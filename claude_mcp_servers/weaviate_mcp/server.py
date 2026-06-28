@@ -708,11 +708,14 @@ _rl_monitor_tasks: "set[asyncio.Task]" = set()
 _rl_node_content_cache: dict[str, dict] = {}
 _RL_NODE_CACHE_MAX: int = 256
 # KG search tool names as they appear in session transcripts (with and without mcp__ prefix).
-_KG_SEARCH_TOOLS: frozenset[str] = frozenset({
-    "hybrid_search", "semantic_graph_search",
-    "mcp__weaviate-kg__hybrid_search",
-    "mcp__weaviate-kg__semantic_graph_search",
-})
+# v0.2.70 (S2): single definitions live in rl_client.answer_window — import
+# here rather than re-declaring (one concern, one home). The matcher is aliased
+# so the monitor and the Stop-hook drain agree byte-for-byte on which answer
+# window maps to which retrieval.
+from claude_mcp_servers.rl_client.answer_window import (
+    KG_SEARCH_TOOLS as _KG_SEARCH_TOOLS,
+    match_position_for_query as _match_position_for_query,
+)
 # Monitor config: poll every N seconds, stop when answer window reaches this size OR a new
 # human turn appears after the search.  Timeout is a hard ceiling.
 _RL_MONITOR_POLL_INTERVAL: float = 2.0
@@ -3430,38 +3433,22 @@ def _enrich_with_adjacent_chunks(coll, results: list[dict], collection_name: str
 
 
 def _rl_load_messages(transcript_path: "Path") -> list[dict]:
-    """Load all JSONL messages from a transcript file."""
-    messages: list[dict] = []
-    try:
-        with open(transcript_path) as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    messages.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-    except OSError:
-        pass
-    return messages
+    """Load all JSONL messages from a transcript file.
+
+    v0.2.70 (S2): thin shim to ``rl_client.answer_window.load_messages`` — one
+    home shared by the MCP monitor AND the Stop-hook drain.
+    """
+    from claude_mcp_servers.rl_client.answer_window import load_messages
+    return load_messages(transcript_path)
 
 
 def _rl_find_kg_positions(messages: list[dict]) -> list[tuple[int, int]]:
-    """Return (msg_idx, blk_idx) for every KG search tool_use block in the transcript."""
-    positions: list[tuple[int, int]] = []
-    for msg_idx, msg in enumerate(messages):
-        if msg.get("type") != "assistant":
-            continue
-        content = msg.get("message", {}).get("content", [])
-        for blk_idx, block in enumerate(content):
-            if (
-                isinstance(block, dict)
-                and block.get("type") == "tool_use"
-                and block.get("name") in _KG_SEARCH_TOOLS
-            ):
-                positions.append((msg_idx, blk_idx))
-    return positions
+    """Return (msg_idx, blk_idx) for every KG search tool_use block.
+
+    v0.2.70 (S2): thin shim to ``rl_client.answer_window.find_kg_positions``.
+    """
+    from claude_mcp_servers.rl_client.answer_window import find_kg_positions
+    return find_kg_positions(messages)
 
 
 def _rl_extract_answer_window(
@@ -3918,27 +3905,13 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
             messages = _rl_load_messages(candidate)
             kg_positions = _rl_find_kg_positions(messages)
 
-            # Find matching position by query fingerprint, scanning newest-first.
-            # seq is used as a tiebreaker when the same query appears multiple times
-            # (parallel chats): prefer the occurrence whose index from the end equals
-            # (total_kg_calls_in_transcript - pos_idx - 1), i.e. the seq-th from the end.
-            # Primary key: query match. Fallback to last match if seq doesn't align.
-            matched_pos: "tuple[int,int] | None" = None
-            if query_snippet:
-                query_matches = []
-                for i, (mi, bi) in enumerate(kg_positions):
-                    msg = messages[mi]
-                    blk = msg.get("message", {}).get("content", [])[bi]
-                    blk_query = blk.get("input", {}).get("query", "") if isinstance(blk, dict) else ""
-                    if query_snippet in blk_query or blk_query in query_snippet:
-                        query_matches.append((i, mi, bi))
-                if query_matches:
-                    # seq-based tiebreak: prefer match whose absolute index == pos_idx
-                    exact = [(i, mi, bi) for (i, mi, bi) in query_matches if i == pos_idx]
-                    best = exact[0] if exact else query_matches[-1]  # fall back to last match
-                    matched_pos = (best[1], best[2])
-            elif pos_idx < len(kg_positions):
-                matched_pos = kg_positions[pos_idx]
+            # Find matching position by query fingerprint + seq tiebreak.
+            # v0.2.70 (S2): the matcher lives in rl_client.answer_window so the
+            # MCP monitor and the Stop-hook drain agree byte-for-byte on which
+            # answer window belongs to which retrieval (one home).
+            matched_pos = _match_position_for_query(
+                messages, kg_positions, query_snippet, pos_idx
+            )
 
             if matched_pos is None:
                 continue
@@ -4621,11 +4594,28 @@ def _rl_pack_linked_embs_for_node(
     return packed_embs, packed_types
 
 
+def _rl_regenerate_node_vector(text: str, model_name: str) -> "list[float] | None":
+    """F-G (v0.2.70, CORRECTED): regenerate a node's embedding from its TEXT.
+
+    Thin shim to the shared ``rl_client.embed_regen.regenerate_node_vector`` so
+    the MCP enrich path AND the hook enrich path share ONE copy of this logic
+    (modularity ruling). Passes the MCP's cached EmbeddingService so the
+    regenerated vector lives in the active model's space (F-D invariant). See
+    that module for the full rationale.
+    """
+    from claude_mcp_servers.rl_client.embed_regen import regenerate_node_vector
+    return regenerate_node_vector(
+        text, model_name, embedding_service=_get_embedding_service()
+    )
+
+
 def _rl_refetch_node_vector(
     node: dict,
     sibling_objs_by_source_id: dict[str, list],
     link_objs_by_title: dict[str, object],
     target_vector_name: str,
+    *,
+    model_name: str = "",
 ) -> "list[float] | None":
     """F-G (v0.2.70): recover a node's own active-slot vector for citation cosine.
 
@@ -4646,6 +4636,10 @@ def _rl_refetch_node_vector(
          never skip).
       3. The title-keyed link object's vector (last resort, when the
          source_id index missed but the title fetch hit).
+      4. F-G CORRECTED: REGENERATE the vector from the node's chunk TEXT (the
+         fetched object's ``content``) using the active model, so cosine is
+         ALWAYS computable for a node whose text we have. Only when this also
+         fails (no text / embed service down) does the caller drop the node.
 
     Pulls ONLY ``target_vector_name`` via ``_extract_obj_vector`` so a recovered
     vector can never come from a foreign embedding space (F-D invariant).
@@ -4687,6 +4681,46 @@ def _rl_refetch_node_vector(
             if vec:
                 return vec
 
+    # 4. F-G CORRECTED — regenerate from text so cosine is ALWAYS computable.
+    # Prefer the fetched object's full ``content`` (matches the stored chunk
+    # text), preferring the matched chunk; fall back to the node dict's content.
+    regen_text = ""
+    for sib in siblings:
+        try:
+            if matched_chunk is not None and sib.properties.get("chunk_num") == matched_chunk:
+                regen_text = sib.properties.get("content") or ""
+                if regen_text:
+                    break
+        except (AttributeError, KeyError, TypeError):
+            continue
+    if not regen_text:
+        for sib in siblings:
+            try:
+                regen_text = sib.properties.get("content") or ""
+            except (AttributeError, KeyError, TypeError):
+                regen_text = ""
+            if regen_text:
+                break
+    if not regen_text and title:
+        link_obj = link_objs_by_title.get(str(title))
+        if link_obj is not None:
+            try:
+                regen_text = link_obj.properties.get("content") or ""
+            except (AttributeError, KeyError, TypeError):
+                regen_text = ""
+    if not regen_text:
+        regen_text = node.get("content") or ""
+    if regen_text and model_name:
+        regen = _rl_regenerate_node_vector(regen_text, model_name)
+        if regen:
+            logger.info(
+                "RL refetch: regenerated embedding from text for node %r "
+                "(stored vector unavailable)",
+                (title or source_id)[:60],
+            )
+            return regen
+    return None
+
     return None
 
 
@@ -4696,6 +4730,7 @@ def _rl_enrich_nodes_with_linked_embs(
     active_slot: str,
     *,
     coll_resolver=None,
+    model_name: str = "",
 ) -> None:
     """Attach v3 training fields to each node in-place.
 
@@ -4910,7 +4945,8 @@ def _rl_enrich_nodes_with_linked_embs(
             # with — never a foreign slot (F-D invariant via _extract_obj_vector).
             if not n_emb:
                 refetched = _rl_refetch_node_vector(
-                    n, sibling_objs_by_source_id, link_objs_by_title, active_slot
+                    n, sibling_objs_by_source_id, link_objs_by_title, active_slot,
+                    model_name=model_name or EMBEDDING_MODEL,
                 )
                 if refetched:
                     n_emb = refetched
@@ -5490,6 +5526,7 @@ async def _semantic_graph_search_body(
             all_formatted,
             query_emb=query_vector,
             active_slot=query_target,
+            model_name=EMBEDDING_MODEL,
         )
     except Exception as exc:
         logger.debug(
@@ -6182,6 +6219,7 @@ async def _hybrid_search_body(
             all_results,
             query_emb=query_vector,
             active_slot=query_target,
+            model_name=EMBEDDING_MODEL,
         )
     except Exception as exc:
         logger.debug("hybrid_search: RL enrich failed (%s); proceeding without linked_embs", exc)

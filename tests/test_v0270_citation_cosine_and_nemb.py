@@ -154,10 +154,97 @@ class TestFGRefetchNodeVector:
         got = _rl_refetch_node_vector(node, {}, link_objs, "qwen3_embed")
         assert got == [0.9, 0.1]
 
-    def test_no_vector_anywhere_returns_none(self) -> None:
+    def test_no_vector_no_text_no_model_returns_none(self) -> None:
+        # No stored vector, no text, no model → genuinely unrecoverable → None
+        # (the caller then DROPS the node — never fabricates).
         node = {"title": "Empty", "source_id": "uuid-e", "chunk_number": 1}
         got = _rl_refetch_node_vector(node, {}, {}, "qwen3_embed")
         assert got is None
+
+    def test_regenerates_from_chunk_text_when_no_stored_vector(self, monkeypatch) -> None:
+        # F-C CORRECTED: a node whose stored vector is missing but whose chunk
+        # TEXT we have gets its embedding REGENERATED on the fly (so cosine is
+        # always computable), instead of being dropped/fabricated.
+        import claude_mcp_servers.rl_client.embed_regen as er
+
+        class _FakeSvc:
+            def embed_text(self, text):
+                return [0.123, 0.456]  # deterministic regenerated vector
+
+        monkeypatch.setattr(er, "regenerate_node_vector",
+                            lambda text, model, embedding_service=None: [0.123, 0.456]
+                            if text else None)
+        # Sibling object carries content but NO vector (slot absent).
+        sib = SimpleNamespace(
+            properties={"source_node_id": "uuid-r", "chunk_num": 1,
+                        "content": "the node body text", "title": "Regen"},
+            vector={},  # no stored vector
+        )
+        node = {"title": "Regen", "source_id": "uuid-r", "chunk_number": 1}
+        got = _rl_refetch_node_vector(
+            node, {"uuid-r": [sib]}, {}, "qwen3_embed",
+            model_name="qwen3-embedding:0.6b",
+        )
+        assert got == [0.123, 0.456]
+
+    def test_no_model_skips_regeneration(self) -> None:
+        # Without a model_name the regeneration step is skipped (can't pick a
+        # chunk preset / embedder) → returns None even with text present.
+        sib = SimpleNamespace(
+            properties={"source_node_id": "uuid-r", "chunk_num": 1,
+                        "content": "body", "title": "Regen"},
+            vector={},
+        )
+        node = {"title": "Regen", "source_id": "uuid-r", "chunk_number": 1}
+        got = _rl_refetch_node_vector(node, {"uuid-r": [sib]}, {}, "qwen3_embed",
+                                      model_name="")
+        assert got is None
+
+
+# ----------------------------------------------------------------------
+# F-C CORRECTED — embed_regen.regenerate_node_vector shared helper.
+# ----------------------------------------------------------------------
+
+
+class TestEmbedRegenHelper:
+    def test_regenerates_via_injected_service(self) -> None:
+        from claude_mcp_servers.rl_client.embed_regen import regenerate_node_vector
+
+        class _Svc:
+            def embed_text(self, text):
+                return [0.9, 0.8, 0.7]
+
+        got = regenerate_node_vector("some node text", "qwen3-embedding:0.6b",
+                                     embedding_service=_Svc())
+        assert got == [0.9, 0.8, 0.7]
+
+    def test_empty_text_returns_none(self) -> None:
+        from claude_mcp_servers.rl_client.embed_regen import regenerate_node_vector
+
+        class _Svc:
+            def embed_text(self, text):
+                return [1.0]
+
+        assert regenerate_node_vector("", "m", embedding_service=_Svc()) is None
+        assert regenerate_node_vector("   ", "m", embedding_service=_Svc()) is None
+
+    def test_no_service_returns_none(self) -> None:
+        from claude_mcp_servers.rl_client.embed_regen import regenerate_node_vector
+        # No service injected and the lazy server resolver returns None in this
+        # test context → None (genuine failure → caller drops).
+        import claude_mcp_servers.weaviate_mcp.server as srv
+        import unittest.mock as mock
+        with mock.patch.object(srv, "_get_embedding_service", return_value=None):
+            assert regenerate_node_vector("text", "m") is None
+
+    def test_embed_failure_returns_none(self) -> None:
+        from claude_mcp_servers.rl_client.embed_regen import regenerate_node_vector
+
+        class _Svc:
+            def embed_text(self, text):
+                raise RuntimeError("embed service down")
+
+        assert regenerate_node_vector("text", "m", embedding_service=_Svc()) is None
 
 
 # ----------------------------------------------------------------------

@@ -28,7 +28,7 @@ Tool RETURNS are already excluded upstream by the answer-window extractor.
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -128,9 +128,19 @@ def compute_citation(
         return None
 
     # --- Step 2: per-node cosine_sims (max over answer chunks vs node.n_emb) ---
+    # F-C (CORRECTED v0.2.70): the cure for the 0.08% starvation is ALWAYS
+    # HAVING THE EMBEDDING (F-G attaches/regenerates the node vector upstream so
+    # cosine is computable for every node whose text we have), NOT lowering a
+    # bar. The formula here drops a no-cosine node (it iterates cosine keys
+    # only), so we must NOT fabricate a target for it. A node that STILL has no
+    # vector at this point means F-G's attach+regenerate genuinely failed (no
+    # text / embed service down): DROP it (pre-F-C behaviour) and log at INFO so
+    # the drop is auditable (F-LOG). Never record it into literal_cited (that
+    # was the withdrawn poisoning path).
     answer_lower = answer.lower()
     cosine_sims: dict[str, float] = {}
     literal_cited: dict[str, bool] = {}
+    dropped_no_vector = 0
     for n in nodes:
         if not isinstance(n, dict):
             continue
@@ -139,10 +149,7 @@ def compute_citation(
             continue
         n_emb = n.get("n_emb") or n.get("emb")
         if not n_emb:
-            # No comparable vector — skip cosine but still record the literal
-            # check (F-C: a literal-only node must still produce a target via
-            # compute_unified_targets' union iteration).
-            literal_cited[title] = _rl_is_literal_cited(n, answer_lower)
+            dropped_no_vector += 1
             continue
         try:
             best = max(_cosine(ac, n_emb) for ac in answer_chunk_embs)
@@ -151,7 +158,14 @@ def compute_citation(
         cosine_sims[title] = float(best)
         literal_cited[title] = _rl_is_literal_cited(n, answer_lower)
 
-    if not cosine_sims and not literal_cited:
+    if dropped_no_vector:
+        logger.info(
+            "citation_compute %s: dropped %d node(s) with no embedding "
+            "(F-G attach+regenerate failed: no text / embed service down)",
+            task_id[:8], dropped_no_vector,
+        )
+
+    if not cosine_sims:
         return None
 
     # --- Step 3: unified-target formula → binary cited dict ---

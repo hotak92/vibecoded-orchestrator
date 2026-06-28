@@ -384,19 +384,26 @@ def _populate_citation_cache(
         logger.debug("_populate_citation_cache: write failed (%s)", exc)
 
     # F-QUEUE: durable pending file (backstop for the deferred-citation drain).
+    # S1 (v0.2.70): this is the SINGLE stage point for BOTH paths — the hook
+    # path threads its resolved session_id through RerankRequest and relies on
+    # this stage exclusively (no separate hook-side re-stage). ``source`` is
+    # derived from task_type: only the long-lived MCP path runs an in-process
+    # monitor that deletes its own pending file on fire, so only it is tagged
+    # "mcp"; hook-path tasks are "hook" (no monitor → drain always processes).
     if stage_pending_file and ctx_dict is not None:
         try:
             from claude_mcp_servers.rl_client.citation_pending import stage_pending
             from .telemetry_emit import resolve_session_id
 
             staged_seq = getattr(srv, "_rl_call_seq", None)
+            source = "mcp" if task_type == "mcp_interactive" else "hook"
             stage_pending(
                 session_id=resolve_session_id(session_id or ""),
                 task_id=task_id,
-                seq=staged_seq,
+                seq=staged_seq if source == "mcp" else None,
                 query=query,
                 ctx=ctx_dict,
-                source="mcp",
+                source=source,
             )
         except Exception as exc:
             logger.debug("_populate_citation_cache: stage_pending failed (%s)", exc)

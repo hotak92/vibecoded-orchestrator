@@ -110,107 +110,26 @@ def compute_unified_targets(
         >>> t["X"]
         1.0
 
-        >>> # Literal-cited node with NO cosine entry (no n_emb available):
-        >>> # its base cosine defaults to the missing-cosine floor (0.4 when no
-        >>> # cosine population exists), then the literal bonus lifts it past the
-        >>> # binary threshold -> cited. base = 0.4 + 0.1*0.5 = 0.45;
-        >>> # literal: 0.45*1.5 = 0.675, +0.1 = 0.775.
-        >>> t, c = compute_unified_targets({}, literal_cited={"Q": True})
-        >>> round(t["Q"], 3)
-        0.775
-        >>> c["Q"]
-        True
-
-        >>> # Cross-encoder-only node with no cosine: same recovery path.
-        >>> t, c = compute_unified_targets({}, cross_encoder_cited={"Q": True})
-        >>> c["Q"]
-        True
-
-        >>> # Mixed: a literal-only node (no cosine) inherits the present
-        >>> # population's mean cosine as its base, then the literal bonus
-        >>> # lifts it. With one cosine node {"A": 0.8} the mean is 0.8, so
-        >>> # B's base = clamp(0.8 + 0.1*0.5) = 0.85, then literal saturates.
-        >>> t, c = compute_unified_targets(
-        ...     {"A": 0.8}, literal_cited={"B": True}
-        ... )
-        >>> sorted(t)
-        ['A', 'B']
-        >>> c["A"], c["B"]
-        (True, True)
-
-        >>> # Empty input (no cosine, no literal, no cross-encoder)
+        >>> # Empty input
         >>> compute_unified_targets({})
         ({}, {})
     """
+    if not cosine_sims:
+        return {}, {}
+
     literal_cited = literal_cited or {}
     cross_encoder_cited = cross_encoder_cited or {}
 
-    # F-C (v0.2.70): a node that is literal_cited (or cross_encoder_cited) but
-    # has NO cosine entry (its n_emb was missing at citation time, the common
-    # case per the deep-bugsweep ~96%-absent finding) used to be discarded
-    # entirely — the early-return guard checked only ``cosine_sims`` and the
-    # loop iterated only ``cosine_sims.items()``. The strongest, most
-    # trustworthy signal (Claude literally named the node) was lost for exactly
-    # the nodes cosine could not score. Iterate the UNION of all three input
-    # dicts so a literal/cross-encoder-only node still produces a target.
-    if not cosine_sims and not literal_cited and not cross_encoder_cited:
-        return {}, {}
-
-    # Z-score population stats over the PRESENT cosine entries. A non-empty
-    # cosine set keeps the original mean/std computation byte-for-byte (the
-    # reproducibility contract — see test_unified_targets.py); an empty set
-    # degenerates to a neutral mid-point.
     vals = list(cosine_sims.values())
-    # Missing-cosine base. The plan's stated "base 0.0 then literal lifts past
-    # 0.6" is arithmetically impossible under the (unchanged) x1.5+0.1 bonus
-    # shape — a base of 0 yields 0.1, never cited. To honour BOTH "literal-
-    # cited is the strongest trustworthy signal and MUST be cited" AND "do not
-    # change the formula's shape", a node ABSENT from cosine_sims is not
-    # penalised to 0 for the accident of a missing n_emb: it inherits the
-    # present population's MEAN cosine as its base (treated as a typical-
-    # similarity node, so its z-score term is neutral). When there is NO cosine
-    # population at all (a literal/cross-encoder-only event), the mean is
-    # undefined → use a 0.4 floor, the smallest round value comfortably above
-    # the cited-after-literal threshold ((0.6-0.1)/1.5 ≈ 0.333) with margin for
-    # the z-term + float imprecision. The per-node Step1-4 arithmetic below is
-    # unchanged; only the *input* cosine for a missing-cosine node moves from
-    # "dropped" to this floor. See knowledge node
-    # rl-citation-literal-only-target-floor.
-    if vals:
-        mean_val = sum(vals) / len(vals)
-        variance = sum((v - mean_val) ** 2 for v in vals) / len(vals)
-        std_val = variance ** 0.5
-        _MISSING_COSINE_BASE: float = mean_val
-    else:
-        # No real cosine population: anchor the z-score mean to the floor so a
-        # missing-cosine node lands at z=0 (z_mapped=0.5) rather than a spurious
-        # high z. base = 0.4 + 0.1*0.5 = 0.45 -> literal 0.45*1.5+0.1 = 0.775.
-        _MISSING_COSINE_BASE = 0.4
-        mean_val = _MISSING_COSINE_BASE
-        std_val = 0.0
+    mean_val = sum(vals) / len(vals)
+    variance = sum((v - mean_val) ** 2 for v in vals) / len(vals)
+    std_val = variance ** 0.5
     denom = max(std_val, 0.05)
 
     targets: dict[str, float] = {}
     cited: dict[str, bool] = {}
 
-    # Deterministic iteration order: present cosine_sims keys first (in their
-    # order — preserves the pre-F-C output ordering for the common path), then
-    # any literal/cross-encoder-only keys not already seen. Output values are
-    # title-keyed so they're order-independent, but a stable order keeps logs
-    # and any order-sensitive downstream replay reproducible.
-    seen: set[str] = set()
-    ordered_titles: list[str] = []
-    for title in cosine_sims:
-        if title not in seen:
-            seen.add(title)
-            ordered_titles.append(title)
-    for extra in (*literal_cited.keys(), *cross_encoder_cited.keys()):
-        if extra not in seen:
-            seen.add(extra)
-            ordered_titles.append(extra)
-
-    for title in ordered_titles:
-        cosine = cosine_sims.get(title, _MISSING_COSINE_BASE)
+    for title, cosine in cosine_sims.items():
         # Step 1: base + z-score
         z = max(-1.0, min(1.0, (cosine - mean_val) / denom))
         z_mapped = 0.5 + z / 2.0

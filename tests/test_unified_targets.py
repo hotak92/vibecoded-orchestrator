@@ -311,75 +311,66 @@ class TestReproducibilityContract:
 
 
 # ----------------------------------------------------------------------
-# 6b. F-C (v0.2.70) — literal/cross-encoder-only nodes (no cosine entry).
-#     A node Claude literally named but whose n_emb was missing at citation
-#     time (the common ~96%-absent case) MUST still appear in the output and
-#     be cited. Pre-F-C the early-return + cosine-only loop dropped it.
+# 6b. F-C (v0.2.70, CORRECTED) — a node with NO cosine entry is DROPPED,
+#     never fabricated. The disease is the MISSING EMBEDDING (cured at the
+#     F-G layer by always attaching/regenerating the node vector so cosine is
+#     always computable). The formula must NOT manufacture a target for a
+#     no-cosine node — a 0.4-floor / mean-inheritance poisons training data
+#     (a no-signal node enters the map; a true literal-only node in a weak
+#     population is under-cited). This class is the regression guard against
+#     re-introducing that floor: it pins main's exact drop-on-no-cosine
+#     behaviour. See knowledge node
+#     rl-citation-always-attach-or-regenerate-embedding-2026-06-27.
 # ----------------------------------------------------------------------
 
 
-class TestFCLiteralOnlyNoCosine:
-    """Union the key sets; a literal-only node is cited, not discarded."""
+class TestFCNoCosineNodeIsDropped:
+    """A node absent from cosine_sims gets NO target — never fabricated."""
 
-    def test_literal_only_no_cosine_population_is_cited(self) -> None:
-        # No cosine entries at all → missing-cosine floor 0.4.
-        # base = 0.4 + 0.1*0.5 = 0.45; literal: 0.45*1.5 = 0.675, +0.1 = 0.775.
-        targets, cited = compute_unified_targets({}, literal_cited={"Q": True})
-        assert "Q" in targets
-        assert math.isclose(targets["Q"], 0.775, abs_tol=1e-9)
-        assert cited["Q"] is True
-
-    def test_cross_encoder_only_no_cosine_is_cited(self) -> None:
-        targets, cited = compute_unified_targets(
-            {}, cross_encoder_cited={"Q": True}
-        )
-        assert "Q" in targets
-        assert cited["Q"] is True
-
-    def test_literal_only_node_appears_alongside_cosine_nodes(self) -> None:
-        # The present-cosine path is unchanged; the literal-only node B
-        # inherits the population mean (0.8) as its base so it is not
-        # spuriously penalised, then the literal bonus saturates it.
-        targets, cited = compute_unified_targets(
-            {"A": 0.8}, literal_cited={"B": True}
-        )
-        assert set(targets) == {"A", "B"}
-        assert cited["A"] is True
-        assert cited["B"] is True
-
-    def test_all_empty_returns_empty_pair(self) -> None:
-        # No cosine, no literal, no cross-encoder → empty (unchanged guard,
-        # now also covers the literal/cross-encoder-absent case).
+    def test_no_cosine_population_returns_empty(self) -> None:
+        # Empty cosine_sims → empty output, regardless of literal/cross flags.
+        # The literal-only node must NOT be fabricated to cited.
+        assert compute_unified_targets({}, literal_cited={"Q": True}) == ({}, {})
+        assert compute_unified_targets({}, cross_encoder_cited={"Q": True}) == ({}, {})
         assert compute_unified_targets({}, {}, {}) == ({}, {})
         assert compute_unified_targets({}, None, None) == ({}, {})
 
-    def test_literal_flag_false_no_cosine_is_not_cited(self) -> None:
-        # NEGATIVE: a node passed with literal_cited=False and no cosine entry
-        # is NOT cited (the floor alone, without a bonus, stays below 0.6).
-        # base = 0.45 (floor 0.4 + z-mid 0.05); no bonus → 0.45 < 0.6.
-        targets, cited = compute_unified_targets({}, literal_cited={"Q": False})
-        assert "Q" in targets
-        assert math.isclose(targets["Q"], 0.45, abs_tol=1e-9)
-        assert cited["Q"] is False
-
-    def test_singleton_cosine_does_not_divide_by_zero(self) -> None:
-        # Singleton cosine population (std=0) plus a literal-only node — the
-        # denom guard (max(std,0.05)) prevents div-by-zero and the literal
-        # node inherits the singleton's value as its mean base.
+    def test_literal_only_node_with_no_cosine_is_absent_from_output(self) -> None:
+        # A literal-cited node B with NO cosine entry must NOT appear in the
+        # output — only the cosine-scored node A does. (Pre-F-G the fix is to
+        # ensure B always HAS a cosine via embedding regeneration; the formula
+        # itself never invents one.)
         targets, cited = compute_unified_targets(
-            {"A": 0.3}, literal_cited={"B": True}
+            {"A": 0.8}, literal_cited={"B": True}
         )
-        assert set(targets) == {"A", "B"}
-        # No exception is the load-bearing assertion; B must be present.
-        assert "B" in cited
+        assert set(targets) == {"A"}
+        assert "B" not in targets
+        assert "B" not in cited
 
-    def test_present_cosine_path_byte_identical_to_pre_fc(self) -> None:
-        # The common path (every node has a cosine entry) must be unchanged.
+    def test_no_signal_node_is_not_poisoned_into_output(self) -> None:
+        # REGRESSION (reviewer blocker B1): a node with no cosine AND a False
+        # literal flag must NOT enter the target map with a manufactured base.
+        targets, cited = compute_unified_targets({}, literal_cited={"X": False})
+        assert targets == {}
+        assert cited == {}
+
+    def test_present_cosine_path_byte_identical_to_main(self) -> None:
+        # The common path (every node has a cosine entry) is unchanged.
         sims = {"A": 0.20, "B": 0.45, "C": 0.55, "D": 0.70, "E": 0.85}
         targets, cited = compute_unified_targets(sims)
         assert math.isclose(targets["A"], 0.20, abs_tol=1e-9)
         assert math.isclose(targets["E"], 0.95, abs_tol=1e-9)
         assert cited["D"] is True
+
+    def test_literal_cited_node_that_HAS_cosine_still_boosted(self) -> None:
+        # The literal bonus still applies — for nodes that HAVE a cosine score
+        # (which, post-F-G, is every node whose text we have). Mid-cosine +
+        # literal crosses the threshold.
+        targets, cited = compute_unified_targets(
+            {"X": 0.3}, literal_cited={"X": True}
+        )
+        assert "X" in targets
+        assert cited["X"] is True
 
 
 # ----------------------------------------------------------------------
