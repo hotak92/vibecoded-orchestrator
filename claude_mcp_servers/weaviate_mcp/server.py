@@ -4721,8 +4721,6 @@ def _rl_refetch_node_vector(
             return regen
     return None
 
-    return None
-
 
 def _rl_enrich_nodes_with_linked_embs(
     nodes: list[dict],
