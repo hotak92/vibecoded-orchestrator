@@ -126,6 +126,17 @@ def hook_env(tmp_path: Path):
         install_root / "templates" / "hooks" / "_lib" / "resolve-vco-venv.sh",
     )
 
+    # v0.2.70 Stream E: the hook now sources the unified seen-store +
+    # session-id + codegraph-query helpers. Copy the REAL production helpers
+    # into the sandbox so the test exercises the new per-chunk dedup +
+    # seen_inject_<sid>.txt store (not the legacy fallback path).
+    for _lib_name in ("seen-store.sh", "session-id.sh", "codegraph-query.sh"):
+        _src = REPO_ROOT / "templates" / "hooks" / "_lib" / _lib_name
+        if _src.exists():
+            shutil.copy(
+                _src, install_root / "templates" / "hooks" / "_lib" / _lib_name
+            )
+
     # detect-project stub — the hook sources it but we don't need
     # multi-codebase detection for the dedup test.
     (install_root / ".claude" / "scripts" / "detect-project.sh").write_text(
@@ -291,16 +302,20 @@ def test_seen_nodes_file_grows_after_first_edit(hook_env, tmp_path):
     result = _invoke_hook(hook_env, "sess-grow-test", str(tmp_path / "foo.py"))
     assert result.returncode == 0, f"hook failed: stderr={result.stderr!r}"
 
-    seen_file = hook_env["state_dir"] / "seen_kg_titles_sess-grow-test.txt"
+    # v0.2.70 Stream E: the unified store is seen_inject_<sid>.txt (renamed
+    # from seen_kg_titles_<sid>.txt) and KG keys are now per-chunk
+    # ("<title>#<sha1(body)>") while CODE keys stay per-entity (full_name).
+    # The substring assertions still hold (the title/full_name prefix the key).
+    seen_file = hook_env["state_dir"] / "seen_inject_sess-grow-test.txt"
     assert seen_file.exists(), "seen file must be touched even when empty"
     content = seen_file.read_text(encoding="utf-8")
-    assert content, "seen file must accumulate titles after first emit (§25b smoke)"
+    assert content, "seen file must accumulate keys after first emit (§25b smoke)"
     assert "Sample Node A" in content, (
-        f"KG title not recorded — _filter_seen + _flush_block append broken "
+        f"KG title not recorded — vco_filter_seen_blocks append broken "
         f"(content={content!r})"
     )
     assert "sample.module.func_a" in content, (
-        f"CODE title not recorded — _filter_seen + _flush_block append broken "
+        f"CODE full_name not recorded — vco_filter_seen_blocks append broken "
         f"(content={content!r})"
     )
 
@@ -344,13 +359,15 @@ def test_second_edit_suppresses_already_seen_titles(hook_env, tmp_path):
         f"got stdout={second.stdout!r}"
     )
 
-    # Seen file should still contain both titles (no duplicate writes).
-    seen = (hook_env["state_dir"] / "seen_kg_titles_sess-dedup-test.txt").read_text("utf-8")
+    # Seen file should still contain both keys (no duplicate writes).
+    # v0.2.70 Stream E: store renamed to seen_inject_<sid>.txt; KG key is
+    # "<title>#<sha1(body)>" so the title appears exactly once.
+    seen = (hook_env["state_dir"] / "seen_inject_sess-dedup-test.txt").read_text("utf-8")
     assert seen.count("Sample Node B") == 1, (
-        f"duplicate title write in seen file: {seen!r}"
+        f"duplicate KG key write in seen file: {seen!r}"
     )
     assert seen.count("sample.module.func_b") == 1, (
-        f"duplicate title write in seen file: {seen!r}"
+        f"duplicate CODE key write in seen file: {seen!r}"
     )
 
 
@@ -383,13 +400,26 @@ def test_no_results_lines_dedup_correctly(hook_env, tmp_path):
         f"(stdout={first.stdout!r})"
     )
 
-    seen = hook_env["state_dir"] / "seen_kg_titles_sess-noresults-test.txt"
+    # v0.2.70 Stream E: store renamed to seen_inject_<sid>.txt. The keys are
+    # now distinct per producer kind: the KG no-results block (no body line)
+    # keys as "no-results#<sha1('')>"; the CODE no-results block keys per-entity
+    # as the bare full_name "no-results". So both are recorded once each (no
+    # longer the single collapsed "no-results\n" entry — that was the old
+    # title-coarse behavior). The dedup CONTRACT (second edit suppressed) below
+    # is the load-bearing assertion.
+    seen = hook_env["state_dir"] / "seen_inject_sess-noresults-test.txt"
     content = seen.read_text("utf-8")
-    # Both KG and CODE share the title "no-results" — so the file has
-    # exactly one entry, matching the 11-byte (`no-results\n`) real-world
-    # state file size observed post-b09ca2a.
-    assert content == "no-results\n", (
-        f"expected exactly 'no-results\\n' in seen file; got {content!r}"
+    lines = [ln for ln in content.splitlines() if ln.strip()]
+    assert "no-results" in content, (
+        f"expected a 'no-results' key in seen file; got {content!r}"
+    )
+    # CODE key is the bare full_name.
+    assert "no-results" in lines, (
+        f"expected the bare CODE 'no-results' key; got {lines!r}"
+    )
+    # KG key is the per-chunk form (title#hash).
+    assert any(ln.startswith("no-results#") for ln in lines), (
+        f"expected a per-chunk KG 'no-results#<hash>' key; got {lines!r}"
     )
 
     # Second Edit: same session, different file. KG + CODE no-results

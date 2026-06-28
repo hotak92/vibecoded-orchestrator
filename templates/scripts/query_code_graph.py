@@ -194,6 +194,45 @@ def _active_code_vector_slot() -> str:
     return svc.code_vector_slot
 
 
+# v0.2.70 Bug C1b: the score floor must track the ACTIVE code embedder.
+# CodeSage-Large / jina place code-shaped queries in a COMPRESSED distance band
+# (~0.70 distance -> ~0.30 score), so the legacy 0.35 floor culled EVERY result
+# (the MCP has no floor and returns them fine — confirmed: floor=0.0 -> results
+# return). qwen3-code reuse has a WIDER, more separable band where a small floor
+# trims true noise. One floor for incompatible distance scales was the bug.
+# Default per-slot; $VCO_CODE_GRAPH_SCORE_FLOOR still overrides.
+#
+# MUST MATCH (3-way mirror): these floor VALUES are the contract between this
+# CLI, any hook that pre-filters codegraph results, and the MCP server
+# (claude_mcp_servers/weaviate_mcp/server.py — which keeps NO floor, i.e. 0.0,
+# for the codesage/jina parity case). Changing a value here without mirroring
+# the MCP/hook reasoning re-creates the cross-scale-floor bug.
+_CODE_FLOOR_BY_SLOT = {
+    "codesage_embed": 0.0,   # parity with MCP; band too compressed for a floor
+    "jina_embed": 0.0,       # 768-dim code model, same compressed band
+    "qwen3_embed": 0.25,     # wider band; keep a light noise trim
+}
+
+
+def _resolve_code_score_floor() -> float:
+    """Resolve the code-graph score floor: explicit env override wins, else the
+    per-active-slot default (0.0 for codesage/jina, 0.25 for qwen3). An empty
+    env string is coerced to the slot default (matches the v0.2.27 KG_COLLECTION
+    empty-string-coercion discipline — do not parse "" as a literal float)."""
+    _floor_env = os.environ.get("VCO_CODE_GRAPH_SCORE_FLOOR")
+    if _floor_env is not None and _floor_env != "":
+        try:
+            return float(_floor_env)
+        except (TypeError, ValueError):
+            # Unparseable override -> safest is no floor (parity with MCP).
+            return 0.0
+    try:
+        _slot = _active_code_vector_slot()
+    except Exception:
+        _slot = "codesage_embed"
+    return _CODE_FLOOR_BY_SLOT.get(_slot, 0.0)
+
+
 def generate_code_embedding(text: str) -> Optional[List[float]]:
     """Generate code embedding via EmbeddingService.
 
@@ -362,15 +401,13 @@ class CodeGraphQuery:
             #     `require_kg_read` at 0.38 on an edit to query_code_graph.py
             #     is a contextually-related access-matrix helper).
             #   * 0.50+: usually directly relevant.
-            # 0.35 is the empirical knee that drops the bottom-third
-            # noise without trimming the genuinely-related mid-tier
-            # hits. Tunable per-user via $VCO_CODE_GRAPH_SCORE_FLOOR
-            # (Step 13 followup will surface a GUI control in the
-            # retrieval-tuning panel; for now, env-only).
-            try:
-                score_floor = float(os.environ.get("VCO_CODE_GRAPH_SCORE_FLOOR", "0.35"))
-            except (TypeError, ValueError):
-                score_floor = 0.35
+            # v0.2.70 Bug C1b: the floor is now EMBEDDER-AWARE (see
+            # _resolve_code_score_floor / _CODE_FLOOR_BY_SLOT above). The legacy
+            # fixed 0.35 was calibrated for qwen3's distance scale and silently
+            # culled ALL CodeSage results (whose distances cluster ~0.70 ->
+            # score ~0.30). Now: codesage/jina -> 0.0 (MCP parity), qwen3 ->
+            # 0.25; $VCO_CODE_GRAPH_SCORE_FLOOR still overrides.
+            score_floor = _resolve_code_score_floor()
             for distance, source, obj in merged:
                 # score = 1 - distance, clamped to [0, 1].
                 score = max(0.0, min(1.0, 1.0 - distance)) if distance >= 0 else 0.0
@@ -553,7 +590,14 @@ class CodeGraphQuery:
                 full_name = "Unknown"
 
         if hook_format:
-            print(f"CODE: {full_name} | {collection} | distance={distance_str}{src_suffix}")
+            # v0.2.70 Stream E: append a "| src=<file_path>" trailer (LAST
+            # field) so the shared seen-store can suppress a CODE block whose
+            # source the model already Read explicitly (reads-ledger match). The
+            # seen-store extracts the src via the last "| src=" occurrence, so it
+            # MUST be last. Empty file_path -> no src trailer (key-only dedup).
+            _fp = rendered.get("file_path", "") or ""
+            _src_trailer = f" | src={_fp}" if _fp else ""
+            print(f"CODE: {full_name} | {collection} | distance={distance_str}{src_suffix}{_src_trailer}")
             CodeGraphQuery._print_body(rendered, indent="  ", hook_format=True)
             # Blank line terminates the block (matches the KG block
             # contract that pre-edit-context-inject.sh _filter_seen
@@ -756,7 +800,11 @@ class CodeGraphQuery:
                     print(f"❌ Module '{target}' not found")
                     return
 
-                imports = response.objects[0].references.get("imports", [])
+                # v0.2.70 C1c: `references` is None when the object carries no
+                # linked refs — guard before .get to avoid 'NoneType' has no
+                # attribute 'get'. Soft-fall to an empty dict.
+                _refs = response.objects[0].references or {}
+                imports = _refs.get("imports", [])
                 print(f"\n🔗 Dependencies of module '{target}':")
                 print(f"   Imports {len(imports)} modules:\n")
 
@@ -791,7 +839,8 @@ class CodeGraphQuery:
                 # Filter for functions that call target
                 callers = []
                 for obj in caller_response.objects:
-                    calls_refs = obj.references.get("calls", [])
+                    # v0.2.70 C1c: guard None references before .get.
+                    calls_refs = (obj.references or {}).get("calls", [])
                     if any(ref.uuid == func_uuid for ref in calls_refs):
                         callers.append(obj)
 
@@ -848,7 +897,8 @@ class CodeGraphQuery:
                     print(f"❌ Class '{target}' not found")
                     return
 
-                extends = response.objects[0].references.get("extends", [])
+                # v0.2.70 C1c: guard None references before .get.
+                extends = (response.objects[0].references or {}).get("extends", [])
                 print(f"\n🔗 Base classes of '{target}':")
                 print(f"   Extends {len(extends)} classes:\n")
 
@@ -987,7 +1037,19 @@ def main():
             from vco_lib.project_config import resolve as _vco_resolve  # type: ignore[import-not-found]
             from pathlib import Path as _Path
             _cfg = _vco_resolve(_Path.cwd())
-            effective_project = _cfg.code_graph_project or None
+            # v0.2.70 Bug C1a: use the canonical binding-row prefix
+            # (code_graph_collection_prefix), NOT the slug alias
+            # code_graph_project. The slug sanitises to a nonexistent
+            # `<Slug>_CodeFunction` (e.g. Orchestrator_root_CodeFunction) so the
+            # CLI returned no-results / crashed `structure` since v0.2.21.
+            # Mirrors server.py:2293-2294 (W3) and post-file-edit.sh:445; keep
+            # code_graph_project as a secondary fallback for legacy resolver
+            # shapes that populate only the slug. MUST MATCH those siblings.
+            effective_project = (
+                _cfg.code_graph_collection_prefix
+                or _cfg.code_graph_project
+                or None
+            )
         except Exception:
             effective_project = None
     if not effective_project:

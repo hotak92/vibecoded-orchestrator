@@ -203,6 +203,15 @@ async def main():
 
             title = entry.get("title", "")
             node_type = entry.get("node_type", "")
+            # v0.2.70 Stream D-2: surface file_path in the --hook-format header so
+            # the injected block is directly openable AND the shared seen-store
+            # (_lib/seen-store.sh) can suppress a block whose source the model
+            # already Read explicitly (reads-ledger match). The "| src=<path>"
+            # trailer must be LAST (the seen-store extracts the last "| src="
+            # occurrence). Only emitted in --hook-format mode + when a path
+            # exists, so interactive CLI output is unchanged.
+            file_path = entry.get("file_path", "") or ""
+            src_trailer = f" | src={file_path}" if (args.hook_format and file_path) else ""
             label_map = {
                 "summary":      "SUMMARY",
                 "single_chunk": "1 CHUNK",
@@ -221,17 +230,17 @@ async def main():
                     or entry.get("summary")
                     or entry.get("content", "")
                 )
-                print(f"{header_prefix}{title} | {node_type} | score={score:.2f} | {body}")
+                print(f"{header_prefix}{title} | {node_type} | score={score:.2f} | {body}{src_trailer}")
             elif chunks_shown and chunks_total and chunks_total > 1:
                 body = entry.get("content", "")
                 print(
                     f"{header_prefix}{title} | {node_type} | score={score:.2f} | "
-                    f"{label} ({chunks_shown}/{chunks_total} chunks):"
+                    f"{label} ({chunks_shown}/{chunks_total} chunks):{src_trailer}"
                 )
                 print(body)
             else:
                 body = entry.get("content", "")
-                print(f"{header_prefix}{title} | {node_type} | score={score:.2f} | {label}:")
+                print(f"{header_prefix}{title} | {node_type} | score={score:.2f} | {label}:{src_trailer}")
                 print(body)
             printed_count += 1
 

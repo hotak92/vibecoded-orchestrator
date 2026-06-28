@@ -39,6 +39,17 @@ fi
 [ -z "${PY:-}" ] && exit 0  # No Python — silent no-op (logging+guards skipped)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# v0.2.70 Streams C+E: shared helpers for canonical session-id, the unified
+# seen-store dedup, and the code-graph retrieval used by the NEW Read(code) +
+# Grep(symbol) injection branches below. Sourced only if present (partial-install
+# tolerance); the new branches no-op gracefully when a helper is missing.
+# shellcheck source=_lib/session-id.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/session-id.sh" ] && . "$SCRIPT_DIR/_lib/session-id.sh"
+# shellcheck source=_lib/seen-store.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/seen-store.sh" ] && . "$SCRIPT_DIR/_lib/seen-store.sh"
+# shellcheck source=_lib/codegraph-query.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/codegraph-query.sh" ] && . "$SCRIPT_DIR/_lib/codegraph-query.sh"
 # v0.2.29: prefer Claude Code's canonical $CLAUDE_PROJECT_DIR (the active
 # workspace the launcher hands us — source of truth for per-project hooks).
 # Fall back to SCRIPT_DIR/../.. for ad-hoc invocations (manual runs, tests)
@@ -110,6 +121,17 @@ except Exception:
     print('')
 " 2>/dev/null || echo "")
 
+# v0.2.70 Stream E: unify session-id resolution with the other hooks via
+# vco_hook_session_id (parse + path-safety sanitise). SESSION_ID_RAW preserves
+# the trustworthy-vs-untrustworthy distinction for the unified reads ledger the
+# injectors consult ("" / "default" → no shared reads store). SESSION_ID keeps
+# the legacy date fallback so the Build Anchor protocol's own reads_*.txt still
+# has a stable per-hour key even without a clean session_id.
+if command -v vco_hook_session_id >/dev/null 2>&1; then
+    SESSION_ID_RAW="$(vco_hook_session_id "$HOOK_STDIN")"
+else
+    SESSION_ID_RAW="$(printf '%s' "$SESSION_ID_FROM_STDIN" | tr -cd 'A-Za-z0-9_-')"
+fi
 SESSION_ID="${SESSION_ID_FROM_STDIN:-${CLAUDE_SESSION_ID:-$(date +%Y%m%d_%H)}}"
 # Per-session dedup state lives under the project's .claude/state/ rather
 # than $TMPDIR so it survives reboots + launcher restarts (Claude Code
@@ -131,6 +153,9 @@ mkdir -p "$BACKUP_DIR" 2>/dev/null || true
 # keeping them around just wastes inodes. Errors suppressed: this is a
 # housekeeping pass, not a correctness step.
 find "$SESSION_STATE_DIR" -maxdepth 1 -name 'reads_*.txt' -mtime +14 -delete 2>/dev/null || true
+# v0.2.70 Stream E (SF-1): same 14-day GC for the INJECTOR reads store
+# (seen_reads_*.txt — distinct from the Build-Anchor reads_*.txt above).
+find "$SESSION_STATE_DIR" -maxdepth 1 -name 'seen_reads_*.txt' -mtime +14 -delete 2>/dev/null || true
 
 # === HELPER: safe JSON field extraction ===
 _get_field() {
@@ -265,11 +290,98 @@ if [[ "$TOOL_NAME" == "Bash" ]]; then
     fi
 fi
 
-# === 3. BUILD ANCHOR PROTOCOL: Track reads ===
+# === v0.2.70 Stream C: shared code-graph injection for Read(code)/Grep(symbol).
+# One concern, one home — both surfaces call this. Queries the shared
+# _lib/codegraph-query.sh helper, dedups through the shared _lib/seen-store.sh,
+# emits via the PreToolUse JSON envelope. Soft-fails to nothing.
+#   $1 query        — the codegraph search query (module name / symbol)
+#   $2 exclude_path — path to grep -v out (self-reference); "" if none
+#   $3 label        — header label for the injected block
+_cg_inject() {
+    local _q="$1" _excl="$2" _label="$3"
+    command -v codegraph_query_block >/dev/null 2>&1 || return 0
+    [ -n "$_q" ] || return 0
+    local _raw
+    _raw="$(codegraph_query_block "$_q" "" 2 "$_excl" 2>/dev/null || true)"
+    [ -n "$_raw" ] || return 0
+    local _inj="" _rd=""
+    if command -v vco_seen_store_path >/dev/null 2>&1; then
+        _inj="$(vco_seen_store_path inject "$SESSION_ID_RAW" "$PROJECT_ROOT")"
+        _rd="$(vco_seen_store_path reads "$SESSION_ID_RAW" "$PROJECT_ROOT")"
+    fi
+    if command -v vco_filter_seen_blocks >/dev/null 2>&1; then
+        _raw="$(vco_filter_seen_blocks "$_raw" "$_inj" "$_rd")"
+    fi
+    case "$_raw" in
+        *[![:space:]]*)
+            if command -v emit_additional_context >/dev/null 2>&1; then
+                emit_additional_context "[${_label}]:"$'\n'$'\n'"$_raw" PreToolUse
+            fi
+            ;;
+    esac
+}
+
+# === 3. BUILD ANCHOR PROTOCOL: Track reads + v0.2.70 code-file inject ===
 if [[ "$TOOL_NAME" == "Read" ]]; then
     FILE_PATH=$(_get_field "file_path")
     if [[ -n "$FILE_PATH" ]]; then
+        # Build Anchor ledger (unchanged path/shape for back-compat — the
+        # harness exact-match gate at section 4 compares against this).
         echo "$FILE_PATH" >> "$SESSION_READS_FILE" 2>/dev/null || true
+        # v0.2.70 Stream E (SF-1 fix): record into the INJECTOR reads store
+        # (seen_reads_<sid>.txt — DISTINCT from the Build-Anchor reads_<sid>.txt)
+        # so a source the model Read explicitly isn't re-injected. The producers
+        # emit a REPO-RELATIVE `| src=<path>` trailer (KG entry.file_path =
+        # "knowledge/..."; CODE file_path = repo-relative POSIX), so the ledger
+        # MUST store the same repo-relative shape or the exact `grep -Fxq`
+        # suppression in vco_filter_seen_blocks NEVER matches. The abs->relative
+        # conversion is the ONE shared vco_to_repo_relative helper (no inline
+        # copy). Skipped when the session id is untrustworthy (helper returns "").
+        _REL_FP="$FILE_PATH"
+        if command -v vco_to_repo_relative >/dev/null 2>&1; then
+            _REL_FP="$(vco_to_repo_relative "$FILE_PATH" "$PROJECT_ROOT")"
+        fi
+        if command -v vco_seen_store_path >/dev/null 2>&1; then
+            _UNIFIED_READS="$(vco_seen_store_path reads "$SESSION_ID_RAW" "$PROJECT_ROOT")"
+            if [ -n "$_UNIFIED_READS" ]; then
+                printf '%s\n' "$_REL_FP" >> "$_UNIFIED_READS" 2>/dev/null || true
+            fi
+        fi
+
+        # v0.2.70 Stream C Surface 1 (Read): for a CODE file, inject its
+        # entity/callers/deps summary so opening a source file surfaces the
+        # code-graph context (was previously injected only on Edit). Gated on
+        # the SAME IS_CODE regex as pre-edit:283 / post-file-edit:440 (MUST
+        # MATCH those siblings). Self-exclude uses the repo-relative path so it
+        # matches the producer's repo-relative CODE: src shape.
+        if [[ "$FILE_PATH" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$ ]]; then
+            _RD_Q="$(basename "$FILE_PATH")"; _RD_Q="${_RD_Q%.*}"
+            _cg_inject "$_RD_Q" "$_REL_FP" "Code-graph context for $(basename "$FILE_PATH")"
+        fi
+    fi
+    exit 0
+fi
+
+# === v0.2.70 Stream C Surface 4: Grep on a code SYMBOL → inject codegraph.
+# A symbol-shaped Grep pattern is a strong "the model is navigating code" signal.
+# Gated by the shared codegraph_pattern_gate (snake / CamelCase / name( / keyword
+# id); a bare-word pattern like "TODO" does NOT fire. EXCLUDES nothing extra —
+# Grep is already a code-navigation tool. diagram/web/secrets/Read-of-noncode/
+# weaviate-kg never reach this branch (different tool names).
+if [[ "$TOOL_NAME" == "Grep" ]]; then
+    # Use codegraph_pattern_gate (identifier shape: snake/CamelCase/name(/keyword
+    # id) — fires on `def authenticate`, `OrderManager`, `migrate_collections`;
+    # NOT on bare `TODO` / `hello` / `foo.bar`). Same gate the pre-bash tool
+    # branch uses (one home).
+    if command -v codegraph_pattern_gate >/dev/null 2>&1; then
+        GREP_PATTERN=$(_get_field "pattern")
+        if [ -n "$GREP_PATTERN" ] && codegraph_pattern_gate "$GREP_PATTERN"; then
+            _GREP_SYM="$GREP_PATTERN"
+            if command -v codegraph_extract_symbol >/dev/null 2>&1; then
+                _GREP_SYM="$(codegraph_extract_symbol "$GREP_PATTERN")"
+            fi
+            _cg_inject "$_GREP_SYM" "" "Code-graph context for symbol: ${_GREP_SYM}"
+        fi
     fi
     exit 0
 fi

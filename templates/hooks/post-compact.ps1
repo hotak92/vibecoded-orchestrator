@@ -49,11 +49,19 @@ $SessionId = if (Get-Command Get-VcoHookSessionId -ErrorAction SilentlyContinue)
 # Wipe the KG/codegraph injection dedup state for this session — the LLM
 # just lost the context that included those previously-injected nodes, so
 # re-injecting them on subsequent edits is now correct (and helpful).
-# pre-edit-context-inject.ps1 writes to .claude/state/seen_kg_titles_<id>.txt.
+# v0.2.70 Stream E: the unified store is .claude/state/seen_inject_<id>.txt
+# (renamed from the pre-v0.2.70 seen_kg_titles_<id>.txt; both wiped here so a
+# session straddling the upgrade still gets a clean reset). MUST MATCH the
+# seen_inject name in _lib/seen-store.ps1 and post-compact.sh.
 if ($SessionId) {
-    $SeenFile = Join-Path $ProjectDir ".claude/state/seen_kg_titles_$SessionId.txt"
-    if (Test-Path $SeenFile) {
-        Remove-Item $SeenFile -Force -ErrorAction SilentlyContinue
+    $SeenInjectFile = Join-Path $ProjectDir ".claude/state/seen_inject_$SessionId.txt"
+    if (Test-Path $SeenInjectFile) {
+        Remove-Item $SeenInjectFile -Force -ErrorAction SilentlyContinue
+    }
+    # Legacy name (pre-v0.2.70) — wipe too for upgrade-straddling sessions.
+    $SeenFileLegacy = Join-Path $ProjectDir ".claude/state/seen_kg_titles_$SessionId.txt"
+    if (Test-Path $SeenFileLegacy) {
+        Remove-Item $SeenFileLegacy -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -68,6 +76,13 @@ if ($SessionId) {
     $ReadsFile = Join-Path $ProjectDir ".claude/state/reads_$SessionId.txt"
     if (Test-Path $ReadsFile) {
         Remove-Item $ReadsFile -Force -ErrorAction SilentlyContinue
+    }
+    # v0.2.70 Stream E (SF-1): also wipe the INJECTOR reads store
+    # (seen_reads_<id>.txt) — DISTINCT from the Build-Anchor reads_<id>.txt.
+    # MUST MATCH the seen_reads name in _lib/seen-store.ps1 + post-compact.sh.
+    $SeenReadsFile = Join-Path $ProjectDir ".claude/state/seen_reads_$SessionId.txt"
+    if (Test-Path $SeenReadsFile) {
+        Remove-Item $SeenReadsFile -Force -ErrorAction SilentlyContinue
     }
 }
 

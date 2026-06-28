@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (v0.2.70 streams C, D, E — context-injection hooks)
+- **Code-graph CLI read-path (Stream C1, broken since v0.2.21):**
+  `templates/scripts/query_code_graph.py` now resolves the default project from
+  the canonical `code_graph_collection_prefix` (not the slug `code_graph_project`,
+  which sanitised to a nonexistent `<Slug>_CodeFunction`), and applies an
+  EMBEDDER-AWARE score floor (codesage/jina → 0.0 for MCP parity, qwen3 → 0.25;
+  `$VCO_CODE_GRAPH_SCORE_FLOOR` still overrides). The fixed 0.35 floor previously
+  culled ALL CodeSage results (distances cluster ~0.70 → score ~0.30). Added a
+  None-guard on the `structure` `references.get` path.
+- **Code-graph hook coverage (Stream C2):** code-graph context now injects on four
+  surfaces — code-file Edit, code-file Read, symbol Grep, and selective Bash
+  (gated by a pure-bash symbol/code-path regex that short-circuits before any
+  subprocess for routine ls/cd/git/cat) — all via one shared
+  `templates/hooks/_lib/codegraph-query.sh` helper + the shared seen-store. The
+  analyzer now refuses to mint a `<Worktree>_Code*` pollution collection when run
+  from a worktree dir without an explicit `--project` (G5).
+- **KG presentation (Stream D):** Development-collection (docs) results now render
+  `node_type: doc` instead of `unknown` (formatter-only fix in `_format_obj`; the
+  docs schema is unchanged); `rl_kg_search.py --hook-format` now emits a
+  `| src=<file_path>` trailer so injected blocks are openable + reads-ledger
+  dedup-able; `pre-bash-context-inject` strips command-noise tokens before
+  building the KG query so a bare `cd`/`ls` no longer injects directory-keyword KG.
+- **Unified per-session read-dedup (Stream E):** new shared
+  `templates/hooks/_lib/seen-store.sh` sourced by all injecting hooks. KG dedup is
+  now PER-CHUNK (`<title>#<sha1(body)>` — a new chunk of a seen node still
+  injects); code-graph dedup is per-entity (`full_name`); explicitly-Read sources
+  are no longer re-injected (the injector reads-ledger `seen_reads_<id>.txt` and
+  the producers' `| src=<path>` trailers are normalised to the same repo-relative
+  shape via one shared helper, so the suppression actually fires); `pre-bash` now
+  dedups (was blind); session-id resolution is unified — an empty/malformed id
+  injects blind rather than cross-bleeding via a shared `default` store. The
+  command-noise strip and the abs→relative path normaliser are extracted to
+  shared `_lib/` helpers (`command-noise-strip.{sh,ps1}`, `vco_to_repo_relative`)
+  with one home per language.
+
 ## [0.2.69] - 2026-06-27
 
 v0.2.69 is a bug-fix cycle from post-v0.2.68 testing. It completes the embedding

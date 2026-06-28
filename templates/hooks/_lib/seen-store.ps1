@@ -1,0 +1,210 @@
+# _lib/seen-store.ps1
+# Unified per-session read/inject dedup store, dot-sourced by the .ps1 context
+# hooks (pre-edit-context-inject, pre-bash-context-inject, pre-tool-use). The
+# PowerShell sibling of _lib/seen-store.sh.
+#
+# Why this exists (one concern, one home -- CLAUDE.md "search before add")
+# -----------------------------------------------------------------------
+# v0.2.70 Stream E. See seen-store.sh for the full rationale. In brief: it
+# unifies the inject-dedup (was inline + title-coarse in pre-edit only, absent
+# in pre-bash) and the explicit-Read ledger (was written but never consulted)
+# behind one set of functions, keyed per-session.
+#
+# Granularity:
+#   KG   -> PER-CHUNK. Key = "<title>#<sha1(body)[:12]>" (a NEW chunk of a seen
+#           node has a different body -> different key -> STILL injects).
+#   CODE -> PER-ENTITY. Key = "<full_name>".
+#
+# TOP RISK: cross-session bleed via a shared "default" bucket. Get-VcoHookSessionId
+# returns "" for missing/malformed AND "default" for a hostile id. EITHER value
+# means "no trustworthy per-chat key" -> Get-VcoSeenStorePath returns "" and
+# Invoke-VcoFilterSeenBlocks then dedups NOTHING (inject blind). Never write a
+# shared bucket.
+#
+# MUST MATCH: templates/hooks/_lib/seen-store.sh -- the KEY FORMAT
+# ("<title>#<sha1(body)[:12]>" for KG, "<full_name>" for CODE), the
+# inject-blind-on-empty/default policy, and the header regex must agree
+# cross-OS. Any change to the key shape here MUST be mirrored there.
+#
+# Plain ASCII only (no em-dash, no BOM needed). Dot-sourced, never executed.
+
+# --- Idempotent double-source guard ---------------------------------------
+if ($script:VcoSeenStoreSourced) { return }
+$script:VcoSeenStoreSourced = $true
+
+# Get-VcoSeenStorePath: resolve the per-session store file for a given kind.
+#   -Kind       "inject" | "reads"
+#   -SessionId  already-sanitised id from Get-VcoHookSessionId
+#   -ProjectRoot
+# Returns the absolute path, OR "" when SessionId is untrustworthy ("" or
+# "default") -- the caller MUST treat "" as "no store; inject blind".
+#
+# File-name convention (MUST MATCH seen-store.sh):
+#   inject -> seen_inject_<sid>.txt
+#   reads  -> seen_reads_<sid>.txt  (INJECTOR reads-ledger, repo-relative paths;
+#             DISTINCT from pre-tool-use's Build-Anchor reads_<sid>.txt -- SF-1)
+function Get-VcoSeenStorePath {
+    param(
+        [string]$Kind,
+        [string]$SessionId,
+        [string]$ProjectRoot
+    )
+    if ([string]::IsNullOrEmpty($SessionId) -or $SessionId -eq "default") { return "" }
+    if ([string]::IsNullOrEmpty($ProjectRoot)) { return "" }
+    $stateDir = Join-Path (Join-Path $ProjectRoot ".claude") "state"
+    return (Join-Path $stateDir ("seen_{0}_{1}.txt" -f $Kind, $SessionId))
+}
+
+# ConvertTo-VcoRepoRelative <Path> <ProjectRoot>
+# The ONE PowerShell-side home (SF-1) for normalising a path to the REPO-RELATIVE
+# shape the producers' "| src=" trailers use. Used by the reads-ledger writer +
+# codegraph self-exclude in pre-tool-use.ps1. Already-relative paths and absolute
+# paths outside the project root are returned unchanged (slashes normalised to
+# forward-slash to match the producers' POSIX src). MUST MATCH seen-store.sh's
+# vco_to_repo_relative.
+function ConvertTo-VcoRepoRelative {
+    param([string]$Path, [string]$ProjectRoot)
+    if ([string]::IsNullOrEmpty($Path)) { return "" }
+    if ($ProjectRoot -and $Path.StartsWith($ProjectRoot)) {
+        return ($Path.Substring($ProjectRoot.Length).TrimStart('/', '\') -replace '\\', '/')
+    }
+    return $Path
+}
+
+# Test-VcoSeenHas <File> <Key> -- $true if Key is present (exact line match).
+function Test-VcoSeenHas {
+    param([string]$File, [string]$Key)
+    if ([string]::IsNullOrEmpty($File)) { return $false }
+    if (-not (Test-Path -LiteralPath $File)) { return $false }
+    try {
+        foreach ($line in [System.IO.File]::ReadLines($File)) {
+            if ($line -eq $Key) { return $true }
+        }
+    } catch { return $false }
+    return $false
+}
+
+# Add-VcoSeen <File> <Key> -- append Key to the store (soft-fail).
+function Add-VcoSeen {
+    param([string]$File, [string]$Key)
+    if ([string]::IsNullOrEmpty($File)) { return }
+    try { Add-Content -LiteralPath $File -Value $Key -ErrorAction Stop } catch { }
+}
+
+# Get-VcoSeenFirstField <Rest> -- first " | "-delimited field of a header,
+# capped to 200 chars. Strips an accidentally-doubled prefix.
+function Get-VcoSeenFirstField {
+    param([string]$Rest)
+    $r = $Rest
+    if ($r.StartsWith("KG: ")) { $r = $r.Substring(4) }
+    if ($r.StartsWith("CODE: ")) { $r = $r.Substring(6) }
+    $idx = $r.IndexOf(" | ")
+    $field = if ($idx -ge 0) { $r.Substring(0, $idx) } else { $r }
+    if ($field.Length -gt 200) { $field = $field.Substring(0, 200) }
+    return $field
+}
+
+# Get-VcoSeenHash <Text> -- sha1 of the body, first 12 hex chars.
+# MUST MATCH seen-store.sh vco_seen_hash (sha1, first 12 hex).
+function Get-VcoSeenHash {
+    param([string]$Text)
+    try {
+        $sha1 = [System.Security.Cryptography.SHA1]::Create()
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+        $hash = $sha1.ComputeHash($bytes)
+        $hex = -join ($hash | ForEach-Object { $_.ToString("x2") })
+        return $hex.Substring(0, 12)
+    } catch {
+        # Fallback sketch (length + head), distinct enough in practice.
+        $len = $Text.Length
+        $head = ($Text.Substring(0, [Math]::Min(24, $Text.Length))) -replace '[^a-zA-Z0-9]', '_'
+        return ("{0}_{1}" -f $len, $head)
+    }
+}
+
+# Invoke-VcoFilterSeenBlocks <Input> <InjectFile> <ReadsFile>
+# Migrated + extended _filter_seen. Returns only blocks not already-seen this
+# session. Suppress if (a) dedup KEY in InjectFile, or (b) source path (from a
+# "| src=<path>" header suffix) in ReadsFile. When InjectFile is "" (untrusted
+# session id), dedup is DISABLED (inject blind). Newly-emitted blocks get their
+# KEY appended to InjectFile.
+function Invoke-VcoFilterSeenBlocks {
+    param(
+        [string]$InputText,
+        [string]$InjectFile,
+        [string]$ReadsFile = ""
+    )
+
+    $dedupOn = $true
+    if ([string]::IsNullOrEmpty($InjectFile)) {
+        $dedupOn = $false
+    } else {
+        try {
+            if (-not (Test-Path -LiteralPath $InjectFile)) {
+                New-Item -ItemType File -Path $InjectFile -Force -ErrorAction Stop | Out-Null
+            }
+        } catch { $dedupOn = $false }
+    }
+
+    $sb = New-Object System.Text.StringBuilder
+    $curPrefix = ""
+    $curFirst = ""
+    $curSrc = ""
+    $curBlock = ""
+    $curBody = ""
+
+    $flush = {
+        if ([string]::IsNullOrEmpty($curPrefix)) {
+            $script:curPrefix = ""; $script:curFirst = ""; $script:curSrc = ""
+            $script:curBlock = ""; $script:curBody = ""
+            return
+        }
+        if ($curPrefix -eq "KG") {
+            $bh = Get-VcoSeenHash -Text $curBody
+            $key = "{0}#{1}" -f $curFirst, $bh
+        } else {
+            $key = $curFirst
+        }
+        $suppress = $false
+        if ($dedupOn) {
+            if (Test-VcoSeenHas -File $InjectFile -Key $key) { $suppress = $true }
+            if ((-not $suppress) -and $curSrc -and $ReadsFile -and (Test-VcoSeenHas -File $ReadsFile -Key $curSrc)) {
+                $suppress = $true
+            }
+        }
+        if (-not $suppress) {
+            [void]$sb.Append($curBlock)
+            if ($dedupOn) { Add-VcoSeen -File $InjectFile -Key $key }
+        }
+        $script:curPrefix = ""; $script:curFirst = ""; $script:curSrc = ""
+        $script:curBlock = ""; $script:curBody = ""
+    }
+
+    foreach ($line in ($InputText -split "`n")) {
+        $line = $line.TrimEnd("`r")
+        $m = [regex]::Match($line, '^(KG|CODE): (.+)$')
+        if ($m.Success) {
+            & $flush
+            $script:curPrefix = $m.Groups[1].Value
+            $rest = $m.Groups[2].Value
+            $script:curFirst = Get-VcoSeenFirstField -Rest $rest
+            $script:curSrc = ""
+            $sidx = $rest.IndexOf("| src=")
+            if ($sidx -ge 0) {
+                $script:curSrc = ($rest.Substring($sidx + 6)).TrimEnd()
+            }
+            $script:curBlock = $line + "`n"
+            $script:curBody = ""
+        } elseif (-not [string]::IsNullOrEmpty($curPrefix)) {
+            $script:curBlock = $curBlock + $line + "`n"
+            $script:curBody = $curBody + $line + "`n"
+        } else {
+            if ($line -match '\S') {
+                [void]$sb.Append($line + "`n")
+            }
+        }
+    }
+    & $flush
+
+    return $sb.ToString()
+}
