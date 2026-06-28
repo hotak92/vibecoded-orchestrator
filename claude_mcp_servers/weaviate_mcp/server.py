@@ -713,7 +713,6 @@ _RL_NODE_CACHE_MAX: int = 256
 # so the monitor and the Stop-hook drain agree byte-for-byte on which answer
 # window maps to which retrieval.
 from claude_mcp_servers.rl_client.answer_window import (
-    KG_SEARCH_TOOLS as _KG_SEARCH_TOOLS,
     match_position_for_query as _match_position_for_query,
 )
 # Monitor config: poll every N seconds, stop when answer window reaches this size OR a new

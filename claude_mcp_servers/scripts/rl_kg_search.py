@@ -159,7 +159,6 @@ async def main():
 
         if EMBEDDING_SOURCE != "weaviate" and _qc.is_oversized(args.query, EMBEDDING_MODEL):
             query_chunks = _qc.chunk_query(args.query, EMBEDDING_MODEL)
-            q = len(query_chunks)
             per_chunk_limit = _qc.kg_results_per_chunk(args.limit) * _RL_OVERFETCH
             pooled_per_chunk: list[list[dict]] = []
             query_chunk_embs: list[list[float]] = []

@@ -69,10 +69,10 @@ import threading
 import requests
 
 # A single shared daemon thread pool for ALL bounded embed POSTs across every
-# adapter in the process. One worker is plenty: embedding is sequential within
-# a sync loop (one chunk at a time), and a bounded queue means a wedged worker
-# simply gets abandoned while the next POST spins up a fresh worker. Daemon
-# threads never block interpreter shutdown.
+# adapter in the process. 4 workers: embedding is sequential within a sync loop
+# (one chunk at a time), and a wedged worker is simply abandoned while the next
+# POST spins up a fresh one — 4 gives headroom so a single stuck daemon worker
+# can't starve the pool. Daemon threads never block interpreter shutdown.
 _EXECUTOR_LOCK = threading.Lock()
 _EXECUTOR: "concurrent.futures.ThreadPoolExecutor | None" = None
 

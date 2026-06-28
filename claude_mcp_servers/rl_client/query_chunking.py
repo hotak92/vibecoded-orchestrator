@@ -187,6 +187,16 @@ def combine_kg_results(
 def combine_codegraph_results(pooled_per_chunk: list[list[dict]]) -> list[dict]:
     """CodeGraph: deduplicated UNION of per-chunk results (no rerank).
 
+    RESERVED scaffolding — intentionally unwired this release (exported + tested
+    but never invoked by a live path). The KG counterparts above
+    (``combine_kg_results`` / ``kg_results_per_chunk``) ARE called from the hook
+    retrieval path; the codegraph hook surface uses the shell CLI, which has no
+    oversized-query branch (codegraph queries are always short symbol/path
+    tokens), so there is no caller today. This (and ``codegraph_results_per_chunk``)
+    is kept ready for a future codegraph-oversized-query surface — it is NOT a
+    dead/forgotten path, so do not delete it and do not wire it without a real
+    oversized-codegraph-query need.
+
     Two-axis dedup via the shared ``content_dedup`` helper (one home):
       1. IDENTITY union — collapse the same entity (full_name/endpoint/path/
          title) surfaced by multiple query chunks.

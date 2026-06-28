@@ -2155,7 +2155,7 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
 
         if token_count <= _max_tokens:
             # Single chunk - store as-is
-            print(f"   Storing as single object")
+            print("   Storing as single object")
 
             # v0.2.70 Part 2: try a pre-shipped embedding FIRST (NO-OP this
             # release — no sidecar is shipped, so this returns None and we

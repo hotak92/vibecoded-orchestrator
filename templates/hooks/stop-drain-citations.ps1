@@ -1,4 +1,4 @@
-﻿# Stop-hook deferred-citation drain (F-QUEUE, v0.2.70)
+# Stop-hook deferred-citation drain (F-QUEUE, v0.2.70)
 # OS-PARITY: ports the .sh sibling. Fires at turn-end (Stop). Reads
 # session_id + transcript_path from stdin JSON and runs the python drain,
 # which recovers hook-path RL citations the in-process monitor never could.

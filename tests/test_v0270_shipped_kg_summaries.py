@@ -40,7 +40,6 @@ import hashlib
 import importlib.util
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -166,8 +165,9 @@ class ShippedSidecarLifecycleTest(unittest.TestCase):
         orphans = [k for k in self.db if k not in valid]
         self.assertEqual(
             orphans, [],
-            f"sidecar entries with no matching shipped node (stale; run "
-            f"scripts/preship_kg_node_formats.py --prune): {orphans}",
+            f"sidecar entries with no matching shipped node (stale; regenerate "
+            f"with scripts/build_shipped_kg_node_formats.py --private-root "
+            f"<checkout>): {orphans}",
         )
 
     def test_every_entry_hash_matches_current_node(self):
@@ -176,7 +176,7 @@ class ShippedSidecarLifecycleTest(unittest.TestCase):
         A mismatch means the node was edited after the summary was generated,
         so the runtime summarizer would NOT skip — it would regenerate,
         defeating the pre-ship. Regenerate with
-        ``scripts/preship_kg_node_formats.py --force``.
+        ``scripts/build_shipped_kg_node_formats.py --private-root <checkout>``.
         """
         node_by_key = {_materialized_key(n): n for n in _shipped_nodes()}
         mismatches: list[str] = []
@@ -193,7 +193,8 @@ class ShippedSidecarLifecycleTest(unittest.TestCase):
         self.assertEqual(
             mismatches, [],
             "shipped summaries are STALE vs current node text (reuse won't "
-            "fire). Run scripts/preship_kg_node_formats.py --force. "
+            "fire). Regenerate with scripts/build_shipped_kg_node_formats.py "
+            "--private-root <checkout>. "
             f"Stale: {mismatches}",
         )
         self.assertEqual(

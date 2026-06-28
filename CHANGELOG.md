@@ -186,6 +186,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   documentation under a non-default folder (e.g. `documentation/`) can point the
   sync engine at it; unset/empty preserves the historical `docs/` default.
 
+### Changed
+- **Fresh installs reuse pre-shipped KG node summaries instead of regenerating
+  them.** The orchestrator now ships ~114 curated node summaries in
+  `templates/knowledge/.node_formats.json`, keyed by the materialized
+  `knowledge/<rel>` path with a `content_hash` over the node's full text. Because
+  bundled knowledge is materialized verbatim, that shipped hash equals the
+  install-time hash, so `generate-kg-summary.py` takes its "unchanged (hash
+  match), skipping" branch and reuses the shipped description/summary rather than
+  invoking the summary LLM per node on every install — removing the per-node
+  summary-generation cost from first-install. The embedding-ingest plumbing that
+  would also reuse shipped vectors is present but INERT this release: no vectors
+  are shipped, so the sync path returns `None` and embeds normally as before. A
+  CI test (`test_v0270_shipped_kg_summaries.py`) guards the sidecar's
+  freshness/completeness so a stale entry can't silently defeat the reuse.
+
 ### Security
 - **Cleared all open Dependabot alerts (dev/build dependencies).** Bumped `vitest`
   → 3.2.6 (CRITICAL: Vitest UI arbitrary file read/execute) in the vendored
@@ -194,6 +209,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dev/build/test dependencies, not present in shipped artifacts; the launcher now
   reports 0 npm vulnerabilities. No vendored `dist/` rebuild was required (the
   vitest bump is test-only).
+- **Pre-tag privacy gate now scans `CHANGELOG.md` for bug-reporter names.** The
+  prior exemption that excluded the changelog from the bug-reporter-name scan was
+  removed, so the gate fails if any reporter's name reaches the published
+  changelog; historical bug-reporter first names already in the file were scrubbed
+  to neutral bug-class descriptors (e.g. "Windows packaging report"). Prevents a
+  contributor identity from leaking into the public release notes.
 
 ## [0.2.69] - 2026-06-27
 
