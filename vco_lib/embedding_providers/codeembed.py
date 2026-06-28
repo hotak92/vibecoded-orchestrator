@@ -33,6 +33,8 @@ from typing import Any
 
 import requests
 
+from vco_lib.embedding_providers._http import bounded_post
+
 # Maximum batch size in one HTTP call. The server enforces 256, we use
 # the same constant so callers can chunk preemptively.
 MAX_BATCH_SIZE = 256
@@ -46,9 +48,14 @@ class CodeEmbedAdapter:
             (e.g. ``"http://localhost:11440"``). No trailing slash.
         session: Injected ``requests.Session`` for connection pooling.
             The caller owns ``close()``.
-        timeout: Per-request timeout in seconds. Default 120s — embedding
-            256 functions on CodeSage-Large-v2 on a slow GPU can take
-            ~30s, and the queue can add more wait.
+        timeout: TOTAL per-request wall-clock deadline in seconds. Default
+            120s when constructed bare; EmbeddingService threads the resolved
+            ``VCT_EMBED_REQUEST_TIMEOUT_SECS`` value in. v0.2.70 FIX A: the
+            ``/embed`` POST goes through :func:`bounded_post` so the deadline
+            bounds the whole request (one batch ≤ MAX_BATCH_SIZE = the embed
+            unit), catching a wedged service instead of the inter-byte read gap
+            a scalar ``requests`` timeout gives. Health GETs keep the plain
+            clamped scalar probe.
     """
 
     def __init__(
@@ -173,8 +180,10 @@ class CodeEmbedAdapter:
         is_query: bool,
     ) -> list[list[float]]:
         """One HTTP call to ``/embed`` for a chunk ≤ MAX_BATCH_SIZE."""
+        # v0.2.70 FIX A: bounded total deadline per embed request (= one batch).
         try:
-            response = self.session.post(
+            response = bounded_post(
+                self.session,
                 f"{self.base_url}/embed",
                 json={"texts": texts, "is_query": is_query},
                 timeout=self.timeout,

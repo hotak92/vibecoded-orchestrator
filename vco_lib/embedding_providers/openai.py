@@ -40,6 +40,8 @@ from typing import Any
 
 import requests
 
+from vco_lib.embedding_providers._http import bounded_post
+
 # Known OpenAI embedding models. Used by catalog discovery so the GUI
 # can show dim before any call is made. Future models can be added
 # here without code changes elsewhere — they'll surface in the dropdown
@@ -93,7 +95,12 @@ class OpenAIAdapter:
             string is a valid "no key configured" sentinel and makes
             every method short-circuit to "not available".
         session: Injected ``requests.Session`` for connection pooling.
-        timeout: Per-request timeout in seconds. Default 30s.
+        timeout: TOTAL per-request wall-clock deadline in seconds. Default
+            30s when constructed bare; EmbeddingService threads the resolved
+            ``VCT_EMBED_REQUEST_TIMEOUT_SECS`` value in. v0.2.70 FIX A: the
+            ``/v1/embeddings`` POST goes through :func:`bounded_post` so the
+            deadline bounds the whole request (one batch = the embed unit),
+            not the inter-byte read gap. Validation GETs keep the plain scalar.
     """
 
     def __init__(
@@ -249,8 +256,10 @@ class OpenAIAdapter:
 
     def _embed_chunk(self, model: str, texts: list[str]) -> list[list[float]]:
         """One HTTP call to ``/v1/embeddings`` for a chunk ≤ MAX_BATCH_SIZE."""
+        # v0.2.70 FIX A: bounded total deadline per embed request (= one batch).
         try:
-            response = self.session.post(
+            response = bounded_post(
+                self.session,
                 f"{API_BASE}/embeddings",
                 headers={
                     "Authorization": f"Bearer {self.api_key}",

@@ -1455,13 +1455,19 @@ def sync_all_docs(server: WeaviateMCPServer) -> Tuple[int, int]:
         print(f"ℹ️  No docs/ at {DOCS_ROOT} — skipping")
         return (0, 0)
     md_files = list(DOCS_ROOT.rglob("*.md"))
-    print(f"📚 Found {len(md_files)} markdown files in docs/")
+    total = len(md_files)
+    print(f"📚 Found {total} markdown files in docs/")
     success = fail = 0
-    for md in sorted(md_files):
+    # v0.2.70 FIX C: running "doc M/N" counter (flush=True), same rationale as
+    # sync_all_nodes — visibility for a long re-embed, no watchdog/timeout.
+    for idx, md in enumerate(sorted(md_files), start=1):
+        print(f"[{idx}/{total}] {md.name}", flush=True)
         if sync_doc(server, md):
             success += 1
         else:
             fail += 1
+        print(f"  → progress: {idx}/{total} docs processed "
+              f"({success} ok, {fail} failed)", flush=True)
     return success, fail
 
 
@@ -2130,14 +2136,24 @@ def sync_all_nodes(server: WeaviateMCPServer) -> Tuple[int, int]:
     EXCLUDED_FILES = {'TAG_HIERARCHY.md', 'VOCABULARY.md'}
     md_files = [f for f in md_files if f.name not in EXCLUDED_FILES]
 
-    print(f"📚 Found {len(md_files)} markdown files in knowledge/")
+    total = len(md_files)
+    print(f"📚 Found {total} markdown files in knowledge/")
     print()
 
-    for md_file in sorted(md_files):
+    # v0.2.70 FIX C: emit a running "node M/N" counter (flush=True) so a long
+    # full re-embed (e.g. an arctic model-swap over thousands of shared-KG
+    # nodes) shows forward motion on install.py's inherited stdout — the cure
+    # for "appears hung" is visibility, NOT a watchdog/timeout. Pure feedback:
+    # no timer, no kill. Per-chunk heartbeats inside sync_node remain the
+    # finer-grained signal for big single nodes.
+    for idx, md_file in enumerate(sorted(md_files), start=1):
+        print(f"[{idx}/{total}] {md_file.name}", flush=True)
         if sync_node(server, md_file):
             success_count += 1
         else:
             fail_count += 1
+        print(f"  → progress: {idx}/{total} nodes processed "
+              f"({success_count} ok, {fail_count} failed)", flush=True)
         print()  # Blank line between nodes
 
     return success_count, fail_count

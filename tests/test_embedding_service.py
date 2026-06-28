@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import unittest
 from io import StringIO
 from pathlib import Path
@@ -2278,6 +2279,222 @@ class HungEmbedRequestAbortsTests(unittest.TestCase):
             f"embed call should abort near the {cap}s cap, took {elapsed:.2f}s "
             "(did the per-request timeout get dropped?)",
         )
+
+
+# ---------------------------------------------------------------------------
+# v0.2.70 FIX A — total per-request deadline catches a DRIBBLING wedge
+# ---------------------------------------------------------------------------
+#
+# The pre-existing HungEmbedRequestAbortsTests above only models a socket that
+# the scalar ``requests`` timeout WOULD catch (the mock raises Timeout itself
+# based on the timeout kwarg). That does NOT exercise the actual install-path
+# wedge: a backend that keeps the socket open and dribbles bytes more often
+# than the read timeout. ``requests`` resets its read clock on every dribble,
+# so the scalar timeout never fires and the request hangs forever.
+#
+# These tests model that real wedge — a ``post`` that blocks (effectively)
+# forever and never raises on its own — and assert that the v0.2.70
+# bounded_post total deadline fails the single request near the cap instead of
+# hanging. The deadline is per-HTTP-request (one chunk for embed_text, one
+# batch for embed_*_batch); it is never per-node or per-process.
+
+
+class _DribblingSession:
+    """A wedged backend that NEVER returns and NEVER raises on its own.
+
+    Models the real install-path failure: the socket stays open and dribbles
+    keep-alive bytes faster than the scalar read timeout, so ``requests``
+    never times out. Here we simply block on an ``Event`` that is never set,
+    ignoring the ``timeout=`` kwarg entirely — exactly what a scalar-timeout
+    request does against a dribbling peer. Only an external total deadline
+    (bounded_post's Future) can break out.
+
+    The blocking happens on bounded_post's worker thread, so the test's main
+    thread is freed by ``future.result(timeout=cap)``. ``release()`` is called
+    in ``tearDown`` so the parked daemon worker can unwind and not leak.
+    """
+
+    def __init__(self) -> None:
+        self.posted_timeouts: list = []
+        self.get_calls = 0
+        self._gate = threading.Event()
+        self.closed = False
+
+    def get(self, url: str, **kwargs):
+        # Health/discovery probes resolve immediately (reachable) so they don't
+        # interfere with the embed path under test.
+        self.get_calls += 1
+        return FakeResponse(200, {"models": [{"name": "qwen3-embedding:0.6b"}]})
+
+    def post(self, url: str, **kwargs):
+        self.posted_timeouts.append(kwargs.get("timeout"))
+        # Block until released. A real dribbling socket would keep requests
+        # busy here indefinitely; we never set the gate during the deadline
+        # window, so only bounded_post's Future deadline can abort the caller.
+        self._gate.wait()  # no timeout — would hang forever without the fix
+        import requests as _req
+
+        raise _req.Timeout("dribbling socket released after test (never reached in-window)")
+
+    def release(self) -> None:
+        self._gate.set()
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class DribblingWedgeBoundedDeadlineTests(unittest.TestCase):
+    """A dribbling/no-forward-progress wedge fails at the bounded total cap."""
+
+    def setUp(self) -> None:
+        self.dribble = _DribblingSession()
+
+    def tearDown(self) -> None:
+        # Let the abandoned daemon worker unwind so it doesn't leak between
+        # tests (it's a daemon, so it would not block process exit regardless).
+        self.dribble.release()
+
+    def _make_service(self, cap: float):
+        with _EnvIsolation():
+            return EmbeddingService(
+                project_root=None,
+                ollama_url="http://localhost:11435",
+                code_embed_url="http://localhost:11440",
+                text_model_id="qwen3-embedding:0.6b",
+                code_model_id="codesage-large-v2",
+                openai_api_key="",
+                session=self.dribble,
+                embed_request_timeout=cap,
+            )
+
+    def test_dribbling_ollama_embed_aborts_at_total_deadline(self):
+        import time as _time
+
+        cap = 0.5
+        svc = self._make_service(cap)
+        self.assertEqual(svc.ollama.timeout, cap)
+
+        started = _time.monotonic()
+        with self.assertRaises(RuntimeError) as ctx:
+            # OllamaAdapter wraps the requests.Timeout from bounded_post's
+            # deadline as RuntimeError("Ollama /api/embed network error").
+            svc.embed_text("a chunk against a dribbling, never-returning socket")
+        elapsed = _time.monotonic() - started
+
+        # The wedge must fail at the REQUEST level, not hang.
+        self.assertIn("network error", str(ctx.exception).lower())
+        # The POST received the small cap (proves it routed through the
+        # bounded path that honours embed_request_timeout).
+        self.assertTrue(self.dribble.posted_timeouts)
+        self.assertEqual(self.dribble.posted_timeouts[0], cap)
+        # And it returned near the cap — NOT after a multi-minute hang. Give
+        # generous slack (CI scheduling jitter) but well under any "forever".
+        self.assertLess(
+            elapsed,
+            cap + 4.0,
+            f"dribbling embed should abort near the {cap}s total deadline, "
+            f"took {elapsed:.2f}s — did the total per-request deadline regress "
+            "back to a scalar read-gap timeout?",
+        )
+
+    def test_normal_fast_embed_succeeds_through_bounded_post(self):
+        # A healthy fast embed must NOT be penalised by the bounded wrapper:
+        # it completes well under the cap and returns its real vector.
+        fast = FakeSession()
+        fast.script(
+            "POST", "http://localhost:11435/api/embed",
+            FakeResponse(200, {"embeddings": [[0.11, 0.22, 0.33]]}),
+        )
+        with _EnvIsolation():
+            svc = EmbeddingService(
+                project_root=None,
+                ollama_url="http://localhost:11435",
+                code_embed_url="http://localhost:11440",
+                text_model_id="qwen3-embedding:0.6b",
+                code_model_id="codesage-large-v2",
+                openai_api_key="",
+                session=fast,
+                embed_request_timeout=0.5,
+            )
+        vec = svc.embed_text("a fast healthy chunk")
+        self.assertEqual(vec, [0.11, 0.22, 0.33])
+        # The POST still received the per-request cap (one deadline, applied).
+        post_calls = [c for c in fast.calls if c[0] == "POST"]
+        self.assertTrue(post_calls)
+        self.assertEqual(post_calls[-1][2]["timeout"], 0.5)
+
+    def test_bounded_post_passes_timeout_to_underlying_post(self):
+        # Direct unit check of the helper: the scalar timeout is still threaded
+        # into the real session.post (the fast-failure floor) AND a caller's
+        # stray timeout kwarg is ignored in favour of the explicit one.
+        from vco_lib.embedding_providers._http import bounded_post
+
+        sess = FakeSession()
+        sess.script(
+            "POST", "http://example/embed", FakeResponse(200, {"ok": True})
+        )
+        resp = bounded_post(
+            sess,
+            "http://example/embed",
+            timeout=3.0,
+            json={"x": 1},
+            # A stray timeout kwarg must be overridden by the explicit one.
+            extra_should_pass="yes",
+        )
+        self.assertEqual(resp.status_code, 200)
+        method, url, kwargs = sess.calls[-1]
+        self.assertEqual(method, "POST")
+        self.assertEqual(kwargs["timeout"], 3.0)
+        self.assertEqual(kwargs["json"], {"x": 1})
+        self.assertEqual(kwargs["extra_should_pass"], "yes")
+
+
+# ---------------------------------------------------------------------------
+# v0.2.70 FIX B — install.py threads VCT_EMBED_REQUEST_TIMEOUT_SECS into seed
+# ---------------------------------------------------------------------------
+
+
+class SubprocessEnvThreadsRequestTimeoutTests(unittest.TestCase):
+    """``_subprocess_env_with_embedding`` propagates the per-chunk timeout env.
+
+    Operators on very slow machines RAISE ``VCT_EMBED_REQUEST_TIMEOUT_SECS``
+    (the maintainer-sanctioned cure for "slow but healthy" is a tunable
+    per-chunk bound, never a process kill). For that override to reach the
+    ``sync_knowledge_graph.py`` subprocess, install.py must thread the env var
+    through when it is set in the install shell. When unset, the subprocess
+    falls back to the 180s default — so install.py must NOT inject a value.
+    """
+
+    def _load_install_module(self):
+        import importlib.util
+
+        install_path = REPO_ROOT / "install.py"
+        spec = importlib.util.spec_from_file_location(
+            "_install_for_fixb_test", install_path
+        )
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_request_timeout_threaded_when_set(self):
+        install_mod = self._load_install_module()
+        with _EnvIsolation(), patch.dict(
+            os.environ,
+            {"ACTIVE_EMBEDDING": "qwen3", EMBED_REQUEST_TIMEOUT_ENV: "600"},
+        ):
+            env = install_mod._subprocess_env_with_embedding()
+        self.assertEqual(env.get(EMBED_REQUEST_TIMEOUT_ENV), "600")
+
+    def test_request_timeout_absent_when_unset(self):
+        install_mod = self._load_install_module()
+        with _EnvIsolation():
+            # Make sure it is not present in the starting env.
+            os.environ.pop(EMBED_REQUEST_TIMEOUT_ENV, None)
+            with patch.dict(os.environ, {"ACTIVE_EMBEDDING": "qwen3"}):
+                env = install_mod._subprocess_env_with_embedding()
+        # install.py must not synthesise a value — absence → subprocess default.
+        self.assertNotIn(EMBED_REQUEST_TIMEOUT_ENV, env)
 
 
 if __name__ == "__main__":

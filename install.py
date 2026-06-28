@@ -10856,6 +10856,18 @@ def _subprocess_env_with_embedding(base_env: "dict[str, str] | None" = None) -> 
     the subprocess defaulted to qwen3 and ground for hours. With this
     helper, install.py threads the resolved values explicitly.
 
+    v0.2.70 FIX B — per-chunk timeout pass-through:
+        The maintainer-sanctioned cure for a "slow but healthy" seed is a
+        *tunable per-chunk* bound (``VCT_EMBED_REQUEST_TIMEOUT_SECS``), NOT a
+        process kill (the seed subprocess carries no per-process timeout —
+        v0.2.69 FIX 3). For an operator's override to actually reach the
+        ``sync_knowledge_graph.py`` subprocess (where EmbeddingService reads
+        it), install.py must thread it through here. We propagate the value
+        EXPLICITLY (not merely via the ``os.environ.copy()`` inheritance) so a
+        future move to a curated env allow-list can't silently drop it — and
+        we only set it when present in the install shell, so an unset var
+        leaves the subprocess on its 180s default rather than being pinned.
+
     Args:
         base_env: starting env dict. Defaults to ``os.environ.copy()``.
 
@@ -10864,6 +10876,15 @@ def _subprocess_env_with_embedding(base_env: "dict[str, str] | None" = None) -> 
         with the embedding env vars threaded in.
     """
     sub_env = dict(base_env) if base_env is not None else os.environ.copy()
+
+    # v0.2.70 FIX B: explicitly carry the per-embed-request (per-chunk) timeout
+    # override into the subprocess env when set in the install shell. Resolve
+    # from the live process env so a curated `base_env` that omitted it still
+    # gets the operator's override. Unset → leave absent (subprocess default).
+    _req_timeout = os.environ.get("VCT_EMBED_REQUEST_TIMEOUT_SECS", "").strip()
+    if _req_timeout and not sub_env.get("VCT_EMBED_REQUEST_TIMEOUT_SECS", "").strip():
+        sub_env["VCT_EMBED_REQUEST_TIMEOUT_SECS"] = _req_timeout
+
     existing_active = sub_env.get("ACTIVE_EMBEDDING", "").strip()
     if existing_active:
         # Env-explicit case — make sure EMBEDDING_MODEL is consistent if

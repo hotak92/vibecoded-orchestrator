@@ -43,6 +43,8 @@ from typing import Any
 
 import requests
 
+from vco_lib.embedding_providers._http import bounded_post
+
 # Model-name substrings that flag an Ollama model as embedding-capable.
 # Ollama doesn't tell us via /api/tags whether a model can embed; the
 # canonical signal is the model's metadata in /api/show, but probing
@@ -131,9 +133,16 @@ class OllamaAdapter:
         base_url: Root URL of the Ollama HTTP API
             (e.g. ``"http://localhost:11435"``). No trailing slash.
         session: Injected ``requests.Session`` for connection pooling.
-        timeout: Per-request timeout in seconds. Default 60s
-            (embedding a 32k-token prompt on qwen3-embedding can take
-            ~10s on CPU, so we give plenty of headroom).
+        timeout: TOTAL per-request wall-clock deadline in seconds. Default
+            60s when constructed bare; EmbeddingService threads the resolved
+            ``VCT_EMBED_REQUEST_TIMEOUT_SECS`` value (180s default) in.
+            v0.2.70 FIX A: embed POSTs go through :func:`bounded_post`, which
+            enforces this as a *total* deadline for the whole request rather
+            than the inter-byte read gap a scalar ``requests`` timeout gives —
+            so a dribbling/wedged Ollama socket fails THIS chunk's request
+            instead of hanging forever. Health/discovery GETs keep the plain
+            scalar ``min(timeout, 5s)`` (a probe that dribbles isn't the wedge
+            we're guarding, and clamping keeps liveness checks snappy).
     """
 
     def __init__(
@@ -206,8 +215,11 @@ class OllamaAdapter:
         if num_ctx is None:
             num_ctx = _num_ctx_for_model(model)
         # Try the modern batched endpoint first.
+        # v0.2.70 FIX A: bounded_post enforces a TOTAL per-request deadline so a
+        # dribbling/wedged socket fails this single chunk instead of hanging.
         try:
-            response = self.session.post(
+            response = bounded_post(
+                self.session,
                 f"{self.base_url}/api/embed",
                 json={
                     "model": model,
@@ -277,8 +289,11 @@ class OllamaAdapter:
         if num_ctx is None:
             num_ctx = _num_ctx_for_model(model)
 
+        # v0.2.70 FIX A: a batch is still ONE HTTP request — the bounded total
+        # deadline applies per-batch (the embed unit), never per-node.
         try:
-            response = self.session.post(
+            response = bounded_post(
+                self.session,
                 f"{self.base_url}/api/embed",
                 json={
                     "model": model,
@@ -331,8 +346,10 @@ class OllamaAdapter:
 
     def _embed_legacy(self, model: str, text: str) -> list[float]:
         """Single-item embed via legacy ``/api/embeddings`` endpoint."""
+        # v0.2.70 FIX A: bounded total deadline, same per-request granularity.
         try:
-            response = self.session.post(
+            response = bounded_post(
+                self.session,
                 f"{self.base_url}/api/embeddings",
                 json={"model": model, "prompt": text},
                 timeout=self.timeout,
