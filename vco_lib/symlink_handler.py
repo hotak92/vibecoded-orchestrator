@@ -311,9 +311,23 @@ def emit_symlink_deferral_multi(
     # Lazy import — same rationale as emit_symlink_deferral.
     from vco_lib.deferral_report import DeferralEntry
 
+    # De-duplicate identical (dest, vco_new) pairs, preserving first-seen order.
+    # The same path can be redirected by more than one install step (e.g.
+    # `.claude/settings.json` flows through both the settings-merge AND the
+    # legacy-BASH_ENV cleanup), so the caller may accumulate duplicate pairs;
+    # the deferral should list each redirected path ONCE.
+    seen: set[tuple[str, str]] = set()
+    deduped: list[tuple[Path, Path]] = []
+    for dest, vco_new in events:
+        key = (str(dest), str(vco_new))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((dest, vco_new))
+
     # Deterministic order so the deferral .md doesn't churn between runs that
     # redirect the same set of files in a different enumeration order.
-    ordered = sorted(events, key=lambda ev: _display_path(ev[0], install_root))
+    ordered = sorted(deduped, key=lambda ev: _display_path(ev[0], install_root))
     shown = ordered[:cap]
     overflow = len(ordered) - len(shown)
 

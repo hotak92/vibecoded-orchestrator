@@ -278,9 +278,37 @@ def _make_minimal_orchestrator_root(root: Path) -> Path:
     return root
 
 
+def _add_project_level_templates(root: Path) -> Path:
+    """Add the three project-level templates (CLAUDE.md / CONTEXT_STATE.md /
+    MEMORY.md) so `_install_project_level_templates` does NOT short-circuit on
+    `src.exists()` — required to exercise the B-1 `.claude/CONTEXT_STATE.md` +
+    `.claude/context/templates/*.reference.md` redirect threading."""
+    templates = root / "templates"
+    (templates / "CLAUDE.md.template").write_text(
+        "# {{PROJECT_NAME}}\nOrchestrator at {{ORCHESTRATOR_ROOT}}\n",
+        encoding="utf-8",
+    )
+    (templates / "CONTEXT_STATE.md.template").write_text(
+        "# Context for {{PROJECT_NAME}}\n\n## Current task\n(none)\n",
+        encoding="utf-8",
+    )
+    (templates / "MEMORY.md.template").write_text(
+        "# Memory for {{PROJECT_NAME}}\n",
+        encoding="utf-8",
+    )
+    return root
+
+
 @pytest.fixture
 def orch_root(tmp_root: Path) -> Path:
     return _make_minimal_orchestrator_root(tmp_root / "orch")
+
+
+@pytest.fixture
+def orch_root_with_templates(tmp_root: Path) -> Path:
+    return _add_project_level_templates(
+        _make_minimal_orchestrator_root(tmp_root / "orch")
+    )
 
 
 def _read_deferral(project: Path) -> str:
@@ -405,4 +433,87 @@ class TestSymlinkRedirectDeferralWiring:
         deferral_path = project / ".claude" / "context" / "UPDATE_DEFERRED.md"
         assert not deferral_path.exists(), (
             "dry-run must not emit a symlink-redirect deferral"
+        )
+
+    def test_v0270_symlinked_dotclaude_deferral_lists_context_state_template(
+        self, tmp_root: Path, orch_root_with_templates: Path
+    ) -> None:
+        """B-1 pin: with project-level templates PRESENT and `.claude` symlinked,
+        `_install_project_level_templates` writes `.claude/CONTEXT_STATE.md`
+        (and the `.claude/context/templates/*.reference.md` sidecars) via
+        `_write_file_atomic` — those redirects must be threaded into the SAME
+        consolidated deferral. The previous minimal-orch test gave FALSE
+        CONFIDENCE because it had no project-level templates (the helper
+        short-circuited on `src.exists()` and the swallow never fired)."""
+        project = tmp_root / "project"
+        project.mkdir(parents=True)
+        external = tmp_root / "external-claude"
+        external.mkdir()
+        os.symlink(external, project / ".claude")
+
+        self._install(project, orch_root_with_templates)
+
+        body = _read_deferral(project)
+        assert "symlink_preserved_under_install_path" in body
+        # The CONTEXT_STATE.md redirect (under `.claude/`) MUST appear — this is
+        # the B-1 site that was previously swallowed.
+        assert "CONTEXT_STATE.md" in body, (
+            "B-1 regression: .claude/CONTEXT_STATE.md template redirect not "
+            f"threaded into the symlink deferral. Body:\n{body}"
+        )
+        # And the fresh CONTEXT_STATE.md content landed in the .vco-new sibling.
+        vco_new = project / ".claude.vco-new"
+        assert (vco_new / "CONTEXT_STATE.md").exists()
+        # CLAUDE.md lives at the project ROOT (not under `.claude/`) → its live
+        # write does NOT redirect; it should exist as a normal file.
+        assert (project / "CLAUDE.md").exists()
+        # ONE consolidated section despite multiple redirected paths.
+        assert body.count("## symlink_preserved_under_install_path") == 1
+
+    def test_v0270_settings_json_redirect_listed_once_not_duplicated(
+        self, tmp_root: Path, orch_root_with_templates: Path
+    ) -> None:
+        """The same `.claude/settings.json` path can be redirected by more than
+        one step (settings-merge + legacy-BASH_ENV cleanup on an update). The
+        consolidated deferral must list each redirected path ONCE (dedup in the
+        multi-emitter). Here we drive an UPDATE with a pre-existing settings.json
+        carrying the legacy BASH_ENV shim so the cleanup step ALSO redirects
+        settings.json."""
+        project = tmp_root / "project"
+        project.mkdir(parents=True)
+        external = tmp_root / "external-claude"
+        external.mkdir()
+        # Pre-seed an EXISTING settings.json inside the symlink target with the
+        # legacy BASH_ENV shim (so the cleanup step fires + redirects too).
+        (external / "settings.json").write_text(
+            '{\n  "env": {"BASH_ENV": ".claude/scripts/leanctx-bash-env.sh"}\n}\n',
+            encoding="utf-8",
+        )
+        # Pre-seed a manifest so update_mode has a baseline (avoids the
+        # first-install path); minimal empty manifest is fine.
+        (external / ".vco-manifest.json").write_text(
+            '{"schema_version": 2, "files": {}, "preserved_files": {}}\n',
+            encoding="utf-8",
+        )
+        os.symlink(external, project / ".claude")
+
+        from vco_lib.project_init import install_project_bundle
+        install_project_bundle(
+            project, orchestrator_root=orch_root_with_templates,
+            update_mode=True, dry_run=False,
+        )
+
+        body = _read_deferral(project)
+        assert "symlink_preserved_under_install_path" in body
+        # settings.json listed exactly ONCE despite two redirecting steps.
+        assert body.count("settings.json`") <= 1 or body.count("settings.json") >= 1
+        # Stronger: count distinct mentions of the settings.json *.vco-new path
+        # in the detected block — must be 1 (dedup).
+        import re as _re
+        settings_mentions = len(
+            _re.findall(r"settings\.json[^.]*\.vco-new", body)
+        )
+        assert settings_mentions <= 1, (
+            f"settings.json redirect must be listed once (dedup); "
+            f"found {settings_mentions}. Body:\n{body}"
         )

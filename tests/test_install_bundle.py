@@ -888,6 +888,80 @@ class HookMergeSupersedeTests(unittest.TestCase):
             )
         )
 
+    # ── BLOCKER G-1: a VCO hook path as an ARGUMENT / pipe operand is NOT an
+    #    invocation → identity None → the user command is PRESERVED, never
+    #    superseded/destroyed. ──────────────────────────────────────────────
+
+    def test_identity_none_when_vco_hook_path_is_an_argument(self):
+        # User's own wrapper that PASSES a VCO hook path as a --target arg.
+        # The invoked script is `my-wrapper.sh`, NOT the .claude/hooks path.
+        self.assertIsNone(
+            project_init._vco_hook_script_identity(
+                "bash my-wrapper.sh --target .claude/hooks/pre-tool-use.sh"
+            ),
+            "a VCO hook path passed as an argument must NOT resolve an identity",
+        )
+
+    def test_identity_none_when_vco_hook_path_is_a_pipe_operand(self):
+        # `cat .claude/hooks/x.sh | grep foo` — the hook path is an operand of
+        # `cat`, not the invoked hook. Must be preserved.
+        self.assertIsNone(
+            project_init._vco_hook_script_identity(
+                "cat .claude/hooks/pre-tool-use.sh | grep foo"
+            ),
+            "a VCO hook path as a cat/pipe operand must NOT resolve an identity",
+        )
+
+    def test_identity_resolves_after_disable_guard_prefix(self):
+        # The VCO disable-guard prefix is the real shipped shape — `bash` after
+        # the `||` IS the interpreter, so the hook path resolves.
+        guarded = '[ -n "$VCT_DISABLE_HOOKS" ] || bash .claude/hooks/ensure-containers.sh'
+        self.assertEqual(
+            project_init._vco_hook_script_identity(guarded), "ensure-containers.sh"
+        )
+
+    def test_user_wrapper_referencing_vco_hook_arg_is_preserved_in_merge(self):
+        # End-to-end: a user wrapper command that references a VCO hook path as
+        # an argument must SURVIVE the merge (never superseded), and the real
+        # VCO hook is appended alongside it.
+        user_wrapper = "bash my-wrapper.sh --target .claude/hooks/pre-tool-use.sh"
+        vco_current = "bash .claude/hooks/pre-tool-use.sh"
+        user_hooks = {
+            "PreToolUse": [
+                {"matcher": "*", "hooks": [{"type": "command", "command": user_wrapper}]},
+            ],
+        }
+        template_hooks = {
+            "PreToolUse": [
+                {"matcher": "*", "hooks": [{"type": "command", "command": vco_current}]},
+            ],
+        }
+        merged = project_init._merge_hooks_for_bundle(user_hooks, template_hooks)
+        cmds = self._cmds(merged, "PreToolUse")
+        self.assertIn(
+            user_wrapper, cmds,
+            "user wrapper referencing a VCO hook path as an arg must be preserved",
+        )
+        self.assertIn(vco_current, cmds, "the real VCO hook is appended alongside")
+
+    def test_user_cat_pipe_referencing_vco_hook_is_preserved_in_merge(self):
+        user_cat = "cat .claude/hooks/pre-tool-use.sh | grep foo"
+        vco_current = "bash .claude/hooks/pre-tool-use.sh"
+        user_hooks = {
+            "PreToolUse": [
+                {"matcher": "*", "hooks": [{"type": "command", "command": user_cat}]},
+            ],
+        }
+        template_hooks = {
+            "PreToolUse": [
+                {"matcher": "*", "hooks": [{"type": "command", "command": vco_current}]},
+            ],
+        }
+        merged = project_init._merge_hooks_for_bundle(user_hooks, template_hooks)
+        cmds = self._cmds(merged, "PreToolUse")
+        self.assertIn(user_cat, cmds, "user cat|grep command must be preserved")
+        self.assertIn(vco_current, cmds, "the real VCO hook is appended alongside")
+
     # ── POSITIVE: supersede the stale backslash command ─────────────────────
 
     def test_supersede_stale_backslash_ps1_command(self):

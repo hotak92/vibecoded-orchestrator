@@ -2643,12 +2643,20 @@ def write_bundle_update_resume_sentinel(
     operation: str = "install-bundle-update",
     orchestrator_root: Optional[Path] = None,
     vco_version: str = "unknown",
+    redirect_sink: Optional[list] = None,
 ) -> bool:
     """Atomic-write the bundle-update resume sentinel.
 
     Best-effort: any I/O failure logs to stderr + returns False rather
     than raising. The bundle install MUST proceed even when sentinel
     write fails (sentinel is a recovery aid, not a hard requirement).
+
+    v0.2.70 (Bug B / B-1): the sentinel lives under `.claude/state/`, so when
+    `.claude` is a symlink VCO refused to write through, the write redirects to
+    a `.vco-new` sibling. When `redirect_sink` (a list) is provided, an
+    `(original_target, vco_new)` pair is appended to it on redirect so the
+    caller can fold it into the consolidated symlink deferral. Default `None`
+    keeps the `bool`-return contract unchanged for all other callers.
     """
     payload = {
         "schema": _BUNDLE_UPDATE_SENTINEL_SCHEMA,
@@ -2673,7 +2681,9 @@ def write_bundle_update_resume_sentinel(
     # this for arbitrary bytes; reuse it.
     try:
         body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
-        _write_file_atomic(target, body)
+        _redirect = _write_file_atomic(target, body)
+        if _redirect is not None and redirect_sink is not None:
+            redirect_sink.append((target, _redirect))
     except OSError as e:
         sys.stderr.write(
             f"[vct] bundle-update sentinel: write {target} failed: {e}\n"
@@ -4490,11 +4500,22 @@ def _install_project_level_templates(
 
     Idempotent. On every run the reference sidecars are rewritten with
     the current shipping shape (atomic write, no-op when bytes match).
+
+    v0.2.70 (Bug B / B-1): the `.claude/CONTEXT_STATE.md` live file and the
+    `.claude/context/templates/*.reference.md` sidecars are written via
+    `_write_file_atomic`, so when `.claude` itself is a symlink VCO refused to
+    write through, those writes redirect to `.vco-new`. We surface every such
+    redirect via the `symlink_redirects` key so `install_project_bundle` folds
+    them into the SAME consolidated symlink deferral as the main file loop.
+    (CLAUDE.md / MEMORY.md live at the project ROOT — never under `.claude/` —
+    so their live writes don't redirect; only their `.reference.md` sidecars,
+    which live under `.claude/`, can.)
     """
-    out = {
+    out: dict = {
         "live_created": [],
         "reference_written": [],
         "diverged": [],
+        "symlink_redirects": [],  # list[tuple[Path, Path]] of (orig, vco_new)
     }
 
     templates_dir = orchestrator_root / "templates"
@@ -4551,7 +4572,9 @@ def _install_project_level_templates(
                 substituted = wrapped.encode("utf-8")
             if not dry_run:
                 try:
-                    _write_file_atomic(live_target, substituted)
+                    _redirect = _write_file_atomic(live_target, substituted)
+                    if _redirect is not None:
+                        out["symlink_redirects"].append((live_target, _redirect))
                 except OSError:
                     # Best-effort: skip this template if the write fails;
                     # don't fail the whole install.
@@ -4567,7 +4590,9 @@ def _install_project_level_templates(
         ref_target = folder / ref_rel
         if not dry_run:
             try:
-                _write_file_atomic(ref_target, substituted)
+                _redirect = _write_file_atomic(ref_target, substituted)
+                if _redirect is not None:
+                    out["symlink_redirects"].append((ref_target, _redirect))
             except OSError:
                 continue
         out["reference_written"].append(str(ref_rel))
@@ -4890,13 +4915,23 @@ def _emit_migrate_required_deferral(
     report.write(folder)
 
 
-def _cleanup_legacy_bash_env_in_project(folder: Path) -> dict:
+def _cleanup_legacy_bash_env_in_project(
+    folder: Path, *, redirect_sink: Optional[list] = None,
+) -> dict:
     """Idempotent cleanup of pre-0.2.11 BASH_ENV lean-ctx shim in a user project.
 
     Parallel of install.py:_cleanup_legacy_bash_env_shim for the orchestrator
     self-update path. Called from `install_project_bundle` during update_mode
     so the launcher's "Update bundle" button on existing user projects also
     strips the fork-bomb fuse left over from pre-0.2.11 installs.
+
+    v0.2.70 (Bug B / B-1, completeness): the BASH_ENV strip rewrites
+    `.claude/settings.json` via `_write_file_atomic`, so when `.claude` is a
+    symlink VCO refused to write through, that write redirects. When
+    `redirect_sink` (a list) is provided, the `(target, vco_new)` pair is
+    appended to it. (The settings-merge step usually captures the same
+    `.claude/settings.json` redirect already; the consolidated emitter dedups
+    duplicate pairs, so threading here is for completeness, not double-listing.)
 
     Pre-0.2.11 installs of user projects could end up with `BASH_ENV` wired
     in `<project>/.claude/settings.json` (either propagated by an old
@@ -4965,10 +5000,12 @@ def _cleanup_legacy_bash_env_in_project(folder: Path) -> dict:
 
     env_block.pop("BASH_ENV", None)
     try:
-        _write_file_atomic(
+        _redirect = _write_file_atomic(
             settings_file,
             (json.dumps(settings, indent=2) + "\n").encode("utf-8"),
         )
+        if _redirect is not None and redirect_sink is not None:
+            redirect_sink.append((settings_file, _redirect))
     except OSError as e:
         return {
             "action": "write-failed",
@@ -6553,6 +6590,17 @@ def install_project_bundle(
     # dry_run (dry-run never mutates the FS so there's nothing to
     # resume). Best-effort: a failed sentinel write logs but does NOT
     # block the install.
+    # v0.2.70 (Bug B): every `_write_file_atomic` call reachable from this
+    # function that gets REDIRECTED to a `.vco-new` sibling (because the target
+    # or an ancestor is a symlink VCO refused to write through) appends its
+    # (original_target, vco_new) pair here. After the loop + settings merge +
+    # project-level templates + the resume sentinel we emit ONE consolidated
+    # `symlink_preserved_under_install_path` deferral (skipped on dry-run).
+    # Mirrors the accumulate-then-emit-once pattern used by `user_modified_paths`
+    # / `skipped_existing_paths` / `orphan_preserved`. Declared HERE (above the
+    # sentinel write) because the sentinel is the FIRST `.claude/`-writing site.
+    symlink_redirect_events: list[tuple[Path, Path]] = []
+
     _sentinel_written = False
     if update_mode and not dry_run:
         _sentinel_written = write_bundle_update_resume_sentinel(
@@ -6560,6 +6608,7 @@ def install_project_bundle(
             operation="install-bundle-update",
             orchestrator_root=orchestrator_root,
             vco_version=result.get("vco_version", "unknown"),
+            redirect_sink=symlink_redirect_events,
         )
         if _sentinel_written:
             _log("4.bundle.sentinel", "start",
@@ -6575,14 +6624,6 @@ def install_project_bundle(
     new_preserved: dict[str, dict] = {}
     user_modified_paths: list[str] = []
     skipped_existing_paths: list[str] = []
-    # v0.2.70 (Bug B): every `_write_file_atomic` call reachable from this
-    # function that gets REDIRECTED to a `.vco-new` sibling (because the target
-    # or an ancestor is a symlink VCO refused to write through) appends its
-    # (original_target, vco_new) pair here. After the loop + settings merge we
-    # emit ONE consolidated `symlink_preserved_under_install_path` deferral
-    # (skipped on dry-run). Mirrors the accumulate-then-emit-once pattern used
-    # by `user_modified_paths` / `skipped_existing_paths` / `orphan_preserved`.
-    symlink_redirect_events: list[tuple[Path, Path]] = []
 
     ops = _enumerate_bundle_files(orchestrator_root, project_root=folder)
     _log("4.bundle", "start",
@@ -6848,7 +6889,9 @@ def install_project_bundle(
     # Runs in update_mode only; first-install never sees the legacy state.
     if update_mode and not dry_run:
         try:
-            cleanup_result = _cleanup_legacy_bash_env_in_project(folder)
+            cleanup_result = _cleanup_legacy_bash_env_in_project(
+                folder, redirect_sink=symlink_redirect_events,
+            )
             action = cleanup_result.get("action", "unknown")
             detail = cleanup_result.get("detail", "")
             if action == "removed":
@@ -7015,6 +7058,14 @@ def install_project_bundle(
             orchestrator_root=orchestrator_root,
             project_name=derived_project_name,
             dry_run=dry_run,
+        )
+        # v0.2.70 (Bug B / B-1): fold any `.claude/`-redirected template writes
+        # (CONTEXT_STATE.md, *.reference.md sidecars) into the SAME consolidated
+        # symlink deferral as the main file loop. Pop the key BEFORE assigning
+        # to result["templates"] — the tuples carry Path objects which are not
+        # JSON-serialisable (the result dict is serialised by the Rust caller).
+        symlink_redirect_events.extend(
+            templates_result.pop("symlink_redirects", []) or []
         )
         result["templates"] = templates_result
         template_review_diverged = list(templates_result.get("diverged", []))
@@ -8673,43 +8724,104 @@ def _backfill_vscode_excludes_in_project(folder: Path) -> dict:
     return result
 
 
+# Interpreter tokens after which a `.claude/hooks/<name>` token is the
+# INVOKED script (bash/sh/PowerShell, .exe variants). Used by
+# `_vco_hook_script_identity` to anchor on the invoked-script POSITION.
+_HOOK_INTERPRETER_TOKENS = frozenset({
+    "bash", "sh", "dash", "zsh",
+    "pwsh", "pwsh.exe", "powershell", "powershell.exe",
+})
+# PowerShell flags whose VALUE (next token) is the script to run.
+_HOOK_SCRIPT_FLAG_TOKENS = frozenset({"-file", "-command"})
+# Shell control operators that reset "command start" so the token after them
+# can begin a fresh invocation (e.g. the `||` in the VCO disable-guard prefix
+# `[ -n "$VCT_DISABLE_HOOKS" ] || bash .claude/hooks/x.sh`).
+_HOOK_CMD_SEPARATOR_TOKENS = frozenset({"||", "&&", ";", "|", "&"})
+
+# A bare `.claude/hooks/<name>.{sh,ps1}` token (with optional `${VAR}/` /
+# `%VAR%/` / path prefix ahead of `.claude/`, no embedded whitespace), with the
+# capture group on the basename. Anchored to the FULL token (the token has
+# already been split on whitespace + de-quoted by the caller).
+_HOOK_TOKEN_RE = re.compile(
+    r"^(?:[^\s]*/)?\.claude/hooks/([A-Za-z0-9][A-Za-z0-9._-]*\.(?:sh|ps1))$"
+)
+
+
 def _vco_hook_script_identity(command: str) -> Optional[str]:
     """Extract the canonical IDENTITY of a VCO-shipped hook command: the hook
     SCRIPT basename under `.claude/hooks/` (e.g. `ensure-containers.ps1`,
     `pre-tool-use.sh`), normalized across path-separator (`\\` vs `/`),
     `${...}` / `%...%` variable expansion, and quoting. Returns `None` when the
-    command does NOT reference a script under `.claude/hooks/` — i.e. it is a
+    command does NOT *invoke* a script under `.claude/hooks/` — i.e. it is a
     user's OWN custom hook, which must never be rewritten/dropped.
 
     v0.2.70 (Stream G): two commands with the SAME identity are the SAME VCO
     hook (one may be a stale form of the other, e.g. a backslash path
     pre-v0.2.70 vs the forward-slash form shipped now). This is the conservative
-    matcher behind the supersede-not-stack merge — it deliberately fires ONLY on
-    a real `.claude/hooks/<name>` reference so a custom user hook (a script
-    elsewhere, or an inline command) returns `None` and is left untouched.
+    matcher behind the supersede-not-stack merge.
+
+    BLOCKER G-1 fix: the identity is resolved ONLY when `.claude/hooks/<name>`
+    is the *invoked script*, NOT when it appears anywhere in the command string.
+    A user command that merely *references* a VCO hook path as an ARGUMENT or a
+    pipe/cat operand (e.g. `bash my-wrapper.sh --target .claude/hooks/x.sh` or
+    `cat .claude/hooks/x.sh | grep foo`) is a CUSTOM user hook and returns
+    `None` (never superseded/destroyed). A token is the invoked script iff it is
+    (a) the first command-start token, (b) immediately follows a shell
+    interpreter token (`bash`/`pwsh`/...), or (c) immediately follows a
+    PowerShell `-File`/`-Command` flag. Tokens appearing later as arguments or
+    after a pipe (without one of those anchors) are NOT invocations.
     """
     if not command or not isinstance(command, str):
         return None
-    # Normalize path separators (bash eats `\`; PowerShell accepts both). A
-    # stale backslash command and the forward-slash form must collapse to the
-    # same identity.
-    norm = command.replace("\\", "/")
-    # Strip quotes around the path token so `'.claude/hooks/x.sh'` and
-    # `".claude/hooks/x.sh"` and the bare form all match.
-    norm = norm.replace('"', " ").replace("'", " ")
-    # Match `.claude/hooks/<basename>` where <basename> is a hook script with a
-    # known hook extension. Allow an optional `${VAR}/` or `%VAR%/` /
-    # `<abs-or-rel-prefix>/` ahead of `.claude/` (variable expansion / absolute
-    # path) — we anchor on the `.claude/hooks/` segment, not the prefix. The
-    # `_lib/` sub-dir is NOT a directly-invoked hook (sourced helper), so
-    # require the basename to sit immediately under `hooks/`.
-    m = re.search(
-        r"\.claude/hooks/([A-Za-z0-9][A-Za-z0-9._-]*\.(?:sh|ps1))(?:$|[\s\"';|&)])",
-        norm,
-    )
-    if not m:
+    # Normalize path separators (bash eats `\`; PowerShell accepts both) so a
+    # stale backslash command and the forward-slash form collapse to the same
+    # identity. Strip quotes so quoted path tokens still split cleanly.
+    norm = command.replace("\\", "/").replace('"', " ").replace("'", " ")
+    tokens = norm.split()
+    if not tokens:
         return None
-    return m.group(1)
+
+    # Walk tokens tracking whether the CURRENT position is a command-start
+    # (eligible to be the invoked script): true at index 0, after a shell
+    # control operator, after an interpreter token, or after a -File/-Command
+    # flag. A `.claude/hooks/<name>` token is the invoked script ONLY at such a
+    # position. Anywhere else (a later argument / pipe operand) → not an
+    # invocation; keep scanning but never resolve identity for it.
+    at_command_start = True
+    expect_script_value = False  # set after a -File/-Command flag
+    for tok in tokens:
+        low = tok.lower()
+        if expect_script_value:
+            # This token is the explicit script value of -File/-Command.
+            m = _HOOK_TOKEN_RE.match(tok)
+            if m:
+                return m.group(1)
+            expect_script_value = False
+            at_command_start = False
+            continue
+        if at_command_start:
+            m = _HOOK_TOKEN_RE.match(tok)
+            if m:
+                return m.group(1)
+            if low in _HOOK_INTERPRETER_TOKENS:
+                # Next token is the script the interpreter runs.
+                at_command_start = True
+                continue
+            # A real executable / token at command-start that isn't an
+            # interpreter (e.g. `cat`, `my-wrapper.sh`) — subsequent tokens are
+            # its arguments, not invocations.
+            at_command_start = False
+            continue
+        # Not at command start: handle separators + script flags.
+        if low in _HOOK_CMD_SEPARATOR_TOKENS:
+            at_command_start = True
+            continue
+        if low in _HOOK_SCRIPT_FLAG_TOKENS:
+            expect_script_value = True
+            continue
+        # Plain argument — ignore (this is where the BLOCKER false-positive
+        # was: a hook path here is an arg, not an invocation).
+    return None
 
 
 def _merge_hooks_for_bundle(user_hooks: dict, template_hooks: dict) -> dict:
@@ -8758,17 +8870,6 @@ def _merge_hooks_for_bundle(user_hooks: dict, template_hooks: dict) -> dict:
             continue
         u_entries = out[event] if isinstance(out[event], list) else []
 
-        # Set of VCO-shipped hook IDENTITIES this template entry-list declares
-        # for THIS event. Only an identity present here is eligible to supersede
-        # a stale user command — guards against rewriting a user's own hook that
-        # happens to share a basename-shaped token.
-        template_identities: set[str] = set()
-        for t_entry in t_entries:
-            for c in _entry_cmds(t_entry):
-                ident = _vco_hook_script_identity(c)
-                if ident:
-                    template_identities.add(ident)
-
         # Exact command strings already present (idempotent skip).
         existing_cmds: set[str] = set()
         for entry in u_entries:
@@ -8779,7 +8880,11 @@ def _merge_hooks_for_bundle(user_hooks: dict, template_hooks: dict) -> dict:
         # commands in the USER entries whose identity matches a template
         # identity but whose string differs from the current template command.
         # Map identity -> current template command (first occurrence wins;
-        # the template ships at most one command per identity per event).
+        # the template ships at most one command per identity per event). The
+        # KEYS of this map ARE the set of VCO-shipped identities eligible to
+        # supersede — a user command whose identity is absent here (e.g. a
+        # user's own hook, or a hook this template doesn't ship) is never
+        # rewritten. This is the eligibility guard (no separate set needed).
         template_cmd_for_identity: dict[str, str] = {}
         for t_entry in t_entries:
             for c in _entry_cmds(t_entry):
@@ -9167,17 +9272,23 @@ def _cmd_migrate_collections(args: argparse.Namespace) -> int:
 
     # PR 5: drift-detection deferral (pre-update path).
     if project_folder and bool(args.dry_run) and not result["errors"] and not all_projects:
-        # v0.2.70: `copy` is the LOSSLESS additive staging double-copy. It
-        # round-trips every UUID + named vector + property byte-for-byte via
-        # `_copy_collection_with_vectors` (no re-embedding, no drop of the live
-        # collection until the staging swap's count-match assertion passes). So
-        # it must AUTO-APPLY without consent — only genuinely data-losing
-        # actions defer. `legacy_single_vector` and any same-name/different-dim
-        # slot are classified `rebuild` (or routed to the schema_migration_runner
-        # subsystem), never `copy` (see `_classify_action` + `_schema_delta`), so
-        # `action == "rebuild"` is the exact lossy set at this gate. The dry-run
-        # plan strips `delta`, leaving `action` as the only signal here — which is
-        # sufficient given that classification proof.
+        # v0.2.70: `copy` is ALWAYS lossless — the staging double-copy
+        # round-trips every EXISTING UUID + named vector + property byte-for-byte
+        # via `_copy_collection_with_vectors` (no re-embedding; the live
+        # collection is not dropped until the staging swap's count-match
+        # assertion passes). So `copy` must AUTO-APPLY without consent — only
+        # genuinely data-losing actions defer, and `action == "rebuild"` is the
+        # exact lossy set here. `legacy_single_vector` classifies `rebuild`
+        # (never `copy`). A same-name/different-dim slot is INVISIBLE to
+        # `_schema_delta` (name-only comparison): on its own it yields `noop`;
+        # when it COEXISTS with a genuinely-missing slot, `_classify_action`
+        # returns `copy` (driven by the missing slot) and the mismatch slot
+        # rides along — but copy still only round-trips the EXISTING vectors
+        # verbatim (it neither fixes nor worsens the dim-mismatch, and never
+        # re-embeds/drops), so it remains lossless + data-safe. Genuine
+        # dim-mismatch remediation is owned by the schema_migration_runner
+        # subsystem (it defers). The dry-run plan strips `delta`, leaving
+        # `action` as the only signal here — sufficient given that proof.
         #
         # NOTE: this auto-apply is NEW behavior, NOT a mirror of
         # `install.py --update` (whose drift detector EXCLUDES the additive
