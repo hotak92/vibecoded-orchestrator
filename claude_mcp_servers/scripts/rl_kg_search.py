@@ -55,6 +55,8 @@ async def main():
         _format_result_by_tier,
         _kg_collections_to_search,
         _embedding_dim_for,
+        _collapse_to_one_per_node,
+        _rl_enrich_nodes_with_linked_embs,
         KG_COLLECTION,
         EMBEDDING_SOURCE,
         EMBEDDING_MODEL,
@@ -88,41 +90,93 @@ async def main():
             target_name = None
         else:
             vector, target_name = await _get_search_vector(args.query)
+        # F-G (v0.2.70): the active named-vector slot (e.g. "qwen3_embed"). The
+        # hook path historically attached NO node vector at all, so EVERY
+        # hook-driven retrieval (≈72% of all events) carried no n_emb → cosine
+        # citations were structurally impossible. We now request include_vector
+        # and run the same emb-enrichment the MCP path uses.
+        query_target = target_name or ""
 
-        all_formatted: list[dict] = []
-        for coll_name in collections_to_search:
-            try:
-                coll = client.collections.get(coll_name)
-            except Exception as exc:
-                # Collection may not exist (peer never indexed yet) —
-                # skip silently.
-                continue
-            try:
-                if EMBEDDING_SOURCE == "weaviate":
-                    primary = coll.query.near_text(
-                        query=args.query,
-                        limit=fetch_limit,
-                        return_metadata=["distance"],
-                    )
-                else:
-                    nv_kwargs = dict(
-                        near_vector=vector,
-                        limit=fetch_limit,
-                        return_metadata=["distance"],
-                    )
-                    if target_name:
-                        nv_kwargs["target_vector"] = target_name
-                    primary = coll.query.near_vector(**nv_kwargs)
-            except Exception:
-                continue
-            if not primary.objects:
-                continue
-            coll_formatted = [
-                _format_obj(obj, coll_name, obj.metadata.distance)
-                for obj in primary.objects
-            ]
-            coll_formatted = _enrich_with_adjacent_chunks(coll, coll_formatted, coll_name)
-            all_formatted.extend(coll_formatted)
+        # Per-(query-text, vector) KG fan-out across all granted collections.
+        # Extracted as a reusable closure so the single-query path AND the
+        # oversized-query per-chunk path share ONE fan-out (no duplication).
+        async def _retrieve_for_vector(q_text: str, q_vector, q_limit: int) -> list[dict]:
+            out: list[dict] = []
+            for coll_name in collections_to_search:
+                try:
+                    coll = client.collections.get(coll_name)
+                except Exception:
+                    # Collection may not exist (peer never indexed yet) — skip.
+                    continue
+                try:
+                    if EMBEDDING_SOURCE == "weaviate":
+                        primary = coll.query.near_text(
+                            query=q_text,
+                            limit=q_limit,
+                            return_metadata=["distance"],
+                        )
+                    else:
+                        nv_kwargs = dict(
+                            near_vector=q_vector,
+                            limit=q_limit,
+                            return_metadata=["distance"],
+                            # F-G: ask Weaviate to return the per-object vector so
+                            # we can attach `emb` (and thus n_emb) on the hook path.
+                            include_vector=True,
+                        )
+                        if q_target := query_target:
+                            nv_kwargs["target_vector"] = q_target
+                        primary = coll.query.near_vector(**nv_kwargs)
+                except Exception:
+                    continue
+                if not primary.objects:
+                    continue
+                coll_formatted = [
+                    _format_obj(obj, coll_name, obj.metadata.distance)
+                    for obj in primary.objects
+                ]
+                # F-G: attach the matched node's active-slot vector (mirrors the
+                # MCP emb-enrichment block). Soft-fail per result.
+                if q_vector is not None:
+                    from weaviate_mcp.server import _extract_obj_vector
+                    for r, obj in zip(coll_formatted, primary.objects):
+                        try:
+                            node_emb = _extract_obj_vector(obj, query_target)
+                            if node_emb:
+                                r["emb"] = node_emb
+                        except Exception:
+                            pass
+                coll_formatted = _enrich_with_adjacent_chunks(coll, coll_formatted, coll_name)
+                out.extend(coll_formatted)
+            return out
+
+        # NEW REQUIREMENT (v0.2.70, HOOK path only): if the QUERY itself exceeds
+        # the embedding model's max chunk size, chunk the query and retrieve per
+        # chunk, then combine via max-over-(node × query-chunk). MCP calls do
+        # NOT do this — they let Weaviate handle oversize. Shared logic lives in
+        # rl_client.query_chunking (one home, reuses chunking.py + _cosine).
+        from claude_mcp_servers.rl_client import query_chunking as _qc
+
+        if EMBEDDING_SOURCE != "weaviate" and _qc.is_oversized(args.query, EMBEDDING_MODEL):
+            query_chunks = _qc.chunk_query(args.query, EMBEDDING_MODEL)
+            q = len(query_chunks)
+            per_chunk_limit = _qc.kg_results_per_chunk(args.limit) * _RL_OVERFETCH
+            pooled_per_chunk: list[list[dict]] = []
+            query_chunk_embs: list[list[float]] = []
+            for qc_text in query_chunks:
+                qc_vec, _qc_target = await _get_search_vector(qc_text)
+                if qc_vec:
+                    query_chunk_embs.append(qc_vec)
+                pooled_per_chunk.append(
+                    await _retrieve_for_vector(qc_text, qc_vec, per_chunk_limit)
+                )
+            # Pool + dedup + max-over-pairs rerank + top-(limit*overfetch) so the
+            # downstream collapse/enrich/rerank still has a healthy candidate set.
+            all_formatted = _qc.combine_kg_results(
+                pooled_per_chunk, query_chunk_embs, args.limit * _RL_OVERFETCH
+            )
+        else:
+            all_formatted = await _retrieve_for_vector(args.query, vector, fetch_limit)
 
         if not all_formatted:
             # v0.2.21 audit fix: under --hook-format, emit a single short
@@ -155,6 +209,27 @@ async def main():
         # below self-collection results even when their score is higher.
         all_formatted.sort(key=lambda x: x.get("score", 0.0), reverse=True)
 
+        # F-G (v0.2.70): collapse to one entry per node (matching the MCP
+        # path, which keys the RL server on title) and run the shared
+        # emb-enrichment so each candidate carries its active-slot n_emb.
+        # The enrich helper re-pulls any node still missing `emb` from its
+        # own include_vector fetch (see _rl_refetch_node_vector), so even
+        # keyword-only / adjacent-chunk survivors get a comparable vector.
+        # Without this the hook path emitted retrieval events with ZERO
+        # node vectors → cosine citations were impossible for ~72% of all
+        # retrievals (the pre_edit_kg_search cohort).
+        all_formatted = _collapse_to_one_per_node(all_formatted, score_field="score")
+        if vector is not None:
+            try:
+                _rl_enrich_nodes_with_linked_embs(
+                    all_formatted, query_emb=vector, active_slot=query_target,
+                    model_name=EMBEDDING_MODEL,
+                )
+            except Exception:
+                # Soft-fail: enrichment is best-effort telemetry; never break
+                # the user-facing context injection.
+                pass
+
         # RL rerank + telemetry emit via the V52-J canonical pipeline.
         # NEW-8 (2026-05-28): query embedding is carried into the
         # retrieval-event payload for offline training. Pre-NEW-8, every
@@ -170,6 +245,24 @@ async def main():
         # accepts arbitrary task_type strings (varchar column, no
         # enum constraint — see launcher/src-tauri/migrations/*.sql).
         task_id = f"pre_edit_{uuid.uuid4().hex[:8]}"
+        # F-A (v0.2.70): do NOT spawn the in-process answer monitor on the
+        # CLI/hook path. ``asyncio.run(main())`` tears the event loop down the
+        # instant ``main()`` returns (and ``client.close()`` runs in the
+        # ``finally``), so a monitor task spawned here is cancelled at birth —
+        # long before Claude has written any answer to poll. Pre-F-A this made
+        # EVERY hook-driven retrieval (≈72% of all events) structurally unable
+        # to cite. The citation is instead RECOVERED by the deferred queue:
+        # the staged ctx is persisted below and a Stop-hook drain computes the
+        # citation at turn-end (see citation_pending.py + rl_drain_citations.py).
+        # S1 (v0.2.70): pass session_id INTO the RerankRequest so the single
+        # internal stage in ``_populate_citation_cache(stage_pending_file=True)``
+        # owns the pending file. Pre-S1 the hook omitted session_id (the
+        # internal stage used resolve_session_id("")) AND re-staged here with a
+        # reversed env priority — if the two env vars differed, two files were
+        # written, one orphaned-until-TTL. Resolving once via the canonical
+        # resolve_session_id and threading it through removes the double-stage.
+        from claude_mcp_servers.rl_client.telemetry_emit import resolve_session_id
+        resolved_session = resolve_session_id("")
         req = RerankRequest(
             query=args.query,
             candidates=all_formatted,
@@ -180,7 +273,13 @@ async def main():
             embedding_model=EMBEDDING_MODEL,
             task_id=task_id,
             task_type="pre_edit_kg_search",
+            session_id=resolved_session,
+            spawn_answer_monitor=False,
         )
+        # F-A (v0.2.70): no in-process monitor on the hook path; the staged
+        # pending file (written inside rerank_and_emit → _populate_citation_cache
+        # with stage_pending_file=True) is the SINGLE source the Stop-hook drain
+        # consumes at turn-end. No separate hook-side re-stage (S1).
         rerank_result = await rerank_and_emit(req)
         results = rerank_result.ranked
         for r in results:

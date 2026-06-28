@@ -255,31 +255,60 @@ class TestComputeAndWriteCitations:
         assert result is None
         assert writer.calls == []
 
-    def test_node_without_n_emb_still_gets_literal_check(self) -> None:
+    def test_node_without_n_emb_is_dropped_not_fabricated(self) -> None:
+        # F-C CORRECTED (v0.2.70): a node with NO n_emb is DROPPED, never
+        # fabricated into a citation. The cure for the missing embedding is the
+        # F-G attach+regenerate path upstream (so by compute time every node
+        # whose text we have HAS a vector); a node that STILL has no vector here
+        # means regeneration genuinely failed → drop it. The withdrawn floor /
+        # literal-only-fabrication path poisoned training data.
         svc = _FakeEmbeddingService()
         writer = _FakeTelemetryWriter()
         ctx = {
             "active_model": "qwen3-embedding:0.6b",
             "nodes": [
                 {"title": "VisibleNode", "file_path": "knowledge/visible.md"},
-                # No n_emb on this node — but literal_cited should still fire.
+                # No n_emb and no content to regenerate from → must be dropped.
             ],
         }
         p1, p2, p3 = _patch_helpers(svc, writer)
         with p1, p2, p3:
-            ok = asyncio.run(
+            result = asyncio.run(
                 _rl_compute_and_write_citations(
                     "t",
                     "we use VisibleNode prominently here",
                     ctx,
                 )
             )
-        # n_emb-less nodes have no cosine signal, so cosine_sims doesn't
-        # include them, but literal_cited does.
+        # No cosine signal for any node → nothing written (dropped, not
+        # fabricated-to-cited).
+        assert result is None
+        assert writer.calls == []
+
+    def test_node_with_n_emb_still_writes_alongside_dropped_no_emb_node(self) -> None:
+        # A node WITH n_emb is scored normally; a sibling without one is dropped
+        # from the map (not poisoned in). The write still happens for the scored
+        # node.
+        svc = _FakeEmbeddingService()
+        writer = _FakeTelemetryWriter()
+        ctx = {
+            "active_model": "qwen3-embedding:0.6b",
+            "nodes": [
+                {"title": "Scored", "n_emb": [1.0, 0.0]},
+                {"title": "NoEmb", "file_path": "knowledge/noemb.md"},
+            ],
+        }
+        p1, p2, p3 = _patch_helpers(svc, writer)
+        with p1, p2, p3:
+            result = asyncio.run(
+                _rl_compute_and_write_citations("t", "Scored and NoEmb mentioned", ctx)
+            )
+        assert result is not None
         assert writer.calls
         call = writer.calls[0]
-        assert "VisibleNode" not in call["cosine_sims"]
-        assert call["literal_cited"]["VisibleNode"] is True
+        assert "Scored" in call["cosine_sims"]
+        assert "NoEmb" not in call["cosine_sims"]
+        assert "NoEmb" not in call["literal_cited"]
 
     def test_no_writer_returns_false(self) -> None:
         svc = _FakeEmbeddingService()

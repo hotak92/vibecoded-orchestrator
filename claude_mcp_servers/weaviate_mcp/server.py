@@ -708,11 +708,14 @@ _rl_monitor_tasks: "set[asyncio.Task]" = set()
 _rl_node_content_cache: dict[str, dict] = {}
 _RL_NODE_CACHE_MAX: int = 256
 # KG search tool names as they appear in session transcripts (with and without mcp__ prefix).
-_KG_SEARCH_TOOLS: frozenset[str] = frozenset({
-    "hybrid_search", "semantic_graph_search",
-    "mcp__weaviate-kg__hybrid_search",
-    "mcp__weaviate-kg__semantic_graph_search",
-})
+# v0.2.70 (S2): single definitions live in rl_client.answer_window — import
+# here rather than re-declaring (one concern, one home). The matcher is aliased
+# so the monitor and the Stop-hook drain agree byte-for-byte on which answer
+# window maps to which retrieval.
+from claude_mcp_servers.rl_client.answer_window import (
+    KG_SEARCH_TOOLS as _KG_SEARCH_TOOLS,
+    match_position_for_query as _match_position_for_query,
+)
 # Monitor config: poll every N seconds, stop when answer window reaches this size OR a new
 # human turn appears after the search.  Timeout is a hard ceiling.
 _RL_MONITOR_POLL_INTERVAL: float = 2.0
@@ -3255,10 +3258,34 @@ def _format_obj(obj, collection_name: str, distance: float | None = None) -> dic
     )
     title = obj.properties.get("title", "Untitled")
 
-    # Parse chunk metadata — prefer schema properties, fall back to content prefix
+    # Parse chunk metadata — prefer schema properties, fall back to content prefix.
+    # F-G (v0.2.70): the ``or`` chains used to fall through to None when the
+    # stored ``chunk_num``/``total_chunks`` were 0 (legacy single-chunk nodes
+    # stored with 0 rather than 1). A None here propagates into the citation /
+    # n_emb / sibling-fetch paths and can make a single-chunk node behave as if
+    # it has no chunk identity. Maintainer ruling: a single-chunk node must be
+    # NON-BLOCKING — absent/0/1 are all a VALID single-chunk node, never "skip".
+    # So we read the property explicitly (preserving an explicit 0/None) and
+    # normalise a missing/0 chunk to "chunk 1 of 1" at the END.
     parsed = _parse_chunk_header(content)
-    chunk_number = obj.properties.get("chunk_num") or (parsed[0] if parsed else None)
-    total_chunks = obj.properties.get("total_chunks") or (parsed[1] if parsed else None)
+    _raw_chunk_num = obj.properties.get("chunk_num")
+    _raw_total = obj.properties.get("total_chunks")
+    chunk_number = (
+        _raw_chunk_num if _raw_chunk_num not in (None, 0)
+        else (parsed[0] if parsed else None)
+    )
+    total_chunks = (
+        _raw_total if _raw_total not in (None, 0)
+        else (parsed[1] if parsed else None)
+    )
+    # Normalise a single-chunk node (no chunk header + no usable chunk props) to
+    # the canonical "chunk 1 of 1" so downstream (sibling refetch, citation
+    # n_emb, adjacent-chunk fetch) treats it as a first-class node rather than
+    # an identity-less one. Multi-chunk nodes (header parsed OR props >1) keep
+    # their real numbers untouched.
+    if chunk_number is None and total_chunks is None:
+        chunk_number = 1
+        total_chunks = 1
     source_id = obj.properties.get("source_node_id") or title
 
     # Phase 1.5.C: discriminator so callers can route diagram results
@@ -3420,38 +3447,22 @@ def _enrich_with_adjacent_chunks(coll, results: list[dict], collection_name: str
 
 
 def _rl_load_messages(transcript_path: "Path") -> list[dict]:
-    """Load all JSONL messages from a transcript file."""
-    messages: list[dict] = []
-    try:
-        with open(transcript_path) as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    messages.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-    except OSError:
-        pass
-    return messages
+    """Load all JSONL messages from a transcript file.
+
+    v0.2.70 (S2): thin shim to ``rl_client.answer_window.load_messages`` — one
+    home shared by the MCP monitor AND the Stop-hook drain.
+    """
+    from claude_mcp_servers.rl_client.answer_window import load_messages
+    return load_messages(transcript_path)
 
 
 def _rl_find_kg_positions(messages: list[dict]) -> list[tuple[int, int]]:
-    """Return (msg_idx, blk_idx) for every KG search tool_use block in the transcript."""
-    positions: list[tuple[int, int]] = []
-    for msg_idx, msg in enumerate(messages):
-        if msg.get("type") != "assistant":
-            continue
-        content = msg.get("message", {}).get("content", [])
-        for blk_idx, block in enumerate(content):
-            if (
-                isinstance(block, dict)
-                and block.get("type") == "tool_use"
-                and block.get("name") in _KG_SEARCH_TOOLS
-            ):
-                positions.append((msg_idx, blk_idx))
-    return positions
+    """Return (msg_idx, blk_idx) for every KG search tool_use block.
+
+    v0.2.70 (S2): thin shim to ``rl_client.answer_window.find_kg_positions``.
+    """
+    from claude_mcp_servers.rl_client.answer_window import find_kg_positions
+    return find_kg_positions(messages)
 
 
 def _rl_extract_answer_window(
@@ -3502,62 +3513,21 @@ def _rl_extract_answer_window(
     cosine downstream means the relevant chunk still dominates.
 
     Returns (text, complete).
+
+    v0.2.70: the extraction logic now lives in the shared module
+    ``claude_mcp_servers.rl_client.answer_window`` so the in-MCP monitor AND
+    the Stop-hook drain (``scripts/rl_drain_citations.py``) use ONE home
+    (modularity ruling). This is a thin shim that forwards the MCP's tunable
+    thresholds; the body is byte-equivalent to the pre-extraction V52-N code.
     """
-    import json as _json
-    parts: list[str] = []
-    total_chars = 0
-    threshold_chars = _RL_MONITOR_ANSWER_THRESHOLD_TOKENS * 4
-    for msg_idx in range(start_msg_idx, len(messages)):
-        msg = messages[msg_idx]
-        msg_type = msg.get("type", "")
-
-        # V52-N: human turns no longer interrupt accumulation. Only
-        # assistant blocks contribute; everything else is skipped without
-        # stopping the scan.
-        if msg_type != "assistant":
-            continue
-
-        content = msg.get("message", {}).get("content", [])
-        for blk_idx, block in enumerate(content):
-            if not isinstance(block, dict):
-                continue
-            # Skip blocks up to and including the search tool_use itself
-            if msg_idx == start_msg_idx and blk_idx <= start_blk_idx:
-                continue
-            btype = block.get("type", "")
-            if btype == "text":
-                text = block.get("text", "")
-                if text:
-                    parts.append(text)
-                    total_chars += len(text)
-            elif btype == "thinking":
-                # Include thinking blocks (useful signal for RL)
-                text = block.get("thinking", "")
-                if text:
-                    parts.append(text)
-                    total_chars += len(text)
-            elif btype == "tool_use":
-                # V52-N tool-agnostic: include the tool name + JSON-serialized
-                # input for EVERY tool_use block. tool name leaking into the
-                # accumulated text is fine per user direction ("if tool name
-                # ends up in the output it's ok"). Tool OUTPUTS
-                # (``toolUseResult`` or block type ``tool_result``) are not
-                # collected here -- they appear on subsequent user-type
-                # messages which we skip above.
-                tool_name = block.get("name", "")
-                tool_input = block.get("input", {})
-                try:
-                    input_serialized = _json.dumps(tool_input, default=str)
-                except Exception:
-                    input_serialized = str(tool_input)
-                snippet = f"{tool_name}: {input_serialized}"[:_RL_TOOL_CONTENT_LIMIT]
-                if snippet:
-                    parts.append(snippet)
-                    total_chars += len(snippet)
-            if total_chars >= threshold_chars:
-                return "".join(parts)[:threshold_chars], True
-
-    return "".join(parts), False
+    from claude_mcp_servers.rl_client.answer_window import extract_answer_window
+    return extract_answer_window(
+        messages,
+        start_msg_idx,
+        start_blk_idx,
+        threshold_tokens=_RL_MONITOR_ANSWER_THRESHOLD_TOKENS,
+        tool_content_limit=_RL_TOOL_CONTENT_LIMIT,
+    )
 
 
 async def _resolve_claude_session_dir(workspace_path: Path) -> "Path | None":
@@ -3757,120 +3727,17 @@ async def _rl_compute_and_write_citations(
     ``/rl_update`` after this returns; the two writes are independent
     (citation logging is unconditional; container training is Pro-tier
     + container-running gated).
+
+    v0.2.70: the compute core now lives in the shared module
+    ``claude_mcp_servers.rl_client.citation_compute`` so the in-MCP monitor AND
+    the Stop-hook drain (``scripts/rl_drain_citations.py``) use ONE home
+    (modularity ruling). This is a thin shim; the body is behaviour-equivalent
+    to the pre-extraction code (it mutates ``ctx`` in place with
+    ``cosine_sims_computed`` / ``literal_cited_computed`` and returns the same
+    ``{cosine_sims, literal_cited, cited}`` dict).
     """
-    nodes = ctx.get("nodes") or []
-    if not nodes:
-        return None
-
-    active_model = ctx.get("active_model") or EMBEDDING_MODEL
-
-    # --- Step 1: chunk + embed the answer ---
-    try:
-        chunker = Chunker.for_model(active_model)
-        chunks = chunker.chunk_text(answer, source_id=task_id)
-    except Exception as exc:
-        logger.debug("RL citation: chunker failed (%s)", exc)
-        return None
-    if not chunks:
-        return None
-
-    svc = _get_embedding_service()
-    if svc is None:
-        logger.debug("RL citation: no EmbeddingService available; skip")
-        return None
-
-    answer_chunk_embs: list[list[float]] = []
-    for chunk in chunks:
-        # Chunker.chunk_text returns objects whose `.content` is the chunk text
-        # (matches sync_knowledge_graph's downstream consumer).
-        text = getattr(chunk, "content", None) or (
-            chunk if isinstance(chunk, str) else None
-        )
-        if not text:
-            continue
-        try:
-            vec = svc.embed_text(text)
-        except Exception as exc:
-            logger.debug("RL citation: chunk embed failed (%s); continuing", exc)
-            continue
-        if vec:
-            answer_chunk_embs.append(vec)
-
-    if not answer_chunk_embs:
-        return None
-
-    # --- Step 2: per-node cosine_sims (max over answer chunks vs node.n_emb) ---
-    answer_lower = answer.lower()
-    cosine_sims: dict[str, float] = {}
-    literal_cited: dict[str, bool] = {}
-    for n in nodes:
-        if not isinstance(n, dict):
-            continue
-        title = n.get("title", "")
-        if not title:
-            continue
-        n_emb = n.get("n_emb") or n.get("emb")
-        if not n_emb:
-            # No vector to compare against — skip the cosine side but
-            # still try the literal-cited check (it doesn't need an emb).
-            literal_cited[title] = _rl_is_literal_cited(n, answer_lower)
-            continue
-        try:
-            best = max(_cosine(ac, n_emb) for ac in answer_chunk_embs)
-        except Exception:
-            continue
-        cosine_sims[title] = float(best)
-        literal_cited[title] = _rl_is_literal_cited(n, answer_lower)
-
-    if not cosine_sims and not literal_cited:
-        return None
-
-    # --- Step 3: unified-target formula -> binary cited dict ---
-    try:
-        from vco_lib.rl_training_targets import compute_unified_targets
-        _targets, cited = compute_unified_targets(
-            cosine_sims,
-            literal_cited=literal_cited,
-            cross_encoder_cited=None,
-        )
-    except Exception as exc:
-        logger.debug("RL citation: compute_unified_targets failed (%s)", exc)
-        return None
-
-    # --- Step 4: write the citation event via the centralized writer ---
-    try:
-        writer = _get_rl_telemetry_writer()
-        if writer is None:
-            return None
-        writer.log_citations(
-            task_id=task_id,
-            task_type=ctx.get("task_type") or "mcp_interactive",
-            citations={t: bool(v) for t, v in cited.items()},
-            cosine_sims=cosine_sims,
-            literal_cited=literal_cited,
-            cross_encoder_cited=None,
-        )
-    except Exception as exc:
-        logger.debug("RL citation: writer.log_citations failed (%s)", exc)
-        return None
-
-    # Stash computed values back on ctx so the monitor's downstream
-    # /rl_update POST can reuse them without re-embedding the answer.
-    ctx["cosine_sims_computed"] = cosine_sims
-    ctx["literal_cited_computed"] = literal_cited
-
-    logger.debug(
-        "RL citation %s: wrote %d cosine entries, %d literal-cited, %d cited",
-        task_id[:8],
-        len(cosine_sims),
-        sum(1 for v in literal_cited.values() if v),
-        sum(1 for v in cited.values() if v),
-    )
-    return {
-        "cosine_sims": cosine_sims,
-        "literal_cited": literal_cited,
-        "cited": cited,
-    }
+    from claude_mcp_servers.rl_client.citation_compute import compute_citation
+    return compute_citation(task_id, answer, ctx, write=True)
 
 
 def _rl_force_flush_sentinel_path() -> "Path":
@@ -3919,6 +3786,56 @@ def _rl_clear_force_flush() -> None:
         pass
 
 
+def _rl_human_turn_after(messages: list[dict], start_msg_idx: int) -> bool:
+    """F-B: True iff a human (user) turn appears after the KG search position.
+
+    The natural end of "this answer" is the first user turn following the
+    search tool_use. Used as the EARLIER-fire trigger so the monitor fires
+    promptly instead of polling for up to 60 min. Tool-result messages are
+    also ``type == "user"`` in the transcript, so we require a user message
+    that carries a plain ``text`` (or string) content block — a real human
+    turn, not a tool_result envelope.
+    """
+    for msg_idx in range(start_msg_idx + 1, len(messages)):
+        msg = messages[msg_idx]
+        if msg.get("type") != "user":
+            continue
+        content = msg.get("message", {}).get("content", [])
+        if isinstance(content, str) and content.strip():
+            return True
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, str) and block.strip():
+                    return True
+                if isinstance(block, dict) and block.get("type") == "text":
+                    if (block.get("text") or "").strip():
+                        return True
+    return False
+
+
+def _rl_delete_own_pending_file(task_id: str) -> None:
+    """F-QUEUE: delete THIS retrieval's pending file when the MCP monitor fires.
+
+    The MCP path stages a pending file (as a backstop) AND keeps in-memory ctx;
+    when the monitor fires successfully it deletes its own file so the Stop-hook
+    drain only processes survivors (orphans = monitor never fired → drain
+    recovers them). Soft-fail — a missing file is the common, fine case.
+    """
+    try:
+        from claude_mcp_servers.rl_client.citation_pending import (
+            list_pending_for_session,
+            delete_pending,
+        )
+        # We don't know the session_id here, so match by the task_id suffix
+        # across all pending files for the project (list with empty session
+        # returns all). Cheap — the pending dir is tiny.
+        for p in list_pending_for_session(""):
+            if p.name.endswith(f"__{task_id}.json"):
+                delete_pending(p)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("RL monitor: pending-file cleanup failed (%s)", exc)
+
+
 async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
     """
     Background asyncio task: poll the session transcript until Claude's answer
@@ -3934,8 +3851,22 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
       - Hard timeout ``_RL_MONITOR_TIMEOUT`` seconds (60 min safety valve,
         raised from 10 min pre-V52-N).
 
-    Note: human turns are no longer a stop condition (the V52-N rewrite of
-    ``_rl_extract_answer_window`` accumulates ACROSS human follow-ups).
+    v0.2.70 (F-B): two lifecycle fixes:
+      1. ``ctx`` is captured into THIS task's closure (``held_ctx``) on the
+         first poll where it is available in ``_rl_node_content_cache`` — so a
+         LATE fire no longer depends on the 256-entry process-global LRU still
+         holding ``task_id``. Pre-F-B the monitor popped the cache at fire time;
+         by then later traffic had evicted it (the cache aggregates across all
+         transcripts a single long-lived MCP subprocess serves), yielding
+         ``ctx=None`` and a silent skip. Holding it in the closure removes the
+         global-state coupling entirely.
+      2. An EARLIER fire is restored: once a NEW human turn appears after the
+         search (the natural end of THAT answer) AND the gate is met, the
+         monitor fires immediately rather than waiting up to 60 min — so it
+         fires well before eviction would ever have been a risk, even for the
+         closure-held ctx. (Accumulation across human turns is preserved for
+         the durable pending-queue path; this in-process trigger is the belt to
+         the queue's suspenders.)
 
     The `seq` value is the 1-based call counter for this MCP process; it maps to
     the (seq-1)'th KG search position in the transcript (0-based rank).
@@ -3950,9 +3881,22 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
     pos_idx = seq - 1  # 0-based index into kg_positions list
     query_snippet = query[:120]  # used to verify we're reading the right transcript
 
+    # F-B: hold the staged ctx in THIS task's closure so a late fire never
+    # depends on the LRU still holding task_id. Captured lazily on the first
+    # poll it's available (the populate runs just after the spawn).
+    held_ctx: "dict | None" = None
+
     # Phase 1 + 2 combined: find the right transcript and poll for completion
     while asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(_RL_MONITOR_POLL_INTERVAL)
+
+        # F-B: snapshot the ctx into the closure as soon as it's available.
+        # We do NOT pop here — the populate path manages the cache size; we
+        # only need a private reference that eviction can't strand.
+        if held_ctx is None:
+            _staged = _rl_node_content_cache.get(task_id)
+            if _staged is not None:
+                held_ctx = _staged
 
         # V52-N: check the compaction sentinel BEFORE scanning transcripts.
         # When set, we force-fire on whatever's accumulated regardless of
@@ -3975,27 +3919,13 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
             messages = _rl_load_messages(candidate)
             kg_positions = _rl_find_kg_positions(messages)
 
-            # Find matching position by query fingerprint, scanning newest-first.
-            # seq is used as a tiebreaker when the same query appears multiple times
-            # (parallel chats): prefer the occurrence whose index from the end equals
-            # (total_kg_calls_in_transcript - pos_idx - 1), i.e. the seq-th from the end.
-            # Primary key: query match. Fallback to last match if seq doesn't align.
-            matched_pos: "tuple[int,int] | None" = None
-            if query_snippet:
-                query_matches = []
-                for i, (mi, bi) in enumerate(kg_positions):
-                    msg = messages[mi]
-                    blk = msg.get("message", {}).get("content", [])[bi]
-                    blk_query = blk.get("input", {}).get("query", "") if isinstance(blk, dict) else ""
-                    if query_snippet in blk_query or blk_query in query_snippet:
-                        query_matches.append((i, mi, bi))
-                if query_matches:
-                    # seq-based tiebreak: prefer match whose absolute index == pos_idx
-                    exact = [(i, mi, bi) for (i, mi, bi) in query_matches if i == pos_idx]
-                    best = exact[0] if exact else query_matches[-1]  # fall back to last match
-                    matched_pos = (best[1], best[2])
-            elif pos_idx < len(kg_positions):
-                matched_pos = kg_positions[pos_idx]
+            # Find matching position by query fingerprint + seq tiebreak.
+            # v0.2.70 (S2): the matcher lives in rl_client.answer_window so the
+            # MCP monitor and the Stop-hook drain agree byte-for-byte on which
+            # answer window belongs to which retrieval (one home).
+            matched_pos = _match_position_for_query(
+                messages, kg_positions, query_snippet, pos_idx
+            )
 
             if matched_pos is None:
                 continue
@@ -4003,15 +3933,36 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
             start_msg_idx, start_blk_idx = matched_pos
             # Right transcript — check if answer is complete
             answer, complete = _rl_extract_answer_window(messages, start_msg_idx, start_blk_idx)
+            fire_reason = "threshold" if complete else ""
             # V52-N: the sentinel forces fire even when the extractor returned
             # complete=False (i.e. we haven't accumulated enough yet but compaction
             # is about to happen and we'd lose access to the transcript).
             if force_flush and answer.strip():
                 complete = True
+                fire_reason = "force_flush"
                 logger.debug(
                     "RL monitor %s: force-flush sentinel detected; firing with %d chars accumulated",
                     task_id[:8], len(answer),
                 )
+            # F-B: earlier fire on a new human turn after the search. The
+            # natural end of THIS answer is the first human turn following the
+            # KG call; firing there (rather than waiting up to 60 min) makes the
+            # monitor fire promptly. Gated on the same token floor as the
+            # threshold path so we don't fire on a noisy preamble.
+            if not complete and answer.strip():
+                if _rl_human_turn_after(messages, start_msg_idx):
+                    try:
+                        from claude_mcp_servers.weaviate_mcp.chunking import TokenCounter
+                        _tok = TokenCounter.count_tokens(answer)
+                    except Exception:
+                        _tok = len(answer) // 4
+                    if _tok >= _RL_MIN_ANSWER_TOKENS_FOR_CITATION:
+                        complete = True
+                        fire_reason = "human_turn"
+                        logger.debug(
+                            "RL monitor %s: human-turn fire (%d tokens accumulated)",
+                            task_id[:8], _tok,
+                        )
             if complete and answer.strip():
                 # v0.2.47 RL-7: MCP-side citation write (replaces the
                 # pre-v0.2.47 container-coupled write path that silently
@@ -4039,12 +3990,23 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
                 except Exception:
                     answer_token_count = len(answer) // 4
 
-                # Pop the per-task cache once; the citation-write path
-                # consumes ``nodes`` + ``query_emb`` and stashes computed
-                # ``cosine_sims`` / ``literal_cited`` back on the dict for
-                # the downstream /rl_update POST to reuse without
-                # re-embedding.
-                ctx = _rl_node_content_cache.pop(task_id, None)
+                # F-B: use the closure-held ctx (captured on an earlier poll)
+                # so a late fire is not stranded by LRU eviction. Fall back to
+                # the cache for the (rare) case the very first poll already had
+                # a complete answer. We still pop the cache to free the slot.
+                ctx = held_ctx or _rl_node_content_cache.get(task_id)
+                _rl_node_content_cache.pop(task_id, None)
+                # F-QUEUE: the MCP monitor deletes its OWN pending file on fire
+                # so the Stop-hook drain only processes survivors (no double
+                # write). Soft-fail — a missing file is fine.
+                _rl_delete_own_pending_file(task_id)
+                # F-LOG: persist answer-window length + the fire reason so the
+                # "≥25k tokens" distribution and monitor lifecycle are auditable
+                # from stored data (pre-F-LOG both were un-observable).
+                logger.info(
+                    "RL monitor %s: fire reason=%s window_tokens=%d window_chars=%d",
+                    task_id[:8], fire_reason, answer_token_count, len(answer),
+                )
                 citation_result: "dict | None" = None
                 if answer_token_count >= _RL_MIN_ANSWER_TOKENS_FOR_CITATION:
                     if ctx is not None:
@@ -4057,6 +4019,14 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
                                 "RL monitor %s: citation write raised (%s); continuing",
                                 task_id[:8], exc,
                             )
+                    else:
+                        # F-B observability: ctx genuinely unavailable (never
+                        # staged) — make the skip visible instead of silent.
+                        logger.info(
+                            "RL monitor %s: gate met but ctx unavailable; "
+                            "citation deferred to Stop-hook drain",
+                            task_id[:8],
+                        )
                 else:
                     logger.debug(
                         "RL monitor %s: answer too short (%d tokens < %d); skip citation",
@@ -4180,8 +4150,21 @@ def _get_rl_client():
     the client lives in "disabled mode" and every call returns the
     no-rerank fallback without touching the network.
     """
-    # Re-read the env value on every call so a flip is caught immediately.
-    current_embedding = os.getenv("ACTIVE_EMBEDDING", "qwen3") or "qwen3"
+    # F-ENV (v0.2.70): resolve the active embedding the rerank request will be
+    # tagged with. The container pins itself to ONE embedding tag and returns a
+    # 409 ``active_embedding_mismatch`` when a request carries a different tag
+    # (the audited ``qwen3`` vs ``legacy`` source mismatch). The module-level
+    # ``ACTIVE_EMBEDDING`` is the HUB-RESOLVED value (via ``_config_field`` —
+    # reflects the per-project Identity-tab selection); a bare
+    # ``os.getenv("ACTIVE_EMBEDDING")`` ignores the hub resolution and can send
+    # a stale tag that the container rejects. Prefer the resolved constant; fall
+    # back to the live env (mid-session flips set the env), then to "qwen3".
+    # The readiness-GATE that consumes this is module-side (NOT this code).
+    current_embedding = (
+        os.getenv("ACTIVE_EMBEDDING")
+        or (ACTIVE_EMBEDDING if "ACTIVE_EMBEDDING" in globals() else "")
+        or "qwen3"
+    )
 
     # v0.2.49: resolve the project_id from the cached ProjectConfig.
     # Soft-fail: on any resolver exception (hub unreachable / malformed
@@ -4294,23 +4277,41 @@ def _extract_obj_vector(obj, target_name: str = "") -> list[float] | None:
     uses named vectors (the orchestrator's default — see e.g.
     `qwen3_embed`, `codesage_embed`) and an unwrapped list otherwise.
     Returns None when no vector is attached (e.g. the caller forgot
-    ``include_vector=True``, or the slot doesn't exist).
+    ``include_vector=True``, or the requested slot doesn't exist).
 
     Used by hybrid_search + semantic_graph_search to attach `emb`
     to candidate dicts before they flow into log_retrieval (v0.2.31
     telemetry audit fix — Item 2.4).
+
+    F-D (v0.2.70): when a ``target_name`` (the active named-vector slot,
+    e.g. ``qwen3_embed``) is supplied, pull ONLY that slot. The pre-F-D
+    body fell back to "first non-empty slot" when the requested slot was
+    missing — which can pull a FOREIGN embedding space (e.g. a legacy
+    ``ollama_embed``/arctic slot when the active model is qwen3, or a
+    2048-dim codesage slot vs a 1024-dim query). Downstream ``_cosine``
+    now refuses cross-dim comparisons, but the right fix is at the source:
+    never hand back a vector from a slot the caller did not ask for.
+    Returning None for a missing active slot is correct — the node simply
+    has no comparable vector for this model, exactly like a node fetched
+    without ``include_vector``. The first-slot fallback is retained ONLY
+    for the slot-agnostic case (``target_name`` empty, e.g. legacy
+    single-vector collections), where there is no active-slot ambiguity.
     """
     try:
         vec = getattr(obj, "vector", None)
         if vec is None:
             return None
         if isinstance(vec, dict):
-            if target_name and target_name in vec:
-                v = vec[target_name]
+            if target_name:
+                # Active slot requested — pull ONLY that slot. A missing
+                # active slot means "no comparable vector for this model"
+                # (F-D: do NOT fall back to a foreign slot).
+                v = vec.get(target_name)
             else:
-                # No target / target missing — pick the first non-empty
-                # slot. Multi-vector collections only have one populated
-                # slot at retrieval time anyway.
+                # Slot-agnostic caller (legacy single-vector mode): no
+                # active-slot ambiguity, so the first non-empty slot is the
+                # node's only vector. Multi-vector collections always pass a
+                # target_name, so this branch never crosses embedding spaces.
                 v = next((val for val in vec.values() if val), None)
         else:
             v = vec
@@ -4325,7 +4326,18 @@ def _extract_obj_vector(obj, target_name: str = "") -> list[float] | None:
 
 def _cosine(a, b) -> float:
     """Cosine similarity between two vectors. Returns 0.0 if either is
-    zero-norm, mismatched-length, or non-iterable.
+    zero-norm, **mismatched-length**, or non-iterable.
+
+    F-D (v0.2.70): REFUSES on a dimension mismatch (``len(a) != len(b)``)
+    by returning 0.0, making the docstring's long-standing claim true. The
+    pre-F-D body did ``n = min(len(a), len(b))`` and computed cosine over
+    the truncated overlap, which returns a *plausible* (~0.75) value for a
+    1024-vs-2048 cross-model comparison — silently passing the 0.6 citation
+    gate with garbage. The maintainer invariant is: never compare
+    cross-model vectors; a length mismatch means the two embeddings live in
+    different spaces (e.g. qwen3 1024 vs codesage 2048, or a node stored
+    under a legacy slot vs an answer embedded with the active model), and
+    the only correct answer is "no comparable signal" → 0.0.
 
     Pure-python — no numpy dep — so this stays usable in lean installs
     where numpy isn't pulled in transitively. Telemetry callsites
@@ -4335,7 +4347,11 @@ def _cosine(a, b) -> float:
     try:
         if not a or not b:
             return 0.0
-        n = min(len(a), len(b))
+        # F-D: refuse on dimension mismatch instead of truncating. Different
+        # lengths ⇒ different embedding spaces ⇒ no meaningful cosine.
+        if len(a) != len(b):
+            return 0.0
+        n = len(a)
         if n == 0:
             return 0.0
         dot = 0.0
@@ -4592,12 +4608,141 @@ def _rl_pack_linked_embs_for_node(
     return packed_embs, packed_types
 
 
+def _rl_regenerate_node_vector(text: str, model_name: str) -> "list[float] | None":
+    """F-G (v0.2.70, CORRECTED): regenerate a node's embedding from its TEXT.
+
+    Thin shim to the shared ``rl_client.embed_regen.regenerate_node_vector`` so
+    the MCP enrich path AND the hook enrich path share ONE copy of this logic
+    (modularity ruling). Passes the MCP's cached EmbeddingService so the
+    regenerated vector lives in the active model's space (F-D invariant). See
+    that module for the full rationale.
+    """
+    from claude_mcp_servers.rl_client.embed_regen import regenerate_node_vector
+    return regenerate_node_vector(
+        text, model_name, embedding_service=_get_embedding_service()
+    )
+
+
+def _rl_refetch_node_vector(
+    node: dict,
+    sibling_objs_by_source_id: dict[str, list],
+    link_objs_by_title: dict[str, object],
+    target_vector_name: str,
+    *,
+    model_name: str = "",
+) -> "list[float] | None":
+    """F-G (v0.2.70): recover a node's own active-slot vector for citation cosine.
+
+    Used by ``_rl_enrich_nodes_with_linked_embs`` ONLY when the node has no
+    ``emb`` already attached (the dominant ~96%-absent case: hook-path nodes
+    that never ran search-time emb enrichment, and collapse-survivors whose
+    winning chunk was keyword-only / an adjacent chunk). Pulls a representative
+    chunk's vector from the SAME ``include_vector=True`` fetch_objects the
+    enrich pass already issued — no extra Weaviate roundtrip.
+
+    Selection order (deterministic):
+      1. The sibling under the node's source_id whose ``chunk_num`` equals the
+         node's matched ``chunk_number`` (the exact matched chunk = the truest
+         n_emb). Single-chunk nodes (chunk_num=1, total_chunks=1) match here.
+      2. Any first sibling under the source_id with a non-empty active-slot
+         vector (covers legacy ``chunk_num=0``/absent storage — the maintainer's
+         single-chunk-bookkeeping concern: treat absent/0/1 as a valid node,
+         never skip).
+      3. The title-keyed link object's vector (last resort, when the
+         source_id index missed but the title fetch hit).
+      4. F-G CORRECTED: REGENERATE the vector from the node's chunk TEXT (the
+         fetched object's ``content``) using the active model, so cosine is
+         ALWAYS computable for a node whose text we have. Only when this also
+         fails (no text / embed service down) does the caller drop the node.
+
+    Pulls ONLY ``target_vector_name`` via ``_extract_obj_vector`` so a recovered
+    vector can never come from a foreign embedding space (F-D invariant).
+    Returns the vector list, or None when no comparable vector exists.
+    """
+    source_id = (
+        node.get("source_id")
+        or node.get("source_node_id")
+        or node.get("title")
+        or ""
+    )
+    matched_chunk = node.get("chunk_number")
+    siblings = sibling_objs_by_source_id.get(source_id) or [] if source_id else []
+
+    # 1. Exact matched chunk.
+    if matched_chunk is not None:
+        for sib in siblings:
+            try:
+                if sib.properties.get("chunk_num") == matched_chunk:
+                    vec = _extract_obj_vector(sib, target_vector_name)
+                    if vec:
+                        return vec
+            except (AttributeError, KeyError, TypeError):
+                continue
+
+    # 2. Any sibling with a vector (covers absent/0 chunk_num — single-chunk
+    #    nodes must be non-blocking; never gate on chunk metadata being >1).
+    for sib in siblings:
+        vec = _extract_obj_vector(sib, target_vector_name)
+        if vec:
+            return vec
+
+    # 3. Title-keyed link object fallback.
+    title = node.get("title") or ""
+    if title:
+        link_obj = link_objs_by_title.get(str(title))
+        if link_obj is not None:
+            vec = _extract_obj_vector(link_obj, target_vector_name)
+            if vec:
+                return vec
+
+    # 4. F-G CORRECTED — regenerate from text so cosine is ALWAYS computable.
+    # Prefer the fetched object's full ``content`` (matches the stored chunk
+    # text), preferring the matched chunk; fall back to the node dict's content.
+    regen_text = ""
+    for sib in siblings:
+        try:
+            if matched_chunk is not None and sib.properties.get("chunk_num") == matched_chunk:
+                regen_text = sib.properties.get("content") or ""
+                if regen_text:
+                    break
+        except (AttributeError, KeyError, TypeError):
+            continue
+    if not regen_text:
+        for sib in siblings:
+            try:
+                regen_text = sib.properties.get("content") or ""
+            except (AttributeError, KeyError, TypeError):
+                regen_text = ""
+            if regen_text:
+                break
+    if not regen_text and title:
+        link_obj = link_objs_by_title.get(str(title))
+        if link_obj is not None:
+            try:
+                regen_text = link_obj.properties.get("content") or ""
+            except (AttributeError, KeyError, TypeError):
+                regen_text = ""
+    if not regen_text:
+        regen_text = node.get("content") or ""
+    if regen_text and model_name:
+        regen = _rl_regenerate_node_vector(regen_text, model_name)
+        if regen:
+            logger.info(
+                "RL refetch: regenerated embedding from text for node %r "
+                "(stored vector unavailable)",
+                (title or source_id)[:60],
+            )
+            return regen
+    return None
+
+
 def _rl_enrich_nodes_with_linked_embs(
     nodes: list[dict],
     query_emb: "list[float] | None",
     active_slot: str,
     *,
     coll_resolver=None,
+    model_name: str = "",
 ) -> None:
     """Attach v3 training fields to each node in-place.
 
@@ -4792,6 +4937,33 @@ def _rl_enrich_nodes_with_linked_embs(
 
             # n_emb: prefer the existing emb (already on the dict from search).
             n_emb = n.get("emb")
+
+            # F-G (v0.2.70): when `emb` is absent — the dominant case on the
+            # hook path (rl_kg_search.py never runs the search-time emb
+            # enrichment) and on any node whose collapse-winning chunk was a
+            # keyword-only / adjacent chunk — RE-PULL the matched node's own
+            # active-slot vector from THIS collection's already-fetched objects
+            # (the same include_vector=True fetch_objects above that built the
+            # sibling/link indices). Deep-bugsweep BUG #2 measured n_emb absent
+            # on ~96% of retrievals, which makes cosine citations structurally
+            # impossible no matter how the lifecycle (F-A/B) is fixed. Pulling
+            # the vector here, at citation-cache populate time, closes that gap
+            # without an extra Weaviate roundtrip.
+            #
+            # Match a representative chunk for the node: prefer the matched
+            # chunk_number, else the first sibling under the node's source_id,
+            # else (no source_id index hit) the title-keyed link object. The
+            # vector comes from the SAME active_slot the answer will be embedded
+            # with — never a foreign slot (F-D invariant via _extract_obj_vector).
+            if not n_emb:
+                refetched = _rl_refetch_node_vector(
+                    n, sibling_objs_by_source_id, link_objs_by_title, active_slot,
+                    model_name=model_name or EMBEDDING_MODEL,
+                )
+                if refetched:
+                    n_emb = refetched
+                    n["emb"] = refetched  # mirror so _build_log_nodes carries it
+
             if n_emb:
                 n["n_emb"] = n_emb
 
@@ -5366,6 +5538,7 @@ async def _semantic_graph_search_body(
             all_formatted,
             query_emb=query_vector,
             active_slot=query_target,
+            model_name=EMBEDDING_MODEL,
         )
     except Exception as exc:
         logger.debug(
@@ -6071,6 +6244,7 @@ async def _hybrid_search_body(
             all_results,
             query_emb=query_vector,
             active_slot=query_target,
+            model_name=EMBEDDING_MODEL,
         )
     except Exception as exc:
         logger.debug("hybrid_search: RL enrich failed (%s); proceeding without linked_embs", exc)

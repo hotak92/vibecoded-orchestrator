@@ -167,6 +167,51 @@ if (Get-Command Get-VcoCommandNoiseStripped -ErrorAction SilentlyContinue) {
 }
 if (-not $Query) { $Query = $QueryRaw }
 
+# === F-LOG (v0.2.70): emit the pre_bash pairing event ===
+# OS-PARITY: mirrors the .sh sibling. pre_bash was declared but never written
+# (only the state file was), so the (pre_bash, bash_outcome) pairs were
+# unconstructable. Emit it with the SAME task_id post-bash reuses. Query passed
+# via env so quotes/newlines can't break the python source. Soft-fail.
+if ($VenvPy -and (Test-Path $VenvPy)) {
+    $QuerySnippet = if ($Command.Length -gt 120) { $Command.Substring(0, 120) } else { $Command }
+    $env:VCT_PREBASH_QUERY = $QuerySnippet
+    $env:VCT_PREBASH_TASK_ID = $TaskId
+    $env:VCT_PREBASH_CMD_LEN = [string]$CmdLen
+    $env:VCT_PREBASH_TS_MS = [string]$StartTsMs
+    $env:VCT_PREBASH_SESSION = $SessionId
+    $preBashPy = @"
+import os
+try:
+    from vco_lib.project_config import resolve_for_project
+    cfg = resolve_for_project(os.environ.get('CLAUDE_PROJECT_DIR', ''))
+    project_id = cfg.get('project_id') if isinstance(cfg, dict) else None
+except Exception:
+    project_id = None
+def _int(name):
+    try:
+        return int(os.environ.get(name, '0') or '0')
+    except (TypeError, ValueError):
+        return 0
+try:
+    from claude_mcp_servers.rl_client.outcome_emit import emit_outcome_event
+    emit_outcome_event(
+        event_type='pre_bash',
+        task_id=os.environ.get('VCT_PREBASH_TASK_ID', ''),
+        task_type='pre_bash',
+        payload={
+            'cmd_len': _int('VCT_PREBASH_CMD_LEN'),
+            'query': os.environ.get('VCT_PREBASH_QUERY', ''),
+            'ts_ms': _int('VCT_PREBASH_TS_MS'),
+        },
+        session_id=os.environ.get('VCT_PREBASH_SESSION', ''),
+        project_id=project_id,
+    )
+except Exception:
+    pass
+"@
+    try { & $VenvPy -c $preBashPy *> $null } catch { }
+}
+
 $KgTmp = New-TemporaryFile
 $RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_kg_search.py"
 if ($VenvPy -and (Test-Path $VenvPy) -and (Test-Path $RlScript)) {

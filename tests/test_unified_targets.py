@@ -311,6 +311,69 @@ class TestReproducibilityContract:
 
 
 # ----------------------------------------------------------------------
+# 6b. F-C (v0.2.70, CORRECTED) — a node with NO cosine entry is DROPPED,
+#     never fabricated. The disease is the MISSING EMBEDDING (cured at the
+#     F-G layer by always attaching/regenerating the node vector so cosine is
+#     always computable). The formula must NOT manufacture a target for a
+#     no-cosine node — a 0.4-floor / mean-inheritance poisons training data
+#     (a no-signal node enters the map; a true literal-only node in a weak
+#     population is under-cited). This class is the regression guard against
+#     re-introducing that floor: it pins main's exact drop-on-no-cosine
+#     behaviour. See knowledge node
+#     rl-citation-always-attach-or-regenerate-embedding-2026-06-27.
+# ----------------------------------------------------------------------
+
+
+class TestFCNoCosineNodeIsDropped:
+    """A node absent from cosine_sims gets NO target — never fabricated."""
+
+    def test_no_cosine_population_returns_empty(self) -> None:
+        # Empty cosine_sims → empty output, regardless of literal/cross flags.
+        # The literal-only node must NOT be fabricated to cited.
+        assert compute_unified_targets({}, literal_cited={"Q": True}) == ({}, {})
+        assert compute_unified_targets({}, cross_encoder_cited={"Q": True}) == ({}, {})
+        assert compute_unified_targets({}, {}, {}) == ({}, {})
+        assert compute_unified_targets({}, None, None) == ({}, {})
+
+    def test_literal_only_node_with_no_cosine_is_absent_from_output(self) -> None:
+        # A literal-cited node B with NO cosine entry must NOT appear in the
+        # output — only the cosine-scored node A does. (Pre-F-G the fix is to
+        # ensure B always HAS a cosine via embedding regeneration; the formula
+        # itself never invents one.)
+        targets, cited = compute_unified_targets(
+            {"A": 0.8}, literal_cited={"B": True}
+        )
+        assert set(targets) == {"A"}
+        assert "B" not in targets
+        assert "B" not in cited
+
+    def test_no_signal_node_is_not_poisoned_into_output(self) -> None:
+        # REGRESSION (reviewer blocker B1): a node with no cosine AND a False
+        # literal flag must NOT enter the target map with a manufactured base.
+        targets, cited = compute_unified_targets({}, literal_cited={"X": False})
+        assert targets == {}
+        assert cited == {}
+
+    def test_present_cosine_path_byte_identical_to_main(self) -> None:
+        # The common path (every node has a cosine entry) is unchanged.
+        sims = {"A": 0.20, "B": 0.45, "C": 0.55, "D": 0.70, "E": 0.85}
+        targets, cited = compute_unified_targets(sims)
+        assert math.isclose(targets["A"], 0.20, abs_tol=1e-9)
+        assert math.isclose(targets["E"], 0.95, abs_tol=1e-9)
+        assert cited["D"] is True
+
+    def test_literal_cited_node_that_HAS_cosine_still_boosted(self) -> None:
+        # The literal bonus still applies — for nodes that HAVE a cosine score
+        # (which, post-F-G, is every node whose text we have). Mid-cosine +
+        # literal crosses the threshold.
+        targets, cited = compute_unified_targets(
+            {"X": 0.3}, literal_cited={"X": True}
+        )
+        assert "X" in targets
+        assert cited["X"] is True
+
+
+# ----------------------------------------------------------------------
 # 7. Type contract.
 # ----------------------------------------------------------------------
 

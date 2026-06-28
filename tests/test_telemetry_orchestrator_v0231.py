@@ -423,11 +423,17 @@ class CosineHelperTest(unittest.TestCase):
         # Non-numeric → caught by try/except, returns 0.0
         self.assertEqual(_cosine(["bad"], [1.0]), 0.0)
 
-    def test_cosine_mismatched_length_truncates(self):
+    def test_cosine_mismatched_length_refuses(self):
+        # F-D (v0.2.70): mismatched lengths mean different embedding spaces
+        # (e.g. 1024-dim qwen3 vs 2048-dim codesage). The pre-F-D body
+        # truncated to min(len) and returned a plausible value (~0.75 for a
+        # cross-model pair), silently passing the 0.6 citation gate with
+        # garbage. It now REFUSES — returns 0.0 — making the docstring true.
         from claude_mcp_servers.weaviate_mcp.server import _cosine
-        # min(len(a), len(b)) — truncates safely; doesn't raise.
-        val = _cosine([1.0, 0.0, 0.0], [1.0, 0.0])
-        self.assertAlmostEqual(val, 1.0, places=6)
+        self.assertEqual(_cosine([1.0, 0.0, 0.0], [1.0, 0.0]), 0.0)
+        self.assertEqual(_cosine([1.0] * 1024, [1.0] * 2048), 0.0)
+        # Same-length comparison still works.
+        self.assertAlmostEqual(_cosine([1.0, 0.0], [1.0, 0.0]), 1.0, places=6)
 
 
 class ExtractObjVectorTest(unittest.TestCase):
@@ -442,14 +448,29 @@ class ExtractObjVectorTest(unittest.TestCase):
         result = _extract_obj_vector(_Obj(), "qwen3_embed")
         self.assertEqual(result, [0.1, 0.2])
 
-    def test_dict_missing_target_picks_first(self):
+    def test_dict_missing_target_refuses(self):
+        # F-D (v0.2.70): asking for an absent active slot returns None — it
+        # must NOT fall back to "first non-empty slot", which can pull a
+        # FOREIGN embedding space (e.g. a legacy ollama/arctic slot when the
+        # active model is qwen3). A missing active slot = "no comparable
+        # vector for this model".
         from claude_mcp_servers.weaviate_mcp.server import _extract_obj_vector
 
         class _Obj:
-            vector = {"qwen3_embed": [0.1, 0.2]}
+            vector = {"ollama_embed": [0.1, 0.2]}  # foreign slot only
 
-        # Asking for non-existent target → first non-empty slot wins.
-        result = _extract_obj_vector(_Obj(), "missing_slot")
+        result = _extract_obj_vector(_Obj(), "qwen3_embed")
+        self.assertIsNone(result)
+
+    def test_dict_no_target_picks_first_slot_agnostic(self):
+        # Slot-agnostic caller (target_name="") — legacy single-vector mode,
+        # no active-slot ambiguity, so the first non-empty slot is correct.
+        from claude_mcp_servers.weaviate_mcp.server import _extract_obj_vector
+
+        class _Obj:
+            vector = {"default": [0.1, 0.2]}
+
+        result = _extract_obj_vector(_Obj(), "")
         self.assertEqual(result, [0.1, 0.2])
 
     def test_unwrapped_list(self):
