@@ -266,7 +266,23 @@ KNOWLEDGE_ROOT = PROJECT_ROOT / "knowledge"
 # v0.2.21 Step 18: name resolved alongside COLLECTION_NAME via the hub
 # (_resolve_collections above); env-fallback preserved.
 DEV_COLLECTION_NAME = _RESOLVED_DEV_COLLECTION
-DOCS_ROOT = PROJECT_ROOT / "docs"
+
+# v0.2.70 FIX #6 (enhancement): the dev-docs root defaults to ``docs/`` but
+# can be overridden via the ``DEV_DOCS_ROOT`` env var for projects that keep
+# their documentation under a different folder (e.g. ``documentation/``). The
+# value may be a bare subdirectory name (joined under PROJECT_ROOT) or an
+# absolute path. Empty / unset → the historical ``docs/`` default, so existing
+# projects are unaffected.
+_dev_docs_root_env = os.getenv("DEV_DOCS_ROOT", "").strip()
+if _dev_docs_root_env:
+    _dev_docs_candidate = Path(_dev_docs_root_env)
+    DOCS_ROOT = (
+        _dev_docs_candidate
+        if _dev_docs_candidate.is_absolute()
+        else PROJECT_ROOT / _dev_docs_candidate
+    )
+else:
+    DOCS_ROOT = PROJECT_ROOT / "docs"
 
 # v0.2.18: named-vector slot is resolved per-instance from
 # `EmbeddingService.text_vector_slot` (see WeaviateWrapper below). The
@@ -1205,11 +1221,14 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
         archived, reason = _is_archived_node(file_path)
         if archived:
             print(f"⊘ Skipping archived doc: {reason}")
+            # v0.2.70 FIX #1: delete by file_path (unique), NOT by title — a
+            # title-scoped delete here removed any active doc sharing this
+            # archived doc's synthesized title during a --all docs run.
             try:
-                title = _doc_title_from_file(
-                    file_path, file_path.read_text(encoding="utf-8")
-                )
-                _delete_doc_by_title(server, title)
+                fp_value = _relative_file_path(file_path)
+                removed = _delete_doc_by_file_path(server, fp_value)
+                if removed:
+                    print(f"  ↳ Removed {removed} prior dev entry(ies) for '{fp_value}'")
             except Exception as e:
                 print(f"  ↳ Could not remove prior dev entry: {e}")
             return True
@@ -1428,14 +1447,20 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
         return False
 
 
-def _delete_doc_by_title(server: WeaviateMCPServer, title: str) -> int:
-    """Mirror of _delete_node_by_title for the dev collection."""
+def _delete_doc_by_file_path(server: WeaviateMCPServer, file_path_value: str) -> int:
+    """File_path-scoped dev-collection cleanup (v0.2.70 FIX #1).
+
+    Mirror of :func:`_delete_node_by_file_path` for the development
+    collection. ``file_path`` is unique per doc, so this never collides
+    with an active sibling the way the title-scoped delete did.
+    """
     if not DEV_COLLECTION_NAME:
         return 0
     try:
         coll = server.client.collections.get(DEV_COLLECTION_NAME)
         existing = coll.query.fetch_objects(
-            filters=Filter.by_property("title").equal(title), limit=100
+            filters=Filter.by_property("file_path").equal(file_path_value),
+            limit=100,
         )
         n = 0
         for obj in existing.objects:
@@ -1578,45 +1603,44 @@ def resolve_wikilinks_to_uuids(server: WeaviateMCPServer, wikilinks: List[str]) 
         return []
 
 
-def _frontmatter_title(file_path: Path) -> str | None:
-    """Cheap title extractor for archived files we don't want to fully parse.
+def _relative_file_path(file_path: Path) -> str:
+    """Return the project-relative file_path string used as a node's
+    Weaviate dedup key.
 
-    Reads only the YAML frontmatter `title:` line. Returns None on any error.
-    Used to look up Weaviate entries to delete when a previously-synced node
-    is archived (moved to `archive/` or marked `status: archived`).
+    MUST match the value stored in the ``file_path`` property by
+    ``parse_markdown_node`` / ``parse_doc_file`` (``str(file_path.
+    relative_to(PROJECT_ROOT))``) so a delete-by-file_path query hits the
+    exact rows written for this file. Falls back to ``str(file_path)`` when
+    the path isn't under PROJECT_ROOT (defensive — should not happen for
+    files discovered under KNOWLEDGE_ROOT / DOCS_ROOT, but a symlinked or
+    out-of-tree path shouldn't crash the cleanup).
     """
     try:
-        with file_path.open("r", encoding="utf-8") as f:
-            head = f.read(2048)
-    except OSError:
-        return None
-    if not head.startswith("---"):
-        return None
-    try:
-        # Stop at the closing '---' of the frontmatter block
-        end = head.find("\n---", 4)
-        if end < 0:
-            return None
-        block = head[4:end]
-        for line in block.splitlines():
-            if line.startswith("title:"):
-                return line.split(":", 1)[1].strip().strip('"\'')
-    except Exception:
-        return None
-    return None
+        return str(file_path.relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(file_path)
 
 
-def _delete_node_by_title(server: WeaviateMCPServer, title: str) -> int:
-    """Remove all Weaviate entries (incl. chunks) matching the given title.
+def _delete_node_by_file_path(server: WeaviateMCPServer, file_path_value: str) -> int:
+    """Remove all Weaviate entries (incl. chunks) for a specific file_path.
 
-    Used when an archived node should disappear from search. Returns the
-    number of objects deleted. Silent (returns 0) if the collection is
-    missing or the connection is down — sync should not block on cleanup.
+    v0.2.70 FIX #1 (silent batch data loss): the archived-node cleanup
+    previously deleted by ``title``. During a ``--all`` run, an archived node
+    sharing its ``title`` with a DIFFERENT active node would delete the active
+    node's rows too — so the active node silently vanished while ``sync_node``
+    still returned True (counted as a success). ``file_path`` is unique per
+    node, so scoping the cleanup to it removes only the archived file's own
+    rows and never collides with an active sibling.
+
+    Returns the number of objects deleted. Silent (returns 0) when the
+    collection is missing or the connection is down — sync must not block
+    on best-effort cleanup.
     """
     try:
         coll = server.client.collections.get(COLLECTION_NAME)
         existing = coll.query.fetch_objects(
-            filters=Filter.by_property("title").equal(title), limit=100
+            filters=Filter.by_property("file_path").equal(file_path_value),
+            limit=100,
         )
         n = 0
         for obj in existing.objects:
@@ -1632,7 +1656,8 @@ def _is_archived_node(file_path: Path, frontmatter: dict | None = None) -> tuple
 
     Returns (is_archived, reason). A node is archived if either:
       - its filesystem path contains an `archive/` segment (knowledge/archive/...
-        or any docs subtree), OR
+        or any docs subtree), including the dot/underscore-prefixed
+        conventions `.archive/` and `_archive/`, OR
       - its frontmatter `status` is `"archived"`, `"deprecated"`, or
         `"superseded"`.
 
@@ -1644,6 +1669,13 @@ def _is_archived_node(file_path: Path, frontmatter: dict | None = None) -> tuple
     `WD14_Tag_Rotation_Strategy`. Authors who write `status: superseded` mean
     "should disappear from KG queries"; honour that.
 
+    v0.2.70 FIX #5: the path leg previously matched only the exact segment
+    ``"archive"``. The widely-used dot/underscore variants ``.archive`` and
+    ``_archive`` (Obsidian's hidden-folder convention; common ``_archive/``
+    layouts) slipped through and got indexed. We now match those three exact
+    segment forms. We deliberately do NOT do a substring match — that would
+    wrongly skip legitimate dirs like ``architecture/`` or ``archived-specs/``.
+
     Archived nodes are kept on disk (so future-anyone can grep / read history)
     but skipped on Weaviate sync — they shouldn't return from KG queries.
     The `_stale_filter()` at query time provides a second layer (in case an
@@ -1652,8 +1684,12 @@ def _is_archived_node(file_path: Path, frontmatter: dict | None = None) -> tuple
     avoids paying embedding cost for content that won't surface.
     """
     parts = file_path.parts
-    if "archive" in parts:
-        return True, f"path contains 'archive/' segment ({file_path})"
+    # Exact segment match for `archive`, `.archive`, `_archive` — NOT a
+    # substring match (would catch `architecture/`, `archived-notes/`).
+    _ARCHIVE_DIR_SEGMENTS = {"archive", ".archive", "_archive"}
+    archive_hit = next((p for p in parts if p in _ARCHIVE_DIR_SEGMENTS), None)
+    if archive_hit is not None:
+        return True, f"path contains {archive_hit!r} segment ({file_path})"
     if frontmatter is not None:
         status = (frontmatter.get("status") or "").strip().lower()
         if status in ("archived", "deprecated", "superseded"):
@@ -1754,11 +1790,14 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
             print(f"⊘ Skipping archived node: {reason}")
             # If it was previously synced (archived after sync), drop it
             # from Weaviate so stale content stops surfacing.
+            # v0.2.70 FIX #1: delete by file_path (unique per node), NOT by
+            # title — a title-scoped delete here silently removed any active
+            # sibling sharing this archived node's title during a --all run.
             try:
-                title = _frontmatter_title(file_path)
-                if title:
-                    _delete_node_by_title(server, title)
-                    print(f"  ↳ Removed prior Weaviate entry for '{title}'")
+                fp_value = _relative_file_path(file_path)
+                removed = _delete_node_by_file_path(server, fp_value)
+                if removed:
+                    print(f"  ↳ Removed {removed} prior Weaviate entry(ies) for '{fp_value}'")
             except Exception as e:
                 print(f"  ↳ Could not remove prior Weaviate entry: {e}")
             return True  # not a sync failure — intentional skip
@@ -1774,11 +1813,15 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
         archived2, reason2 = _is_archived_node(file_path, frontmatter=node_data)
         if archived2:
             print(f"⊘ Skipping (frontmatter): {reason2}")
+            # v0.2.70 FIX #1: delete by file_path (the stored dedup key), NOT
+            # by title — see the path-based archive branch above for the
+            # cross-node title-collision data-loss this prevents. node_data
+            # carries the canonical relative file_path already.
             try:
-                title = node_data.get("title") or _frontmatter_title(file_path)
-                if title:
-                    _delete_node_by_title(server, title)
-                    print(f"  ↳ Removed prior Weaviate entry for '{title}'")
+                fp_value = node_data.get("file_path") or _relative_file_path(file_path)
+                removed = _delete_node_by_file_path(server, fp_value)
+                if removed:
+                    print(f"  ↳ Removed {removed} prior Weaviate entry(ies) for '{fp_value}'")
             except Exception as e:
                 print(f"  ↳ Could not remove prior Weaviate entry: {e}")
             return True
@@ -2159,6 +2202,57 @@ def sync_all_nodes(server: WeaviateMCPServer) -> Tuple[int, int]:
     return success_count, fail_count
 
 
+def _classify_sync_target(raw: str) -> Tuple[Path, bool, bool]:
+    """Classify an explicit sync-target path as knowledge / docs / neither.
+
+    v0.2.70 FIX #6: a symlink physically located under ``docs/`` (or
+    ``knowledge/``) whose TARGET lives outside the tree used to be rejected.
+    The old code ran ``Path(raw).resolve()`` first — which rewrites a symlink
+    to its out-of-tree target — then checked ``relative_to(DOCS_ROOT)``, so
+    the file was reported "not in knowledge/ or docs/ — skipping".
+
+    We classify by the path's LOCATION first. ``os.path.abspath`` normalises
+    ``..`` / cwd lexically WITHOUT resolving the final component's symlink, so
+    a link sitting under ``docs/`` is recognised by where the user placed it.
+    The resolved form is checked as a fallback so a user who passes a path
+    THROUGH a symlinked ancestor (e.g. a symlinked repo root) still matches.
+
+    Returns ``(file_path, in_knowledge, in_docs)``. ``file_path`` is the
+    location path when that form is in-tree (so the stored ``file_path``
+    property reflects the docs/ location and ``read_text()`` follows the link
+    to load content), otherwise the resolved path.
+    """
+    loc = Path(os.path.abspath(raw))
+    try:
+        resolved = Path(raw).resolve()
+    except OSError:
+        resolved = loc
+
+    def _under(cand: Path, root: Path) -> bool:
+        try:
+            cand.relative_to(root)
+            return True
+        except ValueError:
+            return False
+
+    loc_in_knowledge = _under(loc, KNOWLEDGE_ROOT)
+    loc_in_docs = _under(loc, DOCS_ROOT)
+    res_in_knowledge = _under(resolved, KNOWLEDGE_ROOT)
+    res_in_docs = _under(resolved, DOCS_ROOT)
+
+    in_knowledge = loc_in_knowledge or res_in_knowledge
+    in_docs = loc_in_docs or res_in_docs
+
+    # Prefer the location path when it is itself in-tree; otherwise the
+    # resolved path carried us in-tree (symlinked-ancestor case).
+    if loc_in_knowledge or loc_in_docs:
+        file_path = loc
+    else:
+        file_path = resolved
+
+    return file_path, in_knowledge, in_docs
+
+
 def main():
     """Main entry point.
 
@@ -2229,34 +2323,24 @@ def main():
             # sync only the files that changed since the last install.
             # Single-file path (the original behaviour) also falls through here
             # when it has no `--` prefix.
-            file_paths = [Path(p).resolve() for p in sys.argv[1:]]
+            raw_args = sys.argv[1:]
             success_count = 0
             fail_count = 0
-            for file_path in file_paths:
-                try:
-                    file_path.relative_to(KNOWLEDGE_ROOT)
-                    in_knowledge = True
-                except ValueError:
-                    in_knowledge = False
-                try:
-                    file_path.relative_to(DOCS_ROOT)
-                    in_docs = True
-                except ValueError:
-                    in_docs = False
-
+            for raw in raw_args:
+                file_path, in_knowledge, in_docs = _classify_sync_target(raw)
                 if in_knowledge:
                     ok = sync_node(server, file_path)
                 elif in_docs:
                     ok = sync_doc(server, file_path)
                 else:
-                    print(f"ℹ️  {file_path}: not in knowledge/ or docs/ — skipping")
+                    print(f"ℹ️  {raw}: not in knowledge/ or docs/ — skipping")
                     continue
                 if ok:
                     success_count += 1
                 else:
                     fail_count += 1
 
-            if len(file_paths) > 1:
+            if len(raw_args) > 1:
                 print(f"📊 List: {success_count} succeeded, {fail_count} failed")
             sys.exit(0 if fail_count == 0 else 1)
 

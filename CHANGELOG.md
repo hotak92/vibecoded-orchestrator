@@ -156,6 +156,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the new `_lib/*.ps1` helpers; and the `gpu_device.py` docstring no longer claims a
   `wmic` Windows path that was never implemented.
 
+### Fixed (v0.2.70 — kg-sync robustness, found in a 3rd-party adoption report)
+- **`kg-sync --all` no longer silently drops an active node that shares a title
+  with an archived node (P1, silent data loss).** The archived-node cleanup in
+  `sync_node` / `sync_doc` deleted prior Weaviate rows by `title`, which is NOT
+  unique. During a `--all` run, processing an archived node ran a title-scoped
+  delete that ALSO removed any active node sharing that title — the active node
+  vanished while `sync_node` still returned True (so the run reported
+  "N succeeded, 0 failed" while the collection count silently dropped, and
+  re-running `--all` re-inserted then re-deleted it; only a per-file sync of the
+  active node alone worked). The cleanup is now scoped to the unique `file_path`
+  (`_delete_node_by_file_path` / `_delete_doc_by_file_path`), so an archived
+  node only ever removes its own rows. Removed the now-dead title-scoped helpers
+  (`_delete_node_by_title`, `_delete_doc_by_title`, `_frontmatter_title`).
+- **Archive-folder exclusion now also matches `.archive/` and `_archive/`.**
+  `_is_archived_node` matched only the exact path segment `archive`, so the
+  dot/underscore conventions (`.archive/`, `_archive/`) slipped through and got
+  indexed. It now matches those three exact segment forms WITHOUT over-matching
+  legitimate dirs like `architecture/` or `archived-notes/`.
+- **Explicit single-file sync of a symlink located under `docs/`/`knowledge/`
+  is no longer rejected.** The path was `Path(p).resolve()`-d (rewriting a
+  symlink to its out-of-tree target) BEFORE the in-tree membership check, so a
+  symlink physically placed under `docs/` was skipped as "not in knowledge/ or
+  docs/". Classification (`_classify_sync_target`) now keys on the path's
+  LOCATION (`os.path.abspath`, no final-component symlink resolution) and only
+  falls back to the resolved path; the stored `file_path` reflects the
+  `docs/`/`knowledge/` location.
+- **Dev-docs root is now overridable via `DEV_DOCS_ROOT`.** Projects that keep
+  documentation under a non-default folder (e.g. `documentation/`) can point the
+  sync engine at it; unset/empty preserves the historical `docs/` default.
+
 ### Security
 - **Cleared all open Dependabot alerts (dev/build dependencies).** Bumped `vitest`
   → 3.2.6 (CRITICAL: Vitest UI arbitrary file read/execute) in the vendored
