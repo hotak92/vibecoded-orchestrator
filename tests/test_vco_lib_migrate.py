@@ -612,6 +612,162 @@ class CliMigrateCommandTests(unittest.TestCase):
                 "unrelated info-level entry must be preserved",
             )
 
+    def test_v0270_additive_copy_auto_applies_no_deferral(self):
+        """v0.2.70 (Bug A, Branch 1): an additive `copy` dry-run plan is
+        lossless → it must NOT emit a `schema_migration_required` deferral
+        (it is auto-applied by the launcher's WET follow-up), and the clean
+        additive dry-run falls into the stale-clear else branch (clearing any
+        pre-seeded stale migration deferral while preserving unrelated ones).
+        """
+        import tempfile
+        from vco_lib.deferral_report import DeferralEntry, DeferralReport
+
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td)
+            # Pre-seed a stale schema_migration_required deferral + an
+            # unrelated info entry. The additive-copy probe must clear ONLY
+            # the stale migration entry and preserve the other.
+            seed = DeferralReport()
+            seed.add_entry(DeferralEntry(
+                condition_id="schema_migration_required",
+                title="Schema migration required",
+                detected="stale entry from a prior update",
+                why_deferred="needs consent",
+                command_to_apply="migrate-collections ...",
+                severity="warning",
+            ))
+            seed.add_entry(DeferralEntry(
+                condition_id="legacy_vscode_mcp_env_keys_present",
+                title="Legacy MCP keys",
+                detected="an unrelated info-level entry that must survive",
+                why_deferred="hygiene only",
+                command_to_apply="dismiss-deferral ...",
+                severity="info",
+            ))
+            seed.write(folder)
+            target = folder / ".claude" / "context" / "UPDATE_DEFERRED.md"
+
+            fake_result = {
+                "plan": [
+                    {"collection": "Foo_KnowledgeGraph", "action": "copy",
+                     "objects_copied": 0, "elapsed_ms": 0},
+                ],
+                "dry_run": True,
+                "errors": [],
+            }
+            with mock.patch.object(project_init, "migrate_collections",
+                                   return_value=fake_result):
+                argv = ["migrate-collections", "--name", "Foo",
+                        "--dry-run", "--project-folder", str(folder),
+                        "--json"]
+                from io import StringIO
+                buf = StringIO()
+                with mock.patch.object(sys, "stdout", buf):
+                    rc = project_init.main(argv)
+                self.assertEqual(rc, 0)
+                payload = json.loads(buf.getvalue().strip())
+
+            # Additive copy must NOT defer.
+            self.assertIs(
+                payload["deferral_emitted"], False,
+                f"additive copy must not emit a deferral; got {payload}",
+            )
+            # And it falls into the stale-clear else branch.
+            self.assertTrue(
+                payload.get("stale_migrate_deferral_cleared"),
+                f"additive-copy clean probe should clear the stale deferral; "
+                f"got {payload}",
+            )
+            # The stale migration entry is gone; the unrelated one survives.
+            body = target.read_text(encoding="utf-8")
+            self.assertNotIn("## schema_migration_required", body)
+            self.assertIn("legacy_vscode_mcp_env_keys_present", body)
+
+    def test_v0270_rebuild_still_defers(self):
+        """v0.2.70 (Bug A, Branch 2): a lossy `rebuild` dry-run plan STILL
+        defers (drop + re-embed regenerates vectors) and writes the corrected
+        deferral text (no false "drops the collection mid-swap" claim).
+        """
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td)
+            fake_result = {
+                "plan": [
+                    {"collection": "Foo_KnowledgeGraph", "action": "rebuild",
+                     "objects_copied": 0, "elapsed_ms": 0},
+                ],
+                "dry_run": True,
+                "errors": [],
+            }
+            with mock.patch.object(project_init, "migrate_collections",
+                                   return_value=fake_result):
+                argv = ["migrate-collections", "--name", "Foo",
+                        "--dry-run", "--project-folder", str(folder),
+                        "--json"]
+                from io import StringIO
+                buf = StringIO()
+                with mock.patch.object(sys, "stdout", buf):
+                    rc = project_init.main(argv)
+                self.assertEqual(rc, 0)
+                payload = json.loads(buf.getvalue().strip())
+
+            self.assertIs(
+                payload["deferral_emitted"], True,
+                f"rebuild must still emit a deferral; got {payload}",
+            )
+            target = folder / ".claude" / "context" / "UPDATE_DEFERRED.md"
+            body = target.read_text(encoding="utf-8")
+            self.assertIn("schema_migration_required", body)
+            self.assertIn("Foo_KnowledgeGraph", body)
+            self.assertIn("rebuild", body)
+            # The false claim must be gone; the corrected framing present.
+            self.assertNotIn("drops the collection mid-swap", body)
+            self.assertIn("re-embeds every object via Ollama", body)
+
+    def test_v0270_mixed_copy_and_rebuild_defers_only_rebuild(self):
+        """v0.2.70 (Bug A, boundary): a plan with BOTH a `copy` and a
+        `rebuild` entry defers, but the deferral lists ONLY the rebuild
+        collection — the additive copy subset is left to the wet auto-apply
+        path (the `destructive` list now filters to `rebuild`).
+        """
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td)
+            fake_result = {
+                "plan": [
+                    {"collection": "Foo_KnowledgeGraph", "action": "copy",
+                     "objects_copied": 0, "elapsed_ms": 0},
+                    {"collection": "Foo_Development", "action": "rebuild",
+                     "objects_copied": 0, "elapsed_ms": 0},
+                ],
+                "dry_run": True,
+                "errors": [],
+            }
+            with mock.patch.object(project_init, "migrate_collections",
+                                   return_value=fake_result):
+                argv = ["migrate-collections", "--name", "Foo",
+                        "--dry-run", "--project-folder", str(folder),
+                        "--json"]
+                from io import StringIO
+                buf = StringIO()
+                with mock.patch.object(sys, "stdout", buf):
+                    rc = project_init.main(argv)
+                self.assertEqual(rc, 0)
+                payload = json.loads(buf.getvalue().strip())
+
+            self.assertIs(
+                payload["deferral_emitted"], True,
+                f"a plan containing a rebuild must defer; got {payload}",
+            )
+            target = folder / ".claude" / "context" / "UPDATE_DEFERRED.md"
+            body = target.read_text(encoding="utf-8")
+            # ONLY the rebuild collection is listed in the deferral; the
+            # additive copy collection is NOT (it auto-applies).
+            self.assertIn("Foo_Development", body)
+            self.assertNotIn("Foo_KnowledgeGraph", body)
+
 
 # ---------------------------------------------------------------------------
 # Live integration test — real Weaviate, throwaway collection.
