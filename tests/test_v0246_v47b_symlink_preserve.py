@@ -237,8 +237,10 @@ def test_emit_symlink_deferral_includes_reconciliation_commands(tmp_path):
 
 def test_emit_symlink_deferral_multiple_calls_collapse_to_one_entry(tmp_path):
     """DeferralReport.add_entry drops prior entries with the same
-    condition_id (last-write-wins). Multiple symlink hits in one run
-    should not produce one entry per hit."""
+    condition_id (last-write-wins). This documents the low-level single-pair
+    API's behaviour — calling ``emit_symlink_deferral`` twice DROPS the first
+    (the v0.2.70 FIX-3 bug class). Call sites that redirect 2+ paths MUST use
+    ``emit_symlink_deferral_multi`` instead (see the multi test below)."""
     a = tmp_path / "a"
     a.mkdir()
     b = tmp_path / "b"
@@ -252,8 +254,59 @@ def test_emit_symlink_deferral_multiple_calls_collapse_to_one_entry(tmp_path):
     symlink_handler.emit_symlink_deferral(report, link_a, link_a.with_suffix(".vco-new"))
     symlink_handler.emit_symlink_deferral(report, link_b, link_b.with_suffix(".vco-new"))
 
-    # Both calls used the same condition_id; only the last survives.
+    # Both single-pair calls used the same condition_id; only the last
+    # survives — which is precisely why multi-redirect call sites must NOT
+    # loop the single-pair emitter (FIX-3).
     assert len(report.entries) == 1
+    # The surviving entry only names the LAST pair (the dropped-data symptom).
+    assert "linkb" in report.entries[0].detected
+    assert "linka" not in report.entries[0].detected
+
+
+def test_emit_symlink_deferral_multi_lists_all_pairs_in_one_entry(tmp_path):
+    """v0.2.70 FIX-3 contract: the multi emitter consolidates N redirect pairs
+    into ONE entry that names EVERY pair (no last-write-wins data loss). This is
+    what the install.py self-materialize + agents/skills call sites now use."""
+    a = tmp_path / "a"
+    a.mkdir()
+    b = tmp_path / "b"
+    b.mkdir()
+    c = tmp_path / "c"
+    c.mkdir()
+    link_a = tmp_path / "linka"
+    link_b = tmp_path / "linkb"
+    link_c = tmp_path / "linkc"
+    _make_symlink_or_skip(a, link_a)
+    _make_symlink_or_skip(b, link_b)
+    _make_symlink_or_skip(c, link_c)
+
+    events = [
+        (link_a, link_a.with_suffix(".vco-new")),
+        (link_b, link_b.with_suffix(".vco-new")),
+        (link_c, link_c.with_suffix(".vco-new")),
+    ]
+    report = DeferralReport()
+    symlink_handler.emit_symlink_deferral_multi(
+        report, events, install_root=tmp_path,
+    )
+
+    # Exactly ONE consolidated entry, stable condition_id.
+    assert len(report.entries) == 1
+    entry = report.entries[0]
+    assert entry.condition_id == symlink_handler.SYMLINK_PRESERVED_CONDITION_ID
+    # ALL three redirected paths are named (no data loss).
+    detected = entry.detected
+    for name in ("linka", "linkb", "linkc"):
+        assert name in detected, f"{name} missing from consolidated detected text"
+    # The count prefix reflects all three pairs.
+    assert "3 path(s)" in detected
+
+
+def test_emit_symlink_deferral_multi_empty_is_noop(tmp_path):
+    """No redirect pairs → no entry (the common case: install hit no symlinks)."""
+    report = DeferralReport()
+    symlink_handler.emit_symlink_deferral_multi(report, [], install_root=tmp_path)
+    assert len(report.entries) == 0
 
 
 def test_emit_symlink_deferral_handles_unreadable_target(tmp_path):

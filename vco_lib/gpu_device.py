@@ -14,11 +14,16 @@ invariant — see :mod:`vco_lib.embedding_selection`).
 This module replaces that with a two-stage, *testable* pipeline:
 
 - :func:`enumerate_gpus` — thin, probe-only. Parses ``nvidia-smi`` (ALL
-  rows, with per-GPU VRAM), ``rocm-smi`` (all rows), and ``lspci`` (Linux
-  vendor + PCI-bus discrimination) / ``wmic`` (Windows PNPDeviceID
-  vendor). Soft-fails every probe to ``[]`` — NEVER raises, NEVER hangs
-  past the per-probe timeout. The decision lives elsewhere so this layer
-  stays free of policy.
+  rows, with per-GPU VRAM) and ``rocm-smi`` (all rows) cross-OS, plus
+  ``lspci`` (Linux vendor + PCI-bus discrimination). NVIDIA and AMD are
+  the only supported accelerators, so they are the only vendors probed.
+  There is intentionally NO Windows Intel-iGPU enumeration: Intel GPUs
+  (iGPU or discrete) are unsupported (dropped by :func:`select_gpu_device`
+  anyway), so a Windows host with only an Intel iGPU correctly enumerates
+  to ``[]`` → CPU path. (``lspci`` returns ``[]`` on Windows where it is
+  not present; that is the expected no-op.) Soft-fails every probe to
+  ``[]`` — NEVER raises, NEVER hangs past the per-probe timeout. The
+  decision lives elsewhere so this layer stays free of policy.
 - :func:`select_gpu_device` — PURE. Takes a list of candidates and
   returns the chosen :class:`GpuCandidate` (or ``None`` → CPU path). It
   filters out Intel GPUs (unsupported) and integrated GPUs (never a
@@ -63,7 +68,10 @@ from typing import Optional
 # machine — see the "no global install timeout" feedback note).
 _PROBE_TIMEOUT_S = 10
 
-# PCI vendor IDs (lspci -nn / Windows PNPDeviceID VEN_*).
+# PCI vendor IDs as they appear in `lspci -nn` bracketed [VEN:DEV] tokens
+# (e.g. "[8086:...]"). Used only by the Linux lspci classifier below; there
+# is no Windows PNPDeviceID path (see module docstring — Intel is unsupported
+# and NVIDIA/AMD are probed cross-OS via nvidia-smi/rocm-smi).
 _VENDOR_ID_INTEL = "8086"
 _VENDOR_ID_NVIDIA = "10de"
 _VENDOR_ID_AMD = "1002"

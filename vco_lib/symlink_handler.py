@@ -264,12 +264,19 @@ def _render_symlink_pair(
         f"content was written to `{vco_new_display}` instead. The "
         f"symlink itself was NOT modified."
     )
+    # v0.2.70 FIX-5: emit BOTH shells. This is human-facing advisory text the
+    # user copy-pastes; a deferral written on one OS may be read on the other
+    # (cloned/synced project tree), so labelling both forms is more robust than
+    # branching on the writer's platform.system().
     command_to_apply = (
         f"# Option A — accept VCO's defaults over the symlink:\n"
-        f"rm '{dest_display}' && mv '{vco_new_display}' '{dest_display}'\n"
+        f"#   bash:       rm '{dest_display}' && mv '{vco_new_display}' '{dest_display}'\n"
+        f"#   PowerShell: Remove-Item '{dest_display}'; "
+        f"Move-Item '{vco_new_display}' '{dest_display}'\n"
         f"\n"
         f"# Option B — keep the existing symlink (delete VCO's sibling):\n"
-        f"rm -rf '{vco_new_display}'"
+        f"#   bash:       rm -rf '{vco_new_display}'\n"
+        f"#   PowerShell: Remove-Item -Recurse -Force '{vco_new_display}'"
     )
     return detected, command_to_apply
 
@@ -358,9 +365,12 @@ def emit_symlink_deferral_multi(
 
     command_to_apply = "\n\n".join(command_blocks)
     if overflow > 0:
+        # v0.2.70 FIX-5: both-shell listing command (advisory text, see
+        # _render_symlink_pair).
         command_to_apply += (
             f"\n\n# ... and {overflow} more redirected path(s) — list all with:\n"
-            f"find . -name '*{VCO_NEW_SUFFIX}'"
+            f"#   bash:       find . -name '*{VCO_NEW_SUFFIX}'\n"
+            f"#   PowerShell: Get-ChildItem -Recurse -Filter '*{VCO_NEW_SUFFIX}'"
         )
 
     entry = DeferralEntry(
@@ -449,12 +459,17 @@ def check_vco_new_collision(
             "sibling between runs to tweak the bundled defaults). VCO "
             "preserves the prior content and asks the user to reconcile."
         )
+        # v0.2.70 FIX-5: both-shell advisory commands (see _render_symlink_pair).
         command_to_apply = (
             f"# Option A — discard prior .vco-new and re-stage fresh on next run:\n"
-            f"rm -rf '{display}'  &&  python install.py --update\n"
+            f"#   bash:       rm -rf '{display}'  &&  python install.py --update\n"
+            f"#   PowerShell: Remove-Item -Recurse -Force '{display}'; "
+            f"python install.py --update\n"
             f"\n"
             f"# Option B — move prior .vco-new aside, then re-stage:\n"
-            f"mv '{display}' '{display}.kept-by-user'  &&  python install.py --update"
+            f"#   bash:       mv '{display}' '{display}.kept-by-user'  &&  python install.py --update\n"
+            f"#   PowerShell: Move-Item '{display}' '{display}.kept-by-user'; "
+            f"python install.py --update"
         )
 
         entry = DeferralEntry(

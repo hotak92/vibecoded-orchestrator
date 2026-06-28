@@ -153,10 +153,23 @@ function Invoke-VcoFilterSeenBlocks {
     $curBlock = ""
     $curBody = ""
 
+    # v0.2.70 FIX-1: the parse accumulators ($curPrefix/$curFirst/$curSrc/
+    # $curBlock/$curBody) are FUNCTION-LOCAL. The flush logic MUST read and
+    # write the SAME scope as the parse loop. The earlier version mutated
+    # `$script:`-scoped copies inside a `& $flush` closure while the loop read
+    # the bare function-local copies, so the flush never saw the loop's writes
+    # (and vice-versa) -> injected KG/CODE blocks were shredded to orphaned
+    # body fragments and dedup never recorded a key. Using `$script:` for
+    # per-call parse state is ALSO a re-entrancy bug (a second call would see
+    # the first call's leftovers). The fix: invoke the flush block with the
+    # dot-source operator (`. $flush`) so it runs in THIS function's scope and
+    # the bare-name reads/writes target the function-local accumulators
+    # directly -- matching the bash sibling's dynamic-scope `_vco_flush`, which
+    # mutates the enclosing function's locals.
     $flush = {
         if ([string]::IsNullOrEmpty($curPrefix)) {
-            $script:curPrefix = ""; $script:curFirst = ""; $script:curSrc = ""
-            $script:curBlock = ""; $script:curBody = ""
+            $curPrefix = ""; $curFirst = ""; $curSrc = ""
+            $curBlock = ""; $curBody = ""
             return
         }
         if ($curPrefix -eq "KG") {
@@ -176,35 +189,35 @@ function Invoke-VcoFilterSeenBlocks {
             [void]$sb.Append($curBlock)
             if ($dedupOn) { Add-VcoSeen -File $InjectFile -Key $key }
         }
-        $script:curPrefix = ""; $script:curFirst = ""; $script:curSrc = ""
-        $script:curBlock = ""; $script:curBody = ""
+        $curPrefix = ""; $curFirst = ""; $curSrc = ""
+        $curBlock = ""; $curBody = ""
     }
 
     foreach ($line in ($InputText -split "`n")) {
         $line = $line.TrimEnd("`r")
         $m = [regex]::Match($line, '^(KG|CODE): (.+)$')
         if ($m.Success) {
-            & $flush
-            $script:curPrefix = $m.Groups[1].Value
+            . $flush
+            $curPrefix = $m.Groups[1].Value
             $rest = $m.Groups[2].Value
-            $script:curFirst = Get-VcoSeenFirstField -Rest $rest
-            $script:curSrc = ""
+            $curFirst = Get-VcoSeenFirstField -Rest $rest
+            $curSrc = ""
             $sidx = $rest.IndexOf("| src=")
             if ($sidx -ge 0) {
-                $script:curSrc = ($rest.Substring($sidx + 6)).TrimEnd()
+                $curSrc = ($rest.Substring($sidx + 6)).TrimEnd()
             }
-            $script:curBlock = $line + "`n"
-            $script:curBody = ""
+            $curBlock = $line + "`n"
+            $curBody = ""
         } elseif (-not [string]::IsNullOrEmpty($curPrefix)) {
-            $script:curBlock = $curBlock + $line + "`n"
-            $script:curBody = $curBody + $line + "`n"
+            $curBlock = $curBlock + $line + "`n"
+            $curBody = $curBody + $line + "`n"
         } else {
             if ($line -match '\S') {
                 [void]$sb.Append($line + "`n")
             }
         }
     }
-    & $flush
+    . $flush
 
     return $sb.ToString()
 }

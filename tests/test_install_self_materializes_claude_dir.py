@@ -391,5 +391,65 @@ class SkipFlagShortCircuitsTest(unittest.TestCase):
         )
 
 
+class MaterializeSymlinkConsolidatedDeferralTest(unittest.TestCase):
+    """v0.2.70 FIX-3: when the self-materialize hits 2+ symlink redirects in one
+    run, it must emit ONE consolidated `symlink_preserved_under_install_path`
+    deferral listing ALL pairs — not 8 single-pair emits that collapse to
+    last-write-wins."""
+
+    def _make_symlink_or_skip(self, target: Path, link: Path) -> None:
+        try:
+            os.symlink(str(target), str(link))
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(
+                f"cannot create symlink on this platform: {exc} "
+                "(Windows requires developer-mode or admin)"
+            )
+
+    def test_two_symlinked_targets_collapse_to_one_entry_naming_both(self) -> None:
+        from vco_lib.deferral_report import DeferralReport
+
+        install_root = _stage_install_root()
+        try:
+            claude_dir = install_root / ".claude"
+            claude_dir.mkdir()
+            # Symlink BOTH .claude/hooks AND .claude/scripts → 2 redirect pairs.
+            ext_hooks = install_root / "external-hooks"
+            ext_hooks.mkdir()
+            ext_scripts = install_root / "external-scripts"
+            ext_scripts.mkdir()
+            self._make_symlink_or_skip(ext_hooks, claude_dir / "hooks")
+            self._make_symlink_or_skip(ext_scripts, claude_dir / "scripts")
+
+            report = DeferralReport()
+            install._materialize_orchestrator_self_claude_dir(
+                install_root, deferral_report=report,
+            )
+
+            symlink_entries = [
+                e for e in report.entries
+                if e.condition_id == "symlink_preserved_under_install_path"
+            ]
+            # Exactly ONE consolidated entry (not one-per-redirect, not
+            # last-write-wins down to a single pair).
+            self.assertEqual(
+                len(symlink_entries), 1,
+                f"expected ONE consolidated symlink deferral; got "
+                f"{len(symlink_entries)}",
+            )
+            detected = symlink_entries[0].detected
+            # BOTH redirected paths must be named (no data loss).
+            self.assertIn("hooks", detected)
+            self.assertIn("scripts", detected)
+            # Both .vco-new siblings actually got written.
+            self.assertTrue((claude_dir / "hooks.vco-new").is_dir())
+            self.assertTrue((claude_dir / "scripts.vco-new").is_dir())
+            # The originals are untouched symlinks.
+            self.assertTrue((claude_dir / "hooks").is_symlink())
+            self.assertTrue((claude_dir / "scripts").is_symlink())
+        finally:
+            shutil.rmtree(install_root, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

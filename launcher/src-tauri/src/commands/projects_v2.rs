@@ -1795,21 +1795,36 @@ pub(crate) async fn run_migrate_dry_run(
                 .get("deferral_emitted")
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false);
+            // v0.2.70 FIX-4: compute the auto-apply decision ONCE, up front, so
+            // the toast text below only claims additive copies "were applied"
+            // when they actually were. For a REBUILD-ONLY plan,
+            // should_auto_apply_additive returns false (has_lossy) -> nothing
+            // additive was applied, and the over-claim ("were applied
+            // automatically") was misleading. The wet apply itself still runs
+            // off this same flag at the bottom of the Ok arm.
+            let auto_apply_additive =
+                should_auto_apply_additive(&v, out.status.success());
             if deferral_emitted {
                 // must match _emit_migrate_required_deferral why_deferred
                 // (vco_lib/project_init.py) — cross-language mirror. Keep the
                 // framing identical: ONLY lossy `rebuild` is consent-gated here
-                // (it re-embeds every object); additive `copy` is lossless and
-                // auto-applied below, never deferred.
+                // (it re-embeds every object). The additive-`copy` clause is
+                // appended ONLY when additive drift was actually auto-applied
+                // this run (rebuild-only plans have none to apply).
+                let additive_clause = if auto_apply_additive {
+                    " Additive `copy` migrations are lossless and were applied \
+                     automatically."
+                } else {
+                    ""
+                };
                 warnings.push(format!(
                     "Weaviate schema drift detected — `schema_migration_required` \
                      deferral entry written to {}/.claude/context/UPDATE_DEFERRED.md. \
                      A data-rebuilding migration (`rebuild`) requires consent and \
-                     was NOT auto-applied (it re-embeds every object via Ollama); \
-                     additive `copy` migrations are lossless and were applied \
-                     automatically. Re-run `python -m vco_lib.project_init \
+                     was NOT auto-applied (it re-embeds every object via Ollama).{} \
+                     Re-run `python -m vco_lib.project_init \
                      migrate-collections --name {:?} --force-rebuild` to consent.",
-                    folder_str, project_name
+                    folder_str, additive_clause, project_name
                 ));
             }
             if let Some(errs) = v.get("errors").and_then(|x| x.as_array()) {
@@ -1840,7 +1855,8 @@ pub(crate) async fn run_migrate_dry_run(
             // un-applied forever (strictly worse than the old consent prompt),
             // so the launcher must issue the wet apply. Gated behind the
             // per-project migrate lock (refuse-on-contention) and soft-fail.
-            if should_auto_apply_additive(&v, out.status.success()) {
+            // FIX-4: reuse the same flag the toast text was conditioned on.
+            if auto_apply_additive {
                 warnings.extend(
                     run_migrate_apply_additive(project_id, folder, project_name).await,
                 );
@@ -11426,15 +11442,20 @@ export BY_HAND_KEY=\"user_typed\"
             .collect::<Vec<_>>()
             .join(" ");
 
-        // The new warning scopes consent to the rebuild action and states
-        // additive copy is applied automatically.
+        // The new warning scopes consent to the rebuild action.
         assert!(
             src.contains("(`rebuild`) requires consent and was NOT auto-applied"),
             "dry-run warning must scope consent to the rebuild action"
         );
+        // v0.2.70 FIX-4: the additive-copy clause is still present in source,
+        // but it now lives in the CONDITIONAL `additive_clause` branch (only
+        // emitted when additive drift was actually auto-applied). Match
+        // case-insensitively since the clause now starts a sentence ("Additive
+        // `copy` ...") after the rebuild sentence's period.
         assert!(
-            src.contains("additive `copy` migrations are lossless and were applied automatically"),
-            "dry-run warning must state additive copy is auto-applied"
+            src.to_lowercase()
+                .contains("additive `copy` migrations are lossless and were applied automatically"),
+            "dry-run warning must still carry the additive-copy clause text"
         );
         // The old blanket phrasing ("THE destructive migration was NOT
         // auto-applied") implied EVERYTHING defers — must be gone.
@@ -11447,6 +11468,43 @@ export BY_HAND_KEY=\"user_typed\"
         assert!(
             !src.contains("drops the collection mid-swap"),
             "the false 'copy drops the collection mid-swap' claim must not be present"
+        );
+    }
+
+    /// v0.2.70 FIX-4: the additive-copy "were applied automatically" clause is
+    /// gated on `auto_apply_additive` (= should_auto_apply_additive). It must
+    /// NOT be appended unconditionally — for a REBUILD-ONLY plan the predicate
+    /// is false, so the clause is empty and the toast no longer over-claims.
+    #[test]
+    fn migrate_additive_clause_is_conditional_on_auto_apply_v0270() {
+        let raw = include_str!("projects_v2.rs");
+        let prod = match raw.find("#[cfg(test)]") {
+            Some(i) => &raw[..i],
+            None => raw,
+        };
+        let src: String = prod
+            .replace('\\', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        // The clause is selected via an `if auto_apply_additive { ... } else { "" }`.
+        assert!(
+            src.contains("let additive_clause = if auto_apply_additive"),
+            "the additive-copy clause must be gated on auto_apply_additive \
+             (conditional, not unconditional)"
+        );
+        // The empty-string else arm is what suppresses the over-claim on a
+        // rebuild-only plan.
+        assert!(
+            src.contains("} else { \"\" };"),
+            "the additive clause must fall back to an empty string when \
+             auto_apply_additive is false (rebuild-only plan)"
+        );
+        // And the wet apply reuses the SAME precomputed flag (no second
+        // should_auto_apply_additive recomputation in the Ok arm body).
+        assert!(
+            src.contains("if auto_apply_additive {"),
+            "the wet apply must reuse the precomputed auto_apply_additive flag"
         );
     }
 }

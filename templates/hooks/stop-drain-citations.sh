@@ -26,6 +26,10 @@ PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 [ -f "$SCRIPT_DIR/_lib/stderr-cap.sh" ] && . "$SCRIPT_DIR/_lib/stderr-cap.sh"
 
 # shellcheck source=_lib/find-python.sh disable=SC1091
+# $PY (a plain system interpreter) parses the stdin JSON only. It is NOT a
+# valid runner for the drain: the drain imports claude_mcp_servers.rl_client.*,
+# which only the VCO venv satisfies (see VENV resolution below). If no
+# interpreter at all is on PATH we cannot even parse, so soft-exit.
 [ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
 [ -z "${PY:-}" ] && exit 0
 
@@ -46,12 +50,20 @@ SESSION_ID=$(printf '%s' "$_PARSED" | sed -n '1p')
 TRANSCRIPT_PATH=$(printf '%s' "$_PARSED" | sed -n '2p')
 
 # Resolve the project venv python (the drain imports claude_mcp_servers.*).
+# v0.2.70 FIX-2 (sibling-divergence): require the RESOLVED VCO venv on BOTH
+# OSes -- no fallback to system $PY. The drain imports
+# claude_mcp_servers.rl_client.*, so a bare system interpreter would ImportError
+# anyway; falling back to it merely burned a subprocess for a guaranteed failure
+# AND diverged from the .ps1 (which already required the resolved venv). Now
+# both siblings make the SAME decision: venv resolves -> run; venv absent ->
+# soft-exit 0 (telemetry recovery skipped, the turn is never blocked).
 # shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/resolve-vco-venv.sh" ] && . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
 if command -v resolve_vco_venv_python >/dev/null 2>&1; then
     resolve_vco_venv_python "$SCRIPT_DIR"
 fi
-VENV="${VCO_VENV_PYTHON:-$PY}"
+VENV="${VCO_VENV_PYTHON:-}"
+[ -n "$VENV" ] && [ -x "$VENV" ] || exit 0
 
 DRAIN="$PROJECT_ROOT/claude_mcp_servers/scripts/rl_drain_citations.py"
 [ -f "$DRAIN" ] || exit 0

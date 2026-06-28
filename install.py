@@ -148,6 +148,7 @@ from vco_lib.symlink_handler import (  # noqa: E402
     check_vco_new_collision,
     compute_vco_new_path,
     emit_symlink_deferral,
+    emit_symlink_deferral_multi,
     is_symlink_blocking,
 )
 # v0.2.68: hardware-aware embedding/summary backend selectors extracted
@@ -6427,7 +6428,11 @@ def main() -> int:
     )
 
     # Step 9b: Install agents and skills from templates/
-    _install_agents_and_skills(args)
+    # v0.2.70 FIX-3 (secondary): thread the live deferral report so symlinked
+    # .claude/agents | .claude/skills targets emit a deferral (previously this
+    # call passed no report -> the 5 emit_symlink_deferral calls were
+    # guarded-out and a symlinked agents/skills dir redirected SILENTLY).
+    _install_agents_and_skills(args, deferral_report=_deferral_report)
 
     # Step 10: Check Claude CLI
     _check_claude_cli()
@@ -12012,6 +12017,14 @@ def _materialize_orchestrator_self_claude_dir(
     copied_hooks = 0
     copied_scripts = 0
     warnings: list[str] = []
+    # v0.2.70 FIX-3 (Stream B sibling): accumulate every (symlink, .vco-new)
+    # redirect pair across the materialize so we can emit ONE consolidated
+    # deferral via emit_symlink_deferral_multi. Calling the single-pair
+    # emit_symlink_deferral once per redirect would silently DROP all but the
+    # last (DeferralReport.add_entry is last-write-wins per condition_id, and
+    # all 8 redirects share SYMLINK_PRESERVED_CONDITION_ID) -- the exact bug
+    # class Stream B fixed for the bundle path.
+    symlink_events: list[tuple[Path, Path]] = []
     # v0.2.54 Track D: hash-compare bookkeeping. Prior-shipped hashes
     # come from .claude/.vco-manifest.json (rewritten with TEMPLATE
     # hashes by _refresh_orchestrator_self_vco_manifest after this
@@ -12027,11 +12040,7 @@ def _materialize_orchestrator_self_claude_dir(
     # shared workflow tree — VCO refuses to touch it.
     if is_symlink_blocking(claude_dir):
         vco_new_claude = compute_vco_new_path(claude_dir)
-        if deferral_report is not None:
-            emit_symlink_deferral(
-                deferral_report, claude_dir, vco_new_claude,
-                install_root=install_root,
-            )
+        symlink_events.append((claude_dir, vco_new_claude))
         warnings.append(
             f".claude/ is a symlink — materializing into "
             f"{vco_new_claude.name} instead (see UPDATE_DEFERRED.md)"
@@ -12047,11 +12056,7 @@ def _materialize_orchestrator_self_claude_dir(
         # v0.2.46 V47-B: symlinked .claude/hooks/ → redirect to sibling.
         if is_symlink_blocking(hooks_dst):
             vco_new_hooks = compute_vco_new_path(hooks_dst)
-            if deferral_report is not None:
-                emit_symlink_deferral(
-                    deferral_report, hooks_dst, vco_new_hooks,
-                    install_root=install_root,
-                )
+            symlink_events.append((hooks_dst, vco_new_hooks))
             warnings.append(
                 f".claude/hooks is a symlink — writing into "
                 f"{vco_new_hooks.name} instead"
@@ -12077,11 +12082,7 @@ def _materialize_orchestrator_self_claude_dir(
             # the in-place copy; land VCO's version at the sibling.
             if is_symlink_blocking(target):
                 vco_new_file = compute_vco_new_path(target)
-                if deferral_report is not None:
-                    emit_symlink_deferral(
-                        deferral_report, target, vco_new_file,
-                        install_root=install_root,
-                    )
+                symlink_events.append((target, vco_new_file))
                 try:
                     shutil.copy2(src, vco_new_file)
                 except OSError as e:
@@ -12129,11 +12130,7 @@ def _materialize_orchestrator_self_claude_dir(
                 # at sibling instead.
                 if is_symlink_blocking(dst_sub):
                     vco_new_sub = compute_vco_new_path(dst_sub)
-                    if deferral_report is not None:
-                        emit_symlink_deferral(
-                            deferral_report, dst_sub, vco_new_sub,
-                            install_root=install_root,
-                        )
+                    symlink_events.append((dst_sub, vco_new_sub))
                     try:
                         shutil.copytree(sub, vco_new_sub)
                     except OSError as e:
@@ -12158,11 +12155,7 @@ def _materialize_orchestrator_self_claude_dir(
         # v0.2.46 V47-B: symlinked .claude/scripts/ → redirect to sibling.
         if is_symlink_blocking(scripts_dst):
             vco_new_scripts = compute_vco_new_path(scripts_dst)
-            if deferral_report is not None:
-                emit_symlink_deferral(
-                    deferral_report, scripts_dst, vco_new_scripts,
-                    install_root=install_root,
-                )
+            symlink_events.append((scripts_dst, vco_new_scripts))
             warnings.append(
                 f".claude/scripts is a symlink — writing into "
                 f"{vco_new_scripts.name} instead"
@@ -12177,11 +12170,7 @@ def _materialize_orchestrator_self_claude_dir(
             # v0.2.46 V47-B: individual script file is a symlink → skip.
             if is_symlink_blocking(target):
                 vco_new_file = compute_vco_new_path(target)
-                if deferral_report is not None:
-                    emit_symlink_deferral(
-                        deferral_report, target, vco_new_file,
-                        install_root=install_root,
-                    )
+                symlink_events.append((target, vco_new_file))
                 try:
                     shutil.copy2(src, vco_new_file)
                 except OSError as e:
@@ -12223,11 +12212,7 @@ def _materialize_orchestrator_self_claude_dir(
             # settings.json to a shared config tree across projects.
             if is_symlink_blocking(settings_dst):
                 vco_new_settings = compute_vco_new_path(settings_dst)
-                if deferral_report is not None:
-                    emit_symlink_deferral(
-                        deferral_report, settings_dst, vco_new_settings,
-                        install_root=install_root,
-                    )
+                symlink_events.append((settings_dst, vco_new_settings))
                 warnings.append(
                     f".claude/settings.json is a symlink — writing into "
                     f"{vco_new_settings.name} instead"
@@ -12299,6 +12284,14 @@ def _materialize_orchestrator_self_claude_dir(
                 settings_dst.write_text(rendered, encoding="utf-8")
         except OSError as e:
             warnings.append(f"failed to render settings.json: {e}")
+
+    # v0.2.70 FIX-3: emit ONE consolidated symlink deferral covering every
+    # (symlink, .vco-new) redirect this run hit. Replaces the 8 single-pair
+    # emits that collapsed to last-write-wins under the shared condition_id.
+    if symlink_events and deferral_report is not None:
+        emit_symlink_deferral_multi(
+            deferral_report, symlink_events, install_root=install_root,
+        )
 
     # v0.2.54 Track D: surface preserved (user-modified) runtime copies.
     # Informational, not a failure — but they must be visible: the
@@ -25164,6 +25157,12 @@ def _install_agents_and_skills(
         "{{HOME}}": str(Path.home()),
     }
 
+    # v0.2.70 FIX-3 (secondary): accumulate (symlink, .vco-new) redirect pairs
+    # so we emit ONE consolidated deferral (emit_symlink_deferral_multi) at the
+    # end instead of N single-pair emits that collapse to last-write-wins under
+    # the shared SYMLINK_PRESERVED_CONDITION_ID.
+    symlink_events: list[tuple[Path, Path]] = []
+
     def _copy_with_subs(src: Path, dst: Path) -> None:
         content = src.read_text(encoding="utf-8")
         for key, val in subs.items():
@@ -25176,11 +25175,7 @@ def _install_agents_and_skills(
     # a sibling .vco-new tree.
     if is_symlink_blocking(claude_dir):
         vco_new_claude = compute_vco_new_path(claude_dir)
-        if deferral_report is not None:
-            emit_symlink_deferral(
-                deferral_report, claude_dir, vco_new_claude,
-                install_root=PROJECT_ROOT,
-            )
+        symlink_events.append((claude_dir, vco_new_claude))
         claude_dir = vco_new_claude
         agents_dst = claude_dir / "agents"
         skills_dst = claude_dir / "skills"
@@ -25191,11 +25186,7 @@ def _install_agents_and_skills(
         # v0.2.46 V47-B: if .claude/agents/ is a symlink, route to sibling.
         if is_symlink_blocking(agents_dst):
             vco_new_agents = compute_vco_new_path(agents_dst)
-            if deferral_report is not None:
-                emit_symlink_deferral(
-                    deferral_report, agents_dst, vco_new_agents,
-                    install_root=PROJECT_ROOT,
-                )
+            symlink_events.append((agents_dst, vco_new_agents))
             agents_dst = vco_new_agents
 
         agents_dst.mkdir(parents=True, exist_ok=True)
@@ -25206,11 +25197,7 @@ def _install_agents_and_skills(
                 # v0.2.46 V47-B: per-file symlink → land at sibling.
                 if is_symlink_blocking(target):
                     vco_new_target = compute_vco_new_path(target)
-                    if deferral_report is not None:
-                        emit_symlink_deferral(
-                            deferral_report, target, vco_new_target,
-                            install_root=PROJECT_ROOT,
-                        )
+                    symlink_events.append((target, vco_new_target))
                     _copy_with_subs(agent_file, vco_new_target)
                     continue
                 # Use lexists so dangling symlinks count as "occupied".
@@ -25228,11 +25215,7 @@ def _install_agents_and_skills(
             # v0.2.46 V47-B: if .claude/skills/ is a symlink, route to sibling.
             if is_symlink_blocking(skills_dst):
                 vco_new_skills = compute_vco_new_path(skills_dst)
-                if deferral_report is not None:
-                    emit_symlink_deferral(
-                        deferral_report, skills_dst, vco_new_skills,
-                        install_root=PROJECT_ROOT,
-                    )
+                symlink_events.append((skills_dst, vco_new_skills))
                 skills_dst = vco_new_skills
 
             skills_dst.mkdir(parents=True, exist_ok=True)
@@ -25241,11 +25224,7 @@ def _install_agents_and_skills(
                 # v0.2.46 V47-B: per-skill symlink → land at sibling.
                 if is_symlink_blocking(target):
                     vco_new_target = compute_vco_new_path(target)
-                    if deferral_report is not None:
-                        emit_symlink_deferral(
-                            deferral_report, target, vco_new_target,
-                            install_root=PROJECT_ROOT,
-                        )
+                    symlink_events.append((target, vco_new_target))
                     target = vco_new_target
                 elif os.path.lexists(os.fspath(target)):
                     skipped_skills += 1
@@ -25262,6 +25241,14 @@ def _install_agents_and_skills(
                         out.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(f, out)
                 installed_skills += 1
+
+    # v0.2.70 FIX-3 (secondary): emit ONE consolidated symlink deferral for
+    # every agents/skills redirect this run hit, instead of N single-pair emits
+    # that collapsed to last-write-wins under the shared condition_id.
+    if symlink_events and deferral_report is not None:
+        emit_symlink_deferral_multi(
+            deferral_report, symlink_events, install_root=PROJECT_ROOT,
+        )
 
     parts = []
     if args.with_agents:
