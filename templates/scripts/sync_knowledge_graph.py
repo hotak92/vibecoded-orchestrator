@@ -433,6 +433,211 @@ def _build_vector_arg(
     return vec, {server.text_vector_slot: vec}
 
 
+# ──────────────────────────────────────────────────────────────────────
+# v0.2.70 Part 2: pre-shipped embedding INGEST support.
+#
+# A future orchestrator update may ship pre-computed embeddings for the
+# curated KG nodes alongside the (already-shipped) summaries, so a 3rd-party
+# install does not have to re-embed all ~117 curated nodes on first sync
+# (the arctic-on-CPU install-hang class). The vectors live in a per-slot
+# sidecar under knowledge/:
+#
+#     knowledge/.node_embeddings.<slot>.json   (one file per named-vector slot)
+#
+# Format (schema_version 1) — see knowledge/.node_embeddings.README.md:
+#     {
+#       "schema_version": 1,
+#       "slot": "qwen3_embed",                 # the named-vector slot these
+#                                              #   vectors belong to
+#       "model_id": "qwen3-embedding:0.6b",    # informational / provenance
+#       "dim": 1024,                           # informational / provenance
+#       "nodes": {
+#         "<content_hash>": {                  # the node's full-content
+#                                              #   signature (16-hex), == the
+#                                              #   value sync stores as
+#                                              #   `content_hash`
+#           "total_chunks": 1,
+#           "chunks": [
+#             {"chunk_num": 1, "vector": [<float>, ...]}
+#           ]
+#         },
+#         ...
+#       }
+#     }
+#
+# IMPORTANT — this release ships NO such file. The loader returns None when
+# the sidecar is absent, so the ingest gate is a strict NO-OP and the embed
+# path computes vectors exactly as before. The plumbing + its guards are
+# present and tested; the data lands in a later update.
+#
+# Two non-negotiable guards on ingest (the cross-model invariant from the
+# v0.2.70 same-active-slot ruling):
+#   (a) STALENESS  — the shipped vector's content_hash MUST equal the node's
+#                    CURRENT content signature. A stale vector (node edited
+#                    since the vector was computed) is never ingested.
+#   (b) SLOT-MATCH — the sidecar's slot MUST equal the install's ACTIVE
+#                    named-vector slot. A qwen3 vector is NEVER written into
+#                    an arctic install (and vice-versa) — that would mix
+#                    embedding spaces and silently corrupt search.
+# Either guard failing → fall back to computing the embedding (today's
+# behaviour). The sidecar is loaded once and cached per (knowledge_root, slot).
+# ──────────────────────────────────────────────────────────────────────
+
+#: Cache: (knowledge_root_str, slot) -> parsed sidecar dict OR None (absent /
+#: unreadable / slot-mismatch). None is cached too, so a missing sidecar is
+#: probed at most once per run.
+_SHIPPED_EMBED_CACHE: Dict[Tuple[str, str], Optional[dict]] = {}
+
+
+def _shipped_embeddings_path(knowledge_root: Path, slot: str) -> Path:
+    """Path to the per-slot shipped-embeddings sidecar under knowledge/."""
+    return knowledge_root / f".node_embeddings.{slot}.json"
+
+
+def _load_shipped_embeddings(knowledge_root: Path, slot: str) -> Optional[dict]:
+    """Load the shipped-embeddings sidecar for *slot*, or None.
+
+    Returns None (cached) when the sidecar is absent, unparseable, schema-
+    incompatible, or declares a DIFFERENT slot than requested (slot-mismatch
+    guard at the file level — a defensive second check on top of the
+    filename, in case a file is mis-named). Soft-fail: never raises.
+    """
+    key = (str(knowledge_root), slot)
+    if key in _SHIPPED_EMBED_CACHE:
+        return _SHIPPED_EMBED_CACHE[key]
+
+    result: Optional[dict] = None
+    path = _shipped_embeddings_path(knowledge_root, slot)
+    try:
+        if path.is_file():
+            import json as _json
+            data = _json.loads(path.read_text(encoding="utf-8"))
+            if (
+                isinstance(data, dict)
+                and int(data.get("schema_version", 0)) == 1
+                and isinstance(data.get("nodes"), dict)
+                # File-level slot guard: the declared slot must match the slot
+                # we were asked for. A mismatch means this file is for another
+                # model — treat as absent (never cross-model ingest).
+                and data.get("slot") == slot
+            ):
+                result = data
+    except Exception:
+        # Corrupt JSON, permission error, etc. — treat as absent. The embed
+        # path computes vectors as usual; nothing breaks.
+        result = None
+
+    _SHIPPED_EMBED_CACHE[key] = result
+    return result
+
+
+def _shipped_vector_for(
+    server: "WeaviateMCPServer",
+    knowledge_root: Path,
+    content_hash: str,
+    expected_chunks: int,
+) -> Optional[Tuple[object, Mapping[str, List[float]]]]:
+    """Return a ready ``(vector_arg, slots_map)`` from the shipped sidecar, or None.
+
+    Mirrors ``_build_vector_arg``'s return shape so the embed path can drop
+    in the shipped vector with no other changes. Returns None (→ caller
+    computes the embedding) when ANY guard fails:
+
+      * no sidecar for the active slot (the default this release — NO-OP),
+      * no entry for this node's *content_hash* (staleness guard: a vector
+        computed against a now-edited node is never reused),
+      * the entry's chunk count != *expected_chunks* (the node would embed as
+        a different number of chunks than the shipped vectors cover),
+      * any chunk vector is missing / empty / non-numeric.
+
+    The active slot is ``server.text_vector_slot`` — so a vector is only ever
+    placed in the slot whose embedding space matches the install's model. We
+    return a single-slot ``{slot: vec}`` map (NOT a multi-slot fan-out): the
+    shipped data only covers the active model's space, and we must never
+    synthesise a vector for a slot we don't have data for.
+    """
+    slot = server.text_vector_slot
+    data = _load_shipped_embeddings(knowledge_root, slot)
+    if data is None:
+        return None  # NO-OP path (this release): no sidecar → compute.
+
+    entry = data["nodes"].get(content_hash)
+    if not isinstance(entry, dict):
+        return None  # staleness guard: no vector for the current content.
+
+    chunks = entry.get("chunks")
+    if not isinstance(chunks, list) or not chunks:
+        return None
+    if len(chunks) != expected_chunks:
+        # The node would chunk differently than the shipped vectors cover —
+        # don't risk a partial/mismatched ingest; compute fresh.
+        return None
+
+    # For the single-chunk caller (expected_chunks == 1) we hand back the lone
+    # vector. Multi-chunk ingest is handled chunk-by-chunk by the caller via
+    # `_shipped_chunk_vector` below; this function is the single-object path.
+    if expected_chunks != 1:
+        return None
+
+    vec = _coerce_vector(chunks[0].get("vector"))
+    if vec is None:
+        return None
+    return vec, {slot: vec}
+
+
+def _shipped_chunk_vector(
+    server: "WeaviateMCPServer",
+    knowledge_root: Path,
+    content_hash: str,
+    chunk_num: int,
+    expected_chunks: int,
+) -> Optional[Tuple[object, Mapping[str, List[float]]]]:
+    """Per-chunk variant of ``_shipped_vector_for`` for the multi-chunk path.
+
+    ``chunk_num`` is 1-indexed (matches the stored ``chunk_num`` and the
+    multi-chunk insert loop). Same guards as ``_shipped_vector_for``: slot
+    match (via the loaded sidecar), content_hash match (staleness), total
+    chunk-count match, and a present/valid vector for THIS chunk.
+    """
+    slot = server.text_vector_slot
+    data = _load_shipped_embeddings(knowledge_root, slot)
+    if data is None:
+        return None
+
+    entry = data["nodes"].get(content_hash)
+    if not isinstance(entry, dict):
+        return None
+    chunks = entry.get("chunks")
+    if not isinstance(chunks, list) or len(chunks) != expected_chunks:
+        return None
+
+    target = None
+    for c in chunks:
+        if isinstance(c, dict) and int(c.get("chunk_num", -1)) == chunk_num:
+            target = c
+            break
+    if target is None:
+        return None
+    vec = _coerce_vector(target.get("vector"))
+    if vec is None:
+        return None
+    return vec, {slot: vec}
+
+
+def _coerce_vector(raw: object) -> Optional[List[float]]:
+    """Validate + coerce a shipped vector to ``list[float]``, or None.
+
+    Rejects empty lists and non-numeric contents (a malformed sidecar must
+    fall back to computing, never insert a bad vector).
+    """
+    if not isinstance(raw, list) or not raw:
+        return None
+    try:
+        return [float(x) for x in raw]
+    except (TypeError, ValueError):
+        return None
+
+
 def _update_frontmatter_timestamp(file_path: Path, content: str) -> str:
     """
     Update the `updated:` field in YAML frontmatter to current UTC time
@@ -1952,10 +2157,25 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
             # Single chunk - store as-is
             print(f"   Storing as single object")
 
-            # v0.2.18: build vector arg via EmbeddingService. With
-            # DUAL_EMBEDDING_ENABLED=true (default) this fans out to every
-            # reachable text backend so multiple slots get populated.
-            vec_arg, slots_written = _build_vector_arg(server, content)
+            # v0.2.70 Part 2: try a pre-shipped embedding FIRST (NO-OP this
+            # release — no sidecar is shipped, so this returns None and we
+            # compute below). Both guards (content_hash staleness + active-
+            # slot match) live inside _shipped_vector_for. expected_chunks=1
+            # for the single-object path.
+            _shipped = _shipped_vector_for(
+                server, KNOWLEDGE_ROOT, current_content_hash, expected_chunks=1
+            )
+            if _shipped is not None:
+                vec_arg, slots_written = _shipped
+                print(
+                    f"   📦 Ingested shipped vector "
+                    f"(slot={server.text_vector_slot}, no embed call)"
+                )
+            else:
+                # v0.2.18: build vector arg via EmbeddingService. With
+                # DUAL_EMBEDDING_ENABLED=true (default) this fans out to every
+                # reachable text backend so multiple slots get populated.
+                vec_arg, slots_written = _build_vector_arg(server, content)
 
             # Prepare data object
             data_obj = {
@@ -2057,10 +2277,28 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
 
             # Store each chunk
             last_slots: Mapping[str, List[float]] = {}
+            _total_chunks = len(chunks)
             for i, chunk in enumerate(chunks):
-                # v0.2.18: embed via EmbeddingService (multi-slot when
-                # DUAL_EMBEDDING_ENABLED — see _build_vector_arg).
-                vec_arg, last_slots = _build_vector_arg(server, chunk.content)
+                # v0.2.70 Part 2: per-chunk shipped-vector ingest (NO-OP this
+                # release). Same guards as the single-object path. The shipped
+                # entry must cover EXACTLY this node's chunk count; if the node
+                # would chunk differently than the shipped vectors expect, every
+                # chunk falls back to compute (the count guard is enforced
+                # inside _shipped_chunk_vector, so we never mix shipped + freshly
+                # computed chunk vectors for the same node).
+                _shipped = _shipped_chunk_vector(
+                    server,
+                    KNOWLEDGE_ROOT,
+                    current_content_hash,
+                    chunk_num=chunk.chunk_number + 1,
+                    expected_chunks=_total_chunks,
+                )
+                if _shipped is not None:
+                    vec_arg, last_slots = _shipped
+                else:
+                    # v0.2.18: embed via EmbeddingService (multi-slot when
+                    # DUAL_EMBEDDING_ENABLED — see _build_vector_arg).
+                    vec_arg, last_slots = _build_vector_arg(server, chunk.content)
 
                 # Prepare data object (tags, links, typed_links, external_links shared across all chunks)
                 data_obj = {

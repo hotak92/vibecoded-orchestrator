@@ -1,0 +1,96 @@
+# Pre-shipped KG embeddings — sidecar format
+
+**Status (v0.2.70): plumbing only. No `.node_embeddings.<slot>.json` is shipped
+this release.** The ingest path in `templates/scripts/sync_knowledge_graph.py`
+is a strict NO-OP until a future update drops the data files in — install
+behaviour is unchanged (every curated node is embedded as before).
+
+## Why
+
+A 3rd-party VCO install re-embeds the orchestrator's ~117 curated KG nodes on
+first sync. On a CPU-only / slow-Ollama machine that is the slow part of the
+install (the "arctic-on-CPU install hang" class). Pre-computing those vectors
+and ingesting them — instead of recomputing — removes that cost.
+
+Embeddings are large (1024–2048 floats per chunk × ~117 nodes), so they are
+**not** committed in the same release as the (text-cheap) summaries. A later
+update will add the data files plus the CI/maintainer tooling to regenerate
+them per embedding model.
+
+## Format (`schema_version` 1)
+
+One file per named-vector slot, materialized into `<project>/knowledge/`
+verbatim alongside the node `.md` files and `.node_formats.json`:
+
+```
+knowledge/.node_embeddings.qwen3_embed.json
+knowledge/.node_embeddings.arctic2_embed.json
+...
+```
+
+```jsonc
+{
+  "schema_version": 1,
+  "slot": "qwen3_embed",                 // named-vector slot these vectors fill
+  "model_id": "qwen3-embedding:0.6b",    // provenance (informational)
+  "dim": 1024,                           // provenance (informational)
+  "nodes": {
+    "<content_hash>": {                  // the node's full-content signature
+                                         //   (sha256(full file text)[:16]) —
+                                         //   identical to the value sync stores
+                                         //   in the `content_hash` property and
+                                         //   to the key generate-kg-summary.py
+                                         //   uses for the summary sidecar
+      "total_chunks": 1,
+      "chunks": [
+        { "chunk_num": 1, "vector": [/* float, float, ... */] }
+      ]
+    }
+  }
+}
+```
+
+Multi-chunk nodes carry one `chunks[]` entry per chunk (1-indexed `chunk_num`),
+and `total_chunks` must equal `len(chunks)`.
+
+## Ingest gate — two non-negotiable guards
+
+`sync_node` (in `sync_knowledge_graph.py`) consults the sidecar BEFORE
+computing an embedding. It ingests the shipped vector via
+`collection.data.insert(vector=...)` ONLY when BOTH hold:
+
+1. **Staleness guard.** The sidecar entry's `<content_hash>` equals the node's
+   CURRENT content signature (`_content_signature_excluding_updated`). If the
+   node was edited since the vector was computed, the stale vector is never
+   ingested — the embedding is recomputed.
+2. **Slot-match guard.** The sidecar's `slot` equals the install's ACTIVE
+   named-vector slot (`server.text_vector_slot`). A `qwen3_embed` vector is
+   never written into an `arctic2_embed` install (and vice-versa). Mixing
+   embedding spaces would silently corrupt cosine search — this is the
+   v0.2.70 "same-active-slot, never cross-model" invariant.
+
+Additional safety: the chunk count must match (`len(chunks) == total_chunks`
+the node would produce), and every vector must be a non-empty list of finite
+floats. Any guard failing → fall back to computing the embedding (today's
+behaviour). When no sidecar exists for the active slot, the loader returns
+`None` and the gate is a pure NO-OP.
+
+## Hash convention (do NOT change)
+
+The `<content_hash>` keys here use the SAME storage-layer hash as
+`.node_formats.json` and the sync `content_hash` property:
+`sha256(text)[:16]`, computed over the node's full file text (with the
+`updated:` frontmatter line excluded, matching
+`_content_signature_excluding_updated`). This is deliberately DISTINCT from the
+retrieval-layer dedup hash (`rl_client/content_dedup.content_sha`, `sha1[:12]`)
+— the two layers answer different questions and are intentionally not
+converged (see the v0.2.70 dedup triage).
+
+## Regeneration (future)
+
+When the data files are added, a maintainer tool will (re)compute one sidecar
+per shipped embedding model by embedding each curated node's chunks and writing
+them keyed by `content_hash`. Because knowledge is materialized verbatim, the
+shipped `content_hash` matches the installed node's hash → the vectors are
+ingested without recompute. A model bump produces a new per-slot file; old
+slots remain valid for installs still on that model.
