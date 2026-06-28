@@ -5954,6 +5954,23 @@ def _collapse_to_one_per_node(
         r["best_chunk_number"] = r.get("chunk_number")
         collapsed.append(r)
     collapsed.sort(key=lambda x: x.get(score_field, 0.0), reverse=True)
+
+    # v0.2.70 concern-2: a SECOND collapse on CONTENT IDENTITY. The (file_path,
+    # title) key above keeps two rows that are the SAME node living in two
+    # collections — the canonical case is one node present in BOTH the project
+    # KG and the shared KG (same title + same body, different file_path). To the
+    # agent those are one identical block injected twice. The shared helper
+    # collapses entries that share BOTH a name AND a content fingerprint; its
+    # over-collapse guard keeps two genuinely-distinct-title nodes that merely
+    # share a body separate. Score-sorted above, so the first survivor per
+    # content-identity is the highest-scoring representative.
+    try:
+        from claude_mcp_servers.rl_client.content_dedup import (
+            dedup_by_content_identity,
+        )
+        collapsed = dedup_by_content_identity(collapsed, kind="kg")
+    except Exception:  # noqa: BLE001 — never break retrieval on a dedup import
+        pass
     return collapsed
 
 

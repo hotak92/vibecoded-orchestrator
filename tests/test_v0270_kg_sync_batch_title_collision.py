@@ -300,6 +300,53 @@ class BatchTitleCollisionTest(unittest.TestCase):
         store = server.client.collections.get(mod.COLLECTION_NAME)._store
         self.assertEqual(len(store), 5, "all 5 nodes must persist after run 2")
 
+    def test_resync_changed_file_does_not_stack_duplicate_rows(self):
+        """CONCERN 1 (v0.2.70 dedup follow-up): re-syncing a file whose CONTENT
+        changed must DELETE its prior file_path rows BEFORE inserting the new
+        ones — never stack. A changed body misses the embed-skip fast-path, so
+        this exercises the delete-then-insert leg directly.
+        """
+        path = self.root / "knowledge" / "concepts" / "evolving.md"
+        _write(path, "Evolving", "active", "First version of the body.")
+
+        mod = _load_sync_module(self.root)
+        server = _FakeServer()
+        self.assertTrue(mod.sync_node(server, path))
+        store = server.client.collections.get(mod.COLLECTION_NAME)._store
+        self.assertEqual(len(store), 1, "first sync → exactly 1 row")
+
+        # Change the body so the content_hash differs (fast-path will NOT fire).
+        _write(path, "Evolving", "active", "Second, substantially different body.")
+        self.assertTrue(mod.sync_node(server, path))
+        store = server.client.collections.get(mod.COLLECTION_NAME)._store
+        self.assertEqual(
+            len(store), 1,
+            f"re-sync of a changed file stacked a duplicate (rows={len(store)})",
+        )
+        # The surviving row carries the NEW body, proving delete-then-insert.
+        surviving = next(iter(store.values()))
+        self.assertIn("Second", surviving.properties.get("content", ""))
+
+    def test_two_distinct_files_identical_content_are_two_nodes(self):
+        """CONCERN 1 over-collapse guard: two DIFFERENT files with byte-identical
+        bodies are two legitimately-distinct nodes (different file_path) and must
+        BOTH be indexed — the sync layer must NOT collapse them into one.
+        """
+        body = "Exactly the same body text in two files."
+        _write(self.root / "knowledge" / "concepts" / "one.md", "One", "active", body)
+        _write(self.root / "knowledge" / "concepts" / "two.md", "Two", "active", body)
+
+        mod = _load_sync_module(self.root)
+        server = _FakeServer()
+        mod.sync_all_nodes(server)
+
+        fps = sorted(self._kg_file_paths(mod, server))
+        self.assertEqual(
+            fps,
+            ["knowledge/concepts/one.md", "knowledge/concepts/two.md"],
+            "two distinct files with identical content must stay two nodes",
+        )
+
     def test_delete_node_by_file_path_is_scoped(self):
         """Unit-level: _delete_node_by_file_path removes only the matching
         file_path's rows, never a same-title sibling at a different path."""

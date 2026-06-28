@@ -29,6 +29,15 @@
 #   * CODE  → PER-ENTITY. Key = "<full_name>" (code entities are atomic units
 #             retrieved whole; chunk-splitting adds no value).
 #
+# NOTE (v0.2.70 content-dedup triage): the CODE key is full_name-ONLY by
+# design, NOT a gap. Adding a body-hash would make a re-injected entity with a
+# CHANGED body inject AGAIN (the opposite of dedup); and two DISTINCT entities
+# that share a body are distinct functions that must both surface (over-collapse
+# guard). The Python retrieval helper (claude_mcp_servers/rl_client/content_dedup.py)
+# pins the SAME sha1(body)[:12] hash where the layers interoperate (the KG
+# title#hash key here), but the code-entity identity axis is intentionally
+# full_name on both sides.
+#
 # TOP RISK (maintainer-flagged): cross-session bleed via a shared "default"
 # bucket. vco_hook_session_id (_lib/session-id.sh) returns "" for a missing/
 # malformed payload AND the literal "default" for a hostile id (chars outside

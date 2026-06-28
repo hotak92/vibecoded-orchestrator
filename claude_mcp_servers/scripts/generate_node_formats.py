@@ -249,7 +249,15 @@ def get_chunks_from_weaviate(title: str) -> list[tuple[int, str]]:
 
 
 def content_hash(text: str) -> str:
-    """Short stable hash for dedup against re-runs (matches generate-kg-summary.py)."""
+    """Short stable hash for dedup against re-runs (matches generate-kg-summary.py).
+
+    STORAGE-LAYER hash: answers "is this sidecar already current so I can skip
+    re-generating it" — deliberately sha256[:16], distinct from the RETRIEVAL
+    content-identity hash (rl_client/content_dedup.content_sha, sha1[:12], which
+    mirrors the seen-store). The two layers answer different questions ("skip a
+    re-write" vs "drop a duplicate reaching Claude"); they are intentionally NOT
+    converged. See the v0.2.70 dedup triage.
+    """
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 

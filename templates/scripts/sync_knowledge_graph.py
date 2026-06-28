@@ -369,6 +369,14 @@ def _content_signature_excluding_updated(content: str) -> str:
     or just an unchanged file passing through the post-file-edit hook. If
     the signature is unchanged, the `updated:` timestamp is not bumped —
     avoiding KG-wide timestamp churn on every install run (v0.2.14).
+
+    STORAGE-LAYER hash, intentionally distinct from the RETRIEVAL content-
+    identity hash (rl_client/content_dedup.content_sha, sha1[:12]): this one
+    answers "is the stored object unchanged so I can skip the re-embed" and
+    carries the deliberate "exclude the `updated:` line" nuance so a timestamp-
+    only edit hashes identically. The retrieval hash answers "drop this
+    duplicate before it reaches Claude". The v0.2.70 dedup triage keeps them
+    separate on purpose — do NOT converge.
     """
     if not content.strip().startswith('---'):
         return _sha256_text(content)

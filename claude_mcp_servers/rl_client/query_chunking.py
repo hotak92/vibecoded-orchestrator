@@ -107,8 +107,14 @@ def codegraph_results_per_chunk(n: int, q: int) -> int:
 
 
 def _node_key(node: dict) -> tuple:
-    """Node identity for dedup — mirrors _collapse_to_one_per_node's key."""
-    return (node.get("file_path") or "", node.get("title") or "")
+    """Node identity for dedup — mirrors _collapse_to_one_per_node's key.
+
+    Delegates to the shared ``content_dedup.node_identity_key`` (one home) so
+    the KG identity definition is identical across this module,
+    ``server._collapse_to_one_per_node``, and the seen-store layer.
+    """
+    from claude_mcp_servers.rl_client.content_dedup import node_identity_key
+    return node_identity_key(node)
 
 
 def combine_kg_results(
@@ -136,6 +142,8 @@ def combine_kg_results(
     if cosine_fn is None:
         from claude_mcp_servers.weaviate_mcp.server import _cosine as cosine_fn
 
+    from claude_mcp_servers.rl_client.content_dedup import dedup_by_content_identity
+
     # Pool + dedup by node identity, keeping the first-seen dict (and its emb).
     by_key: dict[tuple, dict] = {}
     for chunk_nodes in pooled_per_chunk:
@@ -146,8 +154,16 @@ def combine_kg_results(
             if key not in by_key:
                 by_key[key] = node
 
+    # Content-identity dedup, PRE-rerank (coordinator refinement #1): collapse
+    # any (name, content_hash)-identical survivors BEFORE we spend cosine compute
+    # on them. Catches the cross-collection duplicate (same node title + body
+    # under project + shared KG) that identity dedup above misses because their
+    # file_path differs. Over-collapse guard lives in the shared helper: two
+    # DISTINCT-title nodes with coincidentally-identical bodies are NOT merged.
+    pooled_nodes = dedup_by_content_identity(by_key.values(), kind="kg")
+
     scored: list[tuple[float, dict]] = []
-    for node in by_key.values():
+    for node in pooled_nodes:
         node_emb = node.get("n_emb") or node.get("emb")
         if node_emb and query_chunk_embs:
             # MAX over (node_chunk × query_chunk) pairs — here one node vector
@@ -169,20 +185,27 @@ def combine_kg_results(
 
 
 def combine_codegraph_results(pooled_per_chunk: list[list[dict]]) -> list[dict]:
-    """CodeGraph: deduplicated UNION of per-chunk results (no rerank)."""
-    by_key: dict[tuple, dict] = {}
+    """CodeGraph: deduplicated UNION of per-chunk results (no rerank).
+
+    Two-axis dedup via the shared ``content_dedup`` helper (one home):
+      1. IDENTITY union — collapse the same entity (full_name/endpoint/path/
+         title) surfaced by multiple query chunks.
+      2. CONTENT-IDENTITY — then collapse any survivors that share BOTH a name
+         AND a body fingerprint (the maintainer's name+hash bar). The
+         over-collapse guard in the helper keeps two distinct entities with
+         coincidentally-identical bodies separate (different full_name).
+    """
+    from claude_mcp_servers.rl_client.content_dedup import (
+        code_identity_key,
+        dedup_by_content_identity,
+    )
+
+    by_key: dict[Any, dict] = {}
     for chunk_nodes in pooled_per_chunk:
         for node in chunk_nodes:
             if not isinstance(node, dict):
                 continue
-            # Codegraph nodes key on full_name / endpoint / path / title.
-            key = (
-                node.get("full_name")
-                or node.get("endpoint")
-                or node.get("path")
-                or node.get("title")
-                or id(node)
-            )
+            key = code_identity_key(node)
             if key not in by_key:
                 by_key[key] = node
-    return list(by_key.values())
+    return dedup_by_content_identity(by_key.values(), kind="code")
