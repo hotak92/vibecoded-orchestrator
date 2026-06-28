@@ -375,6 +375,12 @@ fn classify_terminal_status(outcome: &SetupOutcome) -> &'static str {
 /// terminal status becomes `deferred` not `done`). A deferral is the cold-
 /// Weaviate bootstrap case specifically; preserved-files / lazy-creation
 /// notices are informational but do NOT make the whole setup `deferred`.
+///
+/// ⚠️ MUST MATCH `launcher/src/lib/warning-severity.ts::isErrorWarning`. The
+/// `is_error` / `is_deferral` marker lists below are duplicated there for the
+/// SYNCHRONOUS `update_project_v2` warning stream (plain `Vec<String>`, no
+/// per-item severity). Keep both marker lists in sync or the async (this fn)
+/// and sync (TS) toast streams will classify the same message differently.
 pub fn classify_warning(raw: &str) -> (SetupWarningSeverity, bool) {
     let lower = raw.to_lowercase();
     // Genuine failure markers take precedence — a string can contain both

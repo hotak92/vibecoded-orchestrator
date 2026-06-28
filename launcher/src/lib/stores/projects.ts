@@ -18,6 +18,7 @@ import type {
   UnregisterReport,
 } from '$lib/types/launcher';
 import { toast } from '$lib/stores/toast';
+import { isErrorWarning } from '$lib/warning-severity';
 
 const SELECTED_KEY = 'vct.selected_project_id';
 
@@ -157,9 +158,20 @@ function createProjectsStore() {
 
       // Stream every warning as its own toast so the user sees the
       // deferral pointers (schema migration required, user-modified
-      // files preserved). They're info-level conditions, not blocking
+      // files preserved). Most are info-level conditions, not blocking
       // failures — but the project owner should action them.
-      for (const w of result.warnings) toast.error(w);
+      //
+      // v0.2.70 (A2-NIT1): route by severity instead of red-for-all. The
+      // synchronous `UpdateProjectResult.warnings` is a plain string list,
+      // so we classify by content via `isErrorWarning` (must-match
+      // `project_setup.rs::classify_warning`). Genuine failures → red error;
+      // informational notices (e.g. "additive schema migration auto-applied
+      // … vectors preserved", "N file(s) preserved") → amber info, so a
+      // SUCCESS message no longer mis-signals as an error.
+      for (const w of result.warnings) {
+        if (isErrorWarning(w)) toast.error(w);
+        else toast.info(w);
+      }
 
       // Refresh the cached project view (e.g. updated_at bumped via
       // db.log_change).

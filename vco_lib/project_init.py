@@ -7199,6 +7199,19 @@ def install_project_bundle(
                 _emit_symlink_redirect_deferral(
                     folder, symlink_redirect_events, orchestrator_root,
                 )
+                # v0.2.70 (Bug A2 SHOULD-FIX): the redirect itself only logged
+                # to stderr, which never reaches the launcher GUI (the Rust
+                # reads `warnings[]` off stdout). Surface a one-line summary so
+                # the user learns their bundle content landed at `.vco-new`
+                # siblings (because `.claude`/an ancestor is a symlink) instead
+                # of silently discovering it via UPDATE_DEFERRED.md. Mirrors the
+                # `bundle_user_modified_preserved` summary→warning pattern.
+                # Classified Info on both toast paths (no error/failed marker).
+                result["warnings"].append(
+                    f"{len(symlink_redirect_events)} file(s) redirected to "
+                    f".vco-new because the target is a symlink — see "
+                    f"UPDATE_DEFERRED.md (symlink_preserved_under_install_path)"
+                )
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
                 _log("4.bundle.deferral", "error",
@@ -8927,11 +8940,22 @@ def _merge_hooks_for_bundle(user_hooks: dict, template_hooks: dict) -> dict:
             new_entry["hooks"] = new_hooks
             merged_entries.append(new_entry)
 
-        # Second pass: APPEND template entries that are genuinely new. A
-        # template command is "handled" (so its entry need not be appended)
-        # when EITHER its exact string is already present verbatim OR its
-        # VCO-hook identity was just superseded/confirmed-current in a user
-        # entry above. Append only when NOT every command is handled.
+        # Second pass: APPEND genuinely-new template hooks at PER-COMMAND
+        # (inner-hook) granularity. A template command is "handled" (so it
+        # must NOT be re-appended) when EITHER its exact string is already
+        # present verbatim OR its VCO-hook identity was just superseded/
+        # confirmed-current in a user entry above.
+        #
+        # WHY per-command, not per-entry (pre-existing bug, A3): the template
+        # ships several inner-hooks in ONE event group (e.g. the `Stop` group
+        # carries cost-tracker + notify-stop + stop-drain-citations together).
+        # Appending the WHOLE group whenever ANY one inner-hook is new would
+        # re-introduce the already-present cost-tracker/notify-stop commands as
+        # a second entry → a duplicate cost row in costs.jsonl and a double
+        # desktop notification at every turn-end. Adding the new
+        # stop-drain-citations hook makes this fire on every existing project's
+        # next bundle update. So append only the inner-hooks that are NOT
+        # already handled, preserving their per-hook config (timeout/async).
         def _cmd_handled(c: str) -> bool:
             if c in existing_cmds:
                 return True
@@ -8941,10 +8965,22 @@ def _merge_hooks_for_bundle(user_hooks: dict, template_hooks: dict) -> dict:
         for t_entry in t_entries:
             if not isinstance(t_entry, dict):
                 continue
-            t_cmds = _entry_cmds(t_entry)
-            if t_cmds and all(_cmd_handled(c) for c in t_cmds):
+            # Carry forward only the template inner-hooks whose command is not
+            # already present (a command-less hook item, if any, is dropped on
+            # the append path — it has no identity to dedup and the user's
+            # existing group already covers any structural hooks).
+            new_inner = [
+                h
+                for h in t_entry.get("hooks", [])
+                if isinstance(h, dict)
+                and h.get("command")
+                and not _cmd_handled(h["command"])
+            ]
+            if not new_inner:
                 continue
-            merged_entries.append(t_entry)
+            appended = dict(t_entry)
+            appended["hooks"] = new_inner
+            merged_entries.append(appended)
 
         out[event] = merged_entries
     return out

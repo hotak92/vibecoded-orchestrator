@@ -415,6 +415,67 @@ class TestSymlinkRedirectDeferralWiring:
         assert "settings.json" in body
         assert ("coder.md" in body) or ("agents" in body)
 
+    def test_v0270_symlink_redirect_appends_warnings_summary(
+        self, tmp_root: Path, orch_root: Path
+    ) -> None:
+        """A2 SHOULD-FIX: a symlinked-`.claude/agents` install must also append
+        a `result["warnings"]` summary naming the `symlink_preserved_under_
+        install_path` condition — the stderr-only redirect line never reaches
+        the GUI, so the Rust→TS `warnings[]` channel is the user's only signal.
+        The summary must be Info-classified (no error/failed marker) so it does
+        NOT mis-render as a red toast (mirrors the bundle_user_modified summary
+        pattern)."""
+        project = tmp_root / "project"
+        claude = project / ".claude"
+        claude.mkdir(parents=True)
+        external = tmp_root / "external-agents"
+        external.mkdir()
+        os.symlink(external, claude / "agents")
+
+        result = self._install(project, orch_root)
+
+        warnings = result.get("warnings", [])
+        symlink_summaries = [
+            w for w in warnings if "symlink_preserved_under_install_path" in w
+        ]
+        assert symlink_summaries, (
+            f"a symlink-redirect summary warning must be appended; got: {warnings!r}"
+        )
+        summary = symlink_summaries[0]
+        # Names the redirect target + the condition the user actions.
+        assert ".vco-new" in summary
+        assert "symlink" in summary.lower()
+        # Info-classified: must NOT contain the markers the toast classifiers
+        # treat as a genuine error (else it renders red). Mirrors the Rust
+        # `classify_warning` / TS `isErrorWarning` error markers.
+        low = summary.lower()
+        for err_marker in (
+            "error",
+            "failed to start",
+            "subprocess failed",
+            "unparseable",
+            "did not become healthy",
+        ):
+            assert err_marker not in low, (
+                f"summary must classify as Info, not Error; "
+                f"contains {err_marker!r}: {summary!r}"
+            )
+
+    def test_v0270_no_symlink_no_summary_warning(
+        self, tmp_root: Path, orch_root: Path
+    ) -> None:
+        """Control: a normal (no-symlink) install must NOT append the
+        symlink-redirect summary warning."""
+        project = tmp_root / "project"
+        (project / ".claude").mkdir(parents=True)
+
+        result = self._install(project, orch_root)
+
+        warnings = result.get("warnings", [])
+        assert not any(
+            "symlink_preserved_under_install_path" in w for w in warnings
+        ), f"no symlink → no symlink summary; got: {warnings!r}"
+
     def test_v0270_dry_run_symlink_redirect_no_deferral(
         self, tmp_root: Path, orch_root: Path
     ) -> None:

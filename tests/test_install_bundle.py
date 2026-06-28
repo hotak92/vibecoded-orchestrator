@@ -1081,6 +1081,195 @@ class HookMergeSupersedeTests(unittest.TestCase):
             self._cmds(merged, "Stop"), ["bash .claude/hooks/notify-stop.sh"]
         )
 
+    # ── PER-COMMAND GRANULARITY (pre-existing bug, A3): adding a new inner-hook
+    #    to a multi-hook template event group must NOT re-append the whole group
+    #    (which would duplicate the already-present commands). Only the new
+    #    inner-hook is appended. ───────────────────────────────────────────────
+
+    def test_new_inner_hook_in_existing_group_no_sibling_duplication(self):
+        # The real shipped shape: the template `Stop` group carries 3 inner
+        # hooks; a project on a prior bundle has only the first 2. Updating
+        # must add stop-drain-citations EXACTLY ONCE and NOT re-introduce
+        # cost-tracker / notify-stop as a duplicate second entry.
+        cost = "bash .claude/hooks/cost-tracker.sh"
+        notify = "bash .claude/hooks/notify-stop.sh"
+        drain = "bash .claude/hooks/stop-drain-citations.sh"
+        user_hooks = {
+            "Stop": [
+                {
+                    "matcher": "",
+                    "hooks": [
+                        {"type": "command", "command": cost},
+                        {"type": "command", "command": notify},
+                    ],
+                },
+            ],
+        }
+        template_hooks = {
+            "Stop": [
+                {
+                    "matcher": "",
+                    "hooks": [
+                        {"type": "command", "command": cost},
+                        {"type": "command", "command": notify},
+                        {"type": "command", "command": drain},
+                    ],
+                },
+            ],
+        }
+        merged = project_init._merge_hooks_for_bundle(user_hooks, template_hooks)
+        cmds = self._cmds(merged, "Stop")
+        self.assertEqual(
+            cmds.count(cost), 1, f"cost-tracker must not be duplicated; got {cmds}"
+        )
+        self.assertEqual(
+            cmds.count(notify), 1, f"notify-stop must not be duplicated; got {cmds}"
+        )
+        self.assertEqual(
+            cmds.count(drain), 1, f"new stop-drain-citations added once; got {cmds}"
+        )
+        self.assertEqual(len(cmds), 3, f"exactly the 3 distinct commands; got {cmds}")
+
+    def test_new_inner_hook_append_preserves_per_hook_config(self):
+        # The appended inner-hook must carry its own timeout/async, not the
+        # sibling's, and not the whole template group.
+        cost = "bash .claude/hooks/cost-tracker.sh"
+        drain = "bash .claude/hooks/stop-drain-citations.sh"
+        user_hooks = {
+            "Stop": [
+                {"matcher": "", "hooks": [{"type": "command", "command": cost, "timeout": 5}]},
+            ],
+        }
+        template_hooks = {
+            "Stop": [
+                {
+                    "matcher": "",
+                    "hooks": [
+                        {"type": "command", "command": cost, "timeout": 5},
+                        {"type": "command", "command": drain, "timeout": 30, "async": True},
+                    ],
+                },
+            ],
+        }
+        merged = project_init._merge_hooks_for_bundle(user_hooks, template_hooks)
+        drain_hooks = [
+            h
+            for entry in merged["Stop"]
+            for h in entry.get("hooks", [])
+            if h.get("command") == drain
+        ]
+        self.assertEqual(len(drain_hooks), 1, "drain appended exactly once")
+        self.assertEqual(drain_hooks[0].get("timeout"), 30)
+        self.assertTrue(drain_hooks[0].get("async"))
+
+    def test_inner_hook_merge_is_idempotent(self):
+        # Re-running the merge against an already-up-to-date project must not
+        # grow the command list.
+        cost = "bash .claude/hooks/cost-tracker.sh"
+        notify = "bash .claude/hooks/notify-stop.sh"
+        drain = "bash .claude/hooks/stop-drain-citations.sh"
+        stop_group = {
+            "matcher": "",
+            "hooks": [
+                {"type": "command", "command": cost},
+                {"type": "command", "command": notify},
+                {"type": "command", "command": drain},
+            ],
+        }
+        # First merge brings the project current.
+        once = project_init._merge_hooks_for_bundle(
+            {"Stop": [{"matcher": "", "hooks": [
+                {"type": "command", "command": cost},
+                {"type": "command", "command": notify},
+            ]}]},
+            {"Stop": [stop_group]},
+        )
+        # Second merge (same template) must be a no-op on command counts.
+        twice = project_init._merge_hooks_for_bundle(once, {"Stop": [stop_group]})
+        cmds_once = sorted(self._cmds(once, "Stop"))
+        cmds_twice = sorted(self._cmds(twice, "Stop"))
+        self.assertEqual(cmds_once, cmds_twice, "merge is idempotent — no growth")
+        self.assertEqual(cmds_twice.count(cost), 1)
+        self.assertEqual(cmds_twice.count(notify), 1)
+        self.assertEqual(cmds_twice.count(drain), 1)
+
+    def test_user_custom_inner_hook_in_group_preserved_when_inner_appended(self):
+        # A user's OWN custom Stop command coexisting with VCO commands in the
+        # same group must survive while the new VCO inner-hook is added.
+        cost = "bash .claude/hooks/cost-tracker.sh"
+        drain = "bash .claude/hooks/stop-drain-citations.sh"
+        custom = "bash ./scripts/my-own-stop-hook.sh"
+        user_hooks = {
+            "Stop": [
+                {
+                    "matcher": "",
+                    "hooks": [
+                        {"type": "command", "command": cost},
+                        {"type": "command", "command": custom},
+                    ],
+                },
+            ],
+        }
+        template_hooks = {
+            "Stop": [
+                {
+                    "matcher": "",
+                    "hooks": [
+                        {"type": "command", "command": cost},
+                        {"type": "command", "command": drain},
+                    ],
+                },
+            ],
+        }
+        merged = project_init._merge_hooks_for_bundle(user_hooks, template_hooks)
+        cmds = self._cmds(merged, "Stop")
+        self.assertIn(custom, cmds, "user's own Stop hook must be preserved")
+        self.assertEqual(cmds.count(custom), 1, "user hook not duplicated")
+        self.assertEqual(cmds.count(cost), 1, "shared cost-tracker not duplicated")
+        self.assertEqual(cmds.count(drain), 1, "new VCO inner-hook appended once")
+
+    def test_inner_granularity_does_not_regress_supersede(self):
+        # Stream-G supersede must still replace a stale backslash command even
+        # when the per-command append path is exercised: the template Stop
+        # group has a current cost-tracker + a new drain; the user has a STALE
+        # backslash cost-tracker. Uses the real shipped command shapes (full
+        # PowerShell flag string) so the `-File` value resolves an identity.
+        # Result: stale gone, current cost once, drain appended once.
+        stale_cost = (
+            "powershell -NoProfile -ExecutionPolicy Bypass -File "
+            ".claude\\hooks\\cost-tracker.ps1"
+        )
+        current_cost = (
+            "powershell -NoProfile -ExecutionPolicy Bypass -File "
+            ".claude/hooks/cost-tracker.ps1"
+        )
+        drain = (
+            "powershell -NoProfile -ExecutionPolicy Bypass -File "
+            ".claude/hooks/stop-drain-citations.ps1"
+        )
+        user_hooks = {
+            "Stop": [
+                {"matcher": "", "hooks": [{"type": "command", "command": stale_cost}]},
+            ],
+        }
+        template_hooks = {
+            "Stop": [
+                {
+                    "matcher": "",
+                    "hooks": [
+                        {"type": "command", "command": current_cost},
+                        {"type": "command", "command": drain},
+                    ],
+                },
+            ],
+        }
+        merged = project_init._merge_hooks_for_bundle(user_hooks, template_hooks)
+        cmds = self._cmds(merged, "Stop")
+        self.assertNotIn(stale_cost, cmds, "stale backslash command superseded")
+        self.assertEqual(cmds.count(current_cost), 1, "current cost-tracker once")
+        self.assertEqual(cmds.count(drain), 1, "new drain inner-hook appended once")
+        self.assertEqual(len(cmds), 2, f"exactly current-cost + drain; got {cmds}")
+
 
 # ---------------------------------------------------------------------------
 # Manifest tests

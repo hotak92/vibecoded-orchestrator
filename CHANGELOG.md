@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (v0.2.70 streams A, B — migration + install)
+- **Additive Weaviate schema migration now AUTO-APPLIES (Stream A):** a
+  bundle update that detects purely-additive (lossless) schema drift — new
+  optional vector slots added via the `copy` action — now applies it
+  automatically instead of writing a `schema_migration_required` deferral and
+  waiting for consent. The `copy` action round-trips every object UUID, named
+  vector, and property byte-for-byte through a `<collection>__staging`
+  double-copy, so there is no data to lose. The launcher issues an explicit WET
+  `migrate-collections` follow-up (`run_migrate_apply_additive`) after a clean
+  additive-only dry-run; the auto-apply is justified by losslessness alone and
+  is gated behind a per-project in-process re-entrancy lock
+  (`MigrateLockGuard`, refuse-on-contention) so two concurrent updates for the
+  same project can't collide on the shared staging name. A LOSSY `rebuild`
+  migration (legacy single-vector / dimension-mismatch / `--force-rebuild`) is
+  unchanged — it re-embeds every object and still defers for explicit consent.
+  Corrected the factually-wrong "copy drops the collection mid-swap" deferral /
+  warning text in lockstep on both the Python (`_emit_migrate_required_deferral`)
+  and Rust sides (with must-match comments); the consent prompt now fires only
+  for the `rebuild` case it actually applies to.
+- **Symlink-redirect bundle deferral is now wired (Stream B):** when a
+  project's `.claude` (or `.claude/agents`, or any ancestor) is a symlink, the
+  bundle installer refuses to write through it and parks the new content at a
+  `.vco-new` sibling — but the previously-orphaned `emit_symlink_deferral`
+  helper was never called, so the user only found out by inspecting the file
+  tree. `_write_file_atomic` now returns the redirect path, `install_project_bundle`
+  accumulates every `(original, .vco-new)` pair (from the main file loop AND
+  the `settings.json` template merge, which also redirects when `.claude`
+  itself is the symlink), and emits ONE consolidated
+  `symlink_preserved_under_install_path` deferral after the loop (skipped on
+  dry-run). A one-line `warnings[]` summary now also surfaces in the launcher
+  toast stream so the redirect is visible in the GUI, not just stderr.
+
 ### Fixed (v0.2.70 streams C, D, E — context-injection hooks)
 - **Code-graph CLI read-path (Stream C1, broken since v0.2.21):**
   `templates/scripts/query_code_graph.py` now resolves the default project from
@@ -41,6 +73,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   command-noise strip and the abs→relative path normaliser are extracted to
   shared `_lib/` helpers (`command-noise-strip.{sh,ps1}`, `vco_to_repo_relative`)
   with one home per language.
+
+### Fixed (v0.2.70 stream F — RL citation pipeline)
+- **RL citation pipeline (Stream F, RL module optional):** repairs the
+  near-zero citation rate that left the RL reranker's training corpus almost
+  empty. The root cause was a missing node embedding on ~96% of retrievals (the
+  hook path never enriched at all; the MCP path could lose the vector when chunk
+  collapse kept a keyword-only chunk), so cosine-citation scoring had nothing to
+  compare against. `_rl_refetch_node_vector` now REGENERATES a node's vector
+  from its chunk text in the ACTIVE embedding model's space (via the same
+  `EmbeddingService.embed_text` + model-aware chunking preset the answer chunks
+  use) when no stored active-slot vector exists, on both the MCP and hook enrich
+  paths through one shared `rl_client/embed_regen.py` helper; a node whose
+  vector genuinely cannot be regenerated is DROPPED and logged at INFO, never
+  fabricated. `_cosine` now refuses to compare cross-dimension vectors (returns
+  `0.0` instead of truncating to the shorter length) so a vector is never
+  scored against a different model's space, and `_extract_obj_vector` reads only
+  the active slot. Telemetry scores are clamped to `[0,1]` at the writer
+  boundary so unbounded hybrid-fusion scores never reach `rl_events`.
+  Single-chunk nodes are normalised to "chunk 1 of 1" so they stay retrieved,
+  ranked, rendered, and citation-eligible. A hub-drained deferred-citation queue
+  stages each citation context to `.claude/state/rl_pending/` at retrieval time;
+  a new `stop-drain-citations.{sh,ps1}` Stop hook drains it at turn-end via
+  `rl_drain_citations.py` on an ACCUMULATE-DON'T-DROP basis (a sub-gate window
+  is left for the next Stop; compute + write happen only at/above the gate or on
+  TTL). Oversized queries on the hook path are detected and chunked through the
+  shared `Chunker`, retrieved per chunk, and recombined (KG: pool + dedup +
+  max-over-chunk rerank; CodeGraph: dedup union) so a query longer than the
+  model's context no longer silently truncates; normal-size queries take the
+  unchanged single-pass path. The `pre_bash` pairing telemetry event (declared
+  but never written) is now emitted from the pre-bash hook. The RL module stays
+  OPTIONAL throughout — without it installed, retrieval falls back to Weaviate
+  cosine ordering and the corpus/logging accumulation continues unchanged.
+  Shared logic is extracted under `rl_client/` (`answer_window.py`,
+  `citation_compute.py`, `citation_pending.py`, `embed_regen.py`,
+  `query_chunking.py`) with one home per concern.
 
 ## [0.2.69] - 2026-06-27
 

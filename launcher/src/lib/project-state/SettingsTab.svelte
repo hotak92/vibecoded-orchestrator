@@ -244,8 +244,11 @@
         (hooks, scripts, agents, skills, infrastructure) WITHOUT overwriting your
         customizations. Files you've edited are preserved and listed in
         <code>.claude/context/UPDATE_DEFERRED.md</code> with a
-        <code>bundle_user_modified_preserved</code> entry. The bundle install can take
-        5–15 seconds.
+        <code>bundle_user_modified_preserved</code> entry. If your
+        <code>.claude</code> (or <code>.claude/agents</code>) is a symlink, new
+        content is parked at <code>.vco-new</code> siblings and listed under a
+        <code>symlink_preserved_under_install_path</code> entry instead. The
+        bundle install can take 5–15 seconds.
       </p>
       <button
         class="ps-btn-primary"

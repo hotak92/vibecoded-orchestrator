@@ -1059,7 +1059,8 @@ pub async fn list_user_secret_keys_v2(
 // These tests cover the scope-invariant guard rails and the active-flag
 // gate. The scope-invariants check is a pure-DB function; the
 // active-flag tests use the in-memory DB helpers and (where the keychain
-// is involved) skip via `keyring_available()`.
+// is involved) serialise via the shared
+// `crate::secrets::test_serialize::keychain_serialize_lock`.
 
 #[cfg(test)]
 mod tests {
@@ -1110,24 +1111,6 @@ mod tests {
                 params![id, name, folder, id, 1_700_000_000_000_i64],
             )
             .unwrap();
-    }
-
-    /// Probe whether the OS keychain backend is available in this test
-    /// environment. CI containers and headless build hosts typically
-    /// have no Secret Service / Keychain / Credential Manager running,
-    /// so any test that exercises the actual keychain has to short-circuit.
-    fn keyring_available() -> bool {
-        let entry = match keyring::Entry::new("vct.test.probe", "probe") {
-            Ok(e) => e,
-            Err(_) => return false,
-        };
-        // Try a write+delete round-trip. Any error means the backend
-        // can't be reached — we skip the keychain-touching tests.
-        if entry.set_password("canary").is_err() {
-            return false;
-        }
-        let _ = entry.delete_credential();
-        true
     }
 
     #[test]
@@ -2019,7 +2002,8 @@ mod tests {
     //
     // Layer 2 needs an OS keychain because the `is_set` field (cross-launcher
     // gate × keychain presence) reads through the keychain. Tests that
-    // exercise it short-circuit on `keyring_available()`.
+    // exercise it serialise via the shared
+    // `crate::secrets::test_serialize::keychain_serialize_lock`.
 
     #[test]
     fn resolve_winning_scope_precedence_per_project_beats_shared_beats_global() {

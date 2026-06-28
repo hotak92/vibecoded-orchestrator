@@ -640,8 +640,9 @@ async fn apply_mcp_to_claude_settings(config: &OrchestratorConfig) -> Result<(),
 //     temp dir → the test's ~/.claude.json doesn't touch the real one.
 //   - A process-wide Mutex serialises tests that mutate these env vars
 //     so parallel runs don't observe each other.
-//   - Keychain-touching tests probe via `keyring_available()`; CI
-//     hosts without an OS keychain backend skip silently.
+//   - Keychain-touching tests serialise via the shared
+//     `crate::secrets::test_serialize::keychain_serialize_lock`; CI hosts
+//     without an OS keychain backend tolerate the soft-fail paths.
 
 #[cfg(test)]
 mod tests {
@@ -661,18 +662,6 @@ mod tests {
     // serialise against installer + modules_api hub-resolver tests too.
     #[allow(dead_code)]
     static SERIALIZE: Mutex<()> = Mutex::new(());
-
-    fn keyring_available() -> bool {
-        let entry = match keyring::Entry::new("vct.test.dashboard.probe", "probe") {
-            Ok(e) => e,
-            Err(_) => return false,
-        };
-        if entry.set_password("canary").is_err() {
-            return false;
-        }
-        let _ = entry.delete_credential();
-        true
-    }
 
     /// Set up a temp dir as the launcher's state root + the user's HOME.
     /// Returns a guard that restores prior env on drop and the temp path.

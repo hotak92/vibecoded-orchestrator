@@ -163,9 +163,12 @@
     const threshold = m.autoEnableEventThreshold;
     const pct = Math.min(100, Math.round((s.rlEventsCount / threshold) * 100));
     if (s.rlEventsCount >= threshold) {
-      return `${s.rlEventsCount.toLocaleString()} retrieval events accumulated — threshold met`;
+      // `rl_events_count` is SELECT COUNT(*) FROM rl_events — ALL event types
+      // (retrieval + citation + bash_outcome/edit_outcome + pre_bash), not
+      // retrieval alone. Label accordingly (v0.2.70 A2-NIT2).
+      return `${s.rlEventsCount.toLocaleString()} RL events accumulated — threshold met`;
     }
-    return `${s.rlEventsCount.toLocaleString()} / ${threshold.toLocaleString()} retrieval events (${pct}%)`;
+    return `${s.rlEventsCount.toLocaleString()} / ${threshold.toLocaleString()} RL events (${pct}%)`;
   }
 
   onMount(() => {
