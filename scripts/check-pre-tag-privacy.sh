@@ -178,8 +178,13 @@ check_pattern "Antigravity personal-project leak" "\bAntigravity\b"
 # (test_launcher_leak_grep.py), the leak-detector ASSERTION
 # (test_release_tag_repoint_guard.py — `assert "fabio" not in text`), this
 # gate itself, the secrets-scan sibling, the cleanliness policy doc,
-# CHANGELOG.md (historical narrative), CLA.md + pyproject author metadata,
-# and the test FIXTURES where a name is legitimate XML-escape test data.
+# CLA.md + pyproject author metadata, and the test FIXTURES where a name is
+# legitimate XML-escape test data.
+#
+# v0.2.70: CHANGELOG.md is NO LONGER exempt. The prior "historical narrative"
+# exemption let bug-reporter first names sit in shipped changelog entries
+# (scrubbed to neutral bug-class descriptors in v0.2.70); the gate now also
+# guards the changelog so a future entry can't reintroduce a name.
 bare_name_re="\b(Fabio|Luciano|Lucas)\b"
 bare_name_hits=$(git grep -l -i -E "$bare_name_re" -- \
     ':!:tests/test_launcher_leak_grep.py' \
@@ -190,7 +195,6 @@ bare_name_hits=$(git grep -l -i -E "$bare_name_re" -- \
     ':!:docs/REPO_CLEANLINESS.md' \
     ':!:tests/test_release_tag_repoint_guard.py' \
     ':!:tests/test_scheduled_task_xml_escape.py' \
-    ':!:CHANGELOG.md' \
     ':!:CLA.md' \
     ':!:pyproject.toml' \
     ':!:claude_mcp_servers/pyproject.toml' \
