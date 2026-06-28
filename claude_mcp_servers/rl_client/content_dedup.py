@@ -165,14 +165,39 @@ def content_identity_key(node: dict, *, kind: str = "kg") -> tuple:
     distinct identity and never collapsed with another content-less entry. Two
     distinct items only ever collapse when they share BOTH a name AND a
     non-empty content fingerprint.
+
+    TRUNCATION GUARD (v0.2.70 over-collapse fix): result dicts produced by
+    ``weaviate_mcp.server._format_obj`` carry a TRUNCATED display body
+    (``content[:300] + "..."``) — hashing that field would key two
+    legitimately-distinct same-title nodes that merely share their first 300
+    chars on the SAME content fingerprint, silently dropping the one with the
+    differing tail. To prevent that, ``_format_obj`` attaches a precomputed
+    ``content_sha`` computed from the FULL untruncated body. When present we
+    use it verbatim; otherwise we fall back to hashing the (possibly truncated)
+    display field. The fallback is acceptable for callers that pass full bodies
+    (tests, future producers); the truncation risk only ever existed for the
+    ``_format_obj`` display path, which now always supplies ``content_sha``.
     """
     if kind == "code":
         name = code_identity_key(node)
         body = code_content_text(node)
+        # Code dicts come from the code formatter, which never truncates a
+        # fingerprinted body (ranks 1-2 carry the FULL function/class body;
+        # ranks 3-4 omit it → identity fallback). So there is no precomputed
+        # full-body sha to honour here — hash the recovered body directly.
+        sha = content_sha(body)
     else:
         name = node.get("title") or ""
         body = node_content_text(node)
-    sha = content_sha(body)
+        # Prefer the full-body fingerprint attached by the KG/doc producer
+        # (``_format_obj`` sets ``content_sha`` from the UNTRUNCATED body) over
+        # re-hashing ``content``, which on the _format_obj display path is the
+        # truncated ``content[:300] + "..."`` form. Falling back to hashing the
+        # (possibly truncated) display body is only reached for callers that
+        # build dicts without _format_obj (tests / future producers), where the
+        # body they pass is the real one.
+        precomputed = node.get("content_sha") if isinstance(node, dict) else None
+        sha = precomputed if precomputed else content_sha(body)
     if not sha:
         # No comparable content → fall back to identity so we never collapse
         # two content-less-but-distinct entries together. ``code_identity_key``

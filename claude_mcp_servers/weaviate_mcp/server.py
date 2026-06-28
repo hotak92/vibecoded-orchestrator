@@ -3322,10 +3322,32 @@ def _format_obj(obj, collection_name: str, distance: float | None = None) -> dic
         if (collection_name and DEVELOPMENT_COLLECTION and collection_name == DEVELOPMENT_COLLECTION)
         else "unknown"
     )
+    # v0.2.70 over-collapse fix: fingerprint the FULL body BEFORE truncation.
+    # The `content` field below is truncated to `content[:300] + "..."` for
+    # display, but the content-identity dedup (`_collapse_to_one_per_node`'s
+    # second pass + the hook path's combine_kg_results) must key on the REAL
+    # body — otherwise two legitimately-distinct same-title nodes sharing their
+    # first 300 chars but differing in the tail would collapse to one, silently
+    # dropping a node from Claude's context. The shared dedup helper prefers
+    # this precomputed sha over re-hashing the truncated display field.
+    # `content_sha` mirrors the seen-store sha1(body)[:12] convention via the
+    # one Python home (rl_client.content_dedup.content_sha).
+    try:
+        from claude_mcp_servers.rl_client.content_dedup import (
+            content_sha as _content_sha,
+        )
+        _full_content_sha = _content_sha((content or "").strip())
+    except Exception:  # noqa: BLE001 — never break formatting on a dedup import
+        _full_content_sha = ""
     return {
         "title": title,
         "node_type": obj.properties.get("node_type") or _default_node_type,
         "content": content[:300] + "..." if len(content) > 300 else content,
+        # Full-body fingerprint (untruncated) for content-identity dedup. See
+        # the comment above + content_dedup.content_identity_key's truncation
+        # guard. Empty string when content is empty (helper then falls back to
+        # identity keying so a content-less node is never collapsed/dropped).
+        "content_sha": _full_content_sha,
         "tags": obj.properties.get("tags", []),
         "file_path": obj.properties.get("file_path", ""),
         "created_at": serialize_datetime(obj.properties.get("created_at", "")),
@@ -5792,6 +5814,12 @@ async def _hybrid_search_single_collection(
             # _format_obj (single source).
             "node_type": r.get("node_type", "unknown"),
             "content": r.get("content", ""),
+            # v0.2.70 over-collapse fix: carry the full-body fingerprint from
+            # _format_obj so the downstream _collapse_to_one_per_node content
+            # pass keys on the REAL body, not the truncated `content` display
+            # field. Without this the rebuilt entry would lose content_sha and
+            # the collapse would fall back to hashing the truncated body.
+            "content_sha": r.get("content_sha", ""),
             "tags": r.get("tags", []),
             "file_path": r.get("file_path", ""),
             "collection": coll_name,
@@ -5833,6 +5861,10 @@ async def _hybrid_search_single_collection(
                 # site above.
                 "node_type": formatted_kw.get("node_type", "unknown"),
                 "content": formatted_kw.get("content", ""),
+                # v0.2.70 over-collapse fix: see the semantic-site mirror above —
+                # propagate the full-body fingerprint so the collapse content
+                # pass never keys on the truncated display body.
+                "content_sha": formatted_kw.get("content_sha", ""),
                 "tags": formatted_kw.get("tags", []),
                 "file_path": formatted_kw.get("file_path", ""),
                 "collection": coll_name,
