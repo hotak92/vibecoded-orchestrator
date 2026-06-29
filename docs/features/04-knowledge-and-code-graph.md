@@ -218,10 +218,14 @@ Backfills `valid_from` / `created` / `updated` fields in YAML frontmatter from `
 Point-in-time KG queries: retrieve nodes that were `active` at a given timestamp using `valid_from` / `valid_until` Weaviate filters.
 
 ### `generate-kg-summary.py`
-Generates LLM summaries (Claude Haiku) for KG nodes and stores them in `knowledge/.node_formats.json`. For multi-chunk nodes, generates both whole-node and per-chunk summaries. Content hash prevents regeneration when content is unchanged.
+Generates LLM summaries (Claude CLI when available, else Ollama, else the Anthropic API — see the tier order in the script) for KG nodes and stores them in `knowledge/.node_formats.json`. For multi-chunk nodes, generates both whole-node and per-chunk summaries. Content hash prevents regeneration when content is unchanged.
+
+Since v0.2.70 the orchestrator's curated seed nodes ship a **pre-built** `templates/knowledge/.node_formats.json`, materialized into a fresh project's `knowledge/.node_formats.json` on install. Because seed nodes are materialized verbatim (no install-time substitution), their `content_hash` matches the shipped sidecar, so the per-node summary call is **skipped** on first install — a fresh install no longer pays the per-node LLM cost for the shipped KG. The user's own authored nodes still generate normally; the sidecar is `keep-regenerated` so the user's local additions survive bundle updates.
 
 ### `.node_formats.json` sidecar
 JSON file at `knowledge/.node_formats.json`. Maps `file_path → {title, description, summary, chunk_summaries, total_chunks, generated_at, content_hash}`. Used by `hybrid_search`'s `detail` parameter: `"titles"` skips it, `"descriptions"` returns the 3-4 sentence description, `"full"` returns up to 300 chars of raw content.
+
+A sibling **`.node_embeddings.<slot>.json`** sidecar format (per named-vector slot, e.g. `qwen3_embed` / `arctic2_embed`) is defined as of v0.2.70 to let `sync_knowledge_graph.py` ingest a pre-computed node vector instead of computing one at install time — gated on a content-hash staleness check AND an active-slot match (never ingests a vector from a different embedding model). The ingest plumbing ships inert: no `.node_embeddings.*.json` is shipped yet, so installs compute embeddings as before until a future update populates the vector files.
 
 ### `detect_duplicates.py`
 Semantic duplicate detection with configurable threshold (`DEFAULT_SIMILARITY_THRESHOLD = 0.95`). Three detection methods: semantic similarity (Weaviate vector distance), Levenshtein distance on filenames, title substring matching. `--auto-merge` for high-confidence cases.
