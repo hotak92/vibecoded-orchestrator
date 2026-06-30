@@ -1260,6 +1260,50 @@ impl PullPlan {
     }
 }
 
+/// THE single shared classifier for "did a merge/rebase/pull fail because of a
+/// CONFLICT (or a dirty-tree refusal / autostash-pop) that should route to the
+/// conflict-recovery flow, rather than a network/precondition error?".
+///
+/// v0.2.71 (BLOCKER-1 fix): pre-v0.2.71 there were TWO hand-maintained copies —
+/// `installer::is_merge_or_rebase_conflict` and `self_update::is_merge_conflict`
+/// — whose own comments admitted the drift hazard. They are now ONE function
+/// here (the home of the shared `resolve_divergence_pull_plan`). Both surfaces
+/// call this; they cannot diverge.
+///
+/// IMPORTANT — feed it the COMBINED stdout+stderr. git writes `CONFLICT (...)`
+/// lines to STDOUT, not stderr; a classifier fed stderr-only silently misses
+/// real conflicts (that was half of BLOCKER-1). Use `git_output_combined()` /
+/// `run_git_capture` so both streams reach this matcher.
+///
+/// Phrases (git 2.34+):
+///   - merge/rebase conflict: "CONFLICT (...)", "Automatic merge failed",
+///     "could not apply", "Resolve all conflicts"
+///   - dirty-tree refusal: "would be overwritten", "you have unstaged changes",
+///     "cannot pull with rebase", "Please commit your changes or stash",
+///     "Cannot merge with local modifications"
+///   - autostash-pop conflict: "autostash" (the pop left markers)
+///
+/// LOCALE NOTE (LOW-4): these are English substrings. git localizes user-facing
+/// messages, so a non-English `LC_ALL`/`LANG` git would emit translated phrases
+/// and this matcher would miss them. The callers therefore invoke git with
+/// `LC_ALL=C` (see `run_git_capture`) so git always emits the C-locale English
+/// wording this matcher expects. Do NOT rely on this matcher against
+/// unspecified-locale git output.
+pub(crate) fn is_pull_conflict(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("conflict")
+        || lower.contains("automatic merge failed")
+        || lower.contains("could not apply")
+        || lower.contains("resolve all conflicts")
+        // dirty-tree refusals + autostash-pop failures
+        || lower.contains("would be overwritten")
+        || lower.contains("you have unstaged changes")
+        || lower.contains("cannot pull with rebase")
+        || lower.contains("please commit your changes or stash")
+        || lower.contains("cannot merge with local modifications")
+        || lower.contains("autostash")
+}
+
 /// Decide the pull strategy for a divergence-aware update. This is the EXACT
 /// logic that lived inline in `update_orchestrator` (installer.rs, pre-v0.2.71)
 /// — extracted verbatim so the two update surfaces share ONE decision.
@@ -2789,6 +2833,66 @@ mod tests {
             "merged .gitignore missing upstream rule: {}",
             merged
         );
+    }
+
+    // ----- v0.2.71 BLOCKER-1: the ONE shared conflict classifier -----
+    // (gates the destructive resync recovery on both update surfaces — the
+    // project rule requires the destructive-decision branch to be tested.)
+
+    #[test]
+    fn is_pull_conflict_detects_merge_and_rebase_conflicts() {
+        // git 2.34+ samples — these land on STDOUT, which is exactly why the
+        // callers must feed combined stdout+stderr.
+        assert!(is_pull_conflict("CONFLICT (content): Merge conflict in .gitignore"));
+        assert!(is_pull_conflict(
+            "Automatic merge failed; fix conflicts and then commit the result."
+        ));
+        assert!(is_pull_conflict("error: could not apply abc123... Update README"));
+        assert!(is_pull_conflict(
+            "Resolve all conflicts manually, mark them as resolved with"
+        ));
+    }
+
+    #[test]
+    fn is_pull_conflict_detects_dirty_tree_refusals_and_autostash_pop() {
+        assert!(is_pull_conflict(
+            "error: Your local changes to the following files would be overwritten by merge:\n\t.gitignore\nPlease commit your changes or stash them before you merge."
+        ));
+        assert!(is_pull_conflict("error: cannot rebase: You have unstaged changes."));
+        assert!(is_pull_conflict(
+            "error: cannot pull with rebase: You have unstaged changes."
+        ));
+        assert!(is_pull_conflict(
+            "error: Cannot merge with local modifications; please commit or stash them."
+        ));
+        assert!(is_pull_conflict("Applying autostash resulted in conflicts."));
+        assert!(is_pull_conflict(
+            "error: could not apply autostash, the stash entry is kept"
+        ));
+    }
+
+    #[test]
+    fn is_pull_conflict_ignores_network_and_precondition_errors() {
+        // The dangerous direction: a NON-conflict failure must NOT be classified
+        // as a conflict (else a network blip would route to the conflict modal /
+        // trigger a merge-abort on a tree with no merge in progress).
+        assert!(!is_pull_conflict("fatal: not a git repository"));
+        assert!(!is_pull_conflict("Could not resolve host: github.com"));
+        assert!(!is_pull_conflict(""));
+        assert!(!is_pull_conflict(
+            "fatal: unable to access 'https://github.com/...': Failed to connect"
+        ));
+        assert!(!is_pull_conflict("error: Permission denied (publickey)."));
+        // "Already up to date." is success wording, never a conflict.
+        assert!(!is_pull_conflict("Already up to date."));
+        // A clean autostash SUCCESS prints "Applied autostash." — but the
+        // classifier only ever runs on a FAILED pull, so this string never
+        // reaches it on the success path. Documented here so a future reader
+        // doesn't "fix" the substring match: note we DO match "autostash" (the
+        // pop-conflict wording is "Applying autostash" / "could not apply
+        // autostash"); a SUCCESS message "Applied autostash." would match too,
+        // which is harmless because is_pull_conflict is only consulted after a
+        // non-zero git exit. (Verified: clean autostash pulls exit 0.)
     }
 
     // ----- v0.2.71 Piece 3: PullPlan + shared decision -----

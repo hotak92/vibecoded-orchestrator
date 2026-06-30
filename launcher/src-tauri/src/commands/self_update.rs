@@ -343,6 +343,56 @@ async fn run_git(repo: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Like `run_git` but on FAILURE returns the COMBINED stdout+stderr (and forces
+/// `LC_ALL=C` so git emits C-locale English wording). v0.2.71 (BLOCKER-1 fix):
+/// git writes `CONFLICT (...)` lines to STDOUT, not stderr, so the plain
+/// `run_git` (stderr-only error) made `is_merge_conflict` silently miss a real
+/// merge conflict on this surface — the pull error looked like a generic
+/// failure and dead-ended at a raw toast while leaving `.git/MERGE_HEAD` on
+/// disk. This helper feeds the shared `is_pull_conflict` classifier BOTH
+/// streams so a RealMerge conflict is correctly recognized and routed to the
+/// resync modal. The `LC_ALL=C` pin matches the classifier's English-substring
+/// assumption (LOW-4). Success return is unchanged (trimmed stdout).
+async fn run_git_combined(repo: &Path, args: &[&str]) -> Result<String, String> {
+    let fut = TokioCommand::new("git").silent()
+        .args(args)
+        .env("LC_ALL", "C")
+        .current_dir(repo)
+        .output();
+    let output = tokio::time::timeout(GIT_TIMEOUT, fut)
+        .await
+        .map_err(|_| format!("git {} timed out", args.join(" ")))?
+        .map_err(|e| format!("git {} failed: {}", args.join(" "), e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // COMBINE both streams so the conflict classifier sees stdout's
+        // `CONFLICT` lines (not just stderr).
+        return Err(format!(
+            "git {}: {}\n{}",
+            args.join(" "),
+            stderr.trim(),
+            stdout.trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Abort an in-progress merge/rebase left by a failed RealMerge pull, so the
+/// working tree is clean for the next attempt. v0.2.71 (BLOCKER-1 fix): without
+/// this, a conflicted `apply_launcher_update` left `.git/MERGE_HEAD` / `UU`
+/// markers on disk; the NEXT `apply_launcher_update` then dead-ended at the
+/// Step-1 clean-tree guard (`first_blocking_change`) — a hard stop of the
+/// self-update surface. Best-effort + idempotent: `--abort` is a no-op (errors
+/// harmlessly) when no merge/rebase is in progress, so we ignore the result.
+/// Mirrors `installer::abort_orchestrator_merge_or_rebase`'s on-disk detection
+/// intent (merge first, then rebase) without the Tauri-command wrapper.
+async fn abort_merge_or_rebase_in_progress(repo: &Path) {
+    let _ = run_git(repo, &["merge", "--abort"]).await;
+    let _ = run_git(repo, &["rebase", "--abort"]).await;
+}
+
 async fn current_branch(repo: &Path) -> Result<String, String> {
     run_git(repo, &["rev-parse", "--abbrev-ref", "HEAD"]).await
 }
@@ -668,7 +718,10 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
     .await;
     let pull_args = plan.pull_args(VCO_UPSTREAM_REMOTE, &branch);
     let pull_args_ref: Vec<&str> = pull_args.iter().map(|s| s.as_str()).collect();
-    if let Err(e) = run_git(&repo, &pull_args_ref).await {
+    // v0.2.71 (BLOCKER-1 fix): use run_git_combined so a RealMerge CONFLICT
+    // (whose markers git writes to STDOUT) reaches the classifier — the plain
+    // run_git returned stderr-only and silently missed it.
+    if let Err(e) = run_git_combined(&repo, &pull_args_ref).await {
         // A genuine merge conflict (RealMerge arm) or a non-FF refusal
         // (FfOnly arm) both route to the resync modal — the only recovery
         // this surface offers. The frontend keys the modal off
@@ -676,6 +729,14 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
         // A non-conflict, non-FF failure (broken git, detached HEAD, network)
         // stays a raw error string toast.
         if is_non_fast_forward(&e) || is_merge_conflict(&e) {
+            // v0.2.71 (BLOCKER-1 fix): ABORT the in-progress merge/rebase
+            // before returning. Without this, a RealMerge conflict leaves
+            // `.git/MERGE_HEAD` / `UU` markers on disk and the NEXT
+            // apply_launcher_update dead-ends at the Step-1 clean-tree guard.
+            // The user opts into the destructive resync via the modal; until
+            // then the tree must be clean + re-attemptable. (No-op for the
+            // FfOnly/non-FF arm — nothing was merged.)
+            abort_merge_or_rebase_in_progress(&repo).await;
             // Best-effort: capture local + remote SHAs so the modal can
             // show users what their clone has vs. what upstream has.
             let local = current_sha(&repo).await.ok();
@@ -700,6 +761,9 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
         .await
         .unwrap_or_default();
     if !unmerged.trim().is_empty() {
+        // Abort here too: an autostash-pop conflict leaves the tree dirty +
+        // a dangling stash; clean it so the next attempt isn't blocked.
+        abort_merge_or_rebase_in_progress(&repo).await;
         let local = current_sha(&repo).await.ok();
         let remote = ls_remote_sha(&repo, &branch).await.ok();
         return Err(serialize_non_ff_error(
@@ -912,27 +976,15 @@ pub(crate) fn is_non_fast_forward(err: &str) -> bool {
 
 /// Detect a genuine MERGE CONFLICT (or dirty-tree refusal) in git output.
 ///
-/// v0.2.71 (Piece 4): with `apply_launcher_update` now routing through the
-/// shared `resolve_divergence_pull_plan`, its RealMerge arm can produce a real
-/// `git merge` conflict (or git can refuse a dirty tree). Those phrases are
-/// NOT non-FF wording, so `is_non_fast_forward` misses them — but on this
-/// surface the resync modal is the only recovery, so a genuine conflict should
-/// still route there (not a bare toast). Mirrors the conflict phrases in
-/// `installer::is_merge_or_rebase_conflict` (kept in sync — both surfaces must
-/// classify a conflict identically).
+/// v0.2.71 (BLOCKER-1 fix): thin delegator to the ONE shared classifier
+/// `git_user_editable_merge::is_pull_conflict`. Pre-v0.2.71 this was a second
+/// hand-synced copy of installer's phrase list (drift hazard, called out in the
+/// old comment). The phrases now live in exactly one place; both surfaces
+/// classify identically by construction. Feed it COMBINED stdout+stderr (see
+/// `run_git_combined` — git writes `CONFLICT` lines to stdout, so a
+/// stderr-only string silently misses real conflicts).
 pub(crate) fn is_merge_conflict(err: &str) -> bool {
-    let lower = err.to_lowercase();
-    lower.contains("conflict")
-        || lower.contains("automatic merge failed")
-        || lower.contains("could not apply")
-        || lower.contains("resolve all conflicts")
-        // dirty-tree refusals + autostash-pop failures
-        || lower.contains("would be overwritten")
-        || lower.contains("you have unstaged changes")
-        || lower.contains("cannot pull with rebase")
-        || lower.contains("please commit your changes or stash")
-        || lower.contains("cannot merge with local modifications")
-        || lower.contains("autostash")
+    crate::commands::git_user_editable_merge::is_pull_conflict(err)
 }
 
 /// Serialize a non-FF error as a JSON string the Svelte side can parse.

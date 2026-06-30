@@ -5538,32 +5538,14 @@ fn serialize_orchestrator_conflict_error(
 ///   - "could not apply ... — When you have resolved this problem"
 ///   - "Resolve all conflicts manually, mark them as resolved with"
 ///
-/// v0.2.71: ALSO match git's DIRTY-TREE REFUSALS. With `--autostash` now on
-/// the modal's merge/rebase commands these are rare, but a stash-pop conflict
-/// or an autostash-less edge still produces them, and pre-v0.2.71 they fell
-/// through to a BARE ERROR that dead-ended the divergence modal (the user
-/// hit exactly this on a dirty `.gitignore`). Treating them as a conflict
-/// routes them to the conflict modal + resume-sentinel + UPDATE_DEFERRED
-/// recovery (so the user gets a guided path, never a dead-end):
-///   - "would be overwritten by merge" / "would be overwritten by checkout"
-///   - "cannot rebase: You have unstaged changes" / "cannot pull with rebase"
-///   - "Please commit your changes or stash them"
-///   - "Cannot merge with local modifications"
-///   - autostash-pop conflict markers ("could not apply autostash" /
-///     "autostash resulted in conflicts")
+/// v0.2.71 (BLOCKER-1 fix): this is now a thin delegator to the ONE shared
+/// classifier `git_user_editable_merge::is_pull_conflict`. Pre-v0.2.71 this and
+/// `self_update::is_merge_conflict` were two hand-synced copies that drifted;
+/// the phrase list now lives in exactly one place. Kept as a local alias so the
+/// (many) call-sites + tests in this file don't churn. Feed it COMBINED
+/// stdout+stderr (git writes `CONFLICT` lines to stdout).
 fn is_merge_or_rebase_conflict(err: &str) -> bool {
-    let lower = err.to_lowercase();
-    lower.contains("conflict")
-        || lower.contains("automatic merge failed")
-        || lower.contains("could not apply")
-        || lower.contains("resolve all conflicts")
-        // dirty-tree refusals + autostash-pop failures (v0.2.71)
-        || lower.contains("would be overwritten")
-        || lower.contains("you have unstaged changes")
-        || lower.contains("cannot pull with rebase")
-        || lower.contains("please commit your changes or stash")
-        || lower.contains("cannot merge with local modifications")
-        || lower.contains("autostash")
+    crate::commands::git_user_editable_merge::is_pull_conflict(err)
 }
 
 /// Resolve the current pull branch. Defaults to "main" on any error.
