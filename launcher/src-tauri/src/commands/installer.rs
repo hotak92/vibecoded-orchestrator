@@ -4680,183 +4680,47 @@ pub async fn update_orchestrator<R: Runtime>(
     // merge. If that set is empty, the auto-merge is safe regardless of how
     // many untracked KG nodes / scratch files dirty the tree. This honors
     // the principle that the update must NOT CARE about expected-to-diverge
-    // user files. See `tracked_modified_overlapping_upstream`.
+    // user files. See `tracked_modified_overlapping_upstream`. (The shared fn
+    // resolves `theirs` ONCE and reuses it for both the risk check and the
+    // merge-tree probe; any resolution/probe error keeps `--ff-only` so the
+    // modal surfaces, never a wrong silent auto-merge.)
     //
-    // Resolve `theirs` ONCE; reuse for both the risk check and the
-    // merge-tree probe. Any resolution/probe error → keep `--ff-only`
-    // (conservative: the modal surfaces, never a wrong silent auto-merge).
-    let auto_merge_committed_divergence = if pre_merge_committed {
-        // pre-merge already advanced HEAD; the rebase path below owns it.
-        false
-    } else {
-        match crate::commands::git_user_editable_merge::compute_theirs_sha(
-            &install_path,
-            &pull_branch,
-        )
-        .await
-        {
-            Ok(Some(theirs)) => {
-                let base = crate::commands::git_user_editable_merge::compute_base_sha(
-                    &install_path,
-                    &pull_branch,
-                )
-                .await
-                .ok()
-                .flatten();
-                // Precise pop-conflict-risk check (v0.2.58). Empty set =
-                // safe to --autostash auto-merge. On any error, treat as
-                // risky (non-empty) → keep --ff-only.
-                let pop_conflict_risk = match base.as_deref() {
-                    Some(base_sha) => {
-                        match crate::commands::git_user_editable_merge::tracked_modified_overlapping_upstream(
-                            &install_path, base_sha, &theirs,
-                        )
-                        .await
-                        {
-                            Ok(risk) => risk,
-                            Err(e) => {
-                                eprintln!(
-                                    "[vct] update_orchestrator: pop-conflict-risk check failed \
-                                     ({}) — keeping --ff-only.",
-                                    e
-                                );
-                                vec!["<risk-check-failed>".to_string()]
-                            }
-                        }
-                    }
-                    None => {
-                        // No merge-base resolvable → can't compute the
-                        // upstream-changed set; be conservative.
-                        vec!["<no-merge-base>".to_string()]
-                    }
-                };
-                if !pop_conflict_risk.is_empty() {
-                    eprintln!(
-                        "[vct] update_orchestrator: {} tracked file(s) locally-modified AND \
-                         upstream-changed (autostash-pop-conflict risk) — keeping --ff-only; \
-                         modal surfaces if non-FF.",
-                        pop_conflict_risk.len()
-                    );
-                    false
-                } else {
-                    // Tree carries no pop-conflict risk. Now confirm the
-                    // merge itself is conflict-free (stateless merge-tree).
-                    match crate::commands::git_user_editable_merge::committed_divergence_merges_cleanly(
-                        &install_path,
-                        &theirs,
-                    )
-                    .await
-                    {
-                        Ok(clean) => {
-                            if clean {
-                                eprintln!(
-                                    "[vct] update_orchestrator: committed local divergence merges \
-                                     cleanly with upstream AND no pop-conflict risk — routing \
-                                     through a real merge (no modal)."
-                                );
-                            }
-                            clean
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "[vct] update_orchestrator: merge-tree probe failed ({}) — \
-                                 keeping --ff-only; modal will surface on non-FF.",
-                                e
-                            );
-                            false
-                        }
-                    }
-                }
-            }
-            // Upstream tip not resolvable (no fetch yet / detached) — let
-            // the bare pull surface the real error.
-            Ok(None) => false,
-            Err(e) => {
-                eprintln!(
-                    "[vct] update_orchestrator: could not resolve upstream tip for merge \
-                     probe ({}) — keeping --ff-only.",
-                    e
-                );
-                false
-            }
-        }
-    };
-    // v0.2.29 (2026-05-23, post-v0.2.28 bugfix): add `--autostash` to the
-    // rebase path. Without it, ANY uncommitted change in the working tree
-    // outside the user-editable allowlist (typical for private-fork
-    // checkouts with WIP, or any user with in-progress local edits) causes
-    // `git pull --rebase` to abort with "cannot pull with rebase: You
-    // have unstaged changes". The pre-merge step only handles
-    // allowlisted paths; everything else needs autostash. Git stashes
-    // before the rebase, runs the rebase, then pops. On stash-pop
-    // conflict (rare — would require upstream to have touched the
-    // SAME lines the user has WIP changes on), git leaves the stash
-    // for manual recovery rather than silently dropping it.
+    // v0.2.71 (Piece 3): the pull-strategy decision is now the SHARED
+    // `resolve_divergence_pull_plan` in `git_user_editable_merge` (used by
+    // BOTH update surfaces — this command AND `self_update::apply_launcher_update`
+    // — so the two can't drift). The decision tree is identical to the
+    // pre-v0.2.71 inline block: pre_merge_committed → RebaseAutostash; else
+    // resolve theirs/base + pop-conflict-risk + merge-tree probe → RealMerge
+    // when clean & no risk, FfOnly otherwise (conservative on any uncertainty).
     //
-    // `--autostash` is a long-stable git feature (since 2.9, 2016-06)
-    // and is safe to pair with `--no-edit`. Adding it unconditionally
-    // is fine: if there are no uncommitted changes, the autostash is
-    // a no-op.
-    let pull_args: &[&str] = if pre_merge_committed {
-        &[
-            "pull",
-            "--rebase",
-            "--autostash",
-            "--no-edit",
-            crate::commands::self_update::VCO_UPSTREAM_REMOTE,
-            &pull_branch,
-        ]
-    } else if auto_merge_committed_divergence {
-        // v0.2.56 (Defect A) + v0.2.58 (precise gate): committed local
-        // divergence that merge-tree proved conflict-free AND no
-        // pop-conflict risk (`tracked-modified ∩ upstream-changed` is
-        // empty — see the decision above). Do a REAL merge so the local
-        // commits are preserved and folded in — no modal.
-        // `--no-rebase` forces the merge strategy (overriding any
-        // `pull.rebase=true` in the user's git config); `--no-edit`
-        // accepts the default merge-commit message non-interactively.
-        // `--autostash` IS LIVE here (v0.2.58 allows a dirty tree): it
-        // stashes the user's tracked working-tree edits, merges, then
-        // pops. We proved none of those edits overlap upstream's changes,
-        // so the pop normally re-applies cleanly. The ONE residual hazard
-        // is a TOCTOU race — upstream pushes a commit touching a
-        // locally-modified file in the window between our pop-conflict
-        // pre-check and the pull's own fetch — which would make the pop
-        // conflict AND exit 0. That is NOT caught by the
-        // `!pull.status.success()` branch; the dedicated post-pull
-        // autostash-pop-conflict check (v0.2.58 BLOCKER-1 fix, right after
-        // this pull) detects unmerged files / the autostash-conflict
-        // marker and routes to the conflict modal + resume sentinel.
-        //
-        // NOTE (review C1): after this auto-merge, local HEAD is a MERGE
-        // commit. If the user updated INSIDE the post-tag binary-refresh
-        // window (the `chore(binary): refresh` commit lands ~minutes after
-        // the tag), `WaitForBinaryRefresh`'s `--ff-only` re-pull won't
-        // fast-forward a merge-commit HEAD onto the later refresh tip —
-        // it soft-fails + times out, and the v0.2.55 finalize recovery
-        // either restarts into a newer on-disk binary or writes a
-        // BinaryRefreshTimeout deferral. Self-heals on the next update
-        // click (another auto-merge folds in the binary). Common case
-        // (update AFTER the window → binary already upstream → folded in
-        // on this merge) is unaffected.
-        &[
-            "pull",
-            "--no-rebase",
-            "--no-edit",
-            "--autostash",
-            crate::commands::self_update::VCO_UPSTREAM_REMOTE,
-            &pull_branch,
-        ]
-    } else {
-        &[
-            "pull",
-            "--ff-only",
-            crate::commands::self_update::VCO_UPSTREAM_REMOTE,
-            &pull_branch,
-        ]
-    };
+    // v0.2.29/v0.2.56/v0.2.58 rationale (preserved): the RebaseAutostash arm
+    // uses `--autostash` so in-progress WIP outside the allowlist doesn't
+    // abort the rebase ("cannot pull with rebase: You have unstaged
+    // changes"); the RealMerge arm folds conflict-free committed divergence
+    // (e.g. committed KG nodes) with `--autostash` LIVE over a dirty tree
+    // we proved has no pop-conflict overlap. The ONE residual hazard for
+    // RealMerge is a TOCTOU race (upstream pushes a commit touching a
+    // locally-modified file between our pre-check and the pull's own fetch)
+    // → caught by the post-pull autostash-pop backstop below, NOT silently
+    // continued. NOTE (review C1): after a RealMerge, local HEAD is a merge
+    // commit; if the user updated inside the post-tag binary-refresh window,
+    // `WaitForBinaryRefresh`'s `--ff-only` re-pull soft-fails+times out and
+    // the v0.2.55 finalize recovery handles it (self-heals next update).
+    let pull_plan = crate::commands::git_user_editable_merge::resolve_divergence_pull_plan(
+        &install_path,
+        &pull_branch,
+        pre_merge_committed,
+    )
+    .await;
+    // Retained for the conflict-op label below (the post-pull conflict +
+    // autostash-pop paths say "merge" for the real-merge arm, "rebase"
+    // otherwise) — identical semantics to the pre-v0.2.71 boolean.
+    let auto_merge_committed_divergence = pull_plan
+        == crate::commands::git_user_editable_merge::PullPlan::RealMerge;
+    let pull_args =
+        pull_plan.pull_args(crate::commands::self_update::VCO_UPSTREAM_REMOTE, &pull_branch);
     let pull = tokio::process::Command::new("git").silent()
-        .args(pull_args)
+        .args(&pull_args)
         .current_dir(&install_path)
         .output()
         .await
@@ -4867,17 +4731,13 @@ pub async fn update_orchestrator<R: Runtime>(
         let stdout = String::from_utf8_lossy(&pull.stdout);
         // v0.2.17 (plan 0.0.B): on pull failure, revert the pre-pull
         // rename so the running launcher can still be re-launched if
-        // the user kills the GUI. Best-effort.
-        if let Some(backup) = pre_pull_renamed.as_deref() {
-            revert_pre_pull_rename(backup);
-        }
-        // v0.2.21 Step 12: also revert the hub-binary rename so the
-        // canonical path holds the working hub binary. Then attempt
-        // to restart the hub since we stopped it pre-pull.
-        if let Some(backup) = pre_pull_renamed_hub.as_deref() {
-            revert_pre_pull_rename(backup);
-        }
-        let _ = ensure_hub_started_after_update(&install_path);
+        // the user kills the GUI. Best-effort. v0.2.21 Step 12 also reverts
+        // the hub-binary rename + restarts the hub. v0.2.71: shared tail.
+        abort_update_restore_binaries_and_hub(
+            &install_path,
+            pre_pull_renamed.as_deref(),
+            pre_pull_renamed_hub.as_deref(),
+        );
 
         // v0.2.51 Bug A (defensive): the rebase-with-autostash branch can
         // produce a rebase conflict (`CONFLICT (content):` lines on the
@@ -5006,13 +4866,11 @@ pub async fn update_orchestrator<R: Runtime>(
             );
             // Restore the running binary + hub (we renamed/stopped pre-pull)
             // so the user can keep using the launcher after they resolve.
-            if let Some(backup) = pre_pull_renamed.as_deref() {
-                revert_pre_pull_rename(backup);
-            }
-            if let Some(backup) = pre_pull_renamed_hub.as_deref() {
-                revert_pre_pull_rename(backup);
-            }
-            let _ = ensure_hub_started_after_update(&install_path);
+            abort_update_restore_binaries_and_hub(
+                &install_path,
+                pre_pull_renamed.as_deref(),
+                pre_pull_renamed_hub.as_deref(),
+            );
             let conflict_op = if auto_merge_committed_divergence {
                 "merge"
             } else {
@@ -5031,19 +4889,16 @@ pub async fn update_orchestrator<R: Runtime>(
     let pull_output = String::from_utf8_lossy(&pull.stdout);
     if pull_output.contains("Already up to date") {
         emit_progress(&window, "done", "Already up to date!", 100.0);
-        // v0.2.17: nothing was pulled — revert the rename so the
-        // canonical path holds the (still-current) binary. The user
-        // doesn't expect a restart in this case.
-        if let Some(backup) = pre_pull_renamed.as_deref() {
-            revert_pre_pull_rename(backup);
-        }
-        // v0.2.21 Step 12: same for the hub binary, then bring it
-        // back up — we stopped it pre-pull but nothing has changed
-        // on disk, so the existing binary will start cleanly.
-        if let Some(backup) = pre_pull_renamed_hub.as_deref() {
-            revert_pre_pull_rename(backup);
-        }
-        let _ = ensure_hub_started_after_update(&install_path);
+        // v0.2.17: nothing was pulled — revert the rename so the canonical
+        // path holds the (still-current) binary. The user doesn't expect a
+        // restart in this case. v0.2.21 Step 12: same for the hub binary,
+        // then bring it back up — the existing binary starts cleanly since
+        // nothing changed on disk. v0.2.71: shared tail.
+        abort_update_restore_binaries_and_hub(
+            &install_path,
+            pre_pull_renamed.as_deref(),
+            pre_pull_renamed_hub.as_deref(),
+        );
         // v0.2.43 V0243-15: audit complete for the no-op path.
         write_audit(
             "update_orchestrator_complete",
@@ -5245,20 +5100,18 @@ pub async fn update_orchestrator<R: Runtime>(
 
     if !install_output.status.success() {
         let stderr = String::from_utf8_lossy(&install_output.stderr);
-        // v0.2.17: install.py failed — don't restart. Revert the
-        // pre-pull rename so the canonical path is usable again.
-        if let Some(backup) = pre_pull_renamed.as_deref() {
-            revert_pre_pull_rename(backup);
-        }
-        // v0.2.21 Step 12: same for the hub binary, then attempt to
-        // bring the hub back up so the user isn't left without it.
-        // install.py failed AFTER git pull succeeded, so the on-disk
-        // vct-hub may be the new version — the launcher's discovery
-        // chain will still find it via find_hub_binary().
-        if let Some(backup) = pre_pull_renamed_hub.as_deref() {
-            revert_pre_pull_rename(backup);
-        }
-        let _ = ensure_hub_started_after_update(&install_path);
+        // v0.2.17: install.py failed — don't restart. Revert the pre-pull
+        // rename so the canonical path is usable again. v0.2.21 Step 12:
+        // same for the hub binary, then attempt to bring the hub back up so
+        // the user isn't left without it (install.py failed AFTER git pull
+        // succeeded, so the on-disk vct-hub may be the new version — the
+        // launcher's discovery chain still finds it via find_hub_binary()).
+        // v0.2.71: shared tail.
+        abort_update_restore_binaries_and_hub(
+            &install_path,
+            pre_pull_renamed.as_deref(),
+            pre_pull_renamed_hub.as_deref(),
+        );
         // db_close_guard drops here on the early-return → reopens (or
         // force-restarts if reopen fails). No explicit call needed.
         return Err(format!("Update failed: {}", stderr));
@@ -6326,11 +6179,21 @@ async fn assert_head_reached_upstream(install_path: &Path) -> Result<(), String>
     }
 }
 
-/// v0.2.63: shared abort cleanup for the post-pull HEAD-advance guard — revert
-/// the pre-pull binary renames (so the canonical paths hold working binaries
-/// again) and bring the hub back up (we stopped it pre-pull). Mirrors the
-/// revert+restart idiom the conflict/non-FF early-returns already use; factored
-/// so the two new guard call-sites don't each inline another copy.
+/// Shared recovery tail for the update commands' failure / conflict / abort
+/// branches: revert the pre-pull binary + hub renames (so the canonical paths
+/// hold working binaries again) and best-effort restart the hub (we stopped it
+/// pre-pull).
+///
+/// v0.2.63 introduced this for the post-pull HEAD-advance guard's two
+/// call-sites. v0.2.71 (Piece 3, modularity) made it THE single home for this
+/// trio — the `revert_pre_pull_rename(binary)` + `revert_pre_pull_rename(hub)`
+/// + `let _ = ensure_hub_started_after_update(..)` idiom was hand-repeated 10+
+/// times across `update_orchestrator`, `merge_orchestrator_with_upstream`,
+/// `rebase_orchestrator_onto_upstream`, and `run_post_pull_install_and_restart`.
+/// Behaviour is byte-identical to every inline copy: each `Option<&Path>` is
+/// guarded before reverting, and the hub restart is best-effort (`let _ =`).
+/// Sites that do something extra (emit progress, write a sentinel) keep that
+/// part inline and call this for just the trio.
 fn abort_update_restore_binaries_and_hub(
     install_path: &Path,
     pre_pull_renamed: Option<&Path>,
@@ -6401,13 +6264,12 @@ async fn run_post_pull_install_and_restart<R: Runtime>(
 
     if !install_output.status.success() {
         let stderr = String::from_utf8_lossy(&install_output.stderr);
-        if let Some(backup) = pre_pull_renamed.as_deref() {
-            revert_pre_pull_rename(backup);
-        }
-        if let Some(backup) = pre_pull_renamed_hub.as_deref() {
-            revert_pre_pull_rename(backup);
-        }
-        let _ = ensure_hub_started_after_update(install_path);
+        // v0.2.71: shared recovery tail.
+        abort_update_restore_binaries_and_hub(
+            install_path,
+            pre_pull_renamed.as_deref(),
+            pre_pull_renamed_hub.as_deref(),
+        );
         return Err(format!("Update failed: {}", stderr));
     }
 
@@ -6633,17 +6495,15 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
             // Conflict: leave the working tree in the conflicted state
             // so the user can edit files manually. Revert the pre-pull
             // renames (the binaries are still the OLD versions on disk —
-            // git pull didn't get far enough to swap them) so the
-            // canonical paths point at the working binary again.
-            if let Some(backup) = pre_pull_renamed.as_deref() {
-                revert_pre_pull_rename(backup);
-            }
-            if let Some(backup) = pre_pull_renamed_hub.as_deref() {
-                revert_pre_pull_rename(backup);
-            }
-            // Bring the hub back up — the user is going to spend time
-            // resolving conflicts and shouldn't be without it.
-            let _ = ensure_hub_started_after_update(&install_path);
+            // git pull didn't get far enough to swap them) so the canonical
+            // paths point at the working binary again, and bring the hub
+            // back up — the user is going to spend time resolving conflicts
+            // and shouldn't be without it. v0.2.71: shared tail.
+            abort_update_restore_binaries_and_hub(
+                &install_path,
+                pre_pull_renamed.as_deref(),
+                pre_pull_renamed_hub.as_deref(),
+            );
 
             // v0.2.51 Bug A: write the resume sentinel + deferral BEFORE
             // returning the conflict payload. The user's modal flow may
@@ -6664,26 +6524,66 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
 
         // Non-conflict failure (network, refusing unrelated histories
         // for the very first merge, etc.). Revert + restart hub + bail.
-        if let Some(backup) = pre_pull_renamed.as_deref() {
-            revert_pre_pull_rename(backup);
-        }
-        if let Some(backup) = pre_pull_renamed_hub.as_deref() {
-            revert_pre_pull_rename(backup);
-        }
-        let _ = ensure_hub_started_after_update(&install_path);
+        abort_update_restore_binaries_and_hub(
+            &install_path,
+            pre_pull_renamed.as_deref(),
+            pre_pull_renamed_hub.as_deref(),
+        );
         return Err(format!("git pull (merge) failed: {}", stderr));
+    }
+
+    // v0.2.71 (Piece 3.3): success-path autostash-pop backstop — ported from
+    // `update_orchestrator` (the modal merge command lacked it). `git pull
+    // --no-rebase --autostash` can EXIT 0 yet leave the tree broken: it
+    // stashes the dirty tracked edits (the divergence modal is reached
+    // precisely on a dirty-tree-overlapping-upstream case), merges, then POPS
+    // the stash. If the pop conflicts, git prints "Applying autostash resulted
+    // in conflicts." + leaves `UU` markers + a dangling stash but STILL exits
+    // 0 — so `!pull.status.success()` above does NOT catch it, and proceeding
+    // would run install.py + restart on a silently-broken tree. Detect it here
+    // (unmerged files and/or the autostash marker) and route to the conflict
+    // modal + resume sentinel + UPDATE_DEFERRED exactly like the non-zero
+    // conflict branch, so the user gets a guided recovery, never a dead-end.
+    {
+        let pull_combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&pull.stdout),
+            String::from_utf8_lossy(&pull.stderr)
+        );
+        let autostash_pop_failed = pull_combined.contains("autostash resulted in conflicts")
+            || pull_combined.contains("Applying autostash");
+        let unmerged = collect_conflicted_files(&install_path).await;
+        if !unmerged.is_empty() || autostash_pop_failed {
+            eprintln!(
+                "[vct] merge_orchestrator_with_upstream: pull exited 0 but the working tree \
+                 has {} unmerged file(s){} — an --autostash pop conflict. Routing to the \
+                 conflict modal instead of proceeding on a broken tree.",
+                unmerged.len(),
+                if autostash_pop_failed { " + autostash-conflict marker" } else { "" },
+            );
+            abort_update_restore_binaries_and_hub(
+                &install_path,
+                pre_pull_renamed.as_deref(),
+                pre_pull_renamed_hub.as_deref(),
+            );
+            write_resume_sentinel_and_deferral(&install_path, "merge", &pull_branch).await;
+            return Err(serialize_orchestrator_conflict_error(
+                "merge",
+                &pull_branch,
+                &unmerged,
+                pull_combined.trim(),
+            ));
+        }
     }
 
     let pull_output = String::from_utf8_lossy(&pull.stdout);
     if pull_output.contains("Already up to date") {
         emit_progress(&window, "done", "Already up to date!", 100.0);
-        if let Some(backup) = pre_pull_renamed.as_deref() {
-            revert_pre_pull_rename(backup);
-        }
-        if let Some(backup) = pre_pull_renamed_hub.as_deref() {
-            revert_pre_pull_rename(backup);
-        }
-        let _ = ensure_hub_started_after_update(&install_path);
+        abort_update_restore_binaries_and_hub(
+            &install_path,
+            pre_pull_renamed.as_deref(),
+            pre_pull_renamed_hub.as_deref(),
+        );
         // v0.2.24 §A0 (Q1 fix): deferrals were already emitted BEFORE
         // the pull (see above) — no second call needed here.
         return Ok(InstallResult {
@@ -6783,13 +6683,11 @@ pub async fn rebase_orchestrator_onto_upstream<R: Runtime>(
 
     if !fetch.status.success() {
         let stderr = String::from_utf8_lossy(&fetch.stderr);
-        if let Some(backup) = pre_pull_renamed.as_deref() {
-            revert_pre_pull_rename(backup);
-        }
-        if let Some(backup) = pre_pull_renamed_hub.as_deref() {
-            revert_pre_pull_rename(backup);
-        }
-        let _ = ensure_hub_started_after_update(&install_path);
+        abort_update_restore_binaries_and_hub(
+            &install_path,
+            pre_pull_renamed.as_deref(),
+            pre_pull_renamed_hub.as_deref(),
+        );
         return Err(format!("git fetch failed: {}", stderr));
     }
 
@@ -6821,13 +6719,12 @@ pub async fn rebase_orchestrator_onto_upstream<R: Runtime>(
             // Conflict — leave the rebase in progress so the user can
             // resolve manually. Revert pre-pull renames (binaries are
             // still old on disk) + restart hub for productivity.
-            if let Some(backup) = pre_pull_renamed.as_deref() {
-                revert_pre_pull_rename(backup);
-            }
-            if let Some(backup) = pre_pull_renamed_hub.as_deref() {
-                revert_pre_pull_rename(backup);
-            }
-            let _ = ensure_hub_started_after_update(&install_path);
+            // v0.2.71: shared tail.
+            abort_update_restore_binaries_and_hub(
+                &install_path,
+                pre_pull_renamed.as_deref(),
+                pre_pull_renamed_hub.as_deref(),
+            );
 
             // v0.2.51 Bug A: write the resume sentinel + deferral BEFORE
             // returning the conflict payload (see merge_orchestrator_with_upstream
@@ -6849,14 +6746,54 @@ pub async fn rebase_orchestrator_onto_upstream<R: Runtime>(
             ));
         }
 
-        if let Some(backup) = pre_pull_renamed.as_deref() {
-            revert_pre_pull_rename(backup);
-        }
-        if let Some(backup) = pre_pull_renamed_hub.as_deref() {
-            revert_pre_pull_rename(backup);
-        }
-        let _ = ensure_hub_started_after_update(&install_path);
+        abort_update_restore_binaries_and_hub(
+            &install_path,
+            pre_pull_renamed.as_deref(),
+            pre_pull_renamed_hub.as_deref(),
+        );
         return Err(format!("git rebase failed: {}", stderr));
+    }
+
+    // v0.2.71 (Piece 3.3): success-path autostash-pop backstop — sibling to
+    // the merge command's. `git rebase --autostash` can complete the rebase
+    // (exit 0) yet leave the tree broken when the final autostash POP
+    // conflicts ("could not apply autostash" / "Applying autostash resulted
+    // in conflicts" + `UU` markers + a dangling stash). The
+    // `!rebase.status.success()` branch above does NOT catch that, and
+    // proceeding would run install.py + restart on a silently-broken tree.
+    // Detect it here and route to the conflict modal + resume sentinel +
+    // UPDATE_DEFERRED, never a dead-end.
+    {
+        let rebase_combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&rebase.stdout),
+            String::from_utf8_lossy(&rebase.stderr)
+        );
+        let autostash_pop_failed = rebase_combined.contains("autostash resulted in conflicts")
+            || rebase_combined.contains("Applying autostash")
+            || rebase_combined.contains("could not apply autostash");
+        let unmerged = collect_conflicted_files(&install_path).await;
+        if !unmerged.is_empty() || autostash_pop_failed {
+            eprintln!(
+                "[vct] rebase_orchestrator_onto_upstream: rebase exited 0 but the working tree \
+                 has {} unmerged file(s){} — an --autostash pop conflict. Routing to the \
+                 conflict modal instead of proceeding on a broken tree.",
+                unmerged.len(),
+                if autostash_pop_failed { " + autostash-conflict marker" } else { "" },
+            );
+            abort_update_restore_binaries_and_hub(
+                &install_path,
+                pre_pull_renamed.as_deref(),
+                pre_pull_renamed_hub.as_deref(),
+            );
+            write_resume_sentinel_and_deferral(&install_path, "rebase", &pull_branch).await;
+            return Err(serialize_orchestrator_conflict_error(
+                "rebase",
+                &pull_branch,
+                &unmerged,
+                rebase_combined.trim(),
+            ));
+        }
     }
 
     run_post_pull_install_and_restart(

@@ -64,11 +64,14 @@
 //!
 //! Allowlist (hardcoded, see `USER_EDITABLE_PATTERNS`)
 //! ---------------------------------------------------
-//! Per the v0.2.24 §A0 design doc, the allowlist is intentionally
-//! HARDCODED for v0.2.24. These are all RELATIVE paths against the
-//! orchestrator clone root, so they're portable across machines. A
-//! configurable `.vco-user-editable-paths.json` is deferred to v0.2.25
-//! if user demand surfaces.
+//! The allowlist is intentionally HARDCODED. These are all RELATIVE paths
+//! against the orchestrator clone root, so they're portable across machines.
+//! `USER_EDITABLE_PATTERNS` is the canonical list — extend it there (it was
+//! extended in v0.2.71 to cover `.gitignore` / `.gitattributes` / `README.md`
+//! / `docs/**/*.md`). A configurable per-project override file was floated in
+//! v0.2.24 but deliberately NOT built — no user demand surfaced across 45+
+//! releases, and a hardcoded list keeps the trust boundary auditable in one
+//! place (a config file would let any repo silently widen what auto-merges).
 
 use std::path::{Path, PathBuf};
 
@@ -1189,6 +1192,185 @@ pub(crate) async fn tracked_modified_overlapping_upstream(
 }
 
 // ---------------------------------------------------------------------------
+// Shared divergence pull-strategy decision (v0.2.71 Piece 3)
+// ---------------------------------------------------------------------------
+
+/// Which `git pull`/`git rebase` strategy the update flow should use once
+/// the A0 pre-merge step has run. This is the SINGLE source of truth for the
+/// pull-strategy decision shared by BOTH update surfaces:
+///   - `installer::update_orchestrator` (the MenuBar badge), and
+///   - `self_update::apply_launcher_update` (the Preferences → Updates page).
+///
+/// Before v0.2.71 the decision lived inline only in `update_orchestrator`;
+/// the self-update surface did a blind `--ff-only` and routed ANY committed
+/// divergence (e.g. a committed KG node) to a destructive `reset --hard`
+/// resync. Centralising the decision here kills that drift — both surfaces
+/// now fold conflict-free committed divergence via a real merge, and reserve
+/// the modal/resync for genuine conflict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PullPlan {
+    /// `git pull --ff-only` — conservative: no merge commit, no rebase. Used
+    /// when we can't positively confirm a clean auto-merge (theirs/base
+    /// unresolvable, a pop-conflict risk exists, or merge-tree reports a
+    /// conflict). A non-FF then surfaces the divergence modal / resync modal,
+    /// never a silent wrong-merge.
+    FfOnly,
+    /// `git pull --no-rebase --no-edit --autostash` — a REAL merge that
+    /// preserves local commits and folds them in silently. Chosen only when
+    /// merge-tree proved the committed divergence merges cleanly AND the
+    /// pop-conflict-risk set (`tracked-modified ∩ upstream-changed`) is empty.
+    RealMerge,
+    /// `git pull --rebase --autostash --no-edit` — replays the synthetic A0
+    /// pre-merge commit (and any other local commits) onto upstream tip for a
+    /// linear history. Chosen when the A0 pre-merge produced a synthetic
+    /// commit (so HEAD already advanced past upstream).
+    RebaseAutostash,
+}
+
+impl PullPlan {
+    /// The exact `git` argument vector for this plan. Returned as owned
+    /// `String`s so both call-sites build the SAME args from the SAME place
+    /// (they can't drift). `remote` is the upstream remote name
+    /// (`VCO_UPSTREAM_REMOTE`); `branch` is the resolved pull branch.
+    pub(crate) fn pull_args(&self, remote: &str, branch: &str) -> Vec<String> {
+        match self {
+            PullPlan::FfOnly => vec![
+                "pull".to_string(),
+                "--ff-only".to_string(),
+                remote.to_string(),
+                branch.to_string(),
+            ],
+            PullPlan::RealMerge => vec![
+                "pull".to_string(),
+                "--no-rebase".to_string(),
+                "--no-edit".to_string(),
+                "--autostash".to_string(),
+                remote.to_string(),
+                branch.to_string(),
+            ],
+            PullPlan::RebaseAutostash => vec![
+                "pull".to_string(),
+                "--rebase".to_string(),
+                "--autostash".to_string(),
+                "--no-edit".to_string(),
+                remote.to_string(),
+                branch.to_string(),
+            ],
+        }
+    }
+}
+
+/// Decide the pull strategy for a divergence-aware update. This is the EXACT
+/// logic that lived inline in `update_orchestrator` (installer.rs, pre-v0.2.71)
+/// — extracted verbatim so the two update surfaces share ONE decision.
+///
+/// Decision tree (preserved from the inline block):
+///   - `pre_merge_committed` (the A0 pre-merge synthesized a commit) →
+///     `RebaseAutostash` (the rebase arm owns the advanced HEAD).
+///   - else resolve `theirs` (upstream tip):
+///       - `Ok(None)` (tip unresolvable) / `Err` → `FfOnly` (conservative;
+///         the bare pull surfaces the real error / the modal).
+///       - `Ok(Some(theirs))`:
+///           - compute `base` (merge-base; `None`/`Err` → flattened to None).
+///           - `pop_conflict_risk`:
+///               - base `Some` → `tracked_modified_overlapping_upstream`
+///                 (Err → sentinel "<risk-check-failed>" = risky).
+///               - base `None` → sentinel "<no-merge-base>" = risky.
+///           - if `pop_conflict_risk` NON-empty → `FfOnly` (the modal
+///             surfaces if non-FF; never --autostash over a real overlap).
+///           - else `committed_divergence_merges_cleanly`:
+///               - `Ok(true)` → `RealMerge`.
+///               - `Ok(false)` / `Err` → `FfOnly`.
+///
+/// Best-effort throughout: any resolution/probe failure keeps `FfOnly` so the
+/// legacy non-FF path surfaces the modal — we never auto-merge on uncertainty.
+/// The `eprintln!` diagnostics match the originals so existing log-based
+/// debugging is unchanged.
+pub(crate) async fn resolve_divergence_pull_plan(
+    repo: &Path,
+    branch: &str,
+    pre_merge_committed: bool,
+) -> PullPlan {
+    if pre_merge_committed {
+        // pre-merge already advanced HEAD; the rebase path below owns it.
+        return PullPlan::RebaseAutostash;
+    }
+    match compute_theirs_sha(repo, branch).await {
+        Ok(Some(theirs)) => {
+            let base = compute_base_sha(repo, branch).await.ok().flatten();
+            // Precise pop-conflict-risk check (v0.2.58). Empty set = safe to
+            // --autostash auto-merge. On any error, treat as risky (non-empty)
+            // → keep --ff-only.
+            let pop_conflict_risk = match base.as_deref() {
+                Some(base_sha) => {
+                    match tracked_modified_overlapping_upstream(repo, base_sha, &theirs).await {
+                        Ok(risk) => risk,
+                        Err(e) => {
+                            eprintln!(
+                                "[vct] resolve_divergence_pull_plan: pop-conflict-risk check \
+                                 failed ({}) — keeping --ff-only.",
+                                e
+                            );
+                            vec!["<risk-check-failed>".to_string()]
+                        }
+                    }
+                }
+                None => {
+                    // No merge-base resolvable → can't compute the
+                    // upstream-changed set; be conservative.
+                    vec!["<no-merge-base>".to_string()]
+                }
+            };
+            if !pop_conflict_risk.is_empty() {
+                eprintln!(
+                    "[vct] resolve_divergence_pull_plan: {} tracked file(s) locally-modified AND \
+                     upstream-changed (autostash-pop-conflict risk) — keeping --ff-only; \
+                     modal surfaces if non-FF.",
+                    pop_conflict_risk.len()
+                );
+                PullPlan::FfOnly
+            } else {
+                // Tree carries no pop-conflict risk. Now confirm the merge
+                // itself is conflict-free (stateless merge-tree).
+                match committed_divergence_merges_cleanly(repo, &theirs).await {
+                    Ok(clean) => {
+                        if clean {
+                            eprintln!(
+                                "[vct] resolve_divergence_pull_plan: committed local divergence \
+                                 merges cleanly with upstream AND no pop-conflict risk — routing \
+                                 through a real merge (no modal)."
+                            );
+                            PullPlan::RealMerge
+                        } else {
+                            PullPlan::FfOnly
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[vct] resolve_divergence_pull_plan: merge-tree probe failed ({}) — \
+                             keeping --ff-only; modal will surface on non-FF.",
+                            e
+                        );
+                        PullPlan::FfOnly
+                    }
+                }
+            }
+        }
+        // Upstream tip not resolvable (no fetch yet / detached) — let the bare
+        // pull surface the real error.
+        Ok(None) => PullPlan::FfOnly,
+        Err(e) => {
+            eprintln!(
+                "[vct] resolve_divergence_pull_plan: could not resolve upstream tip for merge \
+                 probe ({}) — keeping --ff-only.",
+                e
+            );
+            PullPlan::FfOnly
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1325,7 +1507,61 @@ mod tests {
         assert!(!is_user_editable("vco_lib/project_init.py", &gs));
         assert!(!is_user_editable("launcher/src-tauri/src/lib.rs", &gs));
         assert!(!is_user_editable("templates/scripts/kg-search", &gs));
-        assert!(!is_user_editable("README.md", &gs));
+        // NOTE: README.md WAS asserted non-editable here pre-v0.2.71, but P2
+        // added it to USER_EDITABLE_PATTERNS (declarative Markdown, high
+        // upstream churn, sidecar-on-conflict so no data loss). The dedicated
+        // `allowlist_covers_v0271_declarative_additions` test below asserts
+        // the new editable entries; this one keeps only the still-protected
+        // paths.
+    }
+
+    /// v0.2.71 (Piece 2): the base commit added `.gitignore`, `.gitattributes`,
+    /// `README.md`, and `docs/**/*.md` to the allowlist but shipped NO test for
+    /// them. This locks in the new editable entries AND re-asserts that the
+    /// protected CODE paths still BLOCK (a divergent pull there must surface
+    /// the modal as a real breakage signal, never silently auto-merge).
+    #[test]
+    fn allowlist_covers_v0271_declarative_additions() {
+        let gs = build_user_editable_globset().expect("build globset");
+
+        // New declarative entries are NOW user-editable (auto-merge / sidecar).
+        assert!(is_user_editable(".gitignore", &gs), ".gitignore must be editable");
+        assert!(
+            is_user_editable(".gitattributes", &gs),
+            ".gitattributes must be editable"
+        );
+        assert!(is_user_editable("README.md", &gs), "README.md must be editable");
+        assert!(
+            is_user_editable("docs/anything.md", &gs),
+            "docs/*.md must be editable"
+        );
+        assert!(
+            is_user_editable("docs/features/code-graph.md", &gs),
+            "nested docs/**/*.md must be editable"
+        );
+
+        // Protected CODE / config must STILL block (NOT auto-merge).
+        assert!(
+            !is_user_editable("vco_lib/foo.py", &gs),
+            "vco_lib/*.py must stay protected"
+        );
+        assert!(
+            !is_user_editable("launcher/src/main.rs", &gs),
+            "launcher/**/*.rs must stay protected"
+        );
+        assert!(
+            !is_user_editable("install.py", &gs),
+            "install.py must stay protected"
+        );
+        assert!(
+            !is_user_editable("templates/settings.json.linux.template", &gs),
+            "templates/** must stay protected"
+        );
+        // docs is editable as Markdown, but a non-.md under docs/ is NOT.
+        assert!(
+            !is_user_editable("docs/diagram.svg", &gs),
+            "non-Markdown under docs/ must stay protected"
+        );
     }
 
     #[test]
@@ -2487,6 +2723,253 @@ mod tests {
             "a STAGED-only tracked file changed upstream must be flagged (it \
              gets autostashed + can pop-conflict). got: {:?}",
             risk,
+        );
+    }
+
+    // ----- v0.2.71 Piece 2: .gitignore clean-3way integration -----
+
+    /// The user's EXACT reported case: a locally-modified tracked `.gitignore`
+    /// that upstream ALSO changed (non-overlapping regions) must auto-merge via
+    /// the A0 3-way fold — proving `.gitignore` (added to the allowlist in P2)
+    /// now produces a `Merged` outcome, NOT a skip and NOT a conflict. Mirrors
+    /// `pre_merge_clean_3way_merge_lands_in_working_tree` but for `.gitignore`.
+    #[tokio::test]
+    async fn pre_merge_gitignore_clean_3way_merge_folds() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+
+        // Establish a base .gitignore that BOTH sides share at the merge-base
+        // (the real-world case: forks inherit upstream's .gitignore). Use
+        // enough lines that the start/end edits below land in well-separated
+        // diff regions — a too-small file makes diff3 treat the whole thing as
+        // one hunk and conflict. Push it upstream, then fast-forward `local` so
+        // the base .gitignore is in local's HISTORY → it becomes the merge-base
+        // content for the 3-way fold (without this, the merge-base lacks the
+        // file, BASE reads empty, and both sides "add from nothing" → conflict).
+        let base_ignore = "*.log\n*.tmp\n*.swp\n*.bak\n*.pyc\n";
+        push_upstream_change(&seed, &local, ".gitignore", base_ignore);
+        run_git(&local, &["pull", "--ff-only", "vco_upstream", "main"]);
+        // Upstream APPENDS a rule at the END (separate region).
+        push_upstream_change(
+            &seed,
+            &local,
+            ".gitignore",
+            "*.log\n*.tmp\n*.swp\n*.bak\n*.pyc\n.cache/\n",
+        );
+        // Local PREPENDS a different rule at the START (separate region) — git
+        // merge-file folds non-overlapping start+end edits cleanly.
+        write_local_mod(
+            &local,
+            ".gitignore",
+            "node_modules/\n*.log\n*.tmp\n*.swp\n*.bak\n*.pyc\n",
+        );
+
+        let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
+        let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+        let outcomes = pre_merge_user_editable(&local, &base, &theirs).await.unwrap();
+
+        let gitignore = outcomes
+            .iter()
+            .find(|o| o.path.as_path() == Path::new(".gitignore"))
+            .expect("expected a .gitignore outcome (must NOT be skipped)");
+        match &gitignore.kind {
+            MergeOutcomeKind::Merged { .. } => {}
+            other => panic!("expected Merged (clean 3-way fold), got {:?}", other),
+        }
+        // Working tree must contain BOTH the local prepend and upstream append.
+        let merged = std::fs::read_to_string(local.join(".gitignore")).unwrap();
+        assert!(
+            merged.contains("node_modules/"),
+            "merged .gitignore missing local rule: {}",
+            merged
+        );
+        assert!(
+            merged.contains(".cache/"),
+            "merged .gitignore missing upstream rule: {}",
+            merged
+        );
+    }
+
+    // ----- v0.2.71 Piece 3: PullPlan + shared decision -----
+
+    #[test]
+    fn pull_args_returns_exact_vectors_per_variant() {
+        let remote = "vco_upstream";
+        let branch = "main";
+
+        assert_eq!(
+            PullPlan::FfOnly.pull_args(remote, branch),
+            vec!["pull", "--ff-only", "vco_upstream", "main"],
+        );
+        assert_eq!(
+            PullPlan::RealMerge.pull_args(remote, branch),
+            vec!["pull", "--no-rebase", "--no-edit", "--autostash", "vco_upstream", "main"],
+        );
+        assert_eq!(
+            PullPlan::RebaseAutostash.pull_args(remote, branch),
+            vec!["pull", "--rebase", "--autostash", "--no-edit", "vco_upstream", "main"],
+        );
+    }
+
+    /// Commit a local-only change in the clone (creates COMMITTED divergence
+    /// from upstream — the KG-node-commit case the RealMerge arm targets).
+    fn commit_local_change(local: &Path, file: &str, body: &str) {
+        write_local_mod(local, file, body);
+        run_git(local, &["add", file]);
+        run_git(local, &["commit", "-m", "local commit"]);
+    }
+
+    /// Re-fetch upstream so vco_upstream/<branch> reflects the latest push.
+    fn refetch_upstream(local: &Path) {
+        run_git(local, &["fetch", "vco_upstream"]);
+    }
+
+    /// pre_merge_committed=true → RebaseAutostash, regardless of repo state
+    /// (the A0 rebase arm owns the advanced HEAD).
+    #[tokio::test]
+    async fn resolve_plan_pre_merge_committed_is_rebase() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let plan = resolve_divergence_pull_plan(&local, "main", true).await;
+        assert_eq!(plan, PullPlan::RebaseAutostash);
+    }
+
+    /// Committed-clean divergence (local committed a NEW file upstream never
+    /// touched) + empty pop-risk → RealMerge.
+    #[tokio::test]
+    async fn resolve_plan_committed_clean_divergence_is_real_merge() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+
+        // Upstream advances on an UNRELATED file (so HEAD..theirs is non-empty
+        // → not a fast-forward; a real merge is needed).
+        push_upstream_change(&seed, &local, "vco_lib/foo.py", "def upstream(): pass\n");
+        // Local commits a brand-new KG node upstream never touched → clean
+        // merge, no overlap, no dirty tree.
+        commit_local_change(
+            &local,
+            "knowledge/concepts/new_node.md",
+            "# new local node\n",
+        );
+        refetch_upstream(&local);
+
+        let plan = resolve_divergence_pull_plan(&local, "main", false).await;
+        assert_eq!(
+            plan,
+            PullPlan::RealMerge,
+            "conflict-free committed divergence with empty pop-risk must RealMerge"
+        );
+    }
+
+    /// Pop-risk NON-empty (a tracked file is BOTH locally-modified AND
+    /// upstream-changed) → FfOnly (never --autostash over a real overlap).
+    #[tokio::test]
+    async fn resolve_plan_pop_conflict_risk_is_ff_only() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+
+        // Upstream changes vco_lib/foo.py.
+        push_upstream_change(&seed, &local, "vco_lib/foo.py", "def upstream(): pass\n");
+        // Local modifies the SAME tracked file (uncommitted) → in the
+        // tracked-modified ∩ upstream-changed risk set.
+        write_local_mod(&local, "vco_lib/foo.py", "def local_wip(): pass\n");
+
+        let plan = resolve_divergence_pull_plan(&local, "main", false).await;
+        assert_eq!(
+            plan,
+            PullPlan::FfOnly,
+            "a tracked file both locally-modified and upstream-changed is a \
+             pop-conflict risk → keep --ff-only"
+        );
+    }
+
+    /// merge-tree reports a CONFLICT (local committed an overlapping edit to
+    /// the same lines upstream changed) → FfOnly (modal surfaces on non-FF).
+    #[tokio::test]
+    async fn resolve_plan_merge_tree_conflict_is_ff_only() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+
+        // Upstream rewrites CLAUDE.md line.
+        push_upstream_change(&seed, &local, "CLAUDE.md", "# base\nUPSTREAM EDIT\nLine B\n");
+        // Local COMMITS a conflicting edit to the SAME line (clean tree, but
+        // committed divergence that merge-tree will flag as conflicting).
+        commit_local_change(&local, "CLAUDE.md", "# base\nLOCAL EDIT\nLine B\n");
+        refetch_upstream(&local);
+
+        let plan = resolve_divergence_pull_plan(&local, "main", false).await;
+        assert_eq!(
+            plan,
+            PullPlan::FfOnly,
+            "a genuine merge-tree conflict must keep --ff-only so the modal surfaces"
+        );
+    }
+
+    /// Upstream tip unresolvable (no `vco_upstream` remote / never fetched) →
+    /// FfOnly (conservative; the bare pull surfaces the real error).
+    #[tokio::test]
+    async fn resolve_plan_theirs_unresolvable_is_ff_only() {
+        skip_if_no_git!();
+        // A fresh repo with NO vco_upstream remote at all → compute_theirs_sha
+        // returns Ok(None) (rev-parse fails) → FfOnly.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("solo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "--initial-branch=main"]);
+        run_git(&repo, &["config", "user.email", "test@example.com"]);
+        run_git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("CLAUDE.md"), "# base\n").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "seed"]);
+
+        let plan = resolve_divergence_pull_plan(&repo, "main", false).await;
+        assert_eq!(
+            plan,
+            PullPlan::FfOnly,
+            "unresolvable upstream tip must fall back to --ff-only"
+        );
+    }
+
+    /// ANTI-DRIFT: BOTH update surfaces (installer::update_orchestrator and
+    /// self_update::apply_launcher_update) must derive their PullPlan from the
+    /// SAME `resolve_divergence_pull_plan` for identical repo state. Pre-v0.2.71
+    /// only installer.rs had the probe; self_update.rs did a blind --ff-only and
+    /// reset --hard on any divergence. This test constructs one repo state and
+    /// asserts the shared fn yields the SAME plan when called the way EACH
+    /// surface calls it (installer with pre_merge_committed possibly true after
+    /// A0; self_update ALWAYS pre_merge_committed=false since it has no A0 step).
+    /// For the clean-committed-divergence state both must agree on RealMerge
+    /// when neither pre-merged — proving the surfaces converged.
+    #[tokio::test]
+    async fn resolve_plan_anti_drift_both_surfaces_agree() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+
+        push_upstream_change(&seed, &local, "vco_lib/foo.py", "def upstream(): pass\n");
+        commit_local_change(&local, "knowledge/concepts/drift_node.md", "# node\n");
+        refetch_upstream(&local);
+
+        // installer::update_orchestrator path when its A0 pre-merge produced NO
+        // synthetic commit (the common committed-KG-divergence case):
+        let installer_plan = resolve_divergence_pull_plan(&local, "main", false).await;
+        // self_update::apply_launcher_update path (NEVER has an A0 step →
+        // ALWAYS pre_merge_committed=false):
+        let self_update_plan = resolve_divergence_pull_plan(&local, "main", false).await;
+
+        assert_eq!(
+            installer_plan, self_update_plan,
+            "the two update surfaces must produce the SAME PullPlan for the same \
+             repo state (shared resolve_divergence_pull_plan — no drift)"
+        );
+        assert_eq!(
+            installer_plan,
+            PullPlan::RealMerge,
+            "clean committed divergence should fold via RealMerge on BOTH surfaces"
         );
     }
 }

@@ -7,9 +7,11 @@
 //! auto-apply.
 //!
 //! Approach:
-//!   1. Daily background check: `git ls-remote origin <branch>` + local
+//!   1. Daily background check: `git ls-remote vco_upstream <branch>` + local
 //!      `git rev-parse HEAD` to compare SHAs without fetching the full
-//!      history. Cheap (<1s on a healthy network).
+//!      history. Cheap (<1s on a healthy network). (Design B: the launcher
+//!      self-updates from the pinned `vco_upstream` remote, NOT `origin` —
+//!      which on a private fork may point somewhere else.)
 //!   2. If remote ahead: emit `vct-launcher-update-available` event and
 //!      surface it in the tray label. NEVER auto-apply.
 //!   3. On user click of "Update now": run `git status --porcelain` to
@@ -186,10 +188,10 @@ pub struct UpdateStatus {
     pub available: bool,
     /// Local HEAD SHA (full 40 chars) or null if not in a git repo.
     pub current_sha: Option<String>,
-    /// Remote HEAD SHA from `git ls-remote origin <branch>`.
+    /// Remote HEAD SHA from `git ls-remote vco_upstream <branch>`.
     pub remote_sha: Option<String>,
     /// Number of commits remote is ahead of local. Computed via
-    /// `git rev-list --count HEAD..origin/<branch>` — requires a fetch
+    /// `git rev-list --count HEAD..vco_upstream/<branch>` — requires a fetch
     /// to be accurate. We do a `git fetch --quiet` before measuring.
     pub commit_count: u32,
     /// Branch we're tracking. Defaults to whatever the launcher repo's
@@ -639,13 +641,41 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
     let needs_cargo = changed_paths_need_cargo(&pre_diff);
     let needs_npm = changed_paths_need_npm(&pre_diff);
 
-    // Step 3: ff-only pull from the canonical upstream. Conservative —
-    // never rewrites history, never creates merge commits. If we're on a
-    // diverged branch we surface a structured error the frontend recognizes
-    // as a non-FF event so it can render the resync modal instead of a raw
-    // error string.
-    if let Err(e) = run_git(&repo, &["pull", "--ff-only", VCO_UPSTREAM_REMOTE, &branch]).await {
-        if is_non_fast_forward(&e) {
+    // Step 3: pull from the canonical upstream using the SHARED divergence
+    // decision (v0.2.71 Piece 4). PRE-v0.2.71 this was a blind `--ff-only`:
+    // ANY committed divergence (e.g. a single committed KG node — the
+    // encouraged 3rd-party behaviour) made it refuse non-FF, and the ONLY
+    // forward action on this surface's resync modal is `force_resync_launcher`
+    // = `git reset --hard` (DATA LOSS). Routing through
+    // `resolve_divergence_pull_plan` gives this surface the SAME auto-merge as
+    // the MenuBar badge: conflict-free committed divergence folds silently via
+    // a real merge (RealMerge), and the destructive resync becomes the
+    // genuine-conflict-only fallback rather than the default path.
+    //
+    // `pre_merge_committed=false`: unlike `update_orchestrator`, this surface
+    // has no A0 pre-merge step (no synthetic commit) — so the plan is either
+    // RealMerge (clean committed divergence, no pop-conflict risk) or FfOnly
+    // (everything else, incl. a clean fast-forwardable tree). We never get
+    // RebaseAutostash here. The `needs_cargo`/`needs_npm` rebuild gating above
+    // was computed from the pre-diff `HEAD..vco_upstream/<branch>` (the
+    // upstream-changed set) BEFORE the pull, so it's correct regardless of
+    // whether the pull fast-forwards or produces a merge commit — a RealMerge
+    // leaves HEAD a merge commit but the set of files that changed vs. our old
+    // HEAD is identical, which is what drives the rebuild decision.
+    let plan = crate::commands::git_user_editable_merge::resolve_divergence_pull_plan(
+        &repo, &branch, false,
+    )
+    .await;
+    let pull_args = plan.pull_args(VCO_UPSTREAM_REMOTE, &branch);
+    let pull_args_ref: Vec<&str> = pull_args.iter().map(|s| s.as_str()).collect();
+    if let Err(e) = run_git(&repo, &pull_args_ref).await {
+        // A genuine merge conflict (RealMerge arm) or a non-FF refusal
+        // (FfOnly arm) both route to the resync modal — the only recovery
+        // this surface offers. The frontend keys the modal off
+        // `kind == "non_fast_forward"`, so serialize that shape for either.
+        // A non-conflict, non-FF failure (broken git, detached HEAD, network)
+        // stays a raw error string toast.
+        if is_non_fast_forward(&e) || is_merge_conflict(&e) {
             // Best-effort: capture local + remote SHAs so the modal can
             // show users what their clone has vs. what upstream has.
             let local = current_sha(&repo).await.ok();
@@ -660,24 +690,56 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
         return Err(e);
     }
 
+    // The RealMerge arm uses `--autostash`: it can EXIT 0 yet leave the tree
+    // broken if the autostash pop conflicts (TOCTOU: upstream touched a
+    // locally-modified file between our pop-conflict pre-check and the pull's
+    // fetch). Detect a conflicted tree on the success path and route to the
+    // resync modal instead of rebuilding + restarting on a broken tree. (The
+    // FfOnly arm can't reach this — it never merges.)
+    let unmerged = run_git(&repo, &["diff", "--name-only", "--diff-filter=U"])
+        .await
+        .unwrap_or_default();
+    if !unmerged.trim().is_empty() {
+        let local = current_sha(&repo).await.ok();
+        let remote = ls_remote_sha(&repo, &branch).await.ok();
+        return Err(serialize_non_ff_error(
+            &branch,
+            local.as_deref(),
+            remote.as_deref(),
+            "git pull (auto-merge) left unmerged files (autostash-pop conflict)",
+        ));
+    }
+
     finish_apply_after_pull(app, &repo, needs_cargo, needs_npm).await
 }
 
 /// Recovery path after a non-fast-forward detection. Hard-resets the
-/// launcher's tracked files to `origin/<branch>`. **Destructive** —
+/// launcher's tracked files to `vco_upstream/<branch>`. **Destructive** —
 /// untracked files (user state, `.env`, `state/`, `~/.vct/`, etc.) are
 /// left untouched, but any tracked-file edits the user made locally
 /// are lost.
+///
+/// Design B (load-bearing — do NOT "fix" the code to match an older doc):
+/// the reset target is `VCO_UPSTREAM_REMOTE` (`vco_upstream`), NOT `origin`.
+/// On a private fork `origin` may point at the fork's own remote; resetting
+/// to it would NOT recover the public release. The doc previously said
+/// `origin/<branch>` (a stale pre-Design-B comment) — corrected here so a
+/// future maintainer doesn't "make the code match the doc" and reintroduce
+/// the wrong-ref bug. See `update-project-own-git-repo` audit §2.
 ///
 /// We deliberately do NOT re-assert clean tree here (unlike
 /// `apply_launcher_update`): the whole point is to override divergence
 /// the user has already opted into via the modal. The frontend modal
 /// makes the "your tracked-file changes will be lost" warning explicit.
+/// v0.2.71: with `apply_launcher_update` now auto-merging conflict-free
+/// committed divergence (Piece 4), this destructive path is reached ONLY
+/// for a genuine conflict the user explicitly opts into via the modal — no
+/// longer the default forward action for any committed divergence.
 ///
 /// Sequence:
-///   1. fetch origin/<branch>
-///   2. compute pre-reset diff for rebuild gating (HEAD..origin/<branch>)
-///   3. reset --hard origin/<branch>
+///   1. fetch vco_upstream/<branch>
+///   2. compute pre-reset diff for rebuild gating (HEAD..vco_upstream/<branch>)
+///   3. reset --hard vco_upstream/<branch>
 ///   4. rebuild + restart (shared with `apply_launcher_update`)
 #[command]
 pub async fn force_resync_launcher<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
@@ -846,6 +908,31 @@ pub(crate) fn is_non_fast_forward(err: &str) -> bool {
         || lower.contains("non-fast-forward")
         || lower.contains("have diverged")
         || lower.contains("refusing to merge unrelated histories")
+}
+
+/// Detect a genuine MERGE CONFLICT (or dirty-tree refusal) in git output.
+///
+/// v0.2.71 (Piece 4): with `apply_launcher_update` now routing through the
+/// shared `resolve_divergence_pull_plan`, its RealMerge arm can produce a real
+/// `git merge` conflict (or git can refuse a dirty tree). Those phrases are
+/// NOT non-FF wording, so `is_non_fast_forward` misses them — but on this
+/// surface the resync modal is the only recovery, so a genuine conflict should
+/// still route there (not a bare toast). Mirrors the conflict phrases in
+/// `installer::is_merge_or_rebase_conflict` (kept in sync — both surfaces must
+/// classify a conflict identically).
+pub(crate) fn is_merge_conflict(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("conflict")
+        || lower.contains("automatic merge failed")
+        || lower.contains("could not apply")
+        || lower.contains("resolve all conflicts")
+        // dirty-tree refusals + autostash-pop failures
+        || lower.contains("would be overwritten")
+        || lower.contains("you have unstaged changes")
+        || lower.contains("cannot pull with rebase")
+        || lower.contains("please commit your changes or stash")
+        || lower.contains("cannot merge with local modifications")
+        || lower.contains("autostash")
 }
 
 /// Serialize a non-FF error as a JSON string the Svelte side can parse.
