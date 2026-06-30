@@ -295,19 +295,20 @@ def test_active_embedding_derives_from_default_text_embedding_when_absent(
     assert env["ACTIVE_EMBEDDING"] == "arctic"
 
 
-def test_active_embedding_self_heals_legacy_qwen3_row_to_arctic(
+def test_active_embedding_legacy_no_marker_row_inherits_global(
     tmp_path: Path,
 ) -> None:
-    """An existing project whose `module_settings/active_embedding` is the
-    legacy hardcoded "qwen3" derives to the arctic hardware pick — the read
-    fallback mirrors the backfill self-heal so the env file heals on the
-    next apply even before backfill rewrites the row."""
+    """v0.2.71 T-B-emb (Fabio case): a legacy `module_settings/active_embedding`
+    row with NO `active_embedding_source` marker INHERITS the machine-global
+    default (here the arctic hardware pick) rather than pinning its stored
+    (auto-stamped) qwen3 value. Provenance, not value, drives resolution."""
     db = tmp_path / "launcher.db"
     proj = tmp_path / "p"
     proj.mkdir()
     _make_launcher_db(
         db, project_id="a2", project_name="Example Legacy Row",
         project_folder=str(proj),
+        # Legacy backfill stamped qwen3 with NO source companion.
         module_settings=[("a2", "orchestrator-core", "active_embedding", '"qwen3"')],
         app_state={"default_text_embedding": "snowflake-arctic-embed2:latest"},
     )
@@ -315,19 +316,42 @@ def test_active_embedding_self_heals_legacy_qwen3_row_to_arctic(
     assert env["ACTIVE_EMBEDDING"] == "arctic"
 
 
-def test_active_embedding_preserves_explicit_user_pick(tmp_path: Path) -> None:
-    """An explicit non-qwen3 user pick (openai) in module_settings is NEVER
-    overridden by the hardware-pick derive, even on an arctic host."""
+def test_active_embedding_source_user_is_sticky(tmp_path: Path) -> None:
+    """v0.2.71 T-B-emb: a deliberate per-project pick (value + source=user)
+    is STICKY — returned verbatim even when the machine-global default differs
+    (here global=arctic, user pick=openai)."""
     db = tmp_path / "launcher.db"
     proj = tmp_path / "p"
     proj.mkdir()
     _make_launcher_db(
         db, project_id="a3", project_name="Example User Pick",
         project_folder=str(proj),
-        module_settings=[("a3", "orchestrator-core", "active_embedding", '"openai"')],
-        app_state={"default_text_embedding": "snowflake-arctic-embed2:latest"},
+        module_settings=[
+            ("a3", "orchestrator-core", "active_embedding", '"openai"'),
+            ("a3", "orchestrator-core", "active_embedding_source", '"user"'),
+        ],
+        app_state={"embedding.active_profile": "arctic"},
     )
     env = project_env_from_db("a3", db_path=db)["canonical_env"]
+    assert env["ACTIVE_EMBEDDING"] == "openai"
+
+
+def test_active_embedding_source_auto_inherits_global(tmp_path: Path) -> None:
+    """v0.2.71 T-B-emb: an explicit source=auto row inherits the global
+    default (openai) rather than pinning its stored qwen3 value."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="a3b", project_name="Example Auto",
+        project_folder=str(proj),
+        module_settings=[
+            ("a3b", "orchestrator-core", "active_embedding", '"qwen3"'),
+            ("a3b", "orchestrator-core", "active_embedding_source", '"auto"'),
+        ],
+        app_state={"embedding.active_profile": "openai"},
+    )
+    env = project_env_from_db("a3b", db_path=db)["canonical_env"]
     assert env["ACTIVE_EMBEDDING"] == "openai"
 
 
@@ -361,6 +385,51 @@ def test_active_embedding_override_wins_over_derive(tmp_path: Path) -> None:
         "a5", db_path=db, active_embedding_override="codesage"
     )["canonical_env"]
     assert env["ACTIVE_EMBEDDING"] == "codesage"
+
+
+def test_active_embedding_bridges_global_app_state(tmp_path: Path) -> None:
+    """v0.2.71 T-B-emb BRIDGE (B1): a non-user project's projection reads the
+    machine-global app_state[embedding.active_profile], so a GUI Identity-tab
+    write reaches the projected `.claude/{settings.json,env}` value — and the
+    hub resolver (same cascade) can never disagree (the Defect-D class)."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="a6", project_name="Example Bridge",
+        project_folder=str(proj),
+        # No per-project active_embedding row → inherit global.
+        app_state={"embedding.active_profile": "openai"},
+    )
+    env = project_env_from_db("a6", db_path=db)["canonical_env"]
+    assert env["ACTIVE_EMBEDDING"] == "openai"
+
+
+def test_active_embedding_source_user_survives_update(tmp_path: Path) -> None:
+    """v0.2.71 T-B-emb SURVIVES-UPDATE (projection-truth): a source=user pick
+    re-projects to the SAME ACTIVE_EMBEDDING value across a simulated update
+    (the projection re-derives to the same value, never goes stale), and a
+    second projection run yields an identical env."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    # Global default is qwen3 (an auto-seed would write qwen3); the user
+    # deliberately picked arctic (source=user).
+    _make_launcher_db(
+        db, project_id="a7", project_name="Example Survivor",
+        project_folder=str(proj),
+        module_settings=[
+            ("a7", "orchestrator-core", "active_embedding", '"arctic"'),
+            ("a7", "orchestrator-core", "active_embedding_source", '"user"'),
+        ],
+        app_state={"embedding.active_profile": "qwen3"},
+    )
+    before = project_env_from_db("a7", db_path=db)["canonical_env"]["ACTIVE_EMBEDDING"]
+    assert before == "arctic"
+    # Simulate an update: the DB rows are untouched by any update path; the
+    # projection re-runs and must re-derive the SAME value (not stale).
+    after = project_env_from_db("a7", db_path=db)["canonical_env"]["ACTIVE_EMBEDDING"]
+    assert after == before == "arctic"
 
 
 def test_from_db_diagrams_suffix_swap_from_canonical_kg(tmp_path: Path) -> None:

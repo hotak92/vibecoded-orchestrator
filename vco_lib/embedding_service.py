@@ -912,10 +912,18 @@ def _resolve_active_embedding() -> str:
     Resolution chain (each step short-circuits if non-empty):
 
       1. ``os.environ["ACTIVE_EMBEDDING"]`` — explicit env / install.py
-         subprocess thread.
-      2. ``launcher.db app_state[embedding.active_profile]`` — what the
-         launcher's Identity tab + install.py's preset selection wrote.
-      3. ``"qwen3"`` — final fallback (free-tier install without launcher,
+         subprocess thread. This env is the PROJECTION of the per-project
+         cascade (config_projection.py writes it from the sticky user pick
+         / global default), so a deliberate per-project choice already
+         reaches here via the projected ``.claude/{settings.json,env}``.
+      2. ``launcher.db app_state[embedding.active_profile]`` — the
+         machine-global default the Identity tab + install.py's preset
+         selection wrote.
+      3. ``launcher.db app_state[default_text_embedding]`` mapped to its
+         profile — the hardware-pick derive (v0.2.71 T-B-emb), mirroring
+         the cascade's machine-global leg so an env-less fallback agrees
+         with the launcher / projection resolvers.
+      4. ``"qwen3"`` — final fallback (free-tier install without launcher,
          or the launcher never booted post-install).
 
     All inputs are normalised with ``.strip().lower()``. Empty strings
@@ -931,11 +939,25 @@ def _resolve_active_embedding() -> str:
     try:
         # Imported lazily to avoid a hard dependency on launcher_db_reader
         # for callers that don't touch this resolution path.
-        from vco_lib.launcher_db_reader import read_app_state_active_embedding
+        from vco_lib.launcher_db_reader import (
+            profile_for_text_model,
+            read_app_state_active_embedding,
+            read_app_state_default_text_embedding,
+        )
 
         db_value = read_app_state_active_embedding()
         if db_value:
             return db_value.strip().lower()
+        # v0.2.71 T-B-emb: mirror the cascade's machine-global leg — when the
+        # canonical `embedding.active_profile` key is unset, derive from the
+        # hardware pick (`app_state[default_text_embedding]`) before the qwen3
+        # floor. Keeps this env-less fallback consistent with
+        # project_env_settings.rs::global_active_embedding +
+        # config_projection.py::_global_active_embedding (the projected env is
+        # still the primary surface; this only fires when no env was projected).
+        derived = profile_for_text_model(read_app_state_default_text_embedding())
+        if derived:
+            return derived.strip().lower()
     except Exception:
         # Soft-fail: every read path in launcher_db_reader already
         # swallows exceptions, but defense-in-depth against an
