@@ -490,18 +490,31 @@ pub const STEADY_STATE_MCP_MIN_AGE_SECS: u64 = 60;
 /// enumeration so both the act AND the leave-alone case are unit-testable (per
 /// the orchestrator's "test the decision that gates a destructive action" rule).
 ///
-/// We reap ONLY when we can POSITIVELY confirm the process is orphaned:
-///   1. its cmdline matches an MCP pattern (it's one of ours), AND
-///   2. it has run at least `STEADY_STATE_MCP_MIN_AGE_SECS` (not a fresh spawn
-///      whose parent link hasn't settled), AND
-///   3. it has a known parent pid that is now DEAD (`parent_alive == false`).
+/// We reap ONLY when we can POSITIVELY confirm the process is orphaned. After
+/// the MCP-pattern + age gates, EITHER orphan signal qualifies:
+///   (a) its known parent pid is now DEAD (`parent_alive == Some(false)`), OR
+///   (b) it has been REPARENTED to a subreaper (`parent_is_subreaper == true`).
 ///
-/// If the parent is still alive, or we can't determine the parent (`None` →
-/// can't positively confirm orphanhood), or the process is too young, we LEAVE
-/// IT ALONE. A live-parent MCP is an MCP with a live Claude session attached —
-/// reaping it would silently break that session's channel push, which is worse
-/// than the CPU burn we're backstopping. Conservative defaults on a
-/// best-effort path: when we can't confirm the precondition, do nothing.
+/// WHY (b) — the POSIX no-op fix (v0.2.71 review): on Linux/macOS the kernel
+/// REPARENTS an orphan to a live subreaper (PID 1 / `systemd --user`) the
+/// instant its real parent exits, so signal (a) `parent_alive == false` is
+/// essentially unreachable there — the orphan always shows a LIVE parent (the
+/// subreaper). Without (b) the reaper had teeth only on Windows (which does not
+/// reparent). Signal (b) catches the reparented POSIX orphan: a HEALTHY MCP's
+/// parent is its live Claude-session process, NEVER a subreaper, so
+/// `parent_is_subreaper` distinguishes "orphaned + reparented" from
+/// "session still attached" without risk to a live-session MCP. The caller
+/// computes `parent_is_subreaper` (e.g. `parent_pid == 1`, or the parent's
+/// comm/exe is a known subreaper like `systemd`); on Windows it is always false
+/// (no reparenting) and signal (a) does the work.
+///
+/// If the parent is still alive AND not a subreaper, or we can't determine the
+/// parent (`None` → can't positively confirm orphanhood), or the process is too
+/// young, we LEAVE IT ALONE. A live-real-parent MCP is an MCP with a live Claude
+/// session attached — reaping it would silently break that session's channel
+/// push, which is worse than the CPU burn we're backstopping. Conservative
+/// defaults on a best-effort path: when we can't confirm the precondition, do
+/// nothing.
 ///
 /// `is_self` short-circuits to false so the launcher never reaps itself.
 pub fn steady_state_mcp_should_reap(
@@ -510,6 +523,7 @@ pub fn steady_state_mcp_should_reap(
     run_time_secs: u64,
     parent_pid: Option<u32>,
     parent_alive: Option<bool>,
+    parent_is_subreaper: bool,
 ) -> bool {
     if is_self {
         return false;
@@ -524,8 +538,45 @@ pub fn steady_state_mcp_should_reap(
     if parent_pid.is_none() {
         return false;
     }
-    // Reap only when we definitively know the parent is dead.
+    // Orphan signal (b): reparented to a subreaper (the POSIX orphan case —
+    // a healthy session-attached MCP is never parented to a subreaper).
+    if parent_is_subreaper {
+        return true;
+    }
+    // Orphan signal (a): we definitively know the (non-subreaper) parent is dead
+    // (the Windows case — Windows does not reparent orphans).
     matches!(parent_alive, Some(false))
+}
+
+/// Is `parent_pid` a subreaper to which the OS reparents orphans? Cross-OS:
+/// - POSIX: PID 1 (init) is the universal floor; `systemd --user` and other
+///   `PR_SET_CHILD_SUBREAPER` reapers also qualify, identified by the parent's
+///   executable/comm basename. We treat PID 1 always, plus a small basename
+///   allowlist for the common user-session subreapers.
+/// - Windows: no orphan reparenting exists → always false (signal (a) handles it).
+///
+/// `parent_comm` is the parent process's executable basename / comm (lowercased
+/// by the caller is fine; we lowercase here defensively). Pass `""` when unknown
+/// — then only the PID-1 check applies (still correct, just narrower).
+pub fn parent_pid_is_subreaper(parent_pid: u32, parent_comm: &str) -> bool {
+    #[cfg(windows)]
+    {
+        let _ = (parent_pid, parent_comm);
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        if parent_pid == 1 {
+            return true;
+        }
+        // Common POSIX user-session subreapers an orphan can land on.
+        let comm = parent_comm.to_ascii_lowercase();
+        // Match a bare/whole comm to avoid catching e.g. "systemd-resolved".
+        matches!(
+            comm.as_str(),
+            "systemd" | "init" | "launchd" | "systemd --user" | "(sd-pam)"
+        )
+    }
 }
 
 /// v0.2.71 (P6): best-effort steady-state reaper for ORPHANED coordination /
@@ -576,6 +627,29 @@ pub fn steady_state_orphaned_mcp_reap() -> usize {
                 pid_is_alive(ppid)
             }
         });
+        // Orphan signal (b) — POSIX reparenting. Resolve whether the parent is a
+        // subreaper (PID 1 / systemd / launchd). On POSIX an orphan is reparented
+        // to a live subreaper the instant its real parent exits, so signal (a)
+        // (dead parent) is unreachable there; (b) catches it. A live session-
+        // attached MCP's parent is the Claude process, never a subreaper, so this
+        // never reaps a healthy MCP. Look up the parent process's exe basename
+        // from the same snapshot; "" when the parent row isn't in the table
+        // (then only the PID-1 check inside parent_pid_is_subreaper applies).
+        let parent_is_subreaper = parent_pid
+            .map(|ppid| {
+                let comm = sys
+                    .process(sysinfo::Pid::from_u32(ppid))
+                    .map(|pp| {
+                        pp.exe()
+                            .and_then(|p| p.file_name())
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| pp.name().to_string_lossy().into_owned())
+                    })
+                    .unwrap_or_default();
+                // The launcher itself is never a subreaper for our MCPs.
+                ppid != my_pid && parent_pid_is_subreaper(ppid, &comm)
+            })
+            .unwrap_or(false);
 
         if !steady_state_mcp_should_reap(
             is_self,
@@ -583,6 +657,7 @@ pub fn steady_state_orphaned_mcp_reap() -> usize {
             proc.run_time(),
             parent_pid,
             parent_alive,
+            parent_is_subreaper,
         ) {
             continue;
         }
@@ -1052,14 +1127,15 @@ mod tests {
 
     #[test]
     fn reap_when_parent_dead_and_old_enough() {
-        // The exact orphaned-coordination-MCP case: matches MCP pattern, past
-        // the grace window, has a parent pid, parent is dead → REAP.
+        // Signal (a) — dead parent (the Windows case; POSIX reparents so this is
+        // rare there). Matches MCP pattern, past the grace window, parent dead → REAP.
         assert!(steady_state_mcp_should_reap(
             false,
             COORD_CMD,
             STEADY_STATE_MCP_MIN_AGE_SECS, // exactly at the floor counts
             Some(424242),
             Some(false),
+            false, // not a subreaper — signal (a) does the work
         ));
         assert!(steady_state_mcp_should_reap(
             false,
@@ -1067,40 +1143,100 @@ mod tests {
             6 * 3600, // 6h old (field signature)
             Some(424242),
             Some(false),
+            false,
         ));
     }
 
     #[test]
-    fn leave_alone_when_parent_alive() {
-        // A live parent == a live Claude session attached. NEVER reap — that
-        // would silently break the session's channel push.
+    fn reap_when_reparented_to_subreaper_posix() {
+        // Signal (b) — the POSIX orphan case the v0.2.71 review surfaced: the
+        // kernel reparents the orphan to a LIVE subreaper, so parent_alive is
+        // Some(true) yet it IS orphaned. parent_is_subreaper=true → REAP.
+        assert!(steady_state_mcp_should_reap(
+            false,
+            COORD_CMD,
+            6 * 3600,
+            Some(1),          // reparented to init/PID-1
+            Some(true),       // the subreaper is alive — signal (a) would MISS this
+            true,             // ...but signal (b) catches it
+        ));
+        // Also at the age floor.
+        assert!(steady_state_mcp_should_reap(
+            false,
+            COORD_CMD,
+            STEADY_STATE_MCP_MIN_AGE_SECS,
+            Some(1),
+            Some(true),
+            true,
+        ));
+    }
+
+    #[test]
+    fn leave_alone_when_parent_alive_and_not_subreaper() {
+        // A live REAL parent == a live Claude session attached. NEVER reap — and
+        // crucially, parent_is_subreaper=false means this is NOT a reparented
+        // orphan, so signal (b) must not fire either.
         assert!(!steady_state_mcp_should_reap(
             false,
             COORD_CMD,
             6 * 3600,
             Some(12345),
             Some(true),
+            false, // real session parent, not a subreaper → leave alone
+        ));
+    }
+
+    #[test]
+    fn subreaper_signal_still_respects_mcp_pattern_age_and_self() {
+        // Signal (b) does NOT bypass the other guards — a non-MCP / too-young /
+        // self process parented to a subreaper is STILL left alone.
+        assert!(!steady_state_mcp_should_reap(
+            false,
+            "/usr/bin/python3 /home/user/myproject/main.py", // not an MCP
+            6 * 3600,
+            Some(1),
+            Some(true),
+            true,
+        ));
+        assert!(!steady_state_mcp_should_reap(
+            false,
+            COORD_CMD,
+            STEADY_STATE_MCP_MIN_AGE_SECS - 1, // too young (fork-race window)
+            Some(1),
+            Some(true),
+            true,
+        ));
+        assert!(!steady_state_mcp_should_reap(
+            true, // is_self short-circuits even under the subreaper signal
+            COORD_CMD,
+            6 * 3600,
+            Some(1),
+            Some(true),
+            true,
         ));
     }
 
     #[test]
     fn leave_alone_when_parent_unknown() {
         // Can't determine the parent → can't positively confirm orphanhood →
-        // do nothing (conservative default on a best-effort path).
+        // do nothing (conservative default on a best-effort path). Neither signal.
         assert!(!steady_state_mcp_should_reap(
             false,
             COORD_CMD,
             6 * 3600,
             None,
             None,
+            false,
         ));
-        // parent pid present but liveness undeterminable also leaves it alone.
+        // parent pid present but liveness undeterminable + not a subreaper also
+        // leaves it alone.
         assert!(!steady_state_mcp_should_reap(
             false,
             COORD_CMD,
             6 * 3600,
             Some(999),
             None,
+            false,
         ));
     }
 
@@ -1114,6 +1250,7 @@ mod tests {
             STEADY_STATE_MCP_MIN_AGE_SECS - 1,
             Some(424242),
             Some(false),
+            false,
         ));
         assert!(!steady_state_mcp_should_reap(
             false,
@@ -1121,6 +1258,7 @@ mod tests {
             0,
             Some(424242),
             Some(false),
+            false,
         ));
     }
 
@@ -1133,6 +1271,7 @@ mod tests {
             6 * 3600,
             Some(424242),
             Some(false),
+            false,
         ));
     }
 
@@ -1145,7 +1284,31 @@ mod tests {
             6 * 3600,
             Some(424242),
             Some(false),
+            false,
         ));
+    }
+
+    #[test]
+    fn parent_pid_is_subreaper_matrix() {
+        // PID 1 is always a subreaper on POSIX; on Windows nothing is.
+        #[cfg(not(windows))]
+        {
+            assert!(parent_pid_is_subreaper(1, ""));
+            assert!(parent_pid_is_subreaper(1, "anything"));
+            assert!(parent_pid_is_subreaper(2589, "systemd"));
+            assert!(parent_pid_is_subreaper(500, "launchd"));
+            // A normal parent process is NOT a subreaper.
+            assert!(!parent_pid_is_subreaper(12345, "node"));
+            assert!(!parent_pid_is_subreaper(12345, "claude"));
+            // Don't be fooled by a prefix match.
+            assert!(!parent_pid_is_subreaper(12345, "systemd-resolved"));
+        }
+        #[cfg(windows)]
+        {
+            // Windows does not reparent orphans → never a subreaper.
+            assert!(!parent_pid_is_subreaper(1, "anything"));
+            assert!(!parent_pid_is_subreaper(4, "System"));
+        }
     }
 
     // ── steady_state_orphaned_mcp_reap runner: soft-fail / no-panic ──────
