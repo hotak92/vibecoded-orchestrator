@@ -170,6 +170,11 @@
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/subagent-start-kg-inject.sh",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/subagent-start-isolation-check.sh",
+            "timeout": 3
           }
         ]
       }
@@ -181,6 +186,17 @@
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/subagent-stop-reconcile.sh",
             "timeout": 2
+          }
+        ]
+      }
+    ],
+    "WorktreeCreate": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/worktree-guard.sh",
+            "timeout": 3
           }
         ]
       }

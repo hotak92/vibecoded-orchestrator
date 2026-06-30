@@ -63,11 +63,17 @@ if (-not $HookStdin) { exit 0 }
 
 # Parse the SubagentStop payload. Field-synonym tolerance for
 # transcript_path mirrors the .sh sibling.
+#
+# v0.2.71 Track T-WT (Layer 3b): also parse the isolation flag + the
+# subagent's cwd/worktree path when exposed. Drives the post-hoc
+# worktree-violation alert below. Both optional — absent ⇒ no-op.
 $SessionId = ""
 $AgentId = ""
 $AgentType = ""
 $TranscriptPath = ""
 $StopReason = ""
+$IsoFlag = $false
+$IsoCwd = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload) {
@@ -78,6 +84,28 @@ try {
         elseif ($payload.transcript_path)     { $TranscriptPath = [string]$payload.transcript_path }
         if ($payload.finish_reason)           { $StopReason     = [string]$payload.finish_reason }
         elseif ($payload.stop_reason)         { $StopReason     = [string]$payload.stop_reason }
+
+        # Isolation flag + cwd (synonym-tolerant; mirror the .sh sibling).
+        function Test-Truthy($v) {
+            if ($v -is [bool]) { return $v }
+            if ($v -is [string]) {
+                return @('worktree','true','1','yes','isolated') -contains $v.Trim().ToLowerInvariant()
+            }
+            return $false
+        }
+        if ($payload.PSObject.Properties['isolation']) {
+            $iv = $payload.isolation
+            if ($iv -is [string] -and $iv.Trim().ToLowerInvariant() -eq 'worktree') { $IsoFlag = $true }
+            elseif (Test-Truthy $iv) { $IsoFlag = $true }
+        }
+        if (-not $IsoFlag) {
+            foreach ($f in 'isolation_mode','worktree','isolated','worktree_isolation') {
+                if ($payload.PSObject.Properties[$f] -and (Test-Truthy $payload.$f)) { $IsoFlag = $true; break }
+            }
+        }
+        foreach ($f in 'cwd','worktree_path','working_directory','working_dir','dir') {
+            if ($payload.PSObject.Properties[$f] -and $payload.$f) { $IsoCwd = [string]$payload.$f; break }
+        }
     }
 } catch {
     exit 0
@@ -339,6 +367,61 @@ if ($SessionId -and $fileCount -gt 0) {
         Move-Item -LiteralPath $tmp -Destination $nudgeFile -Force -ErrorAction Stop
     } catch {
         try { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue } catch {}
+    }
+}
+
+# -------------------- Layer 3b: worktree-violation alert --------------------
+# v0.2.71 Track T-WT. Post-hoc detector mirroring subagent-stop-reconcile.sh:
+# an `isolation: worktree` agent that modified files under the PARENT
+# checkout (Diff-Snapshot resolves paths relative to $ProjectRoot) silently
+# fell back to the shared tree. Write a `worktree_violation` row to
+# .claude/logs/worktree-guard.jsonl. Non-blocking, soft-fail.
+#
+# Guard conditions (all must hold): isolation flag present, >0 changed files,
+# and the reported cwd was NOT a separate worktree (cwd == parent toplevel OR
+# cwd absent).
+if ($IsoFlag -and $fileCount -gt 0) {
+    $wtLog = Join-Path $LogDir "worktree-guard.jsonl"
+    $toplevelWt = ""
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        try { $toplevelWt = (& git -C $ProjectRoot rev-parse --show-toplevel 2>$null | Select-Object -First 1) } catch { $toplevelWt = "" }
+    }
+    function Norm-Path([string]$p) {
+        try { return [System.IO.Path]::GetFullPath($p) } catch { return $p }
+    }
+    # Comparison base: prefer the git toplevel, fall back to ProjectRoot when
+    # not a git repo (mirror subagent-stop-reconcile.sh) so a reported
+    # separate-worktree cwd still exempts.
+    $cmpBase = if ($toplevelWt) { $toplevelWt } else { $ProjectRoot }
+    $cwdIsParent = $true
+    if ($IsoCwd -and $cmpBase) {
+        $nc = Norm-Path $IsoCwd
+        $nt = Norm-Path $cmpBase
+        if ($nc -ne $nt) { $cwdIsParent = $false }
+    }
+    if ($cwdIsParent) {
+        $parentTop = if ($toplevelWt) { $toplevelWt } else { $ProjectRoot }
+        $reason = "isolation:worktree agent modified $fileCount file(s) under the parent checkout ($parentTop) - silent shared-tree fallback detected post-hoc"
+        # Cap the file list so a tree-wide pass cannot bloat the row.
+        $capped = @($changedFiles | Select-Object -First 50)
+        $row = [ordered]@{
+            timestamp       = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            hook            = "subagent-stop-reconcile"
+            decision        = "worktree_violation"
+            reason          = $reason
+            session_id      = $SessionId
+            agent_id        = $AgentId
+            agent_type      = $AgentType
+            parent_toplevel = $parentTop
+            reported_cwd    = $IsoCwd
+            file_count      = $fileCount
+            changed_files   = $capped
+        }
+        try {
+            $line = $row | ConvertTo-Json -Compress -Depth 6
+            Add-Content -Path $wtLog -Value $line -ErrorAction SilentlyContinue
+        } catch { }
+        [Console]::Error.WriteLine("subagent-stop-reconcile: WORKTREE VIOLATION - $reason")
     }
 }
 

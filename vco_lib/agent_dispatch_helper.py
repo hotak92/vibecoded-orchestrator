@@ -2,11 +2,25 @@
 # Copyright (c) 2026 VibeCoded Tools
 """Parallel-agent dispatch helper — defensive worktree-isolation boilerplate (V52-AE).
 
-The `isolation: worktree` frontmatter on Claude Code agents is implemented
-inside the Claude Code binary itself (closed-source). The orchestrator
-cannot intercept the spawn pathway. Empirical evidence on this machine
-during V52-J Phase 1 (2026-06-09) showed several subagents reporting
-"branch switched under me mid-session" + having to cherry-pick to recover.
+The `isolation: worktree` worktree *creation* happens inside the Claude
+Code binary (closed-source). However, the orchestrator CAN intercept the
+spawn pathway via two harness hook events: ``WorktreeCreate`` (can-block;
+receives the intended worktree path on stdin and must echo the absolute
+path on stdout — so VCO can validate or override the path before the binary
+uses it) and ``SubagentStart`` (cannot block, but can inject a loud warning
+into the subagent's initial context). This boilerplate is the *prompt-level*
+(Layer 2) defense; the hook-level (Layer 0) defense lives in
+``templates/hooks/worktree-guard.sh`` (WorktreeCreate) and the
+isolation-check in the SubagentStart hooks
+(``templates/hooks/subagent-start-isolation-check.sh``), with a post-hoc
+Layer 3b violation-alert in ``subagent-stop-reconcile.sh``. Prompt
+boilerplate alone is LLM-discretionary and can be skipped or false-pass —
+see the 2026-06-30 silent-fallback incident — so it must not be the only
+line of defense.
+
+Empirical evidence on this machine during V52-J Phase 1 (2026-06-09) showed
+several subagents reporting "branch switched under me mid-session" + having
+to cherry-pick to recover.
 
 Root cause (likely):
     The harness DOES create per-agent worktrees (verified: this session
@@ -31,7 +45,10 @@ spawning parallel agents) prepend it to the agent prompt.
 References
 ~~~~~~~~~~
 - v0.2.52 backlog §V52-AE
+- v0.2.71 Track T-WT — hook-level safeguard (worktree-guard.sh on
+  WorktreeCreate + SubagentStart isolation-check + SubagentStop Layer 3b)
 - knowledge/concepts/parallel-agent-worktree-isolation-footgun-2026-06-09.md
+- ``.claude/context/audits/worktree-isolation-safeguard-design-2026-06-30.md``
 - ``feedback_subagent_explicit_base_commit.md`` (sibling rule: verify
   base SHA before acting; THIS rule: verify worktree CWD before
   committing)
