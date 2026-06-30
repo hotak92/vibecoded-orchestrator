@@ -209,8 +209,146 @@ def compute_citation(
         sum(1 for v in literal_cited.values() if v),
         sum(1 for v in cited.values() if v),
     )
+
+    # v0.2.71 Sweep-C: dual-RL-log citation second-event. When the staged ctx was
+    # marked dual_log (the retrieval emitted a second event on the OTHER slot),
+    # emit a matching citation on the SAME ``:slot``-suffixed task_id so the pair
+    # joins in the other source's corpus. The other-slot cosine is computed from
+    # answer chunks embedded in the OTHER model's space against the OTHER slot's
+    # per-node vectors (staged as ``other_nodes[].n_emb``). Soft-fail — a broken
+    # second citation never affects the active citation just written above.
+    if write and ctx.get("dual_log"):
+        try:
+            _write_other_slot_citation(task_id, answer, answer_lower, ctx)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("citation_compute: dual-log second citation raised (%s)", exc)
+
     return CitationResult({
         "cosine_sims": cosine_sims,
         "literal_cited": literal_cited,
         "cited": cited,
     })
+
+
+def _write_other_slot_citation(
+    task_id: str, answer: str, answer_lower: str, ctx: dict
+) -> None:
+    """Emit the OTHER-slot citation event (v0.2.71 Sweep-C). Soft-fail, no-op on empty.
+
+    Mirrors the active citation compute but in the OTHER model's space:
+      * answer chunks are re-embedded with the OTHER model via
+        ``svc.ollama.embed(other_model_id, ...)`` (or an OpenAI/active-fallback),
+      * cosine is taken against ``other_nodes[].n_emb`` (the staged other-slot
+        per-node vectors),
+      * the event is written via the OTHER-slot telemetry writer on the
+        ``<task_id>:<other_source>`` suffixed id so it pairs with the second
+        retrieval event in the other source's corpus.
+    """
+    other_nodes = ctx.get("other_nodes") or []
+    other_source = ctx.get("other_embedding_source") or ""
+    other_model = ctx.get("other_embedding_model") or ""
+    other_dim = ctx.get("other_embedding_dim") or 0
+    if not other_nodes or not other_source:
+        return
+
+    try:
+        from claude_mcp_servers.weaviate_mcp.server import (
+            Chunker,
+            _cosine,
+            _get_embedding_service,
+            _get_rl_telemetry_writer_for,
+            _rl_is_literal_cited,
+            _embed_text_in_other_model,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("_write_other_slot_citation: server import failed (%s)", exc)
+        return
+
+    svc = _get_embedding_service()
+    if svc is None:
+        return
+
+    # Chunk the answer with the OTHER model's preset, then embed each chunk in the
+    # OTHER model's space (model-aware: arctic vs qwen3 differ ~4x in chunk size).
+    try:
+        chunker = Chunker.for_model(other_model)
+        chunks = chunker.chunk_text(answer, source_id=f"{task_id}:{other_source}")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("_write_other_slot_citation: chunker failed (%s)", exc)
+        return
+    if not chunks:
+        return
+
+    answer_chunk_embs: list[list[float]] = []
+    for chunk in chunks:
+        text = getattr(chunk, "content", None) or (
+            chunk if isinstance(chunk, str) else None
+        )
+        if not text:
+            continue
+        try:
+            vec = _embed_text_in_other_model(svc, text, other_source, other_model)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("_write_other_slot_citation: chunk embed failed (%s)", exc)
+            continue
+        if vec:
+            answer_chunk_embs.append(vec)
+    if not answer_chunk_embs:
+        return
+
+    cosine_sims: dict[str, float] = {}
+    literal_cited: dict[str, bool] = {}
+    for n in other_nodes:
+        if not isinstance(n, dict):
+            continue
+        title = n.get("title", "")
+        if not title:
+            continue
+        n_emb = n.get("n_emb") or n.get("emb")
+        if not n_emb:
+            continue
+        try:
+            best = max(_cosine(ac, n_emb) for ac in answer_chunk_embs)
+        except Exception:  # noqa: BLE001
+            continue
+        cosine_sims[title] = float(best)
+        literal_cited[title] = _rl_is_literal_cited(n, answer_lower)
+
+    if not cosine_sims:
+        return
+
+    try:
+        from vco_lib.rl_training_targets import compute_unified_targets
+
+        _targets, cited = compute_unified_targets(
+            cosine_sims,
+            literal_cited=literal_cited,
+            cross_encoder_cited=None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("_write_other_slot_citation: compute_unified_targets failed (%s)", exc)
+        return
+
+    writer = _get_rl_telemetry_writer_for(
+        other_source, embedding_dim=other_dim, embedding_model=other_model
+    )
+    if writer is None:
+        return
+    suffixed = f"{task_id}:{other_source}"
+    try:
+        writer.log_citations(
+            task_id=suffixed,
+            task_type=ctx.get("task_type") or "mcp_interactive",
+            citations={t: bool(v) for t, v in cited.items()},
+            cosine_sims=cosine_sims,
+            literal_cited=literal_cited,
+            cross_encoder_cited=None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("_write_other_slot_citation: log_citations failed (%s)", exc)
+        return
+    logger.debug(
+        "citation_compute %s: other-slot (%s) citation written — %d cosine, %d cited",
+        task_id[:8], other_source, len(cosine_sims),
+        sum(1 for v in cited.values() if v),
+    )

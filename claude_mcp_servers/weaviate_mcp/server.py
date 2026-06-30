@@ -4409,13 +4409,13 @@ def _get_rl_telemetry_writer():
     its own writer with correct tags. All cached writers share the
     process and are eligible for shutdown reset via
     ``_reset_rl_telemetry_writers()``.
-    """
-    try:
-        from claude_mcp_servers.rl_client import RLTelemetryWriter
-    except Exception as exc:
-        logger.debug("RLTelemetryWriter import failed (%s); telemetry disabled", exc)
-        return None
 
+    v0.2.71 Sweep-C: this is now a thin wrapper over
+    ``_get_rl_telemetry_writer_for`` that resolves the ACTIVE embedding triple
+    from env / EmbeddingService. The dual-log fan-out reaches the SAME
+    construction body for the OTHER slot via ``_get_rl_telemetry_writer_for``
+    with an explicit ``embedding_source`` override (one home).
+    """
     # ---- step 1: derive the embedding triple (source/model/dim) ----
     #
     # v0.2.31 telemetry audit fix (Item 2.2 — was 31% blank rows): when
