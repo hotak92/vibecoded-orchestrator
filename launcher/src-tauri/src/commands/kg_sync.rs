@@ -56,6 +56,76 @@ use vct_launcher_core::process::CommandExt as _;
 
 const SYNC_EVENT: &str = "kg-sync-progress";
 
+/// v0.2.71 Piece 5a — process-global single-flight cap on KG re-embeds.
+///
+/// THE BUG (audit `update-all-kg-reembed-serialization-2026-06-30.md`):
+/// "Update all projects" iterates projects sequentially but each project's
+/// re-embed is launched fire-and-forget (`spawn_initial_sync` →
+/// `tokio::spawn(run_sync_task)`), so the iteration loop never waits for
+/// project N's `sync_knowledge_graph.py --all` before starting N+1. With 8
+/// projects the detached subprocesses pile up (the field-reported "14"
+/// wrapper→python pairs), thrashing one Ollama instance and starving the
+/// machine. There was NO machine-wide KG-sync lock anywhere — `MigrateLockGuard`
+/// is keyed per-project_id (uncontended across distinct projects), and the
+/// stall watchdog bounds per-child silence, not cross-child concurrency.
+///
+/// THE FIX: every `run_sync_task` must hold ONE of these permits across the
+/// ENTIRE subprocess lifetime (acquire → spawn → drain → exit). With a single
+/// permit, the second-and-later detached tasks `await` the permit instead of
+/// launching a competing child, so at most `KG_SYNC_MAX_CONCURRENT`
+/// `sync_knowledge_graph.py` processes run at once regardless of how many
+/// callers (update-all, retry, create, boot-resume) spawn tasks.
+///
+/// WHY A `tokio::sync::Semaphore` (async) and not a `std::sync::Mutex`:
+/// `run_sync_task` runs ON the tokio runtime. A blocking `std::sync::Mutex`
+/// held across an `.await` would park a runtime worker thread for the whole
+/// (possibly multi-minute) re-embed; the async semaphore lets queued tasks
+/// yield the worker while they wait. `acquire_owned` yields an
+/// `OwnedSemaphorePermit` that we bind as a local — it releases on drop (RAII),
+/// so a panicking or early-returning sync still frees its permit for the queue.
+///
+/// WHY PROCESS-GLOBAL IS SUFFICIENT: the launcher is single-instance per user
+/// (`tauri_plugin_single_instance`, `lib.rs:570/583` — a second launch focuses
+/// the existing window and exits without touching launcher.db). All KG syncs
+/// therefore originate in this one process, so a process-global semaphore caps
+/// machine-wide concurrency. (If the launcher ever became multi-process, this
+/// would need a cross-process lock — e.g. an OS file lock — but that is not the
+/// case today and a process-global is the correct first fix.)
+///
+/// CROSS-OS: the lock sits ABOVE `run_subprocess`, which is shared Rust on all
+/// three OSes; only the wrapper/powershell/CREATE_NO_WINDOW branches *inside*
+/// `run_subprocess` differ. One lock therefore covers Linux/macOS/Windows.
+///
+/// TUNABILITY: `KG_SYNC_MAX_CONCURRENT` is a `const` (default 1, conservative).
+/// A small N>1 could be set if a slow backend benefits from limited parallelism,
+/// but 1 is the safe default that guarantees the 14-concurrent state cannot recur.
+const KG_SYNC_MAX_CONCURRENT: usize = 1;
+
+/// The process-global semaphore. `LazyLock` mirrors the static-init style used
+/// elsewhere in the launcher (`MIGRATE_IN_FLIGHT`, `UNREGISTER_CANONICAL_ENV_KEYS`
+/// in `projects_v2.rs`).
+static KG_SYNC_SEMAPHORE: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Arc::new(tokio::sync::Semaphore::new(KG_SYNC_MAX_CONCURRENT))
+    });
+
+/// Acquire a permit on the process-global KG-sync semaphore, parking the
+/// caller (async) until one is free. Returns an owned permit whose `Drop`
+/// releases it back to the queue. Extracted as a thin async helper so the
+/// acquire point in `run_sync_task` reads clearly and so tests can exercise
+/// the same semaphore the production path uses.
+///
+/// `acquire_owned` only errors if the semaphore is `close()`d; we never close
+/// it (it lives for the process lifetime), so the `expect` is unreachable in
+/// practice — but we surface it loudly rather than silently dropping the cap.
+async fn acquire_kg_sync_permit() -> tokio::sync::OwnedSemaphorePermit {
+    KG_SYNC_SEMAPHORE
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("KG_SYNC_SEMAPHORE is never closed for the process lifetime")
+}
+
 /// Tauri-event payload + DTO for `get_kg_sync_status`.
 ///
 /// Mirrors `KgSyncRow` but in a public-API shape: timestamps in ISO 8601
@@ -385,6 +455,39 @@ async fn run_sync_task(
     //    stdin closed, env block from ProjectEnvSettings, CREATE_NO_WINDOW
     //    on Windows so no console flashes.
     let (program, base_args) = invocation_for(&script);
+
+    // 6a. v0.2.71 Piece 5a — acquire the process-global single-flight permit
+    //     BEFORE spawning the child. This is the hard concurrency cap: when
+    //     "Update all projects" spawns N detached `run_sync_task`s, only
+    //     `KG_SYNC_MAX_CONCURRENT` (default 1) hold a permit and actually run
+    //     a `sync_knowledge_graph.py --all` at a time; the rest park here on
+    //     `.await` until a permit frees. The permit is acquired AFTER the
+    //     fast-skip pre-checks (empty-dir skip at step 2, script resolve at
+    //     step 3) so a project with nothing to sync never occupies the lane.
+    //
+    //     We emit a "queued" phase first so the GUI's per-project pill shows
+    //     "Queued" instead of a generic spinner while it waits for the lane
+    //     (the `pending` DB row already supports this state). Once the permit
+    //     lands we flip to "embed".
+    //
+    //     `_permit` is bound for the rest of the function scope; its `Drop`
+    //     releases the lane back to the queue when `run_sync_task` returns —
+    //     including the panic/early-return paths below (RAII). It MUST outlive
+    //     the `run_subprocess(...).await` so the lane is held across the entire
+    //     child lifetime, not just the acquire.
+    emit_sync(
+        &app,
+        &project_id,
+        sync_status::RUNNING,
+        ProgressCounts {
+            kg_total: kg_md_count,
+            docs_total: docs_md_count,
+            ..ProgressCounts::zero()
+        },
+        Some("queued"),
+        None,
+    );
+    let _permit = acquire_kg_sync_permit().await;
 
     emit_sync(
         &app,
@@ -2049,5 +2152,130 @@ mod tests {
             pairs.iter().all(|(k, _)| *k != "VCT_INSTALL_ROOT"),
             "VCT_INSTALL_ROOT must be absent when orchestrator_root is None"
         );
+    }
+
+    // ─── v0.2.71 Piece 5a — global single-flight KG-sync semaphore ──────
+    //
+    // These tests pin the concurrency-cap contract WITHOUT spawning real
+    // `sync_knowledge_graph.py` subprocesses (which need Weaviate/Ollama).
+    // They exercise the SAME `acquire_kg_sync_permit()` chokepoint the
+    // production `run_sync_task` uses, so a regression that removes the
+    // acquire (or widens the permit count) fails here.
+
+    /// The default cap is the conservative single-flight value. If a future
+    /// edit bumps `KG_SYNC_MAX_CONCURRENT`, this test forces a deliberate
+    /// review (the whole point of the fix is to bound machine-wide concurrency).
+    #[test]
+    fn kg_sync_max_concurrent_default_is_one() {
+        assert_eq!(
+            KG_SYNC_MAX_CONCURRENT, 1,
+            "the single-flight cap must default to 1 — bumping it re-opens the \
+             14-concurrent-sync blast radius the audit closed"
+        );
+        // The live semaphore must be initialised with exactly that many permits.
+        assert_eq!(
+            KG_SYNC_SEMAPHORE.available_permits(),
+            KG_SYNC_MAX_CONCURRENT,
+            "the process-global semaphore must start with KG_SYNC_MAX_CONCURRENT permits"
+        );
+    }
+
+    /// N tasks racing through `acquire_kg_sync_permit()` must never have more
+    /// than `KG_SYNC_MAX_CONCURRENT` permits checked out at once. Each task
+    /// holds its permit across an `.await` (simulating the subprocess
+    /// lifetime), bumps a shared in-flight counter on entry, asserts the peak
+    /// never exceeds the cap, then drops the permit. We also assert all N
+    /// tasks COMPLETE (queued syncs wait — they are not dropped).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn acquire_kg_sync_permit_serializes_to_the_cap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        const N: usize = 8; // mirrors the field-reported 8-project update-all
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let in_flight = in_flight.clone();
+            let peak = peak.clone();
+            let completed = completed.clone();
+            handles.push(tokio::spawn(async move {
+                // Acquire the SAME process-global permit the production
+                // run_sync_task acquires before spawning its child.
+                let _permit = acquire_kg_sync_permit().await;
+
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                // Record the running peak.
+                peak.fetch_max(now, Ordering::SeqCst);
+                assert!(
+                    now <= KG_SYNC_MAX_CONCURRENT,
+                    "more than {} KG syncs in flight ({}) — semaphore failed to \
+                     serialize (regression of v0.2.71 Piece 5a)",
+                    KG_SYNC_MAX_CONCURRENT,
+                    now
+                );
+
+                // Hold the permit across an await, like the real subprocess.
+                tokio::time::sleep(Duration::from_millis(15)).await;
+
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                completed.fetch_add(1, Ordering::SeqCst);
+                // `_permit` drops here, releasing the lane to the next waiter.
+            }));
+        }
+
+        for h in handles {
+            h.await.expect("task must not panic (would mean the cap was exceeded)");
+        }
+
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            KG_SYNC_MAX_CONCURRENT,
+            "the peak in-flight count must reach exactly the cap (work happened) \
+             and never exceed it"
+        );
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            N,
+            "all {} queued syncs must complete in order — queued tasks WAIT, \
+             they are never dropped",
+            N
+        );
+        // The semaphore must be fully restored to its starting permit count
+        // once every task released — proving Drop-based release works.
+        assert_eq!(
+            KG_SYNC_SEMAPHORE.available_permits(),
+            KG_SYNC_MAX_CONCURRENT,
+            "all permits must be returned after the tasks finish (RAII release)"
+        );
+    }
+
+    /// A panicking holder must still release its permit (RAII via Drop), so a
+    /// crashed sync cannot permanently wedge the lane for every later project.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn acquire_kg_sync_permit_releases_on_panic() {
+        let before = KG_SYNC_SEMAPHORE.available_permits();
+
+        let h = tokio::spawn(async move {
+            let _permit = acquire_kg_sync_permit().await;
+            panic!("simulate a sync task that panics mid-run");
+        });
+        // The spawned task panics; the JoinHandle resolves to an Err.
+        assert!(h.await.is_err(), "the task must have panicked");
+
+        // The permit must be back — Drop ran during unwind.
+        assert_eq!(
+            KG_SYNC_SEMAPHORE.available_permits(),
+            before,
+            "a panicking sync must still release its permit (otherwise one \
+             crash permanently wedges every queued project)"
+        );
+
+        // And a fresh acquire must succeed promptly (lane is usable again).
+        let _permit = acquire_kg_sync_permit().await;
     }
 }

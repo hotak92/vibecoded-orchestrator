@@ -56,6 +56,7 @@ from vco_lib.embedding_service import (
     DEFAULT_EMBED_REQUEST_TIMEOUT_SECS,
     DEFAULT_TEXT_MODEL,
     DEFAULT_TEXT_SLOT,
+    DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV,
     EMBED_REQUEST_TIMEOUT_ENV,
     OPENAI_MODEL_ID_PREFIX,
     EmbeddingService,
@@ -64,6 +65,7 @@ from vco_lib.embedding_service import (
     _resolve_code_slot,
     _resolve_embed_request_timeout,
     _resolve_text_slot,
+    _resolve_write_all_slots,
     _to_openai_api_model,
     _to_openai_catalog_id,
     main as embedding_service_main,
@@ -188,6 +190,8 @@ class _EnvIsolation:
         "OPENAI_EMBEDDING_MODEL",
         "KG_BASE_DIR",
         "VCT_ORCHESTRATOR_ROOT",
+        # v0.2.71 Piece 5c: secondary-slot write toggle (default OFF).
+        "DUAL_EMBEDDING_WRITE_ALL_SLOTS",
     )
 
     def __enter__(self):
@@ -1440,32 +1444,41 @@ class EmbeddingServiceMethodTests(unittest.TestCase):
 
     def test_embed_text_all_configured_with_openai_fallback(self):
         # qwen3 is active; openai key is configured and valid. Both
-        # should populate.
-        svc, _ = _make_service_with_mocks(
-            text_model=DEFAULT_TEXT_MODEL,
-            openai_key="sk-test",
-            openai_valid=True,
-        )
-        try:
-            result = svc.embed_text_all_configured("hello")
-            self.assertIn("qwen3_embed", result)
-            self.assertIn("openai_text_embed", result)
-        finally:
-            svc.close()
+        # should populate WHEN the secondary-slot write toggle is ON
+        # (v0.2.71 Piece 5c made the fan-out opt-in; default OFF writes
+        # only the active slot — see DualWriteAllSlotsToggleTests).
+        with _EnvIsolation(), patch.dict(
+            os.environ, {DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV: "true"}, clear=False
+        ):
+            svc, _ = _make_service_with_mocks(
+                text_model=DEFAULT_TEXT_MODEL,
+                openai_key="sk-test",
+                openai_valid=True,
+            )
+            try:
+                result = svc.embed_text_all_configured("hello")
+                self.assertIn("qwen3_embed", result)
+                self.assertIn("openai_text_embed", result)
+            finally:
+                svc.close()
 
     def test_embed_code_all_configured_active_and_openai(self):
-        svc, _ = _make_service_with_mocks(
-            code_model="codesage-large-v2",
-            openai_key="sk-test",
-            openai_valid=True,
-            code_ready=True,
-        )
-        try:
-            result = svc.embed_code_all_configured("def f(): pass")
-            self.assertIn("codesage_embed", result)
-            self.assertIn("openai_code_embed", result)
-        finally:
-            svc.close()
+        # Secondary-slot fan-out is opt-in (v0.2.71 Piece 5c) — enable it.
+        with _EnvIsolation(), patch.dict(
+            os.environ, {DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV: "true"}, clear=False
+        ):
+            svc, _ = _make_service_with_mocks(
+                code_model="codesage-large-v2",
+                openai_key="sk-test",
+                openai_valid=True,
+                code_ready=True,
+            )
+            try:
+                result = svc.embed_code_all_configured("def f(): pass")
+                self.assertIn("codesage_embed", result)
+                self.assertIn("openai_code_embed", result)
+            finally:
+                svc.close()
 
     def test_context_manager_closes_owned_session(self):
         # When the caller doesn't inject a session, the service owns
@@ -1981,6 +1994,10 @@ class OpenAIHttpBoundaryStripsPrefixTests(unittest.TestCase):
         with _EnvIsolation():
             # Simulate user error: put the prefixed catalog id in env.
             os.environ["OPENAI_EMBEDDING_MODEL"] = "openai-text-embedding-3-small"
+            # v0.2.71 Piece 5c: the OpenAI fallback is a SECONDARY slot, now
+            # opt-in. Enable the toggle so this prefix-strip boundary test
+            # still exercises the fallback branch.
+            os.environ[DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV] = "true"
             svc = EmbeddingService(
                 project_root=None,
                 ollama_url="http://localhost:11435",
@@ -2495,6 +2512,131 @@ class SubprocessEnvThreadsRequestTimeoutTests(unittest.TestCase):
                 env = install_mod._subprocess_env_with_embedding()
         # install.py must not synthesise a value — absence → subprocess default.
         self.assertNotIn(EMBED_REQUEST_TIMEOUT_ENV, env)
+
+
+class DualWriteAllSlotsToggleTests(unittest.TestCase):
+    """v0.2.71 Piece 5c — secondary-slot enrichment write is opt-in (default OFF).
+
+    The active slot must ALWAYS be written (reads target it; a single-entry
+    named-vector dict keeps existing collections working); the secondary
+    slots (qwen3/openai for text, codesage/openai for code) are written only
+    when DUAL_EMBEDDING_WRITE_ALL_SLOTS is truthy. Default OFF cuts the embed
+    cost the field report flagged without breaking any read.
+    """
+
+    def test_default_resolves_to_false_when_unset(self):
+        with _EnvIsolation():
+            os.environ.pop(DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV, None)
+            self.assertFalse(
+                _resolve_write_all_slots(),
+                "DUAL_EMBEDDING_WRITE_ALL_SLOTS must default to FALSE (opt-in)",
+            )
+
+    def test_truthy_values_enable(self):
+        for val in ("1", "true", "TRUE", "yes", "On"):
+            with _EnvIsolation(), patch.dict(
+                os.environ, {DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV: val}, clear=False
+            ):
+                self.assertTrue(
+                    _resolve_write_all_slots(),
+                    f"{val!r} must enable secondary-slot writes",
+                )
+
+    def test_falsey_and_garbage_values_disable(self):
+        for val in ("0", "false", "no", "off", "", "maybe", "2"):
+            with _EnvIsolation(), patch.dict(
+                os.environ, {DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV: val}, clear=False
+            ):
+                self.assertFalse(
+                    _resolve_write_all_slots(),
+                    f"{val!r} must NOT enable secondary-slot writes",
+                )
+
+    def test_text_default_off_writes_only_active_slot(self):
+        # arctic2-active install with Ollama (qwen3) + OpenAI both reachable:
+        # with the toggle OFF, only the active arctic2_embed slot is written.
+        with _EnvIsolation(), patch.dict(
+            os.environ, {"EMBEDDING_MODEL": "snowflake-arctic-embed2:latest"}, clear=False
+        ):
+            os.environ.pop(DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV, None)
+            svc, _ = _make_service_with_mocks(
+                text_model="snowflake-arctic-embed2:latest",
+                openai_key="sk-test",
+                ollama_ready=True,
+                openai_valid=True,
+            )
+            try:
+                slots = svc.embed_text_all_configured("hello world")
+            finally:
+                svc.close()
+            self.assertEqual(
+                set(slots.keys()),
+                {svc.text_vector_slot},
+                "default-OFF must write ONLY the active slot (a valid named-vector "
+                "write), not the qwen3/openai secondary slots",
+            )
+            self.assertEqual(svc.text_vector_slot, "arctic2_embed")
+
+    def test_text_on_writes_secondary_slots(self):
+        with _EnvIsolation(), patch.dict(
+            os.environ,
+            {
+                "EMBEDDING_MODEL": "snowflake-arctic-embed2:latest",
+                DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV: "true",
+            },
+            clear=False,
+        ):
+            svc, _ = _make_service_with_mocks(
+                text_model="snowflake-arctic-embed2:latest",
+                openai_key="sk-test",
+                ollama_ready=True,
+                openai_valid=True,
+            )
+            try:
+                slots = svc.embed_text_all_configured("hello world")
+            finally:
+                svc.close()
+            # active arctic2 + qwen3 (ollama) + openai_text_embed all present
+            self.assertIn("arctic2_embed", slots)
+            self.assertIn("qwen3_embed", slots)
+            self.assertIn("openai_text_embed", slots)
+
+    def test_code_default_off_writes_only_active_slot(self):
+        # qwen3-active (text) → code active slot is codesage_embed by default.
+        with _EnvIsolation():
+            os.environ.pop(DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV, None)
+            svc, _ = _make_service_with_mocks(
+                openai_key="sk-test",
+                code_ready=True,
+                openai_valid=True,
+            )
+            try:
+                slots = svc.embed_code_all_configured("def f(): pass")
+            finally:
+                svc.close()
+            self.assertEqual(
+                set(slots.keys()),
+                {svc.code_vector_slot},
+                "default-OFF must write ONLY the active code slot",
+            )
+
+    def test_active_slot_always_present_even_off(self):
+        # The guarantee that keeps reads working: the active slot is never
+        # dropped by the toggle, regardless of its value.
+        for toggle in (None, "false", "true"):
+            with _EnvIsolation():
+                if toggle is not None:
+                    os.environ[DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV] = toggle
+                svc, _ = _make_service_with_mocks(ollama_ready=True)
+                try:
+                    slots = svc.embed_text_all_configured("x")
+                finally:
+                    svc.close()
+                self.assertIn(
+                    svc.text_vector_slot,
+                    slots,
+                    f"active slot must always be written (toggle={toggle!r})",
+                )
 
 
 if __name__ == "__main__":

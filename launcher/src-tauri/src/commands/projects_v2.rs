@@ -109,6 +109,22 @@ pub struct UpdateSummary {
     /// failures, manifest write failure, etc.). Each is also surfaced as
     /// a warning string in `UpdateProjectResult.warnings`.
     pub errors_count: u32,
+    /// v0.2.71 Piece 5b: true iff this bundle update actually wrote (created /
+    /// overwrote / always-overwrote) at least one file under `knowledge/**` or
+    /// `docs/**`. Drives the kg-sync spawn gate on UPDATE: when this is FALSE,
+    /// the on-disk KG/docs content the `--all` re-embed would walk is
+    /// byte-identical to what's already in Weaviate, so re-spawning a full
+    /// `sync_knowledge_graph.py --all` is pure waste (the exact case the user
+    /// hit — a settings.json-only update triggering a full ×8 re-embed). Only
+    /// the change-CAUSING buckets count; `noop`/`preserve`/`keep-regenerated`
+    /// do NOT, because they leave the file's on-disk bytes unchanged.
+    ///
+    /// Conservative default `false` (no spawn) only applies on a parsed
+    /// envelope; any parse failure leaves the field at its serde default and
+    /// the caller falls back to spawning (safe-but-slow), see
+    /// `kg_docs_content_changed`.
+    #[serde(default)]
+    pub kg_or_docs_content_changed: bool,
 }
 
 impl UpdateSummary {
@@ -705,6 +721,10 @@ pub(crate) fn create_setup_phases(
                 &app,
                 &db,
                 /* is_initial_create */ true,
+                // v0.2.71 Piece 5b: ignored on create (is_initial_create=true
+                // always spawns the first-time index). Pass `true` to document
+                // intent — a fresh project's pre-existing KG/docs must be synced.
+                /* kg_or_docs_content_changed */ true,
             )
             .await;
             for w in post {
@@ -756,8 +776,18 @@ pub(crate) fn create_setup_phases(
 /// pre-existing per-project code-graph rows can be stale, so the
 /// codegraph spawn passes `prune_stale=false`. On update, prior rows
 /// may reference files the user deleted between create and update, so
-/// the spawn passes `prune_stale=true`. This is the ONLY behavioral
-/// difference between the two call sites (audit recommendation AF-6).
+/// the spawn passes `prune_stale=true`.
+///
+/// **`kg_or_docs_content_changed`** (v0.2.71 Piece 5b): gates step 5
+/// (kg-sync spawn) on UPDATE. On create it is ignored (a fresh project's
+/// pre-existing KG/docs must be indexed for the first time). On update,
+/// the kg-sync `--all` re-embed is spawned ONLY when this is `true` — i.e.
+/// the bundle actually wrote a `knowledge/**` or `docs/**` file. When the
+/// update touched only `.claude/` files (settings/hooks/scripts) the
+/// on-disk KG/docs content is byte-identical to Weaviate, so re-walking it
+/// is pure waste (the exact ×8 full-re-embed the user hit). Callers pass
+/// `true` on create (value unused there but documents intent). See
+/// `should_spawn_kg_sync_on_bundle`.
 ///
 /// **TODO (V52-AG layer 3)**: wire `register_artifact_version` for the
 /// `bundle_materialization` artifact_type here so the schema-version
@@ -790,6 +820,7 @@ pub(crate) async fn apply_post_bundle_steps(
     app: &tauri::AppHandle,
     db: &Db,
     is_initial_create: bool,
+    kg_or_docs_content_changed: bool,
 ) -> Vec<String> {
     let mut warnings: Vec<String> = Vec::new();
     let folder_path_str = folder.to_string_lossy().to_string();
@@ -963,7 +994,37 @@ pub(crate) async fn apply_post_bundle_steps(
     // diff-gate skips unchanged files cheaply, so re-running on every
     // update is the consistent-over-optimization choice (per the
     // "from now on consistent" directive).
-    if let Err(e) = db.upsert_kg_sync(
+    //
+    // v0.2.71 Piece 5b (gate the V52-AF "run on every update" spawn):
+    // the field report showed an 8-project "Update all" — where each
+    // bundle update changed ONLY `.claude/settings.json` (a hook-path fix,
+    // embedding already arctic) — launching 8 full `kg-sync --all`
+    // re-embeds that, even on the all-skip-by-hash fast path, multiply
+    // Weaviate fetch round-trips under Ollama contention and risk a full
+    // arctic-CPU re-seed of the curated/shared nodes on any slot/hash miss
+    // (audit `update-all-kg-reembed-serialization-2026-06-30.md` §3, §B1).
+    //
+    // We now spawn the sync on UPDATE only when the bundle actually wrote a
+    // `knowledge/**` or `docs/**` file (`kg_or_docs_content_changed`). On
+    // CREATE we always spawn (a fresh project's pre-existing KG/docs must be
+    // indexed for the first time). The Piece-5a semaphore still bounds the
+    // residual concurrency for the cases that DO spawn — 5b reduces how
+    // often the work is even attempted; 5a guarantees it can never pile up.
+    //
+    // This is a narrow, deliberate scope-back of the V52-AF "always run on
+    // update" choice: it remains consistent (any real KG/docs change still
+    // syncs), it just stops re-validating byte-identical content. An
+    // embedding-MODEL or COLLECTION switch is handled by the dedicated
+    // regenerate-embeddings / migration flow, NOT by a bundle update, so a
+    // content-change gate is correct and sufficient here.
+    if !should_spawn_kg_sync_on_bundle(is_initial_create, kg_or_docs_content_changed) {
+        eprintln!(
+            "[vct] kg-sync skipped for {} (bundle update touched no \
+             knowledge/** or docs/** content; on-disk KG/docs unchanged \
+             — nothing to re-embed)",
+            project_id
+        );
+    } else if let Err(e) = db.upsert_kg_sync(
         project_id,
         kg_sync_status::PENDING,
         Some(now),
@@ -1412,6 +1473,77 @@ pub(crate) async fn run_install_bundle_update(
     run_install_bundle_update_with_root(folder, None).await
 }
 
+/// v0.2.71 Piece 5b — relative-path buckets whose membership means the bundle
+/// actually CHANGED a file's on-disk bytes (vs left it untouched). Only these
+/// gate the kg-sync re-embed; `noop` / `preserve` / `keep-regenerated` /
+/// `skip-*` / `orphan-preserved` all leave the on-disk content as-is, so they
+/// must NOT trigger a re-embed.
+const BUNDLE_CONTENT_CHANGING_BUCKETS: [&str; 4] =
+    ["create", "overwrite", "always-overwrite", "orphan-deleted"];
+
+/// True iff a relative bundle path lives under `knowledge/` or `docs/` — the
+/// two trees `sync_knowledge_graph.py --all` walks. Normalises Windows
+/// backslashes so the same envelope path matches cross-OS.
+fn is_kg_or_docs_rel_path(rel: &str) -> bool {
+    let norm = rel.replace('\\', "/");
+    let norm = norm.trim_start_matches("./");
+    norm.starts_with("knowledge/") || norm.starts_with("docs/")
+}
+
+/// v0.2.71 Piece 5b — pure inspector over the install-bundle `--json` envelope.
+///
+/// Returns `true` iff at least one path in a content-CHANGING bucket
+/// (`BUNDLE_CONTENT_CHANGING_BUCKETS`) lives under `knowledge/**` or `docs/**`.
+/// That is the ONLY condition under which a fresh `kg-sync --all` re-embed can
+/// surface new/changed content into Weaviate on an UPDATE.
+///
+/// Conservative on ambiguity: if `actions` is missing or not the expected
+/// object-of-arrays shape, returns `true` (assume something changed → spawn the
+/// sync). Better to pay an unnecessary all-skip re-validation (bounded now by
+/// the Piece-5a semaphore) than to silently skip a sync that WAS needed.
+fn envelope_kg_or_docs_content_changed(v: &serde_json::Value) -> bool {
+    let Some(actions) = v.get("actions").and_then(|a| a.as_object()) else {
+        // Unparseable / unexpected shape → assume changed (spawn, safe-but-slow).
+        return true;
+    };
+    for bucket in BUNDLE_CONTENT_CHANGING_BUCKETS {
+        let Some(arr) = actions.get(bucket).and_then(|x| x.as_array()) else {
+            continue;
+        };
+        for entry in arr {
+            if let Some(rel) = entry.as_str() {
+                if is_kg_or_docs_rel_path(rel) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// v0.2.71 Piece 5b — pure decision predicate for the kg-sync spawn gate.
+/// Unit-testable without spawning anything.
+///
+/// On CREATE (`is_initial_create=true`) ALWAYS spawn: a fresh project's
+/// pre-existing `knowledge/**`/`docs/**` must be indexed for the first time
+/// (the original 2026-05-12 KG-auto-sync purpose). On UPDATE, spawn ONLY when
+/// the bundle actually changed KG/docs content — otherwise the `--all` would
+/// re-walk byte-identical content and (per the audit) merely multiply
+/// Weaviate fetch round-trips under contention, plus risk a full arctic-CPU
+/// re-seed of the curated/shared nodes on any slot/hash miss.
+///
+/// NOTE the deliberate scope: this gates ONLY the content-change axis. A
+/// genuine embedding-MODEL or COLLECTION switch is handled by the dedicated
+/// re-embed / migration flow (the regenerate-embeddings modal + migration
+/// runner), NOT by a bundle update — a bundle update never changes the active
+/// embedding model. So content-change is the correct and sufficient gate here.
+pub(crate) fn should_spawn_kg_sync_on_bundle(
+    is_initial_create: bool,
+    kg_or_docs_content_changed: bool,
+) -> bool {
+    is_initial_create || kg_or_docs_content_changed
+}
+
 /// Test-friendly seam: same as `run_install_bundle_update` but lets a
 /// caller (today: the unit tests) override the orchestrator root so
 /// install-bundle resolves templates from a controlled fake tree rather
@@ -1423,6 +1555,13 @@ pub(crate) async fn run_install_bundle_update_with_root(
 ) -> (Vec<String>, UpdateSummary) {
     let mut warnings: Vec<String> = Vec::new();
     let mut summary = UpdateSummary::default();
+    // v0.2.71 Piece 5b: start CONSERVATIVE. Every soft-fail early-return below
+    // (Python missing, orch root unfindable, subprocess fail-to-start) and the
+    // JSON-parse-failure arm leave this `true`, so the kg-sync spawn gate falls
+    // back to spawning (safe-but-slow) whenever we could NOT positively confirm
+    // that no KG/docs content changed. Only the successful-parse path flips it
+    // to the precise computed value via `envelope_kg_or_docs_content_changed`.
+    summary.kg_or_docs_content_changed = true;
 
     let system = match detect_system().await {
         Ok(s) => s,
@@ -1529,6 +1668,14 @@ pub(crate) async fn run_install_bundle_update_with_root(
                 summary.always_overwritten = count_for("always-overwrite");
                 summary.skipped_existing = count_for("skip-existing");
             }
+
+            // v0.2.71 Piece 5b: decide whether this update touched any
+            // knowledge/**/*.md or docs/**/*.md content. Inspect the parsed
+            // envelope (not the flattened counts — those lose the path detail)
+            // so the kg-sync spawn gate can skip a full re-embed when nothing
+            // relevant changed. Conservative: an unparseable / unexpected
+            // `actions` shape yields `true` (assume changed → spawn).
+            summary.kg_or_docs_content_changed = envelope_kg_or_docs_content_changed(&v);
 
             if let Some(errs) = v.get("errors").and_then(|x| x.as_array()) {
                 summary.errors_count = errs.len() as u32;
@@ -2417,6 +2564,10 @@ pub async fn update_project_v2(
         &app,
         &db,
         /* is_initial_create */ false,
+        // v0.2.71 Piece 5b: gate the kg-sync re-embed on whether this bundle
+        // update actually wrote knowledge/** or docs/** content. A settings-
+        // only update (the field-reported case) → `false` → no full re-embed.
+        summary.kg_or_docs_content_changed,
     )
     .await;
     for w in post_bundle_warnings {
@@ -6522,6 +6673,114 @@ pub async fn perform_hard_cut(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── v0.2.71 Piece 5b: kg-sync spawn gate (skip-when-unchanged) ─────
+
+    #[test]
+    fn is_kg_or_docs_rel_path_matches_only_kg_and_docs() {
+        assert!(is_kg_or_docs_rel_path("knowledge/concepts/foo.md"));
+        assert!(is_kg_or_docs_rel_path("docs/features/bar.md"));
+        // Windows-style separators must normalise to the same answer.
+        assert!(is_kg_or_docs_rel_path("knowledge\\concepts\\foo.md"));
+        // Leading ./ is tolerated.
+        assert!(is_kg_or_docs_rel_path("./docs/x.md"));
+        // Non-KG/docs paths must NOT match.
+        assert!(!is_kg_or_docs_rel_path(".claude/settings.json"));
+        assert!(!is_kg_or_docs_rel_path(".claude/hooks/post-file-edit.sh"));
+        assert!(!is_kg_or_docs_rel_path("infrastructure/docker-compose.yml"));
+        // A substring "knowledge" deeper in the tree must NOT match (prefix-anchored).
+        assert!(!is_kg_or_docs_rel_path(".claude/knowledge-helper.md"));
+    }
+
+    #[test]
+    fn envelope_change_detector_false_for_settings_only_update() {
+        // The exact field-reported case: an update whose only write was
+        // .claude/settings.json (a hook-path fix); everything else noop.
+        let v = serde_json::json!({
+            "actions": {
+                "create": [],
+                "overwrite": [".claude/settings.json"],
+                "always-overwrite": [".claude/hooks/_lib/common.sh"],
+                "noop": ["knowledge/concepts/curated.md", "docs/README.md"],
+                "preserve": [],
+                "skip-existing": [],
+                "skip-disabled": [],
+                "keep-regenerated": ["knowledge/.node_formats.json"],
+                "orphan-deleted": [],
+                "orphan-preserved": [],
+            }
+        });
+        assert!(
+            !envelope_kg_or_docs_content_changed(&v),
+            "settings.json + hook-lib overwrite with KG/docs only in noop/keep \
+             must NOT count as KG/docs content change"
+        );
+        assert!(
+            !should_spawn_kg_sync_on_bundle(false, envelope_kg_or_docs_content_changed(&v)),
+            "an UPDATE with no KG/docs content change must NOT spawn a re-embed"
+        );
+    }
+
+    #[test]
+    fn envelope_change_detector_true_when_knowledge_created_or_overwritten() {
+        // A new curated node shipped → create bucket has a knowledge/ path.
+        let created = serde_json::json!({
+            "actions": { "create": ["knowledge/concepts/new-node.md"],
+                         "overwrite": [], "always-overwrite": [],
+                         "noop": [], "preserve": [] }
+        });
+        assert!(envelope_kg_or_docs_content_changed(&created));
+        assert!(should_spawn_kg_sync_on_bundle(false, true));
+
+        // An updated curated node → overwrite bucket has a knowledge/ path.
+        let overwritten = serde_json::json!({
+            "actions": { "create": [],
+                         "overwrite": ["knowledge/concepts/updated.md"],
+                         "always-overwrite": [], "noop": [], "preserve": [] }
+        });
+        assert!(envelope_kg_or_docs_content_changed(&overwritten));
+
+        // A docs file written → docs/ in a changing bucket.
+        let docs = serde_json::json!({
+            "actions": { "create": ["docs/features/new.md"],
+                         "overwrite": [], "always-overwrite": [],
+                         "noop": [], "preserve": [] }
+        });
+        assert!(envelope_kg_or_docs_content_changed(&docs));
+    }
+
+    #[test]
+    fn envelope_change_detector_conservative_on_missing_or_bad_actions() {
+        // No actions key → assume changed (spawn, safe-but-slow).
+        let no_actions = serde_json::json!({ "folder": "/x" });
+        assert!(envelope_kg_or_docs_content_changed(&no_actions));
+
+        // actions is not an object → assume changed.
+        let bad_shape = serde_json::json!({ "actions": [1, 2, 3] });
+        assert!(envelope_kg_or_docs_content_changed(&bad_shape));
+    }
+
+    #[test]
+    fn should_spawn_kg_sync_always_true_on_create_regardless_of_change_flag() {
+        // On create, a fresh project's pre-existing KG/docs must be indexed
+        // even when the bundle "changed" nothing (idempotent first index).
+        assert!(should_spawn_kg_sync_on_bundle(true, false));
+        assert!(should_spawn_kg_sync_on_bundle(true, true));
+    }
+
+    #[test]
+    fn update_summary_default_does_not_imply_content_changed() {
+        // The derived Default is `false`; the conservative `true` is set
+        // explicitly at the top of run_install_bundle_update_with_root so
+        // soft-fail early-returns spawn. This test pins the derive so a future
+        // edit can't silently make the serde/default path claim "changed".
+        let s = UpdateSummary::default();
+        assert!(
+            !s.kg_or_docs_content_changed,
+            "derived Default must be false; the conservative true is applied \
+             explicitly in run_install_bundle_update_with_root, NOT via Default"
+        );
+    }
 
     // ─── Piece 4 (v0.2.60): hard-cut INERT guarantee ───────────────────
 
