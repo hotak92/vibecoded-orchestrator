@@ -25,6 +25,8 @@
   } from '$lib/components/RegenerateOrDeferModal.svelte';
   // v0.2.71 T-B-emb — per-project ACTIVE_EMBEDDING profile picker.
   import ActiveEmbeddingPicker from '$lib/project-state/ActiveEmbeddingPicker.svelte';
+  // v0.2.71 T-B-flags — per-project dual-write + dual-log toggles.
+  import DualWriteFlagsPanel from '$lib/project-state/DualWriteFlagsPanel.svelte';
 
   let { projectId }: { projectId: string } = $props();
 
@@ -263,6 +265,8 @@
     </section>
 
     <ActiveEmbeddingPicker {projectId} />
+
+    <DualWriteFlagsPanel {projectId} />
 
     <section class="ps-section">
       <h2>Project env vars (notes only)</h2>

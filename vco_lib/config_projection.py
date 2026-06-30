@@ -323,6 +323,25 @@ _CANONICAL_KEYS: tuple[str, ...] = (
     # _resolve_shared_kg_read_disabled`` to gate hybrid_search /
     # semantic_graph_search fan-out into the shared collection.
     "SHARED_KG_READ_DISABLED",
+    # v0.2.71 T-B-flags — per-project dual-write + dual-log toggles.
+    # Both sourced from ``module_settings`` (launcher.db as truth), default
+    # OFF. The Rust ``CANONICAL_INSTALL_ENV_KEYS`` const does NOT include
+    # these keys (same deliberate Python-canonical-writer split as
+    # ``DIAGRAMS_COLLECTION`` above) — the Python ``apply`` CLI is the
+    # canonical writer per the Option-A interop strategy at the top of this
+    # module.
+    #
+    #   * ``DUAL_EMBEDDING_WRITE_ALL_SLOTS`` — consumed by
+    #     ``vco_lib/embedding_service.py::_dual_embedding_write_all_slots``
+    #     (reads the env verbatim; its read path is unchanged). Before
+    #     T-B-flags this was an env-only toggle the DB was unaware of; now
+    #     the DB is the truth that POPULATES it.
+    #   * ``DUAL_RL_LOG_ENABLED`` — consumed by
+    #     ``claude_mcp_servers/weaviate_mcp/server.py::
+    #     _resolve_dual_rl_log_enabled`` (T-C). Projecting it here CLOSES
+    #     T-C's ``TODO(T-B-flags)`` — T-C reads the env, this writes it.
+    "DUAL_EMBEDDING_WRITE_ALL_SLOTS",
+    "DUAL_RL_LOG_ENABLED",
     "PROJECT_NAME",
     "CODE_GRAPH_PROJECT",
     "ACTIVE_EMBEDDING",
@@ -1484,6 +1503,22 @@ def project_env_from_db(
             conn, project_id, "orchestrator-core",
             "shared_kg_read_disabled", default=False,
         )
+        # v0.2.71 T-B-flags — dual-write + dual-log toggles. Same
+        # module_settings read shape + default-false (opt-in) as the gates
+        # above; the hub resolver (config_api.rs) reads the identical rows
+        # so a hub fetch and this env projection can never disagree.
+        # dual_embedding_write_all_slots → orchestrator-core scope;
+        # dual_rl_log_enabled → vct-rl-reranker scope. The Tauri setter
+        # enforces dual-log ⟹ dual-write, so the DB never holds the
+        # incoherent pair this projection might otherwise surface.
+        dual_embedding_write_all_slots = _fetch_module_setting_bool(
+            conn, project_id, "orchestrator-core",
+            "dual_embedding_write_all_slots", default=False,
+        )
+        dual_rl_log_enabled = _fetch_module_setting_bool(
+            conn, project_id, "vct-rl-reranker",
+            "dual_rl_log_enabled", default=False,
+        )
         if active_embedding_override is not None:
             active_embedding = active_embedding_override
         else:
@@ -1569,6 +1604,18 @@ def project_env_from_db(
     # v0.2.46 Decision B — symmetric read gate. No legacy alias because
     # the read path was unconditional pre-v0.2.46.
     _set("SHARED_KG_READ_DISABLED", "true" if shared_kg_read_disabled else "false")
+    # v0.2.71 T-B-flags — dual-write + dual-log toggles. Boolean →
+    # "true"/"false" (lowercase). The consumers parse truthily:
+    # ``embedding_service.py::_dual_embedding_write_all_slots`` matches
+    # {"1","true","yes","on"}; T-C's ``_resolve_dual_rl_log_enabled`` is the
+    # same shape. Emitting "false" explicitly (rather than omitting) makes
+    # the DB-driven OFF state visible on disk, which the survives-update
+    # regression test asserts.
+    _set(
+        "DUAL_EMBEDDING_WRITE_ALL_SLOTS",
+        "true" if dual_embedding_write_all_slots else "false",
+    )
+    _set("DUAL_RL_LOG_ENABLED", "true" if dual_rl_log_enabled else "false")
     _set("PROJECT_NAME", proj.name)
     _set("CODE_GRAPH_PROJECT", sanitized)
     _set("ACTIVE_EMBEDDING", active_embedding)

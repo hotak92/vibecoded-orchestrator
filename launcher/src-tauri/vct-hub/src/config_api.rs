@@ -338,6 +338,43 @@ struct ProjectConfigResponse {
     /// pre-v0.2.46 hubs paired with v0.2.46+ clients. ``schema_version``
     /// stays at 1 because the field is defaultable client-side.
     shared_kg_read_disabled: bool,
+    /// v0.2.71 T-B-flags — per-project "write embeddings to ALL named-vector
+    /// slots" flag. Source: `module_settings(project_id, "orchestrator-core",
+    /// "dual_embedding_write_all_slots")`. Default `false` (opt-in).
+    ///
+    /// Before T-B-flags this was an env-only toggle the DB knew nothing
+    /// about (set by hand in `.claude/env`); T-B-flags makes the DB the
+    /// truth that POPULATES the env. The Python projection
+    /// (`config_projection.py`) stamps this into `.claude/settings.json env`
+    /// as `DUAL_EMBEDDING_WRITE_ALL_SLOTS`; the consumer
+    /// `vco_lib/embedding_service.py::_dual_embedding_write_all_slots`
+    /// reads that env verbatim (its read path is unchanged).
+    ///
+    /// Additive field — pre-T-B-flags Python clients see an unknown field
+    /// and ignore it; the parser back-fills with `false` for older hubs.
+    /// `schema_version` stays at 1 because the field is defaultable
+    /// client-side.
+    #[serde(default)]
+    dual_embedding_write_all_slots: bool,
+    /// v0.2.71 T-B-flags — per-project "also log RL events under the
+    /// secondary embedding slot" flag. Source: `module_settings(project_id,
+    /// "vct-rl-reranker", "dual_rl_log_enabled")`. Default `false` (opt-in).
+    ///
+    /// Dependency: dual-logs ⟹ dual-write. The setter in
+    /// `commands/rl_settings.rs` force-enables
+    /// `dual_embedding_write_all_slots` when this is turned on, so the
+    /// resolver never observes the incoherent (log=true, write=false) pair.
+    ///
+    /// Projected to `.claude/settings.json env` as `DUAL_RL_LOG_ENABLED` by
+    /// `config_projection.py`. Closes T-C's `TODO(T-B-flags)` in
+    /// `claude_mcp_servers/weaviate_mcp/server.py::_resolve_dual_rl_log_enabled`,
+    /// which reads `DUAL_RL_LOG_ENABLED` from the env this projection now
+    /// populates.
+    ///
+    /// Additive field — same back-fill/`schema_version` rationale as
+    /// `dual_embedding_write_all_slots` above.
+    #[serde(default)]
+    dual_rl_log_enabled: bool,
     /// v0.2.40 R2 — RL Reranker per-project flags exposed for the
     /// in-container reader. Until v0.2.40 these three booleans were
     /// SETTER-only: the GUI checkboxes wrote them into
@@ -644,6 +681,34 @@ async fn project_config(
     let shared_kg_read_disabled = h
         .0
         .get_setting(&project.id, "orchestrator-core", "shared_kg_read_disabled")
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // 7a-bis. T-B-flags dual-write + dual-log flags (v0.2.71 — module_settings).
+    // Same `get_setting(...).as_bool().unwrap_or(false)` shape as the gates
+    // above. dual_embedding_write_all_slots lives under `orchestrator-core`
+    // (an orchestrator-wide indexing concern); dual_rl_log_enabled lives
+    // under `vct-rl-reranker` (RL-specific logging). Both default false on a
+    // missing row (opt-in), matching the GUI's pre-unchecked checkboxes and
+    // the setter helper's `unwrap_or(false)` contract.
+    //
+    // The setter (`commands/rl_settings.rs::set_dual_rl_log_enabled`)
+    // force-enables dual_embedding_write_all_slots when dual_rl_log_enabled
+    // is turned on, so the (log=true, write=false) pair is unreachable in
+    // the DB — this resolver reads the two rows independently and trusts
+    // that invariant rather than re-deriving it.
+    let dual_embedding_write_all_slots = h
+        .0
+        .get_setting(&project.id, "orchestrator-core", "dual_embedding_write_all_slots")
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let dual_rl_log_enabled = h
+        .0
+        .get_setting(&project.id, "vct-rl-reranker", "dual_rl_log_enabled")
         .ok()
         .flatten()
         .and_then(|v| v.as_bool())
@@ -1026,6 +1091,8 @@ async fn project_config(
         grpc_port,
         shared_kg_write_disabled,
         shared_kg_read_disabled,
+        dual_embedding_write_all_slots,
+        dual_rl_log_enabled,
         rl_use_global,
         rl_online_training_disabled,
         rl_global_training_source_flag,
@@ -2989,6 +3056,117 @@ kg_tier_full = 0.8
             body.get("shared_kg_write_disabled").and_then(|v| v.as_bool()),
             Some(false),
             "write gate must NOT be flipped by setting the read gate",
+        );
+    }
+
+    // ─── v0.2.71 T-B-flags: dual-write + dual-log fields ────────────────
+
+    /// Default branch: a project with NO rows for the two T-B-flags reads
+    /// both back as `false` (opt-in). Mirrors the shared-kg-read-disabled
+    /// default contract.
+    #[tokio::test]
+    async fn config_emits_dual_flags_default_false() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-dual-default", "myproject");
+
+        let resp = reqwest::get(format!("{}/projects/p-dual-default/config", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+
+        assert_eq!(
+            body.get("dual_embedding_write_all_slots").and_then(|v| v.as_bool()),
+            Some(false),
+            "dual_embedding_write_all_slots default must be false; body={}",
+            body,
+        );
+        assert_eq!(
+            body.get("dual_rl_log_enabled").and_then(|v| v.as_bool()),
+            Some(false),
+            "dual_rl_log_enabled default must be false; body={}",
+            body,
+        );
+    }
+
+    /// Set → fetch round-trip for `dual_embedding_write_all_slots`. Writing
+    /// the flag via the canonical key+module_id surfaces it in the resolver
+    /// response and leaves `dual_rl_log_enabled` at its default false (the
+    /// two flags are independent rows under DIFFERENT module_ids).
+    #[tokio::test]
+    async fn config_emits_dual_embedding_write_all_slots_when_set() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-dual-write-set", "myproject");
+
+        // Mirror the GUI setter: orchestrator-core scope, canonical key.
+        h.0.set_setting(
+            "p-dual-write-set",
+            "orchestrator-core",
+            "dual_embedding_write_all_slots",
+            &serde_json::Value::Bool(true),
+        )
+        .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/p-dual-write-set/config", base))
+            .await
+            .expect("hub reachable");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("dual_embedding_write_all_slots").and_then(|v| v.as_bool()),
+            Some(true),
+            "dual_embedding_write_all_slots set→fetch round-trip; body={}",
+            body,
+        );
+        // dual_rl_log_enabled untouched — distinct module_id (vct-rl-reranker).
+        assert_eq!(
+            body.get("dual_rl_log_enabled").and_then(|v| v.as_bool()),
+            Some(false),
+            "dual_rl_log_enabled must NOT flip when only dual-write is set",
+        );
+    }
+
+    /// Set → fetch round-trip for `dual_rl_log_enabled`. The setter command
+    /// force-enables the dual-write prerequisite, but here we exercise the
+    /// RESOLVER's independent read of the `vct-rl-reranker / dual_rl_log_enabled`
+    /// row directly (mirroring the GUI setter's DB write path). Pins the
+    /// canonical key string so a rename surfaces here loudly.
+    #[tokio::test]
+    async fn config_emits_dual_rl_log_enabled_when_set() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-dual-log-set", "myproject");
+
+        // The coherent setter writes BOTH rows (dual-log ⟹ dual-write);
+        // replicate that here so the resolver reads a coherent pair.
+        h.0.set_setting(
+            "p-dual-log-set",
+            "orchestrator-core",
+            "dual_embedding_write_all_slots",
+            &serde_json::Value::Bool(true),
+        )
+        .unwrap();
+        h.0.set_setting(
+            "p-dual-log-set",
+            "vct-rl-reranker",
+            "dual_rl_log_enabled",
+            &serde_json::Value::Bool(true),
+        )
+        .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/p-dual-log-set/config", base))
+            .await
+            .expect("hub reachable");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("dual_rl_log_enabled").and_then(|v| v.as_bool()),
+            Some(true),
+            "dual_rl_log_enabled set→fetch round-trip; body={}",
+            body,
+        );
+        assert_eq!(
+            body.get("dual_embedding_write_all_slots").and_then(|v| v.as_bool()),
+            Some(true),
+            "dependency: dual-log on requires dual-write on; body={}",
+            body,
         );
     }
 
