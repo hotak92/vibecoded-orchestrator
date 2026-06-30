@@ -476,6 +476,137 @@ pub fn mcp_pattern_match(cmdline: &str) -> bool {
         .any(|pat| cmdline.contains(pat))
 }
 
+/// Minimum age (seconds) an MCP process must have before the steady-state
+/// reaper will consider it for reaping. Guards against a race where an MCP is
+/// caught in the window between fork and the harness establishing the parent
+/// link — a just-spawned process can momentarily look parent-less. The
+/// coordination-MCP zombie this backstops accumulates over MINUTES-to-HOURS,
+/// so a conservative 60s floor costs nothing and removes the race entirely.
+pub const STEADY_STATE_MCP_MIN_AGE_SECS: u64 = 60;
+
+/// Pure decision: should the steady-state reaper reap this MCP process?
+///
+/// This is the conservative "is it orphaned?" predicate, isolated from process
+/// enumeration so both the act AND the leave-alone case are unit-testable (per
+/// the orchestrator's "test the decision that gates a destructive action" rule).
+///
+/// We reap ONLY when we can POSITIVELY confirm the process is orphaned:
+///   1. its cmdline matches an MCP pattern (it's one of ours), AND
+///   2. it has run at least `STEADY_STATE_MCP_MIN_AGE_SECS` (not a fresh spawn
+///      whose parent link hasn't settled), AND
+///   3. it has a known parent pid that is now DEAD (`parent_alive == false`).
+///
+/// If the parent is still alive, or we can't determine the parent (`None` →
+/// can't positively confirm orphanhood), or the process is too young, we LEAVE
+/// IT ALONE. A live-parent MCP is an MCP with a live Claude session attached —
+/// reaping it would silently break that session's channel push, which is worse
+/// than the CPU burn we're backstopping. Conservative defaults on a
+/// best-effort path: when we can't confirm the precondition, do nothing.
+///
+/// `is_self` short-circuits to false so the launcher never reaps itself.
+pub fn steady_state_mcp_should_reap(
+    is_self: bool,
+    cmdline: &str,
+    run_time_secs: u64,
+    parent_pid: Option<u32>,
+    parent_alive: Option<bool>,
+) -> bool {
+    if is_self {
+        return false;
+    }
+    if !mcp_pattern_match(cmdline) {
+        return false;
+    }
+    if run_time_secs < STEADY_STATE_MCP_MIN_AGE_SECS {
+        return false;
+    }
+    // No known parent → can't positively confirm orphanhood → leave alone.
+    if parent_pid.is_none() {
+        return false;
+    }
+    // Reap only when we definitively know the parent is dead.
+    matches!(parent_alive, Some(false))
+}
+
+/// v0.2.71 (P6): best-effort steady-state reaper for ORPHANED coordination /
+/// MCP processes whose controlling Claude session is gone.
+///
+/// WHY this exists: a coordination MCP that ignores stdin-EOF (the
+/// `vct-coordination` server.py pre-v0.2.71 zombie-poller bug) survives session
+/// close and accumulates one orphan per closed Claude surface, each burning CPU
+/// polling Supabase forever. The server-side fix (cancel the poll loop on EOF)
+/// makes such processes self-exit, so on a fixed install this reaper finds
+/// NOTHING. It is defense-in-depth: it backstops any MCP — present or future —
+/// that regresses to ignoring EOF, by reaping only processes we can POSITIVELY
+/// confirm are orphaned (dead parent + past the spawn-race grace window).
+///
+/// Unlike `pre_update_mcp_kill_sweep` (which runs inside the update flow and
+/// reaps ALL matching MCPs because the whole MCP fleet is about to respawn
+/// against a fresh binary), this runs in STEADY STATE (e.g. launcher startup)
+/// and must NOT touch MCPs with a live parent session. The orphan predicate
+/// ([`steady_state_mcp_should_reap`]) enforces that.
+///
+/// Posture: SIGTERM (graceful) + soft-fail, never SIGKILL, never blocks boot.
+/// Returns the number of orphans signalled (informational).
+pub fn steady_state_orphaned_mcp_reap() -> usize {
+    use sysinfo::System;
+    use vct_launcher_core::process::pid_is_alive;
+
+    let mut sys = System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let my_pid = std::process::id();
+    let mut count = 0usize;
+
+    for (pid, proc) in sys.processes() {
+        let is_self = pid.as_u32() == my_pid;
+        let cmdline = proc
+            .cmd()
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let parent_pid = proc.parent().map(|p| p.as_u32());
+        // Only probe parent liveness when there IS a parent — and never treat
+        // the launcher's own pid as a "dead parent" (an MCP whose parent is the
+        // launcher is NOT orphaned; we just don't spawn MCPs, but be defensive).
+        let parent_alive = parent_pid.map(|ppid| {
+            if ppid == my_pid {
+                true
+            } else {
+                pid_is_alive(ppid)
+            }
+        });
+
+        if !steady_state_mcp_should_reap(
+            is_self,
+            &cmdline,
+            proc.run_time(),
+            parent_pid,
+            parent_alive,
+        ) {
+            continue;
+        }
+
+        eprintln!(
+            "[update_gate] steady-state reap: terminating ORPHANED MCP PID {} \
+             (parent {:?} dead, age {}s, cmd: {})",
+            pid.as_u32(),
+            parent_pid,
+            proc.run_time(),
+            cmdline.chars().take(120).collect::<String>()
+        );
+        // SIGTERM (graceful) + soft-fail, mirroring pre_update_mcp_kill_sweep.
+        match proc.kill_with(sysinfo::Signal::Term) {
+            Some(_) => {}
+            None => {
+                proc.kill();
+            }
+        }
+        count += 1;
+    }
+    count
+}
+
 /// v0.2.59: return true if a process's executable BASENAME identifies it
 /// as a `vct-hub` instance we should reap during an update.
 ///
@@ -908,5 +1039,112 @@ mod tests {
         // POSIX exe basenames are case-sensitive and carry no `.exe`.
         assert!(!hub_exe_basename_match("vct-hub.exe"));
         assert!(!hub_exe_basename_match("VCT-HUB"));
+    }
+
+    // ── steady_state_mcp_should_reap (v0.2.71 P6 orphan predicate) ───────
+    //
+    // We test the DECISION (per the "test the act AND the leave-alone case"
+    // rule): an orphaned MCP IS reaped; every non-orphan / can't-confirm case
+    // is LEFT ALONE.
+
+    const COORD_CMD: &str =
+        "/x/.venv/bin/python /x/claude_mcp_servers/vct_coordination_mcp/server.py";
+
+    #[test]
+    fn reap_when_parent_dead_and_old_enough() {
+        // The exact orphaned-coordination-MCP case: matches MCP pattern, past
+        // the grace window, has a parent pid, parent is dead → REAP.
+        assert!(steady_state_mcp_should_reap(
+            false,
+            COORD_CMD,
+            STEADY_STATE_MCP_MIN_AGE_SECS, // exactly at the floor counts
+            Some(424242),
+            Some(false),
+        ));
+        assert!(steady_state_mcp_should_reap(
+            false,
+            COORD_CMD,
+            6 * 3600, // 6h old (field signature)
+            Some(424242),
+            Some(false),
+        ));
+    }
+
+    #[test]
+    fn leave_alone_when_parent_alive() {
+        // A live parent == a live Claude session attached. NEVER reap — that
+        // would silently break the session's channel push.
+        assert!(!steady_state_mcp_should_reap(
+            false,
+            COORD_CMD,
+            6 * 3600,
+            Some(12345),
+            Some(true),
+        ));
+    }
+
+    #[test]
+    fn leave_alone_when_parent_unknown() {
+        // Can't determine the parent → can't positively confirm orphanhood →
+        // do nothing (conservative default on a best-effort path).
+        assert!(!steady_state_mcp_should_reap(
+            false,
+            COORD_CMD,
+            6 * 3600,
+            None,
+            None,
+        ));
+        // parent pid present but liveness undeterminable also leaves it alone.
+        assert!(!steady_state_mcp_should_reap(
+            false,
+            COORD_CMD,
+            6 * 3600,
+            Some(999),
+            None,
+        ));
+    }
+
+    #[test]
+    fn leave_alone_when_too_young() {
+        // A just-spawned MCP can momentarily look parent-less while the harness
+        // wires up the parent link. The grace window prevents a fork-race kill.
+        assert!(!steady_state_mcp_should_reap(
+            false,
+            COORD_CMD,
+            STEADY_STATE_MCP_MIN_AGE_SECS - 1,
+            Some(424242),
+            Some(false),
+        ));
+        assert!(!steady_state_mcp_should_reap(
+            false,
+            COORD_CMD,
+            0,
+            Some(424242),
+            Some(false),
+        ));
+    }
+
+    #[test]
+    fn leave_alone_when_not_an_mcp() {
+        // Unrelated user processes must survive even when orphaned + old.
+        assert!(!steady_state_mcp_should_reap(
+            false,
+            "/usr/bin/python3 /home/user/myproject/main.py",
+            6 * 3600,
+            Some(424242),
+            Some(false),
+        ));
+    }
+
+    #[test]
+    fn never_reap_self() {
+        // is_self short-circuits regardless of every other signal.
+        assert!(!steady_state_mcp_should_reap(
+            true,
+            COORD_CMD,
+            6 * 3600,
+            Some(424242),
+            Some(false),
+        ));
     }
 }
