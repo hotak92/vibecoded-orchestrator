@@ -38,6 +38,11 @@ pub mod diagram_watcher;
 pub mod diagrams_local_server;
 pub mod embedding_catalog;
 pub mod embedding_enrichment;
+// v0.2.71 Track T-C-modal — per-slot populated-vector COUNTS for a project's
+// KG collection. Powers the RegenerateOrDeferModal "keep previous model"
+// option (smart default = most-populated slot). Thin shell-out to
+// `vco_lib.embedding_enrichment slot-counts`; no duplicate count logic.
+pub mod embedding_slot_counts;
 // C8 wire-up (2026-05-25): Tauri command `read_env_var` consumed by the
 // DiagramsTab Wayland fallback (read XDG_SESSION_TYPE). Secret-shaped
 // names are redacted to "" before reaching std::env::var; the FE never

@@ -1303,6 +1303,151 @@ class MultiClassInvocationTests(_BaseEnrichmentTest):
 # ---------------------------------------------------------------------------
 
 
+class SlotCountTests(unittest.TestCase):
+    """v0.2.71 Track T-C-modal — per-slot populated counts.
+
+    Covers ``count_populated_slots`` (composes the v4 include_vector
+    iteration + the aggregate-count primitive), ``_text_slot_to_profile``
+    (canonical slot→profile map, must match EmbeddingService), and the
+    ``slot-counts`` CLI subcommand. All mocked — no live Weaviate.
+    """
+
+    def test_slot_to_profile_canonical_map(self):
+        self.assertEqual(ee._text_slot_to_profile("qwen3_embed"), "qwen3")
+        self.assertEqual(ee._text_slot_to_profile("arctic2_embed"), "arctic")
+        self.assertEqual(
+            ee._text_slot_to_profile("openai_text_embed"), "openai",
+        )
+        # Code slot is NOT a user-selectable text profile.
+        self.assertIsNone(ee._text_slot_to_profile("codesage_embed"))
+        # Unknown future slot → None (dropped from the choice set).
+        self.assertIsNone(ee._text_slot_to_profile("future_embed"))
+
+    def _kg_collection(self, objects: list[_FakeObject]) -> _FakeClient:
+        return _FakeClient({"My_KnowledgeGraph": _FakeCollection(objects)})
+
+    def test_counts_per_slot_and_smart_default(self):
+        # 100 objs: all have qwen3, 30 also have arctic2, 0 openai.
+        objs: list[_FakeObject] = []
+        for i in range(100):
+            vec = {"qwen3_embed": [0.1] * 1024}
+            if i < 30:
+                vec["arctic2_embed"] = [0.2] * 1024
+            objs.append(_FakeObject(str(i), {"content": "x"}, vec))
+        client = self._kg_collection(objs)
+        with mock.patch.object(ee, "_estimate_object_count", return_value=100):
+            result = ee.count_populated_slots(
+                "My_KnowledgeGraph",
+                weaviate_client_factory=lambda: client,
+            )
+        self.assertEqual(result["collection"], "My_KnowledgeGraph")
+        self.assertEqual(result["total"], 100)
+        by_slot = {s["slot"]: s for s in result["slots"]}
+        self.assertEqual(by_slot["qwen3_embed"]["populated"], 100)
+        self.assertEqual(by_slot["qwen3_embed"]["profile"], "qwen3")
+        self.assertEqual(by_slot["arctic2_embed"]["populated"], 30)
+        self.assertEqual(by_slot["arctic2_embed"]["profile"], "arctic")
+        # 0-populated slots are excluded entirely.
+        self.assertNotIn("openai_text_embed", by_slot)
+        # Smart default = most-populated profile.
+        self.assertEqual(result["most_populated_profile"], "qwen3")
+
+    def test_smart_default_picks_higher_count(self):
+        # arctic2 dominates → it becomes the smart default.
+        objs: list[_FakeObject] = []
+        for i in range(50):
+            vec = {"arctic2_embed": [0.2] * 1024}
+            if i < 10:
+                vec["qwen3_embed"] = [0.1] * 1024
+            objs.append(_FakeObject(str(i), {"content": "x"}, vec))
+        client = self._kg_collection(objs)
+        with mock.patch.object(ee, "_estimate_object_count", return_value=50):
+            result = ee.count_populated_slots(
+                "My_KnowledgeGraph",
+                weaviate_client_factory=lambda: client,
+            )
+        self.assertEqual(result["most_populated_profile"], "arctic")
+
+    def test_empty_collection_no_slots_no_default(self):
+        client = self._kg_collection([])
+        with mock.patch.object(ee, "_estimate_object_count", return_value=0):
+            result = ee.count_populated_slots(
+                "My_KnowledgeGraph",
+                weaviate_client_factory=lambda: client,
+            )
+        self.assertEqual(result["total"], 0)
+        self.assertEqual(result["slots"], [])
+        self.assertIsNone(result["most_populated_profile"])
+
+    def test_connection_failure_soft_fails_to_empty(self):
+        def _boom():
+            raise RuntimeError("weaviate down")
+
+        with mock.patch.object(ee, "_estimate_object_count", return_value=0):
+            result = ee.count_populated_slots(
+                "My_KnowledgeGraph",
+                weaviate_client_factory=_boom,
+            )
+        # Soft-fail: empty result, no raise — the modal degrades gracefully.
+        self.assertEqual(result["total"], 0)
+        self.assertEqual(result["slots"], [])
+        self.assertIsNone(result["most_populated_profile"])
+
+    def test_legacy_single_vector_objects_skipped(self):
+        # A legacy non-dict vector contributes nothing to per-slot counts.
+        objs = [
+            _FakeObject("a", {"content": "x"}, {"qwen3_embed": [0.1] * 1024}),
+        ]
+        # Force the second yielded obj to have a non-dict vector.
+
+        class _LegacyCollection(_FakeCollection):
+            def iterator(self, include_vector: bool = False):
+                yield _FakeObject(
+                    "a", {"content": "x"}, {"qwen3_embed": [0.1] * 1024},
+                )
+                legacy = _FakeObject("b", {"content": "y"}, {})
+                legacy.vector = [0.9] * 1024  # legacy flat list, not a dict
+                yield legacy
+
+        client = _FakeClient(
+            {"My_KnowledgeGraph": _LegacyCollection(objs)},
+        )
+        with mock.patch.object(ee, "_estimate_object_count", return_value=2):
+            result = ee.count_populated_slots(
+                "My_KnowledgeGraph",
+                weaviate_client_factory=lambda: client,
+            )
+        by_slot = {s["slot"]: s for s in result["slots"]}
+        # Only the dict-vector object counts toward qwen3_embed.
+        self.assertEqual(by_slot["qwen3_embed"]["populated"], 1)
+
+    def test_cli_argparser_accepts_slot_counts(self):
+        parser = ee._build_argparser()
+        args = parser.parse_args(["slot-counts", "--collection", "Foo"])
+        self.assertEqual(args.cmd, "slot-counts")
+        self.assertEqual(args.collection, "Foo")
+
+    def test_cli_slot_counts_emits_json_and_returns_0(self):
+        fake_result = {
+            "collection": "Foo",
+            "total": 7,
+            "slots": [
+                {"slot": "qwen3_embed", "profile": "qwen3", "populated": 7},
+            ],
+            "most_populated_profile": "qwen3",
+        }
+        with mock.patch.object(
+            ee, "count_populated_slots", return_value=fake_result,
+        ):
+            with mock.patch("sys.stdout", new=mock.MagicMock()) as out:
+                rc = ee.main(["slot-counts", "--collection", "Foo"])
+        self.assertEqual(rc, 0)
+        written = "".join(c.args[0] for c in out.write.call_args_list)
+        payload = json.loads(written.strip())
+        self.assertEqual(payload["most_populated_profile"], "qwen3")
+        self.assertEqual(payload["total"], 7)
+
+
 def _weaviate_reachable(url: str) -> bool:
     try:
         req = urllib.request.Request(
