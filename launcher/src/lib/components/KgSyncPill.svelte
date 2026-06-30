@@ -98,6 +98,8 @@
       case 'pending': return 'KG queued';
       case 'running':
         if (v.current_phase === 'scan') return 'KG scanning…';
+        // v0.2.71 Piece 5a: waiting on the global single-flight embed lane.
+        if (v.current_phase === 'queued') return 'KG waiting…';
         if (total > 0) return `KG ${done}/${total}`;
         return 'KG embedding…';
       case 'success':

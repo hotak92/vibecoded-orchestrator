@@ -142,6 +142,9 @@
       case 'running': {
         const counter = progressCounter(v);
         if (v.current_phase === 'scan') return 'KG sync: scanning knowledge/ and docs/…';
+        // v0.2.71 Piece 5a: waiting on the process-global single-flight lane
+        // (another project's KG sync is running first; queued syncs WAIT).
+        if (v.current_phase === 'queued') return 'KG sync: waiting for the embed lane…';
         if (counter) {
           if (v.current_phase === 'docs') return `KG sync: embedding docs (${counter})`;
           return `KG sync: embedding (${counter})`;

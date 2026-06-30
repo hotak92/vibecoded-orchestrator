@@ -2988,7 +2988,13 @@ async def _get_all_kg_embeddings(text: str) -> dict[str, list[float]]:
                 "falling back to inline gather", e
             )
 
-    # Inline fallback (pre-v0.2.18 path): direct 3-way gather.
+    # Inline fallback (pre-v0.2.18 path): direct 3-way gather. Reached ONLY
+    # when the EmbeddingService is unavailable (rare on current installs).
+    # The v0.2.71 Piece 5c secondary-slot gate (DUAL_EMBEDDING_WRITE_ALL_SLOTS)
+    # is enforced on the PRIMARY path above (EmbeddingService.embed_text_all_configured);
+    # this degraded fallback keeps the historical "populate every reachable
+    # slot" behaviour. Writing extra slots here is harmless (valid named-vector
+    # writes, never a read break) and only fires when the service is down.
     qwen3_vec, legacy_vec, openai_vec = await asyncio.gather(
         get_ollama_embedding(text),         # qwen3-embedding (new primary)
         get_legacy_text_embedding(text),     # snowflake-arctic-embed2 (legacy)

@@ -846,6 +846,51 @@ def _resolve_embed_request_timeout() -> float:
     return val
 
 
+# v0.2.71 Piece 5c — second-slot enrichment write toggle (default OFF).
+#
+# THE COST (audit `update-all-kg-reembed-serialization-2026-06-30.md` §5):
+# ``embed_text_all_configured`` / ``embed_code_all_configured`` populate the
+# ACTIVE named slot PLUS every other reachable backend's slot (qwen3, openai,
+# codesage). On an arctic-active install with Ollama up that means TWO embed
+# calls per write (arctic2_embed + qwen3_embed) — the "doubling" multiplier
+# the tester saw, compounding the concurrency problem under contention.
+#
+# THE FEATURE IT SERVES (user, 2026-06-30): the second slot exists so a later
+# model SWITCH (qwen3 → openai, arctic → qwen3) doesn't require a full
+# re-embed — the destination slot is already populated. The user also wants
+# the option to populate BOTH slots so BOTH the arctic AND qwen3 RL-module
+# neural nets can have their embedding spaces filled. It is a REAL feature,
+# not waste — but it doubles embed cost, so per user decision it is now
+# **opt-in, DEFAULT OFF**.
+#
+# WHY A DEDICATED FLAG (not flipping ``DUAL_EMBEDDING_ENABLED``): in the MCP
+# server + sync scripts, ``DUAL_EMBEDDING_ENABLED`` ALSO selects named-vector
+# schema/read/write. Flipping ITS default to false would make searches stop
+# passing ``target_vector`` (server.py:7108) and make writes emit a FLAT
+# vector into a named-vector collection (sync_knowledge_graph.py
+# ``_build_vector_arg`` legacy branch + collection.data.insert), BREAKING
+# reads and writes on every existing install. This flag isolates ONLY the
+# second-slot WRITE fan-out: the active named slot is ALWAYS written (so reads
+# and existing dual data stay queryable), the SECONDARY slots are written only
+# when this is explicitly enabled. Default OFF = the cost saving; set to true
+# to keep the multi-slot model-switch-without-re-embed + dual-net enrichment.
+#
+# Opt-in: ``DUAL_EMBEDDING_WRITE_ALL_SLOTS=true``.
+DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV = "DUAL_EMBEDDING_WRITE_ALL_SLOTS"
+
+
+def _resolve_write_all_slots() -> bool:
+    """Return whether to write the SECONDARY enrichment slots on each embed.
+
+    Default FALSE (v0.2.71 Piece 5c — opt-in). The active slot is always
+    written regardless; this only controls the qwen3/openai/codesage
+    secondary fan-out. Any value other than a truthy string ("1"/"true"/
+    "yes"/"on", case-insensitive) resolves to False.
+    """
+    raw = os.environ.get(DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV, "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 # v0.2.52 V52-AJ: active-embedding resolution helpers.
 #
 # Single canonical resolution path for the ACTIVE_EMBEDDING value:
@@ -1444,24 +1489,40 @@ class EmbeddingService:
     # ---- multi-slot writes --------------------------------------------
 
     def embed_text_all_configured(self, text: str) -> dict[str, list[float]]:
-        """Embed ``text`` into every CONFIGURED + REACHABLE text backend.
+        """Embed ``text`` into the configured text slot(s).
 
-        Returns ``{slot_name: vector}`` for every backend that's ready.
-        Used by ``sync_knowledge_graph`` for the enrichment-migration
-        path: when a user switches from qwen3 to OpenAI, we still want
-        to populate the qwen3_embed slot too so search-with-qwen3 keeps
-        working after the switch.
+        Returns ``{slot_name: vector}``. ALWAYS includes the active slot
+        (``self._text_slot``). The SECONDARY enrichment slots (qwen3,
+        openai) are added only when ``DUAL_EMBEDDING_WRITE_ALL_SLOTS`` is
+        enabled (v0.2.71 Piece 5c — default OFF).
+
+        The secondary slots exist for the enrichment-migration path: when a
+        user switches from qwen3 to OpenAI, a pre-populated qwen3_embed slot
+        means search-with-qwen3 keeps working after the switch (no full
+        re-embed), and BOTH RL nets' embedding spaces can be filled. That is
+        opt-in because it doubles embed cost (see
+        ``DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV``). With the toggle OFF this
+        returns a single-entry ``{active_slot: vector}`` dict — still a valid
+        named-vector write (NOT a flat vector), so existing named-vector
+        collections keep working and previously-written dual data stays
+        queryable; we simply stop WRITING the second slot going forward.
 
         Soft-fail per backend: if one slot's embed call fails (e.g.
         rate limited), it's omitted from the returned dict and a log
         line is emitted. The caller can choose to retry just those.
         """
         result: dict[str, list[float]] = {}
-        # Active backend
+        # Active backend — ALWAYS written (this is the slot reads target).
         try:
             result[self._text_slot] = self._embed_text_via_active(text)
         except Exception as exc:
             logger.warning("Active text backend failed: %s", exc)
+
+        # v0.2.71 Piece 5c: secondary enrichment slots are opt-in (default
+        # OFF). When disabled, return only the active slot above.
+        if not _resolve_write_all_slots():
+            return result
+
         # qwen3 fallback if not already the active slot
         if self._text_slot != "qwen3_embed" and self.ollama.is_reachable():
             try:
@@ -1494,13 +1555,25 @@ class EmbeddingService:
         return result
 
     def embed_code_all_configured(self, code: str) -> dict[str, list[float]]:
-        """Embed ``code`` into every CONFIGURED + REACHABLE code backend."""
+        """Embed ``code`` into the configured code slot(s).
+
+        Mirrors ``embed_text_all_configured`` (v0.2.71 Piece 5c): ALWAYS
+        writes the active code slot; the secondary slots (codesage, openai)
+        are added only when ``DUAL_EMBEDDING_WRITE_ALL_SLOTS`` is enabled
+        (default OFF). With the toggle off, returns a single-entry
+        ``{active_code_slot: vector}`` dict — a valid named-vector write.
+        """
         result: dict[str, list[float]] = {}
-        # Active backend
+        # Active backend — ALWAYS written.
         try:
             result[self._code_slot] = self._embed_code_via_active(code)
         except Exception as exc:
             logger.warning("Active code backend failed: %s", exc)
+
+        # v0.2.71 Piece 5c: secondary enrichment slots are opt-in (default OFF).
+        if not _resolve_write_all_slots():
+            return result
+
         # CodeEmbed service if not active and reachable
         if (
             self._code_slot not in ("codesage_embed", "jina_embed")
