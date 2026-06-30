@@ -5684,12 +5684,33 @@ fn serialize_orchestrator_conflict_error(
 ///   - "Automatic merge failed; fix conflicts and then commit the result."
 ///   - "could not apply ... — When you have resolved this problem"
 ///   - "Resolve all conflicts manually, mark them as resolved with"
+///
+/// v0.2.71: ALSO match git's DIRTY-TREE REFUSALS. With `--autostash` now on
+/// the modal's merge/rebase commands these are rare, but a stash-pop conflict
+/// or an autostash-less edge still produces them, and pre-v0.2.71 they fell
+/// through to a BARE ERROR that dead-ended the divergence modal (the user
+/// hit exactly this on a dirty `.gitignore`). Treating them as a conflict
+/// routes them to the conflict modal + resume-sentinel + UPDATE_DEFERRED
+/// recovery (so the user gets a guided path, never a dead-end):
+///   - "would be overwritten by merge" / "would be overwritten by checkout"
+///   - "cannot rebase: You have unstaged changes" / "cannot pull with rebase"
+///   - "Please commit your changes or stash them"
+///   - "Cannot merge with local modifications"
+///   - autostash-pop conflict markers ("could not apply autostash" /
+///     "autostash resulted in conflicts")
 fn is_merge_or_rebase_conflict(err: &str) -> bool {
     let lower = err.to_lowercase();
     lower.contains("conflict")
         || lower.contains("automatic merge failed")
         || lower.contains("could not apply")
         || lower.contains("resolve all conflicts")
+        // dirty-tree refusals + autostash-pop failures (v0.2.71)
+        || lower.contains("would be overwritten")
+        || lower.contains("you have unstaged changes")
+        || lower.contains("cannot pull with rebase")
+        || lower.contains("please commit your changes or stash")
+        || lower.contains("cannot merge with local modifications")
+        || lower.contains("autostash")
 }
 
 /// Resolve the current pull branch. Defaults to "main" on any error.
@@ -6572,12 +6593,27 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
     //
     // --no-edit suppresses the editor for the merge commit message — a
     // Tauri subprocess has no controlling tty and would hang otherwise.
+    // v0.2.71: --autostash is REQUIRED here. This command is reached
+    // precisely from the divergence modal, i.e. AFTER update_orchestrator's
+    // pop-conflict-risk set was non-empty (a tracked-modified file overlapping
+    // upstream, e.g. a dirty .gitignore). Without --autostash, `git pull`
+    // refuses on the dirty tree ("Your local changes ... would be overwritten
+    // by merge") BEFORE merging — a refusal whose wording isn't a "conflict"
+    // phrase, so it fell through to the bare-error branch below and DEAD-ENDED
+    // the modal (Merge fails, Rebase fails, user stuck at "open clone folder").
+    // --autostash stashes the dirty tracked edits, merges, then pops; the
+    // common case (non-overlapping regions, e.g. the .gitignore append) pops
+    // clean. A genuine pop-conflict is caught by the dirty-tree/conflict
+    // detection below and routed to the conflict modal + UPDATE_DEFERRED, not
+    // a bare error. (The update_orchestrator auto-merge arm already proves
+    // --autostash is acceptable on this path.)
     emit_progress(&window, "update", "Merging upstream into local...", 10.0);
     let pull = tokio::process::Command::new("git").silent()
         .args([
             "pull",
             "--no-rebase",
             "--no-edit",
+            "--autostash",
             crate::commands::self_update::VCO_UPSTREAM_REMOTE,
             &pull_branch,
         ])
@@ -6763,8 +6799,14 @@ pub async fn rebase_orchestrator_onto_upstream<R: Runtime>(
         crate::commands::self_update::VCO_UPSTREAM_REMOTE,
         pull_branch
     );
+    // v0.2.71: --autostash here too (sibling to the merge command's fix). The
+    // rebase modal button is reached on the same dirty-tree-overlapping-upstream
+    // path; without --autostash, bare `git rebase` refuses ("cannot rebase: You
+    // have unstaged changes") and dead-ended the modal. --autostash stashes,
+    // rebases, then pops; a pop-conflict is caught as a conflict below and
+    // routed to the conflict modal + UPDATE_DEFERRED, not a bare error.
     let rebase = tokio::process::Command::new("git").silent()
-        .args(["rebase", &upstream_ref])
+        .args(["rebase", "--autostash", &upstream_ref])
         .current_dir(&install_path)
         .output()
         .await

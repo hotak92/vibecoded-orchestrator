@@ -78,3 +78,20 @@
 #     divergence modal correctly surfaces on a rare genuine binary conflict.
 
 knowledge/**/*.md          merge=union
+
+# v0.2.71: extend the union driver to .gitignore (and .gitattributes itself).
+# SAME append-structured shape as KG nodes: forks routinely APPEND ignore
+# rules; upstream periodically APPENDS its own. Git's default merge marks an
+# overlapping append region as a conflict even when both sides are purely
+# additive. `union` keeps both sides' lines — for ignore-rules a duplicate or
+# extra ignore line is HARMLESS (never breaks anything), unlike CLAUDE.md
+# (modify-heavy, where union would keep contradictory config lines — correctly
+# still NOT union'd). This is the SECONDARY net (forward-only, per the caveat
+# above) for hand-run `git pull`/`git merge`; the PRIMARY fix is the launcher
+# A0 auto-merge path, which now allowlists .gitignore/.gitattributes too.
+# Deliberately NOT extended to README.md / docs/**: those CAN have a
+# semantically-wrong union (two contradictory prose sentences kept side by
+# side reads as broken), so they go through the A0 sidecar-on-conflict path
+# (clean-merge folds, real-conflict sidecars + defers) rather than union.
+.gitignore                 merge=union
+.gitattributes             merge=union

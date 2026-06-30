@@ -105,6 +105,26 @@ pub(crate) const USER_EDITABLE_PATTERNS: &[&str] = &[
     // Top-level HANDOFF-*.md files — convention for between-session
     // handoff notes. Usually gitignored but tracked in some forks.
     "HANDOFF-*.md",
+    // .gitignore / .gitattributes are append-structured declarative files
+    // (NOT executable): a clean line-based 3-way merge of them is correct by
+    // construction (there is no "semantically broken .gitignore" the way a
+    // mis-merged .py/.rs can be). Forks routinely append their own ignore
+    // rules, and upstream edits these periodically, so an overlapping dirty
+    // edit would otherwise poison the WHOLE auto-merge into the divergence
+    // modal even though git merge-file folds it cleanly. Safe to auto-merge
+    // here; the secondary `merge=union` driver in .gitattributes covers
+    // hand-run merges (forward-only). See the v0.2.71 update-reconciliation
+    // work. Deliberately NOT extended to *.py / *.rs / install.py / *.toml /
+    // templates/** — those are protected code where a textually-clean merge
+    // can be silently semantically broken, so a divergent pull there should
+    // surface the modal as a real breakage signal.
+    ".gitignore",
+    ".gitattributes",
+    // README.md and docs/**/*.md are declarative Markdown (high upstream
+    // churn): same text-clean==correct property. On a genuine conflict the
+    // A0 path sidecars the upstream copy + writes a deferral, so no data loss.
+    "README.md",
+    "docs/**/*.md",
 ];
 
 /// Per-file resolution outcome from the pre-pull merge attempt.
