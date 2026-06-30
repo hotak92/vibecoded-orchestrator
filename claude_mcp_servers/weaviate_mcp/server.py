@@ -4416,7 +4416,7 @@ def _get_rl_telemetry_writer():
     construction body for the OTHER slot via ``_get_rl_telemetry_writer_for``
     with an explicit ``embedding_source`` override (one home).
     """
-    # ---- step 1: derive the embedding triple (source/model/dim) ----
+    # ---- derive the ACTIVE embedding triple (source/model/dim) ----
     #
     # v0.2.31 telemetry audit fix (Item 2.2 — was 31% blank rows): when
     # EmbeddingService probe fails AND module-level constants happen to
@@ -4460,7 +4460,57 @@ def _get_rl_telemetry_writer():
     except Exception as exc:
         logger.debug("EmbeddingService probe for telemetry failed (%s); using env defaults", exc)
 
-    # ---- step 2: derive the project tag ----
+    return _get_rl_telemetry_writer_for(
+        emb_source, embedding_dim=emb_dim, embedding_model=emb_model
+    )
+
+
+def _get_rl_telemetry_writer_for(
+    embedding_source: str,
+    *,
+    embedding_dim: int = 0,
+    embedding_model: str = "",
+):
+    """Lazy-build / lookup the ``RLTelemetryWriter`` for an EXPLICIT slot triple.
+
+    v0.2.71 Sweep-C: factored out of ``_get_rl_telemetry_writer`` so BOTH the
+    active path (which resolves the live triple then delegates here) AND the
+    dual-log fan-out (which passes the OTHER slot's triple) share ONE
+    construction body. The per-``(project, embedding_source)`` cache
+    (``_rl_telemetry_writers``) already isolates the two writers, so the
+    second (other-slot) writer is just a second cache entry — no new caching
+    code. The project tag is resolved the SAME way the active path always did
+    (hub-resolved slug, env fallback) — it is identical for both slots since
+    the two events describe the SAME retrieval in two embedding spaces.
+
+    Args:
+        embedding_source: Short source tag (``qwen3`` / ``arctic`` / ``openai``
+            / ``codesage`` / ``legacy``) that partitions the offline corpus.
+        embedding_dim: Vector dim for this source; 0 → resolve from
+            ``embedding_model`` via ``_embedding_dim_for``.
+        embedding_model: Full model id for this source (e.g.
+            ``qwen3-embedding:0.6b``). Empty → kept empty (writer ships the
+            source tag, which is the indexed cohort key).
+    """
+    # V52-AC contract: the ONLY no-write exit is the RLTelemetryWriter
+    # import-failure path (lean install / shim test contexts) — soft-skip with a
+    # DEBUG log so callers degrade gracefully rather than crash every search.
+    # Lazy import keeps the server.py → rl_client edge off the module-load path
+    # (rl_client lazy-imports back into server.py). v0.2.71 Sweep-C: this guarded
+    # import was inadvertently dropped during the writer-factory extraction WIP;
+    # it is restored here in the shared body so BOTH the active path and the
+    # dual-log other-slot path inherit the soft-fail contract.
+    try:
+        from claude_mcp_servers.rl_client import RLTelemetryWriter
+    except Exception as exc:
+        logger.debug("RLTelemetryWriter import failed (%s); telemetry disabled", exc)
+        return None
+
+    emb_source = embedding_source or "qwen3"
+    emb_model = embedding_model or ""
+    emb_dim = embedding_dim or _embedding_dim_for(emb_model)
+
+    # ---- derive the project tag ----
     #
     # v0.2.21 Step 18: prefer the hub-resolved project slug/display name,
     # falling back to PROJECT_NAME / KG_COLLECTION env (historical
@@ -4499,13 +4549,13 @@ def _get_rl_telemetry_writer():
             except Exception:
                 project = raw_name
 
-    # ---- step 3: look up / construct the writer for this key ----
+    # ---- look up / construct the writer for this key ----
     key = (project, emb_source)
     writer = _rl_telemetry_writers.get(key)
     if writer is not None:
         return writer
-    # V52-J Edit 1 (2026-06-09): also pass project_id resolved at line 4178
-    # above. Pre-fix, project_id was never threaded through → 100% NULL in
+    # V52-J Edit 1 (2026-06-09): also pass project_id resolved above.
+    # Pre-fix, project_id was never threaded through → 100% NULL in
     # launcher.db rl_events.project_id (see telemetry_emit.py module
     # docstring for the pre-v0.2.52 baseline).
     writer = RLTelemetryWriter(
@@ -4521,6 +4571,69 @@ def _get_rl_telemetry_writer():
     )
     _rl_telemetry_writers[key] = writer
     return writer
+
+
+def _other_model_for_source(other_source: str) -> str:
+    """Map a short embedding-source tag to a concrete model id (best-effort).
+
+    v0.2.71 Sweep-C. Used by the dual-log other-slot embed when the staged ctx
+    did not carry an explicit ``other_embedding_model``. Mirrors the canonical
+    family→model mapping the rest of the orchestrator uses (qwen3 is the
+    default-text model; arctic / openai are the alternates a dual-write install
+    keeps populated). Unknown tags fall through to the qwen3 default so the
+    embed call still produces a comparable-space vector rather than raising.
+    """
+    s = (other_source or "").lower()
+    if "qwen3" in s:
+        return "qwen3-embedding:0.6b"
+    if "arctic" in s:
+        return "snowflake-arctic-embed2"
+    if "openai" in s:
+        return os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+    return "qwen3-embedding:0.6b"
+
+
+def _embed_text_in_other_model(
+    svc, text: str, other_source: str, other_model: str = ""
+) -> "list[float] | None":
+    """Embed ONE text in a NON-active model's space (v0.2.71 Sweep-C).
+
+    The dual-log other-slot citation compute re-embeds the answer chunks in the
+    OTHER model's space so the cosine it logs against the OTHER slot's per-node
+    vectors lives in the same space (a cross-space cosine is meaningless). This
+    reuses the SAME backend adapters ``EmbeddingService.embed_text_all_configured``
+    drives its secondary fan-out through — ``svc.ollama.embed`` for the Ollama
+    families (qwen3 / arctic / legacy) and ``svc.openai.embed`` for the OpenAI
+    slot — so a stored dual-write vector and an on-the-fly other-slot embed come
+    from the identical backend path (no third embed implementation).
+
+    Returns the vector, or None on soft-fail (empty text / backend down / unknown
+    source). Never raises into the citation compute — the caller drops the chunk.
+    """
+    if not text or not text.strip():
+        return None
+    model = other_model or _other_model_for_source(other_source)
+    src = (other_source or "").lower()
+    try:
+        if "openai" in src:
+            openai = getattr(svc, "openai", None)
+            if openai is None:
+                return None
+            from vco_lib.embedding_service import _to_openai_api_model
+
+            vec = openai.embed(_to_openai_api_model(model), text)
+            return vec or None
+        ollama = getattr(svc, "ollama", None)
+        if ollama is None:
+            return None
+        vec = ollama.embed(model, text)
+        return vec or None
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "_embed_text_in_other_model: embed in %s (%s) failed (%s)",
+            other_source, model, exc,
+        )
+        return None
 
 
 def _reset_rl_telemetry_writers() -> None:
@@ -4763,6 +4876,126 @@ def _rl_refetch_node_vector(
     return None
 
 
+def _rl_find_representative_obj(
+    node: dict,
+    sibling_objs_by_source_id: dict[str, list],
+    link_objs_by_title: dict[str, object],
+):
+    """Return the representative Weaviate object for a node (v0.2.71 Sweep-C).
+
+    Same deterministic selection order ``_rl_refetch_node_vector`` uses to pick a
+    vector, but returns the OBJECT itself so the dual-log path can (a) pull the
+    OTHER slot's vector off it via ``_extract_obj_vector(obj, other_slot)`` and
+    (b) read its UUID + ``content`` for an on-the-fly other-slot backfill — all
+    from the SAME ``include_vector=True`` fetch the enrich pass already issued
+    (no second Weaviate query, case-(a) 1:1 fan-out). Returns None when no
+    representative object is indexed for the node.
+    """
+    source_id = (
+        node.get("source_id")
+        or node.get("source_node_id")
+        or node.get("title")
+        or ""
+    )
+    matched_chunk = node.get("chunk_number")
+    siblings = sibling_objs_by_source_id.get(source_id) or [] if source_id else []
+
+    # 1. Exact matched chunk (the truest representative).
+    if matched_chunk is not None:
+        for sib in siblings:
+            try:
+                if sib.properties.get("chunk_num") == matched_chunk:
+                    return sib
+            except (AttributeError, KeyError, TypeError):
+                continue
+    # 2. Any first sibling under the source_id.
+    if siblings:
+        return siblings[0]
+    # 3. Title-keyed link object fallback.
+    title = node.get("title") or ""
+    if title:
+        link_obj = link_objs_by_title.get(str(title))
+        if link_obj is not None:
+            return link_obj
+    return None
+
+
+def _rl_attach_other_slot_for_node(
+    node: dict,
+    rep_obj,
+    *,
+    other_slot: str,
+    other_query_emb: "list[float] | None",
+    other_model_name: str,
+    backfill_other: bool,
+    coll_for_backfill=None,
+) -> None:
+    """Attach ``emb_other`` / ``cos_qn_other`` to one node (v0.2.71 Sweep-C).
+
+    Pulls the OTHER slot's vector off the already-fetched representative object.
+    When the other slot is genuinely empty (node embedded BEFORE dual-write was
+    enabled) AND ``backfill_other`` is on, generates it on-the-fly via the shared
+    ``ensure_slot_embedding`` (model-aware chunking keyed on ``other_model_name``,
+    async store-back) — the lazy "fill it" that replaces the "skip it" path. When
+    backfill is off, a missing other slot leaves the node without ``emb_other``
+    (the second event then drops it). Soft-fail throughout.
+    """
+    if rep_obj is None or not other_slot:
+        return
+    emb_other = _extract_obj_vector(rep_obj, other_slot)
+    if not emb_other and backfill_other and other_model_name:
+        # Lazy on-use backfill: compute the OTHER slot's vector from the
+        # representative object's stored content (full chunk) sized to the
+        # OTHER model's preset, and schedule the store-back. The freshly
+        # computed vector is used for THIS request immediately.
+        try:
+            uid = getattr(rep_obj, "uuid", None)
+            content = ""
+            try:
+                content = rep_obj.properties.get("content") or ""
+            except (AttributeError, KeyError, TypeError):
+                content = ""
+            if not content:
+                content = node.get("content") or ""
+            if content and uid is not None and coll_for_backfill is not None:
+                from claude_mcp_servers.rl_client.embed_regen import (
+                    ensure_slot_embedding,
+                )
+
+                svc = _get_embedding_service()
+                # Derive the short source tag from the slot so the other-model
+                # embed routes to the right backend family (qwen3/arctic/openai).
+                other_src = _slot_short_source(other_slot)
+
+                def _other_embed(sized_text: str):
+                    return _embed_text_in_other_model(
+                        svc, sized_text, other_src, other_model_name
+                    )
+
+                emb_other = ensure_slot_embedding(
+                    uid,
+                    content,
+                    other_slot,
+                    other_model_name,
+                    coll_for_backfill,
+                    svc,
+                    embed_fn=_other_embed,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "dual-log: other-slot backfill failed for node %r (%s)",
+                (node.get("title") or "")[:60], exc,
+            )
+    if not emb_other:
+        return
+    node["emb_other"] = emb_other
+    if other_query_emb:
+        try:
+            node["cos_qn_other"] = _cosine(other_query_emb, emb_other)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _rl_enrich_nodes_with_linked_embs(
     nodes: list[dict],
     query_emb: "list[float] | None",
@@ -4770,6 +5003,10 @@ def _rl_enrich_nodes_with_linked_embs(
     *,
     coll_resolver=None,
     model_name: str = "",
+    other_slot: str = "",
+    other_query_emb: "list[float] | None" = None,
+    other_model_name: str = "",
+    backfill_other: bool = False,
 ) -> None:
     """Attach v3 training fields to each node in-place.
 
@@ -4816,6 +5053,24 @@ def _rl_enrich_nodes_with_linked_embs(
         coll_resolver: Optional callable ``(collection_name) -> coll
             handle`` for testing. Defaults to ``get_weaviate_client()
             .collections.get(name)``.
+        other_slot: v0.2.71 Sweep-C dual-log — the OTHER embedding slot
+            (e.g. ``"qwen3_embed"`` on an arctic-active install). When set,
+            each node also gets ``emb_other`` (the OTHER slot's per-node
+            vector pulled from the SAME already-fetched objects — no second
+            Weaviate query, case-(a) 1:1 fan-out) and ``cos_qn_other``
+            (cos(other_query_emb, emb_other)). Empty → no dual-log enrichment.
+        other_query_emb: The query vector in the OTHER slot's space, used to
+            compute ``cos_qn_other``. Required for ``cos_qn_other``; absent →
+            ``emb_other`` may still be attached, ``cos_qn_other`` is skipped.
+        other_model_name: Model id for the OTHER slot (drives the chunk preset
+            for the on-the-fly backfill). Only consulted when ``backfill_other``.
+        backfill_other: When True AND a node's other slot is genuinely empty
+            (node embedded BEFORE dual-write was enabled), compute the OTHER
+            slot's vector on-the-fly via ``ensure_slot_embedding`` (model-aware
+            chunking) and store it back async. Gated by the caller to dual-write
+            installs only — the lazy "fill it" that replaces the "skip it" path.
+            False → a missing other slot is simply skipped (node has no
+            ``emb_other`` and is dropped from the second event).
     """
     if not nodes:
         return
@@ -5017,6 +5272,162 @@ def _rl_enrich_nodes_with_linked_embs(
                 except Exception:
                     pass
 
+            # v0.2.71 Sweep-C dual-log: attach the OTHER slot's per-node vector
+            # (emb_other / cos_qn_other) from the SAME already-fetched objects.
+            # Case-(a) 1:1 fan-out — no second Weaviate query. When the other
+            # slot is empty AND backfill is on (dual-write install), generate it
+            # on-the-fly + store back (lazy fill replacing skip). Soft-fail.
+            if other_slot:
+                try:
+                    rep_obj = _rl_find_representative_obj(
+                        n, sibling_objs_by_source_id, link_objs_by_title
+                    )
+                    _rl_attach_other_slot_for_node(
+                        n,
+                        rep_obj,
+                        other_slot=other_slot,
+                        other_query_emb=other_query_emb,
+                        other_model_name=other_model_name,
+                        backfill_other=backfill_other,
+                        coll_for_backfill=coll,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "dual-log: other-slot enrich failed for node %r (%s)",
+                        (n.get("title") or "")[:60], exc,
+                    )
+
+
+DUAL_RL_LOG_ENABLED_ENV = "DUAL_RL_LOG_ENABLED"
+
+
+def _resolve_dual_rl_log_enabled() -> bool:
+    """Whether dual-RL-log fan-out is on for this process (v0.2.71 Sweep-C).
+
+    HARD precondition: dual-log only makes sense when dual-WRITE is on, because
+    the second event needs the OTHER slot's per-node vectors which ONLY exist
+    when ``DUAL_EMBEDDING_WRITE_ALL_SLOTS`` populated them (or the lazy backfill
+    fills them). So this returns True iff BOTH:
+
+      1. ``DUAL_RL_LOG_ENABLED`` env is truthy, AND
+      2. ``_resolve_write_all_slots()`` (the dual-WRITE gate) is True.
+
+    If dual-log is requested but dual-write is OFF, this returns False (forced
+    off) — the second event is never emitted (see the tests). TODO(T-B-flags):
+    the launcher.db → ProjectConfig → settings.json projection of this flag is a
+    SEPARATE track; this reads the env channel only (the canonical override for
+    CLI/dev + what settings.json mirrors), NOT launcher.db directly — do not add
+    a DB read here.
+    """
+    raw = os.environ.get(DUAL_RL_LOG_ENABLED_ENV, "").strip().lower()
+    if raw not in ("1", "true", "yes", "on"):
+        return False
+    try:
+        from vco_lib.embedding_service import _resolve_write_all_slots
+
+        if not _resolve_write_all_slots():
+            logger.debug(
+                "dual-log requested but dual-write (DUAL_EMBEDDING_WRITE_ALL_SLOTS) "
+                "is OFF; forcing dual-log off (the other slot's vectors won't exist)"
+            )
+            return False
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("_resolve_dual_rl_log_enabled: write-gate probe raised (%s)", exc)
+        return False
+    return True
+
+
+async def _resolve_dual_rl_log_inputs(
+    query: str, active_slot: str
+) -> "dict | None":
+    """Resolve the OTHER-slot inputs for the dual-log fan-out (v0.2.71 Sweep-C).
+
+    Returns a dict ``{other_slot, other_source, other_dim, other_model,
+    other_query_emb}`` when dual-log is on AND a single distinct OTHER text slot
+    is resolvable, else None (caller does the bare single-log path). The OTHER
+    slot is whatever ``embed_text_all_configured(query)`` returns that is NOT the
+    active slot — so the second query vector comes from the SAME canonical embed
+    fan-out the dual-WRITE path uses (no third embed implementation). The other
+    slot's (source, model, dim) is derived via the EmbeddingService slot maps.
+
+    Soft-fail: any resolver error → None (no dual-log this call), never raises.
+    """
+    if not _resolve_dual_rl_log_enabled():
+        return None
+    try:
+        svc = _get_embedding_service()
+        if svc is None:
+            return None
+        # embed_text_all_configured returns {active_slot: vec} PLUS the secondary
+        # slots (only when dual-write is on — already guaranteed by the gate).
+        slots = await asyncio.to_thread(svc.embed_text_all_configured, query)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("_resolve_dual_rl_log_inputs: embed fan-out raised (%s)", exc)
+        return None
+    if not slots:
+        return None
+    # Pick the OTHER slot: the single non-active text slot with a vector.
+    others = [
+        (slot, vec) for slot, vec in slots.items() if slot != active_slot and vec
+    ]
+    if not others:
+        return None
+    # Deterministic pick when multiple secondaries exist (e.g. qwen3 + openai):
+    # the first by sorted slot name. Multiple secondaries is an edge case; the
+    # offline corpus is partitioned by source so picking one is correct (the
+    # others simply aren't dual-logged this cycle).
+    others.sort(key=lambda kv: kv[0])
+    other_slot, other_query_emb = others[0]
+    try:
+        from vco_lib.embedding_service import TEXT_SLOT_MAP
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("_resolve_dual_rl_log_inputs: slot-map import raised (%s)", exc)
+        return None
+    # Resolve the other slot's short source + model + dim. Map slot -> source
+    # short tag the SAME way EmbeddingService.text_model_short_id does, and
+    # model/dim via the first TEXT_SLOT_MAP entry that targets this slot.
+    other_source = _slot_short_source(other_slot)
+    other_dim = 0
+    for _substr, slot, dim in TEXT_SLOT_MAP:
+        if slot == other_slot:
+            other_dim = dim
+            break
+    other_model = _other_model_for_source(other_source)
+    if not other_dim:
+        other_dim = _embedding_dim_for(other_model)
+    return {
+        "other_slot": other_slot,
+        "other_source": other_source,
+        "other_dim": other_dim,
+        "other_model": other_model,
+        "other_query_emb": other_query_emb,
+    }
+
+
+def _slot_short_source(slot: str) -> str:
+    """Map a named-vector slot to its short RL embedding-source tag.
+
+    Mirrors ``EmbeddingService.text_model_short_id``'s slot-driven dispatch
+    (the canonical mapping) so the dual-log other-slot event carries the SAME
+    short tag the offline loader partitions by.
+    """
+    s = (slot or "").lower()
+    if s == "qwen3_embed":
+        return "qwen3"
+    if s == "arctic2_embed":
+        return "arctic"
+    if s == "openai_text_embed":
+        return "openai"
+    if s == "codesage_embed":
+        return "codesage"
+    if "arctic" in s:
+        return "arctic"
+    if "qwen3" in s:
+        return "qwen3"
+    if "openai" in s:
+        return "openai"
+    return "legacy"
+
 
 async def _rl_cache_and_rerank(
     task_id: str,
@@ -5027,6 +5438,7 @@ async def _rl_cache_and_rerank(
     failure_mode: str | None = None,
     failed_collections: list[str] | None = None,
     query_emb: list[float] | None = None,
+    dual_log_inputs: "dict | None" = None,
 ) -> list[dict]:
     """
     V52-J Edit 2 (2026-06-09): thin adapter that delegates to the canonical
@@ -5056,6 +5468,14 @@ async def _rl_cache_and_rerank(
         rerank_and_emit,
     )
 
+    # v0.2.71 Sweep-C dual-log: when the caller resolved the other-slot inputs
+    # (dual-log on AND dual-write on AND a distinct other slot exists), thread
+    # them into the request so the pipeline emits the second (other-slot) event
+    # on a ``:slot``-suffixed task_id. The per-node ``emb_other`` / ``cos_qn_other``
+    # were attached upstream by ``_rl_enrich_nodes_with_linked_embs`` on these
+    # same dicts. ``dual_log_inputs is None`` → bare single-log path (unchanged).
+    di = dual_log_inputs or {}
+    dual_log = bool(di)
     req = RerankRequest(
         query=query,
         candidates=all_nodes,
@@ -5068,6 +5488,11 @@ async def _rl_cache_and_rerank(
         task_type="mcp_interactive",
         failure_mode=failure_mode,
         failed_collections=failed_collections or [],
+        dual_log=dual_log,
+        other_query_emb=di.get("other_query_emb"),
+        other_embedding_source=di.get("other_source", ""),
+        other_embedding_dim=di.get("other_dim", 0),
+        other_embedding_model=di.get("other_model", ""),
     )
     result = await rerank_and_emit(req)
     return result.ranked
@@ -5560,12 +5985,21 @@ async def _semantic_graph_search_body(
     # below). When the fan-out had zero successful collections both
     # remain at their initial None / "" sentinels; the helper degrades
     # to a no-op-with-empty-fields write.
+    # v0.2.71 Sweep-C: resolve the dual-RL-log other-slot inputs ONCE (gated on
+    # dual-log AND dual-write env). None → bare single-log path. The other-slot
+    # query vector comes from the canonical embed fan-out; the per-node other
+    # vectors are attached by the enrich call below from the SAME fetched objects.
+    _dual_inputs = await _resolve_dual_rl_log_inputs(query, query_target)
     try:
         _rl_enrich_nodes_with_linked_embs(
             all_formatted,
             query_emb=query_vector,
             active_slot=query_target,
             model_name=EMBEDDING_MODEL,
+            other_slot=(_dual_inputs or {}).get("other_slot", ""),
+            other_query_emb=(_dual_inputs or {}).get("other_query_emb"),
+            other_model_name=(_dual_inputs or {}).get("other_model", ""),
+            backfill_other=_dual_inputs is not None,
         )
     except Exception as exc:
         logger.debug(
@@ -5585,6 +6019,7 @@ async def _semantic_graph_search_body(
         failure_mode=_partial_failure_mode,
         failed_collections=failed_collections_schema or None,
         query_emb=query_vector,
+        dual_log_inputs=_dual_inputs,
     )
     for r in primary_results:
         if "score" not in r:
@@ -6293,12 +6728,19 @@ async def _hybrid_search_body(
     # the nodes as-is and the v3 retrieval event ships with whatever
     # was already attached by the search-time near_vector enrichment
     # (typically `emb` + `cos_qn`).
+    # v0.2.71 Sweep-C: resolve the dual-RL-log other-slot inputs ONCE (gated on
+    # dual-log AND dual-write env). None → bare single-log path.
+    _dual_inputs = await _resolve_dual_rl_log_inputs(query, query_target)
     try:
         _rl_enrich_nodes_with_linked_embs(
             all_results,
             query_emb=query_vector,
             active_slot=query_target,
             model_name=EMBEDDING_MODEL,
+            other_slot=(_dual_inputs or {}).get("other_slot", ""),
+            other_query_emb=(_dual_inputs or {}).get("other_query_emb"),
+            other_model_name=(_dual_inputs or {}).get("other_model", ""),
+            backfill_other=_dual_inputs is not None,
         )
     except Exception as exc:
         logger.debug("hybrid_search: RL enrich failed (%s); proceeding without linked_embs", exc)
@@ -6316,6 +6758,7 @@ async def _hybrid_search_body(
         failure_mode=_partial_failure_mode,
         failed_collections=failed_collections_schema or None,
         query_emb=query_vector,
+        dual_log_inputs=_dual_inputs,
     )
 
     # Ensure score survives the RL hop too (RL server returns its own dicts; if

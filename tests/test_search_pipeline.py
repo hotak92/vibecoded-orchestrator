@@ -376,3 +376,150 @@ def test_build_log_nodes_clamps_over_one_score_at_writer_boundary():
     assert by_title["Hot"]["score"] == 1.0       # clamped from 10.37
     assert by_title["Cold"]["score"] == 0.3       # untouched in-range
     assert by_title["Hot"]["score_cosine"] == 0.8  # already bounded
+
+
+# ----------------------------------------------------------------------
+# 8. v0.2.71 Sweep-C — dual-RL-log fan-out (the OTHER embedding slot)
+#    Active event stays on the bare task_id; the second event uses a
+#    ``:slot``-suffixed id + the other source's embedding triple.
+# ----------------------------------------------------------------------
+
+
+def _dual_request(**overrides):
+    """RerankRequest with dual-log inputs (other slot = qwen3) preset.
+
+    Each candidate carries BOTH the active per-node vector (n_emb) AND the
+    other-slot vector (emb_other) so the second event has nodes to log. The
+    active slot here is taken to be arctic; the OTHER slot is qwen3.
+    """
+    defaults = {
+        "candidates": [
+            {"title": "ConfigDoc", "score": 0.91,
+             "n_emb": [0.2] * 1024, "emb_other": [0.5] * 1024, "cos_qn_other": 0.7},
+            {"title": "InstallNotes", "score": 0.74,
+             "n_emb": [0.3] * 1024, "emb_other": [0.4] * 1024, "cos_qn_other": 0.6},
+        ],
+        "dual_log": True,
+        "other_query_emb": [0.11] * 1024,
+        "other_embedding_source": "qwen3",
+        "other_embedding_dim": 1024,
+        "other_embedding_model": "qwen3-embedding:0.6b",
+    }
+    defaults.update(overrides)
+    return _make_request(**defaults)
+
+
+def test_dual_log_off_emits_exactly_one_event_bare_task_id():
+    """dual_log off (the default single-log path) → exactly ONE emit, bare tid."""
+    async def _inner():
+        req = _make_request(task_id="bare-1")  # dual_log defaults to False
+        with patch.object(search_pipeline, "_resolve_rl_enabled", return_value=False), \
+             patch.object(search_pipeline, "emit_rl_event", return_value=True) as mock_emit:
+            await search_pipeline.rerank_and_emit(req)
+        assert mock_emit.call_count == 1
+        # The single (active) event keeps the bare task_id — no slot suffix.
+        ev = mock_emit.call_args_list[0].args[0]
+        assert ev.task_id == "bare-1"
+        assert ":" not in ev.task_id
+    _run(_inner())
+
+
+def test_dual_log_on_with_both_slots_emits_two_events():
+    """dual_log on + dual-write on + candidates carry the other slot → TWO events.
+
+    The active event is on the BARE task_id and tagged with the active source;
+    the second event is on the ``<tid>:<other>`` suffixed id and tagged with the
+    OTHER embedding source. (dual-write being on is the precondition the SERVER
+    gate enforces; here ``req.dual_log`` is already the resolved-on flag.)
+    """
+    async def _inner():
+        req = _dual_request(task_id="t-9", embedding_source="arctic")
+        with patch.object(search_pipeline, "_resolve_rl_enabled", return_value=False), \
+             patch.object(search_pipeline, "emit_rl_event", return_value=True) as mock_emit:
+            await search_pipeline.rerank_and_emit(req)
+        assert mock_emit.call_count == 2
+        # Event 1 (active): bare task_id, active source.
+        active_ev = mock_emit.call_args_list[0].args[0]
+        assert active_ev.task_id == "t-9"
+        assert active_ev.embedding_source == "arctic"
+        # Event 2 (other slot): suffixed task_id, OTHER source, OTHER query_emb.
+        other_call = mock_emit.call_args_list[1]
+        other_ev = other_call.args[0]
+        assert other_ev.task_id == "t-9:qwen3"
+        assert other_ev.embedding_source == "qwen3"
+        assert other_ev.query_emb == req.other_query_emb
+        # The second event carries the other-slot per-node vectors as n_emb.
+        assert other_ev.nodes
+        assert all(n.get("n_emb") == [0.5] * 1024 or n.get("n_emb") == [0.4] * 1024
+                   for n in other_ev.nodes)
+        # The second emit goes through a writer_factory (the other-slot writer).
+        assert "writer_factory" in other_call.kwargs
+    _run(_inner())
+
+
+def test_dual_log_on_but_no_candidate_has_other_slot_suppresses_second_event():
+    """dual_log on but NO candidate carries emb_other → second event suppressed.
+
+    A node-less happy-path event would mis-signal, so the fan-out stays at ONE
+    event (the active one). This is the "node embedded before dual-write" case
+    when backfill could not fill any slot.
+    """
+    async def _inner():
+        req = _dual_request(
+            task_id="t-10",
+            candidates=[
+                {"title": "OnlyActive", "score": 0.8, "n_emb": [0.2] * 1024},
+            ],
+        )
+        with patch.object(search_pipeline, "_resolve_rl_enabled", return_value=False), \
+             patch.object(search_pipeline, "emit_rl_event", return_value=True) as mock_emit:
+            await search_pipeline.rerank_and_emit(req)
+        assert mock_emit.call_count == 1
+        assert mock_emit.call_args_list[0].args[0].task_id == "t-10"
+    _run(_inner())
+
+
+def test_dual_log_second_emit_failure_does_not_affect_active():
+    """A broken second (other-slot) emit must never disturb the active event."""
+    async def _inner():
+        req = _dual_request(task_id="t-11", embedding_source="arctic")
+        calls = {"n": 0}
+
+        def _emit(ev, *a, **kw):
+            calls["n"] += 1
+            # First call (active) succeeds; second (other slot) raises.
+            if calls["n"] == 2:
+                raise RuntimeError("hub down for other-slot write")
+            return True
+
+        with patch.object(search_pipeline, "_resolve_rl_enabled", return_value=False), \
+             patch.object(search_pipeline, "emit_rl_event", side_effect=_emit):
+            result = await search_pipeline.rerank_and_emit(req)
+        # Active event reported success; the search result is intact.
+        assert result.emit_success is True
+        assert len(result.ranked) > 0
+        assert calls["n"] == 2  # both attempted; second raised but was caught
+    _run(_inner())
+
+
+def test_build_other_slot_log_nodes_skips_candidates_without_emb_other():
+    """``_build_other_slot_log_nodes`` only carries nodes that genuinely have the
+    other slot's vector — never fabricates one for a node that lacks it."""
+    candidates = [
+        {"title": "Both", "score": 0.9, "n_emb": [0.2] * 4,
+         "emb_other": [0.5] * 4, "cos_qn_other": 0.8},
+        {"title": "ActiveOnly", "score": 0.7, "n_emb": [0.3] * 4},  # no emb_other
+    ]
+    out = search_pipeline._build_other_slot_log_nodes(candidates, limit=5)
+    titles = [n["title"] for n in out]
+    assert titles == ["Both"]                       # ActiveOnly skipped
+    assert out[0]["emb"] == [0.5] * 4               # other-slot vector
+    assert out[0]["n_emb"] == [0.5] * 4             # serves as n_emb too
+    assert out[0]["cos_qn"] == 0.8                  # from cos_qn_other
+
+
+def test_slot_suffixed_task_id_shape():
+    """The second event's task_id is ``<tid>:<other_source>`` (paired in the
+    other source's corpus); the active stays bare."""
+    assert search_pipeline.slot_suffixed_task_id("abc123", "qwen3") == "abc123:qwen3"
+    assert search_pipeline.slot_suffixed_task_id("abc123", "arctic") == "abc123:arctic"

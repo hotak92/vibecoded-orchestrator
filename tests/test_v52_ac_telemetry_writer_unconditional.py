@@ -369,8 +369,16 @@ class GetRlTelemetryWriterSourceAuditTest(unittest.TestCase):
     def test_factory_source_has_only_one_no_write_branch(self):
         """Source audit: exactly one ``return None`` (the import-fail
         path). If a future refactor adds more, the contract drifts.
+
+        v0.2.71 Sweep-C: the construction body (incl. the import-failure
+        no-write branch) was extracted from ``_get_rl_telemetry_writer`` into
+        the shared ``_get_rl_telemetry_writer_for`` so the active path and the
+        dual-log other-slot path share ONE body. The thin active wrapper now
+        only resolves the live triple then delegates (no ``return None`` of its
+        own), so the V52-AC single-no-write-branch contract is pinned on the
+        SHARED body where it actually lives.
         """
-        src = inspect.getsource(srv._get_rl_telemetry_writer)
+        src = inspect.getsource(srv._get_rl_telemetry_writer_for)
         # Count occurrences of ``return None`` — the canonical
         # no-write exit shape. The factory should have exactly one.
         # (We allow a margin for the ``client.close()`` paths etc.;
@@ -378,10 +386,18 @@ class GetRlTelemetryWriterSourceAuditTest(unittest.TestCase):
         n_none_returns = src.count("return None")
         self.assertEqual(
             n_none_returns, 1,
-            f"_get_rl_telemetry_writer must have exactly one ``return None`` "
+            f"_get_rl_telemetry_writer_for must have exactly one ``return None`` "
             f"branch (import-failure); found {n_none_returns}. "
             f"A future refactor that adds another no-write exit drifts "
             f"the V52-AC contract."
+        )
+        # The thin active wrapper must itself contain NO no-write exit — it only
+        # resolves the triple then delegates to the shared body above.
+        wrapper_src = inspect.getsource(srv._get_rl_telemetry_writer)
+        self.assertEqual(
+            wrapper_src.count("return None"), 0,
+            "_get_rl_telemetry_writer is a thin wrapper — it must delegate the "
+            "no-write exit to _get_rl_telemetry_writer_for, not add its own.",
         )
 
 
