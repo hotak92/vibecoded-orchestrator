@@ -16892,10 +16892,39 @@ MemAvailable:   23456789 kB
         }
 
         #[test]
+        fn is_merge_or_rebase_conflict_detects_dirty_tree_refusals_v0271() {
+            // v0.2.71: dirty-tree refusals + autostash-pop must now be treated
+            // as conflicts so they route to the conflict modal + UPDATE_DEFERRED
+            // recovery instead of a bare-error dead-end (the .gitignore case).
+            // Real stderr samples from git 2.34+.
+            assert!(is_merge_or_rebase_conflict(
+                "error: Your local changes to the following files would be overwritten by merge:\n\t.gitignore\nPlease commit your changes or stash them before you merge."
+            ));
+            assert!(is_merge_or_rebase_conflict(
+                "error: cannot rebase: You have unstaged changes."
+            ));
+            assert!(is_merge_or_rebase_conflict(
+                "error: cannot pull with rebase: You have unstaged changes."
+            ));
+            assert!(is_merge_or_rebase_conflict(
+                "error: Cannot merge with local modifications; please commit or stash them."
+            ));
+            assert!(is_merge_or_rebase_conflict(
+                "Applying autostash resulted in conflicts."
+            ));
+            assert!(is_merge_or_rebase_conflict(
+                "error: could not apply autostash, the stash entry is kept"
+            ));
+        }
+
+        #[test]
         fn is_merge_or_rebase_conflict_ignores_unrelated_errors() {
             assert!(!is_merge_or_rebase_conflict("fatal: not a git repository"));
             assert!(!is_merge_or_rebase_conflict("Could not resolve host: github.com"));
             assert!(!is_merge_or_rebase_conflict(""));
+            // Network / fetch / spawn failures must still NOT look like conflicts.
+            assert!(!is_merge_or_rebase_conflict("fatal: unable to access 'https://...': Failed to connect"));
+            assert!(!is_merge_or_rebase_conflict("error: Permission denied (publickey)."));
         }
 
         #[test]
