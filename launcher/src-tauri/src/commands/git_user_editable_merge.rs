@@ -112,15 +112,29 @@ pub(crate) const USER_EDITABLE_PATTERNS: &[&str] = &[
     // (NOT executable): a clean line-based 3-way merge of them is correct by
     // construction (there is no "semantically broken .gitignore" the way a
     // mis-merged .py/.rs can be). Forks routinely append their own ignore
-    // rules, and upstream edits these periodically, so an overlapping dirty
-    // edit would otherwise poison the WHOLE auto-merge into the divergence
-    // modal even though git merge-file folds it cleanly. Safe to auto-merge
-    // here; the secondary `merge=union` driver in .gitattributes covers
-    // hand-run merges (forward-only). See the v0.2.71 update-reconciliation
-    // work. Deliberately NOT extended to *.py / *.rs / install.py / *.toml /
-    // templates/** — those are protected code where a textually-clean merge
-    // can be silently semantically broken, so a divergent pull there should
-    // surface the modal as a real breakage signal.
+    // rules, and upstream edits these periodically. Adding them to the A0
+    // allowlist means a NON-overlapping divergent edit (local appends at the
+    // top / upstream appends at the bottom, or vice-versa) folds cleanly via
+    // the per-path 3-way merge instead of poisoning the WHOLE auto-merge into
+    // the divergence modal.
+    //
+    // IMPORTANT accuracy note (corrected by the v0.2.71 adversarial review —
+    // an earlier comment OVERSTATED this): the A0 launcher path uses
+    // `git merge-file`, a low-level primitive that does NOT consult
+    // `.gitattributes` merge drivers. So the `.gitattributes merge=union`
+    // entries do NOT help the launcher A0 path. The common BOTH-append-at-EOF
+    // case (local and upstream each append a DIFFERENT rule at the end, an
+    // OVERLAPPING diff region) therefore CONFLICTS under merge-file → A0
+    // sidecars the upstream copy + writes a deferral (no data loss), it does
+    // NOT silently union-fold. The `merge=union` driver is a SEPARATE,
+    // FORWARD-ONLY safety net that applies ONLY to hand-run `git pull` /
+    // `git merge` (which DO consult `.gitattributes`), never to this A0 path.
+    // See `pre_merge_gitignore_overlapping_append_conflicts` (the honest test)
+    // and the v0.2.71 update-reconciliation work. Deliberately NOT extended to
+    // *.py / *.rs / install.py / *.toml / templates/** — those are protected
+    // code where a textually-clean merge can be silently semantically broken,
+    // so a divergent pull there should surface the modal as a real breakage
+    // signal.
     ".gitignore",
     ".gitattributes",
     // README.md and docs/**/*.md are declarative Markdown (high upstream
@@ -3166,6 +3180,93 @@ mod tests {
             merged.contains(".cache/"),
             "merged .gitignore missing upstream rule: {}",
             merged
+        );
+    }
+
+    /// v0.2.71 MED-2 (honest correction): the COMMON case the prior comment
+    /// OVERSTATED — local appends an ignore rule at EOF AND upstream appends a
+    /// DIFFERENT rule at EOF (an OVERLAPPING diff region). The A0 launcher path
+    /// uses `git merge-file`, which does NOT consult `.gitattributes` drivers,
+    /// so the repo-root `.gitignore merge=union` does NOT apply here: this
+    /// CONFLICTS and A0 produces a `PreservedWithUpstreamSidecar` outcome (the
+    /// upstream copy is written side-by-side + a deferral is emitted), NOT a
+    /// clean `Merged` fold. The local working tree is left untouched (no data
+    /// loss). The previous `.gitignore` test only proved the NON-overlapping
+    /// (start+end) case folds; this proves the overlapping case does NOT — so
+    /// the documented behaviour and the code agree.
+    ///
+    /// NOTE on union: a hand-run `git pull`/`git merge` WOULD union-fold this
+    /// (those consult `.gitattributes`); the A0 `git merge-file` path does not.
+    /// That asymmetry is exactly the accuracy point of MED-2.
+    #[tokio::test]
+    async fn pre_merge_gitignore_overlapping_append_conflicts() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+
+        // Shared base .gitignore in BOTH histories (so the merge-base has the
+        // file → BASE is non-empty for the 3-way). Push it upstream then
+        // fast-forward local so it's the common ancestor content.
+        let base_ignore = "*.log\n*.tmp\n*.swp\n*.bak\n*.pyc\n";
+        push_upstream_change(&seed, &local, ".gitignore", base_ignore);
+        run_git(&local, &["pull", "--ff-only", "vco_upstream", "main"]);
+
+        // Upstream APPENDS its own rule at the END (the last region).
+        push_upstream_change(
+            &seed,
+            &local,
+            ".gitignore",
+            "*.log\n*.tmp\n*.swp\n*.bak\n*.pyc\nupstream_rule/\n",
+        );
+        // Local ALSO appends a DIFFERENT rule at the SAME END region → the two
+        // edits OVERLAP (both touch the trailing context after `*.pyc`), which
+        // `git merge-file` cannot fold and marks as a conflict.
+        let local_body = "*.log\n*.tmp\n*.swp\n*.bak\n*.pyc\nlocal_rule/\n";
+        write_local_mod(&local, ".gitignore", local_body);
+
+        let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
+        let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+        let outcomes = pre_merge_user_editable(&local, &base, &theirs).await.unwrap();
+
+        let gitignore = outcomes
+            .iter()
+            .find(|o| o.path.as_path() == Path::new(".gitignore"))
+            .expect("expected a .gitignore outcome (must NOT be skipped)");
+        match &gitignore.kind {
+            MergeOutcomeKind::PreservedWithUpstreamSidecar {
+                upstream_sidecar_path,
+                ..
+            } => {
+                // Sidecar must hold the UPSTREAM content (the rule git could
+                // not fold into ours).
+                let sidecar = std::fs::read_to_string(upstream_sidecar_path).unwrap();
+                assert!(
+                    sidecar.contains("upstream_rule/"),
+                    "sidecar missing upstream content: {}",
+                    sidecar
+                );
+            }
+            other => panic!(
+                "expected PreservedWithUpstreamSidecar (overlapping append is a \
+                 conflict under merge-file; union would fold it but A0 does NOT), \
+                 got {:?}",
+                other
+            ),
+        }
+        // The local working-tree .gitignore MUST be untouched — A0 never
+        // clobbers OURS on a conflict (no data loss).
+        let local_now = std::fs::read_to_string(local.join(".gitignore")).unwrap();
+        assert_eq!(
+            local_now, local_body,
+            "local .gitignore was modified on a conflict — must stay OURS",
+        );
+        // And it must NOT have been silently union-folded (no upstream rule
+        // merged into the local file).
+        assert!(
+            !local_now.contains("upstream_rule/"),
+            "local .gitignore was union-folded — A0/merge-file must NOT do that, \
+             got:\n{}",
+            local_now,
         );
     }
 

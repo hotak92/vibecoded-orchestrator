@@ -40,6 +40,19 @@ use tauri::{command, AppHandle, Emitter, Manager, Runtime};
 use tokio::process::Command as TokioCommand;
 use vct_launcher_core::process::CommandExt as _;
 
+// v0.2.71 Sweep-A#3: the relocated shared durable-deferral writer + its
+// failure-shape enum. PRE-v0.2.71 a failed launcher SELF-update returned
+// ONLY a transient serialized modal error (`serialize_non_ff_error`) — no
+// `UPDATE_DEFERRED.md` trace a terminal Claude could find at session start,
+// unlike the installer (MenuBar-badge) update surface which DID write one.
+// We now call this ONE writer from the self-update failure paths too so both
+// surfaces leave the SAME durable record. The enum/writer live in
+// `git_user_editable_merge` (relocated from installer.rs-private) so neither
+// surface grows a second copy.
+use crate::commands::git_user_editable_merge::{
+    write_launcher_update_diverged_deferral, LauncherUpdateDivergedKind,
+};
+
 /// Refresh cadence for the daily background check. The user said "once a
 /// day" — we run a check every 24h after the previous successful check
 /// completed. Exposed as a const so tests can override.
@@ -741,6 +754,20 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
             // show users what their clone has vs. what upstream has.
             let local = current_sha(&repo).await.ok();
             let remote = ls_remote_sha(&repo, &branch).await.ok();
+            // v0.2.71 Sweep-A#3: leave the SAME durable UPDATE_DEFERRED.md
+            // trace the installer surface writes. Best-effort — never blocks
+            // the modal-shaped return below. A dismissed resync modal would
+            // otherwise leave NO record a terminal Claude could find at
+            // session start.
+            write_launcher_update_diverged_deferral(
+                &repo,
+                &branch,
+                LauncherUpdateDivergedKind::NonFastForward {
+                    local_sha: local.clone(),
+                    remote_sha: remote.clone(),
+                    detail: e.clone(),
+                },
+            );
             return Err(serialize_non_ff_error(
                 &branch,
                 local.as_deref(),
@@ -766,11 +793,23 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
         abort_merge_or_rebase_in_progress(&repo).await;
         let local = current_sha(&repo).await.ok();
         let remote = ls_remote_sha(&repo, &branch).await.ok();
+        let detail = "git pull (auto-merge) left unmerged files (autostash-pop conflict)";
+        // v0.2.71 Sweep-A#3: durable deferral for the autostash-pop-conflict
+        // success-path failure too (same rationale as the non-FF arm above).
+        write_launcher_update_diverged_deferral(
+            &repo,
+            &branch,
+            LauncherUpdateDivergedKind::NonFastForward {
+                local_sha: local.clone(),
+                remote_sha: remote.clone(),
+                detail: detail.to_string(),
+            },
+        );
         return Err(serialize_non_ff_error(
             &branch,
             local.as_deref(),
             remote.as_deref(),
-            "git pull (auto-merge) left unmerged files (autostash-pop conflict)",
+            detail,
         ));
     }
 
@@ -1946,5 +1985,60 @@ mod tests {
         // And the SAME string the rest of the codebase uses — guard
         // against accidental hard-coding.
         assert_eq!(v, env!("CARGO_PKG_VERSION"));
+    }
+
+    /// v0.2.71 Sweep-A#3: prove the relocated shared deferral writer is
+    /// reachable + usable from THIS module (the `use` import resolves) and
+    /// that the `NonFastForward` shape the two `apply_launcher_update`
+    /// failure paths now build produces a durable, parseable
+    /// `UPDATE_DEFERRED.md` trace. This is the contract the self-update
+    /// surface relies on: PRE-v0.2.71 a failed launcher self-update returned
+    /// ONLY a transient modal error; now both failure paths leave the SAME
+    /// durable record the installer surface does, so a terminal Claude can
+    /// find the stuck state at session start.
+    ///
+    /// We exercise the writer directly (the full `apply_launcher_update`
+    /// command needs an `AppHandle` + live git network, so a whole-command
+    /// integration test is impractical) — but we use the EXACT kind +
+    /// detail string the autostash-pop-conflict success-path branch passes,
+    /// so this guards that specific call-site's shape, not a generic one.
+    #[test]
+    fn self_update_failure_writes_durable_launcher_update_diverged_deferral() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let install = dir.path().to_path_buf();
+
+        // The literal detail the success-path unmerged-tree branch uses.
+        let detail = "git pull (auto-merge) left unmerged files (autostash-pop conflict)";
+        write_launcher_update_diverged_deferral(
+            &install,
+            "main",
+            LauncherUpdateDivergedKind::NonFastForward {
+                local_sha: Some("dead001".into()),
+                remote_sha: Some("beef002".into()),
+                detail: detail.to_string(),
+            },
+        );
+
+        let target = install.join(".claude/context/UPDATE_DEFERRED.md");
+        let body = std::fs::read_to_string(&target)
+            .expect("self-update failure must leave a durable UPDATE_DEFERRED.md");
+
+        // Same single condition_id as the installer surface → self-clears on
+        // the next successful install.py run.
+        assert!(
+            body.contains("condition_ids: [launcher_update_diverged]"),
+            "frontmatter must carry the shared condition_id"
+        );
+        assert!(body.contains("## launcher_update_diverged (warning)"));
+        // SHAs + the autostash-pop detail must be embedded for diagnosis.
+        assert!(body.contains("dead001"), "local sha must appear");
+        assert!(body.contains("beef002"), "remote sha must appear");
+        assert!(
+            body.contains("autostash-pop conflict"),
+            "the self-update failure detail must be embedded for diagnosis"
+        );
+        // The recovery instructions a terminal Claude needs.
+        assert!(body.contains("**For your Claude assistant**"));
+        assert!(body.contains("python install.py --update"));
     }
 }
