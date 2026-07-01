@@ -14,8 +14,8 @@
 //!          other).
 //!       2. Detects PRE-EXISTING legacy named volumes left over from
 //!          previous installs, with a STRICT allowlist so we never offer
-//!          to alias an unrelated project's data (`aihive-*`, `artup_*`,
-//!          `bitmagnet-*`, etc.).
+//!          to alias an unrelated project's data (e.g. some other app's
+//!          `someapp-*` / `otherproj_*` volumes on the same host).
 //!       3. Generates `infrastructure/compose.override.yaml` in
 //!          three shapes: default (empty), bind-mount per service, or
 //!          external alias per service. The filename intentionally matches
@@ -76,11 +76,11 @@ use vct_launcher_core::process::CommandExt as _;
 ///
 /// Any volume on the host NOT in this list (and not prefixed `vco_`) is
 /// considered out-of-namespace and MUST NOT be surfaced to the user as a
-/// recyclable volume. Concretely: never include `aihive-*`, `artup_*`,
-/// `bitmagnet-*`, `frontend_*`, `python_*`, `accounts_*`, `redis_*`, or
-/// `postgres_*` (the bare names without our prefix). Also exclude bare
-/// `ollama` — that's a bind-mount path in some user setups, not a
-/// named volume we own.
+/// recyclable volume. Concretely: never include some other app's namespaced
+/// volumes (e.g. `someapp-*`, `otherproj_*`) or bare service names like
+/// `frontend_*`, `python_*`, `accounts_*`, `redis_*`, or `postgres_*` (the
+/// bare names without our prefix). Also exclude bare `ollama` — that's a
+/// bind-mount path in some user setups, not a named volume we own.
 ///
 /// See `tests::detect_legacy_volumes_rejects_unrelated_namespaces` for the
 /// negative assertion that locks this list down.
@@ -1457,13 +1457,14 @@ mod tests {
         // Plausible non-real names from neighboring projects on a shared
         // machine. NONE of these should ever be returned.
         for forbidden in [
-            // Sibling-project namespaces
-            "aihive-weaviate",
-            "aihive-ollama",
-            "artup_postgres",
-            "artup_redis",
-            "bitmagnet-data",
-            "bitmagnet-postgres",
+            // Sibling-project namespaces (some other app's volumes on the
+            // same host — generic placeholders, not real project names)
+            "someapp-weaviate",
+            "someapp-ollama",
+            "otherproj_postgres",
+            "otherproj_redis",
+            "thirdapp-data",
+            "thirdapp-postgres",
             // Generic infrastructure
             "redis_cache",
             "postgres_data",
@@ -1498,9 +1499,9 @@ mod tests {
             // Prefix match
             "vco_custom_thing",
             // Out of namespace — must be rejected
-            "aihive-weaviate",
-            "artup_postgres",
-            "bitmagnet-data",
+            "someapp-weaviate",
+            "otherproj_postgres",
+            "thirdapp-data",
             "redis_data",
             "frontend_cache",
             // Whitespace / blanks

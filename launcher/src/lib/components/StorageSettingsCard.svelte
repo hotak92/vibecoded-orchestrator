@@ -12,8 +12,8 @@
    *
    * STRICT allowlist note: the Rust side filters `detect_legacy_volumes`
    * through a hand-curated allowlist + the `vco_*` prefix. We never get
-   * to see sibling-project volumes (aihive-*, artup_*, bitmagnet-*, etc.)
-   * here — the FE just renders whatever the backend hands back.
+   * to see some other app's sibling-project volumes (e.g. `someapp-*`,
+   * `otherproj_*`) here — the FE just renders whatever the backend hands back.
    */
   import { onMount } from 'svelte';
   import { invoke } from '$lib/tauri';

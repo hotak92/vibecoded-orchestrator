@@ -3464,7 +3464,7 @@ class CodeGraphAnalyzer:
         # new one, even when THIS object's body is byte-identical to what's
         # indexed. A 1-function edit therefore generated ~50 needless
         # tombstones; over time those accumulate into the cleanup-spin disk
-        # leak this fix targets (e.g. SD15_CodeFunction reached 8943).
+        # leak this fix targets (e.g. DemoProj_CodeFunction reached 8943).
         #
         # FIX: stamp a stable `content_hash` on the object, then before
         # replacing, point-read the existing object's stored `content_hash`

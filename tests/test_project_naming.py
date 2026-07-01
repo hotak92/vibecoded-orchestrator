@@ -27,7 +27,7 @@ class TestDocstringExamples:
     break we MUST update the docstring; users read the docstring as
     the spec."""
 
-    def test_sd15(self):
+    def test_demo15(self):
         assert canonical_class_prefix("MyProject") == "MyProject"
 
     def test_camel_case_preserves_underscore(self):

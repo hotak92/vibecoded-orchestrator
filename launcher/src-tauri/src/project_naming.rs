@@ -171,7 +171,7 @@ mod tests {
     // test (tests/project_naming_parity.rs) covers the wider fixture.
 
     #[test]
-    fn smoke_sd15() {
+    fn smoke_demo15() {
         assert_eq!(canonical_class_prefix("MyProject").unwrap(), "MyProject");
     }
 

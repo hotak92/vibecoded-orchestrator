@@ -198,7 +198,7 @@ class SchemaDeltaTests(unittest.TestCase):
         self.assertEqual(project_init._classify_action(delta), "noop")
 
     def test_index_null_state_only(self):
-        # TestInstall_KnowledgeGraph / BaliHospitality_KnowledgeGraph /
+        # TestInstall_KnowledgeGraph / AcmeHospitality_KnowledgeGraph /
         # VibecodedOrchestrator_Development: needs indexNullState only.
         actual = _missing_index_null_state_only()
         target = project_init.kg_class_definition("TestInstall_KnowledgeGraph")

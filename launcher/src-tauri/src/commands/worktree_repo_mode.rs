@@ -216,16 +216,16 @@ pub async fn create_local_project_repo(project_root: String) -> Result<(), Strin
 
 /// Append a guard block to `<root>/.gitignore` that ignores (a) every nested
 /// git repo found under `root` (so a stray `git add -A` can't swallow a nested
-/// repo like `ARTup_platform/`), and (b) the VCO runtime paths. Idempotent:
+/// repo like `Code/python/app/`), and (b) the VCO runtime paths. Idempotent:
 /// skips if our marker is already present.
 ///
 /// v0.2.71 (MEDIUM-1 widening): the scan walks DESCENDANTS up to
 /// `MAX_NESTED_SCAN_DEPTH` levels (not just immediate children), so a repo at
-/// `Code/python/ARTup_platform/.git` (two levels down under a non-repo `Code/`)
-/// is also ignored — matching the guard's stated intent "don't absorb nested
-/// repos". The walk is bounded (depth cap + we never descend INTO a discovered
-/// nested repo) so it can't blow up on a deep tree. Each nested repo is written
-/// as a root-anchored path (`/Code/python/ArtUP_platform/`) relative to `root`.
+/// `Code/python/app/.git` (two levels down under a non-repo `Code/`) is also
+/// ignored — matching the guard's stated intent "don't absorb nested repos".
+/// The walk is bounded (depth cap + we never descend INTO a discovered nested
+/// repo) so it can't blow up on a deep tree. Each nested repo is written as a
+/// root-anchored path (`/Code/python/app/`) relative to `root`.
 fn append_local_repo_gitignore_guard(root: &Path) -> std::io::Result<()> {
     use std::io::Write;
     const MARKER: &str = "# --- VCO local-only repo guard (created by the subagent-git modal) ---";
@@ -387,8 +387,8 @@ mod tests {
     #[tokio::test]
     async fn gitignore_guard_ignores_deeply_nested_repo() {
         // v0.2.71 MEDIUM-1: a repo TWO levels down (under a non-repo parent),
-        // the documented `Code/python/ARTup_platform/.git` shape, must also be
-        // ignored — the immediate-child-only scan missed it before the widening.
+        // the `Code/python/app/.git` shape, must also be ignored — the
+        // immediate-child-only scan missed it before the widening.
         if !git_available() {
             return;
         }

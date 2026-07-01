@@ -140,7 +140,7 @@ Before bringing up its own containers, `install.py` probes each port and content
 
 - **Nothing on the port** → start our service on the default port.
 - **A prior vco install on the port** → adopt it. No new container, no re-prompt; reuses the running service via the `~/.vct/services.toml` lock file.
-- **A foreign service on the port** (e.g. an unrelated Weaviate, an aihive Ollama, a project's own stack) → default action is **alt-port**: pick the next free port, write `infrastructure/docker-compose.override.yml`, and bring our copy up next to the existing service. Your service is never stopped, modified, or written to.
+- **A foreign service on the port** (e.g. an unrelated Weaviate, another app's Ollama, a project's own stack) → default action is **alt-port**: pick the next free port, write `infrastructure/docker-compose.override.yml`, and bring our copy up next to the existing service. Your service is never stopped, modified, or written to.
 
 Override the default with `--on-conflict`:
 

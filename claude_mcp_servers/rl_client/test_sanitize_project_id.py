@@ -41,13 +41,13 @@ class TestSanitizeProjectIdHappyPath:
         assert got == "02FBC934-ADA5-433C-B606-D1F56194035A"
 
     def test_simple_slug(self) -> None:
-        """Slug shape ``projects.slug`` carries (orchestrator-root, sd15, …)."""
+        """Slug shape ``projects.slug`` carries (orchestrator-root, demo15, …)."""
         got = sanitize_project_id("orchestrator-root")
         assert got == "orchestrator-root"
 
     def test_alphanumeric_only(self) -> None:
-        got = sanitize_project_id("sd15")
-        assert got == "sd15"
+        got = sanitize_project_id("demo15")
+        assert got == "demo15"
 
     def test_slug_with_underscores(self) -> None:
         """Underscores are part of the accepted set (some legacy slugs)."""

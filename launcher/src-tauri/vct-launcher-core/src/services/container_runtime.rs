@@ -3693,8 +3693,8 @@ mod tests {
         // leftover).
         let claimed = claimed_set(&[
             "vct-rl-reranker-orchestrator-root",
-            "vct-rl-reranker-instambul1860",
-            "vct-rl-reranker-sd15",
+            "vct-rl-reranker-demoproj1",
+            "vct-rl-reranker-demo15",
         ]);
         let verdict = classify_container_for_reaper(&s, &claimed, |_| None);
         assert_eq!(verdict, ReaperVerdict::Orphan);
