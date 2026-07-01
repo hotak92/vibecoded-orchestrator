@@ -881,6 +881,23 @@ fn project_still_exists(app: &AppHandle, project_id: &str) -> bool {
 /// never propagated. Each transition emits a `code-graph-build-progress`
 /// event so the GUI updates live.
 ///
+/// v0.2.72 (P5): compile-safe fallback resolver for the `.claude/` gate.
+///
+/// Mirrors the DEFAULT of T-GUI-DB's `codegraph_settings::
+/// resolve_codegraph_index_dot_claude` so this branch compiles + behaves
+/// correctly BEFORE T-GUI-DB is merged (see the INTEGRATOR NOTE in
+/// `run_build_task`). Root heuristic: a folder is the orchestrator clone
+/// iff it contains BOTH `vco_lib/` (unique to the orchestrator clone) AND
+/// a `.claude/` directory — every other VCO-installed project has
+/// `.claude/` but NOT `vco_lib/`. Returns `true` (index `.claude`) only for
+/// the orchestrator root; `false` (exclude) for user projects. Mirrors the
+/// Python-side `_looks_like_orchestrator_root` in `analyze_code_graph.py`
+/// — the two MUST stay in sync (cross-language mirror). Never panics.
+fn resolve_index_dot_claude_fallback(folder_path: &str) -> bool {
+    let root = std::path::Path::new(folder_path);
+    root.join("vco_lib").is_dir() && root.join(".claude").is_dir()
+}
+
 /// Mid-build unregister race (follow-up #11): if the user calls
 /// `delete_project_v2` while this task is in flight, the DB row vanishes
 /// and any subsequent upsert hits an FK violation that prints a
@@ -1046,6 +1063,43 @@ async fn run_build_task(
     // boot-resume to preserve conservative semantics on those paths.
     if prune_stale {
         args.push("--prune-stale".to_string());
+    }
+
+    // v0.2.72 (P5): `.claude/` gate. For a user project `.claude/` is
+    // orchestrator-GENERATED tooling (bundled agents/skills/hooks/scripts),
+    // not first-party source; indexing it injects that tooling as retrieval
+    // "context" noise. For the orchestrator clone itself `.claude/` IS
+    // first-party source under active development, so it should be indexed.
+    //
+    // The per-project bool lives in `module_settings`
+    // (`codegraph_index_dot_claude`, default: root→true, else→false) and is
+    // resolved by T-GUI-DB's `codegraph_settings::
+    // resolve_codegraph_index_dot_claude(&db, &project_id)`.
+    //
+    // ⚠️ INTEGRATOR NOTE (T-GUI-DB merge): T-GUI-DB (branch v0272-gui-db) is
+    // NOT yet merged into this branch's base, so `codegraph_settings` does
+    // not exist here and calling it directly would break `cargo build`.
+    // `resolve_index_dot_claude_fallback` below mirrors the DB contract's
+    // DEFAULT (root-detect) so this branch compiles + behaves correctly on
+    // its own. When T-GUI-DB lands, REPLACE the fallback call with:
+    //
+    //     let index_dot_claude = crate::commands::codegraph_settings::
+    //         resolve_codegraph_index_dot_claude(&db, &project_id)
+    //         .unwrap_or_else(|e| {
+    //             eprintln!("[vct] warning: resolve_codegraph_index_dot_claude \
+    //                 for {}: {} — defaulting to exclude .claude", project_id, e);
+    //             false
+    //         });
+    //
+    // (get `db` via `app.state::<Db>()` — this task holds only `AppHandle`).
+    // The fallback only reads root-detection; the DB value additionally
+    // honours a user's explicit per-project opt-in toggle, so swapping it in
+    // is a strict upgrade.
+    let index_dot_claude = resolve_index_dot_claude_fallback(&folder_path);
+    if index_dot_claude {
+        args.push("--index-dot-claude".to_string());
+    } else {
+        args.push("--no-index-dot-claude".to_string());
     }
 
     // Resolve VCT_INSTALL_ROOT: the directory of the orchestrator

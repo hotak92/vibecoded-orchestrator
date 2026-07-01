@@ -455,6 +455,15 @@ _COMMON_IGNORE_DIRS: frozenset = frozenset({
     'node_modules',
     # v0.2.16 — git-worktree clones under .claude/worktrees/agent-*/
     'worktrees',
+    # v0.2.72 (P5) — top-level `.wt/` git-worktree container. The
+    # release process creates per-track worktrees under `<repo>/.wt/
+    # v0272-<track>/` (see knowledge/concepts/parallel-pr-coordination-
+    # gotchas). These are exact byte copies of the main-repo source;
+    # walking them re-analyzes the same symbols (wasted work + duplicate
+    # -effort metrics) and, worse, injects the worktree copy's functions
+    # as retrieval "context" noise. `.wt` complements the existing
+    # `worktrees` entry (which only covered `.claude/worktrees/`).
+    '.wt',
     # v0.2.52 (V52-O.1) — JS/TS framework codegen + cache dirs. SvelteKit
     # in particular produces a `.svelte-kit/output/` tree full of Rollup
     # chunks that look like JS source to the analyzer; in real-world
@@ -486,9 +495,15 @@ _LANGUAGE_IGNORE_DIRS_EXTRAS: Dict[str, frozenset] = {
     'ruby':   frozenset({'vendor', '.bundle'}),
     # .NET / VS workspace artefacts
     'csharp': frozenset({'obj', 'bin', '.vs'}),
-    # JS / TS test-coverage reports
-    'js':     frozenset({'coverage'}),
-    'ts':     frozenset({'coverage'}),
+    # JS / TS test-coverage reports + vendored third-party deps.
+    # v0.2.72 (P5): `vendor` — some JS/TS projects vendor third-party
+    # libraries into `<pkg>/vendor/` (e.g. the launcher's bundled
+    # diagram editors under `launcher/vendor/diagrams-editor/`). Those
+    # are minified/third-party sources, not first-party code; indexing
+    # them injects thousands of vendor functions as retrieval noise.
+    # (Go/Ruby already skip `vendor` via their own extras above.)
+    'js':     frozenset({'coverage', 'vendor'}),
+    'ts':     frozenset({'coverage', 'vendor'}),
     # Languages with no extras (placeholder — explicit is better than
     # implicit when the analyzer learns a new language family later)
     'shell':  frozenset(),
@@ -499,15 +514,78 @@ _LANGUAGE_IGNORE_DIRS_EXTRAS: Dict[str, frozenset] = {
 }
 
 
-def _ignore_dirs_for(language: str) -> frozenset:
+def _ignore_dirs_for(language: str, index_dot_claude: bool = False) -> frozenset:
     """Return the directory-skip set for a given language.
 
     The set merges :data:`_COMMON_IGNORE_DIRS` with any
     language-specific extras. Unknown languages get the common set
     only (no error — analyzer should never crash on a new language
     being added without first updating the table).
+
+    ``index_dot_claude`` (v0.2.72, P5) gates the ``.claude`` directory:
+
+    * ``False`` (default, and the resolved value for every non-root
+      user project) → ``.claude`` is ADDED to the ignore set. For a
+      user project, ``.claude/`` is orchestrator-GENERATED tooling
+      (bundled agents/skills/hooks/scripts), not first-party source;
+      indexing it injects that tooling as retrieval "context" noise.
+    * ``True`` (the orchestrator clone itself, or an explicit
+      per-project opt-in) → ``.claude`` is walked normally, because on
+      the orchestrator root ``.claude/`` IS first-party source under
+      active development.
+
+    The launcher resolves the per-project bool via
+    ``codegraph_settings::resolve_codegraph_index_dot_claude`` and
+    passes ``--index-dot-claude`` / ``--no-index-dot-claude`` so the
+    analyzer honours it (see ``main()``'s argparse + the CLI tri-state
+    default in ``_resolve_index_dot_claude``).
     """
-    return _COMMON_IGNORE_DIRS | _LANGUAGE_IGNORE_DIRS_EXTRAS.get(language, frozenset())
+    dirs = _COMMON_IGNORE_DIRS | _LANGUAGE_IGNORE_DIRS_EXTRAS.get(language, frozenset())
+    if not index_dot_claude:
+        dirs = dirs | frozenset({'.claude'})
+    return dirs
+
+
+def _looks_like_orchestrator_root(repo_path: Path) -> bool:
+    """Best-effort check: does ``repo_path`` look like the orchestrator clone?
+
+    The orchestrator clone is the ONE tree where ``.claude/`` is
+    first-party source under active development (bundled agents, hooks,
+    scripts, MCP servers), so a bare CLI run there should still index it.
+    Heuristic: the root both *contains* ``vco_lib/`` (unique to the
+    orchestrator clone) AND has a ``.claude/`` directory. Every other
+    project that has VCO installed has ``.claude/`` but NOT ``vco_lib/``.
+    Never raises — returns False on any filesystem error (conservative:
+    unknown → treat as a user project → exclude ``.claude``).
+    """
+    try:
+        return (repo_path / "vco_lib").is_dir() and (repo_path / ".claude").is_dir()
+    except OSError:
+        return False
+
+
+def _resolve_index_dot_claude(cli_value: Optional[bool], repo_path: Path) -> bool:
+    """Resolve the tri-state ``--index-dot-claude`` CLI flag into a bool.
+
+    v0.2.72 (P5). Three input states:
+
+    * ``cli_value is True``  → ``--index-dot-claude`` was passed → index it.
+    * ``cli_value is False`` → ``--no-index-dot-claude`` was passed → skip it.
+    * ``cli_value is None``  → neither flag passed (bare CLI run). Fall
+      back to root-autodetect: index ``.claude`` ONLY when ``repo_path``
+      looks like the orchestrator clone (see
+      :func:`_looks_like_orchestrator_root`); exclude it for every user
+      project. This keeps a plain ``analyze_code_graph.py <orch-root>``
+      invocation indexing the orchestrator's own ``.claude/`` while
+      defaulting user projects to EXCLUDE.
+
+    The launcher always passes an explicit flag (from
+    ``resolve_codegraph_index_dot_claude``), so the ``None`` path only
+    matters for hand-run CLI invocations.
+    """
+    if cli_value is not None:
+        return cli_value
+    return _looks_like_orchestrator_root(repo_path)
 
 
 # ---------------------------------------------------------------------------
@@ -2931,6 +3009,15 @@ class CodeGraphAnalyzer:
         # Empty string when no analyze is in progress.
         self._current_source: str = ""
 
+        # v0.2.72 (P5) — whether to index the `.claude/` directory. For a
+        # user project this is orchestrator-GENERATED tooling (noise); for
+        # the orchestrator clone itself it's first-party source. Default
+        # False (exclude). main() overwrites it from the resolved CLI
+        # tri-state (`--index-dot-claude` / `--no-index-dot-claude`, else
+        # root-autodetect). Read by every `_find_*_files` via
+        # `_ignore_dirs_for(lang, self.index_dot_claude)`.
+        self.index_dot_claude: bool = False
+
     def connect(self):
         """Connect to Weaviate."""
         try:
@@ -4617,7 +4704,7 @@ class CodeGraphAnalyzer:
 
     def _find_python_files(self, repo_path: Path) -> List[Path]:
         """Find all Python files in repository."""
-        ignore_dirs = _ignore_dirs_for('python')
+        ignore_dirs = _ignore_dirs_for('python', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.py')
             if not any(d in f.parts for d in ignore_dirs)
@@ -4625,7 +4712,7 @@ class CodeGraphAnalyzer:
 
     def _find_lua_files(self, repo_path: Path) -> List[Path]:
         """Find all Lua files in repository."""
-        ignore_dirs = _ignore_dirs_for('lua')
+        ignore_dirs = _ignore_dirs_for('lua', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.lua')
             if not any(d in f.parts for d in ignore_dirs)
@@ -4633,7 +4720,7 @@ class CodeGraphAnalyzer:
 
     def _find_cpp_files(self, repo_path: Path) -> List[Path]:
         """Find all C++/header files in repository."""
-        ignore_dirs = _ignore_dirs_for('cpp')
+        ignore_dirs = _ignore_dirs_for('cpp', self.index_dot_claude)
         files = []
         for ext in ('*.cpp', '*.cc', '*.cxx', '*.c', '*.h', '*.hpp'):
             files.extend([
@@ -4644,8 +4731,15 @@ class CodeGraphAnalyzer:
 
     def _find_js_files(self, repo_path: Path) -> List[Path]:
         """Find all JavaScript files in repository."""
-        ignore_dirs = _ignore_dirs_for('js')
-        skip_suffixes = {'.min.js', '.config.js', '.config.mjs'}
+        ignore_dirs = _ignore_dirs_for('js', self.index_dot_claude)
+        # v0.2.72 (P5): `.bundle.js` + `.chunk.js` join `.min.js` — these
+        # are build-output bundles (webpack/rollup/esbuild), not source.
+        # The launcher's `launcher/vendor/diagrams-editor/excalidraw/
+        # excalidraw.bundle.js` was live-confirmed injecting its functions
+        # as retrieval context. `.chunk.js` covers split-chunk output that
+        # doesn't live under an already-ignored codegen dir.
+        skip_suffixes = {'.min.js', '.bundle.js', '.chunk.js',
+                         '.config.js', '.config.mjs'}
         files = []
         for ext in ('*.js', '*.mjs', '*.jsx'):
             for f in repo_path.rglob(ext):
@@ -4660,8 +4754,11 @@ class CodeGraphAnalyzer:
 
     def _find_ts_files(self, repo_path: Path) -> List[Path]:
         """Find all TypeScript files in repository."""
-        ignore_dirs = _ignore_dirs_for('ts')
-        skip_suffixes = {'.config.ts', '.config.mts'}
+        ignore_dirs = _ignore_dirs_for('ts', self.index_dot_claude)
+        # v0.2.72 (P5): `.bundle.ts` / `.chunk.ts` mirror the JS bundle
+        # skips. Bundle output is almost always `.js`, but the mirror keeps
+        # the two find-methods symmetric if a toolchain emits `.ts` bundles.
+        skip_suffixes = {'.bundle.ts', '.chunk.ts', '.config.ts', '.config.mts'}
         files = []
         for ext in ('*.ts', '*.tsx'):
             for f in repo_path.rglob(ext):
@@ -4679,7 +4776,7 @@ class CodeGraphAnalyzer:
 
     def _find_go_files(self, repo_path: Path) -> List[Path]:
         """Find all Go files in repository."""
-        ignore_dirs = _ignore_dirs_for('go')
+        ignore_dirs = _ignore_dirs_for('go', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.go')
             if not any(d in f.parts for d in ignore_dirs)
@@ -4687,7 +4784,7 @@ class CodeGraphAnalyzer:
 
     def _find_rust_files(self, repo_path: Path) -> List[Path]:
         """Find all Rust files in repository."""
-        ignore_dirs = _ignore_dirs_for('rust')
+        ignore_dirs = _ignore_dirs_for('rust', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.rs')
             if not any(d in f.parts for d in ignore_dirs)
@@ -4695,7 +4792,7 @@ class CodeGraphAnalyzer:
 
     def _find_java_files(self, repo_path: Path) -> List[Path]:
         """Find all Java files in repository."""
-        ignore_dirs = _ignore_dirs_for('java')
+        ignore_dirs = _ignore_dirs_for('java', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.java')
             if not any(d in f.parts for d in ignore_dirs)
@@ -4703,7 +4800,7 @@ class CodeGraphAnalyzer:
 
     def _find_ruby_files(self, repo_path: Path) -> List[Path]:
         """Find all Ruby files in repository."""
-        ignore_dirs = _ignore_dirs_for('ruby')
+        ignore_dirs = _ignore_dirs_for('ruby', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.rb')
             if not any(d in f.parts for d in ignore_dirs)
@@ -4711,7 +4808,7 @@ class CodeGraphAnalyzer:
 
     def _find_shell_files(self, repo_path: Path) -> List[Path]:
         """Find all Shell script files in repository."""
-        ignore_dirs = _ignore_dirs_for('shell')
+        ignore_dirs = _ignore_dirs_for('shell', self.index_dot_claude)
         files = []
         for ext in ('*.sh', '*.bash'):
             files.extend([
@@ -4722,7 +4819,7 @@ class CodeGraphAnalyzer:
 
     def _find_csharp_files(self, repo_path: Path) -> List[Path]:
         """Find all C# files in repository."""
-        ignore_dirs = _ignore_dirs_for('csharp')
+        ignore_dirs = _ignore_dirs_for('csharp', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.cs')
             if not any(d in f.parts for d in ignore_dirs)
@@ -4736,7 +4833,7 @@ class CodeGraphAnalyzer:
         the JS/TS ignore-dir set because Svelte sits in the same npm
         tooling ecosystem (node_modules, dist, .svelte-kit codegen).
         """
-        ignore_dirs = _ignore_dirs_for('js')
+        ignore_dirs = _ignore_dirs_for('js', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.svelte')
             if not any(d in f.parts for d in ignore_dirs)
@@ -4751,7 +4848,7 @@ class CodeGraphAnalyzer:
         shell ignore-dir set since .ps1 lives in the same parts of the
         tree as .sh (templates/hooks/, scripts/).
         """
-        ignore_dirs = _ignore_dirs_for('shell')
+        ignore_dirs = _ignore_dirs_for('shell', self.index_dot_claude)
         files = []
         for ext in ('*.ps1', '*.psm1'):
             files.extend([
@@ -4762,7 +4859,7 @@ class CodeGraphAnalyzer:
 
     def _find_proto_files(self, repo_path: Path) -> List[Path]:
         """Find all Protocol Buffer definition files."""
-        ignore_dirs = _ignore_dirs_for('proto')
+        ignore_dirs = _ignore_dirs_for('proto', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.proto')
             if not any(d in f.parts for d in ignore_dirs)
@@ -7816,6 +7913,20 @@ def main():
     parser.add_argument('--json-progress', action='store_true',
                        help='Emit per-file progress + final report as JSON '
                             'lines on stdout (Tauri Re-analyze modal).')
+    # v0.2.72 (P5): tri-state `.claude` gate. `dest` defaults to None
+    # (neither flag passed) so `_resolve_index_dot_claude` can fall back to
+    # root-autodetect for bare CLI runs. The launcher resolves the
+    # per-project bool via `resolve_codegraph_index_dot_claude` and ALWAYS
+    # passes one of these two flags explicitly.
+    parser.add_argument('--index-dot-claude', dest='index_dot_claude',
+                       action='store_true', default=None,
+                       help='Index the `.claude/` directory (default: only on '
+                            'the orchestrator clone; excluded for user projects '
+                            'where `.claude/` is generated tooling, not source).')
+    parser.add_argument('--no-index-dot-claude', dest='index_dot_claude',
+                       action='store_false',
+                       help='Exclude the `.claude/` directory from analysis '
+                            '(the launcher passes this for every non-root project).')
 
     args = parser.parse_args()
 
@@ -8038,6 +8149,13 @@ def main():
 
     # Create analyzer
     analyzer = CodeGraphAnalyzer(project_name, named_vectors=args.named_vectors)
+    # v0.2.72 (P5): resolve the tri-state `.claude` gate. Explicit CLI flag
+    # wins (the launcher always passes one); a bare run falls back to
+    # root-autodetect so the orchestrator clone still indexes its own
+    # `.claude/` while user projects exclude the generated tooling.
+    analyzer.index_dot_claude = _resolve_index_dot_claude(
+        args.index_dot_claude, repo_path
+    )
 
     # Connect to Weaviate
     if not analyzer.connect():

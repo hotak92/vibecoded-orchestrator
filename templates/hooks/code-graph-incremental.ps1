@@ -59,6 +59,32 @@ function Resolve-CodegraphProject {
 
 if (-not $ProjectName) { $ProjectName = Resolve-CodegraphProject -Root $RepoPath }
 
+# v0.2.72 (P5): resolve the `.claude/` gate. For a user project `.claude/`
+# is orchestrator-GENERATED tooling (noise); for the orchestrator clone it's
+# first-party source. Resolution: hub resolver field
+# `code_graph_index_dot_claude` (per-project bool from T-GUI-DB), else
+# root-detection fallback (index only when the root has vco_lib/ + .claude/).
+# CONSERVATIVE-DEFAULT: soft-fail to EXCLUDE. MUST MATCH
+# templates/hooks/code-graph-incremental.sh :: _resolve_index_dot_claude
+# and analyze_code_graph.py :: _looks_like_orchestrator_root.
+function Resolve-IndexDotClaude {
+    param([string]$Root)
+    $val = ""
+    $resolver = Join-Path $Root ".claude/scripts/vct_project_config.ps1"
+    if (Test-Path $resolver) {
+        try {
+            $val = (& $PsExe -NoProfile -File $resolver -Project $Root -Field "code_graph_index_dot_claude" 2>$null)
+        } catch { $val = "" }
+    }
+    switch (("" + $val).Trim()) {
+        { $_ -in 'true','True','TRUE','1' }    { return $true }
+        { $_ -in 'false','False','FALSE','0' } { return $false }
+    }
+    # Field absent (hub down / old hub) -> root-detection fallback.
+    return ((Test-Path (Join-Path $Root "vco_lib") -PathType Container) -and
+            (Test-Path (Join-Path $Root ".claude") -PathType Container))
+}
+
 $ScriptDir = $PSScriptRoot
 $DefaultRepoRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
 $Analyzer = if ($env:VCT_ANALYZER_SCRIPT) { $env:VCT_ANALYZER_SCRIPT } else { Join-Path $DefaultRepoRoot ".claude/scripts/analyze_code_graph.py" }
@@ -244,7 +270,12 @@ if (-not $Python -or -not (Test-Path $Analyzer)) { exit 0 }
 # rows regression. The analyzer also scopes Joern's CPG build to the one file.
 # --canonical-source $CanonRoot dedups git-worktree edits onto the
 # main-checkout object (Bug 3 part b — mirrors the .sh sibling).
-$analyzerArgs = @($Analyzer, $RepoPath, '--project', $ProjectName, '--only-file', $EditedFile, '--canonical-source', $CanonRoot)
+# v0.2.72 (P5): resolve + append the `.claude/` gate flag (mirrors the .sh
+# sibling's $_DOT_CLAUDE_FLAG). Resolved against $CanonRoot so a worktree edit
+# uses the canonical main root's setting.
+$IndexDotClaude = Resolve-IndexDotClaude -Root $CanonRoot
+$DotClaudeFlag = if ($IndexDotClaude) { '--index-dot-claude' } else { '--no-index-dot-claude' }
+$analyzerArgs = @($Analyzer, $RepoPath, '--project', $ProjectName, '--only-file', $EditedFile, '--canonical-source', $CanonRoot, $DotClaudeFlag)
 Start-Process -FilePath $Python -ArgumentList $analyzerArgs `
     -WorkingDirectory $RepoPath -WindowStyle Hidden | Out-Null
 
