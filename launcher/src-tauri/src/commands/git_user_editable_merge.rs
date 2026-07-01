@@ -112,15 +112,29 @@ pub(crate) const USER_EDITABLE_PATTERNS: &[&str] = &[
     // (NOT executable): a clean line-based 3-way merge of them is correct by
     // construction (there is no "semantically broken .gitignore" the way a
     // mis-merged .py/.rs can be). Forks routinely append their own ignore
-    // rules, and upstream edits these periodically, so an overlapping dirty
-    // edit would otherwise poison the WHOLE auto-merge into the divergence
-    // modal even though git merge-file folds it cleanly. Safe to auto-merge
-    // here; the secondary `merge=union` driver in .gitattributes covers
-    // hand-run merges (forward-only). See the v0.2.71 update-reconciliation
-    // work. Deliberately NOT extended to *.py / *.rs / install.py / *.toml /
-    // templates/** — those are protected code where a textually-clean merge
-    // can be silently semantically broken, so a divergent pull there should
-    // surface the modal as a real breakage signal.
+    // rules, and upstream edits these periodically. Adding them to the A0
+    // allowlist means a NON-overlapping divergent edit (local appends at the
+    // top / upstream appends at the bottom, or vice-versa) folds cleanly via
+    // the per-path 3-way merge instead of poisoning the WHOLE auto-merge into
+    // the divergence modal.
+    //
+    // IMPORTANT accuracy note (corrected by the v0.2.71 adversarial review —
+    // an earlier comment OVERSTATED this): the A0 launcher path uses
+    // `git merge-file`, a low-level primitive that does NOT consult
+    // `.gitattributes` merge drivers. So the `.gitattributes merge=union`
+    // entries do NOT help the launcher A0 path. The common BOTH-append-at-EOF
+    // case (local and upstream each append a DIFFERENT rule at the end, an
+    // OVERLAPPING diff region) therefore CONFLICTS under merge-file → A0
+    // sidecars the upstream copy + writes a deferral (no data loss), it does
+    // NOT silently union-fold. The `merge=union` driver is a SEPARATE,
+    // FORWARD-ONLY safety net that applies ONLY to hand-run `git pull` /
+    // `git merge` (which DO consult `.gitattributes`), never to this A0 path.
+    // See `pre_merge_gitignore_overlapping_append_conflicts` (the honest test)
+    // and the v0.2.71 update-reconciliation work. Deliberately NOT extended to
+    // *.py / *.rs / install.py / *.toml / templates/** — those are protected
+    // code where a textually-clean merge can be silently semantically broken,
+    // so a divergent pull there should surface the modal as a real breakage
+    // signal.
     ".gitignore",
     ".gitattributes",
     // README.md and docs/**/*.md are declarative Markdown (high upstream
@@ -1411,6 +1425,340 @@ pub(crate) async fn resolve_divergence_pull_plan(
             );
             PullPlan::FfOnly
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Launcher-side update divergence deferral (relocated v0.2.71 Sweep-A#3)
+// ---------------------------------------------------------------------------
+//
+// RELOCATED from installer.rs (was installer.rs-private) so BOTH update
+// surfaces share ONE durable-deferral writer:
+//   - the MenuBar-badge orchestrator-clone update (`installer::update_orchestrator`
+//     and its binary-refresh tail), and
+//   - the launcher SELF-update (`self_update::apply_launcher_update`).
+//
+// Pre-Sweep-A#3 only the installer surface wrote a durable
+// `UPDATE_DEFERRED.md` trace on a non-FF / git-pull failure; the self-update
+// surface returned ONLY a transient serialized modal error, so a launcher
+// self-update that failed left NO record a terminal Claude could find at
+// session start (the asymmetry §A6 of the shared-code audit flagged). Both
+// surfaces now call this ONE writer. Behaviour for the installer side is
+// IDENTICAL byte-for-byte to the prior installer.rs-private copy (the body
+// below is relocated verbatim) — only its home changed.
+
+/// v0.2.55 (durable-logging fix): the distinct launcher-side update
+/// failure shapes that `write_launcher_update_diverged_deferral` renders.
+/// All three are the SAME condition_id (`launcher_update_diverged`) so the
+/// deferral self-clears on the next successful `install.py --update` — they
+/// differ only in the human/Claude-facing diagnosis text.
+pub(crate) enum LauncherUpdateDivergedKind {
+    /// `git pull --ff-only` failed because local `main` has diverged from
+    /// upstream by committed history (NOT user-editable allowlisted paths —
+    /// those are handled non-blocking by the A0 per-path 3-way merge). The
+    /// GUI shows a Merge/Rebase/Cancel modal, but if the user cancels or
+    /// the modal is dismissed there was — pre-v0.2.55 — NO durable record.
+    NonFastForward {
+        local_sha: Option<String>,
+        remote_sha: Option<String>,
+        detail: String,
+    },
+    /// `WaitForBinaryRefresh` timed out but the on-disk dist binary is
+    /// NEWER than the running launcher — we restarted into it anyway
+    /// (v0.2.55 "update in any case"), and record that the update may be
+    /// one step behind the absolute source target.
+    PartialBinaryRefresh {
+        running: String,
+        on_disk: String,
+        detail: String,
+    },
+    /// `WaitForBinaryRefresh` timed out and there is NO newer binary on
+    /// disk — the restart was (correctly) aborted because re-execing the
+    /// same old binary helps nothing. The durable record makes the stuck
+    /// state diagnosable at session start.
+    BinaryRefreshTimeout {
+        running: String,
+        on_disk: String,
+        detail: String,
+    },
+    /// v0.2.55 (audit R1): a git-pull failure that is neither a conflict
+    /// nor a non-FF divergence (broken local git, detached HEAD, missing
+    /// upstream remote, etc.). PRE-v0.2.55 these returned a GUI-only error
+    /// string with no durable trace.
+    GitPullFailed {
+        detail: String,
+    },
+}
+
+/// v0.2.55 (durable-logging fix): write a `launcher_update_diverged`
+/// entry into `.claude/context/UPDATE_DEFERRED.md` for launcher-side
+/// update failures that PRE-v0.2.55 surfaced ONLY as a transient GUI
+/// modal / a confusing "still offers update" loop.
+///
+/// WHY this exists: a 3rd-party user's Claude reads `UPDATE_DEFERRED.md`
+/// at session start (per the project CLAUDE.md SESSION START rule). The
+/// rebase/merge CONFLICT path already writes a deferral via
+/// `write_resume_sentinel_and_deferral`; a plain non-FF divergence and a
+/// binary-refresh timeout did NOT — so a stuck update was invisible to
+/// the terminal Claude. This closes that asymmetry.
+///
+/// v0.2.71 Sweep-A#3: relocated from installer.rs to this shared module
+/// (was installer.rs-private) so the launcher SELF-update surface
+/// (`self_update::apply_launcher_update`) can call the SAME writer rather
+/// than growing a second copy. Both surfaces now leave an identical
+/// durable trace on a failed update.
+///
+/// Standalone Rust writer (does NOT depend on install.py firing) — the
+/// whole point is that install.py / the binary swap did NOT complete.
+/// Markdown shape mirrors `vco_lib/deferral_report.py` (frontmatter +
+/// `## <condition_id> (<severity>)` + Title/Detected/Why/To apply/For
+/// your Claude assistant/Detected at), so `DeferralReport.read()`
+/// round-trips it and treats it as resolved on the next successful
+/// install.py run (install.py running IS the resolution). Best-effort:
+/// any I/O failure is logged + swallowed — the caller MUST still surface
+/// its own error / continue its own flow.
+pub(crate) fn write_launcher_update_diverged_deferral(
+    install_path: &Path,
+    branch: &str,
+    kind: LauncherUpdateDivergedKind,
+) {
+    let target = install_path.join(".claude/context/UPDATE_DEFERRED.md");
+    let parent = match target.parent() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[vct] launcher_update_diverged: target has no parent: {}",
+                target.display()
+            );
+            return;
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(parent) {
+        eprintln!(
+            "[vct] launcher_update_diverged: mkdir {} failed: {} — skipping",
+            parent.display(),
+            e
+        );
+        return;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let install_root_display = install_path.display();
+
+    // Per-kind diagnosis. `detected` + `why` + `claude` vary; the
+    // condition_id, severity, and recovery commands are shared.
+    let (title, detected, why, claude_note) = match &kind {
+        LauncherUpdateDivergedKind::NonFastForward {
+            local_sha,
+            remote_sha,
+            detail,
+        } => {
+            let l = local_sha.as_deref().unwrap_or("<unknown>");
+            let r = remote_sha.as_deref().unwrap_or("<unknown>");
+            (
+                "Orchestrator update could not fast-forward (local history diverged)".to_string(),
+                format!(
+                    "`git pull --ff-only {branch}` failed: local `{branch}` (HEAD `{l}`) has \
+                     diverged from upstream (`{r}`) by committed history. This is NOT the \
+                     normal case of editing CLAUDE.md / CONTEXT_STATE.md / KG nodes — those \
+                     are handled non-blocking by the per-path 3-way merge. It means real \
+                     commits exist on your local `{branch}` that upstream doesn't have (e.g. \
+                     a clone whose `origin` was repointed at a private fork, or local commits \
+                     on `{branch}` instead of a feature branch). git said: `{d}`",
+                    branch = branch,
+                    l = l,
+                    r = r,
+                    d = detail.trim(),
+                ),
+                "The launcher cannot safely fast-forward over diverged history. It surfaced a \
+                 Merge / Rebase / Cancel modal in the GUI; if that was dismissed, the update \
+                 did not apply and the launcher still runs the old binary. This entry is the \
+                 durable record so the state is recoverable from a terminal."
+                    .to_string(),
+                format!(
+                    "The user's orchestrator update could not fast-forward: local `{branch}` \
+                     has committed history upstream doesn't have. The update did NOT apply. \
+                     Recommended: surface this at session start. The cleanest fix depends on \
+                     WHY they diverged — if local commits belong on a feature branch, move \
+                     them there and reset `{branch}` to upstream; if `origin` was repointed at \
+                     a private fork, the public upstream is the pull source (the launcher \
+                     pulls from its configured upstream remote, not `origin`). DO NOT blindly \
+                     `git reset --hard` without confirming the local commits are backed up. \
+                     Once `{branch}` can fast-forward, click Update again in the launcher.",
+                    branch = branch,
+                ),
+            )
+        }
+        LauncherUpdateDivergedKind::PartialBinaryRefresh {
+            running,
+            on_disk,
+            detail,
+        } => (
+            "Orchestrator updated, but the launcher binary may be one step behind target"
+                .to_string(),
+            format!(
+                "`WaitForBinaryRefresh` timed out before the on-disk launcher binary reached \
+                 the exact source target, but a NEWER binary than the running one was present \
+                 (running v{running}, on-disk v{on_disk}), so the launcher restarted into it \
+                 anyway (v0.2.55 \"update in any case\"). The remaining gap is usually the \
+                 binary-refresh commit (`chore(binary): refresh … [skip ci]`) not yet pushed \
+                 by the Release workflow, or a transient pull failure. Underlying: `{d}`",
+                running = running,
+                on_disk = on_disk,
+                d = detail.trim(),
+            ),
+            "Non-fatal: the launcher is now newer than before. The update may be a single \
+             version behind the absolute target until the Release workflow's binary-refresh \
+             commit lands; the next update closes the gap."
+                .to_string(),
+            format!(
+                "The user's orchestrator update advanced the launcher (running was v{running}, \
+                 on-disk now v{on_disk}) but may be one version behind the absolute target. \
+                 This is expected briefly while the Release workflow finishes committing the \
+                 refreshed dist binaries. Recommended: mention it's benign and self-resolving; \
+                 if it persists across multiple update attempts over >15 min, the binary-refresh \
+                 commit may have failed — check the repo's latest commit for a \
+                 `chore(binary): refresh` and the Release workflow run.",
+                running = running,
+                on_disk = on_disk,
+            ),
+        ),
+        LauncherUpdateDivergedKind::BinaryRefreshTimeout {
+            running,
+            on_disk,
+            detail,
+        } => {
+            let od = if on_disk.is_empty() { "<unknown>" } else { on_disk };
+            (
+                "Orchestrator update did not deliver a new launcher binary".to_string(),
+                format!(
+                    "`WaitForBinaryRefresh` timed out and NO binary newer than the running \
+                     launcher (v{running}) is on disk (on-disk v{od}). Restarting was aborted \
+                     because re-execing the same old binary would not help. This usually means \
+                     the source pull did not land the binary-refresh commit (a non-FF \
+                     divergence that the re-pull kept failing on, or the Release workflow has \
+                     not pushed the refreshed binaries yet). Underlying: `{d}`",
+                    running = running,
+                    od = od,
+                    d = detail.trim(),
+                ),
+                "The launcher is still on the OLD binary. If a divergence blocked the pull, \
+                 resolve it (see the non-FF guidance). If the binary-refresh commit simply \
+                 hasn't shipped yet, waiting a few minutes and clicking Update again resolves \
+                 it."
+                    .to_string(),
+                format!(
+                    "The user's orchestrator update failed to deliver a new launcher binary — \
+                     it's still on v{running}. Recommended: surface at session start. Check (1) \
+                     whether `git -C {root} status` shows a diverged/non-FF `{branch}` (then \
+                     follow the non-FF recovery), and (2) whether the latest upstream commit \
+                     includes a `chore(binary): refresh` (if not, the Release workflow may \
+                     still be building — wait + retry). Re-run the update via the launcher GUI \
+                     or `python install.py --update` once the pull can advance.",
+                    running = running,
+                    root = install_root_display,
+                    branch = branch,
+                ),
+            )
+        }
+        LauncherUpdateDivergedKind::GitPullFailed { detail } => (
+            "Orchestrator update could not pull from upstream".to_string(),
+            format!(
+                "`git pull` for the orchestrator update failed for a reason that is \
+                 neither a merge conflict nor a fast-forward divergence (e.g. a broken \
+                 local git repo, a detached HEAD, or a missing/misconfigured upstream \
+                 remote). git said: `{d}`",
+                d = detail.trim(),
+            ),
+            "The update did not apply — the launcher is unchanged. The git state needs \
+             attention before the update can proceed."
+                .to_string(),
+            format!(
+                "The user's orchestrator update could not `git pull` from upstream (not a \
+                 conflict, not a non-FF). Recommended: surface at session start, then \
+                 inspect the repo state: `git -C {root} status`, `git -C {root} remote -v`, \
+                 `git -C {root} branch --show-current`. Common causes: detached HEAD (check \
+                 out `{branch}`), missing upstream remote, or an interrupted prior git op \
+                 (look for `.git/MERGE_HEAD` / `.git/rebase-*`). Fix the git state, then \
+                 click Update again or run `python install.py --update`.",
+                root = install_root_display,
+                branch = branch,
+            ),
+        ),
+    };
+
+    let content = format!(
+        "---\n\
+title: VCO Update Deferred\n\
+generated_at: {now}\n\
+condition_ids: [launcher_update_diverged]\n\
+severity_max: warning\n\
+---\n\
+\n\
+# VCO Update Deferred\n\
+\n\
+The last orchestrator update (run from the launcher GUI) hit a condition it could not \
+auto-resolve safely. The section below names the condition and how to recover.\n\
+\n\
+## launcher_update_diverged (warning)\n\
+\n\
+**Title**: {title}\n\
+\n\
+**Detected**: {detected}\n\
+\n\
+**Why deferred**: {why}\n\
+\n\
+**To apply**:\n\
+```bash\n\
+# Option A (recommended): open the launcher GUI and click Update again\n\
+# (top-right MenuBar). If the launcher shows a Merge/Rebase/Cancel modal,\n\
+# choose Rebase to replay upstream cleanly (your local edits are kept).\n\
+#\n\
+# Option B (terminal): from the orchestrator install root, inspect + pull:\n\
+cd {install_root_display}\n\
+git status            # is `{branch}` diverged / non-fast-forward?\n\
+git log --oneline -5  # do you have local commits upstream lacks?\n\
+# Then either resolve the divergence (move local commits to a branch, or\n\
+# pull --rebase from the configured upstream), or wait for the Release\n\
+# workflow's `chore(binary): refresh` commit, then:\n\
+python install.py --update\n\
+# After install.py finishes, fully quit the launcher (tray -> Quit) and\n\
+# relaunch so the freshly-staged binary loads.\n\
+```\n\
+\n\
+**For your Claude assistant** (read this before continuing the user's task):\n\
+{claude_note}\n\
+\n\
+**Detected at**: {now}\n\
+\n\
+---\n",
+        now = now,
+        title = title,
+        detected = detected,
+        why = why,
+        claude_note = claude_note,
+        install_root_display = install_root_display,
+        branch = branch,
+    );
+
+    // Atomic write: temp file in the same directory, then rename.
+    let tmp = parent.join(format!("UPDATE_DEFERRED.md.tmp.{}", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, content.as_bytes()) {
+        eprintln!(
+            "[vct] launcher_update_diverged: write {} failed: {}",
+            tmp.display(),
+            e
+        );
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &target) {
+        eprintln!(
+            "[vct] launcher_update_diverged: rename {} → {} failed: {}",
+            tmp.display(),
+            target.display(),
+            e
+        );
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -2835,6 +3183,93 @@ mod tests {
         );
     }
 
+    /// v0.2.71 MED-2 (honest correction): the COMMON case the prior comment
+    /// OVERSTATED — local appends an ignore rule at EOF AND upstream appends a
+    /// DIFFERENT rule at EOF (an OVERLAPPING diff region). The A0 launcher path
+    /// uses `git merge-file`, which does NOT consult `.gitattributes` drivers,
+    /// so the repo-root `.gitignore merge=union` does NOT apply here: this
+    /// CONFLICTS and A0 produces a `PreservedWithUpstreamSidecar` outcome (the
+    /// upstream copy is written side-by-side + a deferral is emitted), NOT a
+    /// clean `Merged` fold. The local working tree is left untouched (no data
+    /// loss). The previous `.gitignore` test only proved the NON-overlapping
+    /// (start+end) case folds; this proves the overlapping case does NOT — so
+    /// the documented behaviour and the code agree.
+    ///
+    /// NOTE on union: a hand-run `git pull`/`git merge` WOULD union-fold this
+    /// (those consult `.gitattributes`); the A0 `git merge-file` path does not.
+    /// That asymmetry is exactly the accuracy point of MED-2.
+    #[tokio::test]
+    async fn pre_merge_gitignore_overlapping_append_conflicts() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+
+        // Shared base .gitignore in BOTH histories (so the merge-base has the
+        // file → BASE is non-empty for the 3-way). Push it upstream then
+        // fast-forward local so it's the common ancestor content.
+        let base_ignore = "*.log\n*.tmp\n*.swp\n*.bak\n*.pyc\n";
+        push_upstream_change(&seed, &local, ".gitignore", base_ignore);
+        run_git(&local, &["pull", "--ff-only", "vco_upstream", "main"]);
+
+        // Upstream APPENDS its own rule at the END (the last region).
+        push_upstream_change(
+            &seed,
+            &local,
+            ".gitignore",
+            "*.log\n*.tmp\n*.swp\n*.bak\n*.pyc\nupstream_rule/\n",
+        );
+        // Local ALSO appends a DIFFERENT rule at the SAME END region → the two
+        // edits OVERLAP (both touch the trailing context after `*.pyc`), which
+        // `git merge-file` cannot fold and marks as a conflict.
+        let local_body = "*.log\n*.tmp\n*.swp\n*.bak\n*.pyc\nlocal_rule/\n";
+        write_local_mod(&local, ".gitignore", local_body);
+
+        let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
+        let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+        let outcomes = pre_merge_user_editable(&local, &base, &theirs).await.unwrap();
+
+        let gitignore = outcomes
+            .iter()
+            .find(|o| o.path.as_path() == Path::new(".gitignore"))
+            .expect("expected a .gitignore outcome (must NOT be skipped)");
+        match &gitignore.kind {
+            MergeOutcomeKind::PreservedWithUpstreamSidecar {
+                upstream_sidecar_path,
+                ..
+            } => {
+                // Sidecar must hold the UPSTREAM content (the rule git could
+                // not fold into ours).
+                let sidecar = std::fs::read_to_string(upstream_sidecar_path).unwrap();
+                assert!(
+                    sidecar.contains("upstream_rule/"),
+                    "sidecar missing upstream content: {}",
+                    sidecar
+                );
+            }
+            other => panic!(
+                "expected PreservedWithUpstreamSidecar (overlapping append is a \
+                 conflict under merge-file; union would fold it but A0 does NOT), \
+                 got {:?}",
+                other
+            ),
+        }
+        // The local working-tree .gitignore MUST be untouched — A0 never
+        // clobbers OURS on a conflict (no data loss).
+        let local_now = std::fs::read_to_string(local.join(".gitignore")).unwrap();
+        assert_eq!(
+            local_now, local_body,
+            "local .gitignore was modified on a conflict — must stay OURS",
+        );
+        // And it must NOT have been silently union-folded (no upstream rule
+        // merged into the local file).
+        assert!(
+            !local_now.contains("upstream_rule/"),
+            "local .gitignore was union-folded — A0/merge-file must NOT do that, \
+             got:\n{}",
+            local_now,
+        );
+    }
+
     // ----- v0.2.71 BLOCKER-1: the ONE shared conflict classifier -----
     // (gates the destructive resync recovery on both update surfaces — the
     // project rule requires the destructive-decision branch to be tested.)
@@ -3075,5 +3510,168 @@ mod tests {
             PullPlan::RealMerge,
             "clean committed divergence should fold via RealMerge on BOTH surfaces"
         );
+    }
+
+    // ─── launcher_update_diverged durable-logging writer ──────────────────
+    //
+    // RELOCATED v0.2.71 Sweep-A#3 from installer.rs (the writer + enum moved
+    // to this shared module so BOTH update surfaces — the MenuBar-badge
+    // orchestrator update AND the launcher SELF-update — emit the SAME
+    // durable `UPDATE_DEFERRED.md` trace). The writer closes the gap where a
+    // non-FF divergence / a binary-refresh timeout surfaced ONLY as a
+    // transient GUI modal. These tests pin that all four kinds write a
+    // parseable, comprehensive entry under the single `launcher_update_diverged`
+    // condition_id.
+
+    #[test]
+    fn launcher_update_diverged_non_ff_shape_is_comprehensive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let install = dir.path().to_path_buf();
+        write_launcher_update_diverged_deferral(
+            &install,
+            "main",
+            LauncherUpdateDivergedKind::NonFastForward {
+                local_sha: Some("aaaa111".into()),
+                remote_sha: Some("bbbb222".into()),
+                detail: "fatal: Not possible to fast-forward, aborting.".into(),
+            },
+        );
+        let target = install.join(".claude/context/UPDATE_DEFERRED.md");
+        let body = std::fs::read_to_string(&target).expect("read");
+
+        assert!(body.starts_with("---\n"), "YAML frontmatter required");
+        assert!(
+            body.contains("condition_ids: [launcher_update_diverged]"),
+            "frontmatter must carry the condition_id"
+        );
+        assert!(body.contains("## launcher_update_diverged (warning)"));
+        assert!(body.contains("**Title**:"));
+        assert!(body.contains("**Detected**:"));
+        assert!(body.contains("**Why deferred**:"));
+        assert!(body.contains("**To apply**:"));
+        assert!(body.contains("**For your Claude assistant**"));
+        assert!(body.contains("**Detected at**:"));
+        // The non-FF detail + SHAs should be embedded for diagnosis.
+        assert!(body.contains("aaaa111"), "local sha must appear");
+        assert!(body.contains("bbbb222"), "remote sha must appear");
+        assert!(body.contains("python install.py --update"), "CLI recovery");
+    }
+
+    #[test]
+    fn launcher_update_diverged_partial_and_timeout_kinds_render() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let install = dir.path().to_path_buf();
+
+        write_launcher_update_diverged_deferral(
+            &install,
+            "main",
+            LauncherUpdateDivergedKind::PartialBinaryRefresh {
+                running: "0.2.54".into(),
+                on_disk: "0.2.55".into(),
+                detail: "timeout".into(),
+            },
+        );
+        let body =
+            std::fs::read_to_string(install.join(".claude/context/UPDATE_DEFERRED.md")).unwrap();
+        assert!(body.contains("condition_ids: [launcher_update_diverged]"));
+        assert!(body.contains("running v0.2.54"));
+        assert!(body.contains("on-disk v0.2.55"));
+
+        // Overwrite with the timeout kind (single-entry writer).
+        write_launcher_update_diverged_deferral(
+            &install,
+            "main",
+            LauncherUpdateDivergedKind::BinaryRefreshTimeout {
+                running: "0.2.54".into(),
+                on_disk: String::new(), // unknown on-disk
+                detail: "no newer binary".into(),
+            },
+        );
+        let body2 =
+            std::fs::read_to_string(install.join(".claude/context/UPDATE_DEFERRED.md")).unwrap();
+        assert!(body2.contains("did not deliver a new launcher binary"));
+        assert!(
+            body2.contains("on-disk v<unknown>"),
+            "empty on-disk must render as <unknown>; got: {body2}"
+        );
+
+        // v0.2.55 audit R1: the GitPullFailed kind renders under the
+        // same condition_id with git-state recovery guidance.
+        write_launcher_update_diverged_deferral(
+            &install,
+            "main",
+            LauncherUpdateDivergedKind::GitPullFailed {
+                detail: "fatal: not a git repository".into(),
+            },
+        );
+        let body3 =
+            std::fs::read_to_string(install.join(".claude/context/UPDATE_DEFERRED.md")).unwrap();
+        assert!(body3.contains("condition_ids: [launcher_update_diverged]"));
+        assert!(body3.contains("could not pull from upstream"));
+        assert!(
+            body3.contains("not a git repository"),
+            "git detail must be embedded; got: {body3}"
+        );
+    }
+
+    // ─── v0.2.71 Sweep-A#3: self_update surface durable-trace coverage ────
+    //
+    // The whole point of relocating the writer is that the launcher
+    // SELF-update path (`self_update::apply_launcher_update`) can now leave
+    // the SAME durable `UPDATE_DEFERRED.md` trace the installer path already
+    // does. `apply_launcher_update` itself is `#[command]` (needs a Tauri
+    // AppHandle + a real git checkout), so we can't unit-test the command
+    // end-to-end here. Instead we pin the contract self_update relies on:
+    // the SHARED writer, called with the EXACT argument shapes the
+    // self_update failure branches pass (a branch name + a NonFastForward
+    // kind whose detail is the combined git output and whose SHAs come from
+    // `current_sha` / `ls_remote_sha`), produces the frontmatter +
+    // condition-id + recovery shape a terminal Claude can find. If this ever
+    // regresses (e.g. the writer stops emitting the condition_id), the
+    // self_update durable-trace promise breaks here rather than silently in
+    // production.
+    #[test]
+    fn self_update_failure_branch_writes_findable_deferral() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let install = dir.path().to_path_buf();
+
+        // Mirror exactly what `apply_launcher_update`'s non-FF / conflict
+        // return path passes: a NonFastForward kind built from the combined
+        // git output (`e`) + best-effort local/remote SHAs.
+        let combined_git_output =
+            "Auto-merging launcher/src\nCONFLICT (content): Merge conflict in launcher/src";
+        write_launcher_update_diverged_deferral(
+            &install,
+            "main",
+            LauncherUpdateDivergedKind::NonFastForward {
+                local_sha: Some("deadbeef".into()),
+                remote_sha: Some("cafef00d".into()),
+                detail: combined_git_output.into(),
+            },
+        );
+
+        let target = install.join(".claude/context/UPDATE_DEFERRED.md");
+        let body = std::fs::read_to_string(&target)
+            .expect("self_update failure path must leave a durable UPDATE_DEFERRED.md");
+
+        // A terminal Claude keys off the frontmatter condition_id at session
+        // start — that's the load-bearing promise this relocation delivers
+        // to the self_update surface.
+        assert!(body.starts_with("---\n"), "YAML frontmatter required");
+        assert!(
+            body.contains("condition_ids: [launcher_update_diverged]"),
+            "self_update deferral must carry the same condition_id the installer uses"
+        );
+        assert!(body.contains("## launcher_update_diverged (warning)"));
+        assert!(body.contains("**For your Claude assistant**"));
+        // The combined git output (incl. the stdout-only CONFLICT marker) +
+        // the SHAs must be embedded so the failure is diagnosable.
+        assert!(
+            body.contains("CONFLICT (content)"),
+            "combined git output (incl. stdout markers) must be embedded; got: {body}"
+        );
+        assert!(body.contains("deadbeef"), "local sha must appear");
+        assert!(body.contains("cafef00d"), "remote sha must appear");
+        assert!(body.contains("python install.py --update"), "CLI recovery present");
     }
 }

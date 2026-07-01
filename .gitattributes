@@ -71,8 +71,12 @@
 #     so union does NOT apply to the very update that first introduces this
 #     file — it activates on updates AFTER v0.2.56 is committed locally. KG
 #     nodes are usually NEW files (which never conflict), so the practical
-#     gap is small; the launcher's auto-merge path is the primary fix and
-#     this driver is the secondary safety net for hand-run merges.
+#     gap is small. NOTE (see the accuracy block on the v0.2.71 rules below):
+#     this union driver is consulted ONLY by hand-run `git pull`/`git merge`;
+#     the launcher A0 auto-merge path uses `git merge-file`, which ignores
+#     `.gitattributes` drivers entirely. So for an OVERLAPPING-append KG node
+#     the union driver (hand-run merges) is what folds it; the A0 path folds
+#     only the NON-overlapping case and sidecars the overlapping one.
 #   * launcher/dist/** binaries intentionally get NO driver: the auto-merge
 #     path resolves the normal binary-refresh case to upstream, and the
 #     divergence modal correctly surfaces on a rare genuine binary conflict.
@@ -86,9 +90,28 @@ knowledge/**/*.md          merge=union
 # additive. `union` keeps both sides' lines — for ignore-rules a duplicate or
 # extra ignore line is HARMLESS (never breaks anything), unlike CLAUDE.md
 # (modify-heavy, where union would keep contradictory config lines — correctly
-# still NOT union'd). This is the SECONDARY net (forward-only, per the caveat
-# above) for hand-run `git pull`/`git merge`; the PRIMARY fix is the launcher
-# A0 auto-merge path, which now allowlists .gitignore/.gitattributes too.
+# still NOT union'd).
+#
+# ACCURACY (corrected by the v0.2.71 adversarial review — an earlier version
+# of this comment OVERSTATED the A0 path's reach): there are TWO distinct
+# reconciliation paths and they handle the OVERLAPPING-append case
+# DIFFERENTLY, so name the split honestly:
+#   - Hand-run `git pull` / `git merge` DO consult these `.gitattributes`
+#     drivers, so a both-append-at-EOF .gitignore/.gitattributes folds via
+#     `union` (keeps both lines, no conflict). FORWARD-ONLY per the caveat
+#     above (git reads the driver from the merge-base/HEAD side).
+#   - The launcher A0 auto-merge path uses `git merge-file`, a low-level
+#     primitive that does NOT consult `.gitattributes` drivers AT ALL. So
+#     `union` does NOTHING for the A0 path: a both-append-at-EOF overlap
+#     CONFLICTS under merge-file → A0 sidecars the upstream copy + writes a
+#     deferral (no data loss, but NOT a silent union fold). A0 only folds the
+#     NON-overlapping case (local-at-top + upstream-at-bottom).
+# So neither path is unconditionally "primary": for the OVERLAPPING-append
+# case the union driver (hand-run merges) is the only one that folds; for the
+# NON-overlapping case the launcher A0 path folds and union is redundant. The
+# A0 allowlist (now covering .gitignore/.gitattributes) keeps the launcher
+# from poisoning the WHOLE auto-merge into the divergence modal on a benign
+# non-overlapping edit; the union driver here is the hand-run-merge net.
 # Deliberately NOT extended to README.md / docs/**: those CAN have a
 # semantically-wrong union (two contradictory prose sentences kept side by
 # side reads as broken), so they go through the A0 sidecar-on-conflict path
