@@ -1028,6 +1028,15 @@ async fn run_build_task(
     //    (rebuild_code_graph upserts pending → spawn_initial_build),
     //    and we keep them as full passes too for now: incremental
     //    semantics depend on git state we don't necessarily have.
+    //
+    // v0.2.72 (P7): this full pass automatically RESPECTS the code-graph
+    // embedding-revision gate. The gate lives in the analyzer's single
+    // `_write_one_object` choke-point (analyze_code_graph.py), so every
+    // entity written by this rebuild is revision-checked: rows whose stored
+    // `embed_revision` != CODEGRAPH_EMBED_REVISION are FORCED to re-embed
+    // (the ~7-9% of over-budget Function/Class rows P3 chunking invalidated),
+    // while already-current rows hash-skip. No Rust-side flag is needed —
+    // keeping the gate Python-side avoids forking the logic across languages.
     let mut args: Vec<String> = vec![
         folder_path.clone(),
         "--project".to_string(),

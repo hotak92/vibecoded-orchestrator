@@ -361,6 +361,15 @@ fi
 # (`_get_existing_module`, keyed on path+hash) and per-object
 # (`_dedup_insert` content_hash) skip paths, so an unchanged or trivially-
 # edited file writes ~0 objects — "just the hashes" make it a near-no-op.
+#
+# v0.2.72 (P7): the per-object skip also honors the embedding-revision gate.
+# When an edited file contains a Function/Class whose stored `embed_revision`
+# is behind CODEGRAPH_EMBED_REVISION (a row still embedded under the pre-P3
+# pre-chunking scheme), the analyzer FORCES its re-embed even if the body is
+# byte-identical — so a revision mismatch counts as "stale" here and the
+# edited file's stale rows self-heal on this incremental run. Whole-project
+# stale rows in unedited files are re-embedded by the background resync
+# (install.py --update → vco_lib.codegraph_resync), not per-edit.
 # No repo-wide prune happens (single-file mode never deletes other files'
 # rows), so this also can't re-introduce the V52-O.7 prune-deletes-other-
 # rows regression.

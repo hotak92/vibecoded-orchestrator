@@ -244,6 +244,15 @@ if (-not $Python -or -not (Test-Path $Analyzer)) { exit 0 }
 # rows regression. The analyzer also scopes Joern's CPG build to the one file.
 # --canonical-source $CanonRoot dedups git-worktree edits onto the
 # main-checkout object (Bug 3 part b — mirrors the .sh sibling).
+#
+# v0.2.72 (P7): the per-object skip also honors the embedding-revision gate.
+# When an edited file contains a Function/Class whose stored embed_revision is
+# behind CODEGRAPH_EMBED_REVISION (a row still embedded under the pre-P3
+# pre-chunking scheme), the analyzer FORCES its re-embed even if the body is
+# byte-identical — so a revision mismatch counts as "stale" here and the edited
+# file's stale rows self-heal on this incremental run. Whole-project stale rows
+# in unedited files are re-embedded by the background resync (install.py
+# --update -> vco_lib.codegraph_resync), not per-edit. Mirrors the .sh sibling.
 $analyzerArgs = @($Analyzer, $RepoPath, '--project', $ProjectName, '--only-file', $EditedFile, '--canonical-source', $CanonRoot)
 Start-Process -FilePath $Python -ArgumentList $analyzerArgs `
     -WorkingDirectory $RepoPath -WindowStyle Hidden | Out-Null

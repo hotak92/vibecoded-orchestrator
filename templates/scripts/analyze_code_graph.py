@@ -203,7 +203,60 @@ _CONTENT_HASH_FIELDS = {
 _CONTENT_HASH_EXCLUDE = frozenset({
     "content_hash", "last_modified", "project_source", "language",
     "file_path", "start_line", "end_line",
+    # v0.2.72 (P7): the embedding-revision marker is generation metadata, not
+    # semantic content — excluding it keeps the content hash a fixed point so
+    # stamping/bumping the revision never triggers a spurious content-hash
+    # rewrite on the unknown-collection fallback path.
+    "embed_revision",
 })
+
+
+# ── v0.2.72 (P7): code-graph embedding-revision sentinel + forced resync ─────
+#
+# OWNED BY T-RESYNC (P7). This is a NEW top-level constant — it does NOT touch
+# T-SCOPE's ignore-dirs regions or T-CHUNK's chunking/store code. It bumps
+# whenever the way an entity's TEXT is turned into embedding vectors changes in
+# a way that INVALIDATES existing stored vectors — i.e. the same source line now
+# lands in a different embedding than the row already in Weaviate carries.
+#
+# WHY it exists (the P3 chunking change): pre-v0.2.72, an over-budget
+# Function/Class had everything past `_max_chars_for_model` DROPPED from its
+# single embedding (the tail was unsearchable). P3 (T-CHUNK) now CHUNKS such
+# entities into N objects (chunk_num/total_chunks), so every line contributes to
+# some chunk's vector. That means the ~7-9% of entities that were over budget
+# have STALE embeddings: their `function_body`/`class_body` text on disk is
+# unchanged, so the per-object content-hash tombstone-skip (`_write_one_object`)
+# would SKIP them forever and they'd never gain their chunks. The revision gate
+# below forces exactly those rows (revision mismatch) to re-embed, while leaving
+# the 91%+ that already fit untouched (content-hash still matches AND revision
+# matches → skip). Re-running after the resync completes is a cheap no-op (all
+# rows at the current revision).
+#
+# WHY per-object (not per-collection): the skip already does a per-UUID
+# point-read of `content_hash`; adding `embed_revision` to that SAME read costs
+# nothing extra and lets the resync be INCREMENTAL + RESUMABLE — each object
+# self-heals the first time it's visited at the new revision, so an interrupted
+# resync simply continues where it left off (no all-or-nothing marker to
+# reconcile). A per-collection marker would force an all-or-nothing decision and
+# couldn't express "this row is fresh, that row is stale."
+#
+# Storage: the `embed_revision` property is ADDITIVE (mirrors T-CHUNK's
+# `_ensure_chunk_props_property` non-destructive `config.add_property` pattern).
+# Pre-migration rows return NULL `embed_revision` → treated as "revision
+# unknown" → FORCED re-embed (fail-safe toward re-embedding, never a wrong
+# skip), after which they carry the current revision and go stable.
+#
+# Revision history:
+#   1 (v0.2.72, P3): model-aware chunking for over-budget Function/Class
+#     entities. Over-budget tails now chunk instead of truncate → existing
+#     single-object embeddings of those entities are stale.
+CODEGRAPH_EMBED_REVISION: int = 1
+
+# Property name carrying the per-object revision. Kept out of
+# `_CONTENT_HASH_FIELDS` and added to `_CONTENT_HASH_EXCLUDE`-analog handling so
+# stamping it never perturbs the content hash itself (the revision is an
+# embedding-generation marker, NOT semantic content).
+_EMBED_REVISION_PROP = "embed_revision"
 
 
 def _stable_scalar(value: Any) -> str:
@@ -3141,6 +3194,11 @@ class CodeGraphAnalyzer:
                         # pre-v0.2.61 rows → treated as unknown → one-time
                         # re-write, then stable.
                         Property(name="content_hash", data_type=DataType.TEXT, description="SHA-256 of semantically-meaningful content (per-object tombstone-skip)", skip_vectorization=True),
+                        # v0.2.72 (P7): embedding-generation revision this row was
+                        # produced under. NULL/mismatch vs CODEGRAPH_EMBED_REVISION forces
+                        # a re-embed even when content is byte-identical (revision-gated
+                        # forced resync). Excluded from the content hash.
+                        Property(name="embed_revision", data_type=DataType.INT, description="Embedding-generation revision (P7 revision-gated forced resync)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="imports", target_collection=self.coll_module, description="Imported modules"),
@@ -3197,6 +3255,11 @@ class CodeGraphAnalyzer:
                         Property(name="file_path", data_type=DataType.TEXT, description="Repo-relative POSIX path of the source file (mirrors CodeModule.path)", skip_vectorization=True),
                         # v0.2.61 (Track E): per-object content hash (see CodeModule).
                         Property(name="content_hash", data_type=DataType.TEXT, description="SHA-256 of semantically-meaningful content (per-object tombstone-skip)", skip_vectorization=True),
+                        # v0.2.72 (P7): embedding-generation revision this row was
+                        # produced under. NULL/mismatch vs CODEGRAPH_EMBED_REVISION forces
+                        # a re-embed even when content is byte-identical (revision-gated
+                        # forced resync). Excluded from the content hash.
+                        Property(name="embed_revision", data_type=DataType.INT, description="Embedding-generation revision (P7 revision-gated forced resync)", skip_vectorization=True),
                         # v0.2.72 (P3): model-aware chunking. Over-budget classes
                         # (~7-9%) are split into N objects sharing the same
                         # full_name; chunk_num (0-indexed) identifies each chunk,
@@ -3258,6 +3321,11 @@ class CodeGraphAnalyzer:
                         Property(name="file_path", data_type=DataType.TEXT, description="Repo-relative POSIX path of the source file (mirrors CodeModule.path)", skip_vectorization=True),
                         # v0.2.61 (Track E): per-object content hash (see CodeModule).
                         Property(name="content_hash", data_type=DataType.TEXT, description="SHA-256 of semantically-meaningful content (per-object tombstone-skip)", skip_vectorization=True),
+                        # v0.2.72 (P7): embedding-generation revision this row was
+                        # produced under. NULL/mismatch vs CODEGRAPH_EMBED_REVISION forces
+                        # a re-embed even when content is byte-identical (revision-gated
+                        # forced resync). Excluded from the content hash.
+                        Property(name="embed_revision", data_type=DataType.INT, description="Embedding-generation revision (P7 revision-gated forced resync)", skip_vectorization=True),
                         # v0.2.72 (P3): model-aware chunking (see CodeClass).
                         Property(name="chunk_num", data_type=DataType.INT, description="0-indexed chunk number within this entity (0 for single-chunk)", skip_vectorization=True),
                         Property(name="total_chunks", data_type=DataType.INT, description="Total chunks this entity was split into (1 for single-chunk)", skip_vectorization=True),
@@ -3301,6 +3369,11 @@ class CodeGraphAnalyzer:
                         Property(name="project_source", data_type=DataType.TEXT, description="Absolute path of the source root that produced this row (primary repo OR extra-path)", skip_vectorization=True),
                         # v0.2.61 (Track E): per-object content hash (see CodeModule).
                         Property(name="content_hash", data_type=DataType.TEXT, description="SHA-256 of semantically-meaningful content (per-object tombstone-skip)", skip_vectorization=True),
+                        # v0.2.72 (P7): embedding-generation revision this row was
+                        # produced under. NULL/mismatch vs CODEGRAPH_EMBED_REVISION forces
+                        # a re-embed even when content is byte-identical (revision-gated
+                        # forced resync). Excluded from the content hash.
+                        Property(name="embed_revision", data_type=DataType.INT, description="Embedding-generation revision (P7 revision-gated forced resync)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="handler", target_collection=self.coll_function, description="Handler function"),
@@ -3346,6 +3419,11 @@ class CodeGraphAnalyzer:
                         Property(name="project_source", data_type=DataType.TEXT, description="Absolute path of the source root that produced this row (primary repo OR extra-path)", skip_vectorization=True),
                         # v0.2.61 (Track E): per-object content hash (see CodeModule).
                         Property(name="content_hash", data_type=DataType.TEXT, description="SHA-256 of semantically-meaningful content (per-object tombstone-skip)", skip_vectorization=True),
+                        # v0.2.72 (P7): embedding-generation revision this row was
+                        # produced under. NULL/mismatch vs CODEGRAPH_EMBED_REVISION forces
+                        # a re-embed even when content is byte-identical (revision-gated
+                        # forced resync). Excluded from the content hash.
+                        Property(name="embed_revision", data_type=DataType.INT, description="Embedding-generation revision (P7 revision-gated forced resync)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="source_function", target_collection=self.coll_function, description="Function that makes the call"),
@@ -3410,6 +3488,15 @@ class CodeGraphAnalyzer:
         # behave as single-chunk entities until re-analyzed. Additive (no
         # re-index, no data loss). Idempotent + soft-fail per collection.
         self._ensure_chunk_props_property()
+
+        # v0.2.72 (P7) schema migration: ensure `embed_revision` (INT) exists on
+        # all 5 code collections so pre-P7 installs gain the property on the next
+        # analyze run and `_write_one_object` can stamp + read it for the
+        # revision-gated forced resync. Pre-migration rows have NULL
+        # embed_revision → the fingerprint gate forces a re-embed (fail-safe),
+        # after which they carry the current revision and go stable. Additive
+        # (no re-index, no data loss). Idempotent + soft-fail per collection.
+        self._ensure_embed_revision_property()
 
     def _dedup_insert(self, collection, insert_params: dict, identity_key: str,
                       file_path_rel: str = "") -> str:
@@ -3723,25 +3810,49 @@ class CodeGraphAnalyzer:
                 )
             except Exception:  # noqa: BLE001 — hashing must never wedge a write
                 content_hash = ""
+            # ── v0.2.72 (P7): stamp the current embedding revision on every
+            # write. It rides alongside `content_hash` so the NEXT run can tell
+            # whether a byte-identical object was embedded under the CURRENT
+            # embedding-generation scheme (chunking) or a stale one. Don't
+            # clobber a caller-preset value (mirrors the content_hash stamp).
+            if props.get(_EMBED_REVISION_PROP) is None:
+                props[_EMBED_REVISION_PROP] = CODEGRAPH_EMBED_REVISION
             if content_hash:
                 # Persist for the NEXT run's comparison (and don't clobber a
                 # caller-preset value, mirroring the other stamp sites).
                 if not props.get("content_hash"):
                     props["content_hash"] = content_hash
-                # Cheap point-read of the existing stored hash. Any failure is
-                # a fall-through to write (fail-safe), NOT a skip.
+                # Cheap point-read of the existing stored hash + embed_revision.
+                # Any failure is a fall-through to write (fail-safe), NOT a skip.
                 try:
                     query = getattr(collection, "query", None)
                     fetch_by_id = getattr(query, "fetch_object_by_id", None) if query else None
                     if callable(fetch_by_id):
                         existing = fetch_by_id(
-                            det_uuid, return_properties=["content_hash"]
+                            det_uuid,
+                            return_properties=["content_hash", _EMBED_REVISION_PROP],
                         )
                         # fetch_object_by_id returns None when absent.
                         if existing is not None:
                             existing_props = getattr(existing, "properties", None) or {}
                             stored_hash = existing_props.get("content_hash") or ""
-                            if stored_hash and stored_hash == content_hash:
+                            # v0.2.72 (P7): FINGERPRINT GATE. Skip ONLY when BOTH
+                            # (a) the content is byte-identical (content_hash
+                            # matches) AND (b) the stored row was embedded under
+                            # the CURRENT revision. A NULL / mismatched
+                            # embed_revision (pre-migration row, or a row written
+                            # before the P3 chunking bump) FORCES a re-embed even
+                            # when the body text is unchanged — that is exactly
+                            # the ~7-9% over-budget-entity case P7 targets. This
+                            # is fail-safe: any uncertainty falls through to
+                            # write, never to a wrong skip.
+                            stored_rev = existing_props.get(_EMBED_REVISION_PROP)
+                            revision_current = stored_rev == CODEGRAPH_EMBED_REVISION
+                            if (
+                                stored_hash
+                                and stored_hash == content_hash
+                                and revision_current
+                            ):
                                 skip_replace = True
                 except Exception:  # noqa: BLE001
                     # Read error / unsupported client / mocked collection →
@@ -4018,6 +4129,66 @@ class CodeGraphAnalyzer:
                     logger.debug(
                         f"v0.2.72 {prop_name} migration on {label} skipped: {e}"
                     )
+
+    def _ensure_embed_revision_property(self):
+        """v0.2.72 (P7) schema migration: add `embed_revision` (INT) to the
+        5 code collections so pre-P7 installs gain the property on the next
+        analyze run and `_write_one_object` can stamp + read it for the
+        revision-gated forced resync.
+
+        WHY all 5 (not just Function/Class): the fingerprint gate lives in the
+        shared `_write_one_object` write path, which handles EVERY collection.
+        Stamping `embed_revision` uniformly keeps the gate's point-read simple
+        (one property name, one meaning) and lets a FUTURE revision bump that
+        affects Module/API/Interaction embeddings reuse the same machinery
+        without another migration. Today only Function/Class chunk, so only
+        their over-budget rows will actually mismatch and re-embed under
+        revision 1 — the others stamp the revision on their next ordinary write
+        and thereafter match.
+
+        Pre-migration rows have NULL `embed_revision` → the gate treats them as
+        "revision unknown" → FORCED re-embed (fail-safe), after which they carry
+        the current revision and go stable. Adding a property is a
+        non-destructive metadata operation (no re-index, no data loss).
+        Idempotent — an already-present property is skipped silently. Soft-fail
+        per collection. Mirrors `_ensure_content_hash_property` exactly.
+        """
+        collections = [
+            ("CodeModule",      self.modules_collection),
+            ("CodeClass",       self.classes_collection),
+            ("CodeFunction",    self.functions_collection),
+            ("CodeAPI",         self.apis_collection),
+            ("CodeInteraction", self.interactions_collection),
+        ]
+        desc = (
+            "Embedding-generation revision this row's vector(s) were produced "
+            "under (P7 revision-gated forced resync; see CODEGRAPH_EMBED_REVISION)"
+        )
+        for label, coll in collections:
+            if coll is None:
+                continue
+            try:
+                config = coll.config.get()
+                existing_props = {p.name for p in config.properties}
+                if _EMBED_REVISION_PROP in existing_props:
+                    continue
+                coll.config.add_property(
+                    Property(
+                        name=_EMBED_REVISION_PROP,
+                        data_type=DataType.INT,
+                        description=desc,
+                        skip_vectorization=True,
+                    )
+                )
+                print(f"   Added {_EMBED_REVISION_PROP} property to {label} schema (v0.2.72 P7)")
+            except Exception as e:
+                # Soft-fail. A 422 here doesn't break analysis — the revision
+                # gate just sees NULL for this collection until the next
+                # successful migration (which errs toward re-embed, never a
+                # wrong skip).
+                logger.debug(
+                    f"v0.2.72 P7 {_EMBED_REVISION_PROP} migration on {label} skipped: {e}"
+                )
 
     def analyze_repository(self, repo_path: Path, language: Optional[str] = None,
                           incremental: bool = False,
