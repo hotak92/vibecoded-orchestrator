@@ -157,10 +157,11 @@ pub async fn detect_project_git_repo(project_root: String) -> Result<GitRepoDete
 ///      NOT inside a repo, but we re-check here (TOCTOU + defense-in-depth).
 ///   2. Init with `--initial-branch=main`, NO remote (local-only, never pushed).
 ///   3. Append a guard block to the root `.gitignore` so `git add -A` does NOT
-///      swallow NESTED repos (e.g. ARTup's `Code/python/ARTup_platform/` shape):
-///      each immediate-child dir that is itself a git repo is ignored, plus the
-///      VCO runtime paths. We do NOT auto-commit — the repo starts empty so the
-///      user controls what (if anything) they track.
+///      swallow NESTED repos (e.g. the `Code/python/<app>/` shape): every
+///      nested git repo found under the root (bounded-depth descendant walk,
+///      not just immediate children) is ignored, plus the VCO runtime paths.
+///      We do NOT auto-commit — the repo starts empty so the user controls what
+///      (if anything) they track.
 /// Cross-OS: pure `git` invocation via the shared `.silent()` wrapper.
 #[command]
 pub async fn create_local_project_repo(project_root: String) -> Result<(), String> {
@@ -282,6 +283,13 @@ fn find_nested_git_repos(root: &Path) -> Vec<String> {
         for e in entries.flatten() {
             let p = e.path();
             if !p.is_dir() {
+                continue;
+            }
+            // Skip symlinked dirs — following them could re-walk the tree (or
+            // an out-of-tree target) redundantly. The depth cap already bounds
+            // any cycle, but not descending symlinks is cleaner + avoids
+            // ignoring a repo by a path that isn't really under `root`.
+            if e.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
                 continue;
             }
             if p.join(".git").exists() {

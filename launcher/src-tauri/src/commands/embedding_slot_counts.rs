@@ -87,6 +87,15 @@ pub struct SlotCounts {
     /// The profile with the MOST populated objects — the modal's "keep
     /// previous model" smart default. `None` when `slots` is empty.
     pub most_populated_profile: Option<String>,
+    /// v0.2.71 (R1 HIGH fix): when the caller passed `for_profile` (the
+    /// profile the user switched TO), this is the named-vector slot that
+    /// profile embeds into — resolved server-side from the canonical
+    /// `TEXT_SLOT_MAP` so the model-switch modal's "Regenerate now" can enrich
+    /// the collection into it (via `enrich_collection_vectors`) without
+    /// re-deriving the profile->slot map on the frontend. `None` when
+    /// `for_profile` was absent or unresolvable.
+    #[serde(default)]
+    pub target_slot: Option<String>,
 }
 
 impl SlotCounts {
@@ -97,6 +106,7 @@ impl SlotCounts {
             total: 0,
             slots: Vec::new(),
             most_populated_profile: None,
+            target_slot: None,
         }
     }
 }
@@ -129,6 +139,7 @@ fn parse_slot_counts(stdout: &str, fallback_collection: &str) -> SlotCounts {
 #[command]
 pub async fn project_embedding_slot_counts(
     project_id: String,
+    for_profile: Option<String>,
     db: State<'_, Db>,
 ) -> Result<SlotCounts, String> {
     let row = db
@@ -157,9 +168,14 @@ pub async fn project_embedding_slot_counts(
         "slot-counts",
         "--collection",
         &collection,
-    ])
-    .current_dir(&orch_root)
-    .stdin(std::process::Stdio::null());
+    ]);
+    // v0.2.71 (R1 HIGH fix): thread the switched-to profile so the Python side
+    // resolves + returns `target_slot` for the model-switch "Regenerate now".
+    if let Some(profile) = for_profile.as_deref().filter(|p| !p.trim().is_empty()) {
+        cmd.args(["--for-profile", profile]);
+    }
+    cmd.current_dir(&orch_root)
+        .stdin(std::process::Stdio::null());
 
     #[cfg(windows)]
     {
@@ -206,6 +222,29 @@ mod tests {
         assert_eq!(parsed.slots[1].profile, "arctic");
         assert_eq!(parsed.slots[1].populated, 30);
         assert_eq!(parsed.most_populated_profile.as_deref(), Some("qwen3"));
+    }
+
+    #[test]
+    fn parses_target_slot_when_present() {
+        // v0.2.71 R1 HIGH fix: --for-profile makes the Python side add
+        // `target_slot`; the modal's "Regenerate now" enriches into it.
+        let json = concat!(
+            r#"{"collection":"K","total":10,"slots":["#,
+            r#"{"slot":"qwen3_embed","profile":"qwen3","populated":10}],"#,
+            r#""most_populated_profile":"qwen3","target_slot":"arctic2_embed"}"#,
+        );
+        let parsed = parse_slot_counts(json, "fb");
+        assert_eq!(parsed.target_slot.as_deref(), Some("arctic2_embed"));
+    }
+
+    #[test]
+    fn target_slot_defaults_none_when_absent() {
+        // Back-compat: a slot-counts payload WITHOUT target_slot (no
+        // --for-profile) parses fine and leaves target_slot None.
+        let json =
+            r#"{"collection":"K","total":0,"slots":[],"most_populated_profile":null}"#;
+        let parsed = parse_slot_counts(json, "fb");
+        assert_eq!(parsed.target_slot, None);
     }
 
     #[test]

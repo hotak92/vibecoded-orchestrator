@@ -114,7 +114,7 @@
   // ── v0.2.71 Track T-C-modal: model-switch "keep previous model" state ────
   type ModelSwitchState = {
     busy: boolean;
-    decided: 'kept' | null;
+    decided: 'kept' | 'regenerated' | null;
     detail: string;
     error: string | null;
   };
@@ -292,13 +292,31 @@
 
   /**
    * v0.2.71 Track T-C-modal: "Regenerate now" from the model-switch panel.
-   * Re-embeds every still-undecided derived artifact (drop + recreate +
-   * re-sync into the new model's slot). Fires sequentially; if every artifact
-   * ends up decided (none refused) the modal closes. A GUARD refusal leaves
-   * that artifact's card visible below so the user can still Defer it.
+   *
+   * TWO cases:
+   *  (a) Derived-artifact path (`artifacts` non-empty): re-embed every
+   *      still-undecided derived artifact (drop + recreate + re-sync) via the
+   *      per-artifact `apply_stale_derived_choice`.
+   *  (b) PURE model-switch path (`artifacts` empty, `modelSwitch` set): there
+   *      are no schema-stale artifacts — the new profile's vector slot is just
+   *      empty. Enrich the KG collection INTO that slot via the existing
+   *      `enrich_collection_vectors` command (R1 HIGH fix — before this, the
+   *      button looped an empty list and silently closed, doing nothing).
+   *
+   * Fires sequentially; closes only when nothing is left undecided (a GUARD
+   * refusal in case (a) keeps the modal up).
    */
   async function regenerateAll() {
     if (anyBusy) return;
+
+    // Case (b): pure model-switch with no derived artifacts → enrich into the
+    // new profile's slot.
+    if (artifacts.length === 0 && modelSwitch) {
+      await regenerateModelSwitch();
+      return;
+    }
+
+    // Case (a): per-artifact regenerate.
     const undecided = artifacts.filter((a) => rows[a.artifact_name]?.decided === null);
     for (const a of undecided) {
       await choose(a, 'regenerate');
@@ -306,6 +324,58 @@
     // Close only when nothing is left undecided (a refusal keeps the modal up).
     if (artifacts.every((a) => rows[a.artifact_name]?.decided !== null)) {
       onClose();
+    }
+  }
+
+  /**
+   * R1 HIGH fix — the pure model-switch "Regenerate now": enrich the project's
+   * KG collection into the new profile's named-vector slot. Uses the existing
+   * streaming `enrich_collection_vectors` command (the same one the
+   * EnrichmentProgressModal drives). `collection` + `targetSlot` are resolved
+   * server-side (from the canonical TEXT_SLOT_MAP) and carried on the
+   * ModelSwitchContext. If either is missing (probe soft-failed) we cannot
+   * regenerate — surface that and leave Keep/Defer available.
+   */
+  async function regenerateModelSwitch() {
+    if (!modelSwitch) return;
+    if (switchState.busy || switchState.decided !== null) return;
+    const { collection, targetSlot } = modelSwitch;
+    if (!collection || !targetSlot) {
+      switchState = {
+        ...switchState,
+        error:
+          'Could not resolve the collection or target slot to re-embed into ' +
+          '(the embedding probe was unavailable). Try "Keep previous model" ' +
+          'or "Defer", or re-open after the embedding backend is reachable.',
+      };
+      return;
+    }
+    switchState = { ...switchState, busy: true, error: null };
+    try {
+      await invoke('enrich_collection_vectors', {
+        collectionName: collection,
+        newSlot: targetSlot,
+        projectId,
+        dryRun: false,
+      });
+      switchState = {
+        busy: false,
+        decided: 'regenerated',
+        detail: `Re-embedded ${collection} into ${modelSwitch.newProfile} (${targetSlot}).`,
+        error: null,
+      };
+      toast.success(`Re-embedded into ${modelSwitch.newProfile}.`);
+      onClose();
+    } catch (e) {
+      switchState = {
+        busy: false,
+        decided: null,
+        detail: '',
+        error: e instanceof Error ? e.message : String(e),
+      };
+      toast.error(
+        `Regenerate failed: ${e instanceof Error ? e.message : String(e)}`,
+      );
     }
   }
 
@@ -349,6 +419,8 @@
           <span class="rgd-type">Active embedding model</span>
           {#if switchState.decided === 'kept'}
             <span class="rgd-badge rgd-badge-ok">Kept previous</span>
+          {:else if switchState.decided === 'regenerated'}
+            <span class="rgd-badge rgd-badge-ok">Re-embedded</span>
           {/if}
         </div>
 
@@ -370,7 +442,7 @@
         {#if switchState.error}
           <div class="rgd-error">{switchState.error}</div>
         {/if}
-        {#if switchState.decided === 'kept' && switchState.detail}
+        {#if switchState.decided !== null && switchState.detail}
           <div class="rgd-ok">{switchState.detail}</div>
         {/if}
 
@@ -378,11 +450,15 @@
           <div class="rgd-card-actions">
             <button
               class="rgd-btn rgd-btn-primary"
-              disabled={anyBusy}
+              disabled={anyBusy || (artifacts.length === 0 && (!modelSwitch.collection || !modelSwitch.targetSlot))}
               onclick={() => void regenerateAll()}
-              title="Re-embed every node into the new model's slot. Takes time."
+              title={artifacts.length === 0 && (!modelSwitch.collection || !modelSwitch.targetSlot)
+                ? 'Re-embed unavailable — the embedding probe could not resolve the collection/slot.'
+                : "Re-embed every node into the new model's slot. Takes time."}
             >
-              Regenerate now (re-embed into {modelSwitch.newProfile})
+              {switchState.busy && artifacts.length === 0
+                ? `Re-embedding into ${modelSwitch.newProfile}…`
+                : `Regenerate now (re-embed into ${modelSwitch.newProfile})`}
             </button>
             {#if keepCandidate}
               <button

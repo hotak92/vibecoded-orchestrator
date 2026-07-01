@@ -29,6 +29,15 @@ export type ModelSwitchContext = {
   mostPopulatedProfile: string | null;
   /** Aggregate total objects in the collection (the "N" denominator). */
   total: number;
+  /**
+   * v0.2.71 (R1 HIGH fix): the KG collection to enrich when the user picks
+   * "Regenerate now", plus the named-vector slot `newProfile` embeds into
+   * (resolved server-side from the canonical TEXT_SLOT_MAP). Both null when
+   * the slot-count probe soft-failed — in that case "Regenerate now" for the
+   * pure model-switch path is unavailable (the modal still offers Keep/Defer).
+   */
+  collection: string | null;
+  targetSlot: string | null;
 };
 
 /**

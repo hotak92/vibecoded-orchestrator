@@ -16,9 +16,10 @@
   //      remote, nested repos gitignored) so the harness's worktree add
   //      succeeds with the agents' frontmatter unchanged.
   //   3. Opt out ("No .git repo") — subagents run in the shared cwd, no
-  //      isolation. VCO strips the `isolation: worktree` frontmatter from
-  //      the project's agents (enforcement owned by the install/update flow,
-  //      keyed off the persisted mode).
+  //      isolation. The persisted mode is honoured by VCO's SubagentStart
+  //      isolation-check (warns on a shared-tree spawn) + SubagentStop
+  //      reconcile (flags shared-tree writes post-hoc) — the runtime backstops
+  //      that ship this cycle. (No agent-frontmatter rewrite is performed.)
   //
   // ── When it shows ───────────────────────────────────────────────────
   // ONLY when the workspace root is genuinely not inside any repo (detection
@@ -32,9 +33,10 @@
   //   props.projectId   — persists the choice via set_worktree_repo_mode.
   //   props.projectPath — display in the header.
   //   props.onChoose    — called with the chosen mode after persistence
-  //                       ('local_init' | 'no_repo'); parent runs the
-  //                       enforcement side effect (git init / frontmatter
-  //                       strip) — this modal only persists the choice.
+  //                       ('local_init' | 'no_repo'). For 'local_init' the
+  //                       modal itself already ran the git-init side effect;
+  //                       'no_repo' has no side effect (the persisted mode is
+  //                       honoured at runtime by the SubagentStart/Stop hooks).
   //   props.onDismiss   — called on cancel/close; records NOTHING (current
   //                       behaviour preserved — never silently mutate).
 
@@ -150,9 +152,10 @@
           </button>
           <p class="swt-option-text">
             Opt out for this project. Subagents run in the shared working
-            directory (no isolation). VCO removes the
-            <code>isolation: worktree</code> setting from this project's agents
-            so the harness never attempts a worktree. You won't be asked again.
+            directory (no worktree isolation). VCO's <code>SubagentStart</code>
+            hook warns if an agent that requested isolation lands in the shared
+            tree, and <code>SubagentStop</code> flags shared-tree writes after
+            the fact. You won't be asked again.
           </p>
         </div>
       </div>

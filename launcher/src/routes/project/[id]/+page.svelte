@@ -154,8 +154,9 @@
   function onSubagentGitChoose(_mode: 'use_existing' | 'local_init' | 'no_repo') {
     // The modal already persisted the choice + ran the git-init side effect
     // (for local_init). Nothing more to do here — close is handled by the
-    // modal's bindable `open`. The `no_repo` frontmatter-strip enforcement
-    // is owned by the install/update flow keyed off the persisted mode.
+    // modal's bindable `open`. The `no_repo` choice has no filesystem side
+    // effect; it's honoured at runtime by the SubagentStart/Stop hooks that
+    // warn/flag on a shared-tree spawn.
     showSubagentGitModal = false;
   }
   function onSubagentGitDismiss() {

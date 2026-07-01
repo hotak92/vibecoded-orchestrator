@@ -908,6 +908,39 @@ def _text_slot_to_profile(slot_name: str) -> Optional[str]:
     return _TEXT_SLOT_TO_PROFILE.get(slot_name)
 
 
+# Profile -> CURRENT target slot, derived from the canonical `TEXT_SLOT_MAP`
+# in `vco_lib/embedding_service.py` so it can never drift from it. For each
+# selectable profile we take the model id `_model_id_for_active` yields, then
+# resolve that model's slot via `text_slot_for_model` (the same resolver the
+# enrichment/embed path uses). This is the FORWARD direction the model-switch
+# "Regenerate now" needs: given the profile the user switched TO, which slot
+# must we enrich into. (The `_TEXT_SLOT_TO_PROFILE` map above is the reverse
+# projection used by the "keep previous" chooser.)
+def _profile_to_active_slot(profile: str) -> Optional[str]:
+    """Return the CURRENT text named-vector slot a profile embeds into.
+
+    Single-sourced from `embedding_service.TEXT_SLOT_MAP` via the canonical
+    profile->model (`_model_id_for_active`) then model->slot
+    (`_resolve_text_slot`) resolvers, so adding a new profile/slot to the map
+    automatically flows here. Returns None only when `embedding_service` is
+    unimportable (half-installed venv) — a soft-fail the caller treats as "no
+    slot to enrich".
+    """
+    try:
+        from vco_lib.embedding_service import (  # local import: keep module import cheap
+            _model_id_for_active,
+            _resolve_text_slot,
+        )
+    except Exception:
+        return None
+    # `_model_id_for_active` always yields a model id (qwen3 default for an
+    # unknown profile); `_resolve_text_slot` always yields (slot, dim)
+    # (DEFAULT_TEXT_SLOT fallback). So a known profile always resolves.
+    model_id = _model_id_for_active(profile)
+    slot, _dim = _resolve_text_slot(model_id)
+    return slot
+
+
 def count_populated_slots(
     collection: str,
     *,
@@ -1087,6 +1120,16 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--collection", required=True,
         help="Weaviate class name to count (e.g. MyProject_KnowledgeGraph)",
     )
+    counts.add_argument(
+        "--for-profile", default=None,
+        help=(
+            "Optional: the profile the user is switching TO. When given, the "
+            "output also carries `target_slot` — the named-vector slot that "
+            "profile embeds into — so the model-switch modal's 'Regenerate "
+            "now' can enrich the collection into it without re-deriving the "
+            "profile->slot map on the frontend."
+        ),
+    )
     return parser
 
 
@@ -1098,6 +1141,13 @@ def _cli_slot_counts(args: argparse.Namespace) -> int:
     non-zero exit), so the caller's update flow is never blocked.
     """
     result = count_populated_slots(args.collection)
+    # When the caller names the profile they're switching TO, resolve its
+    # current target slot (single-sourced from TEXT_SLOT_MAP) so the modal's
+    # "Regenerate now" can enrich into it. Soft: None on an unresolvable
+    # profile (unimportable embedding_service) — the modal then can't
+    # regenerate, only keep/defer, which it already handles.
+    if getattr(args, "for_profile", None):
+        result["target_slot"] = _profile_to_active_slot(args.for_profile)
     sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
     sys.stdout.flush()
     return 0

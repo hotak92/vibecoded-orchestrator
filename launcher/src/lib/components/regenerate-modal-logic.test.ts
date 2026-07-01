@@ -22,6 +22,8 @@ function ctx(
     newProfile: 'arctic',
     mostPopulatedProfile: null,
     total: 0,
+    collection: null,
+    targetSlot: null,
     ...partial,
   };
 }

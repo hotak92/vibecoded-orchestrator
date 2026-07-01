@@ -1323,6 +1323,73 @@ class SlotCountTests(unittest.TestCase):
         # Unknown future slot → None (dropped from the choice set).
         self.assertIsNone(ee._text_slot_to_profile("future_embed"))
 
+    def test_profile_to_active_slot_forward_map(self):
+        # v0.2.71 R1 HIGH fix: the FORWARD profile→current-slot resolver the
+        # model-switch "Regenerate now" uses to know which slot to enrich into.
+        # Single-sourced from TEXT_SLOT_MAP via _model_id_for_active +
+        # _resolve_text_slot, so these assertions also pin that the canonical
+        # map still yields the expected current slots.
+        self.assertEqual(ee._profile_to_active_slot("qwen3"), "qwen3_embed")
+        self.assertEqual(ee._profile_to_active_slot("arctic"), "arctic2_embed")
+        self.assertEqual(
+            ee._profile_to_active_slot("openai"), "openai_text_embed",
+        )
+        # An unknown profile falls back through _model_id_for_active's qwen3
+        # default → qwen3_embed (never None for a string input, matching the
+        # "conservative default" contract of the underlying resolvers).
+        self.assertEqual(ee._profile_to_active_slot("nonsense"), "qwen3_embed")
+
+    def test_slot_counts_cli_includes_target_slot_when_for_profile(self):
+        # The --for-profile arg must add `target_slot` to the JSON so the Rust
+        # command + modal can enrich into it. Mock count_populated_slots so the
+        # test is offline; assert the CLI merges target_slot on top.
+        import argparse
+        import io
+        import json as _json
+        from contextlib import redirect_stdout
+
+        args = argparse.Namespace(collection="My_KG", for_profile="arctic")
+        with mock.patch.object(
+            ee,
+            "count_populated_slots",
+            return_value={
+                "collection": "My_KG",
+                "total": 5,
+                "slots": [],
+                "most_populated_profile": None,
+            },
+        ):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = ee._cli_slot_counts(args)
+        self.assertEqual(rc, 0)
+        payload = _json.loads(buf.getvalue().strip().splitlines()[-1])
+        self.assertEqual(payload["target_slot"], "arctic2_embed")
+
+    def test_slot_counts_cli_omits_target_slot_without_for_profile(self):
+        import argparse
+        import io
+        import json as _json
+        from contextlib import redirect_stdout
+
+        args = argparse.Namespace(collection="My_KG", for_profile=None)
+        with mock.patch.object(
+            ee,
+            "count_populated_slots",
+            return_value={
+                "collection": "My_KG",
+                "total": 0,
+                "slots": [],
+                "most_populated_profile": None,
+            },
+        ):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = ee._cli_slot_counts(args)
+        self.assertEqual(rc, 0)
+        payload = _json.loads(buf.getvalue().strip().splitlines()[-1])
+        self.assertNotIn("target_slot", payload)
+
     def _kg_collection(self, objects: list[_FakeObject]) -> _FakeClient:
         return _FakeClient({"My_KnowledgeGraph": _FakeCollection(objects)})
 
