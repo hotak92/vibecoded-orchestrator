@@ -8871,11 +8871,16 @@ def _merge_hooks_for_bundle(user_hooks: dict, template_hooks: dict) -> dict:
     def _entry_cmds(entry: dict) -> list[str]:
         if not isinstance(entry, dict):
             return []
-        return [
-            h.get("command")
-            for h in entry.get("hooks", [])
-            if isinstance(h, dict) and h.get("command")
-        ]
+        cmds: list[str] = []
+        for h in entry.get("hooks", []):
+            if not isinstance(h, dict):
+                continue
+            cmd = h.get("command")
+            # Keep only non-empty string commands (drops None + falsy) — this
+            # also narrows the element type to `str` for the return contract.
+            if isinstance(cmd, str) and cmd:
+                cmds.append(cmd)
+        return cmds
 
     for event, t_entries in template_hooks.items():
         if event not in out:
