@@ -101,6 +101,57 @@ fn get_bool_flag(db: &Db, project_id: &str, key: &str) -> Result<bool, String> {
         .unwrap_or(false))
 }
 
+// ─── v0.2.71 T-B-flags: module-id-parameterised bool flag helpers ────────
+//
+// The two `set_bool_flag` / `get_bool_flag` helpers above are pinned to
+// `MODULE_ID = "vct-rl-reranker"`. The T-B-flags pair below needs to write
+// under TWO module_ids — `orchestrator-core` (dual_embedding_write_all_slots)
+// and `vct-rl-reranker` (dual_rl_log_enabled) — so we add explicit
+// module-id-taking variants rather than overloading the pinned ones. Same
+// JSON-bool encoding + `unwrap_or(false)` default contract as the pinned
+// helpers, so the hub resolver's `get_setting(...).as_bool().unwrap_or(false)`
+// reader round-trips byte-identically.
+
+/// Canonical `module_id` the `dual_embedding_write_all_slots` flag lives
+/// under. Orchestrator-core scope (not RL-specific): the flag controls
+/// the embedding service's secondary-slot dual-write, which is an
+/// orchestrator-wide indexing concern.
+const ORCHESTRATOR_CORE_MODULE_ID: &str = "orchestrator-core";
+
+/// Setting key for the per-project "write embeddings to ALL named-vector
+/// slots" flag. Consumed (via the projected `DUAL_EMBEDDING_WRITE_ALL_SLOTS`
+/// env) by `vco_lib/embedding_service.py::_dual_embedding_write_all_slots`.
+const DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY: &str = "dual_embedding_write_all_slots";
+
+/// Setting key for the per-project "also log RL events under the secondary
+/// embedding slot" flag. Consumed (via the projected `DUAL_RL_LOG_ENABLED`
+/// env) by the RL telemetry path in
+/// `claude_mcp_servers/weaviate_mcp/server.py::_resolve_dual_rl_log_enabled`
+/// (T-C). Lives under `vct-rl-reranker` because it gates RL-specific logging.
+const DUAL_RL_LOG_ENABLED_KEY: &str = "dual_rl_log_enabled";
+
+fn set_bool_flag_for_module(
+    db: &Db,
+    project_id: &str,
+    module_id: &str,
+    key: &str,
+    value: bool,
+) -> Result<(), String> {
+    db.set_setting(project_id, module_id, key, &serde_json::Value::Bool(value))
+}
+
+fn get_bool_flag_for_module(
+    db: &Db,
+    project_id: &str,
+    module_id: &str,
+    key: &str,
+) -> Result<bool, String> {
+    Ok(db
+        .get_setting(project_id, module_id, key)?
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false))
+}
+
 /// "Use global model (read-only)" — when true, this project's online
 /// training events are NOT applied to its local model. Project still
 /// reads from the local checkpoint (which equals the last sync from
@@ -196,6 +247,141 @@ pub async fn get_rl_global_training_source_flag(
         return Err("get_rl_global_training_source_flag: project_id required".into());
     }
     get_bool_flag(&db, &project_id, "rl_global_training_source_flag")
+}
+
+// ─── v0.2.71 T-B-flags: dual-write + dual-log per-project flags ───────────
+//
+// Two NEW per-project boolean flags, default OFF, with the launcher.db
+// `module_settings` table as the SINGLE source of truth. Both mirror the
+// well-behaved `module_set_enabled_for_project` reference: write to
+// `module_settings`, resolve in `config_api.rs` into `ProjectConfig`,
+// project to `.claude/settings.json env` via `config_projection.py`.
+//
+//   * `dual_embedding_write_all_slots` (orchestrator-core scope) →
+//     `DUAL_EMBEDDING_WRITE_ALL_SLOTS` env. Before T-B-flags this flag was
+//     env-only with the DB unaware; now the DB is the truth that POPULATES
+//     the env. `embedding_service.py` keeps reading the env as-is.
+//   * `dual_rl_log_enabled` (vct-rl-reranker scope) → `DUAL_RL_LOG_ENABLED`
+//     env. Closes T-C's `TODO(T-B-flags)` in
+//     `weaviate_mcp/server.py::_resolve_dual_rl_log_enabled` (T-C reads the
+//     env; this projection populates it from the DB).
+//
+// Dependency invariant (enforced GUI-side + by the setter guard below):
+// dual-logs ⟹ dual-write. Enabling `dual_rl_log_enabled` requires
+// `dual_embedding_write_all_slots` to be ON, because the secondary-slot RL
+// log rows can only be written if the secondary embedding slot is being
+// populated at all. The setter force-enables the prerequisite when
+// `dual_rl_log_enabled` is turned on so the two flags can never reach the
+// incoherent (log=true, write=false) state.
+
+/// Set the per-project "write embeddings to ALL named-vector slots" flag.
+/// Stored in `module_settings(project_id, "orchestrator-core",
+/// "dual_embedding_write_all_slots")`. Default OFF when no row exists.
+///
+/// Turning this OFF while `dual_rl_log_enabled` is ON would leave the
+/// dependent flag incoherent (RL dual-logging with no secondary slot to
+/// log into). We therefore cascade: disabling the prerequisite also
+/// disables the dependent flag. Enabling has no cascade (the dependent
+/// stays whatever it was).
+#[command]
+pub async fn set_dual_embedding_write_all_slots(
+    project_id: String,
+    value: bool,
+    db: State<'_, Db>,
+) -> Result<(), String> {
+    if project_id.is_empty() {
+        return Err("set_dual_embedding_write_all_slots: project_id required".into());
+    }
+    set_bool_flag_for_module(
+        &db,
+        &project_id,
+        ORCHESTRATOR_CORE_MODULE_ID,
+        DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY,
+        value,
+    )?;
+    // Coherence cascade: a dependent dual-log flag cannot survive its
+    // prerequisite being switched off. Mirror the GUI's grey-out by
+    // force-disabling the dependent here so the DB never holds the
+    // incoherent (log=true, write=false) pair even if the caller bypasses
+    // the GUI (e.g. a direct Tauri invoke or a future scripted setter).
+    if !value {
+        set_bool_flag_for_module(
+            &db,
+            &project_id,
+            MODULE_ID,
+            DUAL_RL_LOG_ENABLED_KEY,
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+/// Read back the persisted "write embeddings to ALL named-vector slots"
+/// flag. Default `false` for a missing row (opt-in).
+#[command]
+pub async fn get_dual_embedding_write_all_slots(
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<bool, String> {
+    if project_id.is_empty() {
+        return Err("get_dual_embedding_write_all_slots: project_id required".into());
+    }
+    get_bool_flag_for_module(
+        &db,
+        &project_id,
+        ORCHESTRATOR_CORE_MODULE_ID,
+        DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY,
+    )
+}
+
+/// Set the per-project "also log RL events under the secondary embedding
+/// slot" flag. Stored in `module_settings(project_id, "vct-rl-reranker",
+/// "dual_rl_log_enabled")`. Default OFF when no row exists.
+///
+/// Dependency: dual-logs ⟹ dual-write. Turning this ON force-enables
+/// `dual_embedding_write_all_slots` (the prerequisite) so the two flags
+/// stay coherent regardless of GUI state. Turning it OFF has no cascade.
+#[command]
+pub async fn set_dual_rl_log_enabled(
+    project_id: String,
+    value: bool,
+    db: State<'_, Db>,
+) -> Result<(), String> {
+    if project_id.is_empty() {
+        return Err("set_dual_rl_log_enabled: project_id required".into());
+    }
+    if value {
+        // Force-enable the prerequisite BEFORE writing the dependent so an
+        // observer can never read (log=true, write=false). dual-logging
+        // requires the secondary slot to be populated.
+        set_bool_flag_for_module(
+            &db,
+            &project_id,
+            ORCHESTRATOR_CORE_MODULE_ID,
+            DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY,
+            true,
+        )?;
+    }
+    set_bool_flag_for_module(
+        &db,
+        &project_id,
+        MODULE_ID,
+        DUAL_RL_LOG_ENABLED_KEY,
+        value,
+    )
+}
+
+/// Read back the persisted "also log RL events under the secondary
+/// embedding slot" flag. Default `false` for a missing row (opt-in).
+#[command]
+pub async fn get_dual_rl_log_enabled(
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<bool, String> {
+    if project_id.is_empty() {
+        return Err("get_dual_rl_log_enabled: project_id required".into());
+    }
+    get_bool_flag_for_module(&db, &project_id, MODULE_ID, DUAL_RL_LOG_ENABLED_KEY)
 }
 
 // ─── Reset / retrain (STUBS for Stream 2) ───────────────────────────────
@@ -353,5 +539,136 @@ mod tests {
         assert!(out.contains(&ids[0]));
         assert!(out.contains(&ids[2]));
         assert!(!out.contains(&ids[1]));
+    }
+
+    // ─── v0.2.71 T-B-flags: dual-write + dual-log flags ──────────────────
+
+    /// Both new flags default to `false` on a missing row, and they live
+    /// under DIFFERENT module_ids (`orchestrator-core` vs `vct-rl-reranker`)
+    /// so they never collide with each other or with the three RL flags
+    /// above.
+    #[test]
+    fn dual_flags_default_false_and_use_distinct_module_ids() {
+        let (db, ids) = open_db_with_projects(1);
+        let p = &ids[0];
+
+        assert!(!get_bool_flag_for_module(
+            &db, p, ORCHESTRATOR_CORE_MODULE_ID, DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY
+        )
+        .unwrap());
+        assert!(!get_bool_flag_for_module(
+            &db, p, MODULE_ID, DUAL_RL_LOG_ENABLED_KEY
+        )
+        .unwrap());
+    }
+
+    /// Per-project `true` overrides the default. Writing one flag does NOT
+    /// flip the other (independent rows under distinct module_ids).
+    #[test]
+    fn dual_flags_set_true_independently() {
+        let (db, ids) = open_db_with_projects(1);
+        let p = &ids[0];
+
+        set_bool_flag_for_module(
+            &db, p, ORCHESTRATOR_CORE_MODULE_ID, DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY, true,
+        )
+        .unwrap();
+        assert!(get_bool_flag_for_module(
+            &db, p, ORCHESTRATOR_CORE_MODULE_ID, DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY
+        )
+        .unwrap());
+        // dual_rl_log untouched.
+        assert!(!get_bool_flag_for_module(&db, p, MODULE_ID, DUAL_RL_LOG_ENABLED_KEY).unwrap());
+    }
+
+    // The dependency cascade lives in the `#[command]` bodies
+    // (`set_dual_rl_log_enabled` / `set_dual_embedding_write_all_slots`),
+    // which take `State<'_, Db>` and can't be constructed in a unit test
+    // without a Tauri runtime. Following the codebase convention
+    // (`list_global_training_source_filters_by_flag` above), we replicate
+    // the setter's cascade LOGIC against the same helper functions the
+    // commands wrap — pinning the invariant without a Tauri context.
+
+    /// Helper mirroring `set_dual_rl_log_enabled`'s body (sans the
+    /// `State`/`project_id.is_empty()` wrapper) so the cascade is unit-
+    /// testable. MUST stay in lock-step with the `#[command]` body.
+    fn apply_set_dual_rl_log(db: &Db, project_id: &str, value: bool) -> Result<(), String> {
+        if value {
+            set_bool_flag_for_module(
+                db, project_id, ORCHESTRATOR_CORE_MODULE_ID,
+                DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY, true,
+            )?;
+        }
+        set_bool_flag_for_module(db, project_id, MODULE_ID, DUAL_RL_LOG_ENABLED_KEY, value)
+    }
+
+    /// Helper mirroring `set_dual_embedding_write_all_slots`'s body.
+    /// MUST stay in lock-step with the `#[command]` body.
+    fn apply_set_dual_write(db: &Db, project_id: &str, value: bool) -> Result<(), String> {
+        set_bool_flag_for_module(
+            db, project_id, ORCHESTRATOR_CORE_MODULE_ID,
+            DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY, value,
+        )?;
+        if !value {
+            set_bool_flag_for_module(db, project_id, MODULE_ID, DUAL_RL_LOG_ENABLED_KEY, false)?;
+        }
+        Ok(())
+    }
+
+    /// Dependency invariant: enabling `dual_rl_log_enabled` force-enables
+    /// the prerequisite `dual_embedding_write_all_slots`. The setter must
+    /// never leave the DB in the incoherent (log=true, write=false) state.
+    #[test]
+    fn dual_rl_log_on_forces_dual_write_on() {
+        let (db, ids) = open_db_with_projects(1);
+        let p = &ids[0];
+
+        // Sanity: both off to start.
+        assert!(!get_bool_flag_for_module(
+            &db, p, ORCHESTRATOR_CORE_MODULE_ID, DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY
+        )
+        .unwrap());
+
+        apply_set_dual_rl_log(&db, p, true).unwrap();
+
+        assert!(
+            get_bool_flag_for_module(&db, p, MODULE_ID, DUAL_RL_LOG_ENABLED_KEY).unwrap(),
+            "dual_rl_log must be true after enabling",
+        );
+        assert!(
+            get_bool_flag_for_module(
+                &db, p, ORCHESTRATOR_CORE_MODULE_ID, DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY
+            )
+            .unwrap(),
+            "enabling dual_rl_log must force-enable dual_embedding_write_all_slots",
+        );
+    }
+
+    /// Cascade the other way: disabling the prerequisite
+    /// `dual_embedding_write_all_slots` while the dependent is ON must also
+    /// disable the dependent, so the DB never holds (log=true, write=false).
+    #[test]
+    fn dual_write_off_cascades_dual_log_off() {
+        let (db, ids) = open_db_with_projects(1);
+        let p = &ids[0];
+
+        // Seed the coherent (both-on) starting point.
+        apply_set_dual_rl_log(&db, p, true).unwrap();
+        assert!(get_bool_flag_for_module(&db, p, MODULE_ID, DUAL_RL_LOG_ENABLED_KEY).unwrap());
+
+        // Now turn the prerequisite OFF — the dependent must cascade off.
+        apply_set_dual_write(&db, p, false).unwrap();
+
+        assert!(
+            !get_bool_flag_for_module(
+                &db, p, ORCHESTRATOR_CORE_MODULE_ID, DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY
+            )
+            .unwrap(),
+            "dual_embedding_write_all_slots must be false after disable",
+        );
+        assert!(
+            !get_bool_flag_for_module(&db, p, MODULE_ID, DUAL_RL_LOG_ENABLED_KEY).unwrap(),
+            "disabling the prerequisite must cascade the dependent off",
+        );
     }
 }
