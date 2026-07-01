@@ -1,6 +1,6 @@
 ﻿# SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-#
+# OS-EXEMPT-PARITY: this .ps1 carries a UTF-8 BOM its .sh sibling must NOT have (PS 5.1 encoding) — the two legitimately diverge on that byte, so a BOM-only edit need not touch the .sh. Keep the LOGIC in lockstep by hand.
 # worktree-guard.ps1 — Windows sibling of worktree-guard.sh. WorktreeCreate
 # hook (Layer 0, primary deterministic gate) for the worktree-isolation
 # silent-fallback safeguard.
