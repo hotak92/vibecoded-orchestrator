@@ -226,7 +226,12 @@ def test_unchanged_object_is_skipped(analyzer_mod: types.ModuleType) -> None:
     det_uuid = analyzer_mod._deterministic_uuid(
         analyzer.project_name, "src/mod.py", "mod.foo"
     )
-    stored_hash = analyzer_mod._content_hash_for_object("T_CodeFunction", params["properties"])
+    # v0.2.72 (P3): a single-chunk CodeFunction is written with chunk_num=0,
+    # which is part of the content hash. In steady state (post-migration) the
+    # stored object's hash reflects that, so seed the store with a hash that
+    # includes chunk_num=0 — else the one-time migration re-write masks the skip.
+    _stored_props = {**params["properties"], "chunk_num": 0}
+    stored_hash = analyzer_mod._content_hash_for_object("T_CodeFunction", _stored_props)
     # Seed the store as if a prior run already indexed this exact object.
     coll = _FakeCollection(
         "T_CodeFunction", store={det_uuid: {"content_hash": stored_hash}}
@@ -358,7 +363,10 @@ def test_skipped_object_still_marked_visited(analyzer_mod: types.ModuleType) -> 
     det_uuid = analyzer_mod._deterministic_uuid(
         analyzer.project_name, "src/mod.py", "mod.foo"
     )
-    stored_hash = analyzer_mod._content_hash_for_object("T_CodeFunction", params["properties"])
+    # v0.2.72 (P3): include chunk_num=0 in the seeded hash (single-chunk steady
+    # state) — see test_unchanged_object_is_skipped for rationale.
+    _stored_props = {**params["properties"], "chunk_num": 0}
+    stored_hash = analyzer_mod._content_hash_for_object("T_CodeFunction", _stored_props)
     coll = _FakeCollection(
         "T_CodeFunction", store={det_uuid: {"content_hash": stored_hash}}
     )

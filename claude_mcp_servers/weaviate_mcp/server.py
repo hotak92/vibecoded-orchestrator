@@ -991,6 +991,26 @@ _TIER_THRESHOLDS: dict[str, float] = {
     "full":         float(os.getenv("KG_TIER_FULL",         "0.75")),
 }
 
+# v0.2.72 (P4): CODE-path tier thresholds — a SEPARATE, lower-calibrated gate
+# than the KG thresholds above. Code cosine similarities run materially lower
+# than KG's (CodeSage-embedded source vs qwen3-embedded prose), so the KG
+# min=0.42 would DISCARD good code matches — this is exactly the v0.2.70 Bug B
+# (code post_rerank_floor is 0.22, so the code tier `min` MUST be <= 0.22 or
+# genuine code hits get thrown away before they can render). We set min=0.22 to
+# match the code retrieval floor, then step the richer tiers up from there:
+#   score < 0.22        → discard (aligned with post_rerank_floor 0.22)
+#   0.22..0.45          → summary (signature + first chunk for code)
+#   0.45..0.60          → single_chunk
+#   0.60..0.75          → three_chunks
+#   >= 0.75             → full (up to 7 chunks)
+# Overridable via CODE_TIER_* env vars (parallel to KG_TIER_*).
+_CODE_TIER_THRESHOLDS: dict[str, float] = {
+    "min":          float(os.getenv("CODE_TIER_MIN",          "0.22")),
+    "single_chunk": float(os.getenv("CODE_TIER_SINGLE_CHUNK", "0.45")),
+    "three_chunks": float(os.getenv("CODE_TIER_THREE_CHUNKS", "0.60")),
+    "full":         float(os.getenv("CODE_TIER_FULL",         "0.75")),
+}
+
 # Per-tier chunk window (how many chunks to assemble from a chunked node)
 _TIER_CHUNK_WINDOW: dict[str, int] = {
     "single_chunk": 1,
@@ -999,22 +1019,31 @@ _TIER_CHUNK_WINDOW: dict[str, int] = {
 }
 
 
-def _get_result_verbosity_by_score(score: float) -> str:
+def _get_result_verbosity_by_score(
+    score: float,
+    thresholds: dict[str, float] | None = None,
+) -> str:
     """Return one of: 'discard' | 'summary' | 'single_chunk' | 'three_chunks' | 'full'.
 
-    Score is normalised 0..1, higher=better. See _TIER_THRESHOLDS for the cutoffs.
+    Score is normalised 0..1, higher=better.
+
+    ``thresholds`` (v0.2.72 P4) selects the tier gate. Default ``None`` →
+    ``_TIER_THRESHOLDS`` (the KG gate, min=0.42) — so KG callers that pass no
+    ``thresholds`` get byte-identical v0.2.71 behaviour. The CODE path passes
+    ``_CODE_TIER_THRESHOLDS`` (min=0.22) so good code matches aren't discarded.
     """
+    t = thresholds if thresholds is not None else _TIER_THRESHOLDS
     try:
         s = float(score)
     except (TypeError, ValueError):
         s = 0.0
-    if s < _TIER_THRESHOLDS["min"]:
+    if s < t["min"]:
         return "discard"
-    if s < _TIER_THRESHOLDS["single_chunk"]:
+    if s < t["single_chunk"]:
         return "summary"
-    if s < _TIER_THRESHOLDS["three_chunks"]:
+    if s < t["three_chunks"]:
         return "single_chunk"
-    if s < _TIER_THRESHOLDS["full"]:
+    if s < t["full"]:
         return "three_chunks"
     return "full"
 
@@ -1090,6 +1119,7 @@ def _allocate_tier_within_budget(
     score: float,
     total_chunks: int,
     remaining_budget: int,
+    thresholds: dict[str, float] | None = None,
 ) -> tuple[str, int]:
     """Pick a tier for one result given its score and the remaining shared budget.
 
@@ -1098,10 +1128,14 @@ def _allocate_tier_within_budget(
     we downgrade through three_chunks → single_chunk → summary until
     something fits. Summary always fits (cost 0).
 
-    A "discard" score (below _TIER_THRESHOLDS["min"]) returns ("discard", 0)
+    A "discard" score (below the gate's ``min``) returns ("discard", 0)
     regardless of budget — discarded results never render.
+
+    ``thresholds`` (v0.2.72 P4) is threaded to ``_get_result_verbosity_by_score``
+    so the CODE path can pass ``_CODE_TIER_THRESHOLDS``. Default ``None`` keeps
+    the KG gate — KG callers pass no new arg → identical v0.2.71 behaviour.
     """
-    score_allowed = _get_result_verbosity_by_score(score)
+    score_allowed = _get_result_verbosity_by_score(score, thresholds)
     if score_allowed == "discard":
         return ("discard", 0)
 
@@ -1361,6 +1395,132 @@ def _format_code_result_by_rank(
             base["siblings"] = sibs
 
     return base
+
+
+def _code_body_field(collection: str) -> str:
+    """Return the body property name for a code collection (P4 helper)."""
+    if collection == "CodeFunction":
+        return "function_body"
+    if collection == "CodeClass":
+        return "class_body"
+    if collection == "CodeModule":
+        return "module_summary"
+    if collection == "CodeAPI":
+        return "api_description"
+    if collection == "CodeInteraction":
+        return "description"
+    return "content"
+
+
+def _format_code_result_by_tier(
+    properties: dict,
+    collection: str,
+    tier: str,
+    *,
+    score: float | None = None,
+    distance: float | None = None,
+    chunk_fetcher=None,
+) -> dict:
+    """Render one code-graph result by SCORE-TIER (v0.2.72 P4).
+
+    The score-tier code renderer — parallel to the KG tier renderer, and a
+    sibling of the rank-based ``_format_code_result_by_rank``. Assembles
+    1/3/7 chunks per tier via ``_TIER_CHUNK_WINDOW`` (single_chunk=1,
+    three_chunks=3, full=7). Designed to be called by the integrator (or
+    T-FLOOR's ``run_code_retrieval_pipeline`` via an injected callable);
+    ``search_code_graph``'s body is NOT rewired here.
+
+    Code has NO ``.node_formats`` sidecar (that's a KG-only artifact), so the
+    ``summary`` tier for code = signature + the first chunk's body (guarded —
+    a sidecar lookup would just return ``None`` and we never dereference it).
+
+    Args:
+        properties: the WINNING chunk's Weaviate properties (already carries
+            ``chunk_num``/``total_chunks`` from _format_obj, plus the body field
+            and signature/full_name).
+        collection: base collection name (CodeFunction / CodeClass / ...).
+        tier: one of "summary" | "single_chunk" | "three_chunks" | "full".
+        score / distance: display metadata.
+        chunk_fetcher: optional callable
+            ``(full_name, hit_chunk_num, total_chunks, max_chunks) -> list[dict]``
+            returning up to ``max_chunks`` chunk-property dicts (matched +
+            neighbours) for the three_chunks / full tiers. ``None`` → the tier
+            degrades to single_chunk (just the matched chunk's body).
+
+    Returns:
+        A result dict with ``collection``/``tier``/``file_path`` + tier body.
+    """
+    body_field = _code_body_field(collection)
+    file_path = _code_result_file_path(collection, properties)
+
+    out: dict = {"collection": collection, "tier": tier, "file_path": file_path}
+    if score is not None:
+        out["score"] = f"{score:.3f}"
+    if distance is not None:
+        out["distance"] = f"{distance:.3f}"
+
+    # Identity fields always present so the agent can locate the entity.
+    if collection in ("CodeFunction", "CodeClass"):
+        out["full_name"] = properties.get("full_name", "")
+        out["signature"] = properties.get("signature", "")
+
+    if tier == "summary":
+        # Code has no sidecar summary. Signature (above) + first chunk body,
+        # truncated for the summary tier. The sidecar lookup is GUARDED — for a
+        # code file_path it returns None and we never dereference it.
+        sidecar = _get_node_format(file_path, "summary", collection) if file_path else None
+        if isinstance(sidecar, str) and sidecar:
+            out["summary"] = sidecar
+        else:
+            body = properties.get(body_field, "") or ""
+            out["summary"] = _truncate_code_field(_strip_chunk_header_text(body), 400)
+        return out
+
+    matched_body = _strip_chunk_header_text(properties.get(body_field, "") or "")
+
+    if tier == "single_chunk" or chunk_fetcher is None:
+        out[body_field] = matched_body
+        out["chunks_shown"] = 1
+        return out
+
+    # three_chunks / full → assemble a window of chunks around the hit.
+    window = _TIER_CHUNK_WINDOW.get(tier, 1)
+    try:
+        hit_chunk = int(properties.get("chunk_num") or 0)
+    except (TypeError, ValueError):
+        hit_chunk = 0
+    try:
+        total = int(properties.get("total_chunks") or 1)
+    except (TypeError, ValueError):
+        total = 1
+    try:
+        chunks = chunk_fetcher(
+            properties.get("full_name", ""), hit_chunk, total, window,
+        ) or []
+    except Exception as exc:  # noqa: BLE001 — best-effort; degrade to single
+        logger.debug("code chunk_fetcher failed: %s", exc)
+        chunks = []
+
+    if not chunks:
+        out[body_field] = matched_body
+        out["chunks_shown"] = 1
+        return out
+
+    assembled = "\n\n".join(
+        _strip_chunk_header_text(c.get(body_field, "") or "") for c in chunks
+    )
+    out[body_field] = assembled or matched_body
+    out["chunks_shown"] = len(chunks)
+    return out
+
+
+def _strip_chunk_header_text(text: str) -> str:
+    """Remove a leading ``[chunk N/total]`` header from a code chunk body.
+
+    Mirror of ``analyze_code_graph._strip_chunk_header`` (must match the
+    header format ``server._parse_chunk_header`` accepts). No-op when absent.
+    """
+    return _CHUNK_HEADER_RE.sub("", text, count=1)
 
 
 def _chunk_summaries_header(
@@ -6381,11 +6541,31 @@ async def _hybrid_search_single_collection(
 def _collapse_to_one_per_node(
     results: list[dict],
     score_field: str = "combined_score",
+    *,
+    key_fields: tuple[str, ...] = ("file_path", "title"),
+    chunk_field: str = "chunk_number",
+    dedup_kind: str = "kg",
 ) -> list[dict]:
     """
     Collapse multi-chunk matches of the same node into a single entry, keeping
     the highest-scoring chunk's full record and recording how many chunks of
     that node matched the query.
+
+    Generalized (v0.2.72 P4) so BOTH the KG path (default args → identical
+    v0.2.71 behaviour) and the CODE path share one collapse:
+      * KG (default): key_fields=("file_path","title"), chunk_field=
+        "chunk_number", dedup_kind="kg" — keys on (file_path, title) exactly
+        as before; the content-identity second pass runs with kind="kg".
+      * CODE: pass key_fields=("file_path","full_name"), chunk_field=
+        "chunk_num", dedup_kind="code" — code chunks share a full_name; the
+        content-identity pass runs with kind="code" (code_identity_key +
+        code body fields).
+
+    KG-SAFETY: every added parameter is keyword-only with a default equal to
+    the v0.2.71 hard-coded value, so the four KG hot-path callers
+    (server.py hybrid_search / semantic_graph_search at 5975/6041/6714/6809)
+    pass no new kwargs and get byte-identical output. The KG parity test
+    (tests/test_collapse_tier_generalized.py) asserts this.
 
     Why: the per-collection dedup keys on (title, chunk_number) — correct for
     merging semantic+keyword hits on the SAME chunk. But two different chunks
@@ -6414,7 +6594,9 @@ def _collapse_to_one_per_node(
     by_node: dict[tuple, dict] = {}
     counts: dict[tuple, int] = {}
     for r in results:
-        key = (r.get("file_path") or "", r.get("title") or "")
+        # Key on the caller-chosen fields. Default ("file_path","title") is the
+        # v0.2.71 KG key; code passes ("file_path","full_name").
+        key = tuple((r.get(f) or "") for f in key_fields)
         counts[key] = counts.get(key, 0) + 1
         existing = by_node.get(key)
         if existing is None or r.get(score_field, 0.0) > existing.get(score_field, 0.0):
@@ -6423,7 +6605,10 @@ def _collapse_to_one_per_node(
     for key, r in by_node.items():
         r = dict(r)  # don't mutate caller's dict
         r["chunks_matched"] = counts[key]
-        r["best_chunk_number"] = r.get("chunk_number")
+        # best_chunk_number reads the caller's chunk field (KG "chunk_number",
+        # code "chunk_num"). Kept under the SAME output key so downstream
+        # consumers (RL, formatters) read it uniformly.
+        r["best_chunk_number"] = r.get(chunk_field)
         collapsed.append(r)
     collapsed.sort(key=lambda x: x.get(score_field, 0.0), reverse=True)
 
@@ -6440,7 +6625,9 @@ def _collapse_to_one_per_node(
         from claude_mcp_servers.rl_client.content_dedup import (
             dedup_by_content_identity,
         )
-        collapsed = dedup_by_content_identity(collapsed, kind="kg")
+        # dedup_kind defaults to "kg" (unchanged); code passes "code" so the
+        # content-identity pass uses code_identity_key + code body fields.
+        collapsed = dedup_by_content_identity(collapsed, kind=dedup_kind)
     except Exception:  # noqa: BLE001 — never break retrieval on a dedup import
         pass
     return collapsed
@@ -7873,6 +8060,47 @@ def _caller_match_terms(target: str) -> list[str]:
     return terms
 
 
+def _pick_canonical_chunk(objects: list):
+    """From a list of Weaviate code objects sharing a full_name, return the
+    CANONICAL (chunk_num == 0) one.
+
+    v0.2.72 (P3): a chunked function/class is stored as N objects that all
+    carry the same ``full_name`` but different ``chunk_num`` (0-indexed). The
+    ``query_code_structure`` lookups (methods / extends / interactions) want
+    THE object for that name — which must be the canonical chunk 0 (it holds
+    the signature-leading body, the methods list, and is the reference target
+    cross-references resolve to).
+
+    Selection: prefer chunk_num == 0; then a legacy row with chunk_num
+    None/absent (single-chunk pre-migration entity); else the lowest chunk_num
+    present; else the first object. Never raises on a missing property.
+    Returns ``None`` for an empty list.
+    """
+    if not objects:
+        return None
+
+    def _cn(o):
+        try:
+            v = o.properties.get("chunk_num")
+        except Exception:  # noqa: BLE001
+            return None
+        return v
+
+    # chunk_num == 0 → canonical.
+    for o in objects:
+        if _cn(o) == 0:
+            return o
+    # legacy single-chunk (property absent/None).
+    for o in objects:
+        if _cn(o) is None:
+            return o
+    # else: lowest chunk_num present.
+    try:
+        return min(objects, key=lambda o: (_cn(o) if _cn(o) is not None else 1 << 30))
+    except Exception:  # noqa: BLE001
+        return objects[0]
+
+
 @mcp.tool()
 def query_code_structure(
     query_type: str,
@@ -7974,31 +8202,38 @@ def query_code_structure(
         elif query_type == "methods":
             # List methods in a class
             coll = client.collections.get(_proj_coll("CodeClass"))
+            # v0.2.72 (P3): a chunked class is N objects sharing full_name;
+            # fetch a few and pick the CANONICAL (chunk_num==0) one, which
+            # carries the methods list + canonical file_path.
             response = coll.query.fetch_objects(
                 filters=with_project(Filter.by_property("full_name").equal(target)),
-                limit=1
+                limit=8
             )
 
-            if not response.objects:
+            canonical = _pick_canonical_chunk(response.objects)
+            if canonical is None:
                 return json.dumps({"success": False, "error": f"Class '{target}' not found"}, indent=2)
 
-            class_file_path = response.objects[0].properties.get("file_path") or response.objects[0].properties.get("path", "")
-            methods = response.objects[0].properties.get("methods", [])
+            class_file_path = canonical.properties.get("file_path") or canonical.properties.get("path", "")
+            methods = canonical.properties.get("methods", [])
             results = [{"name": method, "file_path": class_file_path} for method in methods]
 
         elif query_type == "extends":
             # Find base classes
             coll = client.collections.get(_proj_coll("CodeClass"))
+            # v0.2.72 (P3): pick the canonical chunk (chunk 0 holds the
+            # `extends` references).
             response = coll.query.fetch_objects(
                 filters=with_project(Filter.by_property("full_name").equal(target)),
-                limit=1,
+                limit=8,
                 return_references=["extends"]
             )
 
-            if not response.objects:
+            canonical = _pick_canonical_chunk(response.objects)
+            if canonical is None:
                 return json.dumps({"success": False, "error": f"Class '{target}' not found"}, indent=2)
 
-            extends = response.objects[0].references.get("extends", [])
+            extends = canonical.references.get("extends", [])
             results = [{
                 "name": base.properties.get("name"),
                 "full_name": base.properties.get("full_name"),
@@ -8039,13 +8274,18 @@ def query_code_structure(
             interactions_coll = client.collections.get(_proj_coll("CodeInteraction"))
 
             func_coll = client.collections.get(_proj_coll("CodeFunction"))
+            # v0.2.72 (P3): interaction rows reference the CANONICAL (chunk 0)
+            # function UUID (the analyzer captures chunk-0's UUID as func_uuid).
+            # Resolve the target's canonical chunk so the source_function ref
+            # filter matches.
             func_resp = func_coll.query.fetch_objects(
                 filters=with_project(Filter.by_property("full_name").equal(target)),
-                limit=1
+                limit=8
             )
 
-            if func_resp.objects:
-                source_uuid = str(func_resp.objects[0].uuid)
+            canonical_func = _pick_canonical_chunk(func_resp.objects)
+            if canonical_func is not None:
+                source_uuid = str(canonical_func.uuid)
                 ix_resp = interactions_coll.query.fetch_objects(
                     filters=Filter.by_ref("source_function").by_id().equal(source_uuid),
                     limit=INTERACTIONS_LIMIT
