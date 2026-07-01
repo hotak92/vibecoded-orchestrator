@@ -246,6 +246,151 @@ class TestEmbedRegenHelper:
 
         assert regenerate_node_vector("text", "m", embedding_service=_Svc()) is None
 
+    def test_model_aware_chunk_sizing_truncates_to_model_preset(self) -> None:
+        """The OTHER-slot backfill must size text to the OTHER model's preset.
+
+        A model with a SMALL context (arctic/medium) truncates more than one
+        with a LARGE context (qwen3/xlarge) for the same long body — the chunk
+        asymmetry constraint. We assert the embed callable received a SHORTER
+        sized text for the small-context model than for the large-context one.
+        """
+        from claude_mcp_servers.rl_client.embed_regen import regenerate_node_vector
+
+        seen: dict[str, int] = {}
+
+        def _make_fn(tag):
+            def _fn(sized_text):
+                seen[tag] = len(sized_text)
+                return [0.1, 0.2, 0.3]
+            return _fn
+
+        long_text = "word " * 40000  # well past either preset's max-token cap
+        regenerate_node_vector(long_text, "snowflake-arctic-embed2",
+                               embed_fn=_make_fn("arctic"))
+        regenerate_node_vector(long_text, "qwen3-embedding:0.6b",
+                               embed_fn=_make_fn("qwen3"))
+        # arctic (medium_context max ~3200 tok) truncates harder than qwen3
+        # (xlarge_context max ~13500 tok), so the sized arctic text is shorter.
+        assert seen["arctic"] < seen["qwen3"]
+
+
+# ----------------------------------------------------------------------
+# v0.2.71 Sweep-C — ensure_slot_embedding (compute + async store-back).
+# ----------------------------------------------------------------------
+
+
+class TestEnsureSlotEmbedding:
+    def test_missing_slot_computed_returned_and_store_scheduled(self) -> None:
+        """Active-slot self-heal: a node missing its slot gets the vector
+        computed + returned, and the store-back is scheduled (in an event loop)."""
+        import asyncio
+
+        from claude_mcp_servers.rl_client.embed_regen import (
+            ensure_slot_embedding,
+            _store_back_tasks,
+        )
+
+        class _Svc:
+            def embed_text(self, text):
+                return [0.5, 0.6, 0.7]
+
+        class _Coll:
+            def __init__(self):
+                self.updated = []
+
+            class _Data:
+                def __init__(self, outer):
+                    self._outer = outer
+
+                def update(self, *, uuid, vector):
+                    self._outer.updated.append((uuid, vector))
+
+            @property
+            def data(self):
+                return _Coll._Data(self)
+
+        async def _inner():
+            coll = _Coll()
+            vec = ensure_slot_embedding(
+                "uuid-1", "node content text", "qwen3_embed",
+                "qwen3-embedding:0.6b", coll, _Svc(),
+            )
+            # Vector returned immediately for THIS request.
+            assert vec == [0.5, 0.6, 0.7]
+            # A store-back task was scheduled (strong-ref'd so GC can't drop it).
+            assert len(_store_back_tasks) >= 1
+            # Let the fire-and-forget store run.
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert coll.updated == [("uuid-1", {"qwen3_embed": [0.5, 0.6, 0.7]})]
+
+        asyncio.run(_inner())
+
+    def test_no_text_returns_none_no_store(self) -> None:
+        """Empty/whitespace content → None, no compute, no store."""
+        from claude_mcp_servers.rl_client.embed_regen import ensure_slot_embedding
+
+        class _Svc:
+            def embed_text(self, text):
+                return [1.0]
+
+        assert ensure_slot_embedding(
+            "u", "", "qwen3_embed", "qwen3-embedding:0.6b", object(), _Svc()
+        ) is None
+        assert ensure_slot_embedding(
+            "u", "   ", "qwen3_embed", "qwen3-embedding:0.6b", object(), _Svc()
+        ) is None
+
+    def test_embed_down_returns_none_so_caller_keeps_skip(self) -> None:
+        """When the embed call fails (single-slot install / service down) the
+        OTHER slot is NOT generated → None, caller keeps its skip/drop path."""
+        from claude_mcp_servers.rl_client.embed_regen import ensure_slot_embedding
+
+        class _Svc:
+            def embed_text(self, text):
+                raise RuntimeError("ollama down")
+
+        # embed_fn (other-slot path) also failing → None.
+        def _embed_fn(_text):
+            raise RuntimeError("other model down")
+
+        assert ensure_slot_embedding(
+            "u", "some text", "qwen3_embed", "qwen3-embedding:0.6b",
+            object(), _Svc(), embed_fn=_embed_fn,
+        ) is None
+
+    def test_sync_context_returns_vector_skips_store(self) -> None:
+        """With no running event loop (CLI/sync test) the vector is still
+        returned for immediate use; the store is skipped rather than blocking."""
+        from claude_mcp_servers.rl_client.embed_regen import ensure_slot_embedding
+
+        class _Svc:
+            def embed_text(self, text):
+                return [0.9, 0.8]
+
+        class _Coll:
+            def __init__(self):
+                self.updated = []
+
+            class _Data:
+                def __init__(self, outer):
+                    self._outer = outer
+
+                def update(self, *, uuid, vector):  # pragma: no cover
+                    self._outer.updated.append((uuid, vector))
+
+            @property
+            def data(self):
+                return _Coll._Data(self)
+
+        coll = _Coll()
+        # Called directly (no asyncio.run) → no running loop.
+        vec = ensure_slot_embedding(
+            "u", "text", "qwen3_embed", "qwen3-embedding:0.6b", coll, _Svc()
+        )
+        assert vec == [0.9, 0.8]
+        assert coll.updated == []  # store skipped (no loop), vector still returned
+
 
 # ----------------------------------------------------------------------
 # F-G — enrich attaches n_emb to a node that arrived WITHOUT emb.

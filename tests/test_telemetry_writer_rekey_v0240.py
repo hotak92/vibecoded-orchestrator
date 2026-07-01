@@ -274,5 +274,93 @@ class TelemetryWriterRekeyV0240Test(unittest.TestCase):
         self.assertIsNotNone(w_post)
 
 
+class TelemetryWriterForSlotV0271Test(unittest.TestCase):
+    """v0.2.71 Sweep-C: ``_get_rl_telemetry_writer_for`` is the extracted
+    construction body shared by the active path AND the dual-log other-slot
+    writer. The active path is a thin wrapper that resolves the live triple
+    then delegates; the other-slot writer is just a second cache entry."""
+
+    def setUp(self):
+        import claude_mcp_servers.weaviate_mcp.server as srv
+        srv._reset_rl_telemetry_writers()
+        self._srv = srv
+
+    def tearDown(self):
+        self._srv._reset_rl_telemetry_writers()
+
+    def test_explicit_other_slot_writer_is_separate_cache_entry(self):
+        """An explicit other-slot triple builds (and caches) a SECOND writer
+        keyed on the other source — the dual-log fan-out's writer."""
+        srv = self._srv
+        with patch.dict(os.environ, {"PROJECT_NAME": "ProjectA"}, clear=False):
+            with patch.object(srv, "_try_resolve_project_config", return_value=None):
+                w_active = srv._get_rl_telemetry_writer_for(
+                    "arctic", embedding_dim=1024,
+                    embedding_model="snowflake-arctic-embed2",
+                )
+                w_other = srv._get_rl_telemetry_writer_for(
+                    "qwen3", embedding_dim=1024,
+                    embedding_model="qwen3-embedding:0.6b",
+                )
+        self.assertIsNot(w_active, w_other)
+        self.assertEqual(w_active._embedding_source, "arctic")
+        self.assertEqual(w_other._embedding_source, "qwen3")
+        # Two distinct (project, source) cache entries.
+        self.assertEqual(len(srv._rl_telemetry_writers), 2)
+
+    def test_same_other_source_returns_same_instance(self):
+        """Repeated lookups for the same source are idempotent (one writer)."""
+        srv = self._srv
+        with patch.dict(os.environ, {"PROJECT_NAME": "ProjectA"}, clear=False):
+            with patch.object(srv, "_try_resolve_project_config", return_value=None):
+                w1 = srv._get_rl_telemetry_writer_for(
+                    "qwen3", embedding_dim=1024,
+                    embedding_model="qwen3-embedding:0.6b",
+                )
+                w2 = srv._get_rl_telemetry_writer_for(
+                    "qwen3", embedding_dim=1024,
+                    embedding_model="qwen3-embedding:0.6b",
+                )
+        self.assertIs(w1, w2)
+        self.assertEqual(len(srv._rl_telemetry_writers), 1)
+
+
+class DualRLLogGateV0271Test(unittest.TestCase):
+    """v0.2.71 Sweep-C: the dual-log gate is the AND of the dual-log env flag
+    and the dual-WRITE gate (the hard precondition — the other slot's vectors
+    only exist when dual-write populated them)."""
+
+    def test_off_by_default(self):
+        import claude_mcp_servers.weaviate_mcp.server as srv
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(srv._resolve_dual_rl_log_enabled())
+
+    def test_dual_log_on_but_write_off_is_forced_off(self):
+        """The single most important guard: dual-log requested but dual-write
+        OFF → forced off (no second-slot vectors to log)."""
+        import claude_mcp_servers.weaviate_mcp.server as srv
+        with patch.dict(os.environ, {
+            "DUAL_RL_LOG_ENABLED": "true",
+            # DUAL_EMBEDDING_WRITE_ALL_SLOTS absent → write gate off
+        }, clear=True):
+            self.assertFalse(srv._resolve_dual_rl_log_enabled())
+
+    def test_both_on_enables(self):
+        import claude_mcp_servers.weaviate_mcp.server as srv
+        with patch.dict(os.environ, {
+            "DUAL_RL_LOG_ENABLED": "1",
+            "DUAL_EMBEDDING_WRITE_ALL_SLOTS": "1",
+        }, clear=True):
+            self.assertTrue(srv._resolve_dual_rl_log_enabled())
+
+    def test_slot_short_source_mapping(self):
+        import claude_mcp_servers.weaviate_mcp.server as srv
+        self.assertEqual(srv._slot_short_source("qwen3_embed"), "qwen3")
+        self.assertEqual(srv._slot_short_source("arctic2_embed"), "arctic")
+        self.assertEqual(srv._slot_short_source("openai_text_embed"), "openai")
+        self.assertEqual(srv._slot_short_source("codesage_embed"), "codesage")
+        self.assertEqual(srv._slot_short_source("ollama_embed"), "legacy")
+
+
 if __name__ == "__main__":
     unittest.main()

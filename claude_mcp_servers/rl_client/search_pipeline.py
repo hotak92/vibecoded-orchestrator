@@ -51,7 +51,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -94,6 +93,19 @@ class RerankRequest:
     failed_collections: list[str] = field(default_factory=list)
     # ---- behaviour overrides ----
     spawn_answer_monitor: bool = True
+    # ---- v0.2.71 Sweep-C: dual-RL-log fan-out (the OTHER embedding slot) ----
+    # When ``dual_log`` is True the pipeline emits a SECOND retrieval event tagged
+    # with the other slot's embedding triple, on a deterministic ``:slot``-suffixed
+    # task_id (so the offline loader's per-source corpus picks it up cleanly and the
+    # citation second-event pairs by the same suffixed id). The other-slot per-node
+    # vectors are attached upstream as ``emb_other`` / ``cos_qn_other`` on each
+    # candidate dict (mirrors the existing ``emb`` / ``cos_qn`` enrichment); the
+    # active (bare-task_id) event is byte-unchanged.
+    dual_log: bool = False
+    other_query_emb: Optional[list[float]] = None
+    other_embedding_source: str = ""
+    other_embedding_dim: int = 0
+    other_embedding_model: str = ""
 
 
 @dataclass(frozen=True)
@@ -173,6 +185,14 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
             session_id=req.session_id,
             query=req.query,
             stage_pending_file=True,
+            # v0.2.71 Sweep-C: carry the dual-log decision + other-slot triple
+            # into the staged ctx so the citation second-event (suffixed task_id)
+            # can be emitted at fire time alongside the active citation.
+            dual_log=req.dual_log,
+            other_embedding_source=req.other_embedding_source,
+            other_embedding_dim=req.other_embedding_dim,
+            other_embedding_model=req.other_embedding_model,
+            other_query_emb=req.other_query_emb,
         )
     except Exception as exc:
         logger.debug("rerank_and_emit: citation cache populate failed (%s)", exc)
@@ -206,6 +226,18 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
         logger.debug("rerank_and_emit: emit validation failed (%s)", exc)
     except Exception as exc:
         logger.debug("rerank_and_emit: emit raised (%s)", exc)
+
+    # ---- v0.2.71 Sweep-C: dual-RL-log fan-out (the OTHER embedding slot) ----
+    # 1:1 reuse of the collapsed per-node candidate set (the collapse already ran
+    # upstream of this pipeline), with the other slot's per-node vectors that the
+    # enrichment site attached as ``emb_other`` / ``cos_qn_other``. No second
+    # retrieval. Soft-fail throughout — a broken second emit never affects the
+    # active event, the rerank, or the user-facing search.
+    if req.dual_log:
+        try:
+            _emit_other_slot_event(task_id, req)
+        except Exception as exc:
+            logger.debug("rerank_and_emit: dual-log second emit raised (%s)", exc)
 
     return RerankResult(
         ranked=ranked,
@@ -336,6 +368,11 @@ def _populate_citation_cache(
     session_id: Optional[str] = None,
     query: str = "",
     stage_pending_file: bool = False,
+    dual_log: bool = False,
+    other_embedding_source: str = "",
+    other_embedding_dim: int = 0,
+    other_embedding_model: str = "",
+    other_query_emb: Optional[list[float]] = None,
 ) -> None:
     """Write the per-task entry the answer monitor reads at citation time.
 
@@ -375,6 +412,23 @@ def _populate_citation_cache(
             "project_name": getattr(srv, "PROJECT_NAME", "") or "",
             "task_type": task_type,
         }
+        # v0.2.71 Sweep-C: stage the dual-log decision + the OTHER slot's triple
+        # so the citation second-event (slot-suffixed task_id) can fire at the
+        # same time as the active citation. ``other_nodes`` carries each node's
+        # other-slot vector under ``n_emb`` so ``compute_citation`` can compute
+        # the other-model cosine without re-fetching; suppressed when no node has
+        # the other slot (the second citation event is then skipped downstream).
+        if dual_log:
+            other_nodes = _build_other_slot_log_nodes(candidates, limit)
+            if other_nodes:
+                ctx_dict["dual_log"] = True
+                ctx_dict["other_embedding_source"] = other_embedding_source
+                ctx_dict["other_embedding_dim"] = other_embedding_dim
+                ctx_dict["other_embedding_model"] = other_embedding_model
+                ctx_dict["other_query_emb"] = (
+                    list(other_query_emb) if other_query_emb else None
+                )
+                ctx_dict["other_nodes"] = other_nodes
         srv._rl_node_content_cache[task_id] = ctx_dict
         # LRU bound — pop oldest insertion-order entry until size <= max.
         max_size = getattr(srv, "_RL_NODE_CACHE_MAX", 256)
@@ -485,3 +539,114 @@ def _build_log_nodes(
             rec["score_cosine"] = _clamp_unit_score(n["score_cosine"])
         out.append(rec)
     return out
+
+
+# ---- v0.2.71 Sweep-C: dual-RL-log fan-out helpers ------------------
+
+
+def slot_suffixed_task_id(task_id: str, embedding_source: str) -> str:
+    """Derive the second-slot event's task_id (``<task_id>:<slot>``).
+
+    The hub enforces NO task_id uniqueness and the offline loader pairs the
+    retrieval↔citation events by the bare task_id WITHIN an ``embedding_source``
+    partition (RL-chat contract, 2026-06-30). Applying a deterministic ``:slot``
+    suffix to BOTH the second retrieval event AND the second citation event keeps
+    them paired in the OTHER source's corpus while leaving the ACTIVE-slot pair on
+    the bare ``task_id`` (so the existing single-log path is byte-unchanged). The
+    loader then filters retrievals by ``embedding_source``, so ``<tid>:qwen3`` lands
+    cleanly in the qwen3 corpus and never collides with the active arctic event.
+    """
+    return f"{task_id}:{embedding_source}"
+
+
+def _build_other_slot_log_nodes(
+    candidates: list[dict[str, Any]], limit: int
+) -> list[dict[str, Any]]:
+    """Reduce candidates to telemetry log-nodes using the OTHER slot's vectors.
+
+    Same shape + tiering as ``_build_log_nodes`` but reads ``emb_other`` /
+    ``cos_qn_other`` (attached by the enrichment site for the non-active slot)
+    in place of ``emb`` / ``cos_qn`` / ``n_emb``. Candidates lacking an
+    ``emb_other`` are SKIPPED entirely (the second event only carries nodes for
+    which the other slot's vector genuinely exists — never fabricates). All
+    other fields (score, links, node_type) are reused verbatim from the
+    identical per-node candidate set (case-(a) 1:1 fan-out).
+    """
+    out: list[dict[str, Any]] = []
+    for idx, n in enumerate(candidates):
+        if not isinstance(n, dict):
+            continue
+        emb_other = n.get("emb_other")
+        if not emb_other:
+            # No other-slot vector for this node — skip rather than fabricate.
+            continue
+        rec: dict[str, Any] = {
+            "title": n.get("title", ""),
+            "score": _clamp_unit_score(n.get("score", 0.0)),
+            "tier": "top_k" if idx < limit else "extra_reference",
+            # The other slot's per-node vector serves as BOTH ``emb`` and
+            # ``n_emb`` (the citation cosine side reads ``n_emb`` first).
+            "emb": emb_other,
+            "n_emb": emb_other,
+        }
+        if n.get("node_type"):
+            rec["node_type"] = n["node_type"]
+        if n.get("links"):
+            rec["links"] = n["links"]
+        cos_other = n.get("cos_qn_other")
+        if cos_other is not None:
+            rec["cos_qn"] = cos_other
+        if n.get("score_cosine") is not None:
+            rec["score_cosine"] = _clamp_unit_score(n["score_cosine"])
+        out.append(rec)
+    return out
+
+
+def _emit_other_slot_event(task_id: str, req: "RerankRequest") -> None:
+    """Emit the second (other-slot) retrieval event. Soft-fail, no-op when empty.
+
+    Builds the other-slot log-nodes (skipping candidates with no other-slot
+    vector). When NO candidate has the other slot, the second event is SUPPRESSED
+    (we do not write a node-less happy-path event — that would mis-signal). The
+    writer is the OTHER-slot writer, resolved via ``_get_rl_telemetry_writer_for``
+    keyed on ``other_embedding_source`` (the per-(project, emb_source) cache
+    already isolates the two writers — no new caching code).
+    """
+    other_nodes = _build_other_slot_log_nodes(req.candidates, req.limit)
+    if not other_nodes:
+        logger.debug(
+            "dual-log: no candidate carries the other slot; suppressing second event"
+        )
+        return
+
+    other_src = req.other_embedding_source
+    other_task_id = slot_suffixed_task_id(task_id, other_src or "other")
+
+    def _other_writer_factory():
+        from claude_mcp_servers.weaviate_mcp.server import _get_rl_telemetry_writer_for
+
+        return _get_rl_telemetry_writer_for(
+            other_src,
+            embedding_dim=req.other_embedding_dim,
+            embedding_model=req.other_embedding_model,
+        )
+
+    other_ev = RetrievalEvent(
+        query=req.query,
+        query_emb=req.other_query_emb,
+        embedding_source=other_src,
+        embedding_dim=req.other_embedding_dim,
+        embedding_model=req.other_embedding_model,
+        nodes=other_nodes,
+        task_id=other_task_id,
+        task_type=req.task_type,
+        session_id=req.session_id,
+        failure_mode=req.failure_mode,
+        failed_collections=list(req.failed_collections),
+    )
+    try:
+        emit_rl_event(other_ev, writer_factory=_other_writer_factory)
+    except EmitValidationError as exc:
+        logger.debug("dual-log: second emit validation failed (%s)", exc)
+    except Exception as exc:
+        logger.debug("dual-log: second emit raised (%s)", exc)
