@@ -526,6 +526,10 @@ def _iter_target_files() -> Iterable[Path]:
         ".pytest_cache", "dist", "build", ".cargo", ".rustup",
         # Don't scan our own worktrees (other agents' branches).
         ".claude",
+        # ``.wt`` = orchestrator-created parallel-worktree dir (gitignored,
+        # full repo copies of each in-flight track) — same transient-mirror
+        # class as ``.claude/worktrees``; prune the whole subtree.
+        ".wt",
     }
     for root, dirs, files in _walk_with_pruning(REPO_ROOT, skip_dirs):
         for name in files:

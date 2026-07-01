@@ -33,6 +33,8 @@ UTF8_BOM = b"\xef\xbb\xbf"
 # false-positive offenders that made the test pointlessly flaky.
 _EXCLUDED_PATH_PARTS: tuple[str, ...] = (
     ".claude/worktrees",      # parallel-agent worktrees (per-agent ephemera)
+    ".wt",                    # orchestrator-created parallel-worktree dir (full
+                              # repo copies of in-flight tracks; gitignored)
     "node_modules",           # vendored JS deps (sometimes ship .ps1 wrappers)
     "target",                 # Rust build artifacts
     ".venv",                  # Python virtualenvs

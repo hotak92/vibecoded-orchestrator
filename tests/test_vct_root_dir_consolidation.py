@@ -246,7 +246,11 @@ def test_no_inline_reconstructions_outside_paths_module():
     }
 
     # Walk production code only (skip tests/, .venv/, archive/).
-    skip_dirs = {".venv", "tests", ".git", "node_modules", "archive", "dist"}
+    # ``.wt`` = orchestrator-created parallel-worktree dir (gitignored, holds
+    # full repo copies of each in-flight track) — same class of transient
+    # mirror as ``.claude/worktrees/`` below; skipping the whole subtree keeps
+    # the guard robust to the parallel-worktree release workflow.
+    skip_dirs = {".venv", "tests", ".git", "node_modules", "archive", "dist", ".wt"}
     offenders: list[tuple[Path, int, str]] = []
     for py_file in repo_root.rglob("*.py"):
         # Skip third-party / venv / tests.
