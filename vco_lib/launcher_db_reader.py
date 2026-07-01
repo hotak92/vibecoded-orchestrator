@@ -183,6 +183,29 @@ APP_STATE_KEY_ACTIVE_EMBEDDING = "embedding.active_profile"
 #:     ::APP_STATE_DEFAULT_TEXT_EMBED (canonical string: "default_text_embedding")
 APP_STATE_KEY_DEFAULT_TEXT_EMBED = "default_text_embedding"
 
+# ─── v0.2.71 T-B-emb: per-project active-embedding marker ────────────────────
+#
+# The per-project ACTIVE_EMBEDDING profile + its provenance live in
+# ``module_settings`` under module_id ``orchestrator-core``. Mirror constants:
+#   launcher/src-tauri/src/commands/project_env_settings.rs
+#     ::ORCHESTRATOR_CORE_MODULE_ID / ::ACTIVE_EMBEDDING_SETTING_KEY /
+#     ::ACTIVE_EMBEDDING_SOURCE_SETTING_KEY /
+#     ::ACTIVE_EMBEDDING_SOURCE_USER / ::ACTIVE_EMBEDDING_SOURCE_AUTO
+# The hub config_api.rs resolver + config_projection.py use the same cascade:
+# a source=="user" per-project row is sticky; "auto" / legacy-no-marker / absent
+# rows inherit the machine-global ``app_state[embedding.active_profile]``.
+
+#: module_settings module_id that owns the per-project active-embedding rows.
+ORCHESTRATOR_CORE_MODULE_ID = "orchestrator-core"
+#: setting_key for the per-project ACTIVE_EMBEDDING profile value.
+ACTIVE_EMBEDDING_SETTING_KEY = "active_embedding"
+#: setting_key for the provenance marker companion row.
+ACTIVE_EMBEDDING_SOURCE_SETTING_KEY = "active_embedding_source"
+#: marker value: deliberate Settings-tab user pick (sticky across updates).
+ACTIVE_EMBEDDING_SOURCE_USER = "user"
+#: marker value: startup-backfill auto-seed (inherits the global default).
+ACTIVE_EMBEDDING_SOURCE_AUTO = "auto"
+
 #: TEXT model id → ACTIVE_EMBEDDING named-vector slot ("profile").
 #:
 #: MUST match (and is the importable shared home for what was previously

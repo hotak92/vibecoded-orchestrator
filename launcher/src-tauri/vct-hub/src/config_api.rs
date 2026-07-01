@@ -66,6 +66,7 @@ use serde::{Deserialize, Serialize};
 
 use rusqlite::params;
 use vct_launcher_core::config::LocalConfig;
+use vct_launcher_core::db::Db;
 
 use super::modules_api::LauncherDbHandle;
 use super::retrieval_tuning_io::{read_tuning, RetrievalTuning};
@@ -121,6 +122,81 @@ fn default_schema_version() -> u8 {
 #[allow(dead_code)]
 fn default_true_bool() -> bool {
     true
+}
+
+// ─── v0.2.71 T-B-emb: active-embedding cascade (B1 bridge) ────────
+//
+// The hub resolver leg of the ONE active-embedding cascade. Kept
+// byte-identical in behaviour to the launcher's
+// `project_env_settings.rs::resolve_active_embedding_cascade` and the
+// Python `config_projection.py` writer. The hub crate depends on
+// vct-launcher-core but NOT the launcher binary crate where
+// `active_profile_for_model` lives, so the model→profile map is mirrored
+// here behind a "must match" comment (same cross-lang-mirror discipline
+// as the shared-KG const + the three model→profile maps).
+
+/// TEXT model id → ACTIVE_EMBEDDING profile.
+///
+/// MUST match (drift re-introduces v0.2.68 Defect D):
+///   * `project_env_settings.rs::active_profile_for_model`
+///   * `vco_lib/launcher_db_reader.py::_TEXT_MODEL_ACTIVE_EMBEDDING`
+///   * `install.py::_TEXT_MODEL_ACTIVE_EMBEDDING`
+fn hub_active_profile_for_model(model_id: &str) -> Option<&'static str> {
+    match model_id.trim() {
+        "qwen3-embedding:0.6b" => Some("qwen3"),
+        "snowflake-arctic-embed2:latest" => Some("arctic"),
+        "openai-text-embedding-3-small" => Some("openai"),
+        "text-embedding-3-small" => Some("openai"),
+        _ => None,
+    }
+}
+
+/// Machine-global active-embedding profile from `app_state`:
+/// `embedding.active_profile` → `default_text_embedding` (mapped) → None.
+/// Mirrors `project_env_settings.rs::global_active_embedding`.
+fn hub_global_active_embedding(db: &Db) -> Option<String> {
+    db.app_state_get("embedding.active_profile")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            db.app_state_get("default_text_embedding")
+                .ok()
+                .flatten()
+                .and_then(|model_id| hub_active_profile_for_model(&model_id))
+                .map(|p| p.to_string())
+        })
+}
+
+/// Resolve ACTIVE_EMBEDDING for a project (B1 two-DB-location bridge).
+///
+/// Cascade (LOCKED — must match the launcher + Python resolvers):
+///   1. per-project `module_settings/orchestrator-core/active_embedding`
+///      WHERE `active_embedding_source == "user"` → verbatim (sticky).
+///   2. machine-global default (`hub_global_active_embedding`).
+///   3. `"qwen3"`.
+///
+/// Soft-fail on every read. An "auto" marker, a legacy NO-marker row, or an
+/// absent per-project row all fall to leg 2 (inherit global).
+fn resolve_active_embedding_for_hub(db: &Db, project_id: &str) -> String {
+    let source = db
+        .get_setting(project_id, "orchestrator-core", "active_embedding_source")
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_str().map(String::from));
+    if source.as_deref() == Some("user") {
+        if let Some(value) = db
+            .get_setting(project_id, "orchestrator-core", "active_embedding")
+            .ok()
+            .flatten()
+            .and_then(|v| v.as_str().map(String::from))
+            .filter(|s| !s.is_empty())
+        {
+            return value;
+        }
+        // source=user but the value row is missing/empty — fall through.
+    }
+    hub_global_active_embedding(db).unwrap_or_else(|| "qwen3".to_string())
 }
 
 // ─── Router ──────────────────────────────────────────────────────
@@ -527,15 +603,26 @@ async fn project_config(
     diagrams_access_list.sort();
     diagrams_access_list.dedup();
 
-    // 6. active_embedding (module_settings → orchestrator-core).
-    // Default 'qwen3' matches the launcher's compiled default.
-    let active_embedding = h
-        .0
-        .get_setting(&project.id, "orchestrator-core", "active_embedding")
-        .ok()
-        .flatten()
-        .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_else(|| "qwen3".to_string());
+    // 6. active_embedding — v0.2.71 T-B-emb cascade (B1 two-DB-location bridge).
+    //
+    // The SAME cascade as launcher `project_env_settings.rs::
+    // resolve_active_embedding_cascade` + the Python `config_projection.py`
+    // writer (cross-surface lockstep — a hub read and a GUI write/populate
+    // can NEVER disagree, the Defect-D class):
+    //
+    //   1. per-project module_settings/orchestrator-core/active_embedding
+    //      WHERE active_embedding_source == "user" (sticky pick) → verbatim.
+    //   2. machine-global app_state[embedding.active_profile], then the
+    //      hardware-pick derive (app_state[default_text_embedding] → profile).
+    //      This is the BRIDGE: a non-user project yields to the global value
+    //      the launcher/install.py also computed, so the two DB locations
+    //      (app_state vs per-project module_settings) can't diverge.
+    //   3. "qwen3" final fallback.
+    //
+    // An "auto" marker OR a legacy NO-marker per-project row both fall to
+    // leg 2 (inherit global) — the LOCKED v0.2.71 decision that fixes the
+    // Fabio auto-qwen3 case (a backfill-stamped qwen3 with no provenance).
+    let active_embedding = resolve_active_embedding_for_hub(&h.0, &project.id);
 
     // 7. shared_kg_write_disabled (module_settings → orchestrator-core).
     // Default false — match the access-matrix audit's "asymmetric
@@ -2431,8 +2518,10 @@ kg_tier_full = 0.8
 
     #[tokio::test]
     async fn config_emits_active_embedding_from_module_settings() {
-        // When module_settings has an explicit value, it overrides the
-        // default 'qwen3'.
+        // v0.2.71 T-B-emb: a STICKY per-project pick (value + source=user)
+        // overrides the default 'qwen3'. (Pre-v0.2.71 this test set only the
+        // value with no marker; under the provenance cascade a no-marker row
+        // inherits the global default, so the value alone no longer pins.)
         let (base, h) = spawn_config_api_hub().await;
         seed_full_project(&h, "p-openai", "myproject");
         h.0.set_setting(
@@ -2440,6 +2529,13 @@ kg_tier_full = 0.8
             "orchestrator-core",
             "active_embedding",
             &serde_json::Value::String("openai".to_string()),
+        )
+        .unwrap();
+        h.0.set_setting(
+            "p-openai",
+            "orchestrator-core",
+            "active_embedding_source",
+            &serde_json::Value::String("user".to_string()),
         )
         .unwrap();
         h.0.set_setting(
@@ -2461,6 +2557,92 @@ kg_tier_full = 0.8
         assert_eq!(
             body.get("shared_kg_write_disabled").and_then(|v| v.as_bool()),
             Some(true)
+        );
+    }
+
+    /// v0.2.71 T-B-emb — BRIDGE (B1): a non-user project's hub resolve
+    /// reads the machine-global app_state[embedding.active_profile], so a
+    /// GUI/Identity-tab write reaches the hub-read path (no Defect-D
+    /// disagreement). Here: NO per-project user pick, global=arctic.
+    #[tokio::test]
+    async fn config_active_embedding_bridges_global_app_state() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-bridge", "bridgeproj");
+        // GUI Identity-tab style global write.
+        h.0.app_state_set("embedding.active_profile", "arctic").unwrap();
+        // No per-project active_embedding row at all → inherit global.
+
+        let resp = reqwest::get(format!("{}/projects/p-bridge/config", base))
+            .await
+            .expect("hub reachable");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("active_embedding").and_then(|v| v.as_str()),
+            Some("arctic"),
+            "non-user project must inherit the global app_state profile (B1 bridge)"
+        );
+    }
+
+    /// v0.2.71 T-B-emb — Fabio case: a legacy per-project value row with NO
+    /// source marker INHERITS the global default rather than pinning its
+    /// stored (auto-stamped) qwen3 value.
+    #[tokio::test]
+    async fn config_active_embedding_legacy_no_marker_inherits_global() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-legacy", "legacyproj");
+        // Global hardware pick is arctic.
+        h.0.app_state_set("default_text_embedding", "snowflake-arctic-embed2:latest")
+            .unwrap();
+        // Legacy backfill stamped qwen3 with NO source marker.
+        h.0.set_setting(
+            "p-legacy",
+            "orchestrator-core",
+            "active_embedding",
+            &serde_json::Value::String("qwen3".to_string()),
+        )
+        .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/p-legacy/config", base))
+            .await
+            .expect("hub reachable");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("active_embedding").and_then(|v| v.as_str()),
+            Some("arctic"),
+            "legacy no-marker row must inherit the global default (Fabio fix)"
+        );
+    }
+
+    /// v0.2.71 T-B-emb — source=auto explicitly inherits global, not its
+    /// stored value.
+    #[tokio::test]
+    async fn config_active_embedding_source_auto_inherits_global() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-auto", "autoproj");
+        h.0.app_state_set("embedding.active_profile", "openai").unwrap();
+        h.0.set_setting(
+            "p-auto",
+            "orchestrator-core",
+            "active_embedding",
+            &serde_json::Value::String("qwen3".to_string()),
+        )
+        .unwrap();
+        h.0.set_setting(
+            "p-auto",
+            "orchestrator-core",
+            "active_embedding_source",
+            &serde_json::Value::String("auto".to_string()),
+        )
+        .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/p-auto/config", base))
+            .await
+            .expect("hub reachable");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("active_embedding").and_then(|v| v.as_str()),
+            Some("openai"),
+            "source=auto must inherit the global default, not pin stored qwen3"
         );
     }
 

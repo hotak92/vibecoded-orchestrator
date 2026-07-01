@@ -259,7 +259,12 @@ from typing import Any, Iterable, Mapping, Optional, TypedDict
 
 from vco_lib.atomic import atomic_write_text
 from vco_lib.launcher_db_reader import (
+    ACTIVE_EMBEDDING_SETTING_KEY,
+    ACTIVE_EMBEDDING_SOURCE_SETTING_KEY,
+    ACTIVE_EMBEDDING_SOURCE_USER,
+    APP_STATE_KEY_ACTIVE_EMBEDDING,
     APP_STATE_KEY_DEFAULT_TEXT_EMBED,
+    ORCHESTRATOR_CORE_MODULE_ID,
     profile_for_text_model,
 )
 
@@ -822,6 +827,58 @@ def _fetch_app_state_str(
         return None
     stripped = raw.strip()
     return stripped if stripped else None
+
+
+def _global_active_embedding(conn: sqlite3.Connection) -> Optional[str]:
+    """Machine-global active-embedding profile from ``app_state``.
+
+    ``app_state[embedding.active_profile]`` → ``app_state[default_text_embedding]``
+    mapped via :func:`profile_for_text_model` → ``None``. Mirror of
+    ``project_env_settings.rs::global_active_embedding`` (and the hub's
+    ``hub_global_active_embedding``).
+    """
+    explicit = _fetch_app_state_str(conn, APP_STATE_KEY_ACTIVE_EMBEDDING)
+    if explicit:
+        return explicit
+    return profile_for_text_model(
+        _fetch_app_state_str(conn, APP_STATE_KEY_DEFAULT_TEXT_EMBED)
+    )
+
+
+def _resolve_active_embedding_cascade(
+    conn: sqlite3.Connection,
+    project_id: str,
+) -> str:
+    """Resolve ACTIVE_EMBEDDING for a project — the ONE shared cascade.
+
+    LOCKED order (must match ``project_env_settings.rs::
+    resolve_active_embedding_cascade`` + the hub ``config_api.rs``
+    resolver byte-for-byte — cross-surface lockstep prevents the
+    Defect-D class of GUI-write-vs-hub-read disagreement):
+
+      1. per-project ``module_settings/orchestrator-core/active_embedding``
+         WHERE ``active_embedding_source == "user"`` → returned verbatim
+         (sticky deliberate pick).
+      2. machine-global default (:func:`_global_active_embedding`).
+      3. ``"qwen3"`` final fallback.
+
+    An ``"auto"`` marker, a legacy NO-marker per-project row, or an absent
+    per-project row all fall to leg 2 (inherit the global default). Every
+    read is soft-fail.
+    """
+    source = _fetch_module_setting_str_opt(
+        conn, project_id, ORCHESTRATOR_CORE_MODULE_ID,
+        ACTIVE_EMBEDDING_SOURCE_SETTING_KEY,
+    )
+    if source == ACTIVE_EMBEDDING_SOURCE_USER:
+        value = _fetch_module_setting_str_opt(
+            conn, project_id, ORCHESTRATOR_CORE_MODULE_ID,
+            ACTIVE_EMBEDDING_SETTING_KEY,
+        )
+        if value:
+            return value
+        # source=user but the value row is missing/empty — fall through.
+    return _global_active_embedding(conn) or "qwen3"
 
 
 def _fetch_kg_bindings(
@@ -1430,36 +1487,29 @@ def project_env_from_db(
         if active_embedding_override is not None:
             active_embedding = active_embedding_override
         else:
-            # v0.2.69 FIX 1 (Defect D add-path gap): this is the
-            # LOAD-BEARING ACTIVE_EMBEDDING writer — the value here is what
-            # lands in .claude/{settings.json,env} (the Rust populate() value
-            # does NOT reach those canonical surfaces). The per-project
-            # `module_settings/active_embedding` row was hardcoded to "qwen3"
-            # by project_backfill.rs for every project, so a fresh add on an
-            # arctic host wrote ACTIVE_EMBEDDING=qwen3 and broke the
-            # arctic-trained RL reranker.
+            # v0.2.71 T-B-emb: the LOAD-BEARING ACTIVE_EMBEDDING writer.
+            # The value here is what lands in .claude/{settings.json,env}
+            # (the Rust populate() value does NOT reach those canonical
+            # surfaces). Resolve via the ONE cascade — must match
+            # project_env_settings.rs::resolve_active_embedding_cascade +
+            # the hub config_api.rs resolver EXACTLY (cross-surface lockstep,
+            # the Defect-D class):
             #
-            # When the row is ABSENT or still the legacy default "qwen3",
-            # fall back to the machine's hardware pick
-            # (app_state[default_text_embedding]) mapped to its profile,
-            # BEFORE defaulting to qwen3. Mirror of project_backfill.rs's
-            # seed-derive + default-value reconcile and the Rust populate()
-            # canonical-key-empty fallback (option c, both languages).
+            #   1. per-project module_settings/orchestrator-core/active_embedding
+            #      WHERE active_embedding_source == "user" → verbatim (sticky).
+            #   2. machine-global app_state[embedding.active_profile], then the
+            #      hardware-pick derive (app_state[default_text_embedding] →
+            #      profile). This is the BRIDGE: a non-user project yields to
+            #      the global value the launcher/install.py also computed.
+            #   3. "qwen3" final fallback.
             #
-            # GUARD: an unmapped/absent hardware pick → stay qwen3. Never
-            # stamp a guessed profile (wrong vector slot). An explicit
-            # non-qwen3 user pick already in the row (e.g. "openai") is left
-            # untouched — only the absent / legacy-"qwen3" value derives.
-            stored_active = _fetch_module_setting_str_opt(
-                conn, project_id, "orchestrator-core", "active_embedding",
-            )
-            if stored_active is None or stored_active == "qwen3":
-                derived = profile_for_text_model(
-                    _fetch_app_state_str(conn, APP_STATE_KEY_DEFAULT_TEXT_EMBED)
-                )
-                active_embedding = derived if derived is not None else "qwen3"
-            else:
-                active_embedding = stored_active
+            # An "auto" marker OR a legacy NO-marker per-project row both fall
+            # to leg 2 (inherit global) — the LOCKED v0.2.71 decision that
+            # supersedes the brittle pre-v0.2.71 "stored == qwen3" heuristic
+            # and fixes the Fabio auto-qwen3 case (a backfill-stamped qwen3 with
+            # no provenance). GUARD on the derive: an unmapped/absent hardware
+            # pick → stay qwen3 (never stamp a guessed profile → wrong slot).
+            active_embedding = _resolve_active_embedding_cascade(conn, project_id)
     finally:
         try:
             conn.close()

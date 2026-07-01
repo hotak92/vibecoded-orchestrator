@@ -9851,6 +9851,14 @@ _EMBEDDING_MODEL_DIMS = {
 # model override that doesn't re-point this slot would write vectors
 # from one model into a slot labelled for another (the 2026-04-30
 # vector-audit bug class).
+#
+# This map is the model→profile half of the v0.2.71 T-B-emb active-embedding
+# cascade. It MUST stay byte-identical to its mirrors (drift re-introduces the
+# v0.2.68 Defect D bug — see project_env_settings.rs:78-87):
+#   * launcher/src-tauri/src/commands/project_env_settings.rs
+#       ::active_profile_for_model
+#   * launcher/src-tauri/vct-hub/src/config_api.rs::hub_active_profile_for_model
+#   * vco_lib/launcher_db_reader.py::_TEXT_MODEL_ACTIVE_EMBEDDING
 _TEXT_MODEL_ACTIVE_EMBEDDING = {
     "qwen3-embedding:0.6b": "qwen3",
     "snowflake-arctic-embed2:latest": "arctic",
