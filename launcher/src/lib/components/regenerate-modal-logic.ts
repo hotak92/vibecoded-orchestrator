@@ -58,6 +58,28 @@ export function pickKeepCandidate(
 }
 
 /**
+ * The count to DISPLAY next to "keep previous model" for a given profile.
+ *
+ * v0.2.71 (L2 fix): several slots can map to the SAME profile (e.g. the legacy
+ * `ollama_embed` and the current `arctic2_embed` both map to `arctic`). The
+ * INVOKE target is a single profile (`pickKeepCandidate().profile`, correct),
+ * but the reassurance NUMBER shown to the user must be the profile's TOTAL
+ * populated objects across all its slots — not just the first slot's count
+ * (which `pickKeepCandidate`'s `.find` returns in catalog order, understating
+ * a migrated dual-populated project). Sum across every slot mapping to the
+ * candidate's profile.
+ */
+export function keepCandidateDisplayCount(
+  modelSwitch: ModelSwitchContext | null,
+): number {
+  const candidate = pickKeepCandidate(modelSwitch);
+  if (!candidate || !modelSwitch) return 0;
+  return (modelSwitch.slotCounts ?? [])
+    .filter((s) => s.profile === candidate.profile)
+    .reduce((sum, s) => sum + s.populated, 0);
+}
+
+/**
  * Whether the modal should render the model-switch THREE-option panel.
  * True iff a model-switch context is present (even with zero populated
  * slots — in that case the panel shows Regenerate + Defer only, with an

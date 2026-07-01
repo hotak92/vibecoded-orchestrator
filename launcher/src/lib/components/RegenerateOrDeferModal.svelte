@@ -31,6 +31,7 @@
   import { toast } from '$lib/stores/toast';
   import {
     pickKeepCandidate,
+    keepCandidateDisplayCount,
     type SlotPopulatedCount,
     type ModelSwitchContext,
   } from './regenerate-modal-logic';
@@ -132,6 +133,11 @@
   // profile per the count probe, falling back to the highest-populated slot.
   // Logic lives in the testable `regenerate-modal-logic` module.
   const keepCandidate = $derived(pickKeepCandidate(modelSwitch));
+  // v0.2.71 (L2 fix): the number shown to the user is the profile's TOTAL
+  // populated objects across ALL its slots (a profile like `arctic` can span
+  // `ollama_embed` + `arctic2_embed`), not just the single candidate slot's
+  // count. The invoke still targets `keepCandidate.profile` (correct).
+  const keepCount = $derived(keepCandidateDisplayCount(modelSwitch));
 
   /**
    * "Keep previous model" — revert the active-embedding choice to the
@@ -151,7 +157,7 @@
       switchState = {
         busy: false,
         decided: 'kept',
-        detail: `Kept ${profile} (${keepCandidate.populated} already embedded). Re-syncing fills any gaps.`,
+        detail: `Kept ${profile} (${keepCount} already embedded). Re-syncing fills any gaps.`,
         error: null,
       };
       toast.success(`Kept previous model: ${profile}.`);
@@ -349,7 +355,7 @@
         {#if keepCandidate}
           <p class="rgd-switch-note">
             <strong>{keepCandidate.profile}</strong> already has
-            <strong>{keepCandidate.populated}</strong>{#if modelSwitch.total > 0}
+            <strong>{keepCount}</strong>{#if modelSwitch.total > 0}
               of {modelSwitch.total}{/if} entries embedded — keeping it re-syncs
             cheaply (skip already-embedded, backfill gaps) instead of re-embedding
             everything into <code>{modelSwitch.newProfile}</code>'s empty slot.

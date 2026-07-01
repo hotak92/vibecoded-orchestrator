@@ -873,13 +873,18 @@ def _estimate_object_count(collection: str) -> int:
 
 # Canonical text-slot -> embedding profile map.
 #
-# MUST MATCH `EmbeddingService._text_partition_tag` in
-# `vco_lib/embedding_service.py` (the slot-driven arm at lines ~1352-1359).
-# Keep these two in sync — diverging them would mis-label the modal's
-# "keep previous model" default and write the wrong profile through
-# `set_project_active_embedding`. We deliberately mirror rather than import
-# the method because `_text_partition_tag` is an instance method bound to a
-# configured EmbeddingService; here we only have a raw slot name.
+# MUST STAY CONSISTENT WITH `TEXT_SLOT_MAP` in `vco_lib/embedding_service.py`
+# (the `(model-substr, slot_name, dim)` tuple list, ~line 117): every text
+# slot_name that TEXT_SLOT_MAP can produce must have an entry here mapping it
+# to its user-selectable profile id, and the profile ids must match the
+# ACTIVE_EMBEDDING profiles `active_profile_for_model` yields
+# (qwen3 / arctic / openai). TEXT_SLOT_MAP is model-substr -> slot -> dim;
+# THIS map is the inverse-ish slot -> profile projection the modal needs (we
+# only have a raw slot name from the Weaviate object, not a model id). Keep
+# them in sync — diverging them would mis-label the modal's "keep previous
+# model" default and write the wrong profile through
+# `set_project_active_embedding`. (An earlier version of this comment named
+# `_text_partition_tag`, which does not exist — corrected v0.2.71.)
 _TEXT_SLOT_TO_PROFILE: dict[str, str] = {
     "qwen3_embed": "qwen3",
     "arctic2_embed": "arctic",

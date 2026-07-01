@@ -133,7 +133,10 @@ def test_apply_post_bundle_steps_exists_with_expected_signature() -> None:
         r"folder:\s*&Path\s*,\s*"
         r"app:\s*&tauri::AppHandle\s*,\s*"
         r"db:\s*&Db\s*,\s*"
-        r"is_initial_create:\s*bool\s*,?\s*"
+        r"is_initial_create:\s*bool\s*,\s*"
+        # v0.2.71 (P5): the kg-sync skip-gate threads whether the bundle
+        # changed KG/docs content into the re-embed decision.
+        r"kg_or_docs_content_changed:\s*bool\s*,?\s*"
         r"\)\s*->\s*Vec<String>",
         re.DOTALL,
     )
@@ -147,6 +150,7 @@ def test_apply_post_bundle_steps_exists_with_expected_signature() -> None:
         "      app: &tauri::AppHandle,\n"
         "      db: &Db,\n"
         "      is_initial_create: bool,\n"
+        "      kg_or_docs_content_changed: bool,\n"
         "  ) -> Vec<String>\n"
         "If you're refactoring this helper, update both call sites "
         "(create_project_v2 + update_project_v2) AND this test."
