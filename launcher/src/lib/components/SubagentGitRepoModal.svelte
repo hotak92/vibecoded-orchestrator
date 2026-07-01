@@ -78,8 +78,24 @@
     }
   }
 
-  function handleCreateNew() {
-    void persistAndChoose('local_init');
+  async function handleCreateNew() {
+    if (busy) return;
+    busy = true;
+    errorMsg = '';
+    try {
+      // Actually create the local-only repo (the enforcement side effect) —
+      // the backend refuses if the root is already inside a repo + adds a
+      // gitignore guard so nested repos aren't absorbed. THEN persist the
+      // choice, so a git-init failure doesn't record a state we can't honor.
+      await invoke('create_local_project_repo', { projectRoot: projectPath });
+      await invoke('set_worktree_repo_mode', { projectId, mode: 'local_init' });
+      open = false;
+      onChoose('local_init');
+    } catch (e) {
+      errorMsg = `Could not create the local repo: ${e}`;
+    } finally {
+      busy = false;
+    }
   }
   function handleNoRepo() {
     void persistAndChoose('no_repo');

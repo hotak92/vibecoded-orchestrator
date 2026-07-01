@@ -2361,6 +2361,8 @@ pub fn run() {
             // subagent-git modal's create-local/adopt/opt-out choice.
             commands::worktree_repo_mode::set_worktree_repo_mode,
             commands::worktree_repo_mode::get_worktree_repo_mode,
+            commands::worktree_repo_mode::detect_project_git_repo,
+            commands::worktree_repo_mode::create_local_project_repo,
             // v0.2.26 (2026-05-22): generic declarative HTTP-action
             // dispatcher. Single Tauri command that executes any
             // `ActionDescriptor::Http` descriptor declared in a

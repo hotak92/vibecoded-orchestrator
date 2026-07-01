@@ -40,9 +40,11 @@
 //! bool, since this is tri-state.
 
 use serde_json::Value;
+use std::path::Path;
 use tauri::{command, State};
 
 use crate::db::Db;
+use vct_launcher_core::process::CommandExt;
 
 /// Module id under which the orchestrator's own per-project settings live.
 const MODULE_ID: &str = "orchestrator-core";
@@ -99,6 +101,163 @@ pub async fn get_worktree_repo_mode(
     })
 }
 
+/// Result of the git-repo detection probe the modal runs before offering
+/// choices. `inside_repo` is true when the workspace root OR any ancestor is
+/// already a git worktree (in which case isolation already works and the modal
+/// auto-selects `use_existing`, never offering `local_init`).
+#[derive(serde::Serialize)]
+pub struct GitRepoDetection {
+    /// The workspace root IS inside a git worktree (self or a parent).
+    pub inside_repo: bool,
+    /// The toplevel of the enclosing repo, when `inside_repo` (for display).
+    pub toplevel: Option<String>,
+}
+
+/// Detect whether `project_root` is already inside a git repo (walking UP to
+/// any parent), so the modal can offer "use existing" (auto) vs the
+/// create-new / opt-out choices. Uses `git rev-parse --show-toplevel` from the
+/// project root — correct for the subdir-of-a-bigger-repo and monorepo cases
+/// (it returns the REAL toplevel, not an assumed one). Soft-fails to
+/// `inside_repo=false` (no git / not a repo) so the modal defaults to offering
+/// create-new/opt-out.
+#[command]
+pub async fn detect_project_git_repo(project_root: String) -> Result<GitRepoDetection, String> {
+    if project_root.trim().is_empty() {
+        return Err("detect_project_git_repo: project_root required".into());
+    }
+    let root = Path::new(&project_root);
+    let out = tokio::process::Command::new("git")
+        .silent()
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(root)
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {
+            let top = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            Ok(GitRepoDetection {
+                inside_repo: !top.is_empty(),
+                toplevel: if top.is_empty() { None } else { Some(top) },
+            })
+        }
+        // Non-zero (not a repo) or spawn failure → treat as not inside a repo.
+        _ => Ok(GitRepoDetection {
+            inside_repo: false,
+            toplevel: None,
+        }),
+    }
+}
+
+/// Create a LOCAL-ONLY git repo at the project root (the modal's "create new"
+/// choice). SAFETY GUARDS — this MUTATES the user's filesystem, so it refuses
+/// anything ambiguous:
+///   1. REFUSE if the root is ALREADY inside a git repo (self or a parent) —
+///      `git init` there would create a nested/duplicate repo or be a no-op on
+///      an existing `.git`. The modal only offers this when detection said
+///      NOT inside a repo, but we re-check here (TOCTOU + defense-in-depth).
+///   2. Init with `--initial-branch=main`, NO remote (local-only, never pushed).
+///   3. Append a guard block to the root `.gitignore` so `git add -A` does NOT
+///      swallow NESTED repos (e.g. ARTup's `Code/python/ARTup_platform/` shape):
+///      each immediate-child dir that is itself a git repo is ignored, plus the
+///      VCO runtime paths. We do NOT auto-commit — the repo starts empty so the
+///      user controls what (if anything) they track.
+/// Cross-OS: pure `git` invocation via the shared `.silent()` wrapper.
+#[command]
+pub async fn create_local_project_repo(project_root: String) -> Result<(), String> {
+    if project_root.trim().is_empty() {
+        return Err("create_local_project_repo: project_root required".into());
+    }
+    let root = Path::new(&project_root);
+    if !root.is_dir() {
+        return Err(format!(
+            "create_local_project_repo: '{}' is not a directory",
+            project_root
+        ));
+    }
+
+    // Guard 1: refuse if already inside a repo (self or parent).
+    let det = detect_project_git_repo(project_root.clone()).await?;
+    if det.inside_repo {
+        return Err(format!(
+            "create_local_project_repo: '{}' is already inside a git repo ({}). \
+             Use the existing repo instead of creating a nested one.",
+            project_root,
+            det.toplevel.as_deref().unwrap_or("unknown toplevel")
+        ));
+    }
+
+    // Guard 2: local-only init, no remote, main branch.
+    let init = tokio::process::Command::new("git")
+        .silent()
+        .args(["init", "--initial-branch=main"])
+        .current_dir(root)
+        .output()
+        .await
+        .map_err(|e| format!("git init spawn failed: {}", e))?;
+    if !init.status.success() {
+        return Err(format!(
+            "git init failed: {}",
+            String::from_utf8_lossy(&init.stderr).trim()
+        ));
+    }
+
+    // Guard 3: append the nested-repo + VCO-runtime ignore guard.
+    if let Err(e) = append_local_repo_gitignore_guard(root) {
+        // Non-fatal: the repo exists; a missing ignore guard is a warning, not
+        // a failure (the user can still add it). Log to stderr, don't fail.
+        eprintln!(
+            "[worktree_repo_mode] create_local_project_repo: gitignore guard append failed: {}",
+            e
+        );
+    }
+    Ok(())
+}
+
+/// Append a guard block to `<root>/.gitignore` that ignores (a) each immediate
+/// child directory that is ITSELF a git repo (so a stray `git add -A` can't
+/// swallow a nested repo like `ARTup_platform/`), and (b) the VCO runtime
+/// paths. Idempotent: skips if our marker is already present.
+fn append_local_repo_gitignore_guard(root: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    const MARKER: &str = "# --- VCO local-only repo guard (created by the subagent-git modal) ---";
+    let gi = root.join(".gitignore");
+    if let Ok(existing) = std::fs::read_to_string(&gi) {
+        if existing.contains(MARKER) {
+            return Ok(());
+        }
+    }
+    // Find immediate-child dirs that are themselves git repos.
+    let mut nested: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() && p.join(".git").exists() {
+                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                    nested.push(name.to_string());
+                }
+            }
+        }
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&gi)?;
+    writeln!(f, "\n{}", MARKER)?;
+    writeln!(
+        f,
+        "# This is a LOCAL-ONLY repo for subagent worktree isolation — never pushed."
+    )?;
+    writeln!(f, "# Nested git repos (do not absorb them into this repo):")?;
+    for n in &nested {
+        writeln!(f, "/{}/", n)?;
+    }
+    writeln!(f, "# VCO runtime / per-machine state:")?;
+    for p in [".claude/state/", ".claude/worktrees/", ".claude/logs/"] {
+        writeln!(f, "{}", p)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +280,94 @@ mod tests {
         // paid-module id.
         assert_eq!(MODULE_ID, "orchestrator-core");
         assert_eq!(SETTING_KEY, "worktree_repo_mode");
+    }
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn detect_not_a_repo_reports_not_inside() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let det = detect_project_git_repo(tmp.path().to_string_lossy().to_string())
+            .await
+            .unwrap();
+        assert!(!det.inside_repo, "a plain temp dir is not inside a repo");
+        assert!(det.toplevel.is_none());
+    }
+
+    #[tokio::test]
+    async fn create_local_repo_then_detects_inside() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_string_lossy().to_string();
+        // Create a nested child repo FIRST to prove the ignore-guard captures it.
+        let nested = tmp.path().join("nested_app");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .current_dir(&nested)
+            .output()
+            .unwrap();
+
+        create_local_project_repo(root.clone()).await.unwrap();
+
+        // The root is now a repo.
+        let det = detect_project_git_repo(root.clone()).await.unwrap();
+        assert!(det.inside_repo, "root should now be a git repo");
+        // The nested repo is ignored (not absorbed) + the guard marker present.
+        let gi = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert!(gi.contains("VCO local-only repo guard"), "guard marker present");
+        assert!(gi.contains("/nested_app/"), "nested repo ignored: {gi}");
+        assert!(gi.contains(".claude/worktrees/"), "runtime paths ignored");
+    }
+
+    #[tokio::test]
+    async fn create_local_repo_refuses_when_already_inside_a_repo() {
+        if !git_available() {
+            return;
+        }
+        // The DANGEROUS case: never git-init inside an existing repo (would make
+        // a nested/duplicate). Init the parent, then a subdir must be refused.
+        let tmp = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let sub = tmp.path().join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        let res = create_local_project_repo(sub.to_string_lossy().to_string()).await;
+        assert!(
+            res.is_err(),
+            "must REFUSE git init inside an existing repo (parent has .git)"
+        );
+        assert!(res.unwrap_err().contains("already inside a git repo"));
+    }
+
+    #[tokio::test]
+    async fn create_local_repo_gitignore_guard_is_idempotent() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_string_lossy().to_string();
+        create_local_project_repo(root.clone()).await.unwrap();
+        // Re-running append (via a second helper call) must not duplicate the block.
+        append_local_repo_gitignore_guard(tmp.path()).unwrap();
+        let gi = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        let marker_count = gi.matches("VCO local-only repo guard").count();
+        assert_eq!(marker_count, 1, "guard block must be idempotent, got {marker_count}");
     }
 }
