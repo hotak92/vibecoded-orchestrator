@@ -1541,8 +1541,8 @@ def project_env_from_db(
             # An "auto" marker OR a legacy NO-marker per-project row both fall
             # to leg 2 (inherit global) — the LOCKED v0.2.71 decision that
             # supersedes the brittle pre-v0.2.71 "stored == qwen3" heuristic
-            # and fixes the Fabio auto-qwen3 case (a backfill-stamped qwen3 with
-            # no provenance). GUARD on the derive: an unmapped/absent hardware
+            # and fixes the auto-seeded qwen3 case (a backfill-stamped qwen3
+            # with no provenance). GUARD on the derive: an unmapped/absent hardware
             # pick → stay qwen3 (never stamp a guessed profile → wrong slot).
             active_embedding = _resolve_active_embedding_cascade(conn, project_id)
     finally:

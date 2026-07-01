@@ -298,7 +298,8 @@ def test_active_embedding_derives_from_default_text_embedding_when_absent(
 def test_active_embedding_legacy_no_marker_row_inherits_global(
     tmp_path: Path,
 ) -> None:
-    """v0.2.71 T-B-emb (Fabio case): a legacy `module_settings/active_embedding`
+    """v0.2.71 T-B-emb (auto-seeded-qwen3 case): a legacy
+    `module_settings/active_embedding`
     row with NO `active_embedding_source` marker INHERITS the machine-global
     default (here the arctic hardware pick) rather than pinning its stored
     (auto-stamped) qwen3 value. Provenance, not value, drives resolution."""

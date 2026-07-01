@@ -73,8 +73,8 @@ pub const ACTIVE_EMBEDDING_SOURCE_SETTING_KEY: &str = "active_embedding_source";
 /// companion (written before v0.2.71) is treated identically to `"auto"` —
 /// inherit the global default. This is a LOCKED decision (v0.2.71 MASTER PLAN
 /// §Sweep B): a legacy deliberate qwen3 pick getting overridden by a global
-/// arctic default is the accepted cost of fixing the far-more-common Fabio
-/// auto-qwen3 case (the backfill stamped qwen3 with no provenance).
+/// arctic default is the accepted cost of fixing the far-more-common
+/// auto-seeded qwen3 case (the backfill stamped qwen3 with no provenance).
 pub const ACTIVE_EMBEDDING_SOURCE_USER: &str = "user";
 pub const ACTIVE_EMBEDDING_SOURCE_AUTO: &str = "auto";
 
@@ -2029,14 +2029,14 @@ mod tests {
         );
     }
 
-    /// Leg 2 (Fabio case): a LEGACY per-project row with NO source marker
-    /// inherits the global default. This is the locked decision that fixes
-    /// the auto-qwen3 bug — the brittle pre-v0.2.71 "==qwen3" heuristic is
-    /// gone; provenance, not value, decides.
+    /// Leg 2 (auto-seeded-qwen3 case): a LEGACY per-project row with NO source
+    /// marker inherits the global default. This is the locked decision that
+    /// fixes the auto-qwen3 bug — the brittle pre-v0.2.71 "==qwen3" heuristic
+    /// is gone; provenance, not value, decides.
     #[test]
-    fn cascade_legacy_no_marker_inherits_global_fabio_case() {
+    fn cascade_legacy_no_marker_inherits_global_auto_seeded_case() {
         let db = Db::open_in_memory().unwrap();
-        let pid = seed_bare_project(&db, "LegacyFabio");
+        let pid = seed_bare_project(&db, "LegacyAutoSeeded");
         // Global hardware pick is arctic.
         db.app_state_set(APP_STATE_DEFAULT_TEXT_EMBED, "snowflake-arctic-embed2:latest")
             .unwrap();
@@ -2049,7 +2049,7 @@ mod tests {
         assert_eq!(
             resolve_active_embedding_cascade(&db, Some(&pid)),
             "arctic",
-            "legacy no-marker row must inherit the global default (Fabio auto-qwen3 fix)"
+            "legacy no-marker row must inherit the global default (auto-qwen3 fix)"
         );
     }
 

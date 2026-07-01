@@ -658,7 +658,7 @@ async fn project_config(
     //
     // An "auto" marker OR a legacy NO-marker per-project row both fall to
     // leg 2 (inherit global) — the LOCKED v0.2.71 decision that fixes the
-    // Fabio auto-qwen3 case (a backfill-stamped qwen3 with no provenance).
+    // auto-seeded qwen3 case (a backfill-stamped qwen3 with no provenance).
     let active_embedding = resolve_active_embedding_for_hub(&h.0, &project.id);
 
     // 7. shared_kg_write_disabled (module_settings → orchestrator-core).
@@ -2650,9 +2650,9 @@ kg_tier_full = 0.8
         );
     }
 
-    /// v0.2.71 T-B-emb — Fabio case: a legacy per-project value row with NO
-    /// source marker INHERITS the global default rather than pinning its
-    /// stored (auto-stamped) qwen3 value.
+    /// v0.2.71 T-B-emb — auto-seeded-qwen3 case: a legacy per-project value
+    /// row with NO source marker INHERITS the global default rather than
+    /// pinning its stored (auto-stamped) qwen3 value.
     #[tokio::test]
     async fn config_active_embedding_legacy_no_marker_inherits_global() {
         let (base, h) = spawn_config_api_hub().await;
@@ -2676,7 +2676,7 @@ kg_tier_full = 0.8
         assert_eq!(
             body.get("active_embedding").and_then(|v| v.as_str()),
             Some("arctic"),
-            "legacy no-marker row must inherit the global default (Fabio fix)"
+            "legacy no-marker row must inherit the global default (auto-qwen3 fix)"
         );
     }
 
