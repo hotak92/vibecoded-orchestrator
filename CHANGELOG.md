@@ -7,6 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.71] - 2026-07-01
+
+### Fixed (update reconciliation — the dead-end divergence modal)
+- **`install.py --update` / launcher "Update orchestrator" no longer dead-ends
+  on a dirty tracked file that overlaps an upstream change.** The divergence
+  modal offered only "retry merge" (which kept failing) or "rebase". Root cause:
+  the merge surface read git's conflict signal from stderr only, but git writes
+  the `CONFLICT` marker to STDOUT — so the shared conflict classifier never
+  fired and the merge/rebase abort never ran. Fixes: ONE shared
+  `is_pull_conflict` classifier + a `run_git_combined` that reads stdout+stderr
+  together (`LC_ALL=C`), merge/rebase abort wired on BOTH the self-update and
+  installer surfaces, and the launcher-update deferral writer relocated to the
+  shared module so a self-update divergence also leaves a durable
+  `UPDATE_DEFERRED.md` trace.
+- **User-editable files that overlap an upstream change now auto-merge instead
+  of blocking the update.** `.gitignore`, `.gitattributes`, `README.md`, and
+  `docs/**/*.md` are treated as user-editable: a 3-way merge is attempted
+  automatically (union driver for hand-run merges), so a locally-dirtied
+  `.gitignore` no longer stalls the whole update behind a manual modal.
+
+### Fixed (KG-sync serialization on Update-all)
+- **"Update all projects" no longer fires many concurrent KG re-embeds.** The
+  per-project KG sync now runs under a process-global single-flight semaphore at
+  the spawn point, plus a skip-when-content-unchanged gate — so an Update-all
+  across N projects serializes the syncs instead of launching N at once.
+
+### Added (config centralization — launcher.db as the source of truth)
+- **Per-project ACTIVE_EMBEDDING is now first-class and STICKY.** A new
+  Settings-tab embedding picker writes `module_settings/orchestrator-core/
+  active_embedding` with an `active_embedding_source: user|auto` provenance
+  marker. A deliberate user pick (`source=user`) survives bundle / orchestrator
+  updates; a project with no pick inherits the machine-global default (shown
+  with an "inherited" badge). ONE shared resolver cascade — kept byte-for-byte
+  in lockstep across Rust (`project_env_settings.rs`), the hub
+  (`config_api.rs`), and Python (`config_projection.py`) — prevents the
+  GUI-write-vs-hub-read disagreement class. A legacy row with no provenance
+  marker inherits the global default (provenance, not value, decides — fixing
+  auto-seeded-qwen3 projects that should track a corrected global).
+- **Two new per-project flags, DB→ProjectConfig→settings.json projected**
+  (mirroring the RL-enabled flag): `dual_embedding_write_all_slots` (opt-in,
+  default off — write every embedding slot on sync) and `dual_rl_log_enabled`
+  (opt-in — produce RL training corpus for both embedding nets). Enabling
+  dual-logs implies dual-write.
+
+### Added (embedding model-switch UX)
+- **Switching a project's embedding model surfaces a Regenerate / Keep-previous
+  / Defer choice.** The existing regenerate-or-defer modal gains a third
+  "keep previous model" option that reverts the active-embedding to the
+  most-populated slot (cheap re-sync: skip-by-hash + backfill gaps) instead of
+  re-embedding into the new model's empty slot; the smart default proposes the
+  profile with the most already-embedded objects. "Regenerate now" re-embeds the
+  KG collection into the new profile's slot. This choice is also surfaced
+  per-project after "Update all projects" (a "needs re-sync → Resolve" row).
+
+### Added (dual-RL-log fan-out)
+- **Optional dual-net RL training corpus.** With `dual_rl_log_enabled`, the
+  retrieval + citation telemetry events fan out a second, `:slot`-suffixed copy
+  so both embedding nets accumulate a training corpus; the online path stays
+  single-slot. On-the-fly missing-embedding backfill fills a node's slot vector
+  lazily on use / re-sync (active-only unless dual), never a bulk sweep.
+
+### Fixed (coordination-MCP CPU burn)
+- **The coordination MCP no longer leaves CPU-burning zombie instances.**
+  Server-side: cancel the poll loop on stdin-EOF, reuse one HTTP client, idle
+  backoff. Launcher-side: a steady-state reaper reaps orphaned MCP processes
+  (parent-dead on Windows OR reparented-to-a-subreaper on POSIX), never touching
+  a live-session MCP.
+
+### Added (parallel-subagent worktree isolation)
+- **Worktree-isolation safeguards for parallel subagents.** A `WorktreeCreate`
+  hook (ships log-only this cycle — captures the payload to
+  `.claude/logs/worktree-guard.jsonl`) plus SubagentStart/Stop backstops that
+  warn/flag when an `isolation: worktree` subagent falls back to the shared
+  parent tree (the silent-fallback footgun). A new subagent-git modal offers, on
+  a repo-less project root, "use existing repo" (auto when an enclosing repo is
+  detected), "create local-only repo" (safe `git init` — refuses inside an
+  existing repo, no remote, nested repos gitignored, no auto-commit), or opt-out.
+
 ## [0.2.70] - 2026-06-28
 
 ### Fixed (v0.2.70 streams A, B — migration + install)
