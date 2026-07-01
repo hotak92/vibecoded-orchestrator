@@ -194,43 +194,66 @@ def _active_code_vector_slot() -> str:
     return svc.code_vector_slot
 
 
-# v0.2.70 Bug C1b: the score floor must track the ACTIVE code embedder.
-# CodeSage-Large / jina place code-shaped queries in a COMPRESSED distance band
-# (~0.70 distance -> ~0.30 score), so the legacy 0.35 floor culled EVERY result
-# (the MCP has no floor and returns them fine — confirmed: floor=0.0 -> results
-# return). qwen3-code reuse has a WIDER, more separable band where a small floor
-# trims true noise. One floor for incompatible distance scales was the bug.
-# Default per-slot; $VCO_CODE_GRAPH_SCORE_FLOOR still overrides.
+# v0.2.72 T-FLOOR (P1): the two-stage per-slot floor table + resolvers now live
+# in the SINGLE SHARED home ``weaviate_mcp.code_ranking`` so the CLI path and the
+# MCP path (server.py::search_code_graph) cannot diverge. This CLI already
+# imports shared helpers from weaviate_mcp via the pip-editable install (see the
+# ``from weaviate_mcp.server import ...`` block above, :72-87) — mirror that
+# style here.
 #
-# MUST MATCH (3-way mirror): these floor VALUES are the contract between this
-# CLI, any hook that pre-filters codegraph results, and the MCP server
-# (claude_mcp_servers/weaviate_mcp/server.py — which keeps NO floor, i.e. 0.0,
-# for the codesage/jina parity case). Changing a value here without mirroring
-# the MCP/hook reasoning re-creates the cross-scale-floor bug.
-_CODE_FLOOR_BY_SLOT = {
-    "codesage_embed": 0.0,   # parity with MCP; band too compressed for a floor
-    "jina_embed": 0.0,       # 768-dim code model, same compressed band
-    "qwen3_embed": 0.25,     # wider band; keep a light noise trim
-}
+# ``CODE_FLOOR_BY_SLOT`` (measured CodeSage 0.16/0.22, jina 0.16/0.22, qwen3
+# conservative 0.20/0.30) is the (retrieval_floor, post_rerank_floor) contract;
+# ``resolve_retrieval_floor`` / ``resolve_post_rerank_floor`` own the env-
+# override + empty-string-coercion discipline. Graceful fallback keeps the CLI
+# working on a half-installed venv where the shared module isn't importable.
+#
+# MUST MATCH (3-way mirror): the floor VALUES in code_ranking.py are the
+# contract between this CLI, the MCP server
+# (claude_mcp_servers/weaviate_mcp/server.py::search_code_graph), and any hook
+# that pre-filters code-graph results. v0.2.72 moved the table to the shared
+# module so the three surfaces cannot drift; changing a value re-opens the
+# cross-scale-floor bug unless every surface + the experiment re-run agree. The
+# half-installed-venv fallback below therefore mirrors those same values.
+try:
+    from weaviate_mcp.code_ranking import (  # noqa: F401  (run_code_retrieval_pipeline wired by integrator)
+        CODE_FLOOR_BY_SLOT,
+        resolve_post_rerank_floor,
+        resolve_retrieval_floor,
+        run_code_retrieval_pipeline,
+    )
+    _HAS_CODE_RANKING = True
+except ImportError:
+    _HAS_CODE_RANKING = False
+    # Half-installed venv fallback: mirror the shipped two-stage defaults so the
+    # CLI still applies a sane floor. Values MUST MATCH code_ranking.py.
+    CODE_FLOOR_BY_SLOT = {  # type: ignore[assignment]
+        "codesage_embed": (0.16, 0.22),
+        "jina_embed": (0.16, 0.22),
+        "qwen3_embed": (0.20, 0.30),
+    }
+
+    def resolve_retrieval_floor(slot, env=None):  # type: ignore[no-redef]
+        return CODE_FLOOR_BY_SLOT.get(slot, (0.16, 0.22))[0]
+
+    def resolve_post_rerank_floor(slot, env=None):  # type: ignore[no-redef]
+        return CODE_FLOOR_BY_SLOT.get(slot, (0.16, 0.22))[1]
 
 
 def _resolve_code_score_floor() -> float:
-    """Resolve the code-graph score floor: explicit env override wins, else the
-    per-active-slot default (0.0 for codesage/jina, 0.25 for qwen3). An empty
-    env string is coerced to the slot default (matches the v0.2.27 KG_COLLECTION
-    empty-string-coercion discipline — do not parse "" as a literal float)."""
-    _floor_env = os.environ.get("VCO_CODE_GRAPH_SCORE_FLOOR")
-    if _floor_env is not None and _floor_env != "":
-        try:
-            return float(_floor_env)
-        except (TypeError, ValueError):
-            # Unparseable override -> safest is no floor (parity with MCP).
-            return 0.0
+    """Back-compat shim: resolve the effective code-graph SCORE floor for the
+    active slot. Delegates to the shared ``resolve_post_rerank_floor`` (the real
+    gate) so the single-stage CLI apply site keeps working until the v0.2.72
+    integrator wires ``run_code_retrieval_pipeline`` into ``search_by_concept``.
+
+    Env override + empty-string coercion is handled inside the shared resolver
+    (canonical ``VCO_CODE_GRAPH_POST_RERANK_FLOOR``, deprecated
+    ``VCO_CODE_GRAPH_SCORE_FLOOR`` alias). Slot resolution soft-fails to
+    codesage_embed."""
     try:
         _slot = _active_code_vector_slot()
     except Exception:
         _slot = "codesage_embed"
-    return _CODE_FLOOR_BY_SLOT.get(_slot, 0.0)
+    return resolve_post_rerank_floor(_slot, os.environ)
 
 
 def generate_code_embedding(text: str) -> Optional[List[float]]:
@@ -407,6 +430,15 @@ class CodeGraphQuery:
             # culled ALL CodeSage results (whose distances cluster ~0.70 ->
             # score ~0.30). Now: codesage/jina -> 0.0 (MCP parity), qwen3 ->
             # 0.25; $VCO_CODE_GRAPH_SCORE_FLOOR still overrides.
+            # v0.2.72 integrator: wire run_code_retrieval_pipeline here (see
+            # weaviate_mcp/code_ranking.py). Normalise `merged` into the
+            # {"_s": score, "_p": props, ...} candidate shape, resolve the
+            # two-stage floors via resolve_retrieval_floor /
+            # resolve_post_rerank_floor, and replace this single-stage
+            # break-loop with one pipeline call so the CLI and MCP paths are
+            # byte-identical. T-FLOOR (P1+P2) left this body UNTOUCHED — the
+            # shim `_resolve_code_score_floor()` keeps the pre-integrator
+            # behaviour working (post-rerank floor as the single gate).
             score_floor = _resolve_code_score_floor()
             for distance, source, obj in merged:
                 # score = 1 - distance, clamped to [0, 1].
