@@ -13,15 +13,37 @@
   // (bundle install + schema bootstrap) is non-trivial to roll back.
   // Best we offer is "close this dialog after it finishes".
 
+  import { invoke } from '$lib/tauri';
   import { projects } from '$lib/stores/projects';
   import { toast } from '$lib/stores/toast';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
+  import RegenerateOrDeferModal, {
+    type StaleDerivedArtifact,
+  } from '$lib/components/RegenerateOrDeferModal.svelte';
   import type {
     UpdateAllReport,
     UpdateAllProjectEntry,
   } from '$lib/types/launcher';
 
   let { open = $bindable<boolean>(false) }: { open: boolean } = $props();
+
+  // v0.2.71 Track T-C-modal / Gap A: a model-switch (or any schema change with
+  // no data-preserving migration) during Update-all silently leaves stale
+  // embeddings unless we probe. After the run completes we probe each SUCCEEDED
+  // project for POLICY-STEP-3 stale-derived collections (the SAME read-only
+  // `probe_stale_derived_collections` the per-project SettingsTab flow uses) and
+  // surface a per-project "needs re-sync → Resolve" action. Clicking Resolve
+  // opens the EXISTING RegenerateOrDeferModal scoped to that project — no
+  // shortcut toast, the real interactive Regenerate/Defer choice.
+  //
+  // Keyed by project_id → the stale artifacts found for it. Absent key = not
+  // probed yet or nothing pending. Empty array is possible (probed, clean) and
+  // is treated the same as absent for the "needs resolve" check.
+  let staleByProject = $state<Record<string, StaleDerivedArtifact[]>>({});
+  let probing = $state(false);
+  // The project currently open in the scoped RegenerateOrDeferModal (id+name),
+  // or null when no resolve modal is up.
+  let resolveTarget = $state<{ id: string; name: string } | null>(null);
 
   // Three phases:
   //   "confirm" — initial prompt + count of projects to update.
@@ -44,6 +66,9 @@
       phase = 'confirm';
       report = null;
       runError = null;
+      staleByProject = {};
+      resolveTarget = null;
+      probing = false;
     }
   });
 
@@ -67,11 +92,89 @@
       } else {
         toast.success(`Update all finished: ${line}.`);
       }
+
+      // Gap A (v0.2.71): probe succeeded projects for stale-derived
+      // collections needing a re-sync (per-project, read-only). Non-blocking:
+      // the report is already shown; the resolve rows appear as probing
+      // completes. A probe failure for one project just means no resolve row
+      // for it (soft-fail), never an error on the whole run.
+      void probeStaleForReport(r);
     } catch (e) {
       runError = e instanceof Error ? e.message : String(e);
       phase = 'done';
       toast.error(`Update all failed: ${runError}`);
     }
+  }
+
+  /**
+   * Gap A: after Update-all, probe each SUCCEEDED project for POLICY-STEP-3
+   * stale-derived collections (`probe_stale_derived_collections` — the same
+   * read-only check the per-project SettingsTab update flow runs). Populates
+   * `staleByProject` so the report renders a per-project "needs re-sync →
+   * Resolve" action. Sequential (small N, avoids a Weaviate probe storm);
+   * each project soft-fails independently.
+   */
+  async function probeStaleForReport(r: UpdateAllReport) {
+    probing = true;
+    try {
+      for (const entry of r.updated) {
+        if (entry.status !== 'succeeded') continue;
+        try {
+          const pending = await invoke<StaleDerivedArtifact[]>(
+            'probe_stale_derived_collections',
+            { projectId: entry.project_id },
+          );
+          if (pending && pending.length > 0) {
+            staleByProject = { ...staleByProject, [entry.project_id]: pending };
+          }
+        } catch (probeErr) {
+          // Soft-fail per project: no resolve row, no error toast.
+          console.warn(
+            `probe_stale_derived_collections failed for ${entry.project_name}:`,
+            probeErr,
+          );
+        }
+      }
+    } finally {
+      probing = false;
+    }
+  }
+
+  function openResolve(projectId: string, projectName: string) {
+    resolveTarget = { id: projectId, name: projectName };
+  }
+
+  /**
+   * The scoped RegenerateOrDeferModal closed. Re-probe the just-resolved
+   * project so a fully-resolved project drops its "needs re-sync" row (the
+   * user may have Regenerated some/all artifacts, or Deferred — Defer keeps
+   * the row so it's still visible as an outstanding item; only Regenerate
+   * clears it). Cheap single-project re-probe, soft-fail.
+   */
+  async function closeResolve() {
+    const target = resolveTarget;
+    resolveTarget = null;
+    if (!target) return;
+    try {
+      const pending = await invoke<StaleDerivedArtifact[]>(
+        'probe_stale_derived_collections',
+        { projectId: target.id },
+      );
+      if (pending && pending.length > 0) {
+        staleByProject = { ...staleByProject, [target.id]: pending };
+      } else {
+        // Fully resolved — drop the row.
+        const next = { ...staleByProject };
+        delete next[target.id];
+        staleByProject = next;
+      }
+    } catch {
+      // Leave the existing row as-is on a re-probe failure.
+    }
+  }
+
+  function staleFor(projectId: string): StaleDerivedArtifact[] {
+    return staleByProject[projectId] ?? [];
   }
 
   function close() {
@@ -149,6 +252,7 @@
         </p>
         <ul class="ua-rows">
           {#each report.updated as r (r.project_id)}
+            {@const stale = staleFor(r.project_id)}
             <li class="ua-row ua-row-{r.status}">
               <span class="ua-row-icon">{statusIcon(r.status)}</span>
               <span class="ua-row-name">{r.project_name}</span>
@@ -161,9 +265,29 @@
                   {r.warnings.length} warning{r.warnings.length === 1 ? '' : 's'}
                 </div>
               {/if}
+              {#if stale.length > 0}
+                <!-- Gap A: a derived collection is stale with no data-preserving
+                     migration. Surface the REAL interactive resolve, not a toast. -->
+                <div class="ua-row-resync">
+                  <span class="ua-resync-text">
+                    ⚠ {stale.length} collection{stale.length === 1 ? '' : 's'}
+                    need{stale.length === 1 ? 's' : ''} re-sync
+                  </span>
+                  <button
+                    class="ua-resync-btn"
+                    onclick={() => openResolve(r.project_id, r.project_name)}
+                    title="Open the Regenerate / Keep-previous / Defer choice for this project"
+                  >
+                    Resolve
+                  </button>
+                </div>
+              {/if}
             </li>
           {/each}
         </ul>
+        {#if probing}
+          <p class="ua-hint ua-probing">Checking projects for collections that need re-syncing…</p>
+        {/if}
       {/if}
     {/if}
   {/snippet}
@@ -181,6 +305,18 @@
     {/if}
   {/snippet}
 </DialogRoot>
+
+<!-- Gap A (v0.2.71): the per-project resolve modal, scoped to the project whose
+     "Resolve" was clicked. Same modal + commands as the per-project SettingsTab
+     flow — Regenerate now (drop+recreate+re-sync from disk) / Defer to Claude.
+     Closing re-probes so a fully-Regenerated project drops its row. -->
+{#if resolveTarget}
+  <RegenerateOrDeferModal
+    projectId={resolveTarget.id}
+    artifacts={staleFor(resolveTarget.id)}
+    onClose={closeResolve}
+  />
+{/if}
 
 <style>
   .ua-title {
@@ -333,6 +469,42 @@
     font-size: 11px;
     color: #ffc800;
     margin-top: 4px;
+  }
+  /* Gap A: per-project "needs re-sync → Resolve" row. */
+  .ua-row-resync {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: 6px;
+    padding: 6px 8px;
+    background: rgba(123, 95, 255, 0.1);
+    border: 1px solid rgba(123, 95, 255, 0.3);
+    border-radius: 4px;
+  }
+  .ua-resync-text {
+    font-size: 11px;
+    color: #c4b3ff;
+  }
+  .ua-resync-btn {
+    padding: 3px 12px;
+    background: rgba(123, 95, 255, 0.2);
+    border: 1px solid rgba(123, 95, 255, 0.5);
+    color: #c4b3ff;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 600;
+    flex-shrink: 0;
+  }
+  .ua-resync-btn:hover {
+    background: rgba(123, 95, 255, 0.35);
+    border-color: #7b5fff;
+  }
+  .ua-probing {
+    margin-top: 8px;
+    font-style: italic;
   }
   .btn-primary {
     padding: 6px 14px;

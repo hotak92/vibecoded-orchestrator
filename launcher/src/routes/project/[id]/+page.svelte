@@ -43,6 +43,15 @@
   import CodeGraphBuildBanner from '$lib/components/CodeGraphBuildBanner.svelte';
   import KgSyncBanner from '$lib/components/KgSyncBanner.svelte';
   import KgSummaryBanner from '$lib/components/KgSummaryBanner.svelte';
+  // v0.2.71 Track T-WT — subagent-git modal. Mounted here (the project
+  // page) because this is the surface a user opens BEFORE running subagent
+  // work in that project, and it already has `project.folder_path` +
+  // `project.id`. It self-gates: only shows when the workspace root is NOT
+  // inside any git repo AND the user has not already recorded a choice —
+  // detection via `detect_project_git_repo`, persistence via
+  // `get/set_worktree_repo_mode`. See the modal's docstring for the
+  // auto-use-vs-show rule.
+  import SubagentGitRepoModal from '$lib/components/SubagentGitRepoModal.svelte';
   import type { ProjectView } from '$lib/types/launcher';
 
   let projectId = $derived($page.params.id);
@@ -90,6 +99,70 @@
   // Defaults to `false` until Phase 1.1 lands so the tab stays hidden
   // for projects that haven't been migrated to project_modules yet.
   let diagramsModuleActive = $state(false);
+
+  // v0.2.71 Track T-WT — subagent-git modal state. `showSubagentGitModal`
+  // is set true only after `maybeOfferSubagentGitRepo` finds the project
+  // root is repo-less AND no choice was recorded. `use_existing` is
+  // auto-recorded (never shown) when an enclosing repo is detected.
+  let showSubagentGitModal = $state(false);
+
+  /**
+   * v0.2.71 Track T-WT: decide whether to surface the subagent-git modal.
+   *
+   * Subagents that use `isolation: worktree` need a git repo at/above the
+   * workspace root (the harness's `git worktree add`). This runs once per
+   * project load:
+   *   1. If the root is INSIDE a repo (self or parent) → isolation already
+   *      works. Auto-record `use_existing` (idempotent) and never prompt.
+   *   2. If the root is NOT inside a repo AND no choice is recorded yet →
+   *      surface the modal so the user picks create-local / opt-out.
+   *   3. If a choice is already recorded (`local_init` / `no_repo` /
+   *      `use_existing`) → respect it, never re-prompt.
+   * Entirely best-effort: any probe failure leaves the modal closed (never
+   * blocks the page).
+   */
+  async function maybeOfferSubagentGitRepo(id: string, folderPath: string) {
+    try {
+      // Already decided? Respect it, don't re-prompt.
+      const existingMode = await invoke<string | null>('get_worktree_repo_mode', {
+        projectId: id,
+      });
+      if (existingMode) return;
+
+      const det = await invoke<{ inside_repo: boolean; toplevel: string | null }>(
+        'detect_project_git_repo',
+        { projectRoot: folderPath },
+      );
+      if (det.inside_repo) {
+        // Enclosing repo present → isolation works with zero config. Record
+        // `use_existing` so we never probe/prompt again (soft-fail on write).
+        try {
+          await invoke('set_worktree_repo_mode', { projectId: id, mode: 'use_existing' });
+        } catch (e) {
+          console.warn('[project-page] record use_existing failed:', e);
+        }
+        return;
+      }
+      // Repo-less + undecided → prompt.
+      showSubagentGitModal = true;
+    } catch (e) {
+      // Never block the page on this best-effort probe.
+      console.warn('[project-page] maybeOfferSubagentGitRepo failed:', e);
+    }
+  }
+
+  function onSubagentGitChoose(_mode: 'use_existing' | 'local_init' | 'no_repo') {
+    // The modal already persisted the choice + ran the git-init side effect
+    // (for local_init). Nothing more to do here — close is handled by the
+    // modal's bindable `open`. The `no_repo` frontmatter-strip enforcement
+    // is owned by the install/update flow keyed off the persisted mode.
+    showSubagentGitModal = false;
+  }
+  function onSubagentGitDismiss() {
+    // "Decide later" — records NOTHING (so we prompt again next load until
+    // the user picks). Matches the modal's never-silently-mutate contract.
+    showSubagentGitModal = false;
+  }
 
   async function checkDiagramsModule(id: string) {
     try {
@@ -176,6 +249,9 @@
       // orchState above; this one is non-critical for the rest of the
       // page so don't block on errors).
       void checkDiagramsModule(project.id);
+      // v0.2.71 Track T-WT: surface the subagent-git modal if this
+      // project's root is repo-less + undecided (best-effort, non-blocking).
+      void maybeOfferSubagentGitRepo(project.id, project.folder_path);
     } catch (e) {
       toast.error(e);
     }
@@ -409,6 +485,20 @@
     {/if}
   </main>
 </div>
+
+<!-- v0.2.71 Track T-WT: subagent-git modal. Self-gated by
+     `maybeOfferSubagentGitRepo` (only shows when the root is repo-less +
+     undecided). Persists the choice + runs the git-init side effect
+     internally; this page just tracks open/closed. -->
+{#if project && showSubagentGitModal}
+  <SubagentGitRepoModal
+    bind:open={showSubagentGitModal}
+    projectId={project.id}
+    projectPath={project.folder_path}
+    onChoose={onSubagentGitChoose}
+    onDismiss={onSubagentGitDismiss}
+  />
+{/if}
 
 <Toast />
 

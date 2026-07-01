@@ -25,7 +25,21 @@
     ModelChoice,
   } from '$lib/types/embedding-catalog';
 
-  let { projectId }: { projectId: string } = $props();
+  let {
+    projectId,
+    onModelSwitch,
+  }: {
+    projectId: string;
+    /**
+     * v0.2.71 Track T-C-modal — OPTIONAL. Fired after a successful save when
+     * the chosen profile DIFFERS from the previously-effective one (a genuine
+     * model SWITCH, not a re-save of the same value). The parent uses it to
+     * surface the RegenerateOrDeferModal with a `modelSwitch` context so the
+     * user can Regenerate / Keep-previous / Defer. Passing `newProfile` lets
+     * the parent build that context via `project_embedding_slot_counts`.
+     */
+    onModelSwitch?: (newProfile: string) => void;
+  } = $props();
 
   // Resolved state from the backend: { effective, source }.
   interface ActiveEmbeddingState {
@@ -137,6 +151,10 @@
   async function save(): Promise<void> {
     if (!selected) return;
     saving = true;
+    // Capture the pre-save effective value: a genuine model SWITCH is
+    // `selected !== previousEffective` (re-saving the SAME profile — e.g. to
+    // flip source auto→user — is NOT a switch and must not trigger re-embed).
+    const previousEffective = effective;
     try {
       await invoke('set_project_active_embedding', {
         projectId,
@@ -154,7 +172,15 @@
         );
       }
       toast.success('Project embedding set (sticky across updates)');
+      // v0.2.71 Track T-C-modal: a genuine switch (new profile != old) means
+      // the new model's vector slot is (likely) empty — signal the parent so
+      // it can offer Regenerate / Keep-previous / Defer. Fire AFTER the DB
+      // write + re-projection succeed; skip when the value didn't change.
+      const chosen = selected;
       await load();
+      if (onModelSwitch && chosen !== previousEffective) {
+        onModelSwitch(chosen);
+      }
     } catch (e) {
       toast.error(e);
     } finally {

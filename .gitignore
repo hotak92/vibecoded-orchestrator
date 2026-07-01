@@ -353,3 +353,4 @@ supabase/.temp/
 .claude/context/pre-compact-snapshot.md
 .claude/context/UPDATE_DEFERRED.md
 .claude/context/SELF-HANDOFF-*.md
+.wt/

@@ -213,10 +213,18 @@ pub async fn create_local_project_repo(project_root: String) -> Result<(), Strin
     Ok(())
 }
 
-/// Append a guard block to `<root>/.gitignore` that ignores (a) each immediate
-/// child directory that is ITSELF a git repo (so a stray `git add -A` can't
-/// swallow a nested repo like `ARTup_platform/`), and (b) the VCO runtime
-/// paths. Idempotent: skips if our marker is already present.
+/// Append a guard block to `<root>/.gitignore` that ignores (a) every nested
+/// git repo found under `root` (so a stray `git add -A` can't swallow a nested
+/// repo like `ARTup_platform/`), and (b) the VCO runtime paths. Idempotent:
+/// skips if our marker is already present.
+///
+/// v0.2.71 (MEDIUM-1 widening): the scan walks DESCENDANTS up to
+/// `MAX_NESTED_SCAN_DEPTH` levels (not just immediate children), so a repo at
+/// `Code/python/ARTup_platform/.git` (two levels down under a non-repo `Code/`)
+/// is also ignored — matching the guard's stated intent "don't absorb nested
+/// repos". The walk is bounded (depth cap + we never descend INTO a discovered
+/// nested repo) so it can't blow up on a deep tree. Each nested repo is written
+/// as a root-anchored path (`/Code/python/ArtUP_platform/`) relative to `root`.
 fn append_local_repo_gitignore_guard(root: &Path) -> std::io::Result<()> {
     use std::io::Write;
     const MARKER: &str = "# --- VCO local-only repo guard (created by the subagent-git modal) ---";
@@ -226,18 +234,8 @@ fn append_local_repo_gitignore_guard(root: &Path) -> std::io::Result<()> {
             return Ok(());
         }
     }
-    // Find immediate-child dirs that are themselves git repos.
-    let mut nested: Vec<String> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(root) {
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.is_dir() && p.join(".git").exists() {
-                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                    nested.push(name.to_string());
-                }
-            }
-        }
-    }
+    // Find nested git repos under root (bounded-depth descendant walk).
+    let nested = find_nested_git_repos(root);
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -256,6 +254,51 @@ fn append_local_repo_gitignore_guard(root: &Path) -> std::io::Result<()> {
         writeln!(f, "{}", p)?;
     }
     Ok(())
+}
+
+/// Max directory depth the nested-repo scan descends from `root` (1 = immediate
+/// children). 6 covers the documented deep-nesting shapes (e.g.
+/// `Code/python/<app>/`) without risk of walking an unboundedly deep tree.
+const MAX_NESTED_SCAN_DEPTH: usize = 6;
+
+/// Collect every nested git repo under `root`, as forward-slash paths RELATIVE
+/// to `root` (e.g. `Code/python/app`). Bounded: descends at most
+/// `MAX_NESTED_SCAN_DEPTH` levels and NEVER descends into a discovered repo
+/// (a repo's own subdirs are its business, and a git repo can't be nested
+/// inside another tracked repo without a gitlink anyway). Best-effort: an
+/// unreadable dir is skipped, never fatal.
+fn find_nested_git_repos(root: &Path) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    // Stack of (absolute dir, depth). Start with root's children at depth 1.
+    let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth >= MAX_NESTED_SCAN_DEPTH {
+            continue;
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            if p.join(".git").exists() {
+                // A nested repo — record it, do NOT descend into it.
+                if let Ok(rel) = p.strip_prefix(root) {
+                    let rel_str = rel.to_string_lossy().replace('\\', "/");
+                    if !rel_str.is_empty() {
+                        found.push(rel_str);
+                    }
+                }
+            } else {
+                // Plain dir — descend (bounded by the depth cap).
+                stack.push((p, depth + 1));
+            }
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -331,6 +374,54 @@ mod tests {
         assert!(gi.contains("VCO local-only repo guard"), "guard marker present");
         assert!(gi.contains("/nested_app/"), "nested repo ignored: {gi}");
         assert!(gi.contains(".claude/worktrees/"), "runtime paths ignored");
+    }
+
+    #[tokio::test]
+    async fn gitignore_guard_ignores_deeply_nested_repo() {
+        // v0.2.71 MEDIUM-1: a repo TWO levels down (under a non-repo parent),
+        // the documented `Code/python/ARTup_platform/.git` shape, must also be
+        // ignored — the immediate-child-only scan missed it before the widening.
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let deep = tmp.path().join("Code").join("python").join("app");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .current_dir(&deep)
+            .output()
+            .unwrap();
+
+        create_local_project_repo(tmp.path().to_string_lossy().to_string())
+            .await
+            .unwrap();
+
+        let gi = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        // Forward-slash, root-anchored, regardless of host path separator.
+        assert!(
+            gi.contains("/Code/python/app/"),
+            "deep nested repo ignored: {gi}"
+        );
+    }
+
+    #[test]
+    fn find_nested_git_repos_does_not_descend_into_a_repo() {
+        // A repo that itself contains a sub-repo: we record the OUTER repo and
+        // do NOT descend into it (the inner one is the outer repo's concern).
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path().join("outer");
+        let inner = outer.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::create_dir_all(outer.join(".git")).unwrap();
+        std::fs::create_dir_all(inner.join(".git")).unwrap();
+
+        let found = find_nested_git_repos(tmp.path());
+        assert!(found.contains(&"outer".to_string()), "outer recorded: {found:?}");
+        assert!(
+            !found.iter().any(|p| p.contains("inner")),
+            "must NOT descend into a discovered repo: {found:?}"
+        );
     }
 
     #[tokio::test]

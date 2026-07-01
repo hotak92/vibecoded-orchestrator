@@ -23,6 +23,13 @@
   import RegenerateOrDeferModal, {
     type StaleDerivedArtifact,
   } from '$lib/components/RegenerateOrDeferModal.svelte';
+  // The model-switch types originate in the dependency-free logic module;
+  // import them from there directly (the svelte language server does not
+  // surface a `.svelte` file's `export type` re-exports as named members).
+  import type {
+    ModelSwitchContext,
+    SlotPopulatedCount,
+  } from '$lib/components/regenerate-modal-logic';
   // v0.2.71 T-B-emb — per-project ACTIVE_EMBEDDING profile picker.
   import ActiveEmbeddingPicker from '$lib/project-state/ActiveEmbeddingPicker.svelte';
   // v0.2.71 T-B-flags — per-project dual-write + dual-log toggles.
@@ -36,6 +43,12 @@
   // is read-only (migrate-schema --check) and soft-fails to "no modal".
   let staleDerived = $state<StaleDerivedArtifact[]>([]);
   let showRegenerateModal = $state(false);
+  // v0.2.71 Track T-C-modal: when the ActiveEmbeddingPicker reports a genuine
+  // model SWITCH, we build a ModelSwitchContext (per-slot populated counts +
+  // smart default) and open the SAME modal with a `modelSwitch` prop so the
+  // user gets the three-option Regenerate / Keep-previous / Defer panel. Null
+  // when the modal was opened by the bundle-update stale-derived probe instead.
+  let modelSwitchCtx = $state<ModelSwitchContext | null>(null);
 
   let project = $state<ProjectView | null>(null);
   let newName = $state('');
@@ -147,6 +160,52 @@
   function closeRegenerateModal() {
     showRegenerateModal = false;
     staleDerived = [];
+    modelSwitchCtx = null;
+  }
+
+  /**
+   * v0.2.71 Track T-C-modal: the ActiveEmbeddingPicker fired `onModelSwitch`
+   * after the user saved a NEW active-embedding profile. Build the
+   * ModelSwitchContext (per-slot populated counts → smart default) via the
+   * `project_embedding_slot_counts` command, then open the RegenerateOrDeferModal
+   * with `modelSwitch` set so the three-option panel renders.
+   *
+   * Best-effort: slot-count probe soft-fails to an empty result (the command
+   * itself never throws on a probe failure — only on project-not-found), in
+   * which case the modal still opens but degrades to Regenerate/Defer (no
+   * keep-previous smart default). We open the modal regardless of the probe so
+   * a switch always surfaces the choice.
+   */
+  async function handleModelSwitch(newProfile: string) {
+    if (!project) return;
+    let slotCounts: SlotPopulatedCount[] = [];
+    let mostPopulatedProfile: string | null = null;
+    let total = 0;
+    try {
+      const counts = await invoke<{
+        collection: string;
+        total: number;
+        slots: SlotPopulatedCount[];
+        most_populated_profile: string | null;
+      }>('project_embedding_slot_counts', { projectId: project.id });
+      slotCounts = counts.slots ?? [];
+      mostPopulatedProfile = counts.most_populated_profile;
+      total = counts.total ?? 0;
+    } catch (e) {
+      // Probe faulted (project vanished, etc.) — still surface the switch
+      // choice with a degraded (2-option) modal.
+      console.warn('project_embedding_slot_counts failed:', e);
+    }
+    modelSwitchCtx = {
+      newProfile,
+      slotCounts,
+      mostPopulatedProfile,
+      total,
+    };
+    // No stale-derived artifacts in the pure model-switch path — the modal
+    // renders just the model-switch panel.
+    staleDerived = [];
+    showRegenerateModal = true;
   }
 
   function addEnv() {
@@ -264,7 +323,7 @@
       </button>
     </section>
 
-    <ActiveEmbeddingPicker {projectId} />
+    <ActiveEmbeddingPicker {projectId} onModelSwitch={handleModelSwitch} />
 
     <DualWriteFlagsPanel {projectId} />
 
@@ -364,6 +423,7 @@
     projectId={project.id}
     artifacts={staleDerived}
     onClose={closeRegenerateModal}
+    modelSwitch={modelSwitchCtx}
   />
 {/if}
 

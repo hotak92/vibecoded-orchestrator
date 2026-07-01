@@ -114,9 +114,9 @@ def test_apply_post_bundle_steps_exists_with_expected_signature() -> None:
     - The function `apply_post_bundle_steps` exists.
     - It's declared `async` (background-task spawns need an await-able
       path).
-    - It takes 6 parameters in the documented order: project_id (&str),
+    - It takes 7 parameters in the documented order: project_id (&str),
       project_name (&str), folder (&Path), app (&AppHandle), db (&Db),
-      is_initial_create (bool).
+      is_initial_create (bool), kg_or_docs_content_changed (bool).
     - It returns `Vec<String>` (the warnings aggregation contract).
 
     Regex-source-parsing assertion — mirrors the
