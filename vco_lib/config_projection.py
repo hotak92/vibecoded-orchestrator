@@ -332,7 +332,7 @@ _CANONICAL_KEYS: tuple[str, ...] = (
     # module.
     #
     #   * ``DUAL_EMBEDDING_WRITE_ALL_SLOTS`` — consumed by
-    #     ``vco_lib/embedding_service.py::_dual_embedding_write_all_slots``
+    #     ``vco_lib/embedding_service.py::_resolve_write_all_slots``
     #     (reads the env verbatim; its read path is unchanged). Before
     #     T-B-flags this was an env-only toggle the DB was unaware of; now
     #     the DB is the truth that POPULATES it.
@@ -1606,7 +1606,7 @@ def project_env_from_db(
     _set("SHARED_KG_READ_DISABLED", "true" if shared_kg_read_disabled else "false")
     # v0.2.71 T-B-flags — dual-write + dual-log toggles. Boolean →
     # "true"/"false" (lowercase). The consumers parse truthily:
-    # ``embedding_service.py::_dual_embedding_write_all_slots`` matches
+    # ``embedding_service.py::_resolve_write_all_slots`` matches
     # {"1","true","yes","on"}; T-C's ``_resolve_dual_rl_log_enabled`` is the
     # same shape. Emitting "false" explicitly (rather than omitting) makes
     # the DB-driven OFF state visible on disk, which the survives-update
