@@ -86,6 +86,12 @@ HOOK_STDIN=$(cat 2>/dev/null || echo "")
 # synonym tolerance for transcript_path mirrors how the docs describe
 # it (agent_transcript_path in some payloads, plain transcript_path in
 # others). We emit whichever is present; both missing → empty string.
+#
+# v0.2.71 Track T-WT (Layer 3b): also parse the isolation flag + the
+# subagent's cwd/worktree path when the payload exposes them. These drive
+# the post-hoc worktree-violation alert below (the last-chance detector when
+# WorktreeCreate + SubagentStart both missed). Both are optional — when
+# absent the violation check no-ops gracefully.
 PARSED=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
@@ -94,18 +100,44 @@ except Exception:
     sys.exit(0)
 if not isinstance(d, dict):
     sys.exit(0)
+
+def truthy(v):
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.strip().lower() in ('worktree', 'true', '1', 'yes', 'isolated')
+    return False
+
+iso = 0
+val = d.get('isolation')
+if isinstance(val, str) and val.strip().lower() == 'worktree':
+    iso = 1
+elif truthy(val):
+    iso = 1
+if not iso:
+    for f in ('isolation_mode', 'worktree', 'isolated', 'worktree_isolation'):
+        if truthy(d.get(f)):
+            iso = 1
+            break
+cwd = (d.get('cwd') or d.get('worktree_path') or d.get('working_directory')
+       or d.get('working_dir') or d.get('dir') or '')
+
 sys.stdout.write(str(d.get('session_id', '') or '') + '\n')
 sys.stdout.write(str(d.get('agent_id', '') or '') + '\n')
 sys.stdout.write(str(d.get('agent_type', '') or '') + '\n')
 sys.stdout.write(str(d.get('agent_transcript_path') or d.get('transcript_path') or '') + '\n')
-sys.stdout.write(str(d.get('finish_reason') or d.get('stop_reason') or ''))
-" 2>/dev/null || printf '\n\n\n\n')
+sys.stdout.write(str(d.get('finish_reason') or d.get('stop_reason') or '') + '\n')
+sys.stdout.write(str(iso) + '\n')
+sys.stdout.write(str(cwd))
+" 2>/dev/null || printf '\n\n\n\n\n0\n')
 
 SESSION_ID="$(printf '%s' "$PARSED" | sed -n '1p')"
 AGENT_ID="$(printf '%s' "$PARSED" | sed -n '2p')"
 AGENT_TYPE="$(printf '%s' "$PARSED" | sed -n '3p')"
 TRANSCRIPT_PATH="$(printf '%s' "$PARSED" | sed -n '4p')"
 STOP_REASON="$(printf '%s' "$PARSED" | sed -n '5p')"
+ISO_FLAG="$(printf '%s' "$PARSED" | sed -n '6p')"
+ISO_CWD="$(printf '%s' "$PARSED" | sed -n '7p')"
 
 # Step 1 (preserved from V52-L.2): emit the audit row.
 # Build the JSONL line in Python so every field is properly escaped.
@@ -436,6 +468,95 @@ try:
 except OSError:
     sys.exit(0)
 ' 2>/dev/null || true
+fi
+
+# -------------------- Layer 3b: worktree-violation alert --------------------
+# v0.2.71 Track T-WT. Post-hoc detector: if this subagent requested
+# `isolation: worktree` AND it modified files that the snapshot diff found
+# under the PARENT checkout (diff_snapshot resolves paths relative to
+# $PROJECT_ROOT — i.e. the parent's working tree), then the isolation
+# silently fell back to the shared tree — exactly the 2026-06-30 incident.
+# Write a `worktree_violation` row to .claude/logs/worktree-guard.jsonl
+# (the same JSONL the WorktreeCreate guard writes) so the integrator has one
+# place to diagnose. This is the last-chance detector when WorktreeCreate +
+# SubagentStart both missed. Non-blocking, soft-fail.
+#
+# Guard conditions (all must hold to emit a violation):
+#   - the payload exposed an isolation flag (ISO_FLAG == 1); else no-op
+#     (we don't guess non-isolation agents into violations),
+#   - the diff found >0 changed files under the parent root (FILE_COUNT>0),
+#   - the reported cwd (if any) was NOT a separate worktree (cwd == parent
+#     toplevel OR cwd absent). When the build DOES expose a real worktree
+#     cwd that differs from the toplevel, the changed files under the parent
+#     are some OTHER write path (not the isolation fallback) and we stay
+#     silent rather than false-alarm.
+if [ "${ISO_FLAG:-0}" = "1" ] && [ "$FILE_COUNT" -gt 0 ]; then
+    WT_LOG="$LOG_DIR/worktree-guard.jsonl"
+    TOPLEVEL_WT=""
+    if command -v git >/dev/null 2>&1; then
+        TOPLEVEL_WT="$(git -C "$PROJECT_ROOT" rev-parse --show-toplevel 2>/dev/null || true)"
+    fi
+    # Decide whether the cwd indicates a genuine separate worktree.
+    # Comparison base for "is the cwd the parent checkout?": prefer the git
+    # toplevel, but when the project isn't a git repo (TOPLEVEL_WT empty) fall
+    # back to PROJECT_ROOT so a reported separate-worktree cwd still exempts.
+    _cmp_base="${TOPLEVEL_WT:-$PROJECT_ROOT}"
+    CWD_IS_PARENT=1
+    if [ -n "$ISO_CWD" ] && [ -n "$_cmp_base" ]; then
+        _norm_cwd="$ISO_CWD"
+        _norm_top="$_cmp_base"
+        if command -v realpath >/dev/null 2>&1; then
+            _norm_cwd="$(realpath -m "$ISO_CWD" 2>/dev/null || printf '%s' "$ISO_CWD")"
+            _norm_top="$(realpath -m "$_cmp_base" 2>/dev/null || printf '%s' "$_cmp_base")"
+        fi
+        # cwd differs from the parent checkout root ⇒ a real separate worktree
+        # was used; the parent-root writes came from somewhere else ⇒ no alert.
+        [ "$_norm_cwd" != "$_norm_top" ] && CWD_IS_PARENT=0
+    fi
+    if [ "$CWD_IS_PARENT" -eq 1 ]; then
+        REASON="isolation:worktree agent modified $FILE_COUNT file(s) under the parent checkout (${TOPLEVEL_WT:-$PROJECT_ROOT}) — silent shared-tree fallback detected post-hoc"
+        printf '%s\n' "$CHANGED_FILES" \
+            | AGENT_ID_FOR_PY="$AGENT_ID" \
+              SESSION_ID_FOR_PY="$SESSION_ID" \
+              AGENT_TYPE_FOR_PY="$AGENT_TYPE" \
+              REASON_FOR_PY="$REASON" \
+              TOPLEVEL_FOR_PY="${TOPLEVEL_WT:-$PROJECT_ROOT}" \
+              CWD_FOR_PY="$ISO_CWD" \
+              FILE_COUNT_FOR_PY="$FILE_COUNT" \
+              WT_LOG_FOR_PY="$WT_LOG" \
+              "$PY" -c '
+import json, os, sys
+from datetime import datetime, timezone
+out = os.environ.get("WT_LOG_FOR_PY", "")
+if not out:
+    sys.exit(0)
+files = [l.rstrip("\r\n") for l in sys.stdin if l.strip()]
+try:
+    fc = int(os.environ.get("FILE_COUNT_FOR_PY", "0"))
+except ValueError:
+    fc = len(files)
+row = {
+    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "hook": "subagent-stop-reconcile",
+    "decision": "worktree_violation",
+    "reason": os.environ.get("REASON_FOR_PY", ""),
+    "session_id": os.environ.get("SESSION_ID_FOR_PY", ""),
+    "agent_id": os.environ.get("AGENT_ID_FOR_PY", ""),
+    "agent_type": os.environ.get("AGENT_TYPE_FOR_PY", ""),
+    "parent_toplevel": os.environ.get("TOPLEVEL_FOR_PY", ""),
+    "reported_cwd": os.environ.get("CWD_FOR_PY", ""),
+    "file_count": fc,
+    # Cap the file list so a tree-wide pass cannot bloat the row.
+    "changed_files": files[:50],
+}
+try:
+    with open(out, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row) + "\n")
+except OSError:
+    pass
+' 2>/dev/null || true
+        printf 'subagent-stop-reconcile: WORKTREE VIOLATION — %s\n' "$REASON" >&2
+    fi
 fi
 
 # Cleanup: delete the snapshot file (we are done with it). Soft-fail.

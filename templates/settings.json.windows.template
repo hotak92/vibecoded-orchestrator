@@ -170,6 +170,11 @@
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/subagent-start-kg-inject.ps1",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/subagent-start-isolation-check.ps1",
+            "timeout": 3
           }
         ]
       }
@@ -181,6 +186,17 @@
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/subagent-stop-reconcile.ps1",
             "timeout": 2
+          }
+        ]
+      }
+    ],
+    "WorktreeCreate": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/worktree-guard.ps1",
+            "timeout": 3
           }
         ]
       }
