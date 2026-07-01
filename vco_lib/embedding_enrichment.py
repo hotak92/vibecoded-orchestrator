@@ -868,6 +868,159 @@ def _estimate_object_count(collection: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Per-slot populated counts (powers the "keep previous model" modal option)
+# ---------------------------------------------------------------------------
+
+# Canonical text-slot -> embedding profile map.
+#
+# MUST MATCH `EmbeddingService._text_partition_tag` in
+# `vco_lib/embedding_service.py` (the slot-driven arm at lines ~1352-1359).
+# Keep these two in sync — diverging them would mis-label the modal's
+# "keep previous model" default and write the wrong profile through
+# `set_project_active_embedding`. We deliberately mirror rather than import
+# the method because `_text_partition_tag` is an instance method bound to a
+# configured EmbeddingService; here we only have a raw slot name.
+_TEXT_SLOT_TO_PROFILE: dict[str, str] = {
+    "qwen3_embed": "qwen3",
+    "arctic2_embed": "arctic",
+    "openai_text_embed": "openai",
+    # Legacy 1024-dim arctic bucket — surfaced as "arctic" so a project that
+    # was embedded before the arctic2_embed slot existed still maps to a
+    # selectable profile rather than the opaque "legacy" partition.
+    "ollama_embed": "arctic",
+    # Legacy OpenAI slot (pre openai_text_embed split).
+    "openai_embed": "openai",
+}
+
+
+def _text_slot_to_profile(slot_name: str) -> Optional[str]:
+    """Map a KG named-vector slot to its embedding profile id, or None.
+
+    None means the slot is not a user-selectable text profile (e.g. a code
+    slot, or an unknown future slot). The caller drops such slots from the
+    "keep previous model" choice set.
+    """
+    return _TEXT_SLOT_TO_PROFILE.get(slot_name)
+
+
+def count_populated_slots(
+    collection: str,
+    *,
+    weaviate_client_factory: Optional[Callable[[], Any]] = None,
+) -> dict[str, Any]:
+    """Count objects whose named-vector slot is POPULATED, per slot.
+
+    Composes the two existing primitives:
+
+      * the v4 ``include_vector`` iteration pattern from
+        ``weaviate_schema._existing_slot_dim`` (a non-empty
+        ``obj.vector[slot]`` means that slot is populated for that object);
+      * ``_estimate_object_count`` for the collection total (the aggregate
+        denominator the modal renders as "X of N embedded").
+
+    Returns a JSON-serialisable dict::
+
+        {
+          "collection": "MyProject_KnowledgeGraph",
+          "total": 1234,
+          "slots": [
+            {"slot": "qwen3_embed",  "profile": "qwen3",  "populated": 1234},
+            {"slot": "arctic2_embed","profile": "arctic", "populated": 200},
+            ...
+          ],
+          "most_populated_profile": "qwen3"
+        }
+
+    Only slots that map to a user-selectable text profile (see
+    ``_text_slot_to_profile``) are reported, so the modal's "keep previous
+    model" choice never proposes a code-only or legacy-opaque slot.
+
+    Soft-fail: on any transport/connection failure returns the same shape
+    with ``total=0``, ``slots=[]`` and ``most_populated_profile=None`` so the
+    modal degrades to its 2-option form (no smart default) rather than
+    erroring. Counting must never gate the user's update flow.
+    """
+    total = _estimate_object_count(collection)
+
+    # Per-slot populated tally. We only track slots that map to a text
+    # profile — code slots and unknown slots are irrelevant to the
+    # active-text-embedding revert choice.
+    tally: dict[str, int] = {}
+    catalog = _slot_catalog_for(collection)
+    candidate_slots = [
+        s.name for s in catalog if _text_slot_to_profile(s.name) is not None
+    ]
+    if not candidate_slots:
+        return {
+            "collection": collection,
+            "total": total,
+            "slots": [],
+            "most_populated_profile": None,
+        }
+
+    factory = weaviate_client_factory or (lambda: _connect_weaviate(_weaviate_url()))
+    client = None
+    try:
+        client = factory()
+        col = client.collections.get(collection)
+        for obj in col.iterator(include_vector=True):
+            vec = obj.vector
+            if not isinstance(vec, dict):
+                # Legacy single-vector format has no named slots — nothing
+                # to attribute to a per-slot count.
+                continue
+            for slot in candidate_slots:
+                v = vec.get(slot)
+                if v:
+                    tally[slot] = tally.get(slot, 0) + 1
+    except Exception as e:  # noqa: BLE001 — soft-fail by contract
+        logger.warning(
+            "count_populated_slots(%r) soft-failed: %s: %s",
+            collection, type(e).__name__, e,
+        )
+        return {
+            "collection": collection,
+            "total": total,
+            "slots": [],
+            "most_populated_profile": None,
+        }
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    slots_out: list[dict[str, Any]] = []
+    for slot in candidate_slots:
+        populated = tally.get(slot, 0)
+        if populated == 0:
+            # Don't surface empty slots — they're not a "previous model" the
+            # user could meaningfully revert to.
+            continue
+        slots_out.append(
+            {
+                "slot": slot,
+                "profile": _text_slot_to_profile(slot),
+                "populated": populated,
+            }
+        )
+    # Most-populated profile drives the modal's smart default. Ties resolve
+    # to the catalog order (stable) since `slots_out` preserves it.
+    most_populated_profile: Optional[str] = None
+    if slots_out:
+        best = max(slots_out, key=lambda r: r["populated"])
+        most_populated_profile = best["profile"]
+
+    return {
+        "collection": collection,
+        "total": total,
+        "slots": slots_out,
+        "most_populated_profile": most_populated_profile,
+    }
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point (consumed by the Tauri shell-out)
 # ---------------------------------------------------------------------------
 
@@ -918,7 +1071,31 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--json", action="store_true", default=False,
         help="Output the final report as JSON (default is JSON too).",
     )
+
+    # `slot-counts` — read-only per-slot populated counts for one collection.
+    # Powers the RegenerateOrDeferModal "keep previous model" smart default.
+    counts = sub.add_parser(
+        "slot-counts",
+        help="Per-slot populated-vector counts for one collection (read-only)",
+    )
+    counts.add_argument(
+        "--collection", required=True,
+        help="Weaviate class name to count (e.g. MyProject_KnowledgeGraph)",
+    )
     return parser
+
+
+def _cli_slot_counts(args: argparse.Namespace) -> int:
+    """Implement ``python -m vco_lib.embedding_enrichment slot-counts ...``.
+
+    Always returns 0 and emits a JSON object — counting is soft-fail by
+    contract (a Weaviate outage yields ``total=0, slots=[]`` rather than a
+    non-zero exit), so the caller's update flow is never blocked.
+    """
+    result = count_populated_slots(args.collection)
+    sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+    return 0
 
 
 def _cli_enrich(args: argparse.Namespace) -> int:
@@ -988,6 +1165,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
     if args.cmd == "enrich":
         return _cli_enrich(args)
+    if args.cmd == "slot-counts":
+        return _cli_slot_counts(args)
     parser.error(f"Unknown command: {args.cmd}")
     return 2  # unreachable; parser.error exits
 
