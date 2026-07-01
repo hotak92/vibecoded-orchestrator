@@ -459,10 +459,20 @@ if [[ "$EDITED_FILE" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|jav
     _CG_SYNC_CMD="bash $(_kg_debounce_shquote "$SCRIPT_DIR/code-graph-incremental.sh") $(_kg_debounce_shquote "$EDITED_FILE") $(_kg_debounce_shquote "$PROJECT_ROOT") $(_kg_debounce_shquote "$CODE_GRAPH_PREFIX_RESOLVED")"
     _kg_debounce_schedule "$PROJECT_ROOT" "$EDITED_FILE" "$PY" "$PROJECT_ROOT" "$_CG_SYNC_CMD" "code"
 
-    _add_nudge "[Code edit reminder] $(basename "$EDITED_FILE") was just edited.
-When you're done with this work item:
-- Update CONTEXT_STATE.md with what changed and what's next.
-- Capture any non-obvious learnings as a KG node under knowledge/concepts/."
+    # v0.2.72 P6: reminder AGGREGATION. This "was just edited → update
+    # CONTEXT_STATE / capture KG" nudge previously fired on EVERY code-file
+    # Edit (~15x/turn on a busy turn — pure repetition). Instead of emitting
+    # here, APPEND the edited path to a per-turn accumulator file; the Stop
+    # hook (stop-codegraph-reminder.sh) drains it at end-of-turn and emits ONE
+    # aggregated reminder naming all edited files. Soft-fail: an unkeyable
+    # session (empty id) or a write error just skips accumulation (no reminder
+    # that turn) rather than reverting to per-edit spam. The Stop hook dedups
+    # paths, so re-editing the same file across the turn lists it once.
+    if [ -n "$SESSION_ID_FROM_STDIN" ]; then
+        _EDIT_ACCUM="$PROJECT_ROOT/.claude/state/edit_reminder_${SESSION_ID_FROM_STDIN}.txt"
+        mkdir -p "$PROJECT_ROOT/.claude/state" 2>/dev/null || true
+        printf '%s\n' "$EDITED_FILE" >> "$_EDIT_ACCUM" 2>/dev/null || true
+    fi
 fi
 
 # 4. CONTEXT_STATE.md significant-changes → expert-skill nudge.

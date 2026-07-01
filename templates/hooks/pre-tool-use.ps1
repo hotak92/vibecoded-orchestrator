@@ -232,6 +232,28 @@ if ($ToolName -eq "Bash") {
 function Invoke-CgInject([string]$q, [string]$excl, [string]$label) {
     if (-not (Get-Command Invoke-VcoCodegraphQueryBlock -ErrorAction SilentlyContinue)) { return }
     if (-not $q) { return }
+
+    # v0.2.72 P6: per-session inject VOLUME cap. The seen-store dedups by
+    # IDENTITY but a long session navigating many DISTINCT entities still
+    # injects unboundedly. Bound the TOTAL EMITTED injections per session_id
+    # (VCO_CG_INJECT_CAP, default 40). Read-only capped-check short-circuits
+    # BEFORE the codegraph query (one-line note emitted once); the counter is
+    # incremented ONLY on a real emit. Soft-fail OPEN: unkeyable session / any
+    # counter error runs UNCAPPED. MUST MATCH pre-tool-use.sh _cg_inject.
+    $cnt = ""
+    if (Get-Command Get-VcoCgInjectCountPath -ErrorAction SilentlyContinue) {
+        $cnt = Get-VcoCgInjectCountPath -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
+    }
+    if ($cnt -and (Get-Command Test-VcoCgInjectCapped -ErrorAction SilentlyContinue) `
+        -and (Test-VcoCgInjectCapped -CountFile $cnt)) {
+        if ((Get-Command Test-VcoCgInjectNoteOnce -ErrorAction SilentlyContinue) `
+            -and (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) `
+            -and (Test-VcoCgInjectNoteOnce -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot)) {
+            Emit-AdditionalContext "[codegraph injection cap reached for this session]" 'PreToolUse'
+        }
+        return
+    }
+
     $raw = Invoke-VcoCodegraphQueryBlock -Query $q -ProjectArg "" -Limit 2 -ExcludePath $excl
     if (-not $raw) { return }
     $inj = ""
@@ -246,6 +268,10 @@ function Invoke-CgInject([string]$q, [string]$excl, [string]$label) {
     if (($raw -replace '\s+', '')) {
         if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
             Emit-AdditionalContext "[${label}]:`n`n$raw" 'PreToolUse'
+            # Count this REAL injection toward the per-session cap.
+            if ($cnt -and (Get-Command Add-VcoCgInjectRecord -ErrorAction SilentlyContinue)) {
+                Add-VcoCgInjectRecord -CountFile $cnt
+            }
         }
     }
 }

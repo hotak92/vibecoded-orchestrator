@@ -301,6 +301,34 @@ _cg_inject() {
     local _q="$1" _excl="$2" _label="$3"
     command -v codegraph_query_block >/dev/null 2>&1 || return 0
     [ -n "$_q" ] || return 0
+
+    # v0.2.72 P6: per-session inject VOLUME cap. The seen-store dedups by
+    # IDENTITY (same entity is not re-injected) but a long session navigating
+    # many DISTINCT entities still injects unboundedly. Bound the TOTAL number
+    # of EMITTED injections per session_id (VCO_CG_INJECT_CAP, default 40).
+    #
+    # Two-part contract so the cap counts REAL injections (not query attempts
+    # that dedup to nothing): (1) a read-only capped-check short-circuits BEFORE
+    # the heavier codegraph subprocess once the cap is hit — emitting a ONE-LINE
+    # note EXACTLY ONCE; (2) the counter is incremented ONLY on an actual emit
+    # (bottom of the function). Soft-fail OPEN throughout: an unkeyable session
+    # (untrustworthy id) or any counter error runs UNCAPPED — a broken cap must
+    # never break injection.
+    local _cnt=""
+    if command -v vco_cg_inject_count_path >/dev/null 2>&1; then
+        _cnt="$(vco_cg_inject_count_path "$SESSION_ID_RAW" "$PROJECT_ROOT")"
+    fi
+    if [ -n "$_cnt" ] && command -v vco_cg_inject_capped >/dev/null 2>&1 \
+        && vco_cg_inject_capped "$_cnt"; then
+        # Cap reached — stop injecting. Emit the one-line note once per session.
+        if command -v vco_cg_inject_note_once >/dev/null 2>&1 \
+            && command -v emit_additional_context >/dev/null 2>&1 \
+            && vco_cg_inject_note_once "$SESSION_ID_RAW" "$PROJECT_ROOT"; then
+            emit_additional_context "[codegraph injection cap reached for this session]" PreToolUse
+        fi
+        return 0
+    fi
+
     local _raw
     _raw="$(codegraph_query_block "$_q" "" 2 "$_excl" 2>/dev/null || true)"
     [ -n "$_raw" ] || return 0
@@ -316,6 +344,11 @@ _cg_inject() {
         *[![:space:]]*)
             if command -v emit_additional_context >/dev/null 2>&1; then
                 emit_additional_context "[${_label}]:"$'\n'$'\n'"$_raw" PreToolUse
+                # Count this REAL injection toward the per-session cap. Only
+                # reached on a non-empty post-dedup block that actually emits.
+                if [ -n "$_cnt" ] && command -v vco_cg_inject_record >/dev/null 2>&1; then
+                    vco_cg_inject_record "$_cnt"
+                fi
             fi
             ;;
     esac
