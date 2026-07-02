@@ -6855,10 +6855,26 @@ class CodeGraphAnalyzer:
         return count
 
     def _get_existing_module(self, path: str, file_hash: str) -> Optional[str]:
-        """Check if module already exists with same hash.
+        """Check if module already exists with same hash AT THE CURRENT
+        EMBED REVISION.
 
-        Returns the UUID if a module with matching path and hash exists,
-        so it can be skipped during incremental analysis.
+        Returns the UUID when a module with matching path + hash exists AND
+        its stored ``embed_revision`` equals ``CODEGRAPH_EMBED_REVISION`` —
+        only then may the whole file be skipped during incremental analysis.
+
+        v0.2.72 M0 (F-GAP fix): this per-FILE gate is checked at the top of
+        every ``_analyze_*_file`` walker, BEFORE any per-object logic runs —
+        so without the revision conjunct here, the P7 forced resync was INERT
+        for unchanged files: the file-hash match short-circuited the walk and
+        the per-object ``embed_revision`` gate in ``_write_one_object`` never
+        fired. A stale/NULL module-row revision (pre-P3 embeddings) now falls
+        through to a full re-walk of the file; the per-object gates then
+        re-embed stale entities and cheaply hash-skip current ones, and the
+        module row itself is re-written with the current revision stamp — so
+        the NEXT run skips the file again (converges to one extra pass per
+        pre-v0.2.72 file). Read as an explicit property (not a filter
+        conjunct) so absent/NULL pre-migration values are handled here and
+        the behavior doesn't depend on the new prop's filter index.
         """
         try:
             result = self.modules_collection.query.fetch_objects(
@@ -6866,8 +6882,19 @@ class CodeGraphAnalyzer:
                         Filter.by_property("file_hash").equal(file_hash),
                 limit=1
             )
-            if result.objects:
-                return result.objects[0].uuid
+            if not result.objects:
+                return None
+            obj = result.objects[0]
+            stored_rev = (getattr(obj, "properties", None) or {}).get(
+                _EMBED_REVISION_PROP
+            )
+            try:
+                if stored_rev is not None and int(stored_rev) == CODEGRAPH_EMBED_REVISION:
+                    return obj.uuid
+            except (TypeError, ValueError):
+                pass
+            # Absent / NULL / older / unparseable revision → the file's rows
+            # were embedded under a previous scheme → do NOT skip the file.
             return None
         except Exception:
             return None

@@ -40,7 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and callers/cross-references resolve the canonical chunk. Stale chunk rows are
   deleted when an entity shrinks. A revision-gated background resync (per-object
   `embed_revision`, detached, resumable, no global timeout, defers when the
-  code-embed service is down) re-embeds affected entities after update.
+  code-embed service is down) re-embeds affected entities after update. The
+  per-FILE skip gate is embed-revision-aware, so the resync actually reaches
+  rows in unchanged files: the first post-update resync re-walks each
+  pre-v0.2.72 project once (background; unchanged entities at the current
+  revision hash-skip cheaply, and subsequent runs skip whole files again).
 - **Score-tiered code results.** `detail="auto"` now renders by score tier
   (summary / 1 / 3 / 7 chunks) under code-calibrated gates ({0.22/0.32/0.48/
   0.62}, env-overridable) instead of position-based top-4-full; the tier `min`

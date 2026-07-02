@@ -364,3 +364,87 @@ def test_resync_spawn_failure_degrades_to_deferral(monkeypatch, tmp_path):
     monkeypatch.setattr(mod.subprocess, "Popen", _boom)
     result = mod.spawn_background_resync(tmp_path, "MyProj", python_exe="/usr/bin/python3")
     assert result.status == "deferred", "spawn failure must degrade, not crash"
+
+
+# ─────────────── M0 (F-GAP): the per-FILE gate is revision-aware ───────────────
+#
+# v0.2.72 M0: without the revision check INSIDE `_get_existing_module`, the
+# P7 resync was INERT for unchanged files — the path+file_hash match at the
+# top of every `_analyze_*_file` walker short-circuited the whole file BEFORE
+# the per-object `embed_revision` gate (tested above) could ever run. These
+# tests drive the gate itself (THROUGH the file-skip layer, not below it).
+
+
+class _M0ModulesColl:
+    """modules_collection stub: fetch_objects returns the canned objects."""
+
+    def __init__(self, objects):
+        self.query = types.SimpleNamespace(
+            fetch_objects=lambda **kw: types.SimpleNamespace(objects=objects)
+        )
+
+
+def _m0_gate(analyzer_mod, objects):
+    stub = types.SimpleNamespace(modules_collection=_M0ModulesColl(objects))
+    return analyzer_mod.CodeGraphAnalyzer._get_existing_module(
+        stub, "pkg/mod.py", "deadbeef"
+    )
+
+
+def _m0_obj(revision):
+    return types.SimpleNamespace(uuid="uuid-1", properties={"embed_revision": revision})
+
+
+def test_m0_file_gate_current_revision_skips(analyzer_mod):
+    """path+hash match AND embed_revision == current → UUID (file skipped)."""
+    rev = analyzer_mod.CODEGRAPH_EMBED_REVISION
+    assert _m0_gate(analyzer_mod, [_m0_obj(rev)]) == "uuid-1"
+
+
+def test_m0_file_gate_null_revision_not_skipped(analyzer_mod):
+    """Pre-migration row (embed_revision NULL) → None → file re-walked.
+    THE F-GAP regression guard: pre-fix this returned the UUID and the
+    resync never reached the per-object gate for unchanged files."""
+    assert _m0_gate(analyzer_mod, [_m0_obj(None)]) is None
+
+
+def test_m0_file_gate_absent_property_not_skipped(analyzer_mod):
+    """Row without the property at all (pre-additive-migration) → None."""
+    obj = types.SimpleNamespace(uuid="uuid-1", properties={})
+    assert _m0_gate(analyzer_mod, [obj]) is None
+
+
+def test_m0_file_gate_older_revision_not_skipped(analyzer_mod):
+    """Stored revision behind current → None → file re-walked."""
+    rev = analyzer_mod.CODEGRAPH_EMBED_REVISION
+    assert _m0_gate(analyzer_mod, [_m0_obj(rev - 1)]) is None
+
+
+def test_m0_file_gate_unparseable_revision_not_skipped(analyzer_mod):
+    """Garbage revision value → conservative None (re-walk, never skip)."""
+    assert _m0_gate(analyzer_mod, [_m0_obj("not-a-number")]) is None
+
+
+def test_m0_file_gate_no_row_not_skipped(analyzer_mod):
+    """No matching path+hash row (pre-existing behavior) → None."""
+    assert _m0_gate(analyzer_mod, []) is None
+
+
+def test_m0_file_gate_fetch_error_not_skipped(analyzer_mod):
+    """A read failure must never cause a skip (fail-safe direction)."""
+    class _Boom:
+        @property
+        def query(self):
+            raise RuntimeError("weaviate down")
+
+    stub = types.SimpleNamespace(modules_collection=_Boom())
+    assert (
+        analyzer_mod.CodeGraphAnalyzer._get_existing_module(stub, "p", "h") is None
+    )
+
+
+def test_m0_float_revision_from_weaviate_still_skips(analyzer_mod):
+    """Weaviate INT props can round-trip as float (1.0) — int() coercion in
+    the gate must still recognize the current revision."""
+    rev = float(analyzer_mod.CODEGRAPH_EMBED_REVISION)
+    assert _m0_gate(analyzer_mod, [_m0_obj(rev)]) == "uuid-1"
