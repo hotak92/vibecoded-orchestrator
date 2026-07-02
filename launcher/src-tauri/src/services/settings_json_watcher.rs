@@ -159,6 +159,17 @@ const MCP_RELEVANT_ENV_KEYS: &[&str] = &[
     // --- embedding selection (weaviate_mcp reads ACTIVE_EMBEDDING / EMBEDDING_MODEL) ---
     "ACTIVE_EMBEDDING",
     "EMBEDDING_MODEL",
+    // --- v0.2.72 codegraph retrieval floors (weaviate_mcp's search_code_graph
+    // reads these via code_ranking.resolve_retrieval_floor /
+    // resolve_post_rerank_floor). set_codegraph_floors re-projects them into
+    // every project's settings.json; without listing them here the watcher
+    // would hash-match an idempotent-looking write and SKIP the reload, leaving
+    // the live MCP on stale floors (the F5 staleness the fold-in closes). The
+    // deprecated single-floor alias is listed too (code_ranking still honours
+    // it as the post-rerank gate). ---
+    "VCO_CODE_GRAPH_RETRIEVAL_FLOOR",
+    "VCO_CODE_GRAPH_POST_RERANK_FLOOR",
+    "VCO_CODE_GRAPH_SCORE_FLOOR", // deprecated alias → post-rerank floor
     // --- dual-write / dual-log toggles ---
     // projection surface writes DUAL_EMBEDDING_WRITE_ALL_SLOTS; the MCP /
     // embedding_service read is DUAL_EMBEDDING_ENABLED — list both spellings.
