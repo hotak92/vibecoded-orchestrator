@@ -1761,6 +1761,25 @@ pub async fn install_module_for_project(
                         "warnings": populate_report.warnings,
                     }),
                 )?;
+                // F5 (v0.2.72): newly-seeded access rows change every
+                // project's VCT_KG_ACCESS_LIST env — re-project so the
+                // settings watcher's diff-guard fires the guarded MCP
+                // reload. Gated on rows_inserted > 0 (idempotent
+                // re-installs stay subprocess-free) and soft-fail: a
+                // projection hiccup never blocks the module install.
+                if let Some(refresh_report) =
+                    crate::commands::project_state_populate::reproject_all_after_global_access_seed(
+                        &db,
+                        populate_report.kg_access_rows_inserted,
+                    )
+                {
+                    for (name, err) in &refresh_report.failed {
+                        eprintln!(
+                            "[vct] warning: post-seed env re-projection failed for {}: {}",
+                            name, err
+                        );
+                    }
+                }
             }
         }
     }

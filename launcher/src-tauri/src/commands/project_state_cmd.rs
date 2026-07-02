@@ -813,35 +813,7 @@ pub async fn set_project_kg_binding(
         }
     }
 
-    // v0.2.46 Decision A — orchestrator-root primary/shared atomic auto-sync.
-    // Resolve the project's slug so the DB layer can detect the
-    // orchestrator-root case (slug == "orchestrator-root"). For peer
-    // projects the slug isn't "orchestrator-root", so only the
-    // requested row is written. Soft-fail to empty-string on a missing
-    // project (the underlying write will fail with a clearer FK error).
-    let project_slug = db
-        .get_project(&project_id)
-        .ok()
-        .flatten()
-        .map(|p| p.slug)
-        .unwrap_or_default();
-    let row = db.set_project_kg_binding_with_root_sync(
-        &project_id,
-        &project_slug,
-        &req.role,
-        &req.collection_name,
-        req.embedding_model.as_deref(),
-        req.embedding_dim,
-        req.kg_dir_path.as_deref(),
-        req.weaviate_url.as_deref(),
-        &req.config,
-    )?;
-    db.audit(
-        "project_kg_binding_set",
-        Some(&project_id),
-        None,
-        &serde_json::json!({ "role": req.role, "collection": req.collection_name }),
-    )?;
+    let row = set_project_kg_binding_row_with_db(&db, &project_id, &req)?;
 
     // Bug 2 (2026-04-28): also ensure the Weaviate collection exists.
     // Previously the binding was registered in the DB but the
@@ -869,6 +841,76 @@ pub async fn set_project_kg_binding(
     Ok(row)
 }
 
+/// Free-function core of `set_project_kg_binding`'s DB write: the
+/// orchestrator-root-aware binding upsert + audit + F5 env
+/// re-projection. Testable without a Tauri runtime; the `#[command]`
+/// wrapper handles the async catalog validation + Weaviate
+/// collection-ensure around it.
+///
+/// F5 (v0.2.72): `config_projection.py` resolves KG_COLLECTION /
+/// SHARED_KG_COLLECTION / DEVELOPMENT_COLLECTION (and the derived
+/// DIAGRAMS_COLLECTION) from `project_kg_bindings` rows — all
+/// `MCP_RELEVANT_ENV_KEYS` members. Re-projecting after the write is
+/// what lets the settings watcher's diff-guard fire the guarded MCP
+/// reload for a rebind. Soft-fail: projection warnings ride in the
+/// returned result; the binding write is never rolled back.
+pub fn set_project_kg_binding_row_with_db(
+    db: &Db,
+    project_id: &str,
+    req: &SetKgBindingReq,
+) -> Result<ProjectKgBinding, String> {
+    // v0.2.46 Decision A — orchestrator-root primary/shared atomic auto-sync.
+    // Resolve the project's slug so the DB layer can detect the
+    // orchestrator-root case (slug == "orchestrator-root"). For peer
+    // projects the slug isn't "orchestrator-root", so only the
+    // requested row is written. Soft-fail to empty-string on a missing
+    // project (the underlying write will fail with a clearer FK error).
+    let project_slug = db
+        .get_project(project_id)
+        .ok()
+        .flatten()
+        .map(|p| p.slug)
+        .unwrap_or_default();
+    let row = db.set_project_kg_binding_with_root_sync(
+        project_id,
+        &project_slug,
+        &req.role,
+        &req.collection_name,
+        req.embedding_model.as_deref(),
+        req.embedding_dim,
+        req.kg_dir_path.as_deref(),
+        req.weaviate_url.as_deref(),
+        &req.config,
+    )?;
+    db.audit(
+        "project_kg_binding_set",
+        Some(project_id),
+        None,
+        &serde_json::json!({ "role": req.role, "collection": req.collection_name }),
+    )?;
+    let _ = crate::commands::projects_v2::reproject_env_soft(db, project_id);
+    Ok(row)
+}
+
+/// Free-function core of `delete_project_kg_binding` — DB delete + audit
+/// + F5 env re-projection (an unbind changes the projected
+/// KG_COLLECTION/SHARED_KG_COLLECTION resolution back to the derived
+/// defaults, so the MCP must be reloaded the same way a rebind is).
+pub fn delete_project_kg_binding_with_db(
+    db: &Db,
+    project_id: &str,
+    role: &str,
+) -> Result<crate::commands::projects_v2::RefreshProjectEnvResult, String> {
+    db.delete_project_kg_binding(project_id, role)?;
+    db.audit(
+        "project_kg_binding_delete",
+        Some(project_id),
+        None,
+        &serde_json::json!({ "role": role }),
+    )?;
+    Ok(crate::commands::projects_v2::reproject_env_soft(db, project_id))
+}
+
 /// Remove a project's KG binding for a given role. Used by the launcher
 /// GUI when the user wants to unbind a project from a KG collection
 /// (e.g. revoke "shared" so the project no longer mounts the shared KG,
@@ -885,14 +927,7 @@ pub async fn delete_project_kg_binding(
     role: String,
     db: State<'_, Db>,
 ) -> Result<(), String> {
-    db.delete_project_kg_binding(&project_id, &role)?;
-    db.audit(
-        "project_kg_binding_delete",
-        Some(&project_id),
-        None,
-        &serde_json::json!({ "role": role }),
-    )?;
-    Ok(())
+    delete_project_kg_binding_with_db(&db, &project_id, &role).map(|_| ())
 }
 
 /// POSTs a canonical KG-collection schema to Weaviate `/v1/schema` if
@@ -997,6 +1032,17 @@ fn default_true() -> bool {
     true
 }
 
+// F5 (v0.2.72) audit note — set/delete_project_codegraph_binding do NOT
+// re-project env, deliberately: `config_projection.py` derives
+// CODE_GRAPH_PROJECT from the sanitized project NAME, not from
+// `project_codegraph_bindings` (the binding's collection_prefix is
+// consumed hub-first only). A re-projection after a prefix change would
+// rewrite `.claude/settings.json` byte-identically → the watcher
+// diff-guard hash-matches → no reload — i.e. the refresh would be inert
+// and would only make these commands LOOK covered. Closing the residual
+// staleness (live MCP keeps the old hub-resolved prefix until some other
+// reload) requires projecting the prefix into a hashed env key first;
+// tracked in the F5 audit report, out of scope here.
 #[command]
 pub async fn set_project_codegraph_binding(
     project_id: String,
@@ -1091,6 +1137,76 @@ mod tests {
         // folder_path must be unique per project (UNIQUE constraint).
         db.insert_project(id, name, &format!("/tmp/mcp-perm-test/{}", id), ProjectHost::Base, id)
             .unwrap();
+    }
+
+    // ─── F5 (v0.2.72): KG-binding writes re-project env ────────────────
+
+    /// `set_project_kg_binding_row_with_db` upserts the binding AND
+    /// re-projects the project's env (KG_COLLECTION & friends derive from
+    /// `project_kg_bindings` in the canonical projection). The binding row
+    /// must land regardless of projection outcome (soft-fail contract).
+    #[test]
+    fn set_kg_binding_row_persists_and_reprojects() {
+        let db = make_db();
+        seed_project(&db, "p-f5-bind", "F5Bind");
+
+        let req = SetKgBindingReq {
+            role: "primary".to_string(),
+            collection_name: "F5Bind_KnowledgeGraph".to_string(),
+            embedding_model: None,
+            embedding_dim: None,
+            kg_dir_path: None,
+            weaviate_url: None,
+            config: serde_json::json!({}),
+        };
+        let row = set_project_kg_binding_row_with_db(&db, "p-f5-bind", &req)
+            .expect("binding write must succeed");
+        assert_eq!(row.collection_name, "F5Bind_KnowledgeGraph");
+
+        // The authoritative row is in the DB (projection soft-fail can
+        // never roll it back).
+        let bindings = db.list_project_kg_bindings("p-f5-bind").unwrap();
+        assert!(bindings
+            .iter()
+            .any(|b| b.role == "primary" && b.collection_name == "F5Bind_KnowledgeGraph"));
+    }
+
+    /// `delete_project_kg_binding_with_db` removes the row AND re-projects.
+    /// Proof of the refresh: the returned result carries the access list
+    /// only the refresh path (populate) computes — seeded here so the
+    /// value is deterministic.
+    #[test]
+    fn delete_kg_binding_removes_row_and_reprojects() {
+        let db = make_db();
+        seed_project(&db, "p-f5-unbind", "F5Unbind");
+        let req = SetKgBindingReq {
+            role: "primary".to_string(),
+            collection_name: "F5Unbind_KnowledgeGraph".to_string(),
+            embedding_model: None,
+            embedding_dim: None,
+            kg_dir_path: None,
+            weaviate_url: None,
+            config: serde_json::json!({}),
+        };
+        set_project_kg_binding_row_with_db(&db, "p-f5-unbind", &req).unwrap();
+        db.kg_set_access("p-f5-unbind", "PeerProj_KnowledgeGraph", "read")
+            .unwrap();
+
+        let result = delete_project_kg_binding_with_db(&db, "p-f5-unbind", "primary")
+            .expect("unbind must succeed");
+
+        assert!(
+            db.list_project_kg_bindings("p-f5-unbind")
+                .unwrap()
+                .iter()
+                .all(|b| b.role != "primary"),
+            "primary binding row must be gone",
+        );
+        assert_eq!(
+            result.kg_access_list,
+            vec!["PeerProj".to_string()],
+            "the delete must re-project env after the write",
+        );
     }
 
     /// Replicate `list_project_mcp_permissions`'s DB-only logic (the

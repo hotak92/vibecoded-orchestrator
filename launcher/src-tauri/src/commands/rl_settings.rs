@@ -274,6 +274,48 @@ pub async fn get_rl_global_training_source_flag(
 // `dual_rl_log_enabled` is turned on so the two flags can never reach the
 // incoherent (log=true, write=false) state.
 
+/// Free-function core of `set_dual_embedding_write_all_slots` — the DB
+/// write + coherence cascade + F5 env re-projection, testable without a
+/// Tauri runtime. The `#[command]` wrapper below only delegates.
+///
+/// F5 (v0.2.72): the flag projects into `.claude/settings.json env` as
+/// `DUAL_EMBEDDING_WRITE_ALL_SLOTS` (an `MCP_RELEVANT_ENV_KEYS` member),
+/// so after the write we re-project the project's env files — that's what
+/// lets the settings watcher's diff-guard fire the guarded MCP reload.
+/// Soft-fail: projection warnings ride in the returned result; the DB
+/// write is never rolled back.
+pub fn set_dual_embedding_write_all_slots_with_db(
+    db: &Db,
+    project_id: &str,
+    value: bool,
+) -> Result<crate::commands::projects_v2::RefreshProjectEnvResult, String> {
+    if project_id.is_empty() {
+        return Err("set_dual_embedding_write_all_slots: project_id required".into());
+    }
+    set_bool_flag_for_module(
+        db,
+        project_id,
+        ORCHESTRATOR_CORE_MODULE_ID,
+        DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY,
+        value,
+    )?;
+    // Coherence cascade: a dependent dual-log flag cannot survive its
+    // prerequisite being switched off. Mirror the GUI's grey-out by
+    // force-disabling the dependent here so the DB never holds the
+    // incoherent (log=true, write=false) pair even if the caller bypasses
+    // the GUI (e.g. a direct Tauri invoke or a future scripted setter).
+    if !value {
+        set_bool_flag_for_module(
+            db,
+            project_id,
+            MODULE_ID,
+            DUAL_RL_LOG_ENABLED_KEY,
+            false,
+        )?;
+    }
+    Ok(crate::commands::projects_v2::reproject_env_soft(db, project_id))
+}
+
 /// Set the per-project "write embeddings to ALL named-vector slots" flag.
 /// Stored in `module_settings(project_id, "orchestrator-core",
 /// "dual_embedding_write_all_slots")`. Default OFF when no row exists.
@@ -289,31 +331,7 @@ pub async fn set_dual_embedding_write_all_slots(
     value: bool,
     db: State<'_, Db>,
 ) -> Result<(), String> {
-    if project_id.is_empty() {
-        return Err("set_dual_embedding_write_all_slots: project_id required".into());
-    }
-    set_bool_flag_for_module(
-        &db,
-        &project_id,
-        ORCHESTRATOR_CORE_MODULE_ID,
-        DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY,
-        value,
-    )?;
-    // Coherence cascade: a dependent dual-log flag cannot survive its
-    // prerequisite being switched off. Mirror the GUI's grey-out by
-    // force-disabling the dependent here so the DB never holds the
-    // incoherent (log=true, write=false) pair even if the caller bypasses
-    // the GUI (e.g. a direct Tauri invoke or a future scripted setter).
-    if !value {
-        set_bool_flag_for_module(
-            &db,
-            &project_id,
-            MODULE_ID,
-            DUAL_RL_LOG_ENABLED_KEY,
-            false,
-        )?;
-    }
-    Ok(())
+    set_dual_embedding_write_all_slots_with_db(&db, &project_id, value).map(|_| ())
 }
 
 /// Read back the persisted "write embeddings to ALL named-vector slots"
@@ -334,6 +352,44 @@ pub async fn get_dual_embedding_write_all_slots(
     )
 }
 
+/// Free-function core of `set_dual_rl_log_enabled` — DB write + coherence
+/// cascade + F5 env re-projection, testable without a Tauri runtime. The
+/// `#[command]` wrapper below only delegates.
+///
+/// F5 (v0.2.72): `DUAL_RL_LOG_ENABLED` is an `MCP_RELEVANT_ENV_KEYS`
+/// member (the MCP's `_resolve_dual_rl_log_enabled` reads it from env),
+/// so the write re-projects the project's env files. Soft-fail — see
+/// `set_dual_embedding_write_all_slots_with_db`.
+pub fn set_dual_rl_log_enabled_with_db(
+    db: &Db,
+    project_id: &str,
+    value: bool,
+) -> Result<crate::commands::projects_v2::RefreshProjectEnvResult, String> {
+    if project_id.is_empty() {
+        return Err("set_dual_rl_log_enabled: project_id required".into());
+    }
+    if value {
+        // Force-enable the prerequisite BEFORE writing the dependent so an
+        // observer can never read (log=true, write=false). dual-logging
+        // requires the secondary slot to be populated.
+        set_bool_flag_for_module(
+            db,
+            project_id,
+            ORCHESTRATOR_CORE_MODULE_ID,
+            DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY,
+            true,
+        )?;
+    }
+    set_bool_flag_for_module(
+        db,
+        project_id,
+        MODULE_ID,
+        DUAL_RL_LOG_ENABLED_KEY,
+        value,
+    )?;
+    Ok(crate::commands::projects_v2::reproject_env_soft(db, project_id))
+}
+
 /// Set the per-project "also log RL events under the secondary embedding
 /// slot" flag. Stored in `module_settings(project_id, "vct-rl-reranker",
 /// "dual_rl_log_enabled")`. Default OFF when no row exists.
@@ -347,28 +403,7 @@ pub async fn set_dual_rl_log_enabled(
     value: bool,
     db: State<'_, Db>,
 ) -> Result<(), String> {
-    if project_id.is_empty() {
-        return Err("set_dual_rl_log_enabled: project_id required".into());
-    }
-    if value {
-        // Force-enable the prerequisite BEFORE writing the dependent so an
-        // observer can never read (log=true, write=false). dual-logging
-        // requires the secondary slot to be populated.
-        set_bool_flag_for_module(
-            &db,
-            &project_id,
-            ORCHESTRATOR_CORE_MODULE_ID,
-            DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY,
-            true,
-        )?;
-    }
-    set_bool_flag_for_module(
-        &db,
-        &project_id,
-        MODULE_ID,
-        DUAL_RL_LOG_ENABLED_KEY,
-        value,
-    )
+    set_dual_rl_log_enabled_with_db(&db, &project_id, value).map(|_| ())
 }
 
 /// Read back the persisted "also log RL events under the secondary
@@ -581,38 +616,48 @@ mod tests {
         assert!(!get_bool_flag_for_module(&db, p, MODULE_ID, DUAL_RL_LOG_ENABLED_KEY).unwrap());
     }
 
-    // The dependency cascade lives in the `#[command]` bodies
-    // (`set_dual_rl_log_enabled` / `set_dual_embedding_write_all_slots`),
-    // which take `State<'_, Db>` and can't be constructed in a unit test
-    // without a Tauri runtime. Following the codebase convention
-    // (`list_global_training_source_filters_by_flag` above), we replicate
-    // the setter's cascade LOGIC against the same helper functions the
-    // commands wrap — pinning the invariant without a Tauri context.
+    // F5 (v0.2.72): the cascade + re-projection now live in the
+    // `_with_db` free functions (`set_dual_rl_log_enabled_with_db` /
+    // `set_dual_embedding_write_all_slots_with_db`) that the `#[command]`
+    // wrappers delegate to — the tests below exercise the REAL logic,
+    // replacing the pre-F5 "MUST stay in lock-step" mirror helpers.
 
-    /// Helper mirroring `set_dual_rl_log_enabled`'s body (sans the
-    /// `State`/`project_id.is_empty()` wrapper) so the cascade is unit-
-    /// testable. MUST stay in lock-step with the `#[command]` body.
     fn apply_set_dual_rl_log(db: &Db, project_id: &str, value: bool) -> Result<(), String> {
-        if value {
-            set_bool_flag_for_module(
-                db, project_id, ORCHESTRATOR_CORE_MODULE_ID,
-                DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY, true,
-            )?;
-        }
-        set_bool_flag_for_module(db, project_id, MODULE_ID, DUAL_RL_LOG_ENABLED_KEY, value)
+        set_dual_rl_log_enabled_with_db(db, project_id, value).map(|_| ())
     }
 
-    /// Helper mirroring `set_dual_embedding_write_all_slots`'s body.
-    /// MUST stay in lock-step with the `#[command]` body.
     fn apply_set_dual_write(db: &Db, project_id: &str, value: bool) -> Result<(), String> {
-        set_bool_flag_for_module(
-            db, project_id, ORCHESTRATOR_CORE_MODULE_ID,
-            DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY, value,
-        )?;
-        if !value {
-            set_bool_flag_for_module(db, project_id, MODULE_ID, DUAL_RL_LOG_ENABLED_KEY, false)?;
-        }
-        Ok(())
+        set_dual_embedding_write_all_slots_with_db(db, project_id, value).map(|_| ())
+    }
+
+    /// F5 (v0.2.72): both dual-flag setters re-project the project's env
+    /// after the DB write. Proof of invocation: `reproject_env_soft` runs
+    /// `populate()` against THIS db, so a seeded `kg_collection_access`
+    /// row must surface in the returned `kg_access_list` — a value only
+    /// the refresh path computes. (The Python subprocess leg soft-fails
+    /// into `warnings` in unit-test environments; that's the designed
+    /// never-roll-back-the-write behaviour.)
+    #[test]
+    fn dual_flag_setters_reproject_env_after_write() {
+        let (db, ids) = open_db_with_projects(1);
+        let p = &ids[0];
+        db.kg_set_access(p, "PeerProj_KnowledgeGraph", "read").unwrap();
+
+        let r_write = set_dual_embedding_write_all_slots_with_db(&db, p, true)
+            .expect("dual-write setter must succeed");
+        assert_eq!(
+            r_write.kg_access_list,
+            vec!["PeerProj".to_string()],
+            "dual-write setter must have run the env re-projection (populate)",
+        );
+
+        let r_log = set_dual_rl_log_enabled_with_db(&db, p, true)
+            .expect("dual-log setter must succeed");
+        assert_eq!(
+            r_log.kg_access_list,
+            vec!["PeerProj".to_string()],
+            "dual-log setter must have run the env re-projection (populate)",
+        );
     }
 
     /// Dependency invariant: enabling `dual_rl_log_enabled` force-enables

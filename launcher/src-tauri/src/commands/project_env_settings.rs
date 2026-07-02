@@ -146,7 +146,19 @@ pub(crate) fn active_profile_for_model(model_id: &str) -> Option<&'static str> {
 /// `active_profile_for_model`; an unrecognised id leaves the canonical key
 /// untouched (conservative: don't stamp a guessed profile that could index
 /// the KG against the wrong vector slot).
-pub fn set_text_embedding_and_profile(db: &Db, model_id: &str) -> Result<(), String> {
+///
+/// F5 (v0.2.72): both keys feed the machine-global leg of the
+/// ACTIVE_EMBEDDING cascade — every project WITHOUT a sticky per-project
+/// user pick inherits the new value in its projected env. After the DB
+/// write we therefore re-project `.claude/{settings.json,env}` for ALL
+/// projects so the settings watcher's diff-guard can fire the guarded MCP
+/// reload (see `projects_v2::reproject_env_soft` for the mechanism note).
+/// Soft-fail: the returned report carries per-project outcomes; a
+/// projection hiccup never rolls back the app_state write.
+pub fn set_text_embedding_and_profile(
+    db: &Db,
+    model_id: &str,
+) -> Result<crate::commands::projects_v2::RefreshAllProjectsEnvResult, String> {
     let model_id = model_id.trim();
     db.app_state_set(APP_STATE_DEFAULT_TEXT_EMBED, model_id)
         .map_err(|e| format!("app_state_set default_text_embedding: {e}"))?;
@@ -154,7 +166,32 @@ pub fn set_text_embedding_and_profile(db: &Db, model_id: &str) -> Result<(), Str
         db.app_state_set(APP_STATE_KEY_ACTIVE_EMBEDDING, profile)
             .map_err(|e| format!("app_state_set embedding.active_profile: {e}"))?;
     }
-    Ok(())
+    Ok(crate::commands::projects_v2::refresh_all_projects_env_with_db(db))
+}
+
+/// F5 (v0.2.72): `app_state` keys whose value changes MCP-relevant
+/// per-project env (they feed the machine-global leg of the
+/// ACTIVE_EMBEDDING cascade that `config_projection.py` projects into
+/// every project's `.claude/settings.json`). The generic `app_state_set`
+/// / `app_state_set_bool` Tauri commands consult this predicate to decide
+/// whether a write must trigger a machine-global env re-projection — the
+/// launcher GUI's Preferences page writes `embedding.active_profile`
+/// through the GENERIC command, not a dedicated setter.
+///
+/// Deliberately NOT listed:
+///   * `APP_STATE_KEY_SHARED_KG_NAME` — the canonical Python projection
+///     + hub resolver derive SHARED_KG_COLLECTION from the
+///     orchestrator-root primary KG binding and do NOT read this
+///     app_state override (only the Rust `populate()` does). A refresh
+///     would be inert; see the F5 audit note on
+///     `set_shared_kg_collection_name`.
+///   * `codegraph.retrieval_floor` / `codegraph.post_rerank_floor` —
+///     written only by `set_codegraph_floors`, which already refreshes.
+pub fn app_state_key_triggers_env_reprojection(key: &str) -> bool {
+    matches!(
+        key,
+        APP_STATE_KEY_ACTIVE_EMBEDDING | APP_STATE_DEFAULT_TEXT_EMBED
+    )
 }
 
 /// Read the machine-global active-embedding profile from `app_state`.
@@ -264,24 +301,45 @@ pub fn write_project_active_embedding_user(
     Ok(())
 }
 
+/// Free-function core of `set_project_active_embedding` — write the sticky
+/// per-project pick, then re-project the env files so
+/// `.claude/{settings.json,env}` reflect the new ACTIVE_EMBEDDING and the
+/// settings watcher's diff-guard can fire the guarded MCP reload.
+///
+/// F5 (v0.2.72): the re-projection moved INTO the command (previously the
+/// doc comment delegated it to "the caller" — and one caller, the
+/// model-switch modal's "keep previous model" path, never did it, leaving
+/// the live MCP on a stale ACTIVE_EMBEDDING until an unrelated refresh).
+/// Soft-fail: a projection hiccup lands in the returned result's
+/// `warnings`; it never rolls back the DB write.
+pub fn set_project_active_embedding_with_db(
+    db: &Db,
+    project_id: &str,
+    profile: &str,
+) -> Result<crate::commands::projects_v2::RefreshProjectEnvResult, String> {
+    if project_id.is_empty() {
+        return Err("set_project_active_embedding: project_id required".into());
+    }
+    write_project_active_embedding_user(db, project_id, profile)?;
+    Ok(crate::commands::projects_v2::reproject_env_soft(db, project_id))
+}
+
 /// Tauri command — Settings-tab per-project embedding picker WRITE path.
 ///
 /// Records a deliberate user pick (`source = "user"`, sticky). The frontend
 /// passes the resolved PROFILE id (qwen3 / arctic / openai / codesage), not
 /// the raw model id — the picker maps the chosen catalog model's slot to its
-/// profile before invoking. After a successful write the caller should
-/// re-project the env files (the existing `refresh_project_env_with_db`
-/// path) so `.claude/{settings.json,env}` reflect the new ACTIVE_EMBEDDING.
+/// profile before invoking. The command re-projects the env files itself
+/// (F5, v0.2.72) — callers no longer need a follow-up
+/// `refresh_project_env` invoke (a duplicate one is a harmless idempotent
+/// no-op: the watcher diff-guard hash-matches and skips the reload).
 #[tauri::command]
 pub async fn set_project_active_embedding(
     project_id: String,
     profile: String,
     db: tauri::State<'_, Db>,
 ) -> Result<(), String> {
-    if project_id.is_empty() {
-        return Err("set_project_active_embedding: project_id required".into());
-    }
-    write_project_active_embedding_user(&db, &project_id, &profile)
+    set_project_active_embedding_with_db(&db, &project_id, &profile).map(|_| ())
 }
 
 /// Resolved per-project active-embedding profile + its provenance, for the
@@ -1648,6 +1706,99 @@ mod tests {
             .unwrap();
         let s = populate(&db, "Acme", None);
         assert_eq!(s.active_embedding, DEFAULT_ACTIVE_EMBEDDING);
+    }
+
+    // ─── F5 (v0.2.72): env re-projection after MCP-relevant DB writes ──
+
+    /// `set_project_active_embedding_with_db` writes the sticky pick AND
+    /// re-projects the project's env. Proof of the refresh: the returned
+    /// `RefreshProjectEnvResult` carries the access list only the refresh
+    /// path (populate) computes — seeded here so the value is
+    /// deterministic. Previously the refresh was delegated to "the
+    /// caller"; the model-switch modal never did it → stale MCP env.
+    #[test]
+    fn set_project_active_embedding_persists_and_reprojects() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_project(
+            "p-f5-emb",
+            "F5Emb",
+            "/nonexistent/f5-emb",
+            crate::db::models::ProjectHost::Base,
+            "f5emb",
+        )
+        .unwrap();
+        db.kg_set_access("p-f5-emb", "PeerProj_KnowledgeGraph", "read")
+            .unwrap();
+
+        let result = set_project_active_embedding_with_db(&db, "p-f5-emb", "arctic")
+            .expect("setter must succeed");
+
+        // The sticky user pick landed (cascade leg 1).
+        assert_eq!(
+            resolve_active_embedding_cascade(&db, Some("p-f5-emb")),
+            "arctic",
+        );
+        // The env re-projection ran (populate resolved the seeded peer).
+        assert_eq!(
+            result.kg_access_list,
+            vec!["PeerProj".to_string()],
+            "the setter must re-project env after the write",
+        );
+        // Empty project_id keeps its precondition error.
+        assert!(set_project_active_embedding_with_db(&db, "", "arctic").is_err());
+    }
+
+    /// `set_text_embedding_and_profile` writes the machine-global default
+    /// keys AND re-projects every project's env (all auto projects inherit
+    /// the new value via the cascade's global leg). Proof of the
+    /// refresh-all: a registered project with a missing folder lands in
+    /// the returned report's `skipped` list — only the refresh path
+    /// computes that.
+    #[test]
+    fn set_text_embedding_and_profile_reprojects_all_projects() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_project(
+            "p-f5-glob",
+            "F5Glob",
+            "/nonexistent/f5-glob",
+            crate::db::models::ProjectHost::Base,
+            "f5glob",
+        )
+        .unwrap();
+
+        let report =
+            set_text_embedding_and_profile(&db, "snowflake-arctic-embed2:latest")
+                .expect("global setter must succeed");
+
+        // Both keys written (pre-existing contract)...
+        assert_eq!(
+            db.app_state_get(APP_STATE_KEY_ACTIVE_EMBEDDING).unwrap().as_deref(),
+            Some("arctic"),
+        );
+        // ...and the machine-global refresh iterated the projects.
+        assert!(
+            report.skipped.contains(&"F5Glob".to_string()),
+            "refresh-all must have run over registered projects; got {:?}",
+            report,
+        );
+    }
+
+    /// The generic-app_state-write predicate: exactly the ACTIVE_EMBEDDING
+    /// cascade keys trigger a machine-global re-projection; launcher-state
+    /// flags and the (projection-inert) shared-KG-name override do not.
+    #[test]
+    fn app_state_reprojection_predicate_covers_cascade_keys_only() {
+        assert!(app_state_key_triggers_env_reprojection(
+            APP_STATE_KEY_ACTIVE_EMBEDDING
+        ));
+        assert!(app_state_key_triggers_env_reprojection(
+            APP_STATE_DEFAULT_TEXT_EMBED
+        ));
+        assert!(!app_state_key_triggers_env_reprojection(
+            APP_STATE_KEY_SHARED_KG_NAME
+        ));
+        assert!(!app_state_key_triggers_env_reprojection("onboarding.complete"));
+        assert!(!app_state_key_triggers_env_reprojection(APP_STATE_KEY_USE_GPU));
     }
 
     #[test]
