@@ -753,6 +753,31 @@ _EXT_TO_DISPATCH_NAME: Dict[str, str] = {
 }
 
 
+# v0.2.72 (P5 + pre-gate audit F8): name-suffix skip sets for JS/TS build
+# output and tool config — ONE home shared by the directory walkers
+# (`_find_js_files` / `_find_ts_files`) AND the single-file dispatch
+# (`_dispatch_name_for_file`), so the two entry points cannot drift on what
+# counts as "not source". `vite.config*` names are handled separately (name
+# PREFIX, not suffix) in both consumers.
+_JS_SKIP_SUFFIXES: tuple = (
+    '.min.js', '.bundle.js', '.chunk.js', '.config.js', '.config.mjs',
+)
+_TS_SKIP_SUFFIXES: tuple = (
+    '.d.ts', '.bundle.ts', '.chunk.ts', '.config.ts', '.config.mts',
+)
+
+# Dispatch-name → `_ignore_dirs_for` language key. The walkers use short
+# keys ('js'/'ts'); the dispatch table uses long names. Identity for
+# everything not listed. MUST MATCH the `_ignore_dirs_for(...)` argument each
+# `_find_*_files` method passes.
+_DISPATCH_TO_IGNORE_LANG: Dict[str, str] = {
+    "javascript": "js",
+    "typescript": "ts",
+    "svelte":     "js",     # _find_svelte_files shares the JS ignore set
+    "powershell": "shell",  # _find_powershell_files shares the shell set
+}
+
+
 def _dispatch_name_for_file(file_path: Path) -> str:
     """Return the `lang_dispatch` name for ``file_path``'s extension.
 
@@ -765,19 +790,22 @@ def _dispatch_name_for_file(file_path: Path) -> str:
     treats that as a no-op (the directory walk would not have indexed it
     either).
 
-    Special cases mirror the ``_find_*_files`` skip rules so single-file
-    mode does not index a file the directory walk would have excluded:
-      * ``*.d.ts`` declaration files (type stubs, not source).
-      * ``*.min.js`` minified bundles.
+    Name-based skips mirror the ``_find_*_files`` rules via the SHARED
+    ``_JS_SKIP_SUFFIXES`` / ``_TS_SKIP_SUFFIXES`` sets (pre-gate audit F8 —
+    this function previously only knew ``.d.ts``/``.min.js`` and let a
+    per-edit ``--only-file x.bundle.js`` re-index build output the walkers
+    skip), plus the ``vite.config*`` name-prefix rule.
     """
     name = file_path.name
     # Mirror `_find_ts_files` / `_find_js_files` name-based skips. These
     # files have a code extension but are deliberately excluded from the
     # directory walk; single-file mode must agree so an edit to one is a
     # no-op rather than an inconsistent index.
-    if name.endswith(".d.ts"):
+    if any(name.endswith(s) for s in _JS_SKIP_SUFFIXES):
         return ""
-    if name.endswith(".min.js"):
+    if any(name.endswith(s) for s in _TS_SKIP_SUFFIXES):
+        return ""
+    if name.startswith("vite.config"):
         return ""
     return _EXT_TO_DISPATCH_NAME.get(file_path.suffix.lower(), "")
 
@@ -3740,6 +3768,46 @@ class CodeGraphAnalyzer:
         if "total_chunks" not in props:
             props["total_chunks"] = 1
 
+    def _delete_stale_chunk_rows(
+        self, collection, full_name: str, file_path_rel: str,
+        current_source: str, min_chunk_num: int,
+    ) -> None:
+        """Delete leftover chunk rows (``chunk_num >= min_chunk_num``) of ONE
+        entity (F3, pre-gate audit, SEV-2).
+
+        When a chunked entity SHRINKS (3 chunks → 2, or → back to a single
+        object), the write path only writes chunks ``0..N-1`` — the old
+        ``::N``/``::N+1`` rows carry deterministic UUIDs the new run never
+        touches, so they linger forever: stale body text keeps matching
+        searches and the collapse counts phantom chunks. Scope the delete by
+        the entity's full identity (project / project_source / file_path /
+        full_name) so ONLY this entity's tail rows go.
+
+        Soft-fail by contract: any delete error logs a warning and returns —
+        a cleanup failure must never fail the write that triggered it (the
+        stale rows are the pre-fix status quo, not a regression).
+        """
+        if not full_name or min_chunk_num < 1:
+            return
+        try:
+            flt = Filter.by_property("full_name").equal(full_name)
+            flt = flt & Filter.by_property("chunk_num").greater_or_equal(
+                int(min_chunk_num)
+            )
+            if file_path_rel:
+                flt = flt & Filter.by_property("file_path").equal(file_path_rel)
+            if self.project_name:
+                flt = flt & Filter.by_property("project").equal(self.project_name)
+            if current_source:
+                flt = flt & Filter.by_property("project_source").equal(current_source)
+            collection.data.delete_many(where=flt)
+        except Exception as exc:  # noqa: BLE001 — cleanup must never fail a write
+            print(
+                f"⚠️  stale-chunk cleanup failed for {full_name} "
+                f"(chunk_num >= {min_chunk_num}): {exc}",
+                file=sys.stderr,
+            )
+
     def _maybe_chunk_and_write(
         self, collection, insert_params: dict, identity_key: str,
         file_path_rel: str, current_source_for_uuid: str,
@@ -3890,6 +3958,19 @@ class CodeGraphAnalyzer:
         # replace()/insert(). A read failure must never cause a stale index.
         props = insert_params.get("properties")
         skip_replace = False
+        # F3 (pre-gate audit): chunk-shrink detection. When the CANONICAL
+        # (chunk 0) write of a Function/Class finds the stored row was chunked
+        # into MORE chunks than this run is writing, the tail rows
+        # (chunk_num >= new total) are stale — schedule a scoped delete.
+        # Piggybacks on the existing point-read (no extra read); fires on BOTH
+        # the skip and write paths (a byte-identical chunk 0 can still coexist
+        # with a shrunken tail). None → no cleanup.
+        _coll_name_for_read = getattr(collection, "name", "") or ""
+        _is_chunkable = (
+            _coll_name_for_read.endswith("CodeFunction")
+            or _coll_name_for_read.endswith("CodeClass")
+        )
+        stale_chunk_min: Optional[int] = None
         if isinstance(props, dict):
             try:
                 content_hash = _content_hash_for_object(
@@ -3915,14 +3996,39 @@ class CodeGraphAnalyzer:
                     query = getattr(collection, "query", None)
                     fetch_by_id = getattr(query, "fetch_object_by_id", None) if query else None
                     if callable(fetch_by_id):
+                        # F3: for chunkable collections also read the stored
+                        # total_chunks so the shrink detector below can run.
+                        # NOT requested for Module/API/Interaction — their
+                        # schemas don't carry chunk props and an unknown
+                        # return_property would error the read into the
+                        # fail-safe write path (re-introducing tombstones).
+                        _read_props = ["content_hash", _EMBED_REVISION_PROP]
+                        if _is_chunkable:
+                            _read_props.append("total_chunks")
                         existing = fetch_by_id(
                             det_uuid,
-                            return_properties=["content_hash", _EMBED_REVISION_PROP],
+                            return_properties=_read_props,
                         )
                         # fetch_object_by_id returns None when absent.
                         if existing is not None:
                             existing_props = getattr(existing, "properties", None) or {}
                             stored_hash = existing_props.get("content_hash") or ""
+                            # F3 shrink detector — canonical (chunk 0 / legacy
+                            # None) writes only, so the per-chunk fan-out
+                            # doesn't re-trigger it N times.
+                            if _is_chunkable and props.get("chunk_num") in (0, None):
+                                try:
+                                    _stored_total = int(
+                                        existing_props.get("total_chunks") or 1
+                                    )
+                                except (TypeError, ValueError):
+                                    _stored_total = 1
+                                try:
+                                    _new_total = int(props.get("total_chunks") or 1)
+                                except (TypeError, ValueError):
+                                    _new_total = 1
+                                if _stored_total > _new_total >= 1:
+                                    stale_chunk_min = _new_total
                             # v0.2.72 (P7): FINGERPRINT GATE. Skip ONLY when BOTH
                             # (a) the content is byte-identical (content_hash
                             # matches) AND (b) the stored row was embedded under
@@ -3946,6 +4052,18 @@ class CodeGraphAnalyzer:
                     # fall through to the unconditional write. Never skip on
                     # uncertainty.
                     skip_replace = False
+
+        # F3: the entity shrank — delete the stale tail rows. Runs on BOTH the
+        # skip and write paths (the cleanup itself soft-fails; see helper).
+        if stale_chunk_min is not None and isinstance(props, dict):
+            self._delete_stale_chunk_rows(
+                collection,
+                props.get("full_name") or identity_key,
+                props.get("file_path") or "",
+                props.get("project_source")
+                or getattr(self, "_current_source", ""),
+                stale_chunk_min,
+            )
 
         if skip_replace:
             # Unchanged object: no replace(), no tombstone, no write. Still
@@ -4791,8 +4909,12 @@ class CodeGraphAnalyzer:
             debounced run);
           * the file is not under ``repo_path`` (wrong relativization root
             would create duplicate/zombie rows keyed on a bad path);
-          * the extension is unrecognised / explicitly skipped
-            (``.d.ts``, ``.min.js``);
+          * the extension is unrecognised / explicitly skipped (the shared
+            ``_JS_SKIP_SUFFIXES`` / ``_TS_SKIP_SUFFIXES`` sets — ``.d.ts``,
+            ``.min.js``, ``.bundle.js``, ``.chunk.js``, ``.config.*``,
+            ``vite.config*``);
+          * the file sits under an ignored directory (the walker's
+            ``_ignore_dirs_for(language)`` set + ``.wt``/``vendor`` — F8);
           * a ``--language`` filter was supplied and the file's language
             does not match it.
         """
@@ -4858,6 +4980,32 @@ class CodeGraphAnalyzer:
             # walk would not have indexed it either → silent no-op.
             return []
 
+        # F8 (pre-gate audit): reject files under ignored directories. The
+        # directory walk skips these trees entirely, but a per-edit
+        # `--only-file .wt/a/b.py` or `vendor/lib/x.js` bypassed the walkers
+        # and re-indexed noise rows. Check the REPO-RELATIVE path parts (the
+        # repo may itself live under a dir named e.g. `build`) against the
+        # SAME `_ignore_dirs_for(language, index_dot_claude)` set the walker
+        # for this language uses, plus `.wt`/`vendor` unconditionally
+        # (worktree containers + vendored third-party code are never
+        # single-file-index targets regardless of language).
+        ignore_lang = _DISPATCH_TO_IGNORE_LANG.get(dispatch_name, dispatch_name)
+        # getattr-default keeps the path safe for test fixtures built via
+        # __new__ that don't set index_dot_claude (same pattern as the
+        # `_current_language` / `_current_source` reads in _dedup_insert).
+        ignore_dirs = _ignore_dirs_for(
+            ignore_lang, getattr(self, "index_dot_claude", False),
+        )
+        ignore_dirs = ignore_dirs | frozenset({'.wt', 'vendor'})
+        rel_parts = resolved.relative_to(repo_root).parts
+        if any(part in ignore_dirs for part in rel_parts[:-1]):
+            print(
+                f"ℹ️  Single-file analyze: {resolved} is under an ignored "
+                "directory — skipping (the directory walk skips it too)",
+                file=sys.stderr,
+            )
+            return []
+
         if lang_filter and lang_filter != dispatch_name:
             # An explicit --language was passed and this file isn't it.
             return []
@@ -4905,12 +5053,12 @@ class CodeGraphAnalyzer:
         ignore_dirs = _ignore_dirs_for('js', self.index_dot_claude)
         # v0.2.72 (P5): `.bundle.js` + `.chunk.js` join `.min.js` — these
         # are build-output bundles (webpack/rollup/esbuild), not source.
-        # The launcher's `launcher/vendor/diagrams-editor/excalidraw/
-        # excalidraw.bundle.js` was live-confirmed injecting its functions
-        # as retrieval context. `.chunk.js` covers split-chunk output that
-        # doesn't live under an already-ignored codegen dir.
-        skip_suffixes = {'.min.js', '.bundle.js', '.chunk.js',
-                         '.config.js', '.config.mjs'}
+        # A vendored `excalidraw.bundle.js` was live-confirmed injecting its
+        # functions as retrieval context. `.chunk.js` covers split-chunk
+        # output that doesn't live under an already-ignored codegen dir.
+        # F8: the suffix set is the SHARED module-level constant so the
+        # single-file dispatch (`_dispatch_name_for_file`) cannot drift.
+        skip_suffixes = set(_JS_SKIP_SUFFIXES)
         files = []
         for ext in ('*.js', '*.mjs', '*.jsx'):
             for f in repo_path.rglob(ext):
@@ -4929,7 +5077,9 @@ class CodeGraphAnalyzer:
         # v0.2.72 (P5): `.bundle.ts` / `.chunk.ts` mirror the JS bundle
         # skips. Bundle output is almost always `.js`, but the mirror keeps
         # the two find-methods symmetric if a toolchain emits `.ts` bundles.
-        skip_suffixes = {'.bundle.ts', '.chunk.ts', '.config.ts', '.config.mts'}
+        # F8: shared module-level constant (includes `.d.ts` type stubs) so
+        # the single-file dispatch cannot drift.
+        skip_suffixes = set(_TS_SKIP_SUFFIXES)
         files = []
         for ext in ('*.ts', '*.tsx'):
             for f in repo_path.rglob(ext):
@@ -4938,9 +5088,6 @@ class CodeGraphAnalyzer:
                 if any(f.name.endswith(s) for s in skip_suffixes):
                     continue
                 if f.name.startswith('vite.config'):
-                    continue
-                # Skip .d.ts declaration files (type stubs, not source)
-                if f.name.endswith('.d.ts'):
                     continue
                 files.append(f)
         return sorted(files)
@@ -6922,6 +7069,54 @@ class CodeGraphAnalyzer:
             return True
         return is_canonical
 
+    def _assemble_full_body_from_chunks(
+        self, full_name: str, canonical_props: dict, total_chunks: int,
+        fallback: str,
+    ) -> str:
+        """Reassemble a chunked function's FULL body from all its chunk rows
+        (F7, pre-gate audit, SEV-3).
+
+        The calls pass used to ``ast.parse`` chunk-0's body alone — for a
+        chunked (over-budget) function that is only the FIRST slice, and a
+        mid-block chunk boundary raises ``SyntaxError`` → ``continue`` — so
+        exactly the big hub functions lost BOTH their ``calls`` references and
+        their ``call_names``. Fetch every chunk row for the entity (scoped by
+        file_path + project so a same-named entity in another file can't mix
+        in), strip the ``[chunk N/total]`` headers, and join in chunk order.
+
+        Returns ``fallback`` (the chunk-0 body) on ANY fetch failure or when
+        fewer than 2 rows come back — the caller then degrades to the pre-fix
+        partial-parse behaviour, never worse.
+        """
+        if not full_name or total_chunks <= 1:
+            return fallback
+        try:
+            flt = Filter.by_property("full_name").equal(full_name)
+            fp = canonical_props.get("file_path") or ""
+            if fp:
+                flt = flt & Filter.by_property("file_path").equal(fp)
+            if self.project_name:
+                flt = flt & Filter.by_property("project").equal(self.project_name)
+            resp = self.functions_collection.query.fetch_objects(
+                filters=flt, limit=max(total_chunks + 4, 8),
+            )
+            rows: List[tuple] = []
+            for obj in resp.objects:
+                p = obj.properties or {}
+                try:
+                    cn = int(p.get("chunk_num") or 0)
+                except (TypeError, ValueError):
+                    cn = 0
+                body_part = _strip_chunk_header(p.get("function_body", "") or "")
+                rows.append((cn, body_part))
+            if len(rows) <= 1:
+                return fallback
+            rows.sort(key=lambda t: t[0])
+            assembled = "\n".join(b for _, b in rows if b)
+            return assembled or fallback
+        except Exception:  # noqa: BLE001 — degrade to the chunk-0 body
+            return fallback
+
     def _populate_caches_from_weaviate(self):
         """Load all existing objects into caches from Weaviate.
 
@@ -7035,21 +7230,37 @@ class CodeGraphAnalyzer:
             # v0.2.72 (P3): `func_uuid` is the CANONICAL (chunk 0) UUID from the
             # cache (see `_prefer_canonical_chunk`). Point-read by that UUID
             # rather than a `full_name`-filtered `limit=1` fetch, which with
-            # multi-chunk objects could return a NON-canonical chunk. NOTE: on
-            # an over-budget (chunked) function, chunk 0's body is only the
-            # first chunk of the source — call extraction is therefore partial
-            # for the rare (~8%) chunked case, an accepted limitation (the body
-            # no longer lives in one object). The `data.update(call_names)`
-            # below still writes to the canonical object, so callers-queries
-            # resolve correctly.
+            # multi-chunk objects could return a NON-canonical chunk.
+            # F7 (pre-gate audit): for a chunked function, reassemble the FULL
+            # body from all chunk rows before AST parse — chunk-0 alone was a
+            # partial slice whose mid-block boundary raised SyntaxError, so
+            # exactly the big hub functions lost calls + call_names. Fetch
+            # failure falls back to the chunk-0 body (pre-fix behaviour). The
+            # `data.update(call_names)` below still writes to the canonical
+            # object, so callers-queries resolve correctly.
             try:
                 canonical = self.functions_collection.query.fetch_object_by_id(func_uuid)
                 body = canonical.properties.get("function_body", "") if canonical is not None else ""
                 if not body:
                     continue
 
+                try:
+                    _total_chunks = int(
+                        (canonical.properties.get("total_chunks") or 1)
+                        if canonical is not None else 1
+                    )
+                except (TypeError, ValueError):
+                    _total_chunks = 1
+                if _total_chunks > 1:
+                    body = self._assemble_full_body_from_chunks(
+                        full_name, canonical.properties or {}, _total_chunks,
+                        fallback=body,
+                    )
+
                 # Strip a leading `[chunk N/total]` header (chunked chunk-0
-                # bodies carry it) before AST parse, else `ast.parse` chokes.
+                # bodies carry it; the reassembly helper strips per-row, so
+                # this is a no-op there) before AST parse, else `ast.parse`
+                # chokes.
                 body = _strip_chunk_header(body)
 
                 # Parse body to extract calls

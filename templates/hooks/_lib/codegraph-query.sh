@@ -44,7 +44,12 @@ vco_codegraph_cli() {
 #   $1 query        — the search query (symbol / module name / bash symbol token)
 #   $2 project_arg  — "--project Foo" or "" (already shell-token-shaped)
 #   $3 limit        — max results (default 2)
-#   $4 exclude_path — a path to grep -v out of the results (avoid self-injection)
+#   $4 exclude_path — forwarded to the CLI as `--exclude-file` so candidates
+#                     from that file are culled BEFORE the result trim
+#                     (v0.2.72 B2 — replaces the old post-hoc line-wise
+#                     `grep -v`, which stripped only the CODE: header line and
+#                     left orphaned body lines when the anchor's same-file
+#                     boost promoted the edited file's own entities)
 #   $5 anchor       — optional edited-file path or grep symbol; forwarded as
 #                     `--anchor` so the CLI's shared retrieval pipeline biases
 #                     the rerank toward call-linked / same-module / shared-type
@@ -72,6 +77,12 @@ codegraph_query_block() {
         set -- "$@" $project_arg
     fi
     set -- "$@" --limit "$limit" --hook-format
+    if [ -n "$exclude_path" ]; then
+        # B2: root-fix self-exclusion — the CLI drops the file's candidates
+        # pre-trim, so the top-K fills with OTHER files' context instead of
+        # being decapitated by a post-hoc grep. MUST MATCH codegraph-query.ps1.
+        set -- "$@" --exclude-file "$exclude_path"
+    fi
     if [ -n "$anchor" ]; then
         set -- "$@" --anchor "$anchor"
     fi
@@ -96,12 +107,10 @@ codegraph_query_block() {
     fi
 
     [ -n "$raw" ] || return 0
-    # Drop any self-reference (the file being edited/read) and cap the volume.
-    if [ -n "$exclude_path" ]; then
-        printf '%s\n' "$raw" | grep -v -F -- "$exclude_path" | head -20
-    else
-        printf '%s\n' "$raw" | head -20
-    fi
+    # Cap the volume. Self-reference exclusion happens INSIDE the CLI via
+    # --exclude-file (B2) — the old line-wise `grep -v` here stripped only the
+    # CODE: header line and left orphaned body lines. Do not re-add it.
+    printf '%s\n' "$raw" | head -20
 }
 
 # codegraph_pattern_gate <pattern>

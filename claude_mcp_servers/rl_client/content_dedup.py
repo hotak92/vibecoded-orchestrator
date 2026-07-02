@@ -12,10 +12,12 @@ re-implementing them per-site:
 
   1. IDENTITY dedup — "the same logical node retrieved twice" (e.g. two query
      chunks both surfaced node A, or two chunks of the same multi-chunk node).
-     Key = ``(file_path, title)`` for KG; the first non-empty of
-     ``full_name / endpoint / path / title`` for code. This is what
-     ``_collapse_to_one_per_node`` and the old ``query_chunking._node_key``
-     already did — pulled here so there is one definition.
+     Key = ``(file_path, title)`` for KG; for code, ``(file_path, name)``
+     where name = the first non-empty of ``full_name / endpoint / path /
+     title`` (pure-name fallback when the dict carries no file_path — see
+     ``code_identity_key``). This is what ``_collapse_to_one_per_node`` and
+     the old ``query_chunking._node_key`` already did — pulled here so there
+     is one definition.
 
   2. CONTENT-IDENTITY dedup — "two entries with the SAME NAME and the SAME
      CONTENT reaching Claude twice." Key = ``(name, content_hash)``. This
@@ -97,19 +99,37 @@ def node_identity_key(node: dict) -> tuple:
 
 
 def code_identity_key(node: dict) -> Any:
-    """Code-entity identity — first non-empty of full_name/endpoint/path/title.
+    """Code-entity identity — ``(file_path, name)`` when the dict carries a
+    ``file_path``; else the bare name (first non-empty of
+    full_name/endpoint/path/title).
 
-    Mirrors the key ``query_chunking.combine_codegraph_results`` used inline.
+    v0.2.72 (pre-gate audit F2): the pure-name key collapsed DISTINCT
+    same-leaf entities living in different files — e.g. ``cli/main.py::run``
+    and ``worker/main.py::run`` both stringify to full_name ``main.run``, so
+    the second silently vanished from results. Including ``file_path`` in the
+    key disambiguates them. The PURE-NAME FALLBACK is kept for callers whose
+    dicts carry no ``file_path`` (hook-block dedup via
+    ``query_chunking.combine_codegraph_results`` pools property-less nodes) —
+    their behaviour is byte-identical to pre-v0.2.72 (back-compat).
+
     Falls back to ``id(node)`` so a property-less dict is never collapsed into
     an unrelated one (it keys on its own object identity → kept).
     """
-    return (
+    name = (
         node.get("full_name")
         or node.get("endpoint")
         or node.get("path")
         or node.get("title")
-        or id(node)
     )
+    if not name:
+        return id(node)
+    file_path = node.get("file_path") or ""
+    if file_path:
+        # (file_path, name): distinct files never merge. When name IS the
+        # path (CodeModule keys on `path`) the pairing is redundant but
+        # harmless — same tuple for the same row.
+        return (file_path, name)
+    return name
 
 
 # --- content extraction (which field carries the body, per node kind) --------

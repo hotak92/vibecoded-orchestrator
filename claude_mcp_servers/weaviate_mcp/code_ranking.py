@@ -389,12 +389,14 @@ def run_code_retrieval_pipeline(
         re-introduce dropped candidates. ``None`` (default) = identity.
 
     ``tier_fn(results: list[dict]) -> list[dict]`` (P4, optional)
-        Receives the (optionally collapsed) list and returns the SAME list
-        (same length, same order) with per-result verbosity/tier annotations
-        added (e.g. a ``"_tier"`` key) so the downstream formatter can vary
-        detail by rank/score. It must NOT drop or reorder rows — that is the
-        pipeline's job. Called AFTER ``collapse_fn``, BEFORE the ``limit`` trim.
-        ``None`` (default) = identity.
+        Receives the (optionally collapsed) list and returns rows in the SAME
+        relative order with per-result verbosity/tier annotations added (e.g.
+        a ``"_tier"`` key) so the downstream formatter can vary detail by
+        rank/score. It MAY DROP discard-tier rows (score below the tier
+        ``min`` gate — the code tier_fn from ``make_code_tier_fn`` does
+        exactly that), but it must NOT reorder or add rows. Called AFTER
+        ``collapse_fn``, BEFORE the ``limit`` trim. ``None`` (default) =
+        identity.
 
     ``anchor_props`` ``None`` → boost is 0 for every candidate → pure semantic
     ordering (the direct-MCP-call path, no seed to reorder around).

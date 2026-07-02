@@ -314,6 +314,28 @@ def _assemble_priority_head(
     return "\n".join(parts)
 
 
+def _body_without_priority_lines(body: str, language: str) -> str:
+    """The body MINUS the lines already carried by the priority head.
+
+    F11-v (pre-gate audit): the over-budget test used to compare
+    ``priority_head + "\\n" + body`` against the budget — but ``body`` STILL
+    CONTAINS the signature line and the docstring the head already carries,
+    so the docstring was counted twice and a borderline entity chunked (N=2
+    objects, headers, extra embeds) when the DEDUPed assembly actually fits.
+
+    Mirrors the skip logic of ``truncate_function_for_embedding`` /
+    ``truncate_class_for_embedding`` (skip the first line + the docstring's
+    line count) so the over-budget test measures exactly what the in-budget
+    single text assembles.
+    """
+    lines = body.split("\n")
+    skip = 1  # first line (signature)
+    docstring = _extract_docstring(body, language)
+    if docstring:
+        skip += len(docstring.split("\n"))
+    return "\n".join(lines[skip:])
+
+
 def chunk_or_truncate_for_embedding(
     signature: str,
     body: str,
@@ -361,8 +383,13 @@ def chunk_or_truncate_for_embedding(
     # max_chars by construction, so it can never look over-budget. The real
     # question is "did truncation drop content?", i.e. is the full text bigger
     # than the budget?
+    #
+    # F11-v (pre-gate audit): assemble head + body-WITHOUT-the-head's-lines
+    # (mirrors the in-budget path's skip logic) — appending the raw body
+    # double-counted the docstring, chunking borderline entities that fit.
     priority_head = _assemble_priority_head(signature, body, language)
-    full_text = f"{priority_head}\n{body}" if body else priority_head
+    body_rest = _body_without_priority_lines(body, language) if body else ""
+    full_text = f"{priority_head}\n{body_rest}" if body_rest else priority_head
 
     if len(full_text) <= max_chars:
         # In budget → the single truncated text already carries the whole
@@ -437,7 +464,10 @@ def chunk_or_truncate_class_for_embedding(
         priority_head = priority_head + "\nMethods: " + ", ".join(method_sigs)
     elif methods:
         priority_head = priority_head + "\nMethods: " + ", ".join(methods[:20])
-    full_text = f"{priority_head}\n{class_body}" if class_body else priority_head
+    # F11-v: same docstring dedup as the function variant (the method-sig
+    # summary line is head-only content, so it stays counted once).
+    body_rest = _body_without_priority_lines(class_body, language) if class_body else ""
+    full_text = f"{priority_head}\n{body_rest}" if body_rest else priority_head
 
     if len(full_text) <= max_chars:
         return [single]

@@ -1012,19 +1012,28 @@ _TIER_THRESHOLDS: dict[str, float] = {
 # than KG's (CodeSage-embedded source vs qwen3-embedded prose), so the KG
 # min=0.42 would DISCARD good code matches — this is exactly the v0.2.70 Bug B
 # (code post_rerank_floor is 0.22, so the code tier `min` MUST be <= 0.22 or
-# genuine code hits get thrown away before they can render). We set min=0.22 to
-# match the code retrieval floor, then step the richer tiers up from there:
-#   score < 0.22        → discard (aligned with post_rerank_floor 0.22)
-#   0.22..0.45          → summary (signature + first chunk for code)
-#   0.45..0.60          → single_chunk
-#   0.60..0.75          → three_chunks
-#   >= 0.75             → full (up to 7 chunks)
+# genuine code hits get thrown away before they can render).
+#
+# v0.2.72 pre-gate recalibration (measured-band rationale):
+#   * NL on-topic queries land ~0.28-0.42 against CodeSage vectors — with the
+#     old single_chunk=0.45 they ALL rendered as summary-only. single_chunk at
+#     0.32 lets a mid-band on-topic hit render a real chunk of code.
+#   * 0.48 is the top of the NL band / lower neighbour band → three_chunks.
+#   * 0.62 sits just above the measured 0.59 good-code→code floor → full.
+#   score < 0.22        → discard (default; in auto mode the EFFECTIVE `min`
+#                          derives from resolve_post_rerank_floor(slot) at
+#                          call time — see make_code_tier_fn(min_gate=...) —
+#                          so a GUI floor override changes what renders)
+#   0.22..0.32          → summary (signature + doc / first chunk for code)
+#   0.32..0.48          → single_chunk
+#   0.48..0.62          → three_chunks
+#   >= 0.62             → full (up to 7 chunks)
 # Overridable via CODE_TIER_* env vars (parallel to KG_TIER_*).
 _CODE_TIER_THRESHOLDS: dict[str, float] = {
     "min":          float(os.getenv("CODE_TIER_MIN",          "0.22")),
-    "single_chunk": float(os.getenv("CODE_TIER_SINGLE_CHUNK", "0.45")),
-    "three_chunks": float(os.getenv("CODE_TIER_THREE_CHUNKS", "0.60")),
-    "full":         float(os.getenv("CODE_TIER_FULL",         "0.75")),
+    "single_chunk": float(os.getenv("CODE_TIER_SINGLE_CHUNK", "0.32")),
+    "three_chunks": float(os.getenv("CODE_TIER_THREE_CHUNKS", "0.48")),
+    "full":         float(os.getenv("CODE_TIER_FULL",         "0.62")),
 }
 
 # Per-tier chunk window (how many chunks to assemble from a chunked node)
@@ -1476,17 +1485,29 @@ def _format_code_result_by_tier(
         out["distance"] = f"{distance:.3f}"
 
     # Identity fields always present so the agent can locate the entity.
+    doc = ""
     if collection in ("CodeFunction", "CodeClass"):
         out["full_name"] = properties.get("full_name", "")
         out["signature"] = properties.get("signature", "")
+        # R1 (design audit): surface the stored `doc` (docstring) — the
+        # analyzer extracts and stores it, but the tier renderer dropped it.
+        # Signature + doc reads better than signature + raw code snippet.
+        doc = properties.get("doc") or ""
+        if doc:
+            out["doc"] = doc
 
     if tier == "summary":
-        # Code has no sidecar summary. Signature (above) + first chunk body,
-        # truncated for the summary tier. The sidecar lookup is GUARDED — for a
-        # code file_path it returns None and we never dereference it.
+        # Code has no sidecar summary. Signature (above) + doc / first chunk
+        # body, truncated for the summary tier. The sidecar lookup is GUARDED —
+        # for a code file_path it returns None and we never dereference it.
         sidecar = _get_node_format(file_path, "summary", collection) if file_path else None
         if isinstance(sidecar, str) and sidecar:
             out["summary"] = sidecar
+        elif doc:
+            # R1: PREFER the stored doc over the raw first-chunk body snippet
+            # for the summary tier — signature + docstring is the better
+            # ~400-char orientation than signature + truncated code.
+            out["summary"] = _truncate_code_field(doc, 400)
         else:
             body = properties.get(body_field, "") or ""
             out["summary"] = _truncate_code_field(_strip_chunk_header_text(body), 400)
@@ -1564,15 +1585,38 @@ def make_code_collapse_fn(*, dedup_kind: str = "code"):
         flat: list[dict] = []
         for r in rows:
             p = r.get("_p") or {}
-            flat.append({
-                **r,  # preserve _s / _p / _rerank / _boost / _c / _d
-                "file_path": p.get("file_path") or "",
-                "full_name": p.get("full_name") or "",
+            # F1 (pre-gate audit, SEV-1): per-collection identity fallback.
+            # CodeModule carries `path` (not file_path/full_name); CodeAPI
+            # carries `endpoint`+`method`. Without the fallback both flatten
+            # to the ("","") key, bucket into ONE group, and only the single
+            # best row survives (modules + APIs even merged together).
+            entry = {
+                **r,  # preserve _s / _p / _rerank / _boost / _c / _d / _src
+                "file_path": p.get("file_path") or p.get("path") or "",
+                "full_name": (
+                    p.get("full_name")
+                    or p.get("path")
+                    or f'{p.get("method", "") or ""} {p.get("endpoint", "") or ""}'.strip()
+                ),
                 "chunk_num": p.get("chunk_num"),
                 # collapse ranks on THIS field → use the boosted score so P2
                 # ordering (not raw semantic) decides the surviving chunk.
                 "combined_score": r.get("_rerank", r.get("_s", 0.0)),
-            })
+            }
+            # F2 (pre-gate audit, SEV-2): carry the body fields to the top
+            # level so the content-identity fingerprint
+            # (content_dedup.code_content_text) hashes the REAL body instead
+            # of an empty string — an empty fingerprint made every flattened
+            # row fall back to the pure-name identity key, which deduped
+            # distinct same-name entities across files.
+            for _bf in (
+                "function_body", "class_body", "module_summary",
+                "api_description", "signature",
+            ):
+                _bv = p.get(_bf)
+                if _bv and _bf not in entry:
+                    entry[_bf] = _bv
+            flat.append(entry)
         collapsed = _collapse_to_one_per_node(
             flat,
             score_field="combined_score",
@@ -1589,19 +1633,34 @@ def make_code_collapse_fn(*, dedup_kind: str = "code"):
 def make_code_tier_fn(
     remaining_budget: int = _HYBRID_CHUNK_BUDGET,
     thresholds: dict[str, float] | None = None,
+    *,
+    min_gate: float | None = None,
 ):
     """Return a `tier_fn(rows) -> rows` for `run_code_retrieval_pipeline`.
 
     Annotates each row with a ``_tier`` (summary/single_chunk/three_chunks/full
     or ``discard``) via the shared budget allocator, using the CODE-calibrated
     ``thresholds`` (``_CODE_TIER_THRESHOLDS`` when ``None``) so good code matches
-    at 0.22–0.42 aren't discarded by the KG 0.42 gate. Same length + order as
-    the input (the pipeline's contract); the caller's format loop reads
-    ``_tier`` and calls ``_format_code_result_by_tier``. ``discard`` rows are
-    dropped (they never render).
+    at 0.22–0.42 aren't discarded by the KG 0.42 gate. Order-preserving; the
+    caller's format loop reads ``_tier`` and calls
+    ``_format_code_result_by_tier``. ``discard`` rows are dropped (they never
+    render — the ONE row-dropping tier_fn allowance in the pipeline contract).
+
+    ``min_gate`` (F4, pre-gate audit): the effective ``min`` threshold derived
+    at CALL time — both surfaces pass ``resolve_post_rerank_floor(slot)`` so a
+    user/GUI floor override (e.g. lowering to 0.15) actually changes what
+    renders in auto mode. Without it the import-time ``_CODE_TIER_THRESHOLDS
+    ["min"]`` (0.22) silently re-discarded the 0.15-0.22 rows the pipeline had
+    just let through. The OTHER tiers still come from ``thresholds``. ``None``
+    → the static default (back-compat for direct callers/tests).
     """
     if thresholds is None:
         thresholds = _CODE_TIER_THRESHOLDS
+    if min_gate is not None:
+        try:
+            thresholds = {**thresholds, "min": float(min_gate)}
+        except (TypeError, ValueError):
+            pass  # unparseable gate → keep the static default (soft-fail)
 
     def tier_fn(rows: list[dict]) -> list[dict]:
         budget = remaining_budget
@@ -1624,6 +1683,29 @@ def make_code_tier_fn(
             kept.append(r)
         return kept
     return tier_fn
+
+
+def _self_project_chunk_fetcher(row: dict, effective_project, fetcher):
+    """F5 (pre-gate audit, SEV-3): gate the chunk fetcher to SELF-project rows.
+
+    The chunk fetchers on both surfaces (`_fetch_code_chunks` in the MCP,
+    `_code_chunk_fetcher` in the CLI) query the SELF project's collections.
+    When the winning row is a PEER hit (cross-project fan-out via
+    VCT_CODE_GRAPH_ACCESS_LIST), assembling its three_chunks/full window from
+    the self collections stitches together the WRONG project's chunks (or a
+    same-named entity's). Returning ``None`` here makes the tier renderer
+    degrade to single_chunk — the matched chunk only, which IS the peer's own
+    content.
+
+    Shared by BOTH render loops (MCP `search_code_graph` + CLI
+    `search_by_concept`) so the two surfaces cannot diverge (the hard
+    invariant). ``row["_src"]`` carries the row's source-project filter value
+    ("" for self/bare-collection rows).
+    """
+    src = (row.get("_src") or "") if isinstance(row, dict) else ""
+    if not src or not effective_project or src == effective_project:
+        return fetcher
+    return None
 
 
 def _strip_chunk_header_text(text: str) -> str:
@@ -6709,6 +6791,14 @@ def _collapse_to_one_per_node(
         # Key on the caller-chosen fields. Default ("file_path","title") is the
         # v0.2.71 KG key; code passes ("file_path","full_name").
         key = tuple((r.get(f) or "") for f in key_fields)
+        # F1 (pre-gate audit, SEV-1): an ALL-EMPTY key is un-collapsible —
+        # key such rows by object identity (mirrors code_ranking.py's
+        # `("__id__", id(c))` guard in run_code_retrieval_pipeline's _dedup_key)
+        # so rows whose props carry none of the key fields NEVER bucket
+        # together into one survivor. Protects the KG path too (a row with
+        # neither file_path nor title stays distinct).
+        if not any(key):
+            key = ("__id__", id(r))
         counts[key] = counts.get(key, 0) + 1
         existing = by_node.get(key)
         if existing is None or r.get(score_field, 0.0) > existing.get(score_field, 0.0):
@@ -7750,21 +7840,31 @@ async def search_code_graph(
         limit: Max results (default: 8).
         expand_hops: 0 (default) — no expansion; 1 or 2 — follow call/interaction
                      edges from seed nodes to discover related code
-        layer: Filter by architectural layer (API, Service, Data, UI, Utility)
+        layer: Filter by architectural layer — lowercase values: api, service,
+               data, ui, utility (mixed-case input is lowercased before
+               matching). If the filter yields zero candidates (the `layer`
+               property is unpopulated on many indexes), the search re-runs
+               without it and the response carries a "note" explaining that.
         project: Project name override. Omit to use workspace default.
         detail: Verbosity per result (default "auto"):
-            - "auto"   → top 4 (highest score) get full details, the rest are
-                         metadata-only refs. Backward-compatible with the
-                         pre-tiering behaviour.
+            - "auto"   → score-tiered per result via the code-calibrated gate
+                         (_CODE_TIER_THRESHOLDS, env-overridable CODE_TIER_*):
+                           score < min          → dropped (min derives from the
+                                                  post-rerank floor at call
+                                                  time, default 0.22)
+                           min..0.32            → "summary" (signature + doc)
+                           0.32..0.48           → "single_chunk" (matched chunk)
+                           0.48..0.62           → "three_chunks" (hit + neighbours)
+                           >= 0.62              → "full" (up to 7 chunks)
+                         A shared chunk budget degrades late results to
+                         cheaper tiers regardless of score.
             - "titles" → metadata-only refs for every result (cheapest)
             - "full"   → full details for every result (most expensive)
-            Code graph has no .node_formats sidecar so the auto-mode tiering is
-            position-based (top-k) rather than score-threshold-based; the score
-            is still surfaced in every result for clients to filter on.
 
     Returns:
-        JSON with code entities, each including file_path, score, and (for
-        full-tier results) full_name/signature/doc. Metadata refs for the rest.
+        JSON with code entities, each including file_path, score, tier (the
+        verbosity actually applied in auto mode), and tier-dependent content
+        (full_name/signature/doc/body chunks). Metadata refs for cheap tiers.
     """
     _SCOPES: dict[str, list[str]] = {
         "all":         ["CodeFunction", "CodeClass", "CodeModule", "CodeAPI", "CodeInteraction"],
@@ -7843,49 +7943,85 @@ async def search_code_graph(
         # `run_code_retrieval_pipeline` has a pool to floor-cull + rerank +
         # collapse before trimming to `limit`. Matches the CLI over-fetch.
         _fetch_limit = max(1, 2 * limit)
-        candidates: list[dict] = []
-        for coll_name in collections:
-            try:
-                coll = client.collections.get(coll_name)
-                kwargs: dict = dict(
-                    near_vector=query_embedding,
-                    limit=_fetch_limit,
-                    return_metadata=MetadataQuery(distance=True, score=True),
+
+        def _gather_candidates(apply_layer: bool) -> list[dict]:
+            gathered: list[dict] = []
+            for coll_name in collections:
+                try:
+                    coll = client.collections.get(coll_name)
+                    kwargs: dict = dict(
+                        near_vector=query_embedding,
+                        limit=_fetch_limit,
+                        return_metadata=MetadataQuery(distance=True, score=True),
+                    )
+                    # v0.2.18: target the slot matching the active code
+                    # backend (codesage_embed / ollama_code_embed /
+                    # openai_code_embed / jina_embed). Falls back to the
+                    # pre-v0.2.18 ACTIVE_EMBEDDING branching when the
+                    # service isn't available.
+                    if DUAL_EMBEDDING_ENABLED:
+                        svc = _get_embedding_service()
+                        if svc is not None:
+                            kwargs["target_vector"] = svc.code_vector_slot
+                        elif ACTIVE_EMBEDDING in ("qwen3", "codesage"):
+                            kwargs["target_vector"] = "codesage_embed"
+                        else:
+                            kwargs["target_vector"] = "ollama_code_embed"
+                    # Build filters: project (per-collection) + optional layer.
+                    base_name, project_filter = coll_meta.get(coll_name, (coll_name, ""))
+                    active_filters = []
+                    if project_filter:
+                        active_filters.append(Filter.by_property("project").equal(project_filter))
+                    if apply_layer and layer and base_name in ("CodeFunction", "CodeClass"):
+                        active_filters.append(Filter.by_property("layer").equal(layer.lower()))
+                    if active_filters:
+                        combined = active_filters[0]
+                        for f in active_filters[1:]:
+                            combined = combined & f
+                        kwargs["filters"] = combined
+                    resp = coll.query.near_vector(**kwargs)
+                    for obj in resp.objects:
+                        p = obj.properties
+                        distance = obj.metadata.distance if (hasattr(obj.metadata, "distance") and obj.metadata.distance is not None) else 1.0
+                        # F11-iv (pre-gate audit): clamp to >= 0.0 — MUST MATCH
+                        # the CLI's `max(0.0, 1.0 - distance)` normalisation
+                        # (query_code_graph.py) so the two surfaces score
+                        # identically on degenerate distances > 1.0.
+                        score = max(0.0, 1.0 - distance)
+                        # Store base name (e.g. "CodeFunction") for formatting
+                        # (not the per-project name) + `_src` = the row's
+                        # source-project filter value ("" for self/bare) so
+                        # the render loop can gate peer rows off the SELF
+                        # chunk fetcher (F5 — mirrors the CLI's `_src`).
+                        gathered.append({
+                            "_c": base_name, "_s": score, "_d": distance,
+                            "_p": p, "_src": project_filter or "",
+                        })
+                except Exception as e:
+                    logger.warning(f"search_code_graph: {coll_name} failed: {e}")
+            return gathered
+
+        candidates = _gather_candidates(apply_layer=True)
+        layer_note: str | None = None
+        if layer:
+            # LAYER-FILTER TRAP (pre-gate audit): the `layer` property is
+            # unpopulated on most indexes (and absent from older schemas,
+            # where the filter ERRORS per-collection), so the filter silently
+            # matches nothing. Gate the retry on the collections the filter
+            # actually applies to (CodeFunction/CodeClass) — with scope="all"/
+            # "code", unfiltered CodeModule/CodeAPI rows would otherwise keep
+            # the raw pool non-empty and mask the zeroed-out filter (live-
+            # confirmed). Re-run WITHOUT the filter and tell the caller via a
+            # note instead of returning a misleading empty result.
+            _layer_filtered_pool = [
+                c for c in candidates if c.get("_c") in ("CodeFunction", "CodeClass")
+            ]
+            if not _layer_filtered_pool:
+                candidates = _gather_candidates(apply_layer=False)
+                layer_note = (
+                    "layer filter ignored — the layer property is not populated "
+                    "on this index"
                 )
-                # v0.2.18: target the slot matching the active code
-                # backend (codesage_embed / ollama_code_embed /
-                # openai_code_embed / jina_embed). Falls back to the
-                # pre-v0.2.18 ACTIVE_EMBEDDING branching when the
-                # service isn't available.
-                if DUAL_EMBEDDING_ENABLED:
-                    svc = _get_embedding_service()
-                    if svc is not None:
-                        kwargs["target_vector"] = svc.code_vector_slot
-                    elif ACTIVE_EMBEDDING in ("qwen3", "codesage"):
-                        kwargs["target_vector"] = "codesage_embed"
-                    else:
-                        kwargs["target_vector"] = "ollama_code_embed"
-                # Build filters: project (per-collection) + optional layer.
-                base_name, project_filter = coll_meta.get(coll_name, (coll_name, ""))
-                active_filters = []
-                if project_filter:
-                    active_filters.append(Filter.by_property("project").equal(project_filter))
-                if layer and base_name in ("CodeFunction", "CodeClass"):
-                    active_filters.append(Filter.by_property("layer").equal(layer.lower()))
-                if active_filters:
-                    combined = active_filters[0]
-                    for f in active_filters[1:]:
-                        combined = combined & f
-                    kwargs["filters"] = combined
-                resp = coll.query.near_vector(**kwargs)
-                for obj in resp.objects:
-                    p = obj.properties
-                    distance = obj.metadata.distance if (hasattr(obj.metadata, "distance") and obj.metadata.distance is not None) else 1.0
-                    score = 1.0 - distance
-                    # Store base name (e.g. "CodeFunction") for formatting, not per-project name
-                    candidates.append({"_c": base_name, "_s": score, "_d": distance, "_p": p})
-            except Exception as e:
-                logger.warning(f"search_code_graph: {coll_name} failed: {e}")
 
         # v0.2.72 (P1/P2/P3/P4): run the SHARED pipeline — two-stage per-slot
         # floor (retrieval 0.16 / post-rerank 0.22 for CodeSage) + relationship
@@ -7916,11 +8052,20 @@ async def search_code_graph(
         # Score-tier allocation only runs in "auto" mode; explicit detail values
         # want uniform output, so we skip the budget allocator and let the
         # format loop honour `detail` directly (tier_fn=None → no `_tier` set).
-        _tier_fn = make_code_tier_fn() if detail == "auto" else None
+        # F4 (pre-gate audit): the tier `min` gate DERIVES from the resolved
+        # post-rerank floor so a GUI/env floor override changes what renders in
+        # auto mode (identical wiring in the CLI — the hard invariant).
+        #
+        # NOTE (B2, design audit): the CLI grows an `--exclude-file` pre-pipeline
+        # candidate filter for the Read/Edit hook's self-injection case. The MCP
+        # has NO exclude concept (a direct tool call has no edited-file context),
+        # so no equivalent filter exists here — deliberate, not drift.
+        _post_floor = resolve_post_rerank_floor(_slot)
+        _tier_fn = make_code_tier_fn(min_gate=_post_floor) if detail == "auto" else None
         candidates = run_code_retrieval_pipeline(
             candidates,
             retrieval_floor=resolve_retrieval_floor(_slot),
-            post_rerank_floor=resolve_post_rerank_floor(_slot),
+            post_rerank_floor=_post_floor,
             anchor_props=None,
             limit=limit,
             collapse_fn=make_code_collapse_fn(),
@@ -8035,7 +8180,12 @@ async def search_code_graph(
                     p, coll_name, tier,
                     score=score,
                     distance=dist,
-                    chunk_fetcher=_fetch_code_chunks,
+                    # F5: peer rows must not assemble chunks from the SELF
+                    # collections — the shared gate returns None for them so
+                    # the tier degrades to single_chunk (matched chunk only).
+                    chunk_fetcher=_self_project_chunk_fetcher(
+                        r, effective_project, _fetch_code_chunks,
+                    ),
                 ))
             else:
                 results.append(_format_code_result_by_rank(
@@ -8197,7 +8347,7 @@ async def search_code_graph(
                 logger.warning(f"search_code_graph: subgraph expansion failed: {expand_err}")
         # --- end subgraph expansion ---
 
-        return _large_result({
+        response_payload = {
             "success": True,
             "query": query,
             "scope": scope,
@@ -8205,7 +8355,11 @@ async def search_code_graph(
             "detail": detail,
             "count": len(results),
             "results": results,
-        })
+        }
+        if layer_note:
+            # LAYER-FILTER TRAP: tell the caller the layer filter was dropped.
+            response_payload["note"] = layer_note
+        return _large_result(response_payload)
 
     except WeaviateUnreachable as exc:
         # Loud-fail per 2026-05-08 silent-zero antipattern fix.
@@ -8296,6 +8450,34 @@ def _pick_canonical_chunk(objects: list):
         return min(objects, key=lambda o: (_cn(o) if _cn(o) is not None else 1 << 30))
     except Exception:  # noqa: BLE001
         return objects[0]
+
+
+def _dedup_objects_by_full_name(objects: list) -> list:
+    """One object per ``full_name`` from a fetch that may match EVERY chunk of
+    a chunked entity (F6, pre-gate audit, SEV-3).
+
+    The ``callers`` / ``composed_by`` / ``type_users`` branches filter with
+    ``contains_any`` on entity-level TEXT_ARRAY properties (``call_names`` /
+    ``composes`` / ``type_uses``) that are replicated on EVERY chunk row of a
+    chunked matcher — so a 3-chunk caller came back as 3 result rows. Group by
+    ``full_name`` (first-seen order preserved) and keep the CANONICAL chunk
+    per group via :func:`_pick_canonical_chunk` (chunk 0 > legacy no-chunk_num
+    > lowest chunk_num). Objects with no ``full_name`` are kept as-is (keyed
+    by object identity — never merged).
+    """
+    groups: dict = {}
+    order: list = []
+    for obj in objects:
+        try:
+            fn = (obj.properties or {}).get("full_name") or ""
+        except Exception:  # noqa: BLE001 — defensive on mocked objects
+            fn = ""
+        key = fn if fn else ("__id__", id(obj))
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(obj)
+    return [_pick_canonical_chunk(groups[k]) for k in order]
 
 
 @mcp.tool()
@@ -8449,13 +8631,15 @@ def query_code_structure(
                 filters=with_project(Filter.by_property("call_names").contains_any(_caller_match_terms(target))),
                 limit=CALLERS_LIMIT
             )
+            # F6: `call_names` is replicated on every chunk row of a chunked
+            # caller — collapse to one row per full_name (canonical chunk).
             results = [
                 {
                     "full_name": obj.properties.get("full_name", ""),
                     "signature": obj.properties.get("signature", ""),
                     "file_path": obj.properties.get("file_path") or obj.properties.get("path", ""),
                 }
-                for obj in response.objects
+                for obj in _dedup_objects_by_full_name(response.objects)
             ]
             _truncation_meta = {
                 "truncated": len(response.objects) >= CALLERS_LIMIT,
@@ -8635,12 +8819,13 @@ def query_code_structure(
                 filters=with_project(Filter.by_property("composes").contains_any([target])),
                 limit=COMPOSED_BY_LIMIT
             )
+            # F6: one row per full_name — `composes` is replicated per chunk.
             results = [
                 {
                     "full_name": obj.properties.get("full_name", ""),
                     "file_path": obj.properties.get("file_path") or obj.properties.get("path", ""),
                 }
-                for obj in response.objects
+                for obj in _dedup_objects_by_full_name(response.objects)
             ]
             _truncation_meta = {
                 "truncated": len(response.objects) >= COMPOSED_BY_LIMIT,
@@ -8656,13 +8841,14 @@ def query_code_structure(
                 filters=with_project(Filter.by_property("type_uses").contains_any([target])),
                 limit=TYPE_USERS_LIMIT
             )
+            # F6: one row per full_name — `type_uses` is replicated per chunk.
             results = [
                 {
                     "full_name": obj.properties.get("full_name", ""),
                     "signature": obj.properties.get("signature", ""),
                     "file_path": obj.properties.get("file_path") or obj.properties.get("path", ""),
                 }
-                for obj in response.objects
+                for obj in _dedup_objects_by_full_name(response.objects)
             ]
             _truncation_meta = {
                 "truncated": len(response.objects) >= TYPE_USERS_LIMIT,

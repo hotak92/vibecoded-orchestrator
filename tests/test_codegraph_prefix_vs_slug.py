@@ -171,8 +171,13 @@ class HookResolverFieldContract(unittest.TestCase):
     # explicitly so the test catches accidental regressions to slug
     # alias use.
     ALLOWED_HOOK_RESOLVER_FIELDS = frozenset({
-        "code_graph_collection_prefix",  # canonical Weaviate prefix
-        "code_graph_extra_paths",        # v0.2.47 (extras)
+        "code_graph_collection_prefix",   # canonical Weaviate prefix
+        "code_graph_extra_paths",         # v0.2.47 (extras)
+        # v0.2.72 (P5): per-project ".claude/ is first-party source" bool —
+        # drives the --index-dot-claude / --no-index-dot-claude analyzer
+        # flag. A resolver FIELD read for a CLI toggle, not a write-target
+        # name; unrelated to the banned slug alias.
+        "code_graph_index_dot_claude",
     })
 
     def test_hooks_ask_resolver_for_collection_prefix(self):

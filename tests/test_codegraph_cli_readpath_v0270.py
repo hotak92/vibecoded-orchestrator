@@ -136,11 +136,15 @@ def test_search_path_calls_shared_pipeline() -> None:
     src = CLI_SRC.read_text(encoding="utf-8")
     assert "run_code_retrieval_pipeline(" in src
     assert "retrieval_floor=resolve_retrieval_floor(_slot)" in src
-    assert "post_rerank_floor=resolve_post_rerank_floor(_slot)" in src
+    # v0.2.72 pre-gate F4: the post-rerank floor is resolved ONCE and shared
+    # between the pipeline gate and the tier `min` gate (min_gate) — same
+    # shape as the MCP.
+    assert "_post_floor = resolve_post_rerank_floor(_slot)" in src
+    assert "post_rerank_floor=_post_floor" in src
     assert "collapse_fn=make_code_collapse_fn()" in src
     assert 'key_fields=("file_path", "full_name")' in src
     # tier_fn only in auto mode — same rule as the MCP.
-    assert 'make_code_tier_fn() if detail == "auto" else None' in src
+    assert 'make_code_tier_fn(min_gate=_post_floor) if detail == "auto" else None' in src
     # The legacy single-stage shim + break-loop are gone.
     assert "_resolve_code_score_floor" not in src, (
         "the pre-integration single-stage floor shim must be removed"

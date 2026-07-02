@@ -27,6 +27,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 import requests
 from pathlib import Path
@@ -80,6 +81,7 @@ try:
         _format_code_result_by_rank,
         _format_code_result_by_tier,
         _format_code_result_ref,
+        _self_project_chunk_fetcher,
         make_code_collapse_fn,
         make_code_tier_fn,
         CODE_SIBLINGS_RANK_1,
@@ -340,10 +342,23 @@ class CodeGraphQuery:
                 if tail:
                     attempts.append(Filter.by_property("file_path").like(f"*{tail}"))
             elif all(ch.isalnum() or ch in "_.:" for ch in anchor):
-                # Bare symbol: also match qualified full_names ending in
-                # ".<anchor>" (e.g. anchor "validate_token" hits
-                # "api.auth.validate_token").
-                attempts.append(Filter.by_property("full_name").like(f"*.{anchor}"))
+                # Bare / qualified symbol: also match full_names ending in the
+                # anchor's LEAF (e.g. anchor "validate_token" hits
+                # "api.auth.validate_token"; Rust "mod::my_fn" leaf-matches on
+                # "my_fn" — split on `.` OR `::`, F10 pre-gate audit).
+                #
+                # F10 tightening: SKIP the bare-leaf LIKE fallback for
+                # over-generic leaves (len < 4 or a ubiquitous name like
+                # "run"/"main") — `LIKE *.run` matches half the codebase and
+                # anchors the rerank to an arbitrary entity. All failure
+                # paths still resolve to None (pure semantic ordering).
+                leaf = re.split(r"::|\.", anchor)[-1]
+                _generic = {"run", "main", "init", "new", "get", "set"}
+                if len(leaf) >= 4 and leaf.lower() not in _generic:
+                    attempts.append(Filter.by_property("full_name").like(f"*.{leaf}"))
+                    if "::" in anchor:
+                        # Rust-style storage may qualify with `::` too.
+                        attempts.append(Filter.by_property("full_name").like(f"*::{leaf}"))
 
             for flt in attempts:
                 best: Optional[dict] = None
@@ -371,7 +386,7 @@ class CodeGraphQuery:
         except Exception:
             return None
 
-    def search_by_concept(self, query: str, collection: str = "CodeFunction", limit: int = 5, detail: str = "auto", hook_format: bool = False, anchor: str = None):
+    def search_by_concept(self, query: str, collection: str = "CodeFunction", limit: int = 5, detail: str = "auto", hook_format: bool = False, anchor: str = None, exclude_file: str = None):
         """Semantic search for code by concept.
 
         P1-D (2026-05-08): when ``self.project`` is set, fan out across
@@ -405,6 +420,17 @@ class CodeGraphQuery:
           relative to it. None / unresolvable → anchor_props=None → pure
           semantic ordering, byte-identical to a direct MCP call. That is
           data, not behaviour — the pipeline code is identical either way.
+
+        exclude_file (B2, design audit): drop candidates whose source file IS
+          this path BEFORE the pipeline trims to `limit`. The Read/Edit hook
+          passes the edited file as BOTH anchor and exclude — the anchor's
+          +0.03 same-file boost used to promote the edited file's own entities
+          into the top-2, and the hook's old line-wise `grep -v` then stripped
+          only their header lines, leaving orphaned body lines. Filtering here
+          (pre-trim, on the normalized candidates — the pipeline itself stays
+          pure) keeps the trimmed top-K full of OTHER files' context. The MCP
+          body has no exclude concept (no edited-file context on a direct
+          tool call) — documented there as deliberately N/A, not drift.
 
         hook_format: when True, emit a stable per-result header line
           'CODE: <full_name> | <collection> | distance=<d>' (with optional
@@ -496,6 +522,30 @@ class CodeGraphQuery:
                     "_src": source,
                 })
 
+            # B2 (design audit): cull the excluded file's own entities BEFORE
+            # the pipeline (pre-trim), so the +0.03 same-file anchor boost
+            # cannot fill the top-K with the file being edited. Pipeline stays
+            # pure — this is caller-side candidate normalisation. Matching is
+            # separator-normalised and boundary-aware so an absolute editor
+            # path still culls the analyzer's repo-relative file_path.
+            if exclude_file:
+                _ex = str(exclude_file).replace("\\", "/").strip()
+
+                def _is_excluded(props: dict) -> bool:
+                    fp = (props.get("file_path") or props.get("path") or "")
+                    fp = str(fp).replace("\\", "/")
+                    if not fp or not _ex:
+                        return False
+                    return (
+                        fp == _ex
+                        or _ex.endswith("/" + fp)
+                        or fp.endswith("/" + _ex)
+                    )
+
+                candidates = [
+                    c for c in candidates if not _is_excluded(c.get("_p") or {})
+                ]
+
             try:
                 _slot = _active_code_vector_slot()
             except Exception:
@@ -506,12 +556,16 @@ class CodeGraphQuery:
             # Score-tier allocation only runs in "auto" mode; explicit detail
             # values want uniform output, so we skip the budget allocator and
             # let the format loop honour `detail` directly (tier_fn=None → no
-            # `_tier` set). Same rule as the MCP.
-            _tier_fn = make_code_tier_fn() if detail == "auto" else None
+            # `_tier` set). Same rule as the MCP. F4 (pre-gate audit): the
+            # tier `min` gate DERIVES from the resolved post-rerank floor so a
+            # GUI/env floor override changes what renders in auto mode —
+            # identical wiring in the MCP (the hard invariant).
+            _post_floor = resolve_post_rerank_floor(_slot)
+            _tier_fn = make_code_tier_fn(min_gate=_post_floor) if detail == "auto" else None
             survivors = run_code_retrieval_pipeline(
                 candidates,
                 retrieval_floor=resolve_retrieval_floor(_slot),
-                post_rerank_floor=resolve_post_rerank_floor(_slot),
+                post_rerank_floor=_post_floor,
                 anchor_props=anchor_props,
                 limit=limit,
                 collapse_fn=make_code_collapse_fn(),
@@ -675,7 +729,13 @@ class CodeGraphQuery:
                         tier,
                         score=score,
                         distance=distance,
-                        chunk_fetcher=_code_chunk_fetcher,
+                        # F5: peer rows must not assemble chunks from the SELF
+                        # project's collections — the shared gate (imported
+                        # from weaviate_mcp.server, same as the MCP loop)
+                        # returns None so the tier degrades to single_chunk.
+                        chunk_fetcher=_self_project_chunk_fetcher(
+                            cand, self.project, _code_chunk_fetcher,
+                        ),
                     )
                 else:
                     rendered = _format_code_result_by_rank(
@@ -789,6 +849,19 @@ class CodeGraphQuery:
                 else:
                     snippet = doc[:200] + ("..." if len(doc) > 200 else "")
                     print(f"{indent}Doc: {snippet}")
+            # B1 (design audit): the summary tier carries its content under
+            # `summary` — previously only the CodeModule branch printed it,
+            # so summary-tier functions rendered as a bare header (content
+            # silently dropped on the CLI while the MCP JSON carried it).
+            # Skip when identical to the doc already printed above (R1 makes
+            # the summary tier prefer doc — avoid the duplicate line).
+            summary = rendered.get("summary", "")
+            if summary and summary != doc:
+                if hook_format:
+                    print(f"{indent}Summary: {summary}")
+                else:
+                    snippet = summary[:400] + ("..." if len(summary) > 400 else "")
+                    print(f"{indent}Summary: {snippet}")
             loc = rendered.get("location", "")
             if loc:
                 print(f"{indent}Location: {loc}")
@@ -808,6 +881,14 @@ class CodeGraphQuery:
                 else:
                     snippet = doc[:200] + ("..." if len(doc) > 200 else "")
                     print(f"{indent}Doc: {snippet}")
+            # B1: same summary-tier rendering as the CodeFunction branch.
+            summary = rendered.get("summary", "")
+            if summary and summary != doc:
+                if hook_format:
+                    print(f"{indent}Summary: {summary}")
+                else:
+                    snippet = summary[:400] + ("..." if len(summary) > 400 else "")
+                    print(f"{indent}Summary: {snippet}")
             method_count = rendered.get("method_count")
             if method_count is not None:
                 print(f"{indent}Methods: {method_count} methods")
@@ -1139,8 +1220,10 @@ def main():
                               help='Filter by project name')
     search_parser.add_argument('--detail', type=str, default='auto',
                               choices=['auto', 'titles', 'full'],
-                              help=("Verbosity per result. 'auto' (default) = top-4 full, "
-                                    "rest as refs (matches search_code_graph MCP). "
+                              help=("Verbosity per result. 'auto' (default) = score-tiered "
+                                    "per result (summary / single_chunk / three_chunks / "
+                                    "full as score rises; the min gate derives from the "
+                                    "post-rerank floor — matches search_code_graph MCP). "
                                     "'titles' = name+score only. 'full' = full details for all."))
     search_parser.add_argument('--hook-format', action='store_true',
                               help=("Emit one-line 'CODE: <full_name> | <collection> | "
@@ -1149,6 +1232,10 @@ def main():
     search_parser.add_argument('--anchor', type=str, default=None,
                               help=('Edited file path or symbol full_name — biases rerank '
                                     'toward call-linked / same-module / shared-type code'))
+    search_parser.add_argument('--exclude-file', type=str, default=None,
+                              help=('Drop candidates whose source file is this path BEFORE '
+                                    'trimming to --limit (the Read/Edit hook passes the '
+                                    'edited file here to avoid self-injection)'))
 
     # Similar code
     similar_parser = subparsers.add_parser('similar', help='Find similar code')
@@ -1220,7 +1307,8 @@ def main():
         if args.command == 'search':
             querier.search_by_concept(args.query, args.collection, args.limit, args.detail,
                                        hook_format=getattr(args, 'hook_format', False),
-                                       anchor=getattr(args, 'anchor', None))
+                                       anchor=getattr(args, 'anchor', None),
+                                       exclude_file=getattr(args, 'exclude_file', None))
         elif args.command == 'similar':
             querier.find_similar(args.reference, args.collection, args.limit)
         elif args.command == 'structure':
