@@ -200,7 +200,7 @@ def resolve_post_rerank_floor(
     return CODE_FLOOR_BY_SLOT.get(slot, _DEFAULT_FLOOR_PAIR)[1]
 
 
-def _leaf(name: Optional[str]) -> str:
+def _leaf(name: object) -> str:
     """Bare leaf of a possibly-qualified name.
 
     Mirrors ``server.py::_caller_match_terms`` — split on Rust ``::`` or Python
@@ -221,10 +221,12 @@ def _as_str_set(value: object) -> set[str]:
         return set()
     if isinstance(value, str):
         return {value} if value else set()
-    try:
+    # Weaviate TEXT_ARRAY props arrive as list[str]; tolerate any real
+    # collection shape. A non-iterable (int, dict-key misuse, ...) → empty set
+    # (same soft behaviour the previous try/except gave, but statically typed).
+    if isinstance(value, (list, tuple, set, frozenset)):
         return {str(v) for v in value if v}
-    except TypeError:
-        return set()
+    return set()
 
 
 def rerank_score(
