@@ -246,3 +246,119 @@ def test_c1_live_search_returns_results() -> None:
     assert "Traceback" not in result.stderr, (
         f"CLI crashed: {result.stderr[-500:]}"
     )
+
+
+# --------------------------------------------------------------------------
+# v0.2.72 HARD INVARIANT — live CLI/MCP cross-surface ranking parity
+# --------------------------------------------------------------------------
+@pytest.mark.skipif(not _code_graph_reachable(), reason="no reachable Weaviate code graph")
+def test_live_cli_mcp_ranking_parity() -> None:
+    """The hook path (CLI ``search_by_concept``) and the MCP path
+    (``search_code_graph``) MUST NOT DIVERGE (maintainer directive, v0.2.72).
+
+    The identity tests above pin that both surfaces import the SAME shared
+    pipeline/adapters — but each BODY still normalises candidates, over-fetches
+    2N, and gates the tier_fn on its own; body-level drift would reorder
+    results without failing an identity check. This end-to-end test runs the
+    SAME query through BOTH surfaces against the live code graph and asserts
+    the CodeFunction ranking agrees.
+
+    Comparison scope: the CLI queries ONE base collection per call
+    (CodeFunction here); the MCP's scope="code" fans out across
+    Function+Class+Module and merges before the shared trim. So exact list
+    equality is not the contract — the RANKING contract is: the MCP's
+    CodeFunction-typed results appear in the SAME relative order as the CLI's,
+    and the top CodeFunction hit is identical. (v0.2.71 lesson codified: live
+    smoke after MCP merges — mocked tests miss scope/closure bugs.)
+    """
+    import asyncio
+    import json
+    import re
+    import subprocess
+
+    sys.path.insert(0, str(REPO_ROOT / "claude_mcp_servers"))
+    try:
+        from weaviate_mcp import server as mcp_server
+    except Exception as exc:  # pragma: no cover - env-dependent
+        pytest.skip(f"weaviate_mcp.server unimportable here: {exc}")
+
+    # Probe a populated CodeFunction collection + its `project` property value
+    # (used as the explicit project arg on BOTH surfaces so neither depends on
+    # this checkout's own binding).
+    try:
+        client = mcp_server.get_weaviate_client()
+        proj = None
+        for cn in client.collections.list_all().keys():
+            if not cn.endswith("CodeFunction"):
+                continue
+            objs = client.collections.get(cn).query.fetch_objects(limit=1).objects
+            if objs:
+                proj = (objs[0].properties or {}).get("project")
+                if proj:
+                    break
+    except Exception as exc:  # pragma: no cover - env-dependent
+        pytest.skip(f"cannot probe code graph: {exc}")
+    if not proj:
+        pytest.skip("no populated CodeFunction collection on this backend")
+
+    query = "parse functions from a source file"
+
+    # --- MCP surface ---
+    raw = asyncio.run(
+        mcp_server.search_code_graph(query, scope="code", limit=8, project=proj)
+    )
+    data = json.loads(raw)
+    mcp_results = data.get("results") or data.get("entities") or []
+    mcp_fns = [
+        r.get("full_name")
+        for r in mcp_results
+        if r.get("collection") == "CodeFunction" and r.get("full_name")
+    ]
+
+    # --- CLI surface (human format carries the rank lines) ---
+    # PYTHONPATH pins the subprocess to THIS repo's weaviate_mcp (ahead of any
+    # pip-editable install pointing at a different clone) — same reason as the
+    # sys.path shim above. In a real install the editable package IS the
+    # updated clone, so this is a dev-checkout-only concern.
+    cli = REPO_ROOT / "templates" / "scripts" / "query_code_graph.py"
+    sub_env = {**os.environ}
+    _mcp_dir = str(REPO_ROOT / "claude_mcp_servers")
+    sub_env["PYTHONPATH"] = (
+        _mcp_dir + os.pathsep + sub_env["PYTHONPATH"]
+        if sub_env.get("PYTHONPATH") else _mcp_dir
+    )
+    result = subprocess.run(
+        [sys.executable, str(cli), "search", query,
+         "--collection", "CodeFunction", "--limit", "8", "--project", str(proj)],
+        capture_output=True, text=True, timeout=120, cwd=str(REPO_ROOT),
+        env=sub_env,
+    )
+    assert "Traceback" not in result.stderr, f"CLI crashed: {result.stderr[-500:]}"
+    assert result.returncode == 0, (
+        f"CLI exited {result.returncode}: {result.stderr[-500:]}"
+    )
+    cli_fns = re.findall(r"^\s*\d+\.\s+(\S+)", result.stdout, re.M)
+
+    if not mcp_fns and not cli_fns:
+        # Both empty is parity too (floors culled everything for this query).
+        return
+    assert mcp_fns and cli_fns, (
+        f"one surface returned results and the other none — divergence: "
+        f"mcp={mcp_fns} cli={cli_fns}\nCLI stdout tail: {result.stdout[-400:]}"
+    )
+    # Top CodeFunction hit must be identical (the strongest single signal).
+    assert mcp_fns[0] == cli_fns[0], (
+        f"top CodeFunction differs across surfaces: mcp={mcp_fns[0]!r} "
+        f"cli={cli_fns[0]!r}"
+    )
+    # The MCP's CodeFunction sequence must be an ORDER-PRESERVING subsequence
+    # of the CLI's (the MCP list can be shorter — Function hits compete with
+    # Class/Module for its top-8 — but relative order comes from the SAME
+    # shared pipeline and must agree).
+    it = iter(cli_fns)
+    missing = [fn for fn in mcp_fns if fn not in it]
+    assert not missing, (
+        f"MCP CodeFunction order is not a subsequence of the CLI order — "
+        f"body-level divergence. mcp={mcp_fns} cli={cli_fns} out-of-order/"
+        f"missing={missing}"
+    )
