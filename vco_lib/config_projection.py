@@ -345,6 +345,17 @@ _CANONICAL_KEYS: tuple[str, ...] = (
     "PROJECT_NAME",
     "CODE_GRAPH_PROJECT",
     "ACTIVE_EMBEDDING",
+    # v0.2.72 T-FLOOR (P1) — code-graph two-stage floor overrides, sourced from
+    # machine-global ``app_state`` (codegraph.retrieval_floor /
+    # codegraph.post_rerank_floor, written by T-GUI-DB). Consumed by
+    # ``claude_mcp_servers/weaviate_mcp/code_ranking.py::resolve_retrieval_floor``
+    # / ``resolve_post_rerank_floor`` (canonical value + empty-string coercion +
+    # per-slot default). Same deliberate Python-canonical-writer split as
+    # DIAGRAMS_COLLECTION / DUAL_* above: the Rust ``CANONICAL_INSTALL_ENV_KEYS``
+    # const does NOT (yet) include these; the Python ``apply`` CLI is the
+    # canonical writer. Conditionally emitted — omitted when no app_state row.
+    "VCO_CODE_GRAPH_RETRIEVAL_FLOOR",
+    "VCO_CODE_GRAPH_POST_RERANK_FLOOR",
     "WEAVIATE_URL",
     "WEAVIATE_PORT",
     "OLLAMA_URL",
@@ -819,6 +830,23 @@ def _fetch_module_setting_str_opt(
     except (json.JSONDecodeError, TypeError):
         return None
     return v if isinstance(v, str) else None
+
+
+# ─── v0.2.72 T-FLOOR (P1): code-graph two-stage floor app_state keys ─────────
+#
+# Machine-global code-graph floor values, written by T-GUI-DB (the launcher's
+# Codegraph settings surface) into ``app_state``. This module only PROJECTS
+# them to the per-project env surfaces (.claude/settings.json + .claude/env) so
+# the CLI + MCP + hooks all read the same VCO_CODE_GRAPH_* override the user
+# picked in the GUI. The floor DEFAULTS + resolution live in
+# ``claude_mcp_servers/weaviate_mcp/code_ranking.py`` — this projection only
+# emits a value when the app_state row is present (soft-fail: absent → key
+# OMITTED → the shared resolver falls back to its per-slot default).
+#
+# The env-key NAMES mirror ``code_ranking.py`` (_ENV_RETRIEVAL_FLOOR /
+# _ENV_POST_RERANK_FLOOR) exactly — changing one requires changing the other.
+APP_STATE_KEY_CODEGRAPH_RETRIEVAL_FLOOR = "codegraph.retrieval_floor"
+APP_STATE_KEY_CODEGRAPH_POST_RERANK_FLOOR = "codegraph.post_rerank_floor"
 
 
 def _fetch_app_state_str(
@@ -1545,6 +1573,24 @@ def project_env_from_db(
             # with no provenance). GUARD on the derive: an unmapped/absent hardware
             # pick → stay qwen3 (never stamp a guessed profile → wrong slot).
             active_embedding = _resolve_active_embedding_cascade(conn, project_id)
+
+        # v0.2.72 T-FLOOR (P1): machine-global code-graph two-stage floor
+        # overrides. T-GUI-DB writes app_state[codegraph.retrieval_floor] /
+        # app_state[codegraph.post_rerank_floor] when the user sets a non-
+        # default floor in the launcher's Codegraph settings; we project them
+        # to VCO_CODE_GRAPH_RETRIEVAL_FLOOR / VCO_CODE_GRAPH_POST_RERANK_FLOOR
+        # so the CLI + MCP + hooks all read the same value the GUI picked. Soft-
+        # fail: an absent row → None → the key is OMITTED by `_set` below → the
+        # shared resolver in weaviate_mcp/code_ranking.py falls back to its per-
+        # slot default. (Read helper is a hook for the DB value; when T-GUI-DB
+        # has not yet written the row, the projection simply emits nothing and
+        # the shipped per-slot defaults apply.)
+        codegraph_retrieval_floor = _fetch_app_state_str(
+            conn, APP_STATE_KEY_CODEGRAPH_RETRIEVAL_FLOOR
+        )
+        codegraph_post_rerank_floor = _fetch_app_state_str(
+            conn, APP_STATE_KEY_CODEGRAPH_POST_RERANK_FLOOR
+        )
     finally:
         try:
             conn.close()
@@ -1619,6 +1665,14 @@ def project_env_from_db(
     _set("PROJECT_NAME", proj.name)
     _set("CODE_GRAPH_PROJECT", sanitized)
     _set("ACTIVE_EMBEDDING", active_embedding)
+    # v0.2.72 T-FLOOR (P1): code-graph two-stage floor overrides (machine-global,
+    # from app_state via T-GUI-DB). Emitted only when a value is present — an
+    # absent app_state row → OMITTED → shared per-slot default applies. The
+    # empty-string / unparseable coercion lives in the CONSUMER
+    # (weaviate_mcp/code_ranking.py::resolve_*_floor), so here we simply project
+    # the raw string (already stripped by _fetch_app_state_str).
+    _set("VCO_CODE_GRAPH_RETRIEVAL_FLOOR", codegraph_retrieval_floor)
+    _set("VCO_CODE_GRAPH_POST_RERANK_FLOOR", codegraph_post_rerank_floor)
     _set("WEAVIATE_URL", weaviate_url)
     _set("WEAVIATE_PORT", str(weaviate_port_default))
     _set("OLLAMA_URL", ollama_url)

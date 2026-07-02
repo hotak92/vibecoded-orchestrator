@@ -81,63 +81,93 @@ def cli_mod():
     return _load_cli_module()
 
 
+# NOTE (v0.2.72 T-FLOOR): the per-slot floor table + resolvers MOVED to the
+# shared home `weaviate_mcp.code_ranking` (the CLI and MCP paths must not
+# diverge). The v0.2.70 C1b defaults (codesage/jina 0.0, qwen3 0.25, single
+# scalar floor) are SUPERSEDED by the experimentally-validated two-stage floors
+# (codesage/jina 0.16/0.22, qwen3 0.20/0.30; RESULTS-2026-07-01.md). These
+# tests are updated to pin the NEW contract:
+#   * the CLI shim `_resolve_code_score_floor()` now returns the POST-RERANK
+#     floor for the active slot (the real gate the single-stage apply site uses
+#     until the integrator wires run_code_retrieval_pipeline).
+#   * `CODE_FLOOR_BY_SLOT` is now a tuple table (retrieval, post_rerank) and is
+#     imported into the CLI module from the shared home.
 def test_c1b_floor_map_values(cli_mod) -> None:
-    """codesage/jina -> 0.0 (MCP parity); qwen3 -> 0.25 (light noise trim)."""
-    fm = cli_mod._CODE_FLOOR_BY_SLOT
-    assert fm["codesage_embed"] == 0.0
-    assert fm["jina_embed"] == 0.0
-    assert fm["qwen3_embed"] == 0.25
+    """v0.2.72: two-stage tuple table (retrieval, post_rerank); imported into
+    the CLI module from the shared code_ranking home."""
+    fm = cli_mod.CODE_FLOOR_BY_SLOT
+    assert fm["codesage_embed"] == (0.16, 0.22)
+    assert fm["jina_embed"] == (0.16, 0.22)
+    assert fm["qwen3_embed"] == (0.20, 0.30)
 
 
-def test_c1b_floor_codesage_is_zero(cli_mod, monkeypatch) -> None:
+def test_c1b_floor_codesage_post_rerank(cli_mod, monkeypatch) -> None:
     monkeypatch.delenv("VCO_CODE_GRAPH_SCORE_FLOOR", raising=False)
+    monkeypatch.delenv("VCO_CODE_GRAPH_POST_RERANK_FLOOR", raising=False)
     monkeypatch.setattr(cli_mod, "_active_code_vector_slot", lambda: "codesage_embed")
-    assert cli_mod._resolve_code_score_floor() == 0.0
+    # The single-stage shim returns the POST-RERANK floor (the real gate).
+    assert cli_mod._resolve_code_score_floor() == 0.22
 
 
-def test_c1b_floor_qwen3_is_quarter(cli_mod, monkeypatch) -> None:
+def test_c1b_floor_qwen3_post_rerank(cli_mod, monkeypatch) -> None:
     monkeypatch.delenv("VCO_CODE_GRAPH_SCORE_FLOOR", raising=False)
+    monkeypatch.delenv("VCO_CODE_GRAPH_POST_RERANK_FLOOR", raising=False)
     monkeypatch.setattr(cli_mod, "_active_code_vector_slot", lambda: "qwen3_embed")
-    assert cli_mod._resolve_code_score_floor() == 0.25
+    assert cli_mod._resolve_code_score_floor() == 0.30
 
 
 def test_c1b_env_override_wins(cli_mod, monkeypatch) -> None:
-    monkeypatch.setenv("VCO_CODE_GRAPH_SCORE_FLOOR", "0.5")
-    # Even though the slot would say 0.0, the explicit env override wins.
+    # Canonical post-rerank override wins over the slot default.
+    monkeypatch.setenv("VCO_CODE_GRAPH_POST_RERANK_FLOOR", "0.5")
     monkeypatch.setattr(cli_mod, "_active_code_vector_slot", lambda: "codesage_embed")
     assert cli_mod._resolve_code_score_floor() == 0.5
+
+
+def test_c1b_deprecated_alias_still_honored(cli_mod, monkeypatch) -> None:
+    """The legacy single-floor key maps to the post-rerank gate (back-compat)."""
+    monkeypatch.delenv("VCO_CODE_GRAPH_POST_RERANK_FLOOR", raising=False)
+    monkeypatch.setenv("VCO_CODE_GRAPH_SCORE_FLOOR", "0.33")
+    monkeypatch.setattr(cli_mod, "_active_code_vector_slot", lambda: "codesage_embed")
+    assert cli_mod._resolve_code_score_floor() == 0.33
 
 
 def test_c1b_empty_env_coerces_to_slot_default(cli_mod, monkeypatch) -> None:
     """An empty env string is coerced to the slot default (v0.2.27 discipline),
     NOT parsed as a literal."""
-    monkeypatch.setenv("VCO_CODE_GRAPH_SCORE_FLOOR", "")
-    monkeypatch.setattr(cli_mod, "_active_code_vector_slot", lambda: "qwen3_embed")
-    assert cli_mod._resolve_code_score_floor() == 0.25
-
-
-def test_c1b_unparseable_env_falls_to_zero(cli_mod, monkeypatch) -> None:
-    monkeypatch.setenv("VCO_CODE_GRAPH_SCORE_FLOOR", "not-a-float")
-    monkeypatch.setattr(cli_mod, "_active_code_vector_slot", lambda: "qwen3_embed")
-    # Safest on a bad override is no floor (MCP parity).
-    assert cli_mod._resolve_code_score_floor() == 0.0
-
-
-def test_c1b_unknown_slot_defaults_to_zero(cli_mod, monkeypatch) -> None:
-    """A future 4th embedder slot defaults to 0.0 (parity-safe: return marginal
-    results rather than silently culling everything)."""
+    monkeypatch.setenv("VCO_CODE_GRAPH_POST_RERANK_FLOOR", "")
     monkeypatch.delenv("VCO_CODE_GRAPH_SCORE_FLOOR", raising=False)
+    monkeypatch.setattr(cli_mod, "_active_code_vector_slot", lambda: "qwen3_embed")
+    assert cli_mod._resolve_code_score_floor() == 0.30
+
+
+def test_c1b_unparseable_env_falls_to_slot_default(cli_mod, monkeypatch) -> None:
+    """v0.2.72: an unparseable override falls through to the per-slot default
+    (was 0.0 under the pre-C-H1 no-floor parity; now the measured post-rerank
+    floor applies so noise stays culled)."""
+    monkeypatch.setenv("VCO_CODE_GRAPH_POST_RERANK_FLOOR", "not-a-float")
+    monkeypatch.delenv("VCO_CODE_GRAPH_SCORE_FLOOR", raising=False)
+    monkeypatch.setattr(cli_mod, "_active_code_vector_slot", lambda: "qwen3_embed")
+    assert cli_mod._resolve_code_score_floor() == 0.30
+
+
+def test_c1b_unknown_slot_defaults_to_codesage_pair(cli_mod, monkeypatch) -> None:
+    """A future 4th embedder slot defaults to the codesage-family post-rerank
+    floor (0.22) — the shipped-default band, not a disabled gate."""
+    monkeypatch.delenv("VCO_CODE_GRAPH_SCORE_FLOOR", raising=False)
+    monkeypatch.delenv("VCO_CODE_GRAPH_POST_RERANK_FLOOR", raising=False)
     monkeypatch.setattr(cli_mod, "_active_code_vector_slot", lambda: "some_new_embed")
-    assert cli_mod._resolve_code_score_floor() == 0.0
+    assert cli_mod._resolve_code_score_floor() == 0.22
 
 
 def test_c1b_slot_resolution_exception_defaults_codesage(cli_mod, monkeypatch) -> None:
-    """If _active_code_vector_slot raises, fall back to codesage (0.0 floor)."""
+    """If _active_code_vector_slot raises, fall back to codesage (0.22 post
+    floor)."""
     monkeypatch.delenv("VCO_CODE_GRAPH_SCORE_FLOOR", raising=False)
+    monkeypatch.delenv("VCO_CODE_GRAPH_POST_RERANK_FLOOR", raising=False)
     def _boom():
         raise RuntimeError("no service")
     monkeypatch.setattr(cli_mod, "_active_code_vector_slot", _boom)
-    assert cli_mod._resolve_code_score_floor() == 0.0
+    assert cli_mod._resolve_code_score_floor() == 0.22
 
 
 # --------------------------------------------------------------------------
