@@ -4,7 +4,7 @@
     "bundle_materialization": 2,
     "code_graph_builds_status_vocabulary": 1,
     "codegraph_access_vocabulary": 1,
-    "codegraph_collection": 4,
+    "codegraph_collection": 5,
     "development_collection": 2,
     "diagrams_collection": 2,
     "kg_collection": 3,

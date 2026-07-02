@@ -63,7 +63,20 @@ DEVELOPMENT_COLLECTION_SCHEMA_VERSION = 2
 #: roots produce distinct UUIDs — eliminates the 49.2% cross-root collision
 #: rate observed on 2026-06-09) + V52-O.4 (``file_path`` property added to
 #: CodeFunction + CodeClass — pre-v0.2.52 only CodeModule had it).
-CODEGRAPH_COLLECTION_SCHEMA_VERSION = 4
+#: v5: v0.2.72 P3/P7 — model-aware chunking of over-budget entities adds
+#: ``chunk_num`` + ``total_chunks`` (INT) to CodeFunction/CodeClass, and a
+#: ``embed_revision`` (INT) generation marker to all 5 classes. The shape
+#: change is ADDITIVE + data-preserving: the migration
+#: ``migrations/codegraph_collection/4_to_5.py`` edge ``add_property``s the new
+#: props (NO drop, NO re-embed). The actual per-row re-embed for the ~7-9% of
+#: functions/classes that now CHUNK is handled INCREMENTALLY + resumably by the
+#: analyzer's per-object ``CODEGRAPH_EMBED_REVISION`` gate (see
+#: ``analyze_code_graph.py`` + ``vco_lib/codegraph_resync.py``), NOT by a
+#: framework drop+recreate — the framework has no selective-per-row re-embed
+#: verb and a full CodeSage re-embed would be needlessly expensive for a 9%
+#: tail. So: framework owns the SCHEMA shape (this bump + the preserving edge);
+#: the analyzer's revision gate owns the DATA re-shape.
+CODEGRAPH_COLLECTION_SCHEMA_VERSION = 5
 
 # ===========================================================================
 # Layer 2 — KG node content schema (USER-CURATED — upgrade in place on bump)
