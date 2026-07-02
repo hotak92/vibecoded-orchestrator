@@ -297,8 +297,11 @@ fi
 #   $1 query        — the codegraph search query (module name / symbol)
 #   $2 exclude_path — path to grep -v out (self-reference); "" if none
 #   $3 label        — header label for the injected block
+#   $4 anchor       — optional file path / symbol forwarded as --anchor so the
+#                     CLI's shared pipeline biases the rerank toward
+#                     call-linked / same-module / shared-type code (v0.2.72 P2)
 _cg_inject() {
-    local _q="$1" _excl="$2" _label="$3"
+    local _q="$1" _excl="$2" _label="$3" _anchor="${4:-}"
     command -v codegraph_query_block >/dev/null 2>&1 || return 0
     [ -n "$_q" ] || return 0
 
@@ -330,7 +333,7 @@ _cg_inject() {
     fi
 
     local _raw
-    _raw="$(codegraph_query_block "$_q" "" 2 "$_excl" 2>/dev/null || true)"
+    _raw="$(codegraph_query_block "$_q" "" 2 "$_excl" "$_anchor" 2>/dev/null || true)"
     [ -n "$_raw" ] || return 0
     local _inj="" _rd=""
     if command -v vco_seen_store_path >/dev/null 2>&1; then
@@ -389,7 +392,7 @@ if [[ "$TOOL_NAME" == "Read" ]]; then
         # matches the producer's repo-relative CODE: src shape.
         if [[ "$FILE_PATH" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$ ]]; then
             _RD_Q="$(basename "$FILE_PATH")"; _RD_Q="${_RD_Q%.*}"
-            _cg_inject "$_RD_Q" "$_REL_FP" "Code-graph context for $(basename "$FILE_PATH")"
+            _cg_inject "$_RD_Q" "$_REL_FP" "Code-graph context for $(basename "$FILE_PATH")" "$_REL_FP"
         fi
     fi
     exit 0
@@ -413,7 +416,7 @@ if [[ "$TOOL_NAME" == "Grep" ]]; then
             if command -v codegraph_extract_symbol >/dev/null 2>&1; then
                 _GREP_SYM="$(codegraph_extract_symbol "$GREP_PATTERN")"
             fi
-            _cg_inject "$_GREP_SYM" "" "Code-graph context for symbol: ${_GREP_SYM}"
+            _cg_inject "$_GREP_SYM" "" "Code-graph context for symbol: ${_GREP_SYM}" "$_GREP_SYM"
         fi
     fi
     exit 0

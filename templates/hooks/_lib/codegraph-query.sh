@@ -39,12 +39,16 @@ vco_codegraph_cli() {
     return 1
 }
 
-# codegraph_query_block <query> <project_arg> <limit> <exclude_path>
+# codegraph_query_block <query> <project_arg> <limit> <exclude_path> [anchor]
 # Echo the raw "CODE:"-prefixed --hook-format block(s) for <query>, or nothing.
 #   $1 query        — the search query (symbol / module name / bash symbol token)
 #   $2 project_arg  — "--project Foo" or "" (already shell-token-shaped)
 #   $3 limit        — max results (default 2)
 #   $4 exclude_path — a path to grep -v out of the results (avoid self-injection)
+#   $5 anchor       — optional edited-file path or grep symbol; forwarded as
+#                     `--anchor` so the CLI's shared retrieval pipeline biases
+#                     the rerank toward call-linked / same-module / shared-type
+#                     code (v0.2.72 P2). Empty → pure semantic (MCP parity).
 # Soft-fail: CLI absent / error / empty → echo nothing, return 0. Never writes to
 # stderr-bound context, never exits non-zero. Bounded by an inner timeout so a
 # hung subprocess can't blow the caller's settings.json budget.
@@ -53,24 +57,35 @@ codegraph_query_block() {
     local project_arg="$2"
     local limit="${3:-2}"
     local exclude_path="${4:-}"
+    local anchor="${5:-}"
 
     [ -n "$query" ] || return 0
     local cli
     cli="$(vco_codegraph_cli)" || return 0
     [ -n "$cli" ] || return 0
 
+    # Build the CLI argv in the function's positional params (bash-3.2-safe —
+    # no arrays — and space-safe for the anchor path/symbol).
+    set -- search "$query"
+    if [ -n "$project_arg" ]; then
+        # shellcheck disable=SC2086 — project_arg is intentionally word-split.
+        set -- "$@" $project_arg
+    fi
+    set -- "$@" --limit "$limit" --hook-format
+    if [ -n "$anchor" ]; then
+        set -- "$@" --anchor "$anchor"
+    fi
+
     # Inner hard bound. Prefer `timeout` (coreutils / busybox); when absent,
     # fall back to a bg-pid + sleep-kill guard so Git-Bash-on-Windows (no
     # timeout) still can't hang the hook.
     local raw=""
     if command -v timeout >/dev/null 2>&1; then
-        # shellcheck disable=SC2086 — project_arg is intentionally word-split.
-        raw="$(timeout 4 "$cli" search "$query" $project_arg --limit "$limit" --hook-format 2>/dev/null || true)"
+        raw="$(timeout 4 "$cli" "$@" 2>/dev/null || true)"
     else
         local _tmp
         _tmp="$(mktemp 2>/dev/null || printf '%s' "/tmp/cg_$$_$RANDOM")"
-        # shellcheck disable=SC2086
-        ( "$cli" search "$query" $project_arg --limit "$limit" --hook-format >"$_tmp" 2>/dev/null ) &
+        ( "$cli" "$@" >"$_tmp" 2>/dev/null ) &
         local _pid=$!
         ( sleep 4; kill -9 "$_pid" 2>/dev/null ) >/dev/null 2>&1 &
         local _watchdog=$!

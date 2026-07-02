@@ -114,7 +114,9 @@ if command -v codegraph_bash_gate >/dev/null 2>&1 && codegraph_bash_gate "$COMMA
     if command -v codegraph_extract_symbol >/dev/null 2>&1; then
         _CG_SYM="$(codegraph_extract_symbol "$COMMAND")"
     fi
-    _CG_RAW="$(codegraph_query_block "$_CG_SYM" "" 2 "" 2>/dev/null || true)"
+    # v0.2.72 P2: the extracted symbol doubles as the --anchor (5th arg) so the
+    # CLI's shared pipeline biases the rerank toward code call-linked to it.
+    _CG_RAW="$(codegraph_query_block "$_CG_SYM" "" 2 "" "$_CG_SYM" 2>/dev/null || true)"
     if [ -n "$_CG_RAW" ]; then
         _CGB_INJECT=""
         _CGB_READS=""

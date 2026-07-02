@@ -31,16 +31,21 @@ function Get-VcoCodegraphCli {
     return ""
 }
 
-# Invoke-VcoCodegraphQueryBlock <Query> <ProjectArg> <Limit> <ExcludePath>
+# Invoke-VcoCodegraphQueryBlock <Query> <ProjectArg> <Limit> <ExcludePath> [Anchor]
 # Return the raw "CODE:"-prefixed --hook-format block(s), or "". Soft-fail to ""
 # on absent CLI / error / empty. Bounded by a 4s job timeout so a hung child
-# can't hang the hook.
+# can't hang the hook. -Anchor (optional): edited-file path or grep symbol,
+# forwarded as `--anchor` so the CLI's shared retrieval pipeline biases the
+# rerank toward call-linked / same-module / shared-type code (v0.2.72 P2).
+# Empty -> pure semantic (MCP parity). MUST MATCH codegraph-query.sh
+# codegraph_query_block ($5 anchor).
 function Invoke-VcoCodegraphQueryBlock {
     param(
         [string]$Query,
         [string]$ProjectArg = "",
         [int]$Limit = 2,
-        [string]$ExcludePath = ""
+        [string]$ExcludePath = "",
+        [string]$Anchor = ""
     )
     if ([string]::IsNullOrEmpty($Query)) { return "" }
     $cli = Get-VcoCodegraphCli
@@ -49,6 +54,7 @@ function Invoke-VcoCodegraphQueryBlock {
     $argList = @("search", $Query)
     if ($ProjectArg) { $argList += ($ProjectArg -split '\s+') }
     $argList += @("--limit", "$Limit", "--hook-format")
+    if ($Anchor) { $argList += @("--anchor", $Anchor) }
 
     $raw = ""
     try {

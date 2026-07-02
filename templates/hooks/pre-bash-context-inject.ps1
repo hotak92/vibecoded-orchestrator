@@ -87,8 +87,11 @@ if ((Get-Command Test-VcoCodegraphBashGate -ErrorAction SilentlyContinue) -and (
         $cgSym = Get-VcoCodegraphSymbol -Text $Command
     }
     $cgRaw = ""
+    # v0.2.72 P2: the extracted symbol doubles as -Anchor so the CLI's shared
+    # pipeline biases the rerank toward code call-linked to it. MUST MATCH
+    # pre-bash-context-inject.sh.
     if (Get-Command Invoke-VcoCodegraphQueryBlock -ErrorAction SilentlyContinue) {
-        $cgRaw = Invoke-VcoCodegraphQueryBlock -Query $cgSym -ProjectArg "" -Limit 2 -ExcludePath ""
+        $cgRaw = Invoke-VcoCodegraphQueryBlock -Query $cgSym -ProjectArg "" -Limit 2 -ExcludePath "" -Anchor $cgSym
     }
     if ($cgRaw) {
         $cgInj = ""

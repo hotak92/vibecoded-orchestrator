@@ -229,7 +229,9 @@ if ($ToolName -eq "Bash") {
 
 # === v0.2.70 Stream C: shared code-graph injection for Read(code)/Grep(symbol).
 # One home for both surfaces. MUST MATCH pre-tool-use.sh _cg_inject.
-function Invoke-CgInject([string]$q, [string]$excl, [string]$label) {
+# $anchor (v0.2.72 P2): optional file path / symbol forwarded as -Anchor so the
+# CLI's shared pipeline biases the rerank toward call-linked code.
+function Invoke-CgInject([string]$q, [string]$excl, [string]$label, [string]$anchor = "") {
     if (-not (Get-Command Invoke-VcoCodegraphQueryBlock -ErrorAction SilentlyContinue)) { return }
     if (-not $q) { return }
 
@@ -254,7 +256,7 @@ function Invoke-CgInject([string]$q, [string]$excl, [string]$label) {
         return
     }
 
-    $raw = Invoke-VcoCodegraphQueryBlock -Query $q -ProjectArg "" -Limit 2 -ExcludePath $excl
+    $raw = Invoke-VcoCodegraphQueryBlock -Query $q -ProjectArg "" -Limit 2 -ExcludePath $excl -Anchor $anchor
     if (-not $raw) { return }
     $inj = ""
     $rd = ""
@@ -304,7 +306,7 @@ if ($ToolName -eq "Read") {
         # uses the repo-relative path so it matches the producer CODE: src shape.
         if ($filePath -match '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$') {
             $rdQ = [System.IO.Path]::GetFileNameWithoutExtension((Split-Path $filePath -Leaf))
-            Invoke-CgInject $rdQ $relFp "Code-graph context for $(Split-Path $filePath -Leaf)"
+            Invoke-CgInject $rdQ $relFp "Code-graph context for $(Split-Path $filePath -Leaf)" $relFp
         }
     }
     exit 0
@@ -319,7 +321,7 @@ if ($ToolName -eq "Grep") {
             if (Get-Command Get-VcoCodegraphSymbol -ErrorAction SilentlyContinue) {
                 $grepSym = Get-VcoCodegraphSymbol -Text $grepPattern
             }
-            Invoke-CgInject $grepSym "" "Code-graph context for symbol: $grepSym"
+            Invoke-CgInject $grepSym "" "Code-graph context for symbol: $grepSym" $grepSym
         }
     }
     exit 0

@@ -69,10 +69,19 @@ for _env_var in ("VCT_ORCHESTRATOR_ROOT", "VCT_INSTALL_ROOT"):
 if _MCP_SERVERS_PATH is None:
     _MCP_SERVERS_PATH = _PROJECT_ROOT / "claude_mcp_servers"
 
+# v0.2.72 (P1/P2/P4 CLI parity): besides the rank/tier FORMATTERS, import the
+# shared pipeline ADAPTER factories (`make_code_collapse_fn` / `make_code_tier_fn`)
+# from the SERVER module. Both this CLI and `search_code_graph` (MCP) build their
+# `run_code_retrieval_pipeline` collapse_fn/tier_fn from THESE factories, so the
+# two surfaces cannot diverge on collapse/tier behaviour (the hard invariant).
+# Do NOT reimplement them per-surface.
 try:
     from weaviate_mcp.server import (
         _format_code_result_by_rank,
+        _format_code_result_by_tier,
         _format_code_result_ref,
+        make_code_collapse_fn,
+        make_code_tier_fn,
         CODE_SIBLINGS_RANK_1,
         CODE_SIBLINGS_RANK_2,
     )
@@ -194,66 +203,47 @@ def _active_code_vector_slot() -> str:
     return svc.code_vector_slot
 
 
-# v0.2.72 T-FLOOR (P1): the two-stage per-slot floor table + resolvers now live
-# in the SINGLE SHARED home ``weaviate_mcp.code_ranking`` so the CLI path and the
-# MCP path (server.py::search_code_graph) cannot diverge. This CLI already
-# imports shared helpers from weaviate_mcp via the pip-editable install (see the
-# ``from weaviate_mcp.server import ...`` block above, :72-87) — mirror that
-# style here.
+# v0.2.72 T-FLOOR (P1) + integration: the two-stage per-slot floor table,
+# resolvers AND the retrieval pipeline live in the SINGLE SHARED home
+# ``weaviate_mcp.code_ranking`` so the CLI path and the MCP path
+# (server.py::search_code_graph) cannot diverge. This CLI already imports shared
+# helpers from weaviate_mcp via the pip-editable install (see the
+# ``from weaviate_mcp.server import ...`` block above) — mirror that style here.
 #
 # ``CODE_FLOOR_BY_SLOT`` (measured CodeSage 0.16/0.22, jina 0.16/0.22, qwen3
 # conservative 0.20/0.30) is the (retrieval_floor, post_rerank_floor) contract;
 # ``resolve_retrieval_floor`` / ``resolve_post_rerank_floor`` own the env-
-# override + empty-string-coercion discipline. Graceful fallback keeps the CLI
-# working on a half-installed venv where the shared module isn't importable.
+# override + empty-string-coercion discipline.
 #
 # MUST MATCH (3-way mirror): the floor VALUES in code_ranking.py are the
 # contract between this CLI, the MCP server
 # (claude_mcp_servers/weaviate_mcp/server.py::search_code_graph), and any hook
 # that pre-filters code-graph results. v0.2.72 moved the table to the shared
 # module so the three surfaces cannot drift; changing a value re-opens the
-# cross-scale-floor bug unless every surface + the experiment re-run agree. The
-# half-installed-venv fallback below therefore mirrors those same values.
+# cross-scale-floor bug unless every surface + the experiment re-run agree.
+#
+# Hard-required (no fallback reimplementation): reimplementing the pipeline or
+# the floor table per-surface is exactly the divergence this module exists to
+# prevent. If `weaviate_mcp.server` imported above, `weaviate_mcp.code_ranking`
+# is importable too (server.py imports it at module scope), so this branch can
+# only fail alongside the server import — which already sys.exit(1)s with the
+# remediation message.
 try:
-    from weaviate_mcp.code_ranking import (  # noqa: F401  (run_code_retrieval_pipeline wired by integrator)
+    from weaviate_mcp.code_ranking import (
         CODE_FLOOR_BY_SLOT,
         resolve_post_rerank_floor,
         resolve_retrieval_floor,
         run_code_retrieval_pipeline,
     )
-    _HAS_CODE_RANKING = True
-except ImportError:
-    _HAS_CODE_RANKING = False
-    # Half-installed venv fallback: mirror the shipped two-stage defaults so the
-    # CLI still applies a sane floor. Values MUST MATCH code_ranking.py.
-    CODE_FLOOR_BY_SLOT = {  # type: ignore[assignment]
-        "codesage_embed": (0.16, 0.22),
-        "jina_embed": (0.16, 0.22),
-        "qwen3_embed": (0.20, 0.30),
-    }
-
-    def resolve_retrieval_floor(slot, env=None):  # type: ignore[no-redef]
-        return CODE_FLOOR_BY_SLOT.get(slot, (0.16, 0.22))[0]
-
-    def resolve_post_rerank_floor(slot, env=None):  # type: ignore[no-redef]
-        return CODE_FLOOR_BY_SLOT.get(slot, (0.16, 0.22))[1]
-
-
-def _resolve_code_score_floor() -> float:
-    """Back-compat shim: resolve the effective code-graph SCORE floor for the
-    active slot. Delegates to the shared ``resolve_post_rerank_floor`` (the real
-    gate) so the single-stage CLI apply site keeps working until the v0.2.72
-    integrator wires ``run_code_retrieval_pipeline`` into ``search_by_concept``.
-
-    Env override + empty-string coercion is handled inside the shared resolver
-    (canonical ``VCO_CODE_GRAPH_POST_RERANK_FLOOR``, deprecated
-    ``VCO_CODE_GRAPH_SCORE_FLOOR`` alias). Slot resolution soft-fails to
-    codesage_embed."""
-    try:
-        _slot = _active_code_vector_slot()
-    except Exception:
-        _slot = "codesage_embed"
-    return resolve_post_rerank_floor(_slot, os.environ)
+except ImportError as exc:  # pragma: no cover — surface a clear error
+    print(
+        f"Error: could not import weaviate_mcp.code_ranking pipeline: {exc}\n"
+        f"  Expected module at: {_MCP_SERVERS_PATH}/weaviate_mcp/code_ranking.py\n"
+        "  Ensure install.py has run (pip install -e claude_mcp_servers/) or set\n"
+        "  VCT_ORCHESTRATOR_ROOT to the orchestrator clone root.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def generate_code_embedding(text: str) -> Optional[List[float]]:
@@ -312,28 +302,109 @@ class CodeGraphQuery:
             print(f"❌ Failed to connect to Weaviate: {e}", file=sys.stderr)
             return False
 
-    def search_by_concept(self, query: str, collection: str = "CodeFunction", limit: int = 5, detail: str = "auto", hook_format: bool = False):
+    def _resolve_anchor_props(self, anchor: str) -> Optional[dict]:
+        """Resolve an ``--anchor`` value (edited file path OR symbol full_name)
+        to the anchor entity's Weaviate props.
+
+        The anchor is the edit/grep seed the hook path passes so the shared
+        pipeline's relationship rerank (call-linked / same-module /
+        shared-type — code_ranking.rerank_score) fires relative to it. Queries
+        CodeFunction + CodeClass in the SELF project only (peers are search
+        targets, not anchors), attempting in priority order:
+          1. full_name == anchor          (exact symbol)
+          2. file_path == anchor          (exact path, as passed)
+          3. file_path LIKE *<tail>       (path-shaped anchor — an absolute
+             editor path still hits the analyzer's repo-relative file_path)
+          4. full_name LIKE *.<anchor>    (bare symbol — qualified leaf)
+        Among matches, the lowest chunk_num wins (entity-level props like
+        call_names / type_uses are replicated per chunk row).
+
+        Failure-soft by contract: empty anchor / no client / no match / any
+        Weaviate error → None (pure semantic ordering, byte-identical to a
+        direct MCP call). Never raises into the search path.
+        """
+        if not anchor or self.client is None:
+            return None
+        try:
+            anchor = str(anchor).strip()
+            if not anchor:
+                return None
+            attempts = [
+                Filter.by_property("full_name").equal(anchor),
+                Filter.by_property("file_path").equal(anchor),
+            ]
+            norm = anchor.replace("\\", "/")
+            if "/" in norm:
+                parts = [p for p in norm.split("/") if p]
+                tail = "/".join(parts[-2:]) if len(parts) >= 2 else (parts[-1] if parts else "")
+                if tail:
+                    attempts.append(Filter.by_property("file_path").like(f"*{tail}"))
+            elif all(ch.isalnum() or ch in "_.:" for ch in anchor):
+                # Bare symbol: also match qualified full_names ending in
+                # ".<anchor>" (e.g. anchor "validate_token" hits
+                # "api.auth.validate_token").
+                attempts.append(Filter.by_property("full_name").like(f"*.{anchor}"))
+
+            for flt in attempts:
+                best: Optional[dict] = None
+                best_chunk = 0
+                for base in ("CodeFunction", "CodeClass"):
+                    try:
+                        coll_obj = self.client.collections.get(self._coll(base))
+                        q = flt
+                        if self.project:
+                            q = flt & Filter.by_property("project").equal(self.project)
+                        resp = coll_obj.query.fetch_objects(filters=q, limit=4)
+                    except Exception:
+                        continue
+                    for obj in resp.objects:
+                        p = obj.properties or {}
+                        try:
+                            cn = int(p.get("chunk_num") or 0)
+                        except (TypeError, ValueError):
+                            cn = 0
+                        if best is None or cn < best_chunk:
+                            best, best_chunk = p, cn
+                if best is not None:
+                    return best
+            return None
+        except Exception:
+            return None
+
+    def search_by_concept(self, query: str, collection: str = "CodeFunction", limit: int = 5, detail: str = "auto", hook_format: bool = False, anchor: str = None):
         """Semantic search for code by concept.
 
         P1-D (2026-05-08): when ``self.project`` is set, fan out across
         self + every peer in ``VCT_CODE_GRAPH_ACCESS_LIST``. Each
-        per-collection query stays bounded to ``limit`` over-fetched
-        candidates; results are merged and re-ranked by distance before
-        truncation. When ``self.project`` is unset (cross-tenant
-        "search all projects" path), behaviour is unchanged: a single
-        bare-collection query.
+        per-collection query over-fetches ``2*limit`` candidates (the
+        shared-pipeline pool, matching the MCP); results are merged and
+        ranked by the shared pipeline before truncation. When
+        ``self.project`` is unset (cross-tenant "search all projects"
+        path), behaviour is unchanged: a single bare-collection query.
 
-        Uses the shared rank-tier formatter (`_format_code_result_by_rank`)
-        so output matches `search_code_graph` MCP exactly. Tier policy:
-          - rank 0-1: full untruncated content + sibling rows in same file
-          - rank 2-3: full content with doc/summary truncated at
-            CODE_TRUNC_CHARS (default 1200)
-          - rank 4+:  metadata-only refs
+        v0.2.72 (P1/P2/P4 CLI parity): ranking runs through the SHARED
+        ``run_code_retrieval_pipeline`` (weaviate_mcp.code_ranking) with the
+        SAME adapter factories (`make_code_collapse_fn` / `make_code_tier_fn`
+        from weaviate_mcp.server) and the SAME per-slot floor resolution the
+        MCP uses — two-stage floor + relationship rerank + multi-chunk
+        collapse + score-tier allocation. Rendering matches the MCP loop:
+        pipeline-tiered candidates go through `_format_code_result_by_tier`
+        (1/3/7-chunk assembly); explicit detail goes through the rank-based
+        `_format_code_result_by_rank`.
 
         detail:
-          "auto"   — rank-driven tiering (top-2 + siblings, mid truncated, rest refs)
+          "auto"   — score-tier verbosity from the shared pipeline's tier_fn
+                     (summary / single_chunk / three_chunks / full per score)
           "titles" — metadata refs for every result
           "full"   — full untruncated for every result
+
+        anchor: edited file path OR symbol full_name (the hook path passes
+          this). Resolved to the anchor entity's Weaviate props and passed as
+          ``anchor_props`` so the pipeline's relationship boost (call-linked /
+          same-module / shared-type — code_ranking.rerank_score) fires
+          relative to it. None / unresolvable → anchor_props=None → pure
+          semantic ordering, byte-identical to a direct MCP call. That is
+          data, not behaviour — the pipeline code is identical either way.
 
         hook_format: when True, emit a stable per-result header line
           'CODE: <full_name> | <collection> | distance=<d>' (with optional
@@ -369,10 +440,12 @@ class CodeGraphQuery:
             # See docs/HOOK_TOKEN_AUDIT_2026-05-20.md §3 and the
             # query_code_graph.py side of the fix.
 
-            # Fan-out: query each (collection, filter) pair, merge by
-            # ascending distance. We over-fetch by `limit` per
-            # collection so the merge has enough candidates to fill
-            # `limit` even when the top-K is concentrated in peers.
+            # Fan-out: query each (collection, filter) pair, merge into one
+            # candidate pool. v0.2.72 (P1/P2): over-fetch 2N per collection so
+            # the shared `run_code_retrieval_pipeline` has a pool to floor-cull
+            # + rerank + collapse before trimming to `limit`. Matches the MCP
+            # over-fetch (server.py::search_code_graph).
+            _fetch_limit = max(1, 2 * limit)
             merged: list[tuple[float, str, object]] = []  # (distance, source_label, obj)
             for coll_name, project_filter in pairs:
                 try:
@@ -382,7 +455,7 @@ class CodeGraphQuery:
                     continue
                 nv_kwargs = dict(
                     near_vector=query_embedding,
-                    limit=limit,
+                    limit=_fetch_limit,
                     return_metadata=MetadataQuery(distance=True),
                     target_vector=_active_code_vector_slot(),
                 )
@@ -399,62 +472,57 @@ class CodeGraphQuery:
                     distance = obj.metadata.distance if obj.metadata.distance is not None else 1.0
                     merged.append((distance, project_filter or "", obj))
 
-            # Sort by distance asc; truncate to limit. Multi-collection
-            # fan-out can return the same full_name from multiple
-            # collections (it shouldn't, but a misconfigured access list
-            # with overlapping projects could) — dedupe by full_name
-            # keeping the lowest-distance candidate.
-            merged.sort(key=lambda t: t[0])
-            seen_keys: set[str] = set()
-            top: list[tuple[float, str, object]] = []
-            # v0.2.21 (mid-session audit fix, 2026-05-20): drop very-low-
-            # similarity results before tier formatting. Codegraph
-            # embedding space is denser than the KG side (CodeSage-Large
-            # tends to place any code-shaped query within ~0.7-0.9
-            # distance of countless unrelated functions), so the KG
-            # tiers (0.42/0.55/0.65/0.75 from
-            # knowledge/concepts/score-driven-retrieval-tiers.md) tuned
-            # for qwen3-embedding don't map cleanly here.
-            #
-            # Default floor: score >= 0.35 (distance <= 0.65). Calibrated
-            # against observed in-session injection quality:
-            #   * < 0.30: structurally unrelated functions (noise; the
-            #     user gains nothing from seeing them).
-            #   * 0.30-0.50: weak but occasionally on-topic (e.g.
-            #     `require_kg_read` at 0.38 on an edit to query_code_graph.py
-            #     is a contextually-related access-matrix helper).
-            #   * 0.50+: usually directly relevant.
-            # v0.2.70 Bug C1b: the floor is now EMBEDDER-AWARE (see
-            # _resolve_code_score_floor / _CODE_FLOOR_BY_SLOT above). The legacy
-            # fixed 0.35 was calibrated for qwen3's distance scale and silently
-            # culled ALL CodeSage results (whose distances cluster ~0.70 ->
-            # score ~0.30). Now: codesage/jina -> 0.0 (MCP parity), qwen3 ->
-            # 0.25; $VCO_CODE_GRAPH_SCORE_FLOOR still overrides.
-            # v0.2.72 integrator: wire run_code_retrieval_pipeline here (see
-            # weaviate_mcp/code_ranking.py). Normalise `merged` into the
-            # {"_s": score, "_p": props, ...} candidate shape, resolve the
-            # two-stage floors via resolve_retrieval_floor /
-            # resolve_post_rerank_floor, and replace this single-stage
-            # break-loop with one pipeline call so the CLI and MCP paths are
-            # byte-identical. T-FLOOR (P1+P2) left this body UNTOUCHED — the
-            # shim `_resolve_code_score_floor()` keeps the pre-integrator
-            # behaviour working (post-rerank floor as the single gate).
-            score_floor = _resolve_code_score_floor()
+            # v0.2.72 (P1/P2/P3/P4 CLI parity): normalise the fan-out into the
+            # shared candidate shape and run the SAME
+            # `run_code_retrieval_pipeline` the MCP calls
+            # (server.py::search_code_graph) with the SAME adapter factories —
+            # two-stage per-slot floor (retrieval 0.16 / post-rerank 0.22 for
+            # CodeSage) + relationship rerank + multi-chunk collapse +
+            # score-tier allocation — then trim to `limit`. This replaced the
+            # v0.2.21/v0.2.70 single-stage floor break-loop; floor history
+            # lives in weaviate_mcp/code_ranking.py. The ONLY per-surface
+            # difference is `anchor_props`: the hook path passes a resolved
+            # anchor entity (edited file / grep symbol) so the P2 relationship
+            # boost fires; a direct MCP call passes None. That is data, not
+            # behaviour — the pipeline code is identical (the hard
+            # non-divergence invariant).
+            candidates: list[dict] = []
             for distance, source, obj in merged:
-                # score = 1 - distance, clamped to [0, 1].
-                score = max(0.0, min(1.0, 1.0 - distance)) if distance >= 0 else 0.0
-                if score < score_floor:
-                    # Stop iterating: results are sorted by distance asc
-                    # (score desc), so once we drop below the floor
-                    # there can be no more candidates above it.
-                    break
-                key = obj.properties.get("full_name") or obj.properties.get("name") or str(obj.uuid)
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-                top.append((distance, source, obj))
-                if len(top) >= limit:
-                    break
+                candidates.append({
+                    "_c": collection,
+                    "_s": max(0.0, 1.0 - distance),
+                    "_d": distance,
+                    "_p": obj.properties,
+                    "_src": source,
+                })
+
+            try:
+                _slot = _active_code_vector_slot()
+            except Exception:
+                _slot = "codesage_embed"
+
+            anchor_props = self._resolve_anchor_props(anchor) if anchor else None
+
+            # Score-tier allocation only runs in "auto" mode; explicit detail
+            # values want uniform output, so we skip the budget allocator and
+            # let the format loop honour `detail` directly (tier_fn=None → no
+            # `_tier` set). Same rule as the MCP.
+            _tier_fn = make_code_tier_fn() if detail == "auto" else None
+            survivors = run_code_retrieval_pipeline(
+                candidates,
+                retrieval_floor=resolve_retrieval_floor(_slot),
+                post_rerank_floor=resolve_post_rerank_floor(_slot),
+                anchor_props=anchor_props,
+                limit=limit,
+                collapse_fn=make_code_collapse_fn(),
+                tier_fn=_tier_fn,
+                key_fields=("file_path", "full_name"),
+            )
+
+            # Rebuild `top` in the (distance, source, candidate) shape the
+            # downstream banner + format loop consume. `_src` / `_d` were
+            # preserved through the pipeline (it never strips caller keys).
+            top = [(c.get("_d", 1.0), c.get("_src", ""), c) for c in survivors]
 
             # Sibling fetcher: closes over self.client + self.project so
             # the shared helper stays Weaviate-agnostic. Only invoked for
@@ -555,20 +623,70 @@ class CodeGraphQuery:
                     proj_part = f" | project={self.project}" if self.project else ""
                     print(f"CODE: no-results | collection={collection}{proj_part} | query='{query}'")
 
-            # Render through shared helper. i is 0-based for the helper;
-            # human output uses 1-based numbering.
-            for i, (distance, source, obj) in enumerate(top):
-                props = obj.properties
-                score = (1.0 - distance) if distance >= 0 else 0.0
-                rendered = _format_code_result_by_rank(
-                    props,
-                    collection,
-                    rank=i,
-                    detail=detail,
-                    score=score,
-                    distance=distance,
-                    sibling_fetcher=_sibling_fetcher,
-                )
+            # Code-chunk fetcher: closes over self.client + self._coll so the
+            # shared tier formatter stays Weaviate-agnostic. Mirrors the MCP's
+            # `_fetch_code_chunks` closure (keys on full_name — code's node
+            # identity; CodeFunction + CodeClass are the only chunked code
+            # collections). Returns [] on any failure or for a single-chunk
+            # entity; only invoked for the three_chunks / full tiers.
+            def _code_chunk_fetcher(full_name: str, hit_chunk: int, total: int, max_chunks: int) -> list[dict]:
+                if not full_name or total <= 1 or max_chunks <= 1:
+                    return []
+                collected_chunks: list[tuple[int, dict]] = []
+                for base in ("CodeFunction", "CodeClass"):
+                    try:
+                        coll_obj = self.client.collections.get(self._coll(base))
+                        flt = Filter.by_property("full_name").equal(full_name)
+                        if self.project:
+                            flt = flt & Filter.by_property("project").equal(self.project)
+                        resp = coll_obj.query.fetch_objects(filters=flt, limit=max(total, max_chunks) + 4)
+                        for obj in resp.objects:
+                            cp = obj.properties or {}
+                            cn = cp.get("chunk_num", 0) or 0
+                            try:
+                                collected_chunks.append((int(cn), cp))
+                            except (TypeError, ValueError):
+                                collected_chunks.append((0, cp))
+                    except Exception:
+                        continue
+                if not collected_chunks:
+                    return []
+                # Centre a window of max_chunks around the hit, ordered by chunk_num.
+                collected_chunks.sort(key=lambda t: abs(t[0] - (hit_chunk or 0)))
+                picked = collected_chunks[:max_chunks]
+                picked.sort(key=lambda t: t[0])
+                return [cp for _, cp in picked]
+
+            # Render each survivor through the shared helpers — SAME split as
+            # the MCP loop: in "auto" mode every candidate carries a `_tier`
+            # (from the shared pipeline's tier_fn) → score-tier renderer
+            # (`_format_code_result_by_tier`, 1/3/7-chunk assembly); explicit
+            # "titles"/"full" (tier_fn was None → no `_tier`) → the rank-based
+            # formatter honours `detail` uniformly. i is 0-based for the
+            # helper; human output uses 1-based numbering.
+            for i, (distance, source, cand) in enumerate(top):
+                props = cand.get("_p") or {}
+                score = cand.get("_s", 0.0)
+                tier = cand.get("_tier")
+                if tier is not None:
+                    rendered = _format_code_result_by_tier(
+                        props,
+                        cand.get("_c", collection),
+                        tier,
+                        score=score,
+                        distance=distance,
+                        chunk_fetcher=_code_chunk_fetcher,
+                    )
+                else:
+                    rendered = _format_code_result_by_rank(
+                        props,
+                        cand.get("_c", collection),
+                        rank=i,
+                        detail=detail,
+                        score=score,
+                        distance=distance,
+                        sibling_fetcher=_sibling_fetcher,
+                    )
                 # Source-project annotation for fan-out clarity. Empty
                 # for self-only queries (the pre-P1-D shape).
                 src_label = ""
@@ -1028,6 +1146,9 @@ def main():
                               help=("Emit one-line 'CODE: <full_name> | <collection> | "
                                     "distance=<d>' header per result so the pre-edit hook "
                                     "can dedup by entity name. Suppresses banner lines."))
+    search_parser.add_argument('--anchor', type=str, default=None,
+                              help=('Edited file path or symbol full_name — biases rerank '
+                                    'toward call-linked / same-module / shared-type code'))
 
     # Similar code
     similar_parser = subparsers.add_parser('similar', help='Find similar code')
@@ -1098,7 +1219,8 @@ def main():
         # Execute command
         if args.command == 'search':
             querier.search_by_concept(args.query, args.collection, args.limit, args.detail,
-                                       hook_format=getattr(args, 'hook_format', False))
+                                       hook_format=getattr(args, 'hook_format', False),
+                                       anchor=getattr(args, 'anchor', None))
         elif args.command == 'similar':
             querier.find_similar(args.reference, args.collection, args.limit)
         elif args.command == 'structure':
