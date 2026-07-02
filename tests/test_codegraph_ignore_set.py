@@ -184,3 +184,163 @@ def test_uuid5_seed_empty_source_root_matches_legacy_shape(analyzer_mod):
         "V52-O.3 default-arg regression — omitting project_source must be "
         "equivalent to passing project_source=''."
     )
+
+
+# ---------------------------------------------------------------------------
+# v0.2.72 (P5) — scope tightening: exclude .claude(non-root)/vendor/
+# .bundle.js/.chunk.js/.wt from analysis + per-project .claude toggle.
+# ---------------------------------------------------------------------------
+
+
+def _make_bare_analyzer(analyzer_mod, index_dot_claude: bool):
+    """Construct a CodeGraphAnalyzer WITHOUT running __init__ (no Weaviate /
+    embedding-service dependency), setting only the attrs the _find_* methods
+    read. Mirrors the __new__ pattern in tests/test_code_graph_content_hash_skip.py."""
+    inst = analyzer_mod.CodeGraphAnalyzer.__new__(analyzer_mod.CodeGraphAnalyzer)
+    inst.index_dot_claude = index_dot_claude
+    return inst
+
+
+def test_wt_worktree_container_excluded(analyzer_mod):
+    """P5: the top-level `.wt/` git-worktree container (release per-track
+    worktrees) is exact byte copies of main-repo source. Walking it injects
+    the worktree copy's functions as retrieval noise. Complements the
+    existing `worktrees` (`.claude/worktrees/`) entry."""
+    assert ".wt" in analyzer_mod._COMMON_IGNORE_DIRS, (
+        "P5 fix missing — `.wt` must be in _COMMON_IGNORE_DIRS so the "
+        "release's per-track worktrees aren't re-indexed as duplicate noise."
+    )
+
+
+def test_vendor_excluded_for_js_and_ts(analyzer_mod):
+    """P5: JS/TS `vendor/` holds third-party/minified libraries (e.g. the
+    launcher's bundled diagram editors). Indexing them injects thousands of
+    vendor functions as retrieval noise. Go/Ruby already skip vendor."""
+    for lang in ("js", "ts"):
+        assert "vendor" in analyzer_mod._ignore_dirs_for(lang), (
+            f"P5 fix missing — `vendor` must be in the {lang} ignore set."
+        )
+
+
+def test_ignore_dirs_gates_dot_claude(analyzer_mod):
+    """P5: `.claude` is EXCLUDED when index_dot_claude is False (default for
+    every user project — `.claude/` is generated tooling, not source) and
+    INCLUDED (walked) when True (orchestrator clone / opt-in)."""
+    for lang in ("python", "js", "ts", "rust", "shell"):
+        excluded = analyzer_mod._ignore_dirs_for(lang, False)
+        included = analyzer_mod._ignore_dirs_for(lang, True)
+        assert ".claude" in excluded, (
+            f"P5: `.claude` must be in the {lang} ignore set when "
+            f"index_dot_claude=False (user-project default)."
+        )
+        assert ".claude" not in included, (
+            f"P5: `.claude` must NOT be in the {lang} ignore set when "
+            f"index_dot_claude=True (orchestrator clone / opt-in)."
+        )
+
+
+def test_ignore_dirs_default_excludes_dot_claude(analyzer_mod):
+    """P5: the DEFAULT (no flag arg) must exclude `.claude` — conservative,
+    matches the launcher passing --no-index-dot-claude for user projects."""
+    assert ".claude" in analyzer_mod._ignore_dirs_for("python"), (
+        "P5: `_ignore_dirs_for(lang)` with the default flag must exclude "
+        "`.claude` (conservative default for user projects)."
+    )
+
+
+def test_resolve_index_dot_claude_tri_state(analyzer_mod, tmp_path):
+    """P5: the tri-state CLI resolver. Explicit True/False win; None falls
+    back to root-autodetect (index only when the path looks like the
+    orchestrator clone: has vco_lib/ + .claude/)."""
+    # Explicit flags win regardless of the path shape.
+    assert analyzer_mod._resolve_index_dot_claude(True, tmp_path) is True
+    assert analyzer_mod._resolve_index_dot_claude(False, tmp_path) is False
+
+    # None + a plain user project (no vco_lib/) → exclude.
+    user_proj = tmp_path / "user_project"
+    (user_proj / ".claude").mkdir(parents=True)
+    assert analyzer_mod._resolve_index_dot_claude(None, user_proj) is False
+
+    # None + an orchestrator-shaped root (vco_lib/ + .claude/) → index.
+    orch_root = tmp_path / "orchestrator"
+    (orch_root / "vco_lib").mkdir(parents=True)
+    (orch_root / ".claude").mkdir(parents=True)
+    assert analyzer_mod._resolve_index_dot_claude(None, orch_root) is True
+
+
+def test_find_js_files_skips_bundle_and_chunk_and_vendor(analyzer_mod, tmp_path):
+    """P5: `_find_js_files` must NOT discover `.bundle.js` / `.chunk.js`
+    build output, nor anything under a `vendor/` dir — live-confirmed noise
+    source `launcher/vendor/diagrams-editor/excalidraw/excalidraw.bundle.js`."""
+    # Real first-party source — SHOULD be found.
+    src = tmp_path / "src"
+    src.mkdir()
+    keep = src / "app.js"
+    keep.write_text("function real() { return 1; }\n", encoding="utf-8")
+    # Build bundles — SHOULD be skipped by suffix.
+    (src / "app.bundle.js").write_text("function b(){}\n", encoding="utf-8")
+    (src / "app.chunk.js").write_text("function c(){}\n", encoding="utf-8")
+    (src / "app.min.js").write_text("function m(){}\n", encoding="utf-8")
+    # Vendored dep — SHOULD be skipped by dir.
+    vendor = tmp_path / "launcher" / "vendor" / "diagrams-editor" / "excalidraw"
+    vendor.mkdir(parents=True)
+    (vendor / "excalidraw.bundle.js").write_text("function _CA(){}\n", encoding="utf-8")
+    (vendor / "plain.js").write_text("function v(){}\n", encoding="utf-8")
+
+    inst = _make_bare_analyzer(analyzer_mod, index_dot_claude=False)
+    found = {p.name for p in inst._find_js_files(tmp_path)}
+    assert "app.js" in found, "first-party source must still be discovered"
+    for skipped in ("app.bundle.js", "app.chunk.js", "app.min.js",
+                    "excalidraw.bundle.js", "plain.js"):
+        assert skipped not in found, (
+            f"P5: {skipped} must NOT be discovered by _find_js_files "
+            f"(bundle/chunk suffix or vendor/ dir)."
+        )
+
+
+def test_find_python_files_gates_dot_claude(analyzer_mod, tmp_path):
+    """P5: a `.claude/scripts/x.py` is discovered ONLY when index_dot_claude
+    is True. For a user project (False) it is excluded as generated tooling."""
+    # First-party source — always found.
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "main.py").write_text("def real():\n    return 1\n", encoding="utf-8")
+    # Generated tooling under .claude/ — gated.
+    dot_claude = tmp_path / ".claude" / "scripts"
+    dot_claude.mkdir(parents=True)
+    (dot_claude / "x.py").write_text("def tooling():\n    return 2\n", encoding="utf-8")
+
+    excluded = _make_bare_analyzer(analyzer_mod, index_dot_claude=False)
+    found_excl = {p.name for p in excluded._find_python_files(tmp_path)}
+    assert "main.py" in found_excl
+    assert "x.py" not in found_excl, (
+        "P5: `.claude/scripts/x.py` must NOT be discovered when "
+        "index_dot_claude=False (user-project default)."
+    )
+
+    included = _make_bare_analyzer(analyzer_mod, index_dot_claude=True)
+    found_incl = {p.name for p in included._find_python_files(tmp_path)}
+    assert "x.py" in found_incl, (
+        "P5: `.claude/scripts/x.py` MUST be discovered when "
+        "index_dot_claude=True (orchestrator clone / opt-in)."
+    )
+
+
+def test_find_files_skip_wt_worktree_dir(analyzer_mod, tmp_path):
+    """P5: files under a top-level `.wt/` worktree container are never
+    discovered (they're byte-copies of main-repo source)."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "main.py").write_text("def real():\n    return 1\n", encoding="utf-8")
+    wt = tmp_path / ".wt" / "v0272-track" / "src"
+    wt.mkdir(parents=True)
+    (wt / "main.py").write_text("def dup():\n    return 1\n", encoding="utf-8")
+
+    inst = _make_bare_analyzer(analyzer_mod, index_dot_claude=True)
+    found = [str(p) for p in inst._find_python_files(tmp_path)]
+    assert any(p.endswith("/src/main.py") and ".wt" not in p for p in found), (
+        "first-party src/main.py must be found"
+    )
+    assert not any(".wt" in p for p in found), (
+        "P5: files under `.wt/` must NOT be discovered."
+    )
