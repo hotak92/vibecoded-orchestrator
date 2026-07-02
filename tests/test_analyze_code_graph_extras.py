@@ -33,6 +33,26 @@ import pytest
 # ─── Module loader (same pattern as test_code_graph_analyzer.py) ────────
 
 
+def _bind_dedup(analyzer_mod, stub, stub_cls):
+    """Bind `_dedup_insert` onto a stub, plus the helper methods it now calls.
+
+    v0.2.72 (P3): `_dedup_insert` was split into a choke-point that delegates
+    to `_maybe_chunk_and_write` / `_stamp_single_chunk_props` /
+    `_write_one_object`. Stubs that steal only `_dedup_insert` must also carry
+    those helpers so the split flow works. We borrow them from the real class
+    (same `__get__` idiom) so the stubs exercise the real logic end-to-end.
+    """
+    cls = analyzer_mod.CodeGraphAnalyzer
+    for meth in (
+        "_maybe_chunk_and_write",
+        "_stamp_single_chunk_props",
+        "_write_one_object",
+    ):
+        if hasattr(cls, meth):
+            setattr(stub, meth, getattr(cls, meth).__get__(stub, stub_cls))
+    return cls._dedup_insert.__get__(stub, stub_cls)
+
+
 _THIS_DIR = Path(__file__).parent
 _REPO_ROOT = _THIS_DIR.parent
 _ANALYZER_PATH = _REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
@@ -232,7 +252,7 @@ def test_dedup_insert_stamps_project_source(
 
     stub = _Stub()
     # Steal the bound method off the class.
-    dedup = analyzer_mod.CodeGraphAnalyzer._dedup_insert.__get__(stub, _Stub)
+    dedup = _bind_dedup(analyzer_mod, stub, _Stub)
 
     insert_params = {
         "properties": {"name": "foo", "language": ""},
@@ -270,7 +290,7 @@ def test_dedup_insert_does_not_clobber_existing_project_source(
         visited_uuids: set = set()
 
     stub = _Stub()
-    dedup = analyzer_mod.CodeGraphAnalyzer._dedup_insert.__get__(stub, _Stub)
+    dedup = _bind_dedup(analyzer_mod, stub, _Stub)
 
     insert_params = {
         "properties": {
@@ -308,7 +328,7 @@ def test_dedup_insert_no_op_when_current_source_empty(
         visited_uuids: set = set()
 
     stub = _Stub()
-    dedup = analyzer_mod.CodeGraphAnalyzer._dedup_insert.__get__(stub, _Stub)
+    dedup = _bind_dedup(analyzer_mod, stub, _Stub)
     insert_params = {"properties": {"name": "foo"}}
     dedup(_Stub._Coll, insert_params, "foo", file_path_rel="src/foo.py")
     props = _Stub._Coll.captured["properties"]
@@ -350,7 +370,7 @@ def test_visited_uuids_is_single_shared_set(
             data = _Data
 
     stub = _Stub()
-    dedup = analyzer_mod.CodeGraphAnalyzer._dedup_insert.__get__(stub, _Stub)
+    dedup = _bind_dedup(analyzer_mod, stub, _Stub)
 
     # Source root 1: primary repo.
     stub._current_source = "/home/u/MyProject"

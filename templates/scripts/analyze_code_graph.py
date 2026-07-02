@@ -134,6 +134,21 @@ def _deterministic_uuid(project: str, file_path_rel: str = "", full_name: str = 
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, key))
 
 
+# v0.2.72 (P3): chunked entity bodies carry a leading `[chunk N/total]\n\n`
+# header (format shared with server._parse_chunk_header). Consumers that parse
+# a chunk-0 body as source (e.g. `ast.parse` in cross-reference call-linking)
+# must strip it first, else the parse fails on the header line.
+_CHUNK_HEADER_RE = re.compile(r"^\[chunk \d+/\d+\]\n\n")
+
+
+def _strip_chunk_header(text: str) -> str:
+    """Remove a leading `[chunk N/total]` header from a chunked entity body.
+
+    No-op when the text has no header (the common single-chunk case).
+    """
+    return _CHUNK_HEADER_RE.sub("", text, count=1)
+
+
 # v0.2.61 (Track E): per-object content-hash fields for the tombstone-skip.
 # Maps the bare collection base-name to the ORDERED list of property keys
 # whose values define an object's semantically-meaningful content. The hash
@@ -160,10 +175,15 @@ def _deterministic_uuid(project: str, file_path_rel: str = "", full_name: str = 
 # more", which can only cause an extra (correct) write, never a wrong skip.
 _CONTENT_HASH_FIELDS = {
     "CodeModule": ["path", "module_summary", "import_names"],
-    "CodeClass": ["full_name", "signature", "class_body", "methods", "composes"],
+    # v0.2.72 (P3): chunk_num is part of the content hash for chunkable
+    # entities so two chunks of the same entity — which share full_name but
+    # carry different chunk bodies AND a different chunk_num — always hash
+    # distinctly (defense-in-depth; their bodies already differ). The
+    # tombstone-skip then compares like-for-like per chunk.
+    "CodeClass": ["full_name", "signature", "class_body", "methods", "composes", "chunk_num"],
     "CodeFunction": [
         "full_name", "signature", "function_body",
-        "type_uses", "cfg_summary", "data_flow_vars",
+        "type_uses", "cfg_summary", "data_flow_vars", "chunk_num",
     ],
     "CodeAPI": ["endpoint", "method", "api_description", "parameters", "returns"],
     "CodeInteraction": [
@@ -726,9 +746,21 @@ try:
         truncate_function_for_embedding,
         truncate_class_for_embedding,
         truncate_module_for_embedding,
+        chunk_or_truncate_for_embedding,
+        chunk_or_truncate_class_for_embedding,
     )
+    _CHUNKING_AVAILABLE = True
 except ImportError:
-    # Inline fallbacks — naive char-based truncation (no model-awareness)
+    # Inline fallbacks — naive char-based truncation (no model-awareness).
+    # NOTE: this branch is effectively dead for a correctly-installed
+    # orchestrator (code_truncation is a same-package sibling of the MCP that
+    # is always importable once vco_lib is on-path). Kept as defense-in-depth
+    # so a broken partial install degrades to single-object writes rather than
+    # crashing. When this branch is taken, `_CHUNKING_AVAILABLE` is False and
+    # `_dedup_insert` skips the chunk fan-out entirely (single object, as pre-
+    # v0.2.72).
+    _CHUNKING_AVAILABLE = False
+
     def truncate_function_for_embedding(signature, body, language="python", model=None):
         return f"{signature}\n{body[:600]}"
 
@@ -738,6 +770,12 @@ except ImportError:
 
     def truncate_module_for_embedding(module_summary, model=None):
         return module_summary[:2000]
+
+    def chunk_or_truncate_for_embedding(signature, body, language="python", model=None, *, full_name=""):
+        return [truncate_function_for_embedding(signature, body, language=language, model=model)]
+
+    def chunk_or_truncate_class_for_embedding(signature, class_body, methods=None, language="python", model=None, *, full_name=""):
+        return [truncate_class_for_embedding(signature, class_body, methods=methods, language=language, model=model)]
 
 
 # v0.2.18: central embedding dispatcher. Replaces the inline
@@ -3159,6 +3197,14 @@ class CodeGraphAnalyzer:
                         Property(name="file_path", data_type=DataType.TEXT, description="Repo-relative POSIX path of the source file (mirrors CodeModule.path)", skip_vectorization=True),
                         # v0.2.61 (Track E): per-object content hash (see CodeModule).
                         Property(name="content_hash", data_type=DataType.TEXT, description="SHA-256 of semantically-meaningful content (per-object tombstone-skip)", skip_vectorization=True),
+                        # v0.2.72 (P3): model-aware chunking. Over-budget classes
+                        # (~7-9%) are split into N objects sharing the same
+                        # full_name; chunk_num (0-indexed) identifies each chunk,
+                        # total_chunks the count. Single-chunk entities carry
+                        # chunk_num=0/total_chunks=1. The canonical object is
+                        # chunk_num=0 (cross-refs + limit=1 lookups resolve to it).
+                        Property(name="chunk_num", data_type=DataType.INT, description="0-indexed chunk number within this entity (0 for single-chunk)", skip_vectorization=True),
+                        Property(name="total_chunks", data_type=DataType.INT, description="Total chunks this entity was split into (1 for single-chunk)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="module", target_collection=self.coll_module, description="Parent module"),
@@ -3212,6 +3258,9 @@ class CodeGraphAnalyzer:
                         Property(name="file_path", data_type=DataType.TEXT, description="Repo-relative POSIX path of the source file (mirrors CodeModule.path)", skip_vectorization=True),
                         # v0.2.61 (Track E): per-object content hash (see CodeModule).
                         Property(name="content_hash", data_type=DataType.TEXT, description="SHA-256 of semantically-meaningful content (per-object tombstone-skip)", skip_vectorization=True),
+                        # v0.2.72 (P3): model-aware chunking (see CodeClass).
+                        Property(name="chunk_num", data_type=DataType.INT, description="0-indexed chunk number within this entity (0 for single-chunk)", skip_vectorization=True),
+                        Property(name="total_chunks", data_type=DataType.INT, description="Total chunks this entity was split into (1 for single-chunk)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="module", target_collection=self.coll_module, description="Parent module"),
@@ -3353,6 +3402,15 @@ class CodeGraphAnalyzer:
         # the hash, after which they go stable. Idempotent + soft-fail.
         self._ensure_content_hash_property()
 
+        # v0.2.72 (P3) schema migration: ensure `chunk_num` + `total_chunks`
+        # (both INT) exist on CodeFunction + CodeClass so pre-v0.2.72 installs
+        # gain them on the next analyze run and the chunk fan-out can stamp
+        # them. Pre-migration rows have NULL chunk_num → the read-path collapse
+        # + `_format_obj` normalise absent/0 to "single chunk", so old rows
+        # behave as single-chunk entities until re-analyzed. Additive (no
+        # re-index, no data loss). Idempotent + soft-fail per collection.
+        self._ensure_chunk_props_property()
+
     def _dedup_insert(self, collection, insert_params: dict, identity_key: str,
                       file_path_rel: str = "") -> str:
         """Upsert with a deterministic UUID derived from
@@ -3453,6 +3511,183 @@ class CodeGraphAnalyzer:
                 if isinstance(props, dict) and not props.get("file_path"):
                     props["file_path"] = file_path_rel
 
+        # ── v0.2.72 (P3): model-aware chunking for over-budget entities ─────
+        #
+        # ~7-9% of functions/classes exceed the embedding budget (measured 8.6%
+        # CodeFunction). Pre-v0.2.72 those were silently truncated — everything
+        # past `_max_chars_for_model` was dropped from the embedding, so a large
+        # function's tail was unsearchable. Chunking splits the FULL entity text
+        # into N chunks so every line contributes to some chunk's embedding.
+        #
+        # CHOKE-POINT design (v0.2.72): the fan-out lives HERE, at the single
+        # `_dedup_insert` store path, NOT at the 23 per-language embed call
+        # sites. The call sites are untouched — they still call
+        # `embed_function`/`embed_class` (one embed) + build one `insert_params`.
+        # When the entity fits (91%+), we keep that single object verbatim
+        # (just stamping chunk_num=0/total_chunks=1). When it's over budget, we
+        # RE-DERIVE the chunk texts from the `function_body`/`class_body` +
+        # `signature` properties already present on `insert_params`, embed each
+        # chunk, and write N objects. The N-object fan-out never touches the
+        # call sites, so it doesn't collide with T-SCOPE's neighbouring
+        # `_find_*` method edits.
+        chunk_uuid = self._maybe_chunk_and_write(
+            collection, insert_params, identity_key, file_path_rel,
+            current_source_for_uuid,
+        )
+        if chunk_uuid is not None:
+            return chunk_uuid
+
+        # Not a chunkable entity (module / API / interaction), chunking
+        # unavailable, or a single-chunk entity → normal single-object write.
+        # Stamp chunk_num=0/total_chunks=1 for Function/Class single objects so
+        # the canonical-chunk filters (`chunk_num == 0`) and the read-path
+        # collapse treat them as first-class single-chunk nodes.
+        self._stamp_single_chunk_props(collection, insert_params)
+
+        return self._write_one_object(
+            collection, det_uuid, insert_params, identity_key,
+        )
+
+    def _stamp_single_chunk_props(self, collection, insert_params: dict) -> None:
+        """Stamp chunk_num=0/total_chunks=1 on a single-object Function/Class write.
+
+        Only Function/Class carry chunk props (they're the chunkable entities);
+        Module/API/Interaction are left untouched. Defensive: don't clobber a
+        caller-preset value, and no-op on non-Function/Class collections.
+        """
+        coll_name = getattr(collection, "name", "") or ""
+        if not (coll_name.endswith("CodeFunction") or coll_name.endswith("CodeClass")):
+            return
+        props = insert_params.get("properties")
+        if not isinstance(props, dict):
+            return
+        if "chunk_num" not in props:
+            props["chunk_num"] = 0
+        if "total_chunks" not in props:
+            props["total_chunks"] = 1
+
+    def _maybe_chunk_and_write(
+        self, collection, insert_params: dict, identity_key: str,
+        file_path_rel: str, current_source_for_uuid: str,
+    ) -> Optional[str]:
+        """Chunk an over-budget Function/Class into N objects and write them.
+
+        Returns the CANONICAL (chunk_num=0) UUID when the entity was chunked
+        into N>=2 objects, so the caller's `func_uuid`/`class_uuid` capture the
+        canonical object (cross-references + cache entries resolve to chunk 0).
+
+        Returns ``None`` when chunking does not apply — the caller then falls
+        through to the normal single-object write. `None` is returned when:
+          * chunking support is unavailable (partial install), OR
+          * the collection is not CodeFunction/CodeClass, OR
+          * the properties lack the body/signature needed to re-derive chunks, OR
+          * the entity fits in one chunk (the common 91%+ case).
+        """
+        if not _CHUNKING_AVAILABLE:
+            return None
+        coll_name = getattr(collection, "name", "") or ""
+        is_function = coll_name.endswith("CodeFunction")
+        is_class = coll_name.endswith("CodeClass")
+        if not (is_function or is_class):
+            return None
+        props = insert_params.get("properties")
+        if not isinstance(props, dict):
+            return None
+
+        signature = props.get("signature") or ""
+        language = props.get("language") or getattr(self, "_current_language", "") or "python"
+        model = _resolve_code_model_id()
+
+        if is_function:
+            body = props.get("function_body") or ""
+            if not body:
+                return None
+            chunk_texts = chunk_or_truncate_for_embedding(
+                signature, body, language=language, model=model,
+                full_name=identity_key,
+            )
+        else:  # class
+            body = props.get("class_body") or ""
+            if not body:
+                return None
+            methods = props.get("methods") or None
+            chunk_texts = chunk_or_truncate_class_for_embedding(
+                signature, body, methods=methods, language=language, model=model,
+                full_name=identity_key,
+            )
+
+        # Single chunk → the entity fits; not our path. Return None so the
+        # caller does the ordinary single-object write (which re-uses the
+        # already-computed vector in insert_params — no needless re-embed).
+        if len(chunk_texts) <= 1:
+            return None
+
+        total = len(chunk_texts)
+        canonical_uuid: Optional[str] = None
+        for i, chunk_text in enumerate(chunk_texts):
+            # Per-chunk UUID: chunk_num is mixed into the identity key so N
+            # chunks of the same entity don't collide on one UUID. chunk 0 uses
+            # the bare identity_key so its UUID is byte-identical to the
+            # pre-chunking single-object UUID for that entity (canonical, and
+            # stable across a fits→over-budget transition for chunk 0).
+            if i == 0:
+                chunk_uuid = _deterministic_uuid(
+                    self.project_name, file_path_rel, identity_key,
+                    project_source=current_source_for_uuid,
+                )
+            else:
+                chunk_uuid = _deterministic_uuid(
+                    self.project_name, file_path_rel, f"{identity_key}::{i}",
+                    project_source=current_source_for_uuid,
+                )
+
+            # Re-embed THIS chunk's text (each chunk gets its own vector).
+            chunk_vec = _shape_for_insert(generate_embedding(chunk_text))
+
+            # Build per-chunk insert_params: copy the shared props, override the
+            # body field with this chunk's text, stamp chunk_num/total_chunks.
+            # References + non-body props are identical across chunks (they all
+            # describe the same entity).
+            chunk_props = dict(props)
+            if is_function:
+                chunk_props["function_body"] = chunk_text
+            else:
+                chunk_props["class_body"] = chunk_text
+            chunk_props["chunk_num"] = i
+            chunk_props["total_chunks"] = total
+            # Recompute content_hash per chunk (the body differs), else the
+            # tombstone-skip would compare against the wrong hash. Drop any
+            # inherited hash so `_write_one_object` re-stamps from this chunk.
+            chunk_props.pop("content_hash", None)
+
+            chunk_params = dict(insert_params)
+            chunk_params["properties"] = chunk_props
+            if chunk_vec:
+                chunk_params["vector"] = chunk_vec
+            elif "vector" in chunk_params:
+                # No vector for this chunk (embed failed) → don't carry the
+                # parent's vector, which belongs to the full-body text.
+                del chunk_params["vector"]
+
+            written = self._write_one_object(
+                collection, chunk_uuid, chunk_params, identity_key,
+            )
+            if i == 0:
+                canonical_uuid = written
+        return canonical_uuid
+
+    def _write_one_object(
+        self, collection, det_uuid: str, insert_params: dict, identity_key: str,
+    ) -> str:
+        """Write one Weaviate object (tombstone-skip + replace-or-insert).
+
+        Extracted from the tail of `_dedup_insert` (v0.2.72) so the chunk
+        fan-out in `_maybe_chunk_and_write` reuses the exact same write
+        mechanics (per-object content-hash tombstone-skip, replace()-first-
+        then-insert() cold-start handling, visited-UUID tracking) instead of
+        duplicating them. `_dedup_insert` (single-object path) and the fan-out
+        both funnel through here — one home for the write logic.
+        """
         # ── v0.2.61 (Track E): per-object content-hash tombstone skip ───────
         #
         # WHY: the per-FILE skip (`_get_existing_module` keyed on path +
@@ -3731,6 +3966,58 @@ class CodeGraphAnalyzer:
                 logger.debug(
                     f"v0.2.61 content_hash migration on {label} skipped: {e}"
                 )
+
+    def _ensure_chunk_props_property(self):
+        """v0.2.72 (P3) schema migration: add `chunk_num` + `total_chunks`
+        (both INT) to CodeFunction + CodeClass so pre-v0.2.72 installs gain the
+        properties on the next analyze run and the chunk fan-out can stamp them.
+
+        Only Function + Class get the properties — they are the only chunkable
+        entities (Module summaries + API descriptions + Interactions fit the
+        budget). Pre-migration rows have NULL chunk_num; the read-path
+        (`_format_obj`, `_collapse_to_one_per_node`) normalises absent/0 to
+        "single chunk 1 of 1", so old rows behave as single-chunk entities
+        until re-analyzed.
+
+        Back-compat: adding a property to an existing Weaviate class is a
+        non-destructive metadata operation (no re-index, no data loss).
+        Idempotent — an already-present property is skipped silently. Soft-fail
+        per (collection, property). Mirrors `_ensure_file_path_property`.
+        """
+        collections = [
+            ("CodeFunction", self.functions_collection),
+            ("CodeClass",    self.classes_collection),
+        ]
+        new_props = [
+            ("chunk_num", "0-indexed chunk number within this entity (0 for single-chunk)"),
+            ("total_chunks", "Total chunks this entity was split into (1 for single-chunk)"),
+        ]
+        for label, coll in collections:
+            if coll is None:
+                continue
+            try:
+                config = coll.config.get()
+                existing_props = {p.name for p in config.properties}
+            except Exception as e:
+                logger.debug(f"v0.2.72 chunk-props migration: config read on {label} skipped: {e}")
+                continue
+            for prop_name, desc in new_props:
+                if prop_name in existing_props:
+                    continue
+                try:
+                    coll.config.add_property(
+                        Property(
+                            name=prop_name,
+                            data_type=DataType.INT,
+                            description=desc,
+                            skip_vectorization=True,
+                        )
+                    )
+                    print(f"   Added {prop_name} property to {label} schema (v0.2.72)")
+                except Exception as e:
+                    logger.debug(
+                        f"v0.2.72 {prop_name} migration on {label} skipped: {e}"
+                    )
 
     def analyze_repository(self, repo_path: Path, language: Optional[str] = None,
                           incremental: bool = False,
@@ -6342,6 +6629,31 @@ class CodeGraphAnalyzer:
                 calls.append(name)
         return calls
 
+    @staticmethod
+    def _prefer_canonical_chunk(cache: Dict[str, str], full_name: str, obj) -> bool:
+        """Return True if `obj` should occupy the cache slot for `full_name`.
+
+        v0.2.72 (P3): with multi-chunk entities sharing a full_name, the
+        full_name → UUID cache must point at the CANONICAL chunk (chunk_num==0)
+        so cross-references (`calls`/`extends`) and downstream lookups resolve
+        to the canonical object, not a random chunk (last-writer-wins would
+        otherwise pick whichever chunk the iterator yielded last).
+
+        Rules:
+          * No incumbent yet → take the slot (True).
+          * This object is chunk 0 (or a legacy row with chunk_num None/0) →
+            take the slot (True) — chunk 0 always wins over a non-zero chunk.
+          * This object is a non-zero chunk AND an incumbent exists → keep the
+            incumbent (False). (If the incumbent was itself a non-zero chunk,
+            we still prefer to hold it stable; chunk 0 will overwrite it when
+            the iterator reaches it.)
+        """
+        chunk_num = obj.properties.get("chunk_num")
+        is_canonical = chunk_num in (None, 0)
+        if full_name not in cache:
+            return True
+        return is_canonical
+
     def _populate_caches_from_weaviate(self):
         """Load all existing objects into caches from Weaviate.
 
@@ -6366,20 +6678,28 @@ class CodeGraphAnalyzer:
         except Exception as e:
             print(f"   ⚠️  Failed to load modules: {e}")
 
-        # Load classes
+        # Load classes. v0.2.72 (P3): with multi-chunk objects sharing a
+        # full_name, prefer the CANONICAL chunk (chunk_num == 0) so the cache
+        # maps full_name → the canonical UUID. `_prefer_canonical_chunk`
+        # returns True when this object should win the cache slot (chunk 0, OR
+        # a legacy row with no chunk_num, OR no incumbent yet).
         try:
             for obj in self.classes_collection.iterator():
                 full_name = obj.properties.get("full_name", "")
-                if full_name:
+                if full_name and self._prefer_canonical_chunk(
+                    self.class_cache, full_name, obj
+                ):
                     self.class_cache[full_name] = str(obj.uuid)
         except Exception as e:
             print(f"   ⚠️  Failed to load classes: {e}")
 
-        # Load functions
+        # Load functions (same canonical-chunk preference as classes).
         try:
             for obj in self.functions_collection.iterator():
                 full_name = obj.properties.get("full_name", "")
-                if full_name:
+                if full_name and self._prefer_canonical_chunk(
+                    self.function_cache, full_name, obj
+                ):
                     self.function_cache[full_name] = str(obj.uuid)
         except Exception as e:
             print(f"   ⚠️  Failed to load functions: {e}")
@@ -6443,17 +6763,26 @@ class CodeGraphAnalyzer:
         # --- 1. Function calls ---
         print("   Linking function calls...")
         for full_name, func_uuid in self.function_cache.items():
-            # Fetch the function to get its body and extract calls
+            # Fetch the function to get its body and extract calls.
+            # v0.2.72 (P3): `func_uuid` is the CANONICAL (chunk 0) UUID from the
+            # cache (see `_prefer_canonical_chunk`). Point-read by that UUID
+            # rather than a `full_name`-filtered `limit=1` fetch, which with
+            # multi-chunk objects could return a NON-canonical chunk. NOTE: on
+            # an over-budget (chunked) function, chunk 0's body is only the
+            # first chunk of the source — call extraction is therefore partial
+            # for the rare (~8%) chunked case, an accepted limitation (the body
+            # no longer lives in one object). The `data.update(call_names)`
+            # below still writes to the canonical object, so callers-queries
+            # resolve correctly.
             try:
-                resp = self.functions_collection.query.fetch_objects(
-                    filters=Filter.by_property("full_name").equal(full_name),
-                    limit=1,
-                )
-                if not resp.objects:
-                    continue
-                body = resp.objects[0].properties.get("function_body", "")
+                canonical = self.functions_collection.query.fetch_object_by_id(func_uuid)
+                body = canonical.properties.get("function_body", "") if canonical is not None else ""
                 if not body:
                     continue
+
+                # Strip a leading `[chunk N/total]` header (chunked chunk-0
+                # bodies carry it) before AST parse, else `ast.parse` chokes.
+                body = _strip_chunk_header(body)
 
                 # Parse body to extract calls
                 try:
