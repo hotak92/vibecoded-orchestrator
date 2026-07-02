@@ -1,5 +1,8 @@
 pub mod app_state_cmd;
 pub mod audit;
+// F3 (v0.2.72 pre-gate audit): spawn_blocking seam for env re-projections
+// triggered from async Tauri commands (see blocking.rs module docs).
+pub mod blocking;
 pub mod changes_cmd;
 pub mod claude_env;
 pub mod gpu;
@@ -11,6 +14,10 @@ pub mod codegraph;
 // "authoritative refresh" path); `--language` is optional and scopes the
 // re-walk + prune to one language.
 pub mod codegraph_reanalyze;
+// v0.2.72 P1/P5: codegraph retrieval floors (machine-global app_state) +
+// per-project `.claude/`-index toggle (module_settings). Command fns are
+// wired into `generate_handler!` by the integrator.
+pub mod codegraph_settings;
 // v0.2.47 RL-7.5 (2026-06-04): chunker-revision deferral. Writes an
 // UPDATE_DEFERRED.md row when an upgrade crosses the v0.2.46 chunker
 // boundary so the user re-syncs KG / codegraph against the new presets.

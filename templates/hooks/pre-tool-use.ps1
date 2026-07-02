@@ -229,10 +229,34 @@ if ($ToolName -eq "Bash") {
 
 # === v0.2.70 Stream C: shared code-graph injection for Read(code)/Grep(symbol).
 # One home for both surfaces. MUST MATCH pre-tool-use.sh _cg_inject.
-function Invoke-CgInject([string]$q, [string]$excl, [string]$label) {
+# $anchor (v0.2.72 P2): optional file path / symbol forwarded as -Anchor so the
+# CLI's shared pipeline biases the rerank toward call-linked code.
+function Invoke-CgInject([string]$q, [string]$excl, [string]$label, [string]$anchor = "") {
     if (-not (Get-Command Invoke-VcoCodegraphQueryBlock -ErrorAction SilentlyContinue)) { return }
     if (-not $q) { return }
-    $raw = Invoke-VcoCodegraphQueryBlock -Query $q -ProjectArg "" -Limit 2 -ExcludePath $excl
+
+    # v0.2.72 P6: per-session inject VOLUME cap. The seen-store dedups by
+    # IDENTITY but a long session navigating many DISTINCT entities still
+    # injects unboundedly. Bound the TOTAL EMITTED injections per session_id
+    # (VCO_CG_INJECT_CAP, default 40). Read-only capped-check short-circuits
+    # BEFORE the codegraph query (one-line note emitted once); the counter is
+    # incremented ONLY on a real emit. Soft-fail OPEN: unkeyable session / any
+    # counter error runs UNCAPPED. MUST MATCH pre-tool-use.sh _cg_inject.
+    $cnt = ""
+    if (Get-Command Get-VcoCgInjectCountPath -ErrorAction SilentlyContinue) {
+        $cnt = Get-VcoCgInjectCountPath -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
+    }
+    if ($cnt -and (Get-Command Test-VcoCgInjectCapped -ErrorAction SilentlyContinue) `
+        -and (Test-VcoCgInjectCapped -CountFile $cnt)) {
+        if ((Get-Command Test-VcoCgInjectNoteOnce -ErrorAction SilentlyContinue) `
+            -and (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) `
+            -and (Test-VcoCgInjectNoteOnce -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot)) {
+            Emit-AdditionalContext "[codegraph injection cap reached for this session]" 'PreToolUse'
+        }
+        return
+    }
+
+    $raw = Invoke-VcoCodegraphQueryBlock -Query $q -ProjectArg "" -Limit 2 -ExcludePath $excl -Anchor $anchor
     if (-not $raw) { return }
     $inj = ""
     $rd = ""
@@ -246,6 +270,10 @@ function Invoke-CgInject([string]$q, [string]$excl, [string]$label) {
     if (($raw -replace '\s+', '')) {
         if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
             Emit-AdditionalContext "[${label}]:`n`n$raw" 'PreToolUse'
+            # Count this REAL injection toward the per-session cap.
+            if ($cnt -and (Get-Command Add-VcoCgInjectRecord -ErrorAction SilentlyContinue)) {
+                Add-VcoCgInjectRecord -CountFile $cnt
+            }
         }
     }
 }
@@ -278,7 +306,7 @@ if ($ToolName -eq "Read") {
         # uses the repo-relative path so it matches the producer CODE: src shape.
         if ($filePath -match '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$') {
             $rdQ = [System.IO.Path]::GetFileNameWithoutExtension((Split-Path $filePath -Leaf))
-            Invoke-CgInject $rdQ $relFp "Code-graph context for $(Split-Path $filePath -Leaf)"
+            Invoke-CgInject $rdQ $relFp "Code-graph context for $(Split-Path $filePath -Leaf)" $relFp
         }
     }
     exit 0
@@ -293,7 +321,7 @@ if ($ToolName -eq "Grep") {
             if (Get-Command Get-VcoCodegraphSymbol -ErrorAction SilentlyContinue) {
                 $grepSym = Get-VcoCodegraphSymbol -Text $grepPattern
             }
-            Invoke-CgInject $grepSym "" "Code-graph context for symbol: $grepSym"
+            Invoke-CgInject $grepSym "" "Code-graph context for symbol: $grepSym" $grepSym
         }
     }
     exit 0

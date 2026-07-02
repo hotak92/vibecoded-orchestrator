@@ -577,7 +577,20 @@ if ($EditedFile -match '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|jav
         $cgSyncExpr = "& '$psEscCg' -NoProfile -File '$cgEsc' '$efEscCg' '$prEsc' '$cgpEsc' *> `$null"
         Invoke-KgDebounceSchedule -ProjectRoot $ProjectRoot -FilePath $EditedFile -WorkingDir $ProjectRoot -Command $cgSyncExpr -Channel "code"
     }
-    Add-Nudge "[Code edit reminder] $bn was just edited.`nWhen you're done with this work item:`n- Update CONTEXT_STATE.md with what changed and what's next.`n- Capture any non-obvious learnings as a KG node under knowledge/concepts/."
+    # v0.2.72 P6: reminder AGGREGATION (MUST MATCH post-file-edit.sh). Instead
+    # of emitting a per-Edit "was just edited" nudge (~15x/turn), APPEND the
+    # edited path to a per-turn accumulator; the Stop hook drains it once at
+    # end-of-turn. Soft-fail: unkeyable session / write error just skips.
+    if ($SessionIdFromStdin) {
+        $stateDir = Join-Path (Join-Path $ProjectRoot ".claude") "state"
+        $accum = Join-Path $stateDir ("edit_reminder_{0}.txt" -f $SessionIdFromStdin)
+        try {
+            if (-not (Test-Path -LiteralPath $stateDir)) {
+                New-Item -ItemType Directory -Path $stateDir -Force -ErrorAction Stop | Out-Null
+            }
+            Add-Content -LiteralPath $accum -Value $EditedFile -ErrorAction Stop
+        } catch { }
+    }
 }
 
 # 4. CONTEXT_STATE.md significant-changes → expert-skill nudge.

@@ -41,6 +41,22 @@
   let cgEmbedding = $state<string>('');
   let cgEnabled = $state(true);
 
+  // v0.2.72 P5 — per-project ".claude/"-index toggle. Default is host-based
+  // (orchestrator-root → ON, other projects → OFF); resolved server-side and
+  // returned as a plain bool. Stored in module_settings, projected to env,
+  // consumed by the analyzer's scope logic (T-SCOPE).
+  let cgIndexDotClaude = $state(false);
+  let savingIndexDotClaude = $state(false);
+
+  // v0.2.72 P1 — MACHINE-GLOBAL retrieval floors. These are NOT per-project:
+  // they gate code-graph retrieval across every project on this install.
+  // Surfaced here (the codegraph tab) for discoverability, with an explicit
+  // "applies to all projects" note. Stored in app_state, projected to env,
+  // consumed by the analyzer + MCP (T-FLOOR owns the projection).
+  let floorRetrieval = $state(0.16);
+  let floorPostRerank = $state(0.22);
+  let savingFloors = $state(false);
+
   // v0.2.18 (Commit 8): embedding catalog populates both dropdowns.
   // Loaded once on mount; refreshed on retry. Errors fall back to
   // empty lists — the Dropdown component handles that gracefully by
@@ -161,6 +177,75 @@
     // Catalog load is independent — don't let a snapshot failure block
     // it, and vice versa.
     await loadCatalog();
+    // v0.2.72: per-project .claude-index flag + machine-global floors load
+    // independently too — a failure here shouldn't blank the whole tab.
+    await loadCodegraphSettings();
+  }
+
+  /** v0.2.72 P1 + P5: load the per-project .claude-index toggle (host-based
+   *  default resolved server-side) and the machine-global retrieval floors.
+   *  Best-effort: errors surface as a toast but leave the rest of the tab
+   *  usable. */
+  async function loadCodegraphSettings() {
+    try {
+      cgIndexDotClaude = await invoke<boolean>(
+        'get_project_codegraph_index_dot_claude',
+        { projectId },
+      );
+    } catch (e) {
+      toast.error(e);
+    }
+    try {
+      const floors = await invoke<{ retrieval: number; post_rerank: number }>(
+        'get_codegraph_floors',
+      );
+      floorRetrieval = floors.retrieval;
+      floorPostRerank = floors.post_rerank;
+    } catch (e) {
+      toast.error(e);
+    }
+  }
+
+  /** Persist the per-project ".claude/"-index toggle, then reload to reflect
+   *  the stored value (the backend re-projects env as a side effect). */
+  async function toggleIndexDotClaude(next: boolean) {
+    savingIndexDotClaude = true;
+    try {
+      await invoke('set_project_codegraph_index_dot_claude', {
+        projectId,
+        enabled: next,
+      });
+      cgIndexDotClaude = next;
+    } catch (e) {
+      toast.error(e);
+      await loadCodegraphSettings();
+    } finally {
+      savingIndexDotClaude = false;
+    }
+  }
+
+  /** Persist both machine-global retrieval floors. Client-side range guard
+   *  mirrors the backend's 0.0..=1.0 validation so the user gets an inline
+   *  message before the round-trip. */
+  async function saveFloors() {
+    const inRange = (v: number) => Number.isFinite(v) && v >= 0 && v <= 1;
+    if (!inRange(floorRetrieval) || !inRange(floorPostRerank)) {
+      toast.error('Floors must be between 0.0 and 1.0');
+      return;
+    }
+    savingFloors = true;
+    try {
+      await invoke('set_codegraph_floors', {
+        retrieval: floorRetrieval,
+        postRerank: floorPostRerank,
+      });
+      toast.success('Codegraph floors saved (applies to all projects)');
+    } catch (e) {
+      toast.error(e);
+      await loadCodegraphSettings();
+    } finally {
+      savingFloors = false;
+    }
   }
 
   /** Detect whether the user changed the model and warn them about the
@@ -373,6 +458,25 @@ Continue?`;
           <input type="checkbox" bind:checked={cgEnabled} />
           <span>Enabled</span>
         </label>
+        <!-- v0.2.72 P5: per-project ".claude/"-index toggle. Writes
+             immediately (no Save button) + re-projects env, mirroring the
+             DualWriteFlagsPanel interaction model. Default is host-based:
+             the orchestrator clone indexes its own tooling; other projects
+             exclude it as generated noise. -->
+        <label class="ps-checkbox ps-index-claude" title="When ON, the code
+          graph analyzer walks this project's .claude/ tooling tree (agents,
+          skills, hooks, scripts). Default: ON for the orchestrator clone
+          itself, OFF for other projects (their .claude/ is generated
+          tooling, not product source).">
+          <input
+            type="checkbox"
+            checked={cgIndexDotClaude}
+            disabled={savingIndexDotClaude}
+            onchange={(e) =>
+              toggleIndexDotClaude((e.target as HTMLInputElement).checked)}
+          />
+          <span>Index <code>.claude/</code> tooling into the code graph</span>
+        </label>
         {#if snapshot?.codegraph_binding?.last_analyzed_commit}
           <div class="ps-meta">
             Last analyzed:
@@ -398,6 +502,51 @@ Continue?`;
           Re-analyze code graph
         </button>
       </div>
+    </div>
+
+    <!-- v0.2.72 P1: MACHINE-GLOBAL retrieval floors. Not per-project — the
+         values here gate code-graph retrieval across every project on this
+         install. Surfaced in the codegraph tab for discoverability with an
+         explicit scope note so the user isn't surprised a change here affects
+         their other projects. -->
+    <div class="ps-section">
+      <h4>Retrieval floors (machine-global)</h4>
+      <p class="ps-global-note">
+        These two score floors apply to <strong>every project on this
+        install</strong>, not just this one. They gate code-graph retrieval:
+        the retrieval floor is the pre-rerank seed cutoff, the post-rerank
+        floor the final cutoff after reranking. Raising them returns fewer,
+        higher-confidence matches; lowering them returns more, noisier ones.
+      </p>
+      <div class="ps-form-grid">
+        <label>
+          <span>Retrieval floor (0.0–1.0)</span>
+          <input
+            type="number"
+            min="0"
+            max="1"
+            step="0.01"
+            bind:value={floorRetrieval}
+          />
+        </label>
+        <label>
+          <span>Post-rerank floor (0.0–1.0)</span>
+          <input
+            type="number"
+            min="0"
+            max="1"
+            step="0.01"
+            bind:value={floorPostRerank}
+          />
+        </label>
+      </div>
+      <button
+        class="ps-btn-primary"
+        onclick={saveFloors}
+        disabled={savingFloors}
+      >
+        {savingFloors ? 'Saving…' : 'Save floors'}
+      </button>
     </div>
 
     <div class="ps-section">
@@ -475,5 +624,21 @@ Continue?`;
   .ps-link-btn {
     background: none; border: none; color: rgb(0,191,166); cursor: pointer;
     padding: 0; margin-left: 8px; text-decoration: underline; font-size: 11px;
+  }
+  /* v0.2.72 P1: scope note for the machine-global floors section — a subtle
+     amber tint distinguishes "affects all projects" from the per-project
+     controls above it. */
+  .ps-global-note {
+    margin: 0 0 12px; padding: 8px 12px;
+    background: rgba(255,200,80,0.06); border: 1px solid rgba(255,200,80,0.16);
+    border-radius: 4px; color: #d8c9a0; font-size: 11px; line-height: 1.5;
+  }
+  .ps-global-note strong { color: #f0e2b8; }
+  /* v0.2.72 P5: the .claude-index checkbox spans both grid columns so its
+     longer label wraps cleanly rather than colliding with a sibling cell. */
+  .ps-index-claude { grid-column: 1 / -1; }
+  .ps-index-claude code {
+    background: rgba(255,255,255,0.05); padding: 1px 5px; border-radius: 3px;
+    font-family: ui-monospace, monospace; font-size: 11px;
   }
 </style>

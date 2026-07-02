@@ -818,11 +818,36 @@ async fn project_config(
         .iter()
         .find(|b| b.role == "primary")
         .map(|b| b.collection_name.clone());
-    let shared_kg_collection_raw = kg_bindings
-        .iter()
-        .find(|b| b.role == "shared")
-        .map(|b| b.collection_name.clone())
-        .unwrap_or_default();
+    // v0.2.72 R1 (F5 residual): the explicit GUI override
+    // `app_state[shared_kg.collection_name]` (SharedKgPicker →
+    // `set_shared_kg_collection_name`) is Priority 1 — it wins over the
+    // project's own `role='shared'` binding row.
+    //
+    // MUST MATCH — the SHARED_KG_COLLECTION resolution is implemented
+    // three times and the precedence must stay identical in all three
+    // (drift here is the R1 resolver-disagreement bug):
+    //   * `launcher/src-tauri/src/commands/project_env_settings.rs`
+    //     (`APP_STATE_KEY_SHARED_KG_NAME` + `populate()` Priority 1)
+    //   * `vco_lib/config_projection.py` (`APP_STATE_KEY_SHARED_KG_NAME`
+    //     read in `project_env_from_db`)
+    //   * THIS resolver.
+    // The key is a string literal here (same cross-crate-mirror
+    // discipline as `hub_global_active_embedding` above — the hub crate
+    // deliberately doesn't depend on the launcher binary crate that owns
+    // the named constant).
+    let shared_kg_collection_raw = h
+        .0
+        .app_state_get("shared_kg.collection_name")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            kg_bindings
+                .iter()
+                .find(|b| b.role == "shared")
+                .map(|b| b.collection_name.clone())
+                .unwrap_or_default()
+        });
     // v0.2.46 Decision C — `development_collection` derives from the
     // primary KG collection via suffix-swap `_KnowledgeGraph` →
     // `_Development`, NOT from a `role='archive'` binding row.
@@ -2647,6 +2672,55 @@ kg_tier_full = 0.8
             body.get("active_embedding").and_then(|v| v.as_str()),
             Some("arctic"),
             "non-user project must inherit the global app_state profile (B1 bridge)"
+        );
+    }
+
+    /// v0.2.72 R1 (F5 residual) — the hub resolver honors the explicit
+    /// GUI override `app_state[shared_kg.collection_name]` as Priority 1,
+    /// beating the project's own `role='shared'` binding row. Pre-R1 the
+    /// hub ignored the override entirely, so a SharedKgPicker pick made
+    /// the hub disagree with the Rust `populate()` (which honored it) and
+    /// with the Python projection (fixed in the same change).
+    #[tokio::test]
+    async fn config_shared_kg_honors_app_state_override() {
+        let (base, h) = spawn_config_api_hub().await;
+        // seed_full_project seeds a role='shared' binding at the
+        // canonical name — the override must beat it.
+        seed_full_project(&h, "p-skg-ovr", "skgovr");
+        h.0.app_state_set("shared_kg.collection_name", "TeamWide_KnowledgeGraph")
+            .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/p-skg-ovr/config", base))
+            .await
+            .expect("hub reachable");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("shared_kg_collection").and_then(|v| v.as_str()),
+            Some("TeamWide_KnowledgeGraph"),
+            "non-empty app_state[shared_kg.collection_name] must win over \
+             the project's own shared binding row (Priority 1, matching \
+             populate() + config_projection.py)"
+        );
+    }
+
+    /// v0.2.72 R1 — an EMPTY app_state override is ignored (falls back to
+    /// the binding-role resolution), mirroring `populate()`'s
+    /// `.filter(|s| !s.is_empty())` semantics: an empty override must not
+    /// blank the read path.
+    #[tokio::test]
+    async fn config_shared_kg_empty_override_falls_back_to_binding() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-skg-empty", "skgempty");
+        h.0.app_state_set("shared_kg.collection_name", "").unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/p-skg-empty/config", base))
+            .await
+            .expect("hub reachable");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("shared_kg_collection").and_then(|v| v.as_str()),
+            Some("VibeCodedOrchestrator_KnowledgeGraph"),
+            "empty override must fall back to the role='shared' binding row"
         );
     }
 

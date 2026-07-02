@@ -226,10 +226,23 @@ def test_unchanged_object_is_skipped(analyzer_mod: types.ModuleType) -> None:
     det_uuid = analyzer_mod._deterministic_uuid(
         analyzer.project_name, "src/mod.py", "mod.foo"
     )
-    stored_hash = analyzer_mod._content_hash_for_object("T_CodeFunction", params["properties"])
+    # v0.2.72 (P3): a single-chunk CodeFunction is written with chunk_num=0,
+    # which is part of the content hash. In steady state (post-migration) the
+    # stored object's hash reflects that, so seed the store with a hash that
+    # includes chunk_num=0 — else the one-time migration re-write masks the skip.
+    _stored_props = {**params["properties"], "chunk_num": 0}
+    stored_hash = analyzer_mod._content_hash_for_object("T_CodeFunction", _stored_props)
     # Seed the store as if a prior run already indexed this exact object.
+    # v0.2.72 (P7): the skip now also requires the stored row to be at the
+    # CURRENT embed_revision (a row written by a P7-aware analyzer). Seed it so
+    # this represents the post-P7 steady state — else the revision gate would
+    # (correctly) force a one-time resync re-embed and mask the content-skip.
     coll = _FakeCollection(
-        "T_CodeFunction", store={det_uuid: {"content_hash": stored_hash}}
+        "T_CodeFunction",
+        store={det_uuid: {
+            "content_hash": stored_hash,
+            "embed_revision": analyzer_mod.CODEGRAPH_EMBED_REVISION,
+        }},
     )
 
     out = analyzer._dedup_insert(coll, params, "mod.foo", file_path_rel="src/mod.py")
@@ -358,9 +371,18 @@ def test_skipped_object_still_marked_visited(analyzer_mod: types.ModuleType) -> 
     det_uuid = analyzer_mod._deterministic_uuid(
         analyzer.project_name, "src/mod.py", "mod.foo"
     )
-    stored_hash = analyzer_mod._content_hash_for_object("T_CodeFunction", params["properties"])
+    # v0.2.72 (P3): include chunk_num=0 in the seeded hash (single-chunk steady
+    # state) — see test_unchanged_object_is_skipped for rationale.
+    _stored_props = {**params["properties"], "chunk_num": 0}
+    stored_hash = analyzer_mod._content_hash_for_object("T_CodeFunction", _stored_props)
+    # v0.2.72 (P7): seed the stored row at the CURRENT embed_revision so the
+    # revision gate lets the content-skip apply (post-P7 steady state).
     coll = _FakeCollection(
-        "T_CodeFunction", store={det_uuid: {"content_hash": stored_hash}}
+        "T_CodeFunction",
+        store={det_uuid: {
+            "content_hash": stored_hash,
+            "embed_revision": analyzer_mod.CODEGRAPH_EMBED_REVISION,
+        }},
     )
 
     analyzer._dedup_insert(coll, params, "mod.foo", file_path_rel="src/mod.py")

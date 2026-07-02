@@ -147,7 +147,88 @@ impl Db {
         }
         self.app_state_set(ORCHESTRATOR_ROOT_KG_COLLECTION_KEY, trimmed)
     }
+
+    // ─── v0.2.72 P1: codegraph retrieval floors (machine-global) ─────────
+    //
+    // Two machine-global score floors that gate code-graph retrieval, stored
+    // in `app_state` exactly like `embedding.active_profile` (a flat TEXT
+    // key). The f64 is serialised as its plain decimal string on write and
+    // parsed back on read; a missing row or a parse failure falls through to
+    // the compiled-in default (soft-fail — a bad row must never crash an env
+    // render). The Python side (`config_projection.py`, owned by T-FLOOR)
+    // projects these into `VCO_CODE_GRAPH_RETRIEVAL_FLOOR` /
+    // `VCO_CODE_GRAPH_POST_RERANK_FLOOR` env vars that the analyzer / MCP consume.
+
+    /// Read the machine-global two-stage retrieval floor (pre-rerank seed
+    /// cutoff). Returns [`DEFAULT_CODEGRAPH_RETRIEVAL_FLOOR`] when the row is
+    /// absent, unparseable, non-finite, or outside `0.0..=1.0`.
+    ///
+    /// F6 (v0.2.72): `"NaN"` / `"inf"` / `"1e300"` all PARSE successfully as
+    /// f64, and such rows are writable through the generic `app_state_set`
+    /// command — so the getter must range-filter, not just parse. Mirrors
+    /// `set_codegraph_floors`' write-side validation (a cosine-score floor
+    /// outside 0..=1 is meaningless and would silently discard every result).
+    pub fn get_codegraph_retrieval_floor(&self) -> Result<f64, String> {
+        Ok(self
+            .app_state_get(CODEGRAPH_RETRIEVAL_FLOOR_KEY)?
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+            .unwrap_or(DEFAULT_CODEGRAPH_RETRIEVAL_FLOOR))
+    }
+
+    /// Read the machine-global post-rerank floor (final result cutoff after
+    /// reranking). Returns [`DEFAULT_CODEGRAPH_POST_RERANK_FLOOR`] when the
+    /// row is absent, unparseable, non-finite, or outside `0.0..=1.0`
+    /// (F6 — see `get_codegraph_retrieval_floor`).
+    pub fn get_codegraph_post_rerank_floor(&self) -> Result<f64, String> {
+        Ok(self
+            .app_state_get(CODEGRAPH_POST_RERANK_FLOOR_KEY)?
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+            .unwrap_or(DEFAULT_CODEGRAPH_POST_RERANK_FLOOR))
+    }
+
+    /// Persist both machine-global codegraph floors. Values MUST already be
+    /// range-validated (`0.0..=1.0`) by the caller — this DB writer refuses
+    /// out-of-range or non-finite inputs defensively so a bad row can never
+    /// land (a floor > 1.0 would silently discard every result; < 0.0 is
+    /// meaningless for a cosine score). Written as plain decimal strings.
+    pub fn set_codegraph_floors(
+        &self,
+        retrieval: f64,
+        post_rerank: f64,
+    ) -> Result<(), String> {
+        for (label, v) in [("retrieval", retrieval), ("post_rerank", post_rerank)] {
+            if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                return Err(format!(
+                    "set_codegraph_floors: {label} floor {v} out of range (0.0..=1.0)"
+                ));
+            }
+        }
+        self.app_state_set(CODEGRAPH_RETRIEVAL_FLOOR_KEY, &retrieval.to_string())?;
+        self.app_state_set(
+            CODEGRAPH_POST_RERANK_FLOOR_KEY,
+            &post_rerank.to_string(),
+        )?;
+        Ok(())
+    }
 }
+
+/// `app_state` key for the machine-global two-stage retrieval floor (v0.2.72
+/// P1). Consumed via the projected `VCO_CODE_GRAPH_RETRIEVAL_FLOOR` env.
+pub const CODEGRAPH_RETRIEVAL_FLOOR_KEY: &str = "codegraph.retrieval_floor";
+
+/// `app_state` key for the machine-global post-rerank floor (v0.2.72 P1).
+/// Consumed via the projected `VCO_CODE_GRAPH_POST_RERANK_FLOOR` env.
+pub const CODEGRAPH_POST_RERANK_FLOOR_KEY: &str = "codegraph.post_rerank_floor";
+
+/// Default two-stage retrieval floor. MUST match the Python-side default in
+/// the T-FLOOR projection + analyzer so a launcher that never touched the
+/// GUI produces identical behaviour.
+pub const DEFAULT_CODEGRAPH_RETRIEVAL_FLOOR: f64 = 0.16;
+
+/// Default post-rerank floor. MUST match the Python-side default (see above).
+pub const DEFAULT_CODEGRAPH_POST_RERANK_FLOOR: f64 = 0.22;
 
 /// `app_state` key for the persisted orchestrator-root shared KG
 /// collection name (migration 028 / Phase 1 / v0.2.49 access-matrix).
@@ -323,5 +404,114 @@ mod tests {
             .expect("trim + persist");
         let v = db.get_orchestrator_root_kg_collection().expect("read");
         assert_eq!(v, "MyCustom_KG");
+    }
+
+    // ─── v0.2.72 P1: codegraph retrieval floors (machine-global) ─────────
+
+    #[test]
+    fn codegraph_floors_default_when_unset() {
+        // Fresh DB: no app_state rows for the floors → getters return the
+        // compiled-in defaults. A launcher that never touched the GUI must
+        // behave identically to the pre-P1 hardcoded floors.
+        let db = Db::open_in_memory().expect("in-memory db");
+        assert_eq!(
+            db.get_codegraph_retrieval_floor().unwrap(),
+            DEFAULT_CODEGRAPH_RETRIEVAL_FLOOR,
+        );
+        assert_eq!(
+            db.get_codegraph_post_rerank_floor().unwrap(),
+            DEFAULT_CODEGRAPH_POST_RERANK_FLOOR,
+        );
+    }
+
+    #[test]
+    fn set_codegraph_floors_persists_both_keys() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        db.set_codegraph_floors(0.30, 0.45).expect("persist floors");
+        assert_eq!(db.get_codegraph_retrieval_floor().unwrap(), 0.30);
+        assert_eq!(db.get_codegraph_post_rerank_floor().unwrap(), 0.45);
+        // Raw rows carry the decimal-string encoding both getters parse.
+        assert_eq!(
+            db.app_state_get(CODEGRAPH_RETRIEVAL_FLOOR_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("0.3"),
+        );
+    }
+
+    #[test]
+    fn set_codegraph_floors_accepts_boundary_values() {
+        // 0.0 and 1.0 are the inclusive endpoints — both valid cosine-score
+        // floors (0.0 = keep everything, 1.0 = exact match only).
+        let db = Db::open_in_memory().expect("in-memory db");
+        db.set_codegraph_floors(0.0, 1.0).expect("boundary floors");
+        assert_eq!(db.get_codegraph_retrieval_floor().unwrap(), 0.0);
+        assert_eq!(db.get_codegraph_post_rerank_floor().unwrap(), 1.0);
+    }
+
+    #[test]
+    fn set_codegraph_floors_rejects_out_of_range() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        assert!(
+            db.set_codegraph_floors(-0.1, 0.2).is_err(),
+            "negative retrieval floor must be refused",
+        );
+        assert!(
+            db.set_codegraph_floors(0.2, 1.5).is_err(),
+            "post-rerank floor > 1.0 must be refused",
+        );
+        assert!(
+            db.set_codegraph_floors(f64::NAN, 0.2).is_err(),
+            "non-finite floor must be refused",
+        );
+        // A rejected write must leave NO partial state — both getters still
+        // return defaults (the first key must not persist before the second
+        // fails, and range checks run before any write).
+        assert_eq!(
+            db.get_codegraph_retrieval_floor().unwrap(),
+            DEFAULT_CODEGRAPH_RETRIEVAL_FLOOR,
+        );
+    }
+
+    #[test]
+    fn codegraph_floor_getter_soft_fails_on_garbage_row() {
+        // A hand-corrupted / legacy non-numeric row must not crash the
+        // getter — it falls through to the default (soft-fail discipline).
+        let db = Db::open_in_memory().expect("in-memory db");
+        db.app_state_set(CODEGRAPH_RETRIEVAL_FLOOR_KEY, "not-a-number")
+            .unwrap();
+        assert_eq!(
+            db.get_codegraph_retrieval_floor().unwrap(),
+            DEFAULT_CODEGRAPH_RETRIEVAL_FLOOR,
+        );
+    }
+
+    /// F6 (v0.2.72): `"NaN"` / `"inf"` / huge / negative rows all PARSE as
+    /// f64 (Rust's `parse::<f64>` accepts them), and the generic
+    /// `app_state_set` command can write them — the getters must degrade
+    /// such rows to the compiled-in default instead of propagating a
+    /// nonsense floor into the projected env.
+    #[test]
+    fn codegraph_floor_getters_reject_non_finite_and_out_of_range_rows() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        for bad in ["NaN", "nan", "inf", "-inf", "1e300", "1.5", "-0.5"] {
+            db.app_state_set(CODEGRAPH_RETRIEVAL_FLOOR_KEY, bad).unwrap();
+            db.app_state_set(CODEGRAPH_POST_RERANK_FLOOR_KEY, bad).unwrap();
+            assert_eq!(
+                db.get_codegraph_retrieval_floor().unwrap(),
+                DEFAULT_CODEGRAPH_RETRIEVAL_FLOOR,
+                "retrieval floor row {bad:?} must degrade to the default",
+            );
+            assert_eq!(
+                db.get_codegraph_post_rerank_floor().unwrap(),
+                DEFAULT_CODEGRAPH_POST_RERANK_FLOOR,
+                "post-rerank floor row {bad:?} must degrade to the default",
+            );
+        }
+        // Boundary values remain accepted (inclusive range).
+        db.app_state_set(CODEGRAPH_RETRIEVAL_FLOOR_KEY, "0.0").unwrap();
+        db.app_state_set(CODEGRAPH_POST_RERANK_FLOOR_KEY, "1.0").unwrap();
+        assert_eq!(db.get_codegraph_retrieval_floor().unwrap(), 0.0);
+        assert_eq!(db.get_codegraph_post_rerank_floor().unwrap(), 1.0);
     }
 }

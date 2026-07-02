@@ -39,12 +39,21 @@ vco_codegraph_cli() {
     return 1
 }
 
-# codegraph_query_block <query> <project_arg> <limit> <exclude_path>
+# codegraph_query_block <query> <project_arg> <limit> <exclude_path> [anchor]
 # Echo the raw "CODE:"-prefixed --hook-format block(s) for <query>, or nothing.
 #   $1 query        — the search query (symbol / module name / bash symbol token)
 #   $2 project_arg  — "--project Foo" or "" (already shell-token-shaped)
 #   $3 limit        — max results (default 2)
-#   $4 exclude_path — a path to grep -v out of the results (avoid self-injection)
+#   $4 exclude_path — forwarded to the CLI as `--exclude-file` so candidates
+#                     from that file are culled BEFORE the result trim
+#                     (v0.2.72 B2 — replaces the old post-hoc line-wise
+#                     `grep -v`, which stripped only the CODE: header line and
+#                     left orphaned body lines when the anchor's same-file
+#                     boost promoted the edited file's own entities)
+#   $5 anchor       — optional edited-file path or grep symbol; forwarded as
+#                     `--anchor` so the CLI's shared retrieval pipeline biases
+#                     the rerank toward call-linked / same-module / shared-type
+#                     code (v0.2.72 P2). Empty → pure semantic (MCP parity).
 # Soft-fail: CLI absent / error / empty → echo nothing, return 0. Never writes to
 # stderr-bound context, never exits non-zero. Bounded by an inner timeout so a
 # hung subprocess can't blow the caller's settings.json budget.
@@ -53,24 +62,41 @@ codegraph_query_block() {
     local project_arg="$2"
     local limit="${3:-2}"
     local exclude_path="${4:-}"
+    local anchor="${5:-}"
 
     [ -n "$query" ] || return 0
     local cli
     cli="$(vco_codegraph_cli)" || return 0
     [ -n "$cli" ] || return 0
 
+    # Build the CLI argv in the function's positional params (bash-3.2-safe —
+    # no arrays — and space-safe for the anchor path/symbol).
+    set -- search "$query"
+    if [ -n "$project_arg" ]; then
+        # shellcheck disable=SC2086 — project_arg is intentionally word-split.
+        set -- "$@" $project_arg
+    fi
+    set -- "$@" --limit "$limit" --hook-format
+    if [ -n "$exclude_path" ]; then
+        # B2: root-fix self-exclusion — the CLI drops the file's candidates
+        # pre-trim, so the top-K fills with OTHER files' context instead of
+        # being decapitated by a post-hoc grep. MUST MATCH codegraph-query.ps1.
+        set -- "$@" --exclude-file "$exclude_path"
+    fi
+    if [ -n "$anchor" ]; then
+        set -- "$@" --anchor "$anchor"
+    fi
+
     # Inner hard bound. Prefer `timeout` (coreutils / busybox); when absent,
     # fall back to a bg-pid + sleep-kill guard so Git-Bash-on-Windows (no
     # timeout) still can't hang the hook.
     local raw=""
     if command -v timeout >/dev/null 2>&1; then
-        # shellcheck disable=SC2086 — project_arg is intentionally word-split.
-        raw="$(timeout 4 "$cli" search "$query" $project_arg --limit "$limit" --hook-format 2>/dev/null || true)"
+        raw="$(timeout 4 "$cli" "$@" 2>/dev/null || true)"
     else
         local _tmp
         _tmp="$(mktemp 2>/dev/null || printf '%s' "/tmp/cg_$$_$RANDOM")"
-        # shellcheck disable=SC2086
-        ( "$cli" search "$query" $project_arg --limit "$limit" --hook-format >"$_tmp" 2>/dev/null ) &
+        ( "$cli" "$@" >"$_tmp" 2>/dev/null ) &
         local _pid=$!
         ( sleep 4; kill -9 "$_pid" 2>/dev/null ) >/dev/null 2>&1 &
         local _watchdog=$!
@@ -81,12 +107,10 @@ codegraph_query_block() {
     fi
 
     [ -n "$raw" ] || return 0
-    # Drop any self-reference (the file being edited/read) and cap the volume.
-    if [ -n "$exclude_path" ]; then
-        printf '%s\n' "$raw" | grep -v -F -- "$exclude_path" | head -20
-    else
-        printf '%s\n' "$raw" | head -20
-    fi
+    # Cap the volume. Self-reference exclusion happens INSIDE the CLI via
+    # --exclude-file (B2) — the old line-wise `grep -v` here stripped only the
+    # CODE: header line and left orphaned body lines. Do not re-add it.
+    printf '%s\n' "$raw" | head -20
 }
 
 # codegraph_pattern_gate <pattern>

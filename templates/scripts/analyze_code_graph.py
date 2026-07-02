@@ -134,6 +134,21 @@ def _deterministic_uuid(project: str, file_path_rel: str = "", full_name: str = 
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, key))
 
 
+# v0.2.72 (P3): chunked entity bodies carry a leading `[chunk N/total]\n\n`
+# header (format shared with server._parse_chunk_header). Consumers that parse
+# a chunk-0 body as source (e.g. `ast.parse` in cross-reference call-linking)
+# must strip it first, else the parse fails on the header line.
+_CHUNK_HEADER_RE = re.compile(r"^\[chunk \d+/\d+\]\n\n")
+
+
+def _strip_chunk_header(text: str) -> str:
+    """Remove a leading `[chunk N/total]` header from a chunked entity body.
+
+    No-op when the text has no header (the common single-chunk case).
+    """
+    return _CHUNK_HEADER_RE.sub("", text, count=1)
+
+
 # v0.2.61 (Track E): per-object content-hash fields for the tombstone-skip.
 # Maps the bare collection base-name to the ORDERED list of property keys
 # whose values define an object's semantically-meaningful content. The hash
@@ -160,10 +175,15 @@ def _deterministic_uuid(project: str, file_path_rel: str = "", full_name: str = 
 # more", which can only cause an extra (correct) write, never a wrong skip.
 _CONTENT_HASH_FIELDS = {
     "CodeModule": ["path", "module_summary", "import_names"],
-    "CodeClass": ["full_name", "signature", "class_body", "methods", "composes"],
+    # v0.2.72 (P3): chunk_num is part of the content hash for chunkable
+    # entities so two chunks of the same entity — which share full_name but
+    # carry different chunk bodies AND a different chunk_num — always hash
+    # distinctly (defense-in-depth; their bodies already differ). The
+    # tombstone-skip then compares like-for-like per chunk.
+    "CodeClass": ["full_name", "signature", "class_body", "methods", "composes", "chunk_num"],
     "CodeFunction": [
         "full_name", "signature", "function_body",
-        "type_uses", "cfg_summary", "data_flow_vars",
+        "type_uses", "cfg_summary", "data_flow_vars", "chunk_num",
     ],
     "CodeAPI": ["endpoint", "method", "api_description", "parameters", "returns"],
     "CodeInteraction": [
@@ -183,7 +203,60 @@ _CONTENT_HASH_FIELDS = {
 _CONTENT_HASH_EXCLUDE = frozenset({
     "content_hash", "last_modified", "project_source", "language",
     "file_path", "start_line", "end_line",
+    # v0.2.72 (P7): the embedding-revision marker is generation metadata, not
+    # semantic content — excluding it keeps the content hash a fixed point so
+    # stamping/bumping the revision never triggers a spurious content-hash
+    # rewrite on the unknown-collection fallback path.
+    "embed_revision",
 })
+
+
+# ── v0.2.72 (P7): code-graph embedding-revision sentinel + forced resync ─────
+#
+# OWNED BY T-RESYNC (P7). This is a NEW top-level constant — it does NOT touch
+# T-SCOPE's ignore-dirs regions or T-CHUNK's chunking/store code. It bumps
+# whenever the way an entity's TEXT is turned into embedding vectors changes in
+# a way that INVALIDATES existing stored vectors — i.e. the same source line now
+# lands in a different embedding than the row already in Weaviate carries.
+#
+# WHY it exists (the P3 chunking change): pre-v0.2.72, an over-budget
+# Function/Class had everything past `_max_chars_for_model` DROPPED from its
+# single embedding (the tail was unsearchable). P3 (T-CHUNK) now CHUNKS such
+# entities into N objects (chunk_num/total_chunks), so every line contributes to
+# some chunk's vector. That means the ~7-9% of entities that were over budget
+# have STALE embeddings: their `function_body`/`class_body` text on disk is
+# unchanged, so the per-object content-hash tombstone-skip (`_write_one_object`)
+# would SKIP them forever and they'd never gain their chunks. The revision gate
+# below forces exactly those rows (revision mismatch) to re-embed, while leaving
+# the 91%+ that already fit untouched (content-hash still matches AND revision
+# matches → skip). Re-running after the resync completes is a cheap no-op (all
+# rows at the current revision).
+#
+# WHY per-object (not per-collection): the skip already does a per-UUID
+# point-read of `content_hash`; adding `embed_revision` to that SAME read costs
+# nothing extra and lets the resync be INCREMENTAL + RESUMABLE — each object
+# self-heals the first time it's visited at the new revision, so an interrupted
+# resync simply continues where it left off (no all-or-nothing marker to
+# reconcile). A per-collection marker would force an all-or-nothing decision and
+# couldn't express "this row is fresh, that row is stale."
+#
+# Storage: the `embed_revision` property is ADDITIVE (mirrors T-CHUNK's
+# `_ensure_chunk_props_property` non-destructive `config.add_property` pattern).
+# Pre-migration rows return NULL `embed_revision` → treated as "revision
+# unknown" → FORCED re-embed (fail-safe toward re-embedding, never a wrong
+# skip), after which they carry the current revision and go stable.
+#
+# Revision history:
+#   1 (v0.2.72, P3): model-aware chunking for over-budget Function/Class
+#     entities. Over-budget tails now chunk instead of truncate → existing
+#     single-object embeddings of those entities are stale.
+CODEGRAPH_EMBED_REVISION: int = 1
+
+# Property name carrying the per-object revision. Kept out of
+# `_CONTENT_HASH_FIELDS` and added to `_CONTENT_HASH_EXCLUDE`-analog handling so
+# stamping it never perturbs the content hash itself (the revision is an
+# embedding-generation marker, NOT semantic content).
+_EMBED_REVISION_PROP = "embed_revision"
 
 
 def _stable_scalar(value: Any) -> str:
@@ -435,6 +508,15 @@ _COMMON_IGNORE_DIRS: frozenset = frozenset({
     'node_modules',
     # v0.2.16 — git-worktree clones under .claude/worktrees/agent-*/
     'worktrees',
+    # v0.2.72 (P5) — top-level `.wt/` git-worktree container. The
+    # release process creates per-track worktrees under `<repo>/.wt/
+    # v0272-<track>/` (see knowledge/concepts/parallel-pr-coordination-
+    # gotchas). These are exact byte copies of the main-repo source;
+    # walking them re-analyzes the same symbols (wasted work + duplicate
+    # -effort metrics) and, worse, injects the worktree copy's functions
+    # as retrieval "context" noise. `.wt` complements the existing
+    # `worktrees` entry (which only covered `.claude/worktrees/`).
+    '.wt',
     # v0.2.52 (V52-O.1) — JS/TS framework codegen + cache dirs. SvelteKit
     # in particular produces a `.svelte-kit/output/` tree full of Rollup
     # chunks that look like JS source to the analyzer; in real-world
@@ -466,9 +548,15 @@ _LANGUAGE_IGNORE_DIRS_EXTRAS: Dict[str, frozenset] = {
     'ruby':   frozenset({'vendor', '.bundle'}),
     # .NET / VS workspace artefacts
     'csharp': frozenset({'obj', 'bin', '.vs'}),
-    # JS / TS test-coverage reports
-    'js':     frozenset({'coverage'}),
-    'ts':     frozenset({'coverage'}),
+    # JS / TS test-coverage reports + vendored third-party deps.
+    # v0.2.72 (P5): `vendor` — some JS/TS projects vendor third-party
+    # libraries into `<pkg>/vendor/` (e.g. the launcher's bundled
+    # diagram editors under `launcher/vendor/diagrams-editor/`). Those
+    # are minified/third-party sources, not first-party code; indexing
+    # them injects thousands of vendor functions as retrieval noise.
+    # (Go/Ruby already skip `vendor` via their own extras above.)
+    'js':     frozenset({'coverage', 'vendor'}),
+    'ts':     frozenset({'coverage', 'vendor'}),
     # Languages with no extras (placeholder — explicit is better than
     # implicit when the analyzer learns a new language family later)
     'shell':  frozenset(),
@@ -479,15 +567,78 @@ _LANGUAGE_IGNORE_DIRS_EXTRAS: Dict[str, frozenset] = {
 }
 
 
-def _ignore_dirs_for(language: str) -> frozenset:
+def _ignore_dirs_for(language: str, index_dot_claude: bool = False) -> frozenset:
     """Return the directory-skip set for a given language.
 
     The set merges :data:`_COMMON_IGNORE_DIRS` with any
     language-specific extras. Unknown languages get the common set
     only (no error — analyzer should never crash on a new language
     being added without first updating the table).
+
+    ``index_dot_claude`` (v0.2.72, P5) gates the ``.claude`` directory:
+
+    * ``False`` (default, and the resolved value for every non-root
+      user project) → ``.claude`` is ADDED to the ignore set. For a
+      user project, ``.claude/`` is orchestrator-GENERATED tooling
+      (bundled agents/skills/hooks/scripts), not first-party source;
+      indexing it injects that tooling as retrieval "context" noise.
+    * ``True`` (the orchestrator clone itself, or an explicit
+      per-project opt-in) → ``.claude`` is walked normally, because on
+      the orchestrator root ``.claude/`` IS first-party source under
+      active development.
+
+    The launcher resolves the per-project bool via
+    ``codegraph_settings::resolve_codegraph_index_dot_claude`` and
+    passes ``--index-dot-claude`` / ``--no-index-dot-claude`` so the
+    analyzer honours it (see ``main()``'s argparse + the CLI tri-state
+    default in ``_resolve_index_dot_claude``).
     """
-    return _COMMON_IGNORE_DIRS | _LANGUAGE_IGNORE_DIRS_EXTRAS.get(language, frozenset())
+    dirs = _COMMON_IGNORE_DIRS | _LANGUAGE_IGNORE_DIRS_EXTRAS.get(language, frozenset())
+    if not index_dot_claude:
+        dirs = dirs | frozenset({'.claude'})
+    return dirs
+
+
+def _looks_like_orchestrator_root(repo_path: Path) -> bool:
+    """Best-effort check: does ``repo_path`` look like the orchestrator clone?
+
+    The orchestrator clone is the ONE tree where ``.claude/`` is
+    first-party source under active development (bundled agents, hooks,
+    scripts, MCP servers), so a bare CLI run there should still index it.
+    Heuristic: the root both *contains* ``vco_lib/`` (unique to the
+    orchestrator clone) AND has a ``.claude/`` directory. Every other
+    project that has VCO installed has ``.claude/`` but NOT ``vco_lib/``.
+    Never raises — returns False on any filesystem error (conservative:
+    unknown → treat as a user project → exclude ``.claude``).
+    """
+    try:
+        return (repo_path / "vco_lib").is_dir() and (repo_path / ".claude").is_dir()
+    except OSError:
+        return False
+
+
+def _resolve_index_dot_claude(cli_value: Optional[bool], repo_path: Path) -> bool:
+    """Resolve the tri-state ``--index-dot-claude`` CLI flag into a bool.
+
+    v0.2.72 (P5). Three input states:
+
+    * ``cli_value is True``  → ``--index-dot-claude`` was passed → index it.
+    * ``cli_value is False`` → ``--no-index-dot-claude`` was passed → skip it.
+    * ``cli_value is None``  → neither flag passed (bare CLI run). Fall
+      back to root-autodetect: index ``.claude`` ONLY when ``repo_path``
+      looks like the orchestrator clone (see
+      :func:`_looks_like_orchestrator_root`); exclude it for every user
+      project. This keeps a plain ``analyze_code_graph.py <orch-root>``
+      invocation indexing the orchestrator's own ``.claude/`` while
+      defaulting user projects to EXCLUDE.
+
+    The launcher always passes an explicit flag (from
+    ``resolve_codegraph_index_dot_claude``), so the ``None`` path only
+    matters for hand-run CLI invocations.
+    """
+    if cli_value is not None:
+        return cli_value
+    return _looks_like_orchestrator_root(repo_path)
 
 
 # ---------------------------------------------------------------------------
@@ -602,6 +753,31 @@ _EXT_TO_DISPATCH_NAME: Dict[str, str] = {
 }
 
 
+# v0.2.72 (P5 + pre-gate audit F8): name-suffix skip sets for JS/TS build
+# output and tool config — ONE home shared by the directory walkers
+# (`_find_js_files` / `_find_ts_files`) AND the single-file dispatch
+# (`_dispatch_name_for_file`), so the two entry points cannot drift on what
+# counts as "not source". `vite.config*` names are handled separately (name
+# PREFIX, not suffix) in both consumers.
+_JS_SKIP_SUFFIXES: tuple = (
+    '.min.js', '.bundle.js', '.chunk.js', '.config.js', '.config.mjs',
+)
+_TS_SKIP_SUFFIXES: tuple = (
+    '.d.ts', '.bundle.ts', '.chunk.ts', '.config.ts', '.config.mts',
+)
+
+# Dispatch-name → `_ignore_dirs_for` language key. The walkers use short
+# keys ('js'/'ts'); the dispatch table uses long names. Identity for
+# everything not listed. MUST MATCH the `_ignore_dirs_for(...)` argument each
+# `_find_*_files` method passes.
+_DISPATCH_TO_IGNORE_LANG: Dict[str, str] = {
+    "javascript": "js",
+    "typescript": "ts",
+    "svelte":     "js",     # _find_svelte_files shares the JS ignore set
+    "powershell": "shell",  # _find_powershell_files shares the shell set
+}
+
+
 def _dispatch_name_for_file(file_path: Path) -> str:
     """Return the `lang_dispatch` name for ``file_path``'s extension.
 
@@ -614,19 +790,22 @@ def _dispatch_name_for_file(file_path: Path) -> str:
     treats that as a no-op (the directory walk would not have indexed it
     either).
 
-    Special cases mirror the ``_find_*_files`` skip rules so single-file
-    mode does not index a file the directory walk would have excluded:
-      * ``*.d.ts`` declaration files (type stubs, not source).
-      * ``*.min.js`` minified bundles.
+    Name-based skips mirror the ``_find_*_files`` rules via the SHARED
+    ``_JS_SKIP_SUFFIXES`` / ``_TS_SKIP_SUFFIXES`` sets (pre-gate audit F8 —
+    this function previously only knew ``.d.ts``/``.min.js`` and let a
+    per-edit ``--only-file x.bundle.js`` re-index build output the walkers
+    skip), plus the ``vite.config*`` name-prefix rule.
     """
     name = file_path.name
     # Mirror `_find_ts_files` / `_find_js_files` name-based skips. These
     # files have a code extension but are deliberately excluded from the
     # directory walk; single-file mode must agree so an edit to one is a
     # no-op rather than an inconsistent index.
-    if name.endswith(".d.ts"):
+    if any(name.endswith(s) for s in _JS_SKIP_SUFFIXES):
         return ""
-    if name.endswith(".min.js"):
+    if any(name.endswith(s) for s in _TS_SKIP_SUFFIXES):
+        return ""
+    if name.startswith("vite.config"):
         return ""
     return _EXT_TO_DISPATCH_NAME.get(file_path.suffix.lower(), "")
 
@@ -726,9 +905,21 @@ try:
         truncate_function_for_embedding,
         truncate_class_for_embedding,
         truncate_module_for_embedding,
+        chunk_or_truncate_for_embedding,
+        chunk_or_truncate_class_for_embedding,
     )
+    _CHUNKING_AVAILABLE = True
 except ImportError:
-    # Inline fallbacks — naive char-based truncation (no model-awareness)
+    # Inline fallbacks — naive char-based truncation (no model-awareness).
+    # NOTE: this branch is effectively dead for a correctly-installed
+    # orchestrator (code_truncation is a same-package sibling of the MCP that
+    # is always importable once vco_lib is on-path). Kept as defense-in-depth
+    # so a broken partial install degrades to single-object writes rather than
+    # crashing. When this branch is taken, `_CHUNKING_AVAILABLE` is False and
+    # `_dedup_insert` skips the chunk fan-out entirely (single object, as pre-
+    # v0.2.72).
+    _CHUNKING_AVAILABLE = False
+
     def truncate_function_for_embedding(signature, body, language="python", model=None):
         return f"{signature}\n{body[:600]}"
 
@@ -738,6 +929,12 @@ except ImportError:
 
     def truncate_module_for_embedding(module_summary, model=None):
         return module_summary[:2000]
+
+    def chunk_or_truncate_for_embedding(signature, body, language="python", model=None, *, full_name=""):
+        return [truncate_function_for_embedding(signature, body, language=language, model=model)]
+
+    def chunk_or_truncate_class_for_embedding(signature, class_body, methods=None, language="python", model=None, *, full_name=""):
+        return [truncate_class_for_embedding(signature, class_body, methods=methods, language=language, model=model)]
 
 
 # v0.2.18: central embedding dispatcher. Replaces the inline
@@ -2893,6 +3090,15 @@ class CodeGraphAnalyzer:
         # Empty string when no analyze is in progress.
         self._current_source: str = ""
 
+        # v0.2.72 (P5) — whether to index the `.claude/` directory. For a
+        # user project this is orchestrator-GENERATED tooling (noise); for
+        # the orchestrator clone itself it's first-party source. Default
+        # False (exclude). main() overwrites it from the resolved CLI
+        # tri-state (`--index-dot-claude` / `--no-index-dot-claude`, else
+        # root-autodetect). Read by every `_find_*_files` via
+        # `_ignore_dirs_for(lang, self.index_dot_claude)`.
+        self.index_dot_claude: bool = False
+
     def connect(self):
         """Connect to Weaviate."""
         try:
@@ -3103,6 +3309,11 @@ class CodeGraphAnalyzer:
                         # pre-v0.2.61 rows → treated as unknown → one-time
                         # re-write, then stable.
                         Property(name="content_hash", data_type=DataType.TEXT, description="SHA-256 of semantically-meaningful content (per-object tombstone-skip)", skip_vectorization=True),
+                        # v0.2.72 (P7): embedding-generation revision this row was
+                        # produced under. NULL/mismatch vs CODEGRAPH_EMBED_REVISION forces
+                        # a re-embed even when content is byte-identical (revision-gated
+                        # forced resync). Excluded from the content hash.
+                        Property(name="embed_revision", data_type=DataType.INT, description="Embedding-generation revision (P7 revision-gated forced resync)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="imports", target_collection=self.coll_module, description="Imported modules"),
@@ -3159,6 +3370,19 @@ class CodeGraphAnalyzer:
                         Property(name="file_path", data_type=DataType.TEXT, description="Repo-relative POSIX path of the source file (mirrors CodeModule.path)", skip_vectorization=True),
                         # v0.2.61 (Track E): per-object content hash (see CodeModule).
                         Property(name="content_hash", data_type=DataType.TEXT, description="SHA-256 of semantically-meaningful content (per-object tombstone-skip)", skip_vectorization=True),
+                        # v0.2.72 (P7): embedding-generation revision this row was
+                        # produced under. NULL/mismatch vs CODEGRAPH_EMBED_REVISION forces
+                        # a re-embed even when content is byte-identical (revision-gated
+                        # forced resync). Excluded from the content hash.
+                        Property(name="embed_revision", data_type=DataType.INT, description="Embedding-generation revision (P7 revision-gated forced resync)", skip_vectorization=True),
+                        # v0.2.72 (P3): model-aware chunking. Over-budget classes
+                        # (~7-9%) are split into N objects sharing the same
+                        # full_name; chunk_num (0-indexed) identifies each chunk,
+                        # total_chunks the count. Single-chunk entities carry
+                        # chunk_num=0/total_chunks=1. The canonical object is
+                        # chunk_num=0 (cross-refs + limit=1 lookups resolve to it).
+                        Property(name="chunk_num", data_type=DataType.INT, description="0-indexed chunk number within this entity (0 for single-chunk)", skip_vectorization=True),
+                        Property(name="total_chunks", data_type=DataType.INT, description="Total chunks this entity was split into (1 for single-chunk)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="module", target_collection=self.coll_module, description="Parent module"),
@@ -3212,6 +3436,14 @@ class CodeGraphAnalyzer:
                         Property(name="file_path", data_type=DataType.TEXT, description="Repo-relative POSIX path of the source file (mirrors CodeModule.path)", skip_vectorization=True),
                         # v0.2.61 (Track E): per-object content hash (see CodeModule).
                         Property(name="content_hash", data_type=DataType.TEXT, description="SHA-256 of semantically-meaningful content (per-object tombstone-skip)", skip_vectorization=True),
+                        # v0.2.72 (P7): embedding-generation revision this row was
+                        # produced under. NULL/mismatch vs CODEGRAPH_EMBED_REVISION forces
+                        # a re-embed even when content is byte-identical (revision-gated
+                        # forced resync). Excluded from the content hash.
+                        Property(name="embed_revision", data_type=DataType.INT, description="Embedding-generation revision (P7 revision-gated forced resync)", skip_vectorization=True),
+                        # v0.2.72 (P3): model-aware chunking (see CodeClass).
+                        Property(name="chunk_num", data_type=DataType.INT, description="0-indexed chunk number within this entity (0 for single-chunk)", skip_vectorization=True),
+                        Property(name="total_chunks", data_type=DataType.INT, description="Total chunks this entity was split into (1 for single-chunk)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="module", target_collection=self.coll_module, description="Parent module"),
@@ -3252,6 +3484,11 @@ class CodeGraphAnalyzer:
                         Property(name="project_source", data_type=DataType.TEXT, description="Absolute path of the source root that produced this row (primary repo OR extra-path)", skip_vectorization=True),
                         # v0.2.61 (Track E): per-object content hash (see CodeModule).
                         Property(name="content_hash", data_type=DataType.TEXT, description="SHA-256 of semantically-meaningful content (per-object tombstone-skip)", skip_vectorization=True),
+                        # v0.2.72 (P7): embedding-generation revision this row was
+                        # produced under. NULL/mismatch vs CODEGRAPH_EMBED_REVISION forces
+                        # a re-embed even when content is byte-identical (revision-gated
+                        # forced resync). Excluded from the content hash.
+                        Property(name="embed_revision", data_type=DataType.INT, description="Embedding-generation revision (P7 revision-gated forced resync)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="handler", target_collection=self.coll_function, description="Handler function"),
@@ -3297,6 +3534,11 @@ class CodeGraphAnalyzer:
                         Property(name="project_source", data_type=DataType.TEXT, description="Absolute path of the source root that produced this row (primary repo OR extra-path)", skip_vectorization=True),
                         # v0.2.61 (Track E): per-object content hash (see CodeModule).
                         Property(name="content_hash", data_type=DataType.TEXT, description="SHA-256 of semantically-meaningful content (per-object tombstone-skip)", skip_vectorization=True),
+                        # v0.2.72 (P7): embedding-generation revision this row was
+                        # produced under. NULL/mismatch vs CODEGRAPH_EMBED_REVISION forces
+                        # a re-embed even when content is byte-identical (revision-gated
+                        # forced resync). Excluded from the content hash.
+                        Property(name="embed_revision", data_type=DataType.INT, description="Embedding-generation revision (P7 revision-gated forced resync)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="source_function", target_collection=self.coll_function, description="Function that makes the call"),
@@ -3352,6 +3594,24 @@ class CodeGraphAnalyzer:
         # → the skip treats them as "unknown" → one-time re-write that stamps
         # the hash, after which they go stable. Idempotent + soft-fail.
         self._ensure_content_hash_property()
+
+        # v0.2.72 (P3) schema migration: ensure `chunk_num` + `total_chunks`
+        # (both INT) exist on CodeFunction + CodeClass so pre-v0.2.72 installs
+        # gain them on the next analyze run and the chunk fan-out can stamp
+        # them. Pre-migration rows have NULL chunk_num → the read-path collapse
+        # + `_format_obj` normalise absent/0 to "single chunk", so old rows
+        # behave as single-chunk entities until re-analyzed. Additive (no
+        # re-index, no data loss). Idempotent + soft-fail per collection.
+        self._ensure_chunk_props_property()
+
+        # v0.2.72 (P7) schema migration: ensure `embed_revision` (INT) exists on
+        # all 5 code collections so pre-P7 installs gain the property on the next
+        # analyze run and `_write_one_object` can stamp + read it for the
+        # revision-gated forced resync. Pre-migration rows have NULL
+        # embed_revision → the fingerprint gate forces a re-embed (fail-safe),
+        # after which they carry the current revision and go stable. Additive
+        # (no re-index, no data loss). Idempotent + soft-fail per collection.
+        self._ensure_embed_revision_property()
 
     def _dedup_insert(self, collection, insert_params: dict, identity_key: str,
                       file_path_rel: str = "") -> str:
@@ -3453,6 +3713,223 @@ class CodeGraphAnalyzer:
                 if isinstance(props, dict) and not props.get("file_path"):
                     props["file_path"] = file_path_rel
 
+        # ── v0.2.72 (P3): model-aware chunking for over-budget entities ─────
+        #
+        # ~7-9% of functions/classes exceed the embedding budget (measured 8.6%
+        # CodeFunction). Pre-v0.2.72 those were silently truncated — everything
+        # past `_max_chars_for_model` was dropped from the embedding, so a large
+        # function's tail was unsearchable. Chunking splits the FULL entity text
+        # into N chunks so every line contributes to some chunk's embedding.
+        #
+        # CHOKE-POINT design (v0.2.72): the fan-out lives HERE, at the single
+        # `_dedup_insert` store path, NOT at the 23 per-language embed call
+        # sites. The call sites are untouched — they still call
+        # `embed_function`/`embed_class` (one embed) + build one `insert_params`.
+        # When the entity fits (91%+), we keep that single object verbatim
+        # (just stamping chunk_num=0/total_chunks=1). When it's over budget, we
+        # RE-DERIVE the chunk texts from the `function_body`/`class_body` +
+        # `signature` properties already present on `insert_params`, embed each
+        # chunk, and write N objects. The N-object fan-out never touches the
+        # call sites, so it doesn't collide with T-SCOPE's neighbouring
+        # `_find_*` method edits.
+        chunk_uuid = self._maybe_chunk_and_write(
+            collection, insert_params, identity_key, file_path_rel,
+            current_source_for_uuid,
+        )
+        if chunk_uuid is not None:
+            return chunk_uuid
+
+        # Not a chunkable entity (module / API / interaction), chunking
+        # unavailable, or a single-chunk entity → normal single-object write.
+        # Stamp chunk_num=0/total_chunks=1 for Function/Class single objects so
+        # the canonical-chunk filters (`chunk_num == 0`) and the read-path
+        # collapse treat them as first-class single-chunk nodes.
+        self._stamp_single_chunk_props(collection, insert_params)
+
+        return self._write_one_object(
+            collection, det_uuid, insert_params, identity_key,
+        )
+
+    def _stamp_single_chunk_props(self, collection, insert_params: dict) -> None:
+        """Stamp chunk_num=0/total_chunks=1 on a single-object Function/Class write.
+
+        Only Function/Class carry chunk props (they're the chunkable entities);
+        Module/API/Interaction are left untouched. Defensive: don't clobber a
+        caller-preset value, and no-op on non-Function/Class collections.
+        """
+        coll_name = getattr(collection, "name", "") or ""
+        if not (coll_name.endswith("CodeFunction") or coll_name.endswith("CodeClass")):
+            return
+        props = insert_params.get("properties")
+        if not isinstance(props, dict):
+            return
+        if "chunk_num" not in props:
+            props["chunk_num"] = 0
+        if "total_chunks" not in props:
+            props["total_chunks"] = 1
+
+    def _delete_stale_chunk_rows(
+        self, collection, full_name: str, file_path_rel: str,
+        current_source: str, min_chunk_num: int,
+    ) -> None:
+        """Delete leftover chunk rows (``chunk_num >= min_chunk_num``) of ONE
+        entity (F3, pre-gate audit, SEV-2).
+
+        When a chunked entity SHRINKS (3 chunks → 2, or → back to a single
+        object), the write path only writes chunks ``0..N-1`` — the old
+        ``::N``/``::N+1`` rows carry deterministic UUIDs the new run never
+        touches, so they linger forever: stale body text keeps matching
+        searches and the collapse counts phantom chunks. Scope the delete by
+        the entity's full identity (project / project_source / file_path /
+        full_name) so ONLY this entity's tail rows go.
+
+        Soft-fail by contract: any delete error logs a warning and returns —
+        a cleanup failure must never fail the write that triggered it (the
+        stale rows are the pre-fix status quo, not a regression).
+        """
+        if not full_name or min_chunk_num < 1:
+            return
+        try:
+            flt = Filter.by_property("full_name").equal(full_name)
+            flt = flt & Filter.by_property("chunk_num").greater_or_equal(
+                int(min_chunk_num)
+            )
+            if file_path_rel:
+                flt = flt & Filter.by_property("file_path").equal(file_path_rel)
+            if self.project_name:
+                flt = flt & Filter.by_property("project").equal(self.project_name)
+            if current_source:
+                flt = flt & Filter.by_property("project_source").equal(current_source)
+            collection.data.delete_many(where=flt)
+        except Exception as exc:  # noqa: BLE001 — cleanup must never fail a write
+            print(
+                f"⚠️  stale-chunk cleanup failed for {full_name} "
+                f"(chunk_num >= {min_chunk_num}): {exc}",
+                file=sys.stderr,
+            )
+
+    def _maybe_chunk_and_write(
+        self, collection, insert_params: dict, identity_key: str,
+        file_path_rel: str, current_source_for_uuid: str,
+    ) -> Optional[str]:
+        """Chunk an over-budget Function/Class into N objects and write them.
+
+        Returns the CANONICAL (chunk_num=0) UUID when the entity was chunked
+        into N>=2 objects, so the caller's `func_uuid`/`class_uuid` capture the
+        canonical object (cross-references + cache entries resolve to chunk 0).
+
+        Returns ``None`` when chunking does not apply — the caller then falls
+        through to the normal single-object write. `None` is returned when:
+          * chunking support is unavailable (partial install), OR
+          * the collection is not CodeFunction/CodeClass, OR
+          * the properties lack the body/signature needed to re-derive chunks, OR
+          * the entity fits in one chunk (the common 91%+ case).
+        """
+        if not _CHUNKING_AVAILABLE:
+            return None
+        coll_name = getattr(collection, "name", "") or ""
+        is_function = coll_name.endswith("CodeFunction")
+        is_class = coll_name.endswith("CodeClass")
+        if not (is_function or is_class):
+            return None
+        props = insert_params.get("properties")
+        if not isinstance(props, dict):
+            return None
+
+        signature = props.get("signature") or ""
+        language = props.get("language") or getattr(self, "_current_language", "") or "python"
+        model = _resolve_code_model_id()
+
+        if is_function:
+            body = props.get("function_body") or ""
+            if not body:
+                return None
+            chunk_texts = chunk_or_truncate_for_embedding(
+                signature, body, language=language, model=model,
+                full_name=identity_key,
+            )
+        else:  # class
+            body = props.get("class_body") or ""
+            if not body:
+                return None
+            methods = props.get("methods") or None
+            chunk_texts = chunk_or_truncate_class_for_embedding(
+                signature, body, methods=methods, language=language, model=model,
+                full_name=identity_key,
+            )
+
+        # Single chunk → the entity fits; not our path. Return None so the
+        # caller does the ordinary single-object write (which re-uses the
+        # already-computed vector in insert_params — no needless re-embed).
+        if len(chunk_texts) <= 1:
+            return None
+
+        total = len(chunk_texts)
+        canonical_uuid: Optional[str] = None
+        for i, chunk_text in enumerate(chunk_texts):
+            # Per-chunk UUID: chunk_num is mixed into the identity key so N
+            # chunks of the same entity don't collide on one UUID. chunk 0 uses
+            # the bare identity_key so its UUID is byte-identical to the
+            # pre-chunking single-object UUID for that entity (canonical, and
+            # stable across a fits→over-budget transition for chunk 0).
+            if i == 0:
+                chunk_uuid = _deterministic_uuid(
+                    self.project_name, file_path_rel, identity_key,
+                    project_source=current_source_for_uuid,
+                )
+            else:
+                chunk_uuid = _deterministic_uuid(
+                    self.project_name, file_path_rel, f"{identity_key}::{i}",
+                    project_source=current_source_for_uuid,
+                )
+
+            # Re-embed THIS chunk's text (each chunk gets its own vector).
+            chunk_vec = _shape_for_insert(generate_embedding(chunk_text))
+
+            # Build per-chunk insert_params: copy the shared props, override the
+            # body field with this chunk's text, stamp chunk_num/total_chunks.
+            # References + non-body props are identical across chunks (they all
+            # describe the same entity).
+            chunk_props = dict(props)
+            if is_function:
+                chunk_props["function_body"] = chunk_text
+            else:
+                chunk_props["class_body"] = chunk_text
+            chunk_props["chunk_num"] = i
+            chunk_props["total_chunks"] = total
+            # Recompute content_hash per chunk (the body differs), else the
+            # tombstone-skip would compare against the wrong hash. Drop any
+            # inherited hash so `_write_one_object` re-stamps from this chunk.
+            chunk_props.pop("content_hash", None)
+
+            chunk_params = dict(insert_params)
+            chunk_params["properties"] = chunk_props
+            if chunk_vec:
+                chunk_params["vector"] = chunk_vec
+            elif "vector" in chunk_params:
+                # No vector for this chunk (embed failed) → don't carry the
+                # parent's vector, which belongs to the full-body text.
+                del chunk_params["vector"]
+
+            written = self._write_one_object(
+                collection, chunk_uuid, chunk_params, identity_key,
+            )
+            if i == 0:
+                canonical_uuid = written
+        return canonical_uuid
+
+    def _write_one_object(
+        self, collection, det_uuid: str, insert_params: dict, identity_key: str,
+    ) -> str:
+        """Write one Weaviate object (tombstone-skip + replace-or-insert).
+
+        Extracted from the tail of `_dedup_insert` (v0.2.72) so the chunk
+        fan-out in `_maybe_chunk_and_write` reuses the exact same write
+        mechanics (per-object content-hash tombstone-skip, replace()-first-
+        then-insert() cold-start handling, visited-UUID tracking) instead of
+        duplicating them. `_dedup_insert` (single-object path) and the fan-out
+        both funnel through here — one home for the write logic.
+        """
         # ── v0.2.61 (Track E): per-object content-hash tombstone skip ───────
         #
         # WHY: the per-FILE skip (`_get_existing_module` keyed on path +
@@ -3481,6 +3958,19 @@ class CodeGraphAnalyzer:
         # replace()/insert(). A read failure must never cause a stale index.
         props = insert_params.get("properties")
         skip_replace = False
+        # F3 (pre-gate audit): chunk-shrink detection. When the CANONICAL
+        # (chunk 0) write of a Function/Class finds the stored row was chunked
+        # into MORE chunks than this run is writing, the tail rows
+        # (chunk_num >= new total) are stale — schedule a scoped delete.
+        # Piggybacks on the existing point-read (no extra read); fires on BOTH
+        # the skip and write paths (a byte-identical chunk 0 can still coexist
+        # with a shrunken tail). None → no cleanup.
+        _coll_name_for_read = getattr(collection, "name", "") or ""
+        _is_chunkable = (
+            _coll_name_for_read.endswith("CodeFunction")
+            or _coll_name_for_read.endswith("CodeClass")
+        )
+        stale_chunk_min: Optional[int] = None
         if isinstance(props, dict):
             try:
                 content_hash = _content_hash_for_object(
@@ -3488,31 +3978,92 @@ class CodeGraphAnalyzer:
                 )
             except Exception:  # noqa: BLE001 — hashing must never wedge a write
                 content_hash = ""
+            # ── v0.2.72 (P7): stamp the current embedding revision on every
+            # write. It rides alongside `content_hash` so the NEXT run can tell
+            # whether a byte-identical object was embedded under the CURRENT
+            # embedding-generation scheme (chunking) or a stale one. Don't
+            # clobber a caller-preset value (mirrors the content_hash stamp).
+            if props.get(_EMBED_REVISION_PROP) is None:
+                props[_EMBED_REVISION_PROP] = CODEGRAPH_EMBED_REVISION
             if content_hash:
                 # Persist for the NEXT run's comparison (and don't clobber a
                 # caller-preset value, mirroring the other stamp sites).
                 if not props.get("content_hash"):
                     props["content_hash"] = content_hash
-                # Cheap point-read of the existing stored hash. Any failure is
-                # a fall-through to write (fail-safe), NOT a skip.
+                # Cheap point-read of the existing stored hash + embed_revision.
+                # Any failure is a fall-through to write (fail-safe), NOT a skip.
                 try:
                     query = getattr(collection, "query", None)
                     fetch_by_id = getattr(query, "fetch_object_by_id", None) if query else None
                     if callable(fetch_by_id):
+                        # F3: for chunkable collections also read the stored
+                        # total_chunks so the shrink detector below can run.
+                        # NOT requested for Module/API/Interaction — their
+                        # schemas don't carry chunk props and an unknown
+                        # return_property would error the read into the
+                        # fail-safe write path (re-introducing tombstones).
+                        _read_props = ["content_hash", _EMBED_REVISION_PROP]
+                        if _is_chunkable:
+                            _read_props.append("total_chunks")
                         existing = fetch_by_id(
-                            det_uuid, return_properties=["content_hash"]
+                            det_uuid,
+                            return_properties=_read_props,
                         )
                         # fetch_object_by_id returns None when absent.
                         if existing is not None:
                             existing_props = getattr(existing, "properties", None) or {}
                             stored_hash = existing_props.get("content_hash") or ""
-                            if stored_hash and stored_hash == content_hash:
+                            # F3 shrink detector — canonical (chunk 0 / legacy
+                            # None) writes only, so the per-chunk fan-out
+                            # doesn't re-trigger it N times.
+                            if _is_chunkable and props.get("chunk_num") in (0, None):
+                                try:
+                                    _stored_total = int(
+                                        existing_props.get("total_chunks") or 1
+                                    )
+                                except (TypeError, ValueError):
+                                    _stored_total = 1
+                                try:
+                                    _new_total = int(props.get("total_chunks") or 1)
+                                except (TypeError, ValueError):
+                                    _new_total = 1
+                                if _stored_total > _new_total >= 1:
+                                    stale_chunk_min = _new_total
+                            # v0.2.72 (P7): FINGERPRINT GATE. Skip ONLY when BOTH
+                            # (a) the content is byte-identical (content_hash
+                            # matches) AND (b) the stored row was embedded under
+                            # the CURRENT revision. A NULL / mismatched
+                            # embed_revision (pre-migration row, or a row written
+                            # before the P3 chunking bump) FORCES a re-embed even
+                            # when the body text is unchanged — that is exactly
+                            # the ~7-9% over-budget-entity case P7 targets. This
+                            # is fail-safe: any uncertainty falls through to
+                            # write, never to a wrong skip.
+                            stored_rev = existing_props.get(_EMBED_REVISION_PROP)
+                            revision_current = stored_rev == CODEGRAPH_EMBED_REVISION
+                            if (
+                                stored_hash
+                                and stored_hash == content_hash
+                                and revision_current
+                            ):
                                 skip_replace = True
                 except Exception:  # noqa: BLE001
                     # Read error / unsupported client / mocked collection →
                     # fall through to the unconditional write. Never skip on
                     # uncertainty.
                     skip_replace = False
+
+        # F3: the entity shrank — delete the stale tail rows. Runs on BOTH the
+        # skip and write paths (the cleanup itself soft-fails; see helper).
+        if stale_chunk_min is not None and isinstance(props, dict):
+            self._delete_stale_chunk_rows(
+                collection,
+                props.get("full_name") or identity_key,
+                props.get("file_path") or "",
+                props.get("project_source")
+                or getattr(self, "_current_source", ""),
+                stale_chunk_min,
+            )
 
         if skip_replace:
             # Unchanged object: no replace(), no tombstone, no write. Still
@@ -3730,6 +4281,118 @@ class CodeGraphAnalyzer:
                 # for this collection until the next successful migration.
                 logger.debug(
                     f"v0.2.61 content_hash migration on {label} skipped: {e}"
+                )
+
+    def _ensure_chunk_props_property(self):
+        """v0.2.72 (P3) schema migration: add `chunk_num` + `total_chunks`
+        (both INT) to CodeFunction + CodeClass so pre-v0.2.72 installs gain the
+        properties on the next analyze run and the chunk fan-out can stamp them.
+
+        Only Function + Class get the properties — they are the only chunkable
+        entities (Module summaries + API descriptions + Interactions fit the
+        budget). Pre-migration rows have NULL chunk_num; the read-path
+        (`_format_obj`, `_collapse_to_one_per_node`) normalises absent/0 to
+        "single chunk 1 of 1", so old rows behave as single-chunk entities
+        until re-analyzed.
+
+        Back-compat: adding a property to an existing Weaviate class is a
+        non-destructive metadata operation (no re-index, no data loss).
+        Idempotent — an already-present property is skipped silently. Soft-fail
+        per (collection, property). Mirrors `_ensure_file_path_property`.
+        """
+        collections = [
+            ("CodeFunction", self.functions_collection),
+            ("CodeClass",    self.classes_collection),
+        ]
+        new_props = [
+            ("chunk_num", "0-indexed chunk number within this entity (0 for single-chunk)"),
+            ("total_chunks", "Total chunks this entity was split into (1 for single-chunk)"),
+        ]
+        for label, coll in collections:
+            if coll is None:
+                continue
+            try:
+                config = coll.config.get()
+                existing_props = {p.name for p in config.properties}
+            except Exception as e:
+                logger.debug(f"v0.2.72 chunk-props migration: config read on {label} skipped: {e}")
+                continue
+            for prop_name, desc in new_props:
+                if prop_name in existing_props:
+                    continue
+                try:
+                    coll.config.add_property(
+                        Property(
+                            name=prop_name,
+                            data_type=DataType.INT,
+                            description=desc,
+                            skip_vectorization=True,
+                        )
+                    )
+                    print(f"   Added {prop_name} property to {label} schema (v0.2.72)")
+                except Exception as e:
+                    logger.debug(
+                        f"v0.2.72 {prop_name} migration on {label} skipped: {e}"
+                    )
+
+    def _ensure_embed_revision_property(self):
+        """v0.2.72 (P7) schema migration: add `embed_revision` (INT) to the
+        5 code collections so pre-P7 installs gain the property on the next
+        analyze run and `_write_one_object` can stamp + read it for the
+        revision-gated forced resync.
+
+        WHY all 5 (not just Function/Class): the fingerprint gate lives in the
+        shared `_write_one_object` write path, which handles EVERY collection.
+        Stamping `embed_revision` uniformly keeps the gate's point-read simple
+        (one property name, one meaning) and lets a FUTURE revision bump that
+        affects Module/API/Interaction embeddings reuse the same machinery
+        without another migration. Today only Function/Class chunk, so only
+        their over-budget rows will actually mismatch and re-embed under
+        revision 1 — the others stamp the revision on their next ordinary write
+        and thereafter match.
+
+        Pre-migration rows have NULL `embed_revision` → the gate treats them as
+        "revision unknown" → FORCED re-embed (fail-safe), after which they carry
+        the current revision and go stable. Adding a property is a
+        non-destructive metadata operation (no re-index, no data loss).
+        Idempotent — an already-present property is skipped silently. Soft-fail
+        per collection. Mirrors `_ensure_content_hash_property` exactly.
+        """
+        collections = [
+            ("CodeModule",      self.modules_collection),
+            ("CodeClass",       self.classes_collection),
+            ("CodeFunction",    self.functions_collection),
+            ("CodeAPI",         self.apis_collection),
+            ("CodeInteraction", self.interactions_collection),
+        ]
+        desc = (
+            "Embedding-generation revision this row's vector(s) were produced "
+            "under (P7 revision-gated forced resync; see CODEGRAPH_EMBED_REVISION)"
+        )
+        for label, coll in collections:
+            if coll is None:
+                continue
+            try:
+                config = coll.config.get()
+                existing_props = {p.name for p in config.properties}
+                if _EMBED_REVISION_PROP in existing_props:
+                    continue
+                coll.config.add_property(
+                    Property(
+                        name=_EMBED_REVISION_PROP,
+                        data_type=DataType.INT,
+                        description=desc,
+                        skip_vectorization=True,
+                    )
+                )
+                print(f"   Added {_EMBED_REVISION_PROP} property to {label} schema (v0.2.72 P7)")
+            except Exception as e:
+                # Soft-fail. A 422 here doesn't break analysis — the revision
+                # gate just sees NULL for this collection until the next
+                # successful migration (which errs toward re-embed, never a
+                # wrong skip).
+                logger.debug(
+                    f"v0.2.72 P7 {_EMBED_REVISION_PROP} migration on {label} skipped: {e}"
                 )
 
     def analyze_repository(self, repo_path: Path, language: Optional[str] = None,
@@ -4246,8 +4909,12 @@ class CodeGraphAnalyzer:
             debounced run);
           * the file is not under ``repo_path`` (wrong relativization root
             would create duplicate/zombie rows keyed on a bad path);
-          * the extension is unrecognised / explicitly skipped
-            (``.d.ts``, ``.min.js``);
+          * the extension is unrecognised / explicitly skipped (the shared
+            ``_JS_SKIP_SUFFIXES`` / ``_TS_SKIP_SUFFIXES`` sets — ``.d.ts``,
+            ``.min.js``, ``.bundle.js``, ``.chunk.js``, ``.config.*``,
+            ``vite.config*``);
+          * the file sits under an ignored directory (the walker's
+            ``_ignore_dirs_for(language)`` set + ``.wt``/``vendor`` — F8);
           * a ``--language`` filter was supplied and the file's language
             does not match it.
         """
@@ -4313,6 +4980,32 @@ class CodeGraphAnalyzer:
             # walk would not have indexed it either → silent no-op.
             return []
 
+        # F8 (pre-gate audit): reject files under ignored directories. The
+        # directory walk skips these trees entirely, but a per-edit
+        # `--only-file .wt/a/b.py` or `vendor/lib/x.js` bypassed the walkers
+        # and re-indexed noise rows. Check the REPO-RELATIVE path parts (the
+        # repo may itself live under a dir named e.g. `build`) against the
+        # SAME `_ignore_dirs_for(language, index_dot_claude)` set the walker
+        # for this language uses, plus `.wt`/`vendor` unconditionally
+        # (worktree containers + vendored third-party code are never
+        # single-file-index targets regardless of language).
+        ignore_lang = _DISPATCH_TO_IGNORE_LANG.get(dispatch_name, dispatch_name)
+        # getattr-default keeps the path safe for test fixtures built via
+        # __new__ that don't set index_dot_claude (same pattern as the
+        # `_current_language` / `_current_source` reads in _dedup_insert).
+        ignore_dirs = _ignore_dirs_for(
+            ignore_lang, getattr(self, "index_dot_claude", False),
+        )
+        ignore_dirs = ignore_dirs | frozenset({'.wt', 'vendor'})
+        rel_parts = resolved.relative_to(repo_root).parts
+        if any(part in ignore_dirs for part in rel_parts[:-1]):
+            print(
+                f"ℹ️  Single-file analyze: {resolved} is under an ignored "
+                "directory — skipping (the directory walk skips it too)",
+                file=sys.stderr,
+            )
+            return []
+
         if lang_filter and lang_filter != dispatch_name:
             # An explicit --language was passed and this file isn't it.
             return []
@@ -4330,7 +5023,7 @@ class CodeGraphAnalyzer:
 
     def _find_python_files(self, repo_path: Path) -> List[Path]:
         """Find all Python files in repository."""
-        ignore_dirs = _ignore_dirs_for('python')
+        ignore_dirs = _ignore_dirs_for('python', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.py')
             if not any(d in f.parts for d in ignore_dirs)
@@ -4338,7 +5031,7 @@ class CodeGraphAnalyzer:
 
     def _find_lua_files(self, repo_path: Path) -> List[Path]:
         """Find all Lua files in repository."""
-        ignore_dirs = _ignore_dirs_for('lua')
+        ignore_dirs = _ignore_dirs_for('lua', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.lua')
             if not any(d in f.parts for d in ignore_dirs)
@@ -4346,7 +5039,7 @@ class CodeGraphAnalyzer:
 
     def _find_cpp_files(self, repo_path: Path) -> List[Path]:
         """Find all C++/header files in repository."""
-        ignore_dirs = _ignore_dirs_for('cpp')
+        ignore_dirs = _ignore_dirs_for('cpp', self.index_dot_claude)
         files = []
         for ext in ('*.cpp', '*.cc', '*.cxx', '*.c', '*.h', '*.hpp'):
             files.extend([
@@ -4357,8 +5050,15 @@ class CodeGraphAnalyzer:
 
     def _find_js_files(self, repo_path: Path) -> List[Path]:
         """Find all JavaScript files in repository."""
-        ignore_dirs = _ignore_dirs_for('js')
-        skip_suffixes = {'.min.js', '.config.js', '.config.mjs'}
+        ignore_dirs = _ignore_dirs_for('js', self.index_dot_claude)
+        # v0.2.72 (P5): `.bundle.js` + `.chunk.js` join `.min.js` — these
+        # are build-output bundles (webpack/rollup/esbuild), not source.
+        # A vendored `excalidraw.bundle.js` was live-confirmed injecting its
+        # functions as retrieval context. `.chunk.js` covers split-chunk
+        # output that doesn't live under an already-ignored codegen dir.
+        # F8: the suffix set is the SHARED module-level constant so the
+        # single-file dispatch (`_dispatch_name_for_file`) cannot drift.
+        skip_suffixes = set(_JS_SKIP_SUFFIXES)
         files = []
         for ext in ('*.js', '*.mjs', '*.jsx'):
             for f in repo_path.rglob(ext):
@@ -4373,8 +5073,13 @@ class CodeGraphAnalyzer:
 
     def _find_ts_files(self, repo_path: Path) -> List[Path]:
         """Find all TypeScript files in repository."""
-        ignore_dirs = _ignore_dirs_for('ts')
-        skip_suffixes = {'.config.ts', '.config.mts'}
+        ignore_dirs = _ignore_dirs_for('ts', self.index_dot_claude)
+        # v0.2.72 (P5): `.bundle.ts` / `.chunk.ts` mirror the JS bundle
+        # skips. Bundle output is almost always `.js`, but the mirror keeps
+        # the two find-methods symmetric if a toolchain emits `.ts` bundles.
+        # F8: shared module-level constant (includes `.d.ts` type stubs) so
+        # the single-file dispatch cannot drift.
+        skip_suffixes = set(_TS_SKIP_SUFFIXES)
         files = []
         for ext in ('*.ts', '*.tsx'):
             for f in repo_path.rglob(ext):
@@ -4384,15 +5089,12 @@ class CodeGraphAnalyzer:
                     continue
                 if f.name.startswith('vite.config'):
                     continue
-                # Skip .d.ts declaration files (type stubs, not source)
-                if f.name.endswith('.d.ts'):
-                    continue
                 files.append(f)
         return sorted(files)
 
     def _find_go_files(self, repo_path: Path) -> List[Path]:
         """Find all Go files in repository."""
-        ignore_dirs = _ignore_dirs_for('go')
+        ignore_dirs = _ignore_dirs_for('go', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.go')
             if not any(d in f.parts for d in ignore_dirs)
@@ -4400,7 +5102,7 @@ class CodeGraphAnalyzer:
 
     def _find_rust_files(self, repo_path: Path) -> List[Path]:
         """Find all Rust files in repository."""
-        ignore_dirs = _ignore_dirs_for('rust')
+        ignore_dirs = _ignore_dirs_for('rust', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.rs')
             if not any(d in f.parts for d in ignore_dirs)
@@ -4408,7 +5110,7 @@ class CodeGraphAnalyzer:
 
     def _find_java_files(self, repo_path: Path) -> List[Path]:
         """Find all Java files in repository."""
-        ignore_dirs = _ignore_dirs_for('java')
+        ignore_dirs = _ignore_dirs_for('java', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.java')
             if not any(d in f.parts for d in ignore_dirs)
@@ -4416,7 +5118,7 @@ class CodeGraphAnalyzer:
 
     def _find_ruby_files(self, repo_path: Path) -> List[Path]:
         """Find all Ruby files in repository."""
-        ignore_dirs = _ignore_dirs_for('ruby')
+        ignore_dirs = _ignore_dirs_for('ruby', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.rb')
             if not any(d in f.parts for d in ignore_dirs)
@@ -4424,7 +5126,7 @@ class CodeGraphAnalyzer:
 
     def _find_shell_files(self, repo_path: Path) -> List[Path]:
         """Find all Shell script files in repository."""
-        ignore_dirs = _ignore_dirs_for('shell')
+        ignore_dirs = _ignore_dirs_for('shell', self.index_dot_claude)
         files = []
         for ext in ('*.sh', '*.bash'):
             files.extend([
@@ -4435,7 +5137,7 @@ class CodeGraphAnalyzer:
 
     def _find_csharp_files(self, repo_path: Path) -> List[Path]:
         """Find all C# files in repository."""
-        ignore_dirs = _ignore_dirs_for('csharp')
+        ignore_dirs = _ignore_dirs_for('csharp', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.cs')
             if not any(d in f.parts for d in ignore_dirs)
@@ -4449,7 +5151,7 @@ class CodeGraphAnalyzer:
         the JS/TS ignore-dir set because Svelte sits in the same npm
         tooling ecosystem (node_modules, dist, .svelte-kit codegen).
         """
-        ignore_dirs = _ignore_dirs_for('js')
+        ignore_dirs = _ignore_dirs_for('js', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.svelte')
             if not any(d in f.parts for d in ignore_dirs)
@@ -4464,7 +5166,7 @@ class CodeGraphAnalyzer:
         shell ignore-dir set since .ps1 lives in the same parts of the
         tree as .sh (templates/hooks/, scripts/).
         """
-        ignore_dirs = _ignore_dirs_for('shell')
+        ignore_dirs = _ignore_dirs_for('shell', self.index_dot_claude)
         files = []
         for ext in ('*.ps1', '*.psm1'):
             files.extend([
@@ -4475,7 +5177,7 @@ class CodeGraphAnalyzer:
 
     def _find_proto_files(self, repo_path: Path) -> List[Path]:
         """Find all Protocol Buffer definition files."""
-        ignore_dirs = _ignore_dirs_for('proto')
+        ignore_dirs = _ignore_dirs_for('proto', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.proto')
             if not any(d in f.parts for d in ignore_dirs)
@@ -6342,6 +7044,79 @@ class CodeGraphAnalyzer:
                 calls.append(name)
         return calls
 
+    @staticmethod
+    def _prefer_canonical_chunk(cache: Dict[str, str], full_name: str, obj) -> bool:
+        """Return True if `obj` should occupy the cache slot for `full_name`.
+
+        v0.2.72 (P3): with multi-chunk entities sharing a full_name, the
+        full_name → UUID cache must point at the CANONICAL chunk (chunk_num==0)
+        so cross-references (`calls`/`extends`) and downstream lookups resolve
+        to the canonical object, not a random chunk (last-writer-wins would
+        otherwise pick whichever chunk the iterator yielded last).
+
+        Rules:
+          * No incumbent yet → take the slot (True).
+          * This object is chunk 0 (or a legacy row with chunk_num None/0) →
+            take the slot (True) — chunk 0 always wins over a non-zero chunk.
+          * This object is a non-zero chunk AND an incumbent exists → keep the
+            incumbent (False). (If the incumbent was itself a non-zero chunk,
+            we still prefer to hold it stable; chunk 0 will overwrite it when
+            the iterator reaches it.)
+        """
+        chunk_num = obj.properties.get("chunk_num")
+        is_canonical = chunk_num in (None, 0)
+        if full_name not in cache:
+            return True
+        return is_canonical
+
+    def _assemble_full_body_from_chunks(
+        self, full_name: str, canonical_props: dict, total_chunks: int,
+        fallback: str,
+    ) -> str:
+        """Reassemble a chunked function's FULL body from all its chunk rows
+        (F7, pre-gate audit, SEV-3).
+
+        The calls pass used to ``ast.parse`` chunk-0's body alone — for a
+        chunked (over-budget) function that is only the FIRST slice, and a
+        mid-block chunk boundary raises ``SyntaxError`` → ``continue`` — so
+        exactly the big hub functions lost BOTH their ``calls`` references and
+        their ``call_names``. Fetch every chunk row for the entity (scoped by
+        file_path + project so a same-named entity in another file can't mix
+        in), strip the ``[chunk N/total]`` headers, and join in chunk order.
+
+        Returns ``fallback`` (the chunk-0 body) on ANY fetch failure or when
+        fewer than 2 rows come back — the caller then degrades to the pre-fix
+        partial-parse behaviour, never worse.
+        """
+        if not full_name or total_chunks <= 1:
+            return fallback
+        try:
+            flt = Filter.by_property("full_name").equal(full_name)
+            fp = canonical_props.get("file_path") or ""
+            if fp:
+                flt = flt & Filter.by_property("file_path").equal(fp)
+            if self.project_name:
+                flt = flt & Filter.by_property("project").equal(self.project_name)
+            resp = self.functions_collection.query.fetch_objects(
+                filters=flt, limit=max(total_chunks + 4, 8),
+            )
+            rows: List[tuple] = []
+            for obj in resp.objects:
+                p = obj.properties or {}
+                try:
+                    cn = int(p.get("chunk_num") or 0)
+                except (TypeError, ValueError):
+                    cn = 0
+                body_part = _strip_chunk_header(p.get("function_body", "") or "")
+                rows.append((cn, body_part))
+            if len(rows) <= 1:
+                return fallback
+            rows.sort(key=lambda t: t[0])
+            assembled = "\n".join(b for _, b in rows if b)
+            return assembled or fallback
+        except Exception:  # noqa: BLE001 — degrade to the chunk-0 body
+            return fallback
+
     def _populate_caches_from_weaviate(self):
         """Load all existing objects into caches from Weaviate.
 
@@ -6366,20 +7141,28 @@ class CodeGraphAnalyzer:
         except Exception as e:
             print(f"   ⚠️  Failed to load modules: {e}")
 
-        # Load classes
+        # Load classes. v0.2.72 (P3): with multi-chunk objects sharing a
+        # full_name, prefer the CANONICAL chunk (chunk_num == 0) so the cache
+        # maps full_name → the canonical UUID. `_prefer_canonical_chunk`
+        # returns True when this object should win the cache slot (chunk 0, OR
+        # a legacy row with no chunk_num, OR no incumbent yet).
         try:
             for obj in self.classes_collection.iterator():
                 full_name = obj.properties.get("full_name", "")
-                if full_name:
+                if full_name and self._prefer_canonical_chunk(
+                    self.class_cache, full_name, obj
+                ):
                     self.class_cache[full_name] = str(obj.uuid)
         except Exception as e:
             print(f"   ⚠️  Failed to load classes: {e}")
 
-        # Load functions
+        # Load functions (same canonical-chunk preference as classes).
         try:
             for obj in self.functions_collection.iterator():
                 full_name = obj.properties.get("full_name", "")
-                if full_name:
+                if full_name and self._prefer_canonical_chunk(
+                    self.function_cache, full_name, obj
+                ):
                     self.function_cache[full_name] = str(obj.uuid)
         except Exception as e:
             print(f"   ⚠️  Failed to load functions: {e}")
@@ -6443,17 +7226,42 @@ class CodeGraphAnalyzer:
         # --- 1. Function calls ---
         print("   Linking function calls...")
         for full_name, func_uuid in self.function_cache.items():
-            # Fetch the function to get its body and extract calls
+            # Fetch the function to get its body and extract calls.
+            # v0.2.72 (P3): `func_uuid` is the CANONICAL (chunk 0) UUID from the
+            # cache (see `_prefer_canonical_chunk`). Point-read by that UUID
+            # rather than a `full_name`-filtered `limit=1` fetch, which with
+            # multi-chunk objects could return a NON-canonical chunk.
+            # F7 (pre-gate audit): for a chunked function, reassemble the FULL
+            # body from all chunk rows before AST parse — chunk-0 alone was a
+            # partial slice whose mid-block boundary raised SyntaxError, so
+            # exactly the big hub functions lost calls + call_names. Fetch
+            # failure falls back to the chunk-0 body (pre-fix behaviour). The
+            # `data.update(call_names)` below still writes to the canonical
+            # object, so callers-queries resolve correctly.
             try:
-                resp = self.functions_collection.query.fetch_objects(
-                    filters=Filter.by_property("full_name").equal(full_name),
-                    limit=1,
-                )
-                if not resp.objects:
-                    continue
-                body = resp.objects[0].properties.get("function_body", "")
+                canonical = self.functions_collection.query.fetch_object_by_id(func_uuid)
+                body = canonical.properties.get("function_body", "") if canonical is not None else ""
                 if not body:
                     continue
+
+                try:
+                    _total_chunks = int(
+                        (canonical.properties.get("total_chunks") or 1)
+                        if canonical is not None else 1
+                    )
+                except (TypeError, ValueError):
+                    _total_chunks = 1
+                if _total_chunks > 1:
+                    body = self._assemble_full_body_from_chunks(
+                        full_name, canonical.properties or {}, _total_chunks,
+                        fallback=body,
+                    )
+
+                # Strip a leading `[chunk N/total]` header (chunked chunk-0
+                # bodies carry it; the reassembly helper strips per-row, so
+                # this is a no-op there) before AST parse, else `ast.parse`
+                # chokes.
+                body = _strip_chunk_header(body)
 
                 # Parse body to extract calls
                 try:
@@ -7487,6 +8295,20 @@ def main():
     parser.add_argument('--json-progress', action='store_true',
                        help='Emit per-file progress + final report as JSON '
                             'lines on stdout (Tauri Re-analyze modal).')
+    # v0.2.72 (P5): tri-state `.claude` gate. `dest` defaults to None
+    # (neither flag passed) so `_resolve_index_dot_claude` can fall back to
+    # root-autodetect for bare CLI runs. The launcher resolves the
+    # per-project bool via `resolve_codegraph_index_dot_claude` and ALWAYS
+    # passes one of these two flags explicitly.
+    parser.add_argument('--index-dot-claude', dest='index_dot_claude',
+                       action='store_true', default=None,
+                       help='Index the `.claude/` directory (default: only on '
+                            'the orchestrator clone; excluded for user projects '
+                            'where `.claude/` is generated tooling, not source).')
+    parser.add_argument('--no-index-dot-claude', dest='index_dot_claude',
+                       action='store_false',
+                       help='Exclude the `.claude/` directory from analysis '
+                            '(the launcher passes this for every non-root project).')
 
     args = parser.parse_args()
 
@@ -7709,6 +8531,13 @@ def main():
 
     # Create analyzer
     analyzer = CodeGraphAnalyzer(project_name, named_vectors=args.named_vectors)
+    # v0.2.72 (P5): resolve the tri-state `.claude` gate. Explicit CLI flag
+    # wins (the launcher always passes one); a bare run falls back to
+    # root-autodetect so the orchestrator clone still indexes its own
+    # `.claude/` while user projects exclude the generated tooling.
+    analyzer.index_dot_claude = _resolve_index_dot_claude(
+        args.index_dot_claude, repo_path
+    )
 
     # Connect to Weaviate
     if not analyzer.connect():

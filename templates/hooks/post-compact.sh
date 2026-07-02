@@ -71,6 +71,22 @@ if [ -n "$SESSION_ID" ]; then
     # Legacy name (pre-v0.2.70) — wipe too for upgrade-straddling sessions.
     SEEN_FILE_LEGACY="$PROJECT_DIR/.claude/state/seen_kg_titles_${SESSION_ID}.txt"
     [ -f "$SEEN_FILE_LEGACY" ] && rm -f "$SEEN_FILE_LEGACY"
+    # v0.2.72 P6: the codegraph inject VOLUME cap counter + its one-shot
+    # cap-note sentinel. Compaction dropped the injected blocks the cap was
+    # counting, so a fresh (still-bounded) budget is correct post-compact —
+    # same reasoning as the seen_inject wipe above. MUST MATCH the
+    # seen_cginject_* names in _lib/seen-store.sh + post-compact.ps1.
+    CG_INJECT_COUNT="$PROJECT_DIR/.claude/state/seen_cginject_count_${SESSION_ID}.txt"
+    [ -f "$CG_INJECT_COUNT" ] && rm -f "$CG_INJECT_COUNT"
+    CG_INJECT_CAPNOTE="$PROJECT_DIR/.claude/state/seen_cginject_capnote_${SESSION_ID}.txt"
+    [ -f "$CG_INJECT_CAPNOTE" ] && rm -f "$CG_INJECT_CAPNOTE"
+    # v0.2.72 P6: the per-turn edit-reminder accumulator. Normally drained by
+    # the Stop hook each turn, but wipe any straggler on compact so a
+    # partial-turn list doesn't carry a pre-compaction file into the reset
+    # session. MUST MATCH edit_reminder_ in post-file-edit.{sh,ps1} +
+    # stop-codegraph-reminder.{sh,ps1} + post-compact.ps1.
+    EDIT_REMINDER_ACCUM="$PROJECT_DIR/.claude/state/edit_reminder_${SESSION_ID}.txt"
+    [ -f "$EDIT_REMINDER_ACCUM" ] && rm -f "$EDIT_REMINDER_ACCUM"
 fi
 
 # Same reasoning for pre-tool-use.sh's per-session reads file (Build Anchor

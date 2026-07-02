@@ -4654,6 +4654,40 @@ pub struct RefreshProjectEnvResult {
     pub warnings: Vec<String>,
 }
 
+/// F5 (v0.2.72): soft-fail wrapper around `refresh_project_env_with_db`
+/// for DB-write commands that mutate MCP-relevant per-project config
+/// (ACTIVE_EMBEDDING, DUAL_* flags, KG bindings, access matrices, ...).
+///
+/// The contract every such command follows: the DB write is the
+/// authoritative operation and has ALREADY committed by the time this
+/// runs; a projection hiccup must therefore surface as a warning, never
+/// as an `Err` that callers could mistake for a failed write. The
+/// re-projection rewrites `.claude/settings.json`, which the settings
+/// watcher diff-guard (`services/settings_json_watcher.rs::
+/// MCP_RELEVANT_ENV_KEYS`) hashes to decide whether a guarded MCP reload
+/// fires — re-projection + watcher IS the reload mechanism; do NOT call
+/// `reload_mcps_sighup` from command code (that's the manual-button path).
+///
+/// Never returns `Err`; a refresh failure is folded into `warnings`.
+pub fn reproject_env_soft(db: &Db, project_id: &str) -> RefreshProjectEnvResult {
+    match refresh_project_env_with_db(db, project_id) {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!(
+                "env re-projection after DB write failed for project {}: {}. \
+                 MCP-relevant env may be stale until the next refresh.",
+                project_id, e
+            );
+            eprintln!("[vct] warning: {}", msg);
+            RefreshProjectEnvResult {
+                kg_access_list: Vec::new(),
+                code_graph_access_list: Vec::new(),
+                warnings: vec![msg],
+            }
+        }
+    }
+}
+
 /// v0.2.37 (Agent V37-E, 2026-05-27): bulk refresh of `.claude/env` +
 /// `.claude/settings.json` for every project the launcher knows about.
 ///
@@ -4739,11 +4773,20 @@ pub struct RefreshAllProjectsEnvResult {
 /// "re-render env for every project" without the user having to walk
 /// project-by-project. The boot hook in lib.rs calls
 /// `refresh_all_projects_env_with_db` directly (no Tauri layer).
+///
+/// F3 (v0.2.72): the refresh runs N serial Python subprocesses (30 s cap
+/// each) — route it through spawn_blocking so it doesn't park a tokio
+/// worker for the duration.
 #[command]
 pub async fn refresh_all_projects_env(
-    db: State<'_, Db>,
+    app: tauri::AppHandle,
 ) -> Result<RefreshAllProjectsEnvResult, String> {
-    Ok(refresh_all_projects_env_with_db(&db))
+    crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "refresh_all_projects_env",
+        refresh_all_projects_env_with_db,
+    )
+    .await
 }
 
 #[command]

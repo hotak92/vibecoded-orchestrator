@@ -115,6 +115,13 @@ def _make_analyzer(analyzer_mod: types.ModuleType, project: str = "TestProject")
     inst.module_imports = {}
     inst.visited_uuids = set()
     inst._track_visited = False
+    # v0.2.72 (P5): __init__ now sets index_dot_claude; the walkers read it
+    # directly, so the __new__-based fixture must set it. True here — this
+    # file's walk test pins the ORIGINAL v0.2.16 intent: `.claude/worktrees/`
+    # is skipped EVEN when `.claude/` itself is indexed (orchestrator-root
+    # mode). The user-project False default is covered by the P5 ignore-set
+    # tests (test_codegraph_ignore_set.py).
+    inst.index_dot_claude = True
     return inst
 
 

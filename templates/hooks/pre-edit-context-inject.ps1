@@ -250,21 +250,24 @@ $IsCode = $false
 # function); fall back to the inline invocation only on a partial install.
 if ($FilePath -match '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$') {
     $IsCode = $true
+    # v0.2.72 P2: pass the edited file as -Anchor so the CLI's shared retrieval
+    # pipeline biases the rerank toward call-linked / same-module / shared-type
+    # code relative to the file being edited. MUST MATCH pre-edit-context-inject.sh.
     if (Get-Command Invoke-VcoCodegraphQueryBlock -ErrorAction SilentlyContinue) {
         $projArg = if ($CodeGraphProjectArg.Count -gt 0) { $CodeGraphProjectArg -join ' ' } else { "" }
-        $out = Invoke-VcoCodegraphQueryBlock -Query $Query -ProjectArg $projArg -Limit 2 -ExcludePath $FilePath
+        $out = Invoke-VcoCodegraphQueryBlock -Query $Query -ProjectArg $projArg -Limit 2 -ExcludePath $FilePath -Anchor $FilePath
         if ($out) { Set-Content -Path $CodeTmp.FullName -Value $out }
     } else {
         $cgQueryPs1 = Join-Path $ProjectRoot ".claude/scripts/code-graph-query.ps1"
         $cgQuerySh = Join-Path $ProjectRoot ".claude/scripts/code-graph-query"
         try {
             if (Test-Path $cgQueryPs1) {
-                $out = & $PsExe -NoProfile -File $cgQueryPs1 search $Query @CodeGraphProjectArg --limit 2 --hook-format 2>$null |
+                $out = & $PsExe -NoProfile -File $cgQueryPs1 search $Query @CodeGraphProjectArg --limit 2 --hook-format --anchor $FilePath 2>$null |
                     Where-Object { $_ -notlike "*$FilePath*" } |
                     Select-Object -First 20
                 $out | Set-Content -Path $CodeTmp.FullName
             } elseif ((Test-Path $cgQuerySh) -and (Get-Command bash -ErrorAction SilentlyContinue)) {
-                $out = & bash $cgQuerySh search $Query @CodeGraphProjectArg --limit 2 --hook-format 2>$null |
+                $out = & bash $cgQuerySh search $Query @CodeGraphProjectArg --limit 2 --hook-format --anchor $FilePath 2>$null |
                     Where-Object { $_ -notlike "*$FilePath*" } |
                     Select-Object -First 20
                 $out | Set-Content -Path $CodeTmp.FullName

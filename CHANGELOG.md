@@ -7,6 +7,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.72] - 2026-07-02
+
+### Fixed (codegraph retrieval quality — the injection-noise release)
+- **The code-graph hook/MCP no longer injects unrelated code as "context".**
+  Root cause: the per-slot score floor shipped `0.0` for the default CodeSage
+  embedder (v0.2.70 Bug-C1b parity choice) — i.e. NO filtering — so minified
+  vendor bundles and structurally-unrelated functions at distance ~0.7-0.9 were
+  served as top hits. Replaced by an experimentally-measured TWO-STAGE per-slot
+  floor (CodeSage/jina retrieval 0.16 + post-rerank 0.22; qwen3 0.20/0.30):
+  noise (~0.14) never enters the pool; near-margin candidates survive only when
+  rescued by a real code relationship. Floors are machine-global settings
+  (launcher GUI → `app_state` → env projection) with env overrides.
+- **Relationship rerank (anchor-relative, reorder-only).** Retrieval over-fetches
+  2N, boosts candidates related to the anchor (call-linked +0.05, same-file
+  +0.03, shared-type +0.02, capped 0.08), applies the post-rerank floor, then
+  trims to N. The edit/read/grep hooks pass the edited file / grepped symbol as
+  the anchor, so context injection now exploits the code graph's call/type/module
+  relations. A boost can rescue a linked near-margin result but can never
+  fabricate a match out of noise (floor applied pre-boost).
+- **CLI and MCP retrieval can no longer diverge.** Floor/rerank/collapse/tier
+  logic lives in ONE shared pipeline (`weaviate_mcp/code_ranking.py::
+  run_code_retrieval_pipeline`) + shared adapter factories; both
+  `search_code_graph` (MCP) and `query_code_graph.py` (CLI/hooks) call it with
+  identical arguments. Pinned by identity tests, static guards, and a live
+  cross-surface ranking-parity test.
+- **Over-budget functions/classes no longer lose their tails.** Entities whose
+  assembled text exceeds the embedding model's budget (~9% of functions) now
+  CHUNK via the shared model-aware Chunker (one Weaviate object per chunk,
+  `chunk_num`/`total_chunks` props) instead of hard-truncating; retrieval
+  collapses multi-chunk matches to one entry (keyed `(file_path, full_name)`)
+  and callers/cross-references resolve the canonical chunk. Stale chunk rows are
+  deleted when an entity shrinks. A revision-gated background resync (per-object
+  `embed_revision`, detached, resumable, no global timeout, defers when the
+  code-embed service is down) re-embeds affected entities after update.
+- **Score-tiered code results.** `detail="auto"` now renders by score tier
+  (summary / 1 / 3 / 7 chunks) under code-calibrated gates ({0.22/0.32/0.48/
+  0.62}, env-overridable) instead of position-based top-4-full; the tier `min`
+  derives from the live post-rerank floor so a lowered GUI floor actually
+  renders its results. Stored docstrings now surface in tier output; the CLI
+  prints summary-tier content for functions/classes (was module-only).
+- **Analyzer scope cleanup.** `.claude/` tooling is excluded from user projects'
+  code graphs (orchestrator root still indexes its own; per-project launcher
+  checkbox + tri-state CLI flag to override), `vendor/` excluded for JS/TS,
+  `.bundle.js`/`.chunk.js`/config bundles skipped, `.wt/` worktree containers
+  excluded everywhere — and the single-file (`--only-file`) hook path applies
+  the same rules. The background resync prunes ALREADY-indexed rows matching the
+  exclusion rules, so pre-existing vendor/worktree noise disappears without a
+  manual rebuild. Codegraph schema version bumped 4→5 with a data-preserving
+  additive migration edge (no drop, no forced re-embed).
+- **Hook volume controls.** Per-session code-graph injection cap (default 40,
+  `VCO_CG_INJECT_CAP`) and the per-Edit "update CONTEXT_STATE" reminder is now
+  ONE aggregated end-of-turn reminder.
+- **`layer` filter no longer silently returns nothing** on indexes where the
+  layer property is unpopulated — the search retries unfiltered and reports a
+  note instead.
+
+### Fixed (weaviate-kg MCP dying mid-session — `-32000 Connection closed`)
+- **The launcher no longer SIGHUPs live MCPs on idempotent `settings.json`
+  writes.** Since v0.2.12 the settings watcher reloaded MCPs on ANY write,
+  including byte-idempotent re-projections — killing a mid-conversation MCP
+  that Claude Code only notices on the next tool call. The watcher now keeps a
+  per-project hash of the MCP-relevant env subset and skips the reload when
+  nothing the MCPs consume changed (fail-open on first sight/unreadable files;
+  the manual "Reload MCPs" button stays unconditional). Multi-project write
+  bursts are evaluated PER PATH at fire time, so a change in one project can't
+  be masked by an unchanged later write from another.
+- **DB/hub-side config changes now reach running MCPs.** Every launcher command
+  that mutates MCP-relevant per-project config (embedding selection incl. the
+  keep-previous-model path, dual-write/RL-log flags, KG/codegraph/diagram
+  bindings and access grants, machine-global embedding + codegraph floors,
+  module-install access seeding, shared-KG collection rename) now re-projects
+  the affected projects' env — which the guarded watcher turns into exactly one
+  reload when something real changed. Refresh-all runs on the blocking pool
+  (no async-runtime stalls).
+
+### Fixed (gnome-keyring crash on project-add — "SSH Key Agent closed unexpectedly")
+- Adding a project with many `.env` keys could crash `gnome-keyring-daemon`
+  (Ubuntu 24.04 concurrency bug): `Entry::new()` is itself a D-Bus negotiation
+  and ran OUTSIDE the 150ms pacing layer, so a burst of secret ops doubled the
+  unpaced D-Bus traffic. Entry construction now happens INSIDE the same
+  paced/retried closure as the operation — every keyring D-Bus interaction is
+  rate-limited. No secrets were ever exposed; the alert was Ubuntu's crash
+  reporter mislabeling the daemon crash.
+
+### Fixed (pre-existing resolver drift)
+- `shared_kg.collection_name` override and codegraph-binding `collection_prefix`
+  are now honored consistently by all three config surfaces (Rust env writer,
+  Python projection, vct-hub resolver) — previously each surface could resolve
+  a different collection. Hub REST binding writes flag
+  `reprojection_required: true` for headless callers.
+
+### Added
+- Launcher: Codegraph retrieval-floor settings (machine-global) and per-project
+  "Index `.claude/`" toggle; four new Tauri commands.
+- `code-graph-query search --anchor <file-or-symbol>` + `--exclude-file` (the
+  hook passes both; excluded-file candidates are culled pre-ranking instead of
+  post-hoc output grepping).
+
 ## [0.2.71] - 2026-07-01
 
 ### Fixed (update reconciliation — the dead-end divergence modal)

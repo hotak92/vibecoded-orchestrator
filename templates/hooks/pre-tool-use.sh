@@ -297,12 +297,43 @@ fi
 #   $1 query        — the codegraph search query (module name / symbol)
 #   $2 exclude_path — path to grep -v out (self-reference); "" if none
 #   $3 label        — header label for the injected block
+#   $4 anchor       — optional file path / symbol forwarded as --anchor so the
+#                     CLI's shared pipeline biases the rerank toward
+#                     call-linked / same-module / shared-type code (v0.2.72 P2)
 _cg_inject() {
-    local _q="$1" _excl="$2" _label="$3"
+    local _q="$1" _excl="$2" _label="$3" _anchor="${4:-}"
     command -v codegraph_query_block >/dev/null 2>&1 || return 0
     [ -n "$_q" ] || return 0
+
+    # v0.2.72 P6: per-session inject VOLUME cap. The seen-store dedups by
+    # IDENTITY (same entity is not re-injected) but a long session navigating
+    # many DISTINCT entities still injects unboundedly. Bound the TOTAL number
+    # of EMITTED injections per session_id (VCO_CG_INJECT_CAP, default 40).
+    #
+    # Two-part contract so the cap counts REAL injections (not query attempts
+    # that dedup to nothing): (1) a read-only capped-check short-circuits BEFORE
+    # the heavier codegraph subprocess once the cap is hit — emitting a ONE-LINE
+    # note EXACTLY ONCE; (2) the counter is incremented ONLY on an actual emit
+    # (bottom of the function). Soft-fail OPEN throughout: an unkeyable session
+    # (untrustworthy id) or any counter error runs UNCAPPED — a broken cap must
+    # never break injection.
+    local _cnt=""
+    if command -v vco_cg_inject_count_path >/dev/null 2>&1; then
+        _cnt="$(vco_cg_inject_count_path "$SESSION_ID_RAW" "$PROJECT_ROOT")"
+    fi
+    if [ -n "$_cnt" ] && command -v vco_cg_inject_capped >/dev/null 2>&1 \
+        && vco_cg_inject_capped "$_cnt"; then
+        # Cap reached — stop injecting. Emit the one-line note once per session.
+        if command -v vco_cg_inject_note_once >/dev/null 2>&1 \
+            && command -v emit_additional_context >/dev/null 2>&1 \
+            && vco_cg_inject_note_once "$SESSION_ID_RAW" "$PROJECT_ROOT"; then
+            emit_additional_context "[codegraph injection cap reached for this session]" PreToolUse
+        fi
+        return 0
+    fi
+
     local _raw
-    _raw="$(codegraph_query_block "$_q" "" 2 "$_excl" 2>/dev/null || true)"
+    _raw="$(codegraph_query_block "$_q" "" 2 "$_excl" "$_anchor" 2>/dev/null || true)"
     [ -n "$_raw" ] || return 0
     local _inj="" _rd=""
     if command -v vco_seen_store_path >/dev/null 2>&1; then
@@ -316,6 +347,11 @@ _cg_inject() {
         *[![:space:]]*)
             if command -v emit_additional_context >/dev/null 2>&1; then
                 emit_additional_context "[${_label}]:"$'\n'$'\n'"$_raw" PreToolUse
+                # Count this REAL injection toward the per-session cap. Only
+                # reached on a non-empty post-dedup block that actually emits.
+                if [ -n "$_cnt" ] && command -v vco_cg_inject_record >/dev/null 2>&1; then
+                    vco_cg_inject_record "$_cnt"
+                fi
             fi
             ;;
     esac
@@ -356,7 +392,7 @@ if [[ "$TOOL_NAME" == "Read" ]]; then
         # matches the producer's repo-relative CODE: src shape.
         if [[ "$FILE_PATH" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$ ]]; then
             _RD_Q="$(basename "$FILE_PATH")"; _RD_Q="${_RD_Q%.*}"
-            _cg_inject "$_RD_Q" "$_REL_FP" "Code-graph context for $(basename "$FILE_PATH")"
+            _cg_inject "$_RD_Q" "$_REL_FP" "Code-graph context for $(basename "$FILE_PATH")" "$_REL_FP"
         fi
     fi
     exit 0
@@ -380,7 +416,7 @@ if [[ "$TOOL_NAME" == "Grep" ]]; then
             if command -v codegraph_extract_symbol >/dev/null 2>&1; then
                 _GREP_SYM="$(codegraph_extract_symbol "$GREP_PATTERN")"
             fi
-            _cg_inject "$_GREP_SYM" "" "Code-graph context for symbol: ${_GREP_SYM}"
+            _cg_inject "$_GREP_SYM" "" "Code-graph context for symbol: ${_GREP_SYM}" "$_GREP_SYM"
         fi
     fi
     exit 0

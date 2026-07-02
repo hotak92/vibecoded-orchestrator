@@ -2585,6 +2585,12 @@ pub fn run() {
             commands::codegraph::codegraph_grant_access,
             commands::codegraph::codegraph_check_access,
             commands::codegraph::codegraph_summary,
+            // v0.2.72 (P1/P5): codegraph retrieval floors (machine-global) +
+            // per-project .claude-index toggle. Registered by the integrator.
+            commands::codegraph_settings::get_codegraph_floors,
+            commands::codegraph_settings::set_codegraph_floors,
+            commands::codegraph_settings::get_project_codegraph_index_dot_claude,
+            commands::codegraph_settings::set_project_codegraph_index_dot_claude,
             // Coordination tab
             commands::coordination::coordination_get_config,
             commands::coordination::coordination_set_config,

@@ -31,16 +31,24 @@ function Get-VcoCodegraphCli {
     return ""
 }
 
-# Invoke-VcoCodegraphQueryBlock <Query> <ProjectArg> <Limit> <ExcludePath>
+# Invoke-VcoCodegraphQueryBlock <Query> <ProjectArg> <Limit> <ExcludePath> [Anchor]
 # Return the raw "CODE:"-prefixed --hook-format block(s), or "". Soft-fail to ""
 # on absent CLI / error / empty. Bounded by a 4s job timeout so a hung child
-# can't hang the hook.
+# can't hang the hook. -ExcludePath: forwarded to the CLI as `--exclude-file`
+# so candidates from that file are culled BEFORE the result trim (v0.2.72 B2 --
+# replaces the old post-hoc line-wise filter, which stripped only the CODE:
+# header line and left orphaned body lines). -Anchor (optional): edited-file
+# path or grep symbol, forwarded as `--anchor` so the CLI's shared retrieval
+# pipeline biases the rerank toward call-linked / same-module / shared-type
+# code (v0.2.72 P2). Empty -> pure semantic (MCP parity). MUST MATCH
+# codegraph-query.sh codegraph_query_block ($4 exclude_path / $5 anchor).
 function Invoke-VcoCodegraphQueryBlock {
     param(
         [string]$Query,
         [string]$ProjectArg = "",
         [int]$Limit = 2,
-        [string]$ExcludePath = ""
+        [string]$ExcludePath = "",
+        [string]$Anchor = ""
     )
     if ([string]::IsNullOrEmpty($Query)) { return "" }
     $cli = Get-VcoCodegraphCli
@@ -49,6 +57,10 @@ function Invoke-VcoCodegraphQueryBlock {
     $argList = @("search", $Query)
     if ($ProjectArg) { $argList += ($ProjectArg -split '\s+') }
     $argList += @("--limit", "$Limit", "--hook-format")
+    # B2: root-fix self-exclusion -- the CLI drops the file's candidates
+    # pre-trim. MUST MATCH codegraph-query.sh codegraph_query_block.
+    if ($ExcludePath) { $argList += @("--exclude-file", $ExcludePath) }
+    if ($Anchor) { $argList += @("--anchor", $Anchor) }
 
     $raw = ""
     try {
@@ -69,10 +81,10 @@ function Invoke-VcoCodegraphQueryBlock {
     } catch { return "" }
 
     if ([string]::IsNullOrEmpty($raw)) { return "" }
+    # Cap the volume. Self-reference exclusion happens INSIDE the CLI via
+    # --exclude-file (B2) -- the old line-wise filter here stripped only the
+    # CODE: header line and left orphaned body lines. Do not re-add it.
     $lines = $raw -split "`n"
-    if ($ExcludePath) {
-        $lines = $lines | Where-Object { $_ -notmatch [regex]::Escape($ExcludePath) }
-    }
     return (($lines | Select-Object -First 20) -join "`n")
 }
 

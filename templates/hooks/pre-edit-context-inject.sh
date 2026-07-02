@@ -335,11 +335,14 @@ if [[ "$FILE_PATH" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|
     # code-graph-query is absent. Falls back to the legacy inline call only on a
     # partial install. --hook-format gives "CODE: <full_name> | ..." headers the
     # seen-store recognises. Empty result → "CODE: no-results | ..." sentinel.
+    # v0.2.72 P2: pass the edited file as --anchor (5th arg) so the CLI's
+    # shared retrieval pipeline biases the rerank toward call-linked /
+    # same-module / shared-type code relative to the file being edited.
     if command -v codegraph_query_block >/dev/null 2>&1; then
-        ( codegraph_query_block "$QUERY" "$CODE_GRAPH_PROJECT_ARG" 2 "$FILE_PATH" > "$CODE_TMP" 2>/dev/null ) &
+        ( codegraph_query_block "$QUERY" "$CODE_GRAPH_PROJECT_ARG" 2 "$FILE_PATH" "$FILE_PATH" > "$CODE_TMP" 2>/dev/null ) &
         CODE_PID=$!
     else
-        ("$PROJECT_ROOT/.claude/scripts/code-graph-query" search "$QUERY" $CODE_GRAPH_PROJECT_ARG --limit 2 --hook-format 2>/dev/null \
+        ("$PROJECT_ROOT/.claude/scripts/code-graph-query" search "$QUERY" $CODE_GRAPH_PROJECT_ARG --limit 2 --hook-format --anchor "$FILE_PATH" 2>/dev/null \
             | grep -v "$FILE_PATH" | head -20 > "$CODE_TMP") &
         CODE_PID=$!
     fi

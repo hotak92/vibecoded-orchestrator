@@ -311,6 +311,35 @@ pub async fn delete_diagram_snapshot(
 
 // ─── Access mutations ───────────────────────────────────────────────────
 
+/// Free-function core of `diagram_grant_access` — DB write + audit + F5
+/// env re-projection, testable without a Tauri runtime.
+///
+/// F5 (v0.2.72): the `diagram_access` table resolves into the GRANTEE's
+/// `VCT_DIAGRAMS_ACCESS_LIST` env (an `MCP_RELEVANT_ENV_KEYS` member the
+/// MCP fans hybrid_search out over), so we refresh the GRANTEE's env
+/// files after the write — same shape as `codegraph_grant_access`'s
+/// P1-D refresh (the access list is keyed on grantee → which projects
+/// this grantee can read). Soft-fail: projection warnings ride in the
+/// returned result; the grant row is never rolled back.
+pub fn diagram_grant_access_with_db(
+    db: &Db,
+    grantor_id: &str,
+    grantee_id: &str,
+    level: &str,
+) -> Result<crate::commands::projects_v2::RefreshProjectEnvResult, String> {
+    db.set_diagram_access(grantor_id, grantee_id, level)?;
+    db.audit(
+        "diagram_access_grant",
+        Some(grantor_id),
+        None,
+        &serde_json::json!({
+            "grantee": grantee_id,
+            "level": level,
+        }),
+    )?;
+    Ok(crate::commands::projects_v2::reproject_env_soft(db, grantee_id))
+}
+
 #[command]
 pub async fn diagram_grant_access(
     grantor_id: String,
@@ -318,17 +347,7 @@ pub async fn diagram_grant_access(
     level: String,
     db: State<'_, Db>,
 ) -> Result<(), String> {
-    db.set_diagram_access(&grantor_id, &grantee_id, &level)?;
-    db.audit(
-        "diagram_access_grant",
-        Some(&grantor_id),
-        None,
-        &serde_json::json!({
-            "grantee": grantee_id,
-            "level": level,
-        }),
-    )?;
-    Ok(())
+    diagram_grant_access_with_db(&db, &grantor_id, &grantee_id, &level).map(|_| ())
 }
 
 // ─── Per-tool MCP grants ────────────────────────────────────────────────
@@ -1245,6 +1264,47 @@ mod tests {
         db.insert_project(id, name, folder.to_string_lossy().as_ref(), ProjectHost::Base, &slug)
             .unwrap();
         db
+    }
+
+    /// F5 (v0.2.72): `diagram_grant_access_with_db` writes the grant row
+    /// AND re-projects the GRANTEE's env (the grant lands in the grantee's
+    /// `VCT_DIAGRAMS_ACCESS_LIST`). Proof of the refresh: the returned
+    /// `RefreshProjectEnvResult` carries the KG access list only the
+    /// refresh path (populate) computes — seeded here so the value is
+    /// deterministic. The grant row must land regardless of projection
+    /// outcome (soft-fail contract).
+    #[test]
+    fn diagram_grant_access_persists_and_reprojects_grantee() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = make_db_with_project("p-grantor", "GrantorProj", dir.path());
+        let slug = db.generate_unique_slug("GranteeProj").unwrap();
+        db.insert_project(
+            "p-grantee",
+            "GranteeProj",
+            dir.path().join("grantee").to_string_lossy().as_ref(),
+            ProjectHost::Base,
+            &slug,
+        )
+        .unwrap();
+        db.kg_set_access("p-grantee", "PeerProj_KnowledgeGraph", "read")
+            .unwrap();
+
+        let result = diagram_grant_access_with_db(&db, "p-grantor", "p-grantee", "read")
+            .expect("grant must succeed");
+
+        // Grant row persisted.
+        let rows = db.list_diagram_access("p-grantor").unwrap();
+        assert!(
+            rows.iter().any(|r| r.grantee_project_id == "p-grantee"),
+            "grant row must be in diagram_access; got {:?}",
+            rows,
+        );
+        // Grantee env re-projection ran.
+        assert_eq!(
+            result.kg_access_list,
+            vec!["PeerProj".to_string()],
+            "the grant must re-project the GRANTEE's env after the write",
+        );
     }
 
     #[test]

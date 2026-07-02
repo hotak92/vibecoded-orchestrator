@@ -881,6 +881,15 @@ fn project_still_exists(app: &AppHandle, project_id: &str) -> bool {
 /// never propagated. Each transition emits a `code-graph-build-progress`
 /// event so the GUI updates live.
 ///
+// v0.2.72 (P5): the `.claude/` gate is resolved in `run_build_task` via
+// T-GUI-DB's `codegraph_settings::resolve_codegraph_index_dot_claude`
+// (explicit per-project row → host-based default). The pre-merge compile-safe
+// path-based fallback (`resolve_index_dot_claude_fallback`) was removed by the
+// integrator once T-GUI-DB's resolver became available — the resolver owns the
+// decision, so a second heuristic here would be dead code + a drift risk.
+// The Python-side default still lives in `analyze_code_graph.py`
+// (`_looks_like_orchestrator_root`) for bare-CLI runs with no DB.
+
 /// Mid-build unregister race (follow-up #11): if the user calls
 /// `delete_project_v2` while this task is in flight, the DB row vanishes
 /// and any subsequent upsert hits an FK violation that prints a
@@ -1028,6 +1037,15 @@ async fn run_build_task(
     //    (rebuild_code_graph upserts pending → spawn_initial_build),
     //    and we keep them as full passes too for now: incremental
     //    semantics depend on git state we don't necessarily have.
+    //
+    // v0.2.72 (P7): this full pass automatically RESPECTS the code-graph
+    // embedding-revision gate. The gate lives in the analyzer's single
+    // `_write_one_object` choke-point (analyze_code_graph.py), so every
+    // entity written by this rebuild is revision-checked: rows whose stored
+    // `embed_revision` != CODEGRAPH_EMBED_REVISION are FORCED to re-embed
+    // (the ~7-9% of over-budget Function/Class rows P3 chunking invalidated),
+    // while already-current rows hash-skip. No Rust-side flag is needed —
+    // keeping the gate Python-side avoids forking the logic across languages.
     let mut args: Vec<String> = vec![
         folder_path.clone(),
         "--project".to_string(),
@@ -1046,6 +1064,43 @@ async fn run_build_task(
     // boot-resume to preserve conservative semantics on those paths.
     if prune_stale {
         args.push("--prune-stale".to_string());
+    }
+
+    // v0.2.72 (P5): `.claude/` gate. For a user project `.claude/` is
+    // orchestrator-GENERATED tooling (bundled agents/skills/hooks/scripts),
+    // not first-party source; indexing it injects that tooling as retrieval
+    // "context" noise. For the orchestrator clone itself `.claude/` IS
+    // first-party source under active development, so it should be indexed.
+    //
+    // The per-project bool lives in `module_settings`
+    // (`codegraph_index_dot_claude`, default: root→true, else→false) and is
+    // resolved by T-GUI-DB's `codegraph_settings::
+    // resolve_codegraph_index_dot_claude(&db, &project_id)`.
+    //
+    // v0.2.72 integrator (T-GUI-DB merged): resolve the per-project bool from
+    // `module_settings` via T-GUI-DB's resolver. It honours a user's explicit
+    // per-project opt-in toggle AND applies the host-based default (orchestrator
+    // root → index; other projects → exclude). On any DB error we default to
+    // EXCLUDE .claude (conservative). `db` comes from `app.state::<Db>()` (this
+    // task holds only `AppHandle`).
+    let index_dot_claude = {
+        let db = app.state::<Db>();
+        crate::commands::codegraph_settings::resolve_codegraph_index_dot_claude(
+            &db, &project_id,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "[vct] warning: resolve_codegraph_index_dot_claude for {}: {} \
+                 — defaulting to exclude .claude",
+                project_id, e
+            );
+            false
+        })
+    };
+    if index_dot_claude {
+        args.push("--index-dot-claude".to_string());
+    } else {
+        args.push("--no-index-dot-claude".to_string());
     }
 
     // Resolve VCT_INSTALL_ROOT: the directory of the orchestrator

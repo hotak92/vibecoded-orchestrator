@@ -63,11 +63,13 @@ def _make_launcher_db(
     diagram_access: list[tuple[str, str]] | None = None,
     module_settings: list[tuple[str, str, str, str]] | None = None,
     app_state: dict[str, str] | None = None,
+    codegraph_binding_prefix: str | None = None,
 ) -> None:
     """Build a minimal launcher.db with the schema this module reads.
 
     Tables created: projects, project_kg_bindings, kg_collection_access,
-    codegraph_access, module_settings. Schema mirrors the migrations in
+    codegraph_access, module_settings, project_codegraph_bindings.
+    Schema mirrors the migrations in
     ``launcher/src-tauri/vct-launcher-core/src/db/migrations/`` (just
     enough columns for the resolver — not the full schema).
 
@@ -86,6 +88,10 @@ def _make_launcher_db(
             with ``value`` being a JSON string.
         extra_projects: additional (id, name, folder_path, slug) rows
             for cross-project tests (e.g. codegraph_access joins).
+        codegraph_binding_prefix: when set, insert a
+            ``project_codegraph_bindings`` row for ``project_id`` with
+            this ``collection_prefix`` (v0.2.72 R2 — CODE_GRAPH_PROJECT
+            derives binding-prefix-first).
     """
     conn = sqlite3.connect(str(db_path))
     cur = conn.cursor()
@@ -142,6 +148,12 @@ def _make_launcher_db(
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+        CREATE TABLE project_codegraph_bindings (
+            project_id TEXT PRIMARY KEY,
+            collection_prefix TEXT NOT NULL,
+            embedding_model TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1
+        );
         """
     )
     # app_state stores values verbatim (NOT JSON) — matches the Rust
@@ -189,6 +201,12 @@ def _make_launcher_db(
             "INSERT INTO module_settings (project_id, module_id, setting_key, setting_value) "
             "VALUES (?, ?, ?, ?)",
             (pid, mid, key, value),
+        )
+    if codegraph_binding_prefix is not None:
+        cur.execute(
+            "INSERT INTO project_codegraph_bindings "
+            "(project_id, collection_prefix) VALUES (?, ?)",
+            (project_id, codegraph_binding_prefix),
         )
     conn.commit()
     conn.close()
@@ -267,6 +285,134 @@ def test_from_db_with_kg_bindings(tmp_path: Path) -> None:
     # name "X" → sanitized "X"). This confirms the rule degrades
     # gracefully when bindings carry non-canonical names.
     assert env["DIAGRAMS_COLLECTION"] == "X_Diagrams"
+
+
+# ─── v0.2.72 R1 (F5 residual) — shared-KG app_state override ─────────────
+
+
+def test_shared_kg_app_state_override_wins(tmp_path: Path) -> None:
+    """A non-empty ``app_state[shared_kg.collection_name]`` (the GUI
+    SharedKgPicker override) is Priority 1 — it beats the project's own
+    ``role='shared'`` binding row, matching the Rust ``populate()`` and
+    the hub resolver. Pre-R1 this projection ignored the override
+    entirely, so the three SHARED_KG_COLLECTION resolvers disagreed
+    whenever it was set."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="x", project_name="X", project_folder=str(proj),
+        kg_bindings={"primary": "X_KnowledgeGraph", "shared": "TeamSharedKG"},
+        app_state={"shared_kg.collection_name": "TeamWide_KnowledgeGraph"},
+    )
+    env = project_env_from_db("x", db_path=db)["canonical_env"]
+    assert env["SHARED_KG_COLLECTION"] == "TeamWide_KnowledgeGraph"
+
+
+def test_shared_kg_override_beats_explicit_default_kwarg(tmp_path: Path) -> None:
+    """The override also wins over the caller-supplied
+    ``shared_kg_default`` fallback (the kwarg is a fallback for a missing
+    binding row, not a hard pin — Priority-1 semantics match populate())."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="x", project_name="X", project_folder=str(proj),
+        app_state={"shared_kg.collection_name": "TeamWide_KnowledgeGraph"},
+    )
+    env = project_env_from_db(
+        "x", db_path=db, shared_kg_default="Fallback_KnowledgeGraph",
+    )["canonical_env"]
+    assert env["SHARED_KG_COLLECTION"] == "TeamWide_KnowledgeGraph"
+
+
+def test_shared_kg_empty_override_falls_back_to_binding(tmp_path: Path) -> None:
+    """An empty / whitespace override row is ignored — the binding
+    derivation applies (own shared row here; the const default in the
+    minimal test above). Mirrors populate()'s
+    ``.filter(|s| !s.is_empty())`` semantics."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="x", project_name="X", project_folder=str(proj),
+        kg_bindings={"shared": "TeamSharedKG"},
+        app_state={"shared_kg.collection_name": "   "},
+    )
+    env = project_env_from_db("x", db_path=db)["canonical_env"]
+    assert env["SHARED_KG_COLLECTION"] == "TeamSharedKG"
+
+
+def test_shared_kg_absent_override_uses_default_derivation(tmp_path: Path) -> None:
+    """No override row + no shared binding → the pre-R1 derivation chain
+    is untouched (bundled const via the soft-fail root-binding resolver)."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="x", project_name="X", project_folder=str(proj),
+    )
+    env = project_env_from_db("x", db_path=db)["canonical_env"]
+    assert env["SHARED_KG_COLLECTION"] == "VibeCodedOrchestrator_KnowledgeGraph"
+
+
+# ─── v0.2.72 R2 (F5 residual) — CODE_GRAPH_PROJECT binding prefix ────────
+
+
+def test_code_graph_project_uses_binding_prefix_when_present(
+    tmp_path: Path,
+) -> None:
+    """CODE_GRAPH_PROJECT derives from
+    ``project_codegraph_bindings.collection_prefix`` when a binding row
+    exists — hub-consistent (the hub resolver reads the same row), so the
+    CLI/hooks (env fallback) and the MCP (hub-first) query the SAME
+    collections after a prefix rebind. Pre-R2 the projection always
+    emitted the name-derived prefix."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="x", project_name="My App",
+        project_folder=str(proj),
+        codegraph_binding_prefix="Custom_Prefix",
+    )
+    env = project_env_from_db("x", db_path=db)["canonical_env"]
+    assert env["CODE_GRAPH_PROJECT"] == "Custom_Prefix"
+    # The name-derived keys are unaffected by the codegraph binding.
+    assert env["KG_COLLECTION"] == "MyApp_KnowledgeGraph"
+
+
+def test_code_graph_project_falls_back_to_name_when_no_binding(
+    tmp_path: Path,
+) -> None:
+    """No binding row → the historical name-sanitized prefix (the
+    placeholder that applies before the first code-graph analysis)."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="x", project_name="My App",
+        project_folder=str(proj),
+    )
+    env = project_env_from_db("x", db_path=db)["canonical_env"]
+    assert env["CODE_GRAPH_PROJECT"] == "MyApp"
+
+
+def test_code_graph_project_empty_prefix_falls_back_to_name(
+    tmp_path: Path,
+) -> None:
+    """A binding row with an empty / whitespace prefix is treated as
+    absent (defensive: never emit an empty CODE_GRAPH_PROJECT)."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="x", project_name="My App",
+        project_folder=str(proj),
+        codegraph_binding_prefix="   ",
+    )
+    env = project_env_from_db("x", db_path=db)["canonical_env"]
+    assert env["CODE_GRAPH_PROJECT"] == "MyApp"
 
 
 # ─── v0.2.69 FIX 1 (Defect D add-path gap) — ACTIVE_EMBEDDING derive ──────

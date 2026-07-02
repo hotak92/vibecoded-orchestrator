@@ -224,6 +224,28 @@ pub fn populate_kg_collection_access_for_global_module(
     }
 }
 
+/// F5 (v0.2.72): after a GLOBAL module install seeds `kg_collection_access`
+/// rows (via `populate_kg_collection_access_for_global_module` above), the
+/// affected projects' `VCT_KG_ACCESS_LIST` env — an `MCP_RELEVANT_ENV_KEYS`
+/// member — is stale on disk until re-projected. This helper re-projects
+/// every project's `.claude/{settings.json,env}` so the settings watcher's
+/// diff-guard can fire the guarded MCP reload, but ONLY when the seed
+/// actually inserted rows: an idempotent re-install (0 new rows) must not
+/// spawn N projection subprocesses for nothing.
+///
+/// Returns `None` when no refresh ran (nothing inserted), `Some(report)`
+/// otherwise. Soft-fail throughout — per-project failures live inside the
+/// returned report; module install never blocks on projection hiccups.
+pub fn reproject_all_after_global_access_seed(
+    db: &Db,
+    rows_inserted: usize,
+) -> Option<crate::commands::projects_v2::RefreshAllProjectsEnvResult> {
+    if rows_inserted == 0 {
+        return None;
+    }
+    Some(crate::commands::projects_v2::refresh_all_projects_env_with_db(db))
+}
+
 // ─── Agents ────────────────────────────────────────────────────────────
 
 /// File-stem names (lowercased, no extension) that are NEVER agents and
@@ -2537,6 +2559,38 @@ mod tests {
 
         assert_eq!(report.kg_access_rows_inserted, 0);
         assert!(report.warnings.is_empty());
+    }
+
+    /// F5 (v0.2.72): the post-seed env re-projection runs IFF the seed
+    /// inserted rows. Zero-insert (idempotent re-install) must stay
+    /// subprocess-free (`None`); a real insert must return the
+    /// refresh-all report proving the projects were iterated (a
+    /// missing-folder project lands in `skipped` — a value only the
+    /// refresh path computes).
+    #[test]
+    fn reproject_after_global_seed_gates_on_rows_inserted() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        db.insert_project(
+            "p-f5-seed",
+            "F5Seed",
+            "/nonexistent/f5-seed",
+            ProjectHost::Base,
+            "f5seed",
+        )
+        .unwrap();
+
+        assert!(
+            reproject_all_after_global_access_seed(&db, 0).is_none(),
+            "idempotent re-install (0 rows) must not refresh anything",
+        );
+
+        let report = reproject_all_after_global_access_seed(&db, 1)
+            .expect("inserted rows must trigger the refresh-all");
+        assert!(
+            report.skipped.contains(&"F5Seed".to_string()),
+            "refresh-all must have iterated registered projects; got {:?}",
+            report,
+        );
     }
 
     #[test]

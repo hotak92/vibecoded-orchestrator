@@ -184,9 +184,22 @@ impl<'a> SecretScope<'a> {
     }
 }
 
-fn entry(scope: SecretScope<'_>, module_id: &str, key: &str) -> Result<Entry, String> {
+/// Construct a keychain [`Entry`], returning the raw `keyring::Result` so
+/// the caller can drive it through `retry_with_backoff` alongside the op.
+///
+/// v0.2.72 (P9): `Entry::new` is itself a D-Bus Secret-Service negotiation
+/// on Linux (`sync-secret-service`). Constructing it OUTSIDE the pacing
+/// layer meant a burst of N secret ops fired N unpaced D-Bus calls, which
+/// crashed gnome-keyring 46.1 on Ubuntu 24.04 under concurrency (SIGTRAP,
+/// apport-mislabelled "SSH Key Agent closed unexpectedly"). NOT a leak —
+/// VCO's retry recovered, but the crash still popped a dialog. So the hot
+/// `set`/`get`/`delete` paths now build the entry INSIDE their
+/// `retry_with_backoff` closure, routing construction through the same
+/// `paced_call` (150ms process-wide spacing) + progressive backoff as the
+/// operation. This helper is the shared construction seam.
+fn entry_result(scope: SecretScope<'_>, module_id: &str, key: &str) -> keyring::Result<Entry> {
     let service = scope.service_name(module_id);
-    Entry::new(&service, key).map_err(|e| format!("keyring entry for {}/{}: {}", service, key, e))
+    Entry::new(&service, key)
 }
 
 /// 0.1.7 H1 (2026-05-08): retry on transient daemon-hiccup errors.
@@ -343,9 +356,13 @@ pub fn set(
     if let Some(result) = for_tests::mock_set(scope, module_id, key, value) {
         return result;
     }
-    let e = entry(scope, module_id, key)?;
-    retry_with_backoff(|| e.set_password(value))
-        .map_err(|err| format!("keyring set: {}", err))?;
+    // v0.2.72 (P9): build the Entry INSIDE the closure so `Entry::new`'s
+    // D-Bus construction shares the same paced_call + backoff as the op.
+    retry_with_backoff(|| {
+        let e = entry_result(scope, module_id, key)?;
+        e.set_password(value)
+    })
+    .map_err(|err| format!("keyring set: {}", err))?;
     Ok(())
 }
 
@@ -358,8 +375,12 @@ pub fn get(
     if let Some(result) = for_tests::mock_get(scope, module_id, key) {
         return result;
     }
-    let e = entry(scope, module_id, key)?;
-    match retry_with_backoff(|| e.get_password()) {
+    // v0.2.72 (P9): build the Entry INSIDE the closure so `Entry::new`'s
+    // D-Bus construction shares the same paced_call + backoff as the op.
+    match retry_with_backoff(|| {
+        let e = entry_result(scope, module_id, key)?;
+        e.get_password()
+    }) {
         Ok(v) => Ok(Some(v)),
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(err) => Err(format!("keyring get: {}", err)),
@@ -383,8 +404,12 @@ pub fn delete(
     if for_tests::mock_delete(scope, module_id, key) {
         return Ok(());
     }
-    let e = entry(scope, module_id, key)?;
-    match retry_with_backoff(|| e.delete_credential()) {
+    // v0.2.72 (P9): build the Entry INSIDE the closure so `Entry::new`'s
+    // D-Bus construction shares the same paced_call + backoff as the op.
+    match retry_with_backoff(|| {
+        let e = entry_result(scope, module_id, key)?;
+        e.delete_credential()
+    }) {
         Ok(()) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()), // already gone — treat as success
         Err(err) => Err(format!("keyring delete: {}", err)),
@@ -1305,6 +1330,186 @@ mod tests {
         assert!(
             get(scope, "mod", "fail_key").unwrap().is_none(),
             "failed write must not leave a stale entry"
+        );
+    }
+
+    // ─── P9: Entry::new() D-Bus construction is paced (v0.2.72) ───────────
+    //
+    // Before P9, `set`/`get`/`delete` did `let e = entry(...)?;` OUTSIDE
+    // the pacing layer, then only paced the op. A burst of N ops fired N
+    // UNPACED `Entry::new()` D-Bus calls → crashed gnome-keyring 46.1 on
+    // Ubuntu 24.04. The fix builds the Entry INSIDE the `retry_with_backoff`
+    // closure so construction AND op share one `paced_call`. The real
+    // keychain can't be hit deterministically in unit tests, so these pin
+    // the STRUCTURAL property via a counting seam that mirrors the
+    // production hot-path shape (construct-then-op inside the paced
+    // closure), matching the pattern of `retry_with_backoff_caps_at_*`.
+
+    /// A burst of N hot-path calls (each = construct-then-op inside ONE
+    /// paced closure) incurs exactly N `paced_call` gates, and the
+    /// min-spacing contract holds across the construction+op pair. If
+    /// construction were unpaced (pre-P9), the wall-clock floor below
+    /// could be met with fewer gates; here we prove every closure
+    /// invocation — which now wraps BOTH the D-Bus construction and the
+    /// op — pays the spacing.
+    #[test]
+    fn p9_burst_paces_construction_and_op_together() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let spacing = std::time::Duration::from_millis(20);
+        let _g = TestSpacingGuard::new(spacing);
+
+        // Model the post-P9 hot-path closure: construction (a D-Bus call)
+        // followed by the op (a second D-Bus call), BOTH inside the single
+        // closure that `retry_with_backoff` drives through `paced_call`.
+        let construct_calls = std::cell::Cell::new(0usize);
+        let op_calls = std::cell::Cell::new(0usize);
+        let hot_path = || -> keyring::Result<()> {
+            // construction seam (stands in for `entry_result(...)?`)
+            construct_calls.set(construct_calls.get() + 1);
+            // op seam (stands in for e.set_password / get_password / …)
+            op_calls.set(op_calls.get() + 1);
+            Ok(())
+        };
+
+        // Establish the pacing baseline, then time a burst of 4.
+        let n = 4usize;
+        paced_call(|| 0); // burn first slot so the first timed call pays spacing
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            retry_with_backoff(hot_path).unwrap();
+        }
+        let elapsed = start.elapsed();
+
+        // Construction and op are invoked once per successful call, in
+        // lock-step — proving they live inside the SAME closure (if
+        // construction had stayed outside, op_calls could diverge under
+        // retry).
+        assert_eq!(construct_calls.get(), n, "one construction per call");
+        assert_eq!(op_calls.get(), n, "one op per call");
+        assert_eq!(
+            construct_calls.get(),
+            op_calls.get(),
+            "construction and op must be paced together (same closure)"
+        );
+
+        // N paced closure invocations after the burned baseline means at
+        // least N spacing gaps of `spacing` each. Allow 5ms/gate jitter
+        // slack on slow CI.
+        let min_expected = spacing
+            .checked_mul(n as u32)
+            .unwrap()
+            .saturating_sub(std::time::Duration::from_millis(5 * n as u64));
+        assert!(
+            elapsed >= min_expected,
+            "burst of {} paced closures must take ≥{:?}; got {:?}",
+            n,
+            min_expected,
+            elapsed
+        );
+    }
+
+    /// A construction error inside the hot-path closure is a retryable
+    /// `keyring::Error` — the `?` on `entry_result(...)?` propagates it as
+    /// the closure's return, so a TRANSIENT construction failure (the
+    /// D-Bus negotiation hiccuping mid-respawn) rides the same backoff as
+    /// a transient op failure. Pins that the closure signature
+    /// (`FnMut() -> keyring::Result<T>`) carries construction errors and
+    /// that `Entry::new`-shaped `PlatformFailure` is retried, not dropped.
+    #[test]
+    fn p9_transient_construction_error_is_retried() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _g = TestSpacingGuard::new(std::time::Duration::from_millis(0));
+
+        let mut attempts = 0;
+        // Mirror the hot path: the construction step fails transiently on
+        // the first attempt (as `entry_result(...)?` would), succeeds
+        // after, then the op runs.
+        let result: keyring::Result<&'static str> = retry_with_backoff(|| {
+            attempts += 1;
+            if attempts == 1 {
+                // construction hiccup — same class gnome-keyring returns
+                let boxed: Box<dyn std::error::Error + Send + Sync> =
+                    "Entry::new D-Bus negotiation hiccup".into();
+                return Err(keyring::Error::PlatformFailure(boxed));
+            }
+            // construction succeeded → op runs
+            Ok("stored")
+        });
+
+        assert_eq!(result.unwrap(), "stored");
+        assert_eq!(
+            attempts, 2,
+            "transient construction error must be retried, then op runs"
+        );
+    }
+
+    /// A PERMANENT construction error (e.g. `Invalid` service name) takes
+    /// exactly one attempt — it is not retried, matching how a permanent
+    /// op error behaves. Pins that routing construction through the retry
+    /// layer does NOT accidentally start retrying permanent shape errors.
+    #[test]
+    fn p9_permanent_construction_error_not_retried() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _g = TestSpacingGuard::new(std::time::Duration::from_millis(0));
+
+        let mut attempts = 0;
+        let result: keyring::Result<()> = retry_with_backoff(|| {
+            attempts += 1;
+            Err(keyring::Error::Invalid(
+                "service".into(),
+                "empty".into(),
+            ))
+        });
+
+        assert!(matches!(result, Err(keyring::Error::Invalid(_, _))));
+        assert_eq!(attempts, 1, "permanent construction error must not retry");
+    }
+
+    /// P9 STRUCTURAL GUARD (v0.2.72 pre-gate audit F4). The three pacing
+    /// tests above drive `retry_with_backoff` with STAND-IN closures, so
+    /// reverting the P9 fix in the production fns (hoisting the Entry
+    /// construction back OUT of the retried closure) would keep them
+    /// green. This test pins the SHIPPED source shape instead: every
+    /// Entry-construction call site in this file must appear as the first
+    /// statement inside a `retry_with_backoff` closure, one per hot-path
+    /// fn (`set` / `get` / `delete`).
+    ///
+    /// Whitespace is stripped before matching so rustfmt reflows can't
+    /// break the needles; the needles are assembled from SPLIT string
+    /// literals so this test's own source (also part of secrets.rs) can
+    /// never match them. If you rename the closure binding (`e`) or the
+    /// construction helper, update the needles — the invariant being
+    /// pinned is "construction lives INSIDE the paced+retried closure",
+    /// not the exact spelling.
+    #[test]
+    fn p9_source_shape_entry_construction_inside_retried_closure() {
+        let src = include_str!("secrets.rs");
+        let flat: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+
+        // Any construction call site, paced or not.
+        let construction_needle =
+            String::from("entry_result(scope,") + "module_id,key)";
+        // `retry_with_backoff(|| { let e = <construct>(scope, module_id, key)?;`
+        // — composed from the SAME split parts so neither needle appears
+        // contiguously anywhere in this test's own source.
+        let paced_needle =
+            String::from("retry_with_backoff(||{lete=") + &construction_needle + "?;";
+
+        let paced = flat.matches(paced_needle.as_str()).count();
+        assert_eq!(
+            paced, 3,
+            "set/get/delete must each construct the keyring Entry INSIDE \
+             the retry_with_backoff closure (found {paced} paced \
+             construction sites, expected 3)"
+        );
+
+        let total = flat.matches(construction_needle.as_str()).count();
+        assert_eq!(
+            total, paced,
+            "every Entry-construction call site must live inside a \
+             retry_with_backoff closure — an unpaced `Entry::new` burst is \
+             the exact gnome-keyring crash P9 fixed (found {total} \
+             construction sites, {paced} of them paced)"
         );
     }
 }

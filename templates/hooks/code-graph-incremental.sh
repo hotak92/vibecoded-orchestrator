@@ -338,6 +338,45 @@ if [ -z "$PYTHON" ] || [ ! -f "$ANALYZER" ]; then
     exit 0
 fi
 
+# ── v0.2.72 (P5): resolve the `.claude/` gate ──────────────────────────────
+# For a user project `.claude/` is orchestrator-GENERATED tooling (noise);
+# for the orchestrator clone it's first-party source. Resolution order:
+#   1. hub resolver field `code_graph_index_dot_claude` (per-project bool,
+#      written by T-GUI-DB) — authoritative when the launcher is running.
+#   2. root-detection fallback (hub down / pre-T-GUI-DB hub): index only
+#      when $_CANON_ROOT looks like the orchestrator clone (has vco_lib/ +
+#      .claude/). CONSERVATIVE-DEFAULT: soft-fail to EXCLUDE (--no-index-
+#      dot-claude) so a user project never re-injects generated tooling.
+# MUST MATCH templates/hooks/code-graph-incremental.ps1 :: Resolve-IndexDotClaude
+# and analyze_code_graph.py :: _looks_like_orchestrator_root (cross-language).
+_resolve_index_dot_claude() {
+    # Args: <root>. Echoes "1" (index) or "0" (exclude).
+    local _root="$1"
+    local _val=""
+    local _resolver="$_root/.claude/scripts/vct_project_config.sh"
+    if [ -x "$_resolver" ]; then
+        _val=$(
+            "$_resolver" "$_root" --field code_graph_index_dot_claude 2>/dev/null
+        ) || _val=""
+    fi
+    case "$_val" in
+        true|True|TRUE|1)  printf '1\n'; return 0 ;;
+        false|False|FALSE|0) printf '0\n'; return 0 ;;
+    esac
+    # Field absent (hub down / old hub) → root-detection fallback.
+    if [ -d "$_root/vco_lib" ] && [ -d "$_root/.claude" ]; then
+        printf '1\n'
+    else
+        printf '0\n'
+    fi
+}
+_INDEX_DOT_CLAUDE="$(_resolve_index_dot_claude "$_CANON_ROOT")"
+if [ "$_INDEX_DOT_CLAUDE" = "1" ]; then
+    _DOT_CLAUDE_FLAG="--index-dot-claude"
+else
+    _DOT_CLAUDE_FLAG="--no-index-dot-claude"
+fi
+
 # Run single-file analysis in background (no internal debounce — the
 # per-file coalescing is handled by post-file-edit.sh's debounce layer).
 # --cfg/--pdg default to ON inside analyze_code_graph.py when joern is
@@ -361,6 +400,15 @@ fi
 # (`_get_existing_module`, keyed on path+hash) and per-object
 # (`_dedup_insert` content_hash) skip paths, so an unchanged or trivially-
 # edited file writes ~0 objects — "just the hashes" make it a near-no-op.
+#
+# v0.2.72 (P7): the per-object skip also honors the embedding-revision gate.
+# When an edited file contains a Function/Class whose stored `embed_revision`
+# is behind CODEGRAPH_EMBED_REVISION (a row still embedded under the pre-P3
+# pre-chunking scheme), the analyzer FORCES its re-embed even if the body is
+# byte-identical — so a revision mismatch counts as "stale" here and the
+# edited file's stale rows self-heal on this incremental run. Whole-project
+# stale rows in unedited files are re-embedded by the background resync
+# (install.py --update → vco_lib.codegraph_resync), not per-edit.
 # No repo-wide prune happens (single-file mode never deletes other files'
 # rows), so this also can't re-introduce the V52-O.7 prune-deletes-other-
 # rows regression.
@@ -371,6 +419,7 @@ fi
         --project "$PROJECT_NAME" \
         --only-file "$EDITED_FILE" \
         --canonical-source "$_CANON_ROOT" \
+        "$_DOT_CLAUDE_FLAG" \
         2>&1 | tail -5
 ) &
 
