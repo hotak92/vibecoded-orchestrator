@@ -51,6 +51,7 @@ re-run + doc update re-opens the cross-scale-floor bug.
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Callable, Mapping, Optional
 
@@ -150,7 +151,16 @@ def resolve_retrieval_floor(
     The deprecated ``VCO_CODE_GRAPH_SCORE_FLOOR`` alias does NOT affect the
     retrieval floor — it was historically a single post-boost gate, so it maps
     only to the post-rerank floor (see :func:`resolve_post_rerank_floor`).
+
+    ``env=None`` (the default) reads the PROCESS environment — that is how the
+    launcher-projected ``VCO_CODE_GRAPH_RETRIEVAL_FLOOR`` (GUI → app_state →
+    config_projection → settings.json env → subprocess env) reaches the search
+    path on BOTH surfaces (MCP + CLI) without every call site having to
+    remember to pass ``os.environ``. Pass an explicit mapping (e.g. ``{}``)
+    to isolate from the process env in tests.
     """
+    if env is None:
+        env = os.environ
     override = _coerce_env_float(env, _ENV_RETRIEVAL_FLOOR)
     if override is not None:
         return override
@@ -173,7 +183,14 @@ def resolve_post_rerank_floor(
 
     Empty-string / unparseable overrides fall through to the default (v0.2.27
     coercion discipline).
+
+    ``env=None`` (the default) reads the PROCESS environment — same rationale
+    as :func:`resolve_retrieval_floor`: the launcher-projected override must
+    reach the search path on both surfaces without call sites passing
+    ``os.environ`` by hand. Pass ``{}`` to isolate in tests.
     """
+    if env is None:
+        env = os.environ
     override = _coerce_env_float(env, _ENV_POST_RERANK_FLOOR)
     if override is not None:
         return override

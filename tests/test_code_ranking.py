@@ -11,7 +11,14 @@ plain dicts. Env is injected as a Mapping so overrides are pinned per-test.
 
 from __future__ import annotations
 
-from weaviate_mcp.code_ranking import (
+import sys
+from pathlib import Path
+
+# Resolve weaviate_mcp from THIS repo (ahead of any pip-editable install that
+# may point at a different clone) — same shim as the sibling codegraph tests.
+sys.path.insert(0, str(Path(__file__).parent.parent / "claude_mcp_servers"))
+
+from weaviate_mcp.code_ranking import (  # noqa: E402
     BOOST_CALL_LINKED,
     BOOST_SAME_FILE,
     BOOST_SHARED_TYPE,
@@ -43,14 +50,32 @@ def _cand(score, *, full_name="", file_path="", call_names=None, type_uses=None,
 
 # ─── P1: resolve_retrieval_floor ─────────────────────────────────────────────
 def test_retrieval_floor_per_slot_defaults():
-    assert resolve_retrieval_floor("codesage_embed") == 0.16
-    assert resolve_retrieval_floor("jina_embed") == 0.16
-    assert resolve_retrieval_floor("qwen3_embed") == 0.20
+    # env={} isolates from the process env (env=None reads os.environ — see
+    # test_env_none_reads_process_environ below).
+    assert resolve_retrieval_floor("codesage_embed", {}) == 0.16
+    assert resolve_retrieval_floor("jina_embed", {}) == 0.16
+    assert resolve_retrieval_floor("qwen3_embed", {}) == 0.20
 
 
 def test_retrieval_floor_unknown_slot_falls_back():
     # Unknown slot → default pair (mirrors the shipped codesage default).
-    assert resolve_retrieval_floor("mystery_embed") == 0.16
+    assert resolve_retrieval_floor("mystery_embed", {}) == 0.16
+
+
+def test_env_none_reads_process_environ(monkeypatch):
+    """env=None (the default at BOTH the MCP and CLI call sites) must read the
+    PROCESS environment — this is how the launcher-projected
+    VCO_CODE_GRAPH_* overrides (GUI → app_state → config_projection →
+    settings.json env → subprocess env) actually reach the search path.
+    Regression guard: pre-fix, env=None silently ignored the override and the
+    GUI floor settings were inert."""
+    monkeypatch.setenv("VCO_CODE_GRAPH_RETRIEVAL_FLOOR", "0.31")
+    monkeypatch.setenv("VCO_CODE_GRAPH_POST_RERANK_FLOOR", "0.44")
+    assert resolve_retrieval_floor("codesage_embed") == 0.31
+    assert resolve_post_rerank_floor("codesage_embed") == 0.44
+    # And explicit {} still isolates (defaults, ignoring the process env).
+    assert resolve_retrieval_floor("codesage_embed", {}) == 0.16
+    assert resolve_post_rerank_floor("codesage_embed", {}) == 0.22
 
 
 def test_retrieval_floor_env_override_wins():
@@ -73,9 +98,10 @@ def test_retrieval_floor_unparseable_falls_through():
 
 # ─── P1: resolve_post_rerank_floor ───────────────────────────────────────────
 def test_post_rerank_floor_per_slot_defaults():
-    assert resolve_post_rerank_floor("codesage_embed") == 0.22
-    assert resolve_post_rerank_floor("jina_embed") == 0.22
-    assert resolve_post_rerank_floor("qwen3_embed") == 0.30
+    # env={} isolates from the process env (env=None reads os.environ).
+    assert resolve_post_rerank_floor("codesage_embed", {}) == 0.22
+    assert resolve_post_rerank_floor("jina_embed", {}) == 0.22
+    assert resolve_post_rerank_floor("qwen3_embed", {}) == 0.30
 
 
 def test_post_rerank_floor_env_override_wins():
