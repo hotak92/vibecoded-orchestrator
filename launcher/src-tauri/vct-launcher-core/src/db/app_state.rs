@@ -156,8 +156,8 @@ impl Db {
     // parsed back on read; a missing row or a parse failure falls through to
     // the compiled-in default (soft-fail — a bad row must never crash an env
     // render). The Python side (`config_projection.py`, owned by T-FLOOR)
-    // projects these into `CODEGRAPH_RETRIEVAL_FLOOR` /
-    // `CODEGRAPH_POST_RERANK_FLOOR` env vars that the analyzer / MCP consume.
+    // projects these into `VCO_CODE_GRAPH_RETRIEVAL_FLOOR` /
+    // `VCO_CODE_GRAPH_POST_RERANK_FLOOR` env vars that the analyzer / MCP consume.
 
     /// Read the machine-global two-stage retrieval floor (pre-rerank seed
     /// cutoff). Returns [`DEFAULT_CODEGRAPH_RETRIEVAL_FLOOR`] when the row is
@@ -206,11 +206,11 @@ impl Db {
 }
 
 /// `app_state` key for the machine-global two-stage retrieval floor (v0.2.72
-/// P1). Consumed via the projected `CODEGRAPH_RETRIEVAL_FLOOR` env.
+/// P1). Consumed via the projected `VCO_CODE_GRAPH_RETRIEVAL_FLOOR` env.
 pub const CODEGRAPH_RETRIEVAL_FLOOR_KEY: &str = "codegraph.retrieval_floor";
 
 /// `app_state` key for the machine-global post-rerank floor (v0.2.72 P1).
-/// Consumed via the projected `CODEGRAPH_POST_RERANK_FLOOR` env.
+/// Consumed via the projected `VCO_CODE_GRAPH_POST_RERANK_FLOOR` env.
 pub const CODEGRAPH_POST_RERANK_FLOOR_KEY: &str = "codegraph.post_rerank_floor";
 
 /// Default two-stage retrieval floor. MUST match the Python-side default in

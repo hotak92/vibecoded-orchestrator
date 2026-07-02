@@ -95,6 +95,22 @@ try:
 except ImportError:
     from chunking import Chunker  # noqa: E402 — server.py run directly via python
 
+# v0.2.72 (P1/P2 integration): the SHARED code-retrieval pipeline. Both this
+# MCP (`search_code_graph`) and the CLI (`query_code_graph.py::search_by_concept`)
+# call `run_code_retrieval_pipeline` so floor/rerank/collapse/tier can't diverge.
+try:
+    from .code_ranking import (
+        run_code_retrieval_pipeline,
+        resolve_retrieval_floor,
+        resolve_post_rerank_floor,
+    )
+except ImportError:
+    from code_ranking import (  # noqa: E402 — server.py run directly via python
+        run_code_retrieval_pipeline,
+        resolve_retrieval_floor,
+        resolve_post_rerank_floor,
+    )
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -1512,6 +1528,102 @@ def _format_code_result_by_tier(
     out[body_field] = assembled or matched_body
     out["chunks_shown"] = len(chunks)
     return out
+
+
+# ---------------------------------------------------------------------------
+# SHARED code-retrieval-pipeline adapters (v0.2.72 integration, review SEV-1).
+#
+# `weaviate_mcp.code_ranking.run_code_retrieval_pipeline` operates on the
+# NORMALISED candidate shape `{"_c": base, "_s": semantic, "_p": props, ...}`
+# and, after reranking, stamps `_rerank`/`_boost`. Its `collapse_fn`/`tier_fn`
+# injection points receive those candidate dicts. But the generalized
+# `_collapse_to_one_per_node` / `_allocate_tier_within_budget` helpers above
+# read FLAT dicts (`file_path`/`full_name`/`combined_score`/`chunk_num` at top
+# level). These two factories are the ADAPTER: they flatten `_p` → top-level +
+# map `_rerank` → the collapse's `score_field`, so the pure pipeline composes
+# with the server-side helpers WITHOUT `code_ranking.py` importing `server`.
+#
+# BOTH `search_code_graph` (MCP) AND `query_code_graph.py::search_by_concept`
+# (CLI/hook) build their pipeline collapse_fn/tier_fn from THESE factories, so
+# the two surfaces cannot diverge on collapse/tier behaviour (the hard
+# invariant). Do NOT reimplement per-surface.
+# ---------------------------------------------------------------------------
+
+
+def make_code_collapse_fn(*, dedup_kind: str = "code"):
+    """Return a `collapse_fn(rows) -> rows` for `run_code_retrieval_pipeline`.
+
+    Collapses multi-chunk matches of one code entity into a single entry,
+    keyed on ``(file_path, full_name)`` — reading those from each candidate's
+    ``_p`` props, and ranking survivors by the pipeline's ``_rerank`` (the
+    boosted score) so the P2 relationship boost drives which chunk wins.
+    Preserves ``_s``/``_p``/``_rerank``/``_boost`` on every kept row so the
+    downstream tier-formatter still finds the props.
+    """
+    def collapse_fn(rows: list[dict]) -> list[dict]:
+        flat: list[dict] = []
+        for r in rows:
+            p = r.get("_p") or {}
+            flat.append({
+                **r,  # preserve _s / _p / _rerank / _boost / _c / _d
+                "file_path": p.get("file_path") or "",
+                "full_name": p.get("full_name") or "",
+                "chunk_num": p.get("chunk_num"),
+                # collapse ranks on THIS field → use the boosted score so P2
+                # ordering (not raw semantic) decides the surviving chunk.
+                "combined_score": r.get("_rerank", r.get("_s", 0.0)),
+            })
+        collapsed = _collapse_to_one_per_node(
+            flat,
+            score_field="combined_score",
+            key_fields=("file_path", "full_name"),
+            chunk_field="chunk_num",
+            dedup_kind=dedup_kind,
+        )
+        # _collapse_to_one_per_node re-sorts by score_field desc; that field is
+        # `_rerank` (mapped above), so the pipeline's reranked order is kept.
+        return collapsed
+    return collapse_fn
+
+
+def make_code_tier_fn(
+    remaining_budget: int = _HYBRID_CHUNK_BUDGET,
+    thresholds: dict[str, float] | None = None,
+):
+    """Return a `tier_fn(rows) -> rows` for `run_code_retrieval_pipeline`.
+
+    Annotates each row with a ``_tier`` (summary/single_chunk/three_chunks/full
+    or ``discard``) via the shared budget allocator, using the CODE-calibrated
+    ``thresholds`` (``_CODE_TIER_THRESHOLDS`` when ``None``) so good code matches
+    at 0.22–0.42 aren't discarded by the KG 0.42 gate. Same length + order as
+    the input (the pipeline's contract); the caller's format loop reads
+    ``_tier`` and calls ``_format_code_result_by_tier``. ``discard`` rows are
+    dropped (they never render).
+    """
+    if thresholds is None:
+        thresholds = _CODE_TIER_THRESHOLDS
+
+    def tier_fn(rows: list[dict]) -> list[dict]:
+        budget = remaining_budget
+        kept: list[dict] = []
+        for r in rows:
+            score = float(r.get("_rerank", r.get("_s", 0.0)))
+            p = r.get("_p") or {}
+            try:
+                total = int(p.get("total_chunks") or 1)
+            except (TypeError, ValueError):
+                total = 1
+            tier, cost = _allocate_tier_within_budget(
+                score, total_chunks=total, remaining_budget=budget,
+                thresholds=thresholds,
+            )
+            if tier == "discard":
+                continue
+            r["_tier"] = tier
+            budget -= cost
+            kept.append(r)
+        return kept
+    return tier_fn
 
 
 def _strip_chunk_header_text(text: str) -> str:
@@ -7727,13 +7839,17 @@ async def search_code_graph(
         client = get_weaviate_client()
 
         # Gather candidates from each collection
+        # v0.2.72 (P1/P2): over-fetch 2N per collection so the shared
+        # `run_code_retrieval_pipeline` has a pool to floor-cull + rerank +
+        # collapse before trimming to `limit`. Matches the CLI over-fetch.
+        _fetch_limit = max(1, 2 * limit)
         candidates: list[dict] = []
         for coll_name in collections:
             try:
                 coll = client.collections.get(coll_name)
                 kwargs: dict = dict(
                     near_vector=query_embedding,
-                    limit=limit,
+                    limit=_fetch_limit,
                     return_metadata=MetadataQuery(distance=True, score=True),
                 )
                 # v0.2.18: target the slot matching the active code
@@ -7771,15 +7887,46 @@ async def search_code_graph(
             except Exception as e:
                 logger.warning(f"search_code_graph: {coll_name} failed: {e}")
 
-        # Sort by score, take top `limit`
-        candidates.sort(key=lambda x: x["_s"], reverse=True)
-        candidates = candidates[:limit]
+        # v0.2.72 (P1/P2/P3/P4): run the SHARED pipeline — two-stage per-slot
+        # floor (retrieval 0.16 / post-rerank 0.22 for CodeSage) + relationship
+        # rerank + multi-chunk collapse + score-tier allocation — then trim to
+        # `limit`. This is the SAME `run_code_retrieval_pipeline` the CLI
+        # (query_code_graph.py) calls with the SAME adapters, so the MCP and
+        # hook paths cannot diverge (the hard invariant). anchor_props=None
+        # here: a direct MCP call has no edit/grep anchor, so the relationship
+        # boost degrades to none → pure semantic order.
+        #
+        # Every entity is on the P7-resynced data model (chunk_num /
+        # total_chunks / embed_revision), so we render via the NEW score-tier
+        # path (`_format_code_result_by_tier`), NOT the legacy rank-based one:
+        # tier_fn annotates each survivor with `_tier` under the code-calibrated
+        # gate (min 0.22), and the format loop below assembles 1/3/7 chunks by
+        # tier. In "auto" detail the tier_fn drives verbosity; explicit
+        # "titles"/"full" still override per-result below.
+        try:
+            _svc = _get_embedding_service() if DUAL_EMBEDDING_ENABLED else None
+            _slot = _svc.code_vector_slot if _svc is not None else "codesage_embed"
+        except Exception:
+            _slot = "codesage_embed"
 
-        # Normalize detail before tier selection. The shared formatter
-        # tolerates unknown values but normalising here keeps the surface
-        # detail matching the input back in the JSON envelope below.
+        # Normalize detail before tier selection.
         if detail not in ("auto", "titles", "full"):
             detail = "auto"
+
+        # Score-tier allocation only runs in "auto" mode; explicit detail values
+        # want uniform output, so we skip the budget allocator and let the
+        # format loop honour `detail` directly (tier_fn=None → no `_tier` set).
+        _tier_fn = make_code_tier_fn() if detail == "auto" else None
+        candidates = run_code_retrieval_pipeline(
+            candidates,
+            retrieval_floor=resolve_retrieval_floor(_slot),
+            post_rerank_floor=resolve_post_rerank_floor(_slot),
+            anchor_props=None,
+            limit=limit,
+            collapse_fn=make_code_collapse_fn(),
+            tier_fn=_tier_fn,
+            key_fields=("file_path", "full_name"),
+        )
 
         def _fetch_file_siblings(file_path: str, hit_start_line: int, max_total: int, exclude_full_name: str) -> list[dict]:
             """Fetch up to (max_total - 1) siblings in the same source file,
@@ -7833,21 +7980,71 @@ async def search_code_graph(
                 siblings.append(ref)
             return siblings
 
-        # Render each candidate via the shared rank-tier formatter so
-        # the MCP path and the CLI / pre-edit hook path emit identically
-        # shaped results. The formatter handles tier selection, content
-        # truncation, and (for top-2) sibling enrichment via the
-        # closure above.
+        def _fetch_code_chunks(full_name: str, hit_chunk: int, total: int, max_chunks: int) -> list[dict]:
+            """Fetch up to `max_chunks` property-dicts for one code entity's
+            chunks (matched + neighbours), ordered by chunk_num, centred on
+            `hit_chunk`. Keyed on `full_name` (code's node identity) — the
+            code analogue of `_fetch_node_chunks` (which keys on `title`).
+            Returns [] on any failure or for a single-chunk entity.
+
+            Closes over `client` + `_project_collection`; passed to
+            `_format_code_result_by_tier` as `chunk_fetcher` so the helper
+            stays Weaviate-agnostic. Searches CodeFunction + CodeClass (the
+            only chunked code collections).
+            """
+            if not full_name or total <= 1 or max_chunks <= 1:
+                return []
+            collected: list[tuple[int, dict]] = []
+            for base in ("CodeFunction", "CodeClass"):
+                try:
+                    coll_obj = client.collections.get(_project_collection(base))
+                    flt = Filter.by_property("full_name").equal(full_name)
+                    if effective_project:
+                        flt = flt & Filter.by_property("project").equal(effective_project)
+                    resp = coll_obj.query.fetch_objects(filters=flt, limit=max(total, max_chunks) + 4)
+                    for obj in resp.objects:
+                        cp = obj.properties or {}
+                        cn = cp.get("chunk_num", 0) or 0
+                        try:
+                            collected.append((int(cn), cp))
+                        except (TypeError, ValueError):
+                            collected.append((0, cp))
+                except Exception as exc:
+                    logger.debug("search_code_graph: code chunk fetch %s failed: %s", base, exc)
+            if not collected:
+                return []
+            # Centre a window of max_chunks around the hit chunk, ordered by chunk_num.
+            collected.sort(key=lambda t: abs(t[0] - (hit_chunk or 0)))
+            picked = collected[:max_chunks]
+            picked.sort(key=lambda t: t[0])
+            return [cp for _, cp in picked]
+
+        # Render each survivor. In "auto" mode every candidate carries a
+        # `_tier` (from the shared pipeline's tier_fn) → render via the
+        # score-tier code renderer (`_format_code_result_by_tier`), assembling
+        # 1/3/7 chunks by tier over the P7-resynced multi-chunk data model.
+        # Explicit "titles"/"full" detail (tier_fn was None → no `_tier`) →
+        # the rank-based formatter honours `detail` uniformly. BOTH paths are
+        # shared with the CLI so the two surfaces stay identical.
         results = []
         for i, r in enumerate(candidates):
             coll_name, p, score, dist = r["_c"], r["_p"], r["_s"], r["_d"]
-            results.append(_format_code_result_by_rank(
-                p, coll_name, i,
-                detail=detail,
-                score=score,
-                distance=dist,
-                sibling_fetcher=_fetch_file_siblings,
-            ))
+            tier = r.get("_tier")
+            if tier is not None:
+                results.append(_format_code_result_by_tier(
+                    p, coll_name, tier,
+                    score=score,
+                    distance=dist,
+                    chunk_fetcher=_fetch_code_chunks,
+                ))
+            else:
+                results.append(_format_code_result_by_rank(
+                    p, coll_name, i,
+                    detail=detail,
+                    score=score,
+                    distance=dist,
+                    sibling_fetcher=_fetch_file_siblings,
+                ))
 
         # --- Subgraph expansion ---
         effective_hops = max(0, min(expand_hops, 2))

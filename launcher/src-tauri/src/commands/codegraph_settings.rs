@@ -13,8 +13,8 @@
 //!     pre-rerank seed cutoff, `post_rerank_floor` the final cutoff after
 //!     reranking. `set_codegraph_floors` validates the `0.0..=1.0` range,
 //!     writes both keys, then triggers env re-projection so the analyzer /
-//!     MCP subprocesses pick up the projected `CODEGRAPH_RETRIEVAL_FLOOR` /
-//!     `CODEGRAPH_POST_RERANK_FLOOR` env vars.
+//!     MCP subprocesses pick up the projected `VCO_CODE_GRAPH_RETRIEVAL_FLOOR` /
+//!     `VCO_CODE_GRAPH_POST_RERANK_FLOOR` env vars.
 //!
 //!   * **P5 `.claude`-index toggle** is PER-PROJECT, stored in
 //!     `module_settings(project_id, "orchestrator-core",
@@ -38,14 +38,10 @@
 //!   * generate_handler! wiring in `lib.rs` is integrator-only; the four
 //!     `#[tauri::command]` fns below are `pub` and must be added there.
 
-// NOTE (v0.2.72 T-GUI-DB): every public item in this module is currently
-// unused in the non-test build because the four `#[tauri::command]` fns are
-// not yet listed in `lib.rs`'s `generate_handler!` macro (that wiring is the
-// integrator's job — see the module docstring's COORDINATION block). The
-// shared helper `resolve_codegraph_index_dot_claude` + its constants are
-// consumed by T-SCOPE. Suppress the dead-code lint at module scope until the
-// integrator wires the commands and T-SCOPE lands its call-site.
-#![allow(dead_code)]
+// v0.2.72 integrator: the four `#[tauri::command]` fns are now wired into
+// `lib.rs`'s `generate_handler!`, and `resolve_codegraph_index_dot_claude` is
+// called from `commands::codegraph::run_build_task` — so the pre-merge
+// module-scope `#![allow(dead_code)]` is removed (nothing here is dead now).
 
 use tauri::State;
 

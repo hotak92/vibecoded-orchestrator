@@ -881,22 +881,14 @@ fn project_still_exists(app: &AppHandle, project_id: &str) -> bool {
 /// never propagated. Each transition emits a `code-graph-build-progress`
 /// event so the GUI updates live.
 ///
-/// v0.2.72 (P5): compile-safe fallback resolver for the `.claude/` gate.
-///
-/// Mirrors the DEFAULT of T-GUI-DB's `codegraph_settings::
-/// resolve_codegraph_index_dot_claude` so this branch compiles + behaves
-/// correctly BEFORE T-GUI-DB is merged (see the INTEGRATOR NOTE in
-/// `run_build_task`). Root heuristic: a folder is the orchestrator clone
-/// iff it contains BOTH `vco_lib/` (unique to the orchestrator clone) AND
-/// a `.claude/` directory — every other VCO-installed project has
-/// `.claude/` but NOT `vco_lib/`. Returns `true` (index `.claude`) only for
-/// the orchestrator root; `false` (exclude) for user projects. Mirrors the
-/// Python-side `_looks_like_orchestrator_root` in `analyze_code_graph.py`
-/// — the two MUST stay in sync (cross-language mirror). Never panics.
-fn resolve_index_dot_claude_fallback(folder_path: &str) -> bool {
-    let root = std::path::Path::new(folder_path);
-    root.join("vco_lib").is_dir() && root.join(".claude").is_dir()
-}
+// v0.2.72 (P5): the `.claude/` gate is resolved in `run_build_task` via
+// T-GUI-DB's `codegraph_settings::resolve_codegraph_index_dot_claude`
+// (explicit per-project row → host-based default). The pre-merge compile-safe
+// path-based fallback (`resolve_index_dot_claude_fallback`) was removed by the
+// integrator once T-GUI-DB's resolver became available — the resolver owns the
+// decision, so a second heuristic here would be dead code + a drift risk.
+// The Python-side default still lives in `analyze_code_graph.py`
+// (`_looks_like_orchestrator_root`) for bare-CLI runs with no DB.
 
 /// Mid-build unregister race (follow-up #11): if the user calls
 /// `delete_project_v2` while this task is in flight, the DB row vanishes
@@ -1085,26 +1077,26 @@ async fn run_build_task(
     // resolved by T-GUI-DB's `codegraph_settings::
     // resolve_codegraph_index_dot_claude(&db, &project_id)`.
     //
-    // ⚠️ INTEGRATOR NOTE (T-GUI-DB merge): T-GUI-DB (branch v0272-gui-db) is
-    // NOT yet merged into this branch's base, so `codegraph_settings` does
-    // not exist here and calling it directly would break `cargo build`.
-    // `resolve_index_dot_claude_fallback` below mirrors the DB contract's
-    // DEFAULT (root-detect) so this branch compiles + behaves correctly on
-    // its own. When T-GUI-DB lands, REPLACE the fallback call with:
-    //
-    //     let index_dot_claude = crate::commands::codegraph_settings::
-    //         resolve_codegraph_index_dot_claude(&db, &project_id)
-    //         .unwrap_or_else(|e| {
-    //             eprintln!("[vct] warning: resolve_codegraph_index_dot_claude \
-    //                 for {}: {} — defaulting to exclude .claude", project_id, e);
-    //             false
-    //         });
-    //
-    // (get `db` via `app.state::<Db>()` — this task holds only `AppHandle`).
-    // The fallback only reads root-detection; the DB value additionally
-    // honours a user's explicit per-project opt-in toggle, so swapping it in
-    // is a strict upgrade.
-    let index_dot_claude = resolve_index_dot_claude_fallback(&folder_path);
+    // v0.2.72 integrator (T-GUI-DB merged): resolve the per-project bool from
+    // `module_settings` via T-GUI-DB's resolver. It honours a user's explicit
+    // per-project opt-in toggle AND applies the host-based default (orchestrator
+    // root → index; other projects → exclude). On any DB error we default to
+    // EXCLUDE .claude (conservative). `db` comes from `app.state::<Db>()` (this
+    // task holds only `AppHandle`).
+    let index_dot_claude = {
+        let db = app.state::<Db>();
+        crate::commands::codegraph_settings::resolve_codegraph_index_dot_claude(
+            &db, &project_id,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "[vct] warning: resolve_codegraph_index_dot_claude for {}: {} \
+                 — defaulting to exclude .claude",
+                project_id, e
+            );
+            false
+        })
+    };
     if index_dot_claude {
         args.push("--index-dot-claude".to_string());
     } else {
