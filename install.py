@@ -6259,6 +6259,20 @@ def main() -> int:
         if _seed_succeeded:
             _run_schema_migration_scripts(_deferral_report)
 
+        # v0.2.72 (P7): revision-gated code-graph resync. After the additive
+        # `embed_revision` schema migration ran (above, inside
+        # analyze_code_graph's create_collections on the next analyze), trigger a
+        # BACKGROUND full re-analyze so the ~7-9% of over-budget Function/Class
+        # rows that P3 chunking invalidated get re-embedded into chunks. The
+        # revision gate makes this LIGHT (rows already at the current revision
+        # hash-skip). Non-blocking (background Popen), no global timeout, and it
+        # degrades to a deferral when the code-embed service (:11440) is down.
+        # Only on --update: a fresh install analyzes at the current revision
+        # already, so there are no stale rows to resync. Thin shim → the logic
+        # lives in vco_lib.codegraph_resync (install.py is a mega-file).
+        if _seed_succeeded and getattr(args, "update", False):
+            _trigger_codegraph_embed_resync(_deferral_report)
+
         # PR-34 (v0.2.12, Group M): detect the pre-rename shared-KG class
         # left over from a pre-v0.2.12 install. Emit a deferral pointing
         # at the launcher's "Manage shared KG collection" picker — we
@@ -16273,6 +16287,84 @@ def _run_schema_migration_scripts(deferral_report: "DeferralReport") -> None:
     # V0243-14: emit deferred cleanup suggestions for residual lowercase
     # legacy code-graph collections. Idempotent; never auto-drops.
     _emit_lowercase_codegraph_cleanup_deferrals(deferral_report)
+
+
+def _trigger_codegraph_embed_resync(deferral_report: "DeferralReport") -> None:
+    """v0.2.72 (P7) thin shim: trigger the revision-gated code-graph resync.
+
+    All real logic lives in ``vco_lib.codegraph_resync`` (install.py is a
+    mega-file — per the modularity rule, >50-line additions go to a helper
+    module). This shim only:
+      1. resolves the orchestrator's own code-graph project name,
+      2. calls ``spawn_background_resync`` (background, non-blocking, no global
+         timeout; self-degrades when the code-embed service is down), and
+      3. records the returned ``DeferralEntry`` when the resync was deferred.
+
+    Soft-fail throughout: any error here converts to a log line, never a crash —
+    the resync is a best-effort background refresh, not a gating step.
+    """
+    try:
+        from vco_lib.codegraph_resync import spawn_background_resync
+    except Exception as exc:  # noqa: BLE001 — missing helper must not wedge update
+        _log_install_event(
+            "codegraph_resync", "warn",
+            f"codegraph_resync helper unavailable: {exc}",
+        )
+        return
+
+    project_name = _derive_orchestrator_project_name()
+    venv_python = None
+    try:
+        # Prefer the orchestrator venv python (has weaviate-client + vco_lib)
+        # so the spawned analyze can import its deps. Fall back to sys.executable
+        # inside the helper when this is None.
+        _vp_posix = PROJECT_ROOT / ".venv" / "bin" / "python"
+        _vp_win = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+        if _vp_posix.is_file():
+            venv_python = str(_vp_posix)
+        elif _vp_win.is_file():
+            venv_python = str(_vp_win)
+    except Exception:  # noqa: BLE001
+        venv_python = None
+
+    try:
+        result = spawn_background_resync(
+            PROJECT_ROOT,
+            project_name,
+            python_exe=venv_python,
+        )
+    except Exception as exc:  # noqa: BLE001 — never crash the update
+        _log_install_event(
+            "codegraph_resync", "warn",
+            f"codegraph resync trigger raised: {exc}",
+        )
+        return
+
+    if result.status == "launched":
+        print(f"  → code-graph resync (P7) launched in background (pid {result.pid})")
+        _log_install_event(
+            "codegraph_resync", "ok",
+            f"background resync launched for {project_name} (pid {result.pid})",
+        )
+    elif result.status == "deferred":
+        print(f"  ! code-graph resync deferred: {result.message}")
+        if result.deferral is not None:
+            try:
+                deferral_report.add_entry(result.deferral)
+            except Exception as exc:  # noqa: BLE001
+                _log_install_event(
+                    "codegraph_resync", "warn",
+                    f"could not record resync deferral: {exc}",
+                )
+        _log_install_event(
+            "codegraph_resync", "warn",
+            f"resync deferred for {project_name}: {result.message}",
+        )
+    else:  # skipped
+        _log_install_event(
+            "codegraph_resync", "warn",
+            f"resync skipped for {project_name}: {result.message}",
+        )
 
 
 def _run_additive_temporal_props_migration(
