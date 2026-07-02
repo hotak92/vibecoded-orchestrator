@@ -91,6 +91,95 @@ function Add-VcoSeen {
     try { Add-Content -LiteralPath $File -Value $Key -ErrorAction Stop } catch { }
 }
 
+# --- Per-session codegraph inject VOLUME cap (v0.2.72 P6) ------------------
+# The dedup store bounds RE-injection (same identity) but NOT total injection: a
+# long session navigating many DISTINCT entities injects a fresh block for each.
+# This cap bounds the TOTAL codegraph injections per session_id. Mechanism: a
+# tiny per-session counter file under the SAME .claude/state/ dir + session
+# keying as the dedup store. MUST MATCH seen-store.sh -- file-name convention
+# (seen_cginject_count_<sid>.txt), default cap (40), fail-open-on-error policy,
+# and the emit-the-note-once contract.
+
+# Get-VcoCgInjectCountPath <SessionId> <ProjectRoot>
+# Return the per-session codegraph-inject counter path, or "" for an
+# untrustworthy session id ("" / "default") -- caller then runs UNCAPPED.
+function Get-VcoCgInjectCountPath {
+    param([string]$SessionId, [string]$ProjectRoot)
+    if ([string]::IsNullOrEmpty($SessionId) -or $SessionId -eq "default") { return "" }
+    if ([string]::IsNullOrEmpty($ProjectRoot)) { return "" }
+    $stateDir = Join-Path (Join-Path $ProjectRoot ".claude") "state"
+    return (Join-Path $stateDir ("seen_cginject_count_{0}.txt" -f $SessionId))
+}
+
+# Get-VcoCgInjectCap -- effective cap (env override VCO_CG_INJECT_CAP, else 40).
+# A non-numeric / non-positive override falls back to 40 (a fat-fingered value
+# must not silently disable ALL injection).
+function Get-VcoCgInjectCap {
+    $cap = 40
+    $raw = $env:VCO_CG_INJECT_CAP
+    if (-not [string]::IsNullOrEmpty($raw)) {
+        $parsed = 0
+        if ([int]::TryParse($raw, [ref]$parsed) -and $parsed -gt 0) { $cap = $parsed }
+    }
+    return $cap
+}
+
+# Test-VcoCgInjectCapped <CountFile>
+# READ-ONLY predicate: $true (capped -- suppress) when the per-session count has
+# reached the cap, else $false (still room). Does NOT mutate the counter, so the
+# caller can short-circuit BEFORE the heavy codegraph query. Soft-fail: ""
+# CountFile (untrustworthy session) OR read error -> $false (not capped).
+# MUST MATCH seen-store.sh vco_cg_inject_capped.
+function Test-VcoCgInjectCapped {
+    param([string]$CountFile)
+    if ([string]::IsNullOrEmpty($CountFile)) { return $false }
+    if (-not (Test-Path -LiteralPath $CountFile)) { return $false }
+    $cap = Get-VcoCgInjectCap
+    $n = 0
+    try {
+        $raw = (Get-Content -LiteralPath $CountFile -Raw -ErrorAction Stop).Trim()
+        $parsed = 0
+        if ([int]::TryParse($raw, [ref]$parsed)) { $n = $parsed }
+    } catch { $n = 0 }
+    if ($n -ge $cap) { return $true }
+    return $false
+}
+
+# Add-VcoCgInjectRecord <CountFile>
+# Increment the per-session inject counter by one. Called ONLY when a block is
+# actually emitted (cap counts real injections, not query attempts). Soft-fail:
+# "" CountFile or write error -> no-op. MUST MATCH seen-store.sh
+# vco_cg_inject_record.
+function Add-VcoCgInjectRecord {
+    param([string]$CountFile)
+    if ([string]::IsNullOrEmpty($CountFile)) { return }
+    $n = 0
+    if (Test-Path -LiteralPath $CountFile) {
+        try {
+            $raw = (Get-Content -LiteralPath $CountFile -Raw -ErrorAction Stop).Trim()
+            $parsed = 0
+            if ([int]::TryParse($raw, [ref]$parsed)) { $n = $parsed }
+        } catch { $n = 0 }
+    }
+    $n = $n + 1
+    try { Set-Content -LiteralPath $CountFile -Value $n -ErrorAction Stop } catch { }
+}
+
+# Test-VcoCgInjectNoteOnce <SessionId> <ProjectRoot>
+# Return $true (emit the cap note now) EXACTLY ONCE per session, $false
+# thereafter -- via a sentinel file next to the counter. Soft-fail: unkeyable
+# session or write error -> $false (do NOT spam the note when we can't dedup it).
+function Test-VcoCgInjectNoteOnce {
+    param([string]$SessionId, [string]$ProjectRoot)
+    if ([string]::IsNullOrEmpty($SessionId) -or $SessionId -eq "default") { return $false }
+    if ([string]::IsNullOrEmpty($ProjectRoot)) { return $false }
+    $stateDir = Join-Path (Join-Path $ProjectRoot ".claude") "state"
+    $sentinel = Join-Path $stateDir ("seen_cginject_capnote_{0}.txt" -f $SessionId)
+    if (Test-Path -LiteralPath $sentinel) { return $false }
+    try { Set-Content -LiteralPath $sentinel -Value "1" -ErrorAction Stop } catch { return $false }
+    return $true
+}
+
 # Get-VcoSeenFirstField <Rest> -- first " | "-delimited field of a header,
 # capped to 200 chars. Strips an accidentally-doubled prefix.
 function Get-VcoSeenFirstField {

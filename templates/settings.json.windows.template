@@ -308,6 +308,12 @@
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/stop-drain-citations.ps1",
             "timeout": 30,
             "async": true
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/stop-codegraph-reminder.ps1",
+            "timeout": 5,
+            "async": true
           }
         ]
       }

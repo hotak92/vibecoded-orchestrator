@@ -134,6 +134,114 @@ vco_seen_add() {
     printf '%s\n' "$key" >> "$file" 2>/dev/null || true
 }
 
+# --- Per-session codegraph inject VOLUME cap (v0.2.72 P6) ------------------
+# The seen-store above dedups by IDENTITY (same title#hash / full_name is not
+# re-injected). That bounds RE-injection but NOT total injection: a long session
+# that navigates many DISTINCT code entities injects a fresh block for each,
+# unboundedly. This cap bounds the TOTAL number of codegraph injections per
+# session_id so a marathon session can't accrete injection blocks without limit.
+#
+# Mechanism: a tiny per-session counter file (seen_cginject_count_<sid>.txt)
+# under the SAME .claude/state/ dir + SAME session keying as the dedup store.
+# vco_cg_inject_count_path resolves it (EMPTY for an untrustworthy session id →
+# caller runs UNCAPPED, mirroring the inject-blind dedup policy: better to allow
+# than to silently gate a session we can't key). The count is split into a
+# READ-ONLY predicate (vco_cg_inject_capped) that the caller checks BEFORE the
+# heavy codegraph query, and a mutator (vco_cg_inject_record) the caller calls
+# ONLY when a block actually emits — so the cap counts REAL injections, not
+# query attempts that dedup to nothing. Soft-fail: any read/write error → NOT
+# capped / no-op (a broken counter must never break injection).
+#
+# The cap default is VCO_CG_INJECT_CAP (env-overridable, default 40). A new
+# session_id → new counter file → fresh count. post-compact wipes the state dir
+# alongside the other seen_* files, so the count resets on compaction too. The
+# caller emits the "[codegraph injection cap reached]" note EXACTLY ONCE via the
+# vco_cg_inject_note_once sentinel (not on every call past the cap).
+#
+# MUST MATCH: seen-store.ps1's Get-VcoCgInjectCountPath / Get-VcoCgInjectCap /
+# Test-VcoCgInjectCapped / Add-VcoCgInjectRecord / Test-VcoCgInjectNoteOnce —
+# the file-name convention (seen_cginject_count_<sid>.txt), the default cap (40),
+# the read-only-predicate + record-on-emit split, the fail-open-on-error policy,
+# and the emit-the-note-once contract.
+
+# vco_cg_inject_count_path <session_id> <project_root>
+# Echo the per-session codegraph-inject counter file path, or EMPTY when the
+# session id is untrustworthy ("" or "default") — caller then runs uncapped.
+vco_cg_inject_count_path() {
+    local sid="$1" proot="$2"
+    if [ -z "$sid" ] || [ "$sid" = "default" ]; then
+        printf '%s' ""
+        return 0
+    fi
+    [ -n "$proot" ] || { printf '%s' ""; return 0; }
+    printf '%s' "$proot/.claude/state/seen_cginject_count_${sid}.txt"
+}
+
+# vco_cg_inject_cap — the effective cap (env override, else default 40). A
+# non-numeric / non-positive override falls back to the default (a fat-fingered
+# VCO_CG_INJECT_CAP must not silently disable ALL injection).
+vco_cg_inject_cap() {
+    local cap="${VCO_CG_INJECT_CAP:-40}"
+    case "$cap" in
+        ''|*[!0-9]*) cap=40 ;;
+    esac
+    [ "$cap" -gt 0 ] 2>/dev/null || cap=40
+    printf '%s' "$cap"
+}
+
+# vco_cg_inject_capped <count_file>
+# READ-ONLY predicate: return 0 (capped — suppress) when the per-session count
+# has reached the cap, else 1 (still room). Does NOT mutate the counter, so the
+# caller can cheaply short-circuit BEFORE the heavy codegraph query subprocess
+# without consuming budget for a query that may yield nothing after dedup.
+# Soft-fail: EMPTY count_file (untrustworthy session) OR read error → 1 (not
+# capped / uncapped). A broken counter must never block injection.
+vco_cg_inject_capped() {
+    local file="$1"
+    [ -n "$file" ] || return 1   # untrustworthy session → never capped
+    [ -f "$file" ] || return 1   # no counter yet → not capped
+    local cap n
+    cap="$(vco_cg_inject_cap)"
+    n="$(cat "$file" 2>/dev/null || printf '0')"
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    [ "$n" -ge "$cap" ] 2>/dev/null && return 0
+    return 1
+}
+
+# vco_cg_inject_record <count_file>
+# Increment the per-session inject counter by one. Called ONLY when a block is
+# actually emitted (so the cap counts real injections, not query attempts that
+# dedup to nothing). Soft-fail: EMPTY count_file or write error → no-op, return
+# 0. Idempotency is not required — each emitted injection counts once.
+vco_cg_inject_record() {
+    local file="$1"
+    [ -n "$file" ] || return 0
+    local n=0
+    if [ -f "$file" ]; then
+        n="$(cat "$file" 2>/dev/null || printf '0')"
+        case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    fi
+    n=$((n + 1))
+    printf '%s\n' "$n" > "$file" 2>/dev/null || true
+    return 0
+}
+
+# vco_cg_inject_note_once <session_id> <project_root>
+# Return 0 (emit the cap note now) EXACTLY ONCE per session, 1 thereafter. Uses a
+# sentinel file next to the counter so the "[codegraph injection cap reached]"
+# note is emitted a single time, not on every capped call. Soft-fail: an
+# unkeyable session (empty path) or a write error → return 1 (do NOT spam the
+# note when we can't dedup it).
+vco_cg_inject_note_once() {
+    local sid="$1" proot="$2"
+    [ -n "$sid" ] && [ "$sid" != "default" ] || return 1
+    [ -n "$proot" ] || return 1
+    local sentinel="$proot/.claude/state/seen_cginject_capnote_${sid}.txt"
+    [ -f "$sentinel" ] && return 1
+    printf '1\n' > "$sentinel" 2>/dev/null || return 1
+    return 0
+}
+
 # vco_seen_key_for_header <prefix> <rest>
 # Derive the dedup KEY for one injected block, given the header prefix
 # ("KG"|"CODE") and the part after "<prefix>: ".

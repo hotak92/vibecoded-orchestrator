@@ -63,6 +63,19 @@ if ($SessionId) {
     if (Test-Path $SeenFileLegacy) {
         Remove-Item $SeenFileLegacy -Force -ErrorAction SilentlyContinue
     }
+    # v0.2.72 P6: codegraph inject VOLUME cap counter + one-shot cap-note
+    # sentinel. Fresh bounded budget post-compact (same reasoning as the
+    # seen_inject wipe). MUST MATCH seen_cginject_* in _lib/seen-store.ps1 +
+    # post-compact.sh.
+    $CgInjectCount = Join-Path $ProjectDir ".claude/state/seen_cginject_count_$SessionId.txt"
+    if (Test-Path $CgInjectCount) { Remove-Item $CgInjectCount -Force -ErrorAction SilentlyContinue }
+    $CgInjectCapNote = Join-Path $ProjectDir ".claude/state/seen_cginject_capnote_$SessionId.txt"
+    if (Test-Path $CgInjectCapNote) { Remove-Item $CgInjectCapNote -Force -ErrorAction SilentlyContinue }
+    # v0.2.72 P6: per-turn edit-reminder accumulator straggler. MUST MATCH
+    # edit_reminder_ in post-file-edit.ps1 + stop-codegraph-reminder.ps1 +
+    # post-compact.sh.
+    $EditReminderAccum = Join-Path $ProjectDir ".claude/state/edit_reminder_$SessionId.txt"
+    if (Test-Path $EditReminderAccum) { Remove-Item $EditReminderAccum -Force -ErrorAction SilentlyContinue }
 }
 
 # Same reasoning for pre-tool-use.ps1's per-session reads file (Build Anchor
