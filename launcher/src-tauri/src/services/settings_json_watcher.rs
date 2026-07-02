@@ -105,6 +105,18 @@ const PROJECT_LIST_RE_POLL: Duration = Duration::from_secs(30);
 //
 // The manual "Reload MCPs" button (the `reload_mcps_sighup` Tauri command)
 // stays UNCONDITIONAL — only this watcher-auto path gets the diff-guard.
+//
+// v0.2.72 (pre-gate audit F1): the diff-guard evaluation is PER-PATH, not
+// last-event-only. The debounce still coalesces bursts into one surviving
+// task (last-writer-wins on `last_event`), but every event's settings.json
+// path is recorded in a `pending` set; at fire time the surviving task
+// DRAINS the whole set and evaluates `mcp_env_changed` for EVERY drained
+// path. Without this, `refresh_all_projects_env_with_db` rewriting N
+// projects' settings.json inside one debounce window collapsed to a single
+// decision on the LAST-written file — if THAT file's MCP-relevant subset
+// was unchanged (e.g. sticky per-project ACTIVE_EMBEDDING), the SIGHUP was
+// skipped and the OTHER projects' real changes never reloaded the MCP.
+// One path changed → one global SIGHUP (reloads are process-wide anyway).
 
 /// The `.claude/settings.json` `env` keys whose VALUES the orchestrator
 /// MCPs actually CONSUME (or whose change alters the Weaviate/Ollama/
@@ -277,6 +289,13 @@ struct WatchState {
     /// `.claude/settings.json` PathBuf from the modify event. A cache miss
     /// (first-ever event for a path) fails OPEN — see `mcp_env_changed`.
     last_mcp_env_hash: Mutex<HashMap<PathBuf, u64>>,
+    /// v0.2.72 (F1) per-path pending set: every settings.json modify event
+    /// inserts its path here (and bumps `last_event`). The surviving
+    /// debounce task drains the WHOLE set and evaluates the diff-guard for
+    /// each drained path, so a multi-project rewrite burst (e.g.
+    /// `refresh_all_projects_env_with_db`) can't collapse to a single
+    /// decision on the last-written file.
+    pending: Mutex<HashSet<PathBuf>>,
 }
 
 impl WatchState {
@@ -285,6 +304,26 @@ impl WatchState {
             last_event: Mutex::new(None),
             watched: Mutex::new(HashSet::new()),
             last_mcp_env_hash: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// v0.2.72 (F5): forget diff-guard state for projects whose watch was
+    /// just removed (project unregistered / folder gone). Without this the
+    /// `last_mcp_env_hash` map (and, pathologically, the `pending` set)
+    /// grows monotonically across project add/remove cycles, and a
+    /// re-added project at the same path would compare against a stale
+    /// baseline instead of failing open.
+    async fn prune_removed_dirs(&self, removed_dirs: &[PathBuf]) {
+        if removed_dirs.is_empty() {
+            return;
+        }
+        let mut cache = self.last_mcp_env_hash.lock().await;
+        let mut pending = self.pending.lock().await;
+        for dir in removed_dirs {
+            let settings_path = dir.join("settings.json");
+            cache.remove(&settings_path);
+            pending.remove(&settings_path);
         }
     }
 }
@@ -423,10 +462,15 @@ async fn sync_watches<R: Runtime + 'static>(
         }
     }
     // Remove gone.
-    for dir in watched.difference(&desired).cloned().collect::<Vec<_>>() {
-        let _ = watcher.unwatch(&dir);
+    let removed: Vec<PathBuf> = watched.difference(&desired).cloned().collect();
+    for dir in &removed {
+        let _ = watcher.unwatch(dir);
     }
     *watched = desired;
+    drop(watched);
+    // v0.2.72 (F5): drop the removed projects' diff-guard cache entries
+    // (and any not-yet-drained pending events) alongside the unwatch.
+    state.prune_removed_dirs(&removed).await;
     Ok(())
 }
 
@@ -476,10 +520,12 @@ fn first_settings_json_path(paths: &[PathBuf]) -> Option<PathBuf> {
         .cloned()
 }
 
-/// Schedule a debounced reload. Updates `last_event` and spawns a
-/// task that sleeps `DEBOUNCE_WINDOW` then checks whether more events
-/// arrived in the meantime; only the LAST scheduled task actually
-/// fires SIGHUP. (The earlier tasks see a newer `last_event` and bail.)
+/// Schedule a debounced reload. Records the event's path in the pending
+/// set, updates `last_event`, and spawns a task that sleeps
+/// `DEBOUNCE_WINDOW` then checks whether more events arrived in the
+/// meantime; only the LAST scheduled task actually fires. (The earlier
+/// tasks see a newer `last_event` and bail — but their paths stay in the
+/// pending set, so the surviving task still evaluates them; F1.)
 ///
 /// This is the lowest-cost debounce pattern that doesn't require a
 /// JoinHandle accounting scheme — overlapping tasks are cheap (one
@@ -493,12 +539,19 @@ fn schedule_debounced_reload<R: Runtime + 'static>(
     let state_for_task = state.clone();
     tauri::async_runtime::spawn(async move {
         {
+            // F1: record the path BEFORE bumping the timestamp so that by
+            // the time any task can win the debounce race, every observed
+            // path is already in the set the winner will drain.
+            let mut pending = state.pending.lock().await;
+            pending.insert(settings_path);
+        }
+        {
             let mut last = state.last_event.lock().await;
             *last = Some(scheduled_at);
         }
         tokio::time::sleep(DEBOUNCE_WINDOW).await;
         // If a newer event arrived during our sleep, that newer event's
-        // task will handle the reload. Bail.
+        // task will handle the reload (and drain OUR pending path). Bail.
         {
             let last = state_for_task.last_event.lock().await;
             if *last != Some(scheduled_at) {
@@ -506,9 +559,61 @@ fn schedule_debounced_reload<R: Runtime + 'static>(
             }
         }
         // We're the most-recent-scheduled task and the debounce window
-        // elapsed. Consult the diff-guard, then maybe fire the reload.
-        fire_reload(app, state_for_task, settings_path).await;
+        // elapsed. Drain the pending set, consult the diff-guard per
+        // path, then maybe fire the reload.
+        fire_reload(app, state_for_task).await;
     });
+}
+
+/// v0.2.72 (F1): outcome of evaluating every drained pending path against
+/// its per-path diff-guard baseline.
+struct DrainDecision {
+    /// True when at least ONE drained path's MCP-relevant env moved (or
+    /// failed open) — one global SIGHUP covers all of them.
+    reload: bool,
+    /// Paths whose hash moved / failed open (drove the reload).
+    changed: Vec<PathBuf>,
+    /// Paths whose MCP-relevant subset was provably unchanged.
+    skipped: Vec<PathBuf>,
+}
+
+/// v0.2.72 (F1): per-path diff-guard evaluation over the drained pending
+/// set. For EVERY drained path: read the current body (via `read_body`,
+/// injected so tests don't need the filesystem), compare against that
+/// path's cached baseline with `mcp_env_changed`, and refresh the cache
+/// entry whenever the current body is parseable (reload or skip alike —
+/// same semantics the single-path guard had; an unparseable body leaves
+/// the previous baseline untouched so the next readable write compares
+/// against it).
+///
+/// Fail-open per path is preserved: no baseline → changed; unreadable /
+/// unparseable body → changed. The decision is the OR across paths — one
+/// changed path is enough to reload (the SIGHUP is process-global anyway).
+fn evaluate_drained_paths(
+    drained: &[PathBuf],
+    cache: &mut HashMap<PathBuf, u64>,
+    read_body: impl Fn(&Path) -> String,
+) -> DrainDecision {
+    let mut decision = DrainDecision {
+        reload: false,
+        changed: Vec::new(),
+        skipped: Vec::new(),
+    };
+    for path in drained {
+        let body = read_body(path);
+        let prev_hash = cache.get(path).copied();
+        let path_changed = mcp_env_changed(prev_hash, &body);
+        if let Some(now_hash) = hash_mcp_env(&body) {
+            cache.insert(path.clone(), now_hash);
+        }
+        if path_changed {
+            decision.reload = true;
+            decision.changed.push(path.clone());
+        } else {
+            decision.skipped.push(path.clone());
+        }
+    }
+    decision
 }
 
 /// Invoke the same `reload_mcps_with` core that the Tauri command
@@ -517,58 +622,44 @@ fn schedule_debounced_reload<R: Runtime + 'static>(
 ///   * we want the watcher's audit log entry shape to be distinct so
 ///     forensics can tell auto-reload events apart from manual ones.
 ///
-/// v0.2.72 (C-P8) diff-guard: BEFORE signalling, read the CURRENT
-/// settings.json for `settings_path`, hash its MCP-relevant env subset,
-/// and compare to the cached hash for this path. Skip the SIGHUP when the
-/// hash is unchanged (idempotent write → no MCP-relevant change). Fail
-/// OPEN when there is no baseline or the file is unreadable/unparseable.
+/// v0.2.72 (C-P8) diff-guard + (F1) per-path evaluation: BEFORE
+/// signalling, drain the pending set and, for EVERY drained settings.json
+/// path, read the CURRENT file, hash its MCP-relevant env subset, and
+/// compare to the cached hash for that path. Skip the SIGHUP only when
+/// ALL drained paths are provably unchanged. Fail OPEN per path when
+/// there is no baseline or the file is unreadable/unparseable.
 ///
-// TODO(v0.2.72 integrator): also fire a guarded reload from MCP-relevant
-// DB-write commands (hub-precedence F5). When the launcher writes a
-// per-project config change through vct-hub / launcher.db (Identity tab,
-// embedding selector, access-matrix edits) WITHOUT going through the
-// settings.json surface, the running MCP still holds stale env until the
-// next settings.json write. The clean fix is to have those DB-write
-// commands call a guarded reload too — but they live in other command
-// modules (projects_v2 / mcp_registration / the hub client) and the diff
-// baseline for that path is the resolved ProjectConfig, not settings.json.
-// That's a SEPARATE, larger change; scope it deliberately, don't
-// half-build it here.
-async fn fire_reload<R: Runtime + 'static>(
-    app: AppHandle<R>,
-    state: Arc<WatchState>,
-    settings_path: PathBuf,
-) {
-    // --- Diff-guard: decide whether this write is MCP-relevant. ---
-    // Read the file that triggered us. A read error is treated as "no
-    // proof of irrelevance" → fail open (reload) via `mcp_env_changed`'s
-    // unparseable/None branch (we pass an empty body, which parses to
-    // None → true). We do NOT read on a blocking pool: settings.json is a
-    // few KB and this runs at most once per debounce window.
-    let current_body = std::fs::read_to_string(&settings_path).unwrap_or_default();
-
-    let prev_hash = {
-        let cache = state.last_mcp_env_hash.lock().await;
-        cache.get(&settings_path).copied()
+/// (The v0.2.72 F5 fold-in — firing a guarded reload from MCP-relevant
+/// DB-write commands that bypass the settings.json surface — landed as
+/// env re-projection at the command layer: see
+/// `projects_v2::reproject_env_soft` / `refresh_all_projects_env_with_db`
+/// call sites. Those rewrites route back through THIS watcher.)
+async fn fire_reload<R: Runtime + 'static>(app: AppHandle<R>, state: Arc<WatchState>) {
+    // Drain everything that accumulated during the debounce window. Each
+    // path is evaluated independently against its own baseline.
+    let drained: Vec<PathBuf> = {
+        let mut pending = state.pending.lock().await;
+        pending.drain().collect()
     };
-
-    let should_reload = mcp_env_changed(prev_hash, &current_body);
-
-    // Update the cache with the current hash whenever we can compute one.
-    // We seed/refresh on EVERY fire decision (reload or skip) so the next
-    // event compares against the freshest baseline. A `None` (unparseable)
-    // leaves the previous baseline untouched — the next readable write
-    // then compares against it.
-    if let Some(now_hash) = hash_mcp_env(&current_body) {
-        let mut cache = state.last_mcp_env_hash.lock().await;
-        cache.insert(settings_path.clone(), now_hash);
+    if drained.is_empty() {
+        // Nothing pending (e.g. a racing task already drained) — no-op.
+        return;
     }
 
-    if !should_reload {
+    // We do NOT read on a blocking pool: settings.json files are a few KB
+    // each and this runs at most once per debounce window.
+    let decision = {
+        let mut cache = state.last_mcp_env_hash.lock().await;
+        evaluate_drained_paths(&drained, &mut cache, |p| {
+            std::fs::read_to_string(p).unwrap_or_default()
+        })
+    };
+
+    if !decision.reload {
         eprintln!(
-            "[settings_json_watcher] skip auto-reload: MCP-relevant env unchanged for {} \
-             (idempotent settings.json write — no SIGHUP)",
-            settings_path.display()
+            "[settings_json_watcher] skip auto-reload: MCP-relevant env unchanged for {:?} \
+             (idempotent settings.json write(s) — no SIGHUP)",
+            decision.skipped
         );
         // Audit the SKIP too, so forensics can see the diff-guard working.
         if let Some(db) = app.try_state::<Db>() {
@@ -577,7 +668,11 @@ async fn fire_reload<R: Runtime + 'static>(
                 None,
                 None,
                 &serde_json::json!({
-                    "settings_path": settings_path.display().to_string(),
+                    "settings_paths": decision
+                        .skipped
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>(),
                     "reason": "mcp_env_unchanged",
                 }),
             );
@@ -623,6 +718,13 @@ async fn fire_reload<R: Runtime + 'static>(
                 "signaled_count": report.signaled_count,
                 "pids": report.pids,
                 "errors": report.errors,
+                // F1: which drained paths' MCP-relevant env actually moved
+                // (the reload trigger) — forensics for multi-project bursts.
+                "settings_paths_changed": decision
+                    .changed
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>(),
             }),
         );
     }
@@ -841,5 +943,232 @@ mod tests {
     fn hash_mcp_env_unparseable_is_none() {
         assert_eq!(hash_mcp_env("garbage{{"), None);
         assert_eq!(hash_mcp_env(""), None);
+    }
+
+    // ─── v0.2.72 (F1) per-path drain evaluation tests ────────────────────
+    //
+    // These pin the multi-project-burst fix: when
+    // `refresh_all_projects_env_with_db` rewrites N projects' settings.json
+    // inside one debounce window, the surviving debounce task must evaluate
+    // EVERY pending path — not just the last-written one — and reload when
+    // ANY of them changed.
+
+    /// Build an in-memory "filesystem" for `evaluate_drained_paths`: a
+    /// path → body map served through the injected reader closure. Unknown
+    /// paths read as empty (→ unparseable → fail-open), matching the real
+    /// `read_to_string(..).unwrap_or_default()` behaviour.
+    fn body_reader(
+        bodies: Vec<(PathBuf, String)>,
+    ) -> impl Fn(&Path) -> String {
+        move |p: &Path| {
+            bodies
+                .iter()
+                .find(|(path, _)| path == p)
+                .map(|(_, b)| b.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    /// (a) Two paths pending; the debounce WINNER (last-written file) is
+    /// unchanged but the LOSER changed → the reload must still fire. This
+    /// is the exact multi-project-burst defect: pre-F1 only the winner was
+    /// evaluated and the loser's real change was silently dropped.
+    #[test]
+    fn drained_paths_winner_unchanged_loser_changed_reloads() {
+        let winner = PathBuf::from("/proj-winner/.claude/settings.json");
+        let loser = PathBuf::from("/proj-loser/.claude/settings.json");
+
+        let winner_body = settings_with_env(&[("KG_COLLECTION", "WinnerKG")], "s");
+        let loser_before = settings_with_env(&[("KG_COLLECTION", "LoserKG")], "s");
+        let loser_after = settings_with_env(&[("KG_COLLECTION", "LoserKG_v2")], "s");
+
+        let mut cache = HashMap::new();
+        cache.insert(winner.clone(), hash_mcp_env(&winner_body).unwrap());
+        cache.insert(loser.clone(), hash_mcp_env(&loser_before).unwrap());
+
+        // Drain order puts the winner LAST (the last-writer-wins slot) so
+        // this would have been the only file evaluated pre-F1.
+        let drained = vec![loser.clone(), winner.clone()];
+        let decision = evaluate_drained_paths(
+            &drained,
+            &mut cache,
+            body_reader(vec![
+                (winner.clone(), winner_body),
+                (loser.clone(), loser_after),
+            ]),
+        );
+
+        assert!(
+            decision.reload,
+            "a changed loser path must fire the reload even when the \
+             debounce winner is unchanged"
+        );
+        assert_eq!(decision.changed, vec![loser]);
+        assert_eq!(decision.skipped, vec![winner]);
+    }
+
+    /// (b) Two paths pending, BOTH provably unchanged → skip (the whole
+    /// point of the diff-guard survives the per-path generalisation).
+    #[test]
+    fn drained_paths_all_unchanged_skips() {
+        let a = PathBuf::from("/proj-a/.claude/settings.json");
+        let b = PathBuf::from("/proj-b/.claude/settings.json");
+        let body_a = settings_with_env(&[("KG_COLLECTION", "A_KG")], "s");
+        let body_b = settings_with_env(&[("KG_COLLECTION", "B_KG")], "s");
+
+        let mut cache = HashMap::new();
+        cache.insert(a.clone(), hash_mcp_env(&body_a).unwrap());
+        cache.insert(b.clone(), hash_mcp_env(&body_b).unwrap());
+
+        let decision = evaluate_drained_paths(
+            &[a.clone(), b.clone()],
+            &mut cache,
+            body_reader(vec![(a, body_a), (b, body_b)]),
+        );
+
+        assert!(
+            !decision.reload,
+            "idempotent rewrites of every pending path must not SIGHUP"
+        );
+        assert_eq!(decision.changed.len(), 0);
+        assert_eq!(decision.skipped.len(), 2);
+    }
+
+    /// (c) EVERY drained path's cache entry is refreshed after the
+    /// decision — changed, unchanged, and first-seen paths alike — so the
+    /// next window compares against fresh baselines. An unreadable path
+    /// keeps its previous baseline (no entry clobbering with garbage).
+    #[test]
+    fn drained_paths_all_caches_updated_after_decision() {
+        let changed = PathBuf::from("/proj-c/.claude/settings.json");
+        let unchanged = PathBuf::from("/proj-u/.claude/settings.json");
+        let first_seen = PathBuf::from("/proj-f/.claude/settings.json");
+        let unreadable = PathBuf::from("/proj-x/.claude/settings.json");
+
+        let changed_before = settings_with_env(&[("KG_COLLECTION", "C1")], "s");
+        let changed_after = settings_with_env(&[("KG_COLLECTION", "C2")], "s");
+        let unchanged_body = settings_with_env(&[("KG_COLLECTION", "U")], "s");
+        let first_seen_body = settings_with_env(&[("KG_COLLECTION", "F")], "s");
+
+        let mut cache = HashMap::new();
+        cache.insert(changed.clone(), hash_mcp_env(&changed_before).unwrap());
+        cache.insert(unchanged.clone(), hash_mcp_env(&unchanged_body).unwrap());
+        let unreadable_baseline = 0xDEAD_BEEFu64;
+        cache.insert(unreadable.clone(), unreadable_baseline);
+
+        let decision = evaluate_drained_paths(
+            &[
+                changed.clone(),
+                unchanged.clone(),
+                first_seen.clone(),
+                unreadable.clone(),
+            ],
+            &mut cache,
+            // `unreadable` is missing from the map → reads as "" →
+            // unparseable → fail-open + baseline preserved.
+            body_reader(vec![
+                (changed.clone(), changed_after.clone()),
+                (unchanged.clone(), unchanged_body.clone()),
+                (first_seen.clone(), first_seen_body.clone()),
+            ]),
+        );
+
+        assert!(decision.reload, "changed + first-seen paths fail open");
+        assert_eq!(
+            cache.get(&changed).copied(),
+            hash_mcp_env(&changed_after),
+            "changed path's baseline must move to the new body"
+        );
+        assert_eq!(
+            cache.get(&unchanged).copied(),
+            hash_mcp_env(&unchanged_body),
+            "unchanged path's baseline must be refreshed (same value)"
+        );
+        assert_eq!(
+            cache.get(&first_seen).copied(),
+            hash_mcp_env(&first_seen_body),
+            "first-seen path must be seeded after failing open"
+        );
+        assert_eq!(
+            cache.get(&unreadable).copied(),
+            Some(unreadable_baseline),
+            "unreadable path must keep its previous baseline untouched"
+        );
+        // Fail-open members are in `changed`.
+        assert!(decision.changed.contains(&first_seen));
+        assert!(decision.changed.contains(&unreadable));
+    }
+
+    /// Empty drain → no reload, nothing recorded. (fire_reload treats this
+    /// as a no-op — a racing task already drained the set.)
+    #[test]
+    fn drained_paths_empty_is_noop() {
+        let mut cache = HashMap::new();
+        let decision =
+            evaluate_drained_paths(&[], &mut cache, body_reader(vec![]));
+        assert!(!decision.reload);
+        assert!(decision.changed.is_empty());
+        assert!(decision.skipped.is_empty());
+    }
+
+    // ─── v0.2.72 (F5) diff-guard cache pruning on project removal ────────
+
+    /// When a project's watch dir is removed (`sync_watches` removal arm),
+    /// its settings.json entry must vanish from BOTH the diff-guard cache
+    /// and the pending set, while other projects' entries survive.
+    #[tokio::test]
+    async fn prune_removed_dirs_drops_cache_and_pending_entries() {
+        let state = WatchState::new();
+        let gone_dir = PathBuf::from("/gone-proj/.claude");
+        let kept_dir = PathBuf::from("/kept-proj/.claude");
+        let gone_settings = gone_dir.join("settings.json");
+        let kept_settings = kept_dir.join("settings.json");
+
+        state
+            .last_mcp_env_hash
+            .lock()
+            .await
+            .extend([(gone_settings.clone(), 1u64), (kept_settings.clone(), 2u64)]);
+        state
+            .pending
+            .lock()
+            .await
+            .extend([gone_settings.clone(), kept_settings.clone()]);
+
+        state.prune_removed_dirs(&[gone_dir]).await;
+
+        let cache = state.last_mcp_env_hash.lock().await;
+        assert!(
+            !cache.contains_key(&gone_settings),
+            "removed project's cache entry must be pruned"
+        );
+        assert!(
+            cache.contains_key(&kept_settings),
+            "surviving project's cache entry must be untouched"
+        );
+        drop(cache);
+        let pending = state.pending.lock().await;
+        assert!(
+            !pending.contains(&gone_settings),
+            "removed project's pending event must be pruned"
+        );
+        assert!(
+            pending.contains(&kept_settings),
+            "surviving project's pending event must be untouched"
+        );
+    }
+
+    /// Pruning an empty removal list is a no-op (fast path — no lock churn
+    /// assertions possible, but at least it must not panic or clear state).
+    #[tokio::test]
+    async fn prune_removed_dirs_empty_list_noop() {
+        let state = WatchState::new();
+        let p = PathBuf::from("/p/.claude/settings.json");
+        state.last_mcp_env_hash.lock().await.insert(p.clone(), 7u64);
+        state.prune_removed_dirs(&[]).await;
+        assert_eq!(
+            state.last_mcp_env_hash.lock().await.get(&p).copied(),
+            Some(7u64)
+        );
     }
 }

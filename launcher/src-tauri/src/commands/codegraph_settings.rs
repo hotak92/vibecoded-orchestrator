@@ -93,6 +93,7 @@ pub async fn get_codegraph_floors(db: State<'_, Db>) -> Result<CodegraphFloors, 
 pub async fn set_codegraph_floors(
     retrieval: f64,
     post_rerank: f64,
+    app: tauri::AppHandle,
     db: State<'_, Db>,
 ) -> Result<(), String> {
     db.set_codegraph_floors(retrieval, post_rerank)?;
@@ -101,12 +102,30 @@ pub async fn set_codegraph_floors(
     // returns Err (it accumulates per-project warnings/failures into a
     // result struct) so a projection hiccup can't roll back or hard-fail the
     // DB write. Log any accumulated problems for diagnosis.
-    let refresh = crate::commands::projects_v2::refresh_all_projects_env_with_db(&db);
-    if !refresh.global_warnings.is_empty() || !refresh.failed.is_empty() {
+    //
+    // F3 (v0.2.72): the refresh runs N serial Python subprocesses (30 s cap
+    // each) — route it through spawn_blocking so it doesn't park a tokio
+    // worker for the duration. Join errors are soft-fail too (write landed).
+    if let Err(e) = crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "set_codegraph_floors env re-projection",
+        |db| {
+            let refresh =
+                crate::commands::projects_v2::refresh_all_projects_env_with_db(db);
+            if !refresh.global_warnings.is_empty() || !refresh.failed.is_empty() {
+                eprintln!(
+                    "[vct] set_codegraph_floors: env re-projection warnings: \
+                     global={:?} failed={:?}",
+                    refresh.global_warnings, refresh.failed
+                );
+            }
+        },
+    )
+    .await
+    {
         eprintln!(
-            "[vct] set_codegraph_floors: env re-projection warnings: \
-             global={:?} failed={:?}",
-            refresh.global_warnings, refresh.failed
+            "[vct] warning: set_codegraph_floors: {} (DB write already committed)",
+            e
         );
     }
     Ok(())

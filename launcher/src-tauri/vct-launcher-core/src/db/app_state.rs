@@ -161,21 +161,30 @@ impl Db {
 
     /// Read the machine-global two-stage retrieval floor (pre-rerank seed
     /// cutoff). Returns [`DEFAULT_CODEGRAPH_RETRIEVAL_FLOOR`] when the row is
-    /// absent or unparseable.
+    /// absent, unparseable, non-finite, or outside `0.0..=1.0`.
+    ///
+    /// F6 (v0.2.72): `"NaN"` / `"inf"` / `"1e300"` all PARSE successfully as
+    /// f64, and such rows are writable through the generic `app_state_set`
+    /// command — so the getter must range-filter, not just parse. Mirrors
+    /// `set_codegraph_floors`' write-side validation (a cosine-score floor
+    /// outside 0..=1 is meaningless and would silently discard every result).
     pub fn get_codegraph_retrieval_floor(&self) -> Result<f64, String> {
         Ok(self
             .app_state_get(CODEGRAPH_RETRIEVAL_FLOOR_KEY)?
             .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
             .unwrap_or(DEFAULT_CODEGRAPH_RETRIEVAL_FLOOR))
     }
 
     /// Read the machine-global post-rerank floor (final result cutoff after
     /// reranking). Returns [`DEFAULT_CODEGRAPH_POST_RERANK_FLOOR`] when the
-    /// row is absent or unparseable.
+    /// row is absent, unparseable, non-finite, or outside `0.0..=1.0`
+    /// (F6 — see `get_codegraph_retrieval_floor`).
     pub fn get_codegraph_post_rerank_floor(&self) -> Result<f64, String> {
         Ok(self
             .app_state_get(CODEGRAPH_POST_RERANK_FLOOR_KEY)?
             .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
             .unwrap_or(DEFAULT_CODEGRAPH_POST_RERANK_FLOOR))
     }
 
@@ -475,5 +484,34 @@ mod tests {
             db.get_codegraph_retrieval_floor().unwrap(),
             DEFAULT_CODEGRAPH_RETRIEVAL_FLOOR,
         );
+    }
+
+    /// F6 (v0.2.72): `"NaN"` / `"inf"` / huge / negative rows all PARSE as
+    /// f64 (Rust's `parse::<f64>` accepts them), and the generic
+    /// `app_state_set` command can write them — the getters must degrade
+    /// such rows to the compiled-in default instead of propagating a
+    /// nonsense floor into the projected env.
+    #[test]
+    fn codegraph_floor_getters_reject_non_finite_and_out_of_range_rows() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        for bad in ["NaN", "nan", "inf", "-inf", "1e300", "1.5", "-0.5"] {
+            db.app_state_set(CODEGRAPH_RETRIEVAL_FLOOR_KEY, bad).unwrap();
+            db.app_state_set(CODEGRAPH_POST_RERANK_FLOOR_KEY, bad).unwrap();
+            assert_eq!(
+                db.get_codegraph_retrieval_floor().unwrap(),
+                DEFAULT_CODEGRAPH_RETRIEVAL_FLOOR,
+                "retrieval floor row {bad:?} must degrade to the default",
+            );
+            assert_eq!(
+                db.get_codegraph_post_rerank_floor().unwrap(),
+                DEFAULT_CODEGRAPH_POST_RERANK_FLOOR,
+                "post-rerank floor row {bad:?} must degrade to the default",
+            );
+        }
+        // Boundary values remain accepted (inclusive range).
+        db.app_state_set(CODEGRAPH_RETRIEVAL_FLOOR_KEY, "0.0").unwrap();
+        db.app_state_set(CODEGRAPH_POST_RERANK_FLOOR_KEY, "1.0").unwrap();
+        assert_eq!(db.get_codegraph_retrieval_floor().unwrap(), 0.0);
+        assert_eq!(db.get_codegraph_post_rerank_floor().unwrap(), 1.0);
     }
 }

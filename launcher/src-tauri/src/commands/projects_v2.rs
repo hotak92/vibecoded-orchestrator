@@ -4773,11 +4773,20 @@ pub struct RefreshAllProjectsEnvResult {
 /// "re-render env for every project" without the user having to walk
 /// project-by-project. The boot hook in lib.rs calls
 /// `refresh_all_projects_env_with_db` directly (no Tauri layer).
+///
+/// F3 (v0.2.72): the refresh runs N serial Python subprocesses (30 s cap
+/// each) — route it through spawn_blocking so it doesn't park a tokio
+/// worker for the duration.
 #[command]
 pub async fn refresh_all_projects_env(
-    db: State<'_, Db>,
+    app: tauri::AppHandle,
 ) -> Result<RefreshAllProjectsEnvResult, String> {
-    Ok(refresh_all_projects_env_with_db(&db))
+    crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "refresh_all_projects_env",
+        refresh_all_projects_env_with_db,
+    )
+    .await
 }
 
 #[command]

@@ -70,25 +70,43 @@ fn maybe_reproject_after_app_state_write(
     Some(report)
 }
 
-/// Free-function core of `app_state_set` (testable without a Tauri
-/// runtime). Writes the row, then conditionally re-projects env files —
-/// see `maybe_reproject_after_app_state_write`.
-pub fn app_state_set_with_db(
-    db: &Db,
-    key: &str,
-    value: &str,
-) -> Result<Option<crate::commands::projects_v2::RefreshAllProjectsEnvResult>, String> {
-    db.app_state_set(key, value)?;
-    Ok(maybe_reproject_after_app_state_write(db, key))
+/// F3 (v0.2.72): async-side tail shared by `app_state_set` and
+/// `app_state_set_bool` — run the conditional env re-projection on the
+/// blocking pool. Soft-fail on join error / missing Db state: the
+/// authoritative DB write has already committed by the time this runs, so
+/// a projection hiccup is logged, never propagated.
+async fn reproject_after_app_state_write_blocking(app: tauri::AppHandle, key: String) {
+    let key_for_log = key.clone();
+    if let Err(e) = crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "app_state_set env re-projection",
+        move |db| {
+            let _ = maybe_reproject_after_app_state_write(db, &key);
+        },
+    )
+    .await
+    {
+        eprintln!(
+            "[vct] warning: app_state_set({}) env re-projection: {} \
+             (DB write already committed)",
+            key_for_log, e
+        );
+    }
 }
 
 #[command]
 pub async fn app_state_set(
     key: String,
     value: String,
+    app: tauri::AppHandle,
     db: State<'_, Db>,
 ) -> Result<(), String> {
-    app_state_set_with_db(&db, &key, &value).map(|_| ())
+    // F3 (v0.2.72): the (fast, authoritative) row write happens inline;
+    // the (slow, best-effort, N-subprocess) re-projection is routed
+    // through the spawn_blocking seam below.
+    db.app_state_set(&key, &value)?;
+    reproject_after_app_state_write_blocking(app, key).await;
+    Ok(())
 }
 
 /// Boolean convenience. Returns `null` when the row is absent (so the
@@ -105,13 +123,15 @@ pub async fn app_state_get_bool(
 pub async fn app_state_set_bool(
     key: String,
     value: bool,
+    app: tauri::AppHandle,
     db: State<'_, Db>,
 ) -> Result<(), String> {
     db.app_state_set_bool(&key, value)?;
     // F5 (v0.2.72): same conditional re-projection as `app_state_set`.
     // The known MCP-relevant keys are string-valued, but the generic bool
-    // surface must not become a bypass route.
-    let _ = maybe_reproject_after_app_state_write(&db, &key);
+    // surface must not become a bypass route. F3: routed through
+    // spawn_blocking like the string setter.
+    reproject_after_app_state_write_blocking(app, key).await;
     Ok(())
 }
 
@@ -122,35 +142,32 @@ mod tests {
     /// F5 (v0.2.72): the generic setter re-projects env for MCP-relevant
     /// keys and does NOT for unrelated launcher-state keys. The
     /// `Some`/`None` split is the observable proof of which branch ran.
+    /// Drives the exact write → `maybe_reproject_after_app_state_write`
+    /// sequence the async command runs (with the F3 spawn_blocking seam
+    /// between the two steps in production).
     #[test]
     fn app_state_set_reprojects_only_for_mcp_relevant_keys() {
         let db = Db::open_in_memory().expect("in-memory db");
 
         // MCP-relevant: the ACTIVE_EMBEDDING cascade key the Preferences
         // page writes through the generic command.
-        let report = app_state_set_with_db(
-            &db,
-            crate::commands::project_env_settings::APP_STATE_KEY_ACTIVE_EMBEDDING,
-            "arctic",
-        )
-        .expect("write must succeed");
+        let key = crate::commands::project_env_settings::APP_STATE_KEY_ACTIVE_EMBEDDING;
+        db.app_state_set(key, "arctic").expect("write must succeed");
+        let report = maybe_reproject_after_app_state_write(&db, key);
         assert!(
             report.is_some(),
             "embedding.active_profile write must trigger the env re-projection",
         );
         assert_eq!(
-            db.app_state_get(
-                crate::commands::project_env_settings::APP_STATE_KEY_ACTIVE_EMBEDDING
-            )
-            .unwrap()
-            .as_deref(),
+            db.app_state_get(key).unwrap().as_deref(),
             Some("arctic"),
             "the authoritative DB write must land regardless of projection outcome",
         );
 
         // Not MCP-relevant: an ordinary launcher-state flag.
-        let report = app_state_set_with_db(&db, "onboarding.complete", "true")
+        db.app_state_set("onboarding.complete", "true")
             .expect("write must succeed");
+        let report = maybe_reproject_after_app_state_write(&db, "onboarding.complete");
         assert!(
             report.is_none(),
             "non-MCP-relevant keys must not trigger a machine-global refresh",
@@ -172,13 +189,10 @@ mod tests {
         )
         .expect("insert project");
 
-        let report = app_state_set_with_db(
-            &db,
-            crate::commands::project_env_settings::APP_STATE_KEY_ACTIVE_EMBEDDING,
-            "qwen3",
-        )
-        .expect("write must succeed")
-        .expect("MCP-relevant key must produce a refresh report");
+        let key = crate::commands::project_env_settings::APP_STATE_KEY_ACTIVE_EMBEDDING;
+        db.app_state_set(key, "qwen3").expect("write must succeed");
+        let report = maybe_reproject_after_app_state_write(&db, key)
+            .expect("MCP-relevant key must produce a refresh report");
         assert!(
             report.skipped.contains(&"F5Proj".to_string()),
             "refresh-all must have iterated the registered projects \

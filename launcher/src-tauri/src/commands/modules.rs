@@ -1767,18 +1767,32 @@ pub async fn install_module_for_project(
                 // reload. Gated on rows_inserted > 0 (idempotent
                 // re-installs stay subprocess-free) and soft-fail: a
                 // projection hiccup never blocks the module install.
-                if let Some(refresh_report) =
-                    crate::commands::project_state_populate::reproject_all_after_global_access_seed(
-                        &db,
-                        populate_report.kg_access_rows_inserted,
-                    )
+                // F3: the refresh runs N serial Python subprocesses —
+                // route it through the blocking pool (join errors are
+                // soft-fail too; the seed rows already committed).
+                let rows_inserted = populate_report.kg_access_rows_inserted;
+                match crate::commands::blocking::run_with_db_on_blocking_pool(
+                    app.clone(),
+                    "module-install post-seed env re-projection",
+                    move |db| {
+                        crate::commands::project_state_populate::reproject_all_after_global_access_seed(
+                            db,
+                            rows_inserted,
+                        )
+                    },
+                )
+                .await
                 {
-                    for (name, err) in &refresh_report.failed {
-                        eprintln!(
-                            "[vct] warning: post-seed env re-projection failed for {}: {}",
-                            name, err
-                        );
+                    Ok(Some(refresh_report)) => {
+                        for (name, err) in &refresh_report.failed {
+                            eprintln!(
+                                "[vct] warning: post-seed env re-projection failed for {}: {}",
+                                name, err
+                            );
+                        }
                     }
+                    Ok(None) => {} // 0 rows inserted → no refresh ran
+                    Err(e) => eprintln!("[vct] warning: {}", e),
                 }
             }
         }

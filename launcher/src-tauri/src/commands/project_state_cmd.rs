@@ -792,6 +792,7 @@ fn default_kg_role() -> String {
 pub async fn set_project_kg_binding(
     project_id: String,
     req: SetKgBindingReq,
+    app: tauri::AppHandle,
     db: State<'_, Db>,
 ) -> Result<ProjectKgBinding, String> {
     // v0.2.18 Commit 8: when an embedding_model is supplied, verify it
@@ -813,7 +814,20 @@ pub async fn set_project_kg_binding(
         }
     }
 
-    let row = set_project_kg_binding_row_with_db(&db, &project_id, &req)?;
+    // F3 (v0.2.72): the row write's post-projection can now be
+    // machine-global (F2: orchestrator-root rebind → refresh ALL projects,
+    // N serial Python subprocesses) — run the sync core on the blocking
+    // pool. The write's own Result rides through the join.
+    let role_for_ensure = req.role.clone();
+    let collection_for_ensure = req.collection_name.clone();
+    let weaviate_url_for_ensure = req.weaviate_url.clone();
+    let project_id_for_task = project_id.clone();
+    let row = crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "set_project_kg_binding",
+        move |db| set_project_kg_binding_row_with_db(db, &project_id_for_task, &req),
+    )
+    .await??;
 
     // Bug 2 (2026-04-28): also ensure the Weaviate collection exists.
     // Previously the binding was registered in the DB but the
@@ -825,20 +839,83 @@ pub async fn set_project_kg_binding(
     // if the collection already exists Weaviate returns 422 and we
     // treat that as success. Failure to reach Weaviate is non-fatal —
     // we log a warning and let the user retry from the GUI.
-    if matches!(req.role.as_str(), "primary") {
-        let weaviate_url = req
-            .weaviate_url
+    if matches!(role_for_ensure.as_str(), "primary") {
+        let weaviate_url = weaviate_url_for_ensure
             .as_deref()
             .unwrap_or("http://localhost:8081");
-        if let Err(e) = ensure_kg_collection(weaviate_url, &req.collection_name).await {
+        if let Err(e) = ensure_kg_collection(weaviate_url, &collection_for_ensure).await {
             eprintln!(
                 "[vct] warning: ensure_kg_collection({}) on {}: {}",
-                req.collection_name, weaviate_url, e
+                collection_for_ensure, weaviate_url, e
             );
         }
     }
 
     Ok(row)
+}
+
+/// F2 (v0.2.72): which env re-projection ran after a KG-binding write.
+/// The variant is the observable proof (for tests and callers) of which
+/// scope the projection covered.
+///
+/// The report payloads are read only by the unit tests (production
+/// callers log inside `reproject_after_kg_binding_change` and discard) —
+/// hence the non-test dead_code allowance.
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum KgBindingReprojection {
+    /// The orchestrator-root's primary/shared binding changed. EVERY
+    /// project's projected SHARED_KG_COLLECTION derives from that binding
+    /// (see `vco_lib/config_projection.py::
+    /// _resolve_shared_kg_default_from_launcher_db`), so a single-project
+    /// re-projection would leave every PEER project's settings.json stale
+    /// — and the ensuing global SIGHUP would respawn their MCPs WITH the
+    /// stale env. Machine-global refresh instead.
+    AllProjects(crate::commands::projects_v2::RefreshAllProjectsEnvResult),
+    /// Any other binding: only the target project's env derives from it.
+    SingleProject(crate::commands::projects_v2::RefreshProjectEnvResult),
+}
+
+/// F2 (v0.2.72): shared post-write projection for KG-binding mutations
+/// (set + delete). Root + primary/shared → refresh ALL projects; anything
+/// else → single-project refresh. Soft-fail throughout: failures are
+/// logged and folded into the returned reports; the binding write that
+/// preceded this call is never rolled back.
+///
+/// `role` gates on both "primary" (the canonical shared-KG source) and
+/// "shared" (the root's mirrored row — kept in lockstep by
+/// `set_project_kg_binding_with_root_sync`, but a direct write/delete to
+/// it still changes what peers may resolve, so treat it symmetrically).
+pub fn reproject_after_kg_binding_change(
+    db: &Db,
+    project_id: &str,
+    project_slug: &str,
+    role: &str,
+) -> KgBindingReprojection {
+    let is_root =
+        project_slug == crate::commands::orchestrator_root::ORCHESTRATOR_ROOT_SLUG;
+    if is_root && matches!(role, "primary" | "shared") {
+        let report =
+            crate::commands::projects_v2::refresh_all_projects_env_with_db(db);
+        for w in &report.global_warnings {
+            eprintln!(
+                "[vct] warning: orchestrator-root KG rebind refresh-all: {}",
+                w
+            );
+        }
+        for (name, err) in &report.failed {
+            eprintln!(
+                "[vct] warning: orchestrator-root KG rebind env refresh \
+                 failed for {}: {}",
+                name, err
+            );
+        }
+        KgBindingReprojection::AllProjects(report)
+    } else {
+        KgBindingReprojection::SingleProject(
+            crate::commands::projects_v2::reproject_env_soft(db, project_id),
+        )
+    }
 }
 
 /// Free-function core of `set_project_kg_binding`'s DB write: the
@@ -854,6 +931,11 @@ pub async fn set_project_kg_binding(
 /// what lets the settings watcher's diff-guard fire the guarded MCP
 /// reload for a rebind. Soft-fail: projection warnings ride in the
 /// returned result; the binding write is never rolled back.
+///
+/// F2 (v0.2.72): the projection scope is decided by
+/// `reproject_after_kg_binding_change` — orchestrator-root primary/shared
+/// rebinds refresh EVERY project (peers derive SHARED_KG_COLLECTION from
+/// the root binding); everything else stays single-project.
 pub fn set_project_kg_binding_row_with_db(
     db: &Db,
     project_id: &str,
@@ -888,7 +970,7 @@ pub fn set_project_kg_binding_row_with_db(
         None,
         &serde_json::json!({ "role": req.role, "collection": req.collection_name }),
     )?;
-    let _ = crate::commands::projects_v2::reproject_env_soft(db, project_id);
+    let _ = reproject_after_kg_binding_change(db, project_id, &project_slug, &req.role);
     Ok(row)
 }
 
@@ -896,11 +978,16 @@ pub fn set_project_kg_binding_row_with_db(
 /// + F5 env re-projection (an unbind changes the projected
 /// KG_COLLECTION/SHARED_KG_COLLECTION resolution back to the derived
 /// defaults, so the MCP must be reloaded the same way a rebind is).
+///
+/// F2 (v0.2.72): same scope rule as the set path — deleting the
+/// orchestrator-root's primary/shared binding flips every peer project's
+/// derived SHARED_KG_COLLECTION back to the last-resort default, so the
+/// refresh covers ALL projects in that case.
 pub fn delete_project_kg_binding_with_db(
     db: &Db,
     project_id: &str,
     role: &str,
-) -> Result<crate::commands::projects_v2::RefreshProjectEnvResult, String> {
+) -> Result<KgBindingReprojection, String> {
     db.delete_project_kg_binding(project_id, role)?;
     db.audit(
         "project_kg_binding_delete",
@@ -908,7 +995,15 @@ pub fn delete_project_kg_binding_with_db(
         None,
         &serde_json::json!({ "role": role }),
     )?;
-    Ok(crate::commands::projects_v2::reproject_env_soft(db, project_id))
+    // Resolve the slug for root detection. Soft-fail to empty (→ treated
+    // as non-root, single-project refresh) on a missing project row.
+    let project_slug = db
+        .get_project(project_id)
+        .ok()
+        .flatten()
+        .map(|p| p.slug)
+        .unwrap_or_default();
+    Ok(reproject_after_kg_binding_change(db, project_id, &project_slug, role))
 }
 
 /// Remove a project's KG binding for a given role. Used by the launcher
@@ -925,9 +1020,17 @@ pub fn delete_project_kg_binding_with_db(
 pub async fn delete_project_kg_binding(
     project_id: String,
     role: String,
-    db: State<'_, Db>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
-    delete_project_kg_binding_with_db(&db, &project_id, &role).map(|_| ())
+    // F3 (v0.2.72): the unbind's post-projection can be machine-global
+    // (F2: root primary/shared unbind → refresh ALL projects) — run the
+    // sync core on the blocking pool.
+    crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "delete_project_kg_binding",
+        move |db| delete_project_kg_binding_with_db(db, &project_id, &role).map(|_| ()),
+    )
+    .await?
 }
 
 /// POSTs a canonical KG-collection schema to Weaviate `/v1/schema` if
@@ -1202,10 +1305,135 @@ mod tests {
                 .all(|b| b.role != "primary"),
             "primary binding row must be gone",
         );
+        // F2: a NON-root project's unbind stays single-project scoped.
+        let KgBindingReprojection::SingleProject(result) = result else {
+            panic!("non-root unbind must take the single-project path");
+        };
         assert_eq!(
             result.kg_access_list,
             vec!["PeerProj".to_string()],
             "the delete must re-project env after the write",
+        );
+    }
+
+    // ─── F2 (v0.2.72): orchestrator-root rebind refreshes ALL projects ──
+
+    /// Seed an orchestrator-root project (slug is the detection key the
+    /// projection + root-sync layers use) plus a peer. Folders don't
+    /// exist on disk, so a refresh-all lands every project in `skipped` —
+    /// the observable proof that the machine-global path iterated them.
+    fn seed_root_and_peer(db: &Db) {
+        db.insert_project(
+            "p-root",
+            "RootProj",
+            "/nonexistent/f2-root",
+            ProjectHost::OrchestratorRoot,
+            crate::commands::orchestrator_root::ORCHESTRATOR_ROOT_SLUG,
+        )
+        .unwrap();
+        db.insert_project(
+            "p-peer",
+            "PeerProj",
+            "/nonexistent/f2-peer",
+            ProjectHost::Base,
+            "peerproj",
+        )
+        .unwrap();
+    }
+
+    /// Root + primary → the machine-global refresh runs and iterates
+    /// EVERY registered project (root AND peer), because every project's
+    /// SHARED_KG_COLLECTION derives from the root's primary binding.
+    #[test]
+    fn root_primary_rebind_refreshes_all_projects() {
+        let db = make_db();
+        seed_root_and_peer(&db);
+
+        let result = reproject_after_kg_binding_change(
+            &db,
+            "p-root",
+            crate::commands::orchestrator_root::ORCHESTRATOR_ROOT_SLUG,
+            "primary",
+        );
+        let KgBindingReprojection::AllProjects(report) = result else {
+            panic!("root+primary rebind must take the all-projects path");
+        };
+        assert!(
+            report.skipped.contains(&"RootProj".to_string())
+                && report.skipped.contains(&"PeerProj".to_string()),
+            "refresh-all must have iterated EVERY registered project \
+             (missing-folder projects land in `skipped`); got {:?}",
+            report,
+        );
+    }
+
+    /// Root + shared behaves like primary (the mirrored row is part of the
+    /// shared-KG derivation surface); root + any OTHER role stays
+    /// single-project.
+    #[test]
+    fn root_shared_refreshes_all_but_other_roles_stay_single() {
+        let db = make_db();
+        seed_root_and_peer(&db);
+
+        assert!(matches!(
+            reproject_after_kg_binding_change(
+                &db,
+                "p-root",
+                crate::commands::orchestrator_root::ORCHESTRATOR_ROOT_SLUG,
+                "shared",
+            ),
+            KgBindingReprojection::AllProjects(_)
+        ));
+        assert!(matches!(
+            reproject_after_kg_binding_change(
+                &db,
+                "p-root",
+                crate::commands::orchestrator_root::ORCHESTRATOR_ROOT_SLUG,
+                "archive",
+            ),
+            KgBindingReprojection::SingleProject(_)
+        ));
+    }
+
+    /// Non-root project + primary → single-project path (peers do NOT
+    /// derive anything from a non-root binding).
+    #[test]
+    fn non_root_primary_rebind_stays_single_project() {
+        let db = make_db();
+        seed_root_and_peer(&db);
+
+        assert!(matches!(
+            reproject_after_kg_binding_change(&db, "p-peer", "peerproj", "primary"),
+            KgBindingReprojection::SingleProject(_)
+        ));
+    }
+
+    /// End-to-end through the delete helper: deleting the ROOT's primary
+    /// binding takes the all-projects path (slug resolved from the DB row).
+    #[test]
+    fn delete_root_primary_binding_refreshes_all_projects() {
+        let db = make_db();
+        seed_root_and_peer(&db);
+        let req = SetKgBindingReq {
+            role: "primary".to_string(),
+            collection_name: "Root_KnowledgeGraph".to_string(),
+            embedding_model: None,
+            embedding_dim: None,
+            kg_dir_path: None,
+            weaviate_url: None,
+            config: serde_json::json!({}),
+        };
+        set_project_kg_binding_row_with_db(&db, "p-root", &req).unwrap();
+
+        let result = delete_project_kg_binding_with_db(&db, "p-root", "primary")
+            .expect("root unbind must succeed");
+        let KgBindingReprojection::AllProjects(report) = result else {
+            panic!("root primary unbind must take the all-projects path");
+        };
+        assert!(
+            report.skipped.contains(&"PeerProj".to_string()),
+            "peer projects must be covered by the root-unbind refresh; got {:?}",
+            report,
         );
     }
 

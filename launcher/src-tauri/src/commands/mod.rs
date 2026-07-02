@@ -1,5 +1,8 @@
 pub mod app_state_cmd;
 pub mod audit;
+// F3 (v0.2.72 pre-gate audit): spawn_blocking seam for env re-projections
+// triggered from async Tauri commands (see blocking.rs module docs).
+pub mod blocking;
 pub mod changes_cmd;
 pub mod claude_env;
 pub mod gpu;

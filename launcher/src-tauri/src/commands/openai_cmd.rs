@@ -62,7 +62,7 @@
 //! rejects with an error and the keychain stays untouched.
 
 use serde::{Deserialize, Serialize};
-use tauri::{command, AppHandle, Emitter, Manager, Runtime, State};
+use tauri::{command, AppHandle, Emitter, Runtime, State};
 
 use crate::db::Db;
 use crate::secrets::{self, SecretScope};
@@ -408,12 +408,25 @@ pub async fn register_openai_api_key<R: Runtime>(
         // v0.2.68 Defect D: write BOTH the model id and the canonical
         // `embedding.active_profile` (→ "openai") via the shared helper so
         // populate() resolves "openai", not the "qwen3" fallback.
-        crate::commands::project_env_settings::set_text_embedding_and_profile(
-            &db,
-            OPENAI_DEFAULT_TEXT_MODEL_ID,
-        )?;
-        db.app_state_set(APP_STATE_DEFAULT_CODE_EMBED, OPENAI_DEFAULT_CODE_MODEL_ID)
-            .map_err(|e| format!("app_state_set default_code_embedding: {}", e))?;
+        //
+        // F3 (v0.2.72): `set_text_embedding_and_profile` follows its writes
+        // with a refresh of EVERY project's env (N serial Python
+        // subprocesses) — run the block on the blocking pool. Write errors
+        // still propagate through the join result.
+        crate::commands::blocking::run_with_db_on_blocking_pool(
+            handle.clone(),
+            "register_openai_api_key set-default",
+            |db| -> Result<(), String> {
+                let _ = crate::commands::project_env_settings::set_text_embedding_and_profile(
+                    db,
+                    OPENAI_DEFAULT_TEXT_MODEL_ID,
+                )?;
+                db.app_state_set(APP_STATE_DEFAULT_CODE_EMBED, OPENAI_DEFAULT_CODE_MODEL_ID)
+                    .map_err(|e| format!("app_state_set default_code_embedding: {}", e))?;
+                Ok(())
+            },
+        )
+        .await??;
     }
 
     // Successful re-register clears any pending fallback — if a prior
@@ -452,7 +465,6 @@ pub async fn register_openai_api_key<R: Runtime>(
 #[command]
 pub async fn recheck_openai_validity<R: Runtime>(
     handle: AppHandle<R>,
-    db: State<'_, Db>,
 ) -> Result<OpenAiValidationResult, String> {
     let scope = SecretScope::Shared {
         project_id: SENTINEL_SHARED,
@@ -470,8 +482,24 @@ pub async fn recheck_openai_validity<R: Runtime>(
     // does. Soft-fails (state-machine errors are logged but don't fail
     // the recheck call itself — the validation result is what the GUI
     // most cares about; the state transition is best-effort cleanup).
-    if let Err(e) = apply_recovery_transition(&handle, &db, &result) {
-        eprintln!("[openai] recheck recovery transition warning: {}", e);
+    //
+    // F3 (v0.2.72): the invalid→fallback / valid→restore transitions call
+    // `set_text_embedding_and_profile`, which refreshes EVERY project's env
+    // (N serial Python subprocesses) — run the transition on the blocking
+    // pool instead of this tokio worker.
+    let handle_for_task = handle.clone();
+    let result_for_task = result.clone();
+    match crate::commands::blocking::run_with_db_on_blocking_pool(
+        handle.clone(),
+        "recheck_openai_validity recovery transition",
+        move |db| apply_recovery_transition(&handle_for_task, db, &result_for_task),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) | Err(e) => {
+            eprintln!("[openai] recheck recovery transition warning: {}", e);
+        }
     }
 
     Ok(result)
@@ -603,13 +631,22 @@ pub async fn run_openai_startup_recheck<R: Runtime>(handle: AppHandle<R>) -> Res
     let result = validate_openai_api_key(key, None).await?;
 
     // Resolve DB lazily — Tauri-managed state is only available after
-    // setup() has run; spawning before `db` is registered would crash
-    // try_state. By the time this task wakes the manager has the row.
-    let db_state = match handle.try_state::<Db>() {
-        Some(s) => s,
-        None => return Err("launcher.db state not available".into()),
-    };
-    apply_recovery_transition(&handle, db_state.inner(), &result)
+    // setup() has run; spawning before `db` is registered would crash a
+    // bare state() call. The blocking helper resolves via try_state inside
+    // the task and returns Err when the row isn't registered yet — same
+    // contract as the previous inline check.
+    //
+    // F3 (v0.2.72): the recovery transition can swap machine-global
+    // embedding defaults, which refreshes EVERY project's env (N serial
+    // Python subprocesses) — run it on the blocking pool, not this
+    // runtime task.
+    let handle_for_task = handle.clone();
+    crate::commands::blocking::run_with_db_on_blocking_pool(
+        handle,
+        "run_openai_startup_recheck recovery transition",
+        move |db| apply_recovery_transition(&handle_for_task, db, &result),
+    )
+    .await?
 }
 
 /// Apply the recovery state machine to a fresh validation result. Pure

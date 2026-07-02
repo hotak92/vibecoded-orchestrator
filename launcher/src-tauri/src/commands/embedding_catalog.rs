@@ -371,13 +371,30 @@ pub async fn get_embedding_catalog(
 pub async fn set_default_embedding_models(
     text_model: Option<String>,
     code_model: Option<String>,
+    app: tauri::AppHandle,
     db: State<'_, Db>,
 ) -> Result<(), String> {
     if let Some(ref v) = text_model {
         // v0.2.68 Defect D: also stamp the canonical
         // `embedding.active_profile` so `project_env_settings::populate`
         // doesn't fall back to "qwen3" when the user picked arctic/openai.
-        crate::commands::project_env_settings::set_text_embedding_and_profile(&db, v)?;
+        //
+        // F3 (v0.2.72): the helper follows its app_state writes with a
+        // refresh of EVERY project's env (N serial Python subprocesses) —
+        // run the whole call on the blocking pool instead of a tokio
+        // worker. Write errors still propagate through the join result.
+        let model_id = v.clone();
+        crate::commands::blocking::run_with_db_on_blocking_pool(
+            app.clone(),
+            "set_default_embedding_models",
+            move |db| {
+                crate::commands::project_env_settings::set_text_embedding_and_profile(
+                    db, &model_id,
+                )
+                .map(|_report| ())
+            },
+        )
+        .await??;
     }
     if let Some(ref v) = code_model {
         db.app_state_set(APP_STATE_DEFAULT_CODE_EMBED, v.trim())?;

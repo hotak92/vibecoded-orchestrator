@@ -1464,4 +1464,52 @@ mod tests {
         assert!(matches!(result, Err(keyring::Error::Invalid(_, _))));
         assert_eq!(attempts, 1, "permanent construction error must not retry");
     }
+
+    /// P9 STRUCTURAL GUARD (v0.2.72 pre-gate audit F4). The three pacing
+    /// tests above drive `retry_with_backoff` with STAND-IN closures, so
+    /// reverting the P9 fix in the production fns (hoisting the Entry
+    /// construction back OUT of the retried closure) would keep them
+    /// green. This test pins the SHIPPED source shape instead: every
+    /// Entry-construction call site in this file must appear as the first
+    /// statement inside a `retry_with_backoff` closure, one per hot-path
+    /// fn (`set` / `get` / `delete`).
+    ///
+    /// Whitespace is stripped before matching so rustfmt reflows can't
+    /// break the needles; the needles are assembled from SPLIT string
+    /// literals so this test's own source (also part of secrets.rs) can
+    /// never match them. If you rename the closure binding (`e`) or the
+    /// construction helper, update the needles — the invariant being
+    /// pinned is "construction lives INSIDE the paced+retried closure",
+    /// not the exact spelling.
+    #[test]
+    fn p9_source_shape_entry_construction_inside_retried_closure() {
+        let src = include_str!("secrets.rs");
+        let flat: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+
+        // Any construction call site, paced or not.
+        let construction_needle =
+            String::from("entry_result(scope,") + "module_id,key)";
+        // `retry_with_backoff(|| { let e = <construct>(scope, module_id, key)?;`
+        // — composed from the SAME split parts so neither needle appears
+        // contiguously anywhere in this test's own source.
+        let paced_needle =
+            String::from("retry_with_backoff(||{lete=") + &construction_needle + "?;";
+
+        let paced = flat.matches(paced_needle.as_str()).count();
+        assert_eq!(
+            paced, 3,
+            "set/get/delete must each construct the keyring Entry INSIDE \
+             the retry_with_backoff closure (found {paced} paced \
+             construction sites, expected 3)"
+        );
+
+        let total = flat.matches(construction_needle.as_str()).count();
+        assert_eq!(
+            total, paced,
+            "every Entry-construction call site must live inside a \
+             retry_with_backoff closure — an unpaced `Entry::new` burst is \
+             the exact gnome-keyring crash P9 fixed (found {total} \
+             construction sites, {paced} of them paced)"
+        );
+    }
 }
