@@ -1135,21 +1135,56 @@ fn default_true() -> bool {
     true
 }
 
-// F5 (v0.2.72) audit note — set/delete_project_codegraph_binding do NOT
-// re-project env, deliberately: `config_projection.py` derives
-// CODE_GRAPH_PROJECT from the sanitized project NAME, not from
-// `project_codegraph_bindings` (the binding's collection_prefix is
-// consumed hub-first only). A re-projection after a prefix change would
-// rewrite `.claude/settings.json` byte-identically → the watcher
-// diff-guard hash-matches → no reload — i.e. the refresh would be inert
-// and would only make these commands LOOK covered. Closing the residual
-// staleness (live MCP keeps the old hub-resolved prefix until some other
-// reload) requires projecting the prefix into a hashed env key first;
-// tracked in the F5 audit report, out of scope here.
+// v0.2.72 R2 (F5 residual) — set/delete_project_codegraph_binding now DO
+// re-project env. The pre-R2 audit note here documented a deliberate
+// no-op: `config_projection.py` derived CODE_GRAPH_PROJECT from the
+// sanitized project NAME only, so a refresh after a prefix change would
+// have rewritten `.claude/settings.json` byte-identically (inert —
+// watcher hash-match, no reload). R2 changed the projection to derive
+// CODE_GRAPH_PROJECT binding-prefix-first (hub-consistent; see
+// `vco_lib/config_projection.py::_fetch_codegraph_binding_prefix`), so a
+// prefix rebind NOW moves the projected value → the watcher's hashed
+// CODE_GRAPH_PROJECT key changes (it is in
+// `settings_json_watcher::MCP_RELEVANT_ENV_KEYS`) → the guarded MCP
+// reload fires. Scope is single-project: unlike the shared-KG binding,
+// no peer project derives anything from another project's codegraph
+// binding row.
+
+/// Free-function core of `set_project_codegraph_binding`'s DB write:
+/// binding upsert + audit + R2 env re-projection. Testable without a
+/// Tauri runtime; the `#[command]` wrapper handles the async catalog
+/// validation around it. Soft-fail: projection warnings are logged
+/// inside `reproject_env_soft`; the binding write is never rolled back.
+pub fn set_project_codegraph_binding_row_with_db(
+    db: &Db,
+    project_id: &str,
+    req: &SetCodegraphBindingReq,
+) -> Result<ProjectCodegraphBinding, String> {
+    let row = db.set_project_codegraph_binding(
+        project_id,
+        &req.collection_prefix,
+        req.embedding_model.as_deref(),
+        req.embedding_dim,
+        req.last_analyzed_commit.as_deref(),
+        req.last_analyzed_at,
+        req.enabled,
+        &req.config,
+    )?;
+    db.audit(
+        "project_codegraph_binding_set",
+        Some(project_id),
+        None,
+        &serde_json::json!({ "prefix": req.collection_prefix }),
+    )?;
+    let _ = crate::commands::projects_v2::reproject_env_soft(db, project_id);
+    Ok(row)
+}
+
 #[command]
 pub async fn set_project_codegraph_binding(
     project_id: String,
     req: SetCodegraphBindingReq,
+    app: tauri::AppHandle,
     db: State<'_, Db>,
 ) -> Result<ProjectCodegraphBinding, String> {
     // v0.2.18 Commit 8: same catalog-validation pattern as
@@ -1171,23 +1206,35 @@ pub async fn set_project_codegraph_binding(
         }
     }
 
-    let row = db.set_project_codegraph_binding(
-        &project_id,
-        &req.collection_prefix,
-        req.embedding_model.as_deref(),
-        req.embedding_dim,
-        req.last_analyzed_commit.as_deref(),
-        req.last_analyzed_at,
-        req.enabled,
-        &req.config,
-    )?;
+    // F3 (v0.2.72): the R2 post-projection shells out to Python — run
+    // the sync core on the blocking pool. The write's own Result rides
+    // through the join.
+    let project_id_for_task = project_id.clone();
+    crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "set_project_codegraph_binding",
+        move |db| set_project_codegraph_binding_row_with_db(db, &project_id_for_task, &req),
+    )
+    .await?
+}
+
+/// Free-function core of `delete_project_codegraph_binding` — DB delete
+/// + audit + R2 env re-projection (an unbind flips the projected
+/// CODE_GRAPH_PROJECT back to the name-derived prefix, so the MCP must
+/// be reloaded the same way a rebind is). Returns the refresh result so
+/// tests can observe that the projection ran.
+pub fn delete_project_codegraph_binding_with_db(
+    db: &Db,
+    project_id: &str,
+) -> Result<crate::commands::projects_v2::RefreshProjectEnvResult, String> {
+    db.delete_project_codegraph_binding(project_id)?;
     db.audit(
-        "project_codegraph_binding_set",
-        Some(&project_id),
+        "project_codegraph_binding_delete",
+        Some(project_id),
         None,
-        &serde_json::json!({ "prefix": req.collection_prefix }),
+        &serde_json::json!({}),
     )?;
-    Ok(row)
+    Ok(crate::commands::projects_v2::reproject_env_soft(db, project_id))
 }
 
 /// Remove a project's codegraph binding. Used by the launcher GUI when
@@ -1202,19 +1249,20 @@ pub async fn set_project_codegraph_binding(
 /// only a project_id.
 ///
 /// Idempotent: removing a non-existent project_id is a no-op.
+///
+/// F3 (v0.2.72): the R2 post-projection shells out to Python — run the
+/// sync core on the blocking pool.
 #[command]
 pub async fn delete_project_codegraph_binding(
     project_id: String,
-    db: State<'_, Db>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
-    db.delete_project_codegraph_binding(&project_id)?;
-    db.audit(
-        "project_codegraph_binding_delete",
-        Some(&project_id),
-        None,
-        &serde_json::json!({}),
-    )?;
-    Ok(())
+    crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "delete_project_codegraph_binding",
+        move |db| delete_project_codegraph_binding_with_db(db, &project_id).map(|_| ()),
+    )
+    .await?
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────
@@ -1309,6 +1357,73 @@ mod tests {
         let KgBindingReprojection::SingleProject(result) = result else {
             panic!("non-root unbind must take the single-project path");
         };
+        assert_eq!(
+            result.kg_access_list,
+            vec!["PeerProj".to_string()],
+            "the delete must re-project env after the write",
+        );
+    }
+
+    // ─── R2 (v0.2.72 F5 residual): codegraph-binding writes re-project ──
+
+    fn codegraph_req(prefix: &str) -> SetCodegraphBindingReq {
+        SetCodegraphBindingReq {
+            collection_prefix: prefix.to_string(),
+            embedding_model: None,
+            embedding_dim: None,
+            last_analyzed_commit: None,
+            last_analyzed_at: None,
+            enabled: true,
+            config: serde_json::json!({}),
+        }
+    }
+
+    /// `set_project_codegraph_binding_row_with_db` upserts the binding
+    /// AND re-projects the project's env (CODE_GRAPH_PROJECT derives
+    /// binding-prefix-first in the canonical projection since R2). The
+    /// binding row must land regardless of projection outcome (soft-fail
+    /// contract — mirror of `set_kg_binding_row_persists_and_reprojects`).
+    #[test]
+    fn set_codegraph_binding_row_persists_and_reprojects() {
+        let db = make_db();
+        seed_project(&db, "p-r2-bind", "R2Bind");
+
+        let row =
+            set_project_codegraph_binding_row_with_db(&db, "p-r2-bind", &codegraph_req("Custom_Prefix"))
+                .expect("binding write must succeed");
+        assert_eq!(row.collection_prefix, "Custom_Prefix");
+
+        // The authoritative row is in the DB (projection soft-fail can
+        // never roll it back).
+        let stored = db
+            .get_project_codegraph_binding("p-r2-bind")
+            .unwrap()
+            .expect("binding row present");
+        assert_eq!(stored.collection_prefix, "Custom_Prefix");
+    }
+
+    /// `delete_project_codegraph_binding_with_db` removes the row AND
+    /// re-projects. Proof of the refresh: the returned result carries the
+    /// access list only the refresh path (populate) computes — seeded
+    /// here so the value is deterministic.
+    #[test]
+    fn delete_codegraph_binding_removes_row_and_reprojects() {
+        let db = make_db();
+        seed_project(&db, "p-r2-unbind", "R2Unbind");
+        set_project_codegraph_binding_row_with_db(&db, "p-r2-unbind", &codegraph_req("R2Unbind"))
+            .unwrap();
+        db.kg_set_access("p-r2-unbind", "PeerProj_KnowledgeGraph", "read")
+            .unwrap();
+
+        let result = delete_project_codegraph_binding_with_db(&db, "p-r2-unbind")
+            .expect("unbind must succeed");
+
+        assert!(
+            db.get_project_codegraph_binding("p-r2-unbind")
+                .unwrap()
+                .is_none(),
+            "codegraph binding row must be gone",
+        );
         assert_eq!(
             result.kg_access_list,
             vec!["PeerProj".to_string()],

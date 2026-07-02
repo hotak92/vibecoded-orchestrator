@@ -248,6 +248,22 @@ pub async fn retrieval_tuning_get() -> Result<RetrievalTuning, String> {
 
 /// Persist retrieval tuning values. Validates first; rejects with
 /// `Err(msg)` on any range / ordering violation (no auto-clamp).
+///
+/// v0.2.72 R4 (F5 residual) — NO MCP reload / env re-projection is
+/// needed here, verified against every consumer of
+/// `retrieval-tuning.toml`:
+///   * the hub re-reads the file FRESH on every `/projects/{id}/config`
+///     request (`vct-hub/src/config_api.rs` calls
+///     `retrieval_tuning_io::read_tuning()` inside the request handler —
+///     no startup cache), so resolver clients (`vco_lib/project_config.py`,
+///     `templates/scripts/vct_retrieval_tuning_get.{sh,ps1}`) see the new
+///     values on their next round-trip;
+///   * the weaviate MCP does NOT consume these values at all — its KG
+///     tier thresholds come from the separate, user-managed `KG_TIER_*`
+///     env-var channel (`claude_mcp_servers/weaviate_mcp/server.py`,
+///     `_TIER_THRESHOLDS`), which this command never writes.
+/// i.e. every live consumer resolves per-query; nothing caches this file
+/// at startup, so there is no staleness for a reload to fix.
 #[command]
 pub async fn retrieval_tuning_set(
     tuning: RetrievalTuning,

@@ -848,6 +848,23 @@ def _fetch_module_setting_str_opt(
 APP_STATE_KEY_CODEGRAPH_RETRIEVAL_FLOOR = "codegraph.retrieval_floor"
 APP_STATE_KEY_CODEGRAPH_POST_RERANK_FLOOR = "codegraph.post_rerank_floor"
 
+# v0.2.72 R1 (F5 residual): explicit GUI override for the machine-global
+# shared-KG class name, written by the launcher's SharedKgPicker via
+# ``set_shared_kg_collection_name`` (project_identity.rs).
+#
+# MUST MATCH — the SHARED_KG_COLLECTION resolution is implemented three
+# times and the precedence must stay identical in all three (drift here
+# is the R1 resolver-disagreement bug):
+#   * ``launcher/src-tauri/src/commands/project_env_settings.rs``
+#     (``APP_STATE_KEY_SHARED_KG_NAME`` + ``populate()`` Priority 1)
+#   * ``launcher/src-tauri/vct-hub/src/config_api.rs`` (hub resolver,
+#     app_state override read before the binding-role resolution)
+#   * THIS file (``project_env_from_db``)
+# Precedence in every implementation: non-empty
+# ``app_state[shared_kg.collection_name]`` wins; otherwise each surface's
+# pre-existing binding-derivation chain applies.
+APP_STATE_KEY_SHARED_KG_NAME = "shared_kg.collection_name"
+
 
 def _fetch_app_state_str(
     conn: sqlite3.Connection,
@@ -944,6 +961,52 @@ def _fetch_kg_bindings(
         (project_id,),
     )
     return {str(r["role"]): str(r["collection_name"]) for r in cur.fetchall()}
+
+
+def _fetch_codegraph_binding_prefix(
+    conn: sqlite3.Connection, project_id: str
+) -> Optional[str]:
+    """Return the project's ``project_codegraph_bindings.collection_prefix``.
+
+    v0.2.72 R2 (F5 residual): the CODE_GRAPH_PROJECT env value must derive
+    from the SAME source the hub resolver uses, or the CLI/hooks (env
+    fallback) and the MCP (hub-first) query DIFFERENT code-graph
+    collections after a prefix rebind.
+
+    MUST MATCH the hub's derivation in
+    ``launcher/src-tauri/vct-hub/src/config_api.rs`` (search
+    ``code_graph_collection_prefix``): binding row's ``collection_prefix``
+    first, derived fallback only when no binding row exists. (The two
+    no-row fallbacks differ historically — hub: slug-sanitized; this
+    projection: name-sanitized via :func:`_sanitize_kg_collection` — and
+    both fire only before the first code-graph analysis has written a
+    binding row, when any placeholder prefix is acceptable.)
+
+    Mirrors the hub's ``get_project_codegraph_binding`` read: no
+    ``enabled`` filter — a disabled binding still names the prefix the
+    analyzer last wrote to.
+
+    Soft-fail: missing table (fresh/partial launcher.db), no row, empty /
+    whitespace prefix, or any SQLite error → ``None`` (caller falls back
+    to the name-derived prefix). Never raises.
+    """
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT collection_prefix FROM project_codegraph_bindings "
+            "WHERE project_id = ?",
+            (project_id,),
+        )
+        row = cur.fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    raw = row["collection_prefix"]
+    if not isinstance(raw, str):
+        return None
+    stripped = raw.strip()
+    return stripped if stripped else None
 
 
 # ─── Shared-KG default resolver (v0.2.40 W40-C) ──────────────────────────
@@ -1411,6 +1474,12 @@ def project_env_from_db(
         shared_kg_default: Fallback SHARED_KG_COLLECTION when the
             project's ``shared`` KG binding row is absent.
 
+            **v0.2.72 R1**: a non-empty
+            ``app_state[shared_kg.collection_name]`` override (the GUI
+            SharedKgPicker) is consulted FIRST and wins over both the
+            binding row and this fallback — matching the Rust
+            ``populate()`` Priority-1 semantics.
+
             **v0.2.40 W40-C**: when ``None`` (the new default), the
             resolver consults the launcher's
             ``project_kg_bindings(slug='orchestrator-root',
@@ -1469,19 +1538,35 @@ def project_env_from_db(
         kg_collection = kg_bindings.get(
             "primary", f"{sanitized}_KnowledgeGraph"
         )
-        # v0.2.40 W40-C: when `shared_kg_default` was not provided by
-        # the caller (the new default), resolve from launcher.db's
-        # orchestrator-root primary binding rather than a stale const.
-        # Soft-fail returns the bundled
-        # `_LAST_RESORT_SHARED_KG_NAME` const when the DB is
-        # unreachable / no orchestrator-root row / binding empty.
-        if shared_kg_default is None:
-            resolved_default = _resolve_shared_kg_default_from_launcher_db(
-                db_path=db_path,
-            )
+        # v0.2.72 R1 (F5 residual): the explicit GUI override
+        # `app_state[shared_kg.collection_name]` (SharedKgPicker →
+        # `set_shared_kg_collection_name`) is Priority 1 — it wins over
+        # BOTH the project's own `role='shared'` binding row and the
+        # orchestrator-root derivation, exactly like the Rust
+        # `populate()` (project_env_settings.rs) and the hub resolver
+        # (config_api.rs). See the MUST-MATCH note on
+        # `APP_STATE_KEY_SHARED_KG_NAME`. Empty/absent → fall through to
+        # the binding derivation below (`_fetch_app_state_str` already
+        # coerces empty/whitespace to None).
+        shared_kg_override = _fetch_app_state_str(
+            conn, APP_STATE_KEY_SHARED_KG_NAME
+        )
+        if shared_kg_override:
+            shared_kg = shared_kg_override
         else:
-            resolved_default = shared_kg_default
-        shared_kg = kg_bindings.get("shared", resolved_default)
+            # v0.2.40 W40-C: when `shared_kg_default` was not provided by
+            # the caller (the new default), resolve from launcher.db's
+            # orchestrator-root primary binding rather than a stale const.
+            # Soft-fail returns the bundled
+            # `_LAST_RESORT_SHARED_KG_NAME` const when the DB is
+            # unreachable / no orchestrator-root row / binding empty.
+            if shared_kg_default is None:
+                resolved_default = _resolve_shared_kg_default_from_launcher_db(
+                    db_path=db_path,
+                )
+            else:
+                resolved_default = shared_kg_default
+            shared_kg = kg_bindings.get("shared", resolved_default)
         dev_collection = kg_bindings.get(
             "archive", f"{sanitized}_Development"
         )
@@ -1591,6 +1676,20 @@ def project_env_from_db(
         codegraph_post_rerank_floor = _fetch_app_state_str(
             conn, APP_STATE_KEY_CODEGRAPH_POST_RERANK_FLOOR
         )
+
+        # v0.2.72 R2 (F5 residual): CODE_GRAPH_PROJECT derives
+        # hub-consistently — the project's codegraph binding prefix
+        # (`project_codegraph_bindings.collection_prefix`) first, the
+        # name-sanitized prefix only when no binding row exists. Before
+        # this fix the projection ALWAYS emitted the name-derived prefix,
+        # so a rebound prefix left the CLI/hooks (env fallback) querying a
+        # different set of collections than the MCP (hub-first) — and the
+        # rebind never moved the watcher's hashed CODE_GRAPH_PROJECT key,
+        # so no guarded MCP reload fired. MUST-MATCH note lives on
+        # `_fetch_codegraph_binding_prefix`.
+        code_graph_project = (
+            _fetch_codegraph_binding_prefix(conn, project_id) or sanitized
+        )
     finally:
         try:
             conn.close()
@@ -1663,7 +1762,9 @@ def project_env_from_db(
     )
     _set("DUAL_RL_LOG_ENABLED", "true" if dual_rl_log_enabled else "false")
     _set("PROJECT_NAME", proj.name)
-    _set("CODE_GRAPH_PROJECT", sanitized)
+    # v0.2.72 R2: binding-prefix-first (hub-consistent); see the
+    # resolution comment above where `code_graph_project` is computed.
+    _set("CODE_GRAPH_PROJECT", code_graph_project)
     _set("ACTIVE_EMBEDDING", active_embedding)
     # v0.2.72 T-FLOOR (P1): code-graph two-stage floor overrides (machine-global,
     # from app_state via T-GUI-DB). Emitted only when a value is present — an

@@ -2103,6 +2103,79 @@ mod hub_access_matrix_wiring_tests {
         );
     }
 
+    /// v0.2.72 R3 (F5 residual) — the hub REST binding mutations cannot
+    /// run the env projection (the launcher owns it), so their responses
+    /// carry `"reprojection_required": true` alongside the row fields.
+    /// Headless callers (install.py, bootstrap scripts, the CLI) key off
+    /// the flag to know `.claude/settings.json` is stale until they
+    /// trigger a re-projection.
+    #[tokio::test]
+    async fn hub_http_binding_endpoints_flag_reprojection_required() {
+        let (base, _handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+
+        let create = client
+            .post(format!("{}/cli/projects", base))
+            .json(&serde_json::json!({
+                "name": "FlagProj",
+                "folder_path": ".",
+                "host": "base",
+            }))
+            .send()
+            .await
+            .expect("send");
+        assert!(create.status().is_success());
+        let body: serde_json::Value = create.json().await.expect("json");
+        let pid = body.get("id").and_then(|v| v.as_str()).expect("id").to_string();
+
+        // KG binding: row fields still present + the R3 flag.
+        let resp = client
+            .post(format!("{}/projects/{}/kg-binding", base, pid))
+            .json(&serde_json::json!({
+                "role": "primary",
+                "collection_name": "FlagProj_KnowledgeGraph",
+            }))
+            .send()
+            .await
+            .expect("send");
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.expect("json");
+        assert_eq!(
+            body.get("collection_name").and_then(|v| v.as_str()),
+            Some("FlagProj_KnowledgeGraph"),
+            "binding row fields must survive the flag envelope"
+        );
+        assert_eq!(
+            body.get("reprojection_required").and_then(|v| v.as_bool()),
+            Some(true),
+            "kg-binding response must flag the pending re-projection"
+        );
+
+        // Codegraph binding: same contract (R2 made the prefix
+        // projection-relevant, so the hub-side write is stale-flagged
+        // symmetrically).
+        let resp = client
+            .post(format!("{}/projects/{}/codegraph-binding", base, pid))
+            .json(&serde_json::json!({
+                "collection_prefix": "FlagProj",
+            }))
+            .send()
+            .await
+            .expect("send");
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.expect("json");
+        assert_eq!(
+            body.get("collection_prefix").and_then(|v| v.as_str()),
+            Some("FlagProj"),
+            "binding row fields must survive the flag envelope"
+        );
+        assert_eq!(
+            body.get("reprojection_required").and_then(|v| v.as_bool()),
+            Some(true),
+            "codegraph-binding response must flag the pending re-projection"
+        );
+    }
+
     // ─── Phase 8 / Stream W4 — GET /projects/{id}/access/{collection} ────
     //
     // The WRITE-path gate endpoint consumed by:

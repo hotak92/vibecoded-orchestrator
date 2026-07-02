@@ -179,12 +179,14 @@ pub fn set_text_embedding_and_profile(
 /// through the GENERIC command, not a dedicated setter.
 ///
 /// Deliberately NOT listed:
-///   * `APP_STATE_KEY_SHARED_KG_NAME` — the canonical Python projection
-///     + hub resolver derive SHARED_KG_COLLECTION from the
-///     orchestrator-root primary KG binding and do NOT read this
-///     app_state override (only the Rust `populate()` does). A refresh
-///     would be inert; see the F5 audit note on
-///     `set_shared_kg_collection_name`.
+///   * `APP_STATE_KEY_SHARED_KG_NAME` — written only by the dedicated
+///     `set_shared_kg_collection_name` command, which (v0.2.72 R1)
+///     already refreshes ALL projects itself via
+///     `set_shared_kg_collection_name_with_db`. (Since R1 the Python
+///     projection + hub resolver DO honor this override as Priority 1 —
+///     same precedence as `populate()` below — so the refresh is no
+///     longer inert; it just lives at the dedicated setter, mirroring
+///     the `set_codegraph_floors` pattern.)
 ///   * `codegraph.retrieval_floor` / `codegraph.post_rerank_floor` —
 ///     written only by `set_codegraph_floors`, which already refreshes.
 pub fn app_state_key_triggers_env_reprojection(key: &str) -> bool {
@@ -936,6 +938,15 @@ pub fn populate(
     let active_embedding = resolve_active_embedding_cascade(db, project_id);
 
     // PR-9 (v0.2.11): shared KG resolution with three-tier priority.
+    //
+    // v0.2.72 R1 (F5 residual): the Priority-1 app_state override MUST
+    // MATCH the other two SHARED_KG_COLLECTION resolvers —
+    // `vco_lib/config_projection.py::project_env_from_db` (the canonical
+    // .claude/{settings.json,env} writer) and the hub resolver in
+    // `launcher/src-tauri/vct-hub/src/config_api.rs` — all three honor a
+    // non-empty `app_state[shared_kg.collection_name]` first. Pre-R1 only
+    // this populate() did, so the three surfaces disagreed whenever the
+    // SharedKgPicker override was set.
     //
     // Priority 1: explicit user override in `app_state` (preserves any
     //             manually-set value via the GUI's existing setting).

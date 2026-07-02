@@ -1374,24 +1374,29 @@ pub async fn list_orchestrator_kg_collections(
     Ok(extract_orchestrator_shaped_classes(&schema))
 }
 
-/// Persist the user's pick from the SharedKgPicker as the canonical
-/// shared KG class name (`app_state[shared_kg.collection_name]`).
+/// Free-function core of `set_shared_kg_collection_name` — validation +
+/// `app_state` write + audit + machine-global env re-projection.
+/// Testable without a Tauri runtime; the `#[command]` wrapper routes it
+/// through the blocking pool (F3 pattern).
 ///
-/// Validation:
-///   * `name` non-empty, length <= 100.
-///   * Matches Weaviate class-name shape (letter-prefix, [A-Za-z0-9_]+).
-///   * Ends with `_KnowledgeGraph` — the launcher's env writers + every
-///     consumer in the codebase assume the shared KG suffix is this
-///     literal string. Refusing other suffixes prevents users from
-///     accidentally pointing the shared-KG knob at a code-graph or
-///     development class.
+/// v0.2.72 R1 (F5 residual): the override this writes changes EVERY
+/// project's resolved SHARED_KG_COLLECTION — it is Priority 1 in all
+/// three resolvers (`populate()` here in the launcher, the hub's
+/// `config_api.rs`, and the canonical Python projection
+/// `vco_lib/config_projection.py`; see the MUST-MATCH note on
+/// `APP_STATE_KEY_SHARED_KG_NAME`'s Python mirror). A single-project
+/// refresh would leave every peer's `.claude/settings.json` stale, so we
+/// refresh ALL projects — the settings watcher's diff-guard then fires
+/// the guarded MCP reload wherever the hashed SHARED_KG_COLLECTION value
+/// actually moved.
 ///
-/// Audit-logged via `db.audit("shared_kg_collection_name_set", ...)`.
-#[command]
-pub async fn set_shared_kg_collection_name(
-    name: String,
-    db: State<'_, Db>,
-) -> Result<(), String> {
+/// Soft-fail contract: the app_state write is the authoritative
+/// operation; a projection hiccup is folded into the returned report
+/// (and logged), never rolled back and never surfaced as `Err`.
+pub fn set_shared_kg_collection_name_with_db(
+    db: &Db,
+    name: &str,
+) -> Result<crate::commands::projects_v2::RefreshAllProjectsEnvResult, String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err("shared KG name cannot be empty".into());
@@ -1426,7 +1431,51 @@ pub async fn set_shared_kg_collection_name(
         &serde_json::json!({ "new_value": trimmed }),
     )
     .ok();
-    Ok(())
+    let report = crate::commands::projects_v2::refresh_all_projects_env_with_db(db);
+    for w in &report.global_warnings {
+        eprintln!(
+            "[vct] warning: shared-KG name override refresh-all: {}",
+            w
+        );
+    }
+    for (proj_name, err) in &report.failed {
+        eprintln!(
+            "[vct] warning: shared-KG name override env refresh failed \
+             for {}: {}",
+            proj_name, err
+        );
+    }
+    Ok(report)
+}
+
+/// Persist the user's pick from the SharedKgPicker as the canonical
+/// shared KG class name (`app_state[shared_kg.collection_name]`).
+///
+/// Validation:
+///   * `name` non-empty, length <= 100.
+///   * Matches Weaviate class-name shape (letter-prefix, [A-Za-z0-9_]+).
+///   * Ends with `_KnowledgeGraph` — the launcher's env writers + every
+///     consumer in the codebase assume the shared KG suffix is this
+///     literal string. Refusing other suffixes prevents users from
+///     accidentally pointing the shared-KG knob at a code-graph or
+///     development class.
+///
+/// Audit-logged via `db.audit("shared_kg_collection_name_set", ...)`.
+///
+/// F3 (v0.2.72): the write's post-projection is machine-global (R1:
+/// refresh ALL projects, N serial Python subprocesses) — the sync core
+/// runs on the blocking pool.
+#[command]
+pub async fn set_shared_kg_collection_name(
+    name: String,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "set_shared_kg_collection_name",
+        move |db| set_shared_kg_collection_name_with_db(db, &name).map(|_| ()),
+    )
+    .await?
 }
 
 fn resolve_weaviate_url(cfg: &LocalConfig) -> String {
@@ -1903,6 +1952,68 @@ mod tests {
         assert!(validate_shared_kg_name("has-dash_KnowledgeGraph").is_err());
         let too_long = format!("{}_KnowledgeGraph", "F".repeat(95));
         assert!(validate_shared_kg_name(&too_long).is_err());
+    }
+
+    // ─── v0.2.72 R1 (F5 residual): setter refreshes ALL projects ──────
+
+    /// `set_shared_kg_collection_name_with_db` writes the app_state
+    /// override AND runs the machine-global env refresh (every project's
+    /// SHARED_KG_COLLECTION derives from this Priority-1 key). Proof of
+    /// the refresh: the returned report iterated the registered projects
+    /// (missing-folder projects land in `skipped` — a value only the
+    /// refresh-all path computes). Mirrors the F3/F5 pattern pinned by
+    /// `app_state_cmd::app_state_set_refresh_report_covers_registered_projects`.
+    #[test]
+    fn shared_kg_name_set_persists_and_refreshes_all_projects() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        db.insert_project(
+            "p-r1",
+            "R1Proj",
+            "/nonexistent/r1-proj-folder",
+            crate::db::models::ProjectHost::Base,
+            "r1proj",
+        )
+        .expect("insert project");
+
+        let report =
+            set_shared_kg_collection_name_with_db(&db, "TeamWide_KnowledgeGraph")
+                .expect("valid name must succeed");
+
+        // Authoritative write landed (soft-fail refresh can never roll
+        // it back).
+        assert_eq!(
+            db.app_state_get(
+                crate::commands::project_env_settings::APP_STATE_KEY_SHARED_KG_NAME
+            )
+            .unwrap()
+            .as_deref(),
+            Some("TeamWide_KnowledgeGraph"),
+        );
+        // The machine-global refresh iterated every registered project.
+        assert!(
+            report.skipped.contains(&"R1Proj".to_string()),
+            "refresh-all must have iterated the registered projects \
+             (missing-folder project lands in `skipped`); got {:?}",
+            report,
+        );
+    }
+
+    /// Validation failure → NO write, NO refresh (the leave-alone case
+    /// of the destructive-action decision).
+    #[test]
+    fn shared_kg_name_set_invalid_name_writes_nothing() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let err = set_shared_kg_collection_name_with_db(&db, "BadSuffix_Development")
+            .expect_err("wrong suffix must be rejected");
+        assert!(err.contains("_KnowledgeGraph"), "err was: {}", err);
+        assert_eq!(
+            db.app_state_get(
+                crate::commands::project_env_settings::APP_STATE_KEY_SHARED_KG_NAME
+            )
+            .unwrap(),
+            None,
+            "a rejected name must not touch app_state",
+        );
     }
 
     // ─── v0.2.15 (0.4): orphan-detection helpers ─────────────────────────

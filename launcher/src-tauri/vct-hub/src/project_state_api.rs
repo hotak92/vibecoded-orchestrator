@@ -446,6 +446,40 @@ fn default_kg_role() -> String {
     "primary".into()
 }
 
+/// Serialize a binding row and flag it with `"reprojection_required":
+/// true` (v0.2.72 R3, F5 residual).
+///
+/// WHY the flag instead of re-projecting here: the launcher OWNS env
+/// projection — `.claude/{settings.json,env}` are written by
+/// `python -m vco_lib.config_projection`, which the launcher-side
+/// commands invoke via `projects_v2::reproject_env_soft` /
+/// `refresh_all_projects_env_with_db`. The hub process has NO
+/// python-spawn pattern (its only subprocesses are its own binary,
+/// systemctl/launchctl/schtasks boot glue, and container runtimes) and
+/// no reliable view of the projection interpreter/venv, so spawning the
+/// projection from here would be a new, fragile cross-process contract.
+/// Instead the mutation response is marked machine-readably: a caller
+/// that mutates bindings through the hub REST surface must follow up
+/// with a re-projection (e.g. `python -m vco_lib.config_projection
+/// apply --project <folder>` from the project's environment, or any
+/// launcher-driven refresh) or the on-disk `.claude/settings.json` stays
+/// stale until an unrelated write. No in-repo production caller uses
+/// these endpoints today (they exist for headless callers: install.py
+/// clones, bootstrap scripts, the `vibecoded` CLI) — the flag makes the
+/// contract explicit for those external callers.
+fn binding_response_with_reprojection_flag<T: serde::Serialize>(
+    row: &T,
+) -> axum::response::Response {
+    let mut body = serde_json::to_value(row).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "reprojection_required".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    Json(body).into_response()
+}
+
 async fn set_kg_binding(
     State(h): State<LauncherDbHandle>,
     Path(project_id): Path<String>,
@@ -462,6 +496,13 @@ async fn set_kg_binding(
     // project's slug to detect the orchestrator-root case, so we look
     // it up first; failing the lookup before any DB write is the right
     // failure mode (caller sees 400, no half-state).
+    //
+    // v0.2.72 R3 (F5 residual): this endpoint mutates rows that the env
+    // projection derives KG_COLLECTION / SHARED_KG_COLLECTION from, but
+    // the hub cannot run the projection (see
+    // `binding_response_with_reprojection_flag`) — the response is
+    // flagged so callers know `.claude/settings.json` is stale until
+    // they re-project.
     let project_slug = match h.0.get_project(&project_id) {
         Ok(Some(row)) => row.slug,
         Ok(None) => return err400(format!("project {} not found", project_id)),
@@ -478,7 +519,7 @@ async fn set_kg_binding(
         body.weaviate_url.as_deref(),
         &body.config,
     ) {
-        Ok(row) => Json(row).into_response(),
+        Ok(row) => binding_response_with_reprojection_flag(&row),
         Err(e) => err400(e),
     }
 }
@@ -504,6 +545,13 @@ async fn set_codegraph_binding(
     Path(project_id): Path<String>,
     Json(body): Json<SetCodegraphBindingBody>,
 ) -> impl IntoResponse {
+    // v0.2.72 R3 (F5 residual): same staleness contract as
+    // `set_kg_binding` above — since R2 the env projection derives
+    // CODE_GRAPH_PROJECT from `project_codegraph_bindings.
+    // collection_prefix`, so a hub-driven prefix write leaves
+    // `.claude/settings.json` stale until the caller re-projects. The
+    // response is flagged accordingly (see
+    // `binding_response_with_reprojection_flag`).
     match h.0.set_project_codegraph_binding(
         &project_id,
         &body.collection_prefix,
@@ -514,7 +562,7 @@ async fn set_codegraph_binding(
         body.enabled,
         &body.config,
     ) {
-        Ok(row) => Json(row).into_response(),
+        Ok(row) => binding_response_with_reprojection_flag(&row),
         Err(e) => err400(e),
     }
 }
