@@ -1074,11 +1074,37 @@ def _get_code_format(file_path: str, full_name: str, level: str):
 #
 # Tunable at runtime via env-var overrides (kept as module constants so tests and
 # rl_kg_search can override without monkey-patching imports).
+def _safe_float(env_name: str, default: str) -> float:
+    """Parse a float from an env var, tolerating a user typo.
+
+    D-12 (v0.2.73): KG_TIER_*/CODE_TIER_* are user-documented tunables
+    (CLAUDE.md). Previously `float(os.getenv(...))` ran at MODULE SCOPE, so
+    a locale-comma or typo (e.g. KG_TIER_MIN=0,42) raised ValueError during
+    import → the ENTIRE weaviate-kg MCP failed to start and every KG +
+    codegraph tool disappeared behind a startup traceback the hook contract
+    mostly hides. A tunable knob must not be a kill switch: on a bad value
+    we log a WARNING and fall back to the calibrated default.
+    """
+    raw = os.getenv(env_name)
+    if raw is None or raw.strip() == "":
+        return float(default)
+    try:
+        return float(raw)
+    except (ValueError, TypeError):
+        logger.warning(
+            "%s=%r is not a valid float; using default %s. "
+            "(Tier knobs must be a plain decimal like 0.42 — a comma or "
+            "stray character here would otherwise crash the whole MCP.)",
+            env_name, raw, default,
+        )
+        return float(default)
+
+
 _TIER_THRESHOLDS: dict[str, float] = {
-    "min":          float(os.getenv("KG_TIER_MIN",          "0.42")),
-    "single_chunk": float(os.getenv("KG_TIER_SINGLE_CHUNK", "0.55")),
-    "three_chunks": float(os.getenv("KG_TIER_THREE_CHUNKS", "0.65")),
-    "full":         float(os.getenv("KG_TIER_FULL",         "0.75")),
+    "min":          _safe_float("KG_TIER_MIN",          "0.42"),
+    "single_chunk": _safe_float("KG_TIER_SINGLE_CHUNK", "0.55"),
+    "three_chunks": _safe_float("KG_TIER_THREE_CHUNKS", "0.65"),
+    "full":         _safe_float("KG_TIER_FULL",         "0.75"),
 }
 
 # v0.2.72 (P4): CODE-path tier thresholds — a SEPARATE, lower-calibrated gate
@@ -1104,10 +1130,10 @@ _TIER_THRESHOLDS: dict[str, float] = {
 #   >= 0.62             → full (up to 7 chunks)
 # Overridable via CODE_TIER_* env vars (parallel to KG_TIER_*).
 _CODE_TIER_THRESHOLDS: dict[str, float] = {
-    "min":          float(os.getenv("CODE_TIER_MIN",          "0.22")),
-    "single_chunk": float(os.getenv("CODE_TIER_SINGLE_CHUNK", "0.32")),
-    "three_chunks": float(os.getenv("CODE_TIER_THREE_CHUNKS", "0.48")),
-    "full":         float(os.getenv("CODE_TIER_FULL",         "0.62")),
+    "min":          _safe_float("CODE_TIER_MIN",          "0.22"),
+    "single_chunk": _safe_float("CODE_TIER_SINGLE_CHUNK", "0.32"),
+    "three_chunks": _safe_float("CODE_TIER_THREE_CHUNKS", "0.48"),
+    "full":         _safe_float("CODE_TIER_FULL",         "0.62"),
 }
 
 # Per-tier chunk window (how many chunks to assemble from a chunked node)
@@ -4021,6 +4047,17 @@ def _enrich_with_adjacent_chunks(coll, results: list[dict], collection_name: str
     For each chunked result in *results*, fetch adjacent chunks (N-1, N+1)
     and merge them into the list with deduplication by (title, chunk_number).
 
+    KG-2 (v0.2.73): neighbours are only RENDERED at the `three_chunks` and
+    `full` tiers — the `summary` / `single_chunk` tiers show just the matched
+    chunk. Fetching neighbours for a result that will land below the
+    `three_chunks` tier is a wasted Weaviate round-trip whose rows the tier
+    budget then discards. So we only fetch neighbours for results whose score
+    is at least the `single_chunk` threshold (one tier below three_chunks —
+    a conservative margin that still fetches for a result an RL rerank might
+    bump UP into a neighbour-rendering tier, but skips the clearly-summary
+    band). Results with no score (score unavailable) keep the old behaviour
+    (fetch) so we never regress a legitimately-needed neighbour.
+
     Args:
         coll: Weaviate collection handle
         results: List of formatted result dicts (from _format_obj)
@@ -4038,19 +4075,44 @@ def _enrich_with_adjacent_chunks(coll, results: list[dict], collection_name: str
             seen.add(key)
             combined.append(r)
 
-    # Fetch neighbours for chunked hits
+    # KG-2: the gate below which neighbour-fetch is pure waste. Use the KG
+    # gate's single_chunk threshold as the conservative floor (three_chunks
+    # is the first tier that renders neighbours; single_chunk gives a
+    # one-tier rerank margin).
+    _neighbour_floor = _TIER_THRESHOLDS["single_chunk"]
+
+    def _score_of(r: dict) -> float | None:
+        # score_cosine (1.0 - distance) is what results carry at enrich time
+        # (before combined_score / _rerank are computed downstream); the
+        # others cover the reranked / code-path shapes if this helper is
+        # ever reused post-rerank.
+        for k in ("combined_score", "_rerank", "score_cosine", "score", "_s"):
+            v = r.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    # Fetch neighbours for chunked hits that could actually render them.
     for r in list(combined):
         cn = r.get("chunk_number")
         tc = r.get("total_chunks")
-        if cn is not None and tc is not None:
-            neighbours = _fetch_adjacent_chunks(
-                coll, r["title"], cn, tc, collection_name
-            )
-            for nb in neighbours:
-                nb_key = (nb.get("title", ""), nb.get("chunk_number"))
-                if nb_key not in seen:
-                    seen.add(nb_key)
-                    combined.append(nb)
+        if cn is None or tc is None:
+            continue
+        sc = _score_of(r)
+        if sc is not None and sc < _neighbour_floor:
+            # Will render at summary/single_chunk → neighbours discarded; skip.
+            continue
+        neighbours = _fetch_adjacent_chunks(
+            coll, r["title"], cn, tc, collection_name
+        )
+        for nb in neighbours:
+            nb_key = (nb.get("title", ""), nb.get("chunk_number"))
+            if nb_key not in seen:
+                seen.add(nb_key)
+                combined.append(nb)
 
     return combined
 
@@ -7643,38 +7705,53 @@ async def _hybrid_search_body(
     merged: dict = {}
     failed_collections_schema: list[str] = []
     successful_collections: list[str] = []
-    for coll_name in collections_to_search:
-        try:
-            coll_combined = await _hybrid_search_single_collection(
+
+    # KG-1 (v0.2.73): fan out to the collections CONCURRENTLY instead of
+    # awaiting each in sequence. The three collections (project KG + shared
+    # KG + dev/diagrams) are independent Weaviate round-trips, so total
+    # latency is now max(per-collection) not sum. Each coroutine still gets
+    # its own per-collection error classification below — a schema-missing
+    # shared class is skipped, while an instance-level unreachable/auth
+    # error bubbles (post-gather, after cache reset).
+    _coll_results = await asyncio.gather(
+        *[
+            _hybrid_search_single_collection(
                 coll_name, query, fetch_limit, weaviate_filter, date_filter,
                 include_stale=include_stale,
             )
+            for coll_name in collections_to_search
+        ],
+        return_exceptions=True,
+    )
+    for coll_name, coll_combined in zip(collections_to_search, _coll_results):
+        if not isinstance(coll_combined, Exception):
             for key, item in coll_combined.items():
                 if key not in merged or item["combined_score"] > merged[key]["combined_score"]:
                     merged[key] = item
             successful_collections.append(coll_name)
-        except Exception as e:
-            # Loud-fail v2: don't swallow Weaviate-unreachable. Connection-time
-            # failures fire from get_weaviate_client(); query-time failures
-            # (cached client + Weaviate stopped mid-session) fire here.
-            classified = _classify_weaviate_failure(e)
-            if isinstance(classified, WeaviateUnreachable):
-                _reset_weaviate_client_cache()
-                raise classified from e
-            if isinstance(classified, WeaviateAuthError):
-                # Auth errors persist; don't churn the connection.
-                raise classified from e
-            if isinstance(classified, WeaviateSchemaError):
-                # v0.2.24: per-collection schema error → skip + record,
-                # don't bubble. The shared-KG class may be missing on
-                # this machine while the project KG resolves fine.
-                logger.warning(
-                    "hybrid_search: skipping collection '%s' (schema error: %s)",
-                    coll_name, classified,
-                )
-                failed_collections_schema.append(coll_name)
-                continue
-            logger.warning(f"hybrid_search: error searching {coll_name}: {e}")
+            continue
+        e = coll_combined
+        # Loud-fail v2: don't swallow Weaviate-unreachable. Connection-time
+        # failures fire from get_weaviate_client(); query-time failures
+        # (cached client + Weaviate stopped mid-session) fire here.
+        classified = _classify_weaviate_failure(e)
+        if isinstance(classified, WeaviateUnreachable):
+            _reset_weaviate_client_cache()
+            raise classified from e
+        if isinstance(classified, WeaviateAuthError):
+            # Auth errors persist; don't churn the connection.
+            raise classified from e
+        if isinstance(classified, WeaviateSchemaError):
+            # v0.2.24: per-collection schema error → skip + record,
+            # don't bubble. The shared-KG class may be missing on
+            # this machine while the project KG resolves fine.
+            logger.warning(
+                "hybrid_search: skipping collection '%s' (schema error: %s)",
+                coll_name, classified,
+            )
+            failed_collections_schema.append(coll_name)
+            continue
+        logger.warning(f"hybrid_search: error searching {coll_name}: {e}")
 
     # If EVERY collection in the fan-out schema-failed → instance-level
     # problem; bubble. But first log a degraded-mode retrieval event so
@@ -8266,12 +8343,15 @@ async def store_knowledge_node(
         # Priority for md_path:
         #   1. Absolute file_path → use directly
         #   2. Relative + KG_BASE_DIR → KG_BASE_DIR / file_path
-        #   3. Relative + no KG_BASE_DIR → _SERVER_INFERRED_BASE / file_path
+        #   3. Relative + CLAUDE_PROJECT_DIR (D-10) → that project root
+        #   4. Relative + neither → _SERVER_INFERRED_BASE / file_path
+        #      (LAST resort — writes into the orchestrator clone; flagged)
         #
         # rel_file_path: always relative (strip base prefix from absolute inputs).
         # -------------------------------------------------------------------------
         md_path: Optional[Path] = None
         rel_file_path: str = file_path  # default: use as-is if already relative
+        wrote_outside_project: bool = False
 
         if file_path:
             fp = Path(file_path)
@@ -8291,10 +8371,33 @@ async def store_knowledge_node(
             elif KG_BASE_DIR:
                 md_path = Path(KG_BASE_DIR) / file_path
             else:
-                md_path = _SERVER_INFERRED_BASE / file_path
-                logger.info(
-                    f"KG_BASE_DIR not set — using inferred project root: {md_path}"
-                )
+                # D-10 (v0.2.73): before falling back to the SERVER-inferred
+                # base (which lands the .md inside the ORCHESTRATOR CLONE, not
+                # the user's project — a boundary violation the tool then
+                # reports as success), prefer CLAUDE_PROJECT_DIR via the same
+                # resolver the deferral writer uses. This is the documented
+                # env-propagation footgun class (inert .vscode channel,
+                # subagent env loss): a relative file_path + unset KG_BASE_DIR
+                # should still resolve to the project when CLAUDE_PROJECT_DIR
+                # is present.
+                _proj_root = _resolve_project_root_for_deferral()
+                if _proj_root is not None:
+                    md_path = _proj_root / file_path
+                    logger.info(
+                        f"KG_BASE_DIR not set — resolved via CLAUDE_PROJECT_DIR/"
+                        f"KG_BASE_DIR fallback chain to project root: {md_path}"
+                    )
+                else:
+                    md_path = _SERVER_INFERRED_BASE / file_path
+                    wrote_outside_project = True
+                    logger.warning(
+                        "KG_BASE_DIR and CLAUDE_PROJECT_DIR both unset — writing "
+                        "the .md into the ORCHESTRATOR CLONE (%s), NOT the user's "
+                        "project. The Weaviate row targets the project's "
+                        "KG_COLLECTION, so this stray file is clone-side sync "
+                        "noise. Set KG_BASE_DIR or pass an absolute file_path.",
+                        md_path,
+                    )
             # rel_file_path stays as file_path for relative inputs (already correct)
 
         # Locate existing rows for THIS node (v0.2.73 D-1): scope the match to
@@ -8451,6 +8554,14 @@ async def store_knowledge_node(
         }
         if md_path is not None:
             result["absolute_path"] = str(md_path)
+        if wrote_outside_project:
+            # D-10: make the boundary violation visible in the tool result,
+            # not just a log line the hook contract hides.
+            result["file_note"] = (
+                "wrote outside project: KG_BASE_DIR and CLAUDE_PROJECT_DIR "
+                "both unset, so the .md landed in the orchestrator clone. "
+                "Set KG_BASE_DIR or pass an absolute file_path."
+            )
         if path_adjustments:
             result["path_adjustments"] = path_adjustments
         if file_write_error:
