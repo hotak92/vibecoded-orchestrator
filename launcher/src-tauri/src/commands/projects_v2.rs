@@ -3393,6 +3393,13 @@ pub fn write_project_env_files(
         .map(|s| s.as_str())
         .chain(std::iter::once("GITHUB_TOKEN"))
         .collect();
+    // Deliberate: the VALUE-bearing fields are resolved by `populate()`
+    // (spec §B item 3 — `resolve_user_secret_state` keeps producing
+    // pairs; the hub's user-secret loop shares the same bucket logic in
+    // vct-launcher-core) but this writer IGNORES the value side — that
+    // is the invariant. The explicit no-op read keeps dead-code lint
+    // honest without changing the settings struct.
+    let _ = (&settings.user_secret_pairs, &settings.github_token);
 
     // PR-27 (v0.2.12, 2026-05-16): the historical write to
     // `.vscode/settings.json` `claude-code.env` was removed here.
