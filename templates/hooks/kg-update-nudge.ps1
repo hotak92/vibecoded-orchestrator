@@ -106,9 +106,41 @@ FIRST_THRESHOLD = int(os.environ.get("_KG_NUDGE_FIRST", "175000"))
 INTERVAL = int(os.environ.get("_KG_NUDGE_INTERVAL", "50000"))
 METRICS_FILE = os.environ.get("_KG_NUDGE_METRICS", "")
 METRIC_VERSION = os.environ.get("_KG_NUDGE_VERSION", "v10")
+# HK-4 / D-7 (v0.2.73): stable-sidecar lockfile guards the read-modify-write
+# of the shared JSONL (no-op fcntl-on-mkstemp bug fixed on the .sh side; the
+# .ps1 body uses a portable O_CREAT|O_EXCL spin-lock since fcntl is absent on
+# Windows). Stale-session GC drops rows older than KG_NUDGE_GC_DAYS.
+LOCKFILE = (METRICS_FILE + ".lock") if METRICS_FILE else ""
+GC_MAX_AGE_DAYS = int(os.environ.get("KG_NUDGE_GC_DAYS", "14"))
 
 if not INPUT or not METRICS_FILE:
     sys.exit(0)
+
+import time as _time
+def _acquire_lock(path, attempts=50, delay=0.02):
+    """Portable exclusive lock via O_CREAT|O_EXCL; returns fd or None."""
+    if not path:
+        return None
+    for _ in range(attempts):
+        try:
+            return os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        except FileExistsError:
+            _time.sleep(delay)
+        except OSError:
+            return None
+    return None  # gave up — proceed unlocked best-effort
+
+def _release_lock(fd, path):
+    if fd is None:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 try:
     payload = json.loads(INPUT)
@@ -182,7 +214,10 @@ if _have_scanner and transcript_path and os.path.exists(transcript_path):
     session_total = scan_result.work_units_total
     escape_marker_token_total = _escape_holder[0]
 
-# --- Read existing state ---
+# HK-4 / D-7: acquire the stable lock for the whole read-modify-write.
+_lock_fd = _acquire_lock(LOCKFILE)
+
+# --- Read existing state (inside the lock) ---
 state = {}
 if os.path.exists(METRICS_FILE):
     try:
@@ -281,6 +316,27 @@ current["updated_at"] = datetime.now(timezone.utc).isoformat()
 current["metric_version"] = METRIC_VERSION
 state[session_id] = current
 
+# --- HK-4 / D-7: stale-session GC (mirror of the .sh body) ---
+if GC_MAX_AGE_DAYS > 0:
+    from datetime import timedelta
+    _cutoff = datetime.now(timezone.utc) - timedelta(days=GC_MAX_AGE_DAYS)
+    _kept = {}
+    for sid, entry in state.items():
+        if sid == session_id:
+            _kept[sid] = entry
+            continue
+        _ua = entry.get("updated_at")
+        try:
+            _dt = datetime.fromisoformat(str(_ua))
+            if _dt.tzinfo is None:
+                _dt = _dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            _kept[sid] = entry
+            continue
+        if _dt >= _cutoff:
+            _kept[sid] = entry
+    state = _kept
+
 # --- Atomic write (cross-OS via os.replace + temp file in same dir) ---
 try:
     dir_ = os.path.dirname(METRICS_FILE)
@@ -299,6 +355,8 @@ try:
             pass
 except (OSError, ValueError):
     pass
+finally:
+    _release_lock(_lock_fd, LOCKFILE)
 
 sys.exit(0)
 '@
