@@ -13,6 +13,7 @@
 //!   POST   /api/v1/rl/events            — insert one event (used by MCP)
 //!   GET    /api/v1/rl/events            — list events (dashboard / offline trainer)
 //!   GET    /api/v1/rl/events/count      — count events (Identity-tab badge)
+//!   POST   /api/v1/rl/events/prune      — prune events by age / row-cap (RL-5 retention)
 //!
 //! Auth: standard hub.token bearer middleware applies (mounted INSIDE the
 //! hub-wide `auth::require_auth` layer in `server.rs`).
@@ -36,6 +37,7 @@ pub fn router() -> Router<LauncherDbHandle> {
     Router::new()
         .route("/rl/events", post(post_event).get(list_events))
         .route("/rl/events/count", get(count_events))
+        .route("/rl/events/prune", post(prune_events))
 }
 
 // ─── POST /api/v1/rl/events ────────────────────────────────────────────
@@ -273,6 +275,64 @@ async fn count_events(
     }
 }
 
+// ─── POST /api/v1/rl/events/prune ──────────────────────────────────────
+
+/// Prune-request body (RL-5 retention). ALL fields optional — the Python
+/// retention driver omits fields it isn't bounding on.
+///
+///   * `cutoff_ms` — delete events with `ts < cutoff_ms` (age bound).
+///   * `max_rows`  — keep only the newest `max_rows` rows (row-cap bound).
+///   * `project_id` — scope the prune to one project; absent → all projects.
+///
+/// An empty body `{}` (all None) is a valid no-op: the DB method deletes
+/// nothing and returns 0. This matches the writer's soft-fail contract and
+/// guards against ever wiping the corpus on a misfired prune.
+#[derive(Debug, Deserialize)]
+pub struct PruneEventsBody {
+    #[serde(default)]
+    pub cutoff_ms: Option<i64>,
+    #[serde(default)]
+    pub max_rows: Option<i64>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PruneEventsResponse {
+    pub ok: bool,
+    pub deleted: u64,
+}
+
+async fn prune_events(
+    State(h): State<LauncherDbHandle>,
+    Json(body): Json<PruneEventsBody>,
+) -> impl IntoResponse {
+    match h.0.prune_rl_events(
+        body.cutoff_ms,
+        body.max_rows,
+        body.project_id.as_deref(),
+    ) {
+        Ok(deleted) => (
+            StatusCode::OK,
+            Json(PruneEventsResponse { ok: true, deleted }),
+        )
+            .into_response(),
+        Err(e) => {
+            eprintln!("[vct-hub] prune_rl_events failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "prune_failed",
+                        "message": "rl_events prune failed",
+                    }
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,5 +471,96 @@ mod tests {
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
         let v: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(v["count"], 1);
+    }
+
+    /// Post `n` events with monotonically increasing ts, all `event_type`
+    /// retrieval, no project scope. Returns nothing; caller re-queries count.
+    async fn seed_events(base: &str, client: &reqwest::Client, n: i64) {
+        for i in 0..n {
+            let body = serde_json::json!({
+                "event_type": "retrieval",
+                "schema_version": 3,
+                "ts_ms": 1_000 + i,
+                "task_id": format!("task-{}", i),
+                "payload_json": "{}",
+            });
+            let _ = client
+                .post(format!("{}/rl/events", base))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn count(base: &str, client: &reqwest::Client) -> i64 {
+        let resp = client
+            .get(format!("{}/rl/events/count", base))
+            .send()
+            .await
+            .unwrap();
+        let v: serde_json::Value = resp.json().await.unwrap();
+        v["count"].as_i64().unwrap()
+    }
+
+    #[tokio::test]
+    async fn prune_cutoff_deletes_and_reports_count() {
+        let base = spawn_test_hub().await;
+        let client = reqwest::Client::new();
+        // ts values 1000..1004.
+        seed_events(&base, &client, 5).await;
+        assert_eq!(count(&base, &client).await, 5);
+
+        // Cutoff 1003 → delete ts < 1003 (ts 1000,1001,1002 = 3 rows).
+        let resp = client
+            .post(format!("{}/rl/events/prune", base))
+            .json(&serde_json::json!({ "cutoff_ms": 1003_i64 }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let v: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["deleted"], 3);
+        assert_eq!(count(&base, &client).await, 2);
+    }
+
+    #[tokio::test]
+    async fn prune_max_rows_keeps_newest() {
+        let base = spawn_test_hub().await;
+        let client = reqwest::Client::new();
+        seed_events(&base, &client, 5).await;
+
+        let resp = client
+            .post(format!("{}/rl/events/prune", base))
+            .json(&serde_json::json!({ "max_rows": 2_i64 }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let v: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(v["deleted"], 3);
+        assert_eq!(count(&base, &client).await, 2);
+    }
+
+    #[tokio::test]
+    async fn prune_empty_body_is_noop_returns_200_deleted_zero() {
+        // The critical safety round-trip: `{}` must NOT delete anything.
+        let base = spawn_test_hub().await;
+        let client = reqwest::Client::new();
+        seed_events(&base, &client, 4).await;
+
+        let resp = client
+            .post(format!("{}/rl/events/prune", base))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let v: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["deleted"], 0);
+        // Corpus untouched.
+        assert_eq!(count(&base, &client).await, 4);
     }
 }

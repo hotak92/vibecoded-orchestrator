@@ -212,6 +212,98 @@ impl Db {
             .map_err(|e| format!("count_rl_events: {}", e))?;
         Ok(row.unwrap_or(0))
     }
+
+    /// Prune rl_events by age and/or row-cap (RL-5 retention, v0.2.73).
+    ///
+    /// Drives the hub's `POST /api/v1/rl/events/prune` route, which the
+    /// Python retention driver (`rl_client/hub_writer.py::post_rl_prune`)
+    /// calls to keep the corpus bounded. Two independent bounds, applied in
+    /// a single logical pass; returns the TOTAL rows deleted across both.
+    ///
+    ///   * `cutoff_ms` (Some): delete rows with `ts < cutoff_ms` (age bound).
+    ///   * `max_rows`  (Some): keep only the newest `max_rows` rows (by
+    ///     `ts DESC, id DESC`), delete the rest (row-cap bound).
+    ///   * `project_id` (Some): scope BOTH bounds to that project. A
+    ///     `project_id = ?` predicate naturally excludes `project_id IS NULL`
+    ///     (free-tier) rows — desired. `None` spans ALL projects (global),
+    ///     which is the documented contract for an unscoped retention run.
+    ///
+    /// SAFETY (hard requirement): if BOTH bounds are `None` this is a no-op —
+    /// it deletes nothing and returns `Ok(0)`. A prune with no age bound and
+    /// no row cap must NEVER delete rows (that would wipe the corpus). The
+    /// guard below returns early before any DELETE is prepared.
+    ///
+    /// The two DELETEs run under the SAME lock guard so a concurrent writer
+    /// cannot interleave a row between the age-prune and the row-cap-prune.
+    pub fn prune_rl_events(
+        &self,
+        cutoff_ms: Option<i64>,
+        max_rows: Option<i64>,
+        project_id: Option<&str>,
+    ) -> Result<u64, String> {
+        // Empty-bounds no-op guard: never delete-all on absent bounds.
+        if cutoff_ms.is_none() && max_rows.is_none() {
+            return Ok(0);
+        }
+
+        let guard = self.lock();
+        let mut deleted: u64 = 0;
+
+        // Age bound: DELETE rows older than the cutoff, within project scope.
+        if let Some(cutoff) = cutoff_ms {
+            let n = if let Some(pid) = project_id {
+                guard
+                    .execute(
+                        "DELETE FROM rl_events WHERE ts < ?1 AND project_id = ?2",
+                        params![cutoff, pid],
+                    )
+                    .map_err(|e| format!("prune_rl_events (cutoff): {}", e))?
+            } else {
+                guard
+                    .execute(
+                        "DELETE FROM rl_events WHERE ts < ?1",
+                        params![cutoff],
+                    )
+                    .map_err(|e| format!("prune_rl_events (cutoff): {}", e))?
+            };
+            deleted += n as u64;
+        }
+
+        // Row-cap bound: keep only the newest `max_rows` rows (by ts DESC,
+        // id DESC as tiebreak), delete the rest — within project scope.
+        if let Some(keep) = max_rows {
+            let n = if let Some(pid) = project_id {
+                guard
+                    .execute(
+                        "DELETE FROM rl_events
+                          WHERE project_id = ?1
+                            AND id NOT IN (
+                                SELECT id FROM rl_events
+                                 WHERE project_id = ?1
+                                 ORDER BY ts DESC, id DESC
+                                 LIMIT ?2
+                            )",
+                        params![pid, keep],
+                    )
+                    .map_err(|e| format!("prune_rl_events (max_rows): {}", e))?
+            } else {
+                guard
+                    .execute(
+                        "DELETE FROM rl_events
+                          WHERE id NOT IN (
+                                SELECT id FROM rl_events
+                                 ORDER BY ts DESC, id DESC
+                                 LIMIT ?1
+                            )",
+                        params![keep],
+                    )
+                    .map_err(|e| format!("prune_rl_events (max_rows): {}", e))?
+            };
+            deleted += n as u64;
+        }
+
+        Ok(deleted)
+    }
 }
 
 #[cfg(test)]
@@ -340,6 +432,144 @@ mod tests {
         assert_eq!(recent.len(), 2);
         let count = db.count_rl_events(None, None, Some(150)).unwrap();
         assert_eq!(count, 2);
+    }
+
+    /// Helper: insert one event with explicit ts + optional project_id.
+    fn insert_at(db: &Db, ts: i64, project_id: Option<&str>, task: &str) -> i64 {
+        db.insert_rl_event(
+            "retrieval", 3, ts, project_id, None, task, None, None, None, None, "{}",
+        )
+        .unwrap()
+    }
+
+    /// Helper: seed a `projects` row so an rl_events insert with that
+    /// `project_id` satisfies the FK constraint (project_id → projects.id).
+    fn seed_project(db: &Db, id: &str) {
+        use crate::db::models::ProjectHost;
+        db.insert_project(
+            id,
+            &format!("Project {id}"),
+            &format!("/tmp/project-{id}"),
+            ProjectHost::Base,
+            &format!("project-{id}"),
+        )
+        .expect("insert project");
+    }
+
+    #[test]
+    fn prune_cutoff_deletes_older_keeps_newer() {
+        let db = fresh_db();
+        insert_at(&db, 100, None, "old-1");
+        insert_at(&db, 150, None, "old-2");
+        insert_at(&db, 200, None, "new-1");
+        insert_at(&db, 300, None, "new-2");
+        // Cutoff 200 → delete ts < 200 (the two ts=100,150 rows).
+        let deleted = db.prune_rl_events(Some(200), None, None).unwrap();
+        assert_eq!(deleted, 2);
+        let rows = db.list_rl_events(None, None, None, None, 100).unwrap();
+        assert_eq!(rows.len(), 2);
+        // Boundary row ts==200 is retained (strict <).
+        assert!(rows.iter().all(|r| r.ts_ms >= 200));
+    }
+
+    #[test]
+    fn prune_max_rows_keeps_newest_globally() {
+        let db = fresh_db();
+        for i in 0..5 {
+            insert_at(&db, 1_000 + i, None, &format!("t-{}", i));
+        }
+        // Keep the newest 2 rows → delete the other 3.
+        let deleted = db.prune_rl_events(None, Some(2), None).unwrap();
+        assert_eq!(deleted, 3);
+        let rows = db.list_rl_events(None, None, None, None, 100).unwrap();
+        assert_eq!(rows.len(), 2);
+        // Newest kept: ts 1004 and 1003.
+        assert_eq!(rows[0].task_id, "t-4");
+        assert_eq!(rows[1].task_id, "t-3");
+    }
+
+    #[test]
+    fn prune_project_scoping_leaves_other_projects_untouched() {
+        let db = fresh_db();
+        seed_project(&db, "proj-a");
+        seed_project(&db, "proj-b");
+        insert_at(&db, 100, Some("proj-a"), "a-old");
+        insert_at(&db, 300, Some("proj-a"), "a-new");
+        insert_at(&db, 100, Some("proj-b"), "b-old");
+        insert_at(&db, 300, Some("proj-b"), "b-new");
+        // Prune proj-a older-than-200 only.
+        let deleted = db.prune_rl_events(Some(200), None, Some("proj-a")).unwrap();
+        assert_eq!(deleted, 1);
+        // proj-a lost its old row; proj-b fully intact.
+        let a = db
+            .list_rl_events(Some("proj-a"), None, None, None, 100)
+            .unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].task_id, "a-new");
+        let b = db
+            .list_rl_events(Some("proj-b"), None, None, None, 100)
+            .unwrap();
+        assert_eq!(b.len(), 2);
+    }
+
+    #[test]
+    fn prune_project_scoping_excludes_null_project_rows() {
+        let db = fresh_db();
+        seed_project(&db, "proj-a");
+        insert_at(&db, 100, Some("proj-a"), "a-old");
+        insert_at(&db, 100, None, "null-old");
+        // Scoped prune of proj-a must NOT touch the NULL-project row.
+        let deleted = db.prune_rl_events(Some(200), None, Some("proj-a")).unwrap();
+        assert_eq!(deleted, 1);
+        let rows = db.list_rl_events(None, None, None, None, 100).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task_id, "null-old");
+        assert!(rows[0].project_id.is_none());
+    }
+
+    #[test]
+    fn prune_both_bounds_together() {
+        let db = fresh_db();
+        // ts: 100,150 (old), 200..=204 (newer). Cutoff 200 removes 2 old.
+        insert_at(&db, 100, None, "old-1");
+        insert_at(&db, 150, None, "old-2");
+        for i in 0..5 {
+            insert_at(&db, 200 + i, None, &format!("keep-{}", i));
+        }
+        // Cutoff 200 deletes the 2 old rows; then max_rows=3 keeps newest 3
+        // of the surviving 5 → deletes 2 more. Total 4.
+        let deleted = db.prune_rl_events(Some(200), Some(3), None).unwrap();
+        assert_eq!(deleted, 4);
+        let rows = db.list_rl_events(None, None, None, None, 100).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].task_id, "keep-4");
+        assert_eq!(rows[2].task_id, "keep-2");
+    }
+
+    #[test]
+    fn prune_both_none_is_noop_returns_zero() {
+        // The critical safety test: no cutoff + no max_rows must delete NOTHING.
+        let db = fresh_db();
+        for i in 0..4 {
+            insert_at(&db, 1_000 + i, None, &format!("t-{}", i));
+        }
+        let deleted = db.prune_rl_events(None, None, None).unwrap();
+        assert_eq!(deleted, 0);
+        let rows = db.list_rl_events(None, None, None, None, 100).unwrap();
+        assert_eq!(rows.len(), 4, "no-op prune must leave all rows intact");
+    }
+
+    #[test]
+    fn prune_max_rows_larger_than_count_deletes_nothing() {
+        let db = fresh_db();
+        for i in 0..3 {
+            insert_at(&db, 1_000 + i, None, &format!("t-{}", i));
+        }
+        // Keep 100 but only 3 exist → nothing to delete.
+        let deleted = db.prune_rl_events(None, Some(100), None).unwrap();
+        assert_eq!(deleted, 0);
+        let rows = db.list_rl_events(None, None, None, None, 100).unwrap();
+        assert_eq!(rows.len(), 3);
     }
 
     #[test]
