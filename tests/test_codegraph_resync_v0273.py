@@ -400,7 +400,6 @@ def test_spawn_launches_driver_not_bare_analyzer(monkeypatch, tmp_path):
     """The detached child is the --run-resync driver wrapping the analyzer."""
     monkeypatch.setattr(cr, "code_embed_service_healthy", lambda *a, **k: True)
     monkeypatch.setattr(cr, "count_stale_rows", lambda *a, **k: None)
-    monkeypatch.setattr(cr, "_prune_stale_is_safe", lambda name: True)
     monkeypatch.setattr(cr, "_register_spawn_with_hub", lambda *a, **k: None)
     _stub_analyzer_tree(tmp_path)
 
@@ -417,14 +416,17 @@ def test_spawn_launches_driver_not_bare_analyzer(monkeypatch, tmp_path):
     assert len(driver) == 1
     argv = driver[0]
     assert "--repo-root" in argv and "--analyzer" in argv
-    assert "--prune-stale" in argv, "safe project → prune forwarded"
     assert "--force-recreate" not in argv
 
 
-def test_spawn_omits_prune_when_not_provably_safe(monkeypatch, tmp_path):
+def test_spawn_never_forwards_prune_stale(monkeypatch, tmp_path):
+    """Pre-gate correctness audit C-1: the revision-gated resync MUST NEVER
+    forward --prune-stale. It hash-skips every already-converged file, so those
+    files' rows are 'unvisited' and prune would DELETE them — destroying the
+    majority of an already-converged code graph while the stale-count verifier
+    falsely reports 'converged'. Prune is only safe from a FULL walk."""
     monkeypatch.setattr(cr, "code_embed_service_healthy", lambda *a, **k: True)
     monkeypatch.setattr(cr, "count_stale_rows", lambda *a, **k: None)
-    monkeypatch.setattr(cr, "_prune_stale_is_safe", lambda name: False)
     monkeypatch.setattr(cr, "_register_spawn_with_hub", lambda *a, **k: None)
     _stub_analyzer_tree(tmp_path)
     spawned = []
@@ -438,18 +440,19 @@ def test_spawn_omits_prune_when_not_provably_safe(monkeypatch, tmp_path):
     assert result.status == "launched"
     driver = [a for a in spawned if "--run-resync" in a][0]
     assert "--prune-stale" not in driver, (
-        "prune must NOT run when extras cannot be ruled out"
+        "resync must NEVER prune — it hash-skips converged files (C-1)"
     )
 
 
 def test_spawn_registers_driver_pid_with_hub(monkeypatch, tmp_path):
     monkeypatch.setattr(cr, "code_embed_service_healthy", lambda *a, **k: True)
     monkeypatch.setattr(cr, "count_stale_rows", lambda *a, **k: None)
-    monkeypatch.setattr(cr, "_prune_stale_is_safe", lambda name: False)
     registered = []
     monkeypatch.setattr(
         cr, "_register_spawn_with_hub",
-        lambda name, pid: registered.append((name, pid)),
+        lambda name, pid, repo_root=None: registered.append(
+            (name, pid, str(repo_root) if repo_root is not None else None)
+        ),
     )
     _stub_analyzer_tree(tmp_path)
     monkeypatch.setattr(cr.subprocess, "Popen", lambda *a, **k: _FakeProc())
@@ -457,7 +460,12 @@ def test_spawn_registers_driver_pid_with_hub(monkeypatch, tmp_path):
         tmp_path, "MyProj", python_exe="/usr/bin/python3"
     )
     assert result.status == "launched"
-    assert registered == [("MyProj", 4321)]
+    # name, pid, AND the repo_root path (the C-3 primary resolver) are passed.
+    assert len(registered) == 1
+    name, pid, repo_root = registered[0]
+    assert name == "MyProj"
+    assert pid == 4321
+    assert repo_root == str(tmp_path)
 
 
 def test_hub_registration_is_soft_when_hub_down(monkeypatch, tmp_path):
@@ -465,64 +473,30 @@ def test_hub_registration_is_soft_when_hub_down(monkeypatch, tmp_path):
     monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "empty-state"))
     monkeypatch.setenv("VCT_HUB_PORT", "1")  # nothing listens on port 1
     monkeypatch.setenv("VCT_HUB_TOKEN", "t")
-    cr._register_spawn_with_hub("MyProj", 123)  # must not raise
+    cr._register_spawn_with_hub("MyProj", 123, repo_root=str(tmp_path))  # no raise
 
 
-# ─────────────── R-7: prune-safety probe (destructive-action gate) ──────────
+def test_hub_registration_body_includes_repo_root(monkeypatch, tmp_path):
+    """C-3: repo_root is the PRIMARY resolver on the hub side (project_name is
+    the codegraph name, not resolvable from the path segment). Verify it lands
+    in the POST body."""
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path))
+    (tmp_path / "hub.port").write_text("7700", encoding="utf-8")
+    (tmp_path / "hub.token").write_text("tok", encoding="utf-8")
+    captured = {}
 
+    def _fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["body"] = req.data
 
-def _fake_db(monkeypatch, projects, extras_counts):
-    """Wire a real in-memory sqlite DB through launcher_db_reader."""
-    import sqlite3
+        class _R:
+            status = 200
+        return _R()
 
-    def _open():
-        conn = sqlite3.connect(":memory:")
-        conn.row_factory = sqlite3.Row
-        conn.execute("CREATE TABLE projects (id TEXT, name TEXT)")
-        conn.execute(
-            "CREATE TABLE project_codegraph_extra_paths "
-            "(project_id TEXT, path TEXT)"
-        )
-        for pid, name in projects:
-            conn.execute("INSERT INTO projects VALUES (?, ?)", (pid, name))
-        for pid, n in extras_counts.items():
-            for i in range(n):
-                conn.execute(
-                    "INSERT INTO project_codegraph_extra_paths VALUES (?, ?)",
-                    (pid, f"/extra/{i}"),
-                )
-        return conn
-
-    import vco_lib.launcher_db_reader as ldr
-
-    monkeypatch.setattr(ldr, "_open_db_readonly", _open)
-
-
-def test_prune_safe_when_zero_extras(monkeypatch):
-    _fake_db(monkeypatch, [("p1", "MyProj")], {})
-    assert cr._prune_stale_is_safe("MyProj") is True
-
-
-def test_prune_unsafe_when_extras_exist(monkeypatch):
-    """LEAVE-ALONE branch of the destructive gate: extras rows would be
-    deleted by a prune the walk can't cover → never prune."""
-    _fake_db(monkeypatch, [("p1", "MyProj")], {"p1": 2})
-    assert cr._prune_stale_is_safe("MyProj") is False
-
-
-def test_prune_unsafe_when_project_unknown_or_ambiguous(monkeypatch):
-    _fake_db(monkeypatch, [], {})
-    assert cr._prune_stale_is_safe("MyProj") is False
-    _fake_db(
-        monkeypatch,
-        [("p1", "My Proj"), ("p2", "MyProj")],  # both sanitize to MyProj
-        {},
-    )
-    assert cr._prune_stale_is_safe("MyProj") is False
-
-
-def test_prune_unsafe_when_db_unavailable(monkeypatch):
-    import vco_lib.launcher_db_reader as ldr
-
-    monkeypatch.setattr(ldr, "_open_db_readonly", lambda: None)
-    assert cr._prune_stale_is_safe("MyProj") is False
+    monkeypatch.setattr(cr.urllib.request, "urlopen", _fake_urlopen)
+    cr._register_spawn_with_hub("MyProj", 4321, repo_root="/abs/repo/root")
+    import json as _json
+    assert captured["url"].endswith("/codegraph-builds")  # plural path (C-3)
+    payload = _json.loads(captured["body"].decode("utf-8"))
+    assert payload["repo_root"] == "/abs/repo/root"
+    assert payload["pid"] == 4321

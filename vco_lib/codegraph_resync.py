@@ -825,65 +825,32 @@ def _record_unconverged_deferral(
         logger.warning("resync driver: could not record deferral: %s", exc)
 
 
-def _prune_stale_is_safe(project_name: str) -> bool:
-    """True ONLY when launcher.db positively confirms the project has NO
-    codegraph extra paths configured.
-
-    WHY: the analyzer's ``--prune-stale`` deletes every project row NOT
-    visited by the current walk — and the resync walk covers only the repo
-    root, not ``project_codegraph_extra_paths`` roots. Pruning a project
-    that HAS extras would delete every extras row (expensive vectors,
-    user-configured). Conservative default: when the DB is unreadable, the
-    project row is ambiguous, or extras exist → NOT safe → the walk runs
-    without pruning (orphans then keep the owed-probe non-zero, which the
-    one-time deferral surfaces honestly).
-    """
-    try:
-        from vco_lib.launcher_db_reader import _open_db_readonly
-
-        conn = _open_db_readonly()
-        if conn is None:
-            return False
-        try:
-            target = _collection_prefix(project_name)
-            if not target:
-                return False
-            rows = conn.execute("SELECT id, name FROM projects").fetchall()
-            matches = [
-                r["id"] for r in rows
-                if _collection_prefix(r["name"] or "") == target
-            ]
-            if len(matches) != 1:
-                return False  # not found / ambiguous → not provably safe
-            (n,) = conn.execute(
-                "SELECT COUNT(*) FROM project_codegraph_extra_paths "
-                "WHERE project_id = ?",
-                (matches[0],),
-            ).fetchone()
-            return int(n) == 0
-        finally:
-            conn.close()
-    except Exception as exc:  # noqa: BLE001 — cannot confirm → not safe
-        logger.info("codegraph resync: prune-safety probe unavailable: %s", exc)
-        return False
-
-
-def _register_spawn_with_hub(project_name: str, pid: int) -> None:
+def _register_spawn_with_hub(
+    project_name: str, pid: int, repo_root: "Path | str | None" = None
+) -> None:
     """R-4 (Python half): best-effort registration of the detached resync
     driver in the launcher's ``code_graph_builds`` tracker via vct-hub, so
     the GUI top progress shows the walk and the boot orphan-sweep can
     death-detect it (pid-aliveness).
 
-    ASSUMED INTERFACE — the Rust half (hub endpoint + pid column + sweep
-    nuance) ships separately under R-4:
+    Wire contract (Rust half ships together under R-4 —
+    ``modules_api.rs::register_codegraph_build``):
 
         POST http://127.0.0.1:<port>/api/v1/projects/<project>/codegraph-builds
         Authorization: Bearer <vct_root_dir>/hub.token
-        {"status": "running", "pid": <pid>, "source": "install_resync"}
+        {"status": "running", "pid": <pid>, "source": "install_resync",
+         "repo_root": "<abs repo root>"}
 
-    Hub down / endpoint not shipped yet (404 on older hubs) / token missing
-    → soft no-op logged at debug. Registration is observability, never a
-    gate on the spawn.
+    ``repo_root`` is the PRIMARY resolver on the hub side: ``project_name`` is
+    the codegraph project name (Weaviate class prefix), which is neither the
+    launcher project id nor its slug, so the ``<project>`` path segment can't
+    be resolved from id/slug alone. The hub matches ``repo_root`` against the
+    launcher's indexed ``folder_path`` (canonical match), falling back to
+    id/slug. (Pre-gate correctness audit C-3.)
+
+    Hub down / endpoint absent (404 on older hubs) / token missing → soft
+    no-op logged at debug. Registration is observability, never a gate on the
+    spawn.
     """
     try:
         import json as _json
@@ -902,9 +869,15 @@ def _register_spawn_with_hub(project_name: str, pid: int) -> None:
         token = os.environ.get("VCT_HUB_TOKEN") or ""
         if not token:
             token = (root / "hub.token").read_text(encoding="utf-8").strip()
-        body = _json.dumps(
-            {"status": "running", "pid": int(pid), "source": "install_resync"}
-        ).encode("utf-8")
+        # repo_root is the PRIMARY resolver on the hub side: project_name here
+        # is the codegraph project name (Weaviate class prefix), which is
+        # neither the launcher project id nor its slug — the hub can't resolve
+        # it from the path segment alone. The repo root path IS indexed by the
+        # launcher, so we send it in the body for a reliable match. (C-3.)
+        _payload = {"status": "running", "pid": int(pid), "source": "install_resync"}
+        if repo_root:
+            _payload["repo_root"] = str(repo_root)
+        body = _json.dumps(_payload).encode("utf-8")
         req = urllib.request.Request(
             f"http://127.0.0.1:{port}/api/v1/projects/"
             f"{urllib.parse.quote(project_name, safe='')}/codegraph-builds",
@@ -1081,20 +1054,24 @@ def spawn_background_resync(
     # died silently precisely because nothing verified it. We do NOT pass
     # --force-recreate (that would DROP + rebuild the schema, losing all
     # rows) — the resync is purely additive re-embed of stale rows.
-    # --prune-stale (CG-4 orphan convergence) is forwarded ONLY when
-    # launcher.db positively confirms the project has no codegraph extra
-    # paths (the analyzer's prune deletes every unvisited project row, and
-    # this walk does not cover extras roots). NOTE: prune races live edits —
-    # a file created after the walk passed its directory is briefly pruned
-    # and re-created by the next per-edit hook (self-healing).
+    #
+    # We DO NOT forward --prune-stale here. CRITICAL (pre-gate correctness
+    # audit C-1): the analyzer only adds a file's UUIDs to `visited_uuids`
+    # when it actually WALKS the file. A revision-gated resync hash-skips
+    # every already-converged file (the whole point — 90%+ of files skip),
+    # so those files' rows are "unvisited" and --prune-stale would DELETE
+    # them — destroying the majority of an already-converged code graph
+    # (GPU-hours of vectors) while the post-walk stale-count verifier sees 0
+    # stale rows (deleted rows aren't stale) and falsely reports "converged".
+    # Prune is only ever safe from a FULL walk that visits every current
+    # file; CG-4 orphan cleanup is handled by the F9 ignore-prune child and
+    # the GUI-triggered full rebuild, NOT by this selective re-embed resync.
     argv = [
         py, str(Path(__file__).resolve()), "--run-resync",
         "--project", project_name,
         "--repo-root", str(repo_root),
         "--analyzer", str(analyzer),
     ]
-    if _prune_stale_is_safe(project_name):
-        argv.append("--prune-stale")
 
     # Detached background spawn. stdout/stderr go to a per-spawn log file
     # under <vct_root_dir>/logs/ (R-5 / RT-2 — pre-fix they went to DEVNULL,
@@ -1194,7 +1171,7 @@ def spawn_background_resync(
     # driver pid via vct-hub. Soft no-op when the hub or the endpoint isn't
     # available — never gates the spawn.
     try:
-        _register_spawn_with_hub(project_name, proc.pid)
+        _register_spawn_with_hub(project_name, proc.pid, repo_root=repo_root)
     except Exception as exc:  # noqa: BLE001
         logger.debug("codegraph resync: hub registration raised: %s", exc)
 

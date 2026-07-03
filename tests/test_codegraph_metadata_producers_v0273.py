@@ -592,7 +592,6 @@ def test_backfill_noop_without_helpers(monkeypatch):
 def test_spawn_launches_backfill_child(monkeypatch, tmp_path):
     monkeypatch.setattr(cr, "code_embed_service_healthy", lambda *a, **k: True)
     monkeypatch.setattr(cr, "count_stale_rows", lambda *a, **k: None)
-    monkeypatch.setattr(cr, "_prune_stale_is_safe", lambda name: False)
     monkeypatch.setattr(cr, "_register_spawn_with_hub", lambda *a, **k: None)
     scripts = tmp_path / ".claude" / "scripts"
     scripts.mkdir(parents=True)

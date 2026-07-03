@@ -62,7 +62,7 @@ pub fn router() -> Router<LauncherDbHandle> {
         .route("/projects/{project_id}", get(get_project))
         .route("/projects/{project_id}/env", get(project_env))
         .route(
-            "/projects/{project_id}/codegraph-build",
+            "/projects/{project_id}/codegraph-builds",
             post(register_codegraph_build),
         )
         .route("/projects/by-slug/{slug}", get(get_project_by_slug_route))
@@ -330,9 +330,18 @@ struct RegisterCodegraphBuildReq {
     /// Free-text origin marker (e.g. "install_resync"). Advisory only.
     #[serde(default)]
     source: Option<String>,
+    /// Absolute repo root of the walk. PRIMARY resolver: the Python spawner
+    /// only knows the codegraph PROJECT NAME (Weaviate class prefix), which is
+    /// neither the launcher project id nor its slug — so the path-segment
+    /// `{project_id}` it sends is really that name and won't match id/slug.
+    /// The repo root path IS indexed by the launcher (`folder_path`), so we
+    /// resolve by path first (canonical match), then fall back to id/slug for
+    /// callers that legitimately pass one. (Pre-gate correctness audit C-3.)
+    #[serde(default)]
+    repo_root: Option<String>,
 }
 
-/// POST /projects/{id-or-slug}/codegraph-build — R-4 (v0.2.73).
+/// POST /projects/{id-or-slug-or-codegraph-name}/codegraph-builds — R-4 (v0.2.73).
 ///
 /// Registers a DETACHED analyzer walk (install.py's background resync via
 /// `vco_lib/codegraph_resync.py`) as the project's `code_graph_builds` row
@@ -354,7 +363,38 @@ async fn register_codegraph_build(
             "pid must be a positive OS process id".to_string(),
         );
     }
-    // id-or-slug resolution, same order as the config resolver.
+    // PRIMARY: resolve by repo_root path (the unambiguous identifier the
+    // Python spawner actually has — see repo_root doc above). Canonical match
+    // mirrors get_project_by_path_route.
+    if let Some(raw) = req.repo_root.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Ok(projects) = h.0.list_projects() {
+            let canonical_query = std::fs::canonicalize(raw)
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.to_string()));
+            let matched = projects.into_iter().find(|p| {
+                if p.folder_path == raw {
+                    return true;
+                }
+                if let Some(qcan) = canonical_query.as_deref() {
+                    if let Ok(reg_can) = std::fs::canonicalize(&p.folder_path) {
+                        return reg_can.to_str() == Some(qcan);
+                    }
+                }
+                false
+            });
+            if let Some(p) = matched {
+                return match h.0.register_running_code_graph_build(&p.id, req.pid) {
+                    Ok(()) => Json(serde_json::json!({
+                        "registered": true, "project_id": p.id, "pid": req.pid,
+                        "status": "running", "resolved_by": "path",
+                    }))
+                    .into_response(),
+                    Err(e) => db_error_response("register codegraph build", e),
+                };
+            }
+        }
+    }
+    // FALLBACK: id-or-slug resolution, same order as the config resolver.
     let row = match h.0.get_project(&project_id) {
         Ok(Some(r)) => r,
         Ok(None) => match h.0.get_project_by_slug(&project_id) {
@@ -1872,5 +1912,63 @@ mod tests {
             body.get("EXAMPLE_SHARED_TOKEN").and_then(|v| v.as_str()),
             Some("synthetic-shared-value")
         );
+    }
+
+    #[tokio::test]
+    async fn register_codegraph_build_resolves_by_repo_root_path() {
+        // C-3 regression: the Python spawner sends the codegraph PROJECT NAME
+        // in the path segment (not the launcher id/slug) + the repo_root in the
+        // body. The endpoint must resolve by repo_root path (folder_path match)
+        // and write a running row + pid.
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "proj-uuid-1", "My Real Project", "/tmp/my-real-project");
+        let client = reqwest::Client::new();
+
+        // Path segment is the CODEGRAPH NAME (not an id/slug) — resolution must
+        // come from repo_root.
+        let resp = client
+            .post(format!("{}/projects/MyCodegraphName/codegraph-builds", base))
+            .json(&serde_json::json!({
+                "status": "running", "pid": 424242,
+                "source": "install_resync", "repo_root": "/tmp/my-real-project",
+            }))
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json");
+        assert_eq!(body.get("resolved_by").and_then(|v| v.as_str()), Some("path"));
+        let row = h
+            .0
+            .get_code_graph_build("proj-uuid-1")
+            .unwrap()
+            .expect("running row written");
+        assert_eq!(row.status, "running");
+        assert_eq!(row.pid, Some(424242));
+    }
+
+    #[tokio::test]
+    async fn register_codegraph_build_rejects_bad_pid_and_unknown() {
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "proj-uuid-2", "P2", "/tmp/p2");
+        let client = reqwest::Client::new();
+
+        // pid = 0 → 400
+        let bad = client
+            .post(format!("{}/projects/proj-uuid-2/codegraph-builds", base))
+            .json(&serde_json::json!({"pid": 0, "repo_root": "/tmp/p2"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), 400);
+
+        // unknown project (no path match, no id/slug match) → 404
+        let missing = client
+            .post(format!("{}/projects/no-such/codegraph-builds", base))
+            .json(&serde_json::json!({"pid": 5, "repo_root": "/tmp/nowhere"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), 404);
     }
 }
