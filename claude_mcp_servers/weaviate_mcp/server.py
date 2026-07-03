@@ -9304,6 +9304,39 @@ def _dedup_objects_by_full_name(objects: list) -> list:
     return [_pick_canonical_chunk(groups[k]) for k in order]
 
 
+# M-2 / CG-2 (v0.2.73): query types whose relationships are populated only
+# by language-specific analyzer passes. Calls/paths/type_users come from the
+# call-graph + type-annotation extraction that the Python walker emits richly
+# but many non-Python walkers don't — so an empty result on a non-Python
+# target is "unsupported for that language", not "entity missing". This
+# marker lets the caller distinguish the two.
+_CALLGRAPH_QUERY_TYPES = {"callers", "path", "type_users"}
+
+
+def _code_structure_not_found_hint(query_type: str, target: str,
+                                   effective_project) -> str:
+    """Build an ACTIONABLE hint for a code-structure 'not found' result.
+
+    M-2: the bare "Class 'X' not found" errors gave no next step. The two
+    most common causes are (a) the slug-vs-prefix trap — the caller passed a
+    project SLUG where the collection PREFIX is expected, or the wrong
+    project — and (b) a stale / un-analyzed code graph. Name both.
+    """
+    proj_note = (
+        f"searched project '{effective_project}'"
+        if effective_project else "searched the workspace-default project"
+    )
+    return (
+        f" ({proj_note}.) Next steps: (1) confirm the exact identifier with "
+        f"search_code_graph('{target}') — full_names are module-stem-qualified "
+        f"(e.g. 'module.Class', not a bare name or a file path); (2) if you "
+        f"passed `project`, it must be the analyzer's project NAME, not a slug "
+        f"or the Weaviate collection prefix (the slug-vs-prefix trap); (3) if "
+        f"the entity truly exists in source, the code graph may be stale — "
+        f"re-run `.claude/scripts/code-graph-analyze . --project <name>`."
+    )
+
+
 @mcp.tool()
 def query_code_structure(
     query_type: str,
@@ -9383,7 +9416,11 @@ def query_code_structure(
                 )
 
                 if not response.objects:
-                    return json.dumps({"success": False, "error": f"Module '{target}' not found"}, indent=2)
+                    return json.dumps({
+                        "success": False,
+                        "error": f"Module '{target}' not found"
+                        + _code_structure_not_found_hint(query_type, target, effective_project),
+                    }, indent=2)
 
                 imports = response.objects[0].references.get("imports", [])
                 results = [{"path": imp.properties.get("path"), "file_path": imp.properties.get("path", "")} for imp in imports]
@@ -9415,7 +9452,7 @@ def query_code_structure(
 
             canonical = _pick_canonical_chunk(response.objects)
             if canonical is None:
-                return json.dumps({"success": False, "error": f"Class '{target}' not found"}, indent=2)
+                return json.dumps({"success": False, "error": f"Class '{target}' not found" + _code_structure_not_found_hint(query_type, target, effective_project)}, indent=2)
 
             class_file_path = canonical.properties.get("file_path") or canonical.properties.get("path", "")
             methods = canonical.properties.get("methods", [])
@@ -9434,7 +9471,7 @@ def query_code_structure(
 
             canonical = _pick_canonical_chunk(response.objects)
             if canonical is None:
-                return json.dumps({"success": False, "error": f"Class '{target}' not found"}, indent=2)
+                return json.dumps({"success": False, "error": f"Class '{target}' not found" + _code_structure_not_found_hint(query_type, target, effective_project)}, indent=2)
 
             extends = canonical.references.get("extends", [])
             results = [{
@@ -9505,6 +9542,7 @@ def query_code_structure(
                     return json.dumps({
                         "success": False,
                         "error": f"Function or module '{target}' not found"
+                        + _code_structure_not_found_hint(query_type, target, effective_project)
                     }, indent=2)
                 source_uuid = str(mod_resp.objects[0].uuid)
                 ix_resp = interactions_coll.query.fetch_objects(
@@ -9558,6 +9596,7 @@ def query_code_structure(
                 return json.dumps({
                     "success": False,
                     "error": f"Source function '{source_name}' not found"
+                    + _code_structure_not_found_hint(query_type, source_name, effective_project)
                 }, indent=2)
 
             src_file = src_resp.objects[0].properties.get("file_path") or src_resp.objects[0].properties.get("path", "")
@@ -9635,7 +9674,7 @@ def query_code_structure(
             )
 
             if not response.objects:
-                return json.dumps({"success": False, "error": f"Class '{target}' not found"}, indent=2)
+                return json.dumps({"success": False, "error": f"Class '{target}' not found" + _code_structure_not_found_hint(query_type, target, effective_project)}, indent=2)
 
             composes = response.objects[0].properties.get("composes", []) or []
             results = [{"composed_class": name} for name in composes]
@@ -9706,6 +9745,23 @@ def query_code_structure(
         if _truncation_meta is not None:
             response_payload["truncated"] = _truncation_meta["truncated"]
             response_payload["limit"] = _truncation_meta["limit"]
+        # CG-2 (v0.2.73): a call-graph query (callers/path/type_users) that
+        # returns EMPTY is ambiguous — the target may genuinely have no
+        # callers, OR its language's analyzer walker doesn't populate the
+        # call graph / type-use edges (rich for Python, sparse/absent for
+        # several other walkers). Surface the marker so the caller doesn't
+        # read "0 callers" as "definitely nothing calls this".
+        if query_type in _CALLGRAPH_QUERY_TYPES and not results:
+            response_payload["unsupported_for_language"] = True
+            response_payload["note"] = (
+                f"0 results for a '{query_type}' query. This can mean the "
+                f"target truly has none, OR the target's language does not "
+                f"have call-graph / type-use extraction (this edge type is "
+                f"populated richly for Python, sparsely or not at all for "
+                f"some other languages). Confirm the entity exists with "
+                f"search_code_graph('{target}') before concluding it has no "
+                f"{query_type}."
+            )
 
         # v0.2.73 (RL follow-up): uniform telemetry coverage — structural
         # lookups emit a retrieval event too (no rerank, no citation; see
