@@ -29,6 +29,7 @@ design; the YAML frontmatter is machine-parseable.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -39,6 +40,33 @@ from vco_lib.atomic import atomic_write_text
 
 # Relative path inside any managed project folder.
 _DEFERRED_REL = Path(".claude") / "context" / "UPDATE_DEFERRED.md"
+
+# A-3 (v0.2.73): machine-readable sidecar — the SOURCE OF TRUTH for the
+# deferral report. The Markdown file (``_DEFERRED_REL``) is a HUMAN-READABLE
+# RENDER of the same entries, kept byte-compatible with the Rust
+# ``restart.rs::extract_section/strip_section`` parser (which edits the
+# Markdown to clear the ``launcher_restart_required`` section on restart).
+#
+# WHY a JSON sidecar: the Markdown round-trip corrupted entries (multi-line
+# fields truncated to their first line on read; a ``## fake (crit)`` line
+# inside a field split one entry into three; a ``` line inside a command
+# inverted the fence toggle). The single most common real deferral —
+# ``bundle_user_modified_preserved`` — renders its preserved-files list on
+# continuation lines of ``detected``; the Markdown parser dropped every line
+# but the first, silently destroying the entry's actionable payload on the
+# next read-merge-write by ANY emitter. JSON has no such ambiguity.
+#
+# RECONCILIATION with the Rust editor: ``restart.rs`` clears a section from
+# the Markdown but does NOT know about the JSON sidecar. So on ``read`` we
+# treat JSON as authoritative BUT drop any entry whose ``## <cid>`` header is
+# absent from a co-present Markdown file — that means the Rust restart flow
+# (or a manual edit) removed it. This keeps JSON authoritative for content
+# while honouring the one cross-language mutation that touches the Markdown.
+_DEFERRED_JSON_REL = Path(".claude") / "context" / "UPDATE_DEFERRED.json"
+
+# Sidecar schema version — bump when the JSON shape changes so old readers
+# can detect/skip an incompatible sidecar and fall back to the Markdown.
+_JSON_SCHEMA_VERSION = 1
 
 # Sentinel lines that delimit YAML frontmatter.
 _FM_OPEN = "---"
@@ -468,6 +496,103 @@ def _parse_entries(text: str) -> List[DeferralEntry]:
 
 
 # ---------------------------------------------------------------------------
+# A-3: JSON sidecar (source of truth) serialisation
+# ---------------------------------------------------------------------------
+
+def _entry_to_dict(entry: DeferralEntry) -> dict:
+    """Render one entry to a JSON-safe dict. Every field is preserved
+    losslessly (multi-line strings survive — no Markdown round-trip)."""
+    return {
+        "condition_id": entry.condition_id,
+        "title": entry.title,
+        "detected": entry.detected,
+        "why_deferred": entry.why_deferred,
+        "command_to_apply": entry.command_to_apply,
+        "severity": entry.severity,
+        "kg_node_refs": list(entry.kg_node_refs),
+        "detected_at": entry.detected_at,
+    }
+
+
+def _entry_from_dict(d: dict) -> Optional[DeferralEntry]:
+    """Build a :class:`DeferralEntry` from a sidecar dict.
+
+    Returns ``None`` when the dict is missing the load-bearing
+    ``condition_id`` or carries an invalid severity — a malformed sidecar
+    entry is skipped rather than crashing the whole read (conservative).
+    """
+    cid = d.get("condition_id")
+    if not cid or not isinstance(cid, str):
+        return None
+    sev = d.get("severity", "warning")
+    if sev not in SEVERITY_ORDER:
+        sev = "warning"
+    refs = d.get("kg_node_refs") or []
+    if not isinstance(refs, list):
+        refs = []
+    return DeferralEntry(
+        condition_id=cid,
+        title=str(d.get("title", cid.replace("_", " ").title())),
+        detected=str(d.get("detected", "")),
+        why_deferred=str(d.get("why_deferred", "")),
+        command_to_apply=str(d.get("command_to_apply", "")),
+        severity=sev,
+        kg_node_refs=[str(r) for r in refs],
+        detected_at=str(d.get("detected_at", _now_iso())),
+    )
+
+
+def _render_json_sidecar(entries: List[DeferralEntry]) -> str:
+    """Render the authoritative JSON sidecar for ``entries``."""
+    payload = {
+        "schema_version": _JSON_SCHEMA_VERSION,
+        "generated_at": _now_iso(),
+        "severity_max": _severity_max(entries),
+        "entries": [_entry_to_dict(e) for e in entries],
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+
+
+def _parse_json_sidecar(text: str) -> Optional[List[DeferralEntry]]:
+    """Parse the JSON sidecar. Returns ``None`` (not ``[]``) when the file
+    is unparseable or carries an incompatible ``schema_version`` — the
+    caller then falls back to the Markdown parser. An empty but valid
+    sidecar returns ``[]`` (zero entries, distinct from "unusable")."""
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    ver = payload.get("schema_version")
+    if ver != _JSON_SCHEMA_VERSION:
+        # Unknown/newer schema — don't guess; fall back to Markdown.
+        return None
+    raw_entries = payload.get("entries")
+    if not isinstance(raw_entries, list):
+        return None
+    out: List[DeferralEntry] = []
+    for item in raw_entries:
+        if not isinstance(item, dict):
+            continue
+        entry = _entry_from_dict(item)
+        if entry is not None:
+            out.append(entry)
+    return out
+
+
+def _markdown_condition_ids_present(text: str) -> set:
+    """Return the set of ``condition_id`` values whose ``## <cid> (<sev>)``
+    section header is present in the Markdown ``text``.
+
+    Used to reconcile the JSON source of truth against a Rust
+    ``restart.rs`` edit that stripped a section from the Markdown (the one
+    cross-language mutation that touches the ``.md`` without knowing about
+    the JSON sidecar)."""
+    return {m.group("cid") for m in _SECTION_RE.finditer(text)}
+
+
+# ---------------------------------------------------------------------------
 # DeferralReport
 # ---------------------------------------------------------------------------
 
@@ -569,15 +694,25 @@ class DeferralReport:
             False — no entries; existing file deleted (if any).
         """
         target = folder / _DEFERRED_REL
+        json_target = folder / _DEFERRED_JSON_REL
 
         if not self._entries:
             if target.exists():
                 target.unlink()
+            # A-3: remove the JSON source of truth too so the two views
+            # stay consistent (empty ⇒ both absent).
+            if json_target.exists():
+                json_target.unlink()
             # Strip the reminder block since the deferral is gone.
             _strip_claude_md_reminder(folder)
             return False
 
         target.parent.mkdir(parents=True, exist_ok=True)
+
+        # A-3: JSON sidecar is the SOURCE OF TRUTH — write it first so a
+        # crash between the two writes leaves the authoritative copy intact
+        # (the Markdown is a re-derivable render).
+        atomic_write_text(json_target, _render_json_sidecar(self._entries))
 
         content = (
             _render_frontmatter(self._entries)
@@ -586,7 +721,8 @@ class DeferralReport:
         )
 
         # Atomic write via the shared vco_lib.atomic helper (temp file
-        # in the same directory, fsync, then os.replace()).
+        # in the same directory, fsync, then os.replace()). Markdown is the
+        # human render + the surface Rust ``restart.rs`` edits.
         atomic_write_text(target, content)
 
         # Inject/refresh the wrapped reminder block in CLAUDE.md.
@@ -596,12 +732,58 @@ class DeferralReport:
 
     @classmethod
     def read(cls, folder: Path) -> "DeferralReport":
-        """Parse an existing deferral report file and return a populated instance.
+        """Parse an existing deferral report and return a populated instance.
 
-        If the file does not exist, returns an empty ``DeferralReport``.
+        A-3: the JSON sidecar (``UPDATE_DEFERRED.json``) is the SOURCE OF
+        TRUTH. Resolution order:
+
+        1. **JSON sidecar present + parseable** → authoritative content.
+           Reconcile against the Markdown: if a co-present Markdown file
+           lacks a section for a ``condition_id`` the JSON carries, that
+           entry was stripped by the Rust ``restart.rs`` flow (or a manual
+           edit) — drop it so the two views agree. If the Markdown is
+           absent, take the JSON verbatim.
+        2. **JSON absent / unparseable / incompatible schema** → fall back
+           to the legacy Markdown parser (back-compat for reports written
+           before A-3, and for the round-trip-lossy path).
+        3. **Neither present** → empty report.
         """
         target = folder / _DEFERRED_REL
+        json_target = folder / _DEFERRED_JSON_REL
         report = cls()
+
+        json_entries: Optional[List[DeferralEntry]] = None
+        if json_target.exists():
+            try:
+                json_entries = _parse_json_sidecar(
+                    json_target.read_text(encoding="utf-8")
+                )
+            except OSError:
+                json_entries = None
+
+        if json_entries is not None:
+            # JSON is authoritative. Reconcile against a co-present Markdown
+            # (the surface Rust edits) so a restart-cleared section is
+            # honoured even though Rust doesn't touch the JSON.
+            md_present_cids: Optional[set] = None
+            if target.exists():
+                try:
+                    md_text = target.read_text(encoding="utf-8")
+                    md_present_cids = _markdown_condition_ids_present(md_text)
+                except OSError:
+                    md_present_cids = None
+            for entry in json_entries:
+                if (
+                    md_present_cids is not None
+                    and entry.condition_id not in md_present_cids
+                ):
+                    # Section was stripped from the Markdown by an external
+                    # editor (restart.rs). Treat as resolved — drop it.
+                    continue
+                report._entries.append(entry)
+            return report
+
+        # Fallback: no usable JSON sidecar → parse the Markdown.
         if not target.exists():
             return report
         text = target.read_text(encoding="utf-8")
