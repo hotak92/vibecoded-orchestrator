@@ -4999,6 +4999,7 @@ def _emit_code_retrieval_telemetry(
     anchor_present: bool = False,
     scope: str = "",
     session_id: "str | None" = None,
+    task_id: "str | None" = None,
 ) -> bool:
     """v0.2.73 RL-2: emit a retrieval event for the CODE search path.
 
@@ -5021,11 +5022,16 @@ def _emit_code_retrieval_telemetry(
     source + the ACTUAL query-vector dim) so these events partition into
     their own cohort and never contaminate the text-embedding corpus.
 
-    NOTE (scope, deliberate): code retrievals do NOT stage citation ctx /
-    pending files this release — code candidates are fetched WITHOUT vectors,
-    so the citation cosine has nothing to compute against. Retrieval events +
-    transcript positioning (KG_SEARCH_TOOLS) land now; citation staging needs
-    an n_emb fetch decision. Soft-fail throughout; returns emit success.
+    v0.2.73 RL-2b: code retrievals now ALSO stage citation ctx — when
+    survivors carry per-node vectors (``n_emb``, fetched with the candidates
+    via ``include_vector`` in the MCP path), the helper stages a pending file
+    (``source="hook"``, drain-owned — no in-process monitor for code) marked
+    ``retrieval_kind="code"`` so ``citation_compute`` embeds the answer in
+    the CODE model space and writes via the code-slot writer. Callers without
+    vectors (the CLI today) stage nothing — behaviour is unchanged for them.
+    ``task_id`` may be supplied by the caller; the SAME id is used for the
+    retrieval event and the staged citation ctx so the pair joins in the
+    corpus. Soft-fail throughout; returns emit success.
     """
     try:
         from claude_mcp_servers.rl_client.telemetry_emit import (
@@ -5070,6 +5076,12 @@ def _emit_code_retrieval_telemetry(
                     rec["boost_signals"] = boost.get("signals")
             if c.get("chunks_matched") is not None:
                 rec["chunks_matched"] = c.get("chunks_matched")
+            # v0.2.73 RL-2b: carry the per-node stored vector (attached by the
+            # candidate fetch via include_vector) so the retrieval event has
+            # the same unified-target shape as KG events AND citation staging
+            # below has real vectors to cosine against.
+            if c.get("n_emb"):
+                rec["n_emb"] = c["n_emb"]
             nodes.append(rec)
 
         if not nodes:
@@ -5100,6 +5112,26 @@ def _emit_code_retrieval_telemetry(
         if post_rerank_floor is not None:
             extras["post_rerank_floor"] = post_rerank_floor
 
+        _task_id = task_id or new_task_id()
+
+        # v0.2.73 RL-2b: stage the citation ctx BEFORE the emit (mirrors
+        # rerank_and_emit's ordering — staging never depends on emit
+        # success). No-op when no node carries a vector.
+        try:
+            _stage_code_citation_pending(
+                task_id=_task_id,
+                nodes=nodes,
+                query=query,
+                query_emb=query_emb,
+                code_source=code_source,
+                code_dim=code_dim,
+                code_model=code_model,
+                task_type=task_type,
+                session_id=session_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — staging never breaks search
+            logger.debug("code citation staging failed (%s)", exc)
+
         ev = RetrievalEvent(
             query=query,
             query_emb=query_emb,
@@ -5107,7 +5139,7 @@ def _emit_code_retrieval_telemetry(
             embedding_dim=code_dim,
             embedding_model=code_model,
             nodes=nodes,
-            task_id=new_task_id(),
+            task_id=_task_id,
             task_type=task_type,
             session_id=session_id,
             rl_used=False,
@@ -5127,6 +5159,86 @@ def _emit_code_retrieval_telemetry(
     except Exception as exc:  # noqa: BLE001 — telemetry never breaks search
         logger.debug("code retrieval emit failed (%s)", exc)
         return False
+
+
+def _stage_code_citation_pending(
+    *,
+    task_id: str,
+    nodes: list[dict],
+    query: str,
+    query_emb: "list[float] | None",
+    code_source: str,
+    code_dim: int,
+    code_model: str,
+    task_type: str,
+    session_id: "str | None" = None,
+) -> "str | None":
+    """v0.2.73 RL-2b: stage the CODE citation ctx as a drain-owned pending file.
+
+    Mirrors the KG path's ``search_pipeline._populate_citation_cache`` staging
+    (same ``citation_pending.stage_pending`` single home, same ctx shape) with
+    the code-specific differences named explicitly:
+
+      * ``retrieval_kind="code"`` marks the ctx so ``citation_compute`` embeds
+        the answer window in the CODE model space (``svc.embed_code``) and
+        writes via the code-slot writer — a text-model answer embedding
+        cosined against a CodeSage node vector is cross-space garbage that
+        the ``_cosine`` dim-guard would zero out anyway.
+      * ``source="hook"`` ALWAYS — the code path spawns NO in-process monitor,
+        so the turn-end Stop-hook drain owns every code pending file (the
+        "mcp" tag is reserved for monitor-owned files that self-delete).
+      * ``active_model`` is the CODE model id, so the drain's chunker preset
+        resolves against the right model family.
+
+    No-op (returns None) when no node carries ``n_emb`` — a ctx without
+    vectors can never produce a citation, so staging it would only feed the
+    TTL sweep. Soft-fail throughout; returns the staged path or None.
+    """
+    if not any(isinstance(n, dict) and n.get("n_emb") for n in nodes):
+        return None
+    try:
+        from claude_mcp_servers.rl_client.citation_pending import stage_pending
+        from claude_mcp_servers.rl_client.telemetry_emit import resolve_session_id
+
+        project_id_for_cache = None
+        try:
+            _cfg = _try_resolve_project_config()
+            if _cfg is not None:
+                project_id_for_cache = getattr(_cfg, "project_id", None)
+        except Exception:  # noqa: BLE001
+            pass
+        _staged_session = resolve_session_id(session_id or "")
+        ctx_dict = {
+            "nodes": nodes,
+            "query_emb": list(query_emb) if query_emb else None,
+            "active_model": code_model,
+            "embedding_source": code_source,
+            "embedding_dim": code_dim,
+            "project_id": project_id_for_cache,
+            # Same resolution the KG stage uses (getattr(srv, "PROJECT_NAME")
+            # there) — server.py has no module-level PROJECT_NAME, so the env
+            # is the actual source; empty string is the accepted degrade.
+            "project_name": globals().get("PROJECT_NAME")
+            or os.getenv("PROJECT_NAME", ""),
+            "task_type": task_type,
+            "session_id": _staged_session,
+            # The marker citation_compute branches on (embed_code + code
+            # writer). Kept as a ctx field (not inferred from the source
+            # tag) because qwen3 can legitimately serve as BOTH the text
+            # and the code model on mid-tier hardware.
+            "retrieval_kind": "code",
+        }
+        return stage_pending(
+            session_id=_staged_session,
+            task_id=task_id,
+            seq=None,
+            query=query,
+            ctx=ctx_dict,
+            source="hook",
+        )
+    except Exception as exc:  # noqa: BLE001 — staging never breaks search
+        logger.debug("_stage_code_citation_pending failed (%s)", exc)
+        return None
 
 
 def _get_rl_telemetry_writer_for(
@@ -8314,6 +8426,15 @@ async def search_code_graph(
                             kwargs["target_vector"] = "codesage_embed"
                         else:
                             kwargs["target_vector"] = "ollama_code_embed"
+                    # v0.2.73 RL-2b: fetch each candidate's stored vector in the
+                    # SAME query (no second round-trip) so citation staging has
+                    # real per-node vectors to cosine against. When a named
+                    # target slot is set, request exactly that slot — the
+                    # near_vector call already references it, so this cannot
+                    # introduce a new failure mode; the bare-vector path (no
+                    # target_vector) requests the default vector.
+                    _iv_slot = kwargs.get("target_vector")
+                    kwargs["include_vector"] = [_iv_slot] if _iv_slot else True
                     # Build filters: project (per-collection) + optional layer.
                     base_name, project_filter = coll_meta.get(coll_name, (coll_name, ""))
                     active_filters = []
@@ -8340,10 +8461,32 @@ async def search_code_graph(
                         # source-project filter value ("" for self/bare) so
                         # the render loop can gate peer rows off the SELF
                         # chunk fetcher (F5 — mirrors the CLI's `_src`).
-                        gathered.append({
+                        cand = {
                             "_c": base_name, "_s": score, "_d": distance,
                             "_p": p, "_src": project_filter or "",
-                        })
+                        }
+                        # v0.2.73 RL-2b: attach the row's stored vector as
+                        # `n_emb` (same key the KG path uses) so citation
+                        # staging downstream can cosine the answer against
+                        # it. Soft-fail — a missing/odd-shaped vector just
+                        # means this row won't be citable.
+                        try:
+                            _ov = getattr(obj, "vector", None)
+                            _vec = None
+                            if isinstance(_ov, dict):
+                                if _iv_slot:
+                                    _vec = _ov.get(_iv_slot)
+                                elif _ov:
+                                    _vec = _ov.get("default") or next(
+                                        iter(_ov.values()), None
+                                    )
+                            elif _ov:
+                                _vec = list(_ov)
+                            if _vec:
+                                cand["n_emb"] = list(_vec)
+                        except Exception:  # noqa: BLE001 — never blocks search
+                            pass
+                        gathered.append(cand)
                 except Exception as e:
                     logger.warning(f"search_code_graph: {coll_name} failed: {e}")
             return gathered

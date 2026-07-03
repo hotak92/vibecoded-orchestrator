@@ -586,3 +586,215 @@ def test_rl9_drain_empty_staged_session_id_falls_back_to_payload(tmp_path):
     summary = _drain(tmp_path, "sess-real", transcript, computed)
     assert summary["computed"] == 1
     assert computed[0]["ctx"]["session_id"] == "sess-real"
+
+
+# ---------------------------------------------------------------------------
+# RL-2b — code CITATION staging (vectors fetched with candidates → pending
+# file → code-space compute)
+# ---------------------------------------------------------------------------
+
+
+def _code_survivors_with_vectors():
+    rows = _code_survivors()
+    rows[0]["n_emb"] = [1.0] + [0.0] * 15
+    # Second row deliberately has NO vector — must not block staging of the
+    # first (compute drops vectorless nodes, staging keeps them for parity
+    # with the emitted event's node list).
+    return rows
+
+
+def test_rl2b_code_emit_stages_pending_file_with_code_ctx(monkeypatch, tmp_path):
+    """The shared emit home stages a drain-owned pending file when survivors
+    carry vectors: same task_id as the retrieval event, retrieval_kind=code,
+    active_model = CODE model, source=hook (no in-process monitor)."""
+    import importlib
+
+    srv = importlib.import_module("weaviate_mcp.server")
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("VCT_SESSION_ID", "sess-code")
+    monkeypatch.setenv("CODE_EMBED_MODEL", "sample-code-model")
+    captured: list = []
+    monkeypatch.setattr(
+        srv, "_get_rl_telemetry_writer_for", lambda *a, **k: _writer(captured)
+    )
+    monkeypatch.setattr(srv, "_get_embedding_service", lambda: None)
+    monkeypatch.setattr(srv, "_try_resolve_project_config", lambda: None)
+
+    ok = srv._emit_code_retrieval_telemetry(
+        query="where are batches validated?",
+        query_emb=[0.1] * 16,
+        survivors=_code_survivors_with_vectors(),
+        limit=2,
+        slot="codesage_embed",
+        task_type="code_search",
+        task_id="task-code-pair",
+    )
+    assert ok is True
+
+    # Retrieval event carries the SAME task_id + the per-node vector.
+    event = _payload(captured[0])
+    assert event["task_id"] == "task-code-pair"
+    assert event["nodes"][0]["n_emb"] == [1.0] + [0.0] * 15
+    assert "n_emb" not in event["nodes"][1]
+
+    # Pending file staged for the drain.
+    pend_dir = tmp_path / ".claude" / "state" / "rl_pending"
+    files = list(pend_dir.glob("sess-code__task-code-pair.json"))
+    assert len(files) == 1
+    payload = json.loads(files[0].read_text())
+    assert payload["source"] == "hook"
+    assert payload["seq"] is None
+    assert payload["query"] == "where are batches validated?"
+    ctx = payload["ctx"]
+    assert ctx["retrieval_kind"] == "code"
+    assert ctx["embedding_source"] == "codesage"
+    assert ctx["active_model"] == "sample-code-model"
+    assert ctx["session_id"] == "sess-code"
+    assert ctx["nodes"][0]["title"] == "alpha.processing.process_batch"
+    assert ctx["nodes"][0]["n_emb"] == [1.0] + [0.0] * 15
+
+
+def test_rl2b_code_emit_without_vectors_stages_nothing(monkeypatch, tmp_path):
+    """Vectorless survivors (the CLI shape today) emit the retrieval event but
+    stage NO pending file — a ctx that can never cite would only feed TTL."""
+    import importlib
+
+    srv = importlib.import_module("weaviate_mcp.server")
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    captured: list = []
+    monkeypatch.setattr(
+        srv, "_get_rl_telemetry_writer_for", lambda *a, **k: _writer(captured)
+    )
+    monkeypatch.setattr(srv, "_get_embedding_service", lambda: None)
+
+    ok = srv._emit_code_retrieval_telemetry(
+        query="where are batches validated?",
+        query_emb=[0.1] * 16,
+        survivors=_code_survivors(),
+        limit=2,
+        slot="codesage_embed",
+    )
+    assert ok is True
+    pend_dir = tmp_path / ".claude" / "state" / "rl_pending"
+    assert not list(pend_dir.glob("*.json")) if pend_dir.exists() else True
+
+
+def test_rl2b_mcp_fetch_requests_vectors_with_candidates():
+    """search_code_graph fetches per-candidate vectors in the SAME near_vector
+    query (include_vector) — no second round-trip, no CLI divergence risk."""
+    import importlib
+    import inspect
+
+    srv = importlib.import_module("weaviate_mcp.server")
+    tool_fn = getattr(srv.search_code_graph, "fn", None) or srv.search_code_graph
+    mcp_src = inspect.getsource(tool_fn)
+    assert 'kwargs["include_vector"]' in mcp_src
+    assert '"n_emb"' in mcp_src
+
+
+def test_rl2b_compute_citation_code_ctx_embeds_code_space(monkeypatch):
+    """A retrieval_kind=code ctx must embed the answer via embed_code (NOT
+    embed_text) and write via the code-slot writer (NOT the active-text
+    writer)."""
+    import importlib
+
+    # citation_compute lazy-imports the CANONICAL module path — patch THAT
+    # module object (the bare "weaviate_mcp.server" import is a distinct
+    # module identity under the tests' dual sys.path setup).
+    srv = importlib.import_module("claude_mcp_servers.weaviate_mcp.server")
+    from claude_mcp_servers.rl_client.citation_compute import compute_citation
+
+    embed_code_calls: list = []
+
+    class _Svc:
+        def embed_code(self, text):
+            embed_code_calls.append(text)
+            return [1.0] + [0.0] * 15
+
+        def embed_text(self, text):
+            raise AssertionError("code ctx must NOT use the text embedder")
+
+    writer_factory_args: list = []
+    citations_written: list = []
+
+    class _W:
+        def log_citations(self, **kwargs):
+            citations_written.append(kwargs)
+
+    def _factory(source, *, embedding_dim=0, embedding_model=""):
+        writer_factory_args.append((source, embedding_dim, embedding_model))
+        return _W()
+
+    def _text_writer_forbidden():
+        raise AssertionError("code ctx must NOT use the active-text writer")
+
+    monkeypatch.setattr(srv, "_get_embedding_service", lambda: _Svc())
+    monkeypatch.setattr(srv, "_get_rl_telemetry_writer_for", _factory)
+    monkeypatch.setattr(srv, "_get_rl_telemetry_writer", _text_writer_forbidden)
+
+    ctx = {
+        "nodes": [
+            {"title": "alpha.processing.process_batch", "n_emb": [1.0] + [0.0] * 15},
+            {"title": "alpha.util.helper", "n_emb": [0.0, 1.0] + [0.0] * 14},
+        ],
+        "retrieval_kind": "code",
+        "active_model": "sample-code-model",
+        "embedding_source": "codesage",
+        "embedding_dim": 16,
+        "task_type": "code_search",
+        "session_id": "sess-code",
+    }
+    result = compute_citation(
+        "task-code-cite",
+        "the answer mentions process_batch in alpha/processing explicitly",
+        ctx,
+        write=True,
+    )
+    assert result is not None
+    assert embed_code_calls, "answer chunks were not embedded via embed_code"
+    assert writer_factory_args == [("codesage", 16, "sample-code-model")]
+    assert citations_written
+    kw = citations_written[0]
+    assert kw["task_id"] == "task-code-cite"
+    assert kw["task_type"] == "code_search"
+    assert kw["session_id"] == "sess-code"
+    # Same-space cosine: node 0's vector matches the answer embedding.
+    assert result["cosine_sims"]["alpha.processing.process_batch"] == pytest.approx(1.0)
+
+
+def test_rl2b_compute_citation_kg_ctx_unchanged(monkeypatch):
+    """A ctx WITHOUT the code marker keeps the pre-RL-2b path byte-identical:
+    embed_text + the active-text writer."""
+    import importlib
+
+    srv = importlib.import_module("claude_mcp_servers.weaviate_mcp.server")
+    from claude_mcp_servers.rl_client.citation_compute import compute_citation
+
+    class _Svc:
+        def embed_text(self, text):
+            return [1.0] + [0.0] * 15
+
+        def embed_code(self, text):
+            raise AssertionError("KG ctx must NOT use the code embedder")
+
+    citations_written: list = []
+
+    class _W:
+        def log_citations(self, **kwargs):
+            citations_written.append(kwargs)
+
+    def _code_writer_forbidden(*a, **k):
+        raise AssertionError("KG ctx must NOT use the code-slot writer factory")
+
+    monkeypatch.setattr(srv, "_get_embedding_service", lambda: _Svc())
+    monkeypatch.setattr(srv, "_get_rl_telemetry_writer", lambda: _W())
+    monkeypatch.setattr(srv, "_get_rl_telemetry_writer_for", _code_writer_forbidden)
+
+    ctx = {
+        "nodes": [{"title": "NodeA", "n_emb": [1.0] + [0.0] * 15}],
+        "active_model": "sample-embed",
+        "task_type": "mcp_interactive",
+    }
+    result = compute_citation("task-kg", "answer that cites NodeA", ctx, write=True)
+    assert result is not None
+    assert citations_written

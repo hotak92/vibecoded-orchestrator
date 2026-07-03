@@ -59,6 +59,10 @@ def compute_citation(
             ``{nodes: [...], query_emb, active_model, embedding_source,
             embedding_dim, project_id, project_name, task_type}``.
             Each node carries ``n_emb`` (or ``emb``) for the cosine side.
+            v0.2.73 RL-2b: an optional ``retrieval_kind="code"`` marker
+            (staged by ``server._stage_code_citation_pending``) switches the
+            answer-chunk embedding to the CODE model space and the write to
+            the code-slot writer.
         write: When True (default) write the citation event via the telemetry
             writer. The drain sets True; a dry-run caller can set False to get
             the computed maps without persisting.
@@ -85,6 +89,7 @@ def compute_citation(
             _cosine,
             _get_embedding_service,
             _get_rl_telemetry_writer,
+            _get_rl_telemetry_writer_for,
             _rl_is_literal_cited,
             EMBEDDING_MODEL,
         )
@@ -93,6 +98,16 @@ def compute_citation(
         return None
 
     active_model = ctx.get("active_model") or EMBEDDING_MODEL
+
+    # v0.2.73 RL-2b: a CODE retrieval ctx (staged by
+    # server._stage_code_citation_pending) carries CodeSage/code-slot node
+    # vectors, so the answer window MUST be embedded in the CODE model space
+    # (svc.embed_code) and the event written via the CODE-slot writer — a
+    # text-space answer embedding against a code-space n_emb is exactly the
+    # cross-model comparison the _cosine dim-guard refuses (all-zero sims).
+    # The marker is an explicit ctx field, NOT inferred from the source tag:
+    # qwen3 can legitimately serve as both the text and the code model.
+    is_code = ctx.get("retrieval_kind") == "code"
 
     # --- Step 1: chunk + embed the answer ---
     try:
@@ -117,7 +132,9 @@ def compute_citation(
         if not text:
             continue
         try:
-            vec = svc.embed_text(text)
+            # RL-2b: code ctx → embed in the code model's space so the cosine
+            # against the staged code-slot n_emb is same-space and meaningful.
+            vec = svc.embed_code(text) if is_code else svc.embed_text(text)
         except Exception as exc:  # noqa: BLE001
             logger.debug("citation_compute: chunk embed failed (%s); continuing", exc)
             continue
@@ -184,7 +201,18 @@ def compute_citation(
     # --- Step 4: write the citation event via the centralized writer ---
     if write:
         try:
-            writer = _get_rl_telemetry_writer()
+            if is_code:
+                # RL-2b: code citations partition into the CODE embedding
+                # cohort — same explicit-triple writer the code retrieval
+                # event used, so the (retrieval, citation) pair joins on
+                # BOTH task_id and embedding_source at training time.
+                writer = _get_rl_telemetry_writer_for(
+                    ctx.get("embedding_source") or "codesage",
+                    embedding_dim=int(ctx.get("embedding_dim") or 0),
+                    embedding_model=active_model,
+                )
+            else:
+                writer = _get_rl_telemetry_writer()
             if writer is None:
                 return None
             writer.log_citations(
