@@ -117,6 +117,18 @@ def test_orphan_collection_notice_fires(monkeypatch, tmp_path, capsys):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import install
 
+    # Test-isolation (v0.2.73): this test asserts the orphan NOTICE fires, which
+    # lives past the `SHARED_KG_WRITE_DISABLED=true → skip` early-return in
+    # _seed_weaviate_shared_kg_only. Another test in a broad sweep can leave that
+    # env set (it read as a plain os.environ write, so monkeypatch teardown does
+    # not clear it), which short-circuits us to "shared KG seed: skipped" before
+    # the notice. Explicitly clear it so this test is order-independent.
+    monkeypatch.delenv("SHARED_KG_WRITE_DISABLED", raising=False)
+    # SHARED_KG_OPT_OUT is the LEGACY ALIAS the same guard also honors
+    # (install.py: SHARED_KG_WRITE_DISABLED OR SHARED_KG_OPT_OUT). Clear both
+    # so a leaked alias from another test cannot short-circuit the notice.
+    monkeypatch.delenv("SHARED_KG_OPT_OUT", raising=False)
+
     monkeypatch.setattr(install, "_is_orchestrator_root_install", lambda: True)
     monkeypatch.setattr(install, "_rebind_orchestrator_root_to_canonical", lambda c: [])
     monkeypatch.setattr(install, "_write_app_state_key", lambda *a, **k: None)
@@ -477,6 +489,15 @@ def test_h2_orphan_notice_fires_when_env_reassigned(
     name (passed via the new orphan_candidate_kg kwarg)."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import install
+    # Test-isolation (v0.2.73): clear the leaked SHARED_KG_WRITE_DISABLED that a
+    # broad sweep can set (plain os.environ write, survives monkeypatch teardown)
+    # — it would short-circuit _seed_weaviate_shared_kg_only to "skipped" before
+    # the orphan notice this test asserts. Order-independent.
+    monkeypatch.delenv("SHARED_KG_WRITE_DISABLED", raising=False)
+    # SHARED_KG_OPT_OUT is the LEGACY ALIAS the same guard also honors
+    # (install.py: SHARED_KG_WRITE_DISABLED OR SHARED_KG_OPT_OUT). Clear both
+    # so a leaked alias from another test cannot short-circuit the notice.
+    monkeypatch.delenv("SHARED_KG_OPT_OUT", raising=False)
     monkeypatch.setattr(install, "_is_orchestrator_root_install", lambda: True)
     monkeypatch.setattr(
         install, "_rebind_orchestrator_root_to_canonical", lambda c: [],
