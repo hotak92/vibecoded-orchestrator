@@ -4,7 +4,15 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Probe candidate venvs.
+# Probe candidate venvs — RESILIENT INTERPRETER DISCOVERY (RT-4).
+#
+# This order MUST MATCH the canonical tiers in
+# templates/hooks/_lib/resolve-vco-venv.sh (and the .ps1 sibling of
+# THIS file). Do not fork the order — a divergence here is exactly the
+# class of bug RT-4 caught: an installed shim that hardcoded an absolute
+# legacy venv path (`.../Claude/claude_mcp_servers/.venv/bin/python`)
+# broke with exit 127 once that legacy venv was removed, because it had
+# no fallback discovery at all.
 #
 # Once the bundle install lands the script in a USER PROJECT's
 # `.claude/scripts/`, `$SCRIPT_DIR/../../.venv` resolves to the
@@ -12,11 +20,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # typically has the project's own deps but NOT weaviate-client +
 # the analyzer deps. So we must:
 #
-# 1. Prefer `$VCT_INSTALL_ROOT/.venv` (the launcher always sets this
+# 1. Honour `$VCT_VENV` first — the explicit override a user / the
+#    launcher sets to point at a known-good VCO venv. This is the tier
+#    that makes a stale/removed default recoverable (RT-4's remedy).
+# 2. Prefer `$VCT_INSTALL_ROOT/.venv` (the launcher always sets this
 #    to the orchestrator clone, which has weaviate-client) over the
 #    script-relative candidates. This is the canonical case for any
 #    project registered via the launcher.
-# 2. ALSO validate each candidate venv has weaviate-client installed
+# 3. Fall back to clone-relative candidates (only meaningful when this
+#    script sits inside a real VCO clone, not a user project).
+# 4. ALSO validate each candidate venv has weaviate-client installed
 #    before activating it. This protects against the script being
 #    run from an unrelated context where SCRIPT_DIR/../../.venv
 #    happens to exist but is the wrong env.
@@ -31,44 +44,63 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #     own `.venv/` (used by its own runtime) which the script
 #     activated before getting to VCT_INSTALL_ROOT → reorder +
 #     validate-has-weaviate-client.
+#   - 2026-06-27 (RT-4): a project's INSTALLED shim hardcoded the
+#     removed legacy `.../Claude/claude_mcp_servers/.venv/bin/python`
+#     and exited 127. The template already has no hardcode, but this
+#     revision adds the missing $VCT_VENV tier so a stale default is
+#     always recoverable by the same override the hooks honour.
 CANDIDATES=(
+    "${VCT_VENV:-}"                                    # explicit override (canonical tier 1)
     "${VCT_INSTALL_ROOT:-}/.venv"                      # launcher-provided install root (canonical)
     "${VCT_INSTALL_ROOT:-}/claude_mcp_servers/.venv"   # launcher-provided legacy path
     "$SCRIPT_DIR/../../.venv"                          # vco OSS install root (script in orch clone)
     "$SCRIPT_DIR/../../claude_mcp_servers/.venv"       # legacy Claude orch (script in orch clone)
 )
 
-# Validate a venv has the analyzer deps installed.
-# Without this gate, an unrelated venv (e.g. the project's own venv
-# at SCRIPT_DIR/../../.venv post bundle install) would be activated
+# Resolve the python interpreter inside a candidate. Accepts EITHER a
+# venv directory (probes bin/python, bin/python3, Scripts/python.exe) OR
+# a direct interpreter path ($VCT_VENV may point straight at the binary,
+# mirroring resolve-vco-venv.sh tier 1). Echoes the interpreter on
+# success, empty on failure.
+_interp_for_candidate() {
+    local c="$1"
+    if [ -x "$c/bin/python" ]; then echo "$c/bin/python"; return 0; fi
+    if [ -x "$c/bin/python3" ]; then echo "$c/bin/python3"; return 0; fi
+    if [ -x "$c/Scripts/python.exe" ]; then echo "$c/Scripts/python.exe"; return 0; fi
+    # $VCT_VENV given as the interpreter itself (not a venv dir).
+    if [ -x "$c" ] && [ ! -d "$c" ]; then echo "$c"; return 0; fi
+    return 1
+}
+
+# Validate a candidate resolves to a python that has the analyzer deps
+# installed. Without this gate, an unrelated venv (e.g. the project's own
+# venv at SCRIPT_DIR/../../.venv post bundle install) would be activated
 # and the analyzer would crash with ModuleNotFoundError downstream.
 venv_has_analyzer_deps() {
-    local v="$1"
-    local py=""
-    if [ -x "$v/bin/python" ]; then py="$v/bin/python"
-    elif [ -x "$v/bin/python3" ]; then py="$v/bin/python3"
-    else return 1
-    fi
+    local py
+    py="$(_interp_for_candidate "$1")" || return 1
+    [ -n "$py" ] || return 1
     "$py" -c "import weaviate" 2>/dev/null
 }
 
-VENV_PATH=""
+VENV_PY=""
 for c in "${CANDIDATES[@]}"; do
     [ -z "$c" ] && continue
     [ "$c" = "/.venv" ] && continue                # empty VCT_INSTALL_ROOT → skip
     [ "$c" = "/claude_mcp_servers/.venv" ] && continue
     if venv_has_analyzer_deps "$c"; then
-        VENV_PATH="$c"
+        VENV_PY="$(_interp_for_candidate "$c")"
         break
     fi
 done
 
-if [ -n "$VENV_PATH" ]; then
-    source "$VENV_PATH/bin/activate"
-fi
-
-# Run the Python script. Use the venv's python if we activated one,
-# otherwise fall through to system python3 (which will fail loudly with
+# Run the Python script with the resolved interpreter directly (no
+# `activate` needed — we hold the exact interpreter path). If nothing
+# resolved, fall through to system python3, which fails loudly with
 # "weaviate-client not installed" rather than silently using the wrong
-# environment).
-python3 "$SCRIPT_DIR/analyze_code_graph.py" "$@"
+# environment.
+if [ -n "$VENV_PY" ]; then
+    "$VENV_PY" "$SCRIPT_DIR/analyze_code_graph.py" "$@"
+else
+    python3 "$SCRIPT_DIR/analyze_code_graph.py" "$@"
+fi
