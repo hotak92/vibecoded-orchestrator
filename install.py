@@ -4352,6 +4352,36 @@ import atexit as _atexit
 _atexit.register(_release_main_entry_lock_atexit)
 
 
+def _refresh_update_lockfile_deadline(phase: str) -> None:
+    """A-6 (v0.2.73): re-extend the update-in-progress lockfile deadline at a
+    major phase transition.
+
+    ``update_gate.write_lockfile`` recomputes ``expected_completion_by`` from
+    ``now`` on every call, so re-calling it at each long phase boundary
+    prevents the fixed 15-minute deadline from silently expiring mid-update
+    on weak hardware / cold cache (venv rebuild + Ollama pulls + cargo build
+    can each exceed 15 min). A stale-because-slow lockfile would let an MCP
+    respawn against a mid-swap binary — the exact V52-AI fork-bomb the gate
+    exists to prevent. Mirrors the Rust ``update_gate.rs::advance_phase``
+    deadline-refresh contract for the launcher-driven path.
+
+    Best-effort + soft-fail: a lockfile write failure here must never abort
+    the update (the atexit delete + boot-time stale cleanup remain the
+    backstops). Only meaningful during ``--update``; a no-op if the module or
+    lockfile can't be reached.
+    """
+    try:
+        from vco_lib import update_gate as _vco_update_gate
+        # Only refresh if a lockfile already exists (i.e. we're in the
+        # update flow that wrote one at start). Writing one here on a fresh
+        # install would be spurious.
+        if _vco_update_gate.read_lockfile() is None:
+            return
+        _vco_update_gate.write_lockfile(phase=phase, expected_duration_min=15)
+    except Exception as e:  # noqa: BLE001 — soft-fail
+        print(f"[update_gate] deadline refresh soft-failed ({phase}): {e}")
+
+
 def _install_singleton_lock_or_die(timeout_seconds: float = 15.0):
     """v0.2.49: acquire the install.py main-entry single-instance lock.
 
@@ -6362,6 +6392,12 @@ def main() -> int:
                         )
                     )
 
+        # A-6: seed/collections phase done — re-extend the update-gate
+        # deadline before the schema-migration + resync + binary-refresh
+        # tail (Ollama pulls during seed are a common 15-min-blower).
+        if mode == "update":
+            _refresh_update_lockfile_deadline("install_py")
+
         # PR-24 (v0.2.12, 2026-05-16): schema-correctness migrations.
         # Run AFTER _seed_weaviate so the collections exist before we
         # attempt additive patches. Both scripts are idempotent and
@@ -6674,6 +6710,11 @@ def main() -> int:
         # resolves a binary. This closes the gap where --update finds a
         # stale dist binary (tier-1 success) and never invokes tier-3 to
         # refresh it. Gated by --no-binary-swap.
+        # A-6: entering the binary-refresh phase — re-extend the update-gate
+        # deadline so a slow prior phase (venv/seed) hasn't already let it
+        # expire while the binary swap is still ahead.
+        if mode == "update":
+            _refresh_update_lockfile_deadline("binary_refresh")
         try:
             _refresh_dist_binary_after_rebuild(
                 PROJECT_ROOT,
@@ -20453,14 +20494,44 @@ def _refresh_dist_binary_after_rebuild(
     swap_renamed_old_to: Optional[Path] = None
     try:
         dist_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dist_path)
-        if not platform.system().lower().startswith("win"):
+        # A-7 (v0.2.73): atomic swap on POSIX. The previous in-place
+        # ``shutil.copy2(src, dist_path)`` truncated-and-wrote at the final
+        # path, so a kill / power-loss / disk-full mid-copy left a truncated
+        # binary that ``_register_mcps`` (runs immediately after) would then
+        # register — a broken launcher with no error surfaced. Copy to a
+        # temp file in the SAME directory (so ``os.replace`` is a rename on
+        # one filesystem, not a cross-device copy), chmod it, then
+        # ``os.replace`` for an atomic rename. This matches the codebase's
+        # own ``atomic_write_text`` / ``_write_manifest_atomic`` invariant.
+        #
+        # Windows keeps the direct copy2 path below (its rename-fallback +
+        # ``.new`` staging handle the running-.exe lock case that os.replace
+        # cannot); os.replace onto an open .exe raises the same
+        # SHARING_VIOLATION we already handle there.
+        if platform.system().lower().startswith("win"):
+            shutil.copy2(src, dist_path)
+            swap_succeeded = True
+        else:
+            tmp_dist = dist_path.with_name(
+                f"{dist_path.name}.tmp-{os.getpid()}"
+            )
             try:
-                dist_path.chmod(0o755)
-            except OSError:
-                # Best-effort: fall through; the copy itself succeeded.
-                pass
-        swap_succeeded = True
+                shutil.copy2(src, tmp_dist)
+                try:
+                    tmp_dist.chmod(0o755)
+                except OSError:
+                    # Best-effort chmod; the copy itself succeeded.
+                    pass
+                os.replace(tmp_dist, dist_path)
+                swap_succeeded = True
+            finally:
+                # Clean up the temp file if os.replace never consumed it
+                # (e.g. the copy raised before replace). Best-effort.
+                if tmp_dist.exists():
+                    try:
+                        tmp_dist.unlink()
+                    except OSError:
+                        pass
     except OSError as exc:
         # Windows-specific fallback: when ERROR_SHARING_VIOLATION fires
         # (the running launcher .exe is locked by the OS), try
