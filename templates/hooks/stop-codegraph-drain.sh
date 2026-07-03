@@ -81,7 +81,16 @@ esac
 
 STATE_DIR="$PROJECT_ROOT/.claude/state"
 QUEUE="$STATE_DIR/codegraph_drain_${SESSION_ID}.txt"
-[ -f "$QUEUE" ] || exit 0
+# Session-agnostic SHARED drain queue (v0.2.73 I/O-audit HIGH-2): the
+# SubagentStop reconciler (subagent-stop-reconcile.{sh,ps1}) enqueues gated-IN
+# subagent code edits here rather than the removed orphan code-graph-queue.jsonl.
+# A subagent's payload session_id is the PARENT session's id today, but rather
+# than couple the fix to that undocumented harness detail, subagent edits land
+# in this session-AGNOSTIC file so the NEXT eligible Stop drain (any session)
+# processes them. MUST MATCH stop-codegraph-drain.ps1 + subagent-stop-reconcile.*.
+SHARED_QUEUE="$STATE_DIR/codegraph_drain_shared.txt"
+# Drain when EITHER the per-session queue OR the shared queue has entries.
+[ -f "$QUEUE" ] || [ -f "$SHARED_QUEUE" ] || exit 0
 
 # ── RATE LIMIT ──────────────────────────────────────────────────────────────
 # Per-project last-sync timestamp. If < interval since the last drain, DON'T
@@ -108,8 +117,24 @@ fi
 # batches, so a crash mid-dispatch leaves the consumed file for the next drain
 # to recover is NOT attempted here (soft-fail: worst case a turn's edits wait
 # for the next edit+drain — acceptable, eventually-consistent index).
-CONSUMED="$QUEUE.draining.$$"
-mv "$QUEUE" "$CONSUMED" 2>/dev/null || exit 0
+CONSUMED="$STATE_DIR/codegraph_drain_${SESSION_ID}.draining.$$"
+# Consume the per-session queue (if present) by atomic rename so concurrent
+# appends during the run start a fresh queue. Then FOLD IN the shared queue
+# (subagent edits) by atomic-renaming it aside too and appending its lines to
+# CONSUMED — one batch covers both. If the per-session queue is absent, seed
+# CONSUMED empty so the shared-queue fold still has a target.
+if [ -f "$QUEUE" ]; then
+    mv "$QUEUE" "$CONSUMED" 2>/dev/null || : > "$CONSUMED" 2>/dev/null || exit 0
+else
+    : > "$CONSUMED" 2>/dev/null || exit 0
+fi
+if [ -f "$SHARED_QUEUE" ]; then
+    _SHARED_CONSUMED="$STATE_DIR/codegraph_drain_shared.draining.$$"
+    if mv "$SHARED_QUEUE" "$_SHARED_CONSUMED" 2>/dev/null; then
+        cat "$_SHARED_CONSUMED" >> "$CONSUMED" 2>/dev/null || true
+        rm -f "$_SHARED_CONSUMED" 2>/dev/null || true
+    fi
+fi
 
 # Resolve analyzer + python (mirror code-graph-incremental.sh's resolution).
 DEFAULT_REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"

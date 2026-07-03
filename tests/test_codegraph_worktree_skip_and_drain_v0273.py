@@ -279,3 +279,130 @@ def test_drain_deleted_file_is_not_an_error(tmp_path: Path) -> None:
     # in the list (the analyzer prunes it). The hook must exit 0 regardless.
     runs = _wait_for_lines(argv_log, 1)
     assert len(runs) == 1, f"expected one run despite the deleted path, got {runs}"
+
+
+# ---------------------------------------------------------------------------
+# v0.2.73 HIGH-2 — the drain also consumes the SESSION-AGNOSTIC shared queue
+# (subagent edits enqueued by subagent-stop-reconcile.*)
+# ---------------------------------------------------------------------------
+
+
+def test_drain_consumes_shared_queue_with_per_session(tmp_path: Path) -> None:
+    """The drain folds the shared drain queue (codegraph_drain_shared.txt) into
+    the same batch as the per-session queue. Both a per-session path and a
+    subagent-enqueued shared path reach the analyzer in ONE run per canonical
+    root, and BOTH queues are cleared."""
+    repo = tmp_path / "proj"
+    _init_repo(repo)
+    state = repo / ".claude" / "state"
+    state.mkdir(parents=True)
+    session = "sessShared"
+
+    per_session_file = repo / "a.py"
+    per_session_file.write_text("a=1\n")
+    shared_file = repo / "b.py"
+    shared_file.write_text("b=2\n")
+
+    (state / f"codegraph_drain_{session}.txt").write_text(str(per_session_file) + "\n")
+    (state / "codegraph_drain_shared.txt").write_text(str(shared_file) + "\n")
+
+    argv_log = tmp_path / "argv.jsonl"
+    stub = tmp_path / "stub.py"
+    _make_analyzer_stub(stub, argv_log)
+
+    r = _run_drain(repo, session, {
+        "VCT_ANALYZER_SCRIPT": str(stub),
+        "VCT_PYTHON": shutil.which("python3"),
+        "VCO_CODEGRAPH_DRAIN_MIN_INTERVAL_SECONDS": "0",
+    })
+    assert r.returncode == 0, r.stderr
+    runs = _wait_for_lines(argv_log, 1)
+    # Both paths share ONE canonical root (the main repo) → ONE analyzer run.
+    assert len(runs) == 1, f"expected 1 batched run over both queues, got {runs}"
+    argv = runs[0]
+    assert "--only-files-from" in argv
+    list_file = Path(argv[argv.index("--only-files-from") + 1])
+    # The list file is cleaned up by the detached run; capture its content fast.
+    import time
+    listed = ""
+    for _ in range(60):
+        if list_file.exists():
+            listed = list_file.read_text()
+            if "a.py" in listed and "b.py" in listed:
+                break
+        time.sleep(0.05)
+    # Even if the list file was already GC'd, one run covering the canonical
+    # root is the invariant; when we DID capture it, both paths must be present.
+    if listed:
+        assert "a.py" in listed and "b.py" in listed, (
+            f"batch must contain both per-session and shared paths: {listed!r}")
+
+    # Both queues cleared after a successful drain.
+    assert not (state / f"codegraph_drain_{session}.txt").exists(), (
+        "per-session queue must be consumed")
+    assert not (state / "codegraph_drain_shared.txt").exists(), (
+        "shared queue must be consumed")
+
+
+def test_drain_shared_queue_only_no_per_session(tmp_path: Path) -> None:
+    """When ONLY the shared queue has entries (a subagent enqueued but the
+    session never accumulated its own edits), the drain still runs over the
+    shared paths and clears the shared queue."""
+    repo = tmp_path / "proj"
+    _init_repo(repo)
+    state = repo / ".claude" / "state"
+    state.mkdir(parents=True)
+    session = "sessSharedOnly"
+
+    shared_file = repo / "only.py"
+    shared_file.write_text("o=1\n")
+    (state / "codegraph_drain_shared.txt").write_text(str(shared_file) + "\n")
+    # No per-session queue file exists.
+
+    argv_log = tmp_path / "argv.jsonl"
+    stub = tmp_path / "stub.py"
+    _make_analyzer_stub(stub, argv_log)
+
+    r = _run_drain(repo, session, {
+        "VCT_ANALYZER_SCRIPT": str(stub),
+        "VCT_PYTHON": shutil.which("python3"),
+        "VCO_CODEGRAPH_DRAIN_MIN_INTERVAL_SECONDS": "0",
+    })
+    assert r.returncode == 0, r.stderr
+    runs = _wait_for_lines(argv_log, 1)
+    assert len(runs) == 1, f"shared-only drain must run one batch, got {runs}"
+    assert not (state / "codegraph_drain_shared.txt").exists(), (
+        "shared queue must be consumed even with no per-session queue")
+
+
+def test_drain_rate_limited_leaves_shared_queue(tmp_path: Path) -> None:
+    """A rate-limited drain must leave BOTH the per-session AND the shared queue
+    intact for the next eligible drain (the shared subagent edits must not be
+    lost inside the rate-limit window)."""
+    repo = tmp_path / "proj"
+    _init_repo(repo)
+    state = repo / ".claude" / "state"
+    state.mkdir(parents=True)
+    session = "sessRLshared"
+
+    shared_file = repo / "s.py"
+    shared_file.write_text("s=1\n")
+    shared_q = state / "codegraph_drain_shared.txt"
+    shared_q.write_text(str(shared_file) + "\n")
+
+    import time
+    (state / "codegraph_drain_last_sync.ts").write_text(str(int(time.time())))
+
+    argv_log = tmp_path / "argv.jsonl"
+    stub = tmp_path / "stub.py"
+    _make_analyzer_stub(stub, argv_log)
+
+    r = _run_drain(repo, session, {
+        "VCT_ANALYZER_SCRIPT": str(stub),
+        "VCT_PYTHON": shutil.which("python3"),
+        # Default 120s interval blocks.
+    })
+    assert r.returncode == 0, r.stderr
+    assert not argv_log.exists() or argv_log.read_text().strip() == "", (
+        "rate-limited drain must not run the analyzer")
+    assert shared_q.exists(), "rate-limited drain must leave the shared queue"

@@ -324,15 +324,20 @@ def test_kg_sync_invoked_for_modified_knowledge_md(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# T04: Code-graph queue
+# T04: Code-graph drain enqueue (v0.2.73 HIGH-2)
 # --------------------------------------------------------------------------- #
 
 
-def test_code_graph_queue_appends_modified_code_file(tmp_path):
-    """When the diff includes a code file (e.g. .py), the reconciler
-    appends a JSONL row to `.claude/state/code-graph-queue.jsonl`.
-    The reconciler MUST NOT block on actually analyzing the file —
-    it only enqueues."""
+def test_code_graph_edit_enqueues_into_shared_drain_queue(tmp_path):
+    """When the diff includes a code file, the reconciler routes it into the
+    SESSION-AGNOSTIC shared drain queue (.claude/state/codegraph_drain_shared.txt)
+    that the Stop-hook batched drain consumes — NOT the removed orphan
+    code-graph-queue.jsonl. It only ENQUEUES (never runs the analyzer).
+
+    The project here is NOT a git repo, so the canonical-root resolver returns
+    empty → the worktree gate treats it as a non-worktree edit → INDEX
+    (conservative default). The gated-IN absolute path is appended, one per
+    line."""
     project = _setup_project(tmp_path)
     agent_id = "T04-agent"
     session = "T04-session"
@@ -367,22 +372,191 @@ def test_code_graph_queue_appends_modified_code_file(tmp_path):
         f"reconcile exited {stop_result.returncode}; "
         f"stderr={stop_result.stderr!r}")
 
-    queue = project / ".claude" / "state" / "code-graph-queue.jsonl"
-    assert queue.exists(), "code-graph-queue.jsonl was not written"
-    rows = [
-        json.loads(ln)
-        for ln in queue.read_text(encoding="utf-8").splitlines()
-        if ln.strip()
-    ]
-    assert rows, f"queue file empty: {queue.read_text()!r}"
-    paths = [r.get("file_path") for r in rows]
-    assert "src/main.py" in paths, (
-        f"src/main.py not in queue rows: {paths!r}")
-    # Schema sanity: each row has session_id + agent_id + source.
-    last = rows[-1]
-    assert last["session_id"] == session
-    assert last["agent_id"] == agent_id
-    assert last["source"] == "subagent_stop"
+    shared_queue = project / ".claude" / "state" / "codegraph_drain_shared.txt"
+    assert shared_queue.exists(), "codegraph_drain_shared.txt was not written"
+    lines = [ln for ln in shared_queue.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert lines, f"shared drain queue empty: {shared_queue.read_text()!r}"
+    # Newline-delimited ABSOLUTE paths (matching the drain's format).
+    assert any(ln.endswith("src/main.py") for ln in lines), (
+        f"src/main.py (absolute) not in shared drain queue: {lines!r}")
+    for ln in lines:
+        assert os.path.isabs(ln), f"drain queue path is not absolute: {ln!r}"
+
+
+def test_orphan_code_graph_queue_is_never_written(tmp_path):
+    """v0.2.73 HIGH-2: the orphan .claude/state/code-graph-queue.jsonl (which
+    nothing ever drained) must NEVER be written by the reconciler anymore. A
+    code edit must land in the shared drain queue instead."""
+    project = _setup_project(tmp_path)
+    agent_id = "T04b-agent"
+    session = "T04b-session"
+
+    start_result = _run_hook(
+        SUBAGENT_START,
+        {"prompt": "p", "session_id": session, "agent_id": agent_id, "agent_type": "@a"},
+        project,
+    )
+    assert start_result.returncode == 0
+
+    (project / "src" / "main.py").write_text(
+        "# changed\ndef foo():\n    return 7\n", encoding="utf-8"
+    )
+
+    stop_result = _run_hook(
+        SUBAGENT_STOP,
+        {"session_id": session, "agent_id": agent_id, "agent_type": "@a", "stop_reason": "stop"},
+        project,
+    )
+    assert stop_result.returncode == 0, stop_result.stderr
+
+    orphan = project / ".claude" / "state" / "code-graph-queue.jsonl"
+    assert not orphan.exists(), (
+        "the orphan code-graph-queue.jsonl must NOT be written anymore; "
+        f"contents: {orphan.read_text() if orphan.exists() else ''!r}")
+    # And the edit did reach the batched path.
+    shared_queue = project / ".claude" / "state" / "codegraph_drain_shared.txt"
+    assert shared_queue.exists() and shared_queue.read_text().strip(), (
+        "code edit did not reach the shared drain queue")
+
+
+def test_ephemeral_worktree_edit_is_dropped_not_enqueued(tmp_path):
+    """A subagent code edit in an EPHEMERAL/unregistered git worktree is DROPPED
+    by the FIX-A' gate — not enqueued, and the orphan file is not written.
+
+    Setup: a real git MAIN repo with a stub resolver that answers
+    `resolve-project` with exit 2 (not registered); a linked worktree whose
+    canonical root is that main repo. An edit in the worktree resolves to a
+    canonical root that DIFFERS from the worktree root AND probes 'unregistered'
+    → SKIP."""
+    if not shutil.which("git"):
+        pytest.skip("git required")
+
+    def _git(cwd, *args):
+        subprocess.run(
+            ["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True,
+            env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                 "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"},
+        )
+
+    main = tmp_path / "main"
+    main.mkdir()
+    _git(main, "init", "-q")
+    (main / ".claude" / "logs").mkdir(parents=True)
+    (main / ".claude" / "state").mkdir(parents=True)
+    # Stub resolver under the MAIN (canonical) root: resolve-project → exit 2.
+    scripts = main / ".claude" / "scripts"
+    scripts.mkdir(parents=True)
+    resolver = scripts / "vct_project_config.sh"
+    resolver.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "$1" = "resolve-project" ]; then exit 2; fi\nexit 4\n'
+    )
+    resolver.chmod(0o755)
+    (main / "src").mkdir()
+    (main / "src" / "seed.py").write_text("def s():\n    return 0\n")
+    _git(main, "add", "-A")
+    _git(main, "commit", "-qm", "seed")
+
+    # Linked worktree (its own .claude/{logs,state,scripts} so the hook + gate
+    # can run there); the gate probes the CANONICAL root's resolver (exit 2).
+    wt = tmp_path / "wt"
+    _git(main, "worktree", "add", "-q", str(wt), "-b", "feat")
+    (wt / ".claude" / "logs").mkdir(parents=True, exist_ok=True)
+    (wt / ".claude" / "state").mkdir(parents=True, exist_ok=True)
+    wt_scripts = wt / ".claude" / "scripts"
+    wt_scripts.mkdir(parents=True, exist_ok=True)
+    (wt_scripts / "vct_project_config.sh").write_text(resolver.read_text())
+    (wt_scripts / "vct_project_config.sh").chmod(0o755)
+
+    # 1. Snapshot the worktree checkout.
+    start_result = _run_hook(
+        SUBAGENT_START,
+        {"prompt": "p", "session_id": "wt-s", "agent_id": "wt-a", "agent_type": "@a"},
+        wt,
+    )
+    assert start_result.returncode == 0
+
+    # 2. Edit a code file inside the worktree, under a snapshot-watched dir (src/).
+    (wt / "src" / "feat.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+
+    # 3. Reconcile against the worktree root.
+    stop_result = _run_hook(
+        SUBAGENT_STOP,
+        {"session_id": "wt-s", "agent_id": "wt-a", "agent_type": "@a", "stop_reason": "stop"},
+        wt,
+    )
+    assert stop_result.returncode == 0, stop_result.stderr
+
+    shared_queue = wt / ".claude" / "state" / "codegraph_drain_shared.txt"
+    # The worktree edit was gated OUT → shared queue absent or has no code path.
+    if shared_queue.exists():
+        lines = [ln for ln in shared_queue.read_text().splitlines() if ln.strip()]
+        assert not any(ln.endswith("feat.py") for ln in lines), (
+            f"ephemeral worktree edit must be dropped, not enqueued: {lines!r}")
+    orphan = wt / ".claude" / "state" / "code-graph-queue.jsonl"
+    assert not orphan.exists(), "orphan file must not be written for a dropped edit"
+
+
+def test_registered_worktree_edit_is_enqueued(tmp_path):
+    """A subagent code edit in a worktree whose canonical root IS a registered
+    launcher project (resolver exit 0) is ENQUEUED under the batched path — the
+    bare-repo/worktree-PRIMARY case must still index."""
+    if not shutil.which("git"):
+        pytest.skip("git required")
+
+    def _git(cwd, *args):
+        subprocess.run(
+            ["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True,
+            env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                 "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"},
+        )
+
+    main = tmp_path / "main"
+    main.mkdir()
+    _git(main, "init", "-q")
+    scripts = main / ".claude" / "scripts"
+    scripts.mkdir(parents=True)
+    resolver = scripts / "vct_project_config.sh"
+    resolver.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "$1" = "resolve-project" ]; then echo "proj-123"; exit 0; fi\nexit 4\n'
+    )
+    resolver.chmod(0o755)
+    (main / "src").mkdir()
+    (main / "src" / "seed.py").write_text("def s():\n    return 0\n")
+    _git(main, "add", "-A")
+    _git(main, "commit", "-qm", "seed")
+
+    wt = tmp_path / "wt"
+    _git(main, "worktree", "add", "-q", str(wt), "-b", "feat")
+    (wt / ".claude" / "logs").mkdir(parents=True, exist_ok=True)
+    (wt / ".claude" / "state").mkdir(parents=True, exist_ok=True)
+    wt_scripts = wt / ".claude" / "scripts"
+    wt_scripts.mkdir(parents=True, exist_ok=True)
+    (wt_scripts / "vct_project_config.sh").write_text(resolver.read_text())
+    (wt_scripts / "vct_project_config.sh").chmod(0o755)
+
+    start_result = _run_hook(
+        SUBAGENT_START,
+        {"prompt": "p", "session_id": "rw-s", "agent_id": "rw-a", "agent_type": "@a"},
+        wt,
+    )
+    assert start_result.returncode == 0
+
+    (wt / "src" / "feat.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+
+    stop_result = _run_hook(
+        SUBAGENT_STOP,
+        {"session_id": "rw-s", "agent_id": "rw-a", "agent_type": "@a", "stop_reason": "stop"},
+        wt,
+    )
+    assert stop_result.returncode == 0, stop_result.stderr
+
+    shared_queue = wt / ".claude" / "state" / "codegraph_drain_shared.txt"
+    assert shared_queue.exists(), "registered-worktree edit must be enqueued"
+    lines = [ln for ln in shared_queue.read_text().splitlines() if ln.strip()]
+    assert any(ln.endswith("feat.py") for ln in lines), (
+        f"registered-worktree edit not enqueued: {lines!r}")
 
 
 # --------------------------------------------------------------------------- #

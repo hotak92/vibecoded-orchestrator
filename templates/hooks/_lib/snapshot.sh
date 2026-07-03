@@ -7,8 +7,10 @@
 #
 # Background:
 #   The SubagentStop reconciler needs to know which files the subagent
-#   modified during its run so it can drive KG-sync, code-graph-queue,
-#   credential-scan, and nudge-counter side effects. The SubagentStop
+#   modified during its run so it can drive KG-sync, the code-graph drain
+#   enqueue (v0.2.73: the worktree-gated shared drain queue, replacing the
+#   old orphan code-graph-queue.jsonl), credential-scan, and nudge-counter
+#   side effects. The SubagentStop
 #   payload alone is not sufficient — the wire format doesn't reliably
 #   ship a "files modified" list (and even when it does, content hashing
 #   is the only way to detect modifications that don't go through the
