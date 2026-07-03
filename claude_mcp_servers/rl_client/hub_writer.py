@@ -179,4 +179,90 @@ def post_rl_event(event: dict[str, Any], timeout: float = _DEFAULT_TIMEOUT_S) ->
         return False
 
 
-__all__ = ["post_rl_event"]
+def post_rl_prune(
+    *,
+    cutoff_ms: Optional[int] = None,
+    max_rows: Optional[int] = None,
+    project_id: Optional[str] = None,
+    timeout: float = _DEFAULT_TIMEOUT_S,
+) -> Optional[dict[str, Any]]:
+    """RL-5 (v0.2.73): drive the hub-side ``rl_events`` prune route.
+
+    POSTs a prune request to ``/api/v1/rl/events/prune`` (added hub-side by the
+    W2-B track — see the RL-5 patch spec). The hub deletes events older than
+    ``cutoff_ms`` and/or keeps only the newest ``max_rows`` rows, then returns
+    ``{"ok": true, "deleted": <n>}``.
+
+    Return contract (deliberately three-valued so the retention driver can tell
+    "route missing" apart from "route ran, deleted 0"):
+
+      * ``dict``  — the hub's 2xx JSON body (``{"deleted": N, ...}``).
+      * ``None``  — the route does not exist on this hub binary (404) OR the
+        hub is unreachable / token missing / any transport error. The driver
+        treats None as "prune not available; corpus untouched" and moves on.
+
+    Never raises. Retention is best-effort — a wedged hub must never break the
+    RL write path or the user-facing search.
+
+    Args:
+        cutoff_ms: Delete events with ``ts_ms < cutoff_ms``. None → no age bound.
+        max_rows: Keep at most this many most-recent rows. None → no row bound.
+        project_id: Scope the prune to one project. None → all projects.
+        timeout: Per-request timeout (s).
+    """
+    token = _read_hub_token()
+    if token is None:
+        logger.debug("rl_events prune skipped: no hub.token (hub not running?)")
+        return None
+
+    port = _read_hub_port()
+    url = f"http://127.0.0.1:{port}/api/v1/rl/events/prune"
+
+    body_obj: dict[str, Any] = {}
+    if cutoff_ms is not None:
+        body_obj["cutoff_ms"] = int(cutoff_ms)
+    if max_rows is not None:
+        body_obj["max_rows"] = int(max_rows)
+    if project_id:
+        body_obj["project_id"] = str(project_id)
+
+    try:
+        body = json.dumps(body_obj).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        logger.debug("rl_events prune skipped: not JSON-serializable (%s)", exc)
+        return None
+
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if 200 <= resp.status < 300:
+                try:
+                    return json.loads(resp.read().decode("utf-8"))
+                except Exception:  # noqa: BLE001 — 2xx with unparseable body
+                    return {"ok": True}
+            return None
+    except urllib.error.HTTPError as e:
+        # 404 == route absent on an older hub binary → treat as "unsupported"
+        # (None) so the driver degrades gracefully rather than logging noise.
+        if e.code == 404:
+            logger.debug("rl_events prune route absent (404); older hub binary")
+        else:
+            logger.debug("rl_events prune returned HTTP %s", e.code)
+        return None
+    except urllib.error.URLError as e:
+        logger.debug("rl_events prune URL error: %s", e.reason)
+        return None
+    except (OSError, TimeoutError) as exc:
+        logger.debug("rl_events prune failed: %s", exc)
+        return None
+
+
+__all__ = ["post_rl_event", "post_rl_prune"]
