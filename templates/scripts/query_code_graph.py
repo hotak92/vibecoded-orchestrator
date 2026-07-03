@@ -562,10 +562,9 @@ class CodeGraphQuery:
             # identical wiring in the MCP (the hard invariant).
             _post_floor = resolve_post_rerank_floor(_slot)
             _tier_fn = make_code_tier_fn(min_gate=_post_floor) if detail == "auto" else None
-            _retrieval_floor = resolve_retrieval_floor(_slot)
             survivors = run_code_retrieval_pipeline(
                 candidates,
-                retrieval_floor=_retrieval_floor,
+                retrieval_floor=resolve_retrieval_floor(_slot),
                 post_rerank_floor=_post_floor,
                 anchor_props=anchor_props,
                 limit=limit,
@@ -588,7 +587,7 @@ class CodeGraphQuery:
                     limit=limit,
                     slot=_slot,
                     task_type="code_hook" if hook_format else "code_cli",
-                    retrieval_floor=_retrieval_floor,
+                    retrieval_floor=resolve_retrieval_floor(_slot),
                     post_rerank_floor=_post_floor,
                     anchor_present=anchor_props is not None,
                     scope=collection,

@@ -8408,11 +8408,10 @@ async def search_code_graph(
         # has NO exclude concept (a direct tool call has no edited-file context),
         # so no equivalent filter exists here — deliberate, not drift.
         _post_floor = resolve_post_rerank_floor(_slot)
-        _retrieval_floor = resolve_retrieval_floor(_slot)
         _tier_fn = make_code_tier_fn(min_gate=_post_floor) if detail == "auto" else None
         candidates = run_code_retrieval_pipeline(
             candidates,
-            retrieval_floor=_retrieval_floor,
+            retrieval_floor=resolve_retrieval_floor(_slot),
             post_rerank_floor=_post_floor,
             anchor_props=None,
             limit=limit,
@@ -8431,7 +8430,7 @@ async def search_code_graph(
             limit=limit,
             slot=_slot,
             task_type="code_search",
-            retrieval_floor=_retrieval_floor,
+            retrieval_floor=resolve_retrieval_floor(_slot),
             post_rerank_floor=_post_floor,
             anchor_present=False,
             scope=scope,
