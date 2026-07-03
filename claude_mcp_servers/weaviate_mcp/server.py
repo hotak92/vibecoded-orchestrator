@@ -4986,6 +4986,150 @@ def _get_rl_telemetry_writer():
     )
 
 
+def _resolve_code_embedding_triple(
+    slot: str, query_emb: "list[float] | None" = None
+) -> "tuple[str, int, str]":
+    """Resolve the CODE embedding (source, dim, model) triple — one home.
+
+    v0.2.73: extracted from ``_emit_code_retrieval_telemetry`` so the
+    structural-telemetry emit (``_emit_code_structure_telemetry``) shares the
+    exact same resolution instead of forking it. Short source derives from the
+    slot; dim prefers the ACTUAL query-vector length, then the service; model
+    prefers the service-resolved id, then env, then the source tag. Soft-fail
+    throughout — never raises, never blocks an emit.
+    """
+    code_source = _slot_short_source(slot)
+    code_dim = len(query_emb) if query_emb else 0
+    code_model = ""
+    try:
+        svc = _get_embedding_service()
+        if svc is not None:
+            code_model = getattr(svc, "code_model_id", "") or ""
+            if not code_dim:
+                code_dim = getattr(svc, "code_dim", 0) or 0
+    except Exception:  # noqa: BLE001
+        pass
+    if not code_model:
+        code_model = os.getenv("CODE_EMBED_MODEL", "") or code_source
+    return code_source, code_dim, code_model
+
+
+# Bound on the per-event node list for STRUCTURAL telemetry. The structural
+# branches already cap their result lists (<= 64); this is a defensive second
+# bound so a future uncapped branch can't balloon the event payload.
+_CODE_STRUCTURE_TELEMETRY_MAX_NODES = 64
+
+
+def _emit_code_structure_telemetry(
+    *,
+    query_type: str,
+    target: str,
+    results: "list[dict] | None",
+    truncated: "bool | None" = None,
+    session_id: "str | None" = None,
+) -> bool:
+    """v0.2.73 (RL follow-up): emit a retrieval event for ``query_code_structure``.
+
+    Structural lookups return graph EDGES, not ranked candidates — there is no
+    score, no rerank, and (deliberately) no citation staging and no
+    ``answer_window.KG_SEARCH_TOOLS`` membership. The maintainer still wants
+    uniform telemetry coverage across the code tools, so this emits a
+    retrieval event carrying: the tool's (query_type, target) as the query
+    string, per-result identity nodes (``tier="structural"``, ``score=0.0`` —
+    the writer's clamp floor, honest for "unranked"), and event-level extras
+    with ``retrieval_kind="code_structure"`` + the result count. Zero-result
+    successes ARE emitted (a structural miss is a query-distribution signal);
+    error paths are NOT (a failed tool call is not a retrieval).
+
+    ``query_emb`` is None by design — structural queries never embed anything;
+    the offline trainer's degraded/None handling already covers this shape.
+    Soft-fail throughout; returns emit success.
+    """
+    try:
+        from claude_mcp_servers.rl_client.telemetry_emit import (
+            EmitValidationError,
+            RetrievalEvent,
+            emit_rl_event,
+            new_task_id,
+        )
+
+        rows = results if isinstance(results, list) else []
+        nodes: list[dict] = []
+        for i, r in enumerate(rows[:_CODE_STRUCTURE_TELEMETRY_MAX_NODES]):
+            if not isinstance(r, dict):
+                continue
+            # Per-branch identity fallback (mirrors the collapse helper's F1
+            # lesson): callers/methods/extends → full_name or name;
+            # dependencies/imports → path; composes → composed_class;
+            # interactions → endpoint or raw_target; path hops → full_name.
+            title = (
+                r.get("full_name")
+                or r.get("name")
+                or r.get("path")
+                or r.get("composed_class")
+                or r.get("endpoint")
+                or r.get("raw_target")
+                or ""
+            )
+            if not title:
+                continue
+            rec: dict = {
+                "title": str(title),
+                "score": 0.0,
+                "tier": "structural",
+                "shown_rank": i,
+            }
+            fp = r.get("file_path") or ""
+            if fp:
+                rec["file_path"] = fp
+            nodes.append(rec)
+
+        # Same slot resolution the code search path uses (best-effort).
+        try:
+            _svc = _get_embedding_service() if DUAL_EMBEDDING_ENABLED else None
+            _slot = _svc.code_vector_slot if _svc is not None else "codesage_embed"
+        except Exception:  # noqa: BLE001
+            _slot = "codesage_embed"
+        code_source, code_dim, code_model = _resolve_code_embedding_triple(_slot)
+
+        extras: dict = {
+            "retrieval_kind": "code_structure",
+            "query_type": query_type,
+            "target": target,
+            "result_count": len(rows),
+        }
+        if truncated is not None:
+            extras["truncated"] = bool(truncated)
+
+        ev = RetrievalEvent(
+            query=f"{query_type}:{target}",
+            query_emb=None,
+            embedding_source=code_source,
+            embedding_dim=code_dim,
+            embedding_model=code_model,
+            nodes=nodes,
+            task_id=new_task_id(),
+            task_type="code_structure",
+            session_id=session_id,
+            rl_used=False,
+            extras=extras,
+        )
+
+        def _structure_writer_factory():
+            return _get_rl_telemetry_writer_for(
+                code_source, embedding_dim=code_dim, embedding_model=code_model,
+            )
+
+        try:
+            return emit_rl_event(ev, writer_factory=_structure_writer_factory)
+        except EmitValidationError as exc:
+            logger.debug("code structure emit validation failed (%s)", exc)
+            return False
+    except Exception as exc:  # noqa: BLE001 — telemetry never breaks the tool
+        logger.debug("code structure emit failed (%s)", exc)
+        return False
+
+
 def _emit_code_retrieval_telemetry(
     *,
     query: str,
@@ -5090,19 +5234,9 @@ def _emit_code_retrieval_telemetry(
         # CODE embedding triple: slot-derived short source, the query
         # vector's ACTUAL dim, and the service-resolved model id when
         # available. Falls back to env — never blocks the emit.
-        code_source = _slot_short_source(slot)
-        code_dim = len(query_emb) if query_emb else 0
-        code_model = ""
-        try:
-            svc = _get_embedding_service()
-            if svc is not None:
-                code_model = getattr(svc, "code_model_id", "") or ""
-                if not code_dim:
-                    code_dim = getattr(svc, "code_dim", 0) or 0
-        except Exception:  # noqa: BLE001
-            pass
-        if not code_model:
-            code_model = os.getenv("CODE_EMBED_MODEL", "") or code_source
+        code_source, code_dim, code_model = _resolve_code_embedding_triple(
+            slot, query_emb
+        )
 
         extras: dict = {"retrieval_kind": "code", "anchor": bool(anchor_present)}
         if scope:
@@ -9291,6 +9425,12 @@ def query_code_structure(
                         ))
 
             if found_path is None:
+                # v0.2.73 (RL follow-up): a successful path query with no
+                # path IS a structural result — emit before the early return
+                # so the "no path" outcome lands in the corpus too.
+                _emit_code_structure_telemetry(
+                    query_type=query_type, target=target, results=[],
+                )
                 return json.dumps({
                     "success": True,
                     "query_type": "path",
@@ -9382,6 +9522,20 @@ def query_code_structure(
         if _truncation_meta is not None:
             response_payload["truncated"] = _truncation_meta["truncated"]
             response_payload["limit"] = _truncation_meta["limit"]
+
+        # v0.2.73 (RL follow-up): uniform telemetry coverage — structural
+        # lookups emit a retrieval event too (no rerank, no citation; see
+        # the helper's docstring). Soft-fail, never blocks the response.
+        _emit_code_structure_telemetry(
+            query_type=query_type,
+            target=target,
+            results=results,
+            truncated=(
+                _truncation_meta["truncated"]
+                if _truncation_meta is not None
+                else None
+            ),
+        )
         return _large_result(response_payload)
 
     except WeaviateUnreachable as exc:

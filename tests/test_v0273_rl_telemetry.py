@@ -798,3 +798,104 @@ def test_rl2b_compute_citation_kg_ctx_unchanged(monkeypatch):
     result = compute_citation("task-kg", "answer that cites NodeA", ctx, write=True)
     assert result is not None
     assert citations_written
+
+
+# ---------------------------------------------------------------------------
+# query_code_structure telemetry (uniform code-tool coverage; no rerank, no
+# citation — structural edges are not ranked candidates)
+# ---------------------------------------------------------------------------
+
+
+def test_structure_emit_builds_structural_event(monkeypatch):
+    import importlib
+
+    srv = importlib.import_module("weaviate_mcp.server")
+    captured: list = []
+    monkeypatch.setattr(
+        srv, "_get_rl_telemetry_writer_for", lambda *a, **k: _writer(captured)
+    )
+    monkeypatch.setattr(srv, "_get_embedding_service", lambda: None)
+    ok = srv._emit_code_structure_telemetry(
+        query_type="callers",
+        target="alpha.processing.process_batch",
+        results=[
+            {"full_name": "alpha.api.handler", "file_path": "src/alpha/api.py"},
+            {"path": "src/alpha/util.py"},
+            {"composed_class": "BatchValidator"},
+        ],
+        truncated=False,
+    )
+    assert ok is True
+    event = _payload(captured[0])
+    assert event["task_type"] == "code_structure"
+    assert event["rl_used"] is False
+    assert event["query"] == "callers:alpha.processing.process_batch"
+    assert event.get("query_emb") in (None, [])
+    ex = event["extras"]
+    assert ex["retrieval_kind"] == "code_structure"
+    assert ex["query_type"] == "callers"
+    assert ex["target"] == "alpha.processing.process_batch"
+    assert ex["result_count"] == 3
+    assert ex["truncated"] is False
+    n = event["nodes"]
+    # Identity fallbacks: full_name > name > path > composed_class > ...
+    assert [r["title"] for r in n] == [
+        "alpha.api.handler", "src/alpha/util.py", "BatchValidator",
+    ]
+    assert all(r["tier"] == "structural" for r in n)
+    assert all(r["score"] == 0.0 for r in n)
+    assert n[0]["file_path"] == "src/alpha/api.py"
+    assert [r["shown_rank"] for r in n] == [0, 1, 2]
+
+
+def test_structure_emit_zero_results_still_emits(monkeypatch):
+    """A structural MISS (0 results) is a query-distribution signal."""
+    import importlib
+
+    srv = importlib.import_module("weaviate_mcp.server")
+    captured: list = []
+    monkeypatch.setattr(
+        srv, "_get_rl_telemetry_writer_for", lambda *a, **k: _writer(captured)
+    )
+    monkeypatch.setattr(srv, "_get_embedding_service", lambda: None)
+    ok = srv._emit_code_structure_telemetry(
+        query_type="path",
+        target="alpha.a->alpha.b",
+        results=[],
+    )
+    assert ok is True
+    event = _payload(captured[0])
+    assert event["extras"]["result_count"] == 0
+    assert event["nodes"] == []
+
+
+def test_structure_emit_soft_fails_on_writer_error(monkeypatch):
+    import importlib
+
+    srv = importlib.import_module("weaviate_mcp.server")
+
+    def _boom(*a, **k):
+        raise RuntimeError("writer construction exploded")
+
+    monkeypatch.setattr(srv, "_get_rl_telemetry_writer_for", _boom)
+    monkeypatch.setattr(srv, "_get_embedding_service", lambda: None)
+    ok = srv._emit_code_structure_telemetry(
+        query_type="callers", target="alpha.fn", results=[{"full_name": "x"}],
+    )
+    assert ok is False  # soft-fail, no raise
+
+
+def test_structure_tool_calls_the_emit_home():
+    """query_code_structure routes through _emit_code_structure_telemetry at
+    BOTH success exits (common chokepoint + path-not-found early return)."""
+    import importlib
+    import inspect
+
+    srv = importlib.import_module("weaviate_mcp.server")
+    tool_fn = getattr(srv.query_code_structure, "fn", None) or srv.query_code_structure
+    src = inspect.getsource(tool_fn)
+    assert src.count("_emit_code_structure_telemetry(") == 2
+    # Structural lookups stay OUT of the citable-tool set (no candidates).
+    from claude_mcp_servers.rl_client.answer_window import KG_SEARCH_TOOLS
+
+    assert "query_code_structure" not in KG_SEARCH_TOOLS
