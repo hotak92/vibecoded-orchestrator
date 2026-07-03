@@ -161,6 +161,18 @@ if ($byRoot.Count -eq 0) {
     exit 0
 }
 
+# Stale-lock breaker (v0.2.73 I/O-audit HIGH-1 — must match stop-codegraph-drain.sh):
+# the per-root lock dir below is released only inside the detached analyzer's
+# cleanup. If that process dies before release (kill, OOM, out-of-disk — the exact
+# condition this effort targets, or a reboot) the lock leaks and that root's code
+# graph freezes silently forever. Break locks older than the max plausible analyzer
+# runtime (30 min) so a dead drain self-heals on the next turn.
+try {
+    Get-ChildItem -LiteralPath $stateDir -Directory -Filter 'codegraph_drain_root_*.lock' -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddMinutes(-30) } |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+} catch {}
+
 foreach ($h in @($byRoot.Keys)) {
     $canon = $rootForHash[$h]
     $project = Resolve-DrainProject -Root $canon

@@ -229,6 +229,21 @@ _drain_index_dot_claude() {
     fi
 }
 
+# Stale-lock breaker (v0.2.73 I/O-audit HIGH-1): the per-root lock below is a
+# lock-DIR released only inside the detached analyzer's `_snip` (rm -rf "$_lock").
+# If that detached process dies before the release — SIGKILL, OOM, ENOSPC
+# (the exact disk-full condition this whole effort targets), or a reboot — the
+# lock dir LEAKS and the `mkdir` acquire below fails forever, so that root's
+# code graph would freeze silently and never drain again. Break locks older
+# than the max plausible analyzer runtime so a dead drain self-heals on the next
+# turn. 30 min is well past a normal per-turn batch; a lock older than that
+# means the holder is gone, not slow. `find -mmin +30` on the lock DIR's mtime
+# (set at mkdir); soft-fail if `find` is absent (rare).
+if command -v find >/dev/null 2>&1; then
+    find "$STATE_DIR" -maxdepth 1 -type d -name 'codegraph_drain_root_*.lock' \
+        -mmin +30 -exec rm -rf {} + 2>/dev/null || true
+fi
+
 # Run one analyzer batch per canonical root, serialized per-root.
 for _pf in "$BATCH_DIR"/*.paths; do
     [ -e "$_pf" ] || continue
