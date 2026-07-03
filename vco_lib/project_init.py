@@ -6393,9 +6393,16 @@ def _emit_user_secret_values_retained_deferral(folder: Path) -> None:
     ONE-TIME scanner that detects a secret-shaped line in the managed block
     (no value printed — only a pattern match). Self-clearing: once the next
     env-projection refresh scrubs the value, the deferral is never re-emitted.
-    OWNED condition (v0.2.73 S-8): triggered at bundle-update time, cleared
-    when value leaves the tree, survives UPDATE_DEFERRED.md rewrites so the
-    user's Claude can see the notice if they haven't refreshed yet.
+    FOREIGN from install.py's perspective (v0.2.73 S-8): emitted ONLY on the
+    bundle-update path here, NEVER by install.py --update (which doesn't
+    re-detect it). It is therefore deliberately NOT in
+    ``install.py::_INSTALL_OWNED_CONDITION_IDS`` — install.py preserves it
+    verbatim (per ``deferral_report.condition_is_owned``: non-owned == FOREIGN
+    == preserved). If it were OWNED, an ``install.py --update`` run would seed
+    the report, fail to re-detect this bundle-update-only condition, and
+    silently DROP the secret-retention notice while the value may still be in
+    the tree (the exact A-2 clobber class this whole track fixes). It clears
+    the next time THIS bundle-update path runs and finds the value gone.
 
     Severity is "warning" (not critical) because:
       * The value IS still a secret until the next refresh (users should rotate
@@ -6444,31 +6451,16 @@ def _emit_user_secret_values_retained_deferral(folder: Path) -> None:
                     env_block = data.get("env", {})
                     if not isinstance(env_block, dict):
                         return False
-                    # Check if ANY key looks secret-shaped (all-caps, underscores,
-                    # typical secret patterns like API_KEY, TOKEN, SECRET, etc.).
-                    secret_patterns = [
-                        "TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL",
-                        "API_", "GITHUB_", "OPENAI_", "ANTHROPIC_",
-                    ]
+                    # Secret-shape detection uses the SINGLE HOME
+                    # (vco_lib.secrets_audit.is_secret_shaped_env_key —
+                    # token-based, mirrors install.py::_is_secret_shaped_env_key).
+                    # Do NOT fork a substring list here (B-3 regression). A
+                    # canonical VCO routing key is never secret-shaped by that
+                    # predicate, so no extra allowlist is needed.
+                    from vco_lib.secrets_audit import is_secret_shaped_env_key
                     for key in env_block:
-                        if any(pattern in key.upper() for pattern in secret_patterns):
-                            # This is a potential pre-fix secret key. Guard against
-                            # false positives by checking if it's NOT a canonical
-                            # VCO key (WEAVIATE_URL, KG_COLLECTION, etc.).
-                            canonical_keys = {
-                                "KG_COLLECTION", "DEVELOPMENT_COLLECTION",
-                                "SHARED_KG_COLLECTION", "PROJECT_NAME",
-                                "CODE_GRAPH_PROJECT", "ACTIVE_EMBEDDING",
-                                "WEAVIATE_URL", "OLLAMA_URL", "CODE_EMBED_URL",
-                                "WEAVIATE_PORT", "OLLAMA_PORT", "CODE_EMBED_PORT",
-                                "SHARED_KG_WRITE_DISABLED", "SHARED_KG_OPT_OUT",
-                                "VCT_", "GRPC_", "DEVELOPMENT_COLLECTION",
-                            }
-                            if key not in canonical_keys and not any(
-                                key.startswith(prefix)
-                                for prefix in ("VCT_", "GRPC_", "SHARED_KG_")
-                            ):
-                                return True
+                        if is_secret_shaped_env_key(key):
+                            return True
                 except (json.JSONDecodeError, Exception):
                     return False
             return False

@@ -134,3 +134,29 @@ def test_never_prints_secret_value(project_with_secret_in_env: Path) -> None:
     # The word "secret" should appear (in the condition ID or title), but not
     # paired with a value.
     assert "secret" in content.lower()
+
+
+def test_condition_is_foreign_not_owned_by_installpy() -> None:
+    """D-1 (pre-gate design audit): `user_secret_values_retained_in_tree` is
+    emitted ONLY on the bundle-update path, NEVER by install.py --update. It
+    MUST therefore be FOREIGN from install.py's perspective — i.e. NOT in
+    `_INSTALL_OWNED_CONDITION_IDS`. If it were owned, an `install.py --update`
+    run would seed the report, fail to re-detect this bundle-update-only
+    condition, and silently drop the secret-retention notice while the value
+    may still be in the tree (the A-2 clobber class). This guard prevents a
+    regression back to OWNED.
+    """
+    import install  # noqa: PLC0415 — test-time import of the installer module
+    from vco_lib.deferral_report import condition_is_owned
+
+    cid = "user_secret_values_retained_in_tree"
+    assert cid not in install._INSTALL_OWNED_CONDITION_IDS, (
+        f"{cid} must be FOREIGN (preserved), not OWNED — see the emitter "
+        "docstring in project_init.py::_emit_user_secret_values_retained_deferral"
+    )
+    # And it must not match any owned prefix either.
+    assert not condition_is_owned(
+        cid,
+        install._INSTALL_OWNED_CONDITION_IDS,
+        install._INSTALL_OWNED_CONDITION_PREFIXES,
+    )

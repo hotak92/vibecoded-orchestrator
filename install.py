@@ -205,7 +205,6 @@ _INSTALL_OWNED_CONDITION_IDS = frozenset({
     "boot_service_path_repaired",
     "claude_settings_unparseable",
     "claude_settings_user_modified_preserved",
-    "user_secret_values_retained_in_tree",
 })
 
 # Dynamically-suffixed families install.py emits (see condition_is_owned).
