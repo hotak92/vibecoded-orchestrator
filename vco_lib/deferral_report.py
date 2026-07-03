@@ -29,6 +29,7 @@ design; the YAML frontmatter is machine-parseable.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -39,6 +40,33 @@ from vco_lib.atomic import atomic_write_text
 
 # Relative path inside any managed project folder.
 _DEFERRED_REL = Path(".claude") / "context" / "UPDATE_DEFERRED.md"
+
+# A-3 (v0.2.73): machine-readable sidecar — the SOURCE OF TRUTH for the
+# deferral report. The Markdown file (``_DEFERRED_REL``) is a HUMAN-READABLE
+# RENDER of the same entries, kept byte-compatible with the Rust
+# ``restart.rs::extract_section/strip_section`` parser (which edits the
+# Markdown to clear the ``launcher_restart_required`` section on restart).
+#
+# WHY a JSON sidecar: the Markdown round-trip corrupted entries (multi-line
+# fields truncated to their first line on read; a ``## fake (crit)`` line
+# inside a field split one entry into three; a ``` line inside a command
+# inverted the fence toggle). The single most common real deferral —
+# ``bundle_user_modified_preserved`` — renders its preserved-files list on
+# continuation lines of ``detected``; the Markdown parser dropped every line
+# but the first, silently destroying the entry's actionable payload on the
+# next read-merge-write by ANY emitter. JSON has no such ambiguity.
+#
+# RECONCILIATION with the Rust editor: ``restart.rs`` clears a section from
+# the Markdown but does NOT know about the JSON sidecar. So on ``read`` we
+# treat JSON as authoritative BUT drop any entry whose ``## <cid>`` header is
+# absent from a co-present Markdown file — that means the Rust restart flow
+# (or a manual edit) removed it. This keeps JSON authoritative for content
+# while honouring the one cross-language mutation that touches the Markdown.
+_DEFERRED_JSON_REL = Path(".claude") / "context" / "UPDATE_DEFERRED.json"
+
+# Sidecar schema version — bump when the JSON shape changes so old readers
+# can detect/skip an incompatible sidecar and fall back to the Markdown.
+_JSON_SCHEMA_VERSION = 1
 
 # Sentinel lines that delimit YAML frontmatter.
 _FM_OPEN = "---"
@@ -103,41 +131,101 @@ def _reminder_block() -> str:
     )
 
 
+def _find_reminder_marker_span(existing: str):
+    """A-4 (v0.2.73): locate the reminder block by LINE-START markers that
+    live OUTSIDE fenced code blocks.
+
+    Returns:
+        (start, end)     — char offsets: ``start`` = index of the begin
+                           marker line, ``end`` = index just past the end
+                           marker line (exclusive of its trailing newline).
+        ("ambiguous",)   — a begin marker was found at a real (unfenced,
+                           line-start) position but no matching real end
+                           marker follows it → the caller must do nothing
+                           and log, to avoid deleting user content.
+        None             — no real reminder block present.
+
+    WHY: the pre-A-4 ``existing.find(_REMINDER_BEGIN)`` matched the FIRST
+    literal occurrence anywhere — including a marker QUOTED inside a code
+    fence (this repo's own shareable CLAUDE.md documents the markers). It
+    would then pair that quoted begin with a later real end and delete all
+    user content between them. Matching only line-start markers outside
+    fences removes that class of silent destruction.
+    """
+    lines = existing.splitlines(keepends=True)
+    in_fence = False
+    fence_marker: Optional[str] = None  # track ``` vs ~~~ style
+    begin_at: Optional[int] = None  # char offset of begin marker line
+    offset = 0
+    for line in lines:
+        stripped = line.strip()
+        # Fenced code-block toggle: a line whose FIRST non-space content is
+        # ``` or ~~~ (info string allowed after). Track the fence char so a
+        # nested ``` inside a ~~~ block doesn't mis-toggle.
+        if not in_fence and (stripped.startswith("```") or stripped.startswith("~~~")):
+            in_fence = True
+            fence_marker = stripped[:3]
+            offset += len(line)
+            continue
+        if in_fence:
+            if stripped.startswith(fence_marker or "```"):
+                in_fence = False
+                fence_marker = None
+            offset += len(line)
+            continue
+        # Outside a fence: match markers only when they ARE the line (after
+        # stripping surrounding whitespace) — a marker quoted mid-sentence
+        # or inside a longer line does not count.
+        if stripped == _REMINDER_BEGIN:
+            begin_at = offset
+        elif stripped == _REMINDER_END and begin_at is not None:
+            # end marker line ends at offset + len(line); we want the offset
+            # just past the marker text (exclude the trailing newline so the
+            # caller controls newline trimming).
+            end = offset + len(line.rstrip("\n"))
+            return (begin_at, end)
+        offset += len(line)
+
+    if begin_at is not None:
+        # Real begin found but no matching real end → ambiguous. Do nothing.
+        return ("ambiguous",)
+    return None
+
+
 def _splice_reminder_into_claude_md(existing: str) -> str:
     """Return ``existing`` with the reminder block injected idempotently.
 
     Three insertion points (in priority order):
 
-    1. If a previous reminder block exists (find the begin/end markers):
-       replace it in place — preserves position chosen on the original
-       insertion, prevents block migration on every install.
+    1. If a previous reminder block exists (real, line-start markers outside
+       fences): replace it in place — preserves position chosen on the
+       original insertion, prevents block migration on every install.
     2. Else if ``existing`` opens with YAML frontmatter (``---\n...\n---\n``):
-       prepend the block immediately AFTER the closing fence, separated
-       by a blank line.
+       prepend the block immediately AFTER the closing fence, separated by a
+       blank line.
     3. Else: prepend the block at the very top, separated by a blank line
        from whatever follows.
 
-    The trailing blank line is normalised so we don't accumulate empty
-    lines on repeat injections.
+    A-4: matching is fence-aware + line-start only. On an ambiguous begin
+    (real begin, no real end) we DO NOT splice — we return the file
+    unchanged so no user content is destroyed (the orphan marker stays; the
+    user can clean it). This prefers a missing refresh over data loss.
     """
     block = _reminder_block()
 
-    # Case 1: existing block — replace in place.
-    start = existing.find(_REMINDER_BEGIN)
-    if start != -1:
-        end_rel = existing[start:].find(_REMINDER_END)
-        if end_rel != -1:
-            end = start + end_rel + len(_REMINDER_END)
-            after = existing[end:]
-            # Strip a single leading newline so re-injections don't
-            # accumulate blank lines.
-            if after.startswith("\n"):
-                after = after[1:]
-            return existing[:start] + block + after
-        # Begin marker without a matching end — treat as corrupt; fall
-        # through and prepend a fresh block. The orphan begin marker
-        # stays in place; the user can manually clean it. We prefer
-        # corrupt + accurate over silent loss.
+    span = _find_reminder_marker_span(existing)
+    if span == ("ambiguous",):
+        # Conservative: leave the file exactly as-is rather than risk
+        # splicing across user content.
+        return existing
+    if isinstance(span, tuple) and len(span) == 2 and isinstance(span[0], int):
+        start, end = span
+        after = existing[end:]
+        # Strip a single leading newline so re-injections don't accumulate
+        # blank lines.
+        if after.startswith("\n"):
+            after = after[1:]
+        return existing[:start] + block + after
 
     # Case 2: frontmatter — splice after closing fence.
     fm_match = _LEADING_FRONTMATTER_RE.match(existing)
@@ -159,20 +247,20 @@ def _splice_reminder_into_claude_md(existing: str) -> str:
 def _strip_reminder_from_claude_md(existing: str) -> str:
     """Return ``existing`` with the wrapped reminder block removed.
 
-    No-op (returns the original string) when no block is found. Cleans
-    up the blank-line separator that ``_splice_reminder_into_claude_md``
-    inserts on each side of the block, in either insertion case (block at
-    top-of-file or block after frontmatter).
+    No-op (returns the original string) when no real block is found or when
+    the begin marker is ambiguous (real begin, no real end). Cleans up the
+    blank-line separator that ``_splice_reminder_into_claude_md`` inserts on
+    each side of the block, in either insertion case.
+
+    A-4: uses the same fence-aware line-start locator as the splicer, so a
+    marker quoted inside a code fence never triggers a delete.
     """
-    start = existing.find(_REMINDER_BEGIN)
-    if start == -1:
+    span = _find_reminder_marker_span(existing)
+    if span is None or span == ("ambiguous",):
+        # No real block, or an orphan begin — preserve the file. The user
+        # can clean an orphan manually.
         return existing
-    end_rel = existing[start:].find(_REMINDER_END)
-    if end_rel == -1:
-        # Orphan begin marker: don't try to guess the end — preserve the
-        # file. The user can clean it manually.
-        return existing
-    end = start + end_rel + len(_REMINDER_END)
+    start, end = span  # type: ignore[misc]
 
     before = existing[:start]
     after = existing[end:]
@@ -184,9 +272,9 @@ def _strip_reminder_from_claude_md(existing: str) -> str:
     if after.startswith("\n"):
         after = after[1:]
 
-    # Trim the blank-line separator the splicer inserted before the
-    # block — only the SECOND-to-last newline (the blank line itself),
-    # leaving the newline that ends the preceding logical line intact.
+    # Trim the blank-line separator the splicer inserted before the block —
+    # only the SECOND-to-last newline (the blank line itself), leaving the
+    # newline that ends the preceding logical line intact.
     if before.endswith("\n\n"):
         before = before[:-1]
 
@@ -468,6 +556,103 @@ def _parse_entries(text: str) -> List[DeferralEntry]:
 
 
 # ---------------------------------------------------------------------------
+# A-3: JSON sidecar (source of truth) serialisation
+# ---------------------------------------------------------------------------
+
+def _entry_to_dict(entry: DeferralEntry) -> dict:
+    """Render one entry to a JSON-safe dict. Every field is preserved
+    losslessly (multi-line strings survive — no Markdown round-trip)."""
+    return {
+        "condition_id": entry.condition_id,
+        "title": entry.title,
+        "detected": entry.detected,
+        "why_deferred": entry.why_deferred,
+        "command_to_apply": entry.command_to_apply,
+        "severity": entry.severity,
+        "kg_node_refs": list(entry.kg_node_refs),
+        "detected_at": entry.detected_at,
+    }
+
+
+def _entry_from_dict(d: dict) -> Optional[DeferralEntry]:
+    """Build a :class:`DeferralEntry` from a sidecar dict.
+
+    Returns ``None`` when the dict is missing the load-bearing
+    ``condition_id`` or carries an invalid severity — a malformed sidecar
+    entry is skipped rather than crashing the whole read (conservative).
+    """
+    cid = d.get("condition_id")
+    if not cid or not isinstance(cid, str):
+        return None
+    sev = d.get("severity", "warning")
+    if sev not in SEVERITY_ORDER:
+        sev = "warning"
+    refs = d.get("kg_node_refs") or []
+    if not isinstance(refs, list):
+        refs = []
+    return DeferralEntry(
+        condition_id=cid,
+        title=str(d.get("title", cid.replace("_", " ").title())),
+        detected=str(d.get("detected", "")),
+        why_deferred=str(d.get("why_deferred", "")),
+        command_to_apply=str(d.get("command_to_apply", "")),
+        severity=sev,
+        kg_node_refs=[str(r) for r in refs],
+        detected_at=str(d.get("detected_at", _now_iso())),
+    )
+
+
+def _render_json_sidecar(entries: List[DeferralEntry]) -> str:
+    """Render the authoritative JSON sidecar for ``entries``."""
+    payload = {
+        "schema_version": _JSON_SCHEMA_VERSION,
+        "generated_at": _now_iso(),
+        "severity_max": _severity_max(entries),
+        "entries": [_entry_to_dict(e) for e in entries],
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+
+
+def _parse_json_sidecar(text: str) -> Optional[List[DeferralEntry]]:
+    """Parse the JSON sidecar. Returns ``None`` (not ``[]``) when the file
+    is unparseable or carries an incompatible ``schema_version`` — the
+    caller then falls back to the Markdown parser. An empty but valid
+    sidecar returns ``[]`` (zero entries, distinct from "unusable")."""
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    ver = payload.get("schema_version")
+    if ver != _JSON_SCHEMA_VERSION:
+        # Unknown/newer schema — don't guess; fall back to Markdown.
+        return None
+    raw_entries = payload.get("entries")
+    if not isinstance(raw_entries, list):
+        return None
+    out: List[DeferralEntry] = []
+    for item in raw_entries:
+        if not isinstance(item, dict):
+            continue
+        entry = _entry_from_dict(item)
+        if entry is not None:
+            out.append(entry)
+    return out
+
+
+def _markdown_condition_ids_present(text: str) -> set:
+    """Return the set of ``condition_id`` values whose ``## <cid> (<sev>)``
+    section header is present in the Markdown ``text``.
+
+    Used to reconcile the JSON source of truth against a Rust
+    ``restart.rs`` edit that stripped a section from the Markdown (the one
+    cross-language mutation that touches the ``.md`` without knowing about
+    the JSON sidecar)."""
+    return {m.group("cid") for m in _SECTION_RE.finditer(text)}
+
+
+# ---------------------------------------------------------------------------
 # DeferralReport
 # ---------------------------------------------------------------------------
 
@@ -569,15 +754,25 @@ class DeferralReport:
             False — no entries; existing file deleted (if any).
         """
         target = folder / _DEFERRED_REL
+        json_target = folder / _DEFERRED_JSON_REL
 
         if not self._entries:
             if target.exists():
                 target.unlink()
+            # A-3: remove the JSON source of truth too so the two views
+            # stay consistent (empty ⇒ both absent).
+            if json_target.exists():
+                json_target.unlink()
             # Strip the reminder block since the deferral is gone.
             _strip_claude_md_reminder(folder)
             return False
 
         target.parent.mkdir(parents=True, exist_ok=True)
+
+        # A-3: JSON sidecar is the SOURCE OF TRUTH — write it first so a
+        # crash between the two writes leaves the authoritative copy intact
+        # (the Markdown is a re-derivable render).
+        atomic_write_text(json_target, _render_json_sidecar(self._entries))
 
         content = (
             _render_frontmatter(self._entries)
@@ -586,7 +781,8 @@ class DeferralReport:
         )
 
         # Atomic write via the shared vco_lib.atomic helper (temp file
-        # in the same directory, fsync, then os.replace()).
+        # in the same directory, fsync, then os.replace()). Markdown is the
+        # human render + the surface Rust ``restart.rs`` edits.
         atomic_write_text(target, content)
 
         # Inject/refresh the wrapped reminder block in CLAUDE.md.
@@ -596,12 +792,58 @@ class DeferralReport:
 
     @classmethod
     def read(cls, folder: Path) -> "DeferralReport":
-        """Parse an existing deferral report file and return a populated instance.
+        """Parse an existing deferral report and return a populated instance.
 
-        If the file does not exist, returns an empty ``DeferralReport``.
+        A-3: the JSON sidecar (``UPDATE_DEFERRED.json``) is the SOURCE OF
+        TRUTH. Resolution order:
+
+        1. **JSON sidecar present + parseable** → authoritative content.
+           Reconcile against the Markdown: if a co-present Markdown file
+           lacks a section for a ``condition_id`` the JSON carries, that
+           entry was stripped by the Rust ``restart.rs`` flow (or a manual
+           edit) — drop it so the two views agree. If the Markdown is
+           absent, take the JSON verbatim.
+        2. **JSON absent / unparseable / incompatible schema** → fall back
+           to the legacy Markdown parser (back-compat for reports written
+           before A-3, and for the round-trip-lossy path).
+        3. **Neither present** → empty report.
         """
         target = folder / _DEFERRED_REL
+        json_target = folder / _DEFERRED_JSON_REL
         report = cls()
+
+        json_entries: Optional[List[DeferralEntry]] = None
+        if json_target.exists():
+            try:
+                json_entries = _parse_json_sidecar(
+                    json_target.read_text(encoding="utf-8")
+                )
+            except OSError:
+                json_entries = None
+
+        if json_entries is not None:
+            # JSON is authoritative. Reconcile against a co-present Markdown
+            # (the surface Rust edits) so a restart-cleared section is
+            # honoured even though Rust doesn't touch the JSON.
+            md_present_cids: Optional[set] = None
+            if target.exists():
+                try:
+                    md_text = target.read_text(encoding="utf-8")
+                    md_present_cids = _markdown_condition_ids_present(md_text)
+                except OSError:
+                    md_present_cids = None
+            for entry in json_entries:
+                if (
+                    md_present_cids is not None
+                    and entry.condition_id not in md_present_cids
+                ):
+                    # Section was stripped from the Markdown by an external
+                    # editor (restart.rs). Treat as resolved — drop it.
+                    continue
+                report._entries.append(entry)
+            return report
+
+        # Fallback: no usable JSON sidecar → parse the Markdown.
         if not target.exists():
             return report
         text = target.read_text(encoding="utf-8")

@@ -328,6 +328,10 @@ def test_parity_realistic_settings_round_trip(tmp_path: Path) -> None:
     settings_path = tmp_path / ".claude" / "settings.json"
     settings_path.parent.mkdir()
     # Realistic snapshot from a real install (modulo path values).
+    # A-8 (v0.2.73): KG_BASE_DIR is now a MANAGED canonical key (not a user
+    # key), so a stale on-disk value must be overwritten with the bundle's
+    # managed value. MY_CUSTOM_USER_VAR is the genuinely non-canonical key
+    # whose survival we assert.
     settings_path.write_text(json.dumps({
         "env": {
             "PROJECT_NAME": "VCODev",
@@ -335,7 +339,8 @@ def test_parity_realistic_settings_round_trip(tmp_path: Path) -> None:
             "KG_COLLECTION": "VCODev_KnowledgeGraph",
             "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
             "DEVELOPMENT_COLLECTION": "VCODev_Development",
-            "KG_BASE_DIR": "/home/user/code/project-a",
+            "KG_BASE_DIR": "/home/user/code/STALE-should-be-overwritten",
+            "MY_CUSTOM_USER_VAR": "keep-me",
         },
         "hooks": {
             "PreToolUse": [
@@ -351,6 +356,8 @@ def test_parity_realistic_settings_round_trip(tmp_path: Path) -> None:
     # Override defaults to match the existing keys so we can verify
     # canonical overwrite vs user-key preservation independently.
     bundle["canonical_env"]["KG_COLLECTION"] = "VCODev_KnowledgeGraph"
+    # A-8: the managed KG_BASE_DIR value the apply must project.
+    bundle["canonical_env"]["KG_BASE_DIR"] = "/home/user/code/project-a"
 
     apply_project_env(bundle, surfaces=["claude_settings_json"])
     first = settings_path.read_text()
@@ -361,7 +368,9 @@ def test_parity_realistic_settings_round_trip(tmp_path: Path) -> None:
     assert first == second, "second apply must be byte-identical to first"
 
     parsed = json.loads(first)
-    # User-added key survived.
+    # Genuinely user-added key survived.
+    assert parsed["env"]["MY_CUSTOM_USER_VAR"] == "keep-me"
+    # A-8: KG_BASE_DIR is now managed — overwritten with the bundle value.
     assert parsed["env"]["KG_BASE_DIR"] == "/home/user/code/project-a"
     # Sibling top-level blocks survived.
     assert "hooks" in parsed

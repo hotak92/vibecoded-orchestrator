@@ -1499,6 +1499,73 @@ def migrate_collections(
                 "error": str(e),
             })
 
+    # A-10 (v0.2.73): the env-configured sweep above only inspects the
+    # CURRENT KG/DEV/DIAGRAMS collection names. A migration that crashed
+    # leaving ``OldName_KnowledgeGraph__staging`` becomes INVISIBLE once the
+    # project is renamed (or KG_COLLECTION is re-derived) before the next
+    # run — the sweep now looks at ``NewName_*`` only, and the old staging
+    # class (potentially the ONLY surviving copy per the BLOCKER-1 comment)
+    # leaks forever. So additionally LIST every ``*__staging`` class on the
+    # server and SURFACE any not already handled above. We NEVER auto-drop:
+    # a staging class we can't tie to the current env may hold the last copy
+    # of user data; dropping it blindly is exactly the destructive
+    # operation VCO's consent pattern forbids. Surfacing it as an error
+    # routes it through the caller's deferral integration for human review.
+    try:
+        _already_handled_staging = {
+            os.environ.get(env_key, "") + _STAGING_SUFFIX
+            for env_key in _recover_targets
+            if os.environ.get(env_key, "")
+        }
+        # Only KG/DEV/DIAGRAMS-family staging is in scope: a renamed KG,
+        # Development or Diagrams collection is exactly the A-10 leak. Other
+        # ``__staging`` classes (e.g. code-graph ``*_CodeFunction__staging``)
+        # are owned by different subsystems and must NOT be surfaced here.
+        _KG_FAMILY_STAGING_SUFFIXES = (
+            "_KnowledgeGraph" + _STAGING_SUFFIX,
+            "_Development" + _STAGING_SUFFIX,
+            "_Diagrams" + _STAGING_SUFFIX,
+        )
+        _all_classes = _list_classes(weaviate_url)
+        _orphan_staging = sorted(
+            c for c in _all_classes
+            if c.endswith(_KG_FAMILY_STAGING_SUFFIXES)
+            and c not in _already_handled_staging
+        )
+        for _orphan in _orphan_staging:
+            _base = _orphan[: -len(_STAGING_SUFFIX)]
+            _base_exists = _base in _all_classes
+            _log(
+                "7b.recover", "warn",
+                f"orphan staging class not tied to current env: {_orphan} "
+                f"(base {_base!r} {'present' if _base_exists else 'MISSING'}); "
+                f"RETAINED for human review (never auto-dropped)",
+                data={
+                    "staging": _orphan,
+                    "base": _base,
+                    "base_present": _base_exists,
+                    "branch": "unmatched_orphan_surface",
+                },
+            )
+            result["errors"].append({
+                "collection": _base,
+                "action": "recover",
+                "error": (
+                    f"orphan staging class {_orphan} is not tied to this "
+                    f"project's current KG/DEV/DIAGRAMS env "
+                    f"(likely a pre-rename migration crash). Base collection "
+                    f"{_base!r} is "
+                    f"{'present' if _base_exists else 'MISSING (staging may be the only surviving copy)'}"
+                    f". RETAINED — inspect and, if safe, drop manually via the "
+                    f"launcher; VCO will not auto-drop it."
+                ),
+            })
+    except Exception as e:
+        # Soft-fail: the extra sweep must never break migrate-collections.
+        _log("7b.recover", "warn",
+             f"A-10 unmatched-orphan-staging sweep failed: {e}",
+             data={"error": str(e)})
+
     # Build the plan.
     try:
         plan = _build_plan(
@@ -7562,6 +7629,42 @@ def install_project_bundle(
             _log("4.bundle.safe_add_git_exclude", "error",
                  f"safe-add git-exclude failed: {err}", data={"error": err})
             result["warnings"].append(f"safe-add git-exclude failed: {err}")
+    elif safe_add and not dry_run and update_mode:
+        # A-12 (v0.2.73): safe_add is an ADD-TIME-only concept (the `.env`
+        # protection + sidecar deferral). A caller that passes
+        # safe_add=True together with update_mode=True previously got NEITHER
+        # the sidecar deferral NOR the git-exclude NOR any signal — a silent
+        # no-op. "Conservative defaults" requires the do-nothing to be
+        # logged so the caller isn't misled into thinking safe-add ran.
+        _log("4.bundle.safe_add", "warn",
+             "safe_add ignored in update_mode (safe-add is an add-time-only "
+             "concept; .env protection + sidecar deferral apply only on a "
+             "fresh add). The unconditional .git/info/exclude coverage still "
+             "runs below (G1).",
+             data={"safe_add": True, "update_mode": True})
+
+    # G1 (v0.2.73, secrets spec item #9): unconditional `.git/info/exclude`
+    # coverage on EVERY bundle update (not just the safe-add first-install
+    # branch above). Keeps VCO-created paths out of the user's commits even
+    # for projects added before safe-add existed, or added without it. Uses
+    # the same collision-safe append helper (LOCAL-only `.git/info/exclude`,
+    # never the tracked `.gitignore`; worktree/bare `.git`-file conservatively
+    # skipped inside the helper). Soft-fails. Skipped when the safe-add branch
+    # above already ran the append this call (first-install add).
+    if update_mode:
+        try:
+            git_result = _append_git_info_exclude(
+                folder, tuple(_safe_add_exclude_entries(result, folder)),
+            )
+            result["g1_git_exclude"] = git_result
+            _log("4.bundle.g1_git_exclude", "ok",
+                 f"g1_git_exclude: {git_result['action']}",
+                 data=git_result)
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            _log("4.bundle.g1_git_exclude", "warning",
+                 f"G1 git-exclude failed: {err}", data={"error": err})
+            result["warnings"].append(f"G1 git-exclude failed: {err}")
 
     # v0.2.73 S-8 (ONE-TIME): scan for pre-fix user-secret VALUES in tree files
     # and emit a deferral notice if found. Triggered on every bundle-update run
