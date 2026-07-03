@@ -23,10 +23,13 @@ from weaviate_mcp.code_ranking import (  # noqa: E402
     BOOST_SAME_FILE,
     BOOST_SHARED_TYPE,
     CODE_FLOOR_BY_SLOT,
+    PENALTY_TEST_ENTITY,
     RELATIONSHIP_BOOST_CAP,
+    is_test_path,
     rerank_score,
     resolve_post_rerank_floor,
     resolve_retrieval_floor,
+    resolve_test_penalty,
     run_code_retrieval_pipeline,
 )
 
@@ -139,9 +142,11 @@ def test_floor_table_shape():
 
 # ─── P2: rerank_score ────────────────────────────────────────────────────────
 def test_no_anchor_returns_zero_empty():
-    delta, signals = rerank_score({"full_name": "mod.foo"}, None)
+    # v0.2.73 M1: the no-anchor path now carries the (anchor-independent)
+    # test-penalty diagnostic. A non-test candidate → delta 0.0, no penalty.
+    delta, signals = rerank_score({"full_name": "mod.foo"}, None, test_penalty=0.05)
     assert delta == 0.0
-    assert signals == {}
+    assert signals == {"is_test_penalty": False}
 
 
 def test_call_linked_candidate_leaf_in_anchor_calls():
@@ -399,3 +404,244 @@ def test_pipeline_preserves_extra_candidate_keys():
     assert out[0]["_c"] == "CodeFunction"
     assert out[0]["_d"] == 0.1
     assert "_rerank" in out[0] and "_boost" in out[0]
+
+
+# ─── M1 (v0.2.73): is_test_path truth table ──────────────────────────────────
+# Representative rows per language convention. The FULL table (plus the parity
+# lock vs the analyzer's inline fallback) lives in
+# tests/test_codegraph_metadata_producers_v0273.py — these pin the single-home
+# implementation directly.
+_M1_TEST_PATHS = [
+    "tests/test_foo.py",
+    "src/tests/helper.py",           # dir part anywhere
+    "pkg/__tests__/x.js",
+    "spec/models/user_spec.rb",
+    "testdata/fixture.go",
+    "fixtures/sample.json.py",
+    "app/test_widget.py",
+    "app/widget_test.py",
+    "app/conftest.py",
+    "web/button.spec.ts",
+    "web/button.test.tsx",
+    "svc/handler_test.go",
+    "src/test/java/Anything.java",   # java src/test part-pair
+    "src/main/FooTests.java",
+    "Proj.Tests/FooTests.cs",        # csharp *.Tests dir
+    "src/parser_test.rs",
+    "cpp/test_math.cpp",
+    "lua/thing_spec.lua",
+    "sh/deploy.bats",
+    "ps/Module.Tests.ps1",
+    "win\\tests\\thing.py",          # backslashes normalized
+]
+
+_M1_NON_TEST_PATHS = [
+    "",
+    "src/main.py",
+    "my_tests_helper/x.py",          # substring, not a path PART
+    "attestation/sign.py",
+    "java/contest.java",             # case-sensitive CamelCase suffix
+    "app/test.py",                   # bare `test.py` matches no pattern
+    "src/testing/foo.py",            # `testing` is not in the dir set
+    "rs/src/lib.rs",                 # in-file #[cfg(test)] NOT path-catchable
+    "sh/deploy.sh",
+]
+
+
+def test_is_test_path_truth_table():
+    for p in _M1_TEST_PATHS:
+        assert is_test_path(p) is True, f"expected test: {p}"
+    for p in _M1_NON_TEST_PATHS:
+        assert is_test_path(p) is False, f"expected NON-test: {p}"
+
+
+# ─── M1: resolve_test_penalty ────────────────────────────────────────────────
+def test_penalty_default_is_measured_value():
+    assert resolve_test_penalty({}) == PENALTY_TEST_ENTITY == 0.05
+
+
+def test_penalty_env_override_zero_disables():
+    assert resolve_test_penalty({"VCO_CODE_GRAPH_TEST_PENALTY": "0"}) == 0.0
+
+
+def test_penalty_env_override_aggressive():
+    assert resolve_test_penalty({"VCO_CODE_GRAPH_TEST_PENALTY": "0.12"}) == 0.12
+
+
+def test_penalty_empty_string_env_coerces_to_default():
+    # v0.2.27 discipline: "" is NOT parsed as literal 0.0; fall through.
+    assert resolve_test_penalty({"VCO_CODE_GRAPH_TEST_PENALTY": ""}) == 0.05
+    assert resolve_test_penalty({"VCO_CODE_GRAPH_TEST_PENALTY": "   "}) == 0.05
+
+
+def test_penalty_unparseable_env_falls_through():
+    assert resolve_test_penalty({"VCO_CODE_GRAPH_TEST_PENALTY": "nope"}) == 0.05
+
+
+# ─── M1: rerank_score penalty semantics ──────────────────────────────────────
+def test_stored_is_test_true_penalized():
+    # Stored prop wins — even with a product-looking path.
+    cand = {"full_name": "m.f", "file_path": "src/main.py", "is_test": True}
+    delta, signals = rerank_score(cand, None, test_penalty=0.05)
+    assert delta == -0.05
+    assert signals["is_test_penalty"] is True
+
+
+def test_stored_is_test_false_preferred_over_path_derive():
+    # Stored False beats a test-looking path (producer stamped it; trust it).
+    cand = {"full_name": "m.f", "file_path": "tests/test_x.py", "is_test": False}
+    delta, signals = rerank_score(cand, None, test_penalty=0.05)
+    assert delta == 0.0
+    assert signals["is_test_penalty"] is False
+
+
+def test_null_is_test_derives_from_file_path():
+    # NULL stored prop (pre-backfill / pre-v6 row) → path heuristic fires.
+    cand = {"full_name": "m.f", "file_path": "tests/test_x.py"}
+    delta, signals = rerank_score(cand, None, test_penalty=0.05)
+    assert delta == -0.05
+    assert signals["is_test_penalty"] is True
+
+
+def test_null_is_test_derives_from_module_path_fallback():
+    # CodeModule rows carry `path`, not `file_path` (collapse-adapter mirror).
+    cand = {"full_name": "tests.test_mod", "path": "tests/test_mod.py"}
+    delta, signals = rerank_score(cand, None, test_penalty=0.05)
+    assert delta == -0.05
+    assert signals["is_test_penalty"] is True
+
+
+def test_no_path_no_stored_prop_never_penalized():
+    # Fail-safe: never penalize on uncertainty.
+    delta, signals = rerank_score({"full_name": "m.f"}, None, test_penalty=0.05)
+    assert delta == 0.0
+    assert signals["is_test_penalty"] is False
+
+
+def test_anchor_is_test_escape_zeroes_penalty():
+    # Hook fired while editing a test file → test-context retrieval unaffected.
+    anchor = {"full_name": "t.test_f", "file_path": "tests/test_f.py"}
+    cand = {"full_name": "t.test_g", "file_path": "tests/test_g.py"}
+    delta, signals = rerank_score(cand, anchor, test_penalty=0.05)
+    assert delta == 0.0
+    assert signals["is_test_penalty"] is False
+
+
+def test_anchor_none_still_penalizes():
+    # The penalty is anchor-independent (direct MCP call path).
+    cand = {"full_name": "t.test_g", "file_path": "tests/test_g.py"}
+    delta, _ = rerank_score(cand, None, test_penalty=0.05)
+    assert delta == -0.05
+
+
+def test_penalty_and_boost_compose_cap_unaffected():
+    # All three boost signals fire (0.10 → capped 0.08), THEN the penalty is
+    # subtracted: net = 0.08 − 0.05. The cap applies to the boost only.
+    anchor = {
+        "full_name": "mod.caller",
+        "file_path": "tests/shared.py",
+        "call_names": ["foo"],
+        "type_uses": ["Widget"],
+        "is_test": False,  # anchor is product → no escape
+    }
+    cand = {
+        "full_name": "mod.foo",
+        "file_path": "tests/shared.py",
+        "type_uses": ["Widget"],
+        "is_test": True,
+    }
+    delta, signals = rerank_score(cand, anchor, test_penalty=0.05)
+    assert delta == RELATIONSHIP_BOOST_CAP - 0.05
+    assert signals["capped"] is True
+    assert signals["is_test_penalty"] is True
+
+
+def test_rerank_score_default_penalty_reads_process_env(monkeypatch):
+    # test_penalty=None → resolve_test_penalty(os.environ): the GUI-projected
+    # override reaches the scorer without call-site changes.
+    monkeypatch.setenv("VCO_CODE_GRAPH_TEST_PENALTY", "0.2")
+    cand = {"full_name": "m.f", "file_path": "tests/test_x.py"}
+    delta, _ = rerank_score(cand, None)
+    assert delta == -0.2
+
+
+# ─── M1: pipeline-level semantics ────────────────────────────────────────────
+def test_pipeline_test_row_demoted_below_product_row():
+    # E1 shape: a 0.30 test hit vs a 0.28 product hit → penalty (0.05)
+    # reorders them (0.25 < 0.28).
+    cands = [
+        _cand(0.30, full_name="t.test_thing", file_path="tests/test_thing.py"),
+        _cand(0.28, full_name="m.thing", file_path="src/thing.py"),
+    ]
+    out = run_code_retrieval_pipeline(
+        cands, retrieval_floor=0.16, post_rerank_floor=0.22, limit=10, env={}
+    )
+    names = [c["_p"]["full_name"] for c in out]
+    assert names == ["m.thing", "t.test_thing"]
+    demoted = next(c for c in out if c["_p"]["full_name"] == "t.test_thing")
+    assert demoted["_boost"]["signals"]["is_test_penalty"] is True
+
+
+def test_pipeline_marginal_test_row_culled_by_post_floor():
+    # 0.24 test row: penalty lands BEFORE the stage-2 gate → 0.19 < 0.22 →
+    # culled outright (E1: 18 such rows across the 19 product pools).
+    cands = [_cand(0.24, full_name="t.test_x", file_path="tests/test_x.py")]
+    out = run_code_retrieval_pipeline(
+        cands, retrieval_floor=0.16, post_rerank_floor=0.22, limit=10, env={}
+    )
+    assert out == []
+
+
+def test_pipeline_test_intent_query_still_surfaces_its_test():
+    # A DOMINANT test hit (test-intent query headroom, E1 §3) survives the
+    # penalty and keeps rank 1 over weaker product rows.
+    cands = [
+        _cand(0.60, full_name="t.test_floors", file_path="tests/test_floors.py"),
+        _cand(0.50, full_name="m.floors", file_path="src/floors.py"),
+    ]
+    out = run_code_retrieval_pipeline(
+        cands, retrieval_floor=0.16, post_rerank_floor=0.22, limit=10, env={}
+    )
+    assert [c["_p"]["full_name"] for c in out] == ["t.test_floors", "m.floors"]
+
+
+def test_pipeline_env_override_zero_restores_baseline_ordering():
+    # Operator dials the penalty off → v0.2.72 pure-semantic ordering.
+    cands = [
+        _cand(0.30, full_name="t.test_thing", file_path="tests/test_thing.py"),
+        _cand(0.28, full_name="m.thing", file_path="src/thing.py"),
+    ]
+    out = run_code_retrieval_pipeline(
+        cands, retrieval_floor=0.16, post_rerank_floor=0.22, limit=10,
+        env={"VCO_CODE_GRAPH_TEST_PENALTY": "0"},
+    )
+    assert [c["_p"]["full_name"] for c in out] == ["t.test_thing", "m.thing"]
+
+
+def test_pipeline_env_override_restores_dominant_test(monkeypatch):
+    # The E1 caveat-1 escape: a dominant test file the user actually wants
+    # demoted needs 0.12+; conversely setting 0 restores ANY demoted test.
+    # Also proves env=None reads the process environment (GUI projection).
+    monkeypatch.setenv("VCO_CODE_GRAPH_TEST_PENALTY", "0")
+    cands = [
+        _cand(0.30, full_name="t.test_thing", file_path="tests/test_thing.py"),
+        _cand(0.28, full_name="m.thing", file_path="src/thing.py"),
+    ]
+    out = run_code_retrieval_pipeline(
+        cands, retrieval_floor=0.16, post_rerank_floor=0.22, limit=10
+    )
+    assert [c["_p"]["full_name"] for c in out] == ["t.test_thing", "m.thing"]
+
+
+def test_pipeline_anchor_is_test_leaves_test_rows_unpenalized():
+    # Editing a test file: sibling tests keep their semantic ordering.
+    anchor = {"full_name": "t.test_a", "file_path": "tests/test_a.py"}
+    cands = [
+        _cand(0.30, full_name="t.test_b", file_path="tests/test_b.py"),
+        _cand(0.28, full_name="m.b", file_path="src/b.py"),
+    ]
+    out = run_code_retrieval_pipeline(
+        cands, retrieval_floor=0.16, post_rerank_floor=0.22,
+        anchor_props=anchor, limit=10, env={},
+    )
+    assert [c["_p"]["full_name"] for c in out] == ["t.test_b", "m.b"]

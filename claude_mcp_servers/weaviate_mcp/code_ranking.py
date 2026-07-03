@@ -42,11 +42,17 @@ Measured floor values (RESULTS-2026-07-01.md, do NOT re-derive)
 * jina (768-dim code model): same compressed band as CodeSage → 0.16 / 0.22.
 * qwen3 (code reuse of the text embedder): WIDER, more separable band →
   conservative UNMEASURED 0.20 / 0.30 + override hook.
+* PENALTY_TEST_ENTITY 0.05 (ADDITIVE; E1-is-test-penalty-RESULTS.md,
+  2026-07-03): subtracted from a test-entity's reranked score in step 2,
+  BEFORE the post_rerank_floor gate. MEASURED — 0.05 is the no-collateral
+  point (halves product-query contamination@5, zero test-intent regressions;
+  additive dominates multiplicative because a multiplicative penalty is
+  largest on exactly the high-scoring wanted tests of test-intent queries).
 
-MUST MATCH (cross-surface contract): these floor VALUES + the boost weights are
-the contract between the CLI, the MCP server, and any hook that pre-filters
-code-graph results. Changing a value here without a paired experiment
-re-run + doc update re-opens the cross-scale-floor bug.
+MUST MATCH (cross-surface contract): these floor VALUES + the boost weights +
+the test penalty are the contract between the CLI, the MCP server, and any
+hook that pre-filters code-graph results. Changing a value here without a
+paired experiment re-run + doc update re-opens the cross-scale-floor bug.
 """
 
 from __future__ import annotations
@@ -61,6 +67,9 @@ __all__ = [
     "BOOST_CALL_LINKED",
     "BOOST_SAME_FILE",
     "BOOST_SHARED_TYPE",
+    "PENALTY_TEST_ENTITY",
+    "is_test_path",
+    "resolve_test_penalty",
     "resolve_retrieval_floor",
     "resolve_post_rerank_floor",
     "rerank_score",
@@ -106,6 +115,134 @@ BOOST_CALL_LINKED = 0.05    # candidate.leaf ∈ anchor.call_names OR vice-versa
 BOOST_SAME_FILE = 0.03      # candidate.file_path == anchor.file_path
 BOOST_SHARED_TYPE = 0.02    # anchor.type_uses ∩ candidate.type_uses non-empty
 RELATIONSHIP_BOOST_CAP = 0.08  # sum of signals capped here
+
+# ─── Test-entity penalty (M1; MEASURED, E1-is-test-penalty-RESULTS.md) ───────
+#
+# ADDITIVE penalty subtracted from a test-entity candidate's reranked score
+# (rerank = semantic + boost − penalty), applied in pipeline step 2 BEFORE
+# the post_rerank_floor gate — so a marginal test row (post_floor ≤ sem <
+# post_floor + penalty) is culled outright, while a STRONG test hit merely
+# ranks below equal product hits. Escape: when the ANCHOR itself is a test
+# file (hook fired while editing a test), the penalty is zero → test-context
+# retrieval is unaffected.
+#
+# E1 caveats (measured 2026-07-03, do NOT re-derive without a paired re-run):
+#   * DOMINANT tests still win: a test whose semantic score exceeds the top
+#     product hit by > 0.05 keeps rank 1 by design (the penalty is a nudge,
+#     not a filter). Users hitting this dial the env override
+#     VCO_CODE_GRAPH_TEST_PENALTY up to ~0.08-0.12 (aggressive demotion) or
+#     down to 0 (off). Empty-string / unparseable env values fall through to
+#     the default (v0.2.27 coercion discipline).
+#   * Rust `#[cfg(test)]` in-file test modules (and in-file mocks/fixtures in
+#     any language living beside product code) are INVISIBLE to this
+#     path-only heuristic — they classify as product rows. Honestly out of
+#     scope for a path heuristic.
+PENALTY_TEST_ENTITY = 0.05
+_ENV_TEST_PENALTY = "VCO_CODE_GRAPH_TEST_PENALTY"
+
+
+def is_test_path(path: str) -> bool:
+    """True when *path* names a test/spec/fixture source file.
+
+    SINGLE HOME for the test-file heuristic (M1). The inline fallback in
+    ``templates/scripts/analyze_code_graph.py`` MUST STAY BYTE-IDENTICAL to
+    this body — the parity test
+    ``tests/test_codegraph_metadata_producers_v0273.py::
+    test_is_test_path_parity_with_code_ranking`` locks the two together.
+    Pure function: path string in, bool out. Directory matching is per
+    PATH PART (not substring) — ``tests/x.py`` is a test;
+    ``my_tests_helper/x.py`` is not. Windows backslashes normalized.
+    Empty/unknown → False (never flag on uncertainty).
+    """
+    if not path:
+        return False
+    parts = [p for p in str(path).replace("\\", "/").split("/") if p]
+    if not parts:
+        return False
+    dirs_lower = [d.lower() for d in parts[:-1]]
+    for d in dirs_lower:
+        if d in ("tests", "test", "__tests__", "spec", "specs",
+                 "testdata", "fixtures"):
+            return True
+        if d.endswith(".tests"):  # csharp `Foo.Tests` project dirs
+            return True
+    for i in range(len(dirs_lower) - 1):  # java `src/test` part-pair
+        if dirs_lower[i] == "src" and dirs_lower[i + 1] == "test":
+            return True
+    name = parts[-1]
+    lower = name.lower()
+    if lower == "conftest.py" or lower.endswith("_test.py"):
+        return True
+    if lower.startswith("test_") and lower.endswith((".py", ".cpp")):
+        return True
+    for ext in (".js", ".ts", ".jsx", ".tsx", ".mjs"):
+        if lower.endswith(".spec" + ext) or lower.endswith(".test" + ext):
+            return True
+    if lower.endswith("_test.go") or lower.endswith("_test.rs"):
+        return True
+    # CamelCase suffixes stay case-sensitive (`contest.java` is NOT a test).
+    if name.endswith(("Test.java", "Tests.java", "IT.java")):
+        return True
+    if name.endswith(("Tests.cs", "Test.cs")):
+        return True
+    if lower.endswith(("_spec.rb", "_test.rb")):
+        return True
+    if lower.endswith(("_test.cpp", "_test.cc", "_test.cxx",
+                       "_tests.cpp", "_tests.cc")):
+        return True
+    if lower.endswith("_spec.lua"):
+        return True
+    if lower.endswith("_test.sh") or lower.endswith(".bats"):
+        return True
+    if lower.endswith(".tests.ps1"):  # Pester
+        return True
+    return False
+
+
+def resolve_test_penalty(env: Optional[Mapping[str, str]] = None) -> float:
+    """Resolve the test-entity penalty value.
+
+    Precedence:
+      1. ``VCO_CODE_GRAPH_TEST_PENALTY`` env override — ``0`` disables the
+         penalty entirely; a large value (~0.5) acts as a soft filter.
+         Empty-string / unparseable → fall through (v0.2.27 coercion).
+      2. :data:`PENALTY_TEST_ENTITY` (0.05, MEASURED — see module docstring).
+
+    ``env=None`` (the default) reads the PROCESS environment — same rationale
+    as :func:`resolve_retrieval_floor`: the override must reach the search
+    path on BOTH surfaces (MCP + CLI) without call sites passing
+    ``os.environ`` by hand. Pass ``{}`` to isolate in tests.
+    """
+    if env is None:
+        env = os.environ
+    override = _coerce_env_float(env, _ENV_TEST_PENALTY)
+    if override is not None:
+        return override
+    return PENALTY_TEST_ENTITY
+
+
+def _coerce_is_test(props: Optional[Mapping[str, object]]) -> bool:
+    """Is this entity a test row?
+
+    Prefers the STORED ``is_test`` property (stamped at analyze time since
+    v0.2.73 M1 — the producer half in analyze_code_graph.py). NULL / absent
+    (pre-backfill rows, peer-project rows whose collections predate v6) →
+    derive from the stored path via :func:`is_test_path` — ``file_path`` for
+    Function/Class, falling back to ``path`` for Module (mirrors the collapse
+    adapter's fallback in server.py). No props / no path → False (fail-safe:
+    never penalize on uncertainty).
+    """
+    if props is None:
+        return False
+    stored = props.get("is_test")
+    if isinstance(stored, bool):
+        return stored
+    if stored is not None:
+        # Tolerate a non-bool truthy/falsy stored value (defensive: Weaviate
+        # BOOL props arrive as bool, but a fixture may hold 0/1).
+        return bool(stored)
+    path = props.get("file_path") or props.get("path") or ""
+    return is_test_path(str(path))
 
 
 def _coerce_env_float(env: Optional[Mapping[str, str]], key: str) -> Optional[float]:
@@ -232,13 +369,25 @@ def _as_str_set(value: object) -> set[str]:
 def rerank_score(
     candidate_props: Mapping[str, object],
     anchor_props: Optional[Mapping[str, object]],
+    *,
+    test_penalty: Optional[float] = None,
 ) -> tuple[float, dict]:
-    """Compute the anchor-relative relationship boost for one candidate.
+    """Compute the NET anchor-relative rerank delta for one candidate.
 
-    Returns ``(boost_delta, signals)`` where ``boost_delta`` is the summed,
-    capped boost to ADD to the candidate's semantic score and ``signals`` is a
-    diagnostic dict of which signals fired (``call_linked`` / ``same_file`` /
-    ``shared_type``) plus the ``capped`` boolean.
+    Returns ``(delta, signals)`` where ``delta`` is the summed, capped
+    relationship boost MINUS the test-entity penalty (M1) — the value to ADD
+    to the candidate's semantic score — and ``signals`` is a diagnostic dict
+    of which signals fired (``call_linked`` / ``same_file`` / ``shared_type``)
+    plus the ``capped`` boolean and ``is_test_penalty`` (whether the M1
+    penalty fired for this candidate).
+
+    Test-entity penalty (M1; anchor-INDEPENDENT, computed before the
+    no-anchor early return): fires when the candidate is a test row
+    (:func:`_coerce_is_test` — stored ``is_test`` prop, NULL → path-derive)
+    AND the anchor is NOT a test row (the anchor only provides the ESCAPE:
+    editing a test file keeps test-context retrieval unpenalized). Value from
+    ``test_penalty`` when given (the pipeline resolves it once per call), else
+    :func:`resolve_test_penalty` against the process env.
 
     Signals (all anchor-relative; absent signals contribute +0):
       * call-linked (+0.05): candidate.leaf ∈ anchor.call_names OR
@@ -249,12 +398,20 @@ def rerank_score(
         non-empty).
       * shared-type (+0.02): anchor.type_uses ∩ candidate.type_uses non-empty.
 
-    The sum is capped at :data:`RELATIONSHIP_BOOST_CAP` (0.08). With no anchor
-    (a direct MCP call with no seed to reorder around) the boost is ``(0.0, {})``
-    → pure semantic ordering, unchanged from the pre-P2 behaviour.
+    The boost sum is capped at :data:`RELATIONSHIP_BOOST_CAP` (0.08) BEFORE
+    the penalty is subtracted (``capped`` describes the boost only). With no
+    anchor (a direct MCP call with no seed to reorder around) the boost is 0
+    but the penalty still applies → ``(-penalty_or_0, {"is_test_penalty":
+    bool})``.
     """
+    if test_penalty is None:
+        test_penalty = resolve_test_penalty(None)
+    candidate_is_test = _coerce_is_test(candidate_props)
+    anchor_is_test = _coerce_is_test(anchor_props) if anchor_props else False
+    penalty = test_penalty if (candidate_is_test and not anchor_is_test) else 0.0
+
     if anchor_props is None:
-        return 0.0, {}
+        return 0.0 - penalty, {"is_test_penalty": penalty != 0.0}
 
     signals: dict[str, bool] = {}
     delta = 0.0
@@ -294,7 +451,11 @@ def rerank_score(
         delta = RELATIONSHIP_BOOST_CAP
     signals["capped"] = capped
 
-    return delta, signals
+    # M1: subtract the test penalty AFTER the boost cap (net delta = capped
+    # boost − penalty). E1 §5 measured the boost-cancels-penalty interplay at
+    # 1.7% of test candidates — no need to size the penalty above the cap.
+    signals["is_test_penalty"] = penalty != 0.0
+    return delta - penalty, signals
 
 
 def _candidate_semantic(candidate: Mapping[str, object]) -> float:
@@ -333,6 +494,7 @@ def run_code_retrieval_pipeline(
     collapse_fn: Optional[Callable[[list[dict]], list[dict]]] = None,
     tier_fn: Optional[Callable[[list[dict]], list[dict]]] = None,
     key_fields: tuple[str, ...] = ("file_path", "full_name"),
+    env: Optional[Mapping[str, str]] = None,
 ) -> list[dict]:
     """THE shared two-stage-floor + relationship-rerank pipeline.
 
@@ -357,7 +519,9 @@ def run_code_retrieval_pipeline(
     1. Drop candidates whose SEMANTIC score < ``retrieval_floor`` (stage-1
        gate, before boost — noise never reaches the boost math).
     2. Compute ``rerank = semantic + rerank_score(props, anchor_props).delta``
-       for each survivor and stash ``_rerank`` / ``_boost``.
+       for each survivor and stash ``_rerank`` / ``_boost``. The delta is the
+       NET of the capped relationship boost MINUS the M1 test-entity penalty
+       (a test row is nudged down before the stage-2 gate).
     3. Drop candidates whose RERANKED score < ``post_rerank_floor`` (stage-2
        gate — a near-margin LINKED result can be rescued here by its boost; an
        unlinked near-margin result is culled).
@@ -401,17 +565,31 @@ def run_code_retrieval_pipeline(
         identity.
 
     ``anchor_props`` ``None`` → boost is 0 for every candidate → pure semantic
-    ordering (the direct-MCP-call path, no seed to reorder around).
+    ordering (the direct-MCP-call path, no seed to reorder around) MINUS the
+    M1 test penalty for test rows (the penalty is anchor-independent; only
+    the ESCAPE — anchor-is-test — needs an anchor).
+
+    ``env`` ``None`` (the default at BOTH call sites) → the M1 test penalty
+    resolves against the PROCESS environment (``VCO_CODE_GRAPH_TEST_PENALTY``
+    override → measured default 0.05), so the override reaches both surfaces
+    without call-site changes. Pass ``{}`` to isolate in tests.
     """
+    # M1: resolve the test penalty ONCE per pipeline call (not per candidate).
+    test_penalty = resolve_test_penalty(env)
+
     # Step 1: stage-1 retrieval-floor gate (semantic, pre-boost).
     survivors: list[dict] = [
         c for c in candidates if _candidate_semantic(c) >= retrieval_floor
     ]
 
-    # Step 2: rerank (semantic + boost delta), stash diagnostics.
+    # Step 2: rerank (semantic + boost delta − test penalty), stash
+    # diagnostics. The penalty lands HERE — before the step-3 gate — so
+    # marginal test rows are culled outright by the post_rerank_floor (E1 §6).
     for c in survivors:
         semantic = _candidate_semantic(c)
-        delta, signals = rerank_score(_candidate_props(c), anchor_props)
+        delta, signals = rerank_score(
+            _candidate_props(c), anchor_props, test_penalty=test_penalty
+        )
         c["_rerank"] = semantic + delta
         c["_boost"] = {"delta": delta, "signals": signals}
 
