@@ -30,9 +30,13 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 #   reads cumulative session tokens from the live transcript JSONL passed
 #   as `transcript_path` in the hook payload.
 #
-# Trigger ladder (per user 2026-04-30):
-#   - First nudge: cumulative session tokens since last KG-write >= 175_000
-#   - Subsequent nudges: every 10_000 additional tokens after first fire
+# Trigger ladder (defaults; both env-overridable):
+#   - First nudge: cumulative work units since last KG-write >= KG_NUDGE_FIRST
+#     (default 175_000).
+#   - Subsequent nudges: every KG_NUDGE_INTERVAL additional work units after
+#     the first fire (default 50_000). The cadence is a CONSTANT interval —
+#     the fire message says "escalating" only in the sense that a second
+#     nudge means you skipped the first; it is NOT a growing/geometric gap.
 #
 # Counter reset triggers (PostToolUse):
 #   - tool_name == "mcp__weaviate-kg__store_knowledge_node"
@@ -40,12 +44,16 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 #
 # Bypass: KG_NUDGE_OFF=1 disables the nudge entirely.
 # Threshold tweak:
-#   KG_NUDGE_FIRST=<int>     overrides 175_000 first-fire threshold
-#   KG_NUDGE_INTERVAL=<int>  overrides 10_000 subsequent interval
+#   KG_NUDGE_FIRST=<int>     overrides the 175_000 first-fire threshold
+#   KG_NUDGE_INTERVAL=<int>  overrides the 50_000 subsequent interval
+#   KG_NUDGE_GC_DAYS=<int>   overrides the 14-day stale-session GC window
 #
 # State: ~/.claude/metrics/kg_update_tokens.jsonl
 #   {session_id, baseline, last_nudge_at, last_seen_total, fired_once, updated_at}
-#   Atomic rename + fcntl lock to handle concurrent writes from sibling agents.
+#   HK-4/D-7 (v0.2.73): the whole read-modify-write is guarded by a flock on
+#   a STABLE sidecar lockfile (kg_update_tokens.jsonl.lock) — real mutual
+#   exclusion for concurrent sibling agents/chats — then atomically renamed.
+#   Stale rows (updated_at older than KG_NUDGE_GC_DAYS) are GC'd on write.
 #
 # Always exits 0 — never blocks the tool call or prompt.
 
@@ -91,6 +99,19 @@ FIRST_THRESHOLD = $FIRST_THRESHOLD
 INTERVAL = $INTERVAL
 METRICS_FILE = "$METRICS_FILE"
 METRIC_VERSION = "$METRIC_VERSION"
+# HK-4 / D-7 (v0.2.73): the whole read-modify-write of the shared
+# multi-session JSONL is guarded by a flock on a STABLE sidecar lockfile
+# (below) — previously fcntl.flock was taken on a fresh mkstemp fd that no
+# other process ever opened, so it provided ZERO mutual exclusion and
+# concurrent invocations (parallel chats, subagents, tool bursts) did
+# classic lost-update: a KG-write baseline reset could be clobbered by a
+# concurrently-scanned stale state, re-firing the nudge right after a node
+# was written, or wiping sibling sessions' rows wholesale.
+LOCKFILE = METRICS_FILE + ".lock"
+# Stale-session GC threshold: drop rows whose updated_at is older than this
+# many days so the file doesn't grow one row per session_id forever
+# (re-read + rewritten on every tool call).
+GC_MAX_AGE_DAYS = int(os.environ.get("KG_NUDGE_GC_DAYS", "14"))
 
 try:
     payload = json.loads(INPUT)
@@ -166,10 +187,13 @@ seen_request_ids = set()
 # emits ~3 JSONL entries per actual API request during streaming;
 # without requestId dedup, totals are ~3x inflated. v9 dedups by
 # requestId and uses cache_creation as the genuine "new context the
-# model had to digest" signal. New thresholds (500k first, 200k
-# interval) reflect the cache_creation scale: a typical multi-hour
-# substantive session lands ~500k-1M, casual chat sessions stay
-# under 100k.
+# model had to digest" signal. NOTE (D-15, v0.2.73): v9 originally set
+# 500k/200k thresholds against the cache_creation scale; v10.1 switched
+# the counter to work_units_total (production + intake), which is a
+# smaller scale, so the CURRENT defaults are KG_NUDGE_FIRST=175_000 /
+# KG_NUDGE_INTERVAL=50_000 (see the header + the shell vars above). This
+# comment is kept for history; the live values are the env defaults, not
+# the 500k/200k numbers named here.
 #
 # v7 (2026-04-30): the escape marker now requires a non-empty reason — the
 # bare "No KG update needed" string is no longer accepted. Pattern requires
@@ -223,7 +247,21 @@ if _have_scanner and transcript_path and os.path.exists(transcript_path):
     session_total = scan_result.work_units_total
     escape_marker_token_total = _escape_holder[0]
 
-# --- Read existing state ---
+# HK-4 / D-7: acquire the stable-sidecar lock for the ENTIRE
+# read-modify-write. The expensive transcript scan already ran ABOVE
+# (unlocked) so we hold the lock only for the fast state mutation. The
+# lock fd is a persistent lockfile every invocation opens by the same
+# path — real mutual exclusion, unlike the pre-v0.2.73 mkstemp-fd flock.
+_lock_fd = None
+try:
+    _lock_fd = os.open(LOCKFILE, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(_lock_fd, fcntl.LOCK_EX)
+except OSError:
+    # Can't take the lock (e.g. read-only HOME) — proceed best-effort
+    # unlocked rather than dropping the nudge entirely.
+    _lock_fd = None
+
+# --- Read existing state (inside the lock) ---
 state = {}
 if os.path.exists(METRICS_FILE):
     try:
@@ -353,18 +391,45 @@ current["updated_at"] = datetime.now(timezone.utc).isoformat()
 current["metric_version"] = METRIC_VERSION
 state[session_id] = current
 
-# --- Atomic write ---
+# --- HK-4 / D-7: stale-session GC ---
+# Drop rows whose updated_at is older than GC_MAX_AGE_DAYS so the file
+# doesn't accumulate one row per session forever. The current session's
+# row (just refreshed above) is always kept. Malformed/absent updated_at
+# is treated as "keep" (conservative — never GC a row we can't date).
+if GC_MAX_AGE_DAYS > 0:
+    from datetime import timedelta
+    _now = datetime.now(timezone.utc)
+    _cutoff = _now - timedelta(days=GC_MAX_AGE_DAYS)
+    _kept = {}
+    for sid, entry in state.items():
+        if sid == session_id:
+            _kept[sid] = entry
+            continue
+        _ua = entry.get("updated_at")
+        try:
+            _dt = datetime.fromisoformat(str(_ua))
+            if _dt.tzinfo is None:
+                _dt = _dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            _kept[sid] = entry  # undateable → keep
+            continue
+        if _dt >= _cutoff:
+            _kept[sid] = entry
+    state = _kept
+
+# --- Atomic write (inside the lock) ---
+# The fcntl.flock on the mkstemp fd was removed — it locked a private temp
+# file nobody else opened. The stable LOCKFILE (held for this whole
+# critical section) is the real mutual-exclusion primitive now.
 try:
     dir_ = os.path.dirname(METRICS_FILE)
     fd, tmppath = tempfile.mkstemp(prefix=".kg_update_tokens.", dir=dir_)
     try:
         with os.fdopen(fd, "w") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
             for entry in state.values():
                 f.write(json.dumps(entry) + "\\n")
             f.flush()
             os.fsync(f.fileno())
-            fcntl.flock(f, fcntl.LOCK_UN)
         os.rename(tmppath, METRICS_FILE)
     except OSError:
         try:
@@ -373,6 +438,14 @@ try:
             pass
 except (OSError, ValueError):
     pass
+finally:
+    # Release the stable lock (fd close drops the flock).
+    if _lock_fd is not None:
+        try:
+            fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+            os.close(_lock_fd)
+        except OSError:
+            pass
 
 sys.exit(0)
 PYTHON_EOF
