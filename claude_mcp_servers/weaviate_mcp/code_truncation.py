@@ -72,7 +72,10 @@ def _extract_docstring(body: str, language: str = "python") -> str:
                 if '"""' in stripped or "'''" in stripped:
                     break
 
-    elif language in ("javascript", "typescript", "java", "csharp", "go", "rust", "cpp"):
+    elif language in ("javascript", "typescript", "java", "csharp", "go", "rust", "cpp",
+                      # v0.2.73 (M3): svelte functions come from <script>
+                      # blocks — js/ts comment styles apply verbatim.
+                      "svelte"):
         # Look for /** ... */ or // comments
         in_block = False
         for line in lines[1:]:
@@ -92,6 +95,46 @@ def _extract_docstring(body: str, language: str = "python") -> str:
             else:
                 doc_lines.append(stripped)
                 if stripped.endswith("*/"):
+                    break
+
+    elif language in ("ruby", "shell", "lua"):
+        # v0.2.73 (M3): leading `#` comment block (lua also `--`). NOTE:
+        # this function feeds the EMBED text assembly too — for these NEW
+        # languages the embed text gains the docstring ahead of the body on
+        # the next re-analyze of a CHANGED file (same content, better
+        # ordering; no stored-vector invalidation, no revision bump).
+        for line in lines[1:]:
+            stripped = line.strip()
+            if stripped.startswith("#") or (language == "lua" and stripped.startswith("--")):
+                doc_lines.append(stripped)
+            elif stripped == "":
+                if doc_lines:
+                    break
+                continue
+            else:
+                break
+
+    elif language == "powershell":
+        # v0.2.73 (M3): `<# ... #>` comment block (comment-based help) or
+        # leading `#` lines.
+        in_block = False
+        for line in lines[1:]:
+            stripped = line.strip()
+            if not in_block:
+                if stripped.startswith("<#"):
+                    in_block = True
+                    doc_lines.append(stripped)
+                    if stripped.endswith("#>"):
+                        break
+                elif stripped.startswith("#"):
+                    doc_lines.append(stripped)
+                elif stripped == "":
+                    continue
+                else:
+                    break
+            else:
+                doc_lines.append(stripped)
+                if stripped.endswith("#>"):
                     break
 
     return "\n".join(doc_lines)

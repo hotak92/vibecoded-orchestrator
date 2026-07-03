@@ -957,6 +957,10 @@ def test_f9_path_part_not_substring():
 def test_f9_prune_spawned_by_background_resync(monkeypatch, tmp_path):
     mod = resync
     monkeypatch.setattr(mod, "code_embed_service_healthy", lambda *a, **k: True)
+    # v0.2.73 R-6: hermetic — the owed-probe would otherwise hit live
+    # Weaviate on developer machines (absent TProj collections → not_owed).
+    monkeypatch.setattr(mod, "count_stale_rows", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "_register_spawn_with_hub", lambda *a, **k: None)
     scripts = tmp_path / ".claude" / "scripts"
     scripts.mkdir(parents=True)
     (scripts / "analyze_code_graph.py").write_text("# stub\n")
@@ -970,7 +974,8 @@ def test_f9_prune_spawned_by_background_resync(monkeypatch, tmp_path):
                         lambda argv, **kw: spawned.append(argv) or _P())
     result = mod.spawn_background_resync(tmp_path, "TProj", python_exe="python3")
     assert result.status == "launched"
-    assert len(spawned) == 2, "prune child + analyzer child"
+    # v0.2.73: prune child + metadata-backfill child + resync driver child.
+    assert len(spawned) == 3, "prune + backfill + driver children"
     prune_argv = spawned[0]
     assert "--prune-ignored" in prune_argv and "TProj" in prune_argv
     assert "--index-dot-claude" in prune_argv, "default must NOT prune .claude"

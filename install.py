@@ -140,6 +140,82 @@ from vco_lib import bundled_versions as _bundled_versions  # noqa: E402
 from vco_lib import project_init as _project_init  # noqa: E402
 from vco_lib import secrets_audit as _secrets_audit  # noqa: E402
 from vco_lib.deferral_report import DeferralEntry, DeferralReport  # noqa: E402
+
+# ── A-2 (v0.2.73): install.py's deferral-ownership set ──────────────────────
+#
+# UPDATE_DEFERRED.md has multiple writer families. install.py's end-of-run
+# write() rebuilds the file from its in-memory report — so it may only apply
+# drop-when-absent (self-cleaning) semantics to the condition IDs it OWNS,
+# i.e. the ones IT re-detects on every run. Every other on-disk entry is
+# FOREIGN (written by project_init, the Rust emitters, or a background resync
+# child) and is seeded back into the run's report at start of main() so the
+# final write preserves it verbatim.
+#
+# MAINTENANCE CONTRACT: every `condition_id=` install.py itself emits MUST be
+# listed here (exact ID) or covered by a prefix below (dynamic suffixes).
+# An install.py-emitted ID missing from this set is preserved-forever instead
+# of self-cleaning — annoying but safe. A NON-install.py ID wrongly listed
+# here is silently clobbered on the next update — the exact A-2 data-loss bug.
+# When in doubt, leave the ID out.
+#
+# DELIBERATE EXCLUSION: `codegraph_embed_resync_pending` is emitted through
+# install.py's resync shim but is an "owed work" ledger entry, NOT a
+# re-detected-per-run condition — it is resolved EXPLICITLY (mark_resolved)
+# when the R-6 owed-probe positively confirms zero stale rows, and otherwise
+# preserved (R-7: the background walk's post-walk verifier maintains it).
+_INSTALL_OWNED_CONDITION_IDS = frozenset({
+    "env_secrets_retained_in_plaintext",
+    "env_secrets_hub_migration_failed",
+    "env_secrets_hub_migration_partial",
+    "weaviate_unreachable_at_update",
+    "rebuild_pending_seed",
+    "podman_daemon_start_failed",
+    "orchestrator_self_user_modified_preserved",
+    "compose_overlay_ambiguous",
+    "dual_ollama_detected",
+    "schema_drift_rebuild_required",
+    "legacy_shared_kg_class_present",
+    "orphan_orchestrator_development_collection",
+    "links_to_property_schema_drift",
+    "kg_binding_self_heal_db_error",
+    "kg_binding_self_healed",
+    "multi_candidate_prefix_adopt",
+    "launcher_install_path_seed_unavailable",
+    "orchestrator_root_kg_collection_locked",
+    "searxng_removed_from_default_install",
+    "ollama_mcp_deprecated",
+    "search_mcp_simplified",
+    "launcher_restart_required",
+    "launcher_binary_swap_failed_locked",
+    "update_resume_required",
+    "vct_hub_binary_unavailable",
+    "mcp_registration_no_venv",
+    "mcp_registration_python_fallback",
+    "mcp_registration_failed",
+    "stale_mcp_entry",
+    "stale_mcp_rewrite_quiet_skipped",
+    "stale_mcp_rewrite_declined",
+    "stale_mcp_rewrite_summary",
+    "deprecated_mcp_removal_quiet_skipped",
+    "deprecated_mcp_removal_declined",
+    "deprecated_mcp_removal_lock_failed",
+    "deprecated_mcp_removal_write_failed",
+    "deprecated_mcp_removal_summary",
+    "global_lean_ctx_hooks_detected",
+    "boot_service_path_repaired",
+    "claude_settings_unparseable",
+    "claude_settings_user_modified_preserved",
+})
+
+# Dynamically-suffixed families install.py emits (see condition_is_owned).
+_INSTALL_OWNED_CONDITION_PREFIXES = (
+    "schema_migration_failed_",
+    "kg_named_vector_slot_error_",
+    "lowercase_codegraph_residual_",
+    "schema_migration_required_",
+    "deprecated_mcp_",
+    "bundle_pin_drift_",
+)
 # v0.2.46 V47-B (Gap B): symlinks under install path are never touched.
 # v0.2.46 post-adversarial L1: check_vco_new_collision guards against
 # silently clobbering .vco-new siblings that the user may have hand-
@@ -5695,6 +5771,40 @@ def main() -> int:
     # local below.
     _deferral_report = DeferralReport()
 
+    # HIGH-2 fix (2026-05-01): deferral file lands in the user-project folder
+    # when --project-folder is passed. Default = PROJECT_ROOT preserves the
+    # orchestrator self-update behaviour. Resolved HERE (not just before the
+    # final write) because the A-2 seed below needs it.
+    _deferral_folder = (
+        Path(args.project_folder)
+        if getattr(args, "project_folder", None)
+        else PROJECT_ROOT
+    )
+
+    # A-2 (v0.2.73): seed the run's report FROM DISK so the end-of-run write
+    # cannot clobber entries other writer families persisted (project_init,
+    # Rust emitters, background resync children). Only FOREIGN entries are
+    # merged — condition IDs install.py OWNS (re-detects every run) keep
+    # their drop-when-absent self-cleaning semantics. Soft-fail: a seed
+    # failure degrades to the pre-A-2 behaviour, never blocks the install.
+    try:
+        _seeded = _deferral_report.merge_from_disk(
+            _deferral_folder,
+            exclude_ids=_INSTALL_OWNED_CONDITION_IDS,
+            exclude_prefixes=_INSTALL_OWNED_CONDITION_PREFIXES,
+        )
+        if _seeded:
+            _log_install_event(
+                "deferral_report", "ok",
+                f"preserved {_seeded} foreign deferral entr"
+                f"{'y' if _seeded == 1 else 'ies'} from disk (A-2 seed)",
+            )
+    except Exception as exc:  # noqa: BLE001 — seeding is best-effort
+        _log_install_event(
+            "deferral_report", "warn",
+            f"A-2 disk seed failed: {exc}",
+        )
+
     # PR-11: warn early when global lean-ctx hooks are present in
     # ~/.claude/settings.json or ~/.claude/hooks/. These caused two
     # fork-bomb incidents (2026-04-30, 2026-05-15) before VCO 0.2.11.
@@ -6270,6 +6380,10 @@ def main() -> int:
         # Only on --update: a fresh install analyzes at the current revision
         # already, so there are no stale rows to resync. Thin shim → the logic
         # lives in vco_lib.codegraph_resync (install.py is a mega-file).
+        # R-6 (v0.2.73): inside the helper, the trigger is additionally gated
+        # on the owed-probe (count of rows at a stale/NULL embed revision) —
+        # it fires only when work is actually owed, and a POSITIVE zero
+        # resolves the pending resync deferral instead of spawning.
         if _seed_succeeded and getattr(args, "update", False):
             _trigger_codegraph_embed_resync(_deferral_report)
 
@@ -6512,22 +6626,21 @@ def main() -> int:
     # decide whether the install completed start-to-end.
     _log_install_event("session", "ok", f"{mode} finished cleanly")
 
-    # HIGH-2 fix (2026-05-01): deferral file lands in the user-project folder
-    # when --project-folder is passed. Default = PROJECT_ROOT preserves the
-    # orchestrator self-update behaviour.
-    _deferral_folder = (
-        Path(args.project_folder)
-        if getattr(args, "project_folder", None)
-        else PROJECT_ROOT
-    )
+    # (_deferral_folder is resolved at the top of main(), next to the A-2
+    # disk seed — see the HIGH-2 comment there.)
 
     # Apply pending deferrals if requested (--update --apply-deferred).
     if args.update and getattr(args, "apply_deferred", False):
         _apply_deferred_entries(_deferral_report, _deferral_folder, args=args)
 
-    # Write (or delete) the deferral report. On install runs, this is a no-op
-    # (nothing accumulates); on update runs, any unresolved conditions land here.
-    _deferral_report.write(_deferral_folder)
+    # A-11 (v0.2.73): the mid-run `_deferral_report.write()` that used to sit
+    # here was REMOVED. With an empty in-memory report it unlinked the on-disk
+    # file (and stripped the CLAUDE.md reminder) minutes before the final
+    # write — a hard kill in that window lost every foreign entry with not
+    # even a stub. Nothing between here and the final write reads the file
+    # back (only `--apply-deferred` does, and it runs above), so the final
+    # write at the end of main() is the ONLY writer. Fix 6 (v0.2.13) already
+    # established the final write as the authoritative one.
 
     # Drop the install-manifest at state/install-manifest.json so the launcher
     # (and operators auditing an install) can verify install actually finished.
@@ -6754,12 +6867,15 @@ def main() -> int:
     if args.update:
         _clear_update_resume_sentinel_after_success(PROJECT_ROOT)
 
-    # Fix 6 (v0.2.13): re-write the deferral report AFTER all post-line-2611
-    # deferral-adding steps complete (_check_searxng_remnants,
-    # _check_ollama_mcp_remnants, _check_search_mcp_env_obsolete,
-    # _register_mcps, _materialize_boot_service, _rewrite_stale_mcp_entries).
-    # The earlier write at line ~2611 happens BEFORE those steps and would
-    # otherwise lose every entry they add.
+    # Fix 6 (v0.2.13) + A-11 (v0.2.73): this is the ONLY deferral write of the
+    # run. It happens AFTER all deferral-adding steps complete
+    # (_check_searxng_remnants, _check_ollama_mcp_remnants,
+    # _check_search_mcp_env_obsolete, _register_mcps,
+    # _materialize_boot_service, _rewrite_stale_mcp_entries). The historical
+    # mid-run write (pre-A-11) was removed — with an empty in-memory report it
+    # unlinked foreign entries mid-run. A-2: the report was seeded from disk
+    # at the top of main(), so foreign writer families' entries survive this
+    # rebuild-from-memory write.
     #
     # Additionally, on --update runs that ended with ZERO entries, write a
     # stub UPDATE_DEFERRED.md so the user has a paper trail confirming the
@@ -16297,8 +16413,11 @@ def _trigger_codegraph_embed_resync(deferral_report: "DeferralReport") -> None:
     module). This shim only:
       1. resolves the orchestrator's own code-graph project name,
       2. calls ``spawn_background_resync`` (background, non-blocking, no global
-         timeout; self-degrades when the code-embed service is down), and
-      3. records the returned ``DeferralEntry`` when the resync was deferred.
+         timeout; R-6: gated on the owed-probe — fires only when stale rows
+         exist; self-degrades when the code-embed service is down),
+      3. records the returned ``DeferralEntry`` when the resync was deferred,
+      4. resolves the pending ``codegraph_embed_resync_pending`` ledger entry
+         when the probe POSITIVELY confirms zero stale rows (``not_owed``).
 
     Soft-fail throughout: any error here converts to a log line, never a crash —
     the resync is a best-effort background refresh, not a gating step.
@@ -16345,6 +16464,23 @@ def _trigger_codegraph_embed_resync(deferral_report: "DeferralReport") -> None:
         _log_install_event(
             "codegraph_resync", "ok",
             f"background resync launched for {project_name} (pid {result.pid})",
+        )
+    elif result.status == "not_owed":
+        # R-6 (v0.2.73): the owed-probe POSITIVELY confirmed zero stale rows.
+        # Resolve any pending resync ledger entry — this is the ONLY way that
+        # (deliberately FOREIGN, A-2) entry clears: explicit positive
+        # confirmation, never drop-when-absent.
+        print("  → code-graph resync not owed (all rows at current embed revision)")
+        try:
+            deferral_report.mark_resolved("codegraph_embed_resync_pending")
+        except Exception as exc:  # noqa: BLE001
+            _log_install_event(
+                "codegraph_resync", "warn",
+                f"could not resolve resync deferral: {exc}",
+            )
+        _log_install_event(
+            "codegraph_resync", "ok",
+            f"no resync owed for {project_name}: {result.message}",
         )
     elif result.status == "deferred":
         print(f"  ! code-graph resync deferred: {result.message}")

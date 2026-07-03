@@ -287,6 +287,28 @@ def _severity_max(entries: List[DeferralEntry]) -> str:
     return "info"
 
 
+def condition_is_owned(
+    condition_id: str,
+    owned_ids,
+    owned_prefixes=(),
+) -> bool:
+    """Return True when *condition_id* belongs to the caller's OWNED set.
+
+    A-2 (v0.2.73): ``UPDATE_DEFERRED.md`` has multiple writer families
+    (install.py, ``vco_lib.project_init``, several Rust emitters, background
+    resync children). A writer that rebuilds the file from a fresh in-memory
+    report may only apply drop-when-absent semantics to the condition IDs it
+    OWNS (i.e. re-detects on every run); every other entry is FOREIGN and
+    must be preserved verbatim.
+
+    ``owned_ids`` is a collection of exact condition IDs; ``owned_prefixes``
+    covers dynamically-suffixed families (e.g. ``schema_migration_failed_*``).
+    """
+    if condition_id in owned_ids:
+        return True
+    return any(condition_id.startswith(p) for p in owned_prefixes if p)
+
+
 # ---------------------------------------------------------------------------
 # Markdown serialisation helpers
 # ---------------------------------------------------------------------------
@@ -480,6 +502,47 @@ class DeferralReport:
     def mark_resolved(self, condition_id: str) -> None:
         """Drop all entries matching *condition_id* (resolved; next write removes them)."""
         self._entries = [e for e in self._entries if e.condition_id != condition_id]
+
+    def merge_from_disk(
+        self,
+        folder: Path,
+        *,
+        exclude_ids=(),
+        exclude_prefixes=(),
+    ) -> int:
+        """Merge the on-disk report's FOREIGN entries into this report (A-2).
+
+        Seeds a fresh writer-side report from ``<folder>/.claude/context/
+        UPDATE_DEFERRED.md`` so a later :meth:`write` does not clobber entries
+        emitted by OTHER writer families (project_init, Rust emitters,
+        background resync children). Classification:
+
+        * ``condition_id`` matched by ``exclude_ids`` / ``exclude_prefixes``
+          (the caller's OWNED set — re-detected every run) → NOT merged; the
+          caller's drop-when-absent semantics stay intact for those.
+        * already present in this report (the current run re-detected it) →
+          NOT merged; the in-memory entry is fresher.
+        * everything else (FOREIGN) → appended verbatim.
+
+        Returns the number of entries merged. Never raises — a read/parse
+        failure logs nothing here (the caller owns logging) and returns 0,
+        which is indistinguishable from "no foreign entries"; callers that
+        need to detect the failure should read the file themselves first.
+        """
+        try:
+            on_disk = DeferralReport.read(folder)
+        except Exception:  # noqa: BLE001 — unparseable file → nothing to merge
+            return 0
+        merged = 0
+        for entry in on_disk.entries:
+            cid = entry.condition_id
+            if condition_is_owned(cid, exclude_ids, exclude_prefixes):
+                continue
+            if self.has_condition(cid):
+                continue
+            self._entries.append(entry)
+            merged += 1
+        return merged
 
     @property
     def entries(self) -> List[DeferralEntry]:

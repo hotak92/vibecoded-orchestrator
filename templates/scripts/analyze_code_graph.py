@@ -208,6 +208,10 @@ _CONTENT_HASH_EXCLUDE = frozenset({
     # stamping/bumping the revision never triggers a spurious content-hash
     # rewrite on the unknown-collection fallback path.
     "embed_revision",
+    # v0.2.73 (M1/M4): generation metadata, same rationale — `is_test` is a
+    # pure function of the excluded `file_path`; `n_callers` is recomputed by
+    # every cross-reference pass. Neither belongs in _CONTENT_HASH_FIELDS.
+    "is_test", "n_callers",
 })
 
 
@@ -257,6 +261,14 @@ CODEGRAPH_EMBED_REVISION: int = 1
 # stamping it never perturbs the content hash itself (the revision is an
 # embedding-generation marker, NOT semantic content).
 _EMBED_REVISION_PROP = "embed_revision"
+
+# v0.2.73 (R-2 / C-1): revision value stamped on a VECTORLESS write (the
+# embed backend failed for this object). 0 is never a valid
+# CODEGRAPH_EMBED_REVISION (history starts at 1), so the row stays visibly
+# stale: the fingerprint gate re-writes it on the next visit and the R-1
+# stale-file probe re-walks its file. Distinguishes "known vectorless" (0)
+# from "pre-migration row" (NULL) in diagnostics while both stay stale.
+_EMBED_REVISION_VECTORLESS = 0
 
 
 def _stable_scalar(value: Any) -> str:
@@ -907,6 +919,7 @@ try:
         truncate_module_for_embedding,
         chunk_or_truncate_for_embedding,
         chunk_or_truncate_class_for_embedding,
+        _extract_docstring,
     )
     _CHUNKING_AVAILABLE = True
 except ImportError:
@@ -935,6 +948,76 @@ except ImportError:
 
     def chunk_or_truncate_class_for_embedding(signature, class_body, methods=None, language="python", model=None, *, full_name=""):
         return [truncate_class_for_embedding(signature, class_body, methods=methods, language=language, model=model)]
+
+    def _extract_docstring(body, language="python"):
+        # M3 fallback: extraction unavailable on a broken partial install →
+        # doc stays "" (soft no-op; renderer falls back to the body snippet).
+        return ""
+
+
+# ── v0.2.73 (M1-prod): test-entity heuristic ─────────────────────────────────
+#
+# SINGLE HOME: claude_mcp_servers/weaviate_mcp/code_ranking.py::is_test_path
+# (the retrieval consumer). The inline fallback below MUST STAY BYTE-IDENTICAL
+# to it — tests/test_codegraph_metadata_producers_v0273.py carries the parity
+# test that locks the two together (mirrors the canonical-class-prefix parity
+# pattern). Guarded import: same-package sibling of code_truncation above, so
+# the fallback is effectively dead on a correctly-installed orchestrator.
+try:
+    from weaviate_mcp.code_ranking import is_test_path
+except Exception:  # noqa: BLE001 — partial install → inline fallback
+    def is_test_path(path: str) -> bool:
+        """True when *path* names a test/spec/fixture source file.
+
+        MUST MATCH claude_mcp_servers/weaviate_mcp/code_ranking.py::is_test_path.
+        Pure function: path string in, bool out. Directory matching is per
+        PATH PART (not substring) — ``tests/x.py`` is a test;
+        ``my_tests_helper/x.py`` is not. Windows backslashes normalized.
+        Empty/unknown → False (never flag on uncertainty).
+        """
+        if not path:
+            return False
+        parts = [p for p in str(path).replace("\\", "/").split("/") if p]
+        if not parts:
+            return False
+        dirs_lower = [d.lower() for d in parts[:-1]]
+        for d in dirs_lower:
+            if d in ("tests", "test", "__tests__", "spec", "specs",
+                     "testdata", "fixtures"):
+                return True
+            if d.endswith(".tests"):  # csharp `Foo.Tests` project dirs
+                return True
+        for i in range(len(dirs_lower) - 1):  # java `src/test` part-pair
+            if dirs_lower[i] == "src" and dirs_lower[i + 1] == "test":
+                return True
+        name = parts[-1]
+        lower = name.lower()
+        if lower == "conftest.py" or lower.endswith("_test.py"):
+            return True
+        if lower.startswith("test_") and lower.endswith((".py", ".cpp")):
+            return True
+        for ext in (".js", ".ts", ".jsx", ".tsx", ".mjs"):
+            if lower.endswith(".spec" + ext) or lower.endswith(".test" + ext):
+                return True
+        if lower.endswith("_test.go") or lower.endswith("_test.rs"):
+            return True
+        # CamelCase suffixes stay case-sensitive (`contest.java` is NOT a test).
+        if name.endswith(("Test.java", "Tests.java", "IT.java")):
+            return True
+        if name.endswith(("Tests.cs", "Test.cs")):
+            return True
+        if lower.endswith(("_spec.rb", "_test.rb")):
+            return True
+        if lower.endswith(("_test.cpp", "_test.cc", "_test.cxx",
+                           "_tests.cpp", "_tests.cc")):
+            return True
+        if lower.endswith("_spec.lua"):
+            return True
+        if lower.endswith("_test.sh") or lower.endswith(".bats"):
+            return True
+        if lower.endswith(".tests.ps1"):  # Pester
+            return True
+        return False
 
 
 # v0.2.18: central embedding dispatcher. Replaces the inline
@@ -3314,6 +3397,10 @@ class CodeGraphAnalyzer:
                         # a re-embed even when content is byte-identical (revision-gated
                         # forced resync). Excluded from the content hash.
                         Property(name="embed_revision", data_type=DataType.INT, description="Embedding-generation revision (P7 revision-gated forced resync)", skip_vectorization=True),
+                        # v0.2.73 (M1): test/spec/fixture flag from the pure
+                        # path heuristic (is_test_path). NULL on pre-v6 rows
+                        # (query-time derive fallback covers them).
+                        Property(name="is_test", data_type=DataType.BOOL, description="True when the source file is a test/spec/fixture (path heuristic; retrieval downweight)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="imports", target_collection=self.coll_module, description="Imported modules"),
@@ -3383,6 +3470,8 @@ class CodeGraphAnalyzer:
                         # chunk_num=0 (cross-refs + limit=1 lookups resolve to it).
                         Property(name="chunk_num", data_type=DataType.INT, description="0-indexed chunk number within this entity (0 for single-chunk)", skip_vectorization=True),
                         Property(name="total_chunks", data_type=DataType.INT, description="Total chunks this entity was split into (1 for single-chunk)", skip_vectorization=True),
+                        # v0.2.73 (M1): see CodeModule.
+                        Property(name="is_test", data_type=DataType.BOOL, description="True when the source file is a test/spec/fixture (path heuristic; retrieval downweight)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="module", target_collection=self.coll_module, description="Parent module"),
@@ -3444,6 +3533,14 @@ class CodeGraphAnalyzer:
                         # v0.2.72 (P3): model-aware chunking (see CodeClass).
                         Property(name="chunk_num", data_type=DataType.INT, description="0-indexed chunk number within this entity (0 for single-chunk)", skip_vectorization=True),
                         Property(name="total_chunks", data_type=DataType.INT, description="Total chunks this entity was split into (1 for single-chunk)", skip_vectorization=True),
+                        # v0.2.73 (M1): see CodeModule.
+                        Property(name="is_test", data_type=DataType.BOOL, description="True when the source file is a test/spec/fixture (path heuristic; retrieval downweight)", skip_vectorization=True),
+                        # v0.2.73 (M4): inbound-call count accumulated by
+                        # create_cross_references. Python-resolved,
+                        # project-internal edges only; NULL = unknown/leaf
+                        # (renderer omits the line — no fake zeros). Lands on
+                        # the CANONICAL (chunk-0) row only.
+                        Property(name="n_callers", data_type=DataType.INT, description="Inbound call count (Python-resolved, project-internal; render-time context)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="module", target_collection=self.coll_module, description="Parent module"),
@@ -3613,6 +3710,15 @@ class CodeGraphAnalyzer:
         # (no re-index, no data loss). Idempotent + soft-fail per collection.
         self._ensure_embed_revision_property()
 
+        # v0.2.73 (M1/M4) schema migration: `is_test` (BOOL) on the three
+        # file-anchored collections + `n_callers` (INT) on CodeFunction.
+        # Both are generation metadata (excluded from the content hash);
+        # NULL on pre-migration rows degrades gracefully (query-time derive
+        # for is_test; omitted callers line for n_callers). Belt-and-
+        # suspenders with migrations/codegraph_collection/5_to_6.py.
+        self._ensure_is_test_property()
+        self._ensure_n_callers_property()
+
     def _dedup_insert(self, collection, insert_params: dict, identity_key: str,
                       file_path_rel: str = "") -> str:
         """Upsert with a deterministic UUID derived from
@@ -3712,6 +3818,55 @@ class CodeGraphAnalyzer:
                 props = insert_params.get("properties")
                 if isinstance(props, dict) and not props.get("file_path"):
                     props["file_path"] = file_path_rel
+
+        # ── v0.2.73 (M1-prod): stamp `is_test` at the choke point ───────────
+        # Pure path heuristic (see is_test_path — single home in
+        # code_ranking, byte-identical fallback above). File-anchored
+        # collections only (Function/Class/Module); CodeAPI/CodeInteraction
+        # aren't file-anchored → skipped. `"is_test" not in props` (not a
+        # falsy check): False is a valid preset. Stamped BEFORE the chunk
+        # fan-out so `chunk_props = dict(props)` copies it to every chunk.
+        if file_path_rel:
+            coll_name = getattr(collection, "name", "") or ""
+            if (
+                coll_name.endswith("CodeFunction")
+                or coll_name.endswith("CodeClass")
+                or coll_name.endswith("CodeModule")
+            ):
+                props = insert_params.get("properties")
+                if isinstance(props, dict) and "is_test" not in props:
+                    try:
+                        props["is_test"] = bool(is_test_path(file_path_rel))
+                    except Exception:  # noqa: BLE001 — heuristic never wedges a write
+                        pass
+
+        # ── v0.2.73 (M3-prod): populate `doc` for non-Python entities ───────
+        # All 20 non-Python store sites write `doc: ""` although the
+        # extractor already exists (code_truncation._extract_docstring — it
+        # feeds the EMBED text; its output was thrown away for the prop).
+        # One stamp here instead of 20 walker edits. Python rows arrive with
+        # doc set (ast.get_docstring) → untouched (falsy guard). `doc` is NOT
+        # in _CONTENT_HASH_FIELDS → populating it never perturbs the
+        # tombstone-skip hash (and must NOT be added there — that would
+        # rewrite every stored digest). Render/keyword-only: NO embed-revision
+        # bump (doc never feeds the vector; vectors are client-supplied).
+        coll_name = getattr(collection, "name", "") or ""
+        if coll_name.endswith("CodeFunction") or coll_name.endswith("CodeClass"):
+            props = insert_params.get("properties")
+            if isinstance(props, dict) and not props.get("doc"):
+                body = props.get("function_body") or props.get("class_body") or ""
+                if body:
+                    lang = _canonical_lang_id(
+                        props.get("language")
+                        or getattr(self, "_current_language", "")
+                    ) or "python"
+                    try:
+                        doc = _extract_docstring(body, lang)
+                        if doc:
+                            # Cap: docstring, not a pathological comment wall.
+                            props["doc"] = doc[:2000]
+                    except Exception:  # noqa: BLE001 — extraction never wedges a write
+                        pass
 
         # ── v0.2.72 (P3): model-aware chunking for over-budget entities ─────
         #
@@ -3983,8 +4138,25 @@ class CodeGraphAnalyzer:
             # whether a byte-identical object was embedded under the CURRENT
             # embedding-generation scheme (chunking) or a stale one. Don't
             # clobber a caller-preset value (mirrors the content_hash stamp).
+            #
+            # v0.2.73 (R-2 / C-1): the stamp is CONDITIONAL on a vector being
+            # present. `generate_embedding` returns None on ANY backend
+            # failure and every call site writes anyway (guarding only the
+            # `vector` key) — pre-fix, such a VECTORLESS row was stamped with
+            # the CURRENT revision + content hash, so both gates passed on
+            # every future visit and the row stayed invisible to near_vector
+            # search FOREVER while counting as "converged". Stamping
+            # `_EMBED_REVISION_VECTORLESS` (0) instead keeps the row VISIBLY
+            # stale: the per-object fingerprint gate re-writes it on the next
+            # visit, and the R-1 stale-file probe pulls its file back through
+            # the per-file gate even when the file is unchanged on disk.
+            # Conservative default: never claim an embedding generation the
+            # write cannot positively confirm.
             if props.get(_EMBED_REVISION_PROP) is None:
-                props[_EMBED_REVISION_PROP] = CODEGRAPH_EMBED_REVISION
+                if insert_params.get("vector"):
+                    props[_EMBED_REVISION_PROP] = CODEGRAPH_EMBED_REVISION
+                else:
+                    props[_EMBED_REVISION_PROP] = _EMBED_REVISION_VECTORLESS
             if content_hash:
                 # Persist for the NEXT run's comparison (and don't clobber a
                 # caller-preset value, mirroring the other stamp sites).
@@ -4395,6 +4567,82 @@ class CodeGraphAnalyzer:
                     f"v0.2.72 P7 {_EMBED_REVISION_PROP} migration on {label} skipped: {e}"
                 )
 
+    def _ensure_is_test_property(self):
+        """v0.2.73 (M1) schema migration: add `is_test` (BOOL) to the three
+        file-anchored collections (CodeFunction/CodeClass/CodeModule).
+
+        Stamped by `_dedup_insert` from the pure path heuristic
+        (`is_test_path`); consumed by the retrieval rerank penalty. NULL on
+        pre-migration rows → the consumer derives from the stored
+        file_path/path at query time (fail-safe: no path → not penalized);
+        the backfill pass (`codegraph_resync.backfill_codegraph_metadata`)
+        populates existing rows without touching vectors. Belt-and-suspenders
+        with `migrations/codegraph_collection/5_to_6.py` (same-author rule).
+        Additive, idempotent, soft-fail per collection — mirrors
+        `_ensure_content_hash_property`.
+        """
+        collections = [
+            ("CodeModule",   self.modules_collection),
+            ("CodeClass",    self.classes_collection),
+            ("CodeFunction", self.functions_collection),
+        ]
+        desc = (
+            "True when the source file is a test/spec/fixture "
+            "(path heuristic; retrieval downweight)"
+        )
+        for label, coll in collections:
+            if coll is None:
+                continue
+            try:
+                config = coll.config.get()
+                existing_props = {p.name for p in config.properties}
+                if "is_test" in existing_props:
+                    continue
+                coll.config.add_property(
+                    Property(
+                        name="is_test",
+                        data_type=DataType.BOOL,
+                        description=desc,
+                        skip_vectorization=True,
+                    )
+                )
+                print(f"   Added is_test property to {label} schema (v0.2.73 M1)")
+            except Exception as e:
+                logger.debug(f"v0.2.73 is_test migration on {label} skipped: {e}")
+
+    def _ensure_n_callers_property(self):
+        """v0.2.73 (M4) schema migration: add `n_callers` (INT) to
+        CodeFunction only.
+
+        Accumulated by `create_cross_references` from resolved inbound call
+        edges (Python-resolved, project-internal — honest-coverage note in
+        the property description). Render-time context only, NOT a rerank
+        signal this release. NULL = unknown/leaf (the renderer omits the
+        line; no fake zeros). Additive, idempotent, soft-fail.
+        """
+        coll = self.functions_collection
+        if coll is None:
+            return
+        try:
+            config = coll.config.get()
+            existing_props = {p.name for p in config.properties}
+            if "n_callers" in existing_props:
+                return
+            coll.config.add_property(
+                Property(
+                    name="n_callers",
+                    data_type=DataType.INT,
+                    description=(
+                        "Inbound call count (Python-resolved, "
+                        "project-internal; render-time context)"
+                    ),
+                    skip_vectorization=True,
+                )
+            )
+            print("   Added n_callers property to CodeFunction schema (v0.2.73 M4)")
+        except Exception as e:
+            logger.debug(f"v0.2.73 n_callers migration skipped: {e}")
+
     def analyze_repository(self, repo_path: Path, language: Optional[str] = None,
                           incremental: bool = False,
                           extract_cfg: bool = False,
@@ -4684,6 +4932,10 @@ class CodeGraphAnalyzer:
                     print(f"⚠️  Insert error in {rel_for_msg}: {e}")
                     stats['files_skipped'] += 1
                     stats['insert_errors'] += 1
+                    # R-3 (C-2): the module row may already carry the new
+                    # hash + current revision — un-stamp it so this file
+                    # re-walks next run instead of being skipped forever.
+                    self._invalidate_module_row(f, source_root)
                 except Exception as e:
                     # Non-insert failure (parse error not caught
                     # downstream, regex bug, file IO, etc.). Skip the
@@ -4710,6 +4962,10 @@ class CodeGraphAnalyzer:
                             break
                     if seen_dedup:
                         stats['insert_errors'] += 1
+                    # R-3 (C-2): same compensation as the insert-error
+                    # branch — ANY caught per-file failure after the module
+                    # write leaves a lying module row behind.
+                    self._invalidate_module_row(f, source_root)
 
         # Clear the per-language context now that the dispatch loop is
         # done (Plan C). The prune pass below doesn't depend on it.
@@ -6854,6 +7110,173 @@ class CodeGraphAnalyzer:
                 pass
         return count
 
+    def _count_stale_rows_in_collection(self, coll) -> Optional[int]:
+        """Cheap count of rows NOT at the current embed revision (R-1 pre-check).
+
+        Filtered aggregate: ``embed_revision != CURRENT OR embed_revision IS
+        NULL``. The IsNull leg is load-bearing — Weaviate comparisons ignore
+        NULLs, and pre-migration rows are exactly the NULL ones (a
+        ``min()``/``not_equal``-only probe would report "converged" over a
+        half-migrated collection). Returns ``None`` when the count cannot be
+        determined (Weaviate down, mocked collection, or an old collection
+        created without ``index_null_state=True`` where the IsNull leg
+        errors) — the caller then falls back to a full NULL-safe scan.
+        """
+        try:
+            flt = (
+                Filter.by_property(_EMBED_REVISION_PROP).not_equal(
+                    CODEGRAPH_EMBED_REVISION
+                )
+                | Filter.by_property(_EMBED_REVISION_PROP).is_none(True)
+            )
+            agg = coll.aggregate.over_all(filters=flt, total_count=True)
+            total = getattr(agg, "total_count", None)
+            return int(total) if total is not None else None
+        except Exception:  # noqa: BLE001 — undeterminable, never a wrong 0
+            return None
+
+    def _build_stale_file_set(self) -> Optional[frozenset]:
+        """R-1 (v0.2.73): the set of file paths owning ANY stale-revision row.
+
+        Probes the three FILE-ANCHORED collections (CodeModule.path,
+        CodeClass.file_path, CodeFunction.file_path) for rows whose
+        ``embed_revision`` is NULL or != ``CODEGRAPH_EMBED_REVISION`` and
+        collects their file paths. `_get_existing_module` re-walks any file
+        in this set even when its content hash is unchanged — closing the
+        convergence gap where the v0.2.72 M0 fix made only the MODULE row
+        revision-aware while stale FUNCTION/CLASS rows in unchanged files
+        stayed unreachable behind the per-file gate (live-reproduced: a full
+        re-walk left thousands of entity rows frozen at the old revision).
+
+        CodeAPI/CodeInteraction carry no file_path property and are not
+        probed; their rows re-stamp whenever their source file re-walks.
+        Probe scope MUST MATCH vco_lib/codegraph_resync.py::
+        _RESYNC_PROBE_BASES (the owed-gate + post-walk verifier count the
+        same three collections — counting rows a re-walk cannot reach would
+        make the owed state permanently un-clearable).
+
+        Cost model: a cheap filtered-aggregate pre-check per collection
+        short-circuits the converged steady state (3 aggregates, no scan —
+        this is what the per-edit single-file hook pays). Only collections
+        with stale rows (or an undeterminable count) pay one full scan
+        returning two tiny properties per row, classified client-side
+        (NULL-safe; Weaviate's cursor iterator cannot combine with filters).
+        Orphan rows of DELETED files keep their path in the set harmlessly
+        (no walker consults the gate for a nonexistent file); the resync's
+        ``--prune-stale`` pass removes them so the pre-check can reach 0.
+
+        Returns ``None`` when NO collection could be probed (gate then falls
+        back to pre-R-1 behaviour — fail-open toward the M0 module-row
+        check, never a crash).
+        """
+        probes = (
+            (getattr(self, "modules_collection", None), "path"),
+            (getattr(self, "classes_collection", None), "file_path"),
+            (getattr(self, "functions_collection", None), "file_path"),
+        )
+        stale: Set[str] = set()
+        determinable = False
+        for coll, path_prop in probes:
+            if coll is None:
+                continue
+            count = self._count_stale_rows_in_collection(coll)
+            if count == 0:
+                determinable = True
+                continue
+            try:
+                for obj in coll.iterator(
+                    return_properties=[path_prop, _EMBED_REVISION_PROP]
+                ):
+                    p = getattr(obj, "properties", None) or {}
+                    rev = p.get(_EMBED_REVISION_PROP)
+                    try:
+                        is_current = (
+                            rev is not None
+                            and int(rev) == CODEGRAPH_EMBED_REVISION
+                        )
+                    except (TypeError, ValueError):
+                        is_current = False
+                    if not is_current:
+                        fp = p.get(path_prop) or ""
+                        if fp:
+                            stale.add(str(fp))
+                determinable = True
+            except Exception as exc:  # noqa: BLE001 — per-collection soft-fail
+                print(
+                    f"⚠️  stale-file probe failed on "
+                    f"{getattr(coll, 'name', '?')}: {exc}",
+                    file=sys.stderr,
+                )
+        if not determinable:
+            return None
+        return frozenset(stale)
+
+    def _get_stale_file_set(self) -> Optional[frozenset]:
+        """Lazily-built, per-run cached stale-file set (see the builder)."""
+        if not hasattr(self, "_stale_file_set_cache"):
+            self._stale_file_set_cache = self._build_stale_file_set()
+        return self._stale_file_set_cache
+
+    def _invalidate_module_row(self, file_abs: Path, source_root: Path) -> None:
+        """R-3 (v0.2.73 / C-2): un-stamp the module row after a per-file failure.
+
+        Every walker writes the MODULE row (new ``file_hash`` + current
+        ``embed_revision``) BEFORE the file's entity rows. When a later entity
+        write fails, the per-file handler in ``analyze_repository`` counts the
+        file as skipped and continues — but the module row already claims
+        "done at the current revision", so the per-file gate skips the file on
+        every subsequent run and the missing/stale entities are unreachable
+        forever (until the user happens to edit the file). One transient
+        Weaviate 500 on entity #3 of a 50-entity file used to poison the file
+        permanently.
+
+        Compensation: clear ``file_hash`` and stamp ``embed_revision`` 0 on
+        the module row so BOTH gate conjuncts fail on the next run → the file
+        re-walks (and the R-1 stale-file probe independently sees it). Targets
+        the SAME row ``_get_existing_module`` consults (path-only filter,
+        limit=1), preferring this run's cache UUID when present.
+
+        Leave-alone case: when no module row exists (the failure happened
+        BEFORE the module write), there is nothing to invalidate and the gate
+        cannot wrongly skip — do nothing. Soft-fail with a log line: a failed
+        invalidation leaves exactly the pre-fix status quo, never crashes the
+        walk.
+        """
+        try:
+            rel = file_abs.relative_to(source_root).as_posix()
+        except Exception:  # noqa: BLE001 — extras/odd roots: best-effort key
+            rel = str(file_abs)
+        try:
+            coll = getattr(self, "modules_collection", None)
+            if coll is None:
+                return
+            cache = getattr(self, "module_cache", None) or {}
+            uuid_to_fix = cache.get(rel)
+            if uuid_to_fix is None:
+                result = coll.query.fetch_objects(
+                    filters=Filter.by_property("path").equal(rel), limit=1
+                )
+                objs = getattr(result, "objects", None) or []
+                if not objs:
+                    return  # no module row landed → nothing to compensate
+                uuid_to_fix = objs[0].uuid
+            coll.data.update(
+                uuid=uuid_to_fix,
+                properties={
+                    "file_hash": "",
+                    _EMBED_REVISION_PROP: _EMBED_REVISION_VECTORLESS,
+                },
+            )
+            print(
+                f"   ↺ invalidated module row for {rel} "
+                "(per-file failure → file re-walks next run)"
+            )
+        except Exception as exc:  # noqa: BLE001 — compensation is best-effort
+            print(
+                f"⚠️  module-row invalidation failed for {rel}: {exc}",
+                file=sys.stderr,
+            )
+
     def _get_existing_module(self, path: str, file_hash: str) -> Optional[str]:
         """Check if module already exists with same hash AT THE CURRENT
         EMBED REVISION.
@@ -6875,7 +7298,25 @@ class CodeGraphAnalyzer:
         pre-v0.2.72 file). Read as an explicit property (not a filter
         conjunct) so absent/NULL pre-migration values are handled here and
         the behavior doesn't depend on the new prop's filter index.
+
+        v0.2.73 R-1: the M0 conjunct above covers only the MODULE row. A file
+        whose module row is current can still own stale FUNCTION/CLASS rows
+        (module stamped before a mid-file failure, vectorless writes stamped
+        0 by R-2, a walk that died between entity writes) — so the gate ALSO
+        consults the per-run stale-file set: any file owning a stale-revision
+        row of ANY file-anchored type re-walks, even with an unchanged hash.
+        Probe unavailable → fall back to the M0-only behaviour (fail-open).
         """
+        try:
+            stale_files = self._get_stale_file_set()
+        except Exception:  # noqa: BLE001 — stub analyzers / probe failure
+            stale_files = None
+        if stale_files and path in stale_files:
+            # A stale Function/Class/Module row anchors to this file → the
+            # file must re-walk so its entities re-embed under the current
+            # revision (the per-object gates keep the re-walk cheap for the
+            # rows that are already current).
+            return None
         try:
             result = self.modules_collection.query.fetch_objects(
                 filters=Filter.by_property("path").equal(path) &
@@ -7252,6 +7693,15 @@ class CodeGraphAnalyzer:
 
         # --- 1. Function calls ---
         print("   Linking function calls...")
+        # v0.2.73 (M4-prod): accumulate per-TARGET inbound-edge counts in the
+        # SAME pass that already resolves every call edge (nearly free), and
+        # record each function's stored n_callers from the point-read the
+        # loop already does — the write pass below then updates only rows
+        # whose count actually changed. Because the caches are populated
+        # from ALL of Weaviate (not just this run's files), counts are
+        # complete on EVERY analyze — M4 backfills itself.
+        inbound: Dict[str, int] = {}
+        stored_counts: Dict[str, Any] = {}
         for full_name, func_uuid in self.function_cache.items():
             # Fetch the function to get its body and extract calls.
             # v0.2.72 (P3): `func_uuid` is the CANONICAL (chunk 0) UUID from the
@@ -7267,6 +7717,13 @@ class CodeGraphAnalyzer:
             # object, so callers-queries resolve correctly.
             try:
                 canonical = self.functions_collection.query.fetch_object_by_id(func_uuid)
+                # M4: record the stored count BEFORE any body-based skip —
+                # bodiless rows can still be call TARGETS whose stored value
+                # the write pass must compare against.
+                if canonical is not None:
+                    stored_counts[func_uuid] = (
+                        canonical.properties or {}
+                    ).get("n_callers")
                 body = canonical.properties.get("function_body", "") if canonical is not None else ""
                 if not body:
                     continue
@@ -7326,6 +7783,13 @@ class CodeGraphAnalyzer:
                     except Exception:
                         pass
 
+                # M4: count every RESOLVED inbound edge for its target —
+                # independent of whether reference_add below succeeds (the
+                # count reflects the resolved call graph, and the ref write
+                # already soft-fails).
+                for ref_uuid in refs_to_add:
+                    inbound[ref_uuid] = inbound.get(ref_uuid, 0) + 1
+
                 if refs_to_add:
                     try:
                         for ref_uuid in refs_to_add:
@@ -7340,6 +7804,41 @@ class CodeGraphAnalyzer:
 
             except Exception as e:
                 logger.debug(f"Error processing calls for {full_name}: {e}")
+
+        # ── v0.2.73 (M4-prod): persist n_callers (write-only-on-change) ─────
+        # Rules (destructive-noise avoidance):
+        #   * NULL row with 0 inbound stays NULL — "unknown/leaf", avoiding
+        #     thousands of pointless writes on the first post-upgrade run
+        #     (the renderer omits the line for NULL and 0 alike).
+        #   * write only when the count actually changed (incl. decrements —
+        #     counts are recomputed from scratch every pass, so a deleted
+        #     caller corrects its targets on the next analyze).
+        # Soft-fail per update (mirrors the call_names update above).
+        n_callers_written = 0
+        for target_uuid in set(self.function_cache.values()):
+            new_count = inbound.get(target_uuid, 0)
+            stored_raw = stored_counts.get(target_uuid)
+            try:
+                stored_int: Optional[int] = (
+                    int(stored_raw) if stored_raw is not None else None
+                )
+            except (TypeError, ValueError):
+                stored_int = None
+            if new_count == 0 and stored_int is None:
+                continue  # NULL stays NULL
+            if stored_int == new_count:
+                continue
+            try:
+                self.functions_collection.data.update(
+                    uuid=target_uuid,
+                    properties={"n_callers": new_count},
+                )
+                n_callers_written += 1
+            except Exception:
+                pass
+        stats['n_callers'] = n_callers_written
+        if n_callers_written:
+            print(f"   Updated n_callers on {n_callers_written} function(s)")
 
         # --- 2. Class extends ---
         print("   Linking class inheritance...")
