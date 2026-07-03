@@ -74,9 +74,13 @@ pub async fn start_hub_server() -> Result<u16, String> {
     // With the bind first, a starter that fails to bind writes NOTHING —
     // a pre-existing healthy hub's token/port files stay untouched.
     //
-    // See the bind-address rationale below (kept verbatim) for why this
-    // is 0.0.0.0.
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    // See the bind-address rationale below for the loopback-default /
+    // opt-in-all-interfaces posture (E-2, v0.2.73). F-6 ORDERING PRESERVED:
+    // the bind still happens FIRST, before any discovery-file write — only
+    // the bind ADDRESS changed (0.0.0.0 default → 127.0.0.1 default with an
+    // explicit opt-in), never the bind-first sequencing.
+    let bind_ip = hub_bind_ip();
+    let addr = SocketAddr::from((bind_ip, port));
     let listener = try_bind(addr, 5).await?;
     let actual_port = listener.local_addr().unwrap().port();
 
@@ -191,27 +195,32 @@ pub async fn start_hub_server() -> Result<u16, String> {
         .layer(axum::Extension(auth_state))
         .layer(cors);
 
-    // Bind-address rationale — 0.0.0.0 (v0.2.61, Option H). The hub MUST
-    // be reachable from a global module's container network namespace
-    // (the RL container reads its training corpus via
+    // Bind-address rationale — 127.0.0.1 DEFAULT, 0.0.0.0 OPT-IN (E-2,
+    // v0.2.73; reverses the v0.2.61 Option-H "0.0.0.0 always" default).
+    //
+    // The hub CAN be reached from a global module's container network
+    // namespace (the RL container reads its training corpus via
     // `GET <VCT_HUB_BASE_URL>/api/v1/modules/{id}/projects/{pid}/rl/events`).
     // `host.containers.internal` resolves to different host addresses per
     // container runtime/backend (bridge gateway on rootful podman/docker,
-    // the host LAN IP on rootless pasta, etc.), so the ONLY runtime-
-    // agnostic way to be reachable everywhere — without per-backend
-    // interface detection that breeds bugs — is to listen on all
-    // interfaces and let the BEARER TOKEN be the access control.
+    // the host LAN IP on rootless pasta, etc.), so the only runtime-
+    // agnostic way to be reachable from containers is to listen on all
+    // interfaces. BUT most installs never run a container that needs the
+    // hub — for them, binding all interfaces needlessly exposes a secret-
+    // serving endpoint on the LAN.
     //
-    // SECURITY POSTURE (deliberate change from the prior 127.0.0.1-only
-    // bind): network isolation was never the real lock — EVERY `/api/v1/*`
-    // route is gated by `auth::require_auth` against a 256-bit CSPRNG
-    // `hub.token` (and module routes by the per-module ephemeral token).
-    // A LAN peer that can now reach the port still gets 401 without the
-    // token. Loopback-only was defense-in-depth; binding 0.0.0.0 trades
-    // that one layer for runtime-agnostic container reachability + far
-    // less code. The token IS the boundary. (If a deployment ever needs
-    // the hub pinned off non-loopback interfaces, that's a future opt-in
-    // env, not a default.)
+    // SECURITY POSTURE: every `/api/v1/*` route is gated by
+    // `auth::require_auth` against a 256-bit CSPRNG `hub.token` (and module
+    // routes by the per-module ephemeral token), so the token — not the
+    // bind — is the real access boundary; a peer that reaches the port
+    // still gets 401 without the token. HOWEVER (E-2 finding): if
+    // `hub.token` ever leaks off-host (a loose-perms backup, a CI artifact,
+    // an `scp` of `$HOME`), a 0.0.0.0 bind lets a same-LAN peer siphon
+    // secrets over the NETWORK with no local code execution. Loopback-only
+    // removes that LAN dimension entirely while keeping the token as
+    // defense-in-depth — the conservative default. Container deployments
+    // that genuinely need cross-namespace reachability opt in explicitly
+    // via `VCT_HUB_BIND_ALL=1` (see `hub_bind_ip`).
     //
     // Port-ladder note (F-6, v0.2.73): `try_bind(addr, 5)` walks to
     // port+1..+5 when the base port is occupied. Pre-fix this DEFEATED
@@ -281,8 +290,37 @@ pub async fn start_hub_server() -> Result<u16, String> {
     // cold-start path; the watchdog is the always-on safety net.
     infra_watchdog::spawn_infra_watchdog(launcher_state.clone());
 
-    println!("[vct-hub] API server running on http://127.0.0.1:{}", actual_port);
+    // E-2: log the ACTUAL bind host, not a hardcoded "127.0.0.1" (the prior
+    // string drifted from the real 0.0.0.0 bind). Loopback is always reachable
+    // as 127.0.0.1 regardless of the bind IP, so print that for the all-
+    // interfaces case too, but annotate the exposure.
+    let bind_note = if bind_ip == std::net::Ipv4Addr::LOCALHOST {
+        "loopback-only"
+    } else {
+        "all interfaces (VCT_HUB_BIND_ALL)"
+    };
+    println!(
+        "[vct-hub] API server running on http://127.0.0.1:{} (bound {}: {})",
+        actual_port, bind_ip, bind_note
+    );
     Ok(actual_port)
+}
+
+/// Resolve the hub's bind IP (E-2, v0.2.73).
+///
+/// Default `127.0.0.1` (loopback-only) so a leaked `hub.token` cannot be used
+/// to siphon secrets over the LAN. Set `VCT_HUB_BIND_ALL=1` (or `true`) to bind
+/// `0.0.0.0` — required only when a container must reach the hub across its
+/// network namespace (`host.containers.internal`). Any other value keeps the
+/// loopback default (conservative: only an explicit, recognised opt-in widens
+/// the bind).
+fn hub_bind_ip() -> std::net::Ipv4Addr {
+    match std::env::var("VCT_HUB_BIND_ALL").ok().as_deref() {
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") => {
+            std::net::Ipv4Addr::UNSPECIFIED // 0.0.0.0
+        }
+        _ => std::net::Ipv4Addr::LOCALHOST, // 127.0.0.1
+    }
 }
 
 async fn try_bind(base_addr: SocketAddr, retries: u16) -> Result<tokio::net::TcpListener, String> {
