@@ -371,3 +371,94 @@ def test_parity_realistic_settings_round_trip(tmp_path: Path) -> None:
     # New canonical keys from the bundle were added.
     assert parsed["env"]["ACTIVE_EMBEDDING"] == "qwen3"
     assert parsed["env"]["WEAVIATE_URL"] == "http://localhost:8081"
+
+
+# ─── v0.2.73 WRITE INVARIANT parity (Rust ↔ Python agree on strip) ──────
+#
+# E-SECRETS-ARCHITECTURE §B: the two writers previously DISAGREED on the
+# single most security-sensitive question — the Rust GUI writer EMITTED
+# user-secret values + the keychain-resolved GITHUB_TOKEN into the two
+# project-tree surfaces while the Python writer stripped them. Post-fix
+# both strip. These tests mirror the Rust units
+# ``write_project_env_files_never_emits_github_token_value`` and
+# ``writer_strips_all_user_keys_when_known_keys_emptied`` /
+# ``write_project_env_files_excludes_user_set_secrets`` so the parity
+# contract covers the invariant, not just the canonical layout.
+
+from vco_lib.config_projection import apply_user_secrets  # noqa: E402
+
+
+def test_parity_github_token_scrubbed_from_settings_json(tmp_path: Path) -> None:
+    """Mirrors Rust ``write_project_env_files_never_emits_github_token_value``.
+
+    ``GITHUB_TOKEN`` is a canonical key that no bundle carries a value
+    for post-v0.2.73 (the Rust value arm returns ``None``; the Python
+    ``project_env_from_db`` never resolved it). A stale value written
+    by a pre-fix launcher must be REMOVED on the next apply
+    (signal-to-remove for absent canonical keys).
+    """
+    stale = "ghp_stale_previously_projected_value_999"
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir(parents=True)
+    (claude_dir / "settings.json").write_text(
+        json.dumps({"env": {"GITHUB_TOKEN": stale}})
+    )
+
+    bundle = _my_test_bundle(tmp_path)
+    assert "GITHUB_TOKEN" not in bundle["canonical_env"]
+    apply_project_env(bundle, surfaces=["claude_settings_json"])
+
+    text = (claude_dir / "settings.json").read_text()
+    parsed = json.loads(text)
+    assert "GITHUB_TOKEN" not in parsed["env"], (
+        "stale GITHUB_TOKEN must be scrubbed (write invariant parity "
+        "with the Rust writer)"
+    )
+    assert stale not in text
+
+
+def test_parity_user_secret_strip_shape_no_value_in_tree(tmp_path: Path) -> None:
+    """Mirrors the Rust strip-only production call shape (v0.2.73):
+    EMPTY emit pairs + FULL known-keys strip set. Stale user-secret
+    values written by a pre-fix launcher leave BOTH surfaces, and the
+    value strings appear nowhere under the project tree afterwards.
+    """
+    secret_value = "synthetic-not-a-real-secret-a7f3"
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir(parents=True)
+    (claude_dir / "settings.json").write_text(
+        json.dumps({"env": {"EXAMPLE_API_TOKEN": secret_value}})
+    )
+    # Real pre-fix shape: the Rust writer emitted user secrets under the
+    # section header inside the managed block (projects_v2.rs
+    # `build_claude_env_managed_block_with_user_secrets`); the rebuild
+    # keys its canonical/user split off that header.
+    (claude_dir / "env").write_text(
+        f"{CLAUDE_ENV_MANAGED_BEGIN}\n"
+        'export KG_COLLECTION="ParityFixture_KnowledgeGraph"\n'
+        "\n"
+        "# user secrets (per-project; managed via launcher GUI Secrets panel)\n"
+        f'export EXAMPLE_API_TOKEN="{secret_value}"\n'
+        f"{CLAUDE_ENV_MANAGED_END}\n"
+    )
+
+    # Production shape post-v0.2.73: empty pairs, full known keys.
+    apply_user_secrets(
+        {
+            "user_secret_pairs": [],
+            "user_secret_known_keys": ["EXAMPLE_API_TOKEN"],
+            "project_id": "parity-fixture",
+            "project_root": tmp_path,
+        },
+        surfaces=["claude_settings_json", "claude_env"],
+    )
+
+    # Tree-wide sweep: the value appears in NO file under the tree.
+    for p in tmp_path.rglob("*"):
+        if p.is_file():
+            assert secret_value not in p.read_text(encoding="utf-8"), (
+                f"secret value found in {p} — write-invariant parity violated"
+            )
+    parsed = json.loads((claude_dir / "settings.json").read_text())
+    assert "EXAMPLE_API_TOKEN" not in parsed.get("env", {})
+    assert "EXAMPLE_API_TOKEN" not in (claude_dir / "env").read_text()

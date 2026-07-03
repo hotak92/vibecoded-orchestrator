@@ -3328,13 +3328,20 @@ pub fn write_project_env_files(
                         Some(settings.code_graph_access_list.join(","))
                     }
                 }
-                // 0.1.7 fork-readiness sweep (2026-05-08): emit
-                // `GITHUB_TOKEN` from the keychain-resolved PAT when
-                // present + active, else omit the key entirely. Matches
-                // VCT_ORCHESTRATOR_ROOT semantics (None → not in any of
-                // the 3 surfaces). Resolved by `populate()` via
-                // `crate::commands::installer::github_pat_for_env`.
-                "GITHUB_TOKEN" => settings.github_token.clone(),
+                // v0.2.73 WRITE INVARIANT (E-env-leak): secret VALUES are
+                // NEVER written into any project-tree file. Pre-fix this
+                // arm emitted the keychain-resolved PAT
+                // (`settings.github_token`) into `.claude/env` AND
+                // `.claude/settings.json` — the committable-convention
+                // file. Now it returns `None` unconditionally; the key
+                // stays in `CANONICAL_INSTALL_ENV_KEYS` (the panic guard
+                // below keeps const + match in sync) and is added to the
+                // strip set so previously-written values are scrubbed on
+                // the next projection. Agents resolve the PAT via the hub
+                // `/env` endpoint + the resolver chain
+                // (`vct_secrets_resolve.sh|.ps1` / `agent_secrets.py`),
+                // never via env-file exports.
+                "GITHUB_TOKEN" => None,
                 // v0.2.43 V0243-5-Rust: project folder → KG_BASE_DIR.
                 // Always emitted (the folder is always known at write time).
                 // Mirrors the value `build_kg_sync_env` passes to kg-sync
@@ -3354,40 +3361,45 @@ pub fn write_project_env_files(
     let canonical_env_keys: std::collections::HashSet<&str> =
         canonical_env_pairs.iter().map(|(k, _)| *k).collect();
 
-    // Subagent G (2026-05-08): derive the user-bucket emit + strip sets
-    // from the launcher-resolved settings so they propagate to all 3
-    // surfaces alongside the canonical pairs.
+    // v0.2.73 WRITE INVARIANT (E-env-leak, supersedes Subagent G's
+    // emit half, 2026-05-08): user-secret VALUES are NEVER written into
+    // the project tree. The env files stopped being a secret-delivery
+    // channel — agents resolve values via the hub `/env` user-secret
+    // loop (keychain) + the resolver chain (file store, project `.env`),
+    // all read-at-resolve, nothing on disk under the tree.
     //
-    // EMIT: every (KEY, VALUE) pair the resolver produced. Already
-    // gated by the cross-launcher active flag + keychain presence at
-    // populate time (`resolve_user_secret_state` in project_env_settings).
+    // EMIT: always EMPTY. `settings.user_secret_pairs` (still produced
+    // by `resolve_user_secret_state` — the hub reuses the same bucket
+    // logic) is deliberately ignored on the value side here.
     //
-    // STRIP: every known KEY that is NOT in the EMIT set. This is the
-    // subset of "keys the launcher has ever observed in this project's
-    // user bucket" that is currently inactive / pending-removal /
-    // keychain-empty. Removing them from the JSON env blocks is what
-    // makes a paused secret actually leave the surfaces; for
-    // `.claude/env` the BEGIN/END replace handles strip implicitly.
+    // STRIP: ALL of `settings.user_secret_known_keys` (emit ∪ strip =
+    // known keys) + `GITHUB_TOKEN` (whose canonical value arm is now
+    // `None` — see the match above). This makes the strip machinery the
+    // scrubber for values previously projected by older launchers: the
+    // next projection removes every known user-secret key + the PAT
+    // from the `.claude/settings.json` env object; the `.claude/env`
+    // managed block is rebuilt wholesale between BEGIN/END markers, so
+    // it needs no strip plumbing.
     //
-    // We tolerate a key appearing in BOTH lists defensively (an emit
-    // with the same name as a strip entry shouldn't happen by
-    // construction — `resolve_user_secret_state` always returns
-    // disjoint sets — but the merge primitive runs strip BEFORE emit
-    // so even a buggy resolver couldn't silently drop the active
-    // value).
-    let user_secret_pairs: Vec<(&str, String)> = settings
-        .user_secret_pairs
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.clone()))
-        .collect();
-    let emit_keys: std::collections::HashSet<&str> =
-        user_secret_pairs.iter().map(|(k, _)| *k).collect();
+    // This matches the Python twin (`config_projection.py` Phase 0.E
+    // scenario 3 — empty pairs + full known-keys = strip); the two
+    // writers previously disagreed on the single most security-
+    // sensitive question (Rust emitted, Python stripped). Byte-parity
+    // is pinned by `tests/test_config_projection_byte_identical.py`.
+    let user_secret_pairs: Vec<(&str, String)> = Vec::new();
     let user_secret_strip_keys: Vec<&str> = settings
         .user_secret_known_keys
         .iter()
         .map(|s| s.as_str())
-        .filter(|k| !emit_keys.contains(k))
+        .chain(std::iter::once("GITHUB_TOKEN"))
         .collect();
+    // Deliberate: the VALUE-bearing fields are resolved by `populate()`
+    // (spec §B item 3 — `resolve_user_secret_state` keeps producing
+    // pairs; the hub's user-secret loop shares the same bucket logic in
+    // vct-launcher-core) but this writer IGNORES the value side — that
+    // is the invariant. The explicit no-op read keeps dead-code lint
+    // honest without changing the settings struct.
+    let _ = (&settings.user_secret_pairs, &settings.github_token);
 
     // PR-27 (v0.2.12, 2026-05-16): the historical write to
     // `.vscode/settings.json` `claude-code.env` was removed here.
@@ -5056,18 +5068,14 @@ pub(crate) const CANONICAL_INSTALL_ENV_KEYS: &[&str] = &[
     // Conditionally emitted: omitted when the keychain has no value,
     // or when the value is paused via Lifecycle B's active-flag gate.
     //
-    // Per-project gating semantics (conservative, 2026-05-08): every
-    // registered project receives `GITHUB_TOKEN` whenever the PAT is
-    // set and active. This matches pre-0.1.7 file-based behaviour
-    // (`~/.vct-secrets/shared/github_pat` is readable by every process
-    // running as the user). A finer-grained per-project access matrix
-    // for `github_pat` is out of scope for the 0.1.7 fork sweep — see
-    // `docs/MIGRATION-0.2.0.md` "Replacing `git-credential-vct`".
-    //
-    // Users configure git's credential helper once
-    // (`gh auth setup-git`, or a thin shell helper that reads
-    // `$GITHUB_TOKEN`) and the launcher takes over the per-project
-    // gating via the env var.
+    // v0.2.73 WRITE INVARIANT update: the launcher no longer EMITS
+    // `GITHUB_TOKEN` into any env surface (its value arm in
+    // `write_project_env_files` returns `None` and the key sits in the
+    // per-write strip set). It stays in THIS unregister list so the
+    // cleanup path scrubs values written by pre-v0.2.73 launchers.
+    // Agents resolve the PAT via the hub `/env` endpoint + resolver
+    // chain; `git` uses the `git-credential-vct` helper or
+    // `vct exec`-style injection.
     "GITHUB_TOKEN",
     // v0.2.43 V0243-5-Rust: KG_BASE_DIR mirrors the project folder so
     // .claude/settings.json::env and .claude/env agree with the value
@@ -7332,58 +7340,68 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// 0.1.7 fork-readiness sweep (2026-05-08): when the OnboardingWizard
-    /// has registered a PAT (i.e. the keychain has `github_pat` AND the
-    /// secret is active), the env-pair builder MUST emit `GITHUB_TOKEN`
-    /// to all three install surfaces. Mirrors the
-    /// `vct_portability_keys_propagate_to_all_three_surfaces` shape.
-    ///
-    /// This replaces the pre-0.1.7 `git-credential-vct` helper:
-    /// per-project env propagation is the canonical mechanism since the
-    /// helper protocol is project-agnostic and incompatible with the
-    /// per-project active-flag gate.
+    /// v0.2.73 WRITE INVARIANT (E-env-leak) — INVERTED from the 0.1.7
+    /// `write_project_env_files_emits_github_token_when_keychain_has_entry`
+    /// test: even when the keychain-resolved PAT is present
+    /// (`settings.github_token = Some(...)`), the writer must NOT emit
+    /// its value into ANY project-tree surface. The PAT reaches agents
+    /// via the hub `/env` endpoint + the resolver chain, never via
+    /// env-file exports. The strip set must also SCRUB a value written
+    /// by a pre-v0.2.73 launcher from `.claude/settings.json`.
     #[test]
-    fn write_project_env_files_emits_github_token_when_keychain_has_entry() {
+    fn write_project_env_files_never_emits_github_token_value() {
         let tmp = std::env::temp_dir().join(format!(
-            "vct-github-token-prop-{}",
+            "vct-github-token-invariant-{}",
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&tmp).unwrap();
 
-        // Bypass the populate() path entirely: build a settings struct
-        // with `github_token = Some(canary)` directly. This pins the
-        // pair-builder behaviour without depending on the keychain
-        // backend or DB state — the populate() side has its own tests
-        // in `installer::tests::github_pat_keychain_tests`.
+        // Simulate a pre-fix launcher having already projected the PAT
+        // into the committable-convention file.
+        let stale = "ghp_stale_previously_projected_value_999";
+        std::fs::create_dir_all(tmp.join(".claude")).unwrap();
+        std::fs::write(
+            tmp.join(".claude/settings.json"),
+            serde_json::json!({ "env": { "GITHUB_TOKEN": stale } }).to_string(),
+        )
+        .unwrap();
+
         let canary = "ghp_pair_builder_canary_value_12345";
         let mut settings = ProjectEnvSettings::with_defaults("GhTokTest");
         settings.github_token = Some(canary.to_string());
         write_project_env_files(&tmp, &settings).unwrap();
 
-        // Surface 1: .claude/env (POSIX exports).
+        // Surface 1: .claude/env (POSIX exports) — no GITHUB_TOKEN at all.
         let claude_env_text = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
         assert!(
-            claude_env_text.contains(&format!("export GITHUB_TOKEN=\"{}\"", canary)),
-            ".claude/env missing GITHUB_TOKEN export. Body:\n{}",
+            !claude_env_text.contains("GITHUB_TOKEN"),
+            ".claude/env must not carry GITHUB_TOKEN (write invariant). Body:\n{}",
+            claude_env_text,
+        );
+        assert!(
+            !claude_env_text.contains(canary),
+            ".claude/env must not carry the PAT value anywhere. Body:\n{}",
             claude_env_text,
         );
 
-        // Surface 2: .claude/settings.json env block.
-        let cs: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            cs["env"]["GITHUB_TOKEN"], canary,
-            ".claude/settings.json env block missing or wrong GITHUB_TOKEN. \
-             Block: {}",
+        // Surface 2: .claude/settings.json env block — absent AND the
+        // stale pre-fix value scrubbed.
+        let cs_text = std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap();
+        let cs: serde_json::Value = serde_json::from_str(&cs_text).unwrap();
+        assert!(
+            cs["env"].get("GITHUB_TOKEN").is_none(),
+            ".claude/settings.json env must not contain GITHUB_TOKEN. Block: {}",
             cs["env"],
         );
+        assert!(
+            !cs_text.contains(stale),
+            "stale pre-v0.2.73 GITHUB_TOKEN value must be scrubbed on re-projection",
+        );
+        assert!(!cs_text.contains(canary));
 
         // PR-27 (v0.2.12, 2026-05-16): the writer no longer touches
         // `.vscode/settings.json` — the file must not have been created
-        // by the env write. See function-level docstring for the
-        // empirical-trace KG-node reference.
+        // by the env write.
         assert!(
             !tmp.join(".vscode/settings.json").exists(),
             "PR-27: write_project_env_files must not create .vscode/settings.json",
@@ -10603,36 +10621,34 @@ USER_DB_URL=postgres://user:pass@db/app
         });
     }
 
-    // ─── Subagent G (2026-05-08): user-set per-project secrets in env ──
+    // ─── User-set secrets × env surfaces (v0.2.73 WRITE INVARIANT) ─────
     //
-    // These tests pin the contract that a user adding a per-project
-    // secret in the launcher GUI sees it as `$KEY` in their next Claude
-    // Code session (no session restart, no resolver call). Coverage:
+    // Subagent G (2026-05-08) originally pinned the OPPOSITE contract:
+    // active user-secret VALUES were emitted into the env surfaces.
+    // v0.2.73 (E-env-leak) inverted it — `.claude/settings.json` is the
+    // committable-convention file and a user-secret value written there
+    // can be committed and pushed. Post-fix coverage:
     //
-    //   * Active pairs land in all 3 launcher-managed env surfaces
+    //   * User-secret VALUES appear in NO project-tree surface, ever
     //     (`.claude/env` BEGIN/END block, `.claude/settings.json` env,
-    //     `.vscode/settings.json` claude-code.env).
-    //   * Inactive (paused via Lifecycle B) pairs are OMITTED from emit
-    //     and STRIPPED from any prior write.
+    //     root `.env`, `.env.vco.reference`).
+    //   * Every known user-secret key + `GITHUB_TOKEN` is STRIPPED from
+    //     prior writes (the strip machinery IS the scrubber for values
+    //     projected by pre-v0.2.73 launchers).
     //   * By-hand user-added env keys (never went through `set_secret_v2`)
-    //     are preserved verbatim — the strip set is bounded to keys we
-    //     ourselves wrote.
+    //     are preserved verbatim — the strip set is bounded to keys the
+    //     launcher itself has observed.
     //
-    // The unregister-strips-user-secrets test lives separately because
-    // the surgical-strip helper applies the existing canonical strip;
-    // user-secret keys are removed by clearing them via the env writer
-    // BEFORE unregister calls the strip helper. See the comment on
-    // `surgically_strip_env_surfaces` for the layered-cleanup design.
+    // Agents read the values via the hub `/env` user-secret loop +
+    // the resolver chain (file store, project `.env`), never via
+    // env-file exports.
 
-    /// Direct contract test: when `ProjectEnvSettings` carries an active
-    /// user-secret pair, both launcher-managed env surfaces emit it
-    /// alongside the canonical keys.
-    ///
-    /// PR-27 (v0.2.12, 2026-05-16): the historical third surface
-    /// (`.vscode/settings.json` `claude-code.env`) was removed because
-    /// it didn't propagate to MCP subprocesses on Linux.
+    /// v0.2.73 WRITE INVARIANT — INVERTED from Subagent G's
+    /// `write_project_env_files_includes_user_set_secrets`: even when
+    /// `ProjectEnvSettings` carries active user-secret pairs, NEITHER
+    /// launcher-managed env surface may contain the key or the value.
     #[test]
-    fn write_project_env_files_includes_user_set_secrets() {
+    fn write_project_env_files_excludes_user_set_secrets() {
         let tmp = std::env::temp_dir().join(format!(
             "vct-user-secret-emit-{}",
             uuid::Uuid::new_v4().simple()
@@ -10641,7 +10657,7 @@ USER_DB_URL=postgres://user:pass@db/app
 
         let mut settings = ProjectEnvSettings::with_defaults("UserSecretEmit");
         settings.user_secret_pairs = vec![
-            ("MY_PROJECT_KEY".to_string(), "ghp_subagent_g_canary_value".to_string()),
+            ("MY_PROJECT_KEY".to_string(), "synthetic-user-canary-value".to_string()),
             ("INTERNAL_API_BASE".to_string(), "https://api.internal.example.com".to_string()),
         ];
         settings.user_secret_known_keys = vec![
@@ -10651,46 +10667,37 @@ USER_DB_URL=postgres://user:pass@db/app
 
         write_project_env_files(&tmp, &settings).unwrap();
 
-        // 1. .claude/env (POSIX exports between BEGIN/END markers).
+        // 1. .claude/env: no user-secret keys, no values, no user-secrets
+        //    section header (the block builder receives an empty emit list).
         let claude_env = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
-        assert!(
-            claude_env.contains(r#"export MY_PROJECT_KEY="ghp_subagent_g_canary_value""#),
-            ".claude/env missing MY_PROJECT_KEY export. Body:\n{}",
-            claude_env
-        );
-        assert!(
-            claude_env.contains(r#"export INTERNAL_API_BASE="https://api.internal.example.com""#),
-            ".claude/env missing INTERNAL_API_BASE export. Body:\n{}",
-            claude_env
-        );
-        // Section header makes user secrets visually distinct in diffs.
-        assert!(
-            claude_env.contains("# user secrets (per-project"),
-            ".claude/env missing user-secrets section header. Body:\n{}",
-            claude_env
-        );
-        // Both inside the managed BEGIN/END block (writers replace it
-        // wholesale every call — that is how strip works for this
-        // surface).
-        let begin_idx = claude_env.find(CLAUDE_ENV_MANAGED_BEGIN).unwrap();
-        let end_idx = claude_env.find(CLAUDE_ENV_MANAGED_END).unwrap();
-        let in_block = |needle: &str| {
-            let pos = claude_env.find(needle).unwrap();
-            pos > begin_idx && pos < end_idx
-        };
-        assert!(in_block("MY_PROJECT_KEY"));
-        assert!(in_block("INTERNAL_API_BASE"));
+        for needle in [
+            "MY_PROJECT_KEY",
+            "INTERNAL_API_BASE",
+            "synthetic-user-canary-value",
+            "# user secrets (per-project",
+        ] {
+            assert!(
+                !claude_env.contains(needle),
+                ".claude/env must not contain {:?} (write invariant). Body:\n{}",
+                needle,
+                claude_env
+            );
+        }
 
-        // 2. .claude/settings.json env block.
-        let cs: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap())
-                .unwrap();
-        assert_eq!(cs["env"]["MY_PROJECT_KEY"], "ghp_subagent_g_canary_value");
-        assert_eq!(cs["env"]["INTERNAL_API_BASE"], "https://api.internal.example.com");
+        // 2. .claude/settings.json env block: same absence.
+        let cs_text = std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap();
+        let cs: serde_json::Value = serde_json::from_str(&cs_text).unwrap();
+        assert!(cs["env"].get("MY_PROJECT_KEY").is_none());
+        assert!(cs["env"].get("INTERNAL_API_BASE").is_none());
+        assert!(
+            !cs_text.contains("synthetic-user-canary-value"),
+            "user-secret VALUE must not appear anywhere in settings.json"
+        );
 
-        // PR-27: the writer must not create `.vscode/settings.json` at
-        // all. The historical claude-code.env surface was removed
-        // because it didn't propagate to MCP subprocesses on Linux.
+        // Canonical non-secret config still flows.
+        assert_eq!(cs["env"]["KG_COLLECTION"], "UserSecretEmit_KnowledgeGraph");
+
+        // PR-27: the writer must not create `.vscode/settings.json`.
         assert!(
             !tmp.join(".vscode/settings.json").exists(),
             "PR-27: write_project_env_files must not create .vscode/settings.json",
@@ -10699,10 +10706,76 @@ USER_DB_URL=postgres://user:pass@db/app
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Active-flag-gate test: a known user-secret key whose pair is NOT
-    /// in `user_secret_pairs` (e.g. it's been paused via Lifecycle B)
-    /// must (a) be omitted from the EMIT, AND (b) actively STRIPPED from
-    /// every surface on the next writer call.
+    /// v0.2.73 THE INVARIANT TEST (E-SECRETS-ARCHITECTURE §B): configure
+    /// a synthetic user secret + a keychain-resolved PAT, run the full
+    /// Rust-side projection (env files + root `.env` template +
+    /// `.env.vco.reference` sidecar), and assert the VALUE strings appear
+    /// NOWHERE under the project tree. This is the guarantee that makes
+    /// git topology irrelevant to the security case — no undiscovered
+    /// nested user repo can commit a value that isn't on disk.
+    /// Python twin: `tests/test_config_projection_user_secrets.py`.
+    #[test]
+    fn no_secret_value_anywhere_under_project_tree_after_projection() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-secret-tree-invariant-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        const SECRET_VALUE: &str = "synthetic-not-a-real-secret-a7f3";
+        const PAT_VALUE: &str = "ghp_synthetic_invariant_canary_b9e1";
+
+        let mut settings = ProjectEnvSettings::with_defaults("TreeInvariant");
+        settings.user_secret_pairs =
+            vec![("EXAMPLE_API_TOKEN".to_string(), SECRET_VALUE.to_string())];
+        settings.user_secret_known_keys = vec!["EXAMPLE_API_TOKEN".to_string()];
+        settings.github_token = Some(PAT_VALUE.to_string());
+
+        // Full Rust-side projection: both env files, the root .env
+        // template, and the safe-add reference sidecar.
+        write_project_env_files(&tmp, &settings).unwrap();
+        ensure_project_env_template(&tmp, &settings).unwrap();
+        write_env_reference_sidecar(&tmp, &settings).unwrap();
+
+        // Walk EVERY file under the tree — the invariant is tree-wide,
+        // not per-known-surface, so a future writer that adds a new
+        // surface fails this test if it carries a value.
+        fn walk_assert_absent(dir: &std::path::Path, needles: &[&str]) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    walk_assert_absent(&p, needles);
+                } else if let Ok(text) = std::fs::read_to_string(&p) {
+                    for needle in needles {
+                        assert!(
+                            !text.contains(needle),
+                            "secret value found in project-tree file {} (write invariant violated)",
+                            p.display(),
+                        );
+                    }
+                }
+            }
+        }
+        walk_assert_absent(&tmp, &[SECRET_VALUE, PAT_VALUE]);
+
+        // Sanity: the projection actually ran (canonical config present).
+        let cs: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cs["env"]["KG_COLLECTION"], "TreeInvariant_KnowledgeGraph");
+        assert!(tmp.join(".env").exists());
+        assert!(tmp.join(".env.vco.reference").exists());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Strip test (v0.2.73 update): a known user-secret key must be
+    /// actively STRIPPED from every surface on the writer call —
+    /// regardless of whether it is paused or active (post-invariant the
+    /// EMIT set is always empty; the pause distinction only matters for
+    /// the hub read path). Pre-fix surfaces written by an older launcher
+    /// are the fixture here.
     #[test]
     fn write_project_env_files_omits_paused_user_secrets() {
         let tmp = std::env::temp_dir().join(format!(
@@ -10711,16 +10784,17 @@ USER_DB_URL=postgres://user:pass@db/app
         ));
         std::fs::create_dir_all(&tmp).unwrap();
 
-        // First write: PAUSED_KEY is active and lands in every surface.
-        let mut settings = ProjectEnvSettings::with_defaults("PausedUserSecret");
-        settings.user_secret_pairs = vec![("PAUSED_KEY".to_string(), "old_value".to_string())];
-        settings.user_secret_known_keys = vec!["PAUSED_KEY".to_string()];
-        write_project_env_files(&tmp, &settings).unwrap();
-        // Sanity: the value is there pre-pause.
-        let pre = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
-        assert!(pre.contains("PAUSED_KEY"));
+        // Fixture: a pre-v0.2.73 launcher projected PAUSED_KEY's value
+        // into .claude/settings.json (the writer no longer can — seed by
+        // hand to simulate the upgrade path).
+        std::fs::create_dir_all(tmp.join(".claude")).unwrap();
+        std::fs::write(
+            tmp.join(".claude/settings.json"),
+            serde_json::json!({ "env": { "PAUSED_KEY": "old_value" } }).to_string(),
+        )
+        .unwrap();
 
-        // Second write: PAUSED_KEY is in known_keys but NOT in pairs —
+        // Write: PAUSED_KEY is in known_keys but NOT in pairs —
         // mirrors the post-`clear_secret_v2` state.
         let mut settings_paused = ProjectEnvSettings::with_defaults("PausedUserSecret");
         settings_paused.user_secret_pairs = Vec::new();
@@ -10806,17 +10880,17 @@ USER_DB_URL=postgres://user:pass@db/app
         std::fs::write(tmp.join(".vscode/settings.json"), vscode_pre_existing).unwrap();
 
         let mut settings = ProjectEnvSettings::with_defaults("ByHandPreserve");
-        // Add a launcher-owned user secret that COINCIDENTALLY happens
-        // to NOT be the same name. The strip set is empty (no inactive
-        // entries) and the known set has only the active key. The
-        // by-hand key isn't in either — must survive.
+        // Add a launcher-owned user secret with a DIFFERENT name. The
+        // strip set (v0.2.73: ALL known keys) carries only the
+        // launcher-owned key; the by-hand key isn't in it — must survive.
         settings.user_secret_pairs = vec![("LAUNCHER_OWNED".to_string(), "v1".to_string())];
         settings.user_secret_known_keys = vec!["LAUNCHER_OWNED".to_string()];
 
         write_project_env_files(&tmp, &settings).unwrap();
 
         // `.claude/settings.json`: deep-merge contract still applies —
-        // by-hand env key survives, launcher's user secret is added.
+        // by-hand env key survives; the launcher's user secret is NOT
+        // emitted (v0.2.73 write invariant — values stay keychain-only).
         let cs: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap())
                 .unwrap();
@@ -10824,7 +10898,10 @@ USER_DB_URL=postgres://user:pass@db/app
             cs["env"]["BY_HAND_KEY"], "user_typed_value",
             "by-hand user key must survive when not in user_secret_known_keys"
         );
-        assert_eq!(cs["env"]["LAUNCHER_OWNED"], "v1");
+        assert!(
+            cs["env"].get("LAUNCHER_OWNED").is_none(),
+            "launcher-owned user secret must not be emitted (write invariant)"
+        );
 
         // PR-27: `.vscode/settings.json` must come out byte-for-byte
         // identical. The launcher no longer authors anything into it —
@@ -10840,17 +10917,23 @@ USER_DB_URL=postgres://user:pass@db/app
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Pure-function coverage of the merge primitive: the strip set
-    /// removes only the named keys; canonical pairs always overwrite;
-    /// user pairs are inserted last (collision fallthrough goes to the
-    /// user pair). Pins the order-of-operations contract documented on
-    /// `merge_env_object_canonical_with_user_secrets`.
+    /// Pure-function coverage of the merge primitive, v0.2.73
+    /// STRIP-ONLY shape: since the write invariant landed, the ONLY
+    /// production caller (`write_project_env_files`) always passes an
+    /// EMPTY user-pairs list and a FULL known-keys strip set. This test
+    /// pins that call shape: strip removes exactly the named keys;
+    /// canonical pairs always overwrite; by-hand keys are preserved; NO
+    /// user value is ever inserted. (The primitive's emit parameter is
+    /// retained for signature stability — see the write-invariant
+    /// comment in `write_project_env_files` — but must never receive
+    /// pairs from production code again.)
     #[test]
-    fn merge_env_object_canonical_with_user_secrets_strip_emit_order() {
+    fn merge_env_object_canonical_with_user_secrets_strip_only() {
         let mut parent = serde_json::json!({
             "env": {
                 "KG_COLLECTION": "stale",            // canonical, gets overwritten
                 "PAUSED_USER_KEY": "stale_user",     // in strip set, gets removed
+                "ACTIVE_USER_KEY": "stale_active",   // in strip set too (v0.2.73: ALL known keys)
                 "BY_HAND_KEY": "user_typed",         // unknown to launcher, preserved
             }
         });
@@ -10858,9 +10941,9 @@ USER_DB_URL=postgres://user:pass@db/app
 
         let canonical_pairs: Vec<(&str, String)> =
             vec![("KG_COLLECTION", "fresh".to_string())];
-        let user_secret_pairs: Vec<(&str, String)> =
-            vec![("MY_PROJECT_KEY", "active_user_value".to_string())];
-        let strip: Vec<&str> = vec!["PAUSED_USER_KEY"];
+        // Production call shape post-v0.2.73: empty emit, full strip.
+        let user_secret_pairs: Vec<(&str, String)> = Vec::new();
+        let strip: Vec<&str> = vec!["PAUSED_USER_KEY", "ACTIVE_USER_KEY"];
 
         merge_env_object_canonical_with_user_secrets(
             parent_obj,
@@ -10873,12 +10956,16 @@ USER_DB_URL=postgres://user:pass@db/app
         let env = &parent["env"];
         // Canonical: overwritten with fresh value.
         assert_eq!(env["KG_COLLECTION"], "fresh");
-        // Strip: gone.
+        // Strip: both known user keys gone — active ones too.
         assert!(env.get("PAUSED_USER_KEY").is_none());
-        // User pair: inserted.
-        assert_eq!(env["MY_PROJECT_KEY"], "active_user_value");
+        assert!(env.get("ACTIVE_USER_KEY").is_none());
         // By-hand: preserved.
         assert_eq!(env["BY_HAND_KEY"], "user_typed");
+        // No user value inserted anywhere.
+        assert!(
+            !parent.to_string().contains("stale_user")
+                && !parent.to_string().contains("stale_active")
+        );
     }
 
     /// Covers the unregister code path: at unregister time, a finished
@@ -10935,24 +11022,21 @@ USER_DB_URL=postgres://user:pass@db/app
         ));
         std::fs::create_dir_all(&tmp).unwrap();
 
-        // First write: two user secrets active.
-        let mut settings = ProjectEnvSettings::with_defaults("UnregUserSecret");
-        settings.user_secret_pairs = vec![
-            ("PURGE_TEST_A".to_string(), "v_a".to_string()),
-            ("PURGE_TEST_B".to_string(), "v_b".to_string()),
-        ];
-        settings.user_secret_known_keys = vec![
-            "PURGE_TEST_A".to_string(),
-            "PURGE_TEST_B".to_string(),
-        ];
-        write_project_env_files(&tmp, &settings).unwrap();
-        let pre = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
-        assert!(pre.contains("PURGE_TEST_A"));
-        assert!(pre.contains("PURGE_TEST_B"));
+        // Fixture (v0.2.73 update): a pre-fix launcher projected two
+        // user-secret values into `.claude/settings.json` — seeded by
+        // hand because the writer can no longer emit them.
+        std::fs::create_dir_all(tmp.join(".claude")).unwrap();
+        std::fs::write(
+            tmp.join(".claude/settings.json"),
+            serde_json::json!({
+                "env": { "PURGE_TEST_A": "v_a", "PURGE_TEST_B": "v_b" }
+            })
+            .to_string(),
+        )
+        .unwrap();
 
-        // Second write: caller explicitly nulled out the user-secret state
-        // (e.g. an unregister flow chose to purge user-secret keys). Both
-        // strip set + emit list are empty.
+        // Write with both keys known (any projection run post-upgrade):
+        // the full-known-keys strip set removes them.
         let mut settings_purge = ProjectEnvSettings::with_defaults("UnregUserSecret");
         settings_purge.user_secret_pairs = Vec::new();
         settings_purge.user_secret_known_keys = vec![

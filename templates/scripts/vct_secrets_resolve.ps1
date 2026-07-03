@@ -1,8 +1,32 @@
-﻿# vct_secrets_resolve.ps1 — bridge between bundled wrappers/hooks and the
-# launcher's hub HTTP API. PowerShell counterpart of
-# `vct_secrets_resolve.sh`. See the .sh header for the architectural
-# context (post-Fix-#3 cleanup, hub is the source-of-truth, no file-side
-# secret mirror).
+﻿# vct_secrets_resolve.ps1 — agent-facing secret resolver. PowerShell
+# counterpart of `vct_secrets_resolve.sh`.
+#
+# ONE RESOLUTION CHAIN (v0.2.73 unification — MUST MATCH the other two
+# implementations: `templates/scripts/vct_secrets_resolve.sh` and
+# `vco_lib/agent_secrets.py::get`; keep tier order, fall-through rules,
+# and the tier-3 parsing rule identical across all three):
+#
+#   Tier 1  vct-hub  GET /api/v1/projects/{id}/env?key=NAME
+#           (OS-keychain values, per-(secret x requester) active-flag
+#           gated -- the launcher's permission matrix).
+#   Tier 2  file store  $Env:VCT_SECRETS_DIR (default ~\.vct-secrets):
+#           projects\<NAME>\<key>  ->  shared\<key>.
+#   Tier 3  the project's own `.env` -- READ-ONLY, lowest priority.
+#           Only consulted when the first arg is a FOLDER (a bare
+#           project id gives no folder to read; tier 3 is skipped and
+#           the miss diagnostic says so).
+#
+# Fall-through: tier 1 -> 2 on hub unreachable / project not registered /
+# 401 / key_not_active; tier 2 -> 3 on file absent/unreadable. All-miss
+# -> non-zero exit preserving the tier-1 exit-code contract below (exit
+# 3 `key_not_active` only after tiers 2 and 3 also missed). Errors name
+# the KEY and the tiers consulted -- NEVER the value.
+#
+# Tier-3 parsing rule (identical x3): line-oriented; accept `KEY=VALUE`
+# and `export KEY=VALUE`; strip one matching pair of single/double
+# quotes; NO variable expansion, NO command substitution; first match
+# wins. The value is never logged, cached to disk, or re-exported into
+# any VCO-written file.
 #
 # Usage:
 #   .\vct_secrets_resolve.ps1 <project_id_or_folder> <secret_key>
@@ -12,6 +36,8 @@
 #         2  project not registered
 #         3  key not active for this project
 #         4  key not found in hub response
+#       Non-zero codes mean the key ALSO missed the file store and the
+#       project `.env`.
 #
 #   .\vct_secrets_resolve.ps1 resolve-project <folder>
 #       Print the project_id for <folder>. Same exit codes (0/1/2).
@@ -186,11 +212,16 @@ function Resolve-ProjectId {
     }
 }
 
-function Read-Key {
+function Read-KeyHub {
+    # Tier 1: hub (keychain). Returns @{ ExitCode; Value } — exit codes
+    # preserve the historical contract (1=hub unreachable, 2=project
+    # not registered, 3=key_not_active, 4=key missing from a 200 body).
+    # The chain caller remembers this code and reuses it as the final
+    # exit when tiers 2 and 3 also miss.
     param([string]$ProjectArg, [string]$Key)
     $resolved = Resolve-ProjectId -ArgValue $ProjectArg
     if ($resolved.ExitCode -ne 0) {
-        return $resolved.ExitCode
+        return @{ ExitCode = $resolved.ExitCode }
     }
     $pid_ = $resolved.Value
     $encodedPid = [System.Uri]::EscapeDataString($pid_)
@@ -198,31 +229,30 @@ function Read-Key {
     $result = Invoke-Hub "projects/$encodedPid/env?key=$encodedKey"
     if ($null -eq $result) {
         Write-Err "hub unreachable; is the launcher running?"
-        return 1
+        return @{ ExitCode = 1 }
     }
     switch ($result.Status) {
         0 {
             Write-Err "hub.token missing; is the launcher running?"
-            return 1
+            return @{ ExitCode = 1 }
         }
         401 {
             Write-Err "hub returned 401 unauthorized; the launcher may have restarted (token rotated). Try again."
-            return 1
+            return @{ ExitCode = 1 }
         }
         200 {
             try {
                 $obj = $result.Body | ConvertFrom-Json
             } catch {
                 Write-Err "hub returned 200 but body is not JSON; body=$($result.Body)"
-                return 4
+                return @{ ExitCode = 4 }
             }
             $val = $obj.PSObject.Properties[$Key]
             if ($null -eq $val) {
                 Write-Err "hub returned 200 but no $Key field; body=$($result.Body)"
-                return 4
+                return @{ ExitCode = 4 }
             }
-            [Console]::Out.Write($val.Value)
-            return 0
+            return @{ ExitCode = 0; Value = $val.Value }
         }
         404 {
             try {
@@ -232,27 +262,187 @@ function Read-Key {
             switch ($code) {
                 "project_not_found" {
                     Write-Err "project $pid_ not found in launcher.db"
-                    return 2
+                    return @{ ExitCode = 2 }
                 }
                 "key_not_active" {
-                    Write-Err "key $Key not active for project $pid_ (paused, or not declared by any installed module)"
-                    return 3
+                    Write-Err "key $Key not active for project $pid_ (paused for this project, or not declared by any installed module)"
+                    return @{ ExitCode = 3 }
                 }
                 Default {
                     Write-Err "hub 404 with unknown code $code; body=$($result.Body)"
-                    return 4
+                    return @{ ExitCode = 4 }
                 }
             }
         }
         400 {
             Write-Err "hub rejected request: $($result.Body)"
-            return 4
+            return @{ ExitCode = 4 }
         }
         Default {
             Write-Err "hub returned status $($result.Status); body=$($result.Body)"
-            return 1
+            return @{ ExitCode = 1 }
         }
     }
+}
+
+# ── Tier 2: file store ($Env:VCT_SECRETS_DIR, default ~\.vct-secrets) ───
+#
+# Mirrors `vco_lib/agent_secrets.py::_file_store_get` and the .sh
+# `file_store_get` (must match): projects\<NAME>\<key> first (when a
+# project NAME applies), then shared\<key>. Strips exactly ONE trailing
+# newline (vct-exec semantics). A simple first arg (no path separators)
+# is used verbatim as the file-store project name; a path walks up for
+# a `.vct-project` marker file.
+function Get-SecretsRoot {
+    if ($Env:VCT_SECRETS_DIR -and $Env:VCT_SECRETS_DIR.Trim().Length -gt 0) {
+        return $Env:VCT_SECRETS_DIR
+    }
+    return (Join-Path $HOME ".vct-secrets")
+}
+
+function Get-FileProjectName {
+    param([string]$ArgValue)
+    if ($ArgValue -and -not (Test-LooksLikePath $ArgValue)) {
+        return $ArgValue
+    }
+    try {
+        $cur = (Resolve-Path -LiteralPath $ArgValue -ErrorAction Stop).Path
+    } catch {
+        return $null
+    }
+    if (Test-Path -LiteralPath $cur -PathType Leaf) {
+        $cur = Split-Path -Parent $cur
+    }
+    while ($cur) {
+        $marker = Join-Path $cur ".vct-project"
+        if (Test-Path -LiteralPath $marker -PathType Leaf) {
+            try {
+                $line = (Get-Content -LiteralPath $marker -TotalCount 1 -ErrorAction Stop)
+            } catch {
+                return $null
+            }
+            if ($null -ne $line) {
+                $name = ($line -replace '\s', '')
+                if ($name.Length -gt 0) { return $name }
+            }
+            return $null
+        }
+        $parent = Split-Path -Parent $cur
+        if ($parent -eq $cur) { break }
+        $cur = $parent
+    }
+    return $null
+}
+
+function Read-FileStripOneNewline {
+    param([string]$FilePath)
+    try {
+        $raw = Get-Content -Raw -LiteralPath $FilePath -ErrorAction Stop
+    } catch {
+        return $null
+    }
+    if ($null -eq $raw) { return "" }
+    if ($raw.EndsWith("`n")) {
+        $raw = $raw.Substring(0, $raw.Length - 1)
+    }
+    return $raw
+}
+
+function Get-FileStoreValue {
+    # Returns @{ Found = $true/$false; Value = ... }
+    param([string]$ProjectArg, [string]$Key)
+    $root = Get-SecretsRoot
+    $name = Get-FileProjectName -ArgValue $ProjectArg
+    if ($name) {
+        $f = Join-Path (Join-Path (Join-Path $root "projects") $name) $Key
+        if (Test-Path -LiteralPath $f -PathType Leaf) {
+            $v = Read-FileStripOneNewline -FilePath $f
+            if ($null -ne $v) { return @{ Found = $true; Value = $v } }
+        }
+    }
+    $f = Join-Path (Join-Path $root "shared") $Key
+    if (Test-Path -LiteralPath $f -PathType Leaf) {
+        $v = Read-FileStripOneNewline -FilePath $f
+        if ($null -ne $v) { return @{ Found = $true; Value = $v } }
+    }
+    return @{ Found = $false }
+}
+
+# ── Tier 3: the project's own .env (READ-ONLY, lowest priority) ─────────
+#
+# Parsing rule (must match vct_secrets_resolve.sh::dotenv_get and
+# agent_secrets.py::_parse_dotenv_value): line-oriented; accept
+# `KEY=VALUE` and `export KEY=VALUE`; strip one matching pair of
+# single/double quotes; NO variable expansion, NO command substitution;
+# first match wins. Never writes, never caches, never re-exports.
+function Get-DotenvValue {
+    # Returns @{ Found = $true/$false; Value = ... }
+    param([string]$Folder, [string]$Key)
+    $f = Join-Path $Folder ".env"
+    if (-not (Test-Path -LiteralPath $f -PathType Leaf)) {
+        return @{ Found = $false }
+    }
+    try {
+        $lines = Get-Content -LiteralPath $f -ErrorAction Stop
+    } catch {
+        return @{ Found = $false }
+    }
+    foreach ($line in @($lines)) {
+        $s = "$line".Trim()
+        if ($s.StartsWith("export ")) {
+            $s = $s.Substring(7).TrimStart()
+        }
+        if ($s.Length -eq 0 -or $s.StartsWith("#")) { continue }
+        $eq = $s.IndexOf("=")
+        if ($eq -lt 0) { continue }
+        $k = $s.Substring(0, $eq).TrimEnd()
+        if ($k -cne $Key) { continue }
+        $v = $s.Substring($eq + 1).Trim()
+        if ($v.Length -ge 2) {
+            $first = $v[0]
+            $last = $v[$v.Length - 1]
+            if (($first -eq $last) -and (($first -eq '"') -or ($first -eq "'"))) {
+                $v = $v.Substring(1, $v.Length - 2)
+            }
+        }
+        return @{ Found = $true; Value = $v }
+    }
+    return @{ Found = $false }
+}
+
+function Read-Key {
+    # Chain: hub (tier 1) -> file store (tier 2) -> project .env
+    # (tier 3). The final exit code on all-miss is TIER 1's code,
+    # preserving the historical contract (exit 3 = key_not_active only
+    # after tiers 2 and 3 also missed).
+    param([string]$ProjectArg, [string]$Key)
+    $tier1 = Read-KeyHub -ProjectArg $ProjectArg -Key $Key
+    if ($tier1.ExitCode -eq 0) {
+        [Console]::Out.Write($tier1.Value)
+        return 0
+    }
+    # Tier 2: file store.
+    $tier2 = Get-FileStoreValue -ProjectArg $ProjectArg -Key $Key
+    if ($tier2.Found) {
+        [Console]::Out.Write($tier2.Value)
+        return 0
+    }
+    # Tier 3: project .env — only when the first arg names a folder.
+    if (Test-LooksLikePath $ProjectArg) {
+        $envDir = $ProjectArg
+        if (Test-Path -LiteralPath $envDir -PathType Leaf) {
+            $envDir = Split-Path -Parent $envDir
+        }
+        $tier3 = Get-DotenvValue -Folder $envDir -Key $Key
+        if ($tier3.Found) {
+            [Console]::Out.Write($tier3.Value)
+            return 0
+        }
+    } else {
+        Write-Err "tier 3 (.env) skipped: first arg is a project id, not a folder — re-invoke with the project folder to consult its .env"
+    }
+    Write-Err "key $Key unresolved after hub (tier 1), file store (tier 2), and project .env (tier 3)"
+    return $tier1.ExitCode
 }
 
 # ── Main ────────────────────────────────────────────────────────────────

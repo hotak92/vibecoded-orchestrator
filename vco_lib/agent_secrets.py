@@ -16,26 +16,44 @@ secrets without shelling out to the ``vct`` CLI and fighting quoting /
         secrets={"github_pat": "GH_TOKEN"},          # key -> env var
     )
 
-Resolution strategy (mirrors the bash/ps1 template clients):
+ONE RESOLUTION CHAIN (v0.2.73 unification — MUST MATCH the other two
+implementations: ``templates/scripts/vct_secrets_resolve.sh`` and
+``templates/scripts/vct_secrets_resolve.ps1``; keep tier order,
+fall-through rules, and the tier-3 parsing rule identical across all
+three):
 
-1. **vct-hub first** — the launcher's keychain-backed resolver at
-   ``GET /api/v1/projects/{id}/env?key=NAME``. Hub discovery (port +
-   token) and the 401 retry-with-rediscovery ride on the same machinery
-   as :mod:`vco_lib.project_config` (``$VCT_HUB_PORT`` /
-   ``$VCT_HUB_TOKEN`` env → ``<vct_root>/hub.port`` + ``hub.token`` →
-   defaults). This is the canonical path for launcher-managed slots
-   (``github_pat``, ``openai_api_key``, module secrets).
+1. **vct-hub first (tier 1)** — the launcher's keychain-backed resolver
+   at ``GET /api/v1/projects/{id}/env?key=NAME``, per-(secret ×
+   requester) active-flag gated (the launcher's permission matrix).
+   Hub discovery (port + token) and the 401 retry-with-rediscovery ride
+   on the same machinery as :mod:`vco_lib.project_config`
+   (``$VCT_HUB_PORT`` / ``$VCT_HUB_TOKEN`` env → ``<vct_root>/hub.port``
+   + ``hub.token`` → defaults). Canonical path for launcher-managed
+   slots (``github_pat``, ``openai_api_key``, module secrets, and — as
+   of the v0.2.73 hub fix — every GUI-saved user secret).
 
-2. **File-store fallback** — when the hub is unreachable (no launcher
-   running) or the project isn't registered, fall back to the Phase-1
-   file store at ``$VCT_SECRETS_DIR`` (default ``~/.vct-secrets``):
-   ``projects/<NAME>/<key>`` then ``shared/<key>``. Same resolution
-   order as ``tools/vct-secrets/vct``. Disable with
-   ``allow_file_fallback=False`` when only the keychain truth is
-   acceptable.
+2. **File store (tier 2)** — when the hub is unreachable (no launcher
+   running), the project isn't registered, or the key isn't active,
+   fall back to the Phase-1 file store at ``$VCT_SECRETS_DIR`` (default
+   ``~/.vct-secrets``): ``projects/<NAME>/<key>`` then
+   ``shared/<key>``. Same resolution order as ``tools/vct-secrets/vct``.
+
+3. **Project ``.env`` (tier 3, READ-ONLY, lowest priority)** — the
+   requesting project's own root ``.env``. Parsing rule (identical ×3):
+   line-oriented; accept ``KEY=VALUE`` and ``export KEY=VALUE``; strip
+   one matching pair of single/double quotes; NO variable expansion, NO
+   command substitution; first match wins. The value is never logged,
+   cached to disk, or re-exported into any VCO-written file. The pause
+   model does not apply — the user pauses by editing their own file.
+   Which ``.env``: ``project=`` path → that folder (a file path
+   normalizes to its parent dir); ``project=None`` → cwd; a file-store
+   NAME (no separators) → cwd.
+
+Tiers 2 and 3 together are gated by ``allow_file_fallback`` — disable
+when only the keychain truth is acceptable.
 
 Secrets NEVER touch argv, logs, or exception messages — errors name the
-key, never the value.
+key and the tiers consulted, never the value.
 """
 
 from __future__ import annotations
@@ -77,9 +95,10 @@ class AccessDenied(ResolverError):
     (live-verified 2026-06-11), so :func:`get` still consults the file
     store on this error — the launcher gate governs keychain-managed
     slots, not the independent ``~/.vct-secrets`` file store. This
-    exception surfaces only when the file store ALSO has no copy (or
-    fallback is disabled). Fix in the launcher's SecretsPanel, or
-    ``vct set``.
+    exception surfaces only when the file store AND the project
+    ``.env`` (tier 3) ALSO have no copy (or fallback is disabled). Fix
+    in the launcher's SecretsPanel, ``vct set``, or the project's own
+    ``.env``.
     """
 
 
@@ -136,6 +155,69 @@ def _file_store_get(key: str, project: Optional[str]) -> Optional[str]:
                 continue
             return raw[:-1] if raw.endswith("\n") else raw
     return None
+
+
+# ─── Tier 3: the project's own .env (read-only) ─────────────────────────
+
+
+def _parse_dotenv_value(text: str, key: str) -> Optional[str]:
+    """Extract ``key`` from ``.env``-style ``text``; None when absent.
+
+    Parsing rule (must match ``vct_secrets_resolve.sh::dotenv_get`` and
+    ``vct_secrets_resolve.ps1::Get-DotenvValue``): line-oriented; accept
+    ``KEY=VALUE`` and ``export KEY=VALUE``; strip one matching pair of
+    single/double quotes; NO variable expansion, NO command
+    substitution; first match wins. Never logs the value.
+    """
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("export "):
+            s = s[len("export "):].lstrip()
+        if not s or s.startswith("#"):
+            continue
+        if "=" not in s:
+            continue
+        k, _, v = s.partition("=")
+        if k.strip() != key:
+            continue
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+            v = v[1:-1]
+        return v
+    return None
+
+
+def _dotenv_dir(project: Optional[str]) -> Path:
+    """Which folder's ``.env`` tier 3 reads (must match the sh/ps1 rule).
+
+    ``project=`` path → that folder (file path → its parent, same
+    normalization as :func:`_detect_file_project_name`); ``None`` →
+    cwd; a file-store NAME (no separators) → cwd.
+    """
+    if project and "/" not in project and "\\" not in project:
+        return Path.cwd()
+    cur = Path(project).resolve() if project else Path.cwd()
+    if cur.is_file():
+        cur = cur.parent
+    return cur
+
+
+def _project_dotenv_get(key: str, project: Optional[str]) -> Optional[str]:
+    """Tier 3: read ``key`` from the project's own root ``.env``.
+
+    READ-ONLY and lowest priority. The value never leaves the
+    requesting process (no hub transport, no cross-project reads, no
+    re-export into any VCO-written file). Returns None on any miss or
+    I/O error (soft-fail).
+    """
+    env_path = _dotenv_dir(project) / ".env"
+    if not env_path.is_file():
+        return None
+    try:
+        text = env_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return _parse_dotenv_value(text, key)
 
 
 # ─── Hub path ───────────────────────────────────────────────────────────
@@ -202,21 +284,27 @@ def get(
     project: Optional[str] = None,
     allow_file_fallback: bool = True,
 ) -> str:
-    """Read a secret value. Hub (keychain) first, file store second.
+    """Read a secret value through the canonical three-tier chain.
+
+    Chain (must match ``vct_secrets_resolve.sh`` / ``.ps1``): hub
+    (keychain, tier 1) → file store (tier 2) → the project's own
+    ``.env`` (tier 3, read-only, lowest priority).
 
     Args:
         key: secret key name (e.g. ``"github_pat"``).
         project: project id, registered path, or file-store project
             name. ``None`` → current working directory (hub by-path
-            lookup) / shared scope (file store).
+            lookup / tier-3 ``.env`` folder) / shared scope (file
+            store).
         allow_file_fallback: when False, only the hub answer counts —
-            a hub miss raises instead of consulting ``~/.vct-secrets``.
+            a hub miss raises instead of consulting ``~/.vct-secrets``
+            or the project ``.env`` (tiers 2 AND 3 are both gated).
 
     Raises:
-        SecretNotFound: key resolves nowhere.
+        SecretNotFound: key resolves nowhere (all tiers consulted).
         AccessDenied: the hub has no active binding for the key
-            (paused / undeclared — the hub doesn't distinguish) AND the
-            file store has no copy either (or fallback is disabled).
+            (paused / undeclared — the hub doesn't distinguish) AND
+            tiers 2 + 3 have no copy either (or fallback is disabled).
         HubUnreachable: hub down AND fallback disabled.
         ProjectNotFound: project unknown AND fallback disabled.
     """
@@ -240,15 +328,23 @@ def get(
         value = _file_store_get(key, project)
         if value is not None:
             return value
+        # Tier 3: the project's own .env — read-only, lowest priority.
+        # `.env` last means a user migrating a key into the GUI gets the
+        # managed copy immediately without deleting their .env line.
+        value = _project_dotenv_get(key, project)
+        if value is not None:
+            return value
 
     if isinstance(hub_error, AccessDenied):
         raise hub_error
     if isinstance(hub_error, SecretNotFound) or allow_file_fallback:
         raise SecretNotFound(
-            f"secret {key!r} not found (hub: {hub_error}; file store: "
-            f"{_secrets_root()} checked={allow_file_fallback}). "
-            f"Fix: launcher SecretsPanel, or "
-            f"`vct set --project shared --key {key}`"
+            f"secret {key!r} not found (tier 1 hub: {hub_error}; tier 2 "
+            f"file store: {_secrets_root()}; tier 3 project .env: "
+            f"{_dotenv_dir(project) / '.env'}; tiers 2+3 "
+            f"checked={allow_file_fallback}). Fix: launcher SecretsPanel, "
+            f"`vct set --project shared --key {key}`, or add the key to "
+            f"the project's .env"
         ) from hub_error
     raise hub_error
 

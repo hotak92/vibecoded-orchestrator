@@ -189,6 +189,14 @@ mkdir -p "$VCT_STATE_DIR"
 HUB_TOKEN_CANARY="canary-bearer-tok-1234567890abcdef1234567890abcdef"
 export VCT_HUB_TOKEN="$HUB_TOKEN_CANARY"
 
+# ── File-store isolation (v0.2.73 chain) ────────────────────────────────
+# The resolver now falls through hub → file store → project .env. Point
+# the file store at an EMPTY scratch dir so (a) the pre-chain exit-code
+# tests below keep their tier-1 codes (nothing to fall through to), and
+# (b) no test can ever read the developer's real ~/.vct-secrets.
+export VCT_SECRETS_DIR="$scratch/secrets-store"
+mkdir -p "$VCT_SECRETS_DIR/shared" "$VCT_SECRETS_DIR/projects"
+
 # ── Test 1: hub unreachable → exit 1 ────────────────────────────────────
 # Use a port we know nothing is listening on.
 no_hub_port=1
@@ -392,6 +400,111 @@ assert_eq "$got_auth" "Bearer $file_token" \
 # state.
 rm -f "$scratch/responses/_require_token"
 rm -f "$scratch/state-dir/hub.token"
+
+# ════════════════════════════════════════════════════════════════════════
+# v0.2.73 resolution chain: hub → file store → project .env
+# Synthetic fixture shared with the pytest + ps1 siblings
+# (tests/test_agent_secrets.py, tests/test_vct_secrets_resolve_ps1.py) —
+# same key names, same values, same parse cases.
+# ════════════════════════════════════════════════════════════════════════
+
+# ── Test 11: tier 2 — file store resolves when hub unreachable ──────────
+echo -n "synthetic-file-store-value" >"$VCT_SECRETS_DIR/shared/EXAMPLE_API_TOKEN"
+set +e
+out=$(VCT_HUB_PORT="$no_hub_port" "$RESOLVER" some-project-id EXAMPLE_API_TOKEN 2>/dev/null)
+rc=$?
+set -e
+assert_eq "$rc" "0" "test_chain_tier2_file_store_when_hub_unreachable/exit_code"
+assert_eq "$out" "synthetic-file-store-value" "test_chain_tier2_file_store_when_hub_unreachable/value"
+
+# ── Test 12: tier 2 — key_not_active (hub up) still falls to store ──────
+# Fake hub says PAUSED_KEY is key_not_active; the file store has an
+# independent copy (the launcher gate governs keychain slots only).
+echo -n "synthetic-paused-but-in-store" >"$VCT_SECRETS_DIR/shared/PAUSED_KEY"
+set +e
+out=$(VCT_HUB_PORT="$HUB_PORT" "$RESOLVER" p1 PAUSED_KEY 2>/dev/null)
+rc=$?
+set -e
+assert_eq "$rc" "0" "test_chain_key_not_active_falls_to_file_store/exit_code"
+assert_eq "$out" "synthetic-paused-but-in-store" "test_chain_key_not_active_falls_to_file_store/value"
+rm -f "$VCT_SECRETS_DIR/shared/PAUSED_KEY"
+
+# ── Test 13: tier 3 — project .env resolves when tiers 1+2 miss ────────
+proj_dir="$scratch/proj-with-dotenv"
+mkdir -p "$proj_dir"
+cat >"$proj_dir/.env" <<'DOTENV'
+# comment line — skipped
+export EXPORTED_KEY=plain-exported
+QUOTED_KEY="double quoted value"
+SINGLE_KEY='single quoted value'
+FIRST_MATCH=first-wins
+FIRST_MATCH=second-loses
+NO_EXPANSION=$HOME/literal
+MISMATCHED='half"
+DOTENV
+
+for case_kv in \
+    "EXPORTED_KEY:plain-exported" \
+    "QUOTED_KEY:double quoted value" \
+    "SINGLE_KEY:single quoted value" \
+    "FIRST_MATCH:first-wins" \
+    'NO_EXPANSION:$HOME/literal' \
+    "MISMATCHED:'half\""; do
+    ckey="${case_kv%%:*}"
+    cwant="${case_kv#*:}"
+    set +e
+    out=$(VCT_HUB_PORT="$no_hub_port" "$RESOLVER" "$proj_dir" "$ckey" 2>/dev/null)
+    rc=$?
+    set -e
+    assert_eq "$rc" "0" "test_chain_tier3_dotenv_parse/${ckey}/exit_code"
+    assert_eq "$out" "$cwant" "test_chain_tier3_dotenv_parse/${ckey}/value"
+done
+
+# ── Test 14: tier 3 skipped for a bare project id (no folder known) ────
+# The tier-1 exit code (1: hub unreachable) is preserved, and the
+# diagnostic explains why .env was not consulted.
+set +e
+stderr_out=$(VCT_HUB_PORT="$no_hub_port" "$RESOLVER" bare-project-id EXPORTED_KEY 2>&1 >/dev/null)
+rc=$?
+set -e
+assert_eq "$rc" "1" "test_chain_tier3_skipped_for_bare_id/exit_code"
+case "$stderr_out" in
+    *"tier 3 (.env) skipped"*)
+        assert_eq "yes" "yes" "test_chain_tier3_skipped_for_bare_id/diagnostic" ;;
+    *)
+        assert_eq "$stderr_out" "contains 'tier 3 (.env) skipped'" "test_chain_tier3_skipped_for_bare_id/diagnostic" ;;
+esac
+
+# ── Test 15: all-miss preserves tier-1 exit code (3 = key_not_active) ───
+# PAUSED_KEY was removed from the store above; the .env-less folder arg
+# means tier 3 misses too. Exit must be the historical 3 — only now it
+# means "missed everywhere".
+no_env_dir="$scratch/proj-no-dotenv"
+mkdir -p "$no_env_dir"
+# Register the folder→project mapping so tier 1 reaches the env call.
+qkey_no_env="$(echo "projects_by-path_path=${no_env_dir}" | tr '/' '_')"
+cat >"$scratch/responses/GET_${qkey_no_env}.json" <<JSON
+{"id": "p1", "folder_path": "${no_env_dir}"}
+JSON
+set +e
+VCT_HUB_PORT="$HUB_PORT" "$RESOLVER" "$no_env_dir" PAUSED_KEY 2>/dev/null
+rc=$?
+set -e
+assert_eq "$rc" "3" "test_chain_all_miss_preserves_tier1_exit_code"
+
+# ── Test 16: never-print-value — a miss must not leak OTHER values ─────
+# The .env + store contain synthetic values; asking for a MISSING key
+# must not echo any of them on stderr (errors name keys + tiers only).
+set +e
+stderr_out=$(VCT_HUB_PORT="$no_hub_port" "$RESOLVER" "$proj_dir" TOTALLY_MISSING_KEY 2>&1 >/dev/null)
+rc=$?
+set -e
+[[ $rc -ne 0 ]] || assert_eq "$rc" "nonzero" "test_chain_never_prints_values/miss_is_nonzero"
+leak="no"
+case "$stderr_out" in
+    *"synthetic-file-store-value"*|*"plain-exported"*|*"double quoted value"*|*"single quoted value"*) leak="yes" ;;
+esac
+assert_eq "$leak" "no" "test_chain_never_prints_values/no_value_in_stderr"
 
 # ── Summary ─────────────────────────────────────────────────────────────
 printf '\n%s\n' "── Summary: $PASS passed, $FAIL failed"

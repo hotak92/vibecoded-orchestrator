@@ -1,14 +1,35 @@
 #!/usr/bin/env bash
-# vct_secrets_resolve.sh — bridge between bundled wrappers/hooks and the
-# launcher's hub HTTP API. Reads a single secret value from
-# `GET /api/v1/projects/{id}/env?key=NAME` and prints it on stdout.
+# vct_secrets_resolve.sh — agent-facing secret resolver.
 #
-# This is the post-Fix-#3 (0.1.7) replacement for the old
-# `cat ~/.vct-secrets/<key>` pattern. The launcher's keychain is the
-# authoritative store; the hub adds the per-project active-flag gate
-# and (in the future) per-project access matrix. No file-side mirror,
-# no hard-coded allowlist — every secret active for the project flows
-# through this single path.
+# ONE RESOLUTION CHAIN (v0.2.73 unification — MUST MATCH the other two
+# implementations: `templates/scripts/vct_secrets_resolve.ps1` and
+# `vco_lib/agent_secrets.py::get`; keep tier order, fall-through rules,
+# and the tier-3 parsing rule identical across all three):
+#
+#   Tier 1  vct-hub  GET /api/v1/projects/{id}/env?key=NAME
+#           (OS-keychain values, per-(secret × requester) active-flag
+#           gated — the launcher's permission matrix).
+#   Tier 2  file store  $VCT_SECRETS_DIR (default ~/.vct-secrets):
+#           projects/<NAME>/<key>  →  shared/<key>.
+#   Tier 3  the project's own `.env` — READ-ONLY, lowest priority.
+#           Only consulted when the first arg is a FOLDER (a bare
+#           project id gives no folder to read; tier 3 is skipped and
+#           the miss diagnostic says so).
+#
+# Fall-through: tier 1 → 2 on hub unreachable / project not registered /
+# 401 / key_not_active (the hub cannot distinguish "paused" from "never
+# declared", and the file store is an independent store); tier 2 → 3 on
+# file absent/unreadable. All-miss → non-zero exit preserving the tier-1
+# exit-code contract below (exit 3 `key_not_active` is only returned
+# after tiers 2 and 3 also missed). Errors name the KEY and the tiers
+# consulted — NEVER the value.
+#
+# Tier-3 parsing rule (identical ×3): line-oriented; accept `KEY=VALUE`
+# and `export KEY=VALUE`; strip one matching pair of single/double
+# quotes; NO variable expansion, NO command substitution; first match
+# wins. The value is never logged, cached to disk, or re-exported into
+# any VCO-written file. The pause model does not apply to tier 3 — the
+# user pauses by editing their own file.
 #
 # Usage:
 #   vct_secrets_resolve.sh <project_id_or_folder> <secret_key>
@@ -16,6 +37,8 @@
 #       Exit codes: 0=ok, 1=hub unreachable, 2=project not registered,
 #                   3=key not active for this project, 4=key not found
 #                   in the hub's response (treated like 3 for callers).
+#                   Non-zero codes mean the key ALSO missed the file
+#                   store and the project `.env`.
 #
 #   vct_secrets_resolve.sh resolve-project <folder>
 #       Print the project_id (UUID) registered for <folder>. Same exit
@@ -306,16 +329,24 @@ url_encode() {
     printf '%s' "$out"
 }
 
-# ── Main subcommand: read a single key ──────────────────────────────────
-read_key() {
-    # $1 = project_id_or_folder, $2 = key
+# ── Tier 1: hub (keychain) ──────────────────────────────────────────────
+read_key_hub() {
+    # $1 = project_id_or_folder, $2 = key. Prints the value on success.
+    # Return codes preserve the historical contract (1=hub unreachable,
+    # 2=project not registered, 3=key_not_active, 4=key missing from a
+    # 200 body) — the chain caller remembers this code and reuses it as
+    # the final exit when tiers 2 and 3 also miss.
     local pid_arg="$1" key="$2"
-    local pid
-    if ! pid=$(resolve_project_id "$pid_arg"); then
-        # resolve_project_id already mapped the exit code (1 or 2).
-        return $?
+    local pid rc
+    set +e
+    pid=$(resolve_project_id "$pid_arg")
+    rc=$?
+    set -e
+    if [[ $rc -ne 0 ]]; then
+        # resolve_project_id already printed the diagnostic (1 or 2).
+        return $rc
     fi
-    local result status body rc
+    local result status body
     set +e
     result=$(hub_get "projects/$(url_encode "$pid")/env?key=$(url_encode "$key")")
     rc=$?
@@ -356,7 +387,7 @@ read_key() {
                     return 2
                     ;;
                 key_not_active)
-                    err "key $key not active for project $pid (paused, or not declared by any installed module)"
+                    err "key $key not active for project $pid (paused for this project, or not declared by any installed module)"
                     return 3
                     ;;
                 *)
@@ -376,6 +407,163 @@ read_key() {
     esac
 }
 
+# ── Tier 2: file store ($VCT_SECRETS_DIR, default ~/.vct-secrets) ───────
+#
+# Mirrors `vco_lib/agent_secrets.py::_file_store_get` (must match):
+# projects/<NAME>/<key> first (when a project NAME applies), then
+# shared/<key>. Strips exactly ONE trailing newline (vct-exec
+# semantics). A simple first arg (no path separators) is used verbatim
+# as the file-store project name; a path walks up for a `.vct-project`
+# marker file.
+secrets_root() {
+    printf '%s' "${VCT_SECRETS_DIR:-$HOME/.vct-secrets}"
+}
+
+detect_file_project_name() {
+    # $1 = the original project arg (path or simple name). Prints the
+    # file-store project NAME, or nothing when none applies.
+    local arg="$1"
+    if [[ -n "$arg" ]] && ! looks_like_path "$arg"; then
+        printf '%s' "$arg"
+        return 0
+    fi
+    local cur
+    cur=$(cd "$(dirname "$arg" 2>/dev/null || printf '.')" 2>/dev/null && pwd) || return 0
+    if [[ -d "$arg" ]]; then
+        cur=$(cd "$arg" && pwd) || return 0
+    fi
+    while [[ -n "$cur" && "$cur" != "/" ]]; do
+        if [[ -f "$cur/.vct-project" ]]; then
+            local name
+            name=$(head -n 1 "$cur/.vct-project" 2>/dev/null | tr -d '[:space:]')
+            [[ -n "$name" ]] && printf '%s' "$name"
+            return 0
+        fi
+        cur=$(dirname "$cur")
+    done
+    return 0
+}
+
+read_file_strip_one_newline() {
+    # $1 = file. Prints contents with exactly ONE trailing newline
+    # stripped (command substitution would strip ALL — we preserve any
+    # additional ones to match the Python helper byte-for-byte).
+    local f="$1" raw
+    raw=$(cat "$f" 2>/dev/null; printf x) || return 1
+    raw="${raw%x}"
+    raw="${raw%$'\n'}"
+    printf '%s' "$raw"
+}
+
+file_store_get() {
+    # $1 = project arg, $2 = key. Prints the value; return 1 on miss.
+    local proj_arg="$1" key="$2"
+    local root name f
+    root=$(secrets_root)
+    name=$(detect_file_project_name "$proj_arg")
+    if [[ -n "$name" && -f "$root/projects/$name/$key" ]]; then
+        read_file_strip_one_newline "$root/projects/$name/$key"
+        return 0
+    fi
+    f="$root/shared/$key"
+    if [[ -f "$f" ]]; then
+        read_file_strip_one_newline "$f"
+        return 0
+    fi
+    return 1
+}
+
+# ── Tier 3: the project's own .env (READ-ONLY, lowest priority) ─────────
+#
+# Parsing rule (must match vct_secrets_resolve.ps1 and
+# agent_secrets.py::_parse_dotenv_value): line-oriented; accept
+# `KEY=VALUE` and `export KEY=VALUE`; strip one matching pair of
+# single/double quotes; NO variable expansion, NO command substitution;
+# first match wins. Never writes, never caches, never re-exports.
+dotenv_get() {
+    # $1 = project folder, $2 = key. Prints the value; return 1 on miss.
+    local folder="$1" key="$2"
+    local f="$folder/.env"
+    [[ -f "$f" ]] || return 1
+    local line s k v
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # ltrim
+        s="${line#"${line%%[![:space:]]*}"}"
+        case "$s" in
+            "export "*)
+                s="${s#export }"
+                s="${s#"${s%%[![:space:]]*}"}"
+                ;;
+        esac
+        [[ -z "$s" || "$s" == \#* ]] && continue
+        [[ "$s" == *=* ]] || continue
+        k="${s%%=*}"
+        k="${k%"${k##*[![:space:]]}"}"
+        [[ "$k" == "$key" ]] || continue
+        v="${s#*=}"
+        # trim surrounding whitespace (also strips a CR from CRLF lines)
+        v="${v#"${v%%[![:space:]]*}"}"
+        v="${v%"${v##*[![:space:]]}"}"
+        # strip ONE matching pair of quotes
+        if [[ ${#v} -ge 2 ]]; then
+            local first="${v:0:1}" last="${v: -1}"
+            if [[ "$first" == "$last" && ( "$first" == '"' || "$first" == "'" ) ]]; then
+                v="${v:1:${#v}-2}"
+            fi
+        fi
+        printf '%s' "$v"
+        return 0
+    done < "$f"
+    return 1
+}
+
+# ── Main subcommand: read a single key through the full chain ───────────
+read_key() {
+    # $1 = project_id_or_folder, $2 = key.
+    # Chain: hub (tier 1) → file store (tier 2) → project .env (tier 3).
+    # The final exit code on all-miss is TIER 1's code, preserving the
+    # historical contract (exit 3 = key_not_active only after tiers 2
+    # and 3 also missed).
+    local pid_arg="$1" key="$2"
+    local val tier1_rc
+    set +e
+    val=$(read_key_hub "$pid_arg" "$key")
+    tier1_rc=$?
+    set -e
+    if [[ $tier1_rc -eq 0 ]]; then
+        printf '%s' "$val"
+        return 0
+    fi
+    # Tier 2: file store.
+    set +e
+    val=$(file_store_get "$pid_arg" "$key")
+    local rc2=$?
+    set -e
+    if [[ $rc2 -eq 0 ]]; then
+        printf '%s' "$val"
+        return 0
+    fi
+    # Tier 3: project .env — only when the first arg names a folder (a
+    # bare project id gives no folder to read; if the hub is up the key
+    # already had its tier-1 chance).
+    if looks_like_path "$pid_arg"; then
+        local env_dir="$pid_arg"
+        [[ -f "$env_dir" ]] && env_dir=$(dirname "$env_dir")
+        set +e
+        val=$(dotenv_get "$env_dir" "$key")
+        local rc3=$?
+        set -e
+        if [[ $rc3 -eq 0 ]]; then
+            printf '%s' "$val"
+            return 0
+        fi
+    else
+        err "tier 3 (.env) skipped: first arg is a project id, not a folder — re-invoke with the project folder to consult its .env"
+    fi
+    err "key $key unresolved after hub (tier 1), file store (tier 2), and project .env (tier 3)"
+    return $tier1_rc
+}
+
 # ── Entry point ─────────────────────────────────────────────────────────
 main() {
     if [[ $# -lt 2 ]]; then
@@ -384,7 +572,10 @@ Usage:
   $0 <project_id_or_folder> <secret_key>
   $0 resolve-project <folder>
 
-Exit codes:
+Resolution chain: hub (keychain) -> file store (~/.vct-secrets) ->
+project .env (read-only; folder arg only).
+
+Exit codes (non-zero = key ALSO missed the file store + project .env):
   0  success
   1  hub unreachable
   2  project not registered

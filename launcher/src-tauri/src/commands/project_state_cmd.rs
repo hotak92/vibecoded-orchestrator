@@ -714,7 +714,12 @@ pub async fn set_project_mcp_permission(
     Ok(())
 }
 
+/// v0.2.73 footgun fix (mirrors the hub's `SetSecretBody`): `is_set` is
+/// `Option<bool>` — omitted preserves the stored flag instead of
+/// resetting it to `false`; `deny_unknown_fields` rejects guessed fields
+/// instead of silently swallowing them.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetSecretRefReq {
     pub secret_key: String,
     pub resolution: String,
@@ -725,8 +730,7 @@ pub struct SetSecretRefReq {
     pub required_for: Vec<String>,
     #[serde(default)]
     pub description: String,
-    #[serde(default)]
-    pub is_set: bool,
+    pub is_set: Option<bool>,
 }
 
 #[command]
@@ -1288,6 +1292,91 @@ mod tests {
         // folder_path must be unique per project (UNIQUE constraint).
         db.insert_project(id, name, &format!("/tmp/mcp-perm-test/{}", id), ProjectHost::Base, id)
             .unwrap();
+    }
+
+    // ─── v0.2.73 is_set footgun (Tauri sibling of the hub fix) ─────────
+
+    /// serde contract for the invoke-arg struct: omitted `is_set` → None
+    /// (preserve), explicit values pass through, unknown fields error.
+    /// The GUI bridge (`secrets.ts` `set_project_secret_ref` invoke)
+    /// sends exactly the declared fields with `is_set: true` — pinned by
+    /// the Some(true) case.
+    #[test]
+    fn set_secret_ref_req_is_set_option_and_deny_unknown() {
+        let req: SetSecretRefReq = serde_json::from_value(serde_json::json!({
+            "secret_key": "EXAMPLE_API_TOKEN",
+            "resolution": "keychain-per-project"
+        }))
+        .expect("minimal body must deserialize");
+        assert_eq!(req.is_set, None, "omitted is_set must be None (preserve)");
+
+        let req: SetSecretRefReq = serde_json::from_value(serde_json::json!({
+            "secret_key": "EXAMPLE_API_TOKEN",
+            "resolution": "keychain-per-project",
+            "file_path": null,
+            "env_name": null,
+            "source_module": "user",
+            "required_for": [],
+            "description": "",
+            "is_set": true
+        }))
+        .expect("full GUI-bridge shape must deserialize");
+        assert_eq!(req.is_set, Some(true));
+
+        let res = serde_json::from_value::<SetSecretRefReq>(serde_json::json!({
+            "secret_key": "EXAMPLE_API_TOKEN",
+            "resolution": "keychain-per-project",
+            "active": true
+        }));
+        assert!(res.is_err(), "unknown field `active` must be rejected");
+    }
+
+    /// DB-level preserve semantics through the same core fn the command
+    /// funnels into: redeclare with None keeps 1, explicit false clears.
+    #[test]
+    fn secret_ref_redeclare_preserves_is_set_via_core() {
+        let db = make_db();
+        seed_project(&db, "p-sr-1", "Secret Ref Preserve");
+        db.set_project_secret_ref(
+            "p-sr-1",
+            "EXAMPLE_API_TOKEN",
+            "keychain-per-project",
+            None,
+            None,
+            Some("user"),
+            &[],
+            "",
+            Some(true),
+        )
+        .unwrap();
+        let row = db
+            .set_project_secret_ref(
+                "p-sr-1",
+                "EXAMPLE_API_TOKEN",
+                "keychain-per-project",
+                None,
+                None,
+                Some("user"),
+                &[],
+                "",
+                None,
+            )
+            .unwrap();
+        assert!(row.is_set, "redeclare with None must preserve the stored flag");
+        let row = db
+            .set_project_secret_ref(
+                "p-sr-1",
+                "EXAMPLE_API_TOKEN",
+                "keychain-per-project",
+                None,
+                None,
+                Some("user"),
+                &[],
+                "",
+                Some(false),
+            )
+            .unwrap();
+        assert!(!row.is_set, "explicit Some(false) must clear");
     }
 
     // ─── F5 (v0.2.72): KG-binding writes re-project env ────────────────

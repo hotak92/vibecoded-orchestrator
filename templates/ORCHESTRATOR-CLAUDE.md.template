@@ -796,11 +796,15 @@ VCO ships a secrets primitive so agents never scrape the environment for tokens.
 
 1. **Never grep `env` for secrets.** `env | grep TOKEN` (and similar) is blocked by the `bash_security.py` PreToolUse hook. The block message includes the remediation below.
 
-2. **Two stores, one resolution habit**:
-   - **Launcher keychain** (canonical for `github_pat`, `openai_api_key`, module secrets): values live in the OS keychain, written via the launcher GUI (OnboardingWizard step 4, or Preferences → Special Secrets → SecretsPanel). Resolve through vct-hub: `{{ORCHESTRATOR_ROOT}}/templates/scripts/vct_secrets_resolve.sh <project-path> <key>` (`.ps1` sibling on Windows), or from Python: `from vco_lib.agent_secrets import get; get("github_pat")` — hub-first with automatic file-store fallback.
-   - **File store** (`~/.vct-secrets/{shared,projects/<NAME>}/<key>`, chmod-600 files): launcher-independent, managed by the `vct` CLI at `{{ORCHESTRATOR_ROOT}}/tools/vct-secrets/vct`.
+2. **If a task needs a credential, assume one may already be provisioned — resolve it, don't ask the user to paste it.** The user adds secrets (API tokens, license keys, per-project credentials like a Jira or database token) through the launcher GUI (Projects → *project* → Secrets, or Preferences → Special Secrets → SecretsPanel, or the OnboardingWizard). Your job is to READ them through the sanctioned resolver, by the exact key name the user gave the secret.
 
-3. **Discover / probe / read (file store)**:
+3. **Two stores, one resolution habit**:
+   - **Launcher keychain** (canonical — holds `github_pat`, `openai_api_key`, module secrets, AND any per-project or shared secret the user adds in the GUI): values live in the OS keychain. Resolve through vct-hub: `{{ORCHESTRATOR_ROOT}}/templates/scripts/vct_secrets_resolve.sh <project-path> <key>` (`.ps1` sibling on Windows), or from Python: `from vco_lib.agent_secrets import get; get("<KEY>")` — hub-first with automatic file-store fallback. Use the exact key name from the SecretsPanel (e.g. a per-project `MYPROJECT_JIRA_TOKEN`).
+   - **File store** (`~/.vct-secrets/{shared,projects/<NAME>}/<key>`, chmod-600 files): launcher-independent, managed by the `vct` CLI at `{{ORCHESTRATOR_ROOT}}/tools/vct-secrets/vct`. `agent_secrets.get` falls back here automatically when the hub can't serve a key.
+
+   To see which keys exist for this project before resolving: `vct list --project <NAME>` (names only) and `vct can-read --project <NAME> --key <KEY>` (exit-0 probe). If a key you expect isn't listed or won't resolve, tell the user which key name you looked for — don't silently give up or ask them to paste the value inline.
+
+4. **Discover / probe / read (file store)**:
    ```bash
    vct list                          # key names only — never values
    vct can-read --key KEY            # exit 0/1 probe, prints nothing
@@ -809,19 +813,19 @@ VCO ships a secrets primitive so agents never scrape the environment for tokens.
    ```
    `get`/`exec`/`can-read`/`resolve` default to the shared scope when `--project` is omitted; per-project keys override shared.
 
-4. **Prefer injection over printing**:
+5. **Prefer injection over printing**:
    ```bash
    vct exec --secret KEY=ENV_VAR -- cmd args     # value lands ONLY in the child's env
    ```
    Python equivalent: `vco_lib.agent_secrets.exec_with_secrets([...], secrets={"KEY": "ENV_VAR"})`. Secrets never touch argv or shell history.
 
-5. **GitHub tokens are not interchangeable.** Classic `ghp_*` (40 chars) serves `git push` + `gh`; fine-grained `github_pat_*` (~93 chars) serves scoped `gh` REST calls; App-installation `ghs_*` tokens do NOT work with `gh` (`HTTP 401: Bad credentials`). Per-key purposes for THIS machine: `~/.vct-secrets/shared/_README.md`. `vct doctor` shape-checks `github_pat*` keys. Strip whitespace before use if you read a token by hand: `printf %s "$T" | tr -d '\r\n '`.
+6. **GitHub tokens are not interchangeable.** Classic `ghp_*` (40 chars) serves `git push` + `gh`; fine-grained `github_pat_*` (~93 chars) serves scoped `gh` REST calls; App-installation `ghs_*` tokens do NOT work with `gh` (`HTTP 401: Bad credentials`). Per-key purposes for THIS machine: `~/.vct-secrets/shared/_README.md`. `vct doctor` shape-checks `github_pat*` keys. Strip whitespace before use if you read a token by hand: `printf %s "$T" | tr -d '\r\n '`.
 
-6. **`git push` setup**: register the helper once — `git config --global credential.https://github.com.helper "!$HOME/.vct-secrets/git-credential-vct"` (after copying it from `tools/vct-secrets/`; the launcher does not register it for you). For acquiring a PAT, point the user at the launcher GUI flow (OnboardingWizard inlines the github.com walkthrough) rather than improvising file drops.
+7. **`git push` setup**: register the helper once — `git config --global credential.https://github.com.helper "!$HOME/.vct-secrets/git-credential-vct"` (after copying it from `tools/vct-secrets/`; the launcher does not register it for you). For acquiring a PAT, point the user at the launcher GUI flow (OnboardingWizard inlines the github.com walkthrough) rather than improvising file drops.
 
-7. **Access gating**: vct-hub serves a key only when it's active for the project (`key_not_active` 404 otherwise — paused in SecretsPanel, or not declared by any installed module/shared slot). Separately, KG/code-graph collection writes are gated by the per-project access matrix (`vct_access_check.sh <project_id> <collection>` → `read|write|none`, fail-open to `write` with a WARNING when the hub is down). Secret reads and collection access are different gates — don't conflate them.
+8. **Retrieval honors the launcher's permission matrix.** A secret resolves for THIS project only when the launcher marks it active for this project as the requester: the per-`(scope, key, requester)` active-flag can pause a shared/global secret for one specific project, and cross-project reads require an explicit grant in the SecretsPanel. So `key_not_active` (404 from the hub / exit 3 from `vct_secrets_resolve.sh`) means the key is genuinely not authorized here (paused for this project, not granted, or not present) — respect it; do not try to route around the gate. (KG/code-graph collection writes have a SEPARATE matrix via `vct_access_check.sh <project_id> <collection>` → `read|write|none`, fail-open to `write` with a WARNING when the hub is down. Secret reads and collection access are different gates — don't conflate them.)
 
-8. **Machine-readable discovery**: `python install.py --bootstrap --json` → `.secrets` block (CLI path, store dir, shared key NAMES, helper-registration state, hub endpoint). Full reference: [`docs/VCT_SECRETS_PRIMITIVE.md`](docs/VCT_SECRETS_PRIMITIVE.md).
+9. **Machine-readable discovery**: `python install.py --bootstrap --json` → `.secrets` block (CLI path, store dir, shared key NAMES, helper-registration state, hub endpoint). Full reference: [`docs/VCT_SECRETS_PRIMITIVE.md`](docs/VCT_SECRETS_PRIMITIVE.md).
 
 ---
 
