@@ -46,8 +46,10 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shlex
 import subprocess
 import sys
+import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -295,6 +297,28 @@ def code_embed_service_healthy(
         return False
 
 
+def _resync_log_path(project_name: str) -> Optional[Path]:
+    """R-5 (RT-2): per-spawn log file for the detached resync children.
+
+    ``<vct_root_dir>/logs/resync-<project>-<ts>.log``. Pre-fix the children's
+    stdout/stderr went to DEVNULL — a walk that died at 40% left NO record
+    anywhere ("soft-fail into a void"). Returns ``None`` when the path cannot
+    be prepared (caller then degrades to DEVNULL rather than blocking the
+    spawn — but logs that degradation).
+    """
+    try:
+        from vco_lib.paths import vct_root_dir
+
+        logs_dir = vct_root_dir() / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", project_name or "project")
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        return logs_dir / f"resync-{safe}-{ts}.log"
+    except Exception as exc:  # noqa: BLE001 — logging must not block the spawn
+        logger.warning("codegraph resync: cannot prepare log path: %s", exc)
+        return None
+
+
 def _resolve_analyzer(repo_root: Path) -> Optional[Path]:
     """Locate ``analyze_code_graph.py``. Prefers the shipped project copy under
     ``.claude/scripts/`` (what user projects run), falls back to the source
@@ -391,8 +415,11 @@ def spawn_background_resync(
             status="skipped", message="no python interpreter resolved"
         )
 
-    resume_cmd = (
-        f"{py} {analyzer} {repo_root} --project {project_name}"
+    # R-5 rider (A-1): shlex-quote every part — the command lands verbatim in
+    # UPDATE_DEFERRED.md and must survive paths containing spaces.
+    resume_cmd = " ".join(
+        shlex.quote(part)
+        for part in (str(py), str(analyzer), str(repo_root), "--project", project_name)
     )
 
     if check_service and not code_embed_service_healthy(code_embed_url):
@@ -413,14 +440,32 @@ def spawn_background_resync(
     # wired into the argv and full-walk resync has no use for it.)
     argv = [py, str(analyzer), str(repo_root), "--project", project_name]
 
-    # Detached background spawn. Redirect stdout/stderr to DEVNULL so the
-    # child outlives the parent and doesn't hold the parent's pipes open.
+    # Detached background spawn. stdout/stderr go to a per-spawn log file
+    # under <vct_root_dir>/logs/ (R-5 / RT-2 — pre-fix they went to DEVNULL,
+    # so a walk that died mid-run left no record anywhere). The children
+    # inherit the fd; the parent closes its handle right after spawning so
+    # nothing keeps the parent's pipes open. Log-file preparation failure
+    # degrades to DEVNULL (spawn must never block on logging).
     # start_new_session detaches the process group (POSIX); on Windows the
     # default is fine (no controlling terminal to inherit).
+    log_path = _resync_log_path(project_name)
+    log_handle = None
+    if log_path is not None:
+        try:
+            log_handle = open(log_path, "ab")
+            log_handle.write(
+                f"# codegraph resync for {project_name} — spawned "
+                f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n".encode()
+            )
+            log_handle.flush()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("codegraph resync: cannot open log file: %s", exc)
+            log_handle = None
+    child_out = log_handle if log_handle is not None else subprocess.DEVNULL
     popen_kwargs = {
         "cwd": str(repo_root),
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
+        "stdout": child_out,
+        "stderr": child_out,
         "stdin": subprocess.DEVNULL,
     }
     if os.name == "posix":
@@ -453,10 +498,20 @@ def spawn_background_resync(
             message=f"background analyze spawn failed: {exc}",
             deferral=deferral,
         )
+    finally:
+        # The children inherited the fd; the parent's handle is done.
+        if log_handle is not None:
+            try:
+                log_handle.close()
+            except Exception:  # noqa: BLE001
+                pass
 
+    log_note = f" (log: {log_path})" if log_handle is not None else ""
     return ResyncTriggerResult(
         status="launched",
-        message=f"background code-graph resync launched for {project_name}",
+        message=(
+            f"background code-graph resync launched for {project_name}{log_note}"
+        ),
         pid=proc.pid,
     )
 
