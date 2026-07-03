@@ -37,8 +37,17 @@ Design invariants (project rules)
   ``deferred`` status and hand the caller a :class:`DeferralEntry` so the user
   is told to re-run once the service is up. The update itself still succeeds.
 * **Resumable + idempotent.** Because the gate is per-object, an interrupted
-  resync simply continues on the next run; re-running after completion is a
-  cheap no-op (every row already at the current revision → all skip).
+  resync continues on the next run; re-running after completion is a cheap
+  no-op (every row already at the current revision → all skip). v0.2.73:
+  "the next run" is now guaranteed to exist — the R-6 owed-probe re-triggers
+  on every ``--update`` while stale rows remain, and the R-7 driver verifies
+  convergence post-walk, recording a ONE-TIME ``UPDATE_DEFERRED.md`` entry
+  when rows stay stale (pre-fix, a walk that died mid-run left no record
+  anywhere — runtime-proven on 2026-07-02).
+* **Surface, never silence.** Soft-fail always leaves a signal: children log
+  to ``<vct_root_dir>/logs/`` (R-5), unverified convergence defers (R-7),
+  and the pending ledger entry survives foreign writers' rebuilds (A-2) —
+  it clears ONLY on a positive zero-stale probe.
 """
 
 from __future__ import annotations
@@ -541,6 +550,255 @@ def build_resync_deferral(
     )
 
 
+def build_unconverged_deferral(
+    project_name: str,
+    counts: Optional[dict],
+    command_to_apply: str,
+) -> Optional[object]:
+    """R-7 (v0.2.73): the ONE-TIME "resync did not converge" ledger entry.
+
+    Written by the post-walk verifier when stale rows remain (or convergence
+    could not be verified). Per the deferred-over-autoconverge design ruling
+    this is a one-time surface, NOT a per-update reconciler loop: install.py
+    treats the condition id as FOREIGN (preserved verbatim, A-2) and resolves
+    it ONLY on a positive zero-stale probe (R-6). Fields are single-line —
+    the Markdown round-trip truncates multi-line field values (A-3).
+    """
+    if DeferralEntry is None:
+        return None
+    if counts is not None:
+        owed = ", ".join(f"{k}: {v}" for k, v in counts.items() if v) or "unknown"
+        detected = (
+            f"A background code-graph resync for project '{project_name}' "
+            f"finished but stale rows remain ({owed}). Retrieval still works "
+            "via the previously stored vectors; the stale rows are just not "
+            "re-embedded under the current revision yet."
+        )
+    else:
+        detected = (
+            f"A background code-graph resync for project '{project_name}' "
+            "finished but convergence could not be verified (the stale-row "
+            "probe was unavailable)."
+        )
+    return DeferralEntry(
+        condition_id=_CONDITION_ID,
+        title="Code-graph resync did not fully converge",
+        detected=detected,
+        why_deferred=(
+            "Background resyncs are best-effort and never force-applied. "
+            "Re-running the command below re-embeds only the remaining stale "
+            "rows (cheap, resumable). This entry is written once and clears "
+            "automatically when a later update's probe confirms zero stale rows."
+        ),
+        command_to_apply=command_to_apply,
+        severity="warning",
+        kg_node_refs=[],
+    )
+
+
+def _resolve_persisted_resync_deferral(repo_root: Path) -> None:
+    """Remove a persisted resync ledger entry (converged). Read-merge-write
+    like every non-install.py deferral writer; soft-fail with a log line."""
+    try:
+        from vco_lib.deferral_report import DeferralReport
+
+        folder = Path(repo_root)
+        report = DeferralReport.read(folder)
+        if report.has_condition(_CONDITION_ID):
+            report.mark_resolved(_CONDITION_ID)
+            report.write(folder)
+            logger.info("resync driver: resolved persisted resync deferral")
+    except Exception as exc:  # noqa: BLE001 — cleanup is best-effort
+        logger.warning("resync driver: could not resolve deferral: %s", exc)
+
+
+def _record_unconverged_deferral(
+    repo_root: Path,
+    project_name: str,
+    counts: Optional[dict],
+    resume_cmd: str,
+) -> None:
+    """Persist the one-time unconverged entry. Read-merge-write; soft-fail."""
+    try:
+        entry = build_unconverged_deferral(project_name, counts, resume_cmd)
+        if entry is None:
+            return
+        from vco_lib.deferral_report import DeferralReport
+
+        folder = Path(repo_root)
+        report = DeferralReport.read(folder)
+        report.add_entry(entry)
+        report.write(folder)
+        print(
+            "[resync-driver] one-time deferral recorded in "
+            f"{folder / '.claude' / 'context' / 'UPDATE_DEFERRED.md'}",
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — surfacing must not crash the child
+        logger.warning("resync driver: could not record deferral: %s", exc)
+
+
+def _prune_stale_is_safe(project_name: str) -> bool:
+    """True ONLY when launcher.db positively confirms the project has NO
+    codegraph extra paths configured.
+
+    WHY: the analyzer's ``--prune-stale`` deletes every project row NOT
+    visited by the current walk — and the resync walk covers only the repo
+    root, not ``project_codegraph_extra_paths`` roots. Pruning a project
+    that HAS extras would delete every extras row (expensive vectors,
+    user-configured). Conservative default: when the DB is unreadable, the
+    project row is ambiguous, or extras exist → NOT safe → the walk runs
+    without pruning (orphans then keep the owed-probe non-zero, which the
+    one-time deferral surfaces honestly).
+    """
+    try:
+        from vco_lib.launcher_db_reader import _open_db_readonly
+
+        conn = _open_db_readonly()
+        if conn is None:
+            return False
+        try:
+            target = _collection_prefix(project_name)
+            if not target:
+                return False
+            rows = conn.execute("SELECT id, name FROM projects").fetchall()
+            matches = [
+                r["id"] for r in rows
+                if _collection_prefix(r["name"] or "") == target
+            ]
+            if len(matches) != 1:
+                return False  # not found / ambiguous → not provably safe
+            (n,) = conn.execute(
+                "SELECT COUNT(*) FROM project_codegraph_extra_paths "
+                "WHERE project_id = ?",
+                (matches[0],),
+            ).fetchone()
+            return int(n) == 0
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 — cannot confirm → not safe
+        logger.info("codegraph resync: prune-safety probe unavailable: %s", exc)
+        return False
+
+
+def _register_spawn_with_hub(project_name: str, pid: int) -> None:
+    """R-4 (Python half): best-effort registration of the detached resync
+    driver in the launcher's ``code_graph_builds`` tracker via vct-hub, so
+    the GUI top progress shows the walk and the boot orphan-sweep can
+    death-detect it (pid-aliveness).
+
+    ASSUMED INTERFACE — the Rust half (hub endpoint + pid column + sweep
+    nuance) ships separately under R-4:
+
+        POST http://127.0.0.1:<port>/api/v1/projects/<project>/codegraph-builds
+        Authorization: Bearer <vct_root_dir>/hub.token
+        {"status": "running", "pid": <pid>, "source": "install_resync"}
+
+    Hub down / endpoint not shipped yet (404 on older hubs) / token missing
+    → soft no-op logged at debug. Registration is observability, never a
+    gate on the spawn.
+    """
+    try:
+        import json as _json
+        import urllib.parse
+
+        from vco_lib.paths import vct_root_dir
+
+        root = vct_root_dir()
+        port_raw = os.environ.get("VCT_HUB_PORT") or ""
+        if not port_raw:
+            try:
+                port_raw = (root / "hub.port").read_text(encoding="utf-8").strip()
+            except Exception:  # noqa: BLE001
+                port_raw = ""
+        port = int(port_raw) if port_raw else 7700
+        token = os.environ.get("VCT_HUB_TOKEN") or ""
+        if not token:
+            token = (root / "hub.token").read_text(encoding="utf-8").strip()
+        body = _json.dumps(
+            {"status": "running", "pid": int(pid), "source": "install_resync"}
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/v1/projects/"
+            f"{urllib.parse.quote(project_name, safe='')}/codegraph-builds",
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        resp = urllib.request.urlopen(req, timeout=3.0)
+        logger.info(
+            "codegraph resync: registered spawn with hub (HTTP %s)",
+            getattr(resp, "status", "?"),
+        )
+    except Exception as exc:  # noqa: BLE001 — observability, never a gate
+        logger.debug("codegraph resync: hub registration skipped: %s", exc)
+
+
+def run_resync_and_verify(
+    project_name: str,
+    repo_root: Path,
+    analyzer_path: Path,
+    *,
+    prune_stale: bool = False,
+) -> int:
+    """R-7 driver — runs INSIDE the detached child spawned by
+    :func:`spawn_background_resync`.
+
+    1. Runs the analyzer as a blocking subprocess (NO timeout — project
+       rule; the analyzer self-guards per embed request). ``--prune-stale``
+       is forwarded only when the spawn confirmed it safe (no extra paths).
+    2. Re-probes the stale-row counts post-walk.
+    3. Positive zero → resolves any persisted resync ledger entry.
+       Stale rows remain / probe unavailable → records the ONE-TIME
+       unconverged deferral (soft-fail WITH a signal — the RT-5 walk died
+       with none).
+
+    Always returns 0: the deferral (not the exit code) carries the signal;
+    nothing waits on this process.
+    """
+    argv = [
+        sys.executable, str(analyzer_path), str(repo_root),
+        "--project", project_name,
+    ]
+    if prune_stale:
+        argv.append("--prune-stale")
+    print(f"[resync-driver] running: {' '.join(argv)}", flush=True)
+    try:
+        rc = subprocess.run(argv, cwd=str(repo_root)).returncode  # noqa: S603
+    except Exception as exc:  # noqa: BLE001
+        print(f"[resync-driver] analyzer failed to start: {exc}", flush=True)
+        rc = -1
+
+    try:
+        counts = count_stale_rows(project_name, analyzer_path=Path(analyzer_path))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[resync-driver] post-walk probe raised: {exc}", flush=True)
+        counts = None
+
+    resume_cmd = " ".join(shlex.quote(p) for p in argv)
+    if counts is not None and sum(counts.values()) == 0:
+        # The probe is authoritative for the ledger's "owed" semantic —
+        # converged even when the analyzer exit code was non-zero (rc is
+        # still logged above for the record).
+        print(f"[resync-driver] converged: 0 stale rows (analyzer exit {rc})",
+              flush=True)
+        _resolve_persisted_resync_deferral(repo_root)
+        return 0
+    stale_desc = (
+        str(sum(counts.values())) if counts is not None else "unverifiable"
+    )
+    print(
+        f"[resync-driver] NOT converged (analyzer exit {rc}, "
+        f"stale rows: {stale_desc})",
+        flush=True,
+    )
+    _record_unconverged_deferral(repo_root, project_name, counts, resume_cmd)
+    return 0
+
+
 def spawn_background_resync(
     repo_root: Path,
     project_name: str,
@@ -629,12 +887,27 @@ def spawn_background_resync(
             deferral=deferral,
         )
 
-    # Build the analyze argv. Full walk (revision gate keeps it light). We do
-    # NOT pass --force-recreate (that would DROP + rebuild the schema, losing
-    # all rows) — the resync is purely additive re-embed of stale rows.
-    # (F11-i: the dead `canonical_source` parameter was removed — it was never
-    # wired into the argv and full-walk resync has no use for it.)
-    argv = [py, str(analyzer), str(repo_root), "--project", project_name]
+    # Build the DRIVER argv (R-7): the detached child is this module in
+    # --run-resync mode. It runs the analyzer as a blocking subprocess (full
+    # walk; the revision gate keeps it light), then re-probes convergence and
+    # records the one-time deferral when stale rows remain — the RT-5 walk
+    # died silently precisely because nothing verified it. We do NOT pass
+    # --force-recreate (that would DROP + rebuild the schema, losing all
+    # rows) — the resync is purely additive re-embed of stale rows.
+    # --prune-stale (CG-4 orphan convergence) is forwarded ONLY when
+    # launcher.db positively confirms the project has no codegraph extra
+    # paths (the analyzer's prune deletes every unvisited project row, and
+    # this walk does not cover extras roots). NOTE: prune races live edits —
+    # a file created after the walk passed its directory is briefly pruned
+    # and re-created by the next per-edit hook (self-healing).
+    argv = [
+        py, str(Path(__file__).resolve()), "--run-resync",
+        "--project", project_name,
+        "--repo-root", str(repo_root),
+        "--analyzer", str(analyzer),
+    ]
+    if _prune_stale_is_safe(project_name):
+        argv.append("--prune-stale")
 
     # Detached background spawn. stdout/stderr go to a per-spawn log file
     # under <vct_root_dir>/logs/ (R-5 / RT-2 — pre-fix they went to DEVNULL,
@@ -702,6 +975,14 @@ def spawn_background_resync(
             except Exception:  # noqa: BLE001
                 pass
 
+    # R-4 (Python half): best-effort GUI/death-detection registration of the
+    # driver pid via vct-hub. Soft no-op when the hub or the endpoint isn't
+    # available — never gates the spawn.
+    try:
+        _register_spawn_with_hub(project_name, proc.pid)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("codegraph resync: hub registration raised: %s", exc)
+
     log_note = f" (log: {log_path})" if log_handle is not None else ""
     return ResyncTriggerResult(
         status="launched",
@@ -713,9 +994,14 @@ def spawn_background_resync(
 
 
 def _main(argv: Optional[list] = None) -> int:
-    """Script entrypoint — used by the detached prune child spawned from
-    :func:`spawn_background_resync`. Only the prune mode exists; the analyze
-    itself is a separate child (the analyzer script)."""
+    """Script entrypoint for the detached children spawned from
+    :func:`spawn_background_resync`:
+
+      * ``--prune-ignored`` — F9 ignore-set prune child.
+      * ``--run-resync`` — R-7 resync DRIVER: runs the analyzer (blocking,
+        no timeout), then verifies convergence and maintains the one-time
+        ``codegraph_embed_resync_pending`` deferral.
+    """
     import argparse
 
     # Script mode puts THIS file's directory (vco_lib/) on sys.path, not the
@@ -727,9 +1013,16 @@ def _main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(description="codegraph resync helpers")
     parser.add_argument("--prune-ignored", action="store_true",
                         help="delete rows whose path is in the ignore set")
+    parser.add_argument("--run-resync", action="store_true",
+                        help="run the analyzer + verify convergence (R-7 driver)")
     parser.add_argument("--project", required=True, help="project name")
     parser.add_argument("--index-dot-claude", action="store_true",
                         help="the project indexes .claude/ — do NOT prune it")
+    parser.add_argument("--repo-root", help="repository root (--run-resync)")
+    parser.add_argument("--analyzer", help="analyzer script path (--run-resync)")
+    parser.add_argument("--prune-stale", action="store_true",
+                        help="forward --prune-stale to the analyzer "
+                             "(--run-resync; spawn passes it only when safe)")
     args = parser.parse_args(argv)
 
     if args.prune_ignored:
@@ -740,6 +1033,18 @@ def _main(argv: Optional[list] = None) -> int:
         total = sum(counts.values()) if counts else 0
         logger.info("codegraph prune complete: %d row(s) deleted (%s)",
                     total, counts)
+    elif args.run_resync:
+        logging.basicConfig(level=logging.INFO)
+        if not args.repo_root or not args.analyzer:
+            print("[resync-driver] --run-resync needs --repo-root + --analyzer",
+                  file=sys.stderr)
+            return 2
+        return run_resync_and_verify(
+            args.project,
+            Path(args.repo_root),
+            Path(args.analyzer),
+            prune_stale=args.prune_stale,
+        )
     return 0
 
 

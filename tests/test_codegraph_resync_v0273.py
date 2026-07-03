@@ -292,3 +292,237 @@ def test_install_shim_resolves_ledger_on_not_owed():
     src = (REPO_ROOT / "install.py").read_text(encoding="utf-8")
     assert 'result.status == "not_owed"' in src
     assert 'mark_resolved("codegraph_embed_resync_pending")' in src
+
+
+# ─────────── R-7: driver runs analyzer, verifies, defers one-time ───────────
+
+
+class _RunRecord:
+    def __init__(self, returncode=0):
+        self.calls = []
+        self._rc = returncode
+
+    def __call__(self, argv, **kwargs):
+        import types as _t
+
+        self.calls.append({"argv": argv, "kwargs": kwargs})
+        return _t.SimpleNamespace(returncode=self._rc)
+
+
+def _persisted_cids(folder: Path) -> set:
+    from vco_lib.deferral_report import DeferralReport
+
+    return {e.condition_id for e in DeferralReport.read(folder).entries}
+
+
+def _seed_pending_deferral(folder: Path) -> None:
+    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+
+    rep = DeferralReport.read(folder)
+    rep.add_entry(DeferralEntry(
+        condition_id="codegraph_embed_resync_pending",
+        title="pending", detected="d", why_deferred="w",
+        command_to_apply="cmd", severity="warning",
+    ))
+    rep.write(folder)
+
+
+def test_driver_converged_resolves_persisted_deferral(monkeypatch, tmp_path):
+    _seed_pending_deferral(tmp_path)
+    rec = _RunRecord(returncode=0)
+    monkeypatch.setattr(cr.subprocess, "run", rec)
+    monkeypatch.setattr(
+        cr, "count_stale_rows", lambda *a, **k: {"P_CodeFunction": 0}
+    )
+    rc = cr.run_resync_and_verify(
+        "MyProj", tmp_path, tmp_path / "analyze_code_graph.py"
+    )
+    assert rc == 0
+    assert len(rec.calls) == 1
+    assert "codegraph_embed_resync_pending" not in _persisted_cids(tmp_path), (
+        "positive zero-stale must resolve the persisted ledger entry"
+    )
+
+
+def test_driver_unconverged_records_one_time_deferral(monkeypatch, tmp_path):
+    rec = _RunRecord(returncode=0)
+    monkeypatch.setattr(cr.subprocess, "run", rec)
+    monkeypatch.setattr(
+        cr, "count_stale_rows", lambda *a, **k: {"P_CodeFunction": 42}
+    )
+    rc = cr.run_resync_and_verify(
+        "MyProj", tmp_path, tmp_path / "analyze_code_graph.py",
+        prune_stale=True,
+    )
+    assert rc == 0
+    from vco_lib.deferral_report import DeferralReport
+
+    rep = DeferralReport.read(tmp_path)
+    assert rep.has_condition("codegraph_embed_resync_pending")
+    entry = [e for e in rep.entries
+             if e.condition_id == "codegraph_embed_resync_pending"][0]
+    assert "42" in entry.detected
+    # The resume command reruns the exact analyzer argv (incl. prune flag).
+    assert "--prune-stale" in entry.command_to_apply
+    assert "MyProj" in entry.command_to_apply
+    # --prune-stale reached the analyzer argv too.
+    assert "--prune-stale" in rec.calls[0]["argv"]
+
+
+def test_driver_unverifiable_probe_still_surfaces(monkeypatch, tmp_path):
+    """DESIGN-DECISION: unverifiable convergence must SURFACE (one-time
+    deferral), never soft-fail into a void."""
+    monkeypatch.setattr(cr.subprocess, "run", _RunRecord(returncode=0))
+    monkeypatch.setattr(cr, "count_stale_rows", lambda *a, **k: None)
+    cr.run_resync_and_verify(
+        "MyProj", tmp_path, tmp_path / "analyze_code_graph.py"
+    )
+    from vco_lib.deferral_report import DeferralReport
+
+    rep = DeferralReport.read(tmp_path)
+    assert rep.has_condition("codegraph_embed_resync_pending")
+    entry = rep.entries[0]
+    assert "could not be verified" in entry.detected
+
+
+def test_driver_analyzer_crash_never_raises(monkeypatch, tmp_path):
+    def _boom(*a, **k):
+        raise OSError("exec failed")
+
+    monkeypatch.setattr(cr.subprocess, "run", _boom)
+    monkeypatch.setattr(cr, "count_stale_rows", lambda *a, **k: None)
+    assert cr.run_resync_and_verify(
+        "MyProj", tmp_path, tmp_path / "analyze_code_graph.py"
+    ) == 0
+
+
+def test_spawn_launches_driver_not_bare_analyzer(monkeypatch, tmp_path):
+    """The detached child is the --run-resync driver wrapping the analyzer."""
+    monkeypatch.setattr(cr, "code_embed_service_healthy", lambda *a, **k: True)
+    monkeypatch.setattr(cr, "count_stale_rows", lambda *a, **k: None)
+    monkeypatch.setattr(cr, "_prune_stale_is_safe", lambda name: True)
+    monkeypatch.setattr(cr, "_register_spawn_with_hub", lambda *a, **k: None)
+    _stub_analyzer_tree(tmp_path)
+
+    spawned = []
+    monkeypatch.setattr(
+        cr.subprocess, "Popen",
+        lambda argv, **kw: (spawned.append(argv), _FakeProc())[1],
+    )
+    result = cr.spawn_background_resync(
+        tmp_path, "MyProj", python_exe="/usr/bin/python3"
+    )
+    assert result.status == "launched"
+    driver = [a for a in spawned if "--run-resync" in a]
+    assert len(driver) == 1
+    argv = driver[0]
+    assert "--repo-root" in argv and "--analyzer" in argv
+    assert "--prune-stale" in argv, "safe project → prune forwarded"
+    assert "--force-recreate" not in argv
+
+
+def test_spawn_omits_prune_when_not_provably_safe(monkeypatch, tmp_path):
+    monkeypatch.setattr(cr, "code_embed_service_healthy", lambda *a, **k: True)
+    monkeypatch.setattr(cr, "count_stale_rows", lambda *a, **k: None)
+    monkeypatch.setattr(cr, "_prune_stale_is_safe", lambda name: False)
+    monkeypatch.setattr(cr, "_register_spawn_with_hub", lambda *a, **k: None)
+    _stub_analyzer_tree(tmp_path)
+    spawned = []
+    monkeypatch.setattr(
+        cr.subprocess, "Popen",
+        lambda argv, **kw: (spawned.append(argv), _FakeProc())[1],
+    )
+    result = cr.spawn_background_resync(
+        tmp_path, "MyProj", python_exe="/usr/bin/python3"
+    )
+    assert result.status == "launched"
+    driver = [a for a in spawned if "--run-resync" in a][0]
+    assert "--prune-stale" not in driver, (
+        "prune must NOT run when extras cannot be ruled out"
+    )
+
+
+def test_spawn_registers_driver_pid_with_hub(monkeypatch, tmp_path):
+    monkeypatch.setattr(cr, "code_embed_service_healthy", lambda *a, **k: True)
+    monkeypatch.setattr(cr, "count_stale_rows", lambda *a, **k: None)
+    monkeypatch.setattr(cr, "_prune_stale_is_safe", lambda name: False)
+    registered = []
+    monkeypatch.setattr(
+        cr, "_register_spawn_with_hub",
+        lambda name, pid: registered.append((name, pid)),
+    )
+    _stub_analyzer_tree(tmp_path)
+    monkeypatch.setattr(cr.subprocess, "Popen", lambda *a, **k: _FakeProc())
+    result = cr.spawn_background_resync(
+        tmp_path, "MyProj", python_exe="/usr/bin/python3"
+    )
+    assert result.status == "launched"
+    assert registered == [("MyProj", 4321)]
+
+
+def test_hub_registration_is_soft_when_hub_down(monkeypatch, tmp_path):
+    """Closed port / missing token → no raise (observability, not a gate)."""
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "empty-state"))
+    monkeypatch.setenv("VCT_HUB_PORT", "1")  # nothing listens on port 1
+    monkeypatch.setenv("VCT_HUB_TOKEN", "t")
+    cr._register_spawn_with_hub("MyProj", 123)  # must not raise
+
+
+# ─────────────── R-7: prune-safety probe (destructive-action gate) ──────────
+
+
+def _fake_db(monkeypatch, projects, extras_counts):
+    """Wire a real in-memory sqlite DB through launcher_db_reader."""
+    import sqlite3
+
+    def _open():
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE projects (id TEXT, name TEXT)")
+        conn.execute(
+            "CREATE TABLE project_codegraph_extra_paths "
+            "(project_id TEXT, path TEXT)"
+        )
+        for pid, name in projects:
+            conn.execute("INSERT INTO projects VALUES (?, ?)", (pid, name))
+        for pid, n in extras_counts.items():
+            for i in range(n):
+                conn.execute(
+                    "INSERT INTO project_codegraph_extra_paths VALUES (?, ?)",
+                    (pid, f"/extra/{i}"),
+                )
+        return conn
+
+    import vco_lib.launcher_db_reader as ldr
+
+    monkeypatch.setattr(ldr, "_open_db_readonly", _open)
+
+
+def test_prune_safe_when_zero_extras(monkeypatch):
+    _fake_db(monkeypatch, [("p1", "MyProj")], {})
+    assert cr._prune_stale_is_safe("MyProj") is True
+
+
+def test_prune_unsafe_when_extras_exist(monkeypatch):
+    """LEAVE-ALONE branch of the destructive gate: extras rows would be
+    deleted by a prune the walk can't cover → never prune."""
+    _fake_db(monkeypatch, [("p1", "MyProj")], {"p1": 2})
+    assert cr._prune_stale_is_safe("MyProj") is False
+
+
+def test_prune_unsafe_when_project_unknown_or_ambiguous(monkeypatch):
+    _fake_db(monkeypatch, [], {})
+    assert cr._prune_stale_is_safe("MyProj") is False
+    _fake_db(
+        monkeypatch,
+        [("p1", "My Proj"), ("p2", "MyProj")],  # both sanitize to MyProj
+        {},
+    )
+    assert cr._prune_stale_is_safe("MyProj") is False
+
+
+def test_prune_unsafe_when_db_unavailable(monkeypatch):
+    import vco_lib.launcher_db_reader as ldr
+
+    monkeypatch.setattr(ldr, "_open_db_readonly", lambda: None)
+    assert cr._prune_stale_is_safe("MyProj") is False
