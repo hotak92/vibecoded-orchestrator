@@ -218,7 +218,12 @@ def test_no_inline_reconstructions_outside_paths_module():
     # Files that are allowed to contain the literal reconstruction.
     allowed = {
         repo_root / "vco_lib" / "paths.py",
-        repo_root / "templates" / "scripts" / "generate-kg-summary.py",
+        # v0.2.73 M2: the inline ~/.vct reconstruction (documented design
+        # rationale: templates/scripts/ must not depend on vco_lib being on
+        # PYTHONPATH in per-project installs) moved with the backend-ladder
+        # extraction from generate-kg-summary.py into summary_backends.py
+        # (`_read_app_state_value`). Same exception, new home.
+        repo_root / "templates" / "scripts" / "summary_backends.py",
         # v0.2.53: bootstrap exception. install.py runs BEFORE vco_lib is
         # importable in some flows (it sets up the venv that contains
         # vco_lib). Diagnostic-output functions that reconstruct ~/.vct
