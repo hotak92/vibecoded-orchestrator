@@ -1155,6 +1155,22 @@ def spawn_background_resync(
     except Exception as exc:  # noqa: BLE001 — backfill is best-effort
         logger.warning("codegraph metadata-backfill spawn failed: %s", exc)
 
+    # v0.2.73 (M2): spawn the code-summary generator as a FOURTH detached
+    # child (prune/backfill precedent above). LLM-budgeted via its own
+    # --max-per-run default (env VCO_CODE_SUMMARY_MAX_PER_RUN); writes only
+    # .claude/.code_formats.json; a spawn failure never blocks the resync.
+    try:
+        summary_script = analyzer.parent / "generate-code-summary.py"
+        if summary_script.is_file():
+            summary_argv = [
+                py, str(summary_script),
+                "--project", project_name,
+                "--project-root", str(repo_root),
+            ]
+            subprocess.Popen(summary_argv, **popen_kwargs)  # noqa: S603 — argv is ours
+    except Exception as exc:  # noqa: BLE001 — summary rider is best-effort
+        logger.warning("code-summary spawn failed: %s", exc)
+
     try:
         proc = subprocess.Popen(argv, **popen_kwargs)  # noqa: S603 — argv is ours
     except Exception as exc:  # noqa: BLE001 — spawn failure must not crash update

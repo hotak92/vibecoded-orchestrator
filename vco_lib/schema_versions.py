@@ -106,6 +106,17 @@ KG_NODE_FRONTMATTER_SCHEMA_VERSION = 1
 #: ``artifact_schema_versions`` DB registry, NOT a marker inside the JSON.
 KG_NODE_FORMATS_SCHEMA_VERSION = 1
 
+#: ``<project>/.claude/.code_formats.json`` per-entry shape (the code-summary
+#: cache written by ``generate-code-summary.py``, M2 v0.2.73). v1 entry shape:
+#: ``{full_name, file_path, collection, one_liner, summary, generated_at,
+#: content_hash, backend}`` keyed by ``f"{file_path}::{full_name}"`` (+
+#: ``total_chunks`` / ``chunk_summaries`` only when ``total_chunks > 1``).
+#: DERIVED — fully regeneratable from the project's code graph, so a schema
+#: bump triggers a clean regeneration (re-run the code-summary generator),
+#: not a forward-migration (action ``keep-regenerated``, same discipline as
+#: ``kg_node_formats``).
+CODE_FORMATS_SCHEMA_VERSION = 1
+
 # ===========================================================================
 # Layer 3 — Bundle materialization (DERIVED — manifest-driven)
 # ===========================================================================
@@ -196,6 +207,7 @@ CANONICAL_VERSIONS: dict[str, int] = {
     # Layer 2 — KG content
     "kg_node_frontmatter":        KG_NODE_FRONTMATTER_SCHEMA_VERSION,   # user-curated
     "kg_node_formats":            KG_NODE_FORMATS_SCHEMA_VERSION,        # derived (regen cache)
+    "code_formats":               CODE_FORMATS_SCHEMA_VERSION,           # derived (regen cache)
     # Layer 3 — Bundle (DERIVED)
     "bundle_materialization":     BUNDLE_MATERIALIZATION_SCHEMA_VERSION,
     # Layer 4 — launcher.db row content
@@ -230,6 +242,7 @@ ARTIFACT_STATE_CLASSIFICATION: dict[str, str] = {
     # Layer 2 — KG content
     "kg_node_frontmatter":        "user_curated",
     "kg_node_formats":            "derived",          # regen cache (generate-kg-summary)
+    "code_formats":               "derived",          # regen cache (generate-code-summary)
     # Layer 3 — Bundle (derived from templates/)
     "bundle_materialization":     "derived",
     # Layer 4 — launcher.db rows

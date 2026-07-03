@@ -32,6 +32,12 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+# The is_test_path parity test imports weaviate_mcp.code_ranking; without this
+# the import fails and the parity test SKIPS standalone (it only ran under the
+# full-suite conftest path). Adding the shim makes it run in isolation too.
+_MCP_ROOT = REPO_ROOT / "claude_mcp_servers"
+if str(_MCP_ROOT) not in sys.path:
+    sys.path.insert(0, str(_MCP_ROOT))
 
 _ANALYZER_PATH = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 

@@ -99,10 +99,15 @@ def registered_type(monkeypatch):
     monkeypatch.setitem(sv.ARTIFACT_STATE_CLASSIFICATION, "code_formats", "derived")
 
 
-def test_skipped_while_type_not_in_registry(proj, capsys):
-    # Pre-integration window: code_formats not in CANONICAL_VERSIONS → soft
-    # no-op, exit 0, sidecar untouched.
+def test_skipped_while_type_not_in_registry(proj, capsys, monkeypatch):
+    # Defensive path: if code_formats is absent from CANONICAL_VERSIONS (e.g.
+    # a partial/rolled-back registry) the check must soft no-op — exit 0,
+    # sidecar untouched, nothing stored. code_formats is now a permanent
+    # registry entry (v0.2.73 M2), so we delete it for the duration of this
+    # test to exercise the absent-type branch.
     folder, db = proj
+    monkeypatch.delitem(sv.CANONICAL_VERSIONS, "code_formats", raising=False)
+    monkeypatch.delitem(sv.ARTIFACT_STATE_CLASSIFICATION, "code_formats", raising=False)
     assert "code_formats" not in sv.CANONICAL_VERSIONS
     rc, out = _run(folder, db, capsys)
     assert rc == 0
