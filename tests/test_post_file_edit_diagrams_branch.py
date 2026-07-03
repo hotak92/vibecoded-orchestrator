@@ -107,7 +107,7 @@ def test_non_diagram_edit_does_not_touch_throttle(tmp_path: Path):
         capture_output=True,
         text=True,
         env=env,
-        timeout=10,
+        timeout=30,  # contention-tolerant (was 10s; flaked under parallel CI load)
     )
     # Hook should complete fine.
     assert result.returncode == 0, (
@@ -182,7 +182,12 @@ def test_diagram_edit_creates_throttle_and_invokes_indexer(tmp_path: Path):
         capture_output=True,
         text=True,
         env=env,
-        timeout=10,
+        # 30s (was 10s): the hook resolves venv-python + spawns subprocesses;
+        # under heavy CPU contention (e.g. the full pytest suite running
+        # alongside cargo test in pre-ship-check) a 10s budget flakes with
+        # TimeoutExpired. 30s is generous headroom and still fails fast on a
+        # genuine hang.
+        timeout=30,
     )
     assert result.returncode == 0, (
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
@@ -195,10 +200,13 @@ def test_diagram_edit_creates_throttle_and_invokes_indexer(tmp_path: Path):
         f"expected exactly one throttle file, got {diagram_files}"
     )
 
-    # Indexer invocation: background-spawned, so the log may take a
-    # moment to flush. Wait briefly.
+    # Indexer invocation: background-spawned, so the log may take a moment to
+    # flush. Poll for up to 10s (was 1s = range(20)*0.05) — a 1s budget for a
+    # BACKGROUND subprocess to be scheduled + flush flakes under CPU contention
+    # (the pre-ship failure mode: this loop exhausted and pytest.fail'd while
+    # the indexer was simply queued behind other load).
     import time as _t
-    for _ in range(20):
+    for _ in range(200):
         if record_file.exists():
             content = record_file.read_text()
             if "vco_lib.diagram_indexer" in content:
@@ -218,10 +226,10 @@ def test_diagram_edit_creates_throttle_and_invokes_indexer(tmp_path: Path):
     # `snapshot create <file> --quiet`. Both calls share the same
     # `vco_lib.diagram_indexer` module + file path, so we grep for the
     # subcommand keyword `snapshot` to disambiguate from the `index`
-    # call we just asserted. Background-spawned: give it a moment to
-    # flush, same as the index assertion above.
+    # call we just asserted. Background-spawned: poll up to 10s (same
+    # contention-tolerant budget as the index assertion above).
     import time as _t
-    for _ in range(20):
+    for _ in range(200):
         if "snapshot" in record_file.read_text():
             break
         _t.sleep(0.05)
@@ -291,7 +299,7 @@ def test_diagram_throttle_60s_blocks_immediate_reindex(tmp_path: Path):
             capture_output=True,
             text=True,
             env=env,
-            timeout=10,
+            timeout=30,  # contention-tolerant (was 10s; flaked under parallel CI load)
         )
 
     # First call → indexer dispatched.
@@ -305,7 +313,7 @@ def test_diagram_throttle_60s_blocks_immediate_reindex(tmp_path: Path):
     # the second-hook-call assertion below races the still-flushing
     # background spawns.
     import time as _t
-    for _ in range(30):
+    for _ in range(400):  # up to 20s (was 1.5s) — TWO background dispatches
         if record_file.exists():
             text = record_file.read_text()
             if text.count("vco_lib.diagram_indexer") >= 2:
