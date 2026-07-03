@@ -131,41 +131,101 @@ def _reminder_block() -> str:
     )
 
 
+def _find_reminder_marker_span(existing: str):
+    """A-4 (v0.2.73): locate the reminder block by LINE-START markers that
+    live OUTSIDE fenced code blocks.
+
+    Returns:
+        (start, end)     — char offsets: ``start`` = index of the begin
+                           marker line, ``end`` = index just past the end
+                           marker line (exclusive of its trailing newline).
+        ("ambiguous",)   — a begin marker was found at a real (unfenced,
+                           line-start) position but no matching real end
+                           marker follows it → the caller must do nothing
+                           and log, to avoid deleting user content.
+        None             — no real reminder block present.
+
+    WHY: the pre-A-4 ``existing.find(_REMINDER_BEGIN)`` matched the FIRST
+    literal occurrence anywhere — including a marker QUOTED inside a code
+    fence (this repo's own shareable CLAUDE.md documents the markers). It
+    would then pair that quoted begin with a later real end and delete all
+    user content between them. Matching only line-start markers outside
+    fences removes that class of silent destruction.
+    """
+    lines = existing.splitlines(keepends=True)
+    in_fence = False
+    fence_marker: Optional[str] = None  # track ``` vs ~~~ style
+    begin_at: Optional[int] = None  # char offset of begin marker line
+    offset = 0
+    for line in lines:
+        stripped = line.strip()
+        # Fenced code-block toggle: a line whose FIRST non-space content is
+        # ``` or ~~~ (info string allowed after). Track the fence char so a
+        # nested ``` inside a ~~~ block doesn't mis-toggle.
+        if not in_fence and (stripped.startswith("```") or stripped.startswith("~~~")):
+            in_fence = True
+            fence_marker = stripped[:3]
+            offset += len(line)
+            continue
+        if in_fence:
+            if stripped.startswith(fence_marker or "```"):
+                in_fence = False
+                fence_marker = None
+            offset += len(line)
+            continue
+        # Outside a fence: match markers only when they ARE the line (after
+        # stripping surrounding whitespace) — a marker quoted mid-sentence
+        # or inside a longer line does not count.
+        if stripped == _REMINDER_BEGIN:
+            begin_at = offset
+        elif stripped == _REMINDER_END and begin_at is not None:
+            # end marker line ends at offset + len(line); we want the offset
+            # just past the marker text (exclude the trailing newline so the
+            # caller controls newline trimming).
+            end = offset + len(line.rstrip("\n"))
+            return (begin_at, end)
+        offset += len(line)
+
+    if begin_at is not None:
+        # Real begin found but no matching real end → ambiguous. Do nothing.
+        return ("ambiguous",)
+    return None
+
+
 def _splice_reminder_into_claude_md(existing: str) -> str:
     """Return ``existing`` with the reminder block injected idempotently.
 
     Three insertion points (in priority order):
 
-    1. If a previous reminder block exists (find the begin/end markers):
-       replace it in place — preserves position chosen on the original
-       insertion, prevents block migration on every install.
+    1. If a previous reminder block exists (real, line-start markers outside
+       fences): replace it in place — preserves position chosen on the
+       original insertion, prevents block migration on every install.
     2. Else if ``existing`` opens with YAML frontmatter (``---\n...\n---\n``):
-       prepend the block immediately AFTER the closing fence, separated
-       by a blank line.
+       prepend the block immediately AFTER the closing fence, separated by a
+       blank line.
     3. Else: prepend the block at the very top, separated by a blank line
        from whatever follows.
 
-    The trailing blank line is normalised so we don't accumulate empty
-    lines on repeat injections.
+    A-4: matching is fence-aware + line-start only. On an ambiguous begin
+    (real begin, no real end) we DO NOT splice — we return the file
+    unchanged so no user content is destroyed (the orphan marker stays; the
+    user can clean it). This prefers a missing refresh over data loss.
     """
     block = _reminder_block()
 
-    # Case 1: existing block — replace in place.
-    start = existing.find(_REMINDER_BEGIN)
-    if start != -1:
-        end_rel = existing[start:].find(_REMINDER_END)
-        if end_rel != -1:
-            end = start + end_rel + len(_REMINDER_END)
-            after = existing[end:]
-            # Strip a single leading newline so re-injections don't
-            # accumulate blank lines.
-            if after.startswith("\n"):
-                after = after[1:]
-            return existing[:start] + block + after
-        # Begin marker without a matching end — treat as corrupt; fall
-        # through and prepend a fresh block. The orphan begin marker
-        # stays in place; the user can manually clean it. We prefer
-        # corrupt + accurate over silent loss.
+    span = _find_reminder_marker_span(existing)
+    if span == ("ambiguous",):
+        # Conservative: leave the file exactly as-is rather than risk
+        # splicing across user content.
+        return existing
+    if isinstance(span, tuple) and len(span) == 2 and isinstance(span[0], int):
+        start, end = span
+        after = existing[end:]
+        # Strip a single leading newline so re-injections don't accumulate
+        # blank lines.
+        if after.startswith("\n"):
+            after = after[1:]
+        return existing[:start] + block + after
 
     # Case 2: frontmatter — splice after closing fence.
     fm_match = _LEADING_FRONTMATTER_RE.match(existing)
@@ -187,20 +247,20 @@ def _splice_reminder_into_claude_md(existing: str) -> str:
 def _strip_reminder_from_claude_md(existing: str) -> str:
     """Return ``existing`` with the wrapped reminder block removed.
 
-    No-op (returns the original string) when no block is found. Cleans
-    up the blank-line separator that ``_splice_reminder_into_claude_md``
-    inserts on each side of the block, in either insertion case (block at
-    top-of-file or block after frontmatter).
+    No-op (returns the original string) when no real block is found or when
+    the begin marker is ambiguous (real begin, no real end). Cleans up the
+    blank-line separator that ``_splice_reminder_into_claude_md`` inserts on
+    each side of the block, in either insertion case.
+
+    A-4: uses the same fence-aware line-start locator as the splicer, so a
+    marker quoted inside a code fence never triggers a delete.
     """
-    start = existing.find(_REMINDER_BEGIN)
-    if start == -1:
+    span = _find_reminder_marker_span(existing)
+    if span is None or span == ("ambiguous",):
+        # No real block, or an orphan begin — preserve the file. The user
+        # can clean an orphan manually.
         return existing
-    end_rel = existing[start:].find(_REMINDER_END)
-    if end_rel == -1:
-        # Orphan begin marker: don't try to guess the end — preserve the
-        # file. The user can clean it manually.
-        return existing
-    end = start + end_rel + len(_REMINDER_END)
+    start, end = span  # type: ignore[misc]
 
     before = existing[:start]
     after = existing[end:]
@@ -212,9 +272,9 @@ def _strip_reminder_from_claude_md(existing: str) -> str:
     if after.startswith("\n"):
         after = after[1:]
 
-    # Trim the blank-line separator the splicer inserted before the
-    # block — only the SECOND-to-last newline (the blank line itself),
-    # leaving the newline that ends the preceding logical line intact.
+    # Trim the blank-line separator the splicer inserted before the block —
+    # only the SECOND-to-last newline (the blank line itself), leaving the
+    # newline that ends the preceding logical line intact.
     if before.endswith("\n\n"):
         before = before[:-1]
 
