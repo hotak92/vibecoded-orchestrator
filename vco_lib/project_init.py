@@ -6384,6 +6384,155 @@ def _emit_safe_add_skipped_env_merge_deferral(
     report.write(folder)
 
 
+def _emit_user_secret_values_retained_deferral(folder: Path) -> None:
+    """Emit `user_secret_values_retained_in_tree`: pre-v0.2.73 user-secret
+    VALUEs may still reside in committable tree files (.claude/env or
+    .claude/settings.json) from the Rust GUI writer before S-4's strip
+    invariant shipped.
+
+    ONE-TIME scanner that detects a secret-shaped line in the managed block
+    (no value printed — only a pattern match). Self-clearing: once the next
+    env-projection refresh scrubs the value, the deferral is never re-emitted.
+    OWNED condition (v0.2.73 S-8): triggered at bundle-update time, cleared
+    when value leaves the tree, survives UPDATE_DEFERRED.md rewrites so the
+    user's Claude can see the notice if they haven't refreshed yet.
+
+    Severity is "warning" (not critical) because:
+      * The value IS still a secret until the next refresh (users should rotate
+        if the key was leaked to VCS).
+      * The next refresh will scrub it automatically.
+      * No immediate action required — just awareness + precaution.
+    """
+    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+
+    # Cheap scan: look for a secret-shaped managed-block line. No value parsing
+    # (never print a value). We check BOTH surfaces (.claude/env + settings.json)
+    # to catch either pre-fix projection output.
+    env_path = folder / ".claude" / "env"
+    settings_path = folder / ".claude" / "settings.json"
+
+    # Sentinel regex: a managed-block line that looks like a secret export.
+    # Pattern: after "# user secrets" header, any line with `export KEY="..."`.
+    # We don't validate the key name — just look for secret-shaped syntax.
+    secret_line_pattern = r'export\s+[A-Z_][A-Z0-9_]*="'
+
+    def _has_secret_shaped_line(path: Path) -> bool:
+        if not path.is_file():
+            return False
+        try:
+            import json
+            import re
+            text = path.read_text(encoding="utf-8")
+
+            if path.name == "env":
+                # Shell env file: scan within the managed block.
+                from vco_lib.config_projection import (
+                    CLAUDE_ENV_MANAGED_BEGIN,
+                    CLAUDE_ENV_MANAGED_END,
+                )
+                begin = text.find(CLAUDE_ENV_MANAGED_BEGIN)
+                end = text.find(CLAUDE_ENV_MANAGED_END)
+                if begin == -1 or end == -1:
+                    return False
+                managed_block = text[begin:end]
+                return bool(re.search(secret_line_pattern, managed_block))
+
+            elif path.name == "settings.json":
+                # JSON settings file: check for secret-shaped keys in the env block.
+                try:
+                    data = json.loads(text)
+                    env_block = data.get("env", {})
+                    if not isinstance(env_block, dict):
+                        return False
+                    # Check if ANY key looks secret-shaped (all-caps, underscores,
+                    # typical secret patterns like API_KEY, TOKEN, SECRET, etc.).
+                    secret_patterns = [
+                        "TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL",
+                        "API_", "GITHUB_", "OPENAI_", "ANTHROPIC_",
+                    ]
+                    for key in env_block:
+                        if any(pattern in key.upper() for pattern in secret_patterns):
+                            # This is a potential pre-fix secret key. Guard against
+                            # false positives by checking if it's NOT a canonical
+                            # VCO key (WEAVIATE_URL, KG_COLLECTION, etc.).
+                            canonical_keys = {
+                                "KG_COLLECTION", "DEVELOPMENT_COLLECTION",
+                                "SHARED_KG_COLLECTION", "PROJECT_NAME",
+                                "CODE_GRAPH_PROJECT", "ACTIVE_EMBEDDING",
+                                "WEAVIATE_URL", "OLLAMA_URL", "CODE_EMBED_URL",
+                                "WEAVIATE_PORT", "OLLAMA_PORT", "CODE_EMBED_PORT",
+                                "SHARED_KG_WRITE_DISABLED", "SHARED_KG_OPT_OUT",
+                                "VCT_", "GRPC_", "DEVELOPMENT_COLLECTION",
+                            }
+                            if key not in canonical_keys and not any(
+                                key.startswith(prefix)
+                                for prefix in ("VCT_", "GRPC_", "SHARED_KG_")
+                            ):
+                                return True
+                except (json.JSONDecodeError, Exception):
+                    return False
+            return False
+        except Exception:
+            return False
+
+    has_secret_in_env = _has_secret_shaped_line(env_path)
+    has_secret_in_settings = _has_secret_shaped_line(settings_path)
+
+    if not (has_secret_in_env or has_secret_in_settings):
+        return  # No pre-fix artifacts; don't emit.
+
+    # Check if a push remote exists (user should rotate if leaked to VCS).
+    has_push_remote = False
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            cwd=folder,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        has_push_remote = result.returncode == 0 and result.stdout.strip()
+    except Exception:
+        pass
+
+    rotate_advice = (
+        "If this project's git has a push remote and the pre-v0.2.73 value "
+        "was committed or pushed, rotate the affected key now to be safe."
+    )
+
+    entry = DeferralEntry(
+        condition_id="user_secret_values_retained_in_tree",
+        title="Pre-v0.2.73: user-secret VALUES may be in committable tree files",
+        detected=(
+            "Secret-shaped managed-block lines were found in one or more "
+            "VCO env surfaces (.claude/env or .claude/settings.json). These "
+            "may contain VALUES from the Rust GUI writer before v0.2.73's "
+            "strip-only invariant shipped."
+        ),
+        why_deferred=(
+            "Deferred: the value scrubbing happens automatically at the next "
+            "env-projection refresh (which runs on the next project refresh/"
+            "CLI command / launcher restart). This deferral is a ONE-TIME "
+            "notice only; once the refresh scrubs the value from tree files, "
+            "the deferral will NOT re-emit."
+        ),
+        command_to_apply=(
+            f"# The next project env refresh will scrub the values automatically.\n"
+            f"# No manual action required UNLESS the key was committed/pushed:\n"
+            f"# {rotate_advice}\n"
+            f"# Dismiss this deferral once you've reviewed it:\n"
+            f"python -m vco_lib.project_init dismiss-deferral "
+            f"--folder {str(folder)!r} "
+            f"--condition-id user_secret_values_retained_in_tree"
+        ),
+        severity="warning",
+    )
+    report = DeferralReport.read(folder)
+    report.add_entry(entry)
+    report.write(folder)
+
+
 def _emit_safe_add_git_exclude_deferral(
     folder: Path, git_result: dict,
 ) -> None:
@@ -7429,6 +7578,19 @@ def install_project_bundle(
             _log("4.bundle.safe_add_git_exclude", "error",
                  f"safe-add git-exclude failed: {err}", data={"error": err})
             result["warnings"].append(f"safe-add git-exclude failed: {err}")
+
+    # v0.2.73 S-8 (ONE-TIME): scan for pre-fix user-secret VALUES in tree files
+    # and emit a deferral notice if found. Triggered on every bundle-update run
+    # (cheap pattern scan, no value parsing); self-clears once the next env
+    # refresh removes the value.
+    if update_mode:
+        try:
+            _emit_user_secret_values_retained_deferral(folder)
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            _log("4.bundle.secrets_retention_audit", "warning",
+                 f"pre-fix secret-value scan failed: {err}", data={"error": err})
+            result["warnings"].append(f"pre-fix secret-value scan failed: {err}")
 
     return result
 
