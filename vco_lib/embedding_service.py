@@ -75,6 +75,7 @@ import json
 import logging
 import os
 import sys
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1428,6 +1429,38 @@ class EmbeddingService:
 
     # ---- single-item embed --------------------------------------------
 
+    def _retry_once_on_503(self, fn, *args):
+        """v0.2.73 C-9: retry a provider embed ONCE after a short delay when
+        the backend answered HTTP 503.
+
+        The code-embed FastAPI service (and Ollama, briefly) return 503 while
+        a model is (re)loading — a transient that previously failed the whole
+        embed call chain on the first request of a cold session (the C-1
+        trigger). ONE retry with a small delay absorbs the common case
+        without masking a genuinely-down backend (a second 503 re-raises).
+        Non-503 errors re-raise immediately — no behaviour change.
+
+        Delay tunable via ``VCO_EMBED_503_RETRY_DELAY`` (seconds, default 2;
+        malformed → default — a knob must not be a kill switch).
+        """
+        try:
+            return fn(*args)
+        except Exception as exc:  # noqa: BLE001 — inspect, then re-raise
+            if "503" not in str(exc):
+                raise
+            try:
+                delay = float(os.getenv("VCO_EMBED_503_RETRY_DELAY", "2"))
+            except (TypeError, ValueError):
+                delay = 2.0
+            if delay < 0:
+                delay = 0.0
+            logger.info(
+                "Embed backend returned 503 (model loading?): %s — "
+                "retrying once after %.1fs", exc, delay,
+            )
+            time.sleep(delay)
+            return fn(*args)
+
     def embed_text(self, text: str) -> list[float]:
         """Embed one text via the active text backend.
 
@@ -1443,7 +1476,7 @@ class EmbeddingService:
         cached = self._embed_memo_text.get(key)
         if cached is not None:
             return cached
-        vec = self._embed_text_via_active(text)
+        vec = self._retry_once_on_503(self._embed_text_via_active, text)
         self._memo_put(self._embed_memo_text, key, vec)
         return vec
 
@@ -1460,7 +1493,7 @@ class EmbeddingService:
         cached = self._embed_memo_code.get(key)
         if cached is not None:
             return cached
-        vec = self._embed_code_via_active(code)
+        vec = self._retry_once_on_503(self._embed_code_via_active, code)
         self._memo_put(self._embed_memo_code, key, vec)
         return vec
 
@@ -1484,8 +1517,12 @@ class EmbeddingService:
         if not texts:
             return []
         if "openai" in self._text_slot:
-            return self.openai.embed_batch(self.text_model_id, texts)
-        return self.ollama.embed_batch(self.text_model_id, texts)
+            return self._retry_once_on_503(
+                self.openai.embed_batch, self.text_model_id, texts
+            )
+        return self._retry_once_on_503(
+            self.ollama.embed_batch, self.text_model_id, texts
+        )
 
     def embed_code_batch(self, codes: list[str]) -> list[list[float]]:
         """Batched code embedding. Empty input → empty output.
@@ -1498,15 +1535,19 @@ class EmbeddingService:
         if not codes:
             return []
         if "openai" in self._code_slot:
-            return self.openai.embed_batch(self.code_model_id, codes)
+            return self._retry_once_on_503(
+                self.openai.embed_batch, self.code_model_id, codes
+            )
         if self._code_slot in ("codesage_embed", "jina_embed"):
             # Try service first; on failure fall back to Ollama using the
             # configured code model id. The fallback is best-effort —
             # if Ollama doesn't have a matching model the call will fail
             # cleanly and the caller's exception handler kicks in.
             if self.codeembed.is_reachable():
-                return self.codeembed.embed_batch(codes)
-        return self.ollama.embed_batch(self.code_model_id, codes)
+                return self._retry_once_on_503(self.codeembed.embed_batch, codes)
+        return self._retry_once_on_503(
+            self.ollama.embed_batch, self.code_model_id, codes
+        )
 
     # ---- multi-slot writes --------------------------------------------
 
