@@ -458,6 +458,38 @@ class _Discovery:
 _discovery_lock = threading.Lock()
 _discovery_cache: _Discovery | None = None
 
+#: Rate-limit guard for corrupt-input discovery warnings: emit at most one
+#: stderr line per (process, kind) so a hot caller doing many resolves in a
+#: process with a persistently corrupt hub.port doesn't spam stderr. Reset
+#: by ``_test_clear_cache`` for deterministic tests.
+_discovery_warned_lock = threading.Lock()
+_discovery_warned_kinds: set[str] = set()
+
+
+def _warn_discovery(kind: str, detail: str) -> None:
+    """Emit ONE best-effort stderr warning for a corrupt discovery input.
+
+    F-8 corrupt-input contract — MUST MATCH the bash sibling
+    ``vct_project_config.sh`` (``_emit_warning "hub_port_invalid" | …``)
+    and the ps1 sibling ``vct_project_config.ps1`` (``Emit-Warning``):
+    a corrupt/unreadable ``hub.port`` (or a non-integer ``VCT_HUB_PORT``)
+    must NOT raise — it warns and the caller falls through to the default
+    port. Idempotent per ``kind`` within one process (mirrors
+    :func:`_maybe_warn_schema_version`'s per-value dedup). Stderr write is
+    best-effort — never raises.
+    """
+    with _discovery_warned_lock:
+        if kind in _discovery_warned_kinds:
+            return
+        _discovery_warned_kinds.add(kind)
+    try:
+        sys.stderr.write(f"[vco_lib.project_config] {kind}: {detail}\n")
+        sys.stderr.flush()
+    except OSError:
+        # stderr unavailable (closed in a daemon context, etc.) — the
+        # diagnostic is best-effort; swallow.
+        pass
+
 
 def _discover_hub() -> tuple[int, str]:
     """Resolve ``(port, token)`` for the local launcher hub.
@@ -479,33 +511,63 @@ def _discover_hub() -> tuple[int, str]:
             return cached.port, cached.token
 
         # Port: env > file > default.
+        #
+        # F-8 corrupt-input contract — MUST MATCH the bash sibling
+        # `vct_project_config.sh::hub_port` and the ps1 sibling
+        # `vct_project_config.ps1::Get-HubPort`: a non-integer
+        # `VCT_HUB_PORT`, a non-integer `hub.port` file, or an unreadable
+        # `hub.port` (perm-denied) must NOT raise — the port has a sane
+        # default (7700), so we emit ONE stderr warning and fall through to
+        # it. Only a truly ABSENT file (FileNotFoundError) is the silent
+        # default path (that is the normal env-only / dev case). This makes
+        # all three resolvers behave identically on corrupt port input:
+        # warn + default, never crash, never a garbage/partial resolution.
         port_env = os.environ.get("VCT_HUB_PORT", "").strip()
         if port_env:
             try:
                 port = int(port_env)
-            except ValueError as exc:
-                raise HubUnreachable(
-                    f"VCT_HUB_PORT={port_env!r} is not an integer"
-                ) from exc
+            except ValueError:
+                _warn_discovery(
+                    "hub_port_invalid",
+                    "VCT_HUB_PORT is not a positive integer; "
+                    "using default 7700",
+                )
+                port = DEFAULT_HUB_PORT
         else:
             port_file = vct_root_dir() / "hub.port"
             try:
                 raw = port_file.read_text(encoding="utf-8").strip()
             except FileNotFoundError:
                 port = DEFAULT_HUB_PORT
-            except OSError as exc:
-                raise HubUnreachable(
-                    f"cannot read hub.port at {port_file}: {exc}"
-                ) from exc
+            except OSError:
+                _warn_discovery(
+                    "hub_port_unreadable",
+                    "hub.port is not readable; using default 7700",
+                )
+                port = DEFAULT_HUB_PORT
             else:
                 try:
                     port = int(raw) if raw else DEFAULT_HUB_PORT
-                except ValueError as exc:
-                    raise HubUnreachable(
-                        f"hub.port at {port_file} contains non-integer: {raw!r}"
-                    ) from exc
+                except ValueError:
+                    _warn_discovery(
+                        "hub_port_invalid",
+                        "hub.port contains non-integer content; "
+                        "using default 7700",
+                    )
+                    port = DEFAULT_HUB_PORT
 
         # Token: env > file > fail.
+        #
+        # F-8 corrupt-input contract — MUST MATCH the bash sibling
+        # `vct_project_config.sh::hub_token` and the ps1 sibling
+        # `vct_project_config.ps1::Get-HubToken`: the token has NO sane
+        # default, so an absent/empty/unreadable `hub.token` is not
+        # "corrupt content to warn-and-default" but "no token" → the hub is
+        # genuinely unreachable. We raise :class:`HubUnreachable` (the
+        # caller's env-fallback path), and — for the UNREADABLE case only —
+        # route through `_warn_discovery` first so the stderr shape matches
+        # the sh/ps1 `hub_token_unreadable` warning before the raise. The
+        # read failure NEVER crashes with a raw OSError traceback.
         token_env = os.environ.get("VCT_HUB_TOKEN", "").strip()
         if token_env:
             token = token_env
@@ -518,6 +580,10 @@ def _discover_hub() -> tuple[int, str]:
                     f"hub.token missing at {token_file}; is the launcher running?"
                 ) from exc
             except OSError as exc:
+                _warn_discovery(
+                    "hub_token_unreadable",
+                    "hub.token is not readable; treating as no token",
+                )
                 raise HubUnreachable(
                     f"cannot read hub.token at {token_file}: {exc}"
                 ) from exc
@@ -547,6 +613,8 @@ def _test_clear_cache() -> None:
         _discovery_cache = None
     with _schema_warned_lock:
         _schema_warned_versions.clear()
+    with _discovery_warned_lock:
+        _discovery_warned_kinds.clear()
 
 
 def _invalidate_discovery_cache() -> None:

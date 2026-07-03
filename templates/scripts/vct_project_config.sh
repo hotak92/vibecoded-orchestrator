@@ -245,26 +245,71 @@ _emit_warning() {
 }
 
 # ── Hub port discovery ──────────────────────────────────────────────────
+# CORRUPT-INPUT CONTRACT (F-8) — MUST MATCH the ps1 sibling
+# `vct_project_config.ps1::Get-HubPort` and the python sibling
+# `vco_lib/project_config.py::_discover_hub` (port branch):
+#   * env `VCT_HUB_PORT` or `hub.port` file that is non-numeric / garbage
+#     → emit ONE rate-limited stderr warning (kind `hub_port_invalid`) and
+#     fall through to the default port. NEVER print a garbage value (that
+#     would build a malformed URL that curl then fails on, mis-classed as
+#     `hub_unreachable`).
+#   * `hub.port` present but UNREADABLE (perm-denied) → warn
+#     (`hub_port_unreadable`) + default.
+# A valid numeric port matches `^[0-9]+$`. This is the ONE conservative
+# contract: invalid content → warn + default, never crash, never emit a
+# partial/garbage resolution.
 hub_port() {
     if [[ -n "${VCT_HUB_PORT:-}" ]]; then
-        printf '%s\n' "$VCT_HUB_PORT"
+        if [[ "$VCT_HUB_PORT" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' "$VCT_HUB_PORT"
+            return 0
+        fi
+        _emit_warning "hub_port_invalid" \
+            "VCT_HUB_PORT is not a positive integer; using default 7700"
+        printf '7700\n'
         return 0
     fi
     local state_dir="${VCT_STATE_DIR:-$HOME/.vct}"
     local port_file="$state_dir/hub.port"
     if [[ -f "$port_file" ]]; then
         local p
-        p=$(tr -d '[:space:]' < "$port_file")
-        if [[ -n "$p" ]]; then
+        # A read failure (perm-denied) leaves $p empty and `tr` writes to
+        # stderr; suppress that and detect the failure via the readability
+        # test so we can emit our own single warning instead.
+        if [[ ! -r "$port_file" ]]; then
+            _emit_warning "hub_port_unreadable" \
+                "hub.port is not readable; using default 7700"
+            printf '7700\n'
+            return 0
+        fi
+        p=$(tr -d '[:space:]' < "$port_file" 2>/dev/null)
+        if [[ "$p" =~ ^[0-9]+$ ]]; then
             printf '%s\n' "$p"
             return 0
         fi
+        if [[ -n "$p" ]]; then
+            _emit_warning "hub_port_invalid" \
+                "hub.port contains non-integer content; using default 7700"
+        fi
+        # empty (whitespace-only / truncated write) → silent default.
+        printf '7700\n'
+        return 0
     fi
     # Default — matches launcher's server.rs::DEFAULT_PORT.
     printf '7700\n'
 }
 
 # ── Hub auth-token discovery ────────────────────────────────────────────
+# CORRUPT-INPUT CONTRACT (F-8) — MUST MATCH the ps1 sibling
+# `vct_project_config.ps1::Get-HubToken` and the python sibling
+# `vco_lib/project_config.py::_discover_hub` (token branch):
+#   * env `VCT_HUB_TOKEN` set → used verbatim (any non-empty string is a
+#     legitimate token; no format to validate).
+#   * `hub.token` present but UNREADABLE (perm-denied) → emit ONE
+#     rate-limited stderr warning (kind `hub_token_unreadable`) and return
+#     empty. The token has NO sane default, so an unreadable/absent token
+#     is treated as "no token" → the caller degrades to `hub_unreachable`
+#     (exit 2 in hub_get). NEVER crash on the read failure.
 hub_token() {
     if [[ -n "${VCT_HUB_TOKEN:-}" ]]; then
         printf '%s' "$VCT_HUB_TOKEN"
@@ -273,7 +318,13 @@ hub_token() {
     local state_dir="${VCT_STATE_DIR:-$HOME/.vct}"
     local token_file="$state_dir/hub.token"
     if [[ -f "$token_file" ]]; then
-        tr -d '[:space:]' < "$token_file"
+        if [[ ! -r "$token_file" ]]; then
+            _emit_warning "hub_token_unreadable" \
+                "hub.token is not readable; treating as no token"
+            printf ''
+            return 0
+        fi
+        tr -d '[:space:]' < "$token_file" 2>/dev/null
         return 0
     fi
     printf ''
