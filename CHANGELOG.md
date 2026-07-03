@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **User-declared secrets never enter the project tree.** The per-project env
+  writer now strips user-secret VALUES from `.claude/env` and
+  `.claude/settings.json` (they live only in the OS keychain / file store);
+  the next env-projection refresh auto-scrubs any value written by an older
+  build, and a one-time notice advises rotating a key if it reached a repo with
+  a push remote. Canonical non-secret config still lives in those files.
+- **The hub now serves user-declared secrets, permission-matrix gated.**
+  `GET /projects/{id}/env` previously 404'd on every GUI-added user secret;
+  it now resolves them via the active-flag matrix (a secret paused for the
+  requesting project does not resolve). The agent-facing secrets docs make
+  retrieval discoverable so an agent resolves a provisioned credential rather
+  than asking the user to paste it.
+- **lean-ctx rewrite hook no longer auto-approves wrapped Bash.** The hook was
+  emitting `permissionDecision:"allow"` for every command it rewrote; it now
+  strips that field (keeping the compression rewrite) so wrapped commands run
+  under the normal permission flow.
+
+### Fixed
+- **Code-graph resync now converges the stale-revision tail.** A revision-gated
+  resync re-walks files whose stored rows are behind the current embed revision
+  even when the file content is unchanged (previously the file-hash skip
+  short-circuited before the per-row revision gate, so the over-budget backlog
+  never re-embedded). Embed-failure rows are no longer stamped current (they
+  stay visibly stale and retry), and a mid-file walk error no longer skips the
+  file forever. When a walk cannot verify convergence it records a one-time
+  deferral instead of failing silently, and the detached walk is registered for
+  GUI progress + crash detection. The resync no longer runs a stale-row prune
+  (a revision-gated walk hash-skips converged files, so a prune would delete
+  them — orphan cleanup stays with the full-walk paths).
+- **`install.py --update` no longer clobbers foreign deferrals.** The deferral
+  report is seeded from disk and entries other writers own are preserved verbatim
+  (previously the end-of-run write dropped every entry not re-detected in that run).
+- **Knowledge-graph writes are crash-safe.** `store_knowledge_node` scopes its
+  delete to `title AND file_path` (a same-titled node in another file survives)
+  and embeds+inserts the new rows before deleting the old ones (an embed outage
+  mid-write no longer destroys the existing node).
+- **Playwright MCP is actually registered** by the install flow (both the Rust
+  and Python builders), matching the documented default-on behavior.
+- **Re-enabling a bundled MCP from the GUI writes the correct entry** (venv
+  python, real args/env) instead of a broken catalog stub, and MCP-tab actions
+  no longer inject routing keys that could fork a project's KG collection.
+- **vct-hub single-instance start is race-safe** (atomic claim, owner-scoped
+  release) so two concurrent starters can't both bind or split the port/token.
+- **The secrets resolver `.sh` / `.ps1` / Python legs behave identically** on
+  their edge arms (bare-name tier-3 skip, non-zero-exit and empty-output
+  suppression), and the bash resolver suite now runs in CI.
+
+### Added
+- **Code retrieval down-weights test files** by a measured additive penalty so
+  product code is not crowded out by tests on product-intent queries (an env
+  override restores dominant test files; opt-in per project via the ranker).
+- **Code entities carry `is_test` + `n_callers` metadata** (schema v6, additive)
+  and an optional LLM-generated one-line/summary sidecar (`.code_formats.json`)
+  rendered in retrieval results; the summary-backend ladder is shared with the
+  KG summary generator.
+- **RL telemetry now covers the code retrieval path** (previously KG-only):
+  code retrievals record `rl_used` + shown order, stage citation vectors so
+  code results become labelable, surface container 4xx fallbacks instead of
+  silently degrading, and `query_code_structure` emits structural telemetry.
+
+### Removed
+- Retired the dead JSONL `training_loader` (the RL corpus has been DB-only since
+  RL v0.2.11; it had zero production callers and mismatched the current cohorts).
+
 ## [0.2.72] - 2026-07-02
 
 ### Fixed (codegraph retrieval quality — the injection-noise release)
