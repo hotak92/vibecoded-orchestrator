@@ -21,6 +21,14 @@
 //! "PID file with liveness probe" is more debuggable: a user can
 //! `cat ~/.vct/hub.pid` and see whether the PID matches.
 //!
+//! **Atomicity (F-6, v0.2.73)**: `acquire()`'s read→decide→write section
+//! is serialised across processes by an `O_CREAT|O_EXCL` sidecar
+//! (`hub.pid.claim`, RAII `ClaimGuard`), so concurrent starters (the
+//! install.py post-step + session-start hook + launcher GUI trio) cannot
+//! double-claim inside the read→write gap. The hub's own shutdown paths
+//! release via `release_owned()` (pid-checked) so a losing starter can
+//! never delete a healthy winner's lockfile.
+//!
 //! The lockfile is written with mode 0o600 on Unix — same posture as
 //! `hub.token`. **Format (v0.2.69):**
 //!   * LINE 1 — the integer PID. Always present; every reader takes the
@@ -181,20 +189,138 @@ pub fn running_hub_is_stale(pid: u32, recorded_identity: Option<&str>) -> bool {
     false
 }
 
+/// Sidecar file serialising `acquire()`'s read→decide→write critical
+/// section across processes (F-6, v0.2.73).
+const CLAIM_FILE: &str = "hub.pid.claim";
+
+/// How long a contender waits for a concurrent `acquire()` to finish
+/// before giving up. The guarded section is pure file I/O (milliseconds);
+/// a hold longer than this means the holder is wedged or its pid was
+/// recycled — the mtime-based staleness check below reclaims those.
+const CLAIM_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A claim file older than this is stale no matter what pid it records
+/// (covers pid-recycling: the real holder died, an unrelated process now
+/// owns the pid, and the liveness probe alone would wait forever).
+const CLAIM_STALE_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// RAII guard: `O_CREAT|O_EXCL` on `<vct_root_dir>/hub.pid.claim`.
+///
+/// Why this exists (F-6): the pre-v0.2.73 `acquire()` was read-then-write
+/// with NO mutual exclusion. Two hubs whose reads landed inside the
+/// milliseconds-scale read→write gap BOTH returned `Claimed`, and the
+/// design comment claimed the port bind would reveal the duplicate — but
+/// `server.rs::try_bind`'s port ladder silently moved the loser to
+/// port+1 and let it RUN, yielding two live hubs / a hub.port paired
+/// with the other hub's hub.token. Serialising the critical section
+/// makes the claim atomic; a loser now deterministically observes the
+/// winner's pid and returns `AlreadyRunning`.
+///
+/// Failure model:
+/// * claim file exists + recorded pid dead → stale (holder crashed
+///   mid-acquire); remove + retry.
+/// * claim file exists + older than `CLAIM_STALE_AGE` → stale regardless
+///   of pid (recycled-pid case); remove + retry.
+/// * claim file exists + unparseable → creator is mid-write (µs window);
+///   wait. If STILL unparseable at `CLAIM_MAX_WAIT`, it is a corrupt
+///   leftover — remove + retry once more.
+/// * otherwise contended past `CLAIM_MAX_WAIT` → error (honest surface;
+///   the winner's acquire completes in milliseconds, so a long hold is
+///   itself a defect worth seeing).
+struct ClaimGuard {
+    path: PathBuf,
+}
+
+impl ClaimGuard {
+    fn acquire() -> Result<Self, String> {
+        let path = vct_root_dir().join(CLAIM_FILE);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create_dir_all {}: {}", parent.display(), e))?;
+        }
+        let start = std::time::Instant::now();
+        let mut removed_corrupt_once = false;
+        loop {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            match opts.open(&path) {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    let _ = writeln!(f, "{}", std::process::id());
+                    return Ok(ClaimGuard { path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Stale-claim cleanup: dead recorded pid, or too old.
+                    let recorded_dead = std::fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|c| c.lines().next().map(|l| l.trim().to_string()))
+                        .and_then(|l| l.parse::<u32>().ok())
+                        .map(|pid| !pid_is_alive(pid));
+                    let too_old = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .map(|age| age > CLAIM_STALE_AGE)
+                        .unwrap_or(false);
+                    if recorded_dead == Some(true) || too_old {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    if start.elapsed() > CLAIM_MAX_WAIT {
+                        if recorded_dead.is_none() && !removed_corrupt_once {
+                            // Unparseable for the whole wait budget: the
+                            // creator's `writeln!` trails its create by
+                            // microseconds, so this is a corrupt leftover
+                            // (e.g. SIGKILL between create and write).
+                            removed_corrupt_once = true;
+                            let _ = std::fs::remove_file(&path);
+                            continue;
+                        }
+                        return Err(format!(
+                            "hub lockfile claim at {} is held by another process; \
+                             a concurrent vct-hub start should win in milliseconds — \
+                             if this persists, remove the file and retry",
+                            path.display()
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => return Err(format!("claim {}: {}", path.display(), e)),
+            }
+        }
+    }
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Try to claim the lockfile for the current process.
 ///
-/// Sequence:
+/// Sequence (under the cross-process `ClaimGuard` mutex — F-6, v0.2.73):
 /// 1. Read existing PID. If absent → write our PID+identity, return Claimed.
 /// 2. If present + alive + CURRENT binary → AlreadyRunning. Don't touch it.
 /// 3. If present + alive + STALE binary → StaleVersion (caller stops + retries).
-/// 4. If present + dead → overwrite with our PID+identity, return Claimed.
+/// 4. If present + dead (or unreadable — stale-equivalent) → overwrite
+///    with our PID+identity, return Claimed.
 ///
-/// Race window: between the read and the write a second hub could also see
-/// the stale file. Both would overwrite with their PID; whichever runs last
-/// wins. To make that race harmless, the binder downstream of this function
-/// also tries `TcpListener::bind` on the hub port — EADDRINUSE on the bind
-/// reveals the duplicate. So lockfile + bind together form the atomic check.
+/// History: pre-v0.2.73 this was an UNGUARDED read-then-write, and the
+/// comment here declared the read→write race "harmless" because
+/// "EADDRINUSE on the bind reveals the duplicate". That premise was
+/// defeated by `server.rs::try_bind`'s port ladder (the losing duplicate
+/// silently bound port+1 and RAN — audit finding F-6). The claim is now
+/// genuinely atomic: contenders serialise on `hub.pid.claim`, so exactly
+/// one process can transition the lockfile per critical section and a
+/// loser deterministically sees the winner's live pid → AlreadyRunning.
 pub fn acquire() -> Result<AcquireOutcome, String> {
+    let _guard = ClaimGuard::acquire()?;
     if let Some(existing_pid) = read_pid() {
         if pid_is_alive(existing_pid) {
             let recorded = read_identity();
@@ -206,7 +332,8 @@ pub fn acquire() -> Result<AcquireOutcome, String> {
             }
             return Ok(AcquireOutcome::AlreadyRunning { pid: existing_pid });
         }
-        // Dead — stale lockfile. Fall through to overwrite.
+        // Dead — stale lockfile. Fall through to overwrite (safe: we hold
+        // the claim guard, no concurrent acquire can interleave).
     }
     write_pid(std::process::id())?;
     Ok(AcquireOutcome::Claimed)
@@ -260,15 +387,37 @@ pub fn write_pid_and_identity(pid: u32, identity: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Remove the lockfile. Called by the binary's graceful-shutdown path
-/// (`--stop` IPC, SIGTERM/SIGINT). Best-effort: a leftover lockfile
-/// from a kill -9 is detected at next acquire() as "stale" anyway.
+/// Remove the lockfile UNCONDITIONALLY. Only appropriate when the caller
+/// has positively confirmed the recorded owner is DEAD (the cleanup arms
+/// in `lifecycle::stop` / `lifecycle::start_if_not_running`). The hub's
+/// own shutdown/failure paths must use `release_owned` instead — see its
+/// docstring for the F-6 wrongful-release hazard.
 pub fn release() -> Result<(), String> {
     let path = pid_path();
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("remove {}: {}", path.display(), e)),
+    }
+}
+
+/// Remove the lockfile ONLY when it still records OUR pid (F-6,
+/// v0.2.73). The hub binary's own failure/shutdown paths
+/// (`main.rs::run_foreground`) must use this instead of `release()`:
+/// pre-fix, a hub that failed its port bind released the lockfile
+/// UNCONDITIONALLY — by that point the file could record a different,
+/// HEALTHY hub (e.g. after a stale-version takeover), so the release
+/// deleted the winner's claim and re-opened the double-start window.
+///
+/// Conservative on every non-positive read: an absent, unreadable, or
+/// foreign-pid lockfile is left untouched (do nothing rather than guess).
+/// A leftover file from our own kill -9 is detected at the next
+/// `acquire()` as dead-owner-stale anyway.
+pub fn release_owned() -> Result<(), String> {
+    match read_pid() {
+        Some(pid) if pid == std::process::id() => release(),
+        // Someone else's claim (or unreadable) — leave it alone.
+        _ => Ok(()),
     }
 }
 
@@ -555,6 +704,129 @@ mod tests {
                 "lockfile at {} should now hold our pid",
                 root.join(PID_FILE).display()
             );
+        });
+    }
+
+    // ── F-6 (v0.2.73): atomic claim + pid-owned release ─────────────────
+
+    /// THE regression test for the double-claim entry window (VERIFICATION
+    /// refinement: the hazard is `acquire()`'s ms-scale read→write gap).
+    /// Pre-fix, N concurrent acquires whose reads landed inside the gap
+    /// ALL returned `Claimed` (each overwrote the file). Post-fix the
+    /// `hub.pid.claim` sidecar serialises the critical section: exactly
+    /// one contender wins; every loser deterministically observes the
+    /// winner's live pid and reports `AlreadyRunning`.
+    #[test]
+    fn acquire_concurrent_claims_exactly_one_winner() {
+        with_state_dir(|root| {
+            const CONTENDERS: usize = 8;
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(CONTENDERS));
+            let mut handles = Vec::new();
+            for _ in 0..CONTENDERS {
+                let b = barrier.clone();
+                handles.push(std::thread::spawn(move || {
+                    // Barrier maximises the chance every read lands
+                    // inside the (pre-fix) read→write gap.
+                    b.wait();
+                    acquire()
+                }));
+            }
+            let outcomes: Vec<AcquireOutcome> = handles
+                .into_iter()
+                .map(|h| h.join().expect("thread").expect("acquire"))
+                .collect();
+
+            let claimed = outcomes
+                .iter()
+                .filter(|o| matches!(o, AcquireOutcome::Claimed))
+                .count();
+            let already = outcomes
+                .iter()
+                .filter(|o| matches!(o, AcquireOutcome::AlreadyRunning { .. }))
+                .count();
+            assert_eq!(
+                claimed, 1,
+                "exactly ONE contender may claim the lockfile; got {} (outcomes: {:?})",
+                claimed, outcomes
+            );
+            assert_eq!(
+                already,
+                CONTENDERS - 1,
+                "every loser must observe the winner as AlreadyRunning: {:?}",
+                outcomes
+            );
+            // All contenders share this test process's pid, so the file
+            // records it — and the claim sidecar must be gone (RAII).
+            assert_eq!(read_pid(), Some(std::process::id()));
+            assert!(
+                !root.join(CLAIM_FILE).exists(),
+                "hub.pid.claim must be removed once acquire() returns"
+            );
+        });
+    }
+
+    /// A corrupt (unparseable) hub.pid is stale-equivalent per the module
+    /// contract — acquire() overwrites it (now safely, under the claim
+    /// guard).
+    #[test]
+    fn acquire_reclaims_corrupt_lockfile() {
+        with_state_dir(|root| {
+            std::fs::write(root.join(PID_FILE), "not-a-pid\ngarbage\n").unwrap();
+            let outcome = acquire().expect("acquire");
+            assert_eq!(outcome, AcquireOutcome::Claimed);
+            assert_eq!(read_pid(), Some(std::process::id()));
+        });
+    }
+
+    /// A stale claim SIDECAR left by a crashed contender (dead recorded
+    /// pid) must not wedge acquire() — the guard cleans it and proceeds.
+    #[test]
+    fn acquire_cleans_stale_claim_sidecar() {
+        with_state_dir(|root| {
+            // u32::MAX is rejected by pid_is_alive as a sentinel → "dead".
+            std::fs::write(root.join(CLAIM_FILE), format!("{}\n", u32::MAX)).unwrap();
+            let outcome = acquire().expect("acquire");
+            assert_eq!(outcome, AcquireOutcome::Claimed);
+            assert!(
+                !root.join(CLAIM_FILE).exists(),
+                "stale claim sidecar must be cleaned up"
+            );
+        });
+    }
+
+    /// release_owned removes the lockfile when it records OUR pid…
+    #[test]
+    fn release_owned_removes_own_lockfile() {
+        with_state_dir(|_root| {
+            write_pid(std::process::id()).unwrap();
+            release_owned().expect("release_owned");
+            assert_eq!(read_pid(), None, "own lockfile must be removed");
+        });
+    }
+
+    /// …and leaves a FOREIGN hub's lockfile strictly alone (the F-6
+    /// wrongful-release hazard: a losing starter must never delete a
+    /// healthy winner's claim). Also conservative on absent/corrupt.
+    #[test]
+    fn release_owned_leaves_foreign_lockfile_alone() {
+        with_state_dir(|root| {
+            // Foreign pid (not ours — sentinel is fine, ownership check is
+            // a pid comparison, not a liveness probe).
+            write_pid(u32::MAX).unwrap();
+            release_owned().expect("release_owned is a no-op, not an error");
+            assert_eq!(
+                read_pid(),
+                Some(u32::MAX),
+                "foreign lockfile must survive release_owned"
+            );
+            // Corrupt file: also left alone (cannot positively confirm
+            // ownership → do nothing).
+            std::fs::write(root.join(PID_FILE), "not-a-pid\n").unwrap();
+            release_owned().expect("release_owned on corrupt file");
+            assert!(root.join(PID_FILE).exists(), "corrupt lockfile left in place");
+            // Absent: still Ok.
+            std::fs::remove_file(root.join(PID_FILE)).unwrap();
+            release_owned().expect("release_owned on absent file");
         });
     }
 

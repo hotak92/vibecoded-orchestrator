@@ -371,6 +371,13 @@ pub fn filter_env_for_global_json(
 /// Why this is a separate pure function: makes the entry shape easy to
 /// unit-test in Rust AND mirror in `tests/test_install_mcp_registration.py`
 /// without spinning up an actual file write.
+///
+/// MUST stay in sync with the Python mirror
+/// `install.py::_build_python_mcp_entries` (Tier-4 pure-Python fallback
+/// writer) — same entry names, same order, same shapes. A drift between
+/// the two means fresh installs get different `~/.claude.json` contents
+/// depending on whether the launcher binary or the Python fallback did
+/// the write.
 pub fn build_default_mcp_entries(
     install_root: &Path,
     venv_python: &Path,
@@ -433,6 +440,30 @@ pub fn build_default_mcp_entries(
         "env": serde_json::Value::Object(search_env_safe),
     });
 
+    // ── playwright (F-1, v0.2.73) ───────────────────────────────────
+    // Browser automation via Microsoft's `@playwright/mcp`. The entry
+    // mirrors EXACTLY how the MCP is launched everywhere else in the
+    // stack: bare `npx -y @playwright/mcp@latest` — the same invocation
+    // the GUI catalog ships (vct-launcher-core/src/types.rs::
+    // default_mcp_servers) and install.py's `_install_playwright_browsers`
+    // pre-caches. `npx` resolves from PATH cross-OS; no venv-python and
+    // no env vars are involved. Default-enabled per project.
+    //
+    // Pre-v0.2.73 this entry was MISSING from both builders (audit
+    // finding F-1): the GUI catalog shipped `enabled: true`, so the
+    // toggle-ON write never fired on a fresh install, and no install
+    // path wrote the entry — docs promised a default-enabled playwright
+    // MCP while the ~150 MB Chromium pre-cache was spent on an MCP that
+    // never reached ~/.claude.json.
+    let playwright_env: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    let playwright_entry = serde_json::json!({
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "@playwright/mcp@latest"],
+        "env": serde_json::Value::Object(playwright_env),
+    });
+    let playwright_dropped: Vec<String> = Vec::new();
+
     // ── mermaid (Phase 1.2 — wrapper MCP) ───────────────────────────
     // The wrapper proxies the npm `claude-mermaid` package and filters
     // its tool surface per-project. Spawn command: `<venv-python> -m
@@ -488,9 +519,63 @@ pub fn build_default_mcp_entries(
     vec![
         ("weaviate-kg".to_string(), weaviate_entry, weaviate_dropped),
         ("search".to_string(), search_entry, search_dropped),
+        ("playwright".to_string(), playwright_entry, playwright_dropped),
         ("mermaid".to_string(), mermaid_entry, mermaid_dropped),
         ("excalidraw".to_string(), excalidraw_entry, excalidraw_dropped),
     ]
+}
+
+/// Names of the bundled MCPs whose canonical `~/.claude.json` entries are
+/// composed by `build_default_mcp_entries`. Single source of truth for
+/// "which ids must be (re)registered with the canonical builder shape" —
+/// the GUI toggle path (`dashboard.rs::toggle_mcp_server_inner`) and the
+/// stale-rewrite partition below both consult this list, and the
+/// `default_mcp_entry_names_matches_builder_output` unit test pins it
+/// against the builder's actual output so the two cannot drift (the
+/// pre-v0.2.73 catalog disagreements are audit findings F-1/F-2/F-3).
+pub const DEFAULT_MCP_ENTRY_NAMES: &[&str] =
+    &["weaviate-kg", "search", "playwright", "mermaid", "excalidraw"];
+
+/// Compose the canonical `~/.claude.json` entry for ONE bundled MCP id
+/// (F-2, v0.2.73).
+///
+/// Returns:
+///   * `Ok(Some((entry, dropped_keys)))` — `mcp_id` is bundled and the
+///     canonical entry was composed via `build_default_mcp_entries`.
+///   * `Ok(None)` — `mcp_id` is not a bundled default (user-added custom
+///     MCP); the caller should use its own stored entry shape.
+///   * `Err(_)` — `mcp_id` IS bundled but the canonical entry cannot be
+///     composed (no venv-python under `install_root`). Callers must NOT
+///     fall back to a non-canonical shape on this arm — writing a broken
+///     entry into ~/.claude.json is strictly worse than surfacing the
+///     error (the write "succeeds" and the MCP silently never spawns
+///     again).
+///
+/// Note: playwright's entry does not actually use the venv-python, but
+/// every bundled id routes through the single builder anyway (one
+/// concern, one home); a correctly-installed orchestrator always has the
+/// venv, so the shared gate costs nothing in practice.
+pub fn default_entry_for_bundled_mcp(
+    install_root: &Path,
+    mcp_id: &str,
+    ports: ServicePorts,
+) -> Result<Option<(serde_json::Value, Vec<String>)>, String> {
+    if !DEFAULT_MCP_ENTRY_NAMES.contains(&mcp_id) {
+        return Ok(None);
+    }
+    let venv_python = resolve_venv_python(install_root).ok_or_else(|| {
+        format!(
+            "cannot compose the canonical `{}` MCP entry: no venv-python found \
+             under `{}` (tried .venv and claude_mcp_servers/.venv). Check the \
+             launcher's install path / re-run the installer, then toggle again.",
+            mcp_id,
+            install_root.display()
+        )
+    })?;
+    Ok(build_default_mcp_entries(install_root, &venv_python, ports)
+        .into_iter()
+        .find(|(name, _, _)| name == mcp_id)
+        .map(|(_, entry, dropped)| (entry, dropped)))
 }
 
 /// Register the canonical bundled-orchestrator MCPs in `~/.claude.json`
@@ -762,10 +847,12 @@ pub fn rewrite_stale_orchestrator_mcps(
     }
 
     // Partition accepted names into bundled (writer can touch) and
-    // non-bundled (writer leaves alone). The bundled set must stay in
-    // sync with `build_default_mcp_entries` — currently weaviate-kg
-    // and search.
-    let bundled = ["weaviate-kg", "search"];
+    // non-bundled (writer leaves alone). F-2 (v0.2.73): derive from
+    // DEFAULT_MCP_ENTRY_NAMES instead of a drifted local copy — the
+    // pre-v0.2.73 list here ("weaviate-kg", "search") had already
+    // fallen out of sync with the builder (mermaid/excalidraw missing),
+    // so an accepted stale mermaid entry was skipped as "non-bundled".
+    let bundled = DEFAULT_MCP_ENTRY_NAMES;
     let mut accept_bundled = false;
     for name in accept_names {
         if bundled.iter().any(|b| *b == name.as_str()) {
@@ -997,9 +1084,11 @@ mod tests {
         // include it here. vct-coordination is Pro-tier and likewise excluded.
         // Phase 1.2 (diagrams plan): mermaid wrapper appended.
         // Phase 2 (diagrams plan): excalidraw wrapper appended.
+        // F-1 (v0.2.73): playwright added — was promised default-enabled by
+        // the docs + GUI catalog but never written by any install path.
         assert_eq!(
             names,
-            vec!["weaviate-kg", "search", "mermaid", "excalidraw"]
+            vec!["weaviate-kg", "search", "playwright", "mermaid", "excalidraw"]
         );
 
         // ── weaviate-kg shape ────────────────────────────────────────
@@ -1043,6 +1132,112 @@ mod tests {
             assert_eq!(search["args"].as_array().unwrap().len(), 0);
         }
 
+        // ── playwright shape (F-1, v0.2.73) ──────────────────────────
+        // Must match the shipped launch command everywhere else:
+        // `npx -y @playwright/mcp@latest`, empty env, no venv-python.
+        let (_, playwright, playwright_dropped) = &entries[2];
+        assert_eq!(playwright["type"], "stdio");
+        assert_eq!(playwright["command"], "npx");
+        let playwright_args = playwright["args"].as_array().unwrap();
+        assert_eq!(playwright_args.len(), 2);
+        assert_eq!(playwright_args[0], "-y");
+        assert_eq!(playwright_args[1], "@playwright/mcp@latest");
+        assert!(
+            playwright["env"].as_object().unwrap().is_empty(),
+            "playwright entry must carry an empty env: {}",
+            playwright["env"]
+        );
+        assert!(
+            playwright_dropped.is_empty(),
+            "playwright entry drops no keys: {:?}",
+            playwright_dropped
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// F-2 (v0.2.73): the names constant and the builder's output are two
+    /// spellings of the same catalog — pin them together so a sixth MCP
+    /// added to only one side fails loudly (the F-1 playwright gap was
+    /// exactly this drift).
+    #[test]
+    fn default_mcp_entry_names_matches_builder_output() {
+        let root = make_pseudo_install_root();
+        let py = resolve_venv_python(&root).expect("pseudo venv-python");
+        let entries = build_default_mcp_entries(&root, &py, ServicePorts::default());
+        let names: Vec<&str> = entries.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(
+            names, DEFAULT_MCP_ENTRY_NAMES,
+            "DEFAULT_MCP_ENTRY_NAMES must equal build_default_mcp_entries output (same order)"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// F-2: the per-id helper composes the SAME canonical entry the
+    /// full builder produces — absolute venv-python command for
+    /// weaviate-kg, not the GUI catalog's relative-path stub.
+    #[test]
+    fn default_entry_for_bundled_mcp_composes_canonical_entry() {
+        let root = make_pseudo_install_root();
+        let py = resolve_venv_python(&root).expect("pseudo venv-python");
+
+        let (entry, _dropped) =
+            default_entry_for_bundled_mcp(&root, "weaviate-kg", ServicePorts::default())
+                .expect("no error with a valid pseudo install root")
+                .expect("weaviate-kg is bundled");
+        assert_eq!(entry["type"], "stdio");
+        assert_eq!(entry["command"], py.display().to_string());
+        let cmd = entry["command"].as_str().unwrap();
+        assert!(
+            std::path::Path::new(cmd).is_absolute(),
+            "canonical command must be absolute: {}",
+            cmd
+        );
+        assert!(
+            std::path::Path::new(cmd).exists(),
+            "canonical command must exist on disk: {}",
+            cmd
+        );
+
+        // playwright routes through the same helper (no venv use, but
+        // one home for entry composition).
+        let (pw, _) =
+            default_entry_for_bundled_mcp(&root, "playwright", ServicePorts::default())
+                .expect("no error")
+                .expect("playwright is bundled");
+        assert_eq!(pw["command"], "npx");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// F-2: a custom (non-bundled) id yields Ok(None) — the caller keeps
+    /// its own stored entry shape.
+    #[test]
+    fn default_entry_for_bundled_mcp_none_for_custom_id() {
+        let root = make_pseudo_install_root();
+        let out = default_entry_for_bundled_mcp(&root, "my-custom-mcp", ServicePorts::default())
+            .expect("no error");
+        assert!(out.is_none(), "custom ids are not composed by the builder");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// F-2 conservative arm: a bundled id over an install root with NO
+    /// venv-python must ERROR — never silently fall back to a shape that
+    /// writes a broken entry.
+    #[test]
+    fn default_entry_for_bundled_mcp_errors_without_venv() {
+        let root = std::env::temp_dir().join(format!(
+            "vct-empty-install-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let err = default_entry_for_bundled_mcp(&root, "weaviate-kg", ServicePorts::default())
+            .expect_err("bundled id without venv must error");
+        assert!(
+            err.contains("no venv-python"),
+            "error should name the missing venv: {}",
+            err
+        );
         fs::remove_dir_all(&root).ok();
     }
 
@@ -1062,15 +1257,24 @@ mod tests {
         assert!(report.all_succeeded(), "report.outcomes: {:?}", report.outcomes);
         // Phase 1.2 (diagrams plan): mermaid wrapper added → 3 entries.
         // Phase 2 (diagrams plan): excalidraw wrapper added → 4 entries.
+        // F-1 (v0.2.73): playwright added → 5 entries.
         // Prior: weaviate-kg + search (2). Both wrappers register in
         // ~/.claude.json but are default-DISABLED at the per-project
         // gate (see BUNDLED_MCP_DEFAULT_DISABLED in vct-launcher-core).
-        assert_eq!(report.success_count(), 4);
+        assert_eq!(report.success_count(), 5);
 
         let raw = fs::read_to_string(&target).unwrap();
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(json["mcpServers"]["weaviate-kg"].is_object());
         assert!(json["mcpServers"]["search"].is_object());
+        assert!(
+            json["mcpServers"]["playwright"].is_object(),
+            "playwright MCP must be registered in ~/.claude.json (F-1)"
+        );
+        assert_eq!(
+            json["mcpServers"]["playwright"]["command"], "npx",
+            "playwright registration must match the shipped launch command (npx)"
+        );
         assert!(
             json["mcpServers"]["mermaid"].is_object(),
             "mermaid wrapper MCP must be registered in ~/.claude.json"

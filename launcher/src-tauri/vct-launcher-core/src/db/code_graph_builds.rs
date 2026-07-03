@@ -40,6 +40,13 @@ pub struct CodeGraphBuildRow {
     pub joern_used: bool,
     pub error_message: Option<String>,
     pub log_tail: Option<String>,
+    /// R-4 (v0.2.73, migration 037): OS pid of a DETACHED analyzer
+    /// process registered via the hub's codegraph-build endpoint
+    /// (install.py's post-update resync). `None` = launcher-spawned
+    /// build whose lifecycle is tied to the launcher process. The
+    /// boot-time sweep treats the two differently — see
+    /// `sweep_dead_detached_code_graph_builds`.
+    pub pid: Option<i64>,
 }
 
 /// Cap stored log_tail at 4 KiB. The analyzer's stdout/stderr is mostly
@@ -59,6 +66,15 @@ impl Db {
     ///
     /// Languages are serialized to JSON in the `languages` column. None
     /// stays SQL NULL. Same for `error_message` and `log_tail`.
+    ///
+    /// R-4 (v0.2.73): this legacy writer explicitly CLEARS `pid` on
+    /// every call. Every caller of this signature is a LAUNCHER-spawned
+    /// lifecycle transition (tokio child, no meaningful OS pid to
+    /// record); a launcher-driven write superseding a detached-walk row
+    /// must not leave the detached walk's stale pid attached to a row it
+    /// no longer describes (the boot sweep would then aliveness-check
+    /// the wrong process). Detached walks register through
+    /// `register_running_code_graph_build` instead.
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_code_graph_build(
         &self,
@@ -99,8 +115,8 @@ impl Db {
             .execute(
                 "INSERT INTO code_graph_builds
                     (project_id, status, started_at, finished_at, duration_ms,
-                     files_analyzed, languages, joern_used, error_message, log_tail)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                     files_analyzed, languages, joern_used, error_message, log_tail, pid)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)
                  ON CONFLICT(project_id) DO UPDATE SET
                     status         = excluded.status,
                     started_at     = excluded.started_at,
@@ -110,7 +126,8 @@ impl Db {
                     languages      = excluded.languages,
                     joern_used     = excluded.joern_used,
                     error_message  = excluded.error_message,
-                    log_tail       = excluded.log_tail",
+                    log_tail       = excluded.log_tail,
+                    pid            = NULL",
                 params![
                     project_id,
                     status,
@@ -128,6 +145,45 @@ impl Db {
         Ok(())
     }
 
+    /// Register a DETACHED analyzer walk as this project's build row
+    /// (R-4, v0.2.73). Called by the hub's codegraph-build endpoint on
+    /// behalf of install.py's `spawn_background_resync` — the row is
+    /// written BEFORE the spawn is considered registered, giving the GUI
+    /// its progress pill and the boot sweep a pid to aliveness-check.
+    ///
+    /// Writes: status='running', started_at=now, pid=`pid`; clears the
+    /// terminal fields from any prior row (a fresh walk supersedes the
+    /// previous build's outcome, same as the legacy upsert's semantics).
+    pub fn register_running_code_graph_build(
+        &self,
+        project_id: &str,
+        pid: u32,
+    ) -> Result<(), String> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let guard = self.lock();
+        guard
+            .execute(
+                "INSERT INTO code_graph_builds
+                    (project_id, status, started_at, finished_at, duration_ms,
+                     files_analyzed, languages, joern_used, error_message, log_tail, pid)
+                 VALUES (?1, 'running', ?2, NULL, NULL, 0, NULL, 0, NULL, NULL, ?3)
+                 ON CONFLICT(project_id) DO UPDATE SET
+                    status         = 'running',
+                    started_at     = excluded.started_at,
+                    finished_at    = NULL,
+                    duration_ms    = NULL,
+                    files_analyzed = 0,
+                    languages      = NULL,
+                    joern_used     = 0,
+                    error_message  = NULL,
+                    log_tail       = NULL,
+                    pid            = excluded.pid",
+                params![project_id, now_ms, pid as i64],
+            )
+            .map_err(|e| format!("register running code_graph_build: {}", e))?;
+        Ok(())
+    }
+
     pub fn get_code_graph_build(
         &self,
         project_id: &str,
@@ -136,7 +192,7 @@ impl Db {
         guard
             .query_row(
                 "SELECT project_id, status, started_at, finished_at, duration_ms,
-                        files_analyzed, languages, joern_used, error_message, log_tail
+                        files_analyzed, languages, joern_used, error_message, log_tail, pid
                  FROM code_graph_builds
                  WHERE project_id = ?1",
                 params![project_id],
@@ -199,9 +255,16 @@ impl Db {
             .map_err(|e| format!("collect list running code_graph_builds: {}", e))
     }
 
-    /// Single-statement update: flip every row currently in status='running'
-    /// to status='failed' with a fixed error message + finished_at=now.
-    /// Used by the launcher-startup sweep. Returns rows-affected.
+    /// Single-statement update: flip every LAUNCHER-SPAWNED row currently
+    /// in status='running' (pid IS NULL) to status='failed' with a fixed
+    /// error message + finished_at=now. Used by the launcher-startup
+    /// sweep. Returns rows-affected.
+    ///
+    /// R-4 (v0.2.73): restricted to `pid IS NULL`. A 'running' row that
+    /// CARRIES a pid belongs to a detached analyzer (install.py resync)
+    /// that legitimately survives launcher restarts — those rows are
+    /// reconciled by `sweep_dead_detached_code_graph_builds` (pid
+    /// aliveness-aware) instead of being blanket-failed at boot.
     ///
     /// Mirrors `Db::mark_orphaned_running_kg_syncs_failed`.
     pub fn mark_orphaned_running_code_graph_builds_failed(
@@ -220,11 +283,88 @@ impl Db {
                             ELSE NULL
                         END,
                         error_message = ?2
-                  WHERE status = 'running'",
+                  WHERE status = 'running' AND pid IS NULL",
                 params![now_ms, error_message],
             )
             .map_err(|e| format!("mark orphaned running code_graph_builds failed: {}", e))?;
         Ok(affected)
+    }
+
+    /// R-4 (v0.2.73): reconcile DETACHED 'running' rows (pid IS NOT NULL)
+    /// against actual process liveness. For each such row, `is_pid_alive`
+    /// decides:
+    ///   * alive → leave alone (the detached walk is still working; it
+    ///     survives launcher restarts by design).
+    ///   * positively dead → flip to 'failed' with a message naming the
+    ///     pid, so the GUI shows the broken walk with a Retry button and
+    ///     the silent-death case (RT-5: a P7 resync died mid-walk leaving
+    ///     ~6.2k stale rows with zero signal) becomes visible.
+    ///   * pid out of u32 range (corrupt row) → CONSERVATIVE leave-alone;
+    ///     we cannot positively confirm deadness, and a false 'failed' on
+    ///     a live walk is worse than a stale pill.
+    ///
+    /// `is_pid_alive` is injected so unit tests can simulate dead/alive
+    /// pids without real processes; production passes
+    /// `vct_launcher_core::process::pid_is_alive`.
+    ///
+    /// Returns the project_ids whose rows were flipped to 'failed'.
+    pub fn sweep_dead_detached_code_graph_builds(
+        &self,
+        is_pid_alive: impl Fn(u32) -> bool,
+    ) -> Result<Vec<String>, String> {
+        // Snapshot (project_id, pid) pairs first; decide + update per row.
+        let rows: Vec<(String, i64)> = {
+            let guard = self.lock();
+            let mut stmt = guard
+                .prepare(
+                    "SELECT project_id, pid FROM code_graph_builds
+                     WHERE status = 'running' AND pid IS NOT NULL",
+                )
+                .map_err(|e| format!("prepare list detached running builds: {}", e))?;
+            let mapped = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .map_err(|e| format!("query detached running builds: {}", e))?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("collect detached running builds: {}", e))?
+        };
+
+        let mut failed = Vec::new();
+        for (project_id, pid) in rows {
+            let pid_u32 = match u32::try_from(pid) {
+                Ok(p) => p,
+                // Corrupt/out-of-range pid: cannot positively confirm
+                // deadness → leave the row alone (conservative default).
+                Err(_) => continue,
+            };
+            if is_pid_alive(pid_u32) {
+                continue;
+            }
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let msg = format!(
+                "detached analyzer process (pid {}) is no longer running; \
+                 the walk died before completing — click Re-analyze (or re-run \
+                 the update resync) to finish it",
+                pid_u32
+            );
+            let guard = self.lock();
+            guard
+                .execute(
+                    "UPDATE code_graph_builds
+                        SET status = 'failed',
+                            finished_at = ?1,
+                            duration_ms = CASE
+                                WHEN started_at IS NOT NULL THEN ?1 - started_at
+                                ELSE NULL
+                            END,
+                            error_message = ?2
+                      WHERE project_id = ?3 AND status = 'running'",
+                    params![now_ms, msg, project_id],
+                )
+                .map_err(|e| format!("fail dead detached build {}: {}", project_id, e))?;
+            failed.push(project_id);
+        }
+        Ok(failed)
     }
 }
 
@@ -245,6 +385,7 @@ fn row_to_build(row: &rusqlite::Row<'_>) -> rusqlite::Result<CodeGraphBuildRow> 
         joern_used: joern_int != 0,
         error_message: row.get(8)?,
         log_tail: row.get(9)?,
+        pid: row.get(10)?,
     })
 }
 
@@ -484,6 +625,184 @@ mod tests {
             .mark_orphaned_running_code_graph_builds_failed("ignored")
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    // ─── R-4 (v0.2.73): detached-walk registration + pid-aware sweep ────
+
+    /// The hub endpoint's writer: a fresh 'running' row carrying the
+    /// detached analyzer's pid, terminal fields cleared.
+    #[test]
+    fn register_running_writes_running_row_with_pid() {
+        let (db, pid_str) = fresh_db_with_project();
+        // Seed a prior terminal row so we prove the re-registration
+        // clears it (fresh walk supersedes the previous outcome).
+        db.upsert_code_graph_build(
+            &pid_str,
+            status::SUCCESS,
+            Some(1),
+            Some(2),
+            Some(1),
+            9,
+            None,
+            false,
+            None,
+            Some("old"),
+        )
+        .unwrap();
+
+        db.register_running_code_graph_build(&pid_str, 424242).unwrap();
+
+        let row = db.get_code_graph_build(&pid_str).unwrap().unwrap();
+        assert_eq!(row.status, "running");
+        assert_eq!(row.pid, Some(424242));
+        assert!(row.started_at.is_some(), "started_at stamped");
+        assert_eq!(row.finished_at, None, "terminal fields cleared");
+        assert_eq!(row.error_message, None);
+        assert_eq!(row.log_tail, None);
+        assert_eq!(row.files_analyzed, 0);
+    }
+
+    /// The legacy (launcher-spawned) upsert CLEARS pid: a launcher-driven
+    /// transition superseding a detached-walk row must not leave the
+    /// stale pid attached (the sweep would aliveness-check the wrong
+    /// process).
+    #[test]
+    fn legacy_upsert_clears_pid() {
+        let (db, pid_str) = fresh_db_with_project();
+        db.register_running_code_graph_build(&pid_str, 555).unwrap();
+        assert_eq!(
+            db.get_code_graph_build(&pid_str).unwrap().unwrap().pid,
+            Some(555)
+        );
+
+        db.upsert_code_graph_build(
+            &pid_str,
+            status::RUNNING,
+            Some(10),
+            None,
+            None,
+            0,
+            None,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let row = db.get_code_graph_build(&pid_str).unwrap().unwrap();
+        assert_eq!(row.pid, None, "legacy upsert must clear pid");
+    }
+
+    /// Boot ghost-sweep must SKIP detached rows: a 'running' row with a
+    /// pid belongs to a process that survives launcher restarts.
+    #[test]
+    fn orphan_sweep_skips_detached_pid_rows() {
+        let (db, ids) = fresh_db_with_mixed_build_states();
+        // Add a detached running row alongside the launcher-spawned one.
+        let detached = uuid::Uuid::new_v4().to_string();
+        let slug = db.generate_unique_slug("detached").unwrap();
+        db.insert_project(
+            &detached,
+            "detached",
+            &fixture_path("cgbuild-detached"),
+            ProjectHost::Base,
+            &slug,
+        )
+        .unwrap();
+        db.register_running_code_graph_build(&detached, std::process::id())
+            .unwrap();
+
+        let n = db
+            .mark_orphaned_running_code_graph_builds_failed("launcher crashed")
+            .unwrap();
+        assert_eq!(n, 1, "only the pid-NULL launcher ghost is swept");
+
+        let ghost = db
+            .get_code_graph_build(ids.get("running_a").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(ghost.status, "failed");
+        let kept = db.get_code_graph_build(&detached).unwrap().unwrap();
+        assert_eq!(
+            kept.status, "running",
+            "detached (pid-bearing) row must survive the ghost sweep"
+        );
+    }
+
+    /// Dead-detached sweep: flips only rows whose pid is POSITIVELY dead;
+    /// alive pids and launcher (pid-NULL) rows are untouched.
+    #[test]
+    fn sweep_dead_detached_flips_only_dead_pids() {
+        let (db, ids) = fresh_db_with_mixed_build_states();
+        let mk = |db: &Db, label: &str, pid: u32| -> String {
+            let id = uuid::Uuid::new_v4().to_string();
+            let slug = db.generate_unique_slug(label).unwrap();
+            db.insert_project(
+                &id,
+                label,
+                &fixture_path(&format!("cgbuild-{}", label)),
+                ProjectHost::Base,
+                &slug,
+            )
+            .unwrap();
+            db.register_running_code_graph_build(&id, pid).unwrap();
+            id
+        };
+        let alive_id = mk(&db, "detached-alive", 1111);
+        let dead_id = mk(&db, "detached-dead", 2222);
+
+        // Injected aliveness: 1111 alive, everything else dead.
+        let failed = db
+            .sweep_dead_detached_code_graph_builds(|pid| pid == 1111)
+            .unwrap();
+        assert_eq!(failed, vec![dead_id.clone()], "exactly the dead pid's row flips");
+
+        let dead_row = db.get_code_graph_build(&dead_id).unwrap().unwrap();
+        assert_eq!(dead_row.status, "failed");
+        assert!(
+            dead_row.error_message.as_deref().unwrap_or("").contains("2222"),
+            "failure message names the dead pid: {:?}",
+            dead_row.error_message
+        );
+        assert!(dead_row.finished_at.is_some());
+
+        let alive_row = db.get_code_graph_build(&alive_id).unwrap().unwrap();
+        assert_eq!(alive_row.status, "running", "alive walk left alone");
+        // Launcher-spawned running row (pid NULL) untouched by THIS sweep.
+        let ghost = db
+            .get_code_graph_build(ids.get("running_a").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ghost.status, "running",
+            "pid-NULL rows are the ghost sweep's job, not the detached sweep's"
+        );
+    }
+
+    /// pid survives the row round-trip and defaults to None on the
+    /// legacy writer.
+    #[test]
+    fn pid_round_trips_and_defaults_none() {
+        let (db, pid_str) = fresh_db_with_project();
+        db.upsert_code_graph_build(
+            &pid_str,
+            status::PENDING,
+            None,
+            None,
+            None,
+            0,
+            None,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(db.get_code_graph_build(&pid_str).unwrap().unwrap().pid, None);
+        db.register_running_code_graph_build(&pid_str, 7).unwrap();
+        assert_eq!(
+            db.get_code_graph_build(&pid_str).unwrap().unwrap().pid,
+            Some(7)
+        );
     }
 
     #[test]

@@ -11,6 +11,13 @@
 # wrapping the command in `lean-ctx -c '<cmd>'`. Empty stdout = no rewrite
 # = raw output.
 #
+# D-3 (v0.2.73): lean-ctx 3.x's response ALSO carries
+# "permissionDecision":"allow", which on Claude Code >= 2.1.x AUTO-APPROVES
+# the tool call -- every wrapped Bash command silently bypassed the user's
+# permission settings. This hook strips that field (keeping updatedInput)
+# before handing the response to Claude Code. MUST MATCH the .sh sibling's
+# filter (verification record lives there).
+#
 # BYPASS HIERARCHY (matches .sh sibling)
 # --------------------------------------
 # 1. Per-call:    invoke as `lean-ctx bypass "<cmd>"` — auto-detected by
@@ -64,8 +71,28 @@ if ($leanCtxDefault -eq "off") { exit 0 }
 # 3. lean-ctx availability — optional dep, never break Bash for users without it.
 if (-not (Get-Command lean-ctx -ErrorAction SilentlyContinue)) { exit 0 }
 
-# 4. Delegate to lean-ctx's rewrite handler. Stdin is connected by Claude
-#    Code (the PreToolUse JSON payload); stdout flows back as the hook's
-#    rewrite response.
-& lean-ctx hook rewrite
-exit $LASTEXITCODE
+# 4. Delegate to lean-ctx's rewrite handler, then strip permissionDecision
+#    (D-3, v0.2.73). Stdin is connected by Claude Code (the PreToolUse JSON
+#    payload); the FILTERED stdout flows back as the hook's rewrite response.
+#    Conservative on every failure arm: unparseable output / nothing left to
+#    emit -> print NOTHING (= no rewrite, raw command). Losing compression
+#    for one call is strictly safer than emitting an auto-approval.
+#    MUST MATCH templates/hooks/lean-ctx-rewrite.sh (python filter there).
+$rewriteOut = & lean-ctx hook rewrite
+if (-not $rewriteOut) { exit 0 }
+$rewriteRaw = ($rewriteOut -join "`n").Trim()
+if (-not $rewriteRaw) { exit 0 }
+try {
+    $data = $rewriteRaw | ConvertFrom-Json
+    $hso = $data.hookSpecificOutput
+    if ($null -eq $hso) { exit 0 }
+    if ($hso.PSObject.Properties['permissionDecision']) {
+        $hso.PSObject.Properties.Remove('permissionDecision')
+    }
+    if ($null -eq $hso.PSObject.Properties['updatedInput'] -or $null -eq $hso.updatedInput) { exit 0 }
+    Write-Output ($data | ConvertTo-Json -Depth 8 -Compress)
+} catch {
+    # Emit nothing: no rewrite, raw command runs under the normal
+    # permission flow.
+}
+exit 0

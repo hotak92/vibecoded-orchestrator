@@ -253,10 +253,29 @@ class BuildEntriesTests(unittest.TestCase):
             # bundled list. vct-coordination is Pro-tier and also excluded.
             # Phase 1.2 (diagrams plan): mermaid wrapper appended.
             # Phase 2 (diagrams plan): excalidraw wrapper appended.
+            # F-1 (v0.2.73): playwright appended — docs + GUI catalog promised
+            # a default-enabled playwright MCP but no install path wrote it.
             self.assertEqual(
                 names,
-                ["weaviate-kg", "search", "mermaid", "excalidraw"],
+                ["weaviate-kg", "search", "playwright", "mermaid", "excalidraw"],
             )
+
+    def test_playwright_entry_shape(self):
+        """F-1 (v0.2.73): playwright registration must match the shipped
+        launch command exactly (`npx -y @playwright/mcp@latest`), with an
+        empty env and no venv-python involvement — same shape as the Rust
+        builder (mcp_registration.rs) and the GUI catalog (types.rs)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = _make_pseudo_install_root(Path(td))
+            py = install._resolve_venv_python_for_install(root)
+            entries = install._build_python_mcp_entries(root, py, 8081, 11435, 50052, 11440)
+            by_name = {n: (e, d) for n, e, d in entries}
+            entry, dropped = by_name["playwright"]
+            self.assertEqual(entry["type"], "stdio")
+            self.assertEqual(entry["command"], "npx")
+            self.assertEqual(entry["args"], ["-y", "@playwright/mcp@latest"])
+            self.assertEqual(entry["env"], {})
+            self.assertEqual(dropped, [])
 
     def test_weaviate_entry_shape(self):
         with tempfile.TemporaryDirectory() as td:
@@ -305,6 +324,9 @@ class BuildEntriesTests(unittest.TestCase):
             self.assertEqual(name, "search")
             self.assertTrue(entry["command"].endswith("wrapper.sh"))
             self.assertEqual(entry["args"], [])
+            self.assertEqual(entries[2][0], "playwright",
+                             "playwright must sit between search and mermaid "
+                             "(mirror of the Rust builder order)")
 
     def test_search_entry_uses_python_on_windows(self):
         """On Windows, no wrapper.sh exists, so python is invoked directly."""
@@ -337,12 +359,13 @@ class PythonFallbackWriterTests(unittest.TestCase):
             self.assertFalse(target.exists())
             success, errors = install._python_fallback_write_mcp_entries(target, entries)
             # Phase 1.2 + Phase 2 (diagrams plan): mermaid + excalidraw
-            # wrappers appended → 4 entries.
-            self.assertEqual(success, 4)
+            # wrappers appended; F-1 (v0.2.73): playwright → 5 entries.
+            self.assertEqual(success, 5)
             self.assertEqual(errors, [])
             data = json.loads(target.read_text(encoding="utf-8"))
             self.assertIn("weaviate-kg", data["mcpServers"])
             self.assertIn("search", data["mcpServers"])
+            self.assertIn("playwright", data["mcpServers"])
             self.assertIn("mermaid", data["mcpServers"])
             self.assertIn("excalidraw", data["mcpServers"])
             # Mermaid points at the wrapper module, NOT direct npx — the
@@ -378,8 +401,8 @@ class PythonFallbackWriterTests(unittest.TestCase):
             }
             target.write_text(json.dumps(existing, indent=2), encoding="utf-8")
             success, errors = install._python_fallback_write_mcp_entries(target, entries)
-            # Phase 1.2 + Phase 2 (diagrams plan): both wrappers → 4 entries.
-            self.assertEqual(success, 4)
+            # Phase 1.2 + Phase 2 (both wrappers) + F-1 playwright → 5 entries.
+            self.assertEqual(success, 5)
             data = json.loads(target.read_text(encoding="utf-8"))
             # User's pre-existing MCP survives.
             self.assertEqual(
@@ -391,6 +414,7 @@ class PythonFallbackWriterTests(unittest.TestCase):
             # Orchestrator MCPs were added.
             self.assertIn("weaviate-kg", data["mcpServers"])
             self.assertIn("search", data["mcpServers"])
+            self.assertIn("playwright", data["mcpServers"])
             self.assertIn("mermaid", data["mcpServers"])
             self.assertIn("excalidraw", data["mcpServers"])
 
@@ -532,7 +556,7 @@ class RegisterMcpsOrchestrationTests(unittest.TestCase):
             )
             data = json.loads(target.read_text(encoding="utf-8"))
             # Critical: orchestrator-written entries must NOT contain GITHUB_TOKEN.
-            for orch_name in ("weaviate-kg", "search", "mermaid", "excalidraw"):
+            for orch_name in ("weaviate-kg", "search", "playwright", "mermaid", "excalidraw"):
                 env = data["mcpServers"].get(orch_name, {}).get("env", {})
                 self.assertNotIn(
                     "GITHUB_TOKEN", env,

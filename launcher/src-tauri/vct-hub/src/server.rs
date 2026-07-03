@@ -65,16 +65,38 @@ pub async fn start_hub_server() -> Result<u16, String> {
         }
     }
 
+    // ── Bind FIRST (F-6, v0.2.73) ────────────────────────────────
+    // The listener bind is the point of no return for "this process IS
+    // the hub" — so it must precede EVERY discovery-file write. Pre-fix,
+    // hub.token was written BEFORE the bind and hub.port AFTER it: two
+    // interleaving starters could publish a hub.port that paired with
+    // the OTHER hub's hub.token, 401-ing every resolver until a restart.
+    // With the bind first, a starter that fails to bind writes NOTHING —
+    // a pre-existing healthy hub's token/port files stay untouched.
+    //
+    // See the bind-address rationale below (kept verbatim) for why this
+    // is 0.0.0.0.
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = try_bind(addr, 5).await?;
+    let actual_port = listener.local_addr().unwrap().port();
+
     // ── Auth token (H5) ──────────────────────────────────────────
     // Generate a fresh token on every startup and persist before we
-    // accept any connections. If either step fails we refuse to
-    // start the server: serving secrets without auth would be
-    // strictly worse than the launcher being temporarily down.
+    // accept any connections (the bind above creates the socket but
+    // axum::serve below is what starts accepting). If either step fails
+    // we refuse to start the server: serving secrets without auth would
+    // be strictly worse than the launcher being temporarily down.
     let auth_token = auth::generate_token()
         .map_err(|e| format!("Failed to generate hub auth token: {}", e))?;
     auth::write_token_file(&auth_token)
         .map_err(|e| format!("Failed to write hub.token: {}", e))?;
     let auth_state = auth::AuthState::new(auth_token);
+
+    // Write port file so other apps can discover us. Token first, port
+    // second: resolvers discover the port and then read the token, so
+    // publishing in this order guarantees the (token, port) pair they
+    // assemble came from the SAME process.
+    write_port_file(actual_port).await;
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -169,9 +191,9 @@ pub async fn start_hub_server() -> Result<u16, String> {
         .layer(axum::Extension(auth_state))
         .layer(cors);
 
-    // Bind 0.0.0.0 (v0.2.61, Option H). The hub MUST be reachable from a
-    // global module's container network namespace (the RL container reads
-    // its training corpus via
+    // Bind-address rationale — 0.0.0.0 (v0.2.61, Option H). The hub MUST
+    // be reachable from a global module's container network namespace
+    // (the RL container reads its training corpus via
     // `GET <VCT_HUB_BASE_URL>/api/v1/modules/{id}/projects/{pid}/rl/events`).
     // `host.containers.internal` resolves to different host addresses per
     // container runtime/backend (bridge gateway on rootful podman/docker,
@@ -190,14 +212,16 @@ pub async fn start_hub_server() -> Result<u16, String> {
     // less code. The token IS the boundary. (If a deployment ever needs
     // the hub pinned off non-loopback interfaces, that's a future opt-in
     // env, not a default.)
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-
-    // Try to bind — if port is taken, try next 5 ports
-    let listener = try_bind(addr, 5).await?;
-    let actual_port = listener.local_addr().unwrap().port();
-
-    // Write port file so other apps can discover us
-    write_port_file(actual_port).await;
+    //
+    // Port-ladder note (F-6, v0.2.73): `try_bind(addr, 5)` walks to
+    // port+1..+5 when the base port is occupied. Pre-fix this DEFEATED
+    // the lockfile's "EADDRINUSE reveals the duplicate" assumption — a
+    // racing duplicate hub silently bound port+1 and ran. The lockfile
+    // claim is now genuinely atomic (`lockfile::ClaimGuard`), so a
+    // contested starter exits in `main.rs` BEFORE ever reaching this
+    // bind; the ladder's only remaining consumer is a genuinely foreign
+    // occupant of the base port, which is the feature it was meant for
+    // (discovery goes through hub.port either way).
 
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {

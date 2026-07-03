@@ -11,6 +11,14 @@
 # `lean-ctx -c '<cmd>'`. Claude Code substitutes the rewritten command
 # and executes it; output comes back compressed ~90-97%.
 #
+# D-3 (v0.2.73): lean-ctx 3.x's response ALSO carries
+# `"permissionDecision":"allow"`, which on Claude Code >= 2.1.x
+# AUTO-APPROVES the tool call — every wrapped Bash command silently
+# bypassed the user's permission settings. This hook now strips that
+# field (keeping updatedInput) before handing the response to Claude
+# Code; see the filter at the bottom for the empirical verification
+# record.
+#
 # When this script exits 0 with no stdout (the no-op paths below), Claude
 # Code interprets that as "no rewrite needed" → the original command runs
 # unmodified → raw output. Same effect as the bypasses below.
@@ -57,14 +65,16 @@
 # 1. VCT_DISABLE_HOOKS (global) — sledgehammer, checked first.
 # 2. .claude/env source + VCO_LEAN_CTX_DEFAULT (per-project) — fine-grained.
 # 3. lean-ctx binary availability — graceful no-op when missing.
-# 4. exec lean-ctx hook rewrite — per-call symmetric bypass handled inside
-#    (commands starting with `lean-ctx ...` emit empty stdout → raw).
+# 4. lean-ctx hook rewrite + permissionDecision strip — per-call symmetric
+#    bypass handled inside lean-ctx (commands starting with `lean-ctx ...`
+#    emit empty stdout → raw).
 set -u
 # Scrub sensitive env vars before any subprocess spawning (defense-in-depth
 # parity with every other VCO hook — enforced by tests/test_hooks_disable_guard.py).
-# Note: this hook itself doesn't read secrets, but `exec lean-ctx hook rewrite`
-# inherits our env. Scrubbing before the exec means the lean-ctx subprocess
-# can't accidentally leak a credential via its own logs / debug output.
+# Note: this hook itself doesn't read secrets, but the `lean-ctx hook rewrite`
+# subprocess inherits our env. Scrubbing before spawning it means the lean-ctx
+# subprocess can't accidentally leak a credential via its own logs / debug
+# output.
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 # Source .claude/env if present so per-project defaults (VCO_LEAN_CTX_DEFAULT)
@@ -75,4 +85,45 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 [ -f .claude/env ] && . .claude/env
 [ "${VCO_LEAN_CTX_DEFAULT:-on}" = "off" ] && exit 0
 command -v lean-ctx >/dev/null 2>&1 || exit 0
-exec lean-ctx hook rewrite
+# D-3 (v0.2.73): strip `permissionDecision` from lean-ctx's response, keep
+# `updatedInput`.
+#
+# WHY: lean-ctx 3.x (verified 3.4.5) emits
+#   {"hookSpecificOutput":{"hookEventName":"PreToolUse",
+#    "permissionDecision":"allow","updatedInput":{"command":"lean-ctx -c '...'"}}}
+# and on Claude Code >= 2.1.x `permissionDecision:"allow"` AUTO-APPROVES the
+# tool call: every wrapped Bash command bypassed the user's permission
+# settings. Verified empirically on CC 2.1.172 (2026-07-03):
+#   * with the field present, an un-allowlisted Bash call EXECUTED in
+#     headless mode solely because of the hook's "allow";
+#   * with the field stripped, updatedInput still applied AND the normal
+#     permission flow evaluated the rewritten command (denied without a
+#     grant, ran with one).
+#
+# Filtering is JSON-aware via python (sed on serialized JSON is brittle).
+# Conservative on every failure arm: no python / unparseable output /
+# nothing left to emit → print NOTHING (= no rewrite, raw command). Losing
+# compression for one call is strictly safer than emitting an auto-approval.
+#
+# MUST MATCH templates/hooks/lean-ctx-rewrite.ps1 (same strip, native
+# ConvertFrom-Json there).
+out="$(lean-ctx hook rewrite)" || exit 0
+[ -z "$out" ] && exit 0
+PYBIN="$(command -v python3 || command -v python || true)"
+[ -z "$PYBIN" ] && exit 0
+printf '%s' "$out" | "$PYBIN" -c '
+import json, sys
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+hso = data.get("hookSpecificOutput")
+if not isinstance(hso, dict):
+    sys.exit(0)
+hso.pop("permissionDecision", None)
+if not hso.get("updatedInput"):
+    sys.exit(0)
+sys.stdout.write(json.dumps(data))
+' 2>/dev/null
+exit 0

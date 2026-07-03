@@ -33,10 +33,13 @@ pub enum LifecycleResult {
 /// over and runs as a daemon.
 ///
 /// Race-window note: between probing and spawning, another caller
-/// could also start the hub. The child's own `acquire()` (in
-/// server::start_hub_server's flow — Step 6 wires it) detects that
-/// and exits. So duplicate spawns self-correct without any external
-/// coordination.
+/// could also start the hub. The child's own `acquire()` (run by
+/// `main.rs::run_foreground` before the server binds) is genuinely
+/// ATOMIC since F-6 (v0.2.73): contenders serialise on the
+/// `hub.pid.claim` sidecar, so exactly one duplicate wins the claim
+/// and every loser exits with AlreadyRunning. (Pre-v0.2.73 this note
+/// relied on "EADDRINUSE on the bind reveals the duplicate", which the
+/// port ladder in `server::try_bind` had silently defeated.)
 pub fn start_if_not_running() -> LifecycleResult {
     if let Some(pid) = lockfile::read_pid() {
         if pid_is_alive(pid) {
