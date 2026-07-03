@@ -119,17 +119,101 @@ class NamedVectorSlot:
     dim: int
     vectorizer: str = "none"
 
-    def to_weaviate_config(self) -> dict:
+    def to_weaviate_config(
+        self,
+        *,
+        index_type: str = "hnsw",
+        distance: str = "cosine",
+        rescore_limit: int = -1,
+    ) -> dict:
         """Serialize this slot into the JSON shape Weaviate's REST
         `POST /v1/schema` expects under the `vectorConfig` key.
 
         Returns the inner dict, NOT keyed by slot name. Callers compose
         ``{slot.name: slot.to_weaviate_config()}`` themselves so they can
         merge with other slots.
+
+        Parameters
+        ----------
+        index_type:
+            ``"hnsw"`` (default — the ONLY shipped default) or ``"hfresh"``.
+
+            **v0.2.73 FIX-D4 — HFresh is PREVIEW + carries hard constraints
+            (doc-verified against the 1.37 docs, 2026-07-03):**
+
+            1. *HFresh MANDATES rotational quantization (RQ) — it cannot be
+               turned off.* A collection born ``vectorIndexType:hfresh`` gets
+               lossy RQ compression on its vectors. So the "vector-preserving
+               copy" preserves the STORED client vectors but the INDEX
+               quantizes them (a recall tradeoff). This is precisely WHY
+               HFresh stays opt-in/flagged and is never a silent swap. When
+               ``index_type='hfresh'`` an ``vectorIndexConfig`` with a
+               ``rescoreLimit`` is emitted so callers can trade recall back
+               for latency; the caller passes ``rescore_limit`` (>=0) to set
+               it, or leaves ``-1`` to accept the engine default.
+            2. *HFresh supports ONLY ``cosine`` + ``l2-squared`` distance
+               (NOT ``dot``).* ``distance='dot'`` with ``index_type='hfresh'``
+               raises ``ValueError`` up-front (a clear, actionable error) so
+               the migrate path can route to a documented fallback rather than
+               failing opaque at ``POST /v1/schema``.
+
+            The default stays ``hnsw`` — do NOT flip it. The integrator runs a
+            mandatory scratch-test on a real 1.37 engine (HFresh × client-
+            supplied named vectors is DOCS-SILENT) before any default flip.
+
+        distance:
+            Distance metric for the vector index. Weaviate default is
+            ``cosine`` (what VCO's KG + code collections use). Only relevant
+            to validate against the HFresh cosine/l2-squared constraint above;
+            when ``hnsw`` (the default) this parameter is accepted for API
+            symmetry but the metric is left to Weaviate's own default unless
+            explicitly non-cosine (kept minimal to avoid changing the shipped
+            hnsw schema shape).
+
+        rescore_limit:
+            Only consulted for ``index_type='hfresh'``. ``>=0`` sets
+            ``vectorIndexConfig.rescoreLimit``; ``-1`` (default) omits it and
+            accepts the engine default.
         """
+        it = (index_type or "hnsw").strip().lower()
+        if it not in ("hnsw", "hfresh"):
+            raise ValueError(
+                f"unsupported vectorIndexType {index_type!r} "
+                "(supported: 'hnsw', 'hfresh')"
+            )
+
+        if it == "hnsw":
+            # UNCHANGED shipped shape — do not perturb the hnsw schema so
+            # existing collections keep classifying as `noop` (the schema
+            # delta must not see a spurious diff on a plain hnsw upgrade).
+            cfg = {
+                "vectorizer": {self.vectorizer: {}},
+                "vectorIndexType": "hnsw",
+            }
+            return cfg
+
+        # ── HFresh (preview, GATED) ─────────────────────────────────────
+        # HFresh × distance guard (doc-verified): cosine + l2-squared only.
+        dist = (distance or "cosine").strip().lower()
+        _HFRESH_DISTANCES = {"cosine", "l2-squared"}
+        if dist not in _HFRESH_DISTANCES:
+            raise ValueError(
+                f"HFresh vectorIndexType supports only {sorted(_HFRESH_DISTANCES)} "
+                f"distance — got {distance!r}. A collection using {distance!r} "
+                "cannot migrate to HFresh; keep it on hnsw (route to the "
+                "documented fallback, do not force the swap)."
+            )
+        # HFresh forces RQ (mandatory — not disableable). We emit an explicit
+        # vectorIndexConfig so the RQ tradeoff is visible in the schema and a
+        # rescoreLimit is tunable. `distance` is set so the config is
+        # self-describing (and so a non-cosine l2-squared choice round-trips).
+        vic: dict = {"distance": dist}
+        if isinstance(rescore_limit, int) and rescore_limit >= 0:
+            vic["rescoreLimit"] = rescore_limit
         return {
             "vectorizer": {self.vectorizer: {}},
-            "vectorIndexType": "hnsw",
+            "vectorIndexType": "hfresh",
+            "vectorIndexConfig": vic,
         }
 
 

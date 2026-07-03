@@ -107,6 +107,18 @@ class DeriveProjectCollectionNamesTests(unittest.TestCase):
                 "shared_kg_collection": "VibeCodedOrchestrator_KnowledgeGraph",
                 "shared_kg_write_disabled": "false",
                 "kg_basename": "VideoFrames",
+                # v0.2.73 GAP-1: the 5 code-graph collection names, so a
+                # consented project-unregister reclaims them too instead of
+                # minting fresh orphans. Code prefix uses the underscore-
+                # preserving canonical_class_prefix (VideoFrames has no
+                # underscores, so it equals the KG basename here).
+                "code_collections": [
+                    "VideoFrames_CodeFunction",
+                    "VideoFrames_CodeModule",
+                    "VideoFrames_CodeClass",
+                    "VideoFrames_CodeAPI",
+                    "VideoFrames_CodeInteraction",
+                ],
             },
         )
 
