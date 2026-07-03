@@ -208,6 +208,10 @@ _CONTENT_HASH_EXCLUDE = frozenset({
     # stamping/bumping the revision never triggers a spurious content-hash
     # rewrite on the unknown-collection fallback path.
     "embed_revision",
+    # v0.2.73 (M1/M4): generation metadata, same rationale — `is_test` is a
+    # pure function of the excluded `file_path`; `n_callers` is recomputed by
+    # every cross-reference pass. Neither belongs in _CONTENT_HASH_FIELDS.
+    "is_test", "n_callers",
 })
 
 
@@ -915,6 +919,7 @@ try:
         truncate_module_for_embedding,
         chunk_or_truncate_for_embedding,
         chunk_or_truncate_class_for_embedding,
+        _extract_docstring,
     )
     _CHUNKING_AVAILABLE = True
 except ImportError:
@@ -943,6 +948,76 @@ except ImportError:
 
     def chunk_or_truncate_class_for_embedding(signature, class_body, methods=None, language="python", model=None, *, full_name=""):
         return [truncate_class_for_embedding(signature, class_body, methods=methods, language=language, model=model)]
+
+    def _extract_docstring(body, language="python"):
+        # M3 fallback: extraction unavailable on a broken partial install →
+        # doc stays "" (soft no-op; renderer falls back to the body snippet).
+        return ""
+
+
+# ── v0.2.73 (M1-prod): test-entity heuristic ─────────────────────────────────
+#
+# SINGLE HOME: claude_mcp_servers/weaviate_mcp/code_ranking.py::is_test_path
+# (the retrieval consumer). The inline fallback below MUST STAY BYTE-IDENTICAL
+# to it — tests/test_codegraph_metadata_producers_v0273.py carries the parity
+# test that locks the two together (mirrors the canonical-class-prefix parity
+# pattern). Guarded import: same-package sibling of code_truncation above, so
+# the fallback is effectively dead on a correctly-installed orchestrator.
+try:
+    from weaviate_mcp.code_ranking import is_test_path
+except Exception:  # noqa: BLE001 — partial install → inline fallback
+    def is_test_path(path: str) -> bool:
+        """True when *path* names a test/spec/fixture source file.
+
+        MUST MATCH claude_mcp_servers/weaviate_mcp/code_ranking.py::is_test_path.
+        Pure function: path string in, bool out. Directory matching is per
+        PATH PART (not substring) — ``tests/x.py`` is a test;
+        ``my_tests_helper/x.py`` is not. Windows backslashes normalized.
+        Empty/unknown → False (never flag on uncertainty).
+        """
+        if not path:
+            return False
+        parts = [p for p in str(path).replace("\\", "/").split("/") if p]
+        if not parts:
+            return False
+        dirs_lower = [d.lower() for d in parts[:-1]]
+        for d in dirs_lower:
+            if d in ("tests", "test", "__tests__", "spec", "specs",
+                     "testdata", "fixtures"):
+                return True
+            if d.endswith(".tests"):  # csharp `Foo.Tests` project dirs
+                return True
+        for i in range(len(dirs_lower) - 1):  # java `src/test` part-pair
+            if dirs_lower[i] == "src" and dirs_lower[i + 1] == "test":
+                return True
+        name = parts[-1]
+        lower = name.lower()
+        if lower == "conftest.py" or lower.endswith("_test.py"):
+            return True
+        if lower.startswith("test_") and lower.endswith((".py", ".cpp")):
+            return True
+        for ext in (".js", ".ts", ".jsx", ".tsx", ".mjs"):
+            if lower.endswith(".spec" + ext) or lower.endswith(".test" + ext):
+                return True
+        if lower.endswith("_test.go") or lower.endswith("_test.rs"):
+            return True
+        # CamelCase suffixes stay case-sensitive (`contest.java` is NOT a test).
+        if name.endswith(("Test.java", "Tests.java", "IT.java")):
+            return True
+        if name.endswith(("Tests.cs", "Test.cs")):
+            return True
+        if lower.endswith(("_spec.rb", "_test.rb")):
+            return True
+        if lower.endswith(("_test.cpp", "_test.cc", "_test.cxx",
+                           "_tests.cpp", "_tests.cc")):
+            return True
+        if lower.endswith("_spec.lua"):
+            return True
+        if lower.endswith("_test.sh") or lower.endswith(".bats"):
+            return True
+        if lower.endswith(".tests.ps1"):  # Pester
+            return True
+        return False
 
 
 # v0.2.18: central embedding dispatcher. Replaces the inline
@@ -3322,6 +3397,10 @@ class CodeGraphAnalyzer:
                         # a re-embed even when content is byte-identical (revision-gated
                         # forced resync). Excluded from the content hash.
                         Property(name="embed_revision", data_type=DataType.INT, description="Embedding-generation revision (P7 revision-gated forced resync)", skip_vectorization=True),
+                        # v0.2.73 (M1): test/spec/fixture flag from the pure
+                        # path heuristic (is_test_path). NULL on pre-v6 rows
+                        # (query-time derive fallback covers them).
+                        Property(name="is_test", data_type=DataType.BOOL, description="True when the source file is a test/spec/fixture (path heuristic; retrieval downweight)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="imports", target_collection=self.coll_module, description="Imported modules"),
@@ -3391,6 +3470,8 @@ class CodeGraphAnalyzer:
                         # chunk_num=0 (cross-refs + limit=1 lookups resolve to it).
                         Property(name="chunk_num", data_type=DataType.INT, description="0-indexed chunk number within this entity (0 for single-chunk)", skip_vectorization=True),
                         Property(name="total_chunks", data_type=DataType.INT, description="Total chunks this entity was split into (1 for single-chunk)", skip_vectorization=True),
+                        # v0.2.73 (M1): see CodeModule.
+                        Property(name="is_test", data_type=DataType.BOOL, description="True when the source file is a test/spec/fixture (path heuristic; retrieval downweight)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="module", target_collection=self.coll_module, description="Parent module"),
@@ -3452,6 +3533,14 @@ class CodeGraphAnalyzer:
                         # v0.2.72 (P3): model-aware chunking (see CodeClass).
                         Property(name="chunk_num", data_type=DataType.INT, description="0-indexed chunk number within this entity (0 for single-chunk)", skip_vectorization=True),
                         Property(name="total_chunks", data_type=DataType.INT, description="Total chunks this entity was split into (1 for single-chunk)", skip_vectorization=True),
+                        # v0.2.73 (M1): see CodeModule.
+                        Property(name="is_test", data_type=DataType.BOOL, description="True when the source file is a test/spec/fixture (path heuristic; retrieval downweight)", skip_vectorization=True),
+                        # v0.2.73 (M4): inbound-call count accumulated by
+                        # create_cross_references. Python-resolved,
+                        # project-internal edges only; NULL = unknown/leaf
+                        # (renderer omits the line — no fake zeros). Lands on
+                        # the CANONICAL (chunk-0) row only.
+                        Property(name="n_callers", data_type=DataType.INT, description="Inbound call count (Python-resolved, project-internal; render-time context)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="module", target_collection=self.coll_module, description="Parent module"),
@@ -3621,6 +3710,15 @@ class CodeGraphAnalyzer:
         # (no re-index, no data loss). Idempotent + soft-fail per collection.
         self._ensure_embed_revision_property()
 
+        # v0.2.73 (M1/M4) schema migration: `is_test` (BOOL) on the three
+        # file-anchored collections + `n_callers` (INT) on CodeFunction.
+        # Both are generation metadata (excluded from the content hash);
+        # NULL on pre-migration rows degrades gracefully (query-time derive
+        # for is_test; omitted callers line for n_callers). Belt-and-
+        # suspenders with migrations/codegraph_collection/5_to_6.py.
+        self._ensure_is_test_property()
+        self._ensure_n_callers_property()
+
     def _dedup_insert(self, collection, insert_params: dict, identity_key: str,
                       file_path_rel: str = "") -> str:
         """Upsert with a deterministic UUID derived from
@@ -3720,6 +3818,55 @@ class CodeGraphAnalyzer:
                 props = insert_params.get("properties")
                 if isinstance(props, dict) and not props.get("file_path"):
                     props["file_path"] = file_path_rel
+
+        # ── v0.2.73 (M1-prod): stamp `is_test` at the choke point ───────────
+        # Pure path heuristic (see is_test_path — single home in
+        # code_ranking, byte-identical fallback above). File-anchored
+        # collections only (Function/Class/Module); CodeAPI/CodeInteraction
+        # aren't file-anchored → skipped. `"is_test" not in props` (not a
+        # falsy check): False is a valid preset. Stamped BEFORE the chunk
+        # fan-out so `chunk_props = dict(props)` copies it to every chunk.
+        if file_path_rel:
+            coll_name = getattr(collection, "name", "") or ""
+            if (
+                coll_name.endswith("CodeFunction")
+                or coll_name.endswith("CodeClass")
+                or coll_name.endswith("CodeModule")
+            ):
+                props = insert_params.get("properties")
+                if isinstance(props, dict) and "is_test" not in props:
+                    try:
+                        props["is_test"] = bool(is_test_path(file_path_rel))
+                    except Exception:  # noqa: BLE001 — heuristic never wedges a write
+                        pass
+
+        # ── v0.2.73 (M3-prod): populate `doc` for non-Python entities ───────
+        # All 20 non-Python store sites write `doc: ""` although the
+        # extractor already exists (code_truncation._extract_docstring — it
+        # feeds the EMBED text; its output was thrown away for the prop).
+        # One stamp here instead of 20 walker edits. Python rows arrive with
+        # doc set (ast.get_docstring) → untouched (falsy guard). `doc` is NOT
+        # in _CONTENT_HASH_FIELDS → populating it never perturbs the
+        # tombstone-skip hash (and must NOT be added there — that would
+        # rewrite every stored digest). Render/keyword-only: NO embed-revision
+        # bump (doc never feeds the vector; vectors are client-supplied).
+        coll_name = getattr(collection, "name", "") or ""
+        if coll_name.endswith("CodeFunction") or coll_name.endswith("CodeClass"):
+            props = insert_params.get("properties")
+            if isinstance(props, dict) and not props.get("doc"):
+                body = props.get("function_body") or props.get("class_body") or ""
+                if body:
+                    lang = _canonical_lang_id(
+                        props.get("language")
+                        or getattr(self, "_current_language", "")
+                    ) or "python"
+                    try:
+                        doc = _extract_docstring(body, lang)
+                        if doc:
+                            # Cap: docstring, not a pathological comment wall.
+                            props["doc"] = doc[:2000]
+                    except Exception:  # noqa: BLE001 — extraction never wedges a write
+                        pass
 
         # ── v0.2.72 (P3): model-aware chunking for over-budget entities ─────
         #
@@ -4419,6 +4566,82 @@ class CodeGraphAnalyzer:
                 logger.debug(
                     f"v0.2.72 P7 {_EMBED_REVISION_PROP} migration on {label} skipped: {e}"
                 )
+
+    def _ensure_is_test_property(self):
+        """v0.2.73 (M1) schema migration: add `is_test` (BOOL) to the three
+        file-anchored collections (CodeFunction/CodeClass/CodeModule).
+
+        Stamped by `_dedup_insert` from the pure path heuristic
+        (`is_test_path`); consumed by the retrieval rerank penalty. NULL on
+        pre-migration rows → the consumer derives from the stored
+        file_path/path at query time (fail-safe: no path → not penalized);
+        the backfill pass (`codegraph_resync.backfill_codegraph_metadata`)
+        populates existing rows without touching vectors. Belt-and-suspenders
+        with `migrations/codegraph_collection/5_to_6.py` (same-author rule).
+        Additive, idempotent, soft-fail per collection — mirrors
+        `_ensure_content_hash_property`.
+        """
+        collections = [
+            ("CodeModule",   self.modules_collection),
+            ("CodeClass",    self.classes_collection),
+            ("CodeFunction", self.functions_collection),
+        ]
+        desc = (
+            "True when the source file is a test/spec/fixture "
+            "(path heuristic; retrieval downweight)"
+        )
+        for label, coll in collections:
+            if coll is None:
+                continue
+            try:
+                config = coll.config.get()
+                existing_props = {p.name for p in config.properties}
+                if "is_test" in existing_props:
+                    continue
+                coll.config.add_property(
+                    Property(
+                        name="is_test",
+                        data_type=DataType.BOOL,
+                        description=desc,
+                        skip_vectorization=True,
+                    )
+                )
+                print(f"   Added is_test property to {label} schema (v0.2.73 M1)")
+            except Exception as e:
+                logger.debug(f"v0.2.73 is_test migration on {label} skipped: {e}")
+
+    def _ensure_n_callers_property(self):
+        """v0.2.73 (M4) schema migration: add `n_callers` (INT) to
+        CodeFunction only.
+
+        Accumulated by `create_cross_references` from resolved inbound call
+        edges (Python-resolved, project-internal — honest-coverage note in
+        the property description). Render-time context only, NOT a rerank
+        signal this release. NULL = unknown/leaf (the renderer omits the
+        line; no fake zeros). Additive, idempotent, soft-fail.
+        """
+        coll = self.functions_collection
+        if coll is None:
+            return
+        try:
+            config = coll.config.get()
+            existing_props = {p.name for p in config.properties}
+            if "n_callers" in existing_props:
+                return
+            coll.config.add_property(
+                Property(
+                    name="n_callers",
+                    data_type=DataType.INT,
+                    description=(
+                        "Inbound call count (Python-resolved, "
+                        "project-internal; render-time context)"
+                    ),
+                    skip_vectorization=True,
+                )
+            )
+            print("   Added n_callers property to CodeFunction schema (v0.2.73 M4)")
+        except Exception as e:
+            logger.debug(f"v0.2.73 n_callers migration skipped: {e}")
 
     def analyze_repository(self, repo_path: Path, language: Optional[str] = None,
                           incremental: bool = False,
@@ -7470,6 +7693,15 @@ class CodeGraphAnalyzer:
 
         # --- 1. Function calls ---
         print("   Linking function calls...")
+        # v0.2.73 (M4-prod): accumulate per-TARGET inbound-edge counts in the
+        # SAME pass that already resolves every call edge (nearly free), and
+        # record each function's stored n_callers from the point-read the
+        # loop already does — the write pass below then updates only rows
+        # whose count actually changed. Because the caches are populated
+        # from ALL of Weaviate (not just this run's files), counts are
+        # complete on EVERY analyze — M4 backfills itself.
+        inbound: Dict[str, int] = {}
+        stored_counts: Dict[str, Any] = {}
         for full_name, func_uuid in self.function_cache.items():
             # Fetch the function to get its body and extract calls.
             # v0.2.72 (P3): `func_uuid` is the CANONICAL (chunk 0) UUID from the
@@ -7485,6 +7717,13 @@ class CodeGraphAnalyzer:
             # object, so callers-queries resolve correctly.
             try:
                 canonical = self.functions_collection.query.fetch_object_by_id(func_uuid)
+                # M4: record the stored count BEFORE any body-based skip —
+                # bodiless rows can still be call TARGETS whose stored value
+                # the write pass must compare against.
+                if canonical is not None:
+                    stored_counts[func_uuid] = (
+                        canonical.properties or {}
+                    ).get("n_callers")
                 body = canonical.properties.get("function_body", "") if canonical is not None else ""
                 if not body:
                     continue
@@ -7544,6 +7783,13 @@ class CodeGraphAnalyzer:
                     except Exception:
                         pass
 
+                # M4: count every RESOLVED inbound edge for its target —
+                # independent of whether reference_add below succeeds (the
+                # count reflects the resolved call graph, and the ref write
+                # already soft-fails).
+                for ref_uuid in refs_to_add:
+                    inbound[ref_uuid] = inbound.get(ref_uuid, 0) + 1
+
                 if refs_to_add:
                     try:
                         for ref_uuid in refs_to_add:
@@ -7558,6 +7804,41 @@ class CodeGraphAnalyzer:
 
             except Exception as e:
                 logger.debug(f"Error processing calls for {full_name}: {e}")
+
+        # ── v0.2.73 (M4-prod): persist n_callers (write-only-on-change) ─────
+        # Rules (destructive-noise avoidance):
+        #   * NULL row with 0 inbound stays NULL — "unknown/leaf", avoiding
+        #     thousands of pointless writes on the first post-upgrade run
+        #     (the renderer omits the line for NULL and 0 alike).
+        #   * write only when the count actually changed (incl. decrements —
+        #     counts are recomputed from scratch every pass, so a deleted
+        #     caller corrects its targets on the next analyze).
+        # Soft-fail per update (mirrors the call_names update above).
+        n_callers_written = 0
+        for target_uuid in set(self.function_cache.values()):
+            new_count = inbound.get(target_uuid, 0)
+            stored_raw = stored_counts.get(target_uuid)
+            try:
+                stored_int: Optional[int] = (
+                    int(stored_raw) if stored_raw is not None else None
+                )
+            except (TypeError, ValueError):
+                stored_int = None
+            if new_count == 0 and stored_int is None:
+                continue  # NULL stays NULL
+            if stored_int == new_count:
+                continue
+            try:
+                self.functions_collection.data.update(
+                    uuid=target_uuid,
+                    properties={"n_callers": new_count},
+                )
+                n_callers_written += 1
+            except Exception:
+                pass
+        stats['n_callers'] = n_callers_written
+        if n_callers_written:
+            print(f"   Updated n_callers on {n_callers_written} function(s)")
 
         # --- 2. Class extends ---
         print("   Linking class inheritance...")

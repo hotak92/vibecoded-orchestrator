@@ -428,6 +428,193 @@ def count_stale_rows(
                 pass
 
 
+# ── v0.2.73 (M1/M3): metadata backfill for existing rows ─────────────────────
+#
+# `is_test` (M1) and `doc` (M3) are stamped at analyze time — but the per-file
+# skip means rows in unchanged files never self-heal via analysis, and a
+# revision bump would be the wrong tool (forces embed COMPUTE for render-only
+# props). The right shape is a Weaviate-side `data.update` pass: PATCH
+# semantics — no vector touch, no tombstone, no embed.
+
+# Chunked bodies carry a leading `[chunk N/total]\n\n` header. MUST MATCH
+# templates/scripts/analyze_code_graph.py::_CHUNK_HEADER_RE (and
+# server._parse_chunk_header).
+_CHUNK_HEADER_RE = re.compile(r"^\[chunk \d+/\d+\]\n\n")
+
+
+def _resolve_metadata_helpers():
+    """Import the shared `is_test_path` + `_extract_docstring` helpers.
+
+    Both live in `claude_mcp_servers/weaviate_mcp/` (single homes:
+    code_ranking / code_truncation). Script-mode children may not have that
+    package dir on sys.path — add it from the repo layout before retrying.
+    Returns ``(is_test_path | None, extract_docstring | None)``; a missing
+    helper soft-degrades its half of the backfill (logged by the caller).
+    """
+    pkg_dir = Path(__file__).resolve().parent.parent / "claude_mcp_servers"
+    if pkg_dir.is_dir() and str(pkg_dir) not in sys.path:
+        sys.path.insert(0, str(pkg_dir))
+    itp = None
+    ext = None
+    try:
+        from weaviate_mcp.code_ranking import is_test_path as itp  # type: ignore[no-redef]
+    except Exception:  # noqa: BLE001 — ships with AG-5's consumer half
+        itp = None
+    try:
+        from weaviate_mcp.code_truncation import _extract_docstring as ext  # type: ignore[no-redef]
+    except Exception:  # noqa: BLE001
+        ext = None
+    return itp, ext
+
+
+# Per-base config for the backfill: (path property, body property or None).
+# CodeModule gets is_test only (its `module_summary` is not a doc source).
+_BACKFILL_BASES: dict = {
+    "CodeFunction": ("file_path", "function_body"),
+    "CodeClass": ("file_path", "class_body"),
+    "CodeModule": ("path", None),
+}
+
+
+def backfill_codegraph_metadata(
+    project_name: str,
+    *,
+    client=None,
+    weaviate_url: Optional[str] = None,
+    grpc_port: Optional[int] = None,
+) -> dict:
+    """One-shot `data.update` backfill of `is_test` (+`doc` for F/C rows).
+
+    Idempotent + resumable by construction (already-populated rows are
+    skipped); NO global timeout; per-collection AND per-row soft-fail.
+    Gated by a cheap probe: a collection with no NULL-`is_test` row is
+    skipped entirely (steady-state cost ≈ 3 point queries). Returns
+    ``{collection_name: rows_updated}``.
+
+    doc rules (M3): only when the stored doc is empty AND the row is the
+    canonical chunk (chunk_num 0/None — the docstring lives at the entity
+    head); the `[chunk N/total]` header is stripped before extraction; an
+    empty extract → no write (docstring-less function, re-probed next run
+    at the cost of one iterator row). is_test rules (M1): only when stored
+    is NULL and a path is present (fail-safe: no path → leave NULL, the
+    query-time derive treats it as not-a-test).
+    """
+    counts: dict = {}
+    if not project_name:
+        return counts
+    prefix = _collection_prefix(project_name)
+    if prefix is None:
+        return counts
+
+    is_test_fn, extract_fn = _resolve_metadata_helpers()
+    if is_test_fn is None:
+        logger.warning(
+            "codegraph backfill: is_test_path unavailable — is_test half skipped"
+        )
+    if extract_fn is None:
+        logger.warning(
+            "codegraph backfill: _extract_docstring unavailable — doc half skipped"
+        )
+    if is_test_fn is None and extract_fn is None:
+        return counts
+
+    own_client = False
+    if client is None:
+        client = _build_client(weaviate_url, grpc_port)
+        if client is None:
+            return counts
+        own_client = True
+
+    try:
+        try:
+            from weaviate.classes.query import Filter
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("codegraph backfill: Filter unavailable: %s", exc)
+            return counts
+
+        for base, (path_prop, body_prop) in _BACKFILL_BASES.items():
+            coll_name = f"{prefix}_{base}"
+            try:
+                if hasattr(client.collections, "exists") and not client.collections.exists(coll_name):
+                    continue
+                coll = client.collections.get(coll_name)
+
+                # Cheap gate: fully-populated collections skip the scan.
+                # Probe failure (e.g. IsNull unindexed) → scan anyway
+                # (fail-open toward doing the work).
+                try:
+                    probe = coll.query.fetch_objects(
+                        filters=Filter.by_property("is_test").is_none(True),
+                        limit=1,
+                    )
+                    if not getattr(probe, "objects", None):
+                        counts[coll_name] = 0
+                        continue
+                except Exception:  # noqa: BLE001
+                    pass
+
+                return_props = [path_prop, "is_test"]
+                if body_prop and extract_fn is not None:
+                    return_props += [body_prop, "doc", "language", "chunk_num"]
+
+                updated = 0
+                for obj in coll.iterator(return_properties=return_props):
+                    p = getattr(obj, "properties", None) or {}
+                    new_props: dict = {}
+
+                    if is_test_fn is not None and p.get("is_test") is None:
+                        path_val = p.get(path_prop) or ""
+                        if path_val:
+                            try:
+                                new_props["is_test"] = bool(is_test_fn(path_val))
+                            except Exception:  # noqa: BLE001
+                                pass
+
+                    if (
+                        body_prop
+                        and extract_fn is not None
+                        and not p.get("doc")
+                        and p.get("chunk_num") in (0, None)
+                    ):
+                        body = p.get(body_prop) or ""
+                        if body:
+                            try:
+                                doc = extract_fn(
+                                    _CHUNK_HEADER_RE.sub("", body, count=1),
+                                    str(p.get("language") or "python"),
+                                )
+                                if doc:
+                                    new_props["doc"] = doc[:2000]
+                            except Exception:  # noqa: BLE001
+                                pass
+
+                    if not new_props:
+                        continue
+                    try:
+                        coll.data.update(uuid=obj.uuid, properties=new_props)
+                        updated += 1
+                    except Exception as exc:  # noqa: BLE001 — per-row soft-fail
+                        logger.warning(
+                            "codegraph backfill: update failed on %s/%s: %s",
+                            coll_name, obj.uuid, exc,
+                        )
+                counts[coll_name] = updated
+                if updated:
+                    logger.info(
+                        "codegraph backfill: %s — %d row(s) updated",
+                        coll_name, updated,
+                    )
+            except Exception as exc:  # noqa: BLE001 — per-collection soft-fail
+                logger.warning("codegraph backfill: %s failed: %s", coll_name, exc)
+        return counts
+    finally:
+        if own_client:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 @dataclass
 class ResyncTriggerResult:
     """Outcome of a resync-trigger attempt. Never raises; the caller inspects
@@ -956,6 +1143,18 @@ def spawn_background_resync(
     except Exception as exc:  # noqa: BLE001 — prune is best-effort
         logger.warning("codegraph prune spawn failed: %s", exc)
 
+    # v0.2.73 (M1/M3): spawn the metadata backfill as a THIRD detached child
+    # (prune precedent above). data.update-only — no vectors, no embeds;
+    # idempotent; a spawn failure never blocks the resync itself.
+    try:
+        backfill_argv = [
+            py, str(Path(__file__).resolve()),
+            "--backfill-metadata", "--project", project_name,
+        ]
+        subprocess.Popen(backfill_argv, **popen_kwargs)  # noqa: S603 — argv is ours
+    except Exception as exc:  # noqa: BLE001 — backfill is best-effort
+        logger.warning("codegraph metadata-backfill spawn failed: %s", exc)
+
     try:
         proc = subprocess.Popen(argv, **popen_kwargs)  # noqa: S603 — argv is ours
     except Exception as exc:  # noqa: BLE001 — spawn failure must not crash update
@@ -1015,6 +1214,8 @@ def _main(argv: Optional[list] = None) -> int:
                         help="delete rows whose path is in the ignore set")
     parser.add_argument("--run-resync", action="store_true",
                         help="run the analyzer + verify convergence (R-7 driver)")
+    parser.add_argument("--backfill-metadata", action="store_true",
+                        help="data.update backfill of is_test/doc (M1/M3)")
     parser.add_argument("--project", required=True, help="project name")
     parser.add_argument("--index-dot-claude", action="store_true",
                         help="the project indexes .claude/ — do NOT prune it")
@@ -1045,6 +1246,12 @@ def _main(argv: Optional[list] = None) -> int:
             Path(args.analyzer),
             prune_stale=args.prune_stale,
         )
+    elif args.backfill_metadata:
+        logging.basicConfig(level=logging.INFO)
+        counts = backfill_codegraph_metadata(args.project)
+        total = sum(counts.values()) if counts else 0
+        logger.info("codegraph metadata backfill complete: %d row(s) updated (%s)",
+                    total, counts)
     return 0
 
 
