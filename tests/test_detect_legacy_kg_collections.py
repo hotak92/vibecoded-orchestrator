@@ -487,5 +487,226 @@ class EmitDeferralTests(unittest.TestCase):
         self.assertIn("code-graph-analyze", text)
 
 
+# ---------------------------------------------------------------------------
+# BUG-1 (v0.2.73) — DATA-LOSS: active canonical must never be flagged legacy
+# ---------------------------------------------------------------------------
+
+class Bug1ActiveCanonicalNeverLegacyTests(unittest.TestCase):
+    """The legacy detector must never propose dropping the collection the
+    project is actively bound to, even when the case-lossy sanitizer yields a
+    different casing than the real stored class name.
+    """
+
+    def test_case_variant_active_canonical_is_not_legacy(self):
+        # Sanitizer for an all-lowercase project name yields a lowercase-c
+        # canonical, but the REAL active class is uppercase-C. The active
+        # class must NOT be flagged as a legacy drop target (case-insensitive
+        # canonical skip).
+        #
+        # Use generic example names: project "prefixexample-orchestrator"
+        # sanitizes to "PrefixexampleOrchestrator" (lowercase-e in the middle),
+        # while the real stored class is "PrefixExampleOrchestrator_..."
+        project = "prefixexample-orchestrator"
+        real_class = "PrefixExampleOrchestrator_KnowledgeGraph"
+        # Sanity: the sanitizer's casing differs from the real class casing
+        # (this is the exact BUG-1 condition — case-lossy sanitizer).
+        sanitized = project_init.sanitize_for_weaviate_class(project)
+        self.assertNotEqual(
+            sanitized + "_KnowledgeGraph", real_class,
+            "test premise: sanitizer casing must differ from the real class",
+        )
+        self.assertEqual(sanitized.lower(), "prefixexampleorchestrator")
+
+        with mock.patch.object(
+            project_init, "_http_request",
+            side_effect=_make_http_request_mock(
+                [real_class],
+                counts={real_class: 2590},
+            ),
+        ):
+            # No live binding injected → skip must still fire via the
+            # case-insensitive canonical match alone.
+            result = project_init._detect_legacy_kg_collections(project, URL)
+        self.assertEqual(
+            result, [],
+            "case-variant of the active canonical must never be flagged legacy",
+        )
+
+    def test_live_binding_class_is_never_legacy(self):
+        # Even if the class name were somehow prefix-similar but NOT a case
+        # match of the sanitizer canonical, an explicit live KG_COLLECTION
+        # binding must exclude it as a drop target.
+        project = "FooBar"
+        live_class = "Foo_KnowledgeGraph"  # what the project actually reads
+        with mock.patch.object(
+            project_init, "_http_request",
+            side_effect=_make_http_request_mock(
+                [live_class],
+                counts={live_class: 999},
+            ),
+        ):
+            result = project_init._detect_legacy_kg_collections(
+                project, URL, live_binding=live_class,
+            )
+        self.assertEqual(
+            result, [],
+            "the live KG_COLLECTION binding is never a legacy drop target",
+        )
+
+    def test_live_binding_resolved_from_env(self):
+        # When live_binding is not passed, it is resolved from the
+        # KG_COLLECTION env var.
+        project = "FooBar"
+        live_class = "Foo_KnowledgeGraph"
+        with mock.patch.dict("os.environ", {"KG_COLLECTION": live_class}):
+            with mock.patch.object(
+                project_init, "_http_request",
+                side_effect=_make_http_request_mock(
+                    [live_class], counts={live_class: 5},
+                ),
+            ):
+                result = project_init._detect_legacy_kg_collections(project, URL)
+        self.assertEqual(result, [])
+
+    def test_genuine_legacy_still_detected(self):
+        # Guard against over-correction: a TRULY different prefix (real
+        # drop target) must STILL be detected. Project "FooBar" with a
+        # genuine legacy "Foo_KnowledgeGraph" that is neither a case-variant
+        # of the canonical (FooBar_KnowledgeGraph) nor the live binding.
+        with mock.patch.dict("os.environ", {"KG_COLLECTION": "FooBar_KnowledgeGraph"}):
+            with mock.patch.object(
+                project_init, "_http_request",
+                side_effect=_make_http_request_mock(
+                    ["Foo_KnowledgeGraph"],
+                    counts={"Foo_KnowledgeGraph": 42},
+                ),
+            ):
+                result = project_init._detect_legacy_kg_collections("FooBar", URL)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["class_name"], "Foo_KnowledgeGraph")
+        self.assertFalse(
+            result[0]["case_only"],
+            "a different-prefix legacy is NOT a case-only pair",
+        )
+
+
+# ---------------------------------------------------------------------------
+# BUG-1 hard guard — rendered command never drops a case-only pair
+# ---------------------------------------------------------------------------
+
+class Bug1CommandGuardTests(unittest.TestCase):
+
+    def test_case_only_pair_renders_no_destructive_ops(self):
+        # A case-only candidate (old.lower() == new.lower()) must render a
+        # case-REBIND instruction — never _delete_class or
+        # _copy_collection_with_vectors.
+        candidates = [{
+            "class_name": "PrefixExampleOrchestrator_KnowledgeGraph",
+            "suffix": "_KnowledgeGraph",
+            "object_count": 2590,
+            "embedding_dim": 1024,
+            "canonical_name": "Prefixexampleorchestrator_KnowledgeGraph",
+            "case_only": True,
+        }]
+        cmd = project_init._format_legacy_kg_command(
+            "prefixexample-orchestrator",
+            "http://localhost:8081",
+            candidates,
+        )
+        self.assertNotIn("_delete_class", cmd)
+        self.assertNotIn("_copy_collection_with_vectors", cmd)
+        self.assertIn("case-REBIND", cmd)
+        self.assertIn("bootstrap-collections", cmd)
+
+    def test_case_only_guard_fires_even_without_flag(self):
+        # Belt-and-suspenders: even if a candidate omits/misreports case_only,
+        # the name comparison in the renderer catches the case-only pair.
+        candidates = [{
+            "class_name": "Foo_KnowledgeGraph",
+            "suffix": "_KnowledgeGraph",
+            "object_count": 100,
+            "embedding_dim": None,
+            "canonical_name": "FOO_KnowledgeGraph",  # case-only vs class_name
+            # case_only intentionally omitted
+        }]
+        cmd = project_init._format_legacy_kg_command(
+            "FOO", "http://localhost:8081", candidates,
+        )
+        self.assertNotIn("_delete_class", cmd)
+        self.assertNotIn("_copy_collection_with_vectors", cmd)
+        self.assertIn("case-REBIND", cmd)
+
+
+# ---------------------------------------------------------------------------
+# BUG-2 — genuine legacy migration uses re-embed-from-.md, not copy-vectors
+# ---------------------------------------------------------------------------
+
+class Bug2ReEmbedRemediationTests(unittest.TestCase):
+
+    def test_genuine_legacy_command_uses_reembed_not_copy(self):
+        candidates = [{
+            "class_name": "Foo_KnowledgeGraph",
+            "suffix": "_KnowledgeGraph",
+            "object_count": 42,
+            "embedding_dim": 1024,
+            "canonical_name": "FooBar_KnowledgeGraph",
+            "case_only": False,
+        }]
+        cmd = project_init._format_legacy_kg_command(
+            "FooBar", "http://localhost:8081", candidates,
+        )
+        # RE-EMBED sequence: bootstrap → kg-sync --all → drop legacy.
+        self.assertIn("bootstrap-collections", cmd)
+        self.assertIn("kg-sync --all", cmd)
+        self.assertIn("_delete_class", cmd)  # drop of the GENUINE legacy is OK
+        # Must NOT use the vector-copy helper (422 on shape mismatch).
+        self.assertNotIn("_copy_collection_with_vectors", cmd)
+
+
+class Bug2CopyShapeGuardTests(unittest.TestCase):
+    """`_copy_collection_with_vectors` must fail CLEARLY, not with an opaque
+    422, when the destination is single-vector while the source is named.
+    """
+
+    def test_single_vector_dst_raises_clear_error(self):
+        # Mock _fetch_schema(dst) → single-vector (no vectorConfig).
+        def _fake_fetch(name, weaviate_url=None):
+            # Destination has NO vectorConfig → single-vector.
+            return {"class": name, "properties": []}
+
+        with mock.patch.object(project_init, "_fetch_schema", side_effect=_fake_fetch):
+            with self.assertRaises(ValueError) as ctx:
+                project_init._copy_collection_with_vectors(
+                    "Src_KnowledgeGraph",
+                    "Dst_KnowledgeGraph",
+                    weaviate_url=URL,
+                )
+        msg = str(ctx.exception)
+        self.assertIn("single-vector", msg)
+        self.assertIn("re-embed", msg.lower())
+
+    def test_schema_probe_soft_fails_open(self):
+        # If the dst schema probe raises (transient network), the guard must
+        # NOT block — it falls through to the copy path (which will surface
+        # any real failure). We assert the ValueError shape-guard does NOT
+        # fire; the copy then fails on the v4 client connect (expected), which
+        # is a DIFFERENT error than the shape ValueError.
+        def _raise_fetch(name, weaviate_url=None):
+            raise RuntimeError("transient network")
+
+        with mock.patch.object(project_init, "_fetch_schema", side_effect=_raise_fetch):
+            with mock.patch.object(
+                project_init, "_connect_v4_client",
+                side_effect=RuntimeError("v4-connect-unavailable"),
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    project_init._copy_collection_with_vectors(
+                        "Src_KnowledgeGraph", "Dst_KnowledgeGraph",
+                        weaviate_url=URL,
+                    )
+        # It fell through to the copy path (connect error), NOT the shape guard.
+        self.assertIn("v4-connect-unavailable", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
