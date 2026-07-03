@@ -339,8 +339,9 @@ jobs:
         run: |
           pip install --upgrade pip
           # [mcp] extras include weaviate-client, pyyaml, mcp SDK.
+          # [test] adds pytest for the X-2 retrieval-quality regression step.
           # No || true: packaging regressions must surface.
-          pip install -e ".[mcp]"
+          pip install -e ".[mcp,test]"
           # weaviate-client included in [mcp]; kept explicit for clarity.
           pip install weaviate-client
 
@@ -447,6 +448,32 @@ jobs:
           client.close()  # Con004: explicit close suppresses ResourceWarning on GC
           PYEOF
           echo "✓ Weaviate schema assertions complete"
+
+      # Assertion 6c (X-2): retrieval-quality regression — the v0.2.72
+      # two-stage floors + rerank still cull structurally-unrelated noise.
+      #
+      # Two layers, matching tests/test_codegraph_retrieval_quality_smoke.py:
+      #   * PURE-UNIT (always runs here): deterministic floor-culling proof
+      #     against the shipped run_code_retrieval_pipeline — no vectorizer /
+      #     seed required, so it gates every run even though this job's
+      #     Weaviate has DEFAULT_VECTORIZER_MODULE=none (no code collection).
+      #   * LIVE-GATED (skips cleanly here): a real known-noise query through
+      #     the shared pipeline. It only runs when a *_CodeFunction collection
+      #     is present. This CI Weaviate has none (no embedding module to seed
+      #     code vectors), so the live layer SKIPS — non-blocking by design.
+      #     On a dev machine / future seeded lane with a code graph present it
+      #     exercises real data; set VCO_RUN_LIVE_RETRIEVAL_SMOKE=1 there to
+      #     convert a skip into a hard failure.
+      - name: Retrieval-quality floor regression (X-2)
+        env:
+          WEAVIATE_URL: "http://localhost:8081"
+        run: |
+          set -euo pipefail
+          # -rs surfaces skip reasons in the log so an accidental all-skip
+          # (which would be a silent no-op) is visible.
+          python -m pytest -q -rs \
+            tests/test_codegraph_retrieval_quality_smoke.py
+          echo "✓ Assertion 6c PASS: floor culling regression green"
 
   # ------------------------------------------------------------------ #
   # Job 3: macOS best-effort smoke (v0.2.40 X1)                        #
