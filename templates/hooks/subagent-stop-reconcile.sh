@@ -16,10 +16,14 @@
 #   1. JSONL audit log (V52-L.2 baseline; format unchanged).
 #   2. KG sync — for any modified `knowledge/**/*.md` file, queue an
 #      incremental kg-sync run. Best-effort, 30s timeout per file.
-#   3. Code-graph queue — for any modified code file, append to
-#      `.claude/state/code-graph-queue.jsonl`. The existing batch
-#      processor picks them up; we never run analyze synchronously
-#      because joern + sentence-transformer init are too slow.
+#   3. Code-graph drain enqueue — for any modified code file, apply the
+#      FIX-A' worktree gate (drop edits in ephemeral/unregistered
+#      worktrees) and append the gated-IN paths to the SESSION-AGNOSTIC
+#      drain queue `.claude/state/codegraph_drain_shared.txt` that the
+#      Stop-hook batched drain (stop-codegraph-drain.{sh,ps1}) consumes.
+#      We never run analyze synchronously (joern + sentence-transformer
+#      init are too slow) and we never write the old orphan
+#      code-graph-queue.jsonl (nothing ever drained it — v0.2.73 HIGH-2).
 #   4. Credential scan — run the shared `_lib/credscan.sh` scanner on
 #      every modified file. On hit, append an entry to
 #      `.claude/logs/credential_alerts.jsonl` with the same schema
@@ -66,13 +70,27 @@ if [ -f "$SCRIPT_DIR/_lib/credscan.sh" ]; then
     # shellcheck source=_lib/credscan.sh disable=SC1091
     . "$SCRIPT_DIR/_lib/credscan.sh"
 fi
+# v0.2.73 HIGH-2: the canonical-root resolver + FIX-A' worktree gate — the SAME
+# shared libs the per-edit code-graph hook and the Stop drain use (mirror-don't-
+# fork). Optional sourcing; when absent the Step-3 enqueue falls back to
+# CONSERVATIVE (enqueue-all — never silently lose a real project's edits).
+if [ -f "$SCRIPT_DIR/_lib/canonical-repo-root.sh" ]; then
+    # shellcheck source=_lib/canonical-repo-root.sh disable=SC1091
+    . "$SCRIPT_DIR/_lib/canonical-repo-root.sh"
+fi
+if [ -f "$SCRIPT_DIR/_lib/worktree-gate.sh" ]; then
+    # shellcheck source=_lib/worktree-gate.sh disable=SC1091
+    . "$SCRIPT_DIR/_lib/worktree-gate.sh"
+fi
 
 PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 LOG_DIR="$PROJECT_ROOT/.claude/logs"
 STATE_DIR="$PROJECT_ROOT/.claude/state"
 LOG_FILE="$LOG_DIR/subagent-reconciliation.jsonl"
 ALERT_LOG="$LOG_DIR/credential_alerts.jsonl"
-CODE_QUEUE="$STATE_DIR/code-graph-queue.jsonl"
+# v0.2.73 HIGH-2: the session-agnostic drain queue the Stop-hook batched drain
+# consumes (replaces the orphan code-graph-queue.jsonl that nothing drained).
+CG_DRAIN_SHARED="$STATE_DIR/codegraph_drain_shared.txt"
 
 mkdir -p "$LOG_DIR" 2>/dev/null || exit 0
 mkdir -p "$STATE_DIR" 2>/dev/null || true
@@ -264,47 +282,82 @@ if [ -n "$KG_SYNC_SCRIPT" ] && [ "${#KG_FILES[@]}" -gt 0 ]; then
     done
 fi
 
-# -------------------- Step 3: Code-graph queue --------------------
-# Append modified code files to .claude/state/code-graph-queue.jsonl.
-# The existing batch processor (run from the launcher or by an
-# external cron) picks them up. We never run analyze synchronously
-# — joern + sentence-transformer init takes 5-30s, well over our
-# performance budget.
+# -------------------- Step 3: Code-graph drain enqueue --------------------
+# Route modified code files into the SAME batched, worktree-gated path the
+# main-session Stop drain (stop-codegraph-drain.{sh,ps1}) consumes — NOT the
+# old orphan code-graph-queue.jsonl (nothing ever drained it, so subagent code
+# edits never reached the code graph AND that file grew unbounded — v0.2.73
+# I/O-audit HIGH-2).
 #
-# File paths are piped on stdin (newline-delimited) to avoid argv
-# explosion and bash-3.2 incompatibility with `${arr[@]@Q}`. Python
-# JSON-encodes each row so paths with embedded quotes / unicode /
-# backslashes are correctly escaped.
+# We apply the FIX-A' worktree gate here so an EPHEMERAL/unregistered worktree
+# edit (the exact multi-agent-worktree churn v0.2.73 kills) is DROPPED — the
+# main session re-indexes the merged result. A gated-IN file is appended
+# (newline-delimited, ABSOLUTE path — matching the drain's format + how
+# post-file-edit.sh stores paths) to the session-agnostic shared drain queue.
+#
+# Performance: the gate's registered-project probe shells out to
+# vct_project_config.sh once per DISTINCT canonical root (not per file), so a
+# subagent touching many files under one repo pays ONE probe. We NEVER run the
+# analyzer synchronously (joern + sentence-transformer init is 5-30s, over the
+# <10s budget); we only ENQUEUE. Soft-fail throughout.
 if [ "${#CODE_FILES[@]}" -gt 0 ]; then
-    printf '%s\n' "${CODE_FILES[@]}" \
-        | AGENT_ID_FOR_PY="$AGENT_ID" \
-          SESSION_ID_FOR_PY="$SESSION_ID" \
-          CODE_QUEUE_FOR_PY="$CODE_QUEUE" \
-          "$PY" -c '
-import json, os, sys
-from datetime import datetime, timezone
-ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-agent_id = os.environ.get("AGENT_ID_FOR_PY", "")
-session_id = os.environ.get("SESSION_ID_FOR_PY", "")
-out_path = os.environ.get("CODE_QUEUE_FOR_PY", "")
-if not out_path:
-    sys.exit(0)
-try:
-    with open(out_path, "a", encoding="utf-8") as fh:
-        for line in sys.stdin:
-            f = line.rstrip("\r\n")
-            if not f:
-                continue
-            fh.write(json.dumps({
-                "timestamp": ts,
-                "session_id": session_id,
-                "agent_id": agent_id,
-                "file_path": f,
-                "source": "subagent_stop",
-            }) + "\n")
-except OSError:
-    sys.exit(0)
-' 2>/dev/null || true
+    # Per-canonical-root gate cache: canon-root -> "SKIP" | "INDEX". Resolve +
+    # gate ONCE per distinct canonical root; reuse the verdict for every file
+    # sharing that root. (Associative arrays need bash 4+; fall back to a
+    # linear pair-list scan for bash 3.2 / macOS system bash.)
+    _CG_GATE_ROOTS=()   # parallel arrays: root[i] -> verdict[i]
+    _CG_GATE_VERDICTS=()
+    _cg_gate_lookup() {
+        # $1 = canonical root; echoes cached verdict or empty if unseen.
+        _i=0
+        while [ "$_i" -lt "${#_CG_GATE_ROOTS[@]}" ]; do
+            if [ "${_CG_GATE_ROOTS[$_i]}" = "$1" ]; then
+                printf '%s' "${_CG_GATE_VERDICTS[$_i]}"; return 0
+            fi
+            _i=$((_i + 1))
+        done
+        printf ''
+    }
+
+    _CG_ENQUEUE=()
+    for _rel in "${CODE_FILES[@]}"; do
+        [ -n "$_rel" ] || continue
+        _abs="$PROJECT_ROOT/$_rel"
+
+        # Resolve the canonical MAIN root for this file. When the resolver lib
+        # is absent or resolution fails, _canon stays empty → the gate treats
+        # it as "not a worktree" (INDEX) — conservative (never drop on doubt).
+        _canon=""
+        if command -v _canonical_repo_root >/dev/null 2>&1; then
+            _canon="$(_canonical_repo_root "$_abs" 2>/dev/null)" || _canon=""
+        fi
+
+        # Cached gate verdict for this canonical root?
+        _verdict="$(_cg_gate_lookup "$_canon")"
+        if [ -z "$_verdict" ]; then
+            # Compute once for this root. REPO_PATH = PROJECT_ROOT (the on-disk
+            # session root); the gate compares it against the canonical root.
+            # SKIP only on a definitive "ephemeral/unregistered worktree";
+            # INDEX otherwise (incl. main tree, registered worktree, no gate).
+            if command -v _worktree_gate_should_skip >/dev/null 2>&1 \
+                && _worktree_gate_should_skip "$_abs" "$PROJECT_ROOT" "$_canon"; then
+                _verdict="SKIP"
+            else
+                _verdict="INDEX"
+            fi
+            _CG_GATE_ROOTS+=("$_canon")
+            _CG_GATE_VERDICTS+=("$_verdict")
+        fi
+
+        [ "$_verdict" = "INDEX" ] && _CG_ENQUEUE+=("$_abs")
+    done
+
+    # Append the gated-IN absolute paths to the session-agnostic shared drain
+    # queue. Plain newline-delimited append (the drain reads paths, one per
+    # line) — matches post-file-edit.sh's convention. Soft-fail on any error.
+    if [ "${#_CG_ENQUEUE[@]}" -gt 0 ]; then
+        printf '%s\n' "${_CG_ENQUEUE[@]}" >> "$CG_DRAIN_SHARED" 2>/dev/null || true
+    fi
 fi
 
 # -------------------- Step 4: Credential scan --------------------

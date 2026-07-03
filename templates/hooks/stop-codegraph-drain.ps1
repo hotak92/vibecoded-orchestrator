@@ -51,7 +51,13 @@ if ($SessionId -match '[^A-Za-z0-9_-]') { exit 0 }
 
 $stateDir = Join-Path (Join-Path $ProjectRoot ".claude") "state"
 $queue = Join-Path $stateDir ("codegraph_drain_{0}.txt" -f $SessionId)
-if (-not (Test-Path -LiteralPath $queue)) { exit 0 }
+# Session-agnostic SHARED drain queue (v0.2.73 I/O-audit HIGH-2 — must match
+# stop-codegraph-drain.sh + subagent-stop-reconcile.*): the SubagentStop
+# reconciler enqueues gated-IN subagent code edits here (replacing the removed
+# orphan code-graph-queue.jsonl) so the NEXT eligible Stop drain (any session)
+# processes them, decoupled from the subagent's session id.
+$sharedQueue = Join-Path $stateDir "codegraph_drain_shared.txt"
+if (-not (Test-Path -LiteralPath $queue) -and -not (Test-Path -LiteralPath $sharedQueue)) { exit 0 }
 
 # --- RATE LIMIT ---
 $lastTsFile = Join-Path $stateDir "codegraph_drain_last_sync.ts"
@@ -68,9 +74,26 @@ if ($lastTs -gt 0 -and (($now - $lastTs) -lt $MinInterval)) {
     exit 0
 }
 
-# --- DRAIN: consume queue, gate, group by canonical root ---
-$consumed = "$queue.draining.$PID"
-try { Move-Item -LiteralPath $queue -Destination $consumed -Force -ErrorAction Stop } catch { exit 0 }
+# --- DRAIN: consume queue + shared queue, gate, group by canonical root ---
+# Consume the per-session queue (if present) by atomic rename so concurrent
+# appends start a fresh queue; then FOLD IN the shared queue (subagent edits)
+# the same way. If the per-session queue is absent, seed CONSUMED empty so the
+# shared fold still has a target.
+$consumed = Join-Path $stateDir ("codegraph_drain_{0}.draining.{1}" -f $SessionId, $PID)
+if (Test-Path -LiteralPath $queue) {
+    try { Move-Item -LiteralPath $queue -Destination $consumed -Force -ErrorAction Stop }
+    catch { try { Set-Content -LiteralPath $consumed -Value $null -ErrorAction Stop } catch { exit 0 } }
+} else {
+    try { Set-Content -LiteralPath $consumed -Value $null -ErrorAction Stop } catch { exit 0 }
+}
+if (Test-Path -LiteralPath $sharedQueue) {
+    $sharedConsumed = Join-Path $stateDir ("codegraph_drain_shared.draining.{0}" -f $PID)
+    try {
+        Move-Item -LiteralPath $sharedQueue -Destination $sharedConsumed -Force -ErrorAction Stop
+        try { Get-Content -LiteralPath $sharedConsumed -ErrorAction Stop | Add-Content -LiteralPath $consumed } catch { }
+        Remove-Item -LiteralPath $sharedConsumed -ErrorAction SilentlyContinue
+    } catch { }
+}
 
 $defaultRepoRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
 $analyzer = if ($env:VCT_ANALYZER_SCRIPT) { $env:VCT_ANALYZER_SCRIPT } else { Join-Path $defaultRepoRoot ".claude/scripts/analyze_code_graph.py" }

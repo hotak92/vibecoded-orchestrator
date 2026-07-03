@@ -31,6 +31,13 @@ $SnapshotHelper = Join-Path $ScriptDir "_lib/snapshot.ps1"
 if (Test-Path $SnapshotHelper) { . $SnapshotHelper }
 $CredScanHelper = Join-Path $ScriptDir "_lib/credscan.ps1"
 if (Test-Path $CredScanHelper) { . $CredScanHelper }
+# v0.2.73 HIGH-2: the canonical-root resolver + FIX-A' worktree gate — the SAME
+# shared libs the per-edit code-graph hook + the Stop drain use (mirror-don't-
+# fork). Optional; when absent Step-3 falls back to CONSERVATIVE enqueue-all.
+$CanonHelper = Join-Path $ScriptDir "_lib/canonical-repo-root.ps1"
+if (Test-Path $CanonHelper) { . $CanonHelper }
+$WorktreeGateHelper = Join-Path $ScriptDir "_lib/worktree-gate.ps1"
+if (Test-Path $WorktreeGateHelper) { . $WorktreeGateHelper }
 
 $ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) {
     $env:CLAUDE_PROJECT_DIR
@@ -42,7 +49,9 @@ $LogDir = Join-Path $ProjectRoot ".claude/logs"
 $StateDir = Join-Path $ProjectRoot ".claude/state"
 $LogFile = Join-Path $LogDir "subagent-reconciliation.jsonl"
 $AlertLog = Join-Path $LogDir "credential_alerts.jsonl"
-$CodeQueue = Join-Path $StateDir "code-graph-queue.jsonl"
+# v0.2.73 HIGH-2: the session-agnostic drain queue the Stop-hook batched drain
+# consumes (replaces the orphan code-graph-queue.jsonl that nothing drained).
+$CgDrainShared = Join-Path $StateDir "codegraph_drain_shared.txt"
 
 try {
     if (-not (Test-Path $LogDir)) {
@@ -220,25 +229,52 @@ if ($kgSyncScript -and $kgFiles.Count -gt 0) {
     }
 }
 
-# -------------------- Step 3: Code-graph queue --------------------
+# -------------------- Step 3: Code-graph drain enqueue --------------------
+# MUST MATCH subagent-stop-reconcile.sh Step 3. Route modified code files into
+# the SAME batched, worktree-gated path the Stop drain consumes — NOT the old
+# orphan code-graph-queue.jsonl (nothing drained it — v0.2.73 HIGH-2). Apply
+# the FIX-A' worktree gate (drop ephemeral/unregistered worktree edits), resolve
+# + gate ONCE per distinct canonical root, and append gated-IN ABSOLUTE paths
+# (newline-delimited) to the session-agnostic shared drain queue. Never run the
+# analyzer synchronously; only enqueue. Soft-fail throughout.
 if ($codeFiles.Count -gt 0) {
-    $ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-    try {
-        $sb = New-Object System.Text.StringBuilder
-        foreach ($f in $codeFiles) {
-            $row = [ordered]@{
-                timestamp  = $ts
-                session_id = $SessionId
-                agent_id   = $AgentId
-                file_path  = $f
-                source     = "subagent_stop"
-            }
-            $line = $row | ConvertTo-Json -Compress -Depth 5
-            [void]$sb.AppendLine($line)
+    $gateCache = @{}   # canonical root -> 'SKIP' | 'INDEX'
+    $toEnqueue = New-Object System.Collections.Generic.List[string]
+    $canonAvail = [bool](Get-Command Get-CanonicalRepoRoot -ErrorAction SilentlyContinue)
+    $gateAvail  = [bool](Get-Command Test-EphemeralWorktreeEdit -ErrorAction SilentlyContinue)
+    foreach ($rel in $codeFiles) {
+        if (-not $rel) { continue }
+        $abs = Join-Path $ProjectRoot $rel
+
+        # Canonical MAIN root (empty when unresolved → gate treats as non-worktree/INDEX).
+        $canon = ""
+        if ($canonAvail) {
+            try { $canon = Get-CanonicalRepoRoot -File $abs } catch { $canon = "" }
+            if (-not $canon) { $canon = "" }
         }
-        # Append-mode write; create the file if it doesn't exist.
-        [System.IO.File]::AppendAllText($CodeQueue, $sb.ToString(), [System.Text.Encoding]::UTF8)
-    } catch {}
+
+        $key = $canon
+        if (-not $gateCache.ContainsKey($key)) {
+            $verdict = "INDEX"
+            if ($gateAvail) {
+                try {
+                    if (Test-EphemeralWorktreeEdit -EditedFile $abs -RepoPath $ProjectRoot -CanonRoot $canon) {
+                        $verdict = "SKIP"
+                    }
+                } catch { $verdict = "INDEX" }
+            }
+            $gateCache[$key] = $verdict
+        }
+        if ($gateCache[$key] -eq "INDEX") { [void]$toEnqueue.Add($abs) }
+    }
+
+    if ($toEnqueue.Count -gt 0) {
+        try {
+            $sb = New-Object System.Text.StringBuilder
+            foreach ($p in $toEnqueue) { [void]$sb.AppendLine($p) }
+            [System.IO.File]::AppendAllText($CgDrainShared, $sb.ToString(), [System.Text.Encoding]::UTF8)
+        } catch {}
+    }
 }
 
 # -------------------- Step 4: Credential scan --------------------
