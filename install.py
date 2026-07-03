@@ -22392,6 +22392,29 @@ def _build_python_mcp_entries(
         "env": search_env,
     }
 
+    # playwright (F-1, v0.2.73)
+    # Browser automation via Microsoft's `@playwright/mcp`. The entry
+    # mirrors EXACTLY how the MCP is launched everywhere else in the
+    # stack: bare `npx -y @playwright/mcp@latest` — the same invocation
+    # the GUI catalog ships (vct-launcher-core/src/types.rs::
+    # default_mcp_servers) and `_install_playwright_browsers` pre-caches.
+    # `npx` resolves from PATH cross-OS; no venv-python and no env vars.
+    # Default-enabled per project. MUST stay in sync with the Rust builder
+    # mcp_registration.rs::build_default_mcp_entries.
+    #
+    # Pre-v0.2.73 this entry was MISSING from both builders (audit finding
+    # F-1): the GUI catalog shipped enabled=True so the toggle-ON write
+    # never fired on a fresh install, and no install path wrote the entry —
+    # the Chromium pre-cache was spent on an MCP that never reached
+    # ~/.claude.json.
+    playwright_entry = {
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "@playwright/mcp@latest"],
+        "env": {},
+    }
+    playwright_dropped: list[str] = []
+
     # mermaid (Phase 1.2 — diagrams plan)
     # Wrapper MCP that proxies the pinned `claude-mermaid` npm package.
     # Spawned as `<venv-python> -m claude_mcp_servers.wrappers.mermaid_proxy`
@@ -22435,6 +22458,7 @@ def _build_python_mcp_entries(
     return [
         ("weaviate-kg", weaviate_entry, weaviate_dropped),
         ("search", search_entry, search_dropped),
+        ("playwright", playwright_entry, playwright_dropped),
         ("mermaid", mermaid_entry, mermaid_dropped),
         ("excalidraw", excalidraw_entry, excalidraw_dropped),
     ]

@@ -61,6 +61,10 @@ pub fn router() -> Router<LauncherDbHandle> {
         .route("/projects", get(list_projects))
         .route("/projects/{project_id}", get(get_project))
         .route("/projects/{project_id}/env", get(project_env))
+        .route(
+            "/projects/{project_id}/codegraph-build",
+            post(register_codegraph_build),
+        )
         .route("/projects/by-slug/{slug}", get(get_project_by_slug_route))
         .route("/projects/by-path", get(get_project_by_path_route))
 }
@@ -314,6 +318,67 @@ async fn get_project_by_slug_route(
             format!("project with slug {:?} not found", slug),
         ),
         Err(e) => db_error_response("get project by slug", e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterCodegraphBuildReq {
+    /// OS pid of the DETACHED analyzer driver (must be > 0). This is the
+    /// wrapper/driver pid (`codegraph_resync.py --run-resync`), NOT the
+    /// analyzer child — the driver is what outlives the launcher.
+    pid: u32,
+    /// Free-text origin marker (e.g. "install_resync"). Advisory only.
+    #[serde(default)]
+    source: Option<String>,
+}
+
+/// POST /projects/{id-or-slug}/codegraph-build — R-4 (v0.2.73).
+///
+/// Registers a DETACHED analyzer walk (install.py's background resync via
+/// `vco_lib/codegraph_resync.py`) as the project's `code_graph_builds` row
+/// (status='running' + pid) so the GUI progress system shows it and the
+/// launcher's boot sweep can death-detect it (RT-1/RT-5). Single-writer
+/// rule: the row is system-observed state written via the hub — the Python
+/// spawner never opens launcher.db directly. Soft on the caller side: a
+/// 404 / hub-down is a no-op for the spawner (best-effort visibility).
+async fn register_codegraph_build(
+    State(h): State<LauncherDbHandle>,
+    Path(project_id): Path<String>,
+    Json(req): Json<RegisterCodegraphBuildReq>,
+) -> impl IntoResponse {
+    let _ = &req.source; // advisory only; not persisted
+    if req.pid == 0 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_pid",
+            "pid must be a positive OS process id".to_string(),
+        );
+    }
+    // id-or-slug resolution, same order as the config resolver.
+    let row = match h.0.get_project(&project_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => match h.0.get_project_by_slug(&project_id) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                return error_response(
+                    StatusCode::NOT_FOUND,
+                    "project_not_found",
+                    format!("project {} not found", project_id),
+                )
+            }
+            Err(e) => return db_error_response("register codegraph build (slug lookup)", e),
+        },
+        Err(e) => return db_error_response("register codegraph build (id lookup)", e),
+    };
+    match h.0.register_running_code_graph_build(&row.id, req.pid) {
+        Ok(()) => Json(serde_json::json!({
+            "registered": true,
+            "project_id": row.id,
+            "pid": req.pid,
+            "status": "running",
+        }))
+        .into_response(),
+        Err(e) => db_error_response("register codegraph build", e),
     }
 }
 

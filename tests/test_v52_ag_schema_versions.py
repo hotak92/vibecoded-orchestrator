@@ -97,7 +97,9 @@ def test_canonical_version_helper() -> None:
     assert sv.canonical_version("kg_collection") == 3
     # v0.2.72 P3/P7: codegraph classes gained chunk_num/total_chunks/embed_revision
     # → bumped 4→5 with the preserving migrations/codegraph_collection/4_to_5.py edge.
-    assert sv.canonical_version("codegraph_collection") == 5
+    # v0.2.73 M1/M4: is_test (BOOL) + n_callers (INT) → bumped 5→6 with the
+    # preserving migrations/codegraph_collection/5_to_6.py edge (add_property only).
+    assert sv.canonical_version("codegraph_collection") == 6
     assert sv.canonical_version("rl_events_payload_shape") == 3
     with pytest.raises(KeyError):
         sv.canonical_version("not_a_real_artifact_type")

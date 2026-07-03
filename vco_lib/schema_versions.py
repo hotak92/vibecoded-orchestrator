@@ -76,7 +76,14 @@ DEVELOPMENT_COLLECTION_SCHEMA_VERSION = 2
 #: verb and a full CodeSage re-embed would be needlessly expensive for a 9%
 #: tail. So: framework owns the SCHEMA shape (this bump + the preserving edge);
 #: the analyzer's revision gate owns the DATA re-shape.
-CODEGRAPH_COLLECTION_SCHEMA_VERSION = 5
+#: v6: v0.2.73 M1/M4 — ``is_test`` (BOOL) on CodeFunction/CodeClass/CodeModule
+#: + ``n_callers`` (INT) on CodeFunction. ADDITIVE + data-preserving:
+#: ``migrations/codegraph_collection/5_to_6.py`` add_property's them (NO drop,
+#: NO re-embed — these are render/rank metadata, not embedding inputs).
+#: Backfill of existing rows is data-side
+#: (``codegraph_resync.backfill_codegraph_metadata`` for is_test/doc;
+#: ``create_cross_references`` self-heals n_callers), NOT framework-side.
+CODEGRAPH_COLLECTION_SCHEMA_VERSION = 6
 
 # ===========================================================================
 # Layer 2 — KG node content schema (USER-CURATED — upgrade in place on bump)
@@ -164,7 +171,11 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: the DB schema is at the level this code expects (refuse to start if
 #: launcher.db is somehow ahead — user downgraded orchestrator while running
 #: on newer DB).
-LAUNCHER_DB_TABLE_SET_VERSION = 36
+#: 37 = migration 037_code_graph_build_pid.sql (code_graph_builds.pid, R-4 —
+#: registers the detached install-spawned resync walk so the GUI shows it and
+#: the boot sweep can death-detect it). Bumped ATOMICALLY with mig 037's Rust
+#: registration (a Python-ahead bump would stamp a phantom schema version).
+LAUNCHER_DB_TABLE_SET_VERSION = 37
 
 
 # ===========================================================================
