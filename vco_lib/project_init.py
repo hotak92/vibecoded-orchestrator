@@ -1292,7 +1292,36 @@ def _copy_collection_with_vectors(
     Round-trip semantics (verified by research report):
       iterator(include_vector=True) yields obj.vector as dict[str, list[float]]
       batch.add_object(vector=<dict>, uuid=<orig>) re-imports byte-for-byte.
+
+    BUG-2 (v0.2.73) pre-flight shape guard: before the copy loop, probe the
+    ``dst`` schema. This helper always sends a named-vector DICT (the source
+    round-trip shape). If ``dst`` is single-vector (no ``vectorConfig``),
+    Weaviate rejects the batch with an opaque HTTP 422 ("configured without
+    multiple named vectors, but received named vectors") that only surfaces
+    as a batch-failed error after the loop. We instead raise a CLEAR
+    ValueError up-front telling the caller to re-embed from source (.md)
+    rather than copy vectors. Same-shape (named→named) copies still work, so
+    the migrate-collections internal staging path (weaviate_schema.py, which
+    builds a matching staging schema) is unaffected.
     """
+    # BUG-2: fail early and clearly on a named/single-vector shape mismatch,
+    # rather than letting an opaque 422 batch failure surface later. A
+    # single-vector destination cannot accept the named-vector dict this
+    # helper sends — the correct remediation is re-embed-from-.md.
+    try:
+        dst_schema = _fetch_schema(dst, weaviate_url=weaviate_url)
+    except Exception:
+        # Soft-fail the probe only: if we can't read the schema (transient
+        # network), fall through to the copy — the batch will still surface
+        # any real failure. Never let the probe itself block a valid copy.
+        dst_schema = None
+    if dst_schema is not None and not dst_schema.get("vectorConfig"):
+        raise ValueError(
+            f"destination {dst!r} is single-vector; named-vector copy "
+            f"impossible — re-embed from source (.md) instead "
+            f"(run bootstrap-collections --name {dst!r} then "
+            f".claude/scripts/kg-sync --all)"
+        )
     client = _connect_v4_client(weaviate_url=weaviate_url)
     try:
         src_col = client.collections.get(src)
@@ -5850,10 +5879,34 @@ def _is_similar_prefix(
     return False
 
 
+def _live_kg_collection_binding() -> Optional[str]:
+    """Return the project's LIVE knowledge-graph collection binding — the
+    Weaviate class the project's MCP / hooks actually read from — or None.
+
+    BUG-1 (v0.2.73): the sanitizer (`sanitize_for_weaviate_class`) is
+    case-LOSSY — an all-lowercase project name like ``vibecoded-orchestrator``
+    yields the lowercase-c ``VibecodedOrchestrator_KnowledgeGraph`` which does
+    NOT exist, while the real active class is the uppercase-C
+    ``VibeCodedOrchestrator_KnowledgeGraph`` (populated). The active binding is
+    the authoritative "canonical" — the sanitizer's guess is subordinate to it.
+
+    The canonical channel that reaches this install-time process is the
+    ``KG_COLLECTION`` env var (set by ``.claude/settings.json env`` /
+    ``.claude/env`` / hub resolution — the same value MCP subprocesses see).
+    An empty string is treated as "no binding" (v0.2.27 empty-env coercion).
+    Returns the raw class name (case preserved) so callers can compare it
+    against the live Weaviate schema exactly.
+    """
+    val = os.environ.get("KG_COLLECTION", "")
+    return val.strip() or None
+
+
 def _detect_legacy_collections_with_suffixes(
     project_name: str,
     weaviate_url: str,
     suffixes: tuple,
+    *,
+    live_binding: Optional[str] = None,
 ) -> list[dict]:
     """Shared core for legacy KG + legacy code-graph detection.
 
@@ -5862,6 +5915,13 @@ def _detect_legacy_collections_with_suffixes(
         weaviate_url: Weaviate REST endpoint.
         suffixes: tuple of class-name suffixes to inspect (KG family or
             code-graph family).
+        live_binding: the project's LIVE knowledge-graph collection (the
+            class it actually reads — env ``KG_COLLECTION`` / hub-resolved).
+            When provided, it is the AUTHORITATIVE canonical: a candidate
+            equal to it (case-insensitively) is NEVER a drop target. Defaults
+            to `_live_kg_collection_binding()` for the KG suffix family; for
+            code-graph the caller passes None (code-graph has no single env
+            binding — it's regenerable, and its skip stays sanitizer-based).
 
     Returns a list of candidate dicts, each with:
         {
@@ -5870,6 +5930,9 @@ def _detect_legacy_collections_with_suffixes(
           "object_count":   int | None,    # None when Weaviate unreachable
           "embedding_dim":  int | None,    # None when not discoverable
           "canonical_name": "<canonical class for this project + suffix>",
+          "case_only":      bool,          # BUG-1: candidate differs from the
+                                           # canonical ONLY by case → a
+                                           # case-REBIND, never copy+drop.
         }
 
     Returns [] in any of these conditions (treated as "nothing to migrate"):
@@ -5878,11 +5941,17 @@ def _detect_legacy_collections_with_suffixes(
       - All matching classes have a different prefix than THIS project's
         canonical prefix (i.e., they belong to OTHER projects — never auto-
         suggest migrating someone else's data).
-      - The only matching class IS the canonical name (fresh-install path).
+      - The only matching class IS the canonical name (fresh-install path),
+        matched CASE-INSENSITIVELY (BUG-1) or equal to the live binding.
     """
     canonical_prefix = sanitize_for_weaviate_class(project_name)
     if not canonical_prefix:
         return []
+    # BUG-1: the live KG binding (env KG_COLLECTION) is the authoritative
+    # canonical — the class the project actually reads. A candidate equal
+    # to it is BY DEFINITION not a legacy drop target. Lowercased once here
+    # for O(1) case-insensitive comparison in the loop.
+    live_binding_lc = (live_binding or "").strip().lower() or None
     # Conservative: if the project name didn't yield a real prefix and we
     # fell back to `_FALLBACK_PREFIX` ("vct"), do NOT scan — the fallback
     # is too generic and would match many unrelated classes.
@@ -5920,8 +5989,23 @@ def _detect_legacy_collections_with_suffixes(
         cand_prefix, sfx = decomp
 
         canonical_name = f"{canonical_prefix}{sfx}"
-        # Skip the canonical class itself — it's NOT legacy.
-        if class_name == canonical_name:
+        # BUG-1 (v0.2.73): skip the canonical class itself — it's NOT legacy.
+        # Two authoritative skip rules, both CASE-INSENSITIVE:
+        #   (a) class matches the sanitizer-derived canonical name (case-
+        #       insensitively). Historically this was case-SENSITIVE `==`,
+        #       which let the real uppercase-C active class slip past the
+        #       skip when the sanitizer produced a lowercase-c guess — and
+        #       be emitted as a legacy candidate whose proposed destination
+        #       (the nonexistent lowercase-c class) turned the migration
+        #       command into a self-destruct on the real 2590-node KG.
+        #   (b) class equals the project's LIVE `KG_COLLECTION` binding
+        #       (the class the project actually reads). The live binding is
+        #       BY DEFINITION not a drop target, regardless of the
+        #       sanitizer's casing guess.
+        class_name_lc = class_name.lower()
+        if class_name_lc == canonical_name.lower():
+            continue
+        if live_binding_lc is not None and class_name_lc == live_binding_lc:
             continue
 
         # Conservative prefix-similarity check.  Without this we'd
@@ -5934,12 +6018,23 @@ def _detect_legacy_collections_with_suffixes(
         count = _http_count_objects(class_name, weaviate_url)
         emb_dim = _embedding_dim_from_schema(cls)
 
+        # BUG-1: `case_only` marks a candidate that differs from the
+        # canonical ONLY by case → a case-REBIND (metadata rename of the
+        # launcher binding), NEVER a copy+drop of vectors. With the
+        # case-insensitive skip above, a candidate that is a case-variant of
+        # the *sanitizer* canonical is already skipped, so this is normally
+        # False for emitted candidates. It is kept as an explicit,
+        # authoritative field so `_format_legacy_kg_command` can route + a
+        # future detector regression (e.g. a candidate re-surfaced through a
+        # different path) is still caught by the same-name guard downstream.
+        case_only = class_name_lc == canonical_name.lower()
         candidates.append({
             "class_name": class_name,
             "suffix": sfx,
             "object_count": count,
             "embedding_dim": emb_dim,
             "canonical_name": canonical_name,
+            "case_only": case_only,
         })
 
     # Stable order: by suffix then class_name (deterministic deferral .md).
@@ -5948,15 +6043,26 @@ def _detect_legacy_collections_with_suffixes(
 
 
 def _detect_legacy_kg_collections(
-    project_name: str, weaviate_url: str,
+    project_name: str,
+    weaviate_url: str,
+    *,
+    live_binding: Optional[str] = None,
 ) -> list[dict]:
     """Detect KG-family classes (KnowledgeGraph + Development) that look
     like THIS project's data under a different prefix.
 
     See `_detect_legacy_collections_with_suffixes` for the full contract.
+
+    `live_binding` defaults to the project's live `KG_COLLECTION` env
+    binding (`_live_kg_collection_binding()`) — the AUTHORITATIVE canonical
+    that must never be proposed as a drop target (BUG-1). Tests inject it
+    explicitly; the install caller relies on the env default.
     """
+    if live_binding is None:
+        live_binding = _live_kg_collection_binding()
     return _detect_legacy_collections_with_suffixes(
         project_name, weaviate_url, _KG_SUFFIXES,
+        live_binding=live_binding,
     )
 
 
@@ -5990,6 +6096,34 @@ def _format_legacy_kg_detected(candidates: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _format_case_rebind_instruction(old: str, new: str) -> list[str]:
+    """Render a NON-destructive case-rebind instruction for a legacy
+    candidate that differs from the canonical ONLY by case (BUG-1).
+
+    A case-only pair (``old.lower() == new.lower()``) is NEVER a legitimate
+    copy+drop — the two names refer to the SAME logical collection, and the
+    stored data lives under whichever casing Weaviate actually created. The
+    correct migration is a metadata case-rebind of the launcher binding
+    (make the project read the actual-cased class), which
+    ``bootstrap-collections`` already performs via its case-conflict
+    recovery path (``regenerated[].reason == "case-conflict"``). Emitting a
+    ``_delete_class(old)`` here would DROP the populated collection.
+    """
+    return [
+        f"# CASE-ONLY difference detected: {old!r} vs {new!r} refer to the",
+        "# SAME collection under different casing. This is a metadata",
+        "# case-REBIND, NOT a data migration — do NOT copy+drop (that would",
+        "# destroy the populated collection). Re-run bootstrap-collections;",
+        "# its case-conflict recovery rebinds the launcher to the actual-",
+        "# cased class:",
+        "python -m vco_lib.project_init bootstrap-collections "
+        f"--name {new!r}",
+        "# Verify the project now reads the populated class:",
+        "#   .claude/scripts/kg-search list",
+        "",
+    ]
+
+
 def _format_legacy_kg_command(
     project_name: str,
     weaviate_url: str,
@@ -5997,36 +6131,61 @@ def _format_legacy_kg_command(
 ) -> str:
     """Render the suggested migration commands for the KG deferral.
 
-    Each candidate gets a one-line python-c command that copies objects
-    from the legacy class to the canonical class via
-    `_copy_collection_with_vectors` (vectors + UUIDs preserved), then
-    drops the legacy class.  This is the safe rename idiom — irreversible
-    once the drop succeeds, hence the explicit-consent gating.
+    Two disjoint remediation shapes, selected per candidate:
 
-    The canonical name MUST already exist (created during install_bundle's
-    bootstrap step).  If for some reason it doesn't, the user should re-run
-    `bootstrap-collections --name <project>` first.
+      * CASE-ONLY pair (``old.lower() == new.lower()``, BUG-1): a metadata
+        case-REBIND, never a copy+drop. Rendered by
+        ``_format_case_rebind_instruction``. A HARD GUARD here refuses to
+        emit any ``_delete_class(old)`` / ``_copy_collection_with_vectors``
+        for such a pair — belt-and-suspenders so even a future detector
+        regression can't produce a self-destruct command on a collection the
+        project is actively bound to.
+
+      * GENUINE legacy (different prefix, real drop target — BUG-2): the
+        remediation is RE-EMBED-FROM-`.md`, NOT copy-vectors. When the
+        schema/model changed, the legacy vectors are the wrong shape (a
+        named-vector copy into a single-vector destination 422s) and often
+        the wrong model; the on-disk ``knowledge/**/*.md`` is the source of
+        truth. Sequence: ensure the canonical exists with the current
+        named-vector schema (``bootstrap-collections``), re-embed from
+        ``.md`` (``kg-sync --all``), then drop the legacy class.
     """
     lines = [
-        "# Per-candidate migration: copy objects (vectors + UUIDs preserved)",
-        "# from the legacy class into the canonical class, then drop the",
-        "# legacy class.  Inspect the dry-run plan first.  The canonical",
-        "# class is created by install-bundle's bootstrap step — verify it",
-        f"# exists before running:  curl -s {weaviate_url}/v1/schema | python -m json.tool",
+        "# Per-candidate migration. Two shapes below:",
+        "#   * CASE-ONLY name difference → metadata case-REBIND (no data op).",
+        "#   * GENUINE legacy prefix     → RE-EMBED from source .md, then drop.",
+        "# The canonical class is created by install-bundle's bootstrap step;",
+        f"# verify it before running:  curl -s {weaviate_url}/v1/schema | python -m json.tool",
         "",
     ]
     for c in candidates:
         old = c["class_name"]
         new = c["canonical_name"]
+        # HARD GUARD (BUG-1): a case-only pair is NEVER a copy+drop. Route
+        # to a case-rebind instruction regardless of the detector's flag —
+        # the name comparison here is authoritative and independent, so a
+        # future detector regression that mis-flags `case_only` still cannot
+        # produce a destructive command.
+        if old.lower() == new.lower():
+            lines.extend(_format_case_rebind_instruction(old, new))
+            continue
+
+        # GENUINE legacy (different prefix): re-embed from source .md
+        # (BUG-2). No _copy_collection_with_vectors — cross-schema copies
+        # 422 on named-vector/single-vector shape mismatch, and stale
+        # vectors may carry the wrong embedding model.
+        cnt = c.get("object_count", "?")
+        lines.append(f"# {old} → {new}  ({cnt} objects) — re-embed from source .md")
+        lines.append("# 1. Ensure the canonical exists with the current named-vector schema:")
         lines.append(
-            f"# {old} → {new}  ({c.get('object_count', '?')} objects)"
+            "python -m vco_lib.project_init bootstrap-collections "
+            f"--name {new!r}"
         )
+        lines.append("# 2. Re-embed the canonical from the on-disk knowledge/**/*.md (source of truth):")
+        lines.append(".claude/scripts/kg-sync --all")
+        lines.append("# 3. Drop the legacy class (vectors were the wrong shape/model; .md already re-embedded):")
         lines.append(
-            "python -c \"from vco_lib.project_init import "
-            "_copy_collection_with_vectors, _delete_class; "
-            f"n = _copy_collection_with_vectors({old!r}, {new!r}, "
-            f"weaviate_url={weaviate_url!r}); "
-            f"print(f'copied {{n}} objects'); "
+            "python -c \"from vco_lib.project_init import _delete_class; "
             f"_delete_class({old!r}, weaviate_url={weaviate_url!r}); "
             f"print('dropped {old}')\""
         )
@@ -6035,10 +6194,10 @@ def _format_legacy_kg_command(
         "# Once migration succeeds, the canonical class holds the data and"
     )
     lines.append(
-        "# the legacy class is gone.  Re-running install-bundle will see no"
+        "# any dropped legacy class is gone.  Re-running install-bundle will"
     )
     lines.append(
-        "# remaining candidates and clear this deferral entry."
+        "# see no remaining candidates and clear this deferral entry."
     )
     return "\n".join(lines)
 
