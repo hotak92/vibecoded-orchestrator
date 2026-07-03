@@ -829,6 +829,23 @@ class CodeGraphQuery:
             print()
 
     @staticmethod
+    def _print_identity_extras(rendered: dict, indent: str) -> None:
+        """v0.2.73 M2/M4: print the sidecar one-liner + analyzer fan-in count.
+
+        The shared formatter (weaviate_mcp.server ``_format_code_result_by_*``)
+        already populated the fields; the CLI only prints them — no logic here
+        (the CLI/MCP non-divergence invariant). Absent fields → no lines
+        (older rows / missing sidecar keep the pre-M2 output). Shared by the
+        CodeFunction and CodeClass branches of ``_print_body``.
+        """
+        one_liner = rendered.get("one_liner", "")
+        if one_liner:
+            print(f"{indent}One-liner: {one_liner}")
+        n_callers = rendered.get("n_callers")
+        if n_callers is not None:
+            print(f"{indent}Callers: {n_callers}")
+
+    @staticmethod
     def _print_body(rendered: dict, indent: str, hook_format: bool) -> None:
         """Render the per-collection body section of a code-graph result.
 
@@ -842,6 +859,7 @@ class CodeGraphQuery:
             sig = rendered.get("signature", "")
             if sig:
                 print(f"{indent}Signature: {sig}")
+            CodeGraphQuery._print_identity_extras(rendered, indent)
             doc = rendered.get("doc", "")
             if doc:
                 if hook_format:
@@ -874,6 +892,7 @@ class CodeGraphQuery:
             sig = rendered.get("signature", "")
             if sig:
                 print(f"{indent}Signature: {sig}")
+            CodeGraphQuery._print_identity_extras(rendered, indent)
             doc = rendered.get("doc", "")
             if doc:
                 if hook_format:

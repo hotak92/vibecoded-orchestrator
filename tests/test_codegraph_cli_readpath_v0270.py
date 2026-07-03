@@ -366,3 +366,32 @@ def test_live_cli_mcp_ranking_parity() -> None:
         f"body-level divergence. mcp={mcp_fns} cli={cli_fns} out-of-order/"
         f"missing={missing}"
     )
+
+
+# ---------------------------------------------------------------------------
+# v0.2.73 M2/M4 — CLI/MCP FIELD parity for the new sidecar + n_callers fields
+# (AG-4 append; integrator merges with AG-5's ordering-parity extension)
+# ---------------------------------------------------------------------------
+
+
+def test_m2_m4_cli_prints_shared_formatter_fields() -> None:
+    """The shared formatter emits `one_liner` / `n_callers`; the CLI must
+    PRINT them (no logic — field parity with the MCP JSON). Source-level
+    check so it runs without the Weaviate stack."""
+    src = CLI_SRC.read_text(encoding="utf-8")
+    assert '_print_identity_extras' in src
+    assert 'rendered.get("one_liner"' in src
+    assert 'rendered.get("n_callers"' in src
+
+
+def test_m2_m4_server_formatters_emit_fields() -> None:
+    """Both shared formatters (tier + rank) consult the code sidecar and the
+    n_callers property — the CLI relies on those fields existing."""
+    from weaviate_mcp import server as mcp_server
+    import inspect
+
+    tier_src = inspect.getsource(mcp_server._format_code_result_by_tier)
+    rank_src = inspect.getsource(mcp_server._format_code_result_by_rank)
+    for src_text in (tier_src, rank_src):
+        assert "_get_code_format" in src_text
+        assert "n_callers" in src_text
