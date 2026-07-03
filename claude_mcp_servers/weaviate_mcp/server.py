@@ -3681,13 +3681,25 @@ async def count_tokens_async(text: str) -> int:
 
 
 async def get_code_embedding(text: str) -> list[float] | None:
-    """Get code embedding from the CodeSage service.
+    """Get a CodeSage-space code embedding.
 
-    v0.2.18: prefers EmbeddingService when the active code slot is
-    `codesage_embed` (same backend the inline call targets). Falls
-    through to the inline CodeEmbed HTTP call otherwise — so a project
-    with active=openai-code can still ask for a codesage embedding via
-    this helper (used by `backfill_embeddings(provider="codesage")`).
+    This helper is the CODESAGE-SPECIFIC provider used by the
+    ``backfill_embeddings(provider="codesage")`` caller and the
+    ``_get_all_code_embeddings`` inline-fallback gather. It prefers
+    EmbeddingService ONLY when the active code slot is `codesage_embed`
+    (same backend the inline call targets); otherwise it deliberately
+    falls through to the inline CodeEmbed HTTP call so a project with
+    active=openai-code can still request a codesage vector for backfill.
+
+    ⚠️  Do NOT use this to embed a SEARCH QUERY. For query embedding use
+    ``get_code_query_embedding`` (v0.2.73 C-5) which routes through
+    ``svc.embed_code`` for ALL slots — mirroring the CLI
+    (``query_code_graph.py::generate_code_embedding``). Using this
+    codesage-biased helper for queries broke the CLI≡MCP invariant on
+    every non-CodeSage slot (qwen3 / jina): the CLI embedded via the
+    resolved slot model, the MCP embedded via whatever :11440 served,
+    so the two surfaces produced different query vectors and different
+    results.
     """
     svc = _get_embedding_service()
     if svc is not None and svc.code_vector_slot == "codesage_embed":
@@ -3698,7 +3710,16 @@ async def get_code_embedding(text: str) -> list[float] | None:
                 "EmbeddingService.embed_code failed (%s); falling back to inline CodeEmbed call",
                 e,
             )
-    # Inline fallback (pre-v0.2.18 path): direct CodeEmbed HTTP call.
+    return await _inline_code_embed_http(text)
+
+
+async def _inline_code_embed_http(text: str) -> list[float] | None:
+    """Direct CodeEmbed HTTP call (pre-v0.2.18 fallback path).
+
+    Shared by ``get_code_embedding`` (codesage backfill) and
+    ``get_code_query_embedding`` (svc-None fallback) so the raw-HTTP
+    fallback has ONE home.
+    """
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -3715,6 +3736,51 @@ async def get_code_embedding(text: str) -> list[float] | None:
     except Exception as e:
         logger.error("Code embedding service error: %s", e)
         return None
+
+
+async def get_code_query_embedding(text: str) -> list[float] | None:
+    """Embed a SEARCH QUERY into the active code-vector space.
+
+    v0.2.73 C-5: the CLI≡MCP invariant requires the MCP to embed queries
+    exactly as the CLI does. The CLI's
+    ``query_code_graph.py::generate_code_embedding`` routes ALL slots
+    through ``svc.embed_code`` (which resolves the slot's backend —
+    CodeSage :11440, qwen3 → Ollama :11435, jina → Ollama, openai) and
+    only falls back to raw CodeEmbed HTTP when EmbeddingService is
+    unavailable. This function MIRRORS that contract so
+    ``search_code_graph`` produces the same query vector the CLI would.
+
+    MUST MATCH ``templates/scripts/query_code_graph.py::generate_code_embedding``.
+    """
+    svc = _get_embedding_service()
+    if svc is not None:
+        try:
+            return await asyncio.to_thread(svc.embed_code, text)
+        except Exception as e:
+            logger.warning(
+                "EmbeddingService.embed_code failed (%s); falling back to inline CodeEmbed call",
+                e,
+            )
+    # Legacy fallback (svc unavailable): direct CodeEmbed HTTP call.
+    return await _inline_code_embed_http(text)
+
+
+def _active_code_query_slot() -> str:
+    """Return the active code-vector slot for a query's ``target_vector``.
+
+    v0.2.73 C-6: mirrors the CLI's
+    ``query_code_graph.py::_active_code_vector_slot`` EXACTLY — svc present
+    → its resolved ``code_vector_slot``; svc None → ``"codesage_embed"``
+    (the CLI's unconditional pre-v0.2.18 fallback). Kept as a named helper
+    so both search + any future code-query call site cannot re-fork the
+    fallback.
+
+    MUST MATCH ``templates/scripts/query_code_graph.py::_active_code_vector_slot``.
+    """
+    svc = _get_embedding_service()
+    if svc is None:
+        return "codesage_embed"
+    return svc.code_vector_slot
 
 
 async def get_legacy_code_embedding(text: str) -> list[float] | None:
@@ -8525,7 +8591,11 @@ async def search_code_graph(
     _base_for = {_project_collection(b): b for b in base_names}
 
     try:
-        query_embedding = await get_code_embedding(query)
+        # v0.2.73 C-5: embed the query via the CLI-mirrored path
+        # (svc.embed_code for ALL slots) so the MCP and CLI produce the
+        # SAME query vector on every ladder tier. Using the codesage-biased
+        # get_code_embedding here broke CLI≡MCP on qwen3/jina slots.
+        query_embedding = await get_code_query_embedding(query)
         if not query_embedding:
             return json.dumps({"success": False, "error": "Failed to generate query embedding"}, indent=2)
 
@@ -8553,13 +8623,16 @@ async def search_code_graph(
                     # pre-v0.2.18 ACTIVE_EMBEDDING branching when the
                     # service isn't available.
                     if DUAL_EMBEDDING_ENABLED:
-                        svc = _get_embedding_service()
-                        if svc is not None:
-                            kwargs["target_vector"] = svc.code_vector_slot
-                        elif ACTIVE_EMBEDDING in ("qwen3", "codesage"):
-                            kwargs["target_vector"] = "codesage_embed"
-                        else:
-                            kwargs["target_vector"] = "ollama_code_embed"
+                        # v0.2.73 C-6: mirror the CLI's
+                        # ``_active_code_vector_slot`` — svc present → its
+                        # resolved slot; svc None → "codesage_embed" (the
+                        # CLI's unconditional svc-None fallback). Previously
+                        # the MCP branched on ACTIVE_EMBEDDING here while the
+                        # CLI did not, so with e.g. ACTIVE_EMBEDDING=arctic +
+                        # a broken vco_lib import the two surfaces searched
+                        # different named vectors.
+                        # MUST MATCH query_code_graph.py::_active_code_vector_slot.
+                        kwargs["target_vector"] = _active_code_query_slot()
                     # v0.2.73 RL-2b: fetch each candidate's stored vector in the
                     # SAME query (no second round-trip) so citation staging has
                     # real per-node vectors to cosine against. When a named
