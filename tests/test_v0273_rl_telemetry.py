@@ -430,3 +430,138 @@ def test_rl4_normal_gate_still_fires_with_stop_drain_reason(tmp_path):
     summary = _drain(tmp_path, "sess-d", transcript, computed)
     assert summary["computed"] == 1
     assert computed[0]["ctx"]["fire_reason"] == "stop_drain"
+
+# ---------------------------------------------------------------------------
+# RL-2 — code path retrieval telemetry
+# ---------------------------------------------------------------------------
+
+
+def _code_survivors():
+    return [
+        {
+            "_c": "CodeFunction",
+            "_s": 0.61,
+            "_d": 0.39,
+            "_p": {
+                "full_name": "alpha.processing.process_batch",
+                "file_path": "src/alpha/processing.py",
+            },
+            "_tier": "three_chunks",
+            "_rerank": 0.66,
+            "_boost": {"delta": 0.05, "signals": {"call_linked": True, "capped": False}},
+            "chunks_matched": 2,
+        },
+        {
+            "_c": "CodeModule",
+            "_s": 0.40,
+            "_d": 0.60,
+            "_p": {"path": "src/alpha/util.py"},
+            "_tier": "summary",
+        },
+    ]
+
+
+def test_rl2_code_emit_builds_code_event(monkeypatch):
+    import importlib
+
+    srv = importlib.import_module("weaviate_mcp.server")
+    captured: list = []
+    w = _writer(captured)
+    monkeypatch.setattr(
+        srv, "_get_rl_telemetry_writer_for", lambda *a, **k: w
+    )
+    ok = srv._emit_code_retrieval_telemetry(
+        query="where are batches validated?",
+        query_emb=[0.1] * 16,
+        survivors=_code_survivors(),
+        limit=2,
+        slot="codesage_embed",
+        task_type="code_search",
+        retrieval_floor=0.16,
+        post_rerank_floor=0.22,
+        anchor_present=False,
+        scope="code",
+    )
+    assert ok is True
+    event = _payload(captured[0])
+    assert event["task_type"] == "code_search"
+    assert event["rl_used"] is False
+    assert event["extras"]["retrieval_kind"] == "code"
+    assert event["extras"]["retrieval_floor"] == 0.16
+    assert event["extras"]["post_rerank_floor"] == 0.22
+    assert event["extras"]["anchor"] is False
+    n0 = event["nodes"][0]
+    assert n0["title"] == "alpha.processing.process_batch"
+    assert n0["collection"] == "CodeFunction"
+    assert n0["file_path"] == "src/alpha/processing.py"
+    assert n0["shown_rank"] == 0
+    assert n0["tier"] == "three_chunks"
+    assert n0["rerank_score"] == pytest.approx(0.66)
+    assert n0["boost_delta"] == pytest.approx(0.05)
+    assert n0["boost_signals"]["call_linked"] is True
+    assert n0["chunks_matched"] == 2
+    # Module row keeps its identity via path fallback.
+    assert event["nodes"][1]["title"] == "src/alpha/util.py"
+
+
+def test_rl2_code_emit_empty_survivors_no_event(monkeypatch):
+    import importlib
+
+    srv = importlib.import_module("weaviate_mcp.server")
+    captured: list = []
+    monkeypatch.setattr(
+        srv, "_get_rl_telemetry_writer_for", lambda *a, **k: _writer(captured)
+    )
+    ok = srv._emit_code_retrieval_telemetry(
+        query="anything",
+        query_emb=[0.1] * 16,
+        survivors=[],
+        limit=2,
+        slot="codesage_embed",
+    )
+    assert ok is False
+    assert not captured
+
+
+def test_rl2_code_emit_soft_fails_on_writer_error(monkeypatch):
+    import importlib
+
+    srv = importlib.import_module("weaviate_mcp.server")
+
+    def _boom(*a, **k):
+        raise RuntimeError("writer construction exploded")
+
+    monkeypatch.setattr(srv, "_get_rl_telemetry_writer_for", _boom)
+    ok = srv._emit_code_retrieval_telemetry(
+        query="anything",
+        query_emb=[0.1] * 16,
+        survivors=_code_survivors(),
+        limit=2,
+        slot="codesage_embed",
+    )
+    assert ok is False  # soft-fail, no raise
+
+
+def test_rl2_mcp_and_cli_call_the_shared_emit_home():
+    """Both surfaces route through _emit_code_retrieval_telemetry (one home)."""
+    import inspect
+    import importlib
+
+    srv = importlib.import_module("weaviate_mcp.server")
+    tool_fn = getattr(srv.search_code_graph, "fn", None) or srv.search_code_graph
+    mcp_src = inspect.getsource(tool_fn)
+    assert "_emit_code_retrieval_telemetry(" in mcp_src
+    cli_src = (
+        PROJECT_ROOT / "templates" / "scripts" / "query_code_graph.py"
+    ).read_text(encoding="utf-8")
+    assert "_emit_code_retrieval_telemetry(" in cli_src
+    assert 'task_type="code_hook" if hook_format else "code_cli"' in cli_src
+
+
+def test_rl2_code_tool_in_kg_search_tools():
+    from claude_mcp_servers.rl_client.answer_window import KG_SEARCH_TOOLS
+
+    assert "search_code_graph" in KG_SEARCH_TOOLS
+    assert "mcp__weaviate-kg__search_code_graph" in KG_SEARCH_TOOLS
+    # Structural lookups stay excluded (no semantic candidates to cite).
+    assert "query_code_structure" not in KG_SEARCH_TOOLS

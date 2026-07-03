@@ -42,10 +42,16 @@ DEFAULT_ANSWER_THRESHOLD_TOKENS: int = 25_000
 TOOL_CONTENT_LIMIT: int = 20_000
 
 # KG search tool names as they appear in transcripts (with + without prefix).
+# v0.2.73 RL-2: the CODE search tool is included so code retrievals get
+# transcript positions (find_kg_positions) and become citable once code
+# citation staging lands. Structural lookups (query_code_structure) are
+# deliberately excluded — they carry no semantic candidates to cite.
 KG_SEARCH_TOOLS: frozenset[str] = frozenset({
     "hybrid_search", "semantic_graph_search",
+    "search_code_graph",
     "mcp__weaviate-kg__hybrid_search",
     "mcp__weaviate-kg__semantic_graph_search",
+    "mcp__weaviate-kg__search_code_graph",
 })
 
 

@@ -4986,6 +4986,149 @@ def _get_rl_telemetry_writer():
     )
 
 
+def _emit_code_retrieval_telemetry(
+    *,
+    query: str,
+    query_emb: "list[float] | None",
+    survivors: list[dict],
+    limit: int,
+    slot: str,
+    task_type: str = "code_search",
+    retrieval_floor: "float | None" = None,
+    post_rerank_floor: "float | None" = None,
+    anchor_present: bool = False,
+    scope: str = "",
+    session_id: "str | None" = None,
+) -> bool:
+    """v0.2.73 RL-2: emit a retrieval event for the CODE search path.
+
+    ONE home shared by the MCP tool (``search_code_graph``) and the CLI
+    (``query_code_graph.py search_by_concept`` — hooks route through it), so
+    the code path stops being a telemetry black hole (pre-RL-2 it emitted
+    ZERO events: no queries, no ``_boost`` diagnostics, no floors — the RL
+    corpus was KG-only).
+
+    Per-node record: title = ``full_name`` (or the per-collection identity
+    fallback), fused score (clamped by the writer), tier = the score-tier the
+    renderer applied (``_tier``), shown_rank = final order, plus the code
+    diagnostics ``collection`` / ``file_path`` / ``rerank_score`` /
+    ``boost_delta`` / ``boost_signals`` / ``chunks_matched``. Event-level
+    ``extras`` carries the resolved floors + anchor presence + scope;
+    ``rl_used=False`` always (the code rerank is the deterministic
+    relationship rerank, not the RL container).
+
+    The writer is resolved for the CODE embedding triple (slot-derived short
+    source + the ACTUAL query-vector dim) so these events partition into
+    their own cohort and never contaminate the text-embedding corpus.
+
+    NOTE (scope, deliberate): code retrievals do NOT stage citation ctx /
+    pending files this release — code candidates are fetched WITHOUT vectors,
+    so the citation cosine has nothing to compute against. Retrieval events +
+    transcript positioning (KG_SEARCH_TOOLS) land now; citation staging needs
+    an n_emb fetch decision. Soft-fail throughout; returns emit success.
+    """
+    try:
+        from claude_mcp_servers.rl_client.telemetry_emit import (
+            EmitValidationError,
+            RetrievalEvent,
+            emit_rl_event,
+            new_task_id,
+        )
+
+        nodes: list[dict] = []
+        for i, c in enumerate(survivors):
+            if not isinstance(c, dict):
+                continue
+            p = c.get("_p") or {}
+            coll = c.get("_c", "")
+            title = (
+                p.get("full_name")
+                or p.get("path")
+                or p.get("endpoint")
+                or p.get("file_path")
+                or ""
+            )
+            if not title:
+                continue
+            rec: dict = {
+                "title": title,
+                "score": c.get("_s", 0.0),
+                "tier": str(c.get("_tier") or "top_k"),
+                "shown_rank": i,
+                "collection": coll,
+            }
+            fp = p.get("file_path") or p.get("path") or ""
+            if fp:
+                rec["file_path"] = fp
+            if c.get("_rerank") is not None:
+                rec["rerank_score"] = c.get("_rerank")
+            boost = c.get("_boost")
+            if isinstance(boost, dict):
+                if boost.get("delta") is not None:
+                    rec["boost_delta"] = boost.get("delta")
+                if boost.get("signals"):
+                    rec["boost_signals"] = boost.get("signals")
+            if c.get("chunks_matched") is not None:
+                rec["chunks_matched"] = c.get("chunks_matched")
+            nodes.append(rec)
+
+        if not nodes:
+            return False
+
+        # CODE embedding triple: slot-derived short source, the query
+        # vector's ACTUAL dim, and the service-resolved model id when
+        # available. Falls back to env — never blocks the emit.
+        code_source = _slot_short_source(slot)
+        code_dim = len(query_emb) if query_emb else 0
+        code_model = ""
+        try:
+            svc = _get_embedding_service()
+            if svc is not None:
+                code_model = getattr(svc, "code_model_id", "") or ""
+                if not code_dim:
+                    code_dim = getattr(svc, "code_dim", 0) or 0
+        except Exception:  # noqa: BLE001
+            pass
+        if not code_model:
+            code_model = os.getenv("CODE_EMBED_MODEL", "") or code_source
+
+        extras: dict = {"retrieval_kind": "code", "anchor": bool(anchor_present)}
+        if scope:
+            extras["scope"] = scope
+        if retrieval_floor is not None:
+            extras["retrieval_floor"] = retrieval_floor
+        if post_rerank_floor is not None:
+            extras["post_rerank_floor"] = post_rerank_floor
+
+        ev = RetrievalEvent(
+            query=query,
+            query_emb=query_emb,
+            embedding_source=code_source,
+            embedding_dim=code_dim,
+            embedding_model=code_model,
+            nodes=nodes,
+            task_id=new_task_id(),
+            task_type=task_type,
+            session_id=session_id,
+            rl_used=False,
+            extras=extras,
+        )
+
+        def _code_writer_factory():
+            return _get_rl_telemetry_writer_for(
+                code_source, embedding_dim=code_dim, embedding_model=code_model,
+            )
+
+        try:
+            return emit_rl_event(ev, writer_factory=_code_writer_factory)
+        except EmitValidationError as exc:
+            logger.debug("code retrieval emit validation failed (%s)", exc)
+            return False
+    except Exception as exc:  # noqa: BLE001 — telemetry never breaks search
+        logger.debug("code retrieval emit failed (%s)", exc)
+        return False
+
+
 def _get_rl_telemetry_writer_for(
     embedding_source: str,
     *,
@@ -8265,16 +8408,33 @@ async def search_code_graph(
         # has NO exclude concept (a direct tool call has no edited-file context),
         # so no equivalent filter exists here — deliberate, not drift.
         _post_floor = resolve_post_rerank_floor(_slot)
+        _retrieval_floor = resolve_retrieval_floor(_slot)
         _tier_fn = make_code_tier_fn(min_gate=_post_floor) if detail == "auto" else None
         candidates = run_code_retrieval_pipeline(
             candidates,
-            retrieval_floor=resolve_retrieval_floor(_slot),
+            retrieval_floor=_retrieval_floor,
             post_rerank_floor=_post_floor,
             anchor_props=None,
             limit=limit,
             collapse_fn=make_code_collapse_fn(),
             tier_fn=_tier_fn,
             key_fields=("file_path", "full_name"),
+        )
+
+        # v0.2.73 RL-2: the code path now emits retrieval telemetry (it was a
+        # black hole — the RL corpus was KG-only). One shared emit home with
+        # the CLI; soft-fail, never blocks the search.
+        _emit_code_retrieval_telemetry(
+            query=query,
+            query_emb=query_embedding,
+            survivors=candidates,
+            limit=limit,
+            slot=_slot,
+            task_type="code_search",
+            retrieval_floor=_retrieval_floor,
+            post_rerank_floor=_post_floor,
+            anchor_present=False,
+            scope=scope,
         )
 
         def _fetch_file_siblings(file_path: str, hit_start_line: int, max_total: int, exclude_full_name: str) -> list[dict]:

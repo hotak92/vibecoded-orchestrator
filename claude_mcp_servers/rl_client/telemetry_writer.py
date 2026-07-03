@@ -540,7 +540,12 @@ class RLTelemetryWriter:
             if n.get("boost_delta") is not None:
                 rec["boost_delta"] = float(n["boost_delta"])
             if n.get("boost_signals"):
-                rec["boost_signals"] = list(n["boost_signals"])
+                # code_ranking stamps signals as a dict; keep the shape
+                # verbatim (payload_json is stored as-is).
+                _sig = n["boost_signals"]
+                rec["boost_signals"] = (
+                    dict(_sig) if isinstance(_sig, dict) else list(_sig)
+                )
             node_records.append(rec)
 
         event: Dict[str, Any] = {

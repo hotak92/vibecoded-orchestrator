@@ -562,9 +562,10 @@ class CodeGraphQuery:
             # identical wiring in the MCP (the hard invariant).
             _post_floor = resolve_post_rerank_floor(_slot)
             _tier_fn = make_code_tier_fn(min_gate=_post_floor) if detail == "auto" else None
+            _retrieval_floor = resolve_retrieval_floor(_slot)
             survivors = run_code_retrieval_pipeline(
                 candidates,
-                retrieval_floor=resolve_retrieval_floor(_slot),
+                retrieval_floor=_retrieval_floor,
                 post_rerank_floor=_post_floor,
                 anchor_props=anchor_props,
                 limit=limit,
@@ -572,6 +573,28 @@ class CodeGraphQuery:
                 tier_fn=_tier_fn,
                 key_fields=("file_path", "full_name"),
             )
+
+            # v0.2.73 RL-2: the CLI (and the pre-edit hooks routing through
+            # it) now emits code retrieval telemetry via the SAME shared
+            # server helper the MCP uses — one emit home, no divergence.
+            # Soft-fail: telemetry never breaks the search.
+            try:
+                from weaviate_mcp.server import _emit_code_retrieval_telemetry
+
+                _emit_code_retrieval_telemetry(
+                    query=query,
+                    query_emb=query_embedding,
+                    survivors=survivors,
+                    limit=limit,
+                    slot=_slot,
+                    task_type="code_hook" if hook_format else "code_cli",
+                    retrieval_floor=_retrieval_floor,
+                    post_rerank_floor=_post_floor,
+                    anchor_present=anchor_props is not None,
+                    scope=collection,
+                )
+            except Exception:
+                pass
 
             # Rebuild `top` in the (distance, source, candidate) shape the
             # downstream banner + format loop consume. `_src` / `_d` were
