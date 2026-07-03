@@ -1,8 +1,8 @@
 # Paid-module publisher CI helpers
 
-v0.2.33 (Agent F, C2) introduced two CI artifacts for paid-module publishers (`vct-rl-reranker`, future `vct-mao`, future paid modules). Both close the gap that broke v0.2.32 post-update validation — a launcher install of RL v0.2.7 showed the wrong version on the catalog tile because the manifest silently failed to parse, with no upstream gate to catch the drift.
+v0.2.33 (Agent F, C2) introduced two CI artifacts for paid-module publishers (`vct-rl-reranker`, future `vct-mao`, future paid modules). Both close the gap that broke v0.2.32 post-update validation — a launcher install of RL v0.2.7 showed the wrong version on the catalog tile because the manifest silently failed to parse, with no upstream gate to catch the drift. v0.2.73 (E-3) adds a third artifact — an L0 publish-ordering gate.
 
-The two artifacts are independent — adopt either or both.
+The three artifacts are independent — adopt any or all.
 
 ## 1. JSON Schema — `docs/schemas/vct-module.schema.json`
 
@@ -70,6 +70,65 @@ Or fetch live from the launcher repo (one-shot, no vendoring):
 **Runtime detection**: the script picks `docker` over `podman` if both are available. Override with `VCT_CONTAINER_RUNTIME=podman ./validate-manifest-in-image.sh ...`.
 
 **Path override**: if your module ships the manifest somewhere other than `/app/vct-module.json` (don't — the launcher's extract step is hardcoded to `/app/`), override via `VCT_MANIFEST_PATH=/elsewhere/manifest.json`.
+
+## 3. L0 ordering gate — `validate-l0-image-pullable.sh`
+
+**The strict publish order (E-3):**
+
+```
+1. Build + PUSH the container image(s) to GHCR.
+2. Republish the L0 catalog entry that REFERENCES those image tags.
+3. Supabase serves the refreshed L0 entry to launchers.
+```
+
+This order is load-bearing but was previously enforced by nothing in code
+(E-findings §E-3). If step 2 runs before step 1 — an honest CI mis-order,
+or a silent push failure — the L0 catalog entry names an image tag that
+does not exist yet. A Pro user then installs the module, passes tier
+validation, receives a valid pull token, and `podman pull` 404s/401s
+against the missing tag — **after** paying and starting the download. The
+launcher's `synthesize_install_manifest_from_l0` guard only catches an
+*empty* `install.container.image`; a NON-empty-but-not-yet-pushed tag sails
+past it and fails at pull time.
+
+`validate-l0-image-pullable.sh` closes the gap: run it **AFTER the GHCR
+push and BEFORE the L0 republish**. It extracts `install.container.image`
+from the L0 entry (jq or python3) and asserts every referenced tag is
+pullable from the registry. It is **read-only** — `manifest inspect` (a
+registry metadata query, no layer download) with a `pull` fallback; it
+never pushes, tags, or mutates the registry.
+
+**Wiring example** (paid-module repo's `.github/workflows/release.yml`):
+
+```yaml
+- name: Push image(s) to GHCR
+  run: |
+    docker push ghcr.io/${{ github.repository_owner }}/vct-rl-reranker:${{ github.ref_name }}-cpu
+    # ...cuda / rocm variants...
+
+# GATE: image must be live BEFORE the L0 catalog entry references it.
+- name: Verify L0-referenced image is pullable (ordering gate)
+  run: |
+    cp .github/scripts/validate-l0-image-pullable.sh /tmp/g.sh
+    chmod +x /tmp/g.sh
+    # Either parse the L0 entry JSON you are about to publish:
+    /tmp/g.sh l0-catalog/vct-rl-reranker.json
+    # ...or assert specific tags directly:
+    /tmp/g.sh --image \
+      ghcr.io/${{ github.repository_owner }}/vct-rl-reranker:${{ github.ref_name }}-cpu \
+      ghcr.io/${{ github.repository_owner }}/vct-rl-reranker:${{ github.ref_name }}-cuda
+
+- name: Republish L0 catalog entry
+  if: success()   # only after the gate confirms pullability
+  run: ./scripts/republish-l0.sh
+```
+
+**Runtime detection + override**: same as the image-presence gate — prefers
+`docker`, falls back to `podman`; override with `VCT_CONTAINER_RUNTIME`.
+
+**Exit codes**: `0` all referenced tags pullable (safe to republish); `1` a
+tag is not pullable (push not done / failed — do NOT republish); `2` usage
+error or the L0 entry has an empty/absent `install.container.image`.
 
 ## What this REPLACES
 

@@ -272,22 +272,62 @@ function Emit-Warning {
 }
 
 # ── Hub port discovery ──────────────────────────────────────────────────
+# CORRUPT-INPUT CONTRACT (F-8) — MUST MATCH the bash sibling
+# `vct_project_config.sh::hub_port` and the python sibling
+# `vco_lib/project_config.py::_discover_hub` (port branch):
+#   * env `VCT_HUB_PORT` or `hub.port` file that is non-numeric / garbage
+#     → emit ONE rate-limited stderr warning (kind `hub_port_invalid`) and
+#     fall through to the default port 7700. NEVER throw (the previous
+#     `[int]$Env:VCT_HUB_PORT` cast raised a TERMINATING error that took
+#     the Windows hook host down — F-8 item #2).
+#   * `hub.port` present but UNREADABLE → warn (`hub_port_unreadable`) +
+#     default. The previous `Get-Content -Raw` inside `Test-Path` had no
+#     try/catch and threw on perm-denied (F-8 item #3).
+# A valid numeric port matches `^\d+$`. ONE conservative contract:
+# invalid content → warn + default, never crash, never emit garbage.
 function Get-HubPort {
     if ($Env:VCT_HUB_PORT) {
-        return [int]$Env:VCT_HUB_PORT
+        if ($Env:VCT_HUB_PORT -match '^\d+$') {
+            return [int]$Env:VCT_HUB_PORT
+        }
+        Emit-Warning -ErrorKind "hub_port_invalid" `
+            -Detail "VCT_HUB_PORT is not a positive integer; using default 7700"
+        return 7700
     }
     $stateDir = if ($Env:VCT_STATE_DIR) { $Env:VCT_STATE_DIR } else { Join-Path $HOME ".vct" }
     $portFile = Join-Path $stateDir "hub.port"
     if (Test-Path $portFile) {
-        $raw = (Get-Content -Raw -Path $portFile).Trim()
+        $raw = $null
+        try {
+            $raw = (Get-Content -Raw -Path $portFile -ErrorAction Stop).Trim()
+        } catch {
+            Emit-Warning -ErrorKind "hub_port_unreadable" `
+                -Detail "hub.port is not readable; using default 7700"
+            return 7700
+        }
         if ($raw -match '^\d+$') {
             return [int]$raw
         }
+        if ($raw.Length -gt 0) {
+            Emit-Warning -ErrorKind "hub_port_invalid" `
+                -Detail "hub.port contains non-integer content; using default 7700"
+        }
+        # empty (whitespace-only / truncated write) → silent default.
     }
     return 7700
 }
 
 # ── Hub token discovery ─────────────────────────────────────────────────
+# CORRUPT-INPUT CONTRACT (F-8) — MUST MATCH the bash sibling
+# `vct_project_config.sh::hub_token` and the python sibling
+# `vco_lib/project_config.py::_discover_hub` (token branch):
+#   * env `VCT_HUB_TOKEN` set → used verbatim after trim (any non-empty
+#     string is a legitimate token; no format to validate).
+#   * `hub.token` present but UNREADABLE → emit ONE rate-limited stderr
+#     warning (kind `hub_token_unreadable`) and return $null. The token
+#     has NO sane default, so unreadable/absent → "no token" → caller
+#     degrades to hub_unreachable. NEVER throw (the previous
+#     `Get-Content -Raw` had no try/catch — F-8 item #3).
 function Get-HubToken {
     if ($Env:VCT_HUB_TOKEN) {
         $t = $Env:VCT_HUB_TOKEN.Trim()
@@ -296,7 +336,13 @@ function Get-HubToken {
     $stateDir = if ($Env:VCT_STATE_DIR) { $Env:VCT_STATE_DIR } else { Join-Path $HOME ".vct" }
     $tokenFile = Join-Path $stateDir "hub.token"
     if (Test-Path $tokenFile) {
-        $raw = (Get-Content -Raw -Path $tokenFile).Trim()
+        try {
+            $raw = (Get-Content -Raw -Path $tokenFile -ErrorAction Stop).Trim()
+        } catch {
+            Emit-Warning -ErrorKind "hub_token_unreadable" `
+                -Detail "hub.token is not readable; treating as no token"
+            return $null
+        }
         if ($raw.Length -gt 0) { return $raw }
     }
     return $null
