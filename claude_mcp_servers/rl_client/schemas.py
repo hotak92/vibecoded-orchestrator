@@ -148,9 +148,30 @@ class HealthResponse(BaseModel):
     When the client falls back to "disabled mode" (no container env
     configured) it synthesises ``HealthResponse(ok=False,
     model="disabled")`` rather than performing an HTTP call.
+
+    v0.2.73 RL-10 — container version negotiation. The container's
+    ``/health`` now MAY advertise a ``protocol_version`` (integer wire-
+    contract version) plus its active embedding space (``embedding_dim``
+    + ``embedding_space``). All three are **optional** for backward-compat:
+    an older container that omits them is treated as protocol v1 with an
+    unknown embedding space (the client then degrades gracefully rather
+    than breaking silently — see ``RLClient.negotiate``). The embedding
+    fields let the client detect the RL-2b hazard (code citations are
+    CodeSage 2048-dim while the container may assume qwen3/1024-dim) and
+    refuse to feed a mismatched space into the reranker rather than
+    training the wrong network.
     """
 
     model_config = ConfigDict(extra="allow")
 
     ok: bool = False
     model: str = "unknown"
+    # RL-10: wire-contract protocol version the container implements.
+    # None ⇒ pre-RL-10 container that never advertised one ⇒ assume v1.
+    protocol_version: Optional[int] = None
+    # RL-10 / RL-2b: the embedding space the container's model head expects.
+    # ``embedding_dim`` is the vector width (1024 qwen3 / 2048 codesage /
+    # 768 jina); ``embedding_space`` is the source tag (qwen3 / codesage /
+    # arctic / ...). Both optional; None ⇒ container did not advertise.
+    embedding_dim: Optional[int] = None
+    embedding_space: Optional[str] = None
