@@ -194,6 +194,12 @@ def compute_citation(
                 cosine_sims=cosine_sims,
                 literal_cited=literal_cited,
                 cross_encoder_cited=None,
+                # v0.2.73 RL-6/RL-9 riders: the fire site (MCP monitor / Stop
+                # drain) stamps these onto ctx before calling compute; absent
+                # keys degrade to the writer's own resolution/omission.
+                session_id=str(ctx.get("session_id") or ""),
+                fire_reason=str(ctx.get("fire_reason") or ""),
+                window_tokens=int(ctx.get("window_tokens") or 0),
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("citation_compute: writer.log_citations failed (%s)", exc)
@@ -343,6 +349,10 @@ def _write_other_slot_citation(
             cosine_sims=cosine_sims,
             literal_cited=literal_cited,
             cross_encoder_cited=None,
+            # v0.2.73 RL-6/RL-9: same riders as the active-slot citation.
+            session_id=str(ctx.get("session_id") or ""),
+            fire_reason=str(ctx.get("fire_reason") or ""),
+            window_tokens=int(ctx.get("window_tokens") or 0),
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug("_write_other_slot_citation: log_citations failed (%s)", exc)

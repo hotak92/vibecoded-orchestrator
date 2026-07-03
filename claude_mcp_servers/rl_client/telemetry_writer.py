@@ -184,6 +184,8 @@ class RLTelemetryWriter:
         query_emb: Optional[List[float]] = None,
         failure_mode: Optional[str] = None,
         failed_collections: Optional[List[str]] = None,
+        rl_used: Optional[bool] = None,
+        extras: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Log a retrieval event to launcher.db (via hub) + (if consented) upload queue.
 
@@ -215,6 +217,8 @@ class RLTelemetryWriter:
                     query_emb=query_emb,
                     failure_mode=failure_mode,
                     failed_collections=failed_collections,
+                    rl_used=rl_used,
+                    extras=extras,
                 )
                 envelope = self._wrap_for_hub("retrieval", task_id, task_type, event)
                 self._last_envelope = envelope
@@ -237,6 +241,8 @@ class RLTelemetryWriter:
                 query_emb=query_emb,
                 failure_mode=failure_mode,
                 failed_collections=failed_collections,
+                rl_used=rl_used,
+                extras=extras,
             )
             _enqueue(self._etype_retrieval, payload)
 
@@ -249,6 +255,9 @@ class RLTelemetryWriter:
         literal_cited: Optional[Dict[str, bool]] = None,
         cross_encoder_cited: Optional[Dict[str, bool]] = None,
         answer_text: Optional[str] = None,
+        session_id: str = "",
+        fire_reason: str = "",
+        window_tokens: int = 0,
     ) -> None:
         """Log a citation event to launcher.db (via hub) + (if consented) upload queue.
 
@@ -262,7 +271,25 @@ class RLTelemetryWriter:
         answer so future versions can opt-in to logging answers for offline
         multi-model training without a schema bump. v0.2.9 leaves this None
         (privacy/size); None ⇒ the field is omitted from the event entirely.
+
+        v0.2.73 riders (all optional, additive):
+          * ``session_id`` (RL-9) — pre-RL-9 citation events carried NO
+            session_id, breaking session-grouped analyses on the citation
+            side. Empty ⇒ resolved via the 3-layer env chain at write time.
+          * ``fire_reason`` + ``window_tokens`` (RL-6) — the monitor logged
+            these only to logger.info; now they land in the stored event so
+            the ≥25k-token gate distribution is auditable from data.
         """
+        if not session_id:
+            # RL-9: same 3-layer resolution the retrieval side uses. Local
+            # import — telemetry_emit lazy-imports back toward server.py.
+            try:
+                from .telemetry_emit import resolve_session_id
+
+                session_id = resolve_session_id("")
+            except Exception:  # noqa: BLE001 — never break a citation write
+                session_id = ""
+
         if not _local_logging_disabled():
             try:
                 event = self._build_v3_citation_event(
@@ -273,6 +300,9 @@ class RLTelemetryWriter:
                     literal_cited=literal_cited,
                     cross_encoder_cited=cross_encoder_cited,
                     answer_text=answer_text,
+                    session_id=session_id,
+                    fire_reason=fire_reason,
+                    window_tokens=window_tokens,
                 )
                 envelope = self._wrap_for_hub("citation", task_id, task_type, event)
                 self._last_envelope = envelope
@@ -289,6 +319,9 @@ class RLTelemetryWriter:
                 literal_cited=literal_cited,
                 cross_encoder_cited=cross_encoder_cited,
                 answer_text=answer_text,
+                session_id=session_id,
+                fire_reason=fire_reason,
+                window_tokens=window_tokens,
             )
             _enqueue(self._etype_citations, payload)
 
@@ -305,6 +338,8 @@ class RLTelemetryWriter:
         query_emb: Optional[List[float]],
         failure_mode: Optional[str] = None,
         failed_collections: Optional[List[str]] = None,
+        rl_used: Optional[bool] = None,
+        extras: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Build the queue-bound payload for a retrieval event.
 
@@ -342,6 +377,11 @@ class RLTelemetryWriter:
                 val = n.get(field)
                 if val is not None:
                     rec[field] = float(val)
+            # v0.2.73 RL-1/RL-7: additive, no PII (ranks + counts only).
+            if n.get("shown_rank") is not None:
+                rec["shown_rank"] = int(n["shown_rank"])
+            if n.get("chunks_matched") is not None:
+                rec["chunks_matched"] = int(n["chunks_matched"])
             node_records.append(rec)
 
         payload: Dict[str, Any] = {
@@ -365,6 +405,10 @@ class RLTelemetryWriter:
             payload["failed_collections"] = [
                 str(c) for c in list(failed_collections)[:32]
             ]
+        if rl_used is not None:
+            payload["rl_used"] = bool(rl_used)
+        if extras:
+            payload["extras"] = dict(extras)
         return payload
 
     def _build_citation_payload(
@@ -377,6 +421,9 @@ class RLTelemetryWriter:
         literal_cited: Optional[Dict[str, bool]] = None,
         cross_encoder_cited: Optional[Dict[str, bool]] = None,
         answer_text: Optional[str] = None,
+        session_id: str = "",
+        fire_reason: str = "",
+        window_tokens: int = 0,
     ) -> Dict[str, Any]:
         """Build the queue-bound payload for a citation event.
 
@@ -415,6 +462,12 @@ class RLTelemetryWriter:
             }
         if answer_text is not None:
             payload["answer_text"] = str(answer_text)
+        if session_id:
+            payload["session_id"] = str(session_id)
+        if fire_reason:
+            payload["fire_reason"] = str(fire_reason)
+        if window_tokens:
+            payload["window_tokens"] = int(window_tokens)
         return payload
 
     # ---- v3 hub event builders (v0.2.47 RL-6c) -----------------------
@@ -430,6 +483,8 @@ class RLTelemetryWriter:
         query_emb: Optional[List[float]],
         failure_mode: Optional[str] = None,
         failed_collections: Optional[List[str]] = None,
+        rl_used: Optional[bool] = None,
+        extras: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Build the v3 retrieval event JSON stored in launcher.db's payload_json.
 
@@ -438,6 +493,13 @@ class RLTelemetryWriter:
         (the consented-upload queue payload) PLUS the raw query text — the
         hub keeps query strings because launcher.db is local-only, NOT
         uploaded. Supabase still strips them in the queue payload.
+
+        v0.2.73 additions (all optional / additive): event-level ``rl_used``
+        (RL-1 — did the rerank RPC run) + ``extras`` (RL-2 — code-path
+        diagnostics); per-node ``shown_rank`` (RL-1 — post-rerank shown
+        order), ``chunks_matched`` / ``best_chunk_number`` (RL-7) and the
+        code-path fields ``collection`` / ``file_path`` / ``rerank_score`` /
+        ``boost_delta`` / ``boost_signals`` (RL-2).
         """
         node_records: List[Dict[str, Any]] = []
         for n in nodes:
@@ -462,6 +524,23 @@ class RLTelemetryWriter:
                 val = n.get(field)
                 if val is not None:
                     rec[field] = float(val)
+            if n.get("shown_rank") is not None:
+                rec["shown_rank"] = int(n["shown_rank"])
+            if n.get("chunks_matched") is not None:
+                rec["chunks_matched"] = int(n["chunks_matched"])
+            if n.get("best_chunk_number") is not None:
+                rec["best_chunk_number"] = int(n["best_chunk_number"])
+            # RL-2 code-path node fields (present only on code retrievals).
+            if n.get("collection"):
+                rec["collection"] = str(n["collection"])
+            if n.get("file_path"):
+                rec["file_path"] = str(n["file_path"])
+            if n.get("rerank_score") is not None:
+                rec["rerank_score"] = float(n["rerank_score"])
+            if n.get("boost_delta") is not None:
+                rec["boost_delta"] = float(n["boost_delta"])
+            if n.get("boost_signals"):
+                rec["boost_signals"] = list(n["boost_signals"])
             node_records.append(rec)
 
         event: Dict[str, Any] = {
@@ -486,6 +565,10 @@ class RLTelemetryWriter:
             event["failed_collections"] = [
                 str(c) for c in list(failed_collections)[:32]
             ]
+        if rl_used is not None:
+            event["rl_used"] = bool(rl_used)
+        if extras:
+            event["extras"] = dict(extras)
         return event
 
     def _build_v3_citation_event(
@@ -498,6 +581,9 @@ class RLTelemetryWriter:
         literal_cited: Optional[Dict[str, bool]] = None,
         cross_encoder_cited: Optional[Dict[str, bool]] = None,
         answer_text: Optional[str] = None,
+        session_id: str = "",
+        fire_reason: str = "",
+        window_tokens: int = 0,
     ) -> Dict[str, Any]:
         """Build the v3 citation event JSON stored in launcher.db's payload_json."""
         event: Dict[str, Any] = {
@@ -527,6 +613,13 @@ class RLTelemetryWriter:
             }
         if answer_text is not None:
             event["answer_text"] = str(answer_text)
+        # v0.2.73 RL-9 / RL-6 riders (optional, additive).
+        if session_id:
+            event["session_id"] = str(session_id)
+        if fire_reason:
+            event["fire_reason"] = str(fire_reason)
+        if window_tokens:
+            event["window_tokens"] = int(window_tokens)
         return event
 
     def _wrap_for_hub(

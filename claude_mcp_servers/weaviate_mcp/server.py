@@ -4553,6 +4553,11 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
                 citation_result: "dict | None" = None
                 if answer_token_count >= _RL_MIN_ANSWER_TOKENS_FOR_CITATION:
                     if ctx is not None:
+                        # v0.2.73 RL-6: stamp fire_reason + window_tokens onto
+                        # the ctx so the citation EVENT stores them (pre-RL-6
+                        # they existed only in the logger.info line above).
+                        ctx["fire_reason"] = fire_reason
+                        ctx["window_tokens"] = answer_token_count
                         try:
                             citation_result = await _rl_compute_and_write_citations(
                                 task_id, answer, ctx,

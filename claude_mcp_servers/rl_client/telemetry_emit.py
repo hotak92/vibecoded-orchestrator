@@ -76,6 +76,17 @@ class RetrievalEvent:
     project: Optional[str] = None
     failure_mode: Optional[str] = None
     failed_collections: list[str] = field(default_factory=list)
+    # v0.2.73 RL-1: whether the RL rerank RPC actually ran for this
+    # retrieval. None = caller didn't say (legacy paths); True/False is
+    # threaded into the v3 event so the offline trainer can separate
+    # on-policy (reranked) from off-policy (cosine-order) events. The
+    # SHOWN order itself travels per-node as ``shown_rank`` on ``nodes``.
+    rl_used: Optional[bool] = None
+    # v0.2.73 RL-2: free-form event-level diagnostics (code-path floors,
+    # anchor presence, retrieval kind). Kept out of dedicated columns —
+    # the hub envelope stores payload_json verbatim, so additive keys are
+    # forward-compatible. None ⇒ omitted entirely.
+    extras: Optional[dict] = None
 
 
 def resolve_session_id(arg_session_id: Optional[str] = None) -> str:
@@ -179,7 +190,7 @@ def emit_rl_event(
     # Preserve None vs [] distinction on query_emb (see RetrievalEvent
     # docstring) — list(None) would TypeError, so guard explicitly.
     try:
-        writer.log_retrieval(
+        _kwargs: dict = dict(
             task_id=ev.task_id,
             task_type=ev.task_type,
             query=ev.query,
@@ -189,6 +200,14 @@ def emit_rl_event(
             failure_mode=ev.failure_mode,
             failed_collections=list(ev.failed_collections),
         )
+        # v0.2.73 RL-1 / RL-2: only pass the new optional fields when the
+        # caller set them, so injected test writers with the legacy
+        # signature keep working on legacy-shaped events.
+        if ev.rl_used is not None:
+            _kwargs["rl_used"] = ev.rl_used
+        if ev.extras is not None:
+            _kwargs["extras"] = dict(ev.extras)
+        writer.log_retrieval(**_kwargs)
     except Exception as exc:
         logger.debug("emit_rl_event: log_retrieval raised (%s); soft-fail", exc)
         return False

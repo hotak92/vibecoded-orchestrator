@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 
 # Allow ``from claude_mcp_servers...`` imports when run as a bare script.
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -49,6 +50,36 @@ def _gate_tokens() -> int:
         return int(os.getenv("RL_MIN_ANSWER_TOKENS_FOR_CITATION", "25000"))
     except (TypeError, ValueError):
         return 25000
+
+
+# v0.2.73 RL-4 — terminal-session citation floor.
+#
+# Sessions whose cumulative answer window never reaches the 25k gate were
+# NEVER labeled: the drain left the pending file every Stop and the TTL sweep
+# (60 min) eventually deleted it → the training corpus was censored toward
+# long sessions. The terminal floor gives an aging pending file a second
+# chance: once it is older than RL_TERMINAL_CITATION_AGE_SECONDS (default
+# 1800 s — half the TTL, so the terminal compute always precedes the sweep)
+# AND its window clears the LOWER RL_TERMINAL_CITATION_MIN_TOKENS floor
+# (default 2000 — enough chunks for max-over-chunks cosine to discriminate),
+# the drain computes + writes + deletes instead of leaving it to die.
+#
+# This deliberately preserves the accumulate-don't-drop ruling for YOUNG
+# files: a session that WOULD reach 25k later still gets the full window;
+# only files at real risk of TTL death take the lower floor.
+
+def _terminal_age_seconds() -> float:
+    try:
+        return float(os.getenv("RL_TERMINAL_CITATION_AGE_SECONDS", "1800"))
+    except (TypeError, ValueError):
+        return 1800.0
+
+
+def _terminal_floor_tokens() -> int:
+    try:
+        return int(os.getenv("RL_TERMINAL_CITATION_MIN_TOKENS", "2000"))
+    except (TypeError, ValueError):
+        return 2000
 
 
 def drain_session(
@@ -142,15 +173,39 @@ def drain_session(
         answer, _complete = extract_answer_window(messages, start_msg_idx, start_blk_idx)
         tok = token_count_fn(answer) if answer else 0
 
+        fire_reason = "stop_drain"
         if not answer.strip() or tok < gate:
-            # ⚠️ ACCUMULATE-DON'T-DROP: below the gate → keep the file so it can
-            # keep accumulating into subsequent turns. Never compute, never
-            # delete here. Compute+delete happens only at/above the gate (or
-            # TTL).
-            summary["left"] += 1
-            continue
+            # v0.2.73 RL-4: terminal-session floor. An AGING pending file
+            # (older than the terminal age, i.e. at real risk of dying at the
+            # TTL sweep un-labeled) whose window clears the LOWER terminal
+            # floor is computed NOW instead of left. Young files keep the
+            # accumulate-don't-drop behaviour unchanged.
+            _age_s = None
+            _ts_ms = payload.get("ts_ms")
+            if isinstance(_ts_ms, (int, float)) and _ts_ms > 0:
+                _age_s = (time.time() * 1000.0 - float(_ts_ms)) / 1000.0
+            _terminal = (
+                answer.strip()
+                and _age_s is not None
+                and _age_s >= _terminal_age_seconds()
+                and tok >= _terminal_floor_tokens()
+            )
+            if not _terminal:
+                # ⚠️ ACCUMULATE-DON'T-DROP: below the gate → keep the file so
+                # it can keep accumulating into subsequent turns. Never
+                # compute, never delete here. Compute+delete happens only
+                # at/above a gate (25k, or the terminal floor) or TTL.
+                summary["left"] += 1
+                continue
+            fire_reason = "terminal_floor"
 
         # At/above the gate → compute + write + delete (one-shot).
+        # v0.2.73 RL-6/RL-9: stamp the riders onto ctx so the citation event
+        # stores where/why it fired. session_id prefers the value staged in
+        # the ctx (RL-9 stage-time resolution), then the pending payload.
+        ctx.setdefault("session_id", payload.get("session_id") or session_id or "")
+        ctx["fire_reason"] = fire_reason
+        ctx["window_tokens"] = tok
         try:
             result = compute_fn(task_id, answer, ctx, write=True)
         except Exception:

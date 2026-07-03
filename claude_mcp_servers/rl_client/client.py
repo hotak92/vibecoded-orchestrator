@@ -216,6 +216,17 @@ class RLClient:
         self._client = client
         self._owns_client = client is None
 
+        # v0.2.73 RL-3: per-call rerank outcome surface. ``last_call_ok`` is
+        # True only when the LAST cache_nodes call genuinely got a reranked
+        # list back from the container; ``last_error`` carries the failure
+        # tag otherwise ("disabled" / unreachable / HTTP 4xx text). The
+        # pipeline reads these to (a) report ``rl_used`` accurately and (b)
+        # surface + count fallbacks — a paying user silently degraded to
+        # cosine by a container 4xx (e.g. the env-pin 409) now gets a signal.
+        self.last_call_ok: bool = False
+        self.last_error: Optional[str] = None
+        self._warned_4xx: bool = False
+
         # v0.2.49: per-project routing header. Stored as the sanitized
         # value (or None if input was unsafe). The header is only sent
         # when this is non-None; container falls back to base model when
@@ -318,7 +329,13 @@ class RLClient:
             )
             query_emb = None
 
+        # v0.2.73 RL-3: reset the per-call outcome surface up front so a
+        # caller reading it after this call sees THIS call's result.
+        self.last_call_ok = False
+        self.last_error = None
+
         if not self.enabled:
+            self.last_error = "disabled"
             return list(nodes[:top_k])
 
         # Build the request payload. ``nodes`` are passed as-is
@@ -338,18 +355,38 @@ class RLClient:
         try:
             data = await self._post_json("/cache_nodes", payload, timeout=self._timeout)
         except RLClientUnreachableError as exc:
+            # Routine transient class (container starting / stopped / 5xx) —
+            # keep at debug; the pipeline-level fallback counter aggregates.
+            self.last_error = str(exc)
             logger.debug("RLClient.cache_nodes: unreachable (%s); falling back to no-rerank", exc)
             return list(nodes[:top_k])
         except RLClientError as exc:
-            logger.debug("RLClient.cache_nodes: error (%s); falling back to no-rerank", exc)
+            # v0.2.73 RL-3: a 4xx is NOT transient — it means the container
+            # actively refused (env-pin 409, contract mismatch, bad request)
+            # and every subsequent call will refuse too: the paying user is
+            # PERMANENTLY on cosine until it's fixed. Surface loudly once per
+            # client instance, then degrade to debug.
+            self.last_error = str(exc)
+            if not self._warned_4xx:
+                self._warned_4xx = True
+                logger.warning(
+                    "RLClient.cache_nodes: container REFUSED the rerank "
+                    "request (%s). RL reranking is falling back to cosine "
+                    "order and will keep doing so until the container/config "
+                    "mismatch is resolved.", exc,
+                )
+            else:
+                logger.debug("RLClient.cache_nodes: error (%s); falling back to no-rerank", exc)
             return list(nodes[:top_k])
 
         top = data.get("top_k") or []
         if not isinstance(top, list):
+            self.last_error = f"malformed top_k ({type(top).__name__})"
             logger.debug("RLClient.cache_nodes: malformed top_k (%r); falling back", type(top))
             return list(nodes[:top_k])
 
         # Server may return more / fewer than requested; trim defensively.
+        self.last_call_ok = True
         return list(top[:top_k])
 
     async def rl_update(

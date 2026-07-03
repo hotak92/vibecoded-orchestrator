@@ -200,6 +200,23 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
     # ---- emit retrieval telemetry ----
     emit_success = False
     log_nodes = _build_log_nodes(req.candidates, req.limit)
+    # v0.2.73 RL-1: stamp the post-rerank SHOWN order onto the log nodes.
+    # Pre-RL-1 the event carried only the pre-rerank candidate order (the
+    # ``tier`` field is the pre-rerank index gate) and the ranked list was
+    # discarded — so citation labels conditioned on an order the user never
+    # saw whenever the RL rerank actually reordered. ``shown_rank`` = the
+    # node's 0-based position in the list the caller RETURNS; absent for
+    # candidates that were truncated out of the shown top-k.
+    _shown_ranks: dict[str, int] = {}
+    for _i, _n in enumerate(ranked):
+        if isinstance(_n, dict):
+            _t = _n.get("title", "")
+            if _t and _t not in _shown_ranks:
+                _shown_ranks[_t] = _i
+    for _rec in log_nodes:
+        _sr = _shown_ranks.get(_rec.get("title", ""))
+        if _sr is not None:
+            _rec["shown_rank"] = _sr
     try:
         ev = RetrievalEvent(
             query=req.query,
@@ -216,6 +233,10 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
             session_id=req.session_id,
             failure_mode=req.failure_mode,
             failed_collections=list(req.failed_collections),
+            # v0.2.73 RL-1: True iff the rerank RPC actually ran (structural
+            # failures AND container transport fallbacks both report False —
+            # see _do_rerank / RLClient.last_call_ok).
+            rl_used=rl_used,
         )
         emit_success = emit_rl_event(ev)
     except EmitValidationError as exc:
@@ -322,7 +343,7 @@ async def _do_rerank(
 
     resolved_session = resolve_session_id(session_id)
     try:
-        return await client.cache_nodes(
+        ranked = await client.cache_nodes(
             query=query,
             nodes=candidates,
             top_k=limit,
@@ -331,7 +352,74 @@ async def _do_rerank(
         )
     except Exception as exc:
         logger.debug("_do_rerank: cache_nodes raised (%s)", exc)
+        _record_rl_fallback(f"cache_nodes raised: {exc}")
         return None
+    # v0.2.73 RL-3 / RL-1 accuracy: cache_nodes swallows transport + 4xx
+    # errors internally and returns the INPUT order — pre-RL-3 that counted
+    # as a successful rerank (rl_used=True) and the paying user's permanent
+    # cosine degradation was invisible. Read the client's per-call outcome:
+    # not-ok → treat as a fallback (rl_used=False) + count it persistently.
+    if not getattr(client, "last_call_ok", True):
+        _record_rl_fallback(getattr(client, "last_error", None) or "unknown")
+        return None
+    return ranked
+
+
+def _record_rl_fallback(reason: str) -> None:
+    """v0.2.73 RL-3: persist a rerank-fallback counter + WARN once per process.
+
+    Writes ``<project_root>/.claude/state/rl_fallback_counter.json`` with
+    ``{count, last_reason, last_ts}`` so "my Pro rerank silently stopped
+    working" is diagnosable from disk (rl-doctor material, RL-12). Root
+    resolution: CLAUDE_PROJECT_DIR → server.KG_BASE_DIR → cwd. Soft-fail
+    throughout — the counter must never break a search.
+    """
+    global _WARNED_RL_FALLBACK
+    if not _WARNED_RL_FALLBACK:
+        _WARNED_RL_FALLBACK = True
+        logger.warning(
+            "RL rerank is ENABLED for this project but fell back to cosine "
+            "order (reason: %s). Subsequent fallbacks are counted in "
+            ".claude/state/rl_fallback_counter.json.", reason,
+        )
+    try:
+        import json as _json
+        import os as _os
+        import time as _time
+
+        root = _os.environ.get("CLAUDE_PROJECT_DIR", "")
+        if not root:
+            try:
+                from claude_mcp_servers.weaviate_mcp import server as _srv
+
+                root = getattr(_srv, "KG_BASE_DIR", "") or ""
+            except Exception:  # noqa: BLE001
+                root = ""
+        if not root:
+            root = _os.getcwd()
+        state_dir = _os.path.join(root, ".claude", "state")
+        _os.makedirs(state_dir, exist_ok=True)
+        path = _os.path.join(state_dir, "rl_fallback_counter.json")
+        data = {"count": 0}
+        try:
+            with open(path, encoding="utf-8") as fh:
+                loaded = _json.load(fh)
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:  # noqa: BLE001 — missing/corrupt file → fresh
+            pass
+        data["count"] = int(data.get("count", 0) or 0) + 1
+        data["last_reason"] = str(reason)[:500]
+        data["last_ts"] = _time.strftime("%Y-%m-%dT%H:%M:%S%z", _time.localtime())
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            _json.dump(data, fh)
+        _os.replace(tmp, path)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("_record_rl_fallback: counter write failed (%s)", exc)
+
+
+_WARNED_RL_FALLBACK = False
 
 
 def _spawn_answer_monitor(task_id: str, query: str) -> None:
@@ -402,6 +490,16 @@ def _populate_citation_cache(
                 project_id_for_cache = getattr(_cfg, "project_id", None)
         except Exception:
             pass
+        # v0.2.73 RL-9: resolve + stage the session_id INSIDE the ctx so the
+        # citation write (which happens later, possibly in a different
+        # process — the Stop-hook drain) carries it without re-resolving from
+        # an env that may no longer be populated.
+        try:
+            from .telemetry_emit import resolve_session_id as _resolve_sid
+
+            _staged_session = _resolve_sid(session_id or "")
+        except Exception:  # noqa: BLE001
+            _staged_session = session_id or ""
         ctx_dict = {
             "nodes": cache_nodes,
             "query_emb": list(query_emb) if query_emb else None,
@@ -411,6 +509,7 @@ def _populate_citation_cache(
             "project_id": project_id_for_cache,
             "project_name": getattr(srv, "PROJECT_NAME", "") or "",
             "task_type": task_type,
+            "session_id": _staged_session,
         }
         # v0.2.71 Sweep-C: stage the dual-log decision + the OTHER slot's triple
         # so the citation second-event (slot-suffixed task_id) can fire at the
@@ -537,6 +636,21 @@ def _build_log_nodes(
             # score_cosine = 1 - distance, normally bounded [0,1]; clamp
             # defensively (a negative Weaviate distance would push it >1).
             rec["score_cosine"] = _clamp_unit_score(n["score_cosine"])
+        # v0.2.73 RL-7: the multi-chunk collapse stamps `chunks_matched`
+        # (+ `best_chunk_number`) on every candidate — a node that matched on
+        # N chunks is a stronger semantic signal than a single-chunk match at
+        # the same score. Pre-RL-7 this reducer dropped both at the writer
+        # boundary; preserve them so the v3 event carries the signal.
+        if n.get("chunks_matched") is not None:
+            try:
+                rec["chunks_matched"] = int(n["chunks_matched"])
+            except (TypeError, ValueError):
+                pass
+        if n.get("best_chunk_number") is not None:
+            try:
+                rec["best_chunk_number"] = int(n["best_chunk_number"])
+            except (TypeError, ValueError):
+                pass
         out.append(rec)
     return out
 
