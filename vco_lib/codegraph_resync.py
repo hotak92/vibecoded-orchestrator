@@ -62,7 +62,10 @@ import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:  # real type for annotations; runtime import is the guarded one below
+    from vco_lib.deferral_report import DeferralEntry as _DeferralEntryT
 
 try:  # DeferralEntry is optional at import time (unit tests may not need it)
     from vco_lib.deferral_report import DeferralEntry
@@ -704,7 +707,7 @@ def _resolve_analyzer(repo_root: Path) -> Optional[Path]:
 def build_resync_deferral(
     project_name: str,
     command_to_apply: str,
-) -> Optional[object]:
+) -> Optional["_DeferralEntryT"]:
     """Construct the ``codegraph_embed_resync_pending`` :class:`DeferralEntry`.
 
     Returns None when ``DeferralEntry`` is unavailable (isolated import) so the
@@ -741,7 +744,7 @@ def build_unconverged_deferral(
     project_name: str,
     counts: Optional[dict],
     command_to_apply: str,
-) -> Optional[object]:
+) -> Optional["_DeferralEntryT"]:
     """R-7 (v0.2.73): the ONE-TIME "resync did not converge" ledger entry.
 
     Written by the post-walk verifier when stale rows remain (or convergence
@@ -855,6 +858,7 @@ def _register_spawn_with_hub(
     try:
         import json as _json
         import urllib.parse
+        import urllib.request
 
         from vco_lib.paths import vct_root_dir
 

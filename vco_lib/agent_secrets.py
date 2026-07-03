@@ -348,10 +348,15 @@ def get(
     if isinstance(hub_error, AccessDenied):
         raise hub_error
     if isinstance(hub_error, SecretNotFound) or allow_file_fallback:
+        _tier3_dir = _dotenv_dir(project)
+        _tier3_desc = (
+            str(_tier3_dir / ".env") if _tier3_dir is not None
+            else "skipped (bare project NAME — tier 3 needs a path)"
+        )
         raise SecretNotFound(
             f"secret {key!r} not found (tier 1 hub: {hub_error}; tier 2 "
             f"file store: {_secrets_root()}; tier 3 project .env: "
-            f"{_dotenv_dir(project) / '.env'}; tiers 2+3 "
+            f"{_tier3_desc}; tiers 2+3 "
             f"checked={allow_file_fallback}). Fix: launcher SecretsPanel, "
             f"`vct set --project shared --key {key}`, or add the key to "
             f"the project's .env"
