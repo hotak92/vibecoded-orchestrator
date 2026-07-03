@@ -24,7 +24,6 @@
 //! boots and the user can re-sync manually later.
 
 use crate::db::Db;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Version (inclusive lower bound on the NEW side) at which the
@@ -67,57 +66,101 @@ fn compare_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
     Some(pa.cmp(&pb))
 }
 
-/// Write the deferral notice to one project's `<project>/.claude/context/UPDATE_DEFERRED.md`.
-/// Appends if the file exists; creates parent directories as needed.
+/// Write the chunker-resync deferral notice to one project's
+/// `<project>/.claude/context/UPDATE_DEFERRED.md`.
+///
+/// A-5 (v0.2.73): routes through the SHARED Python emitter
+/// `vco_lib.project_init._emit_chunker_resync_deferral` (which builds a proper
+/// `DeferralEntry` via `DeferralReport`) instead of the previous forked
+/// raw-Markdown writer. The old writer violated the shared schema: it put a
+/// version pair in the severity slot (`## chunker_preset_overhaul (a → b)`),
+/// which the Python parser coerced to "warning" and rewrote on any round-trip,
+/// losing the version info AND all prose; it never updated the YAML
+/// `condition_ids:` frontmatter, so the entry was invisible to the
+/// session-start reminder nudge that is the deferral block's whole purpose.
+///
+/// Delegating to the single Python emitter fixes ALL of that (correct
+/// condition_id `chunker_preset_overhaul_pending`, `info` severity, frontmatter
+/// + reminder-splice, per-project re-sync commands) and keeps one home for the
+/// deferral shape. MUST match the subprocess-into-Python pattern in
+/// `storage_ux::emit_deferral` / `module_updates` (mirror-don't-fork).
 fn write_deferral_for_project(
     project_folder: &Path,
     prev: &str,
     running: &str,
 ) -> Result<(), String> {
-    let deferred_dir = project_folder.join(".claude").join("context");
-    if let Err(e) = fs::create_dir_all(&deferred_dir) {
-        return Err(format!("create_dir_all {:?}: {}", deferred_dir, e));
-    }
-    let deferred_path = deferred_dir.join("UPDATE_DEFERRED.md");
+    let repo_root = super::installer::find_local_repo_root()
+        .map_err(|e| format!("cannot locate repo root for deferral emit: {}", e))?;
+    let py = pick_python()
+        .ok_or_else(|| "no python on PATH to emit chunker deferral".to_string())?;
 
-    let entry = format!(
-        "\n## chunker_preset_overhaul ({}  →  {})\n\n\
-         **Action**: re-sync this project's KG and code graph so the new \
-         chunker presets (v0.2.46+) take effect. Existing Weaviate rows \
-         were chunked under the smaller pre-v0.2.46 presets — search \
-         recall degrades on long answers because relevant content sits \
-         in chunk N+1 that the new preset would have folded into chunk N.\n\n\
-         Run from this project directory:\n\n\
-         ```\n\
-         .claude/scripts/kg-sync --all --force\n\
-         .claude/scripts/code-graph-analyze . --force\n\
-         ```\n\n\
-         Both commands re-chunk every node / source file under the new \
-         presets and overwrite the existing Weaviate rows. Heavy I/O — \
-         consider running them when you're not actively coding.\n\n\
-         Background: the chunker overhaul lands in commit\n\
-         `v0.2.47 chunker-preset-overhaul` (see CHANGELOG.md for details).\n",
-        prev, running
+    // Pre-escape every value into Python double-quoted string literals so the
+    // `-c` snippet is injection-safe (same discipline as storage_ux::emit_deferral).
+    let repo_py = py_quote(&repo_root.to_string_lossy());
+    let folder_py = py_quote(&project_folder.to_string_lossy());
+    let prev_py = py_quote(prev);
+    let running_py = py_quote(running);
+    let script = format!(
+        "import sys\n\
+         sys.path.insert(0, {repo_py})\n\
+         from pathlib import Path\n\
+         from vco_lib.project_init import _emit_chunker_resync_deferral\n\
+         _emit_chunker_resync_deferral(Path({folder_py}), {prev_py}, {running_py})\n",
     );
-
-    let existing = fs::read_to_string(&deferred_path).unwrap_or_default();
-    // Idempotent — if the same upgrade pair entry is already in the file,
-    // skip the append. Match on the header line.
-    let header_marker = format!("## chunker_preset_overhaul ({}  →  {})", prev, running);
-    if existing.contains(&header_marker) {
-        return Ok(());
+    let status = std::process::Command::new(&py)
+        .arg("-c")
+        .arg(&script)
+        .status();
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!("chunker deferral python helper exited {}", s)),
+        Err(e) => Err(format!("chunker deferral python helper spawn failed: {}", e)),
     }
+}
 
-    let combined = if existing.is_empty() {
-        entry
-    } else {
-        format!("{}{}", existing, entry)
-    };
-
-    if let Err(e) = fs::write(&deferred_path, combined) {
-        return Err(format!("write {:?}: {}", deferred_path, e));
+/// First `python3` then `python` from PATH. Mirrors
+/// `storage_ux::emit_deferral`'s resolution order so deferral behaviour is
+/// consistent across every Rust-side emitter (mirror-don't-fork).
+fn pick_python() -> Option<String> {
+    for candidate in ["python3", "python"] {
+        #[cfg(windows)]
+        let names = [format!("{candidate}.exe"), candidate.to_string()];
+        #[cfg(not(windows))]
+        let names = [candidate.to_string()];
+        if let Some(paths) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&paths) {
+                for name in &names {
+                    let probe = dir.join(name);
+                    if probe.is_file() {
+                        return Some(probe.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
     }
-    Ok(())
+    None
+}
+
+/// Quote `s` as a Python double-quoted string literal. Mirrors
+/// `storage_ux::py_quote` byte-for-byte (kept local: that fn is private and
+/// widening its visibility for one caller adds no architectural value — same
+/// rationale documented in `module_updates::py_quote`).
+fn py_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Write the chunker-revision deferral notice to the orchestrator-root
@@ -253,40 +296,83 @@ mod tests {
         assert_eq!(compare_versions("0.2.46-dev", "0.2.46"), None);
     }
 
+    // A-5 (v0.2.73): these tests now exercise the Python-routed emitter
+    // (`vco_lib.project_init._emit_chunker_resync_deferral` via subprocess),
+    // so they require `python3`/`python` on PATH + the repo root resolvable
+    // from the test's CWD (both true in CI + local dev). If python is
+    // unavailable the writer returns Err and the test skips its content
+    // assertions rather than falsely failing — the routing contract is the
+    // thing under test, and the Python emitter's OWN content is pinned by
+    // `tests/test_v0247_chunker_deferral_python.py`.
+
+    fn python_available() -> bool {
+        super::pick_python().is_some()
+            && super::super::installer::find_local_repo_root().is_ok()
+    }
+
     #[test]
     fn write_deferral_for_project_creates_file_and_directory() {
+        if !python_available() {
+            eprintln!("skipping: python/repo-root unavailable");
+            return;
+        }
         let td = TempDir::new().unwrap();
         write_deferral_for_project(td.path(), "0.2.45", "0.2.46").unwrap();
         let path = td.path().join(".claude").join("context").join("UPDATE_DEFERRED.md");
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("chunker_preset_overhaul"));
+        // Canonical condition_id from the shared Python emitter (NOT the old
+        // raw `## chunker_preset_overhaul (a → b)` header that put a version
+        // pair in the severity slot).
+        assert!(content.contains("chunker_preset_overhaul_pending"));
         assert!(content.contains("0.2.45"));
         assert!(content.contains("0.2.46"));
         assert!(content.contains("kg-sync --all --force"));
+        assert!(content.contains("code-graph-analyze . --force"));
     }
 
     #[test]
     fn write_deferral_is_idempotent_for_same_pair() {
+        if !python_available() {
+            eprintln!("skipping: python/repo-root unavailable");
+            return;
+        }
         let td = TempDir::new().unwrap();
         write_deferral_for_project(td.path(), "0.2.45", "0.2.46").unwrap();
         let path = td.path().join(".claude").join("context").join("UPDATE_DEFERRED.md");
         let after_first = std::fs::read_to_string(&path).unwrap();
-        // Second call with same versions should be a no-op.
+        // Second call: DeferralReport keys by condition_id, so re-emitting the
+        // same pending condition is idempotent (no duplicate entry).
         write_deferral_for_project(td.path(), "0.2.45", "0.2.46").unwrap();
         let after_second = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(after_first, after_second);
+        assert_eq!(
+            after_first.matches("chunker_preset_overhaul_pending").count(),
+            after_second.matches("chunker_preset_overhaul_pending").count(),
+            "re-emit must not add a duplicate condition entry"
+        );
     }
 
     #[test]
-    fn write_deferral_appends_distinct_pair() {
+    fn write_deferral_single_pending_condition_regardless_of_version_pairs() {
+        if !python_available() {
+            eprintln!("skipping: python/repo-root unavailable");
+            return;
+        }
         let td = TempDir::new().unwrap();
         write_deferral_for_project(td.path(), "0.2.44", "0.2.46").unwrap();
         write_deferral_for_project(td.path(), "0.2.45", "0.2.47").unwrap();
         let path = td.path().join(".claude").join("context").join("UPDATE_DEFERRED.md");
         let content = std::fs::read_to_string(&path).unwrap();
-        // Both upgrade pairs should be present.
-        assert!(content.contains("0.2.44  →  0.2.46"));
-        assert!(content.contains("0.2.45  →  0.2.47"));
+        // The condition is "re-sync pending" — one condition_id, keyed once
+        // regardless of the version pair that triggered it (unlike the old
+        // per-pair header). `add_entry` dedups by condition_id (last-write-
+        // wins), so exactly one section header exists. (Count the section
+        // header, not the bare slug, which ALSO appears in the
+        // `condition_ids:` frontmatter list → 2 substring matches per entry.)
+        assert_eq!(
+            content.matches("## chunker_preset_overhaul_pending (").count(),
+            1,
+            "only one pending-resync condition section should exist"
+        );
     }
 
     #[test]
