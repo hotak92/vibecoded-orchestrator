@@ -594,6 +594,29 @@ fn tier_meets_requirement(user_tier: &str, required: &OrchestratorTier) -> bool 
     tier_rank(user_tier) >= tier_rank(required.as_slug())
 }
 
+/// Per-project ROUTING keys that must NEVER be emitted into the
+/// install-root `.claude/settings.json env` from the global MCP tab
+/// (F-4, v0.2.73). The orchestrator install root is normally itself a
+/// registered project whose env block carries launcher-PROJECTED
+/// per-project values (e.g. its real KG collection name). Pre-fix, any
+/// MCP-tab action (even toggling an unrelated MCP) rewrote
+/// `env.KG_COLLECTION` with the GUI catalog's DEFAULT ("KnowledgeGraph"),
+/// the settings watcher's diff-guard saw a real change, SIGHUP'd the
+/// live weaviate-kg MCP, and the root project's KG reads/writes silently
+/// forked into a phantom collection until the next re-projection healed
+/// the file. The canonical writer for these keys is the launcher's
+/// per-project projection (`write_project_env_files`), never this legacy
+/// path — same rationale as `mcp_registration::ALLOWED_ENV_KEYS` keeping
+/// them out of ~/.claude.json.
+const PROJECT_ROUTING_ENV_KEYS: &[&str] = &[
+    "KG_COLLECTION",
+    "DEVELOPMENT_COLLECTION",
+    "SHARED_KG_COLLECTION",
+    "PROJECT_NAME",
+    "CODE_GRAPH_PROJECT",
+    "KG_BASE_DIR",
+];
+
 /// Write enabled MCP servers to the orchestrator's .claude/settings.json
 /// so Claude Code picks them up.
 async fn apply_mcp_to_claude_settings(config: &OrchestratorConfig) -> Result<(), String> {
@@ -631,6 +654,13 @@ async fn apply_mcp_to_claude_settings(config: &OrchestratorConfig) -> Result<(),
             if server.enabled {
                 for (key, setting) in &server.settings {
                     if setting.setting_type == McpSettingType::Secret {
+                        continue;
+                    }
+                    // F-4 (v0.2.73): per-project routing keys are owned by
+                    // the launcher's projection, not this legacy path —
+                    // skipping them preserves whatever the projection wrote
+                    // (see PROJECT_ROUTING_ENV_KEYS docstring).
+                    if PROJECT_ROUTING_ENV_KEYS.contains(&key.as_str()) {
                         continue;
                     }
                     env_map.insert(key.clone(), serde_json::Value::String(setting.value.clone()));
@@ -1376,6 +1406,75 @@ mod tests {
         // Non-Secret value still emitted, pre-existing keys preserved.
         assert_eq!(env["MY_VISIBLE"], "ok-emit");
         assert_eq!(env["PRE_EXISTING"], "keep");
+    }
+
+    /// F-4 (v0.2.73): `apply_mcp_to_claude_settings` must NOT emit
+    /// per-project ROUTING keys (KG_COLLECTION / DEVELOPMENT_COLLECTION /
+    /// ...) into the install-root settings env — the launcher-projected
+    /// values there must survive any MCP-tab action. Pre-fix, toggling an
+    /// unrelated MCP rewrote KG_COLLECTION with the catalog DEFAULT
+    /// ("KnowledgeGraph"), silently forking the root project's KG.
+    #[test]
+    fn test_apply_mcp_to_claude_settings_skips_project_routing_keys() {
+        let (home, _guard) = setup_temp_env();
+
+        let install_dir = home.join("orch-install");
+        let claude_dir = install_dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let settings_path = claude_dir.join("settings.json");
+        // The launcher projection already wrote the REAL per-project value.
+        std::fs::write(
+            &settings_path,
+            r#"{"env": {"KG_COLLECTION": "ProjectedRoot_KnowledgeGraph", "DEVELOPMENT_COLLECTION": "ProjectedRoot_Development"}}"#,
+        )
+        .unwrap();
+
+        let mut config = OrchestratorConfig::default();
+        config.install_path = install_dir.display().to_string();
+        // The DEFAULT catalog already carries the hazardous settings
+        // (weaviate-kg ships KG_COLLECTION="KnowledgeGraph" +
+        // DEVELOPMENT_COLLECTION="Development", enabled=true) — use it
+        // as-is so the test exercises the exact shipped shape. Add one
+        // legit non-routing setting to prove those still flow.
+        if let Some(server) = config.mcp_servers.iter_mut().find(|s| s.id == "search") {
+            server.settings.insert(
+                "OPENALEX_EMAIL".to_string(),
+                McpSetting {
+                    label: "OpenAlex Email".to_string(),
+                    value: "user@example.com".to_string(),
+                    setting_type: McpSettingType::Text,
+                    description: String::new(),
+                    editable: true,
+                },
+            );
+        }
+
+        rt().block_on(async {
+            apply_mcp_to_claude_settings(&config).await.unwrap();
+        });
+
+        let raw = std::fs::read_to_string(&settings_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let env = &parsed["env"];
+        // Projected routing values PRESERVED — not clobbered with the
+        // catalog defaults.
+        assert_eq!(
+            env["KG_COLLECTION"], "ProjectedRoot_KnowledgeGraph",
+            "MCP-tab action must not clobber the projected KG_COLLECTION: {}",
+            env
+        );
+        assert_eq!(
+            env["DEVELOPMENT_COLLECTION"], "ProjectedRoot_Development",
+            "MCP-tab action must not clobber the projected DEVELOPMENT_COLLECTION: {}",
+            env
+        );
+        assert!(
+            !raw.contains("\"KnowledgeGraph\""),
+            "catalog default value must not appear anywhere in settings.json: {}",
+            raw
+        );
+        // Non-routing settings still flow through.
+        assert_eq!(env["OPENALEX_EMAIL"], "user@example.com");
     }
 
     /// P1-B: the one-shot migration on first launcher start must move
