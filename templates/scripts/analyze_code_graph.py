@@ -4775,6 +4775,9 @@ class CodeGraphAnalyzer:
         if prune_stale:
             self._track_visited = True
             self.visited_uuids = set()  # fresh state per run
+            # v0.2.73 (C-11 / RT-3): reset per-run before the prune pass sets
+            # it, so a stale value from a prior call can't leak into stats.
+            self._prune_failures = 0
 
         stats = {
             'modules': 0,
@@ -4789,6 +4792,10 @@ class CodeGraphAnalyzer:
             'insert_errors': 0,
             # v0.2.16 (1.4 / H): count of stale orphans pruned at end.
             'stale_pruned': 0,
+            # v0.2.73 (C-11 / RT-3): count of prune deletes that FAILED (e.g.
+            # the Weaviate-500 "subtract prop lengths" signature). Non-zero =>
+            # stale rows remain => build status flips success→partial.
+            'prune_failures': 0,
         }
 
         # Language dispatch: auto-detect from extensions, or filter by --language
@@ -4991,6 +4998,11 @@ class CodeGraphAnalyzer:
         if prune_stale:
             self._prune_language = _canonical_lang_id(language) if language else ""
             stats['stale_pruned'] = self._prune_stale_objects()
+            # v0.2.73 (C-11 / RT-3): propagate the delete-failure count so
+            # main() can flip success→partial and emit PRUNE_FAILURES=N. Read
+            # via getattr because _prune_stale_objects always sets it, but the
+            # attribute may be absent if a future path skips the call.
+            stats['prune_failures'] = int(getattr(self, "_prune_failures", 0))
 
         return stats
 
@@ -5019,15 +5031,22 @@ class CodeGraphAnalyzer:
             Total number of stale objects deleted across all
             collections. Printed per-collection on stdout so the
             launcher's log shows what happened.
+
+        Side effect (v0.2.73, C-11 / RT-3): sets ``self._prune_failures`` to
+        the total number of per-row delete failures across all collections so
+        ``analyze_repository`` can propagate it into ``stats`` and main() can
+        flip the build status success→partial when it is non-zero.
         """
         if not self._track_visited:
             # Defensive: should never happen (caller gates on
             # prune_stale=True which sets _track_visited=True), but
             # guard against a future code path that forgets.
             print("⚠️  _prune_stale_objects called without _track_visited — skipping")
+            self._prune_failures = 0
             return 0
 
         total_pruned = 0
+        total_failures = 0
         per_collection_visited: Dict[str, Set[str]] = {}
         for coll_name, uid in self.visited_uuids:
             per_collection_visited.setdefault(coll_name, set()).add(uid)
@@ -5051,13 +5070,24 @@ class CodeGraphAnalyzer:
             if coll is None:
                 continue
             visited = per_collection_visited.get(coll.name, set())
-            pruned = self._prune_collection(
+            pruned, failures = self._prune_collection(
                 coll, visited, language_scope=scope_lang,
             )
             if pruned:
                 print(f"🧹 Pruned {pruned} stale objects from {coll.name}")
                 total_pruned += pruned
+            if failures:
+                # v0.2.73 (C-11 / RT-3): a per-collection failure count so the
+                # launcher log shows WHICH collection couldn't be pruned (the
+                # Weaviate-500 prop-length signature is per-shard, so it tends
+                # to hit one collection heavily).
+                print(
+                    f"⚠️  {failures} prune deletes FAILED on {coll.name} "
+                    f"(stale rows remain — see warnings above)"
+                )
+                total_failures += failures
 
+        self._prune_failures = total_failures
         return total_pruned
 
     def _prune_collection(
@@ -5065,7 +5095,7 @@ class CodeGraphAnalyzer:
         collection,
         visited_uuids: Set[str],
         language_scope: str = "",
-    ) -> int:
+    ) -> Tuple[int, int]:
         """Delete every object in ``collection`` whose project matches
         ``self.project_name`` AND whose UUID is not in ``visited_uuids``.
 
@@ -5084,8 +5114,18 @@ class CodeGraphAnalyzer:
         project, but defensive in case the schema ever permits
         cross-project sharing. The double-filter is essentially free
         (no extra query roundtrip beyond the initial enumerate).
+
+        v0.2.73 (C-11 / RT-3): returns ``(pruned, failures)`` so callers can
+        flip the build status success→partial when deletes fail. Before this
+        change a per-row ``delete_by_id`` failure only ``logger.warning``'d and
+        was invisible — a build with hundreds of Weaviate-500 prune failures
+        (stale per-shard prop-length tracker state on a pre-chunking
+        collection) reported ``success`` over silently-stale data. Now every
+        failure increments a counter that propagates to the run's exit status
+        and the machine-readable ``PRUNE_FAILURES=N`` summary line.
         """
         pruned = 0
+        failures = 0
         # Read `language` only when needed so a missing-property collection
         # (pre-migration) doesn't 422 the enumerate. Weaviate returns None
         # for missing-on-row props which we treat as "unknown language".
@@ -5125,15 +5165,28 @@ class CodeGraphAnalyzer:
                     collection.data.delete_by_id(uuid=str(obj.uuid))
                     pruned += 1
                 except Exception as exc:
+                    # v0.2.73 (C-11 / RT-3): count the failure so it can flip
+                    # the build status. A recurring signature here is the
+                    # Weaviate-500 "subtract prop lengths: property not found"
+                    # on delete — stale per-shard prop-length tracker state on a
+                    # pre-chunking collection carried across Weaviate upgrades.
+                    # It is upstream shard state, NOT a VCO logic bug, so we
+                    # never auto-drop the collection; the consented
+                    # drop-and-rebuild path is surfaced in main() instead.
+                    failures += 1
                     logger.warning(
                         f"Failed to prune {obj.uuid} from {collection.name}: {exc}"
                     )
         except Exception as exc:
             # Iterating a freshly-created collection can fail if it
-            # has no data yet; treat as zero-prune.
+            # has no data yet; treat as zero-prune. This is an enumeration
+            # failure (not a per-row delete failure) — we cannot tell how many
+            # rows were owed, so we do NOT count it as a prune failure here;
+            # a walk that produced zero visited UUIDs against a populated
+            # collection is caught by higher-level insert-error accounting.
             logger.debug(f"Prune enumeration on {collection.name} failed: {exc}")
 
-        return pruned
+        return pruned, failures
 
     def _single_file_dispatch(
         self,
@@ -9192,17 +9245,27 @@ def main():
                 "apis": stats.get("apis", 0),
                 "insert_errors": stats.get("insert_errors", 0),
                 "stale_pruned": stats.get("stale_pruned", 0),
+                # v0.2.73 (C-11 / RT-3): non-zero => prune couldn't delete
+                # stale rows => the launcher must render this build as
+                # `partial`, not `success`, so the operator sees stale data.
+                "prune_failures": stats.get("prune_failures", 0),
                 "language": args.language or "",
                 "prune_stale": bool(args.prune_stale),
             }
             print(json.dumps(final_payload), flush=True)
 
         # Report results
+        prune_failures = int(stats.get('prune_failures', 0))
         print("\n" + "="*60)
         if stats.get('insert_errors', 0) > 0:
             print("⚠️  Code Graph Analysis Complete (with errors)")
         elif stats.get('files_analyzed', 0) == 0:
             print("⚠️  Code Graph Analysis: NO FILES INDEXED")
+        elif prune_failures > 0:
+            # v0.2.73 (C-11 / RT-3): a build that inserted fine but could NOT
+            # delete stale rows is PARTIAL, not success — stale retrieval data
+            # remains until the deletes succeed.
+            print("⚠️  Code Graph Analysis Complete (PARTIAL — stale rows not pruned)")
         else:
             print("✅ Code Graph Analysis Complete")
         print("="*60)
@@ -9220,8 +9283,40 @@ def main():
         print(f"   Insert errors: {stats.get('insert_errors', 0)}")
         if args.prune_stale:
             print(f"   Stale entries pruned: {stats.get('stale_pruned', 0)}")
+            print(f"   Prune failures: {prune_failures}")
         print(f"   Cross-references: {ref_stats['calls']} calls, {ref_stats['extends']} extends, {ref_stats['imports']} imports")
         print()
+
+        # v0.2.73 (C-11 / RT-3): machine-readable summary line the launcher's
+        # stdout reader parses to flip the code_graph_builds row status
+        # success→partial when prune deletes failed (silent stale data). Always
+        # emitted when prune_stale is on so a `PRUNE_FAILURES=0` line positively
+        # confirms a clean prune (absence-of-line is not confirmation).
+        if args.prune_stale:
+            print(f"PRUNE_FAILURES={prune_failures}", flush=True)
+        if prune_failures > 0:
+            # Surface the CONSENTED drop-and-rebuild remedy for the recurring
+            # Weaviate-500 "subtract prop lengths: property not found" delete
+            # failure (stale per-shard prop-length tracker state on a
+            # pre-chunking collection carried across Weaviate upgrades). We NEVER
+            # auto-drop — the code graph is derived data but a drop is still a
+            # user-consent action, mirroring the ReanalysisModal / drop-collection
+            # deferral discipline used elsewhere (never auto-destroy user data).
+            print(
+                f"⚠️  {prune_failures} stale row(s) could not be deleted. If these "
+                "are Weaviate-500 'subtract prop lengths: property not found' "
+                "errors, the collection carries stale per-shard prop-length state "
+                "(a pre-chunking collection upgraded across Weaviate versions). "
+                "This is upstream shard state, not a VCO logic bug. To clear it, "
+                "rebuild the affected collection from scratch via the launcher's "
+                "Reanalyze (drop-and-rebuild) consent flow, e.g.:\n"
+                "   python -m vco_lib.project_init drop-collection "
+                "--name <project> --suffix CodeFunction   # then re-run analysis\n"
+                "   .claude/scripts/code-graph-analyze . --project <name> --prune-stale\n"
+                "The code graph is derived data, so a rebuild is cheap and "
+                "definitive — but it is NEVER done automatically.",
+                file=sys.stderr,
+            )
 
         # v0.2.16 (bug 0.2): non-zero exit code on bad outcomes.
         # The launcher's `rebuild_code_graph` Tauri command should
@@ -9230,6 +9325,22 @@ def main():
         #   4 → "Partial insert failures — check logs"
         # Pre-v0.2.16 the script always returned 0 even when most
         # files failed to write, masking serious data-loss bugs.
+        #
+        # v0.2.73 (C-11 / RT-3) — PARTIAL (prune-failure) signalling contract:
+        #   Insert work SUCCEEDED but stale-row DELETES failed (prune_failures
+        #   > 0). This is a PARTIAL build, not a hard failure and not a clean
+        #   success. The canonical machine-readable signal for it is the
+        #   `PRUNE_FAILURES=N` line printed above (stdout), NOT the exit code:
+        #   the launcher's stdout reader (codegraph.rs) parses that line and
+        #   flips the code_graph_builds row `success → partial` when N>0. We
+        #   deliberately KEEP exit 0 for the prune-only-partial case because the
+        #   current reader maps ANY non-zero exit → FAILED with files_analyzed=0,
+        #   which would WRONGLY discard the file count of a build that actually
+        #   inserted everything correctly. Data-loss outcomes (codes 3/4) still
+        #   exit non-zero; prune-partial rides the stdout line so the successful
+        #   insert count survives. If a future reader wants a non-zero partial
+        #   code, add it here AND teach the reader to preserve files_analyzed for
+        #   that code first (mirror-don't-fork the contract).
         files_total = stats['files_analyzed'] + stats['files_skipped']
         if stats['files_analyzed'] == 0 and files_total > 0:
             print(
