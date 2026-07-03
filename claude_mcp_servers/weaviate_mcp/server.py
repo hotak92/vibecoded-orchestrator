@@ -7675,13 +7675,37 @@ async def store_knowledge_node(
                 )
             # rel_file_path stays as file_path for relative inputs (already correct)
 
-        # Delete existing (match by title)
+        # Locate existing rows for THIS node (v0.2.73 D-1): scope the match to
+        # `title AND file_path`, mirroring sync_knowledge_graph.py's
+        # `_delete_node_by_file_path` (the v0.2.70 P1 fix). Title is NOT unique
+        # across the collection — an archived and an active node can share a
+        # title at different file_paths — so a title-only delete silently
+        # removed the OTHER node's rows (its .md survived on disk but it
+        # vanished from retrieval until a full kg-sync --all). When
+        # rel_file_path is somehow empty (defensive; _normalize_kg_file_path
+        # auto-derives one), fall back to the legacy title-only match rather
+        # than deleting nothing and accumulating duplicate rows.
+        _delete_filter = Filter.by_property("title").equal(title)
+        if rel_file_path:
+            _delete_filter = _delete_filter & Filter.by_property(
+                "file_path"
+            ).equal(rel_file_path)
+        # v0.2.73 D-2: collect the stale row ids NOW (before any insert, so the
+        # scoped filter can't match the fresh rows) but do NOT delete yet.
+        # Pre-D-2 the delete ran here — BEFORE embeddings were fetched — so a
+        # routine embed failure (Ollama down / timeout) destroyed the existing
+        # node: the tool returned success=false AND the previous rows were
+        # already gone until a manual resync. New order: embed + insert the
+        # new rows first, delete the stale rows LAST ("conservative defaults
+        # on best-effort paths"). Worst case on a mid-insert failure is
+        # temporary duplicate rows (old + partial new), which the next
+        # successful upsert or kg-sync cleans up — strictly better than data
+        # loss.
         existing = collection.query.fetch_objects(
-            filters=Filter.by_property("title").equal(title),
+            filters=_delete_filter,
             limit=100
         )
-        for obj in existing.objects:
-            collection.data.delete_by_id(obj.uuid)
+        _stale_uuids = [obj.uuid for obj in existing.objects]
 
         now = datetime.now(timezone.utc).isoformat()
 
@@ -7725,10 +7749,15 @@ async def store_knowledge_node(
                 collection.data.insert(properties=properties, vector=vector)
             chunk_count = 1
         else:
-            # Multi-chunk insert: split then embed each chunk independently
+            # Multi-chunk insert: split then embed each chunk independently.
+            # v0.2.73 D-2: embed ALL chunks BEFORE inserting any, so a mid-loop
+            # embed failure (the routine outage case) aborts with ZERO new rows
+            # written and the stale rows still pending deletion below — no
+            # partial-chunk state, no data loss.
             chunker = Chunker.for_model(EMBEDDING_MODEL)
             raw_chunks = chunker.chunk_text(content, source_id=title)
             chunk_count = len(raw_chunks)
+            prepared_inserts: list[tuple[dict, "list | dict | None"]] = []
             for chunk in raw_chunks:
                 # Prefix stored content with ordering header (no schema changes needed)
                 chunk_stored = (
@@ -7742,17 +7771,25 @@ async def store_knowledge_node(
                 chunk_props["total_chunks"] = chunk.total_chunks
                 chunk_props["source_node_id"] = title
                 if EMBEDDING_SOURCE == "weaviate":
-                    collection.data.insert(properties=chunk_props)
+                    prepared_inserts.append((chunk_props, None))
                 elif DUAL_EMBEDDING_ENABLED:
                     vectors = await _get_all_kg_embeddings(chunk.content)
-                    collection.data.insert(
-                        properties=chunk_props,
-                        vector=vectors if vectors else None,
+                    prepared_inserts.append(
+                        (chunk_props, vectors if vectors else None)
                     )
                 else:
                     # Embed the raw chunk text (without header) for clean vectors
                     vector = await get_embedding(chunk.content)
-                    collection.data.insert(properties=chunk_props, vector=vector)
+                    prepared_inserts.append((chunk_props, vector))
+            for chunk_props, chunk_vec in prepared_inserts:
+                if EMBEDDING_SOURCE == "weaviate":
+                    collection.data.insert(properties=chunk_props)
+                else:
+                    collection.data.insert(properties=chunk_props, vector=chunk_vec)
+
+        # v0.2.73 D-2: delete the stale rows LAST — the new rows are safely in.
+        for _stale_uuid in _stale_uuids:
+            collection.data.delete_by_id(_stale_uuid)
 
         logger.info(
             f"✓ Stored '{title}' in {chunk_count} chunk(s) "
