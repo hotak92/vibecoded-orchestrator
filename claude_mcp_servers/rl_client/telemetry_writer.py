@@ -432,7 +432,9 @@ class RLTelemetryWriter:
         the local JSONL citation shape and the retrieval-event shape.
         Lets the offline RL pipeline anchor the citation event by its
         own embedding triple if the paired retrieval event was dropped
-        at training_loader steps 4/6.
+        by the reader's embedding-triple filter (historically the JSONL
+        training_loader, retired v0.2.73 RL-8; today the DB-only
+        offline_trainer path).
 
         v3 (v0.2.47): adds ``literal_cited`` + ``cross_encoder_cited``
         per-node boost-flag dicts. Stored as separate fields (NOT baked

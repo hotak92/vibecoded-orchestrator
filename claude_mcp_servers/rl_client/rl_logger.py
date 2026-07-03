@@ -316,9 +316,11 @@ class RLDataLogger:
         # citation event so it is self-contained. The offline RL
         # training pipeline pairs retrieval events with citation
         # events via shared embedding-triple keys; if the retrieval
-        # event is dropped at training_loader steps 4/6 (filter or
-        # alias-map miss), the citation event would otherwise orphan
-        # silently with no anchor. Mirrors the retrieval-event shape.
+        # event is dropped by the reader's embedding-triple filter
+        # (historically the JSONL training_loader, retired v0.2.73
+        # RL-8; today the DB-only offline_trainer path), the citation
+        # event would otherwise orphan silently with no anchor.
+        # Mirrors the retrieval-event shape.
         record: dict[str, Any] = {
             "event": "citation",
             "schema_version": self.SCHEMA_VERSION,

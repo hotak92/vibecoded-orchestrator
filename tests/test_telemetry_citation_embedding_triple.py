@@ -6,14 +6,17 @@ Pre-fix: ``RLDataLogger.log_citations`` and
 ``RLTelemetryWriter._build_citation_payload`` wrote citation events
 WITHOUT the ``(embedding_source, embedding_dim, embedding_model)``
 triple that retrieval events have always carried. The offline RL
-``training_loader`` applies the same step-3 / step-4 / step-6 filters
-to citation events as to retrieval events — so citation events were
-silently dropped at step 4 (``embedding_dim`` missing) on every load.
+training reader (historically the JSONL ``training_loader``, retired
+v0.2.73 RL-8; today the DB-only path — launcher.db ``rl_events`` rows
+served by the hub and consumed by the container's ``offline_trainer``)
+filters/partitions citation events by the same embedding-triple keys
+as retrieval events — so citation events lacking the triple were
+silently dropped on every load.
 
 If a retrieval event was successfully written but its paired citation
-event got dropped at training_loader step 4/6, the offline trainer
-couldn't pair the cited-or-not signal with the retrieved candidates
-— the citation orphaned silently.
+event got dropped by the triple filter, the offline trainer couldn't
+pair the cited-or-not signal with the retrieved candidates — the
+citation orphaned silently.
 
 Post-fix: both write paths now stamp the full triple on the citation
 event. Mirror of the retrieval-event shape; field names match exactly
@@ -84,8 +87,8 @@ class CitationEventEmbeddingTripleLocalJsonlTest(unittest.TestCase):
     def test_citation_event_defaults_to_blank_triple_when_unset(self):
         """When the logger is constructed with no embedding metadata
         (test / standalone usage), the triple still serializes as the
-        empty defaults — keys are PRESENT (so training_loader's step 4
-        filter can identify the legacy / blank state explicitly)
+        empty defaults — keys are PRESENT (so an offline reader's
+        triple filter can identify the legacy / blank state explicitly)
         rather than missing entirely."""
         with tempfile.TemporaryDirectory() as td:
             log_path = Path(td) / "rl_events.jsonl"
@@ -98,9 +101,9 @@ class CitationEventEmbeddingTripleLocalJsonlTest(unittest.TestCase):
             )
             rec = json.loads(log_path.read_text().strip())
 
-            # Keys are present (forward-compat: training_loader step 4
-            # sees the field exists but with the legacy / empty value
-            # and drops the event explicitly rather than silently).
+            # Keys are present (forward-compat: an offline reader's
+            # triple filter sees the field exists but with the legacy /
+            # empty value and drops the event explicitly, not silently).
             self.assertIn("embedding_source", rec)
             self.assertIn("embedding_dim", rec)
             self.assertIn("embedding_model", rec)
