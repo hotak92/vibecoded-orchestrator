@@ -97,6 +97,13 @@ def test_non_diagram_edit_does_not_touch_throttle(tmp_path: Path):
 
     env = os.environ.copy()
     env["VCT_DISABLE_HOOKS"] = ""
+    # Hermetic: clear VCT_VENV so the hook's resolve-vco-venv.sh tier 1
+    # ($VCT_VENV) does NOT hijack the per-test stub venv. An AMBIENT VCT_VENV
+    # (e.g. exported by pre-ship-check pointing at the real VCO_dev venv) would
+    # otherwise win over the VCT_INSTALL_ROOT/.venv stub this test sets up, so
+    # the hook would run the REAL diagram_indexer instead of the argv-recorder
+    # stub and the "indexer invoked" assertion would fail. See resolve-vco-venv.sh.
+    env.pop("VCT_VENV", None)
     env["PATH"] = (
         os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
     )
@@ -171,6 +178,11 @@ def test_diagram_edit_creates_throttle_and_invokes_indexer(tmp_path: Path):
     env = os.environ.copy()
     env["VCT_DISABLE_HOOKS"] = ""
     env["VCT_INSTALL_ROOT"] = str(project)
+    # Hermetic: clear VCT_VENV so resolve-vco-venv.sh tier 1 doesn't hijack the
+    # per-test stub venv (VCT_INSTALL_ROOT/.venv). An ambient VCT_VENV (e.g. from
+    # pre-ship-check) would otherwise run the REAL diagram_indexer instead of the
+    # argv-recorder stub, failing the "indexer invoked" assertion.
+    env.pop("VCT_VENV", None)
     env["PATH"] = (
         os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
     )
@@ -287,6 +299,11 @@ def test_diagram_throttle_60s_blocks_immediate_reindex(tmp_path: Path):
     env = os.environ.copy()
     env["VCT_DISABLE_HOOKS"] = ""
     env["VCT_INSTALL_ROOT"] = str(project)
+    # Hermetic: clear VCT_VENV so resolve-vco-venv.sh tier 1 doesn't hijack the
+    # per-test stub venv (VCT_INSTALL_ROOT/.venv). An ambient VCT_VENV (e.g. from
+    # pre-ship-check) would otherwise run the REAL diagram_indexer instead of the
+    # argv-recorder stub, failing the "indexer invoked" assertion.
+    env.pop("VCT_VENV", None)
     env["PATH"] = (
         os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
     )
