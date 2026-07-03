@@ -398,6 +398,18 @@ _CANONICAL_KEYS: tuple[str, ...] = (
     # Conditionally emitted: omitted when no peers granted diagram read.
     "VCT_DIAGRAMS_ACCESS_LIST",
     "GITHUB_TOKEN",
+    # A-8 (v0.2.73): KG_BASE_DIR — the project's folder path. Previously
+    # Rust-only (emitted "always" by the legacy ``write_project_env_files``
+    # SecretsPanel path) but ABSENT from this Python canonical set. Because
+    # the Python ``apply`` rebuilds the managed block from scratch and drops
+    # keys not in this set, KG_BASE_DIR would appear after a secrets toggle
+    # and VANISH on the next Python apply (create/rename/refresh) — a
+    # flapping config surface. Adding it here makes the Python contract emit
+    # it on every apply, matching the Rust ``CANONICAL_INSTALL_ENV_KEYS``
+    # (last entry) so the two lists agree and the parity test
+    # (test_canonical_env_key_parity_v0273.py) passes. Value = folder path;
+    # always emitted (never None).
+    "KG_BASE_DIR",
 )
 
 
@@ -1762,6 +1774,13 @@ def project_env_from_db(
     )
     _set("DUAL_RL_LOG_ENABLED", "true" if dual_rl_log_enabled else "false")
     _set("PROJECT_NAME", proj.name)
+    # A-8 (v0.2.73): KG_BASE_DIR mirrors the project folder so
+    # .claude/settings.json::env and .claude/env agree with the value
+    # ``build_kg_sync_env`` already passes to kg-sync subprocesses. Matches
+    # the Rust ``KG_BASE_DIR`` arm (``folder.display().to_string()``).
+    # Always emitted (never None) so the Python apply no longer strips it
+    # after a secrets-toggle write left it on disk.
+    _set("KG_BASE_DIR", str(proj.folder_path))
     # v0.2.72 R2: binding-prefix-first (hub-consistent); see the
     # resolution comment above where `code_graph_project` is computed.
     _set("CODE_GRAPH_PROJECT", code_graph_project)
