@@ -10006,27 +10006,45 @@ def _cmd_check_bundle_resume(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_check_node_formats_schema(args: argparse.Namespace) -> int:
-    """v0.2.57: schema-version gate for the regenerated KG-summary cache
-    (`knowledge/.node_formats.json`, artifact_type ``kg_node_formats``).
+#: Stable artifact_name for the code_formats registry row — same rationale
+#: as ``_NODE_FORMATS_ARTIFACT_NAME`` (one sidecar per project, identified by
+#: project_id; a fixed name survives project-folder renames).
+_CODE_FORMATS_ARTIFACT_NAME = "default"
 
-    The cache is DERIVED (regeneratable from the project's KG nodes), so:
+
+def _run_formats_schema_check(
+    args: argparse.Namespace,
+    *,
+    artifact_type: str,
+    artifact_name: str,
+    regenerate_fn,
+    deferral_fn,
+    downgrade_detail: str,
+    success_action: str = "regenerated",
+) -> int:
+    """v0.2.73 M2: the GENERIC schema-version gate for regenerated sidecar
+    caches (one home — v0.2.57's kg_node_formats machinery, generalized with
+    per-artifact parameters instead of a second copy).
+
+    Both sidecars are DERIVED (regeneratable), so:
       * NEVER_MATERIALIZED / UP_TO_DATE → register at canonical, no action.
-      * RECREATE_NEEDED (stored < canonical, i.e. the .node_formats schema
-        bumped in a release) → the cache must be re-generated in the NEW
-        schema. We attempt an inline regeneration (re-run
-        generate-kg-summary.py --force over every knowledge node); if that
-        can't run here (generator/​backend unavailable), write an INFO
-        ``regenerated_data_schema_migration_pending`` deferral with the
-        command, and DO NOT touch the existing cache (no data loss).
+      * RECREATE_NEEDED (stored < canonical) → ``regenerate_fn(folder)``
+        brings the cache to the NEW schema (kg: inline force-regeneration;
+        code: keep-regenerated — delete, the generator rebuilds). If it
+        can't run, ``deferral_fn(folder, canonical, detail)`` writes an INFO
+        deferral and the existing cache is NOT touched (no data loss).
       * REFUSE_DOWNGRADE (stored > canonical) → INFO deferral; never
         downgrade-regenerate.
+
+    An artifact_type not yet in the schema registry (the window before the
+    release's schema_versions entry lands) → soft ``skipped`` result, exit 0
+    (conservative default: a probe never crashes the update flow).
 
     DB-aware: needs ``--db`` (defaults to the canonical launcher.db) and an
     optional ``--project-id``. Folder-only callers (no launcher) pass no
     project-id; the registry keys on COALESCE(project_id,'') so NULL works.
-    Always exits 0 unless --strict (this is an update-time probe; soft-fail
-    keeps the bundle update flowing). Prints a JSON result.
+    Always exits 0 (update-time probe; soft-fail keeps the bundle update
+    flowing). Prints a JSON result.
     """
     from . import artifact_version_registry as avr
     from . import schema_versions as sv
@@ -10034,26 +10052,30 @@ def _cmd_check_node_formats_schema(args: argparse.Namespace) -> int:
     folder = Path(args.folder).resolve()
     db_path = Path(args.db).resolve() if getattr(args, "db", None) else _launcher_db_path()
     project_id = getattr(args, "project_id", None) or None
-    # artifact_name: a STABLE constant, NOT the folder basename (review N2).
-    # The project is already identified by project_id; keying on the
-    # volatile folder name would orphan the registry row on a folder
-    # rename + re-trigger the NEVER_MATERIALIZED window. There is exactly
-    # one node-formats cache per project, so a fixed name is correct.
-    artifact_name = _NODE_FORMATS_ARTIFACT_NAME
-    formats_path = folder / "knowledge" / ".node_formats.json"
     now_ms = int(getattr(args, "now_ms", 0)) or _now_ms_safe()
 
-    canonical = sv.canonical_version("kg_node_formats")
+    try:
+        canonical = sv.canonical_version(artifact_type)
+    except KeyError:
+        print(json.dumps({
+            "folder": str(folder),
+            "artifact_type": artifact_type,
+            "artifact_name": artifact_name,
+            "action": "skipped",
+            "detail": f"{artifact_type} not in the schema registry yet",
+        }, indent=2))
+        return 0
+
     status = avr.check_artifact_version(
         db_path,
         project_id=project_id,
-        artifact_type="kg_node_formats",
+        artifact_type=artifact_type,
         artifact_name=artifact_name,
     )
 
     result = {
         "folder": str(folder),
-        "artifact_type": "kg_node_formats",
+        "artifact_type": artifact_type,
         "artifact_name": artifact_name,
         "canonical_version": canonical,
         "status": status.name,
@@ -10066,52 +10088,124 @@ def _cmd_check_node_formats_schema(args: argparse.Namespace) -> int:
                   avr.ArtifactVersionStatus.UP_TO_DATE):
         # Record the version so a FUTURE canonical bump is detectable.
         # Idempotent upsert. Register UNCONDITIONALLY (review C1): a fresh
-        # project is, by definition, at the current node-formats schema —
-        # whether or not the cache file has been materialized YET (the
-        # KG-summary generator runs async/in the background, so the file
-        # may not exist at update-check time). Registering here closes the
-        # window where a schema bump shipped between create and first
-        # update would be swallowed as NEVER_MATERIALIZED (registering
-        # straight to the new canonical, skipping regeneration). Now the
-        # first check records the CURRENT canonical, so the NEXT bump is
-        # correctly seen as RECREATE_NEEDED. A project that never uses KG
-        # just carries a harmless registry row.
+        # project is, by definition, at the current sidecar schema — whether
+        # or not the cache file has been materialized YET (both generators
+        # run async/in the background, so the file may not exist at
+        # update-check time). Registering here closes the window where a
+        # schema bump shipped between create and first update would be
+        # swallowed as NEVER_MATERIALIZED (registering straight to the new
+        # canonical, skipping regeneration). Now the first check records the
+        # CURRENT canonical, so the NEXT bump is correctly seen as
+        # RECREATE_NEEDED. A project that never materializes the cache just
+        # carries a harmless registry row.
         avr.register_artifact_version(
-            db_path, project_id=project_id, artifact_type="kg_node_formats",
+            db_path, project_id=project_id, artifact_type=artifact_type,
             artifact_name=artifact_name, schema_version=canonical,
             materialized_at=now_ms,
         )
         result["action"] = "registered"
     elif status == avr.ArtifactVersionStatus.RECREATE_NEEDED:
-        # The .node_formats schema bumped. Re-generate in the new schema
-        # (force-rewrite every node's entry), preserving the node SET (we
-        # re-derive from the same knowledge/**/*.md files). If regen can't
-        # run, defer — NEVER overwrite/clobber the existing cache.
-        regenerated, detail = _regenerate_node_formats(folder)
+        # The sidecar schema bumped. Bring the cache to the new schema via
+        # the artifact's strategy; if that can't run, defer — NEVER
+        # overwrite/clobber the existing cache.
+        regenerated, detail = regenerate_fn(folder)
         if regenerated:
             avr.register_artifact_version(
-                db_path, project_id=project_id, artifact_type="kg_node_formats",
+                db_path, project_id=project_id, artifact_type=artifact_type,
                 artifact_name=artifact_name, schema_version=canonical,
                 materialized_at=now_ms,
             )
-            result["action"] = "regenerated"
+            result["action"] = success_action
             result["regenerated"] = True
         else:
-            _write_node_formats_migration_deferral(folder, canonical, detail)
+            deferral_fn(folder, canonical, detail)
             result["action"] = "deferred"
             result["deferral_written"] = True
             result["detail"] = detail
     elif status == avr.ArtifactVersionStatus.REFUSE_DOWNGRADE:
-        _write_node_formats_migration_deferral(
-            folder, canonical,
-            "on-disk kg_node_formats schema is NEWER than this orchestrator "
-            "expects (you may have downgraded). Not modifying the cache.",
-        )
+        deferral_fn(folder, canonical, downgrade_detail)
         result["action"] = "deferred-downgrade"
         result["deferral_written"] = True
 
     print(json.dumps(result, indent=2))
     return 0
+
+
+def _cmd_check_node_formats_schema(args: argparse.Namespace) -> int:
+    """v0.2.57: schema-version gate for the regenerated KG-summary cache
+    (`knowledge/.node_formats.json`, artifact_type ``kg_node_formats``).
+
+    Thin caller of :func:`_run_formats_schema_check` (v0.2.73 M2
+    generalization — behaviour identical). RECREATE_NEEDED attempts an
+    inline regeneration (re-run generate-kg-summary.py --force over every
+    knowledge node); if that can't run here (generator/backend unavailable),
+    an INFO ``regenerated_data_schema_migration_pending`` deferral is
+    written and the existing cache is untouched.
+
+    artifact_name: a STABLE constant, NOT the folder basename (review N2).
+    The project is already identified by project_id; keying on the volatile
+    folder name would orphan the registry row on a folder rename +
+    re-trigger the NEVER_MATERIALIZED window. There is exactly one
+    node-formats cache per project, so a fixed name is correct.
+    """
+    return _run_formats_schema_check(
+        args,
+        artifact_type="kg_node_formats",
+        artifact_name=_NODE_FORMATS_ARTIFACT_NAME,
+        regenerate_fn=_regenerate_node_formats,
+        deferral_fn=_write_node_formats_migration_deferral,
+        downgrade_detail=(
+            "on-disk kg_node_formats schema is NEWER than this orchestrator "
+            "expects (you may have downgraded). Not modifying the cache."
+        ),
+    )
+
+
+def _cmd_check_code_formats_schema(args: argparse.Namespace) -> int:
+    """v0.2.73 M2: schema-version gate for the regenerated code-summary
+    sidecar (`.claude/.code_formats.json`, artifact_type ``code_formats``).
+
+    Thin caller of :func:`_run_formats_schema_check`. Unlike the KG cache
+    (regenerated inline from knowledge/*.md), the code sidecar's bump action
+    is KEEP-REGENERATED: delete the old-schema sidecar and let the generator
+    (``generate-code-summary.py`` — the resync background rider, or a manual
+    run) rebuild it in the new schema. Never a forward-migration. Before the
+    ``code_formats`` registry entry ships in schema_versions, this is a soft
+    no-op (``action: skipped``).
+    """
+    return _run_formats_schema_check(
+        args,
+        artifact_type="code_formats",
+        artifact_name=_CODE_FORMATS_ARTIFACT_NAME,
+        regenerate_fn=_regenerate_code_formats,
+        deferral_fn=_write_code_formats_migration_deferral,
+        downgrade_detail=(
+            "on-disk code_formats schema is NEWER than this orchestrator "
+            "expects (you may have downgraded). Not modifying the sidecar."
+        ),
+        success_action="keep-regenerated",
+    )
+
+
+def _regenerate_code_formats(folder: Path) -> tuple[bool, str]:
+    """Keep-regenerated strategy for `.claude/.code_formats.json` (M2 D5):
+    delete the old-schema sidecar and let ``generate-code-summary.py``
+    rebuild it (resync rider or manual run). Returns (ok, detail); a
+    deletion failure → (False, reason) so the caller DEFERS (sidecar left
+    intact — no half-migrated state)."""
+    sidecar = folder / ".claude" / ".code_formats.json"
+    if not sidecar.exists():
+        return (True, "no code_formats sidecar on disk — nothing to migrate")
+    try:
+        sidecar.unlink()
+    except OSError as exc:
+        return (False, f"could not delete old-schema sidecar {sidecar}: {exc}")
+    return (
+        True,
+        "old-schema sidecar deleted; the code-summary generator rebuilds it "
+        "on the next codegraph resync (or run: python "
+        ".claude/scripts/generate-code-summary.py --project <name>)",
+    )
 
 
 def _cmd_migrate_schema(args: argparse.Namespace) -> int:
@@ -10424,22 +10518,33 @@ def _subprocess_run_quiet(argv: list[str], cwd: Path) -> int:
     ).returncode
 
 
-def _write_node_formats_migration_deferral(folder: Path, canonical: int, detail: str) -> None:
-    """INFO deferral `regenerated_data_schema_migration_pending`: the
-    .node_formats schema bumped but regeneration couldn't run inline. The
-    existing cache is untouched; this tells the project's Claude how to
-    regenerate manually."""
+def _write_formats_migration_deferral(
+    folder: Path,
+    canonical: int,
+    detail: str,
+    *,
+    condition_id: str,
+    title: str,
+    sidecar_desc: str,
+    derived_from: str,
+    regen_cmd: str,
+    log_tag: str,
+) -> None:
+    """INFO deferral: a regenerated-sidecar schema bumped but the migration
+    action couldn't run inline. The existing cache is untouched; this tells
+    the project's Claude how to regenerate manually. Generic home (v0.2.73
+    M2) — per-artifact wrappers below supply the artifact-specific text."""
     try:
         from vco_lib.deferral_report import DeferralEntry, DeferralReport
         report = DeferralReport.read(folder)
         report.add_entry(DeferralEntry(
-            condition_id="regenerated_data_schema_migration_pending",
+            condition_id=condition_id,
             severity="info",
-            title="KG-summary cache schema bumped — regeneration pending",
+            title=title,
             detected=(
-                f"`knowledge/.node_formats.json` is at an older schema than "
+                f"`{sidecar_desc}` is at an older schema than "
                 f"this orchestrator's canonical v{canonical}. It is a "
-                f"regenerated cache (derived from your KG nodes), so it was "
+                f"regenerated cache (derived from {derived_from}), so it was "
                 f"NOT overwritten. Inline regeneration did not run: {detail}."
             ),
             why_deferred=(
@@ -10448,17 +10553,53 @@ def _write_node_formats_migration_deferral(folder: Path, canonical: int, detail:
                 "the cache in the new schema with no data loss."
             ),
             command_to_apply=(
-                "# Regenerate every node summary in the new schema:\n"
-                "for f in knowledge/**/*.md; do "
-                "python .claude/scripts/generate-kg-summary.py \"$f\" --force; done\n"
+                f"{regen_cmd}\n"
                 f"# Then dismiss:\n"
                 f"python -m vco_lib.project_init dismiss-deferral --folder {str(folder)!r} "
-                f"--condition-id regenerated_data_schema_migration_pending"
+                f"--condition-id {condition_id}"
             ),
         ))
         report.write(folder)
     except Exception as exc:  # never block the update flow
-        print(f"[node-formats] deferral write failed (non-fatal): {exc}", file=sys.stderr)
+        print(f"[{log_tag}] deferral write failed (non-fatal): {exc}", file=sys.stderr)
+
+
+def _write_node_formats_migration_deferral(folder: Path, canonical: int, detail: str) -> None:
+    """INFO deferral `regenerated_data_schema_migration_pending`: the
+    .node_formats schema bumped but regeneration couldn't run inline. Thin
+    wrapper over the generic writer (v0.2.73 M2) — text unchanged."""
+    _write_formats_migration_deferral(
+        folder, canonical, detail,
+        condition_id="regenerated_data_schema_migration_pending",
+        title="KG-summary cache schema bumped — regeneration pending",
+        sidecar_desc="knowledge/.node_formats.json",
+        derived_from="your KG nodes",
+        regen_cmd=(
+            "# Regenerate every node summary in the new schema:\n"
+            "for f in knowledge/**/*.md; do "
+            "python .claude/scripts/generate-kg-summary.py \"$f\" --force; done"
+        ),
+        log_tag="node-formats",
+    )
+
+
+def _write_code_formats_migration_deferral(folder: Path, canonical: int, detail: str) -> None:
+    """INFO deferral `code_formats_schema_migration_pending`: the
+    .code_formats schema bumped but the keep-regenerated action (delete +
+    let the generator rebuild) couldn't complete."""
+    _write_formats_migration_deferral(
+        folder, canonical, detail,
+        condition_id="code_formats_schema_migration_pending",
+        title="Code-summary sidecar schema bumped — regeneration pending",
+        sidecar_desc=".claude/.code_formats.json",
+        derived_from="your project's code-graph rows",
+        regen_cmd=(
+            "# Delete the old-schema sidecar and regenerate:\n"
+            "rm .claude/.code_formats.json\n"
+            "python .claude/scripts/generate-code-summary.py --project <name> --force"
+        ),
+        log_tag="code-formats",
+    )
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -10807,6 +10948,38 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Override materialized_at epoch-ms (testing; 0 = wall clock).",
     )
     p_check_nf.set_defaults(func=_cmd_check_node_formats_schema)
+
+    # v0.2.73 M2: same gate for the code-summary sidecar
+    # (.claude/.code_formats.json, artifact_type code_formats). Bump action
+    # is keep-regenerated (delete + let generate-code-summary.py rebuild).
+    p_check_cf = sub.add_parser(
+        "check-code-formats-schema",
+        help=(
+            "Schema-version gate for .claude/.code_formats.json "
+            "(artifact_type code_formats). Registers at canonical on first "
+            "materialize; on a schema bump, deletes the old-schema sidecar "
+            "so the generator rebuilds it (or writes an info deferral). "
+            "Emits a JSON result; exit 0 (probe)."
+        ),
+    )
+    p_check_cf.add_argument(
+        "--folder", required=True,
+        help="Target user-project folder.",
+    )
+    p_check_cf.add_argument(
+        "--db", default=None,
+        help="launcher.db path (defaults to the canonical ~/.vct/launcher.db).",
+    )
+    p_check_cf.add_argument(
+        "--project-id", default=None,
+        help="Project id/slug for the artifact_schema_versions row "
+             "(optional; registry keys on COALESCE(project_id,'')).",
+    )
+    p_check_cf.add_argument(
+        "--now-ms", default=0, type=int,
+        help="Override materialized_at epoch-ms (testing; 0 = wall clock).",
+    )
+    p_check_cf.set_defaults(func=_cmd_check_code_formats_schema)
 
     # v0.2.60: version-gated schema-migration runner (verified no-op today).
     p_migrate = sub.add_parser(
