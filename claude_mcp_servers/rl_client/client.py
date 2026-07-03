@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any, List, Optional
 
 try:
@@ -49,6 +50,62 @@ logger = logging.getLogger(__name__)
 # weaviate_mcp/server.py::_rl_cache_and_rerank.
 _DEFAULT_TIMEOUT = 3.0
 _DEFAULT_HEALTH_TIMEOUT = 1.0
+
+
+# ─── v0.2.73 RL-10: container protocol version negotiation ────────────
+#
+# The MCP RL client and the paid vct-rl-reranker container speak an HTTP
+# wire contract (schemas.py). Historically the ONLY compatibility signal
+# was ``ConfigDict(extra="allow")`` on both sides — a newer client's extra
+# fields are silently ignored by an older container and vice-versa. That
+# tolerance quietly hides genuine breakage: if the container's rerank
+# response shape changes incompatibly, or the container assumes a
+# different embedding space than the client feeds it (RL-2b: code
+# citations are CodeSage 2048-dim while the container may assume qwen3
+# 1024-dim), the client keeps POSTing and silently gets cosine order back
+# with no signal to the paying user.
+#
+# ``PROTOCOL_VERSION`` is the wire-contract version THIS client implements.
+# ``negotiate()`` probes ``/health`` and classifies the pairing:
+#   * compatible          — container advertises a protocol the client
+#                           supports (>= MIN_SERVER_PROTOCOL, <= our own).
+#   * degraded_old_server — container is older than we require, OR omitted
+#                           the field entirely (pre-RL-10). We still talk
+#                           to it (extra=allow tolerance) but flag it.
+#   * incompatible_new_server — container advertises a protocol NEWER than
+#                           this client understands. Refuse rerank, use
+#                           cosine, surface loudly (upgrade the client).
+#   * embedding_space_mismatch — container's advertised embedding space
+#                           does not match the client's active space
+#                           (RL-2b). Refuse rerank for that space rather
+#                           than train/query the wrong network.
+# Bump PROTOCOL_VERSION when the request/response SHAPE changes in a way
+# an older peer cannot tolerate. Additive optional fields do NOT need a
+# bump (extra=allow handles them).
+PROTOCOL_VERSION = 1
+# The oldest container protocol this client will engage without flagging
+# a degraded pairing. Pre-RL-10 containers advertise None → treated as v1.
+MIN_SERVER_PROTOCOL = 1
+
+
+@dataclass(frozen=True)
+class NegotiationResult:
+    """Outcome of a container version handshake (RL-10). Pure data.
+
+    ``compatible`` is the single boolean the pipeline gates on. ``status``
+    is a stable machine tag (compatible / degraded_old_server /
+    incompatible_new_server / embedding_space_mismatch / unreachable /
+    disabled) for rl-doctor + logs. ``detail`` is a human-readable line
+    (never carries user data). ``server_protocol`` / ``server_embedding_*``
+    echo what the container advertised (None when it did not / unreachable).
+    """
+
+    compatible: bool
+    status: str
+    detail: str
+    server_protocol: Optional[int] = None
+    server_embedding_dim: Optional[int] = None
+    server_embedding_space: Optional[str] = None
 
 
 # ─── v0.2.49: per-project routing header sanitization ────────────────
@@ -558,6 +615,136 @@ class RLClient:
             return HealthResponse(ok=bool(data.get("ok", False)),
                                   model=str(data.get("model", "unknown")))
 
+    async def negotiate(
+        self,
+        *,
+        health: Optional[HealthResponse] = None,
+    ) -> NegotiationResult:
+        """RL-10: negotiate wire-contract + embedding-space compatibility.
+
+        Probes ``/health`` (unless a pre-fetched ``health`` is passed — lets
+        rl-doctor reuse a single probe) and classifies the client↔container
+        pairing into a ``NegotiationResult``. This is READ-ONLY: it never
+        mutates the client or the container, only reports whether the client
+        should engage the reranker.
+
+        Compatibility rules:
+          * Disabled mode → ``disabled`` (compatible=False; nothing to talk to).
+          * Unreachable / health not ok → ``unreachable`` (compatible=False).
+          * Container protocol > this client's PROTOCOL_VERSION →
+            ``incompatible_new_server`` (compatible=False): the container speaks
+            a newer contract we don't understand; refuse rather than misparse.
+          * Container protocol advertised but < MIN_SERVER_PROTOCOL, OR not
+            advertised at all (pre-RL-10) → ``degraded_old_server``
+            (compatible=True): we still talk to it via extra=allow tolerance,
+            but flag the pairing so a Pro user can see it's on an old container.
+          * Container advertises an embedding space that DISAGREES with this
+            client's configured space (dim or source tag) →
+            ``embedding_space_mismatch`` (compatible=False): the RL-2b hazard.
+            Feeding a 2048-dim CodeSage query into a container whose head
+            expects 1024-dim qwen3 (or vice-versa) trains/queries the wrong
+            network; refuse for that space.
+          * Otherwise → ``compatible`` (compatible=True).
+
+        Never raises. A probe failure degrades to ``unreachable``.
+        """
+        if not self.enabled:
+            return NegotiationResult(
+                compatible=False,
+                status="disabled",
+                detail="RL client is in disabled mode (no RL_SERVER_URL/PORT).",
+            )
+
+        h = health if health is not None else await self.health()
+        if not h.ok:
+            return NegotiationResult(
+                compatible=False,
+                status="unreachable",
+                detail=f"container health not ok (model={h.model!r}).",
+            )
+
+        server_proto = h.protocol_version  # None ⇒ pre-RL-10 container
+        srv_dim = h.embedding_dim
+        srv_space = h.embedding_space
+
+        # Newer server than we understand → refuse (don't misparse a contract
+        # we don't know).
+        if server_proto is not None and server_proto > PROTOCOL_VERSION:
+            return NegotiationResult(
+                compatible=False,
+                status="incompatible_new_server",
+                detail=(
+                    f"container protocol v{server_proto} is newer than this "
+                    f"client's v{PROTOCOL_VERSION}; update the MCP/orchestrator."
+                ),
+                server_protocol=server_proto,
+                server_embedding_dim=srv_dim,
+                server_embedding_space=srv_space,
+            )
+
+        # RL-2b embedding-space guard. Only fires when BOTH sides declare a
+        # space (the container advertised it AND the client has a non-default
+        # text_dim/active_embedding). A container that doesn't advertise its
+        # space is handled by the degraded path below (can't check → trust).
+        if srv_dim is not None and srv_dim != self.text_dim:
+            return NegotiationResult(
+                compatible=False,
+                status="embedding_space_mismatch",
+                detail=(
+                    f"container embedding dim {srv_dim} != client text_dim "
+                    f"{self.text_dim} (RL-2b: mismatched embedding space; "
+                    f"refusing rerank to avoid the wrong network)."
+                ),
+                server_protocol=server_proto,
+                server_embedding_dim=srv_dim,
+                server_embedding_space=srv_space,
+            )
+        if (
+            srv_space is not None
+            and self.active_embedding
+            and srv_space != self.active_embedding
+        ):
+            return NegotiationResult(
+                compatible=False,
+                status="embedding_space_mismatch",
+                detail=(
+                    f"container embedding space {srv_space!r} != client "
+                    f"active_embedding {self.active_embedding!r} (RL-2b)."
+                ),
+                server_protocol=server_proto,
+                server_embedding_dim=srv_dim,
+                server_embedding_space=srv_space,
+            )
+
+        # Old / non-advertising container: still usable (extra=allow), but flag.
+        if server_proto is None or server_proto < MIN_SERVER_PROTOCOL:
+            return NegotiationResult(
+                compatible=True,
+                status="degraded_old_server",
+                detail=(
+                    "container did not advertise a protocol version (pre-RL-10) "
+                    if server_proto is None
+                    else f"container protocol v{server_proto} < required "
+                    f"v{MIN_SERVER_PROTOCOL} "
+                )
+                + "— engaging via best-effort tolerance.",
+                server_protocol=server_proto,
+                server_embedding_dim=srv_dim,
+                server_embedding_space=srv_space,
+            )
+
+        return NegotiationResult(
+            compatible=True,
+            status="compatible",
+            detail=(
+                f"container protocol v{server_proto} compatible with client "
+                f"v{PROTOCOL_VERSION}."
+            ),
+            server_protocol=server_proto,
+            server_embedding_dim=srv_dim,
+            server_embedding_space=srv_space,
+        )
+
     # ---- transport ----------------------------------------------------
 
     async def _ensure_client(self) -> Any:
@@ -590,15 +777,18 @@ class RLClient:
         # constructor received a project_id that passed
         # sanitize_project_id(). The container uses this to look up
         # per-project fine-tuned model heads; absent → base model.
-        headers: Optional[dict] = None
+        #
+        # v0.2.73 RL-10: ALWAYS advertise this client's wire-contract
+        # protocol version so a container that DOES negotiate can pick a
+        # compatible response shape (or reject an unsupported client). An
+        # older, pre-RL-10 container simply ignores the header. Additive —
+        # never breaks an existing peer.
+        headers: dict = {"X-VCT-RL-Protocol": str(PROTOCOL_VERSION)}
         if self._project_id is not None:
-            headers = {"X-VCT-Project-ID": self._project_id}
+            headers["X-VCT-Project-ID"] = self._project_id
 
         try:
-            if headers is not None:
-                resp = await client.post(url, json=json_body, headers=headers, timeout=timeout)
-            else:
-                resp = await client.post(url, json=json_body, timeout=timeout)
+            resp = await client.post(url, json=json_body, headers=headers, timeout=timeout)
         except Exception as exc:
             # httpx.ConnectError / TimeoutException / ReadError — all
             # treated as "unreachable" so callers can branch.

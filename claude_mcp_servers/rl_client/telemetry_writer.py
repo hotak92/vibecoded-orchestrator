@@ -223,6 +223,11 @@ class RLTelemetryWriter:
                 envelope = self._wrap_for_hub("retrieval", task_id, task_type, event)
                 self._last_envelope = envelope
                 self._hub_post(envelope)
+                # RL-5 (v0.2.73): opportunistically drive bounded retention on
+                # the same hub connection cadence. Throttled to ≤1 pass/hour per
+                # process (RL_EVENTS_RETENTION_MIN_INTERVAL_S) so this is nearly
+                # free; soft-fail so a wedged/older hub never breaks the write.
+                self._maybe_prune_rl_events()
             except Exception as exc:
                 logger.debug("RLTelemetryWriter: hub log_retrieval failed (%s)", exc)
 
@@ -324,6 +329,26 @@ class RLTelemetryWriter:
                 window_tokens=window_tokens,
             )
             _enqueue(self._etype_citations, payload)
+
+    # ---- RL-5 retention driver hook ----------------------------------
+
+    def _maybe_prune_rl_events(self) -> None:
+        """RL-5 (v0.2.73): opportunistically drive bounded ``rl_events`` retention.
+
+        Called after a successful retrieval hub-write so the prune runs on the
+        same connection cadence the writer already has. The heavy lifting
+        (cadence throttle, cutoff computation, in-flight-citation floor, hub
+        route call) lives in ``rl_retention.maybe_run_retention`` — this wrapper
+        only forwards the project scope and swallows every error. Retention is
+        best-effort: a wedged/older hub or a missing prune route must never
+        break a telemetry write or the user-facing search.
+        """
+        try:
+            from .rl_retention import maybe_run_retention
+
+            maybe_run_retention(project_id=self._project_id)
+        except Exception as exc:  # noqa: BLE001 — retention never breaks a write
+            logger.debug("RLTelemetryWriter: retention driver raised (%s)", exc)
 
     # ---- payload builders --------------------------------------------
 

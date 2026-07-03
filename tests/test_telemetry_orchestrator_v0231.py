@@ -53,7 +53,7 @@ class RLClientCacheNodesSessionIdTest(unittest.TestCase):
                 return {"top_k": [{"title": "N1", "score": 0.9}]}
 
         class _FakeClient:
-            async def post(self, url, json=None, timeout=None):
+            async def post(self, url, json=None, headers=None, timeout=None):
                 captured["url"] = url
                 captured["json"] = json
                 return _FakeResp()
@@ -91,7 +91,7 @@ class RLClientCacheNodesSessionIdTest(unittest.TestCase):
                 return {"top_k": []}
 
         class _FakeClient:
-            async def post(self, url, json=None, timeout=None):
+            async def post(self, url, json=None, headers=None, timeout=None):
                 captured["json"] = json
                 return _FakeResp()
             async def get(self, url, timeout=None):
@@ -130,7 +130,7 @@ class RLClientRlUpdateActiveEmbeddingTest(unittest.TestCase):
                 return {"ok": True, "scheduled": 1}
 
         class _FakeClient:
-            async def post(self, url, json=None, timeout=None):
+            async def post(self, url, json=None, headers=None, timeout=None):
                 captured["url"] = url
                 captured["json"] = json
                 return _FakeResp()
@@ -171,7 +171,7 @@ class RLClientRlUpdateActiveEmbeddingTest(unittest.TestCase):
                 return {"ok": True}
 
         class _FakeClient:
-            async def post(self, url, json=None, timeout=None):
+            async def post(self, url, json=None, headers=None, timeout=None):
                 captured["json"] = json
                 return _FakeResp()
             async def get(self, url, timeout=None):
@@ -208,7 +208,7 @@ class RLClientRlUpdateActiveEmbeddingTest(unittest.TestCase):
                 return {"ok": True}
 
         class _FakeClient:
-            async def post(self, url, json=None, timeout=None):
+            async def post(self, url, json=None, headers=None, timeout=None):
                 captured["json"] = json
                 return _FakeResp()
             async def get(self, url, timeout=None):
@@ -244,7 +244,7 @@ class RLClientRlUpdateActiveEmbeddingTest(unittest.TestCase):
                 return {"ok": True}
 
         class _FakeClient:
-            async def post(self, url, json=None, timeout=None):
+            async def post(self, url, json=None, headers=None, timeout=None):
                 captured["json"] = json
                 return _FakeResp()
             async def get(self, url, timeout=None):
