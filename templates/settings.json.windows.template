@@ -314,6 +314,12 @@
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/stop-codegraph-reminder.ps1",
             "timeout": 5,
             "async": true
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/stop-codegraph-drain.ps1",
+            "timeout": 15,
+            "async": true
           }
         ]
       }

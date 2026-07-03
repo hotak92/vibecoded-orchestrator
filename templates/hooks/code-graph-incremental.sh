@@ -233,43 +233,11 @@ esac
 #
 # MUST MATCH templates/hooks/code-graph-incremental.ps1 :: Get-CanonicalRepoRoot
 # (mirror cross-language logic; keep the git primitive identical).
-_canonical_repo_root() {
-    # Args: <edited_file>. Echoes the canonical main repo root on success
-    # (absolute path), echoes nothing + returns non-zero on failure.
-    local _file="$1"
-    local _dir
-    _dir="$(dirname "$_file")"
-    command -v git >/dev/null 2>&1 || return 1
-    # `--git-common-dir` resolves a linked worktree's shared .git dir to the
-    # MAIN repo's `.git` (for the main checkout it's the same path). The
-    # main repo root is its dirname. `--path-format=absolute` (git ≥ 2.31)
-    # makes the relative ".git" of a main checkout absolute too; older git
-    # falls back to resolving the (possibly-relative) value against $_dir.
-    local _common
-    _common="$(git -C "$_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || _common=""
-    if [ -z "$_common" ]; then
-        # Older git without --path-format: resolve the bare value to absolute.
-        _common="$(git -C "$_dir" rev-parse --git-common-dir 2>/dev/null)" || return 1
-        [ -z "$_common" ] && return 1
-        case "$_common" in
-            /*) : ;;                       # already absolute
-            *)  _common="$_dir/$_common" ;; # relative (".git") → make absolute
-        esac
-    fi
-    # Strip a trailing "/.git" (and any trailing slash) → main repo root.
-    local _root="${_common%/}"
-    _root="${_root%/.git}"
-    [ -d "$_root" ] || return 1
-    # NIT (Bug 3): NORMALIZE to an absolute, symlink-resolved path. The
-    # older-git fallback above can yield an unnormalized string (e.g.
-    # ".../src/../..") and macOS resolves /tmp→/private; `cd … && pwd -P`
-    # canonicalizes both so a worktree edit's stamped root EXACTLY equals
-    # the main-checkout's normalized value (else the UUIDs wouldn't match).
-    local _norm
-    _norm="$(cd "$_root" 2>/dev/null && pwd -P)" || return 1
-    [ -n "$_norm" ] || return 1
-    printf '%s\n' "$_norm"
-}
+# v0.2.73 (FIX-B): `_canonical_repo_root` lives in the shared lib
+# _lib/canonical-repo-root.sh so the end-of-turn batched drain
+# (stop-codegraph-drain.sh) reuses the EXACT SAME resolver — one copy, no fork.
+# shellcheck source=_lib/canonical-repo-root.sh disable=SC1091
+. "$SCRIPT_DIR/_lib/canonical-repo-root.sh"
 
 _CANON_ROOT="$(_canonical_repo_root "$EDITED_FILE")" || _CANON_ROOT=""
 if [ -z "$_CANON_ROOT" ]; then
@@ -313,6 +281,31 @@ fi
 # dedup an extra-that-is-a-worktree). MUST MATCH the .ps1 sibling.
 if [ "$EXTRAS_MATCHED" -eq 0 ] && [ "$_CANON_ROOT" != "$REPO_PATH" ]; then
     PROJECT_NAME="$(_resolve_codegraph_project "$_CANON_ROOT")"
+fi
+
+# ── v0.2.73 FIX-A': skip indexing for EPHEMERAL/unregistered worktree edits ──
+# Parallel subagents editing in throwaway `isolation: worktree` checkouts fire
+# this hook on every edit; each sync hits the big CodeFunction collection's
+# insert-time churn, and N concurrent worktrees multiply it into the measured
+# disk write-amplification. Maintainer directive: "only track main and not
+# track worktrees at all." BUT (R1 correctness hole) a user whose PRIMARY
+# checkout IS a linked worktree (bare-repo layout) must NOT lose indexing — so
+# we skip ONLY when the edit is in a worktree AND its canonical main root is
+# NOT a registered launcher project. Extras deliberately keep their parent
+# project (an extra-that-is-a-worktree still dedups via project_source +
+# file_path_rel), so this gate never fires for the extras case.
+# CONSERVATIVE: the shared helper skips ONLY on a definitive "not registered"
+# probe result; on registered OR hub-uncertain it returns "index" (never drop
+# a legit index on doubt). MUST MATCH the .ps1 sibling.
+if [ "$EXTRAS_MATCHED" -eq 0 ]; then
+    # shellcheck source=_lib/worktree-gate.sh disable=SC1091
+    [ -f "$SCRIPT_DIR/_lib/worktree-gate.sh" ] && . "$SCRIPT_DIR/_lib/worktree-gate.sh"
+    if command -v _worktree_gate_should_skip >/dev/null 2>&1 \
+        && _worktree_gate_should_skip "$EDITED_FILE" "$REPO_PATH" "$_CANON_ROOT"; then
+        # Detectable log line so the (deliberate) staleness is observable.
+        echo "ℹ️  code-graph: skipped worktree edit (ephemeral/unregistered) $EDITED_FILE" >&2
+        exit 0
+    fi
 fi
 
 # Resolve python: prefer venv, fall back to system python (cross-OS).

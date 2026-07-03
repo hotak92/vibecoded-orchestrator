@@ -140,9 +140,15 @@ class WeaviateMcpServerPrefixContract(unittest.TestCase):
 class HookResolverFieldContract(unittest.TestCase):
     """Pin the bash hooks to ask the resolver for code_graph_collection_prefix."""
 
+    # v0.2.73 (FIX-B): post-file-edit no longer resolves the code-graph
+    # collection prefix — the per-edit code-graph sync moved to the end-of-turn
+    # batched drain (stop-codegraph-drain.sh), which now owns the per-canonical-
+    # root prefix resolution. The incremental hook still resolves it (GUI
+    # reanalyze / direct invocation path). So the code-graph write-target
+    # resolvers to pin are the incremental hook AND the drain hook.
     HOOKS = [
-        "templates/hooks/post-file-edit.sh",
         "templates/hooks/code-graph-incremental.sh",
+        "templates/hooks/stop-codegraph-drain.sh",
     ]
 
     @staticmethod
@@ -230,21 +236,33 @@ class HookResolverFieldContract(unittest.TestCase):
     ALLOWED_PS1_RESOLVER_FIELDS = frozenset({
         "code_graph_collection_prefix",
         "code_graph_extra_paths",
-        # The PS1 sibling at templates/hooks/code-graph-incremental.ps1
-        # uses literal "code_graph_extra_paths" but it's quoted on the
-        # call site; the regex below matches unquoted tokens only.
+        # v0.2.73 (FIX-B): the drain resolves the `.claude` gate per canonical
+        # root (Resolve-DrainDotClaude), same as the incremental hook's
+        # Resolve-IndexDotClaude. A CLI-toggle field read, not a write-target
+        # name; unrelated to the banned slug alias.
+        "code_graph_index_dot_claude",
     })
 
     def test_ps1_hook_uses_collection_prefix_field(self):
-        """PowerShell sibling of post-file-edit.sh — cross-OS parity.
+        """PowerShell sibling of stop-codegraph-drain.sh — cross-OS parity.
 
-        v0.2.47: the PS1 sibling also queries ``code_graph_extra_paths``
-        via the same allowlist pattern as the bash hook.
+        v0.2.73 (FIX-B): the per-edit code-graph sync moved from
+        post-file-edit to the end-of-turn batched drain, which now owns the
+        per-canonical-root ``code_graph_collection_prefix`` resolution. So the
+        PS1 code-graph write-target resolver to pin is the drain hook (via its
+        ``Resolve-DrainProject`` helper's ``-Field
+        code_graph_collection_prefix`` call), not post-file-edit.ps1.
+        v0.2.47: the drain also queries ``code_graph_index_dot_claude`` for the
+        analyzer's ``.claude`` gate — both are in the allowlist.
         """
-        path = PROJECT_ROOT / "templates" / "hooks" / "post-file-edit.ps1"
+        path = PROJECT_ROOT / "templates" / "hooks" / "stop-codegraph-drain.ps1"
         text = self._strip_comments(path.read_text(encoding="utf-8"), "#")
-        fields = re.findall(r"-Field\s+(\S+)", text)
+        fields = re.findall(r"-Field\s+[\"']?([A-Za-z0-9_]+)[\"']?", text)
         self.assertTrue(fields, f"{path}: expected at least one '-Field <name>' call")
+        self.assertIn(
+            "code_graph_collection_prefix", fields,
+            f"{path}: the drain must resolve '-Field code_graph_collection_prefix'",
+        )
         for fld in fields:
             self.assertIn(
                 fld,

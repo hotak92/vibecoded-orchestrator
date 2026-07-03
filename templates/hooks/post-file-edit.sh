@@ -468,48 +468,26 @@ if [[ "$EDITED_FILE" == "$DIAGRAMS_DIR"/* ]] \
     fi
 fi
 
-# 3. Code file changes: incremental code graph update + LLM nudge.
-# v0.2.21 Step 18 (caller migration): resolve the code-graph collection
-# prefix via the launcher's vct-hub first (`vct_project_config.sh --field
-# code_graph_collection_prefix`), fall back to the legacy env chain when
-# the hub is unreachable (launcher not running, project not registered,
-# stale token). The hub is the authoritative source post-v0.2.21.
-#
-# v0.2.23 field switch: previously this read `code_graph_project`, which
-# the hub returns as a legacy alias for `project_slug` — NOT the canonical
-# Weaviate prefix. The analyzer's own `_sanitize_collection_prefix` then
-# re-canonicalised the slug, producing a prefix that diverged from the
-# launcher's `project_codegraph_bindings.collection_prefix`. Symptom:
-# every incremental write since the project rename landed in zombie
-# collections (e.g. `Orchestrator_root_Code*`) while consumers queried
-# the canonical prefix (e.g. `VibeCodedOrchestrator_Code*`) and saw 0
-# results. `code_graph_collection_prefix` is the binding-row truth and
-# the only correct source for the write target.
-#
-# Pre-v0.2.11 behaviour hardcoded "ClaudeOrchestrator" here, which
-# polluted the legacy collection from every project install. Do NOT
-# re-introduce a hardcoded literal in this position.
+# 3. Code file changes: end-of-turn batched code graph drain + LLM nudge.
+# v0.2.73 (FIX-B): the per-edit code-graph sync is REMOVED. post-file-edit no
+# longer resolves the code-graph collection prefix here NOR schedules a
+# per-edit `code-graph-incremental.sh` run (which hit the big CodeFunction
+# collection's insert-time HNSW churn on every keystroke and, multiplied by
+# parallel worktrees, drove the measured disk write-amplification of 857 GB/8h
+# vs a 5 GB dataset). Instead the edited path is APPENDED to a per-turn drain
+# queue (+ the reminder accumulator), and the Stop hook `stop-codegraph-drain.sh`
+# runs ONE analyzer pass at end-of-turn over ALL the turn's files, GROUPED BY
+# CANONICAL ROOT (so the drain — not this hook — resolves the
+# `code_graph_collection_prefix` per canonical root), rate-limited to once per
+# 120s per project. Latency is acceptable (maintainer: "accept slightly
+# outdated codegraph with less frequent syncs"). The KG-sync (knowledge/) and
+# docs debounce paths above are UNCHANGED — this fix targets the CODE path only
+# (the amplifier); those writes are small and already per-file coalesced.
 if [[ "$EDITED_FILE" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$ ]]; then
-    CODE_GRAPH_PREFIX_RESOLVED=""
-    _RESOLVER="$PROJECT_ROOT/.claude/scripts/vct_project_config.sh"
-    if [ -x "$_RESOLVER" ]; then
-        CODE_GRAPH_PREFIX_RESOLVED=$(
-            "$_RESOLVER" "$PROJECT_ROOT" --field code_graph_collection_prefix 2>/dev/null
-        ) || CODE_GRAPH_PREFIX_RESOLVED=""
-    fi
-    if [ -z "$CODE_GRAPH_PREFIX_RESOLVED" ]; then
-        CODE_GRAPH_PREFIX_RESOLVED="${CODE_GRAPH_PROJECT:-${PROJECT_NAME:-$(basename "$PROJECT_ROOT")}}"
-    fi
-    # 2026-06-18: debounced. code-graph-incremental.sh runs the analyzer
-    # per-edit with NO internal debounce (its own comment: "no debounce —
-    # keep code graph fresh"), so each edit was a separate Weaviate
-    # upsert. Coalescing rapid re-edits of the SAME file is safe: the
-    # analyzer re-reads the file from disk (diffs the working tree) at run
-    # time, so the deferred run indexes the latest content. The
-    # incremental script has no access-matrix gate of its own (code-graph
-    # writes are not gated), so the debounced command is the bare invoke.
-    _CG_SYNC_CMD="bash $(_kg_debounce_shquote "$SCRIPT_DIR/code-graph-incremental.sh") $(_kg_debounce_shquote "$EDITED_FILE") $(_kg_debounce_shquote "$PROJECT_ROOT") $(_kg_debounce_shquote "$CODE_GRAPH_PREFIX_RESOLVED")"
-    _kg_debounce_schedule "$PROJECT_ROOT" "$EDITED_FILE" "$PY" "$PROJECT_ROOT" "$_CG_SYNC_CMD" "code"
+    # NOTE: the accumulator append below serves BOTH the end-of-turn reminder
+    # (P6) AND the batched code-graph drain (FIX-B). Keep the FULL path (the
+    # drain needs it to resolve the canonical root; the reminder reduces to
+    # basenames itself).
 
     # v0.2.72 P6: reminder AGGREGATION. This "was just edited → update
     # CONTEXT_STATE / capture KG" nudge previously fired on EVERY code-file
@@ -521,9 +499,20 @@ if [[ "$EDITED_FILE" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|jav
     # that turn) rather than reverting to per-edit spam. The Stop hook dedups
     # paths, so re-editing the same file across the turn lists it once.
     if [ -n "$SESSION_ID_FROM_STDIN" ]; then
-        _EDIT_ACCUM="$PROJECT_ROOT/.claude/state/edit_reminder_${SESSION_ID_FROM_STDIN}.txt"
         mkdir -p "$PROJECT_ROOT/.claude/state" 2>/dev/null || true
+        _EDIT_ACCUM="$PROJECT_ROOT/.claude/state/edit_reminder_${SESSION_ID_FROM_STDIN}.txt"
         printf '%s\n' "$EDITED_FILE" >> "$_EDIT_ACCUM" 2>/dev/null || true
+        # v0.2.73 (FIX-B): SEPARATE code-graph drain queue. The reminder
+        # accumulator above is drained + cleared EVERY turn by
+        # stop-codegraph-reminder.sh; the drain queue below is drained by
+        # stop-codegraph-drain.sh, which is RATE-LIMITED (once per 120s) and
+        # therefore must PERSIST the union of edited paths across turns that
+        # fall inside the rate-limit window (it clears the queue only when it
+        # actually runs the analyzer). A distinct file avoids a two-consumer
+        # race on one accumulator (two Stop hooks reading + unlinking the same
+        # path). Same full-path convention (the drain resolves canonical roots).
+        _CG_DRAIN_QUEUE="$PROJECT_ROOT/.claude/state/codegraph_drain_${SESSION_ID_FROM_STDIN}.txt"
+        printf '%s\n' "$EDITED_FILE" >> "$_CG_DRAIN_QUEUE" 2>/dev/null || true
     fi
 fi
 

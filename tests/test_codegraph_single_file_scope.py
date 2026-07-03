@@ -378,6 +378,94 @@ def test_analyze_only_file_indexes_only_that_file(
     assert "alpha.py" in blob, "alpha.py (the edited file) must be indexed"
 
 
+# ---------------------------------------------------------------------------
+# v0.2.73 (FIX-B): batched multi-file mode (--only-files-from).
+# ---------------------------------------------------------------------------
+
+
+def test_analyze_only_files_from_batches_all_listed_files(
+    analyzer_mod: types.ModuleType, tmp_path: Path, monkeypatch
+) -> None:
+    """``analyze_repository(only_files_from=<list>)`` analyzes EVERY listed
+    file in ONE pass (the end-of-turn batch) — not one process per file — and
+    leaves unlisted files untouched."""
+    _stub_embeddings(analyzer_mod, monkeypatch)
+
+    repo = tmp_path
+    (repo / "alpha.py").write_text("def alpha_func():\n    return 1\n")
+    (repo / "beta.py").write_text("def beta_func():\n    return 2\n")
+    # gamma.py exists but is NOT in the list → must be untouched.
+    (repo / "gamma.py").write_text("def gamma_func():\n    return 3\n")
+
+    list_file = repo / "batch.txt"
+    list_file.write_text(f"{repo / 'alpha.py'}\n{repo / 'beta.py'}\n")
+
+    analyzer = _wire_full_flow_analyzer(analyzer_mod)
+    stats = analyzer.analyze_repository(
+        repo, only_files_from=list_file, extract_cfg=False, extract_pdg=False
+    )
+
+    assert stats["files_analyzed"] == 2, (
+        f"Both listed files analyzed in one pass, got {stats['files_analyzed']}"
+    )
+    blob = repr(_all_replace_calls(analyzer))
+    assert "alpha.py" in blob and "beta.py" in blob, "both listed files indexed"
+    assert "gamma.py" not in blob and "gamma_func" not in blob, (
+        "an unlisted file must NOT be indexed by the batch"
+    )
+
+
+def test_analyze_only_files_from_prunes_deleted_path(
+    analyzer_mod: types.ModuleType, tmp_path: Path, monkeypatch
+) -> None:
+    """A path in the batch that vanished from disk (edited-then-deleted in the
+    turn) is PRUNED (its objects deleted), not skipped/errored — no
+    self-inflicted orphan."""
+    _stub_embeddings(analyzer_mod, monkeypatch)
+
+    class _FakeDataWithDelete(_FakeCollectionData):
+        def __init__(self) -> None:
+            super().__init__()
+            self.delete_many_calls: List[Any] = []
+
+        def delete_many(self, where: Any = None) -> None:
+            self.delete_many_calls.append(where)
+
+    class _FakeCollWithDelete(_FakeCollection):
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.data = _FakeDataWithDelete()
+
+    analyzer = _wire_full_flow_analyzer(analyzer_mod)
+    # Swap in delete-capable fakes for the file-anchored collections.
+    analyzer.modules_collection = _FakeCollWithDelete(f"{analyzer.project_name}_CodeModule")
+    analyzer.functions_collection = _FakeCollWithDelete(f"{analyzer.project_name}_CodeFunction")
+    analyzer.classes_collection = _FakeCollWithDelete(f"{analyzer.project_name}_CodeClass")
+
+    repo = tmp_path
+    (repo / "present.py").write_text("def present():\n    return 1\n")
+    missing = repo / "gone.py"  # never created
+
+    list_file = repo / "batch.txt"
+    list_file.write_text(f"{repo / 'present.py'}\n{missing}\n")
+
+    stats = analyzer.analyze_repository(
+        repo, only_files_from=list_file, extract_cfg=False, extract_pdg=False
+    )
+
+    # The present file analyzed; the missing one triggered a prune (delete_many)
+    # rather than an error.
+    assert stats["files_analyzed"] == 1, "only the present file is analyzed"
+    total_deletes = (
+        len(analyzer.modules_collection.data.delete_many_calls)
+        + len(analyzer.functions_collection.data.delete_many_calls)
+        + len(analyzer.classes_collection.data.delete_many_calls)
+    )
+    assert total_deletes >= 1, (
+        "the deleted file must trigger a prune (delete_many), not a silent skip"
+    )
+
+
 def test_analyze_unchanged_file_writes_zero_objects(
     analyzer_mod: types.ModuleType, tmp_path: Path, monkeypatch
 ) -> None:

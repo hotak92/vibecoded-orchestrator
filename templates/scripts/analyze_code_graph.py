@@ -3774,6 +3774,41 @@ class CodeGraphAnalyzer:
             project_source=current_source_for_uuid,
         )
 
+        # ── v0.2.73 (FIX-B2): HOIST the content-hash skip BEFORE the embed ──
+        # Walkers now pass a zero-arg embed callable via
+        # `insert_params['_deferred_embed']` instead of an eager `vector`. This
+        # resolver point-reads the stored fingerprint and, when the object is
+        # byte-identical + at the current embed_revision, SKIPS the embed
+        # entirely (a 1-line edit to a 50-func file runs 1 embed, not ~51).
+        # No-op for call sites that still set `vector` eagerly (no
+        # `_deferred_embed` key). Fail-safe: embeds on any read/hash
+        # uncertainty. Clears any prior turn's stashed skip-fingerprint so it
+        # can't leak into an object that DID embed (the stash is consumed once
+        # in _write_one_object). GUARD on the key's presence AND on the method
+        # existing so legacy test stubs that bind `_dedup_insert` as an unbound
+        # method (without the FIX-B2 helpers) keep the pre-fix behaviour — the
+        # deferred path only ever engages for the real analyzer's walker sites.
+        self._embed_skip_fingerprint = None
+        if isinstance(insert_params, dict) and "_deferred_embed" in insert_params:
+            _resolver = getattr(self, "_resolve_deferred_embed", None)
+            if callable(_resolver):
+                _resolver(
+                    collection, insert_params, identity_key, file_path_rel,
+                    current_source_for_uuid,
+                )
+            else:
+                # No resolver (minimal stub) → don't strand the callable in the
+                # Weaviate kwargs: pop it and best-effort embed eagerly.
+                _deferred = insert_params.pop("_deferred_embed", None)
+                if callable(_deferred):
+                    try:
+                        _emb = _deferred()
+                    except Exception:  # noqa: BLE001
+                        _emb = None
+                    _shaped = _shape_for_insert(_emb)
+                    if _shaped:
+                        insert_params["vector"] = _shaped
+
         # v0.2.18 (Plan C): stamp the canonical language ID on every insert
         # so the language-scoped prune filter can match each row. The
         # dispatcher sets `self._current_language` for the duration of one
@@ -4073,6 +4108,210 @@ class CodeGraphAnalyzer:
                 canonical_uuid = written
         return canonical_uuid
 
+    def _read_existing_object_fingerprint(
+        self, collection, det_uuid: str, want_total_chunks: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Point-read an existing object's tombstone-skip fingerprint by UUID.
+
+        v0.2.73 (FIX-B2): single home for the ``content_hash`` +
+        ``embed_revision`` point-read that both the EMBED-skip precheck (in
+        ``_dedup_insert``, BEFORE the embed) and the WRITE-skip decision (in
+        ``_write_one_object``) share. Hoisting the read out of
+        ``_write_one_object`` lets ``_dedup_insert`` decide "this object is
+        unchanged" BEFORE calling the (expensive) embedder — a 1-line edit to a
+        50-func file then runs 1 embed instead of ~51.
+
+        Returns a dict ``{"content_hash": str, "embed_revision": Any,
+        "total_chunks": int|None}`` on a successful read, or ``None`` when the
+        object is absent OR the read cannot be performed (no ``.query`` attr on
+        a mocked/older client, fetch raises, etc.). A ``None`` return means
+        "unknown" → every caller MUST fall through to embed+write (fail-safe:
+        never skip on uncertainty).
+
+        ``want_total_chunks`` requests the ``total_chunks`` property too (only
+        valid for chunkable Function/Class collections — Module/API/Interaction
+        schemas lack it and an unknown return_property errors the read).
+        """
+        try:
+            query = getattr(collection, "query", None)
+            fetch_by_id = getattr(query, "fetch_object_by_id", None) if query else None
+            if not callable(fetch_by_id):
+                return None
+            read_props = ["content_hash", _EMBED_REVISION_PROP]
+            if want_total_chunks:
+                read_props.append("total_chunks")
+            existing = fetch_by_id(det_uuid, return_properties=read_props)
+            if existing is None:
+                return None
+            existing_props = getattr(existing, "properties", None) or {}
+            total_chunks: Optional[int] = None
+            if want_total_chunks:
+                try:
+                    total_chunks = int(existing_props.get("total_chunks") or 1)
+                except (TypeError, ValueError):
+                    total_chunks = 1
+            return {
+                "content_hash": existing_props.get("content_hash") or "",
+                "embed_revision": existing_props.get(_EMBED_REVISION_PROP),
+                "total_chunks": total_chunks,
+            }
+        except Exception:  # noqa: BLE001 — any read failure → unknown → write
+            return None
+
+    def _fingerprint_matches(
+        self, stored_hash: str, stored_rev: Any, content_hash: str,
+    ) -> bool:
+        """The v0.2.72 (P7) FINGERPRINT GATE, factored (FIX-B2, single home).
+
+        Return True (SKIP is safe) ONLY when BOTH:
+          (a) the content is byte-identical (``stored_hash == content_hash``,
+              both non-empty), AND
+          (b) the stored row was embedded under the CURRENT embedding-generation
+              revision (``stored_rev == CODEGRAPH_EMBED_REVISION``).
+
+        A NULL / mismatched ``embed_revision`` (pre-migration row, or a row
+        written before a chunking-scheme bump) FORCES a re-embed even when the
+        body text is unchanged — that is exactly the over-budget-entity resync
+        P7 targets. Fail-safe: any uncertainty upstream (empty hash, absent
+        row, read error) never reaches here as a match, so the default is
+        embed+write, never a wrong skip.
+        """
+        if not content_hash or not stored_hash:
+            return False
+        if stored_hash != content_hash:
+            return False
+        return stored_rev == CODEGRAPH_EMBED_REVISION
+
+    def _resolve_deferred_embed(
+        self, collection, insert_params: dict, identity_key: str,
+        file_path_rel: str, current_source_for_uuid: str,
+    ) -> None:
+        """Hoist the content-hash skip BEFORE the embed (FIX-B2, v0.2.73).
+
+        THE PROBLEM: pre-fix, every walker call site computed the embedding
+        EAGERLY (``embed_function``/``embed_class`` → Ollama/CodeSage) and put
+        it into ``insert_params['vector']``; the content-hash skip only fired
+        LATER in ``_write_one_object``. So a 1-line edit to a 50-func file
+        re-embedded all ~51 funcs even though 50 were byte-identical — the
+        skip saved the ``replace()`` but NOT the embed compute (~50× wasted
+        Ollama load).
+
+        THE FIX: the walkers now pass a ZERO-ARG embed callable via
+        ``insert_params['_deferred_embed']`` instead of a pre-computed
+        ``vector``. This method — called at the very top of ``_dedup_insert``,
+        before chunking / writing — decides whether the object is unchanged
+        (content_hash + embed_revision match the stored row) using the SAME
+        point-read ``_write_one_object`` will reuse, and:
+          * unchanged → SKIP the embed entirely (no ``vector`` set; the
+            downstream write also skips), AND stash the fingerprint so
+            ``_write_one_object`` doesn't re-read.
+          * changed / absent / uncertain → CALL the deferred embedder now,
+            shape it into ``insert_params['vector']`` (fail-safe: embed on ANY
+            doubt), so the write proceeds exactly as before.
+
+        The ``_deferred_embed`` key is popped here so it never reaches
+        Weaviate's ``replace()``/``insert()`` splat. Call sites that still set
+        ``vector`` eagerly (Module/API/Interaction — non-chunkable, cheap embed,
+        or already-cheap ``generate_embedding``) are untouched: this method is a
+        no-op when ``_deferred_embed`` is absent.
+
+        CONSERVATIVE: for chunkable entities the content_hash stored on the
+        canonical row (chunk 0) includes ``chunk_num=0``; the skip precheck
+        stamps ``chunk_num``/``total_chunks`` onto a scratch copy of the props
+        so the computed hash matches the stored canonical hash exactly — an
+        over-budget (multi-chunk) entity therefore never spuriously matches a
+        single-chunk stored hash (its total differs) and correctly re-embeds.
+        """
+        deferred = insert_params.pop("_deferred_embed", None)
+        if deferred is None:
+            return  # eager call site (or no embed) — nothing to defer.
+
+        props = insert_params.get("properties")
+        if not isinstance(props, dict):
+            # No properties to hash → cannot precheck → embed now (fail-safe).
+            self._run_deferred_embed_into(insert_params, deferred)
+            return
+
+        det_uuid = _deterministic_uuid(
+            self.project_name, file_path_rel, identity_key,
+            project_source=current_source_for_uuid,
+        )
+
+        coll_name = getattr(collection, "name", "") or ""
+        is_chunkable = (
+            coll_name.endswith("CodeFunction") or coll_name.endswith("CodeClass")
+        )
+
+        # Compute the content_hash the SAME way _write_one_object will, so a
+        # match here guarantees a match there (single-read reuse). For a
+        # single-object write, _write_one_object stamps chunk_num=0/total=1 via
+        # _stamp_single_chunk_props BEFORE hashing; mirror that on a scratch
+        # props copy so the precheck hash equals the eventual stored hash for
+        # the common (fits-in-one-chunk) case. If the entity is actually
+        # over-budget (chunkable), the real chunk 0 body differs from the full
+        # body → the hashes won't match → we correctly embed. Fail-safe either
+        # way: a hash mismatch only ever causes an embed, never a wrong skip.
+        try:
+            hash_props = props
+            if is_chunkable:
+                hash_props = dict(props)
+                if "chunk_num" not in hash_props:
+                    hash_props["chunk_num"] = 0
+                if "total_chunks" not in hash_props:
+                    hash_props["total_chunks"] = 1
+            content_hash = _content_hash_for_object(coll_name, hash_props)
+        except Exception:  # noqa: BLE001 — hashing must never wedge a write
+            content_hash = ""
+
+        if not content_hash:
+            self._run_deferred_embed_into(insert_params, deferred)
+            return
+
+        fp = self._read_existing_object_fingerprint(
+            collection, det_uuid, want_total_chunks=is_chunkable,
+        )
+        if fp is None:
+            # Absent / unreadable → unknown → embed now (fail-safe).
+            self._run_deferred_embed_into(insert_params, deferred)
+            return
+
+        if self._fingerprint_matches(
+            fp["content_hash"], fp["embed_revision"], content_hash,
+        ):
+            # Unchanged object: DON'T embed, DON'T set a vector. Stash the
+            # verified fingerprint so _write_one_object skips its own point-read
+            # AND its write. The stored content_hash is stamped back onto props
+            # so the (skipped-write) object still carries the correct hash if a
+            # downstream path ever re-stamps it.
+            if not props.get("content_hash"):
+                props["content_hash"] = content_hash
+            self._embed_skip_fingerprint = {
+                "uuid": det_uuid,
+                "content_hash": content_hash,
+                "stored_total_chunks": fp.get("total_chunks"),
+            }
+            return
+
+        # Changed → embed now.
+        self._run_deferred_embed_into(insert_params, deferred)
+
+    @staticmethod
+    def _run_deferred_embed_into(insert_params: dict, deferred) -> None:
+        """Call the deferred embedder and shape its result into ``vector``.
+
+        Mirrors every walker's old eager ``if embedding: insert_params['vector']
+        = _shape_for_insert(embedding)`` line — one home now. A None/failed
+        embed leaves ``vector`` unset (the write path already tolerates a
+        vectorless object and stamps _EMBED_REVISION_VECTORLESS).
+        """
+        try:
+            embedding = deferred()
+        except Exception:  # noqa: BLE001 — an embed failure must not wedge the write
+            embedding = None
+        shaped = _shape_for_insert(embedding)
+        if shaped:
+            insert_params["vector"] = shaped
+
     def _write_one_object(
         self, collection, det_uuid: str, insert_params: dict, identity_key: str,
     ) -> str:
@@ -4157,7 +4396,40 @@ class CodeGraphAnalyzer:
                     props[_EMBED_REVISION_PROP] = CODEGRAPH_EMBED_REVISION
                 else:
                     props[_EMBED_REVISION_PROP] = _EMBED_REVISION_VECTORLESS
-            if content_hash:
+            # ── v0.2.73 (FIX-B2): reuse the embed-skip precheck's point-read ──
+            # `_dedup_insert` → `_resolve_deferred_embed` may already have
+            # point-read this exact UUID's fingerprint to decide "skip the
+            # embed". When it verified an UNCHANGED object (stash present +
+            # matching this det_uuid + content_hash), reuse that decision here
+            # instead of issuing a SECOND identical point-read: skip the
+            # replace() AND feed the F3 shrink detector the stashed
+            # total_chunks. The stash is consumed (set to None) so it can never
+            # leak into a different object's write. Any mismatch (different
+            # UUID, chunked-per-chunk write, or the stash absent) falls through
+            # to the normal read below — never a wrong skip.
+            _stash = getattr(self, "_embed_skip_fingerprint", None)
+            _stash_used = False
+            if (
+                content_hash
+                and isinstance(_stash, dict)
+                and _stash.get("uuid") == det_uuid
+                and _stash.get("content_hash") == content_hash
+            ):
+                skip_replace = True
+                _stash_used = True
+                self._embed_skip_fingerprint = None
+                if _is_chunkable and props.get("chunk_num") in (0, None):
+                    try:
+                        _stored_total = int(_stash.get("stored_total_chunks") or 1)
+                    except (TypeError, ValueError):
+                        _stored_total = 1
+                    try:
+                        _new_total = int(props.get("total_chunks") or 1)
+                    except (TypeError, ValueError):
+                        _new_total = 1
+                    if _stored_total > _new_total >= 1:
+                        stale_chunk_min = _new_total
+            if content_hash and not _stash_used:
                 # Persist for the NEXT run's comparison (and don't clobber a
                 # caller-preset value, mirroring the other stamp sites).
                 if not props.get("content_hash"):
@@ -4651,6 +4923,7 @@ class CodeGraphAnalyzer:
                           extra_paths: Optional[List[Path]] = None,
                           since_commit: Optional[str] = None,
                           only_file: Optional[Path] = None,
+                          only_files_from: Optional[Path] = None,
                           canonical_source: Optional[str] = None) -> Dict[str, Any]:
         """Analyze repository and extract code entities.
 
@@ -4847,6 +5120,51 @@ class CodeGraphAnalyzer:
             per_lang_files = self._single_file_dispatch(
                 only_file, repo_path, lang_dispatch, lang,
             )
+        elif only_files_from is not None:
+            # v0.2.73 (FIX-B): batched multi-file scope for the Stop-hook drain.
+            # Read the newline-delimited absolute paths, prune any that vanished
+            # from disk (edited-then-deleted in the turn), and build the union
+            # dispatch from the survivors via the SAME `_single_file_dispatch`
+            # per file (so every per-file skip / ignore-dir / relativization
+            # guard applies identically). All files share ONE canonical source
+            # (the drain groups by canonical root before calling), so a single
+            # `_current_source` covers the whole batch. Soft-fail: an unreadable
+            # list file is a clean no-op (empty dispatch).
+            try:
+                raw = only_files_from.read_text(encoding="utf-8")
+            except Exception as exc:  # noqa: BLE001 — unreadable list → no-op
+                print(
+                    f"⚠️  --only-files-from: could not read {only_files_from}: "
+                    f"{exc} — nothing to analyze",
+                    file=sys.stderr,
+                )
+                raw = ""
+            seen_paths: Set[str] = set()
+            for line in raw.splitlines():
+                p = line.strip()
+                if not p or p in seen_paths:
+                    continue
+                seen_paths.add(p)
+                fpath = Path(p)
+                if not fpath.is_file():
+                    # Vanished path → PRUNE its objects (delete), not skip. Key
+                    # the delete on the repo-relative path (same as the write
+                    # path stamps) + the canonical source when known.
+                    try:
+                        rel = fpath.resolve().relative_to(repo_path.resolve()).as_posix()
+                    except Exception:  # noqa: BLE001 — outside root / unresolved
+                        rel = ""
+                    if rel:
+                        self._prune_deleted_file_objects(
+                            rel, canonical_source or "",
+                        )
+                    continue
+                # Existing file → route through the single-file dispatch and
+                # merge its (0-or-1) entry into the union.
+                for entry in self._single_file_dispatch(
+                    fpath, repo_path, lang_dispatch, lang,
+                ):
+                    per_lang_files.append(entry)
         else:
             source_roots: List[Path] = [repo_path] + canonical_extras
             for source_root in source_roots:
@@ -4895,9 +5213,12 @@ class CodeGraphAnalyzer:
             # may pass a `canonical_source` (the edited file's git MAIN repo
             # root). Stamp THAT instead of the on-disk `source_root` so a
             # worktree edit converges on the canonical object (see the
-            # `canonical_source` arg docstring). Only honoured for the
-            # single-file path; whole-tree walks keep per-root provenance.
-            if only_file is not None and canonical_source:
+            # `canonical_source` arg docstring). Only honoured for a scoped
+            # file path; whole-tree walks keep per-root provenance.
+            # v0.2.73 (FIX-B): the batched drain (`only_files_from`) passes ONE
+            # canonical source for the whole batch (grouped by canonical root
+            # upstream), so honour it the same way as single-file mode.
+            if (only_file is not None or only_files_from is not None) and canonical_source:
                 self._current_source = canonical_source
             else:
                 self._current_source = source_root.as_posix()
@@ -5593,7 +5914,6 @@ class CodeGraphAnalyzer:
             # V52-O.11.F (Rust). Audit a79152.
             methods = _csharp_methods_for_class(content_clean, cname, source_lines)
             signature = f"class {cname}"
-            embedding = embed_class(signature, class_body, methods=methods[:10], language="csharp")
             insert_params: Dict[str, Any] = {
                 "properties": {
                     "name": cname, "full_name": f"{ns}.{cname}",
@@ -5604,8 +5924,7 @@ class CodeGraphAnalyzer:
                 },
                 "references": {"module": module_uuid},
             }
-            if embedding:
-                insert_params["vector"] = _shape_for_insert(embedding)
+            insert_params["_deferred_embed"] = lambda: embed_class(signature, class_body, methods=methods[:10], language="csharp")
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -5624,7 +5943,6 @@ class CodeGraphAnalyzer:
             is_async = bool(re.search(r'\basync\b', body[:200]))
             full_name = f"{ns}.{enclosing}.{mname}"
             signature = f"{mname}(...)"
-            embedding = embed_function(signature, body, language="csharp")
             insert_params = {
                 "properties": {
                     "name": mname, "full_name": full_name,
@@ -5634,8 +5952,7 @@ class CodeGraphAnalyzer:
                 },
                 "references": {"module": module_uuid},
             }
-            if embedding:
-                insert_params["vector"] = _shape_for_insert(embedding)
+            insert_params["_deferred_embed"] = lambda: embed_function(signature, body, language="csharp")
             func_uuid = self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -6002,7 +6319,6 @@ class CodeGraphAnalyzer:
             if base_class:
                 signature += f" extends {base_class}"
 
-            embedding = embed_class(signature, class_body, methods=methods[:10], language="javascript")
 
             insert_params: Dict[str, Any] = {
                 "properties": {
@@ -6018,8 +6334,7 @@ class CodeGraphAnalyzer:
                 },
                 "references": {"module": module_uuid},
             }
-            if embedding:
-                insert_params["vector"] = _shape_for_insert(embedding)
+            insert_params["_deferred_embed"] = lambda: embed_class(signature, class_body, methods=methods[:10], language="javascript")
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -6029,7 +6344,6 @@ class CodeGraphAnalyzer:
             body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
             full_name = f"{file_path.stem}.{fname}"
             signature = f"{'async ' if is_async else ''}function {fname}()"
-            embedding = embed_function(signature, body, language="javascript")
 
             insert_params = {
                 "properties": {
@@ -6045,8 +6359,7 @@ class CodeGraphAnalyzer:
                 },
                 "references": {"module": module_uuid},
             }
-            if embedding:
-                insert_params["vector"] = _shape_for_insert(embedding)
+            insert_params["_deferred_embed"] = lambda: embed_function(signature, body, language="javascript")
             self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -6242,7 +6555,6 @@ class CodeGraphAnalyzer:
             # scores by language. Embeddings stay 2048-dim either way
             # (model-agnostic), but downstream language-filtered retrieval
             # (--language=lua scopes) was silently never matching.
-            embedding = embed_class(signature, "", methods=methods, language="lua")
 
             insert_params: Dict[str, Any] = {
                 "properties": {
@@ -6253,8 +6565,7 @@ class CodeGraphAnalyzer:
                 },
                 "references": {"module": module_uuid},
             }
-            if embedding:
-                insert_params["vector"] = _shape_for_insert(embedding)
+            insert_params["_deferred_embed"] = lambda: embed_class(signature, "", methods=methods, language="lua")
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -6277,7 +6588,6 @@ class CodeGraphAnalyzer:
             func_full_name = f"{file_path.stem}.{func_name}"
             # V52-O.11.H (v0.2.52, 2026-06-09): see comment on the Lua class
             # embed_class call above — same fix for the function path.
-            embedding = embed_function(f"function {func_name}({args_str})", body, language="lua")
 
             insert_params = {
                 "properties": {
@@ -6289,8 +6599,7 @@ class CodeGraphAnalyzer:
                 },
                 "references": {"module": module_uuid},
             }
-            if embedding:
-                insert_params["vector"] = _shape_for_insert(embedding)
+            insert_params["_deferred_embed"] = lambda: embed_function(f"function {func_name}({args_str})", body, language="lua")
             self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -6404,7 +6713,6 @@ class CodeGraphAnalyzer:
             body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
             full_name = f"{file_path.stem}.{class_name}.{method_name}"
             signature = f"{class_name}::{method_name}({args_str})"
-            embedding = embed_function(signature, body, language="cpp")
             insert_params = {
                 "properties": {
                     "name": method_name, "full_name": full_name,
@@ -6414,8 +6722,7 @@ class CodeGraphAnalyzer:
                 },
                 "references": {"module": module_uuid},
             }
-            if embedding:
-                insert_params["vector"] = _shape_for_insert(embedding)
+            insert_params["_deferred_embed"] = lambda: embed_function(signature, body, language="cpp")
             self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -6506,7 +6813,6 @@ class CodeGraphAnalyzer:
             # MCP path. Mirrors V52-O.11.F (Rust); Go uses receiver
             # syntax instead of `impl` blocks (see helper docstring).
             methods = _go_methods_for_struct(content_clean, sname, source_lines)
-            embedding = embed_class(signature, class_body, language="go")
             insert_params: Dict[str, Any] = {
                 "properties": {
                     "name": sname, "full_name": f"{pkg_name}.{sname}",
@@ -6517,8 +6823,7 @@ class CodeGraphAnalyzer:
                 },
                 "references": {"module": module_uuid},
             }
-            if embedding:
-                insert_params["vector"] = _shape_for_insert(embedding)
+            insert_params["_deferred_embed"] = lambda: embed_class(signature, class_body, language="go")
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -6532,7 +6837,6 @@ class CodeGraphAnalyzer:
             body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
             full_name = f"{pkg_name}.{fname}"
             signature = f"func {fname}({args_str})"
-            embedding = embed_function(signature, body, language="go")
             insert_params = {
                 "properties": {
                     "name": fname, "full_name": full_name,
@@ -6542,8 +6846,7 @@ class CodeGraphAnalyzer:
                 },
                 "references": {"module": module_uuid},
             }
-            if embedding:
-                insert_params["vector"] = _shape_for_insert(embedding)
+            insert_params["_deferred_embed"] = lambda: embed_function(signature, body, language="go")
             self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -6641,7 +6944,6 @@ class CodeGraphAnalyzer:
             # attributions, drowning real signal in noise for the
             # `query_code_structure(methods, StructName)` MCP path.
             methods = _rust_methods_for_struct(content_clean, sname, source_lines)
-            embedding = embed_class(signature, class_body, language="rust")
             insert_params: Dict[str, Any] = {
                 "properties": {
                     "name": sname, "full_name": f"{file_path.stem}.{sname}",
@@ -6652,8 +6954,7 @@ class CodeGraphAnalyzer:
                 },
                 "references": {"module": module_uuid},
             }
-            if embedding:
-                insert_params["vector"] = _shape_for_insert(embedding)
+            insert_params["_deferred_embed"] = lambda: embed_class(signature, class_body, language="rust")
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -6672,7 +6973,6 @@ class CodeGraphAnalyzer:
             body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
             full_name = f"{file_path.stem}.{fname}"
             signature = f"fn {fname}({args_str})"
-            embedding = embed_function(signature, body, language="rust")
             insert_params = {
                 "properties": {
                     "name": fname, "full_name": full_name,
@@ -6682,8 +6982,7 @@ class CodeGraphAnalyzer:
                 },
                 "references": {"module": module_uuid},
             }
-            if embedding:
-                insert_params["vector"] = _shape_for_insert(embedding)
+            insert_params["_deferred_embed"] = lambda: embed_function(signature, body, language="rust")
             self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -6771,7 +7070,6 @@ class CodeGraphAnalyzer:
             # in V52-O.11.F. Java fix mirrors via `_java_methods_for_class`.
             methods = _java_methods_for_class(content_clean, cname, source_lines)
             signature = f"class {cname}"
-            embedding = embed_class(signature, class_body, methods=methods[:10], language="java")
             insert_params: Dict[str, Any] = {
                 "properties": {
                     "name": cname,
@@ -6783,8 +7081,7 @@ class CodeGraphAnalyzer:
                 },
                 "references": {"module": module_uuid},
             }
-            if embedding:
-                insert_params["vector"] = _shape_for_insert(embedding)
+            insert_params["_deferred_embed"] = lambda: embed_class(signature, class_body, methods=methods[:10], language="java")
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -6802,7 +7099,6 @@ class CodeGraphAnalyzer:
             )
             full_name = f"{enclosing}.{mname}"
             signature = f"{mname}({args_str})"
-            embedding = embed_function(signature, body, language="java")
             insert_params = {
                 "properties": {
                     "name": mname, "full_name": full_name,
@@ -6812,8 +7108,7 @@ class CodeGraphAnalyzer:
                 },
                 "references": {"module": module_uuid},
             }
-            if embedding:
-                insert_params["vector"] = _shape_for_insert(embedding)
+            insert_params["_deferred_embed"] = lambda: embed_function(signature, body, language="java")
             self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -6893,7 +7188,6 @@ class CodeGraphAnalyzer:
             class_body = '\n'.join(class_lines)
             methods = [m.group(1) for m in func_pattern.finditer(content_clean)]
             signature = f"class {cname}"
-            embedding = embed_class(signature, class_body, methods=methods[:10], language="ruby")
             insert_params: Dict[str, Any] = {
                 "properties": {
                     "name": cname, "full_name": f"{file_path.stem}.{cname}",
@@ -6904,8 +7198,7 @@ class CodeGraphAnalyzer:
                 },
                 "references": {"module": module_uuid},
             }
-            if embedding:
-                insert_params["vector"] = _shape_for_insert(embedding)
+            insert_params["_deferred_embed"] = lambda: embed_class(signature, class_body, methods=methods[:10], language="ruby")
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -6921,7 +7214,6 @@ class CodeGraphAnalyzer:
             )
             full_name = f"{enclosing}.{fname}"
             signature = f"def {fname}({args_str})"
-            embedding = embed_function(signature, body, language="ruby")
             insert_params = {
                 "properties": {
                     "name": fname, "full_name": full_name,
@@ -6931,8 +7223,7 @@ class CodeGraphAnalyzer:
                 },
                 "references": {"module": module_uuid},
             }
-            if embedding:
-                insert_params["vector"] = _shape_for_insert(embedding)
+            insert_params["_deferred_embed"] = lambda: embed_function(signature, body, language="ruby")
             self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -6999,7 +7290,6 @@ class CodeGraphAnalyzer:
             body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
             full_name = f"{file_path.stem}.{fname}"
             signature = f"{fname}()"
-            embedding = embed_function(signature, body, language="python")
             insert_params = {
                 "properties": {
                     "name": fname, "full_name": full_name,
@@ -7009,8 +7299,7 @@ class CodeGraphAnalyzer:
                 },
                 "references": {"module": module_uuid},
             }
-            if embedding:
-                insert_params["vector"] = _shape_for_insert(embedding)
+            insert_params["_deferred_embed"] = lambda: embed_function(signature, body, language="python")
             self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -7329,6 +7618,65 @@ class CodeGraphAnalyzer:
                 f"⚠️  module-row invalidation failed for {rel}: {exc}",
                 file=sys.stderr,
             )
+
+    def _prune_deleted_file_objects(
+        self, rel_path: str, canonical_source: str = "",
+    ) -> int:
+        """Delete ALL code-graph objects for a file that vanished from disk.
+
+        v0.2.73 (FIX-B): the end-of-turn batch drain can carry a path that was
+        edited THEN DELETED within the same turn. Single-file mode used to just
+        no-op on a missing file — leaving that file's Module / Function / Class
+        objects behind as orphans (a self-inflicted source for the FIX-C
+        cleanup). Treat a vanished path as a PRUNE instead: delete every object
+        keyed on this file, scoped to this project (+ project_source when the
+        canonical source is known so a same-relative-path file in a different
+        source root can't be swept).
+
+        Scoping mirrors how objects are stamped: CodeModule keys the file on
+        ``path``; CodeFunction / CodeClass key it on ``file_path`` (v0.2.52
+        V52-O.4). CodeAPI / CodeInteraction are not 1:1 file-anchored the same
+        way; they are left alone (the module/function prune removes the bulk,
+        and a later full ``--prune-stale`` reanalyze reconciles the rest —
+        never over-delete on a best-effort per-file prune).
+
+        Returns the number of delete passes that ran (informational). Soft-fail
+        by contract: any delete error logs and continues — a cleanup failure
+        must never wedge the drain (the orphan rows are the pre-fix status quo,
+        not a regression).
+        """
+        if not rel_path:
+            return 0
+        deletes = 0
+        # (collection attr, file-path property name) for the file-anchored
+        # collections. Module uses `path`; Function/Class use `file_path`.
+        targets = [
+            (getattr(self, "modules_collection", None), "path"),
+            (getattr(self, "functions_collection", None), "file_path"),
+            (getattr(self, "classes_collection", None), "file_path"),
+        ]
+        for coll, path_prop in targets:
+            if coll is None:
+                continue
+            try:
+                flt = Filter.by_property(path_prop).equal(rel_path)
+                if self.project_name:
+                    flt = flt & Filter.by_property("project").equal(self.project_name)
+                if canonical_source:
+                    flt = flt & Filter.by_property("project_source").equal(
+                        canonical_source
+                    )
+                coll.data.delete_many(where=flt)
+                deletes += 1
+            except Exception as exc:  # noqa: BLE001 — prune must never wedge drain
+                print(
+                    f"⚠️  deleted-file prune failed for {rel_path} in "
+                    f"{getattr(coll, 'name', '?')}: {exc}",
+                    file=sys.stderr,
+                )
+        if deletes:
+            print(f"   🗑️  pruned objects for deleted file {rel_path}")
+        return deletes
 
     def _get_existing_module(self, path: str, file_hash: str) -> Optional[str]:
         """Check if module already exists with same hash AT THE CURRENT
@@ -8100,7 +8448,6 @@ class CodeGraphAnalyzer:
 
         # Create class - smart truncation for embedding
         # class_body is full source (includes class line + docstring + body)
-        embedding = embed_class(signature, class_body, methods=methods, language="python")
 
         # Extract SCG-style composition edges
         field_types = self._extract_field_types(node)
@@ -8133,8 +8480,7 @@ class CodeGraphAnalyzer:
         }
 
         # Add vector if embedding generation succeeded
-        if embedding:
-            insert_params["vector"] = _shape_for_insert(embedding)
+        insert_params["_deferred_embed"] = lambda: embed_class(signature, class_body, methods=methods, language="python")
 
         # v0.2.16 (bug 0.8): capture the return value into class_uuid.
         # Pre-v0.2.16 the return was discarded and the next line referenced
@@ -8209,7 +8555,6 @@ class CodeGraphAnalyzer:
 
         # Create function - smart truncation for embedding
         # function_body is full source (includes def line + docstring + body)
-        embedding = embed_function(signature, function_body, language="python")
 
         insert_params = {
             "properties": {
@@ -8232,8 +8577,7 @@ class CodeGraphAnalyzer:
         }
 
         # Add vector if embedding generation succeeded
-        if embedding:
-            insert_params["vector"] = _shape_for_insert(embedding)
+        insert_params["_deferred_embed"] = lambda: embed_function(signature, function_body, language="python")
 
         func_uuid = self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
 
@@ -8454,7 +8798,6 @@ exit
                 )
 
             full_name = f"{component_name}.{name}"
-            embedding = embed_function(signature, body, language="javascript")
             insert_params: Dict[str, Any] = {
                 "properties": {
                     "name": name,
@@ -8469,8 +8812,7 @@ exit
                 },
                 "references": {"module": module_uuid},
             }
-            if embedding:
-                insert_params["vector"] = _shape_for_insert(embedding)
+            insert_params["_deferred_embed"] = lambda: embed_function(signature, body, language="javascript")
             self._dedup_insert(
                 self.functions_collection,
                 insert_params,
@@ -8610,7 +8952,6 @@ exit
                 else f"{kind} {scope_prefix}{name}"
             )
             full_name = f"{file_path.stem}.{name}"
-            embedding = embed_function(signature, body, language="python")
             insert_params: Dict[str, Any] = {
                 "properties": {
                     "name": name,
@@ -8625,8 +8966,7 @@ exit
                 },
                 "references": {"module": module_uuid},
             }
-            if embedding:
-                insert_params["vector"] = _shape_for_insert(embedding)
+            insert_params["_deferred_embed"] = lambda: embed_function(signature, body, language="python")
             self._dedup_insert(
                 self.functions_collection,
                 insert_params,
@@ -8816,6 +9156,22 @@ def main():
                             'instead of walking the tree. Used by the per-edit '
                             'hook. Mutually exclusive with --incremental, '
                             '--extra-path, --prune-stale.')
+    # v0.2.73 (FIX-B): batched multi-file mode. The end-of-turn Stop-hook drain
+    # collects ALL of a turn's edited files (grouped by canonical root) and
+    # runs ONE analyzer pass over them instead of one process per edit. Reads
+    # newline-delimited ABSOLUTE paths from <file>; every path must live under
+    # repo_path (same relativization contract as --only-file). Each path routes
+    # through the SAME per-file + per-object skips as --only-file; a path that
+    # vanished from disk (edited-then-deleted in the turn) is PRUNED (its
+    # objects deleted) rather than skipped/errored. All files in one invocation
+    # share ONE --canonical-source (the drain groups by canonical root before
+    # calling). Mutually exclusive with --only-file / --incremental /
+    # --extra-path / --prune-stale.
+    parser.add_argument('--only-files-from', type=Path, default=None,
+                       help='Batched per-turn mode: analyze the newline-'
+                            'delimited absolute paths listed in <file> (all '
+                            'under repo_path), one analyzer pass. Vanished '
+                            'paths are pruned. Used by the Stop-hook drain.')
     # v0.2.66 (Bug 3, part b): canonical source root for worktree dedup. The
     # per-edit hook resolves the edited file's git MAIN repo root and passes
     # it here so a worktree edit stamps the SAME project_source / UUID seed
@@ -8941,7 +9297,18 @@ def main():
     # v0.2.66 (Bug 3): --only-file scopes the analyze to a single file and
     # never walks other roots or prunes. Combining it with the whole-tree
     # flags is a usage error — fail fast rather than silently ignore one.
-    if args.only_file is not None:
+    # v0.2.73 (FIX-B): --only-file and --only-files-from are the two single-/
+    # multi-file scoped modes; they are mutually exclusive with each other AND
+    # with the whole-tree flags.
+    if args.only_file is not None and args.only_files_from is not None:
+        print(
+            "❌ --only-file and --only-files-from are mutually exclusive "
+            "(pick single-file or batched-file mode)",
+            file=sys.stderr,
+        )
+        return 1
+    _scoped_flag = "--only-file" if args.only_file is not None else "--only-files-from"
+    if args.only_file is not None or args.only_files_from is not None:
         conflicting = []
         if args.incremental:
             conflicting.append("--incremental")
@@ -8951,18 +9318,18 @@ def main():
             conflicting.append("--prune-stale")
         if conflicting:
             print(
-                "❌ --only-file is mutually exclusive with "
-                f"{', '.join(conflicting)} (single-file mode never walks "
+                f"❌ {_scoped_flag} is mutually exclusive with "
+                f"{', '.join(conflicting)} (scoped file mode never walks "
                 "other roots or prunes)",
                 file=sys.stderr,
             )
             return 1
     elif args.canonical_source:
-        # --canonical-source only has meaning in single-file mode (it stamps
+        # --canonical-source only has meaning in a scoped file mode (it stamps
         # the per-object project_source / UUID seed). Reject the lone flag so
         # a caller isn't surprised it was silently ignored.
         print(
-            "❌ --canonical-source requires --only-file",
+            "❌ --canonical-source requires --only-file or --only-files-from",
             file=sys.stderr,
         )
         return 1
@@ -9213,8 +9580,10 @@ def main():
             # v0.2.66 (Bug 3): single-file scope for the per-edit hook.
             # None (the default) preserves the whole-tree walk.
             only_file=args.only_file,
+            # v0.2.73 (FIX-B): batched multi-file scope for the Stop-hook drain.
+            only_files_from=args.only_files_from,
             # v0.2.66 (Bug 3, part b): canonical source root for worktree
-            # dedup (only honoured alongside only_file).
+            # dedup (honoured alongside only_file OR only_files_from).
             canonical_source=args.canonical_source,
         )
 

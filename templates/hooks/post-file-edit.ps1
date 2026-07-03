@@ -586,49 +586,32 @@ if ($EditedFile.StartsWith($DiagramsDir, [StringComparison]::OrdinalIgnoreCase) 
 # re-introduce a hardcoded literal in this position.
 if ($EditedFile -match '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$') {
     $bn = Split-Path $EditedFile -Leaf
-    $cgIncPs1 = Join-Path $ScriptDir "code-graph-incremental.ps1"
-    if (Test-Path $cgIncPs1) {
-        $codeGraphPrefix = ""
-        $resolverPs1 = Join-Path $ProjectRoot ".claude/scripts/vct_project_config.ps1"
-        if (Test-Path $resolverPs1) {
-            try {
-                $codeGraphPrefix = (& $PsExe -NoProfile -File $resolverPs1 `
-                    -Project $ProjectRoot -Field code_graph_collection_prefix 2>$null) -as [string]
-                if ($null -eq $codeGraphPrefix) { $codeGraphPrefix = "" }
-                $codeGraphPrefix = $codeGraphPrefix.Trim()
-            } catch { $codeGraphPrefix = "" }
-        }
-        if (-not $codeGraphPrefix) {
-            $codeGraphPrefix = if ($env:CODE_GRAPH_PROJECT) { $env:CODE_GRAPH_PROJECT } `
-                elseif ($env:PROJECT_NAME) { $env:PROJECT_NAME } `
-                else { Split-Path $ProjectRoot -Leaf }
-        }
-        # 2026-06-18: debounced. code-graph-incremental.(ps1|sh) runs the
-        # analyzer per-edit with NO internal debounce, so each edit was a
-        # separate Weaviate upsert. Coalescing rapid re-edits of the SAME
-        # file is safe: the analyzer re-reads the file from disk at run
-        # time, so the deferred run indexes the latest content. Code-graph
-        # writes are not access-matrix gated, so no gate wraps this one.
-        $psEscCg = $PsExe -replace "'", "''"
-        $cgEsc = $cgIncPs1 -replace "'", "''"
-        $efEscCg = $EditedFile -replace "'", "''"
-        $prEsc = $ProjectRoot -replace "'", "''"
-        $cgpEsc = $codeGraphPrefix -replace "'", "''"
-        $cgSyncExpr = "& '$psEscCg' -NoProfile -File '$cgEsc' '$efEscCg' '$prEsc' '$cgpEsc' *> `$null"
-        Invoke-KgDebounceSchedule -ProjectRoot $ProjectRoot -FilePath $EditedFile -WorkingDir $ProjectRoot -Command $cgSyncExpr -Channel "code"
-    }
-    # v0.2.72 P6: reminder AGGREGATION (MUST MATCH post-file-edit.sh). Instead
-    # of emitting a per-Edit "was just edited" nudge (~15x/turn), APPEND the
-    # edited path to a per-turn accumulator; the Stop hook drains it once at
-    # end-of-turn. Soft-fail: unkeyable session / write error just skips.
+    # v0.2.73 (FIX-B, MUST MATCH post-file-edit.sh): the per-EDIT code-graph
+    # sync is REMOVED. It used to Invoke-KgDebounceSchedule a
+    # code-graph-incremental.ps1 run on every edit; each run hit the big
+    # CodeFunction collection's insert-time churn, and parallel worktrees
+    # multiplied it into the measured Weaviate disk write-amplification.
+    # Instead, the edited path is appended to a per-turn drain queue below and
+    # drained ONCE at end-of-turn (stop-codegraph-drain.ps1) over ALL the
+    # turn's files in one analyzer pass, rate-limited to once per 120s per
+    # project. KG/docs debounce paths are UNCHANGED (this fix targets the CODE
+    # path only, the amplifier).
+    # v0.2.72 P6 + v0.2.73 FIX-B: append the edited path to BOTH the reminder
+    # accumulator (drained + cleared EVERY turn by stop-codegraph-reminder.ps1)
+    # AND the code-graph drain queue (drained by the rate-limited
+    # stop-codegraph-drain.ps1, which persists the union across rate-limited
+    # turns). Distinct files avoid a two-consumer race. Soft-fail: unkeyable
+    # session / write error just skips.
     if ($SessionIdFromStdin) {
         $stateDir = Join-Path (Join-Path $ProjectRoot ".claude") "state"
-        $accum = Join-Path $stateDir ("edit_reminder_{0}.txt" -f $SessionIdFromStdin)
         try {
             if (-not (Test-Path -LiteralPath $stateDir)) {
                 New-Item -ItemType Directory -Path $stateDir -Force -ErrorAction Stop | Out-Null
             }
+            $accum = Join-Path $stateDir ("edit_reminder_{0}.txt" -f $SessionIdFromStdin)
             Add-Content -LiteralPath $accum -Value $EditedFile -ErrorAction Stop
+            $cgQueue = Join-Path $stateDir ("codegraph_drain_{0}.txt" -f $SessionIdFromStdin)
+            Add-Content -LiteralPath $cgQueue -Value $EditedFile -ErrorAction SilentlyContinue
         } catch { }
     }
 }

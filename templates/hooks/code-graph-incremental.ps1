@@ -168,36 +168,10 @@ if ($EditedFile -match '[\\/]\.claude[\\/]state[\\/]') {
 # the Weaviate-compaction disk-write peaks. We keep $RepoPath as the on-disk
 # root (so the analyzer relativizes the REAL file) but pass the canonical MAIN
 # root via --canonical-source so the object converges on ONE canonical row.
-function Get-CanonicalRepoRoot {
-    param([string]$File)
-    $dir = Split-Path -Parent $File
-    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return "" }
-    # --git-common-dir resolves a linked worktree's shared .git to the MAIN
-    # repo's .git (same for the main checkout). --path-format=absolute
-    # (git >= 2.31) makes the relative ".git" of a main checkout absolute;
-    # older git falls back to resolving the bare value against $dir.
-    $common = (& git -C $dir rev-parse --path-format=absolute --git-common-dir 2>$null)
-    if (-not $common) {
-        $common = (& git -C $dir rev-parse --git-common-dir 2>$null)
-        if (-not $common) { return "" }
-        if (-not ([System.IO.Path]::IsPathRooted($common))) {
-            $common = Join-Path $dir $common
-        }
-    }
-    # Strip a trailing "/.git" (or "\.git") -> main repo root.
-    $root = $common.TrimEnd('/', '\')
-    if ($root.EndsWith("/.git") -or $root.EndsWith("\.git")) {
-        $root = Split-Path -Parent $root
-    }
-    if (-not (Test-Path -PathType Container $root)) { return "" }
-    # NIT (Bug 3): NORMALIZE to an absolute path (mirror the .sh `cd && pwd -P`)
-    # so the older-git fallback's possibly-unnormalized value matches the
-    # main-checkout's normalized value (else the stamped roots wouldn't match
-    # and the UUIDs wouldn't converge). Resolve-Path canonicalizes + collapses
-    # `..` segments; fall back to the raw root if it somehow can't resolve.
-    try { $root = (Resolve-Path -LiteralPath $root).Path } catch { }
-    return $root
-}
+# v0.2.73 (FIX-B): Get-CanonicalRepoRoot lives in the shared lib
+# _lib/canonical-repo-root.ps1 so the end-of-turn batched drain
+# (stop-codegraph-drain.ps1) reuses the EXACT SAME resolver — one copy, no fork.
+. "$PSScriptRoot/_lib/canonical-repo-root.ps1"
 
 $CanonRoot = Get-CanonicalRepoRoot -File $EditedFile
 if (-not $CanonRoot) {
@@ -229,6 +203,24 @@ if (-not $CanonRoot) {
 # their parent $ProjectName. MUST MATCH the .sh sibling.
 if (-not $ExtrasMatched -and $CanonRoot -ne $RepoPath) {
     $ProjectName = Resolve-CodegraphProject -Root $CanonRoot
+}
+
+# ── v0.2.73 FIX-A': skip indexing for EPHEMERAL/unregistered worktree edits ──
+# Parallel-subagent worktree edits drive the Weaviate disk write-amplification;
+# skip them UNLESS the worktree's canonical main root is a registered launcher
+# project (else a bare-repo/worktree-PRIMARY user loses all indexing). Extras
+# keep their parent project, so this never fires for the extras case.
+# CONSERVATIVE: skip ONLY on a definitive "not registered" probe.
+# MUST MATCH the .sh sibling.
+if (-not $ExtrasMatched) {
+    $wtGate = Join-Path $PSScriptRoot "_lib/worktree-gate.ps1"
+    if (Test-Path -LiteralPath $wtGate) {
+        . $wtGate
+        if (Test-EphemeralWorktreeEdit -EditedFile $EditedFile -RepoPath $RepoPath -CanonRoot $CanonRoot) {
+            [Console]::Error.WriteLine("code-graph: skipped worktree edit (ephemeral/unregistered) $EditedFile")
+            exit 0
+        }
+    }
 }
 
 # Resolve Python: prefer venv, fallback system.

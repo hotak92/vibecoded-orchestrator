@@ -162,14 +162,24 @@ def test_pretooluse_has_read_and_grep_codegraph_branches() -> None:
 
 
 def test_post_file_edit_resync_fires_on_code_edit() -> None:
-    """Surface 3 (resync): post-file-edit.sh must schedule a 'code' debounce
-    using the code_graph_collection_prefix (verify-only — was correct since
-    v0.2.23)."""
-    body = (HOOKS / "post-file-edit.sh").read_text(encoding="utf-8")
-    assert "code_graph_collection_prefix" in body, (
-        "post-file-edit.sh must resolve the codegraph prefix for resync"
+    """Surface 3 (resync): v0.2.73 (FIX-B) moved the per-edit 'code' debounce to
+    the END-OF-TURN batched drain. post-file-edit.sh now only APPENDS each code
+    edit to the drain queue; the drain (stop-codegraph-drain.sh) resolves the
+    code_graph_collection_prefix per canonical root and runs the analyzer batch.
+    """
+    pfe = (HOOKS / "post-file-edit.sh").read_text(encoding="utf-8")
+    # post-file-edit appends code edits to the drain queue (the new resync feed).
+    assert "codegraph_drain_" in pfe, (
+        "post-file-edit.sh must append code edits to the codegraph drain queue"
     )
-    assert '"code"' in body, "post-file-edit.sh must schedule a 'code' debounce kind"
+    # The DRAIN now owns the prefix resolution for the code-graph write target.
+    drain = (HOOKS / "stop-codegraph-drain.sh").read_text(encoding="utf-8")
+    assert "code_graph_collection_prefix" in drain, (
+        "stop-codegraph-drain.sh must resolve the codegraph prefix for the batch"
+    )
+    assert "--only-files-from" in drain, (
+        "the drain must run the analyzer in batched multi-file mode"
+    )
 
 
 # --------------------------------------------------------------------------
