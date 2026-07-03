@@ -729,6 +729,127 @@ pub fn is_secret_active_cross_launcher_for_requester(
     true
 }
 
+/// v0.2.73 (E-user-secret-404): resolve every ACTIVE user-declared secret
+/// `(KEY, VALUE)` pair for a project, honoring a specific REQUESTER's
+/// per-(secret × requester) pause state. Used by the hub's
+/// `project_env` resolver — the 4th resolution loop that serves
+/// GUI/keychain-backed user secrets (pre-fix the hub only resolved
+/// installed-module, orchestrator-bundled, and granted secrets, so every
+/// user-saved key 404'd `key_not_active` on the sanctioned path).
+///
+/// Enumeration source is `secret_active_state` via the three bucket
+/// enumerators above — NOT `project_secret_refs`: the GUI bridge writes a
+/// ref row only for per-project scope (shared/global user keys have ZERO
+/// ref rows), and `project_secret_refs.is_set` is display metadata that
+/// must never be load-bearing for resolution.
+///
+/// Bucket table (must match `resolve_user_secret_state` in
+/// `launcher/src-tauri/src/commands/project_env_settings.rs`, which drives
+/// the env-writer's EMIT/STRIP sets from the same enumerators — keep the
+/// scope-string / slot / keychain-scope mapping identical in both):
+///
+/// | bucket      | scope_str     | slot project_id  | keychain scope                |
+/// |-------------|---------------|------------------|-------------------------------|
+/// | per-project | `per_project` | `<project_id>`   | `PerProject { project_id }`   |
+/// | shared      | `shared`      | `_user_shared_`  | `Shared { "_user_shared_" }`  |
+/// | global      | `global`      | `_global_`       | `Global`                      |
+///
+/// Semantics:
+///   * Bucket order per_project → shared → global, first-wins on key
+///     collisions (matches the SecretsPanel read-time resolution).
+///   * Each key is gated on
+///     `is_secret_active_cross_launcher_for_requester(..., "user", key,
+///     requester_project_id)` — per-project rows carry a literal requester
+///     id, shared/global rows carry the `*` sentinel; a shared/global key
+///     paused for THIS requester does NOT resolve.
+///   * Values come from the OS keychain (`crate::secrets::get`); missing
+///     or whitespace-only values are skipped (matches the hub bundled
+///     loop's `!val.trim().is_empty()` discipline) — file-store-only keys
+///     correctly stay unresolved here and fall to the resolvers' tier 2.
+///   * Soft-fail: DB/keychain hiccups skip the key, never error.
+///
+/// Never logs or returns anything beyond the (key, value) pairs — callers
+/// own the transport (the hub serves them over the bearer-token socket;
+/// no file write anywhere).
+pub fn resolve_active_user_secret_pairs_for_requester(
+    own_db: &Db,
+    project_id: &str,
+    requester_project_id: &str,
+) -> Vec<(String, String)> {
+    fn resolve_one_bucket(
+        own_db: &Db,
+        keys: &[String],
+        scope_str: &str,
+        slot_project_id: &str,
+        requester_project_id: &str,
+        out: &mut Vec<(String, String)>,
+    ) {
+        for key in keys {
+            // First-bucket-wins on collisions.
+            if out.iter().any(|(k, _)| k == key) {
+                continue;
+            }
+            let active = is_secret_active_cross_launcher_for_requester(
+                own_db,
+                scope_str,
+                slot_project_id,
+                "user",
+                key,
+                requester_project_id,
+            );
+            if !active {
+                continue;
+            }
+            let scope = match scope_str {
+                "global" => crate::secrets::SecretScope::Global,
+                "shared" => crate::secrets::SecretScope::Shared {
+                    project_id: slot_project_id,
+                },
+                _ => crate::secrets::SecretScope::PerProject {
+                    project_id: slot_project_id,
+                },
+            };
+            if let Ok(Some(val)) = crate::secrets::get(scope, "user", key) {
+                if !val.trim().is_empty() {
+                    out.push((key.clone(), val));
+                }
+            }
+        }
+    }
+
+    let per_project_keys = own_db.list_user_secret_keys_for_project(project_id);
+    let shared_keys = own_db.list_shared_user_secret_keys();
+    let global_keys = own_db.list_global_user_secret_keys();
+
+    let mut out: Vec<(String, String)> =
+        Vec::with_capacity(per_project_keys.len() + shared_keys.len() + global_keys.len());
+    resolve_one_bucket(
+        own_db,
+        &per_project_keys,
+        "per_project",
+        project_id,
+        requester_project_id,
+        &mut out,
+    );
+    resolve_one_bucket(
+        own_db,
+        &shared_keys,
+        "shared",
+        "_user_shared_",
+        requester_project_id,
+        &mut out,
+    );
+    resolve_one_bucket(
+        own_db,
+        &global_keys,
+        "global",
+        "_global_",
+        requester_project_id,
+        &mut out,
+    );
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1313,6 +1434,167 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ─── v0.2.73: resolve_active_user_secret_pairs_for_requester ───────
+
+    /// Per-project user key: active row + keychain value → resolved.
+    /// A key paused FOR THIS REQUESTER must NOT resolve (the
+    /// permission-matrix gate), even though the keychain holds a value.
+    #[test]
+    fn user_pairs_resolver_honors_requester_pause() {
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let db = Db::open_in_memory().unwrap();
+        let proj = "proj-user-pairs-1";
+
+        crate::secrets::set(
+            crate::secrets::SecretScope::PerProject { project_id: proj },
+            "user",
+            "EXAMPLE_API_TOKEN",
+            "synthetic-not-a-real-secret",
+        )
+        .unwrap();
+        db.mark_secret_active("per_project", proj, "user", "EXAMPLE_API_TOKEN")
+            .unwrap();
+
+        let pairs = resolve_active_user_secret_pairs_for_requester(&db, proj, proj);
+        assert_eq!(
+            pairs,
+            vec![(
+                "EXAMPLE_API_TOKEN".to_string(),
+                "synthetic-not-a-real-secret".to_string()
+            )]
+        );
+
+        // Pause for this requester → gone from resolution.
+        db.mark_secret_inactive_for_requester("per_project", proj, "user", "EXAMPLE_API_TOKEN", proj)
+            .unwrap();
+        let pairs = resolve_active_user_secret_pairs_for_requester(&db, proj, proj);
+        assert!(
+            pairs.is_empty(),
+            "key paused for the requester must not resolve: {:?}",
+            pairs.iter().map(|(k, _)| k).collect::<Vec<_>>()
+        );
+    }
+
+    /// REGRESSION PIN (E-user-secret-404 refinement 1): a SHARED user key
+    /// with an active-state row and NO `project_secret_refs` row must
+    /// still resolve. A `project_secret_refs`-keyed implementation passes
+    /// the per-project case and silently misses every shared/global user
+    /// key (the GUI bridge writes ref rows only for per-project scope).
+    #[test]
+    fn user_pairs_resolver_serves_shared_key_with_no_ref_row() {
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let db = Db::open_in_memory().unwrap();
+        let proj = "proj-user-pairs-2";
+
+        crate::secrets::set(
+            crate::secrets::SecretScope::Shared {
+                project_id: "_user_shared_",
+            },
+            "user",
+            "EXAMPLE_SHARED_TOKEN",
+            "synthetic-shared-value",
+        )
+        .unwrap();
+        // Writes the `*`-requester row, exactly like `mark_secret_active`
+        // from the SecretsPanel "Shared (this user)" tab.
+        db.mark_secret_active("shared", "_user_shared_", "user", "EXAMPLE_SHARED_TOKEN")
+            .unwrap();
+
+        // The pin: there is NO project_secret_refs row for this key.
+        let guard = db.lock();
+        let n_refs: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM project_secret_refs WHERE secret_key = 'EXAMPLE_SHARED_TOKEN'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(guard);
+        assert_eq!(n_refs, 0, "test precondition: no ref row may exist");
+
+        let pairs = resolve_active_user_secret_pairs_for_requester(&db, proj, proj);
+        assert_eq!(
+            pairs,
+            vec![(
+                "EXAMPLE_SHARED_TOKEN".to_string(),
+                "synthetic-shared-value".to_string()
+            )],
+            "shared user key with zero ref rows must resolve via secret_active_state"
+        );
+
+        // And the per-requester pause on the SHARED row gates it for
+        // this project only.
+        db.mark_secret_inactive_for_requester(
+            "shared",
+            "_user_shared_",
+            "user",
+            "EXAMPLE_SHARED_TOKEN",
+            proj,
+        )
+        .unwrap();
+        assert!(
+            resolve_active_user_secret_pairs_for_requester(&db, proj, proj).is_empty(),
+            "shared key paused for this requester must not resolve"
+        );
+        assert_eq!(
+            resolve_active_user_secret_pairs_for_requester(&db, "other-proj", "other-proj").len(),
+            1,
+            "the pause is per-requester: other projects still resolve the shared key"
+        );
+    }
+
+    /// Bucket precedence: per-project beats shared on key collision, and
+    /// whitespace-only keychain values are skipped.
+    #[test]
+    fn user_pairs_resolver_per_project_wins_and_skips_blank_values() {
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let db = Db::open_in_memory().unwrap();
+        let proj = "proj-user-pairs-3";
+
+        // Same key in both buckets — per-project must win.
+        crate::secrets::set(
+            crate::secrets::SecretScope::PerProject { project_id: proj },
+            "user",
+            "EXAMPLE_COLLIDING_KEY",
+            "per-project-value",
+        )
+        .unwrap();
+        crate::secrets::set(
+            crate::secrets::SecretScope::Shared {
+                project_id: "_user_shared_",
+            },
+            "user",
+            "EXAMPLE_COLLIDING_KEY",
+            "shared-value",
+        )
+        .unwrap();
+        db.mark_secret_active("per_project", proj, "user", "EXAMPLE_COLLIDING_KEY")
+            .unwrap();
+        db.mark_secret_active("shared", "_user_shared_", "user", "EXAMPLE_COLLIDING_KEY")
+            .unwrap();
+
+        // Blank value → skipped entirely.
+        crate::secrets::set(
+            crate::secrets::SecretScope::PerProject { project_id: proj },
+            "user",
+            "EXAMPLE_BLANK_KEY",
+            "   ",
+        )
+        .unwrap();
+        db.mark_secret_active("per_project", proj, "user", "EXAMPLE_BLANK_KEY")
+            .unwrap();
+
+        let pairs = resolve_active_user_secret_pairs_for_requester(&db, proj, proj);
+        assert_eq!(
+            pairs,
+            vec![(
+                "EXAMPLE_COLLIDING_KEY".to_string(),
+                "per-project-value".to_string()
+            )],
+            "per-project bucket wins the collision; blank value is skipped"
+        );
     }
 
     /// Per-project secret canonical row maps to the owner literally

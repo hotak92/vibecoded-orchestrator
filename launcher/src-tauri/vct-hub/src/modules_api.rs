@@ -638,6 +638,50 @@ async fn project_env(
         }
     }
 
+    // v0.2.73 (E-user-secret-404): 4th resolution loop — the project's own
+    // USER-declared secrets (SecretsPanel / per-project SecretsTab,
+    // `module_id='user'`). Pre-fix the hub built `env` from exactly three
+    // sources (installed modules, orchestrator-bundled, cross-project
+    // grants), so EVERY user-saved key — per-project, shared, and global —
+    // structurally missed the dict and `?key=` returned 404
+    // `key_not_active` even with an active row + keychain value present.
+    //
+    // Enumeration + gating live in
+    // `vct_launcher_core::db::secret_active::resolve_active_user_secret_pairs_for_requester`
+    // (one concern, one home — the env-file writer's
+    // `resolve_user_secret_state` mirrors the same bucket table). Key
+    // properties relied on here:
+    //   * enumerates `secret_active_state`, NOT `project_secret_refs`
+    //     (shared/global user keys have zero ref rows — refinement 1 of
+    //     the finding);
+    //   * permission-matrix gate: each key passes
+    //     `is_secret_active_cross_launcher_for_requester` with THIS
+    //     project as the requester, so a shared/global key paused for
+    //     this project does not resolve;
+    //   * bucket order per_project → shared → global, first-wins.
+    //
+    // Position: AFTER the bundled loop (installed-module + bundled
+    // declarations keep winning via the `env.contains_key` first-wins
+    // guard) and BEFORE the grants loop (the owner's own explicitly-saved
+    // secret beats another project's granted same-named key).
+    //
+    // Scope note: this serves GUI/keychain-backed user secrets only.
+    // File-store-only keys (`vct set`) still 404 here — correctly, per
+    // keychain-source semantics — and resolve via tier 2 of the resolver
+    // chain in `vct_secrets_resolve.sh|.ps1` / `agent_secrets.py`.
+    for (key, val) in
+        vct_launcher_core::db::secret_active::resolve_active_user_secret_pairs_for_requester(
+            &h.0,
+            &project.id,
+            &project.id,
+        )
+    {
+        if env.contains_key(&key) {
+            continue;
+        }
+        env.insert(key, serde_json::Value::String(val));
+    }
+
     // 0.2.1: cross-project grants resolution (migration 009 § secret_grants).
     //
     // Walk every grant where this project is the GRANTEE — i.e. another
@@ -1612,6 +1656,156 @@ mod tests {
         assert_eq!(
             body.get("github_pat").and_then(|v| v.as_str()),
             Some(canary.as_str())
+        );
+    }
+
+    // ─── v0.2.73 (E-user-secret-404): user-declared secrets via /env ────
+    //
+    // Pre-fix, `project_env` built its dict from exactly three sources
+    // (installed modules, orchestrator-bundled, cross-project grants) —
+    // user-saved secrets were structurally absent and every `?key=` for
+    // them returned 404 `key_not_active` even with `active=1` + a
+    // keychain value present. These tests pin the 4th loop end-to-end
+    // over real HTTP, using the thread-local mock keychain
+    // (`secrets::for_tests`) — valid because `#[tokio::test]` runs on the
+    // current-thread runtime, so the axum handler executes on the same
+    // thread that enabled the mock. Fixtures are synthetic (no real key
+    // names, no real values).
+
+    /// A per-project user key (active row + keychain value) resolves
+    /// through `GET /env?key=` — the sanctioned agent path.
+    #[tokio::test]
+    async fn hub_env_serves_per_project_user_secret() {
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "u-proj-1", "User Secret Project", "/tmp/u-proj-1");
+
+        vct_launcher_core::secrets::set(
+            vct_launcher_core::secrets::SecretScope::PerProject { project_id: "u-proj-1" },
+            "user",
+            "EXAMPLE_API_TOKEN",
+            "synthetic-not-a-real-secret",
+        )
+        .unwrap();
+        // Same rows `set_secret_v2` writes: active flag on the
+        // per-project user bucket.
+        h.0.mark_secret_active("per_project", "u-proj-1", "user", "EXAMPLE_API_TOKEN")
+            .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/u-proj-1/env?key=EXAMPLE_API_TOKEN", base))
+            .await
+            .expect("hub reachable");
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            status, 200,
+            "user per-project secret must resolve via /env?key=; body: {}",
+            body
+        );
+        assert_eq!(
+            body.get("EXAMPLE_API_TOKEN").and_then(|v| v.as_str()),
+            Some("synthetic-not-a-real-secret")
+        );
+    }
+
+    /// PERMISSION-MATRIX GATE: the same key paused FOR THIS REQUESTER
+    /// returns 404 `key_not_active` — the keychain value must not leak
+    /// past the per-(secret × requester) active flag.
+    #[tokio::test]
+    async fn hub_env_honours_requester_pause_on_user_secret() {
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "u-proj-2", "User Pause Project", "/tmp/u-proj-2");
+
+        vct_launcher_core::secrets::set(
+            vct_launcher_core::secrets::SecretScope::PerProject { project_id: "u-proj-2" },
+            "user",
+            "EXAMPLE_API_TOKEN",
+            "synthetic-not-a-real-secret",
+        )
+        .unwrap();
+        // Paused for this project as the requester.
+        h.0.mark_secret_inactive_for_requester(
+            "per_project",
+            "u-proj-2",
+            "user",
+            "EXAMPLE_API_TOKEN",
+            "u-proj-2",
+        )
+        .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/u-proj-2/env?key=EXAMPLE_API_TOKEN", base))
+            .await
+            .expect("hub reachable");
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            status, 404,
+            "paused user secret leaked through the hub: body: {}",
+            body
+        );
+        assert_eq!(
+            body.get("error").and_then(|e| e.get("code")).and_then(|v| v.as_str()),
+            Some("key_not_active")
+        );
+        // The value string must appear nowhere in the error body.
+        assert!(
+            !body.to_string().contains("synthetic-not-a-real-secret"),
+            "error envelope must never echo the secret value"
+        );
+    }
+
+    /// REGRESSION PIN (refinement 1): a SHARED user key with an
+    /// active-state row and ZERO `project_secret_refs` rows still
+    /// resolves. A `project_secret_refs`-keyed implementation passes the
+    /// per-project test above and silently misses this case (the GUI
+    /// bridge writes ref rows only for per-project scope).
+    #[tokio::test]
+    async fn hub_env_serves_shared_user_secret_with_no_ref_row() {
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "u-proj-3", "Shared User Secret Project", "/tmp/u-proj-3");
+
+        vct_launcher_core::secrets::set(
+            vct_launcher_core::secrets::SecretScope::Shared { project_id: "_user_shared_" },
+            "user",
+            "EXAMPLE_SHARED_TOKEN",
+            "synthetic-shared-value",
+        )
+        .unwrap();
+        // Writes the `*`-requester row — exactly what the SecretsPanel
+        // "Shared (this user)" tab does. NO project_secret_refs row is
+        // written for shared scope (the pin).
+        h.0.mark_secret_active("shared", "_user_shared_", "user", "EXAMPLE_SHARED_TOKEN")
+            .unwrap();
+        {
+            let guard = h.0.lock();
+            let n_refs: i64 = guard
+                .query_row(
+                    "SELECT COUNT(*) FROM project_secret_refs WHERE secret_key = 'EXAMPLE_SHARED_TOKEN'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n_refs, 0, "test precondition: zero ref rows for the shared key");
+        }
+
+        let resp = reqwest::get(format!(
+            "{}/projects/u-proj-3/env?key=EXAMPLE_SHARED_TOKEN",
+            base
+        ))
+        .await
+        .expect("hub reachable");
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            status, 200,
+            "shared user key with zero ref rows must resolve via secret_active_state; body: {}",
+            body
+        );
+        assert_eq!(
+            body.get("EXAMPLE_SHARED_TOKEN").and_then(|v| v.as_str()),
+            Some("synthetic-shared-value")
         );
     }
 }
