@@ -9513,6 +9513,15 @@ def _find_lean_ctx_binary() -> str | None:
             / "lean-ctx" / "lean-ctx.exe",
         ]
     else:
+        # D-11 (v0.2.73) CANONICAL POSIX candidate order. MUST MATCH the
+        # fallback probe list in ``templates/hooks/lean-ctx-rewrite.sh``
+        # (its `command -v lean-ctx` PATH check falls through to THESE same
+        # paths, in this order). The two used to disagree — install could
+        # conclude "installed" for a ``~/.cargo/bin`` binary that the
+        # hook-shell PATH lacked, so compression silently never activated.
+        # Keep the two lists identical; if you add/remove a path here, mirror
+        # it in the hook (and vice-versa). Mirror-don't-fork (CLAUDE.md names
+        # binary-discovery order as the canonical example).
         candidates = [
             home / ".cargo" / "bin" / "lean-ctx",
             home / ".local" / "bin" / "lean-ctx",
