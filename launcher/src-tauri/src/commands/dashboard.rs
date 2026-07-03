@@ -255,6 +255,9 @@ pub async fn toggle_mcp_server(mcp_id: String, enabled: bool, db: State<'_, Db>)
 /// so unit tests don't need a managed `State<Db>`.
 async fn toggle_mcp_server_inner(mcp_id: String, enabled: bool, tier: &str) -> Result<Vec<McpServerConfig>, String> {
     let mut config = load_config();
+    // Cloned up front: composing the canonical bundled entry below needs
+    // the install path while `server` mutably borrows `config`.
+    let install_path = config.install_path.clone();
 
     let server = config.mcp_servers.iter_mut()
         .find(|s| s.id == mcp_id)
@@ -270,7 +273,40 @@ async fn toggle_mcp_server_inner(mcp_id: String, enabled: bool, tier: &str) -> R
 
     server.enabled = enabled;
     // Snapshot the entry shape for ~/.claude.json BEFORE we drop the &mut.
-    let entry = mcp_server_to_claude_entry(server);
+    //
+    // F-2 (v0.2.73): bundled MCP ids MUST be re-registered with the
+    // CANONICAL entry from `build_default_mcp_entries` (absolute
+    // venv-python / real wrapper module args / filtered env) — NOT the
+    // GUI-catalog shape from `mcp_server_to_claude_entry`. The catalog's
+    // command fields are display stubs (relative .py path for
+    // weaviate-kg, bare `python` for the diagram wrappers, empty env):
+    // writing them into ~/.claude.json produced an entry Claude Code
+    // could not spawn, so a disable→enable cycle permanently broke the
+    // MCP until the next `install.py --update` rewrote it. The catalog
+    // shape remains correct for user-added custom MCPs (the user
+    // supplied a real command at add time).
+    //
+    // Conservative arm: if the id is bundled but the canonical entry
+    // cannot be composed (no venv-python under install_path), the whole
+    // toggle FAILS before any state is persisted — surfacing the broken
+    // install beats silently writing a broken entry.
+    let entry = if enabled {
+        match crate::mcp_registration::default_entry_for_bundled_mcp(
+            std::path::Path::new(&install_path),
+            &mcp_id,
+            // Canonical default ports — same posture as
+            // `maintenance.rs::rerun_mcp_registration`: re-registration
+            // paths don't re-read user-overridden ports from app_state
+            // today (see the comment there).
+            crate::mcp_registration::ServicePorts::default(),
+        )? {
+            Some((canonical, _dropped)) => canonical,
+            None => mcp_server_to_claude_entry(server),
+        }
+    } else {
+        // Disable never registers an entry; placeholder is unused.
+        serde_json::Value::Null
+    };
     save_config(&config).await?;
 
     // Mirror the toggle into ~/.claude.json so Claude Code actually
@@ -736,6 +772,54 @@ mod tests {
         path
     }
 
+    /// F-2: build a minimal pseudo install root (fake venv-python + MCP
+    /// server dirs) under `base` so `default_entry_for_bundled_mcp` can
+    /// compose canonical entries. Mirrors the fixture in
+    /// `mcp_registration::tests::make_pseudo_install_root` (cfg(test)
+    /// items aren't shareable across modules).
+    fn make_pseudo_install_root(base: &std::path::Path) -> std::path::PathBuf {
+        let root = base.join("pseudo-install");
+        let (sub, py) = if cfg!(target_os = "windows") {
+            ("Scripts", "python.exe")
+        } else {
+            ("bin", "python")
+        };
+        let venv_bin = root.join(".venv").join(sub);
+        std::fs::create_dir_all(&venv_bin).unwrap();
+        std::fs::write(venv_bin.join(py), b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = venv_bin.join(py);
+            let mut perms = std::fs::metadata(&p).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&p, perms).unwrap();
+        }
+        std::fs::create_dir_all(root.join("claude_mcp_servers/weaviate_mcp")).unwrap();
+        std::fs::create_dir_all(root.join("claude_mcp_servers/search_mcp")).unwrap();
+        #[cfg(not(target_os = "windows"))]
+        std::fs::write(
+            root.join("claude_mcp_servers/search_mcp/wrapper.sh"),
+            b"#!/usr/bin/env bash\nexit 0\n",
+        )
+        .unwrap();
+        root
+    }
+
+    /// Seed a default config whose `install_path` points at a pseudo
+    /// install root, so bundled toggle-ON can compose canonical entries.
+    fn seed_config_with_install_root(
+        state_dir: &std::path::Path,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        std::fs::create_dir_all(state_dir).unwrap();
+        let install_root = make_pseudo_install_root(state_dir);
+        let mut config = OrchestratorConfig::default();
+        config.install_path = install_root.display().to_string();
+        let path = state_dir.join("orchestrator.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+        (path, install_root)
+    }
+
     fn read_claude_json(home: &std::path::Path) -> serde_json::Value {
         let p = home.join(".claude.json");
         if !p.exists() {
@@ -944,17 +1028,23 @@ mod tests {
     }
 
     /// Inverse of the off-case: toggle on must register the entry back
-    /// into ~/.claude.json with the canonical {type, command, args, env}
-    /// shape so Claude Code starts spawning it.
+    /// into ~/.claude.json with the CANONICAL builder shape (F-2,
+    /// v0.2.73) so Claude Code can actually spawn it.
     ///
     /// (v0.2.5: previously used `code-embed`. v0.2.11: was `ollama`; now
     /// uses `search` after Ollama MCP was removed from the default install.
     /// Exercise the toggle-on path by first flipping `search` off in the
     /// seeded config and then toggling it back on.)
+    ///
+    /// F-2 regression (was audit finding F-2, green-tested pre-fix): the
+    /// old assertions only checked field PRESENCE, so the GUI-catalog
+    /// stub (`command: "claude_mcp_servers/search_mcp/server.py"`,
+    /// relative, no interpreter) passed. Now we assert the command is an
+    /// ABSOLUTE path that EXISTS on disk — the runnable canonical shape.
     #[test]
-    fn test_toggle_mcp_server_on_re_registers_in_claude_json() {
+    fn test_toggle_mcp_server_on_re_registers_canonical_entry_in_claude_json() {
         let (home, _guard) = setup_temp_env();
-        let cfg_path = seed_default_config(&home);
+        let (cfg_path, install_root) = seed_config_with_install_root(&home);
 
         // Flip `search` to disabled in the seeded config so the toggle-on
         // call has something disabled to enable.
@@ -980,24 +1070,123 @@ mod tests {
             "expected `search` registered in ~/.claude.json mcpServers, got: {}",
             cj["mcpServers"]
         );
-        // Canonical shape ({type:stdio, command, args, env}) — same as
-        // `mcp_server_to_claude_entry` produces.
         assert_eq!(entry["type"], "stdio");
+        // The command must be the canonical, RUNNABLE one — absolute and
+        // existing on disk (wrapper.sh on Unix, venv python.exe on
+        // Windows) — never the catalog's relative display stub.
+        let cmd = entry["command"].as_str().expect("command is a string");
         assert!(
-            entry.get("command").is_some(),
-            "missing command field: {}",
-            entry
+            std::path::Path::new(cmd).is_absolute(),
+            "canonical command must be absolute, got catalog stub? {}",
+            cmd
         );
         assert!(
-            entry.get("args").is_some(),
-            "missing args field: {}",
-            entry
+            std::path::Path::new(cmd).exists(),
+            "canonical command must exist on disk: {}",
+            cmd
         );
         assert!(
-            entry.get("env").is_some(),
-            "missing env field: {}",
-            entry
+            cmd.starts_with(&install_root.display().to_string()),
+            "canonical command must live under the install root: {}",
+            cmd
         );
+        assert_ne!(
+            cmd, "claude_mcp_servers/search_mcp/server.py",
+            "must NOT write the GUI catalog's relative stub (F-2)"
+        );
+        assert!(entry.get("args").is_some(), "missing args field: {}", entry);
+        assert!(entry.get("env").is_some(), "missing env field: {}", entry);
+    }
+
+    /// F-2 conservative arm: toggling a BUNDLED MCP on when the install
+    /// root has no venv-python must FAIL the toggle and write NOTHING —
+    /// neither a broken ~/.claude.json entry nor the enabled flag flip.
+    #[test]
+    fn test_toggle_on_bundled_without_venv_errors_and_writes_nothing() {
+        let (home, _guard) = setup_temp_env();
+        // Default config: install_path is EMPTY → no venv resolvable.
+        let cfg_path = seed_default_config(&home);
+        let mut cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        for entry in cfg["mcp_servers"].as_array_mut().unwrap() {
+            if entry["id"] == "search" {
+                entry["enabled"] = serde_json::Value::Bool(false);
+            }
+        }
+        std::fs::write(&cfg_path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
+
+        let err = rt().block_on(async {
+            toggle_mcp_server_inner("search".to_string(), true, "free").await
+        });
+        let msg = err.expect_err("bundled toggle-on without venv must error");
+        assert!(
+            msg.contains("no venv-python"),
+            "error should explain the missing venv: {}",
+            msg
+        );
+
+        // Nothing written to ~/.claude.json.
+        let cj = read_claude_json(&home);
+        assert!(
+            cj["mcpServers"].get("search").is_none(),
+            "no entry may be written on the failed toggle: {}",
+            cj
+        );
+        // The enabled flip was NOT persisted (error before save_config).
+        let cfg_after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        let search = cfg_after["mcp_servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == "search")
+            .expect("search entry");
+        assert_eq!(
+            search["enabled"],
+            serde_json::Value::Bool(false),
+            "failed toggle must not persist the enabled flip"
+        );
+    }
+
+    /// F-2: user-added CUSTOM MCPs keep their stored entry shape on
+    /// toggle-on — the canonical-builder routing applies to bundled ids
+    /// only.
+    #[test]
+    fn test_toggle_on_custom_mcp_keeps_stored_shape() {
+        let (home, _guard) = setup_temp_env();
+        std::fs::create_dir_all(&home).unwrap();
+        let mut config = OrchestratorConfig::default();
+        let custom_cmd = if cfg!(target_os = "windows") {
+            r"C:\tools\my-mcp.exe"
+        } else {
+            "/usr/local/bin/my-mcp"
+        };
+        config.mcp_servers.push(McpServerConfig {
+            id: "my-custom".to_string(),
+            name: "My Custom".to_string(),
+            description: String::new(),
+            enabled: false,
+            command: custom_cmd.to_string(),
+            args: vec!["--flag".to_string()],
+            env: HashMap::new(),
+            min_tier: OrchestratorTier::Free,
+            port: None,
+            configurable: false,
+            settings: HashMap::new(),
+        });
+        let path = home.join("orchestrator.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        rt().block_on(async {
+            toggle_mcp_server_inner("my-custom".to_string(), true, "free")
+                .await
+                .expect("custom toggle on");
+        });
+
+        let cj = read_claude_json(&home);
+        let entry = &cj["mcpServers"]["my-custom"];
+        assert_eq!(entry["command"], custom_cmd, "custom shape preserved");
+        assert_eq!(entry["args"][0], "--flag");
     }
 
     // ─── Fix #2: Secret-typed settings route through keychain ────────────
