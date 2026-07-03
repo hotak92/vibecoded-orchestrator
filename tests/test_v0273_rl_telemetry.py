@@ -565,3 +565,24 @@ def test_rl2_code_tool_in_kg_search_tools():
     assert "mcp__weaviate-kg__search_code_graph" in KG_SEARCH_TOOLS
     # Structural lookups stay excluded (no semantic candidates to cite).
     assert "query_code_structure" not in KG_SEARCH_TOOLS
+
+
+def test_rl9_drain_empty_staged_session_id_falls_back_to_payload(tmp_path):
+    """A staged ctx carrying session_id='' must NOT shadow the pending
+    payload's real session id (explicit falsy check, not setdefault)."""
+    from claude_mcp_servers.rl_client.citation_pending import stage_pending
+
+    stage_pending(
+        session_id="sess-real",
+        task_id="task-empty-sid",
+        seq=None,
+        query="how are batches validated?",
+        ctx={"nodes": [{"title": "NodeA", "n_emb": [0.1] * 4}], "session_id": ""},
+        source="hook",
+        project_root=tmp_path,
+    )
+    computed: list = []
+    transcript = _transcript(tmp_path, "how are batches validated?", "big answer " * 12000)
+    summary = _drain(tmp_path, "sess-real", transcript, computed)
+    assert summary["computed"] == 1
+    assert computed[0]["ctx"]["session_id"] == "sess-real"

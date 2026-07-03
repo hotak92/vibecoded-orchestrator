@@ -202,8 +202,11 @@ def drain_session(
         # At/above the gate → compute + write + delete (one-shot).
         # v0.2.73 RL-6/RL-9: stamp the riders onto ctx so the citation event
         # stores where/why it fired. session_id prefers the value staged in
-        # the ctx (RL-9 stage-time resolution), then the pending payload.
-        ctx.setdefault("session_id", payload.get("session_id") or session_id or "")
+        # the ctx (RL-9 stage-time resolution), then the pending payload —
+        # explicit falsy check (NOT setdefault): a staged EMPTY string must
+        # not shadow the payload's real session id.
+        if not ctx.get("session_id"):
+            ctx["session_id"] = payload.get("session_id") or session_id or ""
         ctx["fire_reason"] = fire_reason
         ctx["window_tokens"] = tok
         try:
