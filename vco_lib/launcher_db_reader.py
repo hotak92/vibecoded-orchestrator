@@ -159,6 +159,134 @@ def get_orchestrator_root_bindings() -> Tuple[Optional[str], Optional[str]]:
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# v0.2.73 FIX-C: code-graph binding keep-set (read-only).
+#
+# The AUTHORITATIVE "keep" set for the orphan-code-collection detector is
+# ``project_codegraph_bindings.collection_prefix`` (one row per registered
+# project) PLUS the owner prefixes of ``project_codegraph_extra_paths`` (a
+# project can inject a sibling clone into its OWN code-graph — its analysis
+# writes under the OWNER's prefix, so the owner's prefix must stay protected).
+#
+# A prefix that matches NEITHER is a candidate orphan (subject to the
+# case-insensitive live-schema guards in project_init). Never propagate the
+# BUG-1 ``_is_similar_prefix`` heuristic here — the binding table is the
+# ground truth, exactly as the Rust wizard's ``normalise_prefix_for_match``
+# binding-exclusion (project_identity.rs:716) is.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def get_codegraph_binding_prefixes() -> list[str]:
+    """Return every ``collection_prefix`` in ``project_codegraph_bindings``.
+
+    This is the authoritative keep-set for the orphan-code-collection
+    detector: any live code-graph prefix that matches one of these
+    (case-insensitively) is an ACTIVE class set, never a drop target.
+
+    Returns ``[]`` when launcher.db is unavailable, the table is absent
+    (free-tier install / never booted), or SQLite errors. Soft-fail:
+    an empty keep-set makes the detector CONSERVATIVE upstream (callers
+    MUST treat "no bindings resolvable" as "cannot safely attribute →
+    do not flag anything", never as "everything is an orphan").
+    """
+    conn = _open_db_readonly()
+    if conn is None:
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT collection_prefix FROM project_codegraph_bindings"
+        ).fetchall()
+        out: list[str] = []
+        for r in rows:
+            val = (r["collection_prefix"] or "").strip()
+            if val:
+                out.append(val)
+        return out
+    except Exception:
+        return []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def get_codegraph_extra_path_owner_prefixes() -> list[str]:
+    """Return the code-graph prefixes of every project that OWNS a row in
+    ``project_codegraph_extra_paths``.
+
+    An extra-path row means "project P also walks this filesystem path into
+    P's OWN code-graph collection" — the injected clone does NOT get its own
+    class set; its entities land under P's ``collection_prefix``. So the OWNER
+    projects' prefixes are already covered by
+    :func:`get_codegraph_binding_prefixes` (they have a bindings row too), but
+    we resolve them explicitly here so a project that has an extra-path row
+    WITHOUT a bindings row (degenerate, but possible mid-migration) still keeps
+    its prefix protected.
+
+    Joins ``project_codegraph_extra_paths.project_id`` → the project's
+    ``collection_prefix`` via ``project_codegraph_bindings``. Returns ``[]``
+    on any failure (soft-fail — same discipline as above).
+    """
+    conn = _open_db_readonly()
+    if conn is None:
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT b.collection_prefix "
+            "FROM project_codegraph_extra_paths AS e "
+            "JOIN project_codegraph_bindings AS b "
+            "  ON b.project_id = e.project_id"
+        ).fetchall()
+        out: list[str] = []
+        for r in rows:
+            val = (r["collection_prefix"] or "").strip()
+            if val:
+                out.append(val)
+        return out
+    except Exception:
+        return []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def codegraph_binding_keep_set() -> tuple[list[str], bool]:
+    """Return ``(prefixes, resolvable)`` — the full code-graph keep-set.
+
+    ``prefixes`` unions :func:`get_codegraph_binding_prefixes` +
+    :func:`get_codegraph_extra_path_owner_prefixes` (deduped, order-stable).
+
+    ``resolvable`` is ``False`` when launcher.db could not be opened at all
+    (no DB / locked / discovery failed) — the CRITICAL distinction the
+    detector needs: an empty keep-set because the DB is UNREACHABLE must NOT
+    be read as "every prefix is an orphan". When ``resolvable`` is False the
+    detector MUST refuse to flag anything (conservative data-safety). When
+    ``resolvable`` is True but ``prefixes`` is empty, the DB is genuinely
+    empty (no registered projects) and the caller may proceed.
+    """
+    conn = _open_db_readonly()
+    if conn is None:
+        return ([], False)
+    try:
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for p in list(get_codegraph_binding_prefixes()) + list(
+            get_codegraph_extra_path_owner_prefixes()
+        ):
+            if p not in seen:
+                seen.add(p)
+                ordered.append(p)
+        return (ordered, True)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # v0.2.52 V52-AJ: app_state key readers
 #
 # Used by EmbeddingService.for_project() + install.py's subprocess env-thread

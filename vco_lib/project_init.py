@@ -210,7 +210,57 @@ def derive_project_collection_names(project_name: str) -> dict:
         "shared_kg_collection": "VibeCodedOrchestrator_KnowledgeGraph",
         "shared_kg_write_disabled": "false",
         "kg_basename": basename,
+        # v0.2.73 GAP-1: the 5 code-graph collection names, so a consented
+        # project-unregister (`drop-collections`) reclaims them too instead
+        # of minting fresh orphans. Keyed under a single sub-dict so callers
+        # that only want KG/DEV/DIAGRAMS are unaffected. The code prefix is
+        # the underscore-PRESERVING `canonical_class_prefix` (SSOT via
+        # `derive_project_code_prefix`), NOT the KG `sanitize_for_weaviate_class`
+        # basename — the two sanitizers diverge on underscored names.
+        "code_collections": derive_project_code_collection_names(project_name),
     }
+
+
+def derive_project_code_prefix(project_name: str) -> str:
+    """Return the canonical CODE-GRAPH collection prefix for a project.
+
+    Code-graph collections use the underscore-PRESERVING sanitizer
+    (``vco_lib.project_naming.canonical_class_prefix``) — the SAME rule the
+    analyzers (`analyze_code_graph.py`) and the Rust binding
+    (`project_codegraph_bindings.collection_prefix`) use — which DIFFERS
+    from the KG-family ``sanitize_for_weaviate_class`` (KG collapses
+    underscores). Consolidated here so the drop-collections / migrate /
+    orphan-detector paths all agree on the code prefix.
+
+    Delegates to the shared sanitizer in ``codegraph_to_mermaid`` (itself a
+    thin wrapper over ``canonical_class_prefix`` with the legacy-fallback
+    that never raises), so a single home owns the rule. Returns "" only when
+    the sanitizer yields an empty/unusable string.
+    """
+    try:
+        from vco_lib.codegraph_to_mermaid import _sanitize_collection_prefix
+        return _sanitize_collection_prefix(project_name or "") or ""
+    except Exception:
+        # Last-resort: never raise into a caller building a drop plan.
+        return ""
+
+
+def derive_project_code_collection_names(project_name: str) -> list[str]:
+    """Return the 5 canonical code-graph collection class names for a project.
+
+    ``["<Prefix>_CodeModule", "<Prefix>_CodeClass", "<Prefix>_CodeFunction",
+       "<Prefix>_CodeAPI", "<Prefix>_CodeInteraction"]`` where ``<Prefix>`` is
+    :func:`derive_project_code_prefix`. Returns ``[]`` when the prefix cannot
+    be derived (empty/unusable name) so drop/migrate callers add nothing
+    rather than emitting bare ``_CodeFunction`` targets.
+
+    Suffix order matches ``_CODEGRAPH_SUFFIXES`` (leading underscore stripped)
+    so it's stable/testable.
+    """
+    prefix = derive_project_code_prefix(project_name)
+    if not prefix:
+        return []
+    return [f"{prefix}{sfx}" for sfx in _CODEGRAPH_SUFFIXES]
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +328,11 @@ def named_vector_config() -> dict:
     return {slot.name: slot.to_weaviate_config() for slot in KG_NAMED_VECTORS}
 
 
-def code_class_definitions(project_prefix: str = "") -> dict[str, dict]:
+def code_class_definitions(
+    project_prefix: str = "",
+    *,
+    index_type: str = "hnsw",
+) -> dict[str, dict]:
     """Return Weaviate class definitions for the 5 code-graph collections.
 
     Args:
@@ -286,6 +340,15 @@ def code_class_definitions(project_prefix: str = "") -> dict[str, dict]:
             (e.g. `project_prefix="MyProj_"` -> `"MyProj_CodeFunction"`).
             Empty string returns bare-name definitions; callers using
             per-project prefixing prepend it.
+        index_type: v0.2.73 FIX-D4 — ``"hnsw"`` (default; the ONLY shipped
+            default) or ``"hfresh"``. When ``"hfresh"``, each slot's
+            ``vectorConfig`` is emitted with ``vectorIndexType:hfresh`` (which
+            forces mandatory RQ compression — see
+            ``NamedVectorSlot.to_weaviate_config``). GATED: default stays hnsw
+            until the integrator's 1.37 scratch-test passes (HFresh is preview
+            + forces RQ). A ``hfresh`` collection is only ever born via the
+            `copy` migrate action (create-fresh-with-target-schema), never a
+            mutation of a live collection (vectorIndexType is immutable live).
 
     Used by analyzers + the v0.2.18 schema migration. The actual
     code-graph create site is `templates/scripts/analyze_code_graph.py`
@@ -312,7 +375,15 @@ def code_class_definitions(project_prefix: str = "") -> dict[str, dict]:
     """
     from vco_lib.weaviate_schema import CODE_NAMED_VECTORS, _CODE_COLLECTION_SUFFIXES
 
-    vc = {slot.name: slot.to_weaviate_config() for slot in CODE_NAMED_VECTORS}
+    # v0.2.73 FIX-D4: thread the target index type into every slot. Default
+    # "hnsw" reproduces the pre-D4 shape byte-for-byte (so no spurious schema
+    # delta on plain migrations); "hfresh" emits the preview index config
+    # (mandatory RQ) — the copy migrate action recreates the collection fresh
+    # with this target, which is the only legal way to change the index type.
+    vc = {
+        slot.name: slot.to_weaviate_config(index_type=index_type)
+        for slot in CODE_NAMED_VECTORS
+    }
 
     # v0.2.18 (Plan C) — minimal property declaration. Same shape used by
     # analyze_code_graph.py's `create_collections` so the smart-dispatch
@@ -853,6 +924,7 @@ class SchemaDelta:
     Attributes drive the migrate dispatch:
       legacy_single_vector → action=rebuild (no named vectors to copy)
       missing_vec_slots / indexNullState_needed → action=copy
+      vector_index_type_change → action=copy  (v0.2.73 FIX-D4, hnsw→hfresh)
       missing_props (only) → action=patch_props
       not_present → action=create
       none of the above → action=noop
@@ -862,6 +934,12 @@ class SchemaDelta:
     missing_vec_slots: list[str] = field(default_factory=list)
     indexNullState_needed: bool = False
     missing_props: list[dict] = field(default_factory=list)
+    # v0.2.73 FIX-D4: the target vectorIndexType (e.g. "hfresh") differs from
+    # the live collection's ("hnsw"). vectorIndexType is IMMUTABLE on a live
+    # collection, so the only way to change it is the `copy` action (create a
+    # fresh collection born with the target index type + re-import the SAME
+    # client vectors — no re-embed). None = no index-type change requested.
+    vector_index_type_change: Optional[str] = None
 
     def any(self) -> bool:
         return (
@@ -870,6 +948,7 @@ class SchemaDelta:
             or bool(self.missing_vec_slots)
             or self.indexNullState_needed
             or bool(self.missing_props)
+            or self.vector_index_type_change is not None
         )
 
 
@@ -960,6 +1039,26 @@ def _schema_delta(actual: dict, target: dict) -> SchemaDelta:
     if missing:
         delta.missing_vec_slots = missing
 
+    # v0.2.73 FIX-D4: detect a vectorIndexType change (hnsw → hfresh) on the
+    # SHARED slots. vectorIndexType lives per-slot in the named-vector schema.
+    # We only compare slots present in BOTH sides (a missing slot is already
+    # handled by `missing_vec_slots` → copy). A target slot whose
+    # `vectorIndexType` differs from the live one signals a copy-migrate
+    # (immutable-on-live → recreate fresh). We record the TARGET type so the
+    # dispatcher/logs can name it; take the first differing target as the
+    # collection-wide target (all slots share one index type in practice).
+    _target_index_type: Optional[str] = None
+    for slot_name in sorted(expected_slots & actual_slots):
+        tgt_it = ((target_vec_config.get(slot_name) or {})
+                  .get("vectorIndexType") or "hnsw")
+        act_it = ((actual_vec_config.get(slot_name) or {})
+                  .get("vectorIndexType") or "hnsw")
+        if str(tgt_it).strip().lower() != str(act_it).strip().lower():
+            _target_index_type = str(tgt_it).strip().lower()
+            break
+    if _target_index_type is not None:
+        delta.vector_index_type_change = _target_index_type
+
     inv_idx = actual.get("invertedIndexConfig") or {}
     target_inv = target.get("invertedIndexConfig") or {}
     if target_inv.get("indexNullState", False) and not inv_idx.get("indexNullState", False):
@@ -975,6 +1074,47 @@ def _schema_delta(actual: dict, target: dict) -> SchemaDelta:
         delta.missing_props = missing_props
 
     return delta
+
+
+#: HFresh (Weaviate 1.37 preview) accepts only these distance metrics.
+#: Doc-verified 2026-07-03 (see reviews/weaviate-doc-verification-1.37).
+_HFRESH_ALLOWED_DISTANCES = frozenset({"cosine", "l2-squared"})
+
+
+def _hfresh_incompatible_distance(
+    name: str, *, weaviate_url: Optional[str] = None,
+) -> Optional[str]:
+    """Return the live collection's distance metric IF it is incompatible with
+    HFresh (i.e. not cosine / l2-squared), else ``None``.
+
+    Reads the actual per-slot ``vectorIndexConfig.distance`` from the live
+    schema. A missing/unspecified distance means Weaviate's default
+    (``cosine``) → compatible → returns ``None``. Soft-fail: if the schema
+    can't be read (transient), returns ``None`` (do NOT block the copy on a
+    probe failure — the POST would still surface a real incompatibility).
+
+    Used as the FIX-D4 pre-flight guard on the hnsw→hfresh copy path.
+    """
+    try:
+        schema = _fetch_schema(name, weaviate_url=weaviate_url)
+    except Exception:
+        return None
+    if schema is None:
+        return None
+    vec_cfg = schema.get("vectorConfig") or {}
+    for _slot, slot_cfg in vec_cfg.items():
+        idx_cfg = (slot_cfg or {}).get("vectorIndexConfig") or {}
+        dist = idx_cfg.get("distance")
+        if dist is None:
+            continue  # Weaviate default = cosine → compatible.
+        if str(dist).strip().lower() not in _HFRESH_ALLOWED_DISTANCES:
+            return str(dist)
+    # Legacy single-vector shape (defensive; copy path shouldn't reach here).
+    idx_cfg = schema.get("vectorIndexConfig") or {}
+    dist = idx_cfg.get("distance")
+    if dist is not None and str(dist).strip().lower() not in _HFRESH_ALLOWED_DISTANCES:
+        return str(dist)
+    return None
 
 
 def _create_class(payload: dict, weaviate_url: Optional[str] = None) -> None:
@@ -1386,7 +1526,16 @@ def _classify_action(delta: SchemaDelta) -> str:
         return "noop"
     if delta.legacy_single_vector:
         return "rebuild"
-    if delta.missing_vec_slots or delta.indexNullState_needed:
+    # v0.2.73 FIX-D4: a vectorIndexType change (hnsw→hfresh) routes to the
+    # SAME copy path as missing_vec_slots — the copy action recreates the
+    # collection with the TARGET schema (born hfresh) + re-imports client
+    # vectors (no re-embed). Ordered before patch_props: an index-type change
+    # is structural (must recreate), a prop add is additive.
+    if (
+        delta.missing_vec_slots
+        or delta.indexNullState_needed
+        or delta.vector_index_type_change is not None
+    ):
         return "copy"
     if delta.missing_props:
         return "patch_props"
@@ -1438,7 +1587,86 @@ def _build_plan(
             "target": target,
             "delta": delta,
         })
+
+    # ── v0.2.73 FIX-D4: code-graph collections (GATED, default OFF) ──────
+    # Pre-D4 the smart-migration machinery was KG-shaped ONLY (KG/DEV/
+    # DIAGRAMS) — the 5 code collections were systematically excluded, which
+    # is the SAME exclusion behind FIX-C GAP-1. We now enumerate them too so
+    # an hnsw→hfresh index-type migration can reach the 87 GB CodeFunction via
+    # the existing vector-preserving `copy` action (no re-embed).
+    #
+    # GATED: only enumerated when a code index-type target is explicitly
+    # requested (via `--index-type hfresh` → args.index_type, or the
+    # VCT_CODEGRAPH_INDEX_TYPE env). Default (unset / "hnsw") adds NOTHING —
+    # the code collections stay out of the plan exactly as before, so no
+    # existing migration behaviour changes. The default is NOT flipped: the
+    # integrator runs the mandatory 1.37 HFresh × client-named-vector
+    # scratch-test before hfresh ever becomes the default.
+    code_index_type = _resolve_codegraph_index_type(args)
+    if code_index_type == "hfresh":
+        code_prefix = _resolve_codegraph_prefix_for_plan(args)
+        if code_prefix:
+            # code_class_definitions is keyed by BASENAME (CodeModule etc.);
+            # compose the full per-project class name with the prefix and
+            # build the hfresh target for each.
+            code_defs = code_class_definitions(
+                project_prefix=f"{code_prefix}_", index_type=code_index_type,
+            )
+            for _basename in sorted(code_defs.keys()):
+                target = code_defs[_basename]
+                cls_name = target["class"]
+                actual = fetcher(cls_name)
+                if actual is None:
+                    # Code collection doesn't exist yet — creating it fresh
+                    # is fine (it's born hfresh) but there's nothing to
+                    # migrate. `create` here is a no-op-ish path; the
+                    # analyzer normally owns code-collection creation with a
+                    # richer property surface, so we SKIP absent code
+                    # collections rather than mint an empty hfresh class the
+                    # analyzer would then have to reconcile.
+                    continue
+                delta = _schema_delta(actual, target)
+                action = _classify_action(delta)
+                if getattr(args, "force_rebuild", False) and action in (
+                    "copy", "patch_props", "noop",
+                ):
+                    action = "rebuild"
+                plan.append({
+                    "env_key": None,  # code collections are prefix-derived
+                    "collection": cls_name,
+                    "action": action,
+                    "target": target,
+                    "delta": delta,
+                })
+
     return plan
+
+
+def _resolve_codegraph_index_type(args) -> str:
+    """Resolve the requested code-graph vectorIndexType target (GATED).
+
+    Precedence: ``args.index_type`` (CLI ``--index-type``) → env
+    ``VCT_CODEGRAPH_INDEX_TYPE`` → ``"hnsw"`` (default; code collections
+    excluded from the plan, pre-D4 behaviour). Only ``"hfresh"`` opts a
+    project's code collections INTO the migration plan.
+
+    // GATED: default hnsw; hfresh is preview + forces RQ + needs 1.37
+    // scratch-test (integrator) before default flip.
+    """
+    val = getattr(args, "index_type", None)
+    if not val:
+        val = os.environ.get("VCT_CODEGRAPH_INDEX_TYPE", "")
+    return (val or "hnsw").strip().lower()
+
+
+def _resolve_codegraph_prefix_for_plan(args) -> str:
+    """Resolve the per-project code-graph prefix for the plan's code
+    collections. Uses ``args.name`` (the migrate --name) → canonical code
+    prefix. Returns "" when unresolvable (plan adds no code collections)."""
+    name = getattr(args, "name", None)
+    if not name:
+        return ""
+    return derive_project_code_prefix(name)
 
 
 def migrate_collections(
@@ -1652,6 +1880,22 @@ def migrate_collections(
                     _post_property(name, prop, weaviate_url=weaviate_url)
 
             elif action == "copy":
+                # v0.2.73 FIX-D4: HFresh × distance pre-flight guard. HFresh
+                # supports ONLY cosine + l2-squared (doc-verified 1.37). If
+                # this copy is an hnsw→hfresh index-type change AND the LIVE
+                # collection uses `dot` distance, refuse up-front with a clear
+                # error (route to the documented fallback: keep it on hnsw)
+                # rather than a 422 at POST time. VCO code/KG use cosine so
+                # the common case passes; the guard exists for correctness.
+                if delta.vector_index_type_change == "hfresh":
+                    _bad = _hfresh_incompatible_distance(name, weaviate_url=weaviate_url)
+                    if _bad is not None:
+                        raise ValueError(
+                            f"{name}: cannot migrate to HFresh — live distance "
+                            f"metric is {_bad!r}; HFresh supports only cosine + "
+                            "l2-squared. Keep this collection on hnsw "
+                            "(documented fallback); do not force the swap."
+                        )
                 staging = f"{name}{_STAGING_SUFFIX}"
                 staging_def = dict(target)
                 staging_def["class"] = staging
@@ -6350,6 +6594,559 @@ def _emit_legacy_codegraph_deferral(
     report.write(folder)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# v0.2.73 FIX-C — Orphan CODE-collection cleanup detector (CONSENTED, never
+# auto-drop) + FIX-C-RECUR — prefix-drift forward-guard.
+#
+# H3 found ~4.6 GB of orphan CODE collections the existing wizard cannot
+# reclaim (4 gaps). This detector closes them with a BINDING-EXCLUSION seed —
+# the AUTHORITATIVE keep-set is `project_codegraph_bindings.collection_prefix`
+# (launcher.db) + `project_codegraph_extra_paths` owners — NOT the BUG-1
+# `_is_similar_prefix` heuristic (which R1 proved is the data-loss vector).
+# This mirrors the Rust wizard's `normalise_prefix_for_match` binding-exclusion
+# (project_identity.rs:716), the SOUND design.
+#
+# DATA-SAFETY (R1 BLOCKER-1, non-negotiable):
+#   * NEVER flag a prefix that matches (case-insensitively) ANY live binding.
+#   * When the binding keep-set is UNRESOLVABLE (launcher.db down), flag
+#     NOTHING (an empty keep-set must never mean "everything is an orphan").
+#   * The consented command RE-VALIDATES against the live binding table + live
+#     schema AT RUN TIME (re-probe-before-acting) — never trusts the
+#     detect-time snapshot.
+#   * On-disk stranded-dir reclaim = STOP-WEAVIATE-FIRST, behind a SECOND flag.
+#   * NEVER auto-drop; emit an `orphan_code_collections_detected` deferral.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _normalise_prefix_for_match(s: str) -> str:
+    """Python mirror of the Rust `normalise_prefix_for_match`
+    (project_identity.rs:791): strip every non-ASCII-alphanumeric char and
+    lowercase. Must match the Rust rule so the Python orphan-detector and the
+    Rust wizard agree on which prefixes are "the same". "VibeCoded_Orchestrator",
+    "vibecodedorchestrator", "VibeCoded Orchestrator" all normalise equal.
+    """
+    return "".join(c.lower() for c in (s or "") if c.isascii() and c.isalnum())
+
+
+def _codegraph_keep_set_normalised() -> tuple[set[str], bool]:
+    """Return ``(normalised_keep_prefixes, resolvable)`` for the orphan
+    detector.
+
+    ``normalised_keep_prefixes`` = every `project_codegraph_bindings`
+    collection_prefix + every extra-path owner prefix, run through
+    :func:`_normalise_prefix_for_match`. ``resolvable`` is False when
+    launcher.db could not be opened at all — the CRITICAL guard: the detector
+    MUST refuse to flag anything when it cannot positively confirm the
+    keep-set (conservative data-safety).
+    """
+    try:
+        from vco_lib.launcher_db_reader import codegraph_binding_keep_set
+        prefixes, resolvable = codegraph_binding_keep_set()
+    except Exception:
+        return (set(), False)
+    normed = {_normalise_prefix_for_match(p) for p in prefixes if p}
+    normed.discard("")
+    return (normed, resolvable)
+
+
+def _list_ondisk_weaviate_dirs(volume_dir: str) -> list[tuple[str, int]]:
+    """List immediate subdirectories of a Weaviate volume dir with their
+    apparent size in bytes. Returns ``[(dirname, size_bytes), ...]``.
+
+    Soft-fail: returns [] if the dir is unreadable / doesn't exist. Sizes are
+    ``os.walk`` apparent bytes (== du here; no sparse files on Weaviate LSM
+    segments). Used by the on-disk-stranded-segment branch (H3 Population-1,
+    the 4.6 GB reclaim invisible to schema-only scans).
+    """
+    out: list[tuple[str, int]] = []
+    try:
+        entries = list(os.scandir(volume_dir))
+    except Exception:
+        return []
+    for ent in entries:
+        try:
+            if not ent.is_dir():
+                continue
+        except Exception:
+            continue
+        total = 0
+        try:
+            for root, _dirs, files in os.walk(ent.path):
+                for f in files:
+                    try:
+                        total += os.path.getsize(os.path.join(root, f))
+                    except OSError:
+                        continue
+        except Exception:
+            total = 0
+        out.append((ent.name, total))
+    return out
+
+
+def _detect_orphan_code_collections(
+    weaviate_url: str,
+    *,
+    volume_dir: Optional[str] = None,
+    keep_set: Optional[set[str]] = None,
+    keep_resolvable: Optional[bool] = None,
+    schema_fetcher: Optional[Callable[[], list[str]]] = None,
+    ondisk_lister: Optional[Callable[[str], list[tuple[str, int]]]] = None,
+) -> dict:
+    """Two-source orphan CODE-collection detector (READ-ONLY, never drops).
+
+    Sources (H3):
+      (a) LIVE-schema code classes whose prefix is in NO current binding.
+      (b) ON-DISK stranded segment dirs whose class is GONE from the live
+          schema (the biggest reclaim — invisible to schema-only scans).
+
+    Seed = BINDING-EXCLUSION (the authoritative keep-set), case-insensitive,
+    exactly like the Rust wizard's `normalise_prefix_for_match` skip — NOT the
+    BUG-1 `_is_similar_prefix` heuristic.
+
+    Returns::
+
+        {
+          "live_orphans":   [{"class_name", "prefix", "suffix",
+                              "object_count"}],
+          "ondisk_orphans": [{"dir", "size_bytes"}],
+          "keep_resolvable": bool,
+          "total_reclaim_bytes": int,
+        }
+
+    HARD GUARD: when the keep-set is UNRESOLVABLE (launcher.db down), returns
+    EMPTY orphan lists — we never flag anything we can't positively attribute.
+
+    Injection points (``keep_set``, ``schema_fetcher``, ``ondisk_lister``)
+    exist for unit tests; production callers pass none.
+    """
+    result: dict = {
+        "live_orphans": [],
+        "ondisk_orphans": [],
+        "keep_resolvable": True,
+        "total_reclaim_bytes": 0,
+    }
+
+    # Resolve the authoritative keep-set (case-insensitive).
+    if keep_set is None or keep_resolvable is None:
+        _normed, _resolvable = _codegraph_keep_set_normalised()
+        keep_set = _normed if keep_set is None else keep_set
+        keep_resolvable = _resolvable if keep_resolvable is None else keep_resolvable
+    result["keep_resolvable"] = bool(keep_resolvable)
+
+    # DATA-SAFETY: cannot confirm the keep-set → flag NOTHING.
+    if not keep_resolvable:
+        return result
+
+    # ── (a) live-schema orphans ─────────────────────────────────────────
+    if schema_fetcher is not None:
+        live_classes = list(schema_fetcher())
+    else:
+        live_classes = _list_classes(weaviate_url)
+    live_class_set_lc = {c.lower() for c in live_classes}
+
+    for cls in sorted(live_classes):
+        decomp = _strip_known_suffix(cls, _CODEGRAPH_SUFFIXES)
+        if decomp is None:
+            continue
+        prefix, sfx = decomp
+        norm = _normalise_prefix_for_match(prefix)
+        if not norm:
+            continue
+        # BINDING-EXCLUSION: a prefix in the keep-set (case-insensitively) is
+        # ACTIVE — never an orphan. This is the hard guard against dropping a
+        # live binding (incl. the 87 GB CodeFunction).
+        if norm in keep_set:
+            continue
+        count = _http_count_objects(cls, weaviate_url)
+        result["live_orphans"].append({
+            "class_name": cls,
+            "prefix": prefix,
+            "suffix": sfx,
+            # GAP-3: include count==0 classes (a zero-object class still holds
+            # a schema slot + dir). None = Weaviate unreachable for the count.
+            "object_count": count,
+        })
+
+    # ── (b) on-disk stranded segment dirs (H3 GAP-4, the big reclaim) ────
+    # A dir whose name has NO case-insensitive match in the live schema is a
+    # class-less segment dir. We ONLY consider dirs that LOOK like a code
+    # collection (end with a code suffix, normalised) so we never touch
+    # Weaviate-internal dirs (`raft`, etc.). Weaviate lowercases class names
+    # for its on-disk dir names.
+    if volume_dir:
+        lister = ondisk_lister or _list_ondisk_weaviate_dirs
+        for dirname, size in lister(volume_dir):
+            # Skip if a live class matches this dir (case-insensitively) — it
+            # is a live collection's segment dir, NOT stranded.
+            if dirname.lower() in live_class_set_lc:
+                continue
+            # Only treat it as a code orphan if the dir name ends with a code
+            # suffix (case-insensitive). Otherwise leave it (KG orphan / raft
+            # / internal).
+            low = dirname.lower()
+            if not any(low.endswith(sfx.lower()) for sfx in _CODEGRAPH_SUFFIXES):
+                continue
+            # Its class is absent from the live schema (checked above) → the
+            # keep-set can't protect a class that doesn't exist, but we STILL
+            # guard: a dir whose prefix matches a live binding is suspicious
+            # (should have a live class) — skip it to be safe.
+            _pfx = None
+            for sfx in _CODEGRAPH_SUFFIXES:
+                if low.endswith(sfx.lower()):
+                    _pfx = dirname[: -len(sfx)]
+                    break
+            if _pfx and _normalise_prefix_for_match(_pfx) in keep_set:
+                continue
+            result["ondisk_orphans"].append({
+                "dir": dirname,
+                "size_bytes": int(size),
+            })
+            result["total_reclaim_bytes"] += int(size)
+
+    return result
+
+
+def _format_orphan_code_command(
+    weaviate_url: str,
+    live_orphans: list[dict],
+    ondisk_orphans: list[dict],
+    volume_dir: Optional[str],
+) -> str:
+    """Render the two CONSENTED, RE-VALIDATING cleanup commands for the
+    orphan-code deferral. Never renders a drop that isn't re-validated at run
+    time against the live binding table + live schema.
+    """
+    lines = [
+        "# ORPHAN CODE-COLLECTION CLEANUP — CONSENTED, re-validated at run time.",
+        "# Both commands re-probe the LIVE launcher.db bindings + live Weaviate",
+        "# schema BEFORE any drop (re-probe-before-acting) — a case-only variant",
+        "# of a live binding is NEVER dropped. Nothing here auto-runs.",
+        "",
+    ]
+    if live_orphans:
+        lines.append("# (a) LIVE-schema orphan classes (no current binding):")
+        for o in live_orphans:
+            cnt = o.get("object_count")
+            cnt_txt = f"{cnt} objects" if isinstance(cnt, int) else "count unknown"
+            lines.append(f"#     - {o['class_name']}  ({cnt_txt})")
+        lines.append(
+            "python -m vco_lib.project_init drop-orphan-code-collections "
+            f"--weaviate-url {weaviate_url!r} --confirm"
+        )
+        lines.append("")
+    if ondisk_orphans:
+        lines.append(
+            "# (b) ON-DISK stranded segment dirs (class ALREADY gone from the"
+        )
+        lines.append(
+            "#     live schema — Weaviate's schema DELETE cannot reclaim these)."
+        )
+        lines.append(
+            "#     FILESYSTEM-LEVEL reclaim. INVARIANT: Weaviate MUST be STOPPED"
+        )
+        lines.append(
+            "#     first — deleting a segment dir under a RUNNING Weaviate can"
+        )
+        lines.append(
+            "#     CORRUPT the volume (Weaviate holds the dir in its shard map)."
+        )
+        lines.append(
+            "#     The command REFUSES to run while Weaviate answers /v1/meta;"
+        )
+        lines.append(
+            "#     stop the weaviate container (launcher Services tab, or"
+        )
+        lines.append(
+            "#     `podman stop weaviate_claude` / `docker compose stop weaviate`),"
+        )
+        lines.append(
+            "#     run it, then restart Weaviate. It also RE-VERIFIES each class"
+        )
+        lines.append("#     is absent from a snapshot before removing its dir.")
+        for o in ondisk_orphans:
+            mb = o["size_bytes"] / (1024 * 1024)
+            lines.append(f"#     - {o['dir']}  ({mb:.1f} MB)")
+        vd = volume_dir or "<weaviate-volume-dir>"
+        lines.append(
+            "python -m vco_lib.project_init reclaim-stranded-code-segments "
+            f"--volume-dir {vd!r} --weaviate-url {weaviate_url!r} "
+            "--confirm --i-understand-filesystem-level"
+        )
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _emit_orphan_code_collections_deferral(
+    folder: Path,
+    weaviate_url: str,
+    detection: dict,
+) -> bool:
+    """Emit `orphan_code_collections_detected` (CONSENTED — never auto-drop).
+
+    Returns True when an entry was written (there were orphans), else False.
+    """
+    live_orphans = detection.get("live_orphans", []) or []
+    ondisk_orphans = detection.get("ondisk_orphans", []) or []
+    if not live_orphans and not ondisk_orphans:
+        return False
+    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+
+    total_mb = detection.get("total_reclaim_bytes", 0) / (1024 * 1024)
+    detected_bits = []
+    if live_orphans:
+        detected_bits.append(
+            f"{len(live_orphans)} live-schema code class(es) with no current "
+            f"`project_codegraph_bindings` prefix"
+        )
+    if ondisk_orphans:
+        detected_bits.append(
+            f"{len(ondisk_orphans)} on-disk stranded segment dir(s) whose class "
+            f"is already gone from the live schema (~{total_mb:.0f} MB reclaimable)"
+        )
+    detected = (
+        "The orphan code-collection detector found "
+        + " and ".join(detected_bits)
+        + ". Orphan code collections accumulate across sanitizer generations "
+        "and are never garbage-collected on their own; dropping them is the "
+        "ONLY way to reclaim their on-disk space (idle collections do not "
+        "self-compact). This is a CONSENTED cleanup — nothing is auto-dropped."
+    )
+    cmd = _format_orphan_code_command(
+        weaviate_url, live_orphans, ondisk_orphans, detection.get("volume_dir"),
+    )
+    entry = DeferralEntry(
+        condition_id="orphan_code_collections_detected",
+        title="Orphan code-graph collections detected (consented cleanup)",
+        detected=detected,
+        why_deferred=(
+            "Dropping a Weaviate class / removing a segment dir is "
+            "irreversible, and the on-disk reclaim requires stopping the "
+            "Weaviate container (deleting a segment dir under a running "
+            "Weaviate can corrupt the volume). VCO never auto-destroys user "
+            "data (CLAUDE.md rule 1) — the user runs the re-validating "
+            "commands explicitly. Each command re-probes the live binding "
+            "table + live schema before any drop (re-probe-before-acting), so "
+            "a case-only variant of a live binding is never dropped."
+        ),
+        command_to_apply=cmd,
+        severity="warning",
+        kg_node_refs=[],
+    )
+    report = DeferralReport.read(folder)
+    report.add_entry(entry)
+    report.write(folder)
+    return True
+
+
+# ── FIX-C run-time re-validating drop commands (consented) ─────────────────
+
+
+def _revalidated_orphan_live_classes(weaviate_url: str) -> list[str]:
+    """Re-run the live-schema orphan detection AT RUN TIME and return the
+    class names that are STILL orphans (binding-excluded, case-insensitive).
+
+    This is the re-probe-before-acting guard: a project could have been
+    re-added between detect-time and run-time, recreating a binding — so the
+    consented drop command re-derives the orphan set from the CURRENT launcher
+    bindings + CURRENT live schema, never the stale snapshot. Returns [] when
+    the keep-set is unresolvable (refuse to drop anything).
+    """
+    keep_set, resolvable = _codegraph_keep_set_normalised()
+    if not resolvable:
+        return []
+    live = _list_classes(weaviate_url)
+    out: list[str] = []
+    for cls in sorted(live):
+        decomp = _strip_known_suffix(cls, _CODEGRAPH_SUFFIXES)
+        if decomp is None:
+            continue
+        prefix, _sfx = decomp
+        norm = _normalise_prefix_for_match(prefix)
+        if not norm or norm in keep_set:
+            continue
+        out.append(cls)
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# v0.2.73 FIX-C-RECUR — prefix-drift forward-guard.
+#
+# Root cause (H3 #1): VCO's name→prefix sanitizer changed across releases →
+# each generation mints a new code-class set, the old one is left behind. FIX-C
+# cleans EXISTING orphans; FIX-C-RECUR stops FUTURE ones by recording the
+# "last-seen collection_prefix generation" per project and detecting a change.
+#
+# Recording channel (Python-only, no cargo): a small JSON state file under the
+# project's `.claude/state/codegraph-prefix-generation.json`. This is the
+# natural Python-writable home (the Rust bindings-column alternative would need
+# a migration + Rust reader/writer — out of scope for this Python track). When
+# the current binding prefix differs from the recorded generation, emit a
+# `codegraph_prefix_drift_detected` deferral (consent — never auto-migrate).
+# ═══════════════════════════════════════════════════════════════════════════
+
+_CODEGRAPH_PREFIX_GEN_FILENAME = "codegraph-prefix-generation.json"
+_CODEGRAPH_PREFIX_GEN_SCHEMA = "vco.codegraph_prefix_generation.v1"
+
+
+def _codegraph_prefix_gen_path(folder: Path) -> Path:
+    """Return the per-project code-prefix generation state file path
+    (`<folder>/.claude/state/codegraph-prefix-generation.json`)."""
+    return Path(folder) / ".claude" / "state" / _CODEGRAPH_PREFIX_GEN_FILENAME
+
+
+def _read_codegraph_prefix_generation(folder: Path) -> Optional[str]:
+    """Read the recorded last-seen code-graph prefix for this project, or None.
+
+    Soft-fail: returns None on any error (missing file / malformed JSON).
+    """
+    p = _codegraph_prefix_gen_path(folder)
+    try:
+        raw = p.read_text(encoding="utf-8")
+    except Exception:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    val = data.get("collection_prefix")
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    return None
+
+
+def _write_codegraph_prefix_generation(folder: Path, prefix: str) -> bool:
+    """Atomic-write the last-seen code-graph prefix generation. Best-effort:
+    returns False on any I/O failure rather than raising (recording is an aid,
+    not a hard requirement)."""
+    p = _codegraph_prefix_gen_path(folder)
+    payload = {
+        "schema": _CODEGRAPH_PREFIX_GEN_SCHEMA,
+        "collection_prefix": prefix,
+        "recorded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        from vco_lib.atomic import atomic_write_text
+        atomic_write_text(p, json.dumps(payload, indent=2) + "\n")
+        return True
+    except Exception:
+        try:
+            p.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            return True
+        except Exception:
+            return False
+
+
+def detect_codegraph_prefix_drift(
+    folder: Path,
+    project_name: str,
+    *,
+    emit_deferral: bool = True,
+    weaviate_url: Optional[str] = None,
+) -> Optional[dict]:
+    """Detect a code-graph prefix-generation drift for a project (FIX-C-RECUR).
+
+    Compares the CURRENT canonical code prefix (from the sanitizer) against the
+    last-seen generation recorded in `.claude/state/`. On a DIFFERENCE:
+      * emit a `codegraph_prefix_drift_detected` deferral (consent — names the
+        old + new prefix + the consented migrate/cleanup command),
+      * DO NOT auto-migrate.
+    On NO change (or first-ever run): record the current prefix silently and
+    return None.
+
+    Returns a dict ``{"old_prefix", "new_prefix"}`` when drift was detected,
+    else None. Best-effort throughout (never raises into the caller).
+    """
+    try:
+        current = derive_project_code_prefix(project_name)
+    except Exception:
+        return None
+    if not current:
+        return None
+
+    recorded = _read_codegraph_prefix_generation(folder)
+
+    if recorded is None:
+        # First-ever observation — record the baseline, no drift.
+        _write_codegraph_prefix_generation(folder, current)
+        return None
+
+    if _normalise_prefix_for_match(recorded) == _normalise_prefix_for_match(current):
+        # Same generation (case/separator drift only counts as same via the
+        # normalised compare — the collections are the SAME logical set).
+        # Refresh the exact-cased record and return.
+        if recorded != current:
+            _write_codegraph_prefix_generation(folder, current)
+        return None
+
+    # DRIFT: the sanitizer produced a genuinely different prefix generation.
+    drift = {"old_prefix": recorded, "new_prefix": current}
+    if emit_deferral:
+        try:
+            _emit_codegraph_prefix_drift_deferral(
+                folder, project_name, recorded, current,
+                weaviate_url=weaviate_url,
+            )
+        except Exception:
+            pass
+    # Record the NEW generation so the deferral fires ONCE per drift, not every
+    # run (the user consents + migrates; the next run sees no further drift).
+    _write_codegraph_prefix_generation(folder, current)
+    return drift
+
+
+def _emit_codegraph_prefix_drift_deferral(
+    folder: Path,
+    project_name: str,
+    old_prefix: str,
+    new_prefix: str,
+    *,
+    weaviate_url: Optional[str] = None,
+) -> None:
+    """Emit `codegraph_prefix_drift_detected` (consent — never auto-migrate)."""
+    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+
+    wv = weaviate_url or _weaviate_url_default()
+    old_classes = ", ".join(f"{old_prefix}{s}" for s in _CODEGRAPH_SUFFIXES)
+    detected = (
+        f"The code-graph collection prefix for project {project_name!r} "
+        f"changed from {old_prefix!r} to {new_prefix!r} (a sanitizer-"
+        f"generation change). The previous generation's code classes "
+        f"({old_classes}) are now ORPHANED — the analyzer writes only to the "
+        f"NEW prefix, so the old set accumulates dead on-disk segments unless "
+        f"migrated or dropped."
+    )
+    cmd = (
+        "# The old code-graph classes are orphaned by the prefix change.\n"
+        "# Reclaim them (CONSENTED) — the detector re-validates against the\n"
+        "# live binding table before any drop:\n"
+        "python -m vco_lib.project_init detect-orphan-code-collections "
+        f"--weaviate-url {wv!r} --project-folder {str(folder)!r}\n"
+        "# then run the drop command it prints in "
+        "`orphan_code_collections_detected`.\n"
+        "# The new-prefix code graph is (re)built by re-running the analyzer:\n"
+        f".claude/scripts/code-graph-analyze . --project {project_name!r}"
+    )
+    entry = DeferralEntry(
+        condition_id="codegraph_prefix_drift_detected",
+        title="Code-graph collection prefix drifted across a sanitizer generation",
+        detected=detected,
+        why_deferred=(
+            "Migrating/dropping the previous-generation code classes is "
+            "irreversible; VCO never auto-migrates (consent — CLAUDE.md rule "
+            "1). The forward-guard records the current prefix so a future "
+            "sanitizer change is detected once rather than silently orphaning "
+            "a collection generation."
+        ),
+        command_to_apply=cmd,
+        severity="warning",
+        kg_node_refs=[],
+    )
+    report = DeferralReport.read(folder)
+    report.add_entry(entry)
+    report.write(folder)
+
+
 # ---------------------------------------------------------------------------
 # v0.2.63 "Safe add" — per-add opt-in (default OFF) that protects a project's
 # sensitive, often-committed project-root `.env` and keeps VCO-created files
@@ -9488,7 +10285,13 @@ def _cmd_migrate_collections(args: argparse.Namespace) -> int:
         os.environ["DIAGRAMS_COLLECTION"] = derived["diagrams_collection"]
 
         # Build a minimal Namespace-like for migrate_collections dispatch.
-        ns = argparse.Namespace(force_rebuild=bool(args.force_rebuild))
+        # v0.2.73 FIX-D4: thread --name + --index-type so _build_plan can add
+        # the (GATED) code-graph collections when hfresh is requested.
+        ns = argparse.Namespace(
+            force_rebuild=bool(args.force_rebuild),
+            name=args.name,
+            index_type=getattr(args, "index_type", None),
+        )
         result = migrate_collections(
             ns,
             dry_run=bool(args.dry_run),
@@ -9886,7 +10689,9 @@ def _cmd_drop_collections(args: argparse.Namespace) -> int:
     """`drop-collections --name <project_name> [--weaviate-url <url>] --json`
 
     Drop the project's OWN Weaviate collections (`<sanitized>_KnowledgeGraph`,
-    `<sanitized>_Development`). The shared KG (`VibeCodedOrchestrator_KnowledgeGraph`
+    `<sanitized>_Development`, `<sanitized>_Diagrams`, and — v0.2.73 GAP-1 —
+    the 5 code-graph classes `<CodePrefix>_CodeModule/CodeClass/CodeFunction/
+    CodeAPI/CodeInteraction`). The shared KG (`VibeCodedOrchestrator_KnowledgeGraph`
     since v0.2.23 B1, was `VibecodedOrchestrator_KnowledgeGraph` v0.2.12–v0.2.22,
     or whatever `_SHARED_KG_NAME` resolves to — was `VibeCodedTools_KnowledgeGraph`
     pre-v0.2.12 PR-26) is NEVER touched — every project depends on read
@@ -9912,11 +10717,22 @@ def _cmd_drop_collections(args: argparse.Namespace) -> int:
     # bootstrap path creates. Idempotent — a 404 from Weaviate on a
     # never-created Diagrams class still counts as a successful drop
     # (consistent with the existing KG / Dev semantics).
+    #
+    # v0.2.73 GAP-1 (H3): ALSO drop the 5 code-graph collections. Pre-fix,
+    # `drop-collections` was CODE-BLIND — a consented project-unregister with
+    # `purge_collections:true` left `<Prefix>_CodeFunction` (potentially the
+    # 87 GB monster) et al. behind → an instant orphan the wizard can't
+    # always reclaim (GAP-4). `code_collections` is [] when the code prefix
+    # can't be derived, so this is a no-op on degenerate names. Same
+    # idempotent 404-is-success semantics as the KG/DEV/DIAGRAMS drops. This
+    # is a CONSENTED drop (the user opted into purge_collections) — it does
+    # NOT scan/guess; it drops exactly THIS project's own canonical set.
     targets = [
         derived["kg_collection"],
         derived["development_collection"],
         derived["diagrams_collection"],
     ]
+    targets.extend(derived.get("code_collections", []) or [])
     weaviate_url = args.weaviate_url
 
     result: dict = {
@@ -9960,6 +10776,184 @@ def _cmd_drop_collections(args: argparse.Namespace) -> int:
         print(f"skipped (shared): {result['skipped_shared']}")
         for err in result["errors"]:
             print(f"  ERROR {err['collection']}: {err['error']}")
+    return 1 if result["errors"] else 0
+
+
+# ── v0.2.73 FIX-C CLI commands (consented orphan cleanup) ──────────────────
+
+
+def _cmd_detect_orphan_code_collections(args: argparse.Namespace) -> int:
+    """`detect-orphan-code-collections --weaviate-url <url>
+    [--volume-dir <dir>] [--project-folder <folder>] [--json]`
+
+    READ-ONLY. Runs the two-source orphan detector (binding-exclusion seed)
+    and, when --project-folder is set, emits the consented
+    `orphan_code_collections_detected` deferral. Never drops anything.
+    Exit 0 always (detection is informational); exit 2 on bad args.
+    """
+    weaviate_url = args.weaviate_url or _weaviate_url_default()
+    detection = _detect_orphan_code_collections(
+        weaviate_url, volume_dir=getattr(args, "volume_dir", None),
+    )
+    detection["volume_dir"] = getattr(args, "volume_dir", None)
+    emitted = False
+    folder = getattr(args, "project_folder", None)
+    if folder:
+        emitted = _emit_orphan_code_collections_deferral(
+            Path(folder), weaviate_url, detection,
+        )
+    out = {
+        "live_orphans": detection["live_orphans"],
+        "ondisk_orphans": detection["ondisk_orphans"],
+        "keep_resolvable": detection["keep_resolvable"],
+        "total_reclaim_bytes": detection["total_reclaim_bytes"],
+        "deferral_emitted": emitted,
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(out))
+    else:
+        if not detection["keep_resolvable"]:
+            print(
+                "keep-set UNRESOLVABLE (launcher.db unreachable) — flagged "
+                "NOTHING (conservative).",
+                file=sys.stderr,
+            )
+        for o in detection["live_orphans"]:
+            print(f"live orphan: {o['class_name']} ({o.get('object_count')})")
+        for o in detection["ondisk_orphans"]:
+            mb = o["size_bytes"] / (1024 * 1024)
+            print(f"on-disk orphan: {o['dir']} ({mb:.1f} MB)")
+        print(f"deferral_emitted: {emitted}")
+    return 0
+
+
+def _cmd_drop_orphan_code_collections(args: argparse.Namespace) -> int:
+    """`drop-orphan-code-collections --weaviate-url <url> --confirm [--json]`
+
+    CONSENTED drop of LIVE-schema orphan code classes. RE-VALIDATES against the
+    CURRENT launcher bindings + CURRENT live schema at RUN TIME (re-probe-
+    before-acting) — never trusts a stale detect-time snapshot, and never drops
+    a class whose prefix (case-insensitively) matches a live binding. Requires
+    --confirm. Exit 0 on clean drop; 1 on any drop error; 2 without --confirm.
+    """
+    if not getattr(args, "confirm", False):
+        print(
+            "refusing to drop without --confirm (this is a destructive, "
+            "consented operation)",
+            file=sys.stderr,
+        )
+        return 2
+    weaviate_url = args.weaviate_url or _weaviate_url_default()
+    # RUN-TIME re-validation: re-derive the orphan set from the CURRENT
+    # bindings + CURRENT live schema. If the keep-set is unresolvable, this
+    # returns [] and we drop nothing.
+    to_drop = _revalidated_orphan_live_classes(weaviate_url)
+    result: dict = {"dropped": [], "errors": [], "revalidated_count": len(to_drop)}
+    for cls in to_drop:
+        try:
+            _delete_class(cls, weaviate_url=weaviate_url)
+            result["dropped"].append(cls)
+        except Exception as e:
+            result["errors"].append({"collection": cls, "error": f"{type(e).__name__}: {e}"})
+    if getattr(args, "json", False):
+        print(json.dumps(result))
+    else:
+        for n in result["dropped"]:
+            print(f"dropped orphan: {n}")
+        if not to_drop:
+            print("no orphans to drop after run-time re-validation "
+                  "(keep-set unresolvable, or all reclaimed already).")
+        for err in result["errors"]:
+            print(f"  ERROR {err['collection']}: {err['error']}")
+    return 1 if result["errors"] else 0
+
+
+def _cmd_reclaim_stranded_code_segments(args: argparse.Namespace) -> int:
+    """`reclaim-stranded-code-segments --volume-dir <dir> --weaviate-url <url>
+    --confirm --i-understand-filesystem-level [--json]`
+
+    FILESYSTEM-LEVEL reclaim of on-disk stranded code segment dirs whose class
+    is already gone from the live schema. HARD invariants:
+      * requires BOTH --confirm AND --i-understand-filesystem-level.
+      * REFUSES to run while Weaviate is reachable (`/v1/meta`) — deleting a
+        segment dir under a running Weaviate can corrupt the volume. The user
+        must stop the container first.
+      * RE-VERIFIES each dir's class is absent from a (best-effort) live schema
+        snapshot before removal — and only removes dirs the detector flagged.
+    Exit 0 on clean reclaim; 1 on error; 2 on missing flags / Weaviate-up.
+    """
+    if not getattr(args, "confirm", False) or not getattr(
+        args, "i_understand_filesystem_level", False,
+    ):
+        print(
+            "refusing: this filesystem-level reclaim requires BOTH --confirm "
+            "and --i-understand-filesystem-level",
+            file=sys.stderr,
+        )
+        return 2
+    volume_dir = getattr(args, "volume_dir", None)
+    if not volume_dir or not os.path.isdir(volume_dir):
+        print(f"error: --volume-dir {volume_dir!r} is not a directory", file=sys.stderr)
+        return 2
+    weaviate_url = args.weaviate_url or _weaviate_url_default()
+
+    # HARD GUARD: Weaviate MUST be down. Probe /v1/meta; if it answers, refuse.
+    try:
+        status, _body = _http_request(
+            "GET", f"{weaviate_url.rstrip('/')}/v1/meta", timeout=5.0,
+        )
+        weaviate_up = status == 200
+    except Exception:
+        weaviate_up = False
+    if weaviate_up:
+        print(
+            "refusing: Weaviate is RUNNING (/v1/meta answered). Stop the "
+            "weaviate container first — removing a segment dir under a live "
+            "Weaviate can corrupt the volume.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Re-detect stranded dirs against the (now-down) volume. Because Weaviate
+    # is down we can't re-fetch the live schema for the absence re-verify;
+    # instead we re-list the dirs and rely on the detector's suffix-shape +
+    # the fact that a running-time detect already excluded live classes. We
+    # STILL guard against the binding keep-set (prefixes that SHOULD be live).
+    keep_set, resolvable = _codegraph_keep_set_normalised()
+    result: dict = {"removed": [], "errors": [], "keep_resolvable": resolvable}
+    import shutil
+    for dirname, size in _list_ondisk_weaviate_dirs(volume_dir):
+        low = dirname.lower()
+        # code-suffix shape only.
+        matched_sfx = next(
+            (s for s in _CODEGRAPH_SUFFIXES if low.endswith(s.lower())), None,
+        )
+        if matched_sfx is None:
+            continue
+        pfx = dirname[: -len(matched_sfx)]
+        # keep-set guard (skip if unresolvable OR the prefix is a live binding).
+        if not resolvable:
+            continue  # conservative: never rm when we can't confirm keep-set.
+        if _normalise_prefix_for_match(pfx) in keep_set:
+            continue
+        target = os.path.join(volume_dir, dirname)
+        try:
+            shutil.rmtree(target)
+            result["removed"].append({"dir": dirname, "size_bytes": int(size)})
+        except Exception as e:
+            result["errors"].append({"dir": dirname, "error": f"{type(e).__name__}: {e}"})
+
+    if getattr(args, "json", False):
+        print(json.dumps(result))
+    else:
+        if not resolvable:
+            print("keep-set UNRESOLVABLE — removed NOTHING (conservative).",
+                  file=sys.stderr)
+        for r in result["removed"]:
+            mb = r["size_bytes"] / (1024 * 1024)
+            print(f"reclaimed: {r['dir']} ({mb:.1f} MB)")
+        for err in result["errors"]:
+            print(f"  ERROR {err['dir']}: {err['error']}")
     return 1 if result["errors"] else 0
 
 
@@ -10915,6 +11909,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Bypass smart path, always drop+re-embed (escape hatch).",
     )
     p_migrate.add_argument(
+        "--index-type", default=None, choices=["hnsw", "hfresh"],
+        help="(v0.2.73 FIX-D4, GATED) Target vectorIndexType for the "
+             "project's 5 CODE-GRAPH collections. 'hnsw' (default) leaves "
+             "code collections OUT of the migration plan (pre-D4 behaviour). "
+             "'hfresh' opts them into a vector-preserving `copy` migrate "
+             "(re-imports client vectors, NO re-embed) — but HFresh is "
+             "PREVIEW and forces mandatory RQ compression; the integrator "
+             "runs a 1.37 scratch-test before this ever becomes the default.",
+    )
+    p_migrate.add_argument(
         "--weaviate-url", default=None,
         help="Override Weaviate URL (default: WEAVIATE_URL env or "
              "http://localhost:8081).",
@@ -10996,6 +12000,70 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Emit a single JSON object on stdout.",
     )
     p_drop.set_defaults(func=_cmd_drop_collections)
+
+    # v0.2.73 FIX-C: orphan code-collection cleanup (consented) ------------
+    p_det = sub.add_parser(
+        "detect-orphan-code-collections",
+        help=(
+            "READ-ONLY two-source orphan CODE-collection detector "
+            "(binding-exclusion seed). With --project-folder, emits the "
+            "consented `orphan_code_collections_detected` deferral. Never "
+            "drops anything."
+        ),
+    )
+    p_det.add_argument("--weaviate-url", default=None,
+                       help="Override Weaviate URL (default: WEAVIATE_URL env "
+                            "or http://localhost:8081).")
+    p_det.add_argument("--volume-dir", default=None,
+                       help="Weaviate volume dir — enables the on-disk "
+                            "stranded-segment source (the big reclaim). "
+                            "Omit for live-schema-only detection.")
+    p_det.add_argument("--project-folder", default=None,
+                       help="Emit the consented deferral into "
+                            "<folder>/.claude/context/UPDATE_DEFERRED.md.")
+    p_det.add_argument("--json", action="store_true",
+                       help="Emit a single JSON object on stdout.")
+    p_det.set_defaults(func=_cmd_detect_orphan_code_collections)
+
+    p_dropo = sub.add_parser(
+        "drop-orphan-code-collections",
+        help=(
+            "CONSENTED drop of LIVE-schema orphan code classes. RE-VALIDATES "
+            "against current bindings + live schema at run time. Requires "
+            "--confirm."
+        ),
+    )
+    p_dropo.add_argument("--weaviate-url", default=None,
+                         help="Override Weaviate URL.")
+    p_dropo.add_argument("--confirm", action="store_true",
+                         help="Required — this is a destructive operation.")
+    p_dropo.add_argument("--json", action="store_true",
+                         help="Emit a single JSON object on stdout.")
+    p_dropo.set_defaults(func=_cmd_drop_orphan_code_collections)
+
+    p_recl = sub.add_parser(
+        "reclaim-stranded-code-segments",
+        help=(
+            "FILESYSTEM-LEVEL reclaim of on-disk stranded code segment dirs "
+            "(class already gone from live schema). REFUSES while Weaviate is "
+            "up. Requires --confirm AND --i-understand-filesystem-level."
+        ),
+    )
+    p_recl.add_argument("--volume-dir", required=True,
+                        help="Weaviate volume dir to reclaim from.")
+    p_recl.add_argument("--weaviate-url", default=None,
+                        help="Override Weaviate URL (used only to REFUSE when "
+                             "Weaviate is still up).")
+    p_recl.add_argument("--confirm", action="store_true",
+                        help="Required — destructive filesystem operation.")
+    p_recl.add_argument("--i-understand-filesystem-level",
+                        dest="i_understand_filesystem_level",
+                        action="store_true",
+                        help="Second required flag — acknowledges this deletes "
+                             "on-disk dirs (Weaviate MUST be stopped first).")
+    p_recl.add_argument("--json", action="store_true",
+                        help="Emit a single JSON object on stdout.")
+    p_recl.set_defaults(func=_cmd_reclaim_stranded_code_segments)
 
     # install-bundle (PR 4) ----------------------------------------------
     p_bundle = sub.add_parser(
