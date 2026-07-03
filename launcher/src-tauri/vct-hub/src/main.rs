@@ -61,8 +61,11 @@ async fn run_foreground() {
             // Lockfile was claimed but server failed to bind — release
             // so the next start_if_not_running doesn't see a fake
             // live hub (our PID would be alive, but no port was
-            // ever bound).
-            let _ = lockfile::release();
+            // ever bound). F-6 (v0.2.73): pid-OWNED release — by this
+            // point the lockfile could record a different, healthy hub
+            // (e.g. after a stale-version takeover raced us);
+            // unconditional removal would delete the winner's claim.
+            let _ = lockfile::release_owned();
             eprintln!("[vct-hub] failed to start server: {}", e);
             process::exit(1);
         }
@@ -73,7 +76,10 @@ async fn run_foreground() {
     wait_for_shutdown_signal().await;
 
     eprintln!("[vct-hub] shutting down");
-    if let Err(e) = lockfile::release() {
+    // F-6 (v0.2.73): pid-owned release — never remove a lockfile that a
+    // NEWER hub has since claimed (stale-version takeover while we were
+    // being signalled).
+    if let Err(e) = lockfile::release_owned() {
         eprintln!("[vct-hub] warning: lockfile release failed: {}", e);
     }
     process::exit(0);
