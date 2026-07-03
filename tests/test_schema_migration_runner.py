@@ -1012,6 +1012,10 @@ def test_rust_owned_register_only_advance_no_deferral(
     canonical = sv.canonical_version(atype)
     # Orchestrator-wide → keyed NULL. Seed one version behind canonical.
     _insert_row(db_with_v033, None, atype, name, canonical - 1)
+    # B-2 precondition: the register-only advance is valid ONLY when the Rust
+    # layer already applied the schema at launcher startup — model that by
+    # seeding _schema_migrations MAX == canonical.
+    _set_schema_migrations_max(db_with_v033, canonical)
 
     spy = _ApplyEdgeSpy()
     monkeypatch.setattr(smr, "_apply_edge", spy)
@@ -1062,6 +1066,8 @@ def test_rust_owned_register_only_advance_check_is_dry_run(
     name = "default"
     canonical = sv.canonical_version(atype)
     _insert_row(db_with_v033, None, atype, name, canonical - 1)
+    # B-2 precondition (see sibling test): DB really applied through canonical.
+    _set_schema_migrations_max(db_with_v033, canonical)
 
     spy = _ApplyEdgeSpy()
     monkeypatch.setattr(smr, "_apply_edge", spy)
@@ -1223,3 +1229,142 @@ def test_v0270_dim_mismatch_stale_probe_still_defers_not_auto_applied(
     assert spy.count == 0, "dim-mismatch must NOT auto-apply a migration edge"
     pend = [p for p in report.pending_regenerate if p["artifact_name"] == name]
     assert len(pend) == 1, "dim-mismatch must surface a pending_regenerate (deferring)"
+
+
+# ---------------------------------------------------------------------------
+# B-2 — register-only advance must NOT phantom-stamp ahead of the real
+# launcher.db _schema_migrations MAX (a Python-ahead constant bump).
+# ---------------------------------------------------------------------------
+
+
+_LAUNCHER_DB_ARTIFACT = "launcher_db_table_set"
+
+
+def _set_registry_version(db_path, atype, version, *, project_id=None):
+    """Force the artifact_schema_versions row for ``atype`` to ``version``.
+
+    ``launcher_db_table_set`` is orchestrator-wide → keyed project_id=NULL,
+    artifact_name='default'.
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "DELETE FROM artifact_schema_versions "
+            "WHERE artifact_type = ? AND artifact_name = 'default' "
+            "AND project_id IS ?",
+            (atype, project_id),
+        )
+        conn.execute(
+            "INSERT INTO artifact_schema_versions "
+            "(project_id, artifact_type, artifact_name, schema_version, "
+            "materialized_at) VALUES (?, ?, 'default', ?, 1)",
+            (project_id, atype, version),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _set_schema_migrations_max(db_path, target_max):
+    """Force _schema_migrations to hold a contiguous 1..target_max ladder.
+
+    The ``db_with_v033`` fixture applies the migration .sql BODIES via
+    ``executescript`` but does NOT populate ``_schema_migrations`` (in
+    production that row is written by the Rust runner, not the SQL). So we seed
+    the version records directly to model "the launcher binary applied through
+    migration ``target_max``".
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("DELETE FROM _schema_migrations")
+        conn.executemany(
+            "INSERT INTO _schema_migrations (version, description, applied_at) "
+            "VALUES (?, ?, 1)",
+            [(v, f"mig{v}") for v in range(1, target_max + 1)],
+        )
+        conn.commit()
+        got = conn.execute(
+            "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert got == target_max, f"fixture: expected MAX={target_max}, got {got}"
+
+
+def test_b2_register_advance_ok_when_db_matches_canonical(
+    db_with_v033, empty_migrations, monkeypatch
+):
+    """STAMP-WHEN-MATCHED: registry stored=(canonical-1), real _schema_migrations
+    MAX == canonical → the Rust layer already applied the schema at launcher
+    startup, so the register-only advance stamps the registry to canonical."""
+    canonical = sv.canonical_version(_LAUNCHER_DB_ARTIFACT)
+    # The db_with_v033 fixture applies ALL shipped migrations, so MAX is already
+    # == canonical (37). Pin it explicitly so the test is robust to future bumps.
+    _set_schema_migrations_max(db_with_v033, canonical)
+    _set_registry_version(db_with_v033, _LAUNCHER_DB_ARTIFACT, canonical - 1)
+
+    monkeypatch.setattr(smr, "_apply_edge", _ApplyEdgeSpy())
+    report = smr.run_schema_migrations(
+        db_path=db_with_v033, project_id="p1", migrations_dir=empty_migrations,
+        env=_env_with_collections(), weaviate_url="http://x",
+        live_drift_probe=_no_drift, codegraph_drift_probe=_no_drift, now_ms=1,
+        include_orchestrator_wide=True,  # launcher_db_table_set is wide
+    )
+    # Advanced (registered), NOT refused.
+    assert any(
+        r[0] == _LAUNCHER_DB_ARTIFACT for r in report.registered
+    ), "matched DB max must allow the register-only advance"
+    assert report.register_refused_db_behind == []
+    # Registry row now at canonical.
+    assert avr.check_artifact_version(
+        db_with_v033, project_id=None, artifact_type=_LAUNCHER_DB_ARTIFACT,
+        artifact_name="default",
+    ) == avr.ArtifactVersionStatus.UP_TO_DATE
+
+
+def test_b2_register_advance_refused_when_db_behind_canonical(
+    db_with_v033, empty_migrations, monkeypatch
+):
+    """REFUSE-WHEN-AHEAD: Python canonical is AHEAD of the real _schema_migrations
+    MAX (launcher binary older than code) → the register-only advance must be
+    REFUSED, leaving the registry at `stored`. No phantom stamp."""
+    canonical = sv.canonical_version(_LAUNCHER_DB_ARTIFACT)
+    # Simulate the launcher binary being one migration behind the Python const.
+    _set_schema_migrations_max(db_with_v033, canonical - 1)
+    _set_registry_version(db_with_v033, _LAUNCHER_DB_ARTIFACT, canonical - 1)
+
+    monkeypatch.setattr(smr, "_apply_edge", _ApplyEdgeSpy())
+    report = smr.run_schema_migrations(
+        db_path=db_with_v033, project_id="p1", migrations_dir=empty_migrations,
+        env=_env_with_collections(), weaviate_url="http://x",
+        live_drift_probe=_no_drift, codegraph_drift_probe=_no_drift, now_ms=1,
+        include_orchestrator_wide=True,
+    )
+    # Refused, NOT registered.
+    assert any(
+        r[0] == _LAUNCHER_DB_ARTIFACT for r in report.register_refused_db_behind
+    ), "DB behind canonical must REFUSE the phantom stamp"
+    assert not any(r[0] == _LAUNCHER_DB_ARTIFACT for r in report.registered)
+    # Registry row UNCHANGED (still behind — no phantom advance).
+    conn = sqlite3.connect(str(db_with_v033))
+    try:
+        got = conn.execute(
+            "SELECT schema_version FROM artifact_schema_versions "
+            "WHERE artifact_type = ? AND artifact_name = 'default' "
+            "AND project_id IS NULL",
+            (_LAUNCHER_DB_ARTIFACT,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert got == canonical - 1, "registry must NOT be stamped ahead of the DB"
+
+
+def test_b2_read_launcher_db_max_missing_table_is_none(tmp_path):
+    """A DB with no _schema_migrations table → helper returns None (unknown),
+    which the caller treats conservatively (refuse), not as 0-or-crash."""
+    db_path = tmp_path / "foreign.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE unrelated (x INTEGER)")
+    conn.commit()
+    conn.close()
+    assert smr._read_launcher_db_max_migration(db_path) is None
