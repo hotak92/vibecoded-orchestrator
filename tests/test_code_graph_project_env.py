@@ -422,32 +422,32 @@ class PostFileEditHookEnvResolutionTests(unittest.TestCase):
                 )
 
     def test_hook_resolves_explicit_code_graph_project_env(self):
-        for path in self.HOOK_PATHS:
-            # Extract the one-liner that builds CODE_GRAPH_PROJECT_RESOLVED.
-            # We use the same parameter-expansion shape the hook emits.
-            expr = (
-                'CODE_GRAPH_PROJECT_RESOLVED='
-                '"${CODE_GRAPH_PROJECT:-${PROJECT_NAME:-$(basename "$PROJECT_ROOT")}}"'
-                '; echo "$CODE_GRAPH_PROJECT_RESOLVED"'
-            )
-            env = os.environ.copy()
-            env["CODE_GRAPH_PROJECT"] = "TestProj"
-            env["PROJECT_NAME"] = "ShouldBeIgnored"
-            env["PROJECT_ROOT"] = "/tmp/should-also-be-ignored"
-            res = subprocess.run(
-                ["bash", "-c", expr], env=env,
-                capture_output=True, text=True,
-            )
-            self.assertEqual(res.returncode, 0, f"bash failed: {res.stderr}")
-            self.assertEqual(res.stdout.strip(), "TestProj")
-            # Confirm the literal expression appears in the actual hook,
-            # not just in our test string.
-            hook_text = path.read_text(encoding="utf-8")
-            self.assertIn(
-                '"${CODE_GRAPH_PROJECT:-${PROJECT_NAME:-$(basename "$PROJECT_ROOT")}}"',
-                hook_text,
-                f"{path} no longer emits the canonical fallback expression",
-            )
+        # v0.2.73 (FIX-B): post-file-edit.sh no longer resolves the code-graph
+        # write-target project — the per-edit code-graph sync moved to the
+        # end-of-turn batched drain (stop-codegraph-drain.sh), which resolves
+        # the prefix per canonical root via the hub resolver
+        # (code_graph_collection_prefix) then a basename fallback. The old
+        # `${CODE_GRAPH_PROJECT:-${PROJECT_NAME:-$(basename ...)}}` chain was
+        # specific to post-file-edit's now-removed block; the CODE_GRAPH_PROJECT
+        # env precedence itself is still honoured by the analyzer's own
+        # --project/env resolution (pinned by test_v0237_install_bundle_gaps).
+        # This test now only asserts the bash env-precedence SEMANTICS still
+        # behave, without pinning the (relocated) literal to a specific hook.
+        expr = (
+            'CODE_GRAPH_PROJECT_RESOLVED='
+            '"${CODE_GRAPH_PROJECT:-${PROJECT_NAME:-$(basename "$PROJECT_ROOT")}}"'
+            '; echo "$CODE_GRAPH_PROJECT_RESOLVED"'
+        )
+        env = os.environ.copy()
+        env["CODE_GRAPH_PROJECT"] = "TestProj"
+        env["PROJECT_NAME"] = "ShouldBeIgnored"
+        env["PROJECT_ROOT"] = "/tmp/should-also-be-ignored"
+        res = subprocess.run(
+            ["bash", "-c", expr], env=env,
+            capture_output=True, text=True,
+        )
+        self.assertEqual(res.returncode, 0, f"bash failed: {res.stderr}")
+        self.assertEqual(res.stdout.strip(), "TestProj")
 
     def test_hook_falls_back_to_project_name(self):
         expr = (
