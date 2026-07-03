@@ -371,6 +371,13 @@ pub fn filter_env_for_global_json(
 /// Why this is a separate pure function: makes the entry shape easy to
 /// unit-test in Rust AND mirror in `tests/test_install_mcp_registration.py`
 /// without spinning up an actual file write.
+///
+/// MUST stay in sync with the Python mirror
+/// `install.py::_build_python_mcp_entries` (Tier-4 pure-Python fallback
+/// writer) — same entry names, same order, same shapes. A drift between
+/// the two means fresh installs get different `~/.claude.json` contents
+/// depending on whether the launcher binary or the Python fallback did
+/// the write.
 pub fn build_default_mcp_entries(
     install_root: &Path,
     venv_python: &Path,
@@ -433,6 +440,30 @@ pub fn build_default_mcp_entries(
         "env": serde_json::Value::Object(search_env_safe),
     });
 
+    // ── playwright (F-1, v0.2.73) ───────────────────────────────────
+    // Browser automation via Microsoft's `@playwright/mcp`. The entry
+    // mirrors EXACTLY how the MCP is launched everywhere else in the
+    // stack: bare `npx -y @playwright/mcp@latest` — the same invocation
+    // the GUI catalog ships (vct-launcher-core/src/types.rs::
+    // default_mcp_servers) and install.py's `_install_playwright_browsers`
+    // pre-caches. `npx` resolves from PATH cross-OS; no venv-python and
+    // no env vars are involved. Default-enabled per project.
+    //
+    // Pre-v0.2.73 this entry was MISSING from both builders (audit
+    // finding F-1): the GUI catalog shipped `enabled: true`, so the
+    // toggle-ON write never fired on a fresh install, and no install
+    // path wrote the entry — docs promised a default-enabled playwright
+    // MCP while the ~150 MB Chromium pre-cache was spent on an MCP that
+    // never reached ~/.claude.json.
+    let playwright_env: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    let playwright_entry = serde_json::json!({
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "@playwright/mcp@latest"],
+        "env": serde_json::Value::Object(playwright_env),
+    });
+    let playwright_dropped: Vec<String> = Vec::new();
+
     // ── mermaid (Phase 1.2 — wrapper MCP) ───────────────────────────
     // The wrapper proxies the npm `claude-mermaid` package and filters
     // its tool surface per-project. Spawn command: `<venv-python> -m
@@ -488,6 +519,7 @@ pub fn build_default_mcp_entries(
     vec![
         ("weaviate-kg".to_string(), weaviate_entry, weaviate_dropped),
         ("search".to_string(), search_entry, search_dropped),
+        ("playwright".to_string(), playwright_entry, playwright_dropped),
         ("mermaid".to_string(), mermaid_entry, mermaid_dropped),
         ("excalidraw".to_string(), excalidraw_entry, excalidraw_dropped),
     ]
@@ -997,9 +1029,11 @@ mod tests {
         // include it here. vct-coordination is Pro-tier and likewise excluded.
         // Phase 1.2 (diagrams plan): mermaid wrapper appended.
         // Phase 2 (diagrams plan): excalidraw wrapper appended.
+        // F-1 (v0.2.73): playwright added — was promised default-enabled by
+        // the docs + GUI catalog but never written by any install path.
         assert_eq!(
             names,
-            vec!["weaviate-kg", "search", "mermaid", "excalidraw"]
+            vec!["weaviate-kg", "search", "playwright", "mermaid", "excalidraw"]
         );
 
         // ── weaviate-kg shape ────────────────────────────────────────
@@ -1043,6 +1077,27 @@ mod tests {
             assert_eq!(search["args"].as_array().unwrap().len(), 0);
         }
 
+        // ── playwright shape (F-1, v0.2.73) ──────────────────────────
+        // Must match the shipped launch command everywhere else:
+        // `npx -y @playwright/mcp@latest`, empty env, no venv-python.
+        let (_, playwright, playwright_dropped) = &entries[2];
+        assert_eq!(playwright["type"], "stdio");
+        assert_eq!(playwright["command"], "npx");
+        let playwright_args = playwright["args"].as_array().unwrap();
+        assert_eq!(playwright_args.len(), 2);
+        assert_eq!(playwright_args[0], "-y");
+        assert_eq!(playwright_args[1], "@playwright/mcp@latest");
+        assert!(
+            playwright["env"].as_object().unwrap().is_empty(),
+            "playwright entry must carry an empty env: {}",
+            playwright["env"]
+        );
+        assert!(
+            playwright_dropped.is_empty(),
+            "playwright entry drops no keys: {:?}",
+            playwright_dropped
+        );
+
         fs::remove_dir_all(&root).ok();
     }
 
@@ -1062,15 +1117,24 @@ mod tests {
         assert!(report.all_succeeded(), "report.outcomes: {:?}", report.outcomes);
         // Phase 1.2 (diagrams plan): mermaid wrapper added → 3 entries.
         // Phase 2 (diagrams plan): excalidraw wrapper added → 4 entries.
+        // F-1 (v0.2.73): playwright added → 5 entries.
         // Prior: weaviate-kg + search (2). Both wrappers register in
         // ~/.claude.json but are default-DISABLED at the per-project
         // gate (see BUNDLED_MCP_DEFAULT_DISABLED in vct-launcher-core).
-        assert_eq!(report.success_count(), 4);
+        assert_eq!(report.success_count(), 5);
 
         let raw = fs::read_to_string(&target).unwrap();
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(json["mcpServers"]["weaviate-kg"].is_object());
         assert!(json["mcpServers"]["search"].is_object());
+        assert!(
+            json["mcpServers"]["playwright"].is_object(),
+            "playwright MCP must be registered in ~/.claude.json (F-1)"
+        );
+        assert_eq!(
+            json["mcpServers"]["playwright"]["command"], "npx",
+            "playwright registration must match the shipped launch command (npx)"
+        );
         assert!(
             json["mcpServers"]["mermaid"].is_object(),
             "mermaid wrapper MCP must be registered in ~/.claude.json"
