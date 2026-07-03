@@ -4425,11 +4425,174 @@ pub async fn rename_project_v2(
         }
     }
 
+    // C-10 (v0.2.73): a rename splits the code graph across two collection
+    // sets. The binding row's `collection_prefix` (the SINGLE source of truth
+    // consumers read: GUI counts, MCP/CLI reads, hooks via the hub resolver)
+    // is NOT changed here — and Weaviate has no class-rename verb, so the OLD
+    // `Sanitize(old_name)_Code*` classes keep the existing rows. But the
+    // launcher's rebuild spawns the analyzer with `projects.name` (NEW) as
+    // `--project`, so a subsequent rebuild WRITES into `Sanitize(new_name)_
+    // Code*` while reads still target the OLD prefix → per-edit hook
+    // increments land in classes nobody reads, GUI counts freeze, and the OLD
+    // set is never pruned. Rather than silently fork, surface a deferral so
+    // the user runs a rebuild-under-the-new-name + cleans up the old
+    // collections deliberately. (The binding prefix stays the source of truth;
+    // this deferral is the honest "your code graph needs a rebuild" signal.)
+    if let Some(old) = &old_name {
+        if old != &new_name {
+            let cg_prefix_old = db
+                .get_project_codegraph_binding(&id)
+                .ok()
+                .flatten()
+                .map(|b| b.collection_prefix);
+            if let Err(e) = emit_codegraph_rename_deferral(
+                Path::new(&row.folder_path),
+                old,
+                &new_name,
+                cg_prefix_old.as_deref(),
+            ) {
+                // Soft-fail: a failed deferral emit must not fail the rename.
+                let msg = format!(
+                    "code-graph rename deferral emit failed: {}. The code graph \
+                     may be split across old/new collection prefixes until you \
+                     rebuild it under the new name.",
+                    e
+                );
+                eprintln!("[vct] warning: {}", msg);
+                warnings.push(msg);
+            }
+        }
+    }
+
     let _ = db.log_change("projects", "update", Some(&id), Some(&id));
     Ok(RenameProjectResult {
         project: ProjectView::from_row(row, count),
         warnings,
     })
+}
+
+/// C-10 (v0.2.73): emit the `codegraph_rename_split_pending` deferral into the
+/// renamed project's `UPDATE_DEFERRED.md` via the shared `DeferralReport`
+/// (Python `-c`, same injection-safe pattern as `storage_ux::emit_deferral`).
+///
+/// Why a deferral and not an auto-fix: Weaviate has no class-rename, and
+/// re-embedding an entire code graph at rename time would block the GUI for
+/// minutes of Ollama/CodeSage time. We record ONE pending condition (keyed by
+/// condition_id, so repeated renames don't stack entries) telling the user to
+/// rebuild the code graph under the new name and drop the stale old-prefix
+/// classes when convenient.
+fn emit_codegraph_rename_deferral(
+    project_folder: &Path,
+    old_name: &str,
+    new_name: &str,
+    old_prefix: Option<&str>,
+) -> Result<(), String> {
+    let repo_root =
+        find_local_repo_root().map_err(|e| format!("repo root not found: {}", e))?;
+    let py = pick_python_for_rename_deferral()
+        .ok_or_else(|| "no python on PATH".to_string())?;
+
+    let old_prefix_note = match old_prefix {
+        Some(p) => format!(
+            "The existing code-graph rows live under the `{}_Code*` classes.",
+            p
+        ),
+        None => "This project has no code-graph binding yet (nothing to \
+                 rebuild until the first analyze runs)."
+            .to_string(),
+    };
+    let detected = format!(
+        "Project renamed from {:?} to {:?}. The code-graph binding prefix is \
+         the source of truth consumers read, but a launcher rebuild spawns the \
+         analyzer with the NEW project name — writing into a new prefix while \
+         reads target the existing one. {}",
+        old_name, new_name, old_prefix_note
+    );
+    let cmd = format!(
+        "# Rebuild this project's code graph under the new name:\n\
+         cd {}\n\
+         .claude/scripts/code-graph-analyze . --force\n\
+         \n\
+         # Then drop the stale old-prefix classes in Weaviate (if any) so the \
+         old collection set stops accumulating orphan rows.",
+        project_folder.display()
+    );
+
+    let repo_py = rename_py_quote(&repo_root.to_string_lossy());
+    let folder_py = rename_py_quote(&project_folder.to_string_lossy());
+    let detected_py = rename_py_quote(&detected);
+    let cmd_py = rename_py_quote(&cmd);
+    let script = format!(
+        "import sys\n\
+         sys.path.insert(0, {repo_py})\n\
+         from pathlib import Path\n\
+         from vco_lib.deferral_report import DeferralEntry, DeferralReport\n\
+         folder = Path({folder_py})\n\
+         report = DeferralReport.read(folder)\n\
+         entry = DeferralEntry(\n\
+         \x20\x20\x20\x20condition_id=\"codegraph_rename_split_pending\",\n\
+         \x20\x20\x20\x20title=\"Code graph needs a rebuild after project rename\",\n\
+         \x20\x20\x20\x20detected={detected_py},\n\
+         \x20\x20\x20\x20why_deferred=\"Re-embedding the whole code graph at \
+rename time would block the launcher for minutes of embedding time. Reads \
+still work against the existing collections; rebuild when convenient.\",\n\
+         \x20\x20\x20\x20command_to_apply={cmd_py},\n\
+         \x20\x20\x20\x20severity=\"info\",\n\
+         )\n\
+         report.add_entry(entry)\n\
+         report.write(folder)\n",
+    );
+    let status = std::process::Command::new(&py)
+        .arg("-c")
+        .arg(&script)
+        .status();
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!("deferral helper exited {}", s)),
+        Err(e) => Err(format!("deferral helper spawn failed: {}", e)),
+    }
+}
+
+/// First `python3` then `python` from PATH. Mirrors
+/// `storage_ux::emit_deferral`'s resolution order (mirror-don't-fork).
+fn pick_python_for_rename_deferral() -> Option<String> {
+    for candidate in ["python3", "python"] {
+        #[cfg(windows)]
+        let names = [format!("{candidate}.exe"), candidate.to_string()];
+        #[cfg(not(windows))]
+        let names = [candidate.to_string()];
+        if let Some(paths) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&paths) {
+                for name in &names {
+                    let probe = dir.join(name);
+                    if probe.is_file() {
+                        return Some(probe.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Quote `s` as a Python double-quoted string literal. Mirrors
+/// `storage_ux::py_quote` byte-for-byte (injection-safe `-c` embedding).
+fn rename_py_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// MEDIUM-1 (2026-05-01, refactored): persist the SHARED_KG_WRITE_DISABLED
@@ -8424,6 +8587,62 @@ mod tests {
     /// rows became orphans on rename, and the newly-derived collection
     /// names had no access grant — so `require_kg_read` rejected every
     /// KG access for the project until manual repair via the GUI.
+    // C-10 (v0.2.73): the rename-split code-graph deferral emitter routes
+    // through the shared DeferralReport (Python `-c`). Requires python + repo
+    // root resolvable; skips content assertions otherwise (the routing is the
+    // contract under test).
+    fn rename_deferral_python_available() -> bool {
+        pick_python_for_rename_deferral().is_some() && find_local_repo_root().is_ok()
+    }
+
+    #[test]
+    fn emit_codegraph_rename_deferral_writes_pending_entry() {
+        if !rename_deferral_python_available() {
+            eprintln!("skipping: python/repo-root unavailable");
+            return;
+        }
+        let td = tempfile::TempDir::new().unwrap();
+        emit_codegraph_rename_deferral(td.path(), "OldName", "NewName", Some("OldName"))
+            .unwrap();
+        let path = td
+            .path()
+            .join(".claude")
+            .join("context")
+            .join("UPDATE_DEFERRED.md");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("codegraph_rename_split_pending"));
+        assert!(content.contains("OldName"));
+        assert!(content.contains("NewName"));
+        assert!(content.contains("code-graph-analyze . --force"));
+    }
+
+    #[test]
+    fn emit_codegraph_rename_deferral_is_idempotent_by_condition() {
+        if !rename_deferral_python_available() {
+            eprintln!("skipping: python/repo-root unavailable");
+            return;
+        }
+        let td = tempfile::TempDir::new().unwrap();
+        emit_codegraph_rename_deferral(td.path(), "A", "B", Some("A")).unwrap();
+        emit_codegraph_rename_deferral(td.path(), "B", "C", Some("B")).unwrap();
+        let path = td
+            .path()
+            .join(".claude")
+            .join("context")
+            .join("UPDATE_DEFERRED.md");
+        let content = std::fs::read_to_string(&path).unwrap();
+        // add_entry dedups by condition_id → one section header regardless of
+        // repeated renames. (Count the header, not the bare slug which also
+        // appears in the condition_ids: frontmatter.)
+        assert_eq!(
+            content
+                .matches("## codegraph_rename_split_pending (")
+                .count(),
+            1,
+            "repeated renames must not stack deferral sections"
+        );
+    }
+
     #[test]
     fn rename_project_v2_renames_access_rows() {
         let db = Db::open_in_memory().unwrap();

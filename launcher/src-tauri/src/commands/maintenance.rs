@@ -139,10 +139,20 @@ pub struct RegistrationReport {
     pub db_warnings: Vec<String>,
 }
 
-/// Default-orchestrator MCP names. Mirror of the names produced by
-/// `mcp_registration::build_default_mcp_entries`. Kept in this module
-/// because the status reader needs the list without invoking the
-/// builder (which requires a real venv-python on disk).
+/// MCP names the registration-health badge probes for
+/// install-path-resolvable presence. F-3 (v0.2.73): this is a DELIBERATE
+/// SUBSET of `mcp_registration::DEFAULT_MCP_ENTRY_NAMES`, NOT a full mirror
+/// of it — the badge only asserts the always-on, venv-python-backed MCPs
+/// whose absence (or wrong `path_matches_install`) means a broken install.
+/// The other bundled defaults are intentionally excluded from the badge:
+///   * `playwright` — bare `npx @playwright/mcp` (no install-root path to
+///     match, so `path_matches_install` is meaningless for it);
+///   * `mermaid` / `excalidraw` — default-DISABLED per project
+///     (`BUNDLED_MCP_DEFAULT_DISABLED`), so their legitimate absence must
+///     not turn the badge yellow.
+/// A cross-catalog agreement test (`mcp_registration.rs`) pins
+/// `DEFAULT_MCP_NAMES ⊆ DEFAULT_MCP_ENTRY_NAMES` so this stays a subset
+/// rather than drifting into a 4th disagreeing catalog.
 const DEFAULT_MCP_NAMES: &[&str] = &["weaviate-kg", "search"];
 
 /// Resolve the install_root the same way `installer::get_known_install_path`
@@ -1265,6 +1275,109 @@ mod tests {
 
     fn make_schema(classes: Vec<serde_json::Value>) -> serde_json::Value {
         serde_json::json!({ "classes": classes })
+    }
+
+    // ── F-3 (v0.2.73): cross-catalog MCP-name agreement ──────────────────
+    // Four MCP-name catalogs exist and MUST relate consistently, or adding
+    // MCP #6 to only one of them silently breaks (a GUI card that never
+    // reaches ~/.claude.json, or a bundled MCP that `remove_mcp_server`
+    // wrongly deletes-then-the-updater-re-adds). Before v0.2.73 NO test
+    // asserted any two agree; these do:
+    //   * types.rs `default_mcp_servers()`  — the GUI catalog (5 ids)
+    //   * mcp_registration `DEFAULT_MCP_ENTRY_NAMES` — the ~/.claude.json
+    //     builder output (5, pinned to the builder by its own test)
+    //   * project_mcp_servers `BUNDLED_MCP_NAMES` — the full bundled set (8)
+    //   * maintenance `DEFAULT_MCP_NAMES` — the health-badge probe subset (2)
+
+    /// The GUI catalog ids (types.rs) must equal the ~/.claude.json builder
+    /// names — every catalog card must have a builder entry and vice-versa.
+    #[test]
+    fn types_catalog_ids_equal_builder_entry_names() {
+        use vct_launcher_core::types::OrchestratorConfig;
+        let mut catalog_ids: Vec<String> = OrchestratorConfig::default()
+            .mcp_servers
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        catalog_ids.sort();
+        let mut builder_names: Vec<String> = crate::mcp_registration::DEFAULT_MCP_ENTRY_NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        builder_names.sort();
+        assert_eq!(
+            catalog_ids, builder_names,
+            "types.rs default_mcp_servers() ids must equal \
+             mcp_registration::DEFAULT_MCP_ENTRY_NAMES — a catalog card with \
+             no builder entry never reaches ~/.claude.json (F-1), and a \
+             builder name with no card is invisible in the GUI (F-3)"
+        );
+    }
+
+    /// Every GUI catalog id must be a bundled MCP — the catalog cannot list
+    /// an id that `is_bundled_mcp` doesn't recognise (else `remove_mcp_server`
+    /// would wrongly treat it as user-added / removable).
+    #[test]
+    fn types_catalog_ids_subset_of_bundled() {
+        use vct_launcher_core::db::project_mcp_servers::is_bundled_mcp;
+        use vct_launcher_core::types::OrchestratorConfig;
+        for s in OrchestratorConfig::default().mcp_servers.iter() {
+            assert!(
+                is_bundled_mcp(&s.id),
+                "GUI catalog id '{}' is not in BUNDLED_MCP_NAMES — \
+                 remove_mcp_server would treat it as removable-custom",
+                s.id
+            );
+        }
+    }
+
+    /// The ~/.claude.json builder names must all be bundled MCPs.
+    #[test]
+    fn builder_entry_names_subset_of_bundled() {
+        use vct_launcher_core::db::project_mcp_servers::is_bundled_mcp;
+        for name in crate::mcp_registration::DEFAULT_MCP_ENTRY_NAMES {
+            assert!(
+                is_bundled_mcp(name),
+                "builder MCP '{}' is not in BUNDLED_MCP_NAMES",
+                name
+            );
+        }
+    }
+
+    /// The health-badge probe list is a documented SUBSET of the builder
+    /// names (see DEFAULT_MCP_NAMES doc-comment) — NOT a 4th disagreeing
+    /// catalog. Pins the subset relation so it can't silently diverge.
+    #[test]
+    fn health_badge_probe_names_subset_of_builder() {
+        for name in DEFAULT_MCP_NAMES {
+            assert!(
+                crate::mcp_registration::DEFAULT_MCP_ENTRY_NAMES.contains(name),
+                "health-badge probe MCP '{}' must be one of the builder \
+                 DEFAULT_MCP_ENTRY_NAMES (it is a deliberate subset, not a \
+                 separate catalog)",
+                name
+            );
+        }
+    }
+
+    /// The dashboard `remove_mcp_server` builtin-protection set is now
+    /// DERIVED from `is_bundled_mcp` (F-3) — assert it protects EVERY
+    /// bundled MCP, so no bundled default can be deleted-then-re-added.
+    #[test]
+    fn remove_protection_covers_every_bundled_mcp() {
+        use vct_launcher_core::db::project_mcp_servers::{
+            is_bundled_mcp, BUNDLED_MCP_NAMES,
+        };
+        for name in BUNDLED_MCP_NAMES {
+            assert!(
+                is_bundled_mcp(name),
+                "remove_mcp_server protection (is_bundled_mcp) must cover \
+                 bundled MCP '{}'",
+                name
+            );
+        }
+        // A user-added custom MCP is NOT protected (still removable).
+        assert!(!is_bundled_mcp("my-custom-mcp"));
     }
 
     #[test]

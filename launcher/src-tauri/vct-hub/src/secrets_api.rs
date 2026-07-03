@@ -232,12 +232,22 @@ async fn migrate_secrets(
                 // entry as "set + active" immediately. Mirrors the post-
                 // write step in `register_secret_from_source`.
                 //
-                // Best-effort: a DB write failure here doesn't undo the
-                // keychain set (irreversible from this call site without
-                // an explicit `secrets::delete`, which has its own
-                // failure modes). We log + continue; the SecretsPanel
-                // will pick the entry up on next launcher startup via
-                // its on-launch reconciliation.
+                // E-4 (v0.2.73): a `mark_secret_active` failure is NOT
+                // silently swallowed. The prior code logged + counted the
+                // item as `migrated`, relying on an "on next launcher start"
+                // reconciliation that DOES NOT EXIST for secret active-flags
+                // (the only startup reconcilers walk `module_installs`, not
+                // `secret_active_state`). Result: the value sat in the
+                // keychain but was BOTH un-served by `/env`'s active gate AND
+                // un-listed in the GUI — the user re-enters it, or the
+                // migration silently under-delivers.
+                //
+                // Correct posture: the keychain WRITE succeeded but the
+                // migration ITEM did not fully succeed (the active-flag is
+                // half of "migrated + usable"). Surface it in `failed[]` so
+                // the caller can retry rather than believe it succeeded. The
+                // keychain value is left in place (idempotent: a retry's
+                // `secrets::set` overwrites it, then re-attempts the flag).
                 if let Err(e) = _h.0.mark_secret_active(
                     "shared",
                     SENTINEL_SHARED,
@@ -246,10 +256,21 @@ async fn migrate_secrets(
                 ) {
                     eprintln!(
                         "[vct-hub secrets_api] mark_secret_active failed for \
-                         key {:?}: {} (keychain write succeeded; GUI will \
-                         catch up on next launcher start)",
+                         key {:?}: {} (keychain write succeeded but the entry \
+                         is un-served + un-listed until the active flag is \
+                         set; reporting as failed so the caller retries)",
                         item.key, e,
                     );
+                    failed.push(MigrateFailure {
+                        key: item.key,
+                        error: format!(
+                            "keychain write succeeded but marking the secret \
+                             active failed: {} (the value is stored but not yet \
+                             served/listed; retry to re-attempt the active flag)",
+                            e
+                        ),
+                    });
+                    continue;
                 }
                 migrated.push(item.key);
             }
@@ -472,6 +493,72 @@ mod tests {
             assert!(f.error.contains(&f.key) || f.error.contains("invalid env key"));
             assert!(!f.error.contains("rejected"), "error leaked value: {}", f.error);
         }
+    }
+
+    #[tokio::test]
+    async fn migrate_reports_mark_active_failure_in_failed_list() {
+        // E-4 (v0.2.73): keychain write succeeds but mark_secret_active fails
+        // → the item lands in `failed[]`, NOT `migrated[]`, so the caller can
+        // retry rather than believe the secret is served/listed. We force the
+        // DB write to fail by dropping the table it targets.
+        let _g = secrets::for_tests::MockGuard::new();
+        let db = Db::open_in_memory().expect("in-memory db");
+        let handle = LauncherDbHandle(Arc::new(db));
+
+        // Sabotage the active-flag write path: remove the table
+        // mark_secret_active INSERTs into. The keychain set (mock) still
+        // succeeds, so this isolates the mark-active failure.
+        handle
+            .0
+            .lock()
+            .execute("DROP TABLE secret_active_state", [])
+            .expect("drop table");
+
+        let req = MigrateSecretsRequest {
+            secrets: vec![MigrateSecretItem {
+                key: "GITHUB_TOKEN".to_string(),
+                value: "ghp_secretvalue".to_string(),
+            }],
+        };
+        let body_ok: Result<
+            Json<MigrateSecretsRequest>,
+            axum::extract::rejection::JsonRejection,
+        > = Ok(Json(req));
+        let resp = migrate_secrets(State(handle.clone()), body_ok)
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body: MigrateSecretsResponse = serde_json::from_slice(&body_bytes).unwrap();
+
+        // Item did NOT count as migrated — it is in failed[].
+        assert!(
+            body.migrated.is_empty(),
+            "mark-active failure must NOT report the key as migrated: {:?}",
+            body.migrated
+        );
+        assert_eq!(body.failed.len(), 1);
+        assert_eq!(body.failed[0].key, "GITHUB_TOKEN");
+        assert!(
+            body.failed[0].error.contains("marking the secret active failed"),
+            "error should explain the mark-active failure: {}",
+            body.failed[0].error
+        );
+        // The error NEVER leaks the secret value.
+        assert!(
+            !body.failed[0].error.contains("ghp_secretvalue"),
+            "error leaked the secret value: {}",
+            body.failed[0].error
+        );
+
+        // The keychain WRITE did happen (idempotent for a retry).
+        let scope = secrets::SecretScope::Shared {
+            project_id: SENTINEL_SHARED,
+        };
+        let v = secrets::get(scope, IMPORT_MODULE_ID, "GITHUB_TOKEN").unwrap();
+        assert_eq!(v.as_deref(), Some("ghp_secretvalue"));
     }
 
     #[tokio::test]

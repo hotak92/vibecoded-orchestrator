@@ -209,6 +209,14 @@ class MigrationRunReport:
     #: Artifacts whose registry write FAILED (DB locked/unwritable) — C4: NOT
     #: counted as registered, so a broken DB doesn't falsely report success.
     register_failed: list[tuple[str, str, str]] = field(default_factory=list)
+    #: B-2: Rust-owned register-only advances REFUSED because the real
+    #: ``MAX(_schema_migrations.version)`` in launcher.db is BEHIND the Python
+    #: canonical constant (the launcher binary is older than the code expects).
+    #: Stamping the registry here would phantom-claim a schema the DB doesn't
+    #: have — conservative default: do nothing, surface "update launcher".
+    register_refused_db_behind: list[tuple[str, str, str]] = field(
+        default_factory=list
+    )
     #: Artifacts already UP_TO_DATE (and not stale) → no action.
     up_to_date: list[tuple[str, str, str]] = field(default_factory=list)
     #: REFUSE_DOWNGRADE artifacts (stored > canonical) — never mutated.
@@ -1097,6 +1105,35 @@ def run_schema_migrations(
             # through to the contiguity-checked apply path below so a real
             # ladder still runs rather than being silently swallowed.
             if not edges and artifact_type in RUST_OWNED_TYPES:
+                # B-2 GUARD: the register-only advance is safe ONLY when the
+                # Rust layer has ALREADY applied the schema at launcher startup.
+                # Trust the REAL DB, not the Python constant: read
+                # MAX(_schema_migrations.version). If it is BEHIND canonical the
+                # launcher binary is older than this code expects — stamping the
+                # registry to `canonical` would phantom-claim a schema the tables
+                # don't have (any later consumer trusting the registry floor
+                # would query a column that doesn't exist). Conservative default
+                # ("do nothing rather than guess"): refuse the advance, leave the
+                # registry at `stored`, and surface a clear "update launcher"
+                # signal. `None` (table missing / unreadable DB) is treated the
+                # same as behind — we cannot positively confirm the precondition.
+                db_max = _read_launcher_db_max_migration(db_path)
+                if db_max is None or db_max < canonical:
+                    detail = (
+                        f"refused v{stored}→v{canonical}: launcher.db "
+                        f"_schema_migrations MAX="
+                        f"{'unknown' if db_max is None else db_max} "
+                        f"< canonical v{canonical} — launcher binary is older "
+                        f"than the code expects; update the launcher, then "
+                        f"re-run. NOT stamping a phantom schema version."
+                    )
+                    report.register_refused_db_behind.append(
+                        (artifact_type, artifact_name, detail)
+                    )
+                    logger.warning(
+                        "run_schema_migrations: %s", detail
+                    )
+                    continue
                 if check:
                     report.registered.append(
                         (
@@ -1188,6 +1225,50 @@ def run_schema_migrations(
 # ---------------------------------------------------------------------------
 # Internal helpers used by run_schema_migrations
 # ---------------------------------------------------------------------------
+
+
+def _read_launcher_db_max_migration(db_path: Path) -> Optional[int]:
+    """Return the REAL highest applied launcher.db migration
+    (``MAX(_schema_migrations.version)``), or ``None`` if it can't be read.
+
+    This is the ground truth for the ``launcher_db_table_set`` version — the
+    schema that the RUNNING launcher binary actually applied at startup. B-2:
+    the register-only advance for Rust-owned types must compare the Python
+    canonical constant against THIS, never phantom-stamp the registry ahead of
+    the real DB.
+
+    Returns ``None`` (rather than 0 or raising) when the table is missing or the
+    DB is unreadable — the caller treats ``None`` conservatively (skip the
+    advance, surface a clear signal) rather than guessing. Mirrors the Rust
+    ``SELECT COALESCE(MAX(version), 0) FROM _schema_migrations`` read
+    (``migrations.rs`` — must match).
+    """
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error as exc:  # pragma: no cover - unreachable in tests
+        logger.warning(
+            "run_schema_migrations: cannot open launcher.db to read "
+            "_schema_migrations MAX (%s); treating as unknown",
+            exc,
+        )
+        return None
+    try:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations"
+        ).fetchone()
+    except sqlite3.Error as exc:
+        # Table absent (fresh/foreign DB) or unreadable — conservative unknown.
+        logger.warning(
+            "run_schema_migrations: cannot read _schema_migrations MAX (%s); "
+            "treating as unknown",
+            exc,
+        )
+        return None
+    finally:
+        conn.close()
+    if row is None or row[0] is None:
+        return None
+    return int(row[0])
 
 
 def _read_stored_version(
