@@ -4709,6 +4709,10 @@ class CodeGraphAnalyzer:
                     print(f"⚠️  Insert error in {rel_for_msg}: {e}")
                     stats['files_skipped'] += 1
                     stats['insert_errors'] += 1
+                    # R-3 (C-2): the module row may already carry the new
+                    # hash + current revision — un-stamp it so this file
+                    # re-walks next run instead of being skipped forever.
+                    self._invalidate_module_row(f, source_root)
                 except Exception as e:
                     # Non-insert failure (parse error not caught
                     # downstream, regex bug, file IO, etc.). Skip the
@@ -4735,6 +4739,10 @@ class CodeGraphAnalyzer:
                             break
                     if seen_dedup:
                         stats['insert_errors'] += 1
+                    # R-3 (C-2): same compensation as the insert-error
+                    # branch — ANY caught per-file failure after the module
+                    # write leaves a lying module row behind.
+                    self._invalidate_module_row(f, source_root)
 
         # Clear the per-language context now that the dispatch loop is
         # done (Plan C). The prune pass below doesn't depend on it.
@@ -6981,6 +6989,66 @@ class CodeGraphAnalyzer:
         if not hasattr(self, "_stale_file_set_cache"):
             self._stale_file_set_cache = self._build_stale_file_set()
         return self._stale_file_set_cache
+
+    def _invalidate_module_row(self, file_abs: Path, source_root: Path) -> None:
+        """R-3 (v0.2.73 / C-2): un-stamp the module row after a per-file failure.
+
+        Every walker writes the MODULE row (new ``file_hash`` + current
+        ``embed_revision``) BEFORE the file's entity rows. When a later entity
+        write fails, the per-file handler in ``analyze_repository`` counts the
+        file as skipped and continues — but the module row already claims
+        "done at the current revision", so the per-file gate skips the file on
+        every subsequent run and the missing/stale entities are unreachable
+        forever (until the user happens to edit the file). One transient
+        Weaviate 500 on entity #3 of a 50-entity file used to poison the file
+        permanently.
+
+        Compensation: clear ``file_hash`` and stamp ``embed_revision`` 0 on
+        the module row so BOTH gate conjuncts fail on the next run → the file
+        re-walks (and the R-1 stale-file probe independently sees it). Targets
+        the SAME row ``_get_existing_module`` consults (path-only filter,
+        limit=1), preferring this run's cache UUID when present.
+
+        Leave-alone case: when no module row exists (the failure happened
+        BEFORE the module write), there is nothing to invalidate and the gate
+        cannot wrongly skip — do nothing. Soft-fail with a log line: a failed
+        invalidation leaves exactly the pre-fix status quo, never crashes the
+        walk.
+        """
+        try:
+            rel = file_abs.relative_to(source_root).as_posix()
+        except Exception:  # noqa: BLE001 — extras/odd roots: best-effort key
+            rel = str(file_abs)
+        try:
+            coll = getattr(self, "modules_collection", None)
+            if coll is None:
+                return
+            cache = getattr(self, "module_cache", None) or {}
+            uuid_to_fix = cache.get(rel)
+            if uuid_to_fix is None:
+                result = coll.query.fetch_objects(
+                    filters=Filter.by_property("path").equal(rel), limit=1
+                )
+                objs = getattr(result, "objects", None) or []
+                if not objs:
+                    return  # no module row landed → nothing to compensate
+                uuid_to_fix = objs[0].uuid
+            coll.data.update(
+                uuid=uuid_to_fix,
+                properties={
+                    "file_hash": "",
+                    _EMBED_REVISION_PROP: _EMBED_REVISION_VECTORLESS,
+                },
+            )
+            print(
+                f"   ↺ invalidated module row for {rel} "
+                "(per-file failure → file re-walks next run)"
+            )
+        except Exception as exc:  # noqa: BLE001 — compensation is best-effort
+            print(
+                f"⚠️  module-row invalidation failed for {rel}: {exc}",
+                file=sys.stderr,
+            )
 
     def _get_existing_module(self, path: str, file_hash: str) -> Optional[str]:
         """Check if module already exists with same hash AT THE CURRENT
