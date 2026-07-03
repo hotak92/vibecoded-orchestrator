@@ -516,6 +516,9 @@ export type CodeGraphBuildStatus =
   | 'pending'
   | 'running'
   | 'success'
+  // v0.2.73 C-11 / RT-3: inserts succeeded but stale-row prune failed
+  // (PRUNE_FAILURES=N, N>0). Terminal, treated as a non-alert warning.
+  | 'partial'
   | 'failed'
   | 'skipped';
 

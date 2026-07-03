@@ -203,6 +203,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "code_graph_builds.pid column (R-4, v0.2.73). Nullable INTEGER: NULL = launcher-spawned build (lifecycle tied to the launcher; boot sweep fails stale 'running' ghosts as before), NOT NULL = detached analyzer registered via the hub's codegraph-build endpoint (install.py post-update resync) — survives launcher restarts; the boot sweep flips its 'running' row to 'failed' only when the pid is positively dead. Closes RT-1/RT-5 (install-spawned P7 resync invisible to the GUI + silent mid-walk death). Plain additive ALTER TABLE — idempotent via the runner's version check, not self-transactional. LAUNCHER_DB_TABLE_SET_VERSION bumps 36->37 atomically with this migration (B-2).",
         sql: include_str!("migrations/037_code_graph_build_pid.sql"),
     },
+    Migration {
+        version: 38,
+        description: "extend code_graph_builds.status CHECK with 'partial' (C-11 / RT-3, v0.2.73). A code-graph build can now finish PARTIAL: inserts succeeded (files_analyzed meaningful) but the stale-row DELETE pass failed (PRUNE_FAILURES=N, N>0). The analyzer keeps exit 0 and emits the machine-readable PRUNE_FAILURES line; the launcher stdout reader (commands/codegraph.rs) flips the row success->partial when N>0. SQLite CHECK constraints are immutable, so this is a table-rebuild (mirror of 021): the replacement table carries EVERY column the live table has after migration 037 — INCLUDING the pid column — then copy/drop/rename and recreate idx_code_graph_builds_status. No FK toggles / not self-transactional: nothing references code_graph_builds via an inbound FOREIGN KEY, so it rides the runner's outer transaction like 021. LAUNCHER_DB_TABLE_SET_VERSION bumps 37->38 atomically with this migration (B-2).",
+        sql: include_str!("migrations/038_code_graph_build_partial_status.sql"),
+    },
 ];
 
 /// Migrations whose .sql manages its OWN `BEGIN`/`COMMIT` boundary.
@@ -1924,5 +1929,184 @@ mod tests {
             )
             .expect("seeded token row must survive");
         assert_eq!(secret, "deadbeef");
+    }
+
+    // --- Migration 038: code_graph_builds.status CHECK extended with
+    //     'partial' (v0.2.73 C-11 / RT-3) ---
+
+    /// Helper: seed a project row + a code_graph_builds row so the table
+    /// rebuild in 038 has data to copy. Assumes the schema is at >= v37
+    /// (code_graph_builds exists with the `pid` column). `pid` is set so
+    /// the rebuild's column-preservation is exercised, not just assumed.
+    fn seed_project_and_build(conn: &Connection, status: &str, pid: Option<i64>) {
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT OR IGNORE INTO projects \
+                (id, name, folder_path, host, created_at, updated_at, slug) \
+             VALUES ('p1', 'Alpha', '/tmp/alpha', 'base', ?1, ?1, 'alpha')",
+            rusqlite::params![now],
+        )
+        .expect("seed project row");
+        conn.execute(
+            "INSERT INTO code_graph_builds \
+                (project_id, status, started_at, finished_at, duration_ms, \
+                 files_analyzed, languages, joern_used, error_message, log_tail, pid) \
+             VALUES ('p1', ?1, ?2, ?3, 1234, 5, '[\"py\"]', 0, NULL, 'tail', ?4)",
+            rusqlite::params![status, now, now + 1, pid],
+        )
+        .expect("seed code_graph_builds row");
+    }
+
+    /// On a fresh DB, `apply()` runs 038 and the code_graph_builds table
+    /// accepts status='partial'.
+    #[test]
+    fn migration_038_accepts_partial_status_on_fresh_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply migrations");
+
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO projects \
+                (id, name, folder_path, host, created_at, updated_at, slug) \
+             VALUES ('p1', 'Alpha', '/tmp/alpha', 'base', ?1, ?1, 'alpha')",
+            rusqlite::params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_graph_builds (project_id, status, files_analyzed) \
+             VALUES ('p1', 'partial', 5)",
+            [],
+        )
+        .expect("status='partial' must satisfy the extended CHECK");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_graph_builds WHERE status = 'partial'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// The extended CHECK is extended, not relaxed: a bogus status still
+    /// fails after 038.
+    #[test]
+    fn migration_038_still_rejects_unknown_status() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply migrations");
+
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO projects \
+                (id, name, folder_path, host, created_at, updated_at, slug) \
+             VALUES ('p1', 'Alpha', '/tmp/alpha', 'base', ?1, ?1, 'alpha')",
+            rusqlite::params![now],
+        )
+        .unwrap();
+        let err = conn.execute(
+            "INSERT INTO code_graph_builds (project_id, status, files_analyzed) \
+             VALUES ('p1', 'bogus', 5)",
+            [],
+        );
+        assert!(err.is_err(), "unknown status must fail the CHECK");
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.to_lowercase().contains("check"),
+            "expected CHECK error, got: {}",
+            msg
+        );
+    }
+
+    /// Upgrade path: a DB stopped at v37 (pre-partial) rebuilds cleanly,
+    /// preserving every column INCLUDING `pid`, and afterward accepts
+    /// 'partial'. Pins the "carry EVERY column" requirement so a future
+    /// edit that drops a column from the _new table fails loudly.
+    #[test]
+    fn migration_038_preserves_all_columns_including_pid_on_upgrade() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 37).expect("apply up to v37");
+
+        // 'partial' must NOT be accepted yet at v37.
+        seed_project_and_build(&conn, "success", Some(4242));
+        let pre = conn.execute(
+            "INSERT INTO code_graph_builds (project_id, status, files_analyzed) \
+             VALUES ('p1', 'partial', 1)",
+            [],
+        );
+        assert!(pre.is_err(), "'partial' must be rejected before migration 038");
+
+        // Apply 038.
+        apply(&conn).expect("apply remaining migrations");
+
+        // The seeded row survived with pid intact (column preservation).
+        let (status, files, pid): (String, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT status, files_analyzed, pid FROM code_graph_builds WHERE project_id = 'p1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("seeded row must survive the table rebuild");
+        assert_eq!(status, "success");
+        assert_eq!(files, 5);
+        assert_eq!(pid, Some(4242), "pid column must survive the 038 rebuild");
+
+        // Every post-037 column is present on the rebuilt table.
+        let mut stmt = conn.prepare("PRAGMA table_info(code_graph_builds)").unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        for expected in [
+            "project_id",
+            "status",
+            "started_at",
+            "finished_at",
+            "duration_ms",
+            "files_analyzed",
+            "languages",
+            "joern_used",
+            "error_message",
+            "log_tail",
+            "pid",
+        ] {
+            assert!(
+                cols.iter().any(|c| c == expected),
+                "column '{}' must survive the 038 rebuild; got {:?}",
+                expected,
+                cols
+            );
+        }
+
+        // And now 'partial' is accepted.
+        conn.execute(
+            "UPDATE code_graph_builds SET status = 'partial' WHERE project_id = 'p1'",
+            [],
+        )
+        .expect("status='partial' must be accepted after migration 038");
+
+        // The status index was recreated.
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_code_graph_builds_status'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "idx_code_graph_builds_status must be recreated by 038");
+    }
+
+    /// Migration 038 is idempotent (runner version-gate; regression net).
+    #[test]
+    fn migration_038_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("first apply");
+        apply(&conn).expect("second apply (idempotent)");
     }
 }

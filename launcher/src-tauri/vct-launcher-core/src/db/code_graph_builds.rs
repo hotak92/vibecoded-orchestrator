@@ -16,12 +16,16 @@ use super::Db;
 /// `pending`  → row inserted, subprocess not yet started.
 /// `running`  → subprocess alive, files being analyzed.
 /// `success`  → subprocess exited 0, rows in Weaviate.
+/// `partial`  → inserts succeeded but stale-row DELETES failed
+///              (`PRUNE_FAILURES=N`, N>0). Terminal, NOT a hard failure —
+///              the file count survives (v0.2.73 C-11 / RT-3).
 /// `failed`   → subprocess exited non-zero or panicked.
 /// `skipped`  → no supported source files in the folder, nothing to do.
 pub mod status {
     pub const PENDING: &str = "pending";
     pub const RUNNING: &str = "running";
     pub const SUCCESS: &str = "success";
+    pub const PARTIAL: &str = "partial";
     pub const FAILED: &str = "failed";
     pub const SKIPPED: &str = "skipped";
 }

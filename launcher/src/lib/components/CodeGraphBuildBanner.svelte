@@ -64,7 +64,8 @@
   }
 
   function maybeStartTick(v: CodeGraphBuildView) {
-    const terminal = v.status === 'success' || v.status === 'skipped';
+    const terminal =
+      v.status === 'success' || v.status === 'skipped' || v.status === 'partial';
     if (terminal && v.finished_at_iso && tickHandle === null) {
       tickHandle = setInterval(() => { now = Date.now(); }, 1000);
     }
@@ -109,6 +110,7 @@
         // payload small).
         if (
           e.payload.status === 'success' ||
+          e.payload.status === 'partial' ||
           e.payload.status === 'failed' ||
           e.payload.status === 'skipped'
         ) {
@@ -133,6 +135,7 @@
       case 'pending': return '·';
       case 'running': return '⟳';
       case 'success': return '✓';
+      case 'partial': return '⚠';
       case 'failed': return '!';
       case 'skipped': return '∅';
     }
@@ -148,6 +151,10 @@
       case 'success':
         if (v.files_analyzed === 0) return 'Code graph: indexed';
         return `Code graph: indexed ${v.files_analyzed} file${v.files_analyzed === 1 ? '' : 's'}`;
+      case 'partial':
+        return v.files_analyzed === 0
+          ? 'Code graph: built with stale-row cleanup warnings'
+          : `Code graph: indexed ${v.files_analyzed} file${v.files_analyzed === 1 ? '' : 's'} (stale-row cleanup warnings)`;
       case 'failed': return 'Code graph: build failed';
       case 'skipped': return 'Code graph: no source files found';
     }
@@ -155,6 +162,10 @@
 
   function detailLine(v: CodeGraphBuildView): string {
     const parts: string[] = [];
+    // Partial: lead with the stale-row warning (error_message carries the
+    // "N stale row(s) could not be pruned" text set by the reader). It's
+    // informational, not a failure — inserts all succeeded.
+    if (v.status === 'partial' && v.error_message) parts.push(v.error_message);
     if (v.languages.length > 0) parts.push(`Languages: ${v.languages.join(', ')}`);
     if (v.duration_ms != null) parts.push(`Took ${(v.duration_ms / 1000).toFixed(1)}s`);
     if (v.joern_used) parts.push('Joern: enabled (CFG + PDG)');
@@ -170,7 +181,9 @@
     if (view.status === 'failed' || view.status === 'pending' || view.status === 'running') {
       return true;
     }
-    // success / skipped: visible until hideTerminalAfterMs after finish
+    // success / skipped / partial: visible until hideTerminalAfterMs after
+    // finish. `partial` is a non-alert warning — inserts succeeded, so it
+    // auto-hides like success rather than sticking like `failed`.
     if (view.finished_at_iso) {
       const finishedMs = Date.parse(view.finished_at_iso);
       return Number.isFinite(finishedMs) && (now - finishedMs) < hideTerminalAfterMs;
@@ -214,7 +227,17 @@
             {rerunning ? 'Retrying…' : 'Retry build'}
           </button>
         {/if}
-        {#if view.status === 'success' || view.status === 'skipped'}
+        {#if view.status === 'partial'}
+          <button
+            type="button"
+            class="bg-btn-primary"
+            onclick={rerun}
+            disabled={rerunning}
+          >
+            {rerunning ? 'Rebuilding…' : 'Rebuild'}
+          </button>
+        {/if}
+        {#if view.status === 'success' || view.status === 'skipped' || view.status === 'partial'}
           <button
             type="button"
             class="bg-btn-x"
@@ -373,6 +396,18 @@
   .status-success .bg-glyph {
     background: rgba(70, 200, 120, 0.18);
     color: rgb(120, 220, 160);
+  }
+  /* Partial (v0.2.73 C-11): inserts succeeded, stale prune incomplete.
+     Amber warning tint — distinct from the pink `failed` (a hard error)
+     and the green `success`. Reuses the skipped-amber hue. */
+  .status-partial {
+    background: rgba(245, 179, 66, 0.10);
+    border-bottom-color: rgba(245, 179, 66, 0.35);
+    color: rgb(245, 179, 66);
+  }
+  .status-partial .bg-glyph {
+    background: rgba(245, 179, 66, 0.20);
+    color: rgb(245, 179, 66);
   }
   .status-failed {
     background: rgba(255, 79, 160, 0.10);

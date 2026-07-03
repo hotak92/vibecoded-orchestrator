@@ -248,6 +248,8 @@
     switch (status) {
       case 'success':
         return '✓';
+      case 'partial':
+        return '⚠';
       case 'failed':
         return '✗';
       case 'skipped':
@@ -269,6 +271,8 @@
         return 'analyzing';
       case 'success':
         return 'done';
+      case 'partial':
+        return 'done (stale-cleanup warnings)';
       case 'failed':
         return 'failed';
       case 'skipped':

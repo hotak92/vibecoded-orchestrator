@@ -1270,10 +1270,26 @@ async fn run_build_task(
 
             if out.status.success() {
                 let count = parse_files_analyzed(&stdout_str).unwrap_or(0);
+                // v0.2.73 C-11 / RT-3: exit 0 but stale-row prune failed
+                // (`PRUNE_FAILURES=N`, N>0) → PARTIAL. Inserts SUCCEEDED,
+                // so `count` (files_analyzed) MUST survive — the analyzer
+                // deliberately keeps exit 0 for this case precisely so the
+                // reader doesn't fall into the non-zero → FAILED / count=0
+                // branch below and discard a correct insert's file count.
+                // A missing line (older analyzer / prune disabled) → SUCCESS.
+                let prune_failures = parse_prune_failures(&stdout_str);
+                let status = success_or_partial_status(prune_failures);
+                let error_msg = match prune_failures {
+                    Some(n) if n > 0 => Some(format!(
+                        "{} stale row(s) could not be pruned; inserts succeeded",
+                        n
+                    )),
+                    _ => None,
+                };
                 (
-                    build_status::SUCCESS.to_string(),
+                    status.to_string(),
                     count,
-                    None,
+                    error_msg,
                     Some(tail),
                     joern_available,
                 )
@@ -1561,6 +1577,60 @@ pub(crate) fn parse_files_analyzed(stdout: &str) -> Option<u32> {
     None
 }
 
+/// Parse the machine-readable `PRUNE_FAILURES=N` line from analyzer
+/// stdout (v0.2.73 C-11 / RT-3). The analyzer emits this line (exactly,
+/// no emoji/prefix) whenever `--prune-stale` is active, so:
+///   * `Some(0)` — prune ran clean, no stale rows left behind.
+///   * `Some(N)`, N>0 — inserts succeeded but N stale-row DELETEs failed
+///     → the build is PARTIAL, not a hard failure (files_analyzed is
+///     still meaningful and must survive).
+///   * `None` — no such line (prune disabled, or an OLDER analyzer that
+///     predates the contract). Treated by callers as "unknown, not
+///     partial" — we NEVER fabricate a partial from a missing line.
+///
+/// Strict shape: a fully-trimmed line matching `PRUNE_FAILURES=<digits>`
+/// with nothing else. Mirrors the Python-side regex asserted by
+/// `test_prune_failures_line_regex_parseable` (`^PRUNE_FAILURES=(\d+)$`).
+///
+// must match analyze_code_graph.py PRUNE_FAILURES= emit (C-11)
+pub(crate) fn parse_prune_failures(stdout: &str) -> Option<u32> {
+    const PREFIX: &str = "PRUNE_FAILURES=";
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(digits) = trimmed.strip_prefix(PREFIX) {
+            // Strict: the remainder must be non-empty and ALL ASCII
+            // digits — reject `PRUNE_FAILURES=abc`, `PRUNE_FAILURES=`,
+            // trailing junk, etc. `u32::from_str_radix(_, 10)` already
+            // rejects signs, whitespace and non-digits.
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                if let Ok(n) = digits.parse::<u32>() {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Select the terminal build status for a subprocess that exited 0.
+///
+/// A pure helper (no I/O, no subprocess) so the success→partial decision
+/// is unit-testable without spawning the analyzer. Given the parsed
+/// prune-failure count (from [`parse_prune_failures`]):
+///   * `Some(n)` with n>0 → `partial` (inserts succeeded, stale prune
+///     incomplete — file count preserved by the caller).
+///   * `Some(0)` / `None`  → `success` (clean prune, or an older analyzer
+///     that didn't emit the line — unknown is treated as not-partial).
+///
+// must match analyze_code_graph.py PRUNE_FAILURES= emit (C-11)
+pub(crate) fn success_or_partial_status(prune_failures: Option<u32>) -> &'static str {
+    if prune_failures.unwrap_or(0) > 0 {
+        build_status::PARTIAL
+    } else {
+        build_status::SUCCESS
+    }
+}
+
 /// Look for `code-graph-analyze` in (in order):
 ///   1. `<project>/.claude/scripts/code-graph-analyze` — projects that
 ///      shipped with their own copy.
@@ -1718,6 +1788,92 @@ mod build_tests {
     #[test]
     fn parse_files_analyzed_returns_none_when_missing() {
         assert_eq!(parse_files_analyzed("nothing to see here"), None);
+    }
+
+    // --- v0.2.73 C-11 / RT-3: PRUNE_FAILURES= parsing + partial status ---
+
+    #[test]
+    fn parse_prune_failures_zero_is_some_zero() {
+        // A clean prune positively confirms N=0 (absence-of-line is NOT
+        // confirmation — that's the `None` case below).
+        assert_eq!(parse_prune_failures("PRUNE_FAILURES=0"), Some(0));
+    }
+
+    #[test]
+    fn parse_prune_failures_nonzero_extracts_count() {
+        assert_eq!(parse_prune_failures("PRUNE_FAILURES=7"), Some(7));
+    }
+
+    #[test]
+    fn parse_prune_failures_finds_line_among_other_output() {
+        let stdout = "🔍 Analyzing codebase...\n\
+                      📊 Statistics:\n\
+                         Files analyzed: 5\n\
+                      PRUNE_FAILURES=3\n\
+                      done\n";
+        assert_eq!(parse_prune_failures(stdout), Some(3));
+    }
+
+    #[test]
+    fn parse_prune_failures_absent_is_none() {
+        // Older analyzer / prune disabled — no line at all.
+        assert_eq!(parse_prune_failures("Files analyzed: 5\n"), None);
+        assert_eq!(parse_prune_failures(""), None);
+    }
+
+    #[test]
+    fn parse_prune_failures_rejects_malformed() {
+        // Non-digit payload, empty payload, and signed values must NOT
+        // parse — they'd desync from the Python `^PRUNE_FAILURES=(\d+)$`
+        // contract. A malformed line reads as "unknown" (None), never a
+        // fabricated partial.
+        assert_eq!(parse_prune_failures("PRUNE_FAILURES=abc"), None);
+        assert_eq!(parse_prune_failures("PRUNE_FAILURES="), None);
+        assert_eq!(parse_prune_failures("PRUNE_FAILURES=-1"), None);
+        assert_eq!(parse_prune_failures("PRUNE_FAILURES=3.5"), None);
+        assert_eq!(parse_prune_failures("PRUNE_FAILURES=3 extra"), None);
+        // A near-miss prefix must not match.
+        assert_eq!(parse_prune_failures("PRUNE_FAILURE=3"), None);
+    }
+
+    #[test]
+    fn parse_prune_failures_tolerates_surrounding_whitespace() {
+        // The line is fully trimmed before matching, so leading/trailing
+        // whitespace (and a trailing CR from CRLF pipes) is fine.
+        assert_eq!(parse_prune_failures("   PRUNE_FAILURES=4   "), Some(4));
+        assert_eq!(parse_prune_failures("PRUNE_FAILURES=9\r"), Some(9));
+    }
+
+    #[test]
+    fn success_or_partial_status_selects_partial_only_when_positive() {
+        // N>0 → partial; N=0, absent, all → success. This is the exact
+        // status-selection the exit-0 reader branch wires.
+        assert_eq!(success_or_partial_status(Some(1)), build_status::PARTIAL);
+        assert_eq!(success_or_partial_status(Some(42)), build_status::PARTIAL);
+        assert_eq!(success_or_partial_status(Some(0)), build_status::SUCCESS);
+        assert_eq!(success_or_partial_status(None), build_status::SUCCESS);
+    }
+
+    #[test]
+    fn partial_path_preserves_files_analyzed() {
+        // Regression guard for the whole point of C-11: a build that
+        // inserted 5 files but had 3 prune failures is PARTIAL, and the
+        // file count (5) MUST survive — it must NOT collapse to the
+        // failed-branch's count=0.
+        let stdout = "Files analyzed: 5\nPRUNE_FAILURES=3\n";
+        let count = parse_files_analyzed(stdout).unwrap_or(0);
+        let status = success_or_partial_status(parse_prune_failures(stdout));
+        assert_eq!(status, build_status::PARTIAL);
+        assert_eq!(count, 5, "files_analyzed must survive a partial build");
+    }
+
+    #[test]
+    fn clean_prune_is_success_with_count() {
+        let stdout = "Files analyzed: 8\nPRUNE_FAILURES=0\n";
+        let count = parse_files_analyzed(stdout).unwrap_or(0);
+        let status = success_or_partial_status(parse_prune_failures(stdout));
+        assert_eq!(status, build_status::SUCCESS);
+        assert_eq!(count, 8);
     }
 
     #[test]

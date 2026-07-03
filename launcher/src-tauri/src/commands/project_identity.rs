@@ -1162,7 +1162,10 @@ pub struct CodeGraphBuildStatusForProject {
 /// stays in lock-step with `db::code_graph_builds::status`.
 fn is_terminal_build_status(status: &str) -> bool {
     use crate::db::code_graph_builds::status as s;
-    matches!(status, s::SUCCESS | s::FAILED | s::SKIPPED)
+    // `partial` (v0.2.73 C-11 / RT-3) IS terminal — inserts succeeded but
+    // stale-row prune failed. Omitting it would make the wizard poll
+    // forever on a build that has, in fact, finished.
+    matches!(status, s::SUCCESS | s::PARTIAL | s::FAILED | s::SKIPPED)
 }
 
 /// Batched read of `code_graph_builds` for the wizard's poll loop.
@@ -2135,6 +2138,7 @@ mod tests {
     #[test]
     fn is_terminal_build_status_recognises_terminal_states() {
         assert!(is_terminal_build_status(build_status::SUCCESS));
+        assert!(is_terminal_build_status(build_status::PARTIAL));
         assert!(is_terminal_build_status(build_status::FAILED));
         assert!(is_terminal_build_status(build_status::SKIPPED));
     }
