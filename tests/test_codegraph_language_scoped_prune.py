@@ -287,7 +287,8 @@ def test_prune_stale_with_language_filters_correctly(analyzer_mod) -> None:
     fake.data.delete_by_id = _delete_by_id  # type: ignore[method-assign]
 
     # Visited only one Python row this run.
-    pruned = analyzer._prune_collection(
+    # v0.2.73 (C-11): _prune_collection now returns (pruned, failures).
+    pruned, _failures = analyzer._prune_collection(
         fake,
         visited_uuids={"py-1-visited"},
         language_scope="python",
@@ -336,7 +337,7 @@ def test_prune_stale_without_language_global_behavior(analyzer_mod) -> None:
     fake.iterator = _iterator  # type: ignore[attr-defined]
     fake.data.delete_by_id = _delete_by_id  # type: ignore[method-assign]
 
-    pruned = analyzer._prune_collection(
+    pruned, _failures = analyzer._prune_collection(
         fake,
         visited_uuids={"a-visited"},
         language_scope="",  # global prune
@@ -380,7 +381,7 @@ def test_prune_scoped_preserves_pre_migration_no_language_rows(analyzer_mod) -> 
     fake.iterator = _iterator  # type: ignore[attr-defined]
     fake.data.delete_by_id = _delete_by_id  # type: ignore[method-assign]
 
-    pruned = analyzer._prune_collection(
+    pruned, _failures = analyzer._prune_collection(
         fake, visited_uuids=set(), language_scope="python",
     )
 
@@ -460,7 +461,7 @@ def test_codeinteraction_prune_scoped_by_source_language(analyzer_mod) -> None:
     fake.data.delete_by_id = _delete_by_id  # type: ignore[method-assign]
 
     # Python pass visited ix-py-1 but not ix-py-2.
-    pruned = analyzer._prune_collection(
+    pruned, _failures = analyzer._prune_collection(
         fake,
         visited_uuids={"ix-py-1"},
         language_scope="python",

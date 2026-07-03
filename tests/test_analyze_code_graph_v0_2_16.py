@@ -554,7 +554,8 @@ def test_prune_stale_removes_unvisited(analyzer_mod):
     # Visit only UUID A.
     analyzer.visited_uuids = {(fake.name, "uuid-a-visited")}
 
-    pruned = analyzer._prune_collection(fake, visited_uuids={"uuid-a-visited"})
+    # v0.2.73 (C-11): _prune_collection now returns (pruned, failures).
+    pruned, _failures = analyzer._prune_collection(fake, visited_uuids={"uuid-a-visited"})
 
     assert pruned == 1, "Exactly one stale object should be pruned"
     assert deleted_uuids == ["uuid-b-stale"], (
