@@ -6461,7 +6461,7 @@ def _emit_user_secret_values_retained_deferral(folder: Path) -> None:
                     for key in env_block:
                         if is_secret_shaped_env_key(key):
                             return True
-                except (json.JSONDecodeError, Exception):
+                except Exception:  # noqa: BLE001 — malformed settings.json → soft no-detection
                     return False
             return False
         except Exception:
@@ -6473,21 +6473,13 @@ def _emit_user_secret_values_retained_deferral(folder: Path) -> None:
     if not (has_secret_in_env or has_secret_in_settings):
         return  # No pre-fix artifacts; don't emit.
 
-    # Check if a push remote exists (user should rotate if leaked to VCS).
-    has_push_remote = False
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["git", "config", "--get", "remote.origin.url"],
-            cwd=folder,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        has_push_remote = result.returncode == 0 and result.stdout.strip()
-    except Exception:
-        pass
-
+    # The rotate advice is CONDITIONAL IN PROSE ("if this project's git has a
+    # push remote…") rather than gated on a probe: the user knows their own
+    # VCS topology, and a git subprocess per bundle-update would be a wasted
+    # call (the advice reads correctly whether or not a remote exists). We also
+    # deliberately do NOT try to discover the user's real repo — it may be
+    # nested anywhere in the tree (see E-two-git-contexts) — so a single
+    # root-level `git config` probe would be unreliable anyway.
     rotate_advice = (
         "If this project's git has a push remote and the pre-v0.2.73 value "
         "was committed or pushed, rotate the affected key now to be safe."

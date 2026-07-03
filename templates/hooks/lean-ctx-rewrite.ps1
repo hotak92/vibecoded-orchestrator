@@ -79,6 +79,11 @@ if (-not (Get-Command lean-ctx -ErrorAction SilentlyContinue)) { exit 0 }
 #    for one call is strictly safer than emitting an auto-approval.
 #    MUST MATCH templates/hooks/lean-ctx-rewrite.sh (python filter there).
 $rewriteOut = & lean-ctx hook rewrite
+# P3 (v0.2.73): a NON-ZERO lean-ctx exit suppresses output — MUST MATCH the
+# .sh's `out="$(lean-ctx hook rewrite)" || exit 0`. Without this, lean-ctx
+# exiting non-zero WITH parseable JSON on stdout would emit a rewrite on
+# Windows while POSIX runs raw (cross-OS divergence).
+if ($LASTEXITCODE -ne 0) { exit 0 }
 if (-not $rewriteOut) { exit 0 }
 $rewriteRaw = ($rewriteOut -join "`n").Trim()
 if (-not $rewriteRaw) { exit 0 }
@@ -89,7 +94,14 @@ try {
     if ($hso.PSObject.Properties['permissionDecision']) {
         $hso.PSObject.Properties.Remove('permissionDecision')
     }
-    if ($null -eq $hso.PSObject.Properties['updatedInput'] -or $null -eq $hso.updatedInput) { exit 0 }
+    # P3 (v0.2.73): suppress on a MISSING, null, OR EMPTY updatedInput — MUST
+    # MATCH the .sh Python filter's truthiness check (`if not
+    # hso.get("updatedInput"): sys.exit(0)`). An empty object {} is falsy
+    # there, so it must be treated as "nothing to emit" here too (otherwise
+    # Windows emits "updatedInput":{} where POSIX emits nothing).
+    $ui = $hso.updatedInput
+    if ($null -eq $hso.PSObject.Properties['updatedInput'] -or $null -eq $ui) { exit 0 }
+    if (($ui.PSObject.Properties | Measure-Object).Count -eq 0) { exit 0 }
     Write-Output ($data | ConvertTo-Json -Depth 8 -Compress)
 } catch {
     # Emit nothing: no rewrite, raw command runs under the normal

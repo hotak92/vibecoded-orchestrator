@@ -187,15 +187,22 @@ def _parse_dotenv_value(text: str, key: str) -> Optional[str]:
     return None
 
 
-def _dotenv_dir(project: Optional[str]) -> Path:
+def _dotenv_dir(project: Optional[str]) -> Optional[Path]:
     """Which folder's ``.env`` tier 3 reads (must match the sh/ps1 rule).
 
     ``project=`` path → that folder (file path → its parent, same
-    normalization as :func:`_detect_file_project_name`); ``None`` →
-    cwd; a file-store NAME (no separators) → cwd.
+    normalization as :func:`_detect_file_project_name`); ``None`` → cwd.
+
+    A bare file-store NAME (no path separators) → **skip tier 3** (return
+    None), matching ``vct_secrets_resolve.sh`` / ``.ps1`` (test
+    ``test_tier3_skipped_for_bare_project_id``). A NAME does not identify a
+    filesystem location — mapping it to ``cwd`` would resolve a DIFFERENT
+    directory's ``.env`` than the named project (a caller in project X asking
+    for ``project="Y"`` would read X's ``.env``), which is both wrong and a
+    cross-project leak. Skipping is the safe, parity-correct behavior.
     """
     if project and "/" not in project and "\\" not in project:
-        return Path.cwd()
+        return None  # bare NAME → skip tier 3 (parity with sh/ps1)
     cur = Path(project).resolve() if project else Path.cwd()
     if cur.is_file():
         cur = cur.parent
@@ -210,7 +217,10 @@ def _project_dotenv_get(key: str, project: Optional[str]) -> Optional[str]:
     re-export into any VCO-written file). Returns None on any miss or
     I/O error (soft-fail).
     """
-    env_path = _dotenv_dir(project) / ".env"
+    dotenv_dir = _dotenv_dir(project)
+    if dotenv_dir is None:
+        return None  # bare NAME → tier 3 skipped (parity with sh/ps1)
+    env_path = dotenv_dir / ".env"
     if not env_path.is_file():
         return None
     try:
