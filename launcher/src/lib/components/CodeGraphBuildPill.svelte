@@ -74,6 +74,7 @@
         };
         if (
           e.payload.status === 'success' ||
+          e.payload.status === 'partial' ||
           e.payload.status === 'failed' ||
           e.payload.status === 'skipped'
         ) {
@@ -92,6 +93,7 @@
       case 'pending': return '·';
       case 'running': return '⟳';
       case 'success': return '✓';
+      case 'partial': return '⚠';
       case 'failed': return '!';
       case 'skipped': return '∅';
     }
@@ -104,6 +106,10 @@
       case 'success':
         if (v.files_analyzed === 0) return 'Indexed';
         return `Indexed · ${v.files_analyzed} file${v.files_analyzed === 1 ? '' : 's'}`;
+      case 'partial':
+        return v.files_analyzed === 0
+          ? 'Indexed · cleanup warnings'
+          : `Indexed · ${v.files_analyzed} file${v.files_analyzed === 1 ? '' : 's'} · cleanup warnings`;
       case 'failed': return 'Index failed';
       case 'skipped': return 'No source files';
     }
@@ -178,6 +184,13 @@
     background: rgba(70, 200, 120, 0.10);
     border-color: rgba(70, 200, 120, 0.3);
     color: rgb(70, 200, 120);
+  }
+  /* Partial (v0.2.73 C-11): inserts succeeded, stale prune incomplete —
+     amber warning, distinct from the pink `failed`. */
+  .status-partial {
+    background: rgba(245,179,66,0.12);
+    border-color: rgba(245,179,66,0.4);
+    color: rgb(245,179,66);
   }
   .status-failed {
     background: rgba(255,79,160,0.10);

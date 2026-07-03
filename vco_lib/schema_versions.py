@@ -182,11 +182,15 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: the DB schema is at the level this code expects (refuse to start if
 #: launcher.db is somehow ahead — user downgraded orchestrator while running
 #: on newer DB).
+#: 38 = migration 038_code_graph_build_partial_status.sql (extend
+#: code_graph_builds.status CHECK with 'partial', C-11/RT-3 — a build whose
+#: inserts succeeded but stale-row prune failed, PRUNE_FAILURES=N>0). Bumped
+#: ATOMICALLY with mig 038's Rust registration (a Python-ahead bump would
+#: stamp a phantom schema version).
 #: 37 = migration 037_code_graph_build_pid.sql (code_graph_builds.pid, R-4 —
 #: registers the detached install-spawned resync walk so the GUI shows it and
-#: the boot sweep can death-detect it). Bumped ATOMICALLY with mig 037's Rust
-#: registration (a Python-ahead bump would stamp a phantom schema version).
-LAUNCHER_DB_TABLE_SET_VERSION = 37
+#: the boot sweep can death-detect it).
+LAUNCHER_DB_TABLE_SET_VERSION = 38
 
 
 # ===========================================================================
