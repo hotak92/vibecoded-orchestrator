@@ -236,3 +236,129 @@ def test_cli_probe_never_prints_value(offline_hub, file_store):
     combined = cp.stdout + cp.stderr
     assert "shared-token-value" not in combined
     assert "github_pat" in combined
+
+
+# ─── v0.2.73 tier 3: the project's own .env (read-only, lowest) ─────────
+#
+# Synthetic fixture shared with the sh + ps1 siblings
+# (tests/test_vct_secrets_resolve.sh, tests/test_vct_secrets_resolve_ps1.py)
+# — same key names, same values, same parse cases. Keep the three in
+# lockstep (the resolvers carry "must match" headers).
+
+_DOTENV_FIXTURE = (
+    "# comment line — skipped\n"
+    "export EXPORTED_KEY=plain-exported\n"
+    'QUOTED_KEY="double quoted value"\n'
+    "SINGLE_KEY='single quoted value'\n"
+    "FIRST_MATCH=first-wins\n"
+    "FIRST_MATCH=second-loses\n"
+    "NO_EXPANSION=$HOME/literal\n"
+    "MISMATCHED='half\"\n"
+)
+
+
+@pytest.fixture()
+def empty_file_store(monkeypatch, tmp_path):
+    """Isolated EMPTY file store so tier 2 always misses."""
+    root = tmp_path / "empty-store"
+    (root / "shared").mkdir(parents=True)
+    monkeypatch.setenv("VCT_SECRETS_DIR", str(root))
+    return root
+
+
+@pytest.mark.parametrize(
+    ("key", "want"),
+    [
+        ("EXPORTED_KEY", "plain-exported"),
+        ("QUOTED_KEY", "double quoted value"),
+        ("SINGLE_KEY", "single quoted value"),
+        ("FIRST_MATCH", "first-wins"),
+        ("NO_EXPANSION", "$HOME/literal"),  # NO variable expansion
+        ("MISMATCHED", "'half\""),  # mismatched quotes NOT stripped
+    ],
+)
+def test_dotenv_parse_cases(key, want):
+    """Tier-3 parsing rule, unit level (identical ×3 across sh/ps1/py)."""
+    assert agent_secrets._parse_dotenv_value(_DOTENV_FIXTURE, key) == want
+
+
+def test_dotenv_parse_absent_key_returns_none():
+    assert agent_secrets._parse_dotenv_value(_DOTENV_FIXTURE, "ABSENT") is None
+
+
+def test_dotenv_resolves_when_hub_and_store_miss(
+    offline_hub, empty_file_store, tmp_path
+):
+    proj = tmp_path / "proj-with-dotenv"
+    proj.mkdir()
+    (proj / ".env").write_text(_DOTENV_FIXTURE, encoding="utf-8")
+    assert get("EXPORTED_KEY", project=str(proj)) == "plain-exported"
+
+
+def test_dotenv_cwd_used_when_project_is_none(
+    offline_hub, empty_file_store, tmp_path, monkeypatch
+):
+    proj = tmp_path / "cwd-proj"
+    proj.mkdir()
+    (proj / ".env").write_text(_DOTENV_FIXTURE, encoding="utf-8")
+    monkeypatch.chdir(proj)
+    assert get("QUOTED_KEY") == "double quoted value"
+
+
+def test_dotenv_file_store_beats_dotenv(offline_hub, file_store, tmp_path):
+    """Tier order: the managed file store (tier 2) wins over the ambient
+    .env (tier 3) — a user migrating a key into the managed store gets
+    the managed copy without deleting their .env line."""
+    proj = tmp_path / "precedence-proj"
+    proj.mkdir()
+    (proj / ".env").write_text("github_pat=dotenv-should-lose\n", encoding="utf-8")
+    # `file_store` seeds shared/github_pat = "shared-token-value".
+    assert get("github_pat", project=str(proj)) == "shared-token-value"
+
+
+def test_dotenv_skipped_when_fallback_disabled(
+    offline_hub, empty_file_store, tmp_path
+):
+    """allow_file_fallback=False gates BOTH tier 2 and tier 3."""
+    proj = tmp_path / "gated-proj"
+    proj.mkdir()
+    (proj / ".env").write_text(_DOTENV_FIXTURE, encoding="utf-8")
+    with pytest.raises((HubUnreachable, ProjectNotFound)):
+        get("EXPORTED_KEY", project=str(proj), allow_file_fallback=False)
+
+
+def test_dotenv_key_not_active_falls_to_dotenv(tmp_path, monkeypatch):
+    """key_not_active falls through tier 2 (empty) to tier 3."""
+    root = tmp_path / "store"
+    (root / "shared").mkdir(parents=True)
+    monkeypatch.setenv("VCT_SECRETS_DIR", str(root))
+    proj = tmp_path / "kna-proj"
+    proj.mkdir()
+    (proj / ".env").write_text("GATED_KEY=dotenv-answers\n", encoding="utf-8")
+
+    def fake_hub_get(key, project):
+        raise AccessDenied(f"key {key!r} not active for project x")
+
+    monkeypatch.setattr(agent_secrets, "_hub_get", fake_hub_get)
+    assert get("GATED_KEY", project=str(proj)) == "dotenv-answers"
+
+
+def test_dotenv_values_never_in_exception(
+    offline_hub, empty_file_store, tmp_path
+):
+    """Errors name keys + tiers, never values — including tier-3 ones."""
+    proj = tmp_path / "leak-proj"
+    proj.mkdir()
+    (proj / ".env").write_text(_DOTENV_FIXTURE, encoding="utf-8")
+    with pytest.raises(SecretNotFound) as exc_info:
+        get("TOTALLY_MISSING_KEY", project=str(proj))
+    msg = str(exc_info.value)
+    for leaked in (
+        "plain-exported",
+        "double quoted value",
+        "single quoted value",
+        "first-wins",
+    ):
+        assert leaked not in msg
+    # The message names the tiers consulted.
+    assert "tier 3" in msg and ".env" in msg
