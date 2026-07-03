@@ -16211,6 +16211,17 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
     #
     # CI-10 diff gate: when _sync_all=False, pass explicit file list
     # instead of --all (only syncs changed files).
+    # SEG-1 (v0.2.73): track whether the sync subprocess actually EXECUTED
+    # (regardless of exit code), as distinct from "never ran" (script missing
+    # or failed to launch). The context-triple app_state persist below is gated
+    # on this flag — NOT on `seed_errors` — because a run where the subprocess
+    # ran and embedded 2589/2590 nodes DID (re)embed the collection against the
+    # current context, even if one node failed. Gating the persist on
+    # `seed_errors` meant a single transient node failure (e.g. one oversize
+    # chunk → sync_knowledge_graph.py exits 1) left last_installed_active_embedding
+    # at None forever, forcing a full ~2590-node re-embed on EVERY subsequent
+    # --update (CI-10 "pay once" defeated). See the persist block below.
+    sync_subprocess_ran = False
     if sync_kg.exists():
         if _sync_all:
             cmd_args = ["--all"]
@@ -16240,19 +16251,49 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
                 cwd=str(PROJECT_ROOT),
                 env=_subprocess_env_with_embedding(),
             )
+            # Subprocess executed AND exited 0 — clean sync.
+            sync_subprocess_ran = True
         except subprocess.CalledProcessError as e:
+            # Subprocess EXECUTED but exited non-zero — e.g. 1/2590 nodes failed
+            # (oversize chunk, transient embed error). The other 2589 WERE
+            # embedded against current_active_embedding, so the collection now
+            # reflects the current context. We record seed_errors (so the KG
+            # PRUNE below stays conservatively skipped) but STILL mark the
+            # subprocess as having run — the context-persist keys off this, not
+            # off seed_errors. The next --update's content-hash diff re-picks-up
+            # only the failed node(s) (their Weaviate content_hash won't match
+            # on-disk), re-embedding them alone in seconds. (SEG-1 fix.)
             print(f"    ! kg/docs sync exited {e.returncode} — re-run later with `kg-sync --all`")
             seed_errors.append(f"kg-sync exit {e.returncode}")
+            sync_subprocess_ran = True
         except FileNotFoundError as e:
+            # Subprocess FAILED TO LAUNCH (venv python / script path bad) —
+            # nothing was embedded. Leave sync_subprocess_ran False so we do
+            # NOT record a false "collection embedded against current context".
             print(f"    ! kg/docs sync failed: {e}")
             seed_errors.append(f"kg-sync FileNotFound: {e}")
     else:
+        # Sync script missing — the subprocess never ran, nothing embedded.
+        # sync_subprocess_ran stays False → context triple is NOT persisted.
         print(f"  ! sync_knowledge_graph.py not found at {sync_kg}")
         seed_errors.append("sync_knowledge_graph.py missing")
 
-    # After a successful sync, update app_state with current context so
-    # the next --update run can compare against these values.
-    if not seed_errors:
+    # SEG-1 (v0.2.73): persist the CONTEXT TRIPLE
+    # (last_installed_active_embedding / _kg_collection / _shared_kg_collection)
+    # whenever the sync subprocess ACTUALLY RAN — even if it exited non-zero
+    # with ≥1 failed node. Rationale: this triple records WHAT CONTEXT the
+    # collection was last embedded against, which is TRUE for the 2589/2590
+    # nodes that succeeded; the next --update's content-hash diff will re-embed
+    # exactly the node(s) that failed (seconds), instead of full-re-embedding
+    # all 2590 (~70 min) because the key was stuck at None. We gate on
+    # `sync_subprocess_ran`, NOT `seed_errors`, so a launch failure / missing
+    # script (nothing embedded) still correctly skips the persist.
+    #
+    # The sync-AT timestamp + sync-STATS are persisted on the same condition:
+    # they record "we last attempted a sync at T, embedding N/K nodes" — reality
+    # regardless of the one failed node — so they belong with the context triple,
+    # not under a stricter success check.
+    if sync_subprocess_ran:
         _write_app_state_key(_APP_STATE_KEY_LAST_ACTIVE_EMBEDDING, current_active_embedding)
         _write_app_state_key(_APP_STATE_KEY_LAST_KG_COLLECTION, current_kg_collection)
         _write_app_state_key(_APP_STATE_KEY_LAST_SHARED_KG_COLLECTION, current_shared_kg)

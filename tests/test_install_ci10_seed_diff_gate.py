@@ -329,6 +329,210 @@ class SeedDiffGateTest(unittest.TestCase):
         self.assertTrue(found_all, "fresh install must always run --all sync")
 
 
+class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
+    """SEG-1 (v0.2.73): the CONTEXT TRIPLE
+    (last_installed_active_embedding / _kg_collection / _shared_kg_collection)
+    must be persisted whenever the KG-sync subprocess ACTUALLY RAN — even if it
+    exited non-zero because ≥1 node failed — and must NOT be persisted when the
+    subprocess never ran (script missing / failed to launch).
+
+    Regression: previously the persist was gated on `if not seed_errors:`, so a
+    single transient node failure (sync_knowledge_graph.py exits 1) left
+    last_installed_active_embedding at None forever, forcing a full ~2590-node
+    re-embed on EVERY subsequent --update (CI-10 "pay once" defeated).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["VCT_STATE_DIR"] = self.tmp
+        os.environ["ACTIVE_EMBEDDING"] = "qwen3"
+        os.environ["KG_COLLECTION"] = "TestProject_KnowledgeGraph"
+        os.environ["SHARED_KG_COLLECTION"] = ""  # shared seed skipped
+
+        # Stored context MATCHES current env → no "context change" full sync;
+        # the diff path decides sync vs skip based on hashes. We give a
+        # non-empty diff below so the sync subprocess actually runs.
+        self.db_path = _make_db_with_state(
+            last_installed_kg_collection="TestProject_KnowledgeGraph",
+            last_installed_shared_kg_collection="",
+        )
+        # NOTE: last_installed_active_embedding is deliberately ABSENT here —
+        # simulating the stuck-at-None fresh-install / post-transient-failure
+        # state SEG-1 is about. Because it's absent, context_changed is True,
+        # so this run takes the FULL --all sync path (the exact path that
+        # embeds all nodes against the current context).
+        self._db_patcher = mock.patch.object(
+            install, "_discover_app_state_db_path", return_value=self.db_path
+        )
+        self._db_patcher.start()
+
+    def tearDown(self):
+        self._db_patcher.stop()
+        for k in ("VCT_STATE_DIR", "ACTIVE_EMBEDDING", "KG_COLLECTION",
+                  "SHARED_KG_COLLECTION"):
+            os.environ.pop(k, None)
+        try:
+            os.unlink(str(self.db_path))
+        except OSError:
+            pass
+
+    def _read_triple(self) -> dict:
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            return {
+                r[0]: r[1]
+                for r in conn.execute("SELECT key, value FROM app_state").fetchall()
+            }
+        finally:
+            conn.close()
+
+    def _run_seed(self, *, subprocess_side_effect, write_sync_script=True):
+        """Run install._seed_weaviate with a controllable subprocess stub.
+
+        subprocess_side_effect(cmd, **kwargs) is called for every subprocess.run;
+        it may return a fake completed-process or raise (e.g. CalledProcessError).
+        When write_sync_script is False, the sync_knowledge_graph.py stub is NOT
+        created → sync_kg.exists() is False → the subprocess never runs.
+        """
+        tmp_dir = Path(self.tmp)
+        scripts_dir = tmp_dir / ".claude" / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        if write_sync_script:
+            (scripts_dir / "sync_knowledge_graph.py").write_text("# stub\n")
+
+        fake_venv = tmp_dir / ".venv" / "bin"
+        fake_venv.mkdir(parents=True, exist_ok=True)
+        fake_python = fake_venv / "python"
+        fake_python.write_text("#!/bin/sh\n")
+        fake_python.chmod(0o755)
+
+        # One on-disk file, no stored hash → non-empty diff → sync runs (when
+        # context is unchanged). With embedding absent, context_changed forces
+        # --all anyway; either way the sync subprocess is invoked.
+        on_disk = {f"{self.tmp}/knowledge/concepts/foo.md": "aabbcc"}
+
+        with mock.patch.object(
+            install, "PROJECT_ROOT", tmp_dir,
+        ), mock.patch.object(
+            install, "_compute_on_disk_content_hashes", return_value=on_disk,
+        ), mock.patch.object(
+            install, "_batch_query_weaviate_content_hashes", return_value={},
+        ), mock.patch(
+            "subprocess.run", side_effect=subprocess_side_effect,
+        ):
+            install._seed_weaviate(_make_args())
+
+    # ── (i) subprocess ran but exited non-zero → context triple PERSISTED ──
+
+    def test_nonzero_exit_still_persists_context_triple(self):
+        """Core regression: a sync that EXECUTED but exited non-zero (≥1 node
+        failed) must still persist last_installed_active_embedding == current."""
+        import subprocess as _sp
+
+        def _raise_nonzero(cmd, **kwargs):
+            # Only the per-project KG sync raises; other subprocess.run calls
+            # (e.g. shared-KG seed) succeed. Identify by the sync script path.
+            if "sync_knowledge_graph.py" in str(cmd):
+                raise _sp.CalledProcessError(returncode=1, cmd=cmd)
+            class _Ret:
+                returncode = 0
+            return _Ret()
+
+        self._run_seed(subprocess_side_effect=_raise_nonzero)
+
+        rows = self._read_triple()
+        self.assertEqual(
+            rows.get(install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING), "qwen3",
+            "SEG-1: context embedding MUST be persisted even when the sync "
+            "subprocess exited non-zero (1 node failed of many)",
+        )
+        self.assertEqual(
+            rows.get(install._APP_STATE_KEY_LAST_KG_COLLECTION),
+            "TestProject_KnowledgeGraph",
+            "SEG-1: kg collection must be persisted on non-zero exit too",
+        )
+        # Stats/timestamp recorded too (they reflect the attempt reality).
+        self.assertIn(install._APP_STATE_KEY_LAST_KG_SYNC_AT, rows)
+        self.assertIn(install._APP_STATE_KEY_LAST_KG_SYNC_STATS, rows)
+
+    # ── (ii) sync script MISSING → context triple NOT persisted ───────────
+
+    def test_missing_sync_script_does_not_persist_context_triple(self):
+        """When sync_knowledge_graph.py is absent, the subprocess never runs and
+        nothing is embedded → the context triple must NOT be recorded (else we
+        would falsely claim the collection is embedded against current context).
+        """
+        def _fail_if_called(cmd, **kwargs):
+            # The per-project sync must NOT be invoked (script missing). Shared
+            # seed may still run; allow it to succeed.
+            if "sync_knowledge_graph.py" in str(cmd) and str(cmd).count(self.tmp):
+                raise AssertionError("per-project sync must not run when script missing")
+            class _Ret:
+                returncode = 0
+            return _Ret()
+
+        self._run_seed(
+            subprocess_side_effect=_fail_if_called,
+            write_sync_script=False,
+        )
+
+        rows = self._read_triple()
+        self.assertIsNone(
+            rows.get(install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING),
+            "SEG-1: context embedding must NOT be persisted when the sync "
+            "script is missing (nothing was embedded)",
+        )
+        self.assertNotIn(
+            install._APP_STATE_KEY_LAST_KG_SYNC_AT, rows,
+            "SEG-1: no sync-at timestamp when the subprocess never ran",
+        )
+
+    # ── (iii) two-update integration: transient failure → diff path next ──
+
+    def test_transient_failure_then_next_update_takes_diff_path(self):
+        """Simulate two consecutive --update runs. Run 1 has a transient node
+        failure (non-zero exit). After the fix, run 1 persists the context
+        triple, so at run 2 `context_changed` is computable as False (the diff
+        path), not the full-sync path.
+
+        We assert the intermediate state directly: after run 1 the stored triple
+        equals the current context, which is exactly the precondition the
+        run-2 context-change check reads at install.py:16087-16091.
+        """
+        import subprocess as _sp
+
+        # RUN 1 — 1 node fails (non-zero exit).
+        def _raise_nonzero(cmd, **kwargs):
+            if "sync_knowledge_graph.py" in str(cmd):
+                raise _sp.CalledProcessError(returncode=1, cmd=cmd)
+            class _Ret:
+                returncode = 0
+            return _Ret()
+
+        self._run_seed(subprocess_side_effect=_raise_nonzero)
+
+        rows = self._read_triple()
+        stored_embedding = rows.get(install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING)
+        stored_kg = rows.get(install._APP_STATE_KEY_LAST_KG_COLLECTION)
+        stored_shared = rows.get(install._APP_STATE_KEY_LAST_SHARED_KG_COLLECTION)
+
+        # This is the exact comparison install.py runs at the top of run 2.
+        current_active_embedding = os.environ["ACTIVE_EMBEDDING"]
+        current_kg = os.environ["KG_COLLECTION"]
+        current_shared = os.environ["SHARED_KG_COLLECTION"]
+        context_changed = (
+            stored_embedding != current_active_embedding
+            or stored_kg != current_kg
+            or stored_shared != current_shared
+        )
+        self.assertFalse(
+            context_changed,
+            "SEG-1: after a transient-failure run, the next --update must NOT "
+            "see a context change → it takes the content-hash DIFF path (re-embed "
+            "only the failed node), not a full 2590-node re-embed",
+        )
+
+
 class ContentHashHelpersTest(unittest.TestCase):
     """Unit tests for the pure helper functions."""
 
