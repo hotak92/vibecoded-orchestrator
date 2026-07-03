@@ -445,11 +445,17 @@ fn mcp_server_to_claude_entry(server: &crate::types::McpServerConfig) -> serde_j
 pub async fn remove_mcp_server(mcp_id: String) -> Result<Vec<McpServerConfig>, String> {
     let mut config = load_config();
 
-    // Don't allow removing built-in servers.
-    // Note: "ollama" was removed from the default MCP list in v0.2.11
-    // (Ollama MCP deprecated; Ollama infrastructure unchanged).
-    let builtin = ["weaviate-kg", "search", "playwright"];
-    if builtin.contains(&mcp_id.as_str()) {
+    // Don't allow removing built-in servers. F-3 (v0.2.73): derive the
+    // protection set from the SINGLE catalog source of truth
+    // (`is_bundled_mcp`, backed by `BUNDLED_MCP_NAMES`) instead of a
+    // hand-maintained 3-name list that disagreed with the 8-name catalog.
+    // The old list omitted mermaid/excalidraw/etc., so `remove_mcp_server`
+    // would delete a bundled-but-default-disabled MCP AND deregister it from
+    // ~/.claude.json — then the next `install-bundle --update` silently
+    // re-adds it (the exact "delete vs disable" confusion CLAUDE.md rule 2
+    // forbids). Protecting EVERY bundled MCP steers the user to disable
+    // (enabled=false, survives updates) rather than remove.
+    if vct_launcher_core::db::project_mcp_servers::is_bundled_mcp(&mcp_id) {
         return Err(format!("Cannot remove built-in MCP server '{}'. Disable it instead.", mcp_id));
     }
 
