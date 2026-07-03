@@ -789,8 +789,16 @@ pub fn resume_pending_builds(
 ) -> (usize, usize) {
     let db = app.state::<Db>();
 
-    // Phase 1: stale-running sweep.
-    let swept = match db.mark_orphaned_running_code_graph_builds_failed(
+    // Phase 1: stale-running sweep — pid-aliveness-aware since R-4
+    // (v0.2.73). Two row classes:
+    //   * pid IS NULL — launcher-spawned build; its subprocess died with
+    //     the previous launcher → stale ghost → failed (as always).
+    //   * pid IS NOT NULL — DETACHED analyzer registered via the hub's
+    //     codegraph-build endpoint (install.py's post-update resync). It
+    //     legitimately survives launcher restarts: only a POSITIVELY dead
+    //     pid flips the row to failed (making RT-5's silent mid-walk
+    //     death visible with a Retry); alive/unknown pids are left alone.
+    let mut swept = match db.mark_orphaned_running_code_graph_builds_failed(
         "launcher crashed mid-run; click Retry to re-run",
     ) {
         Ok(n) => n,
@@ -804,6 +812,27 @@ pub fn resume_pending_builds(
             0
         }
     };
+    match db.sweep_dead_detached_code_graph_builds(crate::pid_is_alive) {
+        Ok(failed) => {
+            if !failed.is_empty() {
+                eprintln!(
+                    "[vct] code-graph sweep: {} detached walk(s) died mid-run \
+                     (project ids: {:?}); rows flipped to failed",
+                    failed.len(),
+                    failed
+                );
+            }
+            swept += failed.len();
+        }
+        Err(e) => {
+            eprintln!(
+                "[vct] warning: dead-detached code-graph sweep failed: {}. \
+                 Detached 'running' rows (if any) keep their pill until the \
+                 next boot; user can click Re-build code graph to recover.",
+                e
+            );
+        }
+    }
 
     // Phase 2: respawn pending. We resolve project name/folder per id
     // because `spawn_initial_build` needs both. Drop projects that no

@@ -198,6 +198,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "project_setups table (Defect B, v0.2.68). One row per project tracks the lifecycle of the async setup task that `create_project_v2` now detaches (bootstrap-collections + install-bundle + post-bundle phase) so the New Project modal returns FAST instead of blocking ~51s on a cold Weaviate/Ollama backend. Mirrors code_graph_builds (006) + kg_syncs (011): same {started,finished}_at, same FK cascade. Status set adds 'done'/'deferred'/'failed' terminal states ('deferred' = informational amber, a phase deferred cleanly e.g. Weaviate bootstrap on a cold backend — NOT a failure). A 'pending'/'running' row is the re-entrancy LOCK (refuses a 2nd concurrent setup for the same project; mirrors v0.2.67 install_in_flight) AND gates the boot-resume sweeps for code-graph/kg-sync/kg-summary so a crash mid-setup can't resurrect the 2026-05-06 spawn-before-bundle race. `warnings` is a JSON array carried on the terminal setup-progress event for the frontend to re-toast (F5). Plain additive CREATE TABLE — idempotent, not self-transactional.",
         sql: include_str!("migrations/036_project_setups.sql"),
     },
+    Migration {
+        version: 37,
+        description: "code_graph_builds.pid column (R-4, v0.2.73). Nullable INTEGER: NULL = launcher-spawned build (lifecycle tied to the launcher; boot sweep fails stale 'running' ghosts as before), NOT NULL = detached analyzer registered via the hub's codegraph-build endpoint (install.py post-update resync) — survives launcher restarts; the boot sweep flips its 'running' row to 'failed' only when the pid is positively dead. Closes RT-1/RT-5 (install-spawned P7 resync invisible to the GUI + silent mid-walk death). Plain additive ALTER TABLE — idempotent via the runner's version check, not self-transactional. LAUNCHER_DB_TABLE_SET_VERSION bumps 36->37 atomically with this migration (B-2).",
+        sql: include_str!("migrations/037_code_graph_build_pid.sql"),
+    },
 ];
 
 /// Migrations whose .sql manages its OWN `BEGIN`/`COMMIT` boundary.

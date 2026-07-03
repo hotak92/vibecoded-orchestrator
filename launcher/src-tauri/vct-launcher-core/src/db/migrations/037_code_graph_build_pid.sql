@@ -1,0 +1,50 @@
+-- v0.2.73 R-4: register install-spawned codegraph resyncs in
+-- code_graph_builds (GUI visibility + death detection).
+--
+-- Adds a nullable `pid` column to `code_graph_builds`.
+--
+-- Why this lands NOW
+-- ------------------
+-- install.py's post-update codegraph resync (spawn_background_resync in
+-- vco_lib/codegraph_resync.py) launches the analyzer as a DETACHED OS
+-- process (start_new_session=True) that outlives both install.py and
+-- the launcher. Pre-v0.2.73 that spawn wrote NO code_graph_builds row:
+-- the GUI's top progress system (which feeds exclusively from this
+-- table) never showed it, and when the walk died mid-run nothing
+-- noticed — runtime-proven on 2026-07-02 when a P7 resync died
+-- silently, leaving ~6.2k rows permanently at a stale embed_revision
+-- with zero signal (RT-1/RT-5 findings).
+--
+-- Column semantics
+-- ----------------
+--   pid IS NULL      — launcher-spawned build (tokio child whose
+--                      lifecycle is tied to the launcher process).
+--                      Boot-time sweep: a 'running' row with NULL pid
+--                      after a launcher restart is a stale ghost ->
+--                      flip to 'failed' (pre-v0.2.73 behaviour).
+--   pid IS NOT NULL  — detached analyzer registered via the hub's
+--                      codegraph-build endpoint. It legitimately
+--                      survives launcher restarts: the sweep flips the
+--                      row to 'failed' ONLY when the pid is positively
+--                      dead (conservative: alive or unknown -> leave
+--                      alone).
+--
+-- Schema change
+-- -------------
+-- Plain additive `ALTER TABLE ... ADD COLUMN` (same shape as
+-- migration 030); nullable INTEGER, all existing rows backfill to
+-- NULL (= launcher-spawned, the only kind that existed pre-v0.2.73).
+--
+-- Idempotency
+-- -----------
+-- The migration runner only applies each version once. Re-running
+-- install.py --update on a host that's already past v37 is a no-op
+-- at the migration layer.
+--
+-- ATOMIC PAIRING (B-2 lesson): vco_lib/schema_versions.py's
+-- LAUNCHER_DB_TABLE_SET_VERSION bumps 36 -> 37 in the SAME merge as
+-- this file — a Python-side bump landing ahead of this registration
+-- would stamp a phantom schema version.
+
+ALTER TABLE code_graph_builds
+    ADD COLUMN pid INTEGER;
