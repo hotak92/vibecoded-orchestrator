@@ -66,6 +66,50 @@ logger = logging.getLogger(__name__)
 DEFAULT_CODE_EMBED_PORT = 11440
 _CONDITION_ID = "codegraph_embed_resync_pending"
 
+# ── R-6 (v0.2.73): owed-work probe ───────────────────────────────────────────
+#
+# Fallback embedding revision when the analyzer source cannot be parsed.
+# MUST MATCH templates/scripts/analyze_code_graph.py::CODEGRAPH_EMBED_REVISION
+# (the primary source — `_resolve_embed_revision` regex-parses it from the
+# resolved analyzer file so the two can't silently drift on a normal install;
+# this constant only covers a missing/unreadable analyzer).
+_FALLBACK_EMBED_REVISION = 1
+
+_EMBED_REVISION_RE = re.compile(
+    r"^CODEGRAPH_EMBED_REVISION\s*:\s*int\s*=\s*(\d+)", re.MULTILINE
+)
+
+# Collections the owed-probe (and the post-walk verifier) count. MUST MATCH
+# the analyzer's `_build_stale_file_set` probe scope (the file-anchored
+# collections a re-walk can actually converge). CodeAPI/CodeInteraction carry
+# no file_path and are deliberately excluded — counting rows the walk cannot
+# reach would make the owed state permanently un-clearable (C-3 interlock
+# warning).
+_RESYNC_PROBE_BASES: tuple = ("CodeModule", "CodeClass", "CodeFunction")
+
+
+def _resolve_embed_revision(analyzer_path: Optional[Path]) -> int:
+    """Parse ``CODEGRAPH_EMBED_REVISION`` out of the analyzer source.
+
+    The constant lives in the analyzer script (a template, not an importable
+    module — importing it would execute heavy top-level code). A regex parse
+    of the resolved file keeps this module in lock-step with whatever
+    revision the spawned walk will actually stamp. Falls back to
+    ``_FALLBACK_EMBED_REVISION`` when the file is missing/unreadable or the
+    anchor line changed shape (conservative: a wrong-but-stale revision makes
+    the probe report MORE stale rows, never fewer → never a wrong skip).
+    """
+    if analyzer_path is None:
+        return _FALLBACK_EMBED_REVISION
+    try:
+        text = Path(analyzer_path).read_text(encoding="utf-8", errors="replace")
+        m = _EMBED_REVISION_RE.search(text)
+        if m:
+            return int(m.group(1))
+    except Exception as exc:  # noqa: BLE001 — parse failure → fallback
+        logger.warning("codegraph resync: cannot parse embed revision: %s", exc)
+    return _FALLBACK_EMBED_REVISION
+
 # ── F9 (pre-gate audit): one-time prune of already-indexed ignore-set rows ──
 #
 # The P5 walker/dispatch exclusions stop NEW `.wt/` + vendor-bundle rows, but
@@ -138,6 +182,31 @@ def _collection_prefix(project_name: str) -> Optional[str]:
     return prefix or None
 
 
+def _build_client(weaviate_url: Optional[str] = None,
+                  grpc_port: Optional[int] = None):
+    """Build a Weaviate client from url/env/defaults; ``None`` on failure.
+
+    One home for the connection recipe (extracted from ``prune_ignored_rows``
+    when ``count_stale_rows`` became the second caller). The caller owns
+    closing the returned client.
+    """
+    try:
+        import weaviate  # local import — soft-fail when not installed
+
+        url = weaviate_url or os.environ.get("WEAVIATE_URL") or "http://localhost:8081"
+        m = re.match(r"^https?://([^:/]+)(?::(\d+))?", url)
+        host = m.group(1) if m else "localhost"
+        http_port = int(m.group(2)) if (m and m.group(2)) else 8081
+        gport = int(grpc_port or os.environ.get("GRPC_PORT") or 50052)
+        return weaviate.connect_to_custom(
+            http_host=host, http_port=http_port, http_secure=False,
+            grpc_host=host, grpc_port=gport, grpc_secure=False,
+        )
+    except Exception as exc:  # noqa: BLE001 — no Weaviate → caller degrades
+        logger.warning("codegraph resync: Weaviate unavailable: %s", exc)
+        return None
+
+
 def _path_is_ignored(file_path: str, *, index_dot_claude: bool = True) -> bool:
     """True when a stored row path falls in the CURRENT ignore set.
 
@@ -185,22 +254,10 @@ def prune_ignored_rows(
 
     own_client = False
     if client is None:
-        try:
-            import weaviate  # local import — soft-fail when not installed
-
-            url = weaviate_url or os.environ.get("WEAVIATE_URL") or "http://localhost:8081"
-            m = re.match(r"^https?://([^:/]+)(?::(\d+))?", url)
-            host = m.group(1) if m else "localhost"
-            http_port = int(m.group(2)) if (m and m.group(2)) else 8081
-            gport = int(grpc_port or os.environ.get("GRPC_PORT") or 50052)
-            client = weaviate.connect_to_custom(
-                http_host=host, http_port=http_port, http_secure=False,
-                grpc_host=host, grpc_port=gport, grpc_secure=False,
-            )
-            own_client = True
-        except Exception as exc:  # noqa: BLE001 — no Weaviate → no prune
-            logger.warning("codegraph prune: Weaviate unavailable: %s", exc)
+        client = _build_client(weaviate_url, grpc_port)
+        if client is None:
             return counts
+        own_client = True
 
     try:
         try:
@@ -251,6 +308,117 @@ def prune_ignored_rows(
                 pass
 
 
+def _count_stale_in_collection(coll, current_revision: int) -> Optional[int]:
+    """Count rows NOT at ``current_revision`` in one collection.
+
+    Two tiers:
+      1. Filtered aggregate ``embed_revision != rev OR embed_revision IS
+         NULL`` — cheap. The IsNull leg is load-bearing: Weaviate comparisons
+         ignore NULLs and pre-migration rows are exactly the NULL ones (a
+         ``min()``/``not_equal``-only probe reports "converged" over a
+         half-migrated collection — C-3 warning).
+      2. Full scan returning only ``embed_revision``, classified client-side
+         (NULL-safe) — covers collections created without
+         ``index_null_state=True`` where the IsNull filter errors.
+
+    Returns ``None`` when neither tier could run (undeterminable — the caller
+    must NOT treat that as zero).
+    """
+    try:
+        from weaviate.classes.query import Filter
+
+        flt = (
+            Filter.by_property("embed_revision").not_equal(int(current_revision))
+            | Filter.by_property("embed_revision").is_none(True)
+        )
+        agg = coll.aggregate.over_all(filters=flt, total_count=True)
+        total = getattr(agg, "total_count", None)
+        if total is not None:
+            return int(total)
+    except Exception:  # noqa: BLE001 — fall to the NULL-safe scan
+        pass
+    try:
+        stale = 0
+        for obj in coll.iterator(return_properties=["embed_revision"]):
+            rev = (getattr(obj, "properties", None) or {}).get("embed_revision")
+            try:
+                if rev is None or int(rev) != int(current_revision):
+                    stale += 1
+            except (TypeError, ValueError):
+                stale += 1
+        return stale
+    except Exception as exc:  # noqa: BLE001 — undeterminable
+        logger.warning(
+            "codegraph resync: stale count failed on %s: %s",
+            getattr(coll, "name", "?"), exc,
+        )
+        return None
+
+
+def count_stale_rows(
+    project_name: str,
+    *,
+    current_revision: Optional[int] = None,
+    analyzer_path: Optional[Path] = None,
+    client=None,
+    weaviate_url: Optional[str] = None,
+    grpc_port: Optional[int] = None,
+) -> Optional[dict]:
+    """R-6 (v0.2.73): per-collection count of rows owed a re-embed.
+
+    Probes ``<Prefix>_{CodeModule,CodeClass,CodeFunction}`` (the collections
+    a re-walk can actually converge — MUST MATCH the analyzer's
+    ``_build_stale_file_set`` scope) for rows whose ``embed_revision`` is
+    NULL or differs from the current revision.
+
+    Returns ``{collection_name: stale_count}`` (absent collections count 0),
+    or ``None`` when the answer is undeterminable (Weaviate down, prefix
+    unresolvable, a collection unprobeable). Callers gate SKIPPING on a
+    positive all-zero result only — ``None`` means "cannot positively
+    confirm", never "converged".
+    """
+    if not project_name:
+        return None
+    if current_revision is None:
+        current_revision = _resolve_embed_revision(analyzer_path)
+    prefix = _collection_prefix(project_name)
+    if prefix is None:
+        return None
+
+    own_client = False
+    if client is None:
+        client = _build_client(weaviate_url, grpc_port)
+        if client is None:
+            return None
+        own_client = True
+
+    try:
+        counts: dict = {}
+        for base in _RESYNC_PROBE_BASES:
+            coll_name = f"{prefix}_{base}"
+            try:
+                if hasattr(client.collections, "exists") and not client.collections.exists(coll_name):
+                    counts[coll_name] = 0
+                    continue
+                coll = client.collections.get(coll_name)
+            except Exception as exc:  # noqa: BLE001 — undeterminable
+                logger.warning(
+                    "codegraph resync: cannot open %s: %s", coll_name, exc
+                )
+                return None
+            n = _count_stale_in_collection(coll, current_revision)
+            if n is None:
+                return None
+            counts[coll_name] = n
+        return counts
+    finally:
+        if own_client:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 @dataclass
 class ResyncTriggerResult:
     """Outcome of a resync-trigger attempt. Never raises; the caller inspects
@@ -263,6 +431,10 @@ class ResyncTriggerResult:
                             for the caller to record. Nothing was spawned.
       * ``"skipped"``    — a precondition wasn't met (analyzer/python missing,
                             no project name). Soft no-op; ``message`` explains.
+      * ``"not_owed"``   — R-6 (v0.2.73): the owed-probe POSITIVELY confirmed
+                            zero stale rows — no work owed, nothing spawned.
+                            The caller may resolve a pending
+                            ``codegraph_embed_resync_pending`` deferral.
     """
 
     status: str
@@ -376,6 +548,7 @@ def spawn_background_resync(
     python_exe: Optional[str] = None,
     code_embed_url: Optional[str] = None,
     check_service: bool = True,
+    check_owed: bool = True,
     index_dot_claude: bool = True,
 ) -> ResyncTriggerResult:
     """Launch a BACKGROUND, revision-gated full re-analyze of ``repo_root``.
@@ -421,6 +594,29 @@ def spawn_background_resync(
         shlex.quote(part)
         for part in (str(py), str(analyzer), str(repo_root), "--project", project_name)
     )
+
+    # R-6 (v0.2.73): gate on OWED WORK, not on "--update happened". Pre-fix,
+    # every update spawned a full background walk regardless of whether any
+    # row needed a re-embed. Skip ONLY on a POSITIVE zero — an undeterminable
+    # probe (Weaviate down, prefix unresolvable) proceeds like before
+    # (conservative default: never skip on uncertainty).
+    if check_owed:
+        try:
+            stale_counts = count_stale_rows(project_name, analyzer_path=analyzer)
+        except Exception as exc:  # noqa: BLE001 — probe must never block
+            logger.warning("codegraph resync: owed-probe raised: %s", exc)
+            stale_counts = None
+        if stale_counts is not None and sum(stale_counts.values()) == 0:
+            return ResyncTriggerResult(
+                status="not_owed",
+                message=(
+                    f"no resync owed for {project_name} — all rows at the "
+                    "current embed revision"
+                ),
+            )
+        if stale_counts:
+            owed = {k: v for k, v in stale_counts.items() if v}
+            logger.info("codegraph resync: stale rows owed: %s", owed)
 
     if check_service and not code_embed_service_healthy(code_embed_url):
         deferral = build_resync_deferral(project_name, resume_cmd)

@@ -6927,6 +6927,10 @@ class CodeGraphAnalyzer:
 
         CodeAPI/CodeInteraction carry no file_path property and are not
         probed; their rows re-stamp whenever their source file re-walks.
+        Probe scope MUST MATCH vco_lib/codegraph_resync.py::
+        _RESYNC_PROBE_BASES (the owed-gate + post-walk verifier count the
+        same three collections — counting rows a re-walk cannot reach would
+        make the owed state permanently un-clearable).
 
         Cost model: a cheap filtered-aggregate pre-check per collection
         short-circuits the converged steady state (3 aggregates, no scan —

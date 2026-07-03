@@ -6380,6 +6380,10 @@ def main() -> int:
         # Only on --update: a fresh install analyzes at the current revision
         # already, so there are no stale rows to resync. Thin shim → the logic
         # lives in vco_lib.codegraph_resync (install.py is a mega-file).
+        # R-6 (v0.2.73): inside the helper, the trigger is additionally gated
+        # on the owed-probe (count of rows at a stale/NULL embed revision) —
+        # it fires only when work is actually owed, and a POSITIVE zero
+        # resolves the pending resync deferral instead of spawning.
         if _seed_succeeded and getattr(args, "update", False):
             _trigger_codegraph_embed_resync(_deferral_report)
 
@@ -16409,8 +16413,11 @@ def _trigger_codegraph_embed_resync(deferral_report: "DeferralReport") -> None:
     module). This shim only:
       1. resolves the orchestrator's own code-graph project name,
       2. calls ``spawn_background_resync`` (background, non-blocking, no global
-         timeout; self-degrades when the code-embed service is down), and
-      3. records the returned ``DeferralEntry`` when the resync was deferred.
+         timeout; R-6: gated on the owed-probe — fires only when stale rows
+         exist; self-degrades when the code-embed service is down),
+      3. records the returned ``DeferralEntry`` when the resync was deferred,
+      4. resolves the pending ``codegraph_embed_resync_pending`` ledger entry
+         when the probe POSITIVELY confirms zero stale rows (``not_owed``).
 
     Soft-fail throughout: any error here converts to a log line, never a crash —
     the resync is a best-effort background refresh, not a gating step.
@@ -16457,6 +16464,23 @@ def _trigger_codegraph_embed_resync(deferral_report: "DeferralReport") -> None:
         _log_install_event(
             "codegraph_resync", "ok",
             f"background resync launched for {project_name} (pid {result.pid})",
+        )
+    elif result.status == "not_owed":
+        # R-6 (v0.2.73): the owed-probe POSITIVELY confirmed zero stale rows.
+        # Resolve any pending resync ledger entry — this is the ONLY way that
+        # (deliberately FOREIGN, A-2) entry clears: explicit positive
+        # confirmation, never drop-when-absent.
+        print("  → code-graph resync not owed (all rows at current embed revision)")
+        try:
+            deferral_report.mark_resolved("codegraph_embed_resync_pending")
+        except Exception as exc:  # noqa: BLE001
+            _log_install_event(
+                "codegraph_resync", "warn",
+                f"could not resolve resync deferral: {exc}",
+            )
+        _log_install_event(
+            "codegraph_resync", "ok",
+            f"no resync owed for {project_name}: {result.message}",
         )
     elif result.status == "deferred":
         print(f"  ! code-graph resync deferred: {result.message}")

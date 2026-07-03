@@ -308,7 +308,9 @@ def test_resync_degrades_to_deferral_when_service_down(monkeypatch, tmp_path):
     scripts.mkdir(parents=True)
     (scripts / "analyze_code_graph.py").write_text("# stub\n")
 
-    result = mod.spawn_background_resync(tmp_path, "MyProj", python_exe="/usr/bin/python3")
+    result = mod.spawn_background_resync(
+        tmp_path, "MyProj", python_exe="/usr/bin/python3", check_owed=False,
+    )
     assert result.status == "deferred", "service down → defer, never spawn"
     assert result.pid is None
     # A DeferralEntry should be attached when the type is importable.
@@ -334,7 +336,9 @@ def test_resync_launches_background_when_service_up(monkeypatch, tmp_path):
         return _FakeProc()
 
     monkeypatch.setattr(mod.subprocess, "Popen", _fake_popen)
-    result = mod.spawn_background_resync(tmp_path, "MyProj", python_exe="/usr/bin/python3")
+    result = mod.spawn_background_resync(
+        tmp_path, "MyProj", python_exe="/usr/bin/python3", check_owed=False,
+    )
     assert result.status == "launched"
     assert result.pid == 4321
     # NO --force-recreate (that would DROP the schema); NO global timeout kwarg.
@@ -347,7 +351,9 @@ def test_resync_skips_when_analyzer_missing(monkeypatch, tmp_path):
     mod = _load_resync()
     monkeypatch.setattr(mod, "code_embed_service_healthy", lambda *a, **k: True)
     # No analyzer script anywhere under tmp_path.
-    result = mod.spawn_background_resync(tmp_path, "MyProj", python_exe="/usr/bin/python3")
+    result = mod.spawn_background_resync(
+        tmp_path, "MyProj", python_exe="/usr/bin/python3", check_owed=False,
+    )
     assert result.status == "skipped"
 
 
@@ -362,7 +368,9 @@ def test_resync_spawn_failure_degrades_to_deferral(monkeypatch, tmp_path):
         raise OSError("cannot spawn")
 
     monkeypatch.setattr(mod.subprocess, "Popen", _boom)
-    result = mod.spawn_background_resync(tmp_path, "MyProj", python_exe="/usr/bin/python3")
+    result = mod.spawn_background_resync(
+        tmp_path, "MyProj", python_exe="/usr/bin/python3", check_owed=False,
+    )
     assert result.status == "deferred", "spawn failure must degrade, not crash"
 
 
