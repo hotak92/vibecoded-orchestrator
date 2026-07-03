@@ -864,6 +864,16 @@ impl Db {
 // ═══════════════════════════════════════════════════════════════════════
 
 impl Db {
+    /// Upsert a project secret reference (declaration metadata — NEVER a
+    /// value).
+    ///
+    /// `is_set` semantics (v0.2.73 footgun fix): `Some(b)` explicitly sets
+    /// the flag; `None` PRESERVES the stored flag on re-declaration (fresh
+    /// rows default to `false`). Pre-fix the upsert did
+    /// `is_set = excluded.is_set` with a plain bool, so any declaration-only
+    /// re-registration reset 1→0 and the GUI claimed the value was unset.
+    /// Value-writing paths (`set_secret_v2` bridge) pass `Some(true)`; clear
+    /// paths pass `Some(false)`; declaration-only callers pass `None`.
     pub fn set_project_secret_ref(
         &self,
         project_id: &str,
@@ -874,18 +884,22 @@ impl Db {
         source_module: Option<&str>,
         required_for: &[String],
         description: &str,
-        is_set: bool,
+        is_set: Option<bool>,
     ) -> Result<ProjectSecretRef, String> {
         check_in("secret.resolution", resolution, VALID_RESOLUTION)?;
         let now = Utc::now().timestamp_millis();
         let req_json = serde_json::to_string(required_for).unwrap_or_else(|_| "[]".to_string());
+        let is_set_param: Option<i32> = is_set.map(|b| b as i32);
         let guard = self.lock();
+        // Conflict arm uses `COALESCE(?9, project_secret_refs.is_set)` — NOT
+        // `excluded.is_set`, which would carry the already-COALESCEd insert
+        // value (0 for None) and re-clobber the stored flag.
         guard
             .execute(
                 "INSERT INTO project_secret_refs
                  (project_id, secret_key, resolution, file_path, env_name,
                   source_module, required_for, description, is_set, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?9, 0), ?10)
                  ON CONFLICT(project_id, secret_key) DO UPDATE SET
                     resolution = excluded.resolution,
                     file_path = excluded.file_path,
@@ -893,14 +907,24 @@ impl Db {
                     source_module = excluded.source_module,
                     required_for = excluded.required_for,
                     description = excluded.description,
-                    is_set = excluded.is_set,
+                    is_set = COALESCE(?9, project_secret_refs.is_set),
                     updated_at = excluded.updated_at",
                 params![
                     project_id, secret_key, resolution, file_path, env_name,
-                    source_module, req_json, description, is_set as i32, now,
+                    source_module, req_json, description, is_set_param, now,
                 ],
             )
             .map_err(|e| format!("set_project_secret_ref: {}", e))?;
+        // Read back the STORED flag so a `None` (preserve) input returns the
+        // actual persisted state rather than a guess.
+        let stored_is_set: i32 = guard
+            .query_row(
+                "SELECT is_set FROM project_secret_refs
+                  WHERE project_id = ?1 AND secret_key = ?2",
+                params![project_id, secret_key],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("set_project_secret_ref readback: {}", e))?;
         Ok(ProjectSecretRef {
             project_id: project_id.to_string(),
             secret_key: secret_key.to_string(),
@@ -910,7 +934,7 @@ impl Db {
             source_module: source_module.map(str::to_string),
             required_for: required_for.to_vec(),
             description: description.to_string(),
-            is_set,
+            is_set: stored_is_set != 0,
             updated_at: now,
         })
     }
@@ -1930,7 +1954,7 @@ mod tests {
             None,
             &["coder".to_string()],
             "GH PAT",
-            true,
+            Some(true),
         )
         .unwrap();
         db.set_project_kg_binding(
@@ -2027,7 +2051,7 @@ mod tests {
             Some("openai-helper"),
             &["coder".to_string(), "tester".to_string()],
             "OpenAI",
-            false,
+            Some(false),
         )
         .unwrap();
         let refs = db.list_project_secret_refs("p1").unwrap();
@@ -2074,7 +2098,7 @@ mod tests {
             Some("user"),
             &[],
             "",
-            true,
+            Some(true),
         )
         .unwrap();
 
@@ -2098,7 +2122,7 @@ mod tests {
             Some("user"),
             &[],
             "",
-            true,
+            Some(true),
         )
         .unwrap();
         let refs = db.list_project_secret_refs("p1").unwrap();
@@ -2116,6 +2140,95 @@ mod tests {
             p2_refs.is_empty(),
             "ref registered for p1 must NOT appear in p2's list"
         );
+    }
+
+    /// v0.2.73 footgun fix: a declaration-only re-registration (is_set =
+    /// None) must PRESERVE the stored is_set flag — pre-fix the upsert did
+    /// `is_set = excluded.is_set` and any redeclare reset 1→0, so the GUI
+    /// claimed a saved value was unset and the user re-entered it.
+    #[test]
+    fn secret_ref_redeclare_without_is_set_preserves_flag() {
+        let db = make_db();
+        seed_project(&db, "p1", "Project One");
+
+        // Value-set path marks the flag explicitly.
+        let row = db
+            .set_project_secret_ref(
+                "p1",
+                "EXAMPLE_API_TOKEN",
+                "keychain-per-project",
+                None,
+                None,
+                Some("user"),
+                &[],
+                "",
+                Some(true),
+            )
+            .unwrap();
+        assert!(row.is_set, "explicit Some(true) must set the flag");
+
+        // Declaration-only redeclare (None) — must NOT reset 1→0. The
+        // returned row must also reflect the STORED flag, not a default.
+        let row = db
+            .set_project_secret_ref(
+                "p1",
+                "EXAMPLE_API_TOKEN",
+                "keychain-per-project",
+                None,
+                None,
+                Some("user"),
+                &["coder".to_string()],
+                "redeclared",
+                None,
+            )
+            .unwrap();
+        assert!(
+            row.is_set,
+            "redeclare with is_set=None must preserve the stored flag (returned row)"
+        );
+        let refs = db.list_project_secret_refs("p1").unwrap();
+        assert_eq!(refs.len(), 1);
+        assert!(
+            refs[0].is_set,
+            "redeclare with is_set=None must preserve the stored flag (stored row)"
+        );
+        // Non-flag fields still update on the redeclare.
+        assert_eq!(refs[0].description, "redeclared");
+        assert_eq!(refs[0].required_for, vec!["coder".to_string()]);
+
+        // Explicit Some(false) still clears (the value-clear path).
+        let row = db
+            .set_project_secret_ref(
+                "p1",
+                "EXAMPLE_API_TOKEN",
+                "keychain-per-project",
+                None,
+                None,
+                Some("user"),
+                &[],
+                "",
+                Some(false),
+            )
+            .unwrap();
+        assert!(!row.is_set, "explicit Some(false) must clear the flag");
+        let refs = db.list_project_secret_refs("p1").unwrap();
+        assert!(!refs[0].is_set);
+
+        // Fresh row declared with None defaults to false (COALESCE(?9, 0)).
+        let row = db
+            .set_project_secret_ref(
+                "p1",
+                "EXAMPLE_OTHER_TOKEN",
+                "keychain-per-project",
+                None,
+                None,
+                Some("user"),
+                &[],
+                "",
+                None,
+            )
+            .unwrap();
+        assert!(!row.is_set, "fresh declaration with None defaults to unset");
     }
 
     #[test]

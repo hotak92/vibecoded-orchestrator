@@ -372,7 +372,17 @@ async fn delete_permission(
 
 // ─── Secret references ───────────────────────────────────────────────────
 
+/// Declaration body for a project secret ref (metadata only — never a
+/// value).
+///
+/// v0.2.73 footgun fix: `is_set` is `Option<bool>` — omitted means
+/// "preserve the stored flag" (pre-fix, an omitted `is_set` deserialized
+/// to `false` and the upsert reset 1→0, detaching the GUI's saved-value
+/// display). `deny_unknown_fields` turns guessed fields (e.g. an
+/// `"active": true` some callers invented) into a 422 instead of a
+/// silent swallow.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SetSecretBody {
     secret_key: String,
     resolution: String,
@@ -383,8 +393,7 @@ struct SetSecretBody {
     required_for: Vec<String>,
     #[serde(default)]
     description: String,
-    #[serde(default)]
-    is_set: bool,
+    is_set: Option<bool>,
 }
 
 async fn list_secrets(
@@ -785,5 +794,170 @@ async fn list_collection_access_by_level(
             Json(serde_json::json!({ "collections": collections })).into_response()
         }
         Err(e) => err500(e),
+    }
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use vct_launcher_core::db::Db;
+
+    // v0.2.73 is_set footgun fix — see `SetSecretBody`'s doc-comment.
+    // HTTP harness mirrors `modules_api.rs::tests::spawn_modules_api_hub`.
+
+    async fn spawn_project_state_hub() -> (String, LauncherDbHandle) {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let handle = LauncherDbHandle(Arc::new(db));
+        let app: Router =
+            Router::new().nest("/api/v1", super::router().with_state(handle.clone()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{}/api/v1", addr), handle)
+    }
+
+    fn seed_project(db: &Db, id: &str, name: &str, folder: &str) {
+        let now = chrono::Utc::now().timestamp_millis();
+        let guard = db.lock();
+        guard
+            .execute(
+                "INSERT INTO projects (id, name, folder_path, host, slug, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'base', ?2, ?4, ?4)",
+                rusqlite::params![id, name, folder, now],
+            )
+            .unwrap();
+    }
+
+    /// serde contract: an omitted `is_set` deserializes to `None`
+    /// (preserve), NOT `false`. Pre-fix `#[serde(default)] is_set: bool`
+    /// made every declaration-only POST reset the flag.
+    #[test]
+    fn set_secret_body_omitted_is_set_is_none() {
+        let body: SetSecretBody = serde_json::from_value(serde_json::json!({
+            "secret_key": "EXAMPLE_API_TOKEN",
+            "resolution": "keychain-per-project"
+        }))
+        .expect("minimal body must deserialize");
+        assert_eq!(body.is_set, None, "omitted is_set must be None (preserve)");
+
+        let body: SetSecretBody = serde_json::from_value(serde_json::json!({
+            "secret_key": "EXAMPLE_API_TOKEN",
+            "resolution": "keychain-per-project",
+            "is_set": true
+        }))
+        .unwrap();
+        assert_eq!(body.is_set, Some(true));
+    }
+
+    /// serde contract: unknown fields are rejected (`deny_unknown_fields`).
+    /// Pre-fix a guessed `"active": true` was silently swallowed.
+    #[test]
+    fn set_secret_body_rejects_unknown_fields() {
+        let res = serde_json::from_value::<SetSecretBody>(serde_json::json!({
+            "secret_key": "EXAMPLE_API_TOKEN",
+            "resolution": "keychain-per-project",
+            "active": true
+        }));
+        assert!(res.is_err(), "unknown field `active` must be rejected");
+    }
+
+    /// HTTP end-to-end: an unknown field in the POST body → 422 (axum's
+    /// Json extractor surfaces the serde error), and the row is NOT
+    /// created.
+    #[tokio::test]
+    async fn set_secret_unknown_field_returns_422_and_writes_nothing() {
+        let (base, h) = spawn_project_state_hub().await;
+        seed_project(&h.0, "ps-proj-1", "PS Test One", "/tmp/ps-proj-1");
+
+        let resp = reqwest::Client::new()
+            .post(format!("{}/projects/ps-proj-1/secrets", base))
+            .json(&serde_json::json!({
+                "secret_key": "EXAMPLE_API_TOKEN",
+                "resolution": "keychain-per-project",
+                "active": true
+            }))
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(
+            resp.status(),
+            422,
+            "unknown field must produce 422, not silent acceptance"
+        );
+        let refs = h.0.list_project_secret_refs("ps-proj-1").unwrap();
+        assert!(refs.is_empty(), "rejected body must not create a row");
+    }
+
+    /// HTTP end-to-end: a declaration-only re-POST (no `is_set`) must
+    /// PRESERVE the stored flag — the footgun was a redeclare resetting
+    /// 1→0 so the GUI claimed the saved value was unset.
+    #[tokio::test]
+    async fn set_secret_redeclare_without_is_set_preserves_flag() {
+        let (base, h) = spawn_project_state_hub().await;
+        seed_project(&h.0, "ps-proj-2", "PS Test Two", "/tmp/ps-proj-2");
+        let client = reqwest::Client::new();
+
+        // Value-set path marks the flag explicitly.
+        let resp = client
+            .post(format!("{}/projects/ps-proj-2/secrets", base))
+            .json(&serde_json::json!({
+                "secret_key": "EXAMPLE_API_TOKEN",
+                "resolution": "keychain-per-project",
+                "source_module": "user",
+                "is_set": true
+            }))
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+
+        // Declaration-only redeclare: is_set omitted.
+        let resp = client
+            .post(format!("{}/projects/ps-proj-2/secrets", base))
+            .json(&serde_json::json!({
+                "secret_key": "EXAMPLE_API_TOKEN",
+                "resolution": "keychain-per-project",
+                "source_module": "user",
+                "description": "redeclared"
+            }))
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("is_set").and_then(|v| v.as_bool()),
+            Some(true),
+            "returned row must reflect the PRESERVED flag; body: {}",
+            body
+        );
+
+        let refs = h.0.list_project_secret_refs("ps-proj-2").unwrap();
+        assert_eq!(refs.len(), 1);
+        assert!(refs[0].is_set, "redeclare without is_set must not reset 1→0");
+        assert_eq!(refs[0].description, "redeclared");
+
+        // Explicit false still clears (the value-clear path).
+        let resp = client
+            .post(format!("{}/projects/ps-proj-2/secrets", base))
+            .json(&serde_json::json!({
+                "secret_key": "EXAMPLE_API_TOKEN",
+                "resolution": "keychain-per-project",
+                "source_module": "user",
+                "is_set": false
+            }))
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let refs = h.0.list_project_secret_refs("ps-proj-2").unwrap();
+        assert!(!refs[0].is_set, "explicit is_set=false must still clear");
     }
 }
