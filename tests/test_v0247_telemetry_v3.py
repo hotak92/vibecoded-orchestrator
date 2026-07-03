@@ -319,6 +319,45 @@ class TestTelemetryWriterPassThrough:
         assert n["linked_type_names"] == ["concept"]
         assert n["node_type"] == "concept"
 
+    def test_retrieval_payload_rounds_embeddings_to_4_decimals(self) -> None:
+        """v0.2.73 RL I/O reduction: the launcher.db write path must ROUND
+        stored embeddings to 4 decimals — parity with the legacy JSONL logger
+        (rl_logger._round_emb). Full float32 repr was ~18 chars/value; 4-decimal
+        ~7 chars → ~50-60% payload_json byte cut with zero training-signal loss.
+        A regression here (storing verbatim floats) re-inflates every rl_event.
+        """
+        w, _ = self._writer_with_captured_posts()
+        payload = w._build_retrieval_payload(
+            task_id="t1",
+            task_type="x",
+            query="q",
+            nodes=[
+                {
+                    "title": "A",
+                    "score": 0.9,
+                    "tier": "top_k",
+                    "emb": [0.123456789, 0.987654321],
+                    "n_emb": [0.111119999, 0.222225555],
+                    "linked_embs": [[0.333338888, 0.444442222]],
+                }
+            ],
+            session_id="",
+            query_emb=[0.555556666, 0.666667777],
+        )
+        n = payload["nodes"][0]
+        # Every stored vector rounded to 4 decimals (no verbatim float32 tail).
+        assert n["emb"] == [0.1235, 0.9877]
+        assert n["n_emb"] == [0.1111, 0.2222]
+        assert n["linked_embs"] == [[0.3333, 0.4444]]
+        assert payload["query_emb"] == [0.5556, 0.6667]
+        # And no value retains >4-decimal precision anywhere.
+        import json as _json
+        for v in _json.dumps(payload).replace("[", " ").replace("]", " ").split():
+            s = v.strip(",")
+            if s.replace(".", "", 1).replace("-", "", 1).isdigit() and "." in s:
+                frac = s.split(".", 1)[1]
+                assert len(frac) <= 4, f"un-rounded value in payload: {s}"
+
 
 # ----------------------------------------------------------------------
 # 5. EmbeddingService embed-result memo cache.

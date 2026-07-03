@@ -59,7 +59,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from .hub_writer import post_rl_event
-from .rl_logger import RLDataLogger
+from .rl_logger import RLDataLogger, _round_emb
 
 logger = logging.getLogger(__name__)
 
@@ -387,13 +387,13 @@ class RLTelemetryWriter:
                 "tier": str(n.get("tier", "top_k")),
             }
             if n.get("emb"):
-                rec["emb"] = list(n["emb"])
+                rec["emb"] = _round_emb(n["emb"])
             # v3+: best-chunk vector (renamed from `emb` for v3 disambiguation)
             if n.get("n_emb"):
-                rec["n_emb"] = list(n["n_emb"])
+                rec["n_emb"] = _round_emb(n["n_emb"])
             # v3+: MAX_LINKED packed linked-slot embeddings
             if n.get("linked_embs"):
-                rec["linked_embs"] = [list(e) for e in n["linked_embs"] if e]
+                rec["linked_embs"] = [_round_emb(e) for e in n["linked_embs"] if e]
             if n.get("linked_type_names"):
                 rec["linked_type_names"] = [str(t) for t in n["linked_type_names"]]
             if n.get("node_type"):
@@ -423,7 +423,7 @@ class RLTelemetryWriter:
             "query_length": len(query or ""),
         }
         if query_emb is not None:
-            payload["query_emb"] = list(query_emb)
+            payload["query_emb"] = _round_emb(query_emb)
         if failure_mode:
             payload["failure_mode"] = str(failure_mode)
         if failed_collections:
@@ -536,11 +536,11 @@ class RLTelemetryWriter:
                 "tier": str(n.get("tier", "top_k")),
             }
             if n.get("emb"):
-                rec["emb"] = list(n["emb"])
+                rec["emb"] = _round_emb(n["emb"])
             if n.get("n_emb"):
-                rec["n_emb"] = list(n["n_emb"])
+                rec["n_emb"] = _round_emb(n["n_emb"])
             if n.get("linked_embs"):
-                rec["linked_embs"] = [list(e) for e in n["linked_embs"] if e]
+                rec["linked_embs"] = [_round_emb(e) for e in n["linked_embs"] if e]
             if n.get("linked_type_names"):
                 rec["linked_type_names"] = [str(t) for t in n["linked_type_names"]]
             if n.get("node_type"):
@@ -590,7 +590,7 @@ class RLTelemetryWriter:
             "nodes": node_records,
         }
         if query_emb is not None:
-            event["query_emb"] = list(query_emb)
+            event["query_emb"] = _round_emb(query_emb)
         if failure_mode:
             event["failure_mode"] = str(failure_mode)
         if failed_collections:
