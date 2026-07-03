@@ -248,6 +248,8 @@ class PowerShellCorruptDiscoveryTest(unittest.TestCase):
             "VCO_HOOK_DEBUG": "1",
         }
         env.update(env_extra)
+        # This class is @skipIf(_PWSH is None), so _PWSH is a str here.
+        assert _PWSH is not None
         # Dot-source the library portion (Main block stripped) then call
         # the discovery function directly — no hub round-trip needed.
         lib = _ps1_library()
@@ -354,43 +356,45 @@ class PythonCorruptDiscoveryTest(unittest.TestCase):
         self._patch.stop()
         self.pc._test_clear_cache()
 
-    def _capture_discover(self):
-        """Run _discover_hub, capturing stderr; return (result_or_exc, stderr)."""
+    def _capture_discover(self) -> tuple[int | None, Exception | None, str]:
+        """Run _discover_hub, capturing stderr.
+
+        Returns ``(port, exc, stderr)``: on success ``port`` is the resolved
+        port and ``exc`` is None; on failure ``port`` is None and ``exc`` is
+        the raised exception. Exactly one of ``port`` / ``exc`` is set."""
         captured: list[str] = []
         with mock.patch.object(
             self.pc.sys.stderr, "write",
             side_effect=lambda s: captured.append(s),
         ):
             try:
-                result = self.pc._discover_hub()
-                return ("ok", result), "".join(captured)
+                port, _token = self.pc._discover_hub()
+                return port, None, "".join(captured)
             except Exception as exc:  # noqa: BLE001 — test asserts the type
-                return ("exc", exc), "".join(captured)
+                return None, exc, "".join(captured)
 
     def test_py_garbage_port_file_warns_and_defaults(self) -> None:
         (Path(self.state) / "hub.port").write_text(GARBAGE_PORT, encoding="utf-8")
         (Path(self.state) / "hub.token").write_text("t", encoding="utf-8")
-        (tag, val), stderr = self._capture_discover()
-        self.assertEqual(tag, "ok",
-                         f"garbage port must NOT raise; got {val!r}")
-        self.assertEqual(val[0], int(DEFAULT_PORT), val)
+        port, exc, stderr = self._capture_discover()
+        self.assertIsNone(exc, f"garbage port must NOT raise; got {exc!r}")
+        self.assertEqual(port, int(DEFAULT_PORT), port)
         self.assertIn(KIND_PORT_INVALID, stderr, stderr)
 
     def test_py_non_integer_env_port_warns_and_defaults(self) -> None:
         os.environ["VCT_HUB_PORT"] = NON_NUMERIC_PORT
         (Path(self.state) / "hub.token").write_text("t", encoding="utf-8")
-        (tag, val), stderr = self._capture_discover()
-        self.assertEqual(tag, "ok",
-                         f"non-int env port must NOT raise; got {val!r}")
-        self.assertEqual(val[0], int(DEFAULT_PORT), val)
+        port, exc, stderr = self._capture_discover()
+        self.assertIsNone(exc, f"non-int env port must NOT raise; got {exc!r}")
+        self.assertEqual(port, int(DEFAULT_PORT), port)
         self.assertIn(KIND_PORT_INVALID, stderr, stderr)
 
     def test_py_valid_env_port_no_warning(self) -> None:
         os.environ["VCT_HUB_PORT"] = VALID_PORT
         (Path(self.state) / "hub.token").write_text("t", encoding="utf-8")
-        (tag, val), stderr = self._capture_discover()
-        self.assertEqual(tag, "ok", val)
-        self.assertEqual(val[0], int(VALID_PORT), val)
+        port, exc, stderr = self._capture_discover()
+        self.assertIsNone(exc, exc)
+        self.assertEqual(port, int(VALID_PORT), port)
         self.assertNotIn(KIND_PORT_INVALID, stderr, stderr)
 
     def test_py_unreadable_port_warns_and_defaults(self) -> None:
@@ -401,12 +405,11 @@ class PythonCorruptDiscoveryTest(unittest.TestCase):
         (Path(self.state) / "hub.token").write_text("t", encoding="utf-8")
         pf.chmod(0o000)
         try:
-            (tag, val), stderr = self._capture_discover()
+            port, exc, stderr = self._capture_discover()
         finally:
             pf.chmod(0o600)
-        self.assertEqual(tag, "ok",
-                         f"unreadable port must NOT raise; got {val!r}")
-        self.assertEqual(val[0], int(DEFAULT_PORT), val)
+        self.assertIsNone(exc, f"unreadable port must NOT raise; got {exc!r}")
+        self.assertEqual(port, int(DEFAULT_PORT), port)
         self.assertIn(KIND_PORT_UNREADABLE, stderr, stderr)
 
     def test_py_unreadable_token_warns_and_hubunreachable(self) -> None:
@@ -417,13 +420,13 @@ class PythonCorruptDiscoveryTest(unittest.TestCase):
         tf.write_text("some-token", encoding="utf-8")
         tf.chmod(0o000)
         try:
-            (tag, val), stderr = self._capture_discover()
+            port, exc, stderr = self._capture_discover()
         finally:
             tf.chmod(0o600)
         # Token has no default → HubUnreachable (the caller's env-fallback
         # path), NOT a raw OSError, and the warning kind matches sh/ps1.
-        self.assertEqual(tag, "exc", f"expected HubUnreachable, got {val!r}")
-        self.assertIsInstance(val, self.pc.HubUnreachable, repr(val))
+        self.assertIsNone(port, f"expected raise, got port={port!r}")
+        self.assertIsInstance(exc, self.pc.HubUnreachable, repr(exc))
         self.assertIn(KIND_TOKEN_UNREADABLE, stderr, stderr)
 
 
