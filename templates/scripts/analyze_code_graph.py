@@ -258,6 +258,14 @@ CODEGRAPH_EMBED_REVISION: int = 1
 # embedding-generation marker, NOT semantic content).
 _EMBED_REVISION_PROP = "embed_revision"
 
+# v0.2.73 (R-2 / C-1): revision value stamped on a VECTORLESS write (the
+# embed backend failed for this object). 0 is never a valid
+# CODEGRAPH_EMBED_REVISION (history starts at 1), so the row stays visibly
+# stale: the fingerprint gate re-writes it on the next visit and the R-1
+# stale-file probe re-walks its file. Distinguishes "known vectorless" (0)
+# from "pre-migration row" (NULL) in diagnostics while both stay stale.
+_EMBED_REVISION_VECTORLESS = 0
+
 
 def _stable_scalar(value: Any) -> str:
     """Render a property value into a stable, order-independent string.
@@ -3983,8 +3991,25 @@ class CodeGraphAnalyzer:
             # whether a byte-identical object was embedded under the CURRENT
             # embedding-generation scheme (chunking) or a stale one. Don't
             # clobber a caller-preset value (mirrors the content_hash stamp).
+            #
+            # v0.2.73 (R-2 / C-1): the stamp is CONDITIONAL on a vector being
+            # present. `generate_embedding` returns None on ANY backend
+            # failure and every call site writes anyway (guarding only the
+            # `vector` key) — pre-fix, such a VECTORLESS row was stamped with
+            # the CURRENT revision + content hash, so both gates passed on
+            # every future visit and the row stayed invisible to near_vector
+            # search FOREVER while counting as "converged". Stamping
+            # `_EMBED_REVISION_VECTORLESS` (0) instead keeps the row VISIBLY
+            # stale: the per-object fingerprint gate re-writes it on the next
+            # visit, and the R-1 stale-file probe pulls its file back through
+            # the per-file gate even when the file is unchanged on disk.
+            # Conservative default: never claim an embedding generation the
+            # write cannot positively confirm.
             if props.get(_EMBED_REVISION_PROP) is None:
-                props[_EMBED_REVISION_PROP] = CODEGRAPH_EMBED_REVISION
+                if insert_params.get("vector"):
+                    props[_EMBED_REVISION_PROP] = CODEGRAPH_EMBED_REVISION
+                else:
+                    props[_EMBED_REVISION_PROP] = _EMBED_REVISION_VECTORLESS
             if content_hash:
                 # Persist for the NEXT run's comparison (and don't clobber a
                 # caller-preset value, mirroring the other stamp sites).
@@ -6854,6 +6879,109 @@ class CodeGraphAnalyzer:
                 pass
         return count
 
+    def _count_stale_rows_in_collection(self, coll) -> Optional[int]:
+        """Cheap count of rows NOT at the current embed revision (R-1 pre-check).
+
+        Filtered aggregate: ``embed_revision != CURRENT OR embed_revision IS
+        NULL``. The IsNull leg is load-bearing — Weaviate comparisons ignore
+        NULLs, and pre-migration rows are exactly the NULL ones (a
+        ``min()``/``not_equal``-only probe would report "converged" over a
+        half-migrated collection). Returns ``None`` when the count cannot be
+        determined (Weaviate down, mocked collection, or an old collection
+        created without ``index_null_state=True`` where the IsNull leg
+        errors) — the caller then falls back to a full NULL-safe scan.
+        """
+        try:
+            flt = (
+                Filter.by_property(_EMBED_REVISION_PROP).not_equal(
+                    CODEGRAPH_EMBED_REVISION
+                )
+                | Filter.by_property(_EMBED_REVISION_PROP).is_none(True)
+            )
+            agg = coll.aggregate.over_all(filters=flt, total_count=True)
+            total = getattr(agg, "total_count", None)
+            return int(total) if total is not None else None
+        except Exception:  # noqa: BLE001 — undeterminable, never a wrong 0
+            return None
+
+    def _build_stale_file_set(self) -> Optional[frozenset]:
+        """R-1 (v0.2.73): the set of file paths owning ANY stale-revision row.
+
+        Probes the three FILE-ANCHORED collections (CodeModule.path,
+        CodeClass.file_path, CodeFunction.file_path) for rows whose
+        ``embed_revision`` is NULL or != ``CODEGRAPH_EMBED_REVISION`` and
+        collects their file paths. `_get_existing_module` re-walks any file
+        in this set even when its content hash is unchanged — closing the
+        convergence gap where the v0.2.72 M0 fix made only the MODULE row
+        revision-aware while stale FUNCTION/CLASS rows in unchanged files
+        stayed unreachable behind the per-file gate (live-reproduced: a full
+        re-walk left thousands of entity rows frozen at the old revision).
+
+        CodeAPI/CodeInteraction carry no file_path property and are not
+        probed; their rows re-stamp whenever their source file re-walks.
+
+        Cost model: a cheap filtered-aggregate pre-check per collection
+        short-circuits the converged steady state (3 aggregates, no scan —
+        this is what the per-edit single-file hook pays). Only collections
+        with stale rows (or an undeterminable count) pay one full scan
+        returning two tiny properties per row, classified client-side
+        (NULL-safe; Weaviate's cursor iterator cannot combine with filters).
+        Orphan rows of DELETED files keep their path in the set harmlessly
+        (no walker consults the gate for a nonexistent file); the resync's
+        ``--prune-stale`` pass removes them so the pre-check can reach 0.
+
+        Returns ``None`` when NO collection could be probed (gate then falls
+        back to pre-R-1 behaviour — fail-open toward the M0 module-row
+        check, never a crash).
+        """
+        probes = (
+            (getattr(self, "modules_collection", None), "path"),
+            (getattr(self, "classes_collection", None), "file_path"),
+            (getattr(self, "functions_collection", None), "file_path"),
+        )
+        stale: Set[str] = set()
+        determinable = False
+        for coll, path_prop in probes:
+            if coll is None:
+                continue
+            count = self._count_stale_rows_in_collection(coll)
+            if count == 0:
+                determinable = True
+                continue
+            try:
+                for obj in coll.iterator(
+                    return_properties=[path_prop, _EMBED_REVISION_PROP]
+                ):
+                    p = getattr(obj, "properties", None) or {}
+                    rev = p.get(_EMBED_REVISION_PROP)
+                    try:
+                        is_current = (
+                            rev is not None
+                            and int(rev) == CODEGRAPH_EMBED_REVISION
+                        )
+                    except (TypeError, ValueError):
+                        is_current = False
+                    if not is_current:
+                        fp = p.get(path_prop) or ""
+                        if fp:
+                            stale.add(str(fp))
+                determinable = True
+            except Exception as exc:  # noqa: BLE001 — per-collection soft-fail
+                print(
+                    f"⚠️  stale-file probe failed on "
+                    f"{getattr(coll, 'name', '?')}: {exc}",
+                    file=sys.stderr,
+                )
+        if not determinable:
+            return None
+        return frozenset(stale)
+
+    def _get_stale_file_set(self) -> Optional[frozenset]:
+        """Lazily-built, per-run cached stale-file set (see the builder)."""
+        if not hasattr(self, "_stale_file_set_cache"):
+            self._stale_file_set_cache = self._build_stale_file_set()
+        return self._stale_file_set_cache
+
     def _get_existing_module(self, path: str, file_hash: str) -> Optional[str]:
         """Check if module already exists with same hash AT THE CURRENT
         EMBED REVISION.
@@ -6875,7 +7003,25 @@ class CodeGraphAnalyzer:
         pre-v0.2.72 file). Read as an explicit property (not a filter
         conjunct) so absent/NULL pre-migration values are handled here and
         the behavior doesn't depend on the new prop's filter index.
+
+        v0.2.73 R-1: the M0 conjunct above covers only the MODULE row. A file
+        whose module row is current can still own stale FUNCTION/CLASS rows
+        (module stamped before a mid-file failure, vectorless writes stamped
+        0 by R-2, a walk that died between entity writes) — so the gate ALSO
+        consults the per-run stale-file set: any file owning a stale-revision
+        row of ANY file-anchored type re-walks, even with an unchanged hash.
+        Probe unavailable → fall back to the M0-only behaviour (fail-open).
         """
+        try:
+            stale_files = self._get_stale_file_set()
+        except Exception:  # noqa: BLE001 — stub analyzers / probe failure
+            stale_files = None
+        if stale_files and path in stale_files:
+            # A stale Function/Class/Module row anchors to this file → the
+            # file must re-walk so its entities re-embed under the current
+            # revision (the per-object gates keep the re-walk cheap for the
+            # rows that are already current).
+            return None
         try:
             result = self.modules_collection.query.fetch_objects(
                 filters=Filter.by_property("path").equal(path) &

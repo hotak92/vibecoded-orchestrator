@@ -448,3 +448,276 @@ def test_m0_float_revision_from_weaviate_still_skips(analyzer_mod):
     the gate must still recognize the current revision."""
     rev = float(analyzer_mod.CODEGRAPH_EMBED_REVISION)
     assert _m0_gate(analyzer_mod, [_m0_obj(rev)]) == "uuid-1"
+
+
+# ─────────────── R-2 (C-1): vectorless writes must stay visibly stale ─────────
+#
+# `generate_embedding` returns None on any backend failure; call sites write
+# anyway (only the `vector` key is guarded). Pre-fix, `_write_one_object`
+# stamped CURRENT revision + content hash on those VECTORLESS rows → both
+# gates passed forever → the row was invisible to near_vector search while
+# counting as converged. These tests drive the real `_write_one_object`.
+
+
+def test_r2_vectorless_write_stamps_revision_zero(analyzer_mod):
+    """No vector in insert_params → embed_revision stamped 0, NOT current."""
+    stub = _StubAnalyzer(analyzer_mod)
+    coll = _FakeColl("P_CodeFunction")  # absent object → write
+    params = {"properties": _small_func_props()}  # NO "vector" key
+    stub._write_one_object(coll, "uuid-V", params, "mod.small")
+    written = coll.data.replaced or coll.data.inserted
+    assert len(written) == 1
+    props = written[0]["properties"]
+    assert props["embed_revision"] == 0, (
+        "a vectorless write must NOT claim the current embed revision"
+    )
+    # content_hash is still stamped truthfully (the CONTENT is real; only
+    # the vector is missing) — the revision mismatch alone forces the retry.
+    assert props.get("content_hash")
+
+
+def test_r2_empty_vector_counts_as_vectorless(analyzer_mod):
+    """`vector: []` / `vector: None` (shaped-empty embeds) also stamp 0."""
+    for empty in ([], None):
+        stub = _StubAnalyzer(analyzer_mod)
+        coll = _FakeColl("P_CodeFunction")
+        params = {"properties": _small_func_props(), "vector": empty}
+        stub._write_one_object(coll, "uuid-V", params, "mod.small")
+        written = coll.data.replaced or coll.data.inserted
+        assert written[0]["properties"]["embed_revision"] == 0
+
+
+def test_r2_vectorless_row_retried_on_next_visit(analyzer_mod):
+    """THROUGH THE FINGERPRINT GATE: a rev-0 row with a MATCHING content hash
+    must NOT skip — the next visit (embed succeeded this time) re-writes it
+    at the current revision. This is the C-1 permanently-unsearchable-row
+    regression guard."""
+    stub = _StubAnalyzer(analyzer_mod)
+    coll_name = "P_CodeFunction"
+    props = _small_func_props()
+    content_hash = _compute_hash(analyzer_mod, coll_name, props)
+    coll = _FakeColl(coll_name, stored={
+        "uuid-V": {"content_hash": content_hash, "embed_revision": 0},
+    })
+    params = {"properties": dict(props), "vector": [0.1, 0.2]}
+    stub._write_one_object(coll, "uuid-V", params, "mod.small")
+    assert len(coll.data.replaced) == 1, "rev-0 row must be re-written"
+    assert coll.data.replaced[0]["properties"]["embed_revision"] == (
+        analyzer_mod.CODEGRAPH_EMBED_REVISION
+    )
+
+
+def test_r2_vector_present_still_stamps_current(analyzer_mod):
+    """Regression: the vector-bearing path keeps stamping CURRENT."""
+    stub = _StubAnalyzer(analyzer_mod)
+    coll = _FakeColl("P_CodeFunction")
+    params = {"properties": _small_func_props(), "vector": [0.5]}
+    stub._write_one_object(coll, "u", params, "mod.small")
+    written = coll.data.replaced or coll.data.inserted
+    assert written[0]["properties"]["embed_revision"] == (
+        analyzer_mod.CODEGRAPH_EMBED_REVISION
+    )
+
+
+# ─────────────── R-1: the per-FILE gate consults the stale-file set ───────────
+#
+# The v0.2.72 M0 fix made the file gate revision-aware for the MODULE row
+# only. RT-5 FINAL live-reproduced the residual gap: thousands of stale
+# FUNCTION/CLASS rows lived in UNCHANGED files whose module row was already
+# current → a full re-walk skipped every one of them and could never
+# converge. R-1 probes the three file-anchored collections up-front and
+# forces a re-walk of any file owning a stale row. Tests drive the REAL
+# `_get_existing_module` + `_build_stale_file_set` (through the gate — the
+# M0 lesson: never test only below the file gate).
+
+
+class _ProbeAgg:
+    def __init__(self, count, raises=False):
+        self._count = count
+        self._raises = raises
+
+    def over_all(self, **kwargs):
+        if self._raises:
+            raise RuntimeError("aggregate unavailable")
+        return types.SimpleNamespace(total_count=self._count)
+
+
+class _ProbeColl:
+    """Collection fake for the stale-file probe: aggregate + iterator +
+    the module-row fetch used by the M0 conjunct."""
+
+    def __init__(self, name, rows=None, agg_count=None, agg_raises=False,
+                 iter_raises=False, module_objects=None):
+        self.name = name
+        self._rows = rows or []
+        self.aggregate = _ProbeAgg(agg_count, raises=agg_raises)
+        self._iter_raises = iter_raises
+        self.iter_calls = 0
+        self.query = types.SimpleNamespace(
+            fetch_objects=lambda **kw: types.SimpleNamespace(
+                objects=module_objects or []
+            )
+        )
+
+    def iterator(self, return_properties=None):
+        self.iter_calls += 1
+        if self._iter_raises:
+            raise RuntimeError("scan failed")
+        for props in self._rows:
+            yield types.SimpleNamespace(uuid="u", properties=props)
+
+
+class _R1Stub:
+    """Binds the REAL gate + probe methods onto a minimal instance."""
+
+    def __init__(self, analyzer_mod, modules, classes, functions):
+        self.modules_collection = modules
+        self.classes_collection = classes
+        self.functions_collection = functions
+        cls = analyzer_mod.CodeGraphAnalyzer
+        for name in (
+            "_get_existing_module", "_get_stale_file_set",
+            "_build_stale_file_set", "_count_stale_rows_in_collection",
+        ):
+            setattr(self, name, getattr(cls, name).__get__(self, _R1Stub))
+
+
+def _current_module_row(analyzer_mod):
+    """A module row at the CURRENT revision (M0 conjunct passes)."""
+    return [types.SimpleNamespace(
+        uuid="uuid-mod",
+        properties={"embed_revision": analyzer_mod.CODEGRAPH_EMBED_REVISION},
+    )]
+
+
+def test_r1_stale_function_row_forces_rewalk_of_unchanged_file(analyzer_mod):
+    """THE RT-5 REGRESSION GUARD: module row current + hash matching, but a
+    FUNCTION row of the same file is at a stale revision → the file gate
+    must return None (re-walk) instead of skipping."""
+    rev = analyzer_mod.CODEGRAPH_EMBED_REVISION
+    modules = _ProbeColl(
+        "P_CodeModule", agg_count=0,
+        module_objects=_current_module_row(analyzer_mod),
+    )
+    classes = _ProbeColl("P_CodeClass", agg_count=0)
+    functions = _ProbeColl(
+        "P_CodeFunction", agg_count=1,
+        rows=[{"file_path": "pkg/mod.py", "embed_revision": rev - 1}],
+    )
+    stub = _R1Stub(analyzer_mod, modules, classes, functions)
+    assert stub._get_existing_module("pkg/mod.py", "deadbeef") is None, (
+        "a stale entity row must pull its unchanged file back through the gate"
+    )
+
+
+def test_r1_null_revision_entity_row_forces_rewalk(analyzer_mod):
+    """Pre-migration (NULL revision) entity rows count as stale too —
+    Weaviate comparisons ignore NULLs, so the client-side classification
+    must catch them."""
+    modules = _ProbeColl(
+        "P_CodeModule", agg_count=0,
+        module_objects=_current_module_row(analyzer_mod),
+    )
+    classes = _ProbeColl(
+        "P_CodeClass", agg_count=None,  # count unknown → scan
+        rows=[{"file_path": "pkg/mod.py", "embed_revision": None}],
+    )
+    functions = _ProbeColl("P_CodeFunction", agg_count=0)
+    stub = _R1Stub(analyzer_mod, modules, classes, functions)
+    assert stub._get_existing_module("pkg/mod.py", "deadbeef") is None
+
+
+def test_r1_converged_collections_skip_file_without_scanning(analyzer_mod):
+    """Steady state: all three aggregates report 0 stale → NO iteration runs
+    (the per-edit hook's cost bound) and the current-revision file skips."""
+    modules = _ProbeColl(
+        "P_CodeModule", agg_count=0,
+        module_objects=_current_module_row(analyzer_mod),
+    )
+    classes = _ProbeColl("P_CodeClass", agg_count=0)
+    functions = _ProbeColl("P_CodeFunction", agg_count=0)
+    stub = _R1Stub(analyzer_mod, modules, classes, functions)
+    assert stub._get_existing_module("pkg/mod.py", "deadbeef") == "uuid-mod"
+    assert modules.iter_calls == 0
+    assert classes.iter_calls == 0
+    assert functions.iter_calls == 0
+
+
+def test_r1_other_files_stale_rows_do_not_block_this_file(analyzer_mod):
+    """A stale row in a DIFFERENT file must not force this file to re-walk."""
+    rev = analyzer_mod.CODEGRAPH_EMBED_REVISION
+    modules = _ProbeColl(
+        "P_CodeModule", agg_count=0,
+        module_objects=_current_module_row(analyzer_mod),
+    )
+    classes = _ProbeColl("P_CodeClass", agg_count=0)
+    functions = _ProbeColl(
+        "P_CodeFunction", agg_count=1,
+        rows=[{"file_path": "other/file.py", "embed_revision": rev - 1}],
+    )
+    stub = _R1Stub(analyzer_mod, modules, classes, functions)
+    assert stub._get_existing_module("pkg/mod.py", "deadbeef") == "uuid-mod"
+
+
+def test_r1_probe_failure_falls_back_to_m0_behavior(analyzer_mod):
+    """Every probe fails (aggregate AND scan) → set is None → the gate keeps
+    the M0 module-row-only behaviour (fail-open, never a crash)."""
+    modules = _ProbeColl(
+        "P_CodeModule", agg_raises=True, iter_raises=True,
+        module_objects=_current_module_row(analyzer_mod),
+    )
+    classes = _ProbeColl("P_CodeClass", agg_raises=True, iter_raises=True)
+    functions = _ProbeColl("P_CodeFunction", agg_raises=True, iter_raises=True)
+    stub = _R1Stub(analyzer_mod, modules, classes, functions)
+    assert stub._get_existing_module("pkg/mod.py", "deadbeef") == "uuid-mod"
+
+
+def test_r1_per_collection_failure_does_not_wedge_others(analyzer_mod):
+    """One collection's scan failing must not hide another's stale rows."""
+    rev = analyzer_mod.CODEGRAPH_EMBED_REVISION
+    modules = _ProbeColl(
+        "P_CodeModule", agg_raises=True, iter_raises=True,
+        module_objects=_current_module_row(analyzer_mod),
+    )
+    classes = _ProbeColl("P_CodeClass", agg_count=0)
+    functions = _ProbeColl(
+        "P_CodeFunction", agg_count=2,
+        rows=[{"file_path": "pkg/mod.py", "embed_revision": rev - 1}],
+    )
+    stub = _R1Stub(analyzer_mod, modules, classes, functions)
+    assert stub._get_existing_module("pkg/mod.py", "deadbeef") is None
+
+
+def test_r1_stale_set_cached_per_run(analyzer_mod):
+    """The probe runs ONCE per analyzer instance (per-run cache)."""
+    functions = _ProbeColl(
+        "P_CodeFunction", agg_count=1,
+        rows=[{"file_path": "pkg/mod.py", "embed_revision": 0}],
+    )
+    modules = _ProbeColl(
+        "P_CodeModule", agg_count=0,
+        module_objects=_current_module_row(analyzer_mod),
+    )
+    classes = _ProbeColl("P_CodeClass", agg_count=0)
+    stub = _R1Stub(analyzer_mod, modules, classes, functions)
+    stub._get_existing_module("pkg/mod.py", "deadbeef")
+    stub._get_existing_module("pkg/mod.py", "deadbeef")
+    stub._get_existing_module("other/one.py", "cafebabe")
+    assert functions.iter_calls == 1, "stale-file scan must be cached per run"
+
+
+def test_r1_vectorless_rev0_row_is_in_stale_set(analyzer_mod):
+    """R-1 x R-2 interlock: a row stamped 0 by a vectorless write pulls its
+    file back through the gate on the next walk — the convergence loop the
+    two fixes form together (this is why R-1 and R-2 land atomically)."""
+    modules = _ProbeColl(
+        "P_CodeModule", agg_count=0,
+        module_objects=_current_module_row(analyzer_mod),
+    )
+    classes = _ProbeColl("P_CodeClass", agg_count=0)
+    functions = _ProbeColl(
+        "P_CodeFunction", agg_count=1,
+        rows=[{"file_path": "pkg/mod.py", "embed_revision": 0}],
+    )
+    stub = _R1Stub(analyzer_mod, modules, classes, functions)
+    assert stub._get_existing_module("pkg/mod.py", "deadbeef") is None
