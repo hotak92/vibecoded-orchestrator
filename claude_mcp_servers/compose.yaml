@@ -55,12 +55,17 @@ services:
       # always wins (so the WAL-replay backlog is bounded to ~500MB, NOT by the
       # long timer); the 1h window just avoids flushing a near-empty memtable
       # every minute during quiet periods. WAL-durable throughout (the flush
-      # cadence never touches the WAL/fsync path). Plus: cap compaction merges
-      # at 500MiB; auto-size Go heap/CPU to host (or container mem_limit) to cut
+      # cadence never touches the WAL/fsync path). Plus: LSM max segment 2GiB
+      # (v0.2.73 FIX-D1, RAISED from 500MiB — see the canonical
+      # infrastructure/docker-compose.yml for the full rationale: the low cap
+      # BLOCKED compaction from collapsing ~42k dead CodeFunction versions, so
+      # they were re-written every cycle; 2GiB lets them converge once. Keep
+      # 2GiB conservative so a ~2x merge spike stays under free-disk headroom /
+      # DISK_USE_READONLY_PERCENTAGE). Auto-size Go heap/CPU to host to cut
       # heap-driven flushing without OOM risk.
       PERSISTENCE_MEMTABLES_FLUSH_DIRTY_AFTER_SECONDS: 3600
       PERSISTENCE_MEMTABLES_MAX_SIZE_MB: 500
-      PERSISTENCE_LSM_MAX_SEGMENT_SIZE: 500MiB
+      PERSISTENCE_LSM_MAX_SEGMENT_SIZE: 2GiB
       LIMIT_RESOURCES: "true"
       # --- HNSW TOMBSTONE-CLEANUP CHURN REDUCTION (v0.2.61) ---
       # Mirror of the tuning in infrastructure/docker-compose.yml (canonical);

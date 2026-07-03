@@ -50,10 +50,34 @@ services:
       # this changes flush CADENCE, never the WAL/fsync path, so write-drop risk
       # is equal-or-lower than the default.
       PERSISTENCE_MEMTABLES_MAX_SIZE_MB: 500
-      # Cap compaction merge output so a vector-heavy collection can't rewrite
-      # one giant multi-GB segment on every merge (the main amplification
-      # spike). With a 500MiB cap, a merge rewrites at most ~1GB.
-      PERSISTENCE_LSM_MAX_SEGMENT_SIZE: 500MiB
+      # LSM max segment size. RAISED 500MiB -> 2GiB in v0.2.73 (FIX-D1).
+      # WHY THE RAISE: the old 500MiB cap was NET-HARMFUL for a large,
+      # update-heavy collection. Weaviate objects are immutable — every
+      # `replace()` writes a new version + tombstones the old; a big
+      # CodeFunction collection accumulated ~42k DEAD versions across 251
+      # un-mergeable segments because the 500MiB cap PREVENTS compaction from
+      # collapsing them into a few large segments. So the dead versions were
+      # re-written on every compaction cycle and never reclaimed — ongoing
+      # write I/O that this raise ENDS (compaction now converges once, then
+      # stays collapsed = fewer total re-writes over a long session).
+      # TRADEOFF: a larger cap means a single merge can rewrite up to ~2x the
+      # cap (~4GB) as a transient spike. Keep it CONSERVATIVE at 2GiB (not 4)
+      # so 2x cap stays well under free disk; a spike bigger than free headroom
+      # could trip DISK_USE_READONLY_PERCENTAGE (default 90%) and flip the
+      # collection read-only. Existing TOMBSTONE_DELETION_* brakes (below) still
+      # bound the cleanup work. Env name + "2GiB" format confirmed valid
+      # (weaviate-doc-verification-1.37 C9; applies on the pinned 1.28.4 too).
+      PERSISTENCE_LSM_MAX_SEGMENT_SIZE: 2GiB
+      # v0.2.73 FIX-D1 companion: make the read-only guard EXPLICIT (was the
+      # Weaviate default 90% on this canonical file, while the legacy
+      # claude_mcp_servers/compose.yaml already pinned 98). Both wire into the
+      # SAME shared volume, so they must AGREE — pin 98 here for parity. 98 also
+      # gives the raised 2GiB cap a little more headroom before a big merge spike
+      # trips read-only. NOTE: this raises the read-only threshold, not the
+      # disk-FULL guarantee — the operator still needs free disk >~2x the cap;
+      # the value trades a slightly later read-only trip for a slightly smaller
+      # last-resort safety margin. Documented, deliberate.
+      DISK_USE_READONLY_PERCENTAGE: "98"
       # Auto-size the Go heap + CPU to the host (or to a container mem_limit if
       # one is set): GOMEMLIMIT ~= 80% of available RAM, GOMAXPROCS = cores-1.
       # Reduces heap-pressure-driven flushing and removes the OOM tail risk on
