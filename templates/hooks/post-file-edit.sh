@@ -45,7 +45,12 @@ set -euo pipefail
 [ -z "${PY:-}" ] && exit 0  # No Python available — silent no-op
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# D-16 (v0.2.73): prefer CLAUDE_PROJECT_DIR so worktree-isolated /
+# out-of-tree sessions resolve state, logs and accumulator paths against
+# the SAME root as pre-tool-use.sh and post-tool-security.sh (whose
+# comment already claims alignment with this hook). Falls back to the
+# script-relative root when the env is absent.
+PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 KNOWLEDGE_ROOT="$PROJECT_ROOT/knowledge"
 
 # Debounce helper (2026-06-18, write-amplification fix). Coalesces rapid
@@ -84,48 +89,55 @@ $1"
 }
 
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
+#
+# HK-1 (v0.2.73): parse stdin EXACTLY ONCE. Previously this block spawned
+# four separate `$PY -c` interpreters (EDITED_FILE, AGENT_ID, AGENT_TYPE,
+# SESSION_ID) each re-reading and re-decoding the same payload — a
+# PostToolUse(Edit|Write) turn fires this hook plus ~6 siblings, so the
+# per-edit interpreter-start count ran ~15. One decoder now emits all four
+# fields as NUL-delimited records; bash reads them with a single `read`.
+# NUL delimiting keeps a newline-bearing file_path intact. Malformed
+# stdin → all-empty (each field defaults to ""), preserving the exit-0
+# soft-fail contract.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
-EDITED_FILE=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
+# The decoder emits the four fields NUL-delimited (a trailing NUL after
+# each field, including the last), so `read -r -d ''` in a loop reads each
+# field cleanly regardless of embedded newlines. Piping into the while
+# loop (not a here-string) avoids the trailing-newline corruption a
+# here-string would add.
+EDITED_FILE=""
+AGENT_ID=""
+AGENT_TYPE=""
+SESSION_ID_FROM_STDIN=""
+_HK_IDX=0
+while IFS= read -r -d '' _HK_VAL; do
+    case "$_HK_IDX" in
+        0) EDITED_FILE="$_HK_VAL" ;;
+        1) AGENT_ID="$_HK_VAL" ;;
+        2) AGENT_TYPE="$_HK_VAL" ;;
+        3) SESSION_ID_FROM_STDIN="$_HK_VAL" ;;
+    esac
+    _HK_IDX=$((_HK_IDX + 1))
+done < <(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
-    ti = d.get('tool_input', {})
-    print(ti.get('file_path', ''))
+    ti = d.get('tool_input', {}) or {}
+    fields = [
+        ti.get('file_path', '') or '',
+        d.get('agent_id', '') or '',
+        d.get('agent_type', '') or '',
+        d.get('session_id', '') or '',
+    ]
 except Exception:
-    print('')
-" 2>/dev/null || echo "")
-# V52-L.2 Fix 2b: parse subagent identity from the stdin payload. We
-# don't write a JSONL log directly from this hook, but the kg-sync /
-# code-graph-incremental subprocesses we spawn DO emit retrieval / sync
-# telemetry — exporting these as env vars (VCT_AGENT_ID / VCT_AGENT_TYPE)
-# lets the canonical emit path (rl_client/telemetry_emit.py) attribute
-# those rows to the agent that triggered the write. Pre-V52-L.2 every
-# subprocess saw an empty agent context regardless of which subagent ran
-# the edit. Empty string when absent (parent context).
-AGENT_ID=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
-import json, sys
-try:
-    d = json.loads(sys.stdin.read())
-    print(d.get('agent_id', ''))
-except Exception:
-    print('')
-" 2>/dev/null || echo "")
-AGENT_TYPE=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
-import json, sys
-try:
-    d = json.loads(sys.stdin.read())
-    print(d.get('agent_type', ''))
-except Exception:
-    print('')
-" 2>/dev/null || echo "")
-SESSION_ID_FROM_STDIN=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
-import json, sys
-try:
-    d = json.loads(sys.stdin.read())
-    print(d.get('session_id', ''))
-except Exception:
-    print('')
-" 2>/dev/null || echo "")
+    fields = ['', '', '', '']
+# Trailing NUL after EACH field so the reader loop terminates cleanly.
+sys.stdout.write(''.join(str(f) + '\0' for f in fields))
+" 2>/dev/null)
+# V52-L.2 Fix 2b context (preserved): AGENT_ID/AGENT_TYPE are exported
+# below so the kg-sync / code-graph-incremental subprocesses we spawn can
+# attribute their retrieval / sync telemetry to the originating subagent;
+# SESSION_ID feeds VCT_SESSION_ID for the same 3-layer telemetry chain.
 # Export for child processes (kg-sync, code-graph-incremental.sh, etc.)
 # so their emit paths can attribute telemetry to the originating agent.
 # Skip empty-string exports — downstream readers treat unset and empty
@@ -276,7 +288,10 @@ if [ -z "$VCT_PROJECT_ID" ] && [ -f "$PROJECT_ROOT/.claude/env" ]; then
 fi
 
 # 1. Auto-sync knowledge graph files (background side-effect).
-if [[ "$EDITED_FILE" == "$KNOWLEDGE_ROOT"* ]]; then
+# D-9 (v0.2.73): match on "<root>/" not "<root>" so sibling directories
+# (knowledge_base/, knowledge-old/) don't sync into the KG collection.
+# The diagrams branch below (:"$DIAGRAMS_DIR"/*) already uses this form.
+if [[ "$EDITED_FILE" == "$KNOWLEDGE_ROOT"/* ]]; then
     REL_PATH="${EDITED_FILE#$PROJECT_ROOT/}"
     cd "$PROJECT_ROOT"
     # v0.2.49 Phase 8: gate the sync on access-matrix write permission.
@@ -293,23 +308,60 @@ if [[ "$EDITED_FILE" == "$KNOWLEDGE_ROOT"* ]]; then
 
     EDIT_COUNT_FILE="$PROJECT_ROOT/.claude/logs/.kg_edit_count"
     mkdir -p "$PROJECT_ROOT/.claude/logs"
+    COUNT=0
     if [ -f "$EDIT_COUNT_FILE" ]; then
-        COUNT=$(cat "$EDIT_COUNT_FILE")
-    else
-        COUNT=0
+        COUNT=$(cat "$EDIT_COUNT_FILE" 2>/dev/null || echo 0)
     fi
+    # D-8 (v0.2.73): guard against corrupted counter content. Under
+    # `set -e`, `$((COUNT + 1))` with non-numeric COUNT aborts the rest of
+    # the hook — coerce anything non-numeric back to 0.
+    case "$COUNT" in
+        ''|*[!0-9]*) COUNT=0 ;;
+    esac
     COUNT=$((COUNT + 1))
     echo "$COUNT" > "$EDIT_COUNT_FILE"
     if [ $((COUNT % 10)) -eq 0 ]; then
-        (.claude/scripts/kg-duplicates --threshold 0.95 2>&1 \
-            | head -c 204800 | head -200 \
-            | grep -E "(✅|⚠️|📊)" || true) &
+        # D-8 (v0.2.73): the every-10-edits duplicate scan previously
+        # greped its ✅/⚠️/📊 summary to PLAIN stdout, which PostToolUse
+        # hooks silently drop (see the file header) — the advertised
+        # feature had no consumer. Persist the summary to a report file
+        # instead; the NEXT synchronous hook fire (a nudge-bearing edit,
+        # or session-start-kg-loader) surfaces it. The scan itself still
+        # runs backgrounded so the hook never blocks.
+        _DUP_REPORT="$PROJECT_ROOT/.claude/state/kg_duplicates_report.txt"
+        mkdir -p "$PROJECT_ROOT/.claude/state" 2>/dev/null || true
+        (
+            _dup_out=$(.claude/scripts/kg-duplicates --threshold 0.95 2>&1 \
+                | head -c 204800 | head -200 \
+                | grep -E "(✅|⚠️|📊)" || true)
+            if [ -n "$_dup_out" ]; then
+                {
+                    printf '# KG duplicate scan (every-10-edits, %s)\n' \
+                        "$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo unknown)"
+                    printf '%s\n' "$_dup_out"
+                } > "$_DUP_REPORT" 2>/dev/null || true
+            fi
+        ) &
+    fi
+    # D-8: surface a PENDING duplicate-scan report (from a prior fire)
+    # through the LLM-visible envelope on THIS synchronous fire, then
+    # consume it (rename) so it's shown once.
+    _DUP_REPORT="$PROJECT_ROOT/.claude/state/kg_duplicates_report.txt"
+    if [ -f "$_DUP_REPORT" ]; then
+        _dup_body=$(cat "$_DUP_REPORT" 2>/dev/null || true)
+        if [ -n "$_dup_body" ]; then
+            _add_nudge "[KG duplicate scan] The periodic duplicate check found candidates worth reviewing:
+$_dup_body
+Run \`.claude/scripts/kg-duplicates\` for detail, or ignore if these are intentional siblings."
+        fi
+        rm -f "$_DUP_REPORT" 2>/dev/null || true
     fi
 fi
 
 # 2. Auto-sync development documentation files (background side-effect).
 DOCS_DIR="$PROJECT_ROOT/docs"
-if [[ "$EDITED_FILE" == "$DOCS_DIR"* ]] && [[ "$EDITED_FILE" == *.md ]]; then
+# D-9 (v0.2.73): trailing slash — don't match docs-archive/, docsite/, etc.
+if [[ "$EDITED_FILE" == "$DOCS_DIR"/* ]] && [[ "$EDITED_FILE" == *.md ]]; then
     REL_PATH="${EDITED_FILE#$PROJECT_ROOT/}"
     cd "$PROJECT_ROOT"
     # v0.2.49 Phase 8: gate docs sync on access-matrix write permission

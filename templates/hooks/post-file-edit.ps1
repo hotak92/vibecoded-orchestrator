@@ -106,9 +106,21 @@ if ($AgentType)          { $Env:VCT_AGENT_TYPE = $AgentType }
 if ($SessionIdFromStdin) { $Env:VCT_SESSION_ID = $SessionIdFromStdin }
 
 $ScriptDir = $PSScriptRoot
-$ProjectRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
+# D-16 (v0.2.73): prefer CLAUDE_PROJECT_DIR (matches the .sh sibling) so
+# worktree-isolated / out-of-tree sessions resolve state paths against the
+# same root; fall back to the script-relative root otherwise.
+if ($Env:CLAUDE_PROJECT_DIR) {
+    $ProjectRoot = $Env:CLAUDE_PROJECT_DIR
+} else {
+    $ProjectRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
+}
 $KnowledgeRoot = Join-Path $ProjectRoot "knowledge"
 $DocsDir = Join-Path $ProjectRoot "docs"
+# D-9 (v0.2.73): match on the directory WITH a trailing separator so
+# sibling dirs (knowledge_base/, docs-archive/) don't sync into the KG /
+# development collections. StartsWith on the bare root matched them.
+$KnowledgeRootSep = $KnowledgeRoot.TrimEnd('\','/') + [System.IO.Path]::DirectorySeparatorChar
+$DocsDirSep = $DocsDir.TrimEnd('\','/') + [System.IO.Path]::DirectorySeparatorChar
 
 if (-not $EditedFile) { exit 0 }
 
@@ -364,7 +376,8 @@ if ((`$null -eq `$lvl) -or ((([string]`$lvl).Trim()) -eq 'write')) { $SyncExpr }
 }
 
 # 1. Knowledge graph auto-sync (background side-effect).
-if ($EditedFile.StartsWith($KnowledgeRoot, [StringComparison]::OrdinalIgnoreCase)) {
+# D-9: require the trailing separator so knowledge_base/ etc. don't match.
+if ($EditedFile.StartsWith($KnowledgeRootSep, [StringComparison]::OrdinalIgnoreCase)) {
     $relPath = $EditedFile
     if ($EditedFile.StartsWith($ProjectRoot, [StringComparison]::OrdinalIgnoreCase)) {
         $relPath = $EditedFile.Substring($ProjectRoot.Length).TrimStart('\','/')
@@ -410,10 +423,37 @@ if ($EditedFile.StartsWith($KnowledgeRoot, [StringComparison]::OrdinalIgnoreCase
         # (only the bash kg-duplicates wrapper exists in templates/scripts/).
         # Probe the bash wrapper directly; native-Windows-without-bash
         # machines skip dup-detection until a .ps1 wrapper actually ships.
+        # D-8 (v0.2.73): capture the summary into a report file (previously
+        # the scan ran hidden and its output was discarded — inert feature).
+        # The next KG-file edit surfaces + consumes the report.
         $dupSh = Join-Path $ProjectRoot ".claude/scripts/kg-duplicates"
         if ((Test-Path $dupSh) -and (Get-Command bash -ErrorAction SilentlyContinue)) {
-            Start-Process -FilePath "bash" -ArgumentList @($dupSh, '--threshold', '0.95') -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
+            $dupReport = Join-Path $ProjectRoot ".claude/state/kg_duplicates_report.txt"
+            $stateDir = Split-Path $dupReport -Parent
+            if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory -Path $stateDir -Force | Out-Null }
+            Start-Job -ScriptBlock {
+                param($bashDup, $root, $reportPath)
+                try {
+                    $out = & bash $bashDup '--threshold' '0.95' 2>&1 |
+                        Select-String -Pattern '✅|⚠️|📊' | ForEach-Object { $_.ToString() }
+                    if ($out) {
+                        $ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+                        Set-Content -Path $reportPath -Value (@("# KG duplicate scan (every-10-edits, $ts)") + $out) -Encoding utf8
+                    }
+                } catch {}
+            } -ArgumentList $dupSh, $ProjectRoot, $dupReport | Out-Null
         }
+    }
+
+    # D-8: surface a PENDING duplicate-scan report (from a prior fire)
+    # through the additionalContext envelope, then consume it.
+    $dupReport = Join-Path $ProjectRoot ".claude/state/kg_duplicates_report.txt"
+    if (Test-Path $dupReport) {
+        $dupBody = (Get-Content $dupReport -Raw -ErrorAction SilentlyContinue)
+        if ($dupBody) {
+            Add-Nudge "[KG duplicate scan] The periodic duplicate check found candidates worth reviewing:`n$dupBody`nRun .claude/scripts/kg-duplicates for detail, or ignore if these are intentional siblings."
+        }
+        Remove-Item $dupReport -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -422,7 +462,7 @@ if ($EditedFile.StartsWith($KnowledgeRoot, [StringComparison]::OrdinalIgnoreCase
 # the inline VCT_INSTALL_ROOT-or-ProjectRoot fallback (the latter pointed
 # at the USER's venv which doesn't have vco_lib + weaviate-client).
 . (Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1")
-if ($EditedFile.StartsWith($DocsDir, [StringComparison]::OrdinalIgnoreCase) -and ($EditedFile -like "*.md")) {
+if ($EditedFile.StartsWith($DocsDirSep, [StringComparison]::OrdinalIgnoreCase) -and ($EditedFile -like "*.md")) {
     # v0.2.49 Phase 8: gate docs sync on access-matrix write permission
     # against DEVELOPMENT_COLLECTION (the docs/ target).
     # 2026-06-18: debounced (same coalesce semantics + sync-time gate as
