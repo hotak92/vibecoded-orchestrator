@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.73] - 2026-07-04
 
 ### Security
 - **User-declared secrets never enter the project tree.** The per-project env
@@ -24,6 +24,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   emitting `permissionDecision:"allow"` for every command it rewrote; it now
   strips that field (keeping the compression rewrite) so wrapped commands run
   under the normal permission flow.
+- **Legacy-KG cleanup can no longer drop an active, in-use collection —
+  including a DIFFERENT project's.** Two independent data-loss paths in the
+  legacy-KG-collection detector are closed. First, a casing-lossy sanitizer
+  combined with a case-insensitive similarity check and a case-SENSITIVE
+  "is this the canonical?" test meant the detector could flag your own live
+  collection as "legacy" and hand you a copy-paste command whose last line
+  drops it. Second, a substring-based prefix-similarity rule meant that on a
+  machine hosting multiple projects, one project's legacy-cleanup deferral
+  could match and target ANOTHER project's live, unrelated KG collection for
+  deletion. Both paths are now cross-checked against the full set of live
+  collection bindings at both detection time and again at the moment the
+  emitted command actually runs (refusing the drop if the target is a live
+  binding of any project). Case-only mismatches are now routed to a metadata
+  rebind instead of a destructive copy+drop.
+- **A destructive row-cap value can no longer wipe an entire telemetry
+  table.** The RL-events retention/prune endpoint treated `max_rows: 0` (or
+  a negative value) as "no limit configured" rather than "zero rows to
+  keep," which combined with the SQL `LIMIT 0` semantics to delete the whole
+  `rl_events` corpus (or an entire project's rows) in one call. The guard now
+  treats any non-positive row cap as a no-op at the deletion authority
+  itself, not just in the one caller that happened to coerce it correctly.
 
 ### Fixed
 - **Code-graph resync now converges the stale-revision tail.** A revision-gated
@@ -40,10 +61,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`install.py --update` no longer clobbers foreign deferrals.** The deferral
   report is seeded from disk and entries other writers own are preserved verbatim
   (previously the end-of-run write dropped every entry not re-detected in that run).
+  The deferral report's JSON sidecar is now the single source of truth end-to-end;
+  a restart-required banner that gets cleared is unlinked from BOTH the Markdown
+  render and its JSON sidecar (previously only the Markdown was removed, so the
+  banner could resurrect on the next read because the JSON copy survived).
 - **Knowledge-graph writes are crash-safe.** `store_knowledge_node` scopes its
   delete to `title AND file_path` (a same-titled node in another file survives)
   and embeds+inserts the new rows before deleting the old ones (an embed outage
   mid-write no longer destroys the existing node).
+- **A single transient node failure no longer forces a full 2500+ node
+  re-embed on every subsequent update.** The knowledge-graph sync used to skip
+  persisting "what embedding model / collection this was last synced against"
+  whenever even one node failed to embed (e.g. one oversized node during a
+  2590-node sync), which made every following update treat the whole
+  collection as unsynced and re-embed everything (tens of minutes wasted per
+  update on slower hardware). The context is now persisted after any sync
+  attempt that ran, so the next update does an incremental diff instead of a
+  full re-embed.
+- **The legacy-KG migration command the tool used to hand out (copy vectors,
+  then drop) could 422 and get you stuck.** When source and destination
+  collections didn't share the same vector-schema shape (single-vector vs
+  named-vector), the copy step failed outright with an opaque batch error and
+  left you with no working remediation. The recommended path is now
+  re-embed-from-source-markdown into a freshly-shaped canonical collection,
+  then drop the legacy one — no schema-shape gymnastics, and it also produces
+  correctly-shaped, correctly-modeled vectors instead of preserving
+  possibly-stale ones.
+- **Code-graph build status now reports "partial" instead of silently
+  swallowing prune failures.** A build that successfully re-indexes changed
+  files but fails to prune some stale/deleted entries previously reported
+  full success; it now surfaces a distinct partial-success status end-to-end
+  (analyzer to database to the launcher GUI's build indicator), so a
+  partially-completed build is visible instead of indistinguishable from a
+  clean one.
 - **Playwright MCP is actually registered** by the install flow (both the Rust
   and Python builders), matching the documented default-on behavior.
 - **Re-enabling a bundled MCP from the GUI writes the correct entry** (venv
@@ -54,6 +104,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The secrets resolver `.sh` / `.ps1` / Python legs behave identically** on
   their edge arms (bare-name tier-3 skip, non-zero-exit and empty-output
   suppression), and the bash resolver suite now runs in CI.
+- **Fixed the root cause of the multi-hundred-gigabyte-per-session disk write
+  storm reported on heavy multi-agent sessions.** Every code edit used to
+  trigger an immediate, synchronous code-graph re-index; with several parallel
+  agents each working in their own git worktree, that fired repeatedly and
+  wrote far more to the underlying vector database than the actual size of the
+  edited code justified (measured: ~857 GB written in 8 hours against a ~5 GB
+  project). The fix has several parts:
+  - Ephemeral/unregistered git-worktree edits (the common shape for a
+    parallel-subagent session) are now skipped entirely at edit time rather
+    than triggering a re-index; edits in the main checkout or in a registered
+    worktree still index normally, and the gate is biased toward indexing
+    whenever it can't tell for sure (so worktree-primary workflows are never
+    silently cut off).
+  - Remaining edits are no longer indexed per-edit at all. They're queued and
+    the actual re-index runs once per turn (at Stop) as a rate-limited,
+    batched pass — cutting redundant re-indexing during a burst of edits to
+    the same files.
+  - The unchanged-content skip that avoids re-embedding a function whose code
+    didn't change now runs BEFORE the (expensive) embedding call across every
+    code-graph write path, instead of after — roughly 50x fewer embedding
+    calls for a typical incremental re-index of a large codebase.
+  - Code edits made by a background subagent (a common source of the
+    worktree-storm pattern) now flow through the same batched, rate-limited
+    drain as foreground edits, instead of a separate, undrained queue file
+    that grew without bound and never actually reached the code graph.
+  - A stale per-repository indexing lock left behind by a killed or crashed
+    indexing process (out-of-memory, out-of-disk, forced shutdown) is now
+    automatically reclaimed, based on the surviving process's actual liveness
+    rather than a fixed timeout alone — a long-but-healthy first-time index of
+    a large codebase is no longer at risk of having its own lock incorrectly
+    broken out from under it by a second, competing pass.
+- **Fixed a second, larger source of disk reads: the code-graph indexer had
+  been walking into internal state/backup directories it should never have
+  entered.** On some installs, roughly 40% of the indexed code-function
+  collection turned out to be timestamped snapshot copies of source files
+  (created by the tool's own edit-backup mechanism), not real source code.
+  Re-indexing this churn on every pass was a major driver of both disk growth
+  and the very high disk-read volume observed on some machines (measured in
+  the multi-terabyte range for a single session). The indexer now excludes
+  these internal directories on every code path (full walk, incremental
+  drain, and single-file updates use one shared exclusion decision), and
+  an additional path used for indexing an extra/secondary source root now
+  excludes that root's OWN internal directories the same way. A one-time,
+  narrowly-targeted database migration removes the already-indexed garbage
+  from existing installs on update — it deletes only the confirmed-garbage
+  rows (verified one-by-one against the real file path, not a pattern match
+  that could accidentally catch real source files with a similar-looking
+  path) and does not touch, re-embed, or discard the vectors/summaries of any
+  real code entity.
+- **Raised the vector-database's internal storage segment-size cap** so that
+  routine background compaction can actually collapse old/superseded data
+  instead of being blocked mid-way — on affected installs this had left tens
+  of thousands of dead entries permanently un-collapsed, which were then
+  repeatedly re-read and re-written on every compaction pass. This is the
+  single biggest lever for reducing both write volume and the disk-read
+  volume the tool causes over time (the two disk-storm investigations above
+  both point at it as a root contributor, not just the code-graph fix).
+- **RL retrieval-telemetry rows are now stored at reduced precision** (matching
+  the precision already used elsewhere in the pipeline), cutting the on-disk
+  size of that telemetry table by roughly half with no measurable effect on
+  retrieval-ranking quality.
+- **A stray, orphaned code-graph queue file that nothing ever drained** has
+  been removed; anything that used to write to it now flows through the
+  batched drain described above instead.
+- **Fixed four Windows-only PowerShell hook files that shipped with a
+  non-ASCII character but no UTF-8 byte-order-mark**, which can cause default
+  Windows PowerShell (5.1) to misread the file and throw a parser error at an
+  unrelated line. Also fixed a related cross-platform inconsistency where the
+  Windows side of a worktree-vs-main-checkout path comparison did not
+  normalize symlinked paths the same way the Linux/macOS side did, which
+  could misclassify a symlinked main-tree edit as a worktree edit and
+  silently skip it.
 
 ### Added
 - **Code retrieval down-weights test files** by a measured additive penalty so
@@ -67,10 +189,118 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   code retrievals record `rl_used` + shown order, stage citation vectors so
   code results become labelable, surface container 4xx fallbacks instead of
   silently degrading, and `query_code_structure` emits structural telemetry.
+- **A new `rl-doctor` diagnostic** reports on RL retrieval health (container
+  connectivity, protocol-version agreement, embedding-space sanity) in one
+  command.
+- **RL retrieval containers now negotiate a protocol version** with the host,
+  and bounded retention/garbage-collection keeps the `rl_events` telemetry
+  store from growing unbounded (hourly-throttled, floor-aware so in-flight
+  citations are never pruned out from under an active session).
+- **Session-start now surfaces any pending update deferral more visibly**, and
+  a one-line knowledge-graph retrieval-health indicator is shown so a
+  degraded search backend (e.g. embedding-service unreachable) is obvious at
+  session start rather than silently returning empty results.
+- **Windows setup-script parity**: a bash-ism that had crept into the Windows
+  settings template is removed, with a parity test guarding against
+  recurrence.
+- Groundwork for a future alternative vector-index type (HFresh) has landed
+  behind an explicit opt-in flag, defaulting to the existing index and adding
+  zero behavior change on the default path. It is not enabled by default and
+  is not expected to activate until the underlying vector-database feature
+  reaches general availability; this is deliberate, gated groundwork, not an
+  active feature in this release.
+- Code-graph build tracking now records the indexing process's PID and
+  registers detached (background) resync runs so the launcher GUI can show
+  live progress and detect a crashed run, and the build-status column
+  distinguishes a genuinely clean build from one that partially failed.
+- **A knowledge-graph search could freeze the machine when a collection's
+  vectors were embedded under a different model than the one currently
+  active.** In that state the retrieval path re-embedded every candidate one at
+  a time, synchronously, on the search's own execution thread — a slow local
+  embedder turned this into a multi-second (or worse) stall that read like a
+  hang, and the same underlying mismatch also made the search return no
+  results. The search now detects the whole-collection slot mismatch once and
+  skips the per-node re-embedding entirely (logging a single clear warning that
+  points at re-analyzing the collection), instead of firing one blocking
+  embed per result.
+- **The per-search telemetry write no longer blocks the search.** The
+  retrieval-telemetry event (which can carry a few hundred KB of vectors) was
+  posted to the local hub synchronously on the search's execution thread; it
+  now runs off-thread so a slow or wedged hub can never stall a search.
+- **A read no longer triggers an unbounded background write storm.** When the
+  optional dual-embedding backfill is enabled, a search would re-issue the same
+  idempotent per-object vector write on every subsequent search; each
+  (object, slot) is now backfilled at most once per process, so enabling that
+  feature can't turn reads into a runaway stream of vector-database writes.
+- **The pre-shipped knowledge-graph summaries are consistent with their nodes
+  again.** Stripping the now-removed Joern references from one shipped node
+  left its cached summary keyed to the old text; the shipped summary sidecar
+  is regenerated so summary reuse fires correctly on a fresh install, and the
+  regenerator now emits fields in a stable order so future regenerations
+  produce a minimal, reviewable diff.
+- **Orphaned code-graph "staging" collections are now reaped instead of
+  leaking forever.** A crashed or mismatched code-graph rebuild leaves a
+  temporary `<Collection>__staging` class behind; the knowledge-graph orphan
+  sweep used to explicitly skip these (assuming another subsystem owned them,
+  which nothing did), so they accumulated on the vector database indefinitely.
+  The sweep now reaps a code-graph staging orphan when — and only when — the
+  real collection is present and holds at least as many objects (the staging is
+  then a provable, regenerable orphan). Crucially, the drop is scoped to the
+  **current project's** code-graph collections: a staging class belonging to a
+  different project on the same shared vector database is never auto-dropped
+  (it may hold a rebuild in flight) — it is surfaced for that project's own
+  run to reconcile. Anything ambiguous (base missing or smaller) is retained
+  and surfaced, never dropped.
+- **The code-graph collection-naming guard now also rejects an explicit
+  worktree-relative project name.** The guard that refuses to mint a
+  `<name>_Code*` collection from inside a throwaway git worktree only fired
+  when the project name was inferred from the directory; passing an explicit
+  `--project some-worktree/track` walked straight past it and minted polluting
+  collections. It now refuses an explicit project value that contains a
+  worktree-container path segment (`.wt`, `worktrees`, `vco-wt`) as well —
+  matching on whole segments so a legitimate name that merely contains those
+  letters is unaffected. A live test that created code-graph collections
+  without cleaning them up now tears them down.
+
+### Changed
+- **The legacy-KG-collection cleanup workflow** now recommends re-embedding
+  from your project's source markdown into a correctly-shaped collection
+  rather than attempting a byte-level vector copy across incompatible
+  schemas — see the Security and Fixed sections above for the underlying
+  data-loss and reliability fixes this replaces.
+- Internal hook helpers for detecting the canonical repository root,
+  scrubbing environment variables, and gating worktree-vs-main-checkout
+  behavior have been consolidated into shared library files (used identically
+  by the per-edit hook and the new batched drain) instead of being
+  duplicated across call sites.
+- The code-graph analyzer's 14 per-language file-discovery walkers, which each
+  inlined the same walk-and-filter body, are now driven by one declarative
+  table plus a single shared walker — eliminating the 14-way duplication with
+  no change to which files any language indexes.
+- **The Weaviate MCP server module was split for maintainability.** The RL
+  reranking / telemetry-enrichment layer and the embedding-generation layer
+  (54 functions) moved out of the ~10k-line `server.py` monolith into dedicated
+  `rl_enrichment.py` and `embeddings.py` modules. Behaviour is unchanged — the
+  shared mutable state stays on `server.py` and the moved functions reach it at
+  call time, so every existing patch point and search path resolves exactly as
+  before.
+- **The installer's MCP-registration and Weaviate KG-hygiene helpers were
+  extracted** from the ~26k-line `install.py` into `vco_lib/install_mcp.py` and
+  `vco_lib/install_weaviate.py`, with couplings passed as explicit parameters
+  so no import cycle is introduced. No behavioural change to installation.
 
 ### Removed
 - Retired the dead JSONL `training_loader` (the RL corpus has been DB-only since
   RL v0.2.11; it had zero production callers and mismatched the current cohorts).
+- **Removed the unused Joern CFG/PDG code-graph extraction path entirely.**
+  The optional Joern integration wrote `cfg_summary` / `data_flow_vars`
+  fields that had zero readers anywhere in the product; the whole path
+  (the analyzer extractor and its schema fields, the `--cfg`/`--pdg` flags,
+  the installer's Joern detection/prompt/auto-install, and the
+  `VCT_JOERN_AVAILABLE` plumbing) is gone. No user-facing capability is
+  lost — the code graph never surfaced those metrics — and the install
+  flow no longer probes for or offers to download a ~600 MB JVM tool.
+
 
 ## [0.2.72] - 2026-07-02
 
