@@ -85,5 +85,4 @@ These exist but are **not** in the OSS bundle:
 | **Slug** | URL-safe project identifier auto-generated from project name, used in `/p/<slug>` routes |
 | **Tier cache** | SQLite table in the Launcher that caches the validated license tier for 72-hour offline use |
 | **Typed WikiLinks** | KG link syntax: `[[relationshipType::Target]]` (e.g. `[[uses::Weaviate]]`) |
-| **CFG / PDG** | Control-Flow Graph / Program Dependence Graph — optional Joern-powered code metrics |
 | **RLS** | Row-Level Security — Supabase policy that prevents clients from self-granting paid tiers |

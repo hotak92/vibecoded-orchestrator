@@ -1,6 +1,6 @@
 # Knowledge Graph & Code Graph
 
-The semantic memory layer: an Obsidian-style knowledge graph (`knowledge/`), a five-collection code graph (AST + optional Joern), the Weaviate schemas behind both, the embedding pipeline (text and code), and the shell scripts that let Claude — and human adopters — drive all of it from the CLI. Source mostly in `claude_mcp_servers/weaviate_mcp/`, `.claude/scripts/`, and `knowledge/`.
+The semantic memory layer: an Obsidian-style knowledge graph (`knowledge/`), a five-collection AST-based code graph, the Weaviate schemas behind both, the embedding pipeline (text and code), and the shell scripts that let Claude — and human adopters — drive all of it from the CLI. Source mostly in `claude_mcp_servers/weaviate_mcp/`, `.claude/scripts/`, and `knowledge/`.
 
 The OSS bundle ships seven canonical node types (`project`, `concept`, `tool`, `model`, `hardware`, `research`, `coordination`), but seed content only populates four folders (`concepts/`, `models/`, `tools/`, `patterns/`) — the rest ship empty for adopters to fill in as they author. `patterns/` is a content category, not a node type; pattern nodes carry `type: concept` in frontmatter. See the full reconciliation in [Bundled Seed Content](#knowledge-graph-bundled-seed-content) below.
 
@@ -117,7 +117,7 @@ One object per source file. Properties: `path`, `language`, `module_summary`, `i
 One object per class/struct. Properties: `name`, `full_name`, `class_body`, `methods` (text array), `extends` (text array, base class names), `field_types` (text array), `composes` (text array, composition relationships).
 
 ### `CodeFunction` collection
-One object per function/method. Properties: `name`, `full_name`, `function_body`, `signature`, `calls` (text array, resolved to other `full_name`s), `type_uses` (text array), `cfg_summary` (control-flow summary from Joern, `skip_vectorization=True`), `data_flow_vars` (variable names from Joern PDG, `skip_vectorization=True`).
+One object per function/method. Properties: `name`, `full_name`, `function_body`, `signature`, `calls` (text array, resolved to other `full_name`s), `type_uses` (text array).
 
 ### `CodeAPI` collection
 One object per inbound API endpoint. Properties: `endpoint`, `method` (HTTP verb), `api_description`, `handler` (function full_name). Populated for Flask, FastAPI, Express, ASP.NET (HTTP attribute annotations), gRPC service RPC methods, and Fastify routes.

@@ -65,7 +65,7 @@ JSON record, which you should skip rather than abort on).
 - `start → ok` — step succeeded
 - `start → error` — step failed; this is your failure point
 - `start → skip` — step intentionally skipped (usually optional features
-  like Joern, or `--skip-seed` / `--skip-collections`)
+  like lean-ctx, or `--skip-seed` / `--skip-collections`)
 - `start → warn` — step partially succeeded (e.g. seed step where the KG
   sync ran but docs upload failed). Non-fatal but worth surfacing.
 - `start` with no terminal phase — the writer crashed mid-step.
@@ -76,10 +76,10 @@ JSON record, which you should skip rather than abort on).
 - `1/10` … `10/10` — main install.py phases (Python → system → venv →
   deps → services → Ollama → models → collections → seed → state-dir →
   .env → claude-cli)
-- `2b/10`, `7b/10`, `7c/10` — sub-steps (joern, collection bootstrap,
-  Weaviate seeding)
+- `2b/10`, `7b/10`, `7c/10` — sub-steps (optional companions like lean-ctx,
+  collection bootstrap, Weaviate seeding)
 - `session` — meta-event: install.py session start/ok markers
-- `choices` — install-time decisions (joern, embedding mode, container
+- `choices` — install-time decisions (optional companions, embedding mode, container
   runtime). `detail` is the choice name, `data.value` is the chosen
   value, `data.reason` is a human-readable rationale. Read by
   `_load_previous_choices` to replay decisions on a re-install
@@ -106,13 +106,13 @@ JSON record, which you should skip rather than abort on).
 
 When the launcher's conflict modal Strategy 3 (overwrite-preserve)
 runs against an already-installed project, the full install.py path
-takes 1-2 minutes (re-asks Joern, redetects GPU, re-pulls Ollama
+takes 1-2 minutes (re-detects lean-ctx, redetects GPU, re-pulls Ollama
 models). Most of that work is unnecessary on a hot system.
 
 **Lightweight mode skips:**
 - Model pulls (shared volume, already pulled)
 - Weaviate seeding (`sync_knowledge_graph.py` is idempotent)
-- Joern probe + lean-ctx detection
+- lean-ctx detection
 - GPU detection / embedding-mode prompt
 
 **Lightweight mode runs:**

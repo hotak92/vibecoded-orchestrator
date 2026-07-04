@@ -19,7 +19,7 @@ For the design behind the v0.2.53 install changes (why `--bootstrap` is additive
 
 ### Bootstrap envelope at `state/logs/bootstrap-prepass.json`
 
-The envelope is a system-detection JSON document conforming to `docs/schemas/install-bootstrap-envelope-v1.json` (schema_version=1). Fields cover OS / arch / RAM, Python / Node / npm / pnpm / Podman / Docker / Git / Brew / Joern / lean-ctx / claude CLI presence + versions, GPU detection (vendor / VRAM), Linux distro + pkg_mgr / Windows features / macOS features, resolved paths (install_root, venv_python, launcher_binary, vct_root_dir), per-OS package-manager advice, Weaviate / Ollama / code-embed / vct-hub endpoint URLs, missing_prereqs list, `ready_to_install` flag with `blocker_messages`.
+The envelope is a system-detection JSON document conforming to `docs/schemas/install-bootstrap-envelope-v1.json` (schema_version=1). Fields cover OS / arch / RAM, Python / Node / npm / pnpm / Podman / Docker / Git / Brew / lean-ctx / claude CLI presence + versions, GPU detection (vendor / VRAM), Linux distro + pkg_mgr / Windows features / macOS features, resolved paths (install_root, venv_python, launcher_binary, vct_root_dir), per-OS package-manager advice, Weaviate / Ollama / code-embed / vct-hub endpoint URLs, missing_prereqs list, `ready_to_install` flag with `blocker_messages`.
 
 Side-effect policy (`install.py:1523-1582`, `_run_bootstrap`):
 - READ-ONLY by default. Spawns short read-only probes (`python3 --version`, `podman --version`, `nvidia-smi`, `getenforce`, `brew --prefix`, `podman machine list`). All probes timeout-bounded.
@@ -45,9 +45,10 @@ PowerShell 5.1+ script with the same interpreter probe (`python3.12`, …, `py -
 <details>
 <summary>Details</summary>
 
-`install.ps1` supports the flags the Python installer accepts: `-NoContainers`, `-Gpu`, `-CpuOnly`, `-LowResource`, `-OpenaiKey`, `-Container`, `-Dev`, `-Update`, `-SkipModels`, `-Quiet`, `-WithJoern`, `-NoJoern`, `-NoAgents`, `-NoSkills`. The Windows `py` launcher with version pinning (`py -3.12`) is tried as a secondary probe to handle Windows Store Python stubs.
+`install.ps1` supports the flags the Python installer accepts: `-NoContainers`, `-Gpu`, `-CpuOnly`, `-LowResource`, `-OpenaiKey`, `-Container`, `-Dev`, `-Update`, `-SkipModels`, `-Quiet`, `-NoAgents`, `-NoSkills`. The Windows `py` launcher with version pinning (`py -3.12`) is tried as a secondary probe to handle Windows Store Python stubs.
 
 > The `-WithMaoAgents` switch is also present in `install.ps1` and forwards `--with-mao-agents` to `install.py`, but `install.py` doesn't define that flag and `templates/agents/mao/` doesn't exist in the OSS bundle — the switch is effectively a no-op until those land. Tracked as a code-doc gap, not a documented flag.
+>
 
 </details>
 
@@ -98,7 +99,7 @@ Explicit telemetry consent for the generated `.env`. Default is prompt-on-TTY; n
 Non-interactive mode: accept all defaults (telemetry=off, confirm all uninstall prompts).
 
 ### `--quiet`
-Minimal output. Also suppresses the Joern interactive prompt.
+Minimal output. Also suppresses interactive optional-companion prompts (e.g. lean-ctx detection).
 
 ### `--uninstall`
 Switches the installer to uninstall mode. Pairs with `--keep-data`, `--remove-projects`, `--dry-run`.
@@ -117,35 +118,10 @@ Each step checks before acting. Venv creation is skipped if `.venv/bin/python` e
 `_install_agents_and_skills()` replaces `{{ORCHESTRATOR_ROOT}}`, `{{PROJECTS_ROOT}}`, and `{{HOME}}` in all `.md` files before copying. This embeds absolute paths into agent definitions at install time so they work regardless of how the CLI invokes them.
 
 ### `.env` generation
-`_write_env_config()` writes a fully-populated `.env` including `WEAVIATE_URL`, `OLLAMA_URL`, `EMBEDDING_MODEL`, `CODE_EMBED_BACKEND`, `CODE_EMBED_DIMS`, `VCT_JOERN_AVAILABLE`, `KG_COLLECTION`, `DEVELOPMENT_COLLECTION`, `VIBECODED_TELEMETRY`, and (if `--openai-key` was given) `OPENAI_API_KEY`. File is only written if `.env` does not already exist.
+`_write_env_config()` writes a fully-populated `.env` including `WEAVIATE_URL`, `OLLAMA_URL`, `EMBEDDING_MODEL`, `CODE_EMBED_BACKEND`, `CODE_EMBED_DIMS`, `KG_COLLECTION`, `DEVELOPMENT_COLLECTION`, `VIBECODED_TELEMETRY`, and (if `--openai-key` was given) `OPENAI_API_KEY`. File is only written if `.env` does not already exist.
 
 ### `.claude/settings.json` generation
 `_configure_claude_settings()` creates `.claude/settings.json` with base `permissions.allow` rules and an `env` block that injects all service URLs and embedding config into every Claude Code session in this project folder. Skipped if the file already exists.
-
----
-
-## Joern Auto-Detect
-
-### Joern detection flow
-`_detect_optional_companions()` runs at step 2b. Calls `shutil.which("joern")`. If found, `VCT_JOERN_AVAILABLE=1` is set in `.env` and CFG/PDG metrics are enabled by default. Not found → prompts interactively (unless `--quiet` or non-TTY).
-
-### `--with-joern` flag
-Downloads `joern-install.sh` over HTTPS from `github.com/joernio/joern/releases/latest`, validates the payload is ≥256 bytes and starts with a `#!` shebang, then runs with `--dir ~/.local/joern --no-interactive`. Installs to `~/.local/joern/joern-cli/` without needing sudo.
-
-<details>
-<summary>Details</summary>
-
-The installer adds `~/.local/joern/joern-cli` to `PATH` for the current process so subsequent steps can find `joern`. Joern install failure is non-fatal — the orchestrator works without it; CFG/PDG fields on `CodeFunction` nodes are simply absent.
-
-Security note: HTTPS-only download is enforced. No checksum is enforced because Joern's release pipeline doesn't publish one. Users who want pinned integrity should pre-install Joern and let the detector find it. `~600MB` JVM-based; this warning is printed before any interactive prompt.
-
-</details>
-
-### `--no-joern` flag
-Skips detection and the install prompt entirely. `VCT_JOERN_AVAILABLE=0` written to `.env`. Useful for CI or minimal installs.
-
-### `VCT_JOERN_AVAILABLE` env var
-Written to `.env` at install time. The `code-graph-analyze` script reads this to auto-enable `--cfg --pdg` flags when Joern is present. Can be manually overridden in `.env` later.
 
 ---
 
@@ -195,7 +171,7 @@ Three scripts at three different levels of cost. `check-install.sh` runs in seco
 Runs without network or containers. Checks: `bash -n install.sh` syntax, `shellcheck` (optional), `python3 -m py_compile install.py`, `install.py --help` exit 0, PowerShell parse via `pwsh` (optional), `pip install --dry-run -r requirements.txt` resolver check, scan for hardcoded personal paths, scan for stale private-module refs, and image-tag pinning in compose files (warns on `:latest` but only fails on non-intentional tags).
 
 ### `scripts/test-install.sh` — container-based smoke test
-Opt-in, requires Docker or Podman, takes ~3-5 minutes. Launches a clean `ubuntu:22.04` container, copies the repo in, runs `install.py --no-containers --skip-models --no-joern --no-agents --no-skills`, then asserts: `.venv/bin/python` exists, `pip list` works, `.env` was created. Supports `RUNTIME=docker` and `IMAGE=ubuntu:24.04` overrides.
+Opt-in, requires Docker or Podman, takes ~3-5 minutes. Launches a clean `ubuntu:22.04` container, copies the repo in, runs `install.py --no-containers --skip-models --no-agents --no-skills`, then asserts: `.venv/bin/python` exists, `pip list` works, `.env` was created. Supports `RUNTIME=docker` and `IMAGE=ubuntu:24.04` overrides.
 
 ### `scripts/check-no-secrets.sh` — pre-commit token blocklist
 Scans the git-tracked tree for historically-leaked secrets. Wire as a pre-commit hook: `ln -sf ../../scripts/check-no-secrets.sh .git/hooks/pre-commit`. Supports `--staged` and `--all` modes. Exits non-zero with instructions to replace with placeholders if any match is found.
@@ -363,7 +339,7 @@ Compose override that adds NVIDIA device reservations to both `ollama` and `code
 ## Environment Configuration
 
 ### `.env` generated by installer
-The repo does not ship a top-level `.env.example`. `install.py::_write_env_config` writes a fully-populated `.env` at install time covering: infrastructure URLs (`WEAVIATE_URL`, `OLLAMA_URL`, `GRPC_PORT`, `CODE_EMBED_SERVICE_URL`), KG collection names (`KG_COLLECTION`, `SHARED_KG_COLLECTION`), embedding settings (`ACTIVE_EMBEDDING`, `EMBEDDING_MODEL`, `CODE_EMBED_BACKEND`, `CODE_EMBED_DIMS`), Joern detection (`VCT_JOERN_AVAILABLE`), telemetry opt-in (`VIBECODED_TELEMETRY=false`), and OpenAI key (only if `--openai-key`). The launcher subtree ships its own `launcher/.env.example` for the SvelteKit / Supabase auth client.
+The repo does not ship a top-level `.env.example`. `install.py::_write_env_config` writes a fully-populated `.env` at install time covering: infrastructure URLs (`WEAVIATE_URL`, `OLLAMA_URL`, `GRPC_PORT`, `CODE_EMBED_SERVICE_URL`), KG collection names (`KG_COLLECTION`, `SHARED_KG_COLLECTION`), embedding settings (`ACTIVE_EMBEDDING`, `EMBEDDING_MODEL`, `CODE_EMBED_BACKEND`, `CODE_EMBED_DIMS`), telemetry opt-in (`VIBECODED_TELEMETRY=false`), and OpenAI key (only if `--openai-key`). The launcher subtree ships its own `launcher/.env.example` for the SvelteKit / Supabase auth client.
 
 ### `VIBECODED_TELEMETRY` env var
 Explicit opt-in flag (default `false`). Written by `install.py` based on the telemetry consent prompt.

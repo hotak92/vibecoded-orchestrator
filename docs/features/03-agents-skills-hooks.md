@@ -328,7 +328,7 @@ Verifies that the Weaviate / Ollama / code-embed container ports are bound and r
 Blocks `vercel ... --token=...` invocations because the Vercel CLI echoes the token back in the `next:` block of stdout, leaking it into tool output. Forces use of `VERCEL_TOKEN` env var instead. Exit 2 on `--token=` match.
 
 ### `code-graph-incremental.sh` — (available, not wired in default settings.json)
-Incremental code graph analysis on every code file edit. Auto-detects the project from the edited file path and supports Joern CFG/PDG extraction when Joern is on PATH.
+Incremental code graph analysis on every code file edit. Auto-detects the project from the edited file path.
 
 ### `agent-skill-keyword-suggest.sh` — UserPromptSubmit (blocking)
 Scans the user prompt for keywords declared in agents'/skills' `keywords:` frontmatter and injects a short suggestion as additionalContext. Globs `.claude/agents/*.md` and `.claude/skills/*/SKILL.md` — disabled items live in sibling `.disabled/` directories and naturally fall outside the glob.

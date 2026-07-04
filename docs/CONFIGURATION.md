@@ -38,7 +38,7 @@ The schema is published at [`docs/schemas/install-bootstrap-envelope-v1.json`](s
 
 | Key | Purpose |
 |---|---|
-| `system` | OS, arch, RAM, CPU count, and tool probes (Python with wheel-coverage flag, Node, npm/pnpm, Podman, Docker, git, brew, Joern, lean-ctx, `claude` CLI), GPU summary (vendor / model / VRAM / driver / container-toolkit), distro-specific feature blocks (`linux_distro`, `macos_features`, `windows_features`). |
+| `system` | OS, arch, RAM, CPU count, and tool probes (Python with wheel-coverage flag, Node, npm/pnpm, Podman, Docker, git, brew, lean-ctx, `claude` CLI), GPU summary (vendor / model / VRAM / driver / container-toolkit), distro-specific feature blocks (`linux_distro`, `macos_features`, `windows_features`). |
 | `paths` | `install_root` + classification (`orchestrator_clone` / `completed_install` / `git_repo` / `unknown`), venv interpreter paths, launcher + hub binary paths and exists flags, state-dir locations. |
 | `package_manager_advice` | Per-tool install command vectors for the host's primary package manager (apt / dnf / pacman / zypper / apk / winget / brew), plus `selinux_volume_flag_needed` (Fedora/RHEL with bind-mount layouts) and the NVIDIA Container Toolkit URL when relevant. |
 | `weaviate_endpoints` | Canonical Weaviate endpoints — notably `health: /v1/.well-known/ready` (this is the SSOT; Rust + bash consumers MUST read it from the envelope rather than inventing their own probe path). |

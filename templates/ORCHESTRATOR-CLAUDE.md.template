@@ -357,8 +357,7 @@ status: active  # active, archived, deprecated, idea
 **Code Graph** (auto venv):
 
 ```bash
-.claude/scripts/code-graph-analyze  /path/to/repo [--project NAME] [--incremental] [--cfg] [--pdg]
-# --cfg/--pdg require joern in PATH
+.claude/scripts/code-graph-analyze  /path/to/repo [--project NAME] [--incremental]
 .claude/scripts/code-graph-query    search "auth middleware" [--collection TYPE] [--limit N]
 .claude/scripts/code-graph-query    similar "module.function" [--limit N]
 .claude/scripts/code-graph-query    structure dependencies|callers|methods|extends|interactions "target"
@@ -525,13 +524,12 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 **3. Code Graph** (Weaviate collections):
 - **CodeModule** — files with imports and metrics (`path`, `language`, `module_summary`, `loc`, `complexity`).
 - **CodeClass** — classes with inheritance (`name`, `full_name`, `class_body`, `methods`, `extends`, `field_types`, `composes`).
-- **CodeFunction** — functions with call graphs (`name`, `full_name`, `function_body`, `signature`, `calls`, `type_uses`, `cfg_summary`*, `data_flow_vars`*).
-  - *`cfg_summary` / `data_flow_vars` populated only when `--cfg`/`--pdg` flags are used with Joern.*
+- **CodeFunction** — functions with call graphs (`name`, `full_name`, `function_body`, `signature`, `calls`, `type_uses`).
 - **CodeAPI** — API endpoints with handlers (`endpoint`, `method`, `api_description`, `handler`).
 - **CodeInteraction** — cross-service calls (`interaction_type`, `protocol`, `endpoint`, `confidence`, `direction`). Query: `query_code_structure("interactions", "module.py")`.
 - Search: `search_code_graph`, `query_code_structure` MCPs or `code-graph-query` CLI.
 - Embedding: hardware-spec ladder via code embedding service — CodeSage-Large-v2 (2048-dim, VRAM >=12 GB) → `qwen3-embedding:0.6b` (1024-dim, VRAM >=6 GB or capable CPU) → `jina-embeddings-v2-base-code` (768-dim) as the CPU / low-VRAM floor; non-CodeSage tiers run via Ollama.
-- Analysis: `.claude/scripts/code-graph-analyze . --project "ProjectName" [--cfg] [--pdg]`.
+- Analysis: `.claude/scripts/code-graph-analyze . --project "ProjectName" [--incremental]`.
 
 **4. Development Collection** (`docs/` → `DEVELOPMENT_COLLECTION`):
 - Verbose project-specific docs.

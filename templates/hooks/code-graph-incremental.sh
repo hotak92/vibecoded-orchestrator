@@ -22,9 +22,6 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # auto-detects the sibling project name and analyzes against its collections.
 # Collections are auto-created if they don't exist (handled by analyze_code_graph.py).
 #
-# Joern: when joern is on PATH (or VCT_JOERN_AVAILABLE=1), analyze_code_graph.py
-# defaults to extracting CFG complexity + PDG data-flow vars per function. Falls
-# through cleanly when joern is missing.
 #
 # Usage: bash code-graph-incremental.sh <edited_file> [repo_path] [project_name]
 #
@@ -372,10 +369,8 @@ fi
 
 # Run single-file analysis in background (no internal debounce — the
 # per-file coalescing is handled by post-file-edit.sh's debounce layer).
-# --cfg/--pdg default to ON inside analyze_code_graph.py when joern is
-# present; silent fallback when absent. To disable, set VCT_JOERN_AVAILABLE=0.
-# In single-file mode the analyzer scopes Joern's CPG build to the one
-# edited file too, so this stays cheap per-edit.
+# In single-file mode the analyzer scopes analysis to the one edited file,
+# so this stays cheap per-edit.
 #
 # v0.2.66 (Bug 3): switched from `"$REPO_PATH" --incremental` to
 # `"$REPO_PATH" --only-file "$EDITED_FILE"`. The old `--incremental` ran

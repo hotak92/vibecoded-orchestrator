@@ -217,11 +217,9 @@ Analyze a repository and populate code graph collections in Weaviate.
 <details>
 <summary>Details</summary>
 
-Usage: `.claude/scripts/code-graph-analyze /path/to/repo [--project NAME] [--incremental] [--cfg] [--pdg] [--language LANG] [--create-collections]`.
+Usage: `.claude/scripts/code-graph-analyze /path/to/repo [--project NAME] [--incremental] [--language LANG] [--create-collections]`.
 
 - `--incremental`: only re-analyze files changed since last run (tracked via content hash).
-- `--cfg`: extract control-flow graph complexity per function (requires Joern in PATH).
-- `--pdg`: extract program dependence graph data-flow vars per function (requires Joern).
 - `--language <lang>`: restricts analysis to one language (useful for polyglot repos).
 - `--create-collections`: explicitly creates Weaviate collections before analysis; safe to call on existing collections (schema migration adds missing properties without data loss).
 

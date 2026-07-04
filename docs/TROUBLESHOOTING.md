@@ -6,23 +6,6 @@ Common issues during install and first-run. If none of these help, open an issue
 
 Issues specific to `first-install.sh` / `first-install.command` / `first-install.bat` / `first-install.desktop`.
 
-### Joern installer hang
-
-Versions before commit `64d5804` could hang indefinitely while downloading the Joern JVM tool. Fixed in `64d5804`. If you are on an older clone:
-
-```bash
-git pull
-bash first-install.sh
-```
-
-To skip Joern entirely on any version:
-
-```bash
-bash first-install.sh --yes
-# then re-run install.py directly with:
-python3 install.py --no-joern
-```
-
 ### macOS: "VCT Launcher is damaged and can't be opened" (Gatekeeper)
 
 Gatekeeper blocks unsigned binaries downloaded from the internet. `first-install.command` strips the quarantine xattr automatically on binaries it downloads. If the warning appears anyway (e.g. you downloaded the `.dmg` manually):

@@ -591,8 +591,7 @@ same function as KG bindings.
   are not portable between dimensions; you must re-analyze.
 - When `last_analyzed_commit` is many commits behind `HEAD`.
 - Run: `.claude/scripts/code-graph-analyze . --project "<ProjectName>"`
-  from the project root. Add `--cfg --pdg` for control-flow / data-flow
-  graphs (requires `joern` in PATH).
+  from the project root.
 
 #### Common operations
 

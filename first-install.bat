@@ -497,7 +497,10 @@ if %ERRORLEVEL% EQU 0 goto :node_install_done
 REM Loud-stop pattern (parity with Linux/macOS post-install-launcher.sh).
 REM Don't silently skip and report "Installation complete!" while the
 REM launcher build was actually skipped — that's the same anti-pattern
-REM as the Joern silent-hang. Tell the user exactly what to do.
+REM as the old Joern silent-hang (Joern integration was removed in
+REM v0.2.73 CG-3; this comment is a historical analogy only, not a
+REM claim that Joern is still installed/probed here). Tell the user
+REM exactly what to do.
 echo.
 echo ===============================================
 echo   Cannot build the launcher: Node.js is missing

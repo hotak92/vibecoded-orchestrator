@@ -2,7 +2,7 @@
 # Opt-in container-based smoke test of install.py.
 #
 # Builds a clean ubuntu:22.04 container, copies the repo in, runs
-# install.py with --no-containers --skip-models --no-joern --no-agents
+# install.py with --no-containers --skip-models --no-agents
 # --no-skills (so we exercise the Python install path without pulling
 # images / models / agents). Useful for catching package-manager-only
 # bugs in install.py and requirements.txt resolution.
@@ -54,7 +54,7 @@ echo "=== install.py (dry-run-ish) ==="
 # We can't run the full installer (no podman/docker inside the container).
 # Skip every step that needs network beyond pip + every step that touches
 # a container daemon.
-python3 install.py --no-containers --skip-models --no-joern --no-agents --no-skills
+python3 install.py --no-containers --skip-models --no-agents --no-skills
 echo
 echo "=== venv created? ==="
 ls -la /work/.venv/bin/python || (echo "MISSING"; exit 1)

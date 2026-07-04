@@ -325,11 +325,6 @@ install.py [--bootstrap] [--json] [--install-missing] [--no-prompt] [--verbose]
       "prefix": "/opt/homebrew",
       "ok": true
     },
-    "joern": {
-      "cmd": null,
-      "version": null,
-      "ok": false
-    },
     "lean_ctx": {
       "cmd": null,
       "version": null,
@@ -394,7 +389,6 @@ install.py [--bootstrap] [--json] [--install-missing] [--no-prompt] [--verbose]
     "install_python": ["brew install python@3.13"],
     "install_node": ["brew install node"],
     "install_podman": ["brew install podman", "podman machine init", "podman machine start"],
-    "install_joern": ["brew install joern"],
     "install_lean_ctx": ["brew install lean-ctx"],
     "tauri_deps": [],
     "selinux_volume_flag_needed": false,
@@ -440,9 +434,7 @@ install.py [--bootstrap] [--json] [--install-missing] [--no-prompt] [--verbose]
   "blocker_messages": [
     "Podman or Docker is required but neither was found on PATH."
   ],
-  "warnings": [
-    "Joern is optional but not installed; CFG/PDG analysis will be unavailable."
-  ]
+  "warnings": []
 }
 ```
 
@@ -768,7 +760,7 @@ These are NOT done in v0.2.53. v2 names them for completeness because Track G's 
 
 #### DEDUP-9: `_package_manager_install_prompt`
 
-**Source**: install.py `_prompt_install_container_runtime` (7281), `_maybe_install_lean_ctx` (7562), `_install_joern` (7834).
+**Source**: install.py `_prompt_install_container_runtime` (7281), `_maybe_install_lean_ctx` (7562). (`_install_joern` was one of the three call-sites cited here at v0.2.54; removed in v0.2.73 CG-3 along with all Joern CFG/PDG code-graph extraction.)
 **New home (v0.2.54)**: ??? — audit-marked HIGH risk; v2 recommendation: extract the *shape* (recipe enum + try-each loop) but keep recipes inline per caller.
 **Owner track (v0.2.54)**: TBD.
 

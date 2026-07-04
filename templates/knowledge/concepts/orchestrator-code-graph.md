@@ -38,10 +38,6 @@ Source repository
         |     git diff to find changed files since last analysis
         |     Only re-analyze changed files
         |
-        +-- Optional Joern integration (--cfg --pdg):
-        |     cfg_summary    — control flow graph summary per function
-        |     data_flow_vars — data-flow variable tracking
-        |
         +-- Embed via the code-embedding service
         |   (CodeSage-Large-v2 on GPU, jina-embeddings-v2-base-code on CPU via Ollama)
         |
@@ -51,8 +47,6 @@ Source repository
 Run:
 ```bash
 .claude/scripts/code-graph-analyze /path/to/repo --project "ProjectName" --incremental
-# With CFG/PDG (requires joern in PATH):
-.claude/scripts/code-graph-analyze /path/to/repo --project "ProjectName" --cfg --pdg
 ```
 
 ## Entity Types
@@ -92,8 +86,6 @@ Represents a source file.
 | signature | Type-annotated signature string |
 | calls | List of functions this function calls |
 | type_uses | Types referenced in annotations |
-| cfg_summary | Control flow graph summary (optional, requires `--cfg`) |
-| data_flow_vars | Data flow variable tracking (optional, requires `--pdg`) |
 
 ### CodeAPI
 
@@ -201,15 +193,6 @@ The `--incremental` flag makes analysis fast enough to run on every commit:
 4. Upsert new/updated entities, delete removed ones.
 
 The PostToolUse file-edit hook (`post-file-edit.sh`) routes edited code files to `code-graph-incremental.sh`, which queues them for incremental analysis after every edit.
-
-## Joern Integration (Optional)
-
-Joern is a static-analysis platform for precise CFG and PDG extraction. Not required for basic operation; enables:
-
-- **CFG summary** (`cfg_summary`): high-level control flow (conditionals, loops, exception paths).
-- **Data flow variables** (`data_flow_vars`): tracks which variables flow into which function parameters.
-
-Joern must be in PATH and is only invoked with `--cfg` / `--pdg` flags.
 
 ## Integration Points
 

@@ -259,7 +259,7 @@ if (-not $Python -or -not (Test-Path $Analyzer)) { exit 0 }
 # keyed on path+hash) and per-object (_dedup_insert content_hash) skip paths,
 # so an unchanged or trivially-edited file writes ~0 objects. No repo-wide
 # prune happens, so this can't re-introduce the V52-O.7 prune-deletes-other-
-# rows regression. The analyzer also scopes Joern's CPG build to the one file.
+# rows regression.
 # --canonical-source $CanonRoot dedups git-worktree edits onto the
 # main-checkout object (Bug 3 part b — mirrors the .sh sibling).
 #

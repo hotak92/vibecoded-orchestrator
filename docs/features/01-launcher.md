@@ -645,7 +645,7 @@ Inline button on the gate spawns `first-install.{sh,command,bat}` in a terminal 
 
 `vct_launcher_core::services::runtime::augment_path_for_graphical_launch()` (`launcher/src-tauri/vct-launcher-core/src/services/runtime.rs:221`) prepends user-installed CLI tooling directories to `PATH` at launcher startup. Called from `launcher/src-tauri/src/lib.rs:639` BEFORE any subprocess spawn.
 
-**Why**: `.app` double-click on macOS Finder, and `.desktop` activation on GNOME/KDE, both inherit a minimal LaunchServices / systemd-user PATH (`/usr/bin:/bin:/usr/sbin:/sbin`). Tooling installed via Homebrew, cargo, pipx, linuxbrew, snap, flatpak is missing, so every subsequent `python3`, `cargo`, `joern`, `podman`, `git` spawn failed with "command not found" until the user re-launched from a terminal. Cross-OS triage finding `cross-os-triage-2026-06-10.md` §P0-7 confirms macOS + Linux are the same root cause.
+**Why**: `.app` double-click on macOS Finder, and `.desktop` activation on GNOME/KDE, both inherit a minimal LaunchServices / systemd-user PATH (`/usr/bin:/bin:/usr/sbin:/sbin`). Tooling installed via Homebrew, cargo, pipx, linuxbrew, snap, flatpak is missing, so every subsequent `python3`, `cargo`, `podman`, `git` spawn failed with "command not found" until the user re-launched from a terminal. Cross-OS triage finding `cross-os-triage-2026-06-10.md` §P0-7 confirms macOS + Linux are the same root cause.
 
 **Candidates** (prepended; first wins):
 - macOS: `/opt/homebrew/bin`, `/opt/homebrew/sbin`, `$HOME/.cargo/bin`, `$HOME/.local/bin`.

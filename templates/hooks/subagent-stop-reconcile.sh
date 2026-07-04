@@ -21,8 +21,8 @@
 #      worktrees) and append the gated-IN paths to the SESSION-AGNOSTIC
 #      drain queue `.claude/state/codegraph_drain_shared.txt` that the
 #      Stop-hook batched drain (stop-codegraph-drain.{sh,ps1}) consumes.
-#      We never run analyze synchronously (joern + sentence-transformer
-#      init are too slow) and we never write the old orphan
+#      We never run analyze synchronously (embedding-model init is too
+#      slow) and we never write the old orphan
 #      code-graph-queue.jsonl (nothing ever drained it — v0.2.73 HIGH-2).
 #   4. Credential scan — run the shared `_lib/credscan.sh` scanner on
 #      every modified file. On hit, append an entry to
@@ -298,8 +298,8 @@ fi
 # Performance: the gate's registered-project probe shells out to
 # vct_project_config.sh once per DISTINCT canonical root (not per file), so a
 # subagent touching many files under one repo pays ONE probe. We NEVER run the
-# analyzer synchronously (joern + sentence-transformer init is 5-30s, over the
-# <10s budget); we only ENQUEUE. Soft-fail throughout.
+# analyzer synchronously (embedding-model init is 5-30s, over the <10s
+# budget); we only ENQUEUE. Soft-fail throughout.
 if [ "${#CODE_FILES[@]}" -gt 0 ]; then
     # Per-canonical-root gate cache: canon-root -> "SKIP" | "INDEX". Resolve +
     # gate ONCE per distinct canonical root; reuse the verdict for every file

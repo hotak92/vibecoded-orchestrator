@@ -33,10 +33,6 @@
     Minimal output
 .PARAMETER LowResource
     Lightest mode: Jina V2 (768d) via Ollama. For low-RAM/low-VRAM machines.
-.PARAMETER WithJoern
-    Force-enable Joern integration for richer code-graph metrics (CFG/PDG).
-.PARAMETER NoJoern
-    Skip Joern detection entirely.
 .PARAMETER NoAgents
     Skip installing Claude agents.
 .PARAMETER WithMaoAgents
@@ -63,8 +59,6 @@ param(
     [switch]$Update,
     [switch]$SkipModels,
     [switch]$Quiet,
-    [switch]$WithJoern,
-    [switch]$NoJoern,
     [switch]$NoAgents,
     [switch]$WithMaoAgents,
     [switch]$NoSkills,
@@ -101,8 +95,6 @@ foreach ($a in $args) {
         '^--dev$'                { $Dev = $true }
         '^--update$'             { $Update = $true }
         '^--skip-models$'        { $SkipModels = $true }
-        '^--with-joern$'         { $WithJoern = $true }
-        '^--no-joern$'           { $NoJoern = $true }
         '^--no-agents$'          { $NoAgents = $true }
         '^--with-mao-agents$'    { $WithMaoAgents = $true }
         '^--no-skills$'          { $NoSkills = $true }
@@ -134,7 +126,7 @@ if ($Help) {
     Write-Host "  -NoAutoLaunch    --no-auto-launch  Skip post-install launcher spawn."
     Write-Host "  -NoDesktopIcon   --no-desktop-icon Skip desktop shortcut creation."
     Write-Host "  -Gpu / -CpuOnly / -LowResource     Hardware mode selection."
-    Write-Host "  -Dev -Update -WithJoern -NoJoern -NoAgents -WithMaoAgents"
+    Write-Host "  -Dev -Update -NoAgents -WithMaoAgents"
     Write-Host "  -NoSkills -NoCompile -Quiet        See .PARAMETER docs in this file."
     Write-Host "  -OpenaiKey <key>  -Container <docker|podman>"
     Write-Host ""
@@ -579,8 +571,6 @@ if ($Dev)           { $installArgs += "--dev" }
 if ($Update)        { $installArgs += "--update" }
 if ($SkipModels)    { $installArgs += "--skip-models" }
 if ($Quiet)         { $installArgs += "--quiet" }
-if ($WithJoern)     { $installArgs += "--with-joern" }
-if ($NoJoern)       { $installArgs += "--no-joern" }
 if ($NoAgents)      { $installArgs += "--no-agents" }
 if ($WithMaoAgents) { $installArgs += "--with-mao-agents" }
 if ($NoSkills)      { $installArgs += "--no-skills" }

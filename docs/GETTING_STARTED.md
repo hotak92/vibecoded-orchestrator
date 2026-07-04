@@ -56,7 +56,7 @@ Or, after cloning, double-click the file for your OS:
 
 2. **Bootstrap prepass** — `install.py --bootstrap --json` runs as a read-only system-detection probe, writing a versioned JSON envelope to `state/logs/bootstrap-prepass.json`. The envelope contains detected Python/Node/Podman/Docker versions, GPU vendor + VRAM, RAM, OS / distro / package manager, resolved paths (install root, launcher binary, dist subdir), Weaviate / Ollama / code-embed / vct-hub endpoints, and a `missing_prereqs` list with per-tool install hints. Side-effect policy: no file writes, no network, no prompts; every probe has a timeout. Failure here is logged and ignored — the full install runs regardless. Schema: [`docs/INSTALL_ARCHITECTURE_v2.md` §3](INSTALL_ARCHITECTURE_v2.md#3-target-architecture-installpy---bootstrap-mode). The `--bootstrap` flag is mutually exclusive with `--update` / `--lightweight` / `--uninstall` and is invoked alone in its own process by the shim.
 
-3. **Full install** — `install.py <forwarded args>` runs the canonical 10-step flow: Python check, system detection, optional companions (Joern, lean-ctx), venv, dependencies, containers, Ollama models, Weaviate collections + KG seeding, MCP server registration in `~/.claude.json`, and Claude CLI check. The shim forwards every user-supplied flag verbatim (so `bash first-install.sh --update`, `--gpu`, `--cpu-only`, etc. all work).
+3. **Full install** — `install.py <forwarded args>` runs the canonical 10-step flow: Python check, system detection, optional companions (lean-ctx), venv, dependencies, containers, Ollama models, Weaviate collections + KG seeding, MCP server registration in `~/.claude.json`, and Claude CLI check. The shim forwards every user-supplied flag verbatim (so `bash first-install.sh --update`, `--gpu`, `--cpu-only`, etc. all work).
 
 On `install.py` exit 0 and unless `--no-auto-launch` was passed, the shim then runs [`scripts/post-install-launcher.sh`](../scripts/post-install-launcher.sh) (Linux/macOS) or its inline equivalent in `first-install.bat` (Windows). That step probes for an existing launcher binary, downloads the prebuilt one from GitHub Releases if absent, or offers to build from source. macOS additionally strips `com.apple.quarantine` from any downloaded binary to preempt Gatekeeper. The launcher is then spawned as a detached process.
 
@@ -127,7 +127,7 @@ python install.py --update            # Re-run on an existing install (preserves
 For CI or non-interactive installs:
 
 ```bash
-python install.py --quiet --no-joern --no-containers
+python install.py --quiet --no-containers
 ```
 
 If anything goes wrong during install, see the troubleshooting table in [README.md](../README.md) and [docs/TROUBLESHOOTING.md](TROUBLESHOOTING.md).
@@ -348,7 +348,7 @@ This extracts `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, and `CodeInt
 The installer fails clearly (no auto-install path) if any of these are missing — most desktop OSes have them by default, but minimal images (Alpine, NixOS minimal, stripped-down WSL distros) may not.
 
 - **`bash`** (Linux / macOS) or **`cmd.exe`** + **`PowerShell 5.1+`** (Windows) — POSIX / Windows guarantees
-- **`curl` OR `wget`** — needed for downloading the Joern installer and (when not bundled) the launcher binary from GitHub Releases. macOS always has `curl`; Linux Alpine / NixOS minimal may have neither and need `apk add curl` / `nix-env -iA curl` first
+- **`curl` OR `wget`** — needed for downloading (when not bundled) the launcher binary from GitHub Releases. macOS always has `curl`; Linux Alpine / NixOS minimal may have neither and need `apk add curl` / `nix-env -iA curl` first
 - **`hdiutil`** (macOS only, for mounting `.dmg`) — ships with macOS
 - **`pkexec`** (Linux only, for graphical sudo prompts during Podman / apt installs) — present on most desktop distros, missing on minimal server images
 
@@ -385,10 +385,6 @@ curl -fsSL https://leanctx.com/install.sh | sh
 ```
 
 Skip with `--no-lean-ctx` if you don't want the auto-detection prompt.
-
-### Joern — control-flow + program-dependence metrics
-
-[Joern](https://docs.joern.io/installation/) is a ~600 MB JVM-based code property graph tool. When installed, the orchestrator's code-graph analyzer can populate CFG (control-flow graph) and PDG (program-dependence graph) metrics on indexed functions. Skip with `--no-joern` if you don't need those metrics.
 
 ## vct-hub: project + secrets resolver (v0.2.21+)
 

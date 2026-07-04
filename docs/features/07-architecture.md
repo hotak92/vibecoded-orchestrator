@@ -203,7 +203,7 @@ Seven items: CI green, local `cargo test --lib`, local `pytest tests/ -q`, local
 `python install.py --update` re-runs on an existing install, preserving `.env` and user settings. Safe to re-run after upstream changes.
 
 ### `--quiet` flag for non-interactive / CI installs
-`python install.py --quiet --no-joern --no-containers` runs without interactive prompts.
+`python install.py --quiet --no-containers` runs without interactive prompts.
 
 ### Hardware-aware install profiles
 Four embedding profiles auto-selected by install flags or hardware detection: NVIDIA GPU (CodeSage-Large-v2 GPU + qwen3 via Ollama), CPU-only (qwen3 for both), OpenAI API key (text-embedding-3-small), `--low-resource` (lightest models). Documented in `README.md` §Hardware table.
