@@ -6145,12 +6145,41 @@ def _live_kg_collection_binding() -> Optional[str]:
     return val.strip() or None
 
 
+def _kg_binding_keep_set_normalised() -> tuple[set[str], bool]:
+    """Return ``(normalised_kg_class_names, resolvable)`` — EVERY project's live
+    KG collection binding (all roles), normalised for case-insensitive match.
+
+    SEV-2 #2 (v0.2.73): the legacy-KG drop detector must NEVER emit a drop
+    command against ANOTHER active project's KG class. BUG-1 only protected the
+    SELF collection; a different project's ``Foobar_KnowledgeGraph`` can
+    substring/Levenshtein-match this project's ``Foo`` prefix via
+    ``_is_similar_prefix`` and be proposed as a drop target — but the consented
+    command re-embeds from THIS project's ``.md`` (never the other project's),
+    so running it drops the other project's populated KG unrecoverably.
+
+    This mirrors ``_codegraph_keep_set_normalised``: the launcher.db binding
+    table is the ground truth. ``resolvable`` is False only when launcher.db is
+    unreachable — callers MUST refuse to emit any drop command in that case
+    (conservative data-safety), never treat an empty set as "nothing is live".
+    """
+    try:
+        from vco_lib.launcher_db_reader import kg_binding_keep_set
+        names, resolvable = kg_binding_keep_set()
+    except Exception:
+        return (set(), False)
+    normed = {_normalise_prefix_for_match(n) for n in names if n}
+    normed.discard("")
+    return (normed, resolvable)
+
+
 def _detect_legacy_collections_with_suffixes(
     project_name: str,
     weaviate_url: str,
     suffixes: tuple,
     *,
     live_binding: Optional[str] = None,
+    cross_project_keep_set: Optional[set[str]] = None,
+    cross_project_keep_resolvable: Optional[bool] = None,
 ) -> list[dict]:
     """Shared core for legacy KG + legacy code-graph detection.
 
@@ -6179,6 +6208,22 @@ def _detect_legacy_collections_with_suffixes(
                                            # case-REBIND, never copy+drop.
         }
 
+        cross_project_keep_set: SEV-2 #2 (KG family only). The normalised set
+            of EVERY project's live KG collection binding (all roles), from
+            launcher.db. A candidate whose full class name (normalised) is in
+            this set is ANOTHER project's live KG — NEVER a drop target, even
+            when ``_is_similar_prefix`` matches this project's prefix. Code-graph
+            callers pass None (their exclusion is prefix-based via the code
+            keep-set, applied elsewhere).
+        cross_project_keep_resolvable: pairs with ``cross_project_keep_set``.
+            When False (launcher.db unreachable), the keep-set is NOT applied to
+            detection (historic substring/Levenshtein behavior is retained), and
+            the emitted DROP command's RUN-TIME re-validation
+            (``_legacy_kg_drop_revalidated``) is the conservative gate — it
+            refuses any drop when the keep-set can't be confirmed. So detection
+            never depends on ambient launcher.db state, yet an unverifiable
+            candidate can never be dropped.
+
     Returns [] in any of these conditions (treated as "nothing to migrate"):
       - Weaviate unreachable.
       - No classes match the suffix family.
@@ -6187,6 +6232,8 @@ def _detect_legacy_collections_with_suffixes(
         suggest migrating someone else's data).
       - The only matching class IS the canonical name (fresh-install path),
         matched CASE-INSENSITIVELY (BUG-1) or equal to the live binding.
+      - (KG family) the candidate class is ANY project's live KG binding
+        (SEV-2 #2 cross-project exclusion).
     """
     canonical_prefix = sanitize_for_weaviate_class(project_name)
     if not canonical_prefix:
@@ -6196,6 +6243,24 @@ def _detect_legacy_collections_with_suffixes(
     # to it is BY DEFINITION not a legacy drop target. Lowercased once here
     # for O(1) case-insensitive comparison in the loop.
     live_binding_lc = (live_binding or "").strip().lower() or None
+
+    # SEV-2 #2: cross-project KG-binding exclusion. When a RESOLVABLE keep-set is
+    # supplied (KG family), any candidate whose normalised class name is ANY
+    # project's live KG binding is excluded from detection — it's active data,
+    # never a drop target. When the keep-set is UNRESOLVABLE (launcher.db down),
+    # detection keeps its historic substring/Levenshtein behavior (deterministic,
+    # informational), and the emitted DROP command is the conservative gate: it
+    # RE-VALIDATES against the live binding table at RUN time via
+    # `_legacy_kg_drop_revalidated`, which REFUSES the drop when the keep-set is
+    # unresolvable. So an unverifiable candidate can be surfaced but can NEVER be
+    # dropped — the data-safety invariant holds without making detection depend
+    # on ambient launcher.db state.
+    cross_keep = (
+        cross_project_keep_set
+        if (cross_project_keep_set is not None
+            and cross_project_keep_resolvable is not False)
+        else None
+    )
     # Conservative: if the project name didn't yield a real prefix and we
     # fell back to `_FALLBACK_PREFIX` ("vct"), do NOT scan — the fallback
     # is too generic and would match many unrelated classes.
@@ -6252,6 +6317,18 @@ def _detect_legacy_collections_with_suffixes(
         if live_binding_lc is not None and class_name_lc == live_binding_lc:
             continue
 
+        # SEV-2 #2: cross-project KG-binding exclusion. A candidate whose FULL
+        # class name (normalised) is ANY project's live KG binding is that
+        # project's active data — NEVER a drop target. Mirrors the code-graph
+        # binding-exclusion (`_detect_orphan_code_collections`). This closes the
+        # substring false-match hole: `Foobar_KnowledgeGraph` (a different
+        # project's live 2590-node class) would otherwise be emitted for project
+        # `Foo` because "foo" is a substring of "foobar".
+        if cross_keep is not None:
+            norm_class = _normalise_prefix_for_match(class_name)
+            if norm_class and norm_class in cross_keep:
+                continue
+
         # Conservative prefix-similarity check.  Without this we'd
         # mistakenly suggest migrating Quux_KnowledgeGraph just because
         # the user added a project called "Foo".
@@ -6304,9 +6381,14 @@ def _detect_legacy_kg_collections(
     """
     if live_binding is None:
         live_binding = _live_kg_collection_binding()
+    # SEV-2 #2: resolve the cross-project KG-binding keep-set so a DIFFERENT
+    # active project's live KG class can never be emitted as a drop target.
+    cross_keep, cross_resolvable = _kg_binding_keep_set_normalised()
     return _detect_legacy_collections_with_suffixes(
         project_name, weaviate_url, _KG_SUFFIXES,
         live_binding=live_binding,
+        cross_project_keep_set=cross_keep,
+        cross_project_keep_resolvable=cross_resolvable,
     )
 
 
@@ -6323,6 +6405,31 @@ def _detect_legacy_codegraph_collections(
     return _detect_legacy_collections_with_suffixes(
         project_name, weaviate_url, _CODEGRAPH_SUFFIXES,
     )
+
+
+def _legacy_kg_drop_revalidated(class_name: str) -> bool:
+    """RUN-TIME re-validation guard for a consented legacy-KG drop (SEV-2 #2).
+
+    Returns True ONLY when ``class_name`` (normalised) is confirmed to be NOT a
+    live KG binding of ANY project AND the keep-set is resolvable. Mirrors
+    ``_revalidated_orphan_live_classes`` for code: the deferral command re-checks
+    the CURRENT launcher bindings at the moment the user runs it (a project may
+    have been re-added between detect-time and run-time, recreating the binding),
+    never trusting the detect-time snapshot.
+
+    Conservative: returns False (refuse the drop) when the keep-set is
+    UNRESOLVABLE (launcher.db down) — we never drop a populated collection we
+    cannot positively confirm is dead. This function is embedded verbatim into
+    the emitted deferral command so the guard runs on the user's machine at
+    execution time.
+    """
+    keep_set, resolvable = _kg_binding_keep_set_normalised()
+    if not resolvable:
+        return False
+    norm = _normalise_prefix_for_match(class_name)
+    if not norm:
+        return False
+    return norm not in keep_set
 
 
 def _format_legacy_kg_detected(candidates: list[dict]) -> str:
@@ -6427,11 +6534,19 @@ def _format_legacy_kg_command(
         )
         lines.append("# 2. Re-embed the canonical from the on-disk knowledge/**/*.md (source of truth):")
         lines.append(".claude/scripts/kg-sync --all")
-        lines.append("# 3. Drop the legacy class (vectors were the wrong shape/model; .md already re-embedded):")
+        lines.append("# 3. Drop the legacy class (vectors were the wrong shape/model; .md already re-embedded).")
+        lines.append("#    RUN-TIME re-validation (SEV-2 #2): the guard refuses the drop if this")
+        lines.append("#    class is a LIVE KG binding of ANY project (re-checked NOW, not at detect")
+        lines.append("#    time), or if launcher.db can't be read (conservative — never drop a")
+        lines.append("#    populated collection we can't confirm is dead):")
         lines.append(
-            "python -c \"from vco_lib.project_init import _delete_class; "
-            f"_delete_class({old!r}, weaviate_url={weaviate_url!r}); "
-            f"print('dropped {old}')\""
+            "python -c \"from vco_lib.project_init import _delete_class, "
+            "_legacy_kg_drop_revalidated; "
+            f"n={old!r}; "
+            f"(_delete_class(n, weaviate_url={weaviate_url!r}) "
+            "or print('dropped ' + n)) if _legacy_kg_drop_revalidated(n) "
+            "else print('REFUSED (live KG binding of a project, or launcher.db "
+            "unreadable): ' + n)\""
         )
         lines.append("")
     lines.append(
@@ -6724,6 +6839,10 @@ def _detect_orphan_code_collections(
         "ondisk_orphans": [],
         "keep_resolvable": True,
         "total_reclaim_bytes": 0,
+        # SEV-3 #1: detect-time snapshot of normalised prefixes that have ANY
+        # live code class (populated below while Weaviate is UP). Empty when
+        # Weaviate is unreachable at detect time.
+        "live_prefixes_normalised": [],
     }
 
     # Resolve the authoritative keep-set (case-insensitive).
@@ -6743,6 +6862,24 @@ def _detect_orphan_code_collections(
     else:
         live_classes = _list_classes(weaviate_url)
     live_class_set_lc = {c.lower() for c in live_classes}
+
+    # SEV-3 #1: capture the DETECT-TIME live-prefix snapshot while Weaviate is
+    # UP. Every normalised prefix that has ANY live code class right now is a
+    # prefix whose on-disk segment dirs must NOT be fs-reclaimed later (the
+    # reclaim runs with Weaviate DOWN and cannot re-fetch). This guards the
+    # "active code-graph but momentarily-absent binding row" degenerate the code
+    # acknowledges at launcher_db_reader.py — a live class for prefix P proves P
+    # is active even if the keep-set (bindings) doesn't list it. Persisted into
+    # the deferral so the fs-level reclaim can honour it.
+    live_prefixes_normalised: set[str] = set()
+    for _cls in live_classes:
+        _decomp = _strip_known_suffix(_cls, _CODEGRAPH_SUFFIXES)
+        if _decomp is None:
+            continue
+        _norm = _normalise_prefix_for_match(_decomp[0])
+        if _norm:
+            live_prefixes_normalised.add(_norm)
+    result["live_prefixes_normalised"] = sorted(live_prefixes_normalised)
 
     for cls in sorted(live_classes):
         decomp = _strip_known_suffix(cls, _CODEGRAPH_SUFFIXES)
@@ -6795,11 +6932,22 @@ def _detect_orphan_code_collections(
                 if low.endswith(sfx.lower()):
                     _pfx = dirname[: -len(sfx)]
                     break
-            if _pfx and _normalise_prefix_for_match(_pfx) in keep_set:
+            _pfx_norm = _normalise_prefix_for_match(_pfx) if _pfx else ""
+            if _pfx_norm and _pfx_norm in keep_set:
+                continue
+            # SEV-3 #1: even without a binding row, a dir whose prefix has ANY
+            # LIVE class (a different suffix of the same prefix) is ACTIVE — skip
+            # it. This is the detect-time-snapshot guard against reclaiming an
+            # active project's segment dir when its binding row is momentarily
+            # absent (Weaviate is DOWN at reclaim, so this is the only chance).
+            if _pfx_norm and _pfx_norm in live_prefixes_normalised:
                 continue
             result["ondisk_orphans"].append({
                 "dir": dirname,
                 "size_bytes": int(size),
+                # Persist the normalised prefix so the fs-reclaim can re-check it
+                # against the persisted live-prefix snapshot before rm.
+                "prefix_normalised": _pfx_norm,
             })
             result["total_reclaim_bytes"] += int(size)
 
@@ -6811,6 +6959,7 @@ def _format_orphan_code_command(
     live_orphans: list[dict],
     ondisk_orphans: list[dict],
     volume_dir: Optional[str],
+    project_folder: Optional[str] = None,
 ) -> str:
     """Render the two CONSENTED, RE-VALIDATING cleanup commands for the
     orphan-code deferral. Never renders a drop that isn't re-validated at run
@@ -6860,20 +7009,107 @@ def _format_orphan_code_command(
             "#     `podman stop weaviate_claude` / `docker compose stop weaviate`),"
         )
         lines.append(
-            "#     run it, then restart Weaviate. It also RE-VERIFIES each class"
+            "#     run it, then restart Weaviate. GUARD (with Weaviate DOWN it"
         )
-        lines.append("#     is absent from a snapshot before removing its dir.")
+        lines.append(
+            "#     CANNOT re-fetch the schema): it removes ONLY dirs whose"
+        )
+        lines.append(
+            "#     normalised prefix is (a) NOT a live launcher.db code-graph"
+        )
+        lines.append(
+            "#     binding AND (b) NOT in the DETECT-TIME live-prefix snapshot"
+        )
+        lines.append(
+            "#     (captured while Weaviate was UP). It REFUSES everything when"
+        )
+        lines.append(
+            "#     the keep-set is unresolvable OR the snapshot is missing."
+        )
         for o in ondisk_orphans:
             mb = o["size_bytes"] / (1024 * 1024)
             lines.append(f"#     - {o['dir']}  ({mb:.1f} MB)")
         vd = volume_dir or "<weaviate-volume-dir>"
-        lines.append(
+        recl = (
             "python -m vco_lib.project_init reclaim-stranded-code-segments "
             f"--volume-dir {vd!r} --weaviate-url {weaviate_url!r} "
             "--confirm --i-understand-filesystem-level"
         )
+        # SEV-3 #1: pass the project folder so the reclaim can locate the
+        # detect-time live-prefix snapshot in `.claude/state/`.
+        if project_folder:
+            recl += f" --project-folder {str(project_folder)!r}"
+        lines.append(recl)
         lines.append("")
     return "\n".join(lines)
+
+
+# SEV-3 #1: detect-time live-prefix snapshot state file. The fs-level reclaim
+# runs with Weaviate DOWN and cannot re-fetch the schema, so the DETECT step
+# (Weaviate UP) persists which normalised prefixes had ANY live code class. The
+# reclaim reads this and REFUSES to rm a dir whose prefix was live at detect
+# time (the "active code-graph but momentarily-absent binding row" degenerate).
+_ORPHAN_LIVE_PREFIX_SNAPSHOT_FILENAME = "codegraph-orphan-live-prefixes.json"
+_ORPHAN_LIVE_PREFIX_SNAPSHOT_SCHEMA = "vco.codegraph_orphan_live_prefixes.v1"
+
+
+def _orphan_live_prefix_snapshot_path(folder: Path) -> Path:
+    """Path of the detect-time live-prefix snapshot state file."""
+    return (
+        Path(folder) / ".claude" / "state"
+        / _ORPHAN_LIVE_PREFIX_SNAPSHOT_FILENAME
+    )
+
+
+def _write_orphan_live_prefix_snapshot(
+    folder: Path, live_prefixes_normalised: list[str],
+) -> bool:
+    """Persist the detect-time normalised live-prefix set. Best-effort:
+    returns False on I/O failure rather than raising."""
+    p = _orphan_live_prefix_snapshot_path(folder)
+    payload = {
+        "schema": _ORPHAN_LIVE_PREFIX_SNAPSHOT_SCHEMA,
+        "live_prefixes_normalised": sorted(
+            {s for s in (live_prefixes_normalised or []) if s}
+        ),
+        "recorded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        from vco_lib.atomic import atomic_write_text
+        atomic_write_text(p, json.dumps(payload, indent=2) + "\n")
+        return True
+    except Exception:
+        try:
+            p.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            return True
+        except Exception:
+            return False
+
+
+def _read_orphan_live_prefix_snapshot(
+    folder: Path,
+) -> tuple[set[str], bool]:
+    """Read the detect-time live-prefix snapshot.
+
+    Returns ``(normalised_prefixes, present)``. ``present`` is False when the
+    file is missing/malformed — the reclaim treats a MISSING snapshot as
+    "cannot confirm which prefixes were live → refuse the fs reclaim entirely"
+    (conservative data-safety; the file is written whenever a deferral is
+    emitted, so its absence at reclaim time is an anomaly worth refusing on)."""
+    p = _orphan_live_prefix_snapshot_path(folder)
+    try:
+        raw = p.read_text(encoding="utf-8")
+    except Exception:
+        return (set(), False)
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return (set(), False)
+    vals = data.get("live_prefixes_normalised")
+    if not isinstance(vals, list):
+        return (set(), False)
+    return ({str(v) for v in vals if isinstance(v, str) and v}, True)
 
 
 def _emit_orphan_code_collections_deferral(
@@ -6884,11 +7120,26 @@ def _emit_orphan_code_collections_deferral(
     """Emit `orphan_code_collections_detected` (CONSENTED — never auto-drop).
 
     Returns True when an entry was written (there were orphans), else False.
+
+    SEV-3 #1: also persists the detect-time live-prefix snapshot (Weaviate is UP
+    here) into `.claude/state/` so the later fs-level reclaim (Weaviate DOWN) can
+    refuse any dir whose prefix was live at detect time.
     """
     live_orphans = detection.get("live_orphans", []) or []
     ondisk_orphans = detection.get("ondisk_orphans", []) or []
     if not live_orphans and not ondisk_orphans:
         return False
+
+    # SEV-3 #1: persist the detect-time live-prefix snapshot for the fs reclaim.
+    # Best-effort — a failed write means the reclaim will see "no snapshot" and
+    # conservatively refuse, which is the safe direction.
+    if ondisk_orphans:
+        try:
+            _write_orphan_live_prefix_snapshot(
+                folder, detection.get("live_prefixes_normalised", []) or [],
+            )
+        except Exception:
+            pass
     from vco_lib.deferral_report import DeferralEntry, DeferralReport
 
     total_mb = detection.get("total_reclaim_bytes", 0) / (1024 * 1024)
@@ -6913,6 +7164,7 @@ def _emit_orphan_code_collections_deferral(
     )
     cmd = _format_orphan_code_command(
         weaviate_url, live_orphans, ondisk_orphans, detection.get("volume_dir"),
+        project_folder=str(folder),
     )
     entry = DeferralEntry(
         condition_id="orphan_code_collections_detected",
@@ -6923,10 +7175,14 @@ def _emit_orphan_code_collections_deferral(
             "irreversible, and the on-disk reclaim requires stopping the "
             "Weaviate container (deleting a segment dir under a running "
             "Weaviate can corrupt the volume). VCO never auto-destroys user "
-            "data (CLAUDE.md rule 1) — the user runs the re-validating "
-            "commands explicitly. Each command re-probes the live binding "
-            "table + live schema before any drop (re-probe-before-acting), so "
-            "a case-only variant of a live binding is never dropped."
+            "data (CLAUDE.md rule 1) — the user runs the guarded commands "
+            "explicitly. The DROP command (a) re-probes the live binding table "
+            "+ live schema before any drop, so a case-only variant of a live "
+            "binding is never dropped. The fs-level RECLAIM runs with Weaviate "
+            "down and CANNOT re-fetch the schema, so it instead guards against "
+            "BOTH the live binding keep-set AND the detect-time live-prefix "
+            "snapshot (captured while Weaviate was up), and refuses everything "
+            "when either is unavailable."
         ),
         command_to_apply=cmd,
         severity="warning",
@@ -8519,6 +8775,34 @@ def install_project_bundle(
         # Surface in result for caller introspection / Tauri visibility.
         result["legacy_kg_candidates"] = legacy_kg_candidates
         result["legacy_codegraph_candidates"] = legacy_codegraph_candidates
+
+        # v0.2.73 FIX-C-RECUR wiring (F1): run the code-graph prefix-drift
+        # forward-guard ONCE per bundle install/update, right beside the legacy
+        # code-graph detection it complements. `detect_codegraph_prefix_drift`
+        # was inert before this — detector + deferral emitter + generation-record
+        # all existed but NOTHING invoked it, so a sanitizer-generation prefix
+        # change would silently orphan a whole code-class generation without ever
+        # surfacing a deferral. It records the current prefix on first run (no
+        # drift), and emits `codegraph_prefix_drift_detected` (consent — never
+        # auto-migrate) when the current prefix differs from the recorded
+        # generation. Soft-fail (best-effort — never blocks the bundle install).
+        try:
+            drift = detect_codegraph_prefix_drift(
+                folder, derived_project_name,
+                emit_deferral=True, weaviate_url=weaviate_url,
+            )
+            result["codegraph_prefix_drift"] = drift
+            _log("4.bundle.codegraph-prefix-drift", "ok",
+                 ("drift detected" if drift else "no drift (baseline recorded)"),
+                 data={"drift": drift})
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            _log("4.bundle.codegraph-prefix-drift", "error",
+                 f"codegraph prefix-drift detection failed: {err}",
+                 data={"error": err})
+            result["warnings"].append(
+                f"codegraph prefix-drift detection failed: {err}"
+            )
 
         # Reconcile + trim: drop entries this install resolved.
         try:
@@ -10870,7 +11154,7 @@ def _cmd_drop_orphan_code_collections(args: argparse.Namespace) -> int:
 
 def _cmd_reclaim_stranded_code_segments(args: argparse.Namespace) -> int:
     """`reclaim-stranded-code-segments --volume-dir <dir> --weaviate-url <url>
-    --confirm --i-understand-filesystem-level [--json]`
+    --confirm --i-understand-filesystem-level [--project-folder <dir>] [--json]`
 
     FILESYSTEM-LEVEL reclaim of on-disk stranded code segment dirs whose class
     is already gone from the live schema. HARD invariants:
@@ -10878,8 +11162,20 @@ def _cmd_reclaim_stranded_code_segments(args: argparse.Namespace) -> int:
       * REFUSES to run while Weaviate is reachable (`/v1/meta`) — deleting a
         segment dir under a running Weaviate can corrupt the volume. The user
         must stop the container first.
-      * RE-VERIFIES each dir's class is absent from a (best-effort) live schema
-        snapshot before removal — and only removes dirs the detector flagged.
+
+    ACTUAL run-time guard (SEV-3 #1 — the docstring previously overstated this):
+    with Weaviate DOWN this command CANNOT re-fetch the live schema, so it does
+    NOT re-verify absence live. Instead it removes ONLY a dir whose normalised
+    prefix is BOTH:
+      (a) absent from the launcher.db code-graph binding keep-set, AND
+      (b) absent from the DETECT-TIME live-prefix snapshot (captured while
+          Weaviate was UP and persisted into `.claude/state/` by the detector).
+    It REFUSES to remove ANYTHING when the keep-set is unresolvable (launcher.db
+    down) OR when the detect-time snapshot is missing (``--project-folder``
+    omitted, or the snapshot file absent) — because without the snapshot it
+    cannot rule out the "active code-graph, momentarily-absent binding row"
+    degenerate. Conservative by construction: never rm a dir it cannot prove is
+    dead.
     Exit 0 on clean reclaim; 1 on error; 2 on missing flags / Weaviate-up.
     """
     if not getattr(args, "confirm", False) or not getattr(
@@ -10914,13 +11210,47 @@ def _cmd_reclaim_stranded_code_segments(args: argparse.Namespace) -> int:
         )
         return 2
 
-    # Re-detect stranded dirs against the (now-down) volume. Because Weaviate
-    # is down we can't re-fetch the live schema for the absence re-verify;
-    # instead we re-list the dirs and rely on the detector's suffix-shape +
-    # the fact that a running-time detect already excluded live classes. We
-    # STILL guard against the binding keep-set (prefixes that SHOULD be live).
+    # Re-detect stranded dirs against the (now-down) volume. Because Weaviate is
+    # down we CANNOT re-fetch the live schema for an absence re-verify. Two
+    # independent guards make the rm safe (SEV-3 #1):
+    #   (1) launcher.db code-graph binding keep-set — a prefix that IS a live
+    #       binding is never removed; unresolvable keep-set → remove NOTHING.
+    #   (2) DETECT-TIME live-prefix snapshot (captured while Weaviate was UP,
+    #       persisted by the detector) — a prefix that HAD a live class at detect
+    #       time is never removed, even without a binding row (the "active
+    #       code-graph, momentarily-absent binding row" degenerate). A MISSING
+    #       snapshot → remove NOTHING (we cannot rule that degenerate out).
     keep_set, resolvable = _codegraph_keep_set_normalised()
-    result: dict = {"removed": [], "errors": [], "keep_resolvable": resolvable}
+
+    project_folder = getattr(args, "project_folder", None)
+    if project_folder:
+        live_snapshot, snapshot_present = _read_orphan_live_prefix_snapshot(
+            Path(project_folder),
+        )
+    else:
+        live_snapshot, snapshot_present = (set(), False)
+
+    result: dict = {
+        "removed": [],
+        "errors": [],
+        "keep_resolvable": resolvable,
+        "snapshot_present": snapshot_present,
+    }
+
+    # SEV-3 #1: without the detect-time snapshot we cannot verify a prefix was
+    # dead at detect time → refuse everything (conservative).
+    if not snapshot_present:
+        if getattr(args, "json", False):
+            print(json.dumps(result))
+        else:
+            print(
+                "detect-time live-prefix snapshot MISSING (pass --project-folder "
+                "pointing at the project whose deferral emitted this command) — "
+                "removed NOTHING (conservative).",
+                file=sys.stderr,
+            )
+        return 0
+
     import shutil
     for dirname, size in _list_ondisk_weaviate_dirs(volume_dir):
         low = dirname.lower()
@@ -10931,10 +11261,16 @@ def _cmd_reclaim_stranded_code_segments(args: argparse.Namespace) -> int:
         if matched_sfx is None:
             continue
         pfx = dirname[: -len(matched_sfx)]
+        pfx_norm = _normalise_prefix_for_match(pfx)
         # keep-set guard (skip if unresolvable OR the prefix is a live binding).
         if not resolvable:
             continue  # conservative: never rm when we can't confirm keep-set.
-        if _normalise_prefix_for_match(pfx) in keep_set:
+        if pfx_norm in keep_set:
+            continue
+        # SEV-3 #1 snapshot guard: a prefix that had ANY live class at detect
+        # time is active — never rm (guards the momentarily-absent-binding-row
+        # degenerate the docstring now honestly describes).
+        if pfx_norm in live_snapshot:
             continue
         target = os.path.join(volume_dir, dirname)
         try:
@@ -12061,6 +12397,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         action="store_true",
                         help="Second required flag — acknowledges this deletes "
                              "on-disk dirs (Weaviate MUST be stopped first).")
+    p_recl.add_argument("--project-folder", dest="project_folder", default=None,
+                        help="Project folder holding the detect-time live-prefix "
+                             "snapshot (.claude/state/). REQUIRED to remove "
+                             "anything — without it the reclaim refuses (SEV-3 "
+                             "#1 conservative guard).")
     p_recl.add_argument("--json", action="store_true",
                         help="Emit a single JSON object on stdout.")
     p_recl.set_defaults(func=_cmd_reclaim_stranded_code_segments)
