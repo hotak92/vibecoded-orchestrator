@@ -238,7 +238,13 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
             # see _do_rerank / RLClient.last_call_ok).
             rl_used=rl_used,
         )
-        emit_success = emit_rl_event(ev)
+        # v0.2.73 retrieval-I/O: emit_rl_event → log_retrieval → post_rl_event
+        # is a BLOCKING urllib POST (hub_writer.py) carrying ~0.5 MB of per-node
+        # embeddings. Called bare on the retrieval coroutine it stalls the MCP
+        # event loop for the POST (up to the 2 s hub timeout on a slow hub).
+        # Offload to a worker thread so the retrieval returns without waiting on
+        # the telemetry write. Soft-fail preserved (the except arms still catch).
+        emit_success = await asyncio.to_thread(emit_rl_event, ev)
     except EmitValidationError as exc:
         # Surface as DEBUG, not WARN — caller-side missing fields are
         # noisy in degraded-mode emit paths (failure_mode set, query_emb
@@ -256,7 +262,10 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
     # active event, the rerank, or the user-facing search.
     if req.dual_log:
         try:
-            _emit_other_slot_event(task_id, req)
+            # Same blocking-POST concern as the primary emit above — the
+            # other-slot event is a second ~0.5 MB urllib POST. Offload so the
+            # dual-log fan-out never blocks the retrieval coroutine.
+            await asyncio.to_thread(_emit_other_slot_event, task_id, req)
         except Exception as exc:
             logger.debug("rerank_and_emit: dual-log second emit raised (%s)", exc)
 
