@@ -5326,38 +5326,46 @@ class CodeGraphAnalyzer:
             # `.claude/`. Restored after the walk so downstream stamping/prune
             # (which key on the primary's identity) see the resolved value.
             _primary_index_dot_claude = getattr(self, "index_dot_claude", False)
-            for source_root in source_roots:
-                is_extra_root = source_root != repo_path
-                # Finders read `self.index_dot_claude`; set it per-root so an
-                # extra's `.claude/` is excluded even when the primary indexes
-                # its own. (No per-finder signature churn — mirror-don't-fork.)
-                self.index_dot_claude = (
-                    False if is_extra_root else _primary_index_dot_claude
-                )
-                for lang_name, find_fn, analyze_fn in lang_dispatch:
-                    if lang and lang != lang_name:
-                        continue
-                    files = find_fn(source_root)
-                    if not files:
-                        continue
-                    if incremental:
-                        files = self._filter_changed_files(
-                            source_root, files, since_commit=since_commit,
-                        )
-                        if not files:
-                            # Quiet skip — the typical case for clean repos.
-                            # We still surface one line per (root, lang) so
-                            # the operator sees the walk happened.
-                            print(
-                                f"ℹ️  No changed {lang_name} files to analyze "
-                                f"under {source_root}"
-                            )
-                            continue
-                    per_lang_files.append(
-                        (lang_name, analyze_fn, list(files), source_root)
+            # try/finally so a raised find_fn/_filter_changed_files mid-loop can
+            # never leave `self.index_dot_claude` stuck at an extra-root's False
+            # (which would silently drop the PRIMARY's own `.claude/` on any later
+            # re-entry). Single-shot today (one analyze per process), but the
+            # restore must be unconditional — correctness-by-construction.
+            try:
+                for source_root in source_roots:
+                    is_extra_root = source_root != repo_path
+                    # Finders read `self.index_dot_claude`; set it per-root so an
+                    # extra's `.claude/` is excluded even when the primary indexes
+                    # its own. (No per-finder signature churn — mirror-don't-fork.)
+                    self.index_dot_claude = (
+                        False if is_extra_root else _primary_index_dot_claude
                     )
-            # Restore the primary's resolved value for any downstream reader.
-            self.index_dot_claude = _primary_index_dot_claude
+                    for lang_name, find_fn, analyze_fn in lang_dispatch:
+                        if lang and lang != lang_name:
+                            continue
+                        files = find_fn(source_root)
+                        if not files:
+                            continue
+                        if incremental:
+                            files = self._filter_changed_files(
+                                source_root, files, since_commit=since_commit,
+                            )
+                            if not files:
+                                # Quiet skip — the typical case for clean repos.
+                                # We still surface one line per (root, lang) so
+                                # the operator sees the walk happened.
+                                print(
+                                    f"ℹ️  No changed {lang_name} files to analyze "
+                                    f"under {source_root}"
+                                )
+                                continue
+                        per_lang_files.append(
+                            (lang_name, analyze_fn, list(files), source_root)
+                        )
+            finally:
+                # Restore the primary's resolved value for any downstream reader,
+                # even if a finder raised mid-loop.
+                self.index_dot_claude = _primary_index_dot_claude
 
         total_files = sum(len(fs) for _, _, fs, _ in per_lang_files)
         seen_files = 0

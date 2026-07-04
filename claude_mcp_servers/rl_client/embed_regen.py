@@ -53,7 +53,17 @@ _store_back_tasks: "set[asyncio.Task]" = set()
 # store-back per process. Bounded to _STORE_DEDUP_MAX entries (FIFO-ish drop) so
 # a very long-lived server can't grow it without limit; a dropped key at worst
 # allows one redundant (still-idempotent) re-store later.
-_stored_slots: "set[tuple[str, str]]" = set()
+#
+# Key = (collection_name, uuid, slot). The collection name is part of the key
+# because a Weaviate object UUID is unique only WITHIN a collection — the same
+# UUID can legitimately exist in two collections (a single hybrid_search enriches
+# project-KG + shared-KG + dev, each its own handle). Keying on (uuid, slot)
+# alone would let a genuinely-needed store-back in collection B be suppressed by a
+# dedup hit from collection A's identical UUID — a MISSED write. Including the
+# collection makes correctness independent of the UUID-generation scheme (random
+# v4 today, but deterministic UUIDs are already used elsewhere for code-graph
+# rows) rather than relying on cross-collection UUID uniqueness.
+_stored_slots: "set[tuple[str, str, str]]" = set()
 _STORE_DEDUP_MAX = 50_000
 
 
@@ -197,10 +207,14 @@ def ensure_slot_embedding(
     # the vector is still returned for this request's immediate use.
     if collection is not None and obj_uuid is not None:
         # Per-object-slot dedup: only schedule the write ONCE per process for a
-        # given (uuid, slot). The store is idempotent, so re-firing it on every
-        # subsequent search is pure I/O waste (Candidate-B write storm). The
-        # freshly-computed vector is still RETURNED above for this request.
-        dedup_key = (str(obj_uuid), slot)
+        # given (collection, uuid, slot). The store is idempotent, so re-firing
+        # it on every subsequent search is pure I/O waste (Candidate-B write
+        # storm). The collection identity is part of the key because a UUID is
+        # unique only WITHIN a collection — see the _stored_slots definition
+        # comment. The freshly-computed vector is still RETURNED above for this
+        # request.
+        coll_id = getattr(collection, "name", "") or ""
+        dedup_key = (coll_id, str(obj_uuid), slot)
         if dedup_key in _stored_slots:
             return vec
         try:

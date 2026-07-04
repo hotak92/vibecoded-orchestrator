@@ -468,8 +468,11 @@ class TestEnsureSlotEmbedding:
                 return [0.5, 0.6, 0.7]
 
         class _Coll:
-            def __init__(self):
+            def __init__(self, name="ProjA_KnowledgeGraph"):
                 self.updated = []
+                # v0.2.73: the dedup key includes the collection name — a UUID is
+                # unique only within a collection, so the fake carries a .name.
+                self.name = name
 
             class _Data:
                 def __init__(self, outer):
@@ -516,6 +519,18 @@ class TestEnsureSlotEmbedding:
             )
             await _drain()
             assert len(coll.updated) == 2
+
+            # v0.2.73 MED-1 regression: the SAME uuid+slot in a DIFFERENT
+            # collection is a DISTINCT dedup key → it MUST still store. Keying on
+            # (uuid, slot) alone (the pre-fix bug) would suppress this genuinely-
+            # needed write because collection A already claimed the (uuid, slot).
+            collB = _Coll(name="SharedKG")
+            er.ensure_slot_embedding(
+                "uuid-dedup", "content", "qwen3_embed",
+                "qwen3-embedding:0.6b", collB, _Svc(),
+            )
+            await _drain()
+            assert collB.updated == [("uuid-dedup", {"qwen3_embed": [0.5, 0.6, 0.7]})]
 
         asyncio.run(_inner())
 
