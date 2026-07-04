@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# canonical-repo-root.ps1 — resolve a git LINKED WORKTREE edit to its MAIN repo
+# canonical-repo-root.ps1 -- resolve a git LINKED WORKTREE edit to its MAIN repo
 # root. Extracted to a shared lib in v0.2.73 FIX-B so BOTH the per-edit
 # code-graph hook AND the end-of-turn batched drain use ONE copy.
 #

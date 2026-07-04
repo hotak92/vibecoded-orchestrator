@@ -1,4 +1,4 @@
-# _lib/scrub-env.ps1 — canonical secret-env scrub list (HK-2, v0.2.73).
+# _lib/scrub-env.ps1 -- canonical secret-env scrub list (HK-2, v0.2.73).
 #
 # PowerShell sibling of _lib/scrub-env.sh. THE single source of truth for
 # the sensitive environment variables every .ps1 hook clears before

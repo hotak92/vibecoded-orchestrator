@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# worktree-gate.ps1 — FIX-A' (v0.2.73): decide whether a code-graph edit that
+# worktree-gate.ps1 -- FIX-A' (v0.2.73): decide whether a code-graph edit that
 # lives in a git LINKED WORKTREE should be SKIPPED (ephemeral/unregistered) or
 # INDEXED (its canonical root is a registered launcher project).
 #
 # MUST MATCH templates/hooks/_lib/worktree-gate.sh :: _worktree_gate_should_skip
 # (mirror cross-language logic; keep the git primitive + probe semantics
 # identical). See the .sh sibling for the full WHY: parallel-subagent worktree
-# edits drive the Weaviate disk write-amplification, so we skip indexing them —
+# edits drive the Weaviate disk write-amplification, so we skip indexing them --
 # but ONLY when the worktree's canonical main root is NOT a registered launcher
 # project (else a bare-repo/worktree-PRIMARY user would silently lose all
 # indexing). CONSERVATIVE: skip ONLY on a definitive "not registered" probe
-# (exit 2); on registered (0) OR hub-uncertain (1) we INDEX — never drop a
+# (exit 2); on registered (0) OR hub-uncertain (1) we INDEX -- never drop a
 # legit index on doubt.
 
 # Return $true (SKIP the edit) when the edit is in an EPHEMERAL/unregistered

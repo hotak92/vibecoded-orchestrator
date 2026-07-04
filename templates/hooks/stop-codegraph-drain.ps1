@@ -19,7 +19,7 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 if (Test-Path "$PSScriptRoot/_lib/stderr-cap.ps1") { . "$PSScriptRoot/_lib/stderr-cap.ps1" }
 if (Test-Path "$PSScriptRoot/_lib/resolve-powershell.ps1") { . "$PSScriptRoot/_lib/resolve-powershell.ps1" }
-# Shared venv resolver — resolves the analyzer's python interpreter from the
+# Shared venv resolver -- resolves the analyzer's python interpreter from the
 # VCO clone's `.venv` (mirrors code-graph-incremental.ps1). MUST dot-source
 # this helper for any `.venv` reference (venv-resolver-drift gate).
 if (Test-Path "$PSScriptRoot/_lib/resolve-vco-venv.ps1") { . "$PSScriptRoot/_lib/resolve-vco-venv.ps1" }
@@ -51,7 +51,7 @@ if ($SessionId -match '[^A-Za-z0-9_-]') { exit 0 }
 
 $stateDir = Join-Path (Join-Path $ProjectRoot ".claude") "state"
 $queue = Join-Path $stateDir ("codegraph_drain_{0}.txt" -f $SessionId)
-# Session-agnostic SHARED drain queue (v0.2.73 I/O-audit HIGH-2 — must match
+# Session-agnostic SHARED drain queue (v0.2.73 I/O-audit HIGH-2 -- must match
 # stop-codegraph-drain.sh + subagent-stop-reconcile.*): the SubagentStop
 # reconciler enqueues gated-IN subagent code edits here (replacing the removed
 # orphan code-graph-queue.jsonl) so the NEXT eligible Stop drain (any session)
@@ -184,9 +184,9 @@ if ($byRoot.Count -eq 0) {
     exit 0
 }
 
-# Stale-lock breaker (v0.2.73 I/O-audit HIGH-1 — must match stop-codegraph-drain.sh):
+# Stale-lock breaker (v0.2.73 I/O-audit HIGH-1 -- must match stop-codegraph-drain.sh):
 # the per-root lock dir below is released only inside the detached analyzer's
-# cleanup. If that process dies before release (kill, OOM, out-of-disk — the exact
+# cleanup. If that process dies before release (kill, OOM, out-of-disk -- the exact
 # condition this effort targets, or a reboot) the lock leaks and that root's code
 # graph freezes silently forever. Break locks older than the max plausible analyzer
 # runtime (30 min) so a dead drain self-heals on the next turn.
