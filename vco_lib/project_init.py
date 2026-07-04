@@ -1800,12 +1800,12 @@ def migrate_collections(
             "_Development" + _STAGING_SUFFIX,
             "_Diagrams" + _STAGING_SUFFIX,
         )
-        _CODEGRAPH_STAGING_SUFFIXES = (
-            "_CodeModule" + _STAGING_SUFFIX,
-            "_CodeClass" + _STAGING_SUFFIX,
-            "_CodeFunction" + _STAGING_SUFFIX,
-            "_CodeAPI" + _STAGING_SUFFIX,
-            "_CodeInteraction" + _STAGING_SUFFIX,
+        # Derive the code-graph staging suffixes from the ONE canonical list of
+        # code-graph class base names (``schema_migration_runner._CODEGRAPH_
+        # CLASS_SUFFIXES``) — do NOT re-list them here (a 5th copy would drift).
+        from . import schema_migration_runner as _smr
+        _CODEGRAPH_STAGING_SUFFIXES = tuple(
+            f"_{_s}{_STAGING_SUFFIX}" for _s in _smr._CODEGRAPH_CLASS_SUFFIXES
         )
         _all_classes = _list_classes(weaviate_url)
         _orphan_staging = sorted(
@@ -1877,7 +1877,7 @@ def migrate_collections(
         # back to the DB binding, not an ad-hoc re-derivation. The CLI
         # ``migrate --name`` path (no env) falls back to ``args.name``. Empty
         # (unresolvable) → ownership can't be proven → NEVER auto-drop.
-        from . import schema_migration_runner as _smr
+        # (_smr already imported above for _CODEGRAPH_CLASS_SUFFIXES.)
         _self_cg_prefix = (_smr._resolve_codegraph_prefix(os.environ) or "")
         if not _self_cg_prefix:
             _self_cg_prefix = _resolve_codegraph_prefix_for_plan(args)
