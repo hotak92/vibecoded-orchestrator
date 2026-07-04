@@ -175,6 +175,48 @@ def get_orchestrator_root_bindings() -> Tuple[Optional[str], Optional[str]]:
 # ────────────────────────────────────────────────────────────────────────────
 
 
+def _codegraph_binding_prefixes_on_conn(conn: sqlite3.Connection) -> list[str]:
+    """Read every ``collection_prefix`` in ``project_codegraph_bindings`` on an
+    ALREADY-OPEN connection. Returns ``[]`` on SQLite error (missing table on a
+    free-tier DB, etc.). Does NOT open or close the connection — the caller owns
+    its lifecycle (SEV-3 #3 TOCTOU fix: all reads share one open)."""
+    try:
+        rows = conn.execute(
+            "SELECT collection_prefix FROM project_codegraph_bindings"
+        ).fetchall()
+    except Exception:
+        return []
+    out: list[str] = []
+    for r in rows:
+        val = (r["collection_prefix"] or "").strip()
+        if val:
+            out.append(val)
+    return out
+
+
+def _codegraph_extra_path_owner_prefixes_on_conn(
+    conn: sqlite3.Connection,
+) -> list[str]:
+    """Read the code-graph prefixes of every project that OWNS a row in
+    ``project_codegraph_extra_paths`` on an ALREADY-OPEN connection. Returns
+    ``[]`` on SQLite error. Does NOT manage the connection lifecycle."""
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT b.collection_prefix "
+            "FROM project_codegraph_extra_paths AS e "
+            "JOIN project_codegraph_bindings AS b "
+            "  ON b.project_id = e.project_id"
+        ).fetchall()
+    except Exception:
+        return []
+    out: list[str] = []
+    for r in rows:
+        val = (r["collection_prefix"] or "").strip()
+        if val:
+            out.append(val)
+    return out
+
+
 def get_codegraph_binding_prefixes() -> list[str]:
     """Return every ``collection_prefix`` in ``project_codegraph_bindings``.
 
@@ -192,17 +234,7 @@ def get_codegraph_binding_prefixes() -> list[str]:
     if conn is None:
         return []
     try:
-        rows = conn.execute(
-            "SELECT collection_prefix FROM project_codegraph_bindings"
-        ).fetchall()
-        out: list[str] = []
-        for r in rows:
-            val = (r["collection_prefix"] or "").strip()
-            if val:
-                out.append(val)
-        return out
-    except Exception:
-        return []
+        return _codegraph_binding_prefixes_on_conn(conn)
     finally:
         try:
             conn.close()
@@ -231,20 +263,7 @@ def get_codegraph_extra_path_owner_prefixes() -> list[str]:
     if conn is None:
         return []
     try:
-        rows = conn.execute(
-            "SELECT DISTINCT b.collection_prefix "
-            "FROM project_codegraph_extra_paths AS e "
-            "JOIN project_codegraph_bindings AS b "
-            "  ON b.project_id = e.project_id"
-        ).fetchall()
-        out: list[str] = []
-        for r in rows:
-            val = (r["collection_prefix"] or "").strip()
-            if val:
-                out.append(val)
-        return out
-    except Exception:
-        return []
+        return _codegraph_extra_path_owner_prefixes_on_conn(conn)
     finally:
         try:
             conn.close()
@@ -255,8 +274,8 @@ def get_codegraph_extra_path_owner_prefixes() -> list[str]:
 def codegraph_binding_keep_set() -> tuple[list[str], bool]:
     """Return ``(prefixes, resolvable)`` — the full code-graph keep-set.
 
-    ``prefixes`` unions :func:`get_codegraph_binding_prefixes` +
-    :func:`get_codegraph_extra_path_owner_prefixes` (deduped, order-stable).
+    ``prefixes`` unions the ``project_codegraph_bindings`` collection_prefixes +
+    the ``project_codegraph_extra_paths`` owner prefixes (deduped, order-stable).
 
     ``resolvable`` is ``False`` when launcher.db could not be opened at all
     (no DB / locked / discovery failed) — the CRITICAL distinction the
@@ -265,6 +284,13 @@ def codegraph_binding_keep_set() -> tuple[list[str], bool]:
     detector MUST refuse to flag anything (conservative data-safety). When
     ``resolvable`` is True but ``prefixes`` is empty, the DB is genuinely
     empty (no registered projects) and the caller may proceed.
+
+    SEV-3 #3 (v0.2.73): BOTH reads run on the SAME connection that established
+    ``resolvable``. Previously ``resolvable`` was set by the outer open, then
+    each read re-opened the DB — if the DB became unreadable between opens,
+    ``resolvable=True`` was returned with an EMPTY prefix list, which would make
+    the orphan detector treat a genuinely-live prefix as a drop candidate. One
+    open closes that TOCTOU window.
     """
     conn = _open_db_readonly()
     if conn is None:
@@ -272,12 +298,84 @@ def codegraph_binding_keep_set() -> tuple[list[str], bool]:
     try:
         seen: set[str] = set()
         ordered: list[str] = []
-        for p in list(get_codegraph_binding_prefixes()) + list(
-            get_codegraph_extra_path_owner_prefixes()
+        for p in list(_codegraph_binding_prefixes_on_conn(conn)) + list(
+            _codegraph_extra_path_owner_prefixes_on_conn(conn)
         ):
             if p not in seen:
                 seen.add(p)
                 ordered.append(p)
+        return (ordered, True)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# v0.2.73 SEV-2 #2: KG-collection binding keep-set (read-only).
+#
+# The AUTHORITATIVE "keep" set for the legacy-KG drop detector is EVERY
+# project's ``project_kg_bindings.collection_name`` — a live KG class of ANY
+# project (not just THIS one) is NEVER a legacy-drop target. The BUG-1 fix only
+# protected the SELF collection; a DIFFERENT active project's KG class can
+# substring/Levenshtein-match this project's canonical prefix via
+# ``_is_similar_prefix`` and be emitted as a drop candidate whose consented
+# command re-embeds from THIS project's .md (not the other project's) → the
+# other project's populated KG is dropped unrecoverably. Mirror the code-graph
+# binding-exclusion (``codegraph_binding_keep_set``) for KG.
+#
+# We keep 'primary' AND 'shared'/'archive' collection_names: any bound KG class
+# is data we must never propose dropping. ``role`` is not filtered.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _kg_binding_collection_names_on_conn(conn: sqlite3.Connection) -> list[str]:
+    """Read every ``collection_name`` in ``project_kg_bindings`` (ALL projects,
+    ALL roles) on an ALREADY-OPEN connection. Returns ``[]`` on SQLite error
+    (missing table on a free-tier DB, etc.). Caller owns the connection."""
+    try:
+        rows = conn.execute(
+            "SELECT collection_name FROM project_kg_bindings"
+        ).fetchall()
+    except Exception:
+        return []
+    out: list[str] = []
+    for r in rows:
+        val = (r["collection_name"] or "").strip()
+        if val:
+            out.append(val)
+    return out
+
+
+def kg_binding_keep_set() -> tuple[list[str], bool]:
+    """Return ``(collection_names, resolvable)`` — every project's live KG
+    collection binding across ALL projects and roles.
+
+    ``collection_names`` is the deduped (order-stable) list of every
+    ``project_kg_bindings.collection_name``. These are FULL class names (e.g.
+    ``Foobar_KnowledgeGraph``), not prefixes — the legacy-KG detector compares
+    a candidate's full class name (normalised) against this set.
+
+    ``resolvable`` is ``False`` only when launcher.db could not be opened at all.
+    The legacy-KG detector MUST treat ``resolvable=False`` as "cannot confirm
+    which KG classes are live → do NOT emit any drop command" (conservative
+    data-safety — never widen the drop blast radius). ``resolvable=True`` with
+    an empty list means the DB is genuinely empty (no bound projects).
+
+    Single-connection (SEV-3 #3 discipline): the read that populates the list
+    runs on the SAME connection that established ``resolvable``.
+    """
+    conn = _open_db_readonly()
+    if conn is None:
+        return ([], False)
+    try:
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for name in _kg_binding_collection_names_on_conn(conn):
+            if name not in seen:
+                seen.add(name)
+                ordered.append(name)
         return (ordered, True)
     finally:
         try:
