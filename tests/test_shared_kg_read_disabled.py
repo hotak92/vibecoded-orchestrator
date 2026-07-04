@@ -271,13 +271,19 @@ class ConfigProjectionEmitTests(unittest.TestCase):
 
     def test_subset_invariant_holds(self):
         """``env_template._CANONICAL_ENV_TEMPLATE_KEYS`` must be a
-        subset of ``config_projection._CANONICAL_KEYS``. Re-import
-        ``env_template`` to re-trigger the import-time assertion;
-        if it raises, the canonical-keys list is missing the new key.
+        subset of ``config_projection._CANONICAL_KEYS``.
+
+        Checked directly via the two live accessors below — NOT via
+        ``importlib.reload``. The reload used to re-trigger
+        ``env_template._assert_subset_invariant()`` at import time, but it
+        rebinds the ``config_projection`` module object process-wide, handing a
+        DIFFERENT ``ConfigProjectionError`` class to any later-ordered test that
+        imported the name at collection time (e.g.
+        ``test_config_projection_user_secrets``) — a cross-file ordering flake.
+        The explicit subset assertion below covers the SAME invariant without
+        the reload, since both key lists are recomputed from the current modules.
         """
         from vco_lib import config_projection, env_template
-        importlib.reload(config_projection)
-        importlib.reload(env_template)
         full = config_projection.list_canonical_keys()
         template = env_template.list_canonical_env_template_keys()
         self.assertTrue(
