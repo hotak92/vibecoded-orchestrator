@@ -41,6 +41,21 @@ __all__ = ["regenerate_node_vector", "ensure_slot_embedding"]
 # never lands. The done-callback discards on completion so the set stays small.
 _store_back_tasks: "set[asyncio.Task]" = set()
 
+# v0.2.73 retrieval-I/O bound: dedup the fire-and-forget slot store-backs.
+# ``ensure_slot_embedding`` schedules a Weaviate ``.data.update(vector=...)``
+# per node whose slot is missing. With dual-write enabled a single search can
+# fire up to ~limit*2 such patches, and EVERY subsequent search re-fires them
+# for the same objects — an unbounded background write storm on a large
+# collection (exactly the I/O class this release reduces). The store is
+# IDEMPOTENT (writing the same slot vector again is a no-op-equivalent), so once
+# we've scheduled a backfill for a given (collection, uuid, slot) this process
+# never needs to schedule it again. This set caps each object-slot to ONE
+# store-back per process. Bounded to _STORE_DEDUP_MAX entries (FIFO-ish drop) so
+# a very long-lived server can't grow it without limit; a dropped key at worst
+# allows one redundant (still-idempotent) re-store later.
+_stored_slots: "set[tuple[str, str]]" = set()
+_STORE_DEDUP_MAX = 50_000
+
 
 def regenerate_node_vector(
     text: str,
@@ -181,11 +196,21 @@ def ensure_slot_embedding(
     # (CLI / sync test context) we skip the store entirely rather than block —
     # the vector is still returned for this request's immediate use.
     if collection is not None and obj_uuid is not None:
+        # Per-object-slot dedup: only schedule the write ONCE per process for a
+        # given (uuid, slot). The store is idempotent, so re-firing it on every
+        # subsequent search is pure I/O waste (Candidate-B write storm). The
+        # freshly-computed vector is still RETURNED above for this request.
+        dedup_key = (str(obj_uuid), slot)
+        if dedup_key in _stored_slots:
+            return vec
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
         if loop is not None:
+            if len(_stored_slots) >= _STORE_DEDUP_MAX:
+                _stored_slots.clear()  # bounded; a cleared key re-stores once (still idempotent)
+            _stored_slots.add(dedup_key)
             task = loop.create_task(_store_slot_vector(collection, obj_uuid, slot, vec))
             _store_back_tasks.add(task)
             task.add_done_callback(_store_back_tasks.discard)

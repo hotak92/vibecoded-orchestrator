@@ -409,6 +409,7 @@ class TestEnsureSlotEmbedding:
         computed + returned, and the store-back is scheduled (in an event loop)."""
         import asyncio
 
+        from claude_mcp_servers.rl_client import embed_regen as _er
         from claude_mcp_servers.rl_client.embed_regen import (
             ensure_slot_embedding,
             _store_back_tasks,
@@ -434,6 +435,7 @@ class TestEnsureSlotEmbedding:
                 return _Coll._Data(self)
 
         async def _inner():
+            _er._stored_slots.clear()  # isolate the per-object-slot dedup set
             coll = _Coll()
             vec = ensure_slot_embedding(
                 "uuid-1", "node content text", "qwen3_embed",
@@ -447,6 +449,67 @@ class TestEnsureSlotEmbedding:
             await asyncio.sleep(0)
             await asyncio.sleep(0)
             assert coll.updated == [("uuid-1", {"qwen3_embed": [0.5, 0.6, 0.7]})]
+
+        asyncio.run(_inner())
+
+    def test_store_back_deduped_per_object_slot(self) -> None:
+        """v0.2.73 Candidate-B bound: the fire-and-forget store-back is
+        scheduled ONCE per (uuid, slot) per process. A second search that hits
+        the same missing slot still gets the vector RETURNED (for its cosine)
+        but does NOT re-schedule the idempotent Weaviate write."""
+        import asyncio
+
+        from claude_mcp_servers.rl_client import embed_regen as er
+
+        class _Svc:
+            def embed_text(self, text):
+                return [0.5, 0.6, 0.7]
+
+        class _Coll:
+            def __init__(self):
+                self.updated = []
+
+            class _Data:
+                def __init__(self, outer):
+                    self._outer = outer
+
+                def update(self, *, uuid, vector):
+                    self._outer.updated.append((uuid, vector))
+
+            @property
+            def data(self):
+                return _Coll._Data(self)
+
+        async def _inner():
+            er._stored_slots.clear()  # isolate from other tests
+            coll = _Coll()
+            # First call: computes, returns, schedules the store.
+            v1 = er.ensure_slot_embedding(
+                "uuid-dedup", "content", "qwen3_embed",
+                "qwen3-embedding:0.6b", coll, _Svc(),
+            )
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            # Second call, SAME uuid+slot: still returns the vector...
+            v2 = er.ensure_slot_embedding(
+                "uuid-dedup", "content", "qwen3_embed",
+                "qwen3-embedding:0.6b", coll, _Svc(),
+            )
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert v1 == [0.5, 0.6, 0.7]
+            assert v2 == [0.5, 0.6, 0.7]  # vector still available for the cosine
+            # ...but only ONE write landed (the second was deduped).
+            assert coll.updated == [("uuid-dedup", {"qwen3_embed": [0.5, 0.6, 0.7]})]
+            # A DIFFERENT slot on the same uuid is a distinct key → stored.
+            er.ensure_slot_embedding(
+                "uuid-dedup", "content", "arctic2_embed",
+                "snowflake-arctic-embed2", coll, _Svc(),
+            )
+            # Drain the fire-and-forget store task (needs a few loop turns).
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert len(coll.updated) == 2
 
         asyncio.run(_inner())
 
