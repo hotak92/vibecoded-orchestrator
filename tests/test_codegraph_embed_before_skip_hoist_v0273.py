@@ -133,8 +133,6 @@ def _func_params_with_deferred(embedder: _EmbedCounter, body: str = "def foo():\
             "function_body": body,
             "signature": "foo()",
             "type_uses": [],
-            "cfg_summary": "",
-            "data_flow_vars": [],
         },
         "_deferred_embed": embedder,
     }
@@ -144,8 +142,8 @@ def _stored_hash_for(analyzer_mod, body: str) -> str:
     """The stored content_hash for the single-chunk steady state (chunk_num=0)."""
     props = {
         "name": "foo", "full_name": "mod.foo", "function_body": body,
-        "signature": "foo()", "type_uses": [], "cfg_summary": "",
-        "data_flow_vars": [], "chunk_num": 0, "total_chunks": 1,
+        "signature": "foo()", "type_uses": [], 
+        "chunk_num": 0, "total_chunks": 1,
     }
     return analyzer_mod._content_hash_for_object("T_CodeFunction", props)
 
@@ -267,8 +265,8 @@ def test_n_funcs_one_changed_embeds_once(analyzer_mod: types.ModuleType) -> None
         det_uuid = analyzer_mod._deterministic_uuid(analyzer.project_name, "src/mod.py", ident)
         props = {
             "name": f"f{i}", "full_name": ident, "function_body": bodies[f"f{i}"],
-            "signature": f"f{i}()", "type_uses": [], "cfg_summary": "",
-            "data_flow_vars": [], "chunk_num": 0, "total_chunks": 1,
+            "signature": f"f{i}()", "type_uses": [], 
+            "chunk_num": 0, "total_chunks": 1,
         }
         h = analyzer_mod._content_hash_for_object("T_CodeFunction", props)
         store[det_uuid] = {
@@ -289,8 +287,7 @@ def test_n_funcs_one_changed_embeds_once(analyzer_mod: types.ModuleType) -> None
         params = {
             "properties": {
                 "name": f"f{i}", "full_name": ident, "function_body": body,
-                "signature": f"f{i}()", "type_uses": [], "cfg_summary": "",
-                "data_flow_vars": [],
+                "signature": f"f{i}()", "type_uses": [], 
             },
             "_deferred_embed": embedder,
         }

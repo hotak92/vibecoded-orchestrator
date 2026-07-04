@@ -1230,20 +1230,17 @@ def _bootstrap_package_manager_advice(
     install_python: list[str] = []
     install_node: list[str] = []
     install_podman: list[str] = []
-    install_joern: list[str] = []
     install_lean_ctx: list[str] = []
     if primary == "brew":
         install_python = ["brew install python@3.13"]
         install_node = ["brew install node"]
         install_podman = ["brew install podman"]
-        install_joern = ["brew install joern"]
         install_lean_ctx = ["brew install lean-ctx"]
     elif primary == "apt":
         install_python = ["sudo apt-get update",
                           "sudo apt-get install -y python3 python3-venv python3-pip"]
         install_node = ["sudo apt-get install -y nodejs npm"]
         install_podman = ["sudo apt-get install -y podman"]
-        install_joern = []  # not in apt
         install_lean_ctx = []
     elif primary == "dnf":
         install_python = ["sudo dnf install -y python3 python3-pip"]
@@ -1338,7 +1335,6 @@ def _bootstrap_package_manager_advice(
         "install_python": install_python,
         "install_node": install_node,
         "install_podman": install_podman,
-        "install_joern": install_joern,
         "install_lean_ctx": install_lean_ctx,
         "tauri_deps": tauri_deps,
         "selinux_volume_flag_needed": selinux_z,
@@ -1406,14 +1402,6 @@ def _bootstrap_compute_missing_prereqs(system_block: dict) -> list[dict]:
             "install_hint": "Install git via your system package manager",
         })
 
-    # Joern — optional
-    if not system_block["joern"]["ok"]:
-        out.append({
-            "name": "joern",
-            "human": "Joern is optional (CFG/PDG code-graph analysis)",
-            "severity": "optional",
-            "install_hint": "See package_manager_advice.install_joern",
-        })
     # lean-ctx — optional
     if not system_block["lean_ctx"]["ok"]:
         out.append({
@@ -1456,7 +1444,6 @@ def _bootstrap_build_envelope(root: Path) -> dict:
     pnpm_block = _bootstrap_probe_binary("pnpm")
     git_block = _bootstrap_probe_binary("git")
     brew_block = _bootstrap_detect_brew()
-    joern_block = _bootstrap_probe_binary("joern")
     lean_ctx_block = _bootstrap_probe_binary("lean-ctx")
     claude_block = _bootstrap_probe_binary("claude")
 
@@ -1512,7 +1499,6 @@ def _bootstrap_build_envelope(root: Path) -> dict:
         "container_runtime_chosen": container_runtime_chosen,
         "git": git_block,
         "brew": brew_block,
-        "joern": joern_block,
         "lean_ctx": lean_ctx_block,
         "claude_cli": claude_block,
         "gpu": gpu_block,
@@ -1599,7 +1585,6 @@ def _bootstrap_print_human(envelope: dict) -> None:
     _row("docker", sys_b["docker"])
     _row("git", sys_b["git"])
     _row("brew", sys_b["brew"])
-    _row("joern", sys_b["joern"])
     _row("lean-ctx", sys_b["lean_ctx"])
     _row("claude", sys_b["claude_cli"])
     print("-" * 72)
@@ -1847,8 +1832,8 @@ def _should_skip_step(step: str) -> bool:
 # re-installs can replay them instead of re-prompting / re-detecting.
 #
 # Two new event step IDs in install.jsonl:
-#   - "choices"      → one record per major decision point (joern,
-#                      embedding mode, container runtime). The record
+#   - "choices"      → one record per major decision point (embedding
+#                      mode, container runtime). The record
 #                      holds enough info that a second install run can
 #                      re-make the same decision without prompting.
 #   - "state-hashes" → MD5 of requirements.txt / Cargo.lock / package.json /
@@ -1883,7 +1868,7 @@ def _record_install_choice(name: str, value, extra: dict | None = None) -> None:
     raises (matches the install-log contract).
 
     Args:
-        name: Stable choice ID (e.g. "joern", "embedding_mode",
+        name: Stable choice ID (e.g. "embedding_mode",
             "container_runtime"). The replay loader keys on this.
         value: The chosen value, JSON-serialisable. Bool / str / dict
             are all fine.
@@ -3753,7 +3738,7 @@ def _venv_triage(install_path: Path,
 def _run_lightweight(args: argparse.Namespace) -> int:
     """Execute the lightweight re-install path.
 
-    Skips: model pulls, Weaviate seed, Joern probe, lean-ctx detection,
+    Skips: model pulls, Weaviate seed, lean-ctx detection,
     full GPU detection. Runs: path rewrite, venv triage, container
     ensure (without seed), state-hash snapshot.
 
@@ -5514,10 +5499,6 @@ def main() -> int:
                              "in their workspace, not the orchestrator clone.")
     parser.add_argument("--quiet", action="store_true",
                         help="Minimal output")
-    parser.add_argument("--with-joern", action="store_true", default=False,
-                        help="Force-enable Joern integration for richer code-graph metrics (CFG/PDG). Skips the install prompt.")
-    parser.add_argument("--no-joern", action="store_true", default=False,
-                        help="Skip Joern detection and don't prompt to install it (~600MB JVM-based).")
     parser.add_argument("--no-lean-ctx", action="store_true", default=False,
                         help="Skip lean-ctx detection / install / hints (optional CLI-output compression tool).")
     parser.add_argument("--with-agents", action="store_true", default=True,
@@ -5990,7 +5971,7 @@ def main() -> int:
     _print_system_info(sysinfo)
 
     # Step 2b: Optional companion tools (lean-ctx for context compression)
-    joern_available = _detect_optional_companions(args)
+    _detect_optional_companions(args)
 
     # Step 3: Determine embedding configuration
     embed_config = _choose_embedding_config(sysinfo, args)
@@ -6449,7 +6430,7 @@ def main() -> int:
 
     # Step 8: Write .env configuration (skip on update — don't overwrite user changes)
     if mode == "install":
-        _write_env_config(embed_config, args, joern_available=joern_available)
+        _write_env_config(embed_config, args)
     else:
         print("[skip] .env configuration (preserved during update)")
         # v0.2.46 V47-F (Gap F): informational log when PROJECT_NAME differs
@@ -9726,19 +9707,16 @@ def _maybe_install_lean_ctx(args: argparse.Namespace) -> str | None:
     return _find_lean_ctx_binary()
 
 
-def _detect_optional_companions(args: argparse.Namespace) -> bool:
-    """Check for optional companion tools that the orchestrator can leverage when present.
+def _detect_optional_companions(args: argparse.Namespace) -> None:
+    """Detect the optional lean-ctx companion (token-compression helper).
 
-    Two checks:
-    1. lean-ctx (Rust binary at ~/.cargo/bin/) — token-compression helper, hint only.
-    2. joern (JVM-based code-property-graph tool) — when present, the code graph
-       analyzer adds CFG complexity metrics + data-flow variable lists per function
-       (`cfg_summary`, `data_flow_vars` fields on CodeFunction). When absent, we
-       skip those fields cleanly. If absent + interactive + not --no-joern, we
-       prompt the user once.
+    lean-ctx (Rust binary at ~/.cargo/bin/) — the per-project PreToolUse hook
+    delegates to it for command-output compression on Claude Code's Bash tool.
+    Hint-only: an absent binary doesn't break anything.
 
-    Returns True if Joern is available (whether pre-existing or freshly installed),
-    so callers can flip --cfg/--pdg defaults.
+    v0.2.73 (CG-3): the Joern (CFG/PDG) detection was removed — the code-graph
+    analyzer no longer extracts `cfg_summary`/`data_flow_vars` (zero readers),
+    so there is no Joern to probe, install, or gate `--cfg`/`--pdg` on.
     """
     print("\n[2b/10] Optional companions ...")
     _log_install_event("2b/10", "start", "probing optional companion tools")
@@ -9793,265 +9771,6 @@ def _detect_optional_companions(args: argparse.Namespace) -> bool:
             print("                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh")
             print("                source $HOME/.cargo/env && cargo install lean-ctx")
         print("            (Pass --no-lean-ctx to silence this hint.)")
-
-    # Joern (CFG/PDG metrics for code graph)
-    #
-    # Deliverable 2 (2026-04-28): also persist the joern choice via
-    # `_record_install_choice`. On a re-install, `_load_previous_choices`
-    # surfaces this so the caller can short-circuit the prompt without
-    # re-detecting / re-asking. The CLI flag (--with-joern / --no-joern)
-    # always wins over a replayed choice.
-    joern_path = shutil.which("joern")
-    if joern_path:
-        print(f"  joern:    detected at {joern_path} (code graph will include CFG/PDG metrics)")
-        _log_install_event(
-            "2b/10", "ok",
-            "joern already installed",
-            data={"joern_path": joern_path},
-        )
-        _record_install_choice("joern", True, {"reason": "pre-installed",
-                                              "joern_path": joern_path})
-        return True
-
-    # Replay-eligible: if we have a recent choice and the user did NOT
-    # pass either CLI flag, honour what they picked last time.
-    prior_choices = _load_previous_choices()
-    if (not args.no_joern and not args.with_joern
-            and "joern" in prior_choices):
-        prior = prior_choices["joern"]
-        prior_value = prior.get("value")
-        if prior_value is False:
-            print("  joern:    skipped (replayed from last install)")
-            _log_install_event("2b/10", "skip",
-                               "joern skipped (replayed from last install)")
-            _record_install_choice("joern", False,
-                                   {"reason": "replayed declined"})
-            return False
-
-    if args.no_joern:
-        print("  joern:    skipped (--no-joern)")
-        _log_install_event("2b/10", "skip", "joern skipped via --no-joern")
-        _record_install_choice("joern", False, {"reason": "user declined via flag"})
-        return False
-
-    if args.with_joern:
-        # User explicitly requested install — proceed without confirmation
-        installed = _install_joern()
-        _log_install_event(
-            "2b/10", "ok" if installed else "error",
-            "joern install (--with-joern)",
-            data={"installed": installed},
-        )
-        _record_install_choice("joern", bool(installed),
-                               {"reason": "user opted in via --with-joern"})
-        return installed
-
-    if args.quiet or not sys.stdin.isatty():
-        # Non-interactive: hint only, don't prompt
-        print("  joern:    not installed (optional, ~600MB JVM-based)")
-        print("            adds CFG complexity + data-flow variable metrics to the code graph")
-        print("            to install:   re-run installer with --with-joern")
-        print("            to skip prompt next time:   re-run with --no-joern")
-        _log_install_event("2b/10", "skip", "joern skipped (non-interactive)")
-        _record_install_choice("joern", False,
-                               {"reason": "non-interactive, no flag"})
-        return False
-
-    # Interactive: ask once
-    print("  joern:    not installed (optional, ~600MB JVM-based)")
-    print("            adds CFG complexity + data-flow variable metrics to the code graph")
-    try:
-        answer = input("            Install Joern now? [y/N]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        _log_install_event("2b/10", "skip", "joern prompt cancelled")
-        _record_install_choice("joern", False, {"reason": "prompt cancelled"})
-        return False
-
-    if answer not in {"y", "yes"}:
-        print("            Skipping. Re-run with --with-joern to install later.")
-        _log_install_event("2b/10", "skip", "user declined joern install")
-        _record_install_choice("joern", False,
-                               {"reason": "user declined interactive prompt"})
-        return False
-
-    installed = _install_joern()
-    _log_install_event(
-        "2b/10", "ok" if installed else "error",
-        "joern install (interactive)",
-        data={"installed": installed},
-    )
-    _record_install_choice("joern", bool(installed),
-                           {"reason": "user accepted interactive prompt"})
-    return installed
-
-
-def _install_joern() -> bool:
-    """Install Joern via the official installer script.
-
-    Returns True on success, False on failure (non-fatal — the orchestrator
-    works fine without Joern).
-
-    Platform support: the upstream installer is a `.sh` script (POSIX
-    bash). It works on Linux + macOS. On Windows we surface a manual-
-    install URL — joernio.github.io ships a separate Windows install
-    path (Scoop / direct download) that this installer doesn't drive.
-    The orchestrator works fine without Joern; CFG/PDG metrics just won't
-    populate in the code graph.
-
-    Security note: this downloads and executes a remote shell script from
-    joernio/joern's GitHub releases. The transport is HTTPS (cert-validated)
-    and the source is the official upstream. We add basic sanity checks
-    (HTTPS-only URL, non-trivial response size, .sh shebang) but do NOT
-    enforce a checksum because Joern's release pipeline does not publish a
-    pinned hash for `latest`. Users who want stronger guarantees should
-    install Joern themselves first (then we just detect it).
-    """
-    # Windows: no .sh installer support. Skip with a manual-install URL.
-    # Joern works on Windows via Scoop or direct download from the GitHub
-    # release, but driving those paths is post-v1.0; for now we just tell
-    # the user where to go.
-    if platform.system() == "Windows":
-        print("            Joern auto-install is not supported on Windows.")
-        print("            Manual install (any one):")
-        print("              Scoop:    scoop install joern")
-        print("              Direct:   https://github.com/joernio/joern/releases/latest")
-        print("              Then re-run install.py and Joern will be detected on PATH.")
-        return False
-    print("            Installing Joern (this can take 5-10 minutes — downloads ~600 MB JVM-based binaries)...")
-    print("            Note: the Joern installer may open a browser tab if a JDK is missing on your system.")
-    print("            Streaming installer output below; press Ctrl+C to abort.")
-    _log_install_event("2b/10", "start", "downloading joern installer")
-
-    install_url = "https://github.com/joernio/joern/releases/latest/download/joern-install.sh"
-    if not install_url.startswith("https://"):
-        # Defense-in-depth — never fetch over plain HTTP.
-        print("            Refusing to fetch Joern installer over non-HTTPS URL.")
-        _log_install_event("2b/10", "error", "non-HTTPS joern installer URL refused")
-        return False
-
-    installer_path: str | None = None
-    try:
-        # Download with explicit timeout (urlretrieve has no default timeout).
-        with tempfile.NamedTemporaryFile(suffix=".sh", delete=False) as tmp:
-            installer_path = tmp.name
-        with urllib.request.urlopen(install_url, timeout=60) as resp:
-            data = resp.read()
-        # Sanity-check the payload looks like a shell script.
-        if len(data) < 256:
-            print(f"            Joern installer suspiciously small ({len(data)} bytes); aborting.")
-            return False
-        if not data.lstrip().startswith(b"#!"):
-            print("            Joern installer does not start with a shebang; aborting.")
-            return False
-        Path(installer_path).write_bytes(data)
-        # Mirror the guard at line 2476: chmod is a Linux/macOS operation;
-        # on Windows os.chmod only honors the read-only bit and the early
-        # return above means we never reach this branch anyway.
-        # Owner-only rwx (0o700) — the installer is in a private NamedTemporary
-        # file we delete seconds later; no other user needs to read or execute
-        # it. CodeQL py/overly-permissive-file (CWE-732) flagged the previous
-        # 0o755 as world-readable+executable; 0o700 is the minimum bit set
-        # that still lets us exec it ourselves.
-        if platform.system() != "Windows":
-            os.chmod(installer_path, 0o700)
-
-        # Install to ~/.local (user-local, no sudo needed). Stream output to
-        # the terminal so the user sees progress (no `capture_output=True` —
-        # silent multi-minute downloads with browser-tab side effects are bad
-        # UX). Bumped timeout to 900 s for slow connections.
-        install_dir = Path.home() / ".local" / "joern"
-        result = subprocess.run(
-            [installer_path, "--dir", str(install_dir), "--no-interactive"],
-            text=True, timeout=900,
-        )
-
-        if result.returncode != 0:
-            print(f"            Joern install failed (exit {result.returncode}).")
-            print("            You can install manually: https://docs.joern.io/installation/")
-            return False
-
-        # Recent Joern installers ignore --dir and land in ~/bin/joern/
-        # regardless of what we pass. Probe several known locations rather
-        # than trusting our flag was honored. Verify the joern executable
-        # itself exists, not just the directory.
-        candidates = [
-            install_dir / "joern-cli",                    # what we asked for
-            Path.home() / "bin" / "joern" / "joern-cli",  # what installer actually does (2026)
-            Path.home() / ".joern" / "joern-cli",         # legacy
-        ]
-        for joern_bin_dir in candidates:
-            joern_exe = joern_bin_dir / "joern"
-            if joern_exe.exists():
-                os.environ["PATH"] = f"{joern_bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
-                print(f"            Joern installed at {joern_bin_dir}")
-                print(f"            To use joern outside this installer, add to your shell rc:")
-                print(f"              export PATH=\"{joern_bin_dir}{os.pathsep}$PATH\"")
-                return True
-
-        # Last-ditch PATH probe — installer may have its own location logic.
-        path_joern = shutil.which("joern")
-        if path_joern:
-            print(f"            Joern detected on PATH at {path_joern}")
-            return True
-
-        probed = ", ".join(str(c / "joern") for c in candidates)
-        print(f"            Joern installer ran but binary not found at any of: {probed}")
-        return False
-
-    except (urllib.error.URLError, subprocess.TimeoutExpired, OSError) as e:
-        print(f"            Joern install failed: {e}")
-        print("            You can install manually: https://docs.joern.io/installation/")
-        return False
-    finally:
-        if installer_path:
-            Path(installer_path).unlink(missing_ok=True)
-
-
-# ---------------------------------------------------------------------------
-# Step 3: Embedding configuration
-# ---------------------------------------------------------------------------
-
-# v0.2.54 (gpu-audit C-5): vector dimensionality per embedding model.
-# Single source for the tier-override path so swapping a model can never
-# leave the profile's stock `code_dims` / `text_dims` behind. Keep in
-# lockstep with EMBEDDING_CONFIGS above and the per-model limits in
-# claude_mcp_servers/weaviate_mcp/chunking.py.
-_EMBEDDING_MODEL_DIMS = {
-    "codesage-large-v2": 2048,
-    "qwen3-embedding:0.6b": 1024,
-    "unclemusclez/jina-embeddings-v2-base-code:latest": 768,
-    "snowflake-arctic-embed2:latest": 1024,
-    "openai-text-embedding-3-small": 1536,
-    "text-embedding-3-small": 1536,
-}
-
-# ACTIVE_EMBEDDING named-vector slot per TEXT model — must match the
-# slot mapping in weaviate_mcp/server.py::_get_search_vector. A text-
-# model override that doesn't re-point this slot would write vectors
-# from one model into a slot labelled for another (the 2026-04-30
-# vector-audit bug class).
-#
-# This map is the model→profile half of the v0.2.71 T-B-emb active-embedding
-# cascade. It MUST stay byte-identical to its mirrors (drift re-introduces the
-# v0.2.68 Defect D bug — see project_env_settings.rs:78-87):
-#   * launcher/src-tauri/src/commands/project_env_settings.rs
-#       ::active_profile_for_model
-#   * launcher/src-tauri/vct-hub/src/config_api.rs::hub_active_profile_for_model
-#   * vco_lib/launcher_db_reader.py::_TEXT_MODEL_ACTIVE_EMBEDDING
-_TEXT_MODEL_ACTIVE_EMBEDDING = {
-    "qwen3-embedding:0.6b": "qwen3",
-    "snowflake-arctic-embed2:latest": "arctic",
-    "openai-text-embedding-3-small": "openai",
-    "text-embedding-3-small": "openai",
-}
-
-# Models served via Ollama (must be in the pull list when selected).
-_OLLAMA_SERVED_EMBEDDING_MODELS = {
-    "qwen3-embedding:0.6b",
-    "unclemusclez/jina-embeddings-v2-base-code:latest",
-    "snowflake-arctic-embed2:latest",
-}
 
 
 def _apply_tier_overrides(config: dict, *, code_pick: str, kg_pick: str) -> None:
@@ -18389,7 +18108,6 @@ def _write_install_manifest(sysinfo, args, install_method: str = "install.py") -
     commit, branch = _read_git_rev()
 
     skipped = {
-        "joern":   getattr(args, "no_joern", False),
         "agents":  getattr(args, "no_agents", False),
         "skills":  getattr(args, "no_skills", False),
         "hooks":   getattr(args, "no_hooks", False),
@@ -23828,7 +23546,7 @@ def _telemetry_consent(args: argparse.Namespace) -> bool:
     return ans in ("y", "yes")
 
 
-def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_available: bool = False) -> None:
+def _write_env_config(embed_config: dict, args: argparse.Namespace) -> None:
     print("[9/10] Writing configuration ... ", end="", flush=True)
     _log_install_event("9/10", "start", "writing .env")
     env_file = PROJECT_ROOT / ".env"
@@ -23878,9 +23596,6 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_availa
         # cross-write qwen3 vectors into a slot labelled for a different
         # model (audit fix 2026-04-30, see kg-embedding-vector-audit-2026-04-30.md).
         f"ACTIVE_EMBEDDING={embed_config.get('active_embedding', 'qwen3')}",
-        "",
-        "# Optional companion tools (auto-detected at install)",
-        f"VCT_JOERN_AVAILABLE={'1' if joern_available else '0'}",
         "",
         "# Knowledge Graph",
         # Resolved by _ensure_collections (per-install naming on adopt mode,
@@ -23940,7 +23655,7 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_availa
     # ``tests/test_config_projection_single_writer.py``. install.py
     # writes a mix of canonical Phase 0.D keys AND non-canonical
     # install-time-only keys (EMBEDDING_MODEL / EMBEDDING_DIMS /
-    # CODE_EMBED_BACKEND / EMBEDDING_PROVIDER / VCT_JOERN_AVAILABLE /
+    # CODE_EMBED_BACKEND / EMBEDDING_PROVIDER /
     # VCT_TELEMETRY / banner comments / RL-section placeholders).
     # Splitting "managed-block keys" from "install-time-only keys" so
     # the install.py fresh-write fully routes through
@@ -23976,8 +23691,7 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_availa
             "9/10", "ok",
             ".env written",
             data={"env_file": str(env_file),
-                  "telemetry_on": telemetry_enabled,
-                  "joern_available": joern_available},
+                  "telemetry_on": telemetry_enabled},
         )
 
 

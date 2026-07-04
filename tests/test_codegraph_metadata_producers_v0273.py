@@ -324,7 +324,7 @@ def test_known_collections_hash_unaffected_by_metadata(analyzer_mod):
     props = {
         "full_name": "mod.f", "signature": "def f()",
         "function_body": "def f():\n    return 1\n",
-        "type_uses": [], "cfg_summary": "", "data_flow_vars": [],
+        "type_uses": [], 
     }
     h1 = analyzer_mod._content_hash_for_object("P_CodeFunction", props)
     h2 = analyzer_mod._content_hash_for_object(

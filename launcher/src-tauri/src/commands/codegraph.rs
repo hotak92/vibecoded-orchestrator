@@ -1057,10 +1057,6 @@ async fn run_build_task(
         }
     };
 
-    let joern_available = std::env::var("VCT_JOERN_AVAILABLE")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-
     // 4. Build args. First run uses no `--incremental` flag so the
     //    analyzer does a full pass. Re-builds also pass through here
     //    (rebuild_code_graph upserts pending → spawn_initial_build),
@@ -1080,10 +1076,9 @@ async fn run_build_task(
         "--project".to_string(),
         project_name.clone(),
     ];
-    if joern_available {
-        args.push("--cfg".to_string());
-        args.push("--pdg".to_string());
-    }
+    // v0.2.73 (CG-3): Joern CFG/PDG extraction removed (zero readers of
+    // cfg_summary/data_flow_vars) — no `--cfg`/`--pdg` are passed. The analyzer
+    // no longer accepts those flags.
     // W1+W3 wire-up / v0.2.16 (plan 1.4 — addendum H): pass through
     // the --prune-stale flag. The analyzer tracks UUIDs it visits and
     // deletes any per-project code-graph object it did NOT visit
@@ -1291,7 +1286,7 @@ async fn run_build_task(
                     count,
                     error_msg,
                     Some(tail),
-                    joern_available,
+                    false, // joern_used: v0.2.73 CG-3 removed Joern CFG/PDG (zero readers)
                 )
             } else {
                 let head = stderr_str
@@ -1309,7 +1304,7 @@ async fn run_build_task(
                         if snippet.is_empty() { "no stderr" } else { &snippet }
                     )),
                     Some(tail),
-                    joern_available,
+                    false, // joern_used: v0.2.73 CG-3 removed Joern CFG/PDG (zero readers)
                 )
             }
         }

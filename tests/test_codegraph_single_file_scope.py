@@ -353,7 +353,7 @@ def test_analyze_only_file_indexes_only_that_file(
 
     analyzer = _wire_full_flow_analyzer(analyzer_mod)
     stats = analyzer.analyze_repository(
-        repo, only_file=(repo / "alpha.py"), extract_cfg=False, extract_pdg=False
+        repo, only_file=(repo / "alpha.py")
     )
 
     # alpha.py produced objects; beta.py is untouched.
@@ -402,7 +402,7 @@ def test_analyze_only_files_from_batches_all_listed_files(
 
     analyzer = _wire_full_flow_analyzer(analyzer_mod)
     stats = analyzer.analyze_repository(
-        repo, only_files_from=list_file, extract_cfg=False, extract_pdg=False
+        repo, only_files_from=list_file
     )
 
     assert stats["files_analyzed"] == 2, (
@@ -450,7 +450,7 @@ def test_analyze_only_files_from_prunes_deleted_path(
     list_file.write_text(f"{repo / 'present.py'}\n{missing}\n")
 
     stats = analyzer.analyze_repository(
-        repo, only_files_from=list_file, extract_cfg=False, extract_pdg=False
+        repo, only_files_from=list_file
     )
 
     # The present file analyzed; the missing one triggered a prune (delete_many)
@@ -493,7 +493,7 @@ def test_analyze_unchanged_file_writes_zero_objects(
     )
 
     stats = analyzer.analyze_repository(
-        repo, only_file=(repo / "alpha.py"), extract_cfg=False, extract_pdg=False
+        repo, only_file=(repo / "alpha.py")
     )
 
     assert stats["files_analyzed"] == 1, "the file is still 'analyzed' (walked)"
@@ -529,8 +529,6 @@ def test_analyze_only_file_with_extras_is_ignored_at_repo_level(
         repo,
         only_file=(repo / "a.py"),
         extra_paths=[extra],  # must be ignored in single-file mode
-        extract_cfg=False,
-        extract_pdg=False,
     )
     assert stats["files_analyzed"] == 1
     blob = repr(_all_replace_calls(analyzer))
@@ -575,8 +573,6 @@ def test_canonical_source_stamps_main_root_not_worktree(
         worktree,
         only_file=(worktree / "src" / "mod.py"),
         canonical_source=main_root,
-        extract_cfg=False,
-        extract_pdg=False,
     )
 
     mods = _written_module_props(analyzer)
@@ -625,8 +621,6 @@ def test_worktree_and_main_edit_converge_on_same_uuid(
         main_root_dir,
         only_file=(main_root_dir / "src" / "mod.py"),
         canonical_source=main_root,
-        extract_cfg=False,
-        extract_pdg=False,
     )
     main_uuids = {c["uuid"] for c in a_main.modules_collection.data.replace_calls}
 
@@ -637,8 +631,6 @@ def test_worktree_and_main_edit_converge_on_same_uuid(
         worktree,
         only_file=(worktree / "src" / "mod.py"),
         canonical_source=main_root,
-        extract_cfg=False,
-        extract_pdg=False,
     )
     wt_uuids = {c["uuid"] for c in a_wt.modules_collection.data.replace_calls}
 
@@ -674,8 +666,6 @@ def test_divergent_project_breaks_convergence_documents_concern1(
             root,
             only_file=(root / "src" / "mod.py"),
             canonical_source=canon,  # SAME canonical source for both
-            extract_cfg=False,
-            extract_pdg=False,
         )
         return {c["uuid"] for c in a.modules_collection.data.replace_calls}
 
@@ -1071,7 +1061,7 @@ def test_live_unchanged_file_writes_zero_objects_on_rerun(
 
         first = analyzer.analyze_repository(
             repo, only_file=(repo / "only.py"),
-            extract_cfg=False, extract_pdg=False,
+            
         )
         assert first["files_analyzed"] == 1
         assert first["modules"] >= 1 and first["functions"] >= 1, (
@@ -1081,7 +1071,7 @@ def test_live_unchanged_file_writes_zero_objects_on_rerun(
         # Re-run on the UNCHANGED file → per-file hash hit → 0 new objects.
         second = analyzer.analyze_repository(
             repo, only_file=(repo / "only.py"),
-            extract_cfg=False, extract_pdg=False,
+            
         )
         assert second["modules"] == 0, "unchanged re-run must write 0 modules"
         assert second["functions"] == 0, "unchanged re-run must write 0 functions"

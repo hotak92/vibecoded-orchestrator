@@ -66,7 +66,6 @@ def _make_args(**overrides) -> argparse.Namespace:
     default. We populate the most common subset to keep noise low.
     """
     defaults = {
-        "no_joern": False,
         "no_agents": False,
         "no_skills": False,
         "no_hooks": False,

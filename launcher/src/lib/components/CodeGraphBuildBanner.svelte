@@ -168,7 +168,8 @@
     if (v.status === 'partial' && v.error_message) parts.push(v.error_message);
     if (v.languages.length > 0) parts.push(`Languages: ${v.languages.join(', ')}`);
     if (v.duration_ms != null) parts.push(`Took ${(v.duration_ms / 1000).toFixed(1)}s`);
-    if (v.joern_used) parts.push('Joern: enabled (CFG + PDG)');
+    // v0.2.73 (CG-3): Joern CFG/PDG removed (zero readers) — joern_used is now
+    // always false; the "Joern: enabled" line is dead and removed.
     return parts.join(' · ');
   }
 

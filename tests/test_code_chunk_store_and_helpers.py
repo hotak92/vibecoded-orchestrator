@@ -110,7 +110,7 @@ def test_multichunk_function_emits_n_objects_distinct_uuids(analyzer_mod, monkey
         "properties": {
             "name": "big", "full_name": "mod.big",
             "function_body": _big_body(), "signature": "def big()",
-            "type_uses": [], "cfg_summary": "", "data_flow_vars": [],
+            "type_uses": [], 
             "language": "python",
         },
         "vector": [0.9, 0.9, 0.9],
@@ -143,7 +143,7 @@ def test_in_budget_function_single_object_chunk_zero(analyzer_mod, monkeypatch):
         "properties": {
             "name": "small", "full_name": "mod.small",
             "function_body": "def small():\n    return 1\n", "signature": "def small()",
-            "type_uses": [], "cfg_summary": "", "data_flow_vars": [],
+            "type_uses": [], 
             "language": "python",
         },
         "vector": [0.9, 0.9, 0.9],

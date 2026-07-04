@@ -75,7 +75,6 @@
         },
         "git": {"$ref": "#/$defs/ToolProbe"},
         "brew": {"$ref": "#/$defs/BrewProbe"},
-        "joern": {"$ref": "#/$defs/ToolProbe"},
         "lean_ctx": {"$ref": "#/$defs/ToolProbe"},
         "claude_cli": {"$ref": "#/$defs/ToolProbe"},
 
@@ -184,7 +183,6 @@
         "install_python": {"type": "array", "items": {"type": "string"}},
         "install_node": {"type": "array", "items": {"type": "string"}},
         "install_podman": {"type": "array", "items": {"type": "string"}},
-        "install_joern": {"type": "array", "items": {"type": "string"}},
         "install_lean_ctx": {"type": "array", "items": {"type": "string"}},
         "tauri_deps": {"type": "array", "items": {"type": "string"}},
         "selinux_volume_flag_needed": {"type": "boolean"},

@@ -492,7 +492,7 @@ def test_main_exits_4_on_insert_errors(analyzer_mod, tmp_path: Path, monkeypatch
         mod.EmbeddingService.for_project = classmethod(lambda cls, *a, **kw: _FakeSvc())
 
         sys.argv = ["analyze_code_graph.py", r"{repo}",
-                    "--project", "FakeProject", "--no-cfg", "--no-pdg"]
+                    "--project", "FakeProject"]
         sys.exit(mod.main())
     """))
 

@@ -194,9 +194,8 @@ def test_analyze_fails_fast_on_case_insensitive_class_collision(
         # what the launcher uses in practice.)
         env = dict(os.environ)
         env["VCT_INSTALL_ROOT"] = str(Path(__file__).parent.parent.resolve())
-        # Don't poke Joern — even if available it adds wall-clock
-        # latency before the script reaches schema-bootstrap.
-        env["VCT_JOERN_AVAILABLE"] = "0"
+        # v0.2.73 (CG-3): Joern CFG/PDG removed — no VCT_JOERN_AVAILABLE / --no-cfg
+        # to set; the analyzer no longer probes Joern.
 
         # Resolve a python that has weaviate-client available. Prefer
         # the local venv if any; otherwise fall back to the running
@@ -211,8 +210,6 @@ def test_analyze_fails_fast_on_case_insensitive_class_collision(
                 str(ANALYZE_SCRIPT),
                 str(temp_repo_with_python_file),
                 "--project", project_name,
-                "--no-cfg",
-                "--no-pdg",
             ],
             capture_output=True,
             text=True,

@@ -106,7 +106,7 @@ def _small_func_props():
     return {
         "name": "small", "full_name": "mod.small",
         "function_body": "def small():\n    return 1\n", "signature": "def small()",
-        "type_uses": [], "cfg_summary": "", "data_flow_vars": [],
+        "type_uses": [], 
         "language": "python",
     }
 

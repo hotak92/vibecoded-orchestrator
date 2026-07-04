@@ -42,7 +42,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import sys
 import tempfile
 import uuid
@@ -166,7 +165,6 @@ def _strip_chunk_header(text: str) -> str:
 #   CodeModule      → path + module_summary + imports
 #   CodeClass       → full_name + signature + class_body + methods + composes
 #   CodeFunction    → full_name + signature + function_body + type_uses
-#                     + cfg_summary + data_flow_vars
 #   CodeAPI         → endpoint + method + api_description + parameters + returns
 #   CodeInteraction → interaction_type + protocol + endpoint + raw_target
 #                     + direction + description
@@ -183,7 +181,7 @@ _CONTENT_HASH_FIELDS = {
     "CodeClass": ["full_name", "signature", "class_body", "methods", "composes", "chunk_num"],
     "CodeFunction": [
         "full_name", "signature", "function_body",
-        "type_uses", "cfg_summary", "data_flow_vars", "chunk_num",
+        "type_uses", "chunk_num",
     ],
     "CodeAPI": ["endpoint", "method", "api_description", "parameters", "returns"],
     "CodeInteraction": [
@@ -3593,8 +3591,6 @@ class CodeGraphAnalyzer:
                         # v0.2.18 (Plan C): canonical-lowercase language ID for scoped prune.
                         Property(name="language", data_type=DataType.TEXT, description="Canonical language ID (python, javascript, ...) — Plan C scoped prune", skip_vectorization=True),
                         Property(name="type_uses", data_type=DataType.TEXT_ARRAY, description="Type names referenced in function annotations", skip_vectorization=True),
-                        Property(name="cfg_summary", data_type=DataType.TEXT, description="CFG summary: branches/loops/max_depth counts (from Joern)", skip_vectorization=True),
-                        Property(name="data_flow_vars", data_type=DataType.TEXT_ARRAY, description="Variable names that flow through the function (from Joern PDG)", skip_vectorization=True),
                         Property(name="layer", data_type=DataType.TEXT, description="Architectural layer (API, Service, Data, UI, Utility, etc.)", skip_vectorization=True),
                         Property(name="call_names", data_type=DataType.TEXT_ARRAY, description="Names of called functions (for callers queries)", skip_vectorization=True),
                         # v0.2.47 (extras): source-root provenance (see CodeModule).
@@ -4999,8 +4995,6 @@ class CodeGraphAnalyzer:
 
     def analyze_repository(self, repo_path: Path, language: Optional[str] = None,
                           incremental: bool = False,
-                          extract_cfg: bool = False,
-                          extract_pdg: bool = False,
                           prune_stale: bool = False,
                           extra_paths: Optional[List[Path]] = None,
                           since_commit: Optional[str] = None,
@@ -5013,8 +5007,6 @@ class CodeGraphAnalyzer:
             repo_path: Path to repository
             language: Specific language to analyze (None = all)
             incremental: Only analyze changed files (requires git)
-            extract_cfg: Run Joern CFG extraction (requires joern in PATH)
-            extract_pdg: Run Joern PDG extraction (requires joern in PATH)
             prune_stale: When True, track every UUID visited this run
                 and DELETE any UUIDs in the per-project code-graph
                 collections that we DIDN'T visit. Useful for projects
@@ -5104,25 +5096,6 @@ class CodeGraphAnalyzer:
                 )
                 continue
             canonical_extras.append(resolved)
-
-        # Run Joern CFG/PDG pre-pass if requested; store on instance for use by _extract_function
-        if extract_cfg or extract_pdg:
-            lang_hint = language or "python"
-            print("🔬 Running Joern CFG/PDG extraction (this may take a while)...")
-            # v0.2.66 (Bug 3): in single-file mode, point Joern at the one
-            # edited file, NOT the whole repo. Building a full CPG on every
-            # keystroke would re-introduce the whole-repo work this fix
-            # exists to eliminate. `importCode` accepts a single file.
-            cfg_pdg_target = only_file if only_file is not None else repo_path
-            self._cfg_pdg_data: Dict[str, Any] = self._extract_cfg_pdg(
-                cfg_pdg_target, lang_hint, extract_cfg=extract_cfg, extract_pdg=extract_pdg
-            )
-            if self._cfg_pdg_data:
-                print(f"   Extracted data for {len(self._cfg_pdg_data)} functions")
-            else:
-                print("   No CFG/PDG data extracted (joern unavailable or no output)")
-        else:
-            self._cfg_pdg_data = {}
 
         # Enable visited-UUID tracking when caller wants prune-stale.
         # See _dedup_insert + _create_or_update_module — both record
@@ -8647,12 +8620,6 @@ class CodeGraphAnalyzer:
             _add_type_names(node.args.kwarg.annotation)
         _add_type_names(node.returns)
 
-        # CFG/PDG data (optional, populated by analyze_repository's pre-pass)
-        cfg_pdg_store = getattr(self, '_cfg_pdg_data', {})
-        cfg_pdg = cfg_pdg_store.get(full_name, {})
-        cfg_summary = cfg_pdg.get("cfg_summary", "")
-        data_flow_vars = cfg_pdg.get("data_flow_vars", [])
-
         # Create function - smart truncation for embedding
         # function_body is full source (includes def line + docstring + body)
 
@@ -8668,8 +8635,6 @@ class CodeGraphAnalyzer:
                 "is_async": isinstance(node, ast.AsyncFunctionDef),
                 "project": self.project_name,
                 "type_uses": type_uses,
-                "cfg_summary": cfg_summary,
-                "data_flow_vars": data_flow_vars,
             },
             "references": {
                 "module": module_uuid,
@@ -8704,105 +8669,6 @@ class CodeGraphAnalyzer:
             return ""
 
         return '\n'.join(source_lines[start:end])
-
-    def _extract_cfg_pdg(
-        self,
-        repo_path: Path,
-        language: str,
-        extract_cfg: bool = False,
-        extract_pdg: bool = False,
-    ) -> Dict[str, Any]:
-        """Run Joern to extract CFG/PDG data for functions in a repository.
-
-        Both flags are opt-in and require joern in PATH.
-        Returns empty dict on any error (non-blocking).
-
-        Args:
-            repo_path: Path to repository root.
-            language: Language hint for Joern ('python', 'cpp', etc.).
-            extract_cfg: Whether to extract CFG summaries.
-            extract_pdg: Whether to extract PDG data-flow variable lists.
-
-        Returns:
-            Dict mapping full_name -> {"cfg_summary": str, "data_flow_vars": list[str]}.
-            Empty dict if joern unavailable or any error occurs.
-        """
-        if not extract_cfg and not extract_pdg:
-            return {}
-
-        if not shutil.which("joern"):
-            logger.warning("joern not found in PATH; skipping CFG/PDG extraction")
-            return {}
-
-        # Joern script: export CPG, collect CFG edge counts and PDG variable names per method
-        joern_script = """
-importCode(inputPath="{repo_path}", projectName="tmp_cgraph")
-val methods = cpg.method.l
-val result = methods.map {{ m =>
-  val cfg_branches = m.cfgNode.isControlStructure.l.size
-  val cfg_loops = m.cfgNode.isControlStructure.filter(_.controlStructureType.matches("FOR|WHILE|DO")).l.size
-  val cfg_max_depth = m.depth
-  val pdg_vars = m.local.name.l.distinct
-  val entry = ujson.Obj(
-    "full_name" -> m.fullName,
-    "cfg_summary" -> s"branches:${{cfg_branches}} loops:${{cfg_loops}} max_depth:${{cfg_max_depth}}",
-    "data_flow_vars" -> ujson.Arr(pdg_vars.map(ujson.Str(_)): _*)
-  )
-  entry
-}}
-println(upickle.default.write(result))
-exit
-""".strip().format(repo_path=str(repo_path))
-
-        result: Dict[str, Any] = {}
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode='w', suffix='.sc', delete=False, prefix='joern_cgraph_'
-            ) as tmp:
-                tmp.write(joern_script)
-                tmp_path = tmp.name
-
-            proc = subprocess.run(
-                ["joern", "--script", tmp_path],
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-
-            if proc.returncode != 0:
-                logger.warning(f"joern exited with code {proc.returncode}: {proc.stderr[:500]}")
-                return {}
-
-            # Parse JSON array from stdout — find the first '[' to skip Joern banner lines
-            stdout = proc.stdout
-            bracket_idx = stdout.find('[')
-            if bracket_idx == -1:
-                logger.warning("joern output did not contain JSON array")
-                return {}
-
-            entries = json.loads(stdout[bracket_idx:])
-            for entry in entries:
-                full_name = entry.get("full_name", "")
-                if not full_name:
-                    continue
-                result[full_name] = {
-                    "cfg_summary": entry.get("cfg_summary", "") if extract_cfg else "",
-                    "data_flow_vars": entry.get("data_flow_vars", []) if extract_pdg else [],
-                }
-
-        except subprocess.TimeoutExpired:
-            logger.warning("joern timed out after 120s; skipping CFG/PDG extraction")
-        except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse joern JSON output: {e}")
-        except Exception as e:
-            logger.warning(f"CFG/PDG extraction error: {e}")
-        finally:
-            try:
-                Path(tmp_path).unlink(missing_ok=True)
-            except Exception:
-                pass
-
-        return result
 
     def _analyze_svelte_file(self, file_path: Path, repo_root: Path) -> Dict[str, int]:
         """Analyze a Svelte component file (V52-O.11.B, v0.2.53 Track E).
@@ -9288,20 +9154,6 @@ def main():
     parser.add_argument('--force-recreate', action='store_true',
                        help='Delete and recreate collections (WARNING: deletes all data)')
     parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
-    # Joern CFG/PDG: auto-on when joern is installed (or VCT_JOERN_AVAILABLE=1).
-    # Opt out per-run with --no-cfg/--no-pdg, or set VCT_JOERN_AVAILABLE=0.
-    _joern_default = (
-        os.environ.get("VCT_JOERN_AVAILABLE", "").strip() == "1"
-        or shutil.which("joern") is not None
-    )
-    parser.add_argument('--cfg', dest='cfg', action='store_true', default=_joern_default,
-                       help='Extract CFG summaries via Joern (default: on if joern is in PATH)')
-    parser.add_argument('--no-cfg', dest='cfg', action='store_false',
-                       help='Skip CFG extraction (faster; useful in CI)')
-    parser.add_argument('--pdg', dest='pdg', action='store_true', default=_joern_default,
-                       help='Extract PDG data-flow variables via Joern (default: on if joern is in PATH)')
-    parser.add_argument('--no-pdg', dest='pdg', action='store_false',
-                       help='Skip PDG extraction')
     parser.add_argument('--named-vectors', action='store_true',
                        default=True,
                        help='Create collections with named vector support (default: True)')
@@ -9669,8 +9521,6 @@ def main():
             repo_path,
             language=args.language,
             incremental=args.incremental,
-            extract_cfg=args.cfg,
-            extract_pdg=args.pdg,
             prune_stale=args.prune_stale,
             # v0.2.47 (extras): pass-through. Empty list when the flag
             # wasn't supplied — analyze_repository treats that the same

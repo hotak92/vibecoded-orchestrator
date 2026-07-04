@@ -160,8 +160,6 @@ def _func_params() -> Dict[str, Any]:
             "function_body": "def foo():\n    return 1\n",
             "signature": "foo()",
             "type_uses": [],
-            "cfg_summary": "",
-            "data_flow_vars": [],
         },
         "vector": [0.1, 0.2, 0.3],
     }
@@ -177,7 +175,6 @@ def test_content_hash_stable_for_identical_content(analyzer_mod: types.ModuleTyp
     a = {
         "full_name": "mod.foo", "signature": "foo()",
         "function_body": "return 1", "type_uses": ["int"],
-        "cfg_summary": "", "data_flow_vars": [],
         # Volatile / derived fields MUST NOT affect the hash:
         "last_modified": "2026-01-01T00:00:00Z",
         "project_source": "/some/root", "language": "python",

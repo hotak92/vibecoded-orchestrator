@@ -66,14 +66,14 @@ class TestRecordChoice(unittest.TestCase):
     def test_recorded_choice_appears_in_log_with_step_choices(self):
         with _LogFixture() as fx:
             install._record_install_choice(
-                "joern", False, {"reason": "user declined interactive prompt"},
+                "container_runtime", False, {"reason": "user declined interactive prompt"},
             )
             text = fx.path.read_text(encoding="utf-8")
             self.assertGreater(len(text), 0)
             obj = json.loads(text.splitlines()[-1])
             self.assertEqual(obj["step"], "choices")
             self.assertEqual(obj["phase"], "ok")
-            self.assertEqual(obj["detail"], "joern")
+            self.assertEqual(obj["detail"], "container_runtime")
             self.assertEqual(obj["data"]["value"], False)
             self.assertEqual(obj["data"]["reason"],
                              "user declined interactive prompt")
@@ -97,16 +97,16 @@ class TestLoadPreviousChoices(unittest.TestCase):
                 {"ts": ts, "actor": "install.py", "step": "1/10",
                  "phase": "start", "detail": "checking"},
                 {"ts": ts, "actor": "install.py", "step": "choices",
-                 "phase": "ok", "detail": "joern",
+                 "phase": "ok", "detail": "container_runtime",
                  "data": {"value": False, "reason": "user declined"}},
                 {"ts": ts, "actor": "install.py", "step": "choices",
                  "phase": "ok", "detail": "embedding_mode",
                  "data": {"value": "gpu", "qwen3_text": True}},
             ])
             choices = install._load_previous_choices()
-            self.assertIn("joern", choices)
-            self.assertEqual(choices["joern"]["value"], False)
-            self.assertEqual(choices["joern"]["reason"], "user declined")
+            self.assertIn("container_runtime", choices)
+            self.assertEqual(choices["container_runtime"]["value"], False)
+            self.assertEqual(choices["container_runtime"]["reason"], "user declined")
             self.assertIn("embedding_mode", choices)
             self.assertEqual(choices["embedding_mode"]["value"], "gpu")
 
@@ -117,7 +117,7 @@ class TestLoadPreviousChoices(unittest.TestCase):
                 {"ts": old_ts, "actor": "install.py", "step": "1/10",
                  "phase": "start", "detail": "stale session"},
                 {"ts": old_ts, "actor": "install.py", "step": "choices",
-                 "phase": "ok", "detail": "joern",
+                 "phase": "ok", "detail": "container_runtime",
                  "data": {"value": True}},
             ])
             choices = install._load_previous_choices()
@@ -133,17 +133,17 @@ class TestLoadPreviousChoices(unittest.TestCase):
                 {"ts": old_ts, "actor": "install.py", "step": "1/10",
                  "phase": "start"},
                 {"ts": old_ts, "actor": "install.py", "step": "choices",
-                 "phase": "ok", "detail": "joern",
+                 "phase": "ok", "detail": "container_runtime",
                  "data": {"value": True}},
                 # Newer session — same choice flipped
                 {"ts": fresh_ts, "actor": "install.py", "step": "1/10",
                  "phase": "start"},
                 {"ts": fresh_ts, "actor": "install.py", "step": "choices",
-                 "phase": "ok", "detail": "joern",
+                 "phase": "ok", "detail": "container_runtime",
                  "data": {"value": False}},
             ])
             choices = install._load_previous_choices()
-            self.assertEqual(choices["joern"]["value"], False,
+            self.assertEqual(choices["container_runtime"]["value"], False,
                              "newer session must win")
 
     def test_no_log_returns_empty(self):
@@ -160,7 +160,7 @@ class TestLoadPreviousChoices(unittest.TestCase):
             ts = _iso_offset()
             fx.write_events([
                 {"ts": ts, "actor": "launcher", "step": "choices",
-                 "phase": "ok", "detail": "joern",
+                 "phase": "ok", "detail": "container_runtime",
                  "data": {"value": True}},
             ])
             choices = install._load_previous_choices()
