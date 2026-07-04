@@ -107,12 +107,19 @@ class _LazyServerProxy(_types.ModuleType):
         # When ``__main__`` is that server, resolve IT: importing
         # ``weaviate_mcp.server`` would build a SECOND, fresh server object with
         # uninitialised state, desyncing the re-exported functions from the one
-        # actually serving requests. Detect via a server-only sentinel attribute.
+        # actually serving requests. Identify it STRICTLY by ``__file__`` ending
+        # in ``weaviate_mcp/server.py`` — NOT by a mere ``hasattr`` sentinel:
+        # under a shared test runner ``__main__`` is pytest, and a loose
+        # attribute check would resolve the pytest process for every subsequent
+        # test once anything set that attr on it (an ordering-pollution trap).
         _main = _sys.modules.get("__main__")
-        if _main is not None and _main is not self and hasattr(
-            _main, "_rl_client_instances"
-        ):
-            return _main
+        if _main is not None and _main is not self:
+            _mf = getattr(_main, "__file__", None) or ""
+            _mf = _mf.replace("\\", "/")
+            if _mf.endswith("weaviate_mcp/server.py") and hasattr(
+                _main, "_rl_client_instances"
+            ):
+                return _main
         for _name in _SERVER_MOD_NAMES:
             mod = _sys.modules.get(_name)
             if mod is not None and mod is not self:

@@ -1864,18 +1864,21 @@ def migrate_collections(
         # any code-graph staging belonging to a DIFFERENT project is only
         # SURFACED (retained) for that project's own migrate run to reconcile.
         #
-        # Resolve the current project's code-graph prefix the SAME canonical way
-        # the analyzer / schema_migration_runner do: env ``CODE_GRAPH_PROJECT``
-        # (already the sanitized prefix) → ``PROJECT_NAME`` (derived) → the CLI
-        # ``args.name`` fallback. Env-first matters because install/post-bundle
-        # runs carry the identity in env, not ``args.name``; the CLI
-        # ``migrate --name`` path carries it in args. Empty (unresolvable) →
-        # ownership can't be proven → NEVER auto-drop (surface only).
-        _self_cg_prefix = (os.environ.get("CODE_GRAPH_PROJECT") or "").strip()
-        if not _self_cg_prefix:
-            _pn = (os.environ.get("PROJECT_NAME") or "").strip()
-            if _pn:
-                _self_cg_prefix = derive_project_code_prefix(_pn)
+        # Resolve the current project's code-graph prefix through the ONE
+        # canonical resolver — ``schema_migration_runner._resolve_codegraph_prefix``
+        # — so this sweep names the SAME collections the hub / analyzer / CLI do
+        # (single source of truth; do NOT inline a parallel env cascade that
+        # could drift from it). That resolver's chain is
+        # ``CODE_GRAPH_PROJECT`` env → ``PROJECT_NAME`` (derived) — and on the
+        # launcher-driven update path ``CODE_GRAPH_PROJECT`` is itself a
+        # PROJECTION of ``project_codegraph_bindings.collection_prefix`` (the
+        # launcher.db binding written by the hub before spawning install.py, see
+        # ``config_projection._fetch_codegraph_binding_prefix``), so this traces
+        # back to the DB binding, not an ad-hoc re-derivation. The CLI
+        # ``migrate --name`` path (no env) falls back to ``args.name``. Empty
+        # (unresolvable) → ownership can't be proven → NEVER auto-drop.
+        from . import schema_migration_runner as _smr
+        _self_cg_prefix = (_smr._resolve_codegraph_prefix(os.environ) or "")
         if not _self_cg_prefix:
             _self_cg_prefix = _resolve_codegraph_prefix_for_plan(args)
         for _cg_orphan in _codegraph_orphan_staging:

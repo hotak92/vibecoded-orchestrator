@@ -100,28 +100,36 @@ def test_proxy_tracks_the_callers_import_path_not_a_fixed_key():
     ``weaviate_mcp.server`` while tests import
     ``claude_mcp_servers.weaviate_mcp.server`` and patch THAT object — the proxy
     resolved the wrong module and never saw the patch."""
-    _purge_weaviate_mcp()
-    for m in list(sys.modules):
-        if m.endswith("weaviate_mcp") or ".weaviate_mcp." in m or m == "claude_mcp_servers":
-            sys.modules.pop(m, None)
-
-    # Import via the REPO-ROOT path (the shape the pytest suite uses).
-    if str(REPO_ROOT) not in sys.path:
-        sys.path.insert(0, str(REPO_ROOT))
-    srv = importlib.import_module("claude_mcp_servers.weaviate_mcp.server")
-    rl = importlib.import_module("claude_mcp_servers.weaviate_mcp.rl_enrichment")
-
-    # The proxy must resolve the SAME server object the caller imported.
-    assert rl.server._live() is srv, (
-        "rl_enrichment.server must resolve the server under its own package "
-        "(claude_mcp_servers.weaviate_mcp), not a hard-coded weaviate_mcp.server"
+    # Run in a SUBPROCESS: this test loads the package under the
+    # ``claude_mcp_servers.*`` prefix (a DISTINCT module object from the
+    # ``weaviate_mcp.*`` prefix most tests use). Doing that in the shared pytest
+    # process leaves both variants in sys.modules and poisons downstream tests
+    # (their proxy would resolve the wrong server object). A clean subprocess
+    # proves the property with zero cross-test contamination.
+    import subprocess
+    driver = (
+        "import sys, importlib\n"
+        f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+        f"sys.path.insert(0, {str(REPO_ROOT / 'claude_mcp_servers')!r})\n"
+        "srv = importlib.import_module('claude_mcp_servers.weaviate_mcp.server')\n"
+        "rl = importlib.import_module('claude_mcp_servers.weaviate_mcp.rl_enrichment')\n"
+        # Proxy must resolve the SAME server object the caller imported.
+        "assert rl.server._live() is srv, 'proxy resolved the wrong package variant'\n"
+        # A patch on THAT object must be observed via the proxy.
+        "from unittest.mock import patch\n"
+        "sentinel = object()\n"
+        "with patch.object(srv, '_extract_obj_vector', lambda *a, **k: sentinel):\n"
+        "    assert rl.server._extract_obj_vector() is sentinel, 'proxy missed the patch'\n"
+        "print('DUAL_IMPORT_OK')\n"
     )
-
-    # And a patch on THAT object must be observed via the proxy.
-    from unittest.mock import patch
-    sentinel = object()
-    with patch.object(srv, "_extract_obj_vector", lambda *a, **k: sentinel):
-        assert rl.server._extract_obj_vector() is sentinel
+    r = subprocess.run(
+        [sys.executable, "-c", driver], capture_output=True, text=True, timeout=90,
+    )
+    assert r.returncode == 0 and "DUAL_IMPORT_OK" in r.stdout, (
+        "rl_enrichment.server must resolve the server under its own package "
+        "(claude_mcp_servers.weaviate_mcp), not a hard-coded weaviate_mcp.server.\n"
+        f"rc={r.returncode}\nstderr:\n{r.stderr[-2000:]}"
+    )
 
 
 def test_server_py_imports_when_run_as_a_bare_script():
