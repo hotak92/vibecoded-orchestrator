@@ -1881,16 +1881,23 @@ def migrate_collections(
         _self_cg_prefix = (_smr._resolve_codegraph_prefix(os.environ) or "")
         if not _self_cg_prefix:
             _self_cg_prefix = _resolve_codegraph_prefix_for_plan(args)
+        # OWNERSHIP is EXACT-SET membership over THIS project's 5 code-graph
+        # class names (``<prefix>_CodeModule`` … ``<prefix>_CodeInteraction``) —
+        # NOT a ``startswith(prefix + "_")`` prefix test. A prefix test
+        # OVER-MATCHES a foreign tenant whose prefix is an underscore-delimited
+        # SUPERSET of ours: with prefix ``Proj`` a bare startswith would treat
+        # ``Proj_Backend_CodeFunction`` (project ``Proj_Backend``'s class) as
+        # OURS and safe-drop its staging — the exact cross-tenant data-loss this
+        # gate exists to prevent (``canonical_class_prefix`` PRESERVES explicit
+        # underscores, so co-resident ``Proj`` + ``Proj_Backend`` is reachable).
+        _own_cg_classes = frozenset(
+            f"{_self_cg_prefix}_{_s}" for _s in _smr._CODEGRAPH_CLASS_SUFFIXES
+        ) if _self_cg_prefix else frozenset()
         for _cg_orphan in _codegraph_orphan_staging:
             _cg_base = _cg_orphan[: -len(_STAGING_SUFFIX)]
-            # OWNERSHIP GATE (the only thing this arm adds over the shared
-            # helper): is this staging OURS? Its base must start with this
-            # project's code-graph prefix. Empty prefix (no --name /
-            # unresolvable) → can't prove ownership, so NEVER auto-drop.
-            _cg_is_ours = bool(_self_cg_prefix) and (
-                _cg_base == _self_cg_prefix
-                or _cg_base.startswith(_self_cg_prefix + "_")
-            )
+            # Empty prefix (no --name / unresolvable) → can't prove ownership,
+            # so NEVER auto-drop (the set is empty → nothing matches).
+            _cg_is_ours = _cg_base in _own_cg_classes
             if not _cg_is_ours:
                 # FOREIGN (or unprovable) — never touch another tenant's
                 # staging; its own migrate run reconciles it. Surface only.

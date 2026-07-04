@@ -274,6 +274,40 @@ class TestCodegraphOrphanStagingSweep(unittest.TestCase):
         self.assertNotEqual(foreign_surfaced[0].get("resolved"), True)
         self.assertIn("DIFFERENT project", foreign_surfaced[0]["error"])
 
+    def test_nested_prefix_foreign_project_is_not_over_matched(self):
+        """CROSS-PROJECT SAFETY (pre-push FINDING-1): a foreign project whose
+        prefix is an underscore-delimited SUPERSET of ours must NOT be treated
+        as ours. We are ``Proj``; ``Proj_Backend`` is a DIFFERENT project.
+        ``canonical_class_prefix`` preserves explicit underscores, so
+        ``Proj_Backend_CodeFunction`` is a real co-resident class — a bare
+        ``startswith('Proj_')`` gate would wrongly safe-drop its staging.
+        Ownership must be EXACT-set membership over our 5 ``Proj_CodeXxx``."""
+        suffix = project_init._STAGING_SUFFIX
+        env = {"KG_COLLECTION": "Proj_KnowledgeGraph", "CODE_GRAPH_PROJECT": "Proj"}
+        # Foreign project 'Proj_Backend' — its class shares our prefix STRING
+        # but is NOT one of our 5 exact class names.
+        foreign_base = "Proj_Backend_CodeFunction"
+        foreign_orphan = foreign_base + suffix
+        own_base = "Proj_CodeFunction"
+        own_orphan = own_base + suffix
+        all_classes = ["Proj_KnowledgeGraph",
+                       foreign_base, foreign_orphan, own_base, own_orphan]
+        # Both count-safe (base >= staging) — only the gate distinguishes them.
+        counts = {foreign_base: 100, foreign_orphan: 50,
+                  own_base: 100, own_orphan: 50}
+        result, dropped = self._run(all_classes, env, counts)
+        dropped = set(dropped)
+        self.assertIn(own_orphan, dropped, "our exact class staging safe-drops")
+        self.assertNotIn(
+            foreign_orphan, dropped,
+            "a nested-prefix foreign project's staging must NEVER be dropped",
+        )
+        foreign_surfaced = [
+            e for e in result["errors"] if foreign_orphan in e.get("error", "")
+        ]
+        self.assertTrue(foreign_surfaced, "nested-prefix foreign must be surfaced")
+        self.assertIn("DIFFERENT project", foreign_surfaced[0]["error"])
+
     def test_unresolvable_prefix_never_drops(self):
         """When neither CODE_GRAPH_PROJECT nor PROJECT_NAME nor args.name
         resolves a prefix, ownership can't be proven → NEVER auto-drop, even a

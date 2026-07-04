@@ -2757,17 +2757,15 @@ pub async fn install_orchestrator(
     let mut install_args = vec!["install.py".to_string()];
 
     // The launcher invokes install.py as a non-interactive subprocess.
-    // ALWAYS pass --quiet + --no-joern so install.py never blocks waiting
-    // for stdin input that the launcher can't provide. Reported 2026-04-28
-    // from real wizard test: project creation hung at step 2b/10 (Joern
-    // prompt) because tokio::process::Command inherits stdin and the
-    // launcher's stdin can register as a TTY via webkit2gtk inheritance.
+    // ALWAYS pass --quiet so install.py never blocks waiting for stdin input
+    // that the launcher can't provide.
     //
-    // CLI users who DO want Joern install via the launcher path will need
-    // to either rerun install.py manually with --with-joern or use a
-    // future "install Joern" tray action.
+    // v0.2.73 (CG-3): the Joern CFG/PDG integration was removed, so install.py
+    // no longer has a Joern prompt NOR the --no-joern/--with-joern flags. We
+    // MUST NOT pass --no-joern here — install.py uses strict argparse
+    // (parse_args), so an unknown flag aborts the whole install/update with
+    // exit code 2. --quiet alone covers non-interactivity now.
     install_args.push("--quiet".to_string());
-    install_args.push("--no-joern".to_string());
 
     if config.use_gpu {
         install_args.push("--gpu".to_string());
@@ -2997,7 +2995,8 @@ pub(crate) fn build_lightweight_install_argv(
     let mut argv = vec![
         "install.py".to_string(),
         "--quiet".to_string(),
-        "--no-joern".to_string(),
+        // NB (v0.2.73 CG-3): NO --no-joern — install.py removed that flag and
+        // uses strict argparse, so passing it would abort the install (exit 2).
         "--lightweight".to_string(),
     ];
     if let Some(old) = lightweight_old_path {
@@ -15475,15 +15474,30 @@ MemAvailable:   23456789 kB
             // Order matters — install.py argument parser is order-insensitive
             // but we lock the shape so the wizard's expected behaviour stays
             // observable in test output.
+            // v0.2.73 (CG-3): --no-joern was REMOVED — install.py deleted that
+            // flag and uses strict argparse, so passing it aborts the install
+            // (exit 2). This shape must NOT contain it.
             assert_eq!(
                 argv,
                 vec![
                     "install.py".to_string(),
                     "--quiet".to_string(),
-                    "--no-joern".to_string(),
                     "--lightweight".to_string(),
                 ]
             );
+        }
+
+        #[test]
+        fn lightweight_argv_never_passes_removed_joern_flags() {
+            // Regression for the v0.2.73 SB-1 ship-blocker: the launcher must
+            // never forward a Joern flag that CG-3 removed from install.py's
+            // strict argparse (an unknown flag → exit 2 → every launcher-driven
+            // install/update aborts).
+            let argv = build_lightweight_install_argv(
+                true, false, Some("podman"), true, Some("/old"),
+            );
+            assert!(!argv.contains(&"--no-joern".to_string()));
+            assert!(!argv.contains(&"--with-joern".to_string()));
         }
 
         #[test]
