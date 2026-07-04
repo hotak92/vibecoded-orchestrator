@@ -3317,25 +3317,54 @@ _EMBED_SERVICE_RETRY_WINDOW = 10.0  # don't re-probe failed construction more th
 # ``_embed_service_construction_failed_at`` / ``_EMBED_SERVICE_RETRY_WINDOW``
 # stay ABOVE (tests poke ``server._cached_embed_service``); the extracted
 # accessor reads/writes them via the ``server`` module object.
-from .embeddings import (  # noqa: E402 — re-export after config constants above
-    _get_embedding_service,
-    get_ollama_embedding,
-    get_legacy_text_embedding,
-    get_openai_embedding,
-    get_embedding,
-    _get_both_embeddings,
-    _get_all_kg_embeddings,
-    _get_all_code_embeddings,
-    _scheme_for_collection,
-    _primary_named_vector,
-    _get_search_vector,
-    count_tokens_async,
-    get_code_embedding,
-    _inline_code_embed_http,
-    get_code_query_embedding,
-    _active_code_query_slot,
-    get_legacy_code_embedding,
-)
+# Two import styles (mirrors the ``from .chunking``/``from .code_ranking``
+# guards above): relative when server is imported as a package
+# (``weaviate_mcp.server``), absolute when it is run DIRECTLY as a script
+# (``python .../weaviate_mcp/server.py`` — the launcher's actual MCP invocation,
+# where ``__package__`` is empty and a bare relative import raises
+# "attempted relative import with no known parent package"). The
+# ``except ImportError`` fallback is REQUIRED for M-1's extracted modules —
+# without it the weaviate-kg MCP fails to start for every user.
+try:
+    from .embeddings import (  # noqa: E402 — re-export after config constants above
+        _get_embedding_service,
+        get_ollama_embedding,
+        get_legacy_text_embedding,
+        get_openai_embedding,
+        get_embedding,
+        _get_both_embeddings,
+        _get_all_kg_embeddings,
+        _get_all_code_embeddings,
+        _scheme_for_collection,
+        _primary_named_vector,
+        _get_search_vector,
+        count_tokens_async,
+        get_code_embedding,
+        _inline_code_embed_http,
+        get_code_query_embedding,
+        _active_code_query_slot,
+        get_legacy_code_embedding,
+    )
+except ImportError:
+    from embeddings import (  # type: ignore  # noqa: E402 — server.py run directly
+        _get_embedding_service,
+        get_ollama_embedding,
+        get_legacy_text_embedding,
+        get_openai_embedding,
+        get_embedding,
+        _get_both_embeddings,
+        _get_all_kg_embeddings,
+        _get_all_code_embeddings,
+        _scheme_for_collection,
+        _primary_named_vector,
+        _get_search_vector,
+        count_tokens_async,
+        get_code_embedding,
+        _inline_code_embed_http,
+        get_code_query_embedding,
+        _active_code_query_slot,
+        get_legacy_code_embedding,
+    )
 
 
 def serialize_datetime(value):
@@ -3635,45 +3664,34 @@ def _enrich_with_adjacent_chunks(coll, results: list[dict], collection_name: str
 # constants stay defined ON THIS module (below / above) — rl_client and the
 # tests reach them via `srv.<name>`; the extracted functions read them via
 # `server.<name>`.
-from .rl_enrichment import (  # noqa: E402 — re-export after config + RL globals
-    _rl_load_messages,
-    _rl_find_kg_positions,
-    _rl_extract_answer_window,
-    _resolve_claude_session_dir,
-    _rl_find_all_transcripts_in_dir,
-    _rl_find_all_transcripts,
-    _rl_is_literal_cited,
-    _rl_compute_and_write_citations,
-    _rl_force_flush_sentinel_path,
-    _rl_check_force_flush,
-    _rl_clear_force_flush,
-    _rl_human_turn_after,
-    _rl_delete_own_pending_file,
-    _rl_answer_monitor,
-    _get_rl_client,
-    _embedding_dim_for,
-    _extract_obj_vector,
-    _cosine,
-    _get_rl_telemetry_writer,
-    _resolve_code_embedding_triple,
-    _emit_code_structure_telemetry,
-    _emit_code_retrieval_telemetry,
-    _stage_code_citation_pending,
-    _get_rl_telemetry_writer_for,
-    _other_model_for_source,
-    _embed_text_in_other_model,
-    _reset_rl_telemetry_writers,
-    _rl_pack_linked_embs_for_node,
-    _rl_regenerate_node_vector,
-    _rl_refetch_node_vector,
-    _rl_find_representative_obj,
-    _rl_attach_other_slot_for_node,
-    _rl_enrich_nodes_with_linked_embs,
-    _resolve_dual_rl_log_enabled,
-    _resolve_dual_rl_log_inputs,
-    _slot_short_source,
-    _rl_cache_and_rerank,
+# Relative when imported as a package; absolute when run directly as a script
+# (see the ``from .embeddings`` guard above — same REQUIRED fallback so the MCP
+# starts under the launcher's ``python .../weaviate_mcp/server.py`` invocation).
+_RL_ENRICHMENT_EXPORTS = (
+    "_rl_load_messages", "_rl_find_kg_positions", "_rl_extract_answer_window",
+    "_resolve_claude_session_dir", "_rl_find_all_transcripts_in_dir",
+    "_rl_find_all_transcripts", "_rl_is_literal_cited",
+    "_rl_compute_and_write_citations", "_rl_force_flush_sentinel_path",
+    "_rl_check_force_flush", "_rl_clear_force_flush", "_rl_human_turn_after",
+    "_rl_delete_own_pending_file", "_rl_answer_monitor", "_get_rl_client",
+    "_embedding_dim_for", "_extract_obj_vector", "_cosine",
+    "_get_rl_telemetry_writer", "_resolve_code_embedding_triple",
+    "_emit_code_structure_telemetry", "_emit_code_retrieval_telemetry",
+    "_stage_code_citation_pending", "_get_rl_telemetry_writer_for",
+    "_other_model_for_source", "_embed_text_in_other_model",
+    "_reset_rl_telemetry_writers", "_rl_pack_linked_embs_for_node",
+    "_rl_regenerate_node_vector", "_rl_refetch_node_vector",
+    "_rl_find_representative_obj", "_rl_attach_other_slot_for_node",
+    "_rl_enrich_nodes_with_linked_embs", "_resolve_dual_rl_log_enabled",
+    "_resolve_dual_rl_log_inputs", "_slot_short_source", "_rl_cache_and_rerank",
 )
+try:
+    from . import rl_enrichment as _rl_enrichment  # noqa: E402 — package-relative
+except ImportError:
+    import rl_enrichment as _rl_enrichment  # type: ignore  # noqa: E402 — run directly
+for _name in _RL_ENRICHMENT_EXPORTS:  # re-export into server's namespace
+    globals()[_name] = getattr(_rl_enrichment, _name)
+del _name
 
 
 # ----------------------------------------------------------------------

@@ -122,3 +122,53 @@ def test_proxy_tracks_the_callers_import_path_not_a_fixed_key():
     sentinel = object()
     with patch.object(srv, "_extract_obj_vector", lambda *a, **k: sentinel):
         assert rl.server._extract_obj_vector() is sentinel
+
+
+def test_server_py_imports_when_run_as_a_bare_script():
+    """SHIP-BLOCKER regression (v0.2.73): the launcher starts the weaviate-kg
+    MCP as ``python .../weaviate_mcp/server.py`` — a BARE SCRIPT, so server.py
+    runs as ``__main__`` with an empty ``__package__``. M-1's re-export blocks
+    (``from .embeddings`` / ``from .rl_enrichment``) are relative imports that
+    raise "attempted relative import with no known parent package" in that mode
+    unless guarded with an absolute-import fallback. Without the guard the MCP
+    fails to start for EVERY user on update. The whole pytest suite MISSES this
+    because tests import server as a PACKAGE module — only a real bare-script
+    run exercises the launcher's actual invocation.
+
+    This test runs server.py exactly as the launcher does and asserts it gets
+    past the import phase (we stub the serve loop so it exits cleanly)."""
+    import subprocess
+
+    server_py = REPO_ROOT / "claude_mcp_servers" / "weaviate_mcp" / "server.py"
+    assert server_py.exists()
+
+    # Run server.py EXACTLY as the launcher does: ``python <path>/server.py``
+    # (a bare script → __main__, empty __package__). server.py logs
+    # "Starting Claude Orchestrator Weaviate MCP Server" only AFTER every import
+    # — including M-1's re-export blocks — has succeeded, then blocks on the
+    # stdio serve loop. So the "Starting" line is proof the import phase is
+    # clean; we kill the process (timeout) once we see it. If the relative
+    # imports were unguarded, server.py would traceback BEFORE that line.
+    proc = subprocess.Popen(
+        [sys.executable, str(server_py)],
+        cwd=str(server_py.parent),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    try:
+        out, _ = proc.communicate(timeout=45)
+        combined = out or ""
+    except subprocess.TimeoutExpired:
+        # Blocked on the serve loop = imports succeeded. Capture what printed.
+        proc.kill()
+        out, _ = proc.communicate()
+        combined = out or ""
+
+    assert "attempted relative import" not in combined, (
+        "server.py's M-1 re-export blocks must have an absolute-import fallback "
+        f"for the bare-script launch. output:\n{combined[-2000:]}"
+    )
+    assert "Starting Claude Orchestrator Weaviate MCP Server" in combined, (
+        "server.py did NOT reach its post-import 'Starting …' log line when run "
+        "as a bare script — the import phase failed (likely M-1's relative "
+        f"re-export imports without the absolute fallback).\noutput:\n{combined[-2000:]}"
+    )

@@ -102,6 +102,17 @@ class _LazyServerProxy(_types.ModuleType):
                          else "weaviate_mcp._server_proxy")
 
     def _live(self):
+        # BARE-SCRIPT case (the launcher runs ``python .../weaviate_mcp/server.py``,
+        # so the RUNNING server is ``__main__`` — NOT ``weaviate_mcp.server``).
+        # When ``__main__`` is that server, resolve IT: importing
+        # ``weaviate_mcp.server`` would build a SECOND, fresh server object with
+        # uninitialised state, desyncing the re-exported functions from the one
+        # actually serving requests. Detect via a server-only sentinel attribute.
+        _main = _sys.modules.get("__main__")
+        if _main is not None and _main is not self and hasattr(
+            _main, "_rl_client_instances"
+        ):
+            return _main
         for _name in _SERVER_MOD_NAMES:
             mod = _sys.modules.get(_name)
             if mod is not None and mod is not self:
