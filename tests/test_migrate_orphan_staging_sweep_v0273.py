@@ -121,29 +121,48 @@ class TestCodegraphOrphanStagingSweep(unittest.TestCase):
 
     def _run(self, all_classes, env, counts):
         """Drive migrate_collections with the code-graph orphan-staging arm
-        active. ``counts`` maps class-name → object count for _count_objects.
+        active. ``counts`` maps class-name → object count.
+
+        v0.2.73 dedup: the code-graph arm now DELEGATES the count-aware
+        SAFE-DROP/SURFACE decision to the shared ``_recover_or_drop_orphan_
+        staging`` (ONE home). So we mock that helper with a count-aware
+        side-effect (base>=staging → "dropped"; base missing/smaller →
+        "ambiguous"; both absent → "none") — exercising THIS arm's ownership
+        gate + result-entry translation while trusting the shared helper's
+        already-tested count logic. ``recovered`` tracks which staging names the
+        helper "dropped" (stands in for the real _delete_class).
 
         The current project's code-graph prefix defaults to ``Proj`` (via
-        ``CODE_GRAPH_PROJECT``) so the cross-project SAFE-DROP gate treats
-        ``Proj_Code*`` staging as OWNED. Pass ``CODE_GRAPH_PROJECT`` in ``env``
-        to override (e.g. to exercise the foreign-project retain path)."""
-        def _fake_count(name, weaviate_url=None):
-            return counts.get(name, 0)
+        ``CODE_GRAPH_PROJECT``) so the ownership gate treats ``Proj_Code*``
+        staging as OWNED. Pass ``CODE_GRAPH_PROJECT`` in ``env`` to override."""
+        dropped_by_helper: list[str] = []
+
+        def _fake_recover(name, target_def=None, *, weaviate_url=None, log_event=None):
+            staging = name + project_init._STAGING_SUFFIX
+            base_present = name in all_classes
+            base_c = counts.get(name, 0)
+            staging_c = counts.get(staging, 0)
+            if (not base_present) or base_c == 0:
+                if staging_c == 0:
+                    return "none"
+                return "ambiguous"  # base missing/empty, staging populated
+            if base_c >= staging_c:
+                dropped_by_helper.append(staging)
+                return "dropped"
+            return "ambiguous"  # base smaller
 
         _env = {"CODE_GRAPH_PROJECT": "Proj", **env}  # caller can override
         with mock.patch.dict("os.environ", _env, clear=False), \
              mock.patch.object(project_init, "_list_classes", return_value=all_classes), \
              mock.patch.object(
                  project_init, "_recover_or_drop_orphan_staging",
-                 return_value="none",
+                 side_effect=_fake_recover,
              ), \
-             mock.patch.object(project_init, "_count_objects", side_effect=_fake_count), \
-             mock.patch.object(project_init, "_delete_class") as del_mock, \
              mock.patch.object(project_init, "_build_plan", return_value=[]):
             result = project_init.migrate_collections(
                 self.args, dry_run=True, weaviate_url="http://localhost:8081",
             )
-        return result, del_mock
+        return result, dropped_by_helper
 
     def test_safe_drops_when_base_intact_and_ge_count(self):
         """Base ``Proj_CodeFunction`` present with count >= staging → SAFE-DROP
@@ -154,9 +173,8 @@ class TestCodegraphOrphanStagingSweep(unittest.TestCase):
         orphan = base + suffix
         all_classes = ["Proj_KnowledgeGraph", base, orphan]
         counts = {base: 23186, orphan: 15025}  # base >= staging
-        result, del_mock = self._run(all_classes, env, counts)
-        # The staging (and ONLY the staging) was dropped.
-        dropped = [c.args[0] for c in del_mock.call_args_list]
+        result, dropped = self._run(all_classes, env, counts)
+        # The staging (and ONLY the staging) was dropped (via the shared helper).
         self.assertIn(orphan, dropped, f"staging must be safe-dropped; drops={dropped}")
         self.assertNotIn(base, dropped, "base collection must never be dropped")
         # A result entry describes the drop as resolved.
@@ -176,11 +194,11 @@ class TestCodegraphOrphanStagingSweep(unittest.TestCase):
         orphan = "Proj_CodeFunction" + suffix
         all_classes = ["Proj_KnowledgeGraph", orphan]  # base absent
         counts = {orphan: 15025}
-        result, del_mock = self._run(all_classes, env, counts)
-        del_mock.assert_not_called()
+        result, dropped = self._run(all_classes, env, counts)
+        self.assertEqual(dropped, [], "missing-base orphan must NOT be dropped")
         surfaced = [e for e in result["errors"] if orphan in e.get("error", "")]
         self.assertTrue(surfaced, "missing-base orphan must surface as an error")
-        self.assertIn("only surviving copy", surfaced[0]["error"])
+        self.assertIn("MISSING or SMALLER", surfaced[0]["error"])
         self.assertNotEqual(surfaced[0].get("resolved"), True)
 
     def test_retains_when_base_smaller(self):
@@ -192,11 +210,11 @@ class TestCodegraphOrphanStagingSweep(unittest.TestCase):
         orphan = base + suffix
         all_classes = ["Proj_KnowledgeGraph", base, orphan]
         counts = {base: 100, orphan: 500}  # base < staging
-        result, del_mock = self._run(all_classes, env, counts)
-        del_mock.assert_not_called()
+        result, dropped = self._run(all_classes, env, counts)
+        self.assertEqual(dropped, [], "smaller-base orphan must NOT be dropped")
         surfaced = [e for e in result["errors"] if orphan in e.get("error", "")]
         self.assertTrue(surfaced, "smaller-base orphan must surface as an error")
-        self.assertIn("SMALLER", surfaced[0]["error"])
+        self.assertIn("MISSING or SMALLER", surfaced[0]["error"])
         self.assertNotEqual(surfaced[0].get("resolved"), True)
 
     def test_all_five_codegraph_suffixes_are_swept(self):
@@ -212,10 +230,9 @@ class TestCodegraphOrphanStagingSweep(unittest.TestCase):
         all_classes = ["Proj_KnowledgeGraph", *bases, *orphans]
         counts = {b: 10 for b in bases}
         counts.update({o: 5 for o in orphans})  # base >= staging for all
-        result, del_mock = self._run(all_classes, env, counts)
-        dropped = {c.args[0] for c in del_mock.call_args_list}
+        result, dropped = self._run(all_classes, env, counts)
         self.assertEqual(
-            dropped, set(orphans),
+            set(dropped), set(orphans),
             f"all five code-graph staging orphans must be safe-dropped; got {dropped}",
         )
 
@@ -240,8 +257,8 @@ class TestCodegraphOrphanStagingSweep(unittest.TestCase):
         # Both have base intact and >= staging (the safe-drop count condition).
         counts = {foreign_base: 100, foreign_orphan: 50,
                   own_base: 100, own_orphan: 50}
-        result, del_mock = self._run(all_classes, env, counts)
-        dropped = {c.args[0] for c in del_mock.call_args_list}
+        result, dropped = self._run(all_classes, env, counts)
+        dropped = set(dropped)
         # OUR staging is dropped; the FOREIGN one is NOT.
         self.assertIn(own_orphan, dropped, "own project's orphan should safe-drop")
         self.assertNotIn(
@@ -269,13 +286,13 @@ class TestCodegraphOrphanStagingSweep(unittest.TestCase):
         counts = {base: 100, orphan: 50}
         # Explicitly BLANK the prefix env (override the _run default) and use a
         # nameless args so nothing resolves a prefix.
-        result, del_mock = self._run(
+        result, dropped = self._run(
             all_classes,
             {"KG_COLLECTION": "Proj_KnowledgeGraph", "CODE_GRAPH_PROJECT": "",
              "PROJECT_NAME": ""},
             counts,
         )
-        del_mock.assert_not_called()
+        self.assertEqual(dropped, [], "un-ownable orphan must NOT be dropped")
         surfaced = [e for e in result["errors"] if orphan in e.get("error", "")]
         self.assertTrue(surfaced, "un-ownable orphan must surface, not drop")
         self.assertNotEqual(surfaced[0].get("resolved"), True)
