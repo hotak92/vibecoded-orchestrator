@@ -152,7 +152,11 @@ class TestRetrievalV3Fields:
             embedding_model="qwen3-embedding:0.6b",
         )
 
-    def test_n_emb_field_is_persisted(self) -> None:
+    def test_node_vector_is_persisted_under_emb(self) -> None:
+        """v0.2.73 n_emb payload-dedup: a node whose vector arrives under
+        ``n_emb`` (the code-retrieval / best-chunk shape) is serialized ONCE,
+        under ``emb`` — the field the offline trainer reads. The stored event
+        no longer carries a duplicate ``n_emb`` copy."""
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
             log = self._logger(td_path)
@@ -170,7 +174,10 @@ class TestRetrievalV3Fields:
                 ],
             )
             event = json.loads((td_path / "ev.jsonl").read_text().strip())
-            assert event["nodes"][0]["n_emb"] == pytest.approx([0.1, 0.2, 0.3])
+            node = event["nodes"][0]
+            # Promoted to `emb`; no redundant `n_emb` copy written.
+            assert node["emb"] == pytest.approx([0.1, 0.2, 0.3])
+            assert "n_emb" not in node
 
     def test_linked_embs_field_is_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -314,7 +321,10 @@ class TestTelemetryWriterPassThrough:
             query_emb=None,
         )
         n = payload["nodes"][0]
-        assert n["n_emb"] == [0.1, 0.2]
+        # v0.2.73 n_emb payload-dedup: the vector is stored once under `emb`
+        # (trainer's field), promoted from the `n_emb`-only input; no `n_emb`.
+        assert n["emb"] == [0.1, 0.2]
+        assert "n_emb" not in n
         assert n["linked_embs"] == [[0.3, 0.4]]
         assert n["linked_type_names"] == ["concept"]
         assert n["node_type"] == "concept"
@@ -346,8 +356,12 @@ class TestTelemetryWriterPassThrough:
         )
         n = payload["nodes"][0]
         # Every stored vector rounded to 4 decimals (no verbatim float32 tail).
+        # v0.2.73 n_emb payload-dedup: when both `emb` and `n_emb` are present
+        # `emb` wins and the redundant `n_emb` copy is NOT written (the KG
+        # enrichment mirrors the SAME vector into both keys; the trainer reads
+        # `emb`). Rounding still applies to the surviving `emb`.
         assert n["emb"] == [0.1235, 0.9877]
-        assert n["n_emb"] == [0.1111, 0.2222]
+        assert "n_emb" not in n
         assert n["linked_embs"] == [[0.3333, 0.4444]]
         assert payload["query_emb"] == [0.5556, 0.6667]
         # And no value retains >4-decimal precision anywhere.

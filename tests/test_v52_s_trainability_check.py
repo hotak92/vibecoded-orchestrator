@@ -194,6 +194,44 @@ def test_script_verdict_failing_corpus(tmp_path):
     assert verdict["metrics"]["cohort_uniformity"]["passed"] is True
 
 
+def test_nemb_presence_counts_the_emb_field_post_dedup(tmp_path):
+    """v0.2.73 n_emb payload-dedup: the written node vector moved from a
+    duplicate `emb`+`n_emb` pair to a single canonical `emb` (the field the
+    offline trainer reads). The `n_emb_presence` metric must count `emb` (with
+    `n_emb` as a legacy fallback) — else a fully-trainable post-dedup corpus
+    would falsely read 0% and block training."""
+    db = tmp_path / "launcher.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE rl_events (id INTEGER PRIMARY KEY, event_type TEXT, "
+        "payload_json TEXT, created_at INTEGER)"
+    )
+    rows = []
+    for i in range(10):
+        # New post-dedup shape: vector under `emb` only, NO `n_emb`.
+        payload = {
+            "task_id": f"t{i}",
+            "project_name": "demo_project",
+            "embedding_model": "qwen3",
+            "embed_dim": 1024,
+            "query_emb": [0.5, 0.5, 0.5],
+            "nodes": [{"title": f"n{i}", "emb": [0.1, 0.2, 0.3]}],
+        }
+        rows.append(("retrieval", json.dumps(payload), i * 1000))
+        rows.append(("answer", json.dumps({"task_id": f"t{i}"}), i * 1000 + 500))
+    conn.executemany(
+        "INSERT INTO rl_events (event_type, payload_json, created_at) VALUES (?, ?, ?)",
+        rows,
+    )
+    conn.commit()
+    conn.close()
+
+    code, verdict = _run_script(db)
+    # 100% of nodes carry the vector under `emb` → presence must be 1.0.
+    assert verdict["metrics"]["n_emb_presence"]["observed"] == pytest.approx(1.0)
+    assert verdict["metrics"]["n_emb_presence"]["passed"] is True
+
+
 def test_script_handles_missing_db(tmp_path):
     """Pointing at a non-existent file → exit 1 with a clear message."""
     nonexistent = tmp_path / "no-such-file.db"

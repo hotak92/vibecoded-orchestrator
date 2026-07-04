@@ -632,9 +632,16 @@ def test_rl2b_code_emit_stages_pending_file_with_code_ctx(monkeypatch, tmp_path)
     assert ok is True
 
     # Retrieval event carries the SAME task_id + the per-node vector.
+    # v0.2.73 n_emb payload-dedup: the WRITTEN event serializes the node vector
+    # ONCE, under `emb` (the field the offline trainer reads) — promoted from
+    # the code path's `n_emb`-only candidate shape, so these code retrievals
+    # become trainable. The in-process citation-cache ctx (asserted below on the
+    # pending file) still carries `n_emb` for the online /rl_update RPC + cosine.
     event = _payload(captured[0])
     assert event["task_id"] == "task-code-pair"
-    assert event["nodes"][0]["n_emb"] == [1.0] + [0.0] * 15
+    assert event["nodes"][0]["emb"] == [1.0] + [0.0] * 15
+    assert "n_emb" not in event["nodes"][0]
+    assert "emb" not in event["nodes"][1]
     assert "n_emb" not in event["nodes"][1]
 
     # Pending file staged for the drain.
@@ -899,3 +906,221 @@ def test_structure_tool_calls_the_emit_home():
     from claude_mcp_servers.rl_client.answer_window import KG_SEARCH_TOOLS
 
     assert "query_code_structure" not in KG_SEARCH_TOOLS
+
+
+# ---------------------------------------------------------------------------
+# v0.2.73 telemetry-dedup — per-node serialization consolidation
+# (Opus reviewer-fixer 2026-07-04). Guards the extraction of the shared
+# `serialize_node_record` helper: proves the two migrated builders emit
+# byte-identical per-node records and cannot silently drift from each other.
+# ---------------------------------------------------------------------------
+
+# One rich node exercising every per-node field + coercion path.
+_DEDUP_RICH_NODE = {
+    "title": 42,  # int -> str coercion
+    "score": 0.876543210,  # full precision preserved (hub side does NOT round)
+    "tier": "extra_reference",
+    "emb": [0.123456, 0.987654321],
+    "n_emb": [0.5555559, 0.3333333],
+    "linked_embs": [[0.11119, 0.2222], [], [0.9]],  # empty inner filtered out
+    "linked_type_names": ["Concept", 7],
+    "node_type": "code",
+    "links": [f"L{i}" for i in range(15)],  # >10 -> truncated to 10
+    "cos_qn": 0.333333,
+    "cos_ql": 0.0,  # falsy-but-present -> emitted (is-not-None guard)
+    "cos_nl": 0.9999,
+    "shown_rank": 3,
+    "chunks_matched": "5",  # str -> int coercion
+    "best_chunk_number": 2,
+    "collection": "CodeFunction",
+    "file_path": "a/b.py",
+    "rerank_score": 0.77,
+    "boost_delta": -0.05,
+    "boost_signals": {"lex": 1, "sem": 2},
+}
+
+
+def test_dedup_queue_builder_per_node_record_is_leaner_surface():
+    """`_build_retrieval_payload` (queue) — the LEANER surface (my lane, the
+    field GATING via flags): the queue payload deliberately OMITS `links`, the
+    RL-2 code-path fields, and `best_chunk_number` (which only the v3 event
+    carries), while keeping full-precision scalars and the RL-1/RL-7 rank+count
+    fields. This asserts the flag-driven omissions I own — NOT the exact field
+    list (the presence/precision of `emb`/`n_emb` is the payload-content lane's
+    contract and may change independently)."""
+    w = _writer([])
+    rec = w._build_retrieval_payload(
+        task_id="t", task_type="x", query="q",
+        nodes=[dict(_DEDUP_RICH_NODE)], session_id="s", query_emb=None,
+    )["nodes"][0]
+    # Coercions + full precision (hub side does NOT round scalars).
+    assert rec["title"] == "42"
+    assert rec["score"] == 0.876543210
+    assert rec["cos_qn"] == 0.333333
+    assert rec["chunks_matched"] == 5  # str -> int
+    assert rec["shown_rank"] == 3
+    # Flag-driven omissions owned by this lane (include_* = False here).
+    assert "links" not in rec
+    assert "best_chunk_number" not in rec
+    assert "collection" not in rec
+    assert "rerank_score" not in rec
+    assert "boost_signals" not in rec
+
+
+def test_dedup_v3_builder_per_node_record_is_superset_surface():
+    """`_build_v3_retrieval_event` (launcher.db) — the SUPERSET surface (my
+    lane): adds `links` (truncated to 10, str-coerced), `best_chunk_number`,
+    and the RL-2 code-path fields the queue omits, at full precision. Asserts
+    the flag-driven ADDITIONS I own, not the exact field list."""
+    w = _writer([])
+    rec = w._build_v3_retrieval_event(
+        task_id="t", task_type="x", query="q",
+        nodes=[dict(_DEDUP_RICH_NODE)], session_id="s", query_emb=None,
+    )["nodes"][0]
+    assert rec["links"] == [f"L{i}" for i in range(10)]  # truncated to 10
+    assert rec["best_chunk_number"] == 2
+    assert rec["collection"] == "CodeFunction"
+    assert rec["rerank_score"] == 0.77
+    assert rec["boost_delta"] == -0.05
+    assert rec["boost_signals"] == {"lex": 1, "sem": 2}  # dict shape verbatim
+    # Insertion order: `links` sits between `node_type` and the cos_* block
+    # (the hub-side order the shared helper fixes).
+    keys = list(rec.keys())
+    assert keys.index("node_type") < keys.index("links") < keys.index("cos_qn")
+    # best_chunk_number follows chunks_matched; code-path fields come last.
+    assert keys.index("chunks_matched") < keys.index("best_chunk_number")
+    assert keys.index("best_chunk_number") < keys.index("collection")
+
+
+def test_dedup_v3_is_strict_superset_of_queue_shared_fields():
+    """For the SAME node, every field the queue builder emits appears
+    identically (key + value) in the v3 event — proving they share one
+    serialization and the v3 event only ADDS fields, never diverges."""
+    w = _writer([])
+    node = dict(_DEDUP_RICH_NODE)
+    q_rec = w._build_retrieval_payload(
+        task_id="t", task_type="x", query="q", nodes=[dict(node)],
+        session_id="s", query_emb=None,
+    )["nodes"][0]
+    v3_rec = w._build_v3_retrieval_event(
+        task_id="t", task_type="x", query="q", nodes=[dict(node)],
+        session_id="s", query_emb=None,
+    )["nodes"][0]
+    for k, v in q_rec.items():
+        assert k in v3_rec, f"v3 event dropped queue field {k!r}"
+        assert v3_rec[k] == v, f"field {k!r} diverged: {v!r} vs {v3_rec[k]!r}"
+
+
+def test_dedup_builders_route_through_shared_helper():
+    """Drift guard: both migrated builders call `serialize_node_record`, so a
+    future edit to per-node shape lands in ONE place, not three copies."""
+    import inspect
+
+    from claude_mcp_servers.rl_client import telemetry_writer as tw
+
+    for meth in (tw.RLTelemetryWriter._build_retrieval_payload,
+                 tw.RLTelemetryWriter._build_v3_retrieval_event):
+        src = inspect.getsource(meth)
+        assert "serialize_node_record(" in src, (
+            f"{meth.__name__} no longer routes through the shared helper"
+        )
+
+
+# ---------------------------------------------------------------------------
+# n_emb payload-dedup (v0.2.73) — the WRITTEN retrieval event serializes the
+# node vector ONCE, under `emb` (the field the offline trainer reads). No
+# offline consumer reads a stored `n_emb`, and the KG enrichment mirrors the
+# SAME vector into both keys — so pre-dedup every KG node's 1024-dim vector was
+# written TWICE (~50% dead bytes). These pin the single-write contract across
+# all three serialization surfaces + the offline-trainer field it targets.
+# ---------------------------------------------------------------------------
+
+
+def test_nemb_dedup_kg_node_writes_vector_once_under_emb():
+    """A KG node carrying the SAME vector under both `emb` and `n_emb` (the
+    enrichment shape) serializes ONCE under `emb`; the redundant `n_emb` copy is
+    dropped from the queue payload AND the v3 event."""
+    from claude_mcp_servers.rl_client.rl_logger import serialize_node_record
+
+    kg_node = {"title": "N", "score": 0.5, "tier": "top_k",
+               "emb": [0.11, 0.22], "n_emb": [0.11, 0.22]}
+    rec = serialize_node_record(dict(kg_node))
+    assert rec["emb"] == [0.11, 0.22]
+    assert "n_emb" not in rec
+
+    w = _writer([])
+    for build in (w._build_retrieval_payload, w._build_v3_retrieval_event):
+        node = build(task_id="t", task_type="x", query="q",
+                     nodes=[dict(kg_node)], session_id="s", query_emb=None)["nodes"][0]
+        assert node["emb"] == [0.11, 0.22]
+        assert "n_emb" not in node
+
+
+def test_nemb_dedup_code_node_promotes_nemb_only_vector_to_emb():
+    """A code retrieval attaches the vector as `n_emb`-only. The written event
+    promotes it to `emb` so the offline trainer (which reads `emb`) can consume
+    it — pre-dedup these events were silently skipped by the trainer."""
+    from claude_mcp_servers.rl_client.rl_logger import serialize_node_record
+
+    code_node = {"title": "mod.fn", "score": 0.7, "tier": "top_k",
+                 "n_emb": [1.0, 0.0, 0.0]}
+    rec = serialize_node_record(dict(code_node))
+    assert rec["emb"] == [1.0, 0.0, 0.0]
+    assert "n_emb" not in rec
+
+
+def test_nemb_dedup_legacy_jsonl_writer_dedups_too():
+    """The legacy JSONL `RLDataLogger.log_retrieval` loop (kept separate for
+    field-order reasons) applies the SAME dedup: one `emb`, no `n_emb`."""
+    import tempfile
+
+    from claude_mcp_servers.rl_client.rl_logger import RLDataLogger
+
+    with tempfile.TemporaryDirectory() as td:
+        log = RLDataLogger(log_path=Path(td) / "ev.jsonl", project="P",
+                           embedding_source="qwen3", embedding_dim=2,
+                           embedding_model="m")
+        log.log_retrieval(
+            task_id="t", task_type="x", query="q",
+            nodes=[{"title": "A", "score": 0.9, "tier": "top_k",
+                    "emb": [0.3, 0.4], "n_emb": [0.3, 0.4]}],
+        )
+        event = json.loads((Path(td) / "ev.jsonl").read_text().strip())
+        node = event["nodes"][0]
+        assert node["emb"] == pytest.approx([0.3, 0.4])
+        assert "n_emb" not in node
+
+
+def test_nemb_dedup_written_event_is_consumable_by_offline_trainer_field():
+    """Contract anchor: the offline trainer reads the node vector via
+    `node.get("emb")` (paid-modules/vct-rl-reranker/offline_trainer.py
+    `extract_samples` + `train_epoch`). Assert the written v3 event exposes the
+    vector under exactly that key for both the KG (dual-key) and code
+    (n_emb-only) shapes — so nothing the trainer needs is lost by the dedup."""
+    w = _writer([])
+    for node_in in (
+        {"title": "kg", "score": 0.5, "tier": "top_k",
+         "emb": [0.1, 0.2], "n_emb": [0.1, 0.2]},
+        {"title": "code", "score": 0.6, "tier": "top_k", "n_emb": [0.9, 0.8]},
+    ):
+        rec = w._build_v3_retrieval_event(
+            task_id="t", task_type="x", query="q",
+            nodes=[dict(node_in)], session_id="s", query_emb=None,
+        )["nodes"][0]
+        # The trainer's exact read must find the vector.
+        assert rec.get("emb"), "offline trainer's node.get('emb') would be empty"
+
+
+def test_dedup_helper_round_scalars_flag_matches_legacy_precision():
+    """The `round_scalars` flag reproduces the legacy JSONL writer's 4-place
+    rounding of `score` + `cos_*` (kept for parity even though no live hub
+    caller sets it — the legacy loop stays separate for byte-order reasons)."""
+    from claude_mcp_servers.rl_client.rl_logger import serialize_node_record
+
+    unrounded = serialize_node_record(dict(_DEDUP_RICH_NODE), round_scalars=False)
+    rounded = serialize_node_record(dict(_DEDUP_RICH_NODE), round_scalars=True)
+    assert unrounded["score"] == 0.876543210
+    assert rounded["score"] == 0.8765
+    assert rounded["cos_qn"] == 0.3333
+    # Embeddings are ALWAYS rounded regardless of the flag.
+    assert unrounded["emb"] == rounded["emb"] == [0.1235, 0.9877]

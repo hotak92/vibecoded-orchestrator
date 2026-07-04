@@ -85,6 +85,148 @@ def _round_emb(emb: "list[float]") -> "list[float]":
     return [round(float(v), 4) for v in emb]
 
 
+def serialize_node_record(
+    n: "dict[str, Any]",
+    *,
+    include_links: bool = False,
+    include_shown_rank: bool = False,
+    include_chunks_matched: bool = False,
+    include_best_chunk_number: bool = False,
+    include_code_path_fields: bool = False,
+    round_scalars: bool = False,
+) -> "dict[str, Any]":
+    """Serialize ONE candidate node dict into a per-node telemetry record.
+
+    Single home for the per-node record shape shared by
+    ``RLTelemetryWriter._build_retrieval_payload`` (the consented-upload
+    queue payload) and ``RLTelemetryWriter._build_v3_retrieval_event`` (the
+    launcher.db v3 event). Prior to this extraction those two loops inlined a
+    near-identical copy — a semi-duplication that had already drifted (the v3
+    builder's docstring claimed field parity with the queue builder while
+    actually carrying ``links`` + ``best_chunk_number`` + the RL-2 code-path
+    fields the queue builder omits). Consolidating here makes the field set
+    and its insertion ORDER a single source of truth so the two callers cannot
+    drift again.
+
+    NOTE the legacy ``RLDataLogger.log_retrieval`` JSONL loop is deliberately
+    NOT routed here: it emits ``links`` AFTER the ``cos_*`` block (vs BEFORE
+    here) and rounds ``score`` + ``cos_*`` — a genuinely different serialization
+    with a different byte order. Folding it in would change its on-disk bytes,
+    so it keeps its own loop (documented at that call-site). The ``round_scalars``
+    flag below encodes that precision difference for parity/testing even though
+    no live caller currently sets it.
+
+    **Byte/insertion-order contract**: JSON preserves dict insertion order, so
+    the on-wire/on-disk record is order-sensitive. Field insertion order here
+    is FIXED:
+    ``title, score, tier, emb, linked_embs, linked_type_names,
+    node_type, [links], [cos_qn, cos_ql, cos_nl], [shown_rank],
+    [chunks_matched], [best_chunk_number], [collection, file_path,
+    rerank_score, boost_delta, boost_signals]``. Bracketed groups are gated by
+    the keyword flags.
+
+    **v0.2.73 n_emb payload-dedup**: the node vector is written ONCE, under
+    ``emb`` (the field the offline trainer reads). Pre-dedup this record emitted
+    the SAME 1024-dim vector twice — as ``emb`` AND ``n_emb`` (the KG enrichment
+    mirrors the vector into both keys on the candidate dict), and NO offline
+    consumer reads a stored ``n_emb`` (the offline trainer's
+    ``extract_samples`` / ``train_epoch`` read ``node.get("emb")`` only; the
+    ``n_emb`` reads in ``retrieval_rl.py`` are the ONLINE /rl_update RPC path,
+    which consumes the in-process ctx dict, never this serialized record). So
+    ``n_emb`` was ~50% dead write weight on KG events. A node that carries only
+    ``n_emb`` (code retrievals) is promoted to ``emb`` here so it becomes
+    trainable rather than silently skipped.
+
+    Each optional field is emitted ONLY when truthy/non-None in ``n`` (same
+    ``if n.get(...)`` / ``is not None`` guards the original loops used), so a
+    sparse node dict yields the same sparse record.
+
+    Args:
+        n: One candidate node dict (as produced by the search-pipeline
+           reducer ``_build_log_nodes``).
+        include_links: emit ``links`` (first 10, str-coerced). v3 event +
+           legacy JSONL include it; the queue payload historically omits it.
+        include_shown_rank: emit ``shown_rank`` (int). RL-1 — post-rerank
+           shown order. Both hub-side builders include it; the legacy JSONL
+           path predates it and omits it.
+        include_chunks_matched: emit ``chunks_matched`` (int). RL-7.
+        include_best_chunk_number: emit ``best_chunk_number`` (int). RL-7 —
+           only the v3 event carries it.
+        include_code_path_fields: emit the RL-2 code-retrieval fields
+           (``collection``, ``file_path``, ``rerank_score``, ``boost_delta``,
+           ``boost_signals``). Only the v3 event carries these.
+        round_scalars: round ``score`` and the ``cos_*`` features to 4 places.
+           The legacy JSONL writer rounds them (file-size); the hub-side
+           builders keep full precision (launcher.db stores JSON verbatim and
+           the offline trainer wants the unrounded scalar). Embeddings are
+           ALWAYS rounded via ``_round_emb`` regardless of this flag — that has
+           been true in every caller since v3.
+    """
+    rec: "dict[str, Any]" = {
+        "title": str(n.get("title", "")),
+        "score": (
+            round(float(n.get("score", 0.0)), 4)
+            if round_scalars
+            else float(n.get("score", 0.0))
+        ),
+        "tier": str(n.get("tier", "top_k")),
+    }
+    # v0.2.73 (n_emb payload-dedup): the node vector is serialized ONCE, under
+    # `emb` — the field the offline trainer actually reads
+    # (paid-modules/vct-rl-reranker/offline_trainer.py `extract_samples`/
+    # `train_epoch` both read `node.get("emb")`; NO offline consumer reads a
+    # stored `n_emb`). The KG enrichment site mirrors the SAME vector into both
+    # `emb` and `n_emb` on the candidate dict, so pre-dedup every KG retrieval
+    # event carried the identical 1024-dim vector TWICE (~50% of the per-node
+    # embedding bytes were dead weight). The in-process citation cache + online
+    # /rl_update RPC still read `n_emb` off the ctx dict (see
+    # search_pipeline `_build_log_nodes` / rl_enrichment) — that path is
+    # UNCHANGED; only this WRITTEN-telemetry serialization is deduped. Code
+    # retrievals attach the vector as `n_emb`-only; promoting it to `emb` here
+    # makes those events trainable (they were silently skipped before, since
+    # the trainer never read `n_emb`).
+    _node_vec = n.get("emb") or n.get("n_emb")
+    if _node_vec:
+        rec["emb"] = _round_emb(_node_vec)
+    # v3+: MAX_LINKED packed linked-slot embeddings.
+    if n.get("linked_embs"):
+        rec["linked_embs"] = [_round_emb(e) for e in n["linked_embs"] if e]
+    if n.get("linked_type_names"):
+        rec["linked_type_names"] = [str(t) for t in n["linked_type_names"]]
+    if n.get("node_type"):
+        rec["node_type"] = str(n["node_type"])
+    if include_links and n.get("links"):
+        rec["links"] = [str(lnk) for lnk in n["links"][:10]]
+    for field in ("cos_qn", "cos_ql", "cos_nl"):
+        val = n.get(field)
+        if val is not None:
+            rec[field] = round(float(val), 4) if round_scalars else float(val)
+    if include_shown_rank and n.get("shown_rank") is not None:
+        rec["shown_rank"] = int(n["shown_rank"])
+    if include_chunks_matched and n.get("chunks_matched") is not None:
+        rec["chunks_matched"] = int(n["chunks_matched"])
+    if include_best_chunk_number and n.get("best_chunk_number") is not None:
+        rec["best_chunk_number"] = int(n["best_chunk_number"])
+    if include_code_path_fields:
+        # RL-2 code-path node fields (present only on code retrievals).
+        if n.get("collection"):
+            rec["collection"] = str(n["collection"])
+        if n.get("file_path"):
+            rec["file_path"] = str(n["file_path"])
+        if n.get("rerank_score") is not None:
+            rec["rerank_score"] = float(n["rerank_score"])
+        if n.get("boost_delta") is not None:
+            rec["boost_delta"] = float(n["boost_delta"])
+        if n.get("boost_signals"):
+            # code_ranking stamps signals as a dict; keep the shape verbatim
+            # (payload_json is stored as-is).
+            _sig = n["boost_signals"]
+            rec["boost_signals"] = (
+                dict(_sig) if isinstance(_sig, dict) else list(_sig)
+            )
+    return rec
+
+
 class RLDataLogger:
     """
     Append-only JSONL data logger for RL retrieval training.
@@ -203,6 +345,25 @@ class RLDataLogger:
                         per-machine config drift (e.g. a hardcoded shared-KG
                         default that doesn't exist on the user's Weaviate).
         """
+        # NOTE — deliberately NOT routed through `serialize_node_record`.
+        # This is the LEGACY JSONL writer (test-only since the v0.2.47 hub
+        # cutover). It is a genuinely different serialization concern from the
+        # two live hub builders in telemetry_writer.py, NOT a copy that drifted:
+        #   * different scalar precision — it rounds `score` + `cos_*` for
+        #     file-size (the hub builders keep full precision for the trainer);
+        #   * different FIELD ORDER — here `links` is emitted AFTER the `cos_*`
+        #     block, whereas the hub builders emit `links` BEFORE it. JSON
+        #     preserves insertion order, so folding this loop into the shared
+        #     helper (which uses the hub order) would change this writer's
+        #     on-disk bytes for any node carrying both `links` and `cos_*`.
+        # Preserving this loop's FIELD ORDER + scalar rounding keeps the legacy
+        # JSONL corpus byte-stable. v0.2.73 (n_emb payload-dedup): the node
+        # vector is serialized ONCE, under `emb` — the field the offline trainer
+        # reads. Pre-dedup a KG node carried the SAME vector under both `emb`
+        # and `n_emb` (the enrichment site mirrors them), doubling the per-node
+        # embedding bytes for a field (`n_emb`) no offline consumer reads. Mirror
+        # of the dedup in `serialize_node_record` above; the only difference here
+        # is this loop's distinct field order / scalar rounding.
         node_records = []
         for n in nodes:
             rec: dict[str, Any] = {
@@ -210,15 +371,9 @@ class RLDataLogger:
                 "score": round(float(n.get("score", 0.0)), 4),
                 "tier": str(n.get("tier", "top_k")),
             }
-            # `emb` is the legacy whole-node embedding from Weaviate.
-            # `n_emb` (v3+) is the SAME field semantically — best-chunk vector
-            # for the matched chunk — but the v3 callers pass it under the
-            # new name so the offline trainer can disambiguate v2 vs v3
-            # payloads. Persist both shapes when present.
-            if n.get("emb"):
-                rec["emb"] = _round_emb(n["emb"])
-            if n.get("n_emb"):
-                rec["n_emb"] = _round_emb(n["n_emb"])
+            _node_vec = n.get("emb") or n.get("n_emb")
+            if _node_vec:
+                rec["emb"] = _round_emb(_node_vec)
             # v3+: per-node packed linked-slot embeddings (MAX_LINKED total,
             # extra_chunks_of_this_node first then actual_linked_nodes).
             # Stored already in the order _rl_model.update() consumes; offline

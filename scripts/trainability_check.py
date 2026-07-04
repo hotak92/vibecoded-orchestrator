@@ -125,15 +125,25 @@ def _compute_metrics(conn: sqlite3.Connection) -> dict[str, float]:
     except sqlite3.Error:
         pass  # leave at 0.0
 
-    # 2. n_emb_presence: per-node entries with non-empty n_emb.
+    # 2. n_emb_presence: per-node entries with a non-empty stored node vector.
+    #    The metric name is historical; what it measures is "does the node carry
+    #    the vector the offline trainer needs". v0.2.73 (n_emb payload-dedup)
+    #    canonicalized the written node vector to `emb` — the field the trainer
+    #    actually reads (paid-modules/.../offline_trainer.py reads
+    #    `node.get("emb")`; it never reads a stored `n_emb`). So presence is
+    #    counted on `emb`, with `n_emb` accepted as a fallback for legacy rows
+    #    written before the dedup (which carried the vector under both keys, or
+    #    under `n_emb`-only on the pre-dedup code-retrieval path).
     #    Implemented by JSON-walking nodes[] — SQLite's json_each makes
     #    this tractable without pulling every payload into Python.
     try:
         row = conn.execute(
             """
             SELECT
-              SUM(CASE WHEN json_extract(node.value, '$.n_emb') IS NOT NULL
-                        AND json_array_length(json_extract(node.value, '$.n_emb')) > 0
+              SUM(CASE WHEN (json_extract(node.value, '$.emb') IS NOT NULL
+                             AND json_array_length(json_extract(node.value, '$.emb')) > 0)
+                         OR (json_extract(node.value, '$.n_emb') IS NOT NULL
+                             AND json_array_length(json_extract(node.value, '$.n_emb')) > 0)
                        THEN 1 ELSE 0 END) AS with_emb,
               COUNT(*) AS total
             FROM rl_events,
