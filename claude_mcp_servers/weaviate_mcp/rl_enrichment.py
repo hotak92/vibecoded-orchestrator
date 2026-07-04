@@ -48,10 +48,14 @@ import os
 from pathlib import Path
 from typing import Optional
 
-# Server imports this module near the end of its own body; every function
-# below does a call-time ``from . import server`` so nothing here touches the
-# ``server`` module at import time (avoids the circular-import edge).
-from . import server  # noqa: F401 — re-exported target + call-time attr source
+# NOTE: there is deliberately NO module-level ``from . import server`` here.
+# ``server`` imports THIS module near the end of its own body (the re-export
+# block), so a top-level import back into ``server`` creates a circular edge
+# that fails when ``rl_enrichment`` is imported FIRST (server's re-export runs
+# against a half-initialised ``rl_enrichment``). Every function below instead
+# does its own call-time ``from . import server`` — nothing here touches the
+# ``server`` module at import time, so this module is import-order-independent
+# (matching sibling ``embeddings.py``).
 
 # Answer-window matcher: single source of truth lives in
 # ``rl_client.answer_window`` (imported here the same way server.py did — one
