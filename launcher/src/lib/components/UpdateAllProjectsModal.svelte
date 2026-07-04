@@ -13,9 +13,19 @@
   // (bundle install + schema bootstrap) is non-trivial to roll back.
   // Best we offer is "close this dialog after it finishes".
 
-  import { invoke } from '$lib/tauri';
+  import { invoke, listen } from '$lib/tauri';
   import { projects } from '$lib/stores/projects';
   import { toast } from '$lib/stores/toast';
+  import { isErrorWarning } from '$lib/warning-severity';
+  import {
+    type UpdateAllProgress,
+    type ProgressState,
+    emptyProgressState,
+    applyProgressEvent,
+    progressTotal as computeProgressTotal,
+    progressIcon,
+  } from './update-all-progress';
+  import { onDestroy } from 'svelte';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
   import RegenerateOrDeferModal, {
     type StaleDerivedArtifact,
@@ -47,9 +57,10 @@
 
   // Three phases:
   //   "confirm" — initial prompt + count of projects to update.
-  //   "running" — Tauri call in flight. Spinner; no per-project rows
-  //               yet because the backend doesn't stream events (one
-  //               sync call returns the full report).
+  //   "running" — Tauri call in flight. The backend now streams a
+  //               per-project `update_all_progress` event at each boundary
+  //               (v0.2.73), so we render a LIVE checklist that fills in as
+  //               each project starts/finishes instead of a static spinner.
   //   "done"    — report received. Per-project rows rendered.
   let phase = $state<'confirm' | 'running' | 'done'>('confirm');
   let stopOnError = $state(true);
@@ -57,6 +68,35 @@
   let runError = $state<string | null>(null);
 
   const projectCount = $derived($projects.projects.length);
+
+  // ── Live per-project progress (v0.2.73) ───────────────────────────────
+  //
+  // The reducer + types live in `./update-all-progress.ts` (pure, unit-tested
+  // in the pure-node vitest env). Here we hold the reactive snapshot and feed
+  // each `update_all_progress` event through the pure `applyProgressEvent`.
+  //
+  // Event payload mirrors the Rust `UpdateAllProgressEvent` — the EVENT
+  // CONTRACT doc-comment on `UPDATE_ALL_PROGRESS_EVENT` in
+  // `commands/projects_v2.rs` is the source of truth.
+  let progress = $state<ProgressState>(emptyProgressState());
+  const progressRows = $derived(progress.rows);
+  const currentProject = $derived(progress.current);
+  // Total count carried by the events (falls back to the confirm-phase count
+  // before the first event arrives).
+  const progressTotal = $derived(computeProgressTotal(progress, projectCount));
+
+  // Unlisten handle for the `update_all_progress` event. Cleared on
+  // done/error and on unmount so we never leak a listener across runs.
+  let unlistenProgress: (() => void) | null = null;
+
+  function teardownProgressListener() {
+    if (unlistenProgress) {
+      unlistenProgress();
+      unlistenProgress = null;
+    }
+  }
+
+  onDestroy(teardownProgressListener);
 
   // Reset state every time the modal opens. Without this, a second
   // "Update all" click would render the previous report's state until
@@ -69,16 +109,38 @@
       staleByProject = {};
       resolveTarget = null;
       probing = false;
+      progress = emptyProgressState();
+      teardownProgressListener();
     }
   });
 
   async function runUpdateAll() {
     phase = 'running';
     runError = null;
+    progress = emptyProgressState();
+
+    // Subscribe to per-project progress BEFORE invoking so we don't miss the
+    // first project's `started` event. `listen` is a no-op outside the Tauri
+    // runtime (returns a no-op unlisten), so tests / browser preview just
+    // render the indeterminate fallback. Soft-fail: a listener-setup error
+    // must not block the actual update.
+    try {
+      unlistenProgress = await listen<UpdateAllProgress>(
+        'update_all_progress',
+        (e) => {
+          progress = applyProgressEvent(progress, e.payload);
+        },
+      );
+    } catch (listenErr) {
+      console.warn('update_all_progress listener setup failed:', listenErr);
+      unlistenProgress = null;
+    }
+
     try {
       const r = await projects.updateAll({ stop_on_error: stopOnError });
       report = r;
       phase = 'done';
+      teardownProgressListener();
 
       // Surface a summary toast so the user sees the result even after
       // closing the modal.
@@ -102,6 +164,7 @@
     } catch (e) {
       runError = e instanceof Error ? e.message : String(e);
       phase = 'done';
+      teardownProgressListener();
       toast.error(`Update all failed: ${runError}`);
     }
   }
@@ -230,12 +293,43 @@
     {#if phase === 'running'}
       <div class="ua-running">
         <div class="ua-spinner" aria-label="Loading"></div>
-        <p>Running bundle update for {projectCount} project{projectCount === 1 ? '' : 's'}…</p>
+        {#if currentProject}
+          <p class="ua-running-current">
+            Updating <strong>{currentProject.name}</strong>
+            ({currentProject.index}/{progressTotal})…
+          </p>
+        {:else if progressRows.length > 0}
+          <p class="ua-running-current">
+            Finishing up ({progressRows.length}/{progressTotal})…
+          </p>
+        {:else}
+          <p>Running bundle update for {progressTotal} project{progressTotal === 1 ? '' : 's'}…</p>
+        {/if}
         <p class="ua-hint">
-          This may take a minute. Each project runs in sequence; the modal will
-          update when all done.
+          This may take several minutes. Each project runs in sequence; the list
+          below fills in as each one completes.
         </p>
       </div>
+
+      {#if progressRows.length > 0}
+        <!-- Live per-project checklist (v0.2.73): fills in as `update_all_progress`
+             events arrive so the modal no longer looks hung. -->
+        <ul class="ua-rows ua-rows-live" aria-live="polite">
+          {#each progressRows as p (p.project_id)}
+            <li class="ua-row ua-row-{p.status}">
+              <span
+                class="ua-row-icon"
+                class:ua-row-icon-spin={p.status === 'running'}
+                aria-hidden="true">{progressIcon(p.status)}</span
+              >
+              <span class="ua-row-name">{p.project_name}</span>
+              <span class="ua-row-status">
+                {#if p.status === 'running'}updating…{:else}{p.status}{/if}
+              </span>
+            </li>
+          {/each}
+        </ul>
+      {/if}
     {/if}
 
     {#if phase === 'done'}
@@ -258,12 +352,33 @@
               <span class="ua-row-name">{r.project_name}</span>
               <span class="ua-row-status">{statusLabel(r.status)}</span>
               {#if r.error}
-                <div class="ua-row-error" title={r.error}>{r.error}</div>
+                <details class="ua-row-error-details">
+                  <summary class="ua-row-error-summary">
+                    <span class="ua-disclosure-caret" aria-hidden="true">▸</span>
+                    Failed — show error
+                  </summary>
+                  <pre class="ua-row-error-body">{r.error}</pre>
+                </details>
               {/if}
               {#if r.warnings.length > 0}
-                <div class="ua-row-warnings">
-                  {r.warnings.length} warning{r.warnings.length === 1 ? '' : 's'}
-                </div>
+                <details class="ua-row-warnings-details">
+                  <summary class="ua-row-warnings-summary">
+                    <span class="ua-disclosure-caret" aria-hidden="true">▸</span>
+                    {r.warnings.length} warning{r.warnings.length === 1 ? '' : 's'}
+                    — show details
+                  </summary>
+                  <ul class="ua-warnings-list">
+                    {#each r.warnings as w, i (i)}
+                      <li
+                        class="ua-warning-item"
+                        class:ua-warning-error={isErrorWarning(w)}
+                        class:ua-warning-info={!isErrorWarning(w)}
+                      >
+                        {w}
+                      </li>
+                    {/each}
+                  </ul>
+                </details>
               {/if}
               {#if stale.length > 0}
                 <!-- Gap A: a derived collection is stale with no data-preserving
@@ -451,24 +566,104 @@
     letter-spacing: 0.4px;
     color: var(--color-mid, #aaa);
   }
-  .ua-row-error {
+  /* Expandable error disclosure (v0.2.73): full error text on demand,
+     keyboard-accessible via native <details>/<summary>. */
+  .ua-row-error-details {
     grid-column: 2 / -1;
+    margin-top: 4px;
     font-size: 11px;
+  }
+  .ua-row-error-summary {
     color: var(--color-pink, #f99);
     background: rgba(255, 79, 160, 0.06);
     padding: 4px 6px;
     border-radius: 3px;
-    margin-top: 4px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    cursor: help;
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
   }
-  .ua-row-warnings {
-    grid-column: 2 / -1;
+  .ua-row-error-summary::-webkit-details-marker {
+    display: none;
+  }
+  .ua-row-error-body {
+    margin: 4px 0 0;
+    padding: 6px 8px;
     font-size: 11px;
-    color: #ffc800;
+    color: var(--color-pink, #f99);
+    background: rgba(255, 79, 160, 0.06);
+    border-radius: 3px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  /* Expandable warnings disclosure (v0.2.73): the actual warning strings,
+     info/error-tinted via `isErrorWarning` (mirrors warning-severity.ts). */
+  .ua-row-warnings-details {
+    grid-column: 2 / -1;
     margin-top: 4px;
+    font-size: 11px;
+  }
+  .ua-row-warnings-summary {
+    color: #ffc800;
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+  }
+  .ua-row-warnings-summary::-webkit-details-marker {
+    display: none;
+  }
+  .ua-disclosure-caret {
+    display: inline-block;
+    transition: transform 0.15s ease;
+    margin-right: 2px;
+    font-size: 9px;
+  }
+  details[open] > summary .ua-disclosure-caret {
+    transform: rotate(90deg);
+  }
+  .ua-warnings-list {
+    list-style: none;
+    margin: 4px 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .ua-warning-item {
+    padding: 4px 6px;
+    border-radius: 3px;
+    font-size: 11px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .ua-warning-error {
+    color: var(--color-pink, #f99);
+    background: rgba(255, 79, 160, 0.08);
+    border-left: 2px solid rgba(255, 79, 160, 0.5);
+  }
+  .ua-warning-info {
+    color: #ffc800;
+    background: rgba(255, 200, 0, 0.06);
+    border-left: 2px solid rgba(255, 200, 0, 0.4);
+  }
+
+  /* Live per-project checklist during phase==='running' (v0.2.73). */
+  .ua-rows-live {
+    margin-top: 12px;
+  }
+  .ua-running-current {
+    margin: 0;
+    font-size: 13px;
+  }
+  .ua-running-current strong {
+    color: rgb(0, 191, 166);
+  }
+  .ua-row-running .ua-row-icon {
+    color: rgb(0, 191, 166);
+    background: rgba(0, 191, 166, 0.12);
+  }
+  .ua-row-icon-spin {
+    animation: ua-spin 1s linear infinite;
   }
   /* Gap A: per-project "needs re-sync → Resolve" row. */
   .ua-row-resync {

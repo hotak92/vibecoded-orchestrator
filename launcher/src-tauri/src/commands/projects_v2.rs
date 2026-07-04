@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tauri::{command, AppHandle, Manager, State};
+use tauri::{command, AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 use crate::commands::codegraph;
@@ -2710,6 +2710,96 @@ pub struct UpdateAllReport {
     pub total_skipped: u32,
 }
 
+/// Tauri event name emitted by `update_all_projects` at each per-project
+/// boundary so the GUI can render live progress instead of a static
+/// spinner (v0.2.73, Update-all "looks hung for ~7 min" UX gap).
+///
+/// ── EVENT CONTRACT (must match the TS listener) ──────────────────────
+/// Event name: `"update_all_progress"`
+/// Payload:    `UpdateAllProgressEvent` (below), serialised camel-untouched
+///             (fields are already snake_case; serde default naming).
+///
+/// Two phases per project, emitted in order:
+///   1. `phase="started"`  — BEFORE `update_project_v2` runs for a project.
+///        Carries `project_id`, `project_name`, `index` (1-based),
+///        `total`. `status`/`warnings_count` are null on a "started" event.
+///   2. `phase="finished"` — AFTER the project resolved. Adds
+///        `status` ("succeeded" | "failed" | "skipped") and
+///        `warnings_count`. `project_name`/`index`/`total` still present.
+///
+/// For a `stop_on_error` skip, only a single `phase="finished"` event with
+/// `status="skipped"` is emitted (there is no work to "start"). The GUI
+/// treats an unseen `started` gracefully — it keys rows by `project_id`.
+///
+/// Emission is BEST-EFFORT: `app.emit(...)` errors are swallowed and never
+/// abort the update loop (mirrors `kg_sync::emit_sync`). The authoritative
+/// result is still the returned `UpdateAllReport`; these events are purely
+/// additive for progress UX. TS mirror lives in
+/// `launcher/src/lib/components/UpdateAllProjectsModal.svelte`
+/// (`UpdateAllProgress` type + `listen('update_all_progress', ...)`).
+pub const UPDATE_ALL_PROGRESS_EVENT: &str = "update_all_progress";
+
+/// Payload for the [`UPDATE_ALL_PROGRESS_EVENT`] Tauri event. Additive,
+/// backward-compatible: does NOT change the returned `UpdateAllReport`.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct UpdateAllProgressEvent {
+    /// "started" (before a project's update) | "finished" (after).
+    pub phase: String,
+    pub project_id: String,
+    pub project_name: String,
+    /// 1-based position of this project in the batch.
+    pub index: u32,
+    /// Total number of projects in the batch.
+    pub total: u32,
+    /// Only on `phase="finished"`: "succeeded" | "failed" | "skipped".
+    /// None on `phase="started"`.
+    pub status: Option<String>,
+    /// Only on `phase="finished"`: how many soft-fail warnings the project
+    /// produced. None on `phase="started"`.
+    pub warnings_count: Option<u32>,
+}
+
+/// Build the `phase="started"` progress payload for a project. Pure — no
+/// I/O, no emit — so the event contract is unit-testable without a Tauri
+/// runtime.
+fn build_progress_started(
+    project_id: &str,
+    project_name: &str,
+    index: u32,
+    total: u32,
+) -> UpdateAllProgressEvent {
+    UpdateAllProgressEvent {
+        phase: "started".to_string(),
+        project_id: project_id.to_string(),
+        project_name: project_name.to_string(),
+        index,
+        total,
+        status: None,
+        warnings_count: None,
+    }
+}
+
+/// Build the `phase="finished"` progress payload for a project. Pure —
+/// see [`build_progress_started`].
+fn build_progress_finished(
+    project_id: &str,
+    project_name: &str,
+    index: u32,
+    total: u32,
+    status: &str,
+    warnings_count: u32,
+) -> UpdateAllProgressEvent {
+    UpdateAllProgressEvent {
+        phase: "finished".to_string(),
+        project_id: project_id.to_string(),
+        project_name: project_name.to_string(),
+        index,
+        total,
+        status: Some(status.to_string()),
+        warnings_count: Some(warnings_count),
+    }
+}
+
 /// Iterate every registered project sequentially and run the same
 /// per-project update flow as `update_project_v2`. See the doc on the
 /// ─── 0.2.x backlog #4 ─── header for the design rationale (sequential,
@@ -2738,8 +2828,22 @@ pub async fn update_all_projects(
     let mut total_skipped: u32 = 0;
     let mut stop = false;
 
-    for row in &projects {
+    // 1-based position + batch size for the live-progress events. `total`
+    // is the count the GUI shows as "(i/N)". Cast is safe: project counts
+    // are small; a saturating cast keeps us correct even in the absurd
+    // >u32::MAX case rather than wrapping.
+    let total: u32 = projects.len().min(u32::MAX as usize) as u32;
+
+    for (idx, row) in projects.iter().enumerate() {
+        let index: u32 = (idx as u64).min(u32::MAX as u64) as u32 + 1;
+
         if stop {
+            // Skipped projects have no work to "start" — emit only a
+            // finished/skipped event so the GUI can grey the row out.
+            let _ = app.emit(
+                UPDATE_ALL_PROGRESS_EVENT,
+                build_progress_finished(&row.id, &row.name, index, total, "skipped", 0),
+            );
             entries.push(UpdateAllProjectEntry {
                 project_id: row.id.clone(),
                 project_name: row.name.clone(),
@@ -2751,12 +2855,29 @@ pub async fn update_all_projects(
             total_skipped += 1;
             continue;
         }
+
+        // Announce this project is starting BEFORE the (potentially
+        // multi-minute) `update_project_v2` call so the modal can show
+        // "Updating <name> (i/N)…" live. Best-effort: an emit error must
+        // never abort the loop (mirrors `kg_sync::emit_sync`).
+        let _ = app.emit(
+            UPDATE_ALL_PROGRESS_EVENT,
+            build_progress_started(&row.id, &row.name, index, total),
+        );
+
         // Use the same internal pipeline as `update_project_v2`. Going
         // through the public command would require Tauri State plumbing
         // we already have; we just call it directly.
         let result = update_project_v2(row.id.clone(), app.clone(), db.clone()).await;
         match result {
             Ok(r) => {
+                let warnings_count = r.warnings.len().min(u32::MAX as usize) as u32;
+                let _ = app.emit(
+                    UPDATE_ALL_PROGRESS_EVENT,
+                    build_progress_finished(
+                        &row.id, &row.name, index, total, "succeeded", warnings_count,
+                    ),
+                );
                 entries.push(UpdateAllProjectEntry {
                     project_id: row.id.clone(),
                     project_name: row.name.clone(),
@@ -2768,6 +2889,10 @@ pub async fn update_all_projects(
                 total_succeeded += 1;
             }
             Err(e) => {
+                let _ = app.emit(
+                    UPDATE_ALL_PROGRESS_EVENT,
+                    build_progress_finished(&row.id, &row.name, index, total, "failed", 0),
+                );
                 entries.push(UpdateAllProjectEntry {
                     project_id: row.id.clone(),
                     project_name: row.name.clone(),
@@ -11523,6 +11648,59 @@ export BY_HAND_KEY=\"user_typed\"
         // field set) deserialises to stop_on_error=true.
         let parsed: UpdateAllOptions = serde_json::from_str("{}").unwrap();
         assert!(parsed.stop_on_error);
+    }
+
+    /// v0.2.73 Update-all live-progress: the pure payload builders produce
+    /// the exact event contract the TS listener depends on. The event is
+    /// ADDITIVE — it never changes the returned `UpdateAllReport` (the
+    /// three async tests above already pin the report shape / counts, and
+    /// still pass unchanged with the emits inserted). Here we pin the
+    /// payload contract so the Rust doc-comment + TS `UpdateAllProgress`
+    /// type can't silently drift.
+    #[test]
+    fn update_all_progress_started_payload_shape() {
+        let ev = build_progress_started("proj-a", "Project Alpha", 2, 5);
+        assert_eq!(ev.phase, "started");
+        assert_eq!(ev.project_id, "proj-a");
+        assert_eq!(ev.project_name, "Project Alpha");
+        assert_eq!(ev.index, 2);
+        assert_eq!(ev.total, 5);
+        // "started" carries no outcome yet.
+        assert!(ev.status.is_none());
+        assert!(ev.warnings_count.is_none());
+        // Serialised JSON keeps snake_case field names the TS side reads.
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["phase"], "started");
+        assert_eq!(json["project_id"], "proj-a");
+        assert_eq!(json["index"], 2);
+        assert_eq!(json["total"], 5);
+        assert!(json["status"].is_null());
+        assert!(json["warnings_count"].is_null());
+    }
+
+    #[test]
+    fn update_all_progress_finished_payload_shape() {
+        let ev = build_progress_finished("proj-b", "Project Beta", 3, 5, "succeeded", 2);
+        assert_eq!(ev.phase, "finished");
+        assert_eq!(ev.project_id, "proj-b");
+        assert_eq!(ev.index, 3);
+        assert_eq!(ev.total, 5);
+        assert_eq!(ev.status.as_deref(), Some("succeeded"));
+        assert_eq!(ev.warnings_count, Some(2));
+
+        // A skipped project reports zero warnings and status="skipped".
+        let skipped = build_progress_finished("proj-c", "Project Gamma", 4, 5, "skipped", 0);
+        assert_eq!(skipped.status.as_deref(), Some("skipped"));
+        assert_eq!(skipped.warnings_count, Some(0));
+
+        // A failed project reports zero warnings and status="failed".
+        let failed = build_progress_finished("proj-d", "Project Delta", 5, 5, "failed", 0);
+        assert_eq!(failed.status.as_deref(), Some("failed"));
+
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["phase"], "finished");
+        assert_eq!(json["status"], "succeeded");
+        assert_eq!(json["warnings_count"], 2);
     }
 
     /// Helper: drive the same iteration as the `update_all_projects` Tauri
