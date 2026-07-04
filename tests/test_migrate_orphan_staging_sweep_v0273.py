@@ -121,11 +121,17 @@ class TestCodegraphOrphanStagingSweep(unittest.TestCase):
 
     def _run(self, all_classes, env, counts):
         """Drive migrate_collections with the code-graph orphan-staging arm
-        active. ``counts`` maps class-name → object count for _count_objects."""
+        active. ``counts`` maps class-name → object count for _count_objects.
+
+        The current project's code-graph prefix defaults to ``Proj`` (via
+        ``CODE_GRAPH_PROJECT``) so the cross-project SAFE-DROP gate treats
+        ``Proj_Code*`` staging as OWNED. Pass ``CODE_GRAPH_PROJECT`` in ``env``
+        to override (e.g. to exercise the foreign-project retain path)."""
         def _fake_count(name, weaviate_url=None):
             return counts.get(name, 0)
 
-        with mock.patch.dict("os.environ", env, clear=False), \
+        _env = {"CODE_GRAPH_PROJECT": "Proj", **env}  # caller can override
+        with mock.patch.dict("os.environ", _env, clear=False), \
              mock.patch.object(project_init, "_list_classes", return_value=all_classes), \
              mock.patch.object(
                  project_init, "_recover_or_drop_orphan_staging",
@@ -212,6 +218,67 @@ class TestCodegraphOrphanStagingSweep(unittest.TestCase):
             dropped, set(orphans),
             f"all five code-graph staging orphans must be safe-dropped; got {dropped}",
         )
+
+    def test_never_drops_a_different_projects_staging(self):
+        """CROSS-PROJECT SAFETY: a code-graph staging whose base belongs to a
+        DIFFERENT project (not under THIS project's code-graph prefix) is NEVER
+        auto-dropped, even when its base is intact and larger — that other
+        project may have a rebuild in flight. It is only SURFACED for the other
+        project's own migrate run to reconcile."""
+        suffix = project_init._STAGING_SUFFIX
+        # We are project 'Proj'; the orphan belongs to 'OtherProj'.
+        env = {"KG_COLLECTION": "Proj_KnowledgeGraph", "CODE_GRAPH_PROJECT": "Proj"}
+        foreign_base = "OtherProj_CodeFunction"
+        foreign_orphan = foreign_base + suffix
+        own_base = "Proj_CodeClass"
+        own_orphan = own_base + suffix
+        all_classes = [
+            "Proj_KnowledgeGraph",
+            foreign_base, foreign_orphan,
+            own_base, own_orphan,
+        ]
+        # Both have base intact and >= staging (the safe-drop count condition).
+        counts = {foreign_base: 100, foreign_orphan: 50,
+                  own_base: 100, own_orphan: 50}
+        result, del_mock = self._run(all_classes, env, counts)
+        dropped = {c.args[0] for c in del_mock.call_args_list}
+        # OUR staging is dropped; the FOREIGN one is NOT.
+        self.assertIn(own_orphan, dropped, "own project's orphan should safe-drop")
+        self.assertNotIn(
+            foreign_orphan, dropped,
+            "another project's code-graph staging must NEVER be auto-dropped",
+        )
+        # The foreign one is surfaced (retained) with the cross-project reason.
+        foreign_surfaced = [
+            e for e in result["errors"]
+            if foreign_orphan in e.get("error", "")
+        ]
+        self.assertTrue(foreign_surfaced, "foreign orphan must be surfaced")
+        self.assertNotEqual(foreign_surfaced[0].get("resolved"), True)
+        self.assertIn("DIFFERENT project", foreign_surfaced[0]["error"])
+
+    def test_unresolvable_prefix_never_drops(self):
+        """When neither CODE_GRAPH_PROJECT nor PROJECT_NAME nor args.name
+        resolves a prefix, ownership can't be proven → NEVER auto-drop, even a
+        count-safe orphan (surface only). Guards the hermetic-unit-test path
+        that historically reached a live DELETE."""
+        suffix = project_init._STAGING_SUFFIX
+        base = "Proj_CodeFunction"
+        orphan = base + suffix
+        all_classes = ["Proj_KnowledgeGraph", base, orphan]
+        counts = {base: 100, orphan: 50}
+        # Explicitly BLANK the prefix env (override the _run default) and use a
+        # nameless args so nothing resolves a prefix.
+        result, del_mock = self._run(
+            all_classes,
+            {"KG_COLLECTION": "Proj_KnowledgeGraph", "CODE_GRAPH_PROJECT": "",
+             "PROJECT_NAME": ""},
+            counts,
+        )
+        del_mock.assert_not_called()
+        surfaced = [e for e in result["errors"] if orphan in e.get("error", "")]
+        self.assertTrue(surfaced, "un-ownable orphan must surface, not drop")
+        self.assertNotEqual(surfaced[0].get("resolved"), True)
 
 
 if __name__ == "__main__":

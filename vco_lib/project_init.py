@@ -1853,17 +1853,51 @@ def migrate_collections(
         # ``_recover_or_drop_orphan_staging`` WITHOUT a KG target schema
         # (code-graph staging must NOT be recovered via the KG schema path —
         # only safe-dropped when provably redundant, or retained).
+        #
+        # CROSS-PROJECT SAFETY (v0.2.73): ``_list_classes`` is INSTANCE-WIDE, so
+        # this sweep sees EVERY project's code-graph staging on the shared
+        # Weaviate. Auto-dropping another project's ``*_Code*__staging`` would
+        # be exactly the cross-tenant data-loss the legacy-KG detector was
+        # hardened against — that project may have a rebuild IN FLIGHT (its
+        # base momentarily >= staging) whose staging we'd delete out from under
+        # it. So the SAFE-DROP is gated to THIS project's own code-graph prefix;
+        # any code-graph staging belonging to a DIFFERENT project is only
+        # SURFACED (retained) for that project's own migrate run to reconcile.
+        #
+        # Resolve the current project's code-graph prefix the SAME canonical way
+        # the analyzer / schema_migration_runner do: env ``CODE_GRAPH_PROJECT``
+        # (already the sanitized prefix) → ``PROJECT_NAME`` (derived) → the CLI
+        # ``args.name`` fallback. Env-first matters because install/post-bundle
+        # runs carry the identity in env, not ``args.name``; the CLI
+        # ``migrate --name`` path carries it in args. Empty (unresolvable) →
+        # ownership can't be proven → NEVER auto-drop (surface only).
+        _self_cg_prefix = (os.environ.get("CODE_GRAPH_PROJECT") or "").strip()
+        if not _self_cg_prefix:
+            _pn = (os.environ.get("PROJECT_NAME") or "").strip()
+            if _pn:
+                _self_cg_prefix = derive_project_code_prefix(_pn)
+        if not _self_cg_prefix:
+            _self_cg_prefix = _resolve_codegraph_prefix_for_plan(args)
         for _cg_orphan in _codegraph_orphan_staging:
             _cg_base = _cg_orphan[: -len(_STAGING_SUFFIX)]
             _cg_base_exists = _cg_base in _all_classes
+            # Is this staging OURS? Its base must start with this project's
+            # code-graph prefix (e.g. ``MyProj_CodeFunction`` for prefix
+            # ``MyProj``). Empty prefix (no --name / unresolvable) → we can't
+            # prove ownership, so we NEVER auto-drop (surface only).
+            _cg_is_ours = bool(_self_cg_prefix) and (
+                _cg_base == _self_cg_prefix
+                or _cg_base.startswith(_self_cg_prefix + "_")
+            )
             _staging_count = _count_objects(_cg_orphan, weaviate_url=weaviate_url)
             _base_count = (
                 _count_objects(_cg_base, weaviate_url=weaviate_url)
                 if _cg_base_exists else 0
             )
-            if _cg_base_exists and _base_count >= _staging_count:
-                # SAFE-DROP: base is intact and at least as complete; the
-                # staging is a pure orphan from a crashed/mismatched rebuild.
+            if _cg_is_ours and _cg_base_exists and _base_count >= _staging_count:
+                # SAFE-DROP: OUR project's staging, base intact and at least as
+                # complete → the staging is a pure orphan from a crashed/
+                # mismatched rebuild of THIS project's code graph.
                 _delete_class(_cg_orphan, weaviate_url=weaviate_url)
                 _log(
                     "7b.recover", "info",
@@ -1892,22 +1926,41 @@ def migrate_collections(
                     "action_taken": "safe_dropped",
                 })
             else:
-                # RETAIN + SURFACE: base MISSING, or base has FEWER objects
-                # than staging — the staging might be the fuller/only copy of
-                # this rebuild's output. Never blind-drop.
+                # RETAIN + SURFACE. Three distinct reasons, all conservative:
+                #  (a) NOT OURS — the staging belongs to a different project's
+                #      code-graph prefix (or ownership is unprovable): never
+                #      touch another tenant's staging; its own migrate run will
+                #      reconcile it.
+                #  (b) base MISSING — staging may be the only surviving copy.
+                #  (c) base SMALLER — staging may be the fuller copy.
+                if not _cg_is_ours:
+                    _reason = (
+                        f"belongs to a DIFFERENT project "
+                        f"(base {_cg_base!r} is not under this project's "
+                        f"code-graph prefix {_self_cg_prefix or '<unresolved>'!r})"
+                    )
+                    _branch = "codegraph_foreign_surface"
+                elif not _cg_base_exists:
+                    _reason = "base MISSING (staging may be the only surviving copy)"
+                    _branch = "codegraph_retain_surface"
+                else:
+                    _reason = (
+                        f"base present but SMALLER ({_base_count} objs < "
+                        f"staging {_staging_count})"
+                    )
+                    _branch = "codegraph_retain_surface"
                 _log(
                     "7b.recover", "warn",
-                    f"code-graph orphan staging {_cg_orphan} RETAINED: base "
-                    f"{_cg_base!r} "
-                    f"{'MISSING' if not _cg_base_exists else f'has FEWER objects ({_base_count} < {_staging_count})'}"
-                    f" — staging may be the fuller/only copy; not auto-dropped",
+                    f"code-graph orphan staging {_cg_orphan} RETAINED: {_reason}"
+                    f" — not auto-dropped",
                     data={
                         "staging": _cg_orphan,
                         "base": _cg_base,
                         "base_present": _cg_base_exists,
                         "base_count": _base_count,
                         "staging_count": _staging_count,
-                        "branch": "codegraph_retain_surface",
+                        "is_ours": _cg_is_ours,
+                        "branch": _branch,
                     },
                 )
                 result["errors"].append({
@@ -1915,15 +1968,8 @@ def migrate_collections(
                     "action": "recover",
                     "error": (
                         f"code-graph orphan staging {_cg_orphan} RETAINED for "
-                        f"human review. Base collection {_cg_base!r} is "
-                        + (
-                            "MISSING (staging may be the only surviving copy)"
-                            if not _cg_base_exists
-                            else f"present but SMALLER ({_base_count} objs < "
-                                 f"staging {_staging_count})"
-                        )
-                        + ". Not auto-dropped — inspect and, if safe, drop "
-                        "manually via the launcher."
+                        f"human review: {_reason}. Not auto-dropped — inspect "
+                        f"and, if safe, drop manually via the launcher."
                     ),
                 })
     except Exception as e:
