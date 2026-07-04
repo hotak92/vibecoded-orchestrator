@@ -87,8 +87,11 @@ DEVELOPMENT_COLLECTION_SCHEMA_VERSION = 2
 #: ``.claude/state/**`` transient-scratch rows (tool_backups snapshots) that the
 #: pre-fix walk wrongly indexed (live-measured 43% of a real CodeFunction
 #: collection → multi-TB mmap READ storm). ``migrations/codegraph_collection/
-#: 6_to_7.py`` ``delete_many``s ONLY those rows — NO drop, NO re-embed, NO
-#: re-summarize (survivors' vectors + summaries untouched). The code fix
+#: 6_to_7.py`` iterates + matches ``.claude/state/`` as an EXACT PYTHON
+#: SUBSTRING and ``delete_by_id``s ONLY those rows (NEVER a Weaviate ``Like`` on
+#: the word-tokenized ``file_path`` — that would delete real functions) — NO
+#: drop, NO re-embed, NO re-summarize (survivors' vectors + summaries
+#: untouched). The code fix
 #: (``analyze_code_graph._path_is_excluded`` + per-root ``.claude`` gate) stops
 #: NEW rows; this edge removes the already-indexed garbage on update,
 #: algorithmically. Idempotent (re-run purges zero); disk reclaim is the

@@ -297,9 +297,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fields that had zero readers anywhere in the product; the whole path
   (the analyzer extractor and its schema fields, the `--cfg`/`--pdg` flags,
   the installer's Joern detection/prompt/auto-install, and the
-  `VCT_JOERN_AVAILABLE` plumbing) is gone. No user-facing capability is
-  lost — the code graph never surfaced those metrics — and the install
-  flow no longer probes for or offers to download a ~600 MB JVM tool.
+  `VCT_JOERN_AVAILABLE` plumbing) is gone, including the `--no-joern` /
+  `--with-joern` installer flags (and the launcher no longer forwards
+  `--no-joern` to the installer — the installer's strict argument parser would
+  otherwise reject the now-unknown flag and abort). The database `joern_used`
+  column is retained (always false) to avoid a schema migration; it is dead but
+  harmless. No user-facing capability is lost — the code graph never surfaced
+  those metrics — and the install flow no longer probes for or offers to
+  download a ~600 MB JVM tool.
 
 
 ## [0.2.72] - 2026-07-02
