@@ -254,20 +254,40 @@ _drain_index_dot_claude() {
     fi
 }
 
-# Stale-lock breaker (v0.2.73 I/O-audit HIGH-1): the per-root lock below is a
-# lock-DIR released only inside the detached analyzer's `_snip` (rm -rf "$_lock").
-# If that detached process dies before the release — SIGKILL, OOM, ENOSPC
-# (the exact disk-full condition this whole effort targets), or a reboot — the
-# lock dir LEAKS and the `mkdir` acquire below fails forever, so that root's
-# code graph would freeze silently and never drain again. Break locks older
-# than the max plausible analyzer runtime so a dead drain self-heals on the next
-# turn. 30 min is well past a normal per-turn batch; a lock older than that
-# means the holder is gone, not slow. `find -mmin +30` on the lock DIR's mtime
-# (set at mkdir); soft-fail if `find` is absent (rare).
-if command -v find >/dev/null 2>&1; then
-    find "$STATE_DIR" -maxdepth 1 -type d -name 'codegraph_drain_root_*.lock' \
-        -mmin +30 -exec rm -rf {} + 2>/dev/null || true
-fi
+# Stale-lock breaker (v0.2.73 I/O-audit HIGH-1; PID-based per Stage-1 SEV-2 #3).
+# The per-root lock below is a lock-DIR released only inside the detached
+# analyzer's `_snip` (rm -rf "$_lock"). If that detached process dies before the
+# release — SIGKILL, OOM, ENOSPC (the exact disk-full condition this effort
+# targets), or a reboot — the lock LEAKS and the `mkdir` acquire fails forever,
+# freezing that root's code graph silently.
+# LIVENESS, not time: the `_snip` writes its PID into the lock dir BEFORE the
+# run. A first full pass on a slow embedder can legitimately exceed 30 min, so a
+# pure mtime breaker would delete a LIVE lock and launch a SECOND concurrent
+# analyzer on the same collection (the exact write-amplification FIX-B kills).
+# So: break a lock ONLY when its recorded PID is no longer alive (`kill -0`
+# fails). Fall back to the 30-min mtime bound ONLY when the PID file is absent
+# (a lock from an older drain that predates this PID-stamping, or a partial
+# acquire). Soft-fail throughout.
+for _stale in "$STATE_DIR"/codegraph_drain_root_*.lock; do
+    [ -d "$_stale" ] || continue
+    _stale_pid=""
+    [ -f "$_stale/pid" ] && _stale_pid="$(cat "$_stale/pid" 2>/dev/null)"
+    case "$_stale_pid" in
+        ''|*[!0-9]*)
+            # No/invalid PID → fall back to the mtime bound (>30 min ⇒ break).
+            if command -v find >/dev/null 2>&1; then
+                find "$_stale" -maxdepth 0 -mmin +30 -exec rm -rf {} + 2>/dev/null || true
+            fi
+            ;;
+        *)
+            # Recorded PID: break ONLY if it is no longer alive. A live long run
+            # (kill -0 succeeds) keeps its lock regardless of age.
+            if ! kill -0 "$_stale_pid" 2>/dev/null; then
+                rm -rf "$_stale" 2>/dev/null || true
+            fi
+            ;;
+    esac
+done
 
 # Run one analyzer batch per canonical root, serialized per-root.
 for _pf in "$BATCH_DIR"/*.paths; do
@@ -293,7 +313,12 @@ for _pf in "$BATCH_DIR"/*.paths; do
 
     # Detached background run: hold the per-root lock for the WHOLE analyzer
     # run so a later drain for the same root serializes behind it, then release.
-    _snip="\"$ANALYZER_PY\" \"$ANALYZER\" \"$_canon\" --project \"$_project\" --only-files-from \"$_list\" --canonical-source \"$_canon\" $_dot_flag >/dev/null 2>&1; rm -f \"$_list\" 2>/dev/null; rm -rf \"$_lock\" 2>/dev/null"
+    # Write the detached shell's PID into the lock dir FIRST (`$$` inside the
+    # `sh -c` subshell) so the stale-lock breaker (above) can tell a LIVE long
+    # run from a DEAD holder via `kill -0` — a slow-but-healthy full pass keeps
+    # its lock past 30 min instead of being broken into a 2nd concurrent run
+    # (Stage-1 SEV-2 #3).
+    _snip="printf '%s' \"\$\$\" > \"$_lock/pid\" 2>/dev/null; \"$ANALYZER_PY\" \"$ANALYZER\" \"$_canon\" --project \"$_project\" --only-files-from \"$_list\" --canonical-source \"$_canon\" $_dot_flag >/dev/null 2>&1; rm -f \"$_list\" 2>/dev/null; rm -rf \"$_lock\" 2>/dev/null"
     if command -v setsid >/dev/null 2>&1; then
         setsid sh -c "$_snip" >/dev/null 2>&1 < /dev/null &
     elif command -v nohup >/dev/null 2>&1; then

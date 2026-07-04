@@ -241,8 +241,16 @@ impl Db {
         max_rows: Option<i64>,
         project_id: Option<&str>,
     ) -> Result<u64, String> {
-        // Empty-bounds no-op guard: never delete-all on absent bounds.
-        if cutoff_ms.is_none() && max_rows.is_none() {
+        // Empty/degenerate-bounds no-op guard: never delete-all. A row-cap of
+        // Some(0) (or negative) is NOT a valid keep-zero-delete-all request —
+        // `LIMIT 0` yields an empty keep-set so `id NOT IN ()` would wipe the
+        // ENTIRE corpus (the invariant the doc above forbids). `_DEFAULT_MAX_ROWS
+        // = 0` on the Python driver means "row-cap disabled"; the driver coerces
+        // 0 -> None, but this method is the deletion AUTHORITY and must not
+        // depend on a caller's coercion (a manual curl / rl-doctor / future
+        // driver edit could pass 0). Treat max_rows <= 0 as "no row-cap bound".
+        let rowcap_active = matches!(max_rows, Some(n) if n > 0);
+        if cutoff_ms.is_none() && !rowcap_active {
             return Ok(0);
         }
 
@@ -271,7 +279,10 @@ impl Db {
 
         // Row-cap bound: keep only the newest `max_rows` rows (by ts DESC,
         // id DESC as tiebreak), delete the rest — within project scope.
-        if let Some(keep) = max_rows {
+        // Defense-in-depth (matches the guard above): keep <= 0 is NOT a
+        // keep-zero-delete-all — a LIMIT 0 keep-set would wipe the corpus. Only
+        // a positive keep is a real row-cap; 0/negative = "row-cap disabled".
+        if let Some(keep) = max_rows.filter(|&k| k > 0) {
             let n = if let Some(pid) = project_id {
                 guard
                     .execute(
@@ -557,6 +568,35 @@ mod tests {
         assert_eq!(deleted, 0);
         let rows = db.list_rl_events(None, None, None, None, 100).unwrap();
         assert_eq!(rows.len(), 4, "no-op prune must leave all rows intact");
+    }
+
+    #[test]
+    fn prune_max_rows_zero_is_noop_not_corpus_wipe() {
+        // v0.2.73 Stage-1 correctness SEV-2 #1: max_rows=Some(0) must be a NO-OP,
+        // NOT a "keep zero, delete all". LIMIT 0 -> empty keep-set -> id NOT IN ()
+        // would wipe the ENTIRE corpus. _DEFAULT_MAX_ROWS=0 ("disabled") makes 0
+        // a live expected value; the deletion authority must not delete-all on it.
+        let db = fresh_db();
+        for i in 0..5 {
+            insert_at(&db, 2_000 + i, None, &format!("z-{}", i));
+        }
+        let deleted = db.prune_rl_events(None, Some(0), None).unwrap();
+        assert_eq!(deleted, 0, "max_rows=0 must delete NOTHING (row-cap disabled)");
+        let rows = db.list_rl_events(None, None, None, None, 100).unwrap();
+        assert_eq!(rows.len(), 5, "max_rows=0 must leave the whole corpus intact");
+    }
+
+    #[test]
+    fn prune_max_rows_negative_is_noop() {
+        // Same guard, negative row-cap: never delete-all.
+        let db = fresh_db();
+        for i in 0..3 {
+            insert_at(&db, 3_000 + i, None, &format!("n-{}", i));
+        }
+        let deleted = db.prune_rl_events(None, Some(-1), None).unwrap();
+        assert_eq!(deleted, 0);
+        let rows = db.list_rl_events(None, None, None, None, 100).unwrap();
+        assert_eq!(rows.len(), 3);
     }
 
     #[test]

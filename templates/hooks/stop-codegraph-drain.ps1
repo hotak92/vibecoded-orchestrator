@@ -184,16 +184,35 @@ if ($byRoot.Count -eq 0) {
     exit 0
 }
 
-# Stale-lock breaker (v0.2.73 I/O-audit HIGH-1 -- must match stop-codegraph-drain.sh):
-# the per-root lock dir below is released only inside the detached analyzer's
-# cleanup. If that process dies before release (kill, OOM, out-of-disk -- the exact
-# condition this effort targets, or a reboot) the lock leaks and that root's code
-# graph freezes silently forever. Break locks older than the max plausible analyzer
-# runtime (30 min) so a dead drain self-heals on the next turn.
+# Stale-lock breaker (v0.2.73 I/O-audit HIGH-1; PID-based per Stage-1 SEV-2 #3 --
+# must match stop-codegraph-drain.sh): the per-root lock dir below is released
+# only inside the detached analyzer's cleanup. If that process dies before release
+# (kill, OOM, out-of-disk -- the exact condition this effort targets, or a reboot)
+# the lock leaks and that root's code graph freezes silently forever.
+# LIVENESS, not time: the detached run writes its PID into the lock dir FIRST. A
+# slow-but-healthy full pass can exceed 30 min, so a pure-mtime breaker would
+# delete a LIVE lock and launch a 2nd concurrent analyzer on the same collection
+# (the write-amplification FIX-B kills). Break a lock ONLY when its recorded PID
+# is dead (Get-Process fails); fall back to the 30-min mtime bound ONLY when the
+# PID file is absent (a lock predating this PID-stamping / a partial acquire).
 try {
     Get-ChildItem -LiteralPath $stateDir -Directory -Filter 'codegraph_drain_root_*.lock' -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTime -lt (Get-Date).AddMinutes(-30) } |
-        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+        ForEach-Object {
+            $pidFile = Join-Path $_.FullName 'pid'
+            $stalePid = $null
+            if (Test-Path -LiteralPath $pidFile) {
+                try { $stalePid = (Get-Content -LiteralPath $pidFile -Raw -ErrorAction Stop).Trim() } catch { $stalePid = $null }
+            }
+            if ($stalePid -match '^\d+$') {
+                # Recorded PID: break ONLY if that process is no longer alive.
+                $alive = $null
+                try { $alive = Get-Process -Id ([int]$stalePid) -ErrorAction Stop } catch { $alive = $null }
+                if (-not $alive) { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+            } elseif ($_.LastWriteTime -lt (Get-Date).AddMinutes(-30)) {
+                # No/invalid PID -> mtime fallback (>30 min => break).
+                Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
 } catch {}
 
 foreach ($h in @($byRoot.Keys)) {
@@ -218,7 +237,10 @@ foreach ($h in @($byRoot.Keys)) {
     # run, then releasing it + the list file.
     $argList = @($analyzer, $canon, '--project', $project, '--only-files-from', $listFile, '--canonical-source', $canon, $dotFlag)
     $cleanup = "try { Remove-Item -LiteralPath '$listFile' -ErrorAction SilentlyContinue } catch {}; try { Remove-Item -LiteralPath '$lock' -Recurse -Force -ErrorAction SilentlyContinue } catch {}"
-    $inner = "& '$python' " + (($argList | ForEach-Object { "'" + ($_ -replace "'","''") + "'" }) -join ' ') + " *> `$null; $cleanup"
+    # Write the detached run's own PID into the lock dir FIRST so the PID-based
+    # stale-lock breaker can tell a live long run from a dead holder (SEV-2 #3).
+    $pidStamp = "try { Set-Content -LiteralPath '$lock/pid' -Value `$PID -ErrorAction SilentlyContinue } catch {}; "
+    $inner = $pidStamp + "& '$python' " + (($argList | ForEach-Object { "'" + ($_ -replace "'","''") + "'" }) -join ' ') + " *> `$null; $cleanup"
     Start-Process -FilePath $PsExe -ArgumentList @('-NoProfile','-Command',$inner) -WindowStyle Hidden | Out-Null
 }
 
