@@ -29,21 +29,23 @@ if str(REPO_ROOT) not in sys.path:
 def describe_excalidraw():
     """Import the tool lazily — the MCP module pulls in weaviate / mcp
     at import time which is heavy. Skip the whole file if those aren't
-    importable on this host (CI without the MCP venv)."""
+    importable on this host (CI without the MCP venv).
+
+    v0.2.73 (M-1): import server as the PACKAGE module ``weaviate_mcp.server``,
+    NOT via ``spec_from_file_location`` on the bare file. The monolith split
+    added relative imports (``from .rl_enrichment import …`` /
+    ``from .embeddings import …``) to server.py, which raise "attempted
+    relative import with no known parent package" when the file is loaded under
+    a package-less synthetic module name. A proper package import resolves the
+    siblings correctly (and matches how the module is loaded in production)."""
     try:
-        import importlib.util
-        path = (
-            REPO_ROOT
-            / "claude_mcp_servers"
-            / "weaviate_mcp"
-            / "server.py"
-        )
-        sys.path.insert(0, str(path.parent))
-        spec = importlib.util.spec_from_file_location("weaviate_mcp_server", path)
-        if spec is None or spec.loader is None:
-            pytest.fail("weaviate_mcp/server.py file missing or unloadable — CI env regression (shipped module must be present)")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
+        import importlib
+        # ``claude_mcp_servers`` must be on sys.path so ``weaviate_mcp`` is a
+        # resolvable package (the extracted sibling modules import relatively).
+        pkg_parent = REPO_ROOT / "claude_mcp_servers"
+        if str(pkg_parent) not in sys.path:
+            sys.path.insert(0, str(pkg_parent))
+        module = importlib.import_module("weaviate_mcp.server")
     except Exception as exc:
         pytest.fail(f"weaviate_mcp.server import failed — CI env regression (shipped module must be importable): {exc}")
     fn = getattr(module, "describe_excalidraw", None)

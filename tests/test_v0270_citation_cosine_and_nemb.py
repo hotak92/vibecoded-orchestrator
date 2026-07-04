@@ -445,9 +445,11 @@ class TestEnsureSlotEmbedding:
             assert vec == [0.5, 0.6, 0.7]
             # A store-back task was scheduled (strong-ref'd so GC can't drop it).
             assert len(_store_back_tasks) >= 1
-            # Let the fire-and-forget store run.
-            await asyncio.sleep(0)
-            await asyncio.sleep(0)
+            # Deterministically drain the fire-and-forget store task(s) rather
+            # than guessing sleep(0) turns (flaky under different scheduling).
+            while _store_back_tasks:
+                await asyncio.gather(*list(_store_back_tasks),
+                                     return_exceptions=True)
             assert coll.updated == [("uuid-1", {"qwen3_embed": [0.5, 0.6, 0.7]})]
 
         asyncio.run(_inner())
@@ -480,6 +482,14 @@ class TestEnsureSlotEmbedding:
             def data(self):
                 return _Coll._Data(self)
 
+        async def _drain():
+            # Deterministically await every scheduled fire-and-forget store-back
+            # task (create_task + to_thread) rather than guessing sleep(0) turns
+            # — the latter is flaky under different scheduler/GC timing.
+            while er._store_back_tasks:
+                await asyncio.gather(*list(er._store_back_tasks),
+                                     return_exceptions=True)
+
         async def _inner():
             er._stored_slots.clear()  # isolate from other tests
             coll = _Coll()
@@ -488,15 +498,13 @@ class TestEnsureSlotEmbedding:
                 "uuid-dedup", "content", "qwen3_embed",
                 "qwen3-embedding:0.6b", coll, _Svc(),
             )
-            await asyncio.sleep(0)
-            await asyncio.sleep(0)
+            await _drain()
             # Second call, SAME uuid+slot: still returns the vector...
             v2 = er.ensure_slot_embedding(
                 "uuid-dedup", "content", "qwen3_embed",
                 "qwen3-embedding:0.6b", coll, _Svc(),
             )
-            await asyncio.sleep(0)
-            await asyncio.sleep(0)
+            await _drain()
             assert v1 == [0.5, 0.6, 0.7]
             assert v2 == [0.5, 0.6, 0.7]  # vector still available for the cosine
             # ...but only ONE write landed (the second was deduped).
@@ -506,9 +514,7 @@ class TestEnsureSlotEmbedding:
                 "uuid-dedup", "content", "arctic2_embed",
                 "snowflake-arctic-embed2", coll, _Svc(),
             )
-            # Drain the fire-and-forget store task (needs a few loop turns).
-            for _ in range(5):
-                await asyncio.sleep(0)
+            await _drain()
             assert len(coll.updated) == 2
 
         asyncio.run(_inner())

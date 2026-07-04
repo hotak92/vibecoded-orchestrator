@@ -833,9 +833,23 @@ def test_f8_dispatch_skips_walker_excluded_names(analyzer_mod):
 
 
 def test_f8_walkers_and_dispatch_share_one_suffix_home(analyzer_mod):
+    # v0.2.73 CG-1: the 14 inline `_find_<lang>_files` walkers were collapsed
+    # onto the declarative `_FINDER_SPECS` table + one shared `_find_files_for`.
+    # The F8 invariant is UNCHANGED — the JS/TS name-skip suffixes still have a
+    # SINGLE home (`_JS_SKIP_SUFFIXES` / `_TS_SKIP_SUFFIXES`) shared by BOTH the
+    # walker path (now via the FINDER_SPECS `name_skip_suffixes` column) AND the
+    # single-file dispatch guard. Anchor on the stable constants + their
+    # table/dispatch wiring, NOT the old inline `skip_suffixes = set(...)` line.
     src = _ANALYZER_PATH.read_text(encoding="utf-8")
-    assert "skip_suffixes = set(_JS_SKIP_SUFFIXES)" in src
-    assert "skip_suffixes = set(_TS_SKIP_SUFFIXES)" in src
+    # The finder table routes JS/TS through the SAME suffix constants.
+    assert "_JS_SKIP_SUFFIXES)" in src, "JS skip suffixes must feed _FINDER_SPECS"
+    assert "_TS_SKIP_SUFFIXES)" in src, "TS skip suffixes must feed _FINDER_SPECS"
+    # The shared walker consumes them as `name_skip_suffixes`.
+    assert "name_skip_suffixes" in src
+    # The single-file dispatch guard reads the SAME constants (one home).
+    assert "for s in _JS_SKIP_SUFFIXES" in src
+    assert "for s in _TS_SKIP_SUFFIXES" in src
+    # Behavioural anchor (survives any future re-expression): .d.ts is skipped.
     assert ".d.ts" in analyzer_mod._TS_SKIP_SUFFIXES
 
 
