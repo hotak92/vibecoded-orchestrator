@@ -68,7 +68,7 @@ If you don't use Claude Code: the KG, code graph, MCP servers, and launcher GUI 
 ## Features
 
 - **Knowledge Graph** — Obsidian-style markdown nodes with typed WikiLinks, indexed in Weaviate via qwen3 embeddings (1024-dim, local). Optional OpenAI embeddings.
-- **Code Graph** — Tree-sitter AST analysis across 10+ languages, populating `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction` collections. Optional Joern integration for CFG/PDG metrics.
+- **Code Graph** — Tree-sitter AST analysis across 10+ languages, populating `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction` collections.
 - **36 automation hooks** — context injection on prompt submit, KG/code-graph auto-sync on file edit, credential scans, compaction-preserving context replay, security checks. Linux/macOS use `.sh`; Windows ships native `.ps1`. Plus the `vct-hub` background service that resolves per-project config for hooks, MCPs, and scripts.
 - **MCP servers (default install)** — 4 registered in `~/.claude.json` via `launcher/src-tauri/src/mcp_registration.rs::build_default_mcp_entries`: `weaviate-kg` (semantic + graph search + code graph) and `search` (academic papers via OpenAlex + arXiv) are **enabled by default per project**; `mermaid` and `excalidraw` are **registered but default-disabled per project** (`launcher/src-tauri/vct-launcher-core/src/db/project_mcp_servers.rs::BUNDLED_MCP_DEFAULT_DISABLED`) — `claude mcp list` shows them connected but their tools are not callable until the user opts in via the launcher's Diagrams tab. A fifth MCP — `playwright` — is **enabled by default** and invoked separately via `npx -y @playwright/mcp@latest` (install.py pre-caches at `_install_playwright_browsers`; opt out with `VCT_SKIP_PLAYWRIGHT=1`). The `vct-coordination` MCP is **Pro-tier** and excluded from the default install. All local, no per-tool API keys. Ollama runs as backend infrastructure (Weaviate vectorizer + code-embed CPU fallback) regardless of MCP wrappers; the CodeSage code-embedding FastAPI service runs locally on port 11440.
 - **44 agents + 53 skills** — shipped via `install.py` templates. Agents handle planning, coding, testing, doc maintenance, KG navigation, code-graph health. Skills cover security review, debugging, architecture, RAG advisory, accessibility, etc.
@@ -192,7 +192,6 @@ No GUI yet? The CLI install path (above) covers all three OSes.
 - GPU drivers — detected, not installed; the install prints download URLs if missing.
 
 **Optional companions (install asks; default Y):**
-- **[Joern](https://docs.joern.io/installation/)** — ~600 MB JVM-based code-property-graph tool. Adds CFG and PDG metrics. Skip with `--no-joern`.
 - **[lean-ctx](https://github.com/yvgude/lean-ctx)** — Rust binary, MIT, zero telemetry. Compresses CLI output by 90–97%, which translates to shorter Claude context windows and lower token costs. Auto-installs via Homebrew / Cargo / AUR when available. Skip with `--no-lean-ctx`.
 
 ### Hardware
@@ -240,7 +239,7 @@ The full flag list (`--gpu`, `--cpu-only`, `--low-resource`, `--openai-key`, `--
 - [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) — install flags, first-session walkthrough, cross-project setup
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — bypass-permissions, container / MCP issues, first-run problems
 
-Non-interactive / CI: `python install.py --quiet --no-joern --no-containers`
+Non-interactive / CI: `python install.py --quiet --no-containers`
 
 ## Project structure
 
