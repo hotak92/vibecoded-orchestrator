@@ -251,7 +251,15 @@ def test_tier_recalibrated_constants():
 
 
 def test_tier_env_override_names_kept():
-    """The CODE_TIER_* env names stay wired (import-time getenv reads)."""
+    """The CODE_TIER_* env names stay wired (import-time env reads).
+
+    v0.2.73 (D-12): the tier thresholds moved from
+    ``float(os.getenv("CODE_TIER_MIN", "0.22"))`` to the safe-parse wrapper
+    ``_safe_float("CODE_TIER_MIN", "0.22")`` (a non-numeric env value now falls
+    back to the default instead of crashing at import). The env override is
+    still wired — accept EITHER accessor so this guard survives the hardening
+    without going blind to a genuine removal.
+    """
     src = _SERVER_PATH.read_text(encoding="utf-8")
     for key, default in (
         ("CODE_TIER_MIN", "0.22"),
@@ -259,8 +267,12 @@ def test_tier_env_override_names_kept():
         ("CODE_TIER_THREE_CHUNKS", "0.48"),
         ("CODE_TIER_FULL", "0.62"),
     ):
-        assert f'os.getenv("{key}",' in src and f'"{default}"' in src, (
-            f"{key} env override (default {default}) must stay wired"
+        wired = (
+            f'os.getenv("{key}",' in src or f'_safe_float("{key}",' in src
+        )
+        assert wired and f'"{default}"' in src, (
+            f"{key} env override (default {default}) must stay wired "
+            f'(via os.getenv or _safe_float)'
         )
 
 

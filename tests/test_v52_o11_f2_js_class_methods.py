@@ -431,42 +431,39 @@ def test_no_inline_method_finditer_in_js_class_loop() -> None:
         _REPO / "templates" / "scripts" / "analyze_code_graph.py"
     ).read_text()
 
-    # Locate the JS class-loop's signature anchor (`signature = f"class
-    # {cname}"` line) — unique to JS in this file (Rust uses
-    # `f"struct/enum/trait {sname}"`, C# uses
-    # `signature = f"class {cname}"` too but precedes the JS site;
-    # we'll anchor on the embed_class call with language="javascript"
-    # which is unique).
-    js_anchor = 'embed_class(signature, class_body, methods=methods[:10], language="javascript")'
-    anchor_pos = src.find(js_anchor)
+    # Anchor on the STABLE per-class scoping call itself — this is the exact
+    # thing V52-O.11.F.2-JS introduced and this test guards. (v0.2.73: the
+    # earlier anchor was the JS `embed_class(...)` literal + a 1400-char lookback
+    # window to the loop header; FIX-B2's embed-hoist wrapped that embed in a
+    # `_deferred_embed` lambda and inserted scaffolding, pushing the loop header
+    # outside the fixed window. Anchoring on `_js_methods_for_class(...)` is
+    # refactor-robust — it's the call that must exist and the regex-ban must hold
+    # around it, regardless of how the downstream embed is dispatched.)
+    js_call_anchor = '_js_methods_for_class(content_clean, cname, source_lines)'
+    anchor_pos = src.find(js_call_anchor)
     assert anchor_pos >= 0, (
-        f"Could not locate JS embed_class anchor in analyze_code_graph.py — "
-        f"has it changed? Looked for: {js_anchor!r}"
-    )
-
-    # Look at a window 1400 chars BEFORE the anchor (covers the
-    # `for cname, ...` loop header + the V52-O.11.F.2-JS comment
-    # block + the `methods = _js_methods_for_class(...)` call).
-    window_start = max(0, anchor_pos - 1400)
-    window_end = min(len(src), anchor_pos + 200)
-    window = src[window_start:window_end]
-
-    # Sanity: window must contain the JS class-iteration loop header.
-    assert "for cname, (start_line, base_class) in class_info.items():" in window, (
-        "JS embed_class anchor isn't inside the class-iteration loop — "
-        "file shape has changed unexpectedly."
-    )
-
-    # The two banned shapes that V52-O.11.F.2-JS supersedes.
-    assert "method_inside.finditer(class_body)" not in window, (
-        "V52-O.11.F.2-JS regression: the JS class loop body contains "
-        "``method_inside.finditer(class_body)`` which under-covered "
-        "method shapes (no static / get/set / generators / private / "
-        "constructor) and matched nested function-call statements. "
-        "Use ``_js_methods_for_class(content_clean, cname, source_lines)`` "
-        "instead."
-    )
-    assert "_js_methods_for_class" in window, (
         "V52-O.11.F.2-JS regression: the JS class loop must call "
-        "``_js_methods_for_class`` for per-class method scoping."
+        f"``_js_methods_for_class`` for per-class method scoping. Looked for: "
+        f"{js_call_anchor!r} — has it changed?"
+    )
+
+    # The JS class-iteration loop header must precede the scoping call (confirms
+    # the anchor is inside the JS class loop, not some other reference). Search
+    # the whole prefix up to the anchor — refactor-size-independent.
+    prefix = src[:anchor_pos]
+    assert "for cname, (start_line, base_class) in class_info.items():" in prefix, (
+        "JS `_js_methods_for_class` call isn't preceded by the JS "
+        "class-iteration loop header — file shape has changed unexpectedly."
+    )
+
+    # The banned inline regex that V52-O.11.F.2-JS supersedes must appear
+    # NOWHERE in the file (it under-covered method shapes + matched nested
+    # call statements). Checking the whole file is strictly stronger than the
+    # old windowed check and immune to embed-dispatch refactors.
+    assert "method_inside.finditer(class_body)" not in src, (
+        "V52-O.11.F.2-JS regression: analyze_code_graph.py reintroduced "
+        "``method_inside.finditer(class_body)`` which under-covered method "
+        "shapes (no static / get/set / generators / private / constructor) "
+        "and matched nested function-call statements. Use "
+        "``_js_methods_for_class(content_clean, cname, source_lines)`` instead."
     )
