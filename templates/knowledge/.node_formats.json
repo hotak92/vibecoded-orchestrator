@@ -8,8 +8,8 @@
     "chunk_summaries": {
       "1.0": "SAC combines entropy regularization with off-policy actor-critic learning to improve exploration and prevent convergence to poor local optima, implementing a squashed Gaussian actor policy with dual Q-function critics."
     },
-    "total_chunks": 2,
-    "content_hash": "a531b76253f6a30d"
+    "content_hash": "a531b76253f6a30d",
+    "total_chunks": 2
   },
   "knowledge/concepts/agent-framework-comparison-2026.md": {
     "title": "Agent Framework Comparison (2026)",
@@ -29,8 +29,8 @@
     "chunk_summaries": {
       "1.0": "Agent orchestration is the process of managing multiple AI agents on complex tasks, with seven core responsibilities (task decomposition, agent selection, resource management, progress tracking, error handling, result assembly, context injection) and three execution patterns (static DAG, dynamic LLM-driven, and reactive event-driven)."
     },
-    "total_chunks": 2,
-    "content_hash": "3576d8aca6241196"
+    "content_hash": "3576d8aca6241196",
+    "total_chunks": 2
   },
   "knowledge/concepts/agentic-llm-workflows.md": {
     "title": "Agentic LLM Workflows",
@@ -293,8 +293,8 @@
     "chunk_summaries": {
       "1.0": "This chunk introduces a shared Weaviate knowledge graph that centralizes reusable knowledge across projects and transparently merges per-project and shared collection results via an MCP server with deduplication and reranking."
     },
-    "total_chunks": 6,
-    "content_hash": "d0771f40b8ff4b10"
+    "content_hash": "d0771f40b8ff4b10",
+    "total_chunks": 6
   },
   "knowledge/concepts/kubernetes-manifest-review-discipline.md": {
     "title": "Kubernetes Manifest Review Discipline",
@@ -350,8 +350,8 @@
     "chunk_summaries": {
       "1.0": "This chunk presents a three-step decision framework for quantizing models: establishing acceptable quality loss by use case, assessing VRAM constraints for RTX 4080 Super (16 GB), and selecting the appropriate quantization method (NF4, AWQ, GPTQ, GGUF, Ollama)."
     },
-    "total_chunks": 3,
-    "content_hash": "cd37e6619a80e50f"
+    "content_hash": "cd37e6619a80e50f",
+    "total_chunks": 3
   },
   "knowledge/concepts/module-contributed-gui-tabs.md": {
     "title": "Module-Contributed GUI Tabs Framework",
@@ -387,15 +387,6 @@
     "generated_at": "2026-06-18T01:17:30.004733+00:00",
     "backend": "cli",
     "content_hash": "05671c80b1630d3c",
-    "total_chunks": 1
-  },
-  "knowledge/concepts/orchestrator-code-graph.md": {
-    "title": "Orchestrator Code Graph",
-    "description": "The Code Graph is a semantic index of source code that extracts structural entities (modules, classes, functions, API endpoints) from repositories, embeds them with code-specialized embeddings, and stores them in Weaviate for purpose-driven and structural code queries. The analysis pipeline detects language, performs AST or regex-based entity extraction, and supports incremental updates via git diff to only re-analyze changed files. Embeddings use CodeSage-Large-v2 (GPU) or jina-embeddings-v2-base-code (CPU via Ollama), then upsert to per-project Weaviate collections. Unlike grep-based search that finds exact strings, the Code Graph enables semantic queries (\"find authentication middleware\") and structural questions (\"what calls this function?\") without file reads, making it essential for understanding code purpose and dependencies across complex codebases.",
-    "summary": "The Code Graph is a semantic code index that extracts structural entities (modules, classes, functions, APIs) from source code, embeds them via code-specialized embeddings, and stores them in Weaviate—enabling purpose-based discovery (\"find authentication middleware\") and structural queries (\"what calls this function?\") without file reads.",
-    "generated_at": "2026-06-27T17:35:42.688654+00:00",
-    "backend": "cli",
-    "content_hash": "586a870eab238b8b",
     "total_chunks": 1
   },
   "knowledge/concepts/orchestrator-context-management.md": {
@@ -506,8 +497,8 @@
     "chunk_summaries": {
       "1.0": "This chunk contrasts Outcome Reward Models (ORMs)—which evaluate only final answers—with Process Reward Models (PRMs)—which provide step-level feedback on intermediate reasoning to enable better credit assignment and generalization to novel problems."
     },
-    "total_chunks": 2,
-    "content_hash": "cba7ff1c49251461"
+    "content_hash": "cba7ff1c49251461",
+    "total_chunks": 2
   },
   "knowledge/concepts/project-extra-codegraph-paths-2026-06-05.md": {
     "title": "Project-extra codegraph paths",
@@ -590,8 +581,8 @@
     "chunk_summaries": {
       "1.0": "This chunk identifies distributional shift and value overestimation as offline RL's core problem: algorithms assign inflated Q-values to unseen actions encountered during bootstrapping, causing learned policies to diverge catastrophically from the training dataset."
     },
-    "total_chunks": 2,
-    "content_hash": "6e87c29dbebfd146"
+    "content_hash": "6e87c29dbebfd146",
+    "total_chunks": 2
   },
   "knowledge/concepts/reproducible-research-workflows.md": {
     "title": "Reproducible Research Workflows",
@@ -746,8 +737,8 @@
     "chunk_summaries": {
       "1.0": "Speculative decoding is a lossless inference acceleration technique where a small draft model proposes multiple tokens and the target model validates all proposals in a single forward pass using probabilistic acceptance/rejection that preserves output distribution."
     },
-    "total_chunks": 2,
-    "content_hash": "a3995bbb6e89c581"
+    "content_hash": "a3995bbb6e89c581",
+    "total_chunks": 2
   },
   "knowledge/concepts/sre-incident-response-playbook.md": {
     "title": "SRE Incident Response Playbook",
@@ -884,8 +875,8 @@
     "chunk_summaries": {
       "1.0": "CodeSage-Large-v2 is a 1.3B-parameter Salesforce code-embedding model producing 2048-dimensional embeddings for source-code retrieval, deployed as the orchestrator's primary GPU-accelerated code embedder via a FastAPI service bound to Weaviate code-graph collections."
     },
-    "total_chunks": 2,
-    "content_hash": "b09ad8a2b3498402"
+    "content_hash": "b09ad8a2b3498402",
+    "total_chunks": 2
   },
   "knowledge/models/gemma4-e4b.md": {
     "title": "Gemma 4 E4B",
@@ -968,8 +959,8 @@
     "chunk_summaries": {
       "1.0": "This chunk introduces ComfyUI as a node-based Stable Diffusion interface and compares its performance (10-20% faster), VRAM efficiency (14% lower), and workflow flexibility advantages over Automatic1111."
     },
-    "total_chunks": 2,
-    "content_hash": "4593b35b15f6139a"
+    "content_hash": "4593b35b15f6139a",
+    "total_chunks": 2
   },
   "knowledge/tools/crm-and-revops-stack-2026.md": {
     "title": "CRM and RevOps Stack 2026",
@@ -998,8 +989,8 @@
     "chunk_summaries": {
       "1.0": "Chunk 1.0 introduces FastMCP as Prefect's standard Python framework for building MCP servers and clients, covering its three core pillars (servers, apps, clients), minimal server example, and key features including decorator-based tools, resources, prompts, authentication, caching, and transport protocols."
     },
-    "total_chunks": 2,
-    "content_hash": "dfee328a33e88afc"
+    "content_hash": "dfee328a33e88afc",
+    "total_chunks": 2
   },
   "knowledge/tools/llama-cpp.md": {
     "title": "llama.cpp",
@@ -1019,8 +1010,8 @@
     "chunk_summaries": {
       "1.0": "Ollama chunk 1.0 covers the local LLM server's core architecture (Go-based llama.cpp wrapper), REST API endpoints, model management via Modelfile, and available models including qwen3-coder, llama3.2:3b, and specialized embeddings models."
     },
-    "total_chunks": 2,
-    "content_hash": "8cd37dff56200392"
+    "content_hash": "8cd37dff56200392",
+    "total_chunks": 2
   },
   "knowledge/tools/scientific-python-stack-2026.md": {
     "title": "Scientific Python Stack 2026",
@@ -1058,7 +1049,7 @@
     "chunk_summaries": {
       "1.0": "Introduces Weaviate as an open-source vector database for semantic search, covering four core capabilities: HNSW-based similarity search, property filtering with GraphQL/gRPC, knowledge graph relationships, and multi-tenant namespace isolation."
     },
-    "total_chunks": 7,
-    "content_hash": "cf829145fe1cb37f"
+    "content_hash": "cf829145fe1cb37f",
+    "total_chunks": 7
   }
 }

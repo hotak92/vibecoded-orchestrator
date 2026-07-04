@@ -238,8 +238,14 @@ def main() -> int:
             continue
 
         out_entry = {k: scrubbed[k] for k in _CARRY_FIELDS if k in scrubbed}
+        # Emit content_hash BEFORE total_chunks so a regeneration produces a
+        # minimal diff (the canonical shipped order is …, content_hash,
+        # total_chunks). Appending content_hash last and letting total_chunks
+        # trail would flip those two lines on EVERY entry each regen — 2×N lines
+        # of pure field-order churn that buries the real change.
+        tc = out_entry.pop("total_chunks", 1)
         out_entry["content_hash"] = h  # canonical, re-derived from public node
-        out_entry.setdefault("total_chunks", 1)
+        out_entry["total_chunks"] = tc
         out_db[key] = out_entry
         if source == "templates":
             n_tk += 1
