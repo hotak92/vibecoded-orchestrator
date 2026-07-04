@@ -165,6 +165,9 @@ def _strip_chunk_header(text: str) -> str:
 #   CodeModule      → path + module_summary + imports
 #   CodeClass       → full_name + signature + class_body + methods + composes
 #   CodeFunction    → full_name + signature + function_body + type_uses
+#                     (+ cfg_summary + data_flow_vars — v0.2.73 CG-3 INERT
+#                      tombstone padding; always "" now, kept only so existing
+#                      rows don't re-hash. See _CONTENT_HASH_FIELDS below.)
 #   CodeAPI         → endpoint + method + api_description + parameters + returns
 #   CodeInteraction → interaction_type + protocol + endpoint + raw_target
 #                     + direction + description
@@ -181,7 +184,22 @@ _CONTENT_HASH_FIELDS = {
     "CodeClass": ["full_name", "signature", "class_body", "methods", "composes", "chunk_num"],
     "CodeFunction": [
         "full_name", "signature", "function_body",
-        "type_uses", "chunk_num",
+        "type_uses",
+        # v0.2.73 (CG-3) TOMBSTONE: cfg_summary + data_flow_vars are RETAINED here
+        # as INERT PADDING even though the Joern CFG/PDG extractor that populated
+        # them was removed. WHY keep them: the content hash mixes each listed
+        # field's value; a row indexed BEFORE CG-3 stored these as "" / [] and its
+        # stored content_hash includes them. If we DROPPED them from this list, the
+        # next walk on every existing install would recompute a DIFFERENT hash for
+        # EVERY function -> a one-time WHOLE-COLLECTION re-replace() (a large write
+        # burst — the exact I/O the v0.2.73 read/write-reduction work exists to
+        # avoid). Because the analyzer no longer EMITS these props, `properties.get`
+        # returns None and `_stable_scalar(None)` == `_stable_scalar("")` == "", so
+        # keeping the names makes the post-CG-3 hash BYTE-IDENTICAL to the stored
+        # one -> ZERO rewrite. The names hash as a constant "" forever; remove them
+        # only alongside a deliberate, batched re-hash migration.
+        "cfg_summary", "data_flow_vars",
+        "chunk_num",
     ],
     "CodeAPI": ["endpoint", "method", "api_description", "parameters", "returns"],
     "CodeInteraction": [
