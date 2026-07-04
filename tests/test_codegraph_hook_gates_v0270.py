@@ -288,3 +288,49 @@ def test_g5_guard_does_not_false_refuse_legit_wt_named_project(tmp_path: Path) -
     assert "refusing to mint" not in r.stderr, (
         f"guard FALSE-REFUSED a legitimately-named 'wt-foo' project: {r.stderr[-400:]}"
     )
+
+
+def test_g5_guard_refuses_explicit_worktree_relative_project(tmp_path: Path) -> None:
+    """Q1 (v0.2.73): the OTHER door — an EXPLICIT `--project vco-wt/bug1` (whose
+    value itself carries a worktree-container segment) must be REFUSED, even
+    from a NON-worktree cwd. This is the bypass that both the `Vco_wt_*` debris
+    and the `CanonicalProj` test leak walked through. The analyzer must exit 1
+    BEFORE connecting to Weaviate, so this test mints NOTHING (leak-free)."""
+    plain = tmp_path / "plain-dir"   # deliberately NOT under a worktree segment
+    plain.mkdir(parents=True)
+    analyzer = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
+    env = {k: v for k, v in os.environ.items() if k not in ("CODE_GRAPH_PROJECT", "PROJECT_NAME")}
+    r = subprocess.run(
+        [shutil.which("python3") or "python3", str(analyzer), ".", "--project", "vco-wt/bug1"],
+        cwd=str(plain), capture_output=True, text=True, timeout=60, env=env,
+    )
+    assert r.returncode == 1, f"expected refusal exit 1; got {r.returncode}\n{r.stderr[-400:]}"
+    assert "refusing to mint" in r.stderr, r.stderr[-400:]
+    assert "vco-wt" in r.stderr, (
+        f"refusal message must name the offending segment: {r.stderr[-400:]}"
+    )
+
+
+def test_g5_guard_allows_explicit_legit_wt_substring_project(tmp_path: Path) -> None:
+    """Q1 companion: an explicit project name that merely CONTAINS the substring
+    'wt' as part of a word ('SwiftlyTyped') is NOT a worktree segment, so the
+    guard must NOT refuse it. (It runs past the guard; when Weaviate is up it
+    would mint SwiftlyTyped_Code*, so we drop those in teardown.)"""
+    plain = tmp_path / "plain-dir2"
+    plain.mkdir(parents=True)
+    analyzer = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
+    env = {k: v for k, v in os.environ.items() if k not in ("CODE_GRAPH_PROJECT", "PROJECT_NAME")}
+    try:
+        r = subprocess.run(
+            [shutil.which("python3") or "python3", str(analyzer), ".", "--project", "SwiftlyTyped"],
+            cwd=str(plain), capture_output=True, text=True, timeout=60, env=env,
+        )
+        assert "refusing to mint" not in r.stderr, (
+            f"guard FALSE-REFUSED an explicit legit 'wt'-substring project: {r.stderr[-400:]}"
+        )
+    finally:
+        _drop_test_collections(
+            f"SwiftlyTyped_{suffix}"
+            for suffix in ("CodeModule", "CodeClass", "CodeFunction",
+                           "CodeAPI", "CodeInteraction")
+        )
