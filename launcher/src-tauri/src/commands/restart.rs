@@ -406,6 +406,27 @@ fn clear_restart_deferral(install_root: &Path) -> Result<(), String> {
         // user sees the stale block at most once.
         std::fs::remove_file(&target)
             .map_err(|e| format!("unlink {}: {}", target.display(), e))?;
+        // v0.2.73 Stage-1 DESIGN F2 (resurrection): A-3 made the JSON sidecar
+        // AUTHORITATIVE — `deferral_report.read()` prefers UPDATE_DEFERRED.json
+        // and falls back to the Markdown only when the JSON is absent. If we
+        // unlink ONLY the .md here, the .json survives with the just-cleared
+        // launcher_restart_required entry, so the next Python read() RESURRECTS
+        // the restart banner (the common single-entry case, which is exactly
+        // this branch). Dual-unlink the JSON sidecar so the clear actually
+        // clears. Best-effort: a missing sidecar is fine (older installs
+        // predate A-3); a remove error is logged, not fatal (the .md is already
+        // gone, so the banner won't re-render from Markdown at least).
+        let json_sidecar = target.with_file_name("UPDATE_DEFERRED.json");
+        if json_sidecar.is_file() {
+            if let Err(e) = std::fs::remove_file(&json_sidecar) {
+                eprintln!(
+                    "[restart] could not unlink JSON deferral sidecar at {} \
+                     (banner may resurrect from JSON): {}",
+                    json_sidecar.display(),
+                    e,
+                );
+            }
+        }
         return Ok(());
     }
 
@@ -655,6 +676,52 @@ condition_ids: [launcher_restart_required]
 
         clear_restart_deferral(tmp.path()).expect("clear");
         assert!(!target.exists(), "file should be removed when no entries remain");
+    }
+
+    #[test]
+    fn clear_restart_deferral_also_unlinks_json_sidecar() {
+        // v0.2.73 Stage-1 DESIGN F2: A-3 made UPDATE_DEFERRED.json authoritative
+        // (Python read() prefers it). Clearing the last MD entry must ALSO unlink
+        // the JSON sidecar — else the cleared restart banner resurrects from JSON.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dot_claude = tmp.path().join(".claude").join("context");
+        std::fs::create_dir_all(&dot_claude).expect("mkdir");
+        let md = dot_claude.join("UPDATE_DEFERRED.md");
+        let json = dot_claude.join("UPDATE_DEFERRED.json");
+        std::fs::write(
+            &md,
+            "---\ncondition_ids: [launcher_restart_required]\n---\n\n# VCO Update Deferred\n\n## launcher_restart_required (info)\n\n**Title**: foo\n\n---\n",
+        )
+        .expect("write md");
+        std::fs::write(
+            &json,
+            "{\"schema_version\":1,\"entries\":[{\"condition_id\":\"launcher_restart_required\",\"title\":\"foo\"}]}",
+        )
+        .expect("write json");
+
+        clear_restart_deferral(tmp.path()).expect("clear");
+        assert!(!md.exists(), "MD removed when no entries remain");
+        assert!(
+            !json.exists(),
+            "JSON sidecar must ALSO be removed — else the banner resurrects from JSON",
+        );
+    }
+
+    #[test]
+    fn clear_restart_deferral_json_absent_is_ok() {
+        // Older installs predate A-3 (no JSON sidecar) — clearing must still
+        // succeed and unlink the MD without erroring on the absent JSON.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dot_claude = tmp.path().join(".claude").join("context");
+        std::fs::create_dir_all(&dot_claude).expect("mkdir");
+        let md = dot_claude.join("UPDATE_DEFERRED.md");
+        std::fs::write(
+            &md,
+            "---\ncondition_ids: [launcher_restart_required]\n---\n\n# VCO Update Deferred\n\n## launcher_restart_required (info)\n\n**Title**: foo\n\n---\n",
+        )
+        .expect("write md");
+        clear_restart_deferral(tmp.path()).expect("clear (no json is fine)");
+        assert!(!md.exists());
     }
 
     #[test]
