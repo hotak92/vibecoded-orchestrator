@@ -160,7 +160,10 @@ def test_is_test_path_parity_with_code_ranking(analyzer_mod):
     try:
         from weaviate_mcp.code_ranking import is_test_path as shared
     except Exception:
-        pytest.skip("code_ranking.is_test_path not landed yet (consumer track)")
+        # Import-availability gate (bare CI container without the weaviate_mcp
+        # deps), NOT a deferred producer/consumer split — code_ranking.is_test_path
+        # IS shipped (code_ranking.py). Skip only when the module can't import.
+        pytest.skip("weaviate_mcp.code_ranking not importable in this env (deps absent)")
     fallback = _extract_inline_is_test_path_fallback()
     # Sanity: the two must be DIFFERENT function objects (else the test is
     # exercising a single body and the drift-lock is illusory).

@@ -33,13 +33,14 @@ directly), so the driver:
      hub binary), or any transport error leaves the corpus untouched and the
      search path unaffected.
 
-Boundary note (v0.2.73 W2-F / W2-B split)
------------------------------------------
-The hub-side DELETE route + the launcher-core ``prune_rl_events`` DB method are
-Rust and owned by the launcher/hub track (W2-B). They are delivered as a patch
-spec (see the W2-F report). This module talks to the route through
-``hub_writer.post_rl_prune`` and degrades gracefully (returns a skipped result)
-when the route is absent — so it is safe to merge BEFORE the hub side lands.
+Boundary note (v0.2.73 RL-5)
+----------------------------
+The hub-side DELETE route (``POST /api/v1/rl/events/prune``) + the launcher-core
+``Db::prune_rl_events`` DB method are Rust and landed TOGETHER with this module in
+v0.2.73 (RL-5 / SPEC-1). This module talks to the route through
+``hub_writer.post_rl_prune`` and still degrades gracefully (returns a skipped
+result) when the route is absent — which now only happens against an OLDER hub
+binary (pre-v0.2.73), not a same-release sequencing gap.
 
 Config (env, all optional — sane defaults when unset)
 ----------------------------------------------------

@@ -200,6 +200,16 @@ _CONTENT_HASH_FIELDS = {
 # by `_dedup_insert` and are pure functions of (file, source-root) — including
 # them would force a one-time re-write whenever a backfill migration first
 # stamps them, defeating the skip.
+# KNOWN LIMITATION (Stage-1 correctness SEV-3 #2, pre-existing v0.2.61 tradeoff):
+# `start_line`/`end_line` are EXCLUDED from the content hash, so a function whose
+# body is byte-identical but whose line range SHIFTED (an edit above it in the
+# file) is content-hash-unchanged → the per-object skip (and, since FIX-B2, the
+# embed) is skipped, leaving the STORED start_line/end_line stale until a full
+# reanalyze. The VECTOR stays correct (body unchanged); only the display line
+# range drifts. Accepted tradeoff: including line ranges would force a re-write
+# of every function below any edit on every keystroke — the exact write
+# amplification the skip exists to avoid. A full `code-graph-analyze` (no
+# --only-file) re-stamps the ranges.
 _CONTENT_HASH_EXCLUDE = frozenset({
     "content_hash", "last_modified", "project_source", "language",
     "file_path", "start_line", "end_line",

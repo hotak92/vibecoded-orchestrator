@@ -64,7 +64,15 @@ _worktree_gate_should_skip() {
     # root) → INDEX. Only a canonical root that DIFFERS from the on-disk root
     # signals a linked worktree.
     [ -z "$_wg_canon" ] && return 1
-    [ "$_wg_canon" = "$_wg_repo" ] && return 1
+    # v0.2.73 Stage-1 PLATFORM MEDIUM-2: `_wg_canon` is symlink-resolved
+    # (`_canonical_repo_root` ends in `pwd -P`), but `_wg_repo` is the raw
+    # hook-resolved path (may be `$(pwd)` or CLAUDE_PROJECT_DIR, NOT physical).
+    # On macOS (/tmp vs /private/tmp) or a symlinked checkout, a MAIN-tree edit
+    # would then have `_wg_canon != _wg_repo` → mis-classified as a worktree →
+    # SILENTLY SKIPPED (the real project stops indexing). Normalize `_wg_repo`
+    # to the SAME physical form before comparing so like is compared with like.
+    _wg_repo_norm="$(cd "$_wg_repo" 2>/dev/null && pwd -P)" || _wg_repo_norm="$_wg_repo"
+    [ "$_wg_canon" = "$_wg_repo_norm" ] && return 1
 
     # Worktree edit: probe whether the canonical MAIN root is a registered
     # launcher project. The resolver lives under the CANONICAL root's

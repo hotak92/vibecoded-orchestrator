@@ -700,6 +700,24 @@ volumes:
 
 Or, for shared access across multiple containers: `:z` (lowercase, shared label).
 
+## RL retrieval reranking looks off (Pro/MAO) — run rl-doctor
+
+If retrieval reranking (the paid RL module) seems to be underperforming, not
+learning, or silently falling back to plain cosine order, run the built-in
+diagnostic:
+
+```bash
+python claude_mcp_servers/scripts/rl_doctor.py     # from the orchestrator root
+```
+
+`rl-doctor` (v0.2.73, RL-12) reports RL retrieval health: whether the feature
+gate is on for the project, whether telemetry (`rl_events`) is being written,
+recent retrieval/citation rates, and the fallback counter (how often a rerank RPC
+fell back to cosine). It reads the same state the pipeline writes, so a healthy
+report means the loop is wired end-to-end; a fallback-heavy report points at the
+reranker container or the license gate. Free-tier installs (no RL license) will
+see the gate reported closed — that is expected, retrieval uses plain cosine.
+
 ## When asking for help
 
 Attach `state/logs/bootstrap-prepass.json` from your install root to any issue or support request. The envelope captures OS / arch / GPU / RAM / tool versions / package-manager advice in a single file (schema at `docs/schemas/install-bootstrap-envelope-v1.json`); maintainers can read the host shape without an unstructured back-and-forth. The file contains no PII — every probe writes only the public-facing data (`pip --version`, `nvidia-smi -L`, etc.). It is regenerated on every `first-install.{sh,command,bat}` invocation.

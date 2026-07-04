@@ -34,7 +34,14 @@ function Test-EphemeralWorktreeEdit {
     # Not a worktree edit (main checkout, non-git, or unresolved canonical
     # root) -> INDEX.
     if (-not $CanonRoot) { return $false }
-    if ($CanonRoot -eq $RepoPath) { return $false }
+    # v0.2.73 Stage-1 PLATFORM MEDIUM-2 (must match worktree-gate.sh): $CanonRoot
+    # is Resolve-Path-normalized (Get-CanonicalRepoRoot), but $RepoPath is the
+    # raw hook-resolved path. Compare like-with-like so a MAIN-tree edit under a
+    # symlinked/differently-cased path is not mis-classified as a worktree and
+    # silently skipped. Normalize $RepoPath the SAME way the canonical root was.
+    $repoNorm = $RepoPath
+    try { $repoNorm = (Resolve-Path -LiteralPath $RepoPath -ErrorAction Stop).Path } catch { }
+    if ($CanonRoot -eq $repoNorm) { return $false }
 
     # Worktree edit: probe whether the canonical MAIN root is a registered
     # launcher project. Prefer the resolver under the canonical root; fall
