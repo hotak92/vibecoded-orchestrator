@@ -31,14 +31,23 @@ mechanical, behaviour-preserving qualifications:
     the SERVER module's namespace (where the constant lives) rather than this
     module's.
 
-The ``from . import server`` inside each function is a call-time import: it
-sidesteps the circular-import edge (``server`` imports THIS module) and
-resolves to the same singleton module object Claude Code loads.
+Import-order: this module is only ever imported by ``server`` itself, at the
+END of server's own body (the re-export block near the bottom of server.py).
+By that point ``server`` is far enough initialised that the module-level
+``from . import server`` below binds the real (in-``sys.modules``) module
+object, and the 29 functions here that read ``server.<name>`` resolve it as a
+normal module global. Nothing in this module touches ``server`` at its OWN
+import time (only inside function bodies), so the circular edge never fires on
+the real load path. Do NOT reorder: importing this module BEFORE ``server``
+(which no shipped entrypoint, test, or script does — every caller imports
+``weaviate_mcp.server``) would run server's re-export against a
+half-initialised ``rl_enrichment``.
 
-This mirrors the coupling pattern already used by the sibling
-``claude_mcp_servers.rl_client`` package (``search_pipeline.py``,
-``citation_compute.py``, ``embed_regen.py`` all reach into ``server`` the
-same way).
+The sibling ``claude_mcp_servers.rl_client`` package (``search_pipeline.py``,
+``citation_compute.py``, ``embed_regen.py``) reaches into ``server`` the same
+way, but via CALL-TIME imports because those modules can be imported
+standalone; this module cannot (server is its sole importer), so the
+module-level binding is both sufficient and cheaper than 29 in-function imports.
 """
 
 from __future__ import annotations
@@ -48,10 +57,13 @@ import os
 from pathlib import Path
 from typing import Optional
 
-# Server imports this module near the end of its own body; every function
-# below does a call-time ``from . import server`` so nothing here touches the
-# ``server`` module at import time (avoids the circular-import edge).
-from . import server  # noqa: F401 — re-exported target + call-time attr source
+# ``server`` imports THIS module at the end of its own body, so by the time
+# this line runs ``server`` is already in ``sys.modules`` and binds fine. The
+# 29 functions below read ``server.<name>`` as a module global — this binding
+# is what makes that resolve. Safe because server is this module's ONLY
+# importer (see module docstring for the import-order guarantee); do not
+# reorder or drop.
+from . import server  # noqa: F401 — module-level attr source for server.<name>
 
 # Answer-window matcher: single source of truth lives in
 # ``rl_client.answer_window`` (imported here the same way server.py did — one
@@ -1680,6 +1692,7 @@ def _rl_refetch_node_vector(
     target_vector_name: str,
     *,
     model_name: str = "",
+    allow_regen: bool = True,
 ) -> "list[float] | None":
     """F-G (v0.2.70): recover a node's own active-slot vector for citation cosine.
 
@@ -1704,6 +1717,10 @@ def _rl_refetch_node_vector(
          fetched object's ``content``) using the active model, so cosine is
          ALWAYS computable for a node whose text we have. Only when this also
          fails (no text / embed service down) does the caller drop the node.
+         GATED by ``allow_regen`` (v0.2.73): the caller sets it False when the
+         active slot is absent across the whole group, so this synchronous
+         Ollama embed is skipped rather than fired per-node (retrieval-lock
+         guard — see ``_rl_enrich_nodes_with_linked_embs``' slot-presence probe).
 
     Pulls ONLY ``target_vector_name`` via ``_extract_obj_vector`` so a recovered
     vector can never come from a foreign embedding space (F-D invariant).
@@ -1748,6 +1765,17 @@ def _rl_refetch_node_vector(
     # 4. F-G CORRECTED — regenerate from text so cosine is ALWAYS computable.
     # Prefer the fetched object's full ``content`` (matches the stored chunk
     # text), preferring the matched chunk; fall back to the node dict's content.
+    #
+    # v0.2.73 retrieval-lock guard: this step runs a SYNCHRONOUS Ollama embed
+    # (blocking, on the retrieval coroutine). The caller passes
+    # ``allow_regen=False`` when it has already determined the active slot is
+    # absent on EVERY object in this group — in that state this would fire once
+    # per node (up to limit*2 blocking embeds) and produce a citation vector
+    # against a slot-mismatched collection that can't be trusted anyway. Skip
+    # the regen; the node simply carries no comparable vector (same outcome as
+    # a node fetched without include_vector).
+    if not allow_regen:
+        return None
     regen_text = ""
     for sib in siblings:
         try:
@@ -2113,6 +2141,33 @@ def _rl_enrich_nodes_with_linked_embs(
                     except (AttributeError, TypeError):
                         pass
 
+        # SLOT-PRESENCE PROBE (v0.2.73 retrieval-lock fix): does ANY fetched
+        # object in this group actually carry the active named-vector slot?
+        # When the collection was embedded under a different/renamed slot (or
+        # predates the active slot), _extract_obj_vector returns None for every
+        # object (F-D: never fall back to a foreign slot). In that state the
+        # per-node step-4 fallback in _rl_refetch_node_vector would fire a
+        # SYNCHRONOUS Ollama re-embed for EVERY node — up to `limit*2` blocking
+        # embeds serialized on the retrieval coroutine = the "lock on retrieval"
+        # the maintainer hit. Detect it ONCE here and disable the per-node
+        # text-regen for this group (steps 1-3 already can't find a vector, so
+        # step 4 is the only thing that would run, and re-embedding against a
+        # slot-mismatched collection yields a citation vector that can't be
+        # trusted anyway). One WARN instead of N blocking embeds.
+        slot_present_in_group = any(
+            server._extract_obj_vector(obj, active_slot) is not None
+            for obj in fetched
+        )
+        if fetched and not slot_present_in_group:
+            server.logger.warning(
+                "RL enrich: active slot %r absent on all %d fetched objects in "
+                "%s — skipping per-node text-regen (would block the retrieval "
+                "on %d synchronous embeds). Collection likely embedded under a "
+                "different slot / predates the active model; re-analyze to "
+                "backfill.",
+                active_slot, len(fetched), collection_name, len(group_nodes),
+            )
+
         # Per-node enrichment.
         for n in group_nodes:
             packed_embs, packed_types = server._rl_pack_linked_embs_for_node(
@@ -2148,6 +2203,13 @@ def _rl_enrich_nodes_with_linked_embs(
                 refetched = server._rl_refetch_node_vector(
                     n, sibling_objs_by_source_id, link_objs_by_title, active_slot,
                     model_name=model_name or server.EMBEDDING_MODEL,
+                    # Only allow the step-4 synchronous text-regen when the slot
+                    # is actually present somewhere in this group. If it's absent
+                    # everywhere, steps 1-3 can't succeed for ANY node and step 4
+                    # would block the retrieval on N Ollama embeds (see the
+                    # slot-presence probe above). Steps 1-3 still run (cheap,
+                    # no-op here) so a stray per-node hit is still recovered.
+                    allow_regen=slot_present_in_group,
                 )
                 if refetched:
                     n_emb = refetched

@@ -200,6 +200,130 @@ class TestFGRefetchNodeVector:
                                       model_name="")
         assert got is None
 
+    def test_allow_regen_false_skips_synchronous_embed(self, monkeypatch) -> None:
+        # v0.2.73 retrieval-lock guard: with allow_regen=False the step-4
+        # synchronous Ollama embed is NOT invoked even when text + model are
+        # present — the whole point is to avoid N blocking embeds when the
+        # active slot is absent group-wide. Assert the regen helper is never
+        # called AND the result is None (node carries no comparable vector).
+        import claude_mcp_servers.weaviate_mcp.server as srv
+
+        called = {"n": 0}
+
+        def _spy_regen(text, model):
+            called["n"] += 1
+            return [0.123, 0.456]
+
+        monkeypatch.setattr(srv, "_rl_regenerate_node_vector", _spy_regen)
+        sib = SimpleNamespace(
+            properties={"source_node_id": "uuid-r", "chunk_num": 1,
+                        "content": "the node body text", "title": "Regen"},
+            vector={},  # active slot absent
+        )
+        node = {"title": "Regen", "source_id": "uuid-r", "chunk_number": 1}
+        got = _rl_refetch_node_vector(
+            node, {"uuid-r": [sib]}, {}, "qwen3_embed",
+            model_name="qwen3-embedding:0.6b", allow_regen=False,
+        )
+        assert got is None
+        assert called["n"] == 0  # the blocking embed was skipped
+
+    def test_allow_regen_true_still_regenerates(self, monkeypatch) -> None:
+        # The leave-alone case's counterpart: with the slot present group-wide
+        # (allow_regen=True, the default), the regen path still fires so the
+        # single-stray-miss recovery is preserved.
+        import claude_mcp_servers.weaviate_mcp.server as srv
+
+        called = {"n": 0}
+
+        def _spy_regen(text, model):
+            called["n"] += 1
+            return [0.123, 0.456]
+
+        monkeypatch.setattr(srv, "_rl_regenerate_node_vector", _spy_regen)
+        sib = SimpleNamespace(
+            properties={"source_node_id": "uuid-r", "chunk_num": 1,
+                        "content": "the node body text", "title": "Regen"},
+            vector={},
+        )
+        node = {"title": "Regen", "source_id": "uuid-r", "chunk_number": 1}
+        got = _rl_refetch_node_vector(
+            node, {"uuid-r": [sib]}, {}, "qwen3_embed",
+            model_name="qwen3-embedding:0.6b", allow_regen=True,
+        )
+        assert got == [0.123, 0.456]
+        assert called["n"] == 1
+
+
+# ----------------------------------------------------------------------
+# v0.2.73 retrieval-lock guard at the ENRICH level: a group whose fetched
+# objects ALL lack the active slot must not fire a synchronous per-node embed.
+# ----------------------------------------------------------------------
+
+
+class TestRetrievalLockSlotAbsentGuard:
+    def _run(self, monkeypatch, fetched_objs, active_slot):
+        import claude_mcp_servers.weaviate_mcp.server as srv
+
+        called = {"n": 0}
+
+        def _spy_regen(text, model):
+            called["n"] += 1
+            return [0.9, 0.9]
+
+        monkeypatch.setattr(srv, "_rl_regenerate_node_vector", _spy_regen)
+        coll = _fake_coll(fetched_objs)
+        # Three nodes, none carrying a pre-existing emb → each would hit the
+        # refetch path; without the guard each fires a blocking embed.
+        nodes = [
+            {"title": f"N{i}", "source_id": f"uuid-{i}", "chunk_number": 1,
+             "collection": "Proj_KnowledgeGraph"}
+            for i in range(3)
+        ]
+        _rl_enrich_nodes_with_linked_embs(
+            nodes, query_emb=None, active_slot=active_slot,
+            coll_resolver=_resolver_for({"Proj_KnowledgeGraph": coll}),
+            model_name="qwen3-embedding:0.6b",
+        )
+        return called["n"]
+
+    def test_slot_absent_group_skips_all_regens(self, monkeypatch) -> None:
+        # Every fetched object carries ONLY a foreign slot → active slot absent
+        # group-wide → ZERO synchronous embeds (the lock is avoided) even though
+        # all 3 nodes lack emb and have recoverable text.
+        foreign = [
+            SimpleNamespace(
+                properties={"source_node_id": f"uuid-{i}", "chunk_num": 1,
+                            "content": "body", "title": f"N{i}"},
+                vector={"ollama_embed": [0.1, 0.2]},  # foreign slot only
+            )
+            for i in range(3)
+        ]
+        n_regens = self._run(monkeypatch, foreign, "qwen3_embed")
+        assert n_regens == 0
+
+    def test_slot_present_group_allows_regen(self, monkeypatch) -> None:
+        # At least one object carries the active slot → the group is healthy →
+        # a node that still misses (no matching sibling) may regen. Here one
+        # object HAS the slot (so the probe passes) but a different node's
+        # source_id has no vector-bearing sibling → its regen is allowed.
+        mixed = [
+            SimpleNamespace(
+                properties={"source_node_id": "uuid-0", "chunk_num": 1,
+                            "content": "body0", "title": "N0"},
+                vector={"qwen3_embed": [0.5, 0.5]},  # active slot present
+            ),
+            SimpleNamespace(
+                properties={"source_node_id": "uuid-1", "chunk_num": 1,
+                            "content": "body1", "title": "N1"},
+                vector={},  # this node's sibling has no vector → regen path
+            ),
+        ]
+        n_regens = self._run(monkeypatch, mixed, "qwen3_embed")
+        # uuid-0 recovered from its own slot (no regen); uuid-1 + uuid-2 miss
+        # but the slot IS present group-wide → regen allowed to fire.
+        assert n_regens >= 1
+
 
 # ----------------------------------------------------------------------
 # F-C CORRECTED — embed_regen.regenerate_node_vector shared helper.
