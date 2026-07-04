@@ -57,13 +57,42 @@ import os
 from pathlib import Path
 from typing import Optional
 
-# ``server`` imports THIS module at the end of its own body, so by the time
-# this line runs ``server`` is already in ``sys.modules`` and binds fine. The
-# 29 functions below read ``server.<name>`` as a module global — this binding
-# is what makes that resolve. Safe because server is this module's ONLY
-# importer (see module docstring for the import-order guarantee); do not
-# reorder or drop.
-from . import server  # noqa: F401 — module-level attr source for server.<name>
+# The 29 functions below read server-module state as ``server.<name>`` (a
+# module global). Rather than an EAGER ``from . import server`` — which binds
+# ONE specific server module object at import time and desyncs if ``server`` is
+# later re-imported while this module isn't (a partial ``sys.modules`` purge
+# leaves the re-exported functions pointing at a STALE server, so a
+# ``monkeypatch.setattr(new_server, …)`` isn't seen) — ``server`` is a LAZY
+# PROXY that forwards every attribute access to the LIVE
+# ``sys.modules["weaviate_mcp.server"]``. This is:
+#   * import-order-safe: nothing touches ``server`` at THIS module's load time
+#     (the proxy resolves lazily on first attribute access, after both modules
+#     have finished importing), so the circular edge never fires;
+#   * re-import-safe: bare ``server.<name>`` always hits the CURRENT server
+#     module, so a test that purges + re-imports ``weaviate_mcp`` (and patches
+#     the fresh server) is observed correctly even by re-exported functions.
+import sys as _sys
+import types as _types
+import importlib as _importlib
+
+
+class _LazyServerProxy(_types.ModuleType):
+    """Attribute access forwards to the live ``weaviate_mcp.server`` module."""
+
+    def __init__(self) -> None:
+        super().__init__("weaviate_mcp._server_proxy")
+
+    def _live(self):
+        mod = _sys.modules.get("weaviate_mcp.server")
+        if mod is None or mod is self:
+            mod = _importlib.import_module("weaviate_mcp.server")
+        return mod
+
+    def __getattr__(self, name):
+        return getattr(self._live(), name)
+
+
+server = _LazyServerProxy()  # noqa: F811 — module-level attr source for server.<name>
 
 # Answer-window matcher: single source of truth lives in
 # ``rl_client.answer_window`` (imported here the same way server.py did — one

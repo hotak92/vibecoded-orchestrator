@@ -24,6 +24,11 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALL_PY = REPO_ROOT / "install.py"
+# v0.2.73 (IN-1): the MCP-registration write site (the `~/.claude.json`
+# mcpServers block writer, which carries the "# Backup + atomic write." marker)
+# was extracted from install.py into vco_lib/install_mcp.py. The structural
+# assertions below follow it to its new home.
+INSTALL_MCP_PY = REPO_ROOT / "vco_lib" / "install_mcp.py"
 
 
 @pytest.fixture(scope="module")
@@ -66,13 +71,17 @@ def test_atomic_write_text_happy_path_replaces_target(tmp_path):
 
 def test_register_mcp_entries_routes_through_atomic_helper(install_module):
     """The `.claude.json` write site uses _atomic_write_text, not inline."""
-    src = INSTALL_PY.read_text(encoding="utf-8")
+    # IN-1 moved the write site into vco_lib/install_mcp.py.
+    src = INSTALL_MCP_PY.read_text(encoding="utf-8")
     # The site is inside the function that writes ~/.claude.json's
-    # mcpServers block. Locate the function then check its body.
+    # mcpServers block. Locate the marker then check the body around it.
     site_marker = "# Backup + atomic write."
     idx = src.find(site_marker)
-    assert idx > 0
-    # 80 lines after the marker should contain the write call.
+    assert idx > 0, (
+        "the '# Backup + atomic write.' write-site marker must exist in "
+        "vco_lib/install_mcp.py (IN-1's new home for MCP registration)"
+    )
+    # The write call lives just after the marker.
     excerpt = src[idx:idx + 2000]
     assert "_atomic_write_text" in excerpt, (
         "The .claude.json write site must route through "
@@ -83,9 +92,10 @@ def test_register_mcp_entries_routes_through_atomic_helper(install_module):
 
 def test_register_mcp_entries_does_not_use_inline_tmp_write(install_module):
     """The `.claude.json` write site must NOT use inline tmp.write_text."""
-    src = INSTALL_PY.read_text(encoding="utf-8")
+    src = INSTALL_MCP_PY.read_text(encoding="utf-8")
     site_marker = "# Backup + atomic write."
     idx = src.find(site_marker)
+    assert idx > 0, "write-site marker must exist in vco_lib/install_mcp.py"
     excerpt = src[idx:idx + 2000]
     # Inline tmp.write_text + os.replace is the leaky pattern.
     assert "tmp.write_text(json.dumps(data" not in excerpt
