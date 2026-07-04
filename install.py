@@ -9772,6 +9772,51 @@ def _detect_optional_companions(args: argparse.Namespace) -> None:
             print("                source $HOME/.cargo/env && cargo install lean-ctx")
         print("            (Pass --no-lean-ctx to silence this hint.)")
 
+# ---------------------------------------------------------------------------
+# Step 3: Embedding configuration
+# ---------------------------------------------------------------------------
+
+# v0.2.54 (gpu-audit C-5): vector dimensionality per embedding model.
+# Single source for the tier-override path so swapping a model can never
+# leave the profile's stock `code_dims` / `text_dims` behind. Keep in
+# lockstep with EMBEDDING_CONFIGS above and the per-model limits in
+# claude_mcp_servers/weaviate_mcp/chunking.py.
+_EMBEDDING_MODEL_DIMS = {
+    "codesage-large-v2": 2048,
+    "qwen3-embedding:0.6b": 1024,
+    "unclemusclez/jina-embeddings-v2-base-code:latest": 768,
+    "snowflake-arctic-embed2:latest": 1024,
+    "openai-text-embedding-3-small": 1536,
+    "text-embedding-3-small": 1536,
+}
+
+# ACTIVE_EMBEDDING named-vector slot per TEXT model — must match the
+# slot mapping in weaviate_mcp/server.py::_get_search_vector. A text-
+# model override that doesn't re-point this slot would write vectors
+# from one model into a slot labelled for another (the 2026-04-30
+# vector-audit bug class).
+#
+# This map is the model→profile half of the v0.2.71 T-B-emb active-embedding
+# cascade. It MUST stay byte-identical to its mirrors (drift re-introduces the
+# v0.2.68 Defect D bug — see project_env_settings.rs:78-87):
+#   * launcher/src-tauri/src/commands/project_env_settings.rs
+#       ::active_profile_for_model
+#   * launcher/src-tauri/vct-hub/src/config_api.rs::hub_active_profile_for_model
+#   * vco_lib/launcher_db_reader.py::_TEXT_MODEL_ACTIVE_EMBEDDING
+_TEXT_MODEL_ACTIVE_EMBEDDING = {
+    "qwen3-embedding:0.6b": "qwen3",
+    "snowflake-arctic-embed2:latest": "arctic",
+    "openai-text-embedding-3-small": "openai",
+    "text-embedding-3-small": "openai",
+}
+
+# Models served via Ollama (must be in the pull list when selected).
+_OLLAMA_SERVED_EMBEDDING_MODELS = {
+    "qwen3-embedding:0.6b",
+    "unclemusclez/jina-embeddings-v2-base-code:latest",
+    "snowflake-arctic-embed2:latest",
+}
+
 
 def _apply_tier_overrides(config: dict, *, code_pick: str, kg_pick: str) -> None:
     """Shim over :func:`vco_lib.gpu_profile.apply_tier_overrides`.
