@@ -176,6 +176,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   normalize symlinked paths the same way the Linux/macOS side did, which
   could misclassify a symlinked main-tree edit as a worktree edit and
   silently skip it.
+- **Turning off local retrieval-data collection now actually stops the work,
+  not just the write.** Previously, disabling "Collect retrieval data locally"
+  only skipped the final log line — every KG search still embedded the whole
+  answer, computed citations, and wrote a pending-scratch file, then threw the
+  result away. The pipeline now skips the entire capture (answer-embedding,
+  citation compute, and the pending file) whenever nothing will consume it — no
+  local logging, no upload consent, and no active online-training subscriber —
+  so an opted-out machine does zero extra per-answer work. It falls open to
+  capturing on any error, so a paying subscriber's training data is never
+  dropped by a transient probe hiccup.
+- **The citation monitor no longer re-reads the whole transcript on every
+  poll.** It re-parses a session transcript only when the file has actually
+  changed since the last check (and skips an idle poll entirely), instead of
+  reading and JSON-parsing the entire growing file every couple of seconds. The
+  extracted answer window is byte-for-byte identical to before — the same
+  shared function feeds the live monitor, the turn-end recovery drain, and the
+  online-training path — so only the wasted reads are gone.
+- **RL retrieval events no longer store each node's embedding twice.** The
+  written event carried the same ~1024-dimension vector under both `emb` and
+  `n_emb`; the offline trainer only ever reads `emb`, so the duplicate was pure
+  write weight. Events now store the vector once (roughly halving the
+  embedding portion of each event), and code-retrieval events — which used to
+  attach the vector under the field the trainer ignored — are now trainable.
+- **RL retrieval internals hardened against two latent correctness gaps.** The
+  read-triggered embedding write-back now keys its per-process dedup on the
+  collection as well as the object id (a raw object id is unique only within a
+  collection, so the previous key could have suppressed a genuinely-needed
+  write across two collections that happened to share an id), and the
+  per-node telemetry serialization is now a single shared function instead of
+  near-duplicate copies that had already drifted — both no-ops for current
+  behavior, closing the drift/aliasing before it could bite.
+- **A cross-file test-ordering flake is closed.** A canonical-keys test reloaded
+  a shared module process-wide, handing a stale exception class to a
+  later-ordered test; the invariant is now checked directly without the reload.
 
 ### Added
 - **Code retrieval down-weights test files** by a measured additive penalty so
@@ -261,6 +295,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matching on whole segments so a legitimate name that merely contains those
   letters is unaffected. A live test that created code-graph collections
   without cleaning them up now tears them down.
+- **Global on/off switches for RL retrieval data collection and online
+  training, in Preferences.** Two machine-global master toggles complement the
+  existing per-project "Collect retrieval data locally" control. A global
+  switch OFF disables that pipeline for every project; with the global switch
+  ON, individual projects can still opt out. The new "Enable online RL
+  training" toggle lets a Pro user turn off the live per-answer training signal
+  (the `/rl_update` call) independently of local logging — a performance
+  opt-out for users who do not want the extra per-answer work. Both are
+  DB-backed (`launcher.db app_state`, re-projected to the MCP env) and default
+  ON, so nothing changes unless you flip them.
+- **Update-all-projects now shows live per-project progress** instead of a
+  single static spinner that looked hung on a long run: a checklist fills in as
+  each project starts and finishes (with its status), and each project's
+  warnings/errors in the final report are expandable to their full text instead
+  of a bare count.
 
 ### Changed
 - **The legacy-KG-collection cleanup workflow** now recommends re-embedding
