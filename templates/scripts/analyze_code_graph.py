@@ -888,6 +888,44 @@ _DISPATCH_TO_IGNORE_LANG: Dict[str, str] = {
 }
 
 
+# v0.2.73 (CG-1): single source of truth for the per-language file WALKERS.
+#
+# Every `_find_<lang>_files` method used to inline the same three-part body:
+# resolve the ignore-dir set, `rglob` one-or-more glob patterns, keep the ones
+# that pass `_keep_source_file`. They differed ONLY in (a) the `_ignore_dirs_for`
+# language key, (b) the glob extensions, and (c) — for JS/TS alone — an extra
+# name-based skip (build-output suffixes + `vite.config*` prefix). This table
+# captures exactly those three axes so the walkers can all delegate to the one
+# `_find_files_for` helper below (mirror-don't-fork). The method surface is
+# UNCHANGED — each `_find_<lang>_files(self, repo_path)` remains a public bound
+# method (tests call them directly, monkeypatch them, and build `lang_dispatch`
+# tuples from them), it just forwards its spec here.
+#
+# Fields per spec: (ignore_lang, extensions, name_skip_suffixes). When
+# `name_skip_suffixes` is None the walker applies no name-based skip; when it is
+# a tuple, the walker drops any file whose name ends with one of those suffixes
+# OR starts with `vite.config` — reproducing the JS/TS bundle/config guard
+# verbatim (only JS and TS ever had it). `.c`/`.h`/`.hpp` glob into the `cpp`
+# walker to match `_EXT_TO_DISPATCH_NAME`; svelte reuses the JS ignore set and
+# powershell the shell set (see `_DISPATCH_TO_IGNORE_LANG`).
+_FINDER_SPECS: Dict[str, Tuple[str, Tuple[str, ...], Optional[Tuple[str, ...]]]] = {
+    "python":     ("python", ("*.py",),                                             None),
+    "lua":        ("lua",    ("*.lua",),                                            None),
+    "cpp":        ("cpp",    ("*.cpp", "*.cc", "*.cxx", "*.c", "*.h", "*.hpp"),     None),
+    "js":         ("js",     ("*.js", "*.mjs", "*.jsx"),                            _JS_SKIP_SUFFIXES),
+    "ts":         ("ts",     ("*.ts", "*.tsx"),                                     _TS_SKIP_SUFFIXES),
+    "go":         ("go",     ("*.go",),                                             None),
+    "rust":       ("rust",   ("*.rs",),                                             None),
+    "java":       ("java",   ("*.java",),                                           None),
+    "ruby":       ("ruby",   ("*.rb",),                                             None),
+    "shell":      ("shell",  ("*.sh", "*.bash"),                                    None),
+    "csharp":     ("csharp", ("*.cs",),                                             None),
+    "svelte":     ("js",     ("*.svelte",),                                         None),
+    "powershell": ("shell",  ("*.ps1", "*.psm1"),                                   None),
+    "proto":      ("proto",  ("*.proto",),                                          None),
+}
+
+
 def _dispatch_name_for_file(file_path: Path) -> str:
     """Return the `lang_dispatch` name for ``file_path``'s extension.
 
@@ -5742,127 +5780,108 @@ class CodeGraphAnalyzer:
         # the map is kept in lock-step). Defensive no-op.
         return []
 
+    def _find_files_for(self, spec_key: str, repo_path: Path) -> List[Path]:
+        """Table-driven file walker shared by every ``_find_<lang>_files``.
+
+        v0.2.73 (CG-1): the 14 per-language walkers used to inline the same
+        body — resolve the ignore-dir set, ``rglob`` one-or-more glob
+        patterns, keep the survivors of ``_keep_source_file``. They varied
+        ONLY along the three axes captured by :data:`_FINDER_SPECS`
+        (``ignore_lang``, ``extensions``, ``name_skip_suffixes``), so this one
+        helper reproduces all of them. Behaviour is byte-for-byte identical to
+        the old bodies:
+
+          * ``ignore_dirs`` comes from ``_ignore_dirs_for(ignore_lang,
+            self.index_dot_claude)`` — read per call so a per-root override of
+            ``self.index_dot_claude`` (extras walk) is honoured, exactly as
+            before.
+          * every extension in ``extensions`` is ``rglob``'d and filtered
+            through ``_keep_source_file`` — same predicate, same order-agnostic
+            final ``sorted``.
+          * when ``name_skip_suffixes`` is set (JS/TS only), a file is dropped
+            if its name ends with one of those suffixes OR starts with
+            ``vite.config`` — the exact JS/TS bundle/config guard (the suffix
+            set is the SHARED module-level constant so the single-file dispatch
+            in ``_dispatch_name_for_file`` cannot drift).
+
+        The public ``_find_<lang>_files`` methods below remain thin wrappers so
+        the method surface (direct calls, monkeypatch, ``lang_dispatch`` tuple
+        construction in tests + ``analyze_repository``) is unchanged.
+        """
+        ignore_lang, extensions, name_skip_suffixes = _FINDER_SPECS[spec_key]
+        ignore_dirs = _ignore_dirs_for(ignore_lang, self.index_dot_claude)
+        files: List[Path] = []
+        for ext in extensions:
+            for f in repo_path.rglob(ext):
+                if not _keep_source_file(f, ignore_dirs):
+                    continue
+                if name_skip_suffixes is not None:
+                    if any(f.name.endswith(s) for s in name_skip_suffixes):
+                        continue
+                    if f.name.startswith('vite.config'):
+                        continue
+                files.append(f)
+        return sorted(files)
+
     def _find_python_files(self, repo_path: Path) -> List[Path]:
         """Find all Python files in repository."""
-        ignore_dirs = _ignore_dirs_for('python', self.index_dot_claude)
-        return sorted([
-            f for f in repo_path.rglob('*.py')
-            if _keep_source_file(f, ignore_dirs)
-        ])
+        return self._find_files_for('python', repo_path)
 
     def _find_lua_files(self, repo_path: Path) -> List[Path]:
         """Find all Lua files in repository."""
-        ignore_dirs = _ignore_dirs_for('lua', self.index_dot_claude)
-        return sorted([
-            f for f in repo_path.rglob('*.lua')
-            if _keep_source_file(f, ignore_dirs)
-        ])
+        return self._find_files_for('lua', repo_path)
 
     def _find_cpp_files(self, repo_path: Path) -> List[Path]:
         """Find all C++/header files in repository."""
-        ignore_dirs = _ignore_dirs_for('cpp', self.index_dot_claude)
-        files = []
-        for ext in ('*.cpp', '*.cc', '*.cxx', '*.c', '*.h', '*.hpp'):
-            files.extend([
-                f for f in repo_path.rglob(ext)
-                if _keep_source_file(f, ignore_dirs)
-            ])
-        return sorted(files)
+        return self._find_files_for('cpp', repo_path)
 
     def _find_js_files(self, repo_path: Path) -> List[Path]:
-        """Find all JavaScript files in repository."""
-        ignore_dirs = _ignore_dirs_for('js', self.index_dot_claude)
-        # v0.2.72 (P5): `.bundle.js` + `.chunk.js` join `.min.js` — these
-        # are build-output bundles (webpack/rollup/esbuild), not source.
-        # A vendored `excalidraw.bundle.js` was live-confirmed injecting its
-        # functions as retrieval context. `.chunk.js` covers split-chunk
-        # output that doesn't live under an already-ignored codegen dir.
-        # F8: the suffix set is the SHARED module-level constant so the
-        # single-file dispatch (`_dispatch_name_for_file`) cannot drift.
-        skip_suffixes = set(_JS_SKIP_SUFFIXES)
-        files = []
-        for ext in ('*.js', '*.mjs', '*.jsx'):
-            for f in repo_path.rglob(ext):
-                if not _keep_source_file(f, ignore_dirs):
-                    continue
-                if any(f.name.endswith(s) for s in skip_suffixes):
-                    continue
-                if f.name.startswith('vite.config'):
-                    continue
-                files.append(f)
-        return sorted(files)
+        """Find all JavaScript files in repository.
+
+        v0.2.72 (P5): `.bundle.js` + `.chunk.js` join `.min.js` — these are
+        build-output bundles (webpack/rollup/esbuild), not source. A vendored
+        `excalidraw.bundle.js` was live-confirmed injecting its functions as
+        retrieval context. `.chunk.js` covers split-chunk output that doesn't
+        live under an already-ignored codegen dir. F8: the suffix set is the
+        SHARED module-level constant (`_JS_SKIP_SUFFIXES`, via `_FINDER_SPECS`)
+        so the single-file dispatch (`_dispatch_name_for_file`) cannot drift.
+        """
+        return self._find_files_for('js', repo_path)
 
     def _find_ts_files(self, repo_path: Path) -> List[Path]:
-        """Find all TypeScript files in repository."""
-        ignore_dirs = _ignore_dirs_for('ts', self.index_dot_claude)
-        # v0.2.72 (P5): `.bundle.ts` / `.chunk.ts` mirror the JS bundle
-        # skips. Bundle output is almost always `.js`, but the mirror keeps
-        # the two find-methods symmetric if a toolchain emits `.ts` bundles.
-        # F8: shared module-level constant (includes `.d.ts` type stubs) so
-        # the single-file dispatch cannot drift.
-        skip_suffixes = set(_TS_SKIP_SUFFIXES)
-        files = []
-        for ext in ('*.ts', '*.tsx'):
-            for f in repo_path.rglob(ext):
-                if not _keep_source_file(f, ignore_dirs):
-                    continue
-                if any(f.name.endswith(s) for s in skip_suffixes):
-                    continue
-                if f.name.startswith('vite.config'):
-                    continue
-                files.append(f)
-        return sorted(files)
+        """Find all TypeScript files in repository.
+
+        v0.2.72 (P5): `.bundle.ts` / `.chunk.ts` mirror the JS bundle skips.
+        Bundle output is almost always `.js`, but the mirror keeps the two
+        find-methods symmetric if a toolchain emits `.ts` bundles. F8: shared
+        module-level constant (`_TS_SKIP_SUFFIXES`, includes `.d.ts` type
+        stubs) so the single-file dispatch cannot drift.
+        """
+        return self._find_files_for('ts', repo_path)
 
     def _find_go_files(self, repo_path: Path) -> List[Path]:
         """Find all Go files in repository."""
-        ignore_dirs = _ignore_dirs_for('go', self.index_dot_claude)
-        return sorted([
-            f for f in repo_path.rglob('*.go')
-            if _keep_source_file(f, ignore_dirs)
-        ])
+        return self._find_files_for('go', repo_path)
 
     def _find_rust_files(self, repo_path: Path) -> List[Path]:
         """Find all Rust files in repository."""
-        ignore_dirs = _ignore_dirs_for('rust', self.index_dot_claude)
-        return sorted([
-            f for f in repo_path.rglob('*.rs')
-            if _keep_source_file(f, ignore_dirs)
-        ])
+        return self._find_files_for('rust', repo_path)
 
     def _find_java_files(self, repo_path: Path) -> List[Path]:
         """Find all Java files in repository."""
-        ignore_dirs = _ignore_dirs_for('java', self.index_dot_claude)
-        return sorted([
-            f for f in repo_path.rglob('*.java')
-            if _keep_source_file(f, ignore_dirs)
-        ])
+        return self._find_files_for('java', repo_path)
 
     def _find_ruby_files(self, repo_path: Path) -> List[Path]:
         """Find all Ruby files in repository."""
-        ignore_dirs = _ignore_dirs_for('ruby', self.index_dot_claude)
-        return sorted([
-            f for f in repo_path.rglob('*.rb')
-            if _keep_source_file(f, ignore_dirs)
-        ])
+        return self._find_files_for('ruby', repo_path)
 
     def _find_shell_files(self, repo_path: Path) -> List[Path]:
         """Find all Shell script files in repository."""
-        ignore_dirs = _ignore_dirs_for('shell', self.index_dot_claude)
-        files = []
-        for ext in ('*.sh', '*.bash'):
-            files.extend([
-                f for f in repo_path.rglob(ext)
-                if _keep_source_file(f, ignore_dirs)
-            ])
-        return sorted(files)
+        return self._find_files_for('shell', repo_path)
 
     def _find_csharp_files(self, repo_path: Path) -> List[Path]:
         """Find all C# files in repository."""
-        ignore_dirs = _ignore_dirs_for('csharp', self.index_dot_claude)
-        return sorted([
-            f for f in repo_path.rglob('*.cs')
-            if _keep_source_file(f, ignore_dirs)
-        ])
+        return self._find_files_for('csharp', repo_path)
 
     def _find_svelte_files(self, repo_path: Path) -> List[Path]:
         """Find all Svelte component files in repository.
@@ -5872,11 +5891,7 @@ class CodeGraphAnalyzer:
         the JS/TS ignore-dir set because Svelte sits in the same npm
         tooling ecosystem (node_modules, dist, .svelte-kit codegen).
         """
-        ignore_dirs = _ignore_dirs_for('js', self.index_dot_claude)
-        return sorted([
-            f for f in repo_path.rglob('*.svelte')
-            if _keep_source_file(f, ignore_dirs)
-        ])
+        return self._find_files_for('svelte', repo_path)
 
     def _find_powershell_files(self, repo_path: Path) -> List[Path]:
         """Find all PowerShell script files in repository.
@@ -5887,22 +5902,11 @@ class CodeGraphAnalyzer:
         shell ignore-dir set since .ps1 lives in the same parts of the
         tree as .sh (templates/hooks/, scripts/).
         """
-        ignore_dirs = _ignore_dirs_for('shell', self.index_dot_claude)
-        files = []
-        for ext in ('*.ps1', '*.psm1'):
-            files.extend([
-                f for f in repo_path.rglob(ext)
-                if _keep_source_file(f, ignore_dirs)
-            ])
-        return sorted(files)
+        return self._find_files_for('powershell', repo_path)
 
     def _find_proto_files(self, repo_path: Path) -> List[Path]:
         """Find all Protocol Buffer definition files."""
-        ignore_dirs = _ignore_dirs_for('proto', self.index_dot_claude)
-        return sorted([
-            f for f in repo_path.rglob('*.proto')
-            if _keep_source_file(f, ignore_dirs)
-        ])
+        return self._find_files_for('proto', repo_path)
 
     def _analyze_csharp_file(self, file_path: Path, repo_root: Path) -> Dict[str, int]:
         """Analyze a C# file using regex-based parsing.
