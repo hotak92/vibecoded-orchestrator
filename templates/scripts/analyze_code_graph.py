@@ -621,6 +621,78 @@ def _ignore_dirs_for(language: str, index_dot_claude: bool = False) -> frozenset
     return dirs
 
 
+def _is_under_transient_state(parts: tuple) -> bool:
+    """True if a path lives under ``.claude/state/`` (transient scratch).
+
+    v0.2.73 (READ-amp origin fix). ``.claude/state/`` holds ``tool_backups/``
+    snapshot copies + per-session scratch — NEVER first-party source. It must
+    be skipped by BOTH the directory walk and the single-file path.
+
+    WHY this is its own predicate and NOT a `_COMMON_IGNORE_DIRS` entry:
+    ``ignore_dirs`` is a flat directory-NAME set tested with
+    ``any(d in f.parts for ...)``. Adding a bare ``'state'`` there would wrongly
+    skip a legitimate top-level ``state/`` package in a user project. The skip
+    must be anchored to the two-segment ``.claude`` → ``state`` sequence, which a
+    name-set can't express — hence a path-aware check shared by every walker.
+
+    Origin this fixes (live-measured 2026-07-04): on the orchestrator clone
+    ``index_dot_claude=True`` makes the walk descend into ``.claude/`` and reach
+    ``.claude/state/tool_backups/``. Because ``state`` was in no ignore set,
+    ~16k backup-snapshot ``.py`` copies (43% of the CodeFunction collection)
+    were indexed as real functions — each backup a flattened copy of a source
+    (often a ``.wt/`` worktree) file, so it ALSO defeated the ``.wt`` exclusion.
+    The old single-file guard at ``_analyze_single_file`` asserted "the directory
+    walk doesn't reach state/ in practice" — FALSE on the orchestrator clone.
+
+    Args:
+        parts: ``Path.parts`` of the candidate file (or its ``.resolve()``).
+
+    Returns:
+        True when some ``.claude`` segment is immediately followed by ``state``.
+    """
+    for i in range(len(parts) - 1):
+        if parts[i] == ".claude" and parts[i + 1] == "state":
+            return True
+    return False
+
+
+def _path_is_excluded(parts: tuple, ignore_dirs: frozenset) -> bool:
+    """The ONE source-exclusion decision, shared by the directory walk AND the
+    single-file / drain path (mirror-don't-fork — v0.2.73).
+
+    A path is excluded when it sits under any ignored directory OR under
+    ``.claude/state/`` (transient scratch — see
+    :func:`_is_under_transient_state`). Both call sites must give an IDENTICAL
+    verdict so a per-edit ``--only-file`` (drain) can't index something the
+    whole-tree walk would have skipped, or vice-versa.
+
+    Args:
+        parts: the path segments to test. Callers pass either the FULL
+            ``path.parts`` (directory walk — the repo root is not itself a
+            skip-dir) or the REPO-RELATIVE parts (single-file path — so a repo
+            that itself lives under a dir literally named e.g. ``build`` isn't
+            mis-skipped). The ``.claude/state`` two-segment check works on either.
+        ignore_dirs: the directory-NAME set to reject (already merged with any
+            language extras + unconditional additions like ``.wt``/``vendor`` by
+            the caller).
+    """
+    if any(d in parts for d in ignore_dirs):
+        return True
+    if _is_under_transient_state(parts):
+        return True
+    return False
+
+
+def _keep_source_file(path: "Path", ignore_dirs: frozenset) -> bool:
+    """Walker-facing convenience: keep ``path`` iff it is not excluded.
+
+    Thin wrapper over :func:`_path_is_excluded` so the 14 ``_find_*_files``
+    walkers read cleanly (``if _keep_source_file(f, ignore_dirs)``). Uses the
+    FULL path parts (the walk root is a real ancestor, never a skip-dir itself).
+    """
+    return not _path_is_excluded(path.parts, ignore_dirs)
+
+
 def _looks_like_orchestrator_root(repo_path: Path) -> bool:
     """Best-effort check: does ``repo_path`` look like the orchestrator clone?
 
@@ -5177,7 +5249,30 @@ class CodeGraphAnalyzer:
                     per_lang_files.append(entry)
         else:
             source_roots: List[Path] = [repo_path] + canonical_extras
+            # v0.2.73 (per-root .claude gate): the resolved `index_dot_claude`
+            # applies to the PRIMARY repo only. Every `--extra-path` root walks
+            # with `.claude` EXCLUDED by default, regardless of the primary's
+            # setting. Rationale (maintainer decision): in v0.2.73 `.claude/` is
+            # opt-out for the root project and opt-in for non-root projects; an
+            # extra path is a foreign root whose `.claude/` is its OWN
+            # orchestrator-generated tooling, not first-party source of THIS
+            # project — indexing it (e.g. the public clone's `.claude/scripts` +
+            # its `.claude/state/tool_backups` snapshots) injects thousands of
+            # foreign functions as retrieval noise (a second entry vector for the
+            # 43%-garbage bloat the `.claude/state` exclusion also targets). The
+            # `.claude/state` skip via `_keep_source_file` is unconditional on
+            # ALL roots; this gate additionally drops the rest of an extra's
+            # `.claude/`. Restored after the walk so downstream stamping/prune
+            # (which key on the primary's identity) see the resolved value.
+            _primary_index_dot_claude = getattr(self, "index_dot_claude", False)
             for source_root in source_roots:
+                is_extra_root = source_root != repo_path
+                # Finders read `self.index_dot_claude`; set it per-root so an
+                # extra's `.claude/` is excluded even when the primary indexes
+                # its own. (No per-finder signature churn — mirror-don't-fork.)
+                self.index_dot_claude = (
+                    False if is_extra_root else _primary_index_dot_claude
+                )
                 for lang_name, find_fn, analyze_fn in lang_dispatch:
                     if lang and lang != lang_name:
                         continue
@@ -5200,6 +5295,8 @@ class CodeGraphAnalyzer:
                     per_lang_files.append(
                         (lang_name, analyze_fn, list(files), source_root)
                     )
+            # Restore the primary's resolved value for any downstream reader.
+            self.index_dot_claude = _primary_index_dot_claude
 
         total_files = sum(len(fs) for _, _, fs, _ in per_lang_files)
         seen_files = 0
@@ -5584,22 +5681,6 @@ class CodeGraphAnalyzer:
             )
             return []
 
-        # v0.2.66 (Bug 3, part c): `.claude/state/` is transient scratch
-        # (tool_backups snapshots, session state) — NEVER source. Skip it
-        # defensively here too, so a direct `--only-file .claude/state/...`
-        # invocation is a no-op even though the hook also guards it. The
-        # directory walk doesn't reach state/ in practice (callers point at
-        # a repo root, not state/), so this is single-file-mode-only.
-        parts = resolved.parts
-        for i in range(len(parts) - 1):
-            if parts[i] == ".claude" and parts[i + 1] == "state":
-                print(
-                    f"ℹ️  Single-file analyze: {resolved} is under .claude/state/"
-                    " (transient scratch) — skipping",
-                    file=sys.stderr,
-                )
-                return []
-
         # Relativization-correctness gate. Collections key on repo-relative
         # POSIX paths; a file outside repo_root would either raise in
         # `relative_to` or (worse) be stamped with an absolute path,
@@ -5620,15 +5701,23 @@ class CodeGraphAnalyzer:
             # walk would not have indexed it either → silent no-op.
             return []
 
-        # F8 (pre-gate audit): reject files under ignored directories. The
-        # directory walk skips these trees entirely, but a per-edit
-        # `--only-file .wt/a/b.py` or `vendor/lib/x.js` bypassed the walkers
-        # and re-indexed noise rows. Check the REPO-RELATIVE path parts (the
-        # repo may itself live under a dir named e.g. `build`) against the
-        # SAME `_ignore_dirs_for(language, index_dot_claude)` set the walker
-        # for this language uses, plus `.wt`/`vendor` unconditionally
-        # (worktree containers + vendored third-party code are never
-        # single-file-index targets regardless of language).
+        # F8 (pre-gate audit) + v0.2.73 (READ-amp origin fix): reject files the
+        # whole-tree walk would have skipped, using the EXACT SAME decision
+        # (`_path_is_excluded`) — mirror-don't-fork. Covers two classes:
+        #   * ignored directories (`.wt`, `vendor`, `node_modules`, `.claude` on
+        #     a user project, …) — a per-edit `--only-file .wt/a/b.py` bypassed
+        #     the walkers and re-indexed noise rows (the F8 bug);
+        #   * `.claude/state/` transient scratch (tool_backups snapshots) — a
+        #     direct `--only-file .claude/state/...` (or a drain-queue entry
+        #     pointing at one) must be a no-op. The old code did this as a
+        #     separate `_is_under_transient_state` early-check; folding it into
+        #     the one predicate keeps the single-file verdict byte-identical to
+        #     the walk's. (History: the walk was thought never to reach `state/`;
+        #     it does on the orchestrator clone with index_dot_claude=True, which
+        #     let ~16k backup snapshots = 43% of the collection be indexed.)
+        # REPO-RELATIVE parts so a repo living under a dir literally named e.g.
+        # `build` isn't mis-skipped; `.wt`/`vendor` added unconditionally
+        # (worktree containers + vendored third-party are never index targets).
         ignore_lang = _DISPATCH_TO_IGNORE_LANG.get(dispatch_name, dispatch_name)
         # getattr-default keeps the path safe for test fixtures built via
         # __new__ that don't set index_dot_claude (same pattern as the
@@ -5638,10 +5727,11 @@ class CodeGraphAnalyzer:
         )
         ignore_dirs = ignore_dirs | frozenset({'.wt', 'vendor'})
         rel_parts = resolved.relative_to(repo_root).parts
-        if any(part in ignore_dirs for part in rel_parts[:-1]):
+        if _path_is_excluded(rel_parts, ignore_dirs):
             print(
                 f"ℹ️  Single-file analyze: {resolved} is under an ignored "
-                "directory — skipping (the directory walk skips it too)",
+                "directory or .claude/state/ — skipping (the directory walk "
+                "skips it too)",
                 file=sys.stderr,
             )
             return []
@@ -5666,7 +5756,7 @@ class CodeGraphAnalyzer:
         ignore_dirs = _ignore_dirs_for('python', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.py')
-            if not any(d in f.parts for d in ignore_dirs)
+            if _keep_source_file(f, ignore_dirs)
         ])
 
     def _find_lua_files(self, repo_path: Path) -> List[Path]:
@@ -5674,7 +5764,7 @@ class CodeGraphAnalyzer:
         ignore_dirs = _ignore_dirs_for('lua', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.lua')
-            if not any(d in f.parts for d in ignore_dirs)
+            if _keep_source_file(f, ignore_dirs)
         ])
 
     def _find_cpp_files(self, repo_path: Path) -> List[Path]:
@@ -5684,7 +5774,7 @@ class CodeGraphAnalyzer:
         for ext in ('*.cpp', '*.cc', '*.cxx', '*.c', '*.h', '*.hpp'):
             files.extend([
                 f for f in repo_path.rglob(ext)
-                if not any(d in f.parts for d in ignore_dirs)
+                if _keep_source_file(f, ignore_dirs)
             ])
         return sorted(files)
 
@@ -5702,7 +5792,7 @@ class CodeGraphAnalyzer:
         files = []
         for ext in ('*.js', '*.mjs', '*.jsx'):
             for f in repo_path.rglob(ext):
-                if any(d in f.parts for d in ignore_dirs):
+                if not _keep_source_file(f, ignore_dirs):
                     continue
                 if any(f.name.endswith(s) for s in skip_suffixes):
                     continue
@@ -5723,7 +5813,7 @@ class CodeGraphAnalyzer:
         files = []
         for ext in ('*.ts', '*.tsx'):
             for f in repo_path.rglob(ext):
-                if any(d in f.parts for d in ignore_dirs):
+                if not _keep_source_file(f, ignore_dirs):
                     continue
                 if any(f.name.endswith(s) for s in skip_suffixes):
                     continue
@@ -5737,7 +5827,7 @@ class CodeGraphAnalyzer:
         ignore_dirs = _ignore_dirs_for('go', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.go')
-            if not any(d in f.parts for d in ignore_dirs)
+            if _keep_source_file(f, ignore_dirs)
         ])
 
     def _find_rust_files(self, repo_path: Path) -> List[Path]:
@@ -5745,7 +5835,7 @@ class CodeGraphAnalyzer:
         ignore_dirs = _ignore_dirs_for('rust', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.rs')
-            if not any(d in f.parts for d in ignore_dirs)
+            if _keep_source_file(f, ignore_dirs)
         ])
 
     def _find_java_files(self, repo_path: Path) -> List[Path]:
@@ -5753,7 +5843,7 @@ class CodeGraphAnalyzer:
         ignore_dirs = _ignore_dirs_for('java', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.java')
-            if not any(d in f.parts for d in ignore_dirs)
+            if _keep_source_file(f, ignore_dirs)
         ])
 
     def _find_ruby_files(self, repo_path: Path) -> List[Path]:
@@ -5761,7 +5851,7 @@ class CodeGraphAnalyzer:
         ignore_dirs = _ignore_dirs_for('ruby', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.rb')
-            if not any(d in f.parts for d in ignore_dirs)
+            if _keep_source_file(f, ignore_dirs)
         ])
 
     def _find_shell_files(self, repo_path: Path) -> List[Path]:
@@ -5771,7 +5861,7 @@ class CodeGraphAnalyzer:
         for ext in ('*.sh', '*.bash'):
             files.extend([
                 f for f in repo_path.rglob(ext)
-                if not any(d in f.parts for d in ignore_dirs)
+                if _keep_source_file(f, ignore_dirs)
             ])
         return sorted(files)
 
@@ -5780,7 +5870,7 @@ class CodeGraphAnalyzer:
         ignore_dirs = _ignore_dirs_for('csharp', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.cs')
-            if not any(d in f.parts for d in ignore_dirs)
+            if _keep_source_file(f, ignore_dirs)
         ])
 
     def _find_svelte_files(self, repo_path: Path) -> List[Path]:
@@ -5794,7 +5884,7 @@ class CodeGraphAnalyzer:
         ignore_dirs = _ignore_dirs_for('js', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.svelte')
-            if not any(d in f.parts for d in ignore_dirs)
+            if _keep_source_file(f, ignore_dirs)
         ])
 
     def _find_powershell_files(self, repo_path: Path) -> List[Path]:
@@ -5811,7 +5901,7 @@ class CodeGraphAnalyzer:
         for ext in ('*.ps1', '*.psm1'):
             files.extend([
                 f for f in repo_path.rglob(ext)
-                if not any(d in f.parts for d in ignore_dirs)
+                if _keep_source_file(f, ignore_dirs)
             ])
         return sorted(files)
 
@@ -5820,7 +5910,7 @@ class CodeGraphAnalyzer:
         ignore_dirs = _ignore_dirs_for('proto', self.index_dot_claude)
         return sorted([
             f for f in repo_path.rglob('*.proto')
-            if not any(d in f.parts for d in ignore_dirs)
+            if _keep_source_file(f, ignore_dirs)
         ])
 
     def _analyze_csharp_file(self, file_path: Path, repo_root: Path) -> Dict[str, int]:
