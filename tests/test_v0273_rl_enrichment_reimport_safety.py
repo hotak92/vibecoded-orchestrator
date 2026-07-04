@@ -87,3 +87,38 @@ def test_bare_server_attr_reads_resolve_after_reimport():
     assert isinstance(rl.server.EMBEDDING_MODEL, str)
     assert callable(rl.server._cosine)
     assert callable(rl.server._extract_obj_vector)
+
+
+def test_proxy_tracks_the_callers_import_path_not_a_fixed_key():
+    """DUAL-IMPORT-PATH safety: the package is importable under BOTH
+    ``weaviate_mcp`` and ``claude_mcp_servers.weaviate_mcp`` — which are
+    DISTINCT module objects in sys.modules. rl_enrichment's proxy must resolve
+    the sibling ``server`` under ITS OWN __package__, so a patch on whichever
+    server object the caller imported is the one the moved functions observe.
+
+    Regression for the v0.2.73 round-3 failure: the proxy hard-coded
+    ``weaviate_mcp.server`` while tests import
+    ``claude_mcp_servers.weaviate_mcp.server`` and patch THAT object — the proxy
+    resolved the wrong module and never saw the patch."""
+    _purge_weaviate_mcp()
+    for m in list(sys.modules):
+        if m.endswith("weaviate_mcp") or ".weaviate_mcp." in m or m == "claude_mcp_servers":
+            sys.modules.pop(m, None)
+
+    # Import via the REPO-ROOT path (the shape the pytest suite uses).
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    srv = importlib.import_module("claude_mcp_servers.weaviate_mcp.server")
+    rl = importlib.import_module("claude_mcp_servers.weaviate_mcp.rl_enrichment")
+
+    # The proxy must resolve the SAME server object the caller imported.
+    assert rl.server._live() is srv, (
+        "rl_enrichment.server must resolve the server under its own package "
+        "(claude_mcp_servers.weaviate_mcp), not a hard-coded weaviate_mcp.server"
+    )
+
+    # And a patch on THAT object must be observed via the proxy.
+    from unittest.mock import patch
+    sentinel = object()
+    with patch.object(srv, "_extract_obj_vector", lambda *a, **k: sentinel):
+        assert rl.server._extract_obj_vector() is sentinel

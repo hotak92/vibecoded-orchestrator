@@ -63,30 +63,52 @@ from typing import Optional
 # later re-imported while this module isn't (a partial ``sys.modules`` purge
 # leaves the re-exported functions pointing at a STALE server, so a
 # ``monkeypatch.setattr(new_server, …)`` isn't seen) — ``server`` is a LAZY
-# PROXY that forwards every attribute access to the LIVE
-# ``sys.modules["weaviate_mcp.server"]``. This is:
+# PROXY that forwards every attribute access to the LIVE sibling ``server``
+# module. This is:
 #   * import-order-safe: nothing touches ``server`` at THIS module's load time
 #     (the proxy resolves lazily on first attribute access, after both modules
 #     have finished importing), so the circular edge never fires;
 #   * re-import-safe: bare ``server.<name>`` always hits the CURRENT server
-#     module, so a test that purges + re-imports ``weaviate_mcp`` (and patches
-#     the fresh server) is observed correctly even by re-exported functions.
+#     module, so a test that purges + re-imports the package (and patches the
+#     fresh server) is observed correctly even by re-exported functions;
+#   * dual-import-path-safe: this package can be loaded under TWO sys.modules
+#     keys (``weaviate_mcp`` on the MCP path, ``claude_mcp_servers.weaviate_mcp``
+#     on the repo-root test path), which are DISTINCT module objects. The proxy
+#     resolves the sibling ``server`` under THIS module's OWN ``__package__``
+#     (falling back to the other key), so ``patch.object(srv, …)`` on whichever
+#     path the caller imported is the one the moved functions observe.
 import sys as _sys
 import types as _types
 import importlib as _importlib
 
+# Sibling ``server`` module name(s) to resolve, current package first. Two keys
+# exist when the package is imported under both path prefixes; prefer the one
+# matching THIS module's __package__ so a patch on the caller's server object
+# is seen.
+_SERVER_MOD_NAMES = tuple(dict.fromkeys(  # de-dup, order-preserving
+    n for n in (
+        (f"{__package__}.server" if __package__ else None),
+        "weaviate_mcp.server",
+        "claude_mcp_servers.weaviate_mcp.server",
+    ) if n
+))
+
 
 class _LazyServerProxy(_types.ModuleType):
-    """Attribute access forwards to the live ``weaviate_mcp.server`` module."""
+    """Attribute access forwards to the live sibling ``server`` module."""
 
     def __init__(self) -> None:
-        super().__init__("weaviate_mcp._server_proxy")
+        super().__init__(f"{__package__}._server_proxy" if __package__
+                         else "weaviate_mcp._server_proxy")
 
     def _live(self):
-        mod = _sys.modules.get("weaviate_mcp.server")
-        if mod is None or mod is self:
-            mod = _importlib.import_module("weaviate_mcp.server")
-        return mod
+        for _name in _SERVER_MOD_NAMES:
+            mod = _sys.modules.get(_name)
+            if mod is not None and mod is not self:
+                return mod
+        # Not yet in sys.modules under any known key → import the canonical
+        # sibling (this module's own package first).
+        return _importlib.import_module(_SERVER_MOD_NAMES[0])
 
     def __getattr__(self, name):
         return getattr(self._live(), name)
