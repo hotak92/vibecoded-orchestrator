@@ -1774,19 +1774,48 @@ def migrate_collections(
             for env_key in _recover_targets
             if os.environ.get(env_key, "")
         }
-        # Only KG/DEV/DIAGRAMS-family staging is in scope: a renamed KG,
-        # Development or Diagrams collection is exactly the A-10 leak. Other
-        # ``__staging`` classes (e.g. code-graph ``*_CodeFunction__staging``)
-        # are owned by different subsystems and must NOT be surfaced here.
+        # Two distinct staging families are reaped here:
+        #
+        #  * KG family (KnowledgeGraph / Development / Diagrams): a renamed KG,
+        #    Development or Diagrams collection is exactly the A-10 leak. These
+        #    are user-authored — a staging class may hold the ONLY surviving
+        #    copy — so they are RETAINED + SURFACED for human review, never
+        #    auto-dropped.
+        #  * Code-graph family (``*_Code{Module,Class,Function,API,
+        #    Interaction}__staging``): IS handled here too (v0.2.73, Q3),
+        #    precisely because NOTHING else reaps it — the code-graph rebuild
+        #    path (``weaviate_schema.rebuild_collection_via_staging``) leaves
+        #    ``<Collection>__staging`` behind on a mismatch/crash and assumes
+        #    this upstream sweep flushes it, but historically this sweep
+        #    excluded it → an ownerless seam that orphaned code-graph staging
+        #    forever. Because code graph is DERIVED/regenerable (unlike KG),
+        #    a *provable* orphan can be SAFE-DROPPED — but only under the same
+        #    count-aware guard as ``_recover_or_drop_orphan_staging``: drop
+        #    ONLY when the base collection exists and holds >= as many objects
+        #    as the staging (staging is then a pure orphan). If the base is
+        #    MISSING or SMALLER, the staging might be the fuller/only copy, so
+        #    RETAIN + SURFACE instead (never blind-drop).
         _KG_FAMILY_STAGING_SUFFIXES = (
             "_KnowledgeGraph" + _STAGING_SUFFIX,
             "_Development" + _STAGING_SUFFIX,
             "_Diagrams" + _STAGING_SUFFIX,
         )
+        _CODEGRAPH_STAGING_SUFFIXES = (
+            "_CodeModule" + _STAGING_SUFFIX,
+            "_CodeClass" + _STAGING_SUFFIX,
+            "_CodeFunction" + _STAGING_SUFFIX,
+            "_CodeAPI" + _STAGING_SUFFIX,
+            "_CodeInteraction" + _STAGING_SUFFIX,
+        )
         _all_classes = _list_classes(weaviate_url)
         _orphan_staging = sorted(
             c for c in _all_classes
             if c.endswith(_KG_FAMILY_STAGING_SUFFIXES)
+            and c not in _already_handled_staging
+        )
+        _codegraph_orphan_staging = sorted(
+            c for c in _all_classes
+            if c.endswith(_CODEGRAPH_STAGING_SUFFIXES)
             and c not in _already_handled_staging
         )
         for _orphan in _orphan_staging:
@@ -1817,6 +1846,132 @@ def migrate_collections(
                     f"launcher; VCO will not auto-drop it."
                 ),
             })
+        # Code-graph orphan staging (Q3): count-aware SAFE-DROP-or-SURFACE.
+        # Code graph is DERIVED (regenerable), so a provable orphan is
+        # self-heal, not destruction — but the count guard is what makes the
+        # drop safe. We mirror the SAFE-DROP / AMBIGUOUS discipline of
+        # ``_recover_or_drop_orphan_staging`` WITHOUT a KG target schema
+        # (code-graph staging must NOT be recovered via the KG schema path —
+        # only safe-dropped when provably redundant, or retained).
+        #
+        # CROSS-PROJECT SAFETY (v0.2.73): ``_list_classes`` is INSTANCE-WIDE, so
+        # this sweep sees EVERY project's code-graph staging on the shared
+        # Weaviate. Auto-dropping another project's ``*_Code*__staging`` would
+        # be exactly the cross-tenant data-loss the legacy-KG detector was
+        # hardened against — that project may have a rebuild IN FLIGHT (its
+        # base momentarily >= staging) whose staging we'd delete out from under
+        # it. So the SAFE-DROP is gated to THIS project's own code-graph prefix;
+        # any code-graph staging belonging to a DIFFERENT project is only
+        # SURFACED (retained) for that project's own migrate run to reconcile.
+        #
+        # Resolve the current project's code-graph prefix the SAME canonical way
+        # the analyzer / schema_migration_runner do: env ``CODE_GRAPH_PROJECT``
+        # (already the sanitized prefix) → ``PROJECT_NAME`` (derived) → the CLI
+        # ``args.name`` fallback. Env-first matters because install/post-bundle
+        # runs carry the identity in env, not ``args.name``; the CLI
+        # ``migrate --name`` path carries it in args. Empty (unresolvable) →
+        # ownership can't be proven → NEVER auto-drop (surface only).
+        _self_cg_prefix = (os.environ.get("CODE_GRAPH_PROJECT") or "").strip()
+        if not _self_cg_prefix:
+            _pn = (os.environ.get("PROJECT_NAME") or "").strip()
+            if _pn:
+                _self_cg_prefix = derive_project_code_prefix(_pn)
+        if not _self_cg_prefix:
+            _self_cg_prefix = _resolve_codegraph_prefix_for_plan(args)
+        for _cg_orphan in _codegraph_orphan_staging:
+            _cg_base = _cg_orphan[: -len(_STAGING_SUFFIX)]
+            _cg_base_exists = _cg_base in _all_classes
+            # Is this staging OURS? Its base must start with this project's
+            # code-graph prefix (e.g. ``MyProj_CodeFunction`` for prefix
+            # ``MyProj``). Empty prefix (no --name / unresolvable) → we can't
+            # prove ownership, so we NEVER auto-drop (surface only).
+            _cg_is_ours = bool(_self_cg_prefix) and (
+                _cg_base == _self_cg_prefix
+                or _cg_base.startswith(_self_cg_prefix + "_")
+            )
+            _staging_count = _count_objects(_cg_orphan, weaviate_url=weaviate_url)
+            _base_count = (
+                _count_objects(_cg_base, weaviate_url=weaviate_url)
+                if _cg_base_exists else 0
+            )
+            if _cg_is_ours and _cg_base_exists and _base_count >= _staging_count:
+                # SAFE-DROP: OUR project's staging, base intact and at least as
+                # complete → the staging is a pure orphan from a crashed/
+                # mismatched rebuild of THIS project's code graph.
+                _delete_class(_cg_orphan, weaviate_url=weaviate_url)
+                _log(
+                    "7b.recover", "info",
+                    f"SAFE-DROP code-graph orphan staging {_cg_orphan}: base "
+                    f"{_cg_base!r} intact ({_base_count} objs >= staging "
+                    f"{_staging_count}); code graph is derived — dropping the "
+                    f"redundant orphan (self-heal)",
+                    data={
+                        "staging": _cg_orphan,
+                        "base": _cg_base,
+                        "base_count": _base_count,
+                        "staging_count": _staging_count,
+                        "branch": "codegraph_safe_drop",
+                    },
+                )
+                result["errors"].append({
+                    "collection": _cg_base,
+                    "action": "recover",
+                    "error": (
+                        f"code-graph orphan staging {_cg_orphan} SAFE-DROPPED: "
+                        f"base {_cg_base!r} intact ({_base_count} objs >= "
+                        f"staging {_staging_count}). Code graph is derived; "
+                        f"the redundant orphan was auto-dropped (self-heal)."
+                    ),
+                    "resolved": True,
+                    "action_taken": "safe_dropped",
+                })
+            else:
+                # RETAIN + SURFACE. Three distinct reasons, all conservative:
+                #  (a) NOT OURS — the staging belongs to a different project's
+                #      code-graph prefix (or ownership is unprovable): never
+                #      touch another tenant's staging; its own migrate run will
+                #      reconcile it.
+                #  (b) base MISSING — staging may be the only surviving copy.
+                #  (c) base SMALLER — staging may be the fuller copy.
+                if not _cg_is_ours:
+                    _reason = (
+                        f"belongs to a DIFFERENT project "
+                        f"(base {_cg_base!r} is not under this project's "
+                        f"code-graph prefix {_self_cg_prefix or '<unresolved>'!r})"
+                    )
+                    _branch = "codegraph_foreign_surface"
+                elif not _cg_base_exists:
+                    _reason = "base MISSING (staging may be the only surviving copy)"
+                    _branch = "codegraph_retain_surface"
+                else:
+                    _reason = (
+                        f"base present but SMALLER ({_base_count} objs < "
+                        f"staging {_staging_count})"
+                    )
+                    _branch = "codegraph_retain_surface"
+                _log(
+                    "7b.recover", "warn",
+                    f"code-graph orphan staging {_cg_orphan} RETAINED: {_reason}"
+                    f" — not auto-dropped",
+                    data={
+                        "staging": _cg_orphan,
+                        "base": _cg_base,
+                        "base_present": _cg_base_exists,
+                        "base_count": _base_count,
+                        "staging_count": _staging_count,
+                        "is_ours": _cg_is_ours,
+                        "branch": _branch,
+                    },
+                )
+                result["errors"].append({
+                    "collection": _cg_base,
+                    "action": "recover",
+                    "error": (
+                        f"code-graph orphan staging {_cg_orphan} RETAINED for "
+                        f"human review: {_reason}. Not auto-dropped — inspect "
+                        f"and, if safe, drop manually via the launcher."
+                    ),
+                })
     except Exception as e:
         # Soft-fail: the extra sweep must never break migrate-collections.
         _log("7b.recover", "warn",

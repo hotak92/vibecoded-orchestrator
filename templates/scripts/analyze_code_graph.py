@@ -494,6 +494,38 @@ def _sanitize_collection_prefix(name: str) -> str:
     return _canonical_class_prefix(name)
 
 
+# v0.2.70 G5 / v0.2.73 Q1: git-worktree-container directory names. A canonical
+# project name NEVER contains one of these as a path segment; when one appears
+# it means the analyzer is being pointed at a throwaway per-track worktree
+# (`<repo>/.wt/<track>`, `worktrees/<name>`, or the older `vco-wt/<track>`
+# layout) whose relative name would mint a `<Worktree>_Code*` pollution
+# collection that never gets cleaned up.
+_WORKTREE_PATH_SEGMENTS = (".wt", "worktrees", "vco-wt")
+
+
+def _worktree_segment_in_value(value: Optional[str]) -> Optional[str]:
+    """Return the offending worktree-container segment if `value` (an EXPLICIT
+    --project / CODE_GRAPH_PROJECT string) contains one as a WHOLE path-ish
+    segment, else None.
+
+    Splits on '/', '\\', and whitespace and compares each resulting segment
+    EXACTLY (case-insensitive) against `_WORKTREE_PATH_SEGMENTS`. This is a
+    segment match, NOT a substring match — a legit project name that merely
+    contains the substring "wt" ("SwiftUI", "MyWtfProject", "Growth") or even
+    the substring ".wt" inside a larger token is NOT flagged; only a bare
+    segment equal to '.wt' / 'worktrees' / 'vco-wt' is.
+    """
+    if not value:
+        return None
+    # Split on the two path separators + any whitespace run.
+    segments = re.split(r"[\\/\s]+", value.strip())
+    wanted = {s.lower() for s in _WORKTREE_PATH_SEGMENTS}
+    for seg in segments:
+        if seg and seg.lower() in wanted:
+            return seg
+    return None
+
+
 def _collection_name(base: str, project_name: str) -> str:
     """Return per-project collection name, e.g. 'MyProject_CodeModule'.
 
@@ -9371,7 +9403,6 @@ def main():
         # never on a project legitimately named "wt-foo". (G4 — dropping the
         # ALREADY-polluted collections — is a destructive ops task needing
         # maintainer consent, intentionally NOT done here.)
-        _WORKTREE_PATH_SEGMENTS = (".wt", "worktrees", "vco-wt")
         _path_parts = {p.lower() for p in repo_path.resolve().parts}
         _in_worktree = any(seg in _path_parts for seg in _WORKTREE_PATH_SEGMENTS)
         if not (args.project or env_project) and _in_worktree:
@@ -9385,6 +9416,31 @@ def main():
                 file=sys.stderr,
             )
             return 1
+        # v0.2.73 G5 (Q1): the basename guard above only fires when NO explicit
+        # project name is given. But an EXPLICIT `--project vco-wt/bug1` (or
+        # `CODE_GRAPH_PROJECT=vco-wt/bug1`) walks straight past it — that is the
+        # same door the `Vco_wt_*` debris AND the `CanonicalProj` test leak used.
+        # A canonical project name NEVER contains a worktree-container segment,
+        # so ALSO refuse an explicit value that carries one as a WHOLE path-ish
+        # segment. `_worktree_segment_in_value` splits on '/', '\\', and
+        # whitespace and checks for an EXACT segment match (case-insensitive) —
+        # so a legit name that merely contains the substring "wt" ("SwiftUI",
+        # "MyWtfProject", "Growth") is NOT refused.
+        for _explicit in (args.project, env_project):
+            _offending = _worktree_segment_in_value(_explicit)
+            if _offending:
+                print(
+                    "❌ analyze_code_graph: refusing to mint a code-graph "
+                    f"collection from a worktree-relative project name "
+                    f"('{_explicit}') — the segment '{_offending}' is a "
+                    "git-worktree-container name, not a canonical project. This "
+                    "would create a `<Worktree>_Code*` pollution collection that "
+                    "never gets cleaned up. Pass the CANONICAL project name "
+                    "(no '.wt'/'worktrees'/'vco-wt' path segment) via --project "
+                    "or CODE_GRAPH_PROJECT.",
+                    file=sys.stderr,
+                )
+                return 1
         project_name = args.project or env_project or repo_path.name
 
     if args.verbose:

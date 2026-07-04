@@ -13,8 +13,10 @@ Also asserts the four code-graph surfaces all route through the SHARED helper
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -27,6 +29,23 @@ HOOKS = REPO_ROOT / "templates" / "hooks"
 
 def _has_bash() -> bool:
     return shutil.which("bash") is not None
+
+
+def _drop_test_collections(class_names) -> None:
+    """Soft teardown: DELETE each `/v1/schema/<class>` on the live Weaviate.
+
+    Mirrors the cleanup idiom in test_codegraph_single_file_scope.py (which
+    reaches the client in-process); here the analyzer ran as a SUBPROCESS, so
+    we issue the DELETE over HTTP instead. Fully soft — a missing class, a
+    down Weaviate, or any transport error must never fail the teardown.
+    """
+    base = os.environ.get("WEAVIATE_URL", "http://localhost:8081").rstrip("/")
+    for name in class_names:
+        try:
+            req = urllib.request.Request(f"{base}/v1/schema/{name}", method="DELETE")
+            urllib.request.urlopen(req, timeout=5).close()  # noqa: S310 (local URL)
+        except Exception:
+            pass
 
 
 pytestmark = pytest.mark.skipif(not _has_bash(), reason="bash required")
@@ -226,18 +245,29 @@ def test_g5_guard_allows_explicit_project_from_worktree(tmp_path: Path) -> None:
     analyze without Weaviate, but the guard runs BEFORE connect — so a clean
     pass past the guard means it either connects or fails later, NOT exit-1
     with the 'refusing to mint' message.)"""
-    import os
     wt = tmp_path / ".wt" / "agent-abc"
     wt.mkdir(parents=True)
     analyzer = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
     env = {k: v for k, v in os.environ.items() if k not in ("CODE_GRAPH_PROJECT", "PROJECT_NAME")}
-    r = subprocess.run(
-        [shutil.which("python3") or "python3", str(analyzer), ".", "--project", "CanonicalProj"],
-        cwd=str(wt), capture_output=True, text=True, timeout=60, env=env,
-    )
-    assert "refusing to mint" not in r.stderr, (
-        f"guard wrongly fired with an explicit --project: {r.stderr[-400:]}"
-    )
+    try:
+        r = subprocess.run(
+            [shutil.which("python3") or "python3", str(analyzer), ".", "--project", "CanonicalProj"],
+            cwd=str(wt), capture_output=True, text=True, timeout=60, env=env,
+        )
+        assert "refusing to mint" not in r.stderr, (
+            f"guard wrongly fired with an explicit --project: {r.stderr[-400:]}"
+        )
+    finally:
+        # The analyzer runs PAST the G5 guard (explicit --project) and, when
+        # Weaviate + the code-embed backend are up, mints the five
+        # `CanonicalProj_Code*` classes via create_collections(). Without this
+        # teardown they leak on the live instance (0-object empty classes,
+        # since `.wt/agent-abc` has no source). Soft-drop them.
+        _drop_test_collections(
+            f"CanonicalProj_{suffix}"
+            for suffix in ("CodeModule", "CodeClass", "CodeFunction",
+                           "CodeAPI", "CodeInteraction")
+        )
 
 
 def test_g5_guard_does_not_false_refuse_legit_wt_named_project(tmp_path: Path) -> None:
@@ -258,3 +288,49 @@ def test_g5_guard_does_not_false_refuse_legit_wt_named_project(tmp_path: Path) -
     assert "refusing to mint" not in r.stderr, (
         f"guard FALSE-REFUSED a legitimately-named 'wt-foo' project: {r.stderr[-400:]}"
     )
+
+
+def test_g5_guard_refuses_explicit_worktree_relative_project(tmp_path: Path) -> None:
+    """Q1 (v0.2.73): the OTHER door — an EXPLICIT `--project vco-wt/bug1` (whose
+    value itself carries a worktree-container segment) must be REFUSED, even
+    from a NON-worktree cwd. This is the bypass that both the `Vco_wt_*` debris
+    and the `CanonicalProj` test leak walked through. The analyzer must exit 1
+    BEFORE connecting to Weaviate, so this test mints NOTHING (leak-free)."""
+    plain = tmp_path / "plain-dir"   # deliberately NOT under a worktree segment
+    plain.mkdir(parents=True)
+    analyzer = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
+    env = {k: v for k, v in os.environ.items() if k not in ("CODE_GRAPH_PROJECT", "PROJECT_NAME")}
+    r = subprocess.run(
+        [shutil.which("python3") or "python3", str(analyzer), ".", "--project", "vco-wt/bug1"],
+        cwd=str(plain), capture_output=True, text=True, timeout=60, env=env,
+    )
+    assert r.returncode == 1, f"expected refusal exit 1; got {r.returncode}\n{r.stderr[-400:]}"
+    assert "refusing to mint" in r.stderr, r.stderr[-400:]
+    assert "vco-wt" in r.stderr, (
+        f"refusal message must name the offending segment: {r.stderr[-400:]}"
+    )
+
+
+def test_g5_guard_allows_explicit_legit_wt_substring_project(tmp_path: Path) -> None:
+    """Q1 companion: an explicit project name that merely CONTAINS the substring
+    'wt' as part of a word ('SwiftlyTyped') is NOT a worktree segment, so the
+    guard must NOT refuse it. (It runs past the guard; when Weaviate is up it
+    would mint SwiftlyTyped_Code*, so we drop those in teardown.)"""
+    plain = tmp_path / "plain-dir2"
+    plain.mkdir(parents=True)
+    analyzer = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
+    env = {k: v for k, v in os.environ.items() if k not in ("CODE_GRAPH_PROJECT", "PROJECT_NAME")}
+    try:
+        r = subprocess.run(
+            [shutil.which("python3") or "python3", str(analyzer), ".", "--project", "SwiftlyTyped"],
+            cwd=str(plain), capture_output=True, text=True, timeout=60, env=env,
+        )
+        assert "refusing to mint" not in r.stderr, (
+            f"guard FALSE-REFUSED an explicit legit 'wt'-substring project: {r.stderr[-400:]}"
+        )
+    finally:
+        _drop_test_collections(
+            f"SwiftlyTyped_{suffix}"
+            for suffix in ("CodeModule", "CodeClass", "CodeFunction",
+                           "CodeAPI", "CodeInteraction")
+        )

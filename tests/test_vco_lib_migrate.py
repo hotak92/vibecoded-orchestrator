@@ -324,6 +324,7 @@ class MigrateDispatchUnitTests(unittest.TestCase):
             "Foo_Diagrams":        _at_target_diagrams(),
         })
         with mock.patch.object(project_init, "_recover_or_drop_orphan_staging", return_value="none"), \
+             mock.patch.object(project_init, "_list_classes", return_value=[]), \
              mock.patch.object(project_init, "_create_class") as cmock, \
              mock.patch.object(project_init, "_post_property") as pmock, \
              mock.patch.object(project_init, "_copy_collection_with_vectors") as copmock, \
@@ -351,6 +352,7 @@ class MigrateDispatchUnitTests(unittest.TestCase):
             "Foo_Development":     _at_target_dev(),
         })
         with mock.patch.object(project_init, "_recover_or_drop_orphan_staging", return_value="none"), \
+             mock.patch.object(project_init, "_list_classes", return_value=[]), \
              mock.patch.object(project_init, "_create_class") as cmock, \
              mock.patch.object(project_init, "_copy_collection_with_vectors", return_value=42) as copmock, \
              mock.patch.object(project_init, "_delete_class") as dmock:
@@ -382,6 +384,7 @@ class MigrateDispatchUnitTests(unittest.TestCase):
             "Foo_Diagrams":        _at_target_diagrams(),
         })
         with mock.patch.object(project_init, "_recover_or_drop_orphan_staging", return_value="none"), \
+             mock.patch.object(project_init, "_list_classes", return_value=[]), \
              mock.patch.object(project_init, "_post_property") as pmock, \
              mock.patch.object(project_init, "_copy_collection_with_vectors") as copmock:
             result = project_init.migrate_collections(
@@ -404,6 +407,7 @@ class MigrateDispatchUnitTests(unittest.TestCase):
             "Foo_Diagrams":        _at_target_diagrams(),
         })
         with mock.patch.object(project_init, "_recover_or_drop_orphan_staging", return_value="none"), \
+             mock.patch.object(project_init, "_list_classes", return_value=[]), \
              mock.patch.object(project_init, "_create_class") as cmock:
             result = project_init.migrate_collections(
                 self.args, dry_run=False, schema_fetcher=fetcher,
@@ -424,6 +428,7 @@ class MigrateDispatchUnitTests(unittest.TestCase):
         })
         args = argparse.Namespace(force_rebuild=True)
         with mock.patch.object(project_init, "_recover_or_drop_orphan_staging", return_value="none"), \
+             mock.patch.object(project_init, "_list_classes", return_value=[]), \
              mock.patch.object(project_init, "_fetch_schema",
                                side_effect=lambda n, weaviate_url=None: fetcher(n)), \
              mock.patch.object(project_init, "_delete_class") as dmock:
@@ -442,6 +447,7 @@ class MigrateDispatchUnitTests(unittest.TestCase):
             "Foo_Development":    _at_target_dev(),
         })
         with mock.patch.object(project_init, "_recover_or_drop_orphan_staging", return_value="none"), \
+             mock.patch.object(project_init, "_list_classes", return_value=[]), \
              mock.patch.object(project_init, "_fetch_schema",
                                side_effect=lambda n, weaviate_url=None: fetcher(n)), \
              mock.patch.object(project_init, "_delete_class") as dmock, \
@@ -465,7 +471,8 @@ class MigrateDispatchUnitTests(unittest.TestCase):
             "Foo_Diagrams":       _at_target_diagrams(),
         })
         with mock.patch.object(project_init, "_recover_or_drop_orphan_staging",
-                               return_value="dropped") as drop_mock:
+                               return_value="dropped") as drop_mock, \
+             mock.patch.object(project_init, "_list_classes", return_value=[]):
             project_init.migrate_collections(
                 self.args, dry_run=True, schema_fetcher=fetcher,
             )
