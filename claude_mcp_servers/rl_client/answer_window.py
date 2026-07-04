@@ -21,6 +21,7 @@ server.py for them (the modularity rule: one concern, one home).
 from __future__ import annotations
 
 import json as _json
+import os as _os
 from pathlib import Path  # used in string annotations (load_messages arg)
 
 __all__ = [
@@ -28,6 +29,8 @@ __all__ = [
     "TOOL_CONTENT_LIMIT",
     "KG_SEARCH_TOOLS",
     "load_messages",
+    "load_messages_cached",
+    "stat_signature",
     "find_kg_positions",
     "extract_answer_window",
     "match_position_for_query",
@@ -70,6 +73,74 @@ def load_messages(transcript_path: "str | Path") -> list[dict]:
                     continue
     except OSError:
         pass
+    return messages
+
+
+# ---- v0.2.73 Concern-B: read-bounding, ONE shared home ---------------------
+#
+# The answer monitor (rl_enrichment._rl_answer_monitor) polls every
+# _RL_MONITOR_POLL_INTERVAL seconds and, pre-Concern-B, re-read + re-JSON-parsed
+# the ENTIRE (growing) transcript on EVERY poll — O(file_size × poll_count) on a
+# long session, most of it wasted on IDLE polls where Claude produced no new
+# output. The drain (rl_drain_citations) reads once per Stop, and the paid
+# online-training path sits downstream of the same window — but per the
+# modularity ruling the read-bounding lives in ONE place all callers share, not
+# forked per caller.
+#
+# The fix is a process-global parse cache keyed on the file's (mtime, size)
+# signature: an UNCHANGED transcript returns the already-parsed message list
+# without re-reading or re-parsing a single byte; a CHANGED transcript re-parses
+# in full and refreshes the cache. Because a cache hit returns the SAME parsed
+# messages a full ``load_messages`` would, and a miss falls straight through to
+# ``load_messages``, the extracted answer window is BYTE-IDENTICAL to the
+# pre-Concern-B full-read path for every caller (monitor / drain / online).
+# Pure-stdlib; no paid-module import; identical on Windows (os.stat is portable).
+
+# path(str) -> (mtime, size, messages). Bounded so a long-lived MCP subprocess
+# serving many transcripts can't grow it without limit (LRU-ish: insertion-order
+# pop of the oldest entry once over the cap). The cache holds parsed lists, which
+# dominate memory, so the cap is modest.
+_MESSAGE_CACHE: "dict[str, tuple[float, int, list[dict]]]" = {}
+_MESSAGE_CACHE_MAX = 32
+
+
+def stat_signature(transcript_path: "str | Path") -> "tuple[float, int] | None":
+    """Return ``(st_mtime, st_size)`` for a transcript, or None if unstattable.
+
+    The cheap change-detector shared by the monitor's idle-poll short-circuit
+    and the cached loader below: two polls with the same signature saw the same
+    bytes, so there is nothing new to read, parse, or recount. Soft-fail to None
+    (treated as "changed / unknown" by callers so they never skip on error)."""
+    try:
+        st = _os.stat(transcript_path)
+    except OSError:
+        return None
+    return (st.st_mtime, st.st_size)
+
+
+def load_messages_cached(transcript_path: "str | Path") -> list[dict]:
+    """``load_messages`` with a process-global (mtime, size) parse cache.
+
+    ONE shared read-bounding home (Concern B). Returns byte-identical parsed
+    messages to ``load_messages`` — a cache HIT hands back the list a full
+    re-parse would have produced (the file is unchanged), a MISS re-parses in
+    full and refreshes the cache. All callers (MCP monitor, Stop-hook drain,
+    online-training path) route through this so none re-parses an unchanged
+    transcript. Soft-fail: an unstattable path falls back to a plain
+    ``load_messages`` (never caches, never skips).
+    """
+    key = str(transcript_path)
+    sig = stat_signature(transcript_path)
+    if sig is not None:
+        cached = _MESSAGE_CACHE.get(key)
+        if cached is not None and (cached[0], cached[1]) == sig:
+            return cached[2]
+    messages = load_messages(transcript_path)
+    if sig is not None:
+        _MESSAGE_CACHE[key] = (sig[0], sig[1], messages)
+        # LRU bound — pop oldest insertion-order entry until size <= max.
+        while len(_MESSAGE_CACHE) > _MESSAGE_CACHE_MAX:
+            _MESSAGE_CACHE.pop(next(iter(_MESSAGE_CACHE)))
     return messages
 
 

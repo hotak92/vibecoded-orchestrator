@@ -133,6 +133,18 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
     # ---- license tier gate + per-project enable toggle ----
     rl_enabled = _resolve_rl_enabled()
 
+    # ---- v0.2.73 Concern-A: is there ANY consumer of the citation capture? ----
+    # Pre-Concern-A the answer monitor (which embeds every answer chunk via
+    # Ollama), the citation-cache populate, and the ``.claude/state/rl_pending``
+    # disk write ran on EVERY search even when NOTHING would consume the result
+    # (the ``RL_LOCAL_LOGGING_DISABLED`` opt-out was checked only at the final
+    # writer boundary, so it embedded + computed + staged, then discarded the
+    # log line). Gate the whole CAPTURE — monitor spawn + citation cache +
+    # pending-file staging — on "does a consumer exist?". The rerank itself
+    # (``_do_rerank``, gated by ``rl_enabled``) is a SEPARATE concern and is NOT
+    # gated here: a Pro user with logging off still gets rerank.
+    capture_citations = _should_capture_citations(rl_enabled)
+
     # ---- rerank or pass through ----
     ranked: list[dict[str, Any]]
     rl_used = False
@@ -156,9 +168,13 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
     # ---- spawn answer monitor (citation accumulator) ----
     # V52-N: monitor accumulates Claude prose + tool inputs until ≥25K
     # tokens OR compaction OR safety-valve timeout, then writes the
-    # citation event. Free tier still spawns — failure-rate telemetry
-    # for upgrade-path users.
-    if req.spawn_answer_monitor and req.candidates:
+    # citation event.
+    # Concern-A: only spawn when a consumer exists — the monitor is the sole
+    # driver of BOTH the (expensive) answer-embedding + citation compute AND the
+    # online ``/rl_update`` training POST. When ``capture_citations`` is False
+    # (local logging off AND no upload AND online training off/absent) spawning
+    # it would embed + compute + train + stage for a result nothing reads.
+    if capture_citations and req.spawn_answer_monitor and req.candidates:
         try:
             _spawn_answer_monitor(task_id, req.query)
         except Exception as exc:
@@ -172,33 +188,91 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
     # the in-process monitor never fires (the hook path has no monitor at all;
     # the MCP path's monitor may be evicted/timed-out). The MCP monitor deletes
     # its own pending file on fire so the drain only processes survivors.
-    try:
-        _populate_citation_cache(
-            task_id=task_id,
-            candidates=req.candidates,
-            limit=req.limit,
-            query_emb=req.query_emb,
-            embedding_source=req.embedding_source,
-            embedding_dim=req.embedding_dim,
-            embedding_model=req.embedding_model,
-            task_type=req.task_type,
-            session_id=req.session_id,
-            query=req.query,
-            stage_pending_file=True,
-            # v0.2.71 Sweep-C: carry the dual-log decision + other-slot triple
-            # into the staged ctx so the citation second-event (suffixed task_id)
-            # can be emitted at fire time alongside the active citation.
-            dual_log=req.dual_log,
-            other_embedding_source=req.other_embedding_source,
-            other_embedding_dim=req.other_embedding_dim,
-            other_embedding_model=req.other_embedding_model,
-            other_query_emb=req.other_query_emb,
-        )
-    except Exception as exc:
-        logger.debug("rerank_and_emit: citation cache populate failed (%s)", exc)
+    # Concern-A: skip the citation cache + the ``.claude/state/rl_pending`` disk
+    # write when nothing will consume the citation. Both exist ONLY to feed the
+    # eventual citation compute (in-process monitor or Stop-hook drain); with no
+    # consumer, the cache entry is never read and the pending file never drains.
+    if capture_citations:
+        try:
+            _populate_citation_cache(
+                task_id=task_id,
+                candidates=req.candidates,
+                limit=req.limit,
+                query_emb=req.query_emb,
+                embedding_source=req.embedding_source,
+                embedding_dim=req.embedding_dim,
+                embedding_model=req.embedding_model,
+                task_type=req.task_type,
+                session_id=req.session_id,
+                query=req.query,
+                stage_pending_file=True,
+                # v0.2.71 Sweep-C: carry the dual-log decision + other-slot triple
+                # into the staged ctx so the citation second-event (suffixed task_id)
+                # can be emitted at fire time alongside the active citation.
+                dual_log=req.dual_log,
+                other_embedding_source=req.other_embedding_source,
+                other_embedding_dim=req.other_embedding_dim,
+                other_embedding_model=req.other_embedding_model,
+                other_query_emb=req.other_query_emb,
+            )
+        except Exception as exc:
+            logger.debug("rerank_and_emit: citation cache populate failed (%s)", exc)
 
     # ---- emit retrieval telemetry ----
+    # Concern-A: the RETRIEVAL event's only consumers are the local hub write
+    # (gated ``not _local_logging_disabled()``) and the upload queue (gated
+    # ``_upload_consent_granted()``) — the online ``/rl_update`` path consumes the
+    # CITATION event, never the retrieval event. So skip the whole build +
+    # ``to_thread`` emit hop when neither retrieval consumer exists (the writer
+    # would drop it at its boundary anyway; skipping here saves the log-node
+    # build, the RetrievalEvent construction, and the worker-thread serialize).
     emit_success = False
+    if not _retrieval_emit_has_consumer():
+        logger.debug(
+            "rerank_and_emit: no retrieval-event consumer (local logging off + "
+            "no upload consent); skipping retrieval emit"
+        )
+    else:
+        emit_success = await _emit_retrieval_event(req, ranked, task_id, rl_used)
+
+    # ---- v0.2.71 Sweep-C: dual-RL-log fan-out (the OTHER embedding slot) ----
+    # 1:1 reuse of the collapsed per-node candidate set (the collapse already ran
+    # upstream of this pipeline), with the other slot's per-node vectors that the
+    # enrichment site attached as ``emb_other`` / ``cos_qn_other``. No second
+    # retrieval. Soft-fail throughout — a broken second emit never affects the
+    # active event, the rerank, or the user-facing search.
+    # Concern-A: the second retrieval event has the SAME two consumers as the
+    # primary, so it is also skipped when neither exists.
+    if req.dual_log and _retrieval_emit_has_consumer():
+        try:
+            # Same blocking-POST concern as the primary emit above — the
+            # other-slot event is a second ~0.5 MB urllib POST. Offload so the
+            # dual-log fan-out never blocks the retrieval coroutine.
+            await asyncio.to_thread(_emit_other_slot_event, task_id, req)
+        except Exception as exc:
+            logger.debug("rerank_and_emit: dual-log second emit raised (%s)", exc)
+
+    return RerankResult(
+        ranked=ranked,
+        task_id=task_id,
+        rl_used=rl_used,
+        emit_success=emit_success,
+    )
+
+
+async def _emit_retrieval_event(
+    req: RerankRequest,
+    ranked: list[dict[str, Any]],
+    task_id: str,
+    rl_used: bool,
+) -> bool:
+    """Build + emit the primary retrieval telemetry event. Returns emit success.
+
+    Extracted from ``rerank_and_emit`` (v0.2.73 Concern-A) so the caller can
+    cheaply SKIP the whole build+emit when neither retrieval consumer exists,
+    without an early-return maze in the main flow. Byte-identical event shape to
+    the pre-extraction inline path — pure move.
+    """
     log_nodes = _build_log_nodes(req.candidates, req.limit)
     # v0.2.73 RL-1: stamp the post-rerank SHOWN order onto the log nodes.
     # Pre-RL-1 the event carried only the pre-rerank candidate order (the
@@ -217,6 +291,7 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
         _sr = _shown_ranks.get(_rec.get("title", ""))
         if _sr is not None:
             _rec["shown_rank"] = _sr
+    emit_success = False
     try:
         ev = RetrievalEvent(
             query=req.query,
@@ -253,31 +328,83 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
         logger.debug("rerank_and_emit: emit validation failed (%s)", exc)
     except Exception as exc:
         logger.debug("rerank_and_emit: emit raised (%s)", exc)
-
-    # ---- v0.2.71 Sweep-C: dual-RL-log fan-out (the OTHER embedding slot) ----
-    # 1:1 reuse of the collapsed per-node candidate set (the collapse already ran
-    # upstream of this pipeline), with the other slot's per-node vectors that the
-    # enrichment site attached as ``emb_other`` / ``cos_qn_other``. No second
-    # retrieval. Soft-fail throughout — a broken second emit never affects the
-    # active event, the rerank, or the user-facing search.
-    if req.dual_log:
-        try:
-            # Same blocking-POST concern as the primary emit above — the
-            # other-slot event is a second ~0.5 MB urllib POST. Offload so the
-            # dual-log fan-out never blocks the retrieval coroutine.
-            await asyncio.to_thread(_emit_other_slot_event, task_id, req)
-        except Exception as exc:
-            logger.debug("rerank_and_emit: dual-log second emit raised (%s)", exc)
-
-    return RerankResult(
-        ranked=ranked,
-        task_id=task_id,
-        rl_used=rl_used,
-        emit_success=emit_success,
-    )
+    return emit_success
 
 
 # ---- internal helpers ----------------------------------------------
+
+
+def _retrieval_emit_has_consumer() -> bool:
+    """v0.2.73 Concern-A: True iff SOMETHING will consume the RETRIEVAL event.
+
+    The retrieval event's only two sinks are the local hub write (gated by
+    ``not _local_logging_disabled()``) and the upload queue (gated by
+    ``_upload_consent_granted()``). The online ``/rl_update`` path consumes the
+    CITATION event, never the retrieval event, so it is deliberately NOT a term
+    here. When neither sink exists the writer drops the event at its boundary
+    anyway — so the caller skips building + offloading it.
+
+    FALL OPEN: any probe import/read failure returns True (capture) so a
+    transient error never silently drops a paying user's telemetry.
+    """
+    try:
+        from .telemetry_writer import (
+            _local_logging_disabled,
+            _upload_consent_granted,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("_retrieval_emit_has_consumer: probe import failed (%s); fall open", exc)
+        return True
+    try:
+        return (not _local_logging_disabled()) or _upload_consent_granted()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("_retrieval_emit_has_consumer: probe raised (%s); fall open", exc)
+        return True
+
+
+def _should_capture_citations(rl_enabled: bool) -> bool:
+    """v0.2.73 Concern-A/C: True iff SOMETHING will consume the citation capture.
+
+    The answer monitor (which embeds every answer chunk via Ollama), the
+    citation cache, and the ``.claude/state/rl_pending`` pending file exist ONLY
+    to PRODUCE a citation event that is consumed by exactly one of:
+
+      * the local hub write   → needs ``not _local_logging_disabled()``
+      * the upload queue       → needs ``_upload_consent_granted()``
+      * the ONLINE ``/rl_update`` training path (paid ``vct-rl-reranker``) →
+        needs ``rl_enabled`` (license tier + per-project toggle) AND the online
+        training opt-out to be OFF (``not _online_training_disabled()``). The
+        monitor's fire path calls ``client.rl_update_v3`` off the SAME single
+        compute (Concern-D), so an rl-enabled Pro user with local logging off
+        still has a live consumer — UNLESS they globally/per-project disabled
+        online training for performance.
+
+    Skip the whole capture (monitor spawn + citation cache + pending file +
+    answer-embed) only when NONE of the three consumers exists.
+
+    FALL OPEN: any probe import/read failure returns True (capture) so a
+    transient error never silently drops a paying user's training corpus —
+    mirrors ``_resolve_rl_enabled``'s soft-fail-to-enabled style.
+    """
+    try:
+        from .telemetry_writer import (
+            _local_logging_disabled,
+            _online_training_disabled,
+            _upload_consent_granted,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("_should_capture_citations: probe import failed (%s); fall open", exc)
+        return True
+    try:
+        online_consumer = bool(rl_enabled) and not _online_training_disabled()
+        return (
+            (not _local_logging_disabled())
+            or _upload_consent_granted()
+            or online_consumer
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("_should_capture_citations: probe raised (%s); fall open", exc)
+        return True
 
 
 def _resolve_rl_enabled() -> bool:

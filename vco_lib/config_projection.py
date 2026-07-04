@@ -356,6 +356,12 @@ _CANONICAL_KEYS: tuple[str, ...] = (
     # canonical writer. Conditionally emitted — omitted when no app_state row.
     "VCO_CODE_GRAPH_RETRIEVAL_FLOOR",
     "VCO_CODE_GRAPH_POST_RERANK_FLOOR",
+    # v0.2.73 Concern-A/C: GLOBAL leg of the two-level RL telemetry gate.
+    # Conditionally emitted — omitted when no app_state row (absent global env →
+    # resolver treats it as "not globally disabled"; the per-project .claude/env
+    # flag still applies). Same Python-canonical-writer split as the floors above.
+    "RL_LOCAL_LOGGING_DISABLED_GLOBAL",
+    "RL_ONLINE_TRAINING_DISABLED_GLOBAL",
     "WEAVIATE_URL",
     "WEAVIATE_PORT",
     "OLLAMA_URL",
@@ -859,6 +865,23 @@ def _fetch_module_setting_str_opt(
 # _ENV_POST_RERANK_FLOOR) exactly — changing one requires changing the other.
 APP_STATE_KEY_CODEGRAPH_RETRIEVAL_FLOOR = "codegraph.retrieval_floor"
 APP_STATE_KEY_CODEGRAPH_POST_RERANK_FLOOR = "codegraph.post_rerank_floor"
+
+# v0.2.73 Concern-A/C: machine-GLOBAL RL telemetry opt-outs. The GUI writes
+# these ``app_state`` keys via the generic ``app_state_set_bool`` Tauri command
+# ("true"/"false" strings); this projection emits them into every project's
+# ``.claude/settings.json`` env as the GLOBAL leg of a two-level gate. The RL
+# resolvers (``telemetry_writer._local_logging_disabled`` /
+# ``_online_training_disabled``) OR the global env with the per-project
+# ``.claude/env`` flag, so a GLOBAL disable overrides ALL projects while a
+# global-enabled state still lets a single project opt out locally.
+# ``app_state_key_triggers_env_reprojection`` (Rust) must list these keys so a
+# GUI write refreshes every project's env.
+#   app_state ``rl.local_logging_disabled_global``  → env RL_LOCAL_LOGGING_DISABLED_GLOBAL
+#   app_state ``rl.online_training_disabled_global`` → env RL_ONLINE_TRAINING_DISABLED_GLOBAL
+APP_STATE_KEY_RL_LOCAL_LOGGING_DISABLED_GLOBAL = "rl.local_logging_disabled_global"
+APP_STATE_KEY_RL_ONLINE_TRAINING_DISABLED_GLOBAL = "rl.online_training_disabled_global"
+_ENV_RL_LOCAL_LOGGING_DISABLED_GLOBAL = "RL_LOCAL_LOGGING_DISABLED_GLOBAL"
+_ENV_RL_ONLINE_TRAINING_DISABLED_GLOBAL = "RL_ONLINE_TRAINING_DISABLED_GLOBAL"
 
 # v0.2.72 R1 (F5 residual): explicit GUI override for the machine-global
 # shared-KG class name, written by the launcher's SharedKgPicker via
@@ -1689,6 +1712,20 @@ def project_env_from_db(
             conn, APP_STATE_KEY_CODEGRAPH_POST_RERANK_FLOOR
         )
 
+        # v0.2.73 Concern-A/C: machine-GLOBAL RL telemetry opt-outs. The GUI's
+        # global Preferences toggles write these app_state keys ("true"/"false");
+        # we project the GLOBAL leg into every project's env so the RL resolvers
+        # can OR it with the per-project ``.claude/env`` flag (global disable
+        # overrides all projects). Soft-fail: an absent row → None → the key is
+        # OMITTED by ``_set`` below, and the resolver treats a missing global env
+        # as "not globally disabled" (the per-project flag still applies).
+        rl_local_logging_disabled_global = _fetch_app_state_str(
+            conn, APP_STATE_KEY_RL_LOCAL_LOGGING_DISABLED_GLOBAL
+        )
+        rl_online_training_disabled_global = _fetch_app_state_str(
+            conn, APP_STATE_KEY_RL_ONLINE_TRAINING_DISABLED_GLOBAL
+        )
+
         # v0.2.72 R2 (F5 residual): CODE_GRAPH_PROJECT derives
         # hub-consistently — the project's codegraph binding prefix
         # (`project_codegraph_bindings.collection_prefix`) first, the
@@ -1793,6 +1830,12 @@ def project_env_from_db(
     # the raw string (already stripped by _fetch_app_state_str).
     _set("VCO_CODE_GRAPH_RETRIEVAL_FLOOR", codegraph_retrieval_floor)
     _set("VCO_CODE_GRAPH_POST_RERANK_FLOOR", codegraph_post_rerank_floor)
+    # v0.2.73 Concern-A/C: GLOBAL leg of the two-level RL telemetry gate. Emitted
+    # only when the app_state row is present (absent → OMITTED → resolver treats
+    # the missing global env as "not globally disabled"). Raw string projected
+    # verbatim; the resolver parses truthily ({"true","1","yes","on"}).
+    _set(_ENV_RL_LOCAL_LOGGING_DISABLED_GLOBAL, rl_local_logging_disabled_global)
+    _set(_ENV_RL_ONLINE_TRAINING_DISABLED_GLOBAL, rl_online_training_disabled_global)
     _set("WEAVIATE_URL", weaviate_url)
     _set("WEAVIATE_PORT", str(weaviate_port_default))
     _set("OLLAMA_URL", ollama_url)

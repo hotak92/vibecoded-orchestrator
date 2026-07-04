@@ -144,11 +144,20 @@ from claude_mcp_servers.rl_client.answer_window import (
 def _rl_load_messages(transcript_path: "Path") -> list[dict]:
     """Load all JSONL messages from a transcript file.
 
-    v0.2.70 (S2): thin shim to ``rl_client.answer_window.load_messages`` — one
-    home shared by the MCP monitor AND the Stop-hook drain.
+    v0.2.70 (S2): thin shim to the shared ``rl_client.answer_window`` loader —
+    one home shared by the MCP monitor AND the Stop-hook drain.
+
+    v0.2.73 (Concern-B): routes through ``load_messages_cached`` so a poll that
+    re-loads an UNCHANGED transcript (identical mtime+size) returns the already-
+    parsed messages without re-reading or re-JSON-parsing a single byte. The
+    monitor polls every ``_RL_MONITOR_POLL_INTERVAL`` and, pre-Concern-B, this
+    re-parsed the whole (growing) transcript on EVERY poll — O(file × polls).
+    A cache HIT is byte-identical to a full re-parse (the file didn't change),
+    so the extracted answer window is unchanged; the drain uses the same shared
+    loader (mirror-don't-fork).
     """
-    from claude_mcp_servers.rl_client.answer_window import load_messages
-    return load_messages(transcript_path)
+    from claude_mcp_servers.rl_client.answer_window import load_messages_cached
+    return load_messages_cached(transcript_path)
 
 def _rl_find_kg_positions(messages: list[dict]) -> list[tuple[int, int]]:
     """Return (msg_idx, blk_idx) for every KG search tool_use block.
@@ -568,6 +577,17 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
     # poll it's available (the populate runs just after the spawn).
     held_ctx: "dict | None" = None
 
+    # v0.2.73 (Concern-B): per-task idle-poll short-circuit cache. Maps every
+    # candidate transcript path → its last-seen (mtime, size) signature. When a
+    # poll finds NO candidate has changed since the previous poll (and no
+    # force-flush), there is provably no new assistant output to re-read,
+    # re-parse, or recount — so we skip the entire scan+load+extract for that
+    # poll. This removes the bulk of the O(file_size × poll_count) re-read waste
+    # (most polls on a long session are idle). It is monitor-local state (the
+    # one-shot drain never polls), so it lives here, not in the shared loader.
+    _last_stat_sig: "dict[str, tuple[float, int] | None]" = {}
+    from claude_mcp_servers.rl_client.answer_window import stat_signature as _stat_sig
+
     # Phase 1 + 2 combined: find the right transcript and poll for completion
     while asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(server._RL_MONITOR_POLL_INTERVAL)
@@ -596,6 +616,31 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
                 for f in sorted(projects_dir.rglob(f"{session_id}.jsonl")):
                     candidates = [f]
                     break
+
+        # Concern-B idle short-circuit: recompute each candidate's (mtime, size)
+        # signature and compare to the previous poll. Skip the scan iff the set
+        # of candidates is unchanged AND every candidate's signature is unchanged
+        # AND we are not force-flushing. A new/removed candidate or any changed
+        # signature (new bytes appended) forces a full scan this poll. On error
+        # stat_signature returns None → treated as "changed" (never skip on a
+        # stat hiccup — correctness over the micro-optimisation).
+        if candidates and not force_flush:
+            _cur_sig = {str(c): _stat_sig(c) for c in candidates}
+            _unchanged = (
+                bool(_last_stat_sig)
+                and set(_cur_sig) == set(_last_stat_sig)
+                and all(
+                    v is not None and _last_stat_sig.get(k) == v
+                    for k, v in _cur_sig.items()
+                )
+            )
+            _last_stat_sig = _cur_sig
+            if _unchanged:
+                continue
+        elif candidates:
+            # force_flush poll — refresh the cache so the NEXT idle poll compares
+            # against current state, but do not skip (we must fire now).
+            _last_stat_sig = {str(c): _stat_sig(c) for c in candidates}
 
         for candidate in candidates:
             messages = server._rl_load_messages(candidate)
@@ -730,7 +775,34 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
                 # Free-tier / no-container installs: the citation event is
                 # already on disk via the writer above; training is
                 # Pro-tier-only, so silent skip here is correct.
-                client = server._get_rl_client()
+                #
+                # v0.2.73 Concern-C: the user can GLOBALLY (or per-project)
+                # disable this LIVE per-answer training RPC for performance
+                # without touching local logging — ``_online_training_disabled``
+                # reads the two-level ``RL_ONLINE_TRAINING_DISABLED[_GLOBAL]``
+                # env gate. When disabled we short-circuit the ``/rl_update``
+                # POST here regardless of container reachability; the citation
+                # LOG event (single compute above, Concern-D) is unaffected.
+                # NOTE: this reuses the ONE compute — cosine_sims/literal_cited
+                # come from ``citation_result`` (never re-embedded).
+                _online_off = False
+                try:
+                    from claude_mcp_servers.rl_client.telemetry_writer import (
+                        _online_training_disabled,
+                    )
+                    _online_off = _online_training_disabled()
+                except Exception as exc:  # noqa: BLE001 — fall open to training
+                    server.logger.debug(
+                        "RL monitor %s: online-training gate probe raised (%s); "
+                        "defaulting to enabled", task_id[:8], exc,
+                    )
+                if _online_off:
+                    server.logger.debug(
+                        "RL monitor %s: online RL training disabled "
+                        "(RL_ONLINE_TRAINING_DISABLED[_GLOBAL]); skipping /rl_update",
+                        task_id[:8],
+                    )
+                client = None if _online_off else server._get_rl_client()
                 if (
                     client is not None
                     and ctx is not None

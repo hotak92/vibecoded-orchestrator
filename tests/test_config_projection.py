@@ -326,6 +326,50 @@ def test_shared_kg_override_beats_explicit_default_kwarg(tmp_path: Path) -> None
     assert env["SHARED_KG_COLLECTION"] == "TeamWide_KnowledgeGraph"
 
 
+# ─── v0.2.73 Concern-A/C — GLOBAL RL telemetry opt-out projection ────────
+
+
+def test_rl_global_opt_outs_projected_when_app_state_set(tmp_path: Path) -> None:
+    """The GLOBAL RL telemetry opt-out app_state rows project into the env as
+    RL_LOCAL_LOGGING_DISABLED_GLOBAL / RL_ONLINE_TRAINING_DISABLED_GLOBAL — the
+    GLOBAL leg of the two-level gate the RL resolver ORs with the per-project
+    .claude/env flag."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="x", project_name="X", project_folder=str(proj),
+        app_state={
+            "rl.local_logging_disabled_global": "true",
+            "rl.online_training_disabled_global": "true",
+        },
+    )
+    env = project_env_from_db("x", db_path=db)["canonical_env"]
+    assert env["RL_LOCAL_LOGGING_DISABLED_GLOBAL"] == "true"
+    assert env["RL_ONLINE_TRAINING_DISABLED_GLOBAL"] == "true"
+
+
+def test_rl_global_opt_outs_omitted_when_absent(tmp_path: Path) -> None:
+    """No app_state rows → keys OMITTED (absent global env = not globally
+    disabled; the per-project flag still applies)."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="x", project_name="X", project_folder=str(proj),
+    )
+    env = project_env_from_db("x", db_path=db)["canonical_env"]
+    assert "RL_LOCAL_LOGGING_DISABLED_GLOBAL" not in env
+    assert "RL_ONLINE_TRAINING_DISABLED_GLOBAL" not in env
+
+
+def test_rl_global_opt_outs_in_canonical_keys() -> None:
+    from vco_lib import config_projection
+    keys = config_projection.list_canonical_keys()
+    assert "RL_LOCAL_LOGGING_DISABLED_GLOBAL" in keys
+    assert "RL_ONLINE_TRAINING_DISABLED_GLOBAL" in keys
+
+
 def test_shared_kg_empty_override_falls_back_to_binding(tmp_path: Path) -> None:
     """An empty / whitespace override row is ignored — the binding
     derivation applies (own shared row here; the const default in the

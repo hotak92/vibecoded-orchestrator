@@ -851,6 +851,23 @@
   // the .claude/env override. Default = enabled.
   let rlLocalLoggingDisabled = $state(false);
   let rlLocalLoggingSaving = $state(false);
+
+  // ── GLOBAL RL telemetry opt-outs (v0.2.73 Concern-A/C) ───────────
+  // Two machine-GLOBAL master toggles stored in launcher.db app_state and
+  // re-projected into every project's .claude/settings.json env
+  // (RL_LOCAL_LOGGING_DISABLED_GLOBAL / RL_ONLINE_TRAINING_DISABLED_GLOBAL).
+  // The RL resolver ORs the global env with the per-project flag, so a GLOBAL
+  // disable overrides ALL projects while a global-enabled state still lets one
+  // project opt out locally. Keys MUST match the Rust
+  // (APP_STATE_KEY_RL_*_GLOBAL) + Python (config_projection) constants.
+  const APP_STATE_KEY_RL_LOCAL_LOGGING_DISABLED_GLOBAL = 'rl.local_logging_disabled_global';
+  const APP_STATE_KEY_RL_ONLINE_TRAINING_DISABLED_GLOBAL = 'rl.online_training_disabled_global';
+  // UI holds the ENABLED sense (checked = enabled); the stored value is the
+  // DISABLED flag, so the two are inverse. Default: both enabled.
+  let rlLocalLoggingGlobalDisabled = $state(false);
+  let rlLocalLoggingGlobalSaving = $state(false);
+  let rlOnlineTrainingGlobalDisabled = $state(false);
+  let rlOnlineTrainingGlobalSaving = $state(false);
   // Cross-project: upload consent (lives in ~/.vibecoded/config.json).
   let rlUploadConsent = $state(false);
   let rlUploadSaving = $state(false);
@@ -914,6 +931,71 @@
       toast.error(e);
     } finally {
       rlLocalLoggingSaving = false;
+    }
+  }
+
+  async function loadRlGlobalTelemetryState() {
+    // Read both global master flags from app_state (bool). Absent → false
+    // (not disabled = enabled). Soft-fail: leave defaults on any error.
+    try {
+      const [localG, onlineG] = await Promise.all([
+        invoke<boolean | null>('app_state_get_bool', {
+          key: APP_STATE_KEY_RL_LOCAL_LOGGING_DISABLED_GLOBAL,
+        }),
+        invoke<boolean | null>('app_state_get_bool', {
+          key: APP_STATE_KEY_RL_ONLINE_TRAINING_DISABLED_GLOBAL,
+        }),
+      ]);
+      rlLocalLoggingGlobalDisabled = localG === true;
+      rlOnlineTrainingGlobalDisabled = onlineG === true;
+    } catch (e) {
+      console.debug('loadRlGlobalTelemetryState failed', e);
+    }
+  }
+
+  async function toggleRlLocalLoggingGlobal() {
+    // Checkbox shows ENABLED; store the DISABLED flag (inverse). A GLOBAL
+    // disable overrides every project's per-project setting.
+    rlLocalLoggingGlobalSaving = true;
+    const nextDisabled = !rlLocalLoggingGlobalDisabled;
+    try {
+      await invoke<void>('app_state_set_bool', {
+        key: APP_STATE_KEY_RL_LOCAL_LOGGING_DISABLED_GLOBAL,
+        value: nextDisabled,
+      });
+      rlLocalLoggingGlobalDisabled = nextDisabled;
+      toast.success(
+        nextDisabled
+          ? 'Local retrieval data collection disabled GLOBALLY (all projects)'
+          : 'Local retrieval data collection enabled globally (per-project settings apply)',
+      );
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      rlLocalLoggingGlobalSaving = false;
+    }
+  }
+
+  async function toggleRlOnlineTrainingGlobal() {
+    // Checkbox shows ENABLED (live per-answer RL training); store the DISABLED
+    // flag (inverse). Global disable short-circuits the live /rl_update RPC.
+    rlOnlineTrainingGlobalSaving = true;
+    const nextDisabled = !rlOnlineTrainingGlobalDisabled;
+    try {
+      await invoke<void>('app_state_set_bool', {
+        key: APP_STATE_KEY_RL_ONLINE_TRAINING_DISABLED_GLOBAL,
+        value: nextDisabled,
+      });
+      rlOnlineTrainingGlobalDisabled = nextDisabled;
+      toast.success(
+        nextDisabled
+          ? 'Online RL training disabled GLOBALLY — no live per-answer signal (rerank still works)'
+          : 'Online RL training enabled globally (live per-answer signal on)',
+      );
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      rlOnlineTrainingGlobalSaving = false;
     }
   }
 
@@ -1626,6 +1708,8 @@
     // Stream 1: local data collection controls.
     void loadRlLocalState();
     void loadRlUploadConsent();
+    // v0.2.73 Concern-A/C: global RL telemetry master toggles.
+    void loadRlGlobalTelemetryState();
     // F2/F3/F4: KG summaries + code-embed override settings, plus the
     // Ollama tags probe shared between the two sections.
     void loadKgSummarySettings();
@@ -2601,6 +2685,39 @@
             ON (default): events appended to <code>~/.claude/retrieval_rl_data/</code>.
             OFF: writes <code>RL_LOCAL_LOGGING_DISABLED=true</code> to
             <code>.claude/env</code> for this project.
+          </small>
+        </label>
+      </div>
+
+      <!-- v0.2.73 Concern-A/C: GLOBAL master toggles (all projects). Stored in
+           launcher.db app_state, projected into every project's env. Global OFF
+           overrides per-project; when Global ON, individual projects may still
+           opt out above. -->
+      <div class="pr-rl-row">
+        <label class="pr-rl-toggle"
+               title="GLOBAL master switch (all projects). When ON (default), local retrieval-data collection is allowed and each project's own toggle above applies. When OFF, disables local collection for EVERY project regardless of the per-project setting — sets RL_LOCAL_LOGGING_DISABLED_GLOBAL=true in app_state, projected into every project's env.">
+          <input type="checkbox" checked={!rlLocalLoggingGlobalDisabled}
+            disabled={rlLocalLoggingGlobalSaving}
+            onchange={() => void toggleRlLocalLoggingGlobal()} />
+          <strong>Collect retrieval data locally — GLOBAL (all projects)</strong>
+          <small>
+            ON (default): allowed globally; per-project toggle above applies.
+            OFF: disables local collection for ALL projects (hard override).
+          </small>
+        </label>
+      </div>
+
+      <div class="pr-rl-row">
+        <label class="pr-rl-toggle"
+               title="GLOBAL performance switch (all projects). When ON (default), the paid RL reranker trains live on every answer — the monitor embeds Claude's answer and computes citations to feed the online /rl_update RPC. When OFF, disables that LIVE per-answer training globally; the rerank still works and no online citation/answer-embedding is computed. Sets RL_ONLINE_TRAINING_DISABLED_GLOBAL=true in app_state, projected into every project's env.">
+          <input type="checkbox" checked={!rlOnlineTrainingGlobalDisabled}
+            disabled={rlOnlineTrainingGlobalSaving}
+            onchange={() => void toggleRlOnlineTrainingGlobal()} />
+          <strong>Enable online RL training (live per-answer signal) — GLOBAL</strong>
+          <small>
+            ON (default): live per-answer RL training active (Pro tier).
+            OFF: disables the live <code>/rl_update</code> answer-embedding +
+            citation RPC globally; rerank still works.
           </small>
         </label>
       </div>

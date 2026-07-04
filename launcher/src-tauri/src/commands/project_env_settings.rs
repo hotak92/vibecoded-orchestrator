@@ -85,6 +85,27 @@ pub const ACTIVE_EMBEDDING_SOURCE_AUTO: &str = "auto";
 /// White-label / fork installs can swap this without recompiling.
 pub const APP_STATE_KEY_SHARED_KG_NAME: &str = "shared_kg.collection_name";
 
+/// v0.2.73 Concern-A/C: machine-GLOBAL RL telemetry opt-out `app_state` keys.
+///
+/// Written by the launcher's GLOBAL Preferences page via the generic
+/// `app_state_set_bool` command ("true"/"false"), read back by the Python
+/// `config_projection` writer (`APP_STATE_KEY_RL_*_GLOBAL`) and projected into
+/// every project's `.claude/settings.json` env as `RL_LOCAL_LOGGING_DISABLED_GLOBAL`
+/// / `RL_ONLINE_TRAINING_DISABLED_GLOBAL`. These are the GLOBAL leg of a
+/// two-level gate: the RL resolver OR's the global env with the per-project
+/// `.claude/env` flag, so a GLOBAL disable overrides ALL projects while a
+/// global-enabled state still lets one project opt out locally.
+///
+/// MUST MATCH the Python constants in `vco_lib/config_projection.py`
+/// (`APP_STATE_KEY_RL_LOCAL_LOGGING_DISABLED_GLOBAL` /
+/// `APP_STATE_KEY_RL_ONLINE_TRAINING_DISABLED_GLOBAL`). Both keys are listed in
+/// `app_state_key_triggers_env_reprojection` below so a GUI write refreshes
+/// every registered project's env.
+pub const APP_STATE_KEY_RL_LOCAL_LOGGING_DISABLED_GLOBAL: &str =
+    "rl.local_logging_disabled_global";
+pub const APP_STATE_KEY_RL_ONLINE_TRAINING_DISABLED_GLOBAL: &str =
+    "rl.online_training_disabled_global";
+
 /// `app_state` keys for explicit port overrides. When set, these win over
 /// services.toml adoption + the canonical defaults.
 pub const APP_STATE_KEY_WEAVIATE_PORT: &str = "weaviate.port_override";
@@ -192,7 +213,16 @@ pub fn set_text_embedding_and_profile(
 pub fn app_state_key_triggers_env_reprojection(key: &str) -> bool {
     matches!(
         key,
-        APP_STATE_KEY_ACTIVE_EMBEDDING | APP_STATE_DEFAULT_TEXT_EMBED
+        APP_STATE_KEY_ACTIVE_EMBEDDING
+            | APP_STATE_DEFAULT_TEXT_EMBED
+            // v0.2.73 Concern-A/C: the GLOBAL RL telemetry opt-outs are written
+            // through the GENERIC app_state_set_bool command (the Preferences
+            // page has no dedicated setter for them), so they MUST be listed
+            // here to trigger the machine-global env re-projection that stamps
+            // RL_LOCAL_LOGGING_DISABLED_GLOBAL / RL_ONLINE_TRAINING_DISABLED_GLOBAL
+            // into every project's .claude/settings.json env.
+            | APP_STATE_KEY_RL_LOCAL_LOGGING_DISABLED_GLOBAL
+            | APP_STATE_KEY_RL_ONLINE_TRAINING_DISABLED_GLOBAL
     )
 }
 
@@ -1794,9 +1824,10 @@ mod tests {
         );
     }
 
-    /// The generic-app_state-write predicate: exactly the ACTIVE_EMBEDDING
-    /// cascade keys trigger a machine-global re-projection; launcher-state
-    /// flags and the (projection-inert) shared-KG-name override do not.
+    /// The generic-app_state-write predicate: the ACTIVE_EMBEDDING cascade keys
+    /// AND the v0.2.73 machine-global RL telemetry opt-outs trigger a
+    /// machine-global re-projection; launcher-state flags and the
+    /// (projection-inert) shared-KG-name override do not.
     #[test]
     fn app_state_reprojection_predicate_covers_cascade_keys_only() {
         assert!(app_state_key_triggers_env_reprojection(
@@ -1804,6 +1835,14 @@ mod tests {
         ));
         assert!(app_state_key_triggers_env_reprojection(
             APP_STATE_DEFAULT_TEXT_EMBED
+        ));
+        // v0.2.73 Concern-A/C: the GLOBAL RL opt-outs are written via the
+        // generic app_state_set_bool command, so they MUST trigger re-projection.
+        assert!(app_state_key_triggers_env_reprojection(
+            APP_STATE_KEY_RL_LOCAL_LOGGING_DISABLED_GLOBAL
+        ));
+        assert!(app_state_key_triggers_env_reprojection(
+            APP_STATE_KEY_RL_ONLINE_TRAINING_DISABLED_GLOBAL
         ));
         assert!(!app_state_key_triggers_env_reprojection(
             APP_STATE_KEY_SHARED_KG_NAME

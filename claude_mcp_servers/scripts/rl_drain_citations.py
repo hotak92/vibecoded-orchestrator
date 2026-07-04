@@ -105,7 +105,7 @@ def drain_session(
     Returns a summary dict: ``{computed, left, swept, skipped}``.
     """
     from claude_mcp_servers.rl_client.answer_window import (
-        load_messages,
+        load_messages_cached,
         find_kg_positions,
         extract_answer_window,
         match_position_for_query,
@@ -133,7 +133,11 @@ def drain_session(
     if not pending:
         return summary
 
-    messages = load_messages(transcript_path) if transcript_path else []
+    # v0.2.73 (Concern-B): shared cached loader (one home with the MCP monitor);
+    # the drain reads once per Stop so the (mtime,size) cache is mostly a miss
+    # here, but routing through the SAME function keeps the parsed-message shape
+    # — and thus the extracted answer window — byte-identical across both paths.
+    messages = load_messages_cached(transcript_path) if transcript_path else []
     kg_positions = find_kg_positions(messages) if messages else []
 
     for path in pending:

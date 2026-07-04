@@ -59,7 +59,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from .hub_writer import post_rl_event
-from .rl_logger import RLDataLogger, _round_emb
+from .rl_logger import RLDataLogger, _round_emb, serialize_node_record
 
 logger = logging.getLogger(__name__)
 
@@ -75,16 +75,70 @@ logger = logging.getLogger(__name__)
 # (user-controlled "don't record my retrievals").
 _LOCAL_OPT_OUT_ENV = "RL_LOCAL_LOGGING_DISABLED"
 
+# v0.2.73 Concern-A/C — two-level RL telemetry gate. Each opt-out has a GLOBAL
+# leg (machine-wide, from launcher.db ``app_state`` re-projected into every
+# project's ``.claude/settings.json`` env by ``vco_lib/config_projection.py``)
+# and a PER-PROJECT leg (the project's ``.claude/env``). The resolver is
+# effective_disabled = global_disabled OR per_project_disabled, so a GLOBAL
+# disable overrides ALL projects while a global-enabled state still lets one
+# project opt out locally. Both env names MUST match the projected names in
+# config_projection.py (``_ENV_RL_*_GLOBAL``).
+_LOCAL_OPT_OUT_ENV_GLOBAL = "RL_LOCAL_LOGGING_DISABLED_GLOBAL"
+# ONLINE per-answer training opt-out (Concern-C). Per-project ``.claude/env`` +
+# machine-global app_state leg. Default ENABLED (both absent → not disabled).
+_ONLINE_TRAINING_OPT_OUT_ENV = "RL_ONLINE_TRAINING_DISABLED"
+_ONLINE_TRAINING_OPT_OUT_ENV_GLOBAL = "RL_ONLINE_TRAINING_DISABLED_GLOBAL"
+
 # Telemetry event_type used for queue publishes. Hub-side schemas
 # key on this string; do not rename without coordinating server-side.
 _EVENT_TYPE_RETRIEVAL = "rl_retrieval"
 _EVENT_TYPE_CITATIONS = "rl_citations"
 
 
+def _env_truthy(name: str) -> bool:
+    """True iff env var ``name`` is set to a truthy value ({true,1,yes,on}).
+
+    Shared by the two-level RL opt-out resolvers. OS-agnostic — reads a plain
+    environment variable, so it behaves identically on Windows (the env is
+    populated from ``.claude/settings.json`` / ``.claude/env`` on every surface).
+    A read that raises (never expected for os.environ, but defensive) falls open
+    to False = "not disabled".
+    """
+    try:
+        return os.environ.get(name, "").strip().lower() in ("true", "1", "yes", "on")
+    except Exception:  # noqa: BLE001 — env read must never break a gate
+        return False
+
+
 def _local_logging_disabled() -> bool:
-    """True iff ``RL_LOCAL_LOGGING_DISABLED`` env is set to a truthy value."""
-    v = os.environ.get(_LOCAL_OPT_OUT_ENV, "").strip().lower()
-    return v in ("true", "1", "yes", "on")
+    """True iff local RL logging is disabled at EITHER level (Concern-A/C).
+
+    Two-level gate: the GLOBAL ``RL_LOCAL_LOGGING_DISABLED_GLOBAL`` (machine-wide
+    app_state, projected into env) OR the per-project ``RL_LOCAL_LOGGING_DISABLED``
+    (this project's ``.claude/env``). A truthy value at EITHER level disables the
+    local hub write. The global leg is the hard override; the per-project leg is
+    the individual opt-out when globally enabled.
+    """
+    return _env_truthy(_LOCAL_OPT_OUT_ENV_GLOBAL) or _env_truthy(_LOCAL_OPT_OUT_ENV)
+
+
+def _online_training_disabled() -> bool:
+    """True iff LIVE per-answer RL training is disabled at EITHER level (Concern-C).
+
+    Gates the ONLINE ``/rl_update`` path — the live answer-embedding + citation
+    RPC the paid ``vct-rl-reranker`` container consumes on every fired
+    answer-monitor. Two-level, same shape as ``_local_logging_disabled``:
+    GLOBAL ``RL_ONLINE_TRAINING_DISABLED_GLOBAL`` (machine-wide app_state) OR the
+    per-project ``RL_ONLINE_TRAINING_DISABLED`` (``.claude/env``).
+
+    DEFAULT ENABLED: both env vars absent → not disabled → returns False
+    (unchanged Pro behaviour). FALL OPEN by construction — ``_env_truthy`` returns
+    False on any read hiccup, so a transient failure never silently disables a
+    paying user's training. An explicit truthy at either level is honoured.
+    """
+    return _env_truthy(_ONLINE_TRAINING_OPT_OUT_ENV_GLOBAL) or _env_truthy(
+        _ONLINE_TRAINING_OPT_OUT_ENV
+    )
 
 
 def _upload_consent_granted() -> bool:
@@ -379,35 +433,24 @@ class RLTelemetryWriter:
         the consented queue payload (no PII in either — failure_mode
         is a fixed tag string and failed_collections are class names).
         """
-        node_records: List[Dict[str, Any]] = []
-        for n in nodes:
-            rec: Dict[str, Any] = {
-                "title": str(n.get("title", "")),
-                "score": float(n.get("score", 0.0)),
-                "tier": str(n.get("tier", "top_k")),
-            }
-            if n.get("emb"):
-                rec["emb"] = _round_emb(n["emb"])
-            # v3+: best-chunk vector (renamed from `emb` for v3 disambiguation)
-            if n.get("n_emb"):
-                rec["n_emb"] = _round_emb(n["n_emb"])
-            # v3+: MAX_LINKED packed linked-slot embeddings
-            if n.get("linked_embs"):
-                rec["linked_embs"] = [_round_emb(e) for e in n["linked_embs"] if e]
-            if n.get("linked_type_names"):
-                rec["linked_type_names"] = [str(t) for t in n["linked_type_names"]]
-            if n.get("node_type"):
-                rec["node_type"] = str(n["node_type"])
-            for field in ("cos_qn", "cos_ql", "cos_nl"):
-                val = n.get(field)
-                if val is not None:
-                    rec[field] = float(val)
-            # v0.2.73 RL-1/RL-7: additive, no PII (ranks + counts only).
-            if n.get("shown_rank") is not None:
-                rec["shown_rank"] = int(n["shown_rank"])
-            if n.get("chunks_matched") is not None:
-                rec["chunks_matched"] = int(n["chunks_matched"])
-            node_records.append(rec)
+        # Per-node record shape is the single-home `serialize_node_record`
+        # helper (rl_logger.py). The queue payload OMITS `links` and the RL-2
+        # code-path fields (queue is the consented-upload surface, kept lean),
+        # keeps full-precision scalars, and carries the RL-1/RL-7 rank+count
+        # fields. Flags below reproduce this caller's exact historical field
+        # set + insertion order byte-identically.
+        node_records: List[Dict[str, Any]] = [
+            serialize_node_record(
+                n,
+                include_links=False,
+                include_shown_rank=True,
+                include_chunks_matched=True,
+                include_best_chunk_number=False,
+                include_code_path_fields=False,
+                round_scalars=False,
+            )
+            for n in nodes
+        ]
 
         payload: Dict[str, Any] = {
             "schema_version": RLDataLogger.SCHEMA_VERSION,
@@ -516,10 +559,16 @@ class RLTelemetryWriter:
         """Build the v3 retrieval event JSON stored in launcher.db's payload_json.
 
         Shape matches the SELF-HANDOFF v2 spec § "v3 retrieval event payload".
-        Per-node records carry the same field set as ``_build_retrieval_payload``
-        (the consented-upload queue payload) PLUS the raw query text — the
-        hub keeps query strings because launcher.db is local-only, NOT
-        uploaded. Supabase still strips them in the queue payload.
+        Per-node records are built by the single-home ``serialize_node_record``
+        helper (rl_logger.py), same as ``_build_retrieval_payload``. This event
+        is the SUPERSET surface: per-node records carry a strict superset of the
+        queue payload's fields — additionally ``links``, ``best_chunk_number``,
+        and the RL-2 code-path fields (``collection`` / ``file_path`` /
+        ``rerank_score`` / ``boost_delta`` / ``boost_signals``) — because
+        launcher.db is local-only and stores payload_json verbatim. The
+        event ALSO carries the raw query text (the queue payload strips query
+        as PII). The two callers differ ONLY by explicit flags into the shared
+        helper, so they can no longer silently drift.
 
         v0.2.73 additions (all optional / additive): event-level ``rl_used``
         (RL-1 — did the rerank RPC run) + ``extras`` (RL-2 — code-path
@@ -528,52 +577,24 @@ class RLTelemetryWriter:
         code-path fields ``collection`` / ``file_path`` / ``rerank_score`` /
         ``boost_delta`` / ``boost_signals`` (RL-2).
         """
-        node_records: List[Dict[str, Any]] = []
-        for n in nodes:
-            rec: Dict[str, Any] = {
-                "title": str(n.get("title", "")),
-                "score": float(n.get("score", 0.0)),
-                "tier": str(n.get("tier", "top_k")),
-            }
-            if n.get("emb"):
-                rec["emb"] = _round_emb(n["emb"])
-            if n.get("n_emb"):
-                rec["n_emb"] = _round_emb(n["n_emb"])
-            if n.get("linked_embs"):
-                rec["linked_embs"] = [_round_emb(e) for e in n["linked_embs"] if e]
-            if n.get("linked_type_names"):
-                rec["linked_type_names"] = [str(t) for t in n["linked_type_names"]]
-            if n.get("node_type"):
-                rec["node_type"] = str(n["node_type"])
-            if n.get("links"):
-                rec["links"] = [str(lnk) for lnk in n["links"][:10]]
-            for field in ("cos_qn", "cos_ql", "cos_nl"):
-                val = n.get(field)
-                if val is not None:
-                    rec[field] = float(val)
-            if n.get("shown_rank") is not None:
-                rec["shown_rank"] = int(n["shown_rank"])
-            if n.get("chunks_matched") is not None:
-                rec["chunks_matched"] = int(n["chunks_matched"])
-            if n.get("best_chunk_number") is not None:
-                rec["best_chunk_number"] = int(n["best_chunk_number"])
-            # RL-2 code-path node fields (present only on code retrievals).
-            if n.get("collection"):
-                rec["collection"] = str(n["collection"])
-            if n.get("file_path"):
-                rec["file_path"] = str(n["file_path"])
-            if n.get("rerank_score") is not None:
-                rec["rerank_score"] = float(n["rerank_score"])
-            if n.get("boost_delta") is not None:
-                rec["boost_delta"] = float(n["boost_delta"])
-            if n.get("boost_signals"):
-                # code_ranking stamps signals as a dict; keep the shape
-                # verbatim (payload_json is stored as-is).
-                _sig = n["boost_signals"]
-                rec["boost_signals"] = (
-                    dict(_sig) if isinstance(_sig, dict) else list(_sig)
-                )
-            node_records.append(rec)
+        # Per-node record shape is the single-home `serialize_node_record`
+        # helper (rl_logger.py). The v3 launcher.db event is the SUPERSET
+        # surface: it carries `links`, `best_chunk_number`, and the RL-2
+        # code-path fields the leaner queue payload omits, at full scalar
+        # precision. Flags below turn all of those ON and reproduce this
+        # caller's exact historical field set + insertion order byte-identically.
+        node_records: List[Dict[str, Any]] = [
+            serialize_node_record(
+                n,
+                include_links=True,
+                include_shown_rank=True,
+                include_chunks_matched=True,
+                include_best_chunk_number=True,
+                include_code_path_fields=True,
+                round_scalars=False,
+            )
+            for n in nodes
+        ]
 
         event: Dict[str, Any] = {
             "event": "retrieval",
