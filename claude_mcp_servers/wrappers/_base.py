@@ -695,32 +695,63 @@ class WrapperMCP:
         if self._hub_port is not None and self._hub_token is not None:
             return self._hub_port, self._hub_token
 
-        # Port
+        # Port: env > file > default.
+        #
+        # F-8 corrupt-input contract — MUST MATCH the 4th mirror of the
+        # triplet fixed by W2-E:
+        #   * vco_lib/project_config.py::_discover_hub
+        #   * templates/scripts/vct_project_config.sh::hub_port
+        #   * templates/scripts/vct_project_config.ps1::Get-HubPort
+        # A non-integer ``VCT_HUB_PORT``, a non-integer ``hub.port`` file, or
+        # an unreadable ``hub.port`` (perm-denied) must NOT yield ``None`` —
+        # the port has a sane default (7700). Warn once, fall through to the
+        # default. Only a truly ABSENT file is the silent default path (the
+        # normal env-only / dev case). This keeps all FOUR resolvers
+        # identical on corrupt port input: warn + default, never a partial
+        # resolution that silently disables the hub.
         port_env = os.environ.get("VCT_HUB_PORT", "").strip()
         if port_env:
             try:
                 port: int | None = int(port_env)
             except ValueError:
                 logger.warning(
-                    "wrapper(%s): VCT_HUB_PORT=%r is not an integer",
-                    self.mcp_name, port_env,
+                    "wrapper(%s): VCT_HUB_PORT=%r is not an integer; "
+                    "using default %d",
+                    self.mcp_name, port_env, DEFAULT_HUB_PORT,
                 )
-                port = None
+                port = DEFAULT_HUB_PORT
         else:
             port_file = vct_root_dir() / "hub.port"
             try:
                 raw = port_file.read_text(encoding="utf-8").strip()
-                port = int(raw) if raw else DEFAULT_HUB_PORT
             except FileNotFoundError:
                 port = DEFAULT_HUB_PORT
-            except (OSError, ValueError) as e:
+            except OSError as e:
                 logger.warning(
-                    "wrapper(%s): cannot read %s: %s",
-                    self.mcp_name, port_file, e,
+                    "wrapper(%s): cannot read %s: %s; using default %d",
+                    self.mcp_name, port_file, e, DEFAULT_HUB_PORT,
                 )
-                port = None
+                port = DEFAULT_HUB_PORT
+            else:
+                try:
+                    port = int(raw) if raw else DEFAULT_HUB_PORT
+                except ValueError:
+                    logger.warning(
+                        "wrapper(%s): %s contains non-integer content; "
+                        "using default %d",
+                        self.mcp_name, port_file, DEFAULT_HUB_PORT,
+                    )
+                    port = DEFAULT_HUB_PORT
 
-        # Token
+        # Token: env > file > no-token (hub unreachable).
+        #
+        # F-8 corrupt-input contract — MUST MATCH the 4th mirror: the token
+        # has NO sane default, so an absent/empty/unreadable ``hub.token`` is
+        # not "warn-and-default" but "no token" → the hub is genuinely
+        # unreachable. We return ``token = None`` (the caller's env-fallback /
+        # unreachable path) and — for the UNREADABLE case only — warn first so
+        # the diagnostic shape matches the sibling resolvers. The read failure
+        # NEVER crashes with a raw OSError traceback.
         token_env = os.environ.get("VCT_HUB_TOKEN", "").strip()
         if token_env:
             token: str | None = token_env
@@ -732,7 +763,7 @@ class WrapperMCP:
                 token = None
             except OSError as e:
                 logger.warning(
-                    "wrapper(%s): cannot read %s: %s",
+                    "wrapper(%s): cannot read %s: %s; treating as no token",
                     self.mcp_name, token_file, e,
                 )
                 token = None

@@ -82,6 +82,16 @@
           },
           {
             "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/session-start-deferral-surface.ps1",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/session-start-retrieval-health.ps1",
+            "timeout": 3
+          },
+          {
+            "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/embedding-failures-surface.ps1",
             "timeout": 3
           },
@@ -102,7 +112,7 @@
           },
           {
             "type": "command",
-            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/kg-update-nudge.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/kg-update-nudge.ps1",
             "timeout": 4
           }
         ]
@@ -147,7 +157,7 @@
           },
           {
             "type": "command",
-            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/kg-update-nudge.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/kg-update-nudge.ps1",
             "timeout": 4
           },
           {
@@ -393,13 +403,6 @@
       {
         "matcher": "Edit|Write",
         "hooks": [
-          {
-            "type": "command",
-            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || powershell -NoProfile -Command \"try { $payload = [Console]::In.ReadToEnd() | ConvertFrom-Json; $fp = $payload.tool_input.file_path; if ($fp) { python .claude/scripts/sync_knowledge_graph.py $fp } } catch { }\"",
-            "timeout": 15,
-            "async": true,
-            "if": "Edit(knowledge/**/*.md)|Write(knowledge/**/*.md)"
-          },
           {
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/kg-summary-generator.ps1",
