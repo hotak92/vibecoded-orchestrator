@@ -7,7 +7,8 @@ implementations that MUST agree, or a credential-named key could leak into
 ``~/.claude.json`` from one registration path while another drops it (the exact
 leak the denylist exists to prevent — see B-3 finding):
 
-  * ``install.py::_SECRET_SHAPED_SUBSTRINGS``            (Python, canonical-ish)
+  * ``vco_lib/install_mcp.py::_SECRET_SHAPED_SUBSTRINGS`` (Python, canonical —
+    moved here from install.py by IN-1 in v0.2.73; install.py re-imports it)
   * ``vco_lib/secrets_audit.py::_SECRET_SHAPED_SUBSTRINGS`` (Python mirror)
   * ``launcher/src-tauri/src/mcp_registration.rs``       (Rust ``needles`` array)
 
@@ -31,7 +32,11 @@ import pytest
 
 _REPO = Path(__file__).resolve().parent.parent
 
-_INSTALL_PY = _REPO / "install.py"
+# IN-1 (v0.2.73): the canonical _SECRET_SHAPED_SUBSTRINGS definition + the
+# _is_secret_shaped_env_key `KEY`/`*_KEY` rule moved from install.py into
+# vco_lib/install_mcp.py (install.py now re-imports both). The parity guard
+# reads the definition from its new home.
+_INSTALL_MCP_PY = _REPO / "vco_lib" / "install_mcp.py"
 _SECRETS_AUDIT_PY = _REPO / "vco_lib" / "secrets_audit.py"
 _MCP_REGISTRATION_RS = (
     _REPO / "launcher" / "src-tauri" / "src" / "mcp_registration.rs"
@@ -69,32 +74,32 @@ _EXPECTED_NEEDLES = {"TOKEN", "SECRET", "PAT", "PASSWORD", "PASS", "AUTH"}
 
 
 def test_install_py_needles_match_expected():
-    assert _parse_python_substrings(_INSTALL_PY) == _EXPECTED_NEEDLES
+    assert _parse_python_substrings(_INSTALL_MCP_PY) == _EXPECTED_NEEDLES
 
 
 def test_secrets_audit_needles_match_install_py():
-    install = _parse_python_substrings(_INSTALL_PY)
+    install = _parse_python_substrings(_INSTALL_MCP_PY)
     audit = _parse_python_substrings(_SECRETS_AUDIT_PY)
     assert audit == install, (
         "vco_lib/secrets_audit.py::_SECRET_SHAPED_SUBSTRINGS drifted from "
-        f"install.py: install={sorted(install)} audit={sorted(audit)}"
+        f"vco_lib/install_mcp.py: install={sorted(install)} audit={sorted(audit)}"
     )
 
 
 def test_rust_needles_match_python():
     """The Rust mcp_registration.rs needle array MUST equal the Python set."""
-    py = _parse_python_substrings(_INSTALL_PY)
+    py = _parse_python_substrings(_INSTALL_MCP_PY)
     rust = _parse_rust_needles(_MCP_REGISTRATION_RS)
     assert rust == py, (
         "launcher/src-tauri/src/mcp_registration.rs `needles` drifted from "
-        f"install.py::_SECRET_SHAPED_SUBSTRINGS: python={sorted(py)} "
+        f"vco_lib/install_mcp.py::_SECRET_SHAPED_SUBSTRINGS: python={sorted(py)} "
         f"rust={sorted(rust)}. Update BOTH (mirror-don't-fork)."
     )
 
 
 def test_all_three_agree_transitively():
     """One assertion that pins all three sources to the same set."""
-    install = _parse_python_substrings(_INSTALL_PY)
+    install = _parse_python_substrings(_INSTALL_MCP_PY)
     audit = _parse_python_substrings(_SECRETS_AUDIT_PY)
     rust = _parse_rust_needles(_MCP_REGISTRATION_RS)
     assert install == audit == rust == _EXPECTED_NEEDLES
@@ -102,7 +107,7 @@ def test_all_three_agree_transitively():
 
 @pytest.mark.parametrize(
     "source_path",
-    [_INSTALL_PY, _SECRETS_AUDIT_PY, _MCP_REGISTRATION_RS],
+    [_INSTALL_MCP_PY, _SECRETS_AUDIT_PY, _MCP_REGISTRATION_RS],
 )
 def test_key_extra_rule_present_in_every_impl(source_path):
     """Every implementation adds the same extra `KEY` / `*_KEY` rule beyond the
