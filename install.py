@@ -10885,198 +10885,57 @@ def _write_app_state_key(key: str, value: str) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# IN-1 (v0.2.73): the Weaviate KG-row-hygiene slice — content-hash diffing +
+# orphan-row pruning — was extracted VERBATIM into vco_lib.install_weaviate
+# (mechanical move, no behaviour change). The extracted functions take their
+# install.py couplings (PROJECT_ROOT, _log_install_event,
+# _is_orchestrator_root_install) as EXPLICIT parameters so this module keeps
+# the pure logic in one place while these thin wrappers preserve the original
+# signatures + the `install.<name>` accessors (and the `install.PROJECT_ROOT`
+# monkeypatch contract) the call sites and test suite rely on.
+# ---------------------------------------------------------------------------
+
+from vco_lib import install_weaviate as _install_weaviate  # noqa: E402
+
+# Re-export the pure content-hash helper under its original name so tests
+# that call `install._compute_on_disk_content_hashes` keep resolving.
+# `_safe_inside_project` and `_path_resolves_on_disk` are wrapped (below) to
+# thread the live PROJECT_ROOT.
+_compute_on_disk_content_hashes = _install_weaviate._compute_on_disk_content_hashes
+
+
 def _batch_query_weaviate_content_hashes(
     collection_name: str,
     weaviate_url: str,
 ) -> "dict[str, str]":
-    """Thin wrapper around ``vco_lib.kg_sync.batch_query_content_hashes``.
+    """Thin wrapper over vco_lib.install_weaviate (IN-1, v0.2.73).
 
-    v0.2.46 KG-AUTO-HEAL-E: this function used to host the full V46-A
-    safety-triad implementation (no Like-% / limit:10000 / errors-before-
-    data / saturation warning). It was extracted into
-    ``vco_lib/kg_sync.py`` so the v0.2.46 KG-rebind re-sync path can
-    share the exact same hardened code path (single source of truth +
-    one regression-guard target). See plan §9.6 + the V46 audit at
-    ``.claude/context/audits/v0.2.46-compat-V46-2026-06-04.md`` (top-of-
-    report "CRITICAL: WATCH OUT FOR" item #1).
-
-    This wrapper preserves the legacy ``(collection_name, weaviate_url)``
-    positional signature so install.py's existing call sites (at lines
-    11675 and 11827) keep working without modification. It also keeps
-    the existing ``_log_install_event`` observability channel — the new
-    helper's ``on_warn`` callback is mapped to install-time deferral
-    log entries.
-
-    Original docstring preserved for historical reference:
-
-      Returns a dict mapping ``file_path`` → ``content_hash`` for every
-      object in the collection that has both properties populated.
-      Objects without a content_hash (e.g. created before v0.2.17) return
-      an empty string for that file_path — the diff logic treats this
-      as "always stale" for that file, which triggers a single-file
-      re-sync (correct: we want to fill in the missing hash).
-
-      v0.2.42 CI-10: "pay once, never again" — this function is the key
-      enabler. Once hashes are stored in Weaviate (after the first sync
-      that sets content_hash), subsequent ``--update`` runs only embed
-      changed files. Nodes created before v0.2.17 (no content_hash
-      property) will be re-synced once (to populate content_hash), then
-      skipped forever.
-
-      v0.2.46 V46-A (now in ``vco_lib.kg_sync``): dropped the broken
-      ``where: Like "%"`` filter, bumped ``limit`` 1000 → 10000, and
-      inspects ``body["errors"]`` BEFORE consuming ``data``. See
-      ``knowledge/concepts/silent-zero-fallback-antipattern.md``
-      instance #3.
+    Preserves the legacy ``(collection_name, weaviate_url)`` positional
+    signature and threads install.py's ``_log_install_event`` in as the
+    observability channel.
     """
-    from vco_lib.kg_sync import batch_query_content_hashes
-
-    def _on_warn(channel: str, payload: "dict") -> None:
-        # Map the helper's structured warn channels back into the
-        # legacy CI-10 install-event log so existing dashboards /
-        # `UPDATE_DEFERRED.md` parsing keeps working.
-        if channel == "graphql_errors":
-            errs = payload.get("errors", [])
-            first = errs[0] if errs else "unknown"
-            _log_install_event(
-                "7c/10", "warn",
-                f"CI-10: GraphQL errors for {collection_name!r}: {first[:200]}",
-                data={"collection": collection_name, "errors": errs},
-            )
-        elif channel == "saturation":
-            _log_install_event(
-                "7c/10", "warn",
-                f"CI-10: hit Weaviate QUERY_MAXIMUM_RESULTS cap (10000) for "
-                f"{collection_name!r}; some rows may be missing — consider "
-                f"cursor pagination",
-                data={"collection": collection_name, "rows": payload.get("rows", 0)},
-            )
-        elif channel == "transport_failure":
-            errs = payload.get("errors", [])
-            first = errs[0] if errs else "unknown"
-            _log_install_event(
-                "7c/10", "warn",
-                f"CI-10: batch hash query failed for {collection_name!r}: {first[:200]}",
-                data={"collection": collection_name, "error": first[:200]},
-            )
-
-    return batch_query_content_hashes(
-        weaviate_url=weaviate_url,
-        collection_name=collection_name,
-        on_warn=_on_warn,
+    return _install_weaviate._batch_query_weaviate_content_hashes(
+        collection_name, weaviate_url, log_event=_log_install_event,
     )
 
 
-def _compute_on_disk_content_hashes(knowledge_root: Path) -> "dict[str, str]":
-    """Compute _content_signature_excluding_updated for every .md in knowledge/.
-
-    Returns a dict mapping relative_file_path (str, relative to the project
-    root) → content_signature. The relative path matches the file_path stored
-    in Weaviate by sync_knowledge_graph.py (which uses
-    `file_path.relative_to(PROJECT_ROOT)` or the absolute path, depending on
-    KG_BASE_DIR — but content_hash comparison is by file content, so we can
-    detect drift purely by hash comparison regardless of the stored path format
-    as long as we match the key consistently).
-    """
-    import hashlib
-    import re as _re
-
-    def _sig(text: str) -> str:
-        """Mirror of sync_knowledge_graph.py::_content_signature_excluding_updated."""
-        if not text.strip().startswith("---"):
-            return hashlib.sha256(text.encode("utf-8")).hexdigest()
-        parts = text.split("---", 2)
-        if len(parts) < 3:
-            return hashlib.sha256(text.encode("utf-8")).hexdigest()
-        fm_no_updated = _re.sub(r"^updated:.*$\n?", "", parts[1], flags=_re.MULTILINE)
-        return hashlib.sha256((fm_no_updated + parts[2]).encode("utf-8")).hexdigest()
-
-    result: dict[str, str] = {}
-    if not knowledge_root.exists():
-        return result
-    for md_file in knowledge_root.rglob("*.md"):
-        try:
-            content = md_file.read_text(encoding="utf-8", errors="replace")
-            result[str(md_file)] = _sig(content)
-        except OSError:
-            # Unreadable file — include with empty hash so the diff logic
-            # treats it as stale (forces a re-sync attempt).
-            result[str(md_file)] = ""
-    return result
-
-
 def _safe_inside_project(candidate: "Path") -> bool:
-    """v0.2.44 V44-H: return True iff candidate resolves to a path inside
-    PROJECT_ROOT. Defends against stored file_path values containing '..'
-    that would otherwise escape the project tree (e.g. "../../../etc/passwd"
-    would resolve to an existing file outside PROJECT_ROOT and erroneously
-    keep an orphan KG row alive forever).
+    """Thin wrapper over vco_lib.install_weaviate (IN-1, v0.2.73).
 
-    Resolve both sides so symlinked install dirs compare consistently. Soft
-    fail (return False) on any OS / value error — a failed resolution should
-    behave like "outside the project" so the prune is permitted to delete
-    the stale row.
+    Threads the live ``PROJECT_ROOT`` so tests that patch
+    ``install.PROJECT_ROOT`` continue to steer the result.
     """
-    try:
-        resolved = candidate.resolve()
-        project_resolved = PROJECT_ROOT.resolve()
-        return resolved.is_relative_to(project_resolved)
-    except (OSError, ValueError):
-        return False
+    return _install_weaviate._safe_inside_project(candidate, PROJECT_ROOT)
 
 
 def _path_resolves_on_disk(file_path_str: str) -> bool:
-    """v0.2.44 V44-A: try multiple normalization strategies before declaring orphan.
+    """Thin wrapper over vco_lib.install_weaviate (IN-1, v0.2.73).
 
-    Strategies (any True → file exists, do NOT prune):
-      1. Direct relative-to-PROJECT_ROOT (must resolve INSIDE PROJECT_ROOT)
-      2. Resolve PROJECT_ROOT first (handles symlinked install dirs;
-         must resolve INSIDE PROJECT_ROOT)
-      3. Absolute path directly (intentionally bypasses PROJECT_ROOT —
-         bundled-template absolute paths are legitimately outside)
-      4. Strip .claude/worktrees/agent-XXX/ prefix (must resolve INSIDE
-         PROJECT_ROOT)
-
-    v0.2.44 V44-H: strategies 1, 2, 4 now require the resolved path to
-    lie inside PROJECT_ROOT. Previously, a stored value like
-    "../../../etc/passwd" would resolve to an existing file outside the
-    project tree and keep a corrupted KG row alive forever (closes Adv-1
-    P1-1 + P1-2).
+    Threads the live ``PROJECT_ROOT`` so tests that patch
+    ``install.PROJECT_ROOT`` continue to steer the result.
     """
-    # 1. Direct relative-to-PROJECT_ROOT (canonical)
-    try:
-        candidate = PROJECT_ROOT / file_path_str
-        if _safe_inside_project(candidate) and candidate.exists():
-            return True
-    except (OSError, ValueError):
-        # NUL bytes / invalid chars in stored file_path would crash Path.exists()
-        pass
-    # 2. Resolve PROJECT_ROOT first (handles symlinked install dirs)
-    try:
-        candidate = PROJECT_ROOT.resolve() / file_path_str
-        if _safe_inside_project(candidate) and candidate.exists():
-            return True
-    except (OSError, ValueError):
-        pass
-    # 3. Absolute path directly — intentionally bypasses PROJECT_ROOT
-    # semantics. Bundled-template absolute paths (e.g. paths written by
-    # an absolute-mode sync_knowledge_graph.py run) are legitimately
-    # outside PROJECT_ROOT and must continue to count as on-disk.
-    try:
-        candidate = Path(file_path_str)
-        if candidate.is_absolute() and candidate.exists():
-            return True
-    except (OSError, ValueError):
-        pass
-    # 4. Strip worktree prefix (.claude/worktrees/agent-XXX/foo.md → foo.md)
-    if ".claude/worktrees/agent-" in file_path_str:
-        import re
-        m = re.search(r"\.claude/worktrees/agent-[^/]+/(.*)$", file_path_str)
-        if m:
-            candidate = PROJECT_ROOT / m.group(1)
-            if _safe_inside_project(candidate) and candidate.exists():
-                return True
-    return False
+    return _install_weaviate._path_resolves_on_disk(file_path_str, PROJECT_ROOT)
 
 
 def _prune_stale_kg_rows(
@@ -11085,191 +10944,19 @@ def _prune_stale_kg_rows(
     *,
     dry_run: bool | None = None,
 ) -> None:
-    """V0243-6: delete Weaviate objects whose ``file_path`` has no matching
-    on-disk Markdown file in ``knowledge/**/*.md``.
+    """Thin wrapper over vco_lib.install_weaviate (IN-1, v0.2.73).
 
-    Called from the full-sync branch of ``_seed_weaviate`` after a successful
-    ``sync_knowledge_graph.py --all``.  The sync upserts every on-disk file
-    but never deletes rows for files that were removed from disk — this step
-    closes that gap.
-
-    Args:
-        collection_name: The Weaviate collection to prune (``KG_COLLECTION``).
-        weaviate_url: Base URL of the Weaviate instance.
-        dry_run: When True, print the stale count but do NOT delete.
-                 When False, batch-delete all stale rows via the Weaviate
-                 ``/v1/batch/objects`` endpoint.
-                 When None (default): False for orchestrator-root installs
-                 (``_is_orchestrator_root_install()``), True otherwise.
-
-    Soft-fail throughout: any error is logged but never raises into the caller.
+    Threads the live ``PROJECT_ROOT``, install.py's ``_log_install_event``,
+    and ``_is_orchestrator_root_install`` (which drives the ``dry_run=None``
+    default) so behaviour is identical to the pre-extraction inline version.
     """
-    if dry_run is None:
-        dry_run = not _is_orchestrator_root_install()
-
-    # v0.2.44 V44-A: existence is checked via _path_resolves_on_disk per row
-    # below (multi-strategy: relative, resolved, absolute, worktree-stripped).
-    # The earlier all_on_disk set-build is no longer needed.
-
-    # Fetch all stored (uuid, file_path) pairs from Weaviate.
-    stored: list[tuple[str, str]] = []  # (uuid, file_path)
-    try:
-        base = (weaviate_url or "http://localhost:8081").rstrip("/")
-        # v0.2.46 V46-A: dropped the broken `where: Like "%"` filter (same
-        # bug as CI-10 in _batch_query_weaviate_content_hashes — Weaviate's
-        # BM25 tokenizer rejects `%` as "only stopwords provided" and the
-        # null response was silently coalesced to []). With the filter
-        # dropped, the secondary `{ Get { ... } }` brace-balance issue that
-        # Investigator 1 reproduced live ("Expected Name, found EOF") also
-        # disappears because the string is now syntactically simpler.
-        # Bumped limit 2000 → 10000 (Weaviate's QUERY_MAXIMUM_RESULTS
-        # default); saturation warning below signals if we approach the cap.
-        gql_query = (
-            f"{{ Get {{ {collection_name}(limit: 10000) "
-            f"{{ _additional {{ id }} file_path }} }} }}"
-        )
-        import json as _json
-        import urllib.request as _ur
-        data = _json.dumps({"query": gql_query}).encode()
-        req = _ur.Request(
-            f"{base}/v1/graphql",
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with _ur.urlopen(req, timeout=15) as resp:  # noqa: S310
-            body = _json.loads(resp.read())
-
-        # v0.2.46 V46-A: inspect errors array BEFORE consuming data. See
-        # knowledge/concepts/mcp-loud-fail-error-pattern.md § GraphQL
-        # errors[] array. Non-empty errors → WARN + early return (prune
-        # check is best-effort; no destructive action is taken without
-        # an authoritative stored-rows list).
-        if body.get("errors"):
-            first_err = (body["errors"][0] or {}).get("message", "unknown")
-            _log_install_event(
-                "7c/10", "warn",
-                f"V0243-6: GraphQL errors fetching prune candidates from "
-                f"{collection_name!r}: {first_err[:200]}",
-                data={
-                    "collection": collection_name,
-                    "errors": [
-                        (e or {}).get("message", "")[:200]
-                        for e in body["errors"][:3]
-                    ],
-                },
-            )
-            return
-
-        objects = (
-            body.get("data", {})
-            .get("Get", {})
-            .get(collection_name, [])
-        ) or []
-
-        # v0.2.46 V46-A: saturation warning — same caveat as CI-10. If we
-        # hit the cap, the prune set is INCOMPLETE; aborting is safer than
-        # deleting based on a truncated view (we might mark live rows as
-        # stale because they fell past the limit).
-        if len(objects) >= 10000:
-            _log_install_event(
-                "7c/10", "warn",
-                f"V0243-6: hit Weaviate QUERY_MAXIMUM_RESULTS cap (10000) "
-                f"for {collection_name!r}; aborting prune to avoid "
-                f"false-positives — consider cursor pagination",
-                data={"collection": collection_name, "rows": len(objects)},
-            )
-            return
-
-        for obj in objects:
-            uid = (obj.get("_additional") or {}).get("id") or ""
-            fp = (obj.get("file_path") or "").strip()
-            if uid and fp:
-                stored.append((uid, fp))
-    except Exception as exc:
-        _log_install_event(
-            "7c/10", "warn",
-            f"V0243-6: could not fetch stored file_paths for prune check: {exc}",
-            data={"collection": collection_name, "error": str(exc)[:200]},
-        )
-        return
-
-    stale_uuids: list[str] = []
-    stale_paths: list[str] = []
-    for uid, fp in stored:
-        if not _path_resolves_on_disk(fp):
-            stale_uuids.append(uid)
-            stale_paths.append(fp)
-            print(f"    → pruned orphan row file_path={fp!r}")
-
-    if not stale_uuids:
-        _log_install_event(
-            "7c/10", "ok",
-            f"V0243-6: prune check: no stale rows in {collection_name!r} "
-            f"({len(stored)} rows, all match on-disk)",
-            data={"collection": collection_name, "stored": len(stored), "stale": 0},
-        )
-        return
-
-    print(
-        f"  V0243-6: {len(stale_uuids)} stale KG row(s) found "
-        f"(file deleted from disk) in {collection_name!r}"
+    _install_weaviate._prune_stale_kg_rows(
+        collection_name, weaviate_url,
+        dry_run=dry_run,
+        project_root=PROJECT_ROOT,
+        log_event=_log_install_event,
+        is_orchestrator_root_install=_is_orchestrator_root_install,
     )
-    _log_install_event(
-        "7c/10", "info",
-        f"V0243-6: prune: {len(stale_uuids)} stale row(s) in {collection_name!r}",
-        data={"collection": collection_name, "stale": len(stale_uuids),
-              "dry_run": dry_run},
-    )
-
-    if dry_run:
-        print(f"  (dry-run: {len(stale_uuids)} row(s) would be deleted)")
-        return
-
-    # Batch-delete via Weaviate v1 batch/objects endpoint.
-    # v0.2.46 V46-A-followup: SECOND v0.2.43 bug caught by V46-B's live
-    # integration test — `valueText: <list>` returns HTTP 400 ("cannot
-    # unmarshal array into Go struct field of type string"). The
-    # correct field for `ContainsAny` with a list of UUIDs is
-    # `valueTextArray` (plural). Reproduced live 2026-06-03; the buggy
-    # form has been on disk since V0243-6 shipped in v0.2.43 (which is
-    # ALSO why the prune logic appeared to "no-op silently" — same
-    # silent-zero-fallback antipattern as the diff-gate fetch).
-    try:
-        base = (weaviate_url or "http://localhost:8081").rstrip("/")
-        delete_body = _json.dumps({
-            "match": {
-                "class": collection_name,
-                "where": {
-                    "path": ["id"],
-                    "operator": "ContainsAny",
-                    "valueTextArray": stale_uuids,
-                },
-            },
-            "output": "minimal",
-            "dryRun": False,
-        }).encode()
-        req = _ur.Request(
-            f"{base}/v1/batch/objects",
-            data=delete_body,
-            headers={"Content-Type": "application/json"},
-            method="DELETE",
-        )
-        with _ur.urlopen(req, timeout=30) as resp:  # noqa: S310
-            result_body = _json.loads(resp.read())
-        deleted_count = (result_body.get("results") or {}).get("successful", 0)
-        print(f"  V0243-6: pruned {deleted_count} stale row(s)")
-        _log_install_event(
-            "7c/10", "ok",
-            f"V0243-6: pruned {deleted_count} stale row(s) from {collection_name!r}",
-            data={"collection": collection_name, "deleted": deleted_count},
-        )
-    except Exception as exc:
-        _log_install_event(
-            "7c/10", "warn",
-            f"V0243-6: batch delete failed for {collection_name!r}: {exc}",
-            data={"collection": collection_name, "error": str(exc)[:200]},
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -19084,6 +18771,17 @@ def _check_search_mcp_env_obsolete(
 #
 # Audit reference: .claude/context/mcp-install-pipeline-audit-2026-05-16.md
 #
+# IN-1 (v0.2.73): the pure MCP-registration primitives — env-key allowlist +
+# secret denylist, the default-MCP entry builder, the pure-Python JSON
+# writer, and the stale/deprecated scan+detect+consent helpers — were
+# extracted VERBATIM into ``vco_lib.install_mcp`` (mechanical move, no
+# behaviour change). They are re-imported below so install.py's existing
+# call sites (and the test suite's ``install.<name>`` accessors) keep
+# resolving. The ORCHESTRATION layer (``_register_mcps``,
+# ``_rewrite_stale_mcp_entries``, ``_remove_deprecated_mcp_entries``) stays
+# HERE because it depends on the launcher-binary resolver + install-time
+# logging + home-dir resolution.
+#
 # Pre-PR-23 install.py performed zero MCP registration. Result: fresh
 # v0.2.11 installs left ~/.claude.json with no bundled MCP servers wired
 # at all → Claude Code couldn't see the orchestrator. The Rust
@@ -19113,78 +18811,20 @@ def _check_search_mcp_env_obsolete(
 # confirming the per-project env channel is sufficient.
 # ---------------------------------------------------------------------------
 
-# Env-key allowlist for ~/.claude.json mcpServers.*.env. MUST stay in sync
-# with launcher/src-tauri/src/mcp_registration.rs::ALLOWED_ENV_KEYS.
-#
-# CRITICAL CONTRACT (see Issue H.1 from mcp-instability audit 2026-05-16):
-# Anthropic semantics say "project scope overrides user scope" for env
-# vars, but Claude Code applies ~/.claude.json mcpServers.*.env keys LAST
-# to MCP subprocesses — so they WIN against .claude/settings.json env.
-# This is the wrong direction for any per-project-varying value.
-#
-# Therefore this allowlist is restricted to keys that are TRULY
-# machine-invariant (same value across every workspace on the user's
-# machine): service URLs/ports, PYTHONPATH (resolves to the install_root),
-# and ACTIVE_EMBEDDING (the embedding-mode toggle is machine-wide because
-# it determines which named-vector Weaviate column is queried).
-#
-# Removed in PR-43 (post-PR-23): RL_SERVER_URL (varies per user setup —
-# the maintainer install runs a dedicated port-11442 service, MAO uses 11439, etc.),
-# EMBEDDING_MODEL (users may want per-project override; if it's in this
-# global allowlist, the per-project .claude/settings.json env value gets
-# overridden the WRONG WAY due to Claude Code's precedence).
-_ALLOWED_GLOBAL_ENV_KEYS = (
-    "WEAVIATE_URL",
-    "OLLAMA_URL",
-    "GRPC_PORT",
-    "PYTHONPATH",
-    "ACTIVE_EMBEDDING",
-    "CODE_EMBED_SERVICE_URL",
+from vco_lib.install_mcp import (  # noqa: E402
+    _ALLOWED_GLOBAL_ENV_KEYS,
+    _DEPRECATED_DEFAULT_MCPS,
+    _SECRET_SHAPED_SUBSTRINGS,
+    _build_python_mcp_entries,
+    _consent_for_stale_entries,
+    _detect_deprecated_mcp_entries,
+    _detect_stale_mcp_entries,
+    _filter_env_for_global_json,
+    _is_secret_shaped_env_key,
+    _python_fallback_write_mcp_entries,
+    _scan_deprecated_mcp_entries,
+    _scan_stale_mcp_entries,
 )
-
-# Patterns that MUST be silently dropped (secrets). Case-insensitive
-# substring match for the "contains" group; plus the explicit `_KEY` /
-# `KEY` rule for the suffix group. Mirrors mcp_registration.rs.
-_SECRET_SHAPED_SUBSTRINGS = (
-    "TOKEN", "SECRET", "PAT", "PASSWORD", "PASS", "AUTH",
-)
-
-
-def _is_secret_shaped_env_key(key: str) -> bool:
-    """True iff `key` looks like a credential. See module docstring.
-
-    Matches secret substrings as TOKENS within ``[_\\-]``-delimited
-    env-key parts. Avoids false positives like ``PYTHONPATH`` matching
-    ``PAT`` or ``COMPASS`` matching ``PASS``. The keys we care about
-    (``GITHUB_TOKEN``, ``DB_PASS``, ``MY_PAT``, ``AUTH_HEADER``, etc.)
-    all have the secret token as a distinct segment between underscores
-    or at the boundary of the string.
-    """
-    upper = key.upper()
-    # Split on `_` and `-` (the two common env-key segment separators).
-    parts = re.split(r"[_\-]+", upper)
-    for needle in _SECRET_SHAPED_SUBSTRINGS:
-        if needle in parts:
-            return True
-    # Trailing `_KEY` and exact `KEY` rules (catch STRIPE_KEY etc.).
-    if upper == "KEY" or upper.endswith("_KEY"):
-        return True
-    return False
-
-
-def _filter_env_for_global_json(candidate: dict) -> tuple[dict, list[str]]:
-    """Return (safe_env, dropped_keys). Mirrors Rust filter_env_for_global_json."""
-    safe = {}
-    dropped = []
-    for k, v in candidate.items():
-        if _is_secret_shaped_env_key(k):
-            dropped.append(k)
-            continue
-        if k not in _ALLOWED_GLOBAL_ENV_KEYS:
-            dropped.append(k)
-            continue
-        safe[k] = v
-    return safe, dropped
 
 
 def _resolve_venv_python_for_install(install_root: Path) -> Optional[Path]:
@@ -21344,229 +20984,6 @@ def _deploy_and_start_vct_hub(
         )
 
 
-def _build_python_mcp_entries(
-    install_root: Path,
-    venv_python: Path,
-    weaviate_port: int,
-    ollama_port: int,
-    grpc_port: int,
-    code_embed_port: int,
-) -> list[tuple[str, dict, list[str]]]:
-    """Pure-Python mirror of mcp_registration.rs::build_default_mcp_entries.
-
-    Returns a list of (name, entry_dict, dropped_keys). Each entry's `env`
-    field has already been filtered through the allowlist + secret-shape
-    denylist. The Rust path is the authoritative writer; this exists for
-    Tier 4 (pure-Python fallback).
-    """
-    weaviate_url = f"http://localhost:{weaviate_port}"
-    ollama_url = f"http://localhost:{ollama_port}"
-    code_embed_url = f"http://localhost:{code_embed_port}"
-    mcp_root = install_root / "claude_mcp_servers"
-    pythonpath = str(mcp_root)
-    venv_python_str = str(venv_python)
-
-    # weaviate-kg
-    weaviate_server = mcp_root / "weaviate_mcp" / "server.py"
-    # PR-43 (post-PR-23): EMBEDDING_MODEL + RL_SERVER_URL are intentionally
-    # omitted here. They were originally written as "global defaults that
-    # per-project may override" but Claude Code's actual env precedence
-    # makes ~/.claude.json mcpServers.*.env WIN against .claude/settings.json
-    # env — so the override goes the wrong direction. The launcher's
-    # write_project_env_files puts these in .claude/settings.json env where
-    # they reach MCP subprocesses correctly. Don't shadow them here.
-    weaviate_env_raw = {
-        "WEAVIATE_URL": weaviate_url,
-        "OLLAMA_URL": ollama_url,
-        "GRPC_PORT": str(grpc_port),
-        "PYTHONPATH": pythonpath,
-        "ACTIVE_EMBEDDING": "qwen3",
-        "CODE_EMBED_SERVICE_URL": code_embed_url,
-    }
-    weaviate_env, weaviate_dropped = _filter_env_for_global_json(weaviate_env_raw)
-    weaviate_entry = {
-        "type": "stdio",
-        "command": venv_python_str,
-        "args": [str(weaviate_server)],
-        "env": weaviate_env,
-    }
-
-    # search (v0.2.11+: needs no secrets; uses wrapper.sh on Unix)
-    search_server = mcp_root / "search_mcp" / "server.py"
-    search_wrapper = mcp_root / "search_mcp" / "wrapper.sh"
-    if platform.system().lower().startswith("win"):
-        search_cmd, search_args = venv_python_str, [str(search_server)]
-    else:
-        search_cmd, search_args = str(search_wrapper), []
-    search_env_raw = {"PYTHONPATH": pythonpath}
-    search_env, search_dropped = _filter_env_for_global_json(search_env_raw)
-    search_entry = {
-        "type": "stdio",
-        "command": search_cmd,
-        "args": search_args,
-        "env": search_env,
-    }
-
-    # playwright (F-1, v0.2.73)
-    # Browser automation via Microsoft's `@playwright/mcp`. The entry
-    # mirrors EXACTLY how the MCP is launched everywhere else in the
-    # stack: bare `npx -y @playwright/mcp@latest` — the same invocation
-    # the GUI catalog ships (vct-launcher-core/src/types.rs::
-    # default_mcp_servers) and `_install_playwright_browsers` pre-caches.
-    # `npx` resolves from PATH cross-OS; no venv-python and no env vars.
-    # Default-enabled per project. MUST stay in sync with the Rust builder
-    # mcp_registration.rs::build_default_mcp_entries.
-    #
-    # Pre-v0.2.73 this entry was MISSING from both builders (audit finding
-    # F-1): the GUI catalog shipped enabled=True so the toggle-ON write
-    # never fired on a fresh install, and no install path wrote the entry —
-    # the Chromium pre-cache was spent on an MCP that never reached
-    # ~/.claude.json.
-    playwright_entry = {
-        "type": "stdio",
-        "command": "npx",
-        "args": ["-y", "@playwright/mcp@latest"],
-        "env": {},
-    }
-    playwright_dropped: list[str] = []
-
-    # mermaid (Phase 1.2 — diagrams plan)
-    # Wrapper MCP that proxies the pinned `claude-mermaid` npm package.
-    # Spawned as `<venv-python> -m claude_mcp_servers.wrappers.mermaid_proxy`
-    # — the wrapper itself spawns `npx` as a child once it's resolved the
-    # per-project tool allowlist. Mirrors the Rust path's mermaid entry
-    # in mcp_registration.rs::build_default_mcp_entries.
-    mermaid_env_raw = {"PYTHONPATH": pythonpath}
-    mermaid_env, mermaid_dropped = _filter_env_for_global_json(mermaid_env_raw)
-    mermaid_entry = {
-        "type": "stdio",
-        "command": venv_python_str,
-        "args": [
-            "-m",
-            "claude_mcp_servers.wrappers.mermaid_proxy",
-        ],
-        "env": mermaid_env,
-    }
-
-    # excalidraw (Phase 2 — diagrams plan)
-    # Wrapper MCP that proxies the in-tree-vendored
-    # `excalidraw-mcp-server` (see
-    # vco_lib/excalidraw_mcp_fork/VENDORED.md — moved here from
-    # claude_mcp_servers/excalidraw_mcp_fork/ in v0.2.34). Spawned as
-    # `<venv-python> -m claude_mcp_servers.wrappers.excalidraw_proxy`
-    # — the wrapper itself spawns Node on the vendored entry point
-    # once it's resolved the per-project tool allowlist. Mirrors the
-    # Rust path's excalidraw entry in
-    # mcp_registration.rs::build_default_mcp_entries.
-    excalidraw_env_raw = {"PYTHONPATH": pythonpath}
-    excalidraw_env, excalidraw_dropped = _filter_env_for_global_json(excalidraw_env_raw)
-    excalidraw_entry = {
-        "type": "stdio",
-        "command": venv_python_str,
-        "args": [
-            "-m",
-            "claude_mcp_servers.wrappers.excalidraw_proxy",
-        ],
-        "env": excalidraw_env,
-    }
-
-    return [
-        ("weaviate-kg", weaviate_entry, weaviate_dropped),
-        ("search", search_entry, search_dropped),
-        ("playwright", playwright_entry, playwright_dropped),
-        ("mermaid", mermaid_entry, mermaid_dropped),
-        ("excalidraw", excalidraw_entry, excalidraw_dropped),
-    ]
-
-
-def _python_fallback_write_mcp_entries(
-    claude_json_path: Path,
-    entries: list[tuple[str, dict, list[str]]],
-) -> tuple[int, list[str]]:
-    """Pure-Python JSON merge mirroring mcp_registration.rs discipline.
-
-    Same contract as the Rust register_mcp:
-      - advisory file lock at <path>.lock (create_new)
-      - read existing JSON (or empty {})
-      - mutate ONLY mcpServers.<name>
-      - write to .tmp + atomic rename
-      - backup existing file to <path>.bak before overwrite
-
-    The launcher.db is NOT touched here — `project_state_populate` will
-    pick up the JSON entries when the user opens the launcher GUI.
-
-    Returns (success_count, error_messages). Soft-fail per entry.
-    """
-    # Ensure parent dir exists before lock + write. The fake_home pattern
-    # in tests creates a path like tmp/fake_home/.claude.json where
-    # `fake_home` doesn't exist yet; without this mkdir, os.open() on the
-    # .lock file raises FileNotFoundError and the write returns (0, ...).
-    try:
-        claude_json_path.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        return (0, [f"create parent {claude_json_path.parent}: {exc}"])
-    # Acquire lock.
-    lock_path = claude_json_path.with_suffix(claude_json_path.suffix + ".lock")
-    locked = False
-    deadline = time.time() + 5.0
-    while time.time() < deadline:
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, str(os.getpid()).encode("ascii"))
-            os.close(fd)
-            locked = True
-            break
-        except FileExistsError:
-            time.sleep(0.05)
-        except OSError:
-            break
-    if not locked:
-        return (0, [f"could not acquire lock {lock_path}"])
-
-    errors: list[str] = []
-    success = 0
-    try:
-        # Read existing (or empty).
-        try:
-            if claude_json_path.is_file():
-                raw = claude_json_path.read_text(encoding="utf-8")
-                data = json.loads(raw) if raw.strip() else {}
-            else:
-                data = {}
-        except (OSError, json.JSONDecodeError) as exc:
-            return (0, [f"read {claude_json_path}: {exc}"])
-        if not isinstance(data, dict):
-            return (0, [f"{claude_json_path} root is not a JSON object"])
-        if "mcpServers" not in data or not isinstance(data.get("mcpServers"), dict):
-            data["mcpServers"] = {}
-        # Merge entries.
-        for name, entry, _dropped in entries:
-            data["mcpServers"][name] = entry
-            success += 1
-        # Backup + atomic write.
-        # v0.2.53 DEDUP-5 / CORRECT-1: route through
-        # vco_lib.env_template._atomic_write_text which uses
-        # tempfile.mkstemp + os.replace AND unlinks the tempfile on any
-        # exception. The inline pre-v0.2.53 recipe (tmp.write_text +
-        # os.replace) left behind <path>.tmp on partial-write failures
-        # (disk-full, write-mid-flush, sigterm). The new helper makes
-        # cleanup atomic.
-        try:
-            if claude_json_path.is_file():
-                bak = claude_json_path.with_suffix(claude_json_path.suffix + ".bak")
-                shutil.copy2(claude_json_path, bak)
-            from vco_lib.env_template import _atomic_write_text
-            _atomic_write_text(claude_json_path, json.dumps(data, indent=2))
-        except OSError as exc:
-            return (0, [f"write {claude_json_path}: {exc}"])
-        return (success, errors)
-    finally:
-        try:
-            lock_path.unlink()
-        except OSError:
-            pass
-
-
 def _register_mcps(
     install_root: Path,
     deferral_report: "DeferralReport",
@@ -21870,113 +21287,6 @@ def _register_mcps(
     _detect_deprecated_mcp_entries(install_root, claude_json, deferral_report)
 
 
-def _scan_stale_mcp_entries(
-    install_root: Path,
-    claude_json: Path,
-) -> list[tuple[str, str, dict]]:
-    """Return a list of ``(mcp_name, stale_path, entry_dict)`` for every
-    ``~/.claude.json mcpServers`` entry whose ``command`` or ``args[0]``
-    points at a vco-install-shaped path OUTSIDE the current install_root.
-
-    Pure function (no deferral side effects, no writes). Used by both
-    :func:`_detect_stale_mcp_entries` (reports only) and
-    :func:`_rewrite_stale_mcp_entries` (PR-33 consent-prompted rewrite).
-    The triple includes the full entry dict so the rewrite path can
-    inspect existing ``env`` keys for the secret-leak warning.
-
-    Cross-OS path detection: absolute paths only (``/``, ``C:\\``,
-    ``c:\\``, ``\\\\``-prefixed UNC). Anchored on the ``claude_mcp_servers``
-    or ``.venv`` directory tokens so user-added MCPs at ``/usr/bin/foo``
-    are NOT misclassified as orchestrator-stale.
-    """
-    if not claude_json.is_file():
-        return []
-    try:
-        data = json.loads(claude_json.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
-    if not isinstance(data, dict):
-        return []
-    mcp_servers = data.get("mcpServers", {})
-    if not isinstance(mcp_servers, dict):
-        return []
-
-    install_root_str = str(install_root.resolve())
-    stale: list[tuple[str, str, dict]] = []
-    for name, entry in mcp_servers.items():
-        if not isinstance(entry, dict):
-            continue
-        cmd = entry.get("command", "") if isinstance(entry.get("command"), str) else ""
-        first_arg = ""
-        args = entry.get("args", [])
-        if isinstance(args, list) and args and isinstance(args[0], str):
-            first_arg = args[0]
-        for candidate in (cmd, first_arg):
-            if not candidate or not candidate.startswith(("/", "C:\\", "c:\\", "\\\\")):
-                continue
-            # Anchor: only flag paths that look like vco install layouts
-            # (claude_mcp_servers/ or .venv/). Otherwise we'd flag every
-            # user-added MCP that lives in /usr/bin/foo.
-            if "claude_mcp_servers" not in candidate and ".venv" not in candidate:
-                continue
-            if not candidate.startswith(install_root_str):
-                stale.append((name, candidate, entry))
-                break
-    return stale
-
-
-def _detect_stale_mcp_entries(
-    install_root: Path,
-    claude_json: Path,
-    deferral_report: "DeferralReport",
-) -> None:
-    """On --update, emit a deferral when ~/.claude.json mcpServers entries
-    point at directories outside the current install_root.
-
-    Detection-only path (no rewrite). The companion
-    :func:`_rewrite_stale_mcp_entries` (PR-33) consumes the same
-    :func:`_scan_stale_mcp_entries` data and performs consent-prompted
-    rewrites when ``--rewrite-stale-mcps`` is passed.
-    """
-    stale = _scan_stale_mcp_entries(install_root, claude_json)
-    if not stale:
-        return
-
-    install_root_str = str(install_root.resolve())
-    detected_lines = [f"  - `{name}`: {path}" for name, path, _ in stale]
-    deferral_report.add_entry(
-        DeferralEntry(
-            condition_id="stale_mcp_entry",
-            title="Stale ~/.claude.json MCP entries from a previous install",
-            detected=(
-                f"~/.claude.json contains MCP entries that point at directories "
-                f"outside the current install_root ({install_root_str}):\n\n"
-                + "\n".join(detected_lines)
-                + "\n\nThese were left behind by a previous orchestrator install "
-                "at a different path. Claude Code may spawn duplicate MCP "
-                "subprocesses against the same Weaviate container if both "
-                "installs are still active."
-            ),
-            why_deferred=(
-                "Auto-rewriting global MCP entries is destructive (user may "
-                "have intentional dual-install setups). v0.2.12 detects and "
-                "reports; pass `--rewrite-stale-mcps` for the consent-prompted "
-                "rewrite path (PR-33)."
-            ),
-            command_to_apply=(
-                "# Re-run with the consent-prompted rewrite flag (PR-33):\n"
-                "python install.py --update --rewrite-stale-mcps\n"
-                "# Or, for CI / scripted contexts that want to accept all:\n"
-                "#   VCT_REWRITE_STALE_MCPS=all python install.py --update --rewrite-stale-mcps"
-            ),
-            severity="warning",
-            kg_node_refs=[
-                ".claude/context/mcp-install-pipeline-audit-2026-05-16.md",
-            ],
-        )
-    )
-
-
 # ---------------------------------------------------------------------------
 # PR-33 (v0.2.12, 2026-05-16): consent-prompted rewrite of stale MCP entries
 # ---------------------------------------------------------------------------
@@ -21999,100 +21309,6 @@ def _detect_stale_mcp_entries(
 # copied BEFORE we hand off to the writer. The writer itself produces a
 # separate ``.bak`` via its atomic-write discipline. Belt-and-suspenders
 # for a destructive operation.
-
-
-def _consent_for_stale_entries(
-    stale: list[tuple[str, str, dict]],
-    install_root: Path,
-    quiet: bool,
-    env_override: str,
-    input_fn=input,
-    output_fn=print,
-) -> dict[str, bool]:
-    """Drive the per-entry consent prompt and return a ``{name: accept}`` map.
-
-    Decision tree (mirrors the PR-33 spec):
-
-    * ``quiet=True`` and ``env_override != "all"`` → return all-False
-      (caller emits a clarifying deferral; no prompt possible).
-    * ``env_override == "all"`` → return all-True (CI fast-path).
-    * Otherwise → walk each entry once, accept ``y`` / ``yes``, default
-      reject on empty / ``n`` / ``no``; ``a`` / ``all`` short-circuits
-      remaining entries to True; ``s`` / ``skip-all`` short-circuits
-      to False.
-
-    Soft-fail: an EOF / KeyboardInterrupt on the prompt is treated as
-    skip-all so install does not crash mid-prompt.
-    """
-    # Fast-path: explicit env override for CI / scripted runs.
-    if env_override.lower() in ("all", "yes", "y", "true", "1"):
-        return {name: True for name, _, _ in stale}
-    # Quiet mode cannot prompt — caller handles the deferral.
-    if quiet:
-        return {name: False for name, _, _ in stale}
-
-    install_root_str = str(install_root.resolve())
-    output_fn("")
-    output_fn(
-        f"Found {len(stale)} ~/.claude.json mcpServers entr"
-        f"{'y' if len(stale) == 1 else 'ies'} "
-        "pointing outside this install_root:"
-    )
-    for name, stale_path, _entry in stale:
-        output_fn(f"  - {name}: {stale_path}")
-    output_fn("")
-    output_fn(
-        "These were registered by a different orchestrator install. "
-        "Rewriting will point them at the CURRENT install:"
-    )
-    output_fn(f"  {install_root_str}")
-    output_fn(
-        "Existing config (env block, args extras) is preserved; only "
-        "path components change. Per-entry choices: "
-        "[y]es, [n]o (default), [a]ll, [s]kip-all"
-    )
-    output_fn("")
-
-    choices: dict[str, bool] = {}
-    blanket: Optional[bool] = None
-    for name, _stale_path, entry in stale:
-        if blanket is not None:
-            choices[name] = blanket
-            output_fn(f"  {name} → {'rewrite' if blanket else 'skip'} (from blanket choice)")
-            continue
-        # Secret-leak warning: highlight env keys that will be dropped.
-        env_block = entry.get("env", {}) if isinstance(entry.get("env"), dict) else {}
-        will_drop = [
-            k for k in env_block.keys()
-            if _is_secret_shaped_env_key(k) or k not in _ALLOWED_GLOBAL_ENV_KEYS
-        ]
-        if will_drop:
-            output_fn(
-                f"  WARNING: rewriting `{name}` will drop env keys: {will_drop}. "
-                "These are not in the global-JSON allowlist (secrets go to the "
-                "OS keychain via the launcher; per-project keys live in "
-                ".claude/settings.json env). Lost on rewrite."
-            )
-        try:
-            answer = input_fn(f"  {name} → rewrite? [y/N/a/s]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            # Treat any prompt-failure as skip-all (safest default).
-            output_fn("  (prompt interrupted — treating as skip-all)")
-            for n, _, _ in stale:
-                choices.setdefault(n, False)
-            return choices
-        if answer in ("a", "all"):
-            blanket = True
-            choices[name] = True
-        elif answer in ("s", "skip-all"):
-            blanket = False
-            choices[name] = False
-        elif answer in ("y", "yes"):
-            choices[name] = True
-        else:
-            # Empty / "n" / "no" / unrecognised → skip (safest default).
-            choices[name] = False
-    return choices
 
 
 def _rewrite_stale_mcp_entries(
@@ -22323,167 +21539,6 @@ def _rewrite_stale_mcp_entries(
 #   When --rewrite-stale-mcps is passed, deprecated-MCP detection is
 #   ALSO run (deprecation is a form of staleness).  The removal itself
 #   still requires the explicit --remove-deprecated-mcps flag.
-
-
-#: Registry of MCPs that used to be in the default install set but were
-#: later removed.  Any entry in this dict will be scanned for in
-#: ~/.claude.json on every --update run.
-_DEPRECATED_DEFAULT_MCPS: dict[str, dict] = {
-    "ollama": {
-        "removed_in": "v0.2.11",
-        "reason": (
-            "Ollama MCP server dropped from default install (PR-14a). "
-            "The tools it exposed (chat / read_document / read_image) are "
-            "redundant with Claude's native capabilities. Ollama remains as "
-            "embedding infrastructure (Weaviate vectorizers); only the MCP "
-            "tool-surface was removed."
-        ),
-        "opt_in_manifest": "launcher/bundled_manifests/vct-ollama.json",
-    },
-    # Future deprecations go here, e.g.:
-    # "coordination": {
-    #     "removed_in": "vX.Y.Z",
-    #     "reason": "...",
-    #     "opt_in_manifest": "launcher/bundled_manifests/vct-coordination.json",
-    # },
-}
-
-
-def _scan_deprecated_mcp_entries(
-    install_root: Path,
-    claude_json: Path,
-) -> list[tuple[str, str, dict, dict]]:
-    """Return a list of ``(mcp_name, cmd_path, entry_dict, dep_info)`` for
-    every ``~/.claude.json mcpServers`` entry that:
-
-    a) has a name present in :data:`_DEPRECATED_DEFAULT_MCPS`, AND
-    b) whose ``command`` or ``args[0]`` path lives INSIDE the current
-       install_root (i.e. it was registered by THIS orchestrator install,
-       not a user-added entry at an unrelated path).
-
-    Entries that match the name but whose command is NOT inside
-    install_root are assumed to be user-customised and are left alone.
-
-    Pure function (no deferral side effects, no writes).
-
-    Returns:
-        List of 4-tuples: (name, path_inside_root, entry_dict, dep_info).
-        ``dep_info`` is the value from :data:`_DEPRECATED_DEFAULT_MCPS`.
-    """
-    if not claude_json.is_file():
-        return []
-    try:
-        data = json.loads(claude_json.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
-    if not isinstance(data, dict):
-        return []
-    mcp_servers = data.get("mcpServers", {})
-    if not isinstance(mcp_servers, dict):
-        return []
-
-    install_root_str = str(install_root.resolve())
-    results: list[tuple[str, str, dict, dict]] = []
-    for name, dep_info in _DEPRECATED_DEFAULT_MCPS.items():
-        entry = mcp_servers.get(name)
-        if not isinstance(entry, dict):
-            continue
-        # Determine the path candidates (command + first arg).
-        cmd = entry.get("command", "") if isinstance(entry.get("command"), str) else ""
-        first_arg = ""
-        args = entry.get("args", [])
-        if isinstance(args, list) and args and isinstance(args[0], str):
-            first_arg = args[0]
-        # Check whether ANY path candidate is inside install_root.
-        # If none of the candidates are absolute paths inside install_root,
-        # the entry is user-customised → leave it alone.
-        matched_path = ""
-        for candidate in (cmd, first_arg):
-            if not candidate:
-                continue
-            # Only consider absolute paths (cross-OS).
-            if not candidate.startswith(("/", "C:\\", "c:\\", "\\\\")):
-                continue
-            if candidate.startswith(install_root_str):
-                matched_path = candidate
-                break
-        if not matched_path:
-            # Either no absolute path candidates, or the path is outside
-            # install_root → user-customised entry; skip.
-            continue
-        results.append((name, matched_path, entry, dep_info))
-    return results
-
-
-def _detect_deprecated_mcp_entries(
-    install_root: Path,
-    claude_json: Path,
-    deferral_report: "DeferralReport",
-) -> None:
-    """Detection-only path: emit a deferral for each deprecated-MCP entry
-    whose path lives inside the current install_root.
-
-    Called unconditionally from :func:`_register_mcps` (after every
-    successful write via Path A or B).  The companion
-    :func:`_remove_deprecated_mcp_entries` performs the actual removal
-    when ``--remove-deprecated-mcps`` is passed.
-
-    User-customised entries (command outside install_root) are silently
-    skipped — they are the user's concern, not ours.
-    """
-    deprecated = _scan_deprecated_mcp_entries(install_root, claude_json)
-    if not deprecated:
-        return
-
-    install_root_str = str(install_root.resolve())
-    for name, matched_path, _entry, dep_info in deprecated:
-        removed_in = dep_info.get("removed_in", "unknown release")
-        reason = dep_info.get("reason", "")
-        opt_in = dep_info.get("opt_in_manifest", "")
-        opt_in_note = (
-            f"\nOpt-in: if you still want these tools, install the module "
-            f"via the launcher → Modules, or inspect {opt_in}."
-        ) if opt_in else ""
-
-        deferral_report.add_entry(
-            DeferralEntry(
-                condition_id=f"deprecated_mcp_{name}",
-                title=(
-                    f"Deprecated MCP entry `{name}` still in ~/.claude.json "
-                    f"(removed {removed_in})"
-                ),
-                detected=(
-                    f"~/.claude.json contains a `{name}` block under "
-                    f"`mcpServers` whose command path ({matched_path}) points "
-                    f"inside the current install_root ({install_root_str}). "
-                    f"This entry was registered by a previous version of this "
-                    f"orchestrator install and is no longer part of the default "
-                    f"install set.\n\nReason: {reason}{opt_in_note}"
-                ),
-                why_deferred=(
-                    "Auto-removal of ~/.claude.json entries requires user "
-                    "consent. Pass `--remove-deprecated-mcps` (with "
-                    "`--update`) for the consent-prompted removal path. "
-                    "The existing entry is preserved and functional until "
-                    "you remove it."
-                ),
-                command_to_apply=(
-                    f"# Consent-prompted removal (PR-34):\n"
-                    f"python install.py --update --remove-deprecated-mcps\n"
-                    f"# Or, for CI / scripted contexts:\n"
-                    f"#   VCT_REMOVE_DEPRECATED_MCPS=all python install.py "
-                    f"--update --remove-deprecated-mcps\n"
-                    f"# Or, remove manually:\n"
-                    f"#   Edit {claude_json} and delete the `\"{name}\": {{...}}` "
-                    f"entry under `mcpServers`."
-                ),
-                severity="info",
-                kg_node_refs=[
-                    "knowledge/concepts/orchestrator-mcp-servers.md",
-                    ".claude/context/mcp-install-pipeline-audit-2026-05-16.md",
-                ],
-            )
-        )
 
 
 def _remove_deprecated_mcp_entries(
