@@ -82,6 +82,16 @@
           },
           {
             "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/session-start-deferral-surface.sh",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/session-start-retrieval-health.sh",
+            "timeout": 3
+          },
+          {
+            "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/embedding-failures-surface.sh",
             "timeout": 3
           },
@@ -395,13 +405,6 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || python3 -c \"import json,sys,subprocess,os; d=json.loads(sys.stdin.read()) if not sys.stdin.isatty() else {}; fp=d.get('tool_input',{}).get('file_path',''); subprocess.run(['python','.claude/scripts/sync_knowledge_graph.py',fp]) if fp else None\" 2>&1 || true",
-            "timeout": 15,
-            "async": true,
-            "if": "Edit(knowledge/**/*.md)|Write(knowledge/**/*.md)"
-          },
-          {
-            "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/kg-summary-generator.sh",
             "timeout": 5,
             "async": true,
@@ -442,7 +445,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/kg-update-nudge.sh",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/kg-update-nudge.sh",
             "async": true,
             "timeout": 3
           }
