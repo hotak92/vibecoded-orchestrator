@@ -83,7 +83,17 @@ DEVELOPMENT_COLLECTION_SCHEMA_VERSION = 2
 #: Backfill of existing rows is data-side
 #: (``codegraph_resync.backfill_codegraph_metadata`` for is_test/doc;
 #: ``create_cross_references`` self-heals n_callers), NOT framework-side.
-CODEGRAPH_COLLECTION_SCHEMA_VERSION = 6
+#: v7: v0.2.73 READ-amp origin cleanup — ONE-TIME targeted purge of
+#: ``.claude/state/**`` transient-scratch rows (tool_backups snapshots) that the
+#: pre-fix walk wrongly indexed (live-measured 43% of a real CodeFunction
+#: collection → multi-TB mmap READ storm). ``migrations/codegraph_collection/
+#: 6_to_7.py`` ``delete_many``s ONLY those rows — NO drop, NO re-embed, NO
+#: re-summarize (survivors' vectors + summaries untouched). The code fix
+#: (``analyze_code_graph._path_is_excluded`` + per-root ``.claude`` gate) stops
+#: NEW rows; this edge removes the already-indexed garbage on update,
+#: algorithmically. Idempotent (re-run purges zero); disk reclaim is the
+#: Weaviate-side compaction that follows the deletes (2 GiB segment cap).
+CODEGRAPH_COLLECTION_SCHEMA_VERSION = 7
 
 # ===========================================================================
 # Layer 2 — KG node content schema (USER-CURATED — upgrade in place on bump)

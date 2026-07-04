@@ -100,7 +100,10 @@ def test_canonical_version_helper() -> None:
     # → bumped 4→5 with the preserving migrations/codegraph_collection/4_to_5.py edge.
     # v0.2.73 M1/M4: is_test (BOOL) + n_callers (INT) → bumped 5→6 with the
     # preserving migrations/codegraph_collection/5_to_6.py edge (add_property only).
-    assert sv.canonical_version("codegraph_collection") == 6
+    # v0.2.73 READ-amp: one-time purge of .claude/state transient-scratch rows the
+    # pre-fix walk wrongly indexed → bumped 6→7 with migrations/codegraph_collection/
+    # 6_to_7.py (targeted delete_by_id; NO drop, NO re-embed, survivors untouched).
+    assert sv.canonical_version("codegraph_collection") == 7
     assert sv.canonical_version("rl_events_payload_shape") == 3
     with pytest.raises(KeyError):
         sv.canonical_version("not_a_real_artifact_type")
