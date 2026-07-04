@@ -61,11 +61,30 @@ class _FakeData:
         self.deleted.append(uuid)
 
 
+class _FakeProp:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _FakeConfig:
+    def __init__(self, prop_names) -> None:
+        self.properties = [_FakeProp(n) for n in prop_names]
+
+
+class _FakeConfigHolder:
+    def __init__(self, prop_names) -> None:
+        self._cfg = _FakeConfig(prop_names)
+
+    def get(self):
+        return self._cfg
+
+
 class _FakeCollection:
-    def __init__(self, name: str, rows: list) -> None:
+    def __init__(self, name: str, rows: list, prop_names=("file_path",)) -> None:
         self.name = name
         self._rows = rows
         self.data = _FakeData()
+        self.config = _FakeConfigHolder(prop_names)
 
     def iterator(self, return_properties=None):
         # `return_properties` is honoured by the real client; the fake just
@@ -149,6 +168,41 @@ def test_marker_is_exact_substring_not_like(edge):
     assert ".like(" not in src, "6_to_7 must not use a Weaviate Like filter (word-tokenized -> unsafe)"
     assert "delete_many(" not in src, "6_to_7 must delete_by_id confirmed UUIDs, not delete_many(filter)"
     assert "delete_by_id" in src
+
+
+def test_module_class_uses_path_prop(edge):
+    """CodeModule keys the file on `path` (not `file_path`); the purge must work
+    on whichever prop the class carries."""
+    rows = [
+        _Obj("m1", ".claude/state/tool_backups/mod.py"),
+        _Obj("m2", "vco_lib/project_init.py"),
+    ]
+    # _Obj stores under 'file_path'; re-key to 'path' for this class.
+    for o in rows:
+        o.properties = {"path": o.properties["file_path"]}
+    coll = _FakeCollection("P_CodeModule", rows, prop_names=("path",))
+    deleted, failures = edge._purge_transient_rows(coll, "path")
+    assert (deleted, failures) == (1, 0)
+    assert coll.data.deleted == ["m1"]
+
+
+def test_missing_path_prop_is_a_clean_skip(edge):
+    """A class WITHOUT the expected path prop (e.g. CodeAPI has endpoint/handler,
+    NOT file_path) must be a no-op, never a 500/crash. Regression guard for the
+    live bug where CodeAPI/CodeInteraction were wrongly mapped to file_path."""
+    rows = [_Obj("x", ".claude/state/tool_backups/foo.py")]
+    coll = _FakeCollection("P_CodeAPI", rows, prop_names=("endpoint", "handler"))
+    deleted, failures = edge._purge_transient_rows(coll, "file_path")
+    assert (deleted, failures) == (0, 0)
+    assert coll.data.deleted == []
+
+
+def test_api_interaction_excluded_from_class_map(edge):
+    """CodeAPI / CodeInteraction must NOT be in the purge map — they are not
+    file-anchored on a path property (the live crash this fixed)."""
+    assert "CodeAPI" not in edge._CLASS_PATH_PROP
+    assert "CodeInteraction" not in edge._CLASS_PATH_PROP
+    assert set(edge._CLASS_PATH_PROP) == {"CodeModule", "CodeFunction", "CodeClass"}
 
 
 def test_edge_header_annotations(edge):

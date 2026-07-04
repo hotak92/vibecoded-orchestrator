@@ -69,16 +69,21 @@ import re
 import sys
 
 
-#: Every file-anchored code class carries a per-file path property. Module keys
-#: it on ``path``; Function/Class/API/Interaction on ``file_path`` (v0.2.52
-#: V52-O.4). We purge on whichever property each class uses so a backup snapshot
-#: is removed from ALL of them.
+#: The FILE-ANCHORED code classes and their per-file path property: Module keys
+#: the file on ``path``; Function/Class on ``file_path`` (v0.2.52 V52-O.4).
+#:
+#: CodeAPI / CodeInteraction are DELIBERATELY EXCLUDED: they are not 1:1
+#: file-anchored (they carry ``endpoint``/``handler``, NOT a file-path property —
+#: a ``file_path`` filter 500s them with "no such prop"). This mirrors
+#: ``analyze_code_graph._prune_deleted_file_objects``, which for the same reason
+#: prunes only Module/Function/Class and lets a later full ``--prune-stale``
+#: reanalyze reconcile any stray API/Interaction rows. The bulk of the
+#: ``.claude/state`` garbage is functions/classes/modules anyway; API/Interaction
+#: rows are not minted from ``tool_backups`` snapshot files.
 _CLASS_PATH_PROP = {
     "CodeModule": "path",
     "CodeFunction": "file_path",
     "CodeClass": "file_path",
-    "CodeAPI": "file_path",
-    "CodeInteraction": "file_path",
 }
 
 #: The transient-scratch marker: a real source row's repo-relative path NEVER
@@ -169,6 +174,17 @@ def _purge_transient_rows(coll, path_prop: str) -> "tuple[int, int]":
     edge → the runner does NOT advance the recorded version and retries next
     update (the leftover rows are the pre-fix status quo, never a regression).
     """
+    # Defense-in-depth: a class missing this property (e.g. a schema variant, or
+    # CodeAPI/CodeInteraction if a caller ever mis-maps them) would 500 the
+    # iterator. Confirm the prop exists first; skip cleanly if not (nothing to
+    # purge there — those classes are not file-anchored on this property).
+    try:
+        cfg = coll.config.get()
+        if path_prop not in {p.name for p in cfg.properties}:
+            return 0, 0
+    except Exception:  # noqa: BLE001 — config probe is best-effort; fall through
+        pass
+
     to_delete = []
     for obj in coll.iterator(return_properties=[path_prop]):
         val = (obj.properties or {}).get(path_prop) or ""
