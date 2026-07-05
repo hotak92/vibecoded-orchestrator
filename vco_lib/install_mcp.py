@@ -37,7 +37,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from vco_lib.deferral_report import DeferralEntry
+from vco_lib.deferral_report import DeferralEntry, DeferralReport
 
 
 # ---------------------------------------------------------------------------

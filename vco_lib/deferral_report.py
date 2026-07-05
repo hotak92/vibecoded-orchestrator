@@ -260,7 +260,12 @@ def _strip_reminder_from_claude_md(existing: str) -> str:
         # No real block, or an orphan begin — preserve the file. The user
         # can clean an orphan manually.
         return existing
-    start, end = span  # type: ignore[misc]
+    # Past the guard, span is the concrete (start, end) int pair — the
+    # ("ambiguous",) 1-tuple and None variants are already returned above.
+    # Bind as int so the slices below type cleanly (the union's ambiguous
+    # arm can't reach here).
+    start: int = span[0]  # type: ignore[assignment]
+    end: int = span[1]  # type: ignore[index]
 
     before = existing[:start]
     after = existing[end:]

@@ -4668,6 +4668,7 @@ still work against the existing collections; rebuild when convenient.\",\n\
          report.write(folder)\n",
     );
     let status = std::process::Command::new(&py)
+        .silent()
         .arg("-c")
         .arg(&script)
         .status();

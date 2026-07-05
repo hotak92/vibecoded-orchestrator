@@ -53,6 +53,7 @@ values in. Behaviour is byte-for-byte the pre-extraction behaviour.
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 import urllib.request
 from typing import Callable, Optional
@@ -423,7 +424,7 @@ def self_heal_kg_bindings(
     existing_classes: set[str],
     existing_by_lower: dict[str, str],
     log_event: Callable[..., None],
-    connect_rw: Callable[..., "object"],
+    connect_rw: Callable[..., sqlite3.Connection],
     deferral_entry_cls,
     run_adoption_uplifts: Optional[Callable[..., None]] = None,
 ) -> None:

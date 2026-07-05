@@ -25,6 +25,7 @@
 
 use crate::db::Db;
 use std::path::{Path, PathBuf};
+use vct_launcher_core::process::CommandExt as _;
 
 /// Version (inclusive lower bound on the NEW side) at which the
 /// chunker-preset overhaul lands. Anyone whose `prev` was strictly
@@ -108,6 +109,7 @@ fn write_deferral_for_project(
          _emit_chunker_resync_deferral(Path({folder_py}), {prev_py}, {running_py})\n",
     );
     let status = std::process::Command::new(&py)
+        .silent()
         .arg("-c")
         .arg(&script)
         .status();

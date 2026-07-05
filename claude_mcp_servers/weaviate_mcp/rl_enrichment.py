@@ -1466,7 +1466,7 @@ def _stage_code_citation_pending(
     code_model: str,
     task_type: str,
     session_id: "str | None" = None,
-) -> "str | None":
+) -> "Path | None":
     """v0.2.73 RL-2b: stage the CODE citation ctx as a drain-owned pending file.
 
     Mirrors the KG path's ``search_pipeline._populate_citation_cache`` staging
@@ -1804,8 +1804,11 @@ def _rl_pack_linked_embs_for_node(
             continue
         packed_embs.append(vec)
         # Per-link node_type from the fetched object's properties; "concept" fallback.
+        # `obj` is an untyped Weaviate v4 object (list element is inferred as
+        # `object`); the `hasattr` guard + except make the `.properties` access
+        # runtime-safe. pyright can't see through the dynamic client type.
         try:
-            ltype = (obj.properties.get("node_type") or "concept") if hasattr(obj, "properties") else "concept"
+            ltype = (obj.properties.get("node_type") or "concept") if hasattr(obj, "properties") else "concept"  # pyright: ignore[reportAttributeAccessIssue]
         except (AttributeError, KeyError):
             ltype = "concept"
         packed_types.append(str(ltype))
@@ -1938,7 +1941,10 @@ def _rl_refetch_node_vector(
         link_obj = link_objs_by_title.get(str(title))
         if link_obj is not None:
             try:
-                regen_text = link_obj.properties.get("content") or ""
+                # link_obj is an untyped Weaviate v4 object; the try/except makes
+                # the dynamic `.properties` access runtime-safe (pyright infers
+                # the dict value as `object`).
+                regen_text = link_obj.properties.get("content") or ""  # pyright: ignore[reportAttributeAccessIssue]
             except (AttributeError, KeyError, TypeError):
                 regen_text = ""
     if not regen_text:
@@ -2171,8 +2177,13 @@ def _rl_enrich_nodes_with_linked_embs(
             server.logger.debug("RL enrich: get_weaviate_client failed (%s); skipping", exc)
             return
 
-        def coll_resolver(name: str):  # noqa: E306 — local fallback
+        # Named distinctly (not `def coll_resolver`) so the local fallback does
+        # not shadow the parameter of the same name — a `def` rebinding a param
+        # trips pyright's reportRedeclaration. Assign the callable instead.
+        def _default_coll_resolver(name: str):
             return client.collections.get(name)
+
+        coll_resolver = _default_coll_resolver
 
     # Import Filter lazily; the search path already does this elsewhere.
     try:

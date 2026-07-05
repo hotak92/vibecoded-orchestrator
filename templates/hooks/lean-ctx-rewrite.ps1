@@ -83,7 +83,14 @@ $rewriteOut = & lean-ctx hook rewrite
 # .sh's `out="$(lean-ctx hook rewrite)" || exit 0`. Without this, lean-ctx
 # exiting non-zero WITH parseable JSON on stdout would emit a rewrite on
 # Windows while POSIX runs raw (cross-OS divergence).
-if ($LASTEXITCODE -ne 0) { exit 0 }
+#
+# Guard against an UNSET $LASTEXITCODE: when `lean-ctx` resolves to a PS
+# *script/function* (e.g. a `.ps1` shim) rather than a native executable, and
+# that callee never `exit`s, PowerShell leaves $LASTEXITCODE $null. `$null -ne
+# 0` is $true, so a bare `-ne 0` would wrongly treat success as failure and
+# drop a valid rewrite. Only a REAL non-zero (native exe / explicit exit) may
+# suppress — matching the .sh, where `||` fires only on an actual non-zero.
+if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { exit 0 }
 if (-not $rewriteOut) { exit 0 }
 $rewriteRaw = ($rewriteOut -join "`n").Trim()
 if (-not $rewriteRaw) { exit 0 }

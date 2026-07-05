@@ -171,9 +171,18 @@ def test_ps1_strips_permission_decision(tmp_path):
     bin_dir = tmp_path / "fakebin"
     bin_dir.mkdir()
     # pwsh resolves `lean-ctx` via Get-Command / PATH; a .ps1 shim works
-    # cross-OS under pwsh.
+    # cross-OS under pwsh. The canned response is written to a SIDE FILE the
+    # shim reads with `Get-Content -Raw` — NOT interpolated into an inline
+    # single-quoted `Write-Output '...'`. ALLOW_RESPONSE itself contains single
+    # quotes (`lean-ctx -c 'git status'`); inlining it would terminate the
+    # PowerShell string early and mangle the JSON. (Mirrors the .sh fake, which
+    # cats a side file for the same reason.)
+    response_file = bin_dir / "response.json"
+    response_file.write_text(ALLOW_RESPONSE, encoding="utf-8")
     (bin_dir / "lean-ctx.ps1").write_text(
-        f"$null = $input\nWrite-Output '{ALLOW_RESPONSE}'\n", encoding="utf-8"
+        "$null = $input\n"
+        f"Write-Output (Get-Content -Raw -LiteralPath '{response_file}')\n",
+        encoding="utf-8",
     )
     cwd = tmp_path / "proj"
     cwd.mkdir()

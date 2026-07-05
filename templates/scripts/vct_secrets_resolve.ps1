@@ -155,9 +155,15 @@ function Invoke-Hub {
 
 function Test-LooksLikePath {
     param([string]$Value)
+    # NOTE: the Windows-drive clause MUST be parenthesized. PowerShell's `-and`
+    # binds tighter than `-or`, but a bare trailing `... -or A -ge 2 -and B`
+    # across a line-continuation still mis-evaluates the whole expression to
+    # $false even when an earlier `-or` term is $true (verified live 2026-07-04:
+    # a "/tmp/…"-prefixed folder returned $false, so tier-3 `.env` resolution was
+    # silently skipped). Wrap the `-and` sub-clause so the `-or` chain is honored.
     return ($Value.StartsWith("/") -or $Value.StartsWith("./") -or
             $Value.StartsWith("../") -or $Value.Contains("/") -or
-            $Value.Contains("\") -or $Value.Length -ge 2 -and $Value.Substring(1, 1) -eq ":")
+            $Value.Contains("\") -or ($Value.Length -ge 2 -and $Value.Substring(1, 1) -eq ":"))
 }
 
 function Resolve-ProjectId {
