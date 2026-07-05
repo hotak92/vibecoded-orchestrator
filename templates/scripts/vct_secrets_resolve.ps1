@@ -1,6 +1,5 @@
 ﻿# vct_secrets_resolve.ps1 — agent-facing secret resolver. PowerShell
 # counterpart of `vct_secrets_resolve.sh`.
-# OS-EXEMPT-PARITY: 2026-07-05 PowerShell-only operator-precedence fix in Test-LooksLikePath (parenthesised the -and drive-letter clause); the .sh sibling's `looks_like_path` uses a `case`/glob match with no precedence ambiguity, so it needs no corresponding change.
 #
 # ONE RESOLUTION CHAIN (v0.2.73 unification — MUST MATCH the other two
 # implementations: `templates/scripts/vct_secrets_resolve.sh` and

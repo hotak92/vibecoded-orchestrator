@@ -249,6 +249,10 @@ else:
 # (UUID hex). Cheap to be wrong here: a misclassified path will 404 the
 # UUID lookup; a misclassified id (rare) will 404 the by-path lookup.
 looks_like_path() {
+    # Cross-OS note (must match vct_secrets_resolve.ps1::Test-LooksLikePath):
+    # this `case`/glob form has no operator-precedence pitfall, so the v0.2.73
+    # PowerShell fix (parenthesising the `-and` drive-letter clause) has no
+    # analog here — the two stay behaviourally identical.
     case "$1" in
         /*|./*|../*) return 0 ;;
         *) [[ "$1" == */* ]] && return 0 ;;
