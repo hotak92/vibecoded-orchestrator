@@ -12483,6 +12483,102 @@ def _classify_service_compose_action(action: str, probe: str) -> str:
     return "skip"
 
 
+#: v0.2.74 (R2): perf/reclaim env vars whose value MUST match the compose file
+#: on the RUNNING Weaviate container. Drift on ANY of these means the container
+#: predates the current compose config and its dead LSM segments cannot compact
+#: (the 136GB-never-reclaims bug: the running container was stuck at
+#: PERSISTENCE_LSM_MAX_SEGMENT_SIZE=500MiB while compose shipped 2GiB, because a
+#: running-and-ours container is "reused" and never recreated). When any drift
+#: is detected we force a `--force-recreate` (data-safe: the named volume
+#: survives). Keys mirror the `environment:` blocks in both compose files.
+_WEAVIATE_RECLAIM_ENV_KEYS: tuple = (
+    "PERSISTENCE_LSM_MAX_SEGMENT_SIZE",
+    "TOMBSTONE_DELETION_MIN_PER_CYCLE",
+    "TOMBSTONE_DELETION_MAX_PER_CYCLE",
+    "TOMBSTONE_DELETION_CONCURRENCY",
+)
+
+
+def _parse_compose_weaviate_reclaim_env(compose_text: str) -> dict:
+    """Extract the reclaim env values (see `_WEAVIATE_RECLAIM_ENV_KEYS`) from a
+    compose file's text. Pure/regex — avoids a YAML dep on the install path.
+
+    Matches `KEY: value` (with optional quotes) anywhere in the file; the
+    reclaim keys are unique across services so a flat scan is unambiguous.
+    Returns a dict of only the keys found, values stripped of quotes/whitespace.
+    """
+    found: dict = {}
+    for key in _WEAVIATE_RECLAIM_ENV_KEYS:
+        m = re.search(
+            rf'^\s*{re.escape(key)}\s*:\s*["\']?([^"\'\n#]+?)["\']?\s*(?:#.*)?$',
+            compose_text,
+            re.MULTILINE,
+        )
+        if m:
+            found[key] = m.group(1).strip()
+    return found
+
+
+def _running_container_reclaim_env(container_cmd: str, container_ref: str) -> "Optional[dict]":
+    """Inspect the RUNNING Weaviate container's reclaim env values.
+
+    Returns a dict of the `_WEAVIATE_RECLAIM_ENV_KEYS` actually set on the live
+    container (via `<runtime> inspect`), or ``None`` when the inspect can't run /
+    parse (unknown → the caller treats "can't determine" as "do NOT force a
+    recreate" — conservative: never recreate on uncertainty, mirroring the
+    best-effort-soft-fail rule).
+    """
+    if not container_cmd or not container_ref:
+        return None
+    try:
+        proc = subprocess.run(
+            [container_cmd, "inspect", "--format", "{{json .Config.Env}}", container_ref],
+            capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return None
+        env_list = json.loads(proc.stdout.strip())
+        if not isinstance(env_list, list):
+            return None
+    except Exception:  # noqa: BLE001 — inspect/parse failure → unknown → None
+        return None
+    wanted = set(_WEAVIATE_RECLAIM_ENV_KEYS)
+    live: dict = {}
+    for item in env_list:
+        if not isinstance(item, str) or "=" not in item:
+            continue
+        k, _, v = item.partition("=")
+        if k in wanted:
+            live[k] = v.strip()
+    return live
+
+
+def _weaviate_reclaim_env_drifted(
+    container_cmd: str, container_ref: str, compose_text: str,
+) -> tuple[bool, list]:
+    """True when the RUNNING Weaviate container's reclaim env DIFFERS from the
+    compose file (→ it must be `--force-recreate`d to apply the reclaim tuning).
+
+    Returns ``(drifted, details)`` where ``details`` is a list of
+    ``(key, live_value, compose_value)`` tuples for the mismatches (for logging).
+    Conservative: when the live env can't be inspected (``None``) we return
+    ``(False, [])`` — never recreate on uncertainty. A key present in compose but
+    ABSENT on the live container IS drift (the container predates the key).
+    """
+    compose_vals = _parse_compose_weaviate_reclaim_env(compose_text)
+    if not compose_vals:
+        return False, []
+    live = _running_container_reclaim_env(container_cmd, container_ref)
+    if live is None:
+        return False, []  # can't determine → don't recreate (conservative)
+    details: list = []
+    for key, want in compose_vals.items():
+        have = live.get(key)
+        if have != want:
+            details.append((key, have, want))
+    return (len(details) > 0), details
+
+
 def _probe_service_identity(name: str, port: int) -> tuple[str, str]:
     """Content-fingerprint whatever is listening on `localhost:<port>`.
 
@@ -13248,6 +13344,50 @@ def _start_services(
             elif disposition == "recreate":
                 services_to_recreate.append(svc)
             # "skip" → leave running untouched (incl. a foreign adopt).
+
+        # ── v0.2.74 (R2): Weaviate reclaim-env DRIFT recreate ────────────────
+        # The adopt-recreate above only fires when THIS run classifies Weaviate
+        # as a fresh vct-managed ADOPT. But a running-and-ours Weaviate is often
+        # classified "reuse/skip" — so a compose env change (the 2GiB LSM cap +
+        # tombstone brake that let the 136GB dead segments compact) NEVER reached
+        # the live container, which stayed at the old 500MiB cap and could never
+        # reclaim. Independently INSPECT the running container's reclaim env and,
+        # if it drifts from compose, force a `--force-recreate` regardless of the
+        # adopt/skip classification. Data-safe: the named volume survives a
+        # recreate. Runs BEFORE the schema-migration 6_to_7 purge + the codegraph
+        # resync (both later in the update flow at the call site), so that heavy
+        # write activity lands under the 2GiB cap and compaction can collapse the
+        # backlog (HIGH-1 sequencing). Conservative: an un-inspectable container
+        # → no drift reported → no recreate (never recreate on uncertainty).
+        if "weaviate" not in services_to_recreate and "weaviate" not in services_to_start:
+            try:
+                from vco_lib.containers import find_existing_container
+                _wv_ref = find_existing_container("weaviate") or "vco_weaviate"
+            except Exception:  # noqa: BLE001 — resolver import/probe soft-fail
+                _wv_ref = "vco_weaviate"
+            try:
+                _compose_text = compose_file.read_text(encoding="utf-8")
+            except Exception:  # noqa: BLE001
+                _compose_text = ""
+            if _compose_text:
+                _drifted, _drift_details = _weaviate_reclaim_env_drifted(
+                    sysinfo.container_cmd, _wv_ref, _compose_text,
+                )
+                if _drifted:
+                    services_to_recreate.append("weaviate")
+                    print(
+                        "  [recreate] Weaviate: reclaim-env drift detected "
+                        "(running container predates the current compose tuning) "
+                        "— forcing --force-recreate so the LSM/compaction config "
+                        "applies. The named data volume is preserved."
+                    )
+                    for _k, _have, _want in _drift_details:
+                        print(f"      {_k}: running={_have!r} → compose={_want!r}")
+                    _log_install_event(
+                        "5/10", "recreate",
+                        "weaviate reclaim-env drift → force-recreate",
+                        data={"drift": [list(d) for d in _drift_details]},
+                    )
     else:
         # Legacy path (no safety probe ran — should not happen in normal
         # install but kept for callers that pass decisions=None).

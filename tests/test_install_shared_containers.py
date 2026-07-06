@@ -772,5 +772,107 @@ class ServicesTomlRoundtripTests(unittest.TestCase):
             self.assertNotIn("external_url", services[1])
 
 
+class WeaviateReclaimEnvDriftTests(unittest.TestCase):
+    """v0.2.74 (R2): the running Weaviate container's reclaim env must match
+    compose; drift forces a --force-recreate so the LSM/compaction tuning that
+    lets the 136GB dead segments reclaim actually applies."""
+
+    _COMPOSE = (
+        "services:\n"
+        "  weaviate:\n"
+        "    environment:\n"
+        "      PERSISTENCE_LSM_MAX_SEGMENT_SIZE: 2GiB\n"
+        '      TOMBSTONE_DELETION_MIN_PER_CYCLE: "10000"\n'
+        '      TOMBSTONE_DELETION_MAX_PER_CYCLE: "10000"\n'
+        '      TOMBSTONE_DELETION_CONCURRENCY: "1"\n'
+    )
+
+    def test_parse_compose_extracts_reclaim_env(self):
+        vals = install._parse_compose_weaviate_reclaim_env(self._COMPOSE)
+        self.assertEqual(vals["PERSISTENCE_LSM_MAX_SEGMENT_SIZE"], "2GiB")
+        self.assertEqual(vals["TOMBSTONE_DELETION_MIN_PER_CYCLE"], "10000")
+        self.assertEqual(vals["TOMBSTONE_DELETION_CONCURRENCY"], "1")
+
+    def test_drift_when_running_has_old_cap(self):
+        # The exact 136GB bug: running container stuck at 500MiB vs compose 2GiB.
+        live = {
+            "PERSISTENCE_LSM_MAX_SEGMENT_SIZE": "500MiB",
+            "TOMBSTONE_DELETION_MIN_PER_CYCLE": "10000",
+            "TOMBSTONE_DELETION_MAX_PER_CYCLE": "10000",
+            "TOMBSTONE_DELETION_CONCURRENCY": "1",
+        }
+        with mock.patch.object(install, "_running_container_reclaim_env",
+                               return_value=live):
+            drifted, details = install._weaviate_reclaim_env_drifted(
+                "podman", "vco_weaviate", self._COMPOSE)
+        self.assertTrue(drifted)
+        keys = {d[0] for d in details}
+        self.assertEqual(keys, {"PERSISTENCE_LSM_MAX_SEGMENT_SIZE"})
+        self.assertEqual(details[0], ("PERSISTENCE_LSM_MAX_SEGMENT_SIZE", "500MiB", "2GiB"))
+
+    def test_no_drift_when_running_matches_compose(self):
+        live = {
+            "PERSISTENCE_LSM_MAX_SEGMENT_SIZE": "2GiB",
+            "TOMBSTONE_DELETION_MIN_PER_CYCLE": "10000",
+            "TOMBSTONE_DELETION_MAX_PER_CYCLE": "10000",
+            "TOMBSTONE_DELETION_CONCURRENCY": "1",
+        }
+        with mock.patch.object(install, "_running_container_reclaim_env",
+                               return_value=live):
+            drifted, details = install._weaviate_reclaim_env_drifted(
+                "podman", "vco_weaviate", self._COMPOSE)
+        self.assertFalse(drifted)
+        self.assertEqual(details, [])
+
+    def test_absent_key_on_running_container_is_drift(self):
+        # A container predating a key (key present in compose, absent live) drifts.
+        live = {"PERSISTENCE_LSM_MAX_SEGMENT_SIZE": "2GiB"}  # tombstone keys absent
+        with mock.patch.object(install, "_running_container_reclaim_env",
+                               return_value=live):
+            drifted, details = install._weaviate_reclaim_env_drifted(
+                "podman", "vco_weaviate", self._COMPOSE)
+        self.assertTrue(drifted)
+        # the 3 absent tombstone keys are drift (live None != compose value)
+        self.assertEqual(
+            {d[0] for d in details},
+            {"TOMBSTONE_DELETION_MIN_PER_CYCLE",
+             "TOMBSTONE_DELETION_MAX_PER_CYCLE",
+             "TOMBSTONE_DELETION_CONCURRENCY"},
+        )
+
+    def test_uninspectable_container_never_recreates(self):
+        # Conservative: can't inspect the live env → return (False, []) so we
+        # never force a recreate on uncertainty.
+        with mock.patch.object(install, "_running_container_reclaim_env",
+                               return_value=None):
+            drifted, details = install._weaviate_reclaim_env_drifted(
+                "podman", "vco_weaviate", self._COMPOSE)
+        self.assertFalse(drifted)
+        self.assertEqual(details, [])
+
+    def test_running_env_parses_config_env_json(self):
+        # _running_container_reclaim_env pulls only the reclaim keys from the
+        # inspect JSON env list.
+        env_json = json.dumps([
+            "PATH=/usr/bin",
+            "PERSISTENCE_LSM_MAX_SEGMENT_SIZE=500MiB",
+            "TOMBSTONE_DELETION_MIN_PER_CYCLE=0",
+            "UNRELATED=x",
+        ])
+        fake = mock.Mock(returncode=0, stdout=env_json)
+        with mock.patch.object(install.subprocess, "run", return_value=fake):
+            live = install._running_container_reclaim_env("podman", "vco_weaviate")
+        self.assertEqual(live, {
+            "PERSISTENCE_LSM_MAX_SEGMENT_SIZE": "500MiB",
+            "TOMBSTONE_DELETION_MIN_PER_CYCLE": "0",
+        })
+
+    def test_running_env_inspect_failure_returns_none(self):
+        fake = mock.Mock(returncode=1, stdout="")
+        with mock.patch.object(install.subprocess, "run", return_value=fake):
+            live = install._running_container_reclaim_env("podman", "vco_weaviate")
+        self.assertIsNone(live)
+
+
 if __name__ == "__main__":
     unittest.main()
