@@ -4129,8 +4129,20 @@ async def semantic_graph_search(
     # Loud-fail wrapper (2026-05-08 silent-zero antipattern fix v2).
     # Catches BOTH connection-time and query-time Weaviate failures.
     try:
+        # v0.2.74 T5-1 backstop (defense-in-depth): refuse-loud on a stale
+        # subprocess whose module-load workspace no longer matches the live
+        # CLAUDE_PROJECT_DIR, rather than fanning out over the wrong project's
+        # collections (the double-MCP-subprocess drift). Same guard as
+        # hybrid_search — the reaper prevents the stale process, this is the
+        # per-call belt-and-suspenders.
+        _assert_workspace_unchanged("semantic_graph_search")
         client = get_weaviate_client()
         return await _semantic_graph_search_body(client, query, limit, depth, detail, include_stale)
+    except WeaviateWorkspaceDriftError as exc:
+        # Surface the refuse-loud message verbatim. Do NOT reset the client
+        # cache (this is not a Weaviate outage) — the fix is a subprocess
+        # restart, not a reconnect.
+        return _workspace_drift_response(exc, query=query)
     except WeaviateUnreachable as exc:
         _reset_weaviate_client_cache()
         return _weaviate_unreachable_response(exc, query=query)
@@ -5552,6 +5564,12 @@ async def store_knowledge_node(
         JSON with success status and file_written flag
     """
     try:
+        # v0.2.74 T5-1 backstop (defense-in-depth): refuse-loud on subprocess
+        # workspace drift BEFORE resolving KG_COLLECTION — a WRITE fanning out to
+        # the WRONG project's KG (stale module-load collection constants) would
+        # CORRUPT another project's knowledge, strictly worse than a wrong read.
+        # The reaper prevents the stale process; this is the per-call guard.
+        _assert_workspace_unchanged("store_knowledge_node")
         client = get_weaviate_client()
         # Determine target collection based on scope
         target_collection_name = KG_COLLECTION
@@ -5953,6 +5971,16 @@ async def store_knowledge_node(
             result["file_note"] = "no file_path provided, Weaviate-only"
         return json.dumps(result, indent=2)
 
+    except WeaviateWorkspaceDriftError as exc:
+        # v0.2.74 T5-1 backstop: surface the refuse-loud message verbatim so the
+        # write is NOT silently misrouted to the wrong project's KG. Must precede
+        # the generic Exception handler (it IS an Exception subclass).
+        logger.error("store_knowledge_node refused (workspace drift): %s", exc)
+        return json.dumps({
+            "success": False,
+            "error": str(exc),
+            "error_class": "WeaviateWorkspaceDriftError",
+        }, indent=2)
     except Exception as e:
         logger.error(f"Error storing node: {e}")
         return json.dumps({

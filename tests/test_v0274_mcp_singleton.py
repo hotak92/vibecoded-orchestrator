@@ -221,5 +221,26 @@ def test_backstop_response_shape(srv, monkeypatch, tmp_path):
     assert "restart" in parsed["message"].lower()
 
 
+def test_drift_backstop_wired_into_all_three_tools():
+    """v0.2.74 T5-1 follow-up (zero-deferral): the workspace-drift guard must be
+    called by ALL THREE workspace-scoped tools — a read to the wrong project
+    returns 0 hits, but a store_knowledge_node WRITE to the wrong project
+    CORRUPTS its KG, so the guard must not be scoped to hybrid_search alone.
+    Source-level pin so a refactor can't silently drop it from two of them."""
+    from pathlib import Path as _P
+    src = (_P(__file__).resolve().parent.parent
+           / "claude_mcp_servers" / "weaviate_mcp" / "server.py").read_text(encoding="utf-8")
+    for tool in ("hybrid_search", "semantic_graph_search", "store_knowledge_node"):
+        assert f'_assert_workspace_unchanged("{tool}")' in src, (
+            f"{tool} must call the workspace-drift backstop "
+            f"_assert_workspace_unchanged(\"{tool}\")"
+        )
+        # And each must catch WeaviateWorkspaceDriftError (not let it fall into a
+        # generic handler that would mask the actionable restart message).
+    assert src.count("except WeaviateWorkspaceDriftError") >= 3, (
+        "each of the 3 guarded tools must catch WeaviateWorkspaceDriftError"
+    )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
