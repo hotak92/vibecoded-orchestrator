@@ -742,8 +742,9 @@ def test_c1_sql_edge_atomic_rollback_on_second_statement(tmp_path):
         artifact_type="launcher_db_table_set", from_version=0, to_version=1,
         path=edge_path, ext="sql",
     )
-    ok = smr._apply_sql_edge(edge, launcher_db=db)
-    assert ok is False
+    # v0.2.74: _apply_sql_edge now returns an EdgeResult (ok + captured stdout).
+    result = smr._apply_sql_edge(edge, launcher_db=db)
+    assert result.ok is False
     conn = sqlite3.connect(str(db))
     count = conn.execute("SELECT COUNT(*) FROM t").fetchone()[0]
     conn.close()
@@ -766,7 +767,8 @@ def test_c1_sql_edge_success_commits_all(tmp_path):
         artifact_type="launcher_db_table_set", from_version=0, to_version=1,
         path=edge_path, ext="sql",
     )
-    assert smr._apply_sql_edge(edge, launcher_db=db) is True
+    # v0.2.74: _apply_sql_edge now returns an EdgeResult (ok + captured stdout).
+    assert smr._apply_sql_edge(edge, launcher_db=db).ok is True
     conn = sqlite3.connect(str(db))
     rows = conn.execute("SELECT id, v FROM t ORDER BY id").fetchall()
     conn.close()

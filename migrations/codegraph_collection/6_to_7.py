@@ -213,6 +213,13 @@ def _purge_transient_rows(coll, path_prop: str) -> "tuple[int, int]":
 def main() -> int:
     prefix = _resolve_codegraph_prefix()
     if not prefix:
+        # v0.2.74 HIGH-2: print the EDGE_NOOP_NO_PREFIX sentinel so the runner
+        # does NOT falsely advance the recorded version on a rc=0 that purged
+        # NOTHING (the A1 second-order trap — the very trap that let v0.2.73's
+        # .claude/state purge never reach existing users). The runner surfaces
+        # a deferral + retries once the prefix is threaded into the edge env by
+        # A1's augmented CODE_GRAPH_PROJECT.
+        print("EDGE_NOOP_NO_PREFIX=1")
         print("6_to_7: no CODE_GRAPH_PROJECT / PROJECT_NAME in env; nothing to purge")
         return 0
 
@@ -261,6 +268,10 @@ def main() -> int:
             client.close()
         except Exception:
             pass
+    # v0.2.74 HIGH-2: the purge body ran with a resolved prefix (any number of
+    # rows removed, including zero on an already-purged / genuinely-clean
+    # collection) → safe to advance the recorded version to v7.
+    print("EDGE_APPLIED=1")
     return 0
 
 

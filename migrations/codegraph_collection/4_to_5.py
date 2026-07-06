@@ -139,8 +139,11 @@ def main() -> int:
     prefix = _resolve_codegraph_prefix()
     if not prefix:
         # No codegraph project resolvable from env → nothing to patch for this
-        # project. Treat as success (the runner still advances the version; a
-        # fresh install without codegraph env simply has no classes to touch).
+        # project. v0.2.74 HIGH-2: print the EDGE_NOOP_NO_PREFIX sentinel so the
+        # runner does NOT falsely advance the recorded version on a rc=0 that
+        # touched NOTHING (the A1 second-order trap). The runner surfaces a
+        # deferral + retries once the prefix is threaded into the edge env by A1.
+        print("EDGE_NOOP_NO_PREFIX=1")
         print("4_to_5: no CODE_GRAPH_PROJECT / PROJECT_NAME in env; nothing to patch")
         return 0
 
@@ -173,6 +176,10 @@ def main() -> int:
             client.close()
         except Exception:
             pass
+    # v0.2.74 HIGH-2: the real body ran (props present/added on every present
+    # class, or the classes are absent-but-scope-was-resolvable) → safe to
+    # advance the recorded version.
+    print("EDGE_APPLIED=1")
     return 0
 
 

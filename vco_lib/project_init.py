@@ -12097,14 +12097,31 @@ def _cmd_migrate_schema(args: argparse.Namespace) -> int:
         return 0
 
     check = bool(getattr(args, "check", False))
+    # A1 (v0.2.74 migration delivery): resolve the codegraph prefix from the
+    # SSOT (launcher.db project_codegraph_bindings, RO-URI) and pass EXPLICIT
+    # artifact_names + an AUGMENTED env (CODE_GRAPH_PROJECT set) so the codegraph
+    # loop iterates AND each edge subprocess resolves the same prefix — even
+    # when this CLI surface is spawned with an env that lacks CODE_GRAPH_PROJECT
+    # (the launcher's run_schema_migration_check now injects it, but a manual
+    # retry / older launcher may not). Falls back to the project's PROJECT_NAME
+    # env then the launcher.db name lookup.
+    _cg_names, _cg_env, _cg_prefix = smr.resolve_codegraph_migration_inputs(
+        os.environ,
+        db_path=db_path,
+        project_id=project_id,
+        project_name=(
+            getattr(args, "project_name", None) or os.environ.get("PROJECT_NAME")
+        ),
+    )
     report = smr.run_schema_migrations(
         db_path=db_path,
         project_id=project_id,
         migrations_dir=migrations_dir,
         deferral_report=None,
         weaviate_url=weaviate_url,
-        env=os.environ,
+        env=_cg_env,
         check=check,
+        artifact_names=_cg_names or None,
         now_ms=now_ms,
         project_root=migrations_dir.parent,
         include_orchestrator_wide=include_wide,

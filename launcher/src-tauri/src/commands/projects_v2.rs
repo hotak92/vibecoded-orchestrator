@@ -2345,6 +2345,24 @@ pub(crate) async fn run_schema_migration_check(
     .current_dir(&orch_root)
     .stdin(std::process::Stdio::null());
 
+    // A1 (v0.2.74 migration delivery): inject CODE_GRAPH_PROJECT into the child
+    // env, resolved from the SSOT (project_codegraph_bindings.collection_prefix).
+    // Without it, the migrate-schema subprocess env has no CODE_GRAPH_PROJECT,
+    // so the runner's codegraph loop iterates ZERO times and the codegraph
+    // edges never run for this project. The Python side (resolve_codegraph_
+    // migration_inputs) ALSO reads launcher.db as a fallback, but injecting here
+    // makes the child deterministic even when its RO-URI read races the hub WAL
+    // lock. Soft-fail: a DB-open / missing-binding error leaves the env unset
+    // and the Python fallback still tries to resolve it.
+    if let Ok(db) = crate::db::Db::open() {
+        if let Ok(Some(binding)) = db.get_project_codegraph_binding(project_id) {
+            let prefix = binding.collection_prefix.trim();
+            if !prefix.is_empty() {
+                cmd.env("CODE_GRAPH_PROJECT", prefix);
+            }
+        }
+    }
+
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

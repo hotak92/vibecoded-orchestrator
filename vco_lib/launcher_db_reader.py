@@ -69,15 +69,27 @@ def _discover_db_path() -> Optional[Path]:
         return None
 
 
-def _open_db_readonly() -> Optional[sqlite3.Connection]:
+def _open_db_readonly(
+    db_path: Optional[Path] = None,
+) -> Optional[sqlite3.Connection]:
     """Open ``launcher.db`` in read-only mode, or ``None`` on any failure.
 
     Uses SQLite's ``file:...?mode=ro`` URI form so concurrent launcher
     writes are never blocked by us. ``timeout=5.0`` guards against a
     locked-DB hang on Windows. Row factory is set to :class:`sqlite3.Row`
     so callers can use column-name access.
+
+    When ``db_path`` is given it is used VERBATIM (must be an existing file);
+    otherwise the module's default discovery (``VCT_LAUNCHER_DB_PATH`` env →
+    ``~/.vct/launcher.db``) runs. The explicit-path form lets callers that
+    already resolved launcher.db (install.py / the migration runner / the
+    reconcile) read the SAME db they operate on rather than re-discovering a
+    possibly-different default.
     """
-    p = _discover_db_path()
+    if db_path is not None:
+        p: Optional[Path] = db_path if Path(db_path).is_file() else None
+    else:
+        p = _discover_db_path()
     if p is None:
         return None
     try:
@@ -264,6 +276,88 @@ def get_codegraph_extra_path_owner_prefixes() -> list[str]:
         return []
     try:
         return _codegraph_extra_path_owner_prefixes_on_conn(conn)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _codegraph_prefix_on_conn(
+    conn: sqlite3.Connection, project_id: str
+) -> Optional[str]:
+    """Read ``project_codegraph_bindings.collection_prefix`` for ``project_id``
+    on an ALREADY-OPEN connection. Returns ``None`` on SQLite error / missing
+    row / empty value. Caller owns the connection lifecycle."""
+    try:
+        row = conn.execute(
+            "SELECT collection_prefix FROM project_codegraph_bindings "
+            "WHERE project_id = ? LIMIT 1",
+            (project_id,),
+        ).fetchone()
+    except Exception:
+        return None
+    if not row:
+        return None
+    val = (row["collection_prefix"] or "").strip()
+    return val or None
+
+
+def _project_id_for_name_on_conn(
+    conn: sqlite3.Connection, name: str
+) -> Optional[str]:
+    """Resolve a ``projects.id`` from a ``name`` OR ``slug`` on an already-open
+    connection. Returns ``None`` on SQLite error / no match. Prefers an exact
+    ``name`` match, then ``slug`` (both are how the launcher keys a project)."""
+    try:
+        row = conn.execute(
+            "SELECT id FROM projects WHERE name = ? OR slug = ? LIMIT 1",
+            (name, name),
+        ).fetchone()
+    except Exception:
+        return None
+    return row["id"] if row else None
+
+
+def get_codegraph_prefix(
+    project_name_or_id: str, *, db_path: Optional[Path] = None
+) -> Optional[str]:
+    """Resolve a project's code-graph Weaviate class prefix (the SSOT).
+
+    Reads ``project_codegraph_bindings.collection_prefix`` — the SINGLE source
+    of truth for the ``<prefix>_Code*`` live class names (v0.2.73 FIX-C: the
+    binding table is ground truth, not the env). This is the env-INDEPENDENT
+    resolution the v0.2.74 migration-delivery fix (A1) needs: the ``install.py``
+    process env has NO ``CODE_GRAPH_PROJECT`` / ``PROJECT_NAME``, so
+    ``schema_migration_runner._resolve_codegraph_prefix(env=os.environ)`` returns
+    ``None`` and the codegraph migration loop silently iterates ZERO times. This
+    reads the prefix straight from launcher.db instead.
+
+    ``project_name_or_id`` may be either a ``projects.id`` (looked up directly)
+    or a ``projects.name`` / ``projects.slug`` (resolved to an id first). The id
+    path is tried first (the common install.py caller has the resolved id).
+
+    Read-only via the RO-URI connect helper (``file:...?mode=ro``) so the
+    vct-hub single-writer WAL lock never blocks or empties this read. Soft-fail:
+    ``None`` when launcher.db is unavailable, the table is absent (free-tier /
+    never-booted), the project has no codegraph binding, or SQLite errors.
+    """
+    if not project_name_or_id:
+        return None
+    conn = _open_db_readonly(db_path)
+    if conn is None:
+        return None
+    try:
+        # Try the direct id → prefix path first (the install.py caller passes
+        # the resolved project_id).
+        prefix = _codegraph_prefix_on_conn(conn, project_name_or_id)
+        if prefix:
+            return prefix
+        # Fall back: treat the argument as a name/slug, resolve its id, retry.
+        pid = _project_id_for_name_on_conn(conn, project_name_or_id)
+        if pid:
+            return _codegraph_prefix_on_conn(conn, pid)
+        return None
     finally:
         try:
             conn.close()

@@ -15898,17 +15898,48 @@ def _run_schema_migration_scripts(deferral_report: "DeferralReport") -> None:
     # on the first launcher-attached run and registered straight to the new
     # canonical (no spurious recreate). Documented consequence, not a bug.
     project_id = root_project_id or (os.environ.get("VCT_PROJECT_ID") or None)
+    _launcher_db = _project_init._launcher_db_path()
     try:
         from vco_lib import schema_migration_runner as smr
 
+        # A1 (v0.2.74 migration delivery): the install.py process env has NO
+        # CODE_GRAPH_PROJECT / PROJECT_NAME, so the runner's env-only codegraph
+        # resolution returns None → the codegraph migration loop iterates ZERO
+        # times, silently, and v0.2.73's .claude/state purge + add-property
+        # ladder never reach existing users. Resolve the codegraph prefix from
+        # the SSOT (launcher.db project_codegraph_bindings, RO-URI) and pass
+        # EXPLICIT artifact_names + an AUGMENTED env (CODE_GRAPH_PROJECT set) so
+        # (a) the loop iterates and (b) each edge subprocess resolves the same
+        # prefix (closing the second-order false-advance trap).
+        _cg_artifact_names, _cg_env, _cg_prefix = (
+            smr.resolve_codegraph_migration_inputs(
+                os.environ,
+                db_path=_launcher_db,
+                project_id=project_id,
+                project_name=os.environ.get("PROJECT_NAME"),
+            )
+        )
+        if _cg_prefix:
+            _log_install_event(
+                "7d/10", "ok",
+                f"codegraph migration prefix resolved: {_cg_prefix}",
+            )
+        else:
+            _log_install_event(
+                "7d/10", "warn",
+                "codegraph migration prefix UNRESOLVED (no binding / env); "
+                "codegraph edges will no-op this pass (A3 reconcile retries)",
+            )
+
         run_report = smr.run_schema_migrations(
-            db_path=_project_init._launcher_db_path(),
+            db_path=_launcher_db,
             project_id=project_id,
             migrations_dir=PROJECT_ROOT / "migrations",
             deferral_report=deferral_report,
             weaviate_url=weaviate_url,
-            env=os.environ,
+            env=_cg_env,
             check=False,
+            artifact_names=_cg_artifact_names or None,
             project_root=PROJECT_ROOT,
             include_orchestrator_wide=True,
         )
@@ -15935,6 +15966,32 @@ def _run_schema_migration_scripts(deferral_report: "DeferralReport") -> None:
         )
 
     _log_install_event("7d/10", "ok", "schema migrations completed")
+
+    # A3 (v0.2.74): one-time code-graph registry reconcile. The main runner
+    # above migrates the ROOT project's codegraph; this sweep carries EVERY
+    # registered project (including non-root existing projects installed at any
+    # prior version) whose codegraph collection EXISTS WITH DATA but whose
+    # registry row is stale/missing to a correct state, by replaying the
+    # idempotent-from-earliest edge ladder. Soft-fail: any error becomes a log
+    # line + deferral, never crashes install.py --update.
+    try:
+        from vco_lib import codegraph_registry_reconcile as cgrr
+
+        cgrr.reconcile_codegraph_registry(
+            deferral_report,
+            db_path=_launcher_db,
+            weaviate_url=weaviate_url,
+            migrations_dir=PROJECT_ROOT / "migrations",
+            project_root=PROJECT_ROOT,
+            env=os.environ,
+            log_event=_log_install_event,
+            deferral_entry_cls=DeferralEntry,
+        )
+    except Exception as exc:  # never abort install on a reconcile fault
+        print(f"  [migrate:reconcile] codegraph reconcile failed (non-fatal): {exc}")
+        _log_install_event(
+            "7d/10", "warn", f"codegraph_registry_reconcile failed: {exc}",
+        )
 
     # V0243-2: additive named-vector slot migration for per-project KG +
     # Development collections. Runs after the runner so the collections are

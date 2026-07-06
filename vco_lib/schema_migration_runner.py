@@ -56,12 +56,15 @@ from . import schema_versions as sv
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "EdgeResult",
     "MigrationEdge",
     "MigrationRunReport",
     "RUST_OWNED_TYPES",
     "WEAVIATE_DERIVED_TYPES",
     "build_deferral_entries",
+    "codegraph_class_names_for_prefix",
     "discover_edges",
+    "resolve_codegraph_migration_inputs",
     "run_schema_migrations",
 ]
 
@@ -165,6 +168,28 @@ _CODEGRAPH_CLASS_SUFFIXES: tuple[str, ...] = (
 #: install.py:16035's 300s).
 _EDGE_SUBPROCESS_TIMEOUT = 300
 
+#: HIGH-2 machine-readable edge stdout sentinels (v0.2.74 migration delivery).
+#: An edge subprocess that exits rc=0 is NOT proof the edge did its job — the
+#: codegraph edges print "nothing to patch" and ``return 0`` when the codegraph
+#: prefix is unresolvable from THEIR env (the A1 second-order trap: rc=0 with
+#: zero work FALSELY advances the recorded version, permanently masking the
+#: collection as migrated). Each edge now prints ONE of these sentinels on its
+#: own stdout line so the runner can DISTINGUISH "applied" from "no-op because
+#: scope was empty" and refuse to advance on the latter:
+#:   * ``EDGE_NOOP_NO_PREFIX=1`` — the edge could not resolve a codegraph
+#:     prefix / project scope from its env, so it touched NOTHING. rc=0 but the
+#:     runner MUST NOT advance the recorded version (surface a deferral instead).
+#:   * ``EDGE_APPLIED=1``        — the edge ran its real body (any number of
+#:     rows/props touched, including zero for an already-migrated collection).
+#:     Safe to advance.
+#: An edge that emits NEITHER (an older edge, or one that crashed before the
+#: print) is treated conservatively as "cannot confirm applied" ONLY when it is
+#: a codegraph edge whose scope depends on the prefix — see
+#: ``_edge_post_state_confirms_apply``. Non-codegraph edges keep the pre-v0.2.74
+#: "rc=0 == success" contract (they have no unresolvable-scope failure mode).
+_EDGE_SENTINEL_NOOP_NO_PREFIX = "EDGE_NOOP_NO_PREFIX=1"
+_EDGE_SENTINEL_APPLIED = "EDGE_APPLIED=1"
+
 #: Header directive grammar (``# @key: value`` or ``-- @key: value``). The
 #: runner reads ``@destructive`` + ``@classification`` and cross-checks them
 #: against ``is_derived`` (SPEC §1 rule 4 — fail-closed packaging guard).
@@ -193,6 +218,38 @@ class MigrationEdge:
     to_version: int
     path: Path
     ext: str  # "sql" | "sh" | "ps1" | "py"
+
+
+@dataclass(frozen=True)
+class EdgeResult:
+    """Outcome of applying ONE edge (HIGH-2, v0.2.74).
+
+    ``ok`` — the edge exited cleanly (rc=0 / .sql committed). ``stdout`` —
+    the captured stdout of a subprocess edge (empty for .sql edges), used by
+    the HIGH-2 sentinel check to distinguish a real apply from a
+    "nothing to patch because scope was empty" rc=0 no-op that must NOT
+    advance the recorded version.
+    """
+
+    ok: bool
+    stdout: str = ""
+
+    def __bool__(self) -> bool:  # back-compat: callers that just test truthiness
+        return self.ok
+
+
+def _coerce_edge_result(value: object) -> EdgeResult:
+    """Normalize an ``_apply_edge`` return to an ``EdgeResult``.
+
+    Back-compat: pre-v0.2.74 test spies (and any external monkeypatch) return
+    a bare ``bool`` from ``_apply_edge``. Treat a bool as ``EdgeResult(ok=bool,
+    stdout="")`` so the HIGH-2 sentinel check degrades gracefully (no stdout →
+    no sentinel → the codegraph-specific "confirm applied" path applies its
+    conservative default; non-codegraph edges keep the rc=0==success contract).
+    """
+    if isinstance(value, EdgeResult):
+        return value
+    return EdgeResult(ok=bool(value), stdout="")
 
 
 @dataclass
@@ -438,19 +495,21 @@ def _apply_edge(
     launcher_db: Path,
     weaviate_url: str,
     env: Mapping[str, str],
-) -> bool:
-    """Apply ONE migration edge. Returns True on success, False on any
-    failure (the runner writes the deferral, not the script). SPEC §2.8.
+) -> EdgeResult:
+    """Apply ONE migration edge. Returns an :class:`EdgeResult` (``ok`` +
+    captured ``stdout``); the runner writes the deferral, not the script.
+    SPEC §2.8 (v0.2.74 HIGH-2: now returns stdout for the sentinel check).
 
     Dispatch by extension:
       - ``.sql`` → open the declared DB; split into statements and run them
         one-at-a-time inside a SINGLE manual transaction (autocommit off via
         ``isolation_level=None`` + explicit BEGIN). A mid-script failure
         ROLLS BACK every prior statement (truly atomic — NOT ``executescript``,
-        which issues an implicit COMMIT and would half-apply). → False on error.
-      - ``.sh``/``.ps1`` → ``subprocess.call`` exactly like install.py
-        (cwd=project_root, timeout=300, OS-dispatched), passing ``env``.
-      - ``.py`` → ``subprocess.call([python, "-m", module])``.
+        which issues an implicit COMMIT and would half-apply). → ``ok=False``.
+      - ``.sh``/``.ps1`` → ``subprocess.run`` exactly like install.py
+        (cwd=project_root, timeout=300, OS-dispatched), passing ``env``, with
+        stdout captured for the HIGH-2 sentinel check.
+      - ``.py`` → ``subprocess.run([python, script])``.
     """
     if edge.ext == "sql":
         return _apply_sql_edge(edge, launcher_db=launcher_db)
@@ -462,17 +521,19 @@ def _apply_edge(
     )
 
 
-def _apply_sql_edge(edge: MigrationEdge, *, launcher_db: Path) -> bool:
+def _apply_sql_edge(edge: MigrationEdge, *, launcher_db: Path) -> EdgeResult:
     db_path = _resolve_target_db(edge, launcher_db=launcher_db)
     try:
         sql = edge.path.read_text(encoding="utf-8")
     except OSError as exc:
         logger.warning("_apply_sql_edge: cannot read %s (%s)", edge.path, exc)
-        return False
+        return EdgeResult(ok=False)
 
     statements = _split_sql_statements(sql)
     if not statements:
-        return True  # nothing to run (comment-only edge) → trivially atomic
+        # nothing to run (comment-only edge) → trivially atomic. .sql edges
+        # have no unresolvable-scope failure mode, so they carry no sentinel.
+        return EdgeResult(ok=True)
 
     # C1 fix: ``conn.executescript`` issues an implicit COMMIT before running,
     # so a mid-script failure half-applies and a manual ROLLBACK errors with
@@ -490,7 +551,7 @@ def _apply_sql_edge(edge: MigrationEdge, *, launcher_db: Path) -> bool:
             for stmt in statements:
                 conn.execute(stmt)
             conn.execute("COMMIT")
-            return True
+            return EdgeResult(ok=True)
         except sqlite3.Error as exc:
             logger.warning(
                 "_apply_sql_edge: %s failed against %s (%s); rolling back",
@@ -502,7 +563,7 @@ def _apply_sql_edge(edge: MigrationEdge, *, launcher_db: Path) -> bool:
                 conn.execute("ROLLBACK")
             except sqlite3.Error:
                 pass
-            return False
+            return EdgeResult(ok=False)
     finally:
         conn.close()
 
@@ -613,7 +674,7 @@ def _apply_subprocess_edge(
     project_root: Path,
     weaviate_url: str,
     env: Mapping[str, str],
-) -> bool:
+) -> EdgeResult:
     if edge.ext in ("sh", "ps1"):
         if edge.ext == "ps1":
             cmd = [
@@ -631,19 +692,26 @@ def _apply_subprocess_edge(
         cmd = [sys.executable, str(edge.path)]
     else:  # pragma: no cover - guarded by discover_edges
         logger.warning("_apply_subprocess_edge: unknown ext %s", edge.ext)
-        return False
+        return EdgeResult(ok=False)
 
     # Pass WEAVIATE_URL through so Weaviate-side edges target the right host
     # (the two folded scripts read $WEAVIATE_URL). Edge env extends the
     # caller's env; never strip it.
     sub_env = dict(env)
     sub_env.setdefault("WEAVIATE_URL", weaviate_url)
+    # HIGH-2 (v0.2.74): capture stdout so the runner can read the edge's
+    # machine-readable sentinel (EDGE_APPLIED / EDGE_NOOP_NO_PREFIX). We do NOT
+    # capture stderr into the return (it keeps flowing to the parent's stderr
+    # for logging via stderr=None), but stdout is captured as text.
     try:
-        rc = subprocess.call(
+        proc = subprocess.run(  # noqa: S603 — trusted edge scripts under migrations/
             cmd,
             cwd=str(project_root),
             timeout=_EDGE_SUBPROCESS_TIMEOUT,
             env=sub_env,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            text=True,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         logger.warning(
@@ -651,15 +719,20 @@ def _apply_subprocess_edge(
             edge.path.name,
             exc,
         )
-        return False
-    if rc != 0:
+        return EdgeResult(ok=False)
+    stdout = proc.stdout or ""
+    # Echo the edge's captured stdout to the parent's stdout so the install-log
+    # narrative (the "6_to_7: purged N rows" lines) is preserved for the user.
+    if stdout:
+        print(stdout, end="" if stdout.endswith("\n") else "\n")
+    if proc.returncode != 0:
         logger.warning(
             "_apply_subprocess_edge: %s exited rc=%s (non-zero)",
             edge.path.name,
-            rc,
+            proc.returncode,
         )
-        return False
-    return True
+        return EdgeResult(ok=False, stdout=stdout)
+    return EdgeResult(ok=True, stdout=stdout)
 
 
 def _retry_command(edge: MigrationEdge) -> str:
@@ -730,6 +803,102 @@ def _resolve_codegraph_prefix(env: Mapping[str, str]) -> Optional[str]:
         if sanitized and sanitized[0].isalpha() and not sanitized[0].isupper():
             sanitized = sanitized[0].upper() + sanitized[1:]
         return sanitized or None
+
+
+def codegraph_class_names_for_prefix(prefix: str) -> list[str]:
+    """Return the 5 ``<prefix>_Code*`` live class names for a codegraph prefix.
+
+    The single home for the ``<prefix> + _CODEGRAPH_CLASS_SUFFIXES`` join so
+    install.py / project_init build the SAME explicit ``artifact_names`` the
+    runner would resolve internally. Returns ``[]`` for an empty/None prefix.
+    """
+    if not prefix:
+        return []
+    return [f"{prefix}_{suffix}" for suffix in _CODEGRAPH_CLASS_SUFFIXES]
+
+
+def resolve_codegraph_migration_inputs(
+    env: Mapping[str, str],
+    *,
+    db_path: Optional[Path],
+    project_id: Optional[str],
+    project_name: Optional[str] = None,
+) -> tuple[dict[str, list[str]], dict[str, str], Optional[str]]:
+    """A1 (v0.2.74): resolve the codegraph migration inputs ENV-INDEPENDENTLY.
+
+    The PRIMARY bug this closes: ``install.py`` calls ``run_schema_migrations``
+    with ``env=os.environ`` — but the install.py process env has NO
+    ``CODE_GRAPH_PROJECT`` / ``PROJECT_NAME``. So the runner's internal
+    ``_resolve_codegraph_prefix(env)`` returns ``None`` →
+    ``_resolve_artifact_names('codegraph_collection')`` returns ``[]`` → the
+    codegraph migration loop iterates ZERO times, silently, leaving the
+    registry frozen and the collection never migrated.
+
+    This helper resolves the codegraph prefix from the SSOT
+    (``launcher.db::project_codegraph_bindings.collection_prefix``, RO-URI) —
+    NOT from the caller's env — and returns:
+
+      * ``artifact_names`` — ``{"codegraph_collection": [<prefix>_CodeModule,
+        ...]}`` when a prefix resolved, else ``{}`` (nothing to override; the
+        runner's own env resolution stays in charge for non-codegraph types).
+        Passing this EXPLICITLY makes the runner iterate the codegraph loop
+        even though the caller env lacks CODE_GRAPH_PROJECT.
+      * ``augmented_env`` — ``dict(env)`` with ``CODE_GRAPH_PROJECT`` set to the
+        resolved prefix (when resolved). This is threaded down to each edge
+        SUBPROCESS via ``_apply_subprocess_edge``'s ``sub_env = dict(env)`` so
+        the edge scripts' OWN ``_resolve_codegraph_prefix()`` resolves the same
+        prefix (closing the A1 second-order trap: an edge run without
+        CODE_GRAPH_PROJECT prints "nothing to patch", exits 0, and would falsely
+        advance the version).
+      * ``prefix`` — the resolved prefix (or ``None``), for logging.
+
+    Resolution order for the prefix:
+      1. ``env['CODE_GRAPH_PROJECT']`` if the caller already set it (respect it).
+      2. ``launcher_db_reader.get_codegraph_prefix(project_id)`` (SSOT).
+      3. ``launcher_db_reader.get_codegraph_prefix(project_name)`` fallback.
+      4. ``env['PROJECT_NAME']`` → analyzer-style prefix derivation (last resort;
+         mirrors ``_resolve_codegraph_prefix``).
+
+    Soft-fail: any launcher.db error yields ``({}, dict(env), None)`` — the
+    caller passes the untouched env + no override, and the runner behaves
+    exactly as before (no regression; the collection is retried next update).
+    """
+    base_env = dict(env)
+
+    # 1. Respect an already-set CODE_GRAPH_PROJECT in the caller's env.
+    prefix = (base_env.get("CODE_GRAPH_PROJECT") or "").strip() or None
+
+    # 2 + 3. SSOT read from launcher.db (RO-URI, soft-fail).
+    if not prefix and db_path is not None:
+        try:
+            from . import launcher_db_reader as ldr
+
+            if project_id:
+                prefix = ldr.get_codegraph_prefix(project_id, db_path=db_path)
+            if not prefix and project_name:
+                prefix = ldr.get_codegraph_prefix(project_name, db_path=db_path)
+        except Exception as exc:  # never block the migration on a DB read
+            logger.debug(
+                "resolve_codegraph_migration_inputs: launcher.db read "
+                "failed (%s); falling back to env",
+                exc,
+            )
+
+    # 4. Last resort: analyzer-style derivation from PROJECT_NAME in env.
+    if not prefix:
+        prefix = _resolve_codegraph_prefix(base_env)
+
+    if not prefix:
+        # Nothing resolved anywhere — return the untouched env + no override so
+        # the runner's own (env-based) resolution stays in charge and the
+        # codegraph loop simply no-ops this pass (retried next update).
+        return ({}, base_env, None)
+
+    base_env["CODE_GRAPH_PROJECT"] = prefix
+    artifact_names = {
+        "codegraph_collection": codegraph_class_names_for_prefix(prefix)
+    }
+    return (artifact_names, base_env, prefix)
 
 
 def _resolve_artifact_names(
@@ -840,6 +1009,111 @@ def _default_codegraph_drift_probe(
 
 
 # ---------------------------------------------------------------------------
+# Weaviate existence / row-count probes (A2 + HIGH-2, v0.2.74)
+# ---------------------------------------------------------------------------
+
+
+def _weaviate_class_object_count(
+    weaviate_url: str, class_name: str
+) -> Optional[int]:
+    """Return the object count of ``class_name`` via Weaviate's GraphQL
+    Aggregate, or ``None`` when unreachable / malformed / absent-class-error.
+
+    Mirrors ``vco_lib.kg_binding_heal._count_weaviate_class_objects`` (kept a
+    thin local copy so the runner has no import cycle into the KG-heal module).
+    ``None`` means "unknown" — callers MUST NOT read it as zero (a transient
+    network blip must never make a populated collection look empty). ``0`` is a
+    genuine empty/absent class. Soft-fails throughout; never raises.
+    """
+    import json
+    import urllib.request
+
+    base = (weaviate_url or "http://localhost:8081").rstrip("/")
+    # class_name is a derived Weaviate class name (prefix + fixed suffix) — shape
+    # -validate anyway to fail-closed against a future untrusted caller.
+    if not class_name or not class_name.replace("_", "").isalnum():
+        return None
+    query = "{ Aggregate { " f"{class_name} {{ meta {{ count }} }}" " } }"
+    try:
+        data = json.dumps({"query": query}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{base}/v1/graphql",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        resp = urllib.request.urlopen(req, timeout=10)  # noqa: S310 (localhost)
+    except Exception:
+        return None
+    try:
+        if resp.getcode() != 200:
+            return None
+        payload = json.loads(resp.read())
+        agg = payload.get("data", {}).get("Aggregate", {}) or {}
+        rows = agg.get(class_name) or []
+        if not rows:
+            return 0
+        count = (rows[0].get("meta") or {}).get("count")
+        return count if isinstance(count, int) else None
+    except Exception:
+        return None
+
+
+def _codegraph_collection_has_rows(
+    weaviate_url: str, artifact_names: Sequence[str]
+) -> Optional[bool]:
+    """Does ANY of the codegraph classes in ``artifact_names`` hold >=1 row?
+
+    Returns:
+        True  — at least one class has a positive object count (the collection
+                EXISTS WITH DATA → the A2 ladder-replay must run so a pre-
+                registry existing collection gets the schema ladder applied
+                rather than being stamped straight to canonical as if born
+                fresh).
+        False — every probeable class returned a definite 0 (genuinely-empty /
+                absent → the born-at-canonical NEVER_MATERIALIZED stamp is
+                correct).
+        None  — every probe returned "unknown" (Weaviate down / all errored):
+                cannot confirm existence. The caller treats ``None``
+                conservatively as "do NOT run the ladder" (keeps the §5 NO-OP
+                guarantee on a containers-down install; the reconcile / next
+                update retries when Weaviate is reachable).
+
+    A definite 0 from at least one class combined with unknowns from the rest
+    still returns None (we cannot prove the whole collection is empty), except
+    when EVERY probe is a definite 0 → False.
+    """
+    saw_unknown = False
+    saw_zero = False
+    for name in artifact_names:
+        cnt = _weaviate_class_object_count(weaviate_url, name)
+        if cnt is None:
+            saw_unknown = True
+            continue
+        if cnt > 0:
+            return True
+        saw_zero = True
+    if saw_unknown:
+        # At least one class is unknown and none had rows → cannot confirm.
+        return None
+    if saw_zero:
+        return False
+    return None
+
+
+def _edge_stdout_says_no_prefix(stdout: str) -> bool:
+    """True if the edge printed the ``EDGE_NOOP_NO_PREFIX`` sentinel — i.e. it
+    could not resolve a codegraph scope from its env and touched nothing."""
+    return _EDGE_SENTINEL_NOOP_NO_PREFIX in (stdout or "")
+
+
+def _edge_stdout_says_applied(stdout: str) -> bool:
+    """True if the edge printed the ``EDGE_APPLIED`` sentinel — it ran its real
+    body (any number of rows/props touched, including zero already-migrated)."""
+    return _EDGE_SENTINEL_APPLIED in (stdout or "")
+
+
+# ---------------------------------------------------------------------------
 # Public entrypoint
 # ---------------------------------------------------------------------------
 
@@ -910,6 +1184,13 @@ def run_schema_migrations(
     when = int(now_ms) if now_ms is not None else int(time.time() * 1000)
     root = project_root or migrations_dir.parent
     Status = avr.ArtifactVersionStatus
+    # A2 (v0.2.74): codegraph_collection's 5 class names share ONE recorded
+    # version + ONE edge ladder (each edge patches all applicable classes on a
+    # single run). When the NEVER_MATERIALIZED-but-exists ladder-replay fires
+    # for the FIRST resolved class name, it runs the ladder for the whole
+    # collection — so subsequent class names in the same type must NOT re-run
+    # it. This set records artifact_types already handled that way this pass.
+    _ladder_replayed_types: set[str] = set()
     # Resolve probe defaults at CALL time (not as bound default-arg values) so
     # a monkeypatch of the module-level default — and Piece 3's swap of
     # _default_live_drift_probe for the richer fingerprint — takes effect
@@ -965,6 +1246,56 @@ def run_schema_migrations(
                 continue
 
             if status == Status.NEVER_MATERIALIZED:
+                # A2 (v0.2.74): NEVER_MATERIALIZED assumes born-at-canonical.
+                # That is TRUE for a genuinely-fresh project but FALSE for a
+                # pre-registry EXISTING codegraph collection (installed before
+                # V52-AG, so its registry row was never written): stamping it
+                # straight to canonical with ZERO edges would PERMANENTLY skip
+                # the schema ladder (add-property edges 4→5→6 + the .claude/
+                # state purge 6→7 would never reach it). So for a DERIVED
+                # collection that has an edge ladder AND actually EXISTS WITH
+                # DATA in Weaviate, replay the WHOLE contiguous ladder from the
+                # earliest edge (idempotent-from-earliest: 4_to_5/5_to_6 are
+                # add-property-if-absent, 6_to_7 is exact-substring delete-only).
+                # _apply_edges_preserving registers at canonical after the final
+                # edge. Runs ONCE per artifact_type (the 5 codegraph classes
+                # share one ladder — see _ladder_replayed_types).
+                if (
+                    not check
+                    and artifact_type in WEAVIATE_DERIVED_TYPES
+                    and artifact_type not in _ladder_replayed_types
+                ):
+                    replay_names = _resolve_artifact_names(
+                        artifact_type, env, artifact_names
+                    )
+                    edges = discover_edges(migrations_dir, artifact_type)
+                    if edges and _codegraph_collection_has_rows(
+                        weaviate_url, replay_names
+                    ):
+                        _ladder_replayed_types.add(artifact_type)
+                        _apply_edges_preserving(
+                            artifact_type=artifact_type,
+                            artifact_name=artifact_name,
+                            edges=edges,
+                            stored=edges[0].from_version,
+                            canonical=canonical,
+                            derived=derived,
+                            env=env,
+                            weaviate_url=weaviate_url,
+                            launcher_db=db_path,
+                            project_id=effective_pid,
+                            root=root,
+                            report=report,
+                            check=check,
+                            when=when,
+                            # register at canonical on the final edge (the row
+                            # doesn't exist yet — this IS the materialization).
+                            register_on_success=True,
+                        )
+                        continue
+                    # No ladder or cannot confirm the collection has data →
+                    # fall through to the born-at-canonical stamp below.
+
                 # Fresh / pre-V52-AG artifact: born at canonical by the seed
                 # path. Only RECORD the version so a FUTURE bump is detectable
                 # (you can't migrate from v0 of something just created at vN).
@@ -1475,14 +1806,16 @@ def _apply_edges_preserving(
         if check:
             report.planned.append((artifact_type, artifact_name, edge.path.name))
             continue
-        ok = _apply_edge(
-            edge,
-            project_root=root,
-            launcher_db=launcher_db,
-            weaviate_url=weaviate_url,
-            env=env,
+        result = _coerce_edge_result(
+            _apply_edge(
+                edge,
+                project_root=root,
+                launcher_db=launcher_db,
+                weaviate_url=weaviate_url,
+                env=env,
+            )
         )
-        if not ok:
+        if not result.ok:
             # ABORT posture (R3): stop at the failed edge, do NOT advance the
             # recorded version, write a failed deferral, retry next update.
             report.errors.append(
@@ -1494,14 +1827,43 @@ def _apply_edges_preserving(
                 )
             )
             return
+        # HIGH-2 (v0.2.74) — defense-in-depth against FALSE-ADVANCE. A codegraph
+        # edge that printed EDGE_NOOP_NO_PREFIX exited rc=0 but touched NOTHING
+        # because it could not resolve a codegraph scope from ITS env (the A1
+        # second-order trap). A rc=0 "nothing to patch" is NOT proof the edge
+        # did its job — do NOT advance the recorded version. Surface a deferral
+        # so the next update (with the prefix now threaded into the edge env by
+        # A1) retries it. Idempotent + soft-failing: the collection is left at
+        # `stored`, not falsely stamped to canonical.
+        if _edge_stdout_says_no_prefix(result.stdout):
+            report.errors.append(
+                (
+                    artifact_type,
+                    artifact_name,
+                    f"edge {edge.path.name} exited rc=0 but reported "
+                    f"EDGE_NOOP_NO_PREFIX (could not resolve codegraph scope "
+                    f"from env → touched nothing); NOT advancing version; retry: "
+                    f"{_retry_command(edge)} "
+                    f"[schema_migration_failed_{edge.path.stem}]",
+                )
+            )
+            return
         report.applied.append((artifact_type, artifact_name, edge.path.name))
-        if register_on_success:
+        # Register ONLY on the FINAL edge (edge.to_version == canonical). A
+        # multi-edge ladder (4→5→6→7) must NOT register the intermediate
+        # versions 5/6 — ``register_artifact_version`` asserts the written
+        # version equals canonical (it refuses to record a non-canonical
+        # version), and a mid-ladder registry write has no independent meaning:
+        # the edges are idempotent-from-earliest, so an abort mid-ladder leaves
+        # the registry at ``stored`` and the WHOLE ladder replays next update
+        # (safe — re-running an applied add-property/delete edge is a no-op).
+        if register_on_success and edge.to_version == canonical:
             avr.register_artifact_version(
                 db_path=launcher_db,
                 project_id=project_id,
                 artifact_type=artifact_type,
                 artifact_name=artifact_name,
-                schema_version=edge.to_version,  # canonical on the final edge
+                schema_version=canonical,  # only ever the canonical version
                 materialized_at=when,
             )
 
@@ -1539,14 +1901,16 @@ def _apply_user_curated_edges(
         if check:
             report.planned.append((artifact_type, artifact_name, edge.path.name))
             continue
-        ok = _apply_edge(
-            edge,
-            project_root=root,
-            launcher_db=launcher_db,
-            weaviate_url=weaviate_url,
-            env=env,
+        result = _coerce_edge_result(
+            _apply_edge(
+                edge,
+                project_root=root,
+                launcher_db=launcher_db,
+                weaviate_url=weaviate_url,
+                env=env,
+            )
         )
-        if not ok:
+        if not result.ok:
             report.errors.append(
                 (
                     artifact_type,
@@ -1557,14 +1921,19 @@ def _apply_user_curated_edges(
             )
             return
         report.applied.append((artifact_type, artifact_name, edge.path.name))
-        avr.register_artifact_version(
-            db_path=launcher_db,
-            project_id=project_id,
-            artifact_type=artifact_type,
-            artifact_name=artifact_name,
-            schema_version=edge.to_version,
-            materialized_at=when,
-        )
+        # Register ONLY on the FINAL (canonical) edge — see the same rationale
+        # in _apply_edges_preserving: register_artifact_version refuses a
+        # non-canonical version, and the forward-only ladder replays from
+        # `stored` on the next update after a mid-ladder abort.
+        if edge.to_version == canonical:
+            avr.register_artifact_version(
+                db_path=launcher_db,
+                project_id=project_id,
+                artifact_type=artifact_type,
+                artifact_name=artifact_name,
+                schema_version=canonical,
+                materialized_at=when,
+            )
 
 
 # ---------------------------------------------------------------------------
