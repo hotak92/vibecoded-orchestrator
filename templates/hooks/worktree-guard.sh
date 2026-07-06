@@ -38,8 +38,8 @@
 # `git worktree add`. This version CREATES the worktree.
 #
 # ── Decision matrix ──────────────────────────────────────────────────────
-#   1. Global bypass (VCT_DISABLE_HOOKS) → echo nothing, exit 0 (harness
-#      default). Full no-op, consistent with every hook.
+#   1. Global bypass (VCT_DISABLE_HOOKS) → echo nothing and no-op (harness
+#      uses its own default). Full no-op, consistent with every hook.
 #   2. cwd is NOT a git repo → this create cannot be isolated; echo nothing
 #      + exit 0 so the harness does its own default (do NOT abort a
 #      legitimate non-git spawn with a non-zero exit).
