@@ -282,6 +282,27 @@ _CONTENT_HASH_EXCLUDE = frozenset({
 #     single-object embeddings of those entities are stale.
 CODEGRAPH_EMBED_REVISION: int = 1
 
+# ── v0.2.74 (D1): embedding-space compatibility floor ────────────────────────
+# The LOWEST positive `embed_revision` whose stored VECTOR is still valid in
+# the CURRENT embedding space (same model + same chunking semantics for a
+# single-chunk entity). A content-UNCHANGED, single-chunk row with a vector at
+# a revision `>=` this floor but `<` CODEGRAPH_EMBED_REVISION needs only an
+# `embed_revision` metadata PATCH — NOT a re-embed — because its vector is
+# still correct (the revision bump was metadata-only, not an embedding-space
+# change). This is the user's "if the hashes are the same, don't re-embed"
+# promise made correct-by-construction.
+#
+# ⚠️ MAINTAINER RULE: whenever a future CODEGRAPH_EMBED_REVISION bump changes
+# the EMBEDDING SPACE (a different embedding model, or a chunking-scheme change
+# that alters what a single-chunk entity's vector represents), you MUST raise
+# this floor to that new revision so those rows are RE-EMBEDDED, not stamped.
+# For a metadata-only revision bump, leave this floor unchanged so the cheap
+# stamp-only path applies. Today: rev 1 is the first revision; there is no
+# older-but-compatible vector, so the floor equals 1 and the stamp-only path
+# only ever applies to a row already at the current revision-space (i.e. it
+# activates once a FUTURE metadata-only bump makes rev 1 "old-but-valid").
+_EMBED_SPACE_COMPATIBLE_FROM_REVISION: int = 1
+
 # Property name carrying the per-object revision. Kept out of
 # `_CONTENT_HASH_FIELDS` and added to `_CONTENT_HASH_EXCLUDE`-analog handling so
 # stamping it never perturbs the content hash itself (the revision is an
@@ -4458,8 +4479,90 @@ class CodeGraphAnalyzer:
             }
             return
 
+        # ── v0.2.74 (D1): PATCH-not-embed for content-unchanged stale-revision
+        # rows whose stored vector is still valid ────────────────────────────
+        # The fingerprint did NOT fully match, but the ONLY reason may be a
+        # stale `embed_revision` while the CONTENT is byte-identical AND the
+        # stored vector is still in the current embedding space. Re-embedding
+        # such a row is wasted compute (the user's "if the hashes are the same,
+        # don't re-embed" promise). When _stale_row_needs_only_revision_stamp
+        # says so, PATCH the `embed_revision` in place (no embed, no tombstone)
+        # and skip the write path — the row converges without touching its
+        # vector or summary. Fail-safe: any doubt → fall through to re-embed.
+        if self._stale_row_needs_only_revision_stamp(
+            fp, content_hash, is_chunkable,
+        ):
+            try:
+                collection.data.update(
+                    uuid=det_uuid,
+                    properties={_EMBED_REVISION_PROP: CODEGRAPH_EMBED_REVISION},
+                )
+                # Mark this object as handled so _write_one_object skips it
+                # (same stash mechanism as the unchanged-skip above — the
+                # content is byte-identical, so its write would be a no-op
+                # tombstone we must avoid).
+                if not props.get("content_hash"):
+                    props["content_hash"] = content_hash
+                self._embed_skip_fingerprint = {
+                    "uuid": det_uuid,
+                    "content_hash": content_hash,
+                    "stored_total_chunks": fp.get("total_chunks"),
+                }
+                self._embed_revision_patched = (
+                    getattr(self, "_embed_revision_patched", 0) + 1
+                )
+                return
+            except Exception:  # noqa: BLE001 — patch failed → re-embed (safe)
+                pass
+
         # Changed → embed now.
         self._run_deferred_embed_into(insert_params, deferred)
+
+    def _stale_row_needs_only_revision_stamp(
+        self, fp: Mapping[str, Any], content_hash: str, is_chunkable: bool,
+    ) -> bool:
+        """D1 classifier: True iff a stale row needs only an `embed_revision`
+        metadata PATCH (its vector is still valid), NOT a re-embed.
+
+        Safe (stamp-only) requires ALL of:
+          * content byte-identical (``stored_hash == content_hash``) — same
+            semantic content, so the stored vector still represents it;
+          * the stored row HAS a vector — proxied by a POSITIVE stored
+            revision. A row is stamped ``CODEGRAPH_EMBED_REVISION`` only when a
+            vector was present at write time, else ``_EMBED_REVISION_VECTORLESS``
+            (0). So ``stored_rev > 0`` ⇒ vector present; ``0`` / NULL ⇒
+            vectorless → must re-embed;
+          * the stored vector is in the CURRENT embedding space —
+            ``stored_rev >= _EMBED_SPACE_COMPATIBLE_FROM_REVISION`` (a bump that
+            changed the model/chunking raises that floor → those rows re-embed);
+          * the row is genuinely stale — ``stored_rev < CODEGRAPH_EMBED_REVISION``
+            (an at-current row was already handled by _fingerprint_matches);
+          * single-chunk — a chunkable entity that is now over-budget needs a
+            real chunk-split + re-embed, never a stamp. ``total_chunks <= 1``.
+        Any read uncertainty (NULL/non-int revision) → False → re-embed.
+        """
+        stored_hash = fp.get("content_hash") or ""
+        if not content_hash or stored_hash != content_hash:
+            return False
+        stored_rev_raw = fp.get("embed_revision")
+        try:
+            stored_rev = int(stored_rev_raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return False  # NULL / non-int → unknown → re-embed (fail-safe)
+        if stored_rev <= _EMBED_REVISION_VECTORLESS:
+            return False  # vectorless (0) or negative → must embed
+        if stored_rev < _EMBED_SPACE_COMPATIBLE_FROM_REVISION:
+            return False  # vector in a stale embedding space → must re-embed
+        if stored_rev >= CODEGRAPH_EMBED_REVISION:
+            return False  # not stale (matches would have skipped) — no stamp
+        # Over-budget multi-chunk entity → needs a real chunk split, not a stamp.
+        if is_chunkable:
+            try:
+                if int(fp.get("total_chunks") or 1) > 1:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
 
     @staticmethod
     def _run_deferred_embed_into(insert_params: dict, deferred) -> None:

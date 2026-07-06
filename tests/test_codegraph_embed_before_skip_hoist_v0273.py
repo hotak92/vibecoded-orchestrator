@@ -83,6 +83,8 @@ class _FakeCollectionData:
     def __init__(self) -> None:
         self.replace_calls: List[Dict[str, Any]] = []
         self.insert_calls: List[Dict[str, Any]] = []
+        # v0.2.74 (D1): record metadata-PATCH calls (embed_revision stamp).
+        self.update_calls: List[Dict[str, Any]] = []
 
     def replace(self, uuid: str, **kwargs: Any) -> None:
         self.replace_calls.append({"uuid": str(uuid), **kwargs})
@@ -91,6 +93,10 @@ class _FakeCollectionData:
     def insert(self, uuid: str, **kwargs: Any) -> str:
         self.insert_calls.append({"uuid": str(uuid), **kwargs})
         return str(uuid)
+
+    def update(self, uuid: str, properties: Dict[str, Any]) -> None:
+        self.update_calls.append({"uuid": str(uuid), "properties": properties})
+        return None
 
 
 class _FakeCollection:
@@ -320,3 +326,147 @@ def test_deferred_embed_key_never_leaks_to_weaviate(analyzer_mod: types.ModuleTy
     )
     # And the top-level insert_params dict must have had the key removed.
     assert "_deferred_embed" not in params
+
+
+# ---------------------------------------------------------------------------
+# (g) v0.2.74 D1 — PATCH-not-embed for content-unchanged stale-revision rows
+# whose stored vector is still valid (embedding space unchanged).
+# ---------------------------------------------------------------------------
+
+
+def test_d1_stamp_only_for_unchanged_row_with_valid_vector(
+    analyzer_mod: types.ModuleType, monkeypatch,
+) -> None:
+    """Content byte-identical, stored at a POSITIVE-but-stale revision whose
+    vector is still in the current space → PATCH embed_revision, do NOT embed,
+    do NOT tombstone (replace)."""
+    # Simulate a future metadata-only revision bump: current = 2, compat floor
+    # stays 1, so a stored rev-1 row is "old-but-valid" → stamp-only.
+    monkeypatch.setattr(analyzer_mod, "CODEGRAPH_EMBED_REVISION", 2)
+    monkeypatch.setattr(analyzer_mod, "_EMBED_SPACE_COMPATIBLE_FROM_REVISION", 1)
+
+    analyzer = _make_analyzer(analyzer_mod)
+    embedder = _EmbedCounter()
+    body = "def foo():\n    return 1\n"
+    params = _func_params_with_deferred(embedder, body=body)
+
+    det_uuid = analyzer_mod._deterministic_uuid(
+        analyzer.project_name, "src/mod.py", "mod.foo")
+    stored_hash = _stored_hash_for(analyzer_mod, body)
+    coll = _FakeCollection(
+        "T_CodeFunction",
+        store={det_uuid: {
+            "content_hash": stored_hash,
+            "embed_revision": 1,       # positive (has vector) but stale (< 2)
+            "total_chunks": 1,         # single-chunk
+        }},
+    )
+
+    analyzer._dedup_insert(coll, params, "mod.foo", file_path_rel="src/mod.py")
+
+    assert embedder.calls == 0, "unchanged row with valid vector must NOT re-embed"
+    assert coll.data.replace_calls == [], "no tombstone/replace — stamp only"
+    assert len(coll.data.update_calls) == 1, "embed_revision must be PATCHED"
+    patched = coll.data.update_calls[0]
+    assert patched["uuid"] == det_uuid
+    assert patched["properties"] == {"embed_revision": 2}
+
+
+def test_d1_vectorless_rev0_still_reembeds(
+    analyzer_mod: types.ModuleType, monkeypatch,
+) -> None:
+    """A rev-0 (VECTORLESS) row must RE-EMBED, never stamp — it has no valid
+    vector to preserve (guards against a wrong-skip stranding a vectorless row)."""
+    monkeypatch.setattr(analyzer_mod, "CODEGRAPH_EMBED_REVISION", 2)
+    monkeypatch.setattr(analyzer_mod, "_EMBED_SPACE_COMPATIBLE_FROM_REVISION", 1)
+
+    analyzer = _make_analyzer(analyzer_mod)
+    embedder = _EmbedCounter()
+    body = "def foo():\n    return 1\n"
+    params = _func_params_with_deferred(embedder, body=body)
+
+    det_uuid = analyzer_mod._deterministic_uuid(
+        analyzer.project_name, "src/mod.py", "mod.foo")
+    stored_hash = _stored_hash_for(analyzer_mod, body)
+    coll = _FakeCollection(
+        "T_CodeFunction",
+        store={det_uuid: {
+            "content_hash": stored_hash,
+            "embed_revision": 0,       # VECTORLESS → must re-embed
+            "total_chunks": 1,
+        }},
+    )
+
+    analyzer._dedup_insert(coll, params, "mod.foo", file_path_rel="src/mod.py")
+
+    assert embedder.calls == 1, "vectorless rev-0 must re-embed, not stamp"
+    assert coll.data.update_calls == [], "no stamp-only for a vectorless row"
+
+
+def test_d1_stale_vector_below_compat_floor_reembeds(
+    analyzer_mod: types.ModuleType, monkeypatch,
+) -> None:
+    """A row whose vector is BELOW the embedding-space-compat floor (its space
+    genuinely changed, e.g. a chunking/model bump) must RE-EMBED, not stamp —
+    the stored vector is in a stale space."""
+    # current = 3, compat floor = 2 → a stored rev-1 vector is in a stale space.
+    monkeypatch.setattr(analyzer_mod, "CODEGRAPH_EMBED_REVISION", 3)
+    monkeypatch.setattr(analyzer_mod, "_EMBED_SPACE_COMPATIBLE_FROM_REVISION", 2)
+
+    analyzer = _make_analyzer(analyzer_mod)
+    embedder = _EmbedCounter()
+    body = "def foo():\n    return 1\n"
+    params = _func_params_with_deferred(embedder, body=body)
+
+    det_uuid = analyzer_mod._deterministic_uuid(
+        analyzer.project_name, "src/mod.py", "mod.foo")
+    stored_hash = _stored_hash_for(analyzer_mod, body)
+    coll = _FakeCollection(
+        "T_CodeFunction",
+        store={det_uuid: {
+            "content_hash": stored_hash,
+            "embed_revision": 1,       # below the compat floor (2) → stale space
+            "total_chunks": 1,
+        }},
+    )
+
+    analyzer._dedup_insert(coll, params, "mod.foo", file_path_rel="src/mod.py")
+
+    assert embedder.calls == 1, "vector below compat floor must re-embed"
+    assert coll.data.update_calls == [], "no stamp-only across an embedding-space change"
+
+
+def test_d1_over_budget_multichunk_reembeds_not_stamped(
+    analyzer_mod: types.ModuleType, monkeypatch,
+) -> None:
+    """A chunkable entity stored as MULTI-chunk (over-budget) must re-embed on a
+    revision bump (it needs a real chunk split), never a metadata stamp."""
+    monkeypatch.setattr(analyzer_mod, "CODEGRAPH_EMBED_REVISION", 2)
+    monkeypatch.setattr(analyzer_mod, "_EMBED_SPACE_COMPATIBLE_FROM_REVISION", 1)
+
+    analyzer = _make_analyzer(analyzer_mod)
+    embedder = _EmbedCounter()
+    body = "def foo():\n    return 1\n"
+    params = _func_params_with_deferred(embedder, body=body)
+
+    det_uuid = analyzer_mod._deterministic_uuid(
+        analyzer.project_name, "src/mod.py", "mod.foo")
+    # A multi-chunk stored row: the precheck hashes a single-chunk scratch copy,
+    # so the content_hash will differ from a real multi-chunk canonical hash →
+    # the fingerprint won't match AND the D1 classifier rejects total_chunks>1.
+    # Store a hash that matches the single-chunk scratch so ONLY the multichunk
+    # guard (not a hash mismatch) drives the re-embed.
+    stored_hash = _stored_hash_for(analyzer_mod, body)
+    coll = _FakeCollection(
+        "T_CodeFunction",
+        store={det_uuid: {
+            "content_hash": stored_hash,
+            "embed_revision": 1,
+            "total_chunks": 3,         # over-budget → must re-embed
+        }},
+    )
+
+    analyzer._dedup_insert(coll, params, "mod.foo", file_path_rel="src/mod.py")
+
+    assert embedder.calls == 1, "over-budget multi-chunk must re-embed, not stamp"
+    assert coll.data.update_calls == [], "no stamp-only for an over-budget entity"
