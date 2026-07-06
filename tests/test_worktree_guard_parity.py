@@ -1,24 +1,26 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""v0.2.71 Track T-WT — cross-OS parity for the worktree-guard stdout contract.
+"""v0.2.74 Track T5-2 — cross-OS parity for the worktree-guard CREATE contract.
 
-The stdout-path contract is the ONE place worktree-guard.sh and
-worktree-guard.ps1 MUST behave identically (per the design audit §Cross-OS
-shape). PowerShell isn't reliably installed on Linux CI, so this file pins
-parity two ways:
+The WorktreeCreate hook is responsible for CREATING the worktree (per the
+official Claude Code Hooks Reference — "Replaces default git behavior"), not
+merely validating a path. worktree-guard.sh and worktree-guard.ps1 MUST behave
+identically on that create contract. PowerShell isn't reliably installed on
+Linux CI, so this file pins parity two ways:
 
 1. STATIC (always runs): assert both scripts share the load-bearing decision
-   invariants — the single-block violation test (proposed == toplevel), the
-   same staged-enable gating env (VCT_WORKTREE_GUARD_ENFORCE), the same
-   strict-upgrade env (VCT_WORKTREE_GUARD_STRICT), the same JSONL decision
-   vocabulary, the same path/repo synonym sets, the VCT_DISABLE_HOOKS bypass,
-   the full-raw-payload capture, and the "must match" mirror comments both
-   ways.
+   invariants — the create path convention (`<toplevel>/.claude/worktrees/<id>`),
+   the detached-HEAD `git worktree add`, the identifier synonyms
+   (`worktree_name` / `name` / ...), the path synonyms (belt-and-suspenders),
+   the repo synonyms, the JSONL decision vocabulary, the VCT_DISABLE_HOOKS
+   bypass, the full-raw-payload capture, `git rev-parse --show-toplevel`, and
+   the "must match" mirror comments both ways.
 
-2. DYNAMIC (only when pwsh/powershell is present): run the .ps1 against a
-   real repo and assert the same stdout-path contract the .sh test pins —
-   not-a-repo echoes through, separate path echoes through, path==toplevel
-   is violation-logged-only by default and blocks under ENFORCE.
+2. DYNAMIC (only when pwsh/powershell is present): run BOTH scripts against a
+   real repo with the SAME real-shaped payload and assert they produce the
+   SAME created worktree path (character-for-character), the path exists, and
+   `git worktree list` shows it — plus the not-a-repo no-op and idempotent
+   re-fire.
 
 The dynamic half is the authoritative parity check when a PowerShell runtime
 exists; the static half is the always-on guard against drift.
@@ -45,7 +47,9 @@ def _sh_text() -> str:
 
 
 def _ps1_text() -> str:
-    return PS1.read_text(encoding="utf-8")
+    # The .ps1 carries a UTF-8 BOM by design (OS-EXEMPT-PARITY); utf-8-sig
+    # strips it so substring assertions match cleanly.
+    return PS1.read_text(encoding="utf-8-sig")
 
 
 # ── STATIC parity ──────────────────────────────────────────────────────────
@@ -63,21 +67,38 @@ def test_both_have_must_match_mirror_comments() -> None:
     assert "worktree-guard.sh" in _ps1_text(), ".ps1 must reference its .sh sibling"
 
 
-def test_both_gate_block_behind_enforce_env() -> None:
-    sh = _sh_text()
-    ps = _ps1_text()
-    assert "VCT_WORKTREE_GUARD_ENFORCE" in sh
-    assert "VCT_WORKTREE_GUARD_ENFORCE" in ps
+def test_both_create_via_detached_worktree_add() -> None:
+    # THE load-bearing behaviour: both create the worktree with a detached
+    # HEAD (no branch-name collisions across parallel agents).
+    assert "worktree add --detach" in _sh_text()
+    assert "worktree add --detach" in _ps1_text()
 
 
-def test_both_support_strict_env() -> None:
-    assert "VCT_WORKTREE_GUARD_STRICT" in _sh_text()
-    assert "VCT_WORKTREE_GUARD_STRICT" in _ps1_text()
+def test_both_use_worktrees_path_convention() -> None:
+    # Same on-disk convention so the SubagentStop reconcile + agents can find
+    # the worktree deterministically.
+    assert ".claude/worktrees" in _sh_text()
+    for token in ("worktrees",):
+        assert token in _ps1_text()
+
+
+def test_both_tolerate_worktree_name_and_name_identifier() -> None:
+    # The docs name the identifier `worktree_name`; the live harness sends
+    # `name`. Both scripts must tolerate BOTH keys.
+    for syn in ("worktree_name", "name"):
+        assert syn in _sh_text(), f".sh missing identifier synonym '{syn}'"
+        assert syn in _ps1_text(), f".ps1 missing identifier synonym '{syn}'"
 
 
 def test_both_honor_vct_disable_hooks() -> None:
     assert "VCT_DISABLE_HOOKS" in _sh_text()
     assert "VCT_DISABLE_HOOKS" in _ps1_text()
+
+
+def test_both_gate_explicit_parent_block_behind_enforce() -> None:
+    # ENFORCE still gates the belt-and-suspenders explicit-path==parent block.
+    assert "VCT_WORKTREE_GUARD_ENFORCE" in _sh_text()
+    assert "VCT_WORKTREE_GUARD_ENFORCE" in _ps1_text()
 
 
 def test_both_share_jsonl_decision_vocabulary() -> None:
@@ -86,16 +107,21 @@ def test_both_share_jsonl_decision_vocabulary() -> None:
     for decision in (
         "noop",
         "not_a_repo",
-        "violation_logged_only",
+        "no_worktree_identifier",
+        "created",
+        "idempotent_existing_worktree",
+        "worktree_add_detached_head",
+        "create_failed",
+        "redirect_parent_path",
         "block",
-        "warn_dirty_parent",
-        "pass",
     ):
         assert decision in sh, f".sh missing decision '{decision}'"
         assert decision in ps, f".ps1 missing decision '{decision}'"
 
 
 def test_both_share_path_synonyms() -> None:
+    # Belt-and-suspenders explicit-path synonyms (a future harness might send
+    # a path). Kept identical so both scripts honour the same vocabulary.
     sh = _sh_text()
     ps = _ps1_text()
     for syn in ("worktree_path", "path", "proposed_path", "worktree", "target_path", "dir"):
@@ -160,6 +186,35 @@ def _init_repo(root: Path) -> None:
     _git(root, "commit", "--allow-empty", "-q", "-m", "seed")
 
 
+def _worktree_paths(root: Path) -> list[str]:
+    out = subprocess.run(
+        ["git", "-C", str(root), "worktree", "list", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    return [
+        line[len("worktree ") :].strip()
+        for line in out.splitlines()
+        if line.startswith("worktree ")
+    ]
+
+
+def _run_sh(payload: dict, project_dir: Path, extra_env: dict | None = None):
+    env = os.environ.copy()
+    env["CLAUDE_PROJECT_DIR"] = str(project_dir)
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        ["bash", str(SH)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+
+
 def _run_ps1(payload: dict, project_dir: Path, extra_env: dict | None = None):
     assert _PS is not None
     env = os.environ.copy()
@@ -177,38 +232,75 @@ def _run_ps1(payload: dict, project_dir: Path, extra_env: dict | None = None):
 
 
 @needs_ps
-def test_ps1_not_a_repo_echoes_through(tmp_path: Path) -> None:
-    proposed = str(tmp_path / "wt" / "agent-x")
-    proc = _run_ps1({"worktree_path": proposed}, tmp_path)
-    assert proc.returncode == 0
-    assert proc.stdout.strip() == str(Path(proposed))
-
-
-@needs_ps
-def test_ps1_separate_path_echoes_through(tmp_path: Path) -> None:
+def test_ps1_creates_worktree_from_real_payload(tmp_path: Path) -> None:
     repo = tmp_path / "proj"
     _init_repo(repo)
-    proposed = str(tmp_path / "wt" / "agent-sep")
-    proc = _run_ps1({"worktree_path": proposed}, repo)
-    assert proc.returncode == 0
-    assert proc.stdout.strip() == str(Path(proposed))
+    payload = {
+        "session_id": "s1",
+        "cwd": str(repo),
+        "hook_event_name": "WorktreeCreate",
+        "name": "agent-ps-create",
+    }
+    proc = _run_ps1(payload, repo)
+    assert proc.returncode == 0, proc.stderr
+    out = proc.stdout.strip()
+    expected = repo / ".claude" / "worktrees" / "agent-ps-create"
+    assert out == str(expected.resolve()), out
+    assert Path(out).is_dir()
+    assert str(expected.resolve()) in _worktree_paths(repo)
 
 
 @needs_ps
-def test_ps1_path_equals_parent_logonly_by_default(tmp_path: Path) -> None:
+def test_sh_and_ps1_produce_same_path(tmp_path: Path) -> None:
+    """Parity: identical input → identical created worktree path from both
+    implementations (run against separate repos to avoid cross-contamination,
+    then compare the repo-relative path)."""
+    sh_repo = tmp_path / "sh_proj"
+    ps_repo = tmp_path / "ps_proj"
+    _init_repo(sh_repo)
+    _init_repo(ps_repo)
+    ident = "agent-parity-xyz"
+    sh_proc = _run_sh(
+        {"hook_event_name": "WorktreeCreate", "name": ident, "cwd": str(sh_repo)}, sh_repo
+    )
+    ps_proc = _run_ps1(
+        {"hook_event_name": "WorktreeCreate", "name": ident, "cwd": str(ps_repo)}, ps_repo
+    )
+    assert sh_proc.returncode == 0, sh_proc.stderr
+    assert ps_proc.returncode == 0, ps_proc.stderr
+    # Compare the tail after the repo root — must be identical.
+    sh_rel = Path(sh_proc.stdout.strip()).relative_to(sh_repo.resolve())
+    ps_rel = Path(ps_proc.stdout.strip()).relative_to(ps_repo.resolve())
+    assert sh_rel == ps_rel == Path(".claude/worktrees") / ident
+
+
+@needs_ps
+def test_ps1_not_a_repo_graceful_noop(tmp_path: Path) -> None:
+    proc = _run_ps1(
+        {"hook_event_name": "WorktreeCreate", "name": "agent-x", "cwd": str(tmp_path)}, tmp_path
+    )
+    assert proc.returncode == 0
+    assert proc.stdout.strip() == ""
+
+
+@needs_ps
+def test_ps1_idempotent_refire(tmp_path: Path) -> None:
     repo = tmp_path / "proj"
     _init_repo(repo)
-    proc = _run_ps1({"worktree_path": str(repo)}, repo)
-    assert proc.returncode == 0
-    assert proc.stdout.strip() == str(repo.resolve())
+    payload = {"hook_event_name": "WorktreeCreate", "name": "agent-ps-refire", "cwd": str(repo)}
+    p1 = _run_ps1(payload, repo)
+    p2 = _run_ps1(payload, repo)
+    assert p1.returncode == 0 and p2.returncode == 0, (p1.stderr, p2.stderr)
+    assert p1.stdout.strip() == p2.stdout.strip()
+    assert len(_worktree_paths(repo)) == 2
 
 
 @needs_ps
-def test_ps1_path_equals_parent_blocks_under_enforce(tmp_path: Path) -> None:
+def test_ps1_explicit_path_equals_parent_blocks_under_enforce(tmp_path: Path) -> None:
     repo = tmp_path / "proj"
     _init_repo(repo)
     proc = _run_ps1(
-        {"worktree_path": str(repo)},
+        {"hook_event_name": "WorktreeCreate", "worktree_path": str(repo), "cwd": str(repo)},
         repo,
         extra_env={"VCT_WORKTREE_GUARD_ENFORCE": "1"},
     )

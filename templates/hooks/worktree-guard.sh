@@ -3,76 +3,95 @@
 # Copyright (c) 2026 VibeCoded Tools
 #
 # worktree-guard.sh — WorktreeCreate hook (Layer 0, primary deterministic
-# gate) for the worktree-isolation silent-fallback safeguard.
+# gate) for the worktree-isolation safeguard.
 #
 # ── Why this exists ──────────────────────────────────────────────────────
 # The 2026-06-30 incident: three subagents dispatched with
 # `isolation: worktree` all silently wrote to the SHARED parent working
-# tree (the parent was dirty at dispatch time). Their reported cwd was
-# `.claude/worktrees/agent-<id>` yet their commits/edits landed on the
-# parent branch. The SILENCE is the bug — there was no deterministic,
-# hook-level gate at the worktree-create instant.
+# tree. Their reported cwd was `.claude/worktrees/agent-<id>` yet their
+# commits/edits landed on the parent branch. The SILENCE was the bug —
+# there was no deterministic, hook-level worktree at the create instant.
 #
-# This hook is that gate. It fires only when the harness is actually about
-# to create a worktree (i.e. isolation WAS requested), so it is
-# automatically a NO-OP for non-isolation work, the deliberate-shared-tree
-# case, and non-git projects — none of those fire WorktreeCreate.
+# ── What the WorktreeCreate contract ACTUALLY is (verified 2026-07-06) ────
+# Per the official Claude Code Hooks Reference
+# (https://code.claude.com/docs/en/hooks.md, retrieved 2026-07-06):
+#   • "When a worktree is being created via `--worktree` or
+#      `isolation: "worktree"`. Replaces default git behavior."
+#     → THE HOOK IS RESPONSIBLE FOR CREATING THE WORKTREE, not merely
+#       validating a path. It replaces git's default create step.
+#   • stdin payload carries the common fields {session_id, transcript_path,
+#     cwd, hook_event_name} plus a worktree IDENTIFIER. The docs name it
+#     `worktree_name`; the live harness on the pinned build sends it as
+#     `name` (= the agent id, e.g. "agent-a10c46d251a62b21d"). THERE IS NO
+#     PROPOSED-PATH FIELD in the real payload — the hook must DECIDE the
+#     path. We tolerate BOTH keys (`worktree_name` OR `name`).
+#   • stdout: print the absolute worktree path (plain line). Exit 0 =
+#     success (the worktree MUST exist at that path). ANY non-zero exit
+#     ABORTS the create (strict — not just exit 2).
 #
-# ── stdout contract (THE cross-OS-critical bit) ──────────────────────────
-# Per Claude Code's hook table (ORCHESTRATOR-CLAUDE.md.template:504),
-# WorktreeCreate can-block = Yes and the contract is "Must print absolute
-# worktree path on stdout." So a hook can:
-#   (a) ACCEPT by echoing the proposed path back,
-#   (b) REDIRECT to a safer path by echoing a different path,
-#   (c) BLOCK by refusing (non-zero / no path) with a human reason.
-# We use (a) on the happy path and (c) ONLY on the one unambiguous
-# violation (proposed path == / inside the parent checkout).
+# ── The bug this version fixes ───────────────────────────────────────────
+# The previous implementation was a VALIDATOR: it parsed stdin for a
+# proposed path and, finding none (the real payload has none), no-op'd,
+# echoed empty, exited 0. The harness then had no path → "hook succeeded
+# but returned no worktree path" → the worktree was NEVER created → the
+# subagent silently fell back to the shared parent tree. NO code path ran
+# `git worktree add`. This version CREATES the worktree.
 #
-# ── Staged enable (log-only first) ───────────────────────────────────────
-# VCO has NEVER exercised WorktreeCreate, so the live stdin schema + the
-# exact stdout-consumption semantics must be verified against a real spawn
-# before we rely on the BLOCK path. Therefore the block branch is gated
-# behind VCT_WORKTREE_GUARD_ENFORCE (default off → log-only). In log-only
-# mode a clear violation is LOGGED loudly to the JSONL but the proposed
-# path is still echoed through (never break a legitimate create). The
-# integrator verifies the round-trip from .claude/logs/worktree-guard.jsonl
-# across a few real isolation spawns THIS cycle, then flips the flag — this
-# is a same-cycle staged enable, NOT a deferred TODO.
+# ── Decision matrix ──────────────────────────────────────────────────────
+#   1. Global bypass (VCT_DISABLE_HOOKS) → echo nothing, exit 0 (harness
+#      default). Full no-op, consistent with every hook.
+#   2. cwd is NOT a git repo → this create cannot be isolated; echo nothing
+#      + exit 0 so the harness does its own default (do NOT abort a
+#      legitimate non-git spawn with a non-zero exit).
+#   3. Derive `<toplevel>/.claude/worktrees/<sanitized-id>` and run
+#      `git worktree add --detach <path> HEAD`.
+#        • already a registered worktree (re-fire / retry) → idempotent
+#          success: echo it, exit 0.
+#        • `git worktree add` FAILS → LOUD abort: log the reason, print it
+#          to stderr, exit NON-ZERO. A loud abort is correct here: the
+#          whole point of this hook is to prevent the SILENT shared-tree
+#          fallback, so a failed create must surface (harness aborts +
+#          shows the reason) rather than fall through to the parent tree.
+#        • success → echo the absolute worktree path, exit 0.
+#   4. Belt-and-suspenders: if a future harness build DOES send an explicit
+#      path field, honour it — validate it is a SEPARATE checkout (never
+#      the parent toplevel) and create it if absent, same create semantics.
 #
-# FALLBACK: if the pinned Claude Code build does NOT consume stdout-as-path
-# (i.e. the echoed path is ignored), this hook degrades to warn+log and the
-# SubagentStart isolation-check + SubagentStop violation-alert backstops act
-# as the block-equivalent (post-hoc loud detection). That is the accepted
-# cycle outcome, not a deferred fix.
+# ── VCT_WORKTREE_GUARD_ENFORCE (staged-enable flag — now vestigial) ───────
+# In the previous log-only design this flag flipped the one violation branch
+# from warn-only to block. Creation is now the DEFAULT behaviour (ungated) —
+# a failed create always aborts loudly regardless of the flag, because the
+# docs contract makes non-zero == abort unconditional. The flag is retained
+# only for the belt-and-suspenders explicit-path branch: when a path IS
+# supplied AND it equals the parent toplevel, ENFORCE hard-blocks (exit
+# non-zero) while the default logs the anomaly and still derives a safe
+# separate path. For the real (no-path) payload the flag has no effect —
+# creation is unconditional. Documented here so the next editor doesn't
+# assume creation is gated behind it.
 #
 # ── Cross-OS parity ──────────────────────────────────────────────────────
-# MUST behave identically to worktree-guard.ps1 on the stdout-path
-# contract: same decision matrix, same single-block case, same
-# echo-through-on-any-doubt discipline. Keep them in lockstep — any change
-# to the decision logic here MUST be mirrored in worktree-guard.ps1.
+# MUST behave identically to worktree-guard.ps1: same decision matrix, same
+# path convention (`<toplevel>/.claude/worktrees/<sanitized-id>`), same
+# `git worktree add --detach`, same idempotent-re-fire handling, same
+# stdout/exit semantics. Any change to the decision logic here MUST be
+# mirrored in worktree-guard.ps1 and vice versa. Keep them in lockstep.
 #
 # ── Tunables ─────────────────────────────────────────────────────────────
-#   VCT_DISABLE_HOOKS        — global bypass (consistent with every hook).
-#   VCT_WORKTREE_GUARD_ENFORCE=1 — flip from log-only to block-on-violation.
-#   VCT_WORKTREE_GUARD_STRICT=1  — upgrade dirty-parent WARN to a BLOCK
-#                                  (belt-and-suspenders; off by default
-#                                  because a dirty parent does NOT by itself
-#                                  make a SEPARATE worktree unsafe).
+#   VCT_DISABLE_HOOKS            — global bypass (consistent with every hook).
+#   VCT_WORKTREE_GUARD_ENFORCE=1 — hard-block the explicit-path==parent case
+#                                  (belt-and-suspenders branch only; no
+#                                  effect on the real no-path payload).
 
 # Scrub sensitive env vars before any subprocess spawning.
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 
-# Global bypass — but we must still satisfy the stdout contract if we can
-# cheaply echo back a proposed path. When hooks are globally disabled we
-# echo nothing (the harness uses its own default) and exit 0. This matches
-# every other hook's VCT_DISABLE_HOOKS behaviour (full no-op).
+# Global bypass — echo nothing (the harness uses its own default) and exit 0.
+# This matches every other hook's VCT_DISABLE_HOOKS behaviour (full no-op).
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 
-# NOTE: deliberately NOT `set -e`. A WorktreeCreate hook that aborts mid-way
-# on an unexpected non-zero would either block a legitimate spawn (if the
-# build treats non-zero as block) or emit no path. We want explicit control
-# over every exit; soft-fail everywhere and only ever block on the one
-# explicit violation branch.
+# NOTE: deliberately NOT `set -e`. We want explicit control over every exit;
+# soft-fail on best-effort steps and only ever abort (non-zero) on a genuine
+# create failure or the explicit-path==parent enforce case.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -106,9 +125,9 @@ emit_path() {
     [ -n "${1:-}" ] && printf '%s\n' "$1"
 }
 
-# log_event KEY DECISION REASON PROPOSED RESOLVED — append a JSONL row.
-# ALWAYS capture the FULL received payload (RAW_STDIN_FOR_PY) so the
-# integrator can verify the live schema field names + stdout semantics.
+# log_event DECISION REASON PROPOSED RESOLVED — append a JSONL row. ALWAYS
+# capture the FULL received payload (raw_payload) so the integrator can
+# verify the live schema field names + stdout semantics across real spawns.
 log_event() {
     [ -n "${PY:-}" ] || return 0
     DECISION_FOR_PY="${1:-}" \
@@ -145,14 +164,23 @@ except OSError:
 ' 2>/dev/null || true
 }
 
-# Parse stdin defensively (synonym-tolerant). We need the proposed worktree
-# path and (optionally) the repo root. Emit two stdout lines:
-#   line 1 = proposed worktree path (or empty)
-#   line 2 = repo root hint (or empty)
-# Any JSON error → both empty (downstream treats as "no path to validate").
+# Parse stdin defensively. We extract:
+#   line 1 = worktree IDENTIFIER (worktree_name / name synonyms) — decides the
+#            create path when no explicit path is supplied.
+#   line 2 = explicit proposed path, IF a future harness build sends one
+#            (worktree_path / path / proposed_path / ... synonyms). Empty in
+#            the real payload.
+#   line 3 = repo root hint (cwd / repo_root / ... synonyms) — we always
+#            re-derive the toplevel via git as well.
+# Any JSON error → all three empty.
+WT_NAME=""
 PROPOSED_PATH=""
 REPO_HINT=""
 if [ -n "$HOOK_STDIN" ] && [ -n "${PY:-}" ]; then
+    # The single-quoted `-c` body is a Python script — the only `$`/`\n`
+    # inside it (the `printf '\n\n'` fallback) is a printf escape, not a
+    # shell expansion, so single quotes are correct. Silence SC2016.
+    # shellcheck disable=SC2016
     PARSED=$(printf '%s' "$HOOK_STDIN" | "$PY" -c '
 import json, sys
 try:
@@ -161,8 +189,20 @@ except Exception:
     sys.exit(0)
 if not isinstance(d, dict):
     sys.exit(0)
-# Proposed worktree path — try the documented + likely synonyms. The
-# WorktreeCreate stdin schema is not frozen; be liberal.
+# Worktree identifier — the docs name this `worktree_name`; the live harness
+# on the pinned build sends it as `name` (the agent id). Tolerate BOTH, plus
+# a couple of likely synonyms. This is the field that drives path derivation.
+name = (
+    d.get("worktree_name")
+    or d.get("name")
+    or d.get("agent_id")
+    or d.get("agent_name")
+    or d.get("id")
+    or ""
+)
+# Explicit proposed path — absent in the real payload; belt-and-suspenders
+# for a future build that DOES send one. Same synonym set as before so the
+# parity tests keep pinning both scripts to the same vocabulary.
 path = (
     d.get("worktree_path")
     or d.get("path")
@@ -181,25 +221,18 @@ repo = (
     or d.get("toplevel")
     or ""
 )
+sys.stdout.write(str(name) + "\n")
 sys.stdout.write(str(path) + "\n")
 sys.stdout.write(str(repo))
-' 2>/dev/null || printf '\n')
-    PROPOSED_PATH="$(printf '%s' "$PARSED" | sed -n '1p')"
-    REPO_HINT="$(printf '%s' "$PARSED" | sed -n '2p')"
+' 2>/dev/null || printf '\n\n')
+    WT_NAME="$(printf '%s' "$PARSED" | sed -n '1p')"
+    PROPOSED_PATH="$(printf '%s' "$PARSED" | sed -n '2p')"
+    REPO_HINT="$(printf '%s' "$PARSED" | sed -n '3p')"
 fi
 
-# ── Step 1: parse failure / no path ───────────────────────────────────────
-# Cannot parse a path ⇒ nothing to validate ⇒ echo back whatever we got
-# (possibly empty) and exit 0. Never break a legitimate create.
-if [ -z "$PROPOSED_PATH" ]; then
-    log_event "noop" "no_proposed_path_parsed" "" ""
-    emit_path "$PROPOSED_PATH"
-    exit 0
-fi
-
-# Normalise the proposed path to absolute (best-effort). realpath -m
-# resolves even non-existent paths (the worktree dir does not exist yet at
-# create time). Fall back to the raw value if realpath is unavailable.
+# norm_path: absolutise best-effort. realpath -m resolves even non-existent
+# paths (the worktree dir does not exist yet at create time). Fall back to
+# the raw value if realpath is unavailable.
 norm_path() {
     local p="$1"
     if command -v realpath >/dev/null 2>&1; then
@@ -208,100 +241,119 @@ norm_path() {
         printf '%s' "$p"
     fi
 }
-PROPOSED_ABS="$(norm_path "$PROPOSED_PATH")"
 
-# ── Step 2: not-a-repo ⇒ graceful no-op ───────────────────────────────────
-# Resolve the repo toplevel relative to the project root. We use
-# `git -C "$PROJECT_ROOT"` so monorepos / subdir-of-bigger-repo layouts
-# resolve to the REAL git toplevel, never an assumed project root.
+# sanitize_id: reduce a worktree identifier to a filesystem-safe token. Keep
+# [A-Za-z0-9._-]; collapse everything else to '-'. Empty/degenerate → a
+# stable "agent" fallback so we never derive an empty path segment.
+sanitize_id() {
+    local raw="$1" out
+    out="$(printf '%s' "$raw" | tr -c 'A-Za-z0-9._-' '-' )"
+    # Neutralise any surviving `..` run (it's already one path segment, so it
+    # can't traverse — this is purely for a tidy token) and collapse dot runs.
+    out="$(printf '%s' "$out" | sed -E 's/\.{2,}/./g')"
+    # Trim leading/trailing dashes/dots and collapse runs of dashes.
+    out="$(printf '%s' "$out" | sed -E 's/-+/-/g; s/^[-.]+//; s/[-.]+$//')"
+    [ -n "$out" ] || out="agent"
+    printf '%s' "$out"
+}
+
+# ── Resolve the git toplevel (the repo this create is scoped to) ──────────
+# Prefer the payload cwd hint when present, else PROJECT_ROOT. We use
+# `git -C <dir> rev-parse --show-toplevel` so monorepos / subdir-of-repo
+# layouts resolve to the REAL git toplevel.
+GIT_SCOPE_DIR="$PROJECT_ROOT"
+if [ -n "$REPO_HINT" ] && [ -d "$REPO_HINT" ]; then
+    GIT_SCOPE_DIR="$REPO_HINT"
+fi
 TOPLEVEL=""
 if command -v git >/dev/null 2>&1; then
-    TOPLEVEL="$(git -C "$PROJECT_ROOT" rev-parse --show-toplevel 2>/dev/null || true)"
+    TOPLEVEL="$(git -C "$GIT_SCOPE_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
 fi
+
+# ── Not a git repo ⇒ graceful no-op ───────────────────────────────────────
+# This create can't be isolated (no repo to base a worktree on). Echo nothing
+# and exit 0 so the harness does its own default — do NOT abort with a
+# non-zero exit, which would block a legitimate non-git spawn.
 if [ -z "$TOPLEVEL" ]; then
-    # Not inside any git repo ⇒ nothing to isolate ⇒ echo through.
-    log_event "noop" "not_a_repo" "$PROPOSED_ABS" ""
-    emit_path "$PROPOSED_ABS"
+    log_event "noop" "not_a_repo" "$PROPOSED_PATH" ""
     exit 0
 fi
 TOPLEVEL_ABS="$(norm_path "$TOPLEVEL")"
 
-# ── Step 3+4: validate the proposed path is a SEPARATE checkout ────────────
-# CLEAR VIOLATION when the proposed worktree path IS the parent checkout
-# toplevel, OR is the parent toplevel itself by any path form. A worktree
-# that resolves to the primary checkout shares HEAD ⇒ exactly the silent
-# shared-tree fallback we must stop.
-#
-# We treat "inside the parent checkout" carefully: the harness legitimately
-# places worktrees under `<toplevel>/.claude/worktrees/agent-<id>` in some
-# builds — that is a path INSIDE the toplevel directory tree but is still a
-# genuinely separate `git worktree` (its own HEAD). So "inside the toplevel
-# directory" is NOT by itself a violation. The unambiguous violation is the
-# narrow case: proposed == toplevel (the worktree path equals the primary
-# checkout root). That is the one case we block.
-IS_VIOLATION=0
-if [ "$PROPOSED_ABS" = "$TOPLEVEL_ABS" ]; then
-    IS_VIOLATION=1
-fi
-
-if [ "$IS_VIOLATION" -eq 1 ]; then
-    REASON="isolation:worktree requested but the proposed worktree path IS the parent checkout ($TOPLEVEL_ABS) — refusing to avoid silent shared-tree fallback"
-    if [ -n "${VCT_WORKTREE_GUARD_ENFORCE:-}" ]; then
-        # ENFORCE mode: BLOCK. Emit the reason on stderr, no path on stdout,
-        # exit non-zero. (The exact "no path + non-zero = block" semantics
-        # are what the integrator verifies on a live spawn before relying
-        # on this branch.)
-        log_event "block" "$REASON" "$PROPOSED_ABS" "$TOPLEVEL_ABS"
-        printf 'worktree-guard: BLOCK — %s\n' "$REASON" >&2
-        exit 2
-    else
-        # LOG-ONLY mode (default until verified-on-live-spawn): log loudly
-        # but echo the proposed path through so we never break a create
-        # while the contract is still unverified. The SubagentStart /
-        # SubagentStop backstops will catch the resulting shared-tree write.
-        log_event "violation_logged_only" "$REASON" "$PROPOSED_ABS" "$TOPLEVEL_ABS"
-        printf 'worktree-guard: WARNING (log-only) — %s\n' "$REASON" >&2
-        emit_path "$PROPOSED_ABS"
+# create_worktree ABS_PATH — run `git worktree add --detach ABS_PATH HEAD`.
+# Idempotent: if ABS_PATH is already a registered worktree, treat as success.
+# On genuine failure, emit the reason to stderr, log it, and abort NON-ZERO
+# (per the strict contract — a failed create must be LOUD, never a silent
+# shared-tree fallback). Returns via exit; never returns normally on failure.
+create_worktree() {
+    local target="$1" reason existing add_err
+    # Already registered at this exact path? (re-fire / retry) → success.
+    # `git worktree list --porcelain` emits `worktree <abs-path>` lines.
+    existing="$(git -C "$TOPLEVEL_ABS" worktree list --porcelain 2>/dev/null \
+        | sed -n 's/^worktree //p')"
+    if printf '%s\n' "$existing" | grep -qxF "$target"; then
+        log_event "created" "idempotent_existing_worktree" "$PROPOSED_PATH" "$target"
+        emit_path "$target"
         exit 0
     fi
-fi
+    # Ensure the parent directory exists (e.g. <toplevel>/.claude/worktrees).
+    mkdir -p "$(dirname "$target")" 2>/dev/null || true
+    # Detached HEAD is the safest base: no branch-name collisions across
+    # parallel agents, and the agent gets a clean separate checkout of HEAD.
+    if add_err="$(git -C "$TOPLEVEL_ABS" worktree add --detach "$target" HEAD 2>&1)"; then
+        log_event "created" "worktree_add_detached_head" "$PROPOSED_PATH" "$target"
+        emit_path "$target"
+        exit 0
+    fi
+    # Failure → LOUD abort. Non-zero exit makes the harness surface the
+    # failure instead of silently falling back to the shared parent tree.
+    reason="git worktree add failed for $target: $add_err"
+    log_event "create_failed" "$reason" "$PROPOSED_PATH" "$target"
+    printf 'worktree-guard: ABORT — %s\n' "$reason" >&2
+    exit 1
+}
 
-# ── Step 5: dirty-parent handling (the incident trigger) ───────────────────
-# A dirty parent does NOT by itself make a SEPARATE worktree unsafe — git
-# can create a worktree from a dirty primary tree. The danger is only the
-# fallback collapsing to the shared tree, which Step 4 already guards. So:
-# WARN by default, escalate to BLOCK only under VCT_WORKTREE_GUARD_STRICT.
-PARENT_DIRTY=0
-if command -v git >/dev/null 2>&1; then
-    if [ -n "$(git -C "$TOPLEVEL_ABS" status --porcelain 2>/dev/null)" ]; then
-        PARENT_DIRTY=1
+# ── Belt-and-suspenders: an explicit path WAS supplied ────────────────────
+# The real payload has no path; this branch only fires on a future harness
+# build that sends one. Validate it is a SEPARATE checkout (never the parent
+# toplevel) and create it if absent.
+if [ -n "$PROPOSED_PATH" ]; then
+    PROPOSED_ABS="$(norm_path "$PROPOSED_PATH")"
+    if [ "$PROPOSED_ABS" = "$TOPLEVEL_ABS" ]; then
+        # Proposed path == parent checkout: creating a worktree there is
+        # exactly the silent shared-tree collapse we exist to prevent.
+        if [ -n "${VCT_WORKTREE_GUARD_ENFORCE:-}" ]; then
+            REASON="explicit worktree path IS the parent checkout ($TOPLEVEL_ABS) — refusing (would collapse to the shared tree)"
+            log_event "block" "$REASON" "$PROPOSED_ABS" "$TOPLEVEL_ABS"
+            printf 'worktree-guard: BLOCK — %s\n' "$REASON" >&2
+            exit 2
+        fi
+        # Default: don't create at the parent; derive a safe separate path
+        # from the identifier instead (fall through to derivation below).
+        log_event "redirect_parent_path" "explicit path equals parent toplevel; deriving a separate worktree path instead" "$PROPOSED_ABS" "$TOPLEVEL_ABS"
+    else
+        # A genuinely separate proposed path → create it there.
+        create_worktree "$PROPOSED_ABS"
     fi
 fi
 
-if [ "$PARENT_DIRTY" -eq 1 ]; then
-    REASON="parent checkout ($TOPLEVEL_ABS) is dirty at worktree-create time — separate worktree still safe, but a fallback to the shared tree would not be"
-    if [ -n "${VCT_WORKTREE_GUARD_STRICT:-}" ] && [ -n "${VCT_WORKTREE_GUARD_ENFORCE:-}" ]; then
-        # Belt-and-suspenders: strict + enforce together upgrade dirty-parent
-        # to a block. (Strict alone, without enforce, stays a warn — we never
-        # block before the stdout contract is verified.)
-        log_event "block" "$REASON" "$PROPOSED_ABS" "$TOPLEVEL_ABS"
-        printf 'worktree-guard: BLOCK (strict) — %s\n' "$REASON" >&2
-        exit 2
-    fi
-    # WARN (not block): the proposed path is a SEPARATE checkout (Step 4
-    # passed) so the worktree itself is safe; we just record the dirty-parent
-    # signal and echo the path through. Exit here so we don't also emit the
-    # Step-6 "pass" row — the last log row should read "warn_dirty_parent".
-    log_event "warn_dirty_parent" "$REASON" "$PROPOSED_ABS" "$TOPLEVEL_ABS"
-    printf 'worktree-guard: WARNING — %s\n' "$REASON" >&2
-    emit_path "$PROPOSED_ABS"
+# ── No usable identifier ⇒ graceful no-op ─────────────────────────────────
+# We reach here with an empty WT_NAME only on a degenerate/malformed
+# invocation (empty stdin, non-JSON, or a payload with neither an identifier
+# nor an explicit path). Do NOT fabricate a worktree from a fallback token in
+# that case — echo nothing + exit 0 so the harness uses its own default. The
+# "agent" fallback in sanitize_id is reserved for the case where a NON-empty
+# identifier sanitizes down to empty (e.g. name == "///").
+if [ -z "$WT_NAME" ]; then
+    log_event "noop" "no_worktree_identifier" "$PROPOSED_PATH" ""
     exit 0
 fi
 
-# ── Step 6: happy path ─────────────────────────────────────────────────────
-# Proposed path validated as a separate checkout, clean parent. Echo the
-# (absolute) worktree path on stdout so the harness uses it. Satisfies the
-# contract.
-log_event "pass" "validated_separate_checkout" "$PROPOSED_ABS" "$TOPLEVEL_ABS"
-emit_path "$PROPOSED_ABS"
-exit 0
+# ── Primary path: derive + create under the VCO convention ────────────────
+# `<toplevel>/.claude/worktrees/<sanitized-id>`. This matches the harness's
+# observed nesting (`.claude/worktrees/agent-<id>`) and the subagent-stop
+# reconcile's expectations.
+SAFE_ID="$(sanitize_id "$WT_NAME")"
+DERIVED_PATH="$TOPLEVEL_ABS/.claude/worktrees/$SAFE_ID"
+DERIVED_ABS="$(norm_path "$DERIVED_PATH")"
+create_worktree "$DERIVED_ABS"
