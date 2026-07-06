@@ -805,6 +805,162 @@ def _resolve_index_dot_claude(cli_value: Optional[bool], repo_path: Path) -> boo
 
 
 # ---------------------------------------------------------------------------
+# v0.2.74 (R3 / D1 orphan-clear): the ONE safe file-row delete primitive.
+#
+# `file_path` (CodeFunction/CodeClass) and `path` (CodeModule) are TEXT with
+# DEFAULT (word) tokenization. A Weaviate `Filter.by_property(...).equal(rel)`
+# or `.like(...)` matches on TOKENS, not the exact string, and can OVER-DELETE
+# sibling files whose token set overlaps (live-diagnosed 2026-07-04: a
+# `Like "*.claude/state/*"` would have swept ~5.5k REAL functions whose backup
+# copies share the `claude`/`state` tokens). The ONLY safe delete is: read the
+# raw property back per row, compare in PYTHON (exact string / on-disk test),
+# and `delete_by_id` ONLY the confirmed matches. This mirrors
+# `migrations/codegraph_collection/6_to_7.py::_purge_transient_rows` and is the
+# single home for both the deleted-file prune (FIX-B) and the orphan-clear
+# convergence fix (D1). NEVER add a tokenized Like/Equal DELETE elsewhere.
+# ---------------------------------------------------------------------------
+
+
+def _path_reachable_on_disk(rel_or_abs_path: str, repo_root: "Path") -> bool:
+    """True when ``rel_or_abs_path`` resolves to a real on-disk file INSIDE
+    ``repo_root`` (mirrors ``install.py::_path_resolves_on_disk`` safety).
+
+    A stored code-graph path is repo-relative POSIX (how the walkers stamp it).
+    It is REACHABLE iff ``(repo_root / rel).exists()`` AND the resolved path
+    lies inside ``repo_root`` — so a stored ``../../../etc/passwd`` escape
+    resolves to an existing file OUTSIDE the tree and is (correctly) reported
+    NOT reachable → an orphan the caller may delete.
+
+    Fail-SAFE toward KEEPING data: an empty path, or ANY OS/value error while
+    probing (NUL bytes, invalid chars, unreadable segment), returns ``True``
+    ("treat as exists → do NOT delete"). Only a determinate "resolved fine and
+    is genuinely absent, or resolved fine and escapes the root" yields
+    ``False``. This differs from the KG prune's soft-fail-to-delete because the
+    orphan-clear runs unattended on a DELETE path where a wrong delete is data
+    loss — uncertainty must never authorise a delete.
+    """
+    if not rel_or_abs_path:
+        # No path to test → cannot prove absence → keep (never delete).
+        return True
+    try:
+        root_resolved = repo_root.resolve()
+    except (OSError, ValueError):
+        # Cannot even resolve the root → indeterminate → keep.
+        return True
+    try:
+        candidate = (root_resolved / rel_or_abs_path).resolve()
+    except (OSError, ValueError):
+        # Bad chars (NUL/newline) / unresolvable → indeterminate → keep.
+        return True
+    try:
+        inside = candidate.is_relative_to(root_resolved)
+    except (OSError, ValueError):
+        return True
+    if not inside:
+        # Determinate escape (e.g. ``../../etc/passwd``) → NOT reachable as a
+        # repo file → an orphan the caller may delete.
+        return False
+    try:
+        return candidate.exists()
+    except (OSError, ValueError):
+        # exists() itself raised → indeterminate → keep (do NOT delete).
+        return True
+
+
+def _delete_file_rows_exact(
+    coll,
+    path_prop: str,
+    match_fn,
+    *,
+    project: str = "",
+    project_source: str = "",
+    extra_props: "Optional[List[str]]" = None,
+    log_prefix: str = "",
+) -> "Tuple[int, int]":
+    """SAFE per-row delete: iterate ``coll``, read the raw ``path_prop`` (plus
+    ``project`` / ``project_source`` when scoping, plus any ``extra_props``) back
+    for EVERY row, test the raw values in PYTHON via ``match_fn``, and
+    ``delete_by_id`` ONLY confirmed matches. Returns ``(deleted, failures)``.
+
+    This is the ONE home for the tokenization-safe delete (see the module
+    banner above). It NEVER hands ``path_prop`` to a Weaviate Like/Equal
+    filter — those match on word tokens and can over-delete siblings.
+
+    Args:
+        coll: the Weaviate collection handle.
+        path_prop: ``"path"`` (CodeModule) or ``"file_path"`` (Function/Class).
+        match_fn: ``(raw_path: str, props: dict) -> bool`` — return True when
+            the row is confirmed for deletion. Called with the raw property
+            value already read back (never a tokenized filter result). ``props``
+            carries ``path_prop`` + whatever scope / ``extra_props`` the class
+            actually has.
+        project / project_source: when non-empty, a row is deleted ONLY if its
+            stored ``project`` / ``project_source`` matches EXACTLY (Python
+            ``==``) — scoping compared in Python for the same tokenization
+            reason. Empty means "do not scope on that field".
+        extra_props: additional property names the predicate needs (e.g.
+            ``embed_revision`` for the orphan-clear's stale check). Only those
+            the class actually has are requested; the predicate must tolerate a
+            missing key.
+        log_prefix: short label for the per-row failure log line.
+
+    Soft-fail per row: a single ``delete_by_id`` error logs + continues so a
+    transient failure can't wedge the caller, but the failure COUNT is
+    propagated so the caller can flip success→partial and defer the version
+    advance / re-attempt next run.
+    """
+    # Defense-in-depth: a class missing the path property would 500 the
+    # iterator. Confirm the prop exists first; skip cleanly if not.
+    read_props = [path_prop]
+    if project:
+        read_props.append("project")
+    if project_source:
+        read_props.append("project_source")
+    for ep in (extra_props or []):
+        if ep not in read_props:
+            read_props.append(ep)
+    try:
+        cfg = coll.config.get()
+        present = {p.name for p in cfg.properties}
+        if path_prop not in present:
+            return 0, 0
+        # Only request props the class actually has (avoid a 500 on a variant
+        # class); still compare in Python on whatever came back.
+        read_props = [p for p in read_props if p in present] or [path_prop]
+    except Exception:  # noqa: BLE001 — config probe is best-effort; fall through
+        pass
+
+    to_delete = []
+    for obj in coll.iterator(return_properties=read_props):
+        props = (getattr(obj, "properties", None) or {})
+        raw = props.get(path_prop) or ""
+        if project and (props.get("project") or "") != project:
+            continue
+        if project_source and (props.get("project_source") or "") != project_source:
+            continue
+        try:
+            if match_fn(raw, props):
+                to_delete.append(obj.uuid)
+        except Exception:  # noqa: BLE001 — a predicate error must never delete
+            continue
+
+    deleted = 0
+    failures = 0
+    for uid in to_delete:
+        try:
+            coll.data.delete_by_id(uuid=str(uid))
+            deleted += 1
+        except Exception as exc:  # noqa: BLE001 — never wedge on one row
+            failures += 1
+            print(
+                f"⚠️  {log_prefix or 'delete'}: delete_by_id failed for {uid} in "
+                f"{getattr(coll, 'name', '?')}: {exc}",
+                file=sys.stderr,
+            )
+    return deleted, failures
+
+
+# ---------------------------------------------------------------------------
 # v0.2.18 (Plan C): canonical language identifier helpers.
 #
 # Pre-Plan-C the analyzer used display strings ("Python", "C++", "C#", ...) for
@@ -4167,17 +4323,40 @@ class CodeGraphAnalyzer:
         if not full_name or min_chunk_num < 1:
             return
         try:
-            flt = Filter.by_property("full_name").equal(full_name)
-            flt = flt & Filter.by_property("chunk_num").greater_or_equal(
-                int(min_chunk_num)
+            # v0.2.74: `full_name` (and `file_path`) are word-tokenized TEXT, so
+            # a `Filter.by_property("full_name").equal(...)` + `delete_many`
+            # could OVER-DELETE a DIFFERENT entity whose tokens match. Route
+            # through the exact-compare-in-Python + delete_by_id safe helper
+            # (same home as the orphan-clear + deleted-file prune). Key on
+            # `full_name` exactly, keep tail rows only (`chunk_num >= min`), and
+            # scope by file_path (via extra_props, exact) + project/source.
+            _target = full_name
+            _min = int(min_chunk_num)
+            _fp = file_path_rel or ""
+
+            def _is_stale_tail(raw_full_name: str, props: dict) -> bool:
+                if raw_full_name != _target:
+                    return False
+                # file_path scoping (exact) when known — belongs to THIS entity.
+                if _fp and (props.get("file_path") or "") != _fp:
+                    return False
+                try:
+                    return int(props.get("chunk_num")) >= _min
+                except (TypeError, ValueError):
+                    return False  # NULL/non-int chunk_num → never a tail row
+
+            _extra = ["chunk_num"]
+            if _fp:
+                _extra.append("file_path")
+            _delete_file_rows_exact(
+                collection,
+                "full_name",
+                _is_stale_tail,
+                project=self.project_name or "",
+                project_source=current_source or "",
+                extra_props=_extra,
+                log_prefix="stale-chunk cleanup",
             )
-            if file_path_rel:
-                flt = flt & Filter.by_property("file_path").equal(file_path_rel)
-            if self.project_name:
-                flt = flt & Filter.by_property("project").equal(self.project_name)
-            if current_source:
-                flt = flt & Filter.by_property("project_source").equal(current_source)
-            collection.data.delete_many(where=flt)
         except Exception as exc:  # noqa: BLE001 — cleanup must never fail a write
             print(
                 f"⚠️  stale-chunk cleanup failed for {full_name} "
@@ -5264,6 +5443,17 @@ class CodeGraphAnalyzer:
 
         if not repo_path.exists():
             raise ValueError(f"Repository path does not exist: {repo_path}")
+
+        # v0.2.74 (D1 orphan-clear): record the resolved repo root so the
+        # per-run stale-file probe (`_build_stale_file_set`) can test whether a
+        # stale row's stored path still exists on disk and delete genuine
+        # orphans (deleted-file rows) instead of pinning their path in the
+        # stale set forever (the C-1 convergence gap). Set on EVERY analyze
+        # entry (whole-tree, single-file, only-files-from) so the gate always
+        # has the relativization root. Stub/older callers that reach
+        # `_get_existing_module` without going through here leave this unset →
+        # the orphan-clear fails open (skips, never deletes on uncertainty).
+        self._analyze_repo_root = repo_path.resolve()
 
         # v0.2.47 (extras): validate + canonicalise extras up-front so
         # downstream loops can assume each entry is an existing absolute
@@ -7741,9 +7931,33 @@ class CodeGraphAnalyzer:
         with stale rows (or an undeterminable count) pay one full scan
         returning two tiny properties per row, classified client-side
         (NULL-safe; Weaviate's cursor iterator cannot combine with filters).
-        Orphan rows of DELETED files keep their path in the set harmlessly
-        (no walker consults the gate for a nonexistent file); the resync's
-        ``--prune-stale`` pass removes them so the pre-check can reach 0.
+
+        Orphan-clear (v0.2.74 / D1 — the real convergence fix): a stale row
+        whose stored path was DELETED from disk (an orphan) used to keep its
+        (nonexistent) path in the stale set forever. Nothing re-walks a file
+        that no longer exists, so its row stayed stale, and the resync's
+        owed-probe never reached 0 → every ``--update`` re-triggered a
+        whole-repo resync (the "not converged" loop). C-1 (cd6c536d, v0.2.73)
+        REMOVED the ``--prune-stale`` pass that used to clear these — so
+        nothing cleared orphan rows on a normal ``--update`` any more. This
+        method now closes that gap directly: for each stale row it tests
+        whether the stored path still resolves on disk INSIDE the repo root
+        (:func:`_path_reachable_on_disk`); a REACHABLE stale row keeps its path
+        in the set (a real file that must re-walk to re-embed), and an ORPHAN
+        (genuinely absent-on-disk) stale row is DELETED via the ONE safe
+        primitive :func:`_delete_file_rows_exact` (exact-Python-compare +
+        ``delete_by_id`` — NEVER a tokenized Like/Equal DELETE). Only reachable
+        stale rows survive → the owed-probe converges. Do NOT re-add a
+        ``--prune-stale`` pass here (C-1 deleted it deliberately; a selective
+        revision-gated resync hash-skips converged files, so ``--prune-stale``
+        from that context would delete the majority of an already-good graph).
+
+        Fail-open on the repo root: the orphan-clear needs the resolved repo
+        root (``self._analyze_repo_root``, set at the top of
+        ``analyze_repository``). When it is absent (a stub analyzer / an older
+        caller that reached the gate without going through ``analyze_repository``)
+        the orphan-clear is SKIPPED entirely — the pre-fix add-to-set behaviour
+        is preserved and NOTHING is deleted on uncertainty.
 
         Returns ``None`` when NO collection could be probed (gate then falls
         back to pre-R-1 behaviour — fail-open toward the M0 module-row
@@ -7754,8 +7968,12 @@ class CodeGraphAnalyzer:
             (getattr(self, "classes_collection", None), "file_path"),
             (getattr(self, "functions_collection", None), "file_path"),
         )
+        # v0.2.74 (D1): the resolved repo root. None → fail open (no delete).
+        repo_root = getattr(self, "_analyze_repo_root", None)
         stale: Set[str] = set()
         determinable = False
+        orphans_cleared = 0
+        orphan_failures = 0
         for coll, path_prop in probes:
             if coll is None:
                 continue
@@ -7787,6 +8005,69 @@ class CodeGraphAnalyzer:
                     f"{getattr(coll, 'name', '?')}: {exc}",
                     file=sys.stderr,
                 )
+                # Probe of THIS collection failed → do NOT orphan-clear it
+                # (an incomplete scan must never authorise deletes).
+                continue
+
+            # v0.2.74 (D1) orphan-clear: only when this collection had stale
+            # rows AND we have a resolved repo root to test existence against.
+            # A stale row whose stored path is genuinely absent-on-disk (or
+            # escapes the repo root) is an orphan → delete it via the ONE safe
+            # primitive; reachable stale rows are left for the re-walk. The
+            # predicate re-reads the raw path per row inside the helper, so the
+            # DELETE decision is made on the value the helper itself read back
+            # (never on a tokenized filter).
+            if repo_root is None:
+                continue  # fail open — never delete when the root is unknown
+
+            def _is_orphan(raw_path, _props):
+                # Delete ONLY when the row is BOTH stale AND unreachable. The
+                # helper hands us every row's raw path; re-derive staleness
+                # here so we never delete a CURRENT-revision row.
+                rev_v = _props.get(_EMBED_REVISION_PROP)
+                try:
+                    row_current = (
+                        rev_v is not None
+                        and int(rev_v) == CODEGRAPH_EMBED_REVISION
+                    )
+                except (TypeError, ValueError):
+                    row_current = False
+                if row_current:
+                    return False  # never touch converged rows
+                if not raw_path:
+                    return False  # no path → cannot prove orphan → keep
+                return not _path_reachable_on_disk(str(raw_path), repo_root)
+
+            try:
+                deleted, failures = _delete_file_rows_exact(
+                    coll,
+                    path_prop,
+                    _is_orphan,
+                    extra_props=[_EMBED_REVISION_PROP],
+                    log_prefix="orphan-clear",
+                )
+                orphans_cleared += deleted
+                orphan_failures += failures
+                # Any path we just deleted must NOT remain in the stale set
+                # (the set was built in the same run from the pre-delete scan;
+                # a re-walk would look for a file that no longer exists). Drop
+                # every stale path that is now unreachable-on-disk.
+                if deleted:
+                    stale = {
+                        fp for fp in stale
+                        if _path_reachable_on_disk(fp, repo_root)
+                    }
+            except Exception as exc:  # noqa: BLE001 — orphan-clear soft-fails
+                print(
+                    f"⚠️  orphan-clear failed on "
+                    f"{getattr(coll, 'name', '?')}: {exc}",
+                    file=sys.stderr,
+                )
+        if orphans_cleared or orphan_failures:
+            print(
+                f"   🧹 cleared {orphans_cleared} orphan (deleted-file) "
+                f"row(s){f'; {orphan_failures} delete(s) failed' if orphan_failures else ''}"
+            )
         if not determinable:
             return None
         return frozenset(stale)
@@ -7878,14 +8159,27 @@ class CodeGraphAnalyzer:
         and a later full ``--prune-stale`` reanalyze reconciles the rest —
         never over-delete on a best-effort per-file prune).
 
-        Returns the number of delete passes that ran (informational). Soft-fail
-        by contract: any delete error logs and continues — a cleanup failure
-        must never wedge the drain (the orphan rows are the pre-fix status quo,
-        not a regression).
+        v0.2.74 (over-delete fix): pre-fix this used
+        ``Filter.by_property(path_prop).equal(rel_path)`` +
+        ``delete_many`` — but ``file_path`` / ``path`` are word-tokenized TEXT,
+        so an ``.equal`` (and a ``project`` / ``project_source`` ``.equal``)
+        matches on TOKEN SETS, not the exact string: a sibling file whose path
+        shares the same word tokens could be swept. Now routes through the ONE
+        safe primitive :func:`_delete_file_rows_exact` — read every row's raw
+        ``path_prop`` (+ project / project_source) back and compare in Python
+        (exact ``==``), ``delete_by_id`` only the confirmed matches. No
+        tokenized Like/Equal DELETE.
+
+        Returns the number of rows deleted (v0.2.74: was "delete passes that
+        ran"; now the true row count). Soft-fail by contract: any delete error
+        logs and continues — a cleanup failure must never wedge the drain (the
+        orphan rows are the pre-fix status quo, not a regression). Per-row
+        delete failures accumulate into ``self._prune_failures`` (same signal
+        the ``--prune-stale`` pass uses to flip success→partial).
         """
         if not rel_path:
             return 0
-        deletes = 0
+        deleted_total = 0
         # (collection attr, file-path property name) for the file-anchored
         # collections. Module uses `path`; Function/Class use `file_path`.
         targets = [
@@ -7893,28 +8187,36 @@ class CodeGraphAnalyzer:
             (getattr(self, "functions_collection", None), "file_path"),
             (getattr(self, "classes_collection", None), "file_path"),
         ]
+        # Exact-string predicate on the RAW stored path — never a token filter.
+        def _is_this_file(raw_path, _props):
+            return raw_path == rel_path
+
         for coll, path_prop in targets:
             if coll is None:
                 continue
             try:
-                flt = Filter.by_property(path_prop).equal(rel_path)
-                if self.project_name:
-                    flt = flt & Filter.by_property("project").equal(self.project_name)
-                if canonical_source:
-                    flt = flt & Filter.by_property("project_source").equal(
-                        canonical_source
-                    )
-                coll.data.delete_many(where=flt)
-                deletes += 1
+                deleted, failures = _delete_file_rows_exact(
+                    coll,
+                    path_prop,
+                    _is_this_file,
+                    project=self.project_name or "",
+                    project_source=canonical_source or "",
+                    log_prefix="deleted-file prune",
+                )
+                deleted_total += deleted
+                if failures:
+                    # Propagate the count so the drain can surface a partial
+                    # (mirrors the --prune-stale failure accounting).
+                    self._prune_failures = getattr(self, "_prune_failures", 0) + failures
             except Exception as exc:  # noqa: BLE001 — prune must never wedge drain
                 print(
                     f"⚠️  deleted-file prune failed for {rel_path} in "
                     f"{getattr(coll, 'name', '?')}: {exc}",
                     file=sys.stderr,
                 )
-        if deletes:
-            print(f"   🗑️  pruned objects for deleted file {rel_path}")
-        return deletes
+        if deleted_total:
+            print(f"   🗑️  pruned {deleted_total} object(s) for deleted file {rel_path}")
+        return deleted_total
 
     def _get_existing_module(self, path: str, file_hash: str) -> Optional[str]:
         """Check if module already exists with same hash AT THE CURRENT

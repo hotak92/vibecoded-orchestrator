@@ -633,7 +633,11 @@ class _F3Data:
     def __init__(self):
         self.replace_calls = []
         self.insert_calls = []
-        self.delete_many_calls = []
+        # v0.2.74: _delete_stale_chunk_rows now routes through the
+        # tokenization-safe iterator + delete_by_id helper (full_name is
+        # word-tokenized TEXT, so the old Filter.equal + delete_many could
+        # over-delete a token-sharing sibling). Record delete_by_id calls.
+        self.delete_by_id_calls = []
 
     def replace(self, uuid, **kw):
         self.replace_calls.append({"uuid": str(uuid), **kw})
@@ -641,23 +645,39 @@ class _F3Data:
     def insert(self, uuid, **kw):
         self.insert_calls.append({"uuid": str(uuid), **kw})
 
-    def delete_many(self, where=None):
-        self.delete_many_calls.append(where)
+    def delete_by_id(self, uuid):
+        self.delete_by_id_calls.append(str(uuid))
 
 
 class _F3Coll:
-    def __init__(self, name, existing_props=None):
+    def __init__(self, name, existing_props=None, rows=None, props_present=None):
         self.name = name
         self.data = _F3Data()
         self._existing = existing_props
+        # v0.2.74: rows the safe-delete helper iterates (each a dict of props,
+        # keyed with a synthetic uuid). Default: none (empty scan).
+        self._rows = list(rows or [])
+        # Property names the class "has" (for the helper's config probe).
+        _default_props = {"full_name", "file_path", "chunk_num", "project",
+                          "project_source", "path", "content_hash"}
+        self._props_present = set(props_present) if props_present is not None else _default_props
         self.fetch_kwargs = []
         self.query = types.SimpleNamespace(fetch_object_by_id=self._fetch)
+        self.config = types.SimpleNamespace(get=self._config_get)
 
     def _fetch(self, uuid, return_properties=None):
         self.fetch_kwargs.append(return_properties)
         if self._existing is None:
             return None
         return types.SimpleNamespace(properties=self._existing)
+
+    def _config_get(self):
+        props = [types.SimpleNamespace(name=n) for n in self._props_present]
+        return types.SimpleNamespace(properties=props)
+
+    def iterator(self, return_properties=None):
+        for i, row in enumerate(self._rows):
+            yield types.SimpleNamespace(uuid=f"row-{i}", properties=dict(row))
 
 
 def _bare_analyzer(analyzer_mod, project="TProj"):
@@ -748,17 +768,38 @@ def test_f3_module_write_does_not_request_total_chunks(analyzer_mod):
 
 def test_f3_delete_helper_scopes_and_soft_fails(analyzer_mod):
     analyzer = _bare_analyzer(analyzer_mod)
-    coll = _F3Coll("TProj_CodeFunction")
+    # Tail rows of THIS entity (chunk_num >= 1) that must be deleted, plus a
+    # token-sharing SIBLING that must SURVIVE (v0.2.74 over-delete guard:
+    # full_name is word-tokenized, so an exact-string compare is required).
+    # Rows carry project="TProj" (matches _bare_analyzer's project_name) so the
+    # Python-side project scoping keeps them in candidacy.
+    _P = "TProj"
+    rows = [
+        {"full_name": "mod.f", "file_path": "src/m.py", "chunk_num": 1, "project": _P},   # tail → delete
+        {"full_name": "mod.f", "file_path": "src/m.py", "chunk_num": 2, "project": _P},   # tail → delete
+        {"full_name": "mod.f", "file_path": "src/m.py", "chunk_num": 0, "project": _P},   # canonical → keep
+        {"full_name": "f.mod", "file_path": "src/m.py", "chunk_num": 2, "project": _P},   # token-sharing sibling → KEEP
+        {"full_name": "mod.f", "file_path": "other.py", "chunk_num": 2, "project": _P},   # different file → KEEP
+    ]
+    coll = _F3Coll("TProj_CodeFunction", rows=rows)
     analyzer._delete_stale_chunk_rows(coll, "mod.f", "src/m.py", "", 1)
-    assert len(coll.data.delete_many_calls) == 1
-    assert coll.data.delete_many_calls[0] is not None, "a scoped filter must be passed"
-    # Guards: empty name / zero min → no delete.
-    analyzer._delete_stale_chunk_rows(coll, "", "src/m.py", "", 1)
-    analyzer._delete_stale_chunk_rows(coll, "mod.f", "src/m.py", "", 0)
-    assert len(coll.data.delete_many_calls) == 1
-    # Soft-fail: delete error never raises.
-    coll.data.delete_many = lambda where=None: (_ for _ in ()).throw(RuntimeError("boom"))
-    analyzer._delete_stale_chunk_rows(coll, "mod.f", "src/m.py", "", 1)
+    # Only the two exact tail rows (row-0, row-1) delete; canonical + sibling +
+    # different-file survive (exact-compare, NOT tokenized).
+    assert coll.data.delete_by_id_calls == ["row-0", "row-1"], (
+        f"over-delete: expected only the exact tail rows, got "
+        f"{coll.data.delete_by_id_calls}"
+    )
+
+    # Guards: empty name / zero min → no delete at all.
+    coll2 = _F3Coll("TProj_CodeFunction", rows=rows)
+    analyzer._delete_stale_chunk_rows(coll2, "", "src/m.py", "", 1)
+    analyzer._delete_stale_chunk_rows(coll2, "mod.f", "src/m.py", "", 0)
+    assert coll2.data.delete_by_id_calls == [], "empty name / min 0 → no delete"
+
+    # Soft-fail: a delete_by_id error never raises out of the cleanup.
+    coll3 = _F3Coll("TProj_CodeFunction", rows=rows)
+    coll3.data.delete_by_id = lambda uuid: (_ for _ in ()).throw(RuntimeError("boom"))
+    analyzer._delete_stale_chunk_rows(coll3, "mod.f", "src/m.py", "", 1)  # must not raise
 
 
 # ---------------------------------------------------------------------------

@@ -99,6 +99,86 @@ _EMBED_REVISION_RE = re.compile(
 # warning).
 _RESYNC_PROBE_BASES: tuple = ("CodeModule", "CodeClass", "CodeFunction")
 
+# Per-base source-path property. MUST MATCH the analyzer's storage shape
+# (CodeModule keys on `path`; Function/Class on `file_path`) — the same map the
+# analyzer's `_build_stale_file_set` probe uses. Used by the R3 reachability
+# filter to read each stale row's stored path.
+_PROBE_PATH_PROP: dict = {
+    "CodeModule": "path",
+    "CodeClass": "file_path",
+    "CodeFunction": "file_path",
+}
+
+
+def _path_reachable_on_disk(rel_or_abs_path: str, repo_root: Path) -> bool:
+    """True when ``rel_or_abs_path`` resolves to a real on-disk file INSIDE
+    ``repo_root``.
+
+    R3 (v0.2.74): mirrors
+    ``templates/scripts/analyze_code_graph.py::_path_reachable_on_disk`` (and
+    ``install.py::_path_resolves_on_disk`` safety) — the owed-probe must count
+    a stale row as REACHABLE on exactly the same rule the analyzer's
+    orphan-clear uses to KEEP it, so the two can't disagree about convergence.
+    (Keep the two in lock-step; do not diverge the containment/fail-safe rule.)
+
+    A stored code-graph path is repo-relative POSIX. It is REACHABLE iff
+    ``(repo_root / rel).exists()`` AND the resolved path lies inside
+    ``repo_root`` (a ``../../etc/passwd`` escape resolves outside → NOT
+    reachable → an orphan the analyzer's orphan-clear would delete → excluded
+    from the reachable count).
+
+    Fail-SAFE toward COUNTING AS REACHABLE (do not let an indeterminate probe
+    make the owed state look converged when it may not be): an empty path or
+    ANY OS/value error while probing returns ``True``. A wrong "reachable"
+    over-counts stale rows → the probe reports MORE owed work → conservative
+    (never a wrong "converged" skip); a wrong "orphan" would UNDER-count and
+    could falsely converge, so uncertainty always resolves to reachable.
+    """
+    if not rel_or_abs_path:
+        return True
+    try:
+        root_resolved = repo_root.resolve()
+    except (OSError, ValueError):
+        return True
+    try:
+        candidate = (root_resolved / rel_or_abs_path).resolve()
+    except (OSError, ValueError):
+        return True
+    try:
+        if not candidate.is_relative_to(root_resolved):
+            return False  # determinate escape → not a repo file → orphan
+    except (OSError, ValueError):
+        return True
+    try:
+        return candidate.exists()
+    except (OSError, ValueError):
+        return True
+
+
+def _make_reachability_filter(repo_root: Optional[Path]):
+    """Return a memoized ``(rel_path: str) -> bool`` reachability predicate, or
+    ``None`` when ``repo_root`` is not provided (R3 disabled → count all stale).
+
+    The on-disk result for each distinct path is cached for the whole probe run
+    (the Function collection repeats one ``file_path`` across every function in
+    a file — one syscall per unique path, not per row). This is the "on-disk
+    file set cached once per run" the R3 bound calls for; membership is resolved
+    lazily via per-path existence checks so we never pay a full-tree walk.
+    """
+    if repo_root is None:
+        return None
+    cache: dict = {}
+
+    def _reachable(rel_path: str) -> bool:
+        key = rel_path or ""
+        hit = cache.get(key)
+        if hit is None:
+            hit = _path_reachable_on_disk(key, repo_root)
+            cache[key] = hit
+        return hit
+
+    return _reachable
+
 
 def _resolve_embed_revision(analyzer_path: Optional[Path]) -> int:
     """Parse ``CODEGRAPH_EMBED_REVISION`` out of the analyzer source.
@@ -320,22 +400,43 @@ def prune_ignored_rows(
                 pass
 
 
-def _count_stale_in_collection(coll, current_revision: int) -> Optional[int]:
+def _count_stale_in_collection(
+    coll,
+    current_revision: int,
+    *,
+    path_prop: str = "file_path",
+    reachable_fn=None,
+) -> Optional[int]:
     """Count rows NOT at ``current_revision`` in one collection.
 
-    Two tiers:
+    R3 (v0.2.74): when ``reachable_fn`` is provided, count only REACHABLE stale
+    rows — a stale row whose stored path is gone from disk (an orphan) is NOT
+    owed a re-walk (nothing re-walks a deleted file), so counting it would keep
+    the owed state permanently non-zero → every ``--update`` re-triggers a
+    whole-repo resync (the "not converged" loop). The analyzer's D1 orphan-clear
+    deletes those rows; this filter stops counting them so the two agree.
+
+    Bounded cost: the cheap filtered aggregate is ALWAYS the first gate. When it
+    returns 0, we return 0 IMMEDIATELY — no per-row scan (the converged
+    steady-state cost is one aggregate). The slow per-row reachability scan is
+    paid ONLY when the aggregate says "stale > 0" (there is genuine work to
+    classify). Without a ``reachable_fn`` the aggregate count is returned as-is
+    (pre-R3 behaviour: all stale rows, orphans included).
+
+    Tiers:
       1. Filtered aggregate ``embed_revision != rev OR embed_revision IS
          NULL`` — cheap. The IsNull leg is load-bearing: Weaviate comparisons
          ignore NULLs and pre-migration rows are exactly the NULL ones (a
          ``min()``/``not_equal``-only probe reports "converged" over a
          half-migrated collection — C-3 warning).
-      2. Full scan returning only ``embed_revision``, classified client-side
-         (NULL-safe) — covers collections created without
-         ``index_null_state=True`` where the IsNull filter errors.
+      2. Full scan classified client-side (NULL-safe) — covers collections
+         created without ``index_null_state=True`` where the IsNull filter
+         errors, AND is where the R3 reachability filter is applied.
 
     Returns ``None`` when neither tier could run (undeterminable — the caller
     must NOT treat that as zero).
     """
+    agg_total: Optional[int] = None
     try:
         from weaviate.classes.query import Filter
 
@@ -346,24 +447,54 @@ def _count_stale_in_collection(coll, current_revision: int) -> Optional[int]:
         agg = coll.aggregate.over_all(filters=flt, total_count=True)
         total = getattr(agg, "total_count", None)
         if total is not None:
-            return int(total)
+            agg_total = int(total)
     except Exception:  # noqa: BLE001 — fall to the NULL-safe scan
-        pass
+        agg_total = None
+
+    if agg_total is not None:
+        # Aggregate is authoritative for "is there ANY stale row?". Zero → done,
+        # NO per-row scan (the R3 bound: cheap converged steady state).
+        if agg_total == 0:
+            return 0
+        if reachable_fn is None:
+            # Pre-R3: return the aggregate (all stale rows, orphans included).
+            return agg_total
+        # R3: aggregate > 0 → pay the per-row scan to count only reachable
+        # stale rows (fall through to the scan below).
+
+    # Full NULL-safe scan. Reads embed_revision (+ the path property when R3
+    # reachability filtering is on) and classifies each row client-side.
+    read_props = ["embed_revision"]
+    if reachable_fn is not None and path_prop not in read_props:
+        read_props.append(path_prop)
     try:
         stale = 0
-        for obj in coll.iterator(return_properties=["embed_revision"]):
-            rev = (getattr(obj, "properties", None) or {}).get("embed_revision")
+        for obj in coll.iterator(return_properties=read_props):
+            props = getattr(obj, "properties", None) or {}
+            rev = props.get("embed_revision")
             try:
-                if rev is None or int(rev) != int(current_revision):
-                    stale += 1
+                is_stale = rev is None or int(rev) != int(current_revision)
             except (TypeError, ValueError):
-                stale += 1
+                is_stale = True
+            if not is_stale:
+                continue
+            if reachable_fn is not None:
+                fp = props.get(path_prop) or ""
+                # Orphan (deleted-file) stale rows are NOT owed a re-walk →
+                # excluded from the count so the owed-probe can converge.
+                if not reachable_fn(str(fp)):
+                    continue
+            stale += 1
         return stale
     except Exception as exc:  # noqa: BLE001 — undeterminable
         logger.warning(
             "codegraph resync: stale count failed on %s: %s",
             getattr(coll, "name", "?"), exc,
         )
+        # If the aggregate DID give a positive count but the R3 scan failed, we
+        # cannot safely subtract orphans — return None (undeterminable) rather
+        # than a possibly-wrong number. The caller treats None conservatively
+        # (never a wrong "converged").
         return None
 
 
@@ -372,6 +503,7 @@ def count_stale_rows(
     *,
     current_revision: Optional[int] = None,
     analyzer_path: Optional[Path] = None,
+    repo_root: Optional[Path] = None,
     client=None,
     weaviate_url: Optional[str] = None,
     grpc_port: Optional[int] = None,
@@ -382,6 +514,18 @@ def count_stale_rows(
     a re-walk can actually converge — MUST MATCH the analyzer's
     ``_build_stale_file_set`` scope) for rows whose ``embed_revision`` is
     NULL or differs from the current revision.
+
+    R3 (v0.2.74): when ``repo_root`` is provided, count only REACHABLE stale
+    rows — a stale row whose stored path was deleted from disk (an orphan) is
+    excluded, because nothing re-walks a deleted file so it can never converge.
+    Counting orphans kept the owed state non-zero forever → every ``--update``
+    re-triggered a whole-repo resync (the "not converged" loop). The analyzer's
+    D1 orphan-clear deletes those rows; this filter stops counting them so the
+    owed-probe reaches 0. Bounded: per-collection the cheap aggregate gates the
+    scan (aggregate 0 → return 0 with NO per-row scan). ``repo_root`` absent →
+    pre-R3 behaviour (count all stale, orphans included — conservative: never a
+    wrong "converged", just an occasional un-clearable owed loop on a shrunk
+    repo, which is the pre-fix status quo).
 
     Returns ``{collection_name: stale_count}`` (absent collections count 0),
     or ``None`` when the answer is undeterminable (Weaviate down, prefix
@@ -396,6 +540,11 @@ def count_stale_rows(
     prefix = _collection_prefix(project_name)
     if prefix is None:
         return None
+
+    # R3: build the memoized on-disk reachability predicate ONCE for the whole
+    # probe run (shared across the 3 collections; one syscall per unique path).
+    # None when repo_root is not supplied → R3 disabled, count all stale.
+    reachable_fn = _make_reachability_filter(repo_root)
 
     own_client = False
     if client is None:
@@ -418,7 +567,12 @@ def count_stale_rows(
                     "codegraph resync: cannot open %s: %s", coll_name, exc
                 )
                 return None
-            n = _count_stale_in_collection(coll, current_revision)
+            n = _count_stale_in_collection(
+                coll,
+                current_revision,
+                path_prop=_PROBE_PATH_PROP.get(base, "file_path"),
+                reachable_fn=reachable_fn,
+            )
             if n is None:
                 return None
             counts[coll_name] = n
@@ -937,7 +1091,11 @@ def run_resync_and_verify(
         rc = -1
 
     try:
-        counts = count_stale_rows(project_name, analyzer_path=Path(analyzer_path))
+        counts = count_stale_rows(
+            project_name,
+            analyzer_path=Path(analyzer_path),
+            repo_root=Path(repo_root),  # R3: exclude orphan (deleted-file) rows
+        )
     except Exception as exc:  # noqa: BLE001
         print(f"[resync-driver] post-walk probe raised: {exc}", flush=True)
         counts = None
@@ -1024,7 +1182,11 @@ def spawn_background_resync(
     # (conservative default: never skip on uncertainty).
     if check_owed:
         try:
-            stale_counts = count_stale_rows(project_name, analyzer_path=analyzer)
+            stale_counts = count_stale_rows(
+                project_name,
+                analyzer_path=analyzer,
+                repo_root=repo_root,  # R3: exclude orphan (deleted-file) rows
+            )
         except Exception as exc:  # noqa: BLE001 — probe must never block
             logger.warning("codegraph resync: owed-probe raised: %s", exc)
             stale_counts = None

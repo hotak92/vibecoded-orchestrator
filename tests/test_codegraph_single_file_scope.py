@@ -420,31 +420,82 @@ def test_analyze_only_files_from_prunes_deleted_path(
 ) -> None:
     """A path in the batch that vanished from disk (edited-then-deleted in the
     turn) is PRUNED (its objects deleted), not skipped/errored — no
-    self-inflicted orphan."""
+    self-inflicted orphan.
+
+    v0.2.74: the prune now uses the tokenization-SAFE path (iterate + exact
+    Python compare + ``delete_by_id``), NOT ``delete_many`` with a
+    word-tokenized ``file_path`` filter. The fake seeds the deleted file's row
+    AND a sibling row sharing word tokens to prove only the exact orphan row is
+    deleted (over-delete guard)."""
     _stub_embeddings(analyzer_mod, monkeypatch)
+
+    class _Obj:
+        def __init__(self, uuid: str, path_prop: str, path_value: str) -> None:
+            self.uuid = uuid
+            self.properties = {
+                path_prop: path_value,
+                "project": "Bug3Project",
+                "project_source": "",
+            }
+
+    class _Prop:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    class _Cfg:
+        def __init__(self, names) -> None:
+            self.properties = [_Prop(n) for n in names]
+
+    class _CfgHolder:
+        def __init__(self, names) -> None:
+            self._c = _Cfg(names)
+
+        def get(self):
+            return self._c
 
     class _FakeDataWithDelete(_FakeCollectionData):
         def __init__(self) -> None:
             super().__init__()
-            self.delete_many_calls: List[Any] = []
+            self.deleted_ids: List[str] = []
 
-        def delete_many(self, where: Any = None) -> None:
-            self.delete_many_calls.append(where)
+        def delete_by_id(self, uuid: str) -> None:  # safe per-row delete
+            self.deleted_ids.append(str(uuid))
 
     class _FakeCollWithDelete(_FakeCollection):
-        def __init__(self, name: str) -> None:
+        def __init__(self, name: str, path_prop: str, rows) -> None:
             self.name = name
             self.data = _FakeDataWithDelete()
+            self._rows = rows
+            self.config = _CfgHolder((path_prop, "project", "project_source"))
+
+        def iterator(self, return_properties=None):
+            return iter(self._rows)
 
     analyzer = _wire_full_flow_analyzer(analyzer_mod)
-    # Swap in delete-capable fakes for the file-anchored collections.
-    analyzer.modules_collection = _FakeCollWithDelete(f"{analyzer.project_name}_CodeModule")
-    analyzer.functions_collection = _FakeCollWithDelete(f"{analyzer.project_name}_CodeFunction")
-    analyzer.classes_collection = _FakeCollWithDelete(f"{analyzer.project_name}_CodeClass")
+    proj = analyzer.project_name
+    # Seed each file-anchored collection: one row for the DELETED file (gone.py)
+    # + a sibling row that shares word tokens but must survive.
+    analyzer.modules_collection = _FakeCollWithDelete(
+        f"{proj}_CodeModule", "path",
+        [_Obj("mod-gone", "path", "gone.py"),
+         _Obj("mod-keep", "path", "gone_helper.py")],
+    )
+    analyzer.functions_collection = _FakeCollWithDelete(
+        f"{proj}_CodeFunction", "file_path",
+        [_Obj("fn-gone", "file_path", "gone.py"),
+         _Obj("fn-keep", "file_path", "present.py")],
+    )
+    analyzer.classes_collection = _FakeCollWithDelete(
+        f"{proj}_CodeClass", "file_path", [],
+    )
 
     repo = tmp_path
     (repo / "present.py").write_text("def present():\n    return 1\n")
-    missing = repo / "gone.py"  # never created
+    # `gone_helper.py` EXISTS on disk so it is reachable (not an orphan) — this
+    # isolates the assertion to the `_prune_deleted_file_objects` exact-match on
+    # `gone.py`, proving the token-sharing sibling survives the prune.
+    (repo / "gone_helper.py").write_text("def helper():\n    return 2\n")
+    missing = repo / "gone.py"  # never created — the deleted-file target
 
     list_file = repo / "batch.txt"
     list_file.write_text(f"{repo / 'present.py'}\n{missing}\n")
@@ -453,16 +504,21 @@ def test_analyze_only_files_from_prunes_deleted_path(
         repo, only_files_from=list_file
     )
 
-    # The present file analyzed; the missing one triggered a prune (delete_many)
-    # rather than an error.
+    # The present file analyzed; the missing one triggered a prune via the safe
+    # delete_by_id path (NOT delete_many), and ONLY the exact orphan row(s).
+    # `gone_helper.py` (real file, shares tokens with gone.py) must survive.
     assert stats["files_analyzed"] == 1, "only the present file is analyzed"
-    total_deletes = (
-        len(analyzer.modules_collection.data.delete_many_calls)
-        + len(analyzer.functions_collection.data.delete_many_calls)
-        + len(analyzer.classes_collection.data.delete_many_calls)
+    assert "mod-gone" in analyzer.modules_collection.data.deleted_ids, (
+        "the exact gone.py module row is deleted"
     )
-    assert total_deletes >= 1, (
-        "the deleted file must trigger a prune (delete_many), not a silent skip"
+    assert "mod-keep" not in analyzer.modules_collection.data.deleted_ids, (
+        "the token-sharing on-disk sibling gone_helper.py must NOT be deleted"
+    )
+    assert "fn-gone" in analyzer.functions_collection.data.deleted_ids, (
+        "the exact gone.py function row is deleted"
+    )
+    assert "fn-keep" not in analyzer.functions_collection.data.deleted_ids, (
+        "present.py (real file) must NOT be deleted"
     )
 
 

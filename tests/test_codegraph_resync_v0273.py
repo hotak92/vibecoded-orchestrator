@@ -241,6 +241,63 @@ def test_count_stale_rows_undeterminable_returns_none(monkeypatch):
     assert cr.count_stale_rows("Proj", current_revision=1, client=client) is None
 
 
+# ─────────── v0.2.74 R3: reachability filter + aggregate-first bound ───────────
+
+
+class _R3PathColl:
+    """Collection fake carrying per-row paths so the R3 reachability filter can
+    run; records iterator scans to assert the aggregate-first bound."""
+
+    def __init__(self, agg_count, rows=None):
+        import types as _t
+
+        self.name = "X"
+        self._rows = rows or []
+        self.iter_calls = 0
+        self.aggregate = _t.SimpleNamespace(
+            over_all=lambda **kw: _t.SimpleNamespace(total_count=agg_count)
+        )
+
+    def iterator(self, return_properties=None):
+        import types as _t
+
+        self.iter_calls += 1
+        for props in self._rows:
+            yield _t.SimpleNamespace(properties=props)
+
+
+def test_r3_aggregate_zero_skips_scan_with_repo_root(monkeypatch, tmp_path):
+    """R3 bound: aggregate 0 → return 0 with NO per-row scan even when a
+    repo_root is supplied (the converged steady-state cost is one aggregate)."""
+    monkeypatch.setattr(cr, "_collection_prefix", lambda name: "Proj")
+    module, klass, func = _R3PathColl(0), _R3PathColl(0), _R3PathColl(0)
+    client = _client_for("Proj", module, klass, func)
+    counts = cr.count_stale_rows(
+        "Proj", current_revision=1, client=client, repo_root=tmp_path,
+    )
+    assert counts == {
+        "Proj_CodeModule": 0, "Proj_CodeClass": 0, "Proj_CodeFunction": 0,
+    }
+    assert (module.iter_calls, klass.iter_calls, func.iter_calls) == (0, 0, 0)
+
+
+def test_r3_excludes_orphan_rows_from_owed_count(monkeypatch, tmp_path):
+    """R3: with repo_root, orphan (deleted-file) stale rows are excluded so the
+    owed-probe can converge; reachable stale rows still count."""
+    monkeypatch.setattr(cr, "_collection_prefix", lambda name: "Proj")
+    (tmp_path / "live.py").write_text("# real\n")
+    func = _R3PathColl(agg_count=2, rows=[
+        {"embed_revision": 0, "file_path": "live.py"},   # reachable stale
+        {"embed_revision": 0, "file_path": "gone.py"},   # orphan → excluded
+    ])
+    client = _client_for("Proj", _R3PathColl(0), _R3PathColl(0), func)
+    counts = cr.count_stale_rows(
+        "Proj", current_revision=1, client=client, repo_root=tmp_path,
+    )
+    assert counts["Proj_CodeFunction"] == 1
+    assert func.iter_calls == 1
+
+
 def test_spawn_not_owed_when_probe_confirms_zero(monkeypatch, tmp_path):
     """POSITIVE zero from the probe → status not_owed, NOTHING spawned."""
     monkeypatch.setattr(cr, "code_embed_service_healthy", lambda *a, **k: True)
