@@ -455,7 +455,7 @@ def test_main_exits_4_on_insert_errors(analyzer_mod, tmp_path: Path, monkeypatch
             return None
         mod.CodeGraphAnalyzer.close = _fake_close
 
-        def _fake_create_cross_refs(self):
+        def _fake_create_cross_refs(self, changed_files=None):
             return {{"calls": 0, "extends": 0, "imports": 0}}
         mod.CodeGraphAnalyzer.create_cross_references = _fake_create_cross_refs
 

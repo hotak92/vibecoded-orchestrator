@@ -8161,19 +8161,71 @@ class CodeGraphAnalyzer:
             print(f"   ⚠️  Failed to load classes: {e}")
 
         # Load functions (same canonical-chunk preference as classes).
+        # v0.2.74 (R4 read-amp fix): capture file_path / call_names / n_callers
+        # into per-uuid side-dicts DURING this single whole-collection scan the
+        # method already does. create_cross_references then reads these instead
+        # of issuing a per-function `fetch_object_by_id` point-read for all 23k
+        # rows (that per-row point-read WAS the read-amplification). Only
+        # changed-file functions still get a body point-read (for AST parse).
+        self._xref_file_path: Dict[str, str] = {}
+        self._xref_stored_calls: Dict[str, Any] = {}
+        self._xref_stored_ncallers: Dict[str, Any] = {}
         try:
             for obj in self.functions_collection.iterator():
                 full_name = obj.properties.get("full_name", "")
                 if full_name and self._prefer_canonical_chunk(
                     self.function_cache, full_name, obj
                 ):
-                    self.function_cache[full_name] = str(obj.uuid)
+                    _u = str(obj.uuid)
+                    self.function_cache[full_name] = _u
+                    _p = obj.properties or {}
+                    self._xref_file_path[_u] = _p.get("file_path") or ""
+                    self._xref_stored_calls[_u] = _p.get("call_names")
+                    self._xref_stored_ncallers[_u] = _p.get("n_callers")
         except Exception as e:
             print(f"   ⚠️  Failed to load functions: {e}")
 
         print(f"   Loaded {len(self.module_cache)} modules, {len(self.class_cache)} classes, {len(self.function_cache)} functions")
 
-    def create_cross_references(self) -> Dict[str, int]:
+    def _resolve_call_target(
+        self,
+        call_name: str,
+        caller_full_name: str,
+        func_name_to_full: Dict[str, List[str]],
+    ) -> Optional[str]:
+        """Resolve a call name to the target function's UUID, or None.
+
+        Single home (v0.2.74 R4) for the call-name → target-UUID resolution
+        used by BOTH the changed-file body-parse path and the unchanged-file
+        stored-call_names counting path in ``create_cross_references``. Keeps
+        the two paths from drifting (my earlier inline copy would have been a
+        second implementation). Resolution order: exact full_name → unique
+        short-name → short-name preferring the caller's own module prefix.
+        """
+        # Exact full_name match first.
+        uuid_ = self.function_cache.get(call_name)
+        if uuid_ is not None:
+            return uuid_
+        # Short-name match (prefer same module).
+        candidates = func_name_to_full.get(call_name, [])
+        if len(candidates) == 1:
+            return self.function_cache.get(candidates[0])
+        if len(candidates) > 1:
+            module_prefix = (
+                caller_full_name.rsplit(".", 1)[0]
+                if "." in caller_full_name else ""
+            )
+            same_module = [
+                c for c in candidates if c.startswith(module_prefix + ".")
+            ]
+            if same_module:
+                return self.function_cache.get(same_module[0])
+            return self.function_cache.get(candidates[0])
+        return None
+
+    def create_cross_references(
+        self, changed_files: Optional[Set[str]] = None,
+    ) -> Dict[str, int]:
         """Post-processing pass: create cross-references between Weaviate objects.
 
         Uses the caches (module_cache, class_cache, function_cache) populated
@@ -8182,9 +8234,27 @@ class CodeGraphAnalyzer:
         - CodeClass.extends -> CodeClass (by matching base class names)
         - CodeModule.imports -> CodeModule (by matching import names to paths)
 
+        v0.2.74 (R4) — ``changed_files`` (repo-relative POSIX paths) scopes the
+        expensive body-fetch + AST-parse to the files that actually changed on a
+        scoped/incremental run. Functions in UNCHANGED files do NOT get their
+        bodies re-parsed; their contribution to the inbound (n_callers) counts
+        is rebuilt from their STORED ``call_names`` (which R1 keeps accurate),
+        and their ``call_names`` write is skipped (unchanged ⇒ R1 gate would
+        skip anyway). This removes the READ-amplification twin of R1's writes
+        (the old code fetched + parsed ALL functions on every 1-line edit) while
+        keeping n_callers/call_names counts COMPLETE and correct (MED-1: a
+        target in an unchanged file whose caller-set changed still gets written,
+        because inbound is accumulated over ALL callers — changed via fresh
+        parse, unchanged via stored call_names). ``None`` ⇒ whole-repo run ⇒
+        parse everything (unchanged pre-R4 behaviour).
+
         Returns dict with counts of references created per type.
         """
         stats = {'calls': 0, 'extends': 0, 'imports': 0}
+        # R4: whole-repo run when changed_files is None → parse every function
+        # (incremental_scope False). A scoped run parses only changed-file
+        # functions and rebuilds the rest of the counts from stored call_names.
+        incremental_scope = changed_files is not None
 
         if not self.client:
             print("⚠️  Not connected to Weaviate, skipping cross-references")
@@ -8237,40 +8307,52 @@ class CodeGraphAnalyzer:
         # from ALL of Weaviate (not just this run's files), counts are
         # complete on EVERY analyze — M4 backfills itself.
         inbound: Dict[str, int] = {}
-        stored_counts: Dict[str, Any] = {}
-        # v0.2.74 (R1 write-amp fix): also record each function's STORED
-        # call_names from the SAME point-read, so the write below can skip
-        # rows whose call_names did not actually change — mirroring the
-        # n_callers change-gate. This is THE headline fix: the old code
-        # re-wrote call_names on EVERY function every analyze (23k rows →
-        # 23k tombstones per run), because `data.update()` bypasses the
-        # content-hash tombstone-skip that only guards `data.replace()`.
-        stored_call_names: Dict[str, Any] = {}
+        # v0.2.74 (R1/R4): stored n_callers + call_names come from the per-uuid
+        # side-dicts captured during `_populate_caches_from_weaviate`'s single
+        # whole-collection scan — NOT from a per-function point-read. The old
+        # code issued a `fetch_object_by_id` for ALL 23k functions on EVERY
+        # analyze (the READ-amplification), plus re-wrote call_names ungated
+        # (the WRITE-amplification / 136GB). Now: counts + the R1 change-gate
+        # read from side-dicts (zero extra reads), and a body point-read only
+        # happens for functions whose FILE changed (or every function on a
+        # whole-repo run — same total work as before, just sourced once).
+        stored_counts: Dict[str, Any] = dict(
+            getattr(self, "_xref_stored_ncallers", {}) or {}
+        )
+        stored_call_names: Dict[str, Any] = dict(
+            getattr(self, "_xref_stored_calls", {}) or {}
+        )
+        _file_by_uuid: Dict[str, str] = getattr(self, "_xref_file_path", {}) or {}
         for full_name, func_uuid in self.function_cache.items():
-            # Fetch the function to get its body and extract calls.
-            # v0.2.72 (P3): `func_uuid` is the CANONICAL (chunk 0) UUID from the
-            # cache (see `_prefer_canonical_chunk`). Point-read by that UUID
-            # rather than a `full_name`-filtered `limit=1` fetch, which with
-            # multi-chunk objects could return a NON-canonical chunk.
-            # F7 (pre-gate audit): for a chunked function, reassemble the FULL
-            # body from all chunk rows before AST parse — chunk-0 alone was a
-            # partial slice whose mid-block boundary raised SyntaxError, so
-            # exactly the big hub functions lost calls + call_names. Fetch
-            # failure falls back to the chunk-0 body (pre-fix behaviour). The
-            # `data.update(call_names)` below still writes to the canonical
-            # object, so callers-queries resolve correctly.
             try:
+                _row_file = _file_by_uuid.get(func_uuid, "")
+
+                # R4: on a scoped run, skip the body point-read + AST-parse for
+                # functions whose file did NOT change. Their contribution to the
+                # inbound (n_callers) counts is rebuilt from their STORED
+                # call_names (captured in the cache scan), so targets keep
+                # COMPLETE counts (MED-1), and their call_names are never
+                # re-written (unchanged ⇒ the R1 gate would skip anyway). This
+                # is the READ-amplification fix: a 1-line edit no longer
+                # point-reads + parses all 23k functions. Whole-repo runs
+                # (incremental_scope False) still read every body as before.
+                if incremental_scope and _row_file not in changed_files:
+                    _stored_for_count = stored_call_names.get(func_uuid)
+                    if isinstance(_stored_for_count, list):
+                        for _cn in _stored_for_count:
+                            _tgt = self._resolve_call_target(
+                                _cn, full_name, func_name_to_full,
+                            )
+                            if _tgt is not None:
+                                inbound[_tgt] = inbound.get(_tgt, 0) + 1
+                    continue
+
+                # Changed file (or whole-repo run): point-read the body to
+                # extract calls. v0.2.72 (P3): `func_uuid` is the CANONICAL
+                # (chunk 0) UUID from the cache. F7: reassemble the FULL body
+                # from all chunk rows before AST parse (chunk-0 alone could be a
+                # partial slice → SyntaxError → lost calls on big hub functions).
                 canonical = self.functions_collection.query.fetch_object_by_id(func_uuid)
-                # M4: record the stored count BEFORE any body-based skip —
-                # bodiless rows can still be call TARGETS whose stored value
-                # the write pass must compare against.
-                if canonical is not None:
-                    _props = canonical.properties or {}
-                    stored_counts[func_uuid] = _props.get("n_callers")
-                    # R1: capture stored call_names for the change-gate below.
-                    # Absent/NULL is recorded as None and treated as [] for
-                    # the compare (a NULL row with no new calls must NOT write).
-                    stored_call_names[func_uuid] = _props.get("call_names")
                 body = canonical.properties.get("function_body", "") if canonical is not None else ""
                 if not body:
                     continue
@@ -8303,22 +8385,13 @@ class CodeGraphAnalyzer:
                 call_names = self._extract_function_calls(tree)
                 refs_to_add = []
                 for call_name in call_names:
-                    # Try exact full_name match first
-                    if call_name in self.function_cache:
-                        refs_to_add.append(self.function_cache[call_name])
-                        continue
-                    # Try short name match (prefer same module)
-                    candidates = func_name_to_full.get(call_name, [])
-                    if len(candidates) == 1:
-                        refs_to_add.append(self.function_cache[candidates[0]])
-                    elif len(candidates) > 1:
-                        # Prefer same module prefix
-                        module_prefix = full_name.rsplit(".", 1)[0] if "." in full_name else ""
-                        same_module = [c for c in candidates if c.startswith(module_prefix + ".")]
-                        if same_module:
-                            refs_to_add.append(self.function_cache[same_module[0]])
-                        else:
-                            refs_to_add.append(self.function_cache[candidates[0]])
+                    # v0.2.74 (R4): single-home resolution (shared with the
+                    # unchanged-file counting path above).
+                    _tgt = self._resolve_call_target(
+                        call_name, full_name, func_name_to_full,
+                    )
+                    if _tgt is not None:
+                        refs_to_add.append(_tgt)
 
                 # Store call_names as text array for callers queries.
                 # ── v0.2.74 (R1) — change-gate this write ──────────────────
@@ -9142,6 +9215,53 @@ def _is_ephemeral_worktree_root(p: Path) -> bool:
         return False
 
 
+def _collect_scoped_rel_paths(
+    only_file: Optional[Path],
+    only_files_from: Optional[Path],
+    repo_path: Path,
+) -> Optional[Set[str]]:
+    """Repo-relative POSIX paths in scope for a scoped analyze run (R4).
+
+    Returns ``None`` for a whole-repo run (neither scoped flag set) — the
+    caller then parses every function (unchanged behaviour). For a scoped run,
+    returns the set of repo-relative paths named by ``--only-file`` /
+    ``--only-files-from`` (the ONLY files whose call bodies can have changed),
+    so ``create_cross_references`` re-parses just those and reads the rest of
+    the inbound counts from stored ``call_names``. Soft: an unreadable list
+    yields an empty set (scope = "nothing changed" ⇒ no body re-parse, counts
+    still rebuilt from stored data), never a crash. Mirrors the relativization
+    used on the write path (``file_path`` is repo-relative POSIX).
+    """
+    if only_file is None and only_files_from is None:
+        return None
+    try:
+        repo_abs = repo_path.resolve()
+    except Exception:  # noqa: BLE001
+        repo_abs = repo_path
+    rels: Set[str] = set()
+
+    def _add(p: Path) -> None:
+        try:
+            rel = p.resolve().relative_to(repo_abs).as_posix()
+        except Exception:  # noqa: BLE001 — outside root / unresolved → ignore
+            return
+        if rel:
+            rels.add(rel)
+
+    if only_file is not None:
+        _add(only_file)
+    if only_files_from is not None:
+        try:
+            raw = only_files_from.read_text(encoding="utf-8")
+        except Exception:  # noqa: BLE001 — unreadable list → empty scope
+            raw = ""
+        for line in raw.splitlines():
+            s = line.strip()
+            if s:
+                _add(Path(s))
+    return rels
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Analyze codebase and extract entities into Weaviate code graph",
@@ -9656,8 +9776,30 @@ def main():
             canonical_source=args.canonical_source,
         )
 
-        # Post-processing: create cross-references
-        ref_stats = analyzer.create_cross_references()
+        # Post-processing: create cross-references.
+        # ── v0.2.74 (R4) — scope the expensive body-parse on incremental runs ──
+        # On a scoped run (`--only-file` / `--only-files-from`), only the named
+        # files' functions can have changed call bodies. Compute the repo-
+        # relative changed-file set so create_cross_references re-parses ONLY
+        # those bodies (the READ-amplification twin of R1's writes: the old code
+        # fetched + AST-parsed ALL 23k functions on every 1-line edit). The
+        # n_callers/call_names WRITES stay GLOBAL — an unchanged target whose
+        # caller-set changed still gets its count/list corrected from the stored
+        # call_names of unchanged callers (MED-1). None ⇒ whole-repo run ⇒ parse
+        # everything (unchanged behaviour).
+        _changed_rel: Optional[Set[str]] = None
+        try:
+            _changed_rel = _collect_scoped_rel_paths(
+                args.only_file, args.only_files_from, repo_path,
+            )
+        except Exception as _scope_exc:  # noqa: BLE001 — soft-fail to whole-repo
+            print(
+                f"⚠️  R4: could not compute changed-file scope ({_scope_exc}); "
+                "falling back to whole-repo cross-ref parse",
+                file=sys.stderr,
+            )
+            _changed_rel = None
+        ref_stats = analyzer.create_cross_references(changed_files=_changed_rel)
 
         # v0.2.18 (Plan C): final progress emit so the modal's progress bar
         # snaps to 100% before the report is rendered.

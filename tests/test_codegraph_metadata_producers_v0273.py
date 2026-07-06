@@ -383,11 +383,16 @@ def test_ensure_n_callers_function_only(analyzer_mod):
 class _XRefFunctions:
     """functions_collection fake for create_cross_references."""
 
-    def __init__(self, bodies, stored_counts=None, stored_call_names=None):
+    def __init__(self, bodies, stored_counts=None, stored_call_names=None,
+                 file_paths=None):
         self._bodies = bodies
         self._stored = stored_counts or {}
         # v0.2.74 (R1): stored call_names per uuid, for the change-gate test.
         self._stored_calls = stored_call_names or {}
+        # v0.2.74 (R4): file_path per uuid + record of which uuids were fetched
+        # (so a test can assert unchanged-file functions are NOT re-parsed).
+        self._file_paths = file_paths or {}
+        self.fetched = []
         self.updates = []
         self.refs = []
         self.query = types.SimpleNamespace(
@@ -401,6 +406,7 @@ class _XRefFunctions:
         )
 
     def _fetch(self, uuid):
+        self.fetched.append(uuid)
         if uuid not in self._bodies:
             return None
         props = {"function_body": self._bodies[uuid], "total_chunks": 1}
@@ -408,6 +414,8 @@ class _XRefFunctions:
             props["n_callers"] = self._stored[uuid]
         if uuid in self._stored_calls:
             props["call_names"] = self._stored_calls[uuid]
+        if uuid in self._file_paths:
+            props["file_path"] = self._file_paths[uuid]
         return types.SimpleNamespace(uuid=uuid, properties=props)
 
     def iterator(self, return_properties=None):
@@ -415,11 +423,11 @@ class _XRefFunctions:
 
 
 def _xref_analyzer(analyzer_mod, bodies, cache, stored_counts=None,
-                   stored_call_names=None):
+                   stored_call_names=None, file_paths=None):
     a = analyzer_mod.CodeGraphAnalyzer("P")
     a.client = object()  # truthy — skip the "not connected" bail
     a.functions_collection = _XRefFunctions(
-        bodies, stored_counts, stored_call_names
+        bodies, stored_counts, stored_call_names, file_paths
     )
     a.classes_collection = types.SimpleNamespace(
         iterator=lambda **kw: iter(()),
@@ -430,7 +438,13 @@ def _xref_analyzer(analyzer_mod, bodies, cache, stored_counts=None,
     a.class_cache = {}
     a.module_cache = {"keep": "the-caches-nonempty"}
     a.module_imports = {}
-    a._populate_caches_from_weaviate = lambda: None  # caches injected above
+    # v0.2.74 (R1/R4): the analyzer sources stored n_callers / call_names /
+    # file_path from side-dicts the whole-collection cache scan populates.
+    # Mirror that here (the caches are injected, so the real scan is stubbed).
+    a._xref_stored_ncallers = dict(stored_counts or {})
+    a._xref_stored_calls = dict(stored_call_names or {})
+    a._xref_file_path = dict(file_paths or {})
+    a._populate_caches_from_weaviate = lambda: None  # caches+side-dicts injected
     return a
 
 
@@ -558,6 +572,84 @@ def test_call_names_changed_set_writes(analyzer_mod):
     cw = _call_names_writes(a)
     assert len(cw) == 1 and cw[0]["uuid"] == "u-c"
     assert set(cw[0]["properties"]["call_names"]) == {"target", "extra"}
+
+
+# ─────────────────── v0.2.74 (R4) incremental cross-ref scope ────────────────
+# On a scoped (--only-file / --only-files-from) run, create_cross_references
+# must re-parse ONLY changed-file function bodies (the READ-amp fix) while
+# still rebuilding COMPLETE inbound (n_callers) counts from unchanged callers'
+# STORED call_names (MED-1). These tests pass `changed_files=` explicitly.
+
+_CALLER_BODY2 = "def caller2():\n    target()\n"
+
+
+def test_r4_whole_repo_parses_everything(analyzer_mod):
+    """changed_files=None (whole-repo) → every function body is fetched/parsed."""
+    cache = {"mod.caller": "u-c", "mod.target": "u-t"}
+    bodies = {"u-c": _CALLER_BODY, "u-t": _TARGET_BODY}
+    a = _xref_analyzer(analyzer_mod, bodies, cache)
+    a.create_cross_references(changed_files=None)
+    # both functions fetched (parsed) in whole-repo mode
+    assert set(a.functions_collection.fetched) == {"u-c", "u-t"}
+
+
+def test_r4_unchanged_caller_not_reparsed_but_still_counted(analyzer_mod):
+    """MED-1: an UNCHANGED caller's body is NOT re-parsed, yet its stored
+    call_names still contribute to the target's n_callers so the count stays
+    complete. Here only 'other.py' changed; the two callers live in unchanged
+    'a.py'/'b.py' and already have call_names=[target] stored."""
+    cache = {"a.caller": "u-a", "b.caller": "u-b",
+             "other.fn": "u-o", "mod.target": "u-t"}
+    bodies = {"u-a": _CALLER_BODY, "u-b": _CALLER_BODY2,
+              "u-o": _TARGET_BODY, "u-t": _TARGET_BODY}
+    file_paths = {"u-a": "a.py", "u-b": "b.py",
+                  "u-o": "other.py", "u-t": "target.py"}
+    stored_calls = {"u-a": ["target"], "u-b": ["target"]}
+    a = _xref_analyzer(analyzer_mod, bodies, cache,
+                       stored_call_names=stored_calls, file_paths=file_paths)
+    a.create_cross_references(changed_files={"other.py"})
+    # unchanged callers u-a / u-b must NOT be re-parsed (READ-amp fix)…
+    assert "u-a" not in a.functions_collection.fetched
+    assert "u-b" not in a.functions_collection.fetched
+    # …but the target's n_callers must still be the COMPLETE 2 (both stored
+    # callers counted from their stored call_names) — MED-1.
+    ncw = [u for u in a.functions_collection.updates
+           if "n_callers" in u["properties"]]
+    assert len(ncw) == 1 and ncw[0]["uuid"] == "u-t"
+    assert ncw[0]["properties"]["n_callers"] == 2
+
+
+def test_r4_changed_file_reparsed_and_written(analyzer_mod):
+    """A changed-file function IS re-parsed and its call_names re-written when
+    its call set differs from stored."""
+    changed_body = "def caller():\n    target()\n    extra()\n"
+    cache = {"mod.caller": "u-c", "mod.target": "u-t", "mod.extra": "u-e"}
+    bodies = {"u-c": changed_body, "u-t": _TARGET_BODY, "u-e": _TARGET_BODY}
+    file_paths = {"u-c": "changed.py", "u-t": "t.py", "u-e": "e.py"}
+    stored_calls = {"u-c": ["target"]}  # stored missing 'extra'
+    a = _xref_analyzer(analyzer_mod, bodies, cache,
+                       stored_call_names=stored_calls, file_paths=file_paths)
+    a.create_cross_references(changed_files={"changed.py"})
+    assert "u-c" in a.functions_collection.fetched, "changed file IS parsed"
+    cw = [u for u in a.functions_collection.updates
+          if "call_names" in u["properties"]]
+    assert len(cw) == 1 and cw[0]["uuid"] == "u-c"
+    assert set(cw[0]["properties"]["call_names"]) == {"target", "extra"}
+
+
+def test_r4_unchanged_caller_never_writes_call_names(analyzer_mod):
+    """An unchanged-file caller (skipped body-parse) must never write call_names
+    (its stored value is authoritative; R1 gate would skip anyway)."""
+    cache = {"a.caller": "u-a", "mod.target": "u-t"}
+    bodies = {"u-a": _CALLER_BODY, "u-t": _TARGET_BODY}
+    file_paths = {"u-a": "a.py", "u-t": "target.py"}
+    stored_calls = {"u-a": ["target"]}
+    a = _xref_analyzer(analyzer_mod, bodies, cache,
+                       stored_call_names=stored_calls, file_paths=file_paths)
+    a.create_cross_references(changed_files={"nothing_matches.py"})
+    cw = [u for u in a.functions_collection.updates
+          if "call_names" in u["properties"]]
+    assert cw == [], "unchanged caller writes no call_names"
 
 
 # ───────────────────────── backfill (data.update pass) ──────────────────────
