@@ -231,6 +231,19 @@ except Exception as _pc_import_err:  # pragma: no cover (rare half-install)
 
 _resolved_project_config = None  # cached resolve() result (or None if unreachable)
 
+# v0.2.74 T5-1: the CLAUDE_PROJECT_DIR this process was SPAWNED with, captured
+# ONCE at module import. Every module-level collection constant
+# (KG_COLLECTION / SHARED_KG_COLLECTION / DEVELOPMENT_COLLECTION / ...) is
+# resolved from THIS value (via the hub-over-env chain) and never refreshed.
+# The per-tool-call backstop (`_assert_workspace_unchanged`) compares the
+# LIVE env against this snapshot and refuses-loud on divergence, so a Claude
+# client that binds to a stale-workspace subprocess never silently gets
+# wrong-project results. Empty string when Claude Code spawned us without the
+# env (CLI / non-workspace launch) — the backstop then no-ops (nothing to
+# diverge from). See vco_lib/mcp_singleton.py for the spawn-time reaper that
+# is the primary fix; this is the correctness backstop.
+_MODULE_LOAD_WORKSPACE: str = os.environ.get("CLAUDE_PROJECT_DIR", "")
+
 
 def _try_resolve_project_config():
     """Best-effort: resolve the project config via vct-hub once.
@@ -2954,6 +2967,96 @@ class WeaviateAuthError(Exception):
         self.user_msg = user_msg or msg
 
 
+class WeaviateWorkspaceDriftError(Exception):
+    """v0.2.74 T5-1 backstop: raised when a tool call's LIVE
+    ``CLAUDE_PROJECT_DIR`` diverges from the value this MCP subprocess was
+    SPAWNED with (``_MODULE_LOAD_WORKSPACE``).
+
+    All module-level collection constants (KG_COLLECTION /
+    SHARED_KG_COLLECTION / DEVELOPMENT_COLLECTION / CODE_GRAPH_PROJECT / ...)
+    are resolved ONCE at import from the spawn-time workspace and read in
+    dozens of places; they cannot be hot-swapped safely mid-process. So when
+    a client binds to a stale-workspace subprocess (the T5-1 double-process
+    hazard the ``vco_lib.mcp_singleton`` reaper primarily prevents), the
+    CORRECT response is to REFUSE LOUD — name both paths, tell the user to
+    restart the MCP — rather than silently serve the wrong project's
+    collections and return 0 hits. Distinct from the connection / schema /
+    auth error classes so the wrapper surfaces it verbatim instead of
+    misclassifying it as a Weaviate outage.
+    """
+    def __init__(self, msg: str, user_msg: str = ""):
+        super().__init__(msg)
+        self.user_msg = user_msg or msg
+
+
+def _assert_workspace_unchanged(tool_name: str = "hybrid_search") -> None:
+    """v0.2.74 T5-1 backstop: refuse-loud if the live workspace drifted.
+
+    Compares the current ``CLAUDE_PROJECT_DIR`` against the value captured at
+    module import (``_MODULE_LOAD_WORKSPACE``). When they differ, this
+    subprocess is serving a client bound to a DIFFERENT workspace than the
+    one its cached collection constants were resolved for — the T5-1
+    double-subprocess drift. Raise ``WeaviateWorkspaceDriftError`` naming both
+    paths so the user restarts the MCP rather than getting silent 0-hit
+    wrong-project results.
+
+    No-op (never raises) when:
+      * the module-load workspace was empty (CLI / non-workspace spawn — no
+        baseline to diverge from), OR
+      * the live env is empty (a hook / script call that didn't re-set the
+        env — we trust the spawn-time value), OR
+      * the two canonicalize equal (symlink / trailing-slash noise).
+
+    Soft on its OWN failure: a bug in path canonicalization must not break a
+    search, so path resolution errors fall through to "no drift".
+    """
+    load_ws = _MODULE_LOAD_WORKSPACE
+    if not load_ws:
+        return  # spawned without a workspace baseline — nothing to compare
+    live_ws = os.environ.get("CLAUDE_PROJECT_DIR", "")
+    if not live_ws:
+        return  # call arrived without the env — trust the spawn-time value
+    try:
+        load_norm = str(Path(load_ws).resolve())
+        live_norm = str(Path(live_ws).resolve())
+    except Exception:  # noqa: BLE001 — canonicalization bug must not break search
+        load_norm, live_norm = load_ws.rstrip("/\\"), live_ws.rstrip("/\\")
+    if load_norm == live_norm:
+        return
+    msg = (
+        f"{tool_name}: workspace drift detected — this weaviate-kg MCP "
+        f"subprocess was spawned for CLAUDE_PROJECT_DIR={load_norm!r} "
+        f"(collections resolved: KG_COLLECTION={KG_COLLECTION!r}, "
+        f"SHARED_KG_COLLECTION={SHARED_KG_COLLECTION!r}) but this call "
+        f"arrived with CLAUDE_PROJECT_DIR={live_norm!r}. The module-level "
+        f"collection constants are frozen at import and cannot be "
+        f"hot-swapped, so serving this call would fan out over the WRONG "
+        f"project's collections. RESTART the weaviate-kg MCP (or your Claude "
+        f"Code session) so a fresh subprocess resolves collections for "
+        f"{live_norm!r}. (If you see two weaviate_mcp/server.py processes, "
+        f"the stale one should have been reaped at spawn — check the "
+        f"'reap_stale_weaviate_mcp' startup log.)"
+    )
+    logger.warning("workspace-drift refuse-loud: %s", msg)
+    raise WeaviateWorkspaceDriftError(msg)
+
+
+def _workspace_drift_response(exc: "WeaviateWorkspaceDriftError", query: str = "") -> str:
+    """Structured refuse-loud response for a workspace-drift error.
+
+    Mirrors the shape of ``_weaviate_unreachable_response`` so the caller
+    surface is consistent: a JSON envelope Claude can read, with an
+    ``error_class`` discriminator and the actionable ``user_msg``.
+    """
+    return _large_result({
+        "error": True,
+        "error_class": "WeaviateWorkspaceDriftError",
+        "query": query,
+        "results": [],
+        "message": exc.user_msg,
+    })
+
+
 _shared_kg_probe_done: bool = False
 
 
@@ -4789,6 +4892,11 @@ async def hybrid_search(
         return await _hybrid_search_body(
             query, limit, node_type, tags, days, detail, include_stale,
         )
+    except WeaviateWorkspaceDriftError as exc:
+        # v0.2.74 T5-1 backstop: surface the refuse-loud message verbatim.
+        # Do NOT reset the client cache (this is not a Weaviate outage) —
+        # the fix is a subprocess restart, not a reconnect.
+        return _workspace_drift_response(exc, query=query)
     except WeaviateUnreachable as exc:
         _reset_weaviate_client_cache()
         return _weaviate_unreachable_response(exc, query=query)
@@ -4823,6 +4931,11 @@ async def _hybrid_search_body(
 ) -> str:
     """Implementation body for hybrid_search. Extracted so the public tool
     can wrap the entire query path with v2 loud-fail handling."""
+    # v0.2.74 T5-1 backstop: refuse-loud if this call's live CLAUDE_PROJECT_DIR
+    # diverged from the value this subprocess resolved its collections for.
+    # Raises WeaviateWorkspaceDriftError (caught by the hybrid_search wrapper)
+    # rather than silently fanning out over the wrong project's collections.
+    _assert_workspace_unchanged("hybrid_search")
     # Build type/tag filter (NON-stale terms only; stale is mixed in
     # per-collection below — see V52-I Fix A).
     filters = []
@@ -5127,7 +5240,15 @@ async def _hybrid_search_body(
     # Log detail level for RL training signal
     _log_detail_choice(query, detail, len(results))
 
-    logger.info(f"hybrid_search: {len(results)} results (detail={detail}) for '{query}' across {collections_to_search}")
+    # v0.2.74 T5-1: stamp PID + resolved KG_COLLECTION on the per-call line so
+    # multi-subprocess drift (two weaviate_mcp servers scoped to different
+    # workspaces) is diagnosable straight from the logs — a "0 results" report
+    # can be cross-checked against which PID / collection actually served it.
+    logger.info(
+        f"hybrid_search[pid={os.getpid()} kg={KG_COLLECTION!r}]: "
+        f"{len(results)} results (detail={detail}) for '{query}' "
+        f"across {collections_to_search}"
+    )
     # v0.2.31 module-deprecation surface (Layer 2): when the launcher has
     # injected the four `VCT_RL_MODULE_*` env vars into
     # `.claude/settings.json env`, prepend a deprecation banner to the
@@ -7418,6 +7539,36 @@ if __name__ == "__main__":
             exit_if_update_in_progress = None  # type: ignore
     if exit_if_update_in_progress is not None:
         exit_if_update_in_progress("weaviate-kg MCP")
+
+    # v0.2.74 T5-1 ROOT FIX: reap any OTHER live weaviate_mcp subprocess whose
+    # CLAUDE_PROJECT_DIR differs from ours (a stale-workspace zombie a
+    # workspace-switch / MCP re-registration left behind) before we start
+    # serving. Keeps exactly one live server per workspace so a client can
+    # never bind to a stale process that resolved a DIFFERENT project's
+    # collections at its own module-load. Best-effort / soft-fail — a failed
+    # reap never blocks THIS process from starting (the per-tool-call
+    # refuse-loud backstop covers the residual case).
+    try:
+        from vco_lib.mcp_singleton import reap_stale_weaviate_mcp  # type: ignore
+    except ImportError:
+        _parent_dir = str(Path(__file__).resolve().parent.parent.parent)
+        if _parent_dir not in sys.path:
+            sys.path.insert(0, _parent_dir)
+        try:
+            from vco_lib.mcp_singleton import reap_stale_weaviate_mcp  # type: ignore
+        except ImportError:
+            reap_stale_weaviate_mcp = None  # type: ignore
+    if reap_stale_weaviate_mcp is not None:
+        try:
+            _reaped = reap_stale_weaviate_mcp(_MODULE_LOAD_WORKSPACE)
+            if _reaped:
+                logger.info(
+                    "weaviate-kg: reaped %d stale weaviate_mcp subprocess(es) "
+                    "for a clean single-instance-per-workspace start (T5-1).",
+                    _reaped,
+                )
+        except Exception as _reap_exc:  # noqa: BLE001 — never block startup
+            logger.debug("weaviate-kg: stale-MCP reap raised (%s); continuing", _reap_exc)
 
     logger.info(f"Starting Claude Orchestrator Weaviate MCP Server")
     logger.info(f"Primary Collection: {KG_COLLECTION}")

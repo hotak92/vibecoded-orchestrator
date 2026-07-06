@@ -23,6 +23,7 @@ log/tag the embedding source).
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -787,8 +788,33 @@ class RLClient:
         if self._project_id is not None:
             headers["X-VCT-Project-ID"] = self._project_id
 
+        # v0.2.74 T5-1b (BLOCKER-2): coerce the body to a JSON-safe dict at the
+        # single POST choke point BEFORE httpx serializes it. ``cache_nodes``
+        # passes candidate node dicts VERBATIM (``payload["nodes"] =
+        # list(nodes)``), and a candidate may embed a ``uuid.UUID`` (a links /
+        # wikilink / enrichment field). httpx's ``json=`` path uses the stdlib
+        # encoder, which raises ``TypeError: Object of type UUID is not JSON
+        # serializable`` — the POST then fails, RLClient falls back to cosine
+        # order, and the paying user is silently demoted per query.
+        #
+        # A ``json.dumps(..., default=str)`` → ``json.loads`` round-trip
+        # coerces EVERY non-natively-serializable value (UUID, datetime, Path,
+        # Decimal, …) to its ``str()`` — covering ALL POST bodies (cache_nodes
+        # AND both rl_update variants), not just the one field we know about
+        # today — while STILL handing httpx a plain dict via ``json=`` so the
+        # content-type, length, and the test mocks' ``json=`` contract are all
+        # unchanged. Already-string wire fields (session_id / task_id /
+        # embedding_source) hit the native path and are byte-identical.
         try:
-            resp = await client.post(url, json=json_body, headers=headers, timeout=timeout)
+            safe_body = json.loads(json.dumps(json_body, default=str))
+        except (TypeError, ValueError) as exc:
+            # A value not even ``default=str`` can coerce (e.g. a bytes blob or
+            # a circular ref) — treat as a client-side bad request so the
+            # caller falls back to cosine rather than crashing the search.
+            raise RLClientError(f"POST {url}: body not serializable: {exc}") from exc
+
+        try:
+            resp = await client.post(url, json=safe_body, headers=headers, timeout=timeout)
         except Exception as exc:
             # httpx.ConnectError / TimeoutException / ReadError — all
             # treated as "unreachable" so callers can branch.
