@@ -5,6 +5,98 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.74] - 2026-07-06
+
+### Fixed
+- **Code-graph write-amplification (the 136 GB) is fixed at the root.** Every
+  analyze run used to re-write `call_names` on ALL functions unconditionally —
+  `data.update()` bypasses the content-hash tombstone-skip, so a 23k-function
+  repo tombstoned 23k rows every run (and even on a single-file edit). It is now
+  change-gated (set-compare, order-insensitive; a non-empty→empty transition
+  correctly clears the stale list) exactly like the `n_callers` write. ~99% of
+  recurring object writes vanish. (R1)
+- **Code-graph READ-amplification on incremental runs is fixed.** The cross-ref
+  pass point-read + AST-parsed EVERY function on every analyze — so a one-line
+  edit re-read and re-parsed all 23k functions. The stored `file_path` /
+  `call_names` / `n_callers` are now captured in the single cache-population scan
+  the pass already does (no per-function point-read), and on a scoped run only
+  the changed files' bodies are re-parsed while the inbound counts stay complete
+  from unchanged callers' stored `call_names`. (R4)
+- **The dead LSM segments now actually reclaim on update.** The running Weaviate
+  container was stuck at `PERSISTENCE_LSM_MAX_SEGMENT_SIZE=500MiB` while compose
+  shipped `2GiB` — a running-and-ours container is "reused" and was never
+  recreated, so 200–500 MB dead segments could never merge. The installer now
+  inspects the live container's reclaim env and, on drift from compose,
+  force-recreates it (the named data volume survives) BEFORE the schema purge +
+  resync run, so that write activity lands under the 2 GiB cap and compaction
+  collapses the backlog. Conservative: an un-inspectable container is never
+  recreated. (R2)
+- **The v0.2.73 code-graph cleanup migration now actually reaches existing users
+  on update.** `install.py` called the schema-migration runner with an env that
+  lacked `CODE_GRAPH_PROJECT`, so the codegraph class names resolved to `[]`,
+  the migration loop iterated zero times silently, and the registry stayed frozen
+  at v4 — the 6_to_7 `.claude/state` purge (and every codegraph edge) never ran
+  for an existing user. Names now resolve from the launcher.db codegraph binding
+  (read-only, WAL-safe) and an augmented env threads `CODE_GRAPH_PROJECT` into the
+  runner AND each edge subprocess (Python + the launcher's Rust spawn). A
+  defense-in-depth sentinel refuses to false-advance the recorded version when an
+  edge ran against an empty scope. A one-time backfill reconcile carries every
+  already-installed user (any prior version) to a correct registry state. (A1/A2/A3)
+- **The resync now converges.** A code-graph row whose source file was deleted
+  kept its stale-revision status forever (the `--prune-stale` path that used to
+  clear it was removed in v0.2.73), so the owed-probe never reached 0 and every
+  update re-triggered a whole-repo resync. Deleted-file (orphan) rows are now
+  cleared, and the owed count considers only reachable rows (aggregate-first so
+  the per-row scan is only paid when something is actually stale). (R3)
+- **Content-unchanged rows are patched, not re-embedded.** A byte-identical row
+  merely behind `embed_revision` — whose vector is still valid in the current
+  embedding space — now gets a metadata stamp instead of a full re-embed
+  (guarded by an embedding-space-compatibility floor so a genuine model/chunking
+  change still forces a re-embed). Delivers the "if the hashes are the same,
+  don't re-embed" promise. (D1)
+- **Three word-tokenized over-delete traps closed.** `file_path` / `path` /
+  `full_name` are word-tokenized TEXT, so a `Filter.by_property(...).equal(...)`
+  + `delete_many` could delete a token-sharing SIBLING. The deleted-file prune,
+  the chunk-shrink cleanup, and the new orphan-clear all now iterate, exact-match
+  the raw value in Python, and `delete_by_id` only confirmed rows (one shared
+  helper, mirroring the 6_to_7 migration's proven pattern).
+- **Duplicate per-project code-graph collections.** The MCP reader resolved
+  Code* class names with the underscore-DROPPING sanitizer while the analyzer
+  writes with the underscore-PRESERVING one — so for any underscored project name
+  the reader queried a different class than the writer wrote (silent 0-results +
+  a latent duplicate). Split into a code-graph-only sanitizer routed through the
+  preserving rule; diagrams/KG stay on the dropping rule (their parity is
+  unchanged). The analyzer now warns loudly when it derives a collection prefix
+  from a bare folder name (how an unregistered clone minted a duplicate). And the
+  orphan-cleanup delete boundary now refuses to drop any class whose prefix
+  matches an active canonical (fail-closed if projects can't be enumerated). (B)
+- **`isolation: worktree` subagents now actually get an isolated worktree.** The
+  `WorktreeCreate` hook was a validator that no-op'd on the real (path-less)
+  payload, so subagents silently fell back to the shared parent tree. Per the
+  documented contract the hook is responsible for CREATING the worktree — it now
+  derives `<repo>/.claude/worktrees/<agent-id>`, runs `git worktree add --detach`,
+  echoes the path, and aborts loudly on a genuine create failure rather than
+  falling through silently. bash + PowerShell in lockstep. (T5-2)
+- **hybrid_search returning 0 hits after a workspace switch / update.** Two
+  weaviate-mcp subprocesses could be alive at once (one per workspace) because an
+  update spawned the new one without stopping the old; a client bound to the
+  stale process fanned out over the wrong project's collections. A per-workspace
+  reaper stops stale subprocesses at spawn time, and a per-call refuse-loud
+  backstop (on `hybrid_search`, `semantic_graph_search`, and
+  `store_knowledge_node`) surfaces "restart the MCP" instead of silently serving
+  the wrong project — critical for `store_knowledge_node`, whose misrouted WRITE
+  would corrupt another project's KG. (T5-1)
+- **RL rerank silently degrading to cosine order.** `cache_nodes` POSTed
+  candidate node dicts that could embed a `uuid.UUID`, which the JSON encoder
+  rejected — demoting a paying user's rerank per query. Fixed at the single POST
+  choke point (`json.dumps(..., default=str)`), covering all RL POST bodies. The
+  absent-module path remains a clean silent cosine no-op. (T5-1b)
+- **Coordination sync no longer creates duplicate rows.** `sync_work_items` /
+  `report_bug` / `sync_knowledge` upserted with `resolution=merge-duplicates`,
+  which conflicts on the PRIMARY KEY — a `gen_random_uuid` `id` the row omits, so
+  every heartbeat minted a new row. They now pass `on_conflict=<the UNIQUE
+  columns>` so the existing row updates. (Ships from the vct-coordination repo.)
+
 ## [0.2.73] - 2026-07-04
 
 ### Security

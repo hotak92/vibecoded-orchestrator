@@ -144,7 +144,10 @@ def _iter_proc_candidates_psutil():
                 continue
             env = info.get("environ") or {}
             workspace = env.get("CLAUDE_PROJECT_DIR", "") if isinstance(env, dict) else ""
-            yield int(info.get("pid")), workspace, cmdline
+            pid_raw = info.get("pid")
+            if pid_raw is None:
+                continue
+            yield int(pid_raw), workspace, cmdline
         except Exception:  # noqa: BLE001 — process vanished / access denied
             continue
 
