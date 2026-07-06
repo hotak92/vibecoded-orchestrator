@@ -8238,6 +8238,14 @@ class CodeGraphAnalyzer:
         # complete on EVERY analyze — M4 backfills itself.
         inbound: Dict[str, int] = {}
         stored_counts: Dict[str, Any] = {}
+        # v0.2.74 (R1 write-amp fix): also record each function's STORED
+        # call_names from the SAME point-read, so the write below can skip
+        # rows whose call_names did not actually change — mirroring the
+        # n_callers change-gate. This is THE headline fix: the old code
+        # re-wrote call_names on EVERY function every analyze (23k rows →
+        # 23k tombstones per run), because `data.update()` bypasses the
+        # content-hash tombstone-skip that only guards `data.replace()`.
+        stored_call_names: Dict[str, Any] = {}
         for full_name, func_uuid in self.function_cache.items():
             # Fetch the function to get its body and extract calls.
             # v0.2.72 (P3): `func_uuid` is the CANONICAL (chunk 0) UUID from the
@@ -8257,9 +8265,12 @@ class CodeGraphAnalyzer:
                 # bodiless rows can still be call TARGETS whose stored value
                 # the write pass must compare against.
                 if canonical is not None:
-                    stored_counts[func_uuid] = (
-                        canonical.properties or {}
-                    ).get("n_callers")
+                    _props = canonical.properties or {}
+                    stored_counts[func_uuid] = _props.get("n_callers")
+                    # R1: capture stored call_names for the change-gate below.
+                    # Absent/NULL is recorded as None and treated as [] for
+                    # the compare (a NULL row with no new calls must NOT write).
+                    stored_call_names[func_uuid] = _props.get("call_names")
                 body = canonical.properties.get("function_body", "") if canonical is not None else ""
                 if not body:
                     continue
@@ -8309,12 +8320,34 @@ class CodeGraphAnalyzer:
                         else:
                             refs_to_add.append(self.function_cache[candidates[0]])
 
-                # Store call_names as text array for callers queries
-                if call_names:
+                # Store call_names as text array for callers queries.
+                # ── v0.2.74 (R1) — change-gate this write ──────────────────
+                # THE headline write-amp fix. The old code did an UNGATED
+                # `data.update(call_names)` for every function every analyze,
+                # tombstoning 23k rows per run (data.update bypasses the
+                # content-hash tombstone-skip that guards data.replace). Now
+                # we compare new vs stored and only write on a real change.
+                #   * MED-2: a non-empty→empty transition (all calls deleted)
+                #     MUST write [] to clear the stale stored list, else
+                #     callers-queries keep returning the wrong callers. So we
+                #     do NOT gate behind `if call_names:` — an emptied list is
+                #     a legitimate change.
+                #   * MED-3: compare as SETS (order-insensitive). call NAMES
+                #     are deduped for the compare, so a mere read-back
+                #     re-ordering never forces a spurious write while a genuine
+                #     content change always differs. Safer than list== for the
+                #     write-reduction goal; never skips a real change.
+                _new_calls = list(call_names)
+                _stored_raw = stored_call_names.get(func_uuid)
+                _stored_calls = _stored_raw if isinstance(_stored_raw, list) else []
+                if set(_new_calls) != set(_stored_calls):
                     try:
                         self.functions_collection.data.update(
                             uuid=func_uuid,
-                            properties={"call_names": list(call_names)},
+                            properties={"call_names": _new_calls},
+                        )
+                        stats['call_names_written'] = (
+                            stats.get('call_names_written', 0) + 1
                         )
                     except Exception:
                         pass

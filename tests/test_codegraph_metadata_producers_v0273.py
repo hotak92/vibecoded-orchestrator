@@ -383,9 +383,11 @@ def test_ensure_n_callers_function_only(analyzer_mod):
 class _XRefFunctions:
     """functions_collection fake for create_cross_references."""
 
-    def __init__(self, bodies, stored_counts=None):
+    def __init__(self, bodies, stored_counts=None, stored_call_names=None):
         self._bodies = bodies
         self._stored = stored_counts or {}
+        # v0.2.74 (R1): stored call_names per uuid, for the change-gate test.
+        self._stored_calls = stored_call_names or {}
         self.updates = []
         self.refs = []
         self.query = types.SimpleNamespace(
@@ -404,16 +406,21 @@ class _XRefFunctions:
         props = {"function_body": self._bodies[uuid], "total_chunks": 1}
         if uuid in self._stored:
             props["n_callers"] = self._stored[uuid]
+        if uuid in self._stored_calls:
+            props["call_names"] = self._stored_calls[uuid]
         return types.SimpleNamespace(uuid=uuid, properties=props)
 
     def iterator(self, return_properties=None):
         return iter(())
 
 
-def _xref_analyzer(analyzer_mod, bodies, cache, stored_counts=None):
+def _xref_analyzer(analyzer_mod, bodies, cache, stored_counts=None,
+                   stored_call_names=None):
     a = analyzer_mod.CodeGraphAnalyzer("P")
     a.client = object()  # truthy — skip the "not connected" bail
-    a.functions_collection = _XRefFunctions(bodies, stored_counts)
+    a.functions_collection = _XRefFunctions(
+        bodies, stored_counts, stored_call_names
+    )
     a.classes_collection = types.SimpleNamespace(
         iterator=lambda **kw: iter(()),
         query=types.SimpleNamespace(fetch_objects=lambda **kw: types.SimpleNamespace(objects=[])),
@@ -474,6 +481,83 @@ def test_n_callers_decrements_on_recompute(analyzer_mod):
     ncw = [u for u in a.functions_collection.updates
            if "n_callers" in u["properties"]]
     assert len(ncw) == 1 and ncw[0]["properties"]["n_callers"] == 1
+
+
+# ───────────────────── v0.2.74 (R1) call_names change-gate ──────────────────
+# THE headline write-amp fix: create_cross_references must only WRITE
+# call_names on a real change (mirroring n_callers). The old code did an
+# UNGATED data.update(call_names) for every function every analyze → 23k
+# tombstones per run → the 136GB objects-LSM bloat. These tests spy the
+# fake collection's `.updates` list for call_names writes.
+
+def _call_names_writes(a):
+    return [u for u in a.functions_collection.updates
+            if "call_names" in u["properties"]]
+
+
+def test_call_names_written_when_no_stored(analyzer_mod):
+    """First analyze (stored call_names absent/NULL) → WRITE the extracted list."""
+    cache = {"mod.caller": "u-c", "mod.target": "u-t"}
+    bodies = {"u-c": _CALLER_BODY, "u-t": _TARGET_BODY}
+    a = _xref_analyzer(analyzer_mod, bodies, cache)  # no stored_call_names
+    a.create_cross_references()
+    cw = _call_names_writes(a)
+    # u-c calls target(); u-t (leaf) has no calls → new [] == stored [] → skip.
+    assert len(cw) == 1, "only the caller (non-empty new) writes on first pass"
+    assert cw[0]["uuid"] == "u-c"
+    assert set(cw[0]["properties"]["call_names"]) == {"target"}
+    assert a.functions_collection is not None
+
+
+def test_call_names_skipped_when_unchanged(analyzer_mod):
+    """Second analyze, stored == new (order-insensitive) → ZERO call_names writes."""
+    cache = {"mod.caller": "u-c", "mod.target": "u-t"}
+    bodies = {"u-c": _CALLER_BODY, "u-t": _TARGET_BODY}
+    # stored already has the target call, but in a different (irrelevant) order
+    a = _xref_analyzer(analyzer_mod, bodies, cache,
+                       stored_call_names={"u-c": ["target"]})
+    a.create_cross_references()
+    assert _call_names_writes(a) == [], "unchanged call set → no write (R1 gate)"
+
+
+def test_call_names_set_compare_ignores_order(analyzer_mod):
+    """MED-3: a mere read-back re-ordering must NOT force a spurious write."""
+    body = "def caller():\n    a()\n    b()\n"
+    cache = {"mod.caller": "u-c", "mod.a": "u-a", "mod.b": "u-b"}
+    bodies = {"u-c": body, "u-a": _TARGET_BODY, "u-b": _TARGET_BODY}
+    # stored order is [b, a]; extracted order is [a, b] — same SET → skip.
+    a = _xref_analyzer(analyzer_mod, bodies, cache,
+                       stored_call_names={"u-c": ["b", "a"]})
+    a.create_cross_references()
+    assert _call_names_writes(a) == [], "set-equal (order differs) → no write"
+
+
+def test_call_names_cleared_on_empty_transition(analyzer_mod):
+    """MED-2: a function that HAD calls and now has NONE must WRITE [] to clear
+    the stale stored list (else callers-queries stay wrong). This is the case
+    the old `if call_names:` guard silently entrenched."""
+    cache = {"mod.caller": "u-c"}
+    bodies = {"u-c": _TARGET_BODY}  # body has NO calls now
+    a = _xref_analyzer(analyzer_mod, bodies, cache,
+                       stored_call_names={"u-c": ["target"]})  # but stored has one
+    a.create_cross_references()
+    cw = _call_names_writes(a)
+    assert len(cw) == 1, "non-empty→empty is a change → clear write"
+    assert cw[0]["uuid"] == "u-c"
+    assert cw[0]["properties"]["call_names"] == [], "must write [] to clear"
+
+
+def test_call_names_changed_set_writes(analyzer_mod):
+    """A genuinely-changed call set (added a call) DOES write."""
+    body = "def caller():\n    target()\n    extra()\n"
+    cache = {"mod.caller": "u-c", "mod.target": "u-t", "mod.extra": "u-e"}
+    bodies = {"u-c": body, "u-t": _TARGET_BODY, "u-e": _TARGET_BODY}
+    a = _xref_analyzer(analyzer_mod, bodies, cache,
+                       stored_call_names={"u-c": ["target"]})  # missing 'extra'
+    a.create_cross_references()
+    cw = _call_names_writes(a)
+    assert len(cw) == 1 and cw[0]["uuid"] == "u-c"
+    assert set(cw[0]["properties"]["call_names"]) == {"target", "extra"}
 
 
 # ───────────────────────── backfill (data.update pass) ──────────────────────
