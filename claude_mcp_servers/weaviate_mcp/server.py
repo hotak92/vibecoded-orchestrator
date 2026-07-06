@@ -195,6 +195,33 @@ except Exception as _sanitiser_import_err:  # pragma: no cover (rare half-instal
     _HAS_CANONICAL_SANITIZER = False
     _canonical_sanitize_for_weaviate_class = None  # type: ignore[assignment]
 
+# v0.2.74 (BLOCKER-1): the code-graph reader prefix is the underscore-PRESERVING
+# `canonical_class_prefix` (the SSOT the ANALYZER writes with + launcher.db
+# `project_codegraph_bindings.collection_prefix` uses), NOT the underscore-
+# DROPPING `sanitize_for_weaviate_class` used for diagrams/KG. Masked until now
+# only because `VibeCodedOrchestrator` has no underscore — but ANY underscored
+# code prefix made the MCP READ a different class than the analyzer WROTE →
+# silent 0-results + a latent duplicate-generator. Import the preserving rule
+# separately; a code-graph-ONLY sanitizer (`_code_sanitize_collection_prefix`,
+# below) routes the Code* class-name construction through it, while diagrams/KG
+# stay on the dropping `_sanitize_collection_prefix` (pinned by
+# `tests/test_diagrams_class_name_parity.py` + the Rust mirror — do NOT merge).
+try:
+    from vco_lib.project_naming import (
+        canonical_class_prefix as _canonical_class_prefix,
+    )
+    _HAS_CODE_CANONICAL_PREFIX = True
+except Exception as _code_prefix_import_err:  # pragma: no cover (rare half-install)
+    logger.warning(
+        "vco_lib.project_naming.canonical_class_prefix import failed (%s) — "
+        "code-graph collection resolution falls back to the underscore-dropping "
+        "rule (correct only for non-underscored project names). Run install.py "
+        "--update to refresh vco_lib.",
+        _code_prefix_import_err,
+    )
+    _HAS_CODE_CANONICAL_PREFIX = False
+    _canonical_class_prefix = None  # type: ignore[assignment]
+
 
 # ─── v0.2.21 Step 18: per-project config resolver ───────────────────────
 #
@@ -2906,14 +2933,44 @@ def _sanitize_collection_prefix(name: str) -> str:
     return pascal
 
 
+def _code_sanitize_collection_prefix(name: str) -> str:
+    """CODE-GRAPH-ONLY prefix sanitizer (v0.2.74, BLOCKER-1).
+
+    The underscore-PRESERVING rule (`canonical_class_prefix`) that the ANALYZER
+    writes Code* classes with and that launcher.db `project_codegraph_bindings.
+    collection_prefix` records. This is DELIBERATELY DIFFERENT from the shared
+    `_sanitize_collection_prefix` (underscore-DROPPING), which diagrams + KG use
+    and which is pinned by `test_diagrams_class_name_parity.py` + the Rust
+    mirror. Routing the code-graph class-name construction through THIS resolver
+    (instead of repointing the shared one) keeps the reader's class name equal
+    to the writer's for ANY project name — including underscored ones — without
+    splitting diagrams/KG resolution.
+
+    Fallback: when `canonical_class_prefix` isn't importable (half-install), fall
+    back to the dropping sanitizer — correct only for non-underscored names, but
+    keeps the MCP booting rather than crashing (same posture as the shared one).
+    """
+    if _HAS_CODE_CANONICAL_PREFIX:
+        try:
+            return _canonical_class_prefix(name)
+        except Exception:  # never let a sanitiser exception take the MCP down
+            pass
+    # Half-install fallback: the dropping rule (parity holds for names with no
+    # underscore, which is the common case; underscored names degrade to the
+    # pre-fix behaviour until vco_lib is refreshed).
+    return _sanitize_collection_prefix(name)
+
+
 def _code_collection(base: str) -> str:
     """Return per-project code graph collection name.
 
     Uses CODE_GRAPH_PROJECT env var as prefix. Falls back to bare name
-    for backward compatibility if not set.
+    for backward compatibility if not set. v0.2.74: uses the code-graph-only
+    underscore-PRESERVING sanitizer so the read class == the analyzer's write
+    class for underscored project names (BLOCKER-1).
     """
     if CODE_GRAPH_PROJECT:
-        prefix = _sanitize_collection_prefix(CODE_GRAPH_PROJECT)
+        prefix = _code_sanitize_collection_prefix(CODE_GRAPH_PROJECT)
         return f"{prefix}_{base}"
     return base
 
@@ -5982,10 +6039,13 @@ async def search_code_graph(
     # search and we don't want to re-scope it.
     base_names = _SCOPES.get(scope, _SCOPES["all"])
     if effective_project:
-        self_prefix = _sanitize_collection_prefix(effective_project)
+        # v0.2.74 (BLOCKER-1): code-graph fan-out uses the underscore-PRESERVING
+        # sanitizer (matches the analyzer's write class), NOT the diagrams/KG
+        # dropping rule.
+        self_prefix = _code_sanitize_collection_prefix(effective_project)
         prefixes: list[tuple[str, str]] = [(self_prefix, effective_project)]
         for peer in _parse_csv_env("VCT_CODE_GRAPH_ACCESS_LIST"):
-            peer_prefix = _sanitize_collection_prefix(peer)
+            peer_prefix = _code_sanitize_collection_prefix(peer)
             if not peer_prefix or peer_prefix == self_prefix:
                 continue
             # Dedupe by prefix; the second tuple element carries the
@@ -6017,7 +6077,8 @@ async def search_code_graph(
     # peer fan-out is opt-in via the seed search above.
     def _project_collection(base: str) -> str:
         if effective_project:
-            prefix = _sanitize_collection_prefix(effective_project)
+            # v0.2.74 (BLOCKER-1): code-graph → underscore-PRESERVING sanitizer.
+            prefix = _code_sanitize_collection_prefix(effective_project)
             return f"{prefix}_{base}"
         return base
     # Reverse map for backward-compat at the few remaining call sites
@@ -6718,7 +6779,8 @@ def query_code_structure(
         # Per-project collection name resolution (uses effective_project, not env)
         def _proj_coll(base: str) -> str:
             if effective_project:
-                prefix = _sanitize_collection_prefix(effective_project)
+                # v0.2.74 (BLOCKER-1): code-graph → underscore-PRESERVING.
+                prefix = _code_sanitize_collection_prefix(effective_project)
                 return f"{prefix}_{base}"
             return base
 
