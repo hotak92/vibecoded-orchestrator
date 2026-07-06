@@ -783,6 +783,49 @@ fn split_codegraph_class_name(class_name: &str) -> Option<(&str, &str)> {
     None
 }
 
+/// v0.2.74 (B-B): pure per-class refusal decision for the orphan-cleanup
+/// delete boundary. Returns `Some(reason)` when the class must NOT be deleted,
+/// or `None` when it is a safe orphan delete candidate.
+///
+/// Refuses when: (a) the class is not a code-graph class; (b) it carries the
+/// legacy prefix (that has its own audited surface); (c) — the HARD GUARD — its
+/// prefix EXACTLY matches an ACTIVE canonical prefix (deleting it would destroy
+/// a live per-project collection). Keeping this pure makes the safety guard
+/// unit-testable without a live Weaviate / DB.
+fn orphan_cleanup_refusal_reason(
+    class: &str,
+    active_canonical_prefixes: &std::collections::HashSet<String>,
+    legacy_prefix: &str,
+) -> Option<String> {
+    let (prefix, _suffix) = match split_codegraph_class_name(class) {
+        Some(parts) => parts,
+        None => {
+            return Some(format!(
+                "refuses to delete '{}': not a code-graph class \
+                 (must end with _CodeModule/_CodeClass/_CodeFunction/\
+                 _CodeAPI/_CodeInteraction)",
+                class
+            ));
+        }
+    };
+    if class.starts_with(&format!("{}_", legacy_prefix)) {
+        return Some(format!(
+            "use cleanup_legacy_codegraph_collections for '{}_*' classes",
+            legacy_prefix
+        ));
+    }
+    if active_canonical_prefixes.contains(prefix) {
+        return Some(format!(
+            "REFUSES to delete '{}': prefix '{}' is the ACTIVE canonical \
+             code-graph collection of a registered project — deleting it \
+             would destroy live data. (If this project was removed, drop \
+             the project first, then re-run detection.)",
+            class, prefix
+        ));
+    }
+    None
+}
+
 /// Normalise a prefix / project name for case-insensitive structural
 /// matching. Strips every non-alphanumeric and lowercases the result.
 /// `"VibeCoded Orchestrator"`, `"VibeCodedOrchestrator"`,
@@ -983,34 +1026,57 @@ pub async fn cleanup_orphan_codegraph_collections(
     let mut deleted: Vec<String> = Vec::new();
     let mut failed: Vec<CleanupFailure> = Vec::new();
 
-    for class in req.classes.iter() {
-        // Must end with a canonical code-graph suffix. Prefix is
-        // user-chosen (any valid Weaviate class name except the legacy
-        // one we already have a separate path for).
-        let (_, _) = match split_codegraph_class_name(class) {
-            Some(parts) => parts,
-            None => {
+    // v0.2.74 (B-B HARD GUARD): the set of ACTIVE canonical code-graph prefixes
+    // (one per registered project, from launcher.db
+    // `project_codegraph_bindings.collection_prefix`, falling back to
+    // `canonical_class_prefix`). The DETECTION side already excludes a prefix
+    // that matches an active canonical from `orphan_groups`, but this command
+    // trusts `req.classes` from the caller — a stale caller, a schema change
+    // between detect and delete, or a bug could pass a LIVE canonical class
+    // (e.g. `VibeCodedOrchestrator_CodeFunction`, the 136GB collection). Deleting
+    // that is catastrophic data loss. So we independently REFUSE any class whose
+    // prefix EXACTLY matches an active canonical prefix — defense-in-depth at the
+    // delete boundary, not by-convention on the detection side.
+    let active_canonical_prefixes: std::collections::HashSet<String> = match db.list_projects() {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|row| {
+                let binding = db.get_project_codegraph_binding(&row.id).ok().flatten();
+                binding.map(|b| b.collection_prefix).unwrap_or_else(|| {
+                    canonical_class_prefix(&row.name)
+                        .unwrap_or_else(|_| sanitize_kg_collection(&row.name))
+                })
+            })
+            .collect(),
+        // If we CANNOT enumerate projects, we cannot prove a class is NOT a live
+        // canonical → refuse ALL deletes (fail-closed: never delete on
+        // uncertainty about what's live).
+        Err(e) => {
+            for class in req.classes.iter() {
                 failed.push(CleanupFailure {
                     class: class.clone(),
                     error: format!(
-                        "refuses to delete '{}': not a code-graph class \
-                         (must end with _CodeModule/_CodeClass/_CodeFunction/\
-                         _CodeAPI/_CodeInteraction)",
-                        class
+                        "refuses to delete '{}': cannot enumerate active projects \
+                         to prove this is not a live canonical collection ({})",
+                        class, e
                     ),
                 });
-                continue;
             }
-        };
-        // Explicitly forbid the legacy prefix here — the user must use
-        // the legacy-cleanup surface for that, which audits separately.
-        if class.starts_with(&format!("{}_", LEGACY_CODEGRAPH_PREFIX)) {
+            return Ok(CleanupLegacyReport { deleted, failed });
+        }
+    };
+
+    for class in req.classes.iter() {
+        // Pure refusal decision (v0.2.74 B-B): not-a-code-graph-class, the
+        // legacy prefix (separate audited surface), OR — the HARD GUARD — a
+        // prefix that matches an ACTIVE canonical (never delete a live
+        // per-project collection). All three land in `failed`, never deleted.
+        if let Some(reason) = orphan_cleanup_refusal_reason(
+            class, &active_canonical_prefixes, LEGACY_CODEGRAPH_PREFIX,
+        ) {
             failed.push(CleanupFailure {
                 class: class.clone(),
-                error: format!(
-                    "use cleanup_legacy_codegraph_collections for '{}_*' classes",
-                    LEGACY_CODEGRAPH_PREFIX
-                ),
+                error: reason,
             });
             continue;
         }
@@ -2053,6 +2119,62 @@ mod tests {
             .expect("must split correctly");
         assert_eq!(prefix, "Foo_Bar");
         assert_eq!(suffix, "CodeFunction");
+    }
+
+    #[test]
+    fn orphan_cleanup_refuses_active_canonical_prefix() {
+        // v0.2.74 (B-B HARD GUARD): the delete boundary must REFUSE a class
+        // whose prefix matches an active canonical — even if a stale/buggy
+        // caller passes it — so a live per-project collection is never dropped.
+        let mut active = std::collections::HashSet::new();
+        active.insert("VibeCodedOrchestrator".to_string());
+        active.insert("SD15".to_string());
+
+        // The live 136GB collection → REFUSED.
+        let r = orphan_cleanup_refusal_reason(
+            "VibeCodedOrchestrator_CodeFunction", &active, "ClaudeOrchestrator",
+        );
+        assert!(r.is_some(), "must refuse a live canonical class");
+        assert!(r.unwrap().contains("ACTIVE canonical"));
+
+        // Another active project's collection → REFUSED.
+        assert!(orphan_cleanup_refusal_reason(
+            "SD15_CodeModule", &active, "ClaudeOrchestrator",
+        ).is_some());
+
+        // The 176MB DUPLICATE variant (differs from canonical) → ALLOWED.
+        assert!(orphan_cleanup_refusal_reason(
+            "Vibecoded_orchestrator_CodeFunction", &active, "ClaudeOrchestrator",
+        ).is_none(), "a non-canonical orphan variant must be deletable");
+
+        // Not a code-graph class → REFUSED.
+        assert!(orphan_cleanup_refusal_reason(
+            "Vibecoded_orchestrator_KnowledgeGraph", &active, "ClaudeOrchestrator",
+        ).is_some());
+
+        // The legacy prefix → REFUSED (separate surface).
+        let r = orphan_cleanup_refusal_reason(
+            "ClaudeOrchestrator_CodeFunction", &active, "ClaudeOrchestrator",
+        );
+        assert!(r.is_some());
+        assert!(r.unwrap().contains("cleanup_legacy_codegraph_collections"));
+    }
+
+    #[test]
+    fn orphan_cleanup_underscored_canonical_matches_exactly() {
+        // An underscored active canonical (e.g. a project literally named with
+        // an underscore) must be matched by its FULL underscored prefix — the
+        // split preserves underscores, so the guard's exact contains() works.
+        let mut active = std::collections::HashSet::new();
+        active.insert("Client_A_Private".to_string());
+        // Live underscored canonical → REFUSED.
+        assert!(orphan_cleanup_refusal_reason(
+            "Client_A_Private_CodeFunction", &active, "ClaudeOrchestrator",
+        ).is_some());
+        // A DIFFERENT underscored variant (e.g. old-generation casing) → ALLOWED.
+        assert!(orphan_cleanup_refusal_reason(
+            "Client_a_private_CodeFunction", &active, "ClaudeOrchestrator",
+        ).is_none());
     }
 
     #[test]

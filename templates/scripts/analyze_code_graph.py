@@ -10009,6 +10009,35 @@ def main():
                 return 1
         project_name = args.project or env_project or repo_path.name
 
+        # ── v0.2.74 (B-A2): loud guard on the FOLDER-NAME fallback ───────────
+        # When neither --project nor CODE_GRAPH_PROJECT is set we fall back to
+        # `repo_path.name`. That is exactly how the 2,196-row
+        # `Vibecoded_orchestrator_Code*` DUPLICATE was minted: the analyzer ran
+        # against the UNREGISTERED public clone (folder `vibecoded-orchestrator`,
+        # no `.claude/env`) and the folder name became the collection prefix —
+        # DIFFERENT from the registered project's canonical prefix
+        # (`VibeCodedOrchestrator`). The worktree guards above don't catch this
+        # (a plain clone folder is not a worktree segment). We can't cheaply know
+        # the registered-project set here, so WARN LOUDLY (never silently mint):
+        # tell the operator the collection is derived from the folder name and
+        # how to point it at the canonical project. Refusing outright would break
+        # legitimate standalone `analyze_code_graph.py .` use, so this is a warn,
+        # not a hard error — but a visible one so a stray clone-analyze is caught
+        # before it accumulates a duplicate collection.
+        if not (args.project or env_project):
+            _derived_prefix = _sanitize_collection_prefix(project_name)
+            print(
+                "⚠️  analyze_code_graph: no --project / CODE_GRAPH_PROJECT set — "
+                f"deriving the code-graph collection prefix from the FOLDER NAME "
+                f"('{repo_path.name}' → '{_derived_prefix}_Code*'). If this repo "
+                "is a clone/checkout of a REGISTERED project, this mints a "
+                "DUPLICATE collection under the folder name instead of writing to "
+                "the project's canonical collections. Pass --project "
+                "<CanonicalProject> (or set CODE_GRAPH_PROJECT / source "
+                ".claude/env) to write to the real collections.",
+                file=sys.stderr,
+            )
+
     if args.verbose:
         print(f"📂 Repository: {repo_path}")
         print(f"📦 Project: {project_name}")
