@@ -448,6 +448,15 @@ else
         "pre-release-gate job not found in release.yml"
 fi
 
+# ── Gate numbering note (v0.2.75 P3) ─────────────────────────────────
+# Gates 19/20 were retired historically and their numbers stay
+# unassigned — old release logs reference them, and re-using the
+# numbers would make those logs ambiguous. The sequence therefore
+# jumps 18 → 21. New gates added in v0.2.75 took the next free
+# numbers instead:
+#   Gate 23 — open Dependabot alerts (Section 3, after Gate 15)
+#   Gate 24 — Step22 access-matrix workflow green (Section 2)
+
 # Gate 21: Pre-tag privacy check (scrubs operational private state from tracked tree).
 if [ -x scripts/check-pre-tag-privacy.sh ]; then
     if bash scripts/check-pre-tag-privacy.sh > /tmp/preship-privacy.log 2>&1; then
