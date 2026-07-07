@@ -5,9 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.74] - 2026-07-06
+## [0.2.74] - 2026-07-07
 
 ### Fixed
+- **Two pre-tag adversarial-audit rounds hardened this release before it
+  shipped.** Round 1 (4 reviewers): a migration-ladder contiguity bug that
+  would deadlock every user at the NEXT codegraph schema bump; the orphan-clear
+  silently deleting legitimate `--extra-path` rows; a false-advance path where
+  an edge with blank output could mask a collection as migrated; the MCP reaper
+  killing a concurrent same-project session's server. Round 2: a
+  Weaviate-unreachable bundle update could permanently stamp an existing
+  collection as already-migrated (now defers + retries); the reaper could kill
+  another project's live session server (now reaps only a superseded sibling of
+  the same harness or a genuinely orphaned process); the resync owed-count now
+  ignores rows a primary walk can never re-index (extra-path rows and
+  `.claude/state` scratch — the scratch is additionally purged by any analyze
+  run, so users the migration cannot reach still converge); the reclaim
+  recreate can never touch a Weaviate we don't own; the per-project
+  migrate-schema surfaces run under the venv python (system python lacked
+  `weaviate-client`, causing recurring failure deferrals); the migration-edge
+  timeout is a last-resort 3600s backstop (`VCT_EDGE_TIMEOUT_SECS`) instead of
+  a 300s working-path deadline that could kill the purge mid-run.
 - **Code-graph write-amplification (the 136 GB) is fixed at the root.** Every
   analyze run used to re-write `call_names` on ALL functions unconditionally —
   `data.update()` bypasses the content-hash tombstone-skip, so a 23k-function
