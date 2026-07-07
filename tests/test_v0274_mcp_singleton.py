@@ -9,8 +9,10 @@ re-registration spawns a new one without stopping the old). ``server.py``
 caches collection constants at module load, so a client binding to a stale
 process fans out over the WRONG project's collections → 0 hits.
 
-  * ``reap_stale_weaviate_mcp(W)`` kills every OTHER live weaviate_mcp whose
-    workspace != W (and any superseded same-workspace prior PID), best-effort.
+  * ``reap_stale_weaviate_mcp(W)`` kills every OTHER live weaviate_mcp that is
+    PROVABLY cross-workspace (its CLAUDE_PROJECT_DIR != W, both known),
+    best-effort. A SAME-workspace peer is LEFT ALONE (H-1): it is harmless (its
+    collections match) and may be a legitimate concurrent session.
   * ``_assert_workspace_unchanged`` (backstop) refuses-loud when a tool call's
     LIVE CLAUDE_PROJECT_DIR diverges from the value the subprocess was spawned
     with, rather than silently serving wrong-project results.
@@ -30,17 +32,18 @@ if str(REPO_ROOT) not in sys.path:
 # ─── reaper ──────────────────────────────────────────────────────────────
 
 
-def test_reaper_kills_other_workspace_only():
-    """Spawning for /ws/W reaps the /ws/OTHER process, leaves nothing else."""
+def test_reaper_kills_cross_workspace_only_keeps_same_workspace():
+    """H-1: spawning for /ws/A reaps ONLY the cross-workspace /ws/B process. A
+    SAME-workspace peer (pid 100, /ws/A) is a legitimate concurrent session and
+    is LEFT ALONE — its collections match ours, so it's harmless, and killing it
+    would terminate another live session's MCP (the regression H-1 flagged)."""
     from vco_lib.mcp_singleton import reap_stale_weaviate_mcp
 
     killed: list[int] = []
 
-    # Two live weaviate_mcp: pid 100 for /ws/A, pid 200 for /ws/B. We are the
-    # fresh process (pid 999) for /ws/A. The /ws/B process is the stale zombie.
     def fake_iter():
-        yield (100, "/ws/A", "python .../weaviate_mcp/server.py")  # same ws as us
-        yield (200, "/ws/B", "python .../weaviate_mcp/server.py")  # DIFFERENT ws
+        yield (100, "/ws/A", "python .../weaviate_mcp/server.py")  # SAME ws → KEEP
+        yield (200, "/ws/B", "python .../weaviate_mcp/server.py")  # DIFFERENT ws → reap
         yield (999, "/ws/A", "python .../weaviate_mcp/server.py")  # us (excluded)
 
     def fake_kill(pid):
@@ -50,11 +53,46 @@ def test_reaper_kills_other_workspace_only():
     n = reap_stale_weaviate_mcp(
         "/ws/A", self_pid=999, _iter=fake_iter, _kill=fake_kill
     )
-    # Both the cross-workspace (200) AND the superseded same-workspace prior
-    # (100) are reaped; self (999) is never signalled.
-    assert n == 2
-    assert set(killed) == {100, 200}
+    # ONLY the cross-workspace (200) is reaped; the same-workspace peer (100)
+    # survives; self (999) is never signalled.
+    assert n == 1
+    assert killed == [200]
+    assert 100 not in killed  # concurrent same-project session preserved
     assert 999 not in killed
+
+
+def test_reaper_never_kills_when_own_workspace_unknown():
+    """Conservative: if OUR workspace is unknown (empty), we cannot prove any
+    peer is cross-workspace → reap NOTHING (never kill on uncertainty)."""
+    from vco_lib.mcp_singleton import reap_stale_weaviate_mcp
+
+    killed: list[int] = []
+
+    def fake_iter():
+        yield (200, "/ws/B", "python .../weaviate_mcp/server.py")
+
+    n = reap_stale_weaviate_mcp(
+        "", self_pid=999, _iter=fake_iter,
+        _kill=lambda p: killed.append(p) or True,
+    )
+    assert n == 0 and killed == []
+
+
+def test_reaper_never_kills_peer_with_unknown_workspace():
+    """A peer whose CLAUDE_PROJECT_DIR is unknown (empty) is NOT reaped — we
+    can't prove it's cross-workspace."""
+    from vco_lib.mcp_singleton import reap_stale_weaviate_mcp
+
+    killed: list[int] = []
+
+    def fake_iter():
+        yield (200, "", "python .../weaviate_mcp/server.py")  # unknown ws
+
+    n = reap_stale_weaviate_mcp(
+        "/ws/A", self_pid=999, _iter=fake_iter,
+        _kill=lambda p: killed.append(p) or True,
+    )
+    assert n == 0 and killed == []
 
 
 def test_reaper_never_signals_self():
@@ -116,20 +154,54 @@ def test_reaper_normalizes_trailing_slash():
     killed: list[int] = []
 
     def fake_iter():
-        # Same workspace, expressed with a trailing slash — still 'us-like',
-        # a superseded same-ws duplicate → reaped (single-instance), NOT
-        # mislabeled cross-workspace.
+        # Same workspace, expressed with a trailing slash — must normalize equal
+        # to ours (/ws/A). Under H-1 a same-workspace peer is KEPT, so the slash
+        # normalization is what proves it's classified same-ws (not spuriously
+        # cross-ws → which would wrongly reap it).
         yield (100, "/ws/A/", "python .../weaviate_mcp/server.py")
 
     n = reap_stale_weaviate_mcp(
         "/ws/A", self_pid=999, _iter=fake_iter,
         _kill=lambda p: killed.append(p) or True,
     )
-    # It's still a duplicate to reap (single-instance-per-workspace), but the
-    # point of THIS test is that normalization didn't crash and the slash
-    # variant compared equal (so it's the same-ws branch, count 1).
-    assert n == 1
-    assert killed == [100]
+    # Normalization made the slash variant compare EQUAL to ours → same-ws →
+    # NOT reaped (H-1: concurrent same-project session preserved). If
+    # normalization had failed, it would look cross-ws and be wrongly killed.
+    assert n == 0
+    assert killed == []
+
+
+# ─── M-1: cmdline matcher must not match editors/pagers/grep ────────────────
+
+
+def test_argv_matcher_matches_real_server_process():
+    from vco_lib.mcp_singleton import _argv_is_weaviate_mcp
+    assert _argv_is_weaviate_mcp(
+        ["python3", "/opt/vco/claude_mcp_servers/weaviate_mcp/server.py"]
+    )
+    assert _argv_is_weaviate_mcp(
+        ["/venv/bin/python", "-u", "/x/weaviate_mcp/server.py"]
+    )
+    # Windows-style backslashes normalize.
+    assert _argv_is_weaviate_mcp(
+        ["python.exe", "C:\\x\\weaviate_mcp\\server.py"]
+    )
+
+
+def test_argv_matcher_rejects_editor_pager_grep_on_the_file():
+    """M-1: an editor/pager/grep OPERATING ON the file must NOT be matched (it
+    would get SIGTERM'd). Requires a python argv[0] + the script as an argv
+    element ending in weaviate_mcp/server.py."""
+    from vco_lib.mcp_singleton import _argv_is_weaviate_mcp
+    assert not _argv_is_weaviate_mcp(["vim", "/x/weaviate_mcp/server.py"])
+    assert not _argv_is_weaviate_mcp(["grep", "-rn", "foo", "/x/weaviate_mcp/server.py"])
+    assert not _argv_is_weaviate_mcp(["tail", "-f", "/x/weaviate_mcp/server.py.log"])
+    assert not _argv_is_weaviate_mcp(["less", "/x/weaviate_mcp/server.py"])
+    # A python process but the file is a .log/.bak (endswith fails).
+    assert not _argv_is_weaviate_mcp(["python3", "/x/weaviate_mcp/server.py.bak"])
+    # Empty / non-python.
+    assert not _argv_is_weaviate_mcp([])
+    assert not _argv_is_weaviate_mcp(["node", "/x/weaviate_mcp/server.py"])
 
 
 # ─── backstop (refuse-loud on workspace drift) ─────────────────────────────

@@ -245,6 +245,32 @@ norm_path() {
 # sanitize_id: reduce a worktree identifier to a filesystem-safe token. Keep
 # [A-Za-z0-9._-]; collapse everything else to '-'. Empty/degenerate → a
 # stable "agent" fallback so we never derive an empty path segment.
+#
+# v0.2.74 (M-3): the token is NOT injective — distinct raw ids like `agent/x`,
+# `agent-x`, `agent\x` all collapse to `agent-x`. If two agents' raw ids
+# collide, the idempotent-re-fire check would match the first's worktree and the
+# second would silently REUSE it (the shared-tree bug, via collision). To keep
+# the token readable AND collision-free, append a short deterministic hash of
+# the RAW id. The live harness sends distinct hex ids (`agent-<hex>`) that never
+# collide today, so this is belt-and-suspenders — but it makes reuse impossible
+# for ANY distinct raw ids. Same rule mirrored in worktree-guard.ps1.
+_id_short_hash() {
+    # First 8 hex chars of a hash of the RAW id. Portable: prefer sha256sum,
+    # fall back to cksum (POSIX). Never empty.
+    local raw="$1" h=""
+    if command -v sha256sum >/dev/null 2>&1; then
+        h="$(printf '%s' "$raw" | sha256sum 2>/dev/null | cut -c1-8)"
+    elif command -v shasum >/dev/null 2>&1; then
+        h="$(printf '%s' "$raw" | shasum -a 256 2>/dev/null | cut -c1-8)"
+    fi
+    if [ -z "$h" ]; then
+        # cksum → decimal; hex-ish enough for disambiguation.
+        h="$(printf '%s' "$raw" | cksum 2>/dev/null | cut -d' ' -f1)"
+    fi
+    [ -n "$h" ] || h="0"
+    printf '%s' "$h"
+}
+
 sanitize_id() {
     local raw="$1" out
     out="$(printf '%s' "$raw" | tr -c 'A-Za-z0-9._-' '-' )"
@@ -254,7 +280,8 @@ sanitize_id() {
     # Trim leading/trailing dashes/dots and collapse runs of dashes.
     out="$(printf '%s' "$out" | sed -E 's/-+/-/g; s/^[-.]+//; s/[-.]+$//')"
     [ -n "$out" ] || out="agent"
-    printf '%s' "$out"
+    # Append the raw-id hash so distinct raw ids never share a token/path.
+    printf '%s-%s' "$out" "$(_id_short_hash "$raw")"
 }
 
 # ── Resolve the git toplevel (the repo this create is scoped to) ──────────

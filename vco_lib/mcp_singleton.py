@@ -76,12 +76,46 @@ def _normalize_workspace(value: Optional[str]) -> str:
         return value.rstrip("/\\")
 
 
+def _argv_is_weaviate_mcp(argv: "list[str]") -> bool:
+    """True iff ``argv`` is a python process EXECUTING weaviate_mcp/server.py.
+
+    v0.2.74 (M-1 fix): tightened from a loose substring test on the joined
+    command line — which matched an editor/pager/grep operating ON the file
+    (``vim …/weaviate_mcp/server.py``, ``tail -f …/server.py.log``,
+    ``grep -rn x …/server.py``) and could SIGTERM it. Now requires BOTH:
+      * argv[0] looks like a python interpreter (basename starts with "python"
+        or is "py"/"py3"), AND
+      * some argv element's PATH ends with ``weaviate_mcp/server.py`` (the
+        script being run, not any substring; the ``.log``/`.bak` case fails
+        the endswith).
+    Falls back to False on an empty / non-list argv.
+    """
+    if not argv:
+        return False
+    exe = os.path.basename((argv[0] or "").strip().lower())
+    # Strip a version suffix like python3.12 → still "python..."
+    if not (exe.startswith("python") or exe in ("py", "py3")):
+        return False
+    for a in argv[1:]:
+        if not a:
+            continue
+        norm = a.replace("\\", "/").lower()
+        if norm.endswith("weaviate_mcp/server.py"):
+            return True
+    return False
+
+
 def _cmdline_is_weaviate_mcp(cmdline: str) -> bool:
-    """True iff the (space-joined) command line launches weaviate_mcp/server.py."""
+    """String-form matcher (psutil path passes a space-joined cmdline).
+
+    Splits on whitespace into a best-effort argv and defers to
+    ``_argv_is_weaviate_mcp``. A path containing a space would split wrong, but
+    the interpreter-basename + endswith checks still hold for the common case;
+    the Linux /proc path uses the exact NUL-split argv and is authoritative.
+    """
     if not cmdline:
         return False
-    low = cmdline.lower()
-    return any(tok in low for tok in _SERVER_TOKENS)
+    return _argv_is_weaviate_mcp(cmdline.split())
 
 
 def _iter_proc_candidates_linux():
@@ -105,10 +139,16 @@ def _iter_proc_candidates_linux():
                 raw = fh.read()
         except (OSError, ValueError):
             continue
-        # cmdline is NUL-separated argv; join with spaces for token match.
-        cmdline = raw.replace(b"\x00", b" ").decode("utf-8", "replace").strip()
-        if not _cmdline_is_weaviate_mcp(cmdline):
+        # cmdline is NUL-separated argv — split it EXACTLY (authoritative, so a
+        # path with a space still matches) and use the argv-structure matcher.
+        argv = [
+            p.decode("utf-8", "replace")
+            for p in raw.split(b"\x00")
+            if p
+        ]
+        if not _argv_is_weaviate_mcp(argv):
             continue
+        cmdline = " ".join(argv)
         workspace = ""
         try:
             with open(f"{proc_root}/{name}/environ", "rb") as fh:
@@ -138,10 +178,11 @@ def _iter_proc_candidates_psutil():
     for proc in psutil.process_iter(["pid", "cmdline", "environ"]):
         try:
             info = proc.info
-            cmd_list = info.get("cmdline") or []
-            cmdline = " ".join(str(c) for c in cmd_list)
-            if not _cmdline_is_weaviate_mcp(cmdline):
+            cmd_list = [str(c) for c in (info.get("cmdline") or [])]
+            # psutil gives the real argv list — match on it directly (M-1).
+            if not _argv_is_weaviate_mcp(cmd_list):
                 continue
+            cmdline = " ".join(cmd_list)
             env = info.get("environ") or {}
             workspace = env.get("CLAUDE_PROJECT_DIR", "") if isinstance(env, dict) else ""
             pid_raw = info.get("pid")
@@ -220,29 +261,37 @@ def reap_stale_weaviate_mcp(
     iterator = _iter if _iter is not None else _iter_weaviate_mcp_processes
     killer = _kill if _kill is not None else _terminate
 
+    # v0.2.74 (H-1 fix): only ever reap a CROSS-WORKSPACE peer. The actual bug
+    # (SD15 hybrid_search 0-hits) is a subprocess scoped to a DIFFERENT project
+    # whose module-load collection constants fan out over the wrong collections.
+    # A SAME-workspace peer is HARMLESS — its collections match ours — and it is
+    # very often a LEGITIMATE concurrent Claude Code session on the same project
+    # (the "main chat + RL chat" model CLAUDE.md explicitly documents). Killing
+    # it would terminate an actively-serving MCP of another live session — a
+    # regression this reaper must not cause. If we cannot determine the peer's
+    # workspace (empty/unknown), we do NOT reap it (conservative: never kill a
+    # process we can't prove is cross-workspace). So a same-workspace duplicate
+    # simply coexists; it's benign, and the per-call refuse-loud backstop already
+    # covers the pathological wrong-binding case.
     reaped = 0
     try:
         for pid, other_ws, cmdline in iterator():
             if pid == my_pid:
                 continue  # never signal ourselves
             other_norm = _normalize_workspace(other_ws)
-            # Reap when the workspace differs. Same-workspace prior PIDs are
-            # ALSO reaped (a superseded restart Claude Code didn't stop) —
-            # keeping exactly one live server per workspace. The my_pid guard
-            # above already excludes the fresh (self) process, so a
-            # same-workspace match here is genuinely a stale duplicate.
-            cross_ws = other_norm != my_ws
+            # Only reap when we can POSITIVELY prove a different workspace.
+            # my_ws unknown OR peer_ws unknown OR equal → leave it alone.
+            if not my_ws or not other_norm or other_norm == my_ws:
+                continue
             if killer(pid):
                 reaped += 1
                 logger.warning(
-                    "reap_stale_weaviate_mcp: terminated stale weaviate_mcp "
-                    "pid=%s (%s: its CLAUDE_PROJECT_DIR=%r, ours=%r) to keep "
-                    "one live server per workspace and prevent collection "
-                    "drift (T5-1).",
-                    pid,
-                    "cross-workspace" if cross_ws else "superseded same-workspace",
-                    other_norm or "(unset)",
-                    my_ws or "(unset)",
+                    "reap_stale_weaviate_mcp: terminated CROSS-WORKSPACE "
+                    "weaviate_mcp pid=%s (its CLAUDE_PROJECT_DIR=%r, ours=%r) so "
+                    "a client binding to it can't fan out over the wrong "
+                    "project's collections (T5-1). Same-workspace peers are left "
+                    "alone (harmless + may be a concurrent session).",
+                    pid, other_norm, my_ws,
                 )
     except Exception as exc:  # noqa: BLE001 — never break the spawn
         logger.debug("reap_stale_weaviate_mcp: enumeration raised (%s)", exc)

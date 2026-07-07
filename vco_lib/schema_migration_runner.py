@@ -1782,7 +1782,37 @@ def _apply_edges_preserving(
     registers at canonical after each successful edge (unless invoked from the
     live-drift path, where the registry is already current).
     SPEC §2.5.
+
+    v0.2.74 (B-1 fix): ``edges`` is the FULL retained ladder from earliest (e.g.
+    ``[4→5, 5→6, 6→7]``), because the earliest edge files must be kept for the
+    A2/reconcile replay-from-earliest paths. But a caller may pass a ``stored``
+    ABOVE the earliest edge (e.g. a project already at v5/v6 taking the
+    RECREATE_NEEDED path). Applying only the edges from ``stored`` forward is the
+    correct minimal walk; asserting contiguity on the WHOLE ladder from ``stored``
+    would spuriously fail ("expected edge at v{stored} but next is {earliest}").
+    So SLICE the ladder to the edges whose ``from_version >= stored`` and validate
+    contiguity on that suffix. When ``stored`` equals the earliest, this is the
+    whole ladder (unchanged behaviour for the A2/reconcile callers). A ``stored``
+    that lands BETWEEN edge boundaries (no edge starts exactly at ``stored``) is a
+    real gap and still errors via the sliced contiguity check.
     """
+    if edges and stored > edges[0].from_version:
+        edges = [e for e in edges if e.from_version >= stored]
+        if not edges:
+            # Nothing at or above `stored` in the ladder — either already at
+            # canonical (no work) or a gap the contiguity check below reports.
+            # An empty suffix with stored < canonical is a genuine missing-edge
+            # condition; surface it rather than silently no-op.
+            if stored < canonical:
+                report.errors.append(
+                    (
+                        artifact_type,
+                        artifact_name,
+                        f"no migration edge starts at or after v{stored} "
+                        f"(canonical v{canonical}) [schema_migration_script_missing]",
+                    )
+                )
+            return
     gap_err = _assert_contiguous(edges, start=stored, end=canonical)
     if gap_err is not None:
         report.errors.append(
@@ -1844,6 +1874,30 @@ def _apply_edges_preserving(
                     f"EDGE_NOOP_NO_PREFIX (could not resolve codegraph scope "
                     f"from env → touched nothing); NOT advancing version; retry: "
                     f"{_retry_command(edge)} "
+                    f"[schema_migration_failed_{edge.path.stem}]",
+                )
+            )
+            return
+        # HIGH-2 / H1 (v0.2.74) — require a POSITIVE proof-of-work sentinel for a
+        # CODEGRAPH edge, not just the absence of the negative one. A codegraph
+        # edge that exits rc=0 having printed NEITHER EDGE_APPLIED nor
+        # EDGE_NOOP_NO_PREFIX cannot be trusted to have done its job (a future
+        # edge author who forgets to emit the sentinel, a truncated stdout) — so
+        # do NOT advance on that ambiguity. Defer + retry. Scoped to
+        # `codegraph_collection` because only the codegraph edges emit these
+        # sentinels; KG/dev/diagrams edges never print them, so they keep the
+        # pre-v0.2.74 rc=0-means-applied contract (no behaviour change for them).
+        if (
+            artifact_type == "codegraph_collection"
+            and not _edge_stdout_says_applied(result.stdout)
+        ):
+            report.errors.append(
+                (
+                    artifact_type,
+                    artifact_name,
+                    f"edge {edge.path.name} exited rc=0 but printed NO "
+                    f"EDGE_APPLIED sentinel (cannot confirm it did real work); "
+                    f"NOT advancing version; retry: {_retry_command(edge)} "
                     f"[schema_migration_failed_{edge.path.stem}]",
                 )
             )

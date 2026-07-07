@@ -88,6 +88,43 @@ def test_guard_present_after_scrub_before_work(hook_path: Path) -> None:
     )
 
 
+def _ps1_hook_files() -> list[Path]:
+    return sorted(HOOKS_DIR.glob("*.ps1"))
+
+
+@pytest.mark.parametrize(
+    "hook_path", _ps1_hook_files(), ids=lambda p: p.name,
+)
+def test_ps1_scrub_before_guard(hook_path: Path) -> None:
+    """v0.2.74 (M-2): the .sh scrub-order static check globbed only *.sh, so a
+    PowerShell hook could reorder the secret-scrub AFTER the VCT_DISABLE_HOOKS
+    guard (a leak on disabled runs) with nothing catching it. This mirrors the
+    .sh check for the PowerShell idiom: a `$env:GITHUB_TOKEN` scrub (Remove-Item
+    Env: or `$env:...=$null`) must precede the `$env:VCT_DISABLE_HOOKS` guard.
+    Only asserts on .ps1 hooks that HAVE both a scrub + a guard (a hook with
+    neither is out of scope)."""
+    lines = hook_path.read_text(encoding="utf-8-sig").splitlines()
+    scrub_idx = next(
+        (i for i, ln in enumerate(lines)
+         if "GITHUB_TOKEN" in ln and (
+             "Remove-Item" in ln or "Env:" in ln or "$env:" in ln.lower()
+             or "'GITHUB_TOKEN'" in ln or '"GITHUB_TOKEN"' in ln)),
+        None,
+    )
+    guard_idx = next(
+        (i for i, ln in enumerate(lines)
+         if "VCT_DISABLE_HOOKS" in ln and ("exit 0" in ln or "exit0" in ln.replace(" ", ""))),
+        None,
+    )
+    if scrub_idx is None or guard_idx is None:
+        pytest.skip(f"{hook_path.name}: no scrub+guard pair to order-check")
+    assert scrub_idx < guard_idx, (
+        f"{hook_path.name}: VCT_DISABLE_HOOKS guard at line {guard_idx + 1} "
+        f"appears BEFORE the secret env-scrub at line {scrub_idx + 1}; this "
+        f"would leak secrets when the guard is disabled mid-run (.ps1 parity)."
+    )
+
+
 @pytest.mark.parametrize("hook_path", _hook_files(), ids=lambda p: p.name)
 def test_guard_short_circuits_fast(hook_path: Path, tmp_path: Path) -> None:
     """With VCT_DISABLE_HOOKS=1, hook exits 0 quickly and quietly.

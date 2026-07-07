@@ -240,6 +240,58 @@ def test_orphan_clear_over_delete_guard(analyzer_mod, tmp_path):
     assert result == frozenset({"src/foo/baz.py"})
 
 
+def test_orphan_clear_never_deletes_extra_path_rows(analyzer_mod, tmp_path):
+    """B1 REGRESSION (silent data loss): a stale row from an `--extra-path`
+    source root (DIFFERENT non-empty `project_source`) must NOT be deleted by the
+    orphan-clear, even though its `file_path` is absent under the PRIMARY root we
+    tested reachability against. The primary-only reachability check has no basis
+    to call an extra-path row an orphan; deleting it destroyed legitimate data on
+    every primary-only resync walk. Only PRIMARY-source rows (empty or
+    primary-matching project_source) are eligible."""
+    rev = analyzer_mod.CODEGRAPH_EMBED_REVISION
+    # Primary root has NOTHING on disk → both rows are absent-under-primary.
+    root = _make_repo(tmp_path, [])
+    rows = [
+        # Primary-source stale+absent row → legitimately an orphan → delete.
+        _Obj("prim", {
+            "file_path": "pkg/gone.py",
+            "embed_revision": rev - 1,
+            "project_source": root.as_posix(),
+        }),
+        # Extra-path stale row: file lives under /some/sibling, absent under the
+        # primary root — but project_source marks it as an extra-path row → KEEP.
+        _Obj("extra", {
+            "file_path": "lib/util.py",
+            "embed_revision": rev - 1,
+            "project_source": "/some/sibling/clone",
+        }),
+        # Legacy row with NO project_source stamp → treated as primary → eligible.
+        _Obj("legacy", {
+            "file_path": "old/legacy.py",
+            "embed_revision": rev - 1,
+            "project_source": "",
+        }),
+    ]
+    functions = _FakeColl(
+        "P_CodeFunction", rows,
+        ("file_path", "embed_revision", "project_source"), agg_count=3,
+    )
+    modules = _FakeColl("P_CodeModule", [], ("path", "embed_revision"), agg_count=0)
+    classes = _FakeColl("P_CodeClass", [], ("file_path", "embed_revision"), agg_count=0)
+    stub = _StaleStub(analyzer_mod, modules, classes, functions, root)
+
+    stub._build_stale_file_set()
+
+    # ONLY the primary + legacy rows deleted; the extra-path row SURVIVES.
+    assert "extra" not in functions.data.deleted, (
+        "B1: an --extra-path row must NEVER be orphan-cleared on a primary walk "
+        f"(deleted={functions.data.deleted})"
+    )
+    assert set(functions.data.deleted) == {"prim", "legacy"}, (
+        f"primary + legacy orphans deleted; got {functions.data.deleted}"
+    )
+
+
 def test_orphan_clear_never_touches_current_revision_row(analyzer_mod, tmp_path):
     """A CURRENT-revision row for a deleted file must NOT be deleted by the
     orphan-clear (scoped to stale rows only)."""

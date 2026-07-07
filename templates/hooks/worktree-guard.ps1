@@ -133,6 +133,22 @@ function Norm-Path([string]$p) {
 # Sanitize-Id: reduce a worktree identifier to a filesystem-safe token. Keep
 # [A-Za-z0-9._-]; collapse everything else to '-'; trim/collapse dashes.
 # Empty → stable "agent" fallback so we never derive an empty path segment.
+# v0.2.74 (M-3): first 8 hex chars of the SHA-256 of the RAW id — mirrors
+# worktree-guard.sh's `sha256sum | cut -c1-8` so distinct raw ids that sanitize
+# to the same token never share a worktree path (collision → silent tree reuse).
+function Get-IdShortHash([string]$raw) {
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($raw)
+        $hash = $sha.ComputeHash($bytes)
+        $sha.Dispose()
+        $hex = -join ($hash | ForEach-Object { $_.ToString('x2') })
+        return $hex.Substring(0, 8)
+    } catch {
+        return '0'
+    }
+}
+
 function Sanitize-Id([string]$raw) {
     $out = ($raw -replace '[^A-Za-z0-9._-]', '-')
     # Neutralise any surviving `..` run (already one path segment, so it can't
@@ -140,7 +156,8 @@ function Sanitize-Id([string]$raw) {
     $out = ($out -replace '\.{2,}', '.')
     $out = ($out -replace '-+', '-') -replace '^[-.]+', '' -replace '[-.]+$', ''
     if (-not $out) { $out = "agent" }
-    return $out
+    # Append the raw-id hash so distinct raw ids never share a token/path (M-3).
+    return ('{0}-{1}' -f $out, (Get-IdShortHash $raw))
 }
 
 # ── Resolve the git toplevel (the repo this create is scoped to) ──────────

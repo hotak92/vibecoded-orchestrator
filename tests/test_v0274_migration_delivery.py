@@ -236,6 +236,90 @@ def test_a1_loop_iterates_and_edge_receives_code_graph_project(
     assert ver == [(canonical,)]
 
 
+@pytest.mark.parametrize("offset", [1, 2])
+def test_b1_stored_above_earliest_still_applies_ladder(
+    db_with_v033, monkeypatch, offset
+):
+    """B-1 REGRESSION: a codegraph collection recorded at a version ABOVE the
+    earliest retained edge (stored=earliest+1 / +2, e.g. v5/v6 against a retained
+    [4→5,5→6,6→7] ladder) must STILL apply the owed edges and advance to canonical.
+
+    Before the B-1 fix, `_apply_edges_preserving` asserted contiguity on the WHOLE
+    retained ladder from `stored`, so `_assert_contiguous(start=5)` saw `4_to_5`
+    first → 'version gap' → ZERO edges applied → permanent defer. The fix slices
+    the ladder to `from_version >= stored`. This is latent today (nothing writes a
+    codegraph v5/v6 row yet) but a guaranteed deadlock at the next codegraph bump,
+    so it's pinned now. The pre-existing test above only covers stored=earliest —
+    the one value that masks the bug.
+    """
+    _insert_codegraph_binding(db_with_v033, "p1", "MyProj")
+    canonical = sv.canonical_version("codegraph_collection")
+    edges = smr.discover_edges(_real_migrations_dir(), "codegraph_collection")
+    assert edges, "shipped codegraph ladder must exist"
+    earliest = edges[0].from_version
+    stored = earliest + offset
+    # Only meaningful when the ladder is deep enough that stored is still < canonical
+    # AND an edge starts exactly at `stored` (mid-ladder boundary).
+    if stored >= canonical or not any(e.from_version == stored for e in edges):
+        pytest.skip(
+            f"ladder too shallow for stored=earliest+{offset} "
+            f"(earliest={earliest}, canonical={canonical})"
+        )
+
+    for suffix in smr._CODEGRAPH_CLASS_SUFFIXES:
+        avr.register_artifact_version(
+            db_with_v033, project_id="p1", artifact_type="codegraph_collection",
+            artifact_name=f"MyProj_{suffix}", schema_version=canonical,
+            materialized_at=1,
+        )
+    conn = sqlite3.connect(str(db_with_v033))
+    conn.execute(
+        "UPDATE artifact_schema_versions SET schema_version = ? "
+        "WHERE artifact_type = 'codegraph_collection'",
+        (stored,),
+    )
+    conn.commit()
+    conn.close()
+
+    # Edge applies successfully + reports it did real work (prefix resolved).
+    spy = _EnvCapturingEdgeSpy(stdout=smr._EDGE_SENTINEL_APPLIED, ok=True)
+    monkeypatch.setattr(smr, "_apply_edge", spy)
+
+    artifact_names = {
+        "codegraph_collection": smr.codegraph_class_names_for_prefix("MyProj")
+    }
+    report = smr.run_schema_migrations(
+        db_path=db_with_v033,
+        project_id="p1",
+        migrations_dir=_real_migrations_dir(),
+        env={"CODE_GRAPH_PROJECT": "MyProj"},
+        artifact_names=artifact_names,
+        weaviate_url="http://localhost:8081",
+        include_orchestrator_wide=False,
+        now_ms=1,
+    )
+
+    # The owed edges from `stored` forward MUST have applied (NOT a gap error).
+    assert spy.count >= 1, (
+        f"stored=earliest+{offset}={stored}: ladder must apply the owed edges, "
+        f"not defer on a spurious contiguity gap. report.errors={report.errors}"
+    )
+    assert not any("script_missing" in str(e) for e in report.errors), (
+        f"stored={stored}: must NOT report a missing-script gap (B-1). "
+        f"errors={report.errors}"
+    )
+    # Advanced to canonical.
+    conn = sqlite3.connect(str(db_with_v033))
+    ver = conn.execute(
+        "SELECT DISTINCT schema_version FROM artifact_schema_versions "
+        "WHERE artifact_type='codegraph_collection'"
+    ).fetchall()
+    conn.close()
+    assert ver == [(canonical,)], (
+        f"stored={stored}: must advance to canonical v{canonical}, got {ver}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # HIGH-2 — no-prefix sentinel refuses the false-advance
 # ---------------------------------------------------------------------------
@@ -338,6 +422,60 @@ def test_high2_applied_sentinel_advances(db_with_v033, monkeypatch):
     ).fetchall()
     conn.close()
     assert ver == [(canonical,)]
+
+
+def test_h1_no_sentinel_does_not_advance(db_with_v033, monkeypatch):
+    """H1 REGRESSION: a codegraph edge that exits rc=0 but prints NEITHER
+    EDGE_APPLIED nor EDGE_NOOP_NO_PREFIX (blank/unexpected stdout — a future edge
+    author forgetting the sentinel, a truncated pipe) must NOT advance the
+    version. The false-advance guard was a denylist (only checked the negative
+    sentinel); a positive EDGE_APPLIED is now REQUIRED as proof-of-work for
+    codegraph edges."""
+    _insert_codegraph_binding(db_with_v033, "p1", "MyProj")
+    canonical = sv.canonical_version("codegraph_collection")
+    edges = smr.discover_edges(_real_migrations_dir(), "codegraph_collection")
+    earliest = edges[0].from_version
+    for suffix in smr._CODEGRAPH_CLASS_SUFFIXES:
+        avr.register_artifact_version(
+            db_with_v033, project_id="p1", artifact_type="codegraph_collection",
+            artifact_name=f"MyProj_{suffix}", schema_version=canonical,
+            materialized_at=1,
+        )
+    conn = sqlite3.connect(str(db_with_v033))
+    conn.execute(
+        "UPDATE artifact_schema_versions SET schema_version = ? "
+        "WHERE artifact_type='codegraph_collection'",
+        (earliest,),
+    )
+    conn.commit()
+    conn.close()
+
+    # rc=0 but BLANK stdout → no positive sentinel → must defer, not advance.
+    spy = _EnvCapturingEdgeSpy(stdout="", ok=True)
+    monkeypatch.setattr(smr, "_apply_edge", spy)
+    report = smr.run_schema_migrations(
+        db_path=db_with_v033,
+        project_id="p1",
+        migrations_dir=_real_migrations_dir(),
+        env={"CODE_GRAPH_PROJECT": "MyProj"},
+        artifact_names={
+            "codegraph_collection": smr.codegraph_class_names_for_prefix("MyProj")
+        },
+        include_orchestrator_wide=False,
+        now_ms=1,
+    )
+    assert report.errors, "a no-sentinel rc=0 edge must surface a deferral"
+    assert any("EDGE_APPLIED" in d for (_t, _n, d) in report.errors), (
+        f"deferral must cite the missing EDGE_APPLIED sentinel; got {report.errors}"
+    )
+    assert not report.applied, "must NOT count as applied on ambiguous stdout"
+    conn = sqlite3.connect(str(db_with_v033))
+    ver = conn.execute(
+        "SELECT DISTINCT schema_version FROM artifact_schema_versions "
+        "WHERE artifact_type='codegraph_collection'"
+    ).fetchall()
+    conn.close()
+    assert ver == [(earliest,)], "version must stay at stored (no false-advance)"
 
 
 # ---------------------------------------------------------------------------

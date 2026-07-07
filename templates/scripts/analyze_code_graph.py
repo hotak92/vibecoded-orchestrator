@@ -5454,6 +5454,11 @@ class CodeGraphAnalyzer:
         # `_get_existing_module` without going through here leave this unset →
         # the orphan-clear fails open (skips, never deletes on uncertainty).
         self._analyze_repo_root = repo_path.resolve()
+        # v0.2.74 (B1): keep the UNRESOLVED primary root too — rows are stamped
+        # with `project_source = source_root.as_posix()` (the unresolved path),
+        # so the orphan-clear must match against BOTH forms to identify which
+        # rows belong to the primary source vs an --extra-path source.
+        self._analyze_repo_root_raw = repo_path.as_posix()
 
         # v0.2.47 (extras): validate + canonicalise extras up-front so
         # downstream loops can assume each entry is an existing absolute
@@ -7970,6 +7975,28 @@ class CodeGraphAnalyzer:
         )
         # v0.2.74 (D1): the resolved repo root. None → fail open (no delete).
         repo_root = getattr(self, "_analyze_repo_root", None)
+        # v0.2.74 (B1 fix): the orphan-clear tests reachability ONLY against the
+        # PRIMARY repo root, but a per-project collection can legitimately hold
+        # rows from `--extra-path` source roots (stamped with a DIFFERENT
+        # `project_source`). Those rows' files are NOT under the primary root, so
+        # a primary-only reachability check would wrongly call them orphans and
+        # DELETE them (silent data loss — the sibling deletes
+        # `_prune_deleted_file_objects` / `_delete_stale_chunk_rows` both scope by
+        # project_source; only this one omitted it). So restrict the orphan-clear
+        # to rows belonging to the PRIMARY source: an empty/absent `project_source`
+        # (legacy or primary-only installs) OR a value equal to the primary root
+        # (resolved OR unresolved form, to tolerate symlink/realpath differences).
+        # A row with a DIFFERENT non-empty project_source is an extra-path row we
+        # did NOT walk here — never delete it on this walk.
+        _primary_sources: Set[str] = set()
+        if repo_root is not None:
+            try:
+                _primary_sources.add(repo_root.as_posix())
+            except Exception:  # noqa: BLE001
+                pass
+        _unresolved_root = getattr(self, "_analyze_repo_root_raw", None)
+        if _unresolved_root:
+            _primary_sources.add(str(_unresolved_root))
         stale: Set[str] = set()
         determinable = False
         orphans_cleared = 0
@@ -8036,6 +8063,14 @@ class CodeGraphAnalyzer:
                     return False  # never touch converged rows
                 if not raw_path:
                     return False  # no path → cannot prove orphan → keep
+                # B1 fix: only orphan-clear rows belonging to the PRIMARY source.
+                # A row whose `project_source` is a DIFFERENT non-empty value is an
+                # `--extra-path` row whose file lives under a root we did NOT test
+                # reachability against — deleting it here would be silent data
+                # loss. Empty/absent project_source = legacy/primary → eligible.
+                _row_src = (_props.get("project_source") or "").strip()
+                if _row_src and _row_src not in _primary_sources:
+                    return False  # extra-path row — not ours to judge on this walk
                 return not _path_reachable_on_disk(str(raw_path), repo_root)
 
             try:
@@ -8043,7 +8078,7 @@ class CodeGraphAnalyzer:
                     coll,
                     path_prop,
                     _is_orphan,
-                    extra_props=[_EMBED_REVISION_PROP],
+                    extra_props=[_EMBED_REVISION_PROP, "project_source"],
                     log_prefix="orphan-clear",
                 )
                 orphans_cleared += deleted

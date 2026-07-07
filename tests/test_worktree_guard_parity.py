@@ -244,10 +244,13 @@ def test_ps1_creates_worktree_from_real_payload(tmp_path: Path) -> None:
     proc = _run_ps1(payload, repo)
     assert proc.returncode == 0, proc.stderr
     out = proc.stdout.strip()
-    expected = repo / ".claude" / "worktrees" / "agent-ps-create"
-    assert out == str(expected.resolve()), out
-    assert Path(out).is_dir()
-    assert str(expected.resolve()) in _worktree_paths(repo)
+    # v0.2.74 (M-3): path is `<token>-<sha256[:8]>`. Assert the directory sits
+    # under .claude/worktrees/ and its basename starts with the token.
+    out_path = Path(out).resolve()
+    assert out_path.parent == (repo / ".claude" / "worktrees").resolve()
+    assert out_path.name.startswith("agent-ps-create-"), out
+    assert out_path.is_dir()
+    assert str(out_path) in _worktree_paths(repo)
 
 
 @needs_ps
@@ -268,10 +271,16 @@ def test_sh_and_ps1_produce_same_path(tmp_path: Path) -> None:
     )
     assert sh_proc.returncode == 0, sh_proc.stderr
     assert ps_proc.returncode == 0, ps_proc.stderr
-    # Compare the tail after the repo root — must be identical.
+    # Compare the tail after the repo root — must be identical (THE parity
+    # assertion: sh and ps1 derive the SAME path, incl. the M-3 sha256[:8] hash
+    # suffix, from the same raw id).
     sh_rel = Path(sh_proc.stdout.strip()).relative_to(sh_repo.resolve())
     ps_rel = Path(ps_proc.stdout.strip()).relative_to(ps_repo.resolve())
-    assert sh_rel == ps_rel == Path(".claude/worktrees") / ident
+    assert sh_rel == ps_rel, f"sh={sh_rel} != ps1={ps_rel}"
+    # And the shape is `.claude/worktrees/<ident>-<8hex>`.
+    assert sh_rel.parent == Path(".claude/worktrees")
+    assert sh_rel.name.startswith(ident + "-")
+    assert len(sh_rel.name) == len(ident) + 1 + 8, sh_rel.name
 
 
 @needs_ps

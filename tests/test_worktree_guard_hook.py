@@ -57,6 +57,23 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HOOK_PATH = REPO_ROOT / "templates" / "hooks" / "worktree-guard.sh"
 
+
+def _expected_wt_path(repo: Path, raw_id: str) -> Path:
+    """The path the hook derives for ``raw_id`` — mirrors the hook's
+    sanitize_id + the v0.2.74 M-3 hash suffix (`<token>-<sha256[:8]>`)."""
+    import hashlib as _hashlib
+    import re as _re
+    out = _re.sub(r"[^A-Za-z0-9._-]", "-", raw_id)
+    out = _re.sub(r"\.{2,}", ".", out)
+    out = _re.sub(r"-+", "-", out)
+    out = _re.sub(r"^[-.]+", "", out)
+    out = _re.sub(r"[-.]+$", "", out)
+    if not out:
+        out = "agent"
+    h = _hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:8]
+    return (repo / ".claude" / "worktrees" / f"{out}-{h}").resolve()
+
+
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32",
     reason="bash hook is POSIX-only; .ps1 sibling covers Windows.",
@@ -160,7 +177,7 @@ def test_real_payload_creates_worktree(tmp_path: Path) -> None:
     proc = _run_hook(payload, repo)
     assert proc.returncode == 0, proc.stderr
     out = proc.stdout.strip()
-    expected = repo / ".claude" / "worktrees" / "agent-a10c46d251a62b21d"
+    expected = _expected_wt_path(repo, "agent-a10c46d251a62b21d")
     assert out == str(expected.resolve()), out
     # The worktree directory actually exists on disk...
     assert Path(out).is_dir(), f"worktree dir not created: {out}"
@@ -182,7 +199,7 @@ def test_worktree_name_key_also_creates(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0, proc.stderr
     out = proc.stdout.strip()
-    expected = repo / ".claude" / "worktrees" / "agent-docs-key"
+    expected = _expected_wt_path(repo, "agent-docs-key")
     assert out == str(expected.resolve())
     assert Path(out).is_dir()
     assert str(expected.resolve()) in _worktree_paths(repo)
@@ -305,10 +322,11 @@ def test_create_failure_aborts_loudly(tmp_path: Path) -> None:
     existing regular FILE (not a registered worktree)."""
     repo = tmp_path / "proj"
     _init_repo(repo)
-    # Pre-create a FILE exactly where the worktree dir would go.
-    wtdir = repo / ".claude" / "worktrees"
-    wtdir.mkdir(parents=True)
-    (wtdir / "agent-collide").write_text("i am a file, not a worktree", encoding="utf-8")
+    # Pre-create a FILE exactly where the worktree dir would go (the M-3
+    # hash-suffixed derived path, computed the same way the hook does).
+    target = _expected_wt_path(repo, "agent-collide")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("i am a file, not a worktree", encoding="utf-8")
     proc = _run_hook(
         {"hook_event_name": "WorktreeCreate", "name": "agent-collide", "cwd": str(repo)},
         repo,
@@ -356,7 +374,7 @@ def test_explicit_path_equals_parent_derives_safe_default(tmp_path: Path) -> Non
     out = Path(proc.stdout.strip())
     # Landed under the convention dir, NOT at the parent root.
     assert out != repo.resolve()
-    assert out == (repo / ".claude" / "worktrees" / "agent-redir").resolve()
+    assert out == _expected_wt_path(repo, "agent-redir"), out
     assert out.is_dir()
     decisions = [r["decision"] for r in _read_log_rows(repo)]
     assert "redirect_parent_path" in decisions
@@ -394,7 +412,7 @@ def test_monorepo_subdir_creates_under_real_toplevel(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0, proc.stderr
     out = Path(proc.stdout.strip())
-    expected = mono / ".claude" / "worktrees" / "agent-mono"
+    expected = _expected_wt_path(mono, "agent-mono")
     assert out == expected.resolve()
     assert out.is_dir()
     assert str(expected.resolve()) in _worktree_paths(mono)
