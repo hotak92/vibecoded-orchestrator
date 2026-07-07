@@ -28,8 +28,11 @@ already-audited machinery:
     from ``knowledge/**`` / ``docs/**``. NO new drop path.
 
   * **codegraph** (`codegraph_collection`) → re-run the project's
-    ``.claude/scripts/code-graph-analyze . --force`` which drops + rebuilds
-    the 5 ``<prefix>_Code*`` classes from the source walk. NO new drop path.
+    ``.claude/scripts/code-graph-analyze . --force-recreate`` which drops +
+    rebuilds the 5 ``<prefix>_Code*`` classes from the source walk. NO new
+    drop path. (v0.2.75: docs previously said ``--force``, a flag the
+    analyzer's argparse rejects — the RUNNER below always used the real
+    ``--force-recreate``.)
 
 After a successful regenerate, the artifact is re-registered at canonical via
 ``vco_lib.artifact_version_registry.register_artifact_version`` (preceded by an
@@ -161,8 +164,8 @@ def regenerate_derived_collection(
         → ``python -m vco_lib.project_init migrate-collections --name <project>
         --force-rebuild --project-folder <folder>`` (drop+recreate+re-sync from
         ``knowledge/**`` / ``docs/**``).
-      * ``codegraph_collection`` → ``.claude/scripts/code-graph-analyze . --force``
-        (drop+rebuild the 5 Code* classes from the source walk).
+      * ``codegraph_collection`` → ``.claude/scripts/code-graph-analyze .
+        --force-recreate`` (drop+rebuild the 5 Code* classes from the walk).
 
     On success, re-registers the artifact at canonical (idempotent
     unregister→register). On a GUARD refusal, NOTHING is dropped and the result

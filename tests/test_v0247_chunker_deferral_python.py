@@ -97,8 +97,15 @@ class TestEmitChunkerResyncDeferral:
             assert "chunker_preset_overhaul_pending" in content
             assert "0.2.45" in content
             assert "0.2.46" in content
-            assert "kg-sync --all --force" in content
-            assert "code-graph-analyze . --force" in content
+            # v0.2.75 (C-10 family fix): the emitted commands must be ones
+            # the target CLIs accept — `kg-sync` has no `--force` (its manual
+            # argv loop silently ignored it) and the analyzer's argparse
+            # REJECTS `--force`; the real drop+rebuild flag is
+            # `--force-recreate`. Family guard:
+            # tests/test_deferral_command_argparse_sweep.py.
+            assert "kg-sync --all" in content
+            assert "kg-sync --all --force" not in content
+            assert "code-graph-analyze . --force-recreate" in content
 
     def test_severity_is_info(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -9718,10 +9718,27 @@ def _collect_scoped_rel_paths(
     return rels
 
 
-def main():
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Construct the analyzer's argparse parser (extracted from main()).
+
+    v0.2.75 (C-10 family fix): the parser is built by a dedicated,
+    side-effect-free function so tests can dry-parse the exact CLI contract
+    without executing an analysis. tests/test_deferral_command_argparse_sweep.py
+    feeds EVERY `command_to_apply` string VCO emits through this parser — a
+    deferral that names a flag this parser rejects (the v0.2.73 rename
+    deferral emitted a nonexistent `--force`) now fails CI instead of
+    shipping an un-runnable remediation.
+
+    `allow_abbrev=False` (v0.2.75): with abbreviation on (the argparse
+    default), that historical bogus flag was silently PREFIX-EXPANDED to
+    `--force-recreate` — i.e. an unintended DROP of all five per-project
+    collections. A destructive flag must only ever fire when spelled out in
+    full; unknown/abbreviated flags now fail loudly instead.
+    """
     parser = argparse.ArgumentParser(
         description="Analyze codebase and extract entities into Weaviate code graph",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
     )
 
     parser.add_argument('repo_path', type=Path, help='Path to repository to analyze')
@@ -9867,8 +9884,11 @@ def main():
                        action='store_false',
                        help='Exclude the `.claude/` directory from analysis '
                             '(the launcher passes this for every non-root project).')
+    return parser
 
-    args = parser.parse_args()
+
+def main():
+    args = _build_arg_parser().parse_args()
 
     # v0.2.18 (Plan C) — --prune-stale + --language is now the CORRECT
     # combination, not a footgun. The prune pass filters by stored

@@ -328,8 +328,14 @@ mod tests {
         assert!(content.contains("chunker_preset_overhaul_pending"));
         assert!(content.contains("0.2.45"));
         assert!(content.contains("0.2.46"));
-        assert!(content.contains("kg-sync --all --force"));
-        assert!(content.contains("code-graph-analyze . --force"));
+        // v0.2.75 (C-10 family fix): the emitted commands must be ones the
+        // target CLIs actually accept — `kg-sync` has no `--force` and the
+        // analyzer's argparse rejects `--force` (the real drop+rebuild flag
+        // is `--force-recreate`). Family-wide guard:
+        // tests/test_deferral_command_argparse_sweep.py.
+        assert!(content.contains("kg-sync --all"));
+        assert!(!content.contains("kg-sync --all --force"));
+        assert!(content.contains("code-graph-analyze . --force-recreate"));
     }
 
     #[test]

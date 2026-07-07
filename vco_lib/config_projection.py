@@ -69,8 +69,9 @@ This module chooses **Option A**. Reasons:
      in ``install.py``'s backfill section; migrating them to the
      contract is a same-language refactor with no FFI involved.
   4. The launcher already shells out to Python in several places
-     (``vco_lib.project_init derive``, ``--migrate-collections``); a
-     fourth CLI verb does not add infrastructure.
+     (the ``vco_lib.project_init`` subcommands ``derive`` and
+     ``migrate-collections``); a fourth CLI verb does not add
+     infrastructure.
 
 The trade-off: Rust call sites pay subprocess overhead (one ``python3``
 spawn per project mutation). Measured worst-case on a cold Python

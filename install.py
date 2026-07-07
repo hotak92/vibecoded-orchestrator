@@ -17089,10 +17089,18 @@ def _w40_run_adoption_uplifts(
                             "be safely auto-applied in an unattended install run. "
                             "Run the command below when you can afford the downtime."
                         ),
+                        # v0.2.75 (C-10 family fix): the previous primary
+                        # command was `python install.py --update
+                        # --migrate-collections --force-rebuild` — neither
+                        # flag exists on install.py's argparse (caught by
+                        # tests/test_deferral_command_argparse_sweep.py). The
+                        # env-scoped call below is the real remediation (the
+                        # same KG_COLLECTION-override mechanism this uplift
+                        # itself used; `args` only needs `force_rebuild` per
+                        # migrate_collections' caller contract).
                         command_to_apply=(
-                            f"python install.py --update --migrate-collections "
-                            f"--force-rebuild\n"
-                            f"# Or migrate only this collection interactively:\n"
+                            f"# Rebuild ONLY this adopted collection "
+                            f"(drops + re-embeds ~{_row_count} objects):\n"
                             f"python -c \"from vco_lib import project_init; "
                             f"import argparse, os; "
                             f"os.environ['KG_COLLECTION']='{new_name}'; "

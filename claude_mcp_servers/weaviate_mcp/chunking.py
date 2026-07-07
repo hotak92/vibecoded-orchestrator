@@ -237,10 +237,13 @@ MODEL_TOKEN_LIMITS: dict[str, int] = {
 #
 # When the launcher detects this changed across an update, it should
 # write an UPDATE_DEFERRED.md entry telling the user to run
-# `.claude/scripts/kg-sync --all --force` + `code-graph-analyze . --force`
-# to re-chunk under the new presets. Today this is a manual user
-# action — see https://github.com/hotak92/vibecoded-orchestrator
-# issue tracking #TBD for the launcher-side automation.
+# `.claude/scripts/kg-sync --all` + `code-graph-analyze . --force-recreate`
+# to re-chunk under the new presets (v0.2.75: the previously-documented
+# `--force` flags don't exist on either CLI — see
+# vco_lib/project_init.py::_emit_chunker_resync_deferral, the actual
+# emitter, and tests/test_deferral_command_argparse_sweep.py). Today this
+# is a manual user action — see https://github.com/hotak92/
+# vibecoded-orchestrator issue tracking #TBD for launcher-side automation.
 #
 # Revision history:
 #   v0.2.47.5 (2026-06-04): re-cast as num_ctx (was: model architectural max).

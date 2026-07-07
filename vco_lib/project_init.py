@@ -5830,13 +5830,21 @@ def _emit_chunker_resync_deferral(
         f"lives in chunk N+1 that the new preset would have folded into "
         f"chunk N."
     )
+    # v0.2.75 (C-10 family fix): the previous commands named flags the target
+    # CLIs reject or ignore — `kg-sync --force` does not exist (kg-sync's
+    # manual argv loop silently ignored it) and `code-graph-analyze --force`
+    # is rejected by argparse ("unrecognized arguments"), so the remediation
+    # could never run as written. `--force-recreate` is the real drop+rebuild
+    # flag, which is exactly the "re-chunk everything" this deferral wants.
+    # Guarded by tests/test_deferral_command_argparse_sweep.py.
     cmd = (
         "# Re-chunk this project's KG under the new presets:\n"
         f"cd {folder}\n"
-        ".claude/scripts/kg-sync --all --force\n"
+        ".claude/scripts/kg-sync --all\n"
         "\n"
-        "# Re-chunk this project's code graph under the new presets:\n"
-        ".claude/scripts/code-graph-analyze . --force\n"
+        "# Re-chunk this project's code graph under the new presets\n"
+        "# (drop + rebuild the 5 Code* classes so every entity re-embeds):\n"
+        ".claude/scripts/code-graph-analyze . --force-recreate\n"
         "\n"
         "# Both commands are heavy I/O (re-embeds every chunk via Ollama).\n"
         "# Consider running them when you're not actively coding."
@@ -11952,7 +11960,8 @@ def _cmd_migrate_schema(args: argparse.Namespace) -> int:
                                guarded ``migrate-shared-kg-schema`` script
                                (GUARD 1/2); per-project / codegraph branches
                                reuse ``migrate-collections --force-rebuild`` /
-                               ``code-graph-analyze --force``. NO new drop path.
+                               ``code-graph-analyze --force-recreate``. NO new
+                               drop path.
 
     Always exits 0 (probe / soft-fail) unless ``--strict``. Prints JSON.
     """
