@@ -981,12 +981,11 @@ def classify_row(
     # 6. Deleted-file orphans — nothing re-walks a file that no longer
     #    exists (D1 orphan-clear semantics, kept). Skipped entirely when no
     #    root/predicate is available (fail-open toward "owed").
-    if reachable_fn is not None or repo_root is not None:
-        if reachable_fn is not None:
-            reachable = reachable_fn(raw_path)
-        else:
-            reachable = path_reachable_on_disk(raw_path, repo_root)
-        if not reachable:
+    if reachable_fn is not None:
+        if not reachable_fn(raw_path):
+            return "purgeable"
+    elif repo_root is not None:
+        if not path_reachable_on_disk(raw_path, repo_root):
             return "purgeable"
     # 7. Reachable, non-ignored, stale → a re-walk converges it.
     return "owed"

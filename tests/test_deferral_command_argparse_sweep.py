@@ -50,7 +50,6 @@ import re
 import shlex
 import sys
 import tempfile
-import types
 from pathlib import Path
 
 import pytest
