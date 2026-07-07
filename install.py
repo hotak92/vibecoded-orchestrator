@@ -6899,6 +6899,37 @@ def main() -> int:
     # at the top of main(), so foreign writer families' entries survive this
     # rebuild-from-memory write.
     #
+    # P1 (v0.2.75) TOCTOU close: the A-2 seed snapshots the disk at t0, but a
+    # detached child (e.g. the P7 resync driver failing fast) can read-merge-
+    # write a NEW foreign entry to disk minutes later — the rebuild-from-
+    # memory write below would clobber it. Re-merge from disk NOW, at the
+    # last moment before the single final write: owned IDs stay excluded
+    # (drop-when-absent semantics intact) and merge_from_disk's per-run
+    # mark_resolved tombstones prevent resurrecting entries this run
+    # explicitly settled (the R-6 not_owed probe clears
+    # codegraph_embed_resync_pending from MEMORY only; its on-disk copy is
+    # still present here and must NOT be re-imported). Soft-fail like the
+    # seed. This is a merge, not a write — A-11's single-write invariant
+    # (tests/test_deferral_foreign_preservation_v0273.py) holds.
+    try:
+        _late_merged = _deferral_report.merge_from_disk(
+            _deferral_folder,
+            exclude_ids=_INSTALL_OWNED_CONDITION_IDS,
+            exclude_prefixes=_INSTALL_OWNED_CONDITION_PREFIXES,
+        )
+        if _late_merged:
+            _log_install_event(
+                "deferral_report", "ok",
+                f"pre-write disk re-merge preserved {_late_merged} mid-run "
+                f"foreign deferral entr{'y' if _late_merged == 1 else 'ies'} "
+                "(P1 TOCTOU close)",
+            )
+    except Exception as exc:  # noqa: BLE001 — re-merge is best-effort
+        _log_install_event(
+            "deferral_report", "warn",
+            f"P1 pre-write disk re-merge failed: {exc}",
+        )
+
     # Additionally, on --update runs that ended with ZERO entries, write a
     # stub UPDATE_DEFERRED.md so the user has a paper trail confirming the
     # update completed cleanly (was previously: NO file at all, indistinguishable

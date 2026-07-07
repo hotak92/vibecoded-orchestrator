@@ -679,6 +679,17 @@ class DeferralReport:
 
     def __init__(self) -> None:
         self._entries: List[DeferralEntry] = []
+        # P1 (v0.2.75): condition IDs this report instance EXPLICITLY
+        # resolved this run (tombstones). :meth:`merge_from_disk` skips
+        # them so a late merge (e.g. install.py's pre-final-write TOCTOU
+        # merge) cannot resurrect an entry whose on-disk copy still exists
+        # only because the single end-of-run write hasn't happened yet.
+        # Canonical case: ``codegraph_embed_resync_pending`` is FOREIGN
+        # (never in install.py's owned set), cleared from MEMORY by the
+        # R-6 owed-probe via mark_resolved — without the tombstone a
+        # naive merge would re-import the stale disk copy and the ledger
+        # would never clear.
+        self._resolved_this_run: set = set()
 
     # ------------------------------------------------------------------
     # Public accumulation API
@@ -688,10 +699,21 @@ class DeferralReport:
         """Accumulate an entry; last write for a given condition_id wins."""
         self._entries = [e for e in self._entries if e.condition_id != entry.condition_id]
         self._entries.append(entry)
+        # A re-add supersedes a prior mark_resolved: the condition is live
+        # again, so it must not be tombstoned out of a later disk merge.
+        self._resolved_this_run.discard(entry.condition_id)
 
     def mark_resolved(self, condition_id: str) -> None:
-        """Drop all entries matching *condition_id* (resolved; next write removes them)."""
+        """Drop all entries matching *condition_id* (resolved; next write removes them).
+
+        Also tombstones the ID for this run so :meth:`merge_from_disk`
+        cannot re-import a stale on-disk copy (P1, v0.2.75). Recorded
+        unconditionally — resolving an ID that was never in memory (e.g.
+        a probe confirming an on-disk ledger entry is settled) must still
+        prevent its resurrection at merge time.
+        """
         self._entries = [e for e in self._entries if e.condition_id != condition_id]
+        self._resolved_this_run.add(condition_id)
 
     def merge_from_disk(
         self,
@@ -712,6 +734,12 @@ class DeferralReport:
           caller's drop-when-absent semantics stay intact for those.
         * already present in this report (the current run re-detected it) →
           NOT merged; the in-memory entry is fresher.
+        * resolved by THIS report instance this run (``mark_resolved``
+          tombstone, P1 v0.2.75) → NOT merged; the on-disk copy is stale —
+          it survives only because the caller's single end-of-run write
+          hasn't landed yet. Re-importing it would resurrect an entry the
+          run explicitly settled (e.g. ``codegraph_embed_resync_pending``
+          after the R-6 not_owed probe) and the ledger would never clear.
         * everything else (FOREIGN) → appended verbatim.
 
         Returns the number of entries merged. Never raises — a read/parse
@@ -727,6 +755,8 @@ class DeferralReport:
         for entry in on_disk.entries:
             cid = entry.condition_id
             if condition_is_owned(cid, exclude_ids, exclude_prefixes):
+                continue
+            if cid in self._resolved_this_run:
                 continue
             if self.has_condition(cid):
                 continue
