@@ -167,6 +167,37 @@ class PowerShellFunctionParsingTests(unittest.TestCase):
         self.assertEqual(decls[0]["name"], "Get-Big")
         self.assertEqual(decls[0]["kind"], "filter")
 
+    def test_deeply_indented_nested_function_does_not_crash(self) -> None:
+        """v0.2.75 (P1b) regression: a declaration indented by >= 8
+        whitespace chars (a nested function inside a scriptblock — the
+        idiomatic hook shape) crashed the parser with IndexError. The
+        `^[ \\t]*` prefix is PART of the regex match, so the old
+        kind-detection slice (`cleaned[line_start:m.start() + 8]`) saw only
+        whitespace, `.strip().split()[0]` blew up, the per-file handler
+        caught it, and `_invalidate_module_row` re-stamped the module row to
+        embed_revision=0 on EVERY run — an immortal convergence loop (the
+        row was counted owed forever while the walk could never finish the
+        file). The kind now comes from the regex `kind` capture group.
+        """
+        src = (
+            "$sb = {\n"
+            "    if ($true) {\n"
+            "        function Test-Truthy($v) {\n"          # 8-space indent
+            "            return [bool]$v\n"
+            "        }\n"
+            "\t\t\tfilter Select-Big { if ($_.n -gt 3) { $_ } }\n"  # tabs
+            "    }\n"
+            "}\n"
+            "function Top-Level { return 1 }\n"
+        )
+        decls = self.mod._parse_powershell_functions(src)  # must not raise
+        by_name = {d["name"]: d for d in decls}
+        self.assertIn("Test-Truthy", by_name)
+        self.assertEqual(by_name["Test-Truthy"]["kind"], "function")
+        self.assertIn("Select-Big", by_name)
+        self.assertEqual(by_name["Select-Big"]["kind"], "filter")
+        self.assertIn("Top-Level", by_name)
+
     def test_function_decl_inside_block_comment_ignored(self) -> None:
         # Defense: docstring-style example shouldn't masquerade as a
         # real declaration.

@@ -110,49 +110,24 @@ _PROBE_PATH_PROP: dict = {
 }
 
 
-def _path_reachable_on_disk(rel_or_abs_path: str, repo_root: Path) -> bool:
-    """True when ``rel_or_abs_path`` resolves to a real on-disk file INSIDE
-    ``repo_root``.
+# v0.2.75 (P1b-1): the reachability rule, the ignore-set and the whole
+# owed/not-owed/purgeable decision now live in ONE shared home —
+# ``vco_lib.codegraph_row_classify`` — consumed here by import and mirrored
+# byte-identically inside the analyzer template (which cannot import vco_lib
+# at user sites); ``tests/test_codegraph_row_classify_parity.py`` locks the
+# mirror. The pre-v0.2.75 module-local names below are kept as aliases for
+# existing importers (tests, downstream scripts).
+from vco_lib.codegraph_row_classify import (  # noqa: E402 — grouped with the notes above
+    CODEGRAPH_IGNORE_PARTS,
+    CODEGRAPH_SKIP_SUFFIXES,
+    TRANSIENT_STATE_MARKER as _SHARED_TRANSIENT_STATE_MARKER,
+    classify_row,
+    path_is_ignored,
+    path_reachable_on_disk,
+)
 
-    R3 (v0.2.74): mirrors
-    ``templates/scripts/analyze_code_graph.py::_path_reachable_on_disk`` (and
-    ``install.py::_path_resolves_on_disk`` safety) — the owed-probe must count
-    a stale row as REACHABLE on exactly the same rule the analyzer's
-    orphan-clear uses to KEEP it, so the two can't disagree about convergence.
-    (Keep the two in lock-step; do not diverge the containment/fail-safe rule.)
-
-    A stored code-graph path is repo-relative POSIX. It is REACHABLE iff
-    ``(repo_root / rel).exists()`` AND the resolved path lies inside
-    ``repo_root`` (a ``../../etc/passwd`` escape resolves outside → NOT
-    reachable → an orphan the analyzer's orphan-clear would delete → excluded
-    from the reachable count).
-
-    Fail-SAFE toward COUNTING AS REACHABLE (do not let an indeterminate probe
-    make the owed state look converged when it may not be): an empty path or
-    ANY OS/value error while probing returns ``True``. A wrong "reachable"
-    over-counts stale rows → the probe reports MORE owed work → conservative
-    (never a wrong "converged" skip); a wrong "orphan" would UNDER-count and
-    could falsely converge, so uncertainty always resolves to reachable.
-    """
-    if not rel_or_abs_path:
-        return True
-    try:
-        root_resolved = repo_root.resolve()
-    except (OSError, ValueError):
-        return True
-    try:
-        candidate = (root_resolved / rel_or_abs_path).resolve()
-    except (OSError, ValueError):
-        return True
-    try:
-        if not candidate.is_relative_to(root_resolved):
-            return False  # determinate escape → not a repo file → orphan
-    except (OSError, ValueError):
-        return True
-    try:
-        return candidate.exists()
-    except (OSError, ValueError):
-        return True
+#: Backwards-compat alias (pre-v0.2.75 module-local name).
+_path_reachable_on_disk = path_reachable_on_disk
 
 
 def _make_reachability_filter(repo_root: Optional[Path]):
@@ -216,31 +191,19 @@ _CODEGRAPH_BASES: tuple = (
     "CodeFunction", "CodeClass", "CodeModule", "CodeAPI", "CodeInteraction",
 )
 
-# Path-part ignore set. MUST MATCH templates/scripts/analyze_code_graph.py::
-# _COMMON_IGNORE_DIRS (+ `vendor`, which the analyzer applies via the js/ts/
-# go/ruby language extras — pruning it unconditionally here matches the
-# single-file dispatch's conservative `.wt`/`vendor` gate). `.claude` is added
-# only when the caller says index_dot_claude=False for the project (the
-# orchestrator root indexes .claude/ as first-party source — never prune it
-# there).
-_PRUNE_IGNORE_PARTS: frozenset = frozenset({
-    '.git', '.svn', '.hg',
-    '.venv', 'venv', 'env', '.env', 'virtualenv', '.tox', 'site-packages',
-    '__pycache__', '.pytest_cache',
-    'build', 'dist', 'out',
-    'node_modules',
-    'worktrees', '.wt',
-    '.svelte-kit', '.next', '.nuxt', '.cache', '.parcel-cache', '.turbo',
-    '.angular',
-    'vendor',
-})
-
-# Filename skip suffixes. MUST MATCH the union of analyze_code_graph.py::
-# _JS_SKIP_SUFFIXES + _TS_SKIP_SUFFIXES (build output / config / type stubs).
-_PRUNE_SKIP_SUFFIXES: tuple = (
-    '.min.js', '.bundle.js', '.chunk.js', '.config.js', '.config.mjs',
-    '.d.ts', '.bundle.ts', '.chunk.ts', '.config.ts', '.config.mts',
-)
+# Path-part ignore set + filename skip suffixes: v0.2.75 (P1b-2) — now the
+# ONE derived set shared with the analyzer's walk table
+# (`_ALL_IGNORE_PARTS`) via `vco_lib.codegraph_row_classify` (value-parity
+# locked by tests/test_codegraph_row_classify_parity.py). This adds the
+# previously missing language-extras (`target`/`coverage`/`obj`/`bin`/
+# `.gradle`/`.vs`/`.bundle`) so a stale row under e.g. `target/` no longer
+# survives the prune while being unreachable by any walk (an immortal
+# convergence loop pre-v0.2.75). `.claude` is added only when the caller
+# says index_dot_claude=False for the project (the orchestrator root indexes
+# .claude/ as first-party source — never prune it there). The pre-v0.2.75
+# module-local names are kept as aliases for existing importers.
+_PRUNE_IGNORE_PARTS: frozenset = CODEGRAPH_IGNORE_PARTS
+_PRUNE_SKIP_SUFFIXES: tuple = CODEGRAPH_SKIP_SUFFIXES
 
 # Per-base property carrying the source path. MUST MATCH the analyzer's
 # storage shape (CodeModule keys on `path`; the rest on `file_path`).
@@ -299,27 +262,10 @@ def _build_client(weaviate_url: Optional[str] = None,
         return None
 
 
-def _path_is_ignored(file_path: str, *, index_dot_claude: bool = True) -> bool:
-    """True when a stored row path falls in the CURRENT ignore set.
-
-    Path-PART match (not substring) for directories — `my_vendor_tools/x.py`
-    is NOT pruned; `vendor/x.py` is. Suffix match for build-output filenames.
-    """
-    if not file_path:
-        return False
-    norm = str(file_path).replace("\\", "/")
-    parts = [p for p in norm.split("/") if p]
-    if not parts:
-        return False
-    ignore = _PRUNE_IGNORE_PARTS
-    if not index_dot_claude:
-        ignore = ignore | frozenset({'.claude'})
-    if any(p in ignore for p in parts[:-1]):
-        return True
-    name = parts[-1]
-    if name.startswith('vite.config'):
-        return True
-    return any(name.endswith(s) for s in _PRUNE_SKIP_SUFFIXES)
+# v0.2.75 (P1b): the ignored-path predicate moved to the shared classifier
+# module (one home). Alias keeps the pre-v0.2.75 module-local name working
+# for existing importers.
+_path_is_ignored = path_is_ignored
 
 
 def prune_ignored_rows(
@@ -400,13 +346,11 @@ def prune_ignored_rows(
                 pass
 
 
-#: Exact substring identifying orchestrator transient-scratch rows — MUST match
-#: ``migrations/codegraph_collection/6_to_7.py::_TRANSIENT_MARKER``. Paths are
-#: stored ``as_posix()`` on every OS, so forward slashes always match. These
-#: rows are walk-EXCLUDED since v0.2.73, so a resync can never re-stamp them:
-#: counting them as "owed" makes the probe permanently non-zero (the CLI-only /
-#: false-v7 non-convergence the v0.2.74 Fable review flagged).
-_TRANSIENT_STATE_MARKER = ".claude/state/"
+#: Exact substring identifying orchestrator transient-scratch rows — the
+#: value now lives in ``vco_lib.codegraph_row_classify.TRANSIENT_STATE_MARKER``
+#: (MUST match ``migrations/codegraph_collection/6_to_7.py::_TRANSIENT_MARKER``).
+#: Alias keeps the pre-v0.2.75 module-local name for existing importers.
+_TRANSIENT_STATE_MARKER = _SHARED_TRANSIENT_STATE_MARKER
 
 
 def _count_stale_in_collection(
@@ -416,36 +360,32 @@ def _count_stale_in_collection(
     path_prop: str = "file_path",
     reachable_fn=None,
     primary_sources: "Optional[set]" = None,
+    index_dot_claude: bool = True,
 ) -> Optional[int]:
-    """Count rows NOT at ``current_revision`` in one collection.
+    """Count rows a re-walk is genuinely OWED in one collection.
 
-    R3 (v0.2.74): when ``reachable_fn`` is provided, count only REACHABLE stale
-    rows — a stale row whose stored path is gone from disk (an orphan) is NOT
-    owed a re-walk (nothing re-walks a deleted file), so counting it would keep
-    the owed state permanently non-zero → every ``--update`` re-triggers a
-    whole-repo resync (the "not converged" loop). The analyzer's D1 orphan-clear
-    deletes those rows; this filter stops counting them so the two agree.
+    v0.2.75 (P1b-1): the per-row decision routes through the ONE shared
+    classifier (``vco_lib.codegraph_row_classify.classify_row`` — the same
+    function the analyzer's orphan-clear mirrors), so the probe and the
+    purge can never disagree again about which rows count. A row is counted
+    iff it classifies ``"owed"``: stale AND reachable AND non-ignored AND
+    primary-source. Everything the classifier calls ``"purgeable"`` —
+    deleted-file orphans (R3, v0.2.74), transient ``.claude/state/`` scratch
+    (F2/F4), pathless rows, ignore-set rows — is NOT owed: the analyzer's
+    orphan-clear deletes those on its next walk, and counting them here kept
+    the owed state permanently non-zero → every ``--update`` re-triggered a
+    whole-repo resync (the "not converged" loop; pathless + ignored-path
+    were the two IMMORTAL classes pre-v0.2.75). Extra-path rows
+    (``project_source`` outside ``primary_sources``) classify ``"not_owed"``
+    and converge on their own root's walk.
 
-    v0.2.74 (Fable-review F2/F4) — two more never-re-stampable row classes are
-    excluded from the owed count for the same convergence reason:
-      * ``.claude/state/`` transient-scratch rows (walk-excluded since v0.2.73;
-        deleted by the 6_to_7 purge and now also by the analyzer's orphan-clear
-        — but for a user the purge can't reach, counting them looped forever);
-      * extra-path rows (``project_source`` set and NOT in ``primary_sources``):
-        their files live under a DIFFERENT source root; a primary-root resync
-        never re-stamps them, and the B1-fixed orphan-clear correctly never
-        deletes them — so when their repo-relative path ALSO exists under the
-        primary root (the fork + upstream-clone pairing) they were counted
-        "owed" forever. They converge on their own extra-path walk instead.
-        ``primary_sources`` = the primary root's resolved + raw POSIX forms;
-        ``None`` disables the source filter (pre-fix behaviour).
-
-    Bounded cost: the cheap filtered aggregate is ALWAYS the first gate. When it
-    returns 0, we return 0 IMMEDIATELY — no per-row scan (the converged
-    steady-state cost is one aggregate). The slow per-row reachability scan is
+    Bounded cost: the cheap filtered aggregate is ALWAYS the first gate. When
+    it returns 0, we return 0 IMMEDIATELY — no per-row scan (the converged
+    steady-state cost is one aggregate). The slow per-row classify scan is
     paid ONLY when the aggregate says "stale > 0" (there is genuine work to
-    classify). Without a ``reachable_fn`` the aggregate count is returned as-is
-    (pre-R3 behaviour: all stale rows, orphans included).
+    classify). Without a ``reachable_fn`` the aggregate count is returned
+    as-is (pre-R3 behaviour: all stale rows, orphans included — conservative
+    over-count, never a wrong "converged").
 
     Tiers:
       1. Filtered aggregate ``embed_revision != rev OR embed_revision IS
@@ -455,7 +395,7 @@ def _count_stale_in_collection(
          half-migrated collection — C-3 warning).
       2. Full scan classified client-side (NULL-safe) — covers collections
          created without ``index_null_state=True`` where the IsNull filter
-         errors, AND is where the R3 reachability filter is applied.
+         errors, AND is where the shared classifier is applied.
 
     Returns ``None`` when neither tier could run (undeterminable — the caller
     must NOT treat that as zero).
@@ -508,30 +448,30 @@ def _count_stale_in_collection(
         stale = 0
         for obj in coll.iterator(return_properties=read_props):
             props = getattr(obj, "properties", None) or {}
-            rev = props.get("embed_revision")
-            try:
-                is_stale = rev is None or int(rev) != int(current_revision)
-            except (TypeError, ValueError):
-                is_stale = True
-            if not is_stale:
+            if reachable_fn is None:
+                # Pre-R3 tier: no root/predicate → revision-only counting
+                # (classify_row would fail open toward "owed" for every
+                # path-bearing row anyway; keep the cheap explicit check).
+                rev = props.get("embed_revision")
+                try:
+                    is_stale = rev is None or int(rev) != int(current_revision)
+                except (TypeError, ValueError):
+                    is_stale = True
+                if is_stale:
+                    stale += 1
                 continue
-            if reachable_fn is not None:
-                fp = str(props.get(path_prop) or "")
-                # Never-re-stampable rows are NOT owed (see docstring):
-                # transient scratch (walk-excluded) …
-                if _TRANSIENT_STATE_MARKER in fp:
-                    continue
-                # … extra-path rows (different source root — converge on their
-                # own walk, not the primary's) … (`want_source` is only True
-                # when primary_sources is a set; re-check for the type-narrow)
-                if want_source and primary_sources is not None:
-                    src = (props.get("project_source") or "").strip()
-                    if src and src not in primary_sources:
-                        continue
-                # … and deleted-file orphans (the D1 orphan-clear deletes them).
-                if not reachable_fn(fp):
-                    continue
-            stale += 1
+            # v0.2.75 (P1b-1): ONE shared decision — count iff "owed".
+            verdict = classify_row(
+                props,
+                None,  # reachability comes via the memoized reachable_fn
+                path_prop=path_prop,
+                current_revision=int(current_revision),
+                index_dot_claude=index_dot_claude,
+                primary_sources=primary_sources if want_source else None,
+                reachable_fn=reachable_fn,
+            )
+            if verdict == "owed":
+                stale += 1
         return stale
     except Exception as exc:  # noqa: BLE001 — undeterminable
         logger.warning(
@@ -554,6 +494,7 @@ def count_stale_rows(
     client=None,
     weaviate_url: Optional[str] = None,
     grpc_port: Optional[int] = None,
+    index_dot_claude: bool = True,
 ) -> Optional[dict]:
     """R-6 (v0.2.73): per-collection count of rows owed a re-embed.
 
@@ -639,6 +580,12 @@ def count_stale_rows(
                 path_prop=_PROBE_PATH_PROP.get(base, "file_path"),
                 reachable_fn=reachable_fn,
                 primary_sources=primary_sources,
+                # v0.2.75 (P1b-1): the classifier's ignore-set gate needs the
+                # per-project `.claude` decision so a user project's stale
+                # `.claude/**` rows (walk-excluded there) are not counted
+                # owed forever, while the orchestrator root (which indexes
+                # `.claude/` as first-party source) keeps counting them.
+                index_dot_claude=index_dot_claude,
             )
             if n is None:
                 return None
@@ -1128,6 +1075,7 @@ def run_resync_and_verify(
     analyzer_path: Path,
     *,
     prune_stale: bool = False,
+    index_dot_claude: bool = True,
 ) -> int:
     """R-7 driver — runs INSIDE the detached child spawned by
     :func:`spawn_background_resync`.
@@ -1162,6 +1110,7 @@ def run_resync_and_verify(
             project_name,
             analyzer_path=Path(analyzer_path),
             repo_root=Path(repo_root),  # R3: exclude orphan (deleted-file) rows
+            index_dot_claude=index_dot_claude,  # P1b-1: same gate as the spawn
         )
     except Exception as exc:  # noqa: BLE001
         print(f"[resync-driver] post-walk probe raised: {exc}", flush=True)
@@ -1253,6 +1202,7 @@ def spawn_background_resync(
                 project_name,
                 analyzer_path=analyzer,
                 repo_root=repo_root,  # R3: exclude orphan (deleted-file) rows
+                index_dot_claude=index_dot_claude,  # P1b-1 classifier gate
             )
         except Exception as exc:  # noqa: BLE001 — probe must never block
             logger.warning("codegraph resync: owed-probe raised: %s", exc)
@@ -1305,6 +1255,12 @@ def spawn_background_resync(
         "--repo-root", str(repo_root),
         "--analyzer", str(analyzer),
     ]
+    # P1b-1 (v0.2.75): forward the `.claude` decision so the driver's
+    # post-walk verify probe classifies with the SAME gate as this spawn's
+    # owed-probe (otherwise spawn says "owed" / verify says "converged" —
+    # or vice versa — for `.claude/**` rows on user projects).
+    if index_dot_claude:
+        argv.append("--index-dot-claude")
 
     # Detached background spawn. stdout/stderr go to a per-spawn log file
     # under <vct_root_dir>/logs/ (R-5 / RT-2 — pre-fix they went to DEVNULL,
@@ -1471,6 +1427,7 @@ def _main(argv: Optional[list] = None) -> int:
             Path(args.repo_root),
             Path(args.analyzer),
             prune_stale=args.prune_stale,
+            index_dot_claude=args.index_dot_claude,
         )
     elif args.backfill_metadata:
         logging.basicConfig(level=logging.INFO)

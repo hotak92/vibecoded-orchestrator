@@ -658,13 +658,36 @@ _LANGUAGE_IGNORE_DIRS_EXTRAS: Dict[str, frozenset] = {
 }
 
 
-def _ignore_dirs_for(language: str, index_dot_claude: bool = False) -> frozenset:
-    """Return the directory-skip set for a given language.
+# v0.2.75 (P1b-2): the ONE derived ignore-set — the union of the common set
+# and EVERY language's extras. Applied by the walk (below), mirrored by the
+# resync prune/probe (vco_lib/codegraph_row_classify.py::
+# CODEGRAPH_IGNORE_PARTS — value-compared by
+# tests/test_codegraph_row_classify_parity.py) and sibling to the Rust
+# language-detection list (codegraph.rs::ignored_dirs(); documented delta in
+# the same parity test).
+#
+# WHY the union replaced per-language application: the extras being
+# per-language made the WALK and the prune/probe disagree per row class —
+# a `.py` under `coverage/` was walked (python's set lacked `coverage`)
+# while the resync prune deleted its rows (delete/recreate churn), and a
+# stale row under `target/` was counted owed forever because no walk ever
+# descends there (immortal convergence loop). Deliberate trade-off: dirs
+# like `bin/` / `vendor/` are now excluded for EVERY language — first-party
+# scripts in a top-level `bin/` stop being indexed, accepted against the
+# immortal-row class this kills. `_LANGUAGE_IGNORE_DIRS_EXTRAS` stays as the
+# documented DEFINITION of which ecosystem contributed each entry.
+_ALL_IGNORE_PARTS: frozenset = _COMMON_IGNORE_DIRS | frozenset().union(
+    *_LANGUAGE_IGNORE_DIRS_EXTRAS.values()
+)
 
-    The set merges :data:`_COMMON_IGNORE_DIRS` with any
-    language-specific extras. Unknown languages get the common set
-    only (no error — analyzer should never crash on a new language
-    being added without first updating the table).
+
+def _ignore_dirs_for(language: str, index_dot_claude: bool = False) -> frozenset:
+    """Return the directory-skip set (v0.2.75: language-independent).
+
+    Returns :data:`_ALL_IGNORE_PARTS` — the union of the common set and
+    every language's extras — for EVERY language (see the union constant's
+    comment for why per-language application was retired). The ``language``
+    parameter is kept for call-site compatibility and future re-scoping.
 
     ``index_dot_claude`` (v0.2.72, P5) gates the ``.claude`` directory:
 
@@ -684,7 +707,8 @@ def _ignore_dirs_for(language: str, index_dot_claude: bool = False) -> frozenset
     analyzer honours it (see ``main()``'s argparse + the CLI tri-state
     default in ``_resolve_index_dot_claude``).
     """
-    dirs = _COMMON_IGNORE_DIRS | _LANGUAGE_IGNORE_DIRS_EXTRAS.get(language, frozenset())
+    del language  # v0.2.75: one union set for every language (see above)
+    dirs = _ALL_IGNORE_PARTS
     if not index_dot_claude:
         dirs = dirs | frozenset({'.claude'})
     return dirs
@@ -821,50 +845,157 @@ def _resolve_index_dot_claude(cli_value: Optional[bool], repo_path: Path) -> boo
 # ---------------------------------------------------------------------------
 
 
-def _path_reachable_on_disk(rel_or_abs_path: str, repo_root: "Path") -> bool:
+# BEGIN MUST-MATCH codegraph-row-classify (mirrored in
+# templates/scripts/analyze_code_graph.py — the analyzer is a template that
+# cannot import vco_lib at user sites. Edit BOTH copies;
+# tests/test_codegraph_row_classify_parity.py byte-compares this region.)
+def path_is_ignored(file_path: str, *, index_dot_claude: bool = True) -> bool:
+    """True when a stored row path falls in the CURRENT ignore set.
+
+    Path-PART match (not substring) for directories — ``my_vendor_tools/x.py``
+    is NOT ignored; ``vendor/x.py`` is. Suffix match for build-output
+    filenames. ``.claude`` joins the set only when ``index_dot_claude`` is
+    False (user projects; the orchestrator root indexes ``.claude/`` as
+    first-party source).
+    """
+    if not file_path:
+        return False
+    norm = str(file_path).replace("\\", "/")
+    parts = [p for p in norm.split("/") if p]
+    if not parts:
+        return False
+    ignore = CODEGRAPH_IGNORE_PARTS
+    if not index_dot_claude:
+        ignore = ignore | frozenset({'.claude'})
+    if any(p in ignore for p in parts[:-1]):
+        return True
+    name = parts[-1]
+    if name.startswith('vite.config'):
+        return True
+    return any(name.endswith(s) for s in CODEGRAPH_SKIP_SUFFIXES)
+
+
+def path_reachable_on_disk(rel_or_abs_path: str, repo_root: "Path") -> bool:
     """True when ``rel_or_abs_path`` resolves to a real on-disk file INSIDE
     ``repo_root`` (mirrors ``install.py::_path_resolves_on_disk`` safety).
 
-    A stored code-graph path is repo-relative POSIX (how the walkers stamp it).
-    It is REACHABLE iff ``(repo_root / rel).exists()`` AND the resolved path
-    lies inside ``repo_root`` — so a stored ``../../../etc/passwd`` escape
-    resolves to an existing file OUTSIDE the tree and is (correctly) reported
-    NOT reachable → an orphan the caller may delete.
-
     Fail-SAFE toward KEEPING data: an empty path, or ANY OS/value error while
     probing (NUL bytes, invalid chars, unreadable segment), returns ``True``
-    ("treat as exists → do NOT delete"). Only a determinate "resolved fine and
-    is genuinely absent, or resolved fine and escapes the root" yields
-    ``False``. This differs from the KG prune's soft-fail-to-delete because the
-    orphan-clear runs unattended on a DELETE path where a wrong delete is data
-    loss — uncertainty must never authorise a delete.
+    ("treat as exists"). Only a determinate "resolved fine and is genuinely
+    absent, or resolved fine and escapes the root" yields ``False`` —
+    uncertainty must never authorise a delete, and on the probe side a wrong
+    "reachable" only over-counts owed work (conservative, never a wrong
+    "converged").
     """
     if not rel_or_abs_path:
-        # No path to test → cannot prove absence → keep (never delete).
         return True
     try:
         root_resolved = repo_root.resolve()
     except (OSError, ValueError):
-        # Cannot even resolve the root → indeterminate → keep.
         return True
     try:
         candidate = (root_resolved / rel_or_abs_path).resolve()
     except (OSError, ValueError):
-        # Bad chars (NUL/newline) / unresolvable → indeterminate → keep.
         return True
     try:
         inside = candidate.is_relative_to(root_resolved)
     except (OSError, ValueError):
         return True
     if not inside:
-        # Determinate escape (e.g. ``../../etc/passwd``) → NOT reachable as a
-        # repo file → an orphan the caller may delete.
         return False
     try:
         return candidate.exists()
     except (OSError, ValueError):
-        # exists() itself raised → indeterminate → keep (do NOT delete).
         return True
+
+
+def classify_row(
+    props: "Optional[Mapping[str, Any]]",
+    repo_root: "Optional[Path]",
+    *,
+    path_prop: str = "file_path",
+    current_revision: int = 1,
+    index_dot_claude: bool = True,
+    primary_sources: "Optional[set]" = None,
+    reachable_fn=None,
+) -> str:
+    """Classify one code-graph row for convergence purposes.
+
+    Returns exactly one of:
+
+    * ``"owed"`` — a reachable, non-ignored stale row: a re-walk of its file
+      re-stamps/re-embeds it. The owed-probe counts these; nothing deletes
+      them. Includes ``embed_revision == 0`` rows (vectorless sentinel /
+      module-row invalidation): the re-walk heals them — see the module
+      docstring for the documented ruling.
+    * ``"not_owed"`` — leave alone AND don't count: rows already at the
+      current revision, and extra-path rows (``project_source`` set to a
+      root outside ``primary_sources``) which converge on their OWN root's
+      walk — never touch them from this walk (B1 tenant scoping).
+    * ``"purgeable"`` — a stale row NO walk can ever converge; deleting it
+      (via the tokenization-safe ``_delete_file_rows_exact`` primitive ONLY)
+      is the only way the owed state can reach zero: transient
+      ``.claude/state/`` scratch (purgeable regardless of revision — 6_to_7
+      purge semantics), pathless rows in file-anchored collections, rows
+      whose path falls in the ignore set (walk-excluded whether or not the
+      file still exists), and deleted-file orphans (stored path gone from
+      disk / escaping the root).
+
+    ``reachable_fn`` optionally injects a memoized reachability predicate
+    (one syscall per unique path across a whole probe run); when neither it
+    nor ``repo_root`` is given the deleted-file rule is SKIPPED and such
+    rows classify ``owed`` (fail-open: never authorise a purge without a
+    positively-known root; over-counting owed is the conservative error).
+    """
+    p = props or {}
+    raw_path = str(p.get(path_prop) or "")
+    # 1. Transient scratch — the marker itself is the proof; regardless of
+    #    revision or source (matches the 6_to_7 purge + F2/F4 semantics).
+    if TRANSIENT_STATE_MARKER in raw_path:
+        return "purgeable"
+    # 2. Extra-path rows — a different source root owns them; this walk can
+    #    neither re-stamp nor judge them (B1 scoping: never delete, never
+    #    count — they converge on their own extra-path walk).
+    if primary_sources is not None:
+        src = str(p.get("project_source") or "").strip()
+        if src and src not in primary_sources:
+            return "not_owed"
+    # 3. Converged rows — never touch, never count.
+    rev = p.get("embed_revision")
+    try:
+        if rev is not None and int(rev) == int(current_revision):
+            return "not_owed"
+    except (TypeError, ValueError):
+        pass  # unparseable revision → stale → fall through
+    # 4. Pathless stale rows — no walk keys on an empty path: nothing can
+    #    ever re-stamp them (immortal pre-v0.2.75), and no data purpose
+    #    survives without the file anchor.
+    if not raw_path:
+        return "purgeable"
+    # 5. Ignore-set rows — the walk never descends there (whether or not
+    #    the file still exists), so a stale row under an ignored dir can
+    #    never re-stamp. Derived, regenerable data: if a future ignore-set
+    #    change re-includes the path, the next walk simply re-creates it.
+    if path_is_ignored(raw_path, index_dot_claude=index_dot_claude):
+        return "purgeable"
+    # 6. Deleted-file orphans — nothing re-walks a file that no longer
+    #    exists (D1 orphan-clear semantics, kept). Skipped entirely when no
+    #    root/predicate is available (fail-open toward "owed").
+    if reachable_fn is not None or repo_root is not None:
+        if reachable_fn is not None:
+            reachable = reachable_fn(raw_path)
+        else:
+            reachable = path_reachable_on_disk(raw_path, repo_root)
+        if not reachable:
+            return "purgeable"
+    # 7. Reachable, non-ignored, stale → a re-walk converges it.
+    return "owed"
+# END MUST-MATCH codegraph-row-classify
+
+
+# Backwards-compat alias — pre-v0.2.75 name used by `_build_stale_file_set`
+# and imported by older tests. Same function object as the mirrored copy.
+_path_reachable_on_disk = path_reachable_on_disk
 
 
 def _delete_file_rows_exact(
@@ -1084,6 +1215,20 @@ _JS_SKIP_SUFFIXES: tuple = (
 _TS_SKIP_SUFFIXES: tuple = (
     '.d.ts', '.bundle.ts', '.chunk.ts', '.config.ts', '.config.mts',
 )
+
+# ---------------------------------------------------------------------------
+# v0.2.75 (P1b): names shared with vco_lib/codegraph_row_classify.py so the
+# MUST-MATCH mirrored region above (path_is_ignored / path_reachable_on_disk
+# / classify_row) is byte-identical across the template boundary. The values
+# are DERIVED from this file's own constants; the parity test value-compares
+# them against the vco_lib module (functions read these late-bound, so the
+# assignments may live after the defs).
+# ---------------------------------------------------------------------------
+CODEGRAPH_IGNORE_PARTS: frozenset = _ALL_IGNORE_PARTS
+CODEGRAPH_SKIP_SUFFIXES: tuple = _JS_SKIP_SUFFIXES + _TS_SKIP_SUFFIXES
+#: MUST match migrations/codegraph_collection/6_to_7.py::_TRANSIENT_MARKER
+#: and vco_lib/codegraph_row_classify.py::TRANSIENT_STATE_MARKER.
+TRANSIENT_STATE_MARKER: str = ".claude/state/"
 
 # Dispatch-name → `_ignore_dirs_for` language key. The walkers use short
 # keys ('js'/'ts'); the dispatch table uses long names. Identity for
@@ -3310,8 +3455,19 @@ def _parse_svelte_functions(content: str) -> List[Dict[str, Any]]:
 # prefix (`global:`, `script:`, `local:`, `private:`) and the name.
 # Trailing `(...)` or `{` is required so we don't pick up bare
 # `function` keyword mentions.
+# v0.2.75 (P1b): the keyword is CAPTURED (`kind` group) instead of being
+# re-derived by slicing the first 8 characters of the match. The old slice
+# (`cleaned[line_start:m.start() + 8].strip().split()[0]`) raised IndexError
+# on any declaration indented by >= 8 whitespace chars — `^[ \t]*` is part of
+# the match, so the first 8 chars were ALL whitespace, strip() emptied them
+# and split()[0] blew up. Live incident: a nested hook function at 8-space
+# indent crashed the per-file walk deterministically on EVERY run; the R-3
+# module-row invalidation then re-stamped the file's module row to
+# embed_revision=0 each time, so the resync owed-probe counted it forever —
+# an immortal convergence loop that looked like a "vectorless sentinel that
+# never heals". Regression: tests/test_powershell_parser.py (deep-indent).
 _POWERSHELL_FUNCTION_DECL = re.compile(
-    r"""^[ \t]*(?:function|filter)\s+"""
+    r"""^[ \t]*(?P<kind>function|filter)\s+"""
     r"""(?:(?P<scope>global|script|local|private):)?"""
     r"""(?P<name>[A-Za-z_][\w-]*)\s*"""
     r"""(?:\([^)]*\))?\s*"""
@@ -3373,16 +3529,12 @@ def _parse_powershell_functions(content: str) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
 
     for m in _POWERSHELL_FUNCTION_DECL.finditer(cleaned):
-        # Inspect the original source line to recover the kind
-        # (function/filter) since the regex doesn't capture it.
         name = m.group("name")
         scope = m.group("scope")
-        # Determine kind by looking at the keyword that opened the
-        # match — we re-anchor on the start position because the
-        # regex consumed it.
-        line_start = cleaned.rfind("\n", 0, m.start()) + 1
-        keyword = cleaned[line_start:m.start() + 8].strip().split()[0].lower()
-        kind = "filter" if keyword.startswith("filter") else "function"
+        # v0.2.75 (P1b): the kind comes straight from the regex capture —
+        # the old first-8-chars re-slice raised IndexError on >=8-char
+        # indentation (see the regex comment above for the live incident).
+        kind = "filter" if m.group("kind").lower() == "filter" else "function"
 
         # Find the function body span to look for a `param(...)` block.
         # We scan from the brace (`{`) following the decl forward to
@@ -8001,6 +8153,29 @@ class CodeGraphAnalyzer:
         determinable = False
         orphans_cleared = 0
         orphan_failures = 0
+        # v0.2.75 (P1b-1): BOTH decisions below — "does this row's path enter
+        # the re-walk set?" and "may the orphan-clear delete this row?" — now
+        # route through the ONE shared classifier (`classify_row`, mirrored
+        # from vco_lib/codegraph_row_classify.py; the parity test is the
+        # lock). Pre-fix the two disagreed on pathless rows (skipped by the
+        # set-build via `if fp:`, KEPT by the orphan-clear via
+        # `if not raw_path: return False`) and on ignore-set rows whose file
+        # still exists (kept + counted, but the walk never descends there) —
+        # both were IMMORTAL: counted owed forever by the resync probe while
+        # nothing could re-stamp or delete them.
+        _classifier_index_dot_claude = bool(getattr(self, "index_dot_claude", True))
+
+        def _classify(props_map, path_prop_name, reachable_fn=None):
+            return classify_row(
+                props_map,
+                repo_root,
+                path_prop=path_prop_name,
+                current_revision=CODEGRAPH_EMBED_REVISION,
+                index_dot_claude=_classifier_index_dot_claude,
+                primary_sources=_primary_sources or None,
+                reachable_fn=reachable_fn,
+            )
+
         for coll, path_prop in probes:
             if coll is None:
                 continue
@@ -8008,23 +8183,26 @@ class CodeGraphAnalyzer:
             if count == 0:
                 determinable = True
                 continue
+            # Request `project_source` only when the class has it (requesting
+            # an absent property 500s the iterator on schema variants — same
+            # defensive probe `_delete_file_rows_exact` uses).
+            _read_props = [path_prop, _EMBED_REVISION_PROP]
             try:
-                for obj in coll.iterator(
-                    return_properties=[path_prop, _EMBED_REVISION_PROP]
-                ):
+                _cfg = coll.config.get()
+                _present = {pr.name for pr in _cfg.properties}
+                if "project_source" in _present:
+                    _read_props.append("project_source")
+            except Exception:  # noqa: BLE001 — probe best-effort
+                pass
+            try:
+                for obj in coll.iterator(return_properties=_read_props):
                     p = getattr(obj, "properties", None) or {}
-                    rev = p.get(_EMBED_REVISION_PROP)
-                    try:
-                        is_current = (
-                            rev is not None
-                            and int(rev) == CODEGRAPH_EMBED_REVISION
-                        )
-                    except (TypeError, ValueError):
-                        is_current = False
-                    if not is_current:
-                        fp = p.get(path_prop) or ""
-                        if fp:
-                            stale.add(str(fp))
+                    # Only OWED rows enter the re-walk set: a re-walk can
+                    # actually converge them. Purgeable rows are handled by
+                    # the orphan-clear below; not_owed rows (current /
+                    # extra-path) need nothing from this walk.
+                    if _classify(p, path_prop) == "owed":
+                        stale.add(str(p.get(path_prop) or ""))
                 determinable = True
             except Exception as exc:  # noqa: BLE001 — per-collection soft-fail
                 print(
@@ -8036,52 +8214,21 @@ class CodeGraphAnalyzer:
                 # (an incomplete scan must never authorise deletes).
                 continue
 
-            # v0.2.74 (D1) orphan-clear: only when this collection had stale
-            # rows AND we have a resolved repo root to test existence against.
-            # A stale row whose stored path is genuinely absent-on-disk (or
-            # escapes the repo root) is an orphan → delete it via the ONE safe
-            # primitive; reachable stale rows are left for the re-walk. The
-            # predicate re-reads the raw path per row inside the helper, so the
-            # DELETE decision is made on the value the helper itself read back
-            # (never on a tokenized filter).
+            # v0.2.74 (D1) orphan-clear, v0.2.75 (P1b-1) classifier-routed:
+            # delete exactly the rows the shared classifier calls PURGEABLE —
+            # deleted-file orphans (the original D1 class), transient
+            # `.claude/state/` scratch (F2/F4), and the two previously
+            # immortal classes (pathless rows; ignore-set rows). Deletes go
+            # through the ONE safe primitive; the predicate re-reads the raw
+            # path per row inside the helper, so the DELETE decision is made
+            # on the value the helper itself read back (never a tokenized
+            # filter).
             if repo_root is None:
                 continue  # fail open — never delete when the root is unknown
 
             def _is_orphan(raw_path, _props):
-                # Delete ONLY when the row is BOTH stale AND unreachable. The
-                # helper hands us every row's raw path; re-derive staleness
-                # here so we never delete a CURRENT-revision row.
-                if not raw_path:
-                    return False  # no path → cannot prove orphan → keep
-                # v0.2.74 (Fable-review F2/F4): `.claude/state/` transient-
-                # scratch rows are ALWAYS purgeable — the marker itself is the
-                # proof (orchestrator scratch is never legitimate code; exact
-                # substring on the raw value, same safety as the 6_to_7 purge,
-                # which deletes them regardless of revision or source). This
-                # delivers the purge to users the migration can't reach
-                # (CLI-only / false-v7 machines) via ANY analyze run, and lets
-                # the owed-probe converge for them.
-                if ".claude/state/" in str(raw_path):
-                    return True
-                rev_v = _props.get(_EMBED_REVISION_PROP)
-                try:
-                    row_current = (
-                        rev_v is not None
-                        and int(rev_v) == CODEGRAPH_EMBED_REVISION
-                    )
-                except (TypeError, ValueError):
-                    row_current = False
-                if row_current:
-                    return False  # never touch converged rows
-                # B1 fix: only orphan-clear rows belonging to the PRIMARY source.
-                # A row whose `project_source` is a DIFFERENT non-empty value is an
-                # `--extra-path` row whose file lives under a root we did NOT test
-                # reachability against — deleting it here would be silent data
-                # loss. Empty/absent project_source = legacy/primary → eligible.
-                _row_src = (_props.get("project_source") or "").strip()
-                if _row_src and _row_src not in _primary_sources:
-                    return False  # extra-path row — not ours to judge on this walk
-                return not _path_reachable_on_disk(str(raw_path), repo_root)
+                del raw_path  # the classifier reads it from _props
+                return _classify(_props, path_prop) == "purgeable"
 
             try:
                 deleted, failures = _delete_file_rows_exact(
