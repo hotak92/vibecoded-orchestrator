@@ -43,6 +43,11 @@ updates:
     commit-message:
       prefix: "deps"
       include: "scope"
+    ignore:
+      # transformers >=4.50 breaks the CodeSage-Large-v2 code-embedding
+      # container — rationale: the transformers pin block in requirements.txt.
+      - dependency-name: "transformers"
+        versions: [">=4.50.0"]
     groups:
       python-minor-patch:
         applies-to: version-updates
@@ -68,6 +73,12 @@ updates:
     commit-message:
       prefix: "deps(mcp)"
       include: "scope"
+    ignore:
+      # transformers >=4.50 breaks the CodeSage-Large-v2 code-embedding
+      # container — rationale: the transformers pin block in
+      # claude_mcp_servers/code_embedding_service/requirements.txt.
+      - dependency-name: "transformers"
+        versions: [">=4.50.0"]
     groups:
       mcp-python-minor-patch:
         applies-to: version-updates
