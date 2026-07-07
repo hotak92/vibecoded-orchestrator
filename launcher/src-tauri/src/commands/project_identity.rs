@@ -2128,7 +2128,7 @@ mod tests {
         // caller passes it — so a live per-project collection is never dropped.
         let mut active = std::collections::HashSet::new();
         active.insert("VibeCodedOrchestrator".to_string());
-        active.insert("SD15".to_string());
+        active.insert("OtherProject".to_string());
 
         // The live 136GB collection → REFUSED.
         let r = orphan_cleanup_refusal_reason(
@@ -2139,7 +2139,7 @@ mod tests {
 
         // Another active project's collection → REFUSED.
         assert!(orphan_cleanup_refusal_reason(
-            "SD15_CodeModule", &active, "ClaudeOrchestrator",
+            "OtherProject_CodeModule", &active, "ClaudeOrchestrator",
         ).is_some());
 
         // The 176MB DUPLICATE variant (differs from canonical) → ALLOWED.

@@ -62,7 +62,7 @@ _NAMES = [
     "foo_bar_baz",
     "Camel_Case",
     "a-b c",
-    "SD15",
+    "App15",
     "Client_A_Private",
 ]
 

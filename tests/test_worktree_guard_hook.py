@@ -160,9 +160,10 @@ def test_hook_file_exists_and_executable() -> None:
 def test_real_payload_creates_worktree(tmp_path: Path) -> None:
     """The live harness payload: no path field, agent id under `name`.
 
-    This is the exact shape captured in SD15/.claude/logs/worktree-guard.jsonl
-    that the old validator hook no-op'd on. The fixed hook must CREATE a
-    worktree, echo its abs path, and register it in git.
+    This is the exact shape captured live in a real project's
+    .claude/logs/worktree-guard.jsonl that the old validator hook no-op'd on.
+    The fixed hook must CREATE a worktree, echo its abs path, and register it
+    in git.
     """
     repo = tmp_path / "proj"
     _init_repo(repo)
