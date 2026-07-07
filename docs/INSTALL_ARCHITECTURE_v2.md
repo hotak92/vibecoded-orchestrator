@@ -950,20 +950,11 @@ Used by both `install.py` (orchestrator-self settings.json) and `vco_lib/project
 
 **Owner**: TBD (v0.2.54).
 
-### 7.4 `vco_lib/manifest.py` (v0.2.54)
+### 7.4 `vco_lib/manifest.py` — REMOVED in v0.2.75
 
-**Purpose**: `.vco-manifest.json` schema + read/write. Consolidates the per-project manifest writer (`project_init.py::_write_manifest_atomic`) and orchestrator-self manifest writer (`install.py::_refresh_orchestrator_self_vco_manifest`).
+**Original purpose**: `.vco-manifest.json` schema + read/write, consolidating the per-project manifest writer (`project_init.py::_write_manifest_atomic`) and the orchestrator-self manifest writer (`install.py::_refresh_orchestrator_self_vco_manifest`).
 
-**Exports**:
-```python
-class ManifestEntry(BaseModel): ...
-class Manifest(BaseModel): ...
-def read_manifest(path: Path) -> Manifest | None: ...
-def write_manifest(path: Path, manifest: Manifest) -> None: ...
-def validate_manifest(data: dict) -> bool: ...
-```
-
-**Owner**: TBD (v0.2.54).
+**Outcome**: the v0.2.53 skeleton's three stubs (`read_manifest` / `write_manifest` / `validate_manifest`) only raised `NotImplementedError` with a "lands in v0.2.54" promise; the migration never happened and the module accumulated zero production callers across ~22 releases. Deleted in v0.2.75 rather than left as a dead promise. The two live writers named above remain the canonical `.vco-manifest.json` code paths; if a consolidation is attempted again, start from those call-sites, not from a pre-seeded skeleton.
 
 ### 7.5 `vco_lib/timeutil.py` (v0.2.54)
 

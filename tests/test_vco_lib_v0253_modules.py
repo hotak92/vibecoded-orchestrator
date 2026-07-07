@@ -2,16 +2,21 @@
 # Copyright (c) 2026 VibeCoded Tools
 """Track B / v0.2.53: smoke tests for the new vco_lib modules.
 
-Verifies the 6 new modules added per docs/INSTALL_ARCHITECTURE_v2.md §7:
+Verifies the modules added per docs/INSTALL_ARCHITECTURE_v2.md §7:
 * vco_lib.atomic     — atomic file writes (CORRECT-1 prep)
 * vco_lib.hashing    — sha256 helpers
 * vco_lib.settings_merge — settings.json merge (stub)
-* vco_lib.manifest   — .vco-manifest.json schema + IO (stub)
 * vco_lib.timeutil   — UTC ISO-8601 helpers
 * vco_lib.git_meta   — git HEAD / rev resolution
 
-Stub modules verify only the import contract + interface; v0.2.54
-lands the full implementations.
+Stub modules verify only the import contract + interface.
+
+(vco_lib.manifest — the sixth v0.2.53 skeleton — was DELETED in v0.2.75:
+its three stubs only raised NotImplementedError with a "lands in v0.2.54"
+promise that never materialised, and it accumulated zero production
+callers. The live manifest writers remain
+``project_init._write_manifest_atomic`` and
+``install.py::_refresh_orchestrator_self_vco_manifest``.)
 """
 
 from __future__ import annotations
@@ -123,28 +128,6 @@ def test_settings_merge_template_stub_raises(tmp_path):
     from vco_lib.settings_merge import merge_settings_template
     with pytest.raises(NotImplementedError):
         merge_settings_template(tmp_path / "settings.json", {})
-
-
-# ---------------------------------------------------------------------------
-# vco_lib.manifest (stub)
-# ---------------------------------------------------------------------------
-
-def test_manifest_module_imports():
-    from vco_lib import manifest
-    assert hasattr(manifest, "ManifestEntry")
-    assert hasattr(manifest, "Manifest")
-    assert hasattr(manifest, "read_manifest")
-    assert hasattr(manifest, "write_manifest")
-    assert hasattr(manifest, "validate_manifest")
-
-
-def test_manifest_entry_dataclass():
-    from vco_lib.manifest import ManifestEntry
-    e = ManifestEntry(relative_path="a/b.txt", sha256="deadbeef")
-    assert e.relative_path == "a/b.txt"
-    assert e.sha256 == "deadbeef"
-    assert e.user_modified is False
-    assert e.source_template is None
 
 
 # ---------------------------------------------------------------------------
