@@ -361,6 +361,52 @@ else
         "Found $ALERT_COUNT open error-severity alerts — triage before release"
 fi
 
+# Gate 23: Open Dependabot alerts (v0.2.75 P2a). Mirrors Gate 15's
+# gh-api + severity-filter shape for the Dependabot alert surface.
+# (Numbering: 19/20 are historically retired — see the seam comment
+# above Gate 21 — so new gates take 23+.)
+#
+#   critical/high open alert  → hard FAIL, listing each alert.
+#   medium/low open alert     → advisory WARN only (Gate-14 style).
+#   gh api error / 403 / 404  → LOUD WARN, never a silent false PASS.
+echo "  [checking open Dependabot alerts...]"
+DEPBOT_LINES="$(gh api "/repos/$REPO/dependabot/alerts?state=open&per_page=100" \
+    --paginate \
+    --jq '.[] | [(.number|tostring), (.security_vulnerability.severity // .security_advisory.severity // "unknown"), .dependency.package.name, .dependency.manifest_path] | join("|")' \
+    2>/dev/null)"
+DEPBOT_RC=$?
+if [ "$DEPBOT_RC" -ne 0 ]; then
+    gate_warn "Dependabot open alerts (P2a)" \
+        "LOUD ADVISORY — could not query /repos/$REPO/dependabot/alerts (gh exit $DEPBOT_RC). This is NOT a confirmation of zero alerts. Likely cause: token missing the security_events scope (classic PAT) or the 'Dependabot alerts' repo permission (fine-grained PAT). Fix: gh auth refresh -s security_events, then re-run this gate."
+elif [ -z "$DEPBOT_LINES" ]; then
+    gate_pass "Dependabot open alerts = 0"
+else
+    _dep_n_crit_high=0
+    _dep_n_med_low=0
+    while IFS='|' read -r _dep_num _dep_sev _dep_pkg _dep_manifest; do
+        [ -z "$_dep_num" ] && continue
+        case "$_dep_sev" in
+            critical|high)
+                _dep_n_crit_high=$((_dep_n_crit_high + 1))
+                printf '  [dependabot] OPEN alert #%s severity=%s package=%s manifest=%s\n' \
+                    "$_dep_num" "$_dep_sev" "$_dep_pkg" "$_dep_manifest"
+                ;;
+            *)
+                _dep_n_med_low=$((_dep_n_med_low + 1))
+                printf '  [dependabot] open (advisory) alert #%s severity=%s package=%s manifest=%s\n' \
+                    "$_dep_num" "$_dep_sev" "$_dep_pkg" "$_dep_manifest"
+                ;;
+        esac
+    done <<< "$DEPBOT_LINES"
+    if [ "$_dep_n_crit_high" -gt 0 ]; then
+        gate_fail "Dependabot open alerts (critical/high = 0)" \
+            "$_dep_n_crit_high critical/high open alert(s) listed above. Remediation: fix the dependency, OR dismiss the alert WITH a dismissal reason AND an inline rationale comment next to the pin (see the transformers CVE-2026-4372 precedent in requirements.txt)."
+    else
+        gate_warn "Dependabot open alerts (medium/low only — advisory)" \
+            "$_dep_n_med_low medium/low open alert(s) listed above. Triage before release."
+    fi
+fi
+
 # Gate 16: CHANGELOG has v$EXPECTED_VERSION entry.
 # Match the Keep-a-Changelog heading shape: `## [0.2.X] - 2026-MM-DD`.
 # Allow optional `v` prefix and optional surrounding brackets for flexibility.
