@@ -224,3 +224,128 @@ def test_prune_failures_line_regex_parseable() -> None:
     line = "PRUNE_FAILURES=7"
     m = re.fullmatch(r"PRUNE_FAILURES=(\d+)", line)
     assert m is not None and int(m.group(1)) == 7
+
+
+# ---------------------------------------------------------------------------
+# v0.2.75 (P1b-3): orphan-clear failures ride the SAME accounting chain.
+# ---------------------------------------------------------------------------
+
+
+def test_prune_stale_objects_accumulates_onto_prior_failures(analyzer_mod) -> None:
+    """The orphan-clear (and the drain's deleted-file prune) may have
+    recorded failures EARLIER in the same run — the --prune-stale pass must
+    ADD its count, never clobber the accumulator (pre-v0.2.75 it assigned,
+    silently un-reporting the earlier failures)."""
+    analyzer = _make_analyzer(analyzer_mod)
+    analyzer._track_visited = True
+    analyzer._prune_failures = 3  # earlier producers (orphan-clear / drain)
+
+    func_coll = _FakeCollection(
+        "ProjA_CodeFunction",
+        [_Obj("f-stale-fail", "ProjA", "python")],
+        fail_uuids={"f-stale-fail"},
+    )
+    analyzer.modules_collection = None
+    analyzer.classes_collection = None
+    analyzer.functions_collection = func_coll
+    analyzer.apis_collection = None
+    analyzer.interactions_collection = None
+    analyzer.visited_uuids = set()
+
+    analyzer._prune_stale_objects()
+    assert analyzer._prune_failures == 4, (
+        "3 earlier failures + 1 prune-pass failure must accumulate to 4"
+    )
+
+
+def test_prune_stale_objects_defensive_branch_preserves_accumulator(
+    analyzer_mod,
+) -> None:
+    """The no-tracking defensive branch must not zero out failures earlier
+    producers already recorded."""
+    analyzer = _make_analyzer(analyzer_mod)
+    analyzer._track_visited = False
+    analyzer._prune_failures = 5
+    assert analyzer._prune_stale_objects() == 0
+    assert analyzer._prune_failures == 5
+
+
+def test_orphan_clear_failures_accumulate_into_prune_failures(
+    analyzer_mod, tmp_path,
+) -> None:
+    """PURGE FAILURE FLIPS STATUS (no false converged): a failed
+    orphan-clear delete leaves a purgeable row behind — which the owed-probe
+    (correctly) no longer counts — so the ONLY honest signal is the
+    prune-failure chain. `_build_stale_file_set` must fold its
+    orphan_failures into `self._prune_failures` so main() emits
+    PRUNE_FAILURES=N and codegraph.rs flips the build success→partial."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "live.py").write_text("# real\n")
+
+    rows = [
+        _Obj("u-orphan-fail", "ProjA"),
+        _Obj("u-orphan-ok", "ProjA"),
+    ]
+    rows[0].properties = {"embed_revision": 0, "path": "src/gone.py"}
+    rows[1].properties = {"embed_revision": 0, "path": "src/also-gone.py"}
+
+    modules = _FakeCollection(
+        "ProjA_CodeModule", rows, fail_uuids={"u-orphan-fail"},
+    )
+    # _build_stale_file_set consults aggregate + config probes.
+    modules.aggregate = types.SimpleNamespace(
+        over_all=lambda **kw: types.SimpleNamespace(total_count=2)
+    )
+    _props = [
+        types.SimpleNamespace(name=n)
+        for n in ("path", "embed_revision", "project_source")
+    ]
+    modules.config = types.SimpleNamespace(
+        get=lambda: types.SimpleNamespace(properties=_props)
+    )
+
+    analyzer = _make_analyzer(analyzer_mod)
+    analyzer.modules_collection = modules
+    analyzer.classes_collection = None
+    analyzer.functions_collection = None
+    analyzer._analyze_repo_root = tmp_path
+    analyzer.index_dot_claude = True
+    analyzer._prune_failures = 0
+
+    stale_set = analyzer._build_stale_file_set()
+    assert stale_set == frozenset(), "both rows are orphans — nothing owed"
+    assert modules.data.deleted == ["u-orphan-ok"], (
+        "the failing row must stay put (soft-fail per row)"
+    )
+    assert analyzer._prune_failures == 1, (
+        "the failed orphan delete must reach the PRUNE_FAILURES chain"
+    )
+
+
+def test_source_emits_prune_failures_line_without_prune_stale_flag() -> None:
+    """v0.2.75 (P1b-3): the machine-readable line must ALSO fire on runs
+    without --prune-stale whenever failures are non-zero (the orphan-clear
+    and the drain prune delete on ordinary walks). The always-emit-under
+    --prune-stale positive-0 confirmation is preserved."""
+    src = _ANALYZER_PATH.read_text(encoding="utf-8")
+    assert "if args.prune_stale or prune_failures > 0:" in src, (
+        "the PRUNE_FAILURES=N emit must fire whenever failures are non-zero, "
+        "not only under --prune-stale"
+    )
+
+
+def test_source_stats_prune_failures_populated_unconditionally() -> None:
+    """`stats['prune_failures']` must be assigned OUTSIDE the
+    `if prune_stale:` block so orphan-clear/drain failures reach main() on
+    ordinary walks."""
+    src = _ANALYZER_PATH.read_text(encoding="utf-8")
+    anchor = src.find("stats['prune_failures'] = int(getattr(self, \"_prune_failures\", 0))")
+    assert anchor > 0, "the unconditional stats assignment is missing"
+    # The assignment's enclosing line must be indented at METHOD-body level
+    # (8 spaces), not inside the `if prune_stale:` suite (12 spaces).
+    line_start = src.rfind("\n", 0, anchor) + 1
+    indent = anchor - line_start
+    assert indent == 8, (
+        f"stats['prune_failures'] assignment is nested at indent {indent} — "
+        "it must sit at method-body level so it runs on EVERY analyze"
+    )

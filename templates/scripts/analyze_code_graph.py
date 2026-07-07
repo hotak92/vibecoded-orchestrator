@@ -5635,15 +5635,20 @@ class CodeGraphAnalyzer:
                 continue
             canonical_extras.append(resolved)
 
+        # v0.2.75 (P1b-3): reset the delete-failure accumulator per run
+        # UNCONDITIONALLY (was: only under prune_stale). Three producers now
+        # feed it — the --prune-stale pass, the drain's deleted-file prune,
+        # and the stale-file probe's orphan-clear (which runs on ANY walk) —
+        # so a stale value from a prior analyze_repository call in the same
+        # process must never leak into this run's stats.
+        self._prune_failures = 0
+
         # Enable visited-UUID tracking when caller wants prune-stale.
         # See _dedup_insert + _create_or_update_module — both record
         # to self.visited_uuids when self._track_visited is True.
         if prune_stale:
             self._track_visited = True
             self.visited_uuids = set()  # fresh state per run
-            # v0.2.73 (C-11 / RT-3): reset per-run before the prune pass sets
-            # it, so a stale value from a prior call can't leak into stats.
-            self._prune_failures = 0
 
         stats = {
             'modules': 0,
@@ -5945,11 +5950,18 @@ class CodeGraphAnalyzer:
         if prune_stale:
             self._prune_language = _canonical_lang_id(language) if language else ""
             stats['stale_pruned'] = self._prune_stale_objects()
-            # v0.2.73 (C-11 / RT-3): propagate the delete-failure count so
-            # main() can flip success→partial and emit PRUNE_FAILURES=N. Read
-            # via getattr because _prune_stale_objects always sets it, but the
-            # attribute may be absent if a future path skips the call.
-            stats['prune_failures'] = int(getattr(self, "_prune_failures", 0))
+
+        # v0.2.73 (C-11 / RT-3): propagate the delete-failure count so main()
+        # can flip success→partial and emit PRUNE_FAILURES=N.
+        # v0.2.75 (P1b-3): populated UNCONDITIONALLY (was: only under
+        # prune_stale) — the stale-file probe's orphan-clear and the drain's
+        # deleted-file prune both delete on runs WITHOUT --prune-stale, and a
+        # failed delete there is the same silent-stale-data condition: the
+        # purgeable row survives, the owed-probe (correctly) no longer counts
+        # it, and NOTHING converges it — the build must surface as partial,
+        # never as a clean success. Read via getattr because the attribute
+        # may be absent if a future path skips the per-run reset.
+        stats['prune_failures'] = int(getattr(self, "_prune_failures", 0))
 
         return stats
 
@@ -5979,17 +5991,23 @@ class CodeGraphAnalyzer:
             collections. Printed per-collection on stdout so the
             launcher's log shows what happened.
 
-        Side effect (v0.2.73, C-11 / RT-3): sets ``self._prune_failures`` to
-        the total number of per-row delete failures across all collections so
-        ``analyze_repository`` can propagate it into ``stats`` and main() can
-        flip the build status success→partial when it is non-zero.
+        Side effect (v0.2.73, C-11 / RT-3): accumulates the total number of
+        per-row delete failures across all collections into
+        ``self._prune_failures`` so ``analyze_repository`` can propagate it
+        into ``stats`` and main() can flip the build status success→partial
+        when it is non-zero. v0.2.75 (P1b-3): ADDS onto the accumulator
+        instead of overwriting it — the stale-file probe's orphan-clear and
+        the drain's deleted-file prune may already have recorded failures
+        earlier in the SAME run, and clobbering them silently un-reported
+        those rows (the per-run reset lives at the top of
+        ``analyze_repository``).
         """
         if not self._track_visited:
             # Defensive: should never happen (caller gates on
             # prune_stale=True which sets _track_visited=True), but
-            # guard against a future code path that forgets.
+            # guard against a future code path that forgets. Do NOT touch
+            # the accumulator — earlier producers' failures must survive.
             print("⚠️  _prune_stale_objects called without _track_visited — skipping")
-            self._prune_failures = 0
             return 0
 
         total_pruned = 0
@@ -6034,7 +6052,11 @@ class CodeGraphAnalyzer:
                 )
                 total_failures += failures
 
-        self._prune_failures = total_failures
+        # v0.2.75 (P1b-3): accumulate — never clobber earlier producers
+        # (orphan-clear / drain prune) in the same run.
+        self._prune_failures = (
+            int(getattr(self, "_prune_failures", 0)) + total_failures
+        )
         return total_pruned
 
     def _prune_collection(
@@ -8259,6 +8281,18 @@ class CodeGraphAnalyzer:
             print(
                 f"   🧹 cleared {orphans_cleared} orphan (deleted-file) "
                 f"row(s){f'; {orphan_failures} delete(s) failed' if orphan_failures else ''}"
+            )
+        if orphan_failures:
+            # v0.2.75 (P1b-3): fold orphan-clear delete failures into the
+            # EXISTING accounting chain (self._prune_failures → stats →
+            # main()'s PRUNE_FAILURES=N line → codegraph.rs reader →
+            # success→partial → GUI banner). Pre-fix the count was only
+            # PRINTED above — a run whose purge failed still reported a
+            # clean success while the purgeable rows silently survived (and,
+            # correctly, no longer counted as owed: a false "converged").
+            # No new plumbing — same signal the --prune-stale pass uses.
+            self._prune_failures = (
+                int(getattr(self, "_prune_failures", 0)) + orphan_failures
             )
         if not determinable:
             return None
@@ -10524,7 +10558,15 @@ def main():
         # success→partial when prune deletes failed (silent stale data). Always
         # emitted when prune_stale is on so a `PRUNE_FAILURES=0` line positively
         # confirms a clean prune (absence-of-line is not confirmation).
-        if args.prune_stale:
+        #
+        # v0.2.75 (P1b-3): ALSO emitted whenever the count is non-zero on a
+        # run WITHOUT --prune-stale — the stale-file probe's orphan-clear and
+        # the drain's deleted-file prune both delete on ordinary walks, and a
+        # failed delete there is the same silent-stale-data condition the
+        # reader must flip to partial. The reader (codegraph.rs::
+        # parse_prune_failures) already parses the line wherever it appears —
+        # no new plumbing.
+        if args.prune_stale or prune_failures > 0:
             print(f"PRUNE_FAILURES={prune_failures}", flush=True)
         if prune_failures > 0:
             # Surface the CONSENTED drop-and-rebuild remedy for the recurring
