@@ -48,6 +48,38 @@ BLOCKLIST=(
   "ltnlwh"
 )
 
+# High-signal live-credential SHAPES (regexes, grep -E). Unlike BLOCKLIST
+# (historical fixed strings), these catch NEW leaks by structure. Used by
+# the dist/ passes below (v0.2.75 P2c) — the paths the main pass excludes.
+# ONE list feeds both the dist text pass and the dist-binary strings pass;
+# do not fork it.
+TOKEN_SHAPES=(
+  # GitHub classic PAT: ghp_ + 36 alnum.
+  "ghp_[A-Za-z0-9]{36}"
+
+  # GitHub fine-grained PAT: github_pat_ + 22 alnum + _ + 59 alnum.
+  # MUST-MATCH anchor: this is the canonical token-shape anchor that
+  # templates/hooks/post-tool-security.sh (hooks plan D-13) must match —
+  # keep the two regexes identical so they cannot drift.
+  # NOTE: the looser shape github_pat_[A-Za-z0-9_]{60,} false-positives
+  # on Rust release binaries — rustc concatenates static strings into
+  # unseparated rodata tables, so command names like
+  # get_github_pat_preview + neighbours fuse into 100+-char word runs
+  # starting with "github_pat_". The exact-format shape matches every
+  # real token while skipping identifier soup (verified 2026-07-07
+  # against all 9 dist binaries).
+  "github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}"
+
+  # OpenAI-style secret key. Alnum-only tail unless a known prefix
+  # (proj/svcacct/admin) follows — the bare sk-[A-Za-z0-9_-]{20,} shape
+  # false-positives on locale asset chunk names in the vendored
+  # Excalidraw bundle (e.g. sk-SK-<hash> for the Slovak locale).
+  "sk-(proj|svcacct|admin)-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{20,}"
+
+  # PEM private key header (RSA/EC/OPENSSH/blank variants).
+  "-----BEGIN [A-Z ]*PRIVATE KEY-----"
+)
+
 # Files we don't want to scan (binaries, generated, vendored).
 EXCLUDE_PATHS=(
   ":(exclude)CHANGELOG.md"
@@ -77,19 +109,87 @@ else
 fi
 
 violations=0
-for token in "${BLOCKLIST[@]}"; do
-  # -F = fixed string, -l = filename only
-  if matches=$(echo "$file_list" | xargs -r grep -l -F -- "$token" 2>/dev/null); then
+
+# Shared scan loop — the ONE home for "grep a pattern list over a file
+# list and report violations". Both the main pass and the dist text
+# pass (v0.2.75 P2c) call this; don't inline a second copy.
+#   $1 = grep matcher mode: -F (fixed string) or -E (extended regex)
+#   $2 = label for the report line
+#   $3 = newline-separated file list
+#   $4..$n = patterns
+scan_files() {
+  local mode="$1" label="$2" list="$3"
+  shift 3
+  local token matches f
+  for token in "$@"; do
+    # -l = filename only. Never print the matched content itself — a
+    # real hit would re-leak the value into logs/CI output.
+    # NOTE: test the OUTPUT, not the exit status — when xargs splits a
+    # long list into batches and one batch has no match, xargs exits
+    # 123 even though another batch DID match; keying on exit status
+    # would silently drop that report.
+    matches=$(printf '%s\n' "$list" | xargs -r grep -l "$mode" -- "$token" 2>/dev/null || true)
     if [ -n "$matches" ]; then
-      printf 'BLOCKED: leaked token "%s" found in:\n' "$token" >&2
+      printf 'BLOCKED (%s): pattern "%s" found in:\n' "$label" "$token" >&2
       while IFS= read -r f; do
         [ -z "$f" ] && continue
         printf '  %s\n' "$f" >&2
       done <<< "$matches"
       violations=$((violations + 1))
     fi
-  fi
-done
+  done
+}
+
+# ── Pass 1: tracked tree (minus EXCLUDE_PATHS), historical blocklist ──
+scan_files -F "leaked token" "$file_list" "${BLOCKLIST[@]}"
+
+# ── Pass 2 (v0.2.75 P2c): dist/ TEXT files ───────────────────────────
+# The blanket **/dist/** exclusion above keeps binaries out of pass 1,
+# but it also skipped TEXT files under dist/ — notably the tracked
+# launcher/dist/**/metadata.json the release bot refreshes on every
+# tag. Scan them explicitly here with the SAME BLOCKLIST plus the
+# TOKEN_SHAPES regexes. Uses find (not git ls-files) so untracked
+# files sitting in a dist/ dir are caught BEFORE anything commits them.
+dist_text_list=$(find . \
+    \( -name .git -o -name node_modules -o -name target \) -prune -o \
+    -type f -path '*/dist/*' \
+    \( -name '*.json' -o -name '*.md' -o -name '*.txt' -o -name '*.js' \
+       -o -name '*.ts' -o -name '*.map' -o -name '*.html' -o -name '*.css' \
+       -o -name '*.yml' -o -name '*.yaml' -o -name '*.toml' \) \
+    -print 2>/dev/null || true)
+if [ -n "$dist_text_list" ]; then
+  scan_files -F "dist text: leaked token" "$dist_text_list" "${BLOCKLIST[@]}"
+  scan_files -E "dist text: credential shape" "$dist_text_list" "${TOKEN_SHAPES[@]}"
+fi
+
+# ── Pass 3 (v0.2.75 P2c tier-2): strings over the dist binaries ──────
+# Time-boxed high-signal sweep of the shipped vct-launcher / vct-hub /
+# vct-updater binaries themselves (all arches, ~0.6 s total). Only the
+# TOKEN_SHAPES regexes — the historical BLOCKLIST prefixes are too
+# short to be meaningful against binary rodata. Reports shape + count
+# only, never the matched bytes (avoid re-leaking a real hit).
+if command -v strings >/dev/null 2>&1; then
+  _strings_tmp="$(mktemp)"
+  for bin in launcher/dist/*/vct-launcher launcher/dist/*/vct-hub \
+             launcher/dist/*/vct-updater launcher/dist/*/vct-launcher.exe \
+             launcher/dist/*/vct-hub.exe launcher/dist/*/vct-updater.exe; do
+    [ -f "$bin" ] || continue
+    strings -n 8 -- "$bin" > "$_strings_tmp" 2>/dev/null || true
+    for shape in "${TOKEN_SHAPES[@]}"; do
+      # grep -c (not -q): -q's early-exit SIGPIPEs the producer, which
+      # pipefail would misread as "no match". -c reads all input.
+      _n=$(grep -E -c -- "$shape" "$_strings_tmp" || true)
+      if [ "${_n:-0}" -gt 0 ]; then
+        printf 'BLOCKED (dist binary): credential shape "%s" matched %s string(s) in %s\n' \
+          "$shape" "$_n" "$bin" >&2
+        violations=$((violations + 1))
+      fi
+    done
+  done
+  rm -f "$_strings_tmp"
+else
+  echo "check-no-secrets: note — 'strings' not on PATH; skipping dist-binary tier-2 sweep" >&2
+fi
 
 if [ "$violations" -gt 0 ]; then
   echo "" >&2
