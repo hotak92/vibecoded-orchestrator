@@ -674,22 +674,43 @@ pub async fn list_legacy_codegraph_collections(
     // canonical_prefix) so we can match orphan code-graph prefixes
     // against them. `project_identities` is the unfiltered list;
     // `affected_projects` is the legacy-cleanup subset.
-    let project_identities: Vec<(String, String, String)> = match db.list_projects() {
+    // v0.2.75 (C-10): collect (id, name, binding_prefix) once, then derive
+    // BOTH views from it: the per-project resolved prefix (binding-first,
+    // used for attribution below) AND the FAIL-CLOSED protected set — for
+    // every live project the binding prefix AND the current name-derived
+    // canonical. Pre-fix only the resolved prefix was protected, so after a
+    // rename that left the binding on the OLD prefix, a rebuild's NEW
+    // name-derived classes were attributed as a deletable orphan group
+    // (SEV-1). See `protected_codegraph_prefixes`.
+    let project_rows: Vec<(String, String, Option<String>)> = match db.list_projects() {
         Ok(rows) => rows
             .into_iter()
             .map(|row| {
-                let binding = db.get_project_codegraph_binding(&row.id).ok().flatten();
-                let prefix = binding
-                    .map(|b| b.collection_prefix)
-                    .unwrap_or_else(|| {
-                        canonical_class_prefix(&row.name)
-                            .unwrap_or_else(|_| sanitize_kg_collection(&row.name))
-                    });
-                (row.id, row.name, prefix)
+                let binding_prefix = db
+                    .get_project_codegraph_binding(&row.id)
+                    .ok()
+                    .flatten()
+                    .map(|b| b.collection_prefix);
+                (row.id, row.name, binding_prefix)
             })
             .collect(),
         Err(_) => Vec::new(),
     };
+    let protected_prefixes = protected_codegraph_prefixes(
+        project_rows
+            .iter()
+            .map(|(_, name, binding)| (name.as_str(), binding.as_deref())),
+    );
+    let project_identities: Vec<(String, String, String)> = project_rows
+        .into_iter()
+        .map(|(id, name, binding_prefix)| {
+            let prefix = binding_prefix.unwrap_or_else(|| {
+                canonical_class_prefix(&name)
+                    .unwrap_or_else(|_| sanitize_kg_collection(&name))
+            });
+            (id, name, prefix)
+        })
+        .collect();
 
     let affected_projects: Vec<AffectedProject> = project_identities
         .iter()
@@ -709,14 +730,95 @@ pub async fn list_legacy_codegraph_collections(
     // them) are surfaced as "untracked" groups ONLY when
     // `include_untracked == true`. Default (false) keeps the wizard's
     // visual clutter down by hiding data from since-deleted projects.
+    let orphan_groups = build_orphan_groups(
+        code_graph_by_prefix,
+        &project_identities,
+        &protected_prefixes,
+        include_untracked,
+    );
+
+    let action_recommended = (!collections.is_empty() && !affected_projects.is_empty())
+        || orphan_groups.iter().any(|g| g.total_objects > 0);
+    Ok(LegacyCodegraphReport {
+        collections,
+        affected_projects,
+        orphan_groups,
+        action_recommended,
+    })
+}
+
+/// Split a Weaviate class name into `(prefix, suffix)` where suffix is
+/// one of the five canonical code-graph suffixes. Returns `None` for
+/// any name that isn't a code-graph class (KG / Development / other
+/// shapes fall through).
+fn split_codegraph_class_name(class_name: &str) -> Option<(&str, &str)> {
+    // Iterate suffixes longest-first to handle the `CodeAPI` ⊂ `CodeAPIWhatever`
+    // case if it ever arises (it doesn't today, but cheap insurance).
+    for suffix in CODE_GRAPH_SUFFIXES {
+        let needle = format!("_{}", suffix);
+        if let Some(stripped) = class_name.strip_suffix(&needle) {
+            return Some((stripped, suffix));
+        }
+    }
+    None
+}
+
+/// v0.2.75 (C-10): FAIL-CLOSED protected-prefix set for the orphan surfaces.
+///
+/// A prefix reachable from EITHER a live project's binding row OR its current
+/// sanitized `projects.name` must never be listed (detection /
+/// `build_orphan_groups`) or deleted (delete boundary /
+/// `cleanup_orphan_codegraph_collections`) as an orphan. The two can diverge
+/// after a rename (binding still on the OLD prefix while the rebuild spawn
+/// writes under the NEW name-derived one — the C-10 split), and pre-fix only
+/// the binding-first resolved prefix was protected, so the freshly-rebuilt
+/// NEW classes were attributable AND deletable. Protecting BOTH is
+/// fail-closed: at worst a genuinely-stale prefix that happens to collide
+/// with a live project's name derivation stays listed as active — never the
+/// reverse.
+///
+/// Input: `(project_name, binding_prefix)` per live project. Both derivations
+/// of the name are included (`canonical_class_prefix` with the
+/// `sanitize_kg_collection` fallback — the same chain every producer uses).
+pub(crate) fn protected_codegraph_prefixes<'a>(
+    projects: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for (name, binding_prefix) in projects {
+        if let Some(b) = binding_prefix {
+            if !b.is_empty() {
+                out.insert(b.to_string());
+            }
+        }
+        let derived =
+            canonical_class_prefix(name).unwrap_or_else(|_| sanitize_kg_collection(name));
+        if !derived.is_empty() {
+            out.insert(derived);
+        }
+    }
+    out
+}
+
+/// v0.2.15 (0.4) orphan-group construction, extracted pure (v0.2.75, C-10) so
+/// the never-flag-live-canonical guard is unit-testable without Weaviate.
+///
+/// For each orphan prefix found in Weaviate, attribute it to a known project
+/// via the case-insensitive normalised-name match — EXCEPT prefixes in
+/// `protected_prefixes` (see `protected_codegraph_prefixes`): those are the
+/// ACTIVE class set of some live project (reachable via its binding row or
+/// its current name) and must never surface as deletable orphans.
+fn build_orphan_groups(
+    code_graph_by_prefix: std::collections::BTreeMap<String, Vec<LegacyCodegraphCollection>>,
+    project_identities: &[(String, String, String)],
+    protected_prefixes: &std::collections::HashSet<String>,
+    include_untracked: bool,
+) -> Vec<OrphanCollectionGroup> {
     let mut orphan_groups: Vec<OrphanCollectionGroup> = Vec::new();
     for (prefix, entries) in code_graph_by_prefix {
-        // Skip prefixes that exactly match SOME project's current
-        // canonical — those are the ACTIVE class set, not orphans.
-        if project_identities
-            .iter()
-            .any(|(_, _, current)| *current == prefix)
-        {
+        // Skip prefixes reachable from ANY live project — binding row OR
+        // current sanitized name (v0.2.75 C-10 fail-closed guard; was
+        // binding-first-resolved-prefix only).
+        if protected_prefixes.contains(&prefix) {
             continue;
         }
         // Try to attribute by case-insensitive normalised-name match.
@@ -756,31 +858,7 @@ pub async fn list_legacy_codegraph_collections(
             total_objects: total,
         });
     }
-
-    let action_recommended = (!collections.is_empty() && !affected_projects.is_empty())
-        || orphan_groups.iter().any(|g| g.total_objects > 0);
-    Ok(LegacyCodegraphReport {
-        collections,
-        affected_projects,
-        orphan_groups,
-        action_recommended,
-    })
-}
-
-/// Split a Weaviate class name into `(prefix, suffix)` where suffix is
-/// one of the five canonical code-graph suffixes. Returns `None` for
-/// any name that isn't a code-graph class (KG / Development / other
-/// shapes fall through).
-fn split_codegraph_class_name(class_name: &str) -> Option<(&str, &str)> {
-    // Iterate suffixes longest-first to handle the `CodeAPI` ⊂ `CodeAPIWhatever`
-    // case if it ever arises (it doesn't today, but cheap insurance).
-    for suffix in CODE_GRAPH_SUFFIXES {
-        let needle = format!("_{}", suffix);
-        if let Some(stripped) = class_name.strip_suffix(&needle) {
-            return Some((stripped, suffix));
-        }
-    }
-    None
+    orphan_groups
 }
 
 /// v0.2.74 (B-B): pure per-class refusal decision for the orphan-cleanup
@@ -1037,17 +1115,30 @@ pub async fn cleanup_orphan_codegraph_collections(
     // that is catastrophic data loss. So we independently REFUSE any class whose
     // prefix EXACTLY matches an active canonical prefix — defense-in-depth at the
     // delete boundary, not by-convention on the detection side.
+    // v0.2.75 (C-10): the set now includes BOTH the binding prefix AND the
+    // current name-derived canonical per project (was binding-first only) —
+    // after a rename the two can diverge and BOTH are reachable-by-a-reader,
+    // so BOTH must be refused at the delete boundary. One home:
+    // `protected_codegraph_prefixes` (shared with the detection side).
     let active_canonical_prefixes: std::collections::HashSet<String> = match db.list_projects() {
-        Ok(rows) => rows
-            .into_iter()
-            .map(|row| {
-                let binding = db.get_project_codegraph_binding(&row.id).ok().flatten();
-                binding.map(|b| b.collection_prefix).unwrap_or_else(|| {
-                    canonical_class_prefix(&row.name)
-                        .unwrap_or_else(|_| sanitize_kg_collection(&row.name))
+        Ok(rows) => {
+            let pairs: Vec<(String, Option<String>)> = rows
+                .into_iter()
+                .map(|row| {
+                    let binding_prefix = db
+                        .get_project_codegraph_binding(&row.id)
+                        .ok()
+                        .flatten()
+                        .map(|b| b.collection_prefix);
+                    (row.name, binding_prefix)
                 })
-            })
-            .collect(),
+                .collect();
+            protected_codegraph_prefixes(
+                pairs
+                    .iter()
+                    .map(|(name, binding)| (name.as_str(), binding.as_deref())),
+            )
+        }
         // If we CANNOT enumerate projects, we cannot prove a class is NOT a live
         // canonical → refuse ALL deletes (fail-closed: never delete on
         // uncertainty about what's live).
@@ -2175,6 +2266,123 @@ mod tests {
         assert!(orphan_cleanup_refusal_reason(
             "Client_a_private_CodeFunction", &active, "ClaudeOrchestrator",
         ).is_none());
+    }
+
+    // ─── v0.2.75 (C-10): never-flag-live-canonical guard ──────────────────
+
+    /// The protected set covers BOTH sides of a rename-split: the binding
+    /// prefix (OLD) and the current name-derived canonical (NEW). Either one
+    /// is reachable by SOME reader, so neither may ever be listed/deleted.
+    #[test]
+    fn protected_prefixes_cover_binding_and_name_derived() {
+        let set = protected_codegraph_prefixes(vec![
+            // Rename-split project: binding still on the OLD prefix while
+            // the name now derives the NEW one.
+            ("NewName", Some("OldName")),
+            // Ordinary project: binding == name-derived.
+            ("Steady", Some("Steady")),
+            // Never-analyzed project: no binding at all.
+            ("Fresh", None),
+        ]);
+        assert!(set.contains("OldName"), "binding prefix must be protected");
+        assert!(set.contains("NewName"), "name-derived prefix must be protected");
+        assert!(set.contains("Steady"));
+        assert!(set.contains("Fresh"), "name-derived covers binding-less projects");
+        assert_eq!(set.len(), 4);
+    }
+
+    /// Delete boundary (B-B guard, extended by C-10): a class whose prefix
+    /// matches the CURRENT NAME-derived canonical of a live project must be
+    /// refused even when the binding row points elsewhere — the exact
+    /// rename-then-rebuild scenario where the freshly-rebuilt NEW-prefix
+    /// classes were deletable pre-fix.
+    #[test]
+    fn orphan_cleanup_refuses_name_derived_canonical_when_binding_diverges() {
+        // Simulate the post-rename state: binding = "OldName" (not yet
+        // rebuilt), projects.name = "NewName".
+        let active = protected_codegraph_prefixes(vec![("NewName", Some("OldName"))]);
+
+        // The rebuild's NEW-prefix class → REFUSED (was deletable pre-fix).
+        let r = orphan_cleanup_refusal_reason(
+            "NewName_CodeFunction", &active, "ClaudeOrchestrator",
+        );
+        assert!(r.is_some(), "name-derived canonical must be refused");
+        assert!(r.unwrap().contains("ACTIVE canonical"));
+
+        // The binding-side class → still REFUSED (pre-existing B-B).
+        assert!(orphan_cleanup_refusal_reason(
+            "OldName_CodeModule", &active, "ClaudeOrchestrator",
+        )
+        .is_some());
+
+        // A genuinely unrelated prefix → ALLOWED (leave-alone case: the
+        // guard must not swallow real orphans).
+        assert!(orphan_cleanup_refusal_reason(
+            "SinceDeletedProj_CodeFunction", &active, "ClaudeOrchestrator",
+        )
+        .is_none());
+    }
+
+    /// Detection side: `build_orphan_groups` must never surface a protected
+    /// prefix as an (attributable, hence deletable) orphan group — even when
+    /// the normalised-name match WOULD attribute it — and must still surface
+    /// genuine orphan variants (act + leave-alone).
+    #[test]
+    fn build_orphan_groups_never_lists_protected_prefixes() {
+        let entry = |class: &str| LegacyCodegraphCollection {
+            class: class.to_string(),
+            suffix: "CodeFunction".to_string(),
+            object_count: 42,
+        };
+        let mut by_prefix: std::collections::BTreeMap<
+            String,
+            Vec<LegacyCodegraphCollection>,
+        > = std::collections::BTreeMap::new();
+        // The rebuild's NEW name-derived classes (post-rename, binding still
+        // on OldName): MUST be skipped.
+        by_prefix.insert(
+            "NewName".to_string(),
+            vec![entry("NewName_CodeFunction")],
+        );
+        // The binding-side classes: MUST be skipped too.
+        by_prefix.insert(
+            "OldName".to_string(),
+            vec![entry("OldName_CodeFunction")],
+        );
+        // A case-variant duplicate (the real orphan class): MUST be listed
+        // and attributed to the project via the normalised-name match.
+        by_prefix.insert(
+            "Newname".to_string(),
+            vec![entry("Newname_CodeFunction")],
+        );
+
+        // Post-rename identity: resolved (binding-first) prefix = OldName.
+        let identities = vec![(
+            "pid-1".to_string(),
+            "NewName".to_string(),
+            "OldName".to_string(),
+        )];
+        let protected = protected_codegraph_prefixes(vec![("NewName", Some("OldName"))]);
+
+        let groups = build_orphan_groups(by_prefix, &identities, &protected, false);
+        let prefixes: Vec<&str> = groups.iter().map(|g| g.prefix.as_str()).collect();
+        assert!(
+            !prefixes.contains(&"NewName"),
+            "name-derived canonical must never be listed: {:?}",
+            prefixes
+        );
+        assert!(
+            !prefixes.contains(&"OldName"),
+            "binding prefix must never be listed: {:?}",
+            prefixes
+        );
+        assert_eq!(
+            prefixes,
+            vec!["Newname"],
+            "the genuine case-variant orphan must still surface"
+        );
+        assert_eq!(groups[0].matched_project_id, "pid-1");
+        assert_eq!(groups[0].total_objects, 42);
     }
 
     #[test]

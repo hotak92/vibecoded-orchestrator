@@ -19,6 +19,7 @@ use crate::db::kg_summaries::status as kg_summary_status;
 use crate::db::kg_syncs::status as kg_sync_status;
 use crate::db::models::{ModuleInstallRow, ProjectHost, ProjectRow};
 use crate::db::Db;
+use crate::project_naming::canonical_class_prefix;
 use vct_launcher_core::process::CommandExt as _;
 
 #[derive(Debug, Clone, Serialize)]
@@ -4531,6 +4532,66 @@ pub async fn rename_project_v2(
         warnings.extend(db.propagate_kg_access_on_rename(&id, old, &new_name));
     }
 
+    // C-10 (v0.2.75): keep the code-graph binding prefix — the SINGLE source
+    // of truth every consumer reads (GUI counts, MCP/CLI reads via the env
+    // projection + hub resolver, and the class set the rebuild fills) — in
+    // lock-step with the rename. Pre-fix the binding kept the OLD prefix
+    // while (a) the launcher's rebuild spawned the analyzer with the NEW
+    // `projects.name` and (b) the GUI count queries filtered `project ==
+    // <new name>` against the OLD classes — a split brain where writes and
+    // reads disagreed and the orphan GUI could attribute the freshly-rebuilt
+    // NEW-prefix classes as a deletable orphan group (SEV-1 data-loss vector).
+    //
+    // Read-path window (decided v0.2.75, plan-preferred option): the binding
+    // moves to the NEW prefix AT RENAME TIME, so reads point at a NEW —
+    // initially EMPTY — class set until the user runs the rebuild the
+    // `codegraph_rename_split_pending` deferral names. Empty reads for that
+    // window are the deliberate trade: they are honest ("this graph needs a
+    // rebuild"), they can never lose data, and the OLD classes stay intact
+    // until the user consents to dropping them via the orphan-collections
+    // GUI (which, post-rename, correctly attributes them as an orphan group).
+    // The alternative (leave the binding on OLD until a migration) keeps
+    // COUNT reads broken anyway — the GUI filters rows by the NEW
+    // `projects.name`, which OLD-prefix rows aren't stamped with.
+    //
+    // Leave-alone case: a binding whose prefix does NOT match the OLD name's
+    // derived prefix was customized by the user (Identity tab → code-graph
+    // prefix). Never clobber it — the custom prefix stays the SSOT and the
+    // deferral text still names where the rows live.
+    let rename_cg_binding = db.get_project_codegraph_binding(&id).ok().flatten();
+    if let Some(old) = &old_name {
+        warnings.extend(propagate_codegraph_binding_on_rename(
+            &db,
+            &id,
+            old,
+            &new_name,
+            rename_cg_binding.as_ref(),
+        ));
+    }
+
+    // C-10 (v0.2.75): `codegraph_access` grants are ID-keyed
+    // (grantor_project_id / grantee_project_id, FK → projects.id), so the
+    // rows themselves survive a rename untouched — verified against the
+    // schema; unlike `kg_collection_access` there is nothing name-keyed to
+    // rewrite. What DOES go stale is each GRANTEE's projected
+    // `VCT_CODE_GRAPH_ACCESS_LIST` env value: the projection derives it from
+    // this project's CURRENT identity at projection time and the grantees'
+    // env files are static snapshots. Re-project every grantee so their MCP
+    // subprocesses resolve the renamed peer correctly. (The reverse
+    // direction — grants where THIS project is the grantee — is covered by
+    // this project's own env refresh below.) Soft-fail per grantee.
+    if old_name.as_deref().is_some_and(|old| old != new_name) {
+        if let Ok(grants) = db.codegraph_list_grants_from(&id) {
+            for (grantee_id, _level) in grants {
+                if grantee_id == id {
+                    continue;
+                }
+                let r = reproject_env_soft(&db, &grantee_id);
+                warnings.extend(r.warnings);
+            }
+        }
+    }
+
     // B9 (2026-05-01): re-run env writers after DB rename so every
     // surface reflects the new KG_COLLECTION, DEVELOPMENT_COLLECTION,
     // PROJECT_NAME. Before this fix, rename was DB-only — renamed
@@ -4579,26 +4640,21 @@ pub async fn rename_project_v2(
         }
     }
 
-    // C-10 (v0.2.73): a rename splits the code graph across two collection
-    // sets. The binding row's `collection_prefix` (the SINGLE source of truth
-    // consumers read: GUI counts, MCP/CLI reads, hooks via the hub resolver)
-    // is NOT changed here — and Weaviate has no class-rename verb, so the OLD
-    // `Sanitize(old_name)_Code*` classes keep the existing rows. But the
-    // launcher's rebuild spawns the analyzer with `projects.name` (NEW) as
-    // `--project`, so a subsequent rebuild WRITES into `Sanitize(new_name)_
-    // Code*` while reads still target the OLD prefix → per-edit hook
-    // increments land in classes nobody reads, GUI counts freeze, and the OLD
-    // set is never pruned. Rather than silently fork, surface a deferral so
-    // the user runs a rebuild-under-the-new-name + cleans up the old
-    // collections deliberately. (The binding prefix stays the source of truth;
-    // this deferral is the honest "your code graph needs a rebuild" signal.)
+    // C-10 (v0.2.73, reworked v0.2.75): a rename leaves the existing rows in
+    // the OLD `<OldPrefix>_Code*` classes — Weaviate has no class-rename verb.
+    // The binding prefix has ALREADY been moved to the NEW name-derived
+    // prefix above (when it was name-derived), so reads now point at a NEW,
+    // initially EMPTY class set. This deferral is the honest "your code graph
+    // needs a rebuild under the new name" signal: the rebuild fills the NEW
+    // classes, and the OLD classes then surface in the launcher's
+    // orphan-collections GUI for consented cleanup. `cg_prefix_old` is the
+    // PRE-rename binding prefix (captured before the update) so the deferral
+    // can name where the existing rows still live.
     if let Some(old) = &old_name {
         if old != &new_name {
-            let cg_prefix_old = db
-                .get_project_codegraph_binding(&id)
-                .ok()
-                .flatten()
-                .map(|b| b.collection_prefix);
+            let cg_prefix_old = rename_cg_binding
+                .as_ref()
+                .map(|b| b.collection_prefix.clone());
             if let Err(e) = emit_codegraph_rename_deferral(
                 Path::new(&row.folder_path),
                 old,
@@ -4623,6 +4679,76 @@ pub async fn rename_project_v2(
         project: ProjectView::from_row(row, count),
         warnings,
     })
+}
+
+/// C-10 (v0.2.75): move the code-graph binding prefix to the NEW name-derived
+/// prefix on rename — but ONLY when the pre-rename binding was itself derived
+/// from the OLD name (leave a user-customized Identity-tab prefix alone).
+///
+/// `binding` is the PRE-rename binding row (captured by the caller before any
+/// update). Returns human-readable warnings (empty on the happy path / every
+/// leave-alone case). Pure DB logic — extracted from `rename_project_v2` so
+/// the act AND leave-alone branches are unit-testable without Tauri state.
+pub(crate) fn propagate_codegraph_binding_on_rename(
+    db: &Db,
+    project_id: &str,
+    old_name: &str,
+    new_name: &str,
+    binding: Option<&crate::db::project_state::ProjectCodegraphBinding>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if old_name == new_name {
+        return warnings;
+    }
+    let binding = match binding {
+        Some(b) => b,
+        None => return warnings, // never analyzed — nothing to track
+    };
+    let old_derived =
+        canonical_class_prefix(old_name).unwrap_or_else(|_| sanitize_kg_collection(old_name));
+    let binding_is_name_derived = binding.collection_prefix == old_derived
+        || binding.collection_prefix == sanitize_kg_collection(old_name);
+    if !binding_is_name_derived {
+        return warnings; // user-customized prefix — never clobber
+    }
+    let new_prefix =
+        canonical_class_prefix(new_name).unwrap_or_else(|_| sanitize_kg_collection(new_name));
+    if new_prefix == binding.collection_prefix {
+        return warnings;
+    }
+    if let Err(e) = db.set_project_codegraph_binding(
+        project_id,
+        &new_prefix,
+        binding.embedding_model.as_deref(),
+        binding.embedding_dim,
+        binding.last_analyzed_commit.as_deref(),
+        binding.last_analyzed_at,
+        binding.enabled,
+        &binding.config,
+    ) {
+        let msg = format!(
+            "code-graph binding prefix update on rename failed: {}. \
+             The binding still points at '{}' while rebuilds write \
+             under '{}' — update it via the Identity tab.",
+            e, binding.collection_prefix, new_prefix
+        );
+        eprintln!("[vct] warning: {}", msg);
+        warnings.push(msg);
+    } else {
+        db.audit(
+            "codegraph_binding_update",
+            Some(project_id),
+            None,
+            &serde_json::json!({
+                "field": "collection_prefix",
+                "new_value": new_prefix,
+                "reason": "project_rename",
+                "old_value": binding.collection_prefix,
+            }),
+        )
+        .ok();
+    }
+    warnings
 }
 
 /// C-10 (v0.2.73): emit the `codegraph_rename_split_pending` deferral into the
@@ -4656,20 +4782,40 @@ fn emit_codegraph_rename_deferral(
             .to_string(),
     };
     let detected = format!(
-        "Project renamed from {:?} to {:?}. The code-graph binding prefix is \
-         the source of truth consumers read, but a launcher rebuild spawns the \
-         analyzer with the NEW project name — writing into a new prefix while \
-         reads target the existing one. {}",
+        "Project renamed from {:?} to {:?}. The code-graph binding prefix \
+         (the source of truth consumers read) now tracks the NEW name, so \
+         reads target an initially-empty class set until a rebuild fills it. \
+         {}",
         old_name, new_name, old_prefix_note
     );
+    // POSIX single-quote the project name for the emitted shell command
+    // (names may contain spaces; embedded single quotes use the standard
+    // '\'' escape). The analyzer needs `--project` explicitly here because
+    // its default is the FOLDER name, which a rename does not change — the
+    // folder-name fallback would mint a third, wrong prefix (B-A2 warns on
+    // exactly that).
+    //
+    // C-10 (v0.2.75): the previous command emitted `--force`, which the
+    // analyzer's argparse REJECTS ("unrecognized arguments") — the user
+    // could never run the remediation as written. No flag is needed: the
+    // analyzer always ensures collections exist (`create_collections(force=
+    // args.force_recreate)` in main()), and the NEW-prefix classes are
+    // empty/new, so a plain full analyze is exactly the rebuild we want.
+    // `--force-recreate` would only add a pointless drop of the brand-new
+    // classes. Guarded by tests/test_deferral_command_argparse_sweep.py.
+    let name_sh = format!("'{}'", new_name.replace('\'', r"'\''"));
     let cmd = format!(
         "# Rebuild this project's code graph under the new name:\n\
          cd {}\n\
-         .claude/scripts/code-graph-analyze . --force\n\
+         .claude/scripts/code-graph-analyze . --project {}\n\
          \n\
-         # Then drop the stale old-prefix classes in Weaviate (if any) so the \
-         old collection set stops accumulating orphan rows.",
-        project_folder.display()
+         # Then drop the stale old-prefix classes via the launcher's \
+         orphan-collections cleanup (Codegraph page) so the old set stops \
+         lingering. If you prefer a custom collection prefix instead of the \
+         name-derived one, set it in the launcher's Identity tab \
+         (code-graph prefix) BEFORE rebuilding.",
+        project_folder.display(),
+        name_sh
     );
 
     let repo_py = rename_py_quote(&repo_root.to_string_lossy());
@@ -8776,7 +8922,24 @@ mod tests {
         assert!(content.contains("codegraph_rename_split_pending"));
         assert!(content.contains("OldName"));
         assert!(content.contains("NewName"));
-        assert!(content.contains("code-graph-analyze . --force"));
+        // C-10 (v0.2.75): the emitted command must be one the analyzer's
+        // argparse ACCEPTS. The old `--force` flag does not exist and was
+        // rejected with "unrecognized arguments" — assert the VALID shape
+        // (`--project '<new name>'`) and that the bogus flag never returns.
+        // Family-wide guard: tests/test_deferral_command_argparse_sweep.py
+        // dry-parses every emitted command through the real parser.
+        assert!(
+            content.contains("code-graph-analyze . --project 'NewName'"),
+            "deferral must emit the argparse-valid rebuild command: {}",
+            content
+        );
+        assert!(
+            !content.contains("code-graph-analyze . --force"),
+            "the argparse-rejected --force flag must not be emitted"
+        );
+        // The deferral names the Identity-tab prefix updater as the
+        // customization surface.
+        assert!(content.contains("Identity tab"));
     }
 
     #[test]
@@ -8837,6 +9000,129 @@ mod tests {
         assert_eq!(
             by_collection.get("VibeCodedOrchestrator_KnowledgeGraph"),
             Some(&"write")
+        );
+    }
+
+    // ─── C-10 (v0.2.75) — rename ↔ code-graph binding lock-step ───────────
+
+    /// ACT case: a binding whose prefix was derived from the OLD name moves
+    /// to the NEW name-derived prefix on rename, preserving every other
+    /// binding field (embedding model/dim, last-analyzed markers, enabled,
+    /// config). This is the SSOT half of the C-10 fix: post-rename, GUI
+    /// counts / env projection / hub resolver / the rebuild's readers all
+    /// agree on the NEW prefix (initially empty until the deferral's rebuild
+    /// fills it — deliberate read-path window, never data loss).
+    #[test]
+    fn rename_moves_name_derived_codegraph_binding() {
+        let db = Db::open_in_memory().unwrap();
+        let pid = uuid::Uuid::new_v4().to_string();
+        db.insert_project(&pid, "Acme", "/tmp/acme", ProjectHost::Base, "acme").unwrap();
+        db.set_project_codegraph_binding(
+            &pid,
+            "Acme", // canonical_class_prefix("Acme") — name-derived
+            Some("codesage-large-v2"),
+            Some(2048),
+            Some("deadbeef"),
+            Some(1_700_000_000),
+            true,
+            &serde_json::json!({"k": "v"}),
+        )
+        .unwrap();
+
+        db.rename_project(&pid, "Beta", Some("beta")).unwrap();
+        let binding = db.get_project_codegraph_binding(&pid).unwrap().unwrap();
+        let warnings = propagate_codegraph_binding_on_rename(
+            &db, &pid, "Acme", "Beta", Some(&binding),
+        );
+        assert!(warnings.is_empty(), "happy path emits no warnings: {:?}", warnings);
+
+        let updated = db.get_project_codegraph_binding(&pid).unwrap().unwrap();
+        assert_eq!(updated.collection_prefix, "Beta");
+        // Every non-prefix field survives the move.
+        assert_eq!(updated.embedding_model.as_deref(), Some("codesage-large-v2"));
+        assert_eq!(updated.embedding_dim, Some(2048));
+        assert_eq!(updated.last_analyzed_commit.as_deref(), Some("deadbeef"));
+        assert_eq!(updated.last_analyzed_at, Some(1_700_000_000));
+        assert!(updated.enabled);
+        assert_eq!(updated.config, serde_json::json!({"k": "v"}));
+    }
+
+    /// LEAVE-ALONE case: a user-customized prefix (Identity tab) does NOT
+    /// match the old name's derivation → the rename must not clobber it.
+    #[test]
+    fn rename_leaves_custom_codegraph_binding_alone() {
+        let db = Db::open_in_memory().unwrap();
+        let pid = uuid::Uuid::new_v4().to_string();
+        db.insert_project(&pid, "Acme", "/tmp/acme", ProjectHost::Base, "acme").unwrap();
+        db.set_project_codegraph_binding(
+            &pid,
+            "TotallyCustomPrefix",
+            None,
+            None,
+            None,
+            None,
+            true,
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+
+        db.rename_project(&pid, "Beta", Some("beta")).unwrap();
+        let binding = db.get_project_codegraph_binding(&pid).unwrap().unwrap();
+        let warnings = propagate_codegraph_binding_on_rename(
+            &db, &pid, "Acme", "Beta", Some(&binding),
+        );
+        assert!(warnings.is_empty());
+
+        let after = db.get_project_codegraph_binding(&pid).unwrap().unwrap();
+        assert_eq!(
+            after.collection_prefix, "TotallyCustomPrefix",
+            "a user-customized prefix must survive rename untouched"
+        );
+    }
+
+    /// No-binding case: nothing to track — the helper must NOT mint a
+    /// binding row for a never-analyzed project.
+    #[test]
+    fn rename_with_no_codegraph_binding_is_a_noop() {
+        let db = Db::open_in_memory().unwrap();
+        let pid = uuid::Uuid::new_v4().to_string();
+        db.insert_project(&pid, "Acme", "/tmp/acme", ProjectHost::Base, "acme").unwrap();
+        db.rename_project(&pid, "Beta", Some("beta")).unwrap();
+        let warnings =
+            propagate_codegraph_binding_on_rename(&db, &pid, "Acme", "Beta", None);
+        assert!(warnings.is_empty());
+        assert!(db.get_project_codegraph_binding(&pid).unwrap().is_none());
+    }
+
+    /// `codegraph_access` grants are ID-keyed (grantor/grantee project ids,
+    /// FK → projects.id) — a rename must leave every edge intact in BOTH
+    /// directions. This pins the verified-in-source design fact the C-10
+    /// fix relies on: no name-keyed codegraph-access rows exist, so rename
+    /// propagation for grants is "refresh the grantees' projected env", not
+    /// a row rewrite. (Contrast: `kg_collection_access` IS name-keyed and
+    /// needs `propagate_kg_access_on_rename`.)
+    #[test]
+    fn rename_preserves_codegraph_access_grants_both_directions() {
+        let db = Db::open_in_memory().unwrap();
+        let renamed = uuid::Uuid::new_v4().to_string();
+        let peer = uuid::Uuid::new_v4().to_string();
+        db.insert_project(&renamed, "Acme", "/tmp/acme", ProjectHost::Base, "acme").unwrap();
+        db.insert_project(&peer, "Peer", "/tmp/peer", ProjectHost::Base, "peer").unwrap();
+
+        // Renamed project as GRANTOR and as GRANTEE.
+        db.codegraph_grant(&renamed, &peer, "read").unwrap();
+        db.codegraph_grant(&peer, &renamed, "read").unwrap();
+
+        db.rename_project(&renamed, "Beta", Some("beta")).unwrap();
+
+        let from_renamed = db.codegraph_list_grants_from(&renamed).unwrap();
+        assert_eq!(from_renamed, vec![(peer.clone(), "read".to_string())]);
+        let to_renamed = db.codegraph_list_grants_to(&renamed).unwrap();
+        assert_eq!(to_renamed, vec![(peer.clone(), "read".to_string())]);
+        // And the check helper still resolves post-rename.
+        assert_eq!(
+            db.codegraph_check(&renamed, &peer).unwrap().as_deref(),
+            Some("read")
         );
     }
 
