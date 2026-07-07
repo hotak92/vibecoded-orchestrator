@@ -44,6 +44,20 @@ on:
       - "tests/common/sandbox.py"
       - "tests/integration/step22_multi_project/**"
       - ".github/workflows/step22-multi-project-access-matrix.yml"
+  # v0.2.75 P2b: also run on pushes to main touching the same paths, so
+  # the pre-ship workflow-green gate (scripts/pre-ship-check.sh Gate 24)
+  # has a main-branch run to assert against. The path list MUST stay in
+  # sync with the pull_request block above.
+  push:
+    branches: [main]
+    paths:
+      - "launcher/src-tauri/vct-hub/**"
+      - "launcher/src-tauri/vct-launcher-core/src/db/**"
+      - "templates/scripts/vct_project_config.*"
+      - "templates/scripts/vct_secrets_resolve.*"
+      - "tests/common/sandbox.py"
+      - "tests/integration/step22_multi_project/**"
+      - ".github/workflows/step22-multi-project-access-matrix.yml"
   workflow_dispatch: {}
 
 permissions:

@@ -330,6 +330,16 @@ check_workflow_last_run "codeql.yml" "CodeQL analysis (codeql.yml)"
 # Gate 13: Hook parity
 check_workflow_last_run "hook-parity.yml" "Hook OS-parity gate (hook-parity.yml)"
 
+# Gate 24: Step22 multi-project access matrix (v0.2.75 P2b).
+# Zero-runs behavior (verified 2026-07-07): with no completed run on
+# main, `gh run list --jq '.[0].conclusion'` prints an EMPTY string,
+# which check_workflow_last_run routes to gate_warn ("Could not fetch
+# run status") — i.e. zero runs is already skip-with-warning, NOT a
+# hard fail. Until the first path-touching push lands on main (the
+# workflow gained a `push: branches: [main]` trigger in v0.2.75), this
+# gate WARNs; after that it is a real green/red assertion.
+check_workflow_last_run "step22-multi-project-access-matrix.yml" "Step22 access matrix (step22-multi-project-access-matrix.yml)"
+
 echo ""
 
 # ── Section 3: Repo-level checks ─────────────────────────────────────────────
