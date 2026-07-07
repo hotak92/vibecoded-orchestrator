@@ -78,6 +78,18 @@ logger = logging.getLogger(__name__)
 DEFAULT_CODE_EMBED_PORT = 11440
 _CONDITION_ID = "codegraph_embed_resync_pending"
 
+# Hygiene (v0.2.75): keep the Popen handles of deliberately-DETACHED children
+# alive for the parent's lifetime. The children (resync driver, prune,
+# metadata backfill, code-summary rider) are meant to outlive install.py —
+# nobody waits on them — but dropping the handle lets CPython's Popen.__del__
+# fire on GC and print "ResourceWarning: subprocess NNN is still running"
+# (+ tracemalloc advice) into the user's update output. Live-observed 4x on
+# the 2026-07-07 dogfood update. Holding the reference suppresses the
+# destructor for the process lifetime; the OS reparents the children on
+# parent exit as designed. Do NOT replace this with warning suppression —
+# the warning is correct for genuinely-forgotten children.
+_DETACHED_CHILDREN: list = []
+
 # ── R-6 (v0.2.73): owed-work probe ───────────────────────────────────────────
 #
 # Fallback embedding revision when the analyzer source cannot be parsed.
@@ -1305,7 +1317,11 @@ def spawn_background_resync(
         ]
         if index_dot_claude:
             prune_argv.append("--index-dot-claude")
-        subprocess.Popen(prune_argv, **popen_kwargs)  # noqa: S603 — argv is ours
+        # Handle kept in _DETACHED_CHILDREN: suppresses the Popen destructor's
+        # ResourceWarning — this child deliberately outlives the caller.
+        _DETACHED_CHILDREN.append(
+            subprocess.Popen(prune_argv, **popen_kwargs)  # noqa: S603 — argv is ours
+        )
     except Exception as exc:  # noqa: BLE001 — prune is best-effort
         logger.warning("codegraph prune spawn failed: %s", exc)
 
@@ -1317,7 +1333,10 @@ def spawn_background_resync(
             py, str(Path(__file__).resolve()),
             "--backfill-metadata", "--project", project_name,
         ]
-        subprocess.Popen(backfill_argv, **popen_kwargs)  # noqa: S603 — argv is ours
+        # Handle kept alive — see _DETACHED_CHILDREN.
+        _DETACHED_CHILDREN.append(
+            subprocess.Popen(backfill_argv, **popen_kwargs)  # noqa: S603 — argv is ours
+        )
     except Exception as exc:  # noqa: BLE001 — backfill is best-effort
         logger.warning("codegraph metadata-backfill spawn failed: %s", exc)
 
@@ -1333,12 +1352,18 @@ def spawn_background_resync(
                 "--project", project_name,
                 "--project-root", str(repo_root),
             ]
-            subprocess.Popen(summary_argv, **popen_kwargs)  # noqa: S603 — argv is ours
+            # Handle kept alive — see _DETACHED_CHILDREN.
+            _DETACHED_CHILDREN.append(
+                subprocess.Popen(summary_argv, **popen_kwargs)  # noqa: S603 — argv is ours
+            )
     except Exception as exc:  # noqa: BLE001 — summary rider is best-effort
         logger.warning("code-summary spawn failed: %s", exc)
 
     try:
         proc = subprocess.Popen(argv, **popen_kwargs)  # noqa: S603 — argv is ours
+        # Handle kept alive — see _DETACHED_CHILDREN (the local `proc` goes
+        # out of scope when this function returns; only the pid is returned).
+        _DETACHED_CHILDREN.append(proc)
     except Exception as exc:  # noqa: BLE001 — spawn failure must not crash update
         # Treat a spawn failure like the service-down case: defer with a
         # re-run command so the user can complete the resync later.

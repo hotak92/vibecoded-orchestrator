@@ -216,6 +216,19 @@ _INSTALL_OWNED_CONDITION_PREFIXES = (
     "deprecated_mcp_",
     "bundle_pin_drift_",
 )
+
+# Hygiene (v0.2.75): keep the Popen handles of deliberately-DETACHED children
+# (Docker Desktop launch, stage-1 vct-updater handoff) alive for install.py's
+# lifetime. Nobody waits on these children — they are meant to outlive this
+# process — but dropping the handle lets CPython's Popen.__del__ fire on GC
+# and print "ResourceWarning: subprocess NNN is still running" into the
+# user's install output. Holding the reference suppresses the destructor for
+# the process lifetime. Mirror of vco_lib/codegraph_resync.py's
+# _DETACHED_CHILDREN (same fix, live-observed on the 2026-07-07 dogfood
+# update). Do NOT replace with global warning suppression — the warning is
+# correct for genuinely-forgotten children.
+_DETACHED_CHILDREN: list = []
+
 # v0.2.46 V47-B (Gap B): symlinks under install path are never touched.
 # v0.2.46 post-adversarial L1: check_vco_new_collision guards against
 # silently clobbering .vco-new siblings that the user may have hand-
@@ -8801,9 +8814,13 @@ def _try_start_docker_daemon() -> tuple[bool, str]:
             )
         try:
             # Detached start — Docker Desktop is a GUI app; don't block.
-            subprocess.Popen(
-                ["cmd", "/c", "start", "", str(exe)],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            # Handle kept in _DETACHED_CHILDREN: suppresses the Popen
+            # destructor's ResourceWarning for a child that outlives us.
+            _DETACHED_CHILDREN.append(
+                subprocess.Popen(
+                    ["cmd", "/c", "start", "", str(exe)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
             )
         except OSError as e:
             return False, f"could not launch Docker Desktop: {e}"
@@ -19627,13 +19644,18 @@ def _try_invoke_windows_stage1_updater(
     # On Windows, subprocess.Popen supports these via creationflags.
     try:
         creation_flags = 0x00000200 | 0x00000008  # NEW_PROCESS_GROUP | DETACHED
-        subprocess.Popen(
-            [str(updater_path), str(lock_path)],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creation_flags,
-            close_fds=True,
+        # Handle kept in _DETACHED_CHILDREN: suppresses the Popen
+        # destructor's ResourceWarning — the updater outlives install.py
+        # by design (it swaps our binaries after we exit).
+        _DETACHED_CHILDREN.append(
+            subprocess.Popen(
+                [str(updater_path), str(lock_path)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creation_flags,
+                close_fds=True,
+            )
         )
     except OSError as exc:
         # Clean up the lock — no updater is running to honor it.
