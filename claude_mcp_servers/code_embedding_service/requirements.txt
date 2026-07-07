@@ -13,6 +13,14 @@ sentence-transformers>=5.0.0
 #      CodeSage with trust_remote_code=True, modeling_codesage.py
 #      imports fail, FastAPI app exits → restart loop forever.
 #      Validated 2026-05-16 against 4.57.6.
+#
+# CVE-2026-4372 (GHSA-29pf-2h5f-8g72, RCE via attacker-controlled model
+# config) is NOT reachable here: this service loads only the fixed,
+# hard-coded CodeSage-Large-v2, never user- or remote-supplied model IDs.
+# GitHub closed the Dependabot alerts on 2026-07-07. Do NOT bump past
+# <4.50 to "fix" the CVE — that breaks the container (see above). The
+# only sanctioned lift path is a deliberate embedder refresh (model
+# swap), not a pin bump.
 transformers>=4.40.0,<4.50.0
 fastapi>=0.136.1
 uvicorn>=0.46.0
