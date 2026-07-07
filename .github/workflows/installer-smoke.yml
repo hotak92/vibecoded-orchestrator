@@ -101,7 +101,13 @@ jobs:
   install-smoke:
     name: install.py + install-bundle smoke
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # v0.2.74 post-tag: raised from 15 → 30 min (same rationale as the tri-OS
+    # job's v0.2.42 CI-3 bump below). The full run — Tauri/GTK apt deps +
+    # venv bootstrap + install.py --no-containers — now takes ~15 min on a
+    # standard ubuntu runner (both v0.2.74 runs were killed AT the budget:
+    # one mid-apt on a slow mirror, one just as install.py printed its
+    # completion epilogue). GitHub reports timeout kills as "cancelled".
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v6
