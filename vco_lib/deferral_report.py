@@ -58,11 +58,33 @@ _DEFERRED_REL = Path(".claude") / "context" / "UPDATE_DEFERRED.md"
 #
 # RECONCILIATION with the Rust editor: ``restart.rs`` clears a section from
 # the Markdown but does NOT know about the JSON sidecar. So on ``read`` we
-# treat JSON as authoritative BUT drop any entry whose ``## <cid>`` header is
+# treat JSON as authoritative BUT drop an entry whose ``## <cid>`` header is
 # absent from a co-present Markdown file — that means the Rust restart flow
-# (or a manual edit) removed it. This keeps JSON authoritative for content
-# while honouring the one cross-language mutation that touches the Markdown.
+# removed it. P2a (v0.2.75): the drop applies ONLY to the condition IDs the
+# Rust side actually strips (``_RUST_STRIPPABLE_CONDITION_IDS``); for every
+# other ID a missing Markdown header means the Markdown is STALE (e.g. the
+# JSON write landed but the Markdown write died mid-run, leaving an older
+# .md on disk) and the entry is KEPT — pre-P2a that crash window silently
+# dropped every cid newly added that run on the next read.
 _DEFERRED_JSON_REL = Path(".claude") / "context" / "UPDATE_DEFERRED.json"
+
+# P2a (v0.2.75): the exact condition IDs the Rust launcher strips from the
+# MARKDOWN ONLY (leaving the JSON sidecar untouched). The read()
+# reconcile-drop below applies exclusively to these IDs.
+#
+# MUST MATCH launcher/src-tauri/src/commands/restart.rs
+# ``clear_restart_deferral()`` — the single production
+# ``strip_section(&content, "launcher_restart_required")`` call site. If
+# restart.rs (or any other Rust editor) ever strips an additional section
+# from the Markdown without touching the JSON, add its condition ID here,
+# otherwise the strip is silently resurrected from the JSON on the next
+# Python read. (Rust editors that delete the WHOLE .md — e.g.
+# installer.rs::clear_update_resume_deferral_if_solo — do not go through
+# this reconcile arm: with no co-present Markdown, the JSON is taken
+# verbatim.)
+_RUST_STRIPPABLE_CONDITION_IDS = frozenset({
+    "launcher_restart_required",
+})
 
 # Sidecar schema version — bump when the JSON shape changes so old readers
 # can detect/skip an incompatible sidecar and fall back to the Markdown.
@@ -834,10 +856,14 @@ class DeferralReport:
 
         1. **JSON sidecar present + parseable** → authoritative content.
            Reconcile against the Markdown: if a co-present Markdown file
-           lacks a section for a ``condition_id`` the JSON carries, that
-           entry was stripped by the Rust ``restart.rs`` flow (or a manual
-           edit) — drop it so the two views agree. If the Markdown is
-           absent, take the JSON verbatim.
+           lacks a section for a ``condition_id`` the JSON carries AND
+           that ID is one the Rust ``restart.rs`` flow strips
+           (``_RUST_STRIPPABLE_CONDITION_IDS``, P2a v0.2.75), the entry
+           was cleared by the restart flow — drop it so the two views
+           agree. For any OTHER ID a missing Markdown header means the
+           Markdown is stale (crashed/partial Markdown write) — KEEP the
+           entry; the next write() re-renders the Markdown from JSON.
+           If the Markdown is absent, take the JSON verbatim.
         2. **JSON absent / unparseable / incompatible schema** → fall back
            to the legacy Markdown parser (back-compat for reports written
            before A-3, and for the round-trip-lossy path).
@@ -871,9 +897,13 @@ class DeferralReport:
                 if (
                     md_present_cids is not None
                     and entry.condition_id not in md_present_cids
+                    and entry.condition_id in _RUST_STRIPPABLE_CONDITION_IDS
                 ):
-                    # Section was stripped from the Markdown by an external
-                    # editor (restart.rs). Treat as resolved — drop it.
+                    # Section was stripped from the Markdown by the Rust
+                    # restart flow (the only editor that strips a section
+                    # from the .md without touching the JSON). Treat as
+                    # resolved — drop it. Any OTHER cid missing from the
+                    # Markdown = stale/partial .md → keep (P2a v0.2.75).
                     continue
                 report._entries.append(entry)
             return report

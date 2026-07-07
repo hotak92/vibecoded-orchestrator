@@ -15,6 +15,10 @@ tests assert the round-trip is now lossless AND that:
   * the Markdown render still exists (human view + Rust restart.rs surface);
   * a Rust-style strip of a section from the Markdown is honoured on read
     (JSON reconciled against Markdown section presence);
+  * P2a (v0.2.75): the reconcile-drop applies ONLY to the condition IDs
+    restart.rs actually strips (``_RUST_STRIPPABLE_CONDITION_IDS``) — any
+    other cid missing from a co-present Markdown means the .md is STALE
+    (crashed/partial Markdown write) and the entry is KEPT;
   * an absent/corrupt/incompatible JSON falls back to the Markdown parser.
 """
 
@@ -180,6 +184,105 @@ class TestReconciliationWithMarkdown(unittest.TestCase):
         cids = {e.condition_id for e in back.entries}
         self.assertNotIn("launcher_restart_required", cids)
         self.assertIn("other_entry", cids)
+
+    def test_non_strippable_cid_survives_stale_markdown(self):
+        """P2a (v0.2.75): a fresh NON-restart cid in the JSON survives a
+        co-present STALE Markdown that lacks its section header.
+
+        Crash window this closes: write() lands the JSON, the Markdown
+        write dies (crash/disk-full), an older pre-existing .md stays on
+        disk → pre-P2a, every cid newly added that run was silently
+        dropped on the next read (misread as a restart.rs strip)."""
+        # Older on-disk state: only `old_entry`.
+        old = DeferralReport()
+        old.add_entry(DeferralEntry(
+            condition_id="old_entry", title="old", detected="d",
+            why_deferred="w", command_to_apply="c", severity="info",
+        ))
+        old.write(self.folder)
+        stale_md = (self.folder / _DEFERRED_REL).read_text()
+
+        # New run adds a fresh entry; JSON write lands, Markdown write
+        # "dies" — simulate by restoring the stale Markdown afterwards.
+        new = DeferralReport()
+        new.add_entry(DeferralEntry(
+            condition_id="old_entry", title="old", detected="d",
+            why_deferred="w", command_to_apply="c", severity="info",
+        ))
+        new.add_entry(DeferralEntry(
+            condition_id="bundle_user_modified_preserved", title="fresh",
+            detected="d", why_deferred="w", command_to_apply="c",
+            severity="warning",
+        ))
+        new.write(self.folder)
+        (self.folder / _DEFERRED_REL).write_text(stale_md)
+
+        back = DeferralReport.read(self.folder)
+        cids = {e.condition_id for e in back.entries}
+        self.assertIn(
+            "bundle_user_modified_preserved", cids,
+            "non-Rust-strippable cid missing from a stale .md must be KEPT",
+        )
+        self.assertIn("old_entry", cids)
+
+    def test_strippable_and_stale_mixed_markdown(self):
+        """P2a: in ONE stale Markdown, `launcher_restart_required` missing
+        → dropped (Rust strip honoured); any other missing cid → kept."""
+        rep = DeferralReport()
+        rep.add_entry(DeferralEntry(
+            condition_id="launcher_restart_required", title="restart",
+            detected="d", why_deferred="w", command_to_apply="c",
+            severity="warning",
+        ))
+        rep.add_entry(DeferralEntry(
+            condition_id="fresh_non_restart_cid", title="fresh",
+            detected="d", why_deferred="w", command_to_apply="c",
+            severity="warning",
+        ))
+        rep.write(self.folder)
+
+        # A Markdown that carries NEITHER section (e.g. restart.rs stripped
+        # its entry from an .md that was already stale for the other cid).
+        md_path = self.folder / _DEFERRED_REL
+        md_path.write_text(
+            "---\ntitle: VCO Update Deferred\ncondition_ids: []\n---\n"
+            "\n# VCO Update Deferred\n"
+        )
+
+        back = DeferralReport.read(self.folder)
+        cids = {e.condition_id for e in back.entries}
+        self.assertNotIn("launcher_restart_required", cids,
+                         "Rust-strippable cid must still honour the strip")
+        self.assertIn("fresh_non_restart_cid", cids,
+                      "non-strippable cid must survive the stale .md")
+
+    def test_strippable_set_matches_restart_rs(self):
+        """Cross-language guard: the frozenset names exactly the cid(s)
+        restart.rs production code passes to strip_section()."""
+        from vco_lib.deferral_report import _RUST_STRIPPABLE_CONDITION_IDS
+        self.assertEqual(
+            _RUST_STRIPPABLE_CONDITION_IDS, {"launcher_restart_required"}
+        )
+        rs = (
+            REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands"
+            / "restart.rs"
+        )
+        if not rs.is_file():
+            self.skipTest("launcher sources not present in this checkout")
+        src = rs.read_text(encoding="utf-8")
+        # Every production strip_section call (skip `fn strip_section` and
+        # test-module usages, which exercise the helper directly).
+        in_tests = src.find("mod tests")
+        production = src[: in_tests if in_tests != -1 else len(src)]
+        import re
+        stripped_cids = set(re.findall(
+            r'strip_section\(&?\w+,\s*"([^"]+)"\)', production
+        ))
+        self.assertEqual(
+            stripped_cids, set(_RUST_STRIPPABLE_CONDITION_IDS),
+            "restart.rs strip_section cids drifted from "
+            "_RUST_STRIPPABLE_CONDITION_IDS — update both sides together",
+        )
 
     def test_absent_json_falls_back_to_markdown(self):
         """A report with only a Markdown file (pre-A-3) still reads."""

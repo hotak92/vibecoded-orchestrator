@@ -369,6 +369,14 @@ fn clear_restart_deferral(install_root: &Path) -> Result<(), String> {
     // anchored at the start of a line; the section runs until the next
     // `## ` header OR end-of-file. The `---` separator after each entry
     // (`_SECTION_SEP` in Python) is part of the section's tail.
+    //
+    // MUST MATCH vco_lib/deferral_report.py `_RUST_STRIPPABLE_CONDITION_IDS`
+    // (P2a v0.2.75): the Python read() honours a Markdown-only strip (drops
+    // the JSON-sidecar entry) ONLY for the condition IDs listed there. If
+    // you add another strip_section(...) call for a different condition_id
+    // here (or anywhere else that edits the .md without the .json), add
+    // that ID to the Python frozenset too — otherwise the strip resurrects
+    // from the JSON sidecar on the next Python read.
     let updated = strip_section(&content, "launcher_restart_required");
 
     // If no sections remain (only frontmatter + header), delete the file
