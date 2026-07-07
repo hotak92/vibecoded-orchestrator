@@ -14,11 +14,27 @@ collections → 0 hits.
 
 This module gives ``server.py`` a spawn-time hook: when a fresh
 ``weaviate_mcp`` starts up for workspace W, it reaps any OTHER live
-``weaviate_mcp`` whose ``CLAUDE_PROJECT_DIR != W`` (and any prior PID for
-the SAME workspace — a superseded restart). This is the same family as the
-existing update-time reapers (``update_gate.rs::pre_update_mcp_kill_sweep_*``)
-and the ``hub.pid`` single-instance pattern, but scoped to ONE MCP kind and
-keyed on the per-workspace env rather than a global sweep.
+``weaviate_mcp`` that is BOTH cross-workspace (``CLAUDE_PROJECT_DIR != W``,
+both values known) AND provably not another session's live server — i.e.
+it was spawned by OUR OWN parent (a superseded sibling from a workspace
+switch within this same harness: a client's stale MCP handle is always a
+stdio pipe to a process its own parent spawned) OR it is ORPHANED (its
+parent died → reparented to init/systemd — nobody is holding its pipe).
+
+Explicitly NOT reaped (v0.2.74 Fable-review fixes):
+* SAME-workspace peers — harmless (collections match) and often a
+  legitimate concurrent session on the same project (the documented
+  "main chat + RL chat" model). (H-1)
+* Cross-workspace peers with a DIFFERENT, LIVE parent — that is another
+  session's actively-serving MCP (e.g. two projects open in two windows).
+  Killing it caused a mutual kill/respawn ping-pong across sessions. (F1)
+* Anything whose workspace or parenthood we cannot determine —
+  conservative: never kill on uncertainty.
+
+Same family as the update-time reapers
+(``update_gate.rs::pre_update_mcp_kill_sweep_*``) and the ``hub.pid``
+single-instance pattern, but scoped to ONE MCP kind and keyed on the
+per-workspace env + parenthood rather than a global sweep.
 
 Design constraints
 ------------------
@@ -40,8 +56,12 @@ Design constraints
 
 Windows note: ``/proc`` does not exist; the psutil fallback handles it when
 installed. Without psutil on Windows the reaper is a silent no-op (returns
-0) — the backstop refuse-loud check in ``server.py`` still protects
-correctness there.
+0) — stale processes then simply coexist until the next update-gate sweep.
+(Honesty note, Fable-review F4: ``server.py``'s ``_assert_workspace_unchanged``
+per-call check can only fire if the PROCESS'S OWN env mutates — a stdio MCP's
+env never changes in production, so it is NOT a runtime mitigation for a stale
+peer; the reaper is the active mitigation. True per-call drift detection would
+need client-supplied workspace info (MCP roots) — see the check's docstring.)
 """
 from __future__ import annotations
 
@@ -162,7 +182,22 @@ def _iter_proc_candidates_linux():
         except (OSError, ValueError):
             # Cannot read environ (perm / gone) — treat workspace as unknown.
             workspace = ""
-        yield pid, workspace, cmdline
+        # v0.2.74 (F1 fix): the peer's PPID — the reap decision needs
+        # parenthood (same-parent = superseded sibling; init/systemd parent =
+        # orphan). /proc/<pid>/stat is "pid (comm) state ppid ..." where comm
+        # may contain spaces/parens — parse after the LAST ')'. Unreadable →
+        # None (conservative: the reap loop never kills on unknown parenthood).
+        ppid: Optional[int] = None
+        try:
+            with open(f"{proc_root}/{name}/stat", "rb") as fh:
+                stat_raw = fh.read().decode("utf-8", "replace")
+            tail = stat_raw.rsplit(")", 1)[-1].split()
+            # tail[0] = state, tail[1] = ppid
+            if len(tail) >= 2:
+                ppid = int(tail[1])
+        except (OSError, ValueError, IndexError):
+            ppid = None
+        yield pid, workspace, cmdline, ppid
 
 
 def _iter_proc_candidates_psutil():
@@ -175,7 +210,7 @@ def _iter_proc_candidates_psutil():
         import psutil  # type: ignore
     except Exception:  # noqa: BLE001 — psutil optional
         return
-    for proc in psutil.process_iter(["pid", "cmdline", "environ"]):
+    for proc in psutil.process_iter(["pid", "cmdline", "environ", "ppid"]):
         try:
             info = proc.info
             cmd_list = [str(c) for c in (info.get("cmdline") or [])]
@@ -188,7 +223,12 @@ def _iter_proc_candidates_psutil():
             pid_raw = info.get("pid")
             if pid_raw is None:
                 continue
-            yield int(pid_raw), workspace, cmdline
+            ppid_raw = info.get("ppid")
+            try:
+                ppid: Optional[int] = int(ppid_raw) if ppid_raw is not None else None
+            except (TypeError, ValueError):
+                ppid = None
+            yield int(pid_raw), workspace, cmdline, ppid
         except Exception:  # noqa: BLE001 — process vanished / access denied
             continue
 
@@ -222,28 +262,85 @@ def _terminate(pid: int) -> bool:
         return False
 
 
+def _peer_is_orphaned(ppid: int) -> bool:
+    """True iff a peer's parent is provably GONE (the peer is an orphan).
+
+    An orphaned MCP was reparented when its harness died: on Linux to PID 1 or
+    the systemd user manager (a subreaper); on Windows/macOS (psutil path) its
+    recorded PPID points at a dead PID (no reparenting) or launchd/init.
+    Conservative: ANY uncertainty → False (treat the parent as alive → the
+    caller does NOT reap). Never raises.
+    """
+    try:
+        if ppid <= 1:
+            return True  # init (or unknowable 0) — nobody holds its pipe
+        if os.path.isdir("/proc"):
+            comm_path = f"/proc/{ppid}/comm"
+            if not os.path.exists(f"/proc/{ppid}"):
+                return True  # parent gone entirely
+            try:
+                with open(comm_path, "r", encoding="utf-8", errors="replace") as fh:
+                    comm = fh.read().strip().lower()
+                # The systemd USER manager is the subreaper orphans land on in
+                # a systemd user session; init covers minimal systems.
+                return comm in ("systemd", "init")
+            except OSError:
+                return False  # can't read → assume alive (conservative)
+        # Non-/proc platforms: psutil if available.
+        try:
+            import psutil  # type: ignore
+        except Exception:  # noqa: BLE001 — psutil optional
+            return False  # cannot determine → conservative
+        if not psutil.pid_exists(ppid):
+            return True  # Windows doesn't reparent — dead PPID = orphan
+        try:
+            pname = (psutil.Process(ppid).name() or "").lower()
+        except Exception:  # noqa: BLE001 — vanished mid-check / access denied
+            return False
+        return pname in ("systemd", "init", "launchd")
+    except Exception:  # noqa: BLE001 — never let the check break the spawn
+        return False
+
+
 def reap_stale_weaviate_mcp(
     workspace: Optional[str] = None,
     *,
     self_pid: Optional[int] = None,
+    self_ppid: Optional[int] = None,
     _iter=None,
     _kill=None,
+    _orphaned=None,
 ) -> int:
-    """Reap every OTHER live weaviate_mcp whose workspace != ``workspace``.
+    """Reap OTHER weaviate_mcp processes that are provably stale, never live peers.
 
-    Called at spawn time by ``server.py`` for workspace W. Kills any live
-    ``weaviate_mcp/server.py`` process that is NOT us and whose
-    ``CLAUDE_PROJECT_DIR`` differs from W — the stale-workspace zombie the
-    T5-1 bug leaves behind. Also reaps a prior PID for the SAME workspace
-    (a superseded restart that Claude Code did not stop).
+    Called at spawn time by ``server.py`` for workspace W. A peer is reaped ONLY
+    when ALL THREE hold (v0.2.74 H-1 + Fable-review F1):
+
+      1. **Cross-workspace** — its ``CLAUDE_PROJECT_DIR`` differs from W, BOTH
+         values known (canonicalized). A same-workspace peer is harmless (its
+         collections match) and often a legitimate concurrent session on the
+         same project — never touched.
+      2. **Not another session's live server** — it was spawned by OUR OWN
+         parent (``peer_ppid == os.getppid()``: a superseded sibling from a
+         workspace switch within this same harness — a client's stale MCP
+         handle is always a stdio pipe to a process its own parent spawned),
+         OR it is ORPHANED (parent died → reparented to init / the systemd
+         user manager / a dead PID — nobody holds its pipe). A cross-workspace
+         peer with a DIFFERENT, LIVE parent is another session's actively-
+         serving MCP (two projects open in two windows) — killing it caused a
+         mutual kill/respawn ping-pong across sessions.
+      3. **Determinable** — unknown workspace or unknown parenthood → never
+         reap (conservative: no kill on uncertainty).
 
     Args:
         workspace: The fresh MCP's ``CLAUDE_PROJECT_DIR`` (defaults to the
             env value). Compared canonicalized (symlinks + trailing slash).
         self_pid: This process's PID (defaults to ``os.getpid()``); always
             excluded so we never signal ourselves.
-        _iter / _kill: Injection seams for tests (process iterator + kill
-            fn). Production leaves them None.
+        self_ppid: This process's parent PID (defaults to ``os.getppid()``) —
+            the "same harness" identity for rule 2.
+        _iter / _kill / _orphaned: Injection seams for tests (process iterator
+            + kill fn + orphan predicate). Production leaves them None.
 
     Returns:
         The count of processes we sent a terminate signal to. Best-effort:
@@ -251,46 +348,54 @@ def reap_stale_weaviate_mcp(
 
     Soft-fail: ANY error in enumeration is caught and returns the count so
     far; a failed kill is skipped. This function must NEVER raise into the
-    MCP startup path — a failed reap degrades to "two processes, backstop
-    refuse-loud catches the wrong one" rather than a boot crash.
+    MCP startup path — a failed reap degrades to coexisting processes, never
+    a boot crash.
     """
     my_pid = self_pid if self_pid is not None else os.getpid()
+    my_ppid = self_ppid if self_ppid is not None else os.getppid()
     my_ws = _normalize_workspace(
         workspace if workspace is not None else os.environ.get("CLAUDE_PROJECT_DIR", "")
     )
     iterator = _iter if _iter is not None else _iter_weaviate_mcp_processes
     killer = _kill if _kill is not None else _terminate
+    orphaned = _orphaned if _orphaned is not None else _peer_is_orphaned
 
-    # v0.2.74 (H-1 fix): only ever reap a CROSS-WORKSPACE peer. The actual bug
-    # (SD15 hybrid_search 0-hits) is a subprocess scoped to a DIFFERENT project
-    # whose module-load collection constants fan out over the wrong collections.
-    # A SAME-workspace peer is HARMLESS — its collections match ours — and it is
-    # very often a LEGITIMATE concurrent Claude Code session on the same project
-    # (the "main chat + RL chat" model CLAUDE.md explicitly documents). Killing
-    # it would terminate an actively-serving MCP of another live session — a
-    # regression this reaper must not cause. If we cannot determine the peer's
-    # workspace (empty/unknown), we do NOT reap it (conservative: never kill a
-    # process we can't prove is cross-workspace). So a same-workspace duplicate
-    # simply coexists; it's benign, and the per-call refuse-loud backstop already
-    # covers the pathological wrong-binding case.
     reaped = 0
     try:
-        for pid, other_ws, cmdline in iterator():
+        for entry in iterator():
+            # Tolerate 3-tuple legacy test iterators (ppid unknown → skip-safe).
+            if len(entry) == 4:
+                pid, other_ws, cmdline, peer_ppid = entry
+            else:
+                pid, other_ws, cmdline = entry
+                peer_ppid = None
             if pid == my_pid:
                 continue  # never signal ourselves
             other_norm = _normalize_workspace(other_ws)
-            # Only reap when we can POSITIVELY prove a different workspace.
-            # my_ws unknown OR peer_ws unknown OR equal → leave it alone.
+            # Rule 1+3: only a POSITIVELY-proven different workspace qualifies.
             if not my_ws or not other_norm or other_norm == my_ws:
+                continue
+            # Rule 2+3: superseded sibling (same parent as us) or orphaned
+            # (parent dead / init / systemd user manager). Unknown ppid → skip.
+            if peer_ppid is None:
+                continue
+            same_parent = peer_ppid == my_ppid
+            if not same_parent and not orphaned(peer_ppid):
+                # A live, different parent = another session's serving MCP.
+                logger.debug(
+                    "reap_stale_weaviate_mcp: leaving cross-workspace pid=%s "
+                    "alone (live foreign parent ppid=%s — likely another "
+                    "session's MCP)", pid, peer_ppid,
+                )
                 continue
             if killer(pid):
                 reaped += 1
                 logger.warning(
-                    "reap_stale_weaviate_mcp: terminated CROSS-WORKSPACE "
+                    "reap_stale_weaviate_mcp: terminated %s CROSS-WORKSPACE "
                     "weaviate_mcp pid=%s (its CLAUDE_PROJECT_DIR=%r, ours=%r) so "
                     "a client binding to it can't fan out over the wrong "
-                    "project's collections (T5-1). Same-workspace peers are left "
-                    "alone (harmless + may be a concurrent session).",
+                    "project's collections (T5-1).",
+                    "superseded-same-parent" if same_parent else "orphaned",
                     pid, other_norm, my_ws,
                 )
     except Exception as exc:  # noqa: BLE001 — never break the spawn

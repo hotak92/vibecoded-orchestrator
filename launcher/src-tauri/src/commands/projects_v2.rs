@@ -2332,7 +2332,18 @@ pub(crate) async fn run_schema_migration_check(
     };
 
     let folder_str = folder.to_string_lossy().to_string();
-    let mut cmd = tokio::process::Command::new(&system.python_cmd).silent();
+    // v0.2.74 (Fable-review F3, update-process lens): prefer the MCP venv
+    // python over the system interpreter. The migration edges do an in-process
+    // `import weaviate`, which only lives in the venv — under the system
+    // python (PEP 668 machines: nearly all) every ladder attempt failed rc=1
+    // and wrote a recurring `schema_migration_failed_4_to_5` deferral on every
+    // bundle update. Same resolution order as every other vco_lib spawn here
+    // ($VCT_VENV → <root>/.venv → <root>/claude_mcp_servers/.venv → system);
+    // falls back to system.python_cmd only when no venv resolves (the runner
+    // then defers safely, as before — never advances on a failed edge).
+    let py_cmd: std::path::PathBuf = resolve_python_for_vco_lib_local()
+        .unwrap_or_else(|| std::path::PathBuf::from(&system.python_cmd));
+    let mut cmd = tokio::process::Command::new(&py_cmd).silent();
     cmd.args([
         "-m",
         "vco_lib.project_init",
@@ -6708,7 +6719,11 @@ pub async fn probe_stale_derived_collections(
         .map_err(|e| format!("orchestrator root not found: {}", e))?;
 
     let folder_str = folder.to_string_lossy().to_string();
-    let mut cmd = tokio::process::Command::new(&system.python_cmd).silent();
+    // v0.2.74 (Fable-review F3): venv python first — the edges/probes import
+    // weaviate, which only lives in the venv (see run_schema_migration_check).
+    let py_cmd: PathBuf = resolve_python_for_vco_lib_local()
+        .unwrap_or_else(|| PathBuf::from(&system.python_cmd));
+    let mut cmd = tokio::process::Command::new(&py_cmd).silent();
     cmd.args([
         "-m",
         "vco_lib.project_init",
@@ -6841,7 +6856,11 @@ pub async fn apply_stale_derived_choice(
         .map_err(|e| format!("orchestrator root not found: {}", e))?;
     let folder_str = folder.to_string_lossy().to_string();
 
-    let mut cmd = tokio::process::Command::new(&system.python_cmd).silent();
+    // v0.2.74 (Fable-review F3): venv python first — migrate-schema imports
+    // weaviate, which only lives in the venv (see run_schema_migration_check).
+    let py_cmd: PathBuf = resolve_python_for_vco_lib_local()
+        .unwrap_or_else(|| PathBuf::from(&system.python_cmd));
+    let mut cmd = tokio::process::Command::new(&py_cmd).silent();
     if choice == "regenerate" {
         cmd.args([
             "-m",

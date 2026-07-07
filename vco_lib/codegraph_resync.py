@@ -400,12 +400,22 @@ def prune_ignored_rows(
                 pass
 
 
+#: Exact substring identifying orchestrator transient-scratch rows — MUST match
+#: ``migrations/codegraph_collection/6_to_7.py::_TRANSIENT_MARKER``. Paths are
+#: stored ``as_posix()`` on every OS, so forward slashes always match. These
+#: rows are walk-EXCLUDED since v0.2.73, so a resync can never re-stamp them:
+#: counting them as "owed" makes the probe permanently non-zero (the CLI-only /
+#: false-v7 non-convergence the v0.2.74 Fable review flagged).
+_TRANSIENT_STATE_MARKER = ".claude/state/"
+
+
 def _count_stale_in_collection(
     coll,
     current_revision: int,
     *,
     path_prop: str = "file_path",
     reachable_fn=None,
+    primary_sources: "Optional[set]" = None,
 ) -> Optional[int]:
     """Count rows NOT at ``current_revision`` in one collection.
 
@@ -415,6 +425,20 @@ def _count_stale_in_collection(
     the owed state permanently non-zero → every ``--update`` re-triggers a
     whole-repo resync (the "not converged" loop). The analyzer's D1 orphan-clear
     deletes those rows; this filter stops counting them so the two agree.
+
+    v0.2.74 (Fable-review F2/F4) — two more never-re-stampable row classes are
+    excluded from the owed count for the same convergence reason:
+      * ``.claude/state/`` transient-scratch rows (walk-excluded since v0.2.73;
+        deleted by the 6_to_7 purge and now also by the analyzer's orphan-clear
+        — but for a user the purge can't reach, counting them looped forever);
+      * extra-path rows (``project_source`` set and NOT in ``primary_sources``):
+        their files live under a DIFFERENT source root; a primary-root resync
+        never re-stamps them, and the B1-fixed orphan-clear correctly never
+        deletes them — so when their repo-relative path ALSO exists under the
+        primary root (the fork + upstream-clone pairing) they were counted
+        "owed" forever. They converge on their own extra-path walk instead.
+        ``primary_sources`` = the primary root's resolved + raw POSIX forms;
+        ``None`` disables the source filter (pre-fix behaviour).
 
     Bounded cost: the cheap filtered aggregate is ALWAYS the first gate. When it
     returns 0, we return 0 IMMEDIATELY — no per-row scan (the converged
@@ -463,10 +487,23 @@ def _count_stale_in_collection(
         # stale rows (fall through to the scan below).
 
     # Full NULL-safe scan. Reads embed_revision (+ the path property when R3
-    # reachability filtering is on) and classifies each row client-side.
+    # reachability filtering is on, + project_source when source-scoping is on
+    # AND the class actually has it — requesting an absent property 500s the
+    # iterator on schema variants, mirroring the 6_to_7 config-probe defense).
     read_props = ["embed_revision"]
     if reachable_fn is not None and path_prop not in read_props:
         read_props.append(path_prop)
+    want_source = primary_sources is not None
+    if want_source:
+        try:
+            cfg = coll.config.get()
+            present = {p.name for p in cfg.properties}
+            if "project_source" in present:
+                read_props.append("project_source")
+            else:
+                want_source = False  # class predates the property → no scoping
+        except Exception:  # noqa: BLE001 — probe best-effort; skip the scoping
+            want_source = False
     try:
         stale = 0
         for obj in coll.iterator(return_properties=read_props):
@@ -479,10 +516,20 @@ def _count_stale_in_collection(
             if not is_stale:
                 continue
             if reachable_fn is not None:
-                fp = props.get(path_prop) or ""
-                # Orphan (deleted-file) stale rows are NOT owed a re-walk →
-                # excluded from the count so the owed-probe can converge.
-                if not reachable_fn(str(fp)):
+                fp = str(props.get(path_prop) or "")
+                # Never-re-stampable rows are NOT owed (see docstring):
+                # transient scratch (walk-excluded) …
+                if _TRANSIENT_STATE_MARKER in fp:
+                    continue
+                # … extra-path rows (different source root — converge on their
+                # own walk, not the primary's) … (`want_source` is only True
+                # when primary_sources is a set; re-check for the type-narrow)
+                if want_source and primary_sources is not None:
+                    src = (props.get("project_source") or "").strip()
+                    if src and src not in primary_sources:
+                        continue
+                # … and deleted-file orphans (the D1 orphan-clear deletes them).
+                if not reachable_fn(fp):
                     continue
             stale += 1
         return stale
@@ -546,6 +593,25 @@ def count_stale_rows(
     # None when repo_root is not supplied → R3 disabled, count all stale.
     reachable_fn = _make_reachability_filter(repo_root)
 
+    # v0.2.74 (Fable-review F2): the primary root's POSIX forms (raw +
+    # resolved) — rows stamped with a DIFFERENT non-empty project_source are
+    # extra-path rows a primary walk can never re-stamp → excluded from the
+    # owed count (mirrors the analyzer orphan-clear's B1 scoping). None when
+    # repo_root is absent (scoping off, pre-fix behaviour).
+    primary_sources: Optional[set] = None
+    if repo_root is not None:
+        primary_sources = set()
+        try:
+            primary_sources.add(Path(repo_root).as_posix())
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            primary_sources.add(Path(repo_root).resolve().as_posix())
+        except Exception:  # noqa: BLE001
+            pass
+        if not primary_sources:
+            primary_sources = None  # unresolvable → scoping off (conservative)
+
     own_client = False
     if client is None:
         client = _build_client(weaviate_url, grpc_port)
@@ -572,6 +638,7 @@ def count_stale_rows(
                 current_revision,
                 path_prop=_PROBE_PATH_PROP.get(base, "file_path"),
                 reachable_fn=reachable_fn,
+                primary_sources=primary_sources,
             )
             if n is None:
                 return None

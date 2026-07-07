@@ -41,6 +41,7 @@ Today it defaults to ``vco_lib.project_init.detect_kg_schema_drift``.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import sqlite3
 import subprocess
@@ -164,9 +165,32 @@ _CODEGRAPH_CLASS_SUFFIXES: tuple[str, ...] = (
     "CodeInteraction",
 )
 
-#: Subprocess timeout for ``.sh``/``.ps1``/``.py`` edge scripts (matches
-#: install.py:16035's 300s).
-_EDGE_SUBPROCESS_TIMEOUT = 300
+#: Subprocess timeout for ``.sh``/``.ps1``/``.py`` edge scripts.
+#:
+#: v0.2.74 (Fable-review F5): raised 300 → 3600 and made env-overridable
+#: (``VCT_EDGE_TIMEOUT_SECS``). The old 300s was a per-process deadline on a
+#: WORKING path — exactly what the project's "no global deadlines; per-chunk
+#: guards only" rule forbids: the 6_to_7 purge iterates + ``delete_by_id``s
+#: O(N) rows, and on precisely the I/O-degraded machines it targets (the
+#: mmap-storm boxes) a 16k-row purge could legitimately exceed 300s, get
+#: SIGKILLed mid-purge, and write a failure deferral every update until enough
+#: partial passes accumulated (monotone but noisy). The edge's INTERNAL ops
+#: are already per-call bounded (weaviate client connect/read timeouts), so
+#: this outer cap is a last-resort backstop against a truly wedged layer, not
+#: a working-path deadline. Override per-machine: ``VCT_EDGE_TIMEOUT_SECS=0``
+#: disables the cap entirely (None → subprocess.run waits indefinitely).
+def _resolve_edge_timeout() -> "Optional[int]":
+    raw = os.environ.get("VCT_EDGE_TIMEOUT_SECS", "").strip()
+    if raw:
+        try:
+            v = int(raw)
+            return None if v <= 0 else v
+        except ValueError:
+            pass  # malformed → fall through to the default
+    return 3600
+
+
+_EDGE_SUBPROCESS_TIMEOUT = _resolve_edge_timeout()
 
 #: HIGH-2 machine-readable edge stdout sentinels (v0.2.74 migration delivery).
 #: An edge subprocess that exits rc=0 is NOT proof the edge did its job — the
@@ -1269,9 +1293,35 @@ def run_schema_migrations(
                         artifact_type, env, artifact_names
                     )
                     edges = discover_edges(migrations_dir, artifact_type)
-                    if edges and _codegraph_collection_has_rows(
+                    _has_rows = _codegraph_collection_has_rows(
                         weaviate_url, replay_names
-                    ):
+                    ) if edges else False
+                    # v0.2.74 (Fable-review F1): a `None` existence probe means
+                    # Weaviate was UNREACHABLE — we cannot distinguish "fresh
+                    # project, no data" from "existing collection we couldn't
+                    # see". Falling through to the born-at-canonical stamp here
+                    # would PERMANENTLY mask an existing collection as migrated
+                    # (v7 with zero edges run → the purge never fires, and every
+                    # future run short-circuits on UP_TO_DATE). So on None, SKIP
+                    # this artifact entirely — leave it unregistered so the next
+                    # update (with Weaviate up) retries. Mirrors the A3
+                    # reconcile's conservative None handling. Only a DEFINITE
+                    # False (all classes answered count 0) may take the
+                    # born-at-canonical stamp below.
+                    if _has_rows is None:
+                        report.errors.append(
+                            (
+                                artifact_type,
+                                artifact_name,
+                                "Weaviate unreachable during the NEVER_"
+                                "MATERIALIZED existence probe; NOT stamping "
+                                "born-at-canonical (would mask an existing "
+                                "collection); will retry next update "
+                                "[schema_migration_probe_unreachable]",
+                            )
+                        )
+                        continue
+                    if _has_rows:
                         _ladder_replayed_types.add(artifact_type)
                         _apply_edges_preserving(
                             artifact_type=artifact_type,
@@ -1293,8 +1343,10 @@ def run_schema_migrations(
                             register_on_success=True,
                         )
                         continue
-                    # No ladder or cannot confirm the collection has data →
-                    # fall through to the born-at-canonical stamp below.
+                    # No ladder, OR a DEFINITE empty (every class answered
+                    # count 0 — genuinely fresh) → fall through to the
+                    # born-at-canonical stamp below. The unreachable/None case
+                    # was handled above (skip + retry; never stamp on doubt).
 
                 # Fresh / pre-V52-AG artifact: born at canonical by the seed
                 # path. Only RECORD the version so a FUTURE bump is detectable
@@ -1511,6 +1563,17 @@ def run_schema_migrations(
                 continue
 
             # ---- user_curated forward-only upgrade (SPEC §2.7) ----
+            # v0.2.74 (Fable-review F9): slice the retained ladder to the edges
+            # from `stored` forward — the SAME latent contiguity trap as the
+            # derived path's B-1: a retained-from-earliest multi-edge ladder
+            # (e.g. [1→2, 2→3]) with stored=2 would spuriously gap-error on the
+            # 1→2 edge. Forward-only semantics are PRESERVED by the slice: edges
+            # BELOW `stored` are never replayed (user-curated edges need not be
+            # idempotent), only the owed suffix applies. No such multi-edge
+            # user_curated ladder ships today — closed pre-emptively per the
+            # zero-deferral rule.
+            if edges and stored > edges[0].from_version:
+                edges = [e for e in edges if e.from_version >= stored]
             if not edges:
                 report.errors.append(
                     (

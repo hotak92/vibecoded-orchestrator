@@ -12483,6 +12483,37 @@ def _classify_service_compose_action(action: str, probe: str) -> str:
     return "skip"
 
 
+def _should_check_weaviate_reclaim_drift(
+    decisions: dict, services_to_start: list, services_to_recreate: list,
+) -> bool:
+    """Pure: may the R2 reclaim-env drift check run for weaviate this pass?
+
+    v0.2.74 (Fable-review F3). True ONLY when ALL hold:
+      * the safety probe classified weaviate as VCT-MANAGED — the v0.2.61
+        invariant ("a FOREIGN adopt is NEVER recreated — we must not touch a
+        service we don't own") is enforced by the disposition loop, but the
+        drift check runs precisely on the "skip" disposition, which INCLUDES a
+        foreign adopt. Without this gate a foreign weaviate on 8081 whose env
+        lacks our tuning keys ("absent IS drift") would get force-recreated
+        (port-conflict failure), and a STOPPED stale vco_weaviate next to a
+        running foreign service could be resurrected into the same conflict.
+        Probe missing/unknown → False (conservative; the reclaim converges on
+        a later run once the probe resolves).
+      * weaviate is NOT already being started or recreated this pass (those
+        paths apply the fresh compose config anyway).
+    Kept pure so the ownership rule is unit-testable without driving the whole
+    ``_start_services`` subprocess path (mirrors
+    ``_classify_service_compose_action``).
+    """
+    probe = ((decisions or {}).get("weaviate", {}) or {}).get("probe", "")
+    if probe != PROBE_VCT_MANAGED:
+        return False
+    return (
+        "weaviate" not in services_to_recreate
+        and "weaviate" not in services_to_start
+    )
+
+
 #: v0.2.74 (R2): perf/reclaim env vars whose value MUST match the compose file
 #: on the RUNNING Weaviate container. Drift on ANY of these means the container
 #: predates the current compose config and its dead LSM segments cannot compact
@@ -13359,7 +13390,13 @@ def _start_services(
         # write activity lands under the 2GiB cap and compaction can collapse the
         # backlog (HIGH-1 sequencing). Conservative: an un-inspectable container
         # → no drift reported → no recreate (never recreate on uncertainty).
-        if "weaviate" not in services_to_recreate and "weaviate" not in services_to_start:
+        #
+        # v0.2.74 (Fable-review F3): additionally gated on the safety probe
+        # having classified weaviate as VCT-MANAGED (pure predicate below —
+        # see _should_check_weaviate_reclaim_drift for the full rationale).
+        if _should_check_weaviate_reclaim_drift(
+            decisions, services_to_start, services_to_recreate
+        ):
             try:
                 from vco_lib.containers import find_existing_container
                 _wv_ref = find_existing_container("weaviate") or "vco_weaviate"

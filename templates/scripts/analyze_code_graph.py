@@ -8051,6 +8051,18 @@ class CodeGraphAnalyzer:
                 # Delete ONLY when the row is BOTH stale AND unreachable. The
                 # helper hands us every row's raw path; re-derive staleness
                 # here so we never delete a CURRENT-revision row.
+                if not raw_path:
+                    return False  # no path → cannot prove orphan → keep
+                # v0.2.74 (Fable-review F2/F4): `.claude/state/` transient-
+                # scratch rows are ALWAYS purgeable — the marker itself is the
+                # proof (orchestrator scratch is never legitimate code; exact
+                # substring on the raw value, same safety as the 6_to_7 purge,
+                # which deletes them regardless of revision or source). This
+                # delivers the purge to users the migration can't reach
+                # (CLI-only / false-v7 machines) via ANY analyze run, and lets
+                # the owed-probe converge for them.
+                if ".claude/state/" in str(raw_path):
+                    return True
                 rev_v = _props.get(_EMBED_REVISION_PROP)
                 try:
                     row_current = (
@@ -8061,8 +8073,6 @@ class CodeGraphAnalyzer:
                     row_current = False
                 if row_current:
                     return False  # never touch converged rows
-                if not raw_path:
-                    return False  # no path → cannot prove orphan → keep
                 # B1 fix: only orphan-clear rows belonging to the PRIMARY source.
                 # A row whose `project_source` is a DIFFERENT non-empty value is an
                 # `--extra-path` row whose file lives under a root we did NOT test
@@ -9693,8 +9703,14 @@ def _collect_scoped_rel_paths(
     if only_files_from is not None:
         try:
             raw = only_files_from.read_text(encoding="utf-8")
-        except Exception:  # noqa: BLE001 — unreadable list → empty scope
-            raw = ""
+        except Exception:  # noqa: BLE001 — unreadable list
+            # v0.2.74 (Fable-review F8): an unreadable list must NOT collapse to
+            # an EMPTY scope ("nothing changed") — the walk may have indexed the
+            # files on its own earlier read (TOCTOU), and an empty scope would
+            # leave their call_names stale until the next whole-repo run. Fall
+            # back to None = whole-repo cross-ref parse (correct, just slower on
+            # this rare error path).
+            return None
         for line in raw.splitlines():
             s = line.strip()
             if s:

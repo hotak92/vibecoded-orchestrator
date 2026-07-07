@@ -3047,15 +3047,28 @@ class WeaviateWorkspaceDriftError(Exception):
 
 
 def _assert_workspace_unchanged(tool_name: str = "hybrid_search") -> None:
-    """v0.2.74 T5-1 backstop: refuse-loud if the live workspace drifted.
+    """v0.2.74 T5-1 guard: refuse-loud if THIS PROCESS'S env workspace mutates.
 
     Compares the current ``CLAUDE_PROJECT_DIR`` against the value captured at
-    module import (``_MODULE_LOAD_WORKSPACE``). When they differ, this
-    subprocess is serving a client bound to a DIFFERENT workspace than the
-    one its cached collection constants were resolved for — the T5-1
-    double-subprocess drift. Raise ``WeaviateWorkspaceDriftError`` naming both
-    paths so the user restarts the MCP rather than getting silent 0-hit
-    wrong-project results.
+    module import (``_MODULE_LOAD_WORKSPACE``) and raises
+    ``WeaviateWorkspaceDriftError`` (naming both paths + "restart the MCP")
+    when they differ.
+
+    HONESTY NOTE (Fable-review F4) — scope this correctly: both values are
+    read from THE SAME process's environment, and a stdio MCP subprocess's env
+    never changes in normal operation, so this check CANNOT detect the
+    cross-session stale-peer scenario at runtime (a client holding a pipe to a
+    wrong-workspace process — that process's own env is self-consistent). The
+    ACTIVE mitigation for stale peers is the spawn-time reaper
+    (``vco_lib.mcp_singleton``), whose parenthood rule covers every real drift
+    scenario (a stale handle is always a pipe to a process the client's own
+    parent spawned). What THIS guard actually protects:
+      * exotic in-process env mutation (an embedded/test harness, a future
+        hot-reload path, a wrapper that mutates ``os.environ``), and
+      * the documented, testable refuse-loud CONTRACT for drift (the error
+        shape clients/tests rely on).
+    True per-call drift detection would require client-supplied workspace
+    info (MCP ``roots``) — a protocol-level follow-up, not an env compare.
 
     No-op (never raises) when:
       * the module-load workspace was empty (CLI / non-workspace spawn — no
@@ -7630,14 +7643,17 @@ if __name__ == "__main__":
     if exit_if_update_in_progress is not None:
         exit_if_update_in_progress("weaviate-kg MCP")
 
-    # v0.2.74 T5-1 ROOT FIX: reap any OTHER live weaviate_mcp subprocess whose
-    # CLAUDE_PROJECT_DIR differs from ours (a stale-workspace zombie a
-    # workspace-switch / MCP re-registration left behind) before we start
-    # serving. Keeps exactly one live server per workspace so a client can
-    # never bind to a stale process that resolved a DIFFERENT project's
-    # collections at its own module-load. Best-effort / soft-fail — a failed
-    # reap never blocks THIS process from starting (the per-tool-call
-    # refuse-loud backstop covers the residual case).
+    # v0.2.74 T5-1 ROOT FIX: reap any OTHER weaviate_mcp subprocess that is
+    # provably stale — cross-workspace AND (spawned by our own parent = a
+    # superseded sibling from a workspace switch, OR orphaned = its harness
+    # died). A stale-handle client always points at a process its own parent
+    # spawned, so this covers every real drift scenario without ever touching
+    # ANOTHER session's live MCP (Fable-review F1: killing cross-project live
+    # peers caused a mutual kill/respawn ping-pong). Best-effort / soft-fail —
+    # a failed reap never blocks THIS process from starting; leftover peers
+    # simply coexist. (The per-tool-call _assert_workspace_unchanged check is
+    # NOT a runtime mitigation here — a stdio MCP's env never mutates, so it
+    # only guards exotic in-process env changes; see its docstring.)
     try:
         from vco_lib.mcp_singleton import reap_stale_weaviate_mcp  # type: ignore
     except ImportError:

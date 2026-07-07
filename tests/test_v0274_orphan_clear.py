@@ -292,6 +292,52 @@ def test_orphan_clear_never_deletes_extra_path_rows(analyzer_mod, tmp_path):
     )
 
 
+def test_orphan_clear_purges_claude_state_rows(analyzer_mod, tmp_path):
+    """F2/F4 (Fable update-process review): `.claude/state/` transient-scratch
+    rows are ALWAYS purged by the orphan-clear — regardless of revision (even
+    CURRENT-revision) and regardless of project_source — the marker itself is
+    the proof of garbage (6_to_7 parity; exact substring, never tokenized).
+    This delivers the purge to CLI-only / false-v7 users the migration can't
+    reach, via ANY analyze run. Real code rows keep the normal rules."""
+    rev = analyzer_mod.CODEGRAPH_EMBED_REVISION
+    # The scratch files EXIST on disk (reachable) — the marker alone decides.
+    root = _make_repo(tmp_path, [".claude/state/tool_backups/junk.py", "pkg/live.py"])
+    rows = [
+        # Scratch, STALE → purge.
+        _Obj("scr-stale", {
+            "file_path": ".claude/state/tool_backups/junk.py",
+            "embed_revision": rev - 1,
+        }),
+        # Scratch, CURRENT revision → STILL purged (6_to_7 deletes regardless).
+        _Obj("scr-current", {
+            "file_path": ".claude/state/tool_backups/junk.py",
+            "embed_revision": rev,
+        }),
+        # Scratch under an EXTRA source → STILL purged (garbage is garbage).
+        _Obj("scr-extra", {
+            "file_path": ".claude/state/tool_backups/junk.py",
+            "embed_revision": rev - 1,
+            "project_source": "/some/sibling/clone",
+        }),
+        # Real code row, stale + reachable → kept for the re-walk (NOT deleted).
+        _Obj("live", {"file_path": "pkg/live.py", "embed_revision": rev - 1}),
+    ]
+    functions = _FakeColl(
+        "P_CodeFunction", rows,
+        ("file_path", "embed_revision", "project_source"), agg_count=4,
+    )
+    modules = _FakeColl("P_CodeModule", [], ("path", "embed_revision"), agg_count=0)
+    classes = _FakeColl("P_CodeClass", [], ("file_path", "embed_revision"), agg_count=0)
+    stub = _StaleStub(analyzer_mod, modules, classes, functions, root)
+
+    stub._build_stale_file_set()
+
+    assert set(functions.data.deleted) == {"scr-stale", "scr-current", "scr-extra"}, (
+        f"all .claude/state rows purged, real code kept; got {functions.data.deleted}"
+    )
+    assert "live" not in functions.data.deleted
+
+
 def test_orphan_clear_never_touches_current_revision_row(analyzer_mod, tmp_path):
     """A CURRENT-revision row for a deleted file must NOT be deleted by the
     orphan-clear (scoped to stale rows only)."""
@@ -525,15 +571,27 @@ from vco_lib import codegraph_resync as cr  # noqa: E402
 
 
 class _R3Coll:
-    """Resync-side collection fake: aggregate + iterator (records scans)."""
+    """Resync-side collection fake: aggregate + iterator (records scans).
 
-    def __init__(self, agg_count, rows=None):
+    v0.2.74 (F2): also exposes ``config.get()`` so the count-side
+    project_source scoping probe sees which properties the class "has"
+    (default includes project_source, mirroring post-v0.2.47 schemas).
+    """
+
+    def __init__(self, agg_count, rows=None, prop_names=None):
         self.name = "X"
         self._agg = agg_count
         self._rows = rows or []
         self.iter_calls = 0
         self.aggregate = types.SimpleNamespace(
             over_all=lambda **kw: types.SimpleNamespace(total_count=agg_count)
+        )
+        _names = prop_names if prop_names is not None else (
+            "embed_revision", "file_path", "path", "project_source",
+        )
+        _props = [types.SimpleNamespace(name=n) for n in _names]
+        self.config = types.SimpleNamespace(
+            get=lambda: types.SimpleNamespace(properties=_props)
         )
 
     def iterator(self, return_properties=None):
@@ -605,6 +663,94 @@ def test_r3_aggregate_positive_counts_only_reachable(monkeypatch, tmp_path):
     # Only the reachable stale row counts; the orphan is excluded.
     assert counts["Proj_CodeFunction"] == 1
     assert func.iter_calls == 1, "aggregate>0 pays exactly one scan"
+
+
+def test_f4_claude_state_rows_not_counted_as_owed(monkeypatch, tmp_path):
+    """F4 REGRESSION (Fable update-process review): `.claude/state/` transient-
+    scratch rows are walk-EXCLUDED since v0.2.73, so a resync can never re-stamp
+    them — counting them as owed made the probe permanently non-zero for users
+    the 6_to_7 purge can't reach (CLI-only, false-v7). They must be excluded
+    from the owed count even though their files EXIST on disk."""
+    monkeypatch.setattr(cr, "_collection_prefix", lambda name: "Proj")
+    # The scratch file genuinely exists on disk (reachable!) — the marker alone
+    # must exclude it.
+    scratch = tmp_path / ".claude" / "state" / "tool_backups"
+    scratch.mkdir(parents=True)
+    (scratch / "junk.py").write_text("# scratch\n")
+    (tmp_path / "real.py").write_text("# real\n")
+
+    func_rows = [
+        {"embed_revision": 0, "file_path": ".claude/state/tool_backups/junk.py"},
+        {"embed_revision": 0, "file_path": "real.py"},  # genuinely owed
+    ]
+    module = _R3Coll(agg_count=0)
+    klass = _R3Coll(agg_count=0)
+    func = _R3Coll(agg_count=2, rows=func_rows)
+    client = _r3_client("Proj", module, klass, func)
+
+    counts = cr.count_stale_rows(
+        "Proj", current_revision=1, client=client, repo_root=tmp_path,
+    )
+    assert counts["Proj_CodeFunction"] == 1, (
+        ".claude/state row must NOT be owed (never re-walkable); only real.py"
+    )
+
+
+def test_f2_extra_path_rows_not_counted_as_owed(monkeypatch, tmp_path):
+    """F2 REGRESSION (Fable patch review): a stale extra-path row whose repo-
+    relative path ALSO exists under the primary root (fork + upstream-clone —
+    e.g. install.py exists in both) was counted owed forever: reachable-under-
+    primary, never deleted (B1, correctly), never re-walked (primary resync
+    doesn't pass --extra-path). The count must skip rows whose project_source
+    is a DIFFERENT non-empty root — they converge on their own extra-path walk."""
+    monkeypatch.setattr(cr, "_collection_prefix", lambda name: "Proj")
+    (tmp_path / "install.py").write_text("# primary copy\n")
+    primary_src = tmp_path.as_posix()
+
+    func_rows = [
+        # Extra-path row: same rel path exists under primary, but the row
+        # belongs to the sibling clone → NOT owed on a primary walk.
+        {"embed_revision": 0, "file_path": "install.py",
+         "project_source": "/some/sibling/clone"},
+        # Primary row, stale + reachable → genuinely owed.
+        {"embed_revision": 0, "file_path": "install.py",
+         "project_source": primary_src},
+        # Legacy row (no source stamp) → treated as primary → owed.
+        {"embed_revision": None, "file_path": "install.py",
+         "project_source": ""},
+    ]
+    module = _R3Coll(agg_count=0)
+    klass = _R3Coll(agg_count=0)
+    func = _R3Coll(agg_count=3, rows=func_rows)
+    client = _r3_client("Proj", module, klass, func)
+
+    counts = cr.count_stale_rows(
+        "Proj", current_revision=1, client=client, repo_root=tmp_path,
+    )
+    assert counts["Proj_CodeFunction"] == 2, (
+        f"extra-path row must NOT be owed on a primary walk; got "
+        f"{counts['Proj_CodeFunction']}"
+    )
+
+
+def test_f2_source_scoping_off_when_class_lacks_property(monkeypatch, tmp_path):
+    """A class that PREDATES project_source (property absent) must not 500 the
+    scan — the probe disables source-scoping and the count still works."""
+    monkeypatch.setattr(cr, "_collection_prefix", lambda name: "Proj")
+    (tmp_path / "real.py").write_text("# real\n")
+    func_rows = [{"embed_revision": 0, "file_path": "real.py"}]
+    module = _R3Coll(agg_count=0)
+    klass = _R3Coll(agg_count=0)
+    func = _R3Coll(
+        agg_count=1, rows=func_rows,
+        prop_names=("embed_revision", "file_path"),  # no project_source
+    )
+    client = _r3_client("Proj", module, klass, func)
+
+    counts = cr.count_stale_rows(
+        "Proj", current_revision=1, client=client, repo_root=tmp_path,
+    )
+    assert counts["Proj_CodeFunction"] == 1
 
 
 def test_r3_module_uses_path_property(monkeypatch, tmp_path):

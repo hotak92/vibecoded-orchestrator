@@ -873,6 +873,36 @@ class WeaviateReclaimEnvDriftTests(unittest.TestCase):
             live = install._running_container_reclaim_env("podman", "vco_weaviate")
         self.assertIsNone(live)
 
+    # ── v0.2.74 (Fable-review F3): ownership gate for the drift check ──────
+
+    def test_drift_check_allowed_only_for_vct_managed(self):
+        """The drift-recreate may only run for a VCT-MANAGED weaviate — a
+        FOREIGN adopt (or an unknown probe) must never be force-recreated."""
+        ours = {"weaviate": {"action": "adopt", "probe": install.PROBE_VCT_MANAGED}}
+        foreign = {"weaviate": {"action": "adopt", "probe": install.PROBE_FOREIGN}}
+        self.assertTrue(
+            install._should_check_weaviate_reclaim_drift(ours, [], [])
+        )
+        self.assertFalse(
+            install._should_check_weaviate_reclaim_drift(foreign, [], []),
+            "FOREIGN adopt must never be drift-recreated (we don't own it)",
+        )
+        # Probe missing / empty decisions → conservative False.
+        self.assertFalse(install._should_check_weaviate_reclaim_drift({}, [], []))
+        self.assertFalse(
+            install._should_check_weaviate_reclaim_drift({"weaviate": {}}, [], [])
+        )
+        self.assertFalse(install._should_check_weaviate_reclaim_drift(None, [], []))
+
+    def test_drift_check_skipped_when_already_starting_or_recreating(self):
+        ours = {"weaviate": {"action": "adopt", "probe": install.PROBE_VCT_MANAGED}}
+        self.assertFalse(
+            install._should_check_weaviate_reclaim_drift(ours, ["weaviate"], [])
+        )
+        self.assertFalse(
+            install._should_check_weaviate_reclaim_drift(ours, [], ["weaviate"])
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

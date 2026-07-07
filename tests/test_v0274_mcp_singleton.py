@@ -32,32 +32,47 @@ if str(REPO_ROOT) not in sys.path:
 # ─── reaper ──────────────────────────────────────────────────────────────
 
 
-def test_reaper_kills_cross_workspace_only_keeps_same_workspace():
-    """H-1: spawning for /ws/A reaps ONLY the cross-workspace /ws/B process. A
-    SAME-workspace peer (pid 100, /ws/A) is a legitimate concurrent session and
-    is LEFT ALONE — its collections match ours, so it's harmless, and killing it
-    would terminate another live session's MCP (the regression H-1 flagged)."""
+_SRV = "python .../weaviate_mcp/server.py"
+_MY_PPID = 4242  # the fake "our harness" parent for these tests
+
+
+def test_reaper_full_matrix_cross_ws_and_parenthood():
+    """H-1 + F1 (Fable review): a peer is reaped ONLY when it is BOTH
+    cross-workspace AND (spawned by OUR OWN parent — a superseded sibling — OR
+    orphaned). Matrix:
+      * same-ws, any parent            → KEEP (concurrent same-project session)
+      * cross-ws, SAME parent          → REAP (superseded within our harness)
+      * cross-ws, different LIVE parent→ KEEP (another session's serving MCP —
+                                          killing it caused the kill/respawn
+                                          ping-pong F1 flagged)
+      * cross-ws, ORPHANED parent      → REAP (nobody holds its pipe)
+      * self                           → excluded
+    """
     from vco_lib.mcp_singleton import reap_stale_weaviate_mcp
 
     killed: list[int] = []
+    ORPHAN_PPIDS = {1}
 
     def fake_iter():
-        yield (100, "/ws/A", "python .../weaviate_mcp/server.py")  # SAME ws → KEEP
-        yield (200, "/ws/B", "python .../weaviate_mcp/server.py")  # DIFFERENT ws → reap
-        yield (999, "/ws/A", "python .../weaviate_mcp/server.py")  # us (excluded)
-
-    def fake_kill(pid):
-        killed.append(pid)
-        return True
+        yield (100, "/ws/A", _SRV, _MY_PPID)   # same-ws, same parent → KEEP
+        yield (150, "/ws/A", _SRV, 7777)       # same-ws, other parent → KEEP
+        yield (200, "/ws/B", _SRV, _MY_PPID)   # cross-ws, SAME parent → REAP
+        yield (300, "/ws/C", _SRV, 8888)       # cross-ws, live foreign parent → KEEP
+        yield (400, "/ws/D", _SRV, 1)          # cross-ws, orphaned → REAP
+        yield (999, "/ws/A", _SRV, _MY_PPID)   # us (excluded)
 
     n = reap_stale_weaviate_mcp(
-        "/ws/A", self_pid=999, _iter=fake_iter, _kill=fake_kill
+        "/ws/A", self_pid=999, self_ppid=_MY_PPID, _iter=fake_iter,
+        _kill=lambda p: killed.append(p) or True,
+        _orphaned=lambda ppid: ppid in ORPHAN_PPIDS,
     )
-    # ONLY the cross-workspace (200) is reaped; the same-workspace peer (100)
-    # survives; self (999) is never signalled.
-    assert n == 1
-    assert killed == [200]
-    assert 100 not in killed  # concurrent same-project session preserved
+    assert n == 2
+    assert killed == [200, 400]
+    assert 100 not in killed and 150 not in killed, "same-ws peers preserved"
+    assert 300 not in killed, (
+        "F1: a cross-workspace peer with a live foreign parent is another "
+        "session's MCP — must never be reaped"
+    )
     assert 999 not in killed
 
 
@@ -69,11 +84,12 @@ def test_reaper_never_kills_when_own_workspace_unknown():
     killed: list[int] = []
 
     def fake_iter():
-        yield (200, "/ws/B", "python .../weaviate_mcp/server.py")
+        yield (200, "/ws/B", _SRV, _MY_PPID)
 
     n = reap_stale_weaviate_mcp(
-        "", self_pid=999, _iter=fake_iter,
+        "", self_pid=999, self_ppid=_MY_PPID, _iter=fake_iter,
         _kill=lambda p: killed.append(p) or True,
+        _orphaned=lambda p: False,
     )
     assert n == 0 and killed == []
 
@@ -86,11 +102,31 @@ def test_reaper_never_kills_peer_with_unknown_workspace():
     killed: list[int] = []
 
     def fake_iter():
-        yield (200, "", "python .../weaviate_mcp/server.py")  # unknown ws
+        yield (200, "", _SRV, _MY_PPID)  # unknown ws
 
     n = reap_stale_weaviate_mcp(
-        "/ws/A", self_pid=999, _iter=fake_iter,
+        "/ws/A", self_pid=999, self_ppid=_MY_PPID, _iter=fake_iter,
         _kill=lambda p: killed.append(p) or True,
+        _orphaned=lambda p: False,
+    )
+    assert n == 0 and killed == []
+
+
+def test_reaper_never_kills_peer_with_unknown_ppid():
+    """Unknown parenthood (ppid None, or a legacy 3-tuple iterator) → NOT
+    reaped, even cross-workspace — no kill on uncertainty."""
+    from vco_lib.mcp_singleton import reap_stale_weaviate_mcp
+
+    killed: list[int] = []
+
+    def fake_iter():
+        yield (200, "/ws/B", _SRV, None)   # 4-tuple, ppid unknown
+        yield (300, "/ws/C", _SRV)         # legacy 3-tuple (no ppid at all)
+
+    n = reap_stale_weaviate_mcp(
+        "/ws/A", self_pid=999, self_ppid=_MY_PPID, _iter=fake_iter,
+        _kill=lambda p: killed.append(p) or True,
+        _orphaned=lambda p: True,  # even a always-orphan predicate can't fire
     )
     assert n == 0 and killed == []
 
@@ -102,10 +138,12 @@ def test_reaper_never_signals_self():
     killed: list[int] = []
 
     def fake_iter():
-        yield (555, "/ws/A", "python .../weaviate_mcp/server.py")  # us only
+        yield (555, "/ws/A", _SRV, _MY_PPID)  # us only
 
     n = reap_stale_weaviate_mcp(
-        "/ws/A", self_pid=555, _iter=fake_iter, _kill=lambda p: killed.append(p) or True
+        "/ws/A", self_pid=555, self_ppid=_MY_PPID, _iter=fake_iter,
+        _kill=lambda p: killed.append(p) or True,
+        _orphaned=lambda p: False,
     )
     assert n == 0
     assert killed == []
@@ -116,14 +154,15 @@ def test_reaper_soft_fails_on_enumeration_error():
     from vco_lib.mcp_singleton import reap_stale_weaviate_mcp
 
     def boom_iter():
-        yield (100, "/ws/B", "python .../weaviate_mcp/server.py")
+        yield (100, "/ws/B", _SRV, _MY_PPID)  # reapable (cross-ws, same parent)
         raise RuntimeError("proc scan blew up mid-iteration")
 
     killed: list[int] = []
     # Must NOT raise; the one candidate before the boom is still reaped.
     n = reap_stale_weaviate_mcp(
-        "/ws/A", self_pid=999, _iter=boom_iter,
+        "/ws/A", self_pid=999, self_ppid=_MY_PPID, _iter=boom_iter,
         _kill=lambda p: killed.append(p) or True,
+        _orphaned=lambda p: False,
     )
     assert n == 1
     assert killed == [100]
@@ -134,15 +173,16 @@ def test_reaper_soft_fails_on_kill_error():
     from vco_lib.mcp_singleton import reap_stale_weaviate_mcp
 
     def fake_iter():
-        yield (100, "/ws/B", "python .../weaviate_mcp/server.py")
-        yield (200, "/ws/C", "python .../weaviate_mcp/server.py")
+        yield (100, "/ws/B", _SRV, _MY_PPID)
+        yield (200, "/ws/C", _SRV, _MY_PPID)
 
     # pid 100 already gone (kill returns False); 200 killed OK.
     def fake_kill(pid):
         return pid == 200
 
     n = reap_stale_weaviate_mcp(
-        "/ws/A", self_pid=999, _iter=fake_iter, _kill=fake_kill
+        "/ws/A", self_pid=999, self_ppid=_MY_PPID, _iter=fake_iter,
+        _kill=fake_kill, _orphaned=lambda p: False,
     )
     assert n == 1  # only 200 counted
 
@@ -155,20 +195,30 @@ def test_reaper_normalizes_trailing_slash():
 
     def fake_iter():
         # Same workspace, expressed with a trailing slash — must normalize equal
-        # to ours (/ws/A). Under H-1 a same-workspace peer is KEPT, so the slash
-        # normalization is what proves it's classified same-ws (not spuriously
-        # cross-ws → which would wrongly reap it).
-        yield (100, "/ws/A/", "python .../weaviate_mcp/server.py")
+        # to ours (/ws/A). Same-ws peers are KEPT, so the slash normalization is
+        # what proves it's classified same-ws (not spuriously cross-ws → which
+        # would wrongly reap it, since it's same-parent and would pass rule 2).
+        yield (100, "/ws/A/", _SRV, _MY_PPID)
 
     n = reap_stale_weaviate_mcp(
-        "/ws/A", self_pid=999, _iter=fake_iter,
+        "/ws/A", self_pid=999, self_ppid=_MY_PPID, _iter=fake_iter,
         _kill=lambda p: killed.append(p) or True,
+        _orphaned=lambda p: False,
     )
-    # Normalization made the slash variant compare EQUAL to ours → same-ws →
-    # NOT reaped (H-1: concurrent same-project session preserved). If
-    # normalization had failed, it would look cross-ws and be wrongly killed.
     assert n == 0
     assert killed == []
+
+
+def test_peer_is_orphaned_init_and_dead_parent():
+    """_peer_is_orphaned: ppid<=1 → orphan; a live real parent (our own pid,
+    which certainly exists and is python, not systemd/init) → NOT orphan."""
+    import os as _os
+    from vco_lib.mcp_singleton import _peer_is_orphaned
+
+    assert _peer_is_orphaned(1) is True
+    assert _peer_is_orphaned(0) is True
+    # Our own live python process is a definitely-alive, non-init parent.
+    assert _peer_is_orphaned(_os.getpid()) is False
 
 
 # ─── M-1: cmdline matcher must not match editors/pagers/grep ────────────────

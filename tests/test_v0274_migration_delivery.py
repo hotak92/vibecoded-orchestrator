@@ -550,17 +550,21 @@ def test_a2_never_materialized_no_rows_stamps_canonical(db_with_v033, monkeypatc
     assert len(report.registered) >= 5
 
 
-def test_a2_never_materialized_unknown_existence_skips_ladder(
+def test_a2_never_materialized_unknown_existence_skips_ladder_and_stamp(
     db_with_v033, monkeypatch
 ):
-    """Weaviate down / unknown existence (probe returns None) → conservative:
-    NO ladder replay (stamp path), retried next update."""
+    """F1 REGRESSION (Fable update-process review): Weaviate down / unknown
+    existence (probe returns None) → conservative BOTH ways: NO ladder replay
+    AND — critically — NO born-at-canonical stamp. Pre-fix, None fell through
+    to the stamp, permanently masking an existing collection as v7-migrated
+    (the purge would never run; every future update short-circuits on
+    UP_TO_DATE). Now: skip + deferral error → genuinely retried next update."""
     monkeypatch.setattr(
         smr, "_codegraph_collection_has_rows", lambda url, names: None
     )
     spy = _EnvCapturingEdgeSpy()
     monkeypatch.setattr(smr, "_apply_edge", spy)
-    smr.run_schema_migrations(
+    report = smr.run_schema_migrations(
         db_path=db_with_v033,
         project_id="p1",
         migrations_dir=_real_migrations_dir(),
@@ -572,6 +576,24 @@ def test_a2_never_materialized_unknown_existence_skips_ladder(
         now_ms=1,
     )
     assert spy.count == 0, "unknown existence must NOT replay the ladder"
+    # THE F1 assertion: nothing may be registered — a stamp here would be
+    # permanent (UP_TO_DATE short-circuits all future runs + the reconcile).
+    conn = sqlite3.connect(str(db_with_v033))
+    rows = conn.execute(
+        "SELECT COUNT(*) FROM artifact_schema_versions "
+        "WHERE artifact_type='codegraph_collection'"
+    ).fetchone()[0]
+    conn.close()
+    assert rows == 0, (
+        "unknown existence must NOT born-at-canonical stamp (permanent mask); "
+        f"found {rows} registered codegraph rows"
+    )
+    # And the skip is surfaced as a deferral-shaped error so the next update
+    # retries it visibly.
+    assert any(
+        "probe_unreachable" in d or "unreachable" in d.lower()
+        for (_t, _n, d) in report.errors
+    ), f"expected an unreachable-probe deferral error; got {report.errors}"
 
 
 # ---------------------------------------------------------------------------
