@@ -4624,19 +4624,43 @@ pub async fn rename_project_v2(
         eprintln!("[vct] warning: {}", msg);
         warnings.push(msg);
     }
-    // ensure_project_env_template is append-only, so .env may still carry the
-    // old KG_COLLECTION value as an active line. Log a warning when the stale
-    // value is detected; full repair lands in PR 5.
+    // ensure_project_env_template is append-only, so the project-root `.env`
+    // may still carry the OLD KG_COLLECTION value as an active line. VCO never
+    // auto-rewrites `.env` on rename — that file may be committed to the user's
+    // VCS, so poisoning it silently is forbidden (B12 safety, matches safe-add).
+    // We only DETECT the stale line and surface honest remediations. B12 (audit
+    // v0.2.75): the previous message told the user to "run repair-env (PR 5)",
+    // a tool/command that never shipped — the user could not act on it. Name the
+    // REAL remediations instead: the launcher's per-project bundle update (or the
+    // equivalent CLI) re-projects the canonical env surfaces, or the user can hand-
+    // edit the single stale line. The stale finding is also appended to the rename
+    // deferral below so it survives past the toast (see `stale_env_note`).
+    let mut stale_env_note: Option<String> = None;
     if let Ok(env_text) = std::fs::read_to_string(folder.join(".env")) {
         let new_kg = format!("{}_KnowledgeGraph", sanitize_kg_collection(&new_name));
         if !env_text.contains(&format!("KG_COLLECTION={}", new_kg)) {
             let msg = format!(
-                ".env at {} still contains stale KG_COLLECTION after rename; \
-                 run repair-env (PR 5) to fix. Expected KG_COLLECTION={}",
-                row.folder_path, new_kg
+                "The project-root .env at {} still contains a stale KG_COLLECTION \
+                 line after the rename (VCO never rewrites .env automatically — it \
+                 may be committed to your VCS). VCO's own env channels \
+                 (.claude/settings.json for MCP, .claude/env for the shell) were \
+                 already re-projected to the new name, so KG routing is NOT degraded. \
+                 To fix the committed .env too, either run \
+                 `python -m vco_lib.project_init install-bundle --update --folder {}` \
+                 (equivalently, the launcher's per-project \"Update bundle\" button), \
+                 or manually edit the stale line to read KG_COLLECTION={}.",
+                row.folder_path, row.folder_path, new_kg
             );
             eprintln!("[vct] warning: {}", msg);
             warnings.push(msg);
+            stale_env_note = Some(format!(
+                "Stale project-root .env detected: it still carries the pre-rename \
+                 KG_COLLECTION line. VCO left .env untouched (it may be committed); \
+                 fix it with `install-bundle --update` or by editing the line to \
+                 KG_COLLECTION={} (VCO's own .claude env channels already track the \
+                 new name).",
+                new_kg
+            ));
         }
     }
 
@@ -4660,6 +4684,10 @@ pub async fn rename_project_v2(
                 old,
                 &new_name,
                 cg_prefix_old.as_deref(),
+                // B12 (audit v0.2.75): if a stale project-root .env was
+                // detected above, surface the SAME finding into the durable
+                // deferral so it survives past the transient rename toast.
+                stale_env_note.as_deref(),
             ) {
                 // Soft-fail: a failed deferral emit must not fail the rename.
                 let msg = format!(
@@ -4766,6 +4794,7 @@ fn emit_codegraph_rename_deferral(
     old_name: &str,
     new_name: &str,
     old_prefix: Option<&str>,
+    stale_env_note: Option<&str>,
 ) -> Result<(), String> {
     let repo_root =
         find_local_repo_root().map_err(|e| format!("repo root not found: {}", e))?;
@@ -4781,12 +4810,21 @@ fn emit_codegraph_rename_deferral(
                  rebuild until the first analyze runs)."
             .to_string(),
     };
+    // B12 (audit v0.2.75): when the caller detected a stale project-root
+    // `.env`, fold that finding into the SAME deferral so both the code-graph
+    // rebuild and the .env fix outlive the transient rename toast. Appended as
+    // one more sentence on the single-line `detected` field (the deferral
+    // round-trip parses `detected` as one line — keep it newline-free).
+    let stale_env_suffix = match stale_env_note {
+        Some(note) => format!(" {}", note),
+        None => String::new(),
+    };
     let detected = format!(
         "Project renamed from {:?} to {:?}. The code-graph binding prefix \
          (the source of truth consumers read) now tracks the NEW name, so \
          reads target an initially-empty class set until a rebuild fills it. \
-         {}",
-        old_name, new_name, old_prefix_note
+         {}{}",
+        old_name, new_name, old_prefix_note, stale_env_suffix
     );
     // POSIX single-quote the project name for the emitted shell command
     // (names may contain spaces; embedded single quotes use the standard
@@ -8911,7 +8949,7 @@ mod tests {
             return;
         }
         let td = tempfile::TempDir::new().unwrap();
-        emit_codegraph_rename_deferral(td.path(), "OldName", "NewName", Some("OldName"))
+        emit_codegraph_rename_deferral(td.path(), "OldName", "NewName", Some("OldName"), None)
             .unwrap();
         let path = td
             .path()
@@ -8949,8 +8987,8 @@ mod tests {
             return;
         }
         let td = tempfile::TempDir::new().unwrap();
-        emit_codegraph_rename_deferral(td.path(), "A", "B", Some("A")).unwrap();
-        emit_codegraph_rename_deferral(td.path(), "B", "C", Some("B")).unwrap();
+        emit_codegraph_rename_deferral(td.path(), "A", "B", Some("A"), None).unwrap();
+        emit_codegraph_rename_deferral(td.path(), "B", "C", Some("B"), None).unwrap();
         let path = td
             .path()
             .join(".claude")
@@ -8966,6 +9004,75 @@ mod tests {
                 .count(),
             1,
             "repeated renames must not stack deferral sections"
+        );
+    }
+
+    #[test]
+    fn emit_codegraph_rename_deferral_folds_in_stale_env_note_when_present() {
+        // B12 (audit v0.2.75): the ACT case — when the caller detected a stale
+        // project-root .env, the note is surfaced into the deferral body so the
+        // finding outlives the transient rename toast. The LEAVE-ALONE case
+        // (stale_env_note = None) is covered by
+        // `emit_codegraph_rename_deferral_writes_pending_entry` above, which
+        // asserts the base deferral shape WITHOUT any stale-.env text.
+        if !rename_deferral_python_available() {
+            eprintln!("skipping: python/repo-root unavailable");
+            return;
+        }
+        let td = tempfile::TempDir::new().unwrap();
+        emit_codegraph_rename_deferral(
+            td.path(),
+            "OldName",
+            "NewName",
+            Some("OldName"),
+            Some("Stale project-root .env detected: fix with install-bundle --update."),
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(
+            td.path()
+                .join(".claude")
+                .join("context")
+                .join("UPDATE_DEFERRED.md"),
+        )
+        .unwrap();
+        assert!(
+            content.contains("Stale project-root .env detected"),
+            "the stale-.env note must be folded into the deferral body: {}",
+            content
+        );
+        // Sanity: it rides on the SAME single deferral, not a new section.
+        assert_eq!(
+            content
+                .matches("## codegraph_rename_split_pending (")
+                .count(),
+            1,
+            "the stale-.env note must not spawn a second deferral section"
+        );
+    }
+
+    #[test]
+    fn emit_codegraph_rename_deferral_omits_stale_env_text_when_absent() {
+        // B12 (audit v0.2.75): the explicit LEAVE-ALONE assertion — with
+        // stale_env_note = None the deferral body must NOT mention a stale .env,
+        // so a rename whose .env was already canonical carries no phantom note.
+        if !rename_deferral_python_available() {
+            eprintln!("skipping: python/repo-root unavailable");
+            return;
+        }
+        let td = tempfile::TempDir::new().unwrap();
+        emit_codegraph_rename_deferral(td.path(), "OldName", "NewName", Some("OldName"), None)
+            .unwrap();
+        let content = std::fs::read_to_string(
+            td.path()
+                .join(".claude")
+                .join("context")
+                .join("UPDATE_DEFERRED.md"),
+        )
+        .unwrap();
+        assert!(
+            !content.contains("Stale project-root .env detected"),
+            "no stale-.env note should appear when the caller passed None: {}",
+            content
         );
     }
 
