@@ -19,6 +19,7 @@
   import { license } from '$lib/stores/license';
   import { toast } from '$lib/stores/toast';
   import type { ModuleCatalogEntry } from '$lib/types/launcher';
+  import { getColorRgb, type BrandColor } from '$lib/color-rgb';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
   import DeprecationBanner from '$lib/components/DeprecationBanner.svelte';
   // v0.2.33 (Agent E, 2026-05-25):
@@ -294,12 +295,6 @@
     for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
     const palette = ['teal', 'purple', 'pink'];
     return palette[h % palette.length];
-  }
-
-  function colorRgb(c: string): string {
-    if (c === 'teal') return '0,191,166';
-    if (c === 'purple') return '123,95,255';
-    return '255,79,160';
   }
 
   async function handleInstall(m: ModuleCatalogEntry) {
@@ -711,10 +706,10 @@
              so the inline `{@const}` is valid (Svelte 5 requires
              const tags to be the immediate child of a block). -->
         {@const ppBadge = resolvePerProjectBadge(m, installRow)}
-        <div class="module-card glass-card" style:--accent="rgb({colorRgb(color)})">
+        <div class="module-card glass-card" style:--accent="rgb({getColorRgb(color as BrandColor)})">
           <div class="card-head">
-            <div class="card-icon" style:background="rgba({colorRgb(color)}, 0.12)" style:border-color="rgba({colorRgb(color)}, 0.25)">
-              <span style:color="rgb({colorRgb(color)})">{initials(m.name)}</span>
+            <div class="card-icon" style:background="rgba({getColorRgb(color as BrandColor)}, 0.12)" style:border-color="rgba({getColorRgb(color as BrandColor)}, 0.25)">
+              <span style:color="rgb({getColorRgb(color as BrandColor)})">{initials(m.name)}</span>
             </div>
             <div class="card-title-block">
               <div class="card-title-row">

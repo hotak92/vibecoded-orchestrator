@@ -23,6 +23,7 @@
   import { selectedProject } from '$lib/stores/projects';
   import { toast } from '$lib/stores/toast';
   import { moduleActionForKind, detectModuleErrorAfterAction } from '$lib/module-status-display';
+  import { getColorRgb } from '$lib/color-rgb';
   import type { ModuleCatalogEntry } from '$lib/types/launcher';
 
   onMount(() => {
@@ -108,12 +109,6 @@
   );
 
   let selectedCard = $state<AppCard | null>(null);
-
-  function getColorRgb(color: 'teal' | 'purple' | 'pink'): string {
-    if (color === 'teal') return '0,191,166';
-    if (color === 'purple') return '123,95,255';
-    return '255,79,160';
-  }
 
   function getColorVar(color: 'teal' | 'purple' | 'pink'): string {
     if (color === 'teal') return 'var(--color-teal)';

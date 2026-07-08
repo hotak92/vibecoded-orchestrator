@@ -19,6 +19,7 @@
   import { ui } from '$lib/stores/ui';
   import { modules } from '$lib/stores/modules';
   import { moduleActionForKind, detectModuleErrorAfterAction } from '$lib/module-status-display';
+  import { getColorRgb, type BrandColor } from '$lib/color-rgb';
   import Dropdown from '$lib/components/Dropdown.svelte';
 
   // v0.2.43 (contributor branch feat/launcher-logo-circular-white): brand
@@ -343,12 +344,6 @@
       }, 2000);
     }, 1000);
   }
-
-  function getColorRgb(color: string): string {
-    if (color === 'teal') return '0,191,166';
-    if (color === 'purple') return '123,95,255';
-    return '255,79,160';
-  }
 </script>
 
 <aside class="right-sidebar">
@@ -356,8 +351,8 @@
     <div class="sidebar-section">
       <div
         class="sidebar-app-icon"
-        style:background="rgba({getColorRgb(selectedApp.color)}, 0.15)"
-        style:border-color="rgba({getColorRgb(selectedApp.color)}, 0.3)"
+        style:background="rgba({getColorRgb(selectedApp.color as BrandColor)}, 0.15)"
+        style:border-color="rgba({getColorRgb(selectedApp.color as BrandColor)}, 0.3)"
       >
         <span class="sidebar-app-letter">{selectedApp.name.charAt(0)}</span>
       </div>

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import RightSidebar from '$lib/components/RightSidebar.svelte';
+  import { getColorRgb, type BrandColor } from '$lib/color-rgb';
   import { currentUser, auth } from '$lib/stores/auth';
   import { orchestrator } from '$lib/stores/orchestrator';
   import { modules } from '$lib/stores/modules';
@@ -81,12 +82,6 @@
 
   let selectedApp = $state<AppItem | null>(null);
 
-  function getColorRgb(color: string): string {
-    if (color === 'teal') return '0,191,166';
-    if (color === 'purple') return '123,95,255';
-    return '255,79,160';
-  }
-
   function getColorVar(color: string): string {
     if (color === 'teal') return 'var(--color-teal)';
     if (color === 'purple') return 'var(--color-purple)';
@@ -146,7 +141,7 @@
             tabindex="0"
           >
             <div class="app-card-top-line" style:background="linear-gradient(90deg, transparent, {getColorVar(app.color)}, transparent)"></div>
-            <div class="app-card-icon" style:background="rgba({getColorRgb(app.color)}, 0.12)" style:border-color="rgba({getColorRgb(app.color)}, 0.25)">
+            <div class="app-card-icon" style:background="rgba({getColorRgb(app.color as BrandColor)}, 0.12)" style:border-color="rgba({getColorRgb(app.color as BrandColor)}, 0.25)">
               <span style:color={getColorVar(app.color)}>{app.icon}</span>
             </div>
             <h3 class="app-card-name">{app.name}</h3>

@@ -11,6 +11,15 @@
   --color-purple-hover: #8F77FF;
   --color-pink: #FF4FA0;
   --color-pink-hover: #FF6BB3;
+  /* RGB triplets of the accent colors above, for `rgba(var(--…), α)`
+   * consumers (card glows, icon washes) that need to vary alpha. Keep
+   * these in lockstep with the hex values on the same lines — a palette
+   * change must update BOTH. The single JS reader is $lib/color-rgb.ts
+   * (getColorRgb), which prefers these tokens at runtime and only falls
+   * back to the baked triplets in SSR/test. */
+  --color-teal-rgb: 0, 191, 166;
+  --color-purple-rgb: 123, 95, 255;
+  --color-pink-rgb: 255, 79, 160;
   --color-text: #F1F5F9;
   --color-mid: #94A3B8;
   --color-muted: #475569;
