@@ -261,14 +261,32 @@ impl ClaimGuard {
                         .and_then(|c| c.lines().next().map(|l| l.trim().to_string()))
                         .and_then(|l| l.parse::<u32>().ok())
                         .map(|pid| !pid_is_alive(pid));
-                    let too_old = std::fs::metadata(&path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| t.elapsed().ok())
-                        .map(|age| age > CLAIM_STALE_AGE)
-                        .unwrap_or(false);
+                    let too_old = claim_too_old(&path);
                     if recorded_dead == Some(true) || too_old {
-                        let _ = std::fs::remove_file(&path);
+                        // v0.2.75 P2: rename-to-unique → re-verify → delete
+                        // (reap_stale_claim). A plain remove_file here raced:
+                        // between the staleness read above and the delete,
+                        // another contender could reap the stale file AND
+                        // create a fresh LIVE claim at the same path — the
+                        // delete then destroyed the winner's live claim.
+                        // The reap helper re-judges AFTER the atomic rename
+                        // and restores a live claim untouched. A repeated
+                        // I/O failure is bounded by the wait budget so a
+                        // permanently unreapable file can't spin us forever.
+                        match reap_stale_claim(&path, false) {
+                            ReapOutcome::IoError if start.elapsed() > CLAIM_MAX_WAIT => {
+                                return Err(format!(
+                                    "hub lockfile claim at {} judged stale but could \
+                                     not be reaped (I/O error) — remove the file and \
+                                     retry",
+                                    path.display()
+                                ));
+                            }
+                            ReapOutcome::IoError => {
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                            _ => {}
+                        }
                         continue;
                     }
                     if start.elapsed() > CLAIM_MAX_WAIT {
@@ -277,8 +295,11 @@ impl ClaimGuard {
                             // creator's `writeln!` trails its create by
                             // microseconds, so this is a corrupt leftover
                             // (e.g. SIGKILL between create and write).
+                            // Same rename-then-verify protocol: if the file
+                            // became a parseable LIVE claim since we judged
+                            // it corrupt, it is restored, not removed.
                             removed_corrupt_once = true;
-                            let _ = std::fs::remove_file(&path);
+                            let _ = reap_stale_claim(&path, true);
                             continue;
                         }
                         return Err(format!(
@@ -298,8 +319,132 @@ impl ClaimGuard {
 
 impl Drop for ClaimGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // v0.2.75 P2: pid-checked removal, mirroring `release_owned`.
+        // Pre-fix this removed UNCONDITIONALLY — if our claim had been
+        // (wrongly or rightly) reaped and a different contender had since
+        // created its own claim at the same path, our Drop deleted the
+        // other process's LIVE claim and re-opened the double-start
+        // window. Conservative on every non-positive read: absent,
+        // unreadable, or foreign-pid claim files are left untouched (a
+        // leftover from our own kill -9 is reaped by the next acquire's
+        // dead-owner arm anyway).
+        let owner = std::fs::read_to_string(&self.path)
+            .ok()
+            .and_then(|c| c.lines().next().map(|l| l.trim().to_string()))
+            .and_then(|l| l.parse::<u32>().ok());
+        if owner == Some(std::process::id()) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
+}
+
+/// Monotonic per-process nonce for reap-sidecar names (two threads of the
+/// same process reaping concurrently must not collide on the temp name).
+static REAP_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Outcome of [`reap_stale_claim`]. Every arm leaves the filesystem in a
+/// consistent state; no arm ever deletes a claim that re-verified LIVE.
+#[derive(Debug, PartialEq, Eq)]
+enum ReapOutcome {
+    /// The renamed file re-verified as stale (dead pid / too old /
+    /// still-corrupt when `allow_corrupt`) and was removed.
+    Reaped,
+    /// The claim vanished before we could rename it — another contender
+    /// reaped it first, or the holder released. Nothing removed by us.
+    Vanished,
+    /// The renamed file re-verified as LIVE (the stale file was swapped
+    /// for a fresh claim between the caller's judgement and our rename).
+    /// It was restored; nothing removed.
+    RestoredLive,
+    /// Rename/IO error — claim left as-is.
+    IoError,
+}
+
+/// True when the claim file's mtime is older than `CLAIM_STALE_AGE`.
+/// `rename(2)` preserves mtime, so this judgement is stable across the
+/// reap protocol's rename step.
+fn claim_too_old(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|age| age > CLAIM_STALE_AGE)
+        .unwrap_or(false)
+}
+
+/// Remove a claim file the caller judged stale — safely (v0.2.75 P2).
+///
+/// Protocol: rename-to-unique → re-verify on the renamed file → delete
+/// (stale confirmed) or restore (live). The rename is atomic, so exactly
+/// one contender can win the reap for a given file; the re-verification
+/// happens on a file no other process can touch, closing the pre-fix
+/// judge→delete race where waiter A deleted winner C's fresh LIVE claim
+/// that had replaced the stale file in between.
+///
+/// `allow_corrupt=true` (the CLAIM_MAX_WAIT corrupt-leftover arm) also
+/// reaps a renamed file that is still unparseable; with `false` an
+/// unparseable file is treated as a mid-write creator and restored.
+///
+/// Restore is no-clobber: `hard_link` fails with `AlreadyExists` when a
+/// third contender has already created a fresh claim at the path (its
+/// claim wins; our stolen copy is dropped — the superseded holder's
+/// pid-checked `Drop` will leave the new claim alone). Filesystems
+/// without hard-link support fall back to a best-effort rename.
+fn reap_stale_claim(path: &std::path::Path, allow_corrupt: bool) -> ReapOutcome {
+    let nonce = REAP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "claim".to_string());
+    let reap_path = path.with_file_name(format!(
+        "{}.reap.{}.{}",
+        file_name,
+        std::process::id(),
+        nonce
+    ));
+
+    match std::fs::rename(path, &reap_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ReapOutcome::Vanished,
+        Err(_) => return ReapOutcome::IoError,
+    }
+
+    // Re-judge on the renamed file — authoritative: nobody else can be
+    // mutating it now.
+    let recorded_pid = std::fs::read_to_string(&reap_path)
+        .ok()
+        .and_then(|c| c.lines().next().map(|l| l.trim().to_string()))
+        .and_then(|l| l.parse::<u32>().ok());
+    let stale = match recorded_pid {
+        Some(pid) => !pid_is_alive(pid) || claim_too_old(&reap_path),
+        // Unparseable: corrupt-leftover arm may reap; the normal arm only
+        // reaps when the mtime independently proves staleness.
+        None => allow_corrupt || claim_too_old(&reap_path),
+    };
+
+    if stale {
+        let _ = std::fs::remove_file(&reap_path);
+        return ReapOutcome::Reaped;
+    }
+
+    // LIVE — we stole a fresh claim; put it back without clobbering.
+    match std::fs::hard_link(&reap_path, path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&reap_path);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A third contender claimed the path meanwhile — its claim
+            // stands; the stolen copy is superseded.
+            let _ = std::fs::remove_file(&reap_path);
+        }
+        Err(_) => {
+            // hard_link unsupported on this filesystem — best-effort
+            // rename (tiny TOCTOU window, still strictly better than the
+            // pre-fix unconditional delete).
+            let _ = std::fs::rename(&reap_path, path);
+        }
+    }
+    ReapOutcome::RestoredLive
 }
 
 /// Try to claim the lockfile for the current process.
@@ -838,6 +983,118 @@ mod tests {
             release().expect("release on present");
             assert_eq!(read_pid(), None);
             release().expect("release on absent again");
+        });
+    }
+
+    // ── v0.2.75 P2: rename-then-verify reap + pid-checked Drop ────────
+
+    /// The judge→delete race: a caller judged the claim stale, but the
+    /// file was swapped for a LIVE claim before the reap ran. The reap
+    /// must detect the live content post-rename and RESTORE it — never
+    /// remove another process's live claim.
+    #[test]
+    fn reap_restores_live_claim_swapped_in_after_stale_judgement() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("hub.pid.claim");
+        // A LIVE claim: our own pid, fresh mtime (simulates winner C's
+        // fresh claim replacing the stale file after the judge read).
+        std::fs::write(&path, format!("{}\n", std::process::id())).unwrap();
+
+        let outcome = reap_stale_claim(&path, false);
+        assert_eq!(outcome, ReapOutcome::RestoredLive);
+        assert!(path.exists(), "live claim must be restored at its path");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.starts_with(&std::process::id().to_string()),
+            "restored claim must carry the live owner's pid"
+        );
+        // No reap sidecar leftovers.
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".reap."))
+            .collect();
+        assert!(leftovers.is_empty(), "no .reap. sidecars may remain");
+    }
+
+    /// A genuinely stale claim (dead recorded pid) is reaped: renamed,
+    /// re-verified, removed.
+    #[test]
+    fn reap_removes_genuinely_stale_claim() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("hub.pid.claim");
+        // u32::MAX is the dead-pid sentinel (pid_is_alive rejects it).
+        std::fs::write(&path, format!("{}\n", u32::MAX)).unwrap();
+
+        assert_eq!(reap_stale_claim(&path, false), ReapOutcome::Reaped);
+        assert!(!path.exists(), "stale claim must be removed");
+    }
+
+    /// A claim that vanished between judgement and reap (another
+    /// contender won the rename) reports Vanished — nothing to remove.
+    #[test]
+    fn reap_reports_vanished_when_claim_already_gone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("hub.pid.claim");
+        assert_eq!(reap_stale_claim(&path, false), ReapOutcome::Vanished);
+    }
+
+    /// Corrupt-leftover arm: unparseable content reaps ONLY with
+    /// allow_corrupt; the normal arm restores it (mid-write creator).
+    /// And even the corrupt arm restores a live swap.
+    #[test]
+    fn reap_corrupt_arm_reaps_unparseable_but_restores_live_swap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("hub.pid.claim");
+
+        // Unparseable + fresh mtime, normal arm → restored (creator may
+        // be mid-write).
+        std::fs::write(&path, "garbage-not-a-pid\n").unwrap();
+        assert_eq!(reap_stale_claim(&path, false), ReapOutcome::RestoredLive);
+        assert!(path.exists());
+
+        // Unparseable, corrupt arm → reaped.
+        assert_eq!(reap_stale_claim(&path, true), ReapOutcome::Reaped);
+        assert!(!path.exists());
+
+        // LIVE content, corrupt arm → still restored, never removed.
+        std::fs::write(&path, format!("{}\n", std::process::id())).unwrap();
+        assert_eq!(reap_stale_claim(&path, true), ReapOutcome::RestoredLive);
+        assert!(path.exists());
+    }
+
+    /// Drop with a FOREIGN claim at our path leaves the file intact —
+    /// the pid-checked Drop mirrors `release_owned` (only remove what
+    /// records OUR pid).
+    #[test]
+    fn claim_guard_drop_leaves_foreign_claim_intact() {
+        with_state_dir(|root| {
+            let guard = ClaimGuard::acquire().expect("claim");
+            let claim_path = root.join(CLAIM_FILE);
+            // Simulate: our claim was reaped and a foreign contender
+            // claimed the path while our guard was still alive.
+            std::fs::write(&claim_path, format!("{}\n", u32::MAX)).unwrap();
+            drop(guard);
+            assert!(
+                claim_path.exists(),
+                "foreign claim must survive our guard's Drop"
+            );
+            let content = std::fs::read_to_string(&claim_path).unwrap();
+            assert!(content.starts_with(&u32::MAX.to_string()));
+            std::fs::remove_file(&claim_path).ok();
+        });
+    }
+
+    /// Drop with OUR OWN claim still removes it (the RAII contract the
+    /// rest of acquire() depends on is preserved).
+    #[test]
+    fn claim_guard_drop_removes_own_claim() {
+        with_state_dir(|root| {
+            let guard = ClaimGuard::acquire().expect("claim");
+            let claim_path = root.join(CLAIM_FILE);
+            assert!(claim_path.exists(), "acquire writes the claim file");
+            drop(guard);
+            assert!(!claim_path.exists(), "own claim removed on Drop");
         });
     }
 }
