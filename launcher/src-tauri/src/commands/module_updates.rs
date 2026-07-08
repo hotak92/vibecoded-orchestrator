@@ -567,7 +567,14 @@ fn write_partial_failure_deferral(
     let det_py = py_quote(&detected);
     let why_py = py_quote(&why_deferred);
     let cmd_py = py_quote(&command_to_apply);
-    let sev_py = py_quote("medium");
+    // Severity must be one of the DeferralEntry SEVERITY_ORDER values
+    // (critical|warning|info) — a partial module update the user can retry is
+    // a "warning". Before v0.2.75 this passed "medium", which is NOT in the
+    // set, so DeferralEntry.__post_init__ raised ValueError and the shelled
+    // Python always exited non-zero → this deferral was NEVER written (the
+    // error was logged + swallowed). MUST MATCH vco_lib/deferral_report.py
+    // SEVERITY_ORDER.
+    let sev_py = py_quote("warning");
     let script = format!(
         "import sys\n\
          sys.path.insert(0, {repo_py})\n\

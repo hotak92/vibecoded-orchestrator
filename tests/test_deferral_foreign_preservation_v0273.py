@@ -20,6 +20,7 @@ Covers:
 
 from __future__ import annotations
 
+import re
 import sys
 import unittest
 import tempfile
@@ -226,6 +227,69 @@ class TestInstallOwnershipSet(unittest.TestCase):
         finalize_lines = _code_lines("_deferral_flow.finalize(")
         self.assertEqual(len(finalize_lines), 1, finalize_lines)
         self.assertIn("_final = _deferral_flow.finalize(", finalize_lines[0])
+
+
+class TestRustEmitterSeveritiesValid(unittest.TestCase):
+    """v0.2.75: every Rust command that shells out to build a DeferralEntry
+    must pass a severity in SEVERITY_ORDER — otherwise __post_init__ raises
+    ValueError, the helper exits non-zero, and the deferral is SILENTLY never
+    written (the error is logged + swallowed). module_updates.rs shipped
+    ``severity="medium"`` (not in the set) since v0.2.52, so its
+    ``module_update_partial_failure`` deferral never landed. This source-scan
+    guards the whole class. MUST MATCH vco_lib/deferral_report.py SEVERITY_ORDER.
+    """
+
+    def test_all_rust_literal_severities_are_valid(self) -> None:
+        from vco_lib.deferral_report import SEVERITY_ORDER  # noqa: PLC0415
+        cmds = REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands"
+        # Two shapes emit a severity into the generated Python script:
+        #   py_quote("<lit>") assigned to a *_py var named for severity, and
+        #   an inline  severity=\"<lit>\"  in the format string.
+        pat = re.compile(
+            r'(?:sev(?:erity)?_py\s*=\s*py_quote\("([a-z]+)"\)'
+            r'|severity=\\"([a-z]+)\\")'
+        )
+        found = 0
+        for rs in sorted(cmds.glob("*.rs")):
+            text = rs.read_text(encoding="utf-8")
+            for m in pat.finditer(text):
+                lit = m.group(1) or m.group(2)
+                found += 1
+                with self.subTest(file=rs.name, severity=lit):
+                    self.assertIn(
+                        lit, SEVERITY_ORDER,
+                        f"{rs.name} emits severity={lit!r}, not in "
+                        f"{SEVERITY_ORDER} — the deferral would never be "
+                        f"written (silent ValueError in the shelled helper).",
+                    )
+        # Storage_ux passes a *variable* severity (runtime-checked at its
+        # callsite), so it won't match the literal patterns — that's fine.
+        # We only assert we scanned at least the two known literal emitters.
+        self.assertGreaterEqual(found, 2, "severity-literal scan found too few "
+                                "emitters — the regex likely drifted from the "
+                                "Rust source shape.")
+
+
+class TestLightweightPathSeedsBeforeWrite(unittest.TestCase):
+    """v0.2.75: the install.py --lightweight branch builds a FRESH
+    DeferralReport and must merge_from_disk (foreign-only) BEFORE write(),
+    or an empty lightweight run unlinks UPDATE_DEFERRED.{md,json} and destroys
+    pending foreign deferrals. Guards the A-2 seed on the lightweight path."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.source = (REPO_ROOT / "install.py").read_text(encoding="utf-8")
+
+    def test_lightweight_merges_before_write(self) -> None:
+        # The seed merge must appear between the fresh construction and the
+        # write, with the install-owned exclusions.
+        lw_construct = self.source.index("_lightweight_deferral = DeferralReport()")
+        lw_write = self.source.index("_lightweight_deferral.write(")
+        window = self.source[lw_construct:lw_write]
+        self.assertIn("_lightweight_deferral.merge_from_disk(", window,
+                      "lightweight path must A-2 seed before write()")
+        self.assertIn("_INSTALL_OWNED_CONDITION_IDS", window)
+        self.assertIn("_INSTALL_OWNED_CONDITION_PREFIXES", window)
 
 
 if __name__ == "__main__":

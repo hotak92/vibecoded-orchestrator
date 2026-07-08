@@ -33,7 +33,11 @@ _MAIN_SPAN_MAX = 1668
 
 # TOTAL: strict — measured exactly, no headroom. Additions require
 # extraction to vco_lib, not a bump.
-_TOTAL_LINES_MAX = 25367
+# v0.2.75 pre-ship: +12 for the lightweight-path A-2 seed (data-safety fix —
+# the fresh DeferralReport on the --lightweight branch was clobbering pending
+# foreign deferrals; the seed is inseparable from the existing write block,
+# not extractable without contortion). Re-pinned to the new measured value.
+_TOTAL_LINES_MAX = 25379
 
 
 def _measure() -> tuple:

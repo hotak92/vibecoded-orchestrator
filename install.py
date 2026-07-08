@@ -3974,6 +3974,18 @@ def _run_lightweight(args: argparse.Namespace) -> int:
             if getattr(args, "project_folder", None)
             else PROJECT_ROOT
         )
+        # A-2 seed (v0.2.75): the lightweight path builds a FRESH DeferralReport
+        # and does NOT go through InstallDeferralFlow, so without this merge its
+        # write() would clobber any pending FOREIGN entries already on disk
+        # (bundle_user_modified_preserved, codegraph_embed_resync_pending, …) —
+        # an empty lightweight run would unlink both UPDATE_DEFERRED.{md,json}
+        # and strip the CLAUDE.md reminder, silently destroying them. Seed
+        # foreign-only (same owned exclusions as the full path) before writing.
+        _lightweight_deferral.merge_from_disk(
+            _lightweight_folder,
+            exclude_ids=_INSTALL_OWNED_CONDITION_IDS,
+            exclude_prefixes=_INSTALL_OWNED_CONDITION_PREFIXES,
+        )
         _lightweight_deferral.write(_lightweight_folder)
     except Exception as _exc:  # noqa: BLE001 — soft-fail
         _log_install_event(
