@@ -302,6 +302,8 @@ Workflow (do these in order — don't skip):
   2. UPDATE: for each match, Edit the existing node — extend content, set 'valid_until' if old content was superseded. Re-grouping into existing nodes prevents duplicate-KG drift.
   3. CREATE only if no existing node fits. Two near-duplicate nodes hurt future-grep more than the missing node would.
 
+ONE TOPIC PER NODE — a pattern, mechanism, decision, or gotcha; never release/cycle chronicle nodes (those belong in memory/handoffs/CHANGELOG). Over-general "what happened in vX.Y.Z" nodes match everything and focus nothing — capture the specific lesson, not the event.
+
 If — after running step 1's hybrid_search calls — you've genuinely learned nothing worth recording, write [No KG update needed: <one-line reason naming what you searched for>] in your reply (top-level text, not in a tool call). The reason must name the topic(s) you searched and why it didn't yield candidates — bare reasons like "nothing new" or "orthogonal work" are insufficient signal that the search was actually done. Example of acceptable: [No KG update needed: searched 'PR merge order' and 'CI re-trigger flow' — both already covered in workflow-discipline.md].
 
 The escape hatch is for the truly orthogonal turn (deploys, status reports, scrub-only). Default is to write the node."""
