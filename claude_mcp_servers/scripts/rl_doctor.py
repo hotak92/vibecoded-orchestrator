@@ -139,6 +139,50 @@ def _probe_per_project_toggle() -> Dict[str, Any]:
         return {"status": "unknown", "enabled": None, "detail": f"toggle probe raised: {exc}"}
 
 
+def _resolve_active_text_embedding() -> "tuple[str, int]":
+    """Resolve (active_embedding, text_dim) the way the LIVE pipeline does.
+
+    v0.2.75 NEW-3: pre-fix this file hardcoded ``text_dim = 1024``, so on an
+    openai-1536 (or any non-1024) install the doctor's negotiation probe
+    reported ``embedding_space_mismatch`` against a perfectly-matched
+    container — a false alarm — and would have reported ``compatible`` for a
+    genuinely mismatched 1024 container. Mirror of the resolution in
+    ``weaviate_mcp.rl_enrichment._get_rl_client`` (the client the pipeline
+    actually pairs with the container — MUST MATCH that function):
+
+      * active tag: ``ACTIVE_EMBEDDING`` env → server module constant
+        (hub-resolved) → ``"qwen3"``.
+      * text_dim: ``EmbeddingService.for_project().text_dim`` → 1024 floor.
+
+    Every arm soft-fails to the next; never raises.
+    """
+    active = os.environ.get("ACTIVE_EMBEDDING", "") or ""
+    if not active:
+        try:
+            from claude_mcp_servers.weaviate_mcp import server as _srv
+
+            active = getattr(_srv, "ACTIVE_EMBEDDING", "") or ""
+        except Exception:  # noqa: BLE001
+            active = ""
+    active = active or "qwen3"
+
+    text_dim = 0
+    try:
+        from vco_lib.embedding_service import EmbeddingService
+
+        svc = EmbeddingService.for_project()
+        try:
+            text_dim = int(svc.text_dim or 0)
+            # Prefer the service's short id when it resolves — same override
+            # the telemetry-writer triple applies.
+            active = svc.text_model_short_id() or active
+        finally:
+            svc.close()
+    except Exception:  # noqa: BLE001
+        text_dim = 0
+    return active, (text_dim or 1024)
+
+
 def _probe_container() -> Dict[str, Any]:
     """Container reachability + RL-10 negotiation. Never raises."""
     try:
@@ -147,9 +191,8 @@ def _probe_container() -> Dict[str, Any]:
         return {"status": "unknown", "reachable": False, "detail": f"RLClient import raised: {exc}"}
 
     # Resolve the active embedding tag/dim the same way the MCP does, so the
-    # RL-2b space check is meaningful. Defaults are the qwen3 floor.
-    text_dim = 1024
-    active = os.environ.get("ACTIVE_EMBEDDING", "qwen3") or "qwen3"
+    # RL-2b space check is meaningful (NEW-3: no more hardcoded 1024).
+    active, text_dim = _resolve_active_text_embedding()
     try:
         client = RLClient(text_dim=text_dim, active_embedding=active)
     except Exception as exc:  # noqa: BLE001
@@ -182,6 +225,10 @@ def _probe_container() -> Dict[str, Any]:
         "server_embedding_dim": neg.server_embedding_dim,
         "server_embedding_space": neg.server_embedding_space,
         "client_base_url": client.base_url,
+        # NEW-3: surface what the CLIENT side resolved, so a mismatch report
+        # shows both halves of the comparison.
+        "client_text_dim": text_dim,
+        "client_active_embedding": active,
         "detail": neg.detail,
     }
 
@@ -193,6 +240,8 @@ def _probe_fallback_counter(project_root: str) -> Dict[str, Any]:
         return {
             "status": "none",
             "count": 0,
+            "success_count": 0,
+            "fallback_rate": None,
             "detail": "no fallback counter file — no recorded rerank fallbacks.",
             "path": path,
         }
@@ -202,16 +251,28 @@ def _probe_fallback_counter(project_root: str) -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         return {"status": "unreadable", "count": None, "detail": f"counter unreadable: {exc}", "path": path}
     count = int(data.get("count", 0) or 0) if isinstance(data, dict) else 0
+    # NEW-3 (v0.2.75): the pipeline also counts SUCCESSFUL reranks in the
+    # same file, so the fallback RATE is computable from disk.
+    success = int(data.get("success_count", 0) or 0) if isinstance(data, dict) else 0
+    total = count + success
+    rate = (count / total) if total > 0 else None
     return {
         "status": "fallbacks_recorded" if count > 0 else "clean",
         "count": count,
+        "success_count": success,
+        "fallback_rate": rate,
         "last_reason": (data.get("last_reason") if isinstance(data, dict) else None),
         "last_ts": (data.get("last_ts") if isinstance(data, dict) else None),
         "detail": (
-            f"{count} rerank fallback(s) recorded; last reason: "
-            f"{data.get('last_reason', 'n/a')!r}"
+            f"{count} rerank fallback(s) / {success} success(es)"
+            + (f" (fallback rate {rate:.0%})" if rate is not None else "")
+            + f"; last reason: {data.get('last_reason', 'n/a')!r}"
             if count > 0
-            else "no rerank fallbacks recorded."
+            else (
+                f"no rerank fallbacks recorded ({success} successful rerank(s))."
+                if success > 0
+                else "no rerank fallbacks recorded."
+            )
         ),
         "path": path,
     }

@@ -930,6 +930,10 @@ def _get_rl_client():
     # text_dim comes from the MCP's notion of the active embedding —
     # we pull it from the EmbeddingService when available, falling back
     # to a sensible default (1024 for qwen3/arctic; legacy alias).
+    # NEW-3 (v0.2.75): rl-doctor mirrors this exact resolution in
+    # scripts/rl_doctor.py::_resolve_active_text_embedding — keep them in
+    # sync (must match) or the doctor's negotiation probe diverges from the
+    # pairing the live pipeline actually constructs.
     text_dim = 1024
     try:
         from vco_lib.embedding_service import EmbeddingService

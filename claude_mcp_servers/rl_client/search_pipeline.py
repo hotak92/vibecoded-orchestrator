@@ -604,6 +604,10 @@ async def _do_rerank(
     if not getattr(client, "last_call_ok", True):
         _record_rl_fallback(getattr(client, "last_error", None) or "unknown")
         return None
+    # NEW-3 sibling (v0.2.75): count SUCCESSES next to the fallbacks so the
+    # fallback RATE is computable from disk (rl-doctor reads both fields from
+    # the same file — count/(count+success_count)).
+    _record_rl_success()
     return ranked
 
 
@@ -611,10 +615,9 @@ def _record_rl_fallback(reason: str) -> None:
     """v0.2.73 RL-3: persist a rerank-fallback counter + WARN once per process.
 
     Writes ``<project_root>/.claude/state/rl_fallback_counter.json`` with
-    ``{count, last_reason, last_ts}`` so "my Pro rerank silently stopped
-    working" is diagnosable from disk (rl-doctor material, RL-12). Root
-    resolution: CLAUDE_PROJECT_DIR → server.KG_BASE_DIR → cwd. Soft-fail
-    throughout — the counter must never break a search.
+    ``{count, success_count, last_reason, last_ts}`` so "my Pro rerank
+    silently stopped working" is diagnosable from disk (rl-doctor material,
+    RL-12). Soft-fail throughout — the counter must never break a search.
     """
     global _WARNED_RL_FALLBACK
     if not _WARNED_RL_FALLBACK:
@@ -624,6 +627,27 @@ def _record_rl_fallback(reason: str) -> None:
             "order (reason: %s). Subsequent fallbacks are counted in "
             ".claude/state/rl_fallback_counter.json.", reason,
         )
+    _bump_rl_counter("count", reason=reason)
+
+
+def _record_rl_success() -> None:
+    """NEW-3 (v0.2.75): count one genuinely-reranked call in the same file.
+
+    Same disk record as the fallback counter (``success_count`` field) so the
+    fallback RATE — count / (count + success_count) — is computable offline
+    by rl-doctor without needing the process's logs.
+    """
+    _bump_rl_counter("success_count")
+
+
+def _bump_rl_counter(field: str, reason: "Optional[str]" = None) -> None:
+    """Shared writer for the on-disk rerank outcome counter (one home).
+
+    Root resolution: CLAUDE_PROJECT_DIR → server.KG_BASE_DIR → cwd (matches
+    rl-doctor's reader). Atomic tmp-write-then-replace. ``reason`` (when
+    given) updates ``last_reason``; ``last_ts`` always refreshes. Soft-fail
+    throughout — the counter must never break a search.
+    """
     try:
         import json as _json
         import os as _os
@@ -642,7 +666,7 @@ def _record_rl_fallback(reason: str) -> None:
         state_dir = _os.path.join(root, ".claude", "state")
         _os.makedirs(state_dir, exist_ok=True)
         path = _os.path.join(state_dir, "rl_fallback_counter.json")
-        data = {"count": 0}
+        data: dict = {}
         try:
             with open(path, encoding="utf-8") as fh:
                 loaded = _json.load(fh)
@@ -650,15 +674,16 @@ def _record_rl_fallback(reason: str) -> None:
                 data = loaded
         except Exception:  # noqa: BLE001 — missing/corrupt file → fresh
             pass
-        data["count"] = int(data.get("count", 0) or 0) + 1
-        data["last_reason"] = str(reason)[:500]
+        data[field] = int(data.get(field, 0) or 0) + 1
+        if reason is not None:
+            data["last_reason"] = str(reason)[:500]
         data["last_ts"] = _time.strftime("%Y-%m-%dT%H:%M:%S%z", _time.localtime())
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             _json.dump(data, fh)
         _os.replace(tmp, path)
     except Exception as exc:  # noqa: BLE001
-        logger.debug("_record_rl_fallback: counter write failed (%s)", exc)
+        logger.debug("_bump_rl_counter(%s): counter write failed (%s)", field, exc)
 
 
 _WARNED_RL_FALLBACK = False

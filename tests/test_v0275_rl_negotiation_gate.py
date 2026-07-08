@@ -182,7 +182,9 @@ def test_absent_health_fields_keeps_reranking(tmp_path):
     ranked = _run(_rerank_with(client))
     assert ranked is not None and len(ranked) == 2
     assert transport.post_calls == 1
-    assert _counter(tmp_path) == {}, "no fallback recorded for a working pairing"
+    # NEW-3 sibling records the SUCCESS in the same file; the load-bearing
+    # assertion is that no FALLBACK was recorded for a working pairing.
+    assert _counter(tmp_path).get("count", 0) == 0
 
 
 def test_compatible_pairing_keeps_reranking(tmp_path):
@@ -244,7 +246,7 @@ def test_health_transport_error_falls_open_to_per_call_path(tmp_path):
     assert ranked is not None and len(ranked) == 2
     assert transport.get_calls == 1
     assert transport.post_calls == 1
-    assert _counter(tmp_path) == {}
+    assert _counter(tmp_path).get("count", 0) == 0
 
 
 def test_negotiate_raising_entirely_falls_open():
