@@ -136,12 +136,13 @@ def test_server_does_not_own_moved_embedding_config():
 
 
 def test_rl_state_module_owns_the_definitions():
-    """rl_state.py is the real definition home — the caches are empty containers,
-    the thresholds carry their literal values."""
+    """rl_state.py is the real definition home — the caches are the right
+    container TYPES (they are process-global mutable state other tests populate,
+    so assert type not emptiness), the thresholds carry their literal values."""
     st = importlib.import_module("weaviate_mcp.rl_state")
-    assert st._rl_node_content_cache == {}
-    assert st._rl_client_instances == {}
-    assert st._rl_telemetry_writers == {}
+    assert isinstance(st._rl_node_content_cache, dict)
+    assert isinstance(st._rl_client_instances, dict)
+    assert isinstance(st._rl_telemetry_writers, dict)
     assert isinstance(st._rl_monitor_tasks, set)
     assert st._RL_MAX_LINKED == 5
     assert st._RL_MONITOR_ANSWER_THRESHOLD_TOKENS == 25_000

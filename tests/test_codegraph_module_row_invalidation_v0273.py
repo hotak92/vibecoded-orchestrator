@@ -76,14 +76,30 @@ class _Stub:
 
 
 def test_act_via_cache_uuid(analyzer_mod, tmp_path):
+    # C-12 (v0.2.75 P2c): module_cache is now (project_source, path)-keyed.
     coll = _FakeModulesColl()
-    stub = _Stub(analyzer_mod, coll, module_cache={"pkg/mod.py": "uuid-M"})
+    stub = _Stub(
+        analyzer_mod, coll,
+        module_cache={(tmp_path.as_posix(), "pkg/mod.py"): "uuid-M"},
+    )
+    stub._current_source = tmp_path.as_posix()
     stub._invalidate_module_row(tmp_path / "pkg" / "mod.py", tmp_path)
     assert len(coll.updates) == 1
     upd = coll.updates[0]
     assert upd["uuid"] == "uuid-M"
     assert upd["properties"]["file_hash"] == ""
     assert upd["properties"]["embed_revision"] == 0
+
+
+def test_act_via_cache_uuid_legacy_bare_key(analyzer_mod, tmp_path):
+    """C-12 tolerance: a legacy bare-path cache key (older in-flight caches)
+    still resolves via the bare-path fallback scan."""
+    coll = _FakeModulesColl()
+    stub = _Stub(analyzer_mod, coll, module_cache={"pkg/mod.py": "uuid-M"})
+    # No _current_source → the tuple lookup misses, the fallback scan finds it.
+    stub._invalidate_module_row(tmp_path / "pkg" / "mod.py", tmp_path)
+    assert len(coll.updates) == 1
+    assert coll.updates[0]["uuid"] == "uuid-M"
 
 
 def test_act_via_path_query_fallback(analyzer_mod, tmp_path):

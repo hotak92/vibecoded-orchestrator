@@ -3628,8 +3628,15 @@ class CodeGraphAnalyzer:
         self.functions_collection = None
         self.apis_collection = None
 
-        # Cache for entity lookups
-        self.module_cache: Dict[str, str] = {}  # path -> UUID
+        # Cache for entity lookups.
+        # C-12 (v0.2.75 P2c): module_cache is keyed by (project_source, path)
+        # so two --extra-path roots sharing a relpath don't collide on the bare
+        # relpath (the second write would otherwise target the first root's
+        # UUID, defeating V52-O.3 at the cache layer). ``project_source`` is ""
+        # for primary / legacy rows. The project-wide relationship-resolution
+        # phase (which has only bare paths from ``module_imports``) projects a
+        # bare-path→UUID view via ``_module_uuid_by_path`` / the tuple-key iter.
+        self.module_cache: Dict[Tuple[str, str], str] = {}  # (project_source, path) -> UUID
         self.class_cache: Dict[str, str] = {}  # full_name -> UUID
         self.function_cache: Dict[str, str] = {}  # full_name -> UUID
         self.module_imports: Dict[str, List[str]] = {}  # path -> [import names]
@@ -8446,7 +8453,22 @@ class CodeGraphAnalyzer:
             if coll is None:
                 return
             cache = getattr(self, "module_cache", None) or {}
-            uuid_to_fix = cache.get(rel)
+            # C-12 (v0.2.75 P2c): module_cache is (project_source, path)-keyed.
+            # The module row was stamped with project_source = self._current_source
+            # (the source root being walked when this file's row was written), so
+            # look up by that same tuple. Fall back to a bare-path scan across
+            # sources so a stale/absent _current_source still finds the row
+            # (best-effort compensation, never worse than the Weaviate fetch).
+            current_source = getattr(self, "_current_source", "") or ""
+            uuid_to_fix = cache.get((current_source, rel))
+            if uuid_to_fix is None:
+                for _k, _uuid in cache.items():
+                    # (project_source, path) tuple key OR a legacy bare-path
+                    # string key (older callers/tests) — tolerate both.
+                    _p = _k[1] if isinstance(_k, tuple) and len(_k) == 2 else _k
+                    if _p == rel:
+                        uuid_to_fix = _uuid
+                        break
             if uuid_to_fix is None:
                 result = coll.query.fetch_objects(
                     filters=Filter.by_property("path").equal(rel), limit=1
@@ -8698,7 +8720,23 @@ class CodeGraphAnalyzer:
         current_source = getattr(self, "_current_source", "")
 
         # Check if exists
-        if path in self.module_cache:
+        # LANDMINE (v0.2.75 P2c / C-12): this "path in module_cache" update
+        # branch does a DIRECT ``data.update`` — it BYPASSES the fingerprinting
+        # write path (``_dedup_insert`` → ``_write_one_object``) that stamps
+        # ``embed_revision`` + ``content_hash`` on every other write. If the
+        # cache is ever preloaded before the walk (module rows loaded from
+        # Weaviate) and this branch runs WITHOUT stamping those two fields, the
+        # row would keep a NULL/stale ``embed_revision`` while its content is
+        # current — the exact M0-inversion trap (a current-content row read as
+        # stale forever by the revision-aware gate). So stamp BOTH here,
+        # matching the insert path: ``embed_revision`` = current, and
+        # ``content_hash`` computed over the SAME CodeModule fields the insert
+        # path hashes (``path`` + ``module_summary`` + ``import_names``). If you
+        # add a module content field, update BOTH this call and the insert
+        # ``insert_params`` below (and _CONTENT_HASH_FIELDS["CodeModule"]).
+        cache_key = (current_source, path)
+        cached_uuid = self.module_cache.get(cache_key)
+        if cached_uuid is not None:
             # Update existing
             update_props = {
                 "module_summary": module_summary,
@@ -8711,17 +8749,30 @@ class CodeGraphAnalyzer:
                 # rows get the canonical value the next time we touch
                 # them, without needing a separate batch backfill pass.
                 "language": canonical_lang,
+                # C-12: keep the revision-aware gate honest on this bypass path.
+                _EMBED_REVISION_PROP: CODEGRAPH_EMBED_REVISION,
             }
+            try:
+                update_props["content_hash"] = _content_hash_for_object(
+                    "CodeModule",
+                    {
+                        "path": path,
+                        "module_summary": module_summary,
+                        "import_names": imports,
+                    },
+                )
+            except Exception:  # noqa: BLE001 — hashing must never wedge a write
+                pass
             if current_source:
                 update_props["project_source"] = current_source
             self.modules_collection.data.update(
-                uuid=self.module_cache[path],
+                uuid=cached_uuid,
                 properties=update_props,
             )
             # Still record as visited so --prune-stale doesn't delete it.
             if self._track_visited:
-                self.visited_uuids.add((self.modules_collection.name, self.module_cache[path]))
-            return self.module_cache[path]
+                self.visited_uuids.add((self.modules_collection.name, cached_uuid))
+            return cached_uuid
 
         # Create new - generate embedding from module_summary
         embedding = embed_module(module_summary)
@@ -8751,7 +8802,13 @@ class CodeGraphAnalyzer:
             file_path_rel=path,
         )
 
-        self.module_cache[path] = uuid
+        # C-12 (v0.2.75 P2c): key by (project_source, relpath). Two
+        # ``--extra-path`` roots sharing a relpath (e.g. ``install.py`` in the
+        # primary AND a sibling clone) otherwise collided on the bare relpath —
+        # the second update targeted the FIRST root's UUID, defeating V52-O.3 at
+        # the cache layer. ``cache_key`` was computed above for the update
+        # branch; reuse it so insert + update agree on the key.
+        self.module_cache[cache_key] = uuid
         return uuid
 
     def _extract_function_calls(self, node: ast.AST) -> List[str]:
@@ -8872,11 +8929,14 @@ class CodeGraphAnalyzer:
         print("   Loading existing entities from Weaviate (merging with analysis cache)...")
 
         # Load modules (including import_names for cross-ref linking)
+        # C-12 (v0.2.75 P2c): key by (project_source, path) so two extra-path
+        # roots sharing a relpath don't collide (see _create_or_update_module).
         try:
             for obj in self.modules_collection.iterator():
                 path = obj.properties.get("path", "")
                 if path:
-                    self.module_cache[path] = str(obj.uuid)
+                    src = obj.properties.get("project_source", "") or ""
+                    self.module_cache[(src, path)] = str(obj.uuid)
                     # Populate module_imports from stored import_names
                     import_names = obj.properties.get("import_names")
                     if import_names:
@@ -9025,8 +9085,17 @@ class CodeGraphAnalyzer:
 
         # import module name -> module path (match last component of path)
         # e.g. import "foo.bar" matches path "src/foo/bar.py" or module "bar"
+        # C-12: module_cache is (project_source, path)-keyed; this project-wide
+        # relationship resolution works by BARE path (module_imports carries no
+        # source), so project a bare-path→UUID view. Last-writer-wins on a path
+        # shared across sources is acceptable here — cross-ref linking is
+        # best-effort and a shared relpath resolves to A valid module row.
+        module_uuid_by_path: Dict[str, str] = {}
+        for _k, _uuid in self.module_cache.items():
+            _p = _k[1] if isinstance(_k, tuple) and len(_k) == 2 else _k
+            module_uuid_by_path[_p] = _uuid
         module_name_to_path: Dict[str, List[str]] = {}
-        for path in self.module_cache:
+        for path in module_uuid_by_path:
             # "src/foo/bar.py" -> stem "bar"
             stem = Path(path).stem
             module_name_to_path.setdefault(stem, []).append(path)
@@ -9277,7 +9346,7 @@ class CodeGraphAnalyzer:
         # --- 3. Module imports ---
         print("   Linking module imports...")
         for mod_path, import_names in self.module_imports.items():
-            mod_uuid = self.module_cache.get(mod_path)
+            mod_uuid = module_uuid_by_path.get(mod_path)  # C-12: bare-path view
             if not mod_uuid or not import_names:
                 continue
             for imp_name in import_names:
@@ -9294,7 +9363,7 @@ class CodeGraphAnalyzer:
                     target_path = candidates[0]
 
                 if target_path and target_path != mod_path:
-                    target_uuid = self.module_cache.get(target_path)
+                    target_uuid = module_uuid_by_path.get(target_path)  # C-12
                     if target_uuid:
                         try:
                             self.modules_collection.data.reference_add(
