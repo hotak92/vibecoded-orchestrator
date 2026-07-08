@@ -30,12 +30,21 @@ CONSENT_VERSION = "1.0"
 # Categories beyond the always-on baseline.
 OPTIN_CATEGORIES = ("rl_data", "routing_data", "instinct_data", "hardware")
 
+# RL-16 (v0.2.75): the rl_data line is deliberately verbose. The previous
+# copy ("embeddings + similarity, no code/text") implied embeddings carry
+# no content — they are mathematically derived from your text, and
+# approximate content reconstruction from embeddings is possible in
+# principle (inversion attacks are published literature). Consent copy
+# must not undersell that; raw text itself is never uploaded.
 _PROMPT_TEXT = """\
 VibeCoded Tools collects:
   - License validation status (hashed machine ID only)       [ALWAYS]
   - Performance metrics (latency, error rates)               [ALWAYS]
   - Hardware specs (CPU, RAM, GPU — paired with exec times)  [OPT-IN]
-  - RL training data (embeddings + similarity, no code/text) [OPT-IN]
+  - RL training data: embeddings + similarity signals        [OPT-IN]
+    (embeddings are mathematically derived from your text;
+    approximate content reconstruction is possible in principle
+    — raw text is never uploaded)
   - Routing decisions metadata (agent selection, outcomes)   [OPT-IN]
   - Tool usage patterns (tool names + timing, no content)    [OPT-IN]
 
