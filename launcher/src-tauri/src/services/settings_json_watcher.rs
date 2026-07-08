@@ -168,9 +168,43 @@ const MCP_RELEVANT_ENV_KEYS: &[&str] = &[
     "PROJECT_NAME",
     "CODE_GRAPH_PROJECT",
     "VCT_PROJECT_ID",
-    // --- embedding selection (weaviate_mcp reads ACTIVE_EMBEDDING / EMBEDDING_MODEL) ---
+    // --- embedding selection (weaviate_mcp reads ACTIVE_EMBEDDING / EMBEDDING_MODEL /
+    // EMBEDDING_SOURCE / CODE_EMBED_MODEL) ---
     "ACTIVE_EMBEDDING",
     "EMBEDDING_MODEL",
+    // F-7 (v0.2.75): weaviate_mcp reads these too. EMBEDDING_SOURCE selects
+    // weaviate-vs-service vectors; CODE_EMBED_MODEL names the code-embed
+    // model. A user hand-editing either in settings.json env expects the
+    // live MCP to pick it up — without listing them the watcher hash-matches
+    // the unchanged subset and SKIPS the reload (the F-7 staleness).
+    "EMBEDDING_SOURCE",
+    "CODE_EMBED_MODEL",
+    // --- F-7 (v0.2.75): KG retrieval tiers + hybrid tuning (weaviate_mcp's
+    // hybrid_search reads all of these; CLAUDE.md advertises hand-editing
+    // KG_TIER_FULL etc. in settings.json env). KG_BASE_DIR relocates where
+    // the MCP writes/reads the knowledge tree. All previously missing → a
+    // hand-edit silently never reloaded. ---
+    "KG_BASE_DIR",
+    "KG_TIER_MIN",
+    "KG_TIER_SINGLE_CHUNK",
+    "KG_TIER_THREE_CHUNKS",
+    "KG_TIER_FULL",
+    "KG_HYBRID_ALPHA",
+    "KG_HYBRID_CHUNK_BUDGET",
+    // --- F-7 (v0.2.75): code-graph retrieval tiers + expansion/rerank knobs
+    // (weaviate_mcp's search_code_graph reads all of these). The floors are
+    // already listed above (VCO_CODE_GRAPH_*_FLOOR); these are the tier
+    // thresholds + expansion/sibling/truncation knobs that were still
+    // missing. CODE_SIBLINGS_RANK is read as _1 / _2 (both listed — the
+    // list stores concrete spellings, no wildcards). ---
+    "CODE_TIER_MIN",
+    "CODE_TIER_SINGLE_CHUNK",
+    "CODE_TIER_THREE_CHUNKS",
+    "CODE_TIER_FULL",
+    "CODE_EXPANSION_LIMIT",
+    "CODE_SIBLINGS_RANK_1",
+    "CODE_SIBLINGS_RANK_2",
+    "CODE_TRUNC_CHARS",
     // --- v0.2.72 codegraph retrieval floors (weaviate_mcp's search_code_graph
     // reads these via code_ranking.resolve_retrieval_floor /
     // resolve_post_rerank_floor). set_codegraph_floors re-projects them into
@@ -188,9 +222,11 @@ const MCP_RELEVANT_ENV_KEYS: &[&str] = &[
     "DUAL_EMBEDDING_WRITE_ALL_SLOTS",
     "DUAL_EMBEDDING_ENABLED",
     "DUAL_RL_LOG_ENABLED",
-    // --- connection endpoints (weaviate_mcp reads WEAVIATE_URL / OLLAMA_URL / GRPC_PORT) ---
+    // --- connection endpoints (weaviate_mcp reads WEAVIATE_URL / OLLAMA_URL /
+    // OLLAMA_BASE_URL / GRPC_PORT) ---
     "WEAVIATE_URL",
     "OLLAMA_URL",
+    "OLLAMA_BASE_URL", // F-7 (v0.2.75): alt Ollama endpoint spelling the MCP reads
     "GRPC_PORT",
     "WEAVIATE_GRPC_PORT", // alt spelling the MCP also reads
     // projection writes *_PORT / CODE_EMBED_URL; the MCP reads
@@ -898,6 +934,42 @@ mod tests {
             !mcp_env_changed(baseline, &after),
             "changing an env key outside the MCP-relevant denylist must not reload"
         );
+    }
+
+    #[test]
+    fn mcp_env_changed_f7_newly_listed_key_reloads() {
+        // F-7 (v0.2.75): a hand-edit of a newly-listed key (KG_TIER_FULL —
+        // CLAUDE.md advertises exactly this) MUST now trigger a reload.
+        // Pre-F-7 the watcher hashed the unchanged subset and skipped it.
+        let before = settings_with_env(&[("KG_TIER_FULL", "0.75")], "stable");
+        let after = settings_with_env(&[("KG_TIER_FULL", "0.80")], "stable");
+        let baseline = hash_mcp_env(&before);
+        assert!(
+            mcp_env_changed(baseline, &after),
+            "editing KG_TIER_FULL (F-7 newly-listed) must trigger a reload"
+        );
+    }
+
+    #[test]
+    fn mcp_env_changed_f7_code_tier_and_siblings_reload() {
+        // Spot-check a few more F-7 additions so a future edit that drops
+        // one from the list trips here.
+        for key in [
+            "CODE_TIER_FULL",
+            "CODE_SIBLINGS_RANK_1",
+            "CODE_TRUNC_CHARS",
+            "KG_HYBRID_ALPHA",
+            "EMBEDDING_SOURCE",
+            "OLLAMA_BASE_URL",
+        ] {
+            let before = settings_with_env(&[(key, "1")], "stable");
+            let after = settings_with_env(&[(key, "2")], "stable");
+            let baseline = hash_mcp_env(&before);
+            assert!(
+                mcp_env_changed(baseline, &after),
+                "editing {key} (F-7 newly-listed) must trigger a reload"
+            );
+        }
     }
 
     #[test]
