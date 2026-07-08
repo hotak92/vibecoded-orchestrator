@@ -142,6 +142,20 @@ impl Db {
     /// Read the active flag for `(secret × requester)`. Two-step lookup:
     /// the literal-requester row first, the `*` sentinel as fallback,
     /// default-active when neither exists.
+    ///
+    /// Three-way read semantics (v0.2.75 P2 — MUST MATCH the file-read
+    /// sibling `read_is_active_for_requester_from_db_file` below):
+    ///   * row found              → `Ok(active != 0)`
+    ///   * no row (either step)   → `Ok(true)` (default-ACTIVE)
+    ///   * query/DB error         → `Err(_)` (NO OPINION — never coerced
+    ///     to default-ACTIVE)
+    ///
+    /// Pre-fix this used `.ok()` which collapsed a DB error (locked file,
+    /// dropped/corrupted table) into the no-row arm and fell through to
+    /// default-ACTIVE — a paused secret could be SERVED whenever the
+    /// active-state table was unreadable. Errors now propagate so the
+    /// combine sites (`is_secret_active_cross_launcher*`) can treat them
+    /// conservatively (deny — an error side must not over-serve).
     pub fn is_secret_active_for_requester(
         &self,
         scope: &str,
@@ -153,33 +167,37 @@ impl Db {
         let guard = self.lock();
 
         // Step 1: literal-requester row.
-        let specific: Option<i64> = guard
-            .query_row(
-                "SELECT active FROM secret_active_state
-                  WHERE scope = ?1 AND project_id = ?2 AND module_id = ?3
-                    AND key = ?4 AND requester_project_id = ?5",
-                params![scope, project_id, module_id, key, requester_project_id],
-                |r| r.get(0),
-            )
-            .ok();
-        if let Some(v) = specific {
-            return Ok(v != 0);
+        let specific: rusqlite::Result<i64> = guard.query_row(
+            "SELECT active FROM secret_active_state
+              WHERE scope = ?1 AND project_id = ?2 AND module_id = ?3
+                AND key = ?4 AND requester_project_id = ?5",
+            params![scope, project_id, module_id, key, requester_project_id],
+            |r| r.get(0),
+        );
+        match specific {
+            Ok(v) => return Ok(v != 0),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(e) => {
+                return Err(format!("is_secret_active_for_requester: {}", e));
+            }
         }
 
         // Step 2: `*` sentinel fallback. Skip when the requester WAS
         // already `*` — we'd just be re-reading the same row.
         if requester_project_id != REQUESTER_ANY {
-            let fallback: Option<i64> = guard
-                .query_row(
-                    "SELECT active FROM secret_active_state
-                      WHERE scope = ?1 AND project_id = ?2 AND module_id = ?3
-                        AND key = ?4 AND requester_project_id = ?5",
-                    params![scope, project_id, module_id, key, REQUESTER_ANY],
-                    |r| r.get(0),
-                )
-                .ok();
-            if let Some(v) = fallback {
-                return Ok(v != 0);
+            let fallback: rusqlite::Result<i64> = guard.query_row(
+                "SELECT active FROM secret_active_state
+                  WHERE scope = ?1 AND project_id = ?2 AND module_id = ?3
+                    AND key = ?4 AND requester_project_id = ?5",
+                params![scope, project_id, module_id, key, REQUESTER_ANY],
+                |r| r.get(0),
+            );
+            match fallback {
+                Ok(v) => return Ok(v != 0),
+                Err(rusqlite::Error::QueryReturnedNoRows) => {}
+                Err(e) => {
+                    return Err(format!("is_secret_active_for_requester: {}", e));
+                }
             }
         }
 
@@ -553,9 +571,24 @@ pub fn is_secret_active_cross_launcher(
     // Own DB first — most common case is "no other launchers exist",
     // and we can short-circuit on a paused entry without paying the
     // sibling-discovery cost.
-    let own_active = own_db
-        .is_secret_active(scope, project_id, module_id, key)
-        .unwrap_or(true);
+    //
+    // v0.2.75 P2: an own-DB READ ERROR is "no opinion", and at this
+    // combine site (the serving boundary) no-opinion must resolve
+    // conservatively: DENY. Pre-fix the error was `.unwrap_or(true)`d
+    // into ACTIVE, so an unreadable active-state table over-served
+    // paused secrets. Sibling errors below stay skip-only (their
+    // opinion is auxiliary; the own DB already answered positively).
+    let own_active = match own_db.is_secret_active(scope, project_id, module_id, key) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "[secret_active] is_secret_active_cross_launcher: own-DB read \
+                 failed ({}); refusing to serve (error must not over-serve)",
+                e
+            );
+            return false;
+        }
+    };
     if !own_active {
         return false;
     }
@@ -594,6 +627,10 @@ pub fn is_secret_active_cross_launcher(
 ///   * `Some(false)` — sibling has an explicit `active=0` row for this
 ///                     requester (or for `*`, when the requester row is absent)
 ///   * `None`        — DB unreadable / table missing / non-SQLite file
+///
+/// Three-way read semantics — MUST MATCH `Db::is_secret_active_for_requester`
+/// above: row → its value, no-row → default-ACTIVE, error → NO OPINION
+/// (`None` here, `Err` there). Never coerce an error into default-ACTIVE.
 pub fn read_is_active_for_requester_from_db_file(
     db_path: &Path,
     scope: &str,
@@ -705,9 +742,30 @@ pub fn is_secret_active_cross_launcher_for_requester(
     requester_project_id: &str,
 ) -> bool {
     // Own DB first — short-circuit a pause without paying sibling cost.
-    let own_active = own_db
-        .is_secret_active_for_requester(scope, project_id, module_id, key, requester_project_id)
-        .unwrap_or(true);
+    //
+    // v0.2.75 P2: own-DB READ ERROR → no opinion → DENY at this combine
+    // site (mirrors `is_secret_active_cross_launcher` above — an error
+    // side must not over-serve a possibly-paused secret). Siblings we
+    // can't read are still skipped: they only ADD pause opinions on top
+    // of an own-DB read that succeeded.
+    let own_active = match own_db.is_secret_active_for_requester(
+        scope,
+        project_id,
+        module_id,
+        key,
+        requester_project_id,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "[secret_active] is_secret_active_cross_launcher_for_requester: \
+                 own-DB read failed ({}); refusing to serve (error must not \
+                 over-serve)",
+                e
+            );
+            return false;
+        }
+    };
     if !own_active {
         return false;
     }
@@ -1617,5 +1675,123 @@ mod tests {
         assert!(db
             .is_secret_active_for_requester("per_project", "owner-A", "u", "K", "other-B")
             .unwrap());
+    }
+
+    // ── v0.2.75 P2: three-way semantics (row / no-row / error) ────────
+
+    /// A forced DB error (dropped table) must surface as `Err` — NO
+    /// OPINION — never as the default-ACTIVE arm. Pre-fix the `.ok()`
+    /// collapse turned "table unreadable" into "secret active".
+    #[test]
+    fn forced_db_error_yields_err_not_default_active() {
+        let db = Db::open_in_memory().unwrap();
+        db.lock()
+            .execute("DROP TABLE secret_active_state", [])
+            .unwrap();
+        let res = db.is_secret_active_for_requester("global", "_global_", "u", "K", "req-1");
+        assert!(
+            res.is_err(),
+            "dropped table must propagate as Err (no opinion), got {:?}",
+            res
+        );
+        // The legacy single-row API delegates — same contract.
+        let legacy = db.is_secret_active("global", "_global_", "u", "K");
+        assert!(legacy.is_err(), "legacy delegate must also Err, got {:?}", legacy);
+    }
+
+    /// At the serving combine site, an own-DB error must resolve to
+    /// DENY (false) — an error side must not over-serve a possibly-
+    /// paused secret.
+    #[test]
+    fn cross_launcher_combine_denies_on_own_db_error() {
+        let db = Db::open_in_memory().unwrap();
+        db.lock()
+            .execute("DROP TABLE secret_active_state", [])
+            .unwrap();
+        assert!(
+            !is_secret_active_cross_launcher_for_requester(
+                &db, "global", "_global_", "u", "K", "req-1",
+            ),
+            "own-DB error must deny at the combine site, not default-ACTIVE"
+        );
+        assert!(
+            !is_secret_active_cross_launcher(&db, "global", "_global_", "u", "K"),
+            "legacy combine site must deny on own-DB error too"
+        );
+    }
+
+    /// Parity: the Db method and the file-read sibling classify the
+    /// three arms identically — row → its value, no-row → default-
+    /// ACTIVE, error → no-opinion (`Err` on the method, `None` on the
+    /// sibling). Guards the MUST-MATCH comment pair on both variants.
+    #[test]
+    fn db_method_and_file_sibling_three_way_parity() {
+        let dir = scratch_dir("three-way-parity");
+        let db_path = dir.join(".vct-parity").join("launcher.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let db = make_db_at_path(&db_path);
+
+        // Arm 1a: explicit inactive row.
+        db.mark_secret_inactive_for_requester("shared", "_user_shared_", "u", "K", "req-1")
+            .unwrap();
+        // Arm 1b: explicit active row for a second key.
+        db.mark_secret_active_for_requester("shared", "_user_shared_", "u", "K_ON", "req-1")
+            .unwrap();
+
+        // Method arms (row present / row present / no-row).
+        assert_eq!(
+            db.is_secret_active_for_requester("shared", "_user_shared_", "u", "K", "req-1"),
+            Ok(false)
+        );
+        assert_eq!(
+            db.is_secret_active_for_requester("shared", "_user_shared_", "u", "K_ON", "req-1"),
+            Ok(true)
+        );
+        assert_eq!(
+            db.is_secret_active_for_requester("shared", "_user_shared_", "u", "ABSENT", "req-1"),
+            Ok(true),
+            "no-row must default-ACTIVE"
+        );
+
+        // Sibling arms against the same on-disk DB (drop our handle so
+        // the read-only open can't hit lock contention).
+        drop(db);
+        assert_eq!(
+            read_is_active_for_requester_from_db_file(
+                &db_path, "shared", "_user_shared_", "u", "K", "req-1",
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            read_is_active_for_requester_from_db_file(
+                &db_path, "shared", "_user_shared_", "u", "K_ON", "req-1",
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            read_is_active_for_requester_from_db_file(
+                &db_path, "shared", "_user_shared_", "u", "ABSENT", "req-1",
+            ),
+            Some(true),
+            "no-row must default-ACTIVE"
+        );
+
+        // Error arm: method → Err (dropped table); sibling → None
+        // (missing file). Both are no-opinion, never default-ACTIVE.
+        let db2 = Db::open_in_memory().unwrap();
+        db2.lock()
+            .execute("DROP TABLE secret_active_state", [])
+            .unwrap();
+        assert!(db2
+            .is_secret_active_for_requester("shared", "_user_shared_", "u", "K", "req-1")
+            .is_err());
+        assert_eq!(
+            read_is_active_for_requester_from_db_file(
+                &dir.join("nonexistent.db"), "shared", "_user_shared_", "u", "K", "req-1",
+            ),
+            None
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
