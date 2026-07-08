@@ -35,6 +35,13 @@
 #   4  unknown field name
 #   64 usage error
 #
+# F-9 (v0.2.75): this .sh is the REFERENCE for the exit-code contract. The
+# .ps1 sibling used to declare [ValidateSet]/Mandatory on -Field/-Value, so
+# PowerShell's binder turned an unknown-field / missing-arg into a
+# terminating error (exit 1), never the 4 / 64 emitted here. The sibling was
+# brought into line (explicit checks replacing the binding) rather than
+# softening this header — see vct_retrieval_tuning_set.ps1's F-9 note.
+#
 # Note: this script writes the file directly with the same atomic
 # tmp+rename posture the Rust writer uses. There is intentionally no
 # hub-roundtrip write path — the hub is read-only for these values

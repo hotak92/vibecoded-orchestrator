@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# OS-EXEMPT-PARITY: integration test for the bash resolver client only — the PowerShell resolver client has its own dedicated test (vct_project_config.Tests.ps1).
+# OS-EXEMPT-PARITY: bash-only integration test; the PowerShell resolver's rate-limit + Invoke-RWMaybeRotate path is covered by tests/test_resolver_ps1_ratelimit_rotate_f10.py (pwsh-gated pytest).
+# F-10 (v0.2.75): the PRIOR marker here cited a `vct_project_config.Tests.ps1`
+# that does not exist (`git ls-files '*.Tests.ps1'` is empty) — a false
+# premise that left the ps1 resolver rate-limit path untested. The exemption
+# reason above now points at REAL ps1 coverage (a pwsh-gated pytest), which
+# is the honest form of this exemption.
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
 #

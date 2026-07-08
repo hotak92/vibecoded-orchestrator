@@ -20,6 +20,16 @@
 #   4  unknown field
 #   64 usage error
 #
+# F-9 (v0.2.75): the exit-code contract above is REAL now. The previous
+# revision declared `[ValidateSet]` + `Mandatory` on -Field/-Value, so
+# PowerShell's PARAMETER BINDER rejected an unknown field or a missing arg
+# as a TERMINATING error → exit 1, NEVER the advertised 4 / 64 that the
+# bash sibling emits (vct_retrieval_tuning_set.sh:304 exit 4, six `exit 64`
+# sites). We now bind the params loosely and do EXPLICIT checks in Main,
+# so the ps1 emits the SAME 4 / 64 as the .sh. (Decision noted in both
+# siblings — bash was the reference; ps1 was brought into line rather than
+# the header softened.)
+#
 # The hub does NOT expose a write endpoint for retrieval tuning in
 # v0.2.22 — the launcher's Tauri command is the only authenticated
 # writer. Headless callers update the file directly; the hub re-reads
@@ -28,18 +38,14 @@
 
 [CmdletBinding(DefaultParameterSetName = 'Field')]
 param(
-    [Parameter(ParameterSetName = 'Field', Mandatory = $true)]
-    [ValidateSet(
-        'code_graph_score_floor',
-        'kg_tier_min',
-        'kg_tier_single_chunk',
-        'kg_tier_three_chunks',
-        'kg_tier_full'
-    )]
+    # F-9: NO [ValidateSet]/[Mandatory] — those convert an unknown field /
+    # missing arg into a binder terminating error (exit 1), masking the
+    # advertised 4 / 64. Validate explicitly in Main instead.
+    [Parameter(ParameterSetName = 'Field')]
     [string]$Field,
 
-    [Parameter(ParameterSetName = 'Field', Mandatory = $true)]
-    [double]$Value,
+    [Parameter(ParameterSetName = 'Field')]
+    [string]$Value,
 
     [Parameter(ParameterSetName = 'Reset')]
     [switch]$Reset
@@ -182,8 +188,33 @@ function Write-TuningBlock {
     }
 }
 
+# ── Usage helper (mirrors the bash `usage()` — stderr + exit 64) ─────────
+function Show-Usage {
+    [Console]::Error.WriteLine(@"
+Usage:
+  vct_retrieval_tuning_set.ps1 -Field NAME -Value V
+  vct_retrieval_tuning_set.ps1 -Reset
+
+Fields: code_graph_score_floor, kg_tier_min, kg_tier_single_chunk,
+        kg_tier_three_chunks, kg_tier_full
+
+Exit codes:
+  0  success
+  1  disk error
+  2  validation failed (out-of-range / ordering)
+  4  unknown field name
+  64 usage error
+"@)
+}
+
 # ── Main ────────────────────────────────────────────────────────────────
-if ($PSCmdlet.ParameterSetName -eq 'Reset') {
+if ($Reset) {
+    # F-9: --reset is mutually exclusive with -Field / -Value (mirror .sh:285).
+    if ($Field -or $Value) {
+        Write-VctWarn "-Reset is mutually exclusive with -Field / -Value"
+        Show-Usage
+        exit 64
+    }
     $block = [ordered]@{}
     foreach ($k in $DefaultTuning.Keys) {
         $block[$k] = $DefaultTuning[$k]
@@ -192,9 +223,31 @@ if ($PSCmdlet.ParameterSetName -eq 'Reset') {
     exit 0
 }
 
-# Field/Value mode: load existing values, swap the named field,
-# validate the whole block, write.
+# F-9: Field/Value mode. Both required (usage → 64), field must be known
+# (unknown → 4), value must be numeric (usage → 64) — EXPLICIT checks that
+# emit the SAME codes as the bash sibling instead of a binder exit 1.
+if (-not $Field -or -not $Value) {
+    Write-VctWarn "either -Reset or both -Field NAME -Value V required"
+    Show-Usage
+    exit 64
+}
+if (-not $DefaultTuning.Contains($Field)) {
+    Write-VctWarn "unknown field: $Field"
+    exit 4
+}
+[double]$parsedValue = 0
+if (-not [double]::TryParse(
+        $Value,
+        [System.Globalization.NumberStyles]::Float,
+        [System.Globalization.CultureInfo]::InvariantCulture,
+        [ref]$parsedValue)) {
+    Write-VctWarn "-Value must be numeric (got: $Value)"
+    Show-Usage
+    exit 64
+}
+
+# Load existing values, swap the named field, validate the whole block, write.
 $existing = Read-ExistingTuning
-$existing[$Field] = [double]$Value
+$existing[$Field] = $parsedValue
 Write-TuningBlock -Tuning $existing
 exit 0
