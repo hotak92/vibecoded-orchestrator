@@ -140,6 +140,7 @@ from vco_lib import bundled_versions as _bundled_versions  # noqa: E402
 from vco_lib import project_init as _project_init  # noqa: E402
 from vco_lib import secrets_audit as _secrets_audit  # noqa: E402
 from vco_lib.deferral_report import DeferralEntry, DeferralReport  # noqa: E402
+from vco_lib.install_update_gate import InstallUpdateGate  # noqa: E402
 
 # ── A-2 (v0.2.73): install.py's deferral-ownership set ──────────────────────
 #
@@ -4350,34 +4351,10 @@ import atexit as _atexit
 _atexit.register(_release_main_entry_lock_atexit)
 
 
-def _refresh_update_lockfile_deadline(phase: str) -> None:
-    """A-6 (v0.2.73): re-extend the update-in-progress lockfile deadline at a
-    major phase transition.
-
-    ``update_gate.write_lockfile`` recomputes ``expected_completion_by`` from
-    ``now`` on every call, so re-calling it at each long phase boundary
-    prevents the fixed 15-minute deadline from silently expiring mid-update
-    on weak hardware / cold cache (venv rebuild + Ollama pulls + cargo build
-    can each exceed 15 min). A stale-because-slow lockfile would let an MCP
-    respawn against a mid-swap binary — the exact V52-AI fork-bomb the gate
-    exists to prevent. Mirrors the Rust ``update_gate.rs::advance_phase``
-    deadline-refresh contract for the launcher-driven path.
-
-    Best-effort + soft-fail: a lockfile write failure here must never abort
-    the update (the atexit delete + boot-time stale cleanup remain the
-    backstops). Only meaningful during ``--update``; a no-op if the module or
-    lockfile can't be reached.
-    """
-    try:
-        from vco_lib import update_gate as _vco_update_gate
-        # Only refresh if a lockfile already exists (i.e. we're in the
-        # update flow that wrote one at start). Writing one here on a fresh
-        # install would be spurious.
-        if _vco_update_gate.read_lockfile() is None:
-            return
-        _vco_update_gate.write_lockfile(phase=phase, expected_duration_min=15)
-    except Exception as e:  # noqa: BLE001 — soft-fail
-        print(f"[update_gate] deadline refresh soft-failed ({phase}): {e}")
+# A-6 (v0.2.73) deadline refresh + V52-AI initial lockfile write: extracted
+# to vco_lib.install_update_gate.InstallUpdateGate (P2c-a, v0.2.75) — main()
+# holds thin gate.begin()/gate.refresh(phase) call sites. The P3a rider
+# (absent-lockfile RE-CREATE during --update) lives there too.
 
 
 def _install_singleton_lock_or_die(timeout_seconds: float = 15.0):
@@ -5938,30 +5915,14 @@ def main() -> int:
     print("=" * 62)
     print()
 
-    # V52-AI (v0.2.52, 2026-06-09): MCP fork-bomb mitigation. Mirrors
-    # the launcher's update_orchestrator gate so CLI-only updaters
-    # (users running `python install.py --update` directly without
-    # going through the launcher GUI) get the same protection.
-    #
-    # The launcher path also writes a lockfile via Rust's
-    # UpdateInProgressGuard; if both are active, the second write
-    # extends the deadline — same atomic semantics either way.
-    #
-    # atexit covers every exit path (clean return, sys.exit, raised
-    # exception, signal). The lockfile's expected_completion_by
-    # (15 min) is the second line of defense if even atexit fails to
-    # fire (e.g. SIGKILL) — the launcher's boot-time stale cleanup
-    # then removes it on next start.
-    if mode == "update":
-        try:
-            import atexit as _atexit
-            from vco_lib import update_gate as _vco_update_gate
-            _vco_update_gate.write_lockfile(
-                phase="install_py", expected_duration_min=15
-            )
-            _atexit.register(_vco_update_gate.delete_lockfile)
-        except Exception as e:  # noqa: BLE001 — soft-fail
-            print(f"[update_gate] failed to write lockfile (soft-fail): {e}")
+    # V52-AI (v0.2.52) MCP fork-bomb mitigation + A-6 deadline refreshes.
+    # Choreography lives in vco_lib.install_update_gate (P2c-a, v0.2.75):
+    # begin() writes the lockfile + arms the atexit delete on --update
+    # (no-op on fresh installs); the gate.refresh(phase) call sites below
+    # re-extend the 15-min deadline at each long phase boundary and
+    # RE-CREATE an absent lockfile mid-update (P3a rider).
+    _update_gate_flow = InstallUpdateGate(mode)
+    _update_gate_flow.begin()
 
     # Mark the start of this install session in the durable log. Subsequent
     # events from install.py + post-install-launcher.sh share the same log.
@@ -6134,6 +6095,13 @@ def main() -> int:
             # UPDATE_DEFERRED warning if a personal instance is also
             # responding so the user sees the divergence post-install.
             _emit_dual_ollama_deferral(_deferral_report)
+
+        # A-6 rider (P3a, v0.2.75): venv/container/model-pull phase done —
+        # re-extend the update-gate deadline before the collections/seed
+        # phase. Pre-rider the FIRST refresh only fired after the seed, so
+        # the initial 15-min window had to cover venv rebuild + container
+        # start + multi-GB Ollama pulls + the seed in one stretch.
+        _update_gate_flow.refresh("install_py")
 
         # Bug 29: with shared-container reuse, multiple installs hit the same
         # Weaviate. Bootstrap any of THIS project's KG/Development collections
@@ -6389,8 +6357,7 @@ def main() -> int:
         # A-6: seed/collections phase done — re-extend the update-gate
         # deadline before the schema-migration + resync + binary-refresh
         # tail (Ollama pulls during seed are a common 15-min-blower).
-        if mode == "update":
-            _refresh_update_lockfile_deadline("install_py")
+        _update_gate_flow.refresh("install_py")
 
         # PR-24 (v0.2.12, 2026-05-16): schema-correctness migrations.
         # Run AFTER _seed_weaviate so the collections exist before we
@@ -6707,8 +6674,7 @@ def main() -> int:
         # A-6: entering the binary-refresh phase — re-extend the update-gate
         # deadline so a slow prior phase (venv/seed) hasn't already let it
         # expire while the binary swap is still ahead.
-        if mode == "update":
-            _refresh_update_lockfile_deadline("binary_refresh")
+        _update_gate_flow.refresh("binary_refresh")
         try:
             _refresh_dist_binary_after_rebuild(
                 PROJECT_ROOT,

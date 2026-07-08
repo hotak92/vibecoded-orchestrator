@@ -29,7 +29,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import install  # noqa: E402
-from vco_lib import update_gate  # noqa: E402
 from vco_lib.deferral_report import DeferralReport  # noqa: E402
 
 _IS_WINDOWS = platform.system().lower().startswith("win")
@@ -131,39 +130,14 @@ class TestAtomicBinarySwap(unittest.TestCase):
             self.assertEqual(leftovers, [], f"orphan temp files: {leftovers}")
 
 
-class TestUpdateGateDeadlineRefresh(unittest.TestCase):
-    def test_refresh_extends_deadline_when_lockfile_present(self):
-        with tempfile.TemporaryDirectory() as td:
-            lock = Path(td) / ".update-in-progress.json"
-            with mock.patch.object(update_gate, "lockfile_path", return_value=lock):
-                # Seed a lockfile with a deadline far in the past-ish.
-                update_gate.write_lockfile(phase="install_py", expected_duration_min=15, path=lock)
-                first = update_gate.read_lockfile(lock)
-                time.sleep(1.1)
-                install._refresh_update_lockfile_deadline("binary_refresh")
-                second = update_gate.read_lockfile(lock)
-            self.assertIsNotNone(first)
-            self.assertIsNotNone(second)
-            self.assertEqual(second["phase"], "binary_refresh")
-            # New deadline is strictly later (recomputed from now).
-            self.assertGreater(
-                second["expected_completion_by"], first["expected_completion_by"]
-            )
-
-    def test_refresh_is_noop_when_no_lockfile(self):
-        with tempfile.TemporaryDirectory() as td:
-            lock = Path(td) / ".update-in-progress.json"
-            with mock.patch.object(update_gate, "lockfile_path", return_value=lock):
-                # No lockfile written → refresh must NOT create one.
-                install._refresh_update_lockfile_deadline("binary_refresh")
-                self.assertFalse(lock.exists())
-
-    def test_refresh_soft_fails_on_write_error(self):
-        """A write failure must not raise into the caller."""
-        with mock.patch.object(update_gate, "read_lockfile", return_value={"phase": "x"}):
-            with mock.patch.object(update_gate, "write_lockfile", side_effect=OSError("boom")):
-                # Should not raise.
-                install._refresh_update_lockfile_deadline("install_py")
+# A-6 deadline-refresh coverage MOVED (P2c-a, v0.2.75): the
+# `_refresh_update_lockfile_deadline` helper was extracted to
+# `vco_lib.install_update_gate.InstallUpdateGate`, and the P3a rider
+# deliberately CHANGED the absent-lockfile behaviour during --update
+# (re-create instead of no-op). The full matrix — extend-on-present,
+# re-create-on-absent-mid-update, no-op-on-fresh-install, soft-fail,
+# atexit-once, and the main() call-site structural guards — lives in
+# tests/test_install_update_gate_v0275.py.
 
 
 if __name__ == "__main__":
