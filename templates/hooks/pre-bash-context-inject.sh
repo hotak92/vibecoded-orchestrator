@@ -114,6 +114,13 @@ if command -v codegraph_bash_gate >/dev/null 2>&1 && codegraph_bash_gate "$COMMA
     if command -v codegraph_extract_symbol >/dev/null 2>&1; then
         _CG_SYM="$(codegraph_extract_symbol "$COMMAND")"
     fi
+    # P1e (v0.2.75): codegraph_extract_symbol now returns EMPTY when no
+    # discrete code symbol is isolable (env-assignment / path-only / regex
+    # fragment / `git diff sha..HEAD` etc.). An empty symbol means NO
+    # injection — a garbage whole-command query is worse than none. Skip
+    # explicitly here (codegraph_query_block also guards on empty query, but
+    # the explicit skip keeps the no-injection contract obvious).
+    if [ -n "$_CG_SYM" ]; then
     # v0.2.72 P2: the extracted symbol doubles as the --anchor (5th arg) so the
     # CLI's shared pipeline biases the rerank toward code call-linked to it.
     _CG_RAW="$(codegraph_query_block "$_CG_SYM" "" 2 "" "$_CG_SYM" 2>/dev/null || true)"
@@ -135,6 +142,7 @@ if command -v codegraph_bash_gate >/dev/null 2>&1 && codegraph_bash_gate "$COMMA
                 ;;
         esac
     fi
+    fi  # P1e: end empty-symbol guard
 fi
 
 # === Threshold gate ===

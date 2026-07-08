@@ -121,24 +121,51 @@ function Test-VcoCodegraphBashGate {
     return $false
 }
 
-# Get-VcoCodegraphSymbol <Text> -- first symbol/path token the gate matched
-# (query), capped to 200 chars; whole text when no discrete token isolable.
+# Get-VcoCodegraphSymbol <Text> -- first REAL code-symbol/path token (query),
+# capped to 200 chars. P1e (v0.2.75): reject env-assignments, non-code paths,
+# regex/glob fragments, redirects, URLs; return EMPTY when no discrete symbol
+# is isolable (the caller then skips injection — a garbage whole-command query
+# is worse than none). MUST MATCH codegraph-query.sh codegraph_extract_symbol.
+$script:CgqNonCodeExtRe = '\.(log|txt|json|jsonl|yaml|yml|toml|lock|tar|gz|zip|md|html|css)$'
+$script:CgqSourceExtRe  = '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$'
 function Get-VcoCodegraphSymbol {
     param([string]$Text)
     $tok = ""
     foreach ($word in ($Text -split '\s+')) {
         $w = $word.Trim('"').Trim("'")
+        if (-not $w) { continue }
         if ($w.StartsWith("-")) { continue }   # skip flags
-        if ($w -match '^[^\s]+\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$' `
-            -or $w -match '[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_]' `
-            -or $w -match '[A-Z][a-z]+[A-Z]' `
-            -or $w -match '[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+' `
-            -or $w -match '[A-Za-z_][A-Za-z0-9_]*\(') {
+        # NOTE: -cmatch (case-SENSITIVE) throughout to mirror bash's `[[ =~ ]]`
+        # (which is case-sensitive). PowerShell's bare -match is
+        # case-INSENSITIVE, which would make the CamelCase rule
+        # `[A-Z][a-z]+[A-Z]` match ANY 3+ letter word (e.g. `curl`) — a
+        # divergence P1e's fixture-parity tests caught.
+        # P1e: skip env-assignments (FOO=bar / LEAN_CTX_OFF=1).
+        if ($w -cmatch '^[A-Za-z_][A-Za-z0-9_]*=') { continue }
+        # P1e: skip redirects (2>, >>, <) and URLs.
+        if ($w -cmatch '^[0-9]*[<>]') { continue }
+        if ($w -cmatch '^https?://') { continue }
+        # P1e: skip words with regex/glob metacharacters. `(` deliberately
+        # allowed so a `symbol(` call-shape still matches below.
+        if ($w -cmatch '[\\|\^\$\[\*\?]') { continue }
+        # P1e: a `/`-bearing word qualifies ONLY as a real SOURCE file
+        # (source extension AND not a non-code extension); else skip.
+        if ($w -like '*/*') {
+            if (($w -cmatch $script:CgqSourceExtRe) -and -not ($w -cmatch $script:CgqNonCodeExtRe)) {
+                $tok = $w; break
+            }
+            continue
+        }
+        if ($w -cmatch $script:CgqSourceExtRe `
+            -or $w -cmatch '[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_]' `
+            -or $w -cmatch '[A-Z][a-z]+[A-Z]' `
+            -or $w -cmatch '[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+' `
+            -or $w -cmatch '[A-Za-z_][A-Za-z0-9_]*\(') {
             $tok = $w
             break
         }
     }
-    if (-not $tok) { $tok = $Text }
+    # P1e: NO whole-text fallback — empty means "no isolable symbol".
     if ($tok.Length -gt 200) { $tok = $tok.Substring(0, 200) }
     return $tok
 }

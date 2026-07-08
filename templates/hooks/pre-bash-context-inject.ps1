@@ -87,10 +87,15 @@ if ((Get-Command Test-VcoCodegraphBashGate -ErrorAction SilentlyContinue) -and (
         $cgSym = Get-VcoCodegraphSymbol -Text $Command
     }
     $cgRaw = ""
+    # P1e (v0.2.75): Get-VcoCodegraphSymbol now returns EMPTY when no discrete
+    # code symbol is isolable (env-assignment / path-only / regex fragment /
+    # `git diff sha..HEAD` etc.). An empty symbol means NO injection — a
+    # garbage whole-command query is worse than none. Skip explicitly (the
+    # query helper also guards on empty, but the explicit skip keeps the
+    # no-injection contract obvious). MUST MATCH pre-bash-context-inject.sh.
     # v0.2.72 P2: the extracted symbol doubles as -Anchor so the CLI's shared
-    # pipeline biases the rerank toward code call-linked to it. MUST MATCH
-    # pre-bash-context-inject.sh.
-    if (Get-Command Invoke-VcoCodegraphQueryBlock -ErrorAction SilentlyContinue) {
+    # pipeline biases the rerank toward code call-linked to it.
+    if ($cgSym -and (Get-Command Invoke-VcoCodegraphQueryBlock -ErrorAction SilentlyContinue)) {
         $cgRaw = Invoke-VcoCodegraphQueryBlock -Query $cgSym -ProjectArg "" -Limit 2 -ExcludePath "" -Anchor $cgSym
     }
     if ($cgRaw) {

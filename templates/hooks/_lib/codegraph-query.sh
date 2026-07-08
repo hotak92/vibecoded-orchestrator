@@ -197,6 +197,23 @@ codegraph_bash_gate() {
 # tolerates extra context). Matches dotted / CamelCase / snake_case / name( /
 # code-file path shapes — the union of the gate rules so the QUERY is the symbol,
 # not the noisy `grep -rn ...` wrapper.
+# P1e (v0.2.75): the extractor previously matched env-assignments
+# (LEAN_CTX_OFF=1 via the snake_case rule), non-code paths (/tmp/*.log via
+# the dotted rule), grep regex/glob fragments, redirects, and URLs — and,
+# worst, fell back to the WHOLE COMMAND TEXT when nothing matched, issuing
+# garbage queries for e.g. `git diff <sha>..HEAD`. Now: reject those word
+# shapes, require a `/`-bearing word to be a REAL source file (extension
+# allow-list minus a non-code deny-list), and return EMPTY when no discrete
+# symbol is isolable — the caller then skips injection entirely (a garbage
+# query is worse than no query). MUST MATCH codegraph-query.ps1.
+#
+# Non-code extension deny-list for words containing `/` (path-shaped words).
+# A path is only a useful codegraph query when it names a SOURCE file; a
+# `/var/log/app.log` or `/etc/foo.yaml` is noise. Kept as a single string
+# so the .ps1 sibling can mirror it verbatim.
+_CGQ_NONCODE_EXT_RE='\.(log|txt|json|jsonl|yaml|yml|toml|lock|tar|gz|zip|md|html|css)$'
+_CGQ_SOURCE_EXT_RE='\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$'
+
 codegraph_extract_symbol() {
     local text="$1"
     local tok=""
@@ -205,7 +222,29 @@ codegraph_extract_symbol() {
         local w="${word#\"}"; w="${w%\"}"; w="${w#\'}"; w="${w%\'}"
         # skip flags / options
         case "$w" in -*) continue ;; esac
-        if [[ "$w" =~ ^[^[:space:]]+\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$ ]] \
+        [ -z "$w" ] && continue
+        # P1e: skip env-assignments (FOO=bar / LEAN_CTX_OFF=1).
+        [[ "$w" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && continue
+        # P1e: skip redirects (`2>`, `>>`, `<`) and URLs (http/https).
+        [[ "$w" =~ ^[0-9]*[\<\>] ]] && continue
+        [[ "$w" =~ ^https?:// ]] && continue
+        # P1e: skip words carrying regex/glob metacharacters (grep/rg
+        # patterns, globs). `(` is deliberately NOT in this set so a
+        # `symbol(` call-shape still matches below. Check each metachar
+        # explicitly (a bracket-expression around these is brittle).
+        case "$w" in
+            *'\'*|*'|'*|*'^'*|*'$'*|*'['*|*'*'*|*'?'*) continue ;;
+        esac
+        # P1e: a word containing `/` qualifies ONLY as a real SOURCE file —
+        # source extension AND not a non-code extension. Otherwise skip
+        # (paths like /tmp/x.log or a bare dir are not symbols).
+        if [[ "$w" == */* ]]; then
+            if [[ "$w" =~ $_CGQ_SOURCE_EXT_RE ]] && ! [[ "$w" =~ $_CGQ_NONCODE_EXT_RE ]]; then
+                tok="$w"; break
+            fi
+            continue
+        fi
+        if [[ "$w" =~ $_CGQ_SOURCE_EXT_RE ]] \
             || [[ "$w" =~ [A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_] ]] \
             || [[ "$w" =~ [A-Z][a-z]+[A-Z] ]] \
             || [[ "$w" =~ [A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+ ]] \
@@ -214,6 +253,8 @@ codegraph_extract_symbol() {
             break
         fi
     done
-    [ -z "$tok" ] && tok="$text"
+    # P1e: NO whole-text fallback — empty means "no isolable symbol", and
+    # the caller must then skip injection (verify pre-bash-context-inject.sh
+    # + pre-tool-use.sh handle an empty symbol as no-injection).
     printf '%s' "${tok:0:200}"
 }
