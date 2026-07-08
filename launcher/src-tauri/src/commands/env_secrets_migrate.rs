@@ -352,4 +352,131 @@ DB_PASSWORD=__vco_keychain__
         let res = rewrite_env_with_sentinels(env, &["TOKEN".to_string()]);
         assert_eq!(res.text, "TOKEN=__vco_keychain__");
     }
+
+    // ── Cross-language parity (v0.2.75 Part 7 / Part 10) ─────────────────
+    //
+    // The Rust side of the shared `tests/fixtures/env_secrets_parity.json`.
+    // `tests/test_env_secrets_migrate_parity.py` consumes the SAME fixture for
+    // the Python `vco_lib.secrets_audit` — so a divergence between this mirror
+    // and the Python auditor/rewriter fails one of the two runners. Comment-only
+    // "MUST MATCH" parity is a fork risk (B-3 lesson); this fixture makes the
+    // contract executable. Fixture path resolved from `CARGO_MANIFEST_DIR`
+    // (= `launcher/src-tauri/`) → two parents up to the repo root (same walk as
+    // `tests/project_naming_parity.rs`).
+
+    #[derive(serde::Deserialize)]
+    struct SecretsFixture {
+        #[serde(rename = "_format_version", default)]
+        format_version: u32,
+        cases: Vec<SecretsCase>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct SecretsCase {
+        name: String,
+        input: String,
+        audit_expected: Vec<AuditPair>,
+        rewrite: RewriteCase,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct AuditPair {
+        key: String,
+        value: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RewriteCase {
+        migrated_keys: Vec<String>,
+        expected_text: String,
+        expected_replaced: usize,
+        expected_missed: Vec<String>,
+    }
+
+    fn load_secrets_fixture() -> SecretsFixture {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("CARGO_MANIFEST_DIR must have two parents (repo layout)");
+        let fixture_path = repo_root
+            .join("tests")
+            .join("fixtures")
+            .join("env_secrets_parity.json");
+        assert!(
+            fixture_path.exists(),
+            "Parity fixture missing: {} — shared with \
+             tests/test_env_secrets_migrate_parity.py",
+            fixture_path.display()
+        );
+        let raw = std::fs::read_to_string(&fixture_path)
+            .unwrap_or_else(|e| panic!("read {}: {}", fixture_path.display(), e));
+        let fix: SecretsFixture = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("parse {}: {}", fixture_path.display(), e));
+        assert_eq!(
+            fix.format_version, 1,
+            "Fixture _format_version != 1 — coordinate the bump with the Python side"
+        );
+        assert!(!fix.cases.is_empty(), "Fixture has no cases");
+        fix
+    }
+
+    #[test]
+    fn env_secrets_parity_matches_shared_fixture() {
+        let fix = load_secrets_fixture();
+        let mut failures: Vec<String> = Vec::new();
+
+        for case in &fix.cases {
+            // Audit parity: same (key, value) pairs, same order.
+            let got = audit_env_secrets(&case.input);
+            let expected: Vec<EnvSecret> = case
+                .audit_expected
+                .iter()
+                .map(|p| EnvSecret {
+                    key: p.key.clone(),
+                    value: p.value.clone(),
+                })
+                .collect();
+            if got != expected {
+                failures.push(format!(
+                    "  [{}] audit: got {:?}, expected {:?}",
+                    case.name, got, expected
+                ));
+            }
+
+            // Rewrite parity: same text, same replaced count, same missed set.
+            let res = rewrite_env_with_sentinels(&case.input, &case.rewrite.migrated_keys);
+            if res.text != case.rewrite.expected_text {
+                failures.push(format!(
+                    "  [{}] rewrite text: got {:?}, expected {:?}",
+                    case.name, res.text, case.rewrite.expected_text
+                ));
+            }
+            if res.replaced != case.rewrite.expected_replaced {
+                failures.push(format!(
+                    "  [{}] rewrite replaced: got {}, expected {}",
+                    case.name, res.replaced, case.rewrite.expected_replaced
+                ));
+            }
+            let mut got_missed = res.missed.clone();
+            got_missed.sort();
+            let mut want_missed = case.rewrite.expected_missed.clone();
+            want_missed.sort();
+            if got_missed != want_missed {
+                failures.push(format!(
+                    "  [{}] rewrite missed: got {:?}, expected {:?}",
+                    case.name, got_missed, want_missed
+                ));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "Rust .env secret auditor/rewriter diverges from the shared fixture \
+             in {} case(s):\n{}\nIf intentional, regenerate the fixture AND update \
+             vco_lib/secrets_audit.py in the same commit.",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
 }
