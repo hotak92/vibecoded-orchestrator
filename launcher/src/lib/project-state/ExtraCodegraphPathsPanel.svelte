@@ -407,35 +407,6 @@
     }
   }
 
-  // ─── Tauri event subscription (best-effort) ────────────────────────
-
-  // If Agent A's commands emit a `module://codegraph-extras-sync-progress`
-  // event, subscribe so we can refresh the visible list when an analyze
-  // completes out-of-band (e.g. triggered by a hook). Soft-fail: the
-  // listener returns a no-op unlisten in browser mode. We can't make
-  // onMount async itself (its return must be the sync cleanup fn), so
-  // we kick off the subscription in a self-running IIFE and clean up
-  // via a captured handle.
-  let unlistenProgress: (() => void) | null = null;
-  onMount(() => {
-    void (async () => {
-      try {
-        const { listen } = await import('$lib/tauri');
-        unlistenProgress = await listen<unknown>(
-          'module://codegraph-extras-sync-progress',
-          () => {
-            void load();
-          },
-        );
-      } catch {
-        // Event channel unavailable in this runtime — ignore.
-      }
-    })();
-    return () => {
-      unlistenProgress?.();
-    };
-  });
-
   // ─── Dev-only: expose invoke for parent tab fallbacks. ─────────────
   // (Some other tabs use a top-level invoke import; keep ours scoped
   // to the API wrapper.)
