@@ -198,6 +198,96 @@ class SafeAddBundleTests(unittest.TestCase):
         self.assertIn("UserTool", merged["permissions"]["allow"])
         self.assertIn("hooks", merged)
 
+    def test_env_projection_fully_active_under_safe_add(self):
+        """F2.3 end-to-end: the v0.2.63 safe-add contract promises that ONLY
+        the project-root `.env` merge is skipped — the two VCO-owned env
+        channels (`.claude/env` shell channel + `.claude/settings.json` env
+        block, both consumed for KG routing) are STILL projected in full.
+
+        `install_project_bundle(safe_add=True)` owns the `.env` skip + sidecar
+        deferral; the canonical env projection is a SEPARATE step
+        (`apply_project_env`, the Python entry the Rust launcher shells out to
+        UNCONDITIONALLY, before the safe-add branch runs). This test drives
+        BOTH halves against one safe-add project and asserts:
+          1. project-root `.env` byte-for-byte untouched,
+          2. `.env.vco.reference` sidecar present,
+          3. `safe_add_skipped_env_merge` deferral emitted,
+          4. `.claude/env` carries the canonical KG routing exports,
+          5. `.claude/settings.json` env block carries the same canonical
+             values — proving per-project KG routing is NOT degraded.
+        """
+        from vco_lib.config_projection import (
+            CLAUDE_ENV_MANAGED_BEGIN,
+            apply_project_env,
+        )
+
+        self._write_env_sidecar()
+        # (1)-(3): the bundle step (safe-add) — .env skip + sidecar deferral.
+        self._run(safe_add=True)
+        self.assertEqual(
+            self.env_path.read_text(encoding="utf-8"),
+            self.env_original,
+            "safe-add must NOT touch the project-root .env",
+        )
+        self.assertTrue(
+            (self.proj / _ENV_SIDECAR).exists(),
+            "the .env.vco.reference sidecar must be present under safe-add",
+        )
+        self.assertIn("safe_add_skipped_env_merge", self._deferral_ids())
+
+        # (4)-(5): the canonical env projection — the step the Rust launcher
+        # runs UNCONDITIONALLY (safe-add does not gate it). Mirror the DB-
+        # sourced ProjectEnvBundle shape used by the byte-identical parity
+        # test. Generic project name — no personal-project descriptors.
+        bundle = {
+            "canonical_env": {
+                "KG_COLLECTION": "Project_KnowledgeGraph",
+                "DEVELOPMENT_COLLECTION": "Project_Development",
+                "SHARED_KG_COLLECTION": "VibeCodedOrchestrator_KnowledgeGraph",
+                "SHARED_KG_WRITE_DISABLED": "false",
+                "SHARED_KG_OPT_OUT": "false",
+                "PROJECT_NAME": "Project",
+                "CODE_GRAPH_PROJECT": "Project",
+                "ACTIVE_EMBEDDING": "qwen3",
+                "WEAVIATE_URL": "http://localhost:8081",
+                "WEAVIATE_PORT": "8081",
+                "OLLAMA_URL": "http://localhost:11435",
+                "OLLAMA_PORT": "11435",
+                "CODE_EMBED_URL": "http://localhost:11440",
+                "CODE_EMBED_PORT": "11440",
+            },
+            "project_id": "safe-add-fixture",
+            "project_root": self.proj,
+        }
+        apply_project_env(bundle, surfaces=["claude_env", "claude_settings_json"])
+
+        # (4) .claude/env — VCO's shell channel — carries canonical exports.
+        claude_env = (self.proj / ".claude" / "env").read_text(encoding="utf-8")
+        self.assertIn(CLAUDE_ENV_MANAGED_BEGIN, claude_env)
+        self.assertIn(
+            'export KG_COLLECTION="Project_KnowledgeGraph"', claude_env,
+            "safe-add must NOT skip the .claude/env KG routing projection",
+        )
+        self.assertIn('export PROJECT_NAME="Project"', claude_env)
+
+        # (5) .claude/settings.json env block — the MCP channel — matches.
+        settings = json.loads(
+            self.claude_settings.read_text(encoding="utf-8")
+        )
+        self.assertEqual(settings["env"]["KG_COLLECTION"], "Project_KnowledgeGraph")
+        self.assertEqual(settings["env"]["PROJECT_NAME"], "Project")
+        # And the earlier bundle merge is still intact (env projection is a
+        # separate, non-clobbering surface).
+        self.assertIn("UserTool", settings["permissions"]["allow"])
+
+        # Cross-check: the live project-root .env is STILL the user's original
+        # (env projection wrote the .claude surfaces, never the committed .env).
+        self.assertEqual(
+            self.env_path.read_text(encoding="utf-8"),
+            self.env_original,
+            "env projection must target .claude/ surfaces, never the committed .env",
+        )
+
     def test_vscode_settings_still_backfills_under_safe_add(self):
         """Scope correction: .vscode/settings.json is NOT gated by safe-add."""
         self._write_env_sidecar()
