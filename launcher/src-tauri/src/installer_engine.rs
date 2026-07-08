@@ -253,6 +253,35 @@ async fn run_install_inner(
             // release yet). If `tag` is already the cpu variant, or the
             // manifest declares no variants, the fallback is None.
             let fallback = cpu_fallback_tag(manifest, &base_tag, gpu_mode);
+
+            // E-3 (v0.2.75): pullability pre-flight BEFORE any download
+            // UX. Blocks only on a DEFINITIVE anonymous 404 for the
+            // requested tag AND (when one exists) the cpu-fallback tag —
+            // a missing gpu variant with a published cpu variant is the
+            // VariantFallback path, not an absent image. 401/403 and
+            // transport errors pass through (see PreflightVerdict docs).
+            if preflight_registry_manifest(container, &tag).await
+                == PreflightVerdict::DefinitivelyAbsent
+            {
+                let fallback_available = match fallback.as_deref() {
+                    Some(fb) if fb != tag => {
+                        preflight_registry_manifest(container, fb).await
+                            != PreflightVerdict::DefinitivelyAbsent
+                    }
+                    _ => false,
+                };
+                if !fallback_available {
+                    return Err(format!(
+                        "The publisher's image for module '{}' is not yet available \
+                         on the registry ({}:{} — the registry reports it absent). \
+                         No download was started. This is a publisher-side gap, not \
+                         a problem on your machine: try again once the publisher \
+                         finishes releasing this version, or contact them.",
+                        manifest.id, container.image, tag
+                    ));
+                }
+            }
+
             // v0.2.67: tell the GUI we're about to pull (the slow + most
             // failure-prone phase). Without this the tile showed a static
             // spinner across the entire pull. Coarse percent (45) — the
@@ -1678,6 +1707,98 @@ fn infer_registry_from_image(image: &str) -> String {
         .split_once('/')
         .map(|(head, _)| head.to_string())
         .unwrap_or_else(|| "docker.io".to_string())
+}
+
+// ─── E-3 (v0.2.75): launcher-side pullability pre-flight ────────────────
+//
+// Before ANY download UX starts (pull-token request, InstallStage::Pulling
+// emission, podman pull), issue one cheap anonymous HTTP probe of the
+// registry's manifest endpoint. Purpose: catch the "publisher announced
+// the module in the L0 catalog but never pushed the image" case with a
+// clear, user-facing error INSTEAD of a mid-install pull failure after
+// the user has already watched a progress bar.
+//
+// Deliberately conservative — only a DEFINITIVE anonymous 404 blocks:
+//   * GHCR answers 401 to every anonymous manifest request (even for
+//     public repos), so 401/403 is "auth-gated but answering" = PASS;
+//     the authed pull that follows gives the real answer.
+//   * Network errors / timeouts / 5xx are "no opinion" = PASS — a flaky
+//     probe must never block a valid install.
+
+/// Verdict of the anonymous registry-manifest probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreflightVerdict {
+    /// 2xx — manifest anonymously visible.
+    Present,
+    /// 401 / 403 — registry gates manifests behind auth (GHCR does this
+    /// for every repo). Presumed present; the authed pull decides.
+    AuthGatedPresumedPresent,
+    /// 404 — the registry answered and named the repo/tag absent.
+    DefinitivelyAbsent,
+    /// Transport error / timeout / 5xx / anything else — no opinion.
+    Inconclusive,
+}
+
+/// Pure status→verdict classification (unit-tested; the decision core of
+/// the probe).
+pub(crate) fn classify_manifest_probe_status(status: Option<u16>) -> PreflightVerdict {
+    match status {
+        Some(s) if (200..300).contains(&s) => PreflightVerdict::Present,
+        Some(401) | Some(403) => PreflightVerdict::AuthGatedPresumedPresent,
+        Some(404) => PreflightVerdict::DefinitivelyAbsent,
+        _ => PreflightVerdict::Inconclusive,
+    }
+}
+
+/// Build the Docker Registry HTTP API v2 manifest URL for `image:tag`.
+/// `image` is the manifest's fully-qualified reference WITHOUT a tag
+/// (e.g. "ghcr.io/hotak92/vct-rl-reranker"); the registry prefix is
+/// stripped to form the repository path.
+pub(crate) fn build_manifest_probe_url(registry: &str, image: &str, tag: &str) -> String {
+    let prefix = format!("{}/", registry);
+    let repo = image.strip_prefix(&prefix).unwrap_or(image);
+    format!("https://{}/v2/{}/manifests/{}", registry, repo, tag)
+}
+
+/// Probe one manifest URL. GET (not HEAD — a few registry frontends 405
+/// HEAD) with the standard manifest Accept set; the body is a few KB at
+/// most and is discarded. 10s timeout; every transport failure maps to
+/// `Inconclusive` via `classify_manifest_probe_status`.
+pub(crate) async fn probe_manifest_url(url: &str) -> PreflightVerdict {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return PreflightVerdict::Inconclusive,
+    };
+    let status = client
+        .get(url)
+        .header(
+            "Accept",
+            "application/vnd.oci.image.index.v1+json, \
+             application/vnd.oci.image.manifest.v1+json, \
+             application/vnd.docker.distribution.manifest.list.v2+json, \
+             application/vnd.docker.distribution.manifest.v2+json",
+        )
+        .send()
+        .await
+        .ok()
+        .map(|r| r.status().as_u16());
+    classify_manifest_probe_status(status)
+}
+
+/// Pre-flight a container block's `image:tag` (anonymous, no token).
+async fn preflight_registry_manifest(
+    container: &crate::manifest::ContainerInstallBlock,
+    tag: &str,
+) -> PreflightVerdict {
+    let registry = container
+        .registry
+        .clone()
+        .unwrap_or_else(|| infer_registry_from_image(&container.image));
+    let url = build_manifest_probe_url(&registry, &container.image, tag);
+    probe_manifest_url(&url).await
 }
 
 async fn git_clone(source: &str, git_ref: &str, dest: &Path) -> Result<(), String> {
@@ -4577,6 +4698,117 @@ mod tests {
             started.elapsed() < Duration::from_secs(30),
             "the 1s bound must have fired (elapsed {:?})",
             started.elapsed(),
+        );
+    }
+
+    // ── E-3 (v0.2.75): pullability pre-flight ──────────────────────────
+
+    /// Decision core: only an anonymous 404 is definitive-absent;
+    /// 401/403 is auth-gated-presumed-present (GHCR shape); everything
+    /// else is no-opinion.
+    #[test]
+    fn preflight_classification_matrix() {
+        assert_eq!(
+            classify_manifest_probe_status(Some(200)),
+            PreflightVerdict::Present
+        );
+        assert_eq!(
+            classify_manifest_probe_status(Some(401)),
+            PreflightVerdict::AuthGatedPresumedPresent
+        );
+        assert_eq!(
+            classify_manifest_probe_status(Some(403)),
+            PreflightVerdict::AuthGatedPresumedPresent
+        );
+        assert_eq!(
+            classify_manifest_probe_status(Some(404)),
+            PreflightVerdict::DefinitivelyAbsent
+        );
+        for inconclusive in [Some(429), Some(500), Some(503), None] {
+            assert_eq!(
+                classify_manifest_probe_status(inconclusive),
+                PreflightVerdict::Inconclusive,
+                "{:?} must be no-opinion (never block on a flaky probe)",
+                inconclusive
+            );
+        }
+    }
+
+    /// URL builder strips the registry prefix from the image to form
+    /// the repository path (Docker Registry HTTP API v2 shape).
+    #[test]
+    fn preflight_url_builder_strips_registry_prefix() {
+        assert_eq!(
+            build_manifest_probe_url("ghcr.io", "ghcr.io/example-org/some-module", "1.2.3"),
+            "https://ghcr.io/v2/example-org/some-module/manifests/1.2.3"
+        );
+        // Image without the registry prefix (explicit `registry` field
+        // diverging from the image string) — used verbatim.
+        assert_eq!(
+            build_manifest_probe_url("registry.example.com", "org/mod", "0.1.0-cpu"),
+            "https://registry.example.com/v2/org/mod/manifests/0.1.0-cpu"
+        );
+    }
+
+    /// Mocked-registry round-trips: present (200) / auth-gated (401) /
+    /// definitively absent (404) — no live-registry dependency. Uses the
+    /// same local-listener pattern as the module_default_weights tests.
+    #[tokio::test]
+    async fn preflight_probe_against_mocked_registry() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn spawn_mock(status_line: &'static str) -> u16 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 {}\r\nContent-Length: 2\r\nContent-Type: application/json\r\n\r\n{{}}",
+                    status_line
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            });
+            port
+        }
+
+        let present = spawn_mock("200 OK").await;
+        assert_eq!(
+            probe_manifest_url(&format!(
+                "http://127.0.0.1:{}/v2/org/mod/manifests/1.0.0",
+                present
+            ))
+            .await,
+            PreflightVerdict::Present
+        );
+
+        let gated = spawn_mock("401 Unauthorized").await;
+        assert_eq!(
+            probe_manifest_url(&format!(
+                "http://127.0.0.1:{}/v2/org/mod/manifests/1.0.0",
+                gated
+            ))
+            .await,
+            PreflightVerdict::AuthGatedPresumedPresent,
+            "auth-gated registries (GHCR anonymous shape) must PASS the pre-flight"
+        );
+
+        let absent = spawn_mock("404 Not Found").await;
+        assert_eq!(
+            probe_manifest_url(&format!(
+                "http://127.0.0.1:{}/v2/org/mod/manifests/1.0.0",
+                absent
+            ))
+            .await,
+            PreflightVerdict::DefinitivelyAbsent
+        );
+
+        // Connection-refused (nothing listening) → no opinion.
+        assert_eq!(
+            probe_manifest_url("http://127.0.0.1:1/v2/org/mod/manifests/1.0.0").await,
+            PreflightVerdict::Inconclusive
         );
     }
 }
