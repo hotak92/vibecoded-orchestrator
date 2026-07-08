@@ -394,7 +394,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -Command \"try { $payload = [Console]::In.ReadToEnd() | ConvertFrom-Json; $fp = $payload.tool_input.file_path; if ($fp) { python -m py_compile $fp 2>&1 } } catch { Write-Output \\\"Syntax error\\\" }\"",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/py-compile-check.ps1",
             "timeout": 10,
             "if": "Write(*.py)"
           }

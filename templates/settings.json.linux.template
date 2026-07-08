@@ -394,7 +394,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -c \"import json,sys,py_compile; d=json.loads(sys.stdin.read()) if not sys.stdin.isatty() else {}; fp=d.get('tool_input',{}).get('file_path',''); py_compile.compile(fp) if fp else None\" 2>&1 || echo \"Syntax error\"",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/py-compile-check.sh",
             "timeout": 10,
             "if": "Write(*.py)"
           }
