@@ -348,6 +348,8 @@ This extracts `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, and `CodeInt
 The installer fails clearly (no auto-install path) if any of these are missing — most desktop OSes have them by default, but minimal images (Alpine, NixOS minimal, stripped-down WSL distros) may not.
 
 - **`bash`** (Linux / macOS) or **`cmd.exe`** + **`PowerShell 5.1+`** (Windows) — POSIX / Windows guarantees
+
+> **Windows: install PowerShell 7+ for the native-Windows script path.** VCO's `.ps1` hooks and scripts target **PowerShell 7+**, not the PowerShell 5.1 that ships by default on Windows 10/11 — install it with `winget install Microsoft.PowerShell`. Without PowerShell 7, use WSL2 or Git Bash instead so the `.sh` (bash) hooks run.
 - **`curl` OR `wget`** — needed for downloading (when not bundled) the launcher binary from GitHub Releases. macOS always has `curl`; Linux Alpine / NixOS minimal may have neither and need `apk add curl` / `nix-env -iA curl` first
 - **`hdiutil`** (macOS only, for mounting `.dmg`) — ships with macOS
 - **`pkexec`** (Linux only, for graphical sudo prompts during Podman / apt installs) — present on most desktop distros, missing on minimal server images

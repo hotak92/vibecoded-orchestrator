@@ -304,6 +304,7 @@ status: active  # active, archived, deprecated, idea
 - Mid-level: specific domains (<200 lines)
 - Low-level: individual tools/models (<150 lines)
 - One node per tool/model/concept
+- One TOPIC per node — a pattern, mechanism, decision, or gotcha. Do NOT write release/cycle/event chronicle nodes (release records belong in memory, handoffs, or CHANGELOG.md); they are over-general, match everything, and focus nothing. If a release record must exist anyway, tag it `release-record` and set `status: archived` when the next release ships.
 - Links unidirectional (projects → concepts)
 
 **Per-project isolation**: `KG_COLLECTION` (per-project KG) and `SHARED_KG_COLLECTION` (cross-project shared, default `VibeCodedOrchestrator_KnowledgeGraph`) are set per-project via `.claude/settings.json` `env` — **the canonical channel** that propagates to MCP subprocesses on every Claude Code surface (CLI, Desktop app, VS Code extension). The active workspace determines the active KG, not which project is being discussed. The launcher's Identity tab "Manage shared KG collection" picker lets you designate an existing orchestrator-shaped class as canonical (useful when migrating from an older install whose shared collection had a different name).

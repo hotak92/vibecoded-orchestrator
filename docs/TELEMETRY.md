@@ -62,3 +62,20 @@ on anything other than `"true" / "1" / "yes" / "on"`.
 Self-host: deploy your own Supabase / equivalent edge function with a compatible request shape, set `VIBECODED_TELEMETRY_URL` to its URL, and the uploader will POST events there instead of writing to the pending file.
 
 Until then telemetry stays local, on disk, and visible.
+
+## RL retrieval telemetry — what is collected and what it means
+
+The RL retrieval reranker (Pro/MAO modules) keeps a **separate** telemetry path from the install/hardware collector above. This section documents its current-state data posture. Read it before enabling any upload endpoint — no Supabase-side upload path for this data is live yet, and this section MUST land before one is.
+
+**What is uploaded on consent.** When RL online training is enabled, an upload carries the **query embedding** (`query_emb`) plus a per-retrieved-node **embedding vector** (`emb`). The raw query **text is stripped** — it is not uploaded. What ships are the numeric vectors and the retrieval outcome labels used to train the reranker.
+
+**Why "no text" is not the same as "no content".** Embeddings are mathematically derived from your text; approximate reconstruction of content is possible in principle (embedding inversion). So this doc does not claim the upload is content-free. It is content-*reduced* — the exact wording, code, and node bodies never leave the machine — but a vector is a lossy projection of the text it came from, not a random token.
+
+**Retention.** The local RL corpus is **bounded**: a client-side prune keeps it from growing without limit, and the hub exposes a prune route for explicit cleanup. Nothing accumulates on disk indefinitely.
+
+**Opt-outs (two levels, two axes).** Both **local logging** and **online training** can be disabled independently, at either the **global** level or **per-project**:
+
+- **Global** — launcher **Preferences** (global RL prefs). Applies to every project unless a project overrides it.
+- **Per-project** — the project's settings. Overrides the global default for that one project.
+
+The **local-logging opt-out also skips the embedding COMPUTE**, not just the write — when local logging is off, the embedding is never computed in the first place, so there is no vector on disk and no CPU/GPU spent producing one. Turning training off (while leaving local logging on) keeps the local corpus for your own inspection but uploads nothing.

@@ -371,6 +371,13 @@ The pre-existing test investigator caught two P1 production bugs in the V52-M ho
 
 Both bugs were silently dead-on-arrival prior to v0.2.53; users with V52-M-aware retrieval reranker setups silently lost RL training signal. Tracked via the pre-existing-failure investigation in `.claude/context/audits/pre-existing-failure-investigation-2026-06-10.md`.
 
+### Deliberate hook/script asymmetries (not orphans or gaps)
+
+Two bundled items look like coverage gaps at a glance but are intentional — a future cleanup pass should leave them alone:
+
+- **`kg-sync-on-edit.{sh,ps1}` ships but is registered NOWHERE by default.** It is superseded by the `post-file-edit.sh` PostToolUse auto-sync (which routes `knowledge/**/*.md` to the KG collection). The dedicated hook is kept for users who want a single-purpose KG-sync hook they can wire in their own `.claude/settings.json`; it runs standalone and no-ops under `VCT_DISABLE_HOOKS=1` (verified by `tests/test_w2d_session_start_hooks_v0273.py`). Not a dead file — an opt-in one.
+- **`detect-workflow-needs` is a thin wrapper pair over a canonical `.py`.** `templates/scripts/detect_workflow_needs.py` is the pure-stdlib implementation; `detect-workflow-needs` (bash) and `detect-workflow-needs.ps1` are both thin launchers that shell out to it. The `.ps1` is not a Windows-only orphan — it has a matching bash sibling, and the OS-parity gate is satisfied because both wrappers exist. The `.py` carries the logic; the two wrappers only resolve a Python interpreter and forward argv.
+
 ---
 
 ## Per-project Agent / Skill Enable/Disable Contract (B2)

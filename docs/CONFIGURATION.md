@@ -179,6 +179,19 @@ Secrets never live in env files or JSON configs. They live in the OS keychain (m
 
 Don't put PATs or API keys in `~/.claude.json` `env:` blocks — Claude Code's env loader does not expand `${VAR}` (anthropics/claude-code#2065, #4276), so embedded secrets would land in argv and become visible to `ps`.
 
+## Permission matrices
+
+The launcher enforces four independent cross-project access matrices, each backed by its own table in `launcher.db`. They do NOT share a default: **KG is default-GRANT**, the other three are **default-DENY**. Inspecting `launcher.db` (or reading Rust accessors) without this table in front of you invites the wrong assumption that everything is default-deny. The defaults are set on project add in `launcher/src-tauri/src/commands/project_state_populate.rs`.
+
+| Matrix | Table (key) | Default on project add | How to grant more |
+|---|---|---|---|
+| **KG access** | `kg_collection_access` (project_id, collection_name) | **GRANT** — the project's OWN KG + the machine-shared KG get read rows automatically | Cross-project KG reads are explicit-grant (launcher Identity tab → KG access matrix) |
+| **Code-graph access** | `codegraph_access` (grantor_project_id, grantee_project_id) | **DENY** (empty) | Launcher Codegraph → Cross-Project Access tab |
+| **Diagrams access** | `diagram_access` (same shape as code-graph) | **DENY** (empty) | Launcher Diagrams cross-project surface |
+| **Secrets** | per-`(scope, key, requester)` active flags + grants | **DENY** for cross-project | Shared-scope secrets (Preferences → Special Secrets) are readable by requesters unless paused per-project; per-project secrets are project-only unless explicitly shared via the SecretsPanel |
+
+**Why KG grants by default but code-graph denies.** The KG read gate rejects any collection without an explicit row — so without the auto-grant, a fresh project's searches against its own KG would fail on day one. The default-grant seeds the project's own KG plus the machine-shared KG (knowledge is intentionally cross-project value: a pattern learned in one project is usually useful in the next). Source code is the opposite: it is proprietary and per-tenant, so code-graph (and diagrams, which follow the same shape) stay empty until you deliberately grant one project read access to another's. Secrets follow the same default-deny posture — cross-project reads require an explicit grant, and even a shared-scope secret can be paused for a specific requester. See the KG-vs-code-graph asymmetry table in the project `CLAUDE.md` for the read-fan-out consequences of this design.
+
 ## vct-hub (since v0.2.21)
 
 A detached local HTTP server (port 7700 default) that serves as the single source of truth for project config + secrets resolution. Lives in `launcher/dist/<arch>/vct-hub`. Outlives the launcher GUI: close the GUI, the hub keeps running so hooks / MCPs / shell scripts still resolve config.
