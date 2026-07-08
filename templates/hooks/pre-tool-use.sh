@@ -174,6 +174,21 @@ except Exception:
 # is JSON but isn't trustworthy when concatenated into another JSON string.
 # Build the JSONL line through Python so every field is properly escaped.
 # Audit fix 2026-05-07.
+#
+# D-14 (v0.2.75): the TOUCAN log lives at .claude/logs/toucan_dataset.jsonl
+# — gitignored (`.claude/logs/*.jsonl`), so it never reaches a commit and
+# is NOT on the check-no-secrets scan surface. It still needs bounding
+# because it durably duplicated whole Write `content` / whole Bash
+# `command` lines with no truncation, redaction, or size cap: any secret
+# that ever transited a tool call outlived the scrubbed original here.
+# Two mitigations below (mirrored in pre-tool-use.ps1, must-match):
+#   1. Truncate the known content-bearing fields (content / new_string /
+#      old_string / command) to _TOUCAN_FIELD_CAP chars before serialize.
+#   2. Size-cap + rotate the JSONL (oldest rows dropped) at
+#      _TOUCAN_MAX_BYTES so it can't grow unbounded.
+# We do NOT add the log to a scanner surface: post-fix it holds only
+# truncated fragments, and it's gitignored — an ignore-with-rationale, not
+# a scan target.
 TOUCAN_LOG="$PROJECT_ROOT/.claude/logs/toucan_dataset.jsonl"
 TOUCAN_JSONL=$(USER_MESSAGE_FOR_PY="$USER_MESSAGE" \
     TOOL_NAME_FOR_PY="$TOOL_NAME" \
@@ -184,11 +199,31 @@ TOUCAN_JSONL=$(USER_MESSAGE_FOR_PY="$USER_MESSAGE" \
     "$PY" -c '
 import json, os, sys
 from datetime import datetime, timezone
+# D-14: cap each known content-bearing field at this many chars. ~2000 is
+# enough to keep the tool-selection signal TOUCAN is for while making the
+# log useless as a secret-exfil target. MUST MATCH pre-tool-use.ps1.
+_TOUCAN_FIELD_CAP = 2000
+_TOUCAN_TRUNC_FIELDS = ("content", "new_string", "old_string", "command")
+
+def _truncate_known_fields(val):
+    """Truncate the known large content fields in a tool_input dict.
+    Non-dict inputs (or non-str field values) pass through unchanged."""
+    if not isinstance(val, dict):
+        return val
+    out = {}
+    for k, v in val.items():
+        if k in _TOUCAN_TRUNC_FIELDS and isinstance(v, str) and len(v) > _TOUCAN_FIELD_CAP:
+            out[k] = v[:_TOUCAN_FIELD_CAP] + "…[truncated by D-14]"
+        else:
+            out[k] = v
+    return out
+
 tool_args_raw = os.environ.get("TOOL_ARGS_FOR_PY", "")
 try:
     tool_args_val = json.loads(tool_args_raw) if tool_args_raw else None
 except (json.JSONDecodeError, TypeError):
     tool_args_val = tool_args_raw
+tool_args_val = _truncate_known_fields(tool_args_val)
 # V52-L.2 Fix 1: include agent_id / agent_type so TOUCAN consumers can
 # differentiate parent vs subagent rows. Empty string when the field is
 # absent (parent context). session_id is repeated here for the same
@@ -206,6 +241,25 @@ sys.stdout.write(json.dumps({
 ' 2>/dev/null)
 if [ -n "$TOUCAN_JSONL" ]; then
     printf '%s\n' "$TOUCAN_JSONL" >> "$TOUCAN_LOG" 2>/dev/null || true
+    # D-14: size-cap + rotate. When the log exceeds _TOUCAN_MAX_BYTES
+    # (~5 MB), keep only the newest _TOUCAN_KEEP_LINES rows (oldest
+    # dropped). Best-effort: any failure leaves the file as-is (a hook
+    # must never crash the tool call over housekeeping). MUST MATCH
+    # pre-tool-use.ps1.
+    _TOUCAN_MAX_BYTES=5242880
+    _TOUCAN_KEEP_LINES=2000
+    _tsize=""
+    if _tsize=$(stat -c '%s' "$TOUCAN_LOG" 2>/dev/null); then :
+    elif _tsize=$(stat -f '%z' "$TOUCAN_LOG" 2>/dev/null); then :
+    else _tsize=""; fi
+    if [ -n "$_tsize" ] && [ "$_tsize" -gt "$_TOUCAN_MAX_BYTES" ] 2>/dev/null; then
+        _trot="$TOUCAN_LOG.rot.tmp"
+        if tail -n "$_TOUCAN_KEEP_LINES" "$TOUCAN_LOG" > "$_trot" 2>/dev/null; then
+            mv -f "$_trot" "$TOUCAN_LOG" 2>/dev/null || rm -f "$_trot" 2>/dev/null
+        else
+            rm -f "$_trot" 2>/dev/null || true
+        fi
+    fi
 fi
 
 # === 1. SSRF GUARD ===

@@ -148,10 +148,32 @@ function Write-SecurityLine([string]$json) {
 # field round-trips correctly. ToolArgs is parsed when possible to keep
 # structured logging; falls back to string on parse failure.
 # Audit fix 2026-05-07.
+#
+# D-14 (v0.2.75): the TOUCAN log is gitignored (`.claude/logs/*.jsonl`) so
+# it never reaches a commit and is NOT on the check-no-secrets scan
+# surface, but it still durably duplicated whole Write `content` / whole
+# Bash `command` lines unbounded — a secret-exfil target that outlived the
+# scrubbed originals. Truncate the known content fields to
+# $ToucanFieldCap and size-cap+rotate the JSONL below. MUST MATCH
+# pre-tool-use.sh (same cap, same fields, same 5 MB rotate). No scanner
+# surface added: post-fix it holds only truncated fragments and is
+# gitignored — an ignore-with-rationale, not a scan target.
 $ToucanLog = Join-Path $ProjectRoot ".claude/logs/toucan_dataset.jsonl"
+$ToucanFieldCap = 2000
+$ToucanTruncFields = @('content', 'new_string', 'old_string', 'command')
 $toolArgsVal = $null
 if ($ToolArgs) {
     try { $toolArgsVal = $ToolArgs | ConvertFrom-Json -ErrorAction Stop } catch { $toolArgsVal = $ToolArgs }
+}
+# D-14: truncate the known large content fields on a parsed (object) tool_input.
+# Non-object tool_args pass through unchanged (mirrors the .sh isinstance dict check).
+if ($toolArgsVal -is [psobject] -and $toolArgsVal -isnot [string]) {
+    foreach ($f in $ToucanTruncFields) {
+        $prop = $toolArgsVal.PSObject.Properties[$f]
+        if ($prop -and ($prop.Value -is [string]) -and ($prop.Value.Length -gt $ToucanFieldCap)) {
+            $prop.Value = $prop.Value.Substring(0, $ToucanFieldCap) + "…[truncated by D-14]"
+        }
+    }
 }
 $entry = [ordered]@{
     timestamp   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
@@ -167,6 +189,25 @@ $entry = [ordered]@{
 }
 $line = $entry | ConvertTo-Json -Compress -Depth 8
 try { Add-Content -Path $ToucanLog -Value $line -ErrorAction Stop } catch { }
+# D-14: size-cap + rotate. When the log exceeds $ToucanMaxBytes (~5 MB),
+# keep only the newest $ToucanKeepLines rows (oldest dropped). Best-effort:
+# any failure leaves the file as-is (a hook must never crash the tool call
+# over housekeeping). MUST MATCH pre-tool-use.sh.
+$ToucanMaxBytes = 5242880
+$ToucanKeepLines = 2000
+try {
+    if (Test-Path -LiteralPath $ToucanLog) {
+        $tsize = (Get-Item -LiteralPath $ToucanLog).Length
+        if ($tsize -gt $ToucanMaxBytes) {
+            $tail = Get-Content -LiteralPath $ToucanLog -Tail $ToucanKeepLines -ErrorAction Stop
+            $trot = "$ToucanLog.rot.tmp"
+            Set-Content -LiteralPath $trot -Value $tail -Encoding utf8 -ErrorAction Stop
+            Move-Item -LiteralPath $trot -Destination $ToucanLog -Force -ErrorAction Stop
+        }
+    }
+} catch {
+    try { Remove-Item -LiteralPath "$ToucanLog.rot.tmp" -ErrorAction SilentlyContinue } catch { }
+}
 
 # === 1. SSRF GUARD ===
 if ($ToolName -eq "WebFetch") {
