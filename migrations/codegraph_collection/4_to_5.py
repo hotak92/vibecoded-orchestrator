@@ -36,6 +36,15 @@ This edge deliberately mirrors ``analyze_code_graph._ensure_embed_revision_prope
 / ``_ensure_chunk_props_property`` (which stay as belt-and-suspenders for
 Weaviate-down / standalone-analyzer windows the edge can't cover) so a project
 reaches the v5 shape whichever path runs first.
+
+P2d (v0.2.75): the property SPECS + the ensure-if-missing loop live in ONE
+shared home — ``vco_lib/codegraph_schema.py``. NEW PROPS: add them to
+``vco_lib/codegraph_schema.py`` FIRST (``tests/test_codegraph_schema_parity.py``
+locks the table against the analyzer's ``_ensure_*`` helpers AND this edge's
+fallback), then extend the edge subset + fallback. The inline
+``_FALLBACK_SPECS`` / ``_fallback_ensure`` below cover only the
+vco_lib-unimportable window (torn checkout) — keep them MINIMAL and in
+MUST-MATCH lock-step with the shared home.
 """
 
 from __future__ import annotations
@@ -45,10 +54,9 @@ import re
 import sys
 
 
-# Props to add, keyed by which classes get them. Kept in lock-step with
-# analyze_code_graph.py's create_collections + _ensure_* helpers.
-_ALL_CLASSES = ("CodeModule", "CodeClass", "CodeFunction", "CodeAPI", "CodeInteraction")
-_CHUNKED_CLASSES = ("CodeFunction", "CodeClass")
+# Props THIS edge owns (the v5 additions). Authoritative specs:
+# vco_lib.codegraph_schema.CODEGRAPH_PROPERTY_SPECS filtered to this subset.
+_V5_PROPS = ("embed_revision", "chunk_num", "total_chunks")
 
 _EMBED_REVISION_DESC = (
     "Embedding-generation revision this row's vector(s) were produced under "
@@ -56,6 +64,26 @@ _EMBED_REVISION_DESC = (
 )
 _CHUNK_NUM_DESC = "0-indexed chunk number within this entity (0 for single-chunk)"
 _TOTAL_CHUNKS_DESC = "Total chunk count for this entity (1 for single-chunk)"
+
+# MUST-MATCH vco_lib/codegraph_schema.py: ``specs_subset(_V5_PROPS)`` — the
+# class-name-suffix → ((prop, DataType name, description), ...) projection.
+# Consumed ONLY by the inline fallback; parity is asserted by
+# tests/test_codegraph_schema_parity.py.
+_FALLBACK_SPECS = {
+    "CodeModule": (("embed_revision", "INT", _EMBED_REVISION_DESC),),
+    "CodeClass": (
+        ("embed_revision", "INT", _EMBED_REVISION_DESC),
+        ("chunk_num", "INT", _CHUNK_NUM_DESC),
+        ("total_chunks", "INT", _TOTAL_CHUNKS_DESC),
+    ),
+    "CodeFunction": (
+        ("embed_revision", "INT", _EMBED_REVISION_DESC),
+        ("chunk_num", "INT", _CHUNK_NUM_DESC),
+        ("total_chunks", "INT", _TOTAL_CHUNKS_DESC),
+    ),
+    "CodeAPI": (("embed_revision", "INT", _EMBED_REVISION_DESC),),
+    "CodeInteraction": (("embed_revision", "INT", _EMBED_REVISION_DESC),),
+}
 
 
 def _resolve_codegraph_prefix() -> str | None:
@@ -117,22 +145,57 @@ def _connect():
     )
 
 
-def _add_int_prop_if_absent(coll, prop_name: str, description: str) -> None:
-    """Idempotent ``add_property`` of a skip-vectorized INT prop. No-op if the
-    property already exists. Mirrors analyze_code_graph._ensure_* helpers."""
+def _fallback_ensure(client, prefix: str, specs) -> dict:
+    """MINIMAL inline copy of
+    ``vco_lib.codegraph_schema.ensure_codegraph_properties`` — MUST-MATCH its
+    semantics (absent class skipped → ``"absent"``; already-present prop
+    skipped silently; skip-vectorized add; present class → ``"ensured"``).
+    Runs ONLY when vco_lib is unimportable (torn checkout)."""
     from weaviate.classes.config import DataType, Property
 
-    config = coll.config.get()
-    if prop_name in {p.name for p in config.properties}:
-        return
-    coll.config.add_property(
-        Property(
-            name=prop_name,
-            data_type=DataType.INT,
-            description=description,
-            skip_vectorization=True,
+    results = {}
+    for suffix, prop_specs in specs.items():
+        class_name = f"{prefix}_{suffix}"
+        if not client.collections.exists(class_name):
+            results[class_name] = "absent"
+            continue
+        coll = client.collections.get(class_name)
+        existing = {p.name for p in coll.config.get().properties}
+        for prop_name, dtype_name, desc in prop_specs:
+            if prop_name in existing:
+                continue
+            coll.config.add_property(
+                Property(
+                    name=prop_name,
+                    data_type=getattr(DataType, dtype_name),
+                    description=desc,
+                    skip_vectorization=True,
+                )
+            )
+        results[class_name] = "ensured"
+    return results
+
+
+def _ensure_props(client, prefix: str) -> dict:
+    """Run the shared property-ensure loop, falling back to the inline copy.
+
+    Import-with-fallback deliberately mirrors ``_resolve_codegraph_prefix``'s
+    ``canonical_class_prefix`` shape: the runner executes this edge with
+    ``cwd=<project_root>``, so ``vco_lib`` is importable in the common case.
+    Only the IMPORT is guarded — a genuine ensure failure (either path)
+    propagates to ``main()`` → non-zero exit → the runner defers + retries.
+    """
+    ensure_fn = None
+    try:
+        sys.path.insert(0, os.getcwd())
+        from vco_lib.codegraph_schema import (
+            ensure_codegraph_properties as ensure_fn,
         )
-    )
+    except Exception:
+        ensure_fn = None
+    if ensure_fn is not None:
+        return ensure_fn(client, prefix, props_subset=_V5_PROPS)
+    return _fallback_ensure(client, prefix, _FALLBACK_SPECS)
 
 
 def main() -> int:
@@ -154,28 +217,26 @@ def main() -> int:
         return 1
 
     try:
-        for base in _ALL_CLASSES:
-            class_name = f"{prefix}_{base}"
-            try:
-                if not client.collections.exists(class_name):
-                    # Absent → will be born v5-shaped by create_collections.
-                    continue
-                coll = client.collections.get(class_name)
-                _add_int_prop_if_absent(coll, "embed_revision", _EMBED_REVISION_DESC)
-                if base in _CHUNKED_CLASSES:
-                    _add_int_prop_if_absent(coll, "chunk_num", _CHUNK_NUM_DESC)
-                    _add_int_prop_if_absent(coll, "total_chunks", _TOTAL_CHUNKS_DESC)
-                print(f"4_to_5: {class_name} at v5 shape (props present/added)")
-            except Exception as exc:
-                # A genuine per-class add_property error is a real failure — the
-                # runner must NOT advance the version on a half-applied edge.
-                print(f"4_to_5: add_property failed on {class_name}: {exc}", file=sys.stderr)
-                return 1
+        try:
+            # P2d: the ensure-if-missing loop lives in vco_lib/codegraph_schema
+            # (inline fallback when unimportable). Absent classes are skipped —
+            # they will be born v5-shaped by create_collections.
+            results = _ensure_props(client, prefix)
+        except Exception as exc:
+            # A genuine add_property error is a real failure — the runner
+            # must NOT advance the version on a half-applied edge. The shared
+            # loop attaches the failing class via ``.class_name``.
+            failed_on = getattr(exc, "class_name", "a code-graph class")
+            print(f"4_to_5: add_property failed on {failed_on}: {exc}", file=sys.stderr)
+            return 1
     finally:
         try:
             client.close()
         except Exception:
             pass
+    for class_name, status in results.items():
+        if status == "ensured":
+            print(f"4_to_5: {class_name} at v5 shape (props present/added)")
     # v0.2.74 HIGH-2: the real body ran (props present/added on every present
     # class, or the classes are absent-but-scope-was-resolvable) → safe to
     # advance the recorded version.

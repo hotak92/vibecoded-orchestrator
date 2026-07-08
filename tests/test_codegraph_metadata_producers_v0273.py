@@ -806,19 +806,48 @@ def test_edge_header_directives():
 
 
 def test_edge_scope_matches_ensure_helpers():
+    """P2d (v0.2.75): the edge's scope now lives in _V6_PROPS + the inline
+    _FALLBACK_SPECS (MUST-MATCH projection of vco_lib/codegraph_schema —
+    the full parity lock is tests/test_codegraph_schema_parity.py; this
+    pins the M1/M4 class scope locally)."""
     edge = _load_module("_v0273_edge_5_to_6", _EDGE_PATH)
-    assert edge._IS_TEST_CLASSES == ("CodeModule", "CodeClass", "CodeFunction")
-    assert edge._N_CALLERS_CLASSES == ("CodeFunction",)
+    assert edge._V6_PROPS == ("is_test", "n_callers")
+    is_test_classes = tuple(
+        cls for cls, specs in edge._FALLBACK_SPECS.items()
+        if any(p == "is_test" for p, _t, _d in specs)
+    )
+    n_callers_classes = tuple(
+        cls for cls, specs in edge._FALLBACK_SPECS.items()
+        if any(p == "n_callers" for p, _t, _d in specs)
+    )
+    assert is_test_classes == ("CodeModule", "CodeClass", "CodeFunction")
+    assert n_callers_classes == ("CodeFunction",)
 
 
-def test_edge_add_prop_if_absent_bool_and_int():
+def test_edge_fallback_ensure_bool_and_int_idempotent():
+    """P2d: the edge's inline fallback loop adds BOOL + INT props and skips
+    already-present ones (was: per-prop _add_prop_if_absent)."""
     edge = _load_module("_v0273_edge_5_to_6b", _EDGE_PATH)
     coll = _EnsureColl()
-    edge._add_prop_if_absent(coll, "is_test", "BOOL", "d")
-    edge._add_prop_if_absent(coll, "n_callers", "INT", "d")
+    client = types.SimpleNamespace(
+        collections=types.SimpleNamespace(
+            exists=lambda name: name == "P_CodeFunction",
+            get=lambda name: coll,
+        )
+    )
+    results = edge._fallback_ensure(client, "P", edge._FALLBACK_SPECS)
     assert coll.added == ["is_test", "n_callers"]
-    have = _EnsureColl(has_props=("is_test",))
-    edge._add_prop_if_absent(have, "is_test", "BOOL", "d")
+    assert results["P_CodeFunction"] == "ensured"
+    assert results["P_CodeModule"] == "absent"
+
+    have = _EnsureColl(has_props=("is_test", "n_callers"))
+    client2 = types.SimpleNamespace(
+        collections=types.SimpleNamespace(
+            exists=lambda name: True,
+            get=lambda name: have,
+        )
+    )
+    edge._fallback_ensure(client2, "P", edge._FALLBACK_SPECS)
     assert have.added == [], "idempotent"
 
 

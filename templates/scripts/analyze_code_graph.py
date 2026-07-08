@@ -5326,6 +5326,18 @@ class CodeGraphAnalyzer:
                     f"v0.2.61 content_hash migration on {label} skipped: {e}"
                 )
 
+    # ------------------------------------------------------------------
+    # P2d (v0.2.75): the four `_ensure_*` helpers below (chunk props,
+    # embed_revision, is_test, n_callers) are the analyzer-side mirrors of
+    # the property specs in `vco_lib/codegraph_schema.py` — the ONE shared
+    # home also consumed by the migration edges (4_to_5.py / 5_to_6.py).
+    # This template must run standalone at user sites, so the helpers stay
+    # inline here; `tests/test_codegraph_schema_parity.py` asserts their
+    # ensured (class, prop, type) set is EQUAL to the shared table.
+    # NEW PROPS: add to vco_lib/codegraph_schema.py FIRST, then mirror the
+    # helper here + the new migration edge (the parity test is the lock).
+    # ------------------------------------------------------------------
+
     def _ensure_chunk_props_property(self):
         """v0.2.72 (P3) schema migration: add `chunk_num` + `total_chunks`
         (both INT) to CodeFunction + CodeClass so pre-v0.2.72 installs gain the
