@@ -557,9 +557,22 @@ async fn module_stop(
     }
 }
 
-/// `POST /projects/{project_id}/modules/{module_id}/restart` — stop +
-/// start the per-project container. Requires manifest resolver (not
-/// wired yet — see `module_start`). Phase 3+ activates.
+/// `POST /projects/{project_id}/modules/{module_id}/restart` — 501 by
+/// DECISION (v0.2.75 RL-15), not by omission.
+///
+/// DECIDED POSTURE: GUI-alive in-process restart is the SUPPORTED path —
+/// the launcher's `restart_rl_container` command drives
+/// `module_supervisor` in-process via `commands/module_service.rs`, with
+/// the launcher's full manifest context in hand. A hub-side restart would
+/// need its own manifest CATALOG RESOLVER (manifest discovery + variant
+/// resolution without a launcher process); building a partial resolver
+/// just to serve this route would fork the resolution logic and drift
+/// from the launcher's (the exact cross-language-fork failure mode the
+/// house rules forbid). So the route stays 501 — deliberately.
+///
+/// UNLOCK CONDITION: the Phase 3+ manifest catalog resolver (one shared
+/// resolution home reachable from the hub). When THAT lands, wire this
+/// route through it; do NOT implement a partial resolver here earlier.
 async fn module_restart(
     State(_h): State<LauncherDbHandle>,
     Path(p): Path<ProjectModulePath>,
@@ -839,8 +852,15 @@ mod tests {
         assert_eq!(resp.status(), 204);
     }
 
-    /// Step 24 commit b: module_restart still returns 501 — same
-    /// catalog-resolver gap as module_start.
+    /// v0.2.75 RL-15 (DECIDED, was "not yet implemented"): module_restart
+    /// returns 501 BY DESIGN. GUI-alive in-process restart
+    /// (`restart_rl_container` → module_supervisor via
+    /// commands/module_service.rs) is the supported posture until the
+    /// Phase 3+ manifest catalog resolver exists — a partial hub-side
+    /// resolver would fork the launcher's manifest resolution and drift.
+    /// This test PINS the deliberate 501; if it starts failing because the
+    /// route grew an implementation, verify the implementation routes
+    /// through the SHARED catalog resolver, then update this pin.
     #[tokio::test]
     async fn module_restart_returns_501_supervisor_restart() {
         let (base, _h) = spawn_lifecycle_api_hub().await;
