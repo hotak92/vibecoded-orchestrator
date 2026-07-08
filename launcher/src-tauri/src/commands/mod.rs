@@ -45,6 +45,10 @@ pub mod diagram_watcher;
 pub mod diagrams_local_server;
 pub mod embedding_catalog;
 pub mod embedding_enrichment;
+// v0.2.75 P2 — pure `.env` audit + sentinel-rewrite (Rust mirror of
+// vco_lib/secrets_audit.py) backing the launcher-side "Migrate from .env"
+// button. Consumed by secrets_cmd::migrate_env_secrets_from_dotenv.
+pub mod env_secrets_migrate;
 // v0.2.71 Track T-C-modal — per-slot populated-vector COUNTS for a project's
 // KG collection. Powers the RegenerateOrDeferModal "keep previous model"
 // option (smart default = most-populated slot). Thin shell-out to

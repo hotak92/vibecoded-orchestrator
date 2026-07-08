@@ -2191,29 +2191,136 @@ mod tests {
         let _ = db.forget_secret_active_state("shared", SENTINEL_SHARED, "user", &key);
         let _ = db.forget_secret_active_state("per_project", "pwin", "user", &key);
     }
+
+    // ─── V47-G-final / P2: migrate_env_secrets_from_dotenv outcome logic ──
+    //
+    // The HTTP round-trip is exercised at the hub level in
+    // vct-hub::secrets_api::tests; here we pin the pure orchestration seam
+    // (build_migration_outcome) + the hub-unreachable CLI-fallback contract
+    // WITHOUT a live hub, so the success/partial/down branches are covered.
+
+    fn hub_resp(migrated: &[&str], failed: &[&str]) -> HubMigrateResponse {
+        HubMigrateResponse {
+            migrated: migrated.iter().map(|s| s.to_string()).collect(),
+            failed: failed
+                .iter()
+                .map(|k| HubMigrateFailure {
+                    key: k.to_string(),
+                    error: "boom".to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn migration_outcome_success_migrates_and_rewrites_env() {
+        // Unquoted value + inline comment → the comment is preserved (the
+        // quoted-value case drops it; that asymmetry is pinned in
+        // env_secrets_migrate::tests and matches the Python mirror).
+        let env = "export OPENAI_API_KEY=sk-abc  # team\nPLAIN=keep\n";
+        let hub = hub_resp(&["OPENAI_API_KEY"], &[]);
+        let (result, new_env) = build_migration_outcome(env, &hub);
+
+        assert!(result.ok);
+        assert_eq!(result.migrated, vec!["OPENAI_API_KEY".to_string()]);
+        assert!(result.failed.is_empty());
+        assert!(result.error.is_none());
+        // The .env is rewritten: only the migrated key gets the sentinel,
+        // PLAIN is byte-identical, structure (export prefix + comment) kept.
+        assert_eq!(
+            new_env.as_deref(),
+            Some("export OPENAI_API_KEY=__vco_keychain__  # team\nPLAIN=keep\n")
+        );
+    }
+
+    #[test]
+    fn migration_outcome_partial_failure_surfaces_failed_keys_no_flip_on_ok() {
+        let env = "A_TOKEN=one\nB_SECRET=two\n";
+        // Hub migrated A_TOKEN, failed B_SECRET.
+        let hub = hub_resp(&["A_TOKEN"], &["B_SECRET"]);
+        let (result, new_env) = build_migration_outcome(env, &hub);
+
+        assert!(result.ok, "partial failure must not flip ok=false");
+        assert_eq!(result.migrated, vec!["A_TOKEN".to_string()]);
+        assert_eq!(result.failed, vec!["B_SECRET".to_string()]);
+        let err = result.error.expect("error summary for failed keys");
+        assert!(err.contains("B_SECRET"), "error names the failed key: {}", err);
+        assert!(!err.contains("two"), "error must NOT leak the secret value: {}", err);
+        // Only the migrated key's value was replaced; B_SECRET stays plaintext.
+        assert_eq!(
+            new_env.as_deref(),
+            Some("A_TOKEN=__vco_keychain__\nB_SECRET=two\n")
+        );
+    }
+
+    #[test]
+    fn migration_outcome_all_failed_writes_nothing() {
+        let env = "A_TOKEN=one\n";
+        let hub = hub_resp(&[], &["A_TOKEN"]);
+        let (result, new_env) = build_migration_outcome(env, &hub);
+
+        assert!(result.ok);
+        assert!(result.migrated.is_empty());
+        assert_eq!(result.failed, vec!["A_TOKEN".to_string()]);
+        assert!(
+            new_env.is_none(),
+            "no migrated keys ⇒ no .env rewrite (leave user data untouched)"
+        );
+    }
+
+    #[test]
+    fn hub_unreachable_fallback_preserves_cli_guidance() {
+        // The command's hub-down branch returns this exact result shape.
+        // Assert the CLI-fallback text (unchanged from the prior stub) is
+        // what SecretsTab's error panel will render, and nothing "migrated".
+        let down = MigrateEnvSecretsResult {
+            ok: false,
+            migrated: vec![],
+            failed: vec![],
+            error: Some(HUB_UNREACHABLE_CLI_FALLBACK.to_string()),
+        };
+        assert!(!down.ok);
+        assert!(down.migrated.is_empty());
+        let err = down.error.expect("fallback error present");
+        assert!(
+            err.contains("python install.py --update --apply-deferred"),
+            "CLI-fallback guidance preserved: {}",
+            err
+        );
+    }
 }
 
-// ─── v0.2.46 V47-C followup (landed with V47-G-final) ───────────────────
+// ─── V47-G-final (v0.2.75 / P2): in-process "Migrate from .env" wrapper ──
 //
-// Tauri command wrapper for the per-project SecretsTab's "Migrate from
-// .env" button. The Svelte side calls into this; we delegate to the
-// canonical V47-C migration path (vct-hub `/api/v1/secrets/migrate`).
+// Tauri command backing the per-project SecretsTab's "Migrate from .env"
+// button. Implements the Rust → hub round-trip the earlier stub only
+// promised: resolve the project root from `project_id`, audit its `.env`
+// for secret-shaped keys with real values, POST them to the authed hub
+// `/api/v1/secrets/migrate` endpoint, and rewrite the migrated keys'
+// values to the `__vco_keychain__` sentinel on success — the same
+// behaviour the install.py CLI arm (`_audit_and_offer_env_secret_migration`)
+// produces.
 //
-// STATUS (V47-G-final): the Tauri-side wrapper is intentionally a stub
-// today — it returns an "unavailable" error response that the Svelte
-// component (SecretsTab.svelte) catches and routes into a clear CLI-
-// fallback message ("Run `python install.py --update --apply-deferred`
-// at the project root"). The hub endpoint already works (V47-C); the
-// CLI path through install.py works (V47-C). What's NOT wired today is
-// the in-process Rust → hub round-trip, which would require: project-
-// root resolution from project_id, an authenticated hub HTTP client,
-// the secret-shape heuristic in Rust (or shelling out to the python
-// secrets_audit module), and the .env-rewrite-on-success logic.
+// Cross-language discipline:
+//   * Secret-shape check → the single B-3-guarded needle home
+//     (`mcp_registration::is_secret_shaped_env_key`), consumed via the
+//     `env_secrets_migrate` module. NEVER a new inline needle list.
+//   * `.env` parse + sentinel-rewrite → `env_secrets_migrate` (the Rust
+//     mirror of `vco_lib/secrets_audit.py`, with a MUST-MATCH comment on
+//     both sides).
 //
-// FOLLOW-UP: v0.2.47 should land the full Rust wrapper so the GUI button
-// works without the CLI fallback. Tracked as a v0.2.47 backlog item in
-// `.claude/context/plans/v0.2.47-backlog-*.md` once the cycle opens.
+// Hub-down posture: when the hub is unreachable we return `ok=false` with
+// the SAME CLI-fallback guidance the old stub emitted, so SecretsTab's
+// error panel keeps steering the user to `python install.py --update
+// --apply-deferred`. Nothing is written to disk in that case.
 
+use super::env_secrets_migrate::{
+    audit_env_secrets, rewrite_env_with_sentinels, EnvSecret,
+};
+
+/// FE-facing result. `failed` is a flat `Vec<String>` of key names (the
+/// SecretsTab.svelte panel renders key names only); per-key error detail
+/// from the hub is folded into the `error` summary line.
 #[derive(Debug, Clone, Serialize)]
 pub struct MigrateEnvSecretsResult {
     pub ok: bool,
@@ -2222,19 +2329,207 @@ pub struct MigrateEnvSecretsResult {
     pub error: Option<String>,
 }
 
+/// The CLI-fallback guidance surfaced when the hub can't be reached. Kept
+/// verbatim from the prior stub so SecretsTab's error panel is unchanged.
+const HUB_UNREACHABLE_CLI_FALLBACK: &str =
+    "Could not reach the local vct-hub to migrate secrets. Make sure the \
+     launcher / vct-hub is running, or use the CLI fallback: \
+     `python install.py --update --apply-deferred` at the project root.";
+
+/// One `{key, error}` failure row as returned by the hub's
+/// `/api/v1/secrets/migrate` response.
+#[derive(Debug, Clone, Deserialize)]
+struct HubMigrateFailure {
+    key: String,
+    #[allow(dead_code)]
+    error: String,
+}
+
+/// The hub's `POST /api/v1/secrets/migrate` 200 response body.
+#[derive(Debug, Clone, Deserialize)]
+struct HubMigrateResponse {
+    migrated: Vec<String>,
+    failed: Vec<HubMigrateFailure>,
+}
+
+/// Read the hub port + token the same way `hub_proxy.rs` does (re-read
+/// from disk each call so a hub restart's rotated token propagates).
+fn hub_port_token() -> Result<(u16, String), String> {
+    let root = crate::paths::vct_root_dir();
+    let port = std::fs::read_to_string(root.join("hub.port"))
+        .map_err(|e| format!("read hub.port: {}", e))?
+        .trim()
+        .parse::<u16>()
+        .map_err(|e| format!("parse hub.port: {}", e))?;
+    let token = std::fs::read_to_string(root.join("hub.token"))
+        .map_err(|e| format!("read hub.token: {}", e))?
+        .trim()
+        .to_string();
+    if token.is_empty() {
+        return Err("hub.token is empty".into());
+    }
+    Ok((port, token))
+}
+
+/// POST the audited secrets to the hub and return its `(migrated, failed)`.
+/// Errors here are treated as "hub unreachable" by the caller (nothing is
+/// written to disk).
+async fn post_secrets_to_hub(
+    secrets: &[EnvSecret],
+) -> Result<HubMigrateResponse, String> {
+    let (port, token) = hub_port_token()?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("http client: {}", e))?;
+    let url = format!("http://127.0.0.1:{}/api/v1/secrets/migrate", port);
+    let payload = serde_json::json!({
+        "secrets": secrets
+            .iter()
+            .map(|s| serde_json::json!({ "key": s.key, "value": s.value }))
+            .collect::<Vec<_>>(),
+    });
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("hub POST /secrets/migrate: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("hub returned {}", resp.status().as_u16()));
+    }
+    resp.json::<HubMigrateResponse>()
+        .await
+        .map_err(|e| format!("parse hub response: {}", e))
+}
+
+/// Pure orchestration seam: given the current `.env` text and the hub's
+/// migrate result, compute the FE result + the new `.env` text to write
+/// (None ⇒ nothing to write). Kept separate from I/O so the success and
+/// failure branches are unit-testable without a live hub or filesystem.
+fn build_migration_outcome(
+    env_text: &str,
+    hub: &HubMigrateResponse,
+) -> (MigrateEnvSecretsResult, Option<String>) {
+    let migrated = hub.migrated.clone();
+    let failed_keys: Vec<String> = hub.failed.iter().map(|f| f.key.clone()).collect();
+
+    let new_env = if migrated.is_empty() {
+        None
+    } else {
+        Some(rewrite_env_with_sentinels(env_text, &migrated).text)
+    };
+
+    let error = if failed_keys.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "{} key(s) could not be migrated: {}",
+            failed_keys.len(),
+            failed_keys.join(", ")
+        ))
+    };
+
+    (
+        MigrateEnvSecretsResult {
+            // `ok` reflects "the round-trip completed" — partial failures
+            // are surfaced via `failed` + `error`, not by flipping `ok`
+            // (matches the hub's own partial-success-is-200 contract).
+            ok: true,
+            migrated,
+            failed: failed_keys,
+            error,
+        },
+        new_env,
+    )
+}
+
 #[command]
 pub async fn migrate_env_secrets_from_dotenv(
     project_id: String,
+    db: State<'_, Db>,
 ) -> Result<MigrateEnvSecretsResult, String> {
-    // V47-G-final: explicit "use CLI fallback" stub. The Svelte side
-    // (SecretsTab.svelte) catches Err(...) and renders a CLI-fallback
-    // message — this matches the v0.2.46 release-discipline rule of
-    // shipping the surface, the hub endpoint, and the CLI path, while
-    // deferring only the in-process Rust wrapper to v0.2.47.
-    let _ = project_id; // silence unused-warning until the wrapper lands.
-    Err(format!(
-        "migrate_env_secrets_from_dotenv: Tauri wrapper not yet wired \
-         (v0.2.47 follow-up). Use the CLI fallback: \
-         `python install.py --update --apply-deferred` at the project root."
-    ))
+    // 1. Resolve the project root from the launcher DB.
+    let project = db
+        .get_project(&project_id)?
+        .ok_or_else(|| format!("no project registered with id {:?}", project_id))?;
+    let env_path = std::path::Path::new(&project.folder_path).join(".env");
+
+    // 2. Audit `.env` for secret-shaped keys with real values.
+    let env_text = match std::fs::read_to_string(&env_path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // No .env → nothing to migrate. `ok=true`, empty lists.
+            return Ok(MigrateEnvSecretsResult {
+                ok: true,
+                migrated: vec![],
+                failed: vec![],
+                error: None,
+            });
+        }
+        Err(e) => return Err(format!("read {}: {}", env_path.display(), e)),
+    };
+    let candidates = audit_env_secrets(&env_text);
+    if candidates.is_empty() {
+        return Ok(MigrateEnvSecretsResult {
+            ok: true,
+            migrated: vec![],
+            failed: vec![],
+            error: None,
+        });
+    }
+
+    // 3. POST to the hub. Hub-unreachable → CLI-fallback, nothing written.
+    let hub = match post_secrets_to_hub(&candidates).await {
+        Ok(h) => h,
+        Err(_) => {
+            return Ok(MigrateEnvSecretsResult {
+                ok: false,
+                migrated: vec![],
+                failed: vec![],
+                error: Some(HUB_UNREACHABLE_CLI_FALLBACK.to_string()),
+            });
+        }
+    };
+
+    // 4. Rewrite `.env` for the hub-confirmed keys (atomic write).
+    let (result, new_env) = build_migration_outcome(&env_text, &hub);
+    if let Some(text) = new_env {
+        write_env_atomically(&env_path, &text)
+            .map_err(|e| format!("rewrite {}: {}", env_path.display(), e))?;
+    }
+    Ok(result)
+}
+
+/// Atomic `.env` rewrite: write a sibling temp file (0o600 on Unix so the
+/// sentinel-replaced file never flashes world-readable), then rename into
+/// place. Mirrors the atomic-write discipline in
+/// `vco_lib/secrets_audit.py::rewrite_env_with_sentinels`.
+fn write_env_atomically(env_path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let parent = env_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!(
+        ".env.vco-migrate-{}",
+        std::process::id()
+    ));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            let _ = f.set_permissions(perms);
+        }
+        f.write_all(text.as_bytes())?;
+        f.flush()?;
+    }
+    match std::fs::rename(&tmp, env_path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
