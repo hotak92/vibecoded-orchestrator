@@ -4610,13 +4610,13 @@ class CodeGraphAnalyzer:
                 if file_path_rel and (props.get("file_path") or "") != file_path_rel:
                     continue
                 try:
-                    cn = int(props.get("chunk_num"))
+                    cn = int(props.get("chunk_num"))  # type: ignore[arg-type]
                 except (TypeError, ValueError):
                     continue
                 if cn >= new_total:
                     continue  # a tail row (should already be deleted) — skip
                 try:
-                    if int(props.get("total_chunks")) == new_total:
+                    if int(props.get("total_chunks")) == new_total:  # type: ignore[arg-type]
                         continue  # already correct — idempotent no-op
                 except (TypeError, ValueError):
                     pass  # NULL/non-int stored total → patch it
@@ -9169,9 +9169,9 @@ class CodeGraphAnalyzer:
         # roots sharing a relpath don't collide (see _create_or_update_module).
         try:
             for obj in self.modules_collection.iterator():
-                path = obj.properties.get("path", "")
+                path = str(obj.properties.get("path", "") or "")
                 if path:
-                    src = obj.properties.get("project_source", "") or ""
+                    src = str(obj.properties.get("project_source", "") or "")
                     self.module_cache[(src, path)] = str(obj.uuid)
                     # Populate module_imports from stored import_names
                     import_names = obj.properties.get("import_names")
