@@ -3857,6 +3857,9 @@ _RL_ENRICHMENT_EXPORTS = (
     "_rl_find_representative_obj", "_rl_attach_other_slot_for_node",
     "_rl_enrich_nodes_with_linked_embs", "_resolve_dual_rl_log_enabled",
     "_resolve_dual_rl_log_inputs", "_slot_short_source", "_rl_cache_and_rerank",
+    # X-4 (v0.2.75): enrichment fan-out gate (TTL-cached skip predicate).
+    "_rl_enrichment_gate_open", "_rl_enrichment_consumer_exists",
+    "_rl_enrich_gate_reset_for_test",
 )
 try:
     from . import rl_enrichment as _rl_enrichment  # noqa: E402 — package-relative

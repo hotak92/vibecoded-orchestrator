@@ -2141,6 +2141,116 @@ def _rl_attach_other_slot_for_node(
         except Exception:  # noqa: BLE001
             pass
 
+# ── X-4 (v0.2.75): enrichment fan-out gate ─────────────────────────────
+#
+# ``_rl_enrich_nodes_with_linked_embs`` issues one batched Weaviate
+# ``fetch_objects(include_vector=True)`` per collection on EVERY
+# hybrid_search / semantic_graph_search / CLI kg-search, unconditionally.
+# Those fetches hit WEAVIATE (not the RL container — an RL-down install
+# makes them pointless, not failing), and their only consumers are:
+#
+#   * the RL rerank RPC (candidates carry ``n_emb`` into ``cache_nodes``,
+#     and the citation ctx feeds the online ``/rl_update_v3``), and
+#   * the retrieval/citation telemetry events.
+#
+# Free tier DELIBERATELY still emits telemetry (the historical corpus
+# accumulates — see ``rerank_and_emit``'s tier-gate comment), so enrichment
+# is NOT dead weight there: the predicate's consumer term keeps it running.
+# The genuinely dead configuration is "no telemetry consumer AND rerank
+# won't run" — e.g. fully opted-out free tier, or a licensed install whose
+# cached negotiation verdict (RL-10 completion) hard-refuses the pairing.
+#
+# The verdict is TTL-cached per process (default 60 s, ``RL_ENRICH_GATE_TTL_S``)
+# because its inputs (license probe, hub toggle, env gates, consent file) are
+# comparatively expensive and change rarely; the TTL bounds the staleness
+# window after a mid-session opt-in flip. FALL OPEN on any probe error —
+# over-fetching is cheaper than silently starving a paying user's corpus.
+
+_RL_ENRICH_GATE_TTL_ENV = "RL_ENRICH_GATE_TTL_S"
+_RL_ENRICH_GATE_DEFAULT_TTL_S = 60.0
+# (verdict, monotonic-ts) or None. Per-module-object cache — a pure memo,
+# so the dual-import-path duplication documented in the module header is
+# harmless (each path just memoises independently).
+_rl_enrich_gate_cache: "tuple[bool, float] | None" = None
+
+
+def _rl_enrich_gate_reset_for_test() -> None:
+    """Test hook — drop the TTL-cached gate verdict."""
+    global _rl_enrich_gate_cache
+    _rl_enrich_gate_cache = None
+
+
+def _rl_enrichment_consumer_exists() -> bool:
+    """X-4: True iff SOMETHING consumes the enrichment fan-out's output.
+
+    Term 1 — a retrieval-event consumer exists (local hub write or upload
+    queue; free tier included). Term 2 — the rerank will actually run:
+    ``_resolve_rl_enabled()`` (license tier + per-project toggle), REFINED by
+    the RL-10 cached negotiation verdict — a licensed install whose every
+    negotiated client pairing is a hard refuse will not rerank, so a
+    rerank-only consumer is dead. Never raises; errors fall OPEN (True).
+    """
+    try:
+        from claude_mcp_servers.rl_client.search_pipeline import (
+            _retrieval_emit_has_consumer,
+        )
+
+        if _retrieval_emit_has_consumer():
+            return True
+    except Exception:  # noqa: BLE001 — fall open
+        return True
+    try:
+        from claude_mcp_servers.rl_client.search_pipeline import _resolve_rl_enabled
+
+        if not _resolve_rl_enabled():
+            return False
+    except Exception:  # noqa: BLE001 — fall open
+        return True
+    # Licensed + toggled on. Fold in the cached negotiation verdicts (task-1
+    # memo on each RLClient instance): only when every KNOWN verdict is a
+    # hard refuse is the rerank positively dead. No verdict yet / any
+    # non-refusing verdict → fall open (the rerank may run).
+    try:
+        from claude_mcp_servers.rl_client.search_pipeline import (
+            _NEGOTIATION_CACHE_ATTR,
+            _NEGOTIATION_REFUSE_STATUSES,
+        )
+
+        instances = getattr(server, "_rl_client_instances", None) or {}
+        verdicts = [
+            getattr(c, _NEGOTIATION_CACHE_ATTR, None) for c in instances.values()
+        ]
+        known = [v for v in verdicts if v is not None]
+        if known and all(
+            getattr(v, "status", "") in _NEGOTIATION_REFUSE_STATUSES for v in known
+        ):
+            return False
+    except Exception:  # noqa: BLE001 — the fold is best-effort
+        pass
+    return True
+
+
+def _rl_enrichment_gate_open() -> bool:
+    """X-4: TTL-cached wrapper over ``_rl_enrichment_consumer_exists``."""
+    global _rl_enrich_gate_cache
+    import time as _time
+
+    try:
+        ttl = float(os.environ.get(_RL_ENRICH_GATE_TTL_ENV, "") or _RL_ENRICH_GATE_DEFAULT_TTL_S)
+    except (TypeError, ValueError):
+        ttl = _RL_ENRICH_GATE_DEFAULT_TTL_S
+    now = _time.monotonic()
+    cached = _rl_enrich_gate_cache
+    if cached is not None and (now - cached[1]) < ttl:
+        return cached[0]
+    try:
+        verdict = bool(server._rl_enrichment_consumer_exists())
+    except Exception:  # noqa: BLE001 — fall open
+        verdict = True
+    _rl_enrich_gate_cache = (verdict, now)
+    return verdict
+
+
 def _rl_enrich_nodes_with_linked_embs(
     nodes: list[dict],
     query_emb: "list[float] | None",
@@ -2219,6 +2329,18 @@ def _rl_enrich_nodes_with_linked_embs(
     """
     if not nodes:
         return
+
+    # X-4 (v0.2.75): skip the whole fan-out when nothing consumes it — see
+    # the gate block above. Routed through ``server.`` so tests can patch it.
+    try:
+        if not server._rl_enrichment_gate_open():
+            server.logger.debug(
+                "RL enrich: no consumer (rerank gated off + no telemetry "
+                "consumer); skipping enrichment fan-out"
+            )
+            return
+    except Exception:  # noqa: BLE001 — gate errors fall open to enrich
+        pass
 
     # Group nodes by collection so we can issue ONE fetch per collection.
     by_collection: dict[str, list[dict]] = {}
