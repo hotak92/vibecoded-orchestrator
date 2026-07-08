@@ -5,6 +5,199 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.75] - 2026-07-08
+
+### Security
+- **Project rename can no longer hand you a command that silently drops your
+  code-graph collections.** The rename-time deferral used to emit
+  `code-graph-analyze . --force` — a flag the analyzer's argparse *rejects*.
+  Worse, with argument abbreviation on (the argparse default), the bogus
+  `--force` was silently PREFIX-EXPANDED to `--force-recreate`, i.e. an
+  unintended DROP + recreate of all five per-project collections. The deferral
+  now emits a valid, non-destructive command (`--project '<NewName>'`), the
+  analyzer parser is `allow_abbrev=False` so a destructive flag can never be
+  reached by abbreviation, and a new CI sweep parses EVERY CLI command any
+  Python/Rust source line emits against the real target parser (this caught and
+  fixed three more emitters: a `kg-sync --force` flag that was silently
+  ignored, and two `install.py` remediation flags that never existed). (C-10 / P1a)
+- **The orphan-collection GUI could offer your freshly-rebuilt post-rename graph
+  for deletion.** A project rename left the code-graph binding prefix split
+  across the OLD name-derived value and the NEW `projects.name`, so the orphan
+  detector could attribute (and delete) the just-rebuilt canonical class set.
+  The binding is now the single source of truth (moved to the new prefix on
+  rename, user-customized prefixes preserved), and both the orphan detector and
+  the delete boundary now protect the binding prefix AND the current
+  name-derived canonical of every live project (a shared, fail-closed
+  never-flag-live-canonical guard). (C-10 / P1a)
+- **The hub bind is no longer loopback-only when paid modules need it.** v0.2.73
+  flipped the hub to a loopback-only default bind, which silently broke every
+  installed hub-consuming module — a global RL container reaches the hub via
+  `host.containers.internal`, which never resolves to the host's own `127.0.0.1`
+  on any OS. The bind is now supervisor-conditional: derived at every hub start
+  from the installed global-module rows (>=1 install widens to `0.0.0.0` with a
+  loud LAN-exposure + bearer-token log line; the explicit `VCT_HUB_BIND_ALL`
+  opt-in/opt-out always wins; a DB read error stays conservative loopback). The
+  hub records its actual bind to `hub.bind` for out-of-process confirmation, and
+  pre-v0.2.75 installs self-heal on the next hub start with zero migration. (P1a)
+- **A secret-state DB error no longer defaults to ACTIVE.** The
+  "is this secret active for the requester" check `.ok()`-collapsed query errors
+  into the no-row arm, which fell through to default-ACTIVE — an unreadable
+  `secret_active_state` table (lock, corruption, dropped table) silently SERVED
+  paused secrets. It now follows the three-way file-store contract (row → value,
+  no-row → default-ACTIVE, error → no-opinion), and at the cross-launcher combine
+  boundary an own-DB error resolves to DENY with a log line — an error side must
+  never over-serve. (00a2210e)
+- **Webhook replay protection.** HMAC verification proves origin, not
+  one-time-ness — a captured signed body replayed verbatim re-ran the grant path
+  on every delivery. The Lemon Squeezy webhook now claims a `processed_webhooks`
+  ledger keyed on `meta.event_id` (a replay necessarily carries the same event
+  id; changing it breaks the HMAC) BEFORE processing (duplicate → `200` with
+  `{deduplicated: true}` and no re-grant), releasing the claim on any non-2xx so
+  legitimate provider retries still process; plus a payload-timestamp freshness
+  window. (E-7)
+- **Offline license grace now honors `expires_at`.** The 3-day offline-grace arm
+  returned the cached paid tier on cache age alone — a license that expired
+  yesterday kept serving pro/mao for up to 3 more days just because the machine
+  was offline. The grace arm now degrades to free (with a renewal message) when
+  the stored `expires_at` parses to a valid instant in the past; `None`
+  (lifetime) and malformed strings keep the fail-open behavior so a parsing bug
+  can never lock a paying user out. (E-6)
+- **The credential scanner catches more shapes.** The written-file security
+  scanner (`post-tool-security`) now flags fine-grained `github_pat_` tokens and
+  unquoted `.env`-style `API_KEY=…` assignments (previously only quoted forms),
+  and the pre-tool bash guard adds `printenv`/direct-env-dump rules. (D-13)
+- **The TOUCAN tool-log is now truncated and rotated.** The dataset log durably
+  duplicated whole Write `content` / Bash `command` fields with no truncation and
+  no size cap, outliving the scrubbed originals as an exfil target. Content-bearing
+  fields are truncated to 2000 chars before serialization and the JSONL is
+  size-capped + rotated at ~5 MB. (D-14)
+- **Release `dist/` artifacts are now secret-scanned.** The blanket `**/dist/**`
+  exclusion had also been skipping TEXT files under `dist/` (notably the tracked
+  release-bot `metadata.json`). The pre-ship scan now adds a `dist/` text-file
+  pass and a `strings` sweep over the shipped `dist` binaries (one shared
+  `scan_files` home; also fixes an xargs-batching bug that keyed on exit status
+  instead of grep output). (Gate-7 / P2c)
+- **Two new pre-ship release gates.** An open-Dependabot-alerts gate (Gate 23)
+  and a `step22` access-matrix workflow-green gate now join the pre-ship
+  workflow-green checks. (P2a / P2b)
+
+### Fixed
+- **Two immortal code-graph convergence-loop row classes are killed.** The
+  resync owed-probe and the analyzer's orphan-clear each had a partial, and
+  DISAGREEING, notion of "which stale rows can a re-walk converge?" — every class
+  they disagreed on was immortal (counted owed forever while nothing could
+  re-stamp or delete it), so every `install.py --update` re-triggered a
+  whole-repo resync. One shared `classify_row` (owed | not_owed | purgeable, with
+  a byte-identical analyzer mirror locked by a parity test) now drives both the
+  owed-count and the orphan-purge predicate, and the deferrals self-clear once the
+  probe reaches zero. (P1b)
+- **A PowerShell-parser crash kept two module rows permanently unembedded.**
+  `_parse_powershell_functions` raised `IndexError` on any declaration indented
+  >= 8 characters (the deep-indent shape nested functions produce), so the
+  per-file handler caught it and re-stamped the module row to revision 0 with an
+  empty file hash on every run — an immortal owed loop that masqueraded as a gate
+  bug. The declaration kind now comes from a regex capture group; deep-indent
+  regression test added. (root cause of the "vectorless sentinel that never
+  heals" pair, P1b)
+- **Deferral writes are TOCTOU-safe and resolved entries stay resolved.** The
+  seed-to-final-write window that could drop a concurrent writer's deferral is
+  closed WITHOUT resurrecting resolved entries, resolved apply-arms now call
+  `mark_resolved` (tombstoning the condition against the pre-write re-merge) so
+  seeded/foreign entries — nine previously inert "resolved" arms, including the
+  Rust-emitted `launcher_update_diverged` — actually clear, and the solo
+  update-resume clear now unlinks BOTH the Markdown and JSON copies of
+  `UPDATE_DEFERRED` so a cleared banner can't resurrect from the surviving
+  sidecar. (P1 / P2a)
+- **Code-graph read-path and cache correctness.** A whole-repo walk now sweeps
+  current-revision rows for deleted files (CG-4); the collapse identity for
+  `CodeAPI`/`CodeInteraction` now folds handler / interaction-type / direction /
+  protocol so distinct same-endpoint edges are no longer silently merged into one
+  survivor (C-7); `file_path` is threaded through the chunk fetchers and the
+  read-path chunk interleave/over-merge is corrected (C-8); the module cache is
+  keyed on `(source, path)` and stamps `embed_revision` + `content_hash` on the
+  update branch like every other write, closing an extra-path collision and a
+  fingerprint-skip trap (C-12).
+- **`unsupported_for_language` no longer over-claims on Python.** The empty-result
+  marker fired on any empty callers/path/type_users result — including a Python
+  target with genuinely zero callers — and, because those results feed RL
+  telemetry, the mislabel propagated into training data. It is now emitted only
+  when the target's language is positively known to be non-Python (a single cheap
+  point-read on the empty-result path only). (CG-2)
+- **`installer.rs` solo-clear no longer resurrects from JSON.** The solo
+  update-resume clear now dual-unlinks the `UPDATE_DEFERRED.json` sidecar.
+- **No more `ResourceWarning` spam in update output.** Detached-child `Popen`
+  handles are kept alive so the interpreter doesn't emit finalizer warnings during
+  `install.py --update`.
+- **RL code-path telemetry honors the opt-out at COMPUTE time, not just write.**
+  The code-retrieval telemetry path now respects the opt-out gate (skipping the
+  compute, not merely the persist) (NEW-1), retention is no longer inert for
+  opted-out users (NEW-2), `rl-doctor` resolves `text_dim` like the live pipeline
+  (no more false dimension-mismatch) (NEW-3), and the enrichment fan-out is
+  consumer-gated so it's skipped when nothing consumes it (X-4).
+- **`negotiate()` is actually consulted by the live rerank gate.** v0.2.73 shipped
+  `RLClient.negotiate()` but its only caller was `rl-doctor`, so an
+  embedding-space-mismatched or newer-protocol container was still POSTed to on
+  every search. `_do_rerank` now negotiates once per client instance. (RL-10)
+- **Project image pullability is pre-flighted** before the download UX runs (E-3),
+  the bundle `G1` exclude now applies on EVERY add (closing the fresh non-safe-add
+  gap), the `project_setups` row is claimed immediately after insert to close a
+  crash window that could strand a half-initialised project (A2.2), and the
+  rename-time stale-`.env` warning now names the real remediation
+  (`install-bundle --update`, or a one-line `KG_COLLECTION=` edit) instead of a
+  tool that never shipped (B12).
+
+### Added
+- **RL and telemetry data-integrity.** A quarantine marker (`quarantined_at` +
+  `quarantine_reason`, migration 039) marks poisoned `rl_events` rows rather than
+  deleting them, so query-distribution signal survives a backfill (RL-14); a
+  credential-gated live image-variant RL smoke workflow lands as a skeleton
+  (RL-13).
+- **Code-graph migration-edge property specs get a shared home.**
+  `vco_lib/codegraph_schema.py` now owns the additive property specs and the
+  ensure-if-missing loop the `4_to_5` / `5_to_6` migration edges each carried a
+  private copy of (edges consume it via the same import-with-fallback shape used
+  for the canonical class prefix). (P2d)
+- **Install update-gate + deferral-flow extractions.** The update-gate lockfile
+  choreography and the deferral choreography are extracted out of `install.py`
+  (`InstallDeferralFlow`), ratcheting `main()`'s line count down. (P2c)
+- **New cross-language parity + contract tests.** A live-argparse sweep over every
+  emitted CLI command; cross-language KG-sanitizer parity (with the documented
+  divergence pinned by the fixture); cross-language `.env` audit+rewrite parity;
+  a shared derived ignore-set driving analyzer walk + resync prune + classifier;
+  a safe-add end-to-end contract (`.env` skipped, `.claude` env still fully
+  projected); and bounded per-sibling `.sh`/`.ps1` hook disable-guard parity.
+- **Secrets tab `.env` migration is wired to the hub.** The
+  `migrate_env_secrets_from_dotenv` Tauri command (a ~28-releases-stale stub) now
+  performs the Rust→hub round-trip its comment specced, so the SecretsTab
+  "Migrate" button works instead of falling through to CLI-only guidance.
+- **`getColorRgb` collapses to one `$lib` home** (launcher brand triplets), and
+  the orphan codegraph-extras sync-progress listener is removed.
+- **Documentation batch.** Permission-matrix defaults (default-grant KG vs
+  default-deny code-graph/diagrams/secrets), the DECIDED RL telemetry posture, a
+  PowerShell-7+ callout, the canonical secrets 3-tier resolution chain + a
+  write-invariant, a per-KG-node topic guideline, and a `launcher.db` correction.
+
+### Changed
+- **The dead `vco_lib/manifest.py` stub is retired** (three `NotImplementedError`
+  stubs, ~22 releases stale, zero production callers), leaving the live
+  `.vco-manifest.json` writers canonical.
+- **The dormant user-secret emit contract is removed.** The
+  `apply-user-secrets --pairs-json` verb (which could still WRITE secret values
+  into the env surfaces, dormant since v0.2.73 with zero live callers) is deleted;
+  `apply_user_secrets` is now strip-only, leaving "the tree never writes secret
+  VALUES" as the sole invariant (a non-empty pairs set is now a hard error). (P3)
+- **The hub `module_restart` route's `501` is now a documented DECISION**, not an
+  omission: in-process restart via the launcher is the supported posture until the
+  Phase-3+ manifest catalog resolver exists (a partial hub-side resolver would
+  fork the launcher's manifest resolution and drift). (RL-15)
+- **RL consent copy is now honest** about what telemetry is collected (RL-16).
+- **The transformers `CVE-2026-4372` rationale is inlined next to both pins.**
+  The CVE (`GHSA-29pf-2h5f-8g72`) is not reachable from the code-embedding service
+  (it loads only the fixed CodeSage-Large-v2 model, never user/remote model IDs);
+  GitHub closed the corresponding Dependabot alerts on 2026-07-07. The pins are
+  unchanged (bumping past `<4.50` breaks the container) and Dependabot ignore
+  rules are added for the transformers `>=4.50` advisory on both pip manifests.
+
 ## [0.2.74] - 2026-07-07
 
 ### Fixed
