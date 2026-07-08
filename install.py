@@ -7170,7 +7170,10 @@ def _apply_deferred_entries(
                             "rebuild already applied (or schema healed). "
                             "Marking resolved."
                         )
-                        # Resolved: do NOT re-add to current_run_report.
+                        # Resolved: clear any in-memory copy (the A-2 seed
+                        # may have imported the on-disk entry) + tombstone
+                        # against the P1 pre-write re-merge (v0.2.75).
+                        current_run_report.mark_resolved(cid)
                     else:
                         print(
                             f"  [skip] {cid}: drift persists "
@@ -7222,7 +7225,8 @@ def _apply_deferred_entries(
                     "update was resumed (or this very run completed "
                     "it). Marking resolved."
                 )
-                # Resolved: do NOT re-add to current_run_report.
+                # Resolved: clear seeded copy + tombstone (P1, v0.2.75).
+                current_run_report.mark_resolved(cid)
 
         elif cid == "launcher_restart_required":
             # v0.2.54 Track D (Theme 5): the documented self-clear
@@ -7260,7 +7264,8 @@ def _apply_deferred_entries(
                     "the launcher restarted on the new binary. "
                     "Marking resolved."
                 )
-                # Resolved: do NOT re-add to current_run_report.
+                # Resolved: clear seeded copy + tombstone (P1, v0.2.75).
+                current_run_report.mark_resolved(cid)
             else:
                 pid_match = re.search(
                     r"running launcher PID:\s*(\d+)", entry.detected or "",
@@ -7272,7 +7277,8 @@ def _apply_deferred_entries(
                         "exited — the stale in-memory code is gone. "
                         "Marking resolved."
                     )
-                    # Resolved: do NOT re-add to current_run_report.
+                    # Resolved: clear seeded copy + tombstone (P1, v0.2.75).
+                    current_run_report.mark_resolved(cid)
                 else:
                     detail = (
                         f"old launcher PID {old_pid} is still running"
@@ -7323,7 +7329,8 @@ def _apply_deferred_entries(
                     f"{weaviate_url}/v1/.well-known/ready", timeout=5
                 )
                 print(f"  [ok]   {cid}: Weaviate is now reachable. Marking resolved.")
-                # Resolved: do NOT re-add to current_run_report.
+                # Resolved: clear seeded copy + tombstone (P1, v0.2.75).
+                current_run_report.mark_resolved(cid)
             except Exception as exc:
                 print(f"  [fail] {cid}: still unreachable ({exc}). Keeping entry.")
                 current_run_report.add_entry(entry)
@@ -7390,7 +7397,8 @@ def _apply_deferred_entries(
                         f"  [ok]   {cid}: slot `{slot_name}` is present in "
                         f"`{collection_name}`. Marking resolved."
                     )
-                    # Resolved: do NOT re-add to current_run_report.
+                    # Resolved: clear seeded copy + tombstone (P1, v0.2.75).
+                    current_run_report.mark_resolved(cid)
                 else:
                     print(
                         f"  [fail] {cid}: slot `{slot_name}` still missing "
@@ -7434,6 +7442,9 @@ def _apply_deferred_entries(
                                 f"  [ok]   {cid}: collection already absent. "
                                 "Marking resolved."
                             )
+                            # Resolved: clear seeded copy + tombstone
+                            # (P1, v0.2.75).
+                            current_run_report.mark_resolved(cid)
                             continue
                         raise
                     # Sanity-check row count via aggregate (GraphQL):
@@ -7465,7 +7476,8 @@ def _apply_deferred_entries(
                     del_req = urllib.request.Request(schema_url, method="DELETE")
                     urllib.request.urlopen(del_req, timeout=10)
                     print(f"  [ok]   {cid}: collection dropped. Marking resolved.")
-                    # Resolved: do NOT re-add to current_run_report.
+                    # Resolved: clear seeded copy + tombstone (P1, v0.2.75).
+                    current_run_report.mark_resolved(cid)
                 except Exception as exc:  # noqa: BLE001
                     print(
                         f"  [fail] {cid}: delete failed ({exc}). Keeping entry."
@@ -7566,7 +7578,14 @@ def _apply_deferred_entries(
                         f"v{source_version} — the update reached target. "
                         "Marking resolved."
                     )
-                    # Resolved: do NOT re-add.
+                    # Resolved: clear seeded copy + tombstone (P1, v0.2.75).
+                    # This cid is FOREIGN (Rust-emitted,
+                    # git_user_editable_merge.rs — NOT in the owned set), so
+                    # the A-2 seed already imported the on-disk copy into
+                    # current_run_report and the P1 pre-write re-merge would
+                    # re-import it again: without mark_resolved here the
+                    # 'do NOT re-add' resolution was inert since v0.2.73.
+                    current_run_report.mark_resolved(cid)
                 else:
                     blocker = "launcher" if not launcher_ok else "hub"
                     print(

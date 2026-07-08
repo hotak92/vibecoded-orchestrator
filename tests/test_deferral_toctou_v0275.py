@@ -21,21 +21,28 @@ Covers:
   * mid-run foreign ADD survives the final write (the TOCTOU itself);
   * probe-resolved entry does NOT resurrect through the pre-write merge;
   * tombstone unit semantics (mark_resolved → merge skips; re-add revives);
+  * --apply-deferred resolved arms actually clear a FOREIGN entry
+    end-to-end (seed → apply → re-merge → write) — pre-fix, the
+    'do NOT re-add' resolution was inert for foreign cids because the
+    A-2 seed had already imported the on-disk copy;
   * structural guard: install.py carries BOTH merge_from_disk call sites
     (A-2 seed + P1 pre-write re-merge) and still exactly ONE write.
 """
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import install  # type: ignore  # noqa: E402
 from vco_lib.deferral_report import (  # noqa: E402
     DeferralEntry,
     DeferralReport,
@@ -194,6 +201,109 @@ class TestResolvedEntryDoesNotResurrect(unittest.TestCase):
         fresh = DeferralReport()
         self.assertEqual(fresh.merge_from_disk(self.folder, exclude_ids=set()), 1)
         self.assertTrue(fresh.has_condition("sticky_cid"))
+
+
+class TestApplyDeferredForeignResolveClears(unittest.TestCase):
+    """--apply-deferred resolved arms must clear a FOREIGN entry through
+    the FULL main() choreography (A-2 seed → apply → P1 re-merge → write).
+
+    Pre-fix, every resolved arm 'cleared' by simply not re-adding the
+    entry — inert for `launcher_update_diverged` (Rust-emitted, NOT in
+    install.py's owned set): the A-2 seed had already imported the disk
+    copy into memory, so the final write persisted it forever. The arms
+    now call current_run_report.mark_resolved(cid), which drops the
+    seeded copy AND tombstones the cid against the P1 pre-write merge."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.folder = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _seed_run_report(self) -> DeferralReport:
+        run = DeferralReport()
+        run.merge_from_disk(
+            self.folder,
+            exclude_ids=install._INSTALL_OWNED_CONDITION_IDS,
+            exclude_prefixes=install._INSTALL_OWNED_CONDITION_PREFIXES,
+        )
+        return run
+
+    def test_foreign_diverged_entry_clears_end_to_end(self):
+        cid = "launcher_update_diverged"
+        prior = DeferralReport()
+        prior.add_entry(_entry(cid))
+        prior.write(self.folder)
+
+        # A-2 seed: the cid is FOREIGN → imported into memory.
+        run = self._seed_run_report()
+        self.assertTrue(run.has_condition(cid),
+                        "premise: launcher_update_diverged must be FOREIGN "
+                        "(seeded) — if this fails it was added to the owned "
+                        "set and this test needs a different foreign cid")
+
+        # Make the handler's re-probe succeed: on-disk binary metadata at
+        # the source version (hub sidecar absent → treated as OK).
+        subdir, fname = install._launcher_binary_relative_path()
+        dist = self.folder / "launcher" / "dist" / subdir
+        dist.mkdir(parents=True)
+        (dist / f"{fname}.metadata.json").write_text(
+            json.dumps({"launcher_version": "0.2.75"}), encoding="utf-8"
+        )
+        with mock.patch.object(
+            install, "_read_launcher_version", return_value="0.2.75"
+        ):
+            install._apply_deferred_entries(run, self.folder, args=None)
+
+        self.assertFalse(run.has_condition(cid),
+                         "resolved arm must clear the seeded copy")
+
+        # P1 pre-write re-merge (disk copy still present!) + final write.
+        run.merge_from_disk(
+            self.folder,
+            exclude_ids=install._INSTALL_OWNED_CONDITION_IDS,
+            exclude_prefixes=install._INSTALL_OWNED_CONDITION_PREFIXES,
+        )
+        run.write(self.folder)
+
+        after = DeferralReport.read(self.folder)
+        self.assertFalse(
+            after.has_condition(cid),
+            "apply-resolved FOREIGN entry must stay cleared through the "
+            "P1 re-merge + final write",
+        )
+
+    def test_foreign_diverged_entry_kept_when_probe_fails(self):
+        """Keep-side sanity: when the binary has NOT reached the source
+        version, the entry survives the full cycle (re-probe discipline:
+        keep on unconfirmed premise)."""
+        cid = "launcher_update_diverged"
+        prior = DeferralReport()
+        prior.add_entry(_entry(cid))
+        prior.write(self.folder)
+
+        run = self._seed_run_report()
+        subdir, fname = install._launcher_binary_relative_path()
+        dist = self.folder / "launcher" / "dist" / subdir
+        dist.mkdir(parents=True)
+        (dist / f"{fname}.metadata.json").write_text(
+            json.dumps({"launcher_version": "0.2.60"}), encoding="utf-8"
+        )
+        with mock.patch.object(
+            install, "_read_launcher_version", return_value="0.2.75"
+        ):
+            install._apply_deferred_entries(run, self.folder, args=None)
+
+        run.merge_from_disk(
+            self.folder,
+            exclude_ids=install._INSTALL_OWNED_CONDITION_IDS,
+            exclude_prefixes=install._INSTALL_OWNED_CONDITION_PREFIXES,
+        )
+        run.write(self.folder)
+        after = DeferralReport.read(self.folder)
+        self.assertTrue(after.has_condition(cid),
+                        "unresolved entry must be kept (probe not met)")
 
 
 class TestInstallPreWriteMergeStructure(unittest.TestCase):
