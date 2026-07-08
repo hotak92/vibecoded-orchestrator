@@ -192,7 +192,7 @@ def test_one_liner_attached_on_single_chunk_tier(srv_with_sidecar):
 
 
 def test_chunk_map_header_marks_shown_and_unshown(srv_with_sidecar):
-    def _fetcher(full_name, hit_chunk, total, max_chunks):
+    def _fetcher(full_name, hit_chunk, total, max_chunks, file_path=""):  # C-8: +file_path
         return [
             {"chunk_num": 0, "function_body": "part zero"},
             {"chunk_num": 1, "function_body": "part one"},
@@ -213,7 +213,7 @@ def test_chunk_map_header_marks_shown_and_unshown(srv_with_sidecar):
 
 def test_chunk_map_header_on_degraded_fallback(srv_with_sidecar):
     """three_chunks with a failing fetcher still shows the map (hit marked)."""
-    def _fetcher(full_name, hit_chunk, total, max_chunks):
+    def _fetcher(full_name, hit_chunk, total, max_chunks, file_path=""):  # C-8: +file_path
         return []
 
     out = srv_with_sidecar._format_code_result_by_tier(
@@ -227,7 +227,7 @@ def test_chunk_map_header_on_degraded_fallback(srv_with_sidecar):
 
 
 def test_no_chunk_map_without_sidecar(srv_no_sidecar):
-    def _fetcher(full_name, hit_chunk, total, max_chunks):
+    def _fetcher(full_name, hit_chunk, total, max_chunks, file_path=""):  # C-8: +file_path
         return [
             {"chunk_num": 0, "function_body": "part zero"},
             {"chunk_num": 1, "function_body": "part one"},

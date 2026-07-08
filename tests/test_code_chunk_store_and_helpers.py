@@ -272,7 +272,7 @@ def test_code_tier_render_full_assembles_via_fetcher():
         "chunk_num": 1, "total_chunks": 3,
     }
 
-    def fetcher(full_name, hit, total, max_chunks):
+    def fetcher(full_name, hit, total, max_chunks, file_path=""):  # C-8: +file_path
         assert full_name == "mod.f"
         assert max_chunks == 7  # full-tier window
         return [

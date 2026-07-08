@@ -705,7 +705,12 @@ class CodeGraphQuery:
             # identity; CodeFunction + CodeClass are the only chunked code
             # collections). Returns [] on any failure or for a single-chunk
             # entity; only invoked for the three_chunks / full tiers.
-            def _code_chunk_fetcher(full_name: str, hit_chunk: int, total: int, max_chunks: int) -> list[dict]:
+            def _code_chunk_fetcher(full_name: str, hit_chunk: int, total: int, max_chunks: int, file_path: str = "") -> list[dict]:
+                # C-8 (v0.2.75 P2b): `file_path` scopes the fetch to the winning
+                # row's source file — two same-`full_name` entities in different
+                # files cannot interleave chunk bodies. Empty preserves the
+                # pre-fix full_name+project filter. MUST MATCH the MCP's
+                # `_fetch_code_chunks` (server.py) — CLI≡MCP parity.
                 if not full_name or total <= 1 or max_chunks <= 1:
                     return []
                 collected_chunks: list[tuple[int, dict]] = []
@@ -715,6 +720,8 @@ class CodeGraphQuery:
                         flt = Filter.by_property("full_name").equal(full_name)
                         if self.project:
                             flt = flt & Filter.by_property("project").equal(self.project)
+                        if file_path:
+                            flt = flt & Filter.by_property("file_path").equal(file_path)
                         resp = coll_obj.query.fetch_objects(filters=flt, limit=max(total, max_chunks) + 4)
                         for obj in resp.objects:
                             cp = obj.properties or {}

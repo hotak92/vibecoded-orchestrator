@@ -1559,10 +1559,13 @@ def _format_code_result_by_tier(
         tier: one of "summary" | "single_chunk" | "three_chunks" | "full".
         score / distance: display metadata.
         chunk_fetcher: optional callable
-            ``(full_name, hit_chunk_num, total_chunks, max_chunks) -> list[dict]``
-            returning up to ``max_chunks`` chunk-property dicts (matched +
-            neighbours) for the three_chunks / full tiers. ``None`` → the tier
-            degrades to single_chunk (just the matched chunk's body).
+            ``(full_name, hit_chunk_num, total_chunks, max_chunks, file_path)
+            -> list[dict]`` returning up to ``max_chunks`` chunk-property dicts
+            (matched + neighbours) for the three_chunks / full tiers. ``None`` →
+            the tier degrades to single_chunk (just the matched chunk's body).
+            ``file_path`` (C-8) scopes the fetch to the winning row's source
+            file so two same-``full_name`` entities in different files cannot
+            interleave chunk bodies.
 
     Returns:
         A result dict with ``collection``/``tier``/``file_path`` + tier body.
@@ -1644,8 +1647,16 @@ def _format_code_result_by_tier(
     except (TypeError, ValueError):
         total = 1
     try:
+        # C-8 (v0.2.75 P2b): thread the WINNING row's file_path so the fetcher
+        # scopes chunk assembly to the SAME source file. Two entities with the
+        # same `full_name` in different files (a common stem like `__init__` /
+        # `run` / `main`) otherwise interleave each other's chunk bodies at the
+        # three_chunks/full tiers. This is the ONE shared call site (both the
+        # MCP `_fetch_code_chunks` and the CLI `_code_chunk_fetcher` route
+        # through here), so the fix reaches both surfaces identically.
         chunks = chunk_fetcher(
             properties.get("full_name", ""), hit_chunk, total, window,
+            real_file_path,
         ) or []
     except Exception as exc:  # noqa: BLE001 — best-effort; degrade to single
         logger.debug("code chunk_fetcher failed: %s", exc)
@@ -1719,14 +1730,36 @@ def make_code_collapse_fn(*, dedup_kind: str = "code"):
             # carries `endpoint`+`method`. Without the fallback both flatten
             # to the ("","") key, bucket into ONE group, and only the single
             # best row survives (modules + APIs even merged together).
+            # C-7 (v0.2.75 P2b): widen the API/Interaction fallback identity.
+            # CodeAPI/CodeInteraction carry no file_path (the V52-O.4 stamp is
+            # Function/Class-only), so their collapse key was `("", method+
+            # endpoint)`. Same-endpoint rows that differ in `handler` (APIs) or
+            # `interaction_type`/`direction`/`raw_target`/`protocol`
+            # (interactions) all flattened to ONE key → only the single best row
+            # survived (real distinct edges silently dropped). Fold the
+            # distinguishing fields into the fallback name so those rows keep
+            # separate identities. Function/Class rows are unaffected (they hit
+            # the `full_name` branch first). `handler` is a reference property —
+            # str() tolerates a UUID/list/None uniformly (identity only).
+            _fallback_name = p.get("full_name") or p.get("path")
+            if not _fallback_name:
+                _method = str(p.get("method", "") or "")
+                _endpoint = str(p.get("endpoint", "") or "")
+                _bits = [f"{_method} {_endpoint}".strip()]
+                # CodeAPI discriminator.
+                _handler = p.get("handler")
+                if _handler:
+                    _bits.append(f"handler={_handler}")
+                # CodeInteraction discriminators.
+                for _fld in ("interaction_type", "direction", "raw_target", "protocol"):
+                    _v = p.get(_fld)
+                    if _v:
+                        _bits.append(f"{_fld}={_v}")
+                _fallback_name = "|".join(b for b in _bits if b).strip()
             entry = {
                 **r,  # preserve _s / _p / _rerank / _boost / _c / _d / _src
                 "file_path": p.get("file_path") or p.get("path") or "",
-                "full_name": (
-                    p.get("full_name")
-                    or p.get("path")
-                    or f'{p.get("method", "") or ""} {p.get("endpoint", "") or ""}'.strip()
-                ),
+                "full_name": _fallback_name,
                 "chunk_num": p.get("chunk_num"),
                 # collapse ranks on THIS field → use the boosted score so P2
                 # ordering (not raw semantic) decides the surviving chunk.
@@ -6346,12 +6379,18 @@ async def search_code_graph(
                 siblings.append(ref)
             return siblings
 
-        def _fetch_code_chunks(full_name: str, hit_chunk: int, total: int, max_chunks: int) -> list[dict]:
+        def _fetch_code_chunks(full_name: str, hit_chunk: int, total: int, max_chunks: int, file_path: str = "") -> list[dict]:
             """Fetch up to `max_chunks` property-dicts for one code entity's
             chunks (matched + neighbours), ordered by chunk_num, centred on
             `hit_chunk`. Keyed on `full_name` (code's node identity) — the
             code analogue of `_fetch_node_chunks` (which keys on `title`).
             Returns [] on any failure or for a single-chunk entity.
+
+            C-8 (v0.2.75 P2b): `file_path` scopes the fetch to the winning
+            row's source file so two same-`full_name` entities in different
+            files (a common stem like `run`/`main`/`__init__`) cannot interleave
+            each other's chunk bodies. Empty `file_path` (older callers / rows
+            with no stamp) preserves the pre-fix full_name+project filter.
 
             Closes over `client` + `_project_collection`; passed to
             `_format_code_result_by_tier` as `chunk_fetcher` so the helper
@@ -6367,6 +6406,8 @@ async def search_code_graph(
                     flt = Filter.by_property("full_name").equal(full_name)
                     if effective_project:
                         flt = flt & Filter.by_property("project").equal(effective_project)
+                    if file_path:
+                        flt = flt & Filter.by_property("file_path").equal(file_path)
                     resp = coll_obj.query.fetch_objects(filters=flt, limit=max(total, max_chunks) + 4)
                     for obj in resp.objects:
                         cp = obj.properties or {}
