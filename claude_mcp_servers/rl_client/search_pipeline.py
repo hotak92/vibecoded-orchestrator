@@ -447,6 +447,55 @@ def _resolve_rl_enabled() -> bool:
     return True
 
 
+# v0.2.75 (RL-10 completion): negotiation verdicts that REFUSE the live
+# rerank. Kept as a module constant so tests + rl-doctor copy can pin
+# against one home. Everything else — "compatible", "degraded_old_server"
+# (old container, absent /health fields: correct-by-design keep-reranking),
+# "unreachable", "disabled" — proceeds to the per-call fallback machinery.
+_NEGOTIATION_REFUSE_STATUSES = ("embedding_space_mismatch", "incompatible_new_server")
+
+# Attribute name used to memoise the negotiation verdict on the RLClient
+# instance. Client instances are already cached per (active_embedding,
+# project_id) in server._rl_client_instances, so "once per client instance"
+# == once per (embedding, project) pairing per process.
+_NEGOTIATION_CACHE_ATTR = "_vct_cached_negotiation"
+
+
+async def _negotiate_cached(client: Any) -> Optional[Any]:
+    """RL-10 completion (v0.2.75): negotiate once per RLClient instance.
+
+    Calls ``client.negotiate()`` (ONE ``/health`` probe) the first time a
+    given client instance reaches the rerank path, then memoises the
+    ``NegotiationResult`` on the instance — subsequent reranks reuse the
+    verdict with zero extra probes.
+
+    Returns the cached ``NegotiationResult``, or ``None`` when negotiation
+    itself failed at the transport level (``negotiate`` is contractually
+    non-raising, but we stay defensive): ``None`` means "no verdict — fall
+    OPEN to the existing per-call fallback path". The failure outcome is
+    ALSO cached (still exactly one probe per instance); a container that
+    comes up later is handled by ``cache_nodes``' own per-call retry
+    semantics, at the deliberate cost of not re-checking its embedding
+    space mid-process (an accepted trade-off: re-probing per call would
+    add up to 1 s of /health latency to every search on a down container).
+    """
+    sentinel = object()
+    cached = getattr(client, _NEGOTIATION_CACHE_ATTR, sentinel)
+    if cached is not sentinel:
+        return cached
+    result: Optional[Any]
+    try:
+        result = await client.negotiate()
+    except Exception as exc:  # noqa: BLE001 — negotiation must never block retrieval
+        logger.debug("_negotiate_cached: negotiate raised (%s); falling open", exc)
+        result = None
+    try:
+        setattr(client, _NEGOTIATION_CACHE_ATTR, result)
+    except Exception:  # noqa: BLE001 — a slots-only test double can't cache; still works
+        pass
+    return result
+
+
 async def _do_rerank(
     *,
     query: str,
@@ -471,6 +520,24 @@ async def _do_rerank(
         return None
     client = _get_rl_client()
     if client is None:
+        return None
+    # v0.2.75 (RL-10 completion): gate the LIVE rerank on the cached
+    # negotiation verdict. Pre-v0.2.75 ``negotiate()`` existed but had
+    # exactly ONE caller (rl-doctor) — the pipeline itself never consulted
+    # it, so an embedding-space-mismatched or newer-protocol container was
+    # still POSTed to on every search (the exact hazard RL-10 classified).
+    # Hard-refuse statuses fall back to cosine (rl_used=False) and count in
+    # the persistent RL-3 fallback counter so rl-doctor and the counter
+    # agree on WHY. ``degraded_old_server`` keeps reranking
+    # (correct-by-design: extra=allow tolerance); ``unreachable`` /
+    # ``disabled`` / a negotiation transport failure all fall OPEN to the
+    # existing per-call fallback path below — negotiation must never
+    # BLOCK retrieval, only refuse a positively-identified bad pairing.
+    neg = await _negotiate_cached(client)
+    if neg is not None and getattr(neg, "status", "") in _NEGOTIATION_REFUSE_STATUSES:
+        _record_rl_fallback(
+            f"negotiation refused: {neg.status} — {getattr(neg, 'detail', '')}"
+        )
         return None
     # Pre-resolve session_id with the same 3-layer rule we use for
     # telemetry — keeps the X-VCT-Session-ID header on cache_nodes
