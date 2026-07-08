@@ -15,6 +15,24 @@ request and the fresh subprocess reads the new env at module-import
 time. No half-reloaded state, no per-var allowlist, no need to track
 which env reads ran early vs late in the server lifecycle.
 
+**Accepted in-flight trade (F-12).** The clean exit is not free — it is
+deliberately preferred over the more complex alternatives:
+  * An in-flight tool call (a ``hybrid_search`` mid-fan-out, a
+    ``store_knowledge_node`` mid-write) that is executing when SIGHUP
+    arrives dies with the process — the client sees a transport error and
+    must retry. This is rare (reloads fire only on a settings.json env
+    change, not per request) and a retry is cheap, so we accept it rather
+    than build a request-quiescence barrier.
+  * A ``store_knowledge_node`` interrupted BETWEEN its .md file write and
+    its Weaviate upsert leaves the node on disk but not yet in the index;
+    it self-heals at the next ``kg-sync`` (or the next successful upsert of
+    that node) — no data loss, just a temporary retrieval gap.
+If telemetry ever correlates reload audits with a spike in tool errors,
+the escape hatch is a *drain flag*: set a "reloading" sentinel, let
+in-flight calls finish (bounded wait), reject new ones with a retriable
+error, then exit. Not built today because the observed error rate does
+not justify the added state.
+
 Usage in each MCP's ``server.py`` (early, just after the logger is
 ready and before ``mcp.run_*()``):
 
