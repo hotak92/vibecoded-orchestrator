@@ -5622,6 +5622,15 @@ class CodeGraphAnalyzer:
         # so the orphan-clear must match against BOTH forms to identify which
         # rows belong to the primary source vs an --extra-path source.
         self._analyze_repo_root_raw = repo_path.as_posix()
+        # v0.2.75 (P2a / CG-4): flag a WHOLE-REPO walk (neither single-file nor
+        # --only-files-from). Only on a whole-repo walk does the orphan-clear
+        # extend its reachability test to CURRENT-revision primary rows (a
+        # `git rm`-ed file leaves rows at the current embed_revision — not stale
+        # — so the stale-only scan never sees them and they keep serving search
+        # results). Single-file / --only-files-from walks touch only the named
+        # files and MUST NOT sweep the whole collection (they'd delete rows for
+        # files simply not in this narrow batch). See `_build_stale_file_set`.
+        self._analyze_whole_repo = (only_file is None and only_files_from is None)
 
         # v0.2.47 (extras): validate + canonicalise extras up-front so
         # downstream loops can assume each entry is an existing absolute
@@ -8288,6 +8297,30 @@ class CodeGraphAnalyzer:
                     f"{getattr(coll, 'name', '?')}: {exc}",
                     file=sys.stderr,
                 )
+
+        # v0.2.75 (P2a / CG-4): residual-orphan window. The loop above only
+        # scans collections that hold STALE-revision rows — a file deleted from
+        # disk (`git rm`, no editor hook) leaves its rows at the CURRENT
+        # embed_revision, so `classify_row` calls them `not_owed` (correctly —
+        # they ARE embed-converged) and the stale-only scan never sees them.
+        # They keep serving `search_code_graph` results forever. Close the
+        # window with a reachability-only sweep that runs ONLY on a whole-repo
+        # walk (single-file / --only-files-from touch only named files and must
+        # never sweep the collection) and deletes PRIMARY-source rows whose
+        # path no longer resolves on disk — regardless of revision. Extra-path
+        # rows are strictly out of scope (B1): they converge on their own
+        # root's walk and this walk cannot judge their reachability. Fail-open
+        # on an unknown root (never delete on uncertainty).
+        if repo_root is not None and bool(getattr(self, "_analyze_whole_repo", False)):
+            for coll, path_prop in probes:
+                if coll is None:
+                    continue
+                swept, sweep_failures = self._clear_deleted_primary_rows(
+                    coll, path_prop, repo_root, _primary_sources
+                )
+                orphans_cleared += swept
+                orphan_failures += sweep_failures
+
         if orphans_cleared or orphan_failures:
             print(
                 f"   🧹 cleared {orphans_cleared} orphan (deleted-file) "
@@ -8308,6 +8341,70 @@ class CodeGraphAnalyzer:
         if not determinable:
             return None
         return frozenset(stale)
+
+    def _clear_deleted_primary_rows(
+        self, coll, path_prop: str, repo_root: "Path", primary_sources: "Set[str]"
+    ) -> "Tuple[int, int]":
+        """P2a (CG-4): delete PRIMARY-source rows whose file is gone from disk.
+
+        The residual-orphan window: a file deleted from disk leaves rows at the
+        CURRENT ``embed_revision``. Those are not stale, so ``_build_stale_file_set``'s
+        stale-only scan never sees them and they keep surfacing in search. This
+        sweep — invoked ONLY on a whole-repo walk — iterates the collection and
+        deletes rows that (a) belong to the PRIMARY source (empty/absent
+        ``project_source``, or a value in ``primary_sources``), (b) carry a
+        non-empty path, and (c) whose path does not resolve on disk inside
+        ``repo_root``. It deliberately IGNORES revision: the whole point is to
+        catch current-revision orphans the classifier calls ``not_owed``.
+
+        Scoping / safety:
+          * Extra-path rows (a non-empty ``project_source`` NOT in
+            ``primary_sources``) are NEVER touched (B1 tenant isolation) — they
+            converge on their own root's walk and this walk cannot judge their
+            files' existence.
+          * Pathless rows are left to the classifier-routed orphan-clear
+            (``purgeable``) — this sweep only handles path-bearing deleted files.
+          * All deletes go through the ONE safe primitive
+            ``_delete_file_rows_exact`` (exact-Python-compare + ``delete_by_id``,
+            never a tokenized Like/Equal DELETE). The predicate re-reads the raw
+            path per row inside the helper, so the decision is made on the value
+            the helper itself read back.
+          * Reachability is fail-SAFE toward KEEPING (``_path_reachable_on_disk``
+            returns True on any probe error / escape-uncertainty), so a transient
+            filesystem error never authorises a delete.
+
+        Returns ``(deleted, failures)``; a per-collection scan failure soft-fails
+        to ``(0, 0)`` (an incomplete scan must never authorise deletes).
+        """
+        def _is_deleted_primary(raw_path, _props):
+            del raw_path  # re-read from _props (the helper's own read-back)
+            path_val = str(_props.get(path_prop) or "")
+            if not path_val:
+                return False  # pathless → classifier's orphan-clear owns it
+            # Primary-source scoping (mirror of classify_row step 2 / B1): an
+            # extra-path row (non-empty source outside the primary set) is never
+            # judged here.
+            src = str(_props.get("project_source") or "").strip()
+            if src and primary_sources and src not in primary_sources:
+                return False
+            # Deleted-file test — revision-independent (the CG-4 gap).
+            return not _path_reachable_on_disk(path_val, repo_root)
+
+        try:
+            return _delete_file_rows_exact(
+                coll,
+                path_prop,
+                _is_deleted_primary,
+                extra_props=[_EMBED_REVISION_PROP, "project_source"],
+                log_prefix="deleted-file sweep (P2a)",
+            )
+        except Exception as exc:  # noqa: BLE001 — sweep soft-fails, never crashes
+            print(
+                f"⚠️  deleted-file sweep failed on "
+                f"{getattr(coll, 'name', '?')}: {exc}",
+                file=sys.stderr,
+            )
+            return (0, 0)
 
     def _get_stale_file_set(self) -> Optional[frozenset]:
         """Lazily-built, per-run cached stale-file set (see the builder)."""
