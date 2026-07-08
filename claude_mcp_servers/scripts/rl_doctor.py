@@ -25,17 +25,26 @@ gate and outcome on the RL path:
   4. Telemetry write status — can the hub-backed rl_events writer reach the hub?
   5. Retention status (RL-5) — is the append-only rl_events table being bounded?
 
-It NEVER mutates anything: no writes, no container start, no config change. It
-prints a human-readable report by default, or ``--json`` for machine consumption
-(support tooling / CI). Every probe soft-fails to a clear "unknown / can't
-determine" status rather than crashing — a diagnostic that dies on a degraded
-system is useless.
+It NEVER mutates anything by default: no writes, no container start, no config
+change. It prints a human-readable report by default, or ``--json`` for machine
+consumption (support tooling / CI). Every probe soft-fails to a clear
+"unknown / can't determine" status rather than crashing — a diagnostic that
+dies on a degraded system is useless.
+
+ONE deliberate exception (v0.2.75 NEW-2): ``--prune`` runs a single
+``rl_events`` retention pass NOW, bypassing the hourly throttle. It exists as
+the explicit trigger for opted-out users (whose search path only drives the
+throttled opportunistic prune) and for operators who just tightened
+``RL_EVENTS_RETENTION_MAX_AGE_DAYS``. Deletion bounds and the 6-h
+in-flight-citation floor are identical to the automatic path
+(``rl_retention.maybe_run_retention`` — one home).
 
 USAGE
 -----
     python claude_mcp_servers/scripts/rl_doctor.py            # human report
     python claude_mcp_servers/scripts/rl_doctor.py --json     # machine JSON
     python claude_mcp_servers/scripts/rl_doctor.py --project-root /path
+    python claude_mcp_servers/scripts/rl_doctor.py --prune    # + one retention pass
 
 Exit code: 0 when the RL path is healthy OR legitimately free-tier (nothing to
 fix); 1 when RL is ENABLED but a fixable problem was found (container down,
@@ -325,7 +334,10 @@ def format_human(report: Dict[str, Any]) -> str:
 def main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="rl-doctor",
-        description="Read-only RL retrieval health diagnostic (v0.2.73 RL-12).",
+        description=(
+            "Read-only RL retrieval health diagnostic (v0.2.73 RL-12). "
+            "The single mutating exception is --prune (v0.2.75 NEW-2)."
+        ),
     )
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     parser.add_argument(
@@ -333,17 +345,52 @@ def main(argv: Optional[list] = None) -> int:
         default=None,
         help="override project root (default: CLAUDE_PROJECT_DIR → KG_BASE_DIR → cwd)",
     )
+    parser.add_argument(
+        "--prune",
+        action="store_true",
+        help=(
+            "run ONE rl_events retention pass now (bypasses the hourly "
+            "throttle). The only mutating flag on this otherwise read-only "
+            "tool — explicit trigger for opted-out users / freshly-tightened "
+            "retention bounds (v0.2.75 NEW-2)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     project_root = _resolve_project_root(args.project_root)
     report = run_diagnostics(project_root)
 
+    if args.prune:
+        report["prune_run"] = _run_prune_now()
+
     if args.json:
         print(json.dumps(report, indent=2, default=str))
     else:
         print(format_human(report))
+        if args.prune:
+            pr = report["prune_run"]
+            print(
+                f"\n[prune (--prune)] ran={pr.get('ran')} "
+                f"deleted={pr.get('deleted')} skipped={pr.get('skipped')} "
+                f"reason={pr.get('reason')}"
+            )
 
     return 0 if report["healthy"] else 1
+
+
+def _run_prune_now() -> Dict[str, Any]:
+    """NEW-2 (v0.2.75): one forced retention pass. Same single home as the
+    automatic drivers (``rl_retention.maybe_run_retention``) — the 6-h
+    in-flight-citation floor and the no-bounds no-op guard apply identically.
+    Soft-fails to a status dict; never raises."""
+    try:
+        from claude_mcp_servers.rl_client.rl_retention import maybe_run_retention
+    except Exception as exc:  # noqa: BLE001
+        return {"ran": False, "skipped": "import_failed", "deleted": None, "reason": str(exc)}
+    try:
+        return maybe_run_retention(force=True)
+    except Exception as exc:  # noqa: BLE001
+        return {"ran": False, "skipped": "prune_error", "deleted": None, "reason": str(exc)}
 
 
 if __name__ == "__main__":

@@ -277,13 +277,20 @@ class RLTelemetryWriter:
                 envelope = self._wrap_for_hub("retrieval", task_id, task_type, event)
                 self._last_envelope = envelope
                 self._hub_post(envelope)
-                # RL-5 (v0.2.73): opportunistically drive bounded retention on
-                # the same hub connection cadence. Throttled to ≤1 pass/hour per
-                # process (RL_EVENTS_RETENTION_MIN_INTERVAL_S) so this is nearly
-                # free; soft-fail so a wedged/older hub never breaks the write.
-                self._maybe_prune_rl_events()
             except Exception as exc:
                 logger.debug("RLTelemetryWriter: hub log_retrieval failed (%s)", exc)
+
+        # RL-5 (v0.2.73) + NEW-2 (v0.2.75): opportunistically drive bounded
+        # retention on the write cadence. Throttled to ≤1 pass/hour per process
+        # (RL_EVENTS_RETENTION_MIN_INTERVAL_S) so this is nearly free; soft-fail
+        # so a wedged/older hub never breaks the write. NEW-2 moved this OUT of
+        # the logging-enabled branch: the prune is consumer-independent
+        # HOUSEKEEPING, not telemetry — a user who opts out of collecting NEW
+        # events still wants their pre-existing rl_events rows to age out (the
+        # opt-out promise is "stop recording me", not "keep my old rows
+        # forever"). The 6-h in-flight-citation floor inside the retention plan
+        # applies identically in both branches.
+        self._maybe_prune_rl_events()
 
         # Upload publish (gated on consent.rl_data). v0.2.47 note:
         # the Supabase end-to-end wiring for these payloads has not been

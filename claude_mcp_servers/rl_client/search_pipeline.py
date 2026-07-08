@@ -232,6 +232,17 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
             "rerank_and_emit: no retrieval-event consumer (local logging off + "
             "no upload consent); skipping retrieval emit"
         )
+        # NEW-2 (v0.2.75): retention is consumer-independent HOUSEKEEPING, not
+        # telemetry — a fully-opted-out user never reaches the writer (whose
+        # write cadence normally drives the RL-5 prune), so their pre-existing
+        # rl_events rows would grow immortal. Drive the same hourly-throttled
+        # prune from the skip branch. to_thread: the prune's hub POST is a
+        # blocking urllib call (same offload discipline as the emit); the
+        # throttled no-op path returns in microseconds.
+        try:
+            await asyncio.to_thread(_drive_retention_housekeeping)
+        except Exception as exc:  # noqa: BLE001 — housekeeping never breaks search
+            logger.debug("rerank_and_emit: opted-out retention drive raised (%s)", exc)
     else:
         emit_success = await _emit_retrieval_event(req, ranked, task_id, rl_used)
 
@@ -332,6 +343,34 @@ async def _emit_retrieval_event(
 
 
 # ---- internal helpers ----------------------------------------------
+
+
+def _drive_retention_housekeeping() -> None:
+    """NEW-2 (v0.2.75): drive one throttled rl_events retention pass.
+
+    Used by the opted-out skip branch in ``rerank_and_emit`` — mirrors the
+    writer-side ``RLTelemetryWriter._maybe_prune_rl_events`` (same
+    ``maybe_run_retention`` single home: same hourly throttle, same 6-h
+    in-flight-citation floor, same soft-fail). Project scope resolves the
+    same way the writer's does (the hub ProjectConfig); resolution failure
+    degrades to a global prune, matching the writer's project_id=None
+    free-tier behaviour. Never raises.
+    """
+    project_id: Optional[str] = None
+    try:
+        from claude_mcp_servers.weaviate_mcp.server import _try_resolve_project_config
+
+        cfg = _try_resolve_project_config()
+        if cfg is not None:
+            project_id = getattr(cfg, "project_id", None)
+    except Exception:  # noqa: BLE001 — scope resolution is best-effort
+        project_id = None
+    try:
+        from .rl_retention import maybe_run_retention
+
+        maybe_run_retention(project_id=project_id)
+    except Exception as exc:  # noqa: BLE001 — retention never breaks the caller
+        logger.debug("_drive_retention_housekeeping: raised (%s)", exc)
 
 
 def _retrieval_emit_has_consumer() -> bool:
