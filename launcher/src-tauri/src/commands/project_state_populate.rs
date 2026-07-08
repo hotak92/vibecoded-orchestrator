@@ -76,6 +76,18 @@ pub struct PopulateReport {
 /// Idempotent: safe to call multiple times for the same project. The
 /// underlying `register_*` upserts leave `enabled` untouched on conflict
 /// so user toggles survive a re-run.
+// Permission-matrix defaults asymmetry (audit A2.1, v0.2.75). The three
+// access matrices this function seeds do NOT share a default: KG is
+// default-GRANT (own primary + own dev + shared bundled KG get read/write
+// rows below, via `populate_kg_collection_access`), while code-graph,
+// diagrams, AND secrets are default-DENY (no auto-grant — the user opts in
+// per-project via the launcher GUI). KG grants by default because its read
+// gate rejects any collection without an explicit row, so a fresh project's
+// searches against its own KG would fail on day one; knowledge is also
+// intentionally cross-project value. Source code / diagrams / secrets are
+// per-tenant and proprietary, so they stay empty until deliberately granted.
+// Full rationale + the backing-table map: docs/CONFIGURATION.md
+// § Permission matrices.
 pub fn populate_project_state_from_filesystem(
     project_id: &str,
     project_name: &str,
