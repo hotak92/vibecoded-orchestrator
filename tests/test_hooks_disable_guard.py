@@ -227,3 +227,89 @@ def test_all_hooks_have_guard_count_matches() -> None:
         f"Hooks missing VCT_DISABLE_HOOKS guard: "
         f"{sorted(set(h.name for h in hooks) - set(h.name for h in with_guard))}"
     )
+
+
+# ---------------------------------------------------------------------------
+# v0.2.75 (audit E2.1 / F2.2): bounded SEMANTIC parity across .sh/.ps1 pairs.
+#
+# The CI hook-parity gate (`.github/scripts/check_hook_parity.py`) checks only
+# that every `.sh` has a `.ps1` SIBLING — existence, not behaviour. E2.1 asked
+# whether we can cheaply also assert the pair does the SAME conceptual work.
+#
+# What we CAN assert cheaply and reliably (implemented below): every sibling
+# PAIR honours the same disable-guard token — if the `.sh` has a
+# `VCT_DISABLE_HOOKS` guard, its `.ps1` must too (and vice versa). This is the
+# highest-value structural invariant (a `.ps1` missing the guard would keep
+# firing on `VCT_DISABLE_HOOKS=1` runs while the `.sh` short-circuits) and it
+# is noise-free.
+#
+# What we deliberately do NOT force (the "(b)" option from the brief —
+# per-hook env-var-name intersection): empirically too noisy across the 45
+# real pairs. Two independent probes at v0.2.75:
+#   * Broad env-name extraction ([A-Z_]{4,} referenced via $VAR / $env:VAR)
+#     surfaced 250+ names present on ONE side only — but the overwhelming
+#     majority are LOCAL shell variables (SCRIPT_DIR, HOOK_STDIN, PARSED, …)
+#     whose naming idioms legitimately differ between bash and PowerShell,
+#     plus OS-specific env (bash HOME/TMPDIR vs PowerShell USERPROFILE/TEMP/
+#     LOCALAPPDATA). None of those are real cross-language contract drift.
+#   * Even scoped to genuine external knobs (VCT_/VCO_/CLAUDE_/LEAN_CTX_
+#     prefixes) the sides diverge for GOOD reasons: the bash hooks read
+#     `VCO_VENV_PYTHON` where the PowerShell siblings read `VCT_VENV` /
+#     `VCT_PYTHON` (same concept, per-language name), and container knobs
+#     (`VCO_WEAVIATE_CONTAINER`, …) are read only by the bash container hook.
+# A per-var-name assertion would therefore need a large, brittle allowlist
+# that documents the divergence rather than catching bugs — negative value.
+# So we keep (a) and record the (b) noise profile here instead of forcing it.
+# ---------------------------------------------------------------------------
+
+
+def _sibling_pairs() -> list[tuple[Path, Path]]:
+    """All (`.sh`, `.ps1`) sibling pairs under templates/hooks/.
+
+    Only pairs where BOTH files exist are returned — the existence gate is
+    the CI script's job; this test focuses on behavioural parity of the
+    pairs that are supposed to mirror each other.
+    """
+    out: list[tuple[Path, Path]] = []
+    for sh in _hook_files():
+        ps1 = sh.with_suffix(".ps1")
+        if ps1.exists():
+            out.append((sh, ps1))
+    return out
+
+
+def test_sibling_pairs_exist() -> None:
+    """At least a substantial set of pairs must exist, so a globbing typo
+    that silently drops every pair can't make the parity test vacuously
+    pass."""
+    pairs = _sibling_pairs()
+    assert len(pairs) >= 20, (
+        f"expected many .sh/.ps1 sibling pairs under {HOOKS_DIR}, "
+        f"found {len(pairs)} — glob or directory layout changed?"
+    )
+
+
+@pytest.mark.parametrize(
+    "sh_path,ps1_path",
+    _sibling_pairs(),
+    ids=lambda p: p.name,
+)
+def test_sibling_pair_shares_disable_guard(sh_path: Path, ps1_path: Path) -> None:
+    """(a) Bounded semantic parity: a sibling pair must agree on whether it
+    carries the `VCT_DISABLE_HOOKS` disable-guard.
+
+    If the `.sh` guards on `VCT_DISABLE_HOOKS` (the norm — enforced hook-wide
+    by `test_all_hooks_have_guard_count_matches`), the `.ps1` MUST too, else the
+    Windows path keeps firing on disabled runs. The check is symmetric so a
+    future guard-less `.sh` paired with a guarded `.ps1` also trips.
+    """
+    sh_text = sh_path.read_text(encoding="utf-8")
+    ps1_text = ps1_path.read_text(encoding="utf-8-sig")
+    sh_has = "VCT_DISABLE_HOOKS" in sh_text
+    ps1_has = "VCT_DISABLE_HOOKS" in ps1_text
+    assert sh_has == ps1_has, (
+        f"{sh_path.name} / {ps1_path.name}: disable-guard mismatch — "
+        f".sh has VCT_DISABLE_HOOKS={sh_has}, .ps1 has={ps1_has}. Both "
+        f"siblings must honour the same disable-guard so a "
+        f"VCT_DISABLE_HOOKS=1 run short-circuits on every OS."
+    )
