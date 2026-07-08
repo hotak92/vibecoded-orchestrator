@@ -48,6 +48,8 @@
   import FilePickerControl from '$lib/components/module-controls/FilePickerControl.svelte';
   import LinkControl from '$lib/components/module-controls/LinkControl.svelte';
   import {
+    buttonHiddenByWeightsProbe,
+    configTabHasDefaultWeightsButton,
     sectionUsesProjectId,
     substituteEmbeddingSourceInAction,
   } from '$lib/components/module-controls/configTabHelpers';
@@ -278,6 +280,16 @@
     | null
   >(null);
 
+  // ─── v0.2.75 RL-11: default-weights bucket probe ───────────────────────
+  //
+  // `null` = probe pending / not run — buttons subject to the gate render
+  // HIDDEN until the probe POSITIVELY confirms the bucket is populated
+  // (the bucket is parked-empty today; an unconfirmed button is a dead
+  // click for every tier). Probed once per tab mount, only when the
+  // manifest actually contains a gated button; the Rust side caches the
+  // verdict per (module, embedding_source) with a 10-min TTL.
+  let weightsBucketAvailable = $state<boolean | null>(null);
+
   function ckey(sectionIdx: number, controlId: string): string {
     return `${sectionIdx}:${controlId}`;
   }
@@ -340,6 +352,25 @@
     // lazy-load on first reference.
     if (projectId) {
       await ensureEmbeddingSourceCached(projectId);
+    }
+
+    // v0.2.75 RL-11: probe the default-weights bucket ONLY when this tab
+    // actually carries a gated button (unrelated module tabs never pay
+    // the edge round-trip). Failure → false: hidden is the conservative
+    // render for a button whose click would fail identically.
+    if (tauriAvailable() && configTabHasDefaultWeightsButton(configTab.sections)) {
+      try {
+        weightsBucketAvailable = await invoke<boolean>(
+          'module_default_weights_available',
+          {
+            moduleId,
+            embeddingSource: embeddingSourceByProjectId[projectId] ?? 'qwen3',
+          },
+        );
+      } catch (e) {
+        console.warn('[ModuleConfigTab] default-weights bucket probe failed:', e);
+        weightsBucketAvailable = false;
+      }
     }
 
     if (!tauriAvailable()) return;
@@ -971,21 +1002,26 @@
                   {/if}
                 </div>
               {:else if control.kind === 'button'}
-                <div class="control-row">
-                  <button
-                    type="button"
-                    class="action-button variant-{control.variant ?? 'secondary'}"
-                    disabled={sectionDisabled || isBusy}
-                    onclick={() => onButtonClick(sectionIdx, control)}
-                  >
-                    {isBusy ? '…' : control.label}
-                  </button>
-                  <span
-                    class="tooltip-affordance"
-                    title={control.tooltip ?? control.label}
-                    aria-label="More info"
-                  >?</span>
-                </div>
+                <!-- v0.2.75 RL-11: default-weights buttons stay hidden until
+                     the bucket-populated probe confirms the server can serve
+                     a bundle (parked-empty bucket = dead click otherwise). -->
+                {#if !buttonHiddenByWeightsProbe(control, weightsBucketAvailable)}
+                  <div class="control-row">
+                    <button
+                      type="button"
+                      class="action-button variant-{control.variant ?? 'secondary'}"
+                      disabled={sectionDisabled || isBusy}
+                      onclick={() => onButtonClick(sectionIdx, control)}
+                    >
+                      {isBusy ? '…' : control.label}
+                    </button>
+                    <span
+                      class="tooltip-affordance"
+                      title={control.tooltip ?? control.label}
+                      aria-label="More info"
+                    >?</span>
+                  </div>
+                {/if}
               {:else if control.kind === 'text_input'}
                 <TextInputControl
                   {control}

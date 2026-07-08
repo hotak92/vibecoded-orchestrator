@@ -288,3 +288,79 @@ export function substituteEmbeddingSourceInAction(
   if (!isActionDescriptor(action)) return action;
   return substituteEmbeddingSource(action, embeddingSource);
 }
+
+// ─── v0.2.75 RL-11: default-weights bucket gate ─────────────────────────
+//
+// The paid-module default-weights bucket is PARKED-EMPTY (its three
+// prerequisites — embedder choice, eval harness, admin key — haven't
+// landed), so the RL manifest's "Download default weights" button is a
+// guaranteed dead click for EVERY tier. The renderer hides any manifest
+// button whose action dispatches `module_download_default_weights`
+// (directly OR inside a chained_action step) until the launcher-side
+// capability probe (`module_default_weights_available` Tauri command)
+// positively confirms the bucket can serve a bundle for the project's
+// embedding source. The probe returns false without a license key, so
+// the free tier stays hidden exactly as before.
+
+/** Tauri command the RL manifest's default-weights buttons dispatch. */
+export const DOWNLOAD_DEFAULT_WEIGHTS_COMMAND = 'module_download_default_weights';
+
+/**
+ * True when `action` dispatches `command` — legacy string form,
+ * tauri_command descriptor, or ANY step of a chained_action (the RL
+ * manifest's "Download default + offline pass on top" button carries the
+ * download as step 0). Pure — no Tauri imports.
+ */
+export function actionReferencesCommand(
+  action: ActionRef,
+  command: string,
+): boolean {
+  if (typeof action === 'string') return action === command;
+  if (!isActionDescriptor(action)) return false;
+  if (action.kind === 'tauri_command') return action.command === command;
+  if (isChainedAction(action)) {
+    return action.steps.some((step) => actionReferencesCommand(step, command));
+  }
+  // http descriptors never dispatch Tauri commands directly; their
+  // next_action chain could in a future schema — walk it defensively.
+  if (action.kind === 'http' && action.next_action) {
+    return actionReferencesCommand(action.next_action, command);
+  }
+  return false;
+}
+
+/**
+ * Visibility rule for the RL-11 gate. `bucketAvailable` is the probe
+ * result: `true` (bucket populated) / `false` (probe says no) / `null`
+ * (probe pending or failed). Hidden unless POSITIVELY confirmed — the
+ * bucket is parked-empty today, so "unknown" must render as hidden for
+ * every tier (free tier's probe short-circuits to false without a
+ * license key, preserving the pre-RL-11 hidden state).
+ */
+export function buttonHiddenByWeightsProbe(
+  control: ConfigControl,
+  bucketAvailable: boolean | null,
+): boolean {
+  if (control.kind !== 'button') return false;
+  if (!actionReferencesCommand(control.action, DOWNLOAD_DEFAULT_WEIGHTS_COMMAND)) {
+    return false;
+  }
+  return bucketAvailable !== true;
+}
+
+/**
+ * True when any button in the config tab is subject to the RL-11 gate —
+ * the renderer only invokes the probe command when this is the case, so
+ * unrelated module tabs never pay the edge round-trip.
+ */
+export function configTabHasDefaultWeightsButton(
+  sections: ConfigSection[],
+): boolean {
+  return sections.some((s) =>
+    s.controls.some(
+      (c) =>
+        c.kind === 'button' &&
+        actionReferencesCommand(c.action, DOWNLOAD_DEFAULT_WEIGHTS_COMMAND),
+    ),
+  );
+}

@@ -533,6 +533,151 @@ fn rl_latest_weights_url() -> String {
         .unwrap_or_else(|_| DEFAULT_RL_LATEST_WEIGHTS_ENDPOINT.to_string())
 }
 
+/// v0.2.75 RL-11: read-only probe endpoint (the daily-poller's
+/// `rl-latest-version` — reports availability WITHOUT generating a signed
+/// URL). Operators override via `VCT_RL_LATEST_VERSION_URL` for staging /
+/// tests, mirroring `rl_latest_weights_url` above.
+fn rl_latest_version_url() -> String {
+    std::env::var("VCT_RL_LATEST_VERSION_URL").unwrap_or_else(|_| {
+        crate::commands::module_service::DEFAULT_RL_LATEST_VERSION_ENDPOINT.to_string()
+    })
+}
+
+// ─── v0.2.75 RL-11: bucket-populated capability probe ───────────────────
+//
+// The paid-module default-weights bucket is deliberately PARKED-EMPTY until
+// its three prerequisites land (embedder choice, eval harness, admin key) —
+// see the RL ops backlog. Until then the manifest's "Download default
+// weights" button is a guaranteed dead click for EVERY tier: the edge
+// function has no bundle to sign. RL-11 hides the button behind a probe
+// that positively confirms the server can serve a bundle for this
+// (module, embedding_source). The bucket itself stays parked — this change
+// must NOT populate it.
+//
+// Verdict semantics (conservative — the button only appears when the
+// download would plausibly succeed):
+//   * no license key configured → false (free tier stays hidden — the
+//     pre-RL-11 behaviour, unchanged).
+//   * edge 200 with a non-empty `latest_version` → true.
+//   * 400 `unsupported_embedding_source` / 404 / 5xx / transport error /
+//     unparseable body → false. A transient network failure hides the
+//     button for one TTL window; that is the cheaper failure mode than
+//     showing a button whose click would fail identically.
+//
+// The verdict is cached in-process per (module_id, embedding_source) for
+// `WEIGHTS_AVAILABLE_TTL_SECS` so re-renders of the config tab don't
+// hammer the Supabase edge.
+
+/// TTL for the in-process bucket-probe cache. 10 min: long enough that tab
+/// navigation is free, short enough that a freshly-populated bucket appears
+/// without restarting the launcher.
+const WEIGHTS_AVAILABLE_TTL_SECS: u64 = 600;
+
+static WEIGHTS_AVAILABLE_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, (bool, std::time::Instant)>>,
+> = std::sync::OnceLock::new();
+
+fn weights_available_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, (bool, std::time::Instant)>> {
+    WEIGHTS_AVAILABLE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Minimal parse shape for the `rl-latest-version` response — we only need
+/// to know whether a bundle EXISTS (`latest_version` non-empty). Extra
+/// fields (`has_update`, `download_url`, …) are ignored.
+#[derive(Debug, Deserialize)]
+struct VersionProbeBody {
+    #[serde(default)]
+    latest_version: String,
+}
+
+/// Network half of the RL-11 probe. `endpoint` is parameterised so tests
+/// can point it at a mock server (mirrors `fetch_signed_download_url`).
+/// Never errors — every failure class collapses to `false` (hidden).
+pub async fn probe_default_weights_available(
+    endpoint: &str,
+    license_key: &str,
+    machine_id_hash: &str,
+    embedding_source: &str,
+    module_id: &str,
+) -> bool {
+    let body = serde_json::json!({
+        "license_key": license_key,
+        "machine_id_hash": machine_id_hash,
+        "embedding_source": embedding_source,
+        "module_id": module_id,
+    });
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(EDGE_TIMEOUT_SECS))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let resp = match client
+        .post(endpoint)
+        .bearer_auth(license_key)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    if !resp.status().is_success() {
+        return false;
+    }
+    match resp.json::<VersionProbeBody>().await {
+        Ok(b) => !b.latest_version.trim().is_empty(),
+        Err(_) => false,
+    }
+}
+
+/// Tauri command: is the default-weights bucket populated for this
+/// (module, embedding_source)? The renderer hides any manifest button whose
+/// action dispatches `module_download_default_weights` until this returns
+/// true (`configTabHelpers.actionReferencesCommand` finds the dispatch,
+/// including inside chained_action steps).
+#[command]
+pub async fn module_default_weights_available(
+    module_id: String,
+    embedding_source: String,
+) -> Result<bool, String> {
+    // Free tier: no license key → hidden. Same outcome the pre-RL-11
+    // renderer produced via the tier gate; the probe just makes it
+    // unconditional-per-tier ("hidden for ALL tiers until the bucket
+    // exists" — a Pro key alone is not enough).
+    let license_key = match resolve_license_key() {
+        Ok(k) => k,
+        Err(_) => return Ok(false),
+    };
+
+    let cache_key = format!("{}::{}", module_id, embedding_source);
+    if let Ok(cache) = weights_available_cache().lock() {
+        if let Some((verdict, at)) = cache.get(&cache_key) {
+            if at.elapsed().as_secs() < WEIGHTS_AVAILABLE_TTL_SECS {
+                return Ok(*verdict);
+            }
+        }
+    }
+
+    let machine_id_hash = crate::commands::module_service::machine_id_hash_for_poll();
+    let verdict = probe_default_weights_available(
+        &rl_latest_version_url(),
+        &license_key,
+        &machine_id_hash,
+        &embedding_source,
+        &module_id,
+    )
+    .await;
+
+    if let Ok(mut cache) = weights_available_cache().lock() {
+        cache.insert(cache_key, (verdict, std::time::Instant::now()));
+    }
+    Ok(verdict)
+}
+
 // ─── Core download logic ────────────────────────────────────────────────
 
 /// POST the edge function for the signed download URL.
@@ -1675,6 +1820,103 @@ mod tests {
 
         // Cleanup the env override so we don't leak into adjacent tests.
         std::env::remove_var("VCT_STATE_DIR");
+    }
+
+    // ─── v0.2.75 RL-11: bucket-populated capability probe ────────────────
+
+    /// Spawn a one-shot HTTP mock that answers ANY request with the given
+    /// status line + JSON body. Returns the endpoint URL. Mirrors the raw
+    /// tokio-socket pattern of the edge mock above.
+    async fn spawn_probe_mock(status_line: &'static str, body: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                status_line,
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+        format!("http://127.0.0.1:{}/rl-latest-version", port)
+    }
+
+    #[tokio::test]
+    async fn probe_true_when_bucket_serves_a_version() {
+        let endpoint = spawn_probe_mock(
+            "200 OK",
+            serde_json::json!({
+                "has_update": false,
+                "latest_version": "v3",
+                "embedding_source": "arctic",
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(
+            probe_default_weights_available(&endpoint, "key", "hash", "arctic", "vct-rl-reranker")
+                .await,
+            "non-empty latest_version = bucket populated → button may show"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_false_when_version_empty_or_missing() {
+        let endpoint = spawn_probe_mock(
+            "200 OK",
+            serde_json::json!({ "latest_version": "" }).to_string(),
+        )
+        .await;
+        assert!(
+            !probe_default_weights_available(&endpoint, "key", "hash", "arctic", "vct-rl-reranker")
+                .await,
+            "empty latest_version = parked bucket → hidden"
+        );
+
+        let endpoint = spawn_probe_mock("200 OK", "{}".to_string()).await;
+        assert!(
+            !probe_default_weights_available(&endpoint, "key", "hash", "arctic", "vct-rl-reranker")
+                .await,
+            "missing latest_version → hidden"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_false_on_unsupported_embedding_source_400() {
+        let endpoint = spawn_probe_mock(
+            "400 Bad Request",
+            serde_json::json!({
+                "error": "unsupported_embedding_source",
+                "supported_embedding_sources": ["arctic"],
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(
+            !probe_default_weights_available(&endpoint, "key", "hash", "qwen3", "vct-rl-reranker")
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_false_on_transport_error() {
+        // Bind + drop a listener so the port is (very likely) closed.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let endpoint = format!("http://127.0.0.1:{}/rl-latest-version", port);
+        assert!(
+            !probe_default_weights_available(&endpoint, "key", "hash", "arctic", "vct-rl-reranker")
+                .await,
+            "transport error must collapse to hidden, never error"
+        );
     }
 
     #[tokio::test]

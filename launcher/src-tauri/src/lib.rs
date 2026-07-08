@@ -2299,6 +2299,12 @@ pub fn run() {
             // `filter: {kind: "match", equals_runtime: "..."}` to a
             // multi_select's options list.
             commands::module_default_weights::module_download_default_weights,
+            // v0.2.75 RL-11: bucket-populated capability probe — the config
+            // tab hides any manifest button dispatching
+            // `module_download_default_weights` until this returns true
+            // (the default-weights bucket is PARKED-empty; the button is a
+            // dead click for every tier until the bucket exists).
+            commands::module_default_weights::module_default_weights_available,
             commands::module_default_weights::module_get_runtime_value,
             // v0.2.42 RT-4: reset the per-project bind-mount slot back to
             // the globally-downloaded default weights. Derives (source, version)
