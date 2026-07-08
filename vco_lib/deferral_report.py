@@ -78,10 +78,12 @@ _DEFERRED_JSON_REL = Path(".claude") / "context" / "UPDATE_DEFERRED.json"
 # restart.rs (or any other Rust editor) ever strips an additional section
 # from the Markdown without touching the JSON, add its condition ID here,
 # otherwise the strip is silently resurrected from the JSON on the next
-# Python read. (Rust editors that delete the WHOLE .md — e.g.
-# installer.rs::clear_update_resume_deferral_if_solo — do not go through
-# this reconcile arm: with no co-present Markdown, the JSON is taken
-# verbatim.)
+# Python read. (Rust editors that delete the WHOLE .md must delete BOTH
+# files — e.g. installer.rs::clear_update_resume_deferral_if_solo dual-
+# unlinks the .md AND UPDATE_DEFERRED.json (v0.2.75 Part 3b, mirroring
+# restart.rs's F2 sweep). They do not go through this reconcile arm: with
+# no co-present Markdown, a surviving JSON would be taken verbatim and
+# resurrect the cleared entry — hence the dual-file rule.)
 _RUST_STRIPPABLE_CONDITION_IDS = frozenset({
     "launcher_restart_required",
 })

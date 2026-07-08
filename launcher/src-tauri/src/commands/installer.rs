@@ -7268,15 +7268,43 @@ fn clear_update_resume_deferral_if_solo(install_path: &Path) {
         .filter(|l| l.starts_with("## "))
         .count();
     if single_id && section_count == 1 {
-        if let Err(e) = std::fs::remove_file(&target) {
-            eprintln!(
-                "[vct] update_resume_deferral: clear {} failed: {}",
-                target.display(),
-                e
-            );
+        match std::fs::remove_file(&target) {
+            Err(e) => {
+                eprintln!(
+                    "[vct] update_resume_deferral: clear {} failed: {}",
+                    target.display(),
+                    e
+                );
+            }
+            Ok(()) => {
+                // v0.2.75 (Part 3b): whole-file deletion must be DUAL-file.
+                // A-3 made UPDATE_DEFERRED.json the authoritative store —
+                // `deferral_report.read()` prefers it and, with no co-present
+                // Markdown, takes the JSON verbatim. Unlinking ONLY the .md
+                // here left the sidecar to RESURRECT the solo
+                // update_resume_required entry on the next Python read.
+                // Mirrors restart.rs::clear_restart_deferral's empty-file
+                // sweep (the v0.2.73 F2 fix). Best-effort: a missing sidecar
+                // is fine (older installs predate A-3); a remove error is
+                // logged, not fatal (the .md is already gone, so the entry
+                // won't re-render from Markdown at least — install.py's
+                // mark_resolved reconcile is the backstop).
+                let json_sidecar = target.with_file_name("UPDATE_DEFERRED.json");
+                if json_sidecar.is_file() {
+                    if let Err(e) = std::fs::remove_file(&json_sidecar) {
+                        eprintln!(
+                            "[vct] update_resume_deferral: clear JSON sidecar {} \
+                             failed (entry may resurrect from JSON): {}",
+                            json_sidecar.display(),
+                            e
+                        );
+                    }
+                }
+            }
         }
     }
-    // Otherwise: leave the file alone. install.py will reconcile.
+    // Otherwise: leave the file alone (BOTH files — the JSON sidecar too;
+    // deleting only it would desync the pair). install.py will reconcile.
 }
 
 /// Best-effort: scan tracked files for live conflict markers
@@ -17439,6 +17467,80 @@ severity_max: critical\n\
             assert!(
                 !target.exists(),
                 "solo update_resume_required deferral must be unlinked"
+            );
+        }
+
+        /// v0.2.75 (Part 3b): the solo clear must be DUAL-file. install.py's
+        /// A-3 write pairs the .md with an authoritative UPDATE_DEFERRED.json
+        /// sidecar; unlinking only the .md let the next Python read take the
+        /// JSON verbatim and RESURRECT the just-cleared entry. Mirrors
+        /// restart.rs::clear_restart_deferral's empty-file sweep (F2).
+        #[test]
+        fn clear_update_resume_deferral_if_solo_also_unlinks_json_sidecar() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let install = dir.path().to_path_buf();
+            write_update_resume_deferral(&install, "merge", "main");
+            let target = install.join(".claude/context/UPDATE_DEFERRED.md");
+            let sidecar = install.join(".claude/context/UPDATE_DEFERRED.json");
+            // Simulate install.py's A-3 dual write: the JSON sidecar carries
+            // the same solo entry (shape per _render_json_sidecar; content
+            // is irrelevant to the unlink — presence is what matters).
+            std::fs::write(
+                &sidecar,
+                r#"{"schema_version": 1, "generated_at": "2026-07-08T00:00:00Z",
+                    "severity_max": "warning",
+                    "entries": [{"condition_id": "update_resume_required"}]}"#,
+            )
+            .unwrap();
+            assert!(target.exists() && sidecar.exists());
+
+            clear_update_resume_deferral_if_solo(&install);
+            assert!(!target.exists(), "solo .md must be unlinked");
+            assert!(
+                !sidecar.exists(),
+                "JSON sidecar must be unlinked WITH the .md — leaving it \
+                 resurrects the entry on the next Python read"
+            );
+        }
+
+        /// Leave-alone side of the dual-unlink: a multi-entry file is not
+        /// ours to clear, so BOTH files must survive (deleting only the JSON
+        /// would desync the authoritative store from its render).
+        #[test]
+        fn clear_update_resume_deferral_if_solo_multi_entry_keeps_both_files() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let install = dir.path().to_path_buf();
+            let target = install.join(".claude/context/UPDATE_DEFERRED.md");
+            let sidecar = install.join(".claude/context/UPDATE_DEFERRED.json");
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            let multi = "---\n\
+title: VCO Update Deferred\n\
+generated_at: 2026-07-08T12:00:00Z\n\
+condition_ids: [update_resume_required, schema_drift_rebuild_required]\n\
+severity_max: critical\n\
+---\n\
+\n\
+## update_resume_required (warning)\n\
+**Title**: ours\n\
+\n\
+## schema_drift_rebuild_required (critical)\n\
+**Title**: not ours\n\
+";
+            std::fs::write(&target, multi).unwrap();
+            std::fs::write(
+                &sidecar,
+                r#"{"schema_version": 1, "entries": []}"#,
+            )
+            .unwrap();
+
+            clear_update_resume_deferral_if_solo(&install);
+            assert!(
+                target.exists(),
+                "multi-entry .md must NOT be unlinked (not solo-owned)"
+            );
+            assert!(
+                sidecar.exists(),
+                "JSON sidecar must NOT be unlinked when the .md is kept"
             );
         }
 
