@@ -4339,6 +4339,22 @@ pub fn write_env_reference_sidecar(
 /// Convert a project display name into a Weaviate-collection-safe id.
 /// Weaviate collections must start with [A-Z] and contain only
 /// alphanumerics — strip everything else and Title-case.
+///
+/// MUST MATCH the Python KG (underscore-DROPPING) sanitizer
+/// `vco_lib.project_init.sanitize_for_weaviate_class` on the VALID-name domain
+/// (any name starting with an ASCII letter, >=1 alnum). Both derive the
+/// `KG_COLLECTION` / `DEVELOPMENT_COLLECTION` / `DIAGRAMS_COLLECTION` basename
+/// that lands in `.claude/env` + `.claude/settings.json`, so a drift on a real
+/// project name would make the launcher and the Python re-projection compute
+/// different collections for the same project. Cross-language parity is pinned
+/// against the shared fixture `tests/fixtures/kg_sanitizer_parity.json` by the
+/// `#[test] kg_sanitizer_matches_shared_fixture` below AND
+/// `tests/test_kg_sanitizer_parity.py` (audit F1.2). NOTE the two
+/// implementations intentionally DIVERGE on pathological OUT-OF-DOMAIN inputs
+/// (empty / all-non-alnum → this fn returns "Project", Python returns "vct";
+/// leading-digit → this fn prepends "P", Python returns "vct"); those cases are
+/// pinned per-side in the fixture's `divergent` array. If you change either
+/// rule, update the other AND the fixture in the same commit.
 pub fn sanitize_kg_collection(name: &str) -> String {
     let mut out = String::new();
     let mut next_upper = true;
@@ -7415,6 +7431,99 @@ mod tests {
         assert_eq!(sanitize_kg_collection(""), "Project");
         assert_eq!(sanitize_kg_collection("...!!!..."), "Project");
         assert_eq!(sanitize_kg_collection("Already CamelCase"), "AlreadyCamelCase");
+    }
+
+    /// Cross-language parity (audit F1.2 / A3.1): the Rust side of the shared
+    /// `tests/fixtures/kg_sanitizer_parity.json`. `tests/test_kg_sanitizer_parity.py`
+    /// consumes the SAME fixture for the Python `sanitize_for_weaviate_class` —
+    /// so a divergence between the two KG (underscore-DROPPING) sanitizers on a
+    /// VALID project name fails one of the two runners. The `agree` rows MUST
+    /// match cross-language; the `divergent` rows are pathological out-of-domain
+    /// inputs pinned PER-SIDE (Rust column here, Python column in the pytest) so
+    /// a future unification is a deliberate two-file edit. Fixture path resolved
+    /// from `CARGO_MANIFEST_DIR` (= `launcher/src-tauri/`) → two parents up to
+    /// the repo root (same walk as `tests/project_naming_parity.rs`).
+    #[test]
+    fn kg_sanitizer_matches_shared_fixture() {
+        #[derive(serde::Deserialize)]
+        struct KgFixture {
+            #[serde(rename = "_format_version", default)]
+            format_version: u32,
+            agree: Vec<(String, String)>,
+            // (input, python_expected, rust_expected)
+            divergent: Vec<(String, String, String)>,
+        }
+
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("CARGO_MANIFEST_DIR must have two parents (repo layout)");
+        let fixture_path = repo_root
+            .join("tests")
+            .join("fixtures")
+            .join("kg_sanitizer_parity.json");
+        assert!(
+            fixture_path.exists(),
+            "Parity fixture missing: {} — shared with tests/test_kg_sanitizer_parity.py",
+            fixture_path.display()
+        );
+        let raw = std::fs::read_to_string(&fixture_path)
+            .unwrap_or_else(|e| panic!("read {}: {}", fixture_path.display(), e));
+        let fix: KgFixture = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("parse {}: {}", fixture_path.display(), e));
+
+        assert_eq!(
+            fix.format_version, 1,
+            "Fixture _format_version != 1 — coordinate the bump with the Python side"
+        );
+        assert!(
+            fix.agree.len() >= 100,
+            "Fixture 'agree' array should pin 100+ valid-name cases; got {}",
+            fix.agree.len()
+        );
+
+        // Valid-name domain: Rust MUST match the shared expectation (which the
+        // Python side also asserts against).
+        let mut failures: Vec<String> = Vec::new();
+        for (input, expected) in &fix.agree {
+            let actual = sanitize_kg_collection(input);
+            if &actual != expected {
+                failures.push(format!(
+                    "  sanitize_kg_collection({:?}) = {:?}, fixture says {:?}",
+                    input, actual, expected
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "Rust KG sanitizer diverges from fixture in {} valid-name case(s):\n{}\n\
+             If intentional, update the fixture AND vco_lib.project_init.\
+             sanitize_for_weaviate_class in the same commit.",
+            failures.len(),
+            failures.join("\n")
+        );
+
+        // Out-of-domain: assert the RUST column of each divergent row (the
+        // Python column is asserted by the pytest). Also proves the divergence
+        // is real (Rust col differs from Python col somewhere).
+        let mut real_divergence = false;
+        for (input, py_expected, rust_expected) in &fix.divergent {
+            assert_eq!(
+                &sanitize_kg_collection(input),
+                rust_expected,
+                "Rust KG sanitizer fallback drifted for {:?}",
+                input
+            );
+            if py_expected != rust_expected {
+                real_divergence = true;
+            }
+        }
+        assert!(
+            real_divergence,
+            "No 'divergent' row actually differs between py/rust columns — if the \
+             two KG sanitizers converged, move these rows into 'agree'."
+        );
     }
 
     // ─── B12: stale KG_COLLECTION .env auto-repair (0.2.11) ─────────────
