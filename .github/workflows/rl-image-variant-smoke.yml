@@ -1,0 +1,173 @@
+# v0.2.75 RL-13 — live image-variant smoke for the RL Reranker container.
+#
+# WHY THIS EXISTS
+# The v0.2.72 supervisor fix made image resolution variant-aware
+# (`resolve_variant_tag`: `{version}-cpu` / `-cuda` / `-rocm` per the
+# manifest's `gpu_image_variants`), but no live smoke ever pulled a
+# variant-resolved image and confirmed a started container can reach the
+# hub (RL audit item RL-13; the v0.2.75 Part-4 supervisor-conditional
+# bind-widen — `resolve_hub_bind_ip` / `VCT_HUB_BIND_ALL` — is what makes
+# container→hub reach passable on default installs).
+#
+# ONE job: pull the CPU-variant image (GitHub runners have no GPU, so the
+# variant a real supervisor would resolve here IS `-cpu`), start the
+# container, and from INSIDE it curl the hub's /health (no auth) plus one
+# bearer-authed route (/services/status) via host.containers.internal —
+# the exact address the supervisor injects for module containers.
+#
+# ── PENDING-CREDENTIAL STATE (read before wondering why this is gray) ──
+# The image lives in a PRIVATE GHCR package. This workflow ships NOW as a
+# dormant skeleton and goes LIVE the moment the E-1 ops item provisions
+# the bot PAT (read:packages) as the repo secret `GHCR_SMOKE_TOKEN`
+# (+ optionally `GHCR_SMOKE_USER`, defaulting to the package owner).
+# Until then: the `check-secret` job publishes has_token=false and the
+# smoke job self-skips. Job-level `if:` cannot read the `secrets` context,
+# hence the two-job presence probe.
+#
+# Trigger: manual (workflow_dispatch) only — this hits GHCR + Supabase-less
+# hub paths and there's no point burning minutes per-push while the bucket
+# / GHCR publish pipeline (E-1) is still pending. Add a weekly `schedule:`
+# once the credential lands and the first manual run is green.
+
+name: RL Image Variant Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_version:
+        description: >-
+          RL Reranker module version to smoke (the CPU variant tag
+          `<version>-cpu` is derived from it, mirroring
+          resolve_variant_tag's `{version}-cpu` template).
+        required: false
+        default: "0.2.10"
+      image_repo:
+        description: Fully-qualified image repo (no tag).
+        required: false
+        default: "ghcr.io/hotak92/vct-rl-reranker"
+
+jobs:
+  # `secrets` is not readable from a job-level `if:` — expose presence as a
+  # job output instead (standard dance; value never leaks, only a boolean).
+  check-secret:
+    runs-on: ubuntu-latest
+    outputs:
+      has_token: ${{ steps.probe.outputs.has_token }}
+    steps:
+      - id: probe
+        env:
+          GHCR_SMOKE_TOKEN: ${{ secrets.GHCR_SMOKE_TOKEN }}
+        run: |
+          if [ -n "$GHCR_SMOKE_TOKEN" ]; then
+            echo "has_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::GHCR_SMOKE_TOKEN not provisioned yet (E-1 ops item pending) — smoke self-skips."
+          fi
+
+  variant-smoke:
+    needs: check-secret
+    if: needs.check-secret.outputs.has_token == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      IMAGE_REF: ${{ inputs.image_repo || 'ghcr.io/hotak92/vct-rl-reranker' }}:${{ inputs.image_version || '0.2.10' }}-cpu
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: launcher/src-tauri
+
+      - name: Build vct-hub
+        working-directory: launcher/src-tauri
+        run: cargo build --release -p vct-hub
+
+      - name: Start vct-hub (bind-widened for container reach)
+        run: |
+          set -euo pipefail
+          export VCT_STATE_DIR="$RUNNER_TEMP/vct-smoke"
+          mkdir -p "$VCT_STATE_DIR"
+          echo "VCT_STATE_DIR=$VCT_STATE_DIR" >> "$GITHUB_ENV"
+          # VCT_HUB_BIND_ALL=1: the explicit env opt-in half of the Part-4
+          # bind decision (a real install widens automatically once a
+          # hub-consuming module install row exists; CI has no launcher.db
+          # module rows, so we opt in explicitly).
+          VCT_HUB_BIND_ALL=1 nohup ./launcher/src-tauri/target/release/vct-hub --foreground \
+            > "$RUNNER_TEMP/vct-hub.log" 2>&1 &
+          # Wait for the discovery files (written after a successful bind).
+          for i in $(seq 1 30); do
+            [ -s "$VCT_STATE_DIR/hub.port" ] && [ -s "$VCT_STATE_DIR/hub.token" ] && break
+            sleep 1
+          done
+          test -s "$VCT_STATE_DIR/hub.port" || { echo "hub failed to start"; cat "$RUNNER_TEMP/vct-hub.log"; exit 1; }
+          HUB_PORT="$(cat "$VCT_STATE_DIR/hub.port")"
+          echo "HUB_PORT=$HUB_PORT" >> "$GITHUB_ENV"
+          # Host-side sanity before involving the container at all.
+          curl -fsS "http://127.0.0.1:${HUB_PORT}/api/v1/health"
+
+      - name: Pull variant-resolved image
+        env:
+          GHCR_SMOKE_TOKEN: ${{ secrets.GHCR_SMOKE_TOKEN }}
+          GHCR_SMOKE_USER: ${{ secrets.GHCR_SMOKE_USER }}
+        run: |
+          set -euo pipefail
+          echo "$GHCR_SMOKE_TOKEN" | docker login ghcr.io \
+            -u "${GHCR_SMOKE_USER:-hotak92}" --password-stdin
+          docker pull "$IMAGE_REF"
+
+      - name: Start container + smoke container→hub reach
+        run: |
+          set -euo pipefail
+          # host-gateway maps host.containers.internal (the podman-style
+          # name the supervisor injects into module env) onto the runner's
+          # docker bridge gateway — same reachability shape a default
+          # install has after the bind-widen.
+          docker run -d --name rl-smoke \
+            --add-host host.containers.internal:host-gateway \
+            -e RL_SERVER_PORT=11438 \
+            -e PYTHONUNBUFFERED=1 \
+            "$IMAGE_REF"
+          # The image must actually boot (not crash-loop on defaults).
+          for i in $(seq 1 30); do
+            state="$(docker inspect -f '{{.State.Status}}' rl-smoke)"
+            [ "$state" = "running" ] || { echo "container state=$state"; docker logs rl-smoke; exit 1; }
+            sleep 1
+          done
+
+          HUB_TOKEN="$(cat "$VCT_STATE_DIR/hub.token")"
+          # 1. Unauthenticated liveness: /api/v1/health.
+          docker exec rl-smoke python3 -c "
+          import urllib.request, sys
+          url = 'http://host.containers.internal:${HUB_PORT}/api/v1/health'
+          with urllib.request.urlopen(url, timeout=10) as r:
+              sys.exit(0 if r.status == 200 else 1)
+          "
+          # 2. One bearer-authed route: /api/v1/services/status must be 200
+          #    WITH the token and 401 WITHOUT it (proves auth is enforced
+          #    across the widened bind, not just reachable).
+          docker exec -e HUB_TOKEN="$HUB_TOKEN" rl-smoke python3 -c "
+          import urllib.request, urllib.error, os, sys
+          base = 'http://host.containers.internal:${HUB_PORT}/api/v1/services/status'
+          req = urllib.request.Request(base, headers={'Authorization': 'Bearer ' + os.environ['HUB_TOKEN']})
+          with urllib.request.urlopen(req, timeout=10) as r:
+              assert r.status == 200, r.status
+          try:
+              urllib.request.urlopen(urllib.request.Request(base), timeout=10)
+          except urllib.error.HTTPError as e:
+              sys.exit(0 if e.code == 401 else 1)
+          sys.exit(1)  # unauthenticated request must NOT succeed
+          "
+          echo "container→hub reach + auth gate: OK"
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          echo "── vct-hub.log ──"; cat "$RUNNER_TEMP/vct-hub.log" || true
+          echo "── container logs ──"; docker logs rl-smoke || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f rl-smoke >/dev/null 2>&1 || true
+          docker logout ghcr.io >/dev/null 2>&1 || true
