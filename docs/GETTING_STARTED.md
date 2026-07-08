@@ -377,7 +377,7 @@ Bypass / override matrix:
 | Per-project default = off | Add `VCO_LEAN_CTX_DEFAULT=off` to `.claude/env` |
 | Disable all VCO hooks (debug only) | `export VCT_DISABLE_HOOKS=1` |
 
-Footgun: lean-ctx in default mode can swallow stderr from `git commit` to zero output when a pre-commit hook fails. If a `git commit` exits non-zero with no message, retry under `lean-ctx bypass "..."`.
+Footgun (mitigated in v0.2.75): lean-ctx in default mode can swallow stderr from `git commit` to zero output when a pre-commit hook fails. The rewrite hook now **auto-bypasses `git commit` and `git push`** (they run raw, uncompressed — no more silent hook-failed commits). For any *other* command that exits non-zero with no message, retry under `lean-ctx bypass "..."`.
 
 Install:
 ```bash

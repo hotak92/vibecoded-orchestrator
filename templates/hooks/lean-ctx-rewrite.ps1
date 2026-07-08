@@ -68,17 +68,83 @@ if (Test-Path -LiteralPath $envFile) {
 }
 if ($leanCtxDefault -eq "off") { exit 0 }
 
-# 3. lean-ctx availability — optional dep, never break Bash for users without it.
-if (-not (Get-Command lean-ctx -ErrorAction SilentlyContinue)) { exit 0 }
+# Capture the PreToolUse stdin payload ONCE — both the TRIM-b git step-aside
+# and the `hook rewrite` delegation below need it. Reading [Console]::In
+# consumes stdin, so we re-feed $HookStdin to lean-ctx rather than letting it
+# read an already-drained stream. MUST MATCH lean-ctx-rewrite.sh ($_lc_cmd).
+$HookStdin = ""
+try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+
+# TRIM-b (v0.2.75): auto-bypass compression for `git commit` / `git push`.
+# lean-ctx's default mode can swallow stderr from a hook-failed `git commit`
+# to ZERO output (exit 1, no message) making the failure invisible. Step
+# aside for these commands: emit nothing -> Claude runs the command RAW under
+# the normal permission flow. Gate on the FINAL `&&`-segment so
+# `git log && git commit` passes through (the commit governs) while
+# `echo git commit` (benign echo) is still compressed. MUST MATCH
+# lean-ctx-rewrite.sh (Python parse there; native ConvertFrom-Json here).
+if ($HookStdin) {
+    try {
+        $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
+        $cmd = ""
+        if ($payload -and $payload.tool_input -and $payload.tool_input.command) {
+            $cmd = [string]$payload.tool_input.command
+        }
+        if ($cmd -and $cmd.Trim()) {
+            $seg = ($cmd -split '&&')[-1].Trim()
+            $toks = $seg -split '\s+'
+            if ($toks.Count -ge 2 -and $toks[0] -eq 'git' -and
+                ($toks[1] -eq 'commit' -or $toks[1] -eq 'push')) {
+                exit 0
+            }
+        }
+    } catch {
+        # Unparseable payload — fall through to normal (compressed) path.
+    }
+}
+
+# 3. lean-ctx availability — optional dep, never break Bash for users without
+#    it. D-11 (v0.2.75): probe the same candidate list install.py uses so a
+#    `cargo install`ed binary at ~/.cargo/bin (off the hook shell's PATH)
+#    still activates compression. MUST MATCH the CANONICAL candidate order in
+#    install.py::_find_lean_ctx_binary (Windows arm) AND lean-ctx-rewrite.sh.
+$LeanCtxBin = $null
+if (Get-Command lean-ctx -ErrorAction SilentlyContinue) {
+    $LeanCtxBin = "lean-ctx"
+} else {
+    $home = if ($env:USERPROFILE) { $env:USERPROFILE } elseif ($env:HOME) { $env:HOME } else { "" }
+    $cands = @()
+    if ($home) {
+        $cands += (Join-Path $home ".cargo/bin/lean-ctx.exe")
+        $cands += (Join-Path $home "scoop/shims/lean-ctx.exe")
+        $cands += (Join-Path $home "scoop/apps/lean-ctx/current/lean-ctx.exe")
+    }
+    if ($env:ProgramData) { $cands += (Join-Path $env:ProgramData "chocolatey/bin/lean-ctx.exe") }
+    if ($env:ProgramFiles) { $cands += (Join-Path $env:ProgramFiles "lean-ctx/lean-ctx.exe") }
+    # Cross-OS: a POSIX host running the .ps1 under pwsh resolves the same
+    # extensionless candidates the .sh probes.
+    if ($home) {
+        $cands += (Join-Path $home ".cargo/bin/lean-ctx")
+        $cands += (Join-Path $home ".local/bin/lean-ctx")
+    }
+    $cands += "/usr/local/bin/lean-ctx"
+    $cands += "/usr/bin/lean-ctx"
+    $cands += "/opt/homebrew/bin/lean-ctx"
+    $cands += "/home/linuxbrew/.linuxbrew/bin/lean-ctx"
+    foreach ($c in $cands) {
+        if ($c -and (Test-Path -LiteralPath $c -PathType Leaf)) { $LeanCtxBin = $c; break }
+    }
+}
+if (-not $LeanCtxBin) { exit 0 }
 
 # 4. Delegate to lean-ctx's rewrite handler, then strip permissionDecision
-#    (D-3, v0.2.73). Stdin is connected by Claude Code (the PreToolUse JSON
-#    payload); the FILTERED stdout flows back as the hook's rewrite response.
+#    (D-3, v0.2.73). Re-feed the captured $HookStdin (already drained above);
+#    the FILTERED stdout flows back as the hook's rewrite response.
 #    Conservative on every failure arm: unparseable output / nothing left to
 #    emit -> print NOTHING (= no rewrite, raw command). Losing compression
 #    for one call is strictly safer than emitting an auto-approval.
 #    MUST MATCH templates/hooks/lean-ctx-rewrite.sh (python filter there).
-$rewriteOut = & lean-ctx hook rewrite
+$rewriteOut = $HookStdin | & $LeanCtxBin hook rewrite
 # P3 (v0.2.73): a NON-ZERO lean-ctx exit suppresses output — MUST MATCH the
 # .sh's `out="$(lean-ctx hook rewrite)" || exit 0`. Without this, lean-ctx
 # exiting non-zero WITH parseable JSON on stdout would emit a rewrite on

@@ -694,14 +694,16 @@ Output: Where to save
 
 Override symmetry is intentional: with project default `on`, `lean-ctx bypass "<cmd>"` still produces raw output. With default `off`, prefixing `lean-ctx -c "<cmd>"` still produces compressed output.
 
-**⚠️ Known footgun — silent stderr swallowing on `git commit`**: `lean-ctx`'s default mode can swallow stderr from `git commit` to the point where a hook-failed commit returns exit code 1 with **zero output**, making the failure invisible. Symptom: `git commit` returns exit 1 but no error message; subsequent `git status` shows the file is staged but uncommitted. **Workaround**: bypass compression for that command:
+**⚠️ Known footgun — silent stderr swallowing on `git commit` (auto-mitigated in v0.2.75)**: `lean-ctx`'s default mode can swallow stderr from `git commit` to the point where a hook-failed commit returns exit code 1 with **zero output**, making the failure invisible. Symptom: `git commit` returns exit 1 but no error message; subsequent `git status` shows the file is staged but uncommitted.
+
+**As of v0.2.75 the rewrite hook auto-bypasses `git commit` and `git push`** — they run RAW (uncompressed) so their stderr is always visible; you no longer need the manual workaround for those two commands. The step-aside keys on the FINAL `&&`-segment, so `git log && git commit` also runs the commit raw, while `echo git commit` (not a real commit) is still compressed.
+
+For any OTHER command that returns silent non-zero (rare — e.g. a bespoke tool with a failing hook), the manual bypass still applies:
 
 ```bash
-# If `git -c user.name=... commit -m "..."` exits 1 silently:
-lean-ctx bypass "git -c user.name=... commit -m \"...\""
+# Only needed now for non-commit/push commands that exit non-zero silently:
+lean-ctx bypass "some-tool --that-fails-quietly"
 ```
-
-Apply the same workaround for `git push` if it returns silent non-zero (rare, but possible with pre-push hooks). When in doubt, run via `lean-ctx bypass "..."` for any git command that exits non-zero with no output.
 
 **Target Metrics**:
 - Simple: <5K tokens

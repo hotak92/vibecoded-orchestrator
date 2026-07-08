@@ -84,7 +84,74 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # but `[ -f ]` already gates that. Hooks run with CWD=project-root.
 [ -f .claude/env ] && . .claude/env
 [ "${VCO_LEAN_CTX_DEFAULT:-on}" = "off" ] && exit 0
-command -v lean-ctx >/dev/null 2>&1 || exit 0
+
+# TRIM-b (v0.2.75): auto-bypass compression for `git commit` / `git push`.
+# lean-ctx's default mode can swallow stderr from a hook-failed `git commit`
+# to ZERO output (exit 1, no message — the file stays staged) making the
+# failure invisible. Rather than force the user to remember `lean-ctx
+# bypass`, step aside for these commands: emit nothing → Claude runs the
+# command RAW under the normal permission flow. We gate on the FINAL
+# `&&`-segment so `git log && git commit` still passes through (the commit
+# governs) while `echo git commit` (a benign echo, not a real commit) is
+# still compressed. MUST MATCH templates/hooks/lean-ctx-rewrite.ps1.
+_lc_cmd="$(cat 2>/dev/null || true)"
+if [ -n "$_lc_cmd" ]; then
+    PYBIN_BP="$(command -v python3 || command -v python || true)"
+    if [ -n "$PYBIN_BP" ]; then
+        # Parse tool_input.command, take the last `&&` segment, strip lead
+        # whitespace, and check its leading tokens. Python keeps the JSON +
+        # segment logic robust vs brittle shell string-splitting. Prints
+        # "raw" when we must step aside, empty otherwise. Conservative: any
+        # parse failure prints nothing → normal (compressed) path continues.
+        _lc_decision="$(printf '%s' "$_lc_cmd" | "$PYBIN_BP" -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    cmd = (d.get("tool_input") or {}).get("command", "")
+except Exception:
+    sys.exit(0)
+if not isinstance(cmd, str) or not cmd.strip():
+    sys.exit(0)
+# FINAL && segment governs (last command actually run in the chain).
+seg = cmd.split("&&")[-1].strip()
+toks = seg.split()
+if len(toks) >= 2 and toks[0] == "git" and toks[1] in ("commit", "push"):
+    sys.stdout.write("raw")
+' 2>/dev/null || true)"
+        if [ "$_lc_decision" = "raw" ]; then
+            exit 0
+        fi
+    fi
+fi
+
+# D-11 (v0.2.75): probe the same candidate list install.py uses before
+# giving up. `command -v` only checks PATH; a `cargo install lean-ctx`
+# binary lands at ~/.cargo/bin, which a non-interactive hook shell's PATH
+# often lacks (cargo adds it to ~/.profile, not every shell). Without this
+# probe, install declares "lean-ctx detected" while the hook shell can't
+# see it → compression silently never activates (the "assigned ≠ landed"
+# case, F1 NEW-3). MUST MATCH the CANONICAL POSIX candidate order in
+# install.py::_find_lean_ctx_binary (the ":9497" comment there names this
+# hook as its mirror — keep the two lists identical; if you add/remove a
+# path in one, mirror it in the other AND in lean-ctx-rewrite.ps1).
+LEAN_CTX_BIN=""
+if command -v lean-ctx >/dev/null 2>&1; then
+    LEAN_CTX_BIN="lean-ctx"
+else
+    for _cand in \
+        "$HOME/.cargo/bin/lean-ctx" \
+        "$HOME/.local/bin/lean-ctx" \
+        "/usr/local/bin/lean-ctx" \
+        "/usr/bin/lean-ctx" \
+        "/opt/homebrew/bin/lean-ctx" \
+        "/home/linuxbrew/.linuxbrew/bin/lean-ctx"; do
+        if [ -x "$_cand" ]; then
+            LEAN_CTX_BIN="$_cand"
+            break
+        fi
+    done
+fi
+[ -z "$LEAN_CTX_BIN" ] && exit 0
 # D-3 (v0.2.73): strip `permissionDecision` from lean-ctx's response, keep
 # `updatedInput`.
 #
@@ -107,7 +174,12 @@ command -v lean-ctx >/dev/null 2>&1 || exit 0
 #
 # MUST MATCH templates/hooks/lean-ctx-rewrite.ps1 (same strip, native
 # ConvertFrom-Json there).
-out="$(lean-ctx hook rewrite)" || exit 0
+#
+# TRIM-b (v0.2.75): stdin was already consumed into $_lc_cmd above (for the
+# git-commit/push step-aside), so re-feed it to `lean-ctx hook rewrite`
+# rather than reading an empty stdin. Invoke the RESOLVED binary
+# ($LEAN_CTX_BIN — may be a candidate-path absolute, not on PATH; D-11).
+out="$(printf '%s' "$_lc_cmd" | "$LEAN_CTX_BIN" hook rewrite)" || exit 0
 [ -z "$out" ] && exit 0
 PYBIN="$(command -v python3 || command -v python || true)"
 [ -z "$PYBIN" ] && exit 0
