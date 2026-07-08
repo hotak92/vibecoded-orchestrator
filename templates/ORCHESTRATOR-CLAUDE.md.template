@@ -790,7 +790,7 @@ The toast summarises the result ("5 files updated, 2 user-modifications preserve
 
 ## Secrets — read BEFORE any credential-bearing operation
 
-VCO ships a secrets primitive so agents never scrape the environment for tokens.
+VCO ships a secrets primitive so agents never scrape the environment for tokens. Core write invariant: VCO never writes secret values into the project tree — resolvers READ at need (hub → file store → project `.env`, in that order); no VCO writer persists a secret VALUE into any file under the project folder, and neither should you.
 
 1. **Never grep `env` for secrets.** `env | grep TOKEN` (and similar) is blocked by the `bash_security.py` PreToolUse hook. The block message includes the remediation below.
 

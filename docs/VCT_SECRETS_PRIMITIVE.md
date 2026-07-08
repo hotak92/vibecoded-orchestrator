@@ -4,7 +4,10 @@ A unified primitive for per-project secrets, replacing ad-hoc mixes of
 per-service wrapper scripts, flat global token files, and `.env` files
 scattered across multiple projects on one machine.
 
-This doc describes the bash `vct` CLI shipped under `tools/vct-secrets/`.
+This doc covers the whole primitive: the **canonical three-tier
+resolution chain** (hub → file store → project `.env`, below), the bash
+`vct` CLI shipped under `tools/vct-secrets/` (the file-store tier's
+management surface), and the integration patterns around them.
 
 ---
 
@@ -22,6 +25,60 @@ Secret handling in a multi-project setup tends to fragment:
 Project-scoped isolation is the goal: each project sees only the secrets
 it owns; shared secrets (e.g. one GitHub PAT for all of your repos) are
 explicitly opt-in via a `shared/` namespace.
+
+---
+
+## Canonical resolution chain — three tiers
+
+Every sanctioned resolver walks the SAME chain, in this order:
+
+1. **vct-hub (tier 1, keychain-backed)** — `GET
+   /api/v1/projects/{id}/env?key=NAME` against the launcher's hub.
+   Values live in the OS keychain; reads are gated by the launcher's
+   per-`(secret × requester)` active-flag matrix (a paused or ungranted
+   key answers `key_not_active` — respect it, don't route around).
+   Hub discovery: `$VCT_HUB_PORT` / `$VCT_HUB_TOKEN` env →
+   `<vct_root>/hub.port` + `hub.token` → defaults. Canonical for
+   launcher-managed slots (`github_pat`, `openai_api_key`, module
+   secrets, and every GUI-saved user secret).
+2. **File store (tier 2)** — when the hub is unreachable, the project
+   isn't registered, or the key isn't active there: `$VCT_SECRETS_DIR`
+   (default `~/.vct-secrets`), `projects/<NAME>/<key>` first, then
+   `shared/<key>` (see [Storage layout](#storage-layout) below — the
+   `vct` CLI manages this tier).
+3. **Project `.env` (tier 3, READ-ONLY, lowest priority)** — the
+   requesting project's own root `.env`. Line-oriented parse: `KEY=VALUE`
+   and `export KEY=VALUE`, one matching pair of quotes stripped, NO
+   variable expansion, NO command substitution, first match wins. VCO
+   only ever READS this file for resolution — see the invariant below.
+
+**Must-match triplet**: the chain is implemented three times — the bash
+resolver `templates/scripts/vct_secrets_resolve.sh`, its PowerShell
+sibling `templates/scripts/vct_secrets_resolve.ps1`, and the Python
+helper `vco_lib/agent_secrets.py` (`get` / `exec_with_secrets`). Tier
+order, fall-through rules, and the tier-3 parsing rule MUST stay
+identical across all three; each carries a must-match comment naming
+the other two. Change one → change all three.
+
+**Write invariant**: VCO never writes secret values into the project tree.
+Resolution is read-at-need only — no resolver, projection writer, or
+bundle step persists a secret VALUE into `.claude/settings.json`,
+`.claude/env`, `.vscode/settings.json`, `.env`, or any other file under
+the project folder (the tree-wide invariant tests in
+`launcher/src-tauri/src/commands/projects_v2.rs` and
+`tests/test_config_projection_byte_identical.py` enforce this).
+
+### Hub network posture (tier 1)
+
+The hub binds `127.0.0.1` (loopback-only) by default, so a leaked
+`hub.token` is useless from the LAN. The bind widens to `0.0.0.0`
+only (a) while a hub-consuming module (a global container module such
+as the RL reranker) is installed — its container reaches the hub via
+`host.containers.internal`, which never maps to the host's own loopback
+on any OS — or (b) when the user sets `VCT_HUB_BIND_ALL=1` explicitly.
+An explicit `VCT_HUB_BIND_ALL` value wins in both directions. Every
+`/api/v1/*` route stays bearer-token gated while widened. Full runbook:
+`docs/TROUBLESHOOTING.md` § "Hub bind posture".
 
 ---
 
@@ -148,16 +205,20 @@ vct help | version
 └── audit.log                           # Append-only JSON-lines log
 ```
 
-### Resolution order
+### Resolution order (within tier 2)
 
-For each requested `--secret KEY`:
+This is the order INSIDE the file store — the second tier of the
+[canonical three-tier chain](#canonical-resolution-chain--three-tiers)
+above. For each requested `--secret KEY`, the `vct` CLI resolves:
 
 1. `~/.vct-secrets/projects/<PROJECT>/<KEY>` — project-specific (first priority)
 2. `~/.vct-secrets/shared/<KEY>` — cross-project fallback
 3. Fail fast (exit 2, clear error message)
 
 Project always wins, so e.g. one project's `openai_api_key` is its own,
-period.
+period. (The hub-first resolvers — `vct_secrets_resolve.sh` / `.ps1` /
+`agent_secrets.py` — consult the hub before this tier and the project
+`.env` after it.)
 
 ### Permissions
 

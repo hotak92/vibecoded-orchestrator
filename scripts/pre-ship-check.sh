@@ -417,6 +417,24 @@ else
     fi
 fi
 
+# Gate 25 (v0.2.75, advisory): secrets write-invariant sentence present in
+# the canonical docs (doc-drift guard for the load-bearing contract line).
+# Advisory-level by design — a docs rewording must not block a release,
+# but the maintainer should notice if the invariant sentence vanished.
+INVARIANT_SENTENCE="VCO never writes secret values into the project tree"
+_inv_missing=""
+for _inv_file in docs/VCT_SECRETS_PRIMITIVE.md templates/ORCHESTRATOR-CLAUDE.md.template; do
+    if ! grep -qF "$INVARIANT_SENTENCE" "$_inv_file" 2>/dev/null; then
+        _inv_missing="$_inv_missing $_inv_file"
+    fi
+done
+if [ -z "$_inv_missing" ]; then
+    gate_pass "Secrets write-invariant sentence present (docs + CLAUDE.md template)"
+else
+    gate_warn "Secrets write-invariant sentence (advisory)" \
+        "Missing verbatim sentence '$INVARIANT_SENTENCE' in:$_inv_missing"
+fi
+
 # Gate 16: CHANGELOG has v$EXPECTED_VERSION entry.
 # Match the Keep-a-Changelog heading shape: `## [0.2.X] - 2026-MM-DD`.
 # Allow optional `v` prefix and optional surrounding brackets for flexibility.
@@ -456,6 +474,8 @@ fi
 # numbers instead:
 #   Gate 23 — open Dependabot alerts (Section 3, after Gate 15)
 #   Gate 24 — Step22 access-matrix workflow green (Section 2)
+#   Gate 25 — secrets write-invariant sentence doc-drift guard
+#             (Section 3, before Gate 16; advisory)
 
 # Gate 21: Pre-tag privacy check (scrubs operational private state from tracked tree).
 if [ -x scripts/check-pre-tag-privacy.sh ]; then
