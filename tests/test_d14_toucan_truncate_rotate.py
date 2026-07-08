@@ -112,9 +112,10 @@ def test_oversized_bash_command_is_truncated(tmp_path):
         "user_message": "run it",
         "session_id": "s1",
     }
-    res = _run_sh(payload, tmp_path)
     # Bash branch may exit 2 if a security rule trips, but the TOUCAN row is
-    # written BEFORE the security scan. `echo x…` is benign → exit 0.
+    # written BEFORE the security scan. `echo x...` is benign so it exits 0;
+    # either way the row is on disk, which is what we assert.
+    _run_sh(payload, tmp_path)
     row = _last_row(tmp_path)
     assert row is not None
     assert len(row["tool_args"]["command"]) < len(big_cmd)
