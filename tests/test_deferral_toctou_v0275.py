@@ -307,36 +307,71 @@ class TestApplyDeferredForeignResolveClears(unittest.TestCase):
 
 
 class TestInstallPreWriteMergeStructure(unittest.TestCase):
-    """Structural guards on install.py (import-shape only — running main()
-    is out of scope; matches TestInstallOwnershipSet's approach in
-    tests/test_deferral_foreign_preservation_v0273.py)."""
+    """Structural guards on install.py + the extracted flow module
+    (import-shape only — running main() is out of scope; matches
+    TestInstallOwnershipSet's approach in
+    tests/test_deferral_foreign_preservation_v0273.py).
+
+    P2c-b (v0.2.75): the choreography moved into
+    vco_lib.install_deferral_flow.InstallDeferralFlow — the guards moved
+    WITH the code, keeping the same strength: two merge moments (A-2 seed
+    + P1 pre-write re-merge), exactly one write, none of it inline in
+    install.py anymore."""
 
     @classmethod
     def setUpClass(cls):
         cls.source = (REPO_ROOT / "install.py").read_text(encoding="utf-8")
+        cls.flow_source = (
+            REPO_ROOT / "vco_lib" / "install_deferral_flow.py"
+        ).read_text(encoding="utf-8")
 
-    def test_two_merge_from_disk_call_sites(self):
-        """A-2 seed + P1 pre-write re-merge: exactly TWO real
-        `_deferral_report.merge_from_disk(` call sites."""
-        call_lines = [
-            ln for ln in self.source.splitlines()
-            if "_deferral_report.merge_from_disk(" in ln
+    @staticmethod
+    def _code_lines(source: str, needle: str) -> list:
+        return [
+            ln for ln in source.splitlines()
+            if needle in ln
             and not ln.lstrip().startswith("#")
             and "``" not in ln
         ]
-        self.assertEqual(len(call_lines), 2, call_lines)
+
+    def test_two_merge_moments_seed_and_finalize(self):
+        """A-2 seed + P1 pre-write re-merge: install.py holds exactly ONE
+        flow.seed( and ONE flow.finalize( call site; both flow methods
+        route through the single exclusion-scoped disk merge."""
+        self.assertEqual(
+            len(self._code_lines(self.source, "_deferral_flow.seed(")), 1
+        )
+        self.assertEqual(
+            len(self._code_lines(self.source, "_deferral_flow.finalize(")), 1
+        )
+        merge_calls = self._code_lines(
+            self.flow_source, "self._merge_foreign_from_disk()"
+        )
+        self.assertEqual(
+            len(merge_calls), 2,
+            "flow must merge at BOTH moments (seed + finalize): "
+            f"{merge_calls}",
+        )
+
+    def test_no_inline_merge_left_in_install(self):
+        """The extraction is total: no direct merge_from_disk on the run
+        report may remain in install.py."""
+        self.assertEqual(
+            self._code_lines(self.source, "_deferral_report.merge_from_disk("),
+            [],
+        )
 
     def test_single_write_invariant_still_holds(self):
-        """P1 must not add a write call site (A-11 invariant; the canonical
-        assertion lives in test_deferral_foreign_preservation_v0273.py —
-        re-asserted here so a P1 regression fails close to its cause)."""
-        call_lines = [
-            ln for ln in self.source.splitlines()
-            if "_deferral_report.write(" in ln
-            and not ln.lstrip().startswith("#")
-            and "``" not in ln
-        ]
-        self.assertEqual(len(call_lines), 1, call_lines)
+        """A-11 invariant, post-extraction shape: install.py has ZERO
+        direct report writes; the flow module has exactly ONE (inside
+        finalize; also guarded close-up in
+        tests/test_install_deferral_flow_v0275.py)."""
+        self.assertEqual(
+            self._code_lines(self.source, "_deferral_report.write("), []
+        )
+        flow_writes = self._code_lines(self.flow_source, ".write(")
+        self.assertEqual(len(flow_writes), 1, flow_writes)
+        self.assertIn("wrote_entries = self.report.write(", flow_writes[0])
 
 
 if __name__ == "__main__":

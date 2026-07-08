@@ -140,6 +140,7 @@ from vco_lib import bundled_versions as _bundled_versions  # noqa: E402
 from vco_lib import project_init as _project_init  # noqa: E402
 from vco_lib import secrets_audit as _secrets_audit  # noqa: E402
 from vco_lib.deferral_report import DeferralEntry, DeferralReport  # noqa: E402
+from vco_lib.install_deferral_flow import InstallDeferralFlow  # noqa: E402
 from vco_lib.install_update_gate import InstallUpdateGate  # noqa: E402
 
 # ── A-2 (v0.2.73): install.py's deferral-ownership set ──────────────────────
@@ -5766,34 +5767,36 @@ def main() -> int:
         _run_desktop_icon_step(args)
         return 0
 
-    # Deferral report — accumulates non-auto-resolvable conditions detected
-    # during this run; written to .claude/context/UPDATE_DEFERRED.md at end.
-    # Using a distinct name to avoid shadowing the conflict-resolve `report`
-    # local below.
-    _deferral_report = DeferralReport()
-
-    # HIGH-2 fix (2026-05-01): deferral file lands in the user-project folder
-    # when --project-folder is passed. Default = PROJECT_ROOT preserves the
-    # orchestrator self-update behaviour. Resolved HERE (not just before the
-    # final write) because the A-2 seed below needs it.
-    _deferral_folder = (
-        Path(args.project_folder)
-        if getattr(args, "project_folder", None)
-        else PROJECT_ROOT
+    # Deferral choreography (P2c-b, v0.2.75): the A-2 seed / P1 late-merge /
+    # A-11 single-final-write lifecycle lives in
+    # vco_lib.install_deferral_flow.InstallDeferralFlow; main() holds two
+    # thin call sites (flow.seed() below, flow.finalize() at end of run).
+    # `_deferral_report` stays as the run-report alias the mid-run emitter
+    # steps accumulate into (distinct name avoids shadowing the
+    # conflict-resolve `report` local below). HIGH-2 fix (2026-05-01): the
+    # folder resolves to the user-project folder when --project-folder is
+    # passed; default = PROJECT_ROOT preserves the orchestrator self-update
+    # behaviour. Resolved HERE because the A-2 seed needs it.
+    _deferral_flow = InstallDeferralFlow(
+        folder=(
+            Path(args.project_folder)
+            if getattr(args, "project_folder", None)
+            else PROJECT_ROOT
+        ),
+        owned_ids=_INSTALL_OWNED_CONDITION_IDS,
+        owned_prefixes=_INSTALL_OWNED_CONDITION_PREFIXES,
     )
+    _deferral_report = _deferral_flow.report
+    _deferral_folder = _deferral_flow.folder
 
     # A-2 (v0.2.73): seed the run's report FROM DISK so the end-of-run write
     # cannot clobber entries other writer families persisted (project_init,
-    # Rust emitters, background resync children). Only FOREIGN entries are
-    # merged — condition IDs install.py OWNS (re-detects every run) keep
-    # their drop-when-absent self-cleaning semantics. Soft-fail: a seed
-    # failure degrades to the pre-A-2 behaviour, never blocks the install.
+    # Rust emitters, background resync children). Only FOREIGN entries merge;
+    # owned condition IDs keep their drop-when-absent self-cleaning
+    # semantics. Soft-fail: a seed failure degrades to the pre-A-2
+    # behaviour, never blocks the install.
     try:
-        _seeded = _deferral_report.merge_from_disk(
-            _deferral_folder,
-            exclude_ids=_INSTALL_OWNED_CONDITION_IDS,
-            exclude_prefixes=_INSTALL_OWNED_CONDITION_PREFIXES,
-        )
+        _seeded = _deferral_flow.seed()
         if _seeded:
             _log_install_event(
                 "deferral_report", "ok",
@@ -6868,54 +6871,32 @@ def main() -> int:
     if args.update:
         _clear_update_resume_sentinel_after_success(PROJECT_ROOT)
 
-    # Fix 6 (v0.2.13) + A-11 (v0.2.73): this is the ONLY deferral write of the
-    # run. It happens AFTER all deferral-adding steps complete
-    # (_check_searxng_remnants, _check_ollama_mcp_remnants,
-    # _check_search_mcp_env_obsolete, _register_mcps,
-    # _materialize_boot_service, _rewrite_stale_mcp_entries). The historical
-    # mid-run write (pre-A-11) was removed — with an empty in-memory report it
-    # unlinked foreign entries mid-run. A-2: the report was seeded from disk
-    # at the top of main(), so foreign writer families' entries survive this
-    # rebuild-from-memory write.
-    #
-    # P1 (v0.2.75) TOCTOU close: the A-2 seed snapshots the disk at t0, but a
-    # detached child (e.g. the P7 resync driver failing fast) can read-merge-
-    # write a NEW foreign entry to disk minutes later — the rebuild-from-
-    # memory write below would clobber it. Re-merge from disk NOW, at the
-    # last moment before the single final write: owned IDs stay excluded
-    # (drop-when-absent semantics intact) and merge_from_disk's per-run
-    # mark_resolved tombstones prevent resurrecting entries this run
-    # explicitly settled (the R-6 not_owed probe clears
-    # codegraph_embed_resync_pending from MEMORY only; its on-disk copy is
-    # still present here and must NOT be re-imported). Soft-fail like the
-    # seed. This is a merge, not a write — A-11's single-write invariant
-    # (tests/test_deferral_foreign_preservation_v0273.py) holds.
+    # Fix 6 (v0.2.13) + A-11 (v0.2.73) + P1 (v0.2.75): the ONLY deferral
+    # write of the run. flow.finalize() re-merges FOREIGN entries from disk
+    # at the last moment (P1 TOCTOU close — a detached child may have
+    # read-merge-written a NEW entry since the A-2 seed; owned IDs stay
+    # excluded, mark_resolved tombstones are honored so probe-settled
+    # entries don't resurrect) and then performs the single authoritative
+    # write. Runs AFTER all deferral-adding steps complete. Full rationale:
+    # vco_lib/install_deferral_flow.py module docstring. On --update runs
+    # that ended with ZERO entries, write a stub UPDATE_DEFERRED.md so the
+    # user has a paper trail confirming the update completed cleanly.
     try:
-        _late_merged = _deferral_report.merge_from_disk(
-            _deferral_folder,
-            exclude_ids=_INSTALL_OWNED_CONDITION_IDS,
-            exclude_prefixes=_INSTALL_OWNED_CONDITION_PREFIXES,
-        )
-        if _late_merged:
+        _final = _deferral_flow.finalize()
+        if _final.merge_error:
+            _log_install_event(
+                "deferral_report", "warn",
+                f"P1 pre-write disk re-merge failed: {_final.merge_error}",
+            )
+        elif _final.late_merged:
             _log_install_event(
                 "deferral_report", "ok",
-                f"pre-write disk re-merge preserved {_late_merged} mid-run "
-                f"foreign deferral entr{'y' if _late_merged == 1 else 'ies'} "
+                f"pre-write disk re-merge preserved {_final.late_merged} "
+                "mid-run foreign deferral entr"
+                f"{'y' if _final.late_merged == 1 else 'ies'} "
                 "(P1 TOCTOU close)",
             )
-    except Exception as exc:  # noqa: BLE001 — re-merge is best-effort
-        _log_install_event(
-            "deferral_report", "warn",
-            f"P1 pre-write disk re-merge failed: {exc}",
-        )
-
-    # Additionally, on --update runs that ended with ZERO entries, write a
-    # stub UPDATE_DEFERRED.md so the user has a paper trail confirming the
-    # update completed cleanly (was previously: NO file at all, indistinguishable
-    # from "no --update run happened").
-    try:
-        wrote_entries = _deferral_report.write(_deferral_folder)
-        if not wrote_entries and args.update:
+        if not _final.wrote_entries and args.update:
             _write_update_deferred_stub(_deferral_folder, mode=mode)
     except Exception as exc:  # noqa: BLE001 — soft-fail by design
         _log_install_event(

@@ -200,21 +200,32 @@ class TestInstallOwnershipSet(unittest.TestCase):
     def test_owned_set_and_prefixes_exist(self):
         self.assertIn("_INSTALL_OWNED_CONDITION_IDS = frozenset({", self.source)
         self.assertIn("_INSTALL_OWNED_CONDITION_PREFIXES = (", self.source)
-        # The final write must be preceded by the A-2 seed (merge_from_disk).
-        self.assertIn("merge_from_disk(", self.source)
+        # P2c-b (v0.2.75): the seed/finalize choreography moved to
+        # vco_lib.install_deferral_flow — main() must hold the A-2 seed
+        # call site (the flow is constructed with the owned sets above).
+        self.assertIn("_deferral_flow.seed(", self.source)
 
     def test_mid_run_write_removed(self):
-        """A-11: exactly ONE real `_deferral_report.write(` call site remains
-        (the final one, whose return value gates the stub). Comment/docstring
+        """A-11: exactly ONE write moment remains — P2c-b moved it into
+        `InstallDeferralFlow.finalize()` (late-merge + single write), so
+        install.py must hold exactly ONE `_deferral_flow.finalize(` call
+        site and ZERO direct `_deferral_report.write(` calls. The
+        flow-module-side single-write guard lives in
+        tests/test_install_deferral_flow_v0275.py. Comment/docstring
         mentions are excluded by matching code lines only."""
-        call_lines = [
-            ln for ln in self.source.splitlines()
-            if "_deferral_report.write(" in ln
-            and not ln.lstrip().startswith("#")
-            and "``" not in ln
-        ]
-        self.assertEqual(len(call_lines), 1, call_lines)
-        self.assertIn("wrote_entries = _deferral_report.write(", call_lines[0])
+        def _code_lines(needle):
+            return [
+                ln for ln in self.source.splitlines()
+                if needle in ln
+                and not ln.lstrip().startswith("#")
+                and "``" not in ln
+            ]
+
+        self.assertEqual(_code_lines("_deferral_report.write("), [],
+                         "no direct report write may remain in install.py")
+        finalize_lines = _code_lines("_deferral_flow.finalize(")
+        self.assertEqual(len(finalize_lines), 1, finalize_lines)
+        self.assertIn("_final = _deferral_flow.finalize(", finalize_lines[0])
 
 
 if __name__ == "__main__":
