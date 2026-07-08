@@ -9,6 +9,14 @@ import {
   dispatchLifecycleEvent,
 } from "./orchestrator_additions.ts";
 import { findUserIdByEmail } from "./user_lookup.ts";
+import {
+  claimEvent,
+  extractEventId,
+  extractEventTimestamp,
+  isStale,
+  maxAgeHoursFromEnv,
+  releaseClaim,
+} from "./replay_protection.ts";
 
 // Pre-flight: hard-fail at module init if VARIANT_MAP still ships
 // placeholder keys in a production deployment. Prevents the silent
@@ -89,16 +97,66 @@ Deno.serve(async (req: Request) => {
   const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
   const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
+  // ── E-7 (v0.2.75): replay protection ─────────────────────────────────
+  // The HMAC above proves origin, not one-time-ness: a captured signed
+  // body replays verbatim. Freshness first (stale replays are refused
+  // even if the ledger row was pruned), then an insert-or-conflict claim
+  // on meta.event_id (a replay necessarily carries the same event_id —
+  // changing it would break the HMAC). See replay_protection.ts for the
+  // fail-open rationale on absent ids/timestamps and ledger errors.
+  const eventTimestamp = extractEventTimestamp(payload);
+  const maxAgeHours = maxAgeHoursFromEnv(Deno.env.get("WEBHOOK_MAX_AGE_HOURS"));
+  if (isStale(eventTimestamp, Date.now(), maxAgeHours)) {
+    return new Response(
+      JSON.stringify({
+        error: `Stale webhook: event timestamp ${eventTimestamp} is older than ${maxAgeHours}h`,
+      }),
+      { status: 400, headers: { "Content-Type": "application/json" } },
+    );
+  }
+
+  const eventId = extractEventId(payload);
+  let claimed = false;
+  if (eventId) {
+    const claim = await claimEvent(supabase, eventId, eventName);
+    if (claim === "duplicate") {
+      // Already processed successfully — acknowledge without re-granting.
+      console.log(`[replay] duplicate event_id=${eventId} (${eventName}); skipping`);
+      return new Response(
+        JSON.stringify({ message: `Duplicate event ${eventId}: already processed`, deduplicated: true }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    claimed = claim === "claimed";
+  } else {
+    console.warn(
+      `[replay] payload for ${eventName} carries no meta.event_id — processing without dedup`,
+    );
+  }
+
+  // Dedup guards only SUCCESSFUL processing: any non-2xx response below
+  // releases the claim so a Lemon Squeezy retry (or the user retrying
+  // after registering) can re-process instead of being swallowed as a
+  // "duplicate" of a failure.
+  const respond = async (resp: Response): Promise<Response> => {
+    if (claimed && eventId && resp.status >= 400) {
+      await releaseClaim(supabase, eventId);
+    }
+    return resp;
+  };
+
   // Lifecycle events (cancel / expire / refund / payment_failed) are handled
   // in the orchestrator_additions module. Only order_created flows through
   // the activation block below.
   if (eventName !== "order_created") {
     const result = await dispatchLifecycleEvent(supabase, eventName, payload);
     if (result) {
-      return new Response(JSON.stringify(result.body), {
-        status: result.status,
-        headers: { "Content-Type": "application/json" },
-      });
+      return respond(
+        new Response(JSON.stringify(result.body), {
+          status: result.status,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
     }
     // Fall-through shouldn't happen given HANDLED_EVENTS gate above.
     return new Response(
@@ -113,18 +171,22 @@ Deno.serve(async (req: Request) => {
   const variantId = String(firstItem?.variant_id ?? "");
 
   if (!email || !variantId) {
-    return new Response(
-      JSON.stringify({ error: "Missing email or variant_id" }),
-      { status: 400, headers: { "Content-Type": "application/json" } },
+    return respond(
+      new Response(
+        JSON.stringify({ error: "Missing email or variant_id" }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      ),
     );
   }
 
   const mapping = lookupVariant(variantId);
   if (!mapping) {
     console.log(`Unknown variant_id: ${variantId}`);
-    return new Response(
-      JSON.stringify({ error: `Unknown variant_id: ${variantId}` }),
-      { status: 400, headers: { "Content-Type": "application/json" } },
+    return respond(
+      new Response(
+        JSON.stringify({ error: `Unknown variant_id: ${variantId}` }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      ),
     );
   }
 
@@ -137,17 +199,24 @@ Deno.serve(async (req: Request) => {
     userId = await findUserIdByEmail(supabase, email);
   } catch (e) {
     console.error("Error listing users:", e);
-    return new Response(
-      JSON.stringify({ error: "Failed to look up user" }),
-      { status: 500, headers: { "Content-Type": "application/json" } },
+    return respond(
+      new Response(
+        JSON.stringify({ error: "Failed to look up user" }),
+        { status: 500, headers: { "Content-Type": "application/json" } },
+      ),
     );
   }
 
   if (!userId) {
     console.log(`No user found with email: ${email}`);
-    return new Response(
-      JSON.stringify({ error: "User not found. They must register first." }),
-      { status: 404, headers: { "Content-Type": "application/json" } },
+    // respond() releases the dedup claim: when the user registers and
+    // Lemon Squeezy retries (or support re-sends the event), the retry
+    // must process, not short-circuit as a duplicate of this failure.
+    return respond(
+      new Response(
+        JSON.stringify({ error: "User not found. They must register first." }),
+        { status: 404, headers: { "Content-Type": "application/json" } },
+      ),
     );
   }
 
@@ -160,9 +229,11 @@ Deno.serve(async (req: Request) => {
     );
   } catch (e) {
     console.error("Error activating app:", e);
-    return new Response(
-      JSON.stringify({ error: "Failed to activate app" }),
-      { status: 500, headers: { "Content-Type": "application/json" } },
+    return respond(
+      new Response(
+        JSON.stringify({ error: "Failed to activate app" }),
+        { status: 500, headers: { "Content-Type": "application/json" } },
+      ),
     );
   }
 
