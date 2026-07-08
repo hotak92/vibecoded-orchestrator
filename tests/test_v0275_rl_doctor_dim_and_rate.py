@@ -226,3 +226,49 @@ def test_doctor_rate_none_when_no_events(tmp_path):
     assert out["count"] == 0
     assert out["success_count"] == 0
     assert out["fallback_rate"] is None
+
+
+# ── RL-14: quarantine count report (informational probe) ────────────────
+
+
+def test_quarantine_probe_reports_count(monkeypatch):
+    from claude_mcp_servers.rl_client import hub_writer
+
+    monkeypatch.setattr(hub_writer, "_read_hub_token", lambda: "tok-abc")
+    monkeypatch.setattr(hub_writer, "_read_hub_port", lambda: 7700)
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"count": 4}'
+
+    captured = {}
+
+    def _urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["auth"] = req.headers.get("Authorization")
+        return _Resp()
+
+    import urllib.request
+
+    monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+    out = rl_doctor._probe_quarantine()
+    assert out["status"] == "quarantined_rows"
+    assert out["count"] == 4
+    assert "quarantined=true" in captured["url"]
+    assert captured["auth"] == "Bearer tok-abc"
+
+
+def test_quarantine_probe_hub_down(monkeypatch):
+    from claude_mcp_servers.rl_client import hub_writer
+
+    monkeypatch.setattr(hub_writer, "_read_hub_token", lambda: None)
+    monkeypatch.setattr(hub_writer, "_read_hub_port", lambda: 7700)
+    out = rl_doctor._probe_quarantine()
+    assert out["status"] == "hub_down"
+    assert out["count"] is None

@@ -138,6 +138,13 @@ impl Db {
         let cutoff = chrono::Utc::now().timestamp_millis() - 24 * 60 * 60 * 1000;
         let _ = db.prune_change_log(cutoff);
 
+        // RL-14 (v0.2.75): one-time marking pass for historically-poisoned
+        // rl_events rows (out-of-range scores pre-dating the v0.2.70 writer
+        // clamp). Guarded by an app_state key so it runs once per
+        // launcher.db; idempotent + soft-fail either way. Both the launcher
+        // and the hub open through here.
+        db.run_quarantine_backfill_once();
+
         // NOTE (v0.2.21 Step 3d): the orchestrator-root auto-register
         // call previously ran from inside `Db::open()`, but its
         // implementation depends on launcher-only modules

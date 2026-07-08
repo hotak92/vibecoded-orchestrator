@@ -306,6 +306,51 @@ def _probe_telemetry_hub() -> Dict[str, Any]:
     }
 
 
+def _probe_quarantine() -> Dict[str, Any]:
+    """RL-14 (v0.2.75): count quarantined rl_events rows via the hub.
+
+    Read-only GET against ``/api/v1/rl/events/count?quarantined=true``.
+    Quarantined rows are poisoned telemetry (e.g. the historical
+    out-of-range-score class) that the one-time marking pass flagged —
+    they stay on disk but are excluded from every training-data read.
+    A non-zero count here is INFORMATIONAL, not unhealthy: it means the
+    marker is doing its job.
+    """
+    try:
+        from claude_mcp_servers.rl_client import hub_writer
+
+        token = hub_writer._read_hub_token()
+        port = hub_writer._read_hub_port()
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "unknown", "count": None, "detail": f"hub probe raised: {exc}"}
+    if token is None:
+        return {
+            "status": "hub_down",
+            "count": None,
+            "detail": "hub not running — quarantine count unavailable.",
+        }
+    import urllib.request
+
+    url = f"http://127.0.0.1:{port}/api/v1/rl/events/count?quarantined=true"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        count = int(data.get("count", 0) or 0)
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "unknown", "count": None, "detail": f"count request failed: {exc}"}
+    return {
+        "status": "quarantined_rows" if count > 0 else "clean",
+        "count": count,
+        "detail": (
+            f"{count} poisoned row(s) quarantined (marked, excluded from "
+            "training reads — informational, not a fault)."
+            if count > 0
+            else "no quarantined rl_events rows."
+        ),
+    }
+
+
 def _probe_retention() -> Dict[str, Any]:
     """RL-5 retention configuration + resolved plan (read-only, no prune)."""
     try:
@@ -345,6 +390,7 @@ def run_diagnostics(project_root: str) -> Dict[str, Any]:
     fallback = _probe_fallback_counter(project_root)
     telemetry = _probe_telemetry_hub()
     retention = _probe_retention()
+    quarantine = _probe_quarantine()
 
     rl_enabled = bool(lic.get("enabled")) and toggle.get("enabled") is not False
 
@@ -367,6 +413,9 @@ def run_diagnostics(project_root: str) -> Dict[str, Any]:
         "last_fallback": fallback,
         "telemetry_hub": telemetry,
         "retention": retention,
+        # RL-14: informational — a non-zero count means the poison marker
+        # is working, so it deliberately does NOT affect `healthy`.
+        "quarantine": quarantine,
     }
 
 
@@ -389,6 +438,8 @@ def format_human(report: Dict[str, Any]) -> str:
     _sec("last rerank fallback", report["last_fallback"])
     _sec("telemetry hub", report["telemetry_hub"])
     _sec("retention (RL-5)", report["retention"])
+    # .get: tolerate pre-RL-14 report dicts (older JSON consumers / fixtures).
+    _sec("quarantine (RL-14)", report.get("quarantine", {"status": "unknown", "detail": ""}))
     return "\n".join(lines)
 
 

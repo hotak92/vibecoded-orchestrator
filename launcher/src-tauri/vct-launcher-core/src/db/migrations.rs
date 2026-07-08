@@ -208,6 +208,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "extend code_graph_builds.status CHECK with 'partial' (C-11 / RT-3, v0.2.73). A code-graph build can now finish PARTIAL: inserts succeeded (files_analyzed meaningful) but the stale-row DELETE pass failed (PRUNE_FAILURES=N, N>0). The analyzer keeps exit 0 and emits the machine-readable PRUNE_FAILURES line; the launcher stdout reader (commands/codegraph.rs) flips the row success->partial when N>0. SQLite CHECK constraints are immutable, so this is a table-rebuild (mirror of 021): the replacement table carries EVERY column the live table has after migration 037 — INCLUDING the pid column — then copy/drop/rename and recreate idx_code_graph_builds_status. No FK toggles / not self-transactional: nothing references code_graph_builds via an inbound FOREIGN KEY, so it rides the runner's outer transaction like 021. LAUNCHER_DB_TABLE_SET_VERSION bumps 37->38 atomically with this migration (B-2).",
         sql: include_str!("migrations/038_code_graph_build_partial_status.sql"),
     },
+    Migration {
+        version: 39,
+        description: "rl_events quarantine marker (RL-14, v0.2.75). Nullable quarantined_at (unix-ms) + quarantine_reason (stable tag, e.g. 'score_out_of_range') columns + partial index on marked rows. Poisoned telemetry rows (historical out-of-range node scores pre-dating the v0.2.70 F-E writer clamp) are MARKED rather than deleted so query-distribution signal survives while training-data reads (hub GET /rl/events + the module DB API events route) exclude them by default. The one-time marking pass for the historical score>1.0 class runs Rust-side (Db::backfill_quarantine_out_of_range from Db::open, guarded by app_state 'rl_events.quarantine_backfill_v1') — payload_json is writer-supplied TEXT the hub never JSON-validates, so a SQL json_each pass would hard-fail the whole migration on one malformed row; the Rust pass skips unparseable payloads softly. Plain additive ALTER TABLE + partial index — idempotent via the runner's version check, not self-transactional. LAUNCHER_DB_TABLE_SET_VERSION bumps 38->39 atomically with this migration (B-2).",
+        sql: include_str!("migrations/039_rl_events_quarantine.sql"),
+    },
 ];
 
 /// Migrations whose .sql manages its OWN `BEGIN`/`COMMIT` boundary.
@@ -2104,6 +2109,85 @@ mod tests {
     /// Migration 038 is idempotent (runner version-gate; regression net).
     #[test]
     fn migration_038_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("first apply");
+        apply(&conn).expect("second apply (idempotent)");
+    }
+
+    // ─── Migration 039: rl_events quarantine columns (RL-14, v0.2.75) ────
+
+    /// Upgrade path on a POPULATED table: a DB stopped at version 38 with
+    /// existing rl_events rows gains the two nullable quarantine columns +
+    /// the partial index; pre-existing rows survive verbatim with
+    /// quarantined_at NULL (clean).
+    #[test]
+    fn migration_039_upgrade_preserves_populated_rl_events() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 38).expect("apply up to v38");
+
+        // Seed pre-039 rows (the v38 column set — no quarantine columns yet).
+        for i in 0..3 {
+            conn.execute(
+                "INSERT INTO rl_events
+                    (event_type, schema_version, ts, task_id, payload_json)
+                 VALUES ('retrieval', 3, ?1, ?2, ?3)",
+                rusqlite::params![
+                    1_000 + i,
+                    format!("task-{}", i),
+                    r#"{"nodes":[{"title":"A","score":0.9}]}"#,
+                ],
+            )
+            .unwrap();
+        }
+
+        apply(&conn).expect("apply remaining migrations (039)");
+
+        // Columns exist with the right shape (both nullable).
+        let mut stmt = conn.prepare("PRAGMA table_info(rl_events)").unwrap();
+        let cols: Vec<(String, String, i64)> = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let qa = cols.iter().find(|c| c.0 == "quarantined_at")
+            .expect("quarantined_at column must exist after 039");
+        assert_eq!(qa.1.to_uppercase(), "INTEGER");
+        assert_eq!(qa.2, 0, "quarantined_at must be nullable");
+        let qr = cols.iter().find(|c| c.0 == "quarantine_reason")
+            .expect("quarantine_reason column must exist after 039");
+        assert_eq!(qr.1.to_uppercase(), "TEXT");
+        assert_eq!(qr.2, 0, "quarantine_reason must be nullable");
+
+        // Rows survive verbatim, backfilled to NULL (clean).
+        let (n, marked): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COUNT(quarantined_at) FROM rl_events",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(n, 3, "pre-existing rows must survive the upgrade");
+        assert_eq!(marked, 0, "upgrade itself marks nothing (Rust pass does)");
+
+        // The partial index landed.
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_rl_events_quarantined'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1);
+    }
+
+    /// Migration 039 is idempotent (runner version-gate; regression net).
+    #[test]
+    fn migration_039_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         apply(&conn).expect("first apply");

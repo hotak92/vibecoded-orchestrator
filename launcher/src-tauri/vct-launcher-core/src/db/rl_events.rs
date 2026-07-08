@@ -27,12 +27,18 @@ use rusqlite::{params, OptionalExtension};
 
 use super::Db;
 
-/// One RL event row. Matches the migration-025 schema.
+/// One RL event row. Matches the migration-025 schema (+ the migration-039
+/// quarantine columns, v0.2.75 RL-14).
 ///
 /// `payload_json` carries the full v3 event JSON verbatim. The indexed
 /// columns above are denormalized for SQL queries; callers that need
 /// non-indexed fields (e.g. per-node `n_emb`, `linked_embs`, `cosine_sims`)
 /// must parse `payload_json` themselves.
+///
+/// `quarantined_at` (unix-ms) + `quarantine_reason` mark POISONED rows —
+/// e.g. the historical out-of-range-score class that pre-dates the v0.2.70
+/// F-E writer clamp. Marked rows stay on disk (query-distribution signal)
+/// but are excluded from training-data reads by default.
 #[derive(Debug, Clone)]
 pub struct RlEvent {
     pub id: i64,
@@ -48,7 +54,18 @@ pub struct RlEvent {
     pub embedding_dim: Option<i64>,
     pub embedding_model: Option<String>,
     pub payload_json: String,
+    /// RL-14: unix-ms when the row was quarantined; NULL = clean.
+    pub quarantined_at: Option<i64>,
+    /// RL-14: stable machine tag (e.g. `score_out_of_range`).
+    pub quarantine_reason: Option<String>,
 }
+
+/// RL-14: the app_state key guarding the one-time historical marking pass.
+/// Present (any value) ⇒ the backfill already ran on this launcher.db.
+pub const QUARANTINE_BACKFILL_STATE_KEY: &str = "rl_events.quarantine_backfill_v1";
+
+/// RL-14: stable reason tag for the historical out-of-range-score class.
+pub const QUARANTINE_REASON_SCORE_OUT_OF_RANGE: &str = "score_out_of_range";
 
 impl Db {
     /// Insert one RL event. Always appends; rl_events is never updated in
@@ -111,6 +128,11 @@ impl Db {
     /// All filters are optional; passing all `None` returns the most-recent
     /// `limit` rows across the whole table (use with care — the table grows
     /// linearly with retrieval traffic).
+    ///
+    /// RL-14 (v0.2.75): `include_quarantined = false` (the default every
+    /// training-data read passes) excludes rows a marking pass flagged as
+    /// poisoned (`quarantined_at IS NOT NULL`). Pass `true` only for
+    /// inspection surfaces that deliberately want the full corpus.
     pub fn list_rl_events(
         &self,
         project_id: Option<&str>,
@@ -118,13 +140,14 @@ impl Db {
         since_ms: Option<i64>,
         until_ms: Option<i64>,
         limit: u32,
+        include_quarantined: bool,
     ) -> Result<Vec<RlEvent>, String> {
         // Build the WHERE clause + params iteratively to keep the prepared
         // statement cache-friendly across common filter combinations.
         let mut sql = String::from(
             "SELECT id, event_type, schema_version, ts, project_id, project_name,
                     task_id, task_type, embedding_source, embedding_dim,
-                    embedding_model, payload_json
+                    embedding_model, payload_json, quarantined_at, quarantine_reason
                FROM rl_events
               WHERE 1=1",
         );
@@ -144,6 +167,9 @@ impl Db {
         if let Some(u) = until_ms {
             sql.push_str(" AND ts <= ?");
             params_vec.push(Box::new(u));
+        }
+        if !include_quarantined {
+            sql.push_str(" AND quarantined_at IS NULL");
         }
         sql.push_str(" ORDER BY ts DESC, id DESC LIMIT ?");
         params_vec.push(Box::new(limit as i64));
@@ -169,6 +195,8 @@ impl Db {
                     embedding_dim: row.get(9)?,
                     embedding_model: row.get(10)?,
                     payload_json: row.get(11)?,
+                    quarantined_at: row.get(12)?,
+                    quarantine_reason: row.get(13)?,
                 })
             })
             .map_err(|e| format!("query list_rl_events: {}", e))?;
@@ -182,11 +210,16 @@ impl Db {
 
     /// Count rl_events for a project / event-type / time-range.
     /// Used by the launcher Identity-tab event-rate badge.
+    ///
+    /// RL-14 (v0.2.75): `quarantined = None` counts ALL rows (the badge's
+    /// pre-RL-14 semantics, unchanged); `Some(true)` counts only quarantined
+    /// rows (rl-doctor's report); `Some(false)` only clean rows.
     pub fn count_rl_events(
         &self,
         project_id: Option<&str>,
         event_type: Option<&str>,
         since_ms: Option<i64>,
+        quarantined: Option<bool>,
     ) -> Result<i64, String> {
         let mut sql = String::from("SELECT COUNT(*) FROM rl_events WHERE 1=1");
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -201,6 +234,11 @@ impl Db {
         if let Some(s) = since_ms {
             sql.push_str(" AND ts >= ?");
             params_vec.push(Box::new(s));
+        }
+        match quarantined {
+            Some(true) => sql.push_str(" AND quarantined_at IS NOT NULL"),
+            Some(false) => sql.push_str(" AND quarantined_at IS NULL"),
+            None => {}
         }
 
         let guard = self.lock();
@@ -315,11 +353,132 @@ impl Db {
 
         Ok(deleted)
     }
+
+    /// RL-14 (v0.2.75): one-time marking pass for the HISTORICAL poisoned
+    /// class — retrieval events whose payload carries any node `score > 1.0`
+    /// (unbounded hybrid-fusion scores that pre-date the v0.2.70 F-E writer
+    /// clamp; `compute_unified_targets` clamped them to 1.0, silently
+    /// mis-marking those nodes as max-cited in every training pass).
+    ///
+    /// Marks rows (`quarantined_at = now_ms`, reason
+    /// `score_out_of_range`) — never deletes. IDEMPOTENT by construction:
+    /// only rows with `quarantined_at IS NULL` are examined, so a re-run
+    /// touches nothing already marked (and never rewrites a timestamp).
+    ///
+    /// Runs in Rust, not migration SQL: `payload_json` is writer-supplied
+    /// TEXT the hub never JSON-validates, so a SQL `json_each` pass would
+    /// hard-error the whole migration on one malformed row. Here a row that
+    /// fails to parse is SKIPPED (left clean — conservative leave-alone: we
+    /// only quarantine rows we can positively convict).
+    ///
+    /// Returns the number of rows marked.
+    pub fn backfill_quarantine_out_of_range(&self, now_ms: i64) -> Result<u64, String> {
+        // Collect candidate ids under one lock, then mark under another —
+        // the table is append-only + the NULL filter makes the two-step
+        // safe against concurrent writers (new rows are clamped at the
+        // writer boundary and can't join the historical class).
+        let candidates: Vec<i64> = {
+            let guard = self.lock();
+            let mut stmt = guard
+                .prepare(
+                    "SELECT id, payload_json FROM rl_events
+                      WHERE event_type = 'retrieval' AND quarantined_at IS NULL",
+                )
+                .map_err(|e| format!("prepare quarantine scan: {}", e))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| format!("query quarantine scan: {}", e))?;
+
+            let mut ids = Vec::new();
+            for r in rows {
+                let (id, payload) = r.map_err(|e| format!("read quarantine row: {}", e))?;
+                if payload_has_out_of_range_score(&payload) {
+                    ids.push(id);
+                }
+            }
+            ids
+        };
+
+        let mut marked: u64 = 0;
+        let guard = self.lock();
+        for id in candidates {
+            let n = guard
+                .execute(
+                    "UPDATE rl_events
+                        SET quarantined_at = ?1, quarantine_reason = ?2
+                      WHERE id = ?3 AND quarantined_at IS NULL",
+                    params![now_ms, QUARANTINE_REASON_SCORE_OUT_OF_RANGE, id],
+                )
+                .map_err(|e| format!("mark quarantine row {}: {}", id, e))?;
+            marked += n as u64;
+        }
+        Ok(marked)
+    }
+
+    /// RL-14: run [`Self::backfill_quarantine_out_of_range`] exactly once
+    /// per launcher.db, guarded by the `rl_events.quarantine_backfill_v1`
+    /// app_state key. Soft-fail: any error logs + leaves the guard UNSET so
+    /// the next open retries (the pass is idempotent either way). Called
+    /// from `Db::open` (both the launcher and the hub route through it).
+    pub fn run_quarantine_backfill_once(&self) {
+        match self.app_state_get(QUARANTINE_BACKFILL_STATE_KEY) {
+            Ok(Some(_)) => return, // already ran on this DB
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("[launcher-db] quarantine backfill guard read failed: {}", e);
+                return; // no positive confirmation → do nothing (conservative)
+            }
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        match self.backfill_quarantine_out_of_range(now_ms) {
+            Ok(marked) => {
+                if marked > 0 {
+                    eprintln!(
+                        "[launcher-db] RL-14 quarantine backfill: marked {} \
+                         historical out-of-range rl_events row(s)",
+                        marked
+                    );
+                }
+                if let Err(e) = self.app_state_set(QUARANTINE_BACKFILL_STATE_KEY, "done") {
+                    eprintln!("[launcher-db] quarantine backfill guard write failed: {}", e);
+                }
+            }
+            Err(e) => {
+                eprintln!("[launcher-db] RL-14 quarantine backfill failed (will retry next open): {}", e);
+            }
+        }
+    }
+}
+
+/// RL-14: does this payload carry any node with `score > 1.0`?
+///
+/// Pure function over the raw payload text. Unparseable JSON, a missing /
+/// non-array `nodes`, or non-numeric scores all return `false` — we only
+/// convict on positive evidence. Scores exactly 1.0 are IN range (the F-E
+/// clamp emits 1.0 legitimately).
+fn payload_has_out_of_range_score(payload_json: &str) -> bool {
+    let parsed: serde_json::Value = match serde_json::from_str(payload_json) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let nodes = match parsed.get("nodes").and_then(|n| n.as_array()) {
+        Some(a) => a,
+        None => return false,
+    };
+    nodes.iter().any(|n| {
+        n.get("score")
+            .and_then(|s| s.as_f64())
+            .map(|s| s > 1.0)
+            .unwrap_or(false)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::Db;
+    use super::{QUARANTINE_BACKFILL_STATE_KEY, QUARANTINE_REASON_SCORE_OUT_OF_RANGE};
 
     fn fresh_db() -> Db {
         // In-memory DB with all migrations applied (including migration 025
@@ -367,7 +526,7 @@ mod tests {
             )
             .unwrap();
         }
-        let rows = db.list_rl_events(None, None, None, None, 10).unwrap();
+        let rows = db.list_rl_events(None, None, None, None, 10, false).unwrap();
         assert_eq!(rows.len(), 3);
         // Newest-first ordering.
         assert_eq!(rows[0].task_id, "task-2");
@@ -386,7 +545,7 @@ mod tests {
         )
         .unwrap();
         let cit = db
-            .list_rl_events(None, Some("citation"), None, None, 10)
+            .list_rl_events(None, Some("citation"), None, None, 10, false)
             .unwrap();
         assert_eq!(cit.len(), 1);
         assert_eq!(cit[0].event_type, "citation");
@@ -411,13 +570,13 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(db.count_rl_events(None, None, None).unwrap(), 5);
+        assert_eq!(db.count_rl_events(None, None, None, None).unwrap(), 5);
         assert_eq!(
-            db.count_rl_events(None, Some("retrieval"), None).unwrap(),
+            db.count_rl_events(None, Some("retrieval"), None, None).unwrap(),
             3
         );
         assert_eq!(
-            db.count_rl_events(None, Some("citation"), None).unwrap(),
+            db.count_rl_events(None, Some("citation"), None, None).unwrap(),
             2
         );
     }
@@ -438,10 +597,10 @@ mod tests {
         )
         .unwrap();
         let recent = db
-            .list_rl_events(None, None, Some(150), None, 10)
+            .list_rl_events(None, None, Some(150), None, 10, false)
             .unwrap();
         assert_eq!(recent.len(), 2);
-        let count = db.count_rl_events(None, None, Some(150)).unwrap();
+        let count = db.count_rl_events(None, None, Some(150), None).unwrap();
         assert_eq!(count, 2);
     }
 
@@ -477,7 +636,7 @@ mod tests {
         // Cutoff 200 → delete ts < 200 (the two ts=100,150 rows).
         let deleted = db.prune_rl_events(Some(200), None, None).unwrap();
         assert_eq!(deleted, 2);
-        let rows = db.list_rl_events(None, None, None, None, 100).unwrap();
+        let rows = db.list_rl_events(None, None, None, None, 100, false).unwrap();
         assert_eq!(rows.len(), 2);
         // Boundary row ts==200 is retained (strict <).
         assert!(rows.iter().all(|r| r.ts_ms >= 200));
@@ -492,7 +651,7 @@ mod tests {
         // Keep the newest 2 rows → delete the other 3.
         let deleted = db.prune_rl_events(None, Some(2), None).unwrap();
         assert_eq!(deleted, 3);
-        let rows = db.list_rl_events(None, None, None, None, 100).unwrap();
+        let rows = db.list_rl_events(None, None, None, None, 100, false).unwrap();
         assert_eq!(rows.len(), 2);
         // Newest kept: ts 1004 and 1003.
         assert_eq!(rows[0].task_id, "t-4");
@@ -513,12 +672,12 @@ mod tests {
         assert_eq!(deleted, 1);
         // proj-a lost its old row; proj-b fully intact.
         let a = db
-            .list_rl_events(Some("proj-a"), None, None, None, 100)
+            .list_rl_events(Some("proj-a"), None, None, None, 100, false)
             .unwrap();
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].task_id, "a-new");
         let b = db
-            .list_rl_events(Some("proj-b"), None, None, None, 100)
+            .list_rl_events(Some("proj-b"), None, None, None, 100, false)
             .unwrap();
         assert_eq!(b.len(), 2);
     }
@@ -532,7 +691,7 @@ mod tests {
         // Scoped prune of proj-a must NOT touch the NULL-project row.
         let deleted = db.prune_rl_events(Some(200), None, Some("proj-a")).unwrap();
         assert_eq!(deleted, 1);
-        let rows = db.list_rl_events(None, None, None, None, 100).unwrap();
+        let rows = db.list_rl_events(None, None, None, None, 100, false).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].task_id, "null-old");
         assert!(rows[0].project_id.is_none());
@@ -551,7 +710,7 @@ mod tests {
         // of the surviving 5 → deletes 2 more. Total 4.
         let deleted = db.prune_rl_events(Some(200), Some(3), None).unwrap();
         assert_eq!(deleted, 4);
-        let rows = db.list_rl_events(None, None, None, None, 100).unwrap();
+        let rows = db.list_rl_events(None, None, None, None, 100, false).unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].task_id, "keep-4");
         assert_eq!(rows[2].task_id, "keep-2");
@@ -566,7 +725,7 @@ mod tests {
         }
         let deleted = db.prune_rl_events(None, None, None).unwrap();
         assert_eq!(deleted, 0);
-        let rows = db.list_rl_events(None, None, None, None, 100).unwrap();
+        let rows = db.list_rl_events(None, None, None, None, 100, false).unwrap();
         assert_eq!(rows.len(), 4, "no-op prune must leave all rows intact");
     }
 
@@ -582,7 +741,7 @@ mod tests {
         }
         let deleted = db.prune_rl_events(None, Some(0), None).unwrap();
         assert_eq!(deleted, 0, "max_rows=0 must delete NOTHING (row-cap disabled)");
-        let rows = db.list_rl_events(None, None, None, None, 100).unwrap();
+        let rows = db.list_rl_events(None, None, None, None, 100, false).unwrap();
         assert_eq!(rows.len(), 5, "max_rows=0 must leave the whole corpus intact");
     }
 
@@ -595,7 +754,7 @@ mod tests {
         }
         let deleted = db.prune_rl_events(None, Some(-1), None).unwrap();
         assert_eq!(deleted, 0);
-        let rows = db.list_rl_events(None, None, None, None, 100).unwrap();
+        let rows = db.list_rl_events(None, None, None, None, 100, false).unwrap();
         assert_eq!(rows.len(), 3);
     }
 
@@ -608,7 +767,7 @@ mod tests {
         // Keep 100 but only 3 exist → nothing to delete.
         let deleted = db.prune_rl_events(None, Some(100), None).unwrap();
         assert_eq!(deleted, 0);
-        let rows = db.list_rl_events(None, None, None, None, 100).unwrap();
+        let rows = db.list_rl_events(None, None, None, None, 100, false).unwrap();
         assert_eq!(rows.len(), 3);
     }
 
@@ -630,9 +789,122 @@ mod tests {
                 "{}",
             )
             .unwrap();
-        let rows = db.list_rl_events(None, None, None, None, 10).unwrap();
+        let rows = db.list_rl_events(None, None, None, None, 10, false).unwrap();
         assert_eq!(rows[0].id, id);
         assert!(rows[0].project_id.is_none());
         assert_eq!(rows[0].project_name.as_deref(), Some("workspace-slug"));
+    }
+
+    // ─── RL-14 (v0.2.75): quarantine marker ─────────────────────────────
+
+    /// Helper: insert one event with an explicit payload.
+    fn insert_payload(db: &Db, event_type: &str, task: &str, payload: &str) -> i64 {
+        db.insert_rl_event(
+            event_type, 3, 1_000, None, None, task, None, None, None, None, payload,
+        )
+        .unwrap()
+    }
+
+    const POISONED: &str = r#"{"nodes":[{"title":"A","score":10.37},{"title":"B","score":0.4}]}"#;
+    const CLEAN: &str = r#"{"nodes":[{"title":"A","score":0.91},{"title":"B","score":1.0}]}"#;
+
+    #[test]
+    fn backfill_marks_out_of_range_and_leaves_in_range_alone() {
+        let db = fresh_db();
+        insert_payload(&db, "retrieval", "poisoned", POISONED);
+        insert_payload(&db, "retrieval", "clean", CLEAN);
+        // score exactly 1.0 is IN range (the F-E clamp emits it legitimately).
+        insert_payload(&db, "retrieval", "boundary", r#"{"nodes":[{"score":1.0}]}"#);
+        // Malformed payload: never convicted (skip softly).
+        insert_payload(&db, "retrieval", "malformed", "not json {");
+        // Citation events carry no nodes[].score contract → never scanned.
+        insert_payload(&db, "citation", "citation", POISONED);
+
+        let marked = db.backfill_quarantine_out_of_range(9_999).unwrap();
+        assert_eq!(marked, 1, "exactly the poisoned retrieval row is marked");
+
+        let all = db.list_rl_events(None, None, None, None, 100, true).unwrap();
+        let poisoned = all.iter().find(|r| r.task_id == "poisoned").unwrap();
+        assert_eq!(poisoned.quarantined_at, Some(9_999));
+        assert_eq!(
+            poisoned.quarantine_reason.as_deref(),
+            Some(QUARANTINE_REASON_SCORE_OUT_OF_RANGE)
+        );
+        for task in ["clean", "boundary", "malformed", "citation"] {
+            let row = all.iter().find(|r| r.task_id == task).unwrap();
+            assert!(
+                row.quarantined_at.is_none(),
+                "{} must be left alone",
+                task
+            );
+        }
+    }
+
+    #[test]
+    fn backfill_is_idempotent() {
+        let db = fresh_db();
+        insert_payload(&db, "retrieval", "poisoned", POISONED);
+        assert_eq!(db.backfill_quarantine_out_of_range(1_111).unwrap(), 1);
+        // Second pass: nothing new to mark, timestamp NOT rewritten.
+        assert_eq!(db.backfill_quarantine_out_of_range(2_222).unwrap(), 0);
+        let rows = db.list_rl_events(None, None, None, None, 10, true).unwrap();
+        assert_eq!(rows[0].quarantined_at, Some(1_111), "first mark timestamp survives");
+    }
+
+    #[test]
+    fn quarantined_rows_excluded_from_corpus_reads_by_default() {
+        let db = fresh_db();
+        insert_payload(&db, "retrieval", "poisoned", POISONED);
+        insert_payload(&db, "retrieval", "clean", CLEAN);
+        db.backfill_quarantine_out_of_range(5_000).unwrap();
+
+        // Default (training) read: poisoned row invisible.
+        let corpus = db.list_rl_events(None, None, None, None, 100, false).unwrap();
+        assert_eq!(corpus.len(), 1);
+        assert_eq!(corpus[0].task_id, "clean");
+
+        // Inspection read: both visible.
+        let full = db.list_rl_events(None, None, None, None, 100, true).unwrap();
+        assert_eq!(full.len(), 2);
+
+        // Count filters: None = all (badge unchanged), Some(true) = doctor's.
+        assert_eq!(db.count_rl_events(None, None, None, None).unwrap(), 2);
+        assert_eq!(db.count_rl_events(None, None, None, Some(true)).unwrap(), 1);
+        assert_eq!(db.count_rl_events(None, None, None, Some(false)).unwrap(), 1);
+    }
+
+    #[test]
+    fn run_once_guard_prevents_second_pass() {
+        let db = fresh_db();
+        insert_payload(&db, "retrieval", "poisoned-1", POISONED);
+        db.run_quarantine_backfill_once();
+        assert_eq!(
+            db.count_rl_events(None, None, None, Some(true)).unwrap(),
+            1,
+            "first run marks the historical row"
+        );
+        // A NEW poisoned row after the one-time pass (can't happen in
+        // production — the writer clamp blocks it — but pins the guard).
+        insert_payload(&db, "retrieval", "poisoned-2", POISONED);
+        db.run_quarantine_backfill_once();
+        assert_eq!(
+            db.count_rl_events(None, None, None, Some(true)).unwrap(),
+            1,
+            "guarded second run must not scan again"
+        );
+        assert!(db
+            .app_state_get(QUARANTINE_BACKFILL_STATE_KEY)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn payload_scanner_only_convicts_on_positive_evidence() {
+        assert!(super::payload_has_out_of_range_score(POISONED));
+        assert!(!super::payload_has_out_of_range_score(CLEAN));
+        assert!(!super::payload_has_out_of_range_score("not json {"));
+        assert!(!super::payload_has_out_of_range_score("{}"));
+        assert!(!super::payload_has_out_of_range_score(r#"{"nodes":"oops"}"#));
+        assert!(!super::payload_has_out_of_range_score(r#"{"nodes":[{"score":"high"}]}"#));
     }
 }

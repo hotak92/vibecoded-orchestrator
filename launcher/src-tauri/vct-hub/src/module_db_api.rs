@@ -987,30 +987,22 @@ async fn list_module_rl_events(
 
     let limit = q.limit.unwrap_or(500).min(10_000);
     // PIN to the token's project_id — never a client-supplied value.
+    // RL-14 (v0.2.75): this is a TRAINING-data read (the RL container's
+    // corpus fetch) — quarantined rows are unconditionally excluded; the
+    // module route deliberately exposes NO include_quarantined escape hatch
+    // (poisoned rows must never re-enter training silently).
     match h.0.list_rl_events(
         Some(scope.project_id.as_str()),
         q.event_type.as_deref(),
         q.since_ms,
         q.until_ms,
         limit,
+        false,
     ) {
         Ok(rows) => {
             let out: Vec<super::rl_events_api::RlEventOut> = rows
                 .into_iter()
-                .map(|e| super::rl_events_api::RlEventOut {
-                    id: e.id,
-                    event_type: e.event_type,
-                    schema_version: e.schema_version,
-                    ts_ms: e.ts_ms,
-                    project_id: e.project_id,
-                    project_name: e.project_name,
-                    task_id: e.task_id,
-                    task_type: e.task_type,
-                    embedding_source: e.embedding_source,
-                    embedding_dim: e.embedding_dim,
-                    embedding_model: e.embedding_model,
-                    payload_json: e.payload_json,
-                })
+                .map(super::rl_events_api::RlEventOut::from)
                 .collect();
             (StatusCode::OK, Json(out)).into_response()
         }

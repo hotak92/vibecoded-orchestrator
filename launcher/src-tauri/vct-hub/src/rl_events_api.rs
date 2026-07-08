@@ -169,6 +169,11 @@ pub struct ListEventsQuery {
     pub since_ms: Option<i64>,
     pub until_ms: Option<i64>,
     pub limit: Option<u32>,
+    /// RL-14 (v0.2.75): quarantined rows are EXCLUDED by default — this GET
+    /// is the offline trainer's read path and poisoned rows must never
+    /// re-enter the corpus silently. Inspection surfaces opt in explicitly.
+    #[serde(default)]
+    pub include_quarantined: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -185,6 +190,31 @@ pub struct RlEventOut {
     pub embedding_dim: Option<i64>,
     pub embedding_model: Option<String>,
     pub payload_json: String,
+    /// RL-14: unix-ms when the row was quarantined; null = clean.
+    pub quarantined_at: Option<i64>,
+    /// RL-14: stable machine tag (e.g. `score_out_of_range`).
+    pub quarantine_reason: Option<String>,
+}
+
+impl From<vct_launcher_core::db::rl_events::RlEvent> for RlEventOut {
+    fn from(e: vct_launcher_core::db::rl_events::RlEvent) -> Self {
+        RlEventOut {
+            id: e.id,
+            event_type: e.event_type,
+            schema_version: e.schema_version,
+            ts_ms: e.ts_ms,
+            project_id: e.project_id,
+            project_name: e.project_name,
+            task_id: e.task_id,
+            task_type: e.task_type,
+            embedding_source: e.embedding_source,
+            embedding_dim: e.embedding_dim,
+            embedding_model: e.embedding_model,
+            payload_json: e.payload_json,
+            quarantined_at: e.quarantined_at,
+            quarantine_reason: e.quarantine_reason,
+        }
+    }
 }
 
 async fn list_events(
@@ -198,25 +228,10 @@ async fn list_events(
         q.since_ms,
         q.until_ms,
         limit,
+        q.include_quarantined.unwrap_or(false),
     ) {
         Ok(rows) => {
-            let out: Vec<RlEventOut> = rows
-                .into_iter()
-                .map(|e| RlEventOut {
-                    id: e.id,
-                    event_type: e.event_type,
-                    schema_version: e.schema_version,
-                    ts_ms: e.ts_ms,
-                    project_id: e.project_id,
-                    project_name: e.project_name,
-                    task_id: e.task_id,
-                    task_type: e.task_type,
-                    embedding_source: e.embedding_source,
-                    embedding_dim: e.embedding_dim,
-                    embedding_model: e.embedding_model,
-                    payload_json: e.payload_json,
-                })
-                .collect();
+            let out: Vec<RlEventOut> = rows.into_iter().map(RlEventOut::from).collect();
             (StatusCode::OK, Json(out)).into_response()
         }
         Err(e) => {
@@ -242,6 +257,11 @@ pub struct CountEventsQuery {
     pub project_id: Option<String>,
     pub event_type: Option<String>,
     pub since_ms: Option<i64>,
+    /// RL-14 (v0.2.75): absent → count ALL rows (the Identity-tab badge's
+    /// pre-RL-14 semantics); `true` → only quarantined rows (rl-doctor's
+    /// report); `false` → only clean rows.
+    #[serde(default)]
+    pub quarantined: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -257,6 +277,7 @@ async fn count_events(
         q.project_id.as_deref(),
         q.event_type.as_deref(),
         q.since_ms,
+        q.quarantined,
     ) {
         Ok(n) => (StatusCode::OK, Json(CountEventsResponse { count: n })).into_response(),
         Err(e) => {
@@ -541,6 +562,103 @@ mod tests {
         let v: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(v["deleted"], 3);
         assert_eq!(count(&base, &client).await, 2);
+    }
+
+    /// RL-14 (v0.2.75): quarantined rows are excluded from the trainer's GET
+    /// by default, visible with include_quarantined=true, and countable via
+    /// quarantined=true (rl-doctor's read).
+    #[tokio::test]
+    async fn quarantined_rows_excluded_from_default_list_and_countable() {
+        // Spawn with a SHARED handle (unlike `spawn_test_hub`) so the test
+        // can run the Db-side marking pass directly — marking is not a route.
+        let db = Db::open_in_memory().expect("in-memory db");
+        let handle = LauncherDbHandle(Arc::new(db));
+        let app: Router =
+            Router::new().nest("/api/v1", router().with_state(handle.clone()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base = format!("http://{}/api/v1", addr);
+        let client = reqwest::Client::new();
+
+        for (task, payload) in [
+            ("poisoned", r#"{"nodes":[{"title":"A","score":10.37}]}"#),
+            ("clean", r#"{"nodes":[{"title":"A","score":0.9}]}"#),
+        ] {
+            let body = serde_json::json!({
+                "event_type": "retrieval",
+                "schema_version": 3,
+                "ts_ms": 1_000,
+                "task_id": task,
+                "payload_json": payload,
+            });
+            let resp = client
+                .post(format!("{}/rl/events", base))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        }
+
+        // Mark the historical poison class.
+        let marked = handle.0.backfill_quarantine_out_of_range(7_777).unwrap();
+        assert_eq!(marked, 1);
+
+        // Default GET (training read): only the clean row.
+        let rows: serde_json::Value = client
+            .get(format!("{}/rl/events?limit=10", base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let arr = rows.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["task_id"], "clean");
+
+        // Inspection GET: both rows, with the marker fields populated.
+        let rows: serde_json::Value = client
+            .get(format!("{}/rl/events?limit=10&include_quarantined=true", base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let arr = rows.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        let poisoned = arr
+            .iter()
+            .find(|r| r["task_id"] == "poisoned")
+            .expect("poisoned row visible on inspection read");
+        assert_eq!(poisoned["quarantined_at"], 7_777);
+        assert_eq!(poisoned["quarantine_reason"], "score_out_of_range");
+
+        // Count: quarantined=true (rl-doctor) / absent (badge, all rows).
+        let v: serde_json::Value = client
+            .get(format!("{}/rl/events/count?quarantined=true", base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["count"], 1);
+        let v: serde_json::Value = client
+            .get(format!("{}/rl/events/count", base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["count"], 2, "badge semantics unchanged: all rows");
     }
 
     #[tokio::test]
