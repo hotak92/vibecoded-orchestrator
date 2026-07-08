@@ -23,6 +23,6 @@ sentence-transformers>=5.0.0
 # swap), not a pin bump.
 transformers>=4.40.0,<4.50.0
 fastapi>=0.136.1
-uvicorn>=0.46.0
+uvicorn>=0.50.0
 pydantic>=2.13.3
 requests>=2.33.1
