@@ -91,8 +91,27 @@ check_pattern() {
 check_pattern "Anthropic/OpenAI API key"  'sk-(ant-api03|[a-zA-Z0-9]{30,})-[a-zA-Z0-9]'
 check_pattern "AWS access key"            'AKIA[A-Z0-9]{16}'
 check_pattern "GitHub token"             'gh[pousr]_[a-zA-Z0-9]{36}'
+# D-13 (v0.2.75): GitHub fine-grained PAT (github_pat_ + 22 alnum + _ +
+# 59 alnum). The gh[pousr]_ shape above NEVER matches these — yet
+# github_pat_* is exactly the shape VCO's own secrets flow provisions,
+# so the scanner that exists to catch a leaked token stayed blind to the
+# most likely one. MUST MATCH the canonical anchor in
+# scripts/check-no-secrets.sh (TOKEN_SHAPES, the
+# `github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}` entry) — one pattern home,
+# never a fourth fork. The exact-format shape (not the looser
+# github_pat_[A-Za-z0-9_]{60,}) is deliberate: the loose form
+# false-positives on Rust release-binary rodata identifier soup; here it
+# also keeps us from matching identifiers like `get_github_pat_preview`.
+check_pattern "GitHub fine-grained PAT"  'github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}'
 check_pattern "PEM private key"          'BEGIN (RSA |EC |OPENSSH |)PRIVATE KEY'
 check_pattern "Generic secret"           '(SECRET|API_KEY|ACCESS_TOKEN|PRIVATE_KEY)\s*[:=]\s*["'"'"'][a-zA-Z0-9+/=_\-]{32,}'
+# D-13 (v0.2.75): unquoted-assignment variant of the generic-secret
+# pattern. The quoted form above requires an opening quote after the
+# `=`, so a `.env`-style bare `API_KEY=abc123...` (no quotes — the common
+# dotenv shape) escaped it. Anchor on a value that starts with a
+# non-quote, non-space char and runs >=32 chars of secret-alphabet so a
+# short `API_KEY=on` config line doesn't trip.
+check_pattern "Generic secret (unquoted)" '(SECRET|API_KEY|ACCESS_TOKEN|PRIVATE_KEY)\s*[:=]\s*[a-zA-Z0-9+/=_\-]{32,}'
 # Smoke-test marker — used by hook tests to verify the scanner +
 # alert-routing flow without leaving real-looking credentials in
 # example fixtures. Tests use the literal string

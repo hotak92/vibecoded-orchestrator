@@ -100,6 +100,23 @@ _rule(
     r"(env|printenv|set)\s*\|.*grep.*(KEY|TOKEN|SECRET|PASS|CRED)",
     "Searching environment for secrets/credentials",
 )
+# D-13 (v0.2.75): `printenv GITHUB_TOKEN` and `echo $OPENAI_API_KEY`
+# dump a single secret directly — no pipe-to-grep, so `env_grep_secrets`
+# above never matched them. Two targeted rules close that gap:
+#   * printenv/env NAMED with a secret-shaped var (KEY/TOKEN/SECRET/PASS)
+#   * echo/printf of a `$SECRET`-shaped variable expansion
+# Both land in _CREDENTIAL_ACCESS_RULES below so the block message
+# appends the vct-secrets remediation signpost.
+_rule(
+    "printenv_secret",
+    r"\b(printenv|env)\s+\w*(KEY|TOKEN|SECRET|PASS|CRED)\w*",
+    "Reading a named secret env var directly (use vct-secrets)",
+)
+_rule(
+    "echo_secret_var",
+    r"\b(echo|printf)\b[^|]*\$\{?\w*(KEY|TOKEN|SECRET|PASS|CRED)\w*",
+    "Printing a secret-shaped env var (use vct-secrets)",
+)
 _rule(
     "read_env_files",
     r"cat\s+.*\.(env|credentials|netrc|pgpass)",
@@ -190,6 +207,8 @@ _rule(
 # needs to know where to look INSTEAD, not just that it was blocked.
 _CREDENTIAL_ACCESS_RULES: frozenset[str] = frozenset({
     "env_grep_secrets",
+    "printenv_secret",   # D-13 (v0.2.75)
+    "echo_secret_var",   # D-13 (v0.2.75)
     "read_env_files",
     "read_proc_environ",
     "read_ssh_keys",

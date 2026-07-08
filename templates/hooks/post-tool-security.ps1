@@ -70,12 +70,20 @@ if (-not $EditedFile -or -not (Test-Path -LiteralPath $EditedFile -PathType Leaf
 # common-English-looking token tripped on a legitimate CHANGELOG
 # release-note entry. The new sentinel ends in a 6-char random hex
 # (a3f7c2) so it cannot accidentally appear in docs or prose.
+# D-13 (v0.2.75): the "GitHub fine-grained PAT" and "Generic secret
+# (unquoted)" rows MUST MATCH post-tool-security.sh's check_pattern list
+# (which in turn anchors the github_pat_ shape on
+# scripts/check-no-secrets.sh's TOKEN_SHAPES). See the .sh sibling's
+# comments for the rationale (gh[pousr]_ never matches github_pat_*; the
+# quoted generic pattern skips .env-style bare assignments).
 $patterns = @(
     @{ Label = "Anthropic/OpenAI API key"; Re = 'sk-(ant-api03|[a-zA-Z0-9]{30,})-[a-zA-Z0-9]' },
     @{ Label = "AWS access key";          Re = 'AKIA[A-Z0-9]{16}' },
     @{ Label = "GitHub token";            Re = 'gh[pousr]_[a-zA-Z0-9]{36}' },
+    @{ Label = "GitHub fine-grained PAT"; Re = 'github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}' },
     @{ Label = "PEM private key";         Re = 'BEGIN (RSA |EC |OPENSSH |)PRIVATE KEY' },
     @{ Label = "Generic secret";          Re = '(SECRET|API_KEY|ACCESS_TOKEN|PRIVATE_KEY)\s*[:=]\s*["''][a-zA-Z0-9+/=_\-]{32,}' },
+    @{ Label = "Generic secret (unquoted)"; Re = '(SECRET|API_KEY|ACCESS_TOKEN|PRIVATE_KEY)\s*[:=]\s*[a-zA-Z0-9+/=_\-]{32,}' },
     @{ Label = "Hook leak-test marker";   Re = 'VCT_HOOK_LEAK_PROBE_a3f7c2' }
 )
 
