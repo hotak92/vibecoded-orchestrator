@@ -36,12 +36,33 @@
     projectName,
     language = null,
     onClose,
+    dropCommand = null,
   }: {
     projectId: string;
     projectName: string;
     language?: string | null;
     onClose: () => void;
+    /** C-11b (v0.2.75 P2d): when the caller reached this modal from a
+     *  prune-failure PARTIAL build (stale rows a plain re-run can't delete
+     *  because of persistent shard state), pass the drop-and-recreate command
+     *  the user can run manually. It is DISPLAYED only — never auto-executed
+     *  (the modal's own re-analyze is the safe, non-destructive path; the drop
+     *  is an explicit, user-run escalation). Uses the analyzer's real
+     *  `--force-recreate` flag. */
+    dropCommand?: string | null;
   } = $props();
+
+  let copied = $state(false);
+  async function copyDropCommand() {
+    if (!dropCommand) return;
+    try {
+      await navigator.clipboard.writeText(dropCommand);
+      copied = true;
+      setTimeout(() => { copied = false; }, 2000);
+    } catch {
+      // Clipboard unavailable — the command is still visible for manual copy.
+    }
+  }
 
   // ─── state ─────────────────────────────────────────────────────────
   type Phase = 'running' | 'complete' | 'error';
@@ -187,6 +208,33 @@
           <p class="cgr-current-file"><code>{currentFile}</code></p>
         {/if}
 
+        {#if dropCommand}
+          <!-- C-11b (v0.2.75 P2d): prune-failure escalation. The re-analysis
+               above retries the same failing deletes; if stale rows persist
+               (shard state), the user can run this drop-and-recreate manually.
+               NEVER auto-executed — displayed for deliberate, user-run use. -->
+          <div class="cgr-drop">
+            <p class="cgr-drop-lead">
+              Stale rows couldn’t be pruned by a plain re-run. If they persist,
+              drop &amp; recreate the code-graph collections manually:
+            </p>
+            <div class="cgr-drop-cmd">
+              <code>{dropCommand}</code>
+              <button
+                type="button"
+                class="cgr-copy-btn"
+                onclick={copyDropCommand}
+                aria-label="Copy drop-and-recreate command"
+              >{copied ? 'Copied' : 'Copy'}</button>
+            </div>
+            <p class="cgr-drop-warn">
+              This deletes and rebuilds all code-graph collections for this
+              project. Run it only if the re-analysis above didn’t clear the
+              warnings.
+            </p>
+          </div>
+        {/if}
+
         {#if phase === 'complete' && report}
           <div class="cgr-summary">
             <div class="cgr-stat">
@@ -312,6 +360,56 @@
   }
   .cgr-stat-bad strong { color: #f99; }
   .cgr-stat-good strong { color: rgb(0,191,166); }
+  /* C-11b prune-failure drop-and-recreate escalation block. Amber-tinted to
+     match the `partial` banner it was reached from; the command is copyable
+     but never auto-run. */
+  .cgr-drop {
+    margin: 12px 0 4px;
+    padding: 10px 12px;
+    background: rgba(245, 179, 66, 0.08);
+    border-left: 2px solid rgba(245, 179, 66, 0.5);
+    border-radius: 4px;
+  }
+  .cgr-drop-lead {
+    margin: 0 0 8px;
+    font-size: 11px;
+    color: #d8b878;
+    line-height: 1.5;
+  }
+  .cgr-drop-cmd {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .cgr-drop-cmd code {
+    flex: 1;
+    min-width: 0;
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+    background: rgba(0,0,0,0.25);
+    padding: 6px 8px;
+    border-radius: 3px;
+    color: #eee;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+  .cgr-copy-btn {
+    flex-shrink: 0;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.14);
+    color: #ccc;
+    padding: 5px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+  }
+  .cgr-copy-btn:hover { background: rgba(255,255,255,0.1); }
+  .cgr-drop-warn {
+    margin: 8px 0 0;
+    font-size: 10px;
+    color: #9a8a6a;
+    line-height: 1.5;
+  }
   .cgr-error-box {
     background: rgba(255,99,99,0.06);
     border-left: 2px solid rgba(255,99,99,0.5);

@@ -148,6 +148,11 @@ def cli_registry() -> dict:
 # the bogus flags on purpose.
 _PY_SCAN_ROOTS = ("vco_lib", "templates", "claude_mcp_servers", "migrations", "tools")
 _RS_SCAN_ROOT = "launcher/src-tauri"
+# v0.2.75 P2d (C-11b): the launcher GUI also emits user-runnable remediation
+# commands (e.g. the prune-failure drop-and-recreate in
+# CodeGraphReanalysisModal / CodeGraphBuildBanner). Scan the Svelte frontend so
+# a bogus flag in a displayed command is caught by the SAME sweep.
+_SVELTE_SCAN_ROOT = "launcher/src"
 
 # Directories never scanned (vendored / generated / caches).
 _SCAN_EXCLUDE_PARTS = {
@@ -177,6 +182,21 @@ def _iter_scan_files():
             if any(part in _SCAN_EXCLUDE_PARTS for part in p.parts):
                 continue
             yield p, "rs"
+    svelte_base = _REPO_ROOT / _SVELTE_SCAN_ROOT
+    if svelte_base.exists():
+        for p in svelte_base.rglob("*.svelte"):
+            if any(part in _SCAN_EXCLUDE_PARTS for part in p.parts):
+                continue
+            yield p, "svelte"
+        # Extracted GUI logic (e.g. codegraph-build-banner-logic.ts) builds the
+        # displayed remediation commands; scan the .ts too. Test specs (*.test.ts)
+        # are skipped — their negative assertions may name bogus flags on purpose.
+        for p in svelte_base.rglob("*.ts"):
+            if any(part in _SCAN_EXCLUDE_PARTS for part in p.parts):
+                continue
+            if p.name.endswith(".test.ts") or p.name.endswith(".spec.ts"):
+                continue
+            yield p, "svelte"  # same comment conventions (// and /* */)
 
 
 def _scan_lines(path: Path, kind: str):
@@ -200,6 +220,16 @@ def _scan_lines(path: Path, kind: str):
             if _RUST_TEST_MARKER.match(line):
                 return  # test module reached — stop scanning this file
             if stripped.startswith("//"):
+                continue
+        if kind == "svelte":
+            # Svelte commands live in string / template literals; skip comment
+            # lines in both the <script> (`//`) and markup (`<!-- … -->`)
+            # sections so explanatory prose naming a flag isn't mis-flagged.
+            if (
+                stripped.startswith("//")
+                or stripped.startswith("<!--")
+                or stripped.startswith("*")
+            ):
                 continue
         yield lineno, line
 

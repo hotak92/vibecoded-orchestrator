@@ -21,22 +21,42 @@
     CodeGraphBuildView,
     CodeGraphBuildStatus,
   } from '$lib/types/launcher';
+  import CodeGraphReanalysisModal from './CodeGraphReanalysisModal.svelte';
+  import {
+    isPruneFailurePartial as computeIsPruneFailurePartial,
+    buildDropRecreateCommand,
+  } from './codegraph-build-banner-logic';
 
   interface Props {
     projectId: string;
+    /** Project display name — used to build the C-11b drop-and-recreate
+     *  command and to filter the re-analysis modal's progress events. */
+    projectName?: string;
     /** When set, banner stays mounted in terminal states (success/skipped)
      *  for `hideTerminalAfterMs` after `finished_at_iso`, then unmounts.
      *  Defaults to 30s so the user has time to read "Indexed · N files". */
     hideTerminalAfterMs?: number;
   }
 
-  let { projectId, hideTerminalAfterMs = 30_000 }: Props = $props();
+  let { projectId, projectName = '', hideTerminalAfterMs = 30_000 }: Props = $props();
 
   let view = $state<CodeGraphBuildView | null>(null);
   let unlisten: (() => void) | null = null;
   let expanded = $state(false);
   let rerunning = $state(false);
   let dismissed = $state(false);
+  // C-11b (v0.2.75 P2d): the prune-failure escalation modal.
+  let showReanalysis = $state(false);
+
+  // Prune-failure detection + drop-command construction live in
+  // ./codegraph-build-banner-logic (unit-tested; one home). The signature
+  // string there MUST MATCH launcher/src-tauri/src/commands/codegraph.rs.
+  let isPruneFailurePartial = $derived(computeIsPruneFailurePartial(view));
+
+  // The real drop-and-recreate command (analyzer's `--force-recreate` flag).
+  // Displayed by the modal for the user to run manually — never auto-executed.
+  // Validated by tests/test_deferral_command_argparse_sweep.py (svelte + ts scan).
+  let dropCommand = $derived(buildDropRecreateCommand(projectName));
   let now = $state(Date.now());
   // Tick the clock once per second only while we're in a terminal state
   // that needs auto-hide. Cheaper than a constant 1Hz timer.
@@ -237,6 +257,19 @@
           >
             {rerunning ? 'Rebuilding…' : 'Rebuild'}
           </button>
+          {#if isPruneFailurePartial}
+            <!-- C-11b (v0.2.75 P2d): a plain Rebuild retries the SAME failing
+                 deletes against persistent shard state. Offer the drop-and-
+                 recreate escalation (via the re-analysis modal, which also
+                 carries the manual drop command). Never auto-drops. -->
+            <button
+              type="button"
+              class="bg-btn-secondary"
+              onclick={() => (showReanalysis = true)}
+            >
+              Drop &amp; rebuild…
+            </button>
+          {/if}
         {/if}
         {#if view.status === 'success' || view.status === 'skipped' || view.status === 'partial'}
           <button
@@ -264,6 +297,18 @@
       </div>
     {/if}
   </div>
+{/if}
+
+{#if showReanalysis}
+  <!-- C-11b: prune-failure escalation. Runs the (safe, idempotent) re-analysis
+       AND surfaces the manual drop-and-recreate command. Never auto-drops. -->
+  <CodeGraphReanalysisModal
+    projectId={projectId}
+    projectName={projectName}
+    language={null}
+    dropCommand={dropCommand}
+    onClose={() => (showReanalysis = false)}
+  />
 {/if}
 
 <style>

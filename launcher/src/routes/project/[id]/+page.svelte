@@ -387,7 +387,7 @@
          rule. -->
     <KgSummaryBanner projectId={project.id} />
     <KgSyncBanner projectId={project.id} />
-    <CodeGraphBuildBanner projectId={project.id} />
+    <CodeGraphBuildBanner projectId={project.id} projectName={project.name} />
   {/if}
 
   <!--
