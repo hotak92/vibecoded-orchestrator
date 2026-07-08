@@ -170,6 +170,14 @@ db.ensure_module_port(&project_id, "<your-module-id>", || allocate_port_in_range
 
 See `knowledge/concepts/generic-per-module-db-architecture.md` for the table schema + `db/module_ports.rs` for the helper signatures. The supervisor in `vct-hub::module_supervisor` is the canonical writer; other call sites should go through it rather than writing directly.
 
+### Hub reachability contract for global (hub-consuming) modules
+
+If your module installs with `install.scope = "global"` and its container reads from the hub (the supervisor injects `VCT_HUB_BASE_URL=http://host.containers.internal:<port>` + `VCT_MODULE_TOKEN` into every global container), be aware of the bind contract (v0.2.75 P1a):
+
+- The hub binds **loopback-only by default** and widens to `0.0.0.0` automatically **while ≥1 global module install row exists** — `host.containers.internal` never resolves to the host's own `127.0.0.1` on any OS (Linux: bridge/host-gateway IP; macOS/Windows: the container runtime's VM boundary), so loopback is container-unreachable everywhere. The widen state is the install rows themselves; a user-set `VCT_HUB_BIND_ALL` env wins in both directions.
+- After every global container start, the supervisor runs a **container→hub reachability probe**: it checks the recorded bind (`<vct_root_dir>/hub.bind`) and best-effort fetches `/api/v1/health` from inside the container (python3 → curl → wget ladder). Failures are loud (stderr + a `module_hub_reachability_failed` audit row), never silent. **Ship at least one of python3/curl/wget in your image** so the probe can give users a definitive answer instead of a skip.
+- All hub data routes stay bearer-token gated while widened; your container authenticates with the injected `VCT_MODULE_TOKEN`. See `docs/TROUBLESHOOTING.md` § "Hub bind posture" for the user-facing runbook.
+
 ### Template substitution variables
 
 The dispatcher recognises a **closed set** of `{{variable}}` tokens (intentional security boundary — modules cannot smuggle arbitrary launcher state into request bodies):

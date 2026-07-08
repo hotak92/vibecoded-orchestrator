@@ -2879,6 +2879,37 @@ async fn uninstall_global_module(
     }
 
     db.delete_global_module_install(&module_id)?;
+
+    // v0.2.75 P1a: the hub's bind-widen state IS the set of global
+    // install rows (vct-hub server.rs::resolve_hub_bind_ip). Deleting
+    // the last one just CLEARED it — the hub narrows back to the
+    // loopback-only bind on its next start. Deliberately no immediate
+    // restart here: killing the hub mid-session would disrupt every
+    // other consumer (resolvers, hooks, MCPs), and the widened bind
+    // stays bearer-token gated in the meantime. Log it so the security
+    // posture change is visible.
+    match db.has_global_module_install() {
+        Ok(false) => {
+            eprintln!(
+                "[uninstall] '{}' was the last hub-consuming (global) module — the \
+                 hub's bind narrows back to loopback-only (127.0.0.1) on its next \
+                 start. Restart it now if you want the narrowed bind immediately: \
+                 `vct-hub --stop` then `vct-hub --start-if-not-running`.",
+                module_id
+            );
+        }
+        Ok(true) => {
+            // Other hub-consuming modules remain installed — the widened
+            // bind stays (leave-alone).
+        }
+        Err(e) => {
+            eprintln!(
+                "[uninstall] could not check remaining global installs ({}); \
+                 hub bind state unchanged (it re-derives at next hub start).",
+                e
+            );
+        }
+    }
     // module_settings for global modules: the `(project_id, module_id)`
     // settings can still exist per-project (Stream B's per-project
     // enable toggle). Clearing them on uninstall is delegated to

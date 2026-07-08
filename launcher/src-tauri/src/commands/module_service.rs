@@ -563,6 +563,132 @@ fn resolve_rl_port_for_project(db: &Db, project_id: &str) -> Result<u16, String>
 /// `rm -f` / `podman run` (its `start_global_container_supervisor`
 /// mirrors the former launcher body plus the token injection), so none of
 /// that lives here anymore.
+/// What the module-start widen check should do (v0.2.75 P1a). Pure —
+/// see `widen_restart_action` for the decision table, tested without a
+/// live hub.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WidenAction {
+    /// User set VCT_HUB_BIND_ALL to a truthy value — hub already widens
+    /// on its own; leave everything alone.
+    LeaveAloneUserOptIn,
+    /// User explicitly set VCT_HUB_BIND_ALL to a non-truthy value —
+    /// NEVER override the user's env; warn loudly that the container
+    /// cannot reach the hub.
+    WarnUserForcedLoopback,
+    /// No hub is running — nothing to restart; the upcoming
+    /// ensure_hub_running starts it with the widened bind (derived from
+    /// the global install rows).
+    NothingHubDown,
+    /// A hub is running and already bound wide — nothing to do.
+    AlreadyWidened,
+    /// A hub is running bound to loopback (or predates the hub.bind
+    /// discovery file — pre-v0.2.75, loopback-era default): stop it so
+    /// the respawn picks up the widened bind.
+    RestartHub,
+}
+
+/// Pure decision for the module-start bind-widen check.
+///
+/// * `env_value` — `VCT_HUB_BIND_ALL` as seen by the launcher process
+///   (None = unset). MUST MATCH the truthy set recognised by vct-hub's
+///   `decide_hub_bind_ip` (`1`/`true`/`TRUE`/`yes`).
+/// * `hub_alive` — a live hub owns the lockfile.
+/// * `recorded_bind` — content of `<vct_root>/hub.bind` (None = file
+///   absent = pre-v0.2.75 hub = loopback).
+pub(crate) fn widen_restart_action(
+    env_value: Option<&str>,
+    hub_alive: bool,
+    recorded_bind: Option<&str>,
+) -> WidenAction {
+    match env_value {
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") => {
+            return WidenAction::LeaveAloneUserOptIn;
+        }
+        Some(_) => return WidenAction::WarnUserForcedLoopback,
+        None => {}
+    }
+    if !hub_alive {
+        return WidenAction::NothingHubDown;
+    }
+    match recorded_bind.map(str::trim) {
+        Some(b) if b != "127.0.0.1" => WidenAction::AlreadyWidened,
+        // Loopback-bound, or no hub.bind file (pre-v0.2.75 binary whose
+        // default was loopback): positively-confirmed-or-conservative
+        // restart — restarting an already-widened hub is harmless,
+        // leaving a loopback hub breaks the module.
+        _ => WidenAction::RestartHub,
+    }
+}
+
+/// v0.2.75 P1a: make sure the RUNNING hub's bind matches the widened
+/// state a hub-consuming module needs, restarting it when it predates
+/// the widen. Soft-fail throughout — the caller's ensure_hub_running +
+/// the hub-side reachability probe surface any residual problem loudly.
+fn ensure_hub_bind_widened_for_module(module_id: &str) {
+    let env_value = std::env::var("VCT_HUB_BIND_ALL").ok();
+    let hub_alive = matches!(
+        crate::hub_status::probe(),
+        crate::hub_status::HubStatus::Running { .. }
+    );
+    let recorded_bind = std::fs::read_to_string(
+        vct_launcher_core::paths::vct_root_dir().join("hub.bind"),
+    )
+    .ok();
+
+    match widen_restart_action(env_value.as_deref(), hub_alive, recorded_bind.as_deref()) {
+        WidenAction::LeaveAloneUserOptIn => {
+            eprintln!(
+                "[module_service] hub bind: VCT_HUB_BIND_ALL is set (user opt-in); \
+                 leaving the user's env in charge of the widened bind."
+            );
+        }
+        WidenAction::WarnUserForcedLoopback => {
+            eprintln!(
+                "[module_service] WARNING: VCT_HUB_BIND_ALL={} forces the hub to \
+                 loopback-only while hub-consuming module '{}' is installed — its \
+                 container CANNOT reach the hub (host.containers.internal never \
+                 resolves to the host's 127.0.0.1 on any OS). Unset \
+                 VCT_HUB_BIND_ALL (POSIX: `unset VCT_HUB_BIND_ALL`; PowerShell: \
+                 `Remove-Item Env:VCT_HUB_BIND_ALL`) and restart the hub to \
+                 restore module data reads. Not overriding your explicit setting.",
+                env_value.as_deref().unwrap_or(""),
+                module_id
+            );
+        }
+        WidenAction::NothingHubDown => {
+            // ensure_hub_running (next step in the caller) starts the hub,
+            // which derives the widened bind from the global install rows.
+        }
+        WidenAction::AlreadyWidened => {}
+        WidenAction::RestartHub => {
+            eprintln!(
+                "[module_service] NOTICE: hub-consuming module '{}' needs the hub \
+                 reachable from its container, but the running hub is bound to \
+                 loopback (started before this module's install). Restarting the \
+                 hub so it re-derives the widened 0.0.0.0 bind. LAN exposure: \
+                 peers can reach the port, but every /api/v1 route stays \
+                 bearer-token gated (hub.token) — requests without the token get \
+                 401. The bind narrows back automatically on the first hub start \
+                 after the last hub-consuming module is uninstalled.",
+                module_id
+            );
+            match crate::hub_status::stop() {
+                crate::hub_status::StopOutcome::Stopped
+                | crate::hub_status::StopOutcome::AlreadyStopped => {}
+                other => {
+                    eprintln!(
+                        "[module_service] WARNING: could not stop the loopback-bound \
+                         hub ({:?}); the module's container may not reach the hub \
+                         until the hub is restarted (`vct-hub --stop` then \
+                         `vct-hub --start-if-not-running`).",
+                        other
+                    );
+                }
+            }
+        }
+    }
+}
+
 pub async fn start_global_container_for_module(
     manifest: &ModuleManifest,
     module_id: &str,
@@ -578,6 +704,21 @@ pub async fn start_global_container_for_module(
             runtime.r#type
         ));
     }
+
+    // (0) v0.2.75 P1a: hub bind-widen. This fn IS the hub-consuming path
+    // (a global container that reads its data from the hub via
+    // VCT_HUB_BASE_URL), and a hub that is currently RUNNING bound to
+    // loopback predates this module's install-row-derived widen — its
+    // container could never reach it (loopback is container-unreachable
+    // on every OS; see vct-hub server.rs::resolve_hub_bind_ip). Stop
+    // that hub HERE so the ensure_hub_running below respawns it with
+    // the widened bind (vct-hub re-derives the bind from launcher.db's
+    // global install rows at every start). Cross-OS: uses the
+    // lockfile-driven hub_status stop machinery — no raw signals. An
+    // explicit user VCT_HUB_BIND_ALL env is left alone in BOTH
+    // directions (opt-in needs nothing from us; opt-out gets a loud
+    // warning, never an override).
+    ensure_hub_bind_widened_for_module(module_id);
 
     // (1) Ensure the hub is up. The hub is the sole spawn point for
     // global containers (it mints + injects VCT_MODULE_TOKEN); we never
@@ -5165,6 +5306,53 @@ mod tests {
         assert!(
             !finetune_emit_decision(&FtOutcome::Inconclusive, true).2,
             "(Inconclusive, rotate-Ok) is NOT a hard error — base model rotated in"
+        );
+    }
+
+    // ── v0.2.75 P1a: module-start bind-widen decision ─────────────────
+
+    /// User env is left alone in BOTH directions: truthy → nothing to
+    /// do; any other explicit value → warn, never override.
+    #[test]
+    fn widen_leaves_user_env_alone_both_directions() {
+        for v in ["1", "true", "TRUE", "yes"] {
+            assert_eq!(
+                widen_restart_action(Some(v), true, Some("127.0.0.1")),
+                WidenAction::LeaveAloneUserOptIn,
+                "truthy env {v:?} must be left in charge"
+            );
+        }
+        for v in ["0", "false", "no"] {
+            assert_eq!(
+                widen_restart_action(Some(v), true, Some("127.0.0.1")),
+                WidenAction::WarnUserForcedLoopback,
+                "explicit opt-out {v:?} must warn, never restart-override"
+            );
+        }
+    }
+
+    /// No env: a running loopback-bound hub is restarted; an absent
+    /// hub.bind file (pre-v0.2.75 hub, loopback-era default) counts as
+    /// loopback; a widened hub and a down hub are left alone.
+    #[test]
+    fn widen_restarts_only_running_loopback_hub() {
+        assert_eq!(
+            widen_restart_action(None, true, Some("127.0.0.1\n")),
+            WidenAction::RestartHub
+        );
+        assert_eq!(
+            widen_restart_action(None, true, None),
+            WidenAction::RestartHub,
+            "pre-v0.2.75 hub without hub.bind must be treated as loopback"
+        );
+        assert_eq!(
+            widen_restart_action(None, true, Some("0.0.0.0")),
+            WidenAction::AlreadyWidened
+        );
+        assert_eq!(
+            widen_restart_action(None, false, Some("127.0.0.1")),
+            WidenAction::NothingHubDown,
+            "no running hub → nothing to restart (ensure_hub_running follows)"
         );
     }
 }

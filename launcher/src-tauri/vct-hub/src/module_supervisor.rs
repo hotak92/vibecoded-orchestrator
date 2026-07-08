@@ -1167,13 +1167,33 @@ pub async fn start_global_container_supervisor(
     // v0.2.61 (Option H, BLOCKER-INT fix): also inject VCT_HUB_BASE_URL so
     // the container knows where the hub is. `build_podman_run_args_global`
     // emits `--add-host=host.containers.internal:host-gateway`, making that
-    // hostname resolve to the host inside the container; combined with the
-    // hub binding 0.0.0.0 (server.rs), the container can reach the hub at
-    // `http://host.containers.internal:<actual hub port>`. The port is the
-    // hub's ACTUAL bound port (server.rs walks past 7700 on collision and
-    // persists the real one to `hub.port`), NOT the hard-coded default —
-    // so we read it from the port file the hub wrote at startup, falling
-    // back to $VCT_HUB_PORT → 7700 only if the file is unreadable.
+    // hostname resolve to the host inside the container.
+    //
+    // REAL BIND CONTRACT (v0.2.75 P1a — rewrote the stale "the hub binds
+    // 0.0.0.0" claim that E-2/v0.2.73 had already reversed): the hub
+    // binds loopback-only by DEFAULT and widens to 0.0.0.0 conditionally
+    // — via `server.rs::resolve_hub_bind_ip` — while ≥1 global
+    // (hub-consuming) module install row exists in launcher.db, or when
+    // the user sets VCT_HUB_BIND_ALL=1 (an explicit user env wins in
+    // both directions). The widen is REQUIRED for this env var to be
+    // usable, on every OS:
+    //   * Linux (native podman/docker): `host.containers.internal` maps
+    //     to a bridge-gateway or host LAN IP (rootful) / the host's
+    //     routable address (rootless pasta) — never 127.0.0.1.
+    //   * macOS / Windows: the container runtime runs inside a VM, so
+    //     "the host" seen by the container is the VM boundary; the
+    //     host's own loopback is unreachable from the container in ALL
+    //     configurations.
+    // So a loopback-bound hub is container-unreachable everywhere; the
+    // post-start reachability probe below (`verify_container_hub_
+    // reachability`) surfaces that loudly instead of letting the
+    // container 401/timeout silently.
+    //
+    // The port is the hub's ACTUAL bound port (server.rs walks past 7700
+    // on collision and persists the real one to `hub.port`), NOT the
+    // hard-coded default — so we read it from the port file the hub
+    // wrote at startup, falling back to $VCT_HUB_PORT → 7700 only if the
+    // file is unreadable.
     let hub_port = resolve_hub_base_port();
     let extra_env = vec![
         ("VCT_MODULE_TOKEN".to_string(), module_token),
@@ -1239,7 +1259,208 @@ pub async fn start_global_container_supervisor(
         ));
     }
 
+    // v0.2.75 P1a (task 1b): post-start container→hub reachability probe.
+    // NEVER silent — a loopback-bound (or otherwise unreachable) hub
+    // breaks every hub data read this container will attempt, and the
+    // pre-fix failure mode was an invisible 401/timeout inside the
+    // container. The probe does NOT fail the start (the container itself
+    // is healthy and per-project work may proceed), but a failure is
+    // surfaced on stderr AND as a durable audit row so the launcher GUI
+    // and post-mortems can see it even though the detached hub's stderr
+    // goes to /dev/null.
+    match verify_container_hub_reachability(&podman, &container_name, hub_port).await {
+        Ok(note) => {
+            eprintln!(
+                "[module_supervisor] container→hub reachability for {}: {}",
+                container_name, note
+            );
+        }
+        Err(reach_err) => {
+            eprintln!(
+                "[module_supervisor] ERROR: container→hub reachability FAILED for {}: {}",
+                container_name, reach_err
+            );
+            if let Ok(db) = Db::open() {
+                let _ = db.audit(
+                    "module_hub_reachability_failed",
+                    None,
+                    Some(module_id),
+                    &serde_json::json!({
+                        "container": container_name,
+                        "error": reach_err,
+                    }),
+                );
+            }
+        }
+    }
+
     Ok(container_name)
+}
+
+/// Outcome of the best-effort in-container HTTP probe (v0.2.75 P1a).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ExecProbeOutcome {
+    /// The container fetched the hub's unauthenticated `/api/v1/health`.
+    Reached,
+    /// No usable prober in the image (python3 / curl / wget all absent)
+    /// or the exec transport itself was unavailable — probe SKIPPED,
+    /// not failed.
+    ProberUnavailable,
+    /// A prober ran inside the container and could NOT reach the hub.
+    Failed(String),
+}
+
+/// Pure reachability verdict — testable without podman (v0.2.75 P1a).
+///
+/// `recorded_bind` is the content of the hub's `hub.bind` discovery file
+/// (written by `server.rs::write_bind_file`); `None` means the file is
+/// absent — a pre-v0.2.75 hub, which binds loopback-only by default.
+///
+/// Loopback is container-unreachable on EVERY OS (Linux native podman:
+/// `host.containers.internal` maps to a bridge/host IP; macOS/Windows:
+/// the runtime VM cannot see the host's own 127.0.0.1), so a loopback or
+/// unrecorded bind is a definitive failure regardless of the exec probe.
+/// With a widened bind the in-container probe result decides; a missing
+/// prober degrades to a logged skip (best-effort), never a false FAIL.
+pub(crate) fn evaluate_hub_reachability(
+    recorded_bind: Option<&str>,
+    exec_probe: &ExecProbeOutcome,
+) -> Result<String, String> {
+    const RESTART_HINT: &str = "Restart the hub so the widened bind takes effect: \
+        `vct-hub --stop` then `vct-hub --start-if-not-running` (same commands in \
+        POSIX shells and PowerShell), or restart it from the launcher.";
+    match recorded_bind.map(str::trim) {
+        None => Err(format!(
+            "the running hub did not record its bind address (hub.bind absent — a \
+             pre-v0.2.75 hub, which binds loopback-only unless VCT_HUB_BIND_ALL=1). \
+             Loopback is unreachable from containers on every OS. {}",
+            RESTART_HINT
+        )),
+        Some("127.0.0.1") => Err(format!(
+            "the hub is bound to 127.0.0.1 (loopback-only) — unreachable from this \
+             container on every OS (Linux: host-gateway is a bridge/host IP; \
+             macOS/Windows: the container VM cannot see the host's loopback). If \
+             you set VCT_HUB_BIND_ALL=0 yourself, unset it. {}",
+            RESTART_HINT
+        )),
+        Some(_) => match exec_probe {
+            ExecProbeOutcome::Reached => {
+                Ok("container reached the hub's /api/v1/health".to_string())
+            }
+            ExecProbeOutcome::ProberUnavailable => Ok(
+                "hub bind is widened; in-container probe skipped (no python3/curl/wget \
+                 in the image)"
+                    .to_string(),
+            ),
+            ExecProbeOutcome::Failed(e) => Err(format!(
+                "hub bind is widened but the container could not fetch \
+                 /api/v1/health via host.containers.internal: {} — check host \
+                 firewall rules on the container bridge (Linux) or VM→host port \
+                 reachability (macOS/Windows).",
+                e
+            )),
+        },
+    }
+}
+
+/// Effectful reachability check: reads `hub.bind`, runs the in-container
+/// probe only when the recorded bind is widened (the loopback/absent
+/// arms are already definitive), and folds both through the pure
+/// `evaluate_hub_reachability`.
+async fn verify_container_hub_reachability(
+    podman: &str,
+    container_name: &str,
+    hub_port: u16,
+) -> Result<String, String> {
+    let recorded_bind = std::fs::read_to_string(
+        vct_launcher_core::paths::vct_root_dir().join("hub.bind"),
+    )
+    .ok();
+    let widened = matches!(
+        recorded_bind.as_deref().map(str::trim),
+        Some(b) if b != "127.0.0.1"
+    );
+    let exec_outcome = if widened {
+        run_in_container_hub_probe(podman, container_name, hub_port).await
+    } else {
+        // Unused by the loopback/absent arms of the evaluator.
+        ExecProbeOutcome::ProberUnavailable
+    };
+    evaluate_hub_reachability(recorded_bind.as_deref(), &exec_outcome)
+}
+
+/// Best-effort in-container HTTP probe of the hub's unauthenticated
+/// `/api/v1/health` via `podman exec`, trying python3 → curl → wget (the
+/// RL image ships python3; the ladder covers other images). OS-agnostic:
+/// the probe runs INSIDE the container, so it observes exactly the
+/// network path the module's real hub reads will use on any host OS /
+/// runtime backend.
+///
+/// Missing probers (exit 126/127 or the OCI "executable file not found"
+/// message) fall through to the next candidate; exhausting the ladder is
+/// `ProberUnavailable` (a logged skip). A prober that RAN and failed to
+/// connect is definitive: `Failed`.
+async fn run_in_container_hub_probe(
+    podman: &str,
+    container_name: &str,
+    hub_port: u16,
+) -> ExecProbeOutcome {
+    let url = format!(
+        "http://host.containers.internal:{}/api/v1/health",
+        hub_port
+    );
+    let py_expr = format!(
+        "import urllib.request; urllib.request.urlopen('{}', timeout=8)",
+        url
+    );
+    let candidates: [(&str, Vec<&str>); 3] = [
+        ("python3", vec!["-c", py_expr.as_str()]),
+        ("curl", vec!["-fsS", "--max-time", "8", url.as_str()]),
+        ("wget", vec!["-q", "-T", "8", "-O", "-", url.as_str()]),
+    ];
+
+    for (prog, args) in candidates {
+        let mut cmd = Command::new(podman).silent();
+        cmd.args(["exec", container_name, prog]);
+        cmd.args(&args);
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::piped());
+        cmd.kill_on_drop(true);
+        let out = match tokio::time::timeout(Duration::from_secs(15), cmd.output()).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                eprintln!(
+                    "[module_supervisor] hub probe: could not exec {} in {}: {}",
+                    prog, container_name, e
+                );
+                continue;
+            }
+            Err(_) => {
+                eprintln!(
+                    "[module_supervisor] hub probe: exec {} in {} timed out",
+                    prog, container_name
+                );
+                continue;
+            }
+        };
+        if out.status.success() {
+            return ExecProbeOutcome::Reached;
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let prober_missing = matches!(out.status.code(), Some(126) | Some(127))
+            || stderr.contains("executable file not found");
+        if prober_missing {
+            continue;
+        }
+        // A prober ran and failed — definitive connectivity answer.
+        return ExecProbeOutcome::Failed(format!(
+            "{} exited {}: {}",
+            prog,
+            out.status.code().unwrap_or(-1),
+            stderr.chars().take(300).collect::<String>()
+        ));
+    }
+    ExecProbeOutcome::ProberUnavailable
 }
 
 /// Helper used by the hub-side test fixtures to assert state without a
@@ -2380,5 +2601,49 @@ mod tests {
             should_deferred_remint(Some(ModuleStatus::Installing)),
             "Installing row should re-mint (transient; install expects it up next)"
         );
+    }
+
+    // ── v0.2.75 P1a: container→hub reachability verdict ───────────────
+
+    /// hub.bind absent (pre-v0.2.75 hub) → definitive FAIL with the
+    /// restart remediation, regardless of the exec probe.
+    #[test]
+    fn reachability_fails_when_bind_unrecorded() {
+        let v = evaluate_hub_reachability(None, &ExecProbeOutcome::Reached);
+        let err = v.expect_err("absent hub.bind must fail");
+        assert!(err.contains("hub.bind absent"), "err: {}", err);
+        assert!(err.contains("vct-hub --stop"), "must carry remediation: {}", err);
+    }
+
+    /// Loopback-bound hub → definitive FAIL on every OS.
+    #[test]
+    fn reachability_fails_on_loopback_bind() {
+        for probe in [
+            ExecProbeOutcome::Reached,
+            ExecProbeOutcome::ProberUnavailable,
+        ] {
+            let err = evaluate_hub_reachability(Some("127.0.0.1\n"), &probe)
+                .expect_err("loopback bind must fail");
+            assert!(err.contains("loopback-only"), "err: {}", err);
+        }
+    }
+
+    /// Widened bind: the in-container probe decides; a missing prober is
+    /// a logged SKIP (pass), a failed probe is a FAIL with guidance.
+    #[test]
+    fn reachability_widened_bind_follows_exec_probe() {
+        assert!(
+            evaluate_hub_reachability(Some("0.0.0.0"), &ExecProbeOutcome::Reached).is_ok()
+        );
+        let skipped =
+            evaluate_hub_reachability(Some("0.0.0.0"), &ExecProbeOutcome::ProberUnavailable)
+                .expect("missing prober is a skip, not a failure");
+        assert!(skipped.contains("skipped"), "note: {}", skipped);
+        let err = evaluate_hub_reachability(
+            Some("0.0.0.0"),
+            &ExecProbeOutcome::Failed("curl exited 7: connection refused".into()),
+        )
+        .expect_err("failed probe must fail");
+        assert!(err.contains("connection refused"), "err: {}", err);
     }
 }

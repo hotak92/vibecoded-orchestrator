@@ -726,6 +726,37 @@ impl Db {
             .map_err(|e| format!("collect list_global_module_installs: {}", e))
     }
 
+    /// v0.2.75 P1a: true when at least one GLOBAL-scope module install
+    /// row exists (`project_id IS NULL`), regardless of status.
+    ///
+    /// This is the persisted "a hub-consuming module is installed" state
+    /// that widens the hub's bind address: global container modules read
+    /// their data from the hub across the container network namespace
+    /// (the `VCT_HUB_BASE_URL` injection in vct-hub's module_supervisor),
+    /// which a loopback-only bind cannot serve on ANY OS — native podman
+    /// on Linux resolves `host.containers.internal` to a bridge/host IP,
+    /// and on macOS/Windows the container runtime lives inside a VM whose
+    /// view of "the host" is never the host's own 127.0.0.1. Using the
+    /// install rows AS the state (rather than a separate flag) means the
+    /// widen is set by install, dropped by the last uninstall, and heals
+    /// pre-v0.2.75 installs on the next hub start with zero migration.
+    ///
+    /// MUST MATCH the bind-resolution consumer in
+    /// `vct-hub/src/server.rs::resolve_hub_bind_ip` (an explicit
+    /// user-set `VCT_HUB_BIND_ALL` env wins in BOTH directions; this
+    /// row-derived state is only the supervisor-managed default).
+    pub fn has_global_module_install(&self) -> Result<bool, String> {
+        let guard = self.lock();
+        let n: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM module_installs WHERE project_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("has_global_module_install: {}", e))?;
+        Ok(n > 0)
+    }
+
     pub fn delete_module_install(
         &self,
         project_id: &str,
@@ -1755,5 +1786,39 @@ mod tests {
         for r in &pp_rows {
             assert!(r.project_id.is_some());
         }
+    }
+
+    /// v0.2.75 P1a: the hub-bind widen state IS the presence of a global
+    /// install row — set on install (insert), cleared on the last
+    /// uninstall (delete). Per-project rows must NOT count: only global
+    /// container modules consume the hub across the container network
+    /// namespace.
+    #[test]
+    fn has_global_module_install_flips_on_install_and_last_uninstall() {
+        let (db, pid) = open_db_with_project();
+
+        // Empty DB → no widen state.
+        assert!(!db.has_global_module_install().unwrap());
+
+        // A per-project install alone must NOT widen (leave-alone case).
+        db.insert_module_install("i-pp", &pid, "vct-rl-reranker", "0.2.7", "/pp")
+            .expect("per-project insert");
+        assert!(
+            !db.has_global_module_install().unwrap(),
+            "per-project installs must not count as hub-consuming"
+        );
+
+        // Global install → widen state SET (act case).
+        db.insert_global_module_install("i-g", "vct-rl-reranker", "0.2.10", "/g")
+            .expect("global insert");
+        assert!(db.has_global_module_install().unwrap());
+
+        // Last global uninstall → widen state CLEARED.
+        db.delete_global_module_install("vct-rl-reranker")
+            .expect("global delete");
+        assert!(
+            !db.has_global_module_install().unwrap(),
+            "widen state must drop with the last global install row"
+        );
     }
 }

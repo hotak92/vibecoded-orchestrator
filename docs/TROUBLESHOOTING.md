@@ -437,6 +437,28 @@ curl -s http://127.0.0.1:7700/health
 
 If `--status` says `stale`, run `vct-hub --start-if-not-running` — it cleans up the dead lockfile and spawns a fresh detached instance (idempotent; safe to run any time).
 
+### Hub bind posture: loopback vs all interfaces (`VCT_HUB_BIND_ALL`, module widen)
+
+The hub binds `127.0.0.1` (loopback-only) by default, so a leaked `hub.token` cannot be used from another machine on your LAN. Two things widen the bind to `0.0.0.0` (all interfaces):
+
+1. **A hub-consuming module is installed** (v0.2.75+, automatic). Global container modules — the RL reranker is the canonical one — read their data from the hub via `host.containers.internal`, which **never** resolves to the host's own `127.0.0.1` on **any** OS: on Linux (native podman/docker) it maps to a bridge-gateway or host LAN IP; on macOS and Windows the container runtime runs inside a VM whose view of "the host" is the VM boundary. A loopback-only hub is therefore unreachable from containers everywhere, and `0.0.0.0` is the only runtime-agnostic bind that works on all three OSes. The widen state is derived from the launcher DB's global module install rows: it is set by installing such a module, dropped when the last one is uninstalled, and re-evaluated on **every** hub start (install.py post-step, the SessionStart hook, the launcher GUI, and the CLI all just start the same binary). No flag file to manage.
+2. **You set `VCT_HUB_BIND_ALL=1`** (or `true`) — the manual opt-in, unchanged since v0.2.73.
+
+An explicit `VCT_HUB_BIND_ALL` setting wins in **both** directions: `VCT_HUB_BIND_ALL=0` (or any non-truthy value) forces loopback even while a module is installed — the hub logs a loud warning because that module's container cannot reach it.
+
+**Security posture while widened**: every `/api/v1/*` route stays gated by the 256-bit `hub.token` bearer (module routes by the per-module ephemeral token). A LAN peer that reaches the port without the token gets 401. The widen is logged loudly at hub start, and the bind narrows back automatically on the first hub start after the last hub-consuming module is uninstalled.
+
+**Check what the running hub is actually bound to**: the hub writes its bind IP to `<vct_root_dir>/hub.bind` at startup (`127.0.0.1` or `0.0.0.0`). If the file is absent, the hub predates v0.2.75 and is loopback-bound unless you set the env var.
+
+**"My module's container can't read from the hub"** — the module-start log prints a `container→hub reachability` line; a failure names the cause (also recorded as a `module_hub_reachability_failed` audit row). The usual fix is a hub restart so the widened bind takes effect (the module install/start path does this automatically; do it manually after e.g. unsetting a stray `VCT_HUB_BIND_ALL=0`):
+
+```bash
+# POSIX shells                          # PowerShell
+unset VCT_HUB_BIND_ALL                  # Remove-Item Env:VCT_HUB_BIND_ALL
+vct-hub --stop                          # vct-hub --stop
+vct-hub --start-if-not-running          # vct-hub --start-if-not-running
+```
+
 ### `vct-hub` won't start
 
 State files live under `<vct_root_dir>` (defaults to `~/.vct/`; override with `VCT_STATE_DIR`):

@@ -75,11 +75,14 @@ pub async fn start_hub_server() -> Result<u16, String> {
     // a pre-existing healthy hub's token/port files stay untouched.
     //
     // See the bind-address rationale below for the loopback-default /
-    // opt-in-all-interfaces posture (E-2, v0.2.73). F-6 ORDERING PRESERVED:
-    // the bind still happens FIRST, before any discovery-file write — only
-    // the bind ADDRESS changed (0.0.0.0 default → 127.0.0.1 default with an
-    // explicit opt-in), never the bind-first sequencing.
-    let bind_ip = hub_bind_ip();
+    // opt-in-all-interfaces posture (E-2, v0.2.73) and the module-
+    // conditional widen (v0.2.75 P1a — `resolve_hub_bind_ip`). F-6
+    // ORDERING PRESERVED: the bind still happens FIRST, before any
+    // discovery-file write — only the bind ADDRESS is conditional
+    // (loopback default; 0.0.0.0 on user env opt-in OR while a
+    // hub-consuming module is installed), never the bind-first
+    // sequencing.
+    let bind_ip = resolve_hub_bind_ip(&launcher_state.0);
     let addr = SocketAddr::from((bind_ip, port));
     let listener = try_bind(addr, 5).await?;
     let actual_port = listener.local_addr().unwrap().port();
@@ -101,6 +104,14 @@ pub async fn start_hub_server() -> Result<u16, String> {
     // publishing in this order guarantees the (token, port) pair they
     // assemble came from the SAME process.
     write_port_file(actual_port).await;
+
+    // v0.2.75 P1a: record the ACTUAL bind IP alongside hub.port so
+    // out-of-process checks (the launcher's module-start widen check,
+    // the supervisor's container→hub reachability probe) can positively
+    // confirm whether the RUNNING hub is loopback-bound without probing
+    // the network. Absence of this file means a pre-v0.2.75 hub —
+    // readers must treat that as loopback (the conservative-era default).
+    write_bind_file(bind_ip).await;
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -218,9 +229,15 @@ pub async fn start_hub_server() -> Result<u16, String> {
     // an `scp` of `$HOME`), a 0.0.0.0 bind lets a same-LAN peer siphon
     // secrets over the NETWORK with no local code execution. Loopback-only
     // removes that LAN dimension entirely while keeping the token as
-    // defense-in-depth — the conservative default. Container deployments
-    // that genuinely need cross-namespace reachability opt in explicitly
-    // via `VCT_HUB_BIND_ALL=1` (see `hub_bind_ip`).
+    // defense-in-depth — the conservative default.
+    //
+    // v0.2.75 P1a: the widen is now CONDITIONAL, not manual-only. While
+    // ≥1 global (hub-consuming) module is installed, the hub widens to
+    // 0.0.0.0 automatically (that module's container is unreachable
+    // otherwise on every OS); the state is derived from launcher.db's
+    // global install rows so install/uninstall set/clear it and every
+    // start path honours it. An explicit user `VCT_HUB_BIND_ALL` env
+    // (either direction) always wins. See `resolve_hub_bind_ip`.
     //
     // Port-ladder note (F-6, v0.2.73): `try_bind(addr, 5)` walks to
     // port+1..+5 when the base port is occupied. Pre-fix this DEFEATED
@@ -297,7 +314,7 @@ pub async fn start_hub_server() -> Result<u16, String> {
     let bind_note = if bind_ip == std::net::Ipv4Addr::LOCALHOST {
         "loopback-only"
     } else {
-        "all interfaces (VCT_HUB_BIND_ALL)"
+        "all interfaces (VCT_HUB_BIND_ALL opt-in or hub-consuming module installed)"
     };
     println!(
         "[vct-hub] API server running on http://127.0.0.1:{} (bound {}: {})",
@@ -306,21 +323,129 @@ pub async fn start_hub_server() -> Result<u16, String> {
     Ok(actual_port)
 }
 
-/// Resolve the hub's bind IP (E-2, v0.2.73).
+/// Why a bind was chosen — logged at startup + used for the loud
+/// module-widen banner (v0.2.75 P1a).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum BindReason {
+    /// `VCT_HUB_BIND_ALL` recognised-truthy — user opted in to 0.0.0.0.
+    UserEnvOptIn,
+    /// `VCT_HUB_BIND_ALL` set to any other value — user explicitly keeps
+    /// (or forces back) loopback; overrides the module-derived widen.
+    UserEnvOptOut,
+    /// No env; ≥1 global (hub-consuming) module install row exists in
+    /// launcher.db — supervisor-managed widen to 0.0.0.0.
+    ModuleWiden,
+    /// No env, no hub-consuming module — the conservative loopback
+    /// default (E-2, v0.2.73).
+    LoopbackDefault,
+}
+
+/// Pure bind decision (v0.2.75 P1a) — testable without env/DB plumbing.
 ///
-/// Default `127.0.0.1` (loopback-only) so a leaked `hub.token` cannot be used
-/// to siphon secrets over the LAN. Set `VCT_HUB_BIND_ALL=1` (or `true`) to bind
-/// `0.0.0.0` — required only when a container must reach the hub across its
-/// network namespace (`host.containers.internal`). Any other value keeps the
-/// loopback default (conservative: only an explicit, recognised opt-in widens
-/// the bind).
-fn hub_bind_ip() -> std::net::Ipv4Addr {
-    match std::env::var("VCT_HUB_BIND_ALL").ok().as_deref() {
+/// Precedence:
+///   1. `env_value` SET + recognised-truthy (`1`/`true`/`TRUE`/`yes`) →
+///      `0.0.0.0` (user opt-in).
+///   2. `env_value` SET to anything else → `127.0.0.1` (user opt-OUT —
+///      an explicit user setting wins over the supervisor-managed widen
+///      in BOTH directions; we never override the user's env).
+///   3. env UNSET + a hub-consuming module installed → `0.0.0.0`
+///      (supervisor-managed widen; see `resolve_hub_bind_ip` for the
+///      rationale + the loud exposure log).
+///   4. otherwise → `127.0.0.1` (conservative default).
+///
+/// MUST MATCH `vct_launcher_core::db::Db::has_global_module_install`'s
+/// doc contract: the module-derived widen state is the presence of a
+/// global install row; only the env can override it.
+pub(crate) fn decide_hub_bind_ip(
+    env_value: Option<&str>,
+    hub_consuming_module_installed: bool,
+) -> (std::net::Ipv4Addr, BindReason) {
+    match env_value {
         Some("1") | Some("true") | Some("TRUE") | Some("yes") => {
-            std::net::Ipv4Addr::UNSPECIFIED // 0.0.0.0
+            (std::net::Ipv4Addr::UNSPECIFIED, BindReason::UserEnvOptIn)
         }
-        _ => std::net::Ipv4Addr::LOCALHOST, // 127.0.0.1
+        Some(_) => (std::net::Ipv4Addr::LOCALHOST, BindReason::UserEnvOptOut),
+        None if hub_consuming_module_installed => {
+            (std::net::Ipv4Addr::UNSPECIFIED, BindReason::ModuleWiden)
+        }
+        None => (std::net::Ipv4Addr::LOCALHOST, BindReason::LoopbackDefault),
     }
+}
+
+/// Resolve the hub's bind IP (E-2 v0.2.73; module-conditional widen
+/// v0.2.75 P1a).
+///
+/// Default `127.0.0.1` (loopback-only) so a leaked `hub.token` cannot be
+/// used to siphon secrets over the LAN. Two ways the bind widens to
+/// `0.0.0.0`:
+///
+///   * `VCT_HUB_BIND_ALL=1` (or `true`) — explicit user opt-in. Any
+///     OTHER explicit value keeps/forces loopback and also suppresses
+///     the module-derived widen below (user env wins both directions).
+///   * ≥1 GLOBAL module install row in launcher.db (v0.2.75 P1a) — a
+///     hub-consuming module's container must reach the hub across its
+///     network namespace via `host.containers.internal`, which NEVER
+///     resolves to the host's own 127.0.0.1: on Linux (native podman)
+///     it maps to a bridge/host-gateway IP; on macOS/Windows the
+///     container runtime runs inside a VM whose "host" view is the VM
+///     boundary. Loopback-only is therefore unreachable from containers
+///     on ALL THREE OSes; 0.0.0.0 covers all of them. The widen state
+///     lives in the install rows themselves (set by install, dropped by
+///     the last uninstall, honoured by EVERY start path — install.py,
+///     the SessionStart hook, the launcher GUI, and the CLI all just
+///     start this binary, which re-derives the bind here).
+///
+/// SECURITY POSTURE when widened: every `/api/v1/*` route stays gated by
+/// `auth::require_auth` against the 256-bit `hub.token` bearer (module
+/// routes by the per-module ephemeral token); a LAN peer that reaches
+/// the port without the token gets 401. The widen is logged LOUDLY.
+///
+/// Conservative on uncertainty: a launcher.db read error resolves to
+/// loopback (do NOT widen on a guess) with a warning.
+fn resolve_hub_bind_ip(db: &vct_launcher_core::db::Db) -> std::net::Ipv4Addr {
+    let env_value = std::env::var("VCT_HUB_BIND_ALL").ok();
+    let modules_present = match db.has_global_module_install() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "[vct-hub] WARNING: could not read module installs for the bind \
+                 decision ({}); keeping the conservative loopback bind. If a \
+                 hub-consuming module's container cannot reach the hub, restart \
+                 the hub once launcher.db is readable.",
+                e
+            );
+            false
+        }
+    };
+    let (ip, reason) = decide_hub_bind_ip(env_value.as_deref(), modules_present);
+    match reason {
+        BindReason::ModuleWiden => {
+            eprintln!(
+                "[vct-hub] NOTICE: binding 0.0.0.0 (all interfaces) because a \
+                 hub-consuming module is installed — its container reaches the \
+                 hub via host.containers.internal, which loopback cannot serve \
+                 on any OS. LAN exposure: peers on your network can REACH the \
+                 port, but every /api/v1 route remains bearer-token gated \
+                 (hub.token, 0600) — requests without the token get 401. The \
+                 bind narrows back to 127.0.0.1 automatically on the first \
+                 hub start after the last hub-consuming module is uninstalled. \
+                 Set VCT_HUB_BIND_ALL=0 to force loopback anyway (the module's \
+                 container will NOT be able to read its data from the hub)."
+            );
+        }
+        BindReason::UserEnvOptOut if modules_present => {
+            eprintln!(
+                "[vct-hub] WARNING: VCT_HUB_BIND_ALL={} forces a loopback-only \
+                 bind while a hub-consuming module is installed — its container \
+                 CANNOT reach the hub (host.containers.internal never resolves \
+                 to the host's 127.0.0.1). Unset VCT_HUB_BIND_ALL (or set it to \
+                 1) and restart the hub to restore module data reads.",
+                env_value.as_deref().unwrap_or("")
+            );
+        }
+        _ => {}
+    }
+    ip
 }
 
 async fn try_bind(base_addr: SocketAddr, retries: u16) -> Result<tokio::net::TcpListener, String> {
@@ -350,6 +475,29 @@ async fn try_bind(base_addr: SocketAddr, retries: u16) -> Result<tokio::net::Tcp
 /// A same-directory rename is atomic on POSIX and on Windows ReplaceFile
 /// semantics, so a reader sees either the old value or the new one, never a
 /// torn one.
+/// Discovery file recording the hub's ACTUAL bind IP (v0.2.75 P1a).
+/// Sibling of `hub.port`. Readers: the launcher's module-start widen
+/// check (`module_service::widen_restart_action`) and the supervisor's
+/// container→hub reachability probe. Absent ⇒ pre-v0.2.75 hub ⇒ treat
+/// as loopback.
+pub const BIND_FILE: &str = "hub.bind";
+
+/// Persist the bound IP to `<vct_root_dir>/hub.bind`. Same atomic
+/// pid-suffixed-temp + rename discipline as `write_port_file`.
+async fn write_bind_file(bind_ip: std::net::Ipv4Addr) {
+    let path = vct_launcher_core::paths::vct_root_dir().join(BIND_FILE);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.ok();
+    }
+    let tmp = path.with_extension(format!("bind.tmp.{}", std::process::id()));
+    if tokio::fs::write(&tmp, bind_ip.to_string()).await.is_ok() {
+        if tokio::fs::rename(&tmp, &path).await.is_err() {
+            tokio::fs::write(&path, bind_ip.to_string()).await.ok();
+            tokio::fs::remove_file(&tmp).await.ok();
+        }
+    }
+}
+
 async fn write_port_file(port: u16) {
     let path = vct_launcher_core::paths::vct_root_dir().join("hub.port");
 
@@ -366,5 +514,103 @@ async fn write_port_file(port: u16) {
             tokio::fs::write(&path, port.to_string()).await.ok();
             tokio::fs::remove_file(&tmp).await.ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    // ── v0.2.75 P1a: bind decision matrix ─────────────────────────────
+
+    /// User env opt-in wins regardless of module state.
+    #[test]
+    fn bind_env_truthy_widens_with_or_without_modules() {
+        for v in ["1", "true", "TRUE", "yes"] {
+            assert_eq!(
+                decide_hub_bind_ip(Some(v), false),
+                (Ipv4Addr::UNSPECIFIED, BindReason::UserEnvOptIn)
+            );
+            assert_eq!(
+                decide_hub_bind_ip(Some(v), true),
+                (Ipv4Addr::UNSPECIFIED, BindReason::UserEnvOptIn)
+            );
+        }
+    }
+
+    /// User env set to anything else forces loopback EVEN when a
+    /// hub-consuming module is installed — the supervisor-managed widen
+    /// never overrides an explicit user setting (leave-alone).
+    #[test]
+    fn bind_env_optout_forces_loopback_even_with_modules() {
+        for v in ["0", "false", "no", "banana"] {
+            assert_eq!(
+                decide_hub_bind_ip(Some(v), true),
+                (Ipv4Addr::LOCALHOST, BindReason::UserEnvOptOut)
+            );
+        }
+    }
+
+    /// No env: the module-derived widen state decides.
+    #[test]
+    fn bind_module_widen_applies_only_without_user_env() {
+        assert_eq!(
+            decide_hub_bind_ip(None, true),
+            (Ipv4Addr::UNSPECIFIED, BindReason::ModuleWiden)
+        );
+        assert_eq!(
+            decide_hub_bind_ip(None, false),
+            (Ipv4Addr::LOCALHOST, BindReason::LoopbackDefault)
+        );
+    }
+
+    /// End-to-end through the persisted state: installing a global
+    /// (hub-consuming) module SETS the widen; the last uninstall CLEARS
+    /// it. This is the "supervisor sets/clears the widen state" contract
+    /// — the state IS the global install row, so every future hub start
+    /// (install.py post-step, SessionStart hook, launcher GUI, CLI) sees
+    /// it via this same resolution.
+    #[test]
+    fn bind_widen_state_follows_global_install_rows() {
+        let db = vct_launcher_core::db::Db::open_in_memory().unwrap();
+
+        let installed = db.has_global_module_install().unwrap();
+        assert!(!installed);
+        assert_eq!(
+            decide_hub_bind_ip(None, installed).0,
+            Ipv4Addr::LOCALHOST,
+            "no module → loopback"
+        );
+
+        db.insert_global_module_install("i-g", "vct-rl-reranker", "0.2.10", "/g")
+            .unwrap();
+        let installed = db.has_global_module_install().unwrap();
+        assert!(installed, "install sets the widen state");
+        assert_eq!(decide_hub_bind_ip(None, installed).0, Ipv4Addr::UNSPECIFIED);
+
+        db.delete_global_module_install("vct-rl-reranker").unwrap();
+        let installed = db.has_global_module_install().unwrap();
+        assert!(!installed, "last uninstall clears the widen state");
+        assert_eq!(decide_hub_bind_ip(None, installed).0, Ipv4Addr::LOCALHOST);
+    }
+
+    /// Comment-drift gate (v0.2.75 P1a task 1a): the module_supervisor's
+    /// container-env comment must describe the REAL bind contract — the
+    /// pre-fix text claimed the hub unconditionally binds 0.0.0.0, which
+    /// E-2 (v0.2.73) had already reversed.
+    #[test]
+    fn module_supervisor_comment_reflects_conditional_bind_contract() {
+        let src = include_str!("module_supervisor.rs");
+        assert!(
+            !src.contains("combined with\n    // the hub binding 0.0.0.0 (server.rs)")
+                && !src.contains("combined with the hub binding 0.0.0.0"),
+            "stale unconditional-0.0.0.0 comment must not return to module_supervisor.rs"
+        );
+        assert!(
+            src.contains("resolve_hub_bind_ip"),
+            "module_supervisor's env-injection comment must reference the \
+             conditional bind resolution (resolve_hub_bind_ip)"
+        );
     }
 }
