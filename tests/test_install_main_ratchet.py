@@ -22,17 +22,18 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # ── Pinned ceilings — update only DOWNWARD ─────────────────────────────────
 #
-# Measured 2026-07-08 on the v0.2.75 Part-3a state.
+# Measured 2026-07-08 on the v0.2.75 Part-3b state (post P2c extractions:
+# update-gate lockfile choreography → vco_lib/install_update_gate.py,
+# deferral seed/finalize choreography → vco_lib/install_deferral_flow.py;
+# down from 1699 / 25401 at Part 3a).
 #
 # MAIN_SPAN: strict — main() must not grow AT ALL. New steps go into
 # helper functions / vco_lib modules called from main().
-_MAIN_SPAN_MAX = 1699
+_MAIN_SPAN_MAX = 1668
 
-# TOTAL: measured 25401 + 200 headroom because v0.2.75 Part 3b edits
-# install.py next (and is expected to LOWER the total via extraction —
-# re-pin downward when it lands). Additions beyond the headroom require
+# TOTAL: strict — measured exactly, no headroom. Additions require
 # extraction to vco_lib, not a bump.
-_TOTAL_LINES_MAX = 25401 + 200
+_TOTAL_LINES_MAX = 25367
 
 
 def _measure() -> tuple:
