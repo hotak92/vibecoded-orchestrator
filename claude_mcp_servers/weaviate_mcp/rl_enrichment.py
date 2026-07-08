@@ -1215,6 +1215,20 @@ def _emit_code_structure_telemetry(
             new_task_id,
         )
 
+        # v0.2.75 NEW-1: same consumer gate as the code-search emit (this
+        # emit stages no citations, so only the retrieval-consumer probe
+        # applies). One home: search_pipeline._retrieval_emit_has_consumer,
+        # which FALLS OPEN on any probe error.
+        from claude_mcp_servers.rl_client.search_pipeline import (
+            _retrieval_emit_has_consumer,
+        )
+
+        if not _retrieval_emit_has_consumer():
+            server.logger.debug(
+                "code structure emit: no retrieval-event consumer; skipping"
+            )
+            return False
+
         rows = results if isinstance(results, list) else []
         nodes: list[dict] = []
         for i, r in enumerate(rows[:server._CODE_STRUCTURE_TELEMETRY_MAX_NODES]):
@@ -1337,6 +1351,12 @@ def _emit_code_retrieval_telemetry(
     ``task_id`` may be supplied by the caller; the SAME id is used for the
     retrieval event and the staged citation ctx so the pair joins in the
     corpus. Soft-fail throughout; returns emit success.
+
+    v0.2.75 NEW-1: honours the v0.2.73 Concern-A opt-out COMPUTE gates the
+    KG path already had — citation staging is gated on
+    ``_should_capture_citations`` and the event build+emit on
+    ``_retrieval_emit_has_consumer`` (both reused from search_pipeline,
+    both falling OPEN on probe errors).
     """
     try:
         from claude_mcp_servers.rl_client.telemetry_emit import (
@@ -1345,6 +1365,40 @@ def _emit_code_retrieval_telemetry(
             emit_rl_event,
             new_task_id,
         )
+
+        # v0.2.75 NEW-1: the code path bypassed BOTH v0.2.73 Concern-A opt-out
+        # gates — it staged the citation pending file unconditionally whenever
+        # nodes carried ``n_emb`` (so the turn-end drain embedded the answer in
+        # the CODE model space for a result nothing consumed) AND built + posted
+        # the retrieval event the writer would drop at its boundary anyway.
+        # Reuse the KG path's consumer probes (one concern, one home —
+        # search_pipeline owns them; lazy import, no cycle: search_pipeline
+        # only lazy-imports weaviate_mcp.server at call time).
+        #
+        # ``rl_enabled=False`` for the capture gate is deliberate, not a
+        # shortcut: the online ``/rl_update_v3`` consumer exists ONLY on the KG
+        # monitor path — the code-citation drain never POSTs training updates
+        # (sole rl_update_v3 caller is ``_rl_answer_monitor``), so a code
+        # citation's consumers are exactly the local hub write + the upload
+        # queue. Passing a real rl_enabled would re-create the over-capture
+        # NEW-1 fixes for a logging-off Pro user. Flip to the real value if a
+        # code online-training consumer ever lands.
+        #
+        # FALL OPEN preserved: both probes return True on any import/read
+        # error (over-collect, never drop a paying user's corpus).
+        from claude_mcp_servers.rl_client.search_pipeline import (
+            _retrieval_emit_has_consumer,
+            _should_capture_citations,
+        )
+
+        capture_citations = _should_capture_citations(False)
+        emit_has_consumer = _retrieval_emit_has_consumer()
+        if not capture_citations and not emit_has_consumer:
+            server.logger.debug(
+                "code retrieval emit: no consumer (local logging off + no "
+                "upload consent); skipping build + staging + emit"
+            )
+            return False
 
         nodes: list[dict] = []
         for i, c in enumerate(survivors):
@@ -1412,20 +1466,29 @@ def _emit_code_retrieval_telemetry(
         # v0.2.73 RL-2b: stage the citation ctx BEFORE the emit (mirrors
         # rerank_and_emit's ordering — staging never depends on emit
         # success). No-op when no node carries a vector.
-        try:
-            server._stage_code_citation_pending(
-                task_id=_task_id,
-                nodes=nodes,
-                query=query,
-                query_emb=query_emb,
-                code_source=code_source,
-                code_dim=code_dim,
-                code_model=code_model,
-                task_type=task_type,
-                session_id=session_id,
-            )
-        except Exception as exc:  # noqa: BLE001 — staging never breaks search
-            server.logger.debug("code citation staging failed (%s)", exc)
+        # v0.2.75 NEW-1: gated on the citation-capture probe so an opted-out
+        # user's drain never answer-embeds for a result nothing reads.
+        if capture_citations:
+            try:
+                server._stage_code_citation_pending(
+                    task_id=_task_id,
+                    nodes=nodes,
+                    query=query,
+                    query_emb=query_emb,
+                    code_source=code_source,
+                    code_dim=code_dim,
+                    code_model=code_model,
+                    task_type=task_type,
+                    session_id=session_id,
+                )
+            except Exception as exc:  # noqa: BLE001 — staging never breaks search
+                server.logger.debug("code citation staging failed (%s)", exc)
+
+        # v0.2.75 NEW-1: the retrieval event's only sinks are the local hub
+        # write + the upload queue — skip the build + POST when neither exists
+        # (the writer would drop it at its boundary anyway).
+        if not emit_has_consumer:
+            return False
 
         ev = RetrievalEvent(
             query=query,
