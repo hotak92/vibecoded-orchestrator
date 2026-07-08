@@ -1193,6 +1193,7 @@ def _emit_code_structure_telemetry(
     results: "list[dict] | None",
     truncated: "bool | None" = None,
     session_id: "str | None" = None,
+    unsupported_for_language: "bool | None" = None,
 ) -> bool:
     """v0.2.73 (RL follow-up): emit a retrieval event for ``query_code_structure``.
 
@@ -1280,6 +1281,12 @@ def _emit_code_structure_telemetry(
         }
         if truncated is not None:
             extras["truncated"] = bool(truncated)
+        # P2e (CG-2): the CORRECTED unsupported-for-language marker. True only
+        # when the target's language is positively known to be non-Python (the
+        # edge type is genuinely unsupported for it). None → omitted so a Python
+        # zero-caller result isn't mislabeled in the offline training corpus.
+        if unsupported_for_language is not None:
+            extras["unsupported_for_language"] = bool(unsupported_for_language)
 
         ev = RetrievalEvent(
             query=f"{query_type}:{target}",

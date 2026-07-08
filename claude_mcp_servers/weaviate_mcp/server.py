@@ -6750,6 +6750,57 @@ def _dedup_objects_by_full_name(objects: list) -> list:
 # marker lets the caller distinguish the two.
 _CALLGRAPH_QUERY_TYPES = {"callers", "path", "type_users"}
 
+# CG-2 (v0.2.75 P2e): call-graph + type-use extraction is Python-only today
+# (analyze_code_graph._extract_function_calls is ast-based). So an EMPTY
+# callers/path/type_users result is genuinely ambiguous ONLY for a non-Python
+# target — a Python target with zero callers really has zero callers. The
+# ``unsupported_for_language`` boolean is an over-claim when it fires on Python;
+# emit it ONLY once the target's language is positively known to be non-Python.
+# Canonical "python" tag as stamped by the analyzer (_canonical_lang_id).
+_CALLGRAPH_PY_LANGS = {"python"}
+
+
+def _callgraph_target_language(
+    query_type: str, target: str, client, proj_coll, effective_project,
+) -> "str | None":
+    """Best-effort resolve the target entity's stored ``language`` for the CG-2
+    marker decision. Called ONLY when a call-graph query returned EMPTY (so it
+    is a rare, one-point-read cost — never on the common non-empty path).
+
+    Returns the lowercased language tag, or ``None`` when it can't be positively
+    determined (entity absent, unreadable, or the ``path`` query's source stem).
+    ``None`` keeps the marker OFF (fail toward NOT over-claiming) while the prose
+    note still explains the ambiguity.
+    """
+    try:
+        # ``path`` target is "src->dst"; probe the source function's language.
+        probe_name = target.split("->", 1)[0].strip() if query_type == "path" else target
+        if not probe_name:
+            return None
+
+        def _lang_from(base: str, prop: str):
+            try:
+                coll = client.collections.get(proj_coll(base))
+                flt = Filter.by_property(prop).equal(probe_name)
+                if effective_project:
+                    flt = flt & Filter.by_property("project").equal(effective_project)
+                resp = coll.query.fetch_objects(filters=flt, limit=1)
+                if resp.objects:
+                    lang = (resp.objects[0].properties or {}).get("language")
+                    return str(lang).strip().lower() if lang else None
+            except Exception:  # noqa: BLE001 — probe best-effort
+                return None
+            return None
+
+        # CodeFunction/CodeClass carry ``full_name``; CodeModule carries ``path``.
+        return (
+            _lang_from("CodeFunction", "full_name")
+            or _lang_from("CodeClass", "full_name")
+            or _lang_from("CodeModule", "path")
+        )
+    except Exception:  # noqa: BLE001 — never break the tool for a marker
+        return None
+
 
 def _code_structure_not_found_hint(query_type: str, target: str,
                                    effective_project) -> str:
@@ -7184,14 +7235,30 @@ def query_code_structure(
         if _truncation_meta is not None:
             response_payload["truncated"] = _truncation_meta["truncated"]
             response_payload["limit"] = _truncation_meta["limit"]
-        # CG-2 (v0.2.73): a call-graph query (callers/path/type_users) that
-        # returns EMPTY is ambiguous — the target may genuinely have no
-        # callers, OR its language's analyzer walker doesn't populate the
-        # call graph / type-use edges (rich for Python, sparse/absent for
-        # several other walkers). Surface the marker so the caller doesn't
-        # read "0 callers" as "definitely nothing calls this".
+        # CG-2 (v0.2.73 → v0.2.75 P2e): a call-graph query
+        # (callers/path/type_users) that returns EMPTY is ambiguous — the target
+        # may genuinely have no callers, OR its language's analyzer walker
+        # doesn't populate the call graph / type-use edges (rich for Python,
+        # sparse/absent for several other walkers).
+        #
+        # P2e HONESTY FIX: the ``unsupported_for_language`` boolean over-claimed
+        # — it fired on EVERY empty result, including a Python target with
+        # genuinely zero callers, and that mislabel propagated into RL training
+        # data (the field is telemetry-recorded). Now emit the boolean ONLY when
+        # the target's language is POSITIVELY known to be non-Python (call/type
+        # extraction is Python-only today — analyze_code_graph._extract_function_calls
+        # is ast-based). For a Python target, or an ambiguous/unresolvable
+        # language, keep the explanatory prose note but DON'T set the
+        # over-claiming boolean.
+        _cg_unsupported = None
         if query_type in _CALLGRAPH_QUERY_TYPES and not results:
-            response_payload["unsupported_for_language"] = True
+            _target_lang = _callgraph_target_language(
+                query_type, target, client, _proj_coll, effective_project,
+            )
+            # Known non-Python → the edge type is genuinely unsupported for it.
+            _cg_unsupported = bool(_target_lang) and _target_lang not in _CALLGRAPH_PY_LANGS
+            if _cg_unsupported:
+                response_payload["unsupported_for_language"] = True
             response_payload["note"] = (
                 f"0 results for a '{query_type}' query. This can mean the "
                 f"target truly has none, OR the target's language does not "
@@ -7214,6 +7281,10 @@ def query_code_structure(
                 if _truncation_meta is not None
                 else None
             ),
+            # P2e: record the CORRECTED marker (True only for a known non-Python
+            # target; None otherwise) so RL training data isn't keyed on the old
+            # over-claiming boolean. Omitted from extras when None.
+            unsupported_for_language=_cg_unsupported,
         )
         return _large_result(response_payload)
 

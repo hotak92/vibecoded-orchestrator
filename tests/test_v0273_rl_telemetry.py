@@ -874,6 +874,30 @@ def test_structure_emit_zero_results_still_emits(monkeypatch):
     event = _payload(captured[0])
     assert event["extras"]["result_count"] == 0
     assert event["nodes"] == []
+    # P2e: with no marker passed, the corrected field is OMITTED (a Python
+    # zero-result must not be mislabeled unsupported in the training corpus).
+    assert "unsupported_for_language" not in event["extras"]
+
+
+def test_structure_emit_carries_corrected_language_marker(monkeypatch):
+    """P2e (CG-2): the corrected unsupported-for-language marker rides the
+    structural event's extras ONLY when explicitly True (known non-Python)."""
+    import importlib
+
+    srv = importlib.import_module("weaviate_mcp.server")
+    captured: list = []
+    monkeypatch.setattr(
+        srv, "_get_rl_telemetry_writer_for", lambda *a, **k: _writer(captured)
+    )
+    monkeypatch.setattr(srv, "_get_embedding_service", lambda: None)
+    ok = srv._emit_code_structure_telemetry(
+        query_type="callers",
+        target="rustFn",
+        results=[],
+        unsupported_for_language=True,
+    )
+    assert ok is True
+    assert _payload(captured[0])["extras"]["unsupported_for_language"] is True
 
 
 def test_structure_emit_soft_fails_on_writer_error(monkeypatch):

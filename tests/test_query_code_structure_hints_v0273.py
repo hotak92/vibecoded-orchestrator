@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import sys
-import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -29,40 +28,85 @@ class _FakeResp:
         self.objects = objects
 
 
+def _filter_target(flt):
+    """Best-effort extract the leaf property name a weaviate Filter targets.
+
+    Handles a single _FilterValue (``.target``) and a compound _Filters
+    (``.filters`` — return the FIRST leaf's target, which for our queries is
+    the discriminating property). Returns "" when it can't tell."""
+    if flt is None:
+        return ""
+    tgt = getattr(flt, "target", None)
+    if isinstance(tgt, str):
+        return tgt
+    subs = getattr(flt, "filters", None)
+    if subs:
+        for s in subs:
+            t = _filter_target(s)
+            if t:
+                return t
+    return ""
+
+
 class _FakeQuery:
-    def __init__(self, objects):
+    def __init__(self, objects, filter_aware=False):
         self._objects = objects
+        self._filter_aware = filter_aware
 
     def fetch_objects(self, *a, **k):
-        return _FakeResp(self._objects)
+        if not self._filter_aware:
+            return _FakeResp(self._objects)
+        # P2e: distinguish the callers/type_users query (filters on
+        # call_names / type_uses) from the language probe (filters on
+        # full_name / path). Return an object only when its own property
+        # actually satisfies the queried predicate — so the SAME seeded row
+        # can be absent as a caller yet present for the language probe.
+        prop = _filter_target(k.get("filters"))
+        val = getattr(k.get("filters"), "value", None)
+        matched = []
+        for obj in self._objects:
+            props = getattr(obj, "properties", {}) or {}
+            if prop in ("call_names", "type_uses"):
+                have = props.get(prop) or []
+                wants = val if isinstance(val, (list, tuple)) else [val]
+                if any(w in have for w in wants if w is not None):
+                    matched.append(obj)
+            elif prop in ("full_name", "path"):
+                # Language probe (or path source seed): match the identity prop.
+                if props.get(prop) == val or props.get("full_name") == val:
+                    matched.append(obj)
+            else:
+                matched.append(obj)
+        return _FakeResp(matched)
 
 
 class _FakeColl:
-    def __init__(self, objects):
-        self.query = _FakeQuery(objects)
+    def __init__(self, objects, filter_aware=False):
+        self.query = _FakeQuery(objects, filter_aware=filter_aware)
 
 
 class _FakeCollections:
-    def __init__(self, by_name):
+    def __init__(self, by_name, filter_aware=False):
         self._by_name = by_name
+        self._filter_aware = filter_aware
 
     def get(self, name):
         # Return empty for any collection unless seeded — the base name is
         # the suffix after the last '_'.
         for base, objs in self._by_name.items():
             if name.endswith(base):
-                return _FakeColl(objs)
-        return _FakeColl([])
+                return _FakeColl(objs, filter_aware=self._filter_aware)
+        return _FakeColl([], filter_aware=self._filter_aware)
 
 
 class _FakeClient:
-    def __init__(self, by_name):
-        self.collections = _FakeCollections(by_name)
+    def __init__(self, by_name, filter_aware=False):
+        self.collections = _FakeCollections(by_name, filter_aware=filter_aware)
 
 
 class QueryCodeStructureHintTests(unittest.TestCase):
-    def _run(self, srv, query_type, target, by_name):
-        client = _FakeClient(by_name)
+    def _run(self, srv, query_type, target, by_name, filter_aware=False):
+        client = _FakeClient(by_name, filter_aware=filter_aware)
         with mock.patch.object(srv, "get_weaviate_client", return_value=client), \
              mock.patch.object(srv, "CODE_GRAPH_PROJECT", "", create=True):
             return json.loads(srv.query_code_structure(query_type, target, project=""))
@@ -83,14 +127,57 @@ class QueryCodeStructureHintTests(unittest.TestCase):
         self.assertFalse(payload["success"])
         self.assertIn("search_code_graph", payload["error"])
 
-    def test_empty_callers_marks_unsupported_for_language(self):
+    def test_empty_callers_non_python_marks_unsupported(self):
+        """P2e: an empty callers result for a NON-Python target keeps the
+        marker (the call-graph edge type is genuinely unsupported for it).
+        The target-language probe finds a rust CodeFunction row for someFunc."""
         import claude_mcp_servers.weaviate_mcp.server as srv
-        payload = self._run(srv, "callers", "someFunc", {"CodeFunction": []})
+
+        class _RustObj:
+            uuid = "u-rust"
+            properties = {"full_name": "someFunc", "language": "rust", "call_names": []}
+
+        # callers query filters call_names.contains_any(...) → no MATCH (the row
+        # doesn't call someFunc); the SAME collection then serves the language
+        # probe (full_name.equal) and returns the rust row.
+        payload = self._run(
+            srv, "callers", "someFunc", {"CodeFunction": [_RustObj()]},
+            filter_aware=True,
+        )
         self.assertTrue(payload["success"])
         self.assertEqual(payload["count"], 0)
         self.assertTrue(payload.get("unsupported_for_language"))
         self.assertIn("note", payload)
         self.assertIn("call-graph", payload["note"])
+
+    def test_empty_callers_python_no_marker_but_note(self):
+        """P2e HONESTY FIX: a Python target with genuinely zero callers must NOT
+        carry the over-claiming boolean (it mislabeled RL training data). The
+        explanatory note still stands."""
+        import claude_mcp_servers.weaviate_mcp.server as srv
+
+        class _PyObj:
+            uuid = "u-py"
+            properties = {"full_name": "someFunc", "language": "python", "call_names": []}
+
+        payload = self._run(
+            srv, "callers", "someFunc", {"CodeFunction": [_PyObj()]},
+            filter_aware=True,
+        )
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["count"], 0)
+        self.assertNotIn("unsupported_for_language", payload)
+        self.assertIn("note", payload)
+
+    def test_empty_callers_unknown_language_no_marker(self):
+        """Ambiguous: target row absent / no language → don't over-claim the
+        boolean (fail toward not-unsupported), but keep the note."""
+        import claude_mcp_servers.weaviate_mcp.server as srv
+        payload = self._run(srv, "callers", "someFunc", {"CodeFunction": []})
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["count"], 0)
+        self.assertNotIn("unsupported_for_language", payload)
+        self.assertIn("note", payload)
 
     def test_nonempty_callers_has_no_language_marker(self):
         import claude_mcp_servers.weaviate_mcp.server as srv
