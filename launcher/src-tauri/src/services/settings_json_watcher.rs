@@ -191,6 +191,10 @@ const MCP_RELEVANT_ENV_KEYS: &[&str] = &[
     "KG_TIER_FULL",
     "KG_HYBRID_ALPHA",
     "KG_HYBRID_CHUNK_BUDGET",
+    // v0.2.75 P3f: over-fetch multiplier (fetch N×limit from Weaviate before
+    // rerank) — a hand-editable retrieval-fan-out knob, same reload class as
+    // the KG_HYBRID_* / KG_TIER_* tunables above.
+    "KG_OVERFETCH_MULTIPLIER",
     // --- F-7 (v0.2.75): code-graph retrieval tiers + expansion/rerank knobs
     // (weaviate_mcp's search_code_graph reads all of these). The floors are
     // already listed above (VCO_CODE_GRAPH_*_FLOOR); these are the tier
