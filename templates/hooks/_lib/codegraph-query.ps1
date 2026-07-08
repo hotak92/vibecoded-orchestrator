@@ -124,7 +124,7 @@ function Test-VcoCodegraphBashGate {
 # Get-VcoCodegraphSymbol <Text> -- first REAL code-symbol/path token (query),
 # capped to 200 chars. P1e (v0.2.75): reject env-assignments, non-code paths,
 # regex/glob fragments, redirects, URLs; return EMPTY when no discrete symbol
-# is isolable (the caller then skips injection — a garbage whole-command query
+# is isolable (the caller then skips injection -- a garbage whole-command query
 # is worse than none). MUST MATCH codegraph-query.sh codegraph_extract_symbol.
 $script:CgqNonCodeExtRe = '\.(log|txt|json|jsonl|yaml|yml|toml|lock|tar|gz|zip|md|html|css)$'
 $script:CgqSourceExtRe  = '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$'
@@ -138,7 +138,7 @@ function Get-VcoCodegraphSymbol {
         # NOTE: -cmatch (case-SENSITIVE) throughout to mirror bash's `[[ =~ ]]`
         # (which is case-sensitive). PowerShell's bare -match is
         # case-INSENSITIVE, which would make the CamelCase rule
-        # `[A-Z][a-z]+[A-Z]` match ANY 3+ letter word (e.g. `curl`) — a
+        # `[A-Z][a-z]+[A-Z]` match ANY 3+ letter word (e.g. `curl`) -- a
         # divergence P1e's fixture-parity tests caught.
         # P1e: skip env-assignments (FOO=bar / LEAN_CTX_OFF=1).
         if ($w -cmatch '^[A-Za-z_][A-Za-z0-9_]*=') { continue }
@@ -165,7 +165,7 @@ function Get-VcoCodegraphSymbol {
             break
         }
     }
-    # P1e: NO whole-text fallback — empty means "no isolable symbol".
+    # P1e: NO whole-text fallback -- empty means "no isolable symbol".
     if ($tok.Length -gt 200) { $tok = $tok.Substring(0, 200) }
     return $tok
 }
