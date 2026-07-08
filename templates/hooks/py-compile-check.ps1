@@ -11,7 +11,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # fixed error string in its catch-all on ANY failure (including malformed
 # stdin -- which is not a syntax error). This named sibling self-guards +
 # scrubs above and reports the TRUE compiler message below.
-# MUST MATCH py-compile-check.sh.
+# MUST MATCH py-compile-check.sh (which carries the POSIX executable bit;
+# this .ps1 needs none -- pwsh runs it via -File regardless of mode).
 
 # Resolve Python portably (py / python / python3).
 $FindPy = Join-Path $PSScriptRoot "_lib/find-python.ps1"

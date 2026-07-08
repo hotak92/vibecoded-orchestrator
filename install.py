@@ -9609,50 +9609,6 @@ def _install_vendored_lean_ctx() -> str | None:
         return None
 
 
-def _ensure_discovered_lean_ctx_on_path(found_path: str) -> str | None:
-    """D-11 (v0.2.75): copy a DISCOVERED lean-ctx binary into ~/.local/bin
-    (Windows: %USERPROFILE%\\.cargo\\bin) so a hook shell with a minimal PATH
-    resolves it — extending _install_vendored_lean_ctx's copy-to-PATH path
-    from vendored prebuilts to any found binary.
-
-    Returns the destination path when a copy actually happened, None when:
-      * the binary is ALREADY on PATH (shutil.which found it) — nothing to do;
-      * the binary is already AT the canonical dest — nothing to do;
-      * the copy failed (soft-fail — never blocks install).
-
-    We do NOT vendor new platform prebuilts here (binary provenance is a
-    maintainer decision); we only relocate a binary the user already has.
-    """
-    try:
-        src = Path(found_path)
-        if not src.is_file():
-            return None
-        os_name = platform.system()
-        if os_name == "Windows":
-            dest_dir = Path.home() / ".cargo" / "bin"
-            dest = dest_dir / "lean-ctx.exe"
-        else:
-            dest_dir = Path.home() / ".local" / "bin"
-            dest = dest_dir / "lean-ctx"
-        # Already resolvable on PATH → the hook's `command -v` finds it; skip.
-        if shutil.which("lean-ctx"):
-            return None
-        # Already at the destination → idempotent no-op.
-        try:
-            if dest.exists() and dest.resolve() == src.resolve():
-                return None
-        except OSError:
-            pass
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dest)
-        if os_name != "Windows":
-            os.chmod(dest, 0o755)
-        return str(dest)
-    except (OSError, shutil.Error) as e:
-        print(f"  lean-ctx: failed to copy discovered binary to PATH dir: {e}")
-        return None
-
-
 def _maybe_install_lean_ctx(args: argparse.Namespace) -> str | None:
     """Auto-install lean-ctx if a supported package manager is present.
 
@@ -9792,30 +9748,18 @@ def _detect_optional_companions(args: argparse.Namespace) -> None:
     # The hook no-ops gracefully if lean-ctx isn't on PATH, so an absent
     # binary doesn't break Bash for users without it.
     #
-    # Detection: shutil.which checks PATH only. Many users have lean-ctx
-    # installed via `cargo install lean-ctx` (canonical landing dir
-    # ~/.cargo/bin/) but their non-interactive shell PATH doesn't include
-    # ~/.cargo/bin (cargo's installer adds the line to ~/.profile but
-    # `bash first-install.sh` from a fresh terminal may not have sourced
-    # it yet). Probe known-binary locations as a fallback. Also auto-install
-    # via cargo / brew when those are available.
+    # Detection: _find_lean_ctx_binary probes known-binary locations beyond
+    # PATH (see its docstring for the ~/.cargo/bin rationale); auto-install
+    # via cargo / brew when available.
     lean_ctx_path = _find_lean_ctx_binary()
     if not lean_ctx_path and not args.quiet and not args.no_lean_ctx:
         # Try auto-install via the most appropriate package manager.
         lean_ctx_path = _maybe_install_lean_ctx(args)
     if lean_ctx_path:
-        # D-11 (v0.2.75): if the binary was DISCOVERED off-PATH (e.g. a
-        # `cargo install`ed ~/.cargo/bin/lean-ctx that this non-interactive
-        # shell's PATH lacks), copy it into ~/.local/bin so a hook shell with
-        # a minimal PATH still resolves it. The hook now ALSO probes the
-        # candidate list, so this is belt-and-suspenders — but it closes the
-        # "detected but hook can't see it" gap even for hook shells whose PATH
-        # excludes ~/.cargo/bin. Extends the vendored-copy path
-        # (_install_vendored_lean_ctx) to found binaries; does NOT vendor new
-        # prebuilts. Soft-fail: a copy failure never blocks install.
-        _copied = _ensure_discovered_lean_ctx_on_path(lean_ctx_path)
-        if _copied:
-            print(f"  lean-ctx: copied discovered binary → {_copied} (PATH-resolvable)")
+        # D-11 (v0.2.75): copy a DISCOVERED off-PATH binary into ~/.local/bin (vco_lib.install_companions).
+        from vco_lib.install_companions import ensure_discovered_lean_ctx_on_path
+        if ensure_discovered_lean_ctx_on_path(lean_ctx_path):
+            print("  lean-ctx: copied discovered binary into ~/.local/bin (PATH-resolvable)")
         print(
             f"  lean-ctx: detected at {lean_ctx_path} — PreToolUse hook "
             f".claude/hooks/lean-ctx-rewrite.sh will use it if registered "

@@ -219,63 +219,60 @@ class TestPs1Parity:
         assert res.stdout.strip() != "", "ps1 non-git command must rewrite"
 
 
-# ─── install.py: _ensure_discovered_lean_ctx_on_path ─────────────────────
+# ─── vco_lib.install_companions.ensure_discovered_lean_ctx_on_path ───────
+# D-11 installer half was extracted to vco_lib (install.py soft line-ratchet).
 
 
-def _import_install():
+def _import_companions():
     sys.path.insert(0, str(REPO_ROOT))
     import importlib
-    import install  # type: ignore
-    return importlib.reload(install)
+    from vco_lib import install_companions  # type: ignore
+    return importlib.reload(install_companions)
 
 
 class TestInstallDiscoveredCopy:
     """D-11 installer half: copy a DISCOVERED off-PATH binary into
-    ~/.local/bin so a minimal hook shell resolves it."""
+    ~/.local/bin so a minimal hook shell resolves it. home/os_name are
+    injected (no monkeypatching of Path.home / platform needed)."""
 
     def test_copies_off_path_binary_to_local_bin(self, tmp_path, monkeypatch):
-        install = _import_install()
+        mod = _import_companions()
         home = tmp_path / "home"
         cargo = home / ".cargo" / "bin"
         cargo.mkdir(parents=True)
         src = cargo / "lean-ctx"
         src.write_text("#!/bin/sh\necho fake\n")
         src.chmod(0o755)
-
-        monkeypatch.setattr(install.Path, "home", staticmethod(lambda: home))
-        monkeypatch.setattr(install.platform, "system", lambda: "Linux")
         # NOT on PATH → which returns None → copy should happen.
-        monkeypatch.setattr(install.shutil, "which", lambda _n: None)
+        monkeypatch.setattr(mod.shutil, "which", lambda _n: None)
 
-        dest = install._ensure_discovered_lean_ctx_on_path(str(src))
+        dest = mod.ensure_discovered_lean_ctx_on_path(
+            str(src), home=home, os_name="Linux")
         assert dest is not None
         assert Path(dest) == home / ".local" / "bin" / "lean-ctx"
         assert Path(dest).is_file()
         assert os.access(dest, os.X_OK)
 
     def test_skips_when_already_on_path(self, tmp_path, monkeypatch):
-        install = _import_install()
+        mod = _import_companions()
         home = tmp_path / "home"
         cargo = home / ".cargo" / "bin"
         cargo.mkdir(parents=True)
         src = cargo / "lean-ctx"
         src.write_text("x")
-
-        monkeypatch.setattr(install.Path, "home", staticmethod(lambda: home))
-        monkeypatch.setattr(install.platform, "system", lambda: "Linux")
         # Already on PATH → no copy (leave-alone).
-        monkeypatch.setattr(install.shutil, "which", lambda _n: str(src))
+        monkeypatch.setattr(mod.shutil, "which", lambda _n: str(src))
 
-        dest = install._ensure_discovered_lean_ctx_on_path(str(src))
+        dest = mod.ensure_discovered_lean_ctx_on_path(
+            str(src), home=home, os_name="Linux")
         assert dest is None
         assert not (home / ".local" / "bin" / "lean-ctx").exists()
 
     def test_missing_source_is_noop(self, tmp_path, monkeypatch):
-        install = _import_install()
-        monkeypatch.setattr(install.shutil, "which", lambda _n: None)
-        dest = install._ensure_discovered_lean_ctx_on_path(
-            str(tmp_path / "does-not-exist")
-        )
+        mod = _import_companions()
+        monkeypatch.setattr(mod.shutil, "which", lambda _n: None)
+        dest = mod.ensure_discovered_lean_ctx_on_path(
+            str(tmp_path / "does-not-exist"), home=tmp_path, os_name="Linux")
         assert dest is None
 
 

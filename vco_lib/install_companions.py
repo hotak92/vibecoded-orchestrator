@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+"""Optional-companion install primitives for install.py (v0.2.75).
+
+D-11 extraction: the lean-ctx discovery-copy helper that install.py used to
+host inline. Kept out of the install.py monolith (soft line-ratchet, CLAUDE.md
+"extract before you add") — the logic is a pure function of its inputs plus
+the OS, with all filesystem effects at the edges.
+
+This module does NOT import install.py — install.py imports FROM it, keeping
+the dependency edge one-directional (install.py -> vco_lib.install_companions).
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+from pathlib import Path
+
+
+def ensure_discovered_lean_ctx_on_path(
+    found_path: str,
+    *,
+    home: Path | None = None,
+    os_name: str | None = None,
+) -> str | None:
+    """D-11 (v0.2.75): copy a DISCOVERED lean-ctx binary into ~/.local/bin
+    (Windows: %USERPROFILE%\\.cargo\\bin) so a hook shell with a minimal PATH
+    resolves it — extending the vendored-copy path to any found binary.
+
+    ``home`` / ``os_name`` are injectable for tests; they default to
+    ``Path.home()`` / ``platform.system()`` at call time.
+
+    Returns the destination path when a copy actually happened, None when:
+      * the binary is ALREADY on PATH (``shutil.which`` found it) — nothing to do;
+      * the binary is already AT the canonical dest — idempotent no-op;
+      * the source doesn't exist, or the copy failed (soft-fail — never blocks
+        install).
+
+    We do NOT vendor new platform prebuilts here (binary provenance is a
+    maintainer decision); we only relocate a binary the user already has.
+    """
+    import platform
+
+    if home is None:
+        home = Path.home()
+    if os_name is None:
+        os_name = platform.system()
+    try:
+        src = Path(found_path)
+        if not src.is_file():
+            return None
+        if os_name == "Windows":
+            dest_dir = home / ".cargo" / "bin"
+            dest = dest_dir / "lean-ctx.exe"
+        else:
+            dest_dir = home / ".local" / "bin"
+            dest = dest_dir / "lean-ctx"
+        # Already resolvable on PATH -> the hook's `command -v` finds it; skip.
+        if shutil.which("lean-ctx"):
+            return None
+        # Already at the destination -> idempotent no-op.
+        try:
+            if dest.exists() and dest.resolve() == src.resolve():
+                return None
+        except OSError:
+            pass
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        if os_name != "Windows":
+            os.chmod(dest, 0o755)
+        return str(dest)
+    except (OSError, shutil.Error) as e:
+        print(f"  lean-ctx: failed to copy discovered binary to PATH dir: {e}")
+        return None
