@@ -34,17 +34,36 @@ for _p in (str(PROJECT_ROOT), str(MCP_DIR)):
 from claude_mcp_servers.rl_client import search_pipeline  # noqa: E402
 from claude_mcp_servers.rl_client import telemetry_writer  # noqa: E402
 
-srv = pytest.importorskip(
+pytest.importorskip(
     "weaviate_mcp.server",
     reason="weaviate_mcp.server must be importable for the enrich-gate tests",
 )
-from weaviate_mcp import rl_enrichment  # noqa: E402
+
+
+def _srv():
+    """Resolve the CURRENT server module at call time (repo convention).
+
+    A module-level binding goes STALE when a sibling test (e.g.
+    test_v0273_rl_enrichment_reimport_safety) purges + re-imports the
+    weaviate_mcp package mid-suite: rl_enrichment's lazy proxy always
+    resolves the LIVE sys.modules entry, so patches on a stale object
+    are invisible to the code under test.
+    """
+    import importlib
+
+    return importlib.import_module("weaviate_mcp.server")
+
+
+def _enr():
+    import importlib
+
+    return importlib.import_module("weaviate_mcp.rl_enrichment")
 
 
 @pytest.fixture(autouse=True)
 def _fresh_gate(monkeypatch):
     """Reset the TTL cache around every test + neutralise machine-local env."""
-    rl_enrichment._rl_enrich_gate_reset_for_test()
+    _enr()._rl_enrich_gate_reset_for_test()
     for k in (
         "RL_LOCAL_LOGGING_DISABLED",
         "RL_LOCAL_LOGGING_DISABLED_GLOBAL",
@@ -53,7 +72,7 @@ def _fresh_gate(monkeypatch):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setattr(telemetry_writer, "_upload_consent_granted", lambda: False)
     yield
-    rl_enrichment._rl_enrich_gate_reset_for_test()
+    _enr()._rl_enrich_gate_reset_for_test()
 
 
 class _CountingResolver:
@@ -85,7 +104,7 @@ def _nodes():
 
 
 def _enrich(resolver) -> None:
-    srv._rl_enrich_nodes_with_linked_embs(
+    _srv()._rl_enrich_nodes_with_linked_embs(
         _nodes(), query_emb=[1.0, 0.0], active_slot="qwen3_embed",
         coll_resolver=resolver,
     )
@@ -119,7 +138,7 @@ def test_licensed_rerank_only_still_enriches(monkeypatch):
     monkeypatch.setenv("RL_LOCAL_LOGGING_DISABLED", "true")
     resolver = _CountingResolver()
     with patch.object(search_pipeline, "_resolve_rl_enabled", return_value=True), \
-         patch.object(srv, "_rl_client_instances", {}):
+         patch.object(_srv(), "_rl_client_instances", {}):
         _enrich(resolver)
     assert resolver.calls == 1
 
@@ -142,7 +161,7 @@ def test_refused_negotiation_closes_gate_when_no_telemetry(monkeypatch):
     resolver = _CountingResolver()
     instances = {("qwen3", None): _client_with_verdict("embedding_space_mismatch")}
     with patch.object(search_pipeline, "_resolve_rl_enabled", return_value=True), \
-         patch.object(srv, "_rl_client_instances", instances):
+         patch.object(_srv(), "_rl_client_instances", instances):
         _enrich(resolver)
     assert resolver.calls == 0, (
         "licensed but hard-refused pairing + no telemetry consumer → dead fan-out"
@@ -154,7 +173,7 @@ def test_compatible_negotiation_keeps_gate_open(monkeypatch):
     resolver = _CountingResolver()
     instances = {("qwen3", None): _client_with_verdict("compatible")}
     with patch.object(search_pipeline, "_resolve_rl_enabled", return_value=True), \
-         patch.object(srv, "_rl_client_instances", instances):
+         patch.object(_srv(), "_rl_client_instances", instances):
         _enrich(resolver)
     assert resolver.calls == 1
 
@@ -164,7 +183,7 @@ def test_no_verdict_yet_falls_open(monkeypatch):
     resolver = _CountingResolver()
     c = types.SimpleNamespace()  # client cached, never negotiated yet
     with patch.object(search_pipeline, "_resolve_rl_enabled", return_value=True), \
-         patch.object(srv, "_rl_client_instances", {("qwen3", None): c}):
+         patch.object(_srv(), "_rl_client_instances", {("qwen3", None): c}):
         _enrich(resolver)
     assert resolver.calls == 1, "no verdict yet → the rerank may run → enrich"
 
@@ -179,9 +198,9 @@ def test_gate_verdict_cached_within_ttl(monkeypatch):
         calls["n"] += 1
         return True
 
-    monkeypatch.setattr(srv, "_rl_enrichment_consumer_exists", _probe)
-    assert rl_enrichment._rl_enrichment_gate_open() is True
-    assert rl_enrichment._rl_enrichment_gate_open() is True
+    monkeypatch.setattr(_srv(), "_rl_enrichment_consumer_exists", _probe)
+    assert _enr()._rl_enrichment_gate_open() is True
+    assert _enr()._rl_enrichment_gate_open() is True
     assert calls["n"] == 1, "second call within the TTL must hit the memo"
 
 
@@ -192,10 +211,10 @@ def test_gate_ttl_expiry_reprobes(monkeypatch):
         calls["n"] += 1
         return True
 
-    monkeypatch.setattr(srv, "_rl_enrichment_consumer_exists", _probe)
+    monkeypatch.setattr(_srv(), "_rl_enrichment_consumer_exists", _probe)
     monkeypatch.setenv("RL_ENRICH_GATE_TTL_S", "0")
-    rl_enrichment._rl_enrichment_gate_open()
-    rl_enrichment._rl_enrichment_gate_open()
+    _enr()._rl_enrichment_gate_open()
+    _enr()._rl_enrichment_gate_open()
     assert calls["n"] == 2, "TTL=0 must re-probe on every call"
 
 
@@ -203,15 +222,15 @@ def test_gate_probe_error_falls_open(monkeypatch):
     def _boom():
         raise RuntimeError("probe exploded")
 
-    monkeypatch.setattr(srv, "_rl_enrichment_consumer_exists", _boom)
-    assert rl_enrichment._rl_enrichment_gate_open() is True
+    monkeypatch.setattr(_srv(), "_rl_enrichment_consumer_exists", _boom)
+    assert _enr()._rl_enrichment_gate_open() is True
 
 
 def test_gate_error_in_enrich_falls_open(monkeypatch):
     def _boom():
         raise RuntimeError("gate exploded")
 
-    monkeypatch.setattr(srv, "_rl_enrichment_gate_open", _boom)
+    monkeypatch.setattr(_srv(), "_rl_enrichment_gate_open", _boom)
     resolver = _CountingResolver()
     _enrich(resolver)
     assert resolver.calls == 1, "a broken gate must fall open to enrich"

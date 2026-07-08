@@ -37,10 +37,24 @@ for _p in (str(PROJECT_ROOT), str(MCP_DIR)):
 from claude_mcp_servers.rl_client import telemetry_writer  # noqa: E402
 from claude_mcp_servers.rl_client.telemetry_writer import RLTelemetryWriter  # noqa: E402
 
-srv = pytest.importorskip(
+pytest.importorskip(
     "weaviate_mcp.server",
     reason="weaviate_mcp.server must be importable for the code-emit gate tests",
 )
+
+
+def _srv():
+    """Resolve the CURRENT server module at call time (repo convention).
+
+    A module-level binding goes STALE when a sibling test (e.g.
+    test_v0273_rl_enrichment_reimport_safety) purges + re-imports the
+    weaviate_mcp package mid-suite: rl_enrichment's lazy proxy always
+    resolves the LIVE sys.modules entry, so patches on a stale object
+    are invisible to the code under test.
+    """
+    import importlib
+
+    return importlib.import_module("weaviate_mcp.server")
 
 
 def _writer(captured: list) -> RLTelemetryWriter:
@@ -94,8 +108,8 @@ def _env(tmp_path, monkeypatch):
     # Deterministic upload-consent OFF regardless of this machine's
     # ~/.vibecoded/config.json (the probes read the module attr at call time).
     monkeypatch.setattr(telemetry_writer, "_upload_consent_granted", lambda: False)
-    monkeypatch.setattr(srv, "_get_embedding_service", lambda: None)
-    monkeypatch.setattr(srv, "_try_resolve_project_config", lambda: None)
+    monkeypatch.setattr(_srv(), "_get_embedding_service", lambda: None)
+    monkeypatch.setattr(_srv(), "_try_resolve_project_config", lambda: None)
     return tmp_path
 
 
@@ -110,9 +124,9 @@ def _pending_files(tmp_path) -> list:
 def test_opted_out_stages_nothing_and_skips_emit(_env, monkeypatch):
     monkeypatch.setenv("RL_LOCAL_LOGGING_DISABLED", "true")
     captured: list = []
-    monkeypatch.setattr(srv, "_get_rl_telemetry_writer_for", lambda *a, **k: _writer(captured))
+    monkeypatch.setattr(_srv(), "_get_rl_telemetry_writer_for", lambda *a, **k: _writer(captured))
 
-    ok = srv._emit_code_retrieval_telemetry(
+    ok = _srv()._emit_code_retrieval_telemetry(
         query="where are batches validated?",
         query_emb=[0.1] * 16,
         survivors=_code_survivors_with_vectors(),
@@ -131,9 +145,9 @@ def test_opted_out_stages_nothing_and_skips_emit(_env, monkeypatch):
 def test_opted_out_global_leg_also_gates(_env, monkeypatch):
     monkeypatch.setenv("RL_LOCAL_LOGGING_DISABLED_GLOBAL", "1")
     captured: list = []
-    monkeypatch.setattr(srv, "_get_rl_telemetry_writer_for", lambda *a, **k: _writer(captured))
+    monkeypatch.setattr(_srv(), "_get_rl_telemetry_writer_for", lambda *a, **k: _writer(captured))
 
-    ok = srv._emit_code_retrieval_telemetry(
+    ok = _srv()._emit_code_retrieval_telemetry(
         query="q",
         query_emb=[0.1] * 16,
         survivors=_code_survivors_with_vectors(),
@@ -147,9 +161,9 @@ def test_opted_out_global_leg_also_gates(_env, monkeypatch):
 
 def test_opted_in_unchanged_stages_and_emits(_env, monkeypatch):
     captured: list = []
-    monkeypatch.setattr(srv, "_get_rl_telemetry_writer_for", lambda *a, **k: _writer(captured))
+    monkeypatch.setattr(_srv(), "_get_rl_telemetry_writer_for", lambda *a, **k: _writer(captured))
 
-    ok = srv._emit_code_retrieval_telemetry(
+    ok = _srv()._emit_code_retrieval_telemetry(
         query="where are batches validated?",
         query_emb=[0.1] * 16,
         survivors=_code_survivors_with_vectors(),
@@ -178,9 +192,9 @@ def test_probe_error_falls_open_and_stages(_env, monkeypatch):
     # a transient probe failure never silently drops a paying user's corpus.)
     monkeypatch.setattr(telemetry_writer, "_local_logging_disabled", _boom)
     captured: list = []
-    monkeypatch.setattr(srv, "_get_rl_telemetry_writer_for", lambda *a, **k: _writer(captured))
+    monkeypatch.setattr(_srv(), "_get_rl_telemetry_writer_for", lambda *a, **k: _writer(captured))
 
-    srv._emit_code_retrieval_telemetry(
+    _srv()._emit_code_retrieval_telemetry(
         query="q",
         query_emb=[0.1] * 16,
         survivors=_code_survivors_with_vectors(),
@@ -198,9 +212,9 @@ def test_upload_consent_alone_keeps_capture_when_local_off(_env, monkeypatch):
     monkeypatch.setattr(telemetry_writer, "_upload_consent_granted", lambda: True)
     monkeypatch.setattr(telemetry_writer, "_enqueue", lambda *a, **k: True)
     captured: list = []
-    monkeypatch.setattr(srv, "_get_rl_telemetry_writer_for", lambda *a, **k: _writer(captured))
+    monkeypatch.setattr(_srv(), "_get_rl_telemetry_writer_for", lambda *a, **k: _writer(captured))
 
-    ok = srv._emit_code_retrieval_telemetry(
+    ok = _srv()._emit_code_retrieval_telemetry(
         query="q",
         query_emb=[0.1] * 16,
         survivors=_code_survivors_with_vectors(),
@@ -218,9 +232,9 @@ def test_upload_consent_alone_keeps_capture_when_local_off(_env, monkeypatch):
 def test_structure_emit_skipped_when_opted_out(_env, monkeypatch):
     monkeypatch.setenv("RL_LOCAL_LOGGING_DISABLED", "true")
     captured: list = []
-    monkeypatch.setattr(srv, "_get_rl_telemetry_writer_for", lambda *a, **k: _writer(captured))
+    monkeypatch.setattr(_srv(), "_get_rl_telemetry_writer_for", lambda *a, **k: _writer(captured))
 
-    ok = srv._emit_code_structure_telemetry(
+    ok = _srv()._emit_code_structure_telemetry(
         query_type="callers",
         target="alpha.processing.process_batch",
         results=[{"full_name": "beta.caller", "file_path": "src/beta.py"}],
@@ -231,9 +245,9 @@ def test_structure_emit_skipped_when_opted_out(_env, monkeypatch):
 
 def test_structure_emit_unchanged_when_opted_in(_env, monkeypatch):
     captured: list = []
-    monkeypatch.setattr(srv, "_get_rl_telemetry_writer_for", lambda *a, **k: _writer(captured))
+    monkeypatch.setattr(_srv(), "_get_rl_telemetry_writer_for", lambda *a, **k: _writer(captured))
 
-    ok = srv._emit_code_structure_telemetry(
+    ok = _srv()._emit_code_structure_telemetry(
         query_type="callers",
         target="alpha.processing.process_batch",
         results=[{"full_name": "beta.caller", "file_path": "src/beta.py"}],
