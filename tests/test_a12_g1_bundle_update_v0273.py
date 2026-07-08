@@ -6,9 +6,12 @@ A-12: ``install_project_bundle(safe_add=True, update_mode=True)`` previously
 silently no-op'd safe-add (the gate is add-time-only). Now it logs a warn so
 the caller isn't misled.
 
-G1 (secrets spec item #9): ``.git/info/exclude`` coverage runs on EVERY bundle
-update (``update_mode=True``), regardless of safe_add — keeping VCO-created
-paths out of the user's commits for projects added before safe-add existed.
+G1 (secrets spec item #9; widened v0.2.75 P2): ``.git/info/exclude`` coverage
+runs on EVERY add AND update, regardless of safe_add — keeping VCO-created
+paths out of the user's commits for projects added before safe-add existed
+AND for projects added fresh with safe-add OFF (the pre-v0.2.75 gap). The
+safe-add fresh-add branch keeps owning the append for that one flavour so
+the entries aren't appended twice in a single call.
 """
 
 from __future__ import annotations
@@ -105,12 +108,38 @@ class A12G1UpdateModeTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(result["g1_git_exclude"]["action"], "noop")
 
-    def test_g1_exclude_not_run_on_fresh_add(self):
-        """G1's update-only block must NOT fire on a fresh non-safe add
-        (that path is governed by the safe-add branch)."""
+    def test_g1_exclude_runs_on_fresh_non_safe_add(self):
+        """v0.2.75 P2: a FRESH NON-SAFE add gets the exclude entries too.
+        Pre-fix this flavour got nothing until its first bundle update —
+        the safe-add branch only covers safe_add=True adds."""
+        result = self._run(safe_add=False, update_mode=False)
+        self.assertIn("g1_git_exclude", result)
+        self.assertTrue(self.exclude_path.exists(), "exclude file must be written")
+        body = self.exclude_path.read_text(encoding="utf-8")
+        self.assertIn("/.claude/", body)
+
+    def test_g1_exclude_idempotent_after_fresh_add_then_update(self):
+        """Fresh non-safe add followed by an update: the update re-run is a
+        noop (exact-line dedup) — no duplicate entries."""
         self._run(safe_add=False, update_mode=False)
-        result_keys = [s for (s, p, d) in self.logs if s == "4.bundle.g1_git_exclude"]
-        self.assertEqual(result_keys, [])
+        first = self.exclude_path.read_text(encoding="utf-8")
+        self.logs.clear()
+        result = self._run(safe_add=False, update_mode=True)
+        second = self.exclude_path.read_text(encoding="utf-8")
+        self.assertEqual(first, second)
+        self.assertEqual(result["g1_git_exclude"]["action"], "noop")
+
+    def test_g1_skipped_on_safe_fresh_add_which_owns_the_append(self):
+        """A SAFE fresh add keeps routing through the safe-add branch
+        (sidecar deferral + its own append + deferral emission); G1 must
+        not double-append in the same call."""
+        result = self._run(safe_add=True, update_mode=False)
+        g1_logs = [s for (s, p, d) in self.logs if s == "4.bundle.g1_git_exclude"]
+        self.assertEqual(g1_logs, [], "G1 must be skipped when safe-add appended")
+        self.assertIn("safe_add_git_exclude", result)
+        # And the entries still landed (via the safe-add branch).
+        if self.exclude_path.exists():
+            self.assertIn("/.claude/", self.exclude_path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

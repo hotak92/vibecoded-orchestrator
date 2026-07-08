@@ -294,13 +294,19 @@ class SafeAddBundleTests(unittest.TestCase):
         self.assertNotIn("safe_add_skipped_env_merge", ids)
         self.assertNotIn("safe_add_git_exclude_updated", ids)
 
-    def test_default_off_git_info_exclude_untouched(self):
-        self._run(safe_add=False)
-        # The default flow must not create/append .git/info/exclude.
-        self.assertFalse(
+    def test_default_off_git_info_exclude_covered_by_g1(self):
+        """v0.2.75 P2 (G1 widened): a non-safe fresh add gets the SAME
+        local-only `.git/info/exclude` coverage — via the G1 block, not
+        the safe-add branch (so no safe-add deferrals; see
+        test_default_off_no_safe_add_deferrals). Pre-v0.2.75 this test
+        pinned the gap: the default add left VCO paths committable until
+        the first bundle update."""
+        result = self._run(safe_add=False)
+        self.assertIn("g1_git_exclude", result)
+        self.assertTrue(
             self.exclude_path.exists()
             and "/.claude/" in self.exclude_path.read_text(encoding="utf-8"),
-            "default (non-safe) add must NOT touch .git/info/exclude",
+            "non-safe add must ALSO keep VCO paths out of the user's commits",
         )
 
     def test_default_off_settings_still_merges(self):

@@ -9034,15 +9034,20 @@ def install_project_bundle(
              "runs below (G1).",
              data={"safe_add": True, "update_mode": True})
 
-    # G1 (v0.2.73, secrets spec item #9): unconditional `.git/info/exclude`
-    # coverage on EVERY bundle update (not just the safe-add first-install
-    # branch above). Keeps VCO-created paths out of the user's commits even
-    # for projects added before safe-add existed, or added without it. Uses
-    # the same collision-safe append helper (LOCAL-only `.git/info/exclude`,
-    # never the tracked `.gitignore`; worktree/bare `.git`-file conservatively
-    # skipped inside the helper). Soft-fails. Skipped when the safe-add branch
-    # above already ran the append this call (first-install add).
-    if update_mode:
+    # G1 (v0.2.73, secrets spec item #9; widened v0.2.75 P2): unconditional
+    # `.git/info/exclude` coverage on EVERY add AND update — not just the
+    # safe-add first-install branch above and not just updates. Pre-v0.2.75
+    # the gap was the FRESH NON-SAFE ADD: `if update_mode:` skipped it, so a
+    # project added with "Safe add" OFF got no exclude entries until its
+    # first bundle update. Keeps VCO-created paths out of the user's commits
+    # for every add flavour and for projects added before safe-add existed.
+    # Uses the same collision-safe append helper (LOCAL-only
+    # `.git/info/exclude`, never the tracked `.gitignore`; worktree/bare
+    # `.git`-file conservatively skipped inside the helper; idempotent
+    # exact-line dedup so the update re-run after a fresh add is a noop).
+    # Soft-fails. Skipped when the safe-add branch above already ran the
+    # append this call (safe fresh add), and on dry runs (must not mutate).
+    if not dry_run and not (safe_add and not update_mode):
         try:
             git_result = _append_git_info_exclude(
                 folder, tuple(_safe_add_exclude_entries(result, folder)),
