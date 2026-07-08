@@ -22,7 +22,6 @@ v0.2.75 reuses the KG path's probes (one concern, one home —
 """
 from __future__ import annotations
 
-import importlib
 import json
 import sys
 from pathlib import Path
