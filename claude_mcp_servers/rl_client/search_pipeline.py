@@ -703,8 +703,14 @@ def _spawn_answer_monitor(task_id: str, query: str) -> None:
     """
     from claude_mcp_servers.weaviate_mcp import server as srv
 
-    srv._rl_call_seq += 1
-    seq = srv._rl_call_seq
+    # v0.2.75 P3g: the per-process call counter now lives in ``rl_state`` (one
+    # home). It used to be ``srv._rl_call_seq += 1`` — a rebind on the server
+    # namespace that only stayed consistent while the counter was DEFINED on
+    # server; with the definition moved, route the increment through the
+    # ``rl_state`` incrementer so the counter has a single authoritative store.
+    from claude_mcp_servers.weaviate_mcp import rl_state as _rl_state
+
+    seq = _rl_state.next_rl_call_seq()
     monitor = asyncio.create_task(srv._rl_answer_monitor(task_id, seq, query))
     srv._rl_monitor_tasks.add(monitor)
     monitor.add_done_callback(srv._rl_monitor_tasks.discard)
@@ -815,7 +821,13 @@ def _populate_citation_cache(
             from claude_mcp_servers.rl_client.citation_pending import stage_pending
             from .telemetry_emit import resolve_session_id
 
-            staged_seq = getattr(srv, "_rl_call_seq", None)
+            # v0.2.75 P3g: read the counter from its single home (``rl_state``),
+            # not the stale re-exported ``srv._rl_call_seq`` copy.
+            try:
+                from claude_mcp_servers.weaviate_mcp import rl_state as _rl_state
+                staged_seq = getattr(_rl_state, "_rl_call_seq", None)
+            except Exception:  # noqa: BLE001 — soft-fail, staging is best-effort
+                staged_seq = getattr(srv, "_rl_call_seq", None)
             source = "mcp" if task_type == "mcp_interactive" else "hook"
             stage_pending(
                 session_id=resolve_session_id(session_id or ""),

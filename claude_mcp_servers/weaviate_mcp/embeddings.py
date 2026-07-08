@@ -43,8 +43,27 @@ rather than a plain import):
 from __future__ import annotations
 
 import asyncio
+import os
 
 import aiohttp
+
+
+# ─── Embedding config constants (v0.2.75 P3g / M-1 remainder) ────────────
+# These pure-``os.getenv`` embedding-config constants DEFINE here (this is the
+# embedding layer) rather than on ``server.py``; ``server`` re-exports them into
+# its own namespace so bare ``server.<name>`` reads + test patches on the server
+# object keep working. Only the getenv-resolved config that has NO dependency on
+# a server-side resolver moves — ``ACTIVE_EMBEDDING`` (vct-hub-resolved via
+# ``server._config_field``) and the broadly-read search config
+# (``EMBEDDING_MODEL`` / ``EMBEDDING_SOURCE`` / ``DUAL_EMBEDDING_ENABLED`` /
+# ``OLLAMA_URL``) stay on ``server`` where the resolver + read surface live.
+# Legacy text embedding model (kept for backward compat — old named vectors stay populated)
+LEGACY_TEXT_EMBEDDING_MODEL = os.getenv("LEGACY_TEXT_EMBEDDING_MODEL", "snowflake-arctic-embed2:latest")
+# OpenAI embedding config (only used when ACTIVE_EMBEDDING=openai or DUAL_EMBEDDING_ENABLED=true)
+OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+# Code embedding service URL (CodeSage-Large-v2 via FastAPI, or Ollama-compatible endpoint)
+CODE_EMBED_SERVICE_URL = os.getenv("CODE_EMBED_SERVICE_URL", "http://localhost:11440")
 
 
 # ─── EmbeddingService accessor ──────────────────────────────────────────

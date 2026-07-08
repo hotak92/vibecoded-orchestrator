@@ -713,119 +713,44 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
 # variable; the canonical channel today is ``RL_SERVER_PORT`` (set
 # by the launcher's ``allocate_rl_port`` flow).
 RL_SERVER_URL = os.getenv("RL_SERVER_URL", "http://localhost:11439")
-# Over-fetch multiplier: fetch this many × limit from Weaviate, pass all to RL server for reranking.
-_RL_OVERFETCH = 2
-# v0.2.47 RL-6: maximum linked-slot vectors packed per node in the v3
-# retrieval event. Must MATCH `paid-modules/vct-rl-reranker/rl_model.py::MAX_LINKED`
-# (= 5). The container's `_rl_model.update(q_raw, n_raw, linked_raws, n_type_idx)`
-# only consumes the first MAX_LINKED entries — over-shipping wastes bytes.
-# Packing order is fixed: `extra_chunks_of_same_node + actual_linked_nodes`,
-# truncated to MAX_LINKED.
-_RL_MAX_LINKED: int = 5
-# Per-process call counter — used to order calls within a session (maps seq → transcript position).
-_rl_call_seq: int = 0
-# v0.2.28: hold strong references to in-flight `_rl_answer_monitor` tasks
-# so Python's GC cannot drop them mid-poll. Without this, `asyncio.create_task`
-# returns a task whose only reference is the local variable in the caller —
-# which goes out of scope before the task awaits. The CPython asyncio
-# runtime tracks tasks in a WeakSet, so GC can (and does) collect them,
-# logging "Task was destroyed but it is pending!" before silently dropping
-# the citation event. The rl-logging-audit-report 2026-05-23 finding #1
-# (97.7% orphan-citation rate) is the symptom. Standard mitigation:
-# https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
-_rl_monitor_tasks: "set[asyncio.Task]" = set()
-# v0.2.47 RL-6: per-task content cache for the citation-write monitor.
-# Populated by `_rl_cache_and_rerank` at retrieval time with the full per-node
-# payload (best-chunk vector, MAX_LINKED packed linked_embs, node_type, links,
-# cos_qn/ql/nl, etc.) PLUS the query embedding and active-embedding metadata.
-# Consumed by `_rl_answer_monitor` at citation time so it can compute
-# `cosine_sims` (max over answer-chunks × n_emb) + `literal_cited` and write
-# a single v3 citation event without re-fetching anything from Weaviate.
-#
-# Eviction: LRU-ish, bounded at `_RL_NODE_CACHE_MAX`. Entries are popped by
-# the monitor on success; expired-but-unwritten entries (timeout, evicted by
-# new traffic) are dropped silently — the retrieval event still got written
-# at cache-fill time, only the citation event is lost. This is the same
-# soft-fail discipline as the hub POST: no retry, no fallback.
-#
-# Each entry shape (matches what `_rl_answer_monitor` reads):
-#   {
-#       "nodes": list[dict],          # per-node with title / node_type /
-#                                     # n_emb / linked_embs / linked_type_names /
-#                                     # cos_qn / cos_ql / cos_nl / file_path / links
-#       "query_emb": list[float],     # 1024-dim active-slot vector
-#       "active_model": str,          # for chunker.for_model + event payload
-#       "embedding_source": str,
-#       "embedding_dim": int,
-#       "project_id": str | None,
-#       "project_name": str | None,
-#       "task_type": str,
-#   }
-_rl_node_content_cache: dict[str, dict] = {}
-_RL_NODE_CACHE_MAX: int = 256
-# NOTE (v0.2.73 M-1): the ``match_position_for_query as _match_position_for_query``
-# import moved to ``weaviate_mcp.rl_enrichment`` alongside ``_rl_answer_monitor``
-# (its sole consumer). ``rl_client.answer_window`` remains the single source of
-# truth for the matcher — the monitor + Stop-hook drain still agree byte-for-byte.
-# Monitor config: poll every N seconds, stop when answer window reaches this size OR a new
-# human turn appears after the search.  Timeout is a hard ceiling.
-_RL_MONITOR_POLL_INTERVAL: float = 2.0
-# V52-N (2026-06-09): the accumulator threshold is now expressed in TOKENS
-# (not chars) and aligned with the citation gate
-# ``_RL_MIN_ANSWER_TOKENS_FOR_CITATION`` immediately below. Pre-V52-N the
-# accumulator stopped at 64 000 chars (~16k tokens) while the gate required
-# 25 000 tokens -> the monitor would fire on length, the gate would reject
-# as too short, and the citation event was silently dropped. Aligning them
-# to the same 25 000-token value means the monitor fires only once the
-# answer has enough signal to pass the gate.
-_RL_MONITOR_ANSWER_THRESHOLD_TOKENS: int = 25_000  # V52-N: align with citation gate
-# Back-compat char alias for any test/external caller still importing the
-# old name. 1 token ~= 4 chars (qwen3 BPE empirical average).
-_RL_MONITOR_ANSWER_THRESHOLD: int = _RL_MONITOR_ANSWER_THRESHOLD_TOKENS * 4
-_RL_TOOL_CONTENT_LIMIT: int = 20_000         # per tool_use input, chars
-# V52-N: hard timeout raised from 10 min -> 60 min. The new accumulator
-# stops either at the 25 000-token threshold or when the PreCompact hook
-# writes ``.claude/state/rl_monitors_force_flush.flag``; the timeout is
-# now a pure safety valve for sessions that get neither (very short
-# answers, never compacted, never closed). 60 min absorbs slow agents
-# without leaking monitor tasks indefinitely.
-_RL_MONITOR_TIMEOUT: float = 3600.0           # 60 min hard ceiling (V52-N safety valve)
-# V52-N: PreCompact hook drops this sentinel; the monitor picks it up on
-# the next poll and fires with whatever's accumulated so far. After
-# firing the monitor deletes the sentinel so subsequent compactions can
-# re-arm it. Path is relative to ``CLAUDE_PROJECT_DIR``.
-_RL_MONITOR_FORCE_FLUSH_SENTINEL: str = ".claude/state/rl_monitors_force_flush.flag"
-# v0.2.47 RL-7.5: minimum answer length (TOKENS) to compute citation events.
-# Below this, the monitor still POSTs to the RL container's /rl_update
-# (the container may treat short answers as negative-signal training data)
-# but we skip the citation-event write — too-short answers produce noisy
-# cosine signals (single-chunk embedding of a few hundred tokens carries
-# less signal than the noise threshold; the multi-chunk best-of-cosine
-# trick only pays off when the answer spans 3+ chunks).
-#
-# Default 25,000 tokens = ~100KB of text = roughly enough for 2-3 chunks
-# at qwen3's xlarge_context preset (target_tokens=9500) OR ~15 chunks at
-# arctic2's medium preset (target=2500). Either way ample signal for the
-# max-over-chunks cosine to discriminate cited-vs-not.
-#
-# Tunable via env so CPU / Pro users can experiment. Pre-v0.2.47.5
-# this was a 200-char default which was way too low (typical Claude
-# preamble like "Sure! Let me look that up..." would have passed).
-_RL_MIN_ANSWER_TOKENS_FOR_CITATION: int = int(
-    os.getenv("RL_MIN_ANSWER_TOKENS_FOR_CITATION", "25000")
-)
-# Back-compat alias for any test or downstream caller still importing
-# the chars-based name. The actual gate uses the tokens version below.
-_RL_MIN_ANSWER_CHARS_FOR_CITATION: int = _RL_MIN_ANSWER_TOKENS_FOR_CITATION * 4
-# Minimum title length for the literal-citation regex. Below this we skip
-# the per-node regex entirely — two-letter titles like "AI" / "RL" produce
-# enough false-positives ("curl", "url", "fail") to swamp any signal.
-# Matches the rule in paid-modules/vct-rl-reranker/retrieval_rl.py.
-_RL_LITERAL_CITED_MIN_TITLE_LEN: int = 3
+# ─── RL reranking + telemetry state (v0.2.75 P3g / M-1 remainder) ────────
+# The RL mutable caches + tuning constants now DEFINE in ``rl_state`` (this
+# module is importer-only for them). They are re-exported into server's
+# namespace below so the public contract is unchanged bit-for-bit:
+#   * mutable containers (``_rl_client_instances``, ``_rl_telemetry_writers``,
+#     ``_rl_node_content_cache``, ``_rl_monitor_tasks``) re-export BY REFERENCE
+#     — ``server.<name>`` IS the ``rl_state`` object, so every in-place mutation
+#     (``rl_client.search_pipeline``, the tests) is observed on both;
+#   * scalar tuning constants re-export by value — ``rl_enrichment`` reads them
+#     via the ``server`` proxy, so a ``monkeypatch.setattr(srv, "_RL_*", …)``
+#     still rebinds the surface the moved functions read (the patch surface is,
+#     and stays, ``server``; only the DEFINITION home moved).
+# Relative when imported as a package; absolute when run directly as a script
+# (mirrors the ``from .embeddings`` / ``from .rl_enrichment`` guards — REQUIRED
+# so the MCP starts under the launcher's bare-script ``python .../server.py``).
+try:
+    from . import rl_state as _rl_state  # noqa: E402 — package-relative
+except ImportError:
+    import rl_state as _rl_state  # type: ignore  # noqa: E402 — run directly
+# Over-fetch multiplier: fetch this many × limit from Weaviate, pass all to RL
+# server for reranking. (v0.2.75 P3f promotes this to KG_OVERFETCH_MULTIPLIER.)
+_RL_OVERFETCH = _rl_state._RL_OVERFETCH
+_RL_MAX_LINKED = _rl_state._RL_MAX_LINKED
+_rl_call_seq = _rl_state._rl_call_seq  # re-export of the counter's current value
+_rl_monitor_tasks = _rl_state._rl_monitor_tasks  # by-reference (set, mutated in place)
+_rl_node_content_cache = _rl_state._rl_node_content_cache  # by-reference (dict)
+_RL_NODE_CACHE_MAX = _rl_state._RL_NODE_CACHE_MAX
+_RL_MONITOR_POLL_INTERVAL = _rl_state._RL_MONITOR_POLL_INTERVAL
+_RL_MONITOR_ANSWER_THRESHOLD_TOKENS = _rl_state._RL_MONITOR_ANSWER_THRESHOLD_TOKENS
+_RL_MONITOR_ANSWER_THRESHOLD = _rl_state._RL_MONITOR_ANSWER_THRESHOLD
+_RL_TOOL_CONTENT_LIMIT = _rl_state._RL_TOOL_CONTENT_LIMIT
+_RL_MONITOR_TIMEOUT = _rl_state._RL_MONITOR_TIMEOUT
+_RL_MONITOR_FORCE_FLUSH_SENTINEL = _rl_state._RL_MONITOR_FORCE_FLUSH_SENTINEL
+_RL_MIN_ANSWER_TOKENS_FOR_CITATION = _rl_state._RL_MIN_ANSWER_TOKENS_FOR_CITATION
+_RL_MIN_ANSWER_CHARS_FOR_CITATION = _rl_state._RL_MIN_ANSWER_CHARS_FOR_CITATION
+_RL_LITERAL_CITED_MIN_TITLE_LEN = _rl_state._RL_LITERAL_CITED_MIN_TITLE_LEN
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
 EMBEDDING_SOURCE = os.getenv("EMBEDDING_SOURCE", "ollama")
-# Legacy text embedding model (kept for backward compat — old named vectors stay populated)
-LEGACY_TEXT_EMBEDDING_MODEL = os.getenv("LEGACY_TEXT_EMBEDDING_MODEL", "snowflake-arctic-embed2:latest")
 # Dual-embedding support: when enabled, objects are stored with named vectors
 # ("ollama_embed", "openai_embed") instead of a single flat vector.
 # Enabled by default for fresh installs. Existing collections need migration
@@ -837,11 +762,21 @@ DUAL_EMBEDDING_ENABLED = os.getenv("DUAL_EMBEDDING_ENABLED", "true").lower() == 
 # v0.2.21 Step 18: resolved via vct-hub with env-fallback (see _config_field
 # above). Hub failure degrades silently to os.getenv.
 ACTIVE_EMBEDDING = _config_field("active_embedding", "ACTIVE_EMBEDDING", "qwen3")
-# OpenAI embedding config (only used when ACTIVE_EMBEDDING=openai or DUAL_EMBEDDING_ENABLED=true)
-OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-# Code embedding service URL (CodeSage-Large-v2 via FastAPI, or Ollama-compatible endpoint)
-CODE_EMBED_SERVICE_URL = os.getenv("CODE_EMBED_SERVICE_URL", "http://localhost:11440")
+# v0.2.75 P3g / M-1 remainder: the pure-getenv embedding config
+# (LEGACY_TEXT_EMBEDDING_MODEL / OPENAI_EMBEDDING_MODEL / OPENAI_API_KEY /
+# CODE_EMBED_SERVICE_URL) DEFINES in ``embeddings`` (the embedding layer);
+# re-exported here so bare ``server.<name>`` reads + test patches on the server
+# object keep working. Imported early (embeddings has no module-level ``server``
+# dependency — its ``server.<name>`` reads are call-time — so this is safe before
+# the late functions-re-export block). Bare-script fallback mirrors that block.
+try:
+    from . import embeddings as _embeddings  # noqa: E402 — package-relative
+except ImportError:
+    import embeddings as _embeddings  # type: ignore  # noqa: E402 — run directly
+LEGACY_TEXT_EMBEDDING_MODEL = _embeddings.LEGACY_TEXT_EMBEDDING_MODEL
+OPENAI_EMBEDDING_MODEL = _embeddings.OPENAI_EMBEDDING_MODEL
+OPENAI_API_KEY = _embeddings.OPENAI_API_KEY
+CODE_EMBED_SERVICE_URL = _embeddings.CODE_EMBED_SERVICE_URL
 
 # Named vector schemes for different collection types.
 # Each scheme maps named-vector names to their dimension count.
@@ -3880,39 +3815,19 @@ del _name
 # allocate_rl_port flow) are read at first use, not at import time.
 # ----------------------------------------------------------------------
 
-# v0.2.42 RT-1: re-key RLClient singleton on active_embedding so a
-# mid-session ACTIVE_EMBEDDING flip (e.g. user switches from qwen3 to
-# arctic2 via the launcher's embedding dropdown) produces a client whose
-# `active_embedding` attribute matches the current env value rather than
-# freezing the value read at import time (which was ACTIVE_EMBEDDING, a
-# module-level constant).  Pre-fix this was a bare None — replacing with
-# a dict keyed by embedding name mirrors F2's telemetry-writer fix.
-_rl_client_instances: dict = {}  # type: ignore[var-annotated]
-# v0.2.40 F2: re-key telemetry writers on (project, embedding_source) so
-# mid-session env changes (ACTIVE_EMBEDDING flip, PROJECT_NAME re-resolution
-# from launcher.db adopt) produce a writer tagged with the CURRENT env
-# rather than freezing first-call values for the MCP subprocess lifetime.
-# Pre-fix this was a single Optional[RLTelemetryWriter] singleton.
-_rl_telemetry_writers: dict = {}  # type: ignore[var-annotated]
-# Kept as None-valued shim for back-compat: tests / external code that
-# directly reset srv._rl_telemetry_writer_instance = None still work
-# (the factory now consults the dict, so the legacy global is a tombstone
-# read-only sentinel — kept to avoid AttributeError in older callers).
-_rl_telemetry_writer_instance = None  # type: ignore[var-annotated]
-# Legacy alias kept so external code that holds a reference to
-# `srv._rl_client_instance` (e.g. older test shims) still resolves a
-# value rather than raising AttributeError.  The dict is the live
-# storage; this is a read-only tombstone.
-_rl_client_instance = None  # type: ignore[var-annotated]
-
-
-# Bound on the per-event node list for STRUCTURAL telemetry. The structural
-# branches already cap their result lists (<= 64); this is a defensive second
-# bound so a future uncapped branch can't balloon the event payload.
-_CODE_STRUCTURE_TELEMETRY_MAX_NODES = 64
-
-
-DUAL_RL_LOG_ENABLED_ENV = "DUAL_RL_LOG_ENABLED"
+# v0.2.75 P3g / M-1 remainder: these caches + tombstones DEFINE in ``rl_state``
+# (imported near the config block above as ``_rl_state``); re-exported here so
+# ``srv._rl_client_instances`` etc. remain the SAME live objects (by-reference
+# for the dicts — every ``rl_client``/test mutation is observed on both).
+# Their rationale (RT-1 client re-key on active_embedding, F2 writer re-key on
+# (project, embedding_source), the two read-only back-compat tombstones) lives
+# beside the definitions in ``rl_state``.
+_rl_client_instances = _rl_state._rl_client_instances  # by-reference (dict)
+_rl_telemetry_writers = _rl_state._rl_telemetry_writers  # by-reference (dict)
+_rl_telemetry_writer_instance = _rl_state._rl_telemetry_writer_instance  # tombstone (None)
+_rl_client_instance = _rl_state._rl_client_instance  # tombstone (None)
+_CODE_STRUCTURE_TELEMETRY_MAX_NODES = _rl_state._CODE_STRUCTURE_TELEMETRY_MAX_NODES
+DUAL_RL_LOG_ENABLED_ENV = _rl_state.DUAL_RL_LOG_ENABLED_ENV
 
 
 async def search_single_collection(collection_name: str, query: str, limit: int, filters=None) -> list:
