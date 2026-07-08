@@ -152,6 +152,9 @@ mkdir -p "$BACKUP_DIR" 2>/dev/null || true
 # haven't been touched in two weeks are almost certainly abandoned;
 # keeping them around just wastes inodes. Errors suppressed: this is a
 # housekeeping pass, not a correctness step.
+# HK-4 (v0.2.75) accepted-scatter: one of 4 per-hook GC sweeps (uniform 14d);
+# a shared sweeper is optional and deliberately SKIPPED to keep hooks
+# single-file. See pre-edit-context-inject.sh for the full rationale.
 find "$SESSION_STATE_DIR" -maxdepth 1 -name 'reads_*.txt' -mtime +14 -delete 2>/dev/null || true
 # v0.2.70 Stream E (SF-1): same 14-day GC for the INJECTOR reads store
 # (seen_reads_*.txt — distinct from the Build-Anchor reads_*.txt above).

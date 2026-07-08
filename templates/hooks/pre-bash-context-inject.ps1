@@ -153,6 +153,10 @@ try {
 } catch { }
 
 # v0.2.29 GC: prune state files older than 1 day.
+# HK-4 (v0.2.75) accepted-scatter: one of 4 per-hook GC sweeps. This one uses
+# a DELIBERATE 1d threshold (bash task state is short-lived) vs the 14d used by
+# the reads/cache/snapshot sweeps -- so it could NOT share a uniform sweeper
+# even if consolidated. Kept per-hook. MUST MATCH the .sh sibling.
 Get-ChildItem -File $StateDir -Filter "bash_task_*.json" -ErrorAction SilentlyContinue |
     Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
     Remove-Item -Force -ErrorAction SilentlyContinue

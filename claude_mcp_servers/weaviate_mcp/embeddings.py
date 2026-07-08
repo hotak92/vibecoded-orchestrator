@@ -306,18 +306,33 @@ async def _get_all_kg_embeddings(text: str) -> dict[str, list[float]]:
                 "falling back to inline gather", e
             )
 
-    # Inline fallback (pre-v0.2.18 path): direct 3-way gather. Reached ONLY
-    # when the EmbeddingService is unavailable (rare on current installs).
-    # The v0.2.71 Piece 5c secondary-slot gate (DUAL_EMBEDDING_WRITE_ALL_SLOTS)
-    # is enforced on the PRIMARY path above (EmbeddingService.embed_text_all_configured);
-    # this degraded fallback keeps the historical "populate every reachable
-    # slot" behaviour. Writing extra slots here is harmless (valid named-vector
-    # writes, never a read break) and only fires when the service is down.
-    qwen3_vec, legacy_vec, openai_vec = await asyncio.gather(
-        server.get_ollama_embedding(text),         # qwen3-embedding (new primary)
-        server.get_legacy_text_embedding(text),     # snowflake-arctic-embed2 (legacy)
-        server.get_openai_embedding(text),
-    )
+    # Inline fallback (pre-v0.2.18 path): direct gather. Reached ONLY when the
+    # EmbeddingService is unavailable (rare on current installs).
+    #
+    # KG-5 (v0.2.75): gate the SECONDARY slots (legacy ollama + openai) on
+    # DUAL_EMBEDDING_WRITE_ALL_SLOTS, exactly like the primary path
+    # (embedding_service.py::embed_text_all_configured, which returns only the
+    # active slot when the toggle is OFF). Pre-KG-5 this degraded fallback
+    # ALWAYS populated every reachable slot, so a project that deliberately
+    # left dual-write OFF still got the secondary slots written whenever the
+    # service happened to be down — an inconsistency with the primary path.
+    # The active slot (qwen3_embed here) is ALWAYS written; only the secondary
+    # fan-out is gated.
+    from vco_lib.embedding_service import _resolve_write_all_slots
+    _write_all = _resolve_write_all_slots()
+
+    if _write_all:
+        qwen3_vec, legacy_vec, openai_vec = await asyncio.gather(
+            server.get_ollama_embedding(text),         # qwen3-embedding (new primary)
+            server.get_legacy_text_embedding(text),     # snowflake-arctic-embed2 (legacy)
+            server.get_openai_embedding(text),
+        )
+    else:
+        # Toggle OFF: only the active slot. Mirrors the primary path's
+        # single-entry return.
+        qwen3_vec = await server.get_ollama_embedding(text)
+        legacy_vec = None
+        openai_vec = None
     vectors: dict[str, list[float]] = {}
     if qwen3_vec:
         vectors["qwen3_embed"] = qwen3_vec

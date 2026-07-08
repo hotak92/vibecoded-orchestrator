@@ -196,6 +196,11 @@ except Exception:
 # v0.2.29 GC: prune state files older than 1 day. bash sessions are
 # short; stale state files are evidence of a post-hook that never
 # fired (crashes, kills, hung commands) — safe to drop.
+# HK-4 (v0.2.75) accepted-scatter: one of 4 per-hook GC sweeps. This one uses
+# a DELIBERATE 1d threshold (bash task state is short-lived) vs the 14d used
+# by the reads/cache/snapshot sweeps — so it could NOT share a single uniform
+# sweeper even if we consolidated. Kept per-hook; consolidation SKIPPED. See
+# pre-edit-context-inject.sh.
 find "$STATE_DIR" -maxdepth 1 -type f -name "bash_task_*.json" -mtime +1 -delete 2>/dev/null || true
 
 # === Resolve venv for rl_kg_search.py subprocess ===

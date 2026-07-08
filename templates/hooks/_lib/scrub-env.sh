@@ -7,13 +7,18 @@
 # hooks (risk R10): adding a new secret env var meant editing 80 files,
 # and a single miss is a credential-leak surface.
 #
-# Two consumers:
-#   1. Hooks that source this lib call `vct_scrub_secret_env` as their
-#      first executable line (secret-free, so safe to do before the
-#      VCT_DISABLE_HOOKS guard).
-#   2. The parity gate (tests/test_scrub_env_parity_v0273.py) asserts every
-#      hook's inline `unset ... GITHUB_TOKEN ...` line covers EXACTLY this
-#      canonical set — so a hook that drifts from the list fails CI.
+# Single consumer:
+#   * The parity gate (tests/test_scrub_env_parity_v0273.py) reads
+#     ``VCT_SCRUB_SECRET_KEYS`` as the canonical set and asserts every hook's
+#     inline `unset ... GITHUB_TOKEN ...` line covers EXACTLY it — so a hook
+#     that drifts from the list fails CI.
+#
+# HK-2 (v0.2.75): the `vct_scrub_secret_env()` HELPER FUNCTION that used to
+# live here was DELETED — it had ZERO callers (every hook carries its own
+# inline `unset ...` line, enforced by the parity gate, so hooks stay
+# dependency-free single files). Keeping a never-called function around was
+# dead code that implied a sourcing contract no hook actually uses. The
+# canonical VALUE below stays; the parity gate is the enforcement.
 #
 # MUST MATCH ``_lib/scrub-env.ps1::$VctScrubSecretKeys`` and the inline
 # unset lists in every templates/hooks/*.sh (enforced by the parity gate).
@@ -23,11 +28,3 @@
 # Canonical list — keep sorted-by-topic, one string, space-separated.
 VCT_SCRUB_SECRET_KEYS="SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY"
 export VCT_SCRUB_SECRET_KEYS
-
-# Unset every canonical secret key in the current shell. Idempotent; never
-# fails (unset of an absent var is a no-op). Safe to call before the
-# VCT_DISABLE_HOOKS guard — it spawns no subprocess and reads no secret.
-vct_scrub_secret_env() {
-    # shellcheck disable=SC2086 — deliberate word-splitting over the list.
-    unset $VCT_SCRUB_SECRET_KEYS 2>/dev/null || true
-}

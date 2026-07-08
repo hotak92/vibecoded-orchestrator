@@ -80,6 +80,9 @@ mkdir -p "$SNAPSHOT_DIR"
 # `ctx_snapshot_session_*`; both are throwaway diff baselines, so the same
 # 14-day sweep applies. It NEVER touches the per-session CONTEXT_STATE
 # content files under .claude/context/ — those may be user-curated.
+# HK-4 (v0.2.75) accepted-scatter: this GC is one of 4 per-hook sweeps
+# (uniform 14d threshold); consolidation into a shared sweeper is optional and
+# deliberately SKIPPED to keep hooks single-file. See pre-edit-context-inject.sh.
 find "$SNAPSHOT_DIR" -maxdepth 1 -type f -name "ctx_snapshot_*" -mtime +14 -delete 2>/dev/null || true
 
 # If compact flag exists, reset baseline. Also reset the Track C per-session

@@ -150,6 +150,11 @@ mkdir -p "$CACHE_BASE" 2>/dev/null || true
 # v0.2.29 GC: prune per-session edit_cache_* directories older than 14 days.
 # `find -mtime +14` is portable across GNU/BSD find. Best-effort — failure
 # ignored. Keeps .claude/state/ bounded across heavy use.
+# HK-4 (v0.2.75) accepted-scatter: GC is intentionally per-hook (4 sites), not
+# a shared sweeper. Thresholds are now UNIFORM (14d here + the reads/snapshot
+# sweeps; bash_task_* is a deliberate 1d), so consolidation is OPTIONAL and
+# deliberately SKIPPED — a shared sweeper would add a sourcing dependency and
+# break the single-file-hook discipline. Each hook GCs its own state files.
 find "$PROJECT_ROOT/.claude/state" -maxdepth 1 -type d -name "edit_cache_*" -mtime +14 -exec rm -rf {} + 2>/dev/null || true
 CACHE_TTL=600  # 10 minutes in seconds
 

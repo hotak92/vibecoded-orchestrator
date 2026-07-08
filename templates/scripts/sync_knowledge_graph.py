@@ -2499,6 +2499,54 @@ def _classify_sync_target(raw: str) -> Tuple[Path, bool, bool]:
     return file_path, in_knowledge, in_docs
 
 
+def _regen_node_formats_after_full_sync() -> None:
+    """KG-4 (v0.2.75): after a `--all` sync, refresh the
+    `knowledge/.node_formats.json` sidecar so retrieval summaries don't stay
+    stale until the next install/per-edit fire.
+
+    The sidecar (descriptions + summaries surfaced by auto-tier retrieval) is
+    written by `generate_node_formats.py` at install time and by the
+    per-edit `generate-kg-summary.py` hook — but a bare `kg-sync --all` never
+    touched it (grep 0), so a bulk resync left every node's summary stale.
+    This calls the SAME install-time machinery as a capped, soft-fail
+    post-sync step: any error (no generator, no summary backend, timeout) is
+    swallowed with a log line — a summary refresh must never fail the sync.
+    """
+    import subprocess
+
+    gen = PROJECT_ROOT / "claude_mcp_servers" / "scripts" / "generate_node_formats.py"
+    if not gen.is_file():
+        # Materialized-project layout: the per-edit generator lives under
+        # .claude/scripts/. If neither exists, silently skip (nothing to do).
+        alt = PROJECT_ROOT / ".claude" / "scripts" / "generate-kg-summary.py"
+        if not alt.is_file():
+            return
+        gen = alt
+    try:
+        # Cap the whole regen so a slow/hung summary backend can't wedge the
+        # sync exit. --all over a large KG can be slow but is bounded here.
+        py = sys.executable or "python3"
+        print("📝 Refreshing .node_formats.json summaries (KG-4, soft-fail) ...")
+        proc = subprocess.run(
+            [py, str(gen), "--all"],
+            cwd=str(PROJECT_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        if proc.returncode != 0:
+            print(
+                "   (node-format refresh exited "
+                f"{proc.returncode}; summaries left as-is — non-fatal)",
+                file=sys.stderr,
+            )
+    except subprocess.TimeoutExpired:
+        print("   (node-format refresh timed out; summaries left as-is — non-fatal)",
+              file=sys.stderr)
+    except Exception as e:  # noqa: BLE001 — soft-fail, never break the sync
+        print(f"   (node-format refresh skipped: {e} — non-fatal)", file=sys.stderr)
+
+
 def main():
     """Main entry point.
 
@@ -2557,6 +2605,9 @@ def main():
             total_fail = kg_fail + doc_fail
             print(f"📊 KG:   {kg_success} succeeded, {kg_fail} failed")
             print(f"📊 Docs: {doc_success} succeeded, {doc_fail} failed")
+            # KG-4 (v0.2.75): refresh the .node_formats.json summaries after a
+            # full resync (soft-fail — never changes the sync exit code).
+            _regen_node_formats_after_full_sync()
             sys.exit(0 if total_fail == 0 else 1)
         elif sys.argv[1] == "--all-docs":
             doc_success, doc_fail = sync_all_docs(server)

@@ -73,6 +73,14 @@ class _FakeFilter:
     def by_property(name: str) -> _FakeByProperty:
         return _FakeByProperty(name)
 
+    @staticmethod
+    def any_of(predicates) -> _FakePredicate:
+        # C-7 (v0.2.75): OR of the given predicates (matches the real
+        # weaviate Filter.any_of). Used by the delete filter to match both
+        # POSIX + backslash file_path spellings.
+        preds = list(predicates)
+        return _FakePredicate(lambda p: any(pr.matches(p) for pr in preds))
+
 
 # ---------------------------------------------------------------------------
 # Fake Weaviate collection / client
@@ -89,7 +97,10 @@ class _FakeQuery:
     def __init__(self, coll: "_FakeCollection"):
         self._coll = coll
 
-    def fetch_objects(self, filters=None, limit=100):
+    def fetch_objects(self, filters=None, limit=100, offset=0):
+        # C-7 (v0.2.75): the delete path now PAGES with offset — honor it so
+        # the paging loop terminates (a fake ignoring offset would loop until
+        # its defensive bound).
         objs = [
             o for o in self._coll.objects
             if filters is None or filters.matches(o.properties)
@@ -99,7 +110,8 @@ class _FakeQuery:
             pass
 
         resp = _Resp()
-        resp.objects = objs[:limit]
+        start = offset or 0
+        resp.objects = objs[start:start + limit]
         return resp
 
 

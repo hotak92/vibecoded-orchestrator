@@ -117,6 +117,9 @@ New-Item -ItemType Directory -Force -Path $BackupDir -ErrorAction SilentlyContin
 # haven't been touched in two weeks are almost certainly abandoned;
 # keeping them around just wastes inodes. Errors suppressed: housekeeping
 # pass, not a correctness step.
+# HK-4 (v0.2.75) accepted-scatter: one of 4 per-hook GC sweeps (uniform 14d);
+# a shared sweeper is optional and deliberately SKIPPED to keep hooks
+# single-file. MUST MATCH the .sh sibling. See pre-edit-context-inject.ps1.
 try {
     Get-ChildItem -Path $SessionStateDir -Filter 'reads_*.txt' -File -ErrorAction SilentlyContinue |
         Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-14) } |

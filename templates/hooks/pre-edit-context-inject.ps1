@@ -121,7 +121,11 @@ if ($SessionId -and $SessionId -ne "default") {
 $CacheBase = Join-Path $ProjectRoot ".claude/state/edit_cache_$SessionId"
 New-Item -ItemType Directory -Force -Path $CacheBase -ErrorAction SilentlyContinue | Out-Null
 # v0.2.29 GC: prune per-session edit_cache_* directories older than 14 days.
-# Keeps .claude/state/ bounded across heavy use. Best-effort — failures ignored.
+# Keeps .claude/state/ bounded across heavy use. Best-effort -- failures ignored.
+# HK-4 (v0.2.75) accepted-scatter: GC is per-hook (4 sites), not a shared
+# sweeper. Thresholds are uniform (14d here + the reads/snapshot sweeps;
+# bash_task_* is a deliberate 1d), so consolidation is optional and
+# deliberately SKIPPED to keep hooks single-file. MUST MATCH the .sh sibling.
 Get-ChildItem -Directory (Join-Path $ProjectRoot ".claude/state") -Filter "edit_cache_*" -ErrorAction SilentlyContinue |
     Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-14) } |
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue

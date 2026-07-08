@@ -5114,12 +5114,25 @@ async def _hybrid_search_body(
     # its own per-collection error classification below — a schema-missing
     # shared class is skipped, while an instance-level unreachable/auth
     # error bubbles (post-gather, after cache reset).
-    _coll_results = await asyncio.gather(
-        *[
-            _hybrid_search_single_collection(
+    # NEW-4 (v0.2.75): bound the fan-out concurrency. KG-1 made this a
+    # concurrent gather (fine at 3-6 collections), but a wide
+    # VCT_KG_ACCESS_LIST fans N concurrent Weaviate queries — enough to
+    # saturate connections / thread pool on a large access matrix. A
+    # Semaphore(4) caps in-flight collection queries while keeping the
+    # latency win for the common 3-6 case (all fit under the limit, so no
+    # serialization there).
+    _fanout_sem = asyncio.Semaphore(4)
+
+    async def _bounded_single_collection(coll_name: str):
+        async with _fanout_sem:
+            return await _hybrid_search_single_collection(
                 coll_name, query, fetch_limit, weaviate_filter, date_filter,
                 include_stale=include_stale,
             )
+
+    _coll_results = await asyncio.gather(
+        *[
+            _bounded_single_collection(coll_name)
             for coll_name in collections_to_search
         ],
         return_exceptions=True,
@@ -5815,6 +5828,17 @@ async def store_knowledge_node(
                     )
             # rel_file_path stays as file_path for relative inputs (already correct)
 
+        # C-7 (v0.2.75): normalize the STORED spelling to canonical POSIX
+        # (forward-slash) at WRITE, and match BOTH spellings at DELETE. A node
+        # written on Windows could land in Weaviate with a backslash
+        # `knowledge\concepts\foo.md` while a later POSIX write derives
+        # `knowledge/concepts/foo.md`; the exact-equal delete below then missed
+        # the drifted old rows, stranding duplicates that surface as repeated
+        # retrieval hits. `rel_file_path` is normalized here so `properties[...]`
+        # (built below) stores the canonical form going forward.
+        if rel_file_path:
+            rel_file_path = rel_file_path.replace("\\", "/")
+
         # Locate existing rows for THIS node (v0.2.73 D-1): scope the match to
         # `title AND file_path`, mirroring sync_knowledge_graph.py's
         # `_delete_node_by_file_path` (the v0.2.70 P1 fix). Title is NOT unique
@@ -5823,13 +5847,26 @@ async def store_knowledge_node(
         # removed the OTHER node's rows (its .md survived on disk but it
         # vanished from retrieval until a full kg-sync --all). When
         # rel_file_path is somehow empty (defensive; _normalize_kg_file_path
-        # auto-derives one), fall back to the legacy title-only match rather
-        # than deleting nothing and accumulating duplicate rows.
+        # auto-derives one), fall back to the legacy title-only match (the
+        # ratified C-7 fallback: better a title-only cleanup than deleting
+        # nothing and accumulating duplicate rows).
         _delete_filter = Filter.by_property("title").equal(title)
         if rel_file_path:
-            _delete_filter = _delete_filter & Filter.by_property(
-                "file_path"
-            ).equal(rel_file_path)
+            # C-7: match BOTH the canonical POSIX spelling AND the backslash
+            # variant so a Windows-written old row (or any separator drift) is
+            # still reconciled. Use an OR of two EXACT `.equal()` filters (not
+            # `contains_any`, which is token-based and would not match a full
+            # path string exactly) — `.equal()` is the established exact-match
+            # pattern for file_path (sync_knowledge_graph.py uses it too).
+            _backslash_variant = rel_file_path.replace("/", "\\")
+            if _backslash_variant != rel_file_path:
+                _path_filter = Filter.any_of([
+                    Filter.by_property("file_path").equal(rel_file_path),
+                    Filter.by_property("file_path").equal(_backslash_variant),
+                ])
+            else:
+                _path_filter = Filter.by_property("file_path").equal(rel_file_path)
+            _delete_filter = _delete_filter & _path_filter
         # v0.2.73 D-2: collect the stale row ids NOW (before any insert, so the
         # scoped filter can't match the fresh rows) but do NOT delete yet.
         # Pre-D-2 the delete ran here — BEFORE embeddings were fetched — so a
@@ -5841,11 +5878,27 @@ async def store_knowledge_node(
         # temporary duplicate rows (old + partial new), which the next
         # successful upsert or kg-sync cleans up — strictly better than data
         # loss.
-        existing = collection.query.fetch_objects(
-            filters=_delete_filter,
-            limit=100
-        )
-        _stale_uuids = [obj.uuid for obj in existing.objects]
+        # C-7: loop past limit=100 — a heavily-chunked node (or accumulated
+        # drift) can exceed 100 rows; a single fetch capped at 100 would leave
+        # the overflow stranded. Page until a short batch returns.
+        _stale_uuids = []
+        _fetch_offset = 0
+        _FETCH_PAGE = 100
+        while True:
+            _batch = collection.query.fetch_objects(
+                filters=_delete_filter,
+                limit=_FETCH_PAGE,
+                offset=_fetch_offset,
+            )
+            _batch_objs = _batch.objects
+            _stale_uuids.extend(obj.uuid for obj in _batch_objs)
+            if len(_batch_objs) < _FETCH_PAGE:
+                break
+            _fetch_offset += _FETCH_PAGE
+            # Defensive bound: never page forever (corrupt cursor / duplicate
+            # rows) — 50 pages = 5000 rows is far past any real node.
+            if _fetch_offset >= 50 * _FETCH_PAGE:
+                break
 
         now = datetime.now(timezone.utc).isoformat()
 

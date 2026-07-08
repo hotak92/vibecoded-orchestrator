@@ -15,6 +15,12 @@ $VctScrubSecretKeys = @(
     'VERCEL_TOKEN', 'CLAUDE_API_KEY'
 )
 
+# HK-2 (v0.2.75) NOTE: unlike the .sh sibling's `vct_scrub_secret_env` (which
+# had ZERO callers and was deleted), this PowerShell helper is LIVE -- it is
+# sourced + called by session-start-retrieval-health.ps1, kg-sync-on-edit.ps1,
+# and session-start-deferral-surface.ps1. So it stays. (The two siblings
+# intentionally diverge here: bash hooks all inline their scrub, but these
+# three .ps1 hooks delegate to this function.)
 function Invoke-VctScrubSecretEnv {
     foreach ($k in $VctScrubSecretKeys) {
         Remove-Item -Path ("Env:" + $k) -ErrorAction SilentlyContinue

@@ -82,6 +82,9 @@ if (-not (Test-Path $SnapshotDir)) {
 # Track C per-session baseline `ctx_snapshot_session_*` (both throwaway diff
 # baselines); it NEVER touches the per-session CONTEXT_STATE content files
 # under .claude/context/.
+# HK-4 (v0.2.75) accepted-scatter: one of 4 per-hook GC sweeps (uniform 14d);
+# a shared sweeper is optional and deliberately SKIPPED to keep hooks
+# single-file. MUST MATCH the .sh sibling. See pre-edit-context-inject.ps1.
 try {
     $GcCutoff = (Get-Date).AddDays(-14)
     Get-ChildItem -Path $SnapshotDir -Filter "ctx_snapshot_*" -File -ErrorAction SilentlyContinue |
