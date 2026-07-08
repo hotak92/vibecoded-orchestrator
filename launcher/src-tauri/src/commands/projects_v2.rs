@@ -389,6 +389,60 @@ pub async fn create_project_v2(
     let slug = db.generate_unique_slug(&req.name)?;
     let row = db.insert_project(&id, &req.name, &req.folder_path, req.host.clone(), &slug)?;
 
+    // ── A2.2 (v0.2.75): claim the setup row IMMEDIATELY after insert ─────
+    //
+    // Before this, the `project_setups` PENDING row was only written ~200
+    // lines below, right before the detached spawn. A launcher crash in that
+    // window (env writes, populate, B12 repair) stranded a project with NO
+    // setup row: the boot-resume sweep (`resume_pending_setups`, which
+    // re-spawns every `pending` row) never saw it, so the heavy phase
+    // (bootstrap + bundle + post-bundle) never ran on the next session and the
+    // project sat half-initialised. Writing the PENDING row here closes the
+    // window — a crash after this point leaves a resumable `pending` row, and
+    // the sweep's `create_setup_phases` re-run is idempotent by construction
+    // (bootstrap is an UPSERT, install-bundle is manifest-driven, post-bundle
+    // steps are idempotent UPSERTs).
+    //
+    // F7 re-entrancy is preserved: the ONLY caller that shares `row.id` with a
+    // concurrent op is the add-then-immediately-update path (a fresh create
+    // always has a brand-new UUID, and a truly concurrent second add of the
+    // SAME folder is already refused earlier by the folder_path UNIQUE
+    // constraint at `insert_project`). We still check for a pre-existing
+    // in-flight row here (defensive — normally None for a fresh id) and, if one
+    // exists, refuse to claim/spawn rather than clobber it. Everything between
+    // this point and the spawn below is synchronous (NO `.await`), so no other
+    // task can interleave and flip the row we just claimed.
+    let setup_now = chrono::Utc::now().timestamp_millis();
+    let pre_existing_setup = db.get_project_setup(&row.id).ok().flatten();
+    let setup_already_in_flight = crate::commands::project_setup::setup_in_flight_should_refuse(
+        pre_existing_setup.as_ref().map(|r| r.status.as_str()),
+        pre_existing_setup.as_ref().and_then(|r| r.started_at),
+        setup_now,
+        6 * 60 * 60 * 1000,
+    );
+    if !setup_already_in_flight {
+        // Claim the lock + give boot-resume a row to recover. Idempotent UPSERT;
+        // a DB error is non-fatal (the project row is already committed, and the
+        // pre-spawn re-affirm below plus the task's own running-row UPSERT still
+        // drive the setup — we only lose the crash-window recovery guarantee).
+        if let Err(e) = db.upsert_project_setup(
+            &row.id,
+            crate::db::project_setups::status::PENDING,
+            None,
+            Some(setup_now),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ) {
+            eprintln!(
+                "[vct] warning: could not claim early project-setup row for {}: {}",
+                row.id, e
+            );
+        }
+    }
+
     // Bug 23 + 30: write per-project env files for every Claude Code
     // surface — Claude Code CLI (via `.claude/env`, sourced by
     // tools/claude wrapper or user shell rc) AND the canonical
@@ -554,39 +608,35 @@ pub async fn create_project_v2(
     // and carries deferral / preserved-files warnings on its terminal event
     // (F5) so the user never loses the inline toasts they used to see.
     //
-    // Re-entrancy lock (F7): the row IS the lock. We insert a `pending`
-    // `project_setups` row FIRST (so the banner can render an immediate
-    // "queued" state and a concurrent add for the same project is refused),
-    // re-check the in-flight guard, then spawn. A spawn never blocks; the
-    // command returns FAST (hundreds of ms) right after this.
-    let now = chrono::Utc::now().timestamp_millis();
-    let existing_setup = db.get_project_setup(&row.id).ok().flatten();
-    let already_running = crate::commands::project_setup::setup_in_flight_should_refuse(
-        existing_setup.as_ref().map(|r| r.status.as_str()),
-        existing_setup.as_ref().and_then(|r| r.started_at),
-        now,
-        // 6h live window mirrors the module-install backstop shape. A fresh
-        // create can't realistically collide here (the row didn't exist a
-        // moment ago) but add-then-immediately-update on the same project
-        // would — F7 covers that. The constant lives in `project_setup`.
-        6 * 60 * 60 * 1000,
-    );
-    if already_running {
-        // A setup is already in flight for this project_id (e.g. a rapid
-        // double-add of the same folder). Don't spawn a second task — the
-        // first one owns the row + banner. Surface a soft warning so the
-        // caller's toast stream isn't silent. The project row itself is
-        // already committed above, so the user still gets their ProjectView.
+    // Re-entrancy lock (F7): the row IS the lock. A2.2 (v0.2.75) moved the
+    // PENDING claim to IMMEDIATELY after `insert_project` (above) so a crash in
+    // the synchronous phase leaves a resumable row for the boot-resume sweep.
+    // The spawn decision was therefore ALREADY made up there (`setup_already_in_
+    // flight` = a PRE-EXISTING in-flight row for this id, before we claimed it).
+    // We do NOT re-read `get_project_setup` here — it would now see our OWN
+    // just-claimed PENDING row and wrongly refuse to spawn. The whole span from
+    // the claim to this point is synchronous (no `.await`), so nothing could
+    // have flipped the row concurrently.
+    if setup_already_in_flight {
+        // A setup was already in flight for this project_id BEFORE this add
+        // (e.g. an add-then-immediately-update on the same id). Don't spawn a
+        // second task — the first one owns the row + banner. Surface a soft
+        // warning so the caller's toast stream isn't silent. The project row
+        // itself is already committed above, so the user still gets their
+        // ProjectView.
         warnings.push(format!(
             "Setup for {:?} is already in progress — not starting a second one. \
              Watch the progress banner; it will finish in the background.",
             req.name
         ));
     } else {
-        // Queue the PENDING row first (idempotent UPSERT). A DB error here
-        // is non-fatal: we still spawn (the task will UPSERT its own running
-        // row), but the boot-resume gate won't see a pending row to recover
-        // if the launcher crashes in the microsecond window before spawn.
+        // Re-affirm the PENDING status right before spawn (idempotent UPSERT,
+        // refreshes started_at). The row was already claimed after insert; this
+        // keeps the banner's "queued" timestamp fresh and is a no-op-equivalent
+        // status update. A DB error here is non-fatal: the early claim already
+        // gave boot-resume a row, and the spawned task UPSERTs its own running
+        // row.
+        let now = chrono::Utc::now().timestamp_millis();
         if let Err(e) = db.upsert_project_setup(
             &row.id,
             crate::db::project_setups::status::PENDING,
@@ -599,7 +649,7 @@ pub async fn create_project_v2(
             None,
         ) {
             eprintln!(
-                "[vct] warning: could not queue project-setup row for {}: {}",
+                "[vct] warning: could not re-affirm project-setup row for {}: {}",
                 row.id, e
             );
         }

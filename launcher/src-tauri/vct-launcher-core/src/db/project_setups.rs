@@ -403,6 +403,65 @@ mod tests {
     }
 
     #[test]
+    fn a2_2_early_claimed_setup_is_resumable_after_crash_in_sync_phase() {
+        // A2.2 (v0.2.75): `create_project_v2` now claims a PENDING
+        // `project_setups` row IMMEDIATELY after `insert_project`, BEFORE the
+        // synchronous env/populate/B12 phase. This models a launcher crash in
+        // that phase: the project row + a PENDING setup row exist, but the
+        // heavy phase (bootstrap/bundle/post-bundle) never ran. The boot-resume
+        // sweep (`resume_pending_setups`) iterates `list_pending_project_setups`
+        // and re-spawns each, so the setup MUST be discoverable as pending.
+        //
+        // ACT: the setup row exists immediately after insert (before any phase).
+        let (db, pid) = fresh_db_with_project();
+        db.upsert_project_setup(
+            &pid,
+            status::PENDING,
+            None,          // phase: none — the heavy phase never started
+            Some(1000),    // started_at
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let row = db.get_project_setup(&pid).unwrap().expect("early claim row");
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.phase, None, "no phase should have run before the crash");
+        assert_eq!(row.finished_at, None);
+
+        // SWEEP: the crash-window row is picked up by the boot-resume list.
+        let pending = db.list_pending_project_setups().unwrap();
+        assert!(
+            pending.contains(&pid),
+            "an early-claimed setup that crashed before any phase must be \
+             resumable via list_pending_project_setups; got {:?}",
+            pending
+        );
+
+        // Idempotent re-affirm (the pre-spawn UPSERT) keeps it pending — it must
+        // NOT flip out of the resumable state.
+        db.upsert_project_setup(
+            &pid,
+            status::PENDING,
+            None,
+            Some(2000),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            db.list_pending_project_setups().unwrap().contains(&pid),
+            "re-affirming PENDING must keep the row resumable"
+        );
+    }
+
+    #[test]
     fn list_incomplete_returns_pending_and_running_only() {
         let (db, ids) = fresh_db_with_mixed_setup_states();
         let mut incomplete = db.list_incomplete_project_setups().unwrap();

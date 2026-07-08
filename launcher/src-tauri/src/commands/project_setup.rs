@@ -615,6 +615,40 @@ mod tests {
     }
 
     #[test]
+    fn a2_2_pre_existing_inflight_row_refuses_second_claim_and_absence_allows() {
+        // A2.2 (v0.2.75): `create_project_v2` now checks this guard against any
+        // PRE-EXISTING setup row BEFORE claiming PENDING right after insert.
+        //
+        // LEAVE-ALONE (F7): a second add sharing the id whose setup is already
+        // in flight (pending, or running within the window) must be refused —
+        // the early claim must never clobber a live setup.
+        assert!(
+            setup_in_flight_should_refuse(
+                Some(setup_status::PENDING),
+                Some(1_000),
+                2_000,
+                SETUP_LIVE_WINDOW_MS,
+            ),
+            "a pre-existing pending row must refuse a second concurrent claim"
+        );
+        assert!(
+            setup_in_flight_should_refuse(
+                Some(setup_status::RUNNING),
+                Some(1_000),
+                2_000,
+                SETUP_LIVE_WINDOW_MS,
+            ),
+            "a pre-existing running (in-window) row must refuse a second claim"
+        );
+        // ACT: the normal fresh-create path — no pre-existing row → allowed to
+        // claim + spawn (the common case: a brand-new UUID has no setup row).
+        assert!(
+            !setup_in_flight_should_refuse(None, None, 2_000, SETUP_LIVE_WINDOW_MS),
+            "a fresh create with no pre-existing setup row must be allowed to claim"
+        );
+    }
+
+    #[test]
     fn refuse_running_within_window() {
         // started 1s ago, window 6h → live → refuse.
         assert!(setup_in_flight_should_refuse(
