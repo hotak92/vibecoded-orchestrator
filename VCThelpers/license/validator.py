@@ -46,6 +46,7 @@ import platform
 import subprocess
 import time
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -316,6 +317,40 @@ def _save_cached(result: LicenseResult) -> None:
     CACHE_FILE.write_text(result.to_json())
 
 
+def _expires_at_is_past(expires_at: Optional[str], now: Optional[float] = None) -> bool:
+    """True ONLY when ``expires_at`` parses to a VALID instant in the past.
+
+    E-6 (v0.2.75): consulted inside the offline-grace arm so a cached
+    paid tier is rejected once the license itself has expired. Fail-open
+    by design on everything non-positive:
+
+      * ``None`` / empty — lifetime licenses store no expiry → False.
+      * Malformed strings — a parsing bug must degrade to the pre-fix
+        behaviour (grace applies), never lock a paying user out → False.
+      * Future instants → False.
+
+    Accepts the Lemon Squeezy ISO-8601 shape (``2027-04-18T00:00:00.000Z``)
+    plus any ``datetime.fromisoformat``-parseable string; a trailing
+    ``Z``/``z`` is normalised to ``+00:00`` (pre-3.11 ``fromisoformat``
+    compatibility) and naive datetimes are treated as UTC (LS timestamps
+    are UTC).
+    """
+    if not expires_at:
+        return False
+    raw = expires_at.strip()
+    if not raw:
+        return False
+    candidate = raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    reference = now if now is not None else time.time()
+    return parsed.timestamp() < reference
+
+
 _DEFAULT_VALIDATE_URL = (
     # Default = Supabase project's canonical /validate-tier function URL.
     #
@@ -498,7 +533,9 @@ def validate_license(key: Optional[str] = None) -> LicenseResult:
         3. No key → free tier.
         4. Remote validation → success → cache + return.
         5. Remote failure → check cache age:
-             - within 3-day grace period → return cached tier.
+             - within 3-day grace period → return cached tier, UNLESS the
+               cached ``expires_at`` is a valid PAST instant (E-6, v0.2.75:
+               grace never outlives the license's own expiry) → degrade.
              - beyond grace period → degrade to free tier with clear message.
     """
     tier_override = os.environ.get("VIBECODED_TIER", "").lower()
@@ -521,6 +558,26 @@ def validate_license(key: Optional[str] = None) -> LicenseResult:
     cached = _load_cached()
     now = time.time()
     if cached and cached.last_validated_at and (now - cached.last_validated_at) < GRACE_PERIOD_SECONDS:
+        # E-6 (v0.2.75): the offline-grace window must not outlive the
+        # license itself. A cached result whose stored ``expires_at``
+        # parses to a VALID instant in the past is rejected here even
+        # though the cache is fresh — otherwise a license that expired
+        # yesterday would keep serving its paid tier for up to 3 more
+        # days just because the machine is offline. Conservative ONLY on
+        # a positively-confirmed past date: ``None`` (lifetime licenses)
+        # and malformed strings keep the pre-fix behaviour (fail-open,
+        # grace applies) — see ``_expires_at_is_past``.
+        if _expires_at_is_past(cached.expires_at, now=now):
+            msg = (
+                f"Cached license expired at {cached.expires_at} — offline grace "
+                "does not extend past the license's own expiry. Falling back to "
+                "free tier. Renew at vibecodedtools.it/account, then run "
+                "`vibecoded validate` when online. Free-tier features continue "
+                "to work normally."
+            )
+            _write_status(msg)
+            log.warning(msg)
+            return LicenseResult(tier="free", valid=True, message=msg)
         days_left = int((GRACE_PERIOD_SECONDS - (now - cached.last_validated_at)) // 86400)
         msg = f"License: {cached.tier} (offline, {days_left}d grace remaining)"
         _write_status(msg)

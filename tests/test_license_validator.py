@@ -259,6 +259,70 @@ class TestRemoteValidation:
         assert result.valid is False
         assert "Too many machines." in result.message
 
+    # ── E-6 (v0.2.75): grace honors expires_at ────────────────────────
+
+    def _offline_grace_result(self, v, monkeypatch, expires_at):
+        """Seed a 1-minute-old cached pro result with ``expires_at`` and
+        validate while the network is down (URLError) — the grace arm."""
+        monkeypatch.setenv("VIBECODED_LICENSE_KEY", "GOOD-UUID")
+        cached = v.LicenseResult(
+            tier="pro",
+            valid=True,
+            expires_at=expires_at,
+            last_validated_at=time.time() - 60,
+            message="Validated.",
+        )
+        v._save_cached(cached)
+        with mock.patch.object(
+            urllib.request, "urlopen", side_effect=urllib.error.URLError("offline"),
+        ):
+            return v.validate_license()
+
+    def test_expired_license_in_grace_degrades_to_free(
+        self, fresh_validator, monkeypatch
+    ):
+        """A fresh cache whose license ALREADY expired must not ride the
+        offline grace window — degrade to free with a clear message."""
+        result = self._offline_grace_result(
+            fresh_validator, monkeypatch, "2020-01-01T00:00:00.000Z",
+        )
+        assert result.tier == "free"
+        assert "expired" in result.message.lower()
+
+    def test_unexpired_license_in_grace_keeps_paid_tier(
+        self, fresh_validator, monkeypatch
+    ):
+        """A future expires_at keeps the pre-fix grace behaviour."""
+        result = self._offline_grace_result(
+            fresh_validator, monkeypatch, "2099-01-01T00:00:00.000Z",
+        )
+        assert result.tier == "pro"
+
+    def test_malformed_expires_at_in_grace_keeps_paid_tier(
+        self, fresh_validator, monkeypatch
+    ):
+        """Malformed expiry strings fail OPEN: conservative only on a
+        positively-confirmed VALID past date."""
+        for bad in ("not-a-date", "2027-13-45T99:99:99Z", ""):
+            result = self._offline_grace_result(fresh_validator, monkeypatch, bad)
+            assert result.tier == "pro", f"malformed {bad!r} must not degrade"
+        # None (lifetime license) also keeps grace.
+        result = self._offline_grace_result(fresh_validator, monkeypatch, None)
+        assert result.tier == "pro"
+
+    def test_expires_at_is_past_parses_shapes(self, fresh_validator):
+        """Helper unit matrix: LS Z-suffix shape, offset shape, naive-UTC
+        shape, future, malformed, None."""
+        v = fresh_validator
+        now = time.time()
+        assert v._expires_at_is_past("2020-01-01T00:00:00.000Z", now=now)
+        assert v._expires_at_is_past("2020-01-01T00:00:00+00:00", now=now)
+        assert v._expires_at_is_past("2020-01-01T00:00:00", now=now)
+        assert not v._expires_at_is_past("2099-01-01T00:00:00.000Z", now=now)
+        assert not v._expires_at_is_past("garbage", now=now)
+        assert not v._expires_at_is_past(None, now=now)
+        assert not v._expires_at_is_past("   ", now=now)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Caching, no-network short-circuits
