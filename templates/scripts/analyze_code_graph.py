@@ -1229,6 +1229,45 @@ CODEGRAPH_SKIP_SUFFIXES: tuple = _JS_SKIP_SUFFIXES + _TS_SKIP_SUFFIXES
 #: and vco_lib/codegraph_row_classify.py::TRANSIENT_STATE_MARKER.
 TRANSIENT_STATE_MARKER: str = ".claude/state/"
 
+# CG-5 (v0.2.75 P3d): minified-CONTENT heuristic. The name-suffix denylist
+# (``CODEGRAPH_SKIP_SUFFIXES``) only catches conventionally-named build output
+# (``*.min.js`` …). Vendored / generated files that DON'T carry the suffix
+# (a bundled ``vendor.js``, a generated ``schema.js``, a one-line CSS-in-JS
+# blob) still get walked, and their single-giant-line bodies produce garbage
+# entities that pollute retrieval. This content check skips a file whose lines
+# are pathologically long — the signature of minification — regardless of name.
+# Skip + log ONLY; NEVER deletes existing rows (a genuine long-line first-party
+# file simply isn't re-indexed; the orphan-clear owns deletion).
+_MINIFIED_MAX_LINE_LEN = 2000      # any single line this long → almost certainly minified
+_MINIFIED_MEDIAN_LINE_LEN = 400    # typical hand-written code medians well under 100
+_MINIFIED_MIN_CONTENT_LEN = 4000   # don't judge tiny files (a short dense config is fine)
+
+
+def _is_minified_content(content: str) -> bool:
+    """True when ``content`` looks machine-minified (skip it at walk time).
+
+    Heuristic (conservative — errs toward KEEPING first-party code):
+      * only judged for non-trivial files (>= ``_MINIFIED_MIN_CONTENT_LEN``);
+      * flagged when the MAX line length is huge (a bundler's single-line output)
+        OR the MEDIAN line length is far above what hand-written code produces.
+    Empty / short / unreadable content → False (never skip on uncertainty).
+    """
+    if not content or len(content) < _MINIFIED_MIN_CONTENT_LEN:
+        return False
+    try:
+        lines = content.split("\n")
+        lengths = [len(ln) for ln in lines]
+        if not lengths:
+            return False
+        max_len = max(lengths)
+        if max_len >= _MINIFIED_MAX_LINE_LEN:
+            return True
+        srt = sorted(lengths)
+        median = srt[len(srt) // 2]
+        return median >= _MINIFIED_MEDIAN_LINE_LEN
+    except Exception:  # noqa: BLE001 — a heuristic must never crash the walk
+        return False
+
 # Dispatch-name → `_ignore_dirs_for` language key. The walkers use short
 # keys ('js'/'ts'); the dispatch table uses long names. Identity for
 # everything not listed. MUST MATCH the `_ignore_dirs_for(...)` argument each
@@ -4515,10 +4554,86 @@ class CodeGraphAnalyzer:
                 extra_props=_extra,
                 log_prefix="stale-chunk cleanup",
             )
+            # C-13 (v0.2.75 P3a): the SURVIVING chunk rows (0..min-1) keep their
+            # OLD `total_chunks` — it's deliberately excluded from the content
+            # hash (:179-203 rationale), so a shrink hash-skips them and they
+            # still claim the pre-shrink count. That's cosmetic (the tail rows
+            # ARE gone) but the collapse/tier code reads `total_chunks`. Patch it
+            # to the NEW total (== `min_chunk_num`, the count of survivors) with a
+            # point-`update` — a METADATA patch, NEVER a re-embed (no vector, no
+            # body touched). Only survivors whose stored value differs are
+            # updated (idempotent; a converged entity does zero writes).
+            self._patch_survivor_total_chunks(
+                collection, _target, _fp, current_source or "", _min,
+            )
         except Exception as exc:  # noqa: BLE001 — cleanup must never fail a write
             print(
                 f"⚠️  stale-chunk cleanup failed for {full_name} "
                 f"(chunk_num >= {min_chunk_num}): {exc}",
+                file=sys.stderr,
+            )
+
+    def _patch_survivor_total_chunks(
+        self, collection, full_name: str, file_path_rel: str,
+        current_source: str, new_total: int,
+    ) -> None:
+        """C-13 (v0.2.75 P3a): stamp the post-shrink ``total_chunks`` on the
+        surviving chunk rows of ONE entity (chunk_num < new_total).
+
+        Metadata-only ``data.update`` (never a re-embed — ``total_chunks`` is not
+        a content-hash field, and the vector/body are untouched). Scoped by the
+        entity's full identity (project / project_source / file_path / full_name,
+        all compared in Python — never a tokenized filter) so no sibling entity
+        is touched. Only rows whose stored ``total_chunks`` differs are written
+        (idempotent). Soft-fail per row and overall — a cosmetic patch must never
+        fail the write that triggered it.
+        """
+        if not full_name or new_total < 1:
+            return
+        try:
+            _read = ["full_name", "chunk_num", "total_chunks", "project", "project_source"]
+            if file_path_rel:
+                _read.append("file_path")
+            try:
+                _present = {pr.name for pr in collection.config.get().properties}
+                _read = [p for p in _read if p in _present] or _read
+            except Exception:  # noqa: BLE001 — probe best-effort
+                pass
+            for obj in collection.iterator(return_properties=_read):
+                props = getattr(obj, "properties", None) or {}
+                if (props.get("full_name") or "") != full_name:
+                    continue
+                if self.project_name and (props.get("project") or "") != self.project_name:
+                    continue
+                if current_source and (props.get("project_source") or "") != current_source:
+                    continue
+                if file_path_rel and (props.get("file_path") or "") != file_path_rel:
+                    continue
+                try:
+                    cn = int(props.get("chunk_num"))
+                except (TypeError, ValueError):
+                    continue
+                if cn >= new_total:
+                    continue  # a tail row (should already be deleted) — skip
+                try:
+                    if int(props.get("total_chunks")) == new_total:
+                        continue  # already correct — idempotent no-op
+                except (TypeError, ValueError):
+                    pass  # NULL/non-int stored total → patch it
+                try:
+                    collection.data.update(
+                        uuid=obj.uuid,
+                        properties={"total_chunks": new_total},
+                    )
+                except Exception as exc:  # noqa: BLE001 — per-row soft-fail
+                    print(
+                        f"⚠️  total_chunks patch failed for {full_name} "
+                        f"chunk {cn}: {exc}",
+                        file=sys.stderr,
+                    )
+        except Exception as exc:  # noqa: BLE001 — cosmetic patch, never fatal
+            print(
+                f"⚠️  total_chunks survivor patch failed for {full_name}: {exc}",
                 file=sys.stderr,
             )
 
@@ -6456,6 +6571,17 @@ class CodeGraphAnalyzer:
         stats = {'modules': 0, 'classes': 0, 'functions': 0}
 
         content = file_path.read_text(encoding='utf-8', errors='ignore')
+        # CG-5 (v0.2.75 P3d): skip machine-minified content at walk time (skip +
+        # log; NEVER delete existing rows — the orphan-clear owns deletion). One
+        # home: _is_minified_content. A genuine long-line first-party file simply
+        # isn't re-indexed this run.
+        if _is_minified_content(content):
+            try:
+                _rel_min = file_path.relative_to(repo_root).as_posix()
+            except Exception:  # noqa: BLE001
+                _rel_min = str(file_path)
+            print(f"⏭️  Skipping {_rel_min} (looks minified/generated)")
+            return {'modules': 0, 'classes': 0, 'functions': 0}
         source_lines = content.split('\n')
         loc = len([l for l in source_lines
                    if l.strip() and not l.strip().startswith('//')
@@ -6639,6 +6765,17 @@ class CodeGraphAnalyzer:
         stats = {'modules': 0, 'classes': 0, 'apis': 0}
 
         content = file_path.read_text(encoding='utf-8', errors='ignore')
+        # CG-5 (v0.2.75 P3d): skip machine-minified content at walk time (skip +
+        # log; NEVER delete existing rows — the orphan-clear owns deletion). One
+        # home: _is_minified_content. A genuine long-line first-party file simply
+        # isn't re-indexed this run.
+        if _is_minified_content(content):
+            try:
+                _rel_min = file_path.relative_to(repo_root).as_posix()
+            except Exception:  # noqa: BLE001
+                _rel_min = str(file_path)
+            print(f"⏭️  Skipping {_rel_min} (looks minified/generated)")
+            return {'modules': 0, 'classes': 0, 'functions': 0}
         source_lines = content.split('\n')
         loc = len([l for l in source_lines if l.strip() and not l.strip().startswith('//')])
         file_hash = hashlib.sha256(content.encode()).hexdigest()
@@ -6782,6 +6919,17 @@ class CodeGraphAnalyzer:
         stats = {'modules': 0, 'classes': 0, 'functions': 0, 'apis': 0}
 
         content = file_path.read_text(encoding='utf-8', errors='ignore')
+        # CG-5 (v0.2.75 P3d): skip machine-minified content at walk time (skip +
+        # log; NEVER delete existing rows — the orphan-clear owns deletion). One
+        # home: _is_minified_content. A genuine long-line first-party file simply
+        # isn't re-indexed this run.
+        if _is_minified_content(content):
+            try:
+                _rel_min = file_path.relative_to(repo_root).as_posix()
+            except Exception:  # noqa: BLE001
+                _rel_min = str(file_path)
+            print(f"⏭️  Skipping {_rel_min} (looks minified/generated)")
+            return {'modules': 0, 'classes': 0, 'functions': 0}
         source_lines = content.split('\n')
         loc = len([l for l in source_lines
                    if l.strip() and not l.strip().startswith('//') and not l.strip().startswith('*')])
@@ -7109,6 +7257,17 @@ class CodeGraphAnalyzer:
         stats = {'modules': 0, 'classes': 0, 'functions': 0}
 
         content = file_path.read_text(encoding='utf-8', errors='ignore')
+        # CG-5 (v0.2.75 P3d): skip machine-minified content at walk time (skip +
+        # log; NEVER delete existing rows — the orphan-clear owns deletion). One
+        # home: _is_minified_content. A genuine long-line first-party file simply
+        # isn't re-indexed this run.
+        if _is_minified_content(content):
+            try:
+                _rel_min = file_path.relative_to(repo_root).as_posix()
+            except Exception:  # noqa: BLE001
+                _rel_min = str(file_path)
+            print(f"⏭️  Skipping {_rel_min} (looks minified/generated)")
+            return {'modules': 0, 'classes': 0, 'functions': 0}
         source_lines = content.split('\n')
         loc = len([l for l in source_lines if l.strip() and not l.strip().startswith('--')])
         file_hash = hashlib.sha256(content.encode()).hexdigest()
@@ -7249,6 +7408,17 @@ class CodeGraphAnalyzer:
         stats = {'modules': 0, 'classes': 0, 'functions': 0}
 
         content = file_path.read_text(encoding='utf-8', errors='ignore')
+        # CG-5 (v0.2.75 P3d): skip machine-minified content at walk time (skip +
+        # log; NEVER delete existing rows — the orphan-clear owns deletion). One
+        # home: _is_minified_content. A genuine long-line first-party file simply
+        # isn't re-indexed this run.
+        if _is_minified_content(content):
+            try:
+                _rel_min = file_path.relative_to(repo_root).as_posix()
+            except Exception:  # noqa: BLE001
+                _rel_min = str(file_path)
+            print(f"⏭️  Skipping {_rel_min} (looks minified/generated)")
+            return {'modules': 0, 'classes': 0, 'functions': 0}
         source_lines = content.split('\n')
         loc = len([l for l in source_lines
                    if l.strip() and not l.strip().startswith('//') and not l.strip().startswith('*')])
@@ -7372,6 +7542,17 @@ class CodeGraphAnalyzer:
         stats = {'modules': 0, 'classes': 0, 'functions': 0}
 
         content = file_path.read_text(encoding='utf-8', errors='ignore')
+        # CG-5 (v0.2.75 P3d): skip machine-minified content at walk time (skip +
+        # log; NEVER delete existing rows — the orphan-clear owns deletion). One
+        # home: _is_minified_content. A genuine long-line first-party file simply
+        # isn't re-indexed this run.
+        if _is_minified_content(content):
+            try:
+                _rel_min = file_path.relative_to(repo_root).as_posix()
+            except Exception:  # noqa: BLE001
+                _rel_min = str(file_path)
+            print(f"⏭️  Skipping {_rel_min} (looks minified/generated)")
+            return {'modules': 0, 'classes': 0, 'functions': 0}
         source_lines = content.split('\n')
         loc = len([l for l in source_lines if l.strip() and not l.strip().startswith('//')])
         file_hash = hashlib.sha256(content.encode()).hexdigest()
@@ -7496,6 +7677,17 @@ class CodeGraphAnalyzer:
         stats = {'modules': 0, 'classes': 0, 'functions': 0}
 
         content = file_path.read_text(encoding='utf-8', errors='ignore')
+        # CG-5 (v0.2.75 P3d): skip machine-minified content at walk time (skip +
+        # log; NEVER delete existing rows — the orphan-clear owns deletion). One
+        # home: _is_minified_content. A genuine long-line first-party file simply
+        # isn't re-indexed this run.
+        if _is_minified_content(content):
+            try:
+                _rel_min = file_path.relative_to(repo_root).as_posix()
+            except Exception:  # noqa: BLE001
+                _rel_min = str(file_path)
+            print(f"⏭️  Skipping {_rel_min} (looks minified/generated)")
+            return {'modules': 0, 'classes': 0, 'functions': 0}
         source_lines = content.split('\n')
         loc = len([l for l in source_lines if l.strip() and not l.strip().startswith('//')])
         file_hash = hashlib.sha256(content.encode()).hexdigest()
@@ -7632,6 +7824,17 @@ class CodeGraphAnalyzer:
         stats = {'modules': 0, 'classes': 0, 'functions': 0}
 
         content = file_path.read_text(encoding='utf-8', errors='ignore')
+        # CG-5 (v0.2.75 P3d): skip machine-minified content at walk time (skip +
+        # log; NEVER delete existing rows — the orphan-clear owns deletion). One
+        # home: _is_minified_content. A genuine long-line first-party file simply
+        # isn't re-indexed this run.
+        if _is_minified_content(content):
+            try:
+                _rel_min = file_path.relative_to(repo_root).as_posix()
+            except Exception:  # noqa: BLE001
+                _rel_min = str(file_path)
+            print(f"⏭️  Skipping {_rel_min} (looks minified/generated)")
+            return {'modules': 0, 'classes': 0, 'functions': 0}
         source_lines = content.split('\n')
         loc = len([l for l in source_lines
                    if l.strip() and not l.strip().startswith('//')
@@ -7758,6 +7961,17 @@ class CodeGraphAnalyzer:
         stats = {'modules': 0, 'classes': 0, 'functions': 0}
 
         content = file_path.read_text(encoding='utf-8', errors='ignore')
+        # CG-5 (v0.2.75 P3d): skip machine-minified content at walk time (skip +
+        # log; NEVER delete existing rows — the orphan-clear owns deletion). One
+        # home: _is_minified_content. A genuine long-line first-party file simply
+        # isn't re-indexed this run.
+        if _is_minified_content(content):
+            try:
+                _rel_min = file_path.relative_to(repo_root).as_posix()
+            except Exception:  # noqa: BLE001
+                _rel_min = str(file_path)
+            print(f"⏭️  Skipping {_rel_min} (looks minified/generated)")
+            return {'modules': 0, 'classes': 0, 'functions': 0}
         source_lines = content.split('\n')
         loc = len([l for l in source_lines if l.strip() and not l.strip().startswith('#')])
         file_hash = hashlib.sha256(content.encode()).hexdigest()
@@ -7873,6 +8087,17 @@ class CodeGraphAnalyzer:
         stats = {'modules': 0, 'classes': 0, 'functions': 0}
 
         content = file_path.read_text(encoding='utf-8', errors='ignore')
+        # CG-5 (v0.2.75 P3d): skip machine-minified content at walk time (skip +
+        # log; NEVER delete existing rows — the orphan-clear owns deletion). One
+        # home: _is_minified_content. A genuine long-line first-party file simply
+        # isn't re-indexed this run.
+        if _is_minified_content(content):
+            try:
+                _rel_min = file_path.relative_to(repo_root).as_posix()
+            except Exception:  # noqa: BLE001
+                _rel_min = str(file_path)
+            print(f"⏭️  Skipping {_rel_min} (looks minified/generated)")
+            return {'modules': 0, 'classes': 0, 'functions': 0}
         source_lines = content.split('\n')
         loc = len([l for l in source_lines if l.strip() and not l.strip().startswith('#')])
         file_hash = hashlib.sha256(content.encode()).hexdigest()
@@ -7951,6 +8176,17 @@ class CodeGraphAnalyzer:
 
         # Read file
         content = file_path.read_text(encoding='utf-8', errors='ignore')
+        # CG-5 (v0.2.75 P3d): skip machine-minified content at walk time (skip +
+        # log; NEVER delete existing rows — the orphan-clear owns deletion). One
+        # home: _is_minified_content. A genuine long-line first-party file simply
+        # isn't re-indexed this run.
+        if _is_minified_content(content):
+            try:
+                _rel_min = file_path.relative_to(repo_root).as_posix()
+            except Exception:  # noqa: BLE001
+                _rel_min = str(file_path)
+            print(f"⏭️  Skipping {_rel_min} (looks minified/generated)")
+            return {'modules': 0, 'classes': 0, 'functions': 0}
         source_lines = content.split('\n')
 
         # Parse AST
@@ -9662,6 +9898,17 @@ class CodeGraphAnalyzer:
         stats = {'modules': 0, 'classes': 0, 'functions': 0}
 
         content = file_path.read_text(encoding='utf-8', errors='ignore')
+        # CG-5 (v0.2.75 P3d): skip machine-minified content at walk time (skip +
+        # log; NEVER delete existing rows — the orphan-clear owns deletion). One
+        # home: _is_minified_content. A genuine long-line first-party file simply
+        # isn't re-indexed this run.
+        if _is_minified_content(content):
+            try:
+                _rel_min = file_path.relative_to(repo_root).as_posix()
+            except Exception:  # noqa: BLE001
+                _rel_min = str(file_path)
+            print(f"⏭️  Skipping {_rel_min} (looks minified/generated)")
+            return {'modules': 0, 'classes': 0, 'functions': 0}
         source_lines = content.split('\n')
         loc = len([l for l in source_lines if l.strip()])
         file_hash = hashlib.sha256(content.encode()).hexdigest()
@@ -9777,6 +10024,17 @@ class CodeGraphAnalyzer:
         stats = {'modules': 0, 'classes': 0, 'functions': 0}
 
         content = file_path.read_text(encoding='utf-8', errors='ignore')
+        # CG-5 (v0.2.75 P3d): skip machine-minified content at walk time (skip +
+        # log; NEVER delete existing rows — the orphan-clear owns deletion). One
+        # home: _is_minified_content. A genuine long-line first-party file simply
+        # isn't re-indexed this run.
+        if _is_minified_content(content):
+            try:
+                _rel_min = file_path.relative_to(repo_root).as_posix()
+            except Exception:  # noqa: BLE001
+                _rel_min = str(file_path)
+            print(f"⏭️  Skipping {_rel_min} (looks minified/generated)")
+            return {'modules': 0, 'classes': 0, 'functions': 0}
         source_lines = content.split('\n')
         loc = len([l for l in source_lines
                    if l.strip() and not l.strip().startswith('#')])

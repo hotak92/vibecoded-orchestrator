@@ -17,7 +17,7 @@ Environment variables:
   CODE_EMBED_DTYPE        "float32" | "bfloat16" | "float16"  (default: "bfloat16", gpu backend only)
   CODE_EMBED_PORT         Server port (default: 11440)
   CODE_EMBED_BATCH_SIZE   Max batch size (default: 32)
-  CODE_EMBED_MAX_CONCURRENT  Max queued requests before 503 (default: 4)
+  CODE_EMBED_MAX_CONCURRENT  Max in-flight requests before shedding with 503 (default: 4)
   OLLAMA_URL              Ollama API URL (default: http://localhost:11435)
   CODE_EMBED_INSTRUCTION  Query instruction prefix (default: "" — CodeSage needs none)
   CODE_EMBED_MAX_SEQ_LEN  Max sequence length (default: model default)
@@ -58,7 +58,7 @@ DEVICE = os.getenv("CODE_EMBED_DEVICE", "auto")
 DTYPE = os.getenv("CODE_EMBED_DTYPE", "bfloat16")
 PORT = int(os.getenv("CODE_EMBED_PORT", "11440"))
 BATCH_SIZE = int(os.getenv("CODE_EMBED_BATCH_SIZE", "32"))
-MAX_CONCURRENT = int(os.getenv("CODE_EMBED_MAX_CONCURRENT", "4"))  # max queued requests
+MAX_CONCURRENT = int(os.getenv("CODE_EMBED_MAX_CONCURRENT", "4"))  # max in-flight requests before shed
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
 INSTRUCTION = os.getenv("CODE_EMBED_INSTRUCTION", "")
 MAX_SEQ_LEN = os.getenv("CODE_EMBED_MAX_SEQ_LEN", "")
@@ -202,9 +202,17 @@ def get_dim() -> int:
 # Concurrency control
 # ---------------------------------------------------------------------------
 # Lock serializes GPU inference (model.encode is not thread-safe on CUDA).
-# Semaphore limits queued requests to prevent OOM under burst load.
+# Semaphore limits concurrent in-flight requests to prevent OOM under burst.
 _inference_lock: asyncio.Lock | None = None
 _request_semaphore: asyncio.Semaphore | None = None
+# C-9 (v0.2.75 P3b): explicit in-flight counter. Previously the code read the
+# semaphore's PRIVATE ``._value`` (CPython-internal, no stability guarantee) to
+# derive "how many are running". An explicit counter incremented/decremented in
+# a try/finally around the semaphore hold is honest, public, and identical
+# across both endpoints — so ``/embed`` and ``/api/embeddings`` shed on the SAME
+# condition (pre-fix ``/api/embeddings`` never shed, so one burst diverged the
+# two endpoints' behaviour) and ``/health`` reports the real number.
+_in_flight: int = 0
 
 
 def _get_lock() -> asyncio.Lock:
@@ -219,6 +227,14 @@ def _get_semaphore() -> asyncio.Semaphore:
     if _request_semaphore is None:
         _request_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     return _request_semaphore
+
+
+def _should_shed() -> bool:
+    """True when the service is already at capacity (``MAX_CONCURRENT`` requests
+    in flight) — a new request would only queue, so shed it with a 503. ONE home
+    for the load-shed decision, shared by BOTH embed endpoints so they behave
+    identically under burst."""
+    return _in_flight >= MAX_CONCURRENT
 
 
 # ---------------------------------------------------------------------------
@@ -247,28 +263,39 @@ async def embed_endpoint(req: EmbedRequest):
     if len(req.texts) > 256:
         raise HTTPException(status_code=400, detail="max 256 texts per request")
 
-    sem = _get_semaphore()
-    if sem.locked() and sem._value == 0:
+    global _in_flight
+    # C-9: shed at capacity (in-flight == MAX) with an HONEST message — the
+    # service runs inference under a single lock, so an over-cap request would
+    # BLOCK, not queue. Same condition on both endpoints (_should_shed).
+    if _should_shed():
         raise HTTPException(
             status_code=503,
-            detail=f"Too many queued requests (max {MAX_CONCURRENT}). Retry later.",
+            detail=(
+                f"Service at capacity ({MAX_CONCURRENT} request(s) in flight). "
+                "Retry later."
+            ),
         )
 
-    async with sem:
-        t0 = time.time()
-        lock = _get_lock()
-        async with lock:
-            # Run sync inference in thread pool to avoid blocking the event loop,
-            # but the lock ensures only one inference runs at a time.
-            loop = asyncio.get_event_loop()
-            vecs = await loop.run_in_executor(None, embed, req.texts, req.is_query)
-        elapsed = time.time() - t0
+    sem = _get_semaphore()
+    _in_flight += 1
+    try:
+        async with sem:
+            t0 = time.time()
+            lock = _get_lock()
+            async with lock:
+                # Run sync inference in thread pool to avoid blocking the event
+                # loop, but the lock ensures only one inference runs at a time.
+                loop = asyncio.get_event_loop()
+                vecs = await loop.run_in_executor(None, embed, req.texts, req.is_query)
+            elapsed = time.time() - t0
+    finally:
+        _in_flight -= 1
 
     dim = len(vecs[0]) if vecs else 0
     logger.info(
-        "Embedded %d texts in %.2fs (%.0f texts/s) backend=%s queued=%d",
+        "Embedded %d texts in %.2fs (%.0f texts/s) backend=%s in_flight=%d",
         len(req.texts), elapsed, len(req.texts) / elapsed if elapsed > 0 else 0,
-        BACKEND, MAX_CONCURRENT - sem._value,
+        BACKEND, _in_flight,
     )
     return EmbedResponse(
         embeddings=vecs,
@@ -287,14 +314,35 @@ class OllamaEmbedRequest(BaseModel):
 
 @app.post("/api/embeddings")
 async def ollama_compat_endpoint(req: OllamaEmbedRequest):
-    """Ollama-compatible /api/embeddings endpoint for drop-in replacement."""
+    """Ollama-compatible /api/embeddings endpoint for drop-in replacement.
+
+    C-9 (v0.2.75 P3b): this is the endpoint the MCP inline fallback + the CLI
+    raw fallback hit, so it MUST shed under burst identically to ``/embed`` —
+    pre-fix it had no shed at all, so one burst made the two endpoints diverge
+    (``/embed`` 503'd while this one blocked). Shares ``_should_shed`` +
+    ``_in_flight``.
+    """
     if not req.prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
 
-    async with _get_semaphore():
-        async with _get_lock():
-            loop = asyncio.get_event_loop()
-            vecs = await loop.run_in_executor(None, embed, [req.prompt], False)
+    global _in_flight
+    if _should_shed():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Service at capacity ({MAX_CONCURRENT} request(s) in flight). "
+                "Retry later."
+            ),
+        )
+
+    _in_flight += 1
+    try:
+        async with _get_semaphore():
+            async with _get_lock():
+                loop = asyncio.get_event_loop()
+                vecs = await loop.run_in_executor(None, embed, [req.prompt], False)
+    finally:
+        _in_flight -= 1
     return {"embedding": vecs[0]}
 
 
@@ -302,7 +350,6 @@ async def ollama_compat_endpoint(req: OllamaEmbedRequest):
 async def health():
     try:
         dim = get_dim()
-        sem = _get_semaphore()
         return {
             "status": "ok",
             "backend": BACKEND,
@@ -310,7 +357,10 @@ async def health():
             "dim": dim,
             "device": DEVICE,
             "max_concurrent": MAX_CONCURRENT,
-            "queued": MAX_CONCURRENT - sem._value,
+            # C-9: report the REAL in-flight count from the explicit counter
+            # (was ``MAX_CONCURRENT - sem._value`` — a private-API read that
+            # actually meant "in flight", not "queued"; the key was mis-named).
+            "in_flight": _in_flight,
             "inference_busy": _get_lock().locked(),
         }
     except Exception as e:

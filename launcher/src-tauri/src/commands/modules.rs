@@ -399,7 +399,7 @@ fn builtin_catalog_entries(_db: &Db) -> Vec<ModuleCatalogEntry> {
                     OrchestratorComponent {
                         id: "code-graph".into(),
                         name: "Code Graph".into(),
-                        description: "AST analysis with Tree-sitter, optional Joern.".into(),
+                        description: "AST-based code analysis and semantic search.".into(),
                     },
                 ],
             )

@@ -691,7 +691,7 @@ pub async fn sync_project_codegraph_extra_path(
         Some(duration_ms as i64),
         report.files_analyzed as u32,
         None,           // languages: not surfaced by AnalyzerFinalReport here
-        false,          // joern_used: extra-path sync doesn't pass --cfg/--pdg
+        false,          // joern_used: DEPRECATED constant-false (CG-3, v0.2.73)
         None,           // error_message: success path
         None,           // log_tail: not captured for the row-level UI
     ) {
@@ -825,7 +825,7 @@ pub async fn reindex_project_codegraph_after_extras_change(
         Some(duration_ms as i64),
         report.files_analyzed as u32,
         None,           // languages: not surfaced here
-        false,          // joern_used: reindex doesn't pass --cfg/--pdg
+        false,          // joern_used: DEPRECATED constant-false (CG-3, v0.2.73)
         None,
         None,
     ) {

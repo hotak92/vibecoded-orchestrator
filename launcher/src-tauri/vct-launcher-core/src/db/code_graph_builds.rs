@@ -41,6 +41,10 @@ pub struct CodeGraphBuildRow {
     /// JSON array, e.g. `["py","ts"]`. None when no build ran or no
     /// languages were detected.
     pub languages: Option<Vec<String>>,
+    /// DEPRECATED (v0.2.73 CG-3): Joern CFG/PDG extraction was removed (zero
+    /// readers); every write passes `false`. The `joern_used` DB column is
+    /// RETAINED — dropping it needs a schema migration (a later cycle removes
+    /// the column + this field together). Do NOT wire new logic to it.
     pub joern_used: bool,
     pub error_message: Option<String>,
     pub log_tail: Option<String>,

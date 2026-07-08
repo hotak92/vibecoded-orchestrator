@@ -1631,9 +1631,25 @@ def _format_code_result_by_tier(
 
     matched_body = _strip_chunk_header_text(properties.get(body_field, "") or "")
 
+    # R9 (v0.2.75 P3c): a multi-chunk entity shown at a single chunk is a
+    # TRUNCATED view — signal it so the caller knows the body is partial. This
+    # is the peer-row case (chunk_fetcher gated to None by
+    # _self_project_chunk_fetcher for a cross-project hit) and the explicit
+    # single_chunk tier. Cheap one-liner; omitted for genuinely single-chunk
+    # entities (total_chunks <= 1).
+    try:
+        _total_for_note = int(properties.get("total_chunks") or 1)
+    except (TypeError, ValueError):
+        _total_for_note = 1
+
     if tier == "single_chunk" or chunk_fetcher is None:
         out[body_field] = matched_body
         out["chunks_shown"] = 1
+        if _total_for_note > 1:
+            out["note"] = (
+                f"Showing 1 of {_total_for_note} chunks (truncated view). "
+                "Read the source file for the full body."
+            )
         return out
 
     # three_chunks / full → assemble a window of chunks around the hit.
@@ -1670,6 +1686,13 @@ def _format_code_result_by_tier(
         )
         out[body_field] = (header + matched_body) if header else matched_body
         out["chunks_shown"] = 1
+        # R9 (v0.2.75 P3c): the fetcher returned nothing for a multi-chunk
+        # entity → only the matched chunk is shown. Signal the truncation.
+        if total > 1:
+            out["note"] = (
+                f"Showing 1 of {total} chunks (truncated view). "
+                "Read the source file for the full body."
+            )
         return out
 
     assembled = "\n\n".join(

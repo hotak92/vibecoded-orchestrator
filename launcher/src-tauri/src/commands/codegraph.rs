@@ -596,9 +596,6 @@ pub async fn codegraph_set_entity_access_bulk(
 //   3. Otherwise: shell out to `<orchestrator>/.claude/scripts/code-graph-analyze`
 //      capturing stdout+stderr. Tail last 4 KiB into log_tail. Parse
 //      "Files analyzed: N" from stdout.
-//   4. Joern (`--cfg --pdg`) is gated on `VCT_JOERN_AVAILABLE=1` — this
-//      env is set by install.py when the Joern binary is on PATH and
-//      otherwise stays unset. We never assume it's installed.
 //
 // Failure isolation: ANY failure of this background task (analyzer not
 // found, Weaviate down, subprocess crash) is recorded in the row's
@@ -622,13 +619,17 @@ pub struct CodeGraphBuildView {
     pub duration_ms: Option<i64>,
     pub files_analyzed: u32,
     pub languages: Vec<String>,
+    /// DEPRECATED (v0.2.73 CG-3): Joern CFG/PDG extraction was removed (zero
+    /// readers of `cfg_summary` / `data_flow_vars`), so this is CONSTANT FALSE.
+    /// The field + its DB column are RETAINED (dropping the column needs a
+    /// schema bump / migration); a future schema migration removes both. Do NOT
+    /// wire new logic to it — it will never be true.
     pub joern_used: bool,
     pub error_message: Option<String>,
     pub log_tail: Option<String>,
     /// Live phase indicator. Only populated on `running` events emitted
-    /// during the build (e.g. "python", "typescript", "joern-cfg",
-    /// "weaviate-upload"). Always None for stored rows fetched via
-    /// `get_code_graph_build_status`.
+    /// during the build (e.g. "python", "typescript", "weaviate-upload").
+    /// Always None for stored rows fetched via `get_code_graph_build_status`.
     pub current_phase: Option<String>,
 }
 

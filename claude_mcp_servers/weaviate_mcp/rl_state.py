@@ -51,10 +51,21 @@ import os
 # Over-fetch multiplier: fetch this many × limit from Weaviate, pass all to RL
 # server for reranking.
 #
-# v0.2.75 P3f: promotable to the ``KG_OVERFETCH_MULTIPLIER`` env — see the
-# server-side re-export site (the env read lives there so the tunable resolves
-# in the server's env context, identical to every other server config read).
-_RL_OVERFETCH = 2
+# v0.2.75 P3f: promoted to the ``KG_OVERFETCH_MULTIPLIER`` env (default 2 — the
+# prior hardcoded value). A malformed / <1 value falls back to the default so a
+# typo can't wedge retrieval into fetching zero candidates.
+def _resolve_overfetch(default: int = 2) -> int:
+    raw = os.getenv("KG_OVERFETCH_MULTIPLIER", "").strip()
+    if not raw:
+        return default
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return val if val >= 1 else default
+
+
+_RL_OVERFETCH = _resolve_overfetch()
 # v0.2.47 RL-6: maximum linked-slot vectors packed per node in the v3
 # retrieval event. Must MATCH `paid-modules/vct-rl-reranker/rl_model.py::MAX_LINKED`
 # (= 5). The container's `_rl_model.update(q_raw, n_raw, linked_raws, n_type_idx)`
