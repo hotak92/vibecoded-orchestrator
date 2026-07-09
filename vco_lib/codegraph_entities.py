@@ -132,13 +132,14 @@ class CodeEntity:
             passed as ``extras['_identity_key']`` because the source token is
             not otherwise a property).
         """
+        # A caller may pin the exact identity string via extras['_identity_key']
+        # (used where the key is not a stored property — the interaction source
+        # token and the module's ``module::<path>`` key).
+        if "_identity_key" in self.extras:
+            return str(self.extras.get("_identity_key", ""))
         if self.kind == KIND_API:
             props = self.extras
             return f"{props.get('endpoint', '')}:{props.get('method', '')}"
-        if self.kind == KIND_INTERACTION:
-            # The interaction identity uses a source token that is not stored as
-            # a property; the caller supplies the exact key via extras.
-            return str(self.extras.get("_identity_key", ""))
         return self.full_name or self.name or ""
 
     # ---- insert_params assembly (byte-identical to the pre-P2f dicts) --------

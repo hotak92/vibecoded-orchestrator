@@ -6584,18 +6584,16 @@ class CodeGraphAnalyzer:
             # V52-O.11.F (Rust). Audit a79152.
             methods = _csharp_methods_for_class(content_clean, cname, source_lines)
             signature = f"class {cname}"
-            insert_params: Dict[str, Any] = {
-                "properties": {
-                    "name": cname, "full_name": f"{ns}.{cname}",
-                    "class_body": class_body, "methods": methods[:20],
-                    "signature": signature, "doc": "",
-                    "start_line": start_line, "end_line": start_line + len(class_lines),
-                    "project": self.project_name,
-                },
-                "references": {"module": module_uuid},
-            }
-            insert_params["_deferred_embed"] = lambda: embed_class(signature, class_body, methods=methods[:10], language="csharp")
-            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
+            self.store_entity(CodeEntity(
+                kind=KIND_CLASS, file_path_rel=relative_path,
+                name=cname, full_name=f"{ns}.{cname}",
+                body=class_body, signature=signature, doc="",
+                start_line=start_line, end_line=start_line + len(class_lines),
+                project=self.project_name,
+                extras={"methods": methods[:20]},
+                references={"module": module_uuid},
+                deferred_embed=lambda: embed_class(signature, class_body, methods=methods[:10], language="csharp"),
+            ))
             stats['classes'] += 1
 
         # Methods
@@ -6613,17 +6611,15 @@ class CodeGraphAnalyzer:
             is_async = bool(re.search(r'\basync\b', body[:200]))
             full_name = f"{ns}.{enclosing}.{mname}"
             signature = f"{mname}(...)"
-            insert_params = {
-                "properties": {
-                    "name": mname, "full_name": full_name,
-                    "function_body": body, "signature": signature,
-                    "doc": "", "start_line": start_line, "end_line": end_line,
-                    "is_async": is_async, "project": self.project_name,
-                },
-                "references": {"module": module_uuid},
-            }
-            insert_params["_deferred_embed"] = lambda: embed_function(signature, body, language="csharp")
-            func_uuid = self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
+            func_uuid = self.store_entity(CodeEntity(
+                kind=KIND_FUNCTION, file_path_rel=relative_path,
+                name=mname, full_name=full_name,
+                body=body, signature=signature, doc="",
+                start_line=start_line, end_line=end_line,
+                is_async=is_async, project=self.project_name,
+                references={"module": module_uuid},
+                deferred_embed=lambda: embed_function(signature, body, language="csharp"),
+            ))
             stats['functions'] += 1
 
             # ASP.NET route entries for HTTP-attributed methods
@@ -6644,18 +6640,17 @@ class CodeGraphAnalyzer:
                 full_route = ctrl_route + ('/' if ctrl_route else '') + route.lstrip('/')
                 api_desc = f"C# ASP.NET {http_method} {full_route} → {ns}.{enclosing}.{mname}"
                 api_embedding = generate_embedding(api_desc)
-                api_params: Dict[str, Any] = {
-                    "properties": {
+                self.store_entity(CodeEntity(
+                    kind=KIND_API, file_path_rel=relative_path,
+                    extras={
                         "endpoint": full_route, "method": http_method,
                         "api_description": api_desc,
                         "parameters": [], "returns": "",
                         "project": self.project_name, "proxy_target": "",
                     },
-                    "references": {"handler": func_uuid},
-                }
-                if api_embedding:
-                    api_params["vector"] = _shape_for_insert(api_embedding)
-                self._dedup_insert(self.apis_collection, api_params, api_params["properties"].get("endpoint", "") + ":" + api_params["properties"].get("method", ""), file_path_rel=relative_path)
+                    references={"handler": func_uuid},
+                    vector=_shape_for_insert(api_embedding) if api_embedding else None,
+                ))
                 stats.setdefault('apis', 0)
                 stats['apis'] += 1
 
@@ -6706,28 +6701,16 @@ class CodeGraphAnalyzer:
         # imports (other .proto files)
         imports = re.findall(r'import\s+["\']([^"\']+)["\']', content)
 
-        # Message types → CodeClass
+        # Message types → CodeClass. This pre-pass only COLLECTS the message
+        # names (used to build the module summary below); the actual CodeClass
+        # store happens in a second `msg_pattern` loop after the module UUID
+        # exists. (Pre-P2f this loop also derived line spans + built a throwaway
+        # ``insert_params`` dict that was discarded — removed; the second loop
+        # re-derives everything it needs.)
         msg_pattern = re.compile(r'^message\s+([\w]+)\s*\{', re.MULTILINE)
-        message_names: List[str] = []
-        for m in msg_pattern.finditer(content_clean):
-            mname = m.group(1)
-            start_line = content_clean[:m.start()].count('\n') + 1
-            end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 30)
-            class_body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
-            signature = f"message {mname}"
-            embedding = generate_embedding(f"Proto message: {mname}\n{class_body[:400]}")
-            insert_params: Dict[str, Any] = {
-                "properties": {
-                    "name": mname, "full_name": f"{pkg}.{mname}",
-                    "class_body": class_body, "methods": [],
-                    "signature": signature, "doc": "",
-                    "start_line": start_line, "end_line": end_line,
-                    "project": self.project_name,
-                },
-                "references": {"module": ""},   # no module UUID yet; filled after
-            }
-            message_names.append(mname)
-            # Store after module creation below
+        message_names: List[str] = [
+            m.group(1) for m in msg_pattern.finditer(content_clean)
+        ]
 
         # Service RPC methods → CodeAPI
         svc_pattern = re.compile(r'^service\s+([\w]+)\s*\{', re.MULTILINE)
@@ -6782,19 +6765,16 @@ class CodeGraphAnalyzer:
             class_body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
             signature = f"message {mname}"
             embedding = generate_embedding(f"Proto message: {mname}\n{class_body[:400]}")
-            insert_params = {
-                "properties": {
-                    "name": mname, "full_name": f"{pkg}.{mname}",
-                    "class_body": class_body, "methods": [],
-                    "signature": signature, "doc": "",
-                    "start_line": start_line, "end_line": end_line,
-                    "project": self.project_name,
-                },
-                "references": {"module": module_uuid},
-            }
-            if embedding:
-                insert_params["vector"] = _shape_for_insert(embedding)
-            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
+            self.store_entity(CodeEntity(
+                kind=KIND_CLASS, file_path_rel=relative_path,
+                name=mname, full_name=f"{pkg}.{mname}",
+                body=class_body, signature=signature, doc="",
+                start_line=start_line, end_line=end_line,
+                project=self.project_name,
+                extras={"methods": []},
+                references={"module": module_uuid},
+                vector=_shape_for_insert(embedding) if embedding else None,
+            ))
             stats['classes'] += 1
 
         # Insert RPC methods as CodeAPI entries (inbound service contract)
@@ -6805,17 +6785,16 @@ class CodeGraphAnalyzer:
                 f"({entry['input']}) → ({entry['output']}) [{pkg}]"
             )
             embedding = generate_embedding(api_desc)
-            api_params: Dict[str, Any] = {
-                "properties": {
+            self.store_entity(CodeEntity(
+                kind=KIND_API, file_path_rel=relative_path,
+                extras={
                     "endpoint": endpoint, "method": "gRPC",
                     "api_description": api_desc,
                     "parameters": [entry['input']], "returns": entry['output'],
                     "project": self.project_name, "proxy_target": "",
                 },
-            }
-            if embedding:
-                api_params["vector"] = _shape_for_insert(embedding)
-            self._dedup_insert(self.apis_collection, api_params, api_params["properties"].get("endpoint", "") + ":" + api_params["properties"].get("method", ""), file_path_rel=relative_path)
+                vector=_shape_for_insert(embedding) if embedding else None,
+            ))
             stats['apis'] += 1
 
         return stats
@@ -7012,22 +6991,20 @@ class CodeGraphAnalyzer:
                 signature += f" extends {base_class}"
 
 
-            insert_params: Dict[str, Any] = {
-                "properties": {
-                    "name": cname,
-                    "full_name": f"{file_path.stem}.{cname}",
-                    "class_body": class_body,
-                    "methods": methods[:20],
-                    "signature": signature,
-                    "doc": "",
-                    "start_line": start_line,
-                    "end_line": start_line + len(class_lines),
-                    "project": self.project_name,
-                },
-                "references": {"module": module_uuid},
-            }
-            insert_params["_deferred_embed"] = lambda: embed_class(signature, class_body, methods=methods[:10], language="javascript")
-            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
+            self.store_entity(CodeEntity(
+                kind=KIND_CLASS, file_path_rel=relative_path,
+                name=cname,
+                full_name=f"{file_path.stem}.{cname}",
+                body=class_body,
+                signature=signature,
+                doc="",
+                start_line=start_line,
+                end_line=start_line + len(class_lines),
+                project=self.project_name,
+                extras={"methods": methods[:20]},
+                references={"module": module_uuid},
+                deferred_embed=lambda: embed_class(signature, class_body, methods=methods[:10], language="javascript"),
+            ))
             stats['classes'] += 1
 
         # --- Store functions ---
@@ -7037,22 +7014,20 @@ class CodeGraphAnalyzer:
             full_name = f"{file_path.stem}.{fname}"
             signature = f"{'async ' if is_async else ''}function {fname}()"
 
-            insert_params = {
-                "properties": {
-                    "name": fname,
-                    "full_name": full_name,
-                    "function_body": body,
-                    "signature": signature,
-                    "doc": "",
-                    "start_line": start_line,
-                    "end_line": end_line,
-                    "is_async": is_async,
-                    "project": self.project_name,
-                },
-                "references": {"module": module_uuid},
-            }
-            insert_params["_deferred_embed"] = lambda: embed_function(signature, body, language="javascript")
-            self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
+            self.store_entity(CodeEntity(
+                kind=KIND_FUNCTION, file_path_rel=relative_path,
+                name=fname,
+                full_name=full_name,
+                body=body,
+                signature=signature,
+                doc="",
+                start_line=start_line,
+                end_line=end_line,
+                is_async=is_async,
+                project=self.project_name,
+                references={"module": module_uuid},
+                deferred_embed=lambda: embed_function(signature, body, language="javascript"),
+            ))
             stats['functions'] += 1
 
         # --- Store Fastify routes as CodeAPI ---
@@ -7079,8 +7054,9 @@ class CodeGraphAnalyzer:
 
             embedding = generate_embedding(description)
 
-            insert_params = {
-                "properties": {
+            self.store_entity(CodeEntity(
+                kind=KIND_API, file_path_rel=relative_path,
+                extras={
                     "endpoint": route['url'],
                     "method": route['method'],
                     "api_description": description,
@@ -7089,10 +7065,8 @@ class CodeGraphAnalyzer:
                     "project": self.project_name,
                     "proxy_target": proxy_target or "",
                 },
-            }
-            if embedding:
-                insert_params["vector"] = _shape_for_insert(embedding)
-            self._dedup_insert(self.apis_collection, insert_params, insert_params["properties"].get("endpoint", "") + ":" + insert_params["properties"].get("method", ""), file_path_rel=relative_path)
+                vector=_shape_for_insert(embedding) if embedding else None,
+            ))
             stats['apis'] += 1
 
         # Cross-language interactions
