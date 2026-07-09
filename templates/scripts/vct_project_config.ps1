@@ -328,12 +328,34 @@ function Get-HubPort {
 #     has NO sane default, so unreadable/absent → "no token" → caller
 #     degrades to hub_unreachable. NEVER throw (the previous
 #     `Get-Content -Raw` had no try/catch — F-8 item #3).
+# v0.2.76 Part 4 — PER-PROJECT TOKEN PREFERENCE (MUST MATCH the bash
+# sibling `vct_project_config.sh::hub_token` and
+# `vco_lib/project_config.py::_project_token`): Get-HubToken accepts an
+# OPTIONAL -ProjectId. When given AND a readable `hub.token.<ProjectId>`
+# exists, that scoped token is returned in preference to the global
+# `hub.token`. `VCT_HUB_TOKEN` still wins over both. Falls back to the
+# global token when no per-project file exists (compat window). The
+# `by-path` lookup passes no id → global token; only the `/config` +
+# `/env` calls pass the resolved id.
 function Get-HubToken {
+    param([string]$ProjectId = '')
     if ($Env:VCT_HUB_TOKEN) {
         $t = $Env:VCT_HUB_TOKEN.Trim()
         if ($t.Length -gt 0) { return $t }
     }
     $stateDir = if ($Env:VCT_STATE_DIR) { $Env:VCT_STATE_DIR } else { Join-Path $HOME ".vct" }
+    if ($ProjectId) {
+        $projFile = Join-Path $stateDir "hub.token.$ProjectId"
+        if (Test-Path $projFile) {
+            try {
+                $rawP = (Get-Content -Raw -Path $projFile -ErrorAction Stop).Trim()
+                if ($rawP.Length -gt 0) { return $rawP }
+            } catch {
+                # Unreadable per-project file → fall through to the global
+                # token (compat), not a hard failure.
+            }
+        }
+    }
     $tokenFile = Join-Path $stateDir "hub.token"
     if (Test-Path $tokenFile) {
         try {
@@ -361,9 +383,12 @@ function Get-HubToken {
 # on PS 5.1 before the cmdlet runs, taking the whole script down with
 # it. The try/catch below covers both modes uniformly.
 function Invoke-Hub {
-    param([string]$PathAndQuery)
+    # v0.2.76 Part 4: optional -ProjectId for a per-project route
+    # (`/config`, `/env`). When set, Get-HubToken prefers the scoped
+    # `hub.token.<id>`. The `by-path` lookup passes no id → global token.
+    param([string]$PathAndQuery, [string]$ProjectId = '')
     $port = Get-HubPort
-    $token = Get-HubToken
+    $token = Get-HubToken -ProjectId $ProjectId
     if ($null -eq $token) {
         return @{ Status = 0; Body = '' }
     }
@@ -503,7 +528,9 @@ function Get-Config {
         $encodedField = [System.Uri]::EscapeDataString($FieldName)
         $pathAndQuery += "?key=$encodedField"
     }
-    $result = Invoke-Hub $pathAndQuery
+    # Per-project route → pass the resolved project id so Get-HubToken
+    # prefers the scoped `hub.token.<id>` (v0.2.76 Part 4).
+    $result = Invoke-Hub -PathAndQuery $pathAndQuery -ProjectId $ProjectId
     if ($null -eq $result) {
         Emit-Warning -ErrorKind "hub_unreachable" -Detail "hub unreachable; is the launcher running?"
         return 1

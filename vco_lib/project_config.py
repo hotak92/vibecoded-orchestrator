@@ -639,10 +639,44 @@ def _invalidate_discovery_cache() -> None:
         _discovery_cache = None
 
 
+def _project_token(project_id: str, global_token: str) -> str:
+    """Resolve the bearer token to present for a PER-PROJECT route.
+
+    v0.2.76 Part 4 — PER-PROJECT TOKEN PREFERENCE (MUST MATCH the bash
+    sibling ``vct_project_config.sh::hub_token`` / ``vct_secrets_resolve.sh``
+    and the ps1 ``Get-HubToken``): prefer the scoped
+    ``<vct_root_dir>/hub.token.<project_id>`` when a readable file exists;
+    otherwise fall back to ``global_token`` (the discovery-resolved
+    ``hub.token``) for the one-release compat window.
+
+    ``VCT_HUB_TOKEN`` (env) already won inside :func:`_discover_hub`, so
+    ``global_token`` carries it when set — a pinned env token therefore
+    still overrides any per-project file, matching the sh/ps1 rule where
+    the env branch returns first. We only look at the per-project file
+    when no env override is in play (i.e. when ``VCT_HUB_TOKEN`` is unset
+    — checked here so a test/dev harness that pins the env keeps a single
+    token across every route, exactly like the shell resolvers).
+
+    Best-effort: an unreadable / absent per-project file falls through to
+    ``global_token``; a read error never raises here (the caller's 401
+    path handles a wrong token).
+    """
+    if os.environ.get("VCT_HUB_TOKEN", "").strip():
+        # Env pin wins over the per-project file (parity with sh/ps1).
+        return global_token
+    proj_file = vct_root_dir() / f"hub.token.{project_id}"
+    try:
+        raw = proj_file.read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError):
+        return global_token
+    return raw or global_token
+
+
 def _get_with_401_retry(
     url_builder: Callable[[int, str], str],
     *,
     params: dict | None = None,
+    project_id: str | None = None,
 ) -> requests.Response:
     """GET a hub URL with one-shot 401 retry-with-cache-invalidation.
 
@@ -652,6 +686,16 @@ def _get_with_401_retry(
     rotation that also moved the port would invalidate the cached URL.
     The closure is invoked twice on retry — once with the (possibly-
     stale) cached discovery, once with the freshly re-read discovery.
+
+    v0.2.76 Part 4 — when ``project_id`` is set (the caller is hitting a
+    per-project route: ``/config`` or ``/env``), the Authorization header
+    carries the PER-PROJECT token (``hub.token.<id>``) in preference to
+    the global ``hub.token`` — see :func:`_project_token`. The
+    ``by-path`` lookup passes ``project_id=None`` (it is not a
+    per-project route) so it keeps using the global token. The
+    ``url_builder`` still receives the discovery token as its second arg
+    (no current builder embeds it in the URL — only the port matters); we
+    override only the header.
 
     Returns the underlying ``requests.Response`` — the caller handles
     status-code dispatch. Wraps ``requests.RequestException`` into
@@ -663,7 +707,8 @@ def _get_with_401_retry(
     """
     port, token = _discover_hub()
     url = url_builder(port, token)
-    headers = {"Authorization": f"Bearer {token}"}
+    bearer = _project_token(project_id, token) if project_id else token
+    headers = {"Authorization": f"Bearer {bearer}"}
     try:
         resp = _http_session().get(
             url,
@@ -680,10 +725,14 @@ def _get_with_401_retry(
     # 401 → likely a stale token from the in-process 5s discovery cache
     # after a hub restart. Invalidate + re-discover + retry once. If
     # the second attempt also 401s, the caller maps it to HubUnreachable.
+    # The per-project token is re-resolved too (its file may have rotated
+    # on the same restart, or vanished → we fall back to the freshly-read
+    # global token, the compat path).
     _invalidate_discovery_cache()
     port, token = _discover_hub()
     url = url_builder(port, token)
-    headers = {"Authorization": f"Bearer {token}"}
+    bearer = _project_token(project_id, token) if project_id else token
+    headers = {"Authorization": f"Bearer {bearer}"}
     try:
         resp = _http_session().get(
             url,
@@ -1115,6 +1164,8 @@ def resolve(project_root: Path | str) -> ProjectConfig:
 
     resp = _get_with_401_retry(
         lambda port, _token: f"http://127.0.0.1:{port}/api/v1/projects/{pid}/config",
+        # Per-project route → prefer the scoped hub.token.<id> (Part 4).
+        project_id=pid,
     )
 
     if resp.status_code == 200:
@@ -1201,6 +1252,8 @@ def resolve_field(
     resp = _get_with_401_retry(
         lambda port, _token: f"http://127.0.0.1:{port}/api/v1/projects/{pid}/config",
         params={"key": key},
+        # Per-project route → prefer the scoped hub.token.<id> (Part 4).
+        project_id=pid,
     )
 
     if resp.status_code == 200:

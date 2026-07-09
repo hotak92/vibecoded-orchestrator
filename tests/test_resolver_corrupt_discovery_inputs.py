@@ -430,5 +430,186 @@ class PythonCorruptDiscoveryTest(unittest.TestCase):
         self.assertIn(KIND_TOKEN_UNREADABLE, stderr, stderr)
 
 
+# ─── v0.2.76 Part 4: per-project token preference (triplet parity) ──────
+#
+# `hub_token`/`Get-HubToken`/`_project_token` must, given the SAME
+# fixtures, behave identically:
+#   * a readable `hub.token.<id>` present → return the SCOPED token;
+#   * absent → fall back to the global `hub.token` (compat window);
+#   * `VCT_HUB_TOKEN` env pinned → wins over BOTH.
+# Same synthetic values across all three so a future divergence fails here.
+
+SCOPED_PROJECT_ID = "proj-parity"
+SCOPED_TOKEN = "scoped-parity-token"
+GLOBAL_TOKEN = "global-parity-token"
+ENV_PIN_TOKEN = "env-pinned-parity-token"
+
+
+class BashProjectTokenParityTest(unittest.TestCase):
+    def _seed(self, state: str, *, scoped: bool) -> None:
+        (Path(state) / "hub.token").write_text(GLOBAL_TOKEN, encoding="utf-8")
+        if scoped:
+            (Path(state) / f"hub.token.{SCOPED_PROJECT_ID}").write_text(
+                SCOPED_TOKEN, encoding="utf-8"
+            )
+
+    def test_bash_prefers_scoped_token(self) -> None:
+        state = _fresh_state_dir()
+        self._seed(state, scoped=True)
+        r = _run_bash_fn(
+            f"hub_token {SCOPED_PROJECT_ID}", env_extra={}, state_dir=state
+        )
+        self.assertEqual(r.returncode, 0, f"stderr={r.stderr!r}")
+        self.assertEqual(r.stdout.strip(), SCOPED_TOKEN, r.stdout)
+
+    def test_bash_falls_back_to_global_when_scoped_absent(self) -> None:
+        state = _fresh_state_dir()
+        self._seed(state, scoped=False)
+        r = _run_bash_fn(
+            f"hub_token {SCOPED_PROJECT_ID}", env_extra={}, state_dir=state
+        )
+        self.assertEqual(r.returncode, 0, f"stderr={r.stderr!r}")
+        self.assertEqual(r.stdout.strip(), GLOBAL_TOKEN, r.stdout)
+
+    def test_bash_no_project_arg_uses_global(self) -> None:
+        # by-path path: hub_token called with NO project id → global.
+        state = _fresh_state_dir()
+        self._seed(state, scoped=True)
+        r = _run_bash_fn("hub_token", env_extra={}, state_dir=state)
+        self.assertEqual(r.returncode, 0, f"stderr={r.stderr!r}")
+        self.assertEqual(r.stdout.strip(), GLOBAL_TOKEN, r.stdout)
+
+    def test_bash_env_pin_wins_over_scoped(self) -> None:
+        state = _fresh_state_dir()
+        self._seed(state, scoped=True)
+        r = _run_bash_fn(
+            f"hub_token {SCOPED_PROJECT_ID}",
+            env_extra={"VCT_HUB_TOKEN": ENV_PIN_TOKEN},
+            state_dir=state,
+        )
+        self.assertEqual(r.returncode, 0, f"stderr={r.stderr!r}")
+        self.assertEqual(r.stdout.strip(), ENV_PIN_TOKEN, r.stdout)
+
+
+@unittest.skipIf(
+    _PWSH is None,
+    "no PowerShell runtime on PATH (pwsh / powershell.exe).",
+)
+class PowerShellProjectTokenParityTest(unittest.TestCase):
+    def _seed(self, state: str, *, scoped: bool) -> None:
+        (Path(state) / "hub.token").write_text(GLOBAL_TOKEN, encoding="utf-8")
+        if scoped:
+            (Path(state) / f"hub.token.{SCOPED_PROJECT_ID}").write_text(
+                SCOPED_TOKEN, encoding="utf-8"
+            )
+
+    def _run(self, fn: str, *, env_extra: dict[str, str], state_dir: str):
+        # Reuse the ps1 driver from PowerShellCorruptDiscoveryTest.
+        return PowerShellCorruptDiscoveryTest._run_ps1_fn(
+            PowerShellCorruptDiscoveryTest(), fn, env_extra=env_extra, state_dir=state_dir
+        )
+
+    def test_ps1_prefers_scoped_token(self) -> None:
+        state = _fresh_state_dir()
+        self._seed(state, scoped=True)
+        r = self._run(
+            f"Get-HubToken -ProjectId {SCOPED_PROJECT_ID}",
+            env_extra={},
+            state_dir=state,
+        )
+        self.assertEqual(r.returncode, 0, f"stderr={r.stderr!r}")
+        self.assertIn(SCOPED_TOKEN, r.stdout, r.stdout)
+        self.assertNotIn(GLOBAL_TOKEN, r.stdout, r.stdout)
+
+    def test_ps1_falls_back_to_global_when_scoped_absent(self) -> None:
+        state = _fresh_state_dir()
+        self._seed(state, scoped=False)
+        r = self._run(
+            f"Get-HubToken -ProjectId {SCOPED_PROJECT_ID}",
+            env_extra={},
+            state_dir=state,
+        )
+        self.assertEqual(r.returncode, 0, f"stderr={r.stderr!r}")
+        self.assertIn(GLOBAL_TOKEN, r.stdout, r.stdout)
+
+    def test_ps1_no_project_arg_uses_global(self) -> None:
+        state = _fresh_state_dir()
+        self._seed(state, scoped=True)
+        r = self._run("Get-HubToken", env_extra={}, state_dir=state)
+        self.assertEqual(r.returncode, 0, f"stderr={r.stderr!r}")
+        self.assertIn(GLOBAL_TOKEN, r.stdout, r.stdout)
+        self.assertNotIn(SCOPED_TOKEN, r.stdout, r.stdout)
+
+    def test_ps1_env_pin_wins_over_scoped(self) -> None:
+        state = _fresh_state_dir()
+        self._seed(state, scoped=True)
+        r = self._run(
+            f"Get-HubToken -ProjectId {SCOPED_PROJECT_ID}",
+            env_extra={"VCT_HUB_TOKEN": ENV_PIN_TOKEN},
+            state_dir=state,
+        )
+        self.assertEqual(r.returncode, 0, f"stderr={r.stderr!r}")
+        self.assertIn(ENV_PIN_TOKEN, r.stdout, r.stdout)
+
+
+class PythonProjectTokenParityTest(unittest.TestCase):
+    """`_project_token` matches the sh/ps1 preference rules."""
+
+    def setUp(self) -> None:
+        from vco_lib import project_config
+
+        self.pc = project_config
+        self.state = _fresh_state_dir()
+        self.pc._test_clear_cache()
+        self._patch = mock.patch.object(
+            self.pc, "vct_root_dir", return_value=Path(self.state)
+        )
+        self._patch.start()
+        self._env_patch = mock.patch.dict(
+            os.environ,
+            {k: v for k, v in os.environ.items() if k != "VCT_HUB_TOKEN"},
+            clear=True,
+        )
+        self._env_patch.start()
+
+    def tearDown(self) -> None:
+        self._env_patch.stop()
+        self._patch.stop()
+        self.pc._test_clear_cache()
+
+    def _seed(self, *, scoped: bool) -> None:
+        (Path(self.state) / "hub.token").write_text(
+            GLOBAL_TOKEN, encoding="utf-8"
+        )
+        if scoped:
+            (Path(self.state) / f"hub.token.{SCOPED_PROJECT_ID}").write_text(
+                SCOPED_TOKEN, encoding="utf-8"
+            )
+
+    def test_py_prefers_scoped_token(self) -> None:
+        self._seed(scoped=True)
+        self.assertEqual(
+            self.pc._project_token(SCOPED_PROJECT_ID, GLOBAL_TOKEN),
+            SCOPED_TOKEN,
+        )
+
+    def test_py_falls_back_to_global_when_scoped_absent(self) -> None:
+        self._seed(scoped=False)
+        self.assertEqual(
+            self.pc._project_token(SCOPED_PROJECT_ID, GLOBAL_TOKEN),
+            GLOBAL_TOKEN,
+        )
+
+    def test_py_env_pin_wins_over_scoped(self) -> None:
+        self._seed(scoped=True)
+        with mock.patch.dict(os.environ, {"VCT_HUB_TOKEN": ENV_PIN_TOKEN}):
+            # _discover_hub would return the env token as `global`; the
+            # per-project file must NOT override it.
+            self.assertEqual(
+                self.pc._project_token(SCOPED_PROJECT_ID, ENV_PIN_TOKEN),
+                ENV_PIN_TOKEN,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -243,6 +243,10 @@ def _hub_get(key: str, project: Optional[str]) -> str:
             f"http://127.0.0.1:{port}/api/v1/projects/{pid}/env"
         ),
         params={"key": key},
+        # v0.2.76 Part 4 — /env is a per-project route; prefer the scoped
+        # hub.token.<id> (falls back to the global hub.token). MUST MATCH
+        # the sh/ps1 secrets resolvers passing the project id to hub_get.
+        project_id=pid,
     )
     if resp.status_code == 200:
         try:

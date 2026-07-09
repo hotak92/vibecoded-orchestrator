@@ -310,12 +310,34 @@ hub_port() {
 #     empty. The token has NO sane default, so an unreadable/absent token
 #     is treated as "no token" → the caller degrades to `hub_unreachable`
 #     (exit 2 in hub_get). NEVER crash on the read failure.
+#
+# v0.2.76 Part 4 — PER-PROJECT TOKEN PREFERENCE (MUST MATCH the ps1
+# sibling `Get-HubToken` and `vco_lib/project_config.py::_project_token`):
+# hub_token accepts an OPTIONAL project id. When given AND a readable
+# `hub.token.<project_id>` file exists, that scoped token is returned in
+# preference to the global `hub.token`. The env `VCT_HUB_TOKEN` still wins
+# over both (tests / dev harnesses pin it). Falls back cleanly to the
+# global token when no per-project file is present (compat window). The
+# `by-path` lookup passes NO project id (it is not a per-project route, so
+# it must use the global token); only the `/config` + `/env` calls pass
+# the resolved id.
 hub_token() {
+    local project_id="${1:-}"
     if [[ -n "${VCT_HUB_TOKEN:-}" ]]; then
         printf '%s' "$VCT_HUB_TOKEN"
         return 0
     fi
     local state_dir="${VCT_STATE_DIR:-$HOME/.vct}"
+    # Prefer the per-project token file when a project id is known and the
+    # scoped file exists + is readable. An unreadable per-project file
+    # falls through to the global token (compat), not a hard failure.
+    if [[ -n "$project_id" ]]; then
+        local proj_file="$state_dir/hub.token.$project_id"
+        if [[ -f "$proj_file" && -r "$proj_file" ]]; then
+            tr -d '[:space:]' < "$proj_file" 2>/dev/null
+            return 0
+        fi
+    fi
     local token_file="$state_dir/hub.token"
     if [[ -f "$token_file" ]]; then
         if [[ ! -r "$token_file" ]]; then
@@ -338,9 +360,13 @@ hub_token() {
 #   exit 2                              on missing token (no hub.token)
 hub_get() {
     local path="$1"
+    # v0.2.76 Part 4: optional 2nd arg = the project id for a per-project
+    # route (`/config`, `/env`). When set, hub_token prefers the scoped
+    # `hub.token.<id>`. The `by-path` lookup passes no id → global token.
+    local project_id="${2:-}"
     local port token
     port=$(hub_port)
-    token=$(hub_token)
+    token=$(hub_token "$project_id")
     if [[ -z "$token" ]]; then
         return 2
     fi
@@ -598,7 +624,9 @@ fetch_config() {
 
     local result status body rc
     set +e
-    result=$(hub_get "$path")
+    # Per-project route → pass the resolved project id so hub_token
+    # prefers the scoped `hub.token.<id>` (v0.2.76 Part 4).
+    result=$(hub_get "$path" "$pid")
     rc=$?
     set -e
     if [[ $rc -eq 2 ]]; then

@@ -115,12 +115,31 @@ hub_port() {
 # Returns the token on stdout, or empty string if no token file exists.
 # Caller treats empty as "hub not running" (callers can't authenticate
 # without it; the hub will return 401).
+#
+# v0.2.76 Part 4 — PER-PROJECT TOKEN PREFERENCE (MUST MATCH
+# `vct_project_config.sh::hub_token`, `vct_project_config.ps1` /
+# `vct_secrets_resolve.ps1::Get-HubToken`, and
+# `vco_lib/project_config.py::_project_token`): hub_token accepts an
+# OPTIONAL project id. When given AND a readable `hub.token.<project_id>`
+# exists, that scoped token is returned in preference to the global
+# `hub.token`. `VCT_HUB_TOKEN` still wins over both. Falls back to the
+# global token when no per-project file exists (compat window). The
+# `by-path` lookup passes NO project id (global token); only the `/env`
+# call passes the resolved id.
 hub_token() {
+    local project_id="${1:-}"
     if [[ -n "${VCT_HUB_TOKEN:-}" ]]; then
         printf '%s' "$VCT_HUB_TOKEN"
         return 0
     fi
     local state_dir="${VCT_STATE_DIR:-$HOME/.vct}"
+    if [[ -n "$project_id" ]]; then
+        local proj_file="$state_dir/hub.token.$project_id"
+        if [[ -f "$proj_file" && -r "$proj_file" ]]; then
+            tr -d '[:space:]' < "$proj_file"
+            return 0
+        fi
+    fi
     local token_file="$state_dir/hub.token"
     if [[ -f "$token_file" ]]; then
         # Strip ALL whitespace including stray trailing newline.
@@ -152,9 +171,13 @@ hub_get() {
     # specifically when no token file exists (so caller can map it
     # to "hub unreachable" without trying the request).
     local path="$1"
+    # v0.2.76 Part 4: optional 2nd arg = project id for a per-project
+    # route (`/env`). When set, hub_token prefers the scoped
+    # `hub.token.<id>`. The `by-path` lookup passes no id → global token.
+    local project_id="${2:-}"
     local port token
     port=$(hub_port)
-    token=$(hub_token)
+    token=$(hub_token "$project_id")
     if [[ -z "$token" ]]; then
         return 2
     fi
@@ -352,7 +375,9 @@ read_key_hub() {
     fi
     local result status body
     set +e
-    result=$(hub_get "projects/$(url_encode "$pid")/env?key=$(url_encode "$key")")
+    # Per-project route → pass the resolved project id so hub_token
+    # prefers the scoped `hub.token.<id>` (v0.2.76 Part 4).
+    result=$(hub_get "projects/$(url_encode "$pid")/env?key=$(url_encode "$key")" "$pid")
     rc=$?
     set -e
     if [[ $rc -eq 2 ]]; then

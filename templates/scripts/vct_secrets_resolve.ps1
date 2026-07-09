@@ -95,11 +95,34 @@ function Get-HubToken {
     # Returns the auth token string, or $null if no token can be
     # resolved. Caller treats $null as "hub unreachable" (the launcher
     # hasn't written hub.token yet — it isn't running).
+    #
+    # v0.2.76 Part 4 — PER-PROJECT TOKEN PREFERENCE (MUST MATCH the bash
+    # sibling `vct_secrets_resolve.sh::hub_token`,
+    # `vct_project_config.ps1::Get-HubToken`, and
+    # `vco_lib/project_config.py::_project_token`): accepts an OPTIONAL
+    # -ProjectId. When given AND a readable `hub.token.<ProjectId>`
+    # exists, that scoped token is returned in preference to the global
+    # `hub.token`. `VCT_HUB_TOKEN` still wins over both. Falls back to the
+    # global token when no per-project file exists (compat window). The
+    # `by-path` lookup passes no id → global token; only the `/env` call
+    # passes the resolved id.
+    param([string]$ProjectId = '')
     if ($Env:VCT_HUB_TOKEN) {
         $t = $Env:VCT_HUB_TOKEN.Trim()
         if ($t.Length -gt 0) { return $t }
     }
     $stateDir = if ($Env:VCT_STATE_DIR) { $Env:VCT_STATE_DIR } else { Join-Path $HOME ".vct" }
+    if ($ProjectId) {
+        $projFile = Join-Path $stateDir "hub.token.$ProjectId"
+        if (Test-Path $projFile) {
+            try {
+                $rawP = (Get-Content -Raw -Path $projFile -ErrorAction Stop).Trim()
+                if ($rawP.Length -gt 0) { return $rawP }
+            } catch {
+                # Unreadable per-project file → fall through to global.
+            }
+        }
+    }
     $tokenFile = Join-Path $stateDir "hub.token"
     if (Test-Path $tokenFile) {
         $raw = (Get-Content -Raw -Path $tokenFile).Trim()
@@ -109,9 +132,12 @@ function Get-HubToken {
 }
 
 function Invoke-Hub {
-    param([string]$PathAndQuery)
+    # v0.2.76 Part 4: optional -ProjectId for a per-project route
+    # (`/env`). When set, Get-HubToken prefers the scoped
+    # `hub.token.<id>`. The `by-path` lookup passes no id → global token.
+    param([string]$PathAndQuery, [string]$ProjectId = '')
     $port = Get-HubPort
-    $token = Get-HubToken
+    $token = Get-HubToken -ProjectId $ProjectId
     if ($null -eq $token) {
         # Sentinel result the caller can detect alongside the
         # connection-refused $null. We use a distinct shape (Status=0)
@@ -232,7 +258,9 @@ function Read-KeyHub {
     $pid_ = $resolved.Value
     $encodedPid = [System.Uri]::EscapeDataString($pid_)
     $encodedKey = [System.Uri]::EscapeDataString($Key)
-    $result = Invoke-Hub "projects/$encodedPid/env?key=$encodedKey"
+    # Per-project route → pass the resolved project id so Get-HubToken
+    # prefers the scoped `hub.token.<id>` (v0.2.76 Part 4).
+    $result = Invoke-Hub -PathAndQuery "projects/$encodedPid/env?key=$encodedKey" -ProjectId $pid_
     if ($null -eq $result) {
         Write-Err "hub unreachable; is the launcher running?"
         return @{ ExitCode = 1 }

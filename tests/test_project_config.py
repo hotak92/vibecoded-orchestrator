@@ -241,6 +241,106 @@ class DiscoverHubTest(unittest.TestCase):
         self.assertEqual(token2, "t2")
 
 
+# ─── v0.2.76 Part 4: per-project token preference ───────────────────────
+
+
+class ProjectTokenPreferenceTest(unittest.TestCase):
+    """`_project_token` prefers hub.token.<id>, falls back to global.
+
+    Parity with the sh/ps1 resolvers' `hub_token`/`Get-HubToken`:
+    per-project file wins over the global token when present; a pinned
+    VCT_HUB_TOKEN env wins over BOTH; an absent per-project file falls
+    back cleanly (act + leave-alone).
+    """
+
+    def setUp(self) -> None:
+        project_config._test_clear_cache()
+
+    def tearDown(self) -> None:
+        project_config._test_clear_cache()
+
+    def test_prefers_per_project_file_when_present(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "hub.token").write_text("global-tok\n", encoding="utf-8")
+            (Path(td) / "hub.token.proj-a").write_text(
+                "scoped-a\n", encoding="utf-8"
+            )
+            env = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("VCT_HUB_PORT", "VCT_HUB_TOKEN")
+            }
+            env["VCT_STATE_DIR"] = td
+            with mock.patch.dict(os.environ, env, clear=True):
+                # ACT: known project with a scoped file → scoped token.
+                self.assertEqual(
+                    project_config._project_token("proj-a", "global-tok"),
+                    "scoped-a",
+                )
+                # LEAVE-ALONE: a project WITHOUT a scoped file → global.
+                self.assertEqual(
+                    project_config._project_token("proj-b", "global-tok"),
+                    "global-tok",
+                )
+
+    def test_falls_back_to_global_when_file_absent(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            env = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("VCT_HUB_PORT", "VCT_HUB_TOKEN")
+            }
+            env["VCT_STATE_DIR"] = td
+            with mock.patch.dict(os.environ, env, clear=True):
+                self.assertEqual(
+                    project_config._project_token("proj-x", "the-global"),
+                    "the-global",
+                )
+
+    def test_env_pin_wins_over_per_project_file(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "hub.token.proj-a").write_text(
+                "scoped-a", encoding="utf-8"
+            )
+            env = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("VCT_HUB_PORT",)
+            }
+            env["VCT_STATE_DIR"] = td
+            env["VCT_HUB_TOKEN"] = "env-pinned"
+            with mock.patch.dict(os.environ, env, clear=True):
+                # _discover_hub already returns the env token as `global`;
+                # _project_token must NOT override it with the scoped file.
+                self.assertEqual(
+                    project_config._project_token("proj-a", "env-pinned"),
+                    "env-pinned",
+                )
+
+    def test_empty_per_project_file_falls_back_to_global(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "hub.token.proj-a").write_text("   \n", encoding="utf-8")
+            env = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("VCT_HUB_PORT", "VCT_HUB_TOKEN")
+            }
+            env["VCT_STATE_DIR"] = td
+            with mock.patch.dict(os.environ, env, clear=True):
+                self.assertEqual(
+                    project_config._project_token("proj-a", "global-tok"),
+                    "global-tok",
+                )
+
+
 # ─── Singleton session ──────────────────────────────────────────────────
 
 
@@ -645,6 +745,39 @@ class AuthHeaderTest(_ResolverTestBase):
         resolve(FULL_BODY["project_id"])
         headers = self.session.get.call_args.kwargs.get("headers", {})
         self.assertEqual(headers.get("Authorization"), "Bearer test-token-abc")
+
+    def test_per_project_token_used_on_config_route(self) -> None:
+        # v0.2.76 Part 4: a /config resolve for a project whose scoped
+        # hub.token.<id> file exists must carry the SCOPED token on the
+        # wire, not the global one. We drop the env pin (so discovery
+        # reads the disk) and point VCT_STATE_DIR at a temp dir holding a
+        # global token + a per-project token.
+        import tempfile
+
+        pid = FULL_BODY["project_id"]
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "hub.port").write_text("9999", encoding="utf-8")
+            (Path(td) / "hub.token").write_text("global-tok", encoding="utf-8")
+            (Path(td) / f"hub.token.{pid}").write_text(
+                "scoped-tok", encoding="utf-8"
+            )
+            env = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("VCT_HUB_PORT", "VCT_HUB_TOKEN")
+            }
+            env["VCT_STATE_DIR"] = td
+            with mock.patch.dict(os.environ, env, clear=True):
+                project_config._test_clear_cache()
+                self.session.get.return_value = _make_response(200, FULL_BODY)
+                # UUID arg → skips by-path; goes straight to /config with
+                # project_id=pid, so _project_token reads the scoped file.
+                resolve(pid)
+                headers = self.session.get.call_args.kwargs.get("headers", {})
+                self.assertEqual(
+                    headers.get("Authorization"), "Bearer scoped-tok"
+                )
+                project_config._test_clear_cache()
 
 
 # ─── v0.2.31: claude_session_dir_for slug rule + resolver propagation ───
