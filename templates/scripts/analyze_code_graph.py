@@ -8151,8 +8151,14 @@ class CodeGraphAnalyzer:
                 f"[{ix['confidence']}]"
             )
             embedding = generate_embedding(description)
-            insert_params: Dict[str, Any] = {
-                "properties": {
+            references = {"source_module": module_uuid}
+            if func_uuid:
+                references["source_function"] = func_uuid
+            entity = CodeEntity(
+                kind=KIND_INTERACTION, file_path_rel=file_path_rel,
+                extras={
+                    # CodeInteraction's whole property set + the identity key
+                    # (keyed on the source token, which is not a stored prop).
                     "source_project": self.project_name,
                     "interaction_type": ix["interaction_type"],
                     "direction": ix.get("direction", "outbound"),
@@ -8161,19 +8167,13 @@ class CodeGraphAnalyzer:
                     "raw_target": ix.get("raw_target", ""),
                     "confidence": ix.get("confidence", "high"),
                     "description": description,
+                    "_identity_key": f"ix::{ix.get('source','')}::{ix.get('endpoint','')}",
                 },
-                "references": {"source_module": module_uuid},
-            }
-            if func_uuid:
-                insert_params["references"]["source_function"] = func_uuid
-            if embedding:
-                insert_params["vector"] = _shape_for_insert(embedding)
+                references=references,
+                vector=_shape_for_insert(embedding) if embedding else None,
+            )
             try:
-                self._dedup_insert(
-                    self.interactions_collection, insert_params,
-                    f"ix::{ix.get('source','')}::{ix.get('endpoint','')}",
-                    file_path_rel=file_path_rel,
-                )
+                self.store_entity(entity)
                 count += 1
             except Exception as exc:
                 # Non-fatal — log and continue
@@ -8871,30 +8871,31 @@ class CodeGraphAnalyzer:
         # Create new - generate embedding from module_summary
         embedding = embed_module(module_summary)
 
-        insert_params = {
-            "properties": {
-                "path": path,
-                "language": canonical_lang,
-                "module_summary": module_summary,
-                "loc": loc,
-                "complexity": complexity,
-                "project": self.project_name,
-                "last_modified": last_modified.isoformat(),
-                "file_hash": file_hash,
-                "import_names": imports,
-            }
+        # CodeModule has a distinct property set (no name/full_name) and keys on
+        # ``module::<path>``; the whole set + identity ride in ``extras``. The
+        # conditional ``project_source`` is preserved (the choke-point ALSO
+        # stamps it from _current_source, so present-or-not is equivalent when
+        # current_source is set — kept explicit for the extras-only-root case).
+        module_extras: Dict[str, Any] = {
+            "path": path,
+            "language": canonical_lang,
+            "module_summary": module_summary,
+            "loc": loc,
+            "complexity": complexity,
+            "project": self.project_name,
+            "last_modified": last_modified.isoformat(),
+            "file_hash": file_hash,
+            "import_names": imports,
+            "_identity_key": f"module::{path}",
         }
         if current_source:
-            insert_params["properties"]["project_source"] = current_source
+            module_extras["project_source"] = current_source
 
-        # Add vector if embedding generation succeeded
-        if embedding:
-            insert_params["vector"] = _shape_for_insert(embedding)
-
-        uuid = self._dedup_insert(
-            self.modules_collection, insert_params, f"module::{path}",
-            file_path_rel=path,
-        )
+        uuid = self.store_entity(CodeEntity(
+            kind=KIND_MODULE, file_path_rel=path,
+            extras=module_extras,
+            vector=_shape_for_insert(embedding) if embedding else None,
+        ))
 
         # C-12 (v0.2.75 P2c): key by (project_source, relpath). Two
         # ``--extra-path`` roots sharing a relpath (e.g. ``install.py`` in the
@@ -9603,37 +9604,26 @@ class CodeGraphAnalyzer:
                 seen_composes.add(type_name)
                 composes.append(type_name)
 
-        insert_params = {
-            "properties": {
-                "name": node.name,
-                "full_name": f"{file_path.stem}.{node.name}",
-                "class_body": class_body,
-                "methods": methods,
-                "signature": signature,
-                "doc": doc,
-                "start_line": node.lineno,
-                "end_line": node.end_lineno or node.lineno,
-                "project": self.project_name,
-                "field_types": field_types,
-                "composes": composes,
-            },
-            "references": {
-                "module": module_uuid,
-            }
-        }
-
-        # Add vector if embedding generation succeeded
-        insert_params["_deferred_embed"] = lambda: embed_class(signature, class_body, methods=methods, language="python")
-
-        # v0.2.16 (bug 0.8): capture the return value into class_uuid.
-        # Pre-v0.2.16 the return was discarded and the next line referenced
-        # `class_uuid` from nowhere — NameError on every Python file
-        # containing a class. The outer try/except in analyze_repository
-        # was swallowing the exception and counting it as files_skipped,
-        # so the bug was invisible to the exit-code path. Mirrors the
-        # `func_uuid = self._dedup_insert(...)` pattern used in
-        # `_extract_function` below.
-        class_uuid = self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
+        # v0.2.16 (bug 0.8): capture the return value into class_uuid so the
+        # cache entry below resolves to the canonical UUID. Pre-v0.2.16 the
+        # return was discarded and the next line referenced `class_uuid` from
+        # nowhere — NameError on every Python file containing a class (swallowed
+        # by analyze_repository's per-file try/except → invisible files_skipped).
+        class_uuid = self.store_entity(CodeEntity(
+            kind=KIND_CLASS, file_path_rel=relative_path,
+            name=node.name,
+            full_name=f"{file_path.stem}.{node.name}",
+            body=class_body,
+            signature=signature,
+            doc=doc,
+            start_line=node.lineno,
+            end_line=node.end_lineno or node.lineno,
+            project=self.project_name,
+            # field_types + composes are PYTHON-ONLY (SCG composition edges).
+            extras={"methods": methods, "field_types": field_types, "composes": composes},
+            references={"module": module_uuid},
+            deferred_embed=lambda: embed_class(signature, class_body, methods=methods, language="python"),
+        ))
 
         self.class_cache[f"{file_path.stem}.{node.name}"] = class_uuid
 
@@ -9693,28 +9683,22 @@ class CodeGraphAnalyzer:
         # Create function - smart truncation for embedding
         # function_body is full source (includes def line + docstring + body)
 
-        insert_params = {
-            "properties": {
-                "name": node.name,
-                "full_name": full_name,
-                "function_body": function_body,
-                "signature": signature,
-                "doc": doc,
-                "start_line": node.lineno,
-                "end_line": node.end_lineno or node.lineno,
-                "is_async": isinstance(node, ast.AsyncFunctionDef),
-                "project": self.project_name,
-                "type_uses": type_uses,
-            },
-            "references": {
-                "module": module_uuid,
-            }
-        }
-
-        # Add vector if embedding generation succeeded
-        insert_params["_deferred_embed"] = lambda: embed_function(signature, function_body, language="python")
-
-        func_uuid = self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
+        func_uuid = self.store_entity(CodeEntity(
+            kind=KIND_FUNCTION, file_path_rel=relative_path,
+            name=node.name,
+            full_name=full_name,
+            body=function_body,
+            signature=signature,
+            doc=doc,
+            start_line=node.lineno,
+            end_line=node.end_lineno or node.lineno,
+            is_async=isinstance(node, ast.AsyncFunctionDef),
+            project=self.project_name,
+            # type_uses is PYTHON-ONLY (SCG type-annotation edges).
+            extras={"type_uses": type_uses},
+            references={"module": module_uuid},
+            deferred_embed=lambda: embed_function(signature, function_body, language="python"),
+        ))
 
         self.function_cache[full_name] = func_uuid
 
@@ -9845,27 +9829,20 @@ class CodeGraphAnalyzer:
                 )
 
             full_name = f"{component_name}.{name}"
-            insert_params: Dict[str, Any] = {
-                "properties": {
-                    "name": name,
-                    "full_name": full_name,
-                    "function_body": body,
-                    "signature": signature,
-                    "doc": "",
-                    "start_line": start_line,
-                    "end_line": end_line,
-                    "is_async": is_async,
-                    "project": self.project_name,
-                },
-                "references": {"module": module_uuid},
-            }
-            insert_params["_deferred_embed"] = lambda: embed_function(signature, body, language="javascript")
-            self._dedup_insert(
-                self.functions_collection,
-                insert_params,
-                insert_params["properties"].get("full_name", insert_params["properties"]["name"]),
-                file_path_rel=relative_path,
-            )
+            self.store_entity(CodeEntity(
+                kind=KIND_FUNCTION, file_path_rel=relative_path,
+                name=name,
+                full_name=full_name,
+                body=body,
+                signature=signature,
+                doc="",
+                start_line=start_line,
+                end_line=end_line,
+                is_async=is_async,
+                project=self.project_name,
+                references={"module": module_uuid},
+                deferred_embed=lambda: embed_function(signature, body, language="javascript"),
+            ))
             stats['functions'] += 1
 
         return stats
@@ -10010,27 +9987,20 @@ class CodeGraphAnalyzer:
                 else f"{kind} {scope_prefix}{name}"
             )
             full_name = f"{file_path.stem}.{name}"
-            insert_params: Dict[str, Any] = {
-                "properties": {
-                    "name": name,
-                    "full_name": full_name,
-                    "function_body": body,
-                    "signature": signature,
-                    "doc": "",
-                    "start_line": start_line,
-                    "end_line": end_line,
-                    "is_async": False,
-                    "project": self.project_name,
-                },
-                "references": {"module": module_uuid},
-            }
-            insert_params["_deferred_embed"] = lambda: embed_function(signature, body, language="python")
-            self._dedup_insert(
-                self.functions_collection,
-                insert_params,
-                insert_params["properties"].get("full_name", insert_params["properties"]["name"]),
-                file_path_rel=relative_path,
-            )
+            self.store_entity(CodeEntity(
+                kind=KIND_FUNCTION, file_path_rel=relative_path,
+                name=name,
+                full_name=full_name,
+                body=body,
+                signature=signature,
+                doc="",
+                start_line=start_line,
+                end_line=end_line,
+                is_async=False,
+                project=self.project_name,
+                references={"module": module_uuid},
+                deferred_embed=lambda: embed_function(signature, body, language="python"),
+            ))
             stats['functions'] += 1
 
         return stats
