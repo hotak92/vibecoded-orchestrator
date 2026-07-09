@@ -89,8 +89,9 @@
 //!   boundary. (A LAN attacker who can ALSO read `<vct_root_dir>/hub.token`
 //!   off this host is already the same-user-RCE case above.)
 
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     body::Body,
@@ -99,6 +100,8 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+
+use crate::project_tokens::ProjectTokenRegistry;
 // v0.2.54 Track I: the token primitives (CSPRNG generation, 0o600
 // persistence, constant-time compare, Bearer parsing) moved to
 // `vct_launcher_core::services::boot_token` so the launcher's diagrams
@@ -277,6 +280,169 @@ fn is_exempt_path(path: &str) -> bool {
     false
 }
 
+/// The per-project resolver routes that accept EITHER the global
+/// `hub.token` (compat) OR the matching per-project token (v0.2.76
+/// Part 4). Both carry a `{project_id}` in the SAME URL position, so one
+/// parser serves both.
+///
+/// Returns `Some(project_id)` when `path` is exactly
+/// `/api/v1/projects/{project_id}/env` or
+/// `/api/v1/projects/{project_id}/config` (a trailing slash is
+/// tolerated). Returns `None` for every other path — including the
+/// module-scoped `/api/v1/modules/.../projects/.../config` route, which
+/// starts with `/api/v1/modules/` (handled by `module_db_api`), not
+/// `/api/v1/projects/`.
+///
+/// EXACT-tail discipline (same as the module exempt-path matcher): we
+/// match only the precise `env` / `config` leaf so a future
+/// `/api/v1/projects/{id}/env/sub` route can't inherit the per-project
+/// token path by accident.
+pub(crate) fn per_project_token_route(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/api/v1/projects/")?;
+    // rest like "{project_id}/env" or "{project_id}/config" (optional
+    // trailing slash). Split and tolerate a trailing empty segment.
+    let mut parts: Vec<&str> = rest.split('/').collect();
+    if parts.last() == Some(&"") {
+        parts.pop();
+    }
+    if parts.len() != 2 {
+        return None;
+    }
+    let project_id = parts[0];
+    if project_id.is_empty() {
+        return None;
+    }
+    match parts[1] {
+        "env" | "config" => Some(project_id),
+        _ => None,
+    }
+}
+
+/// Whether the one-release compat window still accepts the global
+/// `hub.token` on the per-project `/env` + `/config` routes.
+///
+/// Task 4 (v0.2.76 Part 4): `VCT_HUB_LEGACY_GLOBAL_ENV` — DEFAULT
+/// allow ("1"/unset) THIS release so existing callers (step22, any
+/// bundled resolver that hasn't picked up a per-project token yet) keep
+/// working. Set to `"0"` to lock the routes to per-project tokens NOW
+/// (opt-in early). The DEFAULT flips to deny NEXT release (dated comment
+/// below) — do NOT flip it in this cycle.
+///
+/// Recognised deny values: exactly `"0"`, `"false"`, `"no"` (case-
+/// sensitive on the latter two per the same terse convention as the
+/// bind env). Any other value — including unset — allows (compat).
+///
+// FLIP-DEFAULT-NEXT-RELEASE (target: the release AFTER v0.2.76): change
+// the default so that an UNSET / unrecognised value DENIES the global
+// token on these routes. Callers must present the per-project token by
+// then; the resolver triplet already prefers it (v0.2.76 Part 4 Task 3).
+fn legacy_global_env_allowed() -> bool {
+    match std::env::var("VCT_HUB_LEGACY_GLOBAL_ENV").ok().as_deref() {
+        Some("0") | Some("false") | Some("no") => false,
+        // Some(_) truthy, or None → allow (the v0.2.76 compat default).
+        _ => true,
+    }
+}
+
+/// Process-lifetime dedup set for the "global token used on a per-project
+/// route" deprecation log. Keyed by project_id so a resolver hammering
+/// ONE project's `/env` in a loop logs once, not per request — but a
+/// genuinely different project still surfaces its own line. Granularity
+/// is "caller-ish" (per project) rather than per-request, per the brief.
+static LEGACY_GLOBAL_ENV_WARNED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Emit the deprecation line for `project_id` at most once per process.
+fn warn_legacy_global_env_once(project_id: &str) {
+    let mut guard = match LEGACY_GLOBAL_ENV_WARNED.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let seen = guard.get_or_insert_with(HashSet::new);
+    if !seen.insert(project_id.to_string()) {
+        return; // already warned for this project this process.
+    }
+    eprintln!(
+        "[vct-hub] DEPRECATION: the global hub.token was used to read \
+         /projects/{}/env or /config. This coarse credential grants every \
+         project's env + config; migrate to the per-project token \
+         (hub.token.{}) — the bundled resolvers already prefer it. The \
+         global-token path is a one-release compat window (v0.2.76) and \
+         will be refused next release (or now, if you set \
+         VCT_HUB_LEGACY_GLOBAL_ENV=0).",
+        project_id, project_id
+    );
+}
+
+/// Outcome of evaluating a bearer against the per-project + global
+/// credentials on a `/env` / `/config` route.
+enum ProjectRouteAuth {
+    /// Bearer matched THIS project's per-project token — allow, no log.
+    ProjectToken,
+    /// Bearer matched the global token — allow (compat window) unless
+    /// the legacy flag is off; caller logs the deprecation line once.
+    GlobalTokenCompat,
+    /// Bearer matched a DIFFERENT project's per-project token — hard 403.
+    WrongProject,
+    /// Bearer matched nothing — 401.
+    NoMatch,
+    /// Legacy global-token path disabled by `VCT_HUB_LEGACY_GLOBAL_ENV=0`
+    /// AND the bearer is the global token — 403 with a migration message.
+    GlobalTokenRefused,
+}
+
+/// Decide how a bearer authenticates against a per-project route.
+///
+/// Precedence:
+///   1. per-project token for THIS project → allow;
+///   2. per-project token for ANOTHER project → hard 403 (wrong project
+///      — a scoped credential must never cross the project boundary);
+///   3. global token → allow this release (compat) unless the legacy
+///      flag is off, in which case 403 with a migration message;
+///   4. anything else → 401.
+///
+/// Constant-time comparisons throughout (the registry reverse-lookup and
+/// the global compare both accumulate).
+fn evaluate_project_route_auth(
+    url_project_id: &str,
+    bearer: &str,
+    global_token: &str,
+    registry: &ProjectTokenRegistry,
+) -> ProjectRouteAuth {
+    // 1 + 2: does the bearer match SOME project's per-project token?
+    if let Some(owner) = registry.project_for_token(bearer) {
+        if owner == url_project_id {
+            return ProjectRouteAuth::ProjectToken;
+        }
+        return ProjectRouteAuth::WrongProject;
+    }
+    // 3: global token?
+    if constant_time_eq(bearer.as_bytes(), global_token.as_bytes()) {
+        if legacy_global_env_allowed() {
+            return ProjectRouteAuth::GlobalTokenCompat;
+        }
+        return ProjectRouteAuth::GlobalTokenRefused;
+    }
+    // 4: matches nothing.
+    ProjectRouteAuth::NoMatch
+}
+
+/// 403 for a scoped-credential boundary violation (wrong project token,
+/// or the global token refused when the legacy flag is off).
+fn forbidden_response(message: &str) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "code": "forbidden",
+            "message": message,
+        }
+    });
+    (
+        StatusCode::FORBIDDEN,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
 /// Axum middleware: require `Authorization: Bearer <token>` on every
 /// non-exempt request.
 ///
@@ -284,6 +450,12 @@ fn is_exempt_path(path: &str) -> bool {
 /// so OPTIONS preflight (which never carries Authorization) bypasses
 /// auth and the CORS layer can answer it. Real requests that follow
 /// the preflight DO get gated.
+///
+/// v0.2.76 Part 4 — the per-project `/env` + `/config` routes accept
+/// EITHER the matching per-project token (`hub.token.<id>`) OR the global
+/// `hub.token` (one-release compat window). A token minted for a
+/// different project is a hard 403. All OTHER `/api/v1/*` routes stay on
+/// the global token exactly as before.
 pub async fn require_auth(req: Request<Body>, next: Next) -> Response {
     // OPTIONS = CORS preflight. Always allow; the CORS layer above
     // will produce the right response with no body.
@@ -315,6 +487,51 @@ pub async fn require_auth(req: Request<Body>, next: Next) -> Response {
         }
     };
 
+    // v0.2.76 Part 4 — per-project `/env` + `/config` routes accept the
+    // matching per-project token OR the global token (compat window). A
+    // token minted for a DIFFERENT project is a hard 403.
+    if let Some(url_project_id) = per_project_token_route(path) {
+        // The registry is injected by server.rs. If it's missing (a
+        // wiring bug, or a test harness that only installs AuthState),
+        // treat it as empty — every bearer then evaluates against the
+        // global token alone, which is the pre-Part-4 behaviour. This
+        // fail-soft keeps the global-token path (and every existing
+        // auth test) working when the registry extension is absent.
+        let registry = req
+            .extensions()
+            .get::<ProjectTokenRegistry>()
+            .cloned()
+            .unwrap_or_else(ProjectTokenRegistry::empty);
+
+        match evaluate_project_route_auth(
+            url_project_id,
+            provided,
+            state.token.as_str(),
+            &registry,
+        ) {
+            ProjectRouteAuth::ProjectToken => return next.run(req).await,
+            ProjectRouteAuth::GlobalTokenCompat => {
+                warn_legacy_global_env_once(url_project_id);
+                return next.run(req).await;
+            }
+            ProjectRouteAuth::WrongProject => {
+                return forbidden_response(
+                    "this per-project token does not authorize the project in the \
+                     URL; a token minted for project A cannot read project B",
+                );
+            }
+            ProjectRouteAuth::GlobalTokenRefused => {
+                return forbidden_response(
+                    "the global hub.token is no longer accepted on /env + /config \
+                     (VCT_HUB_LEGACY_GLOBAL_ENV=0); present the per-project token \
+                     (hub.token.<project_id>) — the bundled resolvers already prefer it",
+                );
+            }
+            ProjectRouteAuth::NoMatch => return unauthorized_response(),
+        }
+    }
+
+    // Every other route: global hub.token only, exactly as before.
     if !constant_time_eq(provided.as_bytes(), state.token.as_bytes()) {
         return unauthorized_response();
     }
@@ -639,6 +856,35 @@ mod tests {
             .layer(axum::Extension(auth_state))
     }
 
+    /// v0.2.76 Part 4 — router shaped like the real server: global token
+    /// via `AuthState` PLUS a `ProjectTokenRegistry` extension, both
+    /// `/env` and `/config` routes mounted. `projects` maps project_id →
+    /// per-project token.
+    fn router_with_project_tokens(
+        global_token: &str,
+        projects: &[(&str, &str)],
+    ) -> Router {
+        let auth_state = AuthState::new(global_token.to_string());
+        let mut map = std::collections::HashMap::new();
+        for (pid, tok) in projects {
+            map.insert(pid.to_string(), tok.to_string());
+        }
+        let registry = ProjectTokenRegistry::from_map(map);
+        let app = Router::new()
+            .route("/api/v1/health", get(|| async { "ok" }))
+            .route("/api/v1/projects/{id}/env", get(|| async { "env here" }))
+            .route(
+                "/api/v1/projects/{id}/config",
+                get(|| async { "config here" }),
+            )
+            // A non-per-project route to prove global-token-only behaviour
+            // is unchanged there.
+            .route("/api/v1/projects", get(|| async { "projects list" }));
+        app.layer(axum::middleware::from_fn(require_auth))
+            .layer(axum::Extension(auth_state))
+            .layer(axum::Extension(registry))
+    }
+
     /// Bind on a random port, spawn the server task, return the base
     /// URL for reqwest to hit.
     async fn spawn_router(app: Router) -> String {
@@ -740,5 +986,191 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "OPTIONS preflight must bypass auth so CORS layer can answer"
         );
+    }
+
+    // ─── v0.2.76 Part 4: per-project token routing ───────────────────
+
+    #[test]
+    fn per_project_token_route_matches_env_and_config_only() {
+        assert_eq!(per_project_token_route("/api/v1/projects/p1/env"), Some("p1"));
+        assert_eq!(
+            per_project_token_route("/api/v1/projects/p1/config"),
+            Some("p1")
+        );
+        // Trailing slash tolerated.
+        assert_eq!(
+            per_project_token_route("/api/v1/projects/p1/env/"),
+            Some("p1")
+        );
+        assert_eq!(
+            per_project_token_route("/api/v1/projects/abc-123/config/"),
+            Some("abc-123")
+        );
+        // Non-matching leaves / shapes.
+        assert_eq!(per_project_token_route("/api/v1/projects/p1"), None);
+        assert_eq!(per_project_token_route("/api/v1/projects/p1/env/sub"), None);
+        assert_eq!(per_project_token_route("/api/v1/projects"), None);
+        assert_eq!(per_project_token_route("/api/v1/projects//env"), None);
+        assert_eq!(per_project_token_route("/api/v1/projects/p1/codegraph-builds"), None);
+        // Module-scoped config route lives under /modules/, not /projects/.
+        assert_eq!(
+            per_project_token_route("/api/v1/modules/m/projects/p1/config"),
+            None
+        );
+        assert_eq!(per_project_token_route("/api/v1/health"), None);
+    }
+
+    #[test]
+    fn evaluate_project_route_auth_matrix() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("proj-a".to_string(), "token-a".to_string());
+        map.insert("proj-b".to_string(), "token-b".to_string());
+        let reg = ProjectTokenRegistry::from_map(map);
+        let global = "global-token";
+
+        // Correct project token → allow.
+        assert!(matches!(
+            evaluate_project_route_auth("proj-a", "token-a", global, &reg),
+            ProjectRouteAuth::ProjectToken
+        ));
+        // Wrong project's token → hard 403.
+        assert!(matches!(
+            evaluate_project_route_auth("proj-a", "token-b", global, &reg),
+            ProjectRouteAuth::WrongProject
+        ));
+        // Global token → compat allow (default flag).
+        assert!(matches!(
+            evaluate_project_route_auth("proj-a", global, global, &reg),
+            ProjectRouteAuth::GlobalTokenCompat
+        ));
+        // Garbage → 401.
+        assert!(matches!(
+            evaluate_project_route_auth("proj-a", "nonsense", global, &reg),
+            ProjectRouteAuth::NoMatch
+        ));
+        // A project token whose URL project has no registry entry still
+        // 403s if the token belongs to some OTHER project.
+        assert!(matches!(
+            evaluate_project_route_auth("proj-unknown", "token-a", global, &reg),
+            ProjectRouteAuth::WrongProject
+        ));
+    }
+
+    #[tokio::test]
+    async fn env_route_accepts_matching_project_token() {
+        let base = spawn_router(router_with_project_tokens(
+            "global-tok",
+            &[("proj-a", "tok-a"), ("proj-b", "tok-b")],
+        ))
+        .await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("{}/api/v1/projects/proj-a/env", base))
+            .header("Authorization", "Bearer tok-a")
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.text().await.unwrap(), "env here");
+    }
+
+    #[tokio::test]
+    async fn config_route_accepts_matching_project_token() {
+        let base = spawn_router(router_with_project_tokens(
+            "global-tok",
+            &[("proj-a", "tok-a")],
+        ))
+        .await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("{}/api/v1/projects/proj-a/config", base))
+            .header("Authorization", "Bearer tok-a")
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.text().await.unwrap(), "config here");
+    }
+
+    #[tokio::test]
+    async fn env_route_rejects_wrong_project_token_with_403() {
+        let base = spawn_router(router_with_project_tokens(
+            "global-tok",
+            &[("proj-a", "tok-a"), ("proj-b", "tok-b")],
+        ))
+        .await;
+        let client = reqwest::Client::new();
+        // Project B's token on Project A's route → hard 403.
+        let resp = client
+            .get(format!("{}/api/v1/projects/proj-a/env", base))
+            .header("Authorization", "Bearer tok-b")
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("forbidden"), "body: {}", body);
+    }
+
+    #[tokio::test]
+    async fn env_route_accepts_global_token_compat_window() {
+        let base = spawn_router(router_with_project_tokens(
+            "global-tok",
+            &[("proj-a", "tok-a")],
+        ))
+        .await;
+        let client = reqwest::Client::new();
+        // The global token still works on /env (one-release compat).
+        let resp = client
+            .get(format!("{}/api/v1/projects/proj-a/env", base))
+            .header("Authorization", "Bearer global-tok")
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn env_route_rejects_garbage_token_with_401() {
+        let base = spawn_router(router_with_project_tokens(
+            "global-tok",
+            &[("proj-a", "tok-a")],
+        ))
+        .await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("{}/api/v1/projects/proj-a/env", base))
+            .header("Authorization", "Bearer neither-project-nor-global")
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn non_per_project_route_still_requires_global_token() {
+        let base = spawn_router(router_with_project_tokens(
+            "global-tok",
+            &[("proj-a", "tok-a")],
+        ))
+        .await;
+        let client = reqwest::Client::new();
+        // A per-project token on a NON-per-project route → 401 (only the
+        // global token authorizes /api/v1/projects list).
+        let resp = client
+            .get(format!("{}/api/v1/projects", base))
+            .header("Authorization", "Bearer tok-a")
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // The global token works there.
+        let resp2 = client
+            .get(format!("{}/api/v1/projects", base))
+            .header("Authorization", "Bearer global-tok")
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp2.status(), StatusCode::OK);
     }
 }
