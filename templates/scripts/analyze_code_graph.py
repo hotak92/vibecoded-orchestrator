@@ -481,6 +481,18 @@ try:
         path_is_ignored,  # noqa: F401 — re-exported (parity test asserts identity)
         path_reachable_on_disk,
     )
+    # P2f (v0.2.76): the CodeEntity IR + its insert_params/identity mapping.
+    # Extractors emit a typed entity and call `self.store_entity(...)` instead
+    # of hand-building the `insert_params` dict + repeating the identity-key
+    # expression at ~20 near-identical `_dedup_insert` call-sites.
+    from vco_lib.codegraph_entities import (
+        CodeEntity,
+        KIND_API,  # noqa: F401 — re-exported for extractor readability
+        KIND_CLASS,  # noqa: F401
+        KIND_FUNCTION,  # noqa: F401
+        KIND_INTERACTION,  # noqa: F401
+        KIND_MODULE,  # noqa: F401
+    )
 except ImportError as _exc:  # noqa: F841 — used in the message below
     sys.stderr.write(
         "analyze_code_graph: vco_lib not importable — VCO install is broken; "
@@ -4353,6 +4365,31 @@ class CodeGraphAnalyzer:
             collection, det_uuid, insert_params, identity_key,
         )
 
+    # ── P2f (v0.2.76): CodeEntity → collection routing ──────────────────────
+    _ENTITY_COLLECTION_ATTR = {
+        KIND_MODULE: "modules_collection",
+        KIND_CLASS: "classes_collection",
+        KIND_FUNCTION: "functions_collection",
+        KIND_API: "apis_collection",
+        KIND_INTERACTION: "interactions_collection",
+    }
+
+    def store_entity(self, entity: "CodeEntity") -> str:
+        """Thin wiring: map a ``CodeEntity`` to the pre-P2f ``insert_params`` +
+        identity key and funnel it through the unchanged ``_dedup_insert``
+        choke-point (which owns dedup / fingerprint / chunking / write).
+
+        Returns the deterministic UUID ``_dedup_insert`` returns (callers that
+        need the canonical UUID — python class/function cache entries — capture
+        it, exactly as they captured ``class_uuid``/``func_uuid`` before)."""
+        coll = getattr(self, self._ENTITY_COLLECTION_ATTR[entity.kind])
+        return self._dedup_insert(
+            coll,
+            entity.to_insert_params(),
+            entity.identity_key(),
+            file_path_rel=entity.file_path_rel,
+        )
+
     def _stamp_single_chunk_props(self, collection, insert_params: dict) -> None:
         """Stamp chunk_num=0/total_chunks=1 on a single-object Function/Class write.
 
@@ -7643,18 +7680,16 @@ class CodeGraphAnalyzer:
             # attributions, drowning real signal in noise for the
             # `query_code_structure(methods, StructName)` MCP path.
             methods = _rust_methods_for_struct(content_clean, sname, source_lines)
-            insert_params: Dict[str, Any] = {
-                "properties": {
-                    "name": sname, "full_name": f"{file_path.stem}.{sname}",
-                    "class_body": class_body, "methods": methods[:20],
-                    "signature": signature, "doc": "",
-                    "start_line": start_line, "end_line": start_line + len(class_lines),
-                    "project": self.project_name,
-                },
-                "references": {"module": module_uuid},
-            }
-            insert_params["_deferred_embed"] = lambda: embed_class(signature, class_body, language="rust")
-            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
+            self.store_entity(CodeEntity(
+                kind=KIND_CLASS, file_path_rel=relative_path,
+                name=sname, full_name=f"{file_path.stem}.{sname}",
+                body=class_body, signature=signature, doc="",
+                start_line=start_line, end_line=start_line + len(class_lines),
+                project=self.project_name,
+                extras={"methods": methods[:20]},
+                references={"module": module_uuid},
+                deferred_embed=lambda: embed_class(signature, class_body, language="rust"),
+            ))
             stats['classes'] += 1
 
         for m in func_pattern.finditer(content_clean):
@@ -7672,17 +7707,15 @@ class CodeGraphAnalyzer:
             body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
             full_name = f"{file_path.stem}.{fname}"
             signature = f"fn {fname}({args_str})"
-            insert_params = {
-                "properties": {
-                    "name": fname, "full_name": full_name,
-                    "function_body": body, "signature": signature,
-                    "doc": "", "start_line": start_line, "end_line": end_line,
-                    "is_async": is_async, "project": self.project_name,
-                },
-                "references": {"module": module_uuid},
-            }
-            insert_params["_deferred_embed"] = lambda: embed_function(signature, body, language="rust")
-            self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
+            self.store_entity(CodeEntity(
+                kind=KIND_FUNCTION, file_path_rel=relative_path,
+                name=fname, full_name=full_name,
+                body=body, signature=signature, doc="",
+                start_line=start_line, end_line=end_line,
+                is_async=is_async, project=self.project_name,
+                references={"module": module_uuid},
+                deferred_embed=lambda: embed_function(signature, body, language="rust"),
+            ))
             stats['functions'] += 1
 
         # Cross-language interactions
