@@ -27,43 +27,14 @@ Parallels V52-O.11.F (Rust) — same shape of bug, same shape of fix.
 
 from __future__ import annotations
 
-import importlib.util
-import sys
 from pathlib import Path
-from types import ModuleType
 
-import pytest
-
-_REPO = Path(__file__).resolve().parent.parent
-
-
-def _load_acg() -> ModuleType:
-    """Isolated load (mirrors V52-O.11.F's helper rationale).
-
-    Importing analyze_code_graph.py the obvious way pollutes sys.modules
-    via its ``from weaviate_mcp.code_truncation import ...`` line — the
-    snapshot/restore pattern below keeps the test hermetic.
-    """
-    sys_modules_before = set(sys.modules.keys())
-    sys_path_before = list(sys.path)
-
-    spec = importlib.util.spec_from_file_location(
-        "_v52_o11_f2_js_acg_isolated",
-        _REPO / "templates" / "scripts" / "analyze_code_graph.py",
-    )
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(mod)
-    finally:
-        sys.path[:] = sys_path_before
-        new_keys = set(sys.modules.keys()) - sys_modules_before
-        for key in new_keys:
-            del sys.modules[key]
-    return mod
-
-
-acg = _load_acg()
+# P2f stage 2 (v0.2.76): `_js_methods_for_class` moved verbatim to
+# vco_lib/codegraph_lang/javascript.py, which is import-safe (no
+# weaviate-client / sys.path side effects) — the old isolated-importlib
+# loader for the full analyzer script is no longer needed. Alias the module
+# as ``acg`` so every assertion below stays byte-identical.
+from vco_lib.codegraph_lang import javascript as acg
 
 
 # ---------------------------------------------------------------------------
@@ -426,10 +397,12 @@ def test_no_inline_method_finditer_in_js_class_loop() -> None:
     and matched nested call statements.
 
     The new code uses ``_js_methods_for_class(...)`` instead.
+
+    P2f stage 2 (v0.2.76): the JS extractor moved verbatim to
+    vco_lib/codegraph_lang/javascript.py — the source scan follows it there
+    (assertions unchanged).
     """
-    src = (
-        _REPO / "templates" / "scripts" / "analyze_code_graph.py"
-    ).read_text()
+    src = Path(acg.__file__).read_text()
 
     # Anchor on the STABLE per-class scoping call itself — this is the exact
     # thing V52-O.11.F.2-JS introduced and this test guards. (v0.2.73: the
