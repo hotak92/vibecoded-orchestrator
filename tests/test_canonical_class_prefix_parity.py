@@ -222,11 +222,15 @@ def test_no_fifth_sanitizer_in_vco_lib() -> None:
     assert vco_lib_root.is_dir(), f"vco_lib not found at {vco_lib_root}"
 
     # Known-canonical functions, plus wrappers we explicitly endorse.
+    # X-1 / v0.2.76: BOTH SSOTs now live in the ONE naming home
+    # ``vco_lib/codegraph_naming.py``. ``project_init.py`` /
+    # ``project_naming.py`` keep DEPRECATION RE-EXPORTS (import statements,
+    # not FunctionDefs — so they don't appear as findings here).
     allowed_names = {
-        # SSOT (underscore-dropping).
-        ("project_init.py", "sanitize_for_weaviate_class"),
-        # SSOT (underscore-preserving).
-        ("project_naming.py", "canonical_class_prefix"),
+        # SSOT (underscore-dropping) — the ONE home.
+        ("codegraph_naming.py", "sanitize_for_weaviate_class"),
+        # SSOT (underscore-preserving) — the ONE home.
+        ("codegraph_naming.py", "canonical_class_prefix"),
         # Endorsed wrappers (delegate to SSOTs).
         ("config_projection.py", "_sanitize_kg_collection"),
         ("codegraph_to_mermaid.py", "_sanitize_collection_prefix"),

@@ -65,73 +65,28 @@ from vco_lib.symlink_handler import compute_vco_new_path, is_symlink_blocking
 # so this module is import-free of install.py).
 DEFAULT_WEAVIATE_PORT = 8081
 
-# Sanitizer regex: split on any non-alphanumeric run.
-_SAFE_CLASS_RE = re.compile(r"[^A-Za-z0-9]+")
-
-# Fallback prefix when a project name has no usable alphanumeric characters
-# or starts with a digit. Lowercase `vct_` is intentional — Weaviate
-# capitalizes the first letter on POST regardless, and the prefix flags
-# the class as installer-managed.
-_FALLBACK_PREFIX = "vct"
+# X-1 / v0.2.76: the underscore-DROPPING sanitizer moved to
+# ``vco_lib.codegraph_naming`` — the ONE naming home. These aliases keep
+# the historical private names (used by a couple of install-flow call
+# sites in this module) resolving to the canonical source.
+from vco_lib.codegraph_naming import _SAFE_CLASS_RE  # noqa: E402  (re-export)
+from vco_lib.codegraph_naming import FALLBACK_PREFIX as _FALLBACK_PREFIX  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# Public sanitizer (single source of truth, replaces Rust + Python copies)
+# Public sanitizer — DEPRECATION RE-EXPORT.
+#
+# X-1 / v0.2.76: the underscore-DROPPING sanitizer now lives in the ONE
+# naming home ``vco_lib.codegraph_naming`` (alongside the underscore-
+# PRESERVING ``canonical_class_prefix``). This re-export keeps the historical
+# import path ``from vco_lib.project_init import sanitize_for_weaviate_class``
+# working for existing callers (install.py, config_projection, the weaviate
+# MCP, rl_enrichment, tests). New code should import from
+# ``vco_lib.codegraph_naming`` directly.
 # ---------------------------------------------------------------------------
-
-
-def sanitize_for_weaviate_class(project_name: str) -> str:
-    """PascalCase a project name into a Weaviate class basename.
-
-    **SSOT classification (NEW-10 / DEDUP-6, v0.2.53)**:
-    This function is the CANONICAL underscore-DROPPING sanitizer
-    used to derive ``<prefix>_KnowledgeGraph``,
-    ``<prefix>_Development``, and ``<prefix>_Diagrams`` collection
-    names from a project's display name. The companion canonical for
-    the underscore-PRESERVING rule (code-graph collections) lives at
-    ``vco_lib.project_naming.canonical_class_prefix``. The two rules
-    are intentionally distinct because production Weaviate schemas
-    contain classes named by BOTH rules (different sites adopted
-    different rules historically — see the v0.2.15 wedge described in
-    ``project_naming.py``'s module docstring). Unifying would require
-    a one-shot migration of every existing collection on every user's
-    machine and is gated on a future tag (NOT v0.2.53).
-
-    DEDUP-6 (v0.2.53) callers consolidated to use THIS function:
-      * ``vco_lib.config_projection._sanitize_kg_collection``
-        (preserves a different fallback — "Vct" capitalized).
-      * The 4-way SSOT collision is now reduced to 2 canonical
-        functions: this one (underscore-dropping) and
-        ``canonical_class_prefix`` (underscore-preserving).
-
-    Single source of truth across languages — replaces both the Python
-    helper ``_derive_project_kg_name`` (path-based) and the Rust helper
-    ``sanitize_kg_collection``. Rust callers must subprocess this module
-    via ``python -m vco_lib.project_init derive --name <n> --json``.
-
-    Rules (matching the existing install.py behavior):
-      1. Split on any non-alphanumeric run (``-``, ``_``, space, etc.).
-      2. PascalCase each surviving part (uppercase first letter, keep rest).
-      3. Concatenate.
-      4. If nothing survives OR the result starts with a digit (invalid
-         Weaviate class name), fall back to ``"vct"``.
-
-    Note on non-ASCII: the regex ``[^A-Za-z0-9]+`` treats any non-ASCII
-    character as a separator, so ``étude`` → ``["tude"]`` → ``"Tude"``
-    (the ``é`` is stripped, not preserved). This matches the existing
-    install.py ``_derive_project_kg_name`` behavior exactly. Unicode-aware
-    sanitization is out of scope for PR 2 — would require an explicit
-    migration plan for any project that already exists with a stripped
-    name.
-    """
-    base = project_name or ""
-    parts = [p for p in _SAFE_CLASS_RE.split(base) if p]
-    if not parts:
-        return _FALLBACK_PREFIX
-    pascal = "".join(p[:1].upper() + p[1:] for p in parts)
-    if not pascal or not pascal[0].isalpha():
-        return _FALLBACK_PREFIX
-    return pascal
+from vco_lib.codegraph_naming import (  # noqa: E402  (deprecation re-export)
+    sanitize_for_weaviate_class,
+)
 
 
 def derive_project_kg_name(project_name: str) -> str:
