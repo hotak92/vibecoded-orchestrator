@@ -16,11 +16,10 @@ seams the per-language extractor moves depend on.
    go live in tests — these tests fail loudly instead.
 
 2. THE REGISTRY. ``vco_lib.codegraph_lang.EXTRACTORS`` maps the analyzer's
-   ``lang_dispatch`` language keys to extractor callables. While the
-   per-language moves land the registry grows; every entry must already be
-   consistent (callable, key known to the analyzer's extension dispatch).
-   The final full-parity pin (registry keys == dispatch keys) lands with the
-   last move commit.
+   ``lang_dispatch`` language keys to extractor callables. All 14 languages
+   moved (P2f stage 2 complete): the registry keys must EQUAL the analyzer's
+   extension-dispatch key space — a missing entry silently drops a language,
+   an extra entry is unreachable dead code.
 """
 from __future__ import annotations
 
@@ -120,3 +119,19 @@ def test_registry_entries_are_callable_and_keys_known(analyzer_mod):
             f"EXTRACTORS key {key!r} unknown to the analyzer's "
             "_EXT_TO_DISPATCH_NAME dispatch key space"
         )
+
+
+def test_registry_covers_every_dispatch_language(analyzer_mod):
+    """FULL parity: P2f stage 2 is complete — every language the analyzer's
+    extension dispatch can route MUST have a registry entry (the analyzer's
+    `_analyze_<lang>_file` delegators dispatch through EXTRACTORS, so a
+    missing key is a KeyError at walk time for that language)."""
+    from vco_lib import codegraph_lang
+
+    dispatch_keys = set(analyzer_mod._EXT_TO_DISPATCH_NAME.values())
+    registry_keys = set(codegraph_lang.EXTRACTORS.keys())
+    assert registry_keys == dispatch_keys, (
+        f"EXTRACTORS registry / analyzer dispatch drift: "
+        f"missing={sorted(dispatch_keys - registry_keys)} "
+        f"extra={sorted(registry_keys - dispatch_keys)}"
+    )

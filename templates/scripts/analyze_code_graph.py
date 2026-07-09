@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
+#
+# P2f stage 2 (v0.2.76): extractor logic lives in vco_lib/codegraph_lang/ —
+# new languages/features go THERE (loud-fail import, no inline extractors).
+# This file is the CLI + walk + guards + orchestration; each per-language
+# `_analyze_<lang>_file` method below is a one-line delegator through
+# `vco_lib.codegraph_lang.EXTRACTORS`. The line-count ratchet
+# (tests/test_analyze_code_graph_ratchet.py) fails any PR that grows this
+# file back — extract, don't inline.
 """
 Code Graph Analyzer - Extract code entities and relationships into Weaviate
 
@@ -46,7 +54,7 @@ import sys
 import tempfile
 import uuid
 import requests
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Set, Tuple, Mapping
 import subprocess
@@ -493,19 +501,11 @@ try:
         KIND_INTERACTION,  # noqa: F401
         KIND_MODULE,  # noqa: F401
     )
-    # P2f stage 2 (v0.2.76): shared extractor helpers moved to
-    # vco_lib/codegraph_lang/_shared. The per-language extractor modules
-    # import them directly; these bindings keep the not-yet-moved inline
-    # extractors below (and the module-level per-language method helpers)
-    # working while the per-language moves land, and are removed with them.
-    from vco_lib.codegraph_lang._shared import (
-        _extract_balanced_block,
-        _extract_external_calls,
-        _is_minified_content,
-    )
-    # P2f stage 2: the per-language extractor registry. Each moved
+    # P2f stage 2: the per-language extractor registry. Each
     # `_analyze_<lang>_file` method below is a one-line delegator through
-    # `_codegraph_lang.EXTRACTORS[<lang_dispatch key>]`.
+    # `_codegraph_lang.EXTRACTORS[<lang_dispatch key>]`. Shared extractor
+    # helpers live in vco_lib/codegraph_lang/_shared (imported by the
+    # language modules directly; nothing in THIS file uses them anymore).
     from vco_lib import codegraph_lang as _codegraph_lang
 except ImportError as _exc:  # noqa: F841 — used in the message below
     sys.stderr.write(
