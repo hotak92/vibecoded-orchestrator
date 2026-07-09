@@ -118,9 +118,26 @@ check_workflow_last_run() {
     # rule applies to the release branch + main, not "any branch in
     # the repo". Filter by `--branch main` so the check matches the
     # rule's actual scope.
+    #
+    # v0.2.76 fix (step22 blind-spot): a workflow that is PR-trigger-only
+    # has ZERO completed runs on main, and the pre-fix code routed that
+    # empty result to the SAME benign "Could not fetch run status" WARN as
+    # a genuine gh-api error. step22 shipped RED on every PR run for ~1
+    # month; the main-only query saw zero rows and waved it through as a
+    # benign zero-runs WARN. Now we DISTINGUISH the two empty cases:
+    #   - gh-api error (non-zero exit)          → LOUD advisory WARN (scope named).
+    #   - zero completed runs on main (exit 0)  → FALL BACK to the latest
+    #     completed run on ANY branch:
+    #       * that run failed/cancelled/timed_out → LOUD WARN naming the
+    #         branch+conclusion ("no main run yet but last run FAILED —
+    #         investigate before relying on the main-gate"). NOT a hard
+    #         FAIL: a non-main red (e.g. a Dependabot PR) can be unrelated.
+    #       * that run succeeded                 → informational zero-runs WARN.
+    #       * no runs anywhere / any-branch gh error → informational WARN.
+    # Cross-workflow-generic on purpose: helps the NEXT PR-only workflow too.
     local wf="$1"
     local name="$2"
-    local conclusion
+    local conclusion rc
     conclusion="$(gh run list \
         --repo "$REPO" \
         --workflow "$wf" \
@@ -128,13 +145,68 @@ check_workflow_last_run() {
         --status completed \
         --limit 1 \
         --json conclusion \
-        --jq '.[0].conclusion' 2>/dev/null || echo "unknown")"
-    if [ "$conclusion" = "success" ]; then
+        --jq '.[0].conclusion' 2>/dev/null)"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        # gh itself failed (auth, network, unknown workflow) — this is NOT
+        # a confirmation of zero runs. Keep the loud-advisory posture.
+        gate_warn "$name" \
+            "LOUD ADVISORY — could not query main runs of $wf (gh exit $rc). This is NOT a confirmation the workflow is green. Fix: gh auth status, then re-run this gate."
+    elif [ "$conclusion" = "success" ]; then
         gate_pass "$name"
-    elif [ "$conclusion" = "unknown" ] || [ -z "$conclusion" ]; then
-        gate_warn "$name" "Could not fetch run status (is gh authenticated? try: gh auth status)"
-    else
+    elif [ -n "$conclusion" ]; then
+        # A completed main run exists and it was not "success".
         gate_fail "$name" "Last run conclusion on main: $conclusion"
+    else
+        # Zero completed runs on main (gh succeeded, returned no rows).
+        # Fall back to the latest COMPLETED run on ANY branch so a PR-only
+        # workflow that is silently red does not slip through as benign.
+        _check_workflow_any_branch_fallback "$wf" "$name"
+    fi
+}
+
+_check_workflow_any_branch_fallback() {
+    # Helper for check_workflow_last_run: called only when a workflow has
+    # ZERO completed runs on main. Inspects the most-recent COMPLETED run
+    # on ANY branch and emits a LOUD WARN if that run was red, so a
+    # PR-trigger-only workflow that has never run on main but is failing on
+    # every PR is visible to a human instead of waved through.
+    #   $1 = workflow filename, $2 = friendly name.
+    local wf="$1"
+    local name="$2"
+    local any_json any_rc any_conclusion any_branch
+    # --status completed so an in-progress dispatch doesn't yield an empty
+    # conclusion; --json conclusion,headBranch to name the offending branch.
+    any_json="$(gh run list \
+        --repo "$REPO" \
+        --workflow "$wf" \
+        --status completed \
+        --limit 1 \
+        --json conclusion,headBranch \
+        --jq '.[0] | [(.conclusion // ""), (.headBranch // "")] | join("|")' 2>/dev/null)"
+    any_rc=$?
+    if [ "$any_rc" -ne 0 ]; then
+        gate_warn "$name" \
+            "No completed run on main yet; LOUD ADVISORY — could not query any-branch runs of $wf (gh exit $any_rc) to cross-check. Re-run after: gh auth status."
+        return
+    fi
+    any_conclusion="${any_json%%|*}"
+    any_branch="${any_json#*|}"
+    if [ -z "$any_conclusion" ]; then
+        # No completed runs anywhere (brand-new workflow that has never
+        # finished a run). Informational only — nothing red to point at.
+        gate_warn "$name" \
+            "No completed runs found on any branch for $wf yet (workflow may have just landed; let it run before relying on the main-gate)."
+    elif [ "$any_conclusion" = "success" ]; then
+        # Latest any-branch run is green — zero main runs is genuinely
+        # just "hasn't run on main yet". Informational.
+        gate_warn "$name" \
+            "No completed run on main yet; latest run (on ${any_branch:-unknown}) was success. Informational — will become a real green/red assertion once it runs on main."
+    else
+        # Latest any-branch run is RED. Loud — a human must look. NOT a
+        # hard FAIL (a non-main red can be an unrelated Dependabot PR).
+        gate_warn "$name" \
+            "LOOK HERE — this workflow has NO main run yet but its last run (on ${any_branch:-unknown}) concluded ${any_conclusion}. INVESTIGATE before relying on the main-gate: a PR-only workflow can be red on every PR while the main-only query waves it through as benign."
     fi
 }
 
@@ -331,13 +403,18 @@ check_workflow_last_run "codeql.yml" "CodeQL analysis (codeql.yml)"
 check_workflow_last_run "hook-parity.yml" "Hook OS-parity gate (hook-parity.yml)"
 
 # Gate 24: Step22 multi-project access matrix (v0.2.75 P2b).
-# Zero-runs behavior (verified 2026-07-07): with no completed run on
-# main, `gh run list --jq '.[0].conclusion'` prints an EMPTY string,
-# which check_workflow_last_run routes to gate_warn ("Could not fetch
-# run status") — i.e. zero runs is already skip-with-warning, NOT a
-# hard fail. Until the first path-touching push lands on main (the
-# workflow gained a `push: branches: [main]` trigger in v0.2.75), this
-# gate WARNs; after that it is a real green/red assertion.
+# Zero-runs behavior (v0.2.76 hardening): when this workflow has no
+# completed run on main, check_workflow_last_run no longer emits the
+# benign "Could not fetch run status" WARN. It now FALLS BACK to the
+# latest completed run on ANY branch and, if that run was red, emits a
+# LOUD "LOOK HERE … INVESTIGATE before relying on the main-gate" WARN
+# naming the branch+conclusion (still a WARN, not a hard FAIL, since a
+# non-main red can be an unrelated Dependabot PR). This closes the blind
+# spot that let step22 ship RED on every PR run for ~1 month in v0.2.75
+# while the main-only query saw zero rows and waved it through. Once the
+# workflow's `push: branches: [main]` trigger lands a completed main run,
+# this becomes a real green/red assertion. Generic — every PR-only
+# workflow added after this benefits from the same fallback.
 check_workflow_last_run "step22-multi-project-access-matrix.yml" "Step22 access matrix (step22-multi-project-access-matrix.yml)"
 
 echo ""
