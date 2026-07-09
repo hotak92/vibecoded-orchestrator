@@ -50,6 +50,10 @@ pub mod module_identity;
 pub mod module_supervisor;
 pub mod module_db_api;
 pub mod modules_api;
+// v0.2.76 Part 4 — per-project resolver tokens (`hub.token.<id>`) minted
+// at startup so `/env` + `/config` callers present a project-scoped
+// credential instead of the coarse hub-wide `hub.token`.
+pub mod project_tokens;
 pub mod project_state_api;
 pub mod retrieval_tuning_io;
 pub mod rl_events_api;

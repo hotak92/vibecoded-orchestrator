@@ -19,8 +19,8 @@ use tower_http::cors::{Any, CorsLayer};
 
 use super::{
     api, auth, cli_api, config_api, db, infra_watchdog, lifecycle_api, mcp_tool_grants_api,
-    module_db_api, module_supervisor, modules_api, project_state_api, rl_events_api, secrets_api,
-    weaviate_probe,
+    module_db_api, module_supervisor, modules_api, project_state_api, project_tokens,
+    rl_events_api, secrets_api, weaviate_probe,
 };
 
 const DEFAULT_PORT: u16 = 7700;
@@ -98,6 +98,17 @@ pub async fn start_hub_server() -> Result<u16, String> {
     auth::write_token_file(&auth_token)
         .map_err(|e| format!("Failed to write hub.token: {}", e))?;
     let auth_state = auth::AuthState::new(auth_token);
+
+    // v0.2.76 Part 4 — per-project resolver tokens. Minted AFTER the
+    // global hub.token so its 0o600 write discipline is already proven on
+    // this state dir. Reads the launcher.db project registry, writes one
+    // `hub.token.<project_id>` per project, cleans up stale files for
+    // deleted projects, and returns the in-memory registry the auth
+    // middleware consults to accept a project-scoped bearer on the
+    // `/env` + `/config` routes (with the global token still accepted for
+    // the one-release compat window). Soft-fail throughout — an empty
+    // registry just means every resolver falls back to the global token.
+    let project_token_registry = project_tokens::mint_project_tokens(&launcher_state.0);
 
     // Write port file so other apps can discover us. Token first, port
     // second: resolvers discover the port and then read the token, so
@@ -204,6 +215,11 @@ pub async fn start_hub_server() -> Result<u16, String> {
         .layer(axum::Extension(launcher_state.clone()))
         .layer(axum::middleware::from_fn(auth::require_auth))
         .layer(axum::Extension(auth_state))
+        // v0.2.76 Part 4 — the per-project token registry, read by
+        // `auth::require_auth` to accept a project-scoped bearer on the
+        // `/env` + `/config` routes. Injected alongside `auth_state` so the
+        // middleware pulls both from request extensions.
+        .layer(axum::Extension(project_token_registry))
         .layer(cors);
 
     // Bind-address rationale — 127.0.0.1 DEFAULT, 0.0.0.0 OPT-IN (E-2,
