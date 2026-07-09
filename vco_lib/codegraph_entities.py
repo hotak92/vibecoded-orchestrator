@@ -126,11 +126,11 @@ class CodeEntity:
         """The dedup identity string ``_dedup_insert`` keys the deterministic
         UUID on. Mirrors the pre-P2f per-site expressions exactly:
 
-          * module/class/function → ``full_name`` if set else ``name``;
+          * class/function → ``full_name`` if set else ``name``;
           * api → ``endpoint + ":" + method``;
-          * interaction → ``ix::<source>::<endpoint>`` (built by the caller and
-            passed as ``extras['_identity_key']`` because the source token is
-            not otherwise a property).
+          * module → ``module::<path>`` and interaction →
+            ``ix::<source>::<endpoint>`` — neither key is a stored property, so
+            the caller pins it via ``extras['_identity_key']`` (checked first).
         """
         # A caller may pin the exact identity string via extras['_identity_key']
         # (used where the key is not a stored property — the interaction source
