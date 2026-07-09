@@ -7233,17 +7233,16 @@ class CodeGraphAnalyzer:
             # (model-agnostic), but downstream language-filtered retrieval
             # (--language=lua scopes) was silently never matching.
 
-            insert_params: Dict[str, Any] = {
-                "properties": {
-                    "name": class_name, "full_name": f"{file_path.stem}.{class_name}",
-                    "class_body": body, "methods": methods, "signature": signature,
-                    "doc": "", "start_line": start_line, "end_line": start_line,
-                    "project": self.project_name,
-                },
-                "references": {"module": module_uuid},
-            }
-            insert_params["_deferred_embed"] = lambda: embed_class(signature, "", methods=methods, language="lua")
-            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
+            self.store_entity(CodeEntity(
+                kind=KIND_CLASS, file_path_rel=relative_path,
+                name=class_name, full_name=f"{file_path.stem}.{class_name}",
+                body=body, signature=signature,
+                doc="", start_line=start_line, end_line=start_line,
+                project=self.project_name,
+                extras={"methods": methods},
+                references={"module": module_uuid},
+                deferred_embed=lambda: embed_class(signature, "", methods=methods, language="lua"),
+            ))
             stats['classes'] += 1
 
         # Extract standalone functions (skip class methods already indexed)
@@ -7266,18 +7265,16 @@ class CodeGraphAnalyzer:
             # V52-O.11.H (v0.2.52, 2026-06-09): see comment on the Lua class
             # embed_class call above — same fix for the function path.
 
-            insert_params = {
-                "properties": {
-                    "name": func_name.split('.')[-1].split(':')[-1],
-                    "full_name": func_full_name,
-                    "function_body": body, "signature": f"{func_name}({args_str})",
-                    "doc": "", "start_line": start_line, "end_line": end_line,
-                    "is_async": False, "project": self.project_name,
-                },
-                "references": {"module": module_uuid},
-            }
-            insert_params["_deferred_embed"] = lambda: embed_function(f"function {func_name}({args_str})", body, language="lua")
-            self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
+            self.store_entity(CodeEntity(
+                kind=KIND_FUNCTION, file_path_rel=relative_path,
+                name=func_name.split('.')[-1].split(':')[-1],
+                full_name=func_full_name,
+                body=body, signature=f"{func_name}({args_str})",
+                doc="", start_line=start_line, end_line=end_line,
+                is_async=False, project=self.project_name,
+                references={"module": module_uuid},
+                deferred_embed=lambda: embed_function(f"function {func_name}({args_str})", body, language="lua"),
+            ))
             stats['functions'] += 1
 
         # Cross-language interactions
@@ -7378,19 +7375,16 @@ class CodeGraphAnalyzer:
             embedding = generate_embedding(
                 f"{signature}\nMethods: {', '.join(methods[:10])}\n{class_body[:500]}"
             )
-            insert_params: Dict[str, Any] = {
-                "properties": {
-                    "name": cname, "full_name": f"{file_path.stem}.{cname}",
-                    "class_body": class_body, "methods": methods[:20],
-                    "signature": signature, "doc": "",
-                    "start_line": start_line, "end_line": start_line + len(class_lines),
-                    "project": self.project_name,
-                },
-                "references": {"module": module_uuid},
-            }
-            if embedding:
-                insert_params["vector"] = _shape_for_insert(embedding)
-            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
+            self.store_entity(CodeEntity(
+                kind=KIND_CLASS, file_path_rel=relative_path,
+                name=cname, full_name=f"{file_path.stem}.{cname}",
+                body=class_body, signature=signature, doc="",
+                start_line=start_line, end_line=start_line + len(class_lines),
+                project=self.project_name,
+                extras={"methods": methods[:20]},
+                references={"module": module_uuid},
+                vector=_shape_for_insert(embedding) if embedding else None,
+            ))
             stats['classes'] += 1
 
         # Extract method implementations
@@ -7401,17 +7395,15 @@ class CodeGraphAnalyzer:
             body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
             full_name = f"{file_path.stem}.{class_name}.{method_name}"
             signature = f"{class_name}::{method_name}({args_str})"
-            insert_params = {
-                "properties": {
-                    "name": method_name, "full_name": full_name,
-                    "function_body": body, "signature": signature,
-                    "doc": "", "start_line": start_line, "end_line": end_line,
-                    "is_async": False, "project": self.project_name,
-                },
-                "references": {"module": module_uuid},
-            }
-            insert_params["_deferred_embed"] = lambda: embed_function(signature, body, language="cpp")
-            self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
+            self.store_entity(CodeEntity(
+                kind=KIND_FUNCTION, file_path_rel=relative_path,
+                name=method_name, full_name=full_name,
+                body=body, signature=signature, doc="",
+                start_line=start_line, end_line=end_line,
+                is_async=False, project=self.project_name,
+                references={"module": module_uuid},
+                deferred_embed=lambda: embed_function(signature, body, language="cpp"),
+            ))
             stats['functions'] += 1
 
         # Cross-language interactions (C++ uses #include as import gate)
@@ -7512,18 +7504,16 @@ class CodeGraphAnalyzer:
             # MCP path. Mirrors V52-O.11.F (Rust); Go uses receiver
             # syntax instead of `impl` blocks (see helper docstring).
             methods = _go_methods_for_struct(content_clean, sname, source_lines)
-            insert_params: Dict[str, Any] = {
-                "properties": {
-                    "name": sname, "full_name": f"{pkg_name}.{sname}",
-                    "class_body": class_body, "methods": methods[:20],
-                    "signature": signature, "doc": "",
-                    "start_line": start_line, "end_line": start_line + len(class_lines),
-                    "project": self.project_name,
-                },
-                "references": {"module": module_uuid},
-            }
-            insert_params["_deferred_embed"] = lambda: embed_class(signature, class_body, language="go")
-            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
+            self.store_entity(CodeEntity(
+                kind=KIND_CLASS, file_path_rel=relative_path,
+                name=sname, full_name=f"{pkg_name}.{sname}",
+                body=class_body, signature=signature, doc="",
+                start_line=start_line, end_line=start_line + len(class_lines),
+                project=self.project_name,
+                extras={"methods": methods[:20]},
+                references={"module": module_uuid},
+                deferred_embed=lambda: embed_class(signature, class_body, language="go"),
+            ))
             stats['classes'] += 1
 
         # Function entries
@@ -7536,17 +7526,15 @@ class CodeGraphAnalyzer:
             body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
             full_name = f"{pkg_name}.{fname}"
             signature = f"func {fname}({args_str})"
-            insert_params = {
-                "properties": {
-                    "name": fname, "full_name": full_name,
-                    "function_body": body, "signature": signature,
-                    "doc": "", "start_line": start_line, "end_line": end_line,
-                    "is_async": False, "project": self.project_name,
-                },
-                "references": {"module": module_uuid},
-            }
-            insert_params["_deferred_embed"] = lambda: embed_function(signature, body, language="go")
-            self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
+            self.store_entity(CodeEntity(
+                kind=KIND_FUNCTION, file_path_rel=relative_path,
+                name=fname, full_name=full_name,
+                body=body, signature=signature, doc="",
+                start_line=start_line, end_line=end_line,
+                is_async=False, project=self.project_name,
+                references={"module": module_uuid},
+                deferred_embed=lambda: embed_function(signature, body, language="go"),
+            ))
             stats['functions'] += 1
 
         # Cross-language interactions
@@ -7787,19 +7775,17 @@ class CodeGraphAnalyzer:
             # in V52-O.11.F. Java fix mirrors via `_java_methods_for_class`.
             methods = _java_methods_for_class(content_clean, cname, source_lines)
             signature = f"class {cname}"
-            insert_params: Dict[str, Any] = {
-                "properties": {
-                    "name": cname,
-                    "full_name": f"{pkg_name}.{cname}" if pkg_name else cname,
-                    "class_body": class_body, "methods": methods[:20],
-                    "signature": signature, "doc": "",
-                    "start_line": start_line, "end_line": start_line + len(class_lines),
-                    "project": self.project_name,
-                },
-                "references": {"module": module_uuid},
-            }
-            insert_params["_deferred_embed"] = lambda: embed_class(signature, class_body, methods=methods[:10], language="java")
-            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
+            self.store_entity(CodeEntity(
+                kind=KIND_CLASS, file_path_rel=relative_path,
+                name=cname,
+                full_name=f"{pkg_name}.{cname}" if pkg_name else cname,
+                body=class_body, signature=signature, doc="",
+                start_line=start_line, end_line=start_line + len(class_lines),
+                project=self.project_name,
+                extras={"methods": methods[:20]},
+                references={"module": module_uuid},
+                deferred_embed=lambda: embed_class(signature, class_body, methods=methods[:10], language="java"),
+            ))
             stats['classes'] += 1
 
         for m in method_pattern.finditer(content_clean):
@@ -7816,17 +7802,15 @@ class CodeGraphAnalyzer:
             )
             full_name = f"{enclosing}.{mname}"
             signature = f"{mname}({args_str})"
-            insert_params = {
-                "properties": {
-                    "name": mname, "full_name": full_name,
-                    "function_body": body, "signature": signature,
-                    "doc": "", "start_line": start_line, "end_line": end_line,
-                    "is_async": False, "project": self.project_name,
-                },
-                "references": {"module": module_uuid},
-            }
-            insert_params["_deferred_embed"] = lambda: embed_function(signature, body, language="java")
-            self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
+            self.store_entity(CodeEntity(
+                kind=KIND_FUNCTION, file_path_rel=relative_path,
+                name=mname, full_name=full_name,
+                body=body, signature=signature, doc="",
+                start_line=start_line, end_line=end_line,
+                is_async=False, project=self.project_name,
+                references={"module": module_uuid},
+                deferred_embed=lambda: embed_function(signature, body, language="java"),
+            ))
             stats['functions'] += 1
 
         # Cross-language interactions
@@ -7916,18 +7900,16 @@ class CodeGraphAnalyzer:
             class_body = '\n'.join(class_lines)
             methods = [m.group(1) for m in func_pattern.finditer(content_clean)]
             signature = f"class {cname}"
-            insert_params: Dict[str, Any] = {
-                "properties": {
-                    "name": cname, "full_name": f"{file_path.stem}.{cname}",
-                    "class_body": class_body, "methods": methods[:20],
-                    "signature": signature, "doc": "",
-                    "start_line": start_line, "end_line": start_line + len(class_lines),
-                    "project": self.project_name,
-                },
-                "references": {"module": module_uuid},
-            }
-            insert_params["_deferred_embed"] = lambda: embed_class(signature, class_body, methods=methods[:10], language="ruby")
-            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
+            self.store_entity(CodeEntity(
+                kind=KIND_CLASS, file_path_rel=relative_path,
+                name=cname, full_name=f"{file_path.stem}.{cname}",
+                body=class_body, signature=signature, doc="",
+                start_line=start_line, end_line=start_line + len(class_lines),
+                project=self.project_name,
+                extras={"methods": methods[:20]},
+                references={"module": module_uuid},
+                deferred_embed=lambda: embed_class(signature, class_body, methods=methods[:10], language="ruby"),
+            ))
             stats['classes'] += 1
 
         for m in func_pattern.finditer(content_clean):
@@ -7942,17 +7924,15 @@ class CodeGraphAnalyzer:
             )
             full_name = f"{enclosing}.{fname}"
             signature = f"def {fname}({args_str})"
-            insert_params = {
-                "properties": {
-                    "name": fname, "full_name": full_name,
-                    "function_body": body, "signature": signature,
-                    "doc": "", "start_line": start_line, "end_line": end_line,
-                    "is_async": False, "project": self.project_name,
-                },
-                "references": {"module": module_uuid},
-            }
-            insert_params["_deferred_embed"] = lambda: embed_function(signature, body, language="ruby")
-            self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
+            self.store_entity(CodeEntity(
+                kind=KIND_FUNCTION, file_path_rel=relative_path,
+                name=fname, full_name=full_name,
+                body=body, signature=signature, doc="",
+                start_line=start_line, end_line=end_line,
+                is_async=False, project=self.project_name,
+                references={"module": module_uuid},
+                deferred_embed=lambda: embed_function(signature, body, language="ruby"),
+            ))
             stats['functions'] += 1
 
         # Cross-language interactions
@@ -8029,17 +8009,15 @@ class CodeGraphAnalyzer:
             body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
             full_name = f"{file_path.stem}.{fname}"
             signature = f"{fname}()"
-            insert_params = {
-                "properties": {
-                    "name": fname, "full_name": full_name,
-                    "function_body": body, "signature": signature,
-                    "doc": "", "start_line": start_line, "end_line": end_line,
-                    "is_async": False, "project": self.project_name,
-                },
-                "references": {"module": module_uuid},
-            }
-            insert_params["_deferred_embed"] = lambda: embed_function(signature, body, language="python")
-            self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
+            self.store_entity(CodeEntity(
+                kind=KIND_FUNCTION, file_path_rel=relative_path,
+                name=fname, full_name=full_name,
+                body=body, signature=signature, doc="",
+                start_line=start_line, end_line=end_line,
+                is_async=False, project=self.project_name,
+                references={"module": module_uuid},
+                deferred_embed=lambda: embed_function(signature, body, language="python"),
+            ))
             stats['functions'] += 1
 
         # Cross-language interactions (shell: gate on curl/wget presence in content)
