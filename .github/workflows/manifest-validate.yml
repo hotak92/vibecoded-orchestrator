@@ -95,9 +95,13 @@ jobs:
     runs-on: ubuntu-latest
     # CI-9 (v0.2.42): explicit timeout prevents runaway Rust compilations
     # from burning unbounded CI minutes. The job typically finishes in 4-6 min
-    # (cached) or 8-10 min (cold); 12 min gives headroom without leaving
-    # it unbounded.
-    timeout-minutes: 12
+    # (cached) or 8-10 min (cold). Raised 12 -> 20 (v0.2.75): the v0.2.75 tag
+    # push hit a cold cargo build + a slow image/network stall that rode the
+    # full 12 min and was killed mid-build (a spurious "manifest validate
+    # failure" that was really a timeout). 20 min = ~2x the cold-build time,
+    # real headroom for a cache-miss + slow-runner combo, still bounded well
+    # short of a genuine runaway.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
