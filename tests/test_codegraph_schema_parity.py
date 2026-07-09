@@ -9,15 +9,15 @@ specs that three writer families must agree on:
      the template must run standalone at user sites, so it cannot import
      vco_lib there);
   2. migration edge ``migrations/codegraph_collection/4_to_5.py``
-     (embed_revision + chunk props) — consumes the shared home with a
-     MINIMAL inline fallback;
+     (embed_revision + chunk props) — imports the shared home DIRECTLY;
   3. migration edge ``5_to_6.py`` (is_test + n_callers) — same shape.
 
 THIS FILE IS THE LOCK. It asserts:
   * the analyzer's ensured ``(class, prop, type)`` set is EQUAL to the
     shared table (probed at runtime through the real methods, not regex);
-  * each edge's ``_FALLBACK_SPECS`` equals the shared table filtered to the
-    edge's owned subset (``specs_subset``), descriptions included;
+  * X-1 / v0.2.76 (ruling #1): each edge's inline fallback (``_FALLBACK_SPECS``
+    / ``_fallback_ensure``) + the legacy regex prefix-fallback are GONE — the
+    edges import the shared home directly and loud-fail on a broken install;
   * the edge subsets jointly cover every prop in the shared table (a new
     table prop without an owning edge fails here — write the edge, then
     add it to ``_EDGE_SUBSETS`` below);
@@ -183,26 +183,40 @@ _EDGE_SUBSETS = (
 
 
 @pytest.mark.parametrize("label,path,subset_attr", _EDGE_SUBSETS)
-def test_edge_fallback_specs_match_shared_table(label, path, subset_attr):
-    """Each edge's MUST-MATCH inline fallback equals the shared table
-    filtered to the edge's owned props — full tuples, descriptions
-    included (the fallback IS the shared spec, just inlined)."""
-    edge = _load_module(f"_p2d_parity_edge_{label}", path)
-    subset = getattr(edge, subset_attr)
-    assert edge._FALLBACK_SPECS == specs_subset(subset), (
-        f"{label}._FALLBACK_SPECS drifted from "
-        f"specs_subset({subset_attr}) — the fallback is a MUST-MATCH "
-        "inline copy of vco_lib/codegraph_schema.py"
-    )
+def test_edge_has_no_inline_fallback_after_x1(label, path, subset_attr):
+    """X-1 / v0.2.76 (ruling #1): the edges' inline fallback copies are GONE.
+    They import ``vco_lib.codegraph_schema`` directly and fail loudly on a
+    broken install rather than silently degrading to an inline copy. Grep-gate
+    the removed symbol DEFINITIONS so a regression can't quietly reintroduce a
+    silent fallback arm. (Prose mentions in the docstring are fine — we match
+    the definition sites, not the word.)"""
+    import re as _re
+
+    text = path.read_text(encoding="utf-8")
+    banned_defs = {
+        "_FALLBACK_SPECS assignment": r"(?m)^_FALLBACK_SPECS\s*=",
+        "_fallback_ensure def": r"(?m)^def\s+_fallback_ensure\b",
+        # The legacy regex prefix-fallback (ruling #1): the resolver must use
+        # canonical_class_prefix and let ImportError propagate.
+        "legacy re.sub prefix fallback": r"re\.sub\(",
+    }
+    for what, pat in banned_defs.items():
+        assert not _re.search(pat, text), (
+            f"{label}: the {what} is back — the silent inline fallback was "
+            "removed in X-1 (v0.2.76). The edge must import "
+            "vco_lib.codegraph_schema / codegraph_naming directly and loud-fail "
+            "on ImportError."
+        )
+    # The edge DOES import the shared home directly now.
+    assert "from vco_lib.codegraph_schema import" in text
+    assert "from vco_lib.codegraph_naming import canonical_class_prefix" in text
 
 
 @pytest.mark.parametrize("label,path,subset_attr", _EDGE_SUBSETS)
 def test_edge_live_path_routes_through_shared_home(label, path, subset_attr):
-    """The edges' LIVE path (vco_lib importable — the common case; the
-    runner executes edges with cwd=<project_root>) must route through
-    ensure_codegraph_properties with the edge's subset. Guard against the
-    dead-fallback trap: this exercises the import branch, not the inline
-    copy."""
+    """The edges' path (vco_lib importable — every healthy install; the runner
+    executes edges with cwd=<project_root>) routes through
+    ensure_codegraph_properties with the edge's subset."""
     edge = _load_module(f"_p2d_parity_live_{label}", path)
     subset = set(getattr(edge, subset_attr))
     expected_classes = {
@@ -220,6 +234,37 @@ def test_edge_live_path_routes_through_shared_home(label, path, subset_attr):
         p.name for coll in colls.values() for p in coll.added
     }
     assert added == subset
+
+
+@pytest.mark.parametrize("label,path,subset_attr", _EDGE_SUBSETS)
+def test_edge_loud_fails_on_broken_install(label, path, subset_attr, monkeypatch):
+    """X-1 / v0.2.76 (ruling #1): a broken install (vco_lib import fails during
+    the property-ensure) is a LOUD non-zero exit with the broken-install
+    message on stderr — NOT a silent inline-copy degrade. Simulate it by
+    forcing ``_ensure_props`` to raise ImportError, with a resolvable prefix +
+    a stub Weaviate client so ``main`` reaches the ensure step."""
+    import io
+    from contextlib import redirect_stderr
+
+    edge = _load_module(f"_p2d_parity_loud_{label}", path)
+    monkeypatch.setenv("CODE_GRAPH_PROJECT", "P")  # prefix resolvable
+    monkeypatch.setattr(
+        edge, "_connect", lambda: types.SimpleNamespace(close=lambda: None)
+    )
+
+    def _boom(_client, _prefix):
+        raise ImportError("No module named 'vco_lib'")
+
+    monkeypatch.setattr(edge, "_ensure_props", _boom)
+
+    buf = io.StringIO()
+    with redirect_stderr(buf):
+        rc = edge.main()
+    assert rc == 1, f"{label}: broken install must exit non-zero, got {rc}"
+    err = buf.getvalue()
+    assert "vco_lib not importable" in err and "install.py" in err, (
+        f"{label}: broken-install message missing from stderr: {err!r}"
+    )
 
 
 def test_edge_subsets_cover_whole_table():

@@ -40,11 +40,16 @@ reaches the v5 shape whichever path runs first.
 P2d (v0.2.75): the property SPECS + the ensure-if-missing loop live in ONE
 shared home — ``vco_lib/codegraph_schema.py``. NEW PROPS: add them to
 ``vco_lib/codegraph_schema.py`` FIRST (``tests/test_codegraph_schema_parity.py``
-locks the table against the analyzer's ``_ensure_*`` helpers AND this edge's
-fallback), then extend the edge subset + fallback. The inline
-``_FALLBACK_SPECS`` / ``_fallback_ensure`` below cover only the
-vco_lib-unimportable window (torn checkout) — keep them MINIMAL and in
-MUST-MATCH lock-step with the shared home.
+locks the table against the analyzer's ``_ensure_*`` helpers), then extend the
+edge subset ``_V5_PROPS``.
+
+X-1 / v0.2.76 (ruling #1 — loud-fail, never silent-degrade): the previous inline
+``_FALLBACK_SPECS`` / ``_fallback_ensure`` copies + the ``canonical_class_prefix``
+legacy-regex fallback are GONE. The runner executes this edge with
+``cwd=<project_root>`` where ``vco_lib`` is editable-installed on every healthy
+install, so a failing ``import vco_lib`` means a BROKEN install — surfaced as a
+loud stderr message + non-zero exit (which the runner treats as defer-and-retry),
+NOT a quiet inline-copy degrade that masks the breakage.
 """
 
 from __future__ import annotations
@@ -58,32 +63,13 @@ import sys
 # vco_lib.codegraph_schema.CODEGRAPH_PROPERTY_SPECS filtered to this subset.
 _V5_PROPS = ("embed_revision", "chunk_num", "total_chunks")
 
-_EMBED_REVISION_DESC = (
-    "Embedding-generation revision this row's vector(s) were produced under "
-    "(P7 revision-gated forced resync; see CODEGRAPH_EMBED_REVISION)"
+# X-1 / v0.2.76: the loud broken-install message shared by both vco_lib import
+# sites (prefix resolution + property ensure).
+_BROKEN_INSTALL_MSG = (
+    "4_to_5: vco_lib not importable — VCO install is broken; run install.py. "
+    "(The migration runner executes this edge from the project root where "
+    "vco_lib is editable-installed on every healthy install.)"
 )
-_CHUNK_NUM_DESC = "0-indexed chunk number within this entity (0 for single-chunk)"
-_TOTAL_CHUNKS_DESC = "Total chunk count for this entity (1 for single-chunk)"
-
-# MUST-MATCH vco_lib/codegraph_schema.py: ``specs_subset(_V5_PROPS)`` — the
-# class-name-suffix → ((prop, DataType name, description), ...) projection.
-# Consumed ONLY by the inline fallback; parity is asserted by
-# tests/test_codegraph_schema_parity.py.
-_FALLBACK_SPECS = {
-    "CodeModule": (("embed_revision", "INT", _EMBED_REVISION_DESC),),
-    "CodeClass": (
-        ("embed_revision", "INT", _EMBED_REVISION_DESC),
-        ("chunk_num", "INT", _CHUNK_NUM_DESC),
-        ("total_chunks", "INT", _TOTAL_CHUNKS_DESC),
-    ),
-    "CodeFunction": (
-        ("embed_revision", "INT", _EMBED_REVISION_DESC),
-        ("chunk_num", "INT", _CHUNK_NUM_DESC),
-        ("total_chunks", "INT", _TOTAL_CHUNKS_DESC),
-    ),
-    "CodeAPI": (("embed_revision", "INT", _EMBED_REVISION_DESC),),
-    "CodeInteraction": (("embed_revision", "INT", _EMBED_REVISION_DESC),),
-}
 
 
 def _resolve_codegraph_prefix() -> str | None:
@@ -93,9 +79,13 @@ def _resolve_codegraph_prefix() -> str | None:
 
     ``CODE_GRAPH_PROJECT`` (already the sanitized prefix the analyzer uses)
     wins; else derive it from ``PROJECT_NAME`` via the SAME
-    ``canonical_class_prefix`` helper + legacy regex fallback so we probe the
-    class name the analyzer actually wrote. Returns ``None`` when neither is
-    set (the runner then has nothing to patch for this project).
+    ``canonical_class_prefix`` helper so we probe the class name the analyzer
+    actually wrote. Returns ``None`` when neither is set (the runner then has
+    nothing to patch for this project).
+
+    X-1 / v0.2.76 (ruling #1): a failing ``import vco_lib`` is a broken install
+    — it raises loudly (→ ``main`` prints + exits non-zero), never a legacy
+    regex fallback.
     """
     cg = (os.environ.get("CODE_GRAPH_PROJECT") or "").strip()
     if cg:
@@ -103,19 +93,10 @@ def _resolve_codegraph_prefix() -> str | None:
     pn = (os.environ.get("PROJECT_NAME") or "").strip()
     if not pn:
         return None
-    try:
-        # Prefer the shared canonical helper (must match the analyzer).
-        sys.path.insert(0, os.getcwd())
-        from vco_lib.project_naming import canonical_class_prefix
+    sys.path.insert(0, os.getcwd())
+    from vco_lib.codegraph_naming import canonical_class_prefix
 
-        return canonical_class_prefix(pn)
-    except Exception:
-        # Legacy fallback identical to _sanitize_collection_prefix's:
-        # non-[A-Za-z0-9_] -> "_", uppercase a leading lowercase letter.
-        sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", pn)
-        if sanitized and sanitized[0].isalpha() and not sanitized[0].isupper():
-            sanitized = sanitized[0].upper() + sanitized[1:]
-        return sanitized or None
+    return canonical_class_prefix(pn)
 
 
 def _connect():
@@ -145,61 +126,32 @@ def _connect():
     )
 
 
-def _fallback_ensure(client, prefix: str, specs) -> dict:
-    """MINIMAL inline copy of
-    ``vco_lib.codegraph_schema.ensure_codegraph_properties`` — MUST-MATCH its
-    semantics (absent class skipped → ``"absent"``; already-present prop
-    skipped silently; skip-vectorized add; present class → ``"ensured"``).
-    Runs ONLY when vco_lib is unimportable (torn checkout)."""
-    from weaviate.classes.config import DataType, Property
-
-    results = {}
-    for suffix, prop_specs in specs.items():
-        class_name = f"{prefix}_{suffix}"
-        if not client.collections.exists(class_name):
-            results[class_name] = "absent"
-            continue
-        coll = client.collections.get(class_name)
-        existing = {p.name for p in coll.config.get().properties}
-        for prop_name, dtype_name, desc in prop_specs:
-            if prop_name in existing:
-                continue
-            coll.config.add_property(
-                Property(
-                    name=prop_name,
-                    data_type=getattr(DataType, dtype_name),
-                    description=desc,
-                    skip_vectorization=True,
-                )
-            )
-        results[class_name] = "ensured"
-    return results
-
-
 def _ensure_props(client, prefix: str) -> dict:
-    """Run the shared property-ensure loop, falling back to the inline copy.
+    """Run the shared property-ensure loop from ``vco_lib.codegraph_schema``.
 
-    Import-with-fallback deliberately mirrors ``_resolve_codegraph_prefix``'s
-    ``canonical_class_prefix`` shape: the runner executes this edge with
-    ``cwd=<project_root>``, so ``vco_lib`` is importable in the common case.
-    Only the IMPORT is guarded — a genuine ensure failure (either path)
-    propagates to ``main()`` → non-zero exit → the runner defers + retries.
+    X-1 / v0.2.76 (ruling #1): imports the shared home DIRECTLY. The runner
+    executes this edge with ``cwd=<project_root>`` where ``vco_lib`` is
+    editable-installed on every healthy install, so a failing import means a
+    BROKEN install — raised loudly (→ ``main`` prints the broken-install
+    message + exits non-zero → the runner defers + retries), never a silent
+    inline-copy degrade. A genuine ensure failure (Weaviate error) likewise
+    propagates to ``main()``.
     """
-    ensure_fn = None
-    try:
-        sys.path.insert(0, os.getcwd())
-        from vco_lib.codegraph_schema import (
-            ensure_codegraph_properties as ensure_fn,
-        )
-    except Exception:
-        ensure_fn = None
-    if ensure_fn is not None:
-        return ensure_fn(client, prefix, props_subset=_V5_PROPS)
-    return _fallback_ensure(client, prefix, _FALLBACK_SPECS)
+    sys.path.insert(0, os.getcwd())
+    from vco_lib.codegraph_schema import ensure_codegraph_properties
+
+    return ensure_codegraph_properties(client, prefix, props_subset=_V5_PROPS)
 
 
 def main() -> int:
-    prefix = _resolve_codegraph_prefix()
+    # X-1 / v0.2.76 (ruling #1): resolving the prefix imports vco_lib. A broken
+    # install fails LOUDLY here (before any Weaviate work) → non-zero exit → the
+    # runner defers + retries, never a silent legacy-regex degrade.
+    try:
+        prefix = _resolve_codegraph_prefix()
+    except ImportError as exc:
+        print(f"{_BROKEN_INSTALL_MSG} ({exc})", file=sys.stderr)
+        return 1
     if not prefix:
         # No codegraph project resolvable from env → nothing to patch for this
         # project. v0.2.74 HIGH-2: print the EDGE_NOOP_NO_PREFIX sentinel so the
@@ -218,10 +170,15 @@ def main() -> int:
 
     try:
         try:
-            # P2d: the ensure-if-missing loop lives in vco_lib/codegraph_schema
-            # (inline fallback when unimportable). Absent classes are skipped —
-            # they will be born v5-shaped by create_collections.
+            # P2d: the ensure-if-missing loop lives in vco_lib/codegraph_schema.
+            # Absent classes are skipped — they will be born v5-shaped by
+            # create_collections.
             results = _ensure_props(client, prefix)
+        except ImportError as exc:
+            # X-1 / v0.2.76 (ruling #1): a broken install (vco_lib gone) is a
+            # loud failure, not a silent inline-copy degrade.
+            print(f"{_BROKEN_INSTALL_MSG} ({exc})", file=sys.stderr)
+            return 1
         except Exception as exc:
             # A genuine add_property error is a real failure — the runner
             # must NOT advance the version on a half-applied edge. The shared

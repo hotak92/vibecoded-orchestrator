@@ -806,27 +806,32 @@ def test_edge_header_directives():
 
 
 def test_edge_scope_matches_ensure_helpers():
-    """P2d (v0.2.75): the edge's scope now lives in _V6_PROPS + the inline
-    _FALLBACK_SPECS (MUST-MATCH projection of vco_lib/codegraph_schema —
-    the full parity lock is tests/test_codegraph_schema_parity.py; this
-    pins the M1/M4 class scope locally)."""
+    """X-1 (v0.2.76): the edge's scope is _V6_PROPS; the class projection now
+    comes from the shared home ``specs_subset(_V6_PROPS)`` (the inline
+    _FALLBACK_SPECS was removed — the edge imports vco_lib.codegraph_schema
+    directly). The full parity lock is tests/test_codegraph_schema_parity.py;
+    this pins the M1/M4 class scope locally."""
+    from vco_lib.codegraph_schema import specs_subset
+
     edge = _load_module("_v0273_edge_5_to_6", _EDGE_PATH)
     assert edge._V6_PROPS == ("is_test", "n_callers")
+    subset = specs_subset(edge._V6_PROPS)
     is_test_classes = tuple(
-        cls for cls, specs in edge._FALLBACK_SPECS.items()
+        cls for cls, specs in subset.items()
         if any(p == "is_test" for p, _t, _d in specs)
     )
     n_callers_classes = tuple(
-        cls for cls, specs in edge._FALLBACK_SPECS.items()
+        cls for cls, specs in subset.items()
         if any(p == "n_callers" for p, _t, _d in specs)
     )
     assert is_test_classes == ("CodeModule", "CodeClass", "CodeFunction")
     assert n_callers_classes == ("CodeFunction",)
 
 
-def test_edge_fallback_ensure_bool_and_int_idempotent():
-    """P2d: the edge's inline fallback loop adds BOOL + INT props and skips
-    already-present ones (was: per-prop _add_prop_if_absent)."""
+def test_edge_ensure_props_bool_and_int_idempotent():
+    """X-1 (v0.2.76): the edge's ``_ensure_props`` (now a DIRECT import of
+    vco_lib.codegraph_schema.ensure_codegraph_properties — no inline fallback)
+    adds BOOL + INT props and skips already-present ones."""
     edge = _load_module("_v0273_edge_5_to_6b", _EDGE_PATH)
     coll = _EnsureColl()
     client = types.SimpleNamespace(
@@ -835,7 +840,7 @@ def test_edge_fallback_ensure_bool_and_int_idempotent():
             get=lambda name: coll,
         )
     )
-    results = edge._fallback_ensure(client, "P", edge._FALLBACK_SPECS)
+    results = edge._ensure_props(client, "P")
     assert coll.added == ["is_test", "n_callers"]
     assert results["P_CodeFunction"] == "ensured"
     assert results["P_CodeModule"] == "absent"
@@ -847,7 +852,7 @@ def test_edge_fallback_ensure_bool_and_int_idempotent():
             get=lambda name: have,
         )
     )
-    edge._fallback_ensure(client2, "P", edge._FALLBACK_SPECS)
+    edge._ensure_props(client2, "P")
     assert have.added == [], "idempotent"
 
 

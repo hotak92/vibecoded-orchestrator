@@ -16,9 +16,10 @@ same "add this skip-vectorized property if missing" loop:
 
 This module is the ONE home for the property SPECS and the ensure loop:
 
-  * The migration edges import :func:`ensure_codegraph_properties` (with a
-    MINIMAL inline fallback for torn checkouts — see each edge's
-    ``_FALLBACK_SPECS``, marked MUST-MATCH).
+  * The migration edges import :func:`ensure_codegraph_properties` DIRECTLY
+    (X-1 / v0.2.76, ruling #1: the previous inline fallback copies were
+    removed — a missing ``vco_lib`` is a broken install that fails loudly, not
+    a silent inline-copy degrade).
   * The analyzer template keeps its inline ``_ensure_*`` helpers (it must
     run standalone at user sites), but
     ``tests/test_codegraph_schema_parity.py`` asserts its ensured
