@@ -2,74 +2,28 @@
 # Copyright (c) 2026 VibeCoded Tools
 """V52-O.11.B (v0.2.53 Track E) — Svelte parser unit tests.
 
-Tests the pure-function helpers at
-``templates/scripts/analyze_code_graph.py`` (``_extract_svelte_script_blocks``
-+ ``_parse_svelte_functions``). The wired-in analyzer method
-``_analyze_svelte_file`` lives on the ``CodeGraphAnalyzer`` class and
-depends on Weaviate / EmbeddingService for its side effects — covered
-separately by integration tests; this module exercises the parsing
-logic in isolation, which is where the regex fragility lives.
+Tests the pure-function helpers ``_extract_svelte_script_blocks`` +
+``_parse_svelte_functions``. P2f stage 2 (v0.2.76): the helpers moved
+VERBATIM from ``templates/scripts/analyze_code_graph.py`` to
+``vco_lib/codegraph_lang/svelte.py`` — this guard is retargeted to the new
+home (assertions unchanged). The wired-in extractor ``analyze_svelte_file``
+lives in the same module and depends on Weaviate / EmbeddingService via
+``ctx`` — covered separately by the golden suite + integration tests; this
+module exercises the parsing logic in isolation, which is where the regex
+fragility lives.
 """
 
 from __future__ import annotations
 
-import importlib.util
-import sys
 import unittest
-from pathlib import Path
-
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-ANALYZE_PATH = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 
 
 def _load_module():
-    """Load ``analyze_code_graph.py`` as a module without triggering the
-    weaviate / EmbeddingService imports that the file performs at
-    module load. We do this by loading the source, parsing the AST,
-    and exec'ing only the prelude (everything before
-    ``class CodeGraphAnalyzer``). The pure helpers we test live above
-    the class definition, so the prelude is sufficient.
-
-    Caching: the harness loads once per test session.
-    """
-    module_name = "analyze_code_graph_partial"
-    if module_name in sys.modules:
-        return sys.modules[module_name]
-
-    source = ANALYZE_PATH.read_text(encoding="utf-8")
-    # Stop before the class definition so we don't pay the
-    # weaviate-client import cost (and don't crash if it's not
-    # installed in the test env).
-    cutoff_marker = "class CodeGraphAnalyzer:"
-    cutoff = source.find(cutoff_marker)
-    if cutoff == -1:
-        raise AssertionError(
-            "Could not locate `class CodeGraphAnalyzer:` in "
-            "analyze_code_graph.py — file may have been restructured. "
-            "Update this test loader to match the new layout."
-        )
-    prelude = source[:cutoff]
-
-    # The prelude imports weaviate + vco_lib.embedding_service which we
-    # don't want to pay for. We replace those imports with no-ops by
-    # injecting a guard module. Simpler approach: catch ImportError
-    # and stub the names.
-    module = type(sys)(module_name)
-    # Inject the names the prelude expects to find at import time.
-    namespace = module.__dict__
-    namespace["__file__"] = str(ANALYZE_PATH)
-    namespace["__name__"] = module_name
-    try:
-        exec(compile(prelude, str(ANALYZE_PATH), "exec"), namespace)
-    except SystemExit:
-        # The prelude prints + sys.exit(1) when weaviate-client isn't
-        # installed. In a stripped test env that's expected; we treat
-        # the SystemExit as "import succeeded up to that point" and
-        # check whether the helpers we need are reachable.
-        pass
-    sys.modules[module_name] = module
-    return module
+    """The helpers now live in an import-safe vco_lib module (no
+    weaviate-client / EmbeddingService import cost) — the old
+    partial-prelude ``exec`` loader is no longer needed."""
+    from vco_lib.codegraph_lang import svelte
+    return svelte
 
 
 class SvelteScriptBlockExtractionTests(unittest.TestCase):

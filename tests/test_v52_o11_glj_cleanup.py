@@ -169,20 +169,24 @@ def test_g_rust_regex_still_matches_simple() -> None:
 
 
 def _lua_parser_text() -> str:
-    """Extract the Lua parser method body as a single string.
+    """Extract the Lua parser source as a single string.
 
-    We bound the slice between ``def _analyze_lua_file`` (start) and the
-    next ``def _analyze_`` (which starts the next sibling method). All
-    H-relevant embedder calls live inside this slice.
+    P2f stage 2 (v0.2.76): the Lua extractor moved verbatim to
+    vco_lib/codegraph_lang/lua.py — a module that contains ONLY the Lua
+    extractor, so the whole file IS the slice the old
+    ``def _analyze_lua_file`` .. next-sibling bounds used to cut out of
+    the analyzer. (The H assertions match ``embed_class(`` /
+    ``embed_function(`` substrings, which the mechanical ``ctx.`` prefix
+    from the move does not disturb.)
     """
-    src = (_REPO / "templates" / "scripts" / "analyze_code_graph.py").read_text()
-    start = src.find("def _analyze_lua_file")
-    assert start >= 0, "Lua analyzer method missing — analyzer layout changed"
-    # Find next sibling method (next ``    def _analyze_`` at same indent).
-    rest = src[start + 1:]
-    end_offset = rest.find("    def _analyze_")
-    assert end_offset >= 0, "Could not find Lua analyzer method end"
-    return src[start: start + 1 + end_offset]
+    from pathlib import Path
+
+    from vco_lib.codegraph_lang import lua
+
+    src = Path(lua.__file__).read_text()
+    start = src.find("def analyze_lua_file")
+    assert start >= 0, "Lua extractor missing — codegraph_lang layout changed"
+    return src[start:]
 
 
 def test_h_lua_source_passes_language_lua_to_embed_class() -> None:

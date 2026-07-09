@@ -45,13 +45,19 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable, Dict
 
+from vco_lib.codegraph_lang.cpp import analyze_cpp_file
 from vco_lib.codegraph_lang.csharp import analyze_csharp_file
 from vco_lib.codegraph_lang.go import analyze_go_file
 from vco_lib.codegraph_lang.java import analyze_java_file
 from vco_lib.codegraph_lang.javascript import analyze_js_file
+from vco_lib.codegraph_lang.lua import analyze_lua_file
 from vco_lib.codegraph_lang.powershell import analyze_powershell_file
+from vco_lib.codegraph_lang.proto import analyze_proto_file
 from vco_lib.codegraph_lang.python import analyze_python_file
+from vco_lib.codegraph_lang.ruby import analyze_ruby_file
 from vco_lib.codegraph_lang.rust import analyze_rust_file
+from vco_lib.codegraph_lang.shell import analyze_shell_file
+from vco_lib.codegraph_lang.svelte import analyze_svelte_file
 
 #: language-dispatch key -> extractor callable
 #: ``(ctx, file_path, repo_root) -> stats dict``.
@@ -65,4 +71,10 @@ EXTRACTORS: Dict[str, Callable[[Any, Path, Path], Dict[str, int]]] = {
     "go": analyze_go_file,
     "java": analyze_java_file,
     "csharp": analyze_csharp_file,
+    "cpp": analyze_cpp_file,
+    "ruby": analyze_ruby_file,
+    "lua": analyze_lua_file,
+    "shell": analyze_shell_file,
+    "proto": analyze_proto_file,
+    "svelte": analyze_svelte_file,
 }
