@@ -200,7 +200,12 @@ def canonical_class_prefix(project_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _main(argv: "list[str] | None" = None) -> int:
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser. Exposed (matching the ``_build_arg_parser``
+    convention of the other VCO CLIs) so the live-argparse sweep
+    (``tests/test_deferral_command_argparse_sweep.py``) can validate any
+    emitted ``python -m vco_lib.codegraph_naming`` invocation against the REAL
+    parser rather than a hand-maintained flag list."""
     parser = argparse.ArgumentParser(
         prog="python -m vco_lib.codegraph_naming",
         description=(
@@ -224,7 +229,11 @@ def _main(argv: "list[str] | None" = None) -> int:
         "(underscore-preserving rule; canonical_class_prefix)",
     )
     parser.add_argument("name", help="the raw project name")
+    return parser
 
+
+def _main(argv: "list[str] | None" = None) -> int:
+    parser = _build_arg_parser()
     args = parser.parse_args(argv)
 
     if args.kg:

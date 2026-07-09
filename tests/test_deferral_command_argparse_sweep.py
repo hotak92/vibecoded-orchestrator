@@ -129,12 +129,19 @@ def cli_registry() -> dict:
     project_init_flags = _parser_option_strings(project_init._build_arg_parser())
     kg_sync_flags = _kg_sync_known_flags()
     install_flags = _install_py_known_flags()
+    # X-1 / v0.2.76: the naming CLI is a new emitted-command surface — the
+    # Rust sanitizer/prefix derivation shells out to it. Cover its REAL parser
+    # so an emitted `python -m vco_lib.codegraph_naming --<flag>` that names a
+    # flag the CLI rejects is caught here.
+    codegraph_naming = importlib.import_module("vco_lib.codegraph_naming")
+    naming_flags = _parser_option_strings(codegraph_naming._build_arg_parser())
     return {
         "code-graph-analyze": analyzer_flags,
         "analyze_code_graph.py": analyzer_flags,
         "kg-sync": kg_sync_flags,
         "sync_knowledge_graph.py": kg_sync_flags,
         "vco_lib.project_init": project_init_flags,
+        "vco_lib.codegraph_naming": naming_flags,
         "install.py": install_flags,
     }
 
