@@ -45,6 +45,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable, Dict
 
+from vco_lib.codegraph_lang.python import analyze_python_file
+
 #: language-dispatch key -> extractor callable
 #: ``(ctx, file_path, repo_root) -> stats dict``.
-EXTRACTORS: Dict[str, Callable[[Any, Path, Path], Dict[str, int]]] = {}
+EXTRACTORS: Dict[str, Callable[[Any, Path, Path], Dict[str, int]]] = {
+    "python": analyze_python_file,
+}
