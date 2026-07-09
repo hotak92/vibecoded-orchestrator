@@ -46,11 +46,13 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 _ANALYZER_PATH = _REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
-_CLASSIFY_PATH = _REPO_ROOT / "vco_lib" / "codegraph_row_classify.py"
 _RUST_CODEGRAPH = (
     _REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands" / "codegraph.rs"
 )
 
+# X-1 / v0.2.76: these markers used to wrap the analyzer's byte-identical
+# mirror. The mirror is gone (direct import now); the test asserts they are
+# ABSENT from the analyzer.
 _BEGIN = "# BEGIN MUST-MATCH codegraph-row-classify"
 _END = "# END MUST-MATCH codegraph-row-classify"
 
@@ -72,36 +74,30 @@ def classify_mod():
     return m
 
 
-# ─────────────────────── 1. mirror parity ───────────────────────
+# ─────────────────────── 1. import (no mirror) ───────────────────────
 
 
-def _must_match_region(path: Path) -> str:
-    text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
-    # Line-anchored: the markers are COMMENT LINES (column 0) — a prose
-    # mention inside a docstring must not shadow the real region.
-    begin = re.search(rf"^{re.escape(_BEGIN)}", text, flags=re.MULTILINE)
-    end = re.search(rf"^{re.escape(_END)}", text, flags=re.MULTILINE)
-    assert begin, f"{path}: missing line-anchored '{_BEGIN}' marker"
-    assert end and end.start() > begin.start(), (
-        f"{path}: missing line-anchored '{_END}' marker after the BEGIN"
+def test_analyzer_imports_classifier_no_mirror():
+    """X-1 / v0.2.76 (ruling #1): the analyzer no longer carries a
+    byte-identical MUST-MATCH copy of the classifier — it IMPORTS from
+    ``vco_lib.codegraph_row_classify`` and loud-fails on a broken install.
+    Assert the import site exists and the deleted mirror region is GONE."""
+    text = _ANALYZER_PATH.read_text(encoding="utf-8")
+    assert "from vco_lib.codegraph_row_classify import" in text, (
+        "analyzer must import the classifier directly from vco_lib"
     )
-    # From the line AFTER the begin-marker line to the end-marker line
-    # (exclusive). Byte parity is the contract, whitespace included.
-    region = text[begin.start():end.start()]
-    return region.split("\n", 1)[1]  # drop the begin-marker line itself
-
-
-def test_mirror_region_is_byte_identical():
-    """The lock: the analyzer's mirrored classifier == the vco_lib original,
-    byte for byte (docstrings and comments included — a divergent comment is
-    a divergent contract explanation)."""
-    lib_region = _must_match_region(_CLASSIFY_PATH)
-    analyzer_region = _must_match_region(_ANALYZER_PATH)
-    assert lib_region == analyzer_region, (
-        "MUST-MATCH region drifted between vco_lib/codegraph_row_classify.py "
-        "and templates/scripts/analyze_code_graph.py. Edit BOTH copies "
-        "identically (the analyzer cannot import vco_lib at user sites)."
+    assert _BEGIN not in text and _END not in text, (
+        "the byte-identical classify_row MUST-MATCH mirror region must be GONE "
+        "from the analyzer (X-1 v0.2.76 replaced it with a direct import)."
     )
+
+
+def test_analyzer_classify_row_is_the_vco_lib_object(analyzer_mod, classify_mod):
+    """The analyzer's ``classify_row`` (and helpers) are the SAME function
+    objects as the vco_lib module's — proving the import, not a copy."""
+    assert analyzer_mod.classify_row is classify_mod.classify_row
+    assert analyzer_mod.path_is_ignored is classify_mod.path_is_ignored
+    assert analyzer_mod.path_reachable_on_disk is classify_mod.path_reachable_on_disk
 
 
 def test_shared_constants_value_parity(analyzer_mod, classify_mod):

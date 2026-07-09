@@ -24,20 +24,19 @@ whole-repo resync. Live-confirmed immortal classes:
 
 This module is the single source of truth for that decision:
 :func:`classify_row` returns ``"owed"`` / ``"not_owed"`` / ``"purgeable"``
-and BOTH consumers route through it (the analyzer via a byte-identical
-mirrored copy — see below).
+and BOTH consumers route through it by IMPORT.
 
-Sharing mechanism (template boundary)
--------------------------------------
+Sharing mechanism (X-1 / v0.2.76 — direct import, ruling #1)
+-----------------------------------------------------------
 ``analyze_code_graph.py`` is a TEMPLATE script copied into user projects'
-``.claude/scripts/`` where ``vco_lib`` does not exist — it cannot import this
-module (same reason ``codegraph_resync`` regex-parses the analyzer's
-``CODEGRAPH_EMBED_REVISION`` instead of importing it). So the analyzer
-carries a MIRRORED copy of the classifier functions between the
-BEGIN/END ``MUST-MATCH codegraph-row-classify`` marker comments, and
-``tests/test_codegraph_row_classify_parity.py`` byte-compares the marked
-regions (plus value-compares the constants) so the two can never drift —
-the parity test IS the lock.
+``.claude/scripts/``, but it runs via the VCO install venv (the
+``code-graph-analyze`` wrapper resolves it), into which ``vco_lib`` is
+editable-installed on every healthy install. So the analyzer IMPORTS these
+functions directly and LOUD-FAILS if the import fails (a broken install). The
+byte-identical MUST-MATCH mirror it used to carry is GONE;
+``tests/test_codegraph_row_classify_parity.py`` now asserts the analyzer's
+``classify_row`` IS this module's object (import, not copy) and value-compares
+the shared constants against the analyzer's own walk-table derivation.
 
 The vectorless / rev-0 ruling (documented decision, v0.2.75)
 ------------------------------------------------------------
@@ -129,10 +128,9 @@ CODEGRAPH_SKIP_SUFFIXES: tuple = (
 TRANSIENT_STATE_MARKER: str = ".claude/state/"
 
 
-# BEGIN MUST-MATCH codegraph-row-classify (mirrored in
-# templates/scripts/analyze_code_graph.py — the analyzer is a template that
-# cannot import vco_lib at user sites. Edit BOTH copies;
-# tests/test_codegraph_row_classify_parity.py byte-compares this region.)
+# These classifier functions are the SSOT. X-1 / v0.2.76 (ruling #1): the
+# analyzer template IMPORTS them from here (loud-fail on a broken install) —
+# there is no byte-identical mirror to keep in sync any more. Edit here only.
 def path_is_ignored(file_path: str, *, index_dot_claude: bool = True) -> bool:
     """True when a stored row path falls in the CURRENT ignore set.
 
@@ -273,4 +271,3 @@ def classify_row(
             return "purgeable"
     # 7. Reachable, non-ignored, stale → a re-walk converges it.
     return "owed"
-# END MUST-MATCH codegraph-row-classify

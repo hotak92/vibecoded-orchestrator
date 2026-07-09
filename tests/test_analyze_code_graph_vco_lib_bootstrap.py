@@ -124,8 +124,10 @@ class VcoLibBootstrapTests(unittest.TestCase):
 
     def test_no_env_fake_project_fails_gracefully(self):
         """No env vars + script in a user project with no vco_lib anywhere
-        → returns False WITHOUT raising (the inline fallbacks downstream
-        take over; the build must not crash here)."""
+        → the bootstrap helper returns False WITHOUT raising. (X-1 / v0.2.76:
+        the downstream import then loud-fails with a broken-install message +
+        non-zero exit — ruling #1 — but the helper itself never crashes, so a
+        caller can present the clear error rather than a traceback.)"""
         with tempfile.TemporaryDirectory() as fake:
             ret, on_path = self._run_helper(env={}, fake_script_dir=fake)
         self.assertFalse(ret, "helper must report failure (no vco_lib resolvable)")

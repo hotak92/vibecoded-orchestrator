@@ -459,40 +459,36 @@ def _ensure_vco_lib_on_path() -> bool:
 
 _ensure_vco_lib_on_path()
 
+# X-1 / v0.2.76 (ruling #1 — loud-fail, never silent-degrade): import the
+# shared vco_lib helpers DIRECTLY. The analyzer wrapper (code-graph-analyze /
+# .ps1, RT-4) resolves the VCO install venv, into which vco_lib is
+# editable-installed on every healthy install, so `import vco_lib` works from
+# any CWD (and _ensure_vco_lib_on_path above covers the CLI/standalone case by
+# putting the clone root on sys.path). A failing import therefore means a
+# BROKEN install — surfaced LOUDLY (clear stderr + non-zero exit BEFORE any
+# walk) rather than a silent inline-copy degrade that used to mask it. The
+# previously-mirrored `canonical_class_prefix` fallback AND the byte-identical
+# `classify_row` MUST-MATCH region are GONE; both are imported from vco_lib now.
 try:
-    from vco_lib.project_naming import canonical_class_prefix as _canonical_class_prefix
-except ImportError:
-    # Inline fallback — keep in sync with vco_lib/project_naming.py.
-    # The launcher always passes --project, and VCT_INSTALL_ROOT/.venv
-    # always has vco_lib importable, so this path is exercised only by
-    # external direct invocations (e.g. user calling the script
-    # standalone from a different venv).
-    _NON_ALNUM_OR_UNDERSCORE_FALLBACK = re.compile(r"[^A-Za-z0-9_]")
-
-    def _canonical_class_prefix(project_name: str) -> str:
-        if not isinstance(project_name, str):
-            raise ValueError(
-                f"project_name must be str, got {type(project_name).__name__}"
-            )
-        stripped = project_name.strip()
-        if not stripped:
-            raise ValueError("project_name is empty (or whitespace-only)")
-        parts = stripped.split()
-        if not parts:
-            raise ValueError(f"project_name {project_name!r} has no word parts")
-        pascal_parts = [p[:1].upper() + p[1:] for p in parts]
-        pascal = "".join(pascal_parts)
-        cleaned = _NON_ALNUM_OR_UNDERSCORE_FALLBACK.sub("_", pascal)
-        if not cleaned:
-            raise ValueError(f"project_name {project_name!r} sanitizes to empty string")
-        first = cleaned[0]
-        if not first.isalpha():
-            raise ValueError(
-                f"project_name {project_name!r} sanitizes to {cleaned!r}, "
-                "which starts with a non-letter character — Weaviate class "
-                "names must begin with a letter [A-Z]"
-            )
-        return cleaned
+    from vco_lib.codegraph_naming import (
+        canonical_class_prefix as _canonical_class_prefix,
+    )
+    from vco_lib.codegraph_row_classify import (
+        CODEGRAPH_IGNORE_PARTS as _VCO_CODEGRAPH_IGNORE_PARTS,
+        CODEGRAPH_SKIP_SUFFIXES as _VCO_CODEGRAPH_SKIP_SUFFIXES,
+        TRANSIENT_STATE_MARKER as _VCO_TRANSIENT_STATE_MARKER,
+        classify_row,
+        path_is_ignored,  # noqa: F401 — re-exported (parity test asserts identity)
+        path_reachable_on_disk,
+    )
+except ImportError as _exc:  # noqa: F841 — used in the message below
+    sys.stderr.write(
+        "analyze_code_graph: vco_lib not importable — VCO install is broken; "
+        "run install.py. The code-graph analyzer wrapper resolves the VCO "
+        "install venv (where vco_lib is editable-installed); a missing vco_lib "
+        f"means a broken install, not a normal run. ({_exc})\n"
+    )
+    sys.exit(1)
 
 
 def _sanitize_collection_prefix(name: str) -> str:
@@ -845,155 +841,15 @@ def _resolve_index_dot_claude(cli_value: Optional[bool], repo_path: Path) -> boo
 # ---------------------------------------------------------------------------
 
 
-# BEGIN MUST-MATCH codegraph-row-classify (mirrored in
-# templates/scripts/analyze_code_graph.py — the analyzer is a template that
-# cannot import vco_lib at user sites. Edit BOTH copies;
-# tests/test_codegraph_row_classify_parity.py byte-compares this region.)
-def path_is_ignored(file_path: str, *, index_dot_claude: bool = True) -> bool:
-    """True when a stored row path falls in the CURRENT ignore set.
-
-    Path-PART match (not substring) for directories — ``my_vendor_tools/x.py``
-    is NOT ignored; ``vendor/x.py`` is. Suffix match for build-output
-    filenames. ``.claude`` joins the set only when ``index_dot_claude`` is
-    False (user projects; the orchestrator root indexes ``.claude/`` as
-    first-party source).
-    """
-    if not file_path:
-        return False
-    norm = str(file_path).replace("\\", "/")
-    parts = [p for p in norm.split("/") if p]
-    if not parts:
-        return False
-    ignore = CODEGRAPH_IGNORE_PARTS
-    if not index_dot_claude:
-        ignore = ignore | frozenset({'.claude'})
-    if any(p in ignore for p in parts[:-1]):
-        return True
-    name = parts[-1]
-    if name.startswith('vite.config'):
-        return True
-    return any(name.endswith(s) for s in CODEGRAPH_SKIP_SUFFIXES)
-
-
-def path_reachable_on_disk(rel_or_abs_path: str, repo_root: "Path") -> bool:
-    """True when ``rel_or_abs_path`` resolves to a real on-disk file INSIDE
-    ``repo_root`` (mirrors ``install.py::_path_resolves_on_disk`` safety).
-
-    Fail-SAFE toward KEEPING data: an empty path, or ANY OS/value error while
-    probing (NUL bytes, invalid chars, unreadable segment), returns ``True``
-    ("treat as exists"). Only a determinate "resolved fine and is genuinely
-    absent, or resolved fine and escapes the root" yields ``False`` —
-    uncertainty must never authorise a delete, and on the probe side a wrong
-    "reachable" only over-counts owed work (conservative, never a wrong
-    "converged").
-    """
-    if not rel_or_abs_path:
-        return True
-    try:
-        root_resolved = repo_root.resolve()
-    except (OSError, ValueError):
-        return True
-    try:
-        candidate = (root_resolved / rel_or_abs_path).resolve()
-    except (OSError, ValueError):
-        return True
-    try:
-        inside = candidate.is_relative_to(root_resolved)
-    except (OSError, ValueError):
-        return True
-    if not inside:
-        return False
-    try:
-        return candidate.exists()
-    except (OSError, ValueError):
-        return True
-
-
-def classify_row(
-    props: "Optional[Mapping[str, Any]]",
-    repo_root: "Optional[Path]",
-    *,
-    path_prop: str = "file_path",
-    current_revision: int = 1,
-    index_dot_claude: bool = True,
-    primary_sources: "Optional[set]" = None,
-    reachable_fn=None,
-) -> str:
-    """Classify one code-graph row for convergence purposes.
-
-    Returns exactly one of:
-
-    * ``"owed"`` — a reachable, non-ignored stale row: a re-walk of its file
-      re-stamps/re-embeds it. The owed-probe counts these; nothing deletes
-      them. Includes ``embed_revision == 0`` rows (vectorless sentinel /
-      module-row invalidation): the re-walk heals them — see the module
-      docstring for the documented ruling.
-    * ``"not_owed"`` — leave alone AND don't count: rows already at the
-      current revision, and extra-path rows (``project_source`` set to a
-      root outside ``primary_sources``) which converge on their OWN root's
-      walk — never touch them from this walk (B1 tenant scoping).
-    * ``"purgeable"`` — a stale row NO walk can ever converge; deleting it
-      (via the tokenization-safe ``_delete_file_rows_exact`` primitive ONLY)
-      is the only way the owed state can reach zero: transient
-      ``.claude/state/`` scratch (purgeable regardless of revision — 6_to_7
-      purge semantics), pathless rows in file-anchored collections, rows
-      whose path falls in the ignore set (walk-excluded whether or not the
-      file still exists), and deleted-file orphans (stored path gone from
-      disk / escaping the root).
-
-    ``reachable_fn`` optionally injects a memoized reachability predicate
-    (one syscall per unique path across a whole probe run); when neither it
-    nor ``repo_root`` is given the deleted-file rule is SKIPPED and such
-    rows classify ``owed`` (fail-open: never authorise a purge without a
-    positively-known root; over-counting owed is the conservative error).
-    """
-    p = props or {}
-    raw_path = str(p.get(path_prop) or "")
-    # 1. Transient scratch — the marker itself is the proof; regardless of
-    #    revision or source (matches the 6_to_7 purge + F2/F4 semantics).
-    if TRANSIENT_STATE_MARKER in raw_path:
-        return "purgeable"
-    # 2. Extra-path rows — a different source root owns them; this walk can
-    #    neither re-stamp nor judge them (B1 scoping: never delete, never
-    #    count — they converge on their own extra-path walk).
-    if primary_sources is not None:
-        src = str(p.get("project_source") or "").strip()
-        if src and src not in primary_sources:
-            return "not_owed"
-    # 3. Converged rows — never touch, never count.
-    rev = p.get("embed_revision")
-    try:
-        if rev is not None and int(rev) == int(current_revision):
-            return "not_owed"
-    except (TypeError, ValueError):
-        pass  # unparseable revision → stale → fall through
-    # 4. Pathless stale rows — no walk keys on an empty path: nothing can
-    #    ever re-stamp them (immortal pre-v0.2.75), and no data purpose
-    #    survives without the file anchor.
-    if not raw_path:
-        return "purgeable"
-    # 5. Ignore-set rows — the walk never descends there (whether or not
-    #    the file still exists), so a stale row under an ignored dir can
-    #    never re-stamp. Derived, regenerable data: if a future ignore-set
-    #    change re-includes the path, the next walk simply re-creates it.
-    if path_is_ignored(raw_path, index_dot_claude=index_dot_claude):
-        return "purgeable"
-    # 6. Deleted-file orphans — nothing re-walks a file that no longer
-    #    exists (D1 orphan-clear semantics, kept). Skipped entirely when no
-    #    root/predicate is available (fail-open toward "owed").
-    if reachable_fn is not None:
-        if not reachable_fn(raw_path):
-            return "purgeable"
-    elif repo_root is not None:
-        if not path_reachable_on_disk(raw_path, repo_root):
-            return "purgeable"
-    # 7. Reachable, non-ignored, stale → a re-walk converges it.
-    return "owed"
-# END MUST-MATCH codegraph-row-classify
-
-
+# X-1 / v0.2.76 (ruling #1): the classifier functions (path_is_ignored /
+# path_reachable_on_disk / classify_row) are now IMPORTED from
+# vco_lib.codegraph_row_classify at module top (loud-fail on a broken
+# install), NOT carried as a byte-identical MUST-MATCH mirror. The analyzer
+# wrapper resolves the VCO install venv, into which vco_lib is
+# editable-installed, so the import is available at every user site.
+#
 # Backwards-compat alias — pre-v0.2.75 name used by `_build_stale_file_set`
-# and imported by older tests. Same function object as the mirrored copy.
+# and imported by older tests. Same function object as the imported copy.
 _path_reachable_on_disk = path_reachable_on_disk
 
 
@@ -1216,18 +1072,35 @@ _TS_SKIP_SUFFIXES: tuple = (
 )
 
 # ---------------------------------------------------------------------------
-# v0.2.75 (P1b): names shared with vco_lib/codegraph_row_classify.py so the
-# MUST-MATCH mirrored region above (path_is_ignored / path_reachable_on_disk
-# / classify_row) is byte-identical across the template boundary. The values
-# are DERIVED from this file's own constants; the parity test value-compares
-# them against the vco_lib module (functions read these late-bound, so the
-# assignments may live after the defs).
+# v0.2.75 (P1b) / X-1 v0.2.76: the classifier constants are now the SAME
+# objects as the imported ``vco_lib.codegraph_row_classify`` module's — the
+# classifier functions (imported at module top) read the vco_lib copies, so we
+# re-export those here for any other consumer in this file and lock the WALK's
+# own derived ignore-set against them. The walk's ``_ALL_IGNORE_PARTS`` (built
+# from this file's per-language tables) MUST equal the shared classifier set;
+# a divergent walk-table edit fails LOUDLY here rather than silently letting
+# the walk and the classifier disagree about which dirs are ignored.
 # ---------------------------------------------------------------------------
-CODEGRAPH_IGNORE_PARTS: frozenset = _ALL_IGNORE_PARTS
-CODEGRAPH_SKIP_SUFFIXES: tuple = _JS_SKIP_SUFFIXES + _TS_SKIP_SUFFIXES
+CODEGRAPH_IGNORE_PARTS: frozenset = _VCO_CODEGRAPH_IGNORE_PARTS
+CODEGRAPH_SKIP_SUFFIXES: tuple = tuple(_VCO_CODEGRAPH_SKIP_SUFFIXES)
 #: MUST match migrations/codegraph_collection/6_to_7.py::_TRANSIENT_MARKER
 #: and vco_lib/codegraph_row_classify.py::TRANSIENT_STATE_MARKER.
-TRANSIENT_STATE_MARKER: str = ".claude/state/"
+TRANSIENT_STATE_MARKER: str = _VCO_TRANSIENT_STATE_MARKER
+
+# Loud lock: the walk's own derived ignore-set must equal the shared
+# classifier set (they used to be pinned byte-for-byte via the deleted mirror
+# + the parity test's value-compare; now the values ARE shared and this
+# assertion guards the walk-table derivation instead).
+assert _ALL_IGNORE_PARTS == CODEGRAPH_IGNORE_PARTS, (
+    "analyze_code_graph walk ignore-set (_ALL_IGNORE_PARTS) diverged from "
+    "vco_lib.codegraph_row_classify.CODEGRAPH_IGNORE_PARTS — the walk and the "
+    "classifier would disagree. Reconcile the per-language ignore tables with "
+    "the shared set."
+)
+assert tuple(_JS_SKIP_SUFFIXES + _TS_SKIP_SUFFIXES) == CODEGRAPH_SKIP_SUFFIXES, (
+    "analyze_code_graph skip-suffixes diverged from "
+    "vco_lib.codegraph_row_classify.CODEGRAPH_SKIP_SUFFIXES."
+)
 
 # CG-5 (v0.2.75 P3d): minified-CONTENT heuristic. The name-suffix denylist
 # (``CODEGRAPH_SKIP_SUFFIXES``) only catches conventionally-named build output
