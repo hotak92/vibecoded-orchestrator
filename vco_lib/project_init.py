@@ -66,11 +66,15 @@ from vco_lib.symlink_handler import compute_vco_new_path, is_symlink_blocking
 DEFAULT_WEAVIATE_PORT = 8081
 
 # X-1 / v0.2.76: the underscore-DROPPING sanitizer moved to
-# ``vco_lib.codegraph_naming`` — the ONE naming home. These aliases keep
-# the historical private names (used by a couple of install-flow call
-# sites in this module) resolving to the canonical source.
-from vco_lib.codegraph_naming import _SAFE_CLASS_RE  # noqa: E402  (re-export)
-from vco_lib.codegraph_naming import FALLBACK_PREFIX as _FALLBACK_PREFIX  # noqa: E402
+# ``vco_lib.codegraph_naming`` — the ONE naming home. These aliases keep the
+# historical private names resolving to the canonical source. ``_SAFE_CLASS_RE``
+# is a RE-EXPORT (install.py re-exports it as install._SAFE_CLASS_RE, and
+# tests/test_vco_lib_project_init.py asserts the two are the SAME object);
+# ``_FALLBACK_PREFIX`` is used by an install-flow call site in this module.
+from vco_lib.codegraph_naming import (  # noqa: E402,F401  (re-exports)
+    _SAFE_CLASS_RE,
+    FALLBACK_PREFIX as _FALLBACK_PREFIX,
+)
 
 
 # ---------------------------------------------------------------------------
