@@ -1694,14 +1694,19 @@ impl Db {
 /// `populate_kg_collection_access_for_project` works from inside
 /// vct-launcher-core without taking a dep on the launcher crate.
 ///
-/// MUST stay byte-equivalent to the launcher-side version. A future
-/// refactor can either hoist sanitize_kg_collection into a shared util
-/// module or have the launcher delegate to this one; deferred to keep
-/// the diff bounded.
+/// MUST stay byte-equivalent to the launcher-side version (and both must
+/// match the Python SSOT `vco_lib.codegraph_naming.sanitize_for_weaviate_class`
+/// — cross-language parity pinned by `tests/fixtures/kg_sanitizer_parity.json`).
+/// A future refactor can hoist this into a shared util module; deferred to
+/// keep the diff bounded.
 ///
 /// Convert a project display name into a Weaviate-collection-safe id.
 /// Weaviate collections must start with [A-Z] and contain only
 /// alphanumerics — strip everything else and Title-case.
+///
+/// X-1 / v0.2.76 (ruling #2): empty / all-non-alnum / leading-digit input
+/// all fall back to the sentinel prefix `"vct"` (unified with Python; the
+/// old "Project" / "P"-prepend divergence is retired).
 pub(crate) fn sanitize_kg_collection_local(name: &str) -> String {
     let mut out = String::new();
     let mut next_upper = true;
@@ -1717,12 +1722,10 @@ pub(crate) fn sanitize_kg_collection_local(name: &str) -> String {
             next_upper = true;
         }
     }
-    if out.is_empty() {
-        return "Project".to_string();
-    }
-    // Weaviate requires leading letter, not digit.
-    if out.chars().next().unwrap().is_ascii_digit() {
-        out.insert(0, 'P');
+    // Unified fallback (X-1 / v0.2.76): empty OR leading-digit → sentinel
+    // prefix. Matches Python's `sanitize_for_weaviate_class`.
+    if out.is_empty() || out.chars().next().unwrap().is_ascii_digit() {
+        return "vct".to_string();
     }
     out
 }
@@ -4529,8 +4532,10 @@ mod populate_access_for_project_tests {
         assert_eq!(sanitize_kg_collection_local("Acme"), "Acme");
         assert_eq!(sanitize_kg_collection_local("my project"), "MyProject");
         assert_eq!(sanitize_kg_collection_local("foo-bar_baz"), "FooBarBaz");
-        assert_eq!(sanitize_kg_collection_local(""), "Project");
-        assert_eq!(sanitize_kg_collection_local("123abc"), "P123abc");
+        // X-1 / v0.2.76: out-of-domain input unifies to "vct" (matches the
+        // launcher-side `sanitize_kg_collection` + the Python SSOT).
+        assert_eq!(sanitize_kg_collection_local(""), "vct");
+        assert_eq!(sanitize_kg_collection_local("123abc"), "vct");
     }
 
     /// v0.2.49 Step F SB2 drift sentinel (L2-SB1 follow-up).

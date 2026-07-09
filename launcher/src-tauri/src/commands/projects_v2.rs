@@ -4391,20 +4391,31 @@ pub fn write_env_reference_sidecar(
 /// alphanumerics — strip everything else and Title-case.
 ///
 /// MUST MATCH the Python KG (underscore-DROPPING) sanitizer
-/// `vco_lib.project_init.sanitize_for_weaviate_class` on the VALID-name domain
-/// (any name starting with an ASCII letter, >=1 alnum). Both derive the
-/// `KG_COLLECTION` / `DEVELOPMENT_COLLECTION` / `DIAGRAMS_COLLECTION` basename
-/// that lands in `.claude/env` + `.claude/settings.json`, so a drift on a real
-/// project name would make the launcher and the Python re-projection compute
-/// different collections for the same project. Cross-language parity is pinned
-/// against the shared fixture `tests/fixtures/kg_sanitizer_parity.json` by the
+/// `vco_lib.codegraph_naming.sanitize_for_weaviate_class` (the ONE naming home;
+/// re-exported from `vco_lib.project_init`). Both derive the `KG_COLLECTION` /
+/// `DEVELOPMENT_COLLECTION` / `DIAGRAMS_COLLECTION` basename that lands in
+/// `.claude/env` + `.claude/settings.json`, so a drift on a real project name
+/// would make the launcher and the Python re-projection compute different
+/// collections for the same project. Cross-language parity is pinned against the
+/// shared fixture `tests/fixtures/kg_sanitizer_parity.json` by the
 /// `#[test] kg_sanitizer_matches_shared_fixture` below AND
-/// `tests/test_kg_sanitizer_parity.py` (audit F1.2). NOTE the two
-/// implementations intentionally DIVERGE on pathological OUT-OF-DOMAIN inputs
-/// (empty / all-non-alnum → this fn returns "Project", Python returns "vct";
-/// leading-digit → this fn prepends "P", Python returns "vct"); those cases are
-/// pinned per-side in the fixture's `divergent` array. If you change either
-/// rule, update the other AND the fixture in the same commit.
+/// `tests/test_kg_sanitizer_parity.py` (audit F1.2).
+///
+/// X-1 / v0.2.76 (ruling #2): the two implementations are now UNIFIED on the
+/// pathological OUT-OF-DOMAIN inputs too. Empty / all-non-alnum / leading-digit
+/// input all fall back to the sentinel prefix `"vct"` (Python semantics win) —
+/// the old "Project" / "P"-prepend divergence is eliminated at the source, and
+/// the fixture's `divergent` array is retired. `"vct"` is lowercase on purpose:
+/// Weaviate capitalizes the first letter on POST regardless, and the prefix
+/// flags the class as installer-managed. If you change either rule, update the
+/// other AND the fixture in the same commit.
+///
+/// This stays an in-process Rust derivation (NOT a `python -m
+/// vco_lib.codegraph_naming` subprocess) because callers include per-env-key /
+/// per-grant-row loops on env-render/resolve paths — a subprocess per call
+/// would spawn dozens of Python processes per env write. The shared fixture is
+/// the cross-language lock instead (see the v0.2.76 Part 1 report's task-2
+/// failure-posture note).
 pub fn sanitize_kg_collection(name: &str) -> String {
     let mut out = String::new();
     let mut next_upper = true;
@@ -4420,12 +4431,12 @@ pub fn sanitize_kg_collection(name: &str) -> String {
             next_upper = true;
         }
     }
-    if out.is_empty() {
-        return "Project".to_string();
-    }
-    // Weaviate requires leading letter, not digit.
-    if out.chars().next().unwrap().is_ascii_digit() {
-        out.insert(0, 'P');
+    // Unified fallback (X-1 / v0.2.76): nothing usable survived, OR the result
+    // would start with a digit (Weaviate class names must begin with a letter).
+    // Fall back to the installer-managed sentinel prefix — matches Python's
+    // `sanitize_for_weaviate_class`.
+    if out.is_empty() || out.chars().next().unwrap().is_ascii_digit() {
+        return "vct".to_string();
     }
     out
 }
@@ -7477,22 +7488,24 @@ mod tests {
         assert_eq!(sanitize_kg_collection("My Project"), "MyProject");
         assert_eq!(sanitize_kg_collection("my-project"), "MyProject");
         assert_eq!(sanitize_kg_collection("snake_case_name"), "SnakeCaseName");
-        assert_eq!(sanitize_kg_collection("123-leading-digit"), "P123LeadingDigit");
-        assert_eq!(sanitize_kg_collection(""), "Project");
-        assert_eq!(sanitize_kg_collection("...!!!..."), "Project");
         assert_eq!(sanitize_kg_collection("Already CamelCase"), "AlreadyCamelCase");
+        // X-1 / v0.2.76: out-of-domain input unifies to the sentinel prefix
+        // "vct" (matches Python; no more "P"-prepend / "Project").
+        assert_eq!(sanitize_kg_collection("123-leading-digit"), "vct");
+        assert_eq!(sanitize_kg_collection(""), "vct");
+        assert_eq!(sanitize_kg_collection("...!!!..."), "vct");
     }
 
     /// Cross-language parity (audit F1.2 / A3.1): the Rust side of the shared
     /// `tests/fixtures/kg_sanitizer_parity.json`. `tests/test_kg_sanitizer_parity.py`
-    /// consumes the SAME fixture for the Python `sanitize_for_weaviate_class` —
-    /// so a divergence between the two KG (underscore-DROPPING) sanitizers on a
-    /// VALID project name fails one of the two runners. The `agree` rows MUST
-    /// match cross-language; the `divergent` rows are pathological out-of-domain
-    /// inputs pinned PER-SIDE (Rust column here, Python column in the pytest) so
-    /// a future unification is a deliberate two-file edit. Fixture path resolved
-    /// from `CARGO_MANIFEST_DIR` (= `launcher/src-tauri/`) → two parents up to
-    /// the repo root (same walk as `tests/project_naming_parity.rs`).
+    /// consumes the SAME fixture for the Python
+    /// `vco_lib.codegraph_naming.sanitize_for_weaviate_class` — so a divergence
+    /// between the two KG (underscore-DROPPING) sanitizers on ANY input fails one
+    /// of the two runners. X-1 / v0.2.76 (ruling #2): the `divergent` array is
+    /// RETIRED — the previously-divergent pathological inputs now live in
+    /// `agree` and both sides converge on `"vct"`. Fixture path resolved from
+    /// `CARGO_MANIFEST_DIR` (= `launcher/src-tauri/`) → two parents up to the
+    /// repo root (same walk as `tests/project_naming_parity.rs`).
     #[test]
     fn kg_sanitizer_matches_shared_fixture() {
         #[derive(serde::Deserialize)]
@@ -7500,8 +7513,6 @@ mod tests {
             #[serde(rename = "_format_version", default)]
             format_version: u32,
             agree: Vec<(String, String)>,
-            // (input, python_expected, rust_expected)
-            divergent: Vec<(String, String, String)>,
         }
 
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -7524,17 +7535,19 @@ mod tests {
             .unwrap_or_else(|e| panic!("parse {}: {}", fixture_path.display(), e));
 
         assert_eq!(
-            fix.format_version, 1,
-            "Fixture _format_version != 1 — coordinate the bump with the Python side"
+            fix.format_version, 2,
+            "Fixture _format_version != 2 — v2 retired the 'divergent' array \
+             (X-1 / v0.2.76); coordinate the bump with the Python side"
         );
         assert!(
             fix.agree.len() >= 100,
-            "Fixture 'agree' array should pin 100+ valid-name cases; got {}",
+            "Fixture 'agree' array should pin 100+ cases; got {}",
             fix.agree.len()
         );
 
-        // Valid-name domain: Rust MUST match the shared expectation (which the
-        // Python side also asserts against).
+        // Every fixture row: Rust MUST match the shared expectation (which the
+        // Python side also asserts against). Includes the previously-divergent
+        // out-of-domain inputs, now unified to "vct".
         let mut failures: Vec<String> = Vec::new();
         for (input, expected) in &fix.agree {
             let actual = sanitize_kg_collection(input);
@@ -7547,32 +7560,11 @@ mod tests {
         }
         assert!(
             failures.is_empty(),
-            "Rust KG sanitizer diverges from fixture in {} valid-name case(s):\n{}\n\
-             If intentional, update the fixture AND vco_lib.project_init.\
+            "Rust KG sanitizer diverges from fixture in {} case(s):\n{}\n\
+             If intentional, update the fixture AND vco_lib.codegraph_naming.\
              sanitize_for_weaviate_class in the same commit.",
             failures.len(),
             failures.join("\n")
-        );
-
-        // Out-of-domain: assert the RUST column of each divergent row (the
-        // Python column is asserted by the pytest). Also proves the divergence
-        // is real (Rust col differs from Python col somewhere).
-        let mut real_divergence = false;
-        for (input, py_expected, rust_expected) in &fix.divergent {
-            assert_eq!(
-                &sanitize_kg_collection(input),
-                rust_expected,
-                "Rust KG sanitizer fallback drifted for {:?}",
-                input
-            );
-            if py_expected != rust_expected {
-                real_divergence = true;
-            }
-        }
-        assert!(
-            real_divergence,
-            "No 'divergent' row actually differs between py/rust columns — if the \
-             two KG sanitizers converged, move these rows into 'agree'."
         );
     }
 

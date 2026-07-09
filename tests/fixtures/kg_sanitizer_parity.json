@@ -1,6 +1,6 @@
 {
-  "_comment": "Parity fixture for the KG (underscore-DROPPING) sanitizer — consumed by BOTH tests/test_kg_sanitizer_parity.py (Python vco_lib.project_init.sanitize_for_weaviate_class) AND the Rust #[test] kg_sanitizer_matches_shared_fixture in launcher/src-tauri/src/commands/projects_v2.rs (Rust sanitize_kg_collection). 'agree' rows are VALID project names (start with an ASCII letter, >=1 alnum) where the two implementations MUST produce identical output — the domain that actually reaches env projection. 'divergent' rows are pathological OUT-OF-DOMAIN inputs (empty / all-non-alnum / leading-digit) that each side handles with its OWN documented fallback (Python -> 'vct'; Rust -> 'Project' or 'P'-prepend); they are pinned per-side so a future unification is a deliberate edit of BOTH implementations + this fixture. See audit F1.2/A3.1/D3.",
-  "_format_version": 1,
+  "_comment": "Parity fixture for the KG (underscore-DROPPING) sanitizer — consumed by BOTH tests/test_kg_sanitizer_parity.py (Python vco_lib.codegraph_naming.sanitize_for_weaviate_class, re-exported from vco_lib.project_init) AND the Rust #[test] kg_sanitizer_matches_shared_fixture in launcher/src-tauri/src/commands/projects_v2.rs (Rust sanitize_kg_collection). Every 'agree' row is a case where the two implementations MUST produce identical output. X-1 / v0.2.76 (ruling #2): the Rust port now matches Python semantics on the previously-divergent pathological inputs too (empty / all-non-alnum / leading-digit) — all fall back to the sentinel prefix 'vct' (no more 'Project' / 'P'-prepend divergence). The 'divergent' array is RETIRED; those inputs live in 'agree' now that both sides converge. See audit F1.2/A3.1/D3.",
+  "_format_version": 2,
   "agree": [
     [
       "MyProject",
@@ -465,53 +465,42 @@
     [
       "start end",
       "StartEnd"
-    ]
-  ],
-  "divergent": [
+    ],
     [
       "123abc",
-      "vct",
-      "P123abc"
+      "vct"
     ],
     [
       "9",
-      "vct",
-      "P9"
+      "vct"
     ],
     [
       "1st-project",
-      "vct",
-      "P1stProject"
+      "vct"
     ],
     [
       "007bond",
-      "vct",
-      "P007bond"
+      "vct"
     ],
     [
       "",
-      "vct",
-      "Project"
+      "vct"
     ],
     [
       "   ",
-      "vct",
-      "Project"
+      "vct"
     ],
     [
       "!!!",
-      "vct",
-      "Project"
+      "vct"
     ],
     [
       "...!!!",
-      "vct",
-      "Project"
+      "vct"
     ],
     [
       "___",
-      "vct",
-      "Project"
+      "vct"
     ]
   ]
 }
