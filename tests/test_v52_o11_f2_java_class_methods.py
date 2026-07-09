@@ -27,44 +27,15 @@ Both bugs are fixed in a single helper:
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
-import sys
 from pathlib import Path
-from types import ModuleType
 
-import pytest
-
-_REPO = Path(__file__).resolve().parent.parent
-
-
-def _load_acg() -> ModuleType:
-    """Isolated load (same pattern as V52-O.11.E / V52-O.11.F tests).
-
-    Restores sys.modules + sys.path after exec so the parent test run
-    doesn't accumulate state from importing analyze_code_graph.py with
-    its many top-level side effects.
-    """
-    sys_modules_before = set(sys.modules.keys())
-    sys_path_before = list(sys.path)
-
-    spec = importlib.util.spec_from_file_location(
-        "_v52_o11_f2_java_acg_isolated",
-        _REPO / "templates" / "scripts" / "analyze_code_graph.py",
-    )
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(mod)
-    finally:
-        sys.path[:] = sys_path_before
-        new_keys = set(sys.modules.keys()) - sys_modules_before
-        for key in new_keys:
-            del sys.modules[key]
-    return mod
-
-
-acg = _load_acg()
+# P2f stage 2 (v0.2.76): `_java_methods_for_class` (+ its
+# `_strip_nested_java_classes` / `_find_matching_brace` helpers) moved
+# verbatim to vco_lib/codegraph_lang/java.py, which is import-safe (no
+# weaviate-client / sys.path side effects) — the old isolated-importlib
+# loader for the full analyzer script is no longer needed. Alias the module
+# as ``acg`` so every assertion below stays byte-identical.
+from vco_lib.codegraph_lang import java as acg
 
 
 # ---------------------------------------------------------------------------
@@ -511,10 +482,13 @@ def test_no_unconditional_method_finditer_in_java_class_loop() -> None:
 
     Same shape as the V52-O.11.F Rust regression test, scoped to the
     Java analyzer entry.
+
+    P2f stage 2 (v0.2.76): the Java extractor moved verbatim to
+    vco_lib/codegraph_lang/java.py — the source scan follows it there
+    (function renamed `_analyze_java_file` -> `analyze_java_file` in the
+    move; assertions unchanged).
     """
-    src = (
-        _REPO / "templates" / "scripts" / "analyze_code_graph.py"
-    ).read_text()
+    src = Path(acg.__file__).read_text()
 
     # Locate the Java-specific signature line (unique to Java —
     # `signature = f"class {cname}"`).
@@ -530,13 +504,13 @@ def test_no_unconditional_method_finditer_in_java_class_loop() -> None:
     # similar strings. We need to be MORE specific. The Java loop is the
     # one that lives inside `_analyze_java_file`. Search for the wider
     # context that includes the function header.
-    java_func_anchor_pos = src.find("def _analyze_java_file(")
+    java_func_anchor_pos = src.find("def analyze_java_file(")
     assert java_func_anchor_pos >= 0, (
-        "Could not find `_analyze_java_file` function — file shape changed."
+        "Could not find `analyze_java_file` function — file shape changed."
     )
-    # Find the next `def ` after `_analyze_java_file` (the end of this
-    # function's body).
-    java_func_end_pos = src.find("\n    def ", java_func_anchor_pos + 1)
+    # Find the next top-level `def ` after `analyze_java_file` (the end of
+    # this function's body; it is a module-level function since the P2f move).
+    java_func_end_pos = src.find("\ndef ", java_func_anchor_pos + 1)
     if java_func_end_pos < 0:
         java_func_end_pos = len(src)
     java_func_body = src[java_func_anchor_pos:java_func_end_pos]

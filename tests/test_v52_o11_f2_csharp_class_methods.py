@@ -24,41 +24,14 @@ V52-O.11.F.2-GO (``_go_methods_for_struct``).
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
-import sys
 from pathlib import Path
-from types import ModuleType
 
-import pytest
-
-_REPO = Path(__file__).resolve().parent.parent
-
-
-def _load_acg() -> ModuleType:
-    """Isolated load (same pattern as V52-O.11.E + V52-O.11.F tests).
-    Snapshots sys.modules/sys.path before exec and restores after so the
-    analyzer's import side-effects don't pollute later test runs."""
-    sys_modules_before = set(sys.modules.keys())
-    sys_path_before = list(sys.path)
-
-    spec = importlib.util.spec_from_file_location(
-        "_v52_o11_f2_csharp_acg_isolated",
-        _REPO / "templates" / "scripts" / "analyze_code_graph.py",
-    )
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(mod)
-    finally:
-        sys.path[:] = sys_path_before
-        new_keys = set(sys.modules.keys()) - sys_modules_before
-        for key in new_keys:
-            del sys.modules[key]
-    return mod
-
-
-acg = _load_acg()
+# P2f stage 2 (v0.2.76): `_csharp_methods_for_class` moved verbatim to
+# vco_lib/codegraph_lang/csharp.py, which is import-safe (no weaviate-client
+# / sys.path side effects) — the old isolated-importlib loader for the full
+# analyzer script is no longer needed. Alias the module as ``acg`` so every
+# assertion below stays byte-identical.
+from vco_lib.codegraph_lang import csharp as acg
 
 
 # ---------------------------------------------------------------------------
@@ -496,20 +469,24 @@ def test_no_unconditional_method_finditer_in_csharp_class_loop() -> None:
 
     Scans the C# analyzer's class extraction loop body for the broken
     pattern. The new code uses ``_csharp_methods_for_class(...)`` instead.
+
+    P2f stage 2 (v0.2.76): the C# extractor moved verbatim to
+    vco_lib/codegraph_lang/csharp.py — the source scan follows it there
+    (the embed anchor gained the mechanical ``ctx.`` prefix in the move;
+    the loop boundary indent went 8 -> 4 after the method ->
+    free-function dedent; assertions unchanged).
     """
-    src = (
-        _REPO / "templates" / "scripts" / "analyze_code_graph.py"
-    ).read_text()
+    src = Path(acg.__file__).read_text()
 
     # Locate the C#-specific class loop. The signature line
     # ``signature = f"class {cname}"`` is shared with several languages
     # (Java, JS/TS), so we anchor on a more specific marker: the
-    # ``embed_class(..., language="csharp")`` call that follows the
+    # ``ctx.embed_class(..., language="csharp")`` call that follows the
     # methods extraction inside the C# loop body.
-    csharp_anchor = 'embed_class(signature, class_body, methods=methods[:10], language="csharp")'
+    csharp_anchor = 'ctx.embed_class(signature, class_body, methods=methods[:10], language="csharp")'
     anchor_pos = src.find(csharp_anchor)
     assert anchor_pos >= 0, (
-        f"Could not locate C# class-loop anchor in analyze_code_graph.py — "
+        f"Could not locate C# class-loop anchor in codegraph_lang/csharp.py — "
         f"has it changed? Looked for: {csharp_anchor!r}"
     )
 
@@ -526,7 +503,7 @@ def test_no_unconditional_method_finditer_in_csharp_class_loop() -> None:
     # knowledge/concepts/test-regex-anchoring-fragility-2026-06-10.md); binding
     # to the loop boundary keeps the guard scoped to the class loop body.
     window_start = max(0, anchor_pos - 1500)
-    next_for = src.find("\n        for ", anchor_pos)
+    next_for = src.find("\n    for ", anchor_pos)
     window_end = next_for if next_for != -1 else min(len(src), anchor_pos + 200)
     window = src[window_start:window_end]
 

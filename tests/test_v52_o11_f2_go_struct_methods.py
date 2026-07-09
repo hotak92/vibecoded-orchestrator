@@ -27,41 +27,14 @@ Both pointer and value receivers count as methods on the same type.
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
-import sys
 from pathlib import Path
-from types import ModuleType
 
-import pytest
-
-_REPO = Path(__file__).resolve().parent.parent
-
-
-def _load_acg() -> ModuleType:
-    """Isolated load (same pattern as V52-O.11.E / V52-O.11.F tests). See
-    those tests' helpers for full rationale on the sys.modules / sys.path
-    restoration."""
-    sys_modules_before = set(sys.modules.keys())
-    sys_path_before = list(sys.path)
-
-    spec = importlib.util.spec_from_file_location(
-        "_v52_o11_f2_go_acg_isolated",
-        _REPO / "templates" / "scripts" / "analyze_code_graph.py",
-    )
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(mod)
-    finally:
-        sys.path[:] = sys_path_before
-        new_keys = set(sys.modules.keys()) - sys_modules_before
-        for key in new_keys:
-            del sys.modules[key]
-    return mod
-
-
-acg = _load_acg()
+# P2f stage 2 (v0.2.76): `_go_methods_for_struct` moved verbatim to
+# vco_lib/codegraph_lang/go.py, which is import-safe (no weaviate-client /
+# sys.path side effects) — the old isolated-importlib loader for the full
+# analyzer script is no longer needed. Alias the module as ``acg`` so every
+# assertion below stays byte-identical.
+from vco_lib.codegraph_lang import go as acg
 
 
 # ---------------------------------------------------------------------------
@@ -361,31 +334,38 @@ def test_no_unconditional_func_finditer_in_go_struct_loop() -> None:
     v0.2.52 backlog (Go this commit; JS/TS, Java, C# still queued).
     This regression test deliberately asserts only on the Go site to
     avoid blocking the GO ship on those parallel fixes.
+
+    P2f stage 2 (v0.2.76): the Go extractor moved verbatim to
+    vco_lib/codegraph_lang/go.py — the source scan follows it there.
+    The tail boundary is now the NEXT loop header after the anchor
+    (the rust guard's approach, see
+    knowledge/concepts/test-regex-anchoring-fragility-2026-06-10.md):
+    the old fixed 1500-char tail only excluded the FUNCTION loop's
+    legitimate ``func_pattern.finditer(content_clean)`` by ~30 chars of
+    slack, which the method -> free-function dedent (4 fewer columns per
+    line) silently consumed.
     """
-    src = (
-        _REPO / "templates" / "scripts" / "analyze_code_graph.py"
-    ).read_text()
+    src = Path(acg.__file__).read_text()
 
     # Strategy: locate the Go-specific `signature = f"type {sname}
     # struct/interface"` line first (unique to Go — Rust uses
     # `f"struct/enum/trait {sname}"`, JS/Java/C# use other strings),
-    # then scan WINDOWS of code around it. The loop body for a single
-    # struct entry is small (~25 lines), so 1500-char tail window is
-    # plenty.
+    # then scan the struct-loop body around it.
     go_signature_anchor = 'signature = f"type {sname} struct/interface"'
     anchor_pos = src.find(go_signature_anchor)
     assert anchor_pos >= 0, (
-        f"Could not locate Go signature anchor in analyze_code_graph.py — "
+        f"Could not locate Go signature anchor in codegraph_lang/go.py — "
         f"has it changed? Looked for: {go_signature_anchor!r}"
     )
 
-    # Look at a window starting 600 chars BEFORE the anchor (covers the
-    # `for sname, start_line in struct_info.items():` loop header) and
-    # ending 1500 chars AFTER (covers the explanatory V52-O.11.F.2-GO
-    # comment block + the `methods = _go_methods_for_struct(...)` call
-    # + embed_class invocation).
+    # Window: 600 chars BEFORE the anchor (covers the
+    # `for sname, start_line in struct_info.items():` loop header) up to
+    # the NEXT `for ` loop header after the anchor — the struct loop's
+    # real terminator (the function-extraction loop, which legitimately
+    # iterates all functions).
     window_start = max(0, anchor_pos - 600)
-    window_end = min(len(src), anchor_pos + 1500)
+    next_for = src.find("\n    for ", anchor_pos)
+    window_end = next_for if next_for != -1 else min(len(src), anchor_pos + 1500)
     window = src[window_start:window_end]
 
     # Sanity: window must contain the Go struct-loop's `for sname`

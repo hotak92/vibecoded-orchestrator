@@ -45,6 +45,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable, Dict
 
+from vco_lib.codegraph_lang.csharp import analyze_csharp_file
+from vco_lib.codegraph_lang.go import analyze_go_file
+from vco_lib.codegraph_lang.java import analyze_java_file
 from vco_lib.codegraph_lang.javascript import analyze_js_file
 from vco_lib.codegraph_lang.powershell import analyze_powershell_file
 from vco_lib.codegraph_lang.python import analyze_python_file
@@ -59,4 +62,7 @@ EXTRACTORS: Dict[str, Callable[[Any, Path, Path], Dict[str, int]]] = {
     # One extractor serves both dispatch keys (mirrors lang_dispatch).
     "javascript": analyze_js_file,
     "typescript": analyze_js_file,
+    "go": analyze_go_file,
+    "java": analyze_java_file,
+    "csharp": analyze_csharp_file,
 }
