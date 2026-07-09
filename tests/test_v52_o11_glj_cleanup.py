@@ -298,6 +298,11 @@ def test_i_strip_string_literals_handles_escaped_quotes() -> None:
 # ===========================================================================
 # J — Skip #[cfg(test)] Rust functions
 # ===========================================================================
+# P2f stage 2 (v0.2.76): `_is_rust_test_fn` moved verbatim to
+# vco_lib/codegraph_lang/rust.py — the J guard is retargeted to the new home
+# (assertions unchanged).
+
+from vco_lib.codegraph_lang import rust as _rust_lang  # noqa: E402
 
 
 def test_j_rust_test_fn_helper_exists() -> None:
@@ -305,9 +310,9 @@ def test_j_rust_test_fn_helper_exists() -> None:
     attributes preceding a ``fn``. We accept either name.
     """
     has_helper = (
-        hasattr(acg, "_is_rust_test_fn")
-        or hasattr(acg, "_rust_fn_is_test")
-        or hasattr(acg, "_is_rust_cfg_test")
+        hasattr(_rust_lang, "_is_rust_test_fn")
+        or hasattr(_rust_lang, "_rust_fn_is_test")
+        or hasattr(_rust_lang, "_is_rust_cfg_test")
     )
     assert has_helper, (
         "Rust test-fn detector missing — V52-O.11.J not landed. "
@@ -318,7 +323,7 @@ def test_j_rust_test_fn_helper_exists() -> None:
 def _rust_test_fn_helper():
     """Pick whichever name the implementation chose."""
     for name in ("_is_rust_test_fn", "_rust_fn_is_test", "_is_rust_cfg_test"):
-        h = getattr(acg, name, None)
+        h = getattr(_rust_lang, name, None)
         if h is not None:
             return h
     pytest.skip("Helper not found (J not landed yet)")

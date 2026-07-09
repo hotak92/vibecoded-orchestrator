@@ -30,7 +30,7 @@ _ANALYZER = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 # Measured 2026-07-09, P2f stage 2 in flight (per-language extractor moves
 # into vco_lib/codegraph_lang/ — re-pinned DOWNWARD at every move commit so
 # the pin tracks the shrink; stage-1 pin was 11,010, v0.2.76 base was 11,055).
-_ANALYZER_LINES_MAX = 10203
+_ANALYZER_LINES_MAX = 9855
 
 
 def _measure() -> int:
