@@ -1173,4 +1173,167 @@ mod tests {
             .expect("hub reachable");
         assert_eq!(resp2.status(), StatusCode::OK);
     }
+
+    // ─── v0.2.76 Part 4 Task 4: VCT_HUB_LEGACY_GLOBAL_ENV flag ───────
+    //
+    // The flag DEFAULTS to allow this release (compat window) and flips
+    // to deny NEXT release. These tests pin BOTH postures NOW so the
+    // flip is a one-line default change with test coverage already in
+    // place. The env var is process-global; cargo runs vct-hub tests with
+    // RUST_TEST_THREADS=1 (serialised — see .cargo/config.toml), so each
+    // test sets + restores it without racing siblings.
+
+    /// Serialise the env-mutating flag tests among themselves (belt +
+    /// suspenders on top of the workspace-wide single-thread setting).
+    static LEGACY_FLAG_SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard: acquires the serialise lock ONCE for its lifetime and
+    /// ALWAYS removes `VCT_HUB_LEGACY_GLOBAL_ENV` on drop (even on a
+    /// panicking assert), so a failed flag test never leaks a "deny"
+    /// value into a later compat test. The mutex is NOT reentrant, so the
+    /// guard holds it for the whole test and mutations go through
+    /// `set` / `clear` WITHOUT re-locking. Mirrors the `with_state_dir`
+    /// discipline in this module.
+    struct LegacyFlagGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl LegacyFlagGuard {
+        /// Acquire the lock and set the flag to `value`.
+        fn set(value: &str) -> Self {
+            let lock = LEGACY_FLAG_SERIALIZE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            // Safety: serialised by the held lock + RUST_TEST_THREADS=1.
+            unsafe {
+                std::env::set_var("VCT_HUB_LEGACY_GLOBAL_ENV", value);
+            }
+            Self { _lock: lock }
+        }
+        /// Acquire the lock with the flag cleared.
+        fn cleared() -> Self {
+            let lock = LEGACY_FLAG_SERIALIZE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe {
+                std::env::remove_var("VCT_HUB_LEGACY_GLOBAL_ENV");
+            }
+            Self { _lock: lock }
+        }
+        /// Mutate the flag WITHOUT re-acquiring the lock (this guard
+        /// already holds it — the mutex is not reentrant). Used to sweep
+        /// multiple values inside one test body.
+        fn reset(&self, value: &str) {
+            unsafe {
+                std::env::set_var("VCT_HUB_LEGACY_GLOBAL_ENV", value);
+            }
+        }
+        fn reclear(&self) {
+            unsafe {
+                std::env::remove_var("VCT_HUB_LEGACY_GLOBAL_ENV");
+            }
+        }
+    }
+    impl Drop for LegacyFlagGuard {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("VCT_HUB_LEGACY_GLOBAL_ENV");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_global_env_allowed_default_and_deny_values() {
+        // ONE guard holds the lock for the whole test; mutate via
+        // reset/reclear (the mutex is not reentrant).
+        let g = LegacyFlagGuard::cleared();
+        assert!(
+            legacy_global_env_allowed(),
+            "unset → allow (compat default)"
+        );
+        for deny in ["0", "false", "no"] {
+            g.reset(deny);
+            assert!(!legacy_global_env_allowed(), "{:?} → deny", deny);
+        }
+        for allow in ["1", "true", "yes", "anything-else"] {
+            g.reset(allow);
+            assert!(legacy_global_env_allowed(), "{:?} → allow", allow);
+        }
+        g.reclear();
+        assert!(legacy_global_env_allowed(), "recleared → allow");
+    }
+
+    #[test]
+    fn evaluate_global_token_refused_when_flag_off() {
+        let _g = LegacyFlagGuard::set("0");
+        let mut map = std::collections::HashMap::new();
+        map.insert("proj-a".to_string(), "token-a".to_string());
+        let reg = ProjectTokenRegistry::from_map(map);
+        let global = "global-token";
+
+        // Global token → refused (403) when the flag is off.
+        assert!(matches!(
+            evaluate_project_route_auth("proj-a", global, global, &reg),
+            ProjectRouteAuth::GlobalTokenRefused
+        ));
+        // The per-project token STILL works even with the flag off — the
+        // flag only gates the GLOBAL-token path.
+        assert!(matches!(
+            evaluate_project_route_auth("proj-a", "token-a", global, &reg),
+            ProjectRouteAuth::ProjectToken
+        ));
+    }
+
+    #[tokio::test]
+    async fn env_route_refuses_global_token_when_flag_off() {
+        let _g = LegacyFlagGuard::set("0");
+        let base = spawn_router(router_with_project_tokens(
+            "global-tok",
+            &[("proj-a", "tok-a")],
+        ))
+        .await;
+        let client = reqwest::Client::new();
+
+        // Global token on /env → 403 (compat window closed by the flag).
+        let resp = client
+            .get(format!("{}/api/v1/projects/proj-a/env", base))
+            .header("Authorization", "Bearer global-tok")
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("VCT_HUB_LEGACY_GLOBAL_ENV"),
+            "403 body should name the flag; got: {}",
+            body
+        );
+
+        // The per-project token STILL authorizes with the flag off.
+        let resp2 = client
+            .get(format!("{}/api/v1/projects/proj-a/env", base))
+            .header("Authorization", "Bearer tok-a")
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp2.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn config_route_refuses_global_token_when_flag_off() {
+        let _g = LegacyFlagGuard::set("0");
+        let base = spawn_router(router_with_project_tokens(
+            "global-tok",
+            &[("proj-a", "tok-a")],
+        ))
+        .await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .get(format!("{}/api/v1/projects/proj-a/config", base))
+            .header("Authorization", "Bearer global-tok")
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
 }

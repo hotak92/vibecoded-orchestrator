@@ -467,7 +467,8 @@ State files live under `<vct_root_dir>` (defaults to `~/.vct/`; override with `V
 |---|---|---|
 | `hub.pid` | Lockfile; first line is the running PID | `0o600` |
 | `hub.port` | Bound TCP port (default 7700) | `0o644` |
-| `hub.token` | Bearer token for `/api/v1/*` routes; regenerated on every startup | `0o600` |
+| `hub.token` | Global bearer token for `/api/v1/*` routes; regenerated on every startup | `0o600` |
+| `hub.token.<project_id>` | Per-project bearer for `/projects/{id}/env` + `/config` (v0.2.76); minted at startup per registered project, rotated each start, removed for deleted projects | `0o600` |
 
 **Lockfile won't release after a hard kill**:
 
@@ -506,6 +507,23 @@ Every `/api/v1/*` route (except `/health`) requires `Authorization: Bearer <toke
 - **In-tree wrappers** (`claude_mcp_servers/search_mcp/wrapper.sh`, `vco` CLI, the `vct_secrets_resolve.{sh,ps1}` helpers): read the token per-call automatically — no extra config — but they don't auto-retry. If they 401, re-source / re-invoke them.
 - **Custom bash / PowerShell scripts**: re-read `<vct_root_dir>/hub.token` per call (or per failure-and-retry). Don't cache the token across hub restarts. See `templates/scripts/vct_project_config.sh` and `templates/scripts/vct_project_config.ps1` for reference implementations of the discover-and-call pattern.
 - **`hub.token` missing**: the hub hasn't started, or `VCT_STATE_DIR` differs between the hub and your client. `vct-hub --status` first; if `not-running`, start it with `vct-hub --start-if-not-running`.
+
+### Per-project resolver tokens + the 403 on `/env` / `/config` (v0.2.76)
+
+The two per-project routes — `GET /api/v1/projects/{id}/env` and `GET /api/v1/projects/{id}/config` — accept a **project-scoped** bearer (`hub.token.<project_id>`) in addition to the global `hub.token`. The hub mints one scoped token per registered project at startup (mode `0o600` on Unix; default same-user ACL on Windows), rotates them each start, and removes the file for a deleted project. The bundled resolvers already prefer the scoped token — they read `hub.token.<id>` first and fall back to `hub.token` when it is absent (a project added while the hub runs, or a pre-v0.2.76 hub). `VCT_HUB_TOKEN` (env) overrides both.
+
+- **`403 forbidden` with `"a token minted for project A cannot read project B"`**: you presented one project's scoped token on a DIFFERENT project's route. A scoped token never crosses the project boundary — use the token for the project in the URL (`hub.token.<that-id>`), or the global `hub.token` during the compat window.
+
+  ```bash
+  # POSIX: read a scoped token for the exact project in the URL
+  cat ~/.vct/hub.token.<project_id>
+  ```
+  ```powershell
+  # PowerShell
+  Get-Content "$env:VCT_STATE_DIR\hub.token.<project_id>" -Raw
+  ```
+
+- **`403 forbidden` naming `VCT_HUB_LEGACY_GLOBAL_ENV`**: the global-token compat window is closed on these routes (`VCT_HUB_LEGACY_GLOBAL_ENV=0`). Present the per-project token instead (the bundled resolvers do this automatically), or unset the flag to re-enable the compat path for this release. The default flips to refuse next release.
 
 ### Boot autostart not firing
 

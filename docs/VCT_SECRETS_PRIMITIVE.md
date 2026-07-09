@@ -80,6 +80,32 @@ An explicit `VCT_HUB_BIND_ALL` value wins in both directions. Every
 `/api/v1/*` route stays bearer-token gated while widened. Full runbook:
 `docs/TROUBLESHOOTING.md` § "Hub bind posture".
 
+### Per-project resolver tokens (tier 1, v0.2.76)
+
+The two per-project routes — `GET /api/v1/projects/{id}/env` and
+`GET /api/v1/projects/{id}/config` — accept a **project-scoped** bearer
+in addition to the global `hub.token`. On startup the hub mints one
+`hub.token.<project_id>` (mode `0o600` on Unix — POSIX; on Windows the
+default same-user ACL) per registered project, rotating them each start
+like `hub.token` and removing files for deleted projects. A resolver
+that knows its project id (it is the lookup key) presents the scoped
+token, so a credential that leaks to a different local user/process reads
+only that ONE project's env + config, not every project's.
+
+The bundled resolvers already prefer the scoped token: each reads
+`hub.token.<id>` first and falls back to `hub.token` when the scoped file
+is absent (a project added while the hub is running, or a pre-v0.2.76
+hub). `VCT_HUB_TOKEN` (env) still overrides both, so a test/dev harness
+that pins it keeps a single token across every route.
+
+The global `hub.token` remains accepted on these two routes for a
+**one-release compatibility window** (logged once per project as a
+deprecation). Set `VCT_HUB_LEGACY_GLOBAL_ENV=0` to refuse the global
+token on `/env` + `/config` now (the routes then require the per-project
+token; a wrong-project token is always a hard `403`). The default flips
+to refuse next release. POSIX and PowerShell resolvers behave
+identically — see the must-match triplet above.
+
 ---
 
 ## Architecture — secret-injecting `exec` wrapper

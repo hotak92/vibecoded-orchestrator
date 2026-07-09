@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+- **The hub no longer hands every local process a master key to every
+  project's secrets.** Before, the only credential a resolver could present
+  to `GET /api/v1/projects/{id}/env` (secrets) and `/config` was the coarse
+  global `hub.token` — any process that could read it read EVERY project's
+  resolved env + config. The hub now mints a per-project token
+  (`hub.token.<project_id>`, mode `0o600`, rotated each startup, cleaned up
+  for deleted projects) and the two per-project routes accept it in
+  preference to the global token; a token minted for project A cannot read
+  project B (hard `403`). The bundled resolver triplet (bash / PowerShell /
+  Python) prefers the scoped token and falls back to the global one for a
+  one-release compatibility window. `VCT_HUB_LEGACY_GLOBAL_ENV=0` refuses
+  the global token on those two routes now (default flips to refuse next
+  release). All other `/api/v1` routes keep using the global token
+  unchanged. (v0.2.76 Part 4)
+
 ## [0.2.75] - 2026-07-08
 
 ### Security
