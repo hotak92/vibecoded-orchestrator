@@ -716,6 +716,36 @@ def self_heal_kg_bindings(
                 )
 
             conn.commit()
+
+            # X-1 instrumentation (v0.2.76): count rows this heal pass
+            # ACTUALLY changed. This is the KPI that lets a future release
+            # demote the heal to assert-only: once ``changed`` stays 0 across
+            # releases, the launcher (Rust) creator path is provably keeping
+            # the binding rows canonical and the reconciliation pass is dead
+            # weight. Reuses the accumulators already tracked above — no new
+            # telemetry machinery. ``rebinds`` also feeds the deferral/report
+            # blocks below, so this is a pure read of existing state.
+            _heal_changed = (
+                len(rebinds)
+                + len(access_rebinds)
+                + len(prefix_adopts)
+                + _parity_inserts
+            )
+            log_event(
+                "7e/10", "ok",
+                f"[kg-heal] changed={_heal_changed} "
+                f"(binding_rebinds={len(rebinds)}, "
+                f"access_rebinds={len(access_rebinds)}, "
+                f"prefix_adopts={len(prefix_adopts)}, "
+                f"access_parity_inserts={_parity_inserts})",
+                data={
+                    "changed": _heal_changed,
+                    "binding_rebinds": len(rebinds),
+                    "access_rebinds": len(access_rebinds),
+                    "prefix_adopts": len(prefix_adopts),
+                    "access_parity_inserts": _parity_inserts,
+                },
+            )
         finally:
             conn.close()
     except sqlite3.Error as se:

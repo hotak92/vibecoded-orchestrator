@@ -40,7 +40,6 @@ use std::path::Path;
 use serde_json::Value as JsonValue;
 
 use crate::commands::project_env_settings::LAST_RESORT_SHARED_KG_COLLECTION;
-use crate::commands::projects_v2::sanitize_kg_collection;
 use crate::db::project_mcp_servers::{is_bundled_mcp, is_default_disabled_mcp};
 use crate::db::project_state::{resolve_kind_paths, AgentOrSkill};
 use crate::db::Db;
@@ -753,8 +752,6 @@ fn populate_kg_bindings(
     db: &Db,
     report: &mut PopulateReport,
 ) {
-    let pascal = sanitize_kg_collection(project_name);
-    let primary_collection = format!("{}_KnowledgeGraph", pascal);
     // Single source of truth — see project_env_settings.rs. Renamed from
     // "VibeCodedTools_KnowledgeGraph" in v0.2.12 PR-26 / Group E.
     let shared_collection = LAST_RESORT_SHARED_KG_COLLECTION;
@@ -762,32 +759,33 @@ fn populate_kg_bindings(
     let embedding_model = "qwen3-embedding:0.6b";
     let embedding_dim: i64 = 1024;
 
-    // Idempotence: set_project_kg_binding upserts ON CONFLICT(project_id,
-    // role). User edits to collection_name etc. WILL be overwritten by
-    // a re-run — which is the intended contract for these defaults
-    // (they're orchestrator-managed, not user-editable through this
-    // path; the launcher GUI edits them via set_project_kg_binding
-    // directly).
+    // X-1 / v0.2.76: route the derive-name-then-write through the single
+    // binding-writer home. The primary role derives the collection from the
+    // project name (writer owns the sanitizer call); the shared role passes a
+    // fixed collection name. Idempotence: set_project_kg_binding upserts ON
+    // CONFLICT(project_id, role). User edits WILL be overwritten by a re-run —
+    // the intended contract for these orchestrator-managed defaults; the
+    // launcher GUI edits them via the writer directly.
     if !kg_binding_already_exists(db, project_id, "primary") {
-        if let Err(e) = db.set_project_kg_binding(
+        if let Err(e) = crate::db::bindings_writer::write_kg_binding_primary_from_name(
+            db,
             project_id,
-            "primary",
-            &primary_collection,
+            project_name,
             Some(embedding_model),
             Some(embedding_dim),
-            None,
             Some(weaviate_url),
             &JsonValue::Null,
         ) {
             report
                 .warnings
-                .push(format!("set_project_kg_binding(primary): {}", e));
+                .push(format!("write_kg_binding(primary): {}", e));
         } else {
             report.kg_bindings_inserted += 1;
         }
     }
     if !kg_binding_already_exists(db, project_id, "shared") {
-        if let Err(e) = db.set_project_kg_binding(
+        if let Err(e) = crate::db::bindings_writer::write_kg_binding(
+            db,
             project_id,
             "shared",
             shared_collection,
@@ -799,7 +797,7 @@ fn populate_kg_bindings(
         ) {
             report
                 .warnings
-                .push(format!("set_project_kg_binding(shared): {}", e));
+                .push(format!("write_kg_binding(shared): {}", e));
         } else {
             report.kg_bindings_inserted += 1;
         }
@@ -832,10 +830,12 @@ fn populate_codegraph_binding(
     {
         return;
     }
-    let prefix = sanitize_kg_collection(project_name);
-    if let Err(e) = db.set_project_codegraph_binding(
+    // X-1 / v0.2.76: route through the single binding-writer home, which owns
+    // the sanitizer call.
+    if let Err(e) = crate::db::bindings_writer::write_codegraph_binding_from_name(
+        db,
         project_id,
-        &prefix,
+        project_name,
         Some("codesage-large-v2"),
         Some(2048),
         None,
@@ -845,7 +845,7 @@ fn populate_codegraph_binding(
     ) {
         report
             .warnings
-            .push(format!("set_project_codegraph_binding: {}", e));
+            .push(format!("write_codegraph_binding: {}", e));
     } else {
         report.codegraph_bindings_inserted += 1;
     }

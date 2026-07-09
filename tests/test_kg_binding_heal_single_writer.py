@@ -48,8 +48,16 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # The heal-owned tables. Mutations to these outside the single writer are the
-# regression we guard against.
-_HEAL_TABLES = ("project_kg_bindings", "kg_collection_access")
+# regression we guard against. X-1 / v0.2.76 widened this to include
+# ``project_codegraph_bindings``: on the Python side that table has NO
+# legitimate writer today (the codegraph binding is analyzer/launcher-owned),
+# so the guard asserts Python NEVER mutates it. If a future Python codegraph-
+# binding writer is genuinely needed, add its module to the allowlist here.
+_HEAL_TABLES = (
+    "project_kg_bindings",
+    "kg_collection_access",
+    "project_codegraph_bindings",
+)
 
 # SQL mutation verbs targeting a heal table. Matched case-insensitively;
 # whitespace-flexible so multi-line f-string SQL still hits.

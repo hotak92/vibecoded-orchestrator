@@ -26,6 +26,7 @@ pub mod settings;
 pub mod access;
 pub mod tier;
 pub mod project_state;
+pub mod bindings_writer;
 pub mod project_mcp_servers;
 pub mod slug;
 pub mod change_log;
