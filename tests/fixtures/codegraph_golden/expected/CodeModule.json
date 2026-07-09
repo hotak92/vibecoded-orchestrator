@@ -1,0 +1,149 @@
+[
+  {
+    "complexity": 1.0,
+    "content_hash": "10572197804055f50fdefe4ad93662debe0f6d73cc90d4b91049ee16bbace429",
+    "embed_revision": 0,
+    "file_hash": "a7be79b60ef69a0d5c3428e8b43f454f1d96bb0c122cc0158402ea0c2bc06472",
+    "import_names": [],
+    "is_test": false,
+    "language": "java",
+    "loc": 13,
+    "module_summary": "Java module: src/Account.java\nPackage: golden\nClasses: Account",
+    "path": "src/Account.java",
+    "project": "GoldenProj"
+  },
+  {
+    "complexity": 1.0,
+    "content_hash": "cbbb8f578acde6d9bcb730fa3381701b7762c8271d2cd172eabaaeca207e4b86",
+    "embed_revision": 0,
+    "file_hash": "d2091c2d83b6a2156a6d727a022c0dbfa4bb31597c30c2abc1abf47817cef6a6",
+    "import_names": [
+      "__future__"
+    ],
+    "is_test": false,
+    "language": "python",
+    "loc": 210,
+    "module_summary": "Module: src/big_module.py\nLong module: contains one very large function to exercise chunking.",
+    "path": "src/big_module.py",
+    "project": "GoldenProj"
+  },
+  {
+    "complexity": 1.0,
+    "content_hash": "3688489bf4b58444352134ec733d1c9bb18783d86c83989b1e680b9646e74288",
+    "embed_revision": 0,
+    "file_hash": "521d0b5fd227bb083395abfaff627560b85a9b868a6460df9c0abf469a86ac35",
+    "import_names": [
+      "./util.js"
+    ],
+    "is_test": false,
+    "language": "javascript",
+    "loc": 14,
+    "module_summary": "JavaScript module: src/client.js\nClient module for the golden-fixture repo (JavaScript, regex-parsed).\nClasses: ApiClient\nFunctions: buildClient, doubler",
+    "path": "src/client.js",
+    "project": "GoldenProj"
+  },
+  {
+    "complexity": 2.0,
+    "content_hash": "838042153b53ccead3c272f2064d221b4c764da7d33caa4ea495781548e2a9f7",
+    "embed_revision": 0,
+    "file_hash": "dc227b143cf9081e1cd29ca0bab61e8fef7da1957ff4ed3e67dec65bfcb50702",
+    "import_names": [],
+    "is_test": false,
+    "language": "powershell",
+    "loc": 18,
+    "module_summary": "PowerShell script: src/deploy.ps1\nDeploy helpers for the golden-fixture repo (PowerShell).",
+    "path": "src/deploy.ps1",
+    "project": "GoldenProj"
+  },
+  {
+    "complexity": 2.0,
+    "content_hash": "c526ef86d5a9e5b17a52d60a0d8a706337a421fec1740a0c8ab132d9a46791f3",
+    "embed_revision": 0,
+    "file_hash": "c08e39d9bcb8c8d56200fab6a1b8d53c79f62b071f8e53ce137862e6f851a8de",
+    "import_names": [
+      "std::collections::HashMap"
+    ],
+    "is_test": false,
+    "language": "rust",
+    "loc": 31,
+    "module_summary": "Rust module: src/engine.rs\nEngine module for the golden-fixture repo (Rust, regex-parsed).\nTypes: Counter, Resettable",
+    "path": "src/engine.rs",
+    "project": "GoldenProj"
+  },
+  {
+    "complexity": 1.0,
+    "content_hash": "691129553f3b05e1850bd252d325c48a696b77ba1facf929400801160f634555",
+    "embed_revision": 0,
+    "file_hash": "b7640ba81aad0a92ea9906eb8ca4ac3259d916667bb13fef87443baf39174d44",
+    "import_names": [],
+    "is_test": false,
+    "language": "typescript",
+    "loc": 16,
+    "module_summary": "TypeScript module: src/models.ts\nModels module for the golden-fixture repo (TypeScript, regex-parsed).\nFunctions: makeUser",
+    "path": "src/models.ts",
+    "project": "GoldenProj"
+  },
+  {
+    "complexity": 1.0,
+    "content_hash": "815478071bc68d06e116180294498b8e24f479b3e9871ef24fc1ab20c667fd62",
+    "embed_revision": 0,
+    "file_hash": "acf952f0cdebe1df35426e3b868af99d0c9d780d66510e6c0237a78594256258",
+    "import_names": [],
+    "is_test": false,
+    "language": "javascript",
+    "loc": 11,
+    "module_summary": "JavaScript module: src/routes.js\nFastify-style route definitions for CodeAPI coverage in the golden corpus.\nFunctions: registerRoutes, createItem, listItems\nRoutes: POST /items/create, GET /items/list",
+    "path": "src/routes.js",
+    "project": "GoldenProj"
+  },
+  {
+    "complexity": 1.0,
+    "content_hash": "07f9369d8367bf0cd07020e2330998f383889817255195630f43d52cfd6f4078",
+    "embed_revision": 0,
+    "file_hash": "a90b62f0b281556a7686e4f8ebbc2ec692156fd18b90573bf5c8442df5410caf",
+    "import_names": [
+      "fmt",
+      "%s %s",
+      "hello"
+    ],
+    "is_test": false,
+    "language": "go",
+    "loc": 14,
+    "module_summary": "Go module: src/service.go (package golden)\nPackage golden is a Go fixture for the code-graph golden corpus.\nTypes: Greeter",
+    "path": "src/service.go",
+    "project": "GoldenProj"
+  },
+  {
+    "complexity": 3.0,
+    "content_hash": "0a6933d4a75ea7d9712a403e1ec49083275e50351ad9bc706c690b9130a3657d",
+    "embed_revision": 0,
+    "file_hash": "c17486f61e0a10facd8bad46e33595171a284a001beaa7c6411a46765fa1e9e6",
+    "import_names": [
+      "__future__",
+      "math",
+      "typing"
+    ],
+    "is_test": false,
+    "language": "python",
+    "loc": 43,
+    "module_summary": "Module: src/widgets.py\nWidget module for the golden-fixture repo.\n\nExercises: module docstring, imports, classes with inheritance, nested\nfunctions, decorators, type annotations, internal calls (n_callers axis),\nand a plain top-level function.",
+    "path": "src/widgets.py",
+    "project": "GoldenProj"
+  },
+  {
+    "complexity": 1.0,
+    "content_hash": "89e349f0332db5d741534d32729dba2188b19eb66b3ba6bb56af57e3c9770cf8",
+    "embed_revision": 0,
+    "file_hash": "b412898f3e848ff9c9f1f57bf250377520f7d63a5277172791bb3fa21071cde3",
+    "import_names": [
+      "__future__",
+      "src.widgets"
+    ],
+    "is_test": true,
+    "language": "python",
+    "loc": 8,
+    "module_summary": "Module: tests/test_widgets.py\nTest file for widgets — exercises the is_test path heuristic axis.",
+    "path": "tests/test_widgets.py",
+    "project": "GoldenProj"
+  }
+]

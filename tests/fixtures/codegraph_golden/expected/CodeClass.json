@@ -1,0 +1,153 @@
+[
+  {
+    "chunk_num": 0,
+    "class_body": "package golden;\n\npublic class Account {\n    private long balance;\n\n    public Account(long opening) {\n        this.balance = opening;\n    }\n\n    public void deposit(long amount) {\n        this.balance += amount;\n    }\n\n    public long getBalance() {\n        return this.balance;\n    }\n}",
+    "content_hash": "8b29a7eae8c54f84529802536ed3b1c0af5c158e57a8b88324b6ea59f196fdbf",
+    "doc": "",
+    "embed_revision": 0,
+    "end_line": 19,
+    "file_path": "src/Account.java",
+    "full_name": "golden.Account",
+    "is_test": false,
+    "language": "java",
+    "methods": [
+      "Account",
+      "deposit",
+      "getBalance"
+    ],
+    "name": "Account",
+    "project": "GoldenProj",
+    "signature": "class Account",
+    "start_line": 2,
+    "total_chunks": 1
+  },
+  {
+    "chunk_num": 0,
+    "class_body": "class ApiClient {\n  constructor(baseUrl) {\n    this.baseUrl = baseUrl;\n  }\n\n  request(path) {\n    return helper(this.baseUrl + path);\n  }\n}",
+    "content_hash": "742b2dc1265fd7732d096d44c1211f12f45abf6cded17164ce72f4e44f7bc1cf",
+    "doc": "",
+    "embed_revision": 0,
+    "end_line": 14,
+    "file_path": "src/client.js",
+    "full_name": "client.ApiClient",
+    "is_test": false,
+    "language": "javascript",
+    "methods": [
+      "constructor",
+      "request"
+    ],
+    "name": "ApiClient",
+    "project": "GoldenProj",
+    "signature": "class ApiClient",
+    "start_line": 5,
+    "total_chunks": 1
+  },
+  {
+    "chunk_num": 0,
+    "class_body": "pub struct Counter {\n    count: u64,\n}",
+    "content_hash": "d9fa2482789df97adaa7f8470eb0d1ec3d4f2a3224b87e51f0b87dc82a3a029b",
+    "doc": "",
+    "embed_revision": 0,
+    "end_line": 9,
+    "file_path": "src/engine.rs",
+    "full_name": "engine.Counter",
+    "is_test": false,
+    "language": "rust",
+    "methods": [
+      "new",
+      "increment",
+      "value",
+      "reset"
+    ],
+    "name": "Counter",
+    "project": "GoldenProj",
+    "signature": "struct/enum/trait Counter",
+    "start_line": 6,
+    "total_chunks": 1
+  },
+  {
+    "chunk_num": 0,
+    "class_body": "pub trait Resettable {\n    fn reset(&mut self);\n}",
+    "content_hash": "256bd5879c8cb4f154541a620a5c53b0778ba7afd013c1a04b5b82f85e956b61",
+    "doc": "",
+    "embed_revision": 0,
+    "end_line": 28,
+    "file_path": "src/engine.rs",
+    "full_name": "engine.Resettable",
+    "is_test": false,
+    "language": "rust",
+    "methods": [],
+    "name": "Resettable",
+    "project": "GoldenProj",
+    "signature": "struct/enum/trait Resettable",
+    "start_line": 25,
+    "total_chunks": 1
+  },
+  {
+    "chunk_num": 0,
+    "class_body": "type Greeter struct {\n\tPrefix string\n}",
+    "content_hash": "7db4df33eaf97dc5d6a9a8d1a3639c6c9170dbef36bcda611e736c571dd138cf",
+    "doc": "",
+    "embed_revision": 0,
+    "end_line": 10,
+    "file_path": "src/service.go",
+    "full_name": "golden.Greeter",
+    "is_test": false,
+    "language": "go",
+    "methods": [
+      "Greet"
+    ],
+    "name": "Greeter",
+    "project": "GoldenProj",
+    "signature": "type Greeter struct/interface",
+    "start_line": 7,
+    "total_chunks": 1
+  },
+  {
+    "chunk_num": 0,
+    "class_body": "class Circle(Shape):\n    \"\"\"A circle shape that reuses area_of.\"\"\"\n\n    def __init__(self, radius: float) -> None:\n        super().__init__(\"circle\")\n        self.radius = radius\n\n    def area(self) -> float:\n        \"\"\"Compute this circle's area via the module helper.\"\"\"\n        return area_of(self.radius)\n\n    def scaled(self, factor: float) -> \"Circle\":\n        \"\"\"Return a new Circle scaled by factor, using a nested helper.\"\"\"\n\n        def clamp(value: float) -> float:\n            \"\"\"Nested function: never return a negative scale.\"\"\"\n            return value if value > 0 else 0.0\n\n        return Circle(self.radius * clamp(factor))",
+    "composes": [],
+    "content_hash": "87205d6f48c835250cb836ec846b7a1d07a779c849cf032912d751ef1e434b47",
+    "doc": "A circle shape that reuses area_of.",
+    "embed_revision": 0,
+    "end_line": 55,
+    "field_types": [],
+    "file_path": "src/widgets.py",
+    "full_name": "widgets.Circle",
+    "is_test": false,
+    "language": "python",
+    "methods": [
+      "__init__",
+      "area",
+      "scaled"
+    ],
+    "name": "Circle",
+    "project": "GoldenProj",
+    "signature": "class Circle(Shape)",
+    "start_line": 37,
+    "total_chunks": 1
+  },
+  {
+    "chunk_num": 0,
+    "class_body": "class Shape:\n    \"\"\"Base shape with a name and an abstract-ish area hook.\"\"\"\n\n    def __init__(self, name: str) -> None:\n        self.name = name\n\n    def describe(self) -> str:\n        \"\"\"Return a human label for this shape.\"\"\"\n        return f\"shape:{self.name}\"",
+    "composes": [],
+    "content_hash": "25829c88d0eabf35d733800b737720876f2bdff40f8d77f5ea34d0e531f1b5b4",
+    "doc": "Base shape with a name and an abstract-ish area hook.",
+    "embed_revision": 0,
+    "end_line": 34,
+    "field_types": [],
+    "file_path": "src/widgets.py",
+    "full_name": "widgets.Shape",
+    "is_test": false,
+    "language": "python",
+    "methods": [
+      "__init__",
+      "describe"
+    ],
+    "name": "Shape",
+    "project": "GoldenProj",
+    "signature": "class Shape",
+    "start_line": 26,
+    "total_chunks": 1
+  }
+]

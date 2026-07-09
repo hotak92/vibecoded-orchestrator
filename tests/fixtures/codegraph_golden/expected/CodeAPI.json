@@ -1,0 +1,26 @@
+[
+  {
+    "api_description": "POST /items/create (authenticated) -> createItem",
+    "content_hash": "a223b91e3cbe04d4e2bd3744084b2791e76b474890bb83c0ba6b11fe4815b072",
+    "embed_revision": 0,
+    "endpoint": "/items/create",
+    "language": "javascript",
+    "method": "POST",
+    "parameters": [],
+    "project": "GoldenProj",
+    "proxy_target": "",
+    "returns": ""
+  },
+  {
+    "api_description": "GET /items/list (public) -> listItems",
+    "content_hash": "4815e3b154d1d690985d92fe077cf6c3880f9f56a60488abe1bced057aff284f",
+    "embed_revision": 0,
+    "endpoint": "/items/list",
+    "language": "javascript",
+    "method": "GET",
+    "parameters": [],
+    "project": "GoldenProj",
+    "proxy_target": "",
+    "returns": ""
+  }
+]
