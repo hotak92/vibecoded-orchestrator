@@ -46,7 +46,7 @@
     "complexity": 2.0,
     "content_hash": "838042153b53ccead3c272f2064d221b4c764da7d33caa4ea495781548e2a9f7",
     "embed_revision": 0,
-    "file_hash": "dc227b143cf9081e1cd29ca0bab61e8fef7da1957ff4ed3e67dec65bfcb50702",
+    "file_hash": "de86dae618a544f459d8641eda1dda6fe4c33d8fb1da57b49d5aeb86c4e362d6",
     "import_names": [],
     "is_test": false,
     "language": "powershell",
@@ -132,9 +132,9 @@
   },
   {
     "complexity": 1.0,
-    "content_hash": "89e349f0332db5d741534d32729dba2188b19eb66b3ba6bb56af57e3c9770cf8",
+    "content_hash": "68ffb84e00074fdfc51577f49b295804c0625253ab49a24b754ea550a86717ef",
     "embed_revision": 0,
-    "file_hash": "b412898f3e848ff9c9f1f57bf250377520f7d63a5277172791bb3fa21071cde3",
+    "file_hash": "20a91e4f63b52ae4e0ad2d1f32a199b022590520fcb92d3db11f04c42af61d95",
     "import_names": [
       "__future__",
       "src.widgets"
@@ -142,7 +142,7 @@
     "is_test": true,
     "language": "python",
     "loc": 8,
-    "module_summary": "Module: tests/test_widgets.py\nTest file for widgets — exercises the is_test path heuristic axis.",
+    "module_summary": "Module: tests/test_widgets.py\nTest file for widgets - exercises the is_test path heuristic axis.",
     "path": "tests/test_widgets.py",
     "project": "GoldenProj"
   }

@@ -1,4 +1,4 @@
-"""Test file for widgets — exercises the is_test path heuristic axis."""
+"""Test file for widgets - exercises the is_test path heuristic axis."""
 from __future__ import annotations
 
 from src.widgets import Circle, area_of

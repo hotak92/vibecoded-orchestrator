@@ -513,17 +513,21 @@ def test_no_unconditional_method_finditer_in_csharp_class_loop() -> None:
         f"has it changed? Looked for: {csharp_anchor!r}"
     )
 
-    # Look at a window starting 1500 chars BEFORE the anchor (covers
-    # the `for cname, start_line in class_info.items():` loop header
-    # + the V52-O.11.F.2-CSHARP comment block + the
-    # `_csharp_methods_for_class(...)` call) and ending 200 chars after
-    # (just enough to span the embed_class call's local context).
-    # The 1500-char window is sized so the body of the C# class loop
-    # (which includes a ~700-char V52-O.11.F.2-CSHARP comment block)
-    # falls entirely inside it; reducing too aggressively cuts off the
-    # `for cname` loop header.
+    # Window = the C# CLASS loop body ONLY. Start 1500 chars BEFORE the anchor
+    # (covers the `for cname, start_line in class_info.items():` header + the
+    # V52-O.11.F.2-CSHARP comment block + the `_csharp_methods_for_class(...)`
+    # call). END at the NEXT `for ` after the anchor — the class loop's real
+    # terminator is the METHOD extraction loop
+    # `for m in method_pattern.finditer(content_clean):`, which legitimately
+    # iterates all methods. A fixed `+200`-char window used to spill into that
+    # adjacent loop (the class store block shrank under the P2f CodeEntity
+    # refactor) and false-positive on its legitimate
+    # `method_pattern.finditer(content_clean)` (see
+    # knowledge/concepts/test-regex-anchoring-fragility-2026-06-10.md); binding
+    # to the loop boundary keeps the guard scoped to the class loop body.
     window_start = max(0, anchor_pos - 1500)
-    window_end = min(len(src), anchor_pos + 200)
+    next_for = src.find("\n        for ", anchor_pos)
+    window_end = next_for if next_for != -1 else min(len(src), anchor_pos + 200)
     window = src[window_start:window_end]
 
     # Sanity: window must contain the C# class-loop's `for cname` header.

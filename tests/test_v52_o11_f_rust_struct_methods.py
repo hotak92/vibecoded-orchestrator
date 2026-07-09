@@ -346,13 +346,19 @@ def test_no_unconditional_func_finditer_in_rust_struct_loop() -> None:
         f"has it changed? Looked for: {rust_signature_anchor!r}"
     )
 
-    # Look at a window starting 600 chars BEFORE the anchor (covers the
-    # `for sname, start_line in struct_info.items():` loop header + the
-    # body up to the signature line) and ending 1500 chars AFTER (covers
-    # the explanatory V52-O.11.F comment block + the `methods =
-    # _rust_methods_for_struct(...)` call + embed_class invocation).
+    # Window = the struct loop body ONLY. Start 600 chars BEFORE the anchor
+    # (covers the `for sname, start_line in struct_info.items():` header +
+    # the body up to the signature line). End at the NEXT `for ` after the
+    # anchor — that is the struct loop's real terminator (the FUNCTION
+    # extraction loop `for m in func_pattern.finditer(content_clean):`, which
+    # legitimately iterates all functions). A fixed char-count window used to
+    # spill into that adjacent loop and false-positive on its legitimate
+    # `func_pattern.finditer(content_clean)` (see
+    # knowledge/concepts/test-regex-anchoring-fragility-2026-06-10.md); binding
+    # to the loop boundary keeps the guard scoped to the struct loop body.
     window_start = max(0, anchor_pos - 600)
-    window_end = min(len(src), anchor_pos + 1500)
+    next_for = src.find("\n        for ", anchor_pos)
+    window_end = next_for if next_for != -1 else min(len(src), anchor_pos + 1500)
     window = src[window_start:window_end]
 
     # Sanity: window must contain the Rust struct-loop's `for sname`

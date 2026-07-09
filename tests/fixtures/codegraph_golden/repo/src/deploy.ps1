@@ -9,7 +9,7 @@ function Invoke-Deploy {
         [int]$Retries
     )
 
-    # Nested function declared at 8-space indentation — the v0.2.75
+    # Nested function declared at 8-space indentation - the v0.2.75
     # deep-indent regression case (>=8 leading chars must not IndexError).
         function Write-Step {
             param([string]$Message)
