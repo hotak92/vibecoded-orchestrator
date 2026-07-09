@@ -141,7 +141,7 @@ def _run_cli(*args: str) -> subprocess.CompletedProcess:
 
 
 def test_cli_kg_matches_function():
-    for name in ("VCO_dev", "VibeCoded Orchestrator", "Foo-Bar", "123abc", ""):
+    for name in ("Acme_dev", "VibeCoded Orchestrator", "Foo-Bar", "123abc", ""):
         res = _run_cli("--kg", name)
         assert res.returncode == 0, res.stderr
         assert res.stdout.strip() == sanitize_for_weaviate_class(name)
