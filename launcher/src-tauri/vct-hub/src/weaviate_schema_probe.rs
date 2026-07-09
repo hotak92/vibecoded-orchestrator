@@ -78,6 +78,27 @@ pub async fn resolve_existing_casing_for_class(weaviate_url: &str, candidate: &s
             // Soft-fail: keep the candidate. The downstream caller will
             // surface a Weaviate-side error if the name is genuinely wrong;
             // we don't want every transient probe failure to break resolves.
+            //
+            // NEGATIVE-CACHE (Windows step22 hang fix): store an EMPTY
+            // snapshot so the remaining probes in this same resolve —
+            // `project_config` calls this 4× per request (kg / shared_kg /
+            // development / diagrams) — become cache HITS (empty map ⇒ no
+            // case-different sibling ⇒ `Some(candidate)`) instead of each
+            // re-issuing a fresh reqwest. Without this, an unreachable
+            // Weaviate cost 4× the connect stall per `/config` resolve.
+            //
+            // Why this matters on Windows specifically: connecting to a
+            // CLOSED `localhost:8081` returns ECONNREFUSED near-instantly on
+            // Linux/macOS, but Windows applies SYN-retransmit backoff to a
+            // non-listening port (and `localhost` is dual-stack v4+v6), so a
+            // single failed connect can ride most of `connect_timeout`. 4×
+            // that budget blew past the step22 test's 5s client timeout →
+            // the authed `/config` route hung while `/health` (no probe)
+            // answered. One attempt + cache-fanout keeps the worst case to a
+            // single bounded stall. The empty snapshot is subject to the same
+            // `CACHE_TTL` (5s) as a successful one, so a Weaviate that comes
+            // up shortly after is picked up on the next resolve.
+            store_cached(weaviate_url, HashMap::new());
             candidate.to_string()
         }
     }
@@ -127,6 +148,18 @@ fn store_cached(weaviate_url: &str, map: HashMap<String, String>) {
 async fn fetch_schema_map(weaviate_url: &str) -> Result<HashMap<String, String>, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
+        // Bound the CONNECT phase separately from the total request timeout.
+        // On a reachable-but-slow Weaviate the 2s total still applies; the
+        // value of a discrete connect_timeout is the UNREACHABLE case — a
+        // closed `localhost:8081` on Windows does not get a fast RST (SYN-
+        // retransmit backoff on a non-listening port, dual-stack v4+v6), so
+        // without this the connect could ride most of the 2s total budget.
+        // Capping it at 1s keeps a single failed probe cheap on every OS
+        // (Linux/macOS already fail near-instantly with ECONNREFUSED; this is
+        // a no-op there and a safety bound on Windows). Combined with the
+        // negative-cache in `resolve_existing_casing_for_class`, a `/config`
+        // resolve against a down Weaviate costs one ≤1s stall, not four.
+        .connect_timeout(Duration::from_secs(1))
         .build()
         .map_err(|e| format!("reqwest::Client build failed: {}", e))?;
 
@@ -269,6 +302,60 @@ mod tests {
         let resolved = resolve_existing_casing_for_class(&url, candidate).await;
         // Soft-fail: candidate echoed back unchanged.
         assert_eq!(resolved, candidate);
+    }
+
+    /// Windows step22-hang regression (2026-07-09): an UNREACHABLE Weaviate
+    /// must be probed at most ONCE per cache-TTL window, even across the
+    /// several candidate resolves a single `/config` request issues. Before
+    /// the negative-cache the error branch never populated the cache, so
+    /// `project_config`'s 4 sequential probe calls each re-issued a fresh
+    /// reqwest — 4× the connect stall, which on Windows (slow connect to a
+    /// closed dual-stack `localhost` port) blew past the test client's 5s
+    /// timeout and hung the authed route while `/health` still answered.
+    ///
+    /// We assert the FANOUT-COLLAPSE directly: after the first (network)
+    /// resolve caches an empty snapshot, a follow-up resolve for a DIFFERENT
+    /// candidate against the same unreachable URL is served from cache — no
+    /// second network attempt. `lookup_cached` returning `Some(_)` for the
+    /// second candidate is the observable proof the probe was not re-run.
+    #[tokio::test]
+    async fn unreachable_weaviate_negative_caches_to_collapse_fanout() {
+        _reset_cache_for_test();
+        // A definitely-closed port (bind then drop).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let url = format!("http://{}", addr);
+
+        // Cold cache: no snapshot yet for this URL.
+        assert!(
+            lookup_cached(&url, "First_Development").is_none(),
+            "precondition: URL must be uncached before the first resolve"
+        );
+
+        // First resolve does the (failing) network call and negative-caches.
+        let first = resolve_existing_casing_for_class(&url, "First_Development").await;
+        assert_eq!(first, "First_Development", "soft-fail echoes the candidate");
+
+        // The empty snapshot is now cached, so a resolve for ANY OTHER
+        // candidate (the 2nd/3rd/4th probe of one `/config` request) is a
+        // cache HIT — no further network attempt. If the negative-cache
+        // regressed, this would be `None` (forcing another reqwest).
+        assert_eq!(
+            lookup_cached(&url, "Second_Diagrams").as_deref(),
+            Some("Second_Diagrams"),
+            "second candidate must be served from the negative-cache, not re-probed"
+        );
+        assert_eq!(
+            lookup_cached(&url, "Third_KnowledgeGraph").as_deref(),
+            Some("Third_KnowledgeGraph"),
+            "third candidate must also hit the negative-cache"
+        );
+
+        // And the full resolve path for a fresh candidate still soft-fails
+        // to the candidate (cache-served, no panic, no hang).
+        let fourth = resolve_existing_casing_for_class(&url, "Fourth_Development").await;
+        assert_eq!(fourth, "Fourth_Development");
     }
 
     #[tokio::test]
