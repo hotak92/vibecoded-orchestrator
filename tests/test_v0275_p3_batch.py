@@ -26,6 +26,10 @@ for _p in (str(_REPO_ROOT), str(_REPO_ROOT / "claude_mcp_servers")):
 
 _ANALYZER_PATH = _REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 
+# P2f stage 2 (v0.2.76): `_is_minified_content` moved verbatim to
+# vco_lib/codegraph_lang/_shared — P3d guard retargeted to the new home.
+from vco_lib.codegraph_lang._shared import _is_minified_content  # noqa: E402
+
 
 @pytest.fixture(scope="module")
 def analyzer_mod():
@@ -37,35 +41,38 @@ def analyzer_mod():
 
 
 # ─────────────────── P3d: minified-content heuristic ───────────────────
+# P2f stage 2 (v0.2.76): `_is_minified_content` moved verbatim to
+# vco_lib/codegraph_lang/_shared — guard retargeted to the new home
+# (imported at the top of this file).
 
 
-def test_p3d_minified_long_single_line_is_flagged(analyzer_mod):
+def test_p3d_minified_long_single_line_is_flagged():
     content = "var x=1;" + "a=1;" * 3000  # one huge line
-    assert analyzer_mod._is_minified_content(content) is True
+    assert _is_minified_content(content) is True
 
 
-def test_p3d_high_median_line_length_is_flagged(analyzer_mod):
+def test_p3d_high_median_line_length_is_flagged():
     # 60 lines each ~500 chars → median well above hand-written code.
     content = "\n".join("x" * 500 for _ in range(60))
-    assert analyzer_mod._is_minified_content(content) is True
+    assert _is_minified_content(content) is True
 
 
-def test_p3d_normal_code_not_flagged(analyzer_mod):
+def test_p3d_normal_code_not_flagged():
     content = "\n".join([
         "def foo(a, b):",
         "    # a normal, readable line",
         "    return a + b",
     ] * 400)  # large but normal median line length
-    assert analyzer_mod._is_minified_content(content) is False
+    assert _is_minified_content(content) is False
 
 
-def test_p3d_short_file_never_flagged(analyzer_mod):
+def test_p3d_short_file_never_flagged():
     # Below the min-content threshold, even a dense line is kept.
-    assert analyzer_mod._is_minified_content("x" * 100) is False
+    assert _is_minified_content("x" * 100) is False
 
 
-def test_p3d_empty_never_flagged(analyzer_mod):
-    assert analyzer_mod._is_minified_content("") is False
+def test_p3d_empty_never_flagged():
+    assert _is_minified_content("") is False
 
 
 # ─────────────────── P3a: survivor total_chunks patch ───────────────────

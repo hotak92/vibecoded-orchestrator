@@ -8,9 +8,11 @@ Pre-V52-O.11.E (audit a79152, 2026-06-09): 18 regex-language parsers used
 Audit reproduced: ``is_blocklisted_agent_file`` (real end 281, stored end
 315, body contained 34 lines of the NEXT function).
 
-V52-O.11.E introduces ``_extract_balanced_block`` + ``_scrub_for_brace_balance``
-in ``templates/scripts/analyze_code_graph.py``, replaces all 18 broken sites
-(11 function-body + 7 class-body), and validates:
+V52-O.11.E introduced ``_extract_balanced_block`` + ``_scrub_for_brace_balance``
+in ``templates/scripts/analyze_code_graph.py`` and replaced all 18 broken sites
+(11 function-body + 7 class-body). P2f stage 2 (v0.2.76) moved both helpers
+VERBATIM to ``vco_lib/codegraph_lang/_shared`` — this guard is retargeted to
+the new home (same assertions, unchanged). Validates:
 
 1. Simple brace-balanced functions return the correct end-line.
 2. Nested braces are counted correctly.
@@ -30,62 +32,16 @@ body).
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
-import sys
 from pathlib import Path
-from types import ModuleType
 
-import pytest
+# P2f stage 2 (v0.2.76): the helpers under test moved verbatim to
+# vco_lib/codegraph_lang/_shared, which is import-safe (no weaviate-client /
+# EmbeddingService / sys.path side effects) — the old isolated-importlib
+# loader for the full analyzer script is no longer needed. Alias the module
+# as ``acg`` so every assertion below stays byte-identical.
+from vco_lib.codegraph_lang import _shared as acg
 
 _REPO = Path(__file__).resolve().parent.parent
-
-
-def _load_analyze_code_graph() -> ModuleType:
-    """Load ``templates/scripts/analyze_code_graph.py`` as an isolated module.
-
-    Importing it the obvious way would pollute ``sys.modules`` + ``sys.path``
-    via its module-level ``from weaviate_mcp.code_truncation import ...``
-    line, plus the ``sys.path.insert(0, ...)`` at line 442. That binds
-    ``sys.modules['weaviate_mcp']`` to ``claude_mcp_servers/weaviate_mcp/``
-    (since the analyzer adds the orchestrator-root to sys.path) — which
-    later breaks test_v52_i_valid_until_gap.py because its
-    ``from weaviate_mcp import server`` resolves to the cached, stale
-    module reference.
-
-    Workaround: snapshot ``sys.modules`` and ``sys.path`` BEFORE load,
-    restore them AFTER. Load by file path under a private alias so the
-    analyzer doesn't land in the canonical module registry at all.
-
-    NB: the analyzer's own ``weaviate_mcp.code_truncation`` import has a
-    try/except guard, so it degrades gracefully when the editable install
-    isn't reachable. Our brace-balance helpers (the only thing this test
-    exercises) don't depend on that import path.
-    """
-    sys_modules_before = set(sys.modules.keys())
-    sys_path_before = list(sys.path)
-
-    spec = importlib.util.spec_from_file_location(
-        "_v52_o11_e_acg_isolated",
-        _REPO / "templates" / "scripts" / "analyze_code_graph.py",
-    )
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(mod)
-    finally:
-        # Restore sys.path to its pre-load state.
-        sys.path[:] = sys_path_before
-        # Remove any sys.modules entries that the analyzer's transitive
-        # imports added — restores the environment so test_v52_i_*'s
-        # ``from weaviate_mcp import server`` re-resolves freshly.
-        new_keys = set(sys.modules.keys()) - sys_modules_before
-        for key in new_keys:
-            del sys.modules[key]
-    return mod
-
-
-acg = _load_analyze_code_graph()
 
 
 # ---------------------------------------------------------------------------
@@ -319,10 +275,16 @@ def test_no_broken_body_extraction_sites_remain() -> None:
 
     Note: the helper's docstring mentions the OLD pattern verbatim for
     posterity — we exclude the docstring region from the scan.
+
+    P2f stage 2 (v0.2.76): extractor code is moving to
+    vco_lib/codegraph_lang/ — scan BOTH homes so the guard stays armed over
+    the moved extractors, not just the shrinking analyzer.
     """
     import re
     analyzer_path = _REPO / "templates" / "scripts" / "analyze_code_graph.py"
     src = analyzer_path.read_text()
+    for lang_mod in sorted((_REPO / "vco_lib" / "codegraph_lang").glob("*.py")):
+        src += "\n" + lang_mod.read_text()
 
     # Strip the helper's docstring (it mentions the pattern verbatim).
     # The helper is at module level; we scan the body of CodeGraphAnalyzer.

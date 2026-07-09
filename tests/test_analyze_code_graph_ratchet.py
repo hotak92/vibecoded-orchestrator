@@ -27,12 +27,10 @@ _ANALYZER = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 
 # ── Pinned ceiling — update only DOWNWARD ──────────────────────────────────
 #
-# Measured 2026-07-09 after P2f stage 1 (CodeEntity IR + store_entity mapping;
-# all 28 hand-built _dedup_insert call-sites collapsed onto one path, entity
-# model moved to vco_lib/codegraph_entities.py). Down from 11,055 at the
-# v0.2.76 base. The IR is stage 1 of 4 — the per-language extractor modules
-# (stage 2) will lower this substantially; re-pin then.
-_ANALYZER_LINES_MAX = 11010
+# Measured 2026-07-09, P2f stage 2 in flight (per-language extractor moves
+# into vco_lib/codegraph_lang/ — re-pinned DOWNWARD at every move commit so
+# the pin tracks the shrink; stage-1 pin was 11,010, v0.2.76 base was 11,055).
+_ANALYZER_LINES_MAX = 10624
 
 
 def _measure() -> int:
