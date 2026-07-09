@@ -2,48 +2,28 @@
 # Copyright (c) 2026 VibeCoded Tools
 """V52-O.11.N (v0.2.53 Track E) — PowerShell parser unit tests.
 
-Tests the pure-function helpers at
-``templates/scripts/analyze_code_graph.py``
-(``_strip_powershell_comments`` + ``_parse_powershell_functions``).
-The wired-in analyzer method ``_analyze_powershell_file`` lives on
-``CodeGraphAnalyzer`` and depends on Weaviate / EmbeddingService;
-covered separately by integration tests.
+Tests the pure-function helpers ``_strip_powershell_comments`` +
+``_parse_powershell_functions`` — including the v0.2.75 (P1b) deep-indent
+regression. P2f stage 2 (v0.2.76): the helpers moved VERBATIM from
+``templates/scripts/analyze_code_graph.py`` to
+``vco_lib/codegraph_lang/powershell.py`` — this guard is retargeted to the
+new home (assertions unchanged). The wired-in extractor
+``analyze_powershell_file`` lives in the same module and depends on
+Weaviate / EmbeddingService via ``ctx``; covered separately by the golden
+suite + integration tests.
 """
 
 from __future__ import annotations
 
-import sys
 import unittest
-from pathlib import Path
-
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-ANALYZE_PATH = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 
 
 def _load_module():
-    """Identical loader pattern to ``tests/test_svelte_parser.py`` —
-    parses only the prelude before ``class CodeGraphAnalyzer:`` so the
-    helpers under test are reachable without paying the
-    weaviate-client / EmbeddingService import cost."""
-    module_name = "analyze_code_graph_partial"
-    if module_name in sys.modules:
-        return sys.modules[module_name]
-
-    source = ANALYZE_PATH.read_text(encoding="utf-8")
-    cutoff = source.find("class CodeGraphAnalyzer:")
-    if cutoff == -1:
-        raise AssertionError("Could not locate class CodeGraphAnalyzer:")
-    prelude = source[:cutoff]
-    module = type(sys)(module_name)
-    module.__dict__["__file__"] = str(ANALYZE_PATH)
-    module.__dict__["__name__"] = module_name
-    try:
-        exec(compile(prelude, str(ANALYZE_PATH), "exec"), module.__dict__)
-    except SystemExit:
-        pass
-    sys.modules[module_name] = module
-    return module
+    """The helpers now live in an import-safe vco_lib module (no
+    weaviate-client / EmbeddingService import cost) — the old
+    partial-prelude ``exec`` loader is no longer needed."""
+    from vco_lib.codegraph_lang import powershell
+    return powershell
 
 
 class PowerShellCommentStrippingTests(unittest.TestCase):
