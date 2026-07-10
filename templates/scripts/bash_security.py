@@ -75,7 +75,13 @@ _rule(
 )
 _rule(
     "env_exfil_curl",
-    r"(env|printenv|set)\b.*\|\s*(curl|wget|nc|ncat)\b",
+    # v0.2.76 (R6b): the env-ENUMERATION command must be the DIRECT source of
+    # the pipe into the network tool. `[^;&|\n]*` keeps the match inside ONE
+    # simple command — a bare `env`/`set` token elsewhere in a compound
+    # (`set -a; source rc; …; curl localhost`) no longer spans across `;`/`&&`
+    # to a later, unrelated `| curl`. True `env | curl` / `printenv | nc`
+    # (dump piped straight out) still match.
+    r"(env|printenv|set)\b[^;&|\n]*\|\s*(curl|wget|nc|ncat)\b",
     "Environment dump piped to network tool",
 )
 _rule(
@@ -119,7 +125,12 @@ _rule(
 )
 _rule(
     "read_env_files",
-    r"cat\s+.*\.(env|credentials|netrc|pgpass)",
+    # v0.2.76 (R6b): match `cat <credential-file>` (a READ), not `cat > x.env`
+    # (a WRITE redirect) and not a `.env`-suffixed token in a LATER command of
+    # a compound. The negative lookahead `(?![^;&|\n]*>)` rejects a redirect
+    # between `cat` and the extension; `[^;&|\n]*` keeps the filename inside the
+    # same simple command. `cat ~/.env` / `cat .env.local` still match.
+    r"cat\s+(?![^;&|\n]*>)[^;&|\n]*\.(env|credentials|netrc|pgpass)\b",
     "Reading credential files",
 )
 
@@ -215,14 +226,18 @@ _CREDENTIAL_ACCESS_RULES: frozenset[str] = frozenset({
     "read_bash_history",
 })
 
+# v0.2.76 (R6a): point at paths that EXIST in a deployed project. The prior
+# hint referenced `tools/vct-secrets/vct` and `templates/scripts/vct_secrets_resolve.sh`
+# — both live in the ORCHESTRATOR clone only, NOT in a project the orchestrator
+# was installed into (where this scanner actually runs). The resolver script is
+# bundled to `.claude/scripts/vct_secrets_resolve.sh` (present in both the
+# orchestrator root and every deployed project), and `vco_lib.agent_secrets.get`
+# is importable under the install venv.
 _REMEDIATION_HINT = """\
-REMEDIATION: use the vct-secrets primitive instead of scraping the environment.
-  Discover keys:     tools/vct-secrets/vct list
-  Probe one key:     tools/vct-secrets/vct can-read --key KEY
-  Inject into child: tools/vct-secrets/vct exec --secret KEY=ENV_VAR -- cmd args
-  Key purposes:      ~/.vct-secrets/shared/_README.md
-  Launcher-managed secrets (github_pat, openai_api_key) resolve via vct-hub:
-  templates/scripts/vct_secrets_resolve.sh <project> <key>  (or vco_lib.agent_secrets)
+REMEDIATION: resolve secrets via the vct-secrets primitive instead of scraping the environment.
+  Launcher/keychain secrets (github_pat, openai_api_key, per-project keys):
+    .claude/scripts/vct_secrets_resolve.sh <project_folder> <KEY>
+    or, from Python:  from vco_lib.agent_secrets import get; get("KEY")
   Full docs: docs/VCT_SECRETS_PRIMITIVE.md"""
 
 
