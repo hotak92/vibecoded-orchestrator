@@ -470,3 +470,62 @@ def test_d1_over_budget_multichunk_reembeds_not_stamped(
 
     assert embedder.calls == 1, "over-budget multi-chunk must re-embed, not stamp"
     assert coll.data.update_calls == [], "no stamp-only for an over-budget entity"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# v0.2.77 5c task 4: vectorless degrade emits ONE audit line + sets no vector
+# ─────────────────────────────────────────────────────────────────────
+
+class TestVectorlessDegradeLogging:
+    def test_failed_embed_leaves_no_vector_and_logs_object(
+        self, analyzer_mod, caplog
+    ):
+        cls = analyzer_mod.CodeGraphAnalyzer
+        params = {"properties": {"full_name": "mod.doomed", "name": "doomed"}}
+
+        def _boom():
+            raise RuntimeError("CodeEmbed /embed returned HTTP 503: capacity")
+
+        import logging
+        with caplog.at_level(logging.WARNING):
+            cls._run_deferred_embed_into(params, _boom)
+
+        # No vector set → the write path will stamp _EMBED_REVISION_VECTORLESS.
+        assert "vector" not in params
+        # Exactly one audit line naming the object + the 503 failure.
+        degraded = [r for r in caplog.records if "VECTORLESS" in r.getMessage()]
+        assert len(degraded) == 1
+        msg = degraded[0].getMessage()
+        assert "mod.doomed" in msg
+        assert "503" in msg
+
+    def test_embedder_returns_none_logs_no_vector_reason(
+        self, analyzer_mod, caplog
+    ):
+        cls = analyzer_mod.CodeGraphAnalyzer
+        params = {"properties": {"path": "src/empty.py"}}
+        import logging
+        with caplog.at_level(logging.WARNING):
+            cls._run_deferred_embed_into(params, lambda: None)
+        assert "vector" not in params
+        degraded = [r for r in caplog.records if "VECTORLESS" in r.getMessage()]
+        assert len(degraded) == 1
+        assert "no vector" in degraded[0].getMessage()
+
+    def test_successful_embed_sets_vector_and_no_warning(
+        self, analyzer_mod, caplog
+    ):
+        cls = analyzer_mod.CodeGraphAnalyzer
+        params = {"properties": {"full_name": "mod.ok"}}
+        import logging
+        with caplog.at_level(logging.WARNING):
+            cls._run_deferred_embed_into(params, lambda: [0.1, 0.2, 0.3])
+        # Vector set (may be wrapped in a named-vector slot dict in dual mode).
+        assert "vector" in params
+        shaped = params["vector"]
+        if isinstance(shaped, dict):
+            assert [0.1, 0.2, 0.3] in shaped.values()
+        else:
+            assert shaped == [0.1, 0.2, 0.3]
+        degraded = [r for r in caplog.records if "VECTORLESS" in r.getMessage()]
+        assert degraded == []

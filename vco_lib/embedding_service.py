@@ -74,6 +74,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -95,6 +96,28 @@ from vco_lib.embedding_providers.openai import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ── v0.2.77 5c task 4: bounded 503 backoff-before-vectorless ──────────
+#
+# The code-embed FastAPI service sheds with HTTP 503 when its in-flight
+# semaphore is saturated (a burst, e.g. an update-all fan-out) OR while a model
+# (re)loads. Pre-v0.2.77 the retry was a SINGLE attempt (C-9); under the 5c
+# update-all incident a saturating burst outlived one 2s retry and the embed
+# call chain still failed → the analyzer degraded the object to VECTORLESS
+# (embed_revision=0). A bounded exponential backoff rides out the burst window
+# WITHOUT masking a genuinely-down backend (the schedule is finite; after the
+# last delay a persistent 503 re-raises and the fail-safe vectorless-degrade
+# path takes over exactly as before).
+#
+# Schedule: retries at 2s, 5s, 10s after the initial try (total ~17s of sleep
+# < the 20s/object budget), each with a small +jitter to de-synchronise many
+# concurrent objects hammering the service in lock-step. Module-level so the
+# constants are visible + tunable in ONE place; the first delay is overridable
+# via VCO_EMBED_503_RETRY_DELAY (back-compat with the C-9 knob — it SCALES the
+# whole schedule proportionally so a "0" in tests makes every delay 0).
+_EMBED_503_RETRY_BACKOFFS: "tuple[float, ...]" = (2.0, 5.0, 10.0)
+# Jitter added to each delay: uniform [0, delay * _EMBED_503_JITTER_FRAC].
+_EMBED_503_JITTER_FRAC = 0.25
 
 __all__ = [
     "EmbeddingService",
@@ -1430,36 +1453,74 @@ class EmbeddingService:
     # ---- single-item embed --------------------------------------------
 
     def _retry_once_on_503(self, fn, *args):
-        """v0.2.73 C-9: retry a provider embed ONCE after a short delay when
-        the backend answered HTTP 503.
+        """Retry a provider embed on HTTP 503 with a BOUNDED exponential
+        backoff before letting the failure propagate (v0.2.77 5c task 4;
+        supersedes the v0.2.73 C-9 single-retry).
 
-        The code-embed FastAPI service (and Ollama, briefly) return 503 while
-        a model is (re)loading — a transient that previously failed the whole
-        embed call chain on the first request of a cold session (the C-1
-        trigger). ONE retry with a small delay absorbs the common case
-        without masking a genuinely-down backend (a second 503 re-raises).
-        Non-503 errors re-raise immediately — no behaviour change.
+        The code-embed FastAPI service sheds with 503 when its in-flight
+        semaphore is saturated (an update-all burst) OR while a model
+        (re)loads. A single retry (C-9) was not enough to ride out the 5c
+        incident's saturation window, so the embed chain still failed and the
+        analyzer degraded the object to VECTORLESS (embed_revision=0). This
+        method now retries on the module-level ``_EMBED_503_RETRY_BACKOFFS``
+        schedule (2s, 5s, 10s + jitter — total ~17s < the 20s/object budget)
+        so a transient burst is absorbed. It does NOT mask a genuinely-down
+        backend: the schedule is finite; after the last delay a persistent 503
+        re-raises and the caller's fail-safe (vectorless degrade) takes over
+        exactly as before. Non-503 errors re-raise IMMEDIATELY (no behaviour
+        change — only 503 is transient-retryable).
 
-        Delay tunable via ``VCO_EMBED_503_RETRY_DELAY`` (seconds, default 2;
-        malformed → default — a knob must not be a kill switch).
+        The name is kept (many call sites reference it) even though it now
+        retries up to ``len(_EMBED_503_RETRY_BACKOFFS)`` times.
+
+        ``VCO_EMBED_503_RETRY_DELAY`` (seconds, default from the schedule)
+        SCALES the whole schedule proportionally for back-compat with the C-9
+        knob: a value of ``0`` makes every delay 0 (used by tests). Malformed
+        → schedule used unscaled (a knob must not be a kill switch).
         """
-        try:
-            return fn(*args)
-        except Exception as exc:  # noqa: BLE001 — inspect, then re-raise
-            if "503" not in str(exc):
-                raise
+        # Resolve the optional scale override once. When set, it replaces the
+        # FIRST backoff and scales the rest by the same ratio; "0" → all zero.
+        scale: "float | None" = None
+        raw = os.getenv("VCO_EMBED_503_RETRY_DELAY")
+        if raw is not None:
             try:
-                delay = float(os.getenv("VCO_EMBED_503_RETRY_DELAY", "2"))
+                first = float(raw)
+                if first < 0:
+                    first = 0.0
+                base = _EMBED_503_RETRY_BACKOFFS[0] or 1.0
+                scale = first / base
             except (TypeError, ValueError):
-                delay = 2.0
-            if delay < 0:
-                delay = 0.0
-            logger.info(
-                "Embed backend returned 503 (model loading?): %s — "
-                "retrying once after %.1fs", exc, delay,
-            )
-            time.sleep(delay)
-            return fn(*args)
+                scale = None  # malformed → use the schedule unscaled
+
+        last_exc: "Exception | None" = None
+        # attempt 0 = initial try; attempts 1..N = one per scheduled backoff.
+        for attempt in range(len(_EMBED_503_RETRY_BACKOFFS) + 1):
+            try:
+                return fn(*args)
+            except Exception as exc:  # noqa: BLE001 — inspect, then re-raise
+                if "503" not in str(exc):
+                    raise
+                last_exc = exc
+                if attempt >= len(_EMBED_503_RETRY_BACKOFFS):
+                    break  # schedule exhausted → re-raise below
+                delay = _EMBED_503_RETRY_BACKOFFS[attempt]
+                if scale is not None:
+                    delay *= scale
+                # Jitter de-syncs many concurrent objects retrying in lock-step
+                # (each hammering the same saturated service on the same beat).
+                if delay > 0:
+                    delay += random.uniform(0.0, delay * _EMBED_503_JITTER_FRAC)
+                logger.info(
+                    "Embed backend returned 503 (saturated / model loading?): "
+                    "%s — retry %d/%d after %.1fs",
+                    exc, attempt + 1, len(_EMBED_503_RETRY_BACKOFFS), delay,
+                )
+                if delay > 0:
+                    time.sleep(delay)
+        # Every attempt raised 503 → propagate the last one so the caller's
+        # fail-safe degrade runs (never a silent swallow).
+        assert last_exc is not None
+        raise last_exc
 
     def embed_text(self, text: str) -> list[float]:
         """Embed one text via the active text backend.

@@ -2970,14 +2970,53 @@ class CodeGraphAnalyzer:
         = _shape_for_insert(embedding)`` line — one home now. A None/failed
         embed leaves ``vector`` unset (the write path already tolerates a
         vectorless object and stamps _EMBED_REVISION_VECTORLESS).
+
+        v0.2.77 5c task 4: the deferred embedder routes through
+        ``EmbeddingService._retry_once_on_503``, which now rides out a 503 burst
+        with a bounded backoff BEFORE giving up. When it STILL fails (or returns
+        None) after exhausting the schedule, the object degrades to VECTORLESS —
+        the fail-safe that filled 89 rows with embed_revision=0 in the 5c
+        incident. We emit ONE line per degraded object (naming it + the failure)
+        so the degrade is VISIBLE in the analyze log instead of silent; the R-1
+        stale-file probe + per-object gate still re-embed it on the next
+        (whole-repo OR incremental — task 5) walk.
         """
+        failure: "Exception | None" = None
         try:
             embedding = deferred()
-        except Exception:  # noqa: BLE001 — an embed failure must not wedge the write
+        except Exception as exc:  # noqa: BLE001 — an embed failure must not wedge the write
             embedding = None
+            failure = exc
         shaped = _shape_for_insert(embedding)
         if shaped:
             insert_params["vector"] = shaped
+            return
+        # No vector → the write path will stamp _EMBED_REVISION_VECTORLESS.
+        # Name the object so the degrade is auditable (best-effort — logging
+        # must never wedge a write).
+        try:
+            props = insert_params.get("properties") if isinstance(insert_params, dict) else None
+            ident = ""
+            if isinstance(props, dict):
+                ident = str(
+                    props.get("full_name")
+                    or props.get("name")
+                    or props.get("path")
+                    or props.get("file_path")
+                    or "?"
+                )
+            reason = (
+                f"embed failed after 503 backoff ({failure})"
+                if failure is not None
+                else "embedder returned no vector"
+            )
+            logger.warning(
+                "code-graph object degraded to VECTORLESS "
+                "(embed_revision=0): %s — %s; will re-embed on next walk",
+                ident, reason,
+            )
+        except Exception:  # noqa: BLE001 — never let logging break the write
+            pass
 
     def _write_one_object(
         self, collection, det_uuid: str, insert_params: dict, identity_key: str,
