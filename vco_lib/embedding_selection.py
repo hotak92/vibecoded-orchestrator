@@ -587,3 +587,44 @@ def select_embedding_concurrency(
         device=device or "cpu",
         notes=tuple(notes),
     )
+
+
+def resolve_concurrency_for_config(
+    code_backend: str,
+    kg_backend: str,
+    vram_gb: float,
+    ram_gb: float,
+    has_gpu: bool,
+    gpu_vendor: str = "",
+) -> EmbeddingConcurrencyBudget:
+    """v0.2.77 5c task 2: pick the shared memory pool for the host, then derive
+    the concurrency budget. Extracted from install.py's
+    ``_augment_config_with_concurrency`` so the installer monolith stays flat.
+
+    Device / free-memory selection mirrors the ladder: when the host has a
+    usable GPU AND the chosen code model is GPU-resident (CodeSage on the
+    code-embed service), the shared pool is VRAM; otherwise the Ollama models
+    load into RAM, so the pool is RAM. Uses the detected TOTAL as
+    ``system_memory`` — the same probe the ladder consumes (there is no
+    free/used split at install time; detected-total is the conservative,
+    deterministic value to derive a persisted default from — a user who wants a
+    different value sets ``CODE_EMBED_MAX_CONCURRENT`` explicitly).
+
+    Pure (no probes, no I/O). Callers pass detected hardware fields.
+    """
+    vram = float(vram_gb or 0.0)
+    ram = float(ram_gb or 0.0)
+    code_on_gpu = bool(has_gpu) and code_backend == _CODE_BACKEND_CODESAGE
+    if code_on_gpu and vram > 0.0:
+        system_memory = vram
+        device = (gpu_vendor or "gpu").lower()
+    else:
+        system_memory = ram
+        device = "cpu"
+    return select_embedding_concurrency(
+        system_memory_gb=system_memory,
+        code_backend=code_backend,
+        kg_backend=kg_backend,
+        device=device,
+        both_gpu_resident=True,
+    )

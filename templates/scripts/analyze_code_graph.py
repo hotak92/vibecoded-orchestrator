@@ -549,6 +549,13 @@ try:
     # helpers live in vco_lib/codegraph_lang/_shared (imported by the
     # language modules directly; nothing in THIS file uses them anymore).
     from vco_lib import codegraph_lang as _codegraph_lang
+    # v0.2.77 5c task 5: the pure stale-file union helper lives in vco_lib so
+    # the analyzer monolith stays flat (P2f ratchet). `_union_stale_into_changed`
+    # is a thin shim over it.
+    from vco_lib.codegraph_resync import (
+        union_stale_into_changed as _union_stale_into_changed_impl,
+        log_vectorless_degrade as _log_vectorless_degrade,
+    )
 except ImportError as _exc:  # noqa: F841 — used in the message below
     sys.stderr.write(
         "analyze_code_graph: vco_lib not importable — VCO install is broken; "
@@ -2966,20 +2973,13 @@ class CodeGraphAnalyzer:
     def _run_deferred_embed_into(insert_params: dict, deferred) -> None:
         """Call the deferred embedder and shape its result into ``vector``.
 
-        Mirrors every walker's old eager ``if embedding: insert_params['vector']
-        = _shape_for_insert(embedding)`` line — one home now. A None/failed
-        embed leaves ``vector`` unset (the write path already tolerates a
-        vectorless object and stamps _EMBED_REVISION_VECTORLESS).
-
-        v0.2.77 5c task 4: the deferred embedder routes through
-        ``EmbeddingService._retry_once_on_503``, which now rides out a 503 burst
-        with a bounded backoff BEFORE giving up. When it STILL fails (or returns
-        None) after exhausting the schedule, the object degrades to VECTORLESS —
-        the fail-safe that filled 89 rows with embed_revision=0 in the 5c
-        incident. We emit ONE line per degraded object (naming it + the failure)
-        so the degrade is VISIBLE in the analyze log instead of silent; the R-1
-        stale-file probe + per-object gate still re-embed it on the next
-        (whole-repo OR incremental — task 5) walk.
+        A None/failed embed leaves ``vector`` unset (the write path tolerates a
+        vectorless object and stamps _EMBED_REVISION_VECTORLESS). v0.2.77 5c
+        task 4: the embedder rides out a 503 burst via the bounded backoff in
+        ``EmbeddingService._retry_once_on_503`` first; if it STILL yields no
+        vector, we emit ONE audit line per degraded object (the fail-safe that
+        filled 89 rows with embed_revision=0 in the 5c incident) so the degrade
+        is VISIBLE, not silent. R-1 + the per-object gate re-embed it next walk.
         """
         failure: "Exception | None" = None
         try:
@@ -2991,32 +2991,8 @@ class CodeGraphAnalyzer:
         if shaped:
             insert_params["vector"] = shaped
             return
-        # No vector → the write path will stamp _EMBED_REVISION_VECTORLESS.
-        # Name the object so the degrade is auditable (best-effort — logging
-        # must never wedge a write).
-        try:
-            props = insert_params.get("properties") if isinstance(insert_params, dict) else None
-            ident = ""
-            if isinstance(props, dict):
-                ident = str(
-                    props.get("full_name")
-                    or props.get("name")
-                    or props.get("path")
-                    or props.get("file_path")
-                    or "?"
-                )
-            reason = (
-                f"embed failed after 503 backoff ({failure})"
-                if failure is not None
-                else "embedder returned no vector"
-            )
-            logger.warning(
-                "code-graph object degraded to VECTORLESS "
-                "(embed_revision=0): %s — %s; will re-embed on next walk",
-                ident, reason,
-            )
-        except Exception:  # noqa: BLE001 — never let logging break the write
-            pass
+        # No vector → write path stamps _EMBED_REVISION_VECTORLESS; audit it.
+        _log_vectorless_degrade(insert_params, failure, logger)
 
     def _write_one_object(
         self, collection, det_uuid: str, insert_params: dict, identity_key: str,
@@ -3943,20 +3919,11 @@ class CodeGraphAnalyzer:
                                 source_root, all_files, since_commit=since_commit,
                             )
                             # v0.2.77 5c task 5 (5c-v): UNION the R-1 stale-file
-                            # set into the changed set so `--incremental` can HEAL
-                            # vectorless (embed_revision=0) rows. `_filter_changed_files`
-                            # keeps only git-diff-changed files; an unchanged file
-                            # owning a stale/vectorless row would otherwise never
-                            # reach `_get_existing_module` (the R-1 probe fires
-                            # inside it), so incremental analyze could NEVER heal
-                            # the 89 vectorless rows the 5c incident wrote — only a
-                            # FULL walk could. Adding the file back here makes
-                            # incremental a valid heal path. Fail-open: a None probe
-                            # (stub analyzer / probe failure) → today's behaviour
-                            # EXACTLY (no addition, no crash). The stale-set build is
-                            # 3 filtered aggregates when converged (cheap) and is
-                            # cached per-run, so the end-of-walk force-trigger and
-                            # the per-file gate reuse the same set.
+                            # set into the changed set so `--incremental` HEALS
+                            # vectorless (embed_revision=0) rows in UNCHANGED files
+                            # (git-diff would exclude them → only a full walk could
+                            # re-embed them otherwise). Fail-open on a None probe.
+                            # Rationale: `union_stale_into_changed` docstring.
                             files = self._union_stale_into_changed(
                                 source_root, all_files, files,
                             )
@@ -4678,61 +4645,19 @@ class CodeGraphAnalyzer:
         all_files: List[Path],
         changed_files: List[Path],
     ) -> List[Path]:
-        """v0.2.77 5c task 5 (5c-v): add stale-revision files back into the
-        incremental changed-set so ``--incremental`` can HEAL vectorless rows.
-
-        THE GAP: ``_filter_changed_files`` keeps only git-diff-changed files, so
-        a file whose content is UNCHANGED but which owns a stale/vectorless
-        (``embed_revision`` NULL or 0) code-graph row never re-walks under
-        ``--incremental`` — it never reaches ``_get_existing_module`` (where the
-        R-1 stale-file probe fires), so only a FULL walk could ever re-embed it.
-        The 5c incident wrote 89 vectorless rows; without this, updating users
-        could only heal them via a full re-analyze.
-
-        THE FIX: consult the SAME per-run stale-file set the per-file gate uses
-        (``_get_stale_file_set`` → ``_build_stale_file_set`` — 3 filtered
-        aggregates when converged, cached per run). Any file in THIS
-        ``source_root`` whose repo-relative POSIX path is in the stale set is
-        UNIONed into the changed list even when git-diff didn't flag it. The
-        per-object gates keep the re-walk cheap (current rows hash-skip; only the
-        genuinely stale rows re-embed), and the module-row gate converges the
-        file to "current" so the NEXT incremental run skips it again.
-
-        Path form: rows are stored with ``path``/``file_path`` =
-        ``file.relative_to(source_root).as_posix()`` (the walker relativises
-        against the source root it was invoked with — the primary repo for
-        primary rows, the extra root for extra-path rows). So membership is
-        tested with the SAME relativisation against ``source_root`` here, which
-        correctly matches only the rows belonging to THIS root.
-
-        FAIL-OPEN: a ``None`` stale set (stub analyzer / probe failure) or an
-        empty one → return ``changed_files`` unchanged (today's behaviour
-        exactly). Never crashes: a per-file relativise error is skipped.
+        """v0.2.77 5c task 5 (5c-v): thin shim over
+        ``vco_lib.codegraph_resync.union_stale_into_changed`` (pure logic +
+        rationale there — P2f ratchet). Resolves the per-run stale-file set and
+        delegates so an UNCHANGED file owning a stale/vectorless row is re-queued
+        under ``--incremental`` (rev-0 heal). Fail-open on a ``None`` stale set.
         """
         try:
             stale = self._get_stale_file_set()
         except Exception:  # noqa: BLE001 — stub analyzers / probe failure
             stale = None
-        if not stale:
-            return changed_files
-
-        already = set(changed_files)
-        # Preserve the original changed order, then append newly-added stale
-        # files in their find-order (deterministic; golden/prune unaffected —
-        # this only changes WHICH files walk, not what a walk emits).
-        result = list(changed_files)
-        added = 0
-        for f in all_files:
-            if f in already:
-                continue
-            try:
-                rel = f.relative_to(source_root).as_posix()
-            except Exception:  # noqa: BLE001 — odd root: cannot key, skip
-                continue
-            if rel in stale:
-                result.append(f)
-                already.add(f)
-                added += 1
+        result, added = _union_stale_into_changed_impl(
+            source_root, all_files, changed_files, stale,
+        )
         if added:
             print(
                 f"ℹ️  incremental: +{added} unchanged file(s) with stale/vectorless "

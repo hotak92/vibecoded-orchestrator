@@ -45,7 +45,17 @@ _MAIN_SPAN_MAX = 1668
 # (_is_orchestrator_root_install / _discover_app_state_db_path /
 # _connect_launcher_db_with_retry / _log_install_event) and so can't move out.
 # Re-pinned to the new measured value (same precedent as the A-2 line above).
-_TOTAL_LINES_MAX = 25408
+# v0.2.77 5c task 2: +9 for the embed-concurrency WIRING. All substantive logic
+# (pool selection + budget math, the .env-line producer, the app_state seed,
+# the finalize-for-host stamp) was extracted to
+# vco_lib/install_embed_concurrency.py + vco_lib/embedding_selection.py; the
+# residual install.py delta is irreducible glue — the module import, the single
+# finalize call in main() (which must supply install.py's _log_install_event as
+# the soft-fail callback), the .env-line splat, and the app_state seed call
+# (which needs the open cursor local to _write_preset_defaults_to_app_state).
+# main() itself SHRANK (1668→1667). Same "inseparable thin-shim" precedent as
+# the A-2 / R8 lines above — re-pinned to the new measured value.
+_TOTAL_LINES_MAX = 25417
 
 
 def _measure() -> tuple:

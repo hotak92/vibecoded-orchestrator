@@ -1550,6 +1550,93 @@ def spawn_background_resync(
     )
 
 
+def log_vectorless_degrade(
+    insert_params: "dict", failure: "Exception | None", log=logger
+) -> None:
+    """v0.2.77 5c task 4: emit ONE audit WARNING for a code-graph object that
+    degraded to vectorless (embed_revision=0) after the bounded 503 backoff
+    still yielded no vector. Extracted so the analyzer's
+    ``_run_deferred_embed_into`` stays a few lines (P2f ratchet).
+
+    Best-effort: never raises (logging must not wedge a write). ``insert_params``
+    is the object's insert kwargs (``properties`` holds the identity fields);
+    ``failure`` is the embed exception, or None when the embedder simply
+    returned no vector.
+    """
+    try:
+        props = insert_params.get("properties") if isinstance(insert_params, dict) else None
+        ident = "?"
+        if isinstance(props, dict):
+            ident = str(
+                props.get("full_name") or props.get("name")
+                or props.get("path") or props.get("file_path") or "?"
+            )
+        reason = (
+            f"embed failed after 503 backoff ({failure})"
+            if failure is not None else "embedder returned no vector"
+        )
+        log.warning(
+            "code-graph object degraded to VECTORLESS (embed_revision=0): "
+            "%s — %s; will re-embed on next walk", ident, reason,
+        )
+    except Exception:  # noqa: BLE001 — logging must never break the write
+        pass
+
+
+def union_stale_into_changed(
+    source_root: "Path",
+    all_files: "list[Path]",
+    changed_files: "list[Path]",
+    stale_set: "frozenset | set | None",
+) -> "tuple[list[Path], int]":
+    """v0.2.77 5c task 5 (5c-v): add stale-revision files back into an
+    incremental changed-set so ``--incremental`` can HEAL vectorless rows.
+
+    Pure helper (no ``self``, no I/O) extracted from the analyzer so the
+    monolith stays flat (P2f ratchet) and the union logic is independently
+    testable. The analyzer's ``_union_stale_into_changed`` is a thin shim that
+    resolves the per-run stale set and delegates here.
+
+    THE GAP: ``_filter_changed_files`` keeps only git-diff-changed files, so a
+    file whose content is UNCHANGED but which owns a stale/vectorless
+    (``embed_revision`` NULL or 0) code-graph row never re-walks under
+    ``--incremental`` — it never reaches ``_get_existing_module`` (where the R-1
+    stale-file probe fires), so before this only a FULL walk could re-embed the
+    89 vectorless rows the 5c incident wrote.
+
+    THE FIX: any file in ``all_files`` whose path RELATIVE TO ``source_root``
+    (POSIX) is in ``stale_set`` is UNIONed into ``changed_files`` even when
+    git-diff didn't flag it. Rows are stored with ``path``/``file_path`` =
+    ``file.relative_to(source_root).as_posix()`` (per-root relativisation), so
+    testing membership with the SAME relativisation matches only rows belonging
+    to THIS root (primary rows vs extra-path rows key off their own root).
+
+    FAIL-OPEN: a ``None`` / empty ``stale_set`` → return ``(changed_files, 0)``
+    unchanged (today's behaviour exactly). Never raises: a per-file relativise
+    error is skipped.
+
+    Returns ``(unioned_files, added_count)``. Order: original changed order
+    preserved, newly-added stale files appended in find-order (deterministic).
+    """
+    if not stale_set:
+        return changed_files, 0
+    already = set(changed_files)
+    result = list(changed_files)
+    added = 0
+    for f in all_files:
+        if f in already:
+            continue
+        try:
+            rel = f.relative_to(source_root).as_posix()
+        except Exception:  # noqa: BLE001 — odd root: cannot key, skip
+            continue
+        if rel in stale_set:
+            result.append(f)
+            already.add(f)
+            added += 1
+    return result, added
+
+
 def _main(argv: Optional[list] = None) -> int:
     """Script entrypoint for the detached children spawned from
     :func:`spawn_background_resync`:

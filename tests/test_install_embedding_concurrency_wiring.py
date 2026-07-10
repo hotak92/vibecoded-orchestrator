@@ -3,7 +3,7 @@
 """v0.2.77 5c task 2 — install-time wiring of the concurrency budget.
 
 Covers:
-  * `_augment_config_with_concurrency` stamps `code_embed_max_concurrent` +
+  * `_finalize_embed_config_for_host` stamps `code_embed_max_concurrent` +
     `update_all_max_parallel` onto the resolved embed config, derived from the
     host's free VRAM/RAM via `select_embedding_concurrency`.
   * `_choose_embedding_config` return paths all flow through the augmenter (via
@@ -54,7 +54,7 @@ def _sysinfo(has_gpu: bool, vram_gb: float, ram_gb: float,
 class AugmentConfigTests(unittest.TestCase):
     def test_gpu_codesage_uses_vram_pool(self):
         cfg = dict(install.EMBEDDING_CONFIGS["gpu"])  # code_model == codesage
-        install._augment_config_with_concurrency(
+        install._finalize_embed_config_for_host(
             cfg, _sysinfo(has_gpu=True, vram_gb=16.0, ram_gb=64.0, vendor="nvidia"),
         )
         self.assertIn("code_embed_max_concurrent", cfg)
@@ -66,7 +66,7 @@ class AugmentConfigTests(unittest.TestCase):
     def test_cpu_preset_uses_ram_pool(self):
         # cpu preset code_model is Ollama jina → not GPU-resident → RAM pool.
         cfg = dict(install.EMBEDDING_CONFIGS["cpu"])
-        install._augment_config_with_concurrency(
+        install._finalize_embed_config_for_host(
             cfg, _sysinfo(has_gpu=False, vram_gb=0.0, ram_gb=32.0),
         )
         self.assertGreaterEqual(cfg["code_embed_max_concurrent"], 1)
@@ -76,7 +76,7 @@ class AugmentConfigTests(unittest.TestCase):
         # and land both knobs (mirrors "all _choose_embedding_config returns").
         for key in install.EMBEDDING_CONFIGS:
             cfg = dict(install.EMBEDDING_CONFIGS[key])
-            install._augment_config_with_concurrency(
+            install._finalize_embed_config_for_host(
                 cfg, _sysinfo(has_gpu=True, vram_gb=24.0, ram_gb=64.0, vendor="nvidia"),
             )
             self.assertIn("code_embed_max_concurrent", cfg, key)
@@ -87,7 +87,7 @@ class AugmentConfigTests(unittest.TestCase):
         bad = _sysinfo(has_gpu=True, vram_gb=float("nan"), ram_gb=64.0)
         # A NaN vram must not crash; select_embedding_concurrency tolerates it,
         # so the knobs ARE set (to floor-1 at worst). Assert no exception + set.
-        install._augment_config_with_concurrency(cfg, bad)
+        install._finalize_embed_config_for_host(cfg, bad)
         self.assertIn("code_embed_max_concurrent", cfg)
 
 
