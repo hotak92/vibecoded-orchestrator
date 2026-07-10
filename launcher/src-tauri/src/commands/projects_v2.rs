@@ -1231,7 +1231,16 @@ pub(crate) async fn run_bootstrap_collections(folder: &Path, project_name: &str)
     };
 
     let folder_str = folder.to_string_lossy().to_string();
-    let mut cmd = tokio::process::Command::new(&system.python_cmd).silent();
+    // v0.2.77 (venv-less spawn fix): `bootstrap-collections` calls
+    // `bootstrap_collections` which does `import weaviate` (connect_to_custom
+    // to create the per-project schema). Under a PEP-668 system python on a
+    // project without its own `.venv` this raised `ModuleNotFoundError: No
+    // module named 'weaviate'`. Prefer the RT-4 ladder venv; fall back to
+    // system.python_cmd only when no venv resolves (then the JSON errors[]
+    // surface as soft warnings, as before).
+    let py_cmd: PathBuf = resolve_python_for_vco_lib_local()
+        .unwrap_or_else(|| PathBuf::from(&system.python_cmd));
+    let mut cmd = tokio::process::Command::new(&py_cmd).silent();
     cmd.args([
         "-m",
         "vco_lib.project_init",
@@ -1928,7 +1937,17 @@ async fn build_migrate_command(
         find_local_repo_root().map_err(|e| format!("orchestrator root not found: {}", e))?;
 
     let folder_str = folder.to_string_lossy().to_string();
-    let mut cmd = tokio::process::Command::new(&system.python_cmd).silent();
+    // v0.2.77 (venv-less spawn fix, live bug 2026-07-10): prefer the RT-4
+    // ladder venv python over the system interpreter. `migrate-collections`
+    // does an in-process `import weaviate` (connect_to_custom), which only
+    // lives in the orchestrator venv. A project WITHOUT its own `.venv` ran
+    // every additive auto-apply under a PEP-668 system python and got
+    // `ModuleNotFoundError: No module named 'weaviate'`. Same F3 pattern as
+    // migrate-schema: fall back to system.python_cmd only when no venv
+    // resolves (the caller then defers safely, never advances on failure).
+    let py_cmd: PathBuf = resolve_python_for_vco_lib_local()
+        .unwrap_or_else(|| PathBuf::from(&system.python_cmd));
+    let mut cmd = tokio::process::Command::new(&py_cmd).silent();
     cmd.arg("-m")
         .arg("vco_lib.project_init")
         .arg("migrate-collections")
@@ -6406,7 +6425,14 @@ async fn drop_owned_collections(project_name: &str) -> (Vec<String>, Vec<String>
         }
     };
 
-    let mut cmd = tokio::process::Command::new(&system.python_cmd).silent();
+    // v0.2.77 (venv-less spawn fix): `drop-collections` connects to Weaviate
+    // (`import weaviate`) to delete the per-project classes. Prefer the RT-4
+    // ladder venv over a PEP-668 system python that can't import weaviate;
+    // fall back to system.python_cmd only when no venv resolves (then the
+    // drop soft-fails with a warning, as before).
+    let py_cmd: PathBuf = resolve_python_for_vco_lib_local()
+        .unwrap_or_else(|| PathBuf::from(&system.python_cmd));
+    let mut cmd = tokio::process::Command::new(&py_cmd).silent();
     cmd.args([
         "-m",
         "vco_lib.project_init",
