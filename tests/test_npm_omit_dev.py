@@ -15,9 +15,10 @@ mandates omitting devDeps from the bundled MCP install path anyway:
     registry-pin branch already gets dev-less installs; file pins should
     too).
 
-Patch lives in ``install.py::_install_pinned_npm`` is_file_pin branch:
+Patch lives in ``vco_lib.install_npm.install_pinned_npm`` is_file_pin branch
+(v0.2.77 7a-bis moved the core here from ``install.py::_install_pinned_npm``):
 
-    install_argv = [_NPM_PATH, "install", "-g", "--omit=dev", str(local_dir)]
+    install_argv = [npm_path, "install", "-g", "--omit=dev", str(local_dir)]
                                               ^^^^^^^^^^^^^ added flag
 
 This test ASSERTS THE PATCH LANDED. Until Track B applies the patch in
@@ -41,32 +42,33 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-INSTALL_PY = REPO_ROOT / "install.py"
+INSTALL_NPM_PY = REPO_ROOT / "vco_lib" / "install_npm.py"
 
 
 def _read_install_pinned_npm_source() -> str:
-    """Read the source of ``_install_pinned_npm`` from install.py.
+    """Read the source of ``install_pinned_npm`` from vco_lib/install_npm.py.
 
-    Uses ``ast`` to find the function body and returns the source
-    span. We use the AST-anchored approach rather than a regex over
-    the full file because install.py is 21k+ lines and the
-    ``install_argv = [...]`` literal appears in multiple unrelated
-    helpers (registry-vs-file pin branches + version-probe helpers).
+    v0.2.77 7a-bis moved the pinned-npm core out of install.py into
+    ``vco_lib.install_npm``; install.py keeps a thin name-stable wrapper
+    (``_install_pinned_npm``) that delegates here, so the CVE-1 flag now
+    lives in ``install_pinned_npm``. Uses ``ast`` to find the function body
+    and returns the source span.
     """
-    src = INSTALL_PY.read_text(encoding="utf-8")
+    src = INSTALL_NPM_PY.read_text(encoding="utf-8")
     tree = ast.parse(src)
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.FunctionDef)
-            and node.name == "_install_pinned_npm"
+            and node.name == "install_pinned_npm"
         ):
             start = node.lineno - 1
             end = node.end_lineno
             return "\n".join(src.splitlines()[start:end])
     raise AssertionError(
-        "Could not find `_install_pinned_npm` function in install.py — "
-        "either the function was renamed (update this test) or install.py "
-        "has been restructured beyond what this regression guard expected."
+        "Could not find `install_pinned_npm` function in "
+        "vco_lib/install_npm.py — either the function was renamed (update "
+        "this test) or the module has been restructured beyond what this "
+        "regression guard expected."
     )
 
 
@@ -113,8 +115,8 @@ class CVE1PatchTests(unittest.TestCase):
             "--omit=dev",
             argv_normalised,
             "CVE-1 patch MISSING: "
-            "`install.py::_install_pinned_npm` is_file_pin branch does NOT "
-            "include `--omit=dev` in its install_argv. Per "
+            "`vco_lib.install_npm.install_pinned_npm` is_file_pin branch does "
+            "NOT include `--omit=dev` in its install_argv. Per "
             "`docs/cve-1-patch-spec.md`, Track B was supposed to apply "
             "the patch in v0.2.53 Phase 2 splice. If this test fails on "
             "Track E's worktree (chore/v0253-track-e), that's EXPECTED — "
@@ -123,7 +125,7 @@ class CVE1PatchTests(unittest.TestCase):
             "or was applied to the wrong branch.\n"
             f"\nObserved install_argv list literal:\n  [{argv_list_src}]\n"
             "\nExpected (4 elements, in this order):\n"
-            "  [_NPM_PATH, \"install\", \"-g\", \"--omit=dev\", str(local_dir)]"
+            "  [npm_path, \"install\", \"-g\", \"--omit=dev\", str(local_dir)]"
         )
 
     def test_registry_pin_branch_does_NOT_include_omit_dev(self) -> None:

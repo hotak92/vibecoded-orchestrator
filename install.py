@@ -24124,627 +24124,107 @@ _BUNDLED_VERSIONS_AUDIT_LOG: Path = (
 )
 
 
-def _append_bundled_versions_audit(record: dict[str, Any]) -> None:
-    """Append one JSONL line to the bundled-versions audit log.
+# v0.2.77 Part 7a-bis (task 3): the pinned-npm install + drift core moved to
+# vco_lib.install_npm to break the back-edge where vco_lib.cli.verify imported
+# install._install_pinned_npm. install.py keeps these NAME-STABLE thin wrappers
+# so the existing tests (which patch install._NPM_PATH /
+# install._BUNDLED_VERSIONS_AUDIT_LOG / the module-level helpers) keep working
+# unchanged; the wrappers read the module-level cache values at call time and
+# thread them into the DI core.
+from vco_lib import install_npm as _install_npm  # noqa: E402
 
-    Never raises — log failures must not break the install. Directory
-    is created if missing (Path.home()/.claude/metrics is per-user and
-    safe to mkdir).
+
+def _append_bundled_versions_audit(record: dict[str, Any]) -> None:
+    """Wrapper — see vco_lib.install_npm.append_bundled_versions_audit.
+
+    Reads the module-level ``_BUNDLED_VERSIONS_AUDIT_LOG`` at call time so
+    ``mock.patch.object(install, "_BUNDLED_VERSIONS_AUDIT_LOG", ...)`` still
+    redirects the audit log.
     """
-    try:
-        _BUNDLED_VERSIONS_AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
-        record_full = dict(record)
-        record_full.setdefault("timestamp", _utc_iso_now())
-        with _BUNDLED_VERSIONS_AUDIT_LOG.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record_full, ensure_ascii=True) + "\n")
-            f.flush()
-    except Exception:
-        # Same contract as `_log_install_event`: NEVER let a log
-        # failure break the install.
-        pass
+    _install_npm.append_bundled_versions_audit(
+        record, audit_log_path=_BUNDLED_VERSIONS_AUDIT_LOG,
+    )
 
 
 def _resolve_pinned_package(package_key: str) -> dict[str, str]:
-    """Return the pinned spec for `package_key` from the manifest.
-
-    Raises:
-        KeyError: `[npm.<key>]` missing from the manifest. The KeyError
-            message names the manifest path so the user can correct it.
-    """
-    versions = _bundled_versions.load_bundled_versions()
-    npm_block = versions.get("npm", {})
-    if package_key not in npm_block:
-        manifest_path = _bundled_versions.manifest_path()
-        raise KeyError(
-            f"package key {package_key!r} not present in [npm] section "
-            f"of {manifest_path}. Add the entry there, then re-run."
-        )
-    spec = npm_block[package_key]
-    # Defensive: ensure required fields are present so downstream
-    # callers don't dig through KeyError stack traces.
-    for required in ("package", "version", "shasum"):
-        if required not in spec:
-            raise KeyError(
-                f"[npm.{package_key}] in {_bundled_versions.manifest_path()} "
-                f"is missing required field {required!r} (have: "
-                f"{sorted(spec.keys())})."
-            )
-    return spec
+    """Wrapper — see vco_lib.install_npm.resolve_pinned_package."""
+    return _install_npm.resolve_pinned_package(package_key)
 
 
 def _query_installed_npm_version(package: str,
                                  *, timeout: int = 60) -> str | None:
-    """Return the version of a globally-installed npm package, or None.
+    """Wrapper — see vco_lib.install_npm.query_installed_npm_version.
 
-    v0.2.43 V0243-11: uses ``npm ls -g --json --depth=0 <package>`` and
-    parses ``dependencies[package].version``.  Mirrors the pattern used
-    by :func:`_installed_npm_integrity` (same command, different field).
-
-    The previous implementation used ``npm view -g <package> version``
-    which queries the REGISTRY (network round-trip, returns the latest
-    published version — NOT the locally-installed version).  The local
-    ``npm ls`` approach is offline, faster, and returns the correct
-    installed version even when the registry version is newer.
-
-    Returns None when:
-      - npm is not on PATH (``_NPM_PATH`` is None);
-      - the package is not installed globally (absent from ``dependencies``);
-      - the subprocess errors out / times out.
+    Threads the module-level ``_NPM_PATH`` so ``mock.patch.object(install,
+    "_NPM_PATH", ...)`` still controls npm resolution.
     """
-    if _NPM_PATH is None:
-        return None
-    try:
-        result = subprocess.run(
-            [_NPM_PATH, "ls", "-g", "--json", "--depth=0", package],
-            capture_output=True, text=True, timeout=timeout,
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        return None
-    if not result.stdout.strip():
-        return None
-    try:
-        parsed = json.loads(result.stdout)
-    except (ValueError, TypeError):
-        return None
-    # ``npm ls --json`` shape: {"dependencies": {"<pkg>": {"version": "..."}}}
-    deps = parsed.get("dependencies") or {}
-    entry = deps.get(package) or {}
-    return (entry.get("version") or "").strip() or None
+    return _install_npm.query_installed_npm_version(
+        package, npm_path=_NPM_PATH, timeout=timeout,
+    )
 
 
 def _installed_npm_integrity(package: str, *, timeout: int = 60) -> str | None:
-    """Best-effort: return the SHA-1 (`dist.shasum`) of the LOCALLY
-    INSTALLED copy of `package` if npm exposes it on this version.
-
-    Strategy: ask npm for `_shasum` on the installed entry via
-    `npm ls -g --json --depth=0 <package>`. Older npm clients don't
-    populate `_shasum`/`_integrity` in `ls --json` output; on those we
-    return None and the caller logs a WARN (per the function's
-    docstring) and skips strict integrity comparison.
-
-    Cross-OS: same `_NPM_PATH` + subprocess shape as
-    `_query_installed_npm_version`.
-    """
-    if _NPM_PATH is None:
-        return None
-    try:
-        result = subprocess.run(
-            [_NPM_PATH, "ls", "-g", "--json", "--depth=0", package],
-            capture_output=True, text=True, timeout=timeout,
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        return None
-    if not result.stdout.strip():
-        return None
-    try:
-        parsed = json.loads(result.stdout)
-    except (ValueError, TypeError):
-        return None
-
-    # `npm ls --json` shape: {"dependencies": {"<pkg>": {"version": "...",
-    #                          "_shasum": "...", "_integrity": "sha512-..."}}}
-    deps = parsed.get("dependencies") or {}
-    entry = deps.get(package) or {}
-    return entry.get("_shasum") or None
+    """Wrapper — see vco_lib.install_npm.installed_npm_integrity."""
+    return _install_npm.installed_npm_integrity(
+        package, npm_path=_NPM_PATH, timeout=timeout,
+    )
 
 
 def _truthy_env(env_value: str | None) -> bool:
-    """Match the truthy-env convention used elsewhere in install.py.
-
-    Accept "1", "true", "yes", "on" (case-insensitive); anything else
-    (including unset / empty string) is falsy. Mirrors the recipe in
-    `_telemetry_consent` for consistency.
-    """
-    if env_value is None:
-        return False
-    return env_value.strip().lower() in ("1", "true", "yes", "on")
+    """Wrapper — see vco_lib.install_npm._truthy_env."""
+    return _install_npm._truthy_env(env_value)
 
 
 def _read_vendored_package_json(local_dir: Path) -> dict | None:
-    """Read ``<local_dir>/package.json`` and return the parsed dict.
-
-    Returns ``None`` if the file is missing or unreadable / malformed.
-    Used by ``_install_pinned_npm`` to resolve the npm package name and
-    semver for ``file:``-style pins (where the pin's own ``package``
-    field is a path, not a name).
-
-    Cross-OS: pure Path + stdlib JSON; no shell.
-    """
-    pkg_json = local_dir / "package.json"
-    try:
-        text = pkg_json.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    try:
-        return json.loads(text)
-    except (ValueError, TypeError):
-        return None
+    """Wrapper — see vco_lib.install_npm._read_vendored_package_json."""
+    return _install_npm._read_vendored_package_json(local_dir)
 
 
 def _read_vendored_package_name(local_dir: Path) -> str | None:
-    """Return the ``name`` field of the vendored package.json, or None."""
-    pkg = _read_vendored_package_json(local_dir)
-    if pkg is None:
-        return None
-    name = pkg.get("name")
-    return name if isinstance(name, str) and name else None
+    """Wrapper — see vco_lib.install_npm._read_vendored_package_name."""
+    return _install_npm._read_vendored_package_name(local_dir)
 
 
 def _read_vendored_package_version(local_dir: Path) -> str | None:
-    """Return the ``version`` field of the vendored package.json, or None."""
-    pkg = _read_vendored_package_json(local_dir)
-    if pkg is None:
-        return None
-    ver = pkg.get("version")
-    return ver if isinstance(ver, str) and ver else None
+    """Wrapper — see vco_lib.install_npm._read_vendored_package_version."""
+    return _install_npm._read_vendored_package_version(local_dir)
 
 
 def _install_pinned_npm(package_key: str,
                         *,
                         skip_env_var: str | None = None,
                         timeout: int = 300) -> bool:
-    """Install one npm package at the exact version pinned in
-    `bundled_mcp_versions.toml`.
+    """Wrapper — see vco_lib.install_npm.install_pinned_npm.
 
-    Args:
-        package_key: key under `[npm.*]` in the manifest (e.g.
-            ``"mermaid_mcp"``). Validated against the manifest; missing
-            keys raise `KeyError`.
-        skip_env_var: optional env var name; if set to truthy, the
-            install is SKIPPED and the function returns False. This
-            mirrors `_install_playwright_browsers`'s `VCT_SKIP_PLAYWRIGHT`
-            convention. The .toml itself never controls skip behaviour
-            — env-var-driven opt-outs keep the manifest pure-pinning.
-        timeout: subprocess timeout in seconds (default 300 — npm
-            global installs commonly take 30-90 s; 300 s leaves
-            headroom for slow networks).
-
-    Returns:
-        ``True`` when the package is installed at the EXACT pinned
-        version (whether we installed it now or it was already at the
-        pin); ``False`` on skip / npm missing / version mismatch /
-        integrity mismatch.
-
-    Behaviour:
-        - Skipped entirely if ``skip_env_var`` is set to a truthy value.
-        - Skipped if ``npm`` is not on PATH (the upstream MCP can still
-          lazy-install when Node arrives later; we just warn).
-        - If the package is already at the pinned version: emits an
-          audit-log line with result="already_pinned" and returns True
-          without invoking npm again.
-        - Otherwise runs ``npm install -g <package>@<version>`` (exact
-          pin — NO ``@latest``, NO caret/tilde resolution).
-        - Verifies installed version == pinned version; emits a
-          ``version_mismatch`` audit entry and returns False on
-          mismatch.
-        - Best-effort integrity check: compares `dist.shasum` of the
-          local install (where exposed by `npm ls --json`) against the
-          pinned shasum. On mismatch: audit + return False. On
-          missing-on-old-npm: audit ``integrity_check_skipped`` + return
-          True (we did the version pin, that's the strict contract).
-        - Cross-OS: pure-Python subprocess; ``shutil.which("npm")`` is
-          cached at module-load time; ``Path.home()`` for the audit
-          log path.
+    Threads install.py's module-level ``_NPM_PATH`` /
+    ``_BUNDLED_VERSIONS_AUDIT_LOG`` / ``PROJECT_ROOT`` / ``_log_install_event``
+    into the DI core, so the existing tests that patch those on the
+    ``install`` module continue to control behaviour. ``os.environ.get`` is
+    injected as the skip-env reader so ``mock.patch.dict("os.environ", ...)``
+    still works.
     """
-    spec = _resolve_pinned_package(package_key)
-    package = spec["package"]
-    version = spec["version"]
-    expected_shasum = spec["shasum"]
-
-    # Two supported pin shapes (Phase 2, 2026-05-25):
-    #   1. Registry pin: ``package`` is an npm package name (e.g.
-    #      "claude-mermaid"), ``version`` is exact semver. Installed via
-    #      ``npm install -g <pkg>@<version>``; version + shasum verified
-    #      after. This is the original Phase 0 path.
-    #   2. File: pin: ``package`` starts with ``file:`` — the value
-    #      after the prefix is a repo-relative (or absolute) directory
-    #      containing a vendored npm package. Installed via
-    #      ``npm install -g <absolute-dir>``; shasum verification is
-    #      structurally not applicable (the source-of-truth is the
-    #      on-disk tree tracked by git, not an npm-tarball integrity
-    #      field). ``version`` is treated as a label string for the
-    #      audit log only.
-    is_file_pin = package.startswith("file:")
-
-    if is_file_pin:
-        # Resolve the file: path against the repo root (install.py's
-        # location is the canonical anchor; PROJECT_ROOT is computed at
-        # import time).
-        rel = package[len("file:"):]
-        local_dir = (PROJECT_ROOT / rel).resolve()
-        print(f"[bundled-versions] Installing {package} (vendored, "
-              f"label={version}, key={package_key}) ... ",
-              end="", flush=True)
-        _log_install_event("bundled_versions", "start",
-                           f"pinning vendored {package} ({version})")
-    else:
-        print(f"[bundled-versions] Installing {package}@{version} "
-              f"(key={package_key}) ... ", end="", flush=True)
-        _log_install_event("bundled_versions", "start",
-                           f"pinning {package}@{version}")
-
-    if skip_env_var is not None and _truthy_env(os.environ.get(skip_env_var)):
-        print(f"SKIPPED ({skip_env_var}=truthy)")
-        _log_install_event("bundled_versions", "skip",
-                           f"{skip_env_var} set to truthy",
-                           data={"package": package, "version": version})
-        _append_bundled_versions_audit({
-            "package": package,
-            "package_key": package_key,
-            "version": version,
-            "shasum_expected": expected_shasum,
-            "shasum_actual": None,
-            "result": "skipped_env_var",
-            "skip_env_var": skip_env_var,
-        })
-        return False
-
-    if _NPM_PATH is None:
-        print("SKIPPED (npm not found)")
-        print("  Node.js / npm not detected. The MCP will lazy-install")
-        print("  when first invoked. Install Node.js 18+ to pre-pin:")
-        print("  https://nodejs.org")
-        _log_install_event("bundled_versions", "skip",
-                           "npm not on PATH",
-                           data={"package": package, "version": version})
-        _append_bundled_versions_audit({
-            "package": package,
-            "package_key": package_key,
-            "version": version,
-            "shasum_expected": expected_shasum,
-            "shasum_actual": None,
-            "result": "skipped_npm_missing",
-        })
-        return False
-
-    # For file: pins we need to know the npm-package-name (from the
-    # vendored package.json) to query the global registry. The pin's
-    # `package` field is the file: URL, NOT the package name. Resolve
-    # via a small package.json read so the rest of the verify chain
-    # treats it like a normal install.
-    if is_file_pin:
-        vendor_pkg_name = _read_vendored_package_name(local_dir)
-        if vendor_pkg_name is None:
-            print(f"  WARN: vendored package.json missing or unreadable "
-                  f"at {local_dir}.")
-            _log_install_event("bundled_versions", "warn",
-                               f"vendored package.json unreadable at {local_dir}",
-                               data={"package": package, "version": version})
-            _append_bundled_versions_audit({
-                "package": package,
-                "package_key": package_key,
-                "version": version,
-                "shasum_expected": expected_shasum,
-                "shasum_actual": None,
-                "result": "vendor_unreadable",
-                "vendor_path": str(local_dir),
-            })
-            return False
-        query_pkg_name = vendor_pkg_name
-    else:
-        query_pkg_name = package
-
-    # If already at the pin, skip the install subprocess but still
-    # confirm via audit log so a `tail -1 bundled_versions.jsonl`
-    # reflects the latest state. For file: pins, "already pinned" means
-    # the global install resolves to a version matching what the vendor
-    # directory's package.json declares (best-effort idempotency — npm
-    # treats every `npm install -g <dir>` as a fresh install, but
-    # repeatedly running it on the same dir is a no-op in terms of
-    # behaviour, so we skip the subprocess if the version matches).
-    currently_installed = _query_installed_npm_version(query_pkg_name)
-    if is_file_pin:
-        vendor_version = _read_vendored_package_version(local_dir)
-        already_pinned = (
-            vendor_version is not None
-            and currently_installed == vendor_version
-        )
-    else:
-        already_pinned = currently_installed == version
-    if already_pinned:
-        print("OK (already pinned)")
-        _log_install_event("bundled_versions", "ok",
-                           f"{package} already at pinned {version}")
-        _append_bundled_versions_audit({
-            "package": package,
-            "package_key": package_key,
-            "version": version,
-            "shasum_expected": expected_shasum,
-            "shasum_actual": _installed_npm_integrity(query_pkg_name),
-            "result": "already_pinned",
-        })
-        return True
-
-    print(f"(install; was {currently_installed or 'absent'})")
-
-    # 1) Pin install. Two argv shapes depending on pin type:
-    #    - Registry pin: ``npm install -g <pkg>@<version>`` (exact, no
-    #      @latest, no caret/tilde).
-    #    - File: pin: ``npm install -g <absolute-local-dir>`` (npm
-    #      reads package.json + symlinks the local tree into the global
-    #      prefix; idempotent for re-runs).
-    # CVE-1 (GHSA-5xrq-8626-4rwp): file-pinned MCP installs walk the full
-    # devDependencies tree by default; we add `--omit=dev` below so vendored
-    # forks don't ship ~50MB of test/build tooling to every user. Per Track E
-    # spec at docs/cve-1-patch-spec.md — registry pins (else branch) get
-    # devDeps stripped at `npm publish` time and don't need the flag.
-    if is_file_pin:
-        install_argv = [_NPM_PATH, "install", "-g", "--omit=dev", str(local_dir)]
-    else:
-        install_argv = [_NPM_PATH, "install", "-g", f"{package}@{version}"]
-
-    # v0.2.53 DEDUP-1 note: this site stays on direct subprocess.run.
-    # The custom audit-log flows below (install_timeout / install_oserror /
-    # install_nonzero with per-package audit entries) plus the very high
-    # test surface area (mock.patch.object(subprocess, "run") in
-    # tests/test_install_pinned_npm.py × 8 tests + test_install_excalidraw)
-    # make routing through _run_logged_subprocess (which uses Popen)
-    # cause test fragility. The dot-cycle animation upside is real but
-    # marginal here — npm install -g typically completes in 30-90s and
-    # this code path runs many times per --update (one per pinned MCP);
-    # the chatter of 4 dot-animations would actually be noisier than
-    # silence. Future v0.2.54 cleanup can revisit if the test harness
-    # is reworked to patch Popen alongside run.
-    try:
-        result = subprocess.run(
-            install_argv,
-            capture_output=True, text=True, timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        print(f"  WARN: npm install timed out after {timeout}s.")
-        _log_install_event("bundled_versions", "warn",
-                           f"npm install timed out ({timeout}s)",
-                           data={"package": package, "version": version})
-        _append_bundled_versions_audit({
-            "package": package,
-            "package_key": package_key,
-            "version": version,
-            "shasum_expected": expected_shasum,
-            "shasum_actual": None,
-            "result": "install_timeout",
-            "timeout_seconds": timeout,
-        })
-        return False
-    except OSError as e:
-        print(f"  WARN: npm install failed: {e}")
-        _log_install_event("bundled_versions", "warn",
-                           f"npm install failed: {e}",
-                           data={"package": package, "version": version})
-        _append_bundled_versions_audit({
-            "package": package,
-            "package_key": package_key,
-            "version": version,
-            "shasum_expected": expected_shasum,
-            "shasum_actual": None,
-            "result": "install_oserror",
-            "error": str(e),
-        })
-        return False
-
-    if result.returncode != 0:
-        print("  WARN: npm install exited non-zero.")
-        print(f"    stderr: {result.stderr.strip()[:200]}")
-        _log_install_event("bundled_versions", "warn",
-                           "npm install exited non-zero",
-                           data={"package": package, "version": version,
-                                 "returncode": result.returncode,
-                                 "stderr": result.stderr.strip()[:500]})
-        _append_bundled_versions_audit({
-            "package": package,
-            "package_key": package_key,
-            "version": version,
-            "shasum_expected": expected_shasum,
-            "shasum_actual": None,
-            "result": "install_nonzero",
-            "returncode": result.returncode,
-            "stderr": result.stderr.strip()[:500],
-        })
-        return False
-
-    # 2) Verify the installed version matches the pin. Defends against
-    #    npm's silent best-effort resolution paths (peer-dep conflicts,
-    #    workspace overrides) that could land a non-matching version.
-    #    For file: pins we compare against the vendored package.json's
-    #    version, NOT the pin's `version` label (which is a free-form
-    #    vendor tag like ``git+vendored-2.0.0-2026-05-25``).
-    actual_version = _query_installed_npm_version(query_pkg_name)
-    if is_file_pin:
-        expected_version = _read_vendored_package_version(local_dir)
-    else:
-        expected_version = version
-    if expected_version is not None and actual_version != expected_version:
-        print(f"  WARN: post-install version mismatch — "
-              f"expected {expected_version}, got {actual_version}.")
-        _log_install_event("bundled_versions", "warn",
-                           "post-install version mismatch",
-                           data={"package": package,
-                                 "expected": expected_version,
-                                 "actual": actual_version})
-        _append_bundled_versions_audit({
-            "package": package,
-            "package_key": package_key,
-            "version": version,
-            "shasum_expected": expected_shasum,
-            "shasum_actual": None,
-            "result": "version_mismatch",
-            "actual_version": actual_version,
-        })
-        return False
-
-    # 3) Best-effort integrity check. SKIPPED for file: pins — the
-    #    source-of-truth is the on-disk tree tracked by git, not an
-    #    npm-tarball integrity field. ``expected_shasum`` is empty for
-    #    file: pins (see bundled_mcp_versions.toml comment).
-    if is_file_pin:
-        print(f"[bundled-versions] {package} OK (vendored, "
-              f"label={version}; integrity = on-disk tree).")
-        _log_install_event("bundled_versions", "ok",
-                           f"{package} ({version}) installed from vendor")
-        _append_bundled_versions_audit({
-            "package": package,
-            "package_key": package_key,
-            "version": version,
-            "shasum_expected": expected_shasum,
-            "shasum_actual": None,
-            "result": "ok_vendored",
-            "vendor_path": str(local_dir),
-        })
-        return True
-
-    actual_shasum = _installed_npm_integrity(query_pkg_name)
-    if actual_shasum is None:
-        # Older npm clients don't expose `_shasum` in `npm ls --json` —
-        # log WARN per docstring and return True (version pin already
-        # verified above).
-        print("  WARN: npm did not expose installed integrity; "
-              "skipping strict shasum check.")
-        _log_install_event("bundled_versions", "warn",
-                           "integrity check skipped (npm did not expose _shasum)",
-                           data={"package": package, "version": version})
-        _append_bundled_versions_audit({
-            "package": package,
-            "package_key": package_key,
-            "version": version,
-            "shasum_expected": expected_shasum,
-            "shasum_actual": None,
-            "result": "integrity_check_skipped",
-        })
-        return True
-
-    if actual_shasum != expected_shasum:
-        print(f"  ERROR: integrity mismatch — expected "
-              f"{expected_shasum}, got {actual_shasum}.")
-        _log_install_event("bundled_versions", "error",
-                           "integrity mismatch",
-                           data={"package": package,
-                                 "expected": expected_shasum,
-                                 "actual": actual_shasum})
-        _append_bundled_versions_audit({
-            "package": package,
-            "package_key": package_key,
-            "version": version,
-            "shasum_expected": expected_shasum,
-            "shasum_actual": actual_shasum,
-            "result": "integrity_mismatch",
-        })
-        return False
-
-    print(f"[bundled-versions] {package}@{version} OK "
-          f"(shasum verified).")
-    _log_install_event("bundled_versions", "ok",
-                       f"{package}@{version} installed + verified")
-    _append_bundled_versions_audit({
-        "package": package,
-        "package_key": package_key,
-        "version": version,
-        "shasum_expected": expected_shasum,
-        "shasum_actual": actual_shasum,
-        "result": "ok",
-    })
-    return True
+    return _install_npm.install_pinned_npm(
+        package_key,
+        npm_path=_NPM_PATH,
+        audit_log_path=_BUNDLED_VERSIONS_AUDIT_LOG,
+        project_root=PROJECT_ROOT,
+        log_event=_log_install_event,
+        skip_env_getter=os.environ.get,
+        skip_env_var=skip_env_var,
+        timeout=timeout,
+    )
 
 
 def _check_npm_pin_drift(package_key: str) -> tuple[bool, str | None]:
-    """Detect drift between the installed npm package and its pin.
-
-    Returns:
-        ``(in_sync, drift_msg_or_None)``. ``in_sync`` is True when the
-        installed version equals the pinned version (or when npm is
-        absent / the package is not installed at all — there's no drift
-        to report in those cases, just absence). ``drift_msg_or_None``
-        is a human-readable one-liner describing the drift, intended
-        for the ``DeferralEntry.detected`` field.
-
-    Used by ``install.py --update`` (and, in a later phase,
-    ``install-bundle --update``) to surface "your installed
-    claude-mermaid is out of sync with the pin" without auto-overwriting
-    — that requires explicit ``--force-pin-reset`` from the user.
-    """
-    spec = _resolve_pinned_package(package_key)
-    package = spec["package"]
-    pinned = spec["version"]
-
-    if _NPM_PATH is None:
-        # No npm means no drift to report. The user will see "npm
-        # missing" from the install path instead.
-        return (True, None)
-
-    # For file: pins, the vendor IS the pin — there is no separate
-    # registry version to drift against. The on-disk tree (tracked by
-    # git) is the source of truth; if the user edited the vendor
-    # directory, that's a checked-in change, not a runtime drift. Skip
-    # the npm-query path entirely.
-    if package.startswith("file:"):
-        return (True, None)
-
-    installed = _query_installed_npm_version(package)
-    if installed is None:
-        # Not installed at all → no drift. The pin install will run on
-        # the next install.py invocation.
-        return (True, None)
-
-    if installed == pinned:
-        return (True, None)
-
-    return (
-        False,
-        f"installed {package} version {installed} differs from "
-        f"bundled_mcp_versions.toml pin {pinned}. Run "
-        f"`python install.py --update --force-pin-reset` to reinstall "
-        f"the pinned version, or accept the drift by bumping the "
-        f"manifest in your next VCO release.",
-    )
+    """Wrapper — see vco_lib.install_npm.check_npm_pin_drift."""
+    return _install_npm.check_npm_pin_drift(package_key, npm_path=_NPM_PATH)
 
 
 def _record_npm_pin_drift_deferral(package_key: str,
                                    drift_msg: str,
                                    report: DeferralReport) -> None:
-    """Add a `bundle_pin_drift_<key>` entry to the deferral report.
-
-    Caller (--update flow) decides when to write the report. The
-    condition_id includes the package key so multiple drifts across
-    packages dedupe per-package, not in aggregate.
-    """
-    report.add_entry(
-        DeferralEntry(
-            condition_id=f"bundle_pin_drift_{package_key}",
-            title=f"Pinned npm package `{package_key}` drifted from manifest",
-            detected=drift_msg,
-            why_deferred=(
-                "VCO does not auto-overwrite an existing global npm "
-                "install — that would silently undo any deliberate "
-                "out-of-band version the user installed. Resolution "
-                "requires explicit consent."
-            ),
-            command_to_apply=(
-                f"python install.py --update --force-pin-reset"
-            ),
-            severity="warning",
-            kg_node_refs=[
-                "knowledge/concepts/install-flow-architectural-overhaul-2026-05-06.md",
-            ],
-        )
-    )
+    """Wrapper — see vco_lib.install_npm.record_npm_pin_drift_deferral."""
+    _install_npm.record_npm_pin_drift_deferral(package_key, drift_msg, report)
 
 
 # ---------------------------------------------------------------------------

@@ -69,7 +69,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 
 # ---------------------------------------------------------------------------
@@ -145,30 +145,39 @@ def _load_bundled_versions() -> Mapping[str, Any]:
 
 
 def _install_pinned_npm(package_key: str) -> Any:
-    """Phase 0.A dependency — actual import wired post-merge.
+    """Install one pinned npm package (delegates to the vco_lib core).
 
-    Expected upstream API (per plan §3 Phase 0 step 2)::
+    v0.2.77 7a-bis: the pinned-npm install core lives in
+    ``vco_lib.install_npm`` (moved out of the top-level ``install`` script
+    to break the vco_lib → install back-edge). This resolves the DI params
+    the core needs — npm path, audit-log destination, and the repo root for
+    ``file:`` pin resolution — from this CLI's own environment.
 
-        from install import _install_pinned_npm  # or wherever it lives
-        result = _install_pinned_npm("mermaid_mcp")
-        # Runs ``npm install -g <package>@<version>``, verifies sha256,
-        # logs to ~/.claude/metrics/bundled_versions.jsonl. Returns an
-        # object with at least ``.ok`` (bool) and ``.message`` (str).
-
-    Tests stub this function to assert it is called with the expected
-    keys (one per drift entry) and to simulate failure modes.
+    Returns True when the package is installed at the exact pinned version,
+    False otherwise (see ``install_pinned_npm``). Tests stub this function
+    on ``vco_lib.cli.verify`` to simulate outcomes.
     """
-    # Phase 0.A dependency — actual import wired post-merge.
-    try:
-        from install import _install_pinned_npm as _real  # type: ignore  # noqa: E501
-    except ImportError as exc:  # pragma: no cover — exercised post-merge
-        raise RuntimeError(
-            "install._install_pinned_npm(package_key) is not available. "
-            "This subcommand requires Phase 0.A to be merged. If you're "
-            "running tests, ensure the test fixture monkey-patches "
-            "`_install_pinned_npm` on `vco_lib.cli.verify`."
-        ) from exc
-    return _real(package_key)
+    import os
+
+    from vco_lib.install_npm import install_pinned_npm as _real
+
+    npm_path = _which("npm")
+    audit_log_path = (
+        Path.home() / ".claude" / "metrics" / "bundled_versions.jsonl"
+    )
+    # Repo root anchor for ``file:`` pin resolution: prefer the canonical
+    # env var the launcher/install set, else the in-tree layout
+    # (verify.py lives at ``vco_lib/cli/verify.py`` → repo root is 3 up).
+    env_root = os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip()
+    project_root = (
+        Path(env_root) if env_root else Path(__file__).resolve().parents[2]
+    )
+    return _real(
+        package_key,
+        npm_path=npm_path,
+        audit_log_path=audit_log_path,
+        project_root=project_root,
+    )
 
 
 def _project_env_from_db(project_id: str) -> Mapping[str, str]:

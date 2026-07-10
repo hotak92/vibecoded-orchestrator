@@ -77,7 +77,11 @@ _MAIN_SPAN_MAX = 1668
 # _read_app_state_key / _write_app_state_key bodies collapsed to thin
 # delegators onto the new vco_lib.launcher_db_writer (canonical app_state
 # read/write home). Re-pinned DOWNWARD to the new measured value.
-_TOTAL_LINES_MAX = 25433
+# v0.2.77 Part 7a-bis (task 3): -520. The pinned-npm install + drift core
+# (_install_pinned_npm + ~10 helpers) moved to vco_lib.install_npm to break
+# the vco_lib.cli.verify -> install back-edge; install.py keeps thin
+# name-stable wrappers. Re-pinned DOWNWARD to the new measured value.
+_TOTAL_LINES_MAX = 24913
 
 
 def _measure() -> tuple:
