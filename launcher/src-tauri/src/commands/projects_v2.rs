@@ -6744,20 +6744,16 @@ pub async fn launch_project_in_editor(
     result
 }
 
+/// v0.2.77 (Part 7c task 3): delegates to the shared
+/// `vct_launcher_core::paths::which_on_path` (one home) and collapses to a
+/// bool for the presence-check callers. Two behaviour upgrades vs the prior
+/// inline copy — both correct: (a) on Windows it now also probes
+/// `.cmd`/`.bat` (VS Code's `code` shim + node-style launchers are `.cmd`,
+/// which the `.exe`-only copy missed); (b) it matches on `is_file()` rather
+/// than `exists()`, so a directory that happens to be named `code`/`claude`
+/// no longer counts as the binary being present.
 fn which_on_path(cmd: &str) -> bool {
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in path.split(if cfg!(windows) { ';' } else { ':' }) {
-            let candidate = std::path::Path::new(dir).join(if cfg!(windows) {
-                format!("{}.exe", cmd)
-            } else {
-                cmd.to_string()
-            });
-            if candidate.exists() {
-                return true;
-            }
-        }
-    }
-    false
+    vct_launcher_core::paths::which_on_path(cmd).is_some()
 }
 
 fn launch_in_vscode(folder: &str) -> Result<(), String> {

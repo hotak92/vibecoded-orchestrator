@@ -2391,13 +2391,13 @@ async fn detect_existing_volumes() -> Vec<ExistingVolume> {
     Vec::new()
 }
 
+/// v0.2.77 (Part 7c task 3): delegates to the shared
+/// `vct_launcher_core::paths::which_on_path` (one home). Behaviour upgrade
+/// on Windows — the shared form also probes `.exe`/`.cmd`/`.bat`, which
+/// this inline copy lacked (so a lookup for `python` would previously miss
+/// `python.exe`). POSIX behaviour is unchanged.
 fn which_on_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths).find_map(|dir| {
-            let p = dir.join(name);
-            if p.is_file() { Some(p) } else { None }
-        })
-    })
+    vct_launcher_core::paths::which_on_path(name)
 }
 
 /// Read-only Weaviate schema probe. Returns the list of class names

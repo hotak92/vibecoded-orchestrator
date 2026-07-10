@@ -906,25 +906,14 @@ fn detect_runtime_sync() -> Option<String> {
 }
 
 /// Minimal `which` — walk `PATH` and look for an executable file.
-/// Avoids pulling in the `which` crate just for this one synchronous use.
+///
+/// v0.2.77 (Part 7c task 3): delegates to the shared
+/// `vct_launcher_core::paths::which_on_path` (one home). Behaviour is
+/// preserved on POSIX and upgraded on Windows (the shared form also probes
+/// `.cmd`/`.bat`, not just `.exe`). Kept the local name so the two
+/// `.is_some()` call-sites are undisturbed.
 fn which_cmd(name: &str) -> Option<std::path::PathBuf> {
-    let path_env = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_env) {
-        let candidate = dir.join(name);
-        // Linux/macOS: just check for a regular file. Windows: try
-        // `<name>.exe` too. We stay platform-portable by trying both.
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        #[cfg(windows)]
-        {
-            let with_ext = dir.join(format!("{}.exe", name));
-            if with_ext.is_file() {
-                return Some(with_ext);
-            }
-        }
-    }
-    None
+    vct_launcher_core::paths::which_on_path(name)
 }
 
 /// Populate `ProjectEnvSettings` for a project from launcher state.

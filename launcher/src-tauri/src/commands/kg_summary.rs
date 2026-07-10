@@ -1046,58 +1046,23 @@ pub(crate) fn enumerate_markdown_files(root: &std::path::Path) -> Vec<std::path:
     out
 }
 
-/// Look for `generate-kg-summary.py` in:
-///   1. `<project>/.claude/scripts/`   — bundle-installed copy.
-///   2. `$VCT_LAUNCHER_SCRIPTS_DIR/`   — env override (used by tests).
-///   3. sibling-of-exe convention      — bundled launcher installs.
-///   4. PATH lookup                    — system-wide.
+/// Look for `generate-kg-summary.py` via the shared four-tier ladder
+/// (`<project>/.claude/scripts` → `$VCT_LAUNCHER_SCRIPTS_DIR` →
+/// sibling-of-exe → PATH). Unlike `kg-sync`, the summariser is the SAME
+/// `.py` file on every OS — invocation goes through the venv-python
+/// interpreter rather than a shell wrapper, so there is no `.ps1` variant.
 ///
-/// Order + structure are a 1:1 mirror of `kg_sync::resolve_kg_sync_script`.
-/// Note that unlike `kg-sync` (POSIX) / `kg-sync.ps1` (Windows), the
-/// summariser is the SAME `.py` file on every OS — invocation goes
-/// through the venv-python interpreter rather than via a shell wrapper.
+/// v0.2.77 (Part 7c task 3): this was a byte-for-byte copy of
+/// `kg_sync::resolve_kg_sync_script`'s ladder; it now delegates to
+/// `vct_launcher_core::paths::resolve_installed_script` (one home).
+/// Behaviour preserved (the PATH tier now uses `std::env::split_paths`).
 pub(crate) fn resolve_summary_script(
     project_folder: &std::path::Path,
 ) -> Option<std::path::PathBuf> {
-    let bin = "generate-kg-summary.py";
-
-    // 1. Project-local
-    let p1 = project_folder.join(".claude").join("scripts").join(bin);
-    if p1.is_file() {
-        return Some(p1);
-    }
-
-    // 2. Env override
-    if let Ok(dir) = std::env::var("VCT_LAUNCHER_SCRIPTS_DIR") {
-        let p2 = std::path::PathBuf::from(dir).join(bin);
-        if p2.is_file() {
-            return Some(p2);
-        }
-    }
-
-    // 3. Sibling-of-exe convention
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            for hop in [".", "..", "../.."].iter() {
-                let p3 = parent.join(hop).join(".claude").join("scripts").join(bin);
-                if p3.is_file() {
-                    return Some(p3);
-                }
-            }
-        }
-    }
-
-    // 4. PATH lookup
-    if let Ok(path) = std::env::var("PATH") {
-        let sep = if cfg!(windows) { ';' } else { ':' };
-        for d in path.split(sep) {
-            let p4 = std::path::Path::new(d).join(bin);
-            if p4.is_file() {
-                return Some(p4);
-            }
-        }
-    }
-    None
+    vct_launcher_core::paths::resolve_installed_script(
+        project_folder,
+        "generate-kg-summary.py",
+    )
 }
 
 /// Find a venv python that has the orchestrator's dependencies installed.

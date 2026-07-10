@@ -351,29 +351,12 @@ fn augment_candidates() -> Vec<PathBuf> {
 //   candidate dirs.
 
 
+/// v0.2.77 (Part 7c task 3): delegates to the shared
+/// `crate::paths::which_on_path` (one home). The prior inline copy — which
+/// this file ORIGINATED as the richest `.exe`/`.cmd`/`.bat` variant — was
+/// promoted verbatim into `paths.rs`; the behaviour is identical.
 fn which_on_path(name: &str) -> Option<PathBuf> {
-    // On Windows, also try with .exe / .cmd / .bat appended. PATHEXT may
-    // contain other extensions but those three cover Podman/Docker.
-    #[cfg(windows)]
-    let candidates: Vec<String> = vec![
-        name.to_string(),
-        format!("{}.exe", name),
-        format!("{}.cmd", name),
-        format!("{}.bat", name),
-    ];
-    #[cfg(not(windows))]
-    let candidates: Vec<String> = vec![name.to_string()];
-
-    let paths = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&paths) {
-        for cand in &candidates {
-            let p = dir.join(cand);
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-    }
-    None
+    crate::paths::which_on_path(name)
 }
 
 // ---------------------------------------------------------------------------
