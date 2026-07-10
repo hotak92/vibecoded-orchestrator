@@ -117,14 +117,15 @@ except Exception:
         )
         if not self_project:
             return [(b, "") for b in bases_t]
-        # Mirror sanitize_collection_prefix's contract for the fallback
-        # path. Best-effort only — this branch fires when the helper
-        # isn't on sys.path, which means the user is in a degraded
-        # environment anyway.
+        # Mirror code_sanitize_collection_prefix's contract (the
+        # underscore-PRESERVING code-graph rule = canonical_class_prefix)
+        # for the fallback path. Best-effort only — this branch fires when
+        # the helper isn't on sys.path, which means the user is in a
+        # degraded environment anyway.
         import re as _re
-        prefix = _re.sub(r"[^a-zA-Z0-9_]", "_", self_project)
-        if prefix and not prefix[0].isupper():
-            prefix = prefix[0].upper() + prefix[1:]
+        _parts = self_project.strip().split()
+        _pascal = "".join(p[:1].upper() + p[1:] for p in _parts)
+        prefix = _re.sub(r"[^A-Za-z0-9_]", "_", _pascal)
         return [(f"{prefix}_{b}", self_project) for b in bases_t]
 
 # Load MCP config

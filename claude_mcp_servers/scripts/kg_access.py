@@ -71,7 +71,53 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Iterable, Optional
+import sys
+from pathlib import Path
+from typing import Callable, Iterable, Optional
+
+# Best-effort delegation to the writer SSOT sanitizers so this CLI reader
+# stays byte-behaviour-identical to them (and to the MCP mirrors). The
+# import is graceful: ``kg_access`` is deliberately importable from a bare
+# user-project layout where ``vco_lib`` may not be on ``sys.path`` and the
+# MCP venv may be absent. When the import fails, each sanitizer uses an
+# inline fallback that re-implements the SAME rule (see their bodies).
+#
+# TWO distinct rules (the same split the MCP server keeps, v0.2.74
+# BLOCKER-1):
+#   * KG / Development / Diagrams collections → underscore-DROPPING
+#     ``sanitize_for_weaviate_class`` (``'My Cool App'`` → ``MyCoolApp``,
+#     ``'Foo-Bar'`` → ``FooBar``). Mirror of
+#     ``server._sanitize_collection_prefix``.
+#   * Code-graph (``Code*``) collections → underscore-PRESERVING
+#     ``canonical_class_prefix`` (``'My Cool App'`` → ``MyCoolApp`` but
+#     ``'Foo-Bar'`` → ``Foo_Bar``, ``'Camel_Case'`` → ``Camel_Case``).
+#     Mirror of ``server._code_sanitize_collection_prefix``. The analyzer
+#     WRITES ``Code*`` classes with this rule, so the reader must match it
+#     or it queries a class the writer never created (silent 0-results).
+#
+# vco_lib parent resolution matches the CLI consumers
+# (``templates/scripts/search_knowledge.py``): ``$VCT_ORCHESTRATOR_ROOT``
+# (set in ``.claude/env``) with an in-tree fallback for the orchestrator's
+# own clone.
+_canonical_sanitize_for_weaviate_class: Optional[Callable[[str], str]]
+_canonical_class_prefix: Optional[Callable[[str], str]]
+try:
+    _env_root_for_vco = os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip()
+    if _env_root_for_vco:
+        _vco_lib_parent = Path(_env_root_for_vco)
+    else:
+        # kg_access.py lives at <root>/claude_mcp_servers/scripts/ — the
+        # vco_lib package parent is two levels up.
+        _vco_lib_parent = Path(__file__).resolve().parent.parent.parent
+    if str(_vco_lib_parent) not in sys.path:
+        sys.path.insert(0, str(_vco_lib_parent))
+    from vco_lib.codegraph_naming import (
+        canonical_class_prefix as _canonical_class_prefix,
+        sanitize_for_weaviate_class as _canonical_sanitize_for_weaviate_class,
+    )
+except Exception:  # pragma: no cover (rare bare / half-install layout)
+    _canonical_sanitize_for_weaviate_class = None
+    _canonical_class_prefix = None
 
 # Code-graph base collection names. Mirrors the ``_SCOPES["all"]`` list
 # in ``weaviate_mcp.server.search_code_graph``. Kept in lockstep manually
@@ -105,21 +151,109 @@ def parse_csv_env(name: str) -> list[str]:
 
 
 def sanitize_collection_prefix(name: str) -> str:
-    """Sanitize a project name into the canonical Weaviate collection-prefix
-    shape: alphanumeric + underscore only, leading char uppercased.
+    """Sanitize a project name into the canonical Weaviate KG-collection
+    prefix — the underscore-DROPPING PascalCase rule.
 
-    Idempotent — passing in an already-sanitized prefix returns it
-    unchanged. The launcher always emits sanitized names in
-    ``VCT_*_ACCESS_LIST``, but we tolerate either form for forward-compat
-    with tooling that builds its own access list (tests, scripts that
-    don't go through the launcher).
+    **Canonical rule** (cross-language SSOT, locked 2026-05-25 by cr-b2,
+    re-affirmed here 2026-07-10 by v0.2.77 7a-bis):
+      1. Split on any non-alphanumeric run (``[^A-Za-z0-9]+``).
+      2. PascalCase each surviving part (uppercase first char, keep rest).
+      3. Concatenate (NO joiner — no underscore between parts).
+      4. If nothing survives OR the result starts with a non-letter,
+         fall back to ``"vct"`` (Weaviate uppercases on POST regardless).
 
-    Mirrors ``weaviate_mcp.server._sanitize_collection_prefix``.
+    This is the SAME rule the WRITER uses to name the
+    ``<prefix>_KnowledgeGraph`` collections
+    (``vco_lib.codegraph_naming.sanitize_for_weaviate_class``, re-exported
+    as ``vco_lib.project_init.sanitize_for_weaviate_class``). Converged in
+    v0.2.77 7a-bis: the pre-7a-bis implementation used the divergent
+    ``re.sub([^a-zA-Z0-9_], "_") + upper-first`` rule (underscore-
+    PRESERVING), so a spaced project name like ``'My Cool App'`` resolved
+    to ``My_Cool_App`` and this CLI reader fanned out to
+    ``My_Cool_App_KnowledgeGraph`` — a DIFFERENT collection than the
+    writer-created ``MyCoolApp_KnowledgeGraph`` (silent 0-results, or a
+    wrong-tenant read if a legacy underscore collection happened to
+    exist). Launcher-managed access lists carry canonical prefixes so were
+    safe; hand-built ``VCT_*_ACCESS_LIST`` values with raw names were not.
+
+    Idempotent — passing in an already-canonical prefix returns it
+    unchanged, and the legacy underscore form COLLAPSES onto the canonical
+    prefix (``'My_Cool_App'`` → ``'MyCoolApp'``). Because the rule is
+    idempotent on the underscore form there is no two-collection ambiguity
+    to disambiguate: converging onto this rule resolves both the raw and
+    the legacy-underscore forms onto the single writer-created collection.
+
+    **Byte-behaviour mirror** of
+    ``weaviate_mcp.server._sanitize_collection_prefix`` — the two copies
+    are kept identical (parity pinned by
+    ``tests/test_kg_access_sanitizer_convergence.py``). ``kg_access`` is
+    deliberately pure-stdlib + cheaply importable from a bare user-project
+    layout, so the ``vco_lib`` delegation below is best-effort: it is used
+    when importable, otherwise the inline fallback (behaviour-identical to
+    ``sanitize_for_weaviate_class``) keeps the CLI working without the MCP
+    venv.
     """
-    sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", name)
-    if sanitized and not sanitized[0].isupper():
-        sanitized = sanitized[0].upper() + sanitized[1:]
-    return sanitized
+    canonical = _canonical_sanitize_for_weaviate_class
+    if canonical is not None:
+        try:
+            return canonical(name)
+        except Exception:
+            # Defensive: never let a sanitiser exception break a CLI read.
+            pass
+
+    # Inline fallback — behaviour-identical to
+    # ``vco_lib.codegraph_naming.sanitize_for_weaviate_class``. Kept so the
+    # helper stays importable/usable on a bare layout with no vco_lib on
+    # sys.path.
+    base = name or ""
+    parts = [p for p in re.split(r"[^A-Za-z0-9]+", base) if p]
+    if not parts:
+        return "vct"
+    pascal = "".join(p[:1].upper() + p[1:] for p in parts)
+    if not pascal or not pascal[0].isalpha():
+        return "vct"
+    return pascal
+
+
+def code_sanitize_collection_prefix(name: str) -> str:
+    """CODE-GRAPH-ONLY prefix sanitizer — the underscore-PRESERVING
+    ``canonical_class_prefix`` rule the ANALYZER writes ``Code*`` classes
+    with (and launcher.db ``project_codegraph_bindings.collection_prefix``
+    records).
+
+    DELIBERATELY DIFFERENT from ``sanitize_collection_prefix`` (the
+    underscore-DROPPING KG/Development/Diagrams rule): the code-graph rule
+    PascalCases whitespace-separated words but PRESERVES underscores and
+    maps other non-``[A-Za-z0-9_]`` characters to a single underscore —
+    ``'Foo-Bar'`` → ``'Foo_Bar'``, ``'Camel_Case'`` → ``'Camel_Case'``,
+    while the KG rule drops both to ``'FooBar'`` / ``'CamelCase'``. Routing
+    the code-graph collection-name construction through THIS resolver keeps
+    the CLI reader's class name equal to the writer's for ANY project name,
+    including underscored/hyphenated ones. Mirror of
+    ``weaviate_mcp.server._code_sanitize_collection_prefix`` (v0.2.74
+    BLOCKER-1); parity pinned by
+    ``tests/test_kg_access_sanitizer_convergence.py``.
+
+    Fallback: when ``canonical_class_prefix`` isn't importable
+    (bare/half-install), fall back to the underscore-DROPPING
+    ``sanitize_collection_prefix`` — correct only for non-underscored /
+    non-hyphenated names, but keeps the CLI working rather than crashing
+    (same posture as the MCP mirror).
+    """
+    canonical = _canonical_class_prefix
+    if canonical is not None:
+        try:
+            return canonical(name)
+        except Exception:
+            # ``canonical_class_prefix`` RAISES on names that can't form a
+            # valid class prefix (empty / leading-digit). Never let that
+            # break a CLI read — fall through to the dropping rule, which
+            # returns the ``"vct"`` sentinel for such input.
+            pass
+    # Half-install fallback: the dropping rule (parity holds for names with
+    # no underscore/hyphen; those degrade to the pre-fix behaviour until
+    # vco_lib is refreshed).
+    return sanitize_collection_prefix(name)
 
 
 def kg_peer_collections(env_var: str = "VCT_KG_ACCESS_LIST") -> list[str]:
@@ -258,11 +392,15 @@ def code_graph_collections_to_query(
         # Cross-tenant fallback: bare collection names, no filter.
         return [(base, "") for base in bases_t]
 
-    self_prefix = sanitize_collection_prefix(self_project)
+    # v0.2.74 BLOCKER-1 / v0.2.77 7a-bis: code-graph fan-out uses the
+    # underscore-PRESERVING sanitizer (matches the analyzer's write class),
+    # NOT the diagrams/KG dropping rule. Mirror of the `_code_sanitize_*`
+    # loop in `server.search_code_graph`.
+    self_prefix = code_sanitize_collection_prefix(self_project)
     seen_prefixes: set[str] = {self_prefix}
     prefixes: list[tuple[str, str]] = [(self_prefix, self_project)]
     for peer in parse_csv_env(env_var):
-        peer_prefix = sanitize_collection_prefix(peer)
+        peer_prefix = code_sanitize_collection_prefix(peer)
         if not peer_prefix or peer_prefix in seen_prefixes:
             continue
         seen_prefixes.add(peer_prefix)
@@ -282,6 +420,7 @@ __all__ = [
     "CODE_GRAPH_BASES",
     "parse_csv_env",
     "sanitize_collection_prefix",
+    "code_sanitize_collection_prefix",
     "kg_peer_collections",
     "kg_collections_to_search",
     "code_graph_collections_to_query",

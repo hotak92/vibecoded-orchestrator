@@ -83,7 +83,13 @@ class ParseCsvEnvTests(unittest.TestCase):
 
 
 class SanitizeCollectionPrefixTests(unittest.TestCase):
-    """Idempotent sanitization — already-sanitized prefixes pass through."""
+    """Canonical underscore-DROPPING PascalCase sanitization (converged onto
+    the writer SSOT ``sanitize_for_weaviate_class`` in v0.2.77 7a-bis).
+
+    Pre-7a-bis this pinned the divergent ``re.sub([^a-zA-Z0-9_], "_") +
+    upper-first`` rule (underscore-PRESERVING); the full parity domain now
+    lives in ``test_kg_access_sanitizer_convergence.py``. These cases keep a
+    minimal in-module sanity check."""
 
     def setUp(self) -> None:
         _clear_access_env()
@@ -91,15 +97,30 @@ class SanitizeCollectionPrefixTests(unittest.TestCase):
     def test_idempotent_for_clean_input(self) -> None:
         helper = _fresh_helper()
         self.assertEqual(helper.sanitize_collection_prefix("Alpha"), "Alpha")
-        self.assertEqual(helper.sanitize_collection_prefix("Vibe_Coded_Tools"), "Vibe_Coded_Tools")
+        # Legacy underscore form COLLAPSES onto the canonical prefix (matches
+        # the writer, which drops underscores).
+        self.assertEqual(
+            helper.sanitize_collection_prefix("Vibe_Coded_Tools"),
+            "VibeCodedTools",
+        )
 
     def test_replaces_unsupported_chars(self) -> None:
         helper = _fresh_helper()
-        self.assertEqual(helper.sanitize_collection_prefix("foo-bar.baz"), "Foo_bar_baz")
+        # Non-alnum runs are separators; each part is PascalCased and joined
+        # with NO underscore.
+        self.assertEqual(
+            helper.sanitize_collection_prefix("foo-bar.baz"), "FooBarBaz"
+        )
 
     def test_uppercases_first_char(self) -> None:
         helper = _fresh_helper()
         self.assertEqual(helper.sanitize_collection_prefix("alpha"), "Alpha")
+
+    def test_spaced_name_matches_writer(self) -> None:
+        helper = _fresh_helper()
+        self.assertEqual(
+            helper.sanitize_collection_prefix("My Cool App"), "MyCoolApp"
+        )
 
 
 class KgPeerCollectionsTests(unittest.TestCase):
