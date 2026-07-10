@@ -26,7 +26,73 @@ reach those via ``ctx.`` (see the analyzer's "module-global seams" block).
 from __future__ import annotations
 
 import re
-from typing import Dict, List
+from typing import Any, Dict, List
+
+
+# ── P2f stage 3 (v0.2.77 Part 6): the NARROW helpers protocol ───────────────
+class ExtractorHelpers:
+    """The narrow surface a pure ``extract_<lang>_file`` producer is allowed to
+    reach on the analyzer — deliberately NOT the analyzer itself.
+
+    A pure producer reads source and builds a ``FileExtraction``; it never
+    mutates analyzer state (caches, visited_uuids, the module row — those are
+    the writer's job). But two dependencies are genuinely needed at PRODUCE
+    time:
+
+      * the embedding seams (``embed_class`` / ``embed_function`` /
+        ``generate_embedding``) that the deferred-embed closures fire lazily —
+        routed through the analyzer instance so they keep late-resolving the
+        module-global stub the golden suite / seam tests monkeypatch;
+      * python-only AST helpers (module summary, complexity, imports, source
+        slicing, name/type extraction) that live on the analyzer next to the
+        ``ast`` machinery — exposed as thin passthroughs so the python producer
+        can build entities without importing the analyzer.
+
+    Holding ``_ctx`` privately (never handed to the extractor) keeps the
+    "extractor cannot mutate analyzer state" invariant a code-review-checkable
+    property: the extractor only sees the whitelisted methods below.
+    """
+
+    __slots__ = ("_ctx",)
+
+    def __init__(self, ctx: Any) -> None:
+        self._ctx = ctx
+
+    # ---- embedding seams (late-resolving via the analyzer delegators) --------
+    def embed_class(self, *args: Any, **kwargs: Any) -> Any:
+        return self._ctx.embed_class(*args, **kwargs)
+
+    def embed_function(self, *args: Any, **kwargs: Any) -> Any:
+        return self._ctx.embed_function(*args, **kwargs)
+
+    def generate_embedding(self, *args: Any, **kwargs: Any) -> Any:
+        return self._ctx.generate_embedding(*args, **kwargs)
+
+    # ---- python-only AST helpers (thin passthroughs to analyzer methods) -----
+    @property
+    def project_name(self) -> Any:
+        return self._ctx.project_name
+
+    def extract_imports(self, tree: Any) -> Any:
+        return self._ctx._extract_imports(tree)
+
+    def generate_module_summary(self, tree: Any, source_lines: Any, path: str) -> Any:
+        return self._ctx._generate_module_summary(tree, source_lines, path)
+
+    def calculate_complexity(self, tree: Any) -> Any:
+        return self._ctx._calculate_complexity(tree)
+
+    def extract_source_code(self, node: Any, source_lines: Any) -> Any:
+        return self._ctx._extract_source_code(node, source_lines)
+
+    def get_name(self, node: Any) -> Any:
+        return self._ctx._get_name(node)
+
+    def extract_field_types(self, node: Any) -> Any:
+        return self._ctx._extract_field_types(node)
+
+    def extract_annotation_type_names(self, annotation: Any) -> Any:
+        return self._ctx._extract_annotation_type_names(annotation)
 
 
 # CG-5 (v0.2.75 P3d): minified-CONTENT heuristic. The name-suffix denylist

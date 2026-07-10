@@ -537,6 +537,9 @@ try:
     # expression at ~20 near-identical `_dedup_insert` call-sites.
     from vco_lib.codegraph_entities import (
         CodeEntity,
+        FileExtraction,  # noqa: F401 — P2f stage 3 (v0.2.77 Part 6) pure-producer IR
+        InteractionGroup,  # noqa: F401
+        ModuleDescriptor,  # noqa: F401
         KIND_API,  # noqa: F401 — re-exported for extractor readability
         KIND_CLASS,  # noqa: F401
         KIND_FUNCTION,  # noqa: F401
@@ -2405,6 +2408,92 @@ class CodeGraphAnalyzer:
             entity.identity_key(),
             file_path_rel=entity.file_path_rel,
         )
+
+    # ── P2f stage 3 (v0.2.77 Part 6): the ONE writer for a pure extraction ──
+    def write_file_extraction(self, fx: "FileExtraction") -> Dict[str, int]:
+        """Own EVERY side-effect of one file's ``FileExtraction`` in the EXACT
+        order the pre-Part-6 imperative extractors used.
+
+        The pure ``extract_<lang>_file`` producers gather WHAT to write and
+        return a :class:`FileExtraction`; this method REPLAYS the writes:
+
+          1. module row  — ``_create_or_update_module`` (owns the LANDMINE
+             ``data.update`` bypass + module_cache write + visited_uuids);
+          2. ``module_imports`` cache (python's cross-ref-linking input);
+          3. entities in extractor-emission order — each routed through
+             ``store_entity`` → ``_dedup_insert`` (the unchanged choke-point
+             that stamps language/project_source/file_path/is_test/doc, resolves
+             the deferred embed, fans out chunks, tracks visited_uuids). The
+             module UUID is stamped onto each entity's ``module`` reference here
+             (a pure extractor cannot know it); class/function UUIDs are
+             captured into class_cache/function_cache by ``full_name`` — the
+             SAME cache writes ``_extract_class`` / ``_extract_function`` did;
+          4. interactions — ``_store_interactions`` with the fresh module UUID.
+
+        The unchanged-skip gate stays analyzer-side and runs in the extractor
+        BEFORE this writer is reached (the extractor returns a module-less
+        ``FileExtraction`` on skip), so today's short-circuit economics are
+        preserved — this writer performs no writes when ``fx.module is None``.
+
+        Returns the per-file stats dict the dispatch loop sums. Byte-identity
+        of the resulting stored objects is pinned by the golden suite.
+        """
+        stats = dict(fx.stats)
+        if fx.module is None:
+            # Walk-time no-op (minified / syntax error / unchanged skip):
+            # nothing to write, stats verbatim.
+            return stats
+
+        md = fx.module
+        module_uuid = self._create_or_update_module(
+            path=md.path,
+            language=md.language,
+            loc=md.loc,
+            complexity=md.complexity,
+            last_modified=md.last_modified,
+            file_hash=md.file_hash,
+            imports=md.imports,
+            module_summary=md.module_summary,
+        )
+
+        # module_imports cache — populated by python's imperative extractor
+        # immediately after the module write; a pure extractor surfaces the
+        # import list via ``fx.imports`` and the writer records it under the
+        # module's relative path. Empty ``fx.imports`` is a no-op so non-python
+        # extractors (which never populated this cache) keep the identical
+        # cache state.
+        if fx.imports:
+            self.module_imports[md.path] = fx.imports
+
+        # Entities in emission order. Stamp the module reference (the writer
+        # owns the UUID) and capture class/function UUIDs into the caches keyed
+        # by full_name — reproducing the ``_extract_class`` / ``_extract_function``
+        # cache writes verbatim.
+        for entity in fx.entities:
+            entity.references = dict(entity.references)
+            entity.references["module"] = module_uuid
+            written_uuid = self.store_entity(entity)
+            if entity.kind == KIND_CLASS and entity.full_name:
+                self.class_cache[entity.full_name] = written_uuid
+            elif entity.kind == KIND_FUNCTION and entity.full_name:
+                self.function_cache[entity.full_name] = written_uuid
+
+        # Interactions last — they need the module UUID (and only exist once
+        # the module/entities are in place). Mirror the imperative sites, which
+        # assigned ``stats['interactions'] = ctx._store_interactions(...)``.
+        for group in fx.interactions:
+            if not group.interactions:
+                continue
+            stored = self._store_interactions(
+                group.interactions,
+                group.language,
+                module_uuid,
+                func_uuid=group.func_uuid,
+                file_path_rel=md.path,
+            )
+            stats["interactions"] = stats.get("interactions", 0) + stored
+
+        return stats
 
     # ------------------------------------------------------------------
     # P2f stage 2 (v0.2.76): module-global seams, re-exposed on the

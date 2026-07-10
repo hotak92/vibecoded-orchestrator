@@ -53,7 +53,8 @@ PER-KIND ``extras`` INVENTORY (enumerated from the pre-P2f call-sites)
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Optional
+from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional
 
 # Entity kinds. These map to the analyzer's five collections; the analyzer's
 # ``store_entity`` wrapper picks the collection from ``kind``.
@@ -190,3 +191,106 @@ class CodeEntity:
         if self.vector:
             insert_params["vector"] = self.vector
         return insert_params
+
+
+# ── P2f stage 3 (v0.2.77 Part 6): pure-producer extractor IR ────────────────
+#
+# WHY (successor to the P2f stage-1/2 deferral)
+# ---------------------------------------------
+# Through v0.2.76 the per-language extractors were still "imperative sinks":
+# they called ``ctx._create_or_update_module`` / ``ctx.store_entity`` /
+# ``ctx._store_interactions`` MID-WALK, mutating analyzer state (caches,
+# visited_uuids, the module row) as a side-effect of parsing. That coupling is
+# what the v0.2.76 Part-3 CORRECTION v2 deferred: the write/cache lifecycle
+# deserves its own review budget because a single reordering silently drifts the
+# stored output.
+#
+# Part 6 makes extractors PURE PRODUCERS: ``extract_<lang>_file(...) ->
+# FileExtraction`` reads source and RETURNS a description of what to write, with
+# NO analyzer mutation. ONE writer — ``CodeGraphAnalyzer.write_file_extraction``
+# — owns every side-effect (module row upsert, module_imports cache, entity
+# writes through ``store_entity``→``_dedup_insert``, class/function cache
+# capture, and interaction writes) in the EXACT order the imperative extractors
+# used: module → entities (in extractor-emission order) → interactions. The old
+# ``analyze_<lang>_file(ctx, ...)`` name survives as a thin shim (extract →
+# write → return stats) so the dispatch table and the per-file failure
+# compensation (``_invalidate_module_row``) are unchanged.
+#
+# BYTE-IDENTICAL CONTRACT: the golden snapshots
+# (``tests/test_codegraph_golden.py``) pin the stored output across this whole
+# refactor. Any snapshot diff is a writer-ordering defect to fix, never a regen.
+
+
+@dataclass
+class ModuleDescriptor:
+    """The raw arguments a pure extractor gathers for the module row.
+
+    The module is NOT emitted as a ``CodeEntity`` because its write path is
+    ``CodeGraphAnalyzer._create_or_update_module`` (which owns the LANDMINE
+    ``data.update`` bypass that must stamp ``content_hash`` + ``embed_revision``
+    itself), not the generic ``store_entity`` → ``_dedup_insert`` choke-point.
+    The writer forwards these verbatim to ``_create_or_update_module`` and
+    threads the returned module UUID into every entity's ``module`` reference
+    and into ``_store_interactions``.
+    """
+
+    path: str
+    language: str
+    loc: int
+    complexity: float
+    last_modified: datetime
+    file_hash: str
+    imports: List[str] = field(default_factory=list)
+    module_summary: str = ""
+
+
+@dataclass
+class InteractionGroup:
+    """One extractor's cross-language interaction batch, deferred to the writer.
+
+    ``_store_interactions`` needs the module UUID (and optionally a function
+    UUID) that only exist AFTER the module/entities are written — so a pure
+    extractor cannot call it. It returns the raw ``interactions`` list (the
+    output of ``_extract_external_calls``) plus its ``language`` label, and the
+    writer replays ``ctx._store_interactions(...)`` with the freshly-written
+    module UUID once the file's entities are in place. ``func_uuid`` stays
+    ``None`` for the current extractors (they attribute interactions to the
+    module, matching today's call sites); the field exists so a future
+    function-scoped interaction extractor can key it by an entity's captured
+    UUID without a contract change.
+    """
+
+    interactions: List[Dict[str, str]]
+    language: str
+    func_uuid: Optional[str] = None
+
+
+@dataclass
+class FileExtraction:
+    """The pure-producer result of ``extract_<lang>_file`` — what to write.
+
+    Contains NO analyzer state and NO UUIDs (the writer mints them). The
+    ``entities`` list is in extractor-EMISSION order (module-first is implicit
+    — ``module`` is written before any entity; python's class-then-methods
+    interleaving is preserved by list order). Each ``CodeEntity`` here must NOT
+    pre-bake the ``module`` reference — the writer stamps
+    ``references['module'] = <module_uuid>`` after creating the module row (a
+    pure extractor cannot know the UUID). ``deferred_embed`` / ``vector`` on the
+    entities are fine: they close over the helpers protocol (which delegates to
+    the analyzer's late-resolving embed seams), not over analyzer mutable state.
+
+    ``stats`` is the per-file counts dict the analyzer's dispatch loop sums
+    (``modules`` / ``classes`` / ``functions`` and, when interactions were
+    stored, ``interactions``). A pure extractor may leave ``interactions`` out
+    of ``stats`` and let the writer stamp the stored count — matching how the
+    imperative extractors assigned ``stats['interactions'] =
+    ctx._store_interactions(...)`` at write time.
+    """
+
+    #: ``None`` when the file was a walk-time no-op (minified/syntax-error skip)
+    #: — the writer then performs no writes and returns the stats verbatim.
+    module: Optional[ModuleDescriptor] = None
+    entities: List[CodeEntity] = field(default_factory=list)
+    interactions: List[InteractionGroup] = field(default_factory=list)
+    imports: List[str] = field(default_factory=list)
+    stats: Dict[str, int] = field(default_factory=dict)
