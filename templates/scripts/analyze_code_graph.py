@@ -2469,10 +2469,36 @@ class CodeGraphAnalyzer:
         # owns the UUID) and capture class/function UUIDs into the caches keyed
         # by full_name — reproducing the ``_extract_class`` / ``_extract_function``
         # cache writes verbatim.
+        #
+        # ``written_by_full_name`` resolves an intra-file entity → UUID edge a
+        # pure producer cannot express (csharp's CodeAPI ``handler`` reference
+        # points at the function written immediately before it — the imperative
+        # extractor captured ``func_uuid`` from its own ``store_entity`` return).
+        # A producer marks such an entity with ``extras['_handler_full_name']``
+        # (the target function's full_name); the writer resolves it here from
+        # the UUID it just wrote. Missing target → drop the handler ref (the
+        # imperative code never produced an API without its handler, so this is
+        # purely defensive — never fabricate an edge).
+        written_by_full_name: Dict[str, str] = {}
         for entity in fx.entities:
             entity.references = dict(entity.references)
-            entity.references["module"] = module_uuid
+            # Reference shape is KIND-SPECIFIC and byte-identity-critical:
+            #   * CLASS / FUNCTION → references={"module": module_uuid} (every
+            #     imperative class/function site set exactly this);
+            #   * API → NO module ref. Either references={} (js / proto route
+            #     entries) OR references={"handler": func_uuid} (csharp ASP.NET
+            #     entries, resolved from ``_handler_full_name`` below). Stamping
+            #     a spurious module ref here would diverge the stored edge.
+            if entity.kind in (KIND_CLASS, KIND_FUNCTION):
+                entity.references["module"] = module_uuid
+            handler_fn = entity.extras.get("_handler_full_name")
+            if handler_fn:
+                handler_uuid = written_by_full_name.get(handler_fn)
+                if handler_uuid:
+                    entity.references["handler"] = handler_uuid
             written_uuid = self.store_entity(entity)
+            if entity.full_name:
+                written_by_full_name[entity.full_name] = written_uuid
             if entity.kind == KIND_CLASS and entity.full_name:
                 self.class_cache[entity.full_name] = written_uuid
             elif entity.kind == KIND_FUNCTION and entity.full_name:

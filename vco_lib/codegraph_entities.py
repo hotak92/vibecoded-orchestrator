@@ -177,9 +177,11 @@ class CodeEntity:
             props["project"] = self.project
 
         # Merge extras verbatim (per-kind oddities + full API/interaction sets),
-        # skipping the private identity-control key.
+        # skipping the private control keys (identity override + the P2f-3
+        # ``_handler_full_name`` the writer resolves into a ``handler``
+        # reference; neither is a stored property).
         for k, v in self.extras.items():
-            if k == "_identity_key":
+            if k in ("_identity_key", "_handler_full_name"):
                 continue
             props[k] = v
 

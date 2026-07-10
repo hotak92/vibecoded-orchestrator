@@ -14,40 +14,31 @@ import hashlib
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
-from vco_lib.codegraph_entities import CodeEntity, KIND_FUNCTION
+from vco_lib.codegraph_entities import (
+    CodeEntity,
+    FileExtraction,
+    InteractionGroup,
+    KIND_FUNCTION,
+    ModuleDescriptor,
+)
 from vco_lib.codegraph_lang._shared import (
     _extract_balanced_block,
     _extract_external_calls,
-    _is_minified_content,
+    run_pure_extractor,
 )
 
 
-def analyze_shell_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, int]:
-    """Analyze a Shell script using regex-based parsing."""
-    stats = {'modules': 0, 'classes': 0, 'functions': 0}
-
-    content = file_path.read_text(encoding='utf-8', errors='ignore')
-    # CG-5 (v0.2.75 P3d): skip machine-minified content at walk time (skip +
-    # log; NEVER delete existing rows — the orphan-clear owns deletion). One
-    # home: _is_minified_content. A genuine long-line first-party file simply
-    # isn't re-indexed this run.
-    if _is_minified_content(content):
-        try:
-            _rel_min = file_path.relative_to(repo_root).as_posix()
-        except Exception:  # noqa: BLE001
-            _rel_min = str(file_path)
-        print(f"⏭️  Skipping {_rel_min} (looks minified/generated)")
-        return {'modules': 0, 'classes': 0, 'functions': 0}
+def extract_shell_file(
+    source_text: str, file_path: Path, repo_root: Path, helpers: Any,
+) -> FileExtraction:
+    """Pure producer: parse a Shell script, RETURN a :class:`FileExtraction`."""
+    content = source_text
     source_lines = content.split('\n')
     loc = len([l for l in source_lines if l.strip() and not l.strip().startswith('#')])
     file_hash = hashlib.sha256(content.encode()).hexdigest()
     relative_path = file_path.relative_to(repo_root).as_posix()
-
-    if ctx._get_existing_module(relative_path, file_hash):
-        print(f"⏭️  Skipping {relative_path} (unchanged)")
-        return stats
 
     content_clean = re.sub(r'#.*$', '', content, flags=re.MULTILINE)
 
@@ -75,12 +66,13 @@ def analyze_shell_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, 
     complexity = float(1 + sum(content_clean.count(kw)
                                for kw in ['if [', 'if [[', 'while ', 'for ', 'case ']))
 
-    module_uuid = ctx._create_or_update_module(
+    module = ModuleDescriptor(
         path=relative_path, language="Shell", loc=loc, complexity=complexity,
         last_modified=datetime.fromtimestamp(file_path.stat().st_mtime, tz=timezone.utc),
         file_hash=file_hash, imports=imports, module_summary=module_summary,
     )
-    stats['modules'] = 1
+    entities: List[CodeEntity] = []
+    stats: Dict[str, int] = {'modules': 1, 'classes': 0, 'functions': 0}
 
     for m in func_pattern.finditer(content_clean):
         fname = m.group(1) or m.group(2)
@@ -91,20 +83,34 @@ def analyze_shell_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, 
         body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
         full_name = f"{file_path.stem}.{fname}"
         signature = f"{fname}()"
-        ctx.store_entity(CodeEntity(
+        entities.append(CodeEntity(
             kind=KIND_FUNCTION, file_path_rel=relative_path,
             name=fname, full_name=full_name,
             body=body, signature=signature, doc="",
             start_line=start_line, end_line=end_line,
-            is_async=False, project=ctx.project_name,
-            references={"module": module_uuid},
-            deferred_embed=lambda: ctx.embed_function(signature, body, language="python"),
+            is_async=False, project=helpers.project_name,
+            deferred_embed=(
+                lambda sig=signature, fb=body:
+                helpers.embed_function(sig, fb, language="python")
+            ),
         ))
         stats['functions'] += 1
 
     # Cross-language interactions (shell: gate on curl/wget presence in content)
+    interactions: List[InteractionGroup] = []
     ix = _extract_external_calls(content_clean, imports + ["curl", "wget"], "shell", relative_path)
     if ix:
-        stats['interactions'] = ctx._store_interactions(ix, "Shell", module_uuid, file_path_rel=relative_path)
+        interactions.append(InteractionGroup(interactions=ix, language="Shell"))
 
-    return stats
+    return FileExtraction(
+        module=module, entities=entities, interactions=interactions,
+        imports=[], stats=stats,
+    )
+
+
+def analyze_shell_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, int]:
+    """Thin shim: skip gates analyzer-side, then extract -> write."""
+    return run_pure_extractor(
+        ctx, file_path, repo_root, extract_shell_file,
+        {'modules': 0, 'classes': 0, 'functions': 0},
+    )

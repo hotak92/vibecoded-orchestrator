@@ -25,8 +25,10 @@ reach those via ``ctx.`` (see the analyzer's "module-global seams" block).
 """
 from __future__ import annotations
 
+import hashlib
 import re
-from typing import Any, Dict, List
+from pathlib import Path
+from typing import Any, Callable, Dict, List
 
 
 # ── P2f stage 3 (v0.2.77 Part 6): the NARROW helpers protocol ───────────────
@@ -93,6 +95,51 @@ class ExtractorHelpers:
 
     def extract_annotation_type_names(self, annotation: Any) -> Any:
         return self._ctx._extract_annotation_type_names(annotation)
+
+
+def run_pure_extractor(
+    ctx: Any,
+    file_path: Path,
+    repo_root: Path,
+    extract: Callable[[str, Path, Path, "ExtractorHelpers"], Any],
+    empty_stats: Dict[str, int],
+) -> Dict[str, int]:
+    """The shared thin-shim body for a pure ``extract_<lang>_file`` producer.
+
+    Owns the walk-time I/O + the two analyzer-side skip gates that MUST run
+    BEFORE extraction (preserving today's short-circuit economics — the pure
+    producer is only invoked when the file is NOT skipped):
+
+      1. CG-5 minified-content skip (skip + log, never deletes rows);
+      2. the unchanged-file gate ``ctx._get_existing_module`` (path + hash +
+         embed-revision aware).
+
+    On a skip it returns ``empty_stats`` verbatim (byte-identical to the
+    per-language ``return {'modules': 0, ...}`` / ``return stats`` the imperative
+    extractors used). Otherwise: ``extract`` -> ``ctx.write_file_extraction``
+    -> stats dict.
+
+    ``empty_stats`` is the language's own zero-stats dict (they differ:
+    js/csharp/proto also carry ``apis``) so the returned shape stays identical
+    to the pre-Part-6 body on the skip paths.
+    """
+    content = file_path.read_text(encoding="utf-8", errors="ignore")
+    if _is_minified_content(content):
+        try:
+            _rel_min = file_path.relative_to(repo_root).as_posix()
+        except Exception:  # noqa: BLE001
+            _rel_min = str(file_path)
+        print(f"⏭️  Skipping {_rel_min} (looks minified/generated)")
+        return dict(empty_stats)
+
+    file_hash = hashlib.sha256(content.encode()).hexdigest()
+    relative_path = file_path.relative_to(repo_root).as_posix()
+    if ctx._get_existing_module(relative_path, file_hash):
+        print(f"⏭️  Skipping {relative_path} (unchanged)")
+        return dict(empty_stats)
+
+    fx = extract(content, file_path, repo_root, ExtractorHelpers(ctx))
+    return ctx.write_file_extraction(fx)
 
 
 # CG-5 (v0.2.75 P3d): minified-CONTENT heuristic. The name-suffix denylist
