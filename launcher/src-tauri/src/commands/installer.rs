@@ -7267,6 +7267,16 @@ fn clear_update_resume_deferral_if_solo(install_path: &Path) {
         .lines()
         .filter(|l| l.starts_with("## "))
         .count();
+    // v0.2.76 (A2, acknowledged edge): the "solo" decision reads ONLY the .md
+    // (single condition_id line + exactly one section), yet the Ok arm below
+    // dual-unlinks the co-present UPDATE_DEFERRED.json too. A hand-edited .json
+    // carrying EXTRA entries while the .md still looks solo would thus be
+    // deleted with it. Normal flow cannot produce this: A-3 writes the pair in
+    // lock-step (the .json mirrors the .md's entry set), so a solo .md implies
+    // a solo .json. We accept the edge rather than parse+diff the JSON here
+    // because the backstop is robust — install.py's mark_resolved reconcile
+    // re-derives the deferral set from live install state on the next run, so a
+    // wrongly-cleared hand-edited entry is regenerated if it still applies.
     if single_id && section_count == 1 {
         match std::fs::remove_file(&target) {
             Err(e) => {
