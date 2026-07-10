@@ -6860,21 +6860,60 @@ def _dedup_objects_by_full_name(objects: list) -> list:
 
 
 # M-2 / CG-2 (v0.2.73): query types whose relationships are populated only
-# by language-specific analyzer passes. Calls/paths/type_users come from the
-# call-graph + type-annotation extraction that the Python walker emits richly
-# but many non-Python walkers don't — so an empty result on a non-Python
-# target is "unsupported for that language", not "entity missing". This
-# marker lets the caller distinguish the two.
+# by language-specific analyzer passes. Calls/paths come from the call-graph
+# extraction (now cross-language via tree-sitter — Part 5); type_users comes
+# from Python-only type-annotation extraction. An empty result on a target
+# whose language has no extractor is "unsupported for that language", not
+# "entity missing". This marker lets the caller distinguish the two.
 _CALLGRAPH_QUERY_TYPES = {"callers", "path", "type_users"}
 
-# CG-2 (v0.2.75 P2e): call-graph + type-use extraction is Python-only today
-# (analyze_code_graph._extract_function_calls is ast-based). So an EMPTY
-# callers/path/type_users result is genuinely ambiguous ONLY for a non-Python
-# target — a Python target with zero callers really has zero callers. The
-# ``unsupported_for_language`` boolean is an over-claim when it fires on Python;
-# emit it ONLY once the target's language is positively known to be non-Python.
-# Canonical "python" tag as stamped by the analyzer (_canonical_lang_id).
-_CALLGRAPH_PY_LANGS = {"python"}
+# CG-2 (v0.2.77 Part 5): the ``calls`` edge (feeding ``callers`` / ``path``) is
+# now populated for every language whose tree-sitter grammar is installed
+# (the optional ``codegraph-ts`` extra), not just Python. So the set of
+# languages for which an empty ``callers`` / ``path`` result is a GENUINE "no
+# callers" (rather than "unsupported") is derived dynamically from the facade's
+# probe. ``type_users`` stays Python-only — cross-language type-annotation
+# extraction is out of scope for this release.
+#
+# Graceful import (same rationale as EmbeddingService above): a half-install
+# without vco_lib falls back to the pre-Part-5 Python-only set so the marker
+# behaviour never regresses to crashing.
+try:
+    from vco_lib.codegraph_calls import (
+        supported_call_languages as _supported_call_languages,
+    )
+    _HAS_CALL_FACADE = True
+except Exception as _call_facade_import_err:  # pragma: no cover (rare half-install)
+    logger.warning(
+        "vco_lib.codegraph_calls import failed (%s) — call-graph language "
+        "support probe falls back to Python-only. Run install.py --update "
+        "to refresh vco_lib.",
+        _call_facade_import_err,
+    )
+    _HAS_CALL_FACADE = False
+    _supported_call_languages = None  # type: ignore[assignment]
+
+
+def _callgraph_supported_langs(query_type: str) -> "frozenset[str]":
+    """Canonical language ids for which ``query_type``'s edges are populated.
+
+    * ``callers`` / ``path`` → every language with an installed tree-sitter
+      grammar (probed via the facade), always including ``python`` (ast). When
+      the facade is unimportable, falls back to ``{"python"}``.
+    * ``type_users`` → ``{"python"}`` only (cross-language type-annotation
+      extraction is out of scope this release).
+
+    Used to decide whether an EMPTY result is a genuine "none" (target's
+    language IS supported) or an "unsupported_for_language" (it is not).
+    """
+    if query_type == "type_users":
+        return frozenset({"python"})
+    if _HAS_CALL_FACADE and _supported_call_languages is not None:
+        try:
+            return _supported_call_languages()
+        except Exception:  # noqa: BLE001 — probe must never wedge a query
+            return frozenset({"python"})
+    return frozenset({"python"})
 
 
 def _callgraph_target_language(
@@ -7362,28 +7401,33 @@ def query_code_structure(
         # — it fired on EVERY empty result, including a Python target with
         # genuinely zero callers, and that mislabel propagated into RL training
         # data (the field is telemetry-recorded). Now emit the boolean ONLY when
-        # the target's language is POSITIVELY known to be non-Python (call/type
-        # extraction is Python-only today — analyze_code_graph._extract_function_calls
-        # is ast-based). For a Python target, or an ambiguous/unresolvable
-        # language, keep the explanatory prose note but DON'T set the
-        # over-claiming boolean.
+        # the target's language is POSITIVELY known to LACK extraction for this
+        # query type. v0.2.77 Part 5: ``callers`` / ``path`` extraction is now
+        # cross-language (any installed tree-sitter grammar), so the supported
+        # set is derived per-query-type from the facade; ``type_users`` stays
+        # Python-only. For a supported-language target, or an
+        # ambiguous/unresolvable language, keep the explanatory prose note but
+        # DON'T set the over-claiming boolean.
         _cg_unsupported = None
         if query_type in _CALLGRAPH_QUERY_TYPES and not results:
             _target_lang = _callgraph_target_language(
                 query_type, target, client, _proj_coll, effective_project,
             )
-            # Known non-Python → the edge type is genuinely unsupported for it.
-            _cg_unsupported = bool(_target_lang) and _target_lang not in _CALLGRAPH_PY_LANGS
+            # Known language with NO extractor for this edge type → the edge
+            # type is genuinely unsupported for it.
+            _supported = _callgraph_supported_langs(query_type)
+            _cg_unsupported = bool(_target_lang) and _target_lang not in _supported
             if _cg_unsupported:
                 response_payload["unsupported_for_language"] = True
             response_payload["note"] = (
                 f"0 results for a '{query_type}' query. This can mean the "
                 f"target truly has none, OR the target's language does not "
-                f"have call-graph / type-use extraction (this edge type is "
-                f"populated richly for Python, sparsely or not at all for "
-                f"some other languages). Confirm the entity exists with "
-                f"search_code_graph('{target}') before concluding it has no "
-                f"{query_type}."
+                f"have this edge type extracted (call-graph edges are "
+                f"populated for Python plus every language whose tree-sitter "
+                f"grammar is installed via the optional 'codegraph-ts' extra; "
+                f"type-use edges are Python-only). Confirm the entity exists "
+                f"with search_code_graph('{target}') before concluding it has "
+                f"no {query_type}."
             )
 
         # v0.2.73 (RL follow-up): uniform telemetry coverage — structural
