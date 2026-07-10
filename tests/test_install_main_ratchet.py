@@ -81,7 +81,12 @@ _MAIN_SPAN_MAX = 1668
 # (_install_pinned_npm + ~10 helpers) moved to vco_lib.install_npm to break
 # the vco_lib.cli.verify -> install back-edge; install.py keeps thin
 # name-stable wrappers. Re-pinned DOWNWARD to the new measured value.
-_TOTAL_LINES_MAX = 24913
+# v0.2.77 Part 7a-bis (task 4): -104. Deleted the dead
+# _build_canonical_env_template_text + _env_canonical_template pair (zero
+# callers; the Rust build_canonical_env_text is the sole .env renderer and
+# vco_lib.env_template.list_canonical_env_template_keys is the Python key
+# authority). Re-pinned DOWNWARD to the new measured value.
+_TOTAL_LINES_MAX = 24809
 
 
 def _measure() -> tuple:

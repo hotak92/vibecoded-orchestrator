@@ -152,14 +152,16 @@ Out of scope
   they end up dominated by the new block — same effective behaviour
   as before; users who care can manually delete the legacy lines.)
 * The full template body (banner comments, commented-out RL section,
-  telemetry section, LLM API keys) emitted by the legacy
-  ``_build_canonical_env_template_text``. Phase 0.D's contract is for
-  the MANAGED block only; the legacy renderer can keep emitting the
-  commented-placeholder lines for OPTIONAL keys (ANTHROPIC_API_KEY,
-  OPENAI_API_KEY, GITHUB_TOKEN, RL_SERVER_URL, VCT_TELEMETRY) outside
-  the managed markers. Those keys are intentionally outside the
-  contract because they are user-secrets-or-modules — the launcher
-  never autopopulates them.
+  telemetry section, LLM API keys) is emitted by the Rust renderer
+  ``build_canonical_env_text`` in ``commands/projects_v2.rs`` (the sole
+  full-body ``.env`` producer since v0.2.77 7a-bis removed the legacy
+  install.py ``_build_canonical_env_template_text`` renderer as dead code).
+  Phase 0.D's contract is for the MANAGED block only; the Rust renderer
+  keeps emitting the commented-placeholder lines for OPTIONAL keys
+  (ANTHROPIC_API_KEY, OPENAI_API_KEY, GITHUB_TOKEN, RL_SERVER_URL,
+  VCT_TELEMETRY) outside the managed markers. Those keys are intentionally
+  outside the contract because they are user-secrets-or-modules — the
+  launcher never autopopulates them.
 
 Cross-OS rules (non-negotiable)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

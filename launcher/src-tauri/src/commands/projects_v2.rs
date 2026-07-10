@@ -3959,9 +3959,11 @@ const ENV_VCO_MARKER: &str = "# added by vco";
 ///   - `default = Some(value)` → write `KEY=value` (active)
 ///   - `default = None` → write `# KEY=...` (commented placeholder)
 ///
-/// Mirrors `_env_canonical_template` in install.py. The
-/// `<project>` / `<project_root>` tokens are substituted by the
-/// caller. Keep the two lists in lockstep — the test
+/// The Python canonical-key authority is
+/// `vco_lib.env_template.list_canonical_env_template_keys` (the legacy
+/// install.py `_env_canonical_template` renderer was removed in v0.2.77
+/// 7a-bis as dead code). The `<project>` / `<project_root>` tokens are
+/// substituted by the caller. Keep the two key sets in lockstep — the test
 /// `env_template_canonical_keys_match_python` (added 2026-04-28)
 /// asserts the Python and Rust key sets are identical.
 fn env_canonical_keys() -> Vec<(&'static str, Option<&'static str>)> {
@@ -4033,9 +4035,12 @@ fn render_canonical_default_with_settings(
 
 /// Build the canonical `.env` text used when no `.env` exists.
 ///
-/// Output mirrors `_build_canonical_env_template_text` in install.py
-/// (modulo tiny formatting differences — header date, section order).
-/// What MUST match cross-language: the set of declared KEY names. The
+/// This Rust renderer is now the SOLE canonical `.env` text producer
+/// (the install.py `_build_canonical_env_template_text` renderer was
+/// removed in v0.2.77 7a-bis as dead code; install.py's `.env` handling
+/// goes through `_ensure_env_template` + the vco_lib canonical-key list).
+/// What MUST match cross-language: the set of declared KEY names, against
+/// `vco_lib.env_template.list_canonical_env_template_keys`. The
 /// `env_template_canonical_keys_match_python` test enforces that.
 ///
 /// PR-3 (2026-05-06): when the launcher has resolved non-default ports
@@ -4081,10 +4086,12 @@ fn build_canonical_env_text(settings: &ProjectEnvSettings) -> String {
     s.push_str(&format!("DEVELOPMENT_COLLECTION={}_Development\n", kg_collection_basename));
     s.push_str(&format!("PROJECT_NAME={}\n", project_name));
     // PR-8 cross-PR handoff note (v0.2.11): `CODE_GRAPH_PROJECT` is
-    // intentionally NOT written here — the `.env` template body is
-    // owned by PR-7's `install.py::_env_canonical_template` parity
-    // contract, and adding a key here without the Python side would
-    // break `env_template_canonical_keys_match_python`. The key DOES
+    // intentionally NOT written here — the canonical `.env` key set is
+    // owned by the parity contract against
+    // `vco_lib.env_template.list_canonical_env_template_keys` (v0.2.77
+    // 7a-bis: the old install.py `_env_canonical_template` renderer was
+    // removed as dead code), and adding a key here without the Python side
+    // would break `env_template_canonical_keys_match_python`. The key DOES
     // get written to the canonical JSON env block
     // (`.claude/settings.json::env`) via `CANONICAL_INSTALL_ENV_KEYS`
     // — that is the surface hook subprocesses + Claude Code consume

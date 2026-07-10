@@ -56,7 +56,7 @@ Both `install.py` Step 9 and the launcher's `create_project_v2` Tauri command ca
 - **`.env` exists** → diff against the canonical key list. Any keys not yet present (commented or active) get appended in a marked block tagged `# added by vco YYYY-MM-DD`. The user's existing values are preserved verbatim — never overwritten.
 - **Idempotent** — a second invocation against an up-to-date file is a no-op.
 
-The Python and Rust canonical key lists are kept in lockstep by the cross-language test `env_template_canonical_keys_match_python` (in `commands/projects_v2.rs`). When you add a new key, update both `_env_canonical_template` (install.py) AND `env_canonical_keys` (projects_v2.rs).
+The Python and Rust canonical key lists are kept in lockstep by the cross-language test `env_template_canonical_keys_match_python` (in `commands/projects_v2.rs`). When you add a new key, update both `list_canonical_env_template_keys` (`vco_lib/env_template.py`, the Python authority) AND `env_canonical_keys` (projects_v2.rs).
 
 Canonical keys:
 
