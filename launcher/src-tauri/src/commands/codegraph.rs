@@ -1809,10 +1809,6 @@ fn emit_stale_wrapper_deferral(
         Ok(r) => r,
         Err(_) => return,
     };
-    let py = match stale_wrapper_pick_python() {
-        Some(p) => p,
-        None => return,
-    };
 
     let detected = format!(
         "The project-local code-graph analyzer wrapper at {} is a pre-RT-4 \
@@ -1846,91 +1842,28 @@ fn emit_stale_wrapper_deferral(
         folder = folder_sh
     );
 
-    let repo_py = stale_wrapper_py_quote(&repo_root.to_string_lossy());
-    let folder_py = stale_wrapper_py_quote(&project_folder.to_string_lossy());
-    let detected_py = stale_wrapper_py_quote(&detected);
-    let cmd_py = stale_wrapper_py_quote(&command_to_apply);
-    let script = format!(
-        "import sys\n\
-         sys.path.insert(0, {repo_py})\n\
-         from pathlib import Path\n\
-         from vco_lib.deferral_report import DeferralEntry, DeferralReport\n\
-         folder = Path({folder_py})\n\
-         report = DeferralReport.read(folder)\n\
-         entry = DeferralEntry(\n\
-         \x20\x20\x20\x20condition_id=\"stale_codegraph_wrapper_pending\",\n\
-         \x20\x20\x20\x20title=\"Stale project-local code-graph analyzer wrapper\",\n\
-         \x20\x20\x20\x20detected={detected_py},\n\
-         \x20\x20\x20\x20why_deferred=\"Overwriting a user-touched wrapper \
-without consent could clobber local edits; the orchestrator copy is used \
-meanwhile so nothing is broken. Refresh the one file when convenient.\",\n\
-         \x20\x20\x20\x20command_to_apply={cmd_py},\n\
-         \x20\x20\x20\x20severity=\"info\",\n\
-         )\n\
-         report.add_entry(entry)\n\
-         report.write(folder)\n",
-    );
-    let status = std::process::Command::new(&py)
-        .silent()
-        .arg("-c")
-        .arg(&script)
-        .status();
-    match status {
-        Ok(s) if s.success() => {}
-        Ok(s) => eprintln!(
-            "[codegraph] stale-wrapper deferral helper exited {}",
-            s
-        ),
-        Err(e) => eprintln!(
-            "[codegraph] stale-wrapper deferral helper spawn failed: {}",
-            e
-        ),
+    // v0.2.77 (Part 7c task 4): interpreter resolution + the injection-safe
+    // `-c` snippet + spawn now live in the shared deferral writer. The
+    // deferral lands in the project's folder (`report_folder = project_folder`)
+    // while importing `vco_lib` from the orchestrator clone
+    // (`sys_path_root = repo_root`). Best-effort — a failure must not break
+    // the analyzer fallback that already succeeded.
+    let why_deferred = "Overwriting a user-touched wrapper without consent \
+        could clobber local edits; the orchestrator copy is used meanwhile so \
+        nothing is broken. Refresh the one file when convenient.";
+    let fields = crate::services::deferral::DeferralEntryFields {
+        condition_id: "stale_codegraph_wrapper_pending",
+        title: "Stale project-local code-graph analyzer wrapper",
+        detected: &detected,
+        why_deferred,
+        command_to_apply: &command_to_apply,
+        severity: "info",
+    };
+    if let Err(e) =
+        crate::services::deferral::emit_deferral_entry(&repo_root, project_folder, &fields)
+    {
+        eprintln!("[codegraph] stale-wrapper deferral emit failed: {}", e);
     }
-}
-
-/// First `python3` then `python` from PATH. Mirrors
-/// `chunker_revision_deferral::pick_python` / `storage_ux`'s resolution order
-/// so deferral behaviour is consistent across every Rust-side emitter.
-fn stale_wrapper_pick_python() -> Option<std::path::PathBuf> {
-    for candidate in ["python3", "python"] {
-        #[cfg(windows)]
-        let names = [format!("{candidate}.exe"), candidate.to_string()];
-        #[cfg(not(windows))]
-        let names = [candidate.to_string()];
-        if let Some(paths) = std::env::var_os("PATH") {
-            for dir in std::env::split_paths(&paths) {
-                for name in &names {
-                    let probe = dir.join(name);
-                    if probe.is_file() {
-                        return Some(probe);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Quote `s` as a Python double-quoted string literal. Mirrors
-/// `chunker_revision_deferral::py_quote` byte-for-byte (kept local: that fn
-/// is private and widening its visibility for one caller adds no
-/// architectural value — same documented rationale as the other mirrors).
-fn stale_wrapper_py_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 #[cfg(test)]

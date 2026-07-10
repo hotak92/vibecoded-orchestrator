@@ -4805,8 +4805,6 @@ fn emit_codegraph_rename_deferral(
 ) -> Result<(), String> {
     let repo_root =
         find_local_repo_root().map_err(|e| format!("repo root not found: {}", e))?;
-    let py = pick_python_for_rename_deferral()
-        .ok_or_else(|| "no python on PATH".to_string())?;
 
     let old_prefix_note = match old_prefix {
         Some(p) => format!(
@@ -4863,70 +4861,24 @@ fn emit_codegraph_rename_deferral(
         name_sh
     );
 
-    let repo_py = rename_py_quote(&repo_root.to_string_lossy());
-    let folder_py = rename_py_quote(&project_folder.to_string_lossy());
-    let detected_py = rename_py_quote(&detected);
-    let cmd_py = rename_py_quote(&cmd);
-    let script = format!(
-        "import sys\n\
-         sys.path.insert(0, {repo_py})\n\
-         from pathlib import Path\n\
-         from vco_lib.deferral_report import DeferralEntry, DeferralReport\n\
-         folder = Path({folder_py})\n\
-         report = DeferralReport.read(folder)\n\
-         entry = DeferralEntry(\n\
-         \x20\x20\x20\x20condition_id=\"codegraph_rename_split_pending\",\n\
-         \x20\x20\x20\x20title=\"Code graph needs a rebuild after project rename\",\n\
-         \x20\x20\x20\x20detected={detected_py},\n\
-         \x20\x20\x20\x20why_deferred=\"Re-embedding the whole code graph at \
-rename time would block the launcher for minutes of embedding time. Reads \
-still work against the existing collections; rebuild when convenient.\",\n\
-         \x20\x20\x20\x20command_to_apply={cmd_py},\n\
-         \x20\x20\x20\x20severity=\"info\",\n\
-         )\n\
-         report.add_entry(entry)\n\
-         report.write(folder)\n",
-    );
-    let status = std::process::Command::new(&py)
-        .silent()
-        .arg("-c")
-        .arg(&script)
-        .status();
-    match status {
-        Ok(s) if s.success() => Ok(()),
-        Ok(s) => Err(format!("deferral helper exited {}", s)),
-        Err(e) => Err(format!("deferral helper spawn failed: {}", e)),
-    }
-}
-
-/// Resolve a Python interpreter for the rename-deferral `-c` snippet.
-///
-/// v0.2.77 (Part 7c task 1): delegates to the shared RT-4 ladder in
-/// `vct_launcher_core::python_resolve` (was a PATH-only walk). The ladder
-/// prefers the orchestrator venv — which has `vco_lib` importable — before
-/// PATH, so the deferral emit resolves on PEP-668 machines.
-fn pick_python_for_rename_deferral() -> Option<String> {
-    vct_launcher_core::python_resolve::resolve_python_for_vco_lib_str()
-}
-
-/// Quote `s` as a Python double-quoted string literal. Mirrors
-/// `storage_ux::py_quote` byte-for-byte (injection-safe `-c` embedding).
-fn rename_py_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
+    // v0.2.77 (Part 7c task 4): interpreter resolution + the injection-safe
+    // `-c` snippet + spawn now live in the shared deferral writer. This
+    // deferral lands in the RENAMED project's folder (`report_folder =
+    // project_folder`) while importing `vco_lib` from the orchestrator clone
+    // (`sys_path_root = repo_root`) — the distinct two-path case the shared
+    // writer supports.
+    let why_deferred = "Re-embedding the whole code graph at rename time \
+        would block the launcher for minutes of embedding time. Reads still \
+        work against the existing collections; rebuild when convenient.";
+    let fields = crate::services::deferral::DeferralEntryFields {
+        condition_id: "codegraph_rename_split_pending",
+        title: "Code graph needs a rebuild after project rename",
+        detected: &detected,
+        why_deferred,
+        command_to_apply: &cmd,
+        severity: "info",
+    };
+    crate::services::deferral::emit_deferral_entry(&repo_root, project_folder, &fields)
 }
 
 /// MEDIUM-1 (2026-05-01, refactored): persist the SHARED_KG_WRITE_DISABLED
@@ -9060,7 +9012,8 @@ mod tests {
     // root resolvable; skips content assertions otherwise (the routing is the
     // contract under test).
     fn rename_deferral_python_available() -> bool {
-        pick_python_for_rename_deferral().is_some() && find_local_repo_root().is_ok()
+        vct_launcher_core::python_resolve::resolve_python_for_vco_lib_str().is_some()
+            && find_local_repo_root().is_ok()
     }
 
     #[test]

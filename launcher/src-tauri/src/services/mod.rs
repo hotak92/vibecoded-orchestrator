@@ -28,6 +28,7 @@ pub use vct_launcher_core::services::picker;
 pub use vct_launcher_core::services::runtime;
 
 pub mod adoption;
+pub mod deferral;
 pub mod settings_json_watcher;
 pub mod vco_lib_bridge;
 pub mod watcher;

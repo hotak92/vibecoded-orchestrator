@@ -756,71 +756,31 @@ pub(crate) fn emit_orchestrator_user_modified_deferrals(
         return Ok(());
     }
 
-    let py = match pick_python_for_deferral() {
-        Some(p) => p,
-        None => {
-            eprintln!(
-                "[vct] pre_merge: no python on PATH; skipping deferral emit \
-                 ({} affected file(s) — user must inspect manually)",
-                actionable.len()
-            );
-            return Ok(());
-        }
-    };
-
     let (title, detected, why_deferred, command_to_apply) =
         build_deferral_text(install_path, &actionable, pull_branch);
 
-    let repo_py = py_quote(install_path.to_string_lossy().as_ref());
-    let cid_py = py_quote("orchestrator_user_modified_preserved");
-    let title_py = py_quote(&title);
-    let det_py = py_quote(&detected);
-    let why_py = py_quote(&why_deferred);
-    let cmd_py = py_quote(&command_to_apply);
-    let sev_py = py_quote("info");
-
-    let script = format!(
-        "import sys\n\
-         sys.path.insert(0, {repo_py})\n\
-         from pathlib import Path\n\
-         from vco_lib.deferral_report import DeferralEntry, DeferralReport\n\
-         folder = Path({repo_py})\n\
-         report = DeferralReport.read(folder)\n\
-         entry = DeferralEntry(\n\
-         \x20\x20\x20\x20condition_id={cid_py},\n\
-         \x20\x20\x20\x20title={title_py},\n\
-         \x20\x20\x20\x20detected={det_py},\n\
-         \x20\x20\x20\x20why_deferred={why_py},\n\
-         \x20\x20\x20\x20command_to_apply={cmd_py},\n\
-         \x20\x20\x20\x20severity={sev_py},\n\
-         )\n\
-         report.add_entry(entry)\n\
-         report.write(folder)\n",
-    );
-    let mut cmd = std::process::Command::new(py);
-    cmd.arg("-c").arg(&script);
-    #[cfg(windows)]
+    // v0.2.77 (Part 7c task 4): interpreter resolution + the injection-safe
+    // `-c` snippet + spawn now live in the shared deferral writer. For an
+    // orchestrator-root update, sys.path root == report folder == install_path.
+    // Best-effort: a failure (no python, subprocess non-zero) must NOT mask
+    // the update success — log + continue with Ok(()).
+    let fields = crate::services::deferral::DeferralEntryFields {
+        condition_id: "orchestrator_user_modified_preserved",
+        title: &title,
+        detected: &detected,
+        why_deferred: &why_deferred,
+        command_to_apply: &command_to_apply,
+        severity: "info",
+    };
+    if let Err(e) =
+        crate::services::deferral::emit_deferral_entry(install_path, install_path, &fields)
     {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        eprintln!(
+            "[vct] pre_merge: deferral emit failed: {} — deferral may be missing, continuing",
+            e
+        );
     }
-    match cmd.status() {
-        Ok(s) if s.success() => Ok(()),
-        Ok(s) => {
-            eprintln!(
-                "[vct] pre_merge: deferral helper exited {:?}; deferral may be missing",
-                s.code()
-            );
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!(
-                "[vct] pre_merge: deferral helper spawn failed: {} — continuing",
-                e
-            );
-            Ok(())
-        }
-    }
+    Ok(())
 }
 
 /// Build the four free-form text fields for the deferral entry. Kept
@@ -984,38 +944,12 @@ fn win_quote(s: &str) -> String {
     }
 }
 
-/// Python-double-quoted string literal escaper. Copied from
-/// `storage_ux.rs::py_quote` to keep this module self-contained.
-fn py_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-/// Resolve a python interpreter for the deferral `-c` snippet.
-///
-/// v0.2.77 (Part 7c task 1): delegates to the shared RT-4 ladder in
-/// `vct_launcher_core::python_resolve` (was a PATH-only walk copied from
-/// `storage_ux`). The ladder prefers the orchestrator venv — which has
-/// `vco_lib` importable — before PATH, so the deferral emit resolves on
-/// PEP-668 machines where a bare PATH `python3` cannot import `vco_lib`.
-fn pick_python_for_deferral() -> Option<String> {
-    vct_launcher_core::python_resolve::resolve_python_for_vco_lib_str()
-}
+// v0.2.77 (Part 7c task 4): the per-site `py_quote` and
+// `pick_python_for_deferral` copies were removed. Deferral emission now
+// routes through the shared `crate::services::deferral::emit_deferral_entry`,
+// which owns interpreter resolution + the injection-safe `-c` snippet +
+// the Python-string escaper. `build_deferral_text` (below) still builds the
+// four site-specific free-form fields.
 
 /// v0.2.56 (Defect A fix): stateless probe — would merging the local
 /// HEAD with `vco_upstream/<branch>` produce a conflict-free tree?
@@ -2213,7 +2147,7 @@ mod tests {
         // has no vco_lib stub, so we point at the real repo root). We
         // skip if either is missing — keeping the unit test list
         // green on CI containers that don't ship Python.
-        let py = match pick_python_for_deferral() {
+        let py = match vct_launcher_core::python_resolve::resolve_python_for_vco_lib_str() {
             Some(p) => p,
             None => {
                 eprintln!("skipping: no python on PATH");

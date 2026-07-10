@@ -679,87 +679,24 @@ fn emit_deferral(
         Ok(r) => r,
         Err(_) => return,
     };
-    let py = pick_python();
-    let py = match py {
-        Some(p) => p,
-        None => return,
+    // v0.2.77 (Part 7c task 4): the shared Python-bridge deferral writer
+    // owns interpreter resolution + the injection-safe `-c` snippet +
+    // the spawn. This file just supplies the entry fields. The report
+    // lands in the orchestrator-root folder (sys.path root == report
+    // folder for storage-migration deferrals).
+    let fields = crate::services::deferral::DeferralEntryFields {
+        condition_id,
+        title,
+        detected,
+        why_deferred,
+        command_to_apply,
+        severity,
     };
-    // Inline Python snippet — keeps the routing logic visible in this
-    // file rather than scattering a sibling .py script. The snippet
-    // imports from vco_lib, appends one entry, writes the report.
-    //
-    // We pre-escape every value into Python-double-quoted string literals
-    // on the Rust side so the Python `!r` repr modifier isn't needed
-    // (and so we don't confuse Rust's own `{}` format machinery).
-    let repo_py = py_quote(&repo_root.to_string_lossy());
-    let cid_py = py_quote(condition_id);
-    let title_py = py_quote(title);
-    let det_py = py_quote(detected);
-    let why_py = py_quote(why_deferred);
-    let cmd_py = py_quote(command_to_apply);
-    let sev_py = py_quote(severity);
-    let script = format!(
-        "import sys\n\
-         sys.path.insert(0, {repo_py})\n\
-         from pathlib import Path\n\
-         from vco_lib.deferral_report import DeferralEntry, DeferralReport\n\
-         folder = Path({repo_py})\n\
-         report = DeferralReport.read(folder)\n\
-         entry = DeferralEntry(\n\
-         \x20\x20\x20\x20condition_id={cid_py},\n\
-         \x20\x20\x20\x20title={title_py},\n\
-         \x20\x20\x20\x20detected={det_py},\n\
-         \x20\x20\x20\x20why_deferred={why_py},\n\
-         \x20\x20\x20\x20command_to_apply={cmd_py},\n\
-         \x20\x20\x20\x20severity={sev_py},\n\
-         )\n\
-         report.add_entry(entry)\n\
-         report.write(folder)\n",
-    );
-    let status = std::process::Command::new(py).silent()
-        .arg("-c")
-        .arg(script)
-        .status();
-    match status {
-        Ok(s) if s.success() => {}
-        Ok(s) => eprintln!("[storage_ux] deferral helper exited {}: {}", s, condition_id),
-        Err(e) => eprintln!("[storage_ux] deferral helper spawn failed: {e}"),
+    if let Err(e) =
+        crate::services::deferral::emit_deferral_entry(&repo_root, &repo_root, &fields)
+    {
+        eprintln!("[storage_ux] deferral emit failed ({}): {}", condition_id, e);
     }
-}
-
-/// Quote `s` as a Python double-quoted string literal. Escapes
-/// backslashes, double-quotes, and control characters so the result
-/// is safe to embed in a Python `-c` snippet.
-fn py_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-/// Resolve a Python interpreter for the deferral `-c` snippet.
-///
-/// v0.2.77 (Part 7c task 1): delegates to the shared RT-4 ladder in
-/// `vct_launcher_core::python_resolve` instead of the prior PATH-only walk.
-/// The ladder prefers the orchestrator venv (`$VCT_VENV` / `$VCT_INSTALL_ROOT`
-/// / exe-walk) — which actually has `vco_lib` importable — before falling back
-/// to PATH, so the `import ...vco_lib.deferral_report` snippet resolves on
-/// PEP-668 machines where a bare PATH `python3` can't import it.
-fn pick_python() -> Option<String> {
-    vct_launcher_core::python_resolve::resolve_python_for_vco_lib_str()
 }
 
 // ---------------------------------------------------------------------------

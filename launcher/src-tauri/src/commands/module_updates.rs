@@ -61,7 +61,6 @@
 //! sees an actionable retry suggestion at session start. Best-effort —
 //! a deferral-write failure must NOT mask the underlying update error.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -73,7 +72,10 @@ use crate::commands::module_catalog_client::{
 use crate::commands::modules::update_module_for_project;
 use crate::db::models::ModuleInstallRow;
 use crate::db::Db;
-use vct_launcher_core::process::CommandExt as _;
+// v0.2.77 Part 7c task 4: the partial-failure deferral now routes through
+// the shared `crate::services::deferral` writer, so this file no longer
+// spawns Python directly — `PathBuf` and the `CommandExt` (`.silent()`)
+// import were dropped along with the removed inline emitter helpers.
 
 // ─── Constants ──────────────────────────────────────────────────────────
 
@@ -544,11 +546,6 @@ fn write_partial_failure_deferral(
         Ok(r) => r,
         Err(_) => return,
     };
-    let py = match pick_python() {
-        Some(p) => p,
-        None => return,
-    };
-    let repo_py = py_quote(&repo_root.to_string_lossy());
     let title = format!(
         "Module update failed: {} ({} → {})",
         module_id, previous_version, new_version,
@@ -562,11 +559,6 @@ fn write_partial_failure_deferral(
         "Re-run via the launcher's Modules tab: click Update v{} → v{} on the {} card.",
         previous_version, new_version, module_id,
     );
-    let cid_py = py_quote("module_update_partial_failure");
-    let title_py = py_quote(&title);
-    let det_py = py_quote(&detected);
-    let why_py = py_quote(&why_deferred);
-    let cmd_py = py_quote(&command_to_apply);
     // Severity must be one of the DeferralEntry SEVERITY_ORDER values
     // (critical|warning|info) — a partial module update the user can retry is
     // a "warning". Before v0.2.75 this passed "medium", which is NOT in the
@@ -574,74 +566,26 @@ fn write_partial_failure_deferral(
     // Python always exited non-zero → this deferral was NEVER written (the
     // error was logged + swallowed). MUST MATCH vco_lib/deferral_report.py
     // SEVERITY_ORDER.
-    let sev_py = py_quote("warning");
-    let script = format!(
-        "import sys\n\
-         sys.path.insert(0, {repo_py})\n\
-         from pathlib import Path\n\
-         from vco_lib.deferral_report import DeferralEntry, DeferralReport\n\
-         folder = Path({repo_py})\n\
-         report = DeferralReport.read(folder)\n\
-         entry = DeferralEntry(\n\
-         \x20\x20\x20\x20condition_id={cid_py},\n\
-         \x20\x20\x20\x20title={title_py},\n\
-         \x20\x20\x20\x20detected={det_py},\n\
-         \x20\x20\x20\x20why_deferred={why_py},\n\
-         \x20\x20\x20\x20command_to_apply={cmd_py},\n\
-         \x20\x20\x20\x20severity={sev_py},\n\
-         )\n\
-         report.add_entry(entry)\n\
-         report.write(folder)\n",
-    );
-    let status = std::process::Command::new(py)
-        .silent()
-        .arg("-c")
-        .arg(script)
-        .status();
-    match status {
-        Ok(s) if s.success() => {}
-        Ok(s) => eprintln!(
-            "[module_updates] deferral helper exited {}: module_update_partial_failure({})",
-            s, module_id
-        ),
-        Err(e) => eprintln!("[module_updates] deferral helper spawn failed: {e}"),
+    //
+    // v0.2.77 (Part 7c task 4): interpreter resolution + the injection-safe
+    // `-c` snippet + spawn now live in the shared deferral writer; this fn
+    // just supplies the fields. Report folder == sys.path root == repo root.
+    let fields = crate::services::deferral::DeferralEntryFields {
+        condition_id: "module_update_partial_failure",
+        title: &title,
+        detected: &detected,
+        why_deferred: &why_deferred,
+        command_to_apply: &command_to_apply,
+        severity: "warning",
+    };
+    if let Err(e) =
+        crate::services::deferral::emit_deferral_entry(&repo_root, &repo_root, &fields)
+    {
+        eprintln!(
+            "[module_updates] deferral emit failed (module_update_partial_failure {}): {}",
+            module_id, e
+        );
     }
-}
-
-/// Resolve a Python interpreter for the partial-failure deferral `-c` snippet.
-///
-/// v0.2.77 (Part 7c task 1): delegates to the shared RT-4 ladder in
-/// `vct_launcher_core::python_resolve`. Previously a PATH-only `--version`
-/// probe returning a bare `python3`/`python` name; the ladder prefers the
-/// orchestrator venv (which has `vco_lib` importable) before PATH, keeping
-/// deferral resolution consistent across writers (one home).
-fn pick_python() -> Option<PathBuf> {
-    vct_launcher_core::python_resolve::resolve_python_for_vco_lib()
-}
-
-/// Quote `s` as a Python double-quoted string literal. Mirrors
-/// `storage_ux::py_quote` byte-for-byte. Kept local rather than
-/// `pub use`-ing across modules because the storage_ux fn is private
-/// and re-using it would require widening its visibility for no
-/// architectural reason.
-fn py_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────
@@ -979,22 +923,11 @@ mod tests {
         );
     }
 
-    // ─── py_quote (used by deferral writer) ────────────────────────
-
-    #[test]
-    fn py_quote_escapes_quotes_and_backslashes() {
-        assert_eq!(py_quote("hello"), "\"hello\"");
-        assert_eq!(py_quote("with \"quote\""), "\"with \\\"quote\\\"\"");
-        assert_eq!(py_quote("back\\slash"), "\"back\\\\slash\"");
-        assert_eq!(py_quote("line\nbreak"), "\"line\\nbreak\"");
-    }
-
-    #[test]
-    fn py_quote_escapes_control_chars() {
-        // \x01 = control char < 0x20
-        let got = py_quote("\x01");
-        assert_eq!(got, "\"\\u0001\"");
-    }
+    // ─── py_quote tests moved to services::deferral (v0.2.77 Part 7c
+    //     task 4): the per-site py_quote copy was removed in favour of the
+    //     shared `crate::services::deferral::py_quote`, whose own unit
+    //     tests (py_quote_escapes_injection_chars +
+    //     py_quote_neutralises_breakout_attempt) cover the same contract. ─
 
     // ─── ProjectHost helper to silence unused-import warning in some
     //     test scaffolds — explicit reference so cargo doesn't flag it. ─
