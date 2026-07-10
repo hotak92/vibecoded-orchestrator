@@ -3123,7 +3123,7 @@ fn apply_project_env_via_python(
     // discoverable on disk), we OMIT the flag entirely. This
     // preserves the pre-fix behaviour for forks running outside a
     // clone — no regression for those legitimate cases.
-    let orch_root = crate::commands::installer::resolve_orchestrator_root(db);
+    let orch_root = crate::services::vco_lib_bridge::resolve_orchestrator_root(db);
     for a in build_config_projection_apply_args(project_id, orch_root.as_deref()) {
         cmd.arg(a);
     }
@@ -3132,58 +3132,14 @@ fn apply_project_env_via_python(
     // needs. This prevents per-launcher quirks (e.g. an inherited
     // KG_COLLECTION from the launcher's own .claude/env) from leaking
     // into the subprocess and disrupting the resolver.
-    cmd.env_clear();
-    if let Ok(path) = std::env::var("PATH") {
-        cmd.env("PATH", path);
-    }
-    // Launcher DB location override (canonical when set; the resolver
-    // falls back to ~/.vct/launcher.db).
-    if let Ok(state_dir) = std::env::var("VCT_STATE_DIR") {
-        cmd.env("VCT_STATE_DIR", state_dir);
-    }
-    // Hub-aware resolver hints — the CLI doesn't use them today, but
-    // future contract revisions may resolve secrets via vct-hub.
-    if let Ok(hub_port) = std::env::var("VCT_HUB_PORT") {
-        cmd.env("VCT_HUB_PORT", hub_port);
-    }
-    if let Ok(hub_token) = std::env::var("VCT_HUB_TOKEN") {
-        cmd.env("VCT_HUB_TOKEN", hub_token);
-    }
-    // VCT_INSTALL_ROOT — also needed so `python -m vco_lib...` resolves
-    // `vco_lib` as an implicit-namespace package from the orchestrator
-    // clone (vco_lib is NOT pip-installed). See embedding_catalog.rs
-    // for the same plumbing rationale.
-    if let Ok(install_root) = std::env::var("VCT_INSTALL_ROOT") {
-        cmd.env("VCT_INSTALL_ROOT", install_root);
-    }
-    // Windows + macOS: keep TEMP/TMP so the atomic-write tempfile lands
-    // in a writable location.
-    if let Ok(v) = std::env::var("TEMP") {
-        cmd.env("TEMP", v);
-    }
-    if let Ok(v) = std::env::var("TMP") {
-        cmd.env("TMP", v);
-    }
-    if let Ok(v) = std::env::var("TMPDIR") {
-        cmd.env("TMPDIR", v);
-    }
-    // Windows-only — USERPROFILE / APPDATA / LOCALAPPDATA so the
-    // ~/.vct/launcher.db fallback resolves correctly.
-    #[cfg(target_os = "windows")]
-    {
-        for k in ["USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH"] {
-            if let Ok(v) = std::env::var(k) {
-                cmd.env(k, v);
-            }
-        }
-    }
-    // POSIX — HOME so `~/.vct/launcher.db` resolves.
-    #[cfg(not(target_os = "windows"))]
-    {
-        if let Ok(v) = std::env::var("HOME") {
-            cmd.env("HOME", v);
-        }
-    }
+    //
+    // v0.2.77 Part 7c task 2: the env_clear + allowlist re-injection kernel
+    // (the drift-prone part) now lives in the shared
+    // `services::vco_lib_bridge::reinject_minimal_env` — one home so future
+    // `-m vco_lib.<module>` spawns can't fork a divergent allowlist. The
+    // key set (PATH, VCT_STATE_DIR, VCT_HUB_PORT, VCT_HUB_TOKEN,
+    // VCT_INSTALL_ROOT, TEMP/TMP/TMPDIR, home-dir keys) is unchanged.
+    crate::services::vco_lib_bridge::reinject_minimal_env(&mut cmd);
 
     cmd.current_dir(folder);
 

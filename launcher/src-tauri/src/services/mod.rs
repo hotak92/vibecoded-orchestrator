@@ -29,6 +29,7 @@ pub use vct_launcher_core::services::runtime;
 
 pub mod adoption;
 pub mod settings_json_watcher;
+pub mod vco_lib_bridge;
 pub mod watcher;
 
 use tauri::{AppHandle, Runtime};
