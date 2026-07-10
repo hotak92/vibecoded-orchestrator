@@ -3690,6 +3690,15 @@ class CodeGraphAnalyzer:
         # process must never leak into this run's stats.
         self._prune_failures = 0
 
+        # v0.2.76 (CG-4 sweep-guarantee): reset the lazily-built stale-file-set
+        # cache per run so (a) a prior analyze_repository call in the same
+        # process cannot leak its set into this run and (b) the end-of-walk
+        # force-trigger below builds exactly once for THIS walk. The cache guard
+        # in `_get_stale_file_set` keys on the attribute's presence, so clearing
+        # it here re-arms the lazy build.
+        if hasattr(self, "_stale_file_set_cache"):
+            del self._stale_file_set_cache
+
         # Enable visited-UUID tracking when caller wants prune-stale.
         # See _dedup_insert + _create_or_update_module — both record
         # to self.visited_uuids when self._track_visited is True.
@@ -3980,6 +3989,24 @@ class CodeGraphAnalyzer:
         # standalone insert (cross-reference creation in the post-loop)
         # doesn't accidentally re-stamp the last extra's path.
         self._current_source = ""
+
+        # v0.2.76 (CG-4 sweep-guarantee — respawn-loop edge): the deleted-primary
+        # sweep lives inside `_build_stale_file_set`, which only runs when the
+        # LAZY per-file trigger (`_get_existing_module` → `_get_stale_file_set`)
+        # fires — i.e. when ≥1 analyzable file dispatches. A whole-repo walk that
+        # dispatches ZERO analyzable files (e.g. every analyzable file was just
+        # deleted from disk) would then NEVER run the sweep: the orphan rows
+        # survive, the resync owed-gate keeps counting cleanup-owed>0, and every
+        # subsequent `--update` re-spawns a whole-repo resync forever. Close it
+        # by force-triggering the stale-set build once at the END of a whole-repo
+        # walk. `_get_stale_file_set` caches on `_stale_file_set_cache` presence
+        # (reset per run above), so this is a no-op when the lazy path already
+        # ran it — the sweep runs EXACTLY ONCE per whole-repo walk. Not done for
+        # single-file / --only-files-from walks: those must not sweep the whole
+        # collection (the sweep is itself gated on `_analyze_whole_repo`, but we
+        # also avoid paying the full stale-scan cost on narrow/incremental walks).
+        if getattr(self, "_analyze_whole_repo", False):
+            self._get_stale_file_set()
 
         # v0.2.16 (1.4 / addendum H): --prune-stale pass.
         # Walk every per-project code-graph collection and delete any

@@ -489,6 +489,123 @@ def test_orphan_clear_delete_failure_soft_fails(analyzer_mod, tmp_path):
     assert result is not None
 
 
+# ─────────── CG-4 sweep-guarantee: whole-repo walk sweeps even at zero dispatch ───────────
+
+
+class _WholeRepoStub:
+    """Binds the whole-repo sweep-guarantee plumbing: the lazily-cached stale
+    set + its builder (which runs the P2a sweep when `_analyze_whole_repo` is
+    True) + the sweep method itself. Sets `_analyze_whole_repo=True` so the
+    residual-orphan (current-revision, deleted-on-disk) sweep runs."""
+
+    def __init__(self, analyzer_mod, modules, classes, functions, repo_root):
+        self.modules_collection = modules
+        self.classes_collection = classes
+        self.functions_collection = functions
+        self._analyze_repo_root = repo_root
+        self._analyze_repo_root_raw = repo_root.as_posix()
+        self._analyze_whole_repo = True
+        _bind(
+            analyzer_mod, self,
+            (
+                "_build_stale_file_set", "_get_stale_file_set",
+                "_count_stale_rows_in_collection", "_get_existing_module",
+                "_clear_deleted_primary_rows",
+            ),
+        )
+
+
+def test_cg4_zero_dispatch_whole_repo_walk_still_sweeps(analyzer_mod, tmp_path):
+    """CG-4 respawn-loop edge (ACT): a whole-repo walk that dispatches ZERO
+    analyzable files (every analyzable file deleted from disk) must STILL sweep
+    the residual current-revision orphans — otherwise the resync owed-gate keeps
+    counting cleanup-owed>0 and re-spawns forever.
+
+    The rows here are CURRENT-revision (not stale) primary rows whose files are
+    gone from disk — exactly the class the stale-only D1 scan misses and the P2a
+    whole-repo sweep targets. `agg_count=0` proves the stale-scan sees nothing
+    (zero-dispatch analogue); the end-of-walk force-trigger `_get_stale_file_set`
+    still runs `_build_stale_file_set`, whose whole-repo sweep purges them."""
+    rev = analyzer_mod.CODEGRAPH_EMBED_REVISION
+    root = _make_repo(tmp_path, [])  # nothing on disk → every stored row orphaned
+    rows = [
+        _Obj("gone1", {
+            "file_path": "pkg/a.py", "embed_revision": rev, "project_source": "",
+        }),
+        _Obj("gone2", {
+            "file_path": "pkg/b.py", "embed_revision": rev,
+            "project_source": root.as_posix(),
+        }),
+    ]
+    functions = _FakeColl(
+        "P_CodeFunction", rows,
+        ("file_path", "embed_revision", "project_source"), agg_count=0,
+    )
+    modules = _FakeColl(
+        "P_CodeModule", [], ("path", "embed_revision", "project_source"), agg_count=0
+    )
+    classes = _FakeColl(
+        "P_CodeClass", [], ("file_path", "embed_revision", "project_source"), agg_count=0
+    )
+    stub = _WholeRepoStub(analyzer_mod, modules, classes, functions, root)
+
+    # The end-of-walk force-trigger (what analyze_repository now calls even when
+    # zero files dispatched). Idempotent via the `_stale_file_set_cache` guard.
+    stub._get_stale_file_set()
+
+    assert set(functions.data.deleted) == {"gone1", "gone2"}, (
+        "whole-repo sweep must purge current-revision orphans even at zero "
+        f"dispatch (deleted={functions.data.deleted})"
+    )
+
+
+def test_cg4_force_trigger_is_idempotent_single_sweep(analyzer_mod, tmp_path):
+    """CG-4 LEAVE-ALONE / single-invocation: the end-of-walk force-trigger must
+    run the sweep EXACTLY ONCE per whole-repo walk — the lazy per-file path and
+    the end-of-walk force-trigger share the `_stale_file_set_cache` guard, so a
+    second call is a no-op. Assert via a per-collection sweep counter."""
+    root = _make_repo(tmp_path, ["pkg/live.py"])
+    live_row = _Obj(
+        "live",
+        {"file_path": "pkg/live.py", "embed_revision":
+            analyzer_mod.CODEGRAPH_EMBED_REVISION, "project_source": ""},
+    )
+    functions = _FakeColl(
+        "P_CodeFunction", [live_row],
+        ("file_path", "embed_revision", "project_source"), agg_count=0,
+    )
+    modules = _FakeColl(
+        "P_CodeModule", [], ("path", "embed_revision", "project_source"), agg_count=0
+    )
+    classes = _FakeColl(
+        "P_CodeClass", [], ("file_path", "embed_revision", "project_source"), agg_count=0
+    )
+    stub = _WholeRepoStub(analyzer_mod, modules, classes, functions, root)
+
+    # Count how many times the real sweep method is entered.
+    real_sweep = stub._clear_deleted_primary_rows
+    sweep_calls = {"n": 0}
+
+    def _counting_sweep(*a, **k):
+        sweep_calls["n"] += 1
+        return real_sweep(*a, **k)
+
+    stub._clear_deleted_primary_rows = _counting_sweep
+
+    # Simulate the lazy per-file path having already built the set, THEN the
+    # end-of-walk force-trigger firing: the second call must NOT re-sweep.
+    stub._get_stale_file_set()  # builds once (lazy analogue)
+    first = sweep_calls["n"]
+    stub._get_stale_file_set()  # end-of-walk force-trigger — cached, no re-sweep
+    second = sweep_calls["n"]
+
+    # Exactly one sweep per collection on the first build; zero on the second.
+    assert first == 3, f"one sweep per file-anchored collection, got {first}"
+    assert second == first, "force-trigger must be a no-op (cached), not re-sweep"
+    # A live, on-disk, current-revision row is NEVER purged.
+    assert functions.data.deleted == [], "live file must survive the sweep"
+
+
 # ─────────────────── _delete_file_rows_exact (shared helper) ───────────────────
 
 
