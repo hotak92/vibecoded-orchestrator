@@ -1521,12 +1521,61 @@ impl Db {
         project_name: &str,
     ) -> Result<usize, String> {
         let pascal = sanitize_kg_collection_local(project_name);
-        let primary_collection = format!("{}_KnowledgeGraph", pascal);
         let dev_collection = format!("{}_Development", pascal);
         // Resolve the canonical shared KG name from `app_state` (Phase 1
         // item #3 single-source-of-truth). White-label installers override
         // this at install time via `set_orchestrator_root_kg_collection`.
         let shared_collection = self.get_orchestrator_root_kg_collection()?;
+
+        // v0.2.77 Part 2 (5b) — orchestrator-root own-primary root-cause fix.
+        //
+        // For every OTHER project, the own-primary KG collection is
+        // `sanitize(project_name)_KnowledgeGraph`. But for the
+        // ORCHESTRATOR-ROOT project the display name is
+        // `ORCHESTRATOR_ROOT_NAME` ("VibeCoded Orchestrator") →
+        // sanitized "VibeCodedOrchestrator" → literally
+        // "VibeCodedOrchestrator_KnowledgeGraph" — which is the dead
+        // default name (`DEFAULT_ORCHESTRATOR_ROOT_KG_COLLECTION`).
+        //
+        // Since the 2026-07 consolidation the orchestrator root's OWN KG
+        // collection and the machine's SHARED collection are the SAME
+        // class — the canonical pointer resolved above. When an install
+        // has re-pointed the canonical collection away from the bundled
+        // default (e.g. a migrated install whose shared class is
+        // `VCODev_KnowledgeGraph`), the literal-derived own-primary name
+        // is a DEAD row: it names a Weaviate class that no longer exists.
+        // Populate runs on every launcher boot / update-all
+        // (`ensure_orchestrator_root_state_populated` →
+        // `populate_project_state_from_filesystem` →
+        // `populate_kg_collection_access`), so the dead row is re-seeded
+        // (via `kg_seed_access`, INSERT OR IGNORE) after any heal wiped it.
+        //
+        // Fix: when the target project IS the orchestrator root, derive
+        // the own-primary collection from the canonical pointer
+        // (`get_orchestrator_root_kg_collection`) — the same source the
+        // shared row already uses — so the own-primary and shared rows
+        // AGREE on the live collection name. The `host` field on the
+        // `projects` row is the sturdiest signal for "this is the root"
+        // (same signal `is_orchestrator_root_structural_row` uses).
+        //
+        // No regression on default installs: the canonical pointer's
+        // DEFAULT value IS "VibeCodedOrchestrator_KnowledgeGraph", so for
+        // a fresh default root install the pointer-derived name is
+        // byte-identical to the old literal-derived name.
+        //
+        // Soft-fail on the host lookup: if `get_project` errors or the
+        // row is missing, fall back to the literal-derived name (the
+        // pre-fix behavior) rather than aborting the whole populate — a
+        // conservative default on a best-effort boot path.
+        let is_root = matches!(
+            self.get_project(project_id),
+            Ok(Some(ref row)) if row.host == crate::db::models::ProjectHost::OrchestratorRoot
+        );
+        let primary_collection = if is_root {
+            shared_collection.clone()
+        } else {
+            format!("{}_KnowledgeGraph", pascal)
+        };
 
         // v0.2.49 access-matrix Step F SB2 fix (L2-SB1): match the
         // semantic that `resolve_default_access_level` returns ONCE
@@ -4480,6 +4529,116 @@ mod populate_access_for_project_tests {
             by_collection.get("VibeCodedOrchestrator_KnowledgeGraph"),
             None
         );
+    }
+
+    /// v0.2.77 Part 2 (5b) — orchestrator-root own-primary root-cause fix.
+    ///
+    /// Seed a project whose `host` is `orchestrator_root` under a
+    /// re-pointed canonical collection (a migrated install whose shared
+    /// class is `VCODev_KnowledgeGraph`). The root's own-primary row must
+    /// now be POINTER-DERIVED (the live canonical name), NOT the literal
+    /// `sanitize(project_name)_KnowledgeGraph` (which would be the dead
+    /// default name). The own-primary and shared rows collapse to ONE row
+    /// at the canonical name (they are the same class since consolidation).
+    fn seed_root_project(db: &Db, project_id: &str, name: &str) {
+        let now = 1_700_000_000_000_i64;
+        let folder = format!("/tmp/test-populate-access/{}", project_id);
+        let guard = db.lock();
+        guard
+            .execute(
+                "INSERT OR IGNORE INTO projects \
+                 (id, name, folder_path, host, slug, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, 'orchestrator_root', ?1, ?4, ?4)",
+                rusqlite::params![project_id, name, folder, now],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn populate_root_own_primary_is_pointer_derived_under_repointed_canonical() {
+        // ACT: re-pointed canonical (migrated install) — root's own-
+        // primary must name the LIVE canonical class, not the dead literal.
+        let db = Db::open_in_memory().unwrap();
+        seed_root_project(&db, "root", "VibeCoded Orchestrator");
+        db.set_orchestrator_root_kg_collection("VCODev_KnowledgeGraph")
+            .unwrap();
+
+        db.populate_kg_collection_access_for_project("root", "VibeCoded Orchestrator")
+            .unwrap();
+
+        let access = db.kg_list_access("root").unwrap();
+        let by_collection: std::collections::HashMap<&str, &str> = access
+            .iter()
+            .map(|(c, l)| (c.as_str(), l.as_str()))
+            .collect();
+        // Own-primary + shared collapse onto the ONE canonical class,
+        // at write level.
+        assert_eq!(
+            by_collection.get("VCODev_KnowledgeGraph"),
+            Some(&"write"),
+            "root own-primary must be pointer-derived (live canonical name)"
+        );
+        // The dead literal name is NEVER seeded for the root.
+        assert_eq!(
+            by_collection.get("VibeCodedOrchestrator_KnowledgeGraph"),
+            None,
+            "root own-primary must NOT be the dead literal-derived name"
+        );
+        // Dev collection is still literal-derived from the project name.
+        assert_eq!(
+            by_collection.get("VibeCodedOrchestrator_Development"),
+            Some(&"write")
+        );
+    }
+
+    #[test]
+    fn populate_root_own_primary_unchanged_on_default_pointer_install() {
+        // LEAVE-ALONE / no-regression: on a fresh DEFAULT install the
+        // canonical pointer's default value IS
+        // "VibeCodedOrchestrator_KnowledgeGraph", so the pointer-derived
+        // root own-primary is byte-identical to the old literal-derived
+        // name — nothing changes for default installs.
+        let db = Db::open_in_memory().unwrap();
+        seed_root_project(&db, "root", "VibeCoded Orchestrator");
+        // No set_orchestrator_root_kg_collection call → default pointer.
+
+        db.populate_kg_collection_access_for_project("root", "VibeCoded Orchestrator")
+            .unwrap();
+
+        let access = db.kg_list_access("root").unwrap();
+        let by_collection: std::collections::HashMap<&str, &str> = access
+            .iter()
+            .map(|(c, l)| (c.as_str(), l.as_str()))
+            .collect();
+        assert_eq!(
+            by_collection.get("VibeCodedOrchestrator_KnowledgeGraph"),
+            Some(&"write"),
+            "default-install root own-primary matches the pre-fix literal name"
+        );
+    }
+
+    #[test]
+    fn populate_non_root_own_primary_still_literal_derived() {
+        // Guard: the root-branch must NOT affect regular (base-host)
+        // projects — their own-primary stays literal-derived from the
+        // sanitized project name, even when the canonical pointer differs.
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1"); // host = 'base'
+        db.set_orchestrator_root_kg_collection("VCODev_KnowledgeGraph")
+            .unwrap();
+
+        db.populate_kg_collection_access_for_project("p1", "Acme")
+            .unwrap();
+
+        let access = db.kg_list_access("p1").unwrap();
+        let by_collection: std::collections::HashMap<&str, &str> = access
+            .iter()
+            .map(|(c, l)| (c.as_str(), l.as_str()))
+            .collect();
+        // Base project own-primary is literal-derived.
+        assert_eq!(by_collection.get("Acme_KnowledgeGraph"), Some(&"write"));
+        // …and the shared row is the (re-pointed) canonical name.
+        assert_eq!(by_collection.get("VCODev_KnowledgeGraph"), Some(&"write"));
     }
 
     /// Item #10 integration test target: hub-side `vct project create`

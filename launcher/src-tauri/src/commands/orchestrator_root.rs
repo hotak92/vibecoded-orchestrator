@@ -364,10 +364,32 @@ fn ensure_orchestrator_root_state_populated(
 /// only means the shared KG falls back to `LAST_RESORT_SHARED_KG_COLLECTION`
 /// const for now.
 fn ensure_orchestrator_root_kg_binding(db: &Db, root_id: &str) {
-    let collection_name = format!(
-        "{}_KnowledgeGraph",
-        sanitize_kg_collection(ORCHESTRATOR_ROOT_NAME)
-    );
+    // v0.2.77 Part 2 (5b) — derive the root's primary binding name from
+    // the canonical shared-KG pointer, NOT from
+    // `sanitize(ORCHESTRATOR_ROOT_NAME)`. Since the 2026-07 consolidation
+    // the orchestrator root's own KG collection and the machine's shared
+    // collection are the SAME class (the canonical pointer). Deriving the
+    // binding from `sanitize(ORCHESTRATOR_ROOT_NAME)` mints the literal
+    // "VibeCodedOrchestrator_KnowledgeGraph" — which is a DEAD name on any
+    // install whose canonical pointer was re-pointed (e.g. a migrated
+    // install whose shared class is `VCODev_KnowledgeGraph`). That left
+    // the primary BINDING and the own-primary ACCESS row disagreeing (the
+    // access row is pointer-derived as of this cycle) and re-minted the
+    // dead binding on every boot.
+    //
+    // Pointer-derived keeps binding + access row in lock-step on the live
+    // collection name. No regression on default installs: the pointer's
+    // DEFAULT is exactly "VibeCodedOrchestrator_KnowledgeGraph", so the
+    // derived name is byte-identical to the old literal there.
+    //
+    // Soft-fail: if the pointer read errors, fall back to the literal
+    // (pre-fix behavior) rather than skipping the binding seed entirely —
+    // a conservative default on a best-effort boot path.
+    let collection_name = db
+        .get_orchestrator_root_kg_collection()
+        .unwrap_or_else(|_| {
+            format!("{}_KnowledgeGraph", sanitize_kg_collection(ORCHESTRATOR_ROOT_NAME))
+        });
 
     // v0.2.28 seed-guard: refuse to clobber a binding the user (or a
     // prior migration) put in place. We only write when:
