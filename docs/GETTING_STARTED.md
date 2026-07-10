@@ -337,7 +337,7 @@ Run `code-graph-analyze` to index a codebase:
 .claude/scripts/code-graph-analyze ~/dev/my-api --project "MyAPI"
 ```
 
-This extracts `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, and `CodeInteraction` entities using Tree-sitter and stores them in Weaviate. Claude can then answer structural questions without reading every file:
+This extracts `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, and `CodeInteraction` entities (per-language structural analysis) and stores them in Weaviate. Function call edges are extracted with Python's `ast`; installing the optional `codegraph-ts` extra (`pip install '.[codegraph-ts]'`) adds tree-sitter grammars so call edges also cover rust, go, javascript/typescript, java, c#, c/c++, ruby, lua, and bash — without it those languages just get no call edges. Claude can then answer structural questions without reading every file:
 
 ```bash
 .claude/scripts/code-graph-query search "auth middleware"

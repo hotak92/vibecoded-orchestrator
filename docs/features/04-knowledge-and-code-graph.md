@@ -119,6 +119,8 @@ One object per class/struct. Properties: `name`, `full_name`, `class_body`, `met
 ### `CodeFunction` collection
 One object per function/method. Properties: `name`, `full_name`, `function_body`, `signature`, `calls` (text array, resolved to other `full_name`s), `type_uses` (text array).
 
+The `calls` edge is built by the cross-reference post-pass (`create_cross_references`), which re-parses each stored body via the one facade `vco_lib/codegraph_calls.py::extract_call_names(language, body)`. Python uses the built-in `ast` (dependency-free, always on); every other language uses a per-grammar tree-sitter query when the optional `codegraph-ts` extra is installed (`pip install '.[codegraph-ts]'`, or at install with `VCT_SKIP_CODEGRAPH_TS=1` to opt out). Grammars ship for rust, go, javascript, typescript, java, c#, c/c++, ruby, lua, and bash; `proto`/`powershell` are excluded, and `svelte` routes its `<script>` content through the js grammar. Without the extra, non-Python rows simply get no `calls` edges (the facade returns `None` and the row is skipped, exactly as before). `type_uses` stays Python-only this release.
+
 ### `CodeAPI` collection
 One object per inbound API endpoint. Properties: `endpoint`, `method` (HTTP verb), `api_description`, `handler` (function full_name). Populated for Flask, FastAPI, Express, ASP.NET (HTTP attribute annotations), gRPC service RPC methods, and Fastify routes.
 
