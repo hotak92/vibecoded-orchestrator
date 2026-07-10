@@ -1,14 +1,18 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""Rust extractor for the code-graph analyzer (P2f stage 2, v0.2.76).
+"""Rust extractor for the code-graph analyzer.
 
-Moved VERBATIM from ``templates/scripts/analyze_code_graph.py``:
-``_rust_methods_for_struct`` (V52-O.11.F per-impl method attribution),
-``_is_rust_test_fn`` (V52-O.11.J ``#[cfg(test)]`` gate), and
-``CodeGraphAnalyzer._analyze_rust_file`` (only body edits: the mechanical
-``self.`` -> ``ctx.`` rename and the analyzer-resident ``embed_class`` /
-``embed_function`` seams reached via ``ctx.``). Behavior is pinned
-byte-identically by ``tests/test_codegraph_golden.py``.
+P2f stage 3 (v0.2.77 Part 6): converted to a PURE PRODUCER.
+``extract_rust_file(source_text, file_path, repo_root, helpers) ->
+FileExtraction`` reads source and RETURNS what to write — it mutates NO analyzer
+state. The thin ``analyze_rust_file(ctx, file_path, repo_root)`` shim keeps the
+unchanged-skip gate analyzer-side (short-circuit preserved), then drives
+``extract`` -> ``ctx.write_file_extraction`` -> stats dict. The dispatch table
+and ``EXTRACTORS`` entry are unchanged; behaviour is pinned byte-identically by
+``tests/test_codegraph_golden.py``.
+
+``_rust_methods_for_struct`` (V52-O.11.F per-impl method attribution) and
+``_is_rust_test_fn`` (V52-O.11.J ``#[cfg(test)]`` gate) are unchanged.
 """
 from __future__ import annotations
 
@@ -18,7 +22,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
-from vco_lib.codegraph_entities import CodeEntity, KIND_CLASS, KIND_FUNCTION
+from vco_lib.codegraph_entities import (
+    CodeEntity,
+    FileExtraction,
+    InteractionGroup,
+    KIND_CLASS,
+    KIND_FUNCTION,
+    ModuleDescriptor,
+)
 from vco_lib.codegraph_lang._shared import (
     _extract_balanced_block,
     _extract_external_calls,
@@ -233,30 +244,27 @@ def _is_rust_test_fn(content: str, fn_offset: int) -> bool:
     return False
 
 
-def analyze_rust_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, int]:
-    """Analyze a Rust file using regex-based parsing."""
-    stats = {'modules': 0, 'classes': 0, 'functions': 0}
+def extract_rust_file(
+    source_text: str,
+    file_path: Path,
+    repo_root: Path,
+    helpers: Any,
+) -> FileExtraction:
+    """Pure producer: parse a Rust file and RETURN a :class:`FileExtraction`.
 
-    content = file_path.read_text(encoding='utf-8', errors='ignore')
-    # CG-5 (v0.2.75 P3d): skip machine-minified content at walk time (skip +
-    # log; NEVER delete existing rows — the orphan-clear owns deletion). One
-    # home: _is_minified_content. A genuine long-line first-party file simply
-    # isn't re-indexed this run.
-    if _is_minified_content(content):
-        try:
-            _rel_min = file_path.relative_to(repo_root).as_posix()
-        except Exception:  # noqa: BLE001
-            _rel_min = str(file_path)
-        print(f"⏭️  Skipping {_rel_min} (looks minified/generated)")
-        return {'modules': 0, 'classes': 0, 'functions': 0}
+    Mutates no analyzer state. ``helpers`` is the narrow
+    :class:`vco_lib.codegraph_lang._shared.ExtractorHelpers` protocol — the
+    embedding seams (``embed_class`` / ``embed_function``) the deferred-embed
+    closures fire lazily, and ``project_name``. The module reference is NOT
+    baked into the entities here (the writer stamps it after minting the module
+    UUID). Regex/detection logic is byte-identical to the pre-Part-6 imperative
+    extractor; the golden suite pins the stored output.
+    """
+    content = source_text
     source_lines = content.split('\n')
     loc = len([l for l in source_lines if l.strip() and not l.strip().startswith('//')])
     file_hash = hashlib.sha256(content.encode()).hexdigest()
     relative_path = file_path.relative_to(repo_root).as_posix()
-
-    if ctx._get_existing_module(relative_path, file_hash):
-        print(f"⏭️  Skipping {relative_path} (unchanged)")
-        return stats
 
     content_clean = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
     content_clean = re.sub(r'/\*.*?\*/', ' ', content_clean, flags=re.DOTALL)
@@ -310,12 +318,14 @@ def analyze_rust_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, i
     complexity = float(1 + sum(content_clean.count(kw)
                                for kw in ['if ', 'while ', 'for ', 'match ', 'loop {']))
 
-    module_uuid = ctx._create_or_update_module(
+    module = ModuleDescriptor(
         path=relative_path, language="Rust", loc=loc, complexity=complexity,
         last_modified=datetime.fromtimestamp(file_path.stat().st_mtime, tz=timezone.utc),
         file_hash=file_hash, imports=imports, module_summary=module_summary,
     )
-    stats['modules'] = 1
+
+    entities: List[CodeEntity] = []
+    stats: Dict[str, int] = {'modules': 1, 'classes': 0, 'functions': 0}
 
     for sname, start_line in struct_info.items():
         _class_end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 40)
@@ -331,15 +341,20 @@ def analyze_rust_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, i
         # attributions, drowning real signal in noise for the
         # `query_code_structure(methods, StructName)` MCP path.
         methods = _rust_methods_for_struct(content_clean, sname, source_lines)
-        ctx.store_entity(CodeEntity(
+        # Bind the loop-varying values so each closure captures ITS OWN
+        # signature/body (a bare `lambda` would close over the loop variable
+        # and every deferred embed would fire with the LAST struct's text).
+        entities.append(CodeEntity(
             kind=KIND_CLASS, file_path_rel=relative_path,
             name=sname, full_name=f"{file_path.stem}.{sname}",
             body=class_body, signature=signature, doc="",
             start_line=start_line, end_line=start_line + len(class_lines),
-            project=ctx.project_name,
+            project=helpers.project_name,
             extras={"methods": methods[:20]},
-            references={"module": module_uuid},
-            deferred_embed=lambda: ctx.embed_class(signature, class_body, language="rust"),
+            deferred_embed=(
+                lambda sig=signature, cb=class_body:
+                helpers.embed_class(sig, cb, language="rust")
+            ),
         ))
         stats['classes'] += 1
 
@@ -358,20 +373,66 @@ def analyze_rust_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, i
         body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
         full_name = f"{file_path.stem}.{fname}"
         signature = f"fn {fname}({args_str})"
-        ctx.store_entity(CodeEntity(
+        entities.append(CodeEntity(
             kind=KIND_FUNCTION, file_path_rel=relative_path,
             name=fname, full_name=full_name,
             body=body, signature=signature, doc="",
             start_line=start_line, end_line=end_line,
-            is_async=is_async, project=ctx.project_name,
-            references={"module": module_uuid},
-            deferred_embed=lambda: ctx.embed_function(signature, body, language="rust"),
+            is_async=is_async, project=helpers.project_name,
+            deferred_embed=(
+                lambda sig=signature, fb=body:
+                helpers.embed_function(sig, fb, language="rust")
+            ),
         ))
         stats['functions'] += 1
 
-    # Cross-language interactions
+    # Cross-language interactions (writer replays with the module UUID).
+    interactions: List[InteractionGroup] = []
     ix = _extract_external_calls(content_clean, imports, "Rust", relative_path)
     if ix:
-        stats['interactions'] = ctx._store_interactions(ix, "Rust", module_uuid, file_path_rel=relative_path)
+        interactions.append(InteractionGroup(interactions=ix, language="Rust"))
 
-    return stats
+    return FileExtraction(
+        module=module, entities=entities, interactions=interactions,
+        imports=[], stats=stats,
+    )
+
+
+def analyze_rust_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, int]:
+    """Thin shim over the pure :func:`extract_rust_file` producer.
+
+    Keeps the walk-time I/O + unchanged-skip gate analyzer-side (short-circuit
+    preserved — the extractor is only called when the file is NOT skipped), then
+    ``extract`` -> ``ctx.write_file_extraction`` -> stats dict. Signature +
+    dispatch registration are unchanged."""
+    stats = {'modules': 0, 'classes': 0, 'functions': 0}
+
+    content = file_path.read_text(encoding='utf-8', errors='ignore')
+    # CG-5 (v0.2.75 P3d): skip machine-minified content at walk time (skip +
+    # log; NEVER delete existing rows — the orphan-clear owns deletion). One
+    # home: _is_minified_content. A genuine long-line first-party file simply
+    # isn't re-indexed this run.
+    if _is_minified_content(content):
+        try:
+            _rel_min = file_path.relative_to(repo_root).as_posix()
+        except Exception:  # noqa: BLE001
+            _rel_min = str(file_path)
+        print(f"⏭️  Skipping {_rel_min} (looks minified/generated)")
+        return {'modules': 0, 'classes': 0, 'functions': 0}
+
+    file_hash = hashlib.sha256(content.encode()).hexdigest()
+    relative_path = file_path.relative_to(repo_root).as_posix()
+
+    if ctx._get_existing_module(relative_path, file_hash):
+        print(f"⏭️  Skipping {relative_path} (unchanged)")
+        return stats
+
+    fx = extract_rust_file(content, file_path, repo_root, _helpers(ctx))
+    return ctx.write_file_extraction(fx)
+
+
+def _helpers(ctx: Any) -> Any:
+    """Wrap ``ctx`` in the narrow ExtractorHelpers protocol (imported lazily to
+    avoid a hard import cycle at module load — same idiom the analyzer uses)."""
+    from vco_lib.codegraph_lang._shared import ExtractorHelpers
+    return ExtractorHelpers(ctx)
