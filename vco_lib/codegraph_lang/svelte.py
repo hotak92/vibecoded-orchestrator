@@ -18,10 +18,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from vco_lib.codegraph_entities import CodeEntity, KIND_FUNCTION
+from vco_lib.codegraph_entities import (
+    CodeEntity,
+    FileExtraction,
+    KIND_FUNCTION,
+    ModuleDescriptor,
+)
 from vco_lib.codegraph_lang._shared import (
     _extract_balanced_block,
-    _is_minified_content,
+    run_pure_extractor,
 )
 
 
@@ -220,8 +225,11 @@ def _parse_svelte_functions(content: str) -> List[Dict[str, Any]]:
     return results
 
 
-def analyze_svelte_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, int]:
-    """Analyze a Svelte component file (V52-O.11.B, v0.2.53 Track E).
+def extract_svelte_file(
+    source_text: str, file_path: Path, repo_root: Path, helpers: Any,
+) -> FileExtraction:
+    """Pure producer: parse a Svelte component (V52-O.11.B), RETURN a
+    :class:`FileExtraction`.
 
     Extracts top-level functions, exports, arrow-export consts, and
     reactive declarations from <script> and <script context="module">
@@ -233,28 +241,11 @@ def analyze_svelte_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str,
     declarations are extracted too if present (Svelte allows
     utility classes inside a component's script block).
     """
-    stats = {'modules': 0, 'classes': 0, 'functions': 0}
-
-    content = file_path.read_text(encoding='utf-8', errors='ignore')
-    # CG-5 (v0.2.75 P3d): skip machine-minified content at walk time (skip +
-    # log; NEVER delete existing rows — the orphan-clear owns deletion). One
-    # home: _is_minified_content. A genuine long-line first-party file simply
-    # isn't re-indexed this run.
-    if _is_minified_content(content):
-        try:
-            _rel_min = file_path.relative_to(repo_root).as_posix()
-        except Exception:  # noqa: BLE001
-            _rel_min = str(file_path)
-        print(f"⏭️  Skipping {_rel_min} (looks minified/generated)")
-        return {'modules': 0, 'classes': 0, 'functions': 0}
+    content = source_text
     source_lines = content.split('\n')
     loc = len([l for l in source_lines if l.strip()])
     file_hash = hashlib.sha256(content.encode()).hexdigest()
     relative_path = file_path.relative_to(repo_root).as_posix()
-
-    if ctx._get_existing_module(relative_path, file_hash):
-        print(f"⏭️  Skipping {relative_path} (unchanged)")
-        return stats
 
     component_name = file_path.stem
 
@@ -290,7 +281,7 @@ def analyze_svelte_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str,
         ])
     )
 
-    module_uuid = ctx._create_or_update_module(
+    module = ModuleDescriptor(
         path=relative_path,
         language="Svelte",
         loc=loc,
@@ -300,7 +291,8 @@ def analyze_svelte_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str,
         imports=imports,
         module_summary=module_summary,
     )
-    stats['modules'] = 1
+    entities: List[CodeEntity] = []
+    stats: Dict[str, int] = {'modules': 1, 'classes': 0, 'functions': 0}
 
     # --- Functions / arrow exports / reactive decls ---
     for decl in _parse_svelte_functions(content):
@@ -325,7 +317,7 @@ def analyze_svelte_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str,
             )
 
         full_name = f"{component_name}.{name}"
-        ctx.store_entity(CodeEntity(
+        entities.append(CodeEntity(
             kind=KIND_FUNCTION, file_path_rel=relative_path,
             name=name,
             full_name=full_name,
@@ -335,10 +327,23 @@ def analyze_svelte_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str,
             start_line=start_line,
             end_line=end_line,
             is_async=is_async,
-            project=ctx.project_name,
-            references={"module": module_uuid},
-            deferred_embed=lambda: ctx.embed_function(signature, body, language="javascript"),
+            project=helpers.project_name,
+            deferred_embed=(
+                lambda sig=signature, fb=body:
+                helpers.embed_function(sig, fb, language="javascript")
+            ),
         ))
         stats['functions'] += 1
 
-    return stats
+    return FileExtraction(
+        module=module, entities=entities, interactions=[],
+        imports=[], stats=stats,
+    )
+
+
+def analyze_svelte_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, int]:
+    """Thin shim: skip gates analyzer-side, then extract -> write."""
+    return run_pure_extractor(
+        ctx, file_path, repo_root, extract_svelte_file,
+        {'modules': 0, 'classes': 0, 'functions': 0},
+    )
