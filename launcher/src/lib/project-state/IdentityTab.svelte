@@ -60,9 +60,19 @@
   let orchestratorRootView = $state<OrchestratorRootView | null>(null);
 
   /**
-   * Client-side mirror of Rust's `sanitize_kg_collection`.
-   * Converts a display name to the PascalCase prefix Weaviate uses.
-   * "VibeCoded Orchestrator" → "VibeCodedOrchestrator"
+   * Client-side mirror of Rust's `sanitize_kg_collection`
+   * (`launcher/src-tauri/src/commands/projects_v2.rs`) + Python's
+   * `sanitize_for_weaviate_class`. Converts a display name to the PascalCase
+   * prefix Weaviate uses. "VibeCoded Orchestrator" → "VibeCodedOrchestrator".
+   *
+   * Display-only (the derived shared-KG name shown in this tab); the
+   * authoritative value is written by the Rust/Python backends. Kept in
+   * lockstep with them so the preview matches what actually lands on disk.
+   *
+   * v0.2.76 (seams-lens #2): out-of-domain fallback aligned to the unified
+   * X-1 sentinel `'vct'`. The retired `'Project'` / `'P'`-prepend fallback
+   * diverged from both backends (which return `'vct'` for an empty result OR
+   * a leading-digit result — Weaviate class names must begin with a letter).
    */
   function sanitizeKgCollection(name: string): string {
     let out = '';
@@ -75,8 +85,7 @@
         nextUpper = true;
       }
     }
-    if (!out) return 'Project';
-    if (/[0-9]/.test(out[0])) out = 'P' + out;
+    if (!out || /[0-9]/.test(out[0])) return 'vct';
     return out;
   }
 
