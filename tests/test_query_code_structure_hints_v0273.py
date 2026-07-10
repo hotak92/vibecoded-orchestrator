@@ -127,28 +127,80 @@ class QueryCodeStructureHintTests(unittest.TestCase):
         self.assertFalse(payload["success"])
         self.assertIn("search_code_graph", payload["error"])
 
-    def test_empty_callers_non_python_marks_unsupported(self):
-        """P2e: an empty callers result for a NON-Python target keeps the
-        marker (the call-graph edge type is genuinely unsupported for it).
-        The target-language probe finds a rust CodeFunction row for someFunc."""
+    def test_empty_callers_unsupported_language_marks_unsupported(self):
+        """P2e / v0.2.77 Part 5: an empty callers result for a target in a
+        language that has NO call-graph extraction keeps the marker. Uses
+        ``powershell`` — ruled out of the tree-sitter scope, so it is
+        unsupported REGARDLESS of whether the optional codegraph-ts extra is
+        installed (rust would flip to supported once its grammar is present, so
+        it is unsuitable for a config-independent assertion here — the dynamic
+        rust behaviour is covered by
+        ``test_callers_language_support_is_dynamic`` below)."""
         import claude_mcp_servers.weaviate_mcp.server as srv
 
-        class _RustObj:
-            uuid = "u-rust"
-            properties = {"full_name": "someFunc", "language": "rust", "call_names": []}
+        class _PsObj:
+            uuid = "u-ps"
+            properties = {
+                "full_name": "someFunc", "language": "powershell",
+                "call_names": [],
+            }
 
         # callers query filters call_names.contains_any(...) → no MATCH (the row
         # doesn't call someFunc); the SAME collection then serves the language
-        # probe (full_name.equal) and returns the rust row.
+        # probe (full_name.equal) and returns the powershell row.
         payload = self._run(
-            srv, "callers", "someFunc", {"CodeFunction": [_RustObj()]},
+            srv, "callers", "someFunc", {"CodeFunction": [_PsObj()]},
             filter_aware=True,
         )
         self.assertTrue(payload["success"])
         self.assertEqual(payload["count"], 0)
         self.assertTrue(payload.get("unsupported_for_language"))
         self.assertIn("note", payload)
-        self.assertIn("call-graph", payload["note"])
+
+    def test_callers_language_support_is_dynamic(self):
+        """v0.2.77 Part 5: the callers/path marker is derived per-query-type
+        from the facade probe. Assert BOTH sides of the gate by patching the
+        supported-language set — act (rust supported → NO marker) + leave-alone
+        (rust unsupported → marker), independent of what the venv has installed."""
+        import claude_mcp_servers.weaviate_mcp.server as srv
+
+        class _RustObj:
+            uuid = "u-rust"
+            properties = {
+                "full_name": "someFunc", "language": "rust", "call_names": [],
+            }
+        objs = {"CodeFunction": [_RustObj()]}
+
+        # rust IS supported (grammar present) → empty callers is a genuine
+        # "no callers", NOT an unsupported-language case.
+        with mock.patch.object(
+            srv, "_callgraph_supported_langs",
+            return_value=frozenset({"python", "rust"}),
+        ):
+            payload = self._run(srv, "callers", "someFunc", objs, filter_aware=True)
+        self.assertEqual(payload["count"], 0)
+        self.assertNotIn("unsupported_for_language", payload)
+        self.assertIn("note", payload)
+
+        # rust is NOT supported (grammar absent) → the marker fires.
+        with mock.patch.object(
+            srv, "_callgraph_supported_langs",
+            return_value=frozenset({"python"}),
+        ):
+            payload = self._run(srv, "callers", "someFunc", objs, filter_aware=True)
+        self.assertEqual(payload["count"], 0)
+        self.assertTrue(payload.get("unsupported_for_language"))
+
+    def test_type_users_stays_python_only(self):
+        """v0.2.77 Part 5: type_users extraction is Python-only this release —
+        a non-Python target's empty type_users keeps the unsupported marker even
+        when call-graph grammars are installed for that language."""
+        import claude_mcp_servers.weaviate_mcp.server as srv
+        # Even if rust call-graph is supported, type_users must NOT be.
+        self.assertNotIn("rust", srv._callgraph_supported_langs("type_users"))
+        self.assertEqual(
+            srv._callgraph_supported_langs("type_users"), frozenset({"python"})
+        )
 
     def test_empty_callers_python_no_marker_but_note(self):
         """P2e HONESTY FIX: a Python target with genuinely zero callers must NOT
