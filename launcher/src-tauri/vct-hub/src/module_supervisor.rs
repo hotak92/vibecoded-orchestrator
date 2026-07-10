@@ -1269,13 +1269,25 @@ pub async fn start_global_container_supervisor(
     // and post-mortems can see it even though the detached hub's stderr
     // goes to /dev/null.
     match verify_container_hub_reachability(&podman, &container_name, hub_port).await {
-        Ok(note) => {
+        ReachabilityVerdict::Reached(note) => {
             eprintln!(
                 "[module_supervisor] container→hub reachability for {}: {}",
                 container_name, note
             );
         }
-        Err(reach_err) => {
+        // v0.2.76 (A3): bind-state UNKNOWN (pre-v0.2.75 hub with no hub.bind
+        // discovery file). Do NOT alarm and do NOT write the audit row — a
+        // working install with an older hub would otherwise emit a spurious
+        // "reachability FAILED" every module start. Informational only; the
+        // hint tells the user what to do IF the module actually can't reach
+        // the hub.
+        ReachabilityVerdict::Unknown(note) => {
+            eprintln!(
+                "[module_supervisor] container→hub reachability for {}: {}",
+                container_name, note
+            );
+        }
+        ReachabilityVerdict::Failed(reach_err) => {
             eprintln!(
                 "[module_supervisor] ERROR: container→hub reachability FAILED for {}: {}",
                 container_name, reach_err
@@ -1310,33 +1322,53 @@ pub(crate) enum ExecProbeOutcome {
     Failed(String),
 }
 
+/// Three-way reachability verdict (v0.2.76 A3 — was `Result<String,String>`).
+///
+/// The UNKNOWN arm was split out from the old `Err`: an absent `hub.bind`
+/// discovery file is NOT a positively-verified failure — it just means the
+/// running hub predates v0.2.75 and never recorded its bind. Treating that as
+/// a FAIL alarmed (and wrote an audit row) on every module start of a WORKING
+/// install with an older hub. UNKNOWN is informational: no alarm, no audit row.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReachabilityVerdict {
+    /// Positively reachable (or a best-effort skip we treat as OK).
+    Reached(String),
+    /// Bind-state could not be verified (pre-v0.2.75 hub — no hub.bind).
+    /// Informational only; no audit row.
+    Unknown(String),
+    /// Positively-verified failure (loopback bind, or widened bind + a
+    /// failed in-container probe). Alarms + writes the audit row.
+    Failed(String),
+}
+
 /// Pure reachability verdict — testable without podman (v0.2.75 P1a).
 ///
 /// `recorded_bind` is the content of the hub's `hub.bind` discovery file
 /// (written by `server.rs::write_bind_file`); `None` means the file is
 /// absent — a pre-v0.2.75 hub, which binds loopback-only by default.
 ///
-/// Loopback is container-unreachable on EVERY OS (Linux native podman:
-/// `host.containers.internal` maps to a bridge/host IP; macOS/Windows:
-/// the runtime VM cannot see the host's own 127.0.0.1), so a loopback or
-/// unrecorded bind is a definitive failure regardless of the exec probe.
-/// With a widened bind the in-container probe result decides; a missing
-/// prober degrades to a logged skip (best-effort), never a false FAIL.
+/// v0.2.76 (A3): absent `hub.bind` → `Unknown` (not `Failed`). We cannot
+/// positively verify the bind on a pre-v0.2.75 hub, and a working install
+/// with an older hub was emitting a spurious FAIL + audit row every module
+/// start. A recorded `127.0.0.1` is still a definitive `Failed` (loopback is
+/// container-unreachable on EVERY OS). With a widened bind the in-container
+/// probe result decides; a missing prober degrades to a logged skip
+/// (best-effort `Reached`), never a false FAIL.
 pub(crate) fn evaluate_hub_reachability(
     recorded_bind: Option<&str>,
     exec_probe: &ExecProbeOutcome,
-) -> Result<String, String> {
+) -> ReachabilityVerdict {
     const RESTART_HINT: &str = "Restart the hub so the widened bind takes effect: \
         `vct-hub --stop` then `vct-hub --start-if-not-running` (same commands in \
         POSIX shells and PowerShell), or restart it from the launcher.";
     match recorded_bind.map(str::trim) {
-        None => Err(format!(
-            "the running hub did not record its bind address (hub.bind absent — a \
-             pre-v0.2.75 hub, which binds loopback-only unless VCT_HUB_BIND_ALL=1). \
-             Loopback is unreachable from containers on every OS. {}",
+        None => ReachabilityVerdict::Unknown(format!(
+            "hub predates v0.2.75 (hub.bind absent) — cannot verify its bind \
+             address. Nothing to do on a working install; ONLY if this module \
+             cannot reach the hub, restart the hub once: {}",
             RESTART_HINT
         )),
-        Some("127.0.0.1") => Err(format!(
+        Some("127.0.0.1") => ReachabilityVerdict::Failed(format!(
             "the hub is bound to 127.0.0.1 (loopback-only) — unreachable from this \
              container on every OS (Linux: host-gateway is a bridge/host IP; \
              macOS/Windows: the container VM cannot see the host's loopback). If \
@@ -1344,15 +1376,15 @@ pub(crate) fn evaluate_hub_reachability(
             RESTART_HINT
         )),
         Some(_) => match exec_probe {
-            ExecProbeOutcome::Reached => {
-                Ok("container reached the hub's /api/v1/health".to_string())
-            }
-            ExecProbeOutcome::ProberUnavailable => Ok(
+            ExecProbeOutcome::Reached => ReachabilityVerdict::Reached(
+                "container reached the hub's /api/v1/health".to_string(),
+            ),
+            ExecProbeOutcome::ProberUnavailable => ReachabilityVerdict::Reached(
                 "hub bind is widened; in-container probe skipped (no python3/curl/wget \
                  in the image)"
                     .to_string(),
             ),
-            ExecProbeOutcome::Failed(e) => Err(format!(
+            ExecProbeOutcome::Failed(e) => ReachabilityVerdict::Failed(format!(
                 "hub bind is widened but the container could not fetch \
                  /api/v1/health via host.containers.internal: {} — check host \
                  firewall rules on the container bridge (Linux) or VM→host port \
@@ -1371,7 +1403,7 @@ async fn verify_container_hub_reachability(
     podman: &str,
     container_name: &str,
     hub_port: u16,
-) -> Result<String, String> {
+) -> ReachabilityVerdict {
     let recorded_bind = std::fs::read_to_string(
         vct_launcher_core::paths::vct_root_dir().join("hub.bind"),
     )
@@ -2605,14 +2637,24 @@ mod tests {
 
     // ── v0.2.75 P1a: container→hub reachability verdict ───────────────
 
-    /// hub.bind absent (pre-v0.2.75 hub) → definitive FAIL with the
-    /// restart remediation, regardless of the exec probe.
+    /// v0.2.76 (A3): hub.bind absent (pre-v0.2.75 hub) → UNKNOWN, NOT a
+    /// definitive FAIL. Informational message, no audit row (the caller
+    /// writes the row only on `Failed`), regardless of the exec probe.
     #[test]
-    fn reachability_fails_when_bind_unrecorded() {
+    fn reachability_unknown_when_bind_unrecorded() {
         let v = evaluate_hub_reachability(None, &ExecProbeOutcome::Reached);
-        let err = v.expect_err("absent hub.bind must fail");
-        assert!(err.contains("hub.bind absent"), "err: {}", err);
-        assert!(err.contains("vct-hub --stop"), "must carry remediation: {}", err);
+        match v {
+            ReachabilityVerdict::Unknown(note) => {
+                assert!(note.contains("predates v0.2.75"), "note: {}", note);
+                assert!(note.contains("cannot verify"), "note: {}", note);
+                assert!(
+                    note.contains("vct-hub --stop"),
+                    "must carry the conditional restart hint: {}",
+                    note
+                );
+            }
+            other => panic!("absent hub.bind must be Unknown, got {:?}", other),
+        }
     }
 
     /// Loopback-bound hub → definitive FAIL on every OS.
@@ -2622,28 +2664,37 @@ mod tests {
             ExecProbeOutcome::Reached,
             ExecProbeOutcome::ProberUnavailable,
         ] {
-            let err = evaluate_hub_reachability(Some("127.0.0.1\n"), &probe)
-                .expect_err("loopback bind must fail");
-            assert!(err.contains("loopback-only"), "err: {}", err);
+            match evaluate_hub_reachability(Some("127.0.0.1\n"), &probe) {
+                ReachabilityVerdict::Failed(err) => {
+                    assert!(err.contains("loopback-only"), "err: {}", err);
+                }
+                other => panic!("loopback bind must be Failed, got {:?}", other),
+            }
         }
     }
 
     /// Widened bind: the in-container probe decides; a missing prober is
-    /// a logged SKIP (pass), a failed probe is a FAIL with guidance.
+    /// a logged SKIP (Reached), a failed probe is a FAIL with guidance.
     #[test]
     fn reachability_widened_bind_follows_exec_probe() {
-        assert!(
-            evaluate_hub_reachability(Some("0.0.0.0"), &ExecProbeOutcome::Reached).is_ok()
-        );
-        let skipped =
-            evaluate_hub_reachability(Some("0.0.0.0"), &ExecProbeOutcome::ProberUnavailable)
-                .expect("missing prober is a skip, not a failure");
-        assert!(skipped.contains("skipped"), "note: {}", skipped);
-        let err = evaluate_hub_reachability(
+        assert!(matches!(
+            evaluate_hub_reachability(Some("0.0.0.0"), &ExecProbeOutcome::Reached),
+            ReachabilityVerdict::Reached(_)
+        ));
+        match evaluate_hub_reachability(Some("0.0.0.0"), &ExecProbeOutcome::ProberUnavailable) {
+            ReachabilityVerdict::Reached(note) => {
+                assert!(note.contains("skipped"), "note: {}", note);
+            }
+            other => panic!("missing prober is a skip, got {:?}", other),
+        }
+        match evaluate_hub_reachability(
             Some("0.0.0.0"),
             &ExecProbeOutcome::Failed("curl exited 7: connection refused".into()),
-        )
-        .expect_err("failed probe must fail");
-        assert!(err.contains("connection refused"), "err: {}", err);
+        ) {
+            ReachabilityVerdict::Failed(err) => {
+                assert!(err.contains("connection refused"), "err: {}", err);
+            }
+            other => panic!("failed probe must be Failed, got {:?}", other),
+        }
     }
 }
