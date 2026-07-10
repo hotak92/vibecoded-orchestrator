@@ -263,6 +263,7 @@ from vco_lib.embedding_selection import (  # noqa: E402,F401
     _SUMMARY_BACKEND_QWEN35_9B,
     _SUMMARY_BACKEND_GEMMA,
     _SUMMARY_BACKEND_OPENAI,
+    select_embedding_concurrency,
 )
 
 
@@ -5970,6 +5971,14 @@ def main() -> int:
     # NVIDIA hosts → Dockerfile.cuda. Anyone else (AMD ROCm / Apple
     # Silicon / CPU-only / unknown) → default Dockerfile (CPU multi-arch).
     embed_config["gpu_vendor"] = sysinfo.gpu_vendor or ""
+    # v0.2.77 5c task 2: derive the shared-pool embedding-concurrency budget
+    # (code_embed_max_concurrent + update_all_max_parallel) from the SAME
+    # hardware specs that picked the models. Stashed onto embed_config so
+    # `_write_env_config` writes CODE_EMBED_MAX_CONCURRENT (honouring an
+    # explicit user override) and `_write_preset_defaults_to_app_state` seeds
+    # the two app_state keys the Rust update-all gate reads. Soft-fail: on any
+    # probe error the knobs stay unset and the writers use their defaults.
+    _augment_config_with_concurrency(embed_config, sysinfo)
     # v0.2.61 (stale-embedding reconcile): if a stale ACTIVE_EMBEDDING=qwen3
     # was inherited from the env / an OLD settings.json on hardware whose
     # selector picked arctic (and no deliberate user choice exists), rewrite
@@ -9861,6 +9870,65 @@ def _apply_tier_overrides(config: dict, *, code_pick: str, kg_pick: str) -> None
     )
 
 
+def _augment_config_with_concurrency(config: dict, sysinfo: SystemInfo) -> None:
+    """v0.2.77 5c task 2: derive the shared-pool embedding-concurrency budget
+    from the SAME hardware specs the model selectors used and stash the two
+    knobs onto the resolved embedding config dict.
+
+    Runs for EVERY resolved config (all `_choose_embedding_config` return
+    paths — auto-detect AND the explicit --openai/--low-resource/--cpu-only
+    opt-ins), so the code-embed `CODE_EMBED_MAX_CONCURRENT` env
+    (`_write_env_config`) and the app_state keys
+    (`_write_preset_defaults_to_app_state`) always reflect the host, not the
+    fixed default-4 that shed 503s in the v0.2.77 5c incident.
+
+    Device / free-memory selection mirrors the ladder: when the host has a
+    usable GPU AND the chosen code model is GPU-resident (CodeSage on the
+    code-embed service), the shared pool is VRAM; otherwise the Ollama models
+    load into RAM, so the pool is RAM. Uses the detected TOTAL as the
+    `system_memory` input — the same probe the ladder consumes (`sysinfo`
+    carries no free/used split, and detected-total is the conservative,
+    deterministic value to derive a persisted default from; a user who wants
+    a different value sets `CODE_EMBED_MAX_CONCURRENT` explicitly, which
+    `_write_env_config` honours).
+
+    Never raises: a bad probe / unknown backend must not fail the install —
+    on any error, leave the knobs unset so the downstream writers fall back
+    to their compiled-in defaults.
+    """
+    try:
+        vram = float(sysinfo.vram_gb or 0.0)
+        ram = float(sysinfo.ram_gb or 0.0)
+        has_gpu = bool(sysinfo.has_gpu)
+        code_backend = str(config.get("code_model") or "")
+        kg_backend = str(config.get("text_model") or "")
+        # GPU-resident when a usable GPU is present AND the code model is the
+        # GPU service model (CodeSage). qwen3/jina/arctic run via Ollama even
+        # on GPU hosts (Ollama serializes internally). OpenAI is remote.
+        code_on_gpu = has_gpu and code_backend == _CODE_BACKEND_CODESAGE
+        if code_on_gpu and vram > 0.0:
+            system_memory = vram
+            device = (sysinfo.gpu_vendor or "gpu").lower()
+        else:
+            system_memory = ram
+            device = "cpu"
+        budget = select_embedding_concurrency(
+            system_memory_gb=system_memory,
+            code_backend=code_backend,
+            kg_backend=kg_backend,
+            device=device,
+            both_gpu_resident=True,
+        )
+        config["code_embed_max_concurrent"] = budget.code_embed_max_concurrent
+        config["update_all_max_parallel"] = budget.update_all_max_parallel_projects
+    except Exception as exc:  # noqa: BLE001 — never block install on a probe
+        _log_install_event(
+            "embedding_concurrency", "warn",
+            f"could not derive concurrency budget ({exc}); downstream writers "
+            f"will use compiled-in defaults",
+        )
+
+
 def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> dict:
     # Explicit opt-ins win over auto-detection.
     #
@@ -10060,6 +10128,16 @@ _APP_STATE_KEY_LAST_KG_SYNC_AT = "last_kg_sync_at"
 _APP_STATE_KEY_ACTIVE_EMBEDDING_LIVE = "embedding.active_profile"
 _APP_STATE_KEY_LAST_KG_SYNC_STATS = "last_kg_sync_stats"
 
+# v0.2.77 5c task 2: hardware-derived embedding-concurrency knobs seeded into
+# app_state so the launcher (Rust) can read them without re-probing hardware.
+#   embedding.code_embed_max_concurrent — informational mirror of the .env
+#     CODE_EMBED_MAX_CONCURRENT the code-embed service reads.
+#   embedding.update_all_max_parallel — the machine-global cap the update-all
+#     admission gate reads (codegraph.rs / kg_sync.rs). MUST match the Rust
+#     key constant UPDATE_ALL_MAX_PARALLEL_KEY in db/app_state.rs.
+_APP_STATE_KEY_CODE_EMBED_MAX_CONCURRENT = "embedding.code_embed_max_concurrent"
+_APP_STATE_KEY_UPDATE_ALL_MAX_PARALLEL = "embedding.update_all_max_parallel"
+
 # Canonical OpenAI ID used by Wave A (with `openai-` prefix). MUST match:
 #   launcher/src-tauri/src/commands/openai_cmd.rs::OPENAI_DEFAULT_TEXT_MODEL_ID
 #   launcher/src-tauri/src/commands/embedding_catalog.rs (`id` field)
@@ -10256,6 +10334,29 @@ def _write_preset_defaults_to_app_state(
                 (_APP_STATE_KEY_DEFAULT_CODE_EMBED, code_model, now_ms),
             )
             code_inserted = cur.rowcount > 0
+
+            # v0.2.77 5c task 2: seed the hardware-derived concurrency knobs.
+            # Same ON CONFLICT DO NOTHING idempotency as the model defaults —
+            # a value the user later tuned in the GUI (or set on a prior
+            # install) is preserved; a fresh install seeds the derived value.
+            # Only seed when the budget was actually derived (absent → the
+            # Rust admission gate + code-embed service use their own defaults).
+            _cc = embed_config.get("code_embed_max_concurrent")
+            _up = embed_config.get("update_all_max_parallel")
+            if _cc is not None:
+                cur.execute(
+                    "INSERT INTO app_state (key, value, updated_at) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT(key) DO NOTHING",
+                    (_APP_STATE_KEY_CODE_EMBED_MAX_CONCURRENT, str(int(_cc)), now_ms),
+                )
+            if _up is not None:
+                cur.execute(
+                    "INSERT INTO app_state (key, value, updated_at) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT(key) DO NOTHING",
+                    (_APP_STATE_KEY_UPDATE_ALL_MAX_PARALLEL, str(int(_up)), now_ms),
+                )
             conn.commit()
         except sqlite3.OperationalError as e:
             # Most common: "no such table: app_state". The launcher
@@ -22985,6 +23086,21 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace) -> None:
         f"CODE_EMBED_MODEL={embed_config['code_model']}",
         f"CODE_EMBED_DIMS={embed_config['code_dims']}",
         f"CODE_EMBED_SERVICE_URL=http://localhost:{code_embed_port}",
+        # v0.2.77 5c task 2: hardware-derived in-flight cap for the code-embed
+        # service (requests before it sheds with 503). Honour-explicit-config:
+        # if the user already exported CODE_EMBED_MAX_CONCURRENT we do NOT
+        # clobber it; otherwise we write the budget derived from this host's
+        # free VRAM/RAM (never the fixed default-4 that shed 503s in the
+        # update-all incident). Omitted entirely when the budget could not be
+        # derived (the service then falls back to its own default of 4).
+        *(
+            [f"CODE_EMBED_MAX_CONCURRENT={embed_config['code_embed_max_concurrent']}"]
+            if (
+                "CODE_EMBED_MAX_CONCURRENT" not in os.environ
+                and embed_config.get("code_embed_max_concurrent") is not None
+            )
+            else []
+        ),
         # v0.2.50 audit F1 (2026-06-08): per-arch Dockerfile selection
         # for the code-embed image build. NVIDIA hosts opt into the CUDA
         # base image; everyone else (AMD ROCm, Apple Silicon, CPU-only)
