@@ -952,15 +952,11 @@ mod tests {
     /// have no Secret Service / Keychain / Credential Manager running,
     /// so any test that exercises the actual keychain has to short-circuit.
     fn keyring_available() -> bool {
-        let entry = match keyring::Entry::new("vct.test.hub.probe", "probe") {
-            Ok(e) => e,
-            Err(_) => return false,
-        };
-        if entry.set_password("canary").is_err() {
-            return false;
-        }
-        let _ = entry.delete_credential();
-        true
+        // v0.2.76 (A4): delegate to the ONE shared probe in vct-launcher-core
+        // (bounded-timeout worker — a wedged Secret Service returns false,
+        // never hangs). Replaces the raw `Entry::new(..).set_password("canary")`
+        // copy this hub crate used to carry.
+        vct_launcher_core::secrets::keyring_probe_available()
     }
 
     /// PR-3 Commit 3 canary: the hub's per-subprocess secret resolver MUST

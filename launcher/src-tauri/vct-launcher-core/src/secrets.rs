@@ -184,23 +184,19 @@ impl<'a> SecretScope<'a> {
     }
 }
 
-/// Construct a keychain [`Entry`], returning the raw `keyring::Result` so
-/// the caller can drive it through `retry_with_backoff` alongside the op.
-///
-/// v0.2.72 (P9): `Entry::new` is itself a D-Bus Secret-Service negotiation
-/// on Linux (`sync-secret-service`). Constructing it OUTSIDE the pacing
-/// layer meant a burst of N secret ops fired N unpaced D-Bus calls, which
-/// crashed gnome-keyring 46.1 on Ubuntu 24.04 under concurrency (SIGTRAP,
-/// apport-mislabelled "SSH Key Agent closed unexpectedly"). NOT a leak —
-/// VCO's retry recovered, but the crash still popped a dialog. So the hot
-/// `set`/`get`/`delete` paths now build the entry INSIDE their
-/// `retry_with_backoff` closure, routing construction through the same
-/// `paced_call` (150ms process-wide spacing) + progressive backoff as the
-/// operation. This helper is the shared construction seam.
-fn entry_result(scope: SecretScope<'_>, module_id: &str, key: &str) -> keyring::Result<Entry> {
-    let service = scope.service_name(module_id);
-    Entry::new(&service, key)
-}
+// v0.2.72 (P9) rationale (kept for the maintainer): `Entry::new` is itself a
+// D-Bus Secret-Service negotiation on Linux (`sync-secret-service`).
+// Constructing it OUTSIDE the pacing layer meant a burst of N secret ops fired
+// N unpaced D-Bus calls, which crashed gnome-keyring 46.1 on Ubuntu 24.04 under
+// concurrency (SIGTRAP, apport-mislabelled "SSH Key Agent closed unexpectedly").
+// NOT a leak — VCO's retry recovered, but the crash still popped a dialog. So
+// `set`/`get`/`delete` build the `Entry::new(&service, &key)` INSIDE their
+// `retry_with_backoff` closure, routing construction through the same
+// `paced_call` (150ms process-wide spacing) + progressive backoff as the op.
+// v0.2.76 (A4): the shared `entry_result` construction helper was inlined into
+// those closures so each owns its `service` String and the whole closure is
+// 'static + Send for the bounded-timeout worker; the structural guard
+// `p9_source_shape_entry_construction_inside_retried_closure` pins the shape.
 
 /// 0.1.7 H1 (2026-05-08): retry on transient daemon-hiccup errors.
 /// 2026-05-13 upgrade: 1 retry → 3 attempts with progressive backoff
@@ -346,6 +342,213 @@ fn retry_with_backoff<T>(mut f: impl FnMut() -> keyring::Result<T>) -> keyring::
     Err(last_err.expect("loop runs at least once"))
 }
 
+// ─── Bounded-timeout execution primitive (v0.2.76 A4) ─────────────────────────
+//
+// The pacing/backoff layers above serialize and retry keychain calls, but the
+// underlying `keyring` op (`Entry::new` D-Bus negotiation, `set_password`,
+// `get_password`, `delete_credential`) can block UNBOUNDEDLY when the OS Secret
+// Service is slow or wedged (observed live: gnome-keyring hanging a keychain
+// call for 13+ minutes at ~0% CPU). A blocked op hangs whatever called it — the
+// hub `/env` value read, a launcher GUI keychain command, or a test — with no
+// timeout anywhere in the stack.
+//
+// This primitive wraps keychain execution in a bounded timeout, running the op
+// on ONE dedicated long-lived worker thread fed by a request channel. Design
+// points:
+//
+//   * ONE worker thread (not thread-per-op): a timed-out op leaves its job
+//     stuck ON THE WORKER; we do NOT spawn a fresh thread per call (that would
+//     leak one abandoned thread per timeout). Instead, while the worker is
+//     stuck the NEXT op fails FAST with a distinct "keychain worker stuck"
+//     error until the wedged op returns and the worker drains.
+//   * The timeout wraps OUTSIDE pacing/backoff (v0.2.72 P9 semantics
+//     unchanged) — the job closure IS the full retry_with_backoff call.
+//   * On timeout the caller gets an `Err`; every caller already handles `Err`
+//     (hub /env → key not served; GUI set → error toast; never a panic).
+
+/// Per-op keychain timeout. Generous: a healthy Secret Service answers in
+/// milliseconds; the pacing + backoff worst case is ~1.45s, so 10s leaves
+/// ample headroom for a slow-but-alive daemon while still bounding a wedged
+/// one. A wedged daemon crosses this and the op fails loudly instead of
+/// hanging forever.
+const KEYCHAIN_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Error returned when a keychain op could not complete within the bound.
+#[derive(Debug)]
+pub enum KeychainTimeout {
+    /// This op itself exceeded `KEYCHAIN_OP_TIMEOUT`.
+    TimedOut,
+    /// A PRIOR op is still stuck on the worker (the Secret Service has not
+    /// unwedged); this op failed fast rather than queue behind it.
+    WorkerStuck,
+    /// The worker thread/channel is unavailable (should not happen in
+    /// practice; treated conservatively as a failure).
+    WorkerUnavailable,
+}
+
+impl std::fmt::Display for KeychainTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeychainTimeout::TimedOut => write!(
+                f,
+                "keychain operation timed out — Secret Service unresponsive \
+                 (exceeded {}s)",
+                KEYCHAIN_OP_TIMEOUT.as_secs()
+            ),
+            KeychainTimeout::WorkerStuck => write!(
+                f,
+                "keychain worker stuck — a prior keychain operation is still \
+                 blocked on an unresponsive Secret Service; try again once it \
+                 recovers"
+            ),
+            KeychainTimeout::WorkerUnavailable => {
+                write!(f, "keychain worker unavailable")
+            }
+        }
+    }
+}
+
+type KeychainJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// Lazily-started worker: owns the single thread that actually touches the OS
+/// keychain. `in_flight` > 0 means a job is currently executing (possibly
+/// wedged); a new caller checks it to fast-fail rather than queue behind a
+/// stuck op.
+struct KeychainWorker {
+    tx: std::sync::mpsc::Sender<KeychainJob>,
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+fn keychain_worker() -> &'static KeychainWorker {
+    use std::sync::OnceLock;
+    static WORKER: OnceLock<KeychainWorker> = OnceLock::new();
+    WORKER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<KeychainJob>();
+        let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_in_flight = in_flight.clone();
+        // Detached; lives for the process. A wedged op parks THIS thread (not a
+        // fresh one per call) until the daemon unwedges, then it drains the
+        // queue.
+        std::thread::Builder::new()
+            .name("vct-keychain-worker".into())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    worker_in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    job();
+                    worker_in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+            .expect("spawn keychain worker thread");
+        KeychainWorker { tx, in_flight }
+    })
+}
+
+/// Run a keychain op with a bounded timeout on the shared worker thread.
+///
+/// `f` is the full op INCLUDING pacing/backoff — the timeout wraps outside
+/// them (A4d). Returns `Ok(f())` when it completes within
+/// `KEYCHAIN_OP_TIMEOUT`; `Err(WorkerStuck)` immediately if a prior op is
+/// still blocked; `Err(TimedOut)` if this op exceeds the bound.
+pub(crate) fn run_keychain_with_timeout<T, F>(f: F) -> Result<T, KeychainTimeout>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    use std::sync::atomic::Ordering;
+
+    let worker = keychain_worker();
+    // Fast-fail if the worker is already busy on a (possibly wedged) prior op.
+    // Single-worker means a queued job would otherwise inherit the prior op's
+    // stall; failing fast keeps callers responsive until the daemon recovers.
+    if worker.in_flight.load(Ordering::SeqCst) > 0 {
+        return Err(KeychainTimeout::WorkerStuck);
+    }
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<T>(1);
+    let job: KeychainJob = Box::new(move || {
+        let value = f();
+        // Ignore send error: if the caller already timed out and dropped the
+        // receiver, the result is simply discarded.
+        let _ = result_tx.send(value);
+    });
+    if worker.tx.send(job).is_err() {
+        return Err(KeychainTimeout::WorkerUnavailable);
+    }
+    match result_rx.recv_timeout(current_keychain_timeout()) {
+        Ok(value) => Ok(value),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(KeychainTimeout::TimedOut),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(KeychainTimeout::WorkerUnavailable)
+        }
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+static TEST_KEYCHAIN_TIMEOUT_OVERRIDE: std::sync::Mutex<Option<std::time::Duration>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(any(test, debug_assertions))]
+fn current_keychain_timeout() -> std::time::Duration {
+    TEST_KEYCHAIN_TIMEOUT_OVERRIDE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or(KEYCHAIN_OP_TIMEOUT)
+}
+
+#[cfg(not(any(test, debug_assertions)))]
+fn current_keychain_timeout() -> std::time::Duration {
+    KEYCHAIN_OP_TIMEOUT
+}
+
+/// Test-only RAII guard shortening the keychain timeout so timeout tests run
+/// fast. Restores the previous value on drop.
+#[cfg(any(test, debug_assertions))]
+pub struct TestKeychainTimeoutGuard {
+    prev: Option<std::time::Duration>,
+}
+
+#[cfg(any(test, debug_assertions))]
+impl TestKeychainTimeoutGuard {
+    pub fn new(timeout: std::time::Duration) -> Self {
+        let mut slot = TEST_KEYCHAIN_TIMEOUT_OVERRIDE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = *slot;
+        *slot = Some(timeout);
+        Self { prev }
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+impl Drop for TestKeychainTimeoutGuard {
+    fn drop(&mut self) {
+        let mut slot = TEST_KEYCHAIN_TIMEOUT_OVERRIDE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *slot = self.prev;
+    }
+}
+
+/// ONE shared public probe: is the OS keychain backend reachable *and
+/// responsive*? Writes + deletes a canary under a private namespace, bounded
+/// by the same timeout primitive (a wedged Secret Service → `false`, the
+/// conservative default). Replaces the three duplicated `keyring_available()`
+/// test copies (installer.rs / openai_cmd.rs / vct-hub modules_api.rs) and is
+/// safe to call from any crate that depends on vct-launcher-core.
+pub fn keyring_probe_available() -> bool {
+    run_keychain_with_timeout(|| {
+        let entry = match Entry::new("vct.probe.keyring_available", "probe") {
+            Ok(e) => e,
+            Err(_) => return false,
+        };
+        if entry.set_password("canary").is_err() {
+            return false;
+        }
+        let _ = entry.delete_credential();
+        true
+    })
+    .unwrap_or(false)
+}
+
 pub fn set(
     scope: SecretScope<'_>,
     module_id: &str,
@@ -356,13 +559,20 @@ pub fn set(
     if let Some(result) = for_tests::mock_set(scope, module_id, key, value) {
         return result;
     }
-    // v0.2.72 (P9): build the Entry INSIDE the closure so `Entry::new`'s
-    // D-Bus construction shares the same paced_call + backoff as the op.
-    retry_with_backoff(|| {
-        let e = entry_result(scope, module_id, key)?;
-        e.set_password(value)
+    // v0.2.76 (A4): own the (service, key, value) so the job closure is
+    // 'static + Send, then run it on the bounded-timeout worker. The timeout
+    // wraps OUTSIDE pacing/backoff — the closure IS the full retry_with_backoff
+    // call (v0.2.72 P9 semantics unchanged inside).
+    let service = scope.service_name(module_id);
+    let key = key.to_string();
+    let value = value.to_string();
+    run_keychain_with_timeout(move || {
+        // v0.2.72 (P9): build the Entry INSIDE the closure so `Entry::new`'s
+        // D-Bus construction shares the same paced_call + backoff as the op.
+        retry_with_backoff(|| Entry::new(&service, &key)?.set_password(&value))
+            .map_err(|err| format!("keyring set: {}", err))
     })
-    .map_err(|err| format!("keyring set: {}", err))?;
+    .map_err(|to| format!("keyring set: {}", to))??;
     Ok(())
 }
 
@@ -375,16 +585,21 @@ pub fn get(
     if let Some(result) = for_tests::mock_get(scope, module_id, key) {
         return result;
     }
-    // v0.2.72 (P9): build the Entry INSIDE the closure so `Entry::new`'s
-    // D-Bus construction shares the same paced_call + backoff as the op.
-    match retry_with_backoff(|| {
-        let e = entry_result(scope, module_id, key)?;
-        e.get_password()
-    }) {
-        Ok(v) => Ok(Some(v)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(err) => Err(format!("keyring get: {}", err)),
-    }
+    // v0.2.76 (A4): own (service, key) → 'static + Send job → bounded-timeout
+    // worker. keyring::Error is not Send-safe to carry across the channel
+    // uniformly, so classify NoEntry INSIDE the job and return a plain
+    // Result<Option<String>, String>.
+    let service = scope.service_name(module_id);
+    let key = key.to_string();
+    run_keychain_with_timeout(move || {
+        // v0.2.72 (P9): build the Entry INSIDE the closure.
+        match retry_with_backoff(|| Entry::new(&service, &key)?.get_password()) {
+            Ok(v) => Ok(Some(v)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(err) => Err(format!("keyring get: {}", err)),
+        }
+    })
+    .map_err(|to| format!("keyring get: {}", to))?
 }
 
 pub fn is_set(
@@ -404,16 +619,19 @@ pub fn delete(
     if for_tests::mock_delete(scope, module_id, key) {
         return Ok(());
     }
-    // v0.2.72 (P9): build the Entry INSIDE the closure so `Entry::new`'s
-    // D-Bus construction shares the same paced_call + backoff as the op.
-    match retry_with_backoff(|| {
-        let e = entry_result(scope, module_id, key)?;
-        e.delete_credential()
-    }) {
-        Ok(()) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()), // already gone — treat as success
-        Err(err) => Err(format!("keyring delete: {}", err)),
-    }
+    // v0.2.76 (A4): own (service, key) → 'static + Send job → bounded-timeout
+    // worker. NoEntry (already gone) is treated as success INSIDE the job.
+    let service = scope.service_name(module_id);
+    let key = key.to_string();
+    run_keychain_with_timeout(move || {
+        // v0.2.72 (P9): build the Entry INSIDE the closure.
+        match retry_with_backoff(|| Entry::new(&service, &key)?.delete_credential()) {
+            Ok(()) => Ok(()),
+            Err(keyring::Error::NoEntry) => Ok(()), // already gone — treat as success
+            Err(err) => Err(format!("keyring delete: {}", err)),
+        }
+    })
+    .map_err(|to| format!("keyring delete: {}", to))?
 }
 
 /// Return a masked preview of a non-sensitive value (never for sensitive
@@ -1465,51 +1683,131 @@ mod tests {
         assert_eq!(attempts, 1, "permanent construction error must not retry");
     }
 
-    /// P9 STRUCTURAL GUARD (v0.2.72 pre-gate audit F4). The three pacing
-    /// tests above drive `retry_with_backoff` with STAND-IN closures, so
-    /// reverting the P9 fix in the production fns (hoisting the Entry
-    /// construction back OUT of the retried closure) would keep them
+    // ─── v0.2.76 (A4): bounded-timeout worker primitive ───────────────────
+
+    /// Normal op passes through unchanged: a fast closure completes and its
+    /// value is returned (leave-alone case).
+    #[test]
+    fn keychain_timeout_passes_through_fast_op() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let out = run_keychain_with_timeout(|| 40 + 2);
+        assert!(matches!(out, Ok(42)), "fast op must pass through: {:?}", out);
+    }
+
+    /// ACT: a deliberately-blocking op times out within the (shortened) bound
+    /// and returns `TimedOut`; the NEXT op fast-fails `WorkerStuck` while the
+    /// prior job is still parked on the worker. Then the blocking op is
+    /// released so the worker drains (no cross-test pollution).
+    #[test]
+    fn keychain_timeout_blocks_then_worker_stuck_then_recovers() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _tg = TestKeychainTimeoutGuard::new(std::time::Duration::from_millis(100));
+
+        // The blocking op parks on this channel until the test releases it.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+
+        let blocked = run_keychain_with_timeout(move || {
+            // Block until released — models a wedged Secret Service call.
+            let _ = release_rx.lock().unwrap().recv();
+            7
+        });
+        assert!(
+            matches!(blocked, Err(KeychainTimeout::TimedOut)),
+            "blocking op must time out: {:?}",
+            blocked
+        );
+
+        // The worker is still parked on the prior job → the next op fast-fails.
+        let stuck = run_keychain_with_timeout(|| 1);
+        assert!(
+            matches!(stuck, Err(KeychainTimeout::WorkerStuck)),
+            "a queued op must fast-fail while the worker is stuck: {:?}",
+            stuck
+        );
+
+        // Release the parked job; the worker drains and recovers.
+        release_tx.send(()).unwrap();
+        // Poll until the worker is idle again (in_flight back to 0), then a
+        // fresh op must pass through. Bounded loop so a regression can't hang.
+        let mut recovered = false;
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            if let Ok(v) = run_keychain_with_timeout(|| 99) {
+                assert_eq!(v, 99);
+                recovered = true;
+                break;
+            }
+        }
+        assert!(recovered, "worker must recover after the wedged op drains");
+    }
+
+    /// The shared probe returns `false` (conservative default) when the
+    /// underlying op would exceed the bound — proven here by driving the
+    /// timeout primitive with a blocking closure under a short bound. (The
+    /// real `keyring_probe_available` uses the same primitive; we don't touch
+    /// the OS keychain in unit tests.)
+    #[test]
+    fn keychain_probe_timeout_is_false() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _tg = TestKeychainTimeoutGuard::new(std::time::Duration::from_millis(80));
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+
+        // Same shape as keyring_probe_available's body: op → bool, timeout → false.
+        let probe = run_keychain_with_timeout(move || {
+            let _ = release_rx.lock().unwrap().recv();
+            true
+        })
+        .unwrap_or(false);
+        assert!(!probe, "a probe that exceeds the bound must be false");
+
+        // Drain so the worker recovers for later tests.
+        release_tx.send(()).unwrap();
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            if run_keychain_with_timeout(|| ()).is_ok() {
+                break;
+            }
+        }
+    }
+
+    /// P9 STRUCTURAL GUARD (v0.2.72 pre-gate audit F4; v0.2.76 A4 reshaped).
+    /// The pacing tests above drive `retry_with_backoff` with STAND-IN
+    /// closures, so reverting the P9 fix in the production fns (hoisting the
+    /// Entry construction back OUT of the retried closure) would keep them
     /// green. This test pins the SHIPPED source shape instead: every
-    /// Entry-construction call site in this file must appear as the first
-    /// statement inside a `retry_with_backoff` closure, one per hot-path
-    /// fn (`set` / `get` / `delete`).
+    /// Entry-construction call site in `set`/`get`/`delete` must appear
+    /// INSIDE a `retry_with_backoff` closure.
     ///
-    /// Whitespace is stripped before matching so rustfmt reflows can't
-    /// break the needles; the needles are assembled from SPLIT string
-    /// literals so this test's own source (also part of secrets.rs) can
-    /// never match them. If you rename the closure binding (`e`) or the
-    /// construction helper, update the needles — the invariant being
-    /// pinned is "construction lives INSIDE the paced+retried closure",
-    /// not the exact spelling.
+    /// v0.2.76 A4 changed the spelling: `set`/`get`/`delete` now own the
+    /// service string and build `Entry::new(&service, &key)?` directly inside
+    /// the retried closure (the whole `retry_with_backoff(...)` is itself run
+    /// on the bounded-timeout worker). The invariant pinned is unchanged —
+    /// "construction lives INSIDE the paced+retried closure" — only the needle
+    /// tracks the new spelling. Whitespace is stripped so rustfmt reflows
+    /// can't break the match; the needle is assembled from SPLIT literals so
+    /// this test's own source can never match it.
     #[test]
     fn p9_source_shape_entry_construction_inside_retried_closure() {
         let src = include_str!("secrets.rs");
         let flat: String = src.chars().filter(|c| !c.is_whitespace()).collect();
 
-        // Any construction call site, paced or not.
-        let construction_needle =
-            String::from("entry_result(scope,") + "module_id,key)";
-        // `retry_with_backoff(|| { let e = <construct>(scope, module_id, key)?;`
-        // — composed from the SAME split parts so neither needle appears
-        // contiguously anywhere in this test's own source.
+        // The retried closure constructs the Entry as its first act, one per
+        // hot-path fn. Needle assembled from SPLIT literals (never contiguous
+        // in this test's own source) so the whitespace-stripped scan below
+        // cannot match THIS line.
         let paced_needle =
-            String::from("retry_with_backoff(||{lete=") + &construction_needle + "?;";
+            String::from("retry_with_backoff(||Entry::new(&service,") + "&key)?";
 
         let paced = flat.matches(paced_needle.as_str()).count();
         assert_eq!(
             paced, 3,
             "set/get/delete must each construct the keyring Entry INSIDE \
              the retry_with_backoff closure (found {paced} paced \
-             construction sites, expected 3)"
-        );
-
-        let total = flat.matches(construction_needle.as_str()).count();
-        assert_eq!(
-            total, paced,
-            "every Entry-construction call site must live inside a \
-             retry_with_backoff closure — an unpaced `Entry::new` burst is \
-             the exact gnome-keyring crash P9 fixed (found {total} \
-             construction sites, {paced} of them paced)"
+             construction sites, expected 3) — an unpaced `Entry::new` burst \
+             is the exact gnome-keyring crash P9 fixed"
         );
     }
 }

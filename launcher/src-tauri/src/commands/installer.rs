@@ -14466,16 +14466,9 @@ MemAvailable:   23456789 kB
         }
 
         fn keyring_available() -> bool {
-            let entry =
-                match keyring::Entry::new("vct.test.installer.pat.probe", "probe") {
-                    Ok(e) => e,
-                    Err(_) => return false,
-                };
-            if entry.set_password("canary").is_err() {
-                return false;
-            }
-            let _ = entry.delete_credential();
-            true
+            // v0.2.76 (A4): delegate to the ONE shared probe (bounded-timeout
+            // worker — a wedged Secret Service returns false, never hangs).
+            secrets::keyring_probe_available()
         }
 
         fn make_db() -> crate::db::Db {

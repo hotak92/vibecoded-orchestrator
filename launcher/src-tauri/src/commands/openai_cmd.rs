@@ -1400,17 +1400,12 @@ mod tests {
     // probe so we don't get flaky failures on `secrets::set`.
 
     fn keyring_available() -> bool {
-        // Same probe pattern as installer.rs PAT tests — try to write +
-        // delete a canary entry under a private key namespace.
-        let entry = match keyring::Entry::new("vct.test.openai.probe", "probe") {
-            Ok(e) => e,
-            Err(_) => return false,
-        };
-        if entry.set_password("canary").is_err() {
-            return false;
-        }
-        let _ = entry.delete_credential();
-        true
+        // v0.2.76 (A4): delegate to the ONE shared probe. It runs the canary
+        // through the bounded-timeout worker, so a wedged Secret Service
+        // returns false instead of hanging this test forever (the old raw
+        // `Entry::new(..).set_password("canary")` had no timeout — the exact
+        // 13-min hang this cycle fixed).
+        secrets::keyring_probe_available()
     }
 
     fn make_db_for_tests() -> Db {
