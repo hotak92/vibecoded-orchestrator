@@ -126,15 +126,17 @@ One object per inbound API endpoint. Properties: `endpoint`, `method` (HTTP verb
 One object per detected outbound cross-service call. Properties: `interaction_type` (http/grpc/mq/websocket), `protocol`, `endpoint`, `direction`, `confidence` (high/medium), `raw_target`, plus references to source `CodeModule` and `CodeFunction` UUIDs.
 
 ### Per-project collection prefixing
-All five code collections are prefixed with a sanitized project name (e.g. `VibecodeOrchestrator_CodeFunction`). `_sanitize_collection_prefix` ensures names are alphanumeric+underscore starting with uppercase. Bare base names (no prefix) are used as fallback when `project_name` is empty.
+All five code collections are prefixed with a per-project class prefix (e.g. `VibeCodedOrchestrator_CodeFunction`). The prefix is the stored `project_codegraph_bindings.collection_prefix` (the SSOT) when a binding exists, else it is derived from the project name via `canonical_class_prefix` (see below). Bare base names (no prefix) are used as fallback when `project_name` is empty.
 
-### v0.2.53: class-prefix sanitiser SSOT consolidation (NEW-10 / DEDUP-6)
-Pre-v0.2.53 the project had FOUR Python implementations of "sanitize a project name into a Weaviate class prefix" with three different fallback strings (`"vct"` lowercase, `"Vct"` capitalised, and one that raised on empty). v0.2.15 already burned the project on the same drift class. v0.2.53 Track F collapses to two SSOTs distinguished by their semantic contract:
+### Class-prefix naming SSOT (X-1, v0.2.76 — supersedes the v0.2.53 two-SSOT split)
+`vco_lib/codegraph_naming.py` is now the **single home** for both project-name sanitizers, distinguished by their semantic contract:
 
-- **Underscore-DROPPING** (canonical for project KG / Development collection names): `vco_lib/project_naming.py::canonical_class_prefix` stays the source of truth. `vco_lib/project_init.py::sanitize_for_weaviate_class` and `vco_lib/config_projection.py::_sanitize_kg_collection` are thin wrappers around it.
-- **Underscore-PRESERVING** (canonical for the code-graph MCP server contract): `vco_lib/codegraph_to_mermaid.py::_codegraph_mcp_sanitize_prefix` (renamed from `_sanitize_collection_prefix`). The docstring explicitly notes the divergent rule and links to the project_naming canonical so future readers don't mistake them for redundant copies.
+- **Underscore-PRESERVING** — `codegraph_naming.py::canonical_class_prefix`. Canonical for the code-graph class prefix (`<Prefix>_CodeFunction`, `<Prefix>_CodeClass`, …) and the value written to `CODE_GRAPH_PROJECT`. `"My_Project"` → `"My_Project"` (underscore kept). This is what the analyzer, the vct-hub resolver, and the `project_codegraph_bindings` seed all use, so the env value and the stored binding agree.
+- **Underscore-DROPPING** — `codegraph_naming.py::sanitize_for_weaviate_class`. Canonical for the KG / Development collection basenames (`<Basename>_KnowledgeGraph`, `<Basename>_Development`). `"My_Project"` → `"MyProject"` (underscore dropped). Out-of-domain fallback (empty or leading-digit) is the sentinel `"vct"`.
 
-An AST-level guard test (`tests/test_canonical_class_prefix_parity.py`) asserts the four call sites converge on the right SSOT for a fixed input matrix. The two SSOTs are intentionally NOT collapsed further — they represent two real Weaviate naming behaviours (the MCP server's `<Project>_CodeFunction` shape requires the underscore; the KG's `<Project>KnowledgeGraph` shape forbids it).
+Historical import paths are kept as **deprecation re-exports** — `vco_lib/project_naming.py::canonical_class_prefix` and `vco_lib/project_init.py::sanitize_for_weaviate_class` both re-export from `codegraph_naming`; `vco_lib/config_projection.py::_sanitize_kg_collection` is a thin wrapper around `sanitize_for_weaviate_class`. New call-sites should import from `codegraph_naming` directly.
+
+The two rules are intentionally NOT collapsed — they encode two real Weaviate naming behaviours (the code-graph `<Prefix>_CodeFunction` shape requires the underscore; the KG `<Basename>_KnowledgeGraph` shape drops it). Guard tests: `tests/test_codegraph_naming.py` (rules + fallbacks) and `tests/test_canonical_class_prefix_parity.py` (the call sites converge on the right SSOT). The env writers that render `CODE_GRAPH_PROJECT` (Rust `write_project_env_files`/`populate`, Python `project_env_from_db` and the standalone bundle writer) resolve **binding-first, canonical fallback** so an underscore-containing name never split-brains the analyzer against the stored binding.
 
 ### Deterministic UUIDs for upserts
 Entity UUIDs are generated as `uuid5(NAMESPACE_DNS, f"{project}::{full_name}")`. Re-analyzing the same file produces the same UUID, turning all inserts into Weaviate upserts and preventing duplicates.
@@ -144,23 +146,23 @@ Entity UUIDs are generated as `uuid5(NAMESPACE_DNS, f"{project}::{full_name}")`.
 ## Code Graph Analysis
 
 ### `analyze_code_graph.py` — main analysis script
-Full AST/regex code extraction engine at `.claude/scripts/analyze_code_graph.py`. Accepts a repo path and populates all five code graph collections.
+Full AST/regex code extraction engine at `.claude/scripts/analyze_code_graph.py`. Accepts a repo path and populates all five code graph collections. Since P2f (v0.2.76) the analyzer is walk + orchestration only: the per-language extractors were lifted out into the `vco_lib/codegraph_lang/` package (one module per language — `python.py`, `javascript.py`, `svelte.py`, `powershell.py`, `go.py`, `rust.py`, `java.py`, `ruby.py`, `shell.py`, `lua.py`, `cpp.py`, `csharp.py`, `proto.py`, plus shared helpers in `_shared.py`), dispatched through the `codegraph_lang.EXTRACTORS` registry. Each `_analyze_<lang>_file` method in the analyzer is a one-line delegator into that registry.
 
 ### Language support
-Python (full fidelity via `ast` module), plus regex-based extraction for: Lua, C++/C, JavaScript, TypeScript, JSX, Go, Rust, Java, Ruby, Shell, Svelte (v0.2.53), PowerShell (v0.2.53).
+Python (full fidelity via `ast` module), plus regex-based extraction for: Lua, C++/C, C#, JavaScript, TypeScript, JSX, Go, Rust, Java, Ruby, Shell, Proto, Svelte (v0.2.53), PowerShell (v0.2.53). Each maps to a module in `vco_lib/codegraph_lang/`.
 
-### Svelte parser (V52-O.11.B, v0.2.53 Track E)
-Adds `.svelte` to the language map (`templates/scripts/analyze_code_graph.py:375`). The parser splits a Svelte component into its three logical blocks (`<script>`, `<style>`, `<template>`), feeds the `<script>` block through the existing JS/TS extraction path, and surfaces top-level functions, reactive declarations (`$: name = ...` treated as function-shaped), and `export let`/`export const` props. Component name is extracted from the file stem. Multi-block tolerance: a Svelte file may have at most one default `<script>` and one `<script context="module">`; both are concatenated for analysis.
+### Svelte parser (`vco_lib/codegraph_lang/svelte.py`)
+The parser splits a Svelte component into its logical blocks (`<script>`, `<style>`, `<template>`), feeds the `<script>` block through the JS/TS extraction path, and surfaces top-level functions, reactive declarations (`$: name = ...` treated as function-shaped), and `export let`/`export const` props. Component name is extracted from the file stem. Multi-block tolerance: a Svelte file may have at most one default `<script>` and one `<script context="module">`; both are concatenated for analysis. Helpers `_extract_svelte_script_blocks` / `_parse_svelte_functions` live in the module and are unit-tested in isolation.
 
-Why it matters: the orchestrator's launcher SvelteKit frontend (244 `.svelte` files in `launcher/src/`) was invisible to the code graph pre-v0.2.53 — `search_code_graph` queries for Svelte component names returned no results. Helpers live alongside `_extract_svelte_script_blocks` / `_parse_svelte_functions` at lines 2264 / 2302 so they can be unit-tested in isolation. Test: `tests/test_svelte_parser.py`.
+Why it matters: the orchestrator's launcher SvelteKit frontend (hundreds of `.svelte` files in `launcher/src/`) was invisible to the code graph pre-v0.2.53 — `search_code_graph` queries for Svelte component names returned no results. Test: `tests/test_svelte_parser.py`.
 
-### PowerShell parser (V52-O.11.N, v0.2.53 Track E)
-Adds `.ps1` / `.psm1` / `.psd1` to the language map (same dispatch site). `_parse_powershell_functions` (line 2467) handles top-level `function Name { ... }` and `function Name([Type]$Arg) { ... }` shapes; `_analyze_powershell_file` (line 6515) routes them through the standard module/function emission pipeline.
+### PowerShell parser (`vco_lib/codegraph_lang/powershell.py`)
+`_parse_powershell_functions` handles top-level `function Name { ... }` and `function Name([Type]$Arg) { ... }` shapes; `analyze_powershell_file` routes them through the standard module/function emission pipeline.
 
-Why: the orchestrator's 168 PowerShell scripts under `templates/scripts/`, `templates/hooks/`, and `scripts/` (Windows-native siblings of the bash tooling) were invisible to the code graph. Test: `tests/test_powershell_parser.py`.
+Why: the orchestrator's PowerShell scripts under `templates/scripts/`, `templates/hooks/`, and `scripts/` (Windows-native siblings of the bash tooling) were invisible to the code graph. Test: `tests/test_powershell_parser.py`.
 
 ### Cross-service interaction extraction
-`_extract_external_calls` detects outbound HTTP (requests, httpx, aiohttp, axios, curl/wget), gRPC, message queue (Kafka, RabbitMQ, Redis pub/sub), and WebSocket calls. Three-gate false-positive filter: (1) import gate — only triggers if relevant library is imported; (2) literal gate — only extracts calls with a string literal target; (3) scope gate — strips triple-quoted strings to ignore URLs in docstrings.
+`_extract_external_calls` (shared helper in `vco_lib/codegraph_lang/_shared.py`, called by each per-language extractor) detects outbound HTTP (requests, httpx, aiohttp, axios, curl/wget), gRPC, message queue (Kafka, RabbitMQ, Redis pub/sub), and WebSocket calls. Three-gate false-positive filter: (1) import gate — only triggers if relevant library is imported; (2) literal gate — only extracts calls with a string literal target; (3) scope gate — strips triple-quoted strings to ignore URLs in docstrings.
 
 ### Schema migration for `CodeModule.import_names`
 `ensure_schema_migration` adds the `import_names` property to `CodeModule` if created before this property was introduced. Non-destructive; skips if already present.
