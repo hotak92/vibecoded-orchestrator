@@ -60,6 +60,7 @@ __all__ = [
     "CODEGRAPH_SKIP_SUFFIXES",
     "TRANSIENT_STATE_MARKER",
     "classify_row",
+    "is_deleted_primary_row",
     "path_is_ignored",
     "path_reachable_on_disk",
 ]
@@ -271,3 +272,62 @@ def classify_row(
             return "purgeable"
     # 7. Reachable, non-ignored, stale → a re-walk converges it.
     return "owed"
+
+
+def is_deleted_primary_row(
+    props: "Optional[Mapping[str, Any]]",
+    repo_root: "Optional[Path]",
+    *,
+    path_prop: str = "file_path",
+    primary_sources: "Optional[set]" = None,
+    reachable_fn=None,
+) -> bool:
+    """True when a row is a PRIMARY-source, path-bearing, deleted-from-disk row.
+
+    This is the REVISION-INDEPENDENT deleted-file predicate that the CG-4
+    whole-repo sweep deletes (analyzer's ``_clear_deleted_primary_rows``) and
+    the resync gate's cleanup-owed probe counts. Kept SEPARATE from
+    :func:`classify_row` on purpose: ``classify_row`` classifies a
+    current-revision deleted row as ``"not_owed"`` (correctly — a re-walk
+    cannot embed-converge a deleted file), so a row deleted while at the
+    current revision is invisible to the stale-only convergence path. Those
+    rows keep serving ``search_code_graph`` forever unless the whole-repo
+    sweep runs — but the resync gate never spawns the analyzer when the
+    embed-stale count is a positive zero. This predicate is the ONE home both
+    sides consult so the gate spawns exactly when the sweep would purge.
+
+    A row qualifies iff:
+
+    * it carries a non-empty ``path``/``file_path`` (pathless rows are the
+      classifier's ``purgeable`` orphan-clear job, not this sweep's), AND
+    * it belongs to the PRIMARY source — an empty/absent ``project_source``
+      (legacy / primary-only installs) OR a value in ``primary_sources``.
+      An extra-path row (non-empty ``project_source`` outside the primary
+      set) is NEVER judged here (B1 tenant isolation: it converges on its
+      own root's walk and this walk cannot judge its files' existence), AND
+    * its path does NOT resolve on disk inside the repo root. Reachability is
+      fail-SAFE toward KEEPING (:func:`path_reachable_on_disk` returns True on
+      any probe error / escape-uncertainty) — so a transient filesystem error
+      or a missing root never counts a live row as deleted.
+
+    ``reachable_fn`` optionally injects a memoized reachability predicate (one
+    syscall per unique path across a probe run); without it (and without
+    ``repo_root``) the reachability test cannot run and the row is treated as
+    NOT deleted (conservative: never spawn/purge on an unknowable root).
+    """
+    p = props or {}
+    raw_path = str(p.get(path_prop) or "")
+    if not raw_path:
+        return False  # pathless → classifier's orphan-clear owns it
+    # Primary-source scoping (mirror of classify_row step 2 / B1).
+    if primary_sources is not None:
+        src = str(p.get("project_source") or "").strip()
+        if src and src not in primary_sources:
+            return False
+    # Deleted-file test — revision-independent (the CG-4 gap).
+    if reachable_fn is not None:
+        return not reachable_fn(raw_path)
+    if repo_root is not None:
+        return not path_reachable_on_disk(raw_path, repo_root)
+    # No root/predicate → cannot determine deletion; conservative "not deleted".
+    return False

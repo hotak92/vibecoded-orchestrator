@@ -343,6 +343,112 @@ def test_spawn_proceeds_when_rows_owed(monkeypatch, tmp_path):
     assert result.status == "launched"
 
 
+# ─── A1 (v0.2.76 / CG-4): pure-deletion inertness — cleanup-owed gate ───────
+
+
+def test_count_cleanup_owed_counts_deleted_primary_current_rev(monkeypatch, tmp_path):
+    """A deleted-from-disk row at the CURRENT revision (embed-converged, so
+    count_stale_rows returns 0) IS counted by the cleanup-owed probe — this is
+    the CG-4 gap. A reachable current-revision row in the same collection is
+    NOT counted."""
+    monkeypatch.setattr(cr, "_collection_prefix", lambda name: "Proj")
+    (tmp_path / "live.py").write_text("# real\n")
+    func = _R3PathColl(agg_count=0, rows=[
+        {"embed_revision": 1, "file_path": "live.py"},   # reachable → keep
+        {"embed_revision": 1, "file_path": "gone.py"},   # deleted → owed sweep
+    ])
+    client = _client_for("Proj", _R3PathColl(0), _R3PathColl(0), func)
+    n = cr.count_cleanup_owed_rows("Proj", repo_root=tmp_path, client=client)
+    assert n == 1
+
+
+class _ConfigPathColl(_R3PathColl):
+    """Like _R3PathColl but exposes a `config.get()` advertising `project_source`
+    so the cleanup-owed probe's source-scoping path (B1) is exercised (the real
+    Weaviate collection has this; the bare fake's missing config disables
+    scoping defensively)."""
+
+    def __init__(self, agg_count, rows=None):
+        import types as _t
+
+        super().__init__(agg_count, rows=rows)
+        _props = [_t.SimpleNamespace(name=n) for n in
+                  ("file_path", "embed_revision", "project_source")]
+        self.config = _t.SimpleNamespace(
+            get=lambda: _t.SimpleNamespace(properties=_props)
+        )
+
+
+def test_count_cleanup_owed_ignores_extra_path_deleted_rows(monkeypatch, tmp_path):
+    """B1: an extra-path deleted row (project_source outside the primary root)
+    is NEVER counted — it converges on its own root's walk."""
+    monkeypatch.setattr(cr, "_collection_prefix", lambda name: "Proj")
+    func = _ConfigPathColl(agg_count=0, rows=[
+        {"embed_revision": 1, "file_path": "gone.py",
+         "project_source": "/some/other/root"},   # extra-path deleted → skip
+        {"embed_revision": 1, "file_path": "gone2.py",
+         "project_source": tmp_path.as_posix()},   # primary deleted → count
+    ])
+    client = _client_for("Proj", _R3PathColl(0), _R3PathColl(0), func)
+    n = cr.count_cleanup_owed_rows("Proj", repo_root=tmp_path, client=client)
+    assert n == 1
+
+
+def test_count_cleanup_owed_none_on_scan_failure(monkeypatch, tmp_path):
+    """An incomplete scan must never conclude 'nothing to clean' — None."""
+    monkeypatch.setattr(cr, "_collection_prefix", lambda name: "Proj")
+    broken = _AggColl(agg_raises=True, iter_raises=True)
+    client = _client_for("Proj", _R3PathColl(0), _R3PathColl(0), broken)
+    assert cr.count_cleanup_owed_rows("Proj", repo_root=tmp_path, client=client) is None
+
+
+def test_spawn_proceeds_when_cleanup_owed_despite_zero_stale(monkeypatch, tmp_path):
+    """ACT (the CG-4 fix): embed-stale count is a positive zero BUT a
+    deleted-primary row is owed a sweep → the gate must SPAWN (not not_owed),
+    so the analyzer's whole-repo CG-4 sweep runs."""
+    monkeypatch.setattr(cr, "code_embed_service_healthy", lambda *a, **k: True)
+    monkeypatch.setattr(cr, "count_stale_rows", lambda *a, **k: {"P_CodeFunction": 0})
+    monkeypatch.setattr(cr, "count_cleanup_owed_rows", lambda *a, **k: 3)
+    _stub_analyzer_tree(tmp_path)
+    monkeypatch.setattr(cr.subprocess, "Popen", lambda *a, **k: _FakeProc())
+    result = cr.spawn_background_resync(
+        tmp_path, "MyProj", python_exe="/usr/bin/python3"
+    )
+    assert result.status == "launched"
+
+
+def test_spawn_not_owed_when_zero_stale_and_zero_cleanup(monkeypatch, tmp_path):
+    """LEAVE-ALONE: embed-stale 0 AND no deleted-primary rows → not_owed,
+    NOTHING spawns (the CG-4 probe must not spawn on a fully-converged graph)."""
+    monkeypatch.setattr(cr, "code_embed_service_healthy", lambda *a, **k: True)
+    monkeypatch.setattr(cr, "count_stale_rows", lambda *a, **k: {"P_CodeFunction": 0})
+    monkeypatch.setattr(cr, "count_cleanup_owed_rows", lambda *a, **k: 0)
+    _stub_analyzer_tree(tmp_path)
+
+    def _no_spawn(*a, **k):
+        raise AssertionError("nothing may spawn on a fully-converged graph")
+
+    monkeypatch.setattr(cr.subprocess, "Popen", _no_spawn)
+    result = cr.spawn_background_resync(
+        tmp_path, "MyProj", python_exe="/usr/bin/python3"
+    )
+    assert result.status == "not_owed"
+
+
+def test_spawn_proceeds_when_cleanup_owed_undeterminable(monkeypatch, tmp_path):
+    """None from the cleanup-owed probe (Weaviate down mid-probe) → proceed
+    conservatively (never skip on uncertainty)."""
+    monkeypatch.setattr(cr, "code_embed_service_healthy", lambda *a, **k: True)
+    monkeypatch.setattr(cr, "count_stale_rows", lambda *a, **k: {"P_CodeFunction": 0})
+    monkeypatch.setattr(cr, "count_cleanup_owed_rows", lambda *a, **k: None)
+    _stub_analyzer_tree(tmp_path)
+    monkeypatch.setattr(cr.subprocess, "Popen", lambda *a, **k: _FakeProc())
+    result = cr.spawn_background_resync(
+        tmp_path, "MyProj", python_exe="/usr/bin/python3"
+    )
+    assert result.status == "not_owed"
+
+
 def test_install_shim_resolves_ledger_on_not_owed():
     """Source-level guard: install.py's shim handles not_owed by resolving
     the (deliberately foreign) resync ledger entry."""

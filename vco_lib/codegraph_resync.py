@@ -134,6 +134,7 @@ from vco_lib.codegraph_row_classify import (  # noqa: E402 — grouped with the 
     CODEGRAPH_SKIP_SUFFIXES,
     TRANSIENT_STATE_MARKER as _SHARED_TRANSIENT_STATE_MARKER,
     classify_row,
+    is_deleted_primary_row,
     path_is_ignored,
     path_reachable_on_disk,
 )
@@ -603,6 +604,126 @@ def count_stale_rows(
                 return None
             counts[coll_name] = n
         return counts
+    finally:
+        if own_client:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def count_cleanup_owed_rows(
+    project_name: str,
+    *,
+    repo_root: Path,
+    client=None,
+    weaviate_url: Optional[str] = None,
+    grpc_port: Optional[int] = None,
+) -> Optional[int]:
+    """A1 (v0.2.76 / CG-4): count PRIMARY-source rows whose file is gone from
+    disk — REGARDLESS of revision.
+
+    Why this exists (the CG-4 pure-deletion inertness gap): a ``git rm`` of a
+    file whose rows are already at the CURRENT ``embed_revision`` leaves those
+    rows embed-converged. ``count_stale_rows`` (which counts only ``"owed"``
+    rows) correctly returns 0 for them — a re-walk cannot embed-converge a
+    deleted file. So when such a deletion is the ONLY change, the resync gate
+    sees a positive-zero stale count and returns ``not_owed``, and the
+    analyzer (whose CG-4 whole-repo sweep, ``_clear_deleted_primary_rows``,
+    WOULD purge those rows) is never spawned. The deleted file's rows keep
+    surfacing in ``search_code_graph`` until the next real analyze — the same
+    immortal-ish shape v0.2.75 P1b killed elsewhere.
+
+    This probe closes the gap on the GATE side (classifier semantics stay
+    intact — ``classify_row`` still calls a converged deleted row
+    ``"not_owed"``): it counts exactly the rows the sweep would delete via the
+    ONE shared predicate :func:`is_deleted_primary_row`. When it returns > 0
+    the gate proceeds to spawn (the whole-repo walk runs the sweep). Scoped to
+    the three file-anchored collections (``_RESYNC_PROBE_BASES``), primary
+    source only (extra-path rows converge on their own root's walk — B1),
+    reachability memoized once per probe run.
+
+    Returns the count (``>= 0``), or ``None`` when undeterminable (Weaviate
+    down, prefix unresolvable, a collection unprobeable) — the caller treats
+    ``None`` conservatively (never a wrong "nothing to clean up").
+    """
+    if not project_name or repo_root is None:
+        return None
+    prefix = _collection_prefix(project_name)
+    if prefix is None:
+        return None
+
+    reachable_fn = _make_reachability_filter(repo_root)
+    # Primary-source scoping — the raw + resolved POSIX forms of the root
+    # (mirrors count_stale_rows / the analyzer sweep's B1 scoping). Empty →
+    # scoping off (conservative: judge every path-bearing row's reachability).
+    primary_sources: Optional[set] = set()
+    try:
+        primary_sources.add(Path(repo_root).as_posix())
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        primary_sources.add(Path(repo_root).resolve().as_posix())
+    except Exception:  # noqa: BLE001
+        pass
+    if not primary_sources:
+        primary_sources = None
+
+    own_client = False
+    if client is None:
+        client = _build_client(weaviate_url, grpc_port)
+        if client is None:
+            return None
+        own_client = True
+
+    try:
+        total = 0
+        for base in _RESYNC_PROBE_BASES:
+            coll_name = f"{prefix}_{base}"
+            path_prop = _PROBE_PATH_PROP.get(base, "file_path")
+            try:
+                if hasattr(client.collections, "exists") and not client.collections.exists(coll_name):
+                    continue
+                coll = client.collections.get(coll_name)
+            except Exception as exc:  # noqa: BLE001 — undeterminable
+                logger.warning(
+                    "codegraph cleanup-owed: cannot open %s: %s", coll_name, exc
+                )
+                return None
+            # Read the path + project_source (when the class carries it — an
+            # absent property 500s the iterator on schema variants, same
+            # defensive probe count_stale_rows / the analyzer sweep use).
+            read_props = [path_prop]
+            want_source = primary_sources is not None
+            if want_source:
+                try:
+                    present = {p.name for p in coll.config.get().properties}
+                    if "project_source" in present:
+                        read_props.append("project_source")
+                    else:
+                        want_source = False
+                except Exception:  # noqa: BLE001 — probe best-effort
+                    want_source = False
+            try:
+                for obj in coll.iterator(return_properties=read_props):
+                    props = getattr(obj, "properties", None) or {}
+                    if is_deleted_primary_row(
+                        props,
+                        repo_root,
+                        path_prop=path_prop,
+                        primary_sources=primary_sources if want_source else None,
+                        reachable_fn=reachable_fn,
+                    ):
+                        total += 1
+            except Exception as exc:  # noqa: BLE001 — undeterminable
+                logger.warning(
+                    "codegraph cleanup-owed: scan failed on %s: %s",
+                    coll_name, exc,
+                )
+                # An incomplete scan must never authorise a "nothing to clean"
+                # conclusion — return None (conservative).
+                return None
+        return total
     finally:
         if own_client:
             try:
@@ -1220,14 +1341,44 @@ def spawn_background_resync(
             logger.warning("codegraph resync: owed-probe raised: %s", exc)
             stale_counts = None
         if stale_counts is not None and sum(stale_counts.values()) == 0:
-            return ResyncTriggerResult(
-                status="not_owed",
-                message=(
-                    f"no resync owed for {project_name} — all rows at the "
-                    "current embed revision"
-                ),
+            # A1 (v0.2.76 / CG-4): a positive-zero embed-stale count does NOT
+            # mean "nothing owed". A file deleted from disk while its rows were
+            # at the current revision leaves them embed-converged (classify_row
+            # → not_owed, correctly), so the stale count is 0 — but those rows
+            # still serve stale search results until the analyzer's whole-repo
+            # CG-4 sweep purges them, and the gate would never spawn the
+            # analyzer for a pure deletion. Before short-circuiting not_owed,
+            # probe for such deleted-primary rows; ANY positive count means the
+            # sweep is owed → fall through to spawn (the whole-repo walk runs
+            # it). Undeterminable (None) is conservative: proceed like the
+            # pre-fix path (never skip on uncertainty). repo_root is required
+            # for the reachability test — without it we cannot judge deletion,
+            # so we keep the original not_owed (the reachability-gated stale
+            # count already ran the same way).
+            cleanup_owed = None
+            if repo_root is not None:
+                try:
+                    cleanup_owed = count_cleanup_owed_rows(
+                        project_name, repo_root=repo_root
+                    )
+                except Exception as exc:  # noqa: BLE001 — probe must never block
+                    logger.warning(
+                        "codegraph resync: cleanup-owed probe raised: %s", exc
+                    )
+                    cleanup_owed = None
+            if not (cleanup_owed and cleanup_owed > 0):
+                return ResyncTriggerResult(
+                    status="not_owed",
+                    message=(
+                        f"no resync owed for {project_name} — all rows at the "
+                        "current embed revision"
+                    ),
+                )
+            logger.info(
+                "codegraph resync: %d deleted-primary row(s) owed a CG-4 "
+                "sweep (embed-stale count is 0) — spawning", cleanup_owed
             )
-        if stale_counts:
+        elif stale_counts:
             owed = {k: v for k, v in stale_counts.items() if v}
             logger.info("codegraph resync: stale rows owed: %s", owed)
 

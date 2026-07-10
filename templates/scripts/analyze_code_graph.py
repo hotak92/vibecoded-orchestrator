@@ -486,6 +486,7 @@ try:
         CODEGRAPH_SKIP_SUFFIXES as _VCO_CODEGRAPH_SKIP_SUFFIXES,
         TRANSIENT_STATE_MARKER as _VCO_TRANSIENT_STATE_MARKER,
         classify_row,
+        is_deleted_primary_row,
         path_is_ignored,  # noqa: F401 — re-exported (parity test asserts identity)
         path_reachable_on_disk,
     )
@@ -5072,18 +5073,15 @@ class CodeGraphAnalyzer:
         to ``(0, 0)`` (an incomplete scan must never authorise deletes).
         """
         def _is_deleted_primary(raw_path, _props):
-            del raw_path  # re-read from _props (the helper's own read-back)
-            path_val = str(_props.get(path_prop) or "")
-            if not path_val:
-                return False  # pathless → classifier's orphan-clear owns it
-            # Primary-source scoping (mirror of classify_row step 2 / B1): an
-            # extra-path row (non-empty source outside the primary set) is never
-            # judged here.
-            src = str(_props.get("project_source") or "").strip()
-            if src and primary_sources and src not in primary_sources:
-                return False
-            # Deleted-file test — revision-independent (the CG-4 gap).
-            return not _path_reachable_on_disk(path_val, repo_root)
+            del raw_path  # re-read from _props via the shared predicate
+            # v0.2.76 (A1 / CG-4): route through the ONE shared predicate
+            # `is_deleted_primary_row` (vco_lib.codegraph_row_classify) — the
+            # SAME home the resync gate's cleanup-owed probe consults, so the
+            # gate spawns exactly when this sweep would purge.
+            return is_deleted_primary_row(
+                _props, repo_root, path_prop=path_prop,
+                primary_sources=primary_sources or None,
+            )
 
         try:
             return _delete_file_rows_exact(
