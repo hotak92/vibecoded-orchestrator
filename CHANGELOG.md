@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.76] - 2026-07-10
+
 ### Security
 - **The hub no longer hands every local process a master key to every
   project's secrets.** Before, the only credential a resolver could present
@@ -21,7 +23,174 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one-release compatibility window. `VCT_HUB_LEGACY_GLOBAL_ENV=0` refuses
   the global token on those two routes now (default flips to refuse next
   release). All other `/api/v1` routes keep using the global token
-  unchanged. (v0.2.76 Part 4)
+  unchanged. (Part 4)
+- **The bash-security scanner's remediation now points at paths that exist
+  where it runs.** The credential-block message pointed at
+  `tools/vct-secrets/vct` and `templates/scripts/vct_secrets_resolve.sh` —
+  paths that exist only in the orchestrator clone, never in a deployed
+  project where the scanner actually fires. It now points at the bundled
+  `.claude/scripts/vct_secrets_resolve.sh` and `vco_lib.agent_secrets.get`.
+  Two over-broad rules are also tightened so benign compound commands stop
+  tripping the guard: `env_exfil_curl` now requires the env-enumeration to be
+  the DIRECT pipe source (no spanning `;`/`&&` to an unrelated later network
+  tool), and `read_env_files` matches a `cat <credential-file>` READ rather
+  than a write-redirect to an `.env` or a stray `.env` token later in the
+  line. Genuine env-dump exfil and credential-file reads stay blocked. (R6)
+
+### Changed
+- **Naming and sanitizer rules now live in one place, cross-language.**
+  The underscore-DROPPING KG class sanitizer (`sanitize_for_weaviate_class`)
+  and the underscore-PRESERVING code-graph prefix (`canonical_class_prefix`)
+  are consolidated into one source of truth, `vco_lib/codegraph_naming.py`,
+  which ships a machine-readable CLI (`python -m vco_lib.codegraph_naming
+  [--kg|--prefix] <name>`) for latency-tolerant callers; `project_init` and
+  `project_naming` keep thin deprecation re-exports so every importer still
+  works. The two Rust KG-sanitizer copies are unified with the Python
+  behaviour at the source: out-of-domain input (empty / all-non-alnum /
+  leading-digit) now resolves to the shared sentinel prefix `vct` on both
+  languages, retiring the old Rust `"Project"` / `"P"`-prepend divergence.
+  The shared parity fixture bumps to format-version 2 and RETIRES its
+  `divergent` array — the cross-language lock now enforces convergence on
+  every input. (X-1)
+- **Loud-fail replaces silent-degrade for shared-code imports.** Following
+  the "share, don't mirror" discipline, the code-graph schema-migration edges
+  (`4_to_5` / `5_to_6`), the analyzer template, and the analyzer's
+  `weaviate_mcp` helpers no longer carry silent inline fallbacks or
+  byte-identical MUST-MATCH mirrors of `vco_lib` / `weaviate_mcp` code. Each
+  now imports the canonical implementation directly (the classifier,
+  `canonical_class_prefix`, the schema property specs, code truncation +
+  test-path detection); a failing import surfaces a clear broken-install
+  message + non-zero exit BEFORE any walk, rather than quietly running a
+  divergent copy. A migration edge that fails this way does not advance the
+  recorded schema version — it defers and self-heals on the next `--update`
+  once `vco_lib` is importable again. The orchestrator template's modularity
+  rule is rewritten from "mirror, don't fork" to a three-tier "share, don't
+  mirror (A shared code > B shared config > C mirror-of-last-resort)". (X-1)
+- **One writer home for the launcher.db binding tables.** A new Rust
+  `bindings_writer` module is the single derive-name-then-write orchestration
+  point for the KG and code-graph binding tables, and grep-gate lints (both
+  languages) fail any open-coded `INSERT`/`UPDATE` on those tables from an
+  unauthorized file. The binding self-heal now logs `[kg-heal] changed=N`
+  with a per-pass breakdown, the KPI a future release will use to demote the
+  heal to assert-only once N stays 0.
+
+### Added
+- **The code-graph analyzer is restructured behind a golden-snapshot
+  contract, and the monolith is split into per-language modules.** A
+  CodeEntity intermediate representation (`vco_lib/codegraph_entities.py`)
+  now owns the insert-params assembly and identity-key derivation the ~20
+  `_dedup_insert` call-sites each duplicated, funneling every emit through the
+  unchanged dedup/fingerprint/chunking choke-point. All 14 language extractors
+  move verbatim out of the analyzer into a new `vco_lib/codegraph_lang/`
+  package (python, powershell, rust, javascript/typescript, go, java, csharp,
+  cpp, ruby, lua, shell, proto, svelte) behind a registry the analyzer
+  imports loud-fail. The whole refactor is pinned by a multi-language golden
+  fixture corpus + harness (`tests/test_codegraph_golden.py`) that drives the
+  REAL analyzer over recording fake collections and asserts byte-identical
+  snapshots, plus a line-count ratchet that only ever moves downward. Net
+  effect: `analyze_code_graph.py` drops from 11,010 to 7,215 lines with
+  golden snapshots byte-identical throughout, and the ratchet now blocks any
+  PR that grows extractor logic back into the analyzer. (P2f)
+- **Hook synchronous-latency work + a regression guard.** A synchronous
+  hook-latency measurement harness (`tests/perf/hook_latency_probe.py`) drives
+  every registered POSIX hook the way Claude Code does and reports p50/p95
+  per hook and per-event blocking totals. Acting on it: `pre-tool-use.sh`
+  (fires on every tool call) and `post-tool-security.sh` (every Edit/Write)
+  each collapse their redundant per-field stdin parses (6 and 4 separate
+  Python cold-starts) into ONE NUL-delimited decode — byte-identical parsed
+  values, ~halved p50 on the hottest hook — and the `Stop` RL citation drain
+  is detached (was `( … ) & wait`, functionally synchronous) so `Stop`
+  returns immediately while the drain runs fire-and-forget with observable
+  logs. A coarse always-on CI guard trips a future re-introduction of a
+  blocking embed/network/analyzer call on the hot path.
+
+### Fixed
+- **A wedged Secret Service can no longer hang keychain operations forever.**
+  The keyring op (D-Bus negotiation, set/get/delete) could block unboundedly
+  when the OS Secret Service is slow or wedged (observed: a 13+ minute hang at
+  ~0% CPU), which stalled the hub `/env` handler, any launcher keychain
+  command, and the test binary. A single bounded-timeout primitive
+  (one long-lived worker thread + `recv_timeout`, 10s/op) now wraps
+  set/get/delete OUTSIDE the existing pacing/backoff; a timed-out op parks on
+  the worker and the NEXT op fast-fails rather than leaking a thread. The
+  three duplicated raw-canary keychain-availability probes are replaced with
+  one shared timeout-guarded helper.
+- **A pure git-rm no longer leaves deleted-file rows serving search
+  results.** Deleting a file whose code-graph rows were already at the current
+  embed revision left them embed-converged, so the stale-row count was zero
+  and the resync gate returned `not_owed` — never spawning the analyzer whose
+  whole-repo sweep would purge them (the CG-4 inertness gap). The gate now
+  also counts deleted-primary rows regardless of revision, via the one shared
+  `is_deleted_primary_row` predicate both the gate probe and the analyzer
+  sweep route through, and spawns when cleanup is owed. (CG-4)
+- **A working install running an older hub no longer false-alarms on
+  reachability.** The container→hub reachability probe treated an absent
+  `hub.bind` discovery file (a pre-0.2.75 hub that never wrote one) as a
+  definitive FAILURE, emitting a loud ERROR + an audit row on every module
+  start. Absent `hub.bind` is now a three-way `Unknown` verdict (an
+  informational line, no audit row); a recorded `127.0.0.1` stays a definitive
+  failure and a widened bind still follows the in-container probe.
+- **`hybrid_search` / `semantic_graph_search` no longer return a silent zero
+  on a total fan-out failure.** In the collection fan-out a per-collection
+  SCHEMA error was recorded but a GENERIC exception was only logged and
+  dropped — so if EVERY collection failed with a generic error the tool
+  returned a clean success payload with 0 results and no failure signal (the
+  hole behind a live "0 hits on every query" report). Generic failures are now
+  recorded too: no collection succeeded + any failed → a loud `RuntimeError`
+  naming per-collection reasons; some succeeded + some failed → a
+  `degraded.failed_collections` key on the success payload so the caller sees
+  partial coverage. Both fan-outs fixed. (R7)
+- **Shared-KG canonical-pointer drift self-heals instead of re-seeding dead
+  access rows.** On a white-label / rebind install the access seeder's pointer
+  (`orchestrator_root_kg_collection`) could diverge from the real canonical
+  shared collection (`last_installed_shared_kg_collection`), so the seeder
+  minted access rows for a class absent from the vector store — a dead peer in
+  every search fan-out, re-broken by each update. The write-side seed path now
+  converges the pointer, and a self-heal pass converges it and rewrites only
+  SEED-authored stale rows when there is TRIPLE agreement (the last value is
+  non-empty AND its class exists in the store AND it matches the shared-role
+  binding consensus); divergence without agreement writes a deferral and
+  touches nothing. Wired into BOTH update surfaces (`install.py --update` and
+  `install-bundle --update`), metadata-only — no vector-store writes, no sync
+  enqueues, and it never re-embeds. Idempotent against an already-repaired DB.
+  (R8)
+- **The code-graph binding prefix for a new project matches its collections.**
+  The new-binding path derived the code-graph prefix via the KG-name sanitizer,
+  which DROPS underscores, while the analyzer stamps collections with the
+  underscore-PRESERVING `canonical_class_prefix` — so a project whose name
+  contains an underscore got a binding prefix that never matched its classes.
+  New bindings now derive via `canonical_class_prefix`; existing bindings on
+  live installs stay authoritative and are never re-derived. (R2)
+- **`vct`'s file-store miss message is hub-aware instead of a divergent-copy
+  trap.** A secret saved through the launcher GUI lives in the OS keychain
+  (served by the hub `/env`), invisible to the file-store-only `vct get`,
+  whose miss error said only "Fix: `vct set …`" — following which forks a
+  SECOND on-disk copy. On a miss, `get`/`resolve`/`exec` now probe the hub
+  (bounded, localhost-only, token off argv, silent soft-fail when absent); when
+  the hub HAS the key the error points at the resolver instead of `vct set`.
+  `vct` stays file-store-scoped and never prints the keychain value. The
+  resolver triplet's hub-unreachable / `401` messages also gain an honest hint
+  to restart the launcher + reload the editor after an orchestrator update
+  (the hub rotates its token on restart, so a pre-update session can hold a
+  stale one). (R4 / R5)
+
+### Removed
+- **Dead code cleanup in the code-graph analyzer.** An unused string-literal
+  stripper (and the four contract tests pinning it), an unused PowerShell
+  parameter-attribute constant, and two assigned-but-never-read locals are
+  deleted; a helper docstring referencing a nonexistent function is corrected.
+
+### Documentation
+- **KG access-matrix wiring is audited, corrected, and pinned.** A stale
+  `server.py` comment claiming the hub write-level access endpoint "doesn't
+  exist yet" is fixed (it is live), and a deny-by-design comment is added to
+  both `require_kg_read` copies: an absent `kg_collection_access` row is a
+  DENY, deliberately NOT aligned with the write endpoint's fail-open default.
+  A Rust unit test pins it (granted → Ok, absent row → Err, explicit `none` →
+  Err). An installer decision-site comment also notes the solo-clear
+  JSON-desync edge (dual-unlink removes a co-present `UPDATE_DEFERRED.json`;
+  the normal lock-step write and the reconcile backstop prevent it in
+  practice). (R9)
 
 ## [0.2.75] - 2026-07-08
 
