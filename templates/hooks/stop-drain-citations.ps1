@@ -42,9 +42,30 @@ $Drain = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_drain_citations.p
 if (-not (Test-Path $Drain)) { exit 0 }
 if (-not $VenvPy -or -not (Test-Path $VenvPy)) { exit 0 }
 
+# v0.2.76 P5 (hook-latency): DETACH the drain via Start-Process so its
+# answer-window embed COMPUTE + telemetry write NEVER block the Stop return.
+# Previously this ran the drain SYNCHRONOUSLY (`& $VenvPy ... *> $null`), so
+# the Stop hook blocked for the whole drain. The drain is fire-and-forget by
+# design: no consumer reads its result within this Stop event, and the RL
+# call-sequence is assigned + frozen UPSTREAM in the MCP subprocess
+# (rl_state.next_rl_call_seq) at retrieval time -- the drain only READS the
+# staged seq to locate the transcript position, so detaching cannot reorder
+# staged-seq vs monitor-seq. MUST MATCH the .sh sibling's setsid/nohup detach.
+#
+# Errors stay OBSERVABLE: redirect the detached process's stdout/stderr to a
+# per-run log under .claude/logs/ (overwritten each Stop, so bounded) rather
+# than $null. rl_drain_citations soft-fails internally and prints a
+# "soft-fail (...)" line on any exception, which lands in the log.
+$DrainLog = Join-Path $ProjectRoot ".claude/logs/rl_drain_citations.log"
+try { New-Item -ItemType Directory -Force -Path (Split-Path $DrainLog) -ErrorAction SilentlyContinue | Out-Null } catch { }
 try {
     $env:CLAUDE_PROJECT_DIR = $ProjectRoot
-    & $VenvPy $Drain --session-id $SessionId --transcript-path $TranscriptPath *> $null
+    Start-Process -FilePath $VenvPy `
+        -ArgumentList @($Drain, "--session-id", $SessionId, "--transcript-path", $TranscriptPath) `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput $DrainLog `
+        -RedirectStandardError "$DrainLog.err" `
+        -ErrorAction SilentlyContinue | Out-Null
 } catch { }
 
 exit 0

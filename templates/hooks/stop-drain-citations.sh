@@ -68,12 +68,45 @@ VENV="${VCO_VENV_PYTHON:-}"
 DRAIN="$PROJECT_ROOT/claude_mcp_servers/scripts/rl_drain_citations.py"
 [ -f "$DRAIN" ] || exit 0
 
-# Run the drain. Backgrounded + waited so a slow embed never holds up the turn
-# beyond the hook timeout; soft-fail on any error.
-( CLAUDE_PROJECT_DIR="$PROJECT_ROOT" "$VENV" "$DRAIN" \
-    --session-id "$SESSION_ID" \
-    --transcript-path "$TRANSCRIPT_PATH" >/dev/null 2>&1 ) &
-DRAIN_PID=$!
-wait "$DRAIN_PID" 2>/dev/null || true
+# v0.2.76 P5 (hook-latency): DETACH the drain so its answer-window embed
+# COMPUTE + telemetry write NEVER block the Stop return (the user waits for
+# the turn to end). Previously this ran `( ... ) & wait`, which is functionally
+# SYNCHRONOUS — the Stop hook blocked for the entire drain (embed compute on
+# every eligible pending citation). The drain is fire-and-forget by design (see
+# the file header + rl_drain_citations.py docstring): NO consumer reads its
+# result within this Stop event, and the RL call-sequence is assigned entirely
+# UPSTREAM in the MCP subprocess (rl_state.next_rl_call_seq) and frozen into the
+# staged pending file at retrieval time — the drain only READS that seq to
+# locate the transcript position, it never generates or reorders a seq. So
+# detaching cannot reorder staged-seq vs monitor-seq (verified: no
+# next_rl_call_seq reference in the drain path; the pending-file one-shot
+# delete_pending is the idempotency guard). ACCUMULATE-DON'T-DROP still holds:
+# a below-gate window is left for the next Stop drain regardless of timing.
+#
+# Detach strategy mirrors kg-sync-debounce.sh / stop-codegraph-drain.sh:
+#   setsid (new session, fully detached) → nohup+disown (SIGHUP-immune, off the
+#   job table) → in-process `( ... ) &` fallback. A failure only reverts to a
+#   same-group background job; the drain is never dropped.
+#
+# Errors stay OBSERVABLE (not silently swallowed): the drain's stdout/stderr is
+# redirected to a per-run log under .claude/logs/ (bounded — overwritten each
+# Stop, so it can't grow) rather than /dev/null. rl_drain_citations soft-fails
+# internally (always exit 0) and prints a "soft-fail (...)" line on any
+# exception; that line lands in the log for post-hoc debugging.
+DRAIN_LOG="$PROJECT_ROOT/.claude/logs/rl_drain_citations.log"
+mkdir -p "$PROJECT_ROOT/.claude/logs" 2>/dev/null || true
+# Build the detached command. Args are embedded via a single-quoted snippet run
+# through `sh -c`; SESSION_ID / TRANSCRIPT_PATH are shell-quoted so a path with
+# spaces survives the extra sh -c layer.
+_shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+_DRAIN_SNIP="CLAUDE_PROJECT_DIR=$(_shq "$PROJECT_ROOT") $(_shq "$VENV") $(_shq "$DRAIN") --session-id $(_shq "$SESSION_ID") --transcript-path $(_shq "$TRANSCRIPT_PATH") > $(_shq "$DRAIN_LOG") 2>&1"
+if command -v setsid >/dev/null 2>&1; then
+    setsid sh -c "$_DRAIN_SNIP" >/dev/null 2>&1 < /dev/null &
+elif command -v nohup >/dev/null 2>&1; then
+    nohup sh -c "$_DRAIN_SNIP" >/dev/null 2>&1 < /dev/null &
+    disown 2>/dev/null || true
+else
+    ( sh -c "$_DRAIN_SNIP" ) >/dev/null 2>&1 < /dev/null &
+fi
 
 exit 0
