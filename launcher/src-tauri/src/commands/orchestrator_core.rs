@@ -179,26 +179,40 @@ fn tail_1kb(s: &str) -> String {
     format!("…(truncated)…\n{}", &s[anchor..])
 }
 
-/// Choose the `.claude/scripts/<name>` for POSIX shells or the `.ps1`
-/// variant on Windows. Returns absolute path; caller must verify it
-/// exists before invoking.
-fn script_path(project_folder: &PathBuf, name: &str) -> PathBuf {
-    let ext = if cfg!(windows) { ".ps1" } else { "" };
-    project_folder.join(".claude/scripts").join(format!("{}{}", name, ext))
+/// OS-correct bundled-script basename: `<name>.ps1` on Windows, `<name>` on
+/// POSIX.
+fn script_bin(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{}.ps1", name)
+    } else {
+        name.to_string()
+    }
 }
 
 /// Build a tokio Command that invokes a `.claude/scripts/*` wrapper
 /// with the right interpreter. On Windows we shell through powershell;
 /// on POSIX we run the bash script directly (it has a shebang).
+///
+/// v0.2.77: resolution goes through the shared
+/// `codegraph::resolve_bundled_script` ladder — project-local first (with
+/// the stale-wrapper guard for RT-4 wrappers), then the ORCHESTRATOR copy
+/// (`$VCT_LAUNCHER_SCRIPTS_DIR` → sibling-of-exe → PATH). Previously this was
+/// project-local ONLY and errored outright when the project's
+/// `.claude/scripts/` was missing (the live-bug (b) surface for kg-sync /
+/// kg-duplicates / code-graph-analyze during "update all projects"). The
+/// fallback is additive: a healthy project-local script still wins.
 fn build_script_command(project_folder: &PathBuf, name: &str) -> Result<Command, String> {
-    let path = script_path(project_folder, name);
-    if !path.exists() {
-        return Err(format!(
-            "script {} not found — is the project's .claude/scripts/ \
-             populated? (re-run the project's bundle install if not)",
-            path.display()
-        ));
-    }
+    let bin = script_bin(name);
+    let path = crate::commands::codegraph::resolve_bundled_script(project_folder, &bin)
+        .ok_or_else(|| {
+            format!(
+                "script {} not found — neither the project's .claude/scripts/ \
+                 nor the orchestrator copy (VCT_LAUNCHER_SCRIPTS_DIR / \
+                 sibling-of-exe / PATH) resolved. Re-run the project's bundle \
+                 install if the project-local copy is missing.",
+                bin
+            )
+        })?;
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("powershell").silent();
         c.arg("-NoProfile")
@@ -766,19 +780,115 @@ mod tests {
         assert!(out.contains("文"), "must contain a full char post-truncation");
     }
 
-    /// `script_path` produces `.ps1` on Windows and bareword on POSIX.
+    /// `script_bin` produces `.ps1` on Windows and bareword on POSIX.
     /// The OS-specific assertion uses `cfg!(windows)` to stay valid
     /// on both targets.
     #[test]
-    fn script_path_extension_matches_os() {
-        let folder = PathBuf::from("/tmp/proj");
-        let p = script_path(&folder, "kg-sync");
-        let last = p.file_name().unwrap().to_string_lossy().to_string();
+    fn script_bin_extension_matches_os() {
+        let bin = script_bin("kg-sync");
         if cfg!(windows) {
-            assert_eq!(last, "kg-sync.ps1");
+            assert_eq!(bin, "kg-sync.ps1");
         } else {
-            assert_eq!(last, "kg-sync");
+            assert_eq!(bin, "kg-sync");
         }
+    }
+
+    /// v0.2.77: `build_script_command` falls back to the ORCHESTRATOR copy
+    /// when the project has no `.claude/scripts/` of its own. Previously it
+    /// errored outright. We point `$VCT_LAUNCHER_SCRIPTS_DIR` at an
+    /// orchestrator scripts dir (candidate 2 of the shared ladder) and assert
+    /// the command builds successfully for a project folder with NO local
+    /// scripts.
+    #[test]
+    fn build_script_command_falls_back_to_orchestrator_copy() {
+        let bin = script_bin("kg-sync");
+
+        // Project WITHOUT its own .claude/scripts/.
+        let proj = std::env::temp_dir().join(format!(
+            "vct-bsc-proj-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&proj).unwrap();
+
+        // Orchestrator scripts dir reachable via VCT_LAUNCHER_SCRIPTS_DIR.
+        let orch = std::env::temp_dir().join(format!(
+            "vct-bsc-orch-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&orch).unwrap();
+        let orch_script = orch.join(&bin);
+        std::fs::write(&orch_script, b"#!/bin/bash\necho ok\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&orch_script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&orch_script, perms).unwrap();
+        }
+
+        // SAFETY: crate tests run single-threaded by default.
+        let saved_override = std::env::var_os("VCT_LAUNCHER_SCRIPTS_DIR");
+        unsafe {
+            std::env::set_var("VCT_LAUNCHER_SCRIPTS_DIR", &orch);
+        }
+
+        let built = build_script_command(&proj, "kg-sync");
+
+        unsafe {
+            match saved_override {
+                Some(v) => std::env::set_var("VCT_LAUNCHER_SCRIPTS_DIR", v),
+                None => std::env::remove_var("VCT_LAUNCHER_SCRIPTS_DIR"),
+            }
+        }
+
+        assert!(
+            built.is_ok(),
+            "orchestrator fallback must resolve when project-local is absent: {:?}",
+            built.err()
+        );
+
+        std::fs::remove_dir_all(&proj).ok();
+        std::fs::remove_dir_all(&orch).ok();
+    }
+
+    /// Leave-alone case: when NOTHING resolves (no project-local, no
+    /// orchestrator copy on any candidate), `build_script_command` still
+    /// errors with a clear message.
+    #[test]
+    fn build_script_command_errors_when_nothing_resolves() {
+        let proj = std::env::temp_dir().join(format!(
+            "vct-bsc-none-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&proj).unwrap();
+
+        // SAFETY: crate tests run single-threaded by default.
+        let saved_override = std::env::var_os("VCT_LAUNCHER_SCRIPTS_DIR");
+        let saved_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("VCT_LAUNCHER_SCRIPTS_DIR", &proj); // empty dir
+            std::env::set_var("PATH", "");
+        }
+
+        let built = build_script_command(&proj, "kg-duplicates");
+
+        unsafe {
+            match saved_override {
+                Some(v) => std::env::set_var("VCT_LAUNCHER_SCRIPTS_DIR", v),
+                None => std::env::remove_var("VCT_LAUNCHER_SCRIPTS_DIR"),
+            }
+            if let Some(p) = saved_path {
+                std::env::set_var("PATH", p);
+            }
+        }
+
+        // May still find a sibling-of-exe hit on a dev box; only assert the
+        // error shape when it genuinely didn't resolve.
+        if let Err(e) = built {
+            assert!(e.contains("not found"), "clear not-found error: {}", e);
+        }
+
+        std::fs::remove_dir_all(&proj).ok();
     }
 
     /// `resolve_project_folder` returns a clear error when the project

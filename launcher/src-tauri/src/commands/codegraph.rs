@@ -1645,33 +1645,61 @@ pub(crate) fn resolve_analyzer_script(project_folder: &std::path::Path) -> Optio
     } else {
         "code-graph-analyze"
     };
+    resolve_bundled_script(project_folder, bin)
+}
 
-    // 1. Project-local — but only if it's a RESILIENT (RT-4-era) wrapper.
-    //    Live bug (2026-07-10 dogfood): a project shipped a stale 2026-02
-    //    (pre-RT-4) `code-graph-analyze` that hardcoded an absolute venv
-    //    path; the launcher preferred it over the healthy orchestrator copy
-    //    on MERE EXISTENCE, and the build exited 127. Health-check the
-    //    marker before trusting the project-local wrapper. Stale/unreadable
-    //    → skip candidate 1, WARN once, surface a per-project deferral
-    //    suggesting a single-file `--force` refresh, and fall through to the
-    //    orchestrator candidates (2-4), which are healthy by definition of
-    //    the ladder. Conservative default: can't read → treat as stale.
+/// Generic resolver for a bundled `.claude/scripts/<bin>` wrapper, shared by
+/// `resolve_analyzer_script` (code-graph-analyze) and
+/// `orchestrator_core::build_script_command` (kg-sync, kg-duplicates,
+/// code-graph-analyze). One home for the candidate ladder + stale-guard so a
+/// fix here reaches every wrapper.
+///
+/// Order:
+///   1. Project-local `<project>/.claude/scripts/<bin>` — but for wrappers
+///      that ship the resilient (RT-4-era) interpreter ladder, ONLY if the
+///      copy on disk still carries the ladder marker. A stale pre-RT-4 copy
+///      (or an unreadable file) is skipped: WARN once, emit a best-effort
+///      per-project deferral, and fall through to the orchestrator copy.
+///   2-4. Orchestrator copy via `$VCT_LAUNCHER_SCRIPTS_DIR`, sibling-of-exe,
+///      then PATH — see `resolve_orchestrator_script`.
+///
+/// Returns `None` if nothing resolves.
+pub(crate) fn resolve_bundled_script(
+    project_folder: &std::path::Path,
+    bin: &str,
+) -> Option<std::path::PathBuf> {
+    // 1. Project-local.
     let p1 = project_folder.join(".claude").join("scripts").join(bin);
     if p1.is_file() {
-        if analyzer_wrapper_is_resilient(&p1) {
+        // Live bug (2026-07-10 dogfood): a project shipped a stale 2026-02
+        // (pre-RT-4) `code-graph-analyze` that hardcoded an absolute venv
+        // path; the launcher preferred it on MERE EXISTENCE and the build
+        // exited 127. For wrappers that ship the resilient ladder, require
+        // the marker before trusting the project-local copy. Wrappers that
+        // never carried the marker (e.g. kg-duplicates) skip the check —
+        // marker-checking them would flag every healthy copy as stale.
+        if !wrapper_requires_resilience_marker(bin) || analyzer_wrapper_is_resilient(&p1) {
             return Some(p1);
         }
         eprintln!(
-            "[codegraph] WARN: project-local analyzer wrapper {} is stale \
+            "[codegraph] WARN: project-local wrapper {} is stale \
              (pre-RT-4: no resilient interpreter-discovery marker) — falling \
              back to the orchestrator copy. A single-file bundle refresh will \
              heal it.",
             p1.display()
         );
         emit_stale_wrapper_deferral(project_folder, bin, &p1);
-        // fall through to candidates 2-4 below
+        // fall through to the orchestrator candidates below
     }
 
+    resolve_orchestrator_script(bin)
+}
+
+/// Candidates 2-4 of the bundled-script ladder: the ORCHESTRATOR copy of
+/// `<bin>`, reached via `$VCT_LAUNCHER_SCRIPTS_DIR`, sibling-of-exe, then
+/// PATH. Split out so both the project-local-first resolver and any
+/// orchestrator-fallback caller share ONE candidate walk.
+pub(crate) fn resolve_orchestrator_script(bin: &str) -> Option<std::path::PathBuf> {
     // 2. Env override
     if let Ok(dir) = std::env::var("VCT_LAUNCHER_SCRIPTS_DIR") {
         let p2 = std::path::PathBuf::from(dir).join(bin);
@@ -1703,6 +1731,16 @@ pub(crate) fn resolve_analyzer_script(project_folder: &std::path::Path) -> Optio
         }
     }
     None
+}
+
+/// Which bundled wrappers ship the resilient (`$VCT_INSTALL_ROOT`) ladder and
+/// therefore SHOULD be stale-checked. `code-graph-analyze[.ps1]` (RT-4) and
+/// `kg-sync[.ps1]` (v0.2.37 backport) do. `kg-duplicates` is a simple
+/// project-local-only wrapper with no ladder and no `.ps1` sibling — marker-
+/// checking it would false-positive every healthy copy, so it is excluded.
+fn wrapper_requires_resilience_marker(bin: &str) -> bool {
+    let stem = bin.strip_suffix(".ps1").unwrap_or(bin);
+    matches!(stem, "code-graph-analyze" | "kg-sync")
 }
 
 /// Health-check a project-local `code-graph-analyze` / `.ps1` wrapper: does
