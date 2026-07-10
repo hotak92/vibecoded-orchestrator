@@ -241,19 +241,28 @@ class TestRustEmitterSeveritiesValid(unittest.TestCase):
 
     def test_all_rust_literal_severities_are_valid(self) -> None:
         from vco_lib.deferral_report import SEVERITY_ORDER  # noqa: PLC0415
-        cmds = REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands"
-        # Two shapes emit a severity into the generated Python script:
-        #   py_quote("<lit>") assigned to a *_py var named for severity, and
-        #   an inline  severity=\"<lit>\"  in the format string.
+        src = REPO_ROOT / "launcher" / "src-tauri" / "src"
+        cmds = src / "commands"
+        services = src / "services"
+        # v0.2.77 Part 7c task 4 consolidated the Rust deferral emitters onto
+        # the shared `services::deferral::emit_deferral_entry(..,
+        # &DeferralEntryFields { .., severity: "<lit>" })` writer. The severity
+        # literal now appears as a struct FIELD at each call-site, e.g.
+        #   severity: "warning",
+        # (previously it was `sev_py = py_quote("warning")` or an inline
+        # `severity=\"info\"` inside the generated `-c` format string — both
+        # shapes are gone). We keep matching the OLD shapes too so this guard
+        # still catches any lingering / re-introduced inline emitter.
         pat = re.compile(
-            r'(?:sev(?:erity)?_py\s*=\s*py_quote\("([a-z]+)"\)'
-            r'|severity=\\"([a-z]+)\\")'
+            r'(?:severity:\s*"([a-z]+)"'                 # new struct-field shape
+            r'|sev(?:erity)?_py\s*=\s*py_quote\("([a-z]+)"\)'  # old py_quote var
+            r'|severity=\\"([a-z]+)\\")'                 # old inline -c literal
         )
         found = 0
-        for rs in sorted(cmds.glob("*.rs")):
+        for rs in sorted(cmds.glob("*.rs")) + sorted(services.glob("*.rs")):
             text = rs.read_text(encoding="utf-8")
             for m in pat.finditer(text):
-                lit = m.group(1) or m.group(2)
+                lit = m.group(1) or m.group(2) or m.group(3)
                 found += 1
                 with self.subTest(file=rs.name, severity=lit):
                     self.assertIn(
@@ -262,12 +271,15 @@ class TestRustEmitterSeveritiesValid(unittest.TestCase):
                         f"{SEVERITY_ORDER} — the deferral would never be "
                         f"written (silent ValueError in the shelled helper).",
                     )
-        # Storage_ux passes a *variable* severity (runtime-checked at its
-        # callsite), so it won't match the literal patterns — that's fine.
-        # We only assert we scanned at least the two known literal emitters.
-        self.assertGreaterEqual(found, 2, "severity-literal scan found too few "
+        # storage_ux passes a *variable* severity (runtime-checked at its
+        # callsite), and chunker routes through a different vco_lib helper —
+        # neither carries a literal here, which is fine. We only assert we
+        # scanned at least the known literal emitters (codegraph, module_updates,
+        # git_user_editable_merge, projects_v2 rename — 4 struct-field sites).
+        self.assertGreaterEqual(found, 4, "severity-literal scan found too few "
                                 "emitters — the regex likely drifted from the "
-                                "Rust source shape.")
+                                "Rust source shape (Part 7c moved severities to "
+                                "DeferralEntryFields struct fields).")
 
 
 class TestLightweightPathSeedsBeforeWrite(unittest.TestCase):
