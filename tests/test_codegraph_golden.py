@@ -310,6 +310,14 @@ def test_golden_fixture_coverage(analyzer_mod: types.ModuleType) -> None:
         "src/Account.java",
         "src/deploy.ps1",
         "src/routes.js",
+        # v0.2.77 Part 4 — the seven extractors that had no golden coverage.
+        "src/geometry.cpp",
+        "src/Inventory.cs",
+        "src/ledger.rb",
+        "src/vector.lua",
+        "src/backup.sh",
+        "src/catalog.proto",
+        "src/Counter.svelte",
     ):
         assert expected in module_paths, f"missing module row for {expected}"
 
@@ -355,3 +363,81 @@ def test_golden_fixture_coverage(analyzer_mod: types.ModuleType) -> None:
     # API axis: routes emitted CodeAPI rows.
     endpoints = {a["endpoint"] for a in apis}
     assert {"/items/create", "/items/list"} <= endpoints, "fastify routes → CodeAPI"
+
+    # -----------------------------------------------------------------------
+    # v0.2.77 Part 4 — per-language coverage for the seven extractors that
+    # previously had no golden fixture. Each assertion pins CURRENT extractor
+    # behavior (regex parsers; a tree-sitter rewrite is Part 5). Where the
+    # current behavior is a known parser quirk, the assertion is written
+    # against the observed truth and flagged inline, NOT against the ideal —
+    # the golden snapshot is the contract, and Part 5 will re-pin it.
+    # -----------------------------------------------------------------------
+
+    # None of the new production fixtures live under a tests/ part → is_test False.
+    for path in (
+        "src/geometry.cpp",
+        "src/Inventory.cs",
+        "src/ledger.rb",
+        "src/vector.lua",
+        "src/backup.sh",
+        "src/catalog.proto",
+        "src/Counter.svelte",
+    ):
+        mod = next(m for m in modules if m["path"] == path)
+        assert mod["is_test"] is False, f"{path} is production, is_test must be False"
+
+    # C++: class/struct captured; out-of-line `Class::method` defs become
+    # functions. (Free functions + constructors are NOT captured by the regex
+    # extractor — a Part-5 gap, snapshotted as-is.)
+    assert "geometry.Circle" in class_names, "cpp class extracted"
+    assert "geometry.Point" in class_names, "cpp struct extracted"
+    assert "geometry.Circle.area" in fn_names, "cpp out-of-line method extracted"
+    assert "geometry.Circle.circumference" in fn_names
+
+    # C#: namespace-qualified class + interface + generic method + property.
+    assert "Warehouse.InventoryController" in class_names, "csharp class extracted"
+    assert "Warehouse.IRepository" in class_names, "csharp interface extracted"
+    controller = next(
+        c for c in classes if c["full_name"] == "Warehouse.InventoryController"
+    )
+    controller_methods = set(controller.get("methods") or [])
+    assert {"Lookup", "WrapAll", "GetAll", "Add"} <= controller_methods, (
+        "csharp methods (incl. generic WrapAll) attributed to the class"
+    )
+    assert "Count" in controller_methods, "csharp property surfaced in methods list"
+    # ASP.NET [Route]+[Http*] attributes → CodeAPI with the combined route.
+    assert {"/api/items/all", "/api/items/add"} <= endpoints, "csharp routes → CodeAPI"
+
+    # Ruby: module + class + reopened class + subclass all emit CodeClass rows.
+    assert "ledger.Accounting" in class_names, "ruby module extracted"
+    assert "ledger.Account" in class_names, "ruby class extracted"
+    assert "ledger.SavingsAccount" in class_names, "ruby subclass extracted"
+    assert "SavingsAccount.apply_interest" in fn_names, "ruby method extracted"
+
+    # Lua: table-OOP class + colon/dot/assigned methods + standalone function.
+    assert "vector.Vector" in class_names, "lua table class extracted"
+    vector_cls = next(c for c in classes if c["full_name"] == "vector.Vector")
+    assert {"new", "magnitude", "scale"} <= set(vector_cls.get("methods") or []), (
+        "lua colon/dot/assigned methods attributed to the table class"
+    )
+    assert "vector.clamp" in fn_names, "lua standalone fn (nested end blocks) extracted"
+
+    # Shell: BOTH function syntaxes — `name()` and `function name`.
+    assert "backup.prepare_dir" in fn_names, "shell name() syntax extracted"
+    assert "backup.upload_archive" in fn_names, "shell `function name` syntax extracted"
+
+    # Proto: message types → CodeClass, service rpcs → CodeAPI.
+    assert "catalog.v1.Product" in class_names, "proto message → CodeClass"
+    assert "catalog.v1.ProductRequest" in class_names
+    assert {
+        "grpc:catalog.v1.CatalogService/GetProduct",
+        "grpc:catalog.v1.CatalogService/ListProducts",
+    } <= endpoints, "proto service rpcs → CodeAPI"
+
+    # Svelte: default-script fn, export function, arrow-export const, reactive
+    # decl, and a module-context script function all become CodeFunction rows.
+    assert "Counter.increment" in fn_names, "svelte default-script function"
+    assert "Counter.reset" in fn_names, "svelte export function"
+    assert "Counter.double" in fn_names, "svelte arrow-export const"
+    assert "Counter.doubled" in fn_names, "svelte reactive $: declaration"
+    assert "Counter.createStore" in fn_names, "svelte module-context script function"

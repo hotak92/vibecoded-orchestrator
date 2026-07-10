@@ -14,6 +14,56 @@
   },
   {
     "complexity": 1.0,
+    "content_hash": "83b49586496807565218c872b2f7410040dfa8c53deb9cf230005cd78b3a6aee",
+    "embed_revision": 0,
+    "file_hash": "d367df22cb9c00f726ce0c2960b990d37aa92e8ff31e0f143bac2546e23ba842",
+    "import_names": [
+      "svelte/store",
+      "svelte"
+    ],
+    "is_test": false,
+    "language": "svelte",
+    "loc": 27,
+    "module_summary": "Svelte component: Counter\nCounter component for the golden-fixture repo (Svelte, regex-parsed).",
+    "path": "src/Counter.svelte",
+    "project": "GoldenProj"
+  },
+  {
+    "complexity": 1.0,
+    "content_hash": "44b1ad26ff7cd7b37e8eabf0b1a607c538570a2c3d8905df877383330d1dd8d2",
+    "embed_revision": 0,
+    "file_hash": "9aaf29c94e9fc4efc69e28ec11f430f7b34675374f6fc4b9d8530f3fd8c3dd78",
+    "import_names": [
+      "System",
+      "System.Collections.Generic"
+    ],
+    "is_test": false,
+    "language": "csharp",
+    "loc": 33,
+    "module_summary": "C# module: src/Inventory.cs (namespace Warehouse)\nInventory module for the golden-fixture repo (C#, regex-parsed).\nClasses: IRepository, InventoryController",
+    "path": "src/Inventory.cs",
+    "project": "GoldenProj"
+  },
+  {
+    "complexity": 2.0,
+    "content_hash": "2e11b5aee9476684bc1647358c898da9eb33c029d34bf7e8bbb256d825ab7358",
+    "embed_revision": 0,
+    "file_hash": "d1be4ea1849274873901bb5fb9dbd628972d3c9ec67dc89d84b6f2f2a71de9f6",
+    "import_names": [
+      "set",
+      "./lib/common.sh",
+      "}",
+      "}"
+    ],
+    "is_test": false,
+    "language": "shell",
+    "loc": 17,
+    "module_summary": "Shell script: src/backup.sh\nBackup script for the golden-fixture repo (Shell, regex-parsed).",
+    "path": "src/backup.sh",
+    "project": "GoldenProj"
+  },
+  {
+    "complexity": 1.0,
     "content_hash": "cbbb8f578acde6d9bcb730fa3381701b7762c8271d2cd172eabaaeca207e4b86",
     "embed_revision": 0,
     "file_hash": "d2091c2d83b6a2156a6d727a022c0dbfa4bb31597c30c2abc1abf47817cef6a6",
@@ -25,6 +75,21 @@
     "loc": 210,
     "module_summary": "Module: src/big_module.py\nLong module: contains one very large function to exercise chunking.",
     "path": "src/big_module.py",
+    "project": "GoldenProj"
+  },
+  {
+    "complexity": 1.0,
+    "content_hash": "a8b107388c03bc801972880ae972215c4642266ce2d1fe7ad9f7a5e3d4e706e3",
+    "embed_revision": 0,
+    "file_hash": "51dab814199d8a4f688a561694fecbd91d81b5d4d9e37f7853a0d219b987e7aa",
+    "import_names": [
+      "common.proto"
+    ],
+    "is_test": false,
+    "language": "proto",
+    "loc": 18,
+    "module_summary": "Proto: src/catalog.proto (package catalog.v1)\nMessages: ProductRequest, Product, ProductList\nServices: CatalogService",
+    "path": "src/catalog.proto",
     "project": "GoldenProj"
   },
   {
@@ -72,6 +137,39 @@
   },
   {
     "complexity": 1.0,
+    "content_hash": "7aea930924794009bd1ed87a215acc18e8537aa10af191b3d397a1c7cb79a180",
+    "embed_revision": 0,
+    "file_hash": "17a2fee895d62575133d9a80793e66deb3b02c77ebb9dd7b3a683b3a622d1a45",
+    "import_names": [
+      "vector",
+      "string",
+      "cmath"
+    ],
+    "is_test": false,
+    "language": "cpp",
+    "loc": 34,
+    "module_summary": "C++ module: src/geometry.cpp\nGeometry module for the golden-fixture repo (C++, regex-parsed).\nClasses: Circle, Point, Box",
+    "path": "src/geometry.cpp",
+    "project": "GoldenProj"
+  },
+  {
+    "complexity": 1.0,
+    "content_hash": "6571b32c1b192b774997931cef2a7f5cc4f09035074508155b7fa780c286f931",
+    "embed_revision": 0,
+    "file_hash": "5b798a46f013f92082bfd89c0dcecce3c8d9da3ceb26b205289d75b67d68fcf4",
+    "import_names": [
+      "set",
+      "helpers"
+    ],
+    "is_test": false,
+    "language": "ruby",
+    "loc": 28,
+    "module_summary": "Ruby module: src/ledger.rb\nLedger module for the golden-fixture repo (Ruby, regex-parsed).\nClasses: Accounting, Account, SavingsAccount",
+    "path": "src/ledger.rb",
+    "project": "GoldenProj"
+  },
+  {
+    "complexity": 1.0,
     "content_hash": "691129553f3b05e1850bd252d325c48a696b77ba1facf929400801160f634555",
     "embed_revision": 0,
     "file_hash": "b7640ba81aad0a92ea9906eb8ca4ac3259d916667bb13fef87443baf39174d44",
@@ -111,6 +209,21 @@
     "loc": 14,
     "module_summary": "Go module: src/service.go (package golden)\nPackage golden is a Go fixture for the code-graph golden corpus.\nTypes: Greeter",
     "path": "src/service.go",
+    "project": "GoldenProj"
+  },
+  {
+    "complexity": 7.0,
+    "content_hash": "169b7271465d6f3d29b4b3fd0a75b274a84f693a7aeb48a032d313bf693cafa8",
+    "embed_revision": 0,
+    "file_hash": "e0cd204d5142856ab6497cf200cf48b901ed8041427c133f17e42173963d2f0e",
+    "import_names": [
+      "mathlib"
+    ],
+    "is_test": false,
+    "language": "lua",
+    "loc": 27,
+    "module_summary": "Lua module: src/vector.lua\nVector module for the golden-fixture repo (Lua, regex-parsed). Exercises: table-based class (Name = {} + __index), colon + dot methods, a standalone function, an assigned-function, and nested\nClasses: Vector\nFunctions: Vector.new, Vector:magnitude, Vector.scale, clamp",
+    "path": "src/vector.lua",
     "project": "GoldenProj"
   },
   {

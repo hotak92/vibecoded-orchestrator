@@ -1,5 +1,29 @@
 [
   {
+    "api_description": "C# ASP.NET POST /api/items/add → Warehouse.InventoryController.Add",
+    "content_hash": "db3e8ff9c5859254b0b769147a9169358cb4dcdeff227fdfa6d557b5283535fb",
+    "embed_revision": 0,
+    "endpoint": "/api/items/add",
+    "language": "csharp",
+    "method": "POST",
+    "parameters": [],
+    "project": "GoldenProj",
+    "proxy_target": "",
+    "returns": ""
+  },
+  {
+    "api_description": "C# ASP.NET GET /api/items/all → Warehouse.InventoryController.GetAll",
+    "content_hash": "344272cd3177c9fb02be43a6742d146d12a79728138d31e0d2b8be61338e55e6",
+    "embed_revision": 0,
+    "endpoint": "/api/items/all",
+    "language": "csharp",
+    "method": "GET",
+    "parameters": [],
+    "project": "GoldenProj",
+    "proxy_target": "",
+    "returns": ""
+  },
+  {
     "api_description": "POST /items/create (authenticated) -> createItem",
     "content_hash": "a223b91e3cbe04d4e2bd3744084b2791e76b474890bb83c0ba6b11fe4815b072",
     "embed_revision": 0,
@@ -22,5 +46,33 @@
     "project": "GoldenProj",
     "proxy_target": "",
     "returns": ""
+  },
+  {
+    "api_description": "gRPC CatalogService.GetProduct (ProductRequest) → (Product) [catalog.v1]",
+    "content_hash": "f6aeb0015ca08da1f9df850bcf4a14cfb13b58500292bb42c85f0e194e62c1c3",
+    "embed_revision": 0,
+    "endpoint": "grpc:catalog.v1.CatalogService/GetProduct",
+    "language": "proto",
+    "method": "gRPC",
+    "parameters": [
+      "ProductRequest"
+    ],
+    "project": "GoldenProj",
+    "proxy_target": "",
+    "returns": "Product"
+  },
+  {
+    "api_description": "gRPC CatalogService.ListProducts (ProductRequest) → (ProductList) [catalog.v1]",
+    "content_hash": "f110e80b57a0a2d2140f90d7ac7a25f7bb0471e0ca8acef94b4fafa2da3911bb",
+    "embed_revision": 0,
+    "endpoint": "grpc:catalog.v1.CatalogService/ListProducts",
+    "language": "proto",
+    "method": "gRPC",
+    "parameters": [
+      "ProductRequest"
+    ],
+    "project": "GoldenProj",
+    "proxy_target": "",
+    "returns": "ProductList"
   }
 ]

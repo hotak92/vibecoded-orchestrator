@@ -22,6 +22,13 @@ before and across the P2f `CodeEntity` IR refactor.
 | `repo/src/Account.java` | Java (regex): class + methods |
 | `repo/src/deploy.ps1` | PowerShell: function + filter, plus a nested function at 8-space indent (the v0.2.75 deep-indent regression case) |
 | `repo/src/routes.js` | Fastify-style routes → CodeAPI rows |
+| `repo/src/geometry.cpp` | C++ (regex): namespace, class + struct + template, out-of-line `Class::method` defs |
+| `repo/src/Inventory.cs` | C# (regex): namespace, interface + class + record, generic method, property, `[Route]`+`[Http*]` → CodeAPI |
+| `repo/src/ledger.rb` | Ruby (regex): module + class + class-reopening + subclass, `def self.` methods |
+| `repo/src/vector.lua` | Lua (regex): table-OOP class (`Name = {}` + `__index`), colon/dot/assigned methods, standalone fn with nested `end`s |
+| `repo/src/backup.sh` | Shell (regex): BOTH `name()` and `function name` syntaxes |
+| `repo/src/catalog.proto` | Proto (regex): messages → CodeClass, service rpcs → CodeAPI |
+| `repo/src/Counter.svelte` | Svelte (regex): default + module-context `<script>`, function/export/arrow-export/reactive decls |
 | `repo/src/vendor.js` | Minified content (single huge line) → MUST BE SKIPPED (CG-5) |
 | `repo/node_modules/ignored.js` | Lives in an ignored dir → MUST NOT appear in any snapshot |
 
