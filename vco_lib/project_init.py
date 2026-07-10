@@ -11481,9 +11481,13 @@ def _bundle_update_pointer_heal() -> None:
         schema = json.loads(resp.read())
     except Exception:
         return  # Weaviate unreachable → can't verify existence → skip.
+    # Walrus + isinstance so the element type narrows to `str` (pyright:
+    # repeating `c.get("class")` in the element expression re-widens to
+    # `str | None` — CI caught exactly that on the v0.2.76 push).
     existing_classes = {
-        c.get("class") for c in schema.get("classes", [])
-        if isinstance(c, dict) and c.get("class")
+        name
+        for c in schema.get("classes", [])
+        if isinstance(c, dict) and isinstance((name := c.get("class")), str) and name
     }
 
     # Minimal deferral sink + log shim (the CLI has no DeferralReport here).

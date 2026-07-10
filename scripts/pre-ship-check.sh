@@ -313,6 +313,37 @@ else
     gate_fail "pytest tests/" "See /tmp/preship-pytest.log (cmd: ${_PYTEST_CMD[*]})"
 fi
 
+# Gate 3b: pyright (v0.2.76 post-push hotfix — the gate MUST match CI).
+# CI's "Python (pyright)" job runs `pyright --warnings` scoped by the
+# repo-root pyrightconfig.json and fails on errors. This script had NO
+# pyright leg, so a type error (project_init.py, set[Unknown|None] into a
+# set[str] parameter) sailed through "Safe to tag" and went red on the
+# v0.2.76 push. Resolve pyright from the pytest interpreter's venv bin,
+# then PATH; a MISSING binary is a FAIL, not a skip (a blind gate lies —
+# the pre-tag-gate-must-match-CI rule).
+echo "  [running pyright --warnings ...]"
+_PYRIGHT_BIN=""
+if [ -n "${_PYTEST_CMD[0]:-}" ] && [ -x "$(dirname "${_PYTEST_CMD[0]}")/pyright" ]; then
+    _PYRIGHT_BIN="$(dirname "${_PYTEST_CMD[0]}")/pyright"
+elif command -v pyright >/dev/null 2>&1; then
+    _PYRIGHT_BIN="$(command -v pyright)"
+fi
+# Pin the interpreter to the pytest venv (same env CI type-checks against
+# after installing requirements) — without it pyright resolves imports
+# against the bare system python and reports missing-import noise
+# (weaviate etc.) that CI never sees.
+_PYRIGHT_PY=""
+if [ -n "${_PYTEST_CMD[0]:-}" ] && [ -x "${_PYTEST_CMD[0]}" ]; then
+    _PYRIGHT_PY="${_PYTEST_CMD[0]}"
+fi
+if [ -z "$_PYRIGHT_BIN" ]; then
+    gate_fail "pyright --warnings" "pyright not found (venv bin + PATH); CI runs it — install pyright (requirements-dev.txt) so this gate matches CI"
+elif "$_PYRIGHT_BIN" --warnings ${_PYRIGHT_PY:+--pythonpath "$_PYRIGHT_PY"} > /tmp/preship-pyright.log 2>&1; then
+    gate_pass "pyright --warnings"
+else
+    gate_fail "pyright --warnings" "See /tmp/preship-pyright.log"
+fi
+
 # Gate 4: npm test (svelte-check)
 echo "  [running npm run check in launcher/ ...]"
 if (cd launcher && npm run check > /tmp/preship-npm-check.log 2>&1); then

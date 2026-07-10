@@ -465,7 +465,48 @@ def _ensure_vco_lib_on_path() -> bool:
     return False
 
 
+def _ensure_weaviate_mcp_on_path() -> bool:
+    """Sibling of :func:`_ensure_vco_lib_on_path` for the ``weaviate_mcp``
+    package (lives at ``<orchestrator-root>/claude_mcp_servers/weaviate_mcp``).
+
+    v0.2.76 post-push hotfix: R1 converted the ``weaviate_mcp.code_truncation``
+    / ``code_ranking`` imports to direct + loud-fail, relying on the editable
+    install (install.py A1, v0.2.38). That holds on every INSTALLED machine,
+    but a bare checkout (CI runners, fresh clones running tests) has the
+    package in the tree without the editable .pth — the exact case the
+    vco_lib bootstrap above already handles by inserting the clone root.
+    Extend the SAME treatment to ``claude_mcp_servers/``: this is a path
+    bootstrap for an intact clone, NOT a silent functional fallback — if the
+    package genuinely isn't in the tree either, the loud-fail at the import
+    site below still fires (ruling #1 intact).
+
+    Candidate roots mirror :func:`_ensure_vco_lib_on_path` (env pins, then
+    script-relative), plus any ``sys.path`` entry that already carries
+    ``vco_lib`` (covers the editable-vco_lib-but-no-weaviate_mcp split).
+    Returns True when ``weaviate_mcp`` is importable afterward. Never raises.
+    """
+    if any((Path(p) / "weaviate_mcp").is_dir() for p in sys.path if p):
+        return True
+    roots = [
+        os.environ.get("VCT_INSTALL_ROOT", "").strip(),
+        os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip(),
+        str(Path(__file__).resolve().parent.parent.parent),  # script_dir/../..
+    ]
+    roots.extend(p for p in sys.path if p and (Path(p) / "vco_lib").is_dir())
+    for _root in roots:
+        if not _root:
+            continue
+        _mcp_dir = Path(_root) / "claude_mcp_servers"
+        if (_mcp_dir / "weaviate_mcp").is_dir():
+            _mcp_str = str(_mcp_dir)
+            if _mcp_str not in sys.path:
+                sys.path.insert(0, _mcp_str)
+            return True
+    return False
+
+
 _ensure_vco_lib_on_path()
+_ensure_weaviate_mcp_on_path()
 
 # X-1 / v0.2.76 (ruling #1 — loud-fail, never silent-degrade): import the
 # shared vco_lib helpers DIRECTLY. The analyzer wrapper (code-graph-analyze /

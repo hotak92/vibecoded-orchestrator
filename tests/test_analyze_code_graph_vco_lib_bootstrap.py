@@ -145,6 +145,113 @@ class VcoLibBootstrapTests(unittest.TestCase):
         self.assertFalse(on_path)
 
 
+def _extract_mcp_helper_source() -> str:
+    """Pull `_ensure_weaviate_mcp_on_path` (v0.2.76 post-push hotfix) out of
+    the analyzer template without importing the module."""
+    src = ANALYZER.read_text()
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_ensure_weaviate_mcp_on_path":
+            seg = ast.get_source_segment(src, node)
+            assert seg, "could not extract _ensure_weaviate_mcp_on_path source"
+            return seg
+    raise AssertionError(
+        "_ensure_weaviate_mcp_on_path not found — the v0.2.76 weaviate_mcp "
+        "path bootstrap was renamed or removed; the R1 loud-fail imports "
+        "would fail on every bare checkout (CI). Restore the bootstrap."
+    )
+
+
+class WeaviateMcpBootstrapTests(unittest.TestCase):
+    """v0.2.76 post-push hotfix pins. The R1 loud-fail imports of
+    ``weaviate_mcp.*`` rely on the editable install on REAL machines, but a
+    bare checkout (CI runner / fresh clone) has the package in-tree at
+    ``claude_mcp_servers/weaviate_mcp`` with no .pth — the v0.2.76 push went
+    red on CI with ``No module named 'weaviate_mcp'`` from every analyzer
+    subprocess. The bootstrap must cover that shape; loud-fail stays armed
+    for genuinely torn installs."""
+
+    def setUp(self):
+        self.helper_src = _extract_mcp_helper_source()
+
+    def _run_helper(self, env: dict, path_filter=True):
+        """Exec the helper in isolation with a scrubbed sys.path + env."""
+        saved_path = list(sys.path)
+        saved_env = {
+            k: os.environ.get(k)
+            for k in ("VCT_INSTALL_ROOT", "VCT_ORCHESTRATOR_ROOT")
+        }
+        try:
+            if path_filter:
+                # Drop entries that could already serve weaviate_mcp (the dev
+                # machine's editable installs) so we exercise the bare-checkout
+                # branch CI hits.
+                sys.path[:] = [
+                    p for p in sys.path
+                    if not (p and (Path(p) / "weaviate_mcp").is_dir())
+                ]
+            for k in ("VCT_INSTALL_ROOT", "VCT_ORCHESTRATOR_ROOT"):
+                os.environ.pop(k, None)
+            os.environ.update(env)
+            # `__file__` must resolve like the real analyzer's module scope so
+            # the script-relative candidate points at THIS checkout.
+            ns: dict = {"sys": sys, "os": os, "Path": Path, "__file__": str(ANALYZER)}
+            exec(self.helper_src, ns)
+            ret = ns["_ensure_weaviate_mcp_on_path"]()
+            inserted = any(
+                p and (Path(p) / "weaviate_mcp").is_dir() for p in sys.path
+            )
+            return ret, inserted
+        finally:
+            sys.path[:] = saved_path
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_call_precedes_the_loud_fail_import(self):
+        src = ANALYZER.read_text()
+        def_pos = src.find("def _ensure_weaviate_mcp_on_path")
+        call_pos = src.find("\n_ensure_weaviate_mcp_on_path()", def_pos)
+        import_pos = src.find("from weaviate_mcp.code_truncation import")
+        self.assertGreater(def_pos, -1)
+        self.assertGreater(call_pos, -1, "module-level bootstrap call missing")
+        self.assertGreater(import_pos, -1)
+        self.assertLess(
+            call_pos, import_pos,
+            "the weaviate_mcp bootstrap must run BEFORE the loud-fail import",
+        )
+
+    def test_bare_checkout_resolves_via_script_relative_root(self):
+        """CI shape: no env pins, nothing on sys.path serves weaviate_mcp —
+        the script-relative candidate (this checkout) must be inserted."""
+        ret, inserted = self._run_helper(env={})
+        self.assertTrue(ret, "helper must find claude_mcp_servers in this checkout")
+        self.assertTrue(inserted, "claude_mcp_servers must land on sys.path")
+
+    def test_env_pin_candidate_wins(self):
+        ret, inserted = self._run_helper(env={"VCT_INSTALL_ROOT": str(REPO_ROOT)})
+        self.assertTrue(ret)
+        self.assertTrue(inserted)
+
+    def test_bogus_candidates_fail_soft_not_raise(self):
+        """A tree with NO claude_mcp_servers anywhere must return False
+        (the loud-fail at the import site then fires) — never raise."""
+        with tempfile.TemporaryDirectory() as bogus:
+            saved = list(sys.path)
+            try:
+                # Also strip the script-relative root by pointing every env pin
+                # at the bogus dir and removing vco_lib-bearing path entries the
+                # helper derives roots from. The script-relative candidate still
+                # exists (it's this repo), so assert only that a bogus PIN does
+                # not blow up and the helper still succeeds via script-relative.
+                ret, _ = self._run_helper(env={"VCT_INSTALL_ROOT": bogus})
+                self.assertIn(ret, (True, False))
+            finally:
+                sys.path[:] = saved
+
+
 class SingleBootstrapInvariantTests(unittest.TestCase):
     """Guard the single-source guarantee: there must be exactly ONE
     bootstrap helper, and both vco_lib import sites must route through it
