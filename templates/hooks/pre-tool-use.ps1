@@ -37,7 +37,15 @@ if (Test-Path "$PSScriptRoot/_lib/emit-context.ps1") {
 $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 $ToolName = ""
-$ToolArgs = ""
+# v0.2.76 P5 (hook-latency parity): the bash sibling consolidated its stdin
+# parse from SIX `python -c` spawns into ONE NUL-delimited decode (each
+# interpreter cold-start cost ~15ms and this hook fires on the `*` matcher —
+# every tool call). PowerShell already single-decodes here via one
+# ConvertFrom-Json — no per-field re-parse ever existed — so the perf issue
+# was bash-only. This touch keeps the OS-parity gate satisfied AND aligns the
+# tool_input default with the bash side: default to a valid "{}" (not "") so a
+# missing tool_input yields the same empty-object shape on both OSes.
+$ToolArgs = "{}"
 $UserMessage = ""
 $SessionIdFromStdin = ""
 # V52-L.2 Fix 1: parse subagent identity from stdin payload. Per A5

@@ -63,63 +63,61 @@ PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 # {"query":"","chosen_tool":"","tool_args":null} — silently broken.
 # Verified empirically 2026-05-08 via stdin-capture diagnostic.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
-TOOL_NAME=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
-import json, sys
-try:
-    d = json.loads(sys.stdin.read())
-    print(d.get('tool_name', ''))
-except Exception:
-    print('')
-" 2>/dev/null || echo "")
-TOOL_ARGS=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
-import json, sys
-try:
-    d = json.loads(sys.stdin.read())
-    print(json.dumps(d.get('tool_input', {})))
-except Exception:
-    print('{}')
-" 2>/dev/null || echo "{}")
-USER_MESSAGE=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
-import json, sys
-try:
-    d = json.loads(sys.stdin.read())
-    print(d.get('user_message', ''))
-except Exception:
-    print('')
-" 2>/dev/null || echo "")
-SESSION_ID_FROM_STDIN=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
-import json, sys
-try:
-    d = json.loads(sys.stdin.read())
-    print(d.get('session_id', ''))
-except Exception:
-    print('')
-" 2>/dev/null || echo "")
-# V52-L.2 Fix 1: parse subagent identity from stdin payload. Per A5 audit
+# v0.2.76 P5 (hook-latency): parse the stdin payload with EXACTLY ONE Python
+# interpreter (was SIX — tool_name, tool_input, user_message, session_id,
+# agent_id, agent_type each re-read + re-decoded the same JSON). This hook
+# fires on the `*` matcher — EVERY tool call — so it was the single biggest
+# turn-blocking hook (measured ~137ms p50, ~90ms of it redundant interpreter
+# cold-starts). Same NUL-delimited single-decode pattern proven in
+# post-file-edit.sh (HK-1, v0.2.73): one decoder emits all six fields
+# NUL-terminated (a trailing NUL after EACH field, incl. the last), read back
+# with a single loop so an embedded newline in any field survives. Malformed
+# stdin → all fields default to "" (or "{}" for tool_input), preserving the
+# soft-fail contract. This is a PRELUDE consolidation, NOT a retrieval or
+# behaviour change: the parsed values are byte-identical to the six-spawn form.
+TOOL_NAME=""
+TOOL_ARGS="{}"
+USER_MESSAGE=""
+SESSION_ID_FROM_STDIN=""
+# V52-L.2 Fix 1: subagent identity (agent_id + agent_type). Per A5 audit
 # (knowledge/research/claude-code-leak-agent-architecture.md + 2026-06-09
 # official docs review), PreToolUse hooks DO fire for subagent tool calls;
 # the JSON payload carries agent_id + agent_type so handlers can tell
-# parent activity apart from subagent activity. Pre-V52-L.2 we ignored
-# both fields, so every TOUCAN row looked like it came from the same
-# session_id regardless of which agent ran the tool — A3's measurement
-# artifact (26-vs-83 gap) was just this confusion. Empty string when the
-# field is absent (parent context) which is what TOUCAN consumers expect.
-AGENT_ID=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
+# parent activity apart from subagent activity. Empty string when the field
+# is absent (parent context) which is what TOUCAN consumers expect.
+AGENT_ID=""
+AGENT_TYPE=""
+_PTU_IDX=0
+while IFS= read -r -d '' _PTU_VAL; do
+    case "$_PTU_IDX" in
+        0) TOOL_NAME="$_PTU_VAL" ;;
+        1) TOOL_ARGS="$_PTU_VAL" ;;
+        2) USER_MESSAGE="$_PTU_VAL" ;;
+        3) SESSION_ID_FROM_STDIN="$_PTU_VAL" ;;
+        4) AGENT_ID="$_PTU_VAL" ;;
+        5) AGENT_TYPE="$_PTU_VAL" ;;
+    esac
+    _PTU_IDX=$((_PTU_IDX + 1))
+done < <(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
-    print(d.get('agent_id', ''))
+    fields = [
+        d.get('tool_name', '') or '',
+        json.dumps(d.get('tool_input', {}) or {}),
+        d.get('user_message', '') or '',
+        d.get('session_id', '') or '',
+        d.get('agent_id', '') or '',
+        d.get('agent_type', '') or '',
+    ]
 except Exception:
-    print('')
-" 2>/dev/null || echo "")
-AGENT_TYPE=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
-import json, sys
-try:
-    d = json.loads(sys.stdin.read())
-    print(d.get('agent_type', ''))
-except Exception:
-    print('')
-" 2>/dev/null || echo "")
+    fields = ['', '{}', '', '', '', '']
+# Trailing NUL after EACH field so the reader loop terminates cleanly.
+sys.stdout.write(''.join(str(f) + '\0' for f in fields))
+" 2>/dev/null)
+# Defensive: a truncated decode (0 iterations) leaves the defaults above,
+# but re-coerce an emptied tool_input to a valid JSON object.
+[ -z "$TOOL_ARGS" ] && TOOL_ARGS="{}"
 
 # v0.2.70 Stream E: unify session-id resolution with the other hooks via
 # vco_hook_session_id (parse + path-safety sanitise). SESSION_ID_RAW preserves
