@@ -519,11 +519,11 @@ resolve_project_id() {
     rc=$?
     set -e
     if [[ $rc -eq 2 ]]; then
-        _emit_warning "hub_unreachable" "hub.token missing; is the launcher running?"
+        _emit_warning "hub_unreachable" "hub.token missing; is the launcher running? If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
         return 1
     fi
     if [[ $rc -ne 0 ]]; then
-        _emit_warning "hub_unreachable" "hub unreachable; is the launcher running?"
+        _emit_warning "hub_unreachable" "hub unreachable; is the launcher running? If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
         return 1
     fi
     status="${result%%$'\t'*}"
@@ -539,7 +539,7 @@ resolve_project_id() {
             printf '%s' "$id"
             ;;
         401)
-            _emit_warning "hub_unauthorized" "401 unauthorized on by-path; launcher may have restarted (token rotated)"
+            _emit_warning "hub_unauthorized" "401 unauthorized on by-path; launcher may have restarted (token rotated). If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
             return 1
             ;;
         404)
@@ -630,11 +630,11 @@ fetch_config() {
     rc=$?
     set -e
     if [[ $rc -eq 2 ]]; then
-        _emit_warning "hub_unreachable" "hub.token missing; is the launcher running?"
+        _emit_warning "hub_unreachable" "hub.token missing; is the launcher running? If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
         return 1
     fi
     if [[ $rc -ne 0 ]]; then
-        _emit_warning "hub_unreachable" "hub unreachable; is the launcher running?"
+        _emit_warning "hub_unreachable" "hub unreachable; is the launcher running? If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
         return 1
     fi
 
@@ -678,7 +678,7 @@ fetch_config() {
             fi
             ;;
         401)
-            _emit_warning "hub_unauthorized" "401 unauthorized; launcher may have restarted (token rotated)"
+            _emit_warning "hub_unauthorized" "401 unauthorized; launcher may have restarted (token rotated). If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
             return 1
             ;;
         404)

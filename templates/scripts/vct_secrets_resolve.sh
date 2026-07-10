@@ -299,11 +299,11 @@ resolve_project_id() {
     rc=$?
     set -e
     if [[ $rc -eq 2 ]]; then
-        err "hub.token missing; is the launcher running?"
+        err "hub.token missing; is the launcher running? If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
         return 1
     fi
     if [[ $rc -ne 0 ]]; then
-        err "hub unreachable; is the launcher running?"
+        err "hub unreachable; is the launcher running? If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
         return 1
     fi
     status="${result%%$'\t'*}"
@@ -324,7 +324,7 @@ resolve_project_id() {
             # Treat as "hub unreachable" so callers see one consistent
             # diagnostic. The user fix is the same: restart resolver
             # / re-source env.
-            err "hub returned 401 unauthorized; the launcher may have restarted (token rotated). Try again."
+            err "hub returned 401 unauthorized; the launcher may have restarted (token rotated). Try again. If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
             return 1
             ;;
         404)
@@ -381,11 +381,11 @@ read_key_hub() {
     rc=$?
     set -e
     if [[ $rc -eq 2 ]]; then
-        err "hub.token missing; is the launcher running?"
+        err "hub.token missing; is the launcher running? If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
         return 1
     fi
     if [[ $rc -ne 0 ]]; then
-        err "hub unreachable; is the launcher running?"
+        err "hub unreachable; is the launcher running? If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
         return 1
     fi
     status="${result%%$'\t'*}"
@@ -404,7 +404,7 @@ read_key_hub() {
             # See note in resolve_project_id: stale token → exit 1 to
             # match the "hub unreachable" semantics callers already
             # know how to surface.
-            err "hub returned 401 unauthorized; the launcher may have restarted (token rotated). Try again."
+            err "hub returned 401 unauthorized; the launcher may have restarted (token rotated). Try again. If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
             return 1
             ;;
         404)

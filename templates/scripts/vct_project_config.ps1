@@ -479,16 +479,16 @@ function Resolve-ProjectId {
     $encoded = [System.Uri]::EscapeDataString($ArgValue)
     $result = Invoke-Hub "projects/by-path?path=$encoded"
     if ($null -eq $result) {
-        Emit-Warning -ErrorKind "hub_unreachable" -Detail "hub unreachable; is the launcher running?"
+        Emit-Warning -ErrorKind "hub_unreachable" -Detail "hub unreachable; is the launcher running? If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
         return @{ ExitCode = 1 }
     }
     switch ($result.Status) {
         0 {
-            Emit-Warning -ErrorKind "hub_unreachable" -Detail "hub.token missing; is the launcher running?"
+            Emit-Warning -ErrorKind "hub_unreachable" -Detail "hub.token missing; is the launcher running? If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
             return @{ ExitCode = 1 }
         }
         401 {
-            Emit-Warning -ErrorKind "hub_unauthorized" -Detail "401 unauthorized on by-path; launcher may have restarted (token rotated)"
+            Emit-Warning -ErrorKind "hub_unauthorized" -Detail "401 unauthorized on by-path; launcher may have restarted (token rotated). If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
             return @{ ExitCode = 1 }
         }
         200 {
@@ -532,16 +532,16 @@ function Get-Config {
     # prefers the scoped `hub.token.<id>` (v0.2.76 Part 4).
     $result = Invoke-Hub -PathAndQuery $pathAndQuery -ProjectId $ProjectId
     if ($null -eq $result) {
-        Emit-Warning -ErrorKind "hub_unreachable" -Detail "hub unreachable; is the launcher running?"
+        Emit-Warning -ErrorKind "hub_unreachable" -Detail "hub unreachable; is the launcher running? If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
         return 1
     }
     switch ($result.Status) {
         0 {
-            Emit-Warning -ErrorKind "hub_unreachable" -Detail "hub.token missing; is the launcher running?"
+            Emit-Warning -ErrorKind "hub_unreachable" -Detail "hub.token missing; is the launcher running? If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
             return 1
         }
         401 {
-            Emit-Warning -ErrorKind "hub_unauthorized" -Detail "401 unauthorized; launcher may have restarted (token rotated)"
+            Emit-Warning -ErrorKind "hub_unauthorized" -Detail "401 unauthorized; launcher may have restarted (token rotated). If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
             return 1
         }
         200 {

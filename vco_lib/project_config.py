@@ -125,6 +125,18 @@ class ResolverError(Exception):
     """Base class for every error raised by :func:`resolve`."""
 
 
+# v0.2.76 (R5): honest post-update hint appended to the user-facing
+# unreachable/401 messages. Requiring an editor/launcher restart after an
+# orchestrator update is EXPECTED behaviour (user ruling 2026-07-10) — there is
+# no auto-retry/auto-heal; the hint just tells the user what to do. MUST MATCH
+# the string appended in `vct_secrets_resolve.sh`/`.ps1` and
+# `vct_project_config.sh`/`.ps1`.
+_POST_UPDATE_HINT = (
+    " If VCO was just updated, restart the launcher and reload the editor "
+    "window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
+)
+
+
 class HubUnreachable(ResolverError):
     """The launcher hub couldn't be contacted.
 
@@ -577,7 +589,8 @@ def _discover_hub() -> tuple[int, str]:
                 token = token_file.read_text(encoding="utf-8").strip()
             except FileNotFoundError as exc:
                 raise HubUnreachable(
-                    f"hub.token missing at {token_file}; is the launcher running?"
+                    f"hub.token missing at {token_file}; is the launcher "
+                    f"running?{_POST_UPDATE_HINT}"
                 ) from exc
             except OSError as exc:
                 _warn_discovery(
@@ -875,7 +888,8 @@ def _resolve_project_id(project_arg: str) -> str:
         return pid
     if resp.status_code == 401:
         raise HubUnreachable(
-            "hub returned 401 unauthorized; launcher may have restarted (token rotated)"
+            "hub returned 401 unauthorized; launcher may have restarted "
+            f"(token rotated).{_POST_UPDATE_HINT}"
         )
     if resp.status_code == 404:
         raise ProjectNotFound(f"no project registered at path: {project_arg}")
