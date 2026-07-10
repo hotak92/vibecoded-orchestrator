@@ -487,6 +487,11 @@ def test_no_unconditional_method_finditer_in_java_class_loop() -> None:
     vco_lib/codegraph_lang/java.py — the source scan follows it there
     (function renamed `_analyze_java_file` -> `analyze_java_file` in the
     move; assertions unchanged).
+
+    P2f stage 3 (v0.2.77 Part 6): the per-class loop moved from the
+    imperative ``analyze_java_file`` (now a thin shim) into the pure producer
+    ``extract_java_file``. The scan follows it there; the
+    ``_java_methods_for_class`` guard is unchanged.
     """
     src = Path(acg.__file__).read_text()
 
@@ -502,13 +507,13 @@ def test_no_unconditional_method_finditer_in_java_class_loop() -> None:
     # The Java parser's class loop also uses `signature = f"class {cname}"`,
     # but Kotlin (line ~2540 in the JS/TS area) and Swift (~3340) may use
     # similar strings. We need to be MORE specific. The Java loop is the
-    # one that lives inside `_analyze_java_file`. Search for the wider
-    # context that includes the function header.
-    java_func_anchor_pos = src.find("def analyze_java_file(")
+    # one that lives inside the pure producer ``extract_java_file`` (P2f-3).
+    # Search for the wider context that includes the function header.
+    java_func_anchor_pos = src.find("def extract_java_file(")
     assert java_func_anchor_pos >= 0, (
-        "Could not find `analyze_java_file` function — file shape changed."
+        "Could not find `extract_java_file` function — file shape changed."
     )
-    # Find the next top-level `def ` after `analyze_java_file` (the end of
+    # Find the next top-level `def ` after `extract_java_file` (the end of
     # this function's body; it is a module-level function since the P2f move).
     java_func_end_pos = src.find("\ndef ", java_func_anchor_pos + 1)
     if java_func_end_pos < 0:

@@ -70,6 +70,9 @@ class ExtractorHelpers:
     def generate_embedding(self, *args: Any, **kwargs: Any) -> Any:
         return self._ctx.generate_embedding(*args, **kwargs)
 
+    def shape_for_insert(self, *args: Any, **kwargs: Any) -> Any:
+        return self._ctx._shape_for_insert(*args, **kwargs)
+
     # ---- python-only AST helpers (thin passthroughs to analyzer methods) -----
     @property
     def project_name(self) -> Any:

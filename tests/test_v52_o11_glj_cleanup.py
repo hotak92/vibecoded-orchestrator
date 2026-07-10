@@ -178,13 +178,18 @@ def _lua_parser_text() -> str:
     the analyzer. (The H assertions match ``embed_class(`` /
     ``embed_function(`` substrings, which the mechanical ``ctx.`` prefix
     from the move does not disturb.)
+
+    P2f stage 3 (v0.2.77 Part 6): the emit loops (with the ``embed_class`` /
+    ``embed_function`` calls) moved into the pure producer ``extract_lua_file``
+    — defined ABOVE the thin ``analyze_lua_file`` shim — so the slice now
+    anchors on ``def extract_lua_file`` to reach both.
     """
     from pathlib import Path
 
     from vco_lib.codegraph_lang import lua
 
     src = Path(lua.__file__).read_text()
-    start = src.find("def analyze_lua_file")
+    start = src.find("def extract_lua_file")
     assert start >= 0, "Lua extractor missing — codegraph_lang layout changed"
     return src[start:]
 
