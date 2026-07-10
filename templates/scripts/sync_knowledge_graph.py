@@ -91,7 +91,17 @@ except ImportError:
         category=DeprecationWarning,
     )
 
-import weaviate
+# NOTE: this bare `import weaviate` is a DELIBERATE, load-bearing side-effect
+# import — NOT dead code (do not "clean it up"). It must appear AFTER the
+# AuthlibDeprecationWarning filter block above and BEFORE any other weaviate
+# submodule import, because importing weaviate transitively imports authlib,
+# which force-installs `simplefilter('always', AuthlibDeprecationWarning)` at
+# import time. Pinned by tests/test_no_authlib_deprecation_warning.py
+# (::test_sync_knowledge_graph_filter_block_present). The v0.2.77 Part 7a
+# connect-helper convergence removed the only *runtime* `weaviate.` reference,
+# so ruff now flags F401 — suppressed here because the import's value is the
+# import-time side effect, not the bound name.
+import weaviate  # noqa: F401
 from weaviate.classes.query import Filter
 from weaviate_mcp.chunking import TokenCounter, Chunker
 
@@ -307,16 +317,16 @@ class WeaviateWrapper:
     client and the embedding service.
     """
     def __init__(self, weaviate_url, embedding_service, grpc_port=None):
-        http_host = weaviate_url.replace("http://", "").replace("https://", "").split(":")[0]
-        http_port = int(weaviate_url.split(":")[-1]) if ":" in weaviate_url else 8080
-
-        self.client = weaviate.connect_to_custom(
-            http_host=http_host,
-            http_port=http_port,
-            http_secure=False,
-            grpc_host=http_host,
+        # v0.2.77 Part 7a: connect via the shared connect_v4 factory. Behaviour
+        # is preserved exactly — plaintext HTTP (http_secure=False), the same
+        # gRPC-port fallback, and skip_init_checks=False (this batch path always
+        # did the startup readiness handshake and we don't change that here).
+        from vco_lib import weaviate_helpers as _wh
+        self.client = _wh.connect_v4(
+            weaviate_url,
             grpc_port=grpc_port or 50051,
-            grpc_secure=False
+            http_secure=False,
+            skip_init_checks=False,
         )
         # The EmbeddingService is the single source of truth for: which
         # model to call, which named-vector slot to write, whether the

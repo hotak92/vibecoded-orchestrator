@@ -60,10 +60,12 @@ from typing import Any, Callable, Optional
 # orchestrator-self path; the helpers live in ``vco_lib.symlink_handler``
 # so both paths share the SSOT.
 from vco_lib.symlink_handler import compute_vco_new_path, is_symlink_blocking
+from vco_lib import weaviate_helpers as _wh
 
-# Default Weaviate port (mirrors install.DEFAULT_WEAVIATE_PORT, kept here
-# so this module is import-free of install.py).
-DEFAULT_WEAVIATE_PORT = 8081
+# Default Weaviate port. Canonical value lives in
+# ``vco_lib.weaviate_helpers`` (v0.2.77 Part 7a convergence); re-exported
+# here for the many in-tree + test references to ``project_init.DEFAULT_WEAVIATE_PORT``.
+DEFAULT_WEAVIATE_PORT = _wh.DEFAULT_WEAVIATE_PORT
 
 # X-1 / v0.2.76: the underscore-DROPPING sanitizer moved to
 # ``vco_lib.codegraph_naming`` — the ONE naming home. These aliases keep the
@@ -806,19 +808,11 @@ def rebuild_collections(args, log_event=None) -> None:
     _log("7b.1/10", "start", "schema-rebuild collection drop")
 
     try:
-        import weaviate
         weaviate_url = os.environ.get("WEAVIATE_URL", f"http://localhost:{DEFAULT_WEAVIATE_PORT}")
-        host = weaviate_url.replace("http://", "").replace("https://", "").split(":")[0]
-        port = int(weaviate_url.rsplit(":", 1)[-1]) if ":" in weaviate_url else 8080
-        client = weaviate.connect_to_custom(
-            http_host=host,
-            http_port=port,
-            http_secure=False,
-            grpc_host=host,
-            grpc_port=int(os.environ.get("GRPC_PORT", "50052")),
-            grpc_secure=False,
-            skip_init_checks=True,
-        )
+        # v0.2.77 Part 7a: use the shared connect_v4 factory. Force
+        # http_secure=False to preserve this path's historical behaviour
+        # (it always connected plaintext regardless of scheme).
+        client = _wh.connect_v4(weaviate_url, http_secure=False)
         try:
             for env_key, label in [
                 ("KG_COLLECTION", "KG"),
@@ -924,22 +918,14 @@ def _http_request(
 ) -> tuple[int, bytes]:
     """Thin urllib wrapper. Returns (status, body_bytes). Never raises on
     non-2xx — caller decides what to do.
+
+    Canonical implementation lives in :func:`vco_lib.weaviate_helpers.http_request`
+    (v0.2.77 Part 7a convergence). Kept here as a module-level delegator so
+    the many ``mock.patch.object(project_init, "_http_request", ...)`` test
+    sites and the sibling helpers below (``_fetch_schema`` / ``_list_classes``)
+    that call the module-local name continue to work unchanged.
     """
-    data = None
-    headers = {"Accept": "application/json"}
-    if body is not None:
-        data = json.dumps(body).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return (resp.status, resp.read())
-    except urllib.error.HTTPError as e:
-        # Drain the error body so the caller can inspect Weaviate's reason.
-        try:
-            return (e.code, e.read())
-        except Exception:
-            return (e.code, b"")
+    return _wh.http_request(method, url, body=body, timeout=timeout)
 
 
 def _fetch_schema(name: str, weaviate_url: Optional[str] = None) -> Optional[dict]:
@@ -1120,27 +1106,13 @@ def _count_objects(name: str, weaviate_url: Optional[str] = None) -> int:
     """Count objects in a collection via v4 iterator. Lightweight: yields
     object metadata only (no vectors) so it scales for the recovery
     classification check. Returns 0 if collection missing or empty.
+
+    Delegates to :func:`vco_lib.weaviate_helpers.count_objects_v4` (v0.2.77
+    Part 7a convergence — the 0-on-failure variant). Kept as a module-level
+    delegator so ``mock.patch.object(project_init, "_count_objects", ...)``
+    keeps working.
     """
-    try:
-        client = _connect_v4_client(weaviate_url=weaviate_url)
-    except Exception:
-        # Connection failure → can't classify; treat as 0 (caller will
-        # log + bail rather than risk a destructive decision).
-        return 0
-    try:
-        col = client.collections.get(name)
-        n = 0
-        # include_vector=False keeps payloads small.
-        for _ in col.iterator(include_vector=False):
-            n += 1
-        return n
-    except Exception:
-        # Collection might not exist yet, or v4 client raises on missing
-        # class. Let _fetch_schema be the existence oracle elsewhere;
-        # here, missing → 0.
-        return 0
-    finally:
-        client.close()
+    return _wh.count_objects_v4(name, weaviate_url=weaviate_url)
 
 
 def _recover_or_drop_orphan_staging(
@@ -1354,26 +1326,18 @@ def _snapshot_collection_for_rebuild(
 
 def _connect_v4_client(weaviate_url: Optional[str] = None):
     """Late-import weaviate-client v4 so non-migrate code paths don't pull
-    the dependency. Returns a connected client."""
-    import weaviate  # noqa: WPS433  (intentional lazy import)
+    the dependency. Returns a connected client.
 
-    url = weaviate_url or _weaviate_url_default()
-    host = url.replace("http://", "").replace("https://", "").split(":")[0]
-    # Defensive port parse (works for "http://localhost:8081" or "https://x:9999/").
-    try:
-        port = int(url.rsplit(":", 1)[-1].split("/")[0])
-    except ValueError:
-        port = 8080
-    grpc_port = int(os.environ.get("GRPC_PORT", "50052"))
-    return weaviate.connect_to_custom(
-        http_host=host,
-        http_port=port,
-        http_secure=url.startswith("https://"),
-        grpc_host=host,
-        grpc_port=grpc_port,
-        grpc_secure=False,
-        skip_init_checks=True,
-    )
+    Delegates to :func:`vco_lib.weaviate_helpers.connect_v4` (v0.2.77 Part 7a
+    convergence — one ``connect_to_custom`` factory). Behaviour is identical
+    to the pre-convergence inline (GRPC_PORT env default 50052,
+    skip_init_checks=True, http_secure derived from the https:// scheme) EXCEPT
+    the pathological "URL ends with a non-numeric port" fallback, which now
+    lands on :data:`DEFAULT_WEAVIATE_PORT` (8081) instead of the stray 8080 the
+    old inline used — 8081 is this module's actual default and 8080 never
+    matched any real config.
+    """
+    return _wh.connect_v4(weaviate_url=weaviate_url)
 
 
 def _copy_collection_with_vectors(

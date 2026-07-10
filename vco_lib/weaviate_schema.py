@@ -78,16 +78,16 @@ from __future__ import annotations
 
 import enum
 import json
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-# Default Weaviate port (mirrors `vco_lib.project_init.DEFAULT_WEAVIATE_PORT`
-# without importing it — this module stays import-cheap so the schema
-# catalog can be picked up by static analysis / docs tooling without
-# pulling in the rest of project_init).
-DEFAULT_WEAVIATE_PORT = 8081
+from vco_lib import weaviate_helpers as _wh
+
+# Default Weaviate port. Canonical value lives in
+# ``vco_lib.weaviate_helpers`` (v0.2.77 Part 7a convergence); re-exported here
+# so this module stays import-cheap (weaviate_helpers is pure stdlib) while the
+# constant no longer has an independent copy that could drift.
+DEFAULT_WEAVIATE_PORT = _wh.DEFAULT_WEAVIATE_PORT
 
 
 # ---------------------------------------------------------------------------
@@ -404,21 +404,13 @@ def _http_request(
 ) -> tuple[int, bytes]:
     """Thin urllib wrapper. Returns (status, body_bytes). Never raises on
     non-2xx — caller decides what to do.
+
+    Canonical implementation lives in :func:`vco_lib.weaviate_helpers.http_request`
+    (v0.2.77 Part 7a convergence — this used to be a byte-identical copy of
+    project_init's ``_http_request``). Kept as a module-level delegator so the
+    sibling ``_fetch_schema`` (which calls the module-local name) keeps working.
     """
-    data = None
-    headers = {"Accept": "application/json"}
-    if body is not None:
-        data = json.dumps(body).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return (resp.status, resp.read())
-    except urllib.error.HTTPError as e:
-        try:
-            return (e.code, e.read())
-        except Exception:
-            return (e.code, b"")
+    return _wh.http_request(method, url, body=body, timeout=timeout)
 
 
 def _fetch_schema(
@@ -426,16 +418,11 @@ def _fetch_schema(
 ) -> Optional[dict]:
     """GET /v1/schema/<collection>. Returns dict on 200, None on 404.
     Raises on transport failure (network down, malformed URL).
+
+    Delegates to :func:`vco_lib.weaviate_helpers.fetch_schema` (v0.2.77 Part
+    7a convergence).
     """
-    base = (weaviate_url or _weaviate_url_default()).rstrip("/")
-    status, body = _http_request("GET", f"{base}/v1/schema/{collection}")
-    if status == 200:
-        return json.loads(body.decode("utf-8"))
-    if status == 404:
-        return None
-    raise RuntimeError(
-        f"GET /v1/schema/{collection} -> HTTP {status}: {body[:200]!r}"
-    )
+    return _wh.fetch_schema(collection, weaviate_url=weaviate_url)
 
 
 def _existing_slot_dim(

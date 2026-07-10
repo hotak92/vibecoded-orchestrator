@@ -138,6 +138,7 @@ if str(PROJECT_ROOT) not in sys.path:
 # callers; will be removed in PR 9 (cleanup).
 from vco_lib import bundled_versions as _bundled_versions  # noqa: E402
 from vco_lib import project_init as _project_init  # noqa: E402
+from vco_lib import weaviate_helpers as _wh  # noqa: E402
 from vco_lib import secrets_audit as _secrets_audit  # noqa: E402
 from vco_lib.deferral_report import DeferralEntry, DeferralReport  # noqa: E402
 from vco_lib.install_deferral_flow import InstallDeferralFlow  # noqa: E402
@@ -14515,10 +14516,12 @@ def _ensure_collections(embed_config: dict,
         data={"weaviate_url": weaviate_url, "adopt_mode": adopt_mode},
     )
 
-    # 1. Read existing schema.
+    # 1. Read existing schema (v0.2.77 Part 7a: via shared _wh.http_request).
     try:
-        resp = urllib.request.urlopen(f"{weaviate_url}/v1/schema", timeout=10)
-        schema = json.loads(resp.read())
+        status, body = _wh.http_request("GET", f"{weaviate_url}/v1/schema", timeout=10)
+        if status != 200:
+            raise RuntimeError(f"HTTP {status}")
+        schema = json.loads(body)
     except Exception as e:
         print(f"  WARN: couldn't read schema ({e}). Skipping bootstrap.")
         print("  MCP server will create collections lazily on first write.")
@@ -14715,27 +14718,24 @@ def _ensure_collections(embed_config: dict,
                 )
                 return
 
-    # 3. POST each missing class definition.
+    # 3. POST each missing class definition (v0.2.77 Part 7a: via shared
+    # _wh.http_request, which returns (status, body) for HTTP errors so the
+    # 422 "already exists" race reads the tuple; only transport errors raise).
     created: list[str] = []
     failed: list[tuple[str, str]] = []
+    schema_url = f"{weaviate_url}/v1/schema"
     for name, builder in missing:
-        body = json.dumps(builder(name)).encode()
-        req = urllib.request.Request(
-            f"{weaviate_url}/v1/schema",
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
         try:
-            urllib.request.urlopen(req, timeout=15)
-            created.append(name)
-        except urllib.error.HTTPError as e:
-            err_body = e.read().decode("utf-8", errors="replace")[:200]
-            # 422 with "already exists" is benign on race with another install.
-            if e.code == 422 and "already exists" in err_body.lower():
-                created.append(f"{name} (already)")
+            status, resp_body = _wh.http_request("POST", schema_url, body=builder(name), timeout=15)
+            if 200 <= status < 300:
+                created.append(name)
             else:
-                failed.append((name, f"HTTP {e.code}: {err_body}"))
+                err_body = resp_body.decode("utf-8", errors="replace")[:200]
+                # 422 with "already exists" is benign on race with another install.
+                if status == 422 and "already exists" in err_body.lower():
+                    created.append(f"{name} (already)")
+                else:
+                    failed.append((name, f"HTTP {status}: {err_body}"))
         except Exception as e:
             failed.append((name, str(e)))
 
