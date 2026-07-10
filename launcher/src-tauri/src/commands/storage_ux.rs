@@ -750,21 +750,16 @@ fn py_quote(s: &str) -> String {
     out
 }
 
+/// Resolve a Python interpreter for the deferral `-c` snippet.
+///
+/// v0.2.77 (Part 7c task 1): delegates to the shared RT-4 ladder in
+/// `vct_launcher_core::python_resolve` instead of the prior PATH-only walk.
+/// The ladder prefers the orchestrator venv (`$VCT_VENV` / `$VCT_INSTALL_ROOT`
+/// / exe-walk) — which actually has `vco_lib` importable — before falling back
+/// to PATH, so the `import ...vco_lib.deferral_report` snippet resolves on
+/// PEP-668 machines where a bare PATH `python3` can't import it.
 fn pick_python() -> Option<String> {
-    for candidate in &["python3", "python"] {
-        if let Some(paths) = std::env::var_os("PATH") {
-            for dir in std::env::split_paths(&paths) {
-                #[cfg(windows)]
-                let probe = dir.join(format!("{candidate}.exe"));
-                #[cfg(not(windows))]
-                let probe = dir.join(candidate);
-                if probe.is_file() {
-                    return Some(probe.to_string_lossy().to_string());
-                }
-            }
-        }
-    }
-    None
+    vct_launcher_core::python_resolve::resolve_python_for_vco_lib_str()
 }
 
 // ---------------------------------------------------------------------------

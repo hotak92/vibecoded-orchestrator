@@ -608,22 +608,15 @@ fn write_partial_failure_deferral(
     }
 }
 
-/// First `python3` then `python` from PATH. Mirrors the resolution
-/// order in `storage_ux::emit_deferral` so deferral behaviour is
-/// consistent across writers.
+/// Resolve a Python interpreter for the partial-failure deferral `-c` snippet.
+///
+/// v0.2.77 (Part 7c task 1): delegates to the shared RT-4 ladder in
+/// `vct_launcher_core::python_resolve`. Previously a PATH-only `--version`
+/// probe returning a bare `python3`/`python` name; the ladder prefers the
+/// orchestrator venv (which has `vco_lib` importable) before PATH, keeping
+/// deferral resolution consistent across writers (one home).
 fn pick_python() -> Option<PathBuf> {
-    for candidate in ["python3", "python"] {
-        let probe = std::process::Command::new(candidate)
-            .silent()
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        if probe.map(|s| s.success()).unwrap_or(false) {
-            return Some(PathBuf::from(candidate));
-        }
-    }
-    None
+    vct_launcher_core::python_resolve::resolve_python_for_vco_lib()
 }
 
 /// Quote `s` as a Python double-quoted string literal. Mirrors

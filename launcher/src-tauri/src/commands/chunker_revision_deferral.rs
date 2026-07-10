@@ -120,27 +120,14 @@ fn write_deferral_for_project(
     }
 }
 
-/// First `python3` then `python` from PATH. Mirrors
-/// `storage_ux::emit_deferral`'s resolution order so deferral behaviour is
-/// consistent across every Rust-side emitter (mirror-don't-fork).
+/// Resolve a Python interpreter for the chunker-resync deferral `-c` snippet.
+///
+/// v0.2.77 (Part 7c task 1): delegates to the shared RT-4 ladder in
+/// `vct_launcher_core::python_resolve`. Previously a PATH-only walk; the ladder
+/// prefers the orchestrator venv (which has `vco_lib` importable) before PATH,
+/// keeping every Rust-side emitter's resolution consistent (one home).
 fn pick_python() -> Option<String> {
-    for candidate in ["python3", "python"] {
-        #[cfg(windows)]
-        let names = [format!("{candidate}.exe"), candidate.to_string()];
-        #[cfg(not(windows))]
-        let names = [candidate.to_string()];
-        if let Some(paths) = std::env::var_os("PATH") {
-            for dir in std::env::split_paths(&paths) {
-                for name in &names {
-                    let probe = dir.join(name);
-                    if probe.is_file() {
-                        return Some(probe.to_string_lossy().to_string());
-                    }
-                }
-            }
-        }
-    }
-    None
+    vct_launcher_core::python_resolve::resolve_python_for_vco_lib_str()
 }
 
 /// Quote `s` as a Python double-quoted string literal. Mirrors

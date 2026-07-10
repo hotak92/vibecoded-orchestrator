@@ -76,6 +76,27 @@ fn venv_in(root: &Path) -> Option<PathBuf> {
 /// let py = resolve_python_for_vco_lib()
 ///     .unwrap_or_else(|| PathBuf::from(&system.python_cmd));
 /// ```
+/// `String`-returning convenience wrapper over [`resolve_python_for_vco_lib`].
+///
+/// Several launcher-side deferral emitters (`storage_ux`,
+/// `chunker_revision_deferral`, `git_user_editable_merge`, `projects_v2`
+/// rename, `module_updates`) historically each carried their own PATH-only
+/// `pick_python` copy that returned a `String` interpreter path. Those copies
+/// resolved ONLY from `$PATH` — a strictly WEAKER resolution than the RT-4
+/// ladder: on a machine whose PATH `python3` is a PEP-668 system interpreter
+/// without `vco_lib`/`weaviate` importable, the deferral `-c` snippet
+/// (`import ...vco_lib.deferral_report`) would fail and the deferral silently
+/// go unwritten. Routing them through the full ladder makes the emitter pick
+/// the orchestrator venv (which HAS `vco_lib`) first, falling back to PATH only
+/// as the last resort — the intended behaviour upgrade.
+///
+/// Returns `None` only in the theoretically-impossible case that even the PATH
+/// fallback yields nothing (the underlying resolver always returns `Some`), so
+/// callers that previously treated `None` as "no python" keep working.
+pub fn resolve_python_for_vco_lib_str() -> Option<String> {
+    resolve_python_for_vco_lib().map(|p| p.to_string_lossy().to_string())
+}
+
 pub fn resolve_python_for_vco_lib() -> Option<PathBuf> {
     // 1. $VCT_VENV — explicit override. Accept both "venv dir" and
     //    "interpreter binary path" shapes.

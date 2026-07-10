@@ -4943,26 +4943,14 @@ still work against the existing collections; rebuild when convenient.\",\n\
     }
 }
 
-/// First `python3` then `python` from PATH. Mirrors
-/// `storage_ux::emit_deferral`'s resolution order (mirror-don't-fork).
+/// Resolve a Python interpreter for the rename-deferral `-c` snippet.
+///
+/// v0.2.77 (Part 7c task 1): delegates to the shared RT-4 ladder in
+/// `vct_launcher_core::python_resolve` (was a PATH-only walk). The ladder
+/// prefers the orchestrator venv — which has `vco_lib` importable — before
+/// PATH, so the deferral emit resolves on PEP-668 machines.
 fn pick_python_for_rename_deferral() -> Option<String> {
-    for candidate in ["python3", "python"] {
-        #[cfg(windows)]
-        let names = [format!("{candidate}.exe"), candidate.to_string()];
-        #[cfg(not(windows))]
-        let names = [candidate.to_string()];
-        if let Some(paths) = std::env::var_os("PATH") {
-            for dir in std::env::split_paths(&paths) {
-                for name in &names {
-                    let probe = dir.join(name);
-                    if probe.is_file() {
-                        return Some(probe.to_string_lossy().to_string());
-                    }
-                }
-            }
-        }
-    }
-    None
+    vct_launcher_core::python_resolve::resolve_python_for_vco_lib_str()
 }
 
 /// Quote `s` as a Python double-quoted string literal. Mirrors

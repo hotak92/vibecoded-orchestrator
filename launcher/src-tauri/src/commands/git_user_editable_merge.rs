@@ -1006,25 +1006,15 @@ fn py_quote(s: &str) -> String {
     out
 }
 
-/// Probe for a python interpreter on PATH. Returns `Some(<absolute
-/// path>)` for the first hit; `None` if neither `python3` nor `python`
-/// is available. Copied from `storage_ux.rs::pick_python` to keep this
-/// module self-contained.
+/// Resolve a python interpreter for the deferral `-c` snippet.
+///
+/// v0.2.77 (Part 7c task 1): delegates to the shared RT-4 ladder in
+/// `vct_launcher_core::python_resolve` (was a PATH-only walk copied from
+/// `storage_ux`). The ladder prefers the orchestrator venv — which has
+/// `vco_lib` importable — before PATH, so the deferral emit resolves on
+/// PEP-668 machines where a bare PATH `python3` cannot import `vco_lib`.
 fn pick_python_for_deferral() -> Option<String> {
-    for candidate in &["python3", "python"] {
-        if let Some(paths) = std::env::var_os("PATH") {
-            for dir in std::env::split_paths(&paths) {
-                #[cfg(windows)]
-                let probe = dir.join(format!("{candidate}.exe"));
-                #[cfg(not(windows))]
-                let probe = dir.join(candidate);
-                if probe.is_file() {
-                    return Some(probe.to_string_lossy().to_string());
-                }
-            }
-        }
-    }
-    None
+    vct_launcher_core::python_resolve::resolve_python_for_vco_lib_str()
 }
 
 /// v0.2.56 (Defect A fix): stateless probe — would merging the local
