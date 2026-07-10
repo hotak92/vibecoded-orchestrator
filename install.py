@@ -11484,7 +11484,14 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
         fail_message="FAIL",
         user_hint_lines=[
             "The orchestrator install completed, but weaviate_mcp is not pip-installed.",
-            "Consumer scripts fall back to sys.path resolution automatically.",
+            # v0.2.76 (update-lens #1): post-R1 the code-graph analyzer no longer
+            # sys.path-falls-back — it IMPORTS vco_lib directly and, on a broken
+            # install, exits with an 'analyze_code_graph: vco_lib not importable —
+            # run install.py' message. So the old hint ("consumer scripts fall
+            # back to sys.path resolution automatically") is now FALSE for it.
+            "The code-graph analyzer will NOT run until this is repaired: it "
+            "imports vco_lib directly and exits loudly on a broken install. "
+            "Re-run 'python install.py' to fix the editable install.",
         ],
     )
     if mcp_editable_result.returncode != 0:
