@@ -114,62 +114,24 @@ def test_is_test_path_truth_table(analyzer_mod):
         assert fn(p) is False, f"expected NON-test: {p}"
 
 
-def _extract_inline_is_test_path_fallback():
-    """Parse the INLINE `is_test_path` fallback def out of analyze_code_graph.py
-    and return it as a standalone callable — WITHOUT letting the module's
-    guarded `from weaviate_mcp.code_ranking import is_test_path` succeed.
-
-    Why not just call `analyzer_mod.is_test_path`? On a correctly-installed
-    orchestrator that name is the IMPORTED code_ranking symbol (the guarded
-    import succeeds), so comparing it to code_ranking.is_test_path is a
-    tautology (same object) and the fallback body is never exercised. This
-    helper isolates the fallback source so the parity test actually locks the
-    two independent bodies together (pre-gate platform audit P1).
-    """
-    import ast
-    import textwrap
-
-    src = _ANALYZER_PATH.read_text(encoding="utf-8")
-    tree = ast.parse(src)
-    fallback_src = None
-    for node in ast.walk(tree):
-        # The fallback def lives inside the `except` of the guarded import;
-        # find the FunctionDef named is_test_path that is NOT at module top
-        # level (the import binds the name at module level, the def is nested).
-        if isinstance(node, ast.Try):
-            for handler in node.handlers:
-                for stmt in handler.body:
-                    if isinstance(stmt, ast.FunctionDef) and stmt.name == "is_test_path":
-                        fallback_src = ast.get_source_segment(src, stmt)
-    assert fallback_src is not None, (
-        "inline is_test_path fallback not found in analyze_code_graph.py — the "
-        "guarded-import fallback pattern was removed or renamed"
-    )
-    ns: dict = {}
-    exec(textwrap.dedent(fallback_src), ns)  # noqa: S102 — our own source, test-only
-    return ns["is_test_path"]
-
-
-def test_is_test_path_parity_with_code_ranking(analyzer_mod):
-    """Parity lock: the analyzer's INLINE FALLBACK body must behave identically
-    to the single-home implementation in code_ranking. We exec the fallback
-    source in isolation (see `_extract_inline_is_test_path_fallback`) rather
-    than call `analyzer_mod.is_test_path`, which on a normal install is the
-    imported code_ranking symbol — comparing it to itself would be a tautology
-    (pre-gate platform audit P1)."""
+def test_is_test_path_is_imported_not_mirrored(analyzer_mod):
+    """v0.2.76 (R1): the analyzer's `is_test_path` IS the single-home
+    `weaviate_mcp.code_ranking.is_test_path` object — imported directly, not a
+    byte-identical inline mirror. The prior parity test
+    (`test_is_test_path_parity_with_code_ranking`) locked TWO independent
+    bodies; R1 deleted the inline fallback (loud-fail on a broken install), so
+    there is nothing to keep in sync. Assert IDENTITY: if a future edit
+    reintroduces a fallback body, this identity check fails and the drift risk
+    is surfaced."""
     try:
         from weaviate_mcp.code_ranking import is_test_path as shared
-    except Exception:
-        # Import-availability gate (bare CI container without the weaviate_mcp
-        # deps), NOT a deferred producer/consumer split — code_ranking.is_test_path
-        # IS shipped (code_ranking.py). Skip only when the module can't import.
+    except ImportError:
         pytest.skip("weaviate_mcp.code_ranking not importable in this env (deps absent)")
-    fallback = _extract_inline_is_test_path_fallback()
-    # Sanity: the two must be DIFFERENT function objects (else the test is
-    # exercising a single body and the drift-lock is illusory).
-    assert fallback is not shared
-    for p in _TEST_PATHS + _NON_TEST_PATHS:
-        assert shared(p) == fallback(p), p
+    assert analyzer_mod.is_test_path is shared, (
+        "analyzer.is_test_path must BE the imported code_ranking symbol (R1: "
+        "direct import, no mirror) — a distinct object means a fallback body "
+        "was reintroduced"
+    )
 
 
 # ─────────────────── _dedup_insert choke-point stamps ───────────────────────

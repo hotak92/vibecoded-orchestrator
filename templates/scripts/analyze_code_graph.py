@@ -1302,6 +1302,14 @@ if not _ensure_vco_lib_on_path():
     sys.exit(1)
 # VCO-REWIRE-END: orchestrator-root-resolution
 try:
+    # X-1 / v0.2.76 (ruling #1): direct import + loud-fail. `weaviate_mcp` is
+    # pip-installed as an editable package by install.py (A1, v0.2.38); the
+    # analyzer runs under the install venv where it is always importable. The
+    # inline char-truncation fallbacks that mirrored these (and the
+    # `_CHUNKING_AVAILABLE=False` degrade) are GONE — an ImportError here means
+    # a broken install, not a normal run, so we fail loudly the same way the
+    # vco_lib import above does rather than silently degrade to single-object
+    # writes with a divergent truncation shape.
     from weaviate_mcp.code_truncation import (
         truncate_function_for_embedding,
         truncate_class_for_embedding,
@@ -1310,103 +1318,31 @@ try:
         chunk_or_truncate_class_for_embedding,
         _extract_docstring,
     )
-    _CHUNKING_AVAILABLE = True
-except ImportError:
-    # Inline fallbacks — naive char-based truncation (no model-awareness).
-    # NOTE: this branch is effectively dead for a correctly-installed
-    # orchestrator (code_truncation is a same-package sibling of the MCP that
-    # is always importable once vco_lib is on-path). Kept as defense-in-depth
-    # so a broken partial install degrades to single-object writes rather than
-    # crashing. When this branch is taken, `_CHUNKING_AVAILABLE` is False and
-    # `_dedup_insert` skips the chunk fan-out entirely (single object, as pre-
-    # v0.2.72).
-    _CHUNKING_AVAILABLE = False
-
-    def truncate_function_for_embedding(signature, body, language="python", model=None):
-        return f"{signature}\n{body[:600]}"
-
-    def truncate_class_for_embedding(signature, class_body, methods=None, language="python", model=None):
-        methods_str = ", ".join(methods[:10]) if methods else ""
-        return f"{signature}\nMethods: {methods_str}\n{class_body[:500]}"
-
-    def truncate_module_for_embedding(module_summary, model=None):
-        return module_summary[:2000]
-
-    def chunk_or_truncate_for_embedding(signature, body, language="python", model=None, *, full_name=""):
-        return [truncate_function_for_embedding(signature, body, language=language, model=model)]
-
-    def chunk_or_truncate_class_for_embedding(signature, class_body, methods=None, language="python", model=None, *, full_name=""):
-        return [truncate_class_for_embedding(signature, class_body, methods=methods, language=language, model=model)]
-
-    def _extract_docstring(body, language="python"):
-        # M3 fallback: extraction unavailable on a broken partial install →
-        # doc stays "" (soft no-op; renderer falls back to the body snippet).
-        return ""
+except ImportError as _exc:
+    sys.stderr.write(
+        "analyze_code_graph: weaviate_mcp.code_truncation not importable — VCO "
+        "install is broken; run install.py. weaviate_mcp is editable-installed "
+        "into the analyzer's venv on every healthy install; a missing module "
+        f"means a broken install, not a normal run. ({_exc})\n"
+    )
+    sys.exit(1)
 
 
 # ── v0.2.73 (M1-prod): test-entity heuristic ─────────────────────────────────
 #
 # SINGLE HOME: claude_mcp_servers/weaviate_mcp/code_ranking.py::is_test_path
-# (the retrieval consumer). The inline fallback below MUST STAY BYTE-IDENTICAL
-# to it — tests/test_codegraph_metadata_producers_v0273.py carries the parity
-# test that locks the two together (mirrors the canonical-class-prefix parity
-# pattern). Guarded import: same-package sibling of code_truncation above, so
-# the fallback is effectively dead on a correctly-installed orchestrator.
+# (the retrieval consumer). X-1 / v0.2.76 (ruling #1): direct import + loud-fail
+# — same-package sibling of code_truncation above, always importable under the
+# install venv. The byte-identical inline mirror it used to carry is GONE.
 try:
     from weaviate_mcp.code_ranking import is_test_path
-except Exception:  # noqa: BLE001 — partial install → inline fallback
-    def is_test_path(path: str) -> bool:
-        """True when *path* names a test/spec/fixture source file.
-
-        MUST MATCH claude_mcp_servers/weaviate_mcp/code_ranking.py::is_test_path.
-        Pure function: path string in, bool out. Directory matching is per
-        PATH PART (not substring) — ``tests/x.py`` is a test;
-        ``my_tests_helper/x.py`` is not. Windows backslashes normalized.
-        Empty/unknown → False (never flag on uncertainty).
-        """
-        if not path:
-            return False
-        parts = [p for p in str(path).replace("\\", "/").split("/") if p]
-        if not parts:
-            return False
-        dirs_lower = [d.lower() for d in parts[:-1]]
-        for d in dirs_lower:
-            if d in ("tests", "test", "__tests__", "spec", "specs",
-                     "testdata", "fixtures"):
-                return True
-            if d.endswith(".tests"):  # csharp `Foo.Tests` project dirs
-                return True
-        for i in range(len(dirs_lower) - 1):  # java `src/test` part-pair
-            if dirs_lower[i] == "src" and dirs_lower[i + 1] == "test":
-                return True
-        name = parts[-1]
-        lower = name.lower()
-        if lower == "conftest.py" or lower.endswith("_test.py"):
-            return True
-        if lower.startswith("test_") and lower.endswith((".py", ".cpp")):
-            return True
-        for ext in (".js", ".ts", ".jsx", ".tsx", ".mjs"):
-            if lower.endswith(".spec" + ext) or lower.endswith(".test" + ext):
-                return True
-        if lower.endswith("_test.go") or lower.endswith("_test.rs"):
-            return True
-        # CamelCase suffixes stay case-sensitive (`contest.java` is NOT a test).
-        if name.endswith(("Test.java", "Tests.java", "IT.java")):
-            return True
-        if name.endswith(("Tests.cs", "Test.cs")):
-            return True
-        if lower.endswith(("_spec.rb", "_test.rb")):
-            return True
-        if lower.endswith(("_test.cpp", "_test.cc", "_test.cxx",
-                           "_tests.cpp", "_tests.cc")):
-            return True
-        if lower.endswith("_spec.lua"):
-            return True
-        if lower.endswith("_test.sh") or lower.endswith(".bats"):
-            return True
-        if lower.endswith(".tests.ps1"):  # Pester
-            return True
-        return False
+except ImportError as _exc:
+    sys.stderr.write(
+        "analyze_code_graph: weaviate_mcp.code_ranking not importable — VCO "
+        "install is broken; run install.py. "
+        f"({_exc})\n"
+    )
+    sys.exit(1)
 
 
 # v0.2.18: central embedding dispatcher. Replaces the inline
@@ -2309,7 +2245,7 @@ class CodeGraphAnalyzer:
 
         # ── v0.2.73 (M1-prod): stamp `is_test` at the choke point ───────────
         # Pure path heuristic (see is_test_path — single home in
-        # code_ranking, byte-identical fallback above). File-anchored
+        # code_ranking, IMPORTED directly above per R1/ruling #1). File-anchored
         # collections only (Function/Class/Module); CodeAPI/CodeInteraction
         # aren't file-anchored → skipped. `"is_test" not in props` (not a
         # falsy check): False is a valid preset. Stamped BEFORE the chunk
@@ -2618,13 +2554,13 @@ class CodeGraphAnalyzer:
 
         Returns ``None`` when chunking does not apply — the caller then falls
         through to the normal single-object write. `None` is returned when:
-          * chunking support is unavailable (partial install), OR
           * the collection is not CodeFunction/CodeClass, OR
           * the properties lack the body/signature needed to re-derive chunks, OR
           * the entity fits in one chunk (the common 91%+ case).
         """
-        if not _CHUNKING_AVAILABLE:
-            return None
+        # v0.2.76 (R1): the `_CHUNKING_AVAILABLE` gate is gone — the
+        # code_truncation import is now loud-fail (a broken install exits at
+        # import), so chunking support is always present here.
         coll_name = getattr(collection, "name", "") or ""
         is_function = coll_name.endswith("CodeFunction")
         is_class = coll_name.endswith("CodeClass")

@@ -407,8 +407,9 @@ def test_pipeline_preserves_extra_candidate_keys():
 
 
 # ─── M1 (v0.2.73): is_test_path truth table ──────────────────────────────────
-# Representative rows per language convention. The FULL table (plus the parity
-# lock vs the analyzer's inline fallback) lives in
+# Representative rows per language convention. The FULL table (plus the v0.2.76
+# R1 identity check that the analyzer IMPORTS this single-home is_test_path
+# rather than mirroring it) lives in
 # tests/test_codegraph_metadata_producers_v0273.py — these pin the single-home
 # implementation directly.
 _M1_TEST_PATHS = [
