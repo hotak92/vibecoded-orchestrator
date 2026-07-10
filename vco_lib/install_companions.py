@@ -16,6 +16,50 @@ from __future__ import annotations
 import os
 import shutil
 from pathlib import Path
+from typing import List, Optional, Tuple
+
+
+#: Reason codes returned by :func:`codegraph_ts_install_plan` when it decides
+#: NOT to install (so install.py can log/print a matching notice).
+CODEGRAPH_TS_SKIP_ENV = "skip_env"        # VCT_SKIP_CODEGRAPH_TS=1
+CODEGRAPH_TS_SKIP_NO_PYPROJECT = "skip_no_pyproject"  # extra pins live there
+
+
+def codegraph_ts_install_plan(
+    *,
+    pyproject_exists: bool,
+    skip_env: bool,
+    project_root: str,
+) -> Tuple[bool, Optional[str], Optional[List[str]]]:
+    """Decide whether install.py should install the optional ``codegraph-ts``
+    extra (tree-sitter call-extraction grammars), and with what pip argv.
+
+    Pure decision function (no I/O, no subprocess) — the testable core of
+    install.py's ``_install_codegraph_treesitter`` soft-fail step. install.py
+    owns the actual subprocess run + its logging/animation helpers (irreducible
+    glue coupled to ``_run_logged_subprocess`` / ``_log_install_event``), so
+    only the DECISION lives here.
+
+    Args:
+        pyproject_exists: whether ``<project_root>/pyproject.toml`` is present
+            (the extra's exact pins live there; nothing to install without it).
+        skip_env: whether ``VCT_SKIP_CODEGRAPH_TS=1`` is set (explicit opt-out).
+        project_root: the orchestrator root; the pip target is
+            ``<project_root>[codegraph-ts]`` so pyproject's pins are the single
+            source of truth (no duplicated version list).
+
+    Returns ``(should_install, skip_reason, pip_target_argv)``:
+        * ``(False, <reason>, None)`` when skipping — ``skip_reason`` is one of
+          the ``CODEGRAPH_TS_SKIP_*`` codes.
+        * ``(True, None, ["<project_root>[codegraph-ts]"])`` when installing —
+          the tail argv element install.py appends to its pip invocation.
+    """
+    if skip_env:
+        return (False, CODEGRAPH_TS_SKIP_ENV, None)
+    if not pyproject_exists:
+        return (False, CODEGRAPH_TS_SKIP_NO_PYPROJECT, None)
+    # ``<root>[codegraph-ts]`` — pip resolves the extra from pyproject's pins.
+    return (True, None, [f"{project_root}[codegraph-ts]"])
 
 
 def ensure_discovered_lean_ctx_on_path(

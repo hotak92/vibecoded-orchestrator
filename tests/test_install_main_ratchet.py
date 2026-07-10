@@ -55,7 +55,19 @@ _MAIN_SPAN_MAX = 1668
 # (which needs the open cursor local to _write_preset_defaults_to_app_state).
 # main() itself SHRANK (1668→1667). Same "inseparable thin-shim" precedent as
 # the A-2 / R8 lines above — re-pinned to the new measured value.
-_TOTAL_LINES_MAX = 25417
+# v0.2.77 Part 5 (CG-2): +59 for the optional codegraph-ts (tree-sitter
+# call-extraction) install step _install_codegraph_treesitter. The DECISION
+# (skip-env / no-pyproject / pip-target argv) was extracted to
+# vco_lib.install_companions.codegraph_ts_install_plan (pure + unit-tested);
+# the residual install.py body is irreducible soft-fail glue — the
+# _run_logged_subprocess call with its dot-cycle animation, the _pip_install_flags
+# / _pip_subprocess_env threading, and the _log_install_event lifecycle events —
+# structurally identical to the sibling _install_playwright_browsers, which lives
+# in install.py for the same reason (subprocess orchestration coupled to install
+# internals). main() did NOT grow (single call line fit the existing 1668 budget;
+# no comment block, no blank). Same "inseparable thin-shim" precedent as the
+# A-2 / R8 / 5c lines above — re-pinned to the new measured value.
+_TOTAL_LINES_MAX = 25476
 
 
 def _measure() -> tuple:
