@@ -10724,12 +10724,30 @@ async fn detect_python() -> (bool, String, String) {
     // via python.org or PythonManager. Reported 2026-04-28: the wizard
     // got stuck in "Creating…" with a flashing python.exe console
     // window because the picked python_cmd was a Store-managed stub.
-    // v0.2.53 NEW-3 (drift fix): keep this list in sync with
-    // install.sh:48 and install.ps1:233 (cross-language python-candidate
-    // parity). Add `python3.13` so a Linux box where the user has ONLY
-    // python3.13 installed (no python3 alias) reports has_python=true
-    // for the launcher-driven detect_system() path. The install.sh
-    // path already accepts 3.13; this Rust list lagged.
+    // CROSS-LANGUAGE PARITY (v0.2.53 NEW-3): the POSIX `else { vec![...] }`
+    // branch below is a MIRROR — it must stay identical, in order, to the
+    // other two bootstrap Python probes:
+    //   * install.sh   → find_python `for cmd in ...`
+    //   * install.ps1  → Find-Python `$candidates`
+    // The mirror is deliberate (C-tier, justified): install.sh / install.ps1
+    // run at bootstrap on a fresh machine with NO jq / interpreter / launcher
+    // available, so a shared data file cannot be safely parsed there — the
+    // three lists are locked instead by tests/test_python_candidate_parity.py
+    // (extracts all three literal lists, asserts sh == ps1 == rs for POSIX).
+    // Edit all three + keep that test green when this list changes.
+    //
+    // WHY the POSIX list carries `python3.13`: a Linux box where the user has
+    // ONLY python3.13 (no `python3` alias — Fedora / some Arch derivatives)
+    // must report has_python=true for the launcher-driven detect_system()
+    // path, matching what install.sh already accepts.
+    //
+    // Windows INTENTIONALLY diverges (NOT part of the parity assertion):
+    // prefer `py` (the python.org launcher) over bare `python`, because
+    // `python` on Windows is often the Microsoft Store stub at
+    // C:\Users\<u>\AppData\Local\Microsoft\WindowsApps\python.exe, which
+    // redirects to the Store on first run instead of executing. Reported
+    // 2026-04-28: the wizard got stuck in "Creating…" with a flashing
+    // python.exe console window because the picked python_cmd was that stub.
     let candidates = if cfg!(windows) {
         vec!["py", "python3", "python"]
     } else {

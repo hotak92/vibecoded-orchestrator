@@ -258,6 +258,18 @@ if ($IsWindows -or $env:OS -eq 'Windows_NT') {
 # Python detection
 # ---------------------------------------------------------------------------
 function Find-Python {
+    # CROSS-LANGUAGE PARITY (v0.2.53 NEW-3): this candidate list is a MIRROR —
+    # it must stay identical, in order, to the other two bootstrap Python
+    # probes:
+    #   * install.sh   -> find_python `for cmd in ...`
+    #   * launcher/src-tauri/src/commands/installer.rs -> detect_python POSIX
+    #     `else { vec![...] }` branch
+    # The mirror is deliberate (C-tier, justified): these run at bootstrap on a
+    # fresh machine with NO jq / interpreter / launcher available, so a shared
+    # data file cannot be safely parsed here. The drift is locked by
+    # tests/test_python_candidate_parity.py (extracts all three literal lists,
+    # asserts sh == ps1 == rs for the POSIX list). Edit all three + keep that
+    # test green when this list changes.
     $candidates = @("python3.13", "python3.12", "python3.11", "python3", "python")
     foreach ($cmd in $candidates) {
         $found = Get-Command $cmd -ErrorAction SilentlyContinue

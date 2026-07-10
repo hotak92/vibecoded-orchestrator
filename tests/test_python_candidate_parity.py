@@ -107,3 +107,57 @@ def test_all_three_sources_agree():
         f"  installer.rs (POSIX branch): {rs!r}\n"
         f"All three sources must list the same Python interpreters in the same order."
     )
+
+
+# v0.2.77 Part 7c task 6: lock the INTENTIONAL Windows divergence too, so a
+# future edit can't silently (a) drop `py` from the Rust Windows branch — the
+# Microsoft-Store-stub guard — or (b) leak the Windows-only `py` into the POSIX
+# lists. The mirror is a justified C-tier exception (bootstrap scripts run
+# before jq/python/launcher exist, so no shared data file is parseable there);
+# these assertions are the enforced lock that keeps the mirror honest.
+
+# Canonical Rust Windows branch: `py` first (python.org launcher), then the
+# bare aliases. NO version-suffixed variants (py resolves the newest itself).
+EXPECTED_WINDOWS_RS = ["py", "python3", "python"]
+
+
+def _extract_installer_rs_windows() -> list[str]:
+    """Find the Windows-branch ``vec![...]`` (the ``if cfg!(windows)`` arm)
+    in installer.rs's ``detect_python`` Python probe."""
+    src = (REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands" / "installer.rs").read_text(
+        encoding="utf-8"
+    )
+    m = re.search(
+        r"if\s+cfg!\(windows\)\s*\{\s*vec!\[([^\]]+)\]",
+        src,
+    )
+    assert m is not None, "could not find Windows `if cfg!(windows) { vec![...] }` list in installer.rs"
+    return re.findall(r'"([^"]+)"', m.group(1))
+
+
+def test_installer_rs_windows_branch_keeps_py_first():
+    """The Windows branch must keep `py` first (Store-stub guard) and must
+    NOT drift into the version-suffixed POSIX shape."""
+    assert _extract_installer_rs_windows() == EXPECTED_WINDOWS_RS, (
+        "installer.rs Windows Python candidate list drifted.\n"
+        f"  expected: {EXPECTED_WINDOWS_RS!r}\n"
+        f"  actual:   {_extract_installer_rs_windows()!r}\n"
+        "The Windows branch intentionally diverges from POSIX: `py` first "
+        "(python.org launcher) to avoid the Microsoft Store stub, no "
+        "version-suffixed variants. Keep it distinct from the POSIX list."
+    )
+
+
+def test_posix_lists_do_not_leak_windows_py():
+    """The Windows-only `py` interpreter must NEVER appear in any POSIX
+    candidate list (it doesn't exist on POSIX; its presence would signal a
+    bad copy-paste from the Windows branch)."""
+    for name, lst in (
+        ("install.sh", _extract_install_sh()),
+        ("install.ps1", _extract_install_ps1()),
+        ("installer.rs (POSIX)", _extract_installer_rs()),
+    ):
+        assert "py" not in lst, (
+            f"{name} POSIX candidate list contains the Windows-only `py` "
+            f"launcher: {lst!r} — this is a Windows→POSIX copy-paste leak."
+        )
