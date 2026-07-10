@@ -435,14 +435,23 @@ def test_spawn_not_owed_when_zero_stale_and_zero_cleanup(monkeypatch, tmp_path):
     assert result.status == "not_owed"
 
 
-def test_spawn_proceeds_when_cleanup_owed_undeterminable(monkeypatch, tmp_path):
-    """None from the cleanup-owed probe (Weaviate down mid-probe) → proceed
-    conservatively (never skip on uncertainty)."""
+def test_spawn_leaves_alone_when_cleanup_owed_undeterminable(monkeypatch, tmp_path):
+    """None from the cleanup-owed probe (Weaviate down mid-probe), on top of a
+    positive-zero embed-stale count → LEAVE ALONE (status not_owed, NOTHING
+    spawned). The spawn gate is `if not (cleanup_owed and cleanup_owed > 0)`, so
+    an undeterminable (None) cleanup-owed count keeps the not_owed the stale
+    probe already reached — it does NOT authorise a spawn. Conservative here
+    means "don't purge on uncertainty" (the spawned sweep would DELETE rows), so
+    uncertainty must leave the graph untouched, not trigger a sweep."""
     monkeypatch.setattr(cr, "code_embed_service_healthy", lambda *a, **k: True)
     monkeypatch.setattr(cr, "count_stale_rows", lambda *a, **k: {"P_CodeFunction": 0})
     monkeypatch.setattr(cr, "count_cleanup_owed_rows", lambda *a, **k: None)
     _stub_analyzer_tree(tmp_path)
-    monkeypatch.setattr(cr.subprocess, "Popen", lambda *a, **k: _FakeProc())
+
+    def _no_spawn(*a, **k):
+        raise AssertionError("nothing may spawn when cleanup-owed is undeterminable")
+
+    monkeypatch.setattr(cr.subprocess, "Popen", _no_spawn)
     result = cr.spawn_background_resync(
         tmp_path, "MyProj", python_exe="/usr/bin/python3"
     )
