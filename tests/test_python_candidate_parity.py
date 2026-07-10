@@ -31,6 +31,23 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# v0.2.77 Part 7d: `installer.rs` was split into a facade + `installer/`
+# submodules. `detect_python` (with the POSIX/Windows `vec![...]` lists)
+# now lives in `installer/hardware.rs`. Scan the facade AND every submodule
+# so the parity check follows the code wherever it lands.
+_INSTALLER_DIR = REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands"
+
+
+def _installer_rs_source() -> str:
+    """Concatenated source of installer.rs + installer/*.rs submodules."""
+    parts = [(_INSTALLER_DIR / "installer.rs").read_text(encoding="utf-8")]
+    submod_dir = _INSTALLER_DIR / "installer"
+    if submod_dir.is_dir():
+        for f in sorted(submod_dir.glob("*.rs")):
+            parts.append(f.read_text(encoding="utf-8"))
+    return "\n".join(parts)
+
+
 # Canonical POSIX candidate list. Order matters — the installer tries
 # them in order, and the first that responds to `-c 'import sys'` wins.
 EXPECTED_POSIX = ["python3.13", "python3.12", "python3.11", "python3", "python"]
@@ -60,9 +77,7 @@ def _extract_install_ps1() -> list[str]:
 def _extract_installer_rs() -> list[str]:
     """Find the POSIX-branch ``vec![...]`` in installer.rs's
     ``detect_system`` Python probe."""
-    src = (REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands" / "installer.rs").read_text(
-        encoding="utf-8"
-    )
+    src = _installer_rs_source()
     # The Windows branch comes first (`if cfg!(windows)`); the POSIX
     # branch is the `else` arm. Anchor on the `else { vec![...] };`
     # form to avoid matching the Windows list.
@@ -124,9 +139,7 @@ EXPECTED_WINDOWS_RS = ["py", "python3", "python"]
 def _extract_installer_rs_windows() -> list[str]:
     """Find the Windows-branch ``vec![...]`` (the ``if cfg!(windows)`` arm)
     in installer.rs's ``detect_python`` Python probe."""
-    src = (REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands" / "installer.rs").read_text(
-        encoding="utf-8"
-    )
+    src = _installer_rs_source()
     m = re.search(
         r"if\s+cfg!\(windows\)\s*\{\s*vec!\[([^\]]+)\]",
         src,
