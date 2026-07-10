@@ -500,6 +500,208 @@ def converge_root_pointer_write_side(
     return True
 
 
+def _rewrite_seed_authored_access_rows(
+    cur,
+    dead_rows,
+    *,
+    dead_name: str,
+    canonical: str,
+    log_event: Callable[..., None],
+) -> tuple[int, int]:
+    """Rewrite SEED-AUTHORED ``kg_collection_access`` rows from ``dead_name`` to
+    ``canonical``, merging on PK conflict.
+
+    ``dead_rows`` is an iterable of ``(project_id, access_level, created_at,
+    updated_at)`` tuples (the rows currently at ``dead_name``). Only rows with
+    ``created_at == updated_at`` (the migration-029 seed-authored predicate) are
+    rewritten; user-configured rows are LEFT untouched and reported. On PK
+    conflict with an existing ``(project_id, canonical)`` row, the HIGHER
+    privilege is kept and the dead row deleted (never lowers privilege).
+
+    Single home for the R8 rewrite/merge machinery — shared by BOTH the
+    ``ptr != last`` convergence branch and the ``ptr == last`` dead-row sweep
+    (v0.2.77 Part 2). Returns ``(rewritten_count, user_configured_left)``.
+    """
+    rewritten = 0
+    user_configured_left = 0
+    for proj_id, level, created_at, updated_at in dead_rows:
+        # ACKNOWLEDGED LIMITATION (a) — R8/destructive-lens, accepted:
+        # `created_at == updated_at` is a heuristic for "seed-authored, never
+        # user-touched". It CANNOT distinguish a genuinely seed row from a FRESH
+        # GUI grant the user made but never re-edited (both have equal
+        # timestamps). This is an inherited blind spot: it fires only under the
+        # narrow drift / dead-row paths that reach this heal, and even then it
+        # never LOWERS privilege (the conflict branch keeps the higher of the
+        # two access levels). So a misclassified fresh grant is, at worst,
+        # rewritten to the canonical collection name with its access preserved —
+        # not a privilege downgrade. Accepted; not worth a schema change.
+        if created_at != updated_at:
+            # User-configured row — never auto-rewrite; report it.
+            user_configured_left += 1
+            log_event(
+                "7e/10", "warn",
+                "[kg-heal] leaving user-configured kg_collection_access row at "
+                f"dead collection {dead_name!r} (project={proj_id}); rewrite skipped",
+                data={"project_id": proj_id, "dead": dead_name, "canonical": canonical},
+            )
+            continue
+        # Seed-authored → rewrite to canonical. Handle PK (project_id,
+        # collection_name) conflict with an existing (proj, canonical) row:
+        # keep the HIGHER privilege, delete the dead row.
+        cur.execute(
+            "SELECT access_level FROM kg_collection_access "
+            "WHERE project_id = ? AND collection_name = ?",
+            (proj_id, canonical),
+        )
+        existing = cur.fetchone()
+        if existing is not None:
+            keep = max(
+                (level, existing[0]),
+                key=lambda lv: _KG_ACCESS_RANK.get(lv, 0),
+            )
+            # ACKNOWLEDGED LIMITATION (b) — R8/destructive-lens, accepted:
+            # this stamps the DEAD row's `updated_at` onto the SURVIVING (proj,
+            # canonical) row. If the survivor was itself a user-configured grant
+            # (created_at != updated_at), copying the dead row's timestamp can
+            # coincidentally make created_at == updated_at, flipping the
+            # survivor's "user-configured" flag to "seed-authored" for future
+            # heals. That is metadata drift only — the access_level is preserved
+            # (higher of the two) and no privilege is lost. Accepted as a
+            # cosmetic edge of the merge; not worth carrying the survivor's
+            # original created_at through just to preserve the flag.
+            cur.execute(
+                "UPDATE kg_collection_access SET access_level = ?, updated_at = ? "
+                "WHERE project_id = ? AND collection_name = ?",
+                (keep, updated_at, proj_id, canonical),
+            )
+            cur.execute(
+                "DELETE FROM kg_collection_access "
+                "WHERE project_id = ? AND collection_name = ?",
+                (proj_id, dead_name),
+            )
+        else:
+            # No conflict — preserve the seed-authored timestamps so the row
+            # stays seed-authored (created_at == updated_at) under the canonical
+            # name.
+            cur.execute(
+                "UPDATE kg_collection_access SET collection_name = ? "
+                "WHERE project_id = ? AND collection_name = ?",
+                (canonical, proj_id, dead_name),
+            )
+        rewritten += 1
+    return rewritten, user_configured_left
+
+
+def _sweep_dead_root_own_primary_rows(
+    cur,
+    *,
+    canonical: str,
+    existing_classes: set[str],
+    log_event: Callable[..., None],
+    now_ms: int,
+) -> int:
+    """v0.2.77 Part 2 (5b) — dead-row sweep for the orchestrator-root project.
+
+    Even when the shared-KG pointer is fully converged (``ptr == last`` and the
+    canonical class is live), a stale ``kg_collection_access`` row can survive
+    for the ORCHESTRATOR-ROOT project: pre-fix launcher builds seeded the root's
+    OWN-PRIMARY row as ``sanitize(ORCHESTRATOR_ROOT_NAME)_KnowledgeGraph`` (the
+    literal ``VibeCodedOrchestrator_KnowledgeGraph``), which is DEAD on any
+    install whose canonical class was re-pointed. The R8 convergence branch
+    can't reach it (that branch only fires on ``ptr != last``). The Rust
+    root-cause fix stops NEW dead rows being seeded, but an already-installed
+    machine keeps the old row until this sweep heals it.
+
+    Scope — root project ONLY: this heals rows belonging to the
+    ``host='orchestrator_root'`` project whose ``collection_name`` is
+    seed-authored AND NOT a live Weaviate class. A regular per-project own
+    collection that is legitimately absent from Weaviate (e.g. not yet
+    bootstrapped) is the LEAVE-ALONE case — it is never swept, because it is not
+    the root project's row. The canonical name is derived from the (already
+    agreeing) pointer, not from any project name.
+
+    Read-only against Weaviate (membership test on the caller-supplied
+    ``existing_classes`` snapshot only). Idempotent: after the sweep the root's
+    dead rows are gone, so a second run finds none and returns 0. Returns the
+    number of access rows changed.
+    """
+    # The canonical class MUST be live before we rewrite anything onto it —
+    # otherwise the sweep would move rows onto ANOTHER dead name. The caller
+    # gates on this too, but re-check defensively (conservative default).
+    if canonical not in existing_classes:
+        return 0
+
+    # Identify the orchestrator-root project id(s). host is the authoritative
+    # signal (mirrors the Rust `is_orchestrator_root_structural_row` predicate).
+    try:
+        cur.execute("SELECT id FROM projects WHERE host = 'orchestrator_root'")
+        root_ids = [r[0] for r in cur.fetchall() if r and r[0]]
+    except sqlite3.OperationalError as oe:
+        if "no such table" in str(oe).lower() or "no such column" in str(oe).lower():
+            return 0
+        raise
+    if not root_ids:
+        return 0
+
+    changed = 0
+    for root_id in root_ids:
+        try:
+            cur.execute(
+                "SELECT collection_name, access_level, created_at, updated_at "
+                "FROM kg_collection_access WHERE project_id = ?",
+                (root_id,),
+            )
+            rows = cur.fetchall()
+        except sqlite3.OperationalError as oe:
+            if "no such table" in str(oe).lower():
+                return changed
+            raise
+
+        # A dead row is: seed-authored, NOT already the canonical name, and
+        # NOT a live Weaviate class. Group by dead collection_name so the
+        # shared rewrite/merge helper handles each dead name's PK conflicts.
+        by_dead: dict[str, list] = {}
+        for coll, level, created_at, updated_at in rows:
+            if coll == canonical:
+                continue  # already canonical — nothing to do
+            if coll in existing_classes:
+                continue  # a live class (e.g. own _Development) — leave alone
+            # Only own-KnowledgeGraph-shaped dead rows collapse onto the shared
+            # canonical class. The root's `_Development` row is a distinct
+            # collection and, if dead, is NOT the same class as the shared KG —
+            # do not fold it into the canonical name.
+            if not coll.endswith("_KnowledgeGraph"):
+                continue
+            by_dead.setdefault(coll, []).append(
+                (root_id, level, created_at, updated_at)
+            )
+
+        for dead_name, dead_rows in by_dead.items():
+            rewritten, left = _rewrite_seed_authored_access_rows(
+                cur,
+                dead_rows,
+                dead_name=dead_name,
+                canonical=canonical,
+                log_event=log_event,
+            )
+            if rewritten:
+                log_event(
+                    "7e/10", "ok",
+                    f"[kg-heal] swept {rewritten} dead orchestrator-root own-primary "
+                    f"kg_collection_access row(s) {dead_name!r} -> {canonical!r} "
+                    "(pointer already converged)",
+                    data={
+                        "rewritten": rewritten,
+                        "user_configured_left": left,
+                        "dead": dead_name,
+                        "canonical": canonical,
+                        "project_id": root_id,
+                    },
+                )
+            changed += rewritten
+    return changed
+
+
 def heal_shared_kg_pointer_drift(
     cur,
     *,
@@ -557,7 +759,25 @@ def heal_shared_kg_pointer_drift(
     if not ptr and not last:
         return 0  # nothing recorded yet (pre-seed) — leave-alone.
     if ptr == last:
-        return 0  # keys agree — default install / already converged.
+        # Keys agree — pointer is converged (default install or post-heal).
+        # But a dead orchestrator-root OWN-PRIMARY access row can still survive
+        # under a converged pointer (v0.2.77 Part 2 5b): pre-fix launcher builds
+        # seeded the root's own-primary as the literal
+        # `sanitize(ORCHESTRATOR_ROOT_NAME)_KnowledgeGraph`, which is dead on a
+        # re-pointed install. The `ptr != last` convergence branch below can't
+        # reach it. Run a scoped dead-row sweep (root project only) ONLY when
+        # the canonical class is actually live; if it's absent we can't safely
+        # rewrite onto it, so leave everything alone. Idempotent: after the
+        # sweep the root's dead rows are gone → a second run finds none.
+        if ptr and ptr in existing_classes:
+            return _sweep_dead_root_own_primary_rows(
+                cur,
+                canonical=ptr,
+                existing_classes=existing_classes,
+                log_event=log_event,
+                now_ms=now_ms,
+            )
+        return 0  # canonical class not live (or empty) — leave-alone.
 
     # Divergent. Require triple agreement before touching anything.
     reasons: list[str] = []
@@ -663,82 +883,24 @@ def heal_shared_kg_pointer_drift(
         else:
             raise
 
-    user_configured_left = 0
-    for proj_id, level, created_at, updated_at in dead_rows:
-        # ACKNOWLEDGED LIMITATION (a) — R8/destructive-lens, accepted:
-        # `created_at == updated_at` is a heuristic for "seed-authored, never
-        # user-touched". It CANNOT distinguish a genuinely seed row from a FRESH
-        # GUI grant the user made but never re-edited (both have equal
-        # timestamps). This is an inherited blind spot: it fires only under the
-        # narrow drift + triple-agreement path that reaches this heal, and even
-        # then it never LOWERS privilege (the conflict branch keeps the higher
-        # of the two access levels). So a misclassified fresh grant is, at worst,
-        # rewritten to the canonical collection name with its access preserved —
-        # not a privilege downgrade. Accepted; not worth a schema change.
-        if created_at != updated_at:
-            # User-configured row — never auto-rewrite; report it.
-            user_configured_left += 1
-            log_event(
-                "7e/10", "warn",
-                "[kg-heal] leaving user-configured kg_collection_access row at "
-                f"dead collection {ptr!r} (project={proj_id}); rewrite skipped",
-                data={"project_id": proj_id, "dead": ptr, "canonical": last},
-            )
-            continue
-        # Seed-authored → rewrite to canonical. Handle PK (project_id,
-        # collection_name) conflict with an existing (proj, last) row:
-        # keep the HIGHER privilege, delete the dead row.
-        cur.execute(
-            "SELECT access_level FROM kg_collection_access "
-            "WHERE project_id = ? AND collection_name = ?",
-            (proj_id, last),
-        )
-        existing = cur.fetchone()
-        if existing is not None:
-            keep = max(
-                (level, existing[0]),
-                key=lambda lv: _KG_ACCESS_RANK.get(lv, 0),
-            )
-            # ACKNOWLEDGED LIMITATION (b) — R8/destructive-lens, accepted:
-            # this stamps the DEAD row's `updated_at` onto the SURVIVING (proj,
-            # last) row. If the survivor was itself a user-configured grant
-            # (created_at != updated_at), copying the dead row's timestamp can
-            # coincidentally make created_at == updated_at, flipping the
-            # survivor's "user-configured" flag to "seed-authored" for future
-            # heals. That is metadata drift only — the access_level is preserved
-            # (higher of the two) and no privilege is lost. Accepted as a
-            # cosmetic edge of the merge; not worth carrying the survivor's
-            # original created_at through just to preserve the flag.
-            cur.execute(
-                "UPDATE kg_collection_access SET access_level = ?, updated_at = ? "
-                "WHERE project_id = ? AND collection_name = ?",
-                (keep, updated_at, proj_id, last),
-            )
-            cur.execute(
-                "DELETE FROM kg_collection_access "
-                "WHERE project_id = ? AND collection_name = ?",
-                (proj_id, ptr),
-            )
-        else:
-            # No conflict — preserve the seed-authored timestamps so the row
-            # stays seed-authored (created_at == updated_at) under the canonical
-            # name.
-            cur.execute(
-                "UPDATE kg_collection_access SET collection_name = ? "
-                "WHERE project_id = ? AND collection_name = ?",
-                (last, proj_id, ptr),
-            )
-        changed += 1
+    rewritten, user_configured_left = _rewrite_seed_authored_access_rows(
+        cur,
+        dead_rows,
+        dead_name=ptr,
+        canonical=last,
+        log_event=log_event,
+    )
+    changed += rewritten
 
     if dead_rows:
         log_event(
             "7e/10", "ok",
-            f"[kg-heal] rewrote {changed - 1} stale kg_collection_access row(s) "
+            f"[kg-heal] rewrote {rewritten} stale kg_collection_access row(s) "
             f"{ptr!r} -> {last!r}"
             + (f"; left {user_configured_left} user-configured row(s)"
                if user_configured_left else ""),
             data={
-                "rewritten": changed - 1,
+                "rewritten": rewritten,
                 "user_configured_left": user_configured_left,
                 "dead": ptr, "canonical": last,
             },

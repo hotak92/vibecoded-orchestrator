@@ -306,6 +306,209 @@ def test_heal_makes_zero_weaviate_calls(tmp_path):
 # ─── Wiring guards (source-level: the heal is reachable on both surfaces) ────
 
 
+# ─── v0.2.77 Part 2 (5b): converged-pointer dead-row sweep ───────────────────
+#
+# Even when the shared-KG pointer is fully converged (ptr == last, canonical
+# class live), a dead orchestrator-root OWN-PRIMARY access row can survive from
+# pre-fix launcher builds that seeded the literal
+# `sanitize(ORCHESTRATOR_ROOT_NAME)_KnowledgeGraph`. The `ptr != last` branch
+# never reaches it. These tests pin the scoped sweep.
+
+
+def _make_db_with_projects(tmp_path) -> Path:
+    """launcher.db shape including a `projects` table (host column), so the
+    root-scoped sweep can identify the orchestrator-root project."""
+    db = _make_db(tmp_path)
+    conn = sqlite3.connect(str(db))
+    conn.executescript(
+        """
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY, name TEXT, host TEXT
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+    return db
+
+
+def test_converged_pointer_sweeps_dead_root_own_primary_row(tmp_path):
+    """ACT: ptr == last (converged) but the ROOT project holds a seed-authored
+    own-primary row at the DEAD literal name → it is rewritten to canonical."""
+    db = _make_db_with_projects(tmp_path)
+    conn = sqlite3.connect(str(db))
+    cur = conn.cursor()
+    CANON = "VCODev_KnowledgeGraph"        # live canonical (ptr == last)
+    DEAD = "VibeCodedOrchestrator_KnowledgeGraph"  # dead literal-derived name
+    _set_state(cur, "orchestrator_root_kg_collection", CANON)
+    _set_state(cur, "last_installed_shared_kg_collection", CANON)
+    cur.execute("INSERT INTO projects VALUES ('root', 'VibeCoded Orchestrator', 'orchestrator_root')")
+    ts = 1000
+    # Dead seed-authored own-primary row (created == updated).
+    cur.execute("INSERT INTO kg_collection_access VALUES ('root', ?, 'write', ?, ?)", (DEAD, ts, ts))
+    # A live own-dev row must be LEFT alone.
+    cur.execute(
+        "INSERT INTO kg_collection_access VALUES ('root', 'VibeCodedOrchestrator_Development', 'write', ?, ?)",
+        (ts, ts),
+    )
+    conn.commit()
+
+    _, log = _log_collector()
+    changed = heal_shared_kg_pointer_drift(
+        cur, existing_classes={CANON, "VibeCodedOrchestrator_Development"}, log_event=log,
+        deferral_report=_Sink(), deferral_entry_cls=_Entry,
+    )
+    conn.commit()
+
+    assert changed == 1  # exactly the dead own-primary row rewritten
+    cur.execute("SELECT collection_name FROM kg_collection_access WHERE project_id='root'")
+    names = {r[0] for r in cur.fetchall()}
+    assert DEAD not in names
+    assert CANON in names
+    # Dev row untouched (it's a live class).
+    assert "VibeCodedOrchestrator_Development" in names
+    conn.close()
+
+
+def test_converged_pointer_sweep_pk_conflict_keeps_higher_privilege(tmp_path):
+    """The root already has a canonical-named seed row AND a dead one → merge
+    keeps the HIGHER privilege, deletes the dead row (PK-conflict path)."""
+    db = _make_db_with_projects(tmp_path)
+    conn = sqlite3.connect(str(db))
+    cur = conn.cursor()
+    CANON = "VCODev_KnowledgeGraph"
+    DEAD = "VibeCodedOrchestrator_KnowledgeGraph"
+    _set_state(cur, "orchestrator_root_kg_collection", CANON)
+    _set_state(cur, "last_installed_shared_kg_collection", CANON)
+    cur.execute("INSERT INTO projects VALUES ('root', 'VibeCoded Orchestrator', 'orchestrator_root')")
+    ts = 1000
+    # Canonical row already present at 'read'; dead row at 'write' (higher).
+    cur.execute("INSERT INTO kg_collection_access VALUES ('root', ?, 'read', ?, ?)", (CANON, ts, ts))
+    cur.execute("INSERT INTO kg_collection_access VALUES ('root', ?, 'write', ?, ?)", (DEAD, ts, ts))
+    conn.commit()
+
+    _, log = _log_collector()
+    heal_shared_kg_pointer_drift(
+        cur, existing_classes={CANON}, log_event=log,
+        deferral_report=_Sink(), deferral_entry_cls=_Entry,
+    )
+    conn.commit()
+
+    cur.execute("SELECT access_level FROM kg_collection_access WHERE project_id='root' AND collection_name=?", (CANON,))
+    assert cur.fetchone()[0] == "write"  # higher privilege kept
+    cur.execute("SELECT COUNT(*) FROM kg_collection_access WHERE project_id='root' AND collection_name=?", (DEAD,))
+    assert cur.fetchone()[0] == 0  # dead row deleted
+    conn.close()
+
+
+def test_converged_pointer_sweep_leaves_non_root_dead_row(tmp_path):
+    """LEAVE-ALONE: a NON-root project's own collection that is legitimately
+    absent from Weaviate (e.g. not yet bootstrapped) must NOT be swept."""
+    db = _make_db_with_projects(tmp_path)
+    conn = sqlite3.connect(str(db))
+    cur = conn.cursor()
+    CANON = "VCODev_KnowledgeGraph"
+    _set_state(cur, "orchestrator_root_kg_collection", CANON)
+    _set_state(cur, "last_installed_shared_kg_collection", CANON)
+    cur.execute("INSERT INTO projects VALUES ('root', 'VibeCoded Orchestrator', 'orchestrator_root')")
+    cur.execute("INSERT INTO projects VALUES ('p1', 'Acme', 'base')")
+    ts = 1000
+    # A base project's own KG not yet in Weaviate — the LEAVE-ALONE case.
+    cur.execute("INSERT INTO kg_collection_access VALUES ('p1', 'Acme_KnowledgeGraph', 'write', ?, ?)", (ts, ts))
+    conn.commit()
+
+    _, log = _log_collector()
+    changed = heal_shared_kg_pointer_drift(
+        cur, existing_classes={CANON}, log_event=log,
+        deferral_report=_Sink(), deferral_entry_cls=_Entry,
+    )
+    assert changed == 0  # base project's absent own-KG untouched
+    cur.execute("SELECT COUNT(*) FROM kg_collection_access WHERE project_id='p1' AND collection_name='Acme_KnowledgeGraph'")
+    assert cur.fetchone()[0] == 1
+    conn.close()
+
+
+def test_converged_pointer_sweep_leaves_user_configured_root_row(tmp_path):
+    """LEAVE-ALONE: a USER-configured (created_at != updated_at) dead root row
+    is reported but NOT auto-rewritten."""
+    db = _make_db_with_projects(tmp_path)
+    conn = sqlite3.connect(str(db))
+    cur = conn.cursor()
+    CANON = "VCODev_KnowledgeGraph"
+    DEAD = "VibeCodedOrchestrator_KnowledgeGraph"
+    _set_state(cur, "orchestrator_root_kg_collection", CANON)
+    _set_state(cur, "last_installed_shared_kg_collection", CANON)
+    cur.execute("INSERT INTO projects VALUES ('root', 'VibeCoded Orchestrator', 'orchestrator_root')")
+    # user-configured (created != updated).
+    cur.execute("INSERT INTO kg_collection_access VALUES ('root', ?, 'write', 100, 200)", (DEAD,))
+    conn.commit()
+
+    _, log = _log_collector()
+    changed = heal_shared_kg_pointer_drift(
+        cur, existing_classes={CANON}, log_event=log,
+        deferral_report=_Sink(), deferral_entry_cls=_Entry,
+    )
+    assert changed == 0
+    cur.execute("SELECT COUNT(*) FROM kg_collection_access WHERE project_id='root' AND collection_name=?", (DEAD,))
+    assert cur.fetchone()[0] == 1  # user row survives
+    conn.close()
+
+
+def test_converged_pointer_sweep_idempotent(tmp_path):
+    """IDEMPOTENT: after the sweep heals the dead root row, a second run finds
+    none → 0 changes, no writes."""
+    db = _make_db_with_projects(tmp_path)
+    conn = sqlite3.connect(str(db))
+    cur = conn.cursor()
+    CANON = "VCODev_KnowledgeGraph"
+    DEAD = "VibeCodedOrchestrator_KnowledgeGraph"
+    _set_state(cur, "orchestrator_root_kg_collection", CANON)
+    _set_state(cur, "last_installed_shared_kg_collection", CANON)
+    cur.execute("INSERT INTO projects VALUES ('root', 'VibeCoded Orchestrator', 'orchestrator_root')")
+    ts = 1000
+    cur.execute("INSERT INTO kg_collection_access VALUES ('root', ?, 'write', ?, ?)", (DEAD, ts, ts))
+    conn.commit()
+
+    _, log = _log_collector()
+    heal_shared_kg_pointer_drift(
+        cur, existing_classes={CANON}, log_event=log,
+        deferral_report=_Sink(), deferral_entry_cls=_Entry,
+    )
+    conn.commit()
+    second = heal_shared_kg_pointer_drift(
+        cur, existing_classes={CANON}, log_event=log,
+        deferral_report=_Sink(), deferral_entry_cls=_Entry,
+    )
+    assert second == 0
+    conn.close()
+
+
+def test_converged_pointer_sweep_no_op_when_canonical_class_absent(tmp_path):
+    """LEAVE-ALONE: ptr == last but the canonical class is NOT live → the sweep
+    does not run (can't safely rewrite onto a dead target), dead row survives."""
+    db = _make_db_with_projects(tmp_path)
+    conn = sqlite3.connect(str(db))
+    cur = conn.cursor()
+    CANON = "VCODev_KnowledgeGraph"  # NOT in existing_classes below
+    DEAD = "VibeCodedOrchestrator_KnowledgeGraph"
+    _set_state(cur, "orchestrator_root_kg_collection", CANON)
+    _set_state(cur, "last_installed_shared_kg_collection", CANON)
+    cur.execute("INSERT INTO projects VALUES ('root', 'VibeCoded Orchestrator', 'orchestrator_root')")
+    ts = 1000
+    cur.execute("INSERT INTO kg_collection_access VALUES ('root', ?, 'write', ?, ?)", (DEAD, ts, ts))
+    conn.commit()
+
+    _, log = _log_collector()
+    changed = heal_shared_kg_pointer_drift(
+        cur, existing_classes=set(), log_event=log,  # canonical NOT live
+        deferral_report=_Sink(), deferral_entry_cls=_Entry,
+    )
+    assert changed == 0
+    cur.execute("SELECT COUNT(*) FROM kg_collection_access WHERE project_id='root' AND collection_name=?", (DEAD,))
+    assert cur.fetchone()[0] == 1
+    conn.close()
+
+
 def test_install_update_wires_pointer_heal():
     """install.py's --update self-heal detects pointer divergence AND the RW
     pass calls the pointer heal (via self_heal_kg_bindings pass 5)."""

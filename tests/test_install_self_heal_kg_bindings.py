@@ -1241,5 +1241,149 @@ class RebindCollectionNamesHelperTests(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+_APP_STATE_DDL = """
+CREATE TABLE app_state (
+    key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER
+)
+"""
+
+_PROJECTS_DDL = """
+CREATE TABLE projects (
+    id TEXT PRIMARY KEY, name TEXT, host TEXT
+)
+"""
+
+
+def _build_launcher_db_full(
+    db_path: Path,
+    *,
+    binding_rows: list[tuple[str, str, str]],
+    access_rows: list[tuple[str, str, str, int, int]],
+    projects: list[tuple[str, str, str]],
+    app_state: list[tuple[str, str]],
+) -> None:
+    """launcher.db with project_kg_bindings + kg_collection_access (with audit
+    columns) + projects + app_state — enough for the end-to-end pass-5 sweep.
+
+    access_rows: [(project_id, collection_name, access_level, created_at, updated_at)]
+    projects:    [(id, name, host)]
+    app_state:   [(key, value)]
+    """
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute(_PROJECT_KG_BINDINGS_DDL)
+        conn.execute(_KG_COLLECTION_ACCESS_DDL)
+        conn.execute(_PROJECTS_DDL)
+        conn.execute(_APP_STATE_DDL)
+        now = int(time.time() * 1000)
+        for project_id, role, collection_name in binding_rows:
+            conn.execute(
+                "INSERT INTO project_kg_bindings "
+                "(project_id, role, collection_name, embedding_model, "
+                "embedding_dim, kg_dir_path, weaviate_url, config_json, "
+                "updated_at) VALUES (?, ?, ?, NULL, NULL, NULL, NULL, '{}', ?)",
+                (project_id, role, collection_name, now),
+            )
+        for project_id, collection_name, access_level, created_at, updated_at in access_rows:
+            conn.execute(
+                "INSERT INTO kg_collection_access "
+                "(project_id, collection_name, access_level, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (project_id, collection_name, access_level, created_at, updated_at),
+            )
+        for pid, name, host in projects:
+            conn.execute(
+                "INSERT INTO projects (id, name, host) VALUES (?, ?, ?)",
+                (pid, name, host),
+            )
+        for key, value in app_state:
+            conn.execute(
+                "INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, ?)",
+                (key, value, now),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class SelfHealDeadRootRowSweepEndToEndTests(unittest.TestCase):
+    """v0.2.77 Part 2 (5b) — end-to-end: the install `--update` self-heal
+    reaches pass 5's dead-row sweep. Even with the shared-KG pointer already
+    CONVERGED (ptr == last), a dead seed-authored orchestrator-root own-primary
+    row is healed to the live canonical name once the RW pass is opened (here by
+    a case-mismatched binding, a realistic co-occurring heal need)."""
+
+    def setUp(self):
+        self._tmp = (
+            Path(__file__).resolve().parent
+            / f"_tmp_self_heal_deadrow_{os.getpid()}_{id(self)}"
+        )
+        self._tmp.mkdir(parents=True, exist_ok=True)
+        self._db_path = self._tmp / "launcher.db"
+        self._env_patch = mock.patch.dict(
+            os.environ, {"VCT_STATE_DIR": str(self._tmp)}, clear=False
+        )
+        self._env_patch.start()
+        self._server = None
+        self._port = None
+
+    def tearDown(self):
+        self._env_patch.stop()
+        if self._server is not None:
+            self._server.shutdown()
+            self._server = None
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+        for k in ("WEAVIATE_URL", "WEAVIATE_PORT"):
+            os.environ.pop(k, None)
+
+    def test_end_to_end_sweeps_dead_root_own_primary_row(self):
+        CANON = "VCODev_KnowledgeGraph"                 # live canonical
+        DEAD = "VibeCodedOrchestrator_KnowledgeGraph"   # dead literal-derived
+        ts = 1000
+        _build_launcher_db_full(
+            self._db_path,
+            # Case-mismatch binding opens the RW pass: stored 'Vcodev' (lowercase
+            # 'd') differs only in casing from the live 'VcoDev'.
+            binding_rows=[("p1", "shared", "Vcodev_KnowledgeGraph")],
+            access_rows=[
+                # p1's case-mismatch row (existing heal path) + the dead root row.
+                ("p1", "Vcodev_KnowledgeGraph", "read", ts, ts),
+                ("root", DEAD, "write", ts, ts),
+            ],
+            projects=[
+                ("root", "VibeCoded Orchestrator", "orchestrator_root"),
+                ("p1", "Acme", "base"),
+            ],
+            # Pointer already converged.
+            app_state=[
+                ("orchestrator_root_kg_collection", CANON),
+                ("last_installed_shared_kg_collection", CANON),
+            ],
+        )
+        # Live classes: canonical + the on-disk casing of p1's binding.
+        self._server, self._port = _start_stub_weaviate(
+            classes=[CANON, "VcoDev_KnowledgeGraph"]
+        )
+        os.environ["WEAVIATE_URL"] = f"http://127.0.0.1:{self._port}"
+
+        report = DeferralReport()
+        install._self_heal_kg_bindings_on_update(report)
+
+        # The dead root own-primary row is healed to the canonical name.
+        access = _read_access(self._db_path)
+        root_rows = {(c, lvl) for (pid, c, lvl) in access if pid == "root"}
+        self.assertIn(
+            (CANON, "write"), root_rows,
+            "root own-primary must be healed to the live canonical name",
+        )
+        self.assertNotIn(
+            DEAD, {c for (c, _lvl) in root_rows},
+            "dead literal-derived root row must be gone",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
