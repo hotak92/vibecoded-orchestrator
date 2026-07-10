@@ -3458,12 +3458,17 @@ pub fn write_project_env_files(
                 // analyzer uses `CODE_GRAPH_PROJECT` as the `--project` arg
                 // when present, fallback to sanitized `PROJECT_NAME`.
                 //
-                // Why sanitize here instead of writing `project_name` raw:
-                // `code-graph-analyze` writes Weaviate classes named
-                // `<CODE_GRAPH_PROJECT>_CodeFunction` etc. — those class
-                // names MUST satisfy Weaviate's `[A-Za-z][A-Za-z0-9_]*`
-                // identifier rule, which `sanitize_kg_collection` enforces.
-                "CODE_GRAPH_PROJECT" => Some(sanitize_kg_collection(project_name)),
+                // v0.2.76 (seams-lens #1): value comes from `settings`
+                // (`ProjectEnvSettings::code_graph_project`), resolved
+                // binding-first in `populate()` / canonical in
+                // `with_defaults()`. It is NO LONGER re-derived here with the
+                // underscore-DROPPING `sanitize_kg_collection` — that dropped
+                // underscores the analyzer/hub/binding PRESERVE, so
+                // `My_Project` used to emit `CODE_GRAPH_PROJECT=MyProject` while
+                // the binding named `My_Project_Code*` (split-brain). The class
+                // names still satisfy Weaviate's `[A-Za-z][A-Za-z0-9_]*` rule
+                // because `canonical_class_prefix` enforces the same charset.
+                "CODE_GRAPH_PROJECT" => Some(settings.code_graph_project.clone()),
                 "DEVELOPMENT_COLLECTION" => Some(dev_collection.to_string()),
                 "SHARED_KG_COLLECTION" => Some(shared_kg_collection.to_string()),
                 // Canonical write-gate key (asymmetric semantic since 2026-05-01).
@@ -8170,6 +8175,55 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn code_graph_project_preserves_underscore_via_with_defaults() {
+        // seams-lens #1: the Rust writer must emit the underscore-PRESERVING
+        // canonical prefix for CODE_GRAPH_PROJECT (matching the analyzer/hub/
+        // binding + the Python writers), NOT the underscore-DROPPING
+        // sanitize_kg_collection value the writer re-derived before the fix.
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-cgp-underscore-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        write_project_env_files(&tmp, &ProjectEnvSettings::with_defaults("My_Project")).unwrap();
+
+        let claude_env_text = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
+        let cs: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+
+        // Canonical PRESERVES the underscore.
+        assert!(
+            claude_env_text.contains(r#"export CODE_GRAPH_PROJECT="My_Project""#),
+            ".claude/env CODE_GRAPH_PROJECT must be the canonical My_Project; got:\n{}",
+            claude_env_text,
+        );
+        assert_eq!(cs["env"]["CODE_GRAPH_PROJECT"], "My_Project");
+        // KG_COLLECTION still uses the underscore-DROPPING KG sanitizer.
+        assert_eq!(cs["env"]["KG_COLLECTION"], "MyProject_KnowledgeGraph");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn code_graph_project_cross_language_agreement_underscore() {
+        // Cross-language agreement (seams-lens #1c): the Rust with_defaults
+        // value for an underscore name MUST equal what the Python
+        // canonical_class_prefix emits (the value both writers agree on when no
+        // binding exists). Python side is pinned in
+        // tests/test_config_projection.py::
+        // test_code_graph_project_no_binding_preserves_underscore and
+        // tests/test_install_bundle_standalone.py::
+        // test_code_graph_project_preserves_underscore.
+        let s = ProjectEnvSettings::with_defaults("My_Project");
+        assert_eq!(s.code_graph_project, "My_Project");
+        let s2 = ProjectEnvSettings::with_defaults("foo_bar");
+        assert_eq!(s2.code_graph_project, "Foo_bar");
     }
 
     /// Bug 30: existing `.claude/settings.json` content (hooks, permissions,

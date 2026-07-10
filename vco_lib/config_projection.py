@@ -1688,16 +1688,35 @@ def project_env_from_db(
         # v0.2.72 R2 (F5 residual): CODE_GRAPH_PROJECT derives
         # hub-consistently — the project's codegraph binding prefix
         # (`project_codegraph_bindings.collection_prefix`) first, the
-        # name-sanitized prefix only when no binding row exists. Before
+        # name-derived prefix only when no binding row exists. Before
         # this fix the projection ALWAYS emitted the name-derived prefix,
         # so a rebound prefix left the CLI/hooks (env fallback) querying a
         # different set of collections than the MCP (hub-first) — and the
         # rebind never moved the watcher's hashed CODE_GRAPH_PROJECT key,
         # so no guarded MCP reload fired. MUST-MATCH note lives on
         # `_fetch_codegraph_binding_prefix`.
-        code_graph_project = (
-            _fetch_codegraph_binding_prefix(conn, project_id) or sanitized
-        )
+        #
+        # v0.2.76 (seams-lens #1): the NO-BINDING fallback now uses the
+        # underscore-PRESERVING `canonical_class_prefix` (SSOT:
+        # vco_lib.codegraph_naming) — NOT the underscore-DROPPING
+        # `_sanitize_kg_collection` (`sanitized`) it used before. The analyzer
+        # + binding-seed name code-graph classes with canonical_class_prefix, so
+        # for a never-yet-analyzed underscore-containing name (e.g. `My_Project`)
+        # the old fallback emitted `CODE_GRAPH_PROJECT=MyProject` while the first
+        # analysis would bind `My_Project_Code*` — split-brain until a rebind.
+        # canonical falls back to `sanitized` only for names it rejects
+        # (leading-digit / all-symbol), where any placeholder prefix is fine
+        # (no binding exists yet). Matches the Rust `resolve_code_graph_project`
+        # + the standalone `_apply_standalone_env` writer.
+        _cg_binding_prefix = _fetch_codegraph_binding_prefix(conn, project_id)
+        if _cg_binding_prefix:
+            code_graph_project = _cg_binding_prefix
+        else:
+            try:
+                from vco_lib.codegraph_naming import canonical_class_prefix
+                code_graph_project = canonical_class_prefix(proj.name)
+            except ValueError:
+                code_graph_project = sanitized
     finally:
         try:
             conn.close()

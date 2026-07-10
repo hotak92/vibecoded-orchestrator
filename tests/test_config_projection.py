@@ -459,6 +459,89 @@ def test_code_graph_project_empty_prefix_falls_back_to_name(
     assert env["CODE_GRAPH_PROJECT"] == "MyApp"
 
 
+# ─── v0.2.76 (seams-lens #1) — CODE_GRAPH_PROJECT canonical alignment ────
+
+
+def test_code_graph_project_no_binding_preserves_underscore(tmp_path: Path) -> None:
+    """seams-lens #1: the NO-BINDING fallback now uses the underscore-PRESERVING
+    canonical rule (NOT the underscore-DROPPING KG sanitizer). A never-analyzed
+    project named ``My_Project`` must emit ``CODE_GRAPH_PROJECT=My_Project`` —
+    the value the first analysis will bind — not the split-braining ``MyProject``."""
+    from vco_lib.codegraph_naming import canonical_class_prefix
+
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="x", project_name="My_Project",
+        project_folder=str(proj),
+    )
+    env = project_env_from_db("x", db_path=db)["canonical_env"]
+    assert env["CODE_GRAPH_PROJECT"] == canonical_class_prefix("My_Project")
+    assert env["CODE_GRAPH_PROJECT"] == "My_Project"
+    # KG collection still uses the underscore-DROPPING KG sanitizer (unchanged).
+    assert env["KG_COLLECTION"] == "MyProject_KnowledgeGraph"
+
+
+def test_code_graph_project_existing_legacy_binding_wins(tmp_path: Path) -> None:
+    """existing-binding-wins: an OLD install whose binding carries a LEGACY
+    dropped-underscore prefix (``MyProject`` for name ``My_Project``, written by
+    a pre-fix analyzer) must keep emitting the BINDING value — NOT the new
+    canonical re-derivation (``My_Project``). Old installs stay on their REAL
+    collections; the env must never diverge from the stored binding SSOT."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="x", project_name="My_Project",
+        project_folder=str(proj),
+        codegraph_binding_prefix="MyProject",  # legacy dropped-underscore prefix
+    )
+    env = project_env_from_db("x", db_path=db)["canonical_env"]
+    # Binding wins verbatim — even though canonical(name) would now be My_Project.
+    assert env["CODE_GRAPH_PROJECT"] == "MyProject"
+
+
+def test_update_reprojection_writes_corrected_code_graph_project(
+    tmp_path: Path,
+) -> None:
+    """UPDATE PROPAGATION (seams-lens #1b): the update/refresh chain
+    (project_env_from_db → apply_project_env — the exact path
+    refresh_project_env_with_db and install.py --update use) must WRITE the
+    corrected canonical CODE_GRAPH_PROJECT onto the on-disk surfaces for an
+    existing project. This is the heal: a split-brain install where .claude/env
+    carried the retired dropped-underscore value gets the binding-aligned
+    canonical value on its next update. Metadata-only (no re-embed): the value
+    now MATCHES what the analyzer/hub target.
+
+    Simulate a stale pre-fix surface, then re-project and assert the correction.
+    """
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    # Pre-seed a STALE settings.json carrying the retired dropped-underscore value.
+    claude = proj / ".claude"
+    claude.mkdir()
+    (claude / "settings.json").write_text(
+        json.dumps({"env": {"CODE_GRAPH_PROJECT": "MyProject"}}),
+        encoding="utf-8",
+    )
+    # No binding row → canonical fallback (the never-analyzed / correctly-
+    # prefixed-install case). Name has an underscore.
+    _make_launcher_db(
+        db, project_id="x", project_name="My_Project",
+        project_folder=str(proj),
+    )
+
+    # The update/refresh chain: resolve bundle from DB, then apply to surfaces.
+    bundle = project_env_from_db("x", db_path=db)
+    apply_project_env(bundle, surfaces=["claude_settings_json"])
+
+    data = json.loads((claude / "settings.json").read_text())
+    # Corrected from the stale MyProject → canonical My_Project (binding-aligned).
+    assert data["env"]["CODE_GRAPH_PROJECT"] == "My_Project"
+
+
 # ─── v0.2.69 FIX 1 (Defect D add-path gap) — ACTIVE_EMBEDDING derive ──────
 
 

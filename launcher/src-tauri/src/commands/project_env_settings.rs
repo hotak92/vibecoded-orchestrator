@@ -655,6 +655,22 @@ pub struct ProjectEnvSettings {
     /// `VCT_CODE_GRAPH_ACCESS_LIST=Foo,Bar,Baz`.
     pub code_graph_access_list: Vec<String>,
 
+    /// v0.2.76 (seams-lens #1): the value written to `CODE_GRAPH_PROJECT`.
+    /// This is the code-graph class PREFIX the analyzer/MCP target, and it
+    /// MUST match the stored `project_codegraph_bindings.collection_prefix`
+    /// (the SSOT) for existing projects — otherwise the env-driven analyzer /
+    /// MCP hub-down fallback query a DIFFERENT prefix than the binding/hub
+    /// (split-brain for underscore-containing names, where the retired KG
+    /// sanitizer `sanitize_kg_collection` DROPPED underscores the analyzer
+    /// PRESERVES). Resolution (binding-first, matching the hub +
+    /// `config_projection.project_env_from_db`):
+    ///   * `populate()`: stored binding prefix if a row exists, else
+    ///     `project_naming::canonical_class_prefix(name)` (never re-derive for
+    ///     an existing project — honor the binding).
+    ///   * `with_defaults()` (no DB): `canonical_class_prefix(name)` — the
+    ///     value the first analysis will bind; no binding to contradict.
+    pub code_graph_project: String,
+
     /// GitHub PAT (0.1.7 fork-readiness sweep, 2026-05-08). Resolved at
     /// `populate` time from the OS keychain entry the OnboardingWizard
     /// writes via `commands::installer::register_github_pat`
@@ -743,6 +759,13 @@ impl ProjectEnvSettings {
     #[allow(dead_code)]
     pub fn with_defaults(project_name: &str) -> Self {
         let kg_basename = sanitize_kg_collection(project_name);
+        // v0.2.76 (seams-lens #1): no DB here → no binding to honor → derive the
+        // code-graph prefix with the underscore-PRESERVING `canonical_class_prefix`
+        // (the rule the analyzer/hub/binding-seed use), falling back to the
+        // KG basename only for names canonical rejects (leading-digit / all-symbol),
+        // so this never panics on a pathological name.
+        let code_graph_project = crate::project_naming::canonical_class_prefix(project_name)
+            .unwrap_or_else(|_| kg_basename.clone());
         Self {
             active_embedding: DEFAULT_ACTIVE_EMBEDDING.to_string(),
             weaviate_url: format!("http://localhost:{}", DEFAULT_WEAVIATE_PORT),
@@ -765,6 +788,7 @@ impl ProjectEnvSettings {
             orchestrator_root: None,
             kg_access_list: Vec::new(),
             code_graph_access_list: Vec::new(),
+            code_graph_project,
             // Tests use `with_defaults`; they get an absent token so the
             // pair-builder omits `GITHUB_TOKEN` from the surfaces. Tests
             // that exercise the GITHUB_TOKEN propagation path construct
@@ -1032,6 +1056,18 @@ pub fn populate(
     let own_kg = format!("{}_KnowledgeGraph", kg_basename);
     let own_dev = format!("{}_Development", kg_basename);
 
+    // v0.2.76 (seams-lens #1): CODE_GRAPH_PROJECT — binding-first, matching the
+    // hub resolver + `config_projection.project_env_from_db`. NEVER re-derive a
+    // prefix for an existing project: a stored
+    // `project_codegraph_bindings.collection_prefix` is the SSOT the analyzer
+    // last wrote to, and the env value MUST equal it or the env-driven analyzer
+    // / MCP hub-down fallback target a DIFFERENT prefix than the binding/hub.
+    // No binding row (never-analyzed project, or no project_id in a test
+    // context) → `canonical_class_prefix(name)` (the underscore-PRESERVING rule
+    // the analyzer + binding-seed use — NOT the underscore-DROPPING
+    // `sanitize_kg_collection` this used before the fix).
+    let code_graph_project = resolve_code_graph_project(db, project_id, project_name);
+
     // P1-D (2026-05-08): resolve cross-project KG + codegraph access lists
     // from the launcher's access matrix. These flow into env vars on the
     // 3 surfaces and are consumed by `weaviate_mcp/server.py` + the
@@ -1118,6 +1154,7 @@ pub fn populate(
         orchestrator_root: resolve_orchestrator_root(db),
         kg_access_list,
         code_graph_access_list,
+        code_graph_project,
         github_token,
         user_secret_pairs,
         user_secret_known_keys,
@@ -1210,6 +1247,42 @@ fn resolve_code_graph_access_peers(db: &Db, project_id: &str) -> Vec<String> {
         }
     }
     peers.into_iter().collect()
+}
+
+/// v0.2.76 (seams-lens #1): resolve the `CODE_GRAPH_PROJECT` env value —
+/// the code-graph class prefix the analyzer / MCP target.
+///
+/// Binding-first, matching the hub resolver
+/// (`launcher/src-tauri/vct-hub/src/config_api.rs` `code_graph_collection_prefix`)
+/// and `vco_lib/config_projection.py::_fetch_codegraph_binding_prefix`:
+///
+///   1. A non-empty `project_codegraph_bindings.collection_prefix` (the SSOT the
+///      analyzer last wrote to) — returned verbatim. NEVER re-derived: for an
+///      existing project the binding IS the truth, and the env value must equal
+///      it or the env-driven analyzer / MCP hub-down fallback query a DIFFERENT
+///      prefix (split-brain). No `enabled` filter (mirrors the hub read — a
+///      disabled binding still names the prefix in use).
+///   2. Otherwise `canonical_class_prefix(project_name)` — the underscore-
+///      PRESERVING rule the analyzer + binding-seed use (the value the first
+///      analysis will bind). This REPLACES the retired underscore-DROPPING
+///      `sanitize_kg_collection`, which produced `MyProject` for `My_Project`
+///      and split-brained underscore-containing names.
+///   3. If canonical rejects the name (leading-digit / all-symbol), fall back to
+///      `sanitize_kg_collection` so the writer never panics on a weird name.
+///
+/// Soft-fail: any DB error resolving the binding → treat as no-binding and
+/// derive (env-file writes must never block on a matrix-read hiccup).
+fn resolve_code_graph_project(db: &Db, project_id: Option<&str>, project_name: &str) -> String {
+    if let Some(pid) = project_id {
+        if let Ok(Some(binding)) = db.get_project_codegraph_binding(pid) {
+            let prefix = binding.collection_prefix.trim();
+            if !prefix.is_empty() {
+                return prefix.to_string();
+            }
+        }
+    }
+    crate::project_naming::canonical_class_prefix(project_name)
+        .unwrap_or_else(|_| sanitize_kg_collection(project_name))
 }
 
 /// Subagent G (2026-05-08), broadened by H2 (2026-05-08): resolve the
@@ -1514,6 +1587,52 @@ mod tests {
         assert!(!s.shared_kg_read_disabled);
         assert!(!s.use_gpu);
         assert!(s.cpu_only);
+    }
+
+    #[test]
+    fn resolve_code_graph_project_prefers_existing_binding() {
+        // existing-binding-wins (seams-lens #1c): a stored codegraph binding
+        // (even a LEGACY dropped-underscore prefix) is the SSOT — the resolver
+        // returns it verbatim, NEVER re-deriving. Old installs stay on their
+        // real collections.
+        use crate::db::models::ProjectHost;
+        let db = Db::open_in_memory().unwrap();
+        db.insert_project("p1", "My_Project", "/tmp/p1", ProjectHost::Base, "my-project")
+            .unwrap();
+        db.set_project_codegraph_binding(
+            "p1",
+            "MyProject", // legacy dropped-underscore prefix a pre-fix analyzer wrote
+            None,
+            None,
+            None,
+            None,
+            true,
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+        // Binding wins even though canonical(name) would now be My_Project.
+        assert_eq!(
+            resolve_code_graph_project(&db, Some("p1"), "My_Project"),
+            "MyProject",
+        );
+    }
+
+    #[test]
+    fn resolve_code_graph_project_no_binding_uses_canonical() {
+        // No binding → underscore-PRESERVING canonical prefix (NOT the retired
+        // sanitize_kg_collection). project_id absent (test context) also derives.
+        use crate::db::models::ProjectHost;
+        let db = Db::open_in_memory().unwrap();
+        db.insert_project("p1", "My_Project", "/tmp/p1", ProjectHost::Base, "my-project")
+            .unwrap();
+        assert_eq!(
+            resolve_code_graph_project(&db, Some("p1"), "My_Project"),
+            "My_Project",
+        );
+        assert_eq!(
+            resolve_code_graph_project(&db, None, "foo_bar"),
+            "Foo_bar",
+        );
     }
 
     #[test]

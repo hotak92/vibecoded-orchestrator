@@ -9371,6 +9371,35 @@ def _apply_standalone_env(
     raw_name = project_name or folder.name or "Project"
     sanitized = sanitize_for_weaviate_class(raw_name)
 
+    # v0.2.76 (seams-lens #1 / CG naming): CODE_GRAPH_PROJECT must NOT use the
+    # underscore-DROPPING KG sanitizer — the analyzer/hub/binding name code-graph
+    # classes with the underscore-PRESERVING `canonical_class_prefix`
+    # (SSOT: vco_lib.codegraph_naming), so `My_Project` binds `My_Project_Code*`
+    # but this writer used to emit `CODE_GRAPH_PROJECT=MyProject` → the env-driven
+    # analyzer / MCP hub-down fallback targeted `MyProject_Code*` → split-brain.
+    #
+    # This is the STANDALONE writer (`_apply_standalone_env`, --write-env without
+    # launcher.db, per this function's docstring): there is NO reachable
+    # `project_codegraph_bindings` row to consult, so we cannot honor an existing
+    # binding as SSOT. We fall back to `canonical_class_prefix` (the SAME rule the
+    # analyzer/hub/binding-seed use), which is the correct value for a
+    # never-yet-analyzed project and matches what the first analysis will bind. No
+    # contradiction risk: with no DB, there is no binding to disagree with. The
+    # DB-backed writers (config_projection.project_env_from_db, the Rust
+    # populate()) resolve binding-first; this path only ever runs when they can't.
+    from vco_lib.codegraph_naming import canonical_class_prefix as _canonical_cg_prefix
+
+    try:
+        code_graph_project = _canonical_cg_prefix(raw_name)
+    except ValueError:
+        # `canonical_class_prefix` rejects leading-digit / all-symbol names that
+        # `sanitize_for_weaviate_class` coerces (e.g. to "vct"). Keep the
+        # coerced value for those pathological names so --write-env never crashes
+        # on a weird folder basename — the analyzer applies the identical
+        # canonical rule and, for a rejectable name, its own binding-seed path
+        # will settle the final prefix on first analysis.
+        code_graph_project = sanitized
+
     kg_collection = f"{sanitized}_KnowledgeGraph"
     dev_collection = f"{sanitized}_Development"
     diagrams_collection = f"{sanitized}_Diagrams"
@@ -9378,7 +9407,7 @@ def _apply_standalone_env(
 
     env: dict[str, str] = {
         "PROJECT_NAME": raw_name,
-        "CODE_GRAPH_PROJECT": sanitized,
+        "CODE_GRAPH_PROJECT": code_graph_project,
         "KG_COLLECTION": kg_collection,
         "DEVELOPMENT_COLLECTION": dev_collection,
         "DIAGRAMS_COLLECTION": diagrams_collection,

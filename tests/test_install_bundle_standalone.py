@@ -237,12 +237,44 @@ class TestInstallBundleStandaloneWriteEnv(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_code_graph_project_set(self) -> None:
-        """CODE_GRAPH_PROJECT must equal sanitize(folder.name)."""
+        """CODE_GRAPH_PROJECT must equal canonical_class_prefix(folder.name).
+
+        v0.2.76 (seams-lens #1): the standalone writer now derives
+        CODE_GRAPH_PROJECT with the underscore-PRESERVING canonical rule (the
+        analyzer/hub/binding SSOT), not the underscore-DROPPING KG sanitizer.
+        For "TestProj" (no underscore) both agree; the underscore regression
+        below pins the divergence."""
+        from vco_lib.codegraph_naming import canonical_class_prefix
+
         self._run()
         env = _read_env_file(self.project)
         self.assertIn("CODE_GRAPH_PROJECT", env)
-        expected = sanitize_for_weaviate_class("TestProj")
+        expected = canonical_class_prefix("TestProj")
         self.assertEqual(env["CODE_GRAPH_PROJECT"], expected)
+
+    def test_code_graph_project_preserves_underscore(self) -> None:
+        """seams-lens #1 regression: an underscore-containing name must emit the
+        underscore-PRESERVING canonical prefix — NOT the retired KG sanitizer's
+        dropped-underscore value (which would split-brain the analyzer/hub)."""
+        from vco_lib.codegraph_naming import canonical_class_prefix
+
+        proj = self.base / "My_Cool_Project"
+        proj.mkdir()
+        project_init.install_project_bundle(
+            proj,
+            orchestrator_root=self.orch,
+            write_env=True,
+        )
+        env = _read_env_file(proj)
+        self.assertIn("CODE_GRAPH_PROJECT", env)
+        # Canonical PRESERVES underscores: "My_Cool_Project".
+        self.assertEqual(env["CODE_GRAPH_PROJECT"], canonical_class_prefix("My_Cool_Project"))
+        self.assertEqual(env["CODE_GRAPH_PROJECT"], "My_Cool_Project")
+        # And it MUST differ from the retired KG sanitizer's dropped form.
+        self.assertNotEqual(
+            env["CODE_GRAPH_PROJECT"],
+            sanitize_for_weaviate_class("My_Cool_Project"),
+        )
 
     # ------------------------------------------------------------------
     # Test 8: hyphenated / spaced folder name sanitized correctly
