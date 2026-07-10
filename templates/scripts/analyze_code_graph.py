@@ -556,6 +556,10 @@ try:
         union_stale_into_changed as _union_stale_into_changed_impl,
         log_vectorless_degrade as _log_vectorless_degrade,
     )
+    # v0.2.77 Part 5 (CG-2): ONE facade for cross-language call extraction.
+    # Dependency-free to import (tree-sitter grammars are lazy-loaded inside
+    # the facade, guarded, soft-fail); Python stays ast-based.
+    from vco_lib.codegraph_calls import extract_call_names as _extract_call_names
 except ImportError as _exc:  # noqa: F841 — used in the message below
     sys.stderr.write(
         "analyze_code_graph: vco_lib not importable — VCO install is broken; "
@@ -5500,38 +5504,12 @@ class CodeGraphAnalyzer:
         self.module_cache[cache_key] = uuid
         return uuid
 
-    def _extract_function_calls(self, node: ast.AST) -> List[str]:
-        """Extract names of functions/methods called within an AST node.
-
-        Returns list of call target names (e.g. 'func_name', 'ClassName.method').
-        Only extracts simple Name and Attribute calls, skipping builtins.
-        """
-        _BUILTINS = {
-            'print', 'len', 'range', 'enumerate', 'zip', 'map', 'filter',
-            'sorted', 'reversed', 'list', 'dict', 'set', 'tuple', 'str',
-            'int', 'float', 'bool', 'bytes', 'type', 'isinstance',
-            'issubclass', 'hasattr', 'getattr', 'setattr', 'delattr',
-            'super', 'property', 'staticmethod', 'classmethod',
-            'open', 'iter', 'next', 'id', 'hash', 'repr', 'abs',
-            'min', 'max', 'sum', 'any', 'all', 'ord', 'chr', 'hex',
-            'vars', 'dir', 'format', 'input', 'round',
-        }
-        calls: List[str] = []
-        seen: Set[str] = set()
-        for child in ast.walk(node):
-            if not isinstance(child, ast.Call):
-                continue
-            func = child.func
-            name = ""
-            if isinstance(func, ast.Name):
-                name = func.id
-            elif isinstance(func, ast.Attribute):
-                # e.g. self.method() -> 'method', obj.func() -> 'func'
-                name = func.attr
-            if name and name not in _BUILTINS and name not in seen:
-                seen.add(name)
-                calls.append(name)
-        return calls
+    # v0.2.77 Part 5 (CG-2): the former ``_extract_function_calls`` (Python
+    # ast-based) moved into the shared facade ``vco_lib/codegraph_calls.py``
+    # (``_extract_python_calls``) — ONE entry point for every language. The
+    # cross-reference pass now calls ``_extract_call_names(language, body)``;
+    # the ast path is byte-identical to the removed method (same builtins
+    # denylist, same order-preserving dedup).
 
     @staticmethod
     def _prefer_canonical_chunk(cache: Dict[str, str], full_name: str, obj) -> bool:
@@ -5869,17 +5847,38 @@ class CodeGraphAnalyzer:
 
                 # Strip a leading `[chunk N/total]` header (chunked chunk-0
                 # bodies carry it; the reassembly helper strips per-row, so
-                # this is a no-op there) before AST parse, else `ast.parse`
+                # this is a no-op there) before parsing, else the parser
                 # chokes.
                 body = _strip_chunk_header(body)
 
-                # Parse body to extract calls
-                try:
-                    tree = ast.parse(body)
-                except SyntaxError:
+                # v0.2.77 Part 5 (CG-2): extract calls per the row's stored
+                # language via the shared facade. Python keeps the exact ast
+                # path (moved behind the facade); every other language uses a
+                # tree-sitter grammar WHEN the optional `codegraph-ts` extra is
+                # installed, else the facade returns None and we skip this row
+                # exactly as the old unconditional `ast.parse` → SyntaxError →
+                # `continue` did for non-Python bodies. ``[]`` is a positive
+                # "parsed, no calls" result (clears stale stored call_names).
+                #
+                # Empty/unknown `language` → ``python``: the OLD code ran
+                # `ast.parse` unconditionally regardless of language, so a
+                # pre-migration Python row that never got a `language` stamp
+                # still got its calls extracted. Defaulting the blank case to
+                # ``python`` preserves that byte-for-byte — a genuinely
+                # non-Python body with a blank stamp fails the ast parse, the
+                # facade returns None, and we skip it exactly as before.
+                _lang_raw = (
+                    canonical.properties.get("language")
+                    if canonical is not None else ""
+                )
+                _row_lang = _canonical_lang_id(
+                    str(_lang_raw) if _lang_raw else ""
+                ) or "python"
+                call_names = _extract_call_names(_row_lang, body)
+                if call_names is None:
+                    # No extractor for this language (or the body failed to
+                    # parse) → keep today's behaviour: no call edges for it.
                     continue
-
-                call_names = self._extract_function_calls(tree)
                 refs_to_add = []
                 for call_name in call_names:
                     # v0.2.74 (R4): single-home resolution (shared with the
