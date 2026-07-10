@@ -13111,12 +13111,32 @@ MemAvailable:   23456789 kB
 
         // The function MUST call POST to /v1/schema and MUST NOT call
         // any destructive verb on schema.
-        assert!(body.contains("method=\"POST\""), "expected POST in _ensure_collections");
-        for verb in &["method=\"PUT\"", "method=\"DELETE\"", "method=\"PATCH\""] {
+        //
+        // v0.2.77 Part 7a converged the raw `urllib.request.Request(...,
+        // method="POST")` calls onto the shared `_wh.http_request(<VERB>,
+        // ...)` helper, so the HTTP verb now appears as the FIRST positional
+        // arg (`_wh.http_request("POST", ...)`) rather than a `method="..."`
+        // kwarg. Accept BOTH spellings for each verb so this source-parity
+        // audit keeps working across the convergence (and would still catch a
+        // regression that reintroduced a raw destructive Request).
+        let posts_via_kwarg = body.contains("method=\"POST\"");
+        let posts_via_helper = body.contains("_wh.http_request(\"POST\"")
+            || body.contains("http_request(\"POST\"");
+        assert!(
+            posts_via_kwarg || posts_via_helper,
+            "expected a POST (method=\"POST\" or _wh.http_request(\"POST\", ...)) \
+             in _ensure_collections"
+        );
+        for verb in &[
+            ("method=\"PUT\"", "_wh.http_request(\"PUT\""),
+            ("method=\"DELETE\"", "_wh.http_request(\"DELETE\""),
+            ("method=\"PATCH\"", "_wh.http_request(\"PATCH\""),
+        ] {
             assert!(
-                !body.contains(verb),
-                "FORBIDDEN: {} found in _ensure_collections — would mutate existing classes",
-                verb
+                !body.contains(verb.0) && !body.contains(verb.1),
+                "FORBIDDEN: {} / {} found in _ensure_collections — would mutate existing classes",
+                verb.0,
+                verb.1
             );
         }
         // Belt-and-braces: never DELETE on /v1/schema. The test focuses
