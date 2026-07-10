@@ -818,10 +818,13 @@ fn populate_codegraph_binding(
     db: &Db,
     report: &mut PopulateReport,
 ) {
-    // Idempotence: set_project_codegraph_binding upserts ON
-    // CONFLICT(project_id) and would clobber the `enabled` flag. Pre-check
-    // existence — preserving the toggle is the documented user-facing
-    // contract.
+    // Idempotence + stored-binding-wins: set_project_codegraph_binding upserts
+    // ON CONFLICT(project_id) and would clobber the `enabled` flag. Pre-check
+    // existence — preserving the toggle is the documented user-facing contract,
+    // AND (R2) this early-return is what makes the derivation below run ONLY
+    // for a project with NO stored binding. Existing installs' stored prefixes
+    // are authoritative and are NEVER re-derived here, so switching the
+    // derivation rule cannot re-prefix a live install's collections.
     if db
         .get_project_codegraph_binding(project_id)
         .ok()
@@ -830,12 +833,29 @@ fn populate_codegraph_binding(
     {
         return;
     }
-    // X-1 / v0.2.76: route through the single binding-writer home, which owns
-    // the sanitizer call.
-    if let Err(e) = crate::db::bindings_writer::write_codegraph_binding_from_name(
+    // v0.2.76 (R2): derive the code-graph collection PREFIX via
+    // `canonical_class_prefix` — the underscore-PRESERVING rule the analyzer
+    // stamps collections with (`analyze_code_graph.py::_sanitize_collection_prefix`
+    // → canonical_class_prefix). The previous path derived via the KG-name
+    // sanitizer (`write_codegraph_binding_from_name` →
+    // `sanitize_kg_collection_local`), which DROPS underscores (`Camel_Case` →
+    // `CamelCase`), so a project whose name contains an underscore got a
+    // binding prefix that did not match its analyzer collections. Route through
+    // the explicit-prefix writer (the same seam project_backfill.rs uses).
+    let prefix = match crate::project_naming::canonical_class_prefix(project_name) {
+        Ok(p) => p,
+        Err(e) => {
+            report.warnings.push(format!(
+                "write_codegraph_binding: cannot derive canonical prefix from {:?}: {:?}",
+                project_name, e
+            ));
+            return;
+        }
+    };
+    if let Err(e) = crate::db::bindings_writer::write_codegraph_binding(
         db,
         project_id,
-        project_name,
+        &prefix,
         Some("codesage-large-v2"),
         Some(2048),
         None,
@@ -1814,11 +1834,65 @@ mod tests {
         );
         assert_eq!(report.codegraph_bindings_inserted, 1);
         let cg = db.get_project_codegraph_binding("p1").unwrap().unwrap();
-        // sanitize_kg_collection lowercases punctuation, TitleCases words.
+        // canonical_class_prefix PascalCases whitespace-separated words.
         assert_eq!(cg.collection_prefix, "MyProjectName");
         assert_eq!(cg.embedding_model.as_deref(), Some("codesage-large-v2"));
         assert_eq!(cg.embedding_dim, Some(2048));
         assert!(cg.enabled);
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    /// v0.2.76 (R2): a project name containing an underscore must derive its
+    /// code-graph prefix via `canonical_class_prefix` (underscore-PRESERVING —
+    /// what the analyzer stamps), NOT the KG sanitizer (which DROPS
+    /// underscores). Pre-fix `Camel_Case` bound to `CamelCase` and mismatched
+    /// its `Camel_Case_CodeFunction` analyzer collections.
+    #[test]
+    fn populate_codegraph_binding_preserves_underscore_prefix() {
+        let folder = scratch_dir("cg-underscore");
+        let db = make_db_with_project("p1", "Camel_Case");
+        let report =
+            populate_project_state_from_filesystem("p1", "Camel_Case", &folder, &db);
+        assert_eq!(report.codegraph_bindings_inserted, 1);
+        let cg = db.get_project_codegraph_binding("p1").unwrap().unwrap();
+        assert_eq!(
+            cg.collection_prefix, "Camel_Case",
+            "code-graph prefix must preserve underscores (canonical_class_prefix), \
+             not drop them (KG sanitizer)"
+        );
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    /// v0.2.76 (R2 leave-alone): a project with a STORED code-graph binding
+    /// (e.g. an existing install whose prefix was derived under the old rule)
+    /// is NEVER re-derived — the early-return preserves it. This is what stops
+    /// the derivation change from re-prefixing live installs.
+    #[test]
+    fn populate_codegraph_binding_leaves_existing_stored_prefix_untouched() {
+        let folder = scratch_dir("cg-stored");
+        let db = make_db_with_project("p1", "Camel_Case");
+        // Simulate an existing install whose stored prefix used the OLD
+        // (underscore-dropping) rule.
+        db.set_project_codegraph_binding(
+            "p1",
+            "CamelCase", // stale-rule prefix already on disk
+            Some("codesage-large-v2"),
+            Some(2048),
+            None,
+            None,
+            true,
+            &JsonValue::Null,
+        )
+        .unwrap();
+        let report =
+            populate_project_state_from_filesystem("p1", "Camel_Case", &folder, &db);
+        // No new binding inserted (the stored one wins).
+        assert_eq!(report.codegraph_bindings_inserted, 0);
+        let cg = db.get_project_codegraph_binding("p1").unwrap().unwrap();
+        assert_eq!(
+            cg.collection_prefix, "CamelCase",
+            "an existing stored prefix must be preserved, never re-derived"
+        );
         std::fs::remove_dir_all(&folder).ok();
     }
 

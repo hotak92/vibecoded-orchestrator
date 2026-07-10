@@ -100,33 +100,15 @@ pub fn write_kg_binding(
     )
 }
 
-/// Seed (or upsert) a project's code-graph binding, deriving the collection
-/// prefix from `project_name` via the shared sanitizer. Same wiring seam as
-/// [`write_kg_binding_primary_from_name`] for the codegraph table.
-#[allow(clippy::too_many_arguments)]
-pub fn write_codegraph_binding_from_name(
-    db: &Db,
-    project_id: &str,
-    project_name: &str,
-    embedding_model: Option<&str>,
-    embedding_dim: Option<i64>,
-    last_analyzed_commit: Option<&str>,
-    last_analyzed_at: Option<i64>,
-    enabled: bool,
-    config: &JsonValue,
-) -> Result<ProjectCodegraphBinding, String> {
-    let prefix = crate::db::access::sanitize_kg_collection_local(project_name);
-    db.set_project_codegraph_binding(
-        project_id,
-        &prefix,
-        embedding_model,
-        embedding_dim,
-        last_analyzed_commit,
-        last_analyzed_at,
-        enabled,
-        config,
-    )
-}
+// v0.2.76 (R2): `write_codegraph_binding_from_name` was DELETED. It derived the
+// code-graph collection prefix via the KG-name sanitizer
+// (`sanitize_kg_collection_local`, underscore-DROPPING), which is the WRONG rule
+// for code-graph collections — the analyzer stamps them with the
+// underscore-PRESERVING `canonical_class_prefix`. Its only caller
+// (`populate_codegraph_binding`) now derives via `canonical_class_prefix` and
+// routes through `write_codegraph_binding` (explicit prefix) below. Do NOT
+// reintroduce a from_name helper for the codegraph table: the KG sanitizer must
+// never derive a codegraph prefix (that is the R2 bug).
 
 /// Write a code-graph binding with an explicit, already-resolved prefix (no
 /// derivation) — the routing seam for callers that carry the prefix (e.g. the
