@@ -3938,11 +3938,31 @@ class CodeGraphAnalyzer:
                         if not files:
                             continue
                         if incremental:
+                            all_files = files
                             files = self._filter_changed_files(
-                                source_root, files, since_commit=since_commit,
+                                source_root, all_files, since_commit=since_commit,
+                            )
+                            # v0.2.77 5c task 5 (5c-v): UNION the R-1 stale-file
+                            # set into the changed set so `--incremental` can HEAL
+                            # vectorless (embed_revision=0) rows. `_filter_changed_files`
+                            # keeps only git-diff-changed files; an unchanged file
+                            # owning a stale/vectorless row would otherwise never
+                            # reach `_get_existing_module` (the R-1 probe fires
+                            # inside it), so incremental analyze could NEVER heal
+                            # the 89 vectorless rows the 5c incident wrote — only a
+                            # FULL walk could. Adding the file back here makes
+                            # incremental a valid heal path. Fail-open: a None probe
+                            # (stub analyzer / probe failure) → today's behaviour
+                            # EXACTLY (no addition, no crash). The stale-set build is
+                            # 3 filtered aggregates when converged (cheap) and is
+                            # cached per-run, so the end-of-walk force-trigger and
+                            # the per-file gate reuse the same set.
+                            files = self._union_stale_into_changed(
+                                source_root, all_files, files,
                             )
                             if not files:
-                                # Quiet skip — the typical case for clean repos.
+                                # Quiet skip — the typical case for clean repos
+                                # with NO stale rows (the union added nothing).
                                 # We still surface one line per (root, lang) so
                                 # the operator sees the walk happened.
                                 print(
@@ -4651,6 +4671,74 @@ class CodeGraphAnalyzer:
         except subprocess.CalledProcessError:
             print("⚠️  Git not available or not a git repo, analyzing all files")
             return files
+
+    def _union_stale_into_changed(
+        self,
+        source_root: Path,
+        all_files: List[Path],
+        changed_files: List[Path],
+    ) -> List[Path]:
+        """v0.2.77 5c task 5 (5c-v): add stale-revision files back into the
+        incremental changed-set so ``--incremental`` can HEAL vectorless rows.
+
+        THE GAP: ``_filter_changed_files`` keeps only git-diff-changed files, so
+        a file whose content is UNCHANGED but which owns a stale/vectorless
+        (``embed_revision`` NULL or 0) code-graph row never re-walks under
+        ``--incremental`` — it never reaches ``_get_existing_module`` (where the
+        R-1 stale-file probe fires), so only a FULL walk could ever re-embed it.
+        The 5c incident wrote 89 vectorless rows; without this, updating users
+        could only heal them via a full re-analyze.
+
+        THE FIX: consult the SAME per-run stale-file set the per-file gate uses
+        (``_get_stale_file_set`` → ``_build_stale_file_set`` — 3 filtered
+        aggregates when converged, cached per run). Any file in THIS
+        ``source_root`` whose repo-relative POSIX path is in the stale set is
+        UNIONed into the changed list even when git-diff didn't flag it. The
+        per-object gates keep the re-walk cheap (current rows hash-skip; only the
+        genuinely stale rows re-embed), and the module-row gate converges the
+        file to "current" so the NEXT incremental run skips it again.
+
+        Path form: rows are stored with ``path``/``file_path`` =
+        ``file.relative_to(source_root).as_posix()`` (the walker relativises
+        against the source root it was invoked with — the primary repo for
+        primary rows, the extra root for extra-path rows). So membership is
+        tested with the SAME relativisation against ``source_root`` here, which
+        correctly matches only the rows belonging to THIS root.
+
+        FAIL-OPEN: a ``None`` stale set (stub analyzer / probe failure) or an
+        empty one → return ``changed_files`` unchanged (today's behaviour
+        exactly). Never crashes: a per-file relativise error is skipped.
+        """
+        try:
+            stale = self._get_stale_file_set()
+        except Exception:  # noqa: BLE001 — stub analyzers / probe failure
+            stale = None
+        if not stale:
+            return changed_files
+
+        already = set(changed_files)
+        # Preserve the original changed order, then append newly-added stale
+        # files in their find-order (deterministic; golden/prune unaffected —
+        # this only changes WHICH files walk, not what a walk emits).
+        result = list(changed_files)
+        added = 0
+        for f in all_files:
+            if f in already:
+                continue
+            try:
+                rel = f.relative_to(source_root).as_posix()
+            except Exception:  # noqa: BLE001 — odd root: cannot key, skip
+                continue
+            if rel in stale:
+                result.append(f)
+                already.add(f)
+                added += 1
+        if added:
+            print(
+                f"ℹ️  incremental: +{added} unchanged file(s) with stale/vectorless "
+                f"rows re-queued under {source_root} (rev-0 heal)"
+            )
+        return result
 
     def _analyze_lua_file(self, file_path: Path, repo_root: Path) -> Dict[str, int]:
         """P2f stage 2 (v0.2.76): moved verbatim to
