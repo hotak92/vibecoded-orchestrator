@@ -39,6 +39,13 @@ register the git credential helper — those are manual steps documented below.
 The file store is the right tool when no launcher is installed, or for
 secrets you manage yourself outside the GUI.
 
+> **`vct get` reads ONLY the file store.** Secrets saved in the launcher GUI
+> live in the OS keychain and are served by vct-hub — resolve those via
+> `.claude/scripts/vct_secrets_resolve.sh <project_folder> <KEY>` (or
+> `vco_lib.agent_secrets.get`), NOT via `vct set` (which would create a second,
+> divergent copy on disk). On a miss, `vct` probes the hub and, if the keychain
+> has the key, its error points you at the resolver instead of `vct set`.
+
 ## Layout (file store)
 
 ```

@@ -11,6 +11,7 @@ sandboxed VCT_SECRETS_DIR — no argv-shape mocks.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -101,6 +102,104 @@ def test_vct_can_read_and_resolve(vct_env):
     assert "v" != cp.stdout.strip(), "resolve must print a path, not the value"
     cp = _vct(vct_env, "resolve", "--key", "ABSENT")
     assert cp.returncode == 2
+
+
+# ─── v0.2.76 R4: hub-aware miss message (vct-get-hub-keychain-disjoint) ──────
+
+
+@contextlib.contextmanager
+def _stub_hub(state_dir, *, has_key: bool):
+    """Spin a localhost stub of vct-hub's GET /projects/{id}/env?key=... and
+    write hub.port + hub.token under `state_dir` so `vct` discovers it.
+
+    `has_key=True` → 200 with the key present; False → 404 (project/key absent).
+    Auth is checked loosely (any Bearer token accepted) — enough to exercise
+    the CLI's probe path.
+    """
+    import http.server
+    import threading
+
+    token = "stub-hub-token-r4"
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            if "Bearer " not in (self.headers.get("Authorization") or ""):
+                self.send_response(401)
+                self.end_headers()
+                return
+            if has_key and "/env" in self.path:
+                body = b'{"MYGUIKEY": "kept-in-keychain"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _H)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    Path(state_dir).mkdir(parents=True, exist_ok=True)
+    (Path(state_dir) / "hub.port").write_text(str(port))
+    (Path(state_dir) / "hub.token").write_text(token)
+    try:
+        yield
+    finally:
+        srv.shutdown()
+        t.join(timeout=5)
+
+
+def test_vct_get_miss_points_at_resolver_when_hub_has_key(vct_env, tmp_path):
+    """ACT: a GUI-saved key absent from the file store but present in the
+    launcher keychain (served by the hub) → the miss message points at the
+    resolver script and must NOT suggest `vct set` (which forks a copy)."""
+    state_dir = tmp_path / "vct-state"
+    env = dict(vct_env)
+    env["VCT_STATE_DIR"] = str(state_dir)
+    with _stub_hub(state_dir, has_key=True):
+        cp = _vct(env, "get", "--project", "myproj", "--key", "MYGUIKEY", "--trusted")
+    assert cp.returncode == 2, cp.stderr
+    assert "vct_secrets_resolve.sh" in cp.stderr, cp.stderr
+    assert "Fix: vct set" not in cp.stderr, (
+        "must NOT suggest `vct set` when the keychain has the key (divergent copy)"
+    )
+
+
+def test_vct_get_miss_unchanged_when_hub_lacks_key(vct_env, tmp_path):
+    """LEAVE-ALONE: a truly-absent key (hub 404s too) → the classic
+    `vct set` hint, unchanged."""
+    state_dir = tmp_path / "vct-state"
+    env = dict(vct_env)
+    env["VCT_STATE_DIR"] = str(state_dir)
+    with _stub_hub(state_dir, has_key=False):
+        cp = _vct(env, "get", "--project", "myproj", "--key", "NOSUCH", "--trusted")
+    assert cp.returncode == 2, cp.stderr
+    assert "Fix: vct set" in cp.stderr, cp.stderr
+    assert "vct_secrets_resolve.sh" not in cp.stderr
+
+
+def test_vct_get_miss_unchanged_when_hub_down(vct_env, tmp_path):
+    """LEAVE-ALONE + no-hang: hub unreachable (no port/token files, and a
+    dead port) → the classic message, bounded (curl --max-time)."""
+    state_dir = tmp_path / "vct-state"
+    env = dict(vct_env)
+    env["VCT_STATE_DIR"] = str(state_dir)
+    # Point at a closed port so the probe fails fast (curl connection refused).
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "hub.port").write_text("9")  # unlikely-to-listen low port
+    (state_dir / "hub.token").write_text("irrelevant")
+    import time as _time
+    t0 = _time.time()
+    cp = _vct(env, "get", "--project", "myproj", "--key", "NOSUCH", "--trusted")
+    elapsed = _time.time() - t0
+    assert cp.returncode == 2, cp.stderr
+    assert "Fix: vct set" in cp.stderr, cp.stderr
+    assert elapsed < 15, f"hub-down probe must be bounded, took {elapsed:.1f}s"
 
 
 def test_vct_list_hides_readme(vct_env):
