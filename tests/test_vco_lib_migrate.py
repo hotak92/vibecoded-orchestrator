@@ -492,6 +492,35 @@ class MigrateDispatchUnitTests(unittest.TestCase):
 class CliMigrateCommandTests(unittest.TestCase):
     """`python -m vco_lib.project_init migrate-collections` smoke test."""
 
+    def setUp(self):
+        # project_init.main("migrate-collections --name Foo ...") legitimately
+        # injects KG_COLLECTION / DEVELOPMENT_COLLECTION / DIAGRAMS_COLLECTION
+        # into os.environ so migrate_collections picks them up (production
+        # callers are fresh subprocesses, so the process-scoped mutation is
+        # fine there). But these tests call main() IN-PROCESS, so without this
+        # guard the injected KG_COLLECTION=Foo_KnowledgeGraph leaks into the
+        # shared test process and cross-contaminates any later test that reads
+        # KG_COLLECTION (e.g. test_stage1_projectinit_v0273's orphan-detection
+        # pair, which then treats Foo_KnowledgeGraph as "our own" collection
+        # and stops detecting it — an ordering-dependent failure invisible to
+        # alphabetical CI). Snapshot + restore the three keys around every
+        # test in this class.
+        self._env_backup = {
+            k: os.environ.get(k)
+            for k in (
+                "KG_COLLECTION",
+                "DEVELOPMENT_COLLECTION",
+                "DIAGRAMS_COLLECTION",
+            )
+        }
+
+    def tearDown(self):
+        for k, v in self._env_backup.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
     def test_dry_run_returns_zero_no_weaviate(self):
         # Mock the dispatcher so we don't hit the network. We're only
         # verifying argparse wiring + JSON shape.
