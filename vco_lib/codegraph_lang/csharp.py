@@ -395,16 +395,6 @@ def analyze_csharp_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str,
         re.MULTILINE
     )
 
-    # ASP.NET HTTP attributes for CodeAPI
-    http_attr_pattern = re.compile(
-        r'\[Http(Get|Post|Put|Delete|Patch|Options|Head)\s*(?:\([^)]*\))?\]'
-        r'(?:\s*\[[^\]]*\])*'           # other attributes in between
-        r'[^{]*?'                        # skip to method
-        r'(?:public|private|protected)\s+'
-        r'(?:async\s+)?(?:Task[<>\w]*\s+|IActionResult\s+|ActionResult[<>\w]*\s+)?'
-        r'([\w]+)\s*\(',
-        re.MULTILINE | re.DOTALL
-    )
     # Route attribute (base route on controller or per-method)
     route_attr_pattern = re.compile(r'\[Route\s*\(\s*["\']([^"\']+)["\']')
 

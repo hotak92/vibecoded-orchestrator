@@ -240,63 +240,15 @@ def test_h_lua_source_passes_language_lua_to_embed_function() -> None:
 
 
 # ===========================================================================
-# I — String-literal stripping helper
+# I — String-literal stripping helper — RETIRED (v0.2.76 R3, 2026-07-10)
 # ===========================================================================
-
-
-def test_i_strip_string_literals_helper_exists() -> None:
-    """V52-O.11.I introduces ``_strip_string_literals`` as a module-scope
-    helper. Asserting on its existence locks the contract.
-    """
-    assert hasattr(acg, "_strip_string_literals"), (
-        "_strip_string_literals helper missing from analyze_code_graph — "
-        "V52-O.11.I not landed"
-    )
-
-
-def test_i_strip_string_literals_preserves_line_numbers() -> None:
-    """The strip must replace string content with same-length empty
-    content so downstream line counters still align."""
-    src = 'let s = "fn foo() {}";\nfn real() {}'
-    out = acg._strip_string_literals(src)
-    assert out.count('\n') == src.count('\n'), (
-        f"Line count changed: {src!r} → {out!r}"
-    )
-    # The "fn foo() {}" inside the string must NOT survive verbatim
-    # (otherwise the downstream regex still matches it). Allow ""
-    # (empty string literal) to remain.
-    assert "fn foo()" not in out, (
-        f"String contents leaked through strip: {out!r}"
-    )
-    # The real function must still be intact.
-    assert "fn real()" in out
-
-
-def test_i_strip_string_literals_handles_all_quote_types() -> None:
-    """Single quotes, double quotes, backticks all stripped."""
-    cases = [
-        ('x = "double";',   '"'),
-        ("x = 'single';",   "'"),
-        ('x = `backtick`;', '`'),
-    ]
-    for src, quote in cases:
-        out = acg._strip_string_literals(src)
-        # Content between quotes must be gone (replaced or blanked).
-        # The closing quotes themselves may remain or not, depending on
-        # implementation — we just check the inner text doesn't survive.
-        inner = src.split(quote, 1)[1].rsplit(quote, 1)[0]
-        assert inner not in out, (
-            f"Inner content {inner!r} survived strip of {src!r}: out={out!r}"
-        )
-
-
-def test_i_strip_string_literals_handles_escaped_quotes() -> None:
-    """``"a\\"b"`` is a single string containing an escaped quote — must
-    NOT be split into two strings."""
-    src = r'x = "a\"b"; fn real() {}'
-    out = acg._strip_string_literals(src)
-    # ``fn real`` must still be present (the strip didn't run off the rails).
-    assert "fn real" in out
+# `_strip_string_literals` (V52-O.11.I) was landed as a module-scope helper but
+# NEVER wired to any caller — zero call sites in the analyzer or anywhere in the
+# repo. It was dead code from the start (the false-positive it was meant to
+# guard against never got the intended pre-pass hookup). v0.2.76 R3 deletes the
+# helper as a mechanical dead-code cleanup, so the four contract tests that
+# pinned its existence + behaviour are retired here rather than left asserting
+# on a deleted symbol. No behaviour change: no code path consumed the helper.
 
 
 # ===========================================================================

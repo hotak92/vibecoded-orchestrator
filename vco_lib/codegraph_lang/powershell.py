@@ -86,17 +86,6 @@ _POWERSHELL_FUNCTION_DECL = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 
-# `[Parameter(...)] $name` / `[Parameter()] [string]$name` etc. We
-# capture the parameter name (`$name`) and the bracketed attributes
-# above it so callers can render a richer signature in the code-graph
-# entity.
-_POWERSHELL_PARAM_ATTR = re.compile(
-    r"""\[\s*Parameter\s*\([^)]*\)\s*\]"""
-    r"""(?:\s*\[[^\]]+\])*"""
-    r"""\s*\$(?P<name>[A-Za-z_][\w]*)""",
-    re.IGNORECASE,
-)
-
 
 def _strip_powershell_comments(content: str) -> str:
     """Strip PowerShell single-line and block comments from source.

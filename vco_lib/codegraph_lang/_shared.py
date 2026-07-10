@@ -117,13 +117,14 @@ def _extract_balanced_block(
     at every caller site — drop-in replacement, no off-by-one.
 
     Language coverage: works for any brace-balanced language (C, C++,
-    Java, JavaScript, TypeScript, Go, Rust, C#, Lua-with-end-keyword
-    is handled by ``_extract_balanced_block_keyword`` instead). Doesn't
-    work for indent-significant languages (Python uses AST so it
-    bypasses this helper entirely; Ruby uses ``end`` keywords —
-    callers there should still use this helper since Ruby's bodies are
-    short enough that brace-balance over a 400-line window won't
-    over-extend, but it's a less precise fit).
+    Java, JavaScript, TypeScript, Go, Rust, C#). ``end``-keyword
+    languages (Lua) do NOT use this helper — their extractors
+    (``vco_lib/codegraph_lang/lua.py``) key on the ``end`` token
+    directly. Indent-significant languages don't use it either (Python
+    uses AST so it bypasses this helper entirely; Ruby uses ``end``
+    keywords — callers there may still use this helper since Ruby's
+    bodies are short enough that brace-balance over a 400-line window
+    won't over-extend, but it's a less precise fit).
 
     Performance: ~O(end_line - start_line) lines scanned per call. With
     ``max_lookahead=400`` and typical function bodies of 10-50 lines,
@@ -136,7 +137,6 @@ def _extract_balanced_block(
 
     counter = 0
     found_opener = False
-    end_index = start_line - 1  # 0-indexed start
     lookahead_end = min(start_line - 1 + max_lookahead, len(source_lines))
 
     for line_idx in range(start_line - 1, lookahead_end):

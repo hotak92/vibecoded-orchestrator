@@ -1512,60 +1512,6 @@ def generate_embedding(text: str) -> Optional[Any]:
         return None
 
 
-def _strip_string_literals(content_clean: str) -> str:
-    """V52-O.11.I (v0.2.52, 2026-06-09): replace the *contents* of every
-    single-line single-quoted, double-quoted, and backtick-quoted string
-    with same-length whitespace so downstream regex scans don't match
-    against text that LOOKS like code but is actually string content.
-
-    Audit example: ``let s = "fn foo() {}";`` produces a false-positive
-    function row for a function named ``foo`` in the Rust/JS/Java/C#
-    parsers. The string-stripped version reads as
-    ``let s = "          ";`` and the regex correctly finds no ``fn`` to
-    match.
-
-    Line-number preservation: each stripped string is replaced with the
-    same number of bytes (padded with spaces, with newlines preserved as
-    newlines on the rare multi-line case where an escape sequence
-    happens to include one). This keeps downstream ``content[:m.start()]
-    .count('\\n') + 1`` line calculations correct.
-
-    Quote semantics:
-      - ``'..'`` and ``".."`` handle escape sequences (``\\"``, ``\\'``).
-      - Backtick-quoted (JS template literals) — single-line only,
-        no ``${}`` interpolation handling. A template literal containing
-        ``${expr}`` collapses to blanks too, which is correct (we want
-        to mask the literal text, not the embedded code).
-
-    Caller is expected to have already stripped comments. Multi-line
-    raw strings (Rust ``r#"..."#``, Python triple-quotes — those are
-    handled by ``_strip_triple_quoted``) are out of scope.
-
-    The implementation uses a single regex sweep instead of three passes
-    so overlapping quote characters inside another quote type don't
-    confuse the order-of-stripping (e.g. ``" 'embedded' "`` must NOT
-    re-trigger the single-quote pass after the double-quote pass).
-    """
-    # Combined alternation: try each quote type in turn. The regex engine
-    # picks the leftmost match each iteration, which is what we want.
-    pattern = re.compile(
-        r'"(?:\\.|[^"\\])*"'      # double-quoted (escape-aware)
-        r"|'(?:\\.|[^'\\])*'"     # single-quoted (escape-aware)
-        r"|`(?:\\.|[^`\\])*`",    # backtick (template literal)
-    )
-
-    def _blank(match: "re.Match[str]") -> str:
-        # Replace the matched string (inclusive of quotes) with spaces of
-        # the same length, but preserve any newlines inside (escape
-        # sequences like ``"\n"`` are written as a literal ``\``+``n`` in
-        # source, so they don't actually contain a newline — we still
-        # play it safe and preserve embedded newlines).
-        text = match.group(0)
-        return ''.join(ch if ch == '\n' else ' ' for ch in text)
-
-    return pattern.sub(_blank, content_clean)
-
-
 def _shape_for_insert(embedding: Optional[Any]) -> Optional[Any]:
     """Shape ``embedding`` for ``collection.data.insert(vector=)``.
 
