@@ -212,6 +212,33 @@ impl Db {
         )?;
         Ok(())
     }
+
+    // ─── v0.2.77 5c task 3: update-all embed-admission cap ────────────────
+    //
+    // Machine-global cap on how many projects' embed-heavy background work
+    // (codegraph analyze + kg-sync) may run at once during a launcher "update
+    // all". install.py seeds `embedding.update_all_max_parallel` from the
+    // hardware-derived shared-pool budget (task 2); the update-all admission
+    // semaphore (`commands::embed_admission`) reads it here at first use. A
+    // GUI-tuned value overrides the seed. Same flat-TEXT-key pattern as the
+    // codegraph floors: parse-tolerant with a compiled-in default.
+
+    /// Read the machine-global update-all parallel-projects cap. Returns
+    /// [`DEFAULT_UPDATE_ALL_MAX_PARALLEL`] when the row is absent, unparseable,
+    /// or out of range (`1..=64`). Soft-fail: a hand-corrupted row must never
+    /// crash the admission gate — it degrades to the conservative default.
+    ///
+    /// The `64` upper clamp is a defensive ceiling far above the Python side's
+    /// documented `8` cap (`_CONCURRENCY_CEILING`): the seeded value never
+    /// exceeds 8, but a hand-edited row must not mint an unbounded semaphore.
+    pub fn get_update_all_max_parallel(&self) -> usize {
+        self.app_state_get(UPDATE_ALL_MAX_PARALLEL_KEY)
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|v| (1..=64).contains(v))
+            .unwrap_or(DEFAULT_UPDATE_ALL_MAX_PARALLEL)
+    }
 }
 
 /// `app_state` key for the machine-global two-stage retrieval floor (v0.2.72
@@ -229,6 +256,19 @@ pub const DEFAULT_CODEGRAPH_RETRIEVAL_FLOOR: f64 = 0.16;
 
 /// Default post-rerank floor. MUST match the Python-side default (see above).
 pub const DEFAULT_CODEGRAPH_POST_RERANK_FLOOR: f64 = 0.22;
+
+/// `app_state` key for the machine-global update-all parallel-projects cap
+/// (v0.2.77 5c task 3). Seeded by install.py from the hardware-derived budget;
+/// read by the `commands::embed_admission` semaphore. MUST match the Python
+/// constant `_APP_STATE_KEY_UPDATE_ALL_MAX_PARALLEL` in install.py.
+pub const UPDATE_ALL_MAX_PARALLEL_KEY: &str = "embedding.update_all_max_parallel";
+
+/// Default parallel-projects cap when the row is absent (a fresh install that
+/// never ran the seed, or a free-tier install with no launcher.db at
+/// install-time). Conservative `2` per the task-3 spec: two projects' worth of
+/// embed work is safe on the smallest supported hardware while still making
+/// update-all progress. A hardware-seeded value overrides this.
+pub const DEFAULT_UPDATE_ALL_MAX_PARALLEL: usize = 2;
 
 /// `app_state` key for the persisted orchestrator-root shared KG
 /// collection name (migration 028 / Phase 1 / v0.2.49 access-matrix).
@@ -513,5 +553,40 @@ mod tests {
         db.app_state_set(CODEGRAPH_POST_RERANK_FLOOR_KEY, "1.0").unwrap();
         assert_eq!(db.get_codegraph_retrieval_floor().unwrap(), 0.0);
         assert_eq!(db.get_codegraph_post_rerank_floor().unwrap(), 1.0);
+    }
+
+    // ─── v0.2.77 5c task 3: update-all parallel cap reader ───────────────
+
+    #[test]
+    fn update_all_max_parallel_defaults_when_unset() {
+        // Leave-alone: no row → the compiled-in conservative default (2).
+        let db = Db::open_in_memory().expect("in-memory db");
+        assert_eq!(db.get_update_all_max_parallel(), DEFAULT_UPDATE_ALL_MAX_PARALLEL);
+    }
+
+    #[test]
+    fn update_all_max_parallel_reads_seeded_value() {
+        // Act: install.py seeded a value → the reader returns it verbatim.
+        let db = Db::open_in_memory().expect("in-memory db");
+        db.app_state_set(UPDATE_ALL_MAX_PARALLEL_KEY, "4").unwrap();
+        assert_eq!(db.get_update_all_max_parallel(), 4);
+    }
+
+    #[test]
+    fn update_all_max_parallel_soft_fails_on_garbage_and_out_of_range() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        for bad in ["not-a-number", "0", "-3", "65", "9999", "1.5", ""] {
+            db.app_state_set(UPDATE_ALL_MAX_PARALLEL_KEY, bad).unwrap();
+            assert_eq!(
+                db.get_update_all_max_parallel(),
+                DEFAULT_UPDATE_ALL_MAX_PARALLEL,
+                "row {bad:?} must degrade to the default",
+            );
+        }
+        // Boundary values inside 1..=64 are accepted.
+        db.app_state_set(UPDATE_ALL_MAX_PARALLEL_KEY, "1").unwrap();
+        assert_eq!(db.get_update_all_max_parallel(), 1);
+        db.app_state_set(UPDATE_ALL_MAX_PARALLEL_KEY, "64").unwrap();
+        assert_eq!(db.get_update_all_max_parallel(), 64);
     }
 }

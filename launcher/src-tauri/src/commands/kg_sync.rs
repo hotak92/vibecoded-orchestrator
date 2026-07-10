@@ -487,6 +487,19 @@ async fn run_sync_task(
         Some("queued"),
         None,
     );
+    // v0.2.77 5c task 3: machine-global update-all admission gate. Acquired
+    // FIRST (before the KG single-flight permit below) so a kg-sync counts
+    // against the SAME shared budget as codegraph builds — one shared pool
+    // across both embed pipelines (USER DESIGN RULING), not two independent
+    // caps. Held for the whole task via RAII, so the cross-pipeline slot is
+    // occupied across the entire `sync_knowledge_graph.py` lifetime. Acquired
+    // INSIDE the spawned task (spawn_initial_sync stays non-blocking), so the
+    // update-all loop keeps advancing; queued tasks park here. Also covers the
+    // boot-resume path (`resume_pending_syncs`), which can fire N tasks at once.
+    let _admission = {
+        let db = app.state::<Db>();
+        crate::commands::embed_admission::acquire_update_all_admission(&db).await
+    };
     let _permit = acquire_kg_sync_permit().await;
 
     emit_sync(

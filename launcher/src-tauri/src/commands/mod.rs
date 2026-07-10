@@ -43,6 +43,7 @@ pub mod diagram_watcher;
 // embedded Excalidraw editor (broken on Wayland+webkit2gtk) and adds
 // a visual Mermaid editor alongside the existing text-only one.
 pub mod diagrams_local_server;
+pub mod embed_admission;
 pub mod embedding_catalog;
 pub mod embedding_enrichment;
 // v0.2.75 P2 — pure `.env` audit + sentinel-rewrite (Rust mirror of

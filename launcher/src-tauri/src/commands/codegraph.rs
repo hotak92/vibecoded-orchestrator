@@ -1228,6 +1228,28 @@ async fn run_build_task(
 
     // 5. Run it. We capture stdout+stderr; they're combined into one
     //    log buffer (interleaving is fine for human debugging).
+    // v0.2.77 5c task 3: machine-global update-all admission gate. Acquire a
+    // permit from the ONE shared embed-admission semaphore (sized from the
+    // hardware-derived `embedding.update_all_max_parallel`) BEFORE spawning the
+    // analyzer. When "update all" fans out N codegraph builds + N kg-syncs,
+    // only `update_all_max_parallel` projects' worth of embed work runs at a
+    // time; the rest park here on `.await`. Acquired INSIDE this spawned task
+    // (not in `update_project_v2`) so the outer loop stays non-blocking — tasks
+    // queue on the semaphore while the loop keeps advancing. The permit is
+    // bound for the rest of the function scope; its `Drop` releases the slot
+    // when `run_build_task` returns (RAII, incl. the early-return/panic paths),
+    // so it is held across the entire analyzer subprocess lifetime below.
+    //
+    // A queued task's DB row stays RUNNING with a "queued" phase (piggybacks
+    // the existing status rows — no new state). This gate covers the
+    // boot-resume path too (`resume_pending_builds` → `spawn_initial_build` →
+    // here), which can also fire N tasks at launcher boot.
+    emit_build(&app, &project_id, build_status::RUNNING, 0, Some("queued"), None);
+    let _admission = {
+        let db = app.state::<Db>();
+        crate::commands::embed_admission::acquire_update_all_admission(&db).await
+    };
+
     let mut cmd = tokio::process::Command::new(&script).silent();
     cmd.args(&args)
         // Don't inherit the launcher's working dir; the analyzer is
