@@ -299,7 +299,15 @@ fi
 
 # Gate 3: pytest
 echo "  [running pytest tests/ ...]"
-if "${_PYTEST_CMD[@]}" tests/ -q --tb=no > /tmp/preship-pytest.log 2>&1; then
+# SHADOW TRAP (v0.2.76 / update-lens): prepend REPO_ROOT to PYTHONPATH so the
+# tests import THIS checkout's vco_lib, not a shadowing editable `pip install -e`
+# of vco_lib living elsewhere on the dev machine. Without this, the resolved
+# interpreter (a venv that has some OTHER vco_lib editable-installed) imports the
+# wrong package and pytest reports false failures — verified live this session:
+# 5 spurious failures that vanished once REPO_ROOT was on PYTHONPATH (the same
+# commit passes 7170/0/35 with the prepend). The canonical test recipe uses the
+# same prepend; the gate must match it or it lies.
+if PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:$PYTHONPATH}" "${_PYTEST_CMD[@]}" tests/ -q --tb=no > /tmp/preship-pytest.log 2>&1; then
     gate_pass "pytest tests/"
 else
     gate_fail "pytest tests/" "See /tmp/preship-pytest.log (cmd: ${_PYTEST_CMD[*]})"
