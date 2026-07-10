@@ -618,18 +618,18 @@ def _fetch_writable_collections_for_project(project_id: str) -> list[str]:
     access matrix. Used by `store_knowledge_node`'s deny-branch to
     enrich the error response with actionable remediation.
 
-    Source: vct-hub `GET /api/v1/projects/{id}/access?level=write`
-    endpoint. This endpoint lands in the SAME v0.2.49 cycle (main
-    chat's lane, sibling to the matrix `/access/{collection}` endpoint
-    that this server.py already consumes via vco_lib.access_resolver).
+    Source: vct-hub `GET /api/v1/projects/{id}/access?level=write` endpoint —
+    LIVE (`list_collection_access_by_level` in vct-hub `project_state_api.rs`,
+    routed at `/projects/{project_id}/access`; sibling to the matrix
+    `/access/{collection}` endpoint this server.py already consumes via
+    vco_lib.access_resolver).
 
-    Until that endpoint lands in main chat's branch, this function
-    returns an empty list — the caller's remediation string falls back
-    to a generic "re-register the project / open Manage access" hint.
+    When the hub is unreachable this function returns an empty list — the
+    caller's remediation string falls back to a generic "re-register the
+    project / open Manage access" hint.
 
     Never raises: the deny-branch can't crash on enrichment. On any
-    failure (hub unreachable, endpoint missing, malformed response),
-    return [].
+    failure (hub unreachable, malformed response), return [].
     """
     if not project_id:
         return []
@@ -5782,10 +5782,11 @@ async def store_knowledge_node(
                     # instead of just "denied."
                     #
                     # Source: hub's GET /api/v1/projects/{id}/access?level=write
-                    # endpoint (lands in this same v0.2.49 cycle — main
-                    # chat's lane). Until that endpoint exists, this
-                    # helper returns an empty list and the response
-                    # falls back to the generic remediation string.
+                    # endpoint (LIVE — `list_collection_access_by_level` in
+                    # vct-hub `project_state_api.rs`, routed at
+                    # `/projects/{project_id}/access`). When the hub is
+                    # unreachable this helper returns an empty list and the
+                    # response falls back to the generic remediation string.
                     writable_collections = _fetch_writable_collections_for_project(
                         project_id_for_gate
                     )

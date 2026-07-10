@@ -527,6 +527,12 @@ fn require_kg_read(db: &Db, project_id: &str, collection: &str) -> Result<(), St
     let level = db.kg_get_access(project_id, collection)?;
     match level.as_deref() {
         Some("read") | Some("write") => Ok(()),
+        // R9 (v0.2.76): an ABSENT row (`None`) is a DENY BY DESIGN — the read
+        // gate is deny-by-default, so a project with no kg_collection_access
+        // row for this collection has no read access. Do NOT align this with
+        // the WRITE endpoint's `resolve_default_access_level` fall-through
+        // (which fails OPEN to a permissive default when no row exists): the
+        // read path must never fabricate access for an ungranted collection.
         _ => Err(format!(
             "project {} has no read access to collection {}",
             project_id, collection

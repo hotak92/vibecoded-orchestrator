@@ -432,6 +432,12 @@ fn require_kg_read(db: &Db, project_id: &str, collection: &str) -> Result<(), St
     let level = db.kg_get_access(project_id, collection)?;
     match level.as_deref() {
         Some("read") | Some("write") => Ok(()),
+        // R9 (v0.2.76): an ABSENT row (`None`) is a DENY BY DESIGN — the read
+        // gate is deny-by-default, so a project with no kg_collection_access
+        // row for this collection has no read access. Do NOT align this with
+        // the WRITE endpoint's `resolve_default_access_level` fall-through
+        // (which fails OPEN to a permissive default when no row exists): the
+        // read path must never fabricate access for an ungranted collection.
         _ => Err(format!(
             "project {} has no read access to collection {}",
             project_id, collection
@@ -1338,6 +1344,45 @@ mod tests {
         )
         .expect("set primary binding");
         id
+    }
+
+    /// R9 (v0.2.76): the read gate is DENY-BY-DEFAULT. A collection with a
+    /// `read`/`write` access row → Ok; an ABSENT row → Err (no fail-open to a
+    /// permissive default like the write endpoint's fall-through).
+    #[test]
+    fn require_kg_read_denies_on_absent_row() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        // A plain (non-orchestrator-root) project so the structural-row guard
+        // in kg_set_access doesn't fire on a peer collection.
+        let id = "peer-project-uuid".to_string();
+        db.insert_project(
+            &id, "PeerProject", "/tmp/peer-folder", ProjectHost::Base, "peer",
+        )
+        .expect("insert peer project");
+        let collection = "PeerGranted_KnowledgeGraph";
+
+        // ACT: a granted read row → Ok.
+        db.kg_set_access(&id, collection, "read").expect("grant read");
+        assert!(
+            super::require_kg_read(&db, &id, collection).is_ok(),
+            "a granted read row must pass the gate"
+        );
+        // ACT: a write row also satisfies read.
+        db.kg_set_access(&id, collection, "write").expect("grant write");
+        assert!(super::require_kg_read(&db, &id, collection).is_ok());
+
+        // DENY: no row for a different collection → Err (deny-by-default).
+        let ungranted = "Ungranted_KnowledgeGraph";
+        let err = super::require_kg_read(&db, &id, ungranted)
+            .expect_err("an absent access row must DENY");
+        assert!(err.contains("no read access"), "err: {}", err);
+
+        // DENY: an explicit `none` row → Err too.
+        db.kg_set_access(&id, ungranted, "none").expect("set none");
+        assert!(
+            super::require_kg_read(&db, &id, ungranted).is_err(),
+            "an explicit 'none' row must DENY"
+        );
     }
 
     /// Revoking write access to the orchestrator-root's primary collection
