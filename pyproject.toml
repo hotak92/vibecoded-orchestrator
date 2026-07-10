@@ -84,6 +84,33 @@ mcp = [
     "uvicorn >= 0.46.0",
     "psutil >= 7.2.2",
 ]
+# Cross-language code-graph CALL extraction (CG-2 / Part 5). OPTIONAL — the
+# analyzer's cross-reference pass falls back to Python-only ``ast`` call
+# extraction when this extra is absent (vco_lib/codegraph_calls.py soft-fails
+# per-language on ImportError). Every package below ships wheels for
+# linux x86_64 + macOS arm64 + Windows amd64 (verified 2026-07-10), so the
+# extra resolves on all three OSes.
+#
+# PINNED EXACTLY: the grammar wheels declare a tree-sitter language ABI
+# version (14–15 here) that must be >= the core's MIN_COMPATIBLE_LANGUAGE_VERSION
+# (13 for tree-sitter 0.26.0) — a known break source across the 0.21/0.22 era.
+# The set below was load-tested together (every grammar parses under core
+# 0.26.0). Bump core + grammars together and re-run the parity test; never
+# float them independently.
+codegraph-ts = [
+    "tree-sitter == 0.26.0",
+    "tree-sitter-python == 0.25.0",
+    "tree-sitter-rust == 0.24.2",
+    "tree-sitter-javascript == 0.25.0",
+    "tree-sitter-typescript == 0.23.2",
+    "tree-sitter-go == 0.25.0",
+    "tree-sitter-java == 0.23.5",
+    "tree-sitter-c-sharp == 0.23.5",
+    "tree-sitter-cpp == 0.23.4",
+    "tree-sitter-ruby == 0.23.1",
+    "tree-sitter-lua == 0.5.0",
+    "tree-sitter-bash == 0.25.1",
+]
 # Test/dev tools — mirrors requirements-dev.txt.
 test = [
     "pytest >= 9.0.3",

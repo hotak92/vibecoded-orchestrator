@@ -6588,6 +6588,12 @@ def main() -> int:
     # still lazy-install on first call.
     _install_playwright_browsers()
 
+    # Part 5 (CG-2): pre-install the optional tree-sitter grammars so the
+    # code-graph analyzer can extract call edges for non-Python languages.
+    # Soft-fail: the analyzer degrades to Python-only call extraction without
+    # it. Opt out with VCT_SKIP_CODEGRAPH_TS=1.
+    _install_codegraph_treesitter(venv_python)
+
     # Phase 1.2 (diagrams plan): pre-pin the `claude-mermaid` npm
     # package at the version declared in `bundled_mcp_versions.toml`
     # so the first Mermaid invocation doesn't pay the cold-install
@@ -25026,6 +25032,80 @@ def _install_playwright_browsers() -> None:
         print(f"  WARN: chromium install failed: {e}")
         _log_install_event("playwright", "warn",
                            f"npx playwright install chromium failed: {e}")
+
+
+def _install_codegraph_treesitter(venv_python: Path) -> None:
+    """Install the OPTIONAL ``codegraph-ts`` extra (tree-sitter core + grammar
+    wheels) so the code-graph analyzer's cross-reference pass can extract call
+    edges for non-Python languages.
+
+    Shape mirrors ``_install_playwright_browsers``: this is a best-effort,
+    soft-fail pre-cache step. The analyzer works WITHOUT it — every call site
+    in ``vco_lib/codegraph_calls.py`` guards the grammar import and falls back
+    to Python-only ``ast`` call extraction (no call edges for other languages).
+
+    Behaviour:
+      - Skipped entirely if ``VCT_SKIP_CODEGRAPH_TS=1`` is set (mirrors the
+        ``VCT_SKIP_PLAYWRIGHT`` opt-out).
+      - Skipped (warn only) if ``pyproject.toml`` is missing — the extra's
+        pins live there, so there is nothing to install without it.
+      - ``pip install '<root>[codegraph-ts]'`` into the SAME venv the analyzer
+        runs under, so the exact pins in pyproject are the single source of
+        truth (no duplicated version list here).
+
+    Non-fatal: any failure (no network, an unresolvable wheel on an exotic
+    platform, …) logs a warn + prints a short notice, but never aborts the
+    install. Air-gapped installs keep working — call extraction just stays
+    Python-only until the extra is installed later.
+    """
+    print("[codegraph-ts] Installing tree-sitter call-extraction extra ... ",
+          end="", flush=True)
+    _log_install_event("codegraph-ts", "start",
+                       "pip install .[codegraph-ts]")
+
+    if os.environ.get("VCT_SKIP_CODEGRAPH_TS") == "1":
+        print("SKIPPED (VCT_SKIP_CODEGRAPH_TS=1)")
+        _log_install_event("codegraph-ts", "skip",
+                           "VCT_SKIP_CODEGRAPH_TS=1 in env")
+        return
+
+    pyproject = PROJECT_ROOT / "pyproject.toml"
+    if not pyproject.exists():
+        print("SKIPPED (pyproject.toml missing)")
+        _log_install_event("codegraph-ts", "skip",
+                           "pyproject.toml missing; extra pins unavailable")
+        return
+
+    print("(this may take ~20s)")
+    # Soft-fail (on_failure="return"): the analyzer degrades to Python-only
+    # call extraction when the extra is absent. Reuse the pip robustness flags
+    # + subprocess env the rest of the install uses.
+    try:
+        result = _run_logged_subprocess(
+            [str(venv_python), "-m", "pip", "install",
+             *_pip_install_flags(),
+             ".[codegraph-ts]"],
+            step="codegraph-ts", phase_label="pip-install-codegraph-ts",
+            timeout=600,
+            cwd=str(PROJECT_ROOT),
+            env=_pip_subprocess_env(),
+            on_failure="return",
+            fail_message="  WARN: codegraph-ts extra install exited non-zero.",
+            user_hint_lines=[
+                "Cross-language code-graph call edges will stay Python-only "
+                "until this succeeds. Retry later with:",
+                "  pip install '.[codegraph-ts]'  (in the orchestrator venv)",
+                "Skip permanently with VCT_SKIP_CODEGRAPH_TS=1.",
+            ],
+        )
+        if result.returncode == 0:
+            print("[codegraph-ts] tree-sitter grammars installed OK.")
+            _log_install_event("codegraph-ts", "ok",
+                               "codegraph-ts extra installed")
+    except (subprocess.TimeoutExpired, OSError) as e:
+        print(f"  WARN: codegraph-ts extra install failed: {e}")
+        _log_install_event("codegraph-ts", "warn",
+                           f"pip install .[codegraph-ts] failed: {e}")
 
 
 # ---------------------------------------------------------------------------
