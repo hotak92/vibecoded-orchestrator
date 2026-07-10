@@ -33,44 +33,48 @@ PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 # similar env vars don't exist — settings.json substitutes to "". Verified
 # 2026-05-08 via stdin-capture diagnostic.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
-EDITED_FILE=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
+# v0.2.76 P5 (hook-latency): parse the stdin payload with EXACTLY ONE Python
+# interpreter (was FOUR — file_path, agent_id, agent_type, session_id each
+# re-read + re-decoded the same JSON; each interpreter cold-start cost ~15ms).
+# This hook fires on every Edit|Write, so the redundant parse was ~45ms of the
+# measured ~66ms synchronous cost. Same NUL-delimited single-decode pattern as
+# post-file-edit.sh (HK-1, v0.2.73): one decoder emits all four fields
+# NUL-terminated (a trailing NUL after EACH field, incl. the last), read back
+# with a single loop so an embedded newline in file_path survives. Malformed
+# stdin → all-empty, preserving the exit-0 soft-fail contract. Values are
+# byte-identical to the four-spawn form — no behaviour change.
+# V52-L.2 Fix 2a: agent_id + agent_type + session_id are parsed so
+# credential_alerts.jsonl rows are attributable to the subagent that
+# triggered the write (pre-V52-L.2 every alert row looked parent-sourced).
+EDITED_FILE=""
+AGENT_ID=""
+AGENT_TYPE=""
+SESSION_ID=""
+_PTS_IDX=0
+while IFS= read -r -d '' _PTS_VAL; do
+    case "$_PTS_IDX" in
+        0) EDITED_FILE="$_PTS_VAL" ;;
+        1) AGENT_ID="$_PTS_VAL" ;;
+        2) AGENT_TYPE="$_PTS_VAL" ;;
+        3) SESSION_ID="$_PTS_VAL" ;;
+    esac
+    _PTS_IDX=$((_PTS_IDX + 1))
+done < <(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
-    ti = d.get('tool_input', {})
-    print(ti.get('file_path', ''))
+    ti = d.get('tool_input', {}) or {}
+    fields = [
+        ti.get('file_path', '') or '',
+        d.get('agent_id', '') or '',
+        d.get('agent_type', '') or '',
+        d.get('session_id', '') or '',
+    ]
 except Exception:
-    print('')
-" 2>/dev/null || echo "")
-# V52-L.2 Fix 2a: parse subagent identity (agent_id + agent_type) and
-# session_id from the same stdin payload — so credential_alerts.jsonl
-# rows carry enough context to be attributed back to the agent that
-# triggered the write. Pre-V52-L.2 every alert row looked like it came
-# from the parent context regardless of which subagent did the edit.
-AGENT_ID=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
-import json, sys
-try:
-    d = json.loads(sys.stdin.read())
-    print(d.get('agent_id', ''))
-except Exception:
-    print('')
-" 2>/dev/null || echo "")
-AGENT_TYPE=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
-import json, sys
-try:
-    d = json.loads(sys.stdin.read())
-    print(d.get('agent_type', ''))
-except Exception:
-    print('')
-" 2>/dev/null || echo "")
-SESSION_ID=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
-import json, sys
-try:
-    d = json.loads(sys.stdin.read())
-    print(d.get('session_id', ''))
-except Exception:
-    print('')
-" 2>/dev/null || echo "")
+    fields = ['', '', '', '']
+# Trailing NUL after EACH field so the reader loop terminates cleanly.
+sys.stdout.write(''.join(str(f) + '\0' for f in fields))
+" 2>/dev/null)
 
 ALERT_LOG="$PROJECT_ROOT/.claude/logs/credential_alerts.jsonl"
 mkdir -p "$(dirname "$ALERT_LOG")"

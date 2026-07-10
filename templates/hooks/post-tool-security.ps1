@@ -20,6 +20,12 @@ if (Test-Path $EmitContextLib) { . $EmitContextLib }
 $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 $EditedFile = ""
+# v0.2.76 P5 (hook-latency parity): the bash sibling consolidated its stdin
+# parse from FOUR `python -c` spawns into ONE NUL-delimited decode (each
+# interpreter cold-start cost ~15ms; this hook fires on every Edit|Write).
+# PowerShell already single-decodes here via one ConvertFrom-Json - no
+# per-field re-parse ever existed - so the perf issue was bash-only. This
+# touch keeps the OS-parity modification gate satisfied.
 # V52-L.2 Fix 2a: parse subagent identity + session_id so credential_
 # alerts.jsonl rows carry enough context to be attributed to the agent
 # that triggered the write. Empty string when absent (parent context).
