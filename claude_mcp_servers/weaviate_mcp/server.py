@@ -4219,6 +4219,10 @@ async def _semantic_graph_search_body(
     all_formatted: list[dict] = []
     raw_primary: list[tuple[object, str]] = []
     failed_collections_schema: list[str] = []
+    # R7 (v0.2.76): mirror of the hybrid_search fix — record generic
+    # per-collection failures instead of dropping them (all-generic-fail must
+    # raise, partial must surface in the `degraded` key).
+    failed_collections_other: list[tuple[str, str]] = []
     successful_collections: list[str] = []
     # v0.2.47 RL-6b-2: hoist query_vector / query_target to FUNCTION scope
     # so they're defined even if `collections_to_search` is empty (in which
@@ -4283,7 +4287,9 @@ async def _semantic_graph_search_body(
                 )
                 failed_collections_schema.append(coll_name)
                 continue
+            # R7 (v0.2.76): record the generic failure — do not silently drop.
             logger.warning(f"semantic_graph_search: error searching {coll_name}: {exc}")
+            failed_collections_other.append((coll_name, str(exc)))
             continue
 
         # Format all over-fetched results from this collection
@@ -4324,16 +4330,23 @@ async def _semantic_graph_search_body(
             raw_primary.append((obj, coll_name))
         successful_collections.append(coll_name)
 
-    # If EVERY collection in the fan-out schema-failed → instance-level
-    # problem; bubble after logging a degraded-mode telemetry event.
-    if not successful_collections and failed_collections_schema:
+    # If EVERY collection in the fan-out failed (schema OR generic) → nothing
+    # was searched; bubble a loud error rather than a clean 0-result success.
+    if not successful_collections and (failed_collections_schema or failed_collections_other):
         _reset_weaviate_client_cache()
+        _all_failed = failed_collections_schema + [
+            n for n, _ in failed_collections_other
+        ]
         try:
             failure_task_id = str(uuid.uuid4())
             await _rl_cache_and_rerank(
                 failure_task_id, query, [], limit,
-                failure_mode="all_collections_schema_missing",
-                failed_collections=failed_collections_schema,
+                failure_mode=(
+                    "all_collections_schema_missing"
+                    if not failed_collections_other
+                    else "all_collections_failed"
+                ),
+                failed_collections=_all_failed,
             )
         except Exception as exc:
             logger.debug(
@@ -4345,7 +4358,6 @@ async def _semantic_graph_search_body(
         # the right env vars or fell back to a bundled default. See
         # _describe_collection_source + the resolution log line emitted at
         # module load ("weaviate-kg: resolved collections").
-        annotated_failed = _format_failed_collections_hint(failed_collections_schema)
         hint_suffix = (
             " — if names look unexpected, the resolved KG_COLLECTION / "
             "SHARED_KG_COLLECTION env vars likely don't match your project. "
@@ -4353,6 +4365,24 @@ async def _semantic_graph_search_body(
             "'weaviate-kg: resolved collections' log line at server startup "
             "for what this MCP subprocess actually sees."
         )
+        if failed_collections_other:
+            # R7 (v0.2.76): a generic all-fail → raise loudly (RuntimeError
+            # re-raises through the wrapper, not mapped to a schema hint).
+            other_detail = "; ".join(
+                f"{n}: {reason}" for n, reason in failed_collections_other
+            )
+            schema_detail = (
+                f" schema-missing: {_format_failed_collections_hint(failed_collections_schema)};"
+                if failed_collections_schema
+                else ""
+            )
+            raise RuntimeError(
+                "semantic_graph_search: every configured collection failed "
+                f"({len(_all_failed)} attempted;{schema_detail} "
+                f"errors: {other_detail})"
+                + hint_suffix
+            )
+        annotated_failed = _format_failed_collections_hint(failed_collections_schema)
         raise WeaviateSchemaError(
             "semantic_graph_search: every configured collection schema-failed "
             f"({len(failed_collections_schema)} attempted: "
@@ -4532,7 +4562,7 @@ async def _semantic_graph_search_body(
         f"semantic_graph_search: {len(primary_formatted)} primary + "
         f"{len(connected_nodes)} connected across {collections_to_search}"
     )
-    return _large_result({
+    _sgs_response: dict = {
         "success": True,
         "primary_results": primary_formatted,
         "connected_nodes": connected_nodes,
@@ -4540,7 +4570,16 @@ async def _semantic_graph_search_body(
         "depth": depth,
         "detail": detail,
         "collections_searched": collections_to_search,
-    })
+    }
+    # R7 (v0.2.76): partial coverage → surface which collections failed.
+    if failed_collections_schema or failed_collections_other:
+        _degraded: dict = {}
+        if failed_collections_schema:
+            _degraded["schema_missing"] = failed_collections_schema
+        if failed_collections_other:
+            _degraded["errors"] = {n: r for n, r in failed_collections_other}
+        _sgs_response["degraded"] = {"failed_collections": _degraded}
+    return _large_result(_sgs_response)
 
 
 async def _hybrid_search_single_collection(
@@ -5076,6 +5115,12 @@ async def _hybrid_search_body(
     # to the Weaviate instance as a whole, not one collection.
     merged: dict = {}
     failed_collections_schema: list[str] = []
+    # R7 (v0.2.76): generic (non-schema, non-unreachable, non-auth) per-collection
+    # failures. Pre-fix these were only logger.warning'd and DROPPED — if EVERY
+    # collection failed with a generic error the tool returned a clean success
+    # payload with 0 results and NO failure signal (the silent-zero hole behind
+    # the live "0 hits on every query" report).
+    failed_collections_other: list[tuple[str, str]] = []
     successful_collections: list[str] = []
 
     # KG-1 (v0.2.73): fan out to the collections CONCURRENTLY instead of
@@ -5136,23 +5181,35 @@ async def _hybrid_search_body(
             )
             failed_collections_schema.append(coll_name)
             continue
+        # R7 (v0.2.76): a generic (non-schema) failure. RECORD it — do not
+        # silently drop. All-generic-fail must raise (below), and a partial
+        # generic fail must surface in the `degraded` key.
         logger.warning(f"hybrid_search: error searching {coll_name}: {e}")
+        failed_collections_other.append((coll_name, str(e)))
 
-    # If EVERY collection in the fan-out schema-failed → instance-level
-    # problem; bubble. But first log a degraded-mode retrieval event so
-    # offline training sees the query distribution + failure rate even
-    # when no nodes were retrieved.
-    if not successful_collections and failed_collections_schema:
+    # If EVERY collection in the fan-out failed (schema OR generic) → nothing
+    # was searched; bubble a loud error naming per-collection reasons rather
+    # than returning a clean 0-result success. But first log a degraded-mode
+    # retrieval event so offline training sees the query distribution + failure
+    # rate even when no nodes were retrieved.
+    if not successful_collections and (failed_collections_schema or failed_collections_other):
         _reset_weaviate_client_cache()
         # Best-effort failure telemetry. _rl_cache_and_rerank handles
         # empty-nodes + failure_mode and ALWAYS calls log_retrieval, so
         # we get the audit trail before the exception bubbles.
+        _all_failed = failed_collections_schema + [
+            n for n, _ in failed_collections_other
+        ]
         try:
             failure_task_id = str(uuid.uuid4())
             await _rl_cache_and_rerank(
                 failure_task_id, query, [], limit,
-                failure_mode="all_collections_schema_missing",
-                failed_collections=failed_collections_schema,
+                failure_mode=(
+                    "all_collections_schema_missing"
+                    if not failed_collections_other
+                    else "all_collections_failed"
+                ),
+                failed_collections=_all_failed,
             )
         except Exception as exc:
             logger.debug(
@@ -5160,7 +5217,6 @@ async def _hybrid_search_body(
                 exc,
             )
         # v0.2.27: see semantic_graph_search counterpart for rationale.
-        annotated_failed = _format_failed_collections_hint(failed_collections_schema)
         hint_suffix = (
             " — if names look unexpected, the resolved KG_COLLECTION / "
             "SHARED_KG_COLLECTION env vars likely don't match your project. "
@@ -5168,6 +5224,31 @@ async def _hybrid_search_body(
             "'weaviate-kg: resolved collections' log line at server startup "
             "for what this MCP subprocess actually sees."
         )
+        if failed_collections_other:
+            # R7 (v0.2.76): at least one collection failed with a GENERIC error
+            # (not a clean schema-missing). Raise loudly naming per-collection
+            # reasons rather than returning a silent 0-result success.
+            other_detail = "; ".join(
+                f"{n}: {reason}" for n, reason in failed_collections_other
+            )
+            schema_detail = (
+                f" schema-missing: {_format_failed_collections_hint(failed_collections_schema)};"
+                if failed_collections_schema
+                else ""
+            )
+            # RuntimeError (not a schema/unreachable class): the outer wrapper's
+            # `_classify_weaviate_failure` returns None for it, so it re-raises
+            # LOUDLY through the MCP boundary instead of being mapped to a
+            # schema-recovery hint. That is the point — an all-generic-fail must
+            # be visible, not a clean 0-result success.
+            raise RuntimeError(
+                "hybrid_search: every configured collection failed "
+                f"({len(_all_failed)} attempted;{schema_detail} "
+                f"errors: {other_detail})"
+                + hint_suffix
+            )
+        # All failures were clean schema-missing → the historical error.
+        annotated_failed = _format_failed_collections_hint(failed_collections_schema)
         raise WeaviateSchemaError(
             "hybrid_search: every configured collection schema-failed "
             f"({len(failed_collections_schema)} attempted: "
@@ -5341,6 +5422,18 @@ async def _hybrid_search_body(
         "collections_searched": collections_to_search,
         "methods_used": ["semantic", "keyword"],
     }
+    # R7 (v0.2.76): SOME collections succeeded and SOME failed → surface the
+    # partial coverage so the caller SEES it rather than trusting an
+    # apparently-complete result set. Only present when there was a failure.
+    if failed_collections_schema or failed_collections_other:
+        degraded: dict = {}
+        if failed_collections_schema:
+            degraded["schema_missing"] = failed_collections_schema
+        if failed_collections_other:
+            degraded["errors"] = {
+                n: reason for n, reason in failed_collections_other
+            }
+        response["degraded"] = {"failed_collections": degraded}
     if dep_banner:
         # Two-field carry: a structured field for programmatic consumers
         # and a leading `notice` line for human-readable presentation
