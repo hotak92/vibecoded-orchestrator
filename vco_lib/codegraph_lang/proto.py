@@ -16,41 +16,32 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
-from vco_lib.codegraph_entities import CodeEntity, KIND_API, KIND_CLASS
+from vco_lib.codegraph_entities import (
+    CodeEntity,
+    FileExtraction,
+    KIND_API,
+    KIND_CLASS,
+    ModuleDescriptor,
+)
 from vco_lib.codegraph_lang._shared import (
     _extract_balanced_block,
-    _is_minified_content,
+    run_pure_extractor,
 )
 
 
-def analyze_proto_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, int]:
-    """Analyze a Protocol Buffer (.proto) file.
+def extract_proto_file(
+    source_text: str, file_path: Path, repo_root: Path, helpers: Any,
+) -> FileExtraction:
+    """Pure producer: parse a .proto file, RETURN a :class:`FileExtraction`.
 
     Proto files define cross-language service contracts. Each RPC method is stored
     as a CodeAPI entry (inbound contract), and each message type as a CodeClass.
     """
-    stats = {'modules': 0, 'classes': 0, 'apis': 0}
-
-    content = file_path.read_text(encoding='utf-8', errors='ignore')
-    # CG-5 (v0.2.75 P3d): skip machine-minified content at walk time (skip +
-    # log; NEVER delete existing rows — the orphan-clear owns deletion). One
-    # home: _is_minified_content. A genuine long-line first-party file simply
-    # isn't re-indexed this run.
-    if _is_minified_content(content):
-        try:
-            _rel_min = file_path.relative_to(repo_root).as_posix()
-        except Exception:  # noqa: BLE001
-            _rel_min = str(file_path)
-        print(f"⏭️  Skipping {_rel_min} (looks minified/generated)")
-        return {'modules': 0, 'classes': 0, 'functions': 0}
+    content = source_text
     source_lines = content.split('\n')
     loc = len([l for l in source_lines if l.strip() and not l.strip().startswith('//')])
     file_hash = hashlib.sha256(content.encode()).hexdigest()
     relative_path = file_path.relative_to(repo_root).as_posix()
-
-    if ctx._get_existing_module(relative_path, file_hash):
-        print(f"⏭️  Skipping {relative_path} (unchanged)")
-        return stats
 
     # Strip comments
     content_clean = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
@@ -112,12 +103,13 @@ def analyze_proto_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, 
         summary_parts.append(f"Services: {', '.join(svc_names)}")
     module_summary = '\n'.join(summary_parts)
 
-    module_uuid = ctx._create_or_update_module(
+    module = ModuleDescriptor(
         path=relative_path, language="Proto", loc=loc, complexity=1.0,
         last_modified=datetime.fromtimestamp(file_path.stat().st_mtime, tz=timezone.utc),
         file_hash=file_hash, imports=imports, module_summary=module_summary,
     )
-    stats['modules'] = 1
+    entities: List[CodeEntity] = []
+    stats: Dict[str, int] = {'modules': 1, 'classes': 0, 'apis': 0}
 
     # Now insert message classes with proper module UUID
     for m in msg_pattern.finditer(content_clean):
@@ -126,16 +118,15 @@ def analyze_proto_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, 
         end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 30)
         class_body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
         signature = f"message {mname}"
-        embedding = ctx.generate_embedding(f"Proto message: {mname}\n{class_body[:400]}")
-        ctx.store_entity(CodeEntity(
+        embedding = helpers.generate_embedding(f"Proto message: {mname}\n{class_body[:400]}")
+        entities.append(CodeEntity(
             kind=KIND_CLASS, file_path_rel=relative_path,
             name=mname, full_name=f"{pkg}.{mname}",
             body=class_body, signature=signature, doc="",
             start_line=start_line, end_line=end_line,
-            project=ctx.project_name,
+            project=helpers.project_name,
             extras={"methods": []},
-            references={"module": module_uuid},
-            vector=ctx._shape_for_insert(embedding) if embedding else None,
+            vector=helpers.shape_for_insert(embedding) if embedding else None,
         ))
         stats['classes'] += 1
 
@@ -146,17 +137,28 @@ def analyze_proto_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, 
             f"gRPC {entry['service']}.{entry['method']} "
             f"({entry['input']}) → ({entry['output']}) [{pkg}]"
         )
-        embedding = ctx.generate_embedding(api_desc)
-        ctx.store_entity(CodeEntity(
+        embedding = helpers.generate_embedding(api_desc)
+        entities.append(CodeEntity(
             kind=KIND_API, file_path_rel=relative_path,
             extras={
                 "endpoint": endpoint, "method": "gRPC",
                 "api_description": api_desc,
                 "parameters": [entry['input']], "returns": entry['output'],
-                "project": ctx.project_name, "proxy_target": "",
+                "project": helpers.project_name, "proxy_target": "",
             },
-            vector=ctx._shape_for_insert(embedding) if embedding else None,
+            vector=helpers.shape_for_insert(embedding) if embedding else None,
         ))
         stats['apis'] += 1
 
-    return stats
+    return FileExtraction(
+        module=module, entities=entities, interactions=[],
+        imports=[], stats=stats,
+    )
+
+
+def analyze_proto_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, int]:
+    """Thin shim: skip gates analyzer-side, then extract -> write."""
+    return run_pure_extractor(
+        ctx, file_path, repo_root, extract_proto_file,
+        {'modules': 0, 'classes': 0, 'apis': 0},
+    )

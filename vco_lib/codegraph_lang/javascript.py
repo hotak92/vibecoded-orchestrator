@@ -23,14 +23,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from vco_lib.codegraph_entities import (
     CodeEntity,
+    FileExtraction,
+    InteractionGroup,
     KIND_API,
     KIND_CLASS,
     KIND_FUNCTION,
+    ModuleDescriptor,
 )
 from vco_lib.codegraph_lang._shared import (
     _extract_balanced_block,
     _extract_external_calls,
-    _is_minified_content,
+    run_pure_extractor,
 )
 
 
@@ -264,35 +267,20 @@ def _js_methods_for_class(
     return methods
 
 
-def analyze_js_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, int]:
-    """Analyze a JavaScript/TypeScript file using regex-based parsing.
+def extract_js_file(
+    source_text: str, file_path: Path, repo_root: Path, helpers: Any,
+) -> FileExtraction:
+    """Pure producer: parse a JS/TS file, RETURN a :class:`FileExtraction`.
 
     Extracts imports, functions, classes, Fastify route definitions, and
     external HTTP calls (fetch). Handles both .js/.mjs and .ts/.tsx files.
     """
-    stats = {'modules': 0, 'classes': 0, 'functions': 0, 'apis': 0}
-
-    content = file_path.read_text(encoding='utf-8', errors='ignore')
-    # CG-5 (v0.2.75 P3d): skip machine-minified content at walk time (skip +
-    # log; NEVER delete existing rows — the orphan-clear owns deletion). One
-    # home: _is_minified_content. A genuine long-line first-party file simply
-    # isn't re-indexed this run.
-    if _is_minified_content(content):
-        try:
-            _rel_min = file_path.relative_to(repo_root).as_posix()
-        except Exception:  # noqa: BLE001
-            _rel_min = str(file_path)
-        print(f"⏭️  Skipping {_rel_min} (looks minified/generated)")
-        return {'modules': 0, 'classes': 0, 'functions': 0}
+    content = source_text
     source_lines = content.split('\n')
     loc = len([l for l in source_lines
                if l.strip() and not l.strip().startswith('//') and not l.strip().startswith('*')])
     file_hash = hashlib.sha256(content.encode()).hexdigest()
     relative_path = file_path.relative_to(repo_root).as_posix()
-
-    if ctx._get_existing_module(relative_path, file_hash):
-        print(f"⏭️  Skipping {relative_path} (unchanged)")
-        return stats
 
     # Determine language label from extension
     suffix = file_path.suffix.lower()
@@ -427,12 +415,13 @@ def analyze_js_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, int
                                for kw in ['if (', 'if(', 'else if', '? ', 'while (', 'while(',
                                           'for (', 'for(', 'switch (', 'switch(', 'catch (', 'catch(']))
 
-    module_uuid = ctx._create_or_update_module(
+    module = ModuleDescriptor(
         path=relative_path, language=language, loc=loc, complexity=complexity,
         last_modified=datetime.fromtimestamp(file_path.stat().st_mtime, tz=timezone.utc),
         file_hash=file_hash, imports=imports, module_summary=module_summary,
     )
-    stats['modules'] = 1
+    entities: List[CodeEntity] = []
+    stats: Dict[str, int] = {'modules': 1, 'classes': 0, 'functions': 0, 'apis': 0}
 
     # --- Store classes ---
     for cname, (start_line, base_class) in class_info.items():
@@ -456,7 +445,7 @@ def analyze_js_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, int
             signature += f" extends {base_class}"
 
 
-        ctx.store_entity(CodeEntity(
+        entities.append(CodeEntity(
             kind=KIND_CLASS, file_path_rel=relative_path,
             name=cname,
             full_name=f"{file_path.stem}.{cname}",
@@ -465,10 +454,12 @@ def analyze_js_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, int
             doc="",
             start_line=start_line,
             end_line=start_line + len(class_lines),
-            project=ctx.project_name,
+            project=helpers.project_name,
             extras={"methods": methods[:20]},
-            references={"module": module_uuid},
-            deferred_embed=lambda: ctx.embed_class(signature, class_body, methods=methods[:10], language="javascript"),
+            deferred_embed=(
+                lambda sig=signature, cb=class_body, mth=methods:
+                helpers.embed_class(sig, cb, methods=mth[:10], language="javascript")
+            ),
         ))
         stats['classes'] += 1
 
@@ -479,7 +470,7 @@ def analyze_js_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, int
         full_name = f"{file_path.stem}.{fname}"
         signature = f"{'async ' if is_async else ''}function {fname}()"
 
-        ctx.store_entity(CodeEntity(
+        entities.append(CodeEntity(
             kind=KIND_FUNCTION, file_path_rel=relative_path,
             name=fname,
             full_name=full_name,
@@ -489,9 +480,11 @@ def analyze_js_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, int
             start_line=start_line,
             end_line=end_line,
             is_async=is_async,
-            project=ctx.project_name,
-            references={"module": module_uuid},
-            deferred_embed=lambda: ctx.embed_function(signature, body, language="javascript"),
+            project=helpers.project_name,
+            deferred_embed=(
+                lambda sig=signature, fb=body:
+                helpers.embed_function(sig, fb, language="javascript")
+            ),
         ))
         stats['functions'] += 1
 
@@ -517,9 +510,9 @@ def analyze_js_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, int
         if proxy_target:
             description += f" [proxies to {proxy_target}]"
 
-        embedding = ctx.generate_embedding(description)
+        embedding = helpers.generate_embedding(description)
 
-        ctx.store_entity(CodeEntity(
+        entities.append(CodeEntity(
             kind=KIND_API, file_path_rel=relative_path,
             extras={
                 "endpoint": route['url'],
@@ -527,16 +520,28 @@ def analyze_js_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, int
                 "api_description": description,
                 "parameters": [],
                 "returns": "",
-                "project": ctx.project_name,
+                "project": helpers.project_name,
                 "proxy_target": proxy_target or "",
             },
-            vector=ctx._shape_for_insert(embedding) if embedding else None,
+            vector=helpers.shape_for_insert(embedding) if embedding else None,
         ))
         stats['apis'] += 1
 
-    # Cross-language interactions
+    # Cross-language interactions (writer replays with the module UUID).
+    interactions: List[InteractionGroup] = []
     ix = _extract_external_calls(content_clean, imports, language, relative_path)
     if ix:
-        stats['interactions'] = ctx._store_interactions(ix, language, module_uuid, file_path_rel=relative_path)
+        interactions.append(InteractionGroup(interactions=ix, language=language))
 
-    return stats
+    return FileExtraction(
+        module=module, entities=entities, interactions=interactions,
+        imports=[], stats=stats,
+    )
+
+
+def analyze_js_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, int]:
+    """Thin shim: skip gates analyzer-side, then extract -> write."""
+    return run_pure_extractor(
+        ctx, file_path, repo_root, extract_js_file,
+        {'modules': 0, 'classes': 0, 'functions': 0, 'apis': 0},
+    )

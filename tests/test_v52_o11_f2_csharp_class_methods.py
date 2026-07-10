@@ -475,15 +475,21 @@ def test_no_unconditional_method_finditer_in_csharp_class_loop() -> None:
     (the embed anchor gained the mechanical ``ctx.`` prefix in the move;
     the loop boundary indent went 8 -> 4 after the method ->
     free-function dedent; assertions unchanged).
+
+    P2f stage 3 (v0.2.77 Part 6): the C# extractor became a pure producer
+    (``extract_csharp_file``); the embed seam is now reached via the narrow
+    ``helpers`` protocol and the closure binds sig/body/methods as default
+    args, so the anchor is the ``helpers.embed_class(..., language="csharp")``
+    call. The guard (no whole-file ``method_pattern.finditer``) is unchanged.
     """
     src = Path(acg.__file__).read_text()
 
     # Locate the C#-specific class loop. The signature line
     # ``signature = f"class {cname}"`` is shared with several languages
     # (Java, JS/TS), so we anchor on a more specific marker: the
-    # ``ctx.embed_class(..., language="csharp")`` call that follows the
+    # ``helpers.embed_class(..., language="csharp")`` call that follows the
     # methods extraction inside the C# loop body.
-    csharp_anchor = 'ctx.embed_class(signature, class_body, methods=methods[:10], language="csharp")'
+    csharp_anchor = 'helpers.embed_class(sig, cb, methods=mth[:10], language="csharp")'
     anchor_pos = src.find(csharp_anchor)
     assert anchor_pos >= 0, (
         f"Could not locate C# class-loop anchor in codegraph_lang/csharp.py — "
