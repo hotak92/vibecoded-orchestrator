@@ -178,57 +178,19 @@ pub(crate) fn _test_clear_cache() {
 
 // ─── Python shell-out ────────────────────────────────────────────────────
 
-/// Resolve the python interpreter that can `import vco_lib`. Mirrors
-/// `kg_summary::resolve_venv_python`'s walk (POSIX `.venv/bin/python(3)`
-/// + Windows `.venv/Scripts/python.exe`) but uses the launcher binary's
-/// own location as the seed instead of a project folder. Returns
-/// `Some(path)` on first hit, `None` if no venv reachable. Falls back to
-/// `python3` / `python` on PATH only as last resort — the catalog command
-/// is a no-op (degraded UX, not crash) when no python is available.
+/// Resolve the python interpreter that can `import vco_lib`.
+///
+/// v0.2.77: delegates to the shared RT-4 ladder in
+/// `vct_launcher_core::python_resolve` (the "one home" for interpreter
+/// discovery). The prior inline copy walked only `current_exe()` + PATH;
+/// the shared ladder additionally honours `$VCT_VENV` and
+/// `$VCT_INSTALL_ROOT` first, so the catalog command finds the healthy
+/// orchestrator venv even when the launcher binary lives elsewhere. Still
+/// never returns `None` (PATH fallback), so the catalog command remains a
+/// no-op-on-missing-python (degraded UX, not crash).
+#[inline]
 fn resolve_python_for_vco_lib() -> Option<PathBuf> {
-    // Helper closure: try each known venv layout under `root`.
-    let venv_in = |root: &std::path::Path| -> Option<PathBuf> {
-        for layout in [
-            root.join(".venv"),
-            root.join("claude_mcp_servers").join(".venv"),
-        ] {
-            for candidate in [
-                layout.join("bin").join("python"),
-                layout.join("bin").join("python3"),
-                layout.join("Scripts").join("python.exe"),
-            ] {
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
-        }
-        None
-    };
-
-    // Walk up from current_exe — same pattern as `resolve_venv_python` in
-    // kg_summary.rs and codegraph.rs.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let mut cur = parent.to_path_buf();
-            for _ in 0..8 {
-                if let Some(py) = venv_in(&cur) {
-                    return Some(py);
-                }
-                if !cur.pop() {
-                    break;
-                }
-            }
-        }
-    }
-    // Last-resort PATH fallback: `python3` then `python`. Tauri's
-    // `tokio::process::Command::new("python3")` resolves via PATH on
-    // POSIX; the same lookup happens on Windows with `python.exe` (which
-    // a typical user has from a system Python install).
-    Some(PathBuf::from(if cfg!(target_os = "windows") {
-        "python.exe"
-    } else {
-        "python3"
-    }))
+    vct_launcher_core::python_resolve::resolve_python_for_vco_lib()
 }
 
 /// Spawn `python -m vco_lib.embedding_service discover` and parse JSON.

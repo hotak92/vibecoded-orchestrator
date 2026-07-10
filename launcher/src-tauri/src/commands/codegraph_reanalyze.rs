@@ -105,49 +105,20 @@ pub struct ReanalysisReport {
     pub prune_stale: bool,
 }
 
-// ─── Python interpreter discovery (mirrors embedding_enrichment.rs) ──────
+// ─── Python interpreter discovery ────────────────────────────────────────
 
 /// Resolve a python interpreter capable of running analyze_code_graph.py.
-/// Walks up from the launcher binary location looking for an installed
-/// venv. Mirrors the equivalent helper in embedding_enrichment.rs; kept
-/// inline rather than shared because the commands evolve independently.
+///
+/// v0.2.77: delegates to the shared RT-4 ladder in
+/// `vct_launcher_core::python_resolve`. The prior inline copy was exe-walk
+/// ONLY — it lacked the `$VCT_VENV` and `$VCT_INSTALL_ROOT` tiers, so a
+/// project without its own `.venv` fell straight to a PATH `python3` that
+/// can't `import weaviate`, breaking codegraph re-analysis. Sharing the
+/// full ladder fixes that gap for free. Thin shim kept so the single
+/// call-site below doesn't churn.
+#[inline]
 fn resolve_python_for_analyzer() -> Option<PathBuf> {
-    let venv_in = |root: &std::path::Path| -> Option<PathBuf> {
-        for layout in [
-            root.join(".venv"),
-            root.join("claude_mcp_servers").join(".venv"),
-        ] {
-            for candidate in [
-                layout.join("bin").join("python"),
-                layout.join("bin").join("python3"),
-                layout.join("Scripts").join("python.exe"),
-            ] {
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
-        }
-        None
-    };
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let mut cur = parent.to_path_buf();
-            for _ in 0..8 {
-                if let Some(py) = venv_in(&cur) {
-                    return Some(py);
-                }
-                if !cur.pop() {
-                    break;
-                }
-            }
-        }
-    }
-    Some(PathBuf::from(if cfg!(target_os = "windows") {
-        "python.exe"
-    } else {
-        "python3"
-    }))
+    vct_launcher_core::python_resolve::resolve_python_for_vco_lib()
 }
 
 /// Resolve the analyze_code_graph.py script. Strategy mirrors

@@ -3251,72 +3251,15 @@ fn apply_project_env_via_python(
 /// defensively in case PATH lookup is also unavailable in some
 /// embedded environment.
 ///
-/// Naming: the `_local` suffix differentiates from the same-name
-/// helper in `embedding_catalog.rs` / `embedding_enrichment.rs`. A
-/// future refactor will hoist this to a shared module (e.g.
-/// `crate::commands::python_resolver`); kept inline here for the
-/// Phase 0.B Part 2 migration's minimal-diff discipline.
+/// Naming: the `_local` suffix historically differentiated this from the
+/// same-name helpers in `embedding_catalog.rs` / `embedding_enrichment.rs` /
+/// `codegraph_reanalyze.rs`. v0.2.77 hoisted the canonical ladder into
+/// `vct_launcher_core::python_resolve` (the "one home" for the RT-4 ladder);
+/// this is now a thin delegating shim kept only to avoid churning the many
+/// call-sites in this file.
+#[inline]
 fn resolve_python_for_vco_lib_local() -> Option<PathBuf> {
-    let venv_in = |root: &Path| -> Option<PathBuf> {
-        for layout in [
-            root.join(".venv"),
-            root.join("claude_mcp_servers").join(".venv"),
-        ] {
-            for candidate in [
-                layout.join("bin").join("python"),
-                layout.join("bin").join("python3"),
-                layout.join("Scripts").join("python.exe"),
-            ] {
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
-        }
-        None
-    };
-
-    // 1. $VCT_VENV — explicit override.
-    if let Ok(v) = std::env::var("VCT_VENV") {
-        let base = Path::new(&v);
-        for candidate in [
-            base.join("bin").join("python"),
-            base.join("bin").join("python3"),
-            base.join("Scripts").join("python.exe"),
-        ] {
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    // 2 + 3. $VCT_INSTALL_ROOT — orchestrator clone root.
-    if let Ok(root) = std::env::var("VCT_INSTALL_ROOT") {
-        if let Some(p) = venv_in(Path::new(&root)) {
-            return Some(p);
-        }
-    }
-
-    // 4. Walk up from current_exe — covers launcher-binary runs.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let mut cur = parent.to_path_buf();
-            for _ in 0..8 {
-                if let Some(p) = venv_in(&cur) {
-                    return Some(p);
-                }
-                if !cur.pop() {
-                    break;
-                }
-            }
-        }
-    }
-
-    // 5. PATH fallback.
-    Some(PathBuf::from(if cfg!(target_os = "windows") {
-        "python.exe"
-    } else {
-        "python3"
-    }))
+    vct_launcher_core::python_resolve::resolve_python_for_vco_lib()
 }
 
 /// Bug 23 + 30: write per-project env files for every Claude Code surface.

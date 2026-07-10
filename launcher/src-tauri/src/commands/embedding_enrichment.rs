@@ -119,48 +119,16 @@ struct PreflightError {
 
 // ─── Python interpreter discovery (mirrors embedding_catalog.rs) ─────────
 
-/// Resolve a python interpreter capable of `import vco_lib`. Same walk-up
-/// strategy as `embedding_catalog::resolve_python_for_vco_lib` — kept
-/// inline rather than shared because the two commands evolve
-/// independently (a future re-org would split this into a small shared
-/// helper module).
+/// Resolve a python interpreter capable of `import vco_lib`.
+///
+/// v0.2.77: delegates to the shared RT-4 ladder in
+/// `vct_launcher_core::python_resolve` (the "one home" for interpreter
+/// discovery), which was previously mirrored here as an exe-walk-only copy.
+/// The shared ladder additionally honours `$VCT_VENV` and
+/// `$VCT_INSTALL_ROOT` ahead of the exe-walk.
+#[inline]
 fn resolve_python_for_vco_lib() -> Option<PathBuf> {
-    let venv_in = |root: &std::path::Path| -> Option<PathBuf> {
-        for layout in [
-            root.join(".venv"),
-            root.join("claude_mcp_servers").join(".venv"),
-        ] {
-            for candidate in [
-                layout.join("bin").join("python"),
-                layout.join("bin").join("python3"),
-                layout.join("Scripts").join("python.exe"),
-            ] {
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
-        }
-        None
-    };
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let mut cur = parent.to_path_buf();
-            for _ in 0..8 {
-                if let Some(py) = venv_in(&cur) {
-                    return Some(py);
-                }
-                if !cur.pop() {
-                    break;
-                }
-            }
-        }
-    }
-    Some(PathBuf::from(if cfg!(target_os = "windows") {
-        "python.exe"
-    } else {
-        "python3"
-    }))
+    vct_launcher_core::python_resolve::resolve_python_for_vco_lib()
 }
 
 // ─── Tauri command ───────────────────────────────────────────────────────
