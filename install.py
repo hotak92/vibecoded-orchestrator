@@ -137,10 +137,15 @@ if str(PROJECT_ROOT) not in sys.path:
 # Moved to vco_lib.project_init in PR 2 — kept as shim for existing
 # callers; will be removed in PR 9 (cleanup).
 from vco_lib import bundled_versions as _bundled_versions  # noqa: E402
+from vco_lib import launcher_db_writer as _launcher_db_writer  # noqa: E402
 from vco_lib import project_init as _project_init  # noqa: E402
 from vco_lib import weaviate_helpers as _wh  # noqa: E402
 from vco_lib import secrets_audit as _secrets_audit  # noqa: E402
-from vco_lib.deferral_report import DeferralEntry, DeferralReport  # noqa: E402
+from vco_lib.deferral_report import (  # noqa: E402
+    DeferralEntry,
+    DeferralReport,
+    safe_emit_entry as _safe_emit_deferral,
+)
 from vco_lib.install_deferral_flow import InstallDeferralFlow  # noqa: E402
 from vco_lib.install_update_gate import InstallUpdateGate  # noqa: E402
 
@@ -10491,41 +10496,17 @@ def _read_app_state_key(key: str) -> "str | None":
     Returns the string value, or None when the key is absent or any error
     occurs (soft-fail: callers use None as "unknown / first run").
 
-    v0.2.53 DEDUP-4 / CORRECT-2: uses sqlite3 URI form
-    ``file:<path>?mode=ro&immutable=1`` (the same readonly pattern
-    used by :func:`vco_lib.launcher_db_reader._open_db_readonly`).
-    The ro+immutable URI does NOT acquire a writer lock and never
-    blocks regardless of what the launcher is doing.
-
-    Pre-v0.2.53 this site used ``sqlite3.connect(timeout=5.0)`` which
-    could block install.py for up to 5s on Windows when the launcher
-    held a write lock — a perceived install-hang during the most
-    performance-critical step.
-
-    NOTE: we DO NOT route through ``launcher_db_reader.read_app_state_value``
-    because that helper internally calls its own DB-path discovery
-    (``VCT_LAUNCHER_DB_PATH`` env override → ``vct_root_dir() / launcher.db``).
-    install.py needs to use its own ``_discover_app_state_db_path``
-    so existing test mocks (which patch the install.py-local discoverer)
-    continue to work. The cross-helper unification is a v0.2.54
-    refactor; the readonly URI pattern below closes CORRECT-2 today.
+    v0.2.77 Part 7a cluster D: the canonical readonly-URI implementation now
+    lives in :func:`vco_lib.launcher_db_writer.read_app_state_key` (its own
+    module so the read-only ``launcher_db_reader`` never reaches a writer).
+    This wrapper stays name-stable — it threads install.py's own
+    ``_discover_app_state_db_path`` (which many tests patch) into the shared
+    helper, and remains a patchable module attribute in its own right
+    (``mock.patch.object(install, "_read_app_state_key", ...)`` still works).
     """
-    import sqlite3
-    db_path = _discover_app_state_db_path()
-    if not db_path.is_file():
-        return None
-    try:
-        uri = f"file:{db_path}?mode=ro&immutable=1"
-        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
-        try:
-            row = conn.execute(
-                "SELECT value FROM app_state WHERE key = ?", (key,)
-            ).fetchone()
-            return row[0] if row else None
-        finally:
-            conn.close()
-    except Exception:
-        return None
+    return _launcher_db_writer.read_app_state_key(
+        _discover_app_state_db_path(), key
+    )
 
 
 def _model_id_for_active(active: str) -> str:
@@ -10898,26 +10879,15 @@ def _write_app_state_key(key: str, value: str) -> None:
 
     Soft-fail: any sqlite error is silently swallowed (callers use this
     for telemetry / cache; a missed write just means the next run re-scans).
+
+    v0.2.77 Part 7a cluster D: canonical upsert lives in
+    :func:`vco_lib.launcher_db_writer.write_app_state_key`; this wrapper stays
+    name-stable (threads ``_discover_app_state_db_path`` in; remains patchable
+    by the tests that do ``monkeypatch.setattr(install, "_write_app_state_key", ...)``).
     """
-    import sqlite3
-    db_path = _discover_app_state_db_path()
-    if not db_path.is_file():
-        return
-    try:
-        now_ms = int(time.time() * 1000)
-        conn = sqlite3.connect(str(db_path), timeout=5.0)
-        try:
-            conn.execute(
-                "INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
-                "updated_at = excluded.updated_at",
-                (key, value, now_ms),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-    except Exception:
-        pass
+    _launcher_db_writer.write_app_state_key(
+        _discover_app_state_db_path(), key, value
+    )
 
 
 def _converge_orchestrator_root_kg_pointer(canonical: str) -> None:
@@ -14045,53 +14015,52 @@ def _emit_dual_ollama_deferral(
         return
 
     alt, canon = result
-    try:
-        deferral_report.add_entry(
-            DeferralEntry(
-                condition_id="dual_ollama_detected",
-                title=(
-                    f"Two Ollama instances reachable "
-                    f"(:{alt} + :{canon})"
-                ),
-                detected=(
-                    f"Both `http://localhost:{alt}` (default Ollama "
-                    f"port) and `http://localhost:{canon}` "
-                    f"(launcher-managed Ollama container) responded to "
-                    f"`/api/tags`.  These are two independent daemons "
-                    f"with separate model caches — a model pulled into "
-                    f"one is NOT visible from the other."
-                ),
-                why_deferred=(
-                    "Cannot auto-resolve: we don't know which instance "
-                    "the user intends as canonical.  Stopping the "
-                    "user's personal Ollama daemon would risk breaking "
-                    "their other tooling; stopping the launcher's "
-                    "container would break VCO.  The user must choose "
-                    "and reconcile."
-                ),
-                command_to_apply=(
-                    f"# VCO uses :{canon} (the launcher-managed "
-                    f"container) as canonical.\n"
-                    f"# If you want VCO to use your personal Ollama "
-                    f"instead, set OLLAMA_PORT={alt} in .claude/env and "
-                    f"re-run install.\n"
-                    f"# If you want to stop the personal instance:\n"
-                    f"#   systemctl --user stop ollama   # Linux\n"
-                    f"#   killall ollama                 # macOS / generic\n"
-                    f"# Then re-run install.py --update to reseed."
-                ),
-                severity="info",
-                kg_node_refs=[],
-            )
-        )
+    # v0.2.77 Part 7a cluster F: guard + try/except/soft-fail via the shared
+    # factory; on success we still emit the info success-log below.
+    emitted = _safe_emit_deferral(
+        deferral_report,
+        condition_id="dual_ollama_detected",
+        title=(
+            f"Two Ollama instances reachable "
+            f"(:{alt} + :{canon})"
+        ),
+        detected=(
+            f"Both `http://localhost:{alt}` (default Ollama "
+            f"port) and `http://localhost:{canon}` "
+            f"(launcher-managed Ollama container) responded to "
+            f"`/api/tags`.  These are two independent daemons "
+            f"with separate model caches — a model pulled into "
+            f"one is NOT visible from the other."
+        ),
+        why_deferred=(
+            "Cannot auto-resolve: we don't know which instance "
+            "the user intends as canonical.  Stopping the "
+            "user's personal Ollama daemon would risk breaking "
+            "their other tooling; stopping the launcher's "
+            "container would break VCO.  The user must choose "
+            "and reconcile."
+        ),
+        command_to_apply=(
+            f"# VCO uses :{canon} (the launcher-managed "
+            f"container) as canonical.\n"
+            f"# If you want VCO to use your personal Ollama "
+            f"instead, set OLLAMA_PORT={alt} in .claude/env and "
+            f"re-run install.\n"
+            f"# If you want to stop the personal instance:\n"
+            f"#   systemctl --user stop ollama   # Linux\n"
+            f"#   killall ollama                 # macOS / generic\n"
+            f"# Then re-run install.py --update to reseed."
+        ),
+        severity="info",
+        log_event=_log_install_event,
+        log_step="7/10",
+    )
+    if emitted:
         _log_install_event(
             "7/10", "info",
             f"Bug J: dual-Ollama detected (:{alt} + :{canon}); "
             f"deferral emitted",
         )
-    except Exception:
-        # Defensive: never let a deferral emit failure block install.
-        return
 
 
 # ---------------------------------------------------------------------------
@@ -19717,35 +19686,32 @@ def _emit_launcher_restart_deferral(
     version_label = new_version or _read_install_version(install_root) or "(version unknown)"
     pid_suffix = f" (running launcher PID: {old_pid})" if old_pid else ""
 
-    try:
-        entry = DeferralEntry(
-            condition_id="launcher_restart_required",
-            title=f"Launcher binary updated to {version_label}",
-            detected=(
-                f"A freshly-built launcher binary was swapped into "
-                f"`{new_binary_path}`{pid_suffix}. The currently-running "
-                f"launcher process is still executing the old code in memory."
-            ),
-            why_deferred=(
-                "install.py cannot safely restart a GUI process it didn't "
-                "spawn. The launcher reads this entry on startup and renders "
-                "a green sticky banner with a `Restart now` button that "
-                "detach-spawns the new binary and exits the current process."
-            ),
-            command_to_apply=(
-                "# Manually: fully quit the launcher (tray → Quit), then\n"
-                f"# relaunch via your usual entrypoint (the new binary at\n"
-                f"# {new_binary_path} will execute on next start)."
-            ),
-            severity="info",
-            kg_node_refs=[],
-        )
-        deferral_report.add_entry(entry)
-    except Exception as exc:  # noqa: BLE001 — soft-fail by design
-        _log_install_event(
-            "refresh_dist_binary", "warn",
-            f"could not emit launcher_restart_required deferral: {exc}",
-        )
+    # v0.2.77 Part 7a cluster F: guard + try/except/soft-fail wrapper lives in
+    # the shared factory; this emitter is now data-only.
+    _safe_emit_deferral(
+        deferral_report,
+        condition_id="launcher_restart_required",
+        title=f"Launcher binary updated to {version_label}",
+        detected=(
+            f"A freshly-built launcher binary was swapped into "
+            f"`{new_binary_path}`{pid_suffix}. The currently-running "
+            f"launcher process is still executing the old code in memory."
+        ),
+        why_deferred=(
+            "install.py cannot safely restart a GUI process it didn't "
+            "spawn. The launcher reads this entry on startup and renders "
+            "a green sticky banner with a `Restart now` button that "
+            "detach-spawns the new binary and exits the current process."
+        ),
+        command_to_apply=(
+            "# Manually: fully quit the launcher (tray → Quit), then\n"
+            f"# relaunch via your usual entrypoint (the new binary at\n"
+            f"# {new_binary_path} will execute on next start)."
+        ),
+        severity="info",
+        log_event=_log_install_event,
+        log_step="refresh_dist_binary",
+    )
 
 
 def _emit_binary_swap_locked_deferral(
@@ -19764,39 +19730,33 @@ def _emit_binary_swap_locked_deferral(
     binary-refresh step failed); MCP registration and bundle propagation
     still landed.
     """
-    if deferral_report is None:
-        return
-    try:
-        entry = DeferralEntry(
-            condition_id="launcher_binary_swap_failed_locked",
-            title="Launcher binary update blocked (file locked)",
-            detected=(
-                f"Windows refused to overwrite the launcher binary at "
-                f"`{new_binary_path}` because it is held open by the "
-                f"running launcher process (ERROR_SHARING_VIOLATION). "
-                f"Detail: {error_detail}"
-            ),
-            why_deferred=(
-                "Windows holds an exclusive lock on running .exe files. "
-                "Neither direct overwrite nor rename-then-write succeeded. "
-                "Manual intervention required: fully quit the launcher "
-                "first."
-            ),
-            command_to_apply=(
-                "# 1. Fully quit the launcher (tray → Quit, NOT just close window)\n"
-                "# 2. From a terminal, re-run the orchestrator update:\n"
-                "python install.py --update\n"
-                "# 3. Relaunch the launcher via its usual entrypoint."
-            ),
-            severity="warning",
-            kg_node_refs=[],
-        )
-        deferral_report.add_entry(entry)
-    except Exception as exc:  # noqa: BLE001 — soft-fail by design
-        _log_install_event(
-            "refresh_dist_binary", "warn",
-            f"could not emit launcher_binary_swap_failed_locked deferral: {exc}",
-        )
+    # v0.2.77 Part 7a cluster F: data-only via the shared factory.
+    _safe_emit_deferral(
+        deferral_report,
+        condition_id="launcher_binary_swap_failed_locked",
+        title="Launcher binary update blocked (file locked)",
+        detected=(
+            f"Windows refused to overwrite the launcher binary at "
+            f"`{new_binary_path}` because it is held open by the "
+            f"running launcher process (ERROR_SHARING_VIOLATION). "
+            f"Detail: {error_detail}"
+        ),
+        why_deferred=(
+            "Windows holds an exclusive lock on running .exe files. "
+            "Neither direct overwrite nor rename-then-write succeeded. "
+            "Manual intervention required: fully quit the launcher "
+            "first."
+        ),
+        command_to_apply=(
+            "# 1. Fully quit the launcher (tray → Quit, NOT just close window)\n"
+            "# 2. From a terminal, re-run the orchestrator update:\n"
+            "python install.py --update\n"
+            "# 3. Relaunch the launcher via its usual entrypoint."
+        ),
+        severity="warning",
+        log_event=_log_install_event,
+        log_step="refresh_dist_binary",
+    )
 
 
 def _emit_update_resume_required_deferral(
@@ -19856,55 +19816,52 @@ def _emit_update_resume_required_deferral(
     iv = installed_version or "(unknown)"
     op_phrase = "merge" if operation == "merge" else "rebase"
 
-    try:
-        entry = DeferralEntry(
-            condition_id="update_resume_required",
-            title="Orchestrator update halted at a conflict — resume needed",
-            detected=(
-                f"A previous `update_orchestrator` ({op_phrase} on "
-                f"`{branch}`) was halted at a conflict, the conflict was "
-                f"resolved outside the launcher (CLI `git add` + "
-                f"`git commit`), but `install.py --update` and the binary "
-                f"refresh never ran. Source on disk is v{sv}; last "
-                f"install ran v{iv}. The launcher binary may also be "
-                f"stale relative to the merged source.\n\n"
-                f"Sentinel: `.claude/state/orchestrator-update-resume-needed.json` "
-                f"in `{install_root}`."
-            ),
-            why_deferred=(
-                "install.py cannot detect this state proactively at "
-                "session start — the sentinel is launcher state, not "
-                "install state. The user must either click `Continue "
-                "Update` in the launcher's MenuBar UpdateBadge (which "
-                "runs `resume_orchestrator_update` → install.py --update "
-                "+ binary refresh + auto-restart) OR run `python "
-                "install.py --update` manually from a terminal to finish "
-                "the install. Either path bumps `last_installed_version` "
-                "to match `source_version` and clears this deferral."
-            ),
-            command_to_apply=(
-                "# Option A (recommended): open the launcher, click the\n"
-                "# Continue Update button in the top-right MenuBar badge.\n"
-                "# This re-runs install.py + refreshes the binary + restarts.\n"
-                "#\n"
-                "# Option B (terminal): from the orchestrator install root,\n"
-                f"cd {install_root}\n"
-                "python install.py --update\n"
-                "# After install.py finishes, restart the launcher manually\n"
-                "# (tray → Quit, then relaunch via your usual entrypoint) so\n"
-                "# the freshly-built binary loads."
-            ),
-            severity="warning",
-            kg_node_refs=[
-                "knowledge/concepts/update-resume-required-bug-a-v0251.md",
-            ],
-        )
-        deferral_report.add_entry(entry)
-    except Exception as exc:  # noqa: BLE001 — soft-fail by design
-        _log_install_event(
-            "update_resume_required", "warn",
-            f"could not emit update_resume_required deferral: {exc}",
-        )
+    # v0.2.77 Part 7a cluster F: data-only via the shared factory.
+    _safe_emit_deferral(
+        deferral_report,
+        condition_id="update_resume_required",
+        title="Orchestrator update halted at a conflict — resume needed",
+        detected=(
+            f"A previous `update_orchestrator` ({op_phrase} on "
+            f"`{branch}`) was halted at a conflict, the conflict was "
+            f"resolved outside the launcher (CLI `git add` + "
+            f"`git commit`), but `install.py --update` and the binary "
+            f"refresh never ran. Source on disk is v{sv}; last "
+            f"install ran v{iv}. The launcher binary may also be "
+            f"stale relative to the merged source.\n\n"
+            f"Sentinel: `.claude/state/orchestrator-update-resume-needed.json` "
+            f"in `{install_root}`."
+        ),
+        why_deferred=(
+            "install.py cannot detect this state proactively at "
+            "session start — the sentinel is launcher state, not "
+            "install state. The user must either click `Continue "
+            "Update` in the launcher's MenuBar UpdateBadge (which "
+            "runs `resume_orchestrator_update` → install.py --update "
+            "+ binary refresh + auto-restart) OR run `python "
+            "install.py --update` manually from a terminal to finish "
+            "the install. Either path bumps `last_installed_version` "
+            "to match `source_version` and clears this deferral."
+        ),
+        command_to_apply=(
+            "# Option A (recommended): open the launcher, click the\n"
+            "# Continue Update button in the top-right MenuBar badge.\n"
+            "# This re-runs install.py + refreshes the binary + restarts.\n"
+            "#\n"
+            "# Option B (terminal): from the orchestrator install root,\n"
+            f"cd {install_root}\n"
+            "python install.py --update\n"
+            "# After install.py finishes, restart the launcher manually\n"
+            "# (tray → Quit, then relaunch via your usual entrypoint) so\n"
+            "# the freshly-built binary loads."
+        ),
+        severity="warning",
+        kg_node_refs=[
+            "knowledge/concepts/update-resume-required-bug-a-v0251.md",
+        ],
+        log_event=_log_install_event,
+        log_step="update_resume_required",
+    )
 
 
 def _clear_update_resume_sentinel_after_success(install_root: Path) -> None:

@@ -34,7 +34,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Callable, List, Optional
 
 from vco_lib.atomic import atomic_write_text
 
@@ -424,6 +424,76 @@ def condition_is_owned(
     if condition_id in owned_ids:
         return True
     return any(condition_id.startswith(p) for p in owned_prefixes if p)
+
+
+def safe_emit_entry(
+    report: Any,
+    *,
+    condition_id: str,
+    title: str,
+    detected: str,
+    why_deferred: str,
+    command_to_apply: str,
+    severity: str = "warning",
+    kg_node_refs: Optional[List[str]] = None,
+    log_event: Optional[Callable[..., None]] = None,
+    log_step: str = "",
+) -> bool:
+    """Build a :class:`DeferralEntry` and add it to an in-memory report,
+    with the standard guard + soft-fail wrapper.
+
+    This is the ONE factory for the in-memory ``_emit_*_deferral`` family
+    (v0.2.77 Part 7a cluster F convergence). Every such emitter used to
+    hand-write the identical three-part boilerplate:
+
+        1. ``if report is None: return``            (no-op guard)
+        2. ``try: entry = DeferralEntry(...); report.add_entry(entry)``
+        3. ``except Exception as exc: <soft-fail log>``  (never break the caller)
+
+    Each hand-written copy was a divergence risk: a new emitter could forget
+    the None-guard, use a different log step, or drop the try/except. Routing
+    through this helper makes each per-site emitter shrink to a data-only call.
+
+    Args:
+        report: a ``DeferralReport`` (or None — no-op, returns False). Typed
+            ``Any`` so callers don't need to import DeferralReport just to
+            satisfy the annotation (install.py passes ``DeferralReport | None``).
+        condition_id..kg_node_refs: forwarded verbatim to :class:`DeferralEntry`.
+        log_event: optional ``(step, phase, detail, *, data=None)`` logger
+            (install.py passes ``_log_install_event``). Called with a ``warn``
+            phase if entry construction / add raises. Its own failures are
+            swallowed.
+        log_step: the step label passed to ``log_event`` on the soft-fail path.
+
+    Returns:
+        True when the entry was added, False on the None-guard or on a
+        swallowed exception. (Most call-sites ignore the return — it's there
+        for the rare emitter that wants to branch on "did it land".)
+    """
+    if report is None:
+        return False
+    try:
+        entry = DeferralEntry(
+            condition_id=condition_id,
+            title=title,
+            detected=detected,
+            why_deferred=why_deferred,
+            command_to_apply=command_to_apply,
+            severity=severity,
+            kg_node_refs=list(kg_node_refs) if kg_node_refs else [],
+        )
+        report.add_entry(entry)
+        return True
+    except Exception as exc:  # noqa: BLE001 — soft-fail by design
+        if log_event is not None:
+            try:
+                log_event(
+                    log_step, "warn",
+                    f"could not emit {condition_id} deferral: {exc}",
+                )
+            except Exception:
+                pass
+        return False
 
 
 # ---------------------------------------------------------------------------

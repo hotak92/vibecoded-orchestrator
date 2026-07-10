@@ -18,7 +18,6 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -82,29 +81,49 @@ def test_read_app_state_key_returns_none_for_missing_db(install_module, tmp_path
 
 
 def test_read_app_state_key_uses_readonly_uri(install_module):
-    """The migrated _read_app_state_key body uses mode=ro URI form.
+    """The readonly mode=ro URI form is used for app_state reads.
 
     Regression guard: a future edit that re-introduces the blocking
     sqlite3.connect (without uri=True + mode=ro) would re-introduce
     CORRECT-2.
+
+    v0.2.77 Part 7a cluster D: the canonical read implementation moved from
+    install.py's inline ``_read_app_state_key`` body into
+    ``vco_lib.launcher_db_writer.read_app_state_key`` (its own module so the
+    read-only ``launcher_db_reader`` never reaches a writer). This guard now
+    scans that home for the readonly-URI pattern, AND still asserts install.py
+    itself (whose ``_read_app_state_key`` is now a thin delegator) does not
+    re-introduce the legacy blocking pattern.
     """
-    src = INSTALL_PY.read_text(encoding="utf-8")
-    func_start = src.find("def _read_app_state_key(")
-    assert func_start > 0
-    func_end = src.find("\ndef ", func_start + 1)
-    body = src[func_start:func_end]
+    writer_src = (REPO_ROOT / "vco_lib" / "launcher_db_writer.py").read_text(
+        encoding="utf-8"
+    )
+    func_start = writer_src.find("def read_app_state_key(")
+    assert func_start > 0, "launcher_db_writer.read_app_state_key not found"
+    func_end = writer_src.find("\ndef ", func_start + 1)
+    body = writer_src[func_start:func_end]
     # Body MUST use mode=ro URI form (the readonly + immutable pattern).
     assert "mode=ro" in body, (
-        "_read_app_state_key must use the `file:?mode=ro&immutable=1` "
+        "read_app_state_key must use the `file:?mode=ro&immutable=1` "
         "URI form for non-blocking access (CORRECT-2)."
     )
     assert "uri=True" in body, (
         "sqlite3.connect must be called with uri=True to honor the "
         "mode=ro URI form."
     )
-    # The OLD blocking pattern (just timeout=5.0 without URI) must NOT appear.
+    # The OLD blocking pattern (just timeout=5.0 without URI) must NOT appear
+    # in the read path — neither in the canonical home nor re-introduced in
+    # install.py's delegating wrapper.
     assert "sqlite3.connect(str(db_path), timeout=5.0)" not in body, (
-        "_read_app_state_key must NOT use the legacy blocking pattern."
+        "read_app_state_key must NOT use the legacy blocking pattern."
+    )
+    install_src = INSTALL_PY.read_text(encoding="utf-8")
+    read_start = install_src.find("def _read_app_state_key(")
+    read_end = install_src.find("\ndef ", read_start + 1)
+    read_body = install_src[read_start:read_end]
+    assert "sqlite3.connect(str(db_path), timeout=5.0)" not in read_body, (
+        "install._read_app_state_key must NOT re-introduce the legacy "
+        "blocking pattern (it now delegates to launcher_db_writer)."
     )
 
 

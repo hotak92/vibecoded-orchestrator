@@ -67,7 +67,17 @@ _MAIN_SPAN_MAX = 1668
 # internals). main() did NOT grow (single call line fit the existing 1668 budget;
 # no comment block, no blank). Same "inseparable thin-shim" precedent as the
 # A-2 / R8 / 5c lines above — re-pinned to the new measured value.
-_TOTAL_LINES_MAX = 25476
+# v0.2.77 Part 7a (cluster F): -9 net. Four in-memory `_emit_*_deferral`
+# emitters (launcher_restart / binary_swap_locked / update_resume_required /
+# dual_ollama) dropped their hand-written guard + try/except/soft-fail
+# boilerplate in favour of the shared vco_lib.deferral_report.safe_emit_entry
+# factory - per-site emitters are now data-only. Cluster A+B (Weaviate helper
+# convergence) was net-0 on install.py (import cost offset by a POST-call
+# consolidation). v0.2.77 Part 7a (cluster D): -34 more. install.py's inline
+# _read_app_state_key / _write_app_state_key bodies collapsed to thin
+# delegators onto the new vco_lib.launcher_db_writer (canonical app_state
+# read/write home). Re-pinned DOWNWARD to the new measured value.
+_TOTAL_LINES_MAX = 25433
 
 
 def _measure() -> tuple:
