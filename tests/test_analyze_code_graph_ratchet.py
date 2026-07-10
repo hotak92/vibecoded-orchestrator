@@ -31,16 +31,16 @@ _ANALYZER = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 # into vco_lib/codegraph_lang/ — re-pinned DOWNWARD at every move commit so
 # the pin tracks the shrink; stage-1 pin was 11,010, v0.2.76 base was 11,055).
 #
-# P2f stage 3 (v0.2.77 Part 6) EXCEPTION — the ONE upward re-pin in this
-# ratchet's history, and a deliberate one: the pure-producer split moves the
-# WRITE/CACHE LIFECYCLE into a single analyzer-resident owner
-# (``write_file_extraction``). That method MUST live on the analyzer (it owns
-# the sinks — module upsert, store_entity, caches, interactions), so it is a
-# genuine +~110-line consolidation, NOT inline bulk. It is offset by the python
-# delegation removal (``_extract_class`` / ``_extract_function`` absorbed into
-# vco_lib/codegraph_lang/python.py) landing in the same Part; the pin is
-# re-tightened DOWNWARD to the post-python measured value at the end of Part 6.
-_ANALYZER_LINES_MAX = 7450
+# P2f stage 3 (v0.2.77 Part 6): the pure-producer split added the
+# WRITE/CACHE LIFECYCLE owner ``write_file_extraction`` (a genuine analyzer-
+# resident consolidation — it owns the sinks) and REMOVED the python
+# entity-building (``_extract_class`` / ``_extract_function`` bodies moved to
+# vco_lib/codegraph_lang/python.py as pure builders; the analyzer keeps only
+# thin write+cache shims). Net after the full Part: 7335 -> 7363 (the writer
+# outweighs the python removal by ~28 lines — the ONE small justified net
+# increase in this ratchet's history, for a consolidation that makes the write
+# lifecycle single-homed and reviewable). Re-pinned to the measured value.
+_ANALYZER_LINES_MAX = 7363
 
 
 def _measure() -> int:

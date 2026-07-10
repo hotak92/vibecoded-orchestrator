@@ -7,22 +7,34 @@ new languages / extractor features go in a ``vco_lib/codegraph_lang/<lang>.py``
 module the analyzer imports loud-fail (no inline extractors in the analyzer,
 no silent import fallbacks).
 
-Shape
------
-Each language module exposes ``analyze_<lang>_file(ctx, file_path, repo_root)
--> dict`` — a verbatim move of the former
-``CodeGraphAnalyzer._analyze_<lang>_file`` method where ``ctx`` IS the
-analyzer instance. The write path, unchanged-skip gate, caches, and the
-embedding seams are reached via ``ctx.`` (``ctx.store_entity`` /
-``ctx._create_or_update_module`` / ``ctx._get_existing_module`` /
-``ctx._store_interactions`` / ``ctx.embed_function`` …; see the analyzer's
-"module-global seams" block for the last group). The extractors write
-entities imperatively MID-WALK and return the per-file stats dict — that
-imperative write order is pinned by the golden snapshot suite
-(``tests/test_codegraph_golden.py``). Do NOT convert them to pure
-entity-producers (``-> list[CodeEntity]``) as a drive-by: that reorders the
-write/cache lifecycle and is explicitly deferred to a future stage with its
-own golden-diff review budget.
+Shape (P2f stage 3, v0.2.77 Part 6 — PURE PRODUCERS)
+----------------------------------------------------
+Each language module exposes TWO callables:
+
+* ``extract_<lang>_file(source_text, file_path, repo_root, helpers) ->
+  FileExtraction`` — the PURE PRODUCER. It reads source and RETURNS a
+  ``FileExtraction`` (module descriptor + entities in emission order +
+  interactions + imports + stats); it mutates NO analyzer state. Embedding is
+  reached via the narrow ``helpers`` protocol
+  (``vco_lib.codegraph_lang._shared.ExtractorHelpers`` — embed seams + the
+  python-only AST passthroughs), never the analyzer instance directly.
+* ``analyze_<lang>_file(ctx, file_path, repo_root) -> dict`` — the THIN SHIM
+  the dispatch table still calls (``EXTRACTORS`` maps to THIS). Via the shared
+  ``_shared.run_pure_extractor`` it runs the analyzer-side skip gates
+  (minified-content + the unchanged-file ``ctx._get_existing_module`` gate —
+  BEFORE extraction, preserving the short-circuit), then
+  ``extract_<lang>_file`` -> ``ctx.write_file_extraction`` -> stats dict.
+
+ONE writer — ``CodeGraphAnalyzer.write_file_extraction`` — owns every
+side-effect (module upsert incl. the ``data.update`` LANDMINE bypass,
+``module_imports`` cache, entity writes through
+``store_entity``/``_dedup_insert``, class/function cache capture, and
+``_store_interactions``) in the EXACT pre-Part-6 order. This is the successor
+to the v0.2.76 Part-3 CORRECTION-v2 deferral: the write/cache lifecycle is now
+single-homed and reviewable, no longer scattered as imperative ``ctx.`` calls
+across the extractors. Byte-identity of the stored output is pinned by the
+golden snapshot suite (``tests/test_codegraph_golden.py``) — any diff is a
+writer-ordering defect to FIX, never a regen.
 
 Per-language PRIVATE helpers (regexes, per-language parsers/constants) live in
 their language's module. Helpers shared ACROSS the extractors (and used by

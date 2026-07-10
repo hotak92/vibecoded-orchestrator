@@ -6273,142 +6273,56 @@ class CodeGraphAnalyzer:
 
     def _extract_class(self, node: ast.ClassDef, module_uuid: str,
                       file_path: Path, repo_root: Path, source_lines: List[str]):
-        """Extract class definition."""
+        """Extract class definition.
 
-        # Cross-OS UUID stability (v0.2.16 — bug 0.7): POSIX-normalize
-        # the repo-relative path before threading it to _dedup_insert.
-        # Windows backslashes would otherwise produce different UUIDs
-        # than the same file analyzed on Linux/macOS.
-        relative_path = file_path.relative_to(repo_root).as_posix()
+        P2f stage 3 (v0.2.77 Part 6): the entity-BUILDING moved to
+        ``vco_lib/codegraph_lang/python.py::build_python_class_entities`` (pure,
+        behind the ``helpers`` protocol). This method survives as a thin shim
+        that writes the class + its method entities through ``store_entity`` and
+        populates ``class_cache`` / ``function_cache`` — the direct-call +
+        cache-write seam ``tests/test_analyze_code_graph_v0_2_16.py`` pins. The
+        module reference is stamped here (this seam knows ``module_uuid``);
+        ``extract_python_file`` no longer routes through this method (it uses the
+        pure builder directly and the writer stamps the ref)."""
+        from vco_lib.codegraph_lang._shared import ExtractorHelpers
+        from vco_lib.codegraph_lang.python import build_python_class_entities
 
-        # Get methods
-        methods = [m.name for m in node.body if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))]
-
-        # Get docstring
-        doc = ast.get_docstring(node) or ""
-
-        # Get base classes
-        base_names = [self._get_name(base) for base in node.bases]
-
-        # Extract full class body for embedding
-        class_body = self._extract_source_code(node, source_lines)
-
-        # Get signature (class definition line only)
-        signature = f"class {node.name}"
-        if node.bases:
-            signature += f"({', '.join(base_names)})"
-
-        # Create class - smart truncation for embedding
-        # class_body is full source (includes class line + docstring + body)
-
-        # Extract SCG-style composition edges
-        field_types = self._extract_field_types(node)
-        # composes = unique class names that appear as field types
-        composes: List[str] = []
-        seen_composes: Set[str] = set()
-        for pair in field_types:
-            type_name = pair.split(':', 1)[1] if ':' in pair else ''
-            if type_name and type_name not in seen_composes:
-                seen_composes.add(type_name)
-                composes.append(type_name)
-
-        # v0.2.16 (bug 0.8): capture the return value into class_uuid so the
-        # cache entry below resolves to the canonical UUID. Pre-v0.2.16 the
-        # return was discarded and the next line referenced `class_uuid` from
-        # nowhere — NameError on every Python file containing a class (swallowed
-        # by analyze_repository's per-file try/except → invisible files_skipped).
-        class_uuid = self.store_entity(CodeEntity(
-            kind=KIND_CLASS, file_path_rel=relative_path,
-            name=node.name,
-            full_name=f"{file_path.stem}.{node.name}",
-            body=class_body,
-            signature=signature,
-            doc=doc,
-            start_line=node.lineno,
-            end_line=node.end_lineno or node.lineno,
-            project=self.project_name,
-            # field_types + composes are PYTHON-ONLY (SCG composition edges).
-            extras={"methods": methods, "field_types": field_types, "composes": composes},
-            references={"module": module_uuid},
-            deferred_embed=lambda: embed_class(signature, class_body, methods=methods, language="python"),
-        ))
-
-        self.class_cache[f"{file_path.stem}.{node.name}"] = class_uuid
-
-        # Extract methods
-        for method in node.body:
-            if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                self._extract_function(method, module_uuid, file_path, repo_root, source_lines,
-                                     parent_class=node.name)
+        helpers = ExtractorHelpers(self)
+        entities = build_python_class_entities(
+            node, file_path, repo_root, source_lines, helpers,
+        )
+        # entities[0] is the class; the rest are its methods (recursion order).
+        for entity in entities:
+            entity.references = dict(entity.references)
+            entity.references["module"] = module_uuid
+            written_uuid = self.store_entity(entity)
+            if entity.kind == KIND_CLASS and entity.full_name:
+                self.class_cache[entity.full_name] = written_uuid
+            elif entity.kind == KIND_FUNCTION and entity.full_name:
+                self.function_cache[entity.full_name] = written_uuid
 
     def _extract_function(self, node: ast.FunctionDef, module_uuid: str,
                          file_path: Path, repo_root: Path, source_lines: List[str],
                          parent_class: Optional[str] = None):
-        """Extract function definition."""
+        """Extract function definition.
 
-        # Cross-OS UUID stability (v0.2.16 — bug 0.7): POSIX-normalize.
-        # See _extract_class for the same rationale.
-        relative_path = file_path.relative_to(repo_root).as_posix()
+        P2f stage 3 (v0.2.77 Part 6): entity-BUILDING moved to
+        ``vco_lib/codegraph_lang/python.py::build_python_function_entity``
+        (pure). This thin shim writes it + populates ``function_cache`` (the
+        seam preserved for direct callers/tests)."""
+        from vco_lib.codegraph_lang._shared import ExtractorHelpers
+        from vco_lib.codegraph_lang.python import build_python_function_entity
 
-        # Get signature
-        args = [arg.arg for arg in node.args.args]
-        signature = f"{node.name}({', '.join(args)})"
-
-        # Get docstring
-        doc = ast.get_docstring(node) or ""
-
-        # Extract full function body for embedding
-        function_body = self._extract_source_code(node, source_lines)
-
-        # Determine full name
-        if parent_class:
-            full_name = f"{file_path.stem}.{parent_class}.{node.name}"
-        else:
-            full_name = f"{file_path.stem}.{node.name}"
-
-        # Extract SCG-style type_uses from argument annotations and return annotation
-        type_uses: List[str] = []
-        seen_type_uses: Set[str] = set()
-
-        def _add_type_names(annotation: Optional[ast.expr]) -> None:
-            for t in self._extract_annotation_type_names(annotation):
-                if t not in seen_type_uses:
-                    seen_type_uses.add(t)
-                    type_uses.append(t)
-
-        for arg in node.args.args:
-            _add_type_names(arg.annotation)
-        for arg in node.args.posonlyargs:
-            _add_type_names(arg.annotation)
-        for arg in node.args.kwonlyargs:
-            _add_type_names(arg.annotation)
-        if node.args.vararg:
-            _add_type_names(node.args.vararg.annotation)
-        if node.args.kwarg:
-            _add_type_names(node.args.kwarg.annotation)
-        _add_type_names(node.returns)
-
-        # Create function - smart truncation for embedding
-        # function_body is full source (includes def line + docstring + body)
-
-        func_uuid = self.store_entity(CodeEntity(
-            kind=KIND_FUNCTION, file_path_rel=relative_path,
-            name=node.name,
-            full_name=full_name,
-            body=function_body,
-            signature=signature,
-            doc=doc,
-            start_line=node.lineno,
-            end_line=node.end_lineno or node.lineno,
-            is_async=isinstance(node, ast.AsyncFunctionDef),
-            project=self.project_name,
-            # type_uses is PYTHON-ONLY (SCG type-annotation edges).
-            extras={"type_uses": type_uses},
-            references={"module": module_uuid},
-            deferred_embed=lambda: embed_function(signature, function_body, language="python"),
-        ))
-
-        self.function_cache[full_name] = func_uuid
+        helpers = ExtractorHelpers(self)
+        entity = build_python_function_entity(
+            node, file_path, repo_root, source_lines, helpers,
+            parent_class=parent_class,
+        )
+        entity.references = dict(entity.references)
+        entity.references["module"] = module_uuid
+        func_uuid = self.store_entity(entity)
+        if entity.full_name:
+            self.function_cache[entity.full_name] = func_uuid
 
     def _get_name(self, node: ast.AST) -> str:
         """Get name from AST node."""
