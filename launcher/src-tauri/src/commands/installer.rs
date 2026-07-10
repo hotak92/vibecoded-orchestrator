@@ -10269,39 +10269,20 @@ fn append_install_log_event(
 /// Stdlib-only ISO-8601 UTC "Z" timestamp (matches Python's
 /// `_utc_iso_now`). Avoids pulling chrono just for this. Resolution is
 /// seconds, which is what the rest of the install log uses.
+/// Current UTC time as `YYYY-MM-DDTHH:MM:SSZ`.
+///
+/// v0.2.77 (Part 7c task 5): delegates to the shared
+/// `vct_launcher_core::time` home (one place for the launcher's ISO-Z
+/// timestamp). The prior hand-rolled civil-from-days implementation moved
+/// there verbatim as `iso_z_from_unix_secs` + `civil_from_days`; this
+/// call-site keeps the same second-granularity `Z` format.
 fn chrono_iso_z() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // Convert seconds-since-epoch to UTC YYYY-MM-DDTHH:MM:SSZ. We use a
-    // tiny civil-from-days algorithm rather than chrono.
-    let days = (secs / 86_400) as i64;
-    let secs_of_day = (secs % 86_400) as u32;
-    let hh = secs_of_day / 3600;
-    let mm = (secs_of_day % 3600) / 60;
-    let ss = secs_of_day % 60;
-    let (y, m, d) = civil_from_days(days);
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        y, m, d, hh, mm, ss
-    )
-}
-
-/// Howard Hinnant's days-from-civil inverse (returns y/m/d for unix days).
-fn civil_from_days(z: i64) -> (i32, u32, u32) {
-    let z = z + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z.rem_euclid(146097) as u32; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
-    let y = yoe as i32 + (era as i32) * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
+    vct_launcher_core::time::iso_z_from_unix_secs(secs)
 }
 
 /// Detects NVIDIA GPU + total VRAM (across all GPUs) in GB.
@@ -13996,10 +13977,11 @@ MemAvailable:   23456789 kB
 
     #[test]
     fn test_civil_from_days_known_dates() {
-        // unix epoch (1970-01-01) is day 0.
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-        // 2026-04-27 = days since epoch. Don't compute by hand; just
-        // sanity-check via the iso formatter.
+        // The civil-from-days algorithm now lives in
+        // vct_launcher_core::time (Part 7c task 5) and is unit-tested there;
+        // here we only smoke-test the local `chrono_iso_z` wrapper still
+        // produces the expected shape via the shared home.
+        assert_eq!(vct_launcher_core::time::civil_from_days(0), (1970, 1, 1));
         let s = chrono_iso_z();
         assert!(s.ends_with("Z"));
         assert_eq!(s.len(), 20); // YYYY-MM-DDTHH:MM:SSZ

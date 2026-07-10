@@ -314,14 +314,15 @@ fn read_git_rev(install_path: &Path) -> (Option<String>, Option<String>) {
     }
 }
 
-/// Same ISO8601 UTC `Z` format the rest of the launcher emits. Avoids a
-/// chrono dependency leak into this module — the rest of the codebase
-/// has its own helper but it lives in installer.rs and we don't want a
-/// circular module dependency.
+/// Same ISO8601 UTC `Z` format the rest of the launcher emits.
+///
+/// v0.2.77 (Part 7c task 5): now delegates to the shared
+/// `vct_launcher_core::time::chrono_iso_z_now` (one home). The prior
+/// comment noted the helper "lives in installer.rs and we don't want a
+/// circular module dependency" — moving it to the leaf `vct-launcher-core`
+/// crate dissolves that worry.
 fn chrono_iso_z_now() -> String {
-    chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string()
+    vct_launcher_core::time::chrono_iso_z_now()
 }
 
 // ---------------------------------------------------------------------------
