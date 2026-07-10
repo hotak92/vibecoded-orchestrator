@@ -37,7 +37,15 @@ _MAIN_SPAN_MAX = 1668
 # the fresh DeferralReport on the --lightweight branch was clobbering pending
 # foreign deferrals; the seed is inseparable from the existing write block,
 # not extractable without contortion). Re-pinned to the new measured value.
-_TOTAL_LINES_MAX = 25379
+# v0.2.76 R8: +29 for the shared-KG pointer-drift heal WIRING. The substantive
+# logic (heal_shared_kg_pointer_drift, converge_root_pointer_write_side,
+# pointer_drift_needs_rw) was extracted to vco_lib.kg_binding_heal; the residual
+# install.py delta is the minimal glue — a write-side shim + the RO-detection
+# call + the seed-site call — which must inject install.py-internal helpers
+# (_is_orchestrator_root_install / _discover_app_state_db_path /
+# _connect_launcher_db_with_retry / _log_install_event) and so can't move out.
+# Re-pinned to the new measured value (same precedent as the A-2 line above).
+_TOTAL_LINES_MAX = 25408
 
 
 def _measure() -> tuple:

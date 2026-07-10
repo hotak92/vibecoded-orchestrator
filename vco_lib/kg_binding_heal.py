@@ -416,6 +416,316 @@ def rebind_orchestrator_root_bindings(
         )
 
 
+#: app_state keys R8 converges. `orchestrator_root_kg_collection` is the pointer
+#: `populate_kg_collection_access_for_project` reads (access.rs:1529);
+#: `last_installed_shared_kg_collection` is the ACTUAL canonical shared name
+#: install.py last seeded. On a white-label/rebind install the second changes
+#: while the first stays at the machine default → the access seeder mints rows
+#: for a class that doesn't exist in Weaviate.
+_APP_STATE_ORCH_ROOT_KG = "orchestrator_root_kg_collection"
+_APP_STATE_LAST_SHARED_KG = "last_installed_shared_kg_collection"
+
+
+def _read_app_state(cur, key: str) -> str:
+    """Read one app_state value (stripped), or '' when absent/table-missing."""
+    try:
+        cur.execute("SELECT value FROM app_state WHERE key = ?", (key,))
+        row = cur.fetchone()
+    except sqlite3.OperationalError as oe:
+        if "no such table" in str(oe).lower():
+            return ""
+        raise
+    return (row[0] or "").strip() if row else ""
+
+
+def pointer_drift_needs_rw(ro_cur) -> bool:
+    """R8 (v0.2.76): True when the two shared-KG app_state pointers DIVERGE.
+
+    Cheap RO probe used by install.py's self-heal detection pass to decide
+    whether the RW pass (which runs :func:`heal_shared_kg_pointer_drift`) is
+    owed. A default install has them equal → False → no RW open. Older schemas
+    without ``app_state`` / these rows read as absent → equal ('') → False.
+    """
+    try:
+        ptr = _read_app_state(ro_cur, _APP_STATE_ORCH_ROOT_KG)
+        last = _read_app_state(ro_cur, _APP_STATE_LAST_SHARED_KG)
+    except sqlite3.OperationalError as oe:
+        if "no such table" in str(oe).lower():
+            return False
+        raise
+    return ptr != last and bool(ptr or last)
+
+
+def converge_root_pointer_write_side(
+    db_path,
+    canonical: str,
+    *,
+    is_root: bool,
+    connect_rw: Callable[..., sqlite3.Connection],
+    log_event: Callable[..., None],
+    now_ms: Optional[int] = None,
+) -> bool:
+    """R8 (v0.2.76) write-side convergence: set
+    ``app_state.orchestrator_root_kg_collection`` (the key the access seeder
+    reads) to ``canonical`` when we've just seeded the canonical shared
+    collection. ONLY the orchestrator-ROOT install may write it (``is_root``);
+    a per-project install must never repoint it. Soft-fails; idempotent (same
+    value → no-op UPSERT). Returns True when a write was issued.
+    """
+    canonical = (canonical or "").strip()
+    if not canonical or not is_root:
+        return False
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    try:
+        conn = connect_rw(db_path, label="R8-pointer")
+        try:
+            conn.execute(
+                "INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+                "updated_at = excluded.updated_at",
+                (_APP_STATE_ORCH_ROOT_KG, canonical, now_ms),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 — soft-fail (telemetry-class write)
+        return False
+    log_event(
+        "orchestrator_root_kg_collection", "ok",
+        f"write-side convergence: pointer set to canonical shared collection "
+        f"{canonical!r} (R8)",
+        data={"value": canonical},
+    )
+    return True
+
+
+def heal_shared_kg_pointer_drift(
+    cur,
+    *,
+    existing_classes: set[str],
+    log_event: Callable[..., None],
+    deferral_report,
+    deferral_entry_cls,
+    now_ms: Optional[int] = None,
+) -> int:
+    """R8 (v0.2.76): converge ``orchestrator_root_kg_collection`` to the real
+    canonical shared collection when it has drifted, and rewrite the stale
+    ``kg_collection_access`` rows that point at the dead name.
+
+    launcher.db-metadata ONLY: NO Weaviate object writes, NO sync enqueues, NO
+    ``embed_revision`` changes. ``existing_classes`` is a read-only snapshot of
+    the Weaviate schema (already fetched by the caller); the only Weaviate
+    interaction anywhere in this heal is schema-existence membership, done by
+    the caller.
+
+    Convergence is DIVERGENCE-based with TRIPLE agreement (conservative):
+
+      * ``ptr == last`` (keys agree) → strict no-op. This is the default-install
+        path: both hold the machine default → nothing to do (leave-alone).
+      * ``ptr != last`` AND all three agree:
+          (1) ``last`` is non-empty,
+          (2) ``last``'s class EXISTS in Weaviate,
+          (3) ``last`` equals the consensus of ``role='shared'`` collection
+              names in ``project_kg_bindings`` (all shared rows name the same
+              collection, and it equals ``last``)
+        → converge the pointer to ``last`` and rewrite stale
+        ``kg_collection_access`` rows (see below).
+      * ``ptr != last`` WITHOUT triple agreement → touch nothing; emit an
+        ``UPDATE_DEFERRED``-pattern entry so the user resolves it explicitly.
+
+    Access-row rewrite: only SEED-AUTHORED rows (``created_at == updated_at``,
+    the migration-029 predicate) whose ``collection_name`` equals the dead
+    ``ptr`` are rewritten to ``last``; user-configured rows are LEFT and
+    reported. On PK conflict with an existing (project, last) row, keep the
+    HIGHER privilege and delete the dead row.
+
+    Idempotent: on an already-converged DB ``ptr == last`` and no stale rows
+    remain → returns 0 with no writes (safe against the planner's manual
+    repair). Returns the number of rows changed (pointer + access rewrites).
+    """
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+
+    try:
+        ptr = _read_app_state(cur, _APP_STATE_ORCH_ROOT_KG)
+        last = _read_app_state(cur, _APP_STATE_LAST_SHARED_KG)
+    except sqlite3.OperationalError:
+        # app_state unreadable (older schema) — nothing to converge.
+        return 0
+
+    if not ptr and not last:
+        return 0  # nothing recorded yet (pre-seed) — leave-alone.
+    if ptr == last:
+        return 0  # keys agree — default install / already converged.
+
+    # Divergent. Require triple agreement before touching anything.
+    reasons: list[str] = []
+    if not last:
+        reasons.append("last_installed_shared_kg_collection is empty")
+    elif last not in existing_classes:
+        reasons.append(
+            f"last_installed value {last!r} is not a live Weaviate class"
+        )
+
+    shared_consensus: Optional[str] = None
+    if not reasons:
+        try:
+            cur.execute(
+                "SELECT DISTINCT collection_name FROM project_kg_bindings "
+                "WHERE role = 'shared' AND collection_name IS NOT NULL "
+                "AND collection_name != ''"
+            )
+            shared_names = {r[0] for r in cur.fetchall() if r and r[0]}
+        except sqlite3.OperationalError as oe:
+            if "no such table" in str(oe).lower():
+                shared_names = set()
+            else:
+                raise
+        if len(shared_names) == 1:
+            shared_consensus = next(iter(shared_names))
+        if shared_consensus is None:
+            reasons.append(
+                "no single-collection consensus among role='shared' bindings "
+                f"(found {sorted(shared_names)})"
+            )
+        elif shared_consensus != last:
+            reasons.append(
+                f"shared-binding consensus {shared_consensus!r} != "
+                f"last_installed {last!r}"
+            )
+
+    if reasons:
+        # Diverge without agreement → touch nothing, defer to the user.
+        log_event(
+            "7e/10", "warn",
+            "[kg-heal] shared-KG pointer drift NOT auto-converged "
+            f"(ptr={ptr!r}, last={last!r}): {'; '.join(reasons)}",
+            data={"ptr": ptr, "last": last, "reasons": reasons},
+        )
+        deferral_report.add_entry(
+            deferral_entry_cls(
+                condition_id="shared_kg_pointer_drift_unresolved",
+                title="Shared-KG canonical pointer diverged (manual review)",
+                detected=(
+                    f"app_state.orchestrator_root_kg_collection = {ptr!r} but "
+                    f"app_state.last_installed_shared_kg_collection = {last!r}. "
+                    "The two disagree and the safe-convergence preconditions "
+                    f"were not met: {'; '.join(reasons)}. The access seeder "
+                    "reads the first key; a wrong value seeds kg_collection_access "
+                    "rows for a class that may not exist."
+                ),
+                why_deferred=(
+                    "Auto-converging without triple agreement (last value's "
+                    "class exists in Weaviate AND matches the role='shared' "
+                    "binding consensus) could re-point the access matrix at the "
+                    "wrong collection. Left untouched pending explicit choice."
+                ),
+                command_to_apply=(
+                    "Pick the canonical shared collection in the launcher's "
+                    "Identity tab -> 'Manage shared KG collection', OR set "
+                    "VCT_ORCHESTRATOR_ROOT_KG_COLLECTION and re-run "
+                    "`python install.py --update`."
+                ),
+                severity="warning",
+                kg_node_refs=[],
+            )
+        )
+        return 0
+
+    # Triple agreement met → converge the pointer.
+    changed = 0
+    cur.execute(
+        "INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+        "updated_at = excluded.updated_at",
+        (_APP_STATE_ORCH_ROOT_KG, last, now_ms),
+    )
+    changed += 1
+    log_event(
+        "7e/10", "ok",
+        f"[kg-heal] converged orchestrator_root_kg_collection {ptr!r} -> {last!r}",
+        data={"old": ptr, "new": last},
+    )
+
+    # Rewrite stale kg_collection_access rows pointing at the dead ptr name.
+    # SEED-AUTHORED rows only (created_at == updated_at per migration 029).
+    try:
+        cur.execute(
+            "SELECT project_id, access_level, created_at, updated_at "
+            "FROM kg_collection_access WHERE collection_name = ?",
+            (ptr,),
+        )
+        dead_rows = cur.fetchall()
+    except sqlite3.OperationalError as oe:
+        if "no such table" in str(oe).lower():
+            dead_rows = []
+        else:
+            raise
+
+    user_configured_left = 0
+    for proj_id, level, created_at, updated_at in dead_rows:
+        if created_at != updated_at:
+            # User-configured row — never auto-rewrite; report it.
+            user_configured_left += 1
+            log_event(
+                "7e/10", "warn",
+                "[kg-heal] leaving user-configured kg_collection_access row at "
+                f"dead collection {ptr!r} (project={proj_id}); rewrite skipped",
+                data={"project_id": proj_id, "dead": ptr, "canonical": last},
+            )
+            continue
+        # Seed-authored → rewrite to canonical. Handle PK (project_id,
+        # collection_name) conflict with an existing (proj, last) row:
+        # keep the HIGHER privilege, delete the dead row.
+        cur.execute(
+            "SELECT access_level FROM kg_collection_access "
+            "WHERE project_id = ? AND collection_name = ?",
+            (proj_id, last),
+        )
+        existing = cur.fetchone()
+        if existing is not None:
+            keep = max(
+                (level, existing[0]),
+                key=lambda lv: _KG_ACCESS_RANK.get(lv, 0),
+            )
+            cur.execute(
+                "UPDATE kg_collection_access SET access_level = ?, updated_at = ? "
+                "WHERE project_id = ? AND collection_name = ?",
+                (keep, updated_at, proj_id, last),
+            )
+            cur.execute(
+                "DELETE FROM kg_collection_access "
+                "WHERE project_id = ? AND collection_name = ?",
+                (proj_id, ptr),
+            )
+        else:
+            # No conflict — preserve the seed-authored timestamps so the row
+            # stays seed-authored (created_at == updated_at) under the canonical
+            # name.
+            cur.execute(
+                "UPDATE kg_collection_access SET collection_name = ? "
+                "WHERE project_id = ? AND collection_name = ?",
+                (last, proj_id, ptr),
+            )
+        changed += 1
+
+    if dead_rows:
+        log_event(
+            "7e/10", "ok",
+            f"[kg-heal] rewrote {changed - 1} stale kg_collection_access row(s) "
+            f"{ptr!r} -> {last!r}"
+            + (f"; left {user_configured_left} user-configured row(s)"
+               if user_configured_left else ""),
+            data={
+                "rewritten": changed - 1,
+                "user_configured_left": user_configured_left,
+                "dead": ptr, "canonical": last,
+            },
+        )
+    return changed
+
+
 def self_heal_kg_bindings(
     deferral_report,
     *,
@@ -715,6 +1025,29 @@ def self_heal_kg_bindings(
                     "V0243-9: kg_collection_access absent; parity self-heal skipped",
                 )
 
+            # ── 5. R8 (v0.2.76): shared-KG canonical pointer drift ────
+            # Converge app_state.orchestrator_root_kg_collection to the real
+            # canonical shared collection + rewrite stale kg_collection_access
+            # rows. launcher.db metadata only (no Weaviate writes). Conservative:
+            # a default install has ptr == last → no-op; divergence without
+            # triple agreement defers instead of guessing.
+            _pointer_changed = 0
+            try:
+                _pointer_changed = heal_shared_kg_pointer_drift(
+                    cur,
+                    existing_classes=existing_classes,
+                    log_event=log_event,
+                    deferral_report=deferral_report,
+                    deferral_entry_cls=deferral_entry_cls,
+                )
+            except sqlite3.OperationalError as oe:
+                if "no such table" not in str(oe).lower():
+                    raise
+                log_event(
+                    "7e/10", "skip",
+                    "R8: app_state absent; shared-KG pointer heal skipped",
+                )
+
             conn.commit()
 
             # X-1 instrumentation (v0.2.76): count rows this heal pass
@@ -730,6 +1063,7 @@ def self_heal_kg_bindings(
                 + len(access_rebinds)
                 + len(prefix_adopts)
                 + _parity_inserts
+                + _pointer_changed
             )
             log_event(
                 "7e/10", "ok",
@@ -737,13 +1071,15 @@ def self_heal_kg_bindings(
                 f"(binding_rebinds={len(rebinds)}, "
                 f"access_rebinds={len(access_rebinds)}, "
                 f"prefix_adopts={len(prefix_adopts)}, "
-                f"access_parity_inserts={_parity_inserts})",
+                f"access_parity_inserts={_parity_inserts}, "
+                f"pointer_drift={_pointer_changed})",
                 data={
                     "changed": _heal_changed,
                     "binding_rebinds": len(rebinds),
                     "access_rebinds": len(access_rebinds),
                     "prefix_adopts": len(prefix_adopts),
                     "access_parity_inserts": _parity_inserts,
+                    "pointer_drift": _pointer_changed,
                 },
             )
         finally:

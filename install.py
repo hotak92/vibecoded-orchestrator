@@ -10911,6 +10911,23 @@ def _write_app_state_key(key: str, value: str) -> None:
         pass
 
 
+def _converge_orchestrator_root_kg_pointer(canonical: str) -> None:
+    """R8 write-side convergence shim → ``kg_binding_heal.
+    converge_root_pointer_write_side`` (single-writer home). Only the
+    orchestrator-root install repoints the access-seeder key."""
+    try:
+        is_root = _is_orchestrator_root_install()
+    except Exception:
+        return  # never repoint on an uncertain root check.
+    db_path = _discover_app_state_db_path()
+    if db_path.is_file():
+        _converge_root_pointer_write_side_impl(
+            db_path, canonical, is_root=is_root,
+            connect_rw=_connect_launcher_db_with_retry,
+            log_event=_log_install_event,
+        )
+
+
 # ---------------------------------------------------------------------------
 # IN-1 (v0.2.73): the Weaviate KG-row-hygiene slice — content-hash diffing +
 # orphan-row pruning — was extracted VERBATIM into vco_lib.install_weaviate
@@ -15374,6 +15391,9 @@ def _seed_weaviate_shared_kg_only(
 
         _write_app_state_key(_APP_STATE_KEY_LAST_KG_COLLECTION, canonical)
         _write_app_state_key(_APP_STATE_KEY_LAST_SHARED_KG_COLLECTION, canonical)
+        # R8 (v0.2.76): keep the access-seeder pointer converged with the
+        # canonical shared collection we just recorded (see the shim's docstring).
+        _converge_orchestrator_root_kg_pointer(canonical)
 
         print("  → shared KG seed: skipped (orchestrator-root, "
               "canonical collection serves both roles)")
@@ -16969,6 +16989,8 @@ from vco_lib.kg_binding_heal import (  # noqa: E402
     _count_weaviate_class_objects,
     _prefix_adopt_kg_bindings_pass,
     _rebind_collection_names_to_on_disk_casing,
+    converge_root_pointer_write_side as _converge_root_pointer_write_side_impl,
+    pointer_drift_needs_rw as _pointer_drift_needs_rw,
     self_heal_kg_bindings as _self_heal_kg_bindings_impl,
 )
 
@@ -17450,6 +17472,13 @@ def _self_heal_kg_bindings_on_update(
                             break
                 if needs_rebind:
                     break
+
+            # R8 (v0.2.76): also trigger the RW pass when the two shared-KG
+            # app_state pointers DIVERGE (the pointer-drift heal runs inside
+            # the RW pass, pass 5). Cheap RO probe; default install → equal →
+            # no RW open.
+            if not needs_rebind and _pointer_drift_needs_rw(ro_cur):
+                needs_rebind = True
         finally:
             ro_conn.close()
     except sqlite3.Error as se:

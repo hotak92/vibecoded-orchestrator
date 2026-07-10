@@ -11408,6 +11408,88 @@ def _cmd_reclaim_stranded_code_segments(args: argparse.Namespace) -> int:
     return 1 if result["errors"] else 0
 
 
+def _bundle_update_pointer_heal() -> None:
+    """R8 (v0.2.76): run the MACHINE-WIDE shared-KG pointer-drift heal after a
+    per-project `install-bundle --update`.
+
+    The heal itself is machine-wide (``orchestrator_root_kg_collection`` is one
+    app_state key), so running it from a per-project update is redundant with
+    the root ``install.py --update`` pass — but it is idempotent and cheap
+    (a couple of SELECTs on an already-converged DB), so wiring it here closes
+    the window where a user only ever runs bundle-updates (never the root
+    update) and the pointer stays drifted.
+
+    launcher.db metadata ONLY (the heal writes no Weaviate objects). Soft-fails
+    silently on every error: missing launcher.db, Weaviate unreachable, sqlite
+    lock. Never raises — a bundle update must always exit on its own result.
+    """
+    import sqlite3
+    import urllib.request
+
+    try:
+        from vco_lib.kg_binding_heal import heal_shared_kg_pointer_drift
+    except Exception:
+        return
+
+    # launcher.db discovery via the canonical resolver (vco_lib.paths).
+    try:
+        from vco_lib.paths import vct_root_dir
+        db_path = vct_root_dir() / "launcher.db"
+    except Exception:
+        return
+    if not db_path.is_file():
+        return
+
+    # Weaviate schema (existence-only; the sole Weaviate call in the heal).
+    weaviate_url = (
+        os.environ.get("WEAVIATE_URL")
+        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
+    )
+    try:
+        resp = urllib.request.urlopen(  # noqa: S310 (localhost only)
+            f"{weaviate_url}/v1/schema", timeout=5,
+        )
+        schema = json.loads(resp.read())
+    except Exception:
+        return  # Weaviate unreachable → can't verify existence → skip.
+    existing_classes = {
+        c.get("class") for c in schema.get("classes", [])
+        if isinstance(c, dict) and c.get("class")
+    }
+
+    # Minimal deferral sink + log shim (the CLI has no DeferralReport here).
+    class _Sink:
+        def add_entry(self, *_a, **_k):
+            return None
+
+    class _Entry:
+        def __init__(self, **_k):
+            pass
+
+    def _log(_step, _level, msg, **_k):
+        # Surface convergence loudly on stderr; the heal only logs on change.
+        if "[kg-heal]" in msg:
+            print(f"[install-bundle] {msg}", file=sys.stderr)
+
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            cur = conn.cursor()
+            changed = heal_shared_kg_pointer_drift(
+                cur,
+                existing_classes=existing_classes,
+                log_event=_log,
+                deferral_report=_Sink(),
+                deferral_entry_cls=_Entry,
+            )
+            if changed:
+                conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        return  # sqlite lock / any error → soft-fail.
+
+
 def _cmd_install_bundle(args: argparse.Namespace) -> int:
     """`install-bundle --folder <path> [--orchestrator-root <path>]
     [--update] [--force] [--dry-run] [--project-folder <path>] --json`
@@ -11469,6 +11551,11 @@ def _cmd_install_bundle(args: argparse.Namespace) -> int:
             print(f"  WARNING {w}")
         for err in result["errors"]:
             print(f"  ERROR {err.get('path', '?')}: {err['error']}")
+    # R8 (v0.2.76): after a real bundle UPDATE, run the machine-wide shared-KG
+    # pointer-drift heal (idempotent, soft-fail) so users who only ever run
+    # bundle-updates still get the pointer converged. Skipped on dry-run.
+    if bool(args.update) and not bool(args.dry_run):
+        _bundle_update_pointer_heal()
     return 1 if result["errors"] else 0
 
 
