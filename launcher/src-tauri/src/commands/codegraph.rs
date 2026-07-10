@@ -1646,10 +1646,30 @@ pub(crate) fn resolve_analyzer_script(project_folder: &std::path::Path) -> Optio
         "code-graph-analyze"
     };
 
-    // 1. Project-local
+    // 1. Project-local — but only if it's a RESILIENT (RT-4-era) wrapper.
+    //    Live bug (2026-07-10 dogfood): a project shipped a stale 2026-02
+    //    (pre-RT-4) `code-graph-analyze` that hardcoded an absolute venv
+    //    path; the launcher preferred it over the healthy orchestrator copy
+    //    on MERE EXISTENCE, and the build exited 127. Health-check the
+    //    marker before trusting the project-local wrapper. Stale/unreadable
+    //    → skip candidate 1, WARN once, surface a per-project deferral
+    //    suggesting a single-file `--force` refresh, and fall through to the
+    //    orchestrator candidates (2-4), which are healthy by definition of
+    //    the ladder. Conservative default: can't read → treat as stale.
     let p1 = project_folder.join(".claude").join("scripts").join(bin);
     if p1.is_file() {
-        return Some(p1);
+        if analyzer_wrapper_is_resilient(&p1) {
+            return Some(p1);
+        }
+        eprintln!(
+            "[codegraph] WARN: project-local analyzer wrapper {} is stale \
+             (pre-RT-4: no resilient interpreter-discovery marker) — falling \
+             back to the orchestrator copy. A single-file bundle refresh will \
+             heal it.",
+            p1.display()
+        );
+        emit_stale_wrapper_deferral(project_folder, bin, &p1);
+        // fall through to candidates 2-4 below
     }
 
     // 2. Env override
@@ -1683,6 +1703,174 @@ pub(crate) fn resolve_analyzer_script(project_folder: &std::path::Path) -> Optio
         }
     }
     None
+}
+
+/// Health-check a project-local `code-graph-analyze` / `.ps1` wrapper: does
+/// it carry the RESILIENT interpreter-discovery ladder shipped since RT-4
+/// (2026-06-27)?
+///
+/// Marker: `VCT_INSTALL_ROOT`. It appears in BOTH the shipped `.sh` and
+/// `.ps1` templates as the canonical orchestrator-clone-root venv tier, and
+/// is ABSENT from the pre-RT-4 2026-02 wrapper that hardcoded an absolute
+/// venv path (the wrapper this guard exists to reject). We deliberately DO
+/// NOT add a fresh marker line to the templates — we detect a string that is
+/// already shipped, so the check stays true no matter how the templates are
+/// re-worded, as long as they keep honouring `$VCT_INSTALL_ROOT`.
+///
+/// Conservative default: an unreadable file returns `false` (treated as
+/// stale). Falling through to the orchestrator copy is always safe — that
+/// candidate is healthy by definition of the ladder.
+fn analyzer_wrapper_is_resilient(path: &std::path::Path) -> bool {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => contents.contains("VCT_INSTALL_ROOT"),
+        Err(_) => false,
+    }
+}
+
+/// Best-effort: append a per-project `stale_codegraph_wrapper_pending`
+/// deferral entry to `<project>/.claude/context/UPDATE_DEFERRED.md`,
+/// suggesting a single-file `--force` refresh of the stale wrapper.
+///
+/// Reuses the sanctioned `vco_lib.deferral_report.{DeferralEntry,
+/// DeferralReport}` machinery via a `-c` snippet — the same subprocess-into-
+/// Python pattern as `projects_v2::emit_codegraph_rename_deferral` and
+/// `storage_ux::emit_deferral` (mirror-don't-fork: these deferral emitters
+/// are deliberately kept as thin local mirrors of the one Python writer).
+/// Idempotent at the Python layer (`add_entry` dedups by `condition_id`), so
+/// repeated resolutions don't pile up duplicate rows. Soft-fails at every
+/// gate (no repo root, no python, subprocess error) — a deferral is an FYI,
+/// never a blocker for the resolution it annotates.
+fn emit_stale_wrapper_deferral(
+    project_folder: &std::path::Path,
+    bin: &str,
+    stale_wrapper: &std::path::Path,
+) {
+    let repo_root = match crate::commands::installer::find_local_repo_root() {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let py = match stale_wrapper_pick_python() {
+        Some(p) => p,
+        None => return,
+    };
+
+    let detected = format!(
+        "The project-local code-graph analyzer wrapper at {} is a pre-RT-4 \
+         (2026-02-era) copy: it lacks the resilient $VCT_INSTALL_ROOT \
+         interpreter-discovery ladder, so it can hard-code a stale venv path \
+         and fail (exit 127 / ModuleNotFoundError). The launcher is currently \
+         falling back to the healthy orchestrator copy, so builds still work; \
+         refresh this one file to restore project-local resolution.",
+        stale_wrapper.display()
+    );
+    // POSIX single-quote the folder for the emitted shell command (paths may
+    // contain spaces; embedded single quotes use the standard '\'' escape).
+    let folder_sh = format!("'{}'", project_folder.display().to_string().replace('\'', r"'\''"));
+    // install-bundle has NO single-file flag (verified against its argparse:
+    // --folder/--update/--force/--dry-run only — no `--only`). Emitting an
+    // invented flag would be argparse-rejected (the C-10 lesson). Give TWO
+    // valid remediations: a targeted one-file copy from the bundle template,
+    // or the full manifest-driven refresh (--force overwrites the stale copy).
+    let command_to_apply = format!(
+        "# Option A — refresh JUST the stale wrapper by copying the bundle \
+         template (replace <orchestrator-root> with your install root):\n\
+         cp <orchestrator-root>/templates/scripts/{bin} \
+         {folder}/.claude/scripts/{bin}\n\
+         \n\
+         # Option B — full manifest-driven bundle refresh (--force also \
+         overwrites ANY other user-modified bundle files, so review the \
+         resulting UPDATE_DEFERRED summary):\n\
+         python -m vco_lib.project_init install-bundle --update --force \
+         --folder {folder}",
+        bin = bin,
+        folder = folder_sh
+    );
+
+    let repo_py = stale_wrapper_py_quote(&repo_root.to_string_lossy());
+    let folder_py = stale_wrapper_py_quote(&project_folder.to_string_lossy());
+    let detected_py = stale_wrapper_py_quote(&detected);
+    let cmd_py = stale_wrapper_py_quote(&command_to_apply);
+    let script = format!(
+        "import sys\n\
+         sys.path.insert(0, {repo_py})\n\
+         from pathlib import Path\n\
+         from vco_lib.deferral_report import DeferralEntry, DeferralReport\n\
+         folder = Path({folder_py})\n\
+         report = DeferralReport.read(folder)\n\
+         entry = DeferralEntry(\n\
+         \x20\x20\x20\x20condition_id=\"stale_codegraph_wrapper_pending\",\n\
+         \x20\x20\x20\x20title=\"Stale project-local code-graph analyzer wrapper\",\n\
+         \x20\x20\x20\x20detected={detected_py},\n\
+         \x20\x20\x20\x20why_deferred=\"Overwriting a user-touched wrapper \
+without consent could clobber local edits; the orchestrator copy is used \
+meanwhile so nothing is broken. Refresh the one file when convenient.\",\n\
+         \x20\x20\x20\x20command_to_apply={cmd_py},\n\
+         \x20\x20\x20\x20severity=\"info\",\n\
+         )\n\
+         report.add_entry(entry)\n\
+         report.write(folder)\n",
+    );
+    let status = std::process::Command::new(&py)
+        .silent()
+        .arg("-c")
+        .arg(&script)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => eprintln!(
+            "[codegraph] stale-wrapper deferral helper exited {}",
+            s
+        ),
+        Err(e) => eprintln!(
+            "[codegraph] stale-wrapper deferral helper spawn failed: {}",
+            e
+        ),
+    }
+}
+
+/// First `python3` then `python` from PATH. Mirrors
+/// `chunker_revision_deferral::pick_python` / `storage_ux`'s resolution order
+/// so deferral behaviour is consistent across every Rust-side emitter.
+fn stale_wrapper_pick_python() -> Option<std::path::PathBuf> {
+    for candidate in ["python3", "python"] {
+        #[cfg(windows)]
+        let names = [format!("{candidate}.exe"), candidate.to_string()];
+        #[cfg(not(windows))]
+        let names = [candidate.to_string()];
+        if let Some(paths) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&paths) {
+                for name in &names {
+                    let probe = dir.join(name);
+                    if probe.is_file() {
+                        return Some(probe);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Quote `s` as a Python double-quoted string literal. Mirrors
+/// `chunker_revision_deferral::py_quote` byte-for-byte (kept local: that fn
+/// is private and widening its visibility for one caller adds no
+/// architectural value — same documented rationale as the other mirrors).
+fn stale_wrapper_py_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 #[cfg(test)]
@@ -1886,6 +2074,9 @@ mod build_tests {
         assert_eq!(tail_log(small), "all good");
     }
 
+    /// A HEALTHY (RT-4-era) project-local wrapper — one carrying the
+    /// `VCT_INSTALL_ROOT` resilient-discovery marker — still wins on mere
+    /// existence.
     #[test]
     fn resolve_analyzer_finds_project_local_copy() {
         let d = tmpdir("resolve");
@@ -1897,7 +2088,13 @@ mod build_tests {
             "code-graph-analyze"
         };
         let p = scripts.join(bin);
-        fs::write(&p, b"#!/usr/bin/env bash\necho ok\n").unwrap();
+        // Include the RT-4 resilient-ladder marker so the health-check
+        // (analyzer_wrapper_is_resilient) treats it as healthy.
+        fs::write(
+            &p,
+            b"#!/usr/bin/env bash\n# CANDIDATES use $VCT_INSTALL_ROOT\necho ok\n",
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1909,6 +2106,90 @@ mod build_tests {
         let resolved = resolve_analyzer_script(&d).expect("must resolve");
         assert_eq!(resolved, p);
         fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn analyzer_wrapper_is_resilient_marker_check() {
+        let d = tmpdir("marker");
+        let healthy = d.join("healthy");
+        let stale = d.join("stale");
+        // Healthy wrapper: carries the ladder marker.
+        fs::write(&healthy, b"#!/bin/bash\nCANDIDATES=( \"${VCT_INSTALL_ROOT:-}/.venv\" )\n")
+            .unwrap();
+        // Stale pre-RT-4 wrapper: hardcoded absolute path, no ladder marker.
+        fs::write(&stale, b"#!/bin/bash\nsource /home/user/.venv/bin/activate\n")
+            .unwrap();
+
+        assert!(analyzer_wrapper_is_resilient(&healthy));
+        assert!(!analyzer_wrapper_is_resilient(&stale));
+        // Unreadable / missing path → conservative default: stale.
+        assert!(!analyzer_wrapper_is_resilient(&d.join("does-not-exist")));
+        fs::remove_dir_all(&d).ok();
+    }
+
+    /// A STALE project-local wrapper (no RT-4 marker) is SKIPPED; the
+    /// orchestrator copy (resolved via `$VCT_LAUNCHER_SCRIPTS_DIR`, candidate
+    /// 2) wins instead — and a per-project deferral is emitted.
+    #[test]
+    fn resolve_analyzer_skips_stale_project_local_and_falls_back() {
+        let bin = if cfg!(windows) {
+            "code-graph-analyze.ps1"
+        } else {
+            "code-graph-analyze"
+        };
+
+        // Project with a STALE project-local wrapper (no ladder marker).
+        let proj = tmpdir("stale-proj");
+        let scripts = proj.join(".claude").join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        let stale_p = scripts.join(bin);
+        fs::write(&stale_p, b"#!/bin/bash\nsource /nonexistent/.venv/bin/activate\n")
+            .unwrap();
+
+        // Orchestrator copy reachable via VCT_LAUNCHER_SCRIPTS_DIR (candidate 2).
+        let orch = tmpdir("orch-scripts");
+        let orch_p = orch.join(bin);
+        fs::write(&orch_p, b"#!/bin/bash\n# $VCT_INSTALL_ROOT ladder\necho ok\n").unwrap();
+
+        // SAFETY: crate tests run single-threaded by default (see the note in
+        // resolve_analyzer_returns_none_when_nothing_found).
+        let saved_override = std::env::var_os("VCT_LAUNCHER_SCRIPTS_DIR");
+        unsafe {
+            std::env::set_var("VCT_LAUNCHER_SCRIPTS_DIR", &orch);
+        }
+
+        let resolved = resolve_analyzer_script(&proj).expect("must resolve to orchestrator copy");
+
+        unsafe {
+            match saved_override {
+                Some(v) => std::env::set_var("VCT_LAUNCHER_SCRIPTS_DIR", v),
+                None => std::env::remove_var("VCT_LAUNCHER_SCRIPTS_DIR"),
+            }
+        }
+
+        // The stale project-local copy must NOT have been picked.
+        assert_ne!(resolved, stale_p, "stale project-local wrapper must be skipped");
+        assert_eq!(resolved, orch_p, "orchestrator copy (candidate 2) must win");
+
+        // Best-effort deferral: when python is on PATH + a repo root resolves,
+        // the entry lands in the project's UPDATE_DEFERRED.md. We assert the
+        // condition_id only if the file was written (the emit soft-fails in
+        // sandboxes without python / repo root — that's by design).
+        let deferral = proj
+            .join(".claude")
+            .join("context")
+            .join("UPDATE_DEFERRED.md");
+        if deferral.is_file() {
+            let body = fs::read_to_string(&deferral).unwrap();
+            assert!(
+                body.contains("stale_codegraph_wrapper_pending"),
+                "deferral body must carry the stale-wrapper condition_id; got:\n{}",
+                body
+            );
+        }
+
+        fs::remove_dir_all(&proj).ok();
+        fs::remove_dir_all(&orch).ok();
     }
 
     #[test]
@@ -2016,9 +2297,15 @@ mod build_tests {
         // STATE 2: post-bundle (the fixed order). `run_install_bundle`
         // has dropped the analyzer wrapper; project-local lookup MUST
         // find it now and prefer it (step 1 of the resolve order is
-        // strictly highest priority).
+        // strictly highest priority). The bundle ships the RESILIENT
+        // (RT-4-era) wrapper, so include the `VCT_INSTALL_ROOT` marker the
+        // stale-wrapper health-check (v0.2.77) looks for.
         fs::create_dir_all(&scripts).unwrap();
-        fs::write(&script, b"#!/usr/bin/env bash\necho ok\n").unwrap();
+        fs::write(
+            &script,
+            b"#!/usr/bin/env bash\n# CANDIDATES honour $VCT_INSTALL_ROOT\necho ok\n",
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
