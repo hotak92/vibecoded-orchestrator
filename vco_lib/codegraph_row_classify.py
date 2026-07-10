@@ -52,6 +52,8 @@ pathless / ignored / unreachable. No special-casing by value: ``0`` is simply
 
 from __future__ import annotations
 
+import errno
+import os
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -169,6 +171,15 @@ def path_reachable_on_disk(rel_or_abs_path: str, repo_root: "Path") -> bool:
     uncertainty must never authorise a delete, and on the probe side a wrong
     "reachable" only over-counts owed work (conservative, never a wrong
     "converged").
+
+    Presence is probed with an explicit ``os.stat`` (NOT ``Path.exists()``):
+    on Python >= 3.13 ``Path.exists()`` swallows ``EACCES``/``ELOOP`` and
+    returns ``False``, which would misclassify a permission-denied file as
+    genuinely-absent → DELETED → its rows PURGED (the fail-safe above voided).
+    ``os.stat`` lets us distinguish "determinately absent" (``ENOENT`` /
+    ``ENOTDIR`` → ``False``) from "could not determine" (any other ``OSError``:
+    ``EACCES``/``ELOOP``/... → ``True``, fail-safe). Version-independent: the
+    ``os.stat`` form has these semantics on every supported Python.
     """
     if not rel_or_abs_path:
         return True
@@ -187,8 +198,18 @@ def path_reachable_on_disk(rel_or_abs_path: str, repo_root: "Path") -> bool:
     if not inside:
         return False
     try:
-        return candidate.exists()
-    except (OSError, ValueError):
+        os.stat(candidate)
+        return True
+    except ValueError:
+        # Embedded NUL / invalid path arg reaching the syscall: indeterminate.
+        return True
+    except OSError as exc:
+        # Determinate "genuinely absent" only for ENOENT (no such file) and
+        # ENOTDIR (a path component is not a directory) — both mean the file
+        # truly is not there. EVERY other errno (EACCES/ELOOP/ENAMETOOLONG/...)
+        # is "could not determine" → fail-safe True (keep the data).
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+            return False
         return True
 
 

@@ -174,21 +174,68 @@ def test_reachable_true_on_empty_path(analyzer_mod, tmp_path):
     assert analyzer_mod._path_reachable_on_disk("", tmp_path) is True
 
 
-def test_reachable_true_when_exists_raises(analyzer_mod, tmp_path, monkeypatch):
-    """exists() raising → indeterminate → treat as reachable (do NOT delete)."""
-    orig_exists = Path.exists
+def _patch_stat_for_target(monkeypatch, target_name, exc):
+    """Monkeypatch os.stat so that any candidate path whose final component is
+    ``target_name`` raises ``exc``; all other paths delegate to the real
+    os.stat (so pytest's own internals keep working). ``cr.os`` is the shared
+    stdlib ``os`` module, so the wrapper must be transparent for everything else
+    AND accept the real signature (incl. ``follow_symlinks``)."""
+    from vco_lib import codegraph_row_classify as cr
 
-    def _boom(self):
-        raise OSError("simulated stat failure")
+    real_stat = cr.os.stat
 
-    monkeypatch.setattr(Path, "exists", _boom)
-    try:
-        assert (
-            analyzer_mod._path_reachable_on_disk("src/foo/bar.py", tmp_path)
-            is True
-        )
-    finally:
-        monkeypatch.setattr(Path, "exists", orig_exists)
+    def _wrapped(path, *args, **kwargs):
+        if str(path).replace("\\", "/").rstrip("/").endswith(target_name):
+            raise exc
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(cr.os, "stat", _wrapped)
+
+
+def test_reachable_true_when_stat_raises_generic_oserror(
+    analyzer_mod, tmp_path, monkeypatch
+):
+    """os.stat raising a generic OSError → indeterminate → reachable (no delete)."""
+    root = _make_repo(tmp_path, ["src/foo/bar.py"])
+    _patch_stat_for_target(
+        monkeypatch, "bar.py", OSError("simulated stat failure")
+    )
+    assert (
+        analyzer_mod._path_reachable_on_disk("src/foo/bar.py", root) is True
+    )
+
+
+def test_reachable_true_when_stat_raises_eacces(
+    analyzer_mod, tmp_path, monkeypatch
+):
+    """Py>=3.13 fail-safe hole regression: a permission-denied file (EACCES) is
+    INDETERMINATE, not absent — must classify as reachable so its rows are KEPT,
+    never purged. (Path.exists() returns False on EACCES on 3.13+, which is the
+    bug this test guards against.)"""
+    import errno as _errno
+
+    root = _make_repo(tmp_path, ["src/foo/bar.py"])
+    _patch_stat_for_target(
+        monkeypatch,
+        "bar.py",
+        PermissionError(_errno.EACCES, "Permission denied"),
+    )
+    assert analyzer_mod._path_reachable_on_disk("src/foo/bar.py", root) is True
+
+
+def test_reachable_false_when_stat_raises_enoent(
+    analyzer_mod, tmp_path, monkeypatch
+):
+    """A determinate ENOENT (no such file) → genuinely absent → NOT reachable."""
+    import errno as _errno
+
+    root = _make_repo(tmp_path, ["src/foo/bar.py"])
+    _patch_stat_for_target(
+        monkeypatch,
+        "bar.py",
+        FileNotFoundError(_errno.ENOENT, "No such file or directory"),
+    )
+    assert analyzer_mod._path_reachable_on_disk("src/foo/bar.py", root) is False
 
 
 # ─────────────────── D1 orphan-clear in _build_stale_file_set ───────────────────
@@ -385,7 +432,9 @@ def test_orphan_clear_fail_safe_when_repo_root_none(analyzer_mod, tmp_path):
 
 
 def test_orphan_clear_fail_safe_when_exists_raises(analyzer_mod, tmp_path, monkeypatch):
-    """An existence check that raises → treat as reachable → NO delete."""
+    """An existence probe that raises a generic OSError → treat as reachable
+    → NO delete. (Probe is os.stat now, not Path.exists — a generic OSError is
+    indeterminate, so the row is KEPT.)"""
     rev = analyzer_mod.CODEGRAPH_EMBED_REVISION
     rows = [
         _Obj("orphan", {"file_path": "pkg/deleted.py", "embed_revision": rev - 1}),
@@ -397,12 +446,8 @@ def test_orphan_clear_fail_safe_when_exists_raises(analyzer_mod, tmp_path, monke
     classes = _FakeColl("P_CodeClass", [], ("file_path", "embed_revision"), agg_count=0)
     stub = _StaleStub(analyzer_mod, modules, classes, functions, tmp_path)
 
-    orig_exists = Path.exists
-    monkeypatch.setattr(Path, "exists", lambda self: (_ for _ in ()).throw(OSError("boom")))
-    try:
-        stub._build_stale_file_set()
-    finally:
-        monkeypatch.setattr(Path, "exists", orig_exists)
+    _patch_stat_for_target(monkeypatch, "deleted.py", OSError("boom"))
+    stub._build_stale_file_set()
 
     assert functions.data.deleted == [], "indeterminate existence → no delete"
 

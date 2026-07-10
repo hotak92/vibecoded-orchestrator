@@ -278,6 +278,34 @@ def test_deleted_file_orphan_is_purgeable(classify_fn, repo_root):
     ) == "purgeable"
 
 
+def test_eacces_file_is_owed_not_purgeable(
+    classify_fn, repo_root, monkeypatch
+):
+    """Py>=3.13 EACCES fail-safe hole, THROUGH THE GATE: a stale row whose
+    primary file exists but stat()s EACCES (permission denied) is INDETERMINATE,
+    so the classifier must return ``owed`` (re-walk owed, row KEPT) — NEVER
+    ``purgeable``. Before the os.stat fix, ``Path.exists()`` returned False on
+    EACCES (3.13+), the row classified DELETED → purgeable → its rows PURGED."""
+    import errno as _errno
+
+    from vco_lib import codegraph_row_classify as cr
+
+    real_stat = cr.os.stat
+
+    def _wrapped(path, *args, **kwargs):
+        # Only the target primary file stats EACCES; everything else (pytest
+        # internals, other paths) delegates to the real os.stat.
+        if str(path).replace("\\", "/").rstrip("/").endswith("live.py"):
+            raise PermissionError(_errno.EACCES, "Permission denied")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(cr.os, "stat", _wrapped)
+    assert classify_fn(
+        {"embed_revision": 0, "file_path": "src/live.py"},
+        repo_root, current_revision=1,
+    ) == "owed"
+
+
 def test_reachable_non_ignored_stale_rows_stay_owed(classify_fn, repo_root):
     """LEAVE-ALONE case: a re-walk can converge these — never purge, always
     count. Includes the rev-0 class (vectorless sentinel / R-3 module-row
