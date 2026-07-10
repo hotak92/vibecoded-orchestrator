@@ -665,6 +665,16 @@ def heal_shared_kg_pointer_drift(
 
     user_configured_left = 0
     for proj_id, level, created_at, updated_at in dead_rows:
+        # ACKNOWLEDGED LIMITATION (a) — R8/destructive-lens, accepted:
+        # `created_at == updated_at` is a heuristic for "seed-authored, never
+        # user-touched". It CANNOT distinguish a genuinely seed row from a FRESH
+        # GUI grant the user made but never re-edited (both have equal
+        # timestamps). This is an inherited blind spot: it fires only under the
+        # narrow drift + triple-agreement path that reaches this heal, and even
+        # then it never LOWERS privilege (the conflict branch keeps the higher
+        # of the two access levels). So a misclassified fresh grant is, at worst,
+        # rewritten to the canonical collection name with its access preserved —
+        # not a privilege downgrade. Accepted; not worth a schema change.
         if created_at != updated_at:
             # User-configured row — never auto-rewrite; report it.
             user_configured_left += 1
@@ -689,6 +699,16 @@ def heal_shared_kg_pointer_drift(
                 (level, existing[0]),
                 key=lambda lv: _KG_ACCESS_RANK.get(lv, 0),
             )
+            # ACKNOWLEDGED LIMITATION (b) — R8/destructive-lens, accepted:
+            # this stamps the DEAD row's `updated_at` onto the SURVIVING (proj,
+            # last) row. If the survivor was itself a user-configured grant
+            # (created_at != updated_at), copying the dead row's timestamp can
+            # coincidentally make created_at == updated_at, flipping the
+            # survivor's "user-configured" flag to "seed-authored" for future
+            # heals. That is metadata drift only — the access_level is preserved
+            # (higher of the two) and no privilege is lost. Accepted as a
+            # cosmetic edge of the merge; not worth carrying the survivor's
+            # original created_at through just to preserve the flag.
             cur.execute(
                 "UPDATE kg_collection_access SET access_level = ?, updated_at = ? "
                 "WHERE project_id = ? AND collection_name = ?",
