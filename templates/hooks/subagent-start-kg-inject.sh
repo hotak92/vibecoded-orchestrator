@@ -60,6 +60,18 @@ if [ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/snapshot.sh" ]; then
     . "$(dirname "${BASH_SOURCE[0]}")/_lib/snapshot.sh"
 fi
 
+# v0.2.77 Part 9 task 5: shared TTL result-cache so spawn N>1 with the same
+# prompt is served from the cached KG result (~ms) instead of re-paying the
+# ~3.8 s/spawn search (1793 spawns ~= 113 min in one fleet session — audit
+# 2026-07-11). Every spawn STILL receives the injection, just from cache. The
+# cache TTL self-refreshes and knowledge/ edits invalidate via the post-file-edit
+# KG-sync path bumping the underlying nodes (the query key is the prompt, so a
+# genuinely different task still misses + queries live). Sourced only if present.
+if [ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/query-cache.sh" ]; then
+    # shellcheck source=_lib/query-cache.sh disable=SC1091
+    . "$(dirname "${BASH_SOURCE[0]}")/_lib/query-cache.sh"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 
@@ -146,7 +158,30 @@ fi
 # "KG: <title> | <type> | score=<n.nn> | <body>". Limit to 3 matches —
 # more would push past the SubagentStart additionalContext cap (10 KB
 # in emit-context.sh) and dilute the signal.
-MATCHES=$("$VENV" "$RL_SCRIPT" "$QUERY" --limit 3 --hook-format 2>/dev/null \
+#
+# v0.2.77 Part 9 task 5: serve from the shared TTL cache when available. The
+# cache key namespaces on the "kg-subagent" surface + prompt + limit so a repeat
+# spawn with the same task prompt replays the cached RAW output (~ms) instead of
+# re-running the ~3.8 s search. The RAW (pre-grep/pre-head) block is cached so
+# the identical post-filtering below applies to a cache hit exactly as to a live
+# result — the injection is byte-identical, just faster. Falls back to the direct
+# call when the cache helper is absent (partial install).
+_SAKG_RAW=""
+_SAKG_KEY=""
+if command -v vco_query_cache_key >/dev/null 2>&1; then
+    _SAKG_KEY="$(vco_query_cache_key "kg-subagent" "$QUERY" 3)"
+fi
+if [ -n "$_SAKG_KEY" ] && command -v vco_query_cache_get >/dev/null 2>&1 \
+        && _SAKG_RAW="$(vco_query_cache_get "$_SAKG_KEY")"; then
+    : # cache hit — _SAKG_RAW holds the cached RAW producer output (maybe empty)
+else
+    _SAKG_RAW="$("$VENV" "$RL_SCRIPT" "$QUERY" --limit 3 --hook-format 2>/dev/null || true)"
+    if [ -n "$_SAKG_KEY" ] && command -v vco_query_cache_put >/dev/null 2>&1; then
+        vco_query_cache_put "$_SAKG_KEY" "$_SAKG_RAW"
+    fi
+fi
+# Apply the SAME post-filtering to cache hits and live results (identical output).
+MATCHES=$(printf '%s\n' "$_SAKG_RAW" \
     | grep -v "^KG: no-results" \
     | head -60 || echo "")
 

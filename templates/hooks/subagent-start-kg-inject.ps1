@@ -35,6 +35,13 @@ if (Test-Path $EmitHelper) { . $EmitHelper }
 $SnapshotHelper = Join-Path $ScriptDir "_lib/snapshot.ps1"
 if (Test-Path $SnapshotHelper) { . $SnapshotHelper }
 
+# v0.2.77 Part 9 task 5: shared TTL result-cache so spawn N>1 with the same
+# prompt is served from cache (MUST MATCH subagent-start-kg-inject.sh).
+# $script:ProjectRoot (which the cache dir resolver reads) is set AFTER
+# $ProjectRoot is computed below.
+$QueryCacheHelper = Join-Path $ScriptDir "_lib/query-cache.ps1"
+if (Test-Path $QueryCacheHelper) { . $QueryCacheHelper }
+
 $FindPy = Join-Path $ScriptDir "_lib/find-python.ps1"
 if (Test-Path $FindPy) { . $FindPy }
 if (-not $PY) {
@@ -50,6 +57,8 @@ $ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) {
 } else {
     (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
 }
+# task 5: expose to the query-cache dir resolver.
+$script:ProjectRoot = $ProjectRoot
 
 # Parse SubagentStart payload from stdin: prompt (with synonyms),
 # session_id, agent_id, agent_type. Field-synonym set matches the
@@ -120,9 +129,30 @@ if (-not $Venv -or -not (Test-Path $RlScript)) { exit 0 }
 
 # Run the search with --hook-format. Limit to 3 matches to stay under
 # the additionalContext cap.
+#
+# v0.2.77 Part 9 task 5: serve from the shared TTL cache when available so a
+# repeat spawn with the same prompt replays the cached RAW output (~ms) instead
+# of re-running the ~3.8 s search. Cache the RAW (pre-filter) output so the
+# identical post-filtering below applies to a hit exactly as to a live result.
+# MUST MATCH subagent-start-kg-inject.sh.
 $Matches = ""
 try {
-    $rawOut = & $Venv $RlScript $Query --limit 3 --hook-format 2>$null
+    $rawOut = $null
+    $sakgKey = ""
+    if (Get-Command Get-VcoQueryCacheKey -ErrorAction SilentlyContinue) {
+        $sakgKey = Get-VcoQueryCacheKey "kg-subagent" $Query "3"
+    }
+    $served = $false
+    if ($sakgKey -and (Get-Command Get-VcoQueryCache -ErrorAction SilentlyContinue)) {
+        $qc = Get-VcoQueryCache $sakgKey
+        if ($qc.Hit) { $rawOut = $qc.Value; $served = $true }
+    }
+    if (-not $served) {
+        $rawOut = (& $Venv $RlScript $Query --limit 3 --hook-format 2>$null) -join "`n"
+        if ($sakgKey -and (Get-Command Set-VcoQueryCache -ErrorAction SilentlyContinue)) {
+            Set-VcoQueryCache $sakgKey ([string]$rawOut)
+        }
+    }
     if ($rawOut) {
         # Filter out the no-results sentinel; keep the first 60 lines so
         # we don't blow past the emit-context.ps1 cap with verbose
