@@ -69,10 +69,19 @@ _hub_token() {
     printf ''
 }
 
-# hub_has_key PROJECT KEY → exit 0 iff the hub serves a NON-EMPTY value for KEY
-# on project PROJECT (treated as an id-or-slug the hub resolves). Bounded
-# (--max-time 3), localhost-only, token off argv (`--header @-`). Soft-fails
-# (returns 1) on every error so the caller falls back to the file-store message.
+# hub_has_key PROJECT KEY → probe the launcher keychain via the hub.
+# Exit codes:
+#   0  confirmed HIT — the hub served a NON-EMPTY value for KEY on PROJECT.
+#   2  hub reachable but the probe was REFUSED (403) or UNAUTHORIZED (401)
+#      — the KEY STATE IS UNKNOWN. This is the v0.2.77 flip reality: the
+#      probe presents `hub.token.<project>`, but scoped tokens are keyed by
+#      launcher PROJECT_ID (a UUID) while PROJECT here is the FILE-STORE
+#      NAME, so the scoped file rarely exists → the probe rides the global
+#      hub.token → post-flip /env refuses it with 403. A 403/401 must NOT
+#      be read as "the hub doesn't have the key" (see die_miss).
+#   1  soft-fail — no curl / no hub / no token / any OTHER non-200. Treat
+#      as "hub couldn't answer"; caller falls back to the file-store hint.
+# Bounded (--max-time 3), localhost-only, token off argv (`--header @-`).
 hub_has_key() {
     local project="$1" key="$2"
     command -v curl >/dev/null 2>&1 || return 1
@@ -89,6 +98,13 @@ hub_has_key() {
                 <<<"Authorization: Bearer ${token}" 2>/dev/null) || return 1
     status="${body##*$'\n'}"
     body="${body%$'\n'*}"
+    # v0.2.77 Part 8 Task 4b (option iv): a 403/401 means the hub is up but
+    # this probe's credential was refused — the key state is UNKNOWN, NOT a
+    # confirmed absence. Signal that distinctly so die_miss withholds the
+    # divergent-copy `vct set` hint.
+    case "$status" in
+        403|401) return 2 ;;
+    esac
     [ "$status" = "200" ] || return 1
     # A 200 with an empty/absent value for the key is NOT a hit.
     case "$body" in
@@ -100,14 +116,34 @@ hub_has_key() {
 }
 
 # Emit the correct miss diagnostic for a file-store miss on `verb` and exit `code`.
-# When the hub HAS the key → point at the resolver script (NOT `vct set`, which
-# would fork a divergent copy). Otherwise → the classic `vct set` hint.
+#
+# Three outcomes from the hub probe:
+#   * confirmed HIT (0)          → point at the RESOLVER (the keychain has
+#                                  it; `vct set` would fork a divergent copy).
+#   * reachable-but-refused (2)  → key state UNKNOWN (v0.2.77 flip: the probe
+#                                  rode the global token and got 403/401).
+#                                  Withhold the `vct set` hint — a wrong-copy
+#                                  `vct set` while the keychain MIGHT already
+#                                  hold the value is exactly the divergence we
+#                                  avoid. Point at the resolver instead, noting
+#                                  the probe couldn't confirm.
+#   * soft-fail (1)              → hub couldn't answer → classic `vct set` hint.
 die_miss() {
     local verb="$1" code="$2" project="$3" key="$4"
-    if hub_has_key "$project" "$key"; then
+    hub_has_key "$project" "$key"
+    local probe=$?
+    if [ "$probe" -eq 0 ]; then
         die_code "$code" "$verb: not in the file store, but the launcher keychain HAS project=$project key=$key. \
 Resolve it via '.claude/scripts/vct_secrets_resolve.sh <project_folder> $key' (or vco_lib.agent_secrets.get('$key')). \
 Do NOT 'vct set' it — that creates a second, divergent copy on disk."
+    fi
+    if [ "$probe" -eq 2 ]; then
+        die_code "$code" "$verb: not in the file store. The hub is running but this probe could not confirm the \
+launcher keychain (403/401 — the per-project token file hub.token.<project_id> is keyed by the launcher PROJECT ID, \
+not the name '$project', so the probe fell back to the global hub.token which the /env route no longer accepts). \
+The keychain MAY already hold project=$project key=$key — resolve it via \
+'.claude/scripts/vct_secrets_resolve.sh <project_folder> $key' (or vco_lib.agent_secrets.get('$key')). \
+Do NOT 'vct set' it blindly — that risks a second, divergent copy on disk."
     fi
     die_code "$code" "$verb: secret not found — project=$project key=$key. Fix: vct set --project $project --key $key"
 }

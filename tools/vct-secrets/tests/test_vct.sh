@@ -316,6 +316,102 @@ t_doctor_token_shape() {
     rm -f "$VCT_SECRETS_DIR/shared/github_pat" "$VCT_SECRETS_DIR/shared/github_pat.alt"
 }
 
+# --- Fake-hub helper (v0.2.77 Part 8 Task 4b probe tests) ------------------
+# Spins a tiny python3 HTTP server that answers /env with a fixed status,
+# writes hub.port + hub.token under an isolated VCT_STATE_DIR, and returns
+# the state dir. The caller sets the desired status via arg $2.
+_start_fake_hub() {
+    local status="$1" statedir="$2"
+    command -v python3 >/dev/null 2>&1 || return 2  # skip if no python3
+    mkdir -p "$statedir"
+    local portfile="$statedir/.port"
+    python3 - "$status" "$portfile" <<'PYEOF' &
+import http.server, sys, socket
+status = int(sys.argv[1]); portfile = sys.argv[2]
+s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+with open(portfile, "w") as f: f.write(str(port))
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        body = b'{"error":{"code":"forbidden"}}' if status != 200 else b'{"K":"v"}'
+        self.send_response(status)
+        self.send_header("Content-Type","application/json")
+        self.send_header("Content-Length",str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
+PYEOF
+    echo $! > "$statedir/.hubpid"
+    # Wait for the port file, then publish hub.port + a global hub.token.
+    local port=""
+    for _ in $(seq 1 40); do
+        [ -s "$portfile" ] && port=$(cat "$portfile") && break
+        sleep 0.05
+    done
+    [ -n "$port" ] || return 1
+    printf '%s' "$port" > "$statedir/hub.port"
+    printf 'global-canary-token' > "$statedir/hub.token"
+    chmod 600 "$statedir/hub.token"
+    # Readiness probe.
+    for _ in $(seq 1 40); do
+        curl -s --max-time 0.5 "http://127.0.0.1:${port}/api/v1/projects/x/env?key=K" >/dev/null 2>&1 && break
+        sleep 0.05
+    done
+    return 0
+}
+
+_stop_fake_hub() {
+    local statedir="$1"
+    [ -f "$statedir/.hubpid" ] && kill "$(cat "$statedir/.hubpid")" 2>/dev/null || true
+}
+
+# --- Test (4b): a 403 probe must NOT suggest `vct set`; point at resolver ---
+# Post-flip the probe rides the global hub.token (the scoped file is keyed
+# by launcher project_id, not the file-store name) and /env returns 403.
+# The miss message must withhold the divergent-copy `vct set` hint.
+t_die_miss_403_withholds_vct_set() {
+    local sd="$TMP/hub403"
+    _start_fake_hub 403 "$sd"; local rc=$?
+    [ "$rc" -eq 2 ] && { echo "    (skipped: no python3)"; return 0; }
+    [ "$rc" -eq 0 ] || { echo "    fake hub failed to start"; return 1; }
+    local err
+    # `bare-miss-proj` has no file-store secret → die_miss fires. Isolated
+    # VCT_STATE_DIR points the probe at the fake 403 hub.
+    err=$(VCT_STATE_DIR="$sd" VCT_HUB_PORT="$(cat "$sd/hub.port")" \
+          "$VCT" get --project bare-miss-proj --key SOMEKEY 2>&1 >/dev/null)
+    _stop_fake_hub "$sd"
+    # Must NOT recommend `vct set` on a 403 (the harmful divergent-copy path).
+    # The HARMFUL recommendation is the "Fix: vct set ..." line (the
+    # classic miss hint). The correct messages instead say "Do NOT 'vct
+    # set' it", so we key on the recommendation phrase, not any mention.
+    case "$err" in
+        *"Fix: vct set"*) echo "    403 miss wrongly RECOMMENDED 'vct set': $err"; return 1 ;;
+    esac
+    # Must point at the resolver instead.
+    case "$err" in
+        *vct_secrets_resolve.sh*|*agent_secrets*) : ;;
+        *) echo "    403 miss did not point at the resolver: $err"; return 1 ;;
+    esac
+}
+
+# --- Test (4b): a confirmed 200 HIT still points at the resolver, no `vct set`
+t_die_miss_hit_points_at_resolver() {
+    local sd="$TMP/hub200"
+    _start_fake_hub 200 "$sd"; local rc=$?
+    [ "$rc" -eq 2 ] && { echo "    (skipped: no python3)"; return 0; }
+    [ "$rc" -eq 0 ] || { echo "    fake hub failed to start"; return 1; }
+    local err
+    err=$(VCT_STATE_DIR="$sd" VCT_HUB_PORT="$(cat "$sd/hub.port")" \
+          "$VCT" get --project hit-proj --key K 2>&1 >/dev/null)
+    _stop_fake_hub "$sd"
+    case "$err" in
+        *"Fix: vct set"*) echo "    hit miss wrongly RECOMMENDED 'vct set': $err"; return 1 ;;
+    esac
+    case "$err" in
+        *vct_secrets_resolve.sh*) : ;;
+        *) echo "    hit miss did not point at the resolver: $err"; return 1 ;;
+    esac
+}
+
 # --- Run ---
 printf 'Running vct test suite (VCT_SECRETS_DIR=%s)\n\n' "$VCT_SECRETS_DIR"
 
@@ -341,6 +437,8 @@ run_test "get/exec default to shared (S-2)" t_shared_default_get_exec
 run_test "can-read exit codes (S-5)"   t_can_read
 run_test "resolve prints source path (S-5)" t_resolve_path
 run_test "doctor github_pat shape check (S-3)" t_doctor_token_shape
+run_test "die_miss 403 withholds 'vct set' (4b)" t_die_miss_403_withholds_vct_set
+run_test "die_miss hit points at resolver (4b)"  t_die_miss_hit_points_at_resolver
 
 printf '\n=== Results: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 if [ $FAIL -gt 0 ]; then
