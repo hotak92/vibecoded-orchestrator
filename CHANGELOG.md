@@ -62,7 +62,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `yes`) on the **hub process** to re-open the compat window for one more
   release, then restart the hub. Any other value — including unset, `0`,
   `false`, `no`, or a typo — denies (fail-closed). This escape hatch will
-  be removed in a future release. (Part 8)
+  be removed in a future release. Note: a project whose bundle has NOT yet
+  been updated to v0.2.76+ still ships resolvers WITHOUT the `403` arm, so a
+  refusal there is mislabeled `hub_unreachable` and falls back to
+  `.claude/settings.json` env values (config) / the file store (secrets)
+  until "Update bundle" runs and refreshes the resolver copies. (Part 8)
 
 ### Removed
 - **The unconsumed TOUCAN dataset collector.** The PreToolUse hook

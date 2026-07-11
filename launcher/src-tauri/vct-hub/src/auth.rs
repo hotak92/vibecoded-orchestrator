@@ -645,9 +645,12 @@ pub async fn require_auth(req: Request<Body>, next: Next) -> Response {
                     return next.run(req).await;
                 }
                 return forbidden_response(
-                    "the global hub.token is no longer accepted on /env + /config \
-                     (VCT_HUB_LEGACY_GLOBAL_ENV=0); present the per-project token \
-                     (hub.token.<project_id>) — the bundled resolvers already prefer it",
+                    "the global hub.token is refused by default as of v0.2.77 on \
+                     /env + /config; present the per-project token \
+                     (hub.token.<project_id>) — the bundled resolvers already \
+                     prefer it, and the hub lazy-mints one for a mid-session \
+                     project — or set VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to \
+                     reopen the one-release compat window",
                 );
             }
             ProjectRouteAuth::NoMatch => return unauthorized_response(),

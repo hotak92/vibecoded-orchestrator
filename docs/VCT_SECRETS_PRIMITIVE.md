@@ -98,13 +98,19 @@ is absent (a project added while the hub is running, or a pre-v0.2.76
 hub). `VCT_HUB_TOKEN` (env) still overrides both, so a test/dev harness
 that pins it keeps a single token across every route.
 
-The global `hub.token` remains accepted on these two routes for a
-**one-release compatibility window** (logged once per project as a
-deprecation). Set `VCT_HUB_LEGACY_GLOBAL_ENV=0` to refuse the global
-token on `/env` + `/config` now (the routes then require the per-project
-token; a wrong-project token is always a hard `403`). The default flips
-to refuse next release. POSIX and PowerShell resolvers behave
-identically — see the must-match triplet above.
+As of **v0.2.77 the global `hub.token` is REFUSED by default** on these two
+routes (`/env` + `/config`) — the one-release compatibility window that
+v0.2.76 opened is now closed by default. A per-project scoped token is
+required; a wrong-project token is always a hard `403`. If a bespoke caller
+still presents the global token and cannot migrate yet, set
+`VCT_HUB_LEGACY_GLOBAL_ENV=1` (or `true` / `TRUE` / `yes`) on the **hub
+process** to re-open the compat window for one more release, then restart the
+hub. Any other value — including **unset**, `0`, `false`, `no`, or a typo —
+**denies** (fail-closed); note that unset now DENIES (the opposite of the
+v0.2.76 default). This escape hatch will be removed in a future release. The
+hub lazy-mints a scoped token on the first request for a project added while
+it was running, so standard installs need nothing. POSIX and PowerShell
+resolvers behave identically — see the must-match triplet above.
 
 ---
 

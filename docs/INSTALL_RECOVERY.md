@@ -316,9 +316,12 @@ proxy env vars (`HTTP_PROXY`, `HTTPS_PROXY`).
 
 Symptom: `claude mcp list` is healthy, hook registrations in
 `.claude/settings.json` look correct, but `bash-context-inject.sh`,
-`pre-edit-context-inject.sh` etc. never run — no logs in
-`.claude/logs/YYYY-MM-DD_tool_usage.jsonl`, no observable side
-effects. Cause (pre-v0.2.53): a subset of `templates/hooks/*.sh`
+`pre-edit-context-inject.sh` etc. never run — no entries in
+`.claude/logs/security_events.jsonl` (the hooks' security-event log) and
+no hook stderr under `.claude/logs/`, no observable side effects. (The
+dated `*_tool_usage.jsonl` file is written by the weaviate MCP's query
+logger, not by the hooks, so its absence is NOT a hook-health signal.)
+Cause (pre-v0.2.53): a subset of `templates/hooks/*.sh`
 were committed with mode `0644`, `shutil.copy2` preserved that mode
 into the project, and POSIX Claude Code refuses to invoke a
 non-executable hook script.

@@ -512,7 +512,7 @@ Every `/api/v1/*` route (except `/health`) requires `Authorization: Bearer <toke
 
 The two per-project routes — `GET /api/v1/projects/{id}/env` and `GET /api/v1/projects/{id}/config` — accept a **project-scoped** bearer (`hub.token.<project_id>`) in addition to the global `hub.token`. The hub mints one scoped token per registered project at startup (mode `0o600` on Unix; default same-user ACL on Windows), rotates them each start, and removes the file for a deleted project. The bundled resolvers already prefer the scoped token — they read `hub.token.<id>` first and fall back to `hub.token` when it is absent (a project added while the hub runs, or a pre-v0.2.76 hub). `VCT_HUB_TOKEN` (env) overrides both.
 
-- **`403 forbidden` with `"a token minted for project A cannot read project B"`**: you presented one project's scoped token on a DIFFERENT project's route. A scoped token never crosses the project boundary — use the token for the project in the URL (`hub.token.<that-id>`), or the global `hub.token` during the compat window.
+- **`403 forbidden` with `"a token minted for project A cannot read project B"`**: you presented one project's scoped token on a DIFFERENT project's route. A scoped token never crosses the project boundary — use the token for the project in the URL (`hub.token.<that-id>`), or, only if the hub was started with `VCT_HUB_LEGACY_GLOBAL_ENV=1`, the global `hub.token` (the compat window is closed by default as of v0.2.77).
 
   ```bash
   # POSIX: read a scoped token for the exact project in the URL
@@ -523,7 +523,7 @@ The two per-project routes — `GET /api/v1/projects/{id}/env` and `GET /api/v1/
   Get-Content "$env:VCT_STATE_DIR\hub.token.<project_id>" -Raw
   ```
 
-- **`403 forbidden` naming `VCT_HUB_LEGACY_GLOBAL_ENV`**: the global-token compat window is closed on these routes (`VCT_HUB_LEGACY_GLOBAL_ENV=0`). Present the per-project token instead (the bundled resolvers do this automatically), or unset the flag to re-enable the compat path for this release. The default flips to refuse next release.
+- **`403 forbidden` naming `VCT_HUB_LEGACY_GLOBAL_ENV`**: as of v0.2.77 the global-token compat window is **closed by default** on these routes — the hub refuses the coarse global `hub.token` on `/env` + `/config`. Present the per-project token instead (the bundled resolvers do this automatically; the hub also lazy-mints a scoped token for a project added mid-session). If a bespoke caller genuinely cannot migrate yet, set `VCT_HUB_LEGACY_GLOBAL_ENV=1` (or `true`/`TRUE`/`yes`) on the **hub process** and restart it to re-open the window for one more release. **Unset, `0`, `false`, `no`, or any typo all DENY** (fail-closed) — unsetting the flag does NOT re-enable the compat path anymore (that was the v0.2.76 behaviour). The escape hatch is removed in a future release.
 
 ### Boot autostart not firing
 

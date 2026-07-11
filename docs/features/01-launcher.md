@@ -284,7 +284,7 @@ The Hub is the launcher's local HTTP face — used by the headless `vco` CLI, by
 After binding, the hub writes the actual port to `~/.vct/hub.port`. Consumers (CLI, MCP servers, other apps) read this file to discover the hub — especially useful when the default 7700 is taken.
 
 ### Auth Token (`~/.vct/hub.token`)
-On every startup the hub generates a fresh 32-byte CSPRNG token and writes it to `<vct_root_dir>/hub.token` (mode `0o600` on Unix). Every `/api/v1/*` request must carry `Authorization: Bearer <token>` — same-user processes that can read `hub.token` authenticate transparently; other-user processes get 401. The token is regenerated on every launcher start to bound the leak window. See `launcher/src-tauri/src/hub/auth.rs` for the threat model.
+On every startup the hub generates a fresh 32-byte CSPRNG token and writes it to `<vct_root_dir>/hub.token` (mode `0o600` on Unix). Every `/api/v1/*` request must carry `Authorization: Bearer <token>` — same-user processes that can read `hub.token` authenticate transparently; other-user processes get 401. The token is regenerated on every launcher start to bound the leak window. **v0.2.77:** the two per-project routes `GET /api/v1/projects/{id}/env` and `.../config` require a project-SCOPED token `hub.token.<project_id>` — the global `hub.token` is REFUSED (403) there by default (bundled resolvers prefer the scoped token; the hub lazy-mints one for a mid-session project; `VCT_HUB_LEGACY_GLOBAL_ENV=1` on the hub reopens a one-release compat window). Every other route still accepts the global token. See `launcher/src-tauri/src/hub/auth.rs` for the threat model.
 
 ### Port Retry
 `try_bind` tries the base port and up to 5 increments before failing. Actual bound port is written to `hub.port` regardless of which offset was chosen.
@@ -502,7 +502,7 @@ Returns the current high-water sequence number. The UI calls this once at load t
 
 ## Hub HTTP API — Routes
 
-The hub HTTP server (`hub/server.rs`, port 7700) nests four sub-routers under `/api/v1`. All routes bind to `127.0.0.1` only and require `Authorization: Bearer <token>` (token at `~/.vct/hub.token`); CORS is permissive because the auth gate is on the bearer token, not the origin (see [Auth Token](#auth-token-vcthubtoken) and [CORS Wildcard](#cors-wildcard)). Routes by source module:
+The hub HTTP server (`hub/server.rs`, port 7700) nests four sub-routers under `/api/v1`. All routes bind to `127.0.0.1` only and require `Authorization: Bearer <token>` (token at `~/.vct/hub.token`) — except the two per-project `/env` + `/config` routes, which as of v0.2.77 require the project-SCOPED `hub.token.<project_id>` and refuse the global token by default (see [Auth Token](#auth-token-vcthubtoken)). CORS is permissive because the auth gate is on the bearer token, not the origin (see also [CORS Wildcard](#cors-wildcard)). Routes by source module:
 
 ### Core operations (`hub/api.rs`)
 - `GET /api/v1/health` — liveness probe; returns `{ok: true, version}`.

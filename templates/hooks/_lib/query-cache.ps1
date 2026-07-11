@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+#
 # _lib/query-cache.ps1
 # Shared TTL result-cache for the code-graph / KG injection queries. The
 # PowerShell sibling of _lib/query-cache.sh.
