@@ -48,7 +48,7 @@ _TESTS_DIR = Path(__file__).resolve().parents[2]
 if str(_TESTS_DIR.parent) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR.parent))
 
-from tests.common.sandbox import teardown_sandbox  # noqa: E402
+from tests.common.sandbox import compute_run_id, teardown_sandbox  # noqa: E402
 from tests.integration.step22_multi_project.fixture import (  # noqa: E402
     FixtureResult,
     HubProc,
@@ -511,7 +511,19 @@ def compat_hub() -> Iterator[tuple[FixtureResult, HubProc]]:
     bin_path = _hub_binary_path()
     if not bin_path.exists():
         pytest.skip(f"vct-hub binary not found at {bin_path}")
-    fx = build_fixture()
+    # Fixture isolation: this module has TWO module-scoped fixtures that
+    # each call build_fixture() — `fixture_result` and this one. With no
+    # explicit run_id, build_fixture() derives it from compute_run_id(),
+    # which returns $GITHUB_RUN_ID in CI: a CONSTANT for the whole run. So
+    # both fixtures would resolve to the same VCT_STATE_DIR / launcher.db,
+    # and the second _seed_project_row() would hit
+    # `UNIQUE constraint failed: projects.slug`. (Locally GITHUB_RUN_ID is
+    # unset, so compute_run_id() returns a fresh random token per call and
+    # the collision never surfaces — hence CI-only.) Give this fixture its
+    # OWN fully-isolated sandbox by suffixing the base run_id. The suffix
+    # stays alphanumeric so it remains a valid sandbox/collection namespace.
+    compat_run_id = f"{compute_run_id()}compat"
+    fx = build_fixture(run_id=compat_run_id)
     proc = None
     try:
         proc = start_hub(
