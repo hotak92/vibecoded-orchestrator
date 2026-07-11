@@ -319,30 +319,34 @@ pub(crate) fn per_project_token_route(path: &str) -> Option<&str> {
     }
 }
 
-/// Whether the one-release compat window still accepts the global
-/// `hub.token` on the per-project `/env` + `/config` routes.
+/// Whether the (now opt-IN) compat window accepts the global `hub.token`
+/// on the per-project `/env` + `/config` routes.
 ///
-/// Task 4 (v0.2.76 Part 4): `VCT_HUB_LEGACY_GLOBAL_ENV` — DEFAULT
-/// allow ("1"/unset) THIS release so existing callers (step22, any
-/// bundled resolver that hasn't picked up a per-project token yet) keep
-/// working. Set to `"0"` to lock the routes to per-project tokens NOW
-/// (opt-in early). The DEFAULT flips to deny NEXT release (dated comment
-/// below) — do NOT flip it in this cycle.
+/// ─── DEFAULT FLIPPED (v0.2.77 Part 8) ───────────────────────────────
+/// Introduced in v0.2.76 Part 4 as DEFAULT-allow (a one-release compat
+/// window). As of v0.2.77 the default is FLIPPED to DENY: an UNSET or
+/// unrecognised `VCT_HUB_LEGACY_GLOBAL_ENV` now REFUSES the global token
+/// on these two routes. The per-project scoped token
+/// (`hub.token.<project_id>`) is required — the bundled resolver triplet
+/// already prefers it (v0.2.76 Part 4 Task 3), the hub lazy-mints a
+/// scoped token for projects added mid-session (Part 8 Task 4a), and the
+/// auth layer canonicalizes id-or-slug before comparing (Part 8 Task 4d).
 ///
-/// Recognised deny values: exactly `"0"`, `"false"`, `"no"` (case-
-/// sensitive on the latter two per the same terse convention as the
-/// bind env). Any other value — including unset — allows (compat).
+/// Operator escape hatch: set `VCT_HUB_LEGACY_GLOBAL_ENV=1` (or `true` /
+/// `TRUE` / `yes`) on the HUB process to REOPEN the compat window for one
+/// more release while migrating a bespoke caller. Scoped tokens are
+/// automatic on the next hub restart, so most installs need nothing.
 ///
-// FLIP-DEFAULT-NEXT-RELEASE (target: the release AFTER v0.2.76): change
-// the default so that an UNSET / unrecognised value DENIES the global
-// token on these routes. Callers must present the per-project token by
-// then; the resolver triplet already prefers it (v0.2.76 Part 4 Task 3).
+/// Recognised ALLOW values: exactly `"1"`, `"true"`, `"TRUE"`, `"yes"`
+/// (same terse set + case convention as the bind env `VCT_HUB_BIND_ALL`).
+/// EVERY other value — including unset, `"0"`, `"false"`, `"no"`, or any
+/// typo — DENIES (fail-closed: an unrecognised value must not silently
+/// re-open a security boundary).
 fn legacy_global_env_allowed() -> bool {
-    match std::env::var("VCT_HUB_LEGACY_GLOBAL_ENV").ok().as_deref() {
-        Some("0") | Some("false") | Some("no") => false,
-        // Some(_) truthy, or None → allow (the v0.2.76 compat default).
-        _ => true,
-    }
+    matches!(
+        std::env::var("VCT_HUB_LEGACY_GLOBAL_ENV").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes")
+    )
 }
 
 /// Process-lifetime dedup set for the "global token used on a per-project
@@ -364,12 +368,13 @@ fn warn_legacy_global_env_once(project_id: &str) {
     }
     eprintln!(
         "[vct-hub] DEPRECATION: the global hub.token was used to read \
-         /projects/{}/env or /config. This coarse credential grants every \
-         project's env + config; migrate to the per-project token \
-         (hub.token.{}) — the bundled resolvers already prefer it. The \
-         global-token path is a one-release compat window (v0.2.76) and \
-         will be refused next release (or now, if you set \
-         VCT_HUB_LEGACY_GLOBAL_ENV=0).",
+         /projects/{}/env or /config, accepted ONLY because you set \
+         VCT_HUB_LEGACY_GLOBAL_ENV=1 to re-open the compat window (the \
+         default is now DENY as of v0.2.77). This coarse credential grants \
+         every project's env + config; migrate to the per-project token \
+         (hub.token.{}) — the bundled resolvers already prefer it and the \
+         hub mints one per project — then UNSET the flag. This escape \
+         hatch will be removed in a future release.",
         project_id, project_id
     );
 }
@@ -969,7 +974,12 @@ mod tests {
             .route(
                 "/api/v1/projects/{id}/env",
                 get(|| async { "secrets here" }),
-            );
+            )
+            // A NON-per-project route: the global hub.token is the correct
+            // credential here, unaffected by the v0.2.77 /env+/config flip.
+            // The "correct token accepted" test targets this so it asserts
+            // the global-token auth path itself, not the per-project gate.
+            .route("/api/v1/ping", get(|| async { "pong" }));
         app.layer(axum::middleware::from_fn(require_auth))
             .layer(axum::Extension(auth_state))
     }
@@ -1059,16 +1069,20 @@ mod tests {
 
     #[tokio::test]
     async fn hub_accepts_request_with_correct_bearer_token() {
+        // Target a NON-per-project route: the global hub.token is the
+        // correct credential there and the v0.2.77 flip (which only gates
+        // /env + /config) does not affect it. This test asserts the
+        // global-token auth path, not the per-project gate.
         let base = spawn_router(router_with_auth("the-correct-token")).await;
         let client = reqwest::Client::new();
         let resp = client
-            .get(format!("{}/api/v1/projects/p1/env", base))
+            .get(format!("{}/api/v1/ping", base))
             .header("Authorization", "Bearer the-correct-token")
             .send()
             .await
             .expect("hub reachable");
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.text().await.unwrap(), "secrets here");
+        assert_eq!(resp.text().await.unwrap(), "pong");
     }
 
     #[tokio::test]
@@ -1157,11 +1171,8 @@ mod tests {
             evaluate_project_route_auth("proj-a", "token-b", global, &reg),
             ProjectRouteAuth::WrongProject { owner: "proj-b".to_string() }
         );
-        // Global token → compat allow (default flag).
-        assert!(matches!(
-            evaluate_project_route_auth("proj-a", global, global, &reg),
-            ProjectRouteAuth::GlobalTokenCompat
-        ));
+        // (Global-token posture is flag-driven — asserted explicitly at
+        // the end of this test under a held flag guard, both directions.)
         // Garbage → 401.
         assert!(matches!(
             evaluate_project_route_auth("proj-a", "nonsense", global, &reg),
@@ -1175,6 +1186,22 @@ mod tests {
             evaluate_project_route_auth("proj-unknown", "token-a", global, &reg),
             ProjectRouteAuth::WrongProject { owner: "proj-a".to_string() }
         );
+
+        // Global-token posture is flag-driven — assert BOTH explicitly
+        // (v0.2.77 flip: default is now DENY, so we pin each side under a
+        // held flag guard rather than riding an implicit default).
+        {
+            let g = LegacyFlagGuard::cleared(); // unset → default DENY.
+            assert!(matches!(
+                evaluate_project_route_auth("proj-a", global, global, &reg),
+                ProjectRouteAuth::GlobalTokenRefused
+            ));
+            g.reset("1"); // explicit opt-in → compat allow.
+            assert!(matches!(
+                evaluate_project_route_auth("proj-a", global, global, &reg),
+                ProjectRouteAuth::GlobalTokenCompat
+            ));
+        }
     }
 
     #[tokio::test]
@@ -1235,13 +1262,17 @@ mod tests {
 
     #[tokio::test]
     async fn env_route_accepts_global_token_compat_window() {
+        // v0.2.77 flip: the compat window is now OPT-IN — the operator
+        // must set VCT_HUB_LEGACY_GLOBAL_ENV=1 explicitly. This test pins
+        // that the escape hatch still WORKS when re-opened.
+        let _g = LegacyFlagGuard::set("1");
         let base = spawn_router(router_with_project_tokens(
             "global-tok",
             &[("proj-a", "tok-a")],
         ))
         .await;
         let client = reqwest::Client::new();
-        // The global token still works on /env (one-release compat).
+        // With the flag opted back in, the global token works on /env.
         let resp = client
             .get(format!("{}/api/v1/projects/proj-a/env", base))
             .header("Authorization", "Bearer global-tok")
@@ -1249,6 +1280,44 @@ mod tests {
             .await
             .expect("hub reachable");
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// v0.2.77 flip: the DEFAULT-path test. With NO flag set (the new
+    /// default), the global token is REFUSED on /env with a 403 — this is
+    /// now the out-of-the-box posture, not an opt-in. Formerly
+    /// `env_route_refuses_global_token_when_flag_off` covered this only
+    /// under an explicit VCT_HUB_LEGACY_GLOBAL_ENV=0; that test remains
+    /// (belt + suspenders), but THIS one pins the unset-default behaviour.
+    #[tokio::test]
+    async fn env_route_refuses_global_token_by_default_post_flip() {
+        let _g = LegacyFlagGuard::cleared(); // unset → default DENY.
+        let base = spawn_router(router_with_project_tokens(
+            "global-tok",
+            &[("proj-a", "tok-a")],
+        ))
+        .await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("{}/api/v1/projects/proj-a/env", base))
+            .header("Authorization", "Bearer global-tok")
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "unset flag → global token refused (v0.2.77 flipped default)"
+        );
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("VCT_HUB_LEGACY_GLOBAL_ENV"), "body: {}", body);
+        // The scoped token STILL authorizes under the default.
+        let resp2 = client
+            .get(format!("{}/api/v1/projects/proj-a/env", base))
+            .header("Authorization", "Bearer tok-a")
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp2.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1295,14 +1364,17 @@ mod tests {
         assert_eq!(resp2.status(), StatusCode::OK);
     }
 
-    // ─── v0.2.76 Part 4 Task 4: VCT_HUB_LEGACY_GLOBAL_ENV flag ───────
+    // ─── VCT_HUB_LEGACY_GLOBAL_ENV flag (DEFAULT FLIPPED v0.2.77) ─────
     //
-    // The flag DEFAULTS to allow this release (compat window) and flips
-    // to deny NEXT release. These tests pin BOTH postures NOW so the
-    // flip is a one-line default change with test coverage already in
-    // place. The env var is process-global; cargo runs vct-hub tests with
-    // RUST_TEST_THREADS=1 (serialised — see .cargo/config.toml), so each
-    // test sets + restores it without racing siblings.
+    // Introduced v0.2.76 Part 4 as DEFAULT-allow (one-release compat).
+    // As of v0.2.77 Part 8 the DEFAULT is DENY: unset/unrecognised
+    // refuses the global token on /env + /config; only "1"/"true"/
+    // "TRUE"/"yes" re-open the window. These tests pin the flipped
+    // semantics — compat tests now set "1" EXPLICITLY (they no longer
+    // ride an implicit default-allow). The env var is process-global;
+    // cargo runs vct-hub tests with RUST_TEST_THREADS=1 (serialised — see
+    // .cargo/config.toml), so each test sets + restores it without racing
+    // siblings.
 
     /// Serialise the env-mutating flag tests among themselves (belt +
     /// suspenders on top of the workspace-wide single-thread setting).
@@ -1363,24 +1435,28 @@ mod tests {
     }
 
     #[test]
-    fn legacy_global_env_allowed_default_and_deny_values() {
-        // ONE guard holds the lock for the whole test; mutate via
-        // reset/reclear (the mutex is not reentrant).
+    fn legacy_global_env_allowed_default_and_allow_values() {
+        // v0.2.77 Part 8 (flip): the DEFAULT is now DENY. Unset → deny;
+        // only the recognised truthy set allows; every other value —
+        // including "0"/"false"/"no" AND an unrecognised typo — denies
+        // (fail-closed). ONE guard holds the lock for the whole test.
         let g = LegacyFlagGuard::cleared();
         assert!(
-            legacy_global_env_allowed(),
-            "unset → allow (compat default)"
+            !legacy_global_env_allowed(),
+            "unset → DENY (v0.2.77 flipped default)"
         );
-        for deny in ["0", "false", "no"] {
-            g.reset(deny);
-            assert!(!legacy_global_env_allowed(), "{:?} → deny", deny);
-        }
-        for allow in ["1", "true", "yes", "anything-else"] {
+        // The ONLY values that re-open the compat window.
+        for allow in ["1", "true", "TRUE", "yes"] {
             g.reset(allow);
             assert!(legacy_global_env_allowed(), "{:?} → allow", allow);
         }
+        // Explicit deny values AND anything unrecognised → deny.
+        for deny in ["0", "false", "no", "anything-else", "", "True", "YES"] {
+            g.reset(deny);
+            assert!(!legacy_global_env_allowed(), "{:?} → deny (fail-closed)", deny);
+        }
         g.reclear();
-        assert!(legacy_global_env_allowed(), "recleared → allow");
+        assert!(!legacy_global_env_allowed(), "recleared (unset) → DENY");
     }
 
     #[test]

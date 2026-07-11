@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **The hub now REFUSES the coarse global `hub.token` on the per-project
+  `/env` + `/config` routes by default** (v0.2.76 introduced the per-project
+  token `hub.token.<project_id>` behind a one-release compat window; this
+  flips that window's default from allow to deny). A scoped per-project
+  token is now required on those two routes — the bundled resolver triplet
+  (bash / PowerShell / Python) already prefers it, so most callers need
+  nothing. Every other `/api/v1` route keeps using the global token
+  unchanged. Supporting changes so the flip is safe:
+  - **Lazy-mint for mid-session-added projects (4a):** the hub mints a
+    scoped token on the first request for a project added while it was
+    already running (previously such a project had to wait for the next
+    restart). Only for DB-known projects; unknown ids stay `401`;
+    idempotent; the token still rotates on the next startup.
+  - **Slug canonicalization in auth (4d):** the `/env` + `/config` handler
+    accepts either a project id OR a slug, so a scoped-token call addressed
+    by slug no longer gets a spurious wrong-project `403` — the auth layer
+    canonicalizes the URL segment to an id before the owner comparison.
+  - **Resolvers surface a distinct `403` (4c):** the bash / PowerShell /
+    Python resolvers now map a hub `403` to a typed forbidden condition
+    (new exit code `5` for the shell pair; `Forbidden` — NOT a
+    `HubUnreachable` subclass — for Python) instead of mislabeling it
+    "hub unreachable", so a scoped-token misconfiguration is not masked by
+    an env-var fallback.
+  - **`vct` miss hint (4b):** a `403` from the keychain probe no longer
+    recommends `vct set` (which would fork a divergent on-disk copy); it
+    points at the resolver instead.
+
+  **OPERATOR MIGRATION:** nothing is required for standard installs —
+  scoped tokens are minted automatically on the next hub restart and the
+  bundled resolvers already use them. If you have a BESPOKE caller that
+  still presents the global `hub.token` to `/env` or `/config` and cannot
+  migrate yet, set **`VCT_HUB_LEGACY_GLOBAL_ENV=1`** (or `true` / `TRUE` /
+  `yes`) on the **hub process** to re-open the compat window for one more
+  release, then restart the hub. Any other value — including unset, `0`,
+  `false`, `no`, or a typo — denies (fail-closed). This escape hatch will
+  be removed in a future release. (Part 8)
+
 ## [0.2.76] - 2026-07-10
 
 ### Security
