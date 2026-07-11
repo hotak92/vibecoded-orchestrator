@@ -259,6 +259,33 @@ out=$("$RESOLVER" "$PROJECT_ID" --field code_graph_extra_paths 2>/dev/null)
 assert_lines_eq "$out" "/home/u/with spaces/x" \
     "paths with spaces round-trip cleanly"
 
+# ── Test 8: 403 on a plain config fetch → exit 5 (forbidden), NOT exit 1
+# (v0.2.77 flip 4c). A 403 is a scoped-credential boundary refusal — the
+# resolver must surface it as a distinct HARD forbidden condition so hook
+# consumers never treat it as "hub unreachable" and env-fall back (which
+# would mask the misconfiguration).
+cfg_fpath="$scratch/responses/GET_projects_${PROJECT_ID}_config.json"
+cat > "$cfg_fpath" <<'JSON'
+{"error":{"code":"forbidden","message":"this per-project token does not authorize the project in the URL"}}
+JSON
+echo "403" > "$cfg_fpath.status"
+set +e
+err=$("$RESOLVER" "$PROJECT_ID" 2>&1 >/dev/null)
+rc=$?
+set -e
+assert_eq "$rc" "5" "403 on config fetch → exit 5 (forbidden), not exit 1"
+case "$err" in
+    *forbidden*|*403*)
+        printf '  PASS  403 emits a forbidden warning (not hub_unreachable)\n'
+        PASS=$((PASS + 1))
+        ;;
+    *)
+        printf '  FAIL  403 warning did not mention forbidden/403: %q\n' "$err" >&2
+        FAIL=$((FAIL + 1))
+        ;;
+esac
+rm -f "$cfg_fpath" "$cfg_fpath.status"
+
 # ── Summary ────────────────────────────────────────────────────────────
 echo
 echo "─────────────────────────────────────────────"

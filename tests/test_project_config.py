@@ -31,6 +31,7 @@ from vco_lib.project_config import (
     EmbeddingModels,
     ExtraCodegraphPath,
     FieldNotFound,
+    Forbidden,
     HubUnreachable,
     ProjectConfig,
     ProjectNotFound,
@@ -468,6 +469,46 @@ class ResolveErrorMappingTest(_ResolverTestBase):
         with self.assertRaises(ServiceMisconfigured):
             resolve(FULL_BODY["project_id"])
 
+    def test_403_maps_to_forbidden_not_hub_unreachable(self) -> None:
+        # v0.2.77 flip 4c: a 403 on /config is a scoped-credential boundary
+        # refusal → typed Forbidden, NOT HubUnreachable. Critical: a caller
+        # catching HubUnreachable for env-fallback MUST NOT swallow this, so
+        # Forbidden is deliberately not a HubUnreachable subclass.
+        self.session.get.return_value = _make_response(
+            403,
+            {"error": {"code": "forbidden", "message": "wrong project token"}},
+        )
+        with self.assertRaises(Forbidden):
+            resolve(FULL_BODY["project_id"])
+        # A UUID arg makes exactly one /config GET (no by-path); the 403 is
+        # a hard refusal so there is NO 401-style cache-invalidation retry.
+        self.assertEqual(self.session.get.call_count, 1)
+
+    def test_403_forbidden_is_not_hub_unreachable_subclass(self) -> None:
+        # Guard the class hierarchy: env-fallback code paths catch
+        # HubUnreachable; Forbidden must escape that catch.
+        self.assertTrue(issubclass(Forbidden, ResolverError))
+        self.assertFalse(issubclass(Forbidden, HubUnreachable))
+        self.session.get.return_value = _make_response(
+            403,
+            {"error": {"code": "forbidden", "message": "compat window closed"}},
+        )
+        with self.assertRaises(Forbidden):
+            resolve(FULL_BODY["project_id"])
+        # Confirm it is NOT caught by an `except HubUnreachable`.
+        self.session.get.return_value = _make_response(
+            403,
+            {"error": {"code": "forbidden", "message": "compat window closed"}},
+        )
+        raised_forbidden = False
+        try:
+            resolve(FULL_BODY["project_id"])
+        except HubUnreachable:
+            self.fail("403 must not be caught as HubUnreachable")
+        except Forbidden:
+            raised_forbidden = True
+        self.assertTrue(raised_forbidden)
+
     def test_401_maps_to_hub_unreachable(self) -> None:
         # Both attempts (initial + retry) 401 → final HubUnreachable.
         self.session.get.return_value = _make_response(
@@ -616,6 +657,16 @@ class ResolveFieldTest(_ResolverTestBase):
             resolve_field(FULL_BODY["project_id"], "")
         # No HTTP call should have been made.
         self.session.get.assert_not_called()
+
+    def test_403_maps_to_forbidden(self) -> None:
+        # v0.2.77 flip 4c: the single-field fast path must map a 403 to the
+        # typed Forbidden exactly like the full resolve() path.
+        self.session.get.return_value = _make_response(
+            403,
+            {"error": {"code": "forbidden", "message": "wrong project token"}},
+        )
+        with self.assertRaises(Forbidden):
+            resolve_field(FULL_BODY["project_id"], "kg_collection")
 
 
 # ─── schema_version (v0.2.22 Item #2) ───────────────────────────────────

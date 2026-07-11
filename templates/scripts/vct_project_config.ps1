@@ -29,6 +29,13 @@
 #   2  project not registered
 #   3  service misconfigured (primary KG binding missing)
 #   4  field not found
+#   5  forbidden (403 — scoped-credential boundary refusal; NOT transient,
+#      so callers must NOT env-fallback. Post-flip the hub returns 403 when
+#      the coarse global hub.token is presented on a per-project /env|/config
+#      route with the compat window closed, or a token minted for a DIFFERENT
+#      project is presented. Fix: present the scoped hub.token.<id> (this
+#      resolver already prefers it) or set VCT_HUB_LEGACY_GLOBAL_ENV=1 on the
+#      hub to reopen the one-release compat window.)
 #  64  usage error
 
 [CmdletBinding(DefaultParameterSetName = 'Config')]
@@ -491,6 +498,14 @@ function Resolve-ProjectId {
             Emit-Warning -ErrorKind "hub_unauthorized" -Detail "401 unauthorized on by-path; launcher may have restarted (token rotated). If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
             return @{ ExitCode = 1 }
         }
+        403 {
+            # by-path is NOT a per-project-token route (the flip only gates
+            # /env + /config), so a 403 here is anomalous. Still label it a
+            # hard forbidden refusal rather than mislabeling it
+            # hub_unreachable (which would trigger a spurious env-fallback).
+            Emit-Warning -ErrorKind "forbidden" -Detail "403 forbidden on by-path lookup for: $ArgValue; body=$($result.Body)"
+            return @{ ExitCode = 5 }
+        }
         200 {
             try {
                 $obj = $result.Body | ConvertFrom-Json
@@ -543,6 +558,16 @@ function Get-Config {
         401 {
             Emit-Warning -ErrorKind "hub_unauthorized" -Detail "401 unauthorized; launcher may have restarted (token rotated). If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
             return 1
+        }
+        403 {
+            # Scoped-credential boundary refusal (v0.2.77 flip). Mirrors the
+            # bash sibling's 403 arm: the hub ACCEPTED our request and knows
+            # the project, but refused this bearer — the coarse global
+            # hub.token on a per-project route with the compat window closed,
+            # or a per-project token minted for a DIFFERENT project. HARD
+            # refusal, NOT transient — do NOT env-fallback.
+            Emit-Warning -ErrorKind "forbidden" -Detail "403 forbidden for project ${ProjectId}: the global hub.token is refused on /config (per-project token required) or a token for another project was presented. Present the scoped hub.token.${ProjectId}, or set VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to reopen the one-release compat window. body=$($result.Body)"
+            return 5
         }
         200 {
             # Forward-compat check: warn (once, best-effort) if the

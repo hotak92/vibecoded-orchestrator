@@ -186,6 +186,28 @@ class FieldNotFound(ResolverError):
     """
 
 
+class Forbidden(ResolverError):
+    """The hub responded 403 on a per-project ``/env`` / ``/config`` route.
+
+    v0.2.77 flip. A HARD scoped-credential boundary refusal — the hub
+    ACCEPTED the request and knows the project, but refused the bearer:
+    either the coarse global ``hub.token`` on a per-project route with the
+    compat window closed (``VCT_HUB_LEGACY_GLOBAL_ENV`` unset/deny), or a
+    per-project token minted for a DIFFERENT project.
+
+    Deliberately NOT a :class:`HubUnreachable` subclass: unreachability is
+    a transient condition callers degrade to env-fallback on, whereas a 403
+    is a persistent misconfiguration that env-fallback would MASK. Callers
+    that catch :class:`HubUnreachable` for the fallback path will therefore
+    let this propagate (or handle it explicitly) rather than silently
+    resolving stale env values. The scoped ``hub.token.<id>`` is already
+    preferred by the resolver's token picker; a 403 means that file was
+    absent/unreadable (so we rode the global token) or the wrong project's
+    token was presented. Fix: ensure the scoped token file exists, or set
+    ``VCT_HUB_LEGACY_GLOBAL_ENV=1`` on the hub to reopen the compat window.
+    """
+
+
 # ─── Public dataclasses ─────────────────────────────────────────────────
 
 
@@ -891,6 +913,15 @@ def _resolve_project_id(project_arg: str) -> str:
             "hub returned 401 unauthorized; launcher may have restarted "
             f"(token rotated).{_POST_UPDATE_HINT}"
         )
+    if resp.status_code == 403:
+        # by-path is NOT a per-project-token route (the flip only gates
+        # /env + /config), so a 403 here is anomalous. Still raise the
+        # typed Forbidden rather than mislabeling it HubUnreachable — the
+        # latter would trigger a spurious env-fallback and hide the cause.
+        raise Forbidden(
+            f"hub returned 403 forbidden on by-path lookup for "
+            f"{project_arg!r}: {resp.text!r}"
+        )
     if resp.status_code == 404:
         raise ProjectNotFound(f"no project registered at path: {project_arg}")
     if resp.status_code == 400:
@@ -1212,6 +1243,16 @@ def resolve(project_root: Path | str) -> ProjectConfig:
         raise HubUnreachable(
             f"hub returned 401 unauthorized: {err_msg}"
         )
+    if resp.status_code == 403:
+        # Scoped-credential boundary refusal (v0.2.77 flip). HARD refusal,
+        # NOT transient — Forbidden is not a HubUnreachable subclass, so a
+        # caller catching HubUnreachable for env-fallback will not mask it.
+        raise Forbidden(
+            f"hub returned 403 forbidden for project {pid}: {err_msg}. "
+            f"Present the scoped hub.token.{pid}, or set "
+            f"VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to reopen the "
+            f"one-release compat window."
+        )
     if resp.status_code == 404:
         if err_code == "field_not_found":
             raise FieldNotFound(err_msg)
@@ -1297,6 +1338,16 @@ def resolve_field(
 
     if resp.status_code == 401:
         raise HubUnreachable(f"hub returned 401 unauthorized: {err_msg}")
+    if resp.status_code == 403:
+        # Scoped-credential boundary refusal (v0.2.77 flip). See resolve()
+        # for the full rationale — Forbidden is intentionally NOT a
+        # HubUnreachable subclass so env-fallback callers don't mask it.
+        raise Forbidden(
+            f"hub returned 403 forbidden for project {pid}: {err_msg}. "
+            f"Present the scoped hub.token.{pid}, or set "
+            f"VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to reopen the "
+            f"one-release compat window."
+        )
     if resp.status_code == 404:
         if err_code == "field_not_found":
             raise FieldNotFound(err_msg)
@@ -1371,6 +1422,7 @@ __all__ = [
     "EmbeddingModels",
     "ExtraCodegraphPath",
     "FieldNotFound",
+    "Forbidden",
     "HUB_DISCOVERY_TTL_SECONDS",
     "HubUnreachable",
     "ProjectConfig",

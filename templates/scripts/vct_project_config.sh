@@ -28,6 +28,14 @@
 #   2  project not registered (404 project_not_found)
 #   3  service misconfigured (503 — primary KG binding missing)
 #   4  field not found (--field NAME, NAME not in config)
+#   5  forbidden (403 — a scoped-credential boundary refusal; NOT a
+#      transient/unreachable condition, so callers must NOT env-fallback.
+#      Post-flip the hub returns 403 when a resolver presents the coarse
+#      global hub.token on a per-project /env|/config route while the
+#      compat window is closed, or presents a per-project token minted
+#      for a DIFFERENT project. Fix: present the scoped hub.token.<id>
+#      (this resolver already prefers it) or set
+#      VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to reopen the compat window.)
 #   64 usage error
 #
 # Hub discovery:
@@ -542,6 +550,15 @@ resolve_project_id() {
             _emit_warning "hub_unauthorized" "401 unauthorized on by-path; launcher may have restarted (token rotated). If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
             return 1
             ;;
+        403)
+            # by-path is NOT a per-project-token route (the flip only gates
+            # /env + /config), so a 403 here is anomalous. Still label it as
+            # a hard forbidden refusal rather than mislabeling it
+            # hub_unreachable — the latter would trigger a spurious
+            # env-fallback and hide the real cause.
+            _emit_warning "forbidden" "403 forbidden on by-path lookup for: $arg; body=$body"
+            return 5
+            ;;
         404)
             _emit_warning "project_not_registered" "no project registered at path: $arg"
             return 2
@@ -680,6 +697,20 @@ fetch_config() {
         401)
             _emit_warning "hub_unauthorized" "401 unauthorized; launcher may have restarted (token rotated). If VCO was just updated, restart the launcher and reload the editor window (a pre-update session may hold a stale VCT_HUB_TOKEN)."
             return 1
+            ;;
+        403)
+            # Scoped-credential boundary refusal (v0.2.77 flip). The hub
+            # ACCEPTED our request and knows the project, but refused this
+            # bearer: either the coarse global hub.token on a per-project
+            # route with the compat window closed, or a per-project token
+            # minted for a DIFFERENT project. This is a HARD refusal, NOT a
+            # transient/unreachable condition — callers must NOT env-fall
+            # back (that would mask the misconfiguration). The scoped
+            # hub.token.<id> is already preferred by hub_token; a 403
+            # therefore means that file was absent/unreadable so we rode the
+            # global token, OR the wrong project's token was presented.
+            _emit_warning "forbidden" "403 forbidden for project $pid: the global hub.token is refused on /config (per-project token required) or a token for another project was presented. Present the scoped hub.token.$pid, or set VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to reopen the one-release compat window. body=$body"
+            return 5
             ;;
         404)
             local code
