@@ -178,14 +178,20 @@ class SeedAppStateConcurrencyTests(unittest.TestCase):
             finally:
                 install.PROJECT_ROOT = orig
 
-    def test_seeds_both_concurrency_keys_when_derived(self):
+    def test_seeds_update_all_key_but_not_code_embed_key(self):
+        # v0.2.77 F3: only update_all_max_parallel (which has a Rust reader)
+        # is seeded; code_embed_max_concurrent is NO LONGER a write-only row
+        # — its cap flows via infrastructure/.env → compose instead.
         db = self._fresh_db()
         cfg = dict(install.EMBEDDING_CONFIGS["gpu"])
         cfg["code_embed_max_concurrent"] = 4
         cfg["update_all_max_parallel"] = 2
         self._seed(cfg)
         rows = self._read(db)
-        self.assertEqual(rows.get("embedding.code_embed_max_concurrent"), "4")
+        self.assertNotIn(
+            "embedding.code_embed_max_concurrent", rows,
+            "F3: the write-only code-embed app_state seed must be dropped",
+        )
         self.assertEqual(rows.get("embedding.update_all_max_parallel"), "2")
 
     def test_omits_keys_when_not_derived(self):
@@ -213,8 +219,8 @@ class SeedAppStateConcurrencyTests(unittest.TestCase):
         rows = self._read(db)
         # ON CONFLICT DO NOTHING → prior 6 preserved, not overwritten with 2.
         self.assertEqual(rows.get("embedding.update_all_max_parallel"), "6")
-        # The absent code key IS seeded.
-        self.assertEqual(rows.get("embedding.code_embed_max_concurrent"), "4")
+        # F3: the code-embed cap is NOT seeded to app_state at all.
+        self.assertNotIn("embedding.code_embed_max_concurrent", rows)
 
 
 if __name__ == "__main__":

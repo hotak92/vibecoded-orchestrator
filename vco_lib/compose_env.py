@@ -21,8 +21,9 @@ The two helpers:
 
 - :func:`compose_substitution_env` — derive the ``${...}`` keys that
   docker-compose.yml references but that install.py COMPUTES (not the
-  caller's environment): ``CODE_EMBED_BACKEND`` and (NVIDIA-only)
-  ``CODE_EMBED_DOCKERFILE``.
+  caller's environment): ``CODE_EMBED_BACKEND``, (NVIDIA-only)
+  ``CODE_EMBED_DOCKERFILE``, and (v0.2.77 F2) the host-derived
+  ``CODE_EMBED_MAX_CONCURRENT`` cap.
 - :func:`write_infrastructure_env` — persist those keys to
   ``<infra_dir>/.env`` with managed-line replacement so user lines
   survive re-runs.
@@ -33,6 +34,7 @@ no install.py module-level state.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 
@@ -55,6 +57,19 @@ def compose_substitution_env(embed_config: dict) -> dict[str, str]:
     # on the multi-arch CPU default — there is no ROCm code-embed image).
     if embed_config.get("gpu_vendor") == "nvidia":
         env["CODE_EMBED_DOCKERFILE"] = "Dockerfile.cuda"
+    # v0.2.77 F2: the host-derived code-embed concurrency cap. Pre-fix this
+    # was written ONLY to PROJECT_ROOT/.env (which compose never reads) and
+    # docker-compose.yml hardcoded "4" — so the derived cap never reached
+    # the containerized service and it kept shedding 503s at 4 regardless
+    # of host capacity (5c incident). Routing it through infrastructure/.env
+    # (the file compose ACTUALLY reads) closes that gap; the compose value
+    # is now ${CODE_EMBED_MAX_CONCURRENT:-4}. Honour-explicit-config: an env
+    # the user already exported is respected by NOT overriding it here (the
+    # user's value flows through compose's own env inheritance), matching
+    # code_embed_max_concurrent_env_lines' suppression rule.
+    cap = embed_config.get("code_embed_max_concurrent")
+    if cap is not None and "CODE_EMBED_MAX_CONCURRENT" not in os.environ:
+        env["CODE_EMBED_MAX_CONCURRENT"] = str(int(cap))
     return env
 
 

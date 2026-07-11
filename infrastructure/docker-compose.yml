@@ -230,7 +230,14 @@ services:
       CODE_EMBED_DEVICE: "auto"
       CODE_EMBED_DTYPE: "bfloat16"
       CODE_EMBED_PORT: "11440"
-      CODE_EMBED_MAX_CONCURRENT: "4"
+      # v0.2.77 F2: honour the host-derived concurrency cap install.py wrote
+      # to the orchestrator-root `.env` (producer:
+      # vco_lib/install_embed_concurrency.py). Pre-fix this was hardcoded
+      # "4" — so the derived cap never reached the containerized service and
+      # it kept shedding 503s at 4 regardless of host capacity (5c incident).
+      # Compose auto-reads `.env` from its --env-file / project directory;
+      # ensure-containers passes the root `.env` (see ensure-containers.sh).
+      CODE_EMBED_MAX_CONCURRENT: "${CODE_EMBED_MAX_CONCURRENT:-4}"
       # CPU-fallback (CODE_EMBED_BACKEND=ollama) Ollama endpoint.
       # server.py defaults OLLAMA_URL to http://localhost:11435, but inside
       # this container `localhost` is the container ITSELF, not the Ollama

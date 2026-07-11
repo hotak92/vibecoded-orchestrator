@@ -214,7 +214,9 @@ services:
   #     CODE_EMBED_DEVICE: "auto"
   #     CODE_EMBED_DTYPE: "bfloat16"
   #     CODE_EMBED_PORT: "11440"
-  #     CODE_EMBED_MAX_CONCURRENT: "4"
+  #     # v0.2.77 F2: honour the host-derived cap install.py wrote to .env
+  #     # (falls back to 4). Keep in sync with infrastructure/docker-compose.yml.
+  #     CODE_EMBED_MAX_CONCURRENT: "${CODE_EMBED_MAX_CONCURRENT:-4}"
   #     HF_HUB_CACHE: "/cache"
   #     TRANSFORMERS_CACHE: "/cache"
   #   volumes:

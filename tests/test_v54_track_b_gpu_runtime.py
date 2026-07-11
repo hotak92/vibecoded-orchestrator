@@ -192,6 +192,36 @@ class ComposeSubstitutionEnvTests(unittest.TestCase):
             )
             self.assertEqual(env.get("CODE_EMBED_BACKEND"), "ollama")
 
+    def test_max_concurrent_cap_reaches_compose_substitution(self):
+        # v0.2.77 F2: the host-derived cap must be a compose ${...}
+        # substitution key so it lands in infrastructure/.env (the file
+        # compose reads) rather than only PROJECT_ROOT/.env (which it doesn't).
+        env = install._compose_substitution_env(
+            {"code_backend": "gpu", "gpu_vendor": "nvidia",
+             "code_embed_max_concurrent": 9}
+        )
+        self.assertEqual(env.get("CODE_EMBED_MAX_CONCURRENT"), "9")
+
+    def test_max_concurrent_absent_when_not_derived(self):
+        env = install._compose_substitution_env(
+            {"code_backend": "gpu", "gpu_vendor": "nvidia"}
+        )
+        self.assertNotIn("CODE_EMBED_MAX_CONCURRENT", env)
+
+    def test_max_concurrent_respects_explicit_user_env(self):
+        # Honour-explicit-config: a user-exported env is not overridden.
+        with mock.patch.dict(
+            "os.environ", {"CODE_EMBED_MAX_CONCURRENT": "12"}
+        ):
+            env = install._compose_substitution_env(
+                {"code_backend": "gpu", "gpu_vendor": "nvidia",
+                 "code_embed_max_concurrent": 9}
+            )
+        self.assertNotIn(
+            "CODE_EMBED_MAX_CONCURRENT", env,
+            "user-exported cap must win over the derived one",
+        )
+
     def test_write_infrastructure_env_lands_in_compose_project_dir(self):
         import tempfile
         with tempfile.TemporaryDirectory() as td:
@@ -203,13 +233,16 @@ class ComposeSubstitutionEnvTests(unittest.TestCase):
             )
             with mock.patch.object(install, "PROJECT_ROOT", fake_root):
                 install._write_infrastructure_env(
-                    {"code_backend": "gpu", "gpu_vendor": "nvidia"}
+                    {"code_backend": "gpu", "gpu_vendor": "nvidia",
+                     "code_embed_max_concurrent": 7}
                 )
             body = (fake_root / "infrastructure" / ".env").read_text(
                 encoding="utf-8"
             )
             self.assertIn("CODE_EMBED_DOCKERFILE=Dockerfile.cuda", body)
             self.assertIn("CODE_EMBED_BACKEND=gpu", body)
+            # v0.2.77 F2: the cap lands in the compose-read .env.
+            self.assertIn("CODE_EMBED_MAX_CONCURRENT=7", body)
             self.assertIn("WEAVIATE_PORT=9999", body, "user lines preserved")
 
     def test_write_infrastructure_env_is_idempotent(self):

@@ -144,15 +144,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is reserved first, then each pipeline's parallel slots are allocated from
   the remainder (`floor((pool / model_memory) * 0.8)`, floor 1, cap 8).
   `install.py` derives the budget from the same hardware specs that pick
-  the models and writes `CODE_EMBED_MAX_CONCURRENT` to `.env` (honouring an
-  explicit user override) plus the `embedding.*` app_state seeds
-  (ON CONFLICT DO NOTHING, so GUI/prior selections are preserved). A
-  single process-global admission semaphore, sized from
-  `embedding.update_all_max_parallel`, now gates BOTH embed-heavy spawned
-  tasks (codegraph build + KG sync) so codegraph and KG embedding share one
-  memory budget during `update all projects` rather than two independent
-  caps. The Rust side consumes the derived result via app_state (shared
-  config, no mirror). (Part 3)
+  the models. The derived `CODE_EMBED_MAX_CONCURRENT` cap is written to
+  `infrastructure/.env` (the file docker-compose actually reads) — the
+  compose service reference is now `${CODE_EMBED_MAX_CONCURRENT:-4}` instead
+  of a hardcoded `4`, so the host-derived cap genuinely reaches the
+  containerized code-embed service (previously it was written only to a
+  `.env` compose never reads, so the container kept shedding 503s at 4
+  regardless of host capacity). An explicit user-exported cap is still
+  honoured (not overridden). The `embedding.update_all_max_parallel`
+  app_state seed (ON CONFLICT DO NOTHING, so GUI/prior selections are
+  preserved) drives a single process-global admission semaphore that gates
+  BOTH embed-heavy spawned tasks (codegraph build + KG sync) so codegraph
+  and KG embedding share one memory budget during `update all projects`
+  rather than two independent caps. The Rust side consumes that result via
+  app_state (shared config, no mirror); the code-embed cap flows purely
+  through `infrastructure/.env` → compose (no redundant write-only app_state
+  row). (Part 3)
 - **Optional `codegraph-ts` extra for cross-language call-edge
   extraction.** A new `[project.optional-dependencies] codegraph-ts` extra
   pins tree-sitter 0.26.0 plus 11 grammar wheels (python, rust, javascript,

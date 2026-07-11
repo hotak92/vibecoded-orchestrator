@@ -5,8 +5,11 @@
 Extracted from install.py (the monolith ratchet caps inline additions) so the
 installer only carries thin call-sites. Three pieces:
 
-  * the two ``app_state`` keys the launcher (Rust) reads for the update-all
-    admission gate + the code-embed cap mirror,
+  * the ``app_state`` key the launcher (Rust) reads for the update-all
+    admission gate (``embedding.update_all_max_parallel``); the sibling
+    ``embedding.code_embed_max_concurrent`` constant is retained for a future
+    reader but is NO LONGER seeded (v0.2.77 F3 — it had zero readers; the
+    code-embed cap now flows via ``infrastructure/.env`` → compose instead),
   * a pure producer of the ``CODE_EMBED_MAX_CONCURRENT`` ``.env`` line(s)
     (honour-explicit-config),
   * a pure ``app_state`` seed helper (idempotent ON CONFLICT DO NOTHING).
@@ -85,15 +88,26 @@ def code_embed_max_concurrent_env_lines(embed_config: dict) -> "list[str]":
 
 
 def seed_concurrency_app_state(cur, embed_config: dict, now_ms: int) -> None:
-    """Seed the two concurrency knobs into ``app_state`` via an open cursor.
+    """Seed the update-all admission knob into ``app_state`` via an open cursor.
 
     ON CONFLICT DO NOTHING → a GUI-tuned / prior-install value is preserved; a
-    fresh install seeds the derived value. Only seeds a knob that was actually
-    derived (absent → the Rust gate / code-embed service use their defaults).
+    fresh install seeds the derived value. Only seeds the knob if it was
+    actually derived (absent → the Rust gate uses its default).
     ``cur`` is an open sqlite3 cursor on launcher.db; the caller commits.
+
+    v0.2.77 F3: ONLY ``embedding.update_all_max_parallel`` is seeded here —
+    it has a real Rust reader (``app_state.rs::get_update_all_max_parallel`` →
+    ``embed_admission.rs`` semaphore). ``embedding.code_embed_max_concurrent``
+    is NOT seeded: it had zero non-test readers (the containerized code-embed
+    service reads ``CODE_EMBED_MAX_CONCURRENT`` from its OWN env, which
+    install.py now writes to ``infrastructure/.env`` — the file compose reads
+    — via ``vco_lib.compose_env.compose_substitution_env``). The ``.env`` →
+    compose path is the single channel for that cap; a write-only app_state
+    row would just be dead metadata. The constant
+    ``APP_STATE_KEY_CODE_EMBED_MAX_CONCURRENT`` is retained for any future
+    launcher surface that grows a real reader.
     """
     for key, cfg_key in (
-        (APP_STATE_KEY_CODE_EMBED_MAX_CONCURRENT, "code_embed_max_concurrent"),
         (APP_STATE_KEY_UPDATE_ALL_MAX_PARALLEL, "update_all_max_parallel"),
     ):
         val = embed_config.get(cfg_key)
