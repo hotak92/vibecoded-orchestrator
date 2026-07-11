@@ -34,6 +34,23 @@ INSTALL_PY = PROJECT_ROOT / "install.py"
 RUST_INSTALLER = PROJECT_ROOT / "launcher" / "src-tauri" / "src" / "commands" / "installer.rs"
 
 
+def _rust_installer_source() -> str:
+    """installer.rs facade + its installer/*.rs submodules, concatenated.
+
+    v0.2.77 Part 7d split installer.rs into a facade + `installer/`
+    submodules; `detect_third_party_project_signals` (the Rust mirror of
+    install.py::_detect_third_party_project) moved into
+    `installer/inspect.rs`. Scan the whole submodule set so the drift
+    check follows the mirror wherever it lands.
+    """
+    parts = [RUST_INSTALLER.read_text(encoding="utf-8")]
+    submod_dir = RUST_INSTALLER.parent / "installer"
+    if submod_dir.is_dir():
+        for f in sorted(submod_dir.glob("*.rs")):
+            parts.append(f.read_text(encoding="utf-8"))
+    return "\n".join(parts)
+
+
 def _extract_python_detection_body() -> str:
     """Return the source body of `_detect_third_party_project` in install.py.
 
@@ -59,7 +76,7 @@ def _extract_python_detection_body() -> str:
 
 def _extract_rust_detection_body() -> str:
     """Return the source body of `detect_third_party_project_signals` in installer.rs."""
-    text = RUST_INSTALLER.read_text(encoding="utf-8")
+    text = _rust_installer_source()
     start_m = re.search(
         r"pub fn detect_third_party_project_signals\(",
         text,
