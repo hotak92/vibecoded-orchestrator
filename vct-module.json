@@ -3,7 +3,7 @@
   "schema_version": "1",
   "id": "orchestrator",
   "name": "VibeCoded Orchestrator",
-  "version": "0.2.76",
+  "version": "0.2.77",
   "min_upgradable_from": "0.0.0",
   "_min_upgradable_from_doc": "v0.2.60: the oldest installed version the orchestrator can update IN-PLACE from. installed < this floor → the update engine routes to the guided hard-cut (git-bundle backup + git reset --hard + reinstall, preserving ~/.vct DBs + Weaviate vectors + knowledge/ + .claude/state/) instead of an in-place pull. INERT at '0.0.0' (no real install is below it, so the hard-cut never triggers) until v0.3.0 raises it to declare the first real hard-cut boundary. See vco_lib/hard_cut.py + the perform_hard_cut Tauri command.",
   "description": "The core: 36 hooks, 44 bundled agents, 53 skills, KG + Code Graph, 4 MCP servers in ~/.claude.json (weaviate-kg + search enabled per project; mermaid + excalidraw registered but project-default-disabled until opt-in) + playwright via npx. Runs locally in Podman/Docker.",
