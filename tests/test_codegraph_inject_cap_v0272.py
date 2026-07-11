@@ -312,7 +312,6 @@ def test_stop_hook_aggregates_and_dedups(tmp_path: Path) -> None:
     DUPLICATE path -> exactly ONE reminder listing each basename once; the
     accumulator is drained (removed) afterward."""
     proot = tmp_path / "proj"
-    hooks = proot / ".claude"  # not used; hook resolves _lib relative to itself
     (proot / ".claude" / "state").mkdir(parents=True)
     # Copy the hook + the _lib helpers it sources into a runnable layout.
     hookdir = proot / "hooks"
@@ -370,3 +369,107 @@ def test_stop_hook_noop_without_accumulator(tmp_path: Path) -> None:
     )
     assert r.returncode == 0
     assert "EMIT<<" not in r.stdout
+
+
+# --------------------------------------------------------------------------
+# v0.2.77 Part 9 task 4: query-cost accounting. A CAP-suppressed injection must
+# NOT pay for a live code-graph query it then discards — the cap short-circuits
+# BEFORE codegraph_query_block is invoked. This test uses a COUNTING CLI to
+# prove the capped call issues ZERO additional CLI invocations.
+# --------------------------------------------------------------------------
+def _sandbox_counting_cli(tmp_path: Path, marker: Path) -> Path:
+    """Like _sandbox_pretooluse but the stub CLI appends to `marker` on every
+    invocation and the query-cache lib is present (production shape)."""
+    proot = tmp_path / "proj"
+    (proot / "templates" / "hooks" / "_lib").mkdir(parents=True)
+    (proot / ".claude" / "state").mkdir(parents=True)
+    (proot / ".claude" / "scripts").mkdir(parents=True)
+    for lib in ("session-id.sh", "seen-store.sh", "codegraph-query.sh", "query-cache.sh"):
+        (proot / "templates" / "hooks" / "_lib" / lib).write_bytes(
+            (LIB_DIR / lib).read_bytes()
+        )
+    (proot / "templates" / "hooks" / "_lib" / "stderr-cap.sh").write_text("# noop\n", encoding="utf-8")
+    (proot / "templates" / "hooks" / "_lib" / "find-python.sh").write_text(
+        'PY="$(command -v python3)"\n', encoding="utf-8"
+    )
+    (proot / "templates" / "hooks" / "_lib" / "emit-context.sh").write_text(
+        'emit_additional_context() { printf "EMIT<<%s>>\\n" "$1"; }\n', encoding="utf-8"
+    )
+    (proot / "templates" / "hooks" / "pre-tool-use.sh").write_bytes(
+        (HOOKS / "pre-tool-use.sh").read_bytes()
+    )
+    cli = proot / ".claude" / "scripts" / "code-graph-query"
+    cli.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf x >> "{marker}"\n'
+        'q="$2"\n'
+        'printf "CODE: stub.%s | CodeFunction | distance=0.10 | src=src/%s.py\\n  body for %s\\n\\n" "$q" "$q" "$q"\n',
+        encoding="utf-8",
+    )
+    cli.chmod(0o755)
+    return proot
+
+
+def test_capped_injection_issues_no_live_query(tmp_path: Path) -> None:
+    """Cap=3: the first 3 DISTINCT symbols each run the CLI (3 calls); the 4th
+    (past-cap) call is suppressed BEFORE the query — so the CLI count stays at
+    3, proving the capped path pays nothing for a discarded query."""
+    marker = tmp_path / "cli_calls"
+    proot = _sandbox_counting_cli(tmp_path, marker)
+    sid = "cap-cost-sess"
+
+    def _grep(symbol: str) -> str:
+        payload = {"tool_name": "Grep", "session_id": sid, "tool_input": {"pattern": symbol}}
+        env = {**os.environ, "CLAUDE_PROJECT_DIR": str(proot), "VCO_CG_INJECT_CAP": "3"}
+        return subprocess.run(
+            ["bash", str(proot / "templates" / "hooks" / "pre-tool-use.sh")],
+            input=json.dumps(payload), capture_output=True, text=True, timeout=30,
+            env=env, cwd=str(proot),
+        ).stdout
+
+    # 3 distinct symbols fill the cap; each runs the CLI once.
+    for i in range(3):
+        _grep(f"cost_fn_{i}")
+    calls_at_cap = len(marker.read_text("utf-8")) if marker.exists() else 0
+    assert calls_at_cap == 3, f"first 3 distinct symbols should each query once; got {calls_at_cap}"
+
+    # 4th DISTINCT symbol is past the cap → suppressed BEFORE the query.
+    out4 = _grep("cost_fn_over")
+    calls_after = len(marker.read_text("utf-8")) if marker.exists() else 0
+    assert calls_after == 3, (
+        "the capped (4th) injection must NOT issue a live query — the cap "
+        f"short-circuits before codegraph_query_block; CLI ran {calls_after} times "
+        "(expected 3, no extra call for the discarded injection)."
+    )
+    assert "codegraph injection cap reached" in out4, (
+        "the capped call should still emit the one-shot cap note"
+    )
+
+
+def test_repeat_symbol_served_from_cache_not_requeried(tmp_path: Path) -> None:
+    """task 2 + task 4: re-Grepping the SAME symbol within TTL is served from
+    the shared cache — the CLI is NOT re-invoked, so a dedup-suppressed repeat
+    pays nothing for a live query."""
+    marker = tmp_path / "cli_calls"
+    proot = _sandbox_counting_cli(tmp_path, marker)
+    sid = "cache-repeat-sess"
+
+    def _grep(symbol: str) -> str:
+        payload = {"tool_name": "Grep", "session_id": sid, "tool_input": {"pattern": symbol}}
+        env = {**os.environ, "CLAUDE_PROJECT_DIR": str(proot), "VCO_CG_INJECT_CAP": "40"}
+        return subprocess.run(
+            ["bash", str(proot / "templates" / "hooks" / "pre-tool-use.sh")],
+            input=json.dumps(payload), capture_output=True, text=True, timeout=30,
+            env=env, cwd=str(proot),
+        ).stdout
+
+    _grep("repeat_sym")
+    first = len(marker.read_text("utf-8")) if marker.exists() else 0
+    assert first == 1, f"first query should run the CLI once; got {first}"
+    # Same symbol again → served from the shared query-cache, no new CLI call.
+    _grep("repeat_sym")
+    second = len(marker.read_text("utf-8")) if marker.exists() else 0
+    assert second == 1, (
+        f"repeat identical symbol must be served from cache (no re-query); "
+        f"CLI ran {second} times (expected 1)."
+    )
