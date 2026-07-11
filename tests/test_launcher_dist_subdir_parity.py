@@ -40,6 +40,23 @@ INSTALLER_RS = (
     REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands" / "installer.rs"
 )
 
+
+def _installer_rs_all_text() -> str:
+    """installer.rs facade + its installer/*.rs submodules, concatenated.
+
+    v0.2.77 Part 7d split installer.rs into a facade + `installer/`
+    submodules; the dist-subdir resolver (`launcher_dist_subdir` /
+    `launcher_binary_filename`) moved into `installer/version_info.rs`.
+    Scan the whole submodule set so the parity literals are still found
+    wherever the resolver lands.
+    """
+    parts = [INSTALLER_RS.read_text(encoding="utf-8")]
+    submod_dir = INSTALLER_RS.parent / "installer"
+    if submod_dir.is_dir():
+        for f in sorted(submod_dir.glob("*.rs")):
+            parts.append(f.read_text(encoding="utf-8"))
+    return "\n".join(parts)
+
 # The canonical POSIX subdirs the bash helper is responsible for.
 _EXPECTED_POSIX = {
     ("linux", "x86_64"): "linux-x64",
@@ -148,11 +165,14 @@ def test_python_launcher_relative_path_matches_canonical():
 def test_rust_resolvers_contain_all_canonical_subdirs():
     """Both Rust resolvers must reference every canonical subdir literal, so a
     rename in one Rust file without the others is caught."""
-    for rf in (RESTART_RS, INSTALLER_RS):
-        text = rf.read_text(encoding="utf-8")
+    resolvers = (
+        (RESTART_RS.name, RESTART_RS.read_text(encoding="utf-8")),
+        (INSTALLER_RS.name, _installer_rs_all_text()),
+    )
+    for rf_name, text in resolvers:
         missing = {s for s in _ALL_CANONICAL if f'"{s}"' not in text}
         assert not missing, (
-            f"{rf.name} is missing dist-subdir literal(s): {missing}"
+            f"{rf_name} is missing dist-subdir literal(s): {missing}"
         )
 
 
@@ -190,10 +210,12 @@ def test_resolvers_do_not_return_experimental_macos_slot():
     # Rust resolvers: scan the two resolver source files. (These files don't
     # carry an intentional experimental_macOS fallback list — any occurrence
     # there is the bug.)
-    for rf in (RESTART_RS, INSTALLER_RS):
-        text = rf.read_text(encoding="utf-8")
+    for rf_name, text in (
+        (RESTART_RS.name, RESTART_RS.read_text(encoding="utf-8")),
+        (INSTALLER_RS.name, _installer_rs_all_text()),
+    ):
         assert "experimental_macOS" not in text, (
-            f"{rf.name} reintroduced the stale experimental_macOS slot"
+            f"{rf_name} reintroduced the stale experimental_macOS slot"
         )
 
 
