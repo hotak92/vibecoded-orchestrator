@@ -2,14 +2,18 @@
 # Copyright (c) 2026 VibeCoded Tools
 """v0.2.77 Part 9 task 8 — I/O reduction sweep (verification / regression guard).
 
-The audit + writes-verification found the per-tool-call write surface is already
-bounded: the ONLY hook writing on EVERY tool call is the TOUCAN dataset log,
-which is size-capped + rotated (D-14, v0.2.75), and CONTEXT_STATE injection is
-DIFF-based (diff-context-inject) rather than a per-prompt full re-read.
+The audit + writes-verification found the per-tool-call write surface is
+bounded. v0.2.77 9-bis went further and RETIRED the TOUCAN dataset writer
+(the former every-tool-call log) after the RL-collection verification confirmed
+it had zero consumers — so no per-tool-call log is written at all now. What
+remains guarded here: CONTEXT_STATE injection is DIFF-based (diff-context-inject)
+rather than a per-prompt full re-read, and the every-tool-call hook must not
+reintroduce an unbounded per-call append.
 
-Per the v0.2.77 USER ruling (no telemetry/log/sync stream may be dropped to
-reduce I/O; only batching / caching / rotation-with-data-preserved / refresh-
-timing qualify), task 8 makes NO behavioural change — it pins these bounds so a
+Per the v0.2.77 USER ruling (no telemetry/log/sync stream carrying training data
+may be dropped to reduce I/O; only batching / caching / rotation-with-data-
+preserved / refresh-timing / retiring-a-zero-consumer-collector qualify), task 8
+makes NO behavioural change to the retained streams — it pins the bounds so a
 future edit can't silently reintroduce an unbounded per-call writer or turn the
 diff-based injector back into a full re-read.
 """
@@ -21,26 +25,27 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 HOOKS = REPO_ROOT / "templates" / "hooks"
 
 
-def test_toucan_log_is_size_capped_and_rotated() -> None:
-    """The every-tool-call TOUCAN log must stay bounded (D-14): a byte cap +
-    rotation that keeps the newest rows. Both .sh and .ps1."""
-    sh = (HOOKS / "pre-tool-use.sh").read_text(encoding="utf-8")
-    assert "_TOUCAN_MAX_BYTES" in sh, "TOUCAN byte cap missing from pre-tool-use.sh"
-    assert "_TOUCAN_KEEP_LINES" in sh, "TOUCAN rotation keep-lines missing"
-    # Rotation must actually re-write the file (tail of newest rows), not just
-    # detect the overflow.
-    assert 'tail -n "$_TOUCAN_KEEP_LINES"' in sh, (
-        "TOUCAN rotation must keep the newest rows on overflow"
-    )
-    ps1 = (HOOKS / "pre-tool-use.ps1").read_text(encoding="utf-8")
-    assert "TOUCAN" in ps1 or "toucan" in ps1, "ps1 sibling must handle the TOUCAN log"
-
-
-def test_toucan_field_values_are_truncated() -> None:
-    """Large fields (content/new_string/old_string/command) are truncated before
-    serialize so a single row can't balloon the every-call log."""
-    sh = (HOOKS / "pre-tool-use.sh").read_text(encoding="utf-8")
-    assert "_TOUCAN_FIELD_CAP" in sh, "TOUCAN per-field truncation cap missing"
+def test_toucan_writer_is_retired() -> None:
+    """v0.2.77 9-bis retired the every-tool-call TOUCAN dataset writer (zero
+    consumers). Guard that the WRITE MACHINERY stays gone on BOTH .sh and .ps1 so
+    a future edit can't silently reintroduce the unbounded-per-call-write class it
+    caused. (A historical-note comment may still mention the filename by name;
+    what must not return is the log-path variable + rotate/truncate constants that
+    actually did the writing.)"""
+    for name in ("pre-tool-use.sh", "pre-tool-use.ps1"):
+        text = (HOOKS / name).read_text(encoding="utf-8")
+        # No live append to the retired log path.
+        assert ">> \"$TOUCAN_LOG\"" not in text, f"{name} still appends to $TOUCAN_LOG"
+        assert "Add-Content -Path $ToucanLog" not in text, (
+            f"{name} still appends to $ToucanLog"
+        )
+        # The write machinery (log-path var + rotate/truncate constants) must
+        # also be gone.
+        for token in ("TOUCAN_LOG", "TOUCAN_MAX_BYTES", "TOUCAN_FIELD_CAP",
+                      "TOUCAN_KEEP_LINES", "TOUCAN_JSONL",
+                      "ToucanLog", "ToucanMaxBytes", "ToucanFieldCap",
+                      "ToucanKeepLines", "ToucanTruncFields"):
+            assert token not in text, f"{name} still carries retired TOUCAN token {token!r}"
 
 
 def test_context_state_injection_is_diff_based() -> None:
@@ -55,14 +60,14 @@ def test_context_state_injection_is_diff_based() -> None:
 def test_no_unbounded_every_tool_call_writer_introduced() -> None:
     """Guard: the every-tool-call PreToolUse hook (pre-tool-use.sh) must not add
     a NEW append to an uncapped log. We assert the known append targets are the
-    bounded/rare ones (TOUCAN — capped; SECURITY_LOG — security-block only;
-    SESSION_READS_FILE / seen-reads — session-scoped, compact-wiped). This is a
-    canary: a new `>> "$SOME_LOG"` on the hot path should make a reviewer either
-    bound it or update this allow-list.
+    bounded/rare ones (SECURITY_LOG — security-block only; SESSION_READS_FILE /
+    seen-reads — session-scoped, compact-wiped). The TOUCAN log — the former
+    every-tool-call writer — was RETIRED in v0.2.77 9-bis, so it is no longer on
+    this list. This is a canary: a new `>> "$SOME_LOG"` on the hot path should
+    make a reviewer either bound it or update this allow-list.
     """
     sh = (HOOKS / "pre-tool-use.sh").read_text(encoding="utf-8")
     allowed_targets = {
-        '>> "$TOUCAN_LOG"',
         '>> "$SECURITY_LOG"',
         '>> "$SESSION_READS_FILE"',
         '>> "$_UNIFIED_READS"',

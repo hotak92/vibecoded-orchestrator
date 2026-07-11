@@ -404,7 +404,7 @@
     "summary": "Hooks are shell scripts in `.claude/settings.json` that intercept ~20 Claude Code lifecycle events (session start, tool use, file edits, compaction, stop) to enable automated workflow orchestration via security enforcement, knowledge-graph sync, cost tracking, and context preservation. Lost-In-The-Middle (LITM) ordering during compaction reinjects critical state (`.claude/CONTEXT_STATE.md`) at payload boundaries to preserve context through model context-window exhaustion.",
     "generated_at": "2026-06-27T17:36:39.350087+00:00",
     "backend": "cli",
-    "content_hash": "173591506e7b920c",
+    "content_hash": "dd6dc1f492d27a44",
     "total_chunks": 1
   },
   "knowledge/concepts/orchestrator-knowledge-graph.md": {

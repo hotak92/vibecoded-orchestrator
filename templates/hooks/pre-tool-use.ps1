@@ -16,8 +16,15 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 #   inherit env by default. No centralization needed in this hook itself.
 
 # pre-tool-use.ps1
-# Pre-tool-use hook: SSRF guard, shell injection scan, tool logging,
-# Build Anchor Protocol, file backup, KG search suggestion.
+# Pre-tool-use hook: SSRF guard, shell injection scan, Build Anchor
+# Protocol, file backup, KG search suggestion.
+#
+# v0.2.77 9-bis: the per-tool-call TOUCAN dataset writer
+# (.claude/logs/toucan_dataset.jsonl) was RETIRED here — a write-only
+# collector with zero consumers (RL training telemetry lives in
+# launcher.db rl_events + the citation drain, unaffected). MUST MATCH
+# pre-tool-use.sh (same removal). The stdin parse below still decodes the
+# full payload for the security + Build-Anchor branches.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 # Source emit-context.ps1 ONLY if the file exists. If the helper is
@@ -32,8 +39,9 @@ if (Test-Path "$PSScriptRoot/_lib/emit-context.ps1") {
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
 # Positional args ($args) and $env:CLAUDE_TOOL_NAME etc. are EMPTY because
 # Claude Code does NOT populate those env vars — verified empirically
-# 2026-05-08 via stdin-capture diagnostic. Without this, every toucan log
-# entry is {"query":"","chosen_tool":"","tool_args":null} — silently broken.
+# 2026-05-08 via stdin-capture diagnostic. Without this, the SSRF guard,
+# shell-injection scan, and Build-Anchor branches would all see empty
+# tool_name / tool_input.
 $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 $ToolName = ""
@@ -50,9 +58,10 @@ $UserMessage = ""
 $SessionIdFromStdin = ""
 # V52-L.2 Fix 1: parse subagent identity from stdin payload. Per A5
 # audit, PreToolUse hooks DO fire for subagent tool calls and the
-# payload carries agent_id + agent_type so handlers can differentiate.
-# Empty string when absent (parent context) — TOUCAN consumers expect
-# the field to always be present.
+# payload carries agent_id + agent_type. Parsed for parity with the
+# post-tool-security / post-file-edit siblings that still consume them;
+# this hook's own former consumer (the TOUCAN row) was retired in
+# v0.2.77 9-bis. Empty string when absent (parent context).
 $AgentId = ""
 $AgentType = ""
 try {
@@ -154,73 +163,6 @@ function Get-Field([string]$field) {
 
 function Write-SecurityLine([string]$json) {
     try { Add-Content -Path $SecurityLog -Value $json -ErrorAction Stop } catch { }
-}
-
-# === Tool call logging ===
-# UserMessage may contain newlines and metacharacters that the previous
-# manual escape (only \ and ") didn't cover. Use ConvertTo-Json so every
-# field round-trips correctly. ToolArgs is parsed when possible to keep
-# structured logging; falls back to string on parse failure.
-# Audit fix 2026-05-07.
-#
-# D-14 (v0.2.75): the TOUCAN log is gitignored (`.claude/logs/*.jsonl`) so
-# it never reaches a commit and is NOT on the check-no-secrets scan
-# surface, but it still durably duplicated whole Write `content` / whole
-# Bash `command` lines unbounded — a secret-exfil target that outlived the
-# scrubbed originals. Truncate the known content fields to
-# $ToucanFieldCap and size-cap+rotate the JSONL below. MUST MATCH
-# pre-tool-use.sh (same cap, same fields, same 5 MB rotate). No scanner
-# surface added: post-fix it holds only truncated fragments and is
-# gitignored — an ignore-with-rationale, not a scan target.
-$ToucanLog = Join-Path $ProjectRoot ".claude/logs/toucan_dataset.jsonl"
-$ToucanFieldCap = 2000
-$ToucanTruncFields = @('content', 'new_string', 'old_string', 'command')
-$toolArgsVal = $null
-if ($ToolArgs) {
-    try { $toolArgsVal = $ToolArgs | ConvertFrom-Json -ErrorAction Stop } catch { $toolArgsVal = $ToolArgs }
-}
-# D-14: truncate the known large content fields on a parsed (object) tool_input.
-# Non-object tool_args pass through unchanged (mirrors the .sh isinstance dict check).
-if ($toolArgsVal -is [psobject] -and $toolArgsVal -isnot [string]) {
-    foreach ($f in $ToucanTruncFields) {
-        $prop = $toolArgsVal.PSObject.Properties[$f]
-        if ($prop -and ($prop.Value -is [string]) -and ($prop.Value.Length -gt $ToucanFieldCap)) {
-            $prop.Value = $prop.Value.Substring(0, $ToucanFieldCap) + "…[truncated by D-14]"
-        }
-    }
-}
-$entry = [ordered]@{
-    timestamp   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-    query       = $UserMessage
-    chosen_tool = $ToolName
-    tool_args   = $toolArgsVal
-    # V52-L.2 Fix 1: include agent_id / agent_type / session_id so TOUCAN
-    # consumers can differentiate parent vs subagent rows. Empty string
-    # when absent (parent context).
-    session_id  = $SessionId
-    agent_id    = $AgentId
-    agent_type  = $AgentType
-}
-$line = $entry | ConvertTo-Json -Compress -Depth 8
-try { Add-Content -Path $ToucanLog -Value $line -ErrorAction Stop } catch { }
-# D-14: size-cap + rotate. When the log exceeds $ToucanMaxBytes (~5 MB),
-# keep only the newest $ToucanKeepLines rows (oldest dropped). Best-effort:
-# any failure leaves the file as-is (a hook must never crash the tool call
-# over housekeeping). MUST MATCH pre-tool-use.sh.
-$ToucanMaxBytes = 5242880
-$ToucanKeepLines = 2000
-try {
-    if (Test-Path -LiteralPath $ToucanLog) {
-        $tsize = (Get-Item -LiteralPath $ToucanLog).Length
-        if ($tsize -gt $ToucanMaxBytes) {
-            $tail = Get-Content -LiteralPath $ToucanLog -Tail $ToucanKeepLines -ErrorAction Stop
-            $trot = "$ToucanLog.rot.tmp"
-            Set-Content -LiteralPath $trot -Value $tail -Encoding utf8 -ErrorAction Stop
-            Move-Item -LiteralPath $trot -Destination $ToucanLog -Force -ErrorAction Stop
-        }
-    }
-} catch {
-    try { Remove-Item -LiteralPath "$ToucanLog.rot.tmp" -ErrorAction SilentlyContinue } catch { }
 }
 
 # === 1. SSRF GUARD ===

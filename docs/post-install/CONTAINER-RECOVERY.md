@@ -181,8 +181,8 @@ failure without the hook re-firing:
 
 ```bash
 VCT_DISABLE_HOOKS=1 claude     # opens Claude Code with hooks off
-# OR
-tail -50 <project>/.claude/logs/$(date +%F)_tool_usage.jsonl
+# OR inspect recent security-hook events (SSRF/injection/anchor blocks):
+tail -50 <project>/.claude/logs/security_events.jsonl
 ```
 
 Once you've fixed the root cause, remove `VCT_DISABLE_HOOKS=1` —

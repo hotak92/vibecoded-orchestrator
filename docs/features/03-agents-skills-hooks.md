@@ -257,18 +257,19 @@ First prompt: creates a baseline snapshot. Subsequent prompts: diffs against sna
 </details>
 
 ### `pre-tool-use.sh` — PreToolUse `*` (all tools, blocking)
-Security enforcement + tool call logging + file backup.
+Security enforcement + file backup + KG suggestion.
 
 <details>
 <summary>Details</summary>
 
-Four actions:
+Three actions:
 1. **SSRF guard**: blocks WebFetch/fetch_page requests to private IP ranges.
 2. **Shell injection scan**: detects network-fetch-to-shell patterns (`curl | bash`, etc.).
-3. **Tool logging**: appends tool call events to `.claude/logs/YYYY-MM-DD_tool_usage.jsonl` (TOUCAN dataset format).
-4. **Build Anchor Protocol**: tracks files read this session; blocks Write/Edit on files not yet read (prevents clobber). Creates a backup of existing files before Write/Edit in `/tmp/.claude_backups/`.
+3. **Build Anchor Protocol**: tracks files read this session; blocks Write/Edit on files not yet read (prevents clobber). Creates a backup of existing files before Write/Edit in `.claude/state/tool_backups/`.
 
 Exit 2 blocks the tool call. Exit 0 allows it. Security events logged to `.claude/logs/security_events.jsonl`.
+
+> **Retired (v0.2.77):** an earlier version of this hook also wrote every tool call to a `toucan_dataset.jsonl` "TOUCAN dataset" log. That collector had zero consumers (it was never wired into any RL training path — RL training telemetry lives in `launcher.db rl_events` plus the citation drain, both unaffected), so it was removed to save the per-tool-call I/O. No user action is needed; any existing `.claude/logs/toucan_dataset.jsonl` file is gitignored and inert, and can be deleted at leisure.
 
 </details>
 

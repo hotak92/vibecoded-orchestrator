@@ -139,8 +139,8 @@ Context nearing limit
 ### PreToolUse
 
 **pre-tool-use.sh** (matcher: `*`)
-- Logs tool name + args hash + timestamp to `.claude/logs/YYYY-MM-DD_tool_usage.jsonl`.
-- Also hosts the security layers (SSRF guard, shell-injection scan, Build Anchor + file backup). See [[Orchestrator Security]].
+- Hosts the security layers (SSRF guard, shell-injection scan, Build Anchor + file backup) plus the pre-Edit/Write KG suggestion. See [[Orchestrator Security]].
+- Historical note (v0.2.77 9-bis): this hook previously wrote every tool call to a `.claude/logs/toucan_dataset.jsonl` "TOUCAN dataset" log. That collector had zero consumers (never wired into RL training — RL training data lives in `launcher.db rl_events` + the citation drain), so it was retired to drop the per-tool-call I/O.
 
 **SSRF guard** (inside `pre-tool-use.sh`, matcher: `*`, acts on `WebFetch`)
 - Inspects `WebFetch` target URLs and blocks private/internal addresses unless whitelisted (Weaviate 8081, Ollama 11435, code-embed 11440, Gradio 7860). `search_papers` reaches its APIs directly and is not routed through this guard.

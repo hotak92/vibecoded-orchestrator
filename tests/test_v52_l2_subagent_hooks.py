@@ -4,8 +4,9 @@
 
 Coverage:
 1. `pre-tool-use.sh` parses agent_id / agent_type / session_id from the
-   PreToolUse JSON payload and includes them in each toucan_dataset.jsonl
-   entry. Differentiates parent vs subagent rows in TOUCAN.
+   PreToolUse JSON payload. (Its former consumer — the toucan_dataset.jsonl
+   row — was retired in v0.2.77 9-bis, so the two TOUCAN-row assertions were
+   removed; the parse survives for parity with the sibling hooks below.)
 2. `post-tool-security.sh` parses agent_id / agent_type / session_id and
    includes them in credential_alerts.jsonl rows.
 3. `post-file-edit.sh` parses agent_id / agent_type / session_id and
@@ -105,62 +106,16 @@ def _read_last_jsonl(log_path: Path) -> dict | None:
 
 
 # --------------------------------------------------------------------------- #
-# Fix 1: pre-tool-use.sh — agent_id parsing into TOUCAN
+# Fix 1: pre-tool-use.sh — agent_id / agent_type parsing
+#
+# v0.2.77 9-bis: the two former tests here asserted the parsed agent_id /
+# agent_type landed in the per-tool-call toucan_dataset.jsonl row. That
+# TOUCAN writer was RETIRED (write-only, zero consumers), so those tests
+# were removed with it. The pre-tool-use.sh stdin prelude still PARSES
+# agent_id / agent_type (kept for parity with the sibling hooks below that
+# do consume them); the post-tool-security + post-file-edit coverage below
+# exercises that parsing on the hooks that still act on it.
 # --------------------------------------------------------------------------- #
-
-
-def test_pre_tool_use_includes_agent_id_in_toucan_row(tmp_path):
-    """When the PreToolUse payload includes agent_id + agent_type, the
-    toucan_dataset.jsonl row carries those fields. Pre-V52-L.2 the hook
-    silently dropped them, so subagent rows looked identical to parent
-    rows."""
-    _setup_project_skeleton(tmp_path)
-    payload = {
-        "tool_name": "Read",
-        "tool_input": {"file_path": str(tmp_path / "fixture.py")},
-        "user_message": "fix the bug",
-        "session_id": "parent-session-uuid",
-        "agent_id": "subagent-abc123",
-        "agent_type": "@agent-coder",
-    }
-    # Pre-create the file so the Read branch doesn't trip Build Anchor.
-    (tmp_path / "fixture.py").write_text("# stub\n")
-
-    result = _run_hook(PRE_TOOL_USE, payload, tmp_path)
-    # Even if guards bail mid-hook, the TOUCAN row should already have
-    # been written. (The Read branch exits early but AFTER the log line.)
-    assert result.returncode == 0, (
-        f"hook exited {result.returncode}; stderr={result.stderr!r}")
-
-    toucan = _read_last_jsonl(tmp_path / ".claude/logs/toucan_dataset.jsonl")
-    assert toucan is not None, "expected toucan_dataset.jsonl row"
-    assert toucan["session_id"] == "parent-session-uuid"
-    assert toucan["agent_id"] == "subagent-abc123"
-    assert toucan["agent_type"] == "@agent-coder"
-    assert toucan["chosen_tool"] == "Read"
-
-
-def test_pre_tool_use_parent_context_has_empty_agent_id(tmp_path):
-    """Parent context (no agent_id in payload) writes an empty string —
-    NOT a missing key. Downstream consumers expect the field to always
-    be present so they can `WHERE agent_id IS '' OR agent_id IS '<sub>'`."""
-    _setup_project_skeleton(tmp_path)
-    (tmp_path / "fixture.py").write_text("# stub\n")
-    payload = {
-        "tool_name": "Read",
-        "tool_input": {"file_path": str(tmp_path / "fixture.py")},
-        "user_message": "fix the bug",
-        "session_id": "parent-only-session",
-        # agent_id / agent_type ABSENT — parent context.
-    }
-    result = _run_hook(PRE_TOOL_USE, payload, tmp_path)
-    assert result.returncode == 0
-
-    toucan = _read_last_jsonl(tmp_path / ".claude/logs/toucan_dataset.jsonl")
-    assert toucan is not None
-    assert toucan["agent_id"] == ""
-    assert toucan["agent_type"] == ""
-    assert toucan["session_id"] == "parent-only-session"
 
 
 # --------------------------------------------------------------------------- #

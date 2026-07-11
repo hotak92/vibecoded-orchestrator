@@ -45,6 +45,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `false`, `no`, or a typo — denies (fail-closed). This escape hatch will
   be removed in a future release. (Part 8)
 
+### Removed
+- **The unconsumed TOUCAN dataset collector.** The PreToolUse hook
+  (`pre-tool-use.{sh,ps1}`) used to append every tool call to a
+  `.claude/logs/toucan_dataset.jsonl` "TOUCAN dataset" log. An
+  RL-collection audit confirmed the log had **zero consumers** — it was
+  never wired into any RL training path — so it has been retired to drop
+  the per-tool-call write I/O it caused. **RL training telemetry is
+  unaffected:** it lives in `launcher.db rl_events` plus the Stop-hook
+  citation drain, neither of which touched this file. No user action is
+  needed; any existing `toucan_dataset.jsonl` is gitignored and inert and
+  may be deleted at leisure. The hook's other actions (SSRF guard,
+  shell-injection scan, Build Anchor + file backup, pre-Edit KG
+  suggestion) are unchanged. (9-bis)
+
 ## [0.2.76] - 2026-07-10
 
 ### Security
