@@ -27,10 +27,7 @@ from __future__ import annotations
 
 import sqlite3
 import sys
-import time
 from pathlib import Path
-
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -223,7 +220,7 @@ def test_user_configured_access_row_left(tmp_path):
     conn.commit()
 
     _, log = _log_collector()
-    changed = heal_shared_kg_pointer_drift(
+    heal_shared_kg_pointer_drift(
         cur, existing_classes={LIVE}, log_event=log,
         deferral_report=_Sink(), deferral_entry_cls=_Entry,
     )
@@ -425,6 +422,48 @@ def test_converged_pointer_sweep_leaves_non_root_dead_row(tmp_path):
     assert changed == 0  # base project's absent own-KG untouched
     cur.execute("SELECT COUNT(*) FROM kg_collection_access WHERE project_id='p1' AND collection_name='Acme_KnowledgeGraph'")
     assert cur.fetchone()[0] == 1
+    conn.close()
+
+
+def test_converged_pointer_sweep_leaves_root_grant_to_absent_peer(tmp_path):
+    """LEAVE-ALONE (v0.2.77 L2-1): the ROOT project may hold a cross-project
+    GRANT to a peer collection (e.g. ClientA_KnowledgeGraph) with fresh
+    timestamps (created_at == updated_at — a GUI insert, indistinguishable
+    from a seed row). If that peer collection is merely absent from Weaviate
+    at heal time, the sweep must NOT consume the grant — only the exact
+    known-dead own-primary literal (VibeCodedOrchestrator_KnowledgeGraph) is
+    swept. Pre-fix, the endswith('_KnowledgeGraph') match would have deleted
+    this grant with no undo trail."""
+    db = _make_db_with_projects(tmp_path)
+    conn = sqlite3.connect(str(db))
+    cur = conn.cursor()
+    CANON = "VCODev_KnowledgeGraph"
+    PEER = "ClientA_KnowledgeGraph"  # a peer project's KG, absent from Weaviate
+    _set_state(cur, "orchestrator_root_kg_collection", CANON)
+    _set_state(cur, "last_installed_shared_kg_collection", CANON)
+    cur.execute("INSERT INTO projects VALUES ('root', 'VibeCoded Orchestrator', 'orchestrator_root')")
+    ts = 1000
+    # Root granted read access to ClientA's KG via the GUI (fresh insert,
+    # created == updated). ClientA's class is NOT in existing_classes.
+    cur.execute("INSERT INTO kg_collection_access VALUES ('root', ?, 'read', ?, ?)", (PEER, ts, ts))
+    conn.commit()
+
+    _, log = _log_collector()
+    changed = heal_shared_kg_pointer_drift(
+        cur, existing_classes={CANON}, log_event=log,
+        deferral_report=_Sink(), deferral_entry_cls=_Entry,
+    )
+    conn.commit()
+
+    assert changed == 0, "a root grant to an absent peer collection must not be swept"
+    cur.execute(
+        "SELECT collection_name, access_level FROM kg_collection_access "
+        "WHERE project_id='root' AND collection_name=?",
+        (PEER,),
+    )
+    row = cur.fetchone()
+    assert row is not None, "the peer grant must survive"
+    assert row[1] == "read", "the grant's access level must be intact"
     conn.close()
 
 

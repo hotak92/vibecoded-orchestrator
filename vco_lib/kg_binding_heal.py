@@ -61,6 +61,28 @@ from typing import Callable, Optional
 # Access-level privilege ranking for kg_collection_access dedup decisions.
 _KG_ACCESS_RANK: dict[str, int] = {"none": 0, "read": 1, "write": 2}
 
+# The orchestrator-root project's canonical NAME. The pre-fix launcher bug
+# seeded the root's own-primary kg_collection_access row as
+# ``sanitize_for_weaviate_class(ORCHESTRATOR_ROOT_NAME) + "_KnowledgeGraph"``
+# = ``"VibeCodedOrchestrator_KnowledgeGraph"`` (identical to the shared-KG
+# default class name). That is the ONLY dead literal the R8 5b sweep heals —
+# see ``_dead_root_own_primary_name`` + ``_sweep_dead_root_own_primary_rows``.
+ORCHESTRATOR_ROOT_NAME = "VibeCodedOrchestrator"
+
+
+def _dead_root_own_primary_name() -> str:
+    """The single dead literal the R8 5b sweep is allowed to touch.
+
+    Derived through the canonical writer sanitizer so it can never drift from
+    the name the pre-fix launcher actually seeded. Kept as a function (not a
+    module constant) so the sanitizer import stays lazy — this module is
+    imported on the install/update hot path and the sanitizer pulls in the
+    ``codegraph_naming`` module.
+    """
+    from vco_lib.codegraph_naming import sanitize_for_weaviate_class
+
+    return sanitize_for_weaviate_class(ORCHESTRATOR_ROOT_NAME) + "_KnowledgeGraph"
+
 # Cross-prefix self-heal — suffixes considered when probing Weaviate for a
 # populated sibling under a different prefix. Mirrors
 # ``vco_lib.project_init._KG_SUFFIXES``; kept here so install.py's detection
@@ -612,13 +634,17 @@ def _sweep_dead_root_own_primary_rows(
     root-cause fix stops NEW dead rows being seeded, but an already-installed
     machine keeps the old row until this sweep heals it.
 
-    Scope — root project ONLY: this heals rows belonging to the
-    ``host='orchestrator_root'`` project whose ``collection_name`` is
-    seed-authored AND NOT a live Weaviate class. A regular per-project own
-    collection that is legitimately absent from Weaviate (e.g. not yet
-    bootstrapped) is the LEAVE-ALONE case — it is never swept, because it is not
-    the root project's row. The canonical name is derived from the (already
-    agreeing) pointer, not from any project name.
+    Scope — root project ONLY, and only the EXACT known-dead literal
+    (v0.2.77 L2-1): this heals rows belonging to the
+    ``host='orchestrator_root'`` project whose ``collection_name`` equals
+    ``_dead_root_own_primary_name()`` (``VibeCodedOrchestrator_KnowledgeGraph``)
+    AND is NOT a live Weaviate class. A root-project cross-project GRANT to a
+    peer collection that is merely absent from Weaviate at heal time (e.g. a
+    not-yet-bootstrapped ``ClientA_KnowledgeGraph``), and a regular per-project
+    own collection legitimately absent from Weaviate, are the LEAVE-ALONE
+    cases — neither is the known-dead literal, so neither is ever swept. The
+    canonical name is derived from the (already agreeing) pointer, not from any
+    project name.
 
     Read-only against Weaviate (membership test on the caller-supplied
     ``existing_classes`` snapshot only). Idempotent: after the sweep the root's
@@ -629,6 +655,21 @@ def _sweep_dead_root_own_primary_rows(
     # otherwise the sweep would move rows onto ANOTHER dead name. The caller
     # gates on this too, but re-check defensively (conservative default).
     if canonical not in existing_classes:
+        return 0
+
+    # v0.2.77 L2-1: the ONLY dead literal this sweep is allowed to touch is the
+    # root's own-primary name the pre-fix launcher seeded
+    # (``VibeCodedOrchestrator_KnowledgeGraph``). Matching any dead
+    # ``*_KnowledgeGraph`` row would ALSO consume a root-project cross-project
+    # GRANT to a peer collection that happens to be absent from Weaviate at
+    # heal time (e.g. a not-yet-bootstrapped ClientA_KnowledgeGraph) — silently
+    # deleting an access-matrix grant with no undo trail. Restrict to the exact
+    # known-dead literal so a genuine grant is never swept.
+    dead_literal = _dead_root_own_primary_name()
+    if dead_literal == canonical:
+        # Degenerate: the canonical class IS the historical dead literal (a
+        # default install that never re-pointed) — there is nothing dead to
+        # sweep (a row already at `canonical` is skipped below anyway).
         return 0
 
     # Identify the orchestrator-root project id(s). host is the authoritative
@@ -666,11 +707,14 @@ def _sweep_dead_root_own_primary_rows(
                 continue  # already canonical — nothing to do
             if coll in existing_classes:
                 continue  # a live class (e.g. own _Development) — leave alone
-            # Only own-KnowledgeGraph-shaped dead rows collapse onto the shared
-            # canonical class. The root's `_Development` row is a distinct
-            # collection and, if dead, is NOT the same class as the shared KG —
-            # do not fold it into the canonical name.
-            if not coll.endswith("_KnowledgeGraph"):
+            # v0.2.77 L2-1: ONLY the exact known-dead own-primary literal is
+            # swept. A root-project cross-project GRANT to a peer collection
+            # that is merely absent from Weaviate right now (e.g. a
+            # not-yet-bootstrapped ClientA_KnowledgeGraph) is NOT this literal
+            # and is left untouched — matching any `*_KnowledgeGraph` would
+            # silently delete such a grant. The root's own `_Development` row
+            # is likewise not this literal.
+            if coll != dead_literal:
                 continue
             by_dead.setdefault(coll, []).append(
                 (root_id, level, created_at, updated_at)

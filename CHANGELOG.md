@@ -123,9 +123,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the live canonical class for the orchestrator root (stops new dead rows),
   and the machine-wide heal (`heal_shared_kg_pointer_drift`) gains a scoped
   dead-row sweep that repairs the already-seeded row even when the pointer
-  is otherwise converged. A regular per-project collection legitimately
-  absent from Weaviate (not yet bootstrapped) is the leave-alone case and
-  is never swept. (Part 2)
+  is otherwise converged. The sweep touches ONLY the exact known-dead literal
+  (`VibeCodedOrchestrator_KnowledgeGraph`) — a regular per-project collection
+  legitimately absent from Weaviate (not yet bootstrapped) AND a
+  root-project cross-project grant to a peer collection that is merely absent
+  at heal time are both leave-alone cases and are never swept. (Part 2)
 - **`--incremental` code-graph analysis now heals vectorless (embed
   revision NULL/0) rows.** The incremental branch kept only git-diff
   changed files, so an unchanged file owning a stale/vectorless row never
