@@ -28,7 +28,6 @@ from __future__ import annotations
 import ast
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -605,14 +604,47 @@ class ComposeBuildContextTests(unittest.TestCase):
         CPU-only `compose up -d` invocations don't try to build it.
         """
         text = self.COMPOSE.read_text(encoding="utf-8")
-        # Find the code_embed service block.
-        idx = text.find("code_embed:")
-        self.assertGreater(idx, 0)
-        # 3500-char window — Track B's v0.2.50 multi-arch documentation
-        # block sits between the service header and the profiles: gate.
-        block = text[idx:idx + 3500]
+        block = self._code_embed_service_block(text)
         self.assertIn("profiles:", block)
         self.assertIn("- gpu", block)
+
+    @staticmethod
+    def _code_embed_service_block(text: str) -> str:
+        """Return the EXACT `code_embed:` service block (header → next
+        top-level 2-space-indented service key, or EOF).
+
+        v0.2.77: replaces the previous brittle fixed 3500-char window, which
+        false-failed when a legitimate service-body comment pushed the
+        `profiles:` gate past the window (the gate was still present, just
+        beyond 3500 chars). Delimiting on the next sibling service key makes
+        the assertion robust to body edits of any length.
+        """
+        lines = text.splitlines(keepends=True)
+        # Find the `  code_embed:` service header (2-space indent under
+        # `services:`) — accept either the exact indented form or a bare find.
+        start = None
+        for i, ln in enumerate(lines):
+            if ln.lstrip().startswith("code_embed:") and (
+                ln.startswith("  code_embed:") or ln.strip() == "code_embed:"
+            ):
+                start = i
+                break
+        assert start is not None, "code_embed: service header not found"
+        # The block ends at the next line that starts a sibling service:
+        # exactly 2 leading spaces + a non-space (another `  <name>:`), and
+        # not a comment.
+        end = len(lines)
+        for j in range(start + 1, len(lines)):
+            ln = lines[j]
+            if (
+                ln.startswith("  ")
+                and not ln.startswith("   ")
+                and ln[2:3] not in (" ", "#")
+                and ln.rstrip().endswith(":")
+            ):
+                end = j
+                break
+        return "".join(lines[start:end])
 
 
 if __name__ == "__main__":
