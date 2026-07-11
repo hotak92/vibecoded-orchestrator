@@ -650,6 +650,16 @@ def _fetch_writable_collections_for_project(project_id: str) -> list[str]:
             except OSError:
                 port = "7700"
 
+        # v0.2.77 Part 8 (flip) — ASSUMPTION PIN: this reads the GLOBAL
+        # hub.token (NOT a scoped hub.token.<id>) deliberately. Only the
+        # per-project /env + /config routes are gated by
+        # `per_project_token_route` (auth.rs) and require a scoped token
+        # post-flip. The /access route's trailing segment is "access", so
+        # it is NOT in that gate — the global hub.token stays accepted
+        # here. If a future change gates /access too, this call must switch
+        # to the scoped token (via vco_lib.project_config._project_token,
+        # the same picker the /config path uses); until then, global is
+        # correct and the flip does NOT affect this call.
         token = os.environ.get("VCT_HUB_TOKEN")
         if not token:
             try:

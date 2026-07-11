@@ -132,11 +132,35 @@ def hub(fixture_result: FixtureResult) -> Iterator[HubProc]:
 # ─── HTTP helpers ────────────────────────────────────────────────
 
 
-def _hub_get(hub: HubProc, path: str) -> tuple[int, dict]:
-    """GET <hub>/<path> with the auth token. Returns (status, json)."""
+def _scoped_token(hub: HubProc, project_id: str) -> str:
+    """Read the per-project scoped token the hub minted at startup.
+
+    v0.2.77 Part 8 (flip): the per-project ``/env`` + ``/config`` routes
+    require the SCOPED ``hub.token.<project_id>`` (the global ``hub.token``
+    is refused once the compat window closes). The hub writes one scoped
+    file per project into ``VCT_STATE_DIR`` at startup mint, BEFORE it
+    writes ``hub.port`` (so by the time ``start_hub`` returns, every
+    project's file exists). This helper reads it so Step22 exercises the
+    POST-flip reality — the same credential a real resolver presents.
+    """
+    path = hub.layout.state_dir / f"hub.token.{project_id}"
+    return path.read_text(encoding="utf-8").strip()
+
+
+def _hub_get(
+    hub: HubProc, path: str, *, project_id: str | None = None
+) -> tuple[int, dict]:
+    """GET <hub>/<path>. Returns (status, json).
+
+    When ``project_id`` is given, present that project's SCOPED token
+    (the credential the per-project routes require post-flip). Otherwise
+    present the global ``hub.token`` (for non-per-project routes, or to
+    deliberately exercise the compat/refusal path).
+    """
+    token = _scoped_token(hub, project_id) if project_id is not None else hub.token
     url = f"{hub.base_url()}/{path.lstrip('/')}"
     req = urllib.request.Request(
-        url, headers={"Authorization": f"Bearer {hub.token}"}
+        url, headers={"Authorization": f"Bearer {token}"}
     )
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -226,7 +250,9 @@ def test_resolver_returns_full_envelope_for_every_project(
         "shared_kg_write_disabled",
     }
     for p in fixture_result.projects:
-        status, body = _hub_get(hub, f"projects/{p.project_id}/config")
+        status, body = _hub_get(
+            hub, f"projects/{p.project_id}/config", project_id=p.project_id
+        )
         assert status == 200, f"project {p.slug}: status {status} body {body}"
         missing = required_fields - body.keys()
         assert not missing, (
@@ -252,7 +278,9 @@ def test_kg_access_list_matches_matrix_per_project(
     silent regression (e.g. the filter dropping 'read' instead of
     'none') would surface as a list mismatch."""
     for p in fixture_result.projects:
-        status, body = _hub_get(hub, f"projects/{p.project_id}/config")
+        status, body = _hub_get(
+            hub, f"projects/{p.project_id}/config", project_id=p.project_id
+        )
         assert status == 200
         actual = sorted(body["kg_access_list"])
         expected = _expected_kg_access_list(p, fixture_result)
@@ -272,7 +300,9 @@ def test_kg_access_list_filters_explicit_none_rows(
     leak B's KG into C's access list.)"""
     c = fixture_result.project_by_slug("proj-c-gamma")
     b = fixture_result.project_by_slug("proj-b-beta")
-    status, body = _hub_get(hub, f"projects/{c.project_id}/config")
+    status, body = _hub_get(
+        hub, f"projects/{c.project_id}/config", project_id=c.project_id
+    )
     assert status == 200
     b_kg = fixture_result.layout.collection_name(b.kg_collection_name())
     assert b_kg not in body["kg_access_list"], (
@@ -296,7 +326,9 @@ def test_codegraph_access_list_matches_grant_matrix(
     Catches the common direction-flip bug where grantor + grantee
     are swapped in the JOIN."""
     for p in fixture_result.projects:
-        status, body = _hub_get(hub, f"projects/{p.project_id}/config")
+        status, body = _hub_get(
+            hub, f"projects/{p.project_id}/config", project_id=p.project_id
+        )
         assert status == 200
         actual = sorted(body["codegraph_access_list"])
         expected = _expected_codegraph_access_list(p)
@@ -323,7 +355,9 @@ def test_no_kg_access_leakage_between_unrelated_projects(
         ("proj-a-alpha", "proj-b-beta"),  # only explicit cross-grant
     }
     for reader in projects:
-        status, body = _hub_get(hub, f"projects/{reader.project_id}/config")
+        status, body = _hub_get(
+            hub, f"projects/{reader.project_id}/config", project_id=reader.project_id
+        )
         assert status == 200
         for owner in projects:
             if reader.slug == owner.slug:
@@ -346,10 +380,14 @@ def test_single_field_response_matches_full_envelope(
     envelope. Pins that the single-field path doesn't run a
     different code branch with drift potential."""
     for p in fixture_result.projects:
-        _, full = _hub_get(hub, f"projects/{p.project_id}/config")
+        _, full = _hub_get(
+            hub, f"projects/{p.project_id}/config", project_id=p.project_id
+        )
         for key in ("kg_collection", "code_graph_project", "kg_access_list"):
             status, partial = _hub_get(
-                hub, f"projects/{p.project_id}/config?key={key}"
+                hub,
+                f"projects/{p.project_id}/config?key={key}",
+                project_id=p.project_id,
             )
             assert status == 200, f"key={key} partial returned {status}"
             assert key in partial, f"key={key} missing from partial response"
@@ -381,15 +419,24 @@ def test_resolver_client_script_returns_same_json(
     if not RESOLVER_CLIENT.exists():
         pytest.skip(f"resolver client not found at {RESOLVER_CLIENT}")
 
-    # The shell script discovers the hub via $VCT_HUB_PORT + $VCT_HUB_TOKEN
-    # OR via $VCT_STATE_DIR/hub.port + hub.token. We pass both for clarity.
+    # v0.2.77 Part 8 (flip): the shell script discovers the hub via
+    # $VCT_HUB_PORT + $VCT_STATE_DIR/hub.port, and — crucially — reads the
+    # SCOPED token file $VCT_STATE_DIR/hub.token.<project_id> for the
+    # per-project /config route (the resolver's own token-preference logic).
+    # We DELIBERATELY do NOT set $VCT_HUB_TOKEN: that env pins the GLOBAL
+    # token and overrides the scoped-file preference, which post-flip would
+    # 403 on /config. Leaving it unset exercises exactly the resolver
+    # behaviour a real hook relies on: pick up the scoped token from
+    # VCT_STATE_DIR. (The by-path lookup, a non-gated route, still works on
+    # the global token the resolver reads from VCT_STATE_DIR/hub.token.)
     env = {
         **os.environ,
         "VCT_HUB_PORT": str(hub.port),
-        "VCT_HUB_TOKEN": hub.token,
         "VCT_STATE_DIR": str(fixture_result.layout.state_dir),
         "VCO_CI_FIXTURE": "1",
     }
+    # Ensure no ambient VCT_HUB_TOKEN leaks in from the parent env.
+    env.pop("VCT_HUB_TOKEN", None)
     for p in fixture_result.projects:
         # 1. Resolve project_id by path via the shell script.
         result = subprocess.run(
@@ -422,8 +469,10 @@ def test_resolver_client_script_returns_same_json(
         )
         shell_envelope = json.loads(result.stdout)
 
-        # 3. Direct HTTP fetch.
-        status, http_envelope = _hub_get(hub, f"projects/{p.project_id}/config")
+        # 3. Direct HTTP fetch (scoped token, matching the resolver).
+        status, http_envelope = _hub_get(
+            hub, f"projects/{p.project_id}/config", project_id=p.project_id
+        )
         assert status == 200
 
         # The two envelopes must agree on every load-bearing field.
@@ -439,3 +488,71 @@ def test_resolver_client_script_returns_same_json(
                 f"resolver-client drift on {k}: shell={shell_envelope[k]!r} "
                 f"http={http_envelope[k]!r}"
             )
+
+
+# ─── v0.2.77 Part 8 (flip): compat-window case ───────────────────
+
+
+@pytest.fixture(scope="module")
+def compat_hub() -> Iterator[tuple[FixtureResult, HubProc]]:
+    """A SEPARATE fixture + hub spawned with
+    ``VCT_HUB_LEGACY_GLOBAL_ENV=1`` so the one-release global-token compat
+    window is REOPENED on this hub. It uses its own sandbox state-dir (the
+    hub's per-state-dir lockfile forbids two live hubs sharing one), so it
+    coexists with the module ``hub`` fixture.
+
+    This is the ONE case that proves the deprecation flag stays FUNCTIONAL
+    after the flip: the global ``hub.token`` must still authorize the
+    per-project routes when an operator opts back in. Every OTHER test in
+    this file uses the SCOPED token (the post-flip default reality).
+    """
+    if os.environ.get("VCO_CI_FIXTURE", "") != "1":
+        pytest.skip("Step 22 integration tests require VCO_CI_FIXTURE=1")
+    bin_path = _hub_binary_path()
+    if not bin_path.exists():
+        pytest.skip(f"vct-hub binary not found at {bin_path}")
+    fx = build_fixture()
+    proc = None
+    try:
+        proc = start_hub(
+            fx.layout,
+            bin_path,
+            extra_env={"VCT_HUB_LEGACY_GLOBAL_ENV": "1"},
+        )
+        yield fx, proc
+    finally:
+        if proc is not None:
+            proc.stop()
+        notes = teardown_sandbox(fx.layout, drop_weaviate_collections=True)
+        for n in notes:
+            print(n, file=sys.stderr)
+
+
+def test_global_token_still_allowed_under_compat_flag(
+    compat_hub: tuple[FixtureResult, HubProc],
+) -> None:
+    """Deprecation-allow: with ``VCT_HUB_LEGACY_GLOBAL_ENV=1`` set on the
+    hub, the GLOBAL ``hub.token`` still authorizes ``/config`` (the
+    one-release compat window). This must remain green after the flip —
+    the flag is the operator's migration escape hatch.
+    """
+    fx, chub = compat_hub
+    p = fx.projects[0]
+    # Present the GLOBAL token (chub.token) — NOT the scoped one — on the
+    # per-project route. Under the compat flag this is accepted (200).
+    url = f"{chub.base_url()}/projects/{p.project_id}/config"
+    req = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {chub.token}"}
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        assert resp.status == 200, "global token must be accepted under the compat flag"
+        body = json.loads(resp.read())
+    assert body["project_id"] == p.project_id
+
+    # Sanity: the SCOPED token also works on the compat hub (the flag only
+    # RE-ADMITS the global token; it never disables the scoped path).
+    status, scoped_body = _hub_get(
+        chub, f"projects/{p.project_id}/config", project_id=p.project_id
+    )
+    assert status == 200
+    assert scoped_body["project_id"] == p.project_id

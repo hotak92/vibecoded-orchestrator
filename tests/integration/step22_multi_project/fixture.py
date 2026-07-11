@@ -530,11 +530,16 @@ def start_hub(
     hub_binary: Path,
     *,
     startup_timeout_s: float = 10.0,
+    extra_env: Optional[dict] = None,
 ) -> HubProc:
     """Spawn vct-hub against ``layout.state_dir`` and wait for
     ``hub.port`` + ``hub.token`` to appear (the hub writes both before
     accepting connections, so their presence is sufficient to know
     /health will respond).
+
+    ``extra_env`` merges extra environment variables into the hub
+    subprocess env (e.g. ``VCT_HUB_LEGACY_GLOBAL_ENV=1`` to reopen the
+    one-release global-token compat window for the flip test).
     """
     if not hub_binary.exists():
         raise FileNotFoundError(
@@ -552,6 +557,8 @@ def start_hub(
         # real launcher may already be running on it.
         "VCT_HUB_PORT": "0",
     }
+    if extra_env:
+        env.update(extra_env)
     # Clean stale port/token files so we know the values we read back
     # were freshly produced by this subprocess.
     for f in (layout.hub_port_file(), layout.hub_token_file(), layout.hub_pid_file()):
