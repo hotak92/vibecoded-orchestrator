@@ -151,7 +151,7 @@ pub async fn start_hub_server() -> Result<u16, String> {
     //     unauthenticated request never even reaches the secret-
     //     serving logic. The `Extension` carries `AuthState` into
     //     the middleware closure.
-    let app = axum::Router::new()
+    let routes = axum::Router::new()
         .nest("/api/v1", api::router(database))
         .nest("/api/v1", modules_api::router().with_state(launcher_state.clone()))
         .nest(
@@ -206,21 +206,22 @@ pub async fn start_hub_server() -> Result<u16, String> {
         .nest(
             "/api/v1",
             module_db_api::router().with_state(launcher_state.clone()),
-        )
-        // Inject the launcher_state as a request extension so the
-        // module_db_api middleware can pull it without going through
-        // axum's State<>-typed router. Clone here so the v0.2.49
-        // resume-on-boot task below (which spawns AFTER router build)
-        // can still own its own handle.
-        .layer(axum::Extension(launcher_state.clone()))
-        .layer(axum::middleware::from_fn(auth::require_auth))
-        .layer(axum::Extension(auth_state))
-        // v0.2.76 Part 4 — the per-project token registry, read by
-        // `auth::require_auth` to accept a project-scoped bearer on the
-        // `/env` + `/config` routes. Injected alongside `auth_state` so the
-        // middleware pulls both from request extensions.
-        .layer(axum::Extension(project_token_registry))
-        .layer(cors);
+        );
+
+    // v0.2.77 F1: apply the auth stack via the shared SSOT so the layer
+    // order (launcher_db + registry + auth_state ALL declared after
+    // require_auth → all in request extensions when the middleware runs)
+    // is identical in prod and in the auth tests. The `module_db_api`
+    // middleware still pulls the launcher_state extension (outer-inserted
+    // → visible to inner consumers); the v0.2.49 resume-on-boot task
+    // below owns its own `launcher_state.clone()`.
+    let app = apply_auth_layers(
+        routes,
+        launcher_state.clone(),
+        auth_state,
+        project_token_registry,
+        cors,
+    );
 
     // Bind-address rationale — 127.0.0.1 DEFAULT, 0.0.0.0 OPT-IN (E-2,
     // v0.2.73; reverses the v0.2.61 Option-H "0.0.0.0 always" default).
@@ -337,6 +338,58 @@ pub async fn start_hub_server() -> Result<u16, String> {
         actual_port, bind_ip, bind_note
     );
     Ok(actual_port)
+}
+
+/// Apply the hub-wide auth middleware stack to an already-assembled
+/// router of `/api/v1/*` routes.
+///
+/// SSOT for the layer order (v0.2.77 F1 fix). Axum applies layers in
+/// reverse-of-declaration on the way IN, so the LAST layer added runs
+/// FIRST. For `auth::require_auth` to be able to pull `AuthState`,
+/// `ProjectTokenRegistry`, AND `LauncherDbHandle` from the request
+/// extensions, ALL THREE extension layers must be declared AFTER
+/// `require_auth` (= run before it). Pre-fix, `Extension(launcher_state)`
+/// was declared BEFORE `require_auth` (inner) so it was inserted only
+/// AFTER the middleware ran — leaving the lazy-mint (Task 4a) and
+/// slug-canonicalization (Task 4d) helpers, which read the DB handle
+/// from request extensions, to always fail closed (hard 403) in prod.
+/// The unit/integration tests passed because their bespoke test router
+/// declared `Extension(db)` LAST (outermost) — masking the bug. Both the
+/// production `start_hub_server` AND the auth tests now go through THIS
+/// function so that masking is structurally impossible.
+///
+/// Resulting request-time order (outermost → innermost):
+///   cors → Extension(launcher_db) → Extension(project_token_registry)
+///        → Extension(auth_state) → require_auth → routes
+///
+/// The outermost `Extension(launcher_db)` also reaches the inner
+/// `module_db_api::require_module_scope` middleware (an outer-inserted
+/// extension is visible to every inner consumer), which is why a single
+/// layer suffices for both consumers.
+pub(crate) fn apply_auth_layers(
+    router: axum::Router,
+    launcher_state: modules_api::LauncherDbHandle,
+    auth_state: auth::AuthState,
+    project_token_registry: project_tokens::ProjectTokenRegistry,
+    cors: CorsLayer,
+) -> axum::Router {
+    router
+        // Declared FIRST → innermost → runs LAST (closest to the routes).
+        // require_auth needs the three extensions below to already be in
+        // request extensions, so they are declared AFTER it.
+        .layer(axum::middleware::from_fn(auth::require_auth))
+        .layer(axum::Extension(auth_state))
+        // v0.2.76 Part 4 — the per-project token registry, read by
+        // `auth::require_auth` to accept a project-scoped bearer on the
+        // `/env` + `/config` routes.
+        .layer(axum::Extension(project_token_registry))
+        // v0.2.77 F1 — the launcher.db handle, read by `require_auth`'s
+        // lazy-mint (4a) + slug-canonicalization (4d) helpers AND by the
+        // inner `module_db_api` middleware. Declared LAST among the
+        // extensions (outermost) so it is inserted before `require_auth`
+        // runs and reaches every inner consumer.
+        .layer(axum::Extension(launcher_state))
+        .layer(cors)
 }
 
 /// Why a bind was chosen — logged at startup + used for the loud

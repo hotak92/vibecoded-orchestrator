@@ -1013,6 +1013,15 @@ mod tests {
             .layer(axum::Extension(registry))
     }
 
+    /// Permissive CORS layer for the SSOT-routed test routers
+    /// (`server::apply_auth_layers` takes a `CorsLayer`; the test doesn't
+    /// exercise CORS, so any layer that passes requests through is fine).
+    fn test_cors_layer() -> tower_http::cors::CorsLayer {
+        tower_http::cors::CorsLayer::new()
+            .allow_origin(tower_http::cors::Any)
+            .allow_methods(tower_http::cors::Any)
+    }
+
     /// Bind on a random port, spawn the server task, return the base
     /// URL for reqwest to hit.
     async fn spawn_router(app: Router) -> String {
@@ -1547,16 +1556,27 @@ mod tests {
     ) -> (Router, ProjectTokenRegistry) {
         let auth_state = AuthState::new(global_token.to_string());
         let registry = ProjectTokenRegistry::empty();
-        let app = Router::new()
+        let routes = Router::new()
             .route("/api/v1/projects/{id}/env", get(|| async { "env here" }))
             .route(
                 "/api/v1/projects/{id}/config",
                 get(|| async { "config here" }),
-            )
-            .layer(axum::middleware::from_fn(require_auth))
-            .layer(axum::Extension(auth_state))
-            .layer(axum::Extension(registry.clone()))
-            .layer(axum::Extension(db));
+            );
+        // v0.2.77 F1: apply the auth stack through the PRODUCTION SSOT
+        // (`server::apply_auth_layers`) rather than hand-rolling the layer
+        // order here. The old hand-rolled builder declared `Extension(db)`
+        // LAST (outermost → runs first), which made the DB handle visible
+        // to `require_auth` even though PRODUCTION declared it inner — so
+        // these tests passed while prod failed closed. Routing through the
+        // SSOT makes that masking structurally impossible: if the shared
+        // order regresses, these tests fail with prod.
+        let app = crate::server::apply_auth_layers(
+            routes,
+            db,
+            auth_state,
+            registry.clone(),
+            test_cors_layer(),
+        );
         (app, registry)
     }
 
@@ -1690,16 +1710,23 @@ mod tests {
             map.insert(pid.to_string(), tok.to_string());
         }
         let registry = ProjectTokenRegistry::from_map(map);
-        Router::new()
+        let routes = Router::new()
             .route("/api/v1/projects/{id}/env", get(|| async { "env here" }))
             .route(
                 "/api/v1/projects/{id}/config",
                 get(|| async { "config here" }),
-            )
-            .layer(axum::middleware::from_fn(require_auth))
-            .layer(axum::Extension(auth_state))
-            .layer(axum::Extension(registry))
-            .layer(axum::Extension(db))
+            );
+        // v0.2.77 F1: same SSOT routing as `router_with_db_for_lazy_mint`
+        // — the slug-canonicalization (4d) helper also reads the DB handle
+        // from request extensions, so it must be exercised through the real
+        // production layer order, not a masking hand-rolled one.
+        crate::server::apply_auth_layers(
+            routes,
+            db,
+            auth_state,
+            registry,
+            test_cors_layer(),
+        )
     }
 
     /// A scoped token addressed by the project's SLUG (which canonicalizes
@@ -1793,5 +1820,61 @@ mod tests {
             .await
             .expect("hub reachable");
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ── v0.2.77 F1 regression: production layer order must expose the
+    //    LauncherDbHandle to require_auth (lazy-mint + slug canon) ────────
+
+    /// Pins the F1 fix at the SSOT level: a router built through the REAL
+    /// `server::apply_auth_layers` (the exact function production uses)
+    /// must make the `LauncherDbHandle` extension visible to `require_auth`
+    /// so lazy-mint (4a) proceeds. Before the fix, `Extension(launcher_db)`
+    /// was declared INNER to `require_auth`, so the handle was absent when
+    /// the middleware ran and lazy-mint failed closed (hard 403) — verified
+    /// reproducible: with the handle innermost this request 403s. The
+    /// old bespoke test router masked it by declaring the handle OUTERMOST.
+    /// This test cannot be masked because it goes through the prod SSOT.
+    #[tokio::test]
+    async fn f1_lazy_mint_reachable_through_production_layer_stack() {
+        let _g = LegacyFlagGuard::set("0");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Safety: LegacyFlagGuard serialises the flag/env-mutating tests.
+        unsafe {
+            std::env::set_var("VCT_STATE_DIR", tmp.path());
+        }
+
+        let db = vct_launcher_core::db::Db::open_in_memory().unwrap();
+        seed_project_row(&db, "f1-pid", "F1Session", "/tmp/f1");
+        let handle = LauncherDbHandle(std::sync::Arc::new(db));
+        // Built through the SAME `apply_auth_layers` the production server
+        // calls (via router_with_db_for_lazy_mint).
+        let (app, registry) = router_with_db_for_lazy_mint("global-tok", handle);
+        let base = spawn_router(app).await;
+        let client = reqwest::Client::new();
+
+        assert_eq!(registry.token_for("f1-pid"), None);
+
+        // Global token + flag off → would 403, BUT the DB handle IS in the
+        // request extensions (prod layer order) so lazy-mint rescues → 200.
+        let resp = client
+            .get(format!("{}/api/v1/projects/f1-pid/config", base))
+            .header("Authorization", "Bearer global-tok")
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "F1: lazy-mint must be reachable through the production layer stack \
+             (LauncherDbHandle visible to require_auth)"
+        );
+        assert!(
+            registry.token_for("f1-pid").is_some(),
+            "F1: lazy-mint must register the scoped token"
+        );
+
+        unsafe {
+            std::env::remove_var("VCT_STATE_DIR");
+        }
     }
 }

@@ -27,6 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     accepts either a project id OR a slug, so a scoped-token call addressed
     by slug no longer gets a spurious wrong-project `403` — the auth layer
     canonicalizes the URL segment to an id before the owner comparison.
+  - **Auth-layer wiring fix so 4a + 4d actually reach the DB (F1):** both
+    the lazy-mint and slug-canonicalization rescues read the launcher.db
+    handle from request extensions, but the hub's router declared that
+    extension INNER to the auth middleware — so the handle was absent when
+    the middleware ran and BOTH rescues always failed closed (a hard `403`
+    for mid-session-added projects and slug-addressed scoped calls). The
+    router now applies its auth stack through a single shared assembly used
+    by BOTH the production server AND its tests, so the extension is in
+    request scope when the middleware runs and the test topology can no
+    longer diverge from production. Without this the flip above would have
+    hard-403'd exactly the cases 4a/4d were shipped to rescue.
   - **Resolvers surface a distinct `403` (4c):** the bash / PowerShell /
     Python resolvers now map a hub `403` to a typed forbidden condition
     (new exit code `5` for the shell pair; `Forbidden` — NOT a
