@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.77] - 2026-07-11
+
 ### Security
 - **The hub now REFUSES the coarse global `hub.token` on the per-project
   `/env` + `/config` routes by default** (v0.2.76 introduced the per-project
@@ -75,6 +77,166 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   there is no schema change and no change to the telemetry opt-out
   semantics. This restores the label half of the training corpus for the
   dominant cohort, equally with or without the RL module installed. (9-bis)
+- **`update all projects` no longer crashes on projects without their own
+  `.venv`.** During a machine-wide update, a project lacking a local venv
+  spawned weaviate-connecting `vco_lib` code with a raw PEP-668 system
+  Python that cannot import `weaviate`, so every additive migration
+  auto-apply, collection bootstrap, and drop-collections pass raised
+  `ModuleNotFoundError`. The update-path spawns (`build_migrate_command`,
+  `run_bootstrap_collections`, `drop_owned_collections`) now resolve the
+  orchestrator venv via the shared RT-4 python-resolver ladder, falling
+  back to the system Python only when no venv resolves. The four drifted
+  copies of that ladder across the launcher command layer are converged
+  into one home (`vct_launcher_core::python_resolve`), which also fixes a
+  latent codegraph-reanalyze missing-tiers bug. (Part 1)
+- **A stale, project-local code-graph analyzer wrapper is no longer
+  trusted on mere existence.** A project shipping an ancient (pre-RT-4)
+  `code-graph-analyze` wrapper with a hardcoded absolute venv path caused
+  the codegraph build to exit 127 during `update all projects`. The
+  resolver now health-checks the project-local wrapper (requires the
+  `VCT_INSTALL_ROOT` resilient-ladder marker) before preferring it over
+  the orchestrator copy; a stale/unreadable wrapper is skipped with one
+  WARN line and a best-effort `stale_codegraph_wrapper_pending` deferral.
+  Relatedly, `build_script_command` (kg-sync, kg-duplicates,
+  code-graph-analyze) now falls back to the orchestrator script copy when a
+  project has no local `.claude/scripts/` instead of erroring outright.
+  (Part 1)
+- **The recurring dead orchestrator-root KG access row is fixed at the
+  root cause and healed on already-installed machines.** On any install
+  whose canonical shared-KG pointer was re-pointed away from the bundled
+  default, the orchestrator-root project's own-primary
+  `kg_collection_access` row and primary KG binding were derived from the
+  literal `VibeCodedOrchestrator_KnowledgeGraph` — a dead Weaviate class —
+  and re-seeded on every launcher boot / update-all via INSERT-OR-IGNORE
+  after any heal wiped it. The row and binding are now pointer-derived from
+  the live canonical class for the orchestrator root (stops new dead rows),
+  and the machine-wide heal (`heal_shared_kg_pointer_drift`) gains a scoped
+  dead-row sweep that repairs the already-seeded row even when the pointer
+  is otherwise converged. A regular per-project collection legitimately
+  absent from Weaviate (not yet bootstrapped) is the leave-alone case and
+  is never swept. (Part 2)
+- **`--incremental` code-graph analysis now heals vectorless (embed
+  revision NULL/0) rows.** The incremental branch kept only git-diff
+  changed files, so an unchanged file owning a stale/vectorless row never
+  reached the re-embed probe — previously only a full re-analyze could
+  recover the rows the concurrency-saturation incident left behind.
+  `--incremental` now unions the per-run stale-file set into the changed
+  set, making it a valid heal path for updating users. (Part 3)
+
+### Added
+- **Hardware-derived shared-pool embedding concurrency budget.** A new
+  pure decision function (`select_embedding_concurrency` in
+  `vco_lib/embedding_selection.py`) maps free device memory and the two
+  chosen embedding backends onto a concurrency budget
+  (`code_embed_max_concurrent` + `update_all_max_parallel_projects`)
+  using one shared pool — every concurrently-active model's base footprint
+  is reserved first, then each pipeline's parallel slots are allocated from
+  the remainder (`floor((pool / model_memory) * 0.8)`, floor 1, cap 8).
+  `install.py` derives the budget from the same hardware specs that pick
+  the models and writes `CODE_EMBED_MAX_CONCURRENT` to `.env` (honouring an
+  explicit user override) plus the `embedding.*` app_state seeds
+  (ON CONFLICT DO NOTHING, so GUI/prior selections are preserved). A
+  single process-global admission semaphore, sized from
+  `embedding.update_all_max_parallel`, now gates BOTH embed-heavy spawned
+  tasks (codegraph build + KG sync) so codegraph and KG embedding share one
+  memory budget during `update all projects` rather than two independent
+  caps. The Rust side consumes the derived result via app_state (shared
+  config, no mirror). (Part 3)
+- **Optional `codegraph-ts` extra for cross-language call-edge
+  extraction.** A new `[project.optional-dependencies] codegraph-ts` extra
+  pins tree-sitter 0.26.0 plus 11 grammar wheels (python, rust, javascript,
+  typescript, go, java, c-sharp, cpp, ruby, lua, bash), all shipping wheels
+  for linux x86_64 / macOS arm64 / Windows amd64. `install.py` installs it
+  into the analyzer venv with the same soft-fail shape as the Playwright
+  pre-cache (opt out with `VCT_SKIP_CODEGRAPH_TS=1`; no-network or
+  unresolvable-wheel warns and continues). A new cross-language
+  call-extraction facade (`vco_lib/codegraph_calls.py`) exposes one entry
+  point `extract_call_names(language, body)`: Python keeps its
+  dependency-free `ast` implementation; every other supported language uses
+  a lazily-loaded, cached per-grammar tree-sitter query kept as data.
+  `None` (no grammar available) preserves today's no-edge behaviour; `[]`
+  is a positive zero-calls result. The analyzer's cross-reference pass and
+  the MCP callers/path support gate are both wired to the facade, so
+  non-Python rows get real call edges when the extra is installed and
+  degrade to the prior behaviour when it is not. (Part 5)
+- **Golden code-graph fixture coverage extended to the previously
+  regex-only extractors.** Seven new fixture source files (cpp, csharp,
+  ruby, lua, shell, proto, svelte) with per-language coverage assertions
+  snapshot each extractor's current truth (including known extractor quirks)
+  as the baseline for the Part-5 call-extraction work. Additive only — no
+  existing expected output changed. (Part 4)
+
+### Changed
+- **The code-graph analyzer's per-language extractors are now pure
+  producers over a shared intermediate representation.** Completing the
+  v0.2.76 Part-3 deferral, a `FileExtraction` IR (`ModuleDescriptor`,
+  `InteractionGroup`, and per-entity descriptors carrying no analyzer state
+  and no UUIDs) plus its single writer (`write_file_extraction`) replace
+  the previous imperative "extract-and-store" sinks. Every supported
+  language (rust, go, ruby, shell, java, lua, cpp, js/ts, csharp, proto,
+  svelte, powershell, and the Python delegation case) now returns a pure
+  `FileExtraction` through a shared thin-shim runner that keeps the
+  minified-skip and unchanged-file gates analyzer-side; the writer mints
+  UUIDs and resolves deferred-embed closures. Behaviour-preserving
+  refactor. (Part 6)
+- **Shared components converge internal divergences across the codebase.**
+  Per a user directive to eliminate silent parameter drift (not merely
+  shorten files), several hand-rolled near-copies are consolidated onto one
+  source of truth:
+  - **Python:** Weaviate connection / raw-HTTP / object-count helpers into
+    `vco_lib/weaviate_helpers`; a deferral-emitter factory and a
+    `launcher.db` app_state writer; the pinned-npm install core moved to
+    `vco_lib/install_npm` (removing a `vco_lib → install.py` back-edge);
+    the CLI KG/code-graph access-list sanitizer converged onto the writer
+    SSOT (fixing an underscore-preserving vs underscore-dropping
+    divergence); dead `.env`-template renderer code removed. The
+    `_ensure_collections` / `bootstrap_collections` cores were deliberately
+    left un-converged (their CREATE/PATCH behaviour genuinely differs) with
+    a pinning test recording that decision. (Part 7a)
+  - **Rust:** the deferral `pick_python` variants onto the shared RT-4
+    ladder; the `vco_lib` spawn env-sandbox into
+    `services/vco_lib_bridge`; `which_on_path` + the installed-script ladder
+    into `core/paths`; one Python-bridge deferral writer in
+    `services/deferral`; ISO-Z timestamp helpers into `core/time`. (Part 7c)
+  - **Facade splits:** `installer.rs` and `projects_v2.rs` are split into
+    focused submodules (hardware/runtime probes, version parsers, install-log
+    reader, file-ops, inspection, progress emitters; editor/terminal launch,
+    bundle-update change detectors, KG-name derivation, shared-KG accessors,
+    unregister env-strippers). (Part 7d)
+
+### Performance
+- **Hook-injection latency is substantially reduced without dropping any
+  work.** A per-session query-cost audit (2026-07-11) found several
+  injection surfaces paying full search cost for results they discarded:
+  - The `pre-edit-context-inject` warm-cache replay branch sat AFTER the KG
+    + code-graph searches were launched and waited on — so a "warm" edit
+    paid the full ~1.4s search cost and threw the fresh results away (the
+    cache had been effectively dead since the PR-38 port in v0.2.12). The
+    replay is moved ahead of the search launch: a warm cache hit now serves
+    in ~0.1s instead of ~1.4s. (task 1)
+  - A single shared TTL result-cache now backs every injection surface
+    (pre-edit, pre-bash, pre-tool-use Read/Grep), so the same expensive
+    Weaviate+embed query issued repeatedly in a session is served from
+    cache instead of re-run. (task 2)
+  - Subagent-start KG injection (~3.8s/spawn) is routed through the shared
+    cache keyed on prompt + limit, so repeated spawns of the same task
+    prompt are served in milliseconds. Every spawn still gets its injection.
+    (task 5)
+  - The per-spawn snapshot subsystem is hardened: it previously hashed ~27k
+    files and wrote ~4MB JSON per spawn, re-hashed at SubagentStop, and
+    leaked orphaned snapshots (a 1.2GB, GC-less accumulation). All fixes are
+    functionality-preserving — the diff still drives KG-sync, code-graph,
+    and credential-scan for every real change. (task 9)
+  - Every embed request now carries an Ollama `keep_alive` (default `24h`,
+    override via `VCO_OLLAMA_KEEP_ALIVE`) so the embed model stays resident
+    and the first injection after an idle gap no longer pays a ~1.9s model
+    reload. (task 6)
+
+  Per the governing user ruling, no functionality was removed to improve
+  latency — only work whose output was discarded is now avoided. Tests pin
+  that suppressed injections pay no live query and that the per-tool-call
+  I/O surface stays bounded with no telemetry/log/sync stream dropped.
+  (tasks 4, 7, 8)
 
 ## [0.2.76] - 2026-07-10
 
