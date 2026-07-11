@@ -159,7 +159,7 @@ Context nearing limit
 
 **pre-edit-context-inject.sh** (matcher: `Edit`)
 - Before editing a file, runs KG search for the filename/concept and code-graph search for related functions.
-- Injects search results as context (live ~2.7s, cached ~31ms via 10-min TTL file cache).
+- Injects search results as context. Cold (cache-miss) ~1.3s; warm (cache-hit) ~0.1s via the 10-min TTL per-file cache. v0.2.77 Part 9 moved the cache-replay branch ahead of the search launch so a warm hit is served from cache without re-paying the ~1.3s Weaviate+embed round-trip (the pre-fix cache was dead — it launched+awaited the searches before the replay branch, so warm ≈ cold). A cross-surface shared TTL result-cache (query-cache.sh) additionally serves repeat queries across pre-edit/pre-bash/pre-tool-use.
 - Session-level dedup via a seen-nodes file prevents repeating the same nodes; resets on compaction.
 
 **pre-diagram-path-validation.sh** (matcher: `Write|Edit` and `mcp__mermaid__.*|mcp__excalidraw__.*`)

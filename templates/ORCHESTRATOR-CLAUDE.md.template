@@ -460,7 +460,7 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 
 **PreToolUse**:
 - `pre-tool-use.sh` — log tool usage to `.claude/logs/YYYY-MM-DD_tool_usage.jsonl` (matcher: `*`).
-- `pre-edit-context-inject.sh` — KG + code-graph search before `Edit` (~2.7 s live, ~31 ms cached) (matcher: `Edit(*)`).
+- `pre-edit-context-inject.sh` — KG + code-graph search before `Edit` (~1.3 s cold cache-miss, ~0.1 s warm cache-hit — v0.2.77 moved the cache replay before the search launch so a warm hit no longer pays for the query) (matcher: `Edit(*)`).
 
 **PostToolUse**:
 - `post-file-edit.sh` — auto-sync on file edits: `knowledge/` → KG, `docs/` → development collection, code files → code-graph queue; duplicate detection every 10 edits (matcher: `Edit(*)|Write(*)`).
