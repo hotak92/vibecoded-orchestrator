@@ -9001,6 +9001,55 @@ def install_project_bundle(
     return result
 
 
+# Wrappers that ship the resilient `$VCT_INSTALL_ROOT` interpreter-discovery
+# ladder and therefore SHOULD be stale-checked. MUST match the Rust
+# `wrapper_requires_resilience_marker` set (code-graph-analyze, kg-sync +
+# `.ps1` siblings). `kg-duplicates` has no ladder and is excluded there too.
+_RESILIENT_WRAPPER_BASENAMES: tuple[str, ...] = (
+    "code-graph-analyze",
+    "code-graph-analyze.ps1",
+    "kg-sync",
+    "kg-sync.ps1",
+)
+
+# The marker string that MUST appear in a healthy (RT-4+) wrapper. Mirrors the
+# Rust `analyzer_wrapper_is_resilient` marker. We detect a string the templates
+# already ship rather than adding a fresh sentinel, so the check stays true no
+# matter how the templates are re-worded, as long as they honour the ladder.
+_RESILIENT_WRAPPER_MARKER = "VCT_INSTALL_ROOT"
+
+
+def _codegraph_wrapper_still_stale(folder: Path) -> bool:
+    """v0.2.77 L4-1 probe: does the project STILL carry a stale codegraph
+    analyzer / kg-sync wrapper (exists but lacks the resilient
+    ``$VCT_INSTALL_ROOT`` ladder)?
+
+    Mirrors the Rust ``analyzer_wrapper_is_resilient`` health-check so the
+    ``stale_codegraph_wrapper_pending`` deferral (emitted Rust-side when the
+    launcher falls back to the orchestrator copy) self-clears once the user
+    refreshes the wrapper (Option A ``cp`` / Option B ``--force``).
+
+    Returns ``True`` if ANY resilient-ladder wrapper under
+    ``.claude/scripts`` exists AND does not contain the marker (conservative:
+    an unreadable file is treated as stale — same as the Rust default). Returns
+    ``False`` when no such wrapper is stale (nothing left to defer).
+    """
+    scripts_dir = folder / ".claude" / "scripts"
+    for basename in _RESILIENT_WRAPPER_BASENAMES:
+        wrapper = scripts_dir / basename
+        if not wrapper.is_file():
+            continue
+        try:
+            contents = wrapper.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            # Unreadable → conservatively treat as stale (still-applicable),
+            # mirroring the Rust conservative default.
+            return True
+        if _RESILIENT_WRAPPER_MARKER not in contents:
+            return True
+    return False
+
+
 def _reconcile_bundle_deferrals(
     folder: Path,
     *,
@@ -9011,6 +9060,7 @@ def _reconcile_bundle_deferrals(
     still_legacy_codegraph: bool = False,
     still_orphan_preserved: bool = False,
     still_legacy_vscode_mcp: bool = False,
+    still_stale_wrapper: Optional[bool] = None,
 ) -> None:
     """Trim bundle-specific deferral entries that this install resolved.
 
@@ -9054,6 +9104,21 @@ def _reconcile_bundle_deferrals(
 
     report = DeferralReport.read(folder)
     initial_ids = {e.condition_id for e in report.entries}
+
+    # v0.2.77 L4-1: the codegraph-analyzer/kg-sync stale-wrapper deferral
+    # (emitted Rust-side when the launcher falls back to the orchestrator copy)
+    # had no self-clear. Recompute here — probed from disk (only when the entry
+    # is actually present, to avoid needless reads) when the caller passes None
+    # (the default), so once the user refreshes the wrapper (Option A cp /
+    # Option B --force) the next bundle update sees a healthy wrapper and clears
+    # the entry.
+    if "stale_codegraph_wrapper_pending" in initial_ids:
+        bundle_conditions["stale_codegraph_wrapper_pending"] = (
+            _codegraph_wrapper_still_stale(folder)
+            if still_stale_wrapper is None
+            else still_stale_wrapper
+        )
+
     if not initial_ids & set(bundle_conditions):
         # Nothing on-disk we own → no reconciliation to do.
         return

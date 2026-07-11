@@ -108,10 +108,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `VCT_INSTALL_ROOT` resilient-ladder marker) before preferring it over
   the orchestrator copy; a stale/unreadable wrapper is skipped with one
   WARN line and a best-effort `stale_codegraph_wrapper_pending` deferral.
-  Relatedly, `build_script_command` (kg-sync, kg-duplicates,
-  code-graph-analyze) now falls back to the orchestrator script copy when a
-  project has no local `.claude/scripts/` instead of erroring outright.
-  (Part 1)
+  That deferral now SELF-CLEARS: the bundle-update reconcile pass re-probes
+  the wrapper (exists + carries the `VCT_INSTALL_ROOT` marker) and drops the
+  entry once the user has refreshed the wrapper (Option A `cp` / Option B
+  `--force`) or removed it — so it no longer lingers in UPDATE_DEFERRED.md
+  after the condition is resolved. Relatedly, `build_script_command`
+  (kg-sync, kg-duplicates, code-graph-analyze) now falls back to the
+  orchestrator script copy when a project has no local `.claude/scripts/`
+  instead of erroring outright. (Part 1)
 - **The recurring dead orchestrator-root KG access row is fixed at the
   root cause and healed on already-installed machines.** On any install
   whose canonical shared-KG pointer was re-pointed away from the bundled
