@@ -431,6 +431,123 @@ def test_no_results_lines_dedup_correctly(hook_env, tmp_path):
     )
 
 
+def _write_counting_kg_producer(env, marker: Path) -> None:
+    """Install a KG producer that appends one byte to `marker` on every
+    invocation, then emits one canned KG block. Lets a test count how
+    many times the hook actually launched the (expensive) search — the
+    load-bearing signal for the v0.2.77 Part-9 cache-serves-before-search
+    fix. Also install a no-op code-graph producer so the code branch is
+    inert (we only care about the KG search launch here).
+    """
+    rl = env["scripts_dir"] / "rl_kg_search.py"
+    rl.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys, argparse\n"
+        "ap = argparse.ArgumentParser()\n"
+        "ap.add_argument('query')\n"
+        "ap.add_argument('--limit', type=int, default=1)\n"
+        "ap.add_argument('--hook-format', action='store_true')\n"
+        "args = ap.parse_args()\n"
+        # Record the invocation UNCONDITIONALLY (before the --hook-format
+        # gate) so we count every launch, hook-format or not.
+        f"open({str(marker)!r}, 'a').write('x')\n"
+        "if not args.hook_format:\n"
+        "    sys.exit(0)\n"
+        "print('KG: Cache Probe Node | concept | score=0.90 | FULL NODE:')\n"
+        "print('probe body line')\n",
+        encoding="utf-8",
+    )
+    rl.chmod(rl.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    cg = env["cg_dir"] / "code-graph-query"
+    cg.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    cg.chmod(cg.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+@pytest.mark.skipif(_IS_WINDOWS, reason=".sh hook regression — .ps1 covered by body-parity tests")
+@pytest.mark.skipif(not _has_bash(), reason="bash required for shell hook")
+def test_cache_hit_served_without_relaunching_search(hook_env, tmp_path):
+    """v0.2.77 Part 9 task 1 ACT test: a SECOND identical-payload Edit
+    (same session, same file) within the 10-min TTL must be served from
+    the per-file cache WITHOUT re-launching the KG search subprocess.
+
+    Pre-fix the cache-replay branch sat AFTER the search launch+wait, so a
+    warm edit still paid the full search cost (audit 2026-07-11: warm
+    1431 ms ≈ cold 1440 ms) and threw the fresh results away. This test
+    pins the fix behaviourally: the KG producer's invocation marker must
+    show exactly ONE launch across two invocations, and the cache log must
+    record a `miss` then a `hit`.
+
+    NOTE ON DEDUP: the pre-edit dedup store would normally suppress the
+    already-seen node on the second (replay) invocation, yielding empty
+    stdout. To make the replay EMIT (so we prove the replay path runs, not
+    just that it exits), the two invocations use DIFFERENT session ids for
+    the seen-store while sharing nothing else — but the per-file cache is
+    keyed on (session, file). So instead we assert the load-bearing signal
+    directly: the search subprocess launched exactly once, and the cache
+    log shows miss->hit. Same session + same file guarantees the same
+    cache path.
+    """
+    marker = tmp_path / "kg_launch_marker"
+    _write_counting_kg_producer(hook_env, marker)
+
+    target = str(tmp_path / "probe.py")
+    session = "sess-cache-act"
+
+    first = _invoke_hook(hook_env, session, target)
+    assert first.returncode == 0, f"first hook run failed: {first.stderr!r}"
+    assert marker.exists(), "KG search must have launched on the cold (miss) run"
+    launches_after_first = len(marker.read_text("utf-8"))
+    assert launches_after_first == 1, (
+        f"expected exactly 1 KG launch on the cold run, got {launches_after_first}"
+    )
+
+    # Second identical invocation — must be served from cache.
+    second = _invoke_hook(hook_env, session, target)
+    assert second.returncode == 0, f"second hook run failed: {second.stderr!r}"
+    launches_after_second = len(marker.read_text("utf-8"))
+    assert launches_after_second == 1, (
+        "cache HIT must NOT relaunch the KG search — expected the launch "
+        f"marker to stay at 1, got {launches_after_second}. This is the "
+        "v0.2.77 Part-9 regression: replay running after the search."
+    )
+
+    # Cache log observability: one miss then one hit for this session.
+    log = hook_env["state_dir"] / "preedit_cache_log.jsonl"
+    assert log.exists(), "pre-edit cache log must be written (hit/miss observability)"
+    entries = [
+        json.loads(ln) for ln in log.read_text("utf-8").splitlines() if ln.strip()
+    ]
+    statuses = [e["status"] for e in entries if e.get("session") == session]
+    assert statuses == ["miss", "hit"], (
+        f"expected miss->hit for session {session}; got {statuses!r}"
+    )
+
+
+@pytest.mark.skipif(_IS_WINDOWS, reason=".sh hook regression — .ps1 covered by body-parity tests")
+@pytest.mark.skipif(not _has_bash(), reason="bash required for shell hook")
+def test_cache_miss_cold_path_output_unchanged(hook_env, tmp_path):
+    """Leave-alone control for task 1: the COLD (cache-miss) path must
+    still emit the pre-edit context block exactly as before — the reorder
+    only changed WHEN the replay branch runs, not the miss-path output.
+    """
+    _write_stub_producers(
+        hook_env,
+        kg_lines=[
+            "KG: Cold Path Node | concept | score=0.88 | FULL NODE:",
+            "cold body",
+        ],
+        code_lines=[],
+    )
+    result = _invoke_hook(hook_env, "sess-cold-path", str(tmp_path / "cold.py"))
+    assert result.returncode == 0, f"hook failed: {result.stderr!r}"
+    assert "Cold Path Node" in result.stdout, (
+        f"cold miss path must still emit the KG block (stdout={result.stdout!r})"
+    )
+    assert "[Pre-edit context for cold.py]" in result.stdout, (
+        "cold miss path must still emit the standard context header"
+    )
+
+
 # --------------------------------------------------------------------------
 # Static body-parity guards (so future edits don't silently drop the fix)
 # --------------------------------------------------------------------------

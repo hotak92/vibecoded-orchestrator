@@ -234,6 +234,10 @@ CACHE_FILE="$CACHE_DIR/$FILE_HASH"
 
 mkdir -p "$CACHE_DIR" 2>/dev/null || true
 
+# BASENAME is needed by the cache-replay branch below (v0.2.77 Part 9 task 1),
+# which now runs BEFORE the live search + query build. Compute it up here.
+BASENAME=$(basename "$FILE_PATH")
+
 # === Helper: emit context as PreToolUse JSON envelope ===
 # Wraps emit_additional_context from _lib/emit-context.sh — the helper
 # also gates on whitespace-only content so we don't surface empty
@@ -253,6 +257,110 @@ _emit_context_json() {
     fi
 }
 
+# === Dedup: filter out nodes already injected this session ===
+# (v0.2.77 Part 9 task 1) These functions are DEFINED HERE — before the cache
+# read + replay branch below — so a cache HIT can be served WITHOUT launching
+# the two live searches. Pre-v0.2.77 the functions were defined after the
+# searches, forcing the replay branch to sit after a `wait` on both searches:
+# a "warm" edit paid the full ~1.4 s search cost and then threw the fresh
+# results away. Moving the defs + replay up makes a hit ~80 ms (dedup + emit).
+#
+# The KG/codegraph result blocks emitted by rl_kg_search.py and
+# query_code_graph have the shape:
+#
+#   KG: <title> | <type> | score=<n.nn> | <body...>
+#   <body line 1>
+#   <body line 2>
+#   ...
+#   (blank line separates blocks)
+#
+# v0.2.70 Stream E: dedup is now the shared _lib/seen-store.sh helper
+# (vco_filter_seen_blocks), keyed PER-CHUNK for KG ("<title>#<sha1(body)>" so a
+# NEW chunk of a seen node still injects) and PER-ENTITY for CODE, and it ALSO
+# suppresses a block whose source path the model already Read explicitly
+# (reads-ledger). _filter_seen is now a thin delegator: it calls the shared
+# helper when present, and falls back to the legacy title-keyed inline logic
+# only on a partial install where _lib/seen-store.sh is missing.
+_filter_seen() {
+    local input="$1"
+    if command -v vco_filter_seen_blocks >/dev/null 2>&1; then
+        vco_filter_seen_blocks "$input" "$SEEN_INJECT_FILE" "$SEEN_READS_FILE"
+        return 0
+    fi
+    _filter_seen_legacy "$input"
+}
+
+# Legacy fallback (pre-v0.2.70): title-coarse dedup against a single store, no
+# reads-ledger consult. Kept only for the missing-helper case so a partial
+# install still dedups (just coarser). Bash-3.2 safe (no assoc arrays).
+_filter_seen_legacy() {
+    local input="$1"
+    local filtered=""
+    touch "$SEEN_NODES_FILE"
+
+    local current_title=""
+    local current_block=""
+    local current_skip=0
+
+    _flush_block() {
+        if [ -n "$current_title" ] && [ "$current_skip" = "0" ] \
+            && ! grep -Fxq -- "$current_title" "$SEEN_NODES_FILE"; then
+            filtered="${filtered}${current_block}"
+            echo "$current_title" >> "$SEEN_NODES_FILE"
+        fi
+        current_title=""
+        current_block=""
+        current_skip=0
+    }
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^(KG|CODE):\ (.+)$ ]]; then
+            _flush_block
+            local rest="${BASH_REMATCH[2]}"
+            rest="${rest#KG: }"
+            rest="${rest#CODE: }"
+            current_title="${rest%% | *}"
+            current_title="${current_title:0:200}"
+            current_block="${line}"$'\n'
+            if grep -Fxq -- "$current_title" "$SEEN_NODES_FILE"; then
+                current_skip=1
+            fi
+        elif [ -n "$current_title" ]; then
+            current_block="${current_block}${line}"$'\n'
+        else
+            if [[ "$line" =~ [^[:space:]] ]]; then
+                filtered="${filtered}${line}"$'\n'
+            fi
+        fi
+    done <<< "$input"
+    _flush_block
+
+    echo "$filtered"
+}
+
+# === Cache hit/miss observability (v0.2.77 Part 9 task 1) ===
+# Append a single-line JSON record so the once-dead cache can be verified in
+# the field. Bounded via find-mtime GC of the log alongside the other state
+# GC below. Best-effort; never blocks the edit.
+_cache_log() {
+    # $1 = hit|miss ; write to a per-project state file, capped by rotation.
+    local _status="$1"
+    local _log="$PROJECT_ROOT/.claude/state/preedit_cache_log.jsonl"
+    local _ts
+    _ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '')"
+    # Size guard: rotate at ~256 KB (data preserved in .1 sibling), so the log
+    # never grows unbounded. Rotation keeps the previous window — not a drop.
+    if [ -f "$_log" ]; then
+        local _sz
+        _sz=$(wc -c < "$_log" 2>/dev/null || echo 0)
+        if [ "${_sz:-0}" -gt 262144 ]; then
+            mv -f "$_log" "${_log}.1" 2>/dev/null || true
+        fi
+    fi
+    printf '{"ts":"%s","hook":"pre-edit","status":"%s","session":"%s"}\n' \
+        "$_ts" "$_status" "$SESSION_ID" >> "$_log" 2>/dev/null || true
+}
+
 # === Check cache (10 min TTL) ===
 # Cross-OS mtime: `stat -c %Y` is GNU coreutils (Linux); `stat -f %m` is BSD
 # (macOS). Try GNU first, fall back to BSD; final fallback is Python
@@ -260,9 +368,8 @@ _emit_context_json() {
 # install treats the cache as expired. See audit finding F4.
 #
 # Cache stores RAW per-result blocks (with KG:/CODE: headers) so dedup can
-# still apply on replay against the latest seen-list. The actual replay
-# happens further down, after `_filter_seen` is defined — here we just
-# capture the cached blob and a flag.
+# still apply on replay against the latest seen-list. The replay branch is
+# RIGHT BELOW — before any search launches — so a hit never pays for a query.
 CACHE_HIT=0
 CACHE_BLOB=""
 if [[ -f "$CACHE_FILE" ]]; then
@@ -280,6 +387,36 @@ if [[ -f "$CACHE_FILE" ]]; then
     fi
 fi
 
+# === Cache replay (BEFORE any live search) ===
+# If we have a fresh cache hit, dedup the cached blob against the current
+# seen-list and emit — WITHOUT launching rl_kg_search.py / code-graph-query.
+# If everything in the cache is already seen, exit silently. The cache stores
+# RAW per-result blocks (KG:/CODE: headers) so dedup state stays accurate
+# across replays (a node seen since the cache was written gets filtered out
+# here, rather than being baked into the cache and perma-suppressed after a
+# /compact wipe).
+#
+# History: the cache layer was ported to .sh in PR-38 (v0.2.12) but the replay
+# branch was positioned AFTER the search launch+wait, so it never saved the
+# search cost (audit 2026-07-11: warm 1431 ms ≈ cold 1440 ms). v0.2.77 Part 9
+# moves it here so a warm edit is served from cache in ~80 ms.
+if [[ "$CACHE_HIT" == "1" ]]; then
+    _cache_log hit
+    FILTERED_CACHE=$(_filter_seen "$CACHE_BLOB")
+    # Whitespace-only filtered output → everything was already seen; silent exit.
+    case "$FILTERED_CACHE" in
+        *[![:space:]]*)
+            REPLAY_OUT="[Pre-edit context for ${BASENAME}]:"$'\n'$'\n'"${FILTERED_CACHE}"
+            _emit_context_json "$REPLAY_OUT"
+            exit 0
+            ;;
+        *)
+            exit 0
+            ;;
+    esac
+fi
+_cache_log miss
+
 # === Auto-detect project for multi-codebase support ===
 source "$SCRIPT_DIR/../scripts/detect-project.sh"
 DETECTED_PROJECT=$(detect_project_for_file "$FILE_PATH" "$PROJECT_ROOT")
@@ -289,7 +426,7 @@ if [[ -n "$DETECTED_PROJECT" ]]; then
 fi
 
 # === Build search query ===
-BASENAME=$(basename "$FILE_PATH")
+# BASENAME already computed above (needed by the cache-replay branch).
 MODULE_NAME="${BASENAME%.*}"  # strip extension (e.g. retrieval_rl.py → retrieval_rl)
 
 # First 200 chars of new_string as semantic signal
@@ -373,103 +510,10 @@ fi
 rm -f "$KG_TMP" "$CODE_TMP"
 
 # === Dedup: filter out nodes already injected this session ===
-# The KG/codegraph result blocks emitted by rl_kg_search.py and
-# query_code_graph have the shape:
-#
-#   KG: <title> | <type> | score=<n.nn> | <body...>
-#   <body line 1>
-#   <body line 2>
-#   ...
-#   (blank line separates blocks)
-#
-# v0.2.70 Stream E: dedup is now the shared _lib/seen-store.sh helper
-# (vco_filter_seen_blocks), keyed PER-CHUNK for KG ("<title>#<sha1(body)>" so a
-# NEW chunk of a seen node still injects) and PER-ENTITY for CODE, and it ALSO
-# suppresses a block whose source path the model already Read explicitly
-# (reads-ledger). _filter_seen is now a thin delegator: it calls the shared
-# helper when present, and falls back to the legacy title-keyed inline logic
-# only on a partial install where _lib/seen-store.sh is missing.
-_filter_seen() {
-    local input="$1"
-    if command -v vco_filter_seen_blocks >/dev/null 2>&1; then
-        vco_filter_seen_blocks "$input" "$SEEN_INJECT_FILE" "$SEEN_READS_FILE"
-        return 0
-    fi
-    _filter_seen_legacy "$input"
-}
-
-# Legacy fallback (pre-v0.2.70): title-coarse dedup against a single store, no
-# reads-ledger consult. Kept only for the missing-helper case so a partial
-# install still dedups (just coarser). Bash-3.2 safe (no assoc arrays).
-_filter_seen_legacy() {
-    local input="$1"
-    local filtered=""
-    touch "$SEEN_NODES_FILE"
-
-    local current_title=""
-    local current_block=""
-    local current_skip=0
-
-    _flush_block() {
-        if [ -n "$current_title" ] && [ "$current_skip" = "0" ] \
-            && ! grep -Fxq -- "$current_title" "$SEEN_NODES_FILE"; then
-            filtered="${filtered}${current_block}"
-            echo "$current_title" >> "$SEEN_NODES_FILE"
-        fi
-        current_title=""
-        current_block=""
-        current_skip=0
-    }
-
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^(KG|CODE):\ (.+)$ ]]; then
-            _flush_block
-            local rest="${BASH_REMATCH[2]}"
-            rest="${rest#KG: }"
-            rest="${rest#CODE: }"
-            current_title="${rest%% | *}"
-            current_title="${current_title:0:200}"
-            current_block="${line}"$'\n'
-            if grep -Fxq -- "$current_title" "$SEEN_NODES_FILE"; then
-                current_skip=1
-            fi
-        elif [ -n "$current_title" ]; then
-            current_block="${current_block}${line}"$'\n'
-        else
-            if [[ "$line" =~ [^[:space:]] ]]; then
-                filtered="${filtered}${line}"$'\n'
-            fi
-        fi
-    done <<< "$input"
-    _flush_block
-
-    echo "$filtered"
-}
-
-# Cache replay: if we have a cache hit, dedup the cached blob against the
-# current seen-list and emit. If everything in the cache is already seen,
-# exit silently. The cache stores RAW per-result blocks (KG:/CODE: headers)
-# so dedup state stays accurate across replays (a node seen since the
-# cache was written gets filtered out here, rather than being baked into
-# the cache and perma-suppressed after a /compact wipe).
-#
-# Ported from .ps1 sibling 2026-05-16 (PR-38, v0.2.12) — restores
-# cross-OS parity with the cache layer that PR-35 confirmed had never
-# existed on the .sh side. See knowledge/concepts/cross-os-hook-portability.md.
-if [[ "$CACHE_HIT" == "1" ]]; then
-    FILTERED_CACHE=$(_filter_seen "$CACHE_BLOB")
-    # Whitespace-only filtered output → everything was already seen; silent exit.
-    case "$FILTERED_CACHE" in
-        *[![:space:]]*)
-            REPLAY_OUT="[Pre-edit context for ${BASENAME}]:"$'\n'$'\n'"${FILTERED_CACHE}"
-            _emit_context_json "$REPLAY_OUT"
-            exit 0
-            ;;
-        *)
-            exit 0
-            ;;
-    esac
-fi
+# _filter_seen / _filter_seen_legacy are DEFINED EARLIER (before the cache
+# read + replay branch — v0.2.77 Part 9 task 1) so a cache hit can replay
+# without launching the searches. The MISS path continues here to dedup the
+# freshly-produced KG_RESULT / CODE_RESULT.
 
 # Capture raw producer output (pre-dedup) for the cache. Caching post-dedup
 # would perma-suppress titles seen at write-time but eligible to re-appear

@@ -194,100 +194,6 @@ function Emit-ContextJson([string]$ctx) {
     }
 }
 
-# Check cache (10-min TTL) — uses .NET file mtime, no cross-OS stat issues.
-# Cache stores RAW per-result blocks (with KG:/CODE: headers) so dedup can
-# still apply on replay against the latest seen-list. Replay runs further
-# down, after Filter-Seen is in scope.
-$CacheHit = $false
-$CacheBlob = ""
-if (Test-Path $CacheFile) {
-    $mtime = (Get-Item $CacheFile).LastWriteTime
-    $age = ((Get-Date) - $mtime).TotalSeconds
-    if ($age -lt $CacheTtl) {
-        $CacheHit = $true
-        try { $CacheBlob = (Get-Content $CacheFile -Raw -ErrorAction Stop) } catch { }
-    }
-}
-
-# Auto-detect project for multi-codebase support — best-effort, optional.
-$DetectScriptPs1 = Join-Path $ProjectRoot ".claude/scripts/detect-project.ps1"
-$DetectedProject = ""
-if (Test-Path $DetectScriptPs1) {
-    try {
-        $DetectedProject = (& $PsExe -NoProfile -File $DetectScriptPs1 $FilePath $ProjectRoot 2>$null).Trim()
-    } catch { }
-}
-$CodeGraphProjectArg = if ($DetectedProject) { @('--project', $DetectedProject) } else { @() }
-
-$Basename = Split-Path $FilePath -Leaf
-$ModuleName = [System.IO.Path]::GetFileNameWithoutExtension($Basename)
-$NewSnippet = if ($NewString.Length -gt 200) { $NewString.Substring(0,200) } else { $NewString }
-$Query = "$ModuleName $NewSnippet".Trim()
-
-# Run searches sequentially (PowerShell parallel jobs add overhead worse than 5s budget).
-$KgTmp = New-TemporaryFile
-$CodeTmp = New-TemporaryFile
-
-# v0.2.46 post-adversarial: dot-source shared resolver. The previous
-# inline logic fell back to $ProjectRoot/.venv when $VCT_INSTALL_ROOT was
-# unset — that's the USER's project venv, which won't have weaviate-
-# client + vco_lib. Shared helper enforces canonical 3-tier order +
-# refuses to silently activate the user's venv. (PR-25 / v0.2.12
-# dual-layout history preserved in the helper's docstring.)
-. (Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1")
-$VenvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
-# Final fallback: if no venv resolved, leave $VenvPy as $null — the
-# (Test-Path $VenvPy) gate below skips the KG search subprocess and the
-# hook still exits 0 without blocking the edit.
-$RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_kg_search.py"
-if ($VenvPy -and (Test-Path $VenvPy) -and (Test-Path $RlScript)) {
-    try {
-        # --hook-format prepends "KG: " to each result header so dedup can match by title.
-        & $VenvPy $RlScript $Query --limit 1 --hook-format 2>$null | Select-Object -First 40 | Set-Content -Path $KgTmp.FullName
-    } catch { }
-}
-
-$IsCode = $false
-# v0.2.70 Stream C: keep the IS_CODE regex in lockstep with pre-tool-use.ps1 +
-# post-file-edit.ps1 (MUST MATCH). Route through the shared code-graph helper
-# when present (one home; pre-bash + pre-tool-use Read/Grep use the same
-# function); fall back to the inline invocation only on a partial install.
-if ($FilePath -match '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$') {
-    $IsCode = $true
-    # v0.2.72 P2: pass the edited file as -Anchor so the CLI's shared retrieval
-    # pipeline biases the rerank toward call-linked / same-module / shared-type
-    # code relative to the file being edited. MUST MATCH pre-edit-context-inject.sh.
-    if (Get-Command Invoke-VcoCodegraphQueryBlock -ErrorAction SilentlyContinue) {
-        $projArg = if ($CodeGraphProjectArg.Count -gt 0) { $CodeGraphProjectArg -join ' ' } else { "" }
-        $out = Invoke-VcoCodegraphQueryBlock -Query $Query -ProjectArg $projArg -Limit 2 -ExcludePath $FilePath -Anchor $FilePath
-        if ($out) { Set-Content -Path $CodeTmp.FullName -Value $out }
-    } else {
-        $cgQueryPs1 = Join-Path $ProjectRoot ".claude/scripts/code-graph-query.ps1"
-        $cgQuerySh = Join-Path $ProjectRoot ".claude/scripts/code-graph-query"
-        try {
-            if (Test-Path $cgQueryPs1) {
-                $out = & $PsExe -NoProfile -File $cgQueryPs1 search $Query @CodeGraphProjectArg --limit 2 --hook-format --anchor $FilePath 2>$null |
-                    Where-Object { $_ -notlike "*$FilePath*" } |
-                    Select-Object -First 20
-                $out | Set-Content -Path $CodeTmp.FullName
-            } elseif ((Test-Path $cgQuerySh) -and (Get-Command bash -ErrorAction SilentlyContinue)) {
-                $out = & bash $cgQuerySh search $Query @CodeGraphProjectArg --limit 2 --hook-format --anchor $FilePath 2>$null |
-                    Where-Object { $_ -notlike "*$FilePath*" } |
-                    Select-Object -First 20
-                $out | Set-Content -Path $CodeTmp.FullName
-            }
-        } catch { }
-    }
-}
-
-$KgResult = ""
-$CodeResult = ""
-try { $KgResult = (Get-Content -Path $KgTmp.FullName -Raw -ErrorAction Stop) } catch { }
-if ($IsCode) {
-    try { $CodeResult = (Get-Content -Path $CodeTmp.FullName -Raw -ErrorAction Stop) } catch { }
-}
-Remove-Item $KgTmp.FullName, $CodeTmp.FullName -Force -ErrorAction SilentlyContinue
-
 # Dedup against this session's seen nodes.
 #
 # The KG/codegraph result blocks have the shape:
@@ -302,6 +208,12 @@ Remove-Item $KgTmp.FullName, $CodeTmp.FullName -Force -ErrorAction SilentlyConti
 # plus reads-ledger source suppression. Filter-Seen delegates to it when present
 # and falls back to the legacy title-coarse inline logic only on a partial
 # install (missing helper).
+#
+# v0.2.77 Part 9 task 1: these functions are DEFINED HERE — before the cache
+# read + replay branch below — so a cache HIT can be served WITHOUT running the
+# two live searches. Pre-v0.2.77 they were defined after the searches, so the
+# replay branch sat after the searches had already run (audit: warm ≈ cold).
+# MUST MATCH pre-edit-context-inject.sh ordering.
 function Filter-Seen([string]$input) {
     if (-not $input) { return "" }
     if (Get-Command Invoke-VcoFilterSeenBlocks -ErrorAction SilentlyContinue) {
@@ -370,10 +282,53 @@ function Filter-Seen-Legacy([string]$input) {
     return $filtered.ToString()
 }
 
-# Cache replay: if we have a cache hit, dedup it against the current
-# seen-list and emit. If everything in the cache is already seen, exit
-# silently. The cache stores RAW per-result blocks (KG:/CODE: headers).
+# === Cache hit/miss observability (v0.2.77 Part 9 task 1) ===
+# Append a single-line JSON record so the once-dead cache can be verified in
+# the field. Size-guarded rotation (data preserved in .1 sibling). Best-effort.
+# MUST MATCH pre-edit-context-inject.sh::_cache_log.
+function Write-CacheLog([string]$status) {
+    $logFile = Join-Path $ProjectRoot ".claude/state/preedit_cache_log.jsonl"
+    $ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    try {
+        if (Test-Path $logFile) {
+            if ((Get-Item $logFile).Length -gt 262144) {
+                Move-Item -Path $logFile -Destination "$logFile.1" -Force -ErrorAction SilentlyContinue
+            }
+        }
+        $line = '{"ts":"' + $ts + '","hook":"pre-edit","status":"' + $status + '","session":"' + $SessionId + '"}'
+        Add-Content -Path $logFile -Value $line -ErrorAction SilentlyContinue
+    } catch { }
+}
+
+# Check cache (10-min TTL) — uses .NET file mtime, no cross-OS stat issues.
+# Cache stores RAW per-result blocks (with KG:/CODE: headers) so dedup can
+# still apply on replay against the latest seen-list. Replay runs RIGHT BELOW
+# — before any search launches — so a hit never pays for a query.
+$CacheHit = $false
+$CacheBlob = ""
+if (Test-Path $CacheFile) {
+    $mtime = (Get-Item $CacheFile).LastWriteTime
+    $age = ((Get-Date) - $mtime).TotalSeconds
+    if ($age -lt $CacheTtl) {
+        $CacheHit = $true
+        try { $CacheBlob = (Get-Content $CacheFile -Raw -ErrorAction Stop) } catch { }
+    }
+}
+
+# $Basename is needed by the cache-replay branch below (v0.2.77 Part 9 task 1),
+# which now runs BEFORE the project detection + live searches.
+$Basename = Split-Path $FilePath -Leaf
+
+# === Cache replay (BEFORE any live search) ===
+# If we have a fresh cache hit, dedup it against the current seen-list and emit
+# — WITHOUT running rl_kg_search.py / code-graph-query. If everything in the
+# cache is already seen, exit silently. The cache stores RAW per-result blocks
+# (KG:/CODE: headers). History: the cache layer landed in PR-38 (v0.2.12) but
+# the replay branch sat after the searches, so a warm edit paid the full
+# search cost (audit 2026-07-11: warm 1431 ms ≈ cold 1440 ms). v0.2.77 Part 9
+# moves it here so a warm edit is served from cache. MUST MATCH the .sh sibling.
 if ($CacheHit) {
+    Write-CacheLog "hit"
     $filteredCache = Filter-Seen $CacheBlob
     $trimmed = ($filteredCache -replace '\s+', '')
     if (-not $trimmed) { exit 0 }
@@ -384,6 +339,90 @@ if ($CacheHit) {
     Emit-ContextJson $replayOut.ToString()
     exit 0
 }
+Write-CacheLog "miss"
+
+# Auto-detect project for multi-codebase support — best-effort, optional.
+$DetectScriptPs1 = Join-Path $ProjectRoot ".claude/scripts/detect-project.ps1"
+$DetectedProject = ""
+if (Test-Path $DetectScriptPs1) {
+    try {
+        $DetectedProject = (& $PsExe -NoProfile -File $DetectScriptPs1 $FilePath $ProjectRoot 2>$null).Trim()
+    } catch { }
+}
+$CodeGraphProjectArg = if ($DetectedProject) { @('--project', $DetectedProject) } else { @() }
+
+$ModuleName = [System.IO.Path]::GetFileNameWithoutExtension($Basename)
+$NewSnippet = if ($NewString.Length -gt 200) { $NewString.Substring(0,200) } else { $NewString }
+$Query = "$ModuleName $NewSnippet".Trim()
+
+# Run searches sequentially (PowerShell parallel jobs add overhead worse than 5s budget).
+$KgTmp = New-TemporaryFile
+$CodeTmp = New-TemporaryFile
+
+# v0.2.46 post-adversarial: dot-source shared resolver. The previous
+# inline logic fell back to $ProjectRoot/.venv when $VCT_INSTALL_ROOT was
+# unset — that's the USER's project venv, which won't have weaviate-
+# client + vco_lib. Shared helper enforces canonical 3-tier order +
+# refuses to silently activate the user's venv. (PR-25 / v0.2.12
+# dual-layout history preserved in the helper's docstring.)
+. (Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1")
+$VenvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
+# Final fallback: if no venv resolved, leave $VenvPy as $null — the
+# (Test-Path $VenvPy) gate below skips the KG search subprocess and the
+# hook still exits 0 without blocking the edit.
+$RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_kg_search.py"
+if ($VenvPy -and (Test-Path $VenvPy) -and (Test-Path $RlScript)) {
+    try {
+        # --hook-format prepends "KG: " to each result header so dedup can match by title.
+        & $VenvPy $RlScript $Query --limit 1 --hook-format 2>$null | Select-Object -First 40 | Set-Content -Path $KgTmp.FullName
+    } catch { }
+}
+
+$IsCode = $false
+# v0.2.70 Stream C: keep the IS_CODE regex in lockstep with pre-tool-use.ps1 +
+# post-file-edit.ps1 (MUST MATCH). Route through the shared code-graph helper
+# when present (one home; pre-bash + pre-tool-use Read/Grep use the same
+# function); fall back to the inline invocation only on a partial install.
+if ($FilePath -match '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$') {
+    $IsCode = $true
+    # v0.2.72 P2: pass the edited file as -Anchor so the CLI's shared retrieval
+    # pipeline biases the rerank toward call-linked / same-module / shared-type
+    # code relative to the file being edited. MUST MATCH pre-edit-context-inject.sh.
+    if (Get-Command Invoke-VcoCodegraphQueryBlock -ErrorAction SilentlyContinue) {
+        $projArg = if ($CodeGraphProjectArg.Count -gt 0) { $CodeGraphProjectArg -join ' ' } else { "" }
+        $out = Invoke-VcoCodegraphQueryBlock -Query $Query -ProjectArg $projArg -Limit 2 -ExcludePath $FilePath -Anchor $FilePath
+        if ($out) { Set-Content -Path $CodeTmp.FullName -Value $out }
+    } else {
+        $cgQueryPs1 = Join-Path $ProjectRoot ".claude/scripts/code-graph-query.ps1"
+        $cgQuerySh = Join-Path $ProjectRoot ".claude/scripts/code-graph-query"
+        try {
+            if (Test-Path $cgQueryPs1) {
+                $out = & $PsExe -NoProfile -File $cgQueryPs1 search $Query @CodeGraphProjectArg --limit 2 --hook-format --anchor $FilePath 2>$null |
+                    Where-Object { $_ -notlike "*$FilePath*" } |
+                    Select-Object -First 20
+                $out | Set-Content -Path $CodeTmp.FullName
+            } elseif ((Test-Path $cgQuerySh) -and (Get-Command bash -ErrorAction SilentlyContinue)) {
+                $out = & bash $cgQuerySh search $Query @CodeGraphProjectArg --limit 2 --hook-format --anchor $FilePath 2>$null |
+                    Where-Object { $_ -notlike "*$FilePath*" } |
+                    Select-Object -First 20
+                $out | Set-Content -Path $CodeTmp.FullName
+            }
+        } catch { }
+    }
+}
+
+$KgResult = ""
+$CodeResult = ""
+try { $KgResult = (Get-Content -Path $KgTmp.FullName -Raw -ErrorAction Stop) } catch { }
+if ($IsCode) {
+    try { $CodeResult = (Get-Content -Path $CodeTmp.FullName -Raw -ErrorAction Stop) } catch { }
+}
+Remove-Item $KgTmp.FullName, $CodeTmp.FullName -Force -ErrorAction SilentlyContinue
+
+# Dedup against this session's seen nodes. Filter-Seen / Filter-Seen-Legacy are
+# DEFINED EARLIER (before the cache read + replay branch — v0.2.77 Part 9 task 1)
+# so a cache hit can replay without running the searches. The MISS path
+# continues here to dedup the freshly-produced $KgResult / $CodeResult.
 
 # Capture raw producer output (pre-dedup) for the cache. Caching post-dedup
 # would perma-suppress titles eligible to re-appear after a /compact wipe.
