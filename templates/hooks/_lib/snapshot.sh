@@ -68,13 +68,56 @@ _SNAPSHOT_CODE_EXTS_DEFAULT='py|rs|ts|tsx|js|jsx|go|java|cs|c|cpp|h|hpp|rb|php|s
 # cares about.
 _SNAPSHOT_DIRS_DEFAULT='knowledge docs src lib launcher claude_mcp_servers .claude/scripts vco_lib templates tests'
 
+# v0.2.77 Part 9 task 9: build-output / VCS / cache subtrees to PRUNE from the
+# walk. These directories are matched by the code-ext globs (e.g. Rust build
+# trees under launcher/src-tauri/target contain *.rs; node_modules contains
+# *.js) but are NEVER files a subagent authors as source — so the SubagentStop
+# reconciler's consumers (KG-sync, code-graph drain, credential-scan) never want
+# them. Excluding them shrinks the ~27k-file enumeration (audit: ~10x a sane
+# watch set) WITHOUT changing any consumer's behaviour: the diff drives KG-sync
+# for knowledge/*.md, code-graph for source files, and cred-scan for changed
+# files — none of which legitimately targets a build artifact. The prune is
+# applied IDENTICALLY at snapshot AND diff time (shared _snapshot_enumerate_files),
+# so before/after stay bit-for-bit comparable. Space-separated basenames;
+# override via VCT_SNAPSHOT_PRUNE_DIRS (a build tree named differently, etc.).
+_SNAPSHOT_PRUNE_DIRS_DEFAULT='target node_modules .git .wt __pycache__ .venv dist build .next .svelte-kit .pytest_cache .mypy_cache .ruff_cache'
+
 # Internal: enumerate files under $project_root that we want to track.
 # Outputs newline-delimited relative paths. Tolerates missing dirs.
+# Internal: build the shared `-prune` sub-expression for the excluded build /
+# VCS / cache dirs (task 9c). Sets the global array _SNAP_PRUNE_ARGS to a
+# leading `\( -type d \( -name a -o -name b ... \) -prune \) -o` chunk that is
+# prepended to each find so those subtrees are skipped. Empty array when no
+# prune dirs are configured. Bash-3.2-safe (uses a plain indexed array).
+_snapshot_build_prune_args() {
+    local prune="${VCT_SNAPSHOT_PRUNE_DIRS:-$_SNAPSHOT_PRUNE_DIRS_DEFAULT}"
+    _SNAP_PRUNE_ARGS=()
+    local _p _first=1
+    # shellcheck disable=SC2086
+    for _p in $prune; do
+        [ -z "$_p" ] && continue
+        if [ "$_first" = "1" ]; then
+            _SNAP_PRUNE_ARGS+=( '(' '-type' 'd' '(' '-name' "$_p" )
+            _first=0
+        else
+            _SNAP_PRUNE_ARGS+=( '-o' '-name' "$_p" )
+        fi
+    done
+    if [ "$_first" = "0" ]; then
+        # Close the name-group + type-d group, prune, then `-o` to fall through
+        # to the file-matching expression the caller appends.
+        _SNAP_PRUNE_ARGS+=( ')' '-prune' ')' '-o' )
+    fi
+}
+
 _snapshot_enumerate_files() {
     local project_root="$1"
     local dirs="${VCT_SNAPSHOT_DIRS:-$_SNAPSHOT_DIRS_DEFAULT}"
     local exts="${VCT_SNAPSHOT_CODE_EXTS:-$_SNAPSHOT_CODE_EXTS_DEFAULT}"
     local d full
+    # task 9c: build the prune chunk ONCE. Applied identically to the .md walk
+    # and every extension walk so snapshot and diff enumerate the same set.
+    _snapshot_build_prune_args
     # Build the find expression incrementally: for each existing dir,
     # walk it for .md files (always) + code extensions. We hand-roll the
     # expression rather than relying on Bash 4+ globstar to keep the
@@ -93,7 +136,11 @@ _snapshot_enumerate_files() {
         # per ext) but bit-for-bit portable across GNU/BSD/busybox find.
         # On a normal project this still runs in <500 ms thanks to the
         # OS file cache.
-        find "$full" -type f -iname '*.md' 2>/dev/null
+        # task 9c: "${_SNAP_PRUNE_ARGS[@]}" prepends the -prune chunk so the
+        # excluded build/VCS/cache subtrees are skipped. An explicit `-print`
+        # is required once the expression begins with a prune group (the
+        # default print no longer applies to the whole expression).
+        find "$full" "${_SNAP_PRUNE_ARGS[@]}" -type f -iname '*.md' -print 2>/dev/null
         # Hand-loop extensions to avoid find-regex portability issues.
         local _ext _IFS_save
         _IFS_save="$IFS"
@@ -103,7 +150,7 @@ _snapshot_enumerate_files() {
         IFS="$_IFS_save"
         for _ext in "$@"; do
             [ -z "$_ext" ] && continue
-            find "$full" -type f -iname "*.${_ext}" 2>/dev/null
+            find "$full" "${_SNAP_PRUNE_ARGS[@]}" -type f -iname "*.${_ext}" -print 2>/dev/null
         done
     done
 }
@@ -127,6 +174,20 @@ take_snapshot() {
     [ ! -d "$project_root" ] && return 1
 
     mkdir -p "$snap_dir" 2>/dev/null || return 1
+
+    # v0.2.77 Part 9 task 9a: orphan GC. cleanup_snapshot only runs at
+    # SubagentStop; a killed / TaskStop'd agent whose Stop hook never fires
+    # leaks its snapshot forever (audit: 306 orphaned snapshots, 1.2 GB, oldest
+    # Jun-13, NO GC). Sweep snapshots older than VCT_SNAPSHOT_GC_DAYS (default 3)
+    # here — same age-based pattern as the ctx_snapshot 14-day GC. 3 days is well
+    # past any live subagent's lifetime (subagents are minutes-to-hours), so this
+    # only reaps genuine orphans; a live agent's fresh snapshot (mtime = now) is
+    # never touched. Best-effort; failure ignored. `find -mtime +N` is portable
+    # across GNU/BSD find. This is cleanup of dead state, NOT data loss — a live
+    # session's snapshot is preserved.
+    local _gc_days="${VCT_SNAPSHOT_GC_DAYS:-3}"
+    find "$snap_dir" -maxdepth 1 -type f -name 'subagent-snapshot-*.json' \
+        -mtime "+$_gc_days" -delete 2>/dev/null || true
 
     # Sanitize agent_id for filename use: alnum + dash + underscore only.
     local safe_id
@@ -194,12 +255,32 @@ project_root = os.path.realpath(PROJECT_ROOT)
 MAX_FILES = 50_000
 processed = 0
 
+# v0.2.77 Part 9 task 9b: store mtime + size alongside the hash so
+# diff_snapshot can skip re-reading (re-hashing) a file whose (mtime, size)
+# is unchanged — an rsync-style quick-check that removes the diff-time
+# full-tree read. Format v2: files[rel] = {"h": <sha256>, "m": <mtime_ns>,
+# "s": <size>}. diff_snapshot tolerates BOTH v2 (dict) and legacy v1 (bare
+# hash string) entries, so an old on-disk snapshot still diffs correctly.
 for line in sys.stdin:
     path = line.rstrip("\r\n")
     if not path:
         continue
     if processed >= MAX_FILES:
         break
+    try:
+        st = os.stat(path)
+    except OSError:
+        continue
+    # Skip files larger than 5 MB — usually binaries (pdf, images, model
+    # weights) we do not want to credential-scan or KG-sync anyway. Doing
+    # this BEFORE the read (task 9b) also avoids hashing large files at all.
+    if st.st_size > 5 * 1024 * 1024:
+        continue
+    rel = os.path.relpath(path, project_root)
+    # Skip files that resolve OUTSIDE project_root (symlinks pointing
+    # elsewhere). Otherwise diff would emit spurious changes.
+    if rel.startswith(".."):
+        continue
     # Hash inline rather than spawning an external subprocess per file
     # — much faster (no fork overhead). Read in 64 KB chunks so we do
     # not load multi-MB files into memory.
@@ -211,29 +292,13 @@ for line in sys.stdin:
                 if not chunk:
                     break
                 h.update(chunk)
-        # Skip files larger than 5 MB — those are usually binaries
-        # (pdf, images, model weights) we do not want to credential-
-        # scan or KG-sync anyway. The hash above already ran, so we
-        # do not save any work by skipping early — but excluding them
-        # from the snapshot keeps the JSON small and the diff fast.
-        # Heuristic only; uses post-read size.
-        try:
-            if os.path.getsize(path) > 5 * 1024 * 1024:
-                continue
-        except OSError:
-            continue
-        rel = os.path.relpath(path, project_root)
-        # Skip files that resolve OUTSIDE project_root (symlinks pointing
-        # elsewhere). Otherwise diff would emit spurious changes.
-        if rel.startswith(".."):
-            continue
-        files[rel] = h.hexdigest()
-        processed += 1
     except (OSError, IOError):
         continue
+    files[rel] = {"h": h.hexdigest(), "m": st.st_mtime_ns, "s": st.st_size}
+    processed += 1
 
 doc = {
-    "version": 1,
+    "version": 2,
     "agent_id": AGENT_ID,
     "project_root": project_root,
     "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -315,6 +380,17 @@ except (OSError, json.JSONDecodeError):
 before = doc.get("files") or {}
 project_root = os.path.realpath(PROJECT_ROOT)
 
+
+def _before_parts(entry):
+    """Return (hash, mtime_ns, size) for a snapshot entry, tolerating BOTH
+    the v2 dict form {"h","m","s"} and the legacy v1 bare-hash string.
+    mtime_ns / size are None for v1 (no quick-check possible → always re-hash).
+    """
+    if isinstance(entry, dict):
+        return entry.get("h"), entry.get("m"), entry.get("s")
+    return entry, None, None
+
+
 after = {}
 MAX_FILES = 50_000
 processed = 0
@@ -325,8 +401,27 @@ for line in sys.stdin:
             break
         continue
     try:
-        if os.path.getsize(path) > 5 * 1024 * 1024:
-            continue
+        st = os.stat(path)
+    except OSError:
+        continue
+    if st.st_size > 5 * 1024 * 1024:
+        continue
+    rel = os.path.relpath(path, project_root)
+    if rel.startswith(".."):
+        continue
+    # task 9b quick-check: if the snapshot recorded this file with the SAME
+    # (mtime_ns, size), it is unchanged — reuse the stored hash WITHOUT
+    # re-reading the file. This is the diff-time read-reduction win (the same
+    # ~27k-file second read the audit flagged). A real edit updates mtime, so
+    # this never masks a genuine change; on any mismatch (or a v1 entry with no
+    # stored mtime/size) we fall through and re-hash for an identical result.
+    b_hash, b_m, b_s = _before_parts(before.get(rel))
+    if b_hash is not None and b_m is not None and b_s is not None \
+            and b_m == st.st_mtime_ns and b_s == st.st_size:
+        after[rel] = b_hash
+        processed += 1
+        continue
+    try:
         h = hashlib.sha256()
         with open(path, "rb") as fh:
             while True:
@@ -334,19 +429,18 @@ for line in sys.stdin:
                 if not chunk:
                     break
                 h.update(chunk)
-        rel = os.path.relpath(path, project_root)
-        if rel.startswith(".."):
-            continue
-        after[rel] = h.hexdigest()
-        processed += 1
     except (OSError, IOError):
         continue
+    after[rel] = h.hexdigest()
+    processed += 1
 
 # Diff: anything in `after` whose hash differs (or is new), plus
-# anything in `before` that disappeared.
+# anything in `before` that disappeared. Compare on HASH only (extract the
+# before-hash so v1/v2 entry shapes compare identically).
 changed = set()
 for path, h in after.items():
-    if before.get(path) != h:
+    b_hash, _, _ = _before_parts(before.get(path))
+    if b_hash != h:
         changed.add(path)
 for path in before:
     if path not in after:

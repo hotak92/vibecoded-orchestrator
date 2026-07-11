@@ -199,10 +199,22 @@ def test_subagent_start_creates_snapshot_file(tmp_path):
     assert "knowledge/intro.md" in files
     assert "docs/readme.md" in files
     assert "src/main.py" in files
-    # Hashes are hex SHA-256 (64 chars).
-    for path, hexhash in files.items():
-        assert len(hexhash) == 64, (
-            f"unexpected hash length for {path}: {hexhash!r}")
+    # v0.2.77 Part 9 task 9b: snapshot format v2 stores each file as
+    # {"h": <sha256>, "m": <mtime_ns>, "s": <size>} so diff_snapshot can skip
+    # re-hashing unchanged files (mtime+size quick-check). Legacy v1 stored a
+    # bare hash string; accept BOTH so the test documents the migration.
+    assert doc["version"] in (1, 2)
+    for path, entry in files.items():
+        if isinstance(entry, dict):
+            # v2: hash under "h", plus mtime/size quick-check fields.
+            assert len(entry["h"]) == 64, (
+                f"unexpected hash length for {path}: {entry!r}")
+            assert "m" in entry and "s" in entry, (
+                f"v2 snapshot entry missing mtime/size for {path}: {entry!r}")
+        else:
+            # v1: bare hex SHA-256 (64 chars).
+            assert len(entry) == 64, (
+                f"unexpected hash length for {path}: {entry!r}")
 
 
 # --------------------------------------------------------------------------- #
