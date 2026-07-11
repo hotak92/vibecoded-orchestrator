@@ -86,6 +86,11 @@ PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 [ -f "$SCRIPT_DIR/_lib/seen-store.sh" ] && . "$SCRIPT_DIR/_lib/seen-store.sh"
 # shellcheck source=_lib/codegraph-query.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/codegraph-query.sh" ] && . "$SCRIPT_DIR/_lib/codegraph-query.sh"
+# v0.2.77 Part 9 task 2: shared TTL result-cache used by codegraph_query_block
+# (and the KG-search wrapper). Sourced only if present (partial-install
+# tolerance) — the query helpers no-op the cache gracefully when it's missing.
+# shellcheck source=_lib/query-cache.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/query-cache.sh" ] && . "$SCRIPT_DIR/_lib/query-cache.sh"
 
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
 # Positional args ($1/$2) are EMPTY because $CLAUDE_TOOL_NAME etc. don't
@@ -459,9 +464,18 @@ VENV="${VCO_VENV_PYTHON:-}"
 # "KG: <title>" and the dedup logic below (_filter_seen) recognises it.
 # Pre-fix the hook captured untagged human output, so _filter_seen could
 # never dedup KG injections across Edits within a session.
-("$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "$QUERY" --limit 1 --hook-format 2>/dev/null \
-    | head -40 > "$KG_TMP") &
-KG_PID=$!
+# v0.2.77 Part 9 task 2: route through the shared TTL result-cache wrapper so a
+# repeat query (this file re-edited, or the same module queried elsewhere) is
+# served from disk (~ms) instead of re-paying the ~1.3 s round-trip. Falls back
+# to the direct call when the cache helper is absent (partial install).
+if command -v vco_kg_search_cached >/dev/null 2>&1; then
+    ( vco_kg_search_cached "$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "$QUERY" 1 > "$KG_TMP" 2>/dev/null ) &
+    KG_PID=$!
+else
+    ("$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "$QUERY" --limit 1 --hook-format 2>/dev/null \
+        | head -40 > "$KG_TMP") &
+    KG_PID=$!
+fi
 
 # Code graph search — only for code files (not markdown, yaml, etc.)
 # Uses auto-detected project so edits in sibling repos query the right collections.

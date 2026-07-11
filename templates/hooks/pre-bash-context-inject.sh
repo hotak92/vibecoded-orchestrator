@@ -45,6 +45,10 @@ PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 [ -f "$SCRIPT_DIR/_lib/seen-store.sh" ] && . "$SCRIPT_DIR/_lib/seen-store.sh"
 # shellcheck source=_lib/codegraph-query.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/codegraph-query.sh" ] && . "$SCRIPT_DIR/_lib/codegraph-query.sh"
+# v0.2.77 Part 9 task 2: shared TTL result-cache (codegraph_query_block + the
+# KG-search wrapper below). Sourced only if present (partial-install tolerance).
+# shellcheck source=_lib/query-cache.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/query-cache.sh" ] && . "$SCRIPT_DIR/_lib/query-cache.sh"
 # shellcheck source=_lib/command-noise-strip.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/command-noise-strip.sh" ] && . "$SCRIPT_DIR/_lib/command-noise-strip.sh"
 
@@ -283,9 +287,18 @@ fi
 
 KG_TMP=$(mktemp)
 if [ -n "$VENV" ] && [ -f "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" ]; then
-    ("$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "$QUERY" --limit 1 --hook-format 2>/dev/null \
-        | head -40 > "$KG_TMP") &
-    KG_PID=$!
+    # v0.2.77 Part 9 task 2: route through the shared TTL result-cache wrapper
+    # so a repeat command-derived query is served from disk (~ms) instead of
+    # re-paying the ~1.3 s round-trip. Falls back to the direct call when the
+    # cache helper is absent (partial install).
+    if command -v vco_kg_search_cached >/dev/null 2>&1; then
+        ( vco_kg_search_cached "$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "$QUERY" 1 > "$KG_TMP" 2>/dev/null ) &
+        KG_PID=$!
+    else
+        ("$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "$QUERY" --limit 1 --hook-format 2>/dev/null \
+            | head -40 > "$KG_TMP") &
+        KG_PID=$!
+    fi
     wait "$KG_PID" 2>/dev/null || true
 fi
 

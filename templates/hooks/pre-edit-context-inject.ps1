@@ -90,6 +90,9 @@ $SeenStoreLib = Join-Path $LibDir "seen-store.ps1"
 if (Test-Path $SeenStoreLib) { . $SeenStoreLib }
 $CodegraphLib = Join-Path $LibDir "codegraph-query.ps1"
 if (Test-Path $CodegraphLib) { . $CodegraphLib }
+# v0.2.77 Part 9 task 2: shared TTL result-cache used by the codegraph helper.
+$QueryCacheLib = Join-Path $LibDir "query-cache.ps1"
+if (Test-Path $QueryCacheLib) { . $QueryCacheLib }
 $script:ProjectRoot = $ProjectRoot
 
 # session_id from stdin JSON is the canonical per-conversation key.
@@ -373,8 +376,16 @@ $VenvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
 $RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_kg_search.py"
 if ($VenvPy -and (Test-Path $VenvPy) -and (Test-Path $RlScript)) {
     try {
-        # --hook-format prepends "KG: " to each result header so dedup can match by title.
-        & $VenvPy $RlScript $Query --limit 1 --hook-format 2>$null | Select-Object -First 40 | Set-Content -Path $KgTmp.FullName
+        # v0.2.77 Part 9 task 2: route through the shared TTL result-cache
+        # wrapper so a repeat query is served from disk. Falls back to the
+        # direct call when the cache helper is absent (partial install).
+        if (Get-Command Invoke-VcoKgSearchCached -ErrorAction SilentlyContinue) {
+            $kgOut = Invoke-VcoKgSearchCached -VenvPy $VenvPy -RlScript $RlScript -Query $Query -Limit 1
+            if ($kgOut) { Set-Content -Path $KgTmp.FullName -Value $kgOut }
+        } else {
+            # --hook-format prepends "KG: " to each result header so dedup can match by title.
+            & $VenvPy $RlScript $Query --limit 1 --hook-format 2>$null | Select-Object -First 40 | Set-Content -Path $KgTmp.FullName
+        }
     } catch { }
 }
 

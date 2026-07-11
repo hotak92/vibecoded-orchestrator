@@ -51,6 +51,24 @@ function Invoke-VcoCodegraphQueryBlock {
         [string]$Anchor = ""
     )
     if ([string]::IsNullOrEmpty($Query)) { return "" }
+
+    # v0.2.77 Part 9 task 2: shared TTL result-cache. Serve a fresh cache
+    # entry (~ms) instead of the ~1.3 s live round-trip. Stores the RAW block
+    # (pre-dedup); the caller dedups per-session on the returned value. Key
+    # namespaces on the code-graph surface + all query-shaping args. MUST MATCH
+    # codegraph-query.sh (same "cg" surface + arg order). Best-effort.
+    $qcKey = ""
+    if (Get-Command Get-VcoQueryCacheKey -ErrorAction SilentlyContinue) {
+        $qcKey = Get-VcoQueryCacheKey "cg" $Query $ProjectArg "$Limit" $ExcludePath $Anchor
+    }
+    if ($qcKey -and (Get-Command Get-VcoQueryCache -ErrorAction SilentlyContinue)) {
+        $qc = Get-VcoQueryCache $qcKey
+        if ($qc.Hit) {
+            # Fresh hit (Value may be "" for a cached-empty result).
+            return $qc.Value
+        }
+    }
+
     $cli = Get-VcoCodegraphCli
     if (-not $cli) { return "" }
 
@@ -80,12 +98,20 @@ function Invoke-VcoCodegraphQueryBlock {
         Remove-Job $job -Force -ErrorAction SilentlyContinue
     } catch { return "" }
 
-    if ([string]::IsNullOrEmpty($raw)) { return "" }
     # Cap the volume. Self-reference exclusion happens INSIDE the CLI via
     # --exclude-file (B2) -- the old line-wise filter here stripped only the
     # CODE: header line and left orphaned body lines. Do not re-add it.
-    $lines = $raw -split "`n"
-    return (($lines | Select-Object -First 20) -join "`n")
+    # v0.2.77 Part 9 task 2: compute the final block ONCE, store it (incl. the
+    # EMPTY result so an empty symbol isn't re-queried within TTL), then return.
+    $out = ""
+    if (-not [string]::IsNullOrEmpty($raw)) {
+        $lines = $raw -split "`n"
+        $out = (($lines | Select-Object -First 20) -join "`n")
+    }
+    if ($qcKey -and (Get-Command Set-VcoQueryCache -ErrorAction SilentlyContinue)) {
+        Set-VcoQueryCache $qcKey $out
+    }
+    return $out
 }
 
 # Test-VcoCodegraphPatternGate <Pattern> -- $true if Pattern is a code IDENTIFIER

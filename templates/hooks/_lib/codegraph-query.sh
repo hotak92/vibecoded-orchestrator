@@ -65,6 +65,29 @@ codegraph_query_block() {
     local anchor="${5:-}"
 
     [ -n "$query" ] || return 0
+
+    # v0.2.77 Part 9 task 2: shared TTL result-cache. The SAME symbol is
+    # re-queried many times per session across surfaces (audit: 5x identical
+    # queries in one hour). Serve a fresh cache entry (~ms) instead of the
+    # ~1.3 s live Weaviate+embed round-trip. The cache stores the RAW block
+    # (pre-dedup) — the CALLER still dedups per-session on the returned value,
+    # so cached replays stay dedup-accurate. Cache key namespaces on the code-
+    # graph surface + all query-shaping args so a different anchor/project/limit
+    # is a distinct entry. Best-effort: any cache miss/error runs the query live.
+    local _qc_key=""
+    if command -v vco_query_cache_key >/dev/null 2>&1; then
+        _qc_key="$(vco_query_cache_key "cg" "$query" "$project_arg" "$limit" "$exclude_path" "$anchor")"
+    fi
+    if [ -n "$_qc_key" ] && command -v vco_query_cache_get >/dev/null 2>&1; then
+        local _qc_hit
+        if _qc_hit="$(vco_query_cache_get "$_qc_key")"; then
+            # Fresh hit (may be an empty cached-empty result). Emit and return
+            # WITHOUT touching the CLI.
+            [ -n "$_qc_hit" ] && printf '%s\n' "$_qc_hit"
+            return 0
+        fi
+    fi
+
     local cli
     cli="$(vco_codegraph_cli)" || return 0
     [ -n "$cli" ] || return 0
@@ -106,11 +129,23 @@ codegraph_query_block() {
         rm -f "$_tmp" 2>/dev/null || true
     fi
 
-    [ -n "$raw" ] || return 0
     # Cap the volume. Self-reference exclusion happens INSIDE the CLI via
     # --exclude-file (B2) — the old line-wise `grep -v` here stripped only the
     # CODE: header line and left orphaned body lines. Do not re-add it.
-    printf '%s\n' "$raw" | head -20
+    # v0.2.77 Part 9 task 2: compute the final (capped) block ONCE, store it in
+    # the shared cache (including the EMPTY result, so an empty symbol isn't
+    # re-queried within the TTL), then emit. An empty block is stored so the
+    # next identical query is a cache hit that emits nothing without a live
+    # Weaviate round-trip.
+    local _out=""
+    if [ -n "$raw" ]; then
+        _out="$(printf '%s\n' "$raw" | head -20)"
+    fi
+    if [ -n "$_qc_key" ] && command -v vco_query_cache_put >/dev/null 2>&1; then
+        vco_query_cache_put "$_qc_key" "$_out"
+    fi
+    [ -n "$_out" ] && printf '%s\n' "$_out"
+    return 0
 }
 
 # codegraph_pattern_gate <pattern>

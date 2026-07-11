@@ -91,6 +91,9 @@ $SeenStoreLib = Join-Path $LibDir "seen-store.ps1"
 if (Test-Path $SeenStoreLib) { . $SeenStoreLib }
 $CodegraphLib = Join-Path $LibDir "codegraph-query.ps1"
 if (Test-Path $CodegraphLib) { . $CodegraphLib }
+# v0.2.77 Part 9 task 2: shared TTL result-cache used by the codegraph helper.
+$QueryCacheLib = Join-Path $LibDir "query-cache.ps1"
+if (Test-Path $QueryCacheLib) { . $QueryCacheLib }
 $script:ProjectRoot = $ProjectRoot
 
 # v0.2.70 Stream E: unify session-id (parse+sanitise) with the other hooks.

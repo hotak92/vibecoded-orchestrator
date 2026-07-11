@@ -50,6 +50,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$SCRIPT_DIR/_lib/seen-store.sh" ] && . "$SCRIPT_DIR/_lib/seen-store.sh"
 # shellcheck source=_lib/codegraph-query.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/codegraph-query.sh" ] && . "$SCRIPT_DIR/_lib/codegraph-query.sh"
+# v0.2.77 Part 9 task 2: shared TTL result-cache used by codegraph_query_block.
+# Sourced only if present (partial-install tolerance).
+# shellcheck source=_lib/query-cache.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/query-cache.sh" ] && . "$SCRIPT_DIR/_lib/query-cache.sh"
 # v0.2.29: prefer Claude Code's canonical $CLAUDE_PROJECT_DIR (the active
 # workspace the launcher hands us — source of truth for per-project hooks).
 # Fall back to SCRIPT_DIR/../.. for ad-hoc invocations (manual runs, tests)

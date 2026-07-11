@@ -51,6 +51,9 @@ $SeenStoreLib = Join-Path $LibDir "seen-store.ps1"
 if (Test-Path $SeenStoreLib) { . $SeenStoreLib }
 $CodegraphLib = Join-Path $LibDir "codegraph-query.ps1"
 if (Test-Path $CodegraphLib) { . $CodegraphLib }
+# v0.2.77 Part 9 task 2: shared TTL result-cache used by the codegraph helper.
+$QueryCacheLib = Join-Path $LibDir "query-cache.ps1"
+if (Test-Path $QueryCacheLib) { . $QueryCacheLib }
 $NoiseStripLib = Join-Path $LibDir "command-noise-strip.ps1"
 if (Test-Path $NoiseStripLib) { . $NoiseStripLib }
 $script:ProjectRoot = $ProjectRoot
@@ -228,7 +231,14 @@ $KgTmp = New-TemporaryFile
 $RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_kg_search.py"
 if ($VenvPy -and (Test-Path $VenvPy) -and (Test-Path $RlScript)) {
     try {
-        & $VenvPy $RlScript $Query --limit 1 --hook-format 2>$null | Select-Object -First 40 | Set-Content -Path $KgTmp.FullName
+        # v0.2.77 Part 9 task 2: route through the shared TTL result-cache
+        # wrapper. Falls back to the direct call when the helper is absent.
+        if (Get-Command Invoke-VcoKgSearchCached -ErrorAction SilentlyContinue) {
+            $kgOut = Invoke-VcoKgSearchCached -VenvPy $VenvPy -RlScript $RlScript -Query $Query -Limit 1
+            if ($kgOut) { Set-Content -Path $KgTmp.FullName -Value $kgOut }
+        } else {
+            & $VenvPy $RlScript $Query --limit 1 --hook-format 2>$null | Select-Object -First 40 | Set-Content -Path $KgTmp.FullName
+        }
     } catch { }
 }
 
