@@ -36,6 +36,7 @@
 #         2  project not registered
 #         3  key not active for this project
 #         4  key not found in hub response
+#         5  forbidden (hub refused the token on /env; scoped token required)
 #       Non-zero codes mean the key ALSO missed the file store and the
 #       project `.env`.
 #
@@ -307,6 +308,17 @@ function Read-KeyHub {
                     return @{ ExitCode = 4 }
                 }
             }
+        }
+        403 {
+            # v0.2.77 L3-F3: 403 is a scoped-credential boundary REFUSAL on
+            # the gated /env route (flip default-denies the global hub.token,
+            # or a token for another project was presented). Classify it
+            # distinctly (exit 5) with an HONEST message — NOT the misleading
+            # "hub unreachable" the Default arm used to emit. The outer chain
+            # still consults the file store + project .env (legitimate secrets
+            # tiers), so exit 5 only surfaces if those also miss.
+            Write-Err "hub returned 403 forbidden for $Key (project $pid_): the global hub.token is refused on /env (per-project token required) or a token for another project was presented. Present the scoped hub.token.$pid_, or set VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to reopen the compat window."
+            return @{ ExitCode = 5 }
         }
         400 {
             Write-Err "hub rejected request: $($result.Body)"

@@ -65,6 +65,7 @@ from pathlib import Path
 from typing import Mapping, Optional
 
 from vco_lib.project_config import (  # noqa: F401 — re-exported for callers
+    Forbidden,
     HubUnreachable,
     ProjectNotFound,
     ResolverError,
@@ -74,6 +75,7 @@ from vco_lib.project_config import (  # noqa: F401 — re-exported for callers
 
 __all__ = [
     "AccessDenied",
+    "Forbidden",
     "HubUnreachable",
     "ProjectNotFound",
     "SecretNotFound",
@@ -265,6 +267,22 @@ def _hub_get(key: str, project: Optional[str]) -> str:
         raise HubUnreachable(
             "hub returned 401 unauthorized; launcher may have restarted (token rotated)"
         )
+    if resp.status_code == 403:
+        # v0.2.77 L3-F3: a 403 is a scoped-credential boundary REFUSAL on the
+        # gated /env route (the flip default-denies the coarse global
+        # hub.token; or a token for another project was presented). Classify
+        # it as `Forbidden` (NOT HubUnreachable) so the diagnostic is honest —
+        # mirrors the config resolver triplet. `get()` still consults the
+        # file store on this error (the file store is a legitimate secrets
+        # tier by design), but the message names the scoped-token remediation
+        # instead of the misleading "hub unreachable".
+        raise Forbidden(
+            f"hub returned 403 forbidden for {key!r} (project={pid}): the "
+            "global hub.token is refused on /env (per-project token required) "
+            "or a token for another project was presented. Present the scoped "
+            f"hub.token.{pid}, or set VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub "
+            "to reopen the one-release compat window"
+        )
     if resp.status_code == 404:
         code = None
         try:
@@ -321,6 +339,11 @@ def get(
             tiers 2 + 3 have no copy either (or fallback is disabled).
         HubUnreachable: hub down AND fallback disabled.
         ProjectNotFound: project unknown AND fallback disabled.
+        Forbidden: hub refused the bearer on /env (403 — scoped-token
+            required / wrong project) AND fallback disabled. With fallback
+            enabled the file store is consulted first (a legitimate secrets
+            tier); a subsequent miss surfaces as SecretNotFound whose message
+            names the 403.
     """
     if not key or not key.strip():
         raise SecretNotFound("empty key")
@@ -329,13 +352,22 @@ def get(
     hub_error: Optional[ResolverError] = None
     try:
         return _hub_get(key, project)
-    except (HubUnreachable, ProjectNotFound, SecretNotFound, AccessDenied) as exc:
+    except (HubUnreachable, ProjectNotFound, SecretNotFound, AccessDenied, Forbidden) as exc:
         # AccessDenied (key_not_active) intentionally falls through to
         # the file store: the hub can't tell "explicitly paused" from
         # "never declared" (live-verified 2026-06-11), and hard-failing
         # here would strand every user-managed file-store key whenever
         # the launcher is running. The launcher gate governs keychain
         # slots; ~/.vct-secrets is an independent store.
+        #
+        # v0.2.77 L3-F3: Forbidden (403) ALSO falls through to the file
+        # store — for SECRETS the file store is a legitimate independent
+        # tier by design, so a keychain-route refusal should not strand a
+        # file-store key. Unlike the CONFIG resolvers (where a 403 must
+        # propagate rather than env-fallback), the secrets file store is
+        # user-owned, not the masked-misconfig env values. The distinct
+        # `Forbidden` type keeps the DIAGNOSTIC honest (no "hub unreachable"
+        # mislabel) while preserving the legitimate fallback.
         hub_error = exc
 
     if allow_file_fallback:

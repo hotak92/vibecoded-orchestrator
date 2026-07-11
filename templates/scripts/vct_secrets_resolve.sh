@@ -36,7 +36,9 @@
 #       Print the value of <secret_key> for the resolved project.
 #       Exit codes: 0=ok, 1=hub unreachable, 2=project not registered,
 #                   3=key not active for this project, 4=key not found
-#                   in the hub's response (treated like 3 for callers).
+#                   in the hub's response (treated like 3 for callers),
+#                   5=forbidden (hub refused the token on /env — scoped
+#                   hub.token.<id> required / wrong project).
 #                   Non-zero codes mean the key ALSO missed the file
 #                   store and the project `.env`.
 #
@@ -425,6 +427,19 @@ read_key_hub() {
                     ;;
             esac
             ;;
+        403)
+            # v0.2.77 L3-F3: a 403 is a scoped-credential boundary REFUSAL on
+            # the gated /env route (flip default-denies the global hub.token,
+            # or a token for another project was presented). Classify it
+            # distinctly (exit 5) with an HONEST message — NOT the misleading
+            # "hub unreachable; is the launcher running?" the catch-all used
+            # to emit. The outer read_key chain still consults the file store
+            # (tier 2) + project .env (tier 3) — legitimate secrets tiers — so
+            # a keychain-route refusal does not strand a file-store key; exit 5
+            # only surfaces if those also miss.
+            err "hub returned 403 forbidden for $key (project $pid): the global hub.token is refused on /env (per-project token required) or a token for another project was presented. Present the scoped hub.token.$pid, or set VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to reopen the compat window."
+            return 5
+            ;;
         400)
             err "hub rejected request: $body"
             return 4
@@ -610,6 +625,7 @@ Exit codes (non-zero = key ALSO missed the file store + project .env):
   2  project not registered
   3  key not active for this project
   4  key not found in hub response
+  5  forbidden (hub refused the token on /env; scoped token required)
 EOF
         exit 64
     fi

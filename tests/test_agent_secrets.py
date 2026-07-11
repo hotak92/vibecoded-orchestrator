@@ -30,6 +30,7 @@ from vco_lib import agent_secrets  # noqa: E402
 from vco_lib import project_config  # noqa: E402
 from vco_lib.agent_secrets import (  # noqa: E402
     AccessDenied,
+    Forbidden,
     HubUnreachable,
     ProjectNotFound,
     SecretNotFound,
@@ -219,6 +220,62 @@ def test_access_denied_surfaces_when_file_store_misses(tmp_path, monkeypatch):
     monkeypatch.setattr(agent_secrets, "_hub_get", fake_hub_get)
     with pytest.raises(AccessDenied):
         get("gated_key", project="anything")
+
+
+# ─── v0.2.77 L3-F3: 403 forbidden classification ────────────────────────
+
+
+def test_forbidden_falls_back_to_file_store(tmp_path, monkeypatch):
+    """A hub 403 (Forbidden) must NOT hard-fail: the file store is a
+    legitimate independent secrets tier, so a keychain-route refusal should
+    still resolve a file-store copy."""
+    root = tmp_path / "store"
+    (root / "shared").mkdir(parents=True)
+    (root / "shared" / "gh_pat").write_text("file-copy")
+    monkeypatch.setenv("VCT_SECRETS_DIR", str(root))
+
+    def fake_hub_get(key, project):
+        raise Forbidden(f"hub returned 403 forbidden for {key!r}")
+
+    monkeypatch.setattr(agent_secrets, "_hub_get", fake_hub_get)
+    assert get("gh_pat", project="anything") == "file-copy"
+
+
+def test_forbidden_propagates_when_fallback_disabled(tmp_path, monkeypatch):
+    """With fallback disabled, a 403 surfaces as the distinct Forbidden type
+    (NOT HubUnreachable) so the diagnostic is honest."""
+    monkeypatch.setenv("VCT_SECRETS_DIR", str(tmp_path / "empty"))
+
+    def fake_hub_get(key, project):
+        raise Forbidden("hub returned 403 forbidden")
+
+    monkeypatch.setattr(agent_secrets, "_hub_get", fake_hub_get)
+    with pytest.raises(Forbidden):
+        get("gh_pat", project="anything", allow_file_fallback=False)
+
+
+def test_forbidden_is_not_hub_unreachable():
+    """Forbidden must not be a HubUnreachable subclass — callers that catch
+    HubUnreachable for env-fallback must NOT swallow a 403."""
+    assert not issubclass(Forbidden, HubUnreachable)
+
+
+def test_forbidden_message_names_scoped_token(tmp_path, monkeypatch):
+    """The Forbidden surfaced on an all-miss carries the scoped-token
+    remediation, not a 'hub unreachable' mislabel."""
+    monkeypatch.setenv("VCT_SECRETS_DIR", str(tmp_path / "empty"))
+
+    def fake_hub_get(key, project):
+        raise Forbidden(
+            "hub returned 403 forbidden; present the scoped hub.token.<id>"
+        )
+
+    monkeypatch.setattr(agent_secrets, "_hub_get", fake_hub_get)
+    with pytest.raises(SecretNotFound) as ei:
+        get("gh_pat", project="anything")
+    msg = str(ei.value).lower()
+    assert "403" in msg or "forbidden" in msg
+    assert "unreachable" not in msg.split("tier 1 hub:")[0]
 
 
 # ─── Module probe never prints values ───────────────────────────────────

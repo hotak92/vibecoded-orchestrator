@@ -269,6 +269,27 @@ rc=$?
 set -e
 assert_eq "$rc" "3" "test_vct_secrets_resolve_exits_3_when_key_not_active"
 
+# ── Test 4b (v0.2.77 L3-F3): 403 forbidden → exit 5, honest message ──────
+# A scoped-credential boundary refusal must classify distinctly (exit 5)
+# instead of the pre-fix "hub unreachable" (exit 1) mislabel. With no file
+# store / .env copy, exit 5 surfaces after the fallback chain also misses.
+cat >"$scratch/responses/GET_projects_p1_env_key=FORBIDDEN_KEY.json.status" <<'STATUS'
+403
+STATUS
+cat >"$scratch/responses/GET_projects_p1_env_key=FORBIDDEN_KEY.json" <<'JSON'
+{"error": {"code": "forbidden", "message": "scoped token required"}}
+JSON
+
+set +e
+forbidden_err=$(VCT_HUB_PORT="$HUB_PORT" VCT_SECRETS_DIR="$scratch/empty-store" "$RESOLVER" p1 FORBIDDEN_KEY 2>&1 1>/dev/null)
+rc=$?
+set -e
+assert_eq "$rc" "5" "test_vct_secrets_resolve_exits_5_when_forbidden"
+case "$forbidden_err" in
+    *"403 forbidden"*) assert_eq "0" "0" "test_vct_secrets_resolve_forbidden_msg_is_honest" ;;
+    *) assert_eq "1" "0" "test_vct_secrets_resolve_forbidden_msg_is_honest (got: $forbidden_err)" ;;
+esac
+
 # ── Test 5: by-path resolution, then read ───────────────────────────────
 # Encode the test path the way the resolver does.
 test_folder="/tmp/test-folder-$$"
