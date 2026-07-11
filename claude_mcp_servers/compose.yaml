@@ -165,7 +165,15 @@ services:
     environment:
       # NVIDIA_VISIBLE_DEVICES: all
       # NVIDIA_DRIVER_CAPABILITIES: compute,utility
-      OLLAMA_KEEP_ALIVE: "30s"
+      # v0.2.77 Part 9 task 6: keep the embedding model resident so hook-path
+      # context injection doesn't re-pay the ~1.9 s model reload after any idle
+      # gap (measured in the hook-latency audit 2026-07-11). The 30s default
+      # meant any pause > 30s evicted qwen3-embedding; the next injection then
+      # stalled ~1.9 s reloading it. "24h" pins it for the working day. The
+      # per-request keep_alive the embedding clients now send (VCO_OLLAMA_KEEP_ALIVE,
+      # default 24h) is the primary fix; this server-side default is the backstop
+      # for any Ollama path that doesn't carry the request-level field.
+      OLLAMA_KEEP_ALIVE: "24h"
       OLLAMA_ORIGINS: "*"
       OLLAMA_FLASH_ATTENTION: "1"
       OLLAMA_KV_CACHE_TYPE: "q8_0"

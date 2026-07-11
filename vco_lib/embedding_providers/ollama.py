@@ -39,6 +39,7 @@ common embedding-model name fragments).
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import requests
@@ -113,6 +114,53 @@ def _num_ctx_for_model(model: str) -> int:
                 val = registered
                 break
     return int(val) if val is not None else _NUM_CTX_FALLBACK
+
+
+# v0.2.77 Part 9 task 6: keep the embedding model resident in Ollama between
+# calls. Ollama's default keep_alive is ~5 min; after any idle gap the next
+# embed pays a ~1.9 s model reload (measured in the hook-latency audit
+# 2026-07-11). Sending keep_alive on every embed request pins the model so the
+# recurring reload tax vanishes. This is a REQUEST-level fix (works regardless
+# of the compose env default) and it is IDEMPOTENT — Ollama refreshes the TTL on
+# every request that carries it.
+#
+# Default "24h" (effectively "resident for the working day"). The user can
+# override via VCO_OLLAMA_KEEP_ALIVE (any value Ollama accepts: a duration like
+# "30m"/"2h", "-1" for never-evict, or "0" to opt back into immediate unload).
+# An empty override string means "send no keep_alive" (defer to Ollama's own
+# default / the OLLAMA_KEEP_ALIVE server env) — an explicit opt-out.
+_KEEP_ALIVE_DEFAULT = "24h"
+
+
+def _keep_alive() -> str | None:
+    """Resolve the keep_alive value to attach to embed requests.
+
+    Returns the string to send, or ``None`` to send no keep_alive field
+    (explicit opt-out via an empty ``VCO_OLLAMA_KEEP_ALIVE``). Respecting an
+    explicit user override is required by the task-6 spec.
+    """
+    val = os.environ.get("VCO_OLLAMA_KEEP_ALIVE")
+    if val is None:
+        return _KEEP_ALIVE_DEFAULT
+    val = val.strip()
+    if val == "":
+        # Explicit opt-out: caller wants Ollama's own default behaviour.
+        return None
+    return val
+
+
+def _with_keep_alive(body: dict[str, Any]) -> dict[str, Any]:
+    """Return ``body`` with ``keep_alive`` added when one is configured.
+
+    Mutates a copy, never the caller's dict. Adding the key is a no-op when
+    the user opted out (``_keep_alive()`` returns ``None``).
+    """
+    ka = _keep_alive()
+    if ka is None:
+        return body
+    out = dict(body)
+    out["keep_alive"] = ka
+    return out
 
 
 def looks_like_embedding_model(name: str) -> bool:
@@ -221,11 +269,13 @@ class OllamaAdapter:
             response = bounded_post(
                 self.session,
                 f"{self.base_url}/api/embed",
-                json={
+                # task 6: keep_alive pins the model resident (removes the ~1.9 s
+                # reload after any idle gap). Idempotent — refreshes the TTL.
+                json=_with_keep_alive({
                     "model": model,
                     "input": text,
                     "options": {"num_ctx": num_ctx},
-                },
+                }),
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:
@@ -295,11 +345,12 @@ class OllamaAdapter:
             response = bounded_post(
                 self.session,
                 f"{self.base_url}/api/embed",
-                json={
+                # task 6: keep_alive pins the model resident across batches.
+                json=_with_keep_alive({
                     "model": model,
                     "input": texts,
                     "options": {"num_ctx": num_ctx},
-                },
+                }),
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:
@@ -351,7 +402,8 @@ class OllamaAdapter:
             response = bounded_post(
                 self.session,
                 f"{self.base_url}/api/embeddings",
-                json={"model": model, "prompt": text},
+                # task 6: keep_alive on the legacy endpoint too.
+                json=_with_keep_alive({"model": model, "prompt": text}),
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:

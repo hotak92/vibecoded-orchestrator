@@ -166,14 +166,24 @@ async def get_ollama_embedding(text: str) -> list[float] | None:
     # Inline fallback: direct Ollama call (preserves pre-v0.2.18 path).
     # num_ctx=8192 overrides Ollama's 4096 default, matching qwen3-
     # embedding's actual capacity.
+    # v0.2.77 Part 9 task 6: keep_alive pins the model resident so the hook
+    # path's inline embed doesn't re-pay the ~1.9 s model reload after any idle
+    # gap. Reuse the ONE resolver in vco_lib.embedding_providers.ollama (no
+    # inline copy). Import is soft — a broken vco_lib is loud elsewhere; here we
+    # degrade to "no keep_alive" rather than break the embed.
+    try:
+        from vco_lib.embedding_providers.ollama import _with_keep_alive as _ka
+    except Exception:
+        def _ka(body):  # type: ignore[misc]
+            return body
     async with aiohttp.ClientSession() as session:
         async with session.post(
             f"{server.OLLAMA_URL}/api/embeddings",
-            json={
+            json=_ka({
                 "model": server.EMBEDDING_MODEL,
                 "prompt": text,
                 "options": {"num_ctx": 8192},
-            },
+            }),
             timeout=aiohttp.ClientTimeout(total=30)
         ) as response:
             if response.status != 200:
@@ -190,10 +200,16 @@ async def get_legacy_text_embedding(text: str) -> list[float] | None:
     """
     from . import server
     try:
+        from vco_lib.embedding_providers.ollama import _with_keep_alive as _ka
+    except Exception:
+        def _ka(body):  # type: ignore[misc]
+            return body
+    try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{server.OLLAMA_URL}/api/embeddings",
-                json={"model": server.LEGACY_TEXT_EMBEDDING_MODEL, "prompt": text},
+                # task 6: keep_alive on the legacy text embed too.
+                json=_ka({"model": server.LEGACY_TEXT_EMBEDDING_MODEL, "prompt": text}),
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as response:
                 if response.status != 200:
@@ -635,13 +651,19 @@ async def get_legacy_code_embedding(text: str) -> list[float] | None:
     """
     from . import server
     try:
+        from vco_lib.embedding_providers.ollama import _with_keep_alive as _ka
+    except Exception:
+        def _ka(body):  # type: ignore[misc]
+            return body
+    try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{server.OLLAMA_URL}/api/embeddings",
-                json={
+                # task 6: keep_alive on the legacy code embed too.
+                json=_ka({
                     "model": "unclemusclez/jina-embeddings-v2-base-code:latest",
                     "prompt": text
-                },
+                }),
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as response:
                 if response.status == 200:
