@@ -376,14 +376,20 @@ fn warn_legacy_global_env_once(project_id: &str) {
 
 /// Outcome of evaluating a bearer against the per-project + global
 /// credentials on a `/env` / `/config` route.
+#[derive(Debug, PartialEq, Eq)]
 enum ProjectRouteAuth {
     /// Bearer matched THIS project's per-project token — allow, no log.
     ProjectToken,
     /// Bearer matched the global token — allow (compat window) unless
     /// the legacy flag is off; caller logs the deprecation line once.
     GlobalTokenCompat,
-    /// Bearer matched a DIFFERENT project's per-project token — hard 403.
-    WrongProject,
+    /// Bearer matched a DIFFERENT project's per-project token than the URL
+    /// segment names — a candidate hard 403. Carries the owner id so the
+    /// caller can, as a fallback, canonicalize the URL segment (which may
+    /// be a SLUG — the handler accepts id-OR-slug) to an id and re-compare
+    /// before actually refusing (v0.2.77 Part 8 Task 4d). A token minted
+    /// for project A addressed at project B's id/slug is still a hard 403.
+    WrongProject { owner: String },
     /// Bearer matched nothing — 401.
     NoMatch,
     /// Legacy global-token path disabled by `VCT_HUB_LEGACY_GLOBAL_ENV=0`
@@ -411,12 +417,18 @@ fn evaluate_project_route_auth(
 ) -> ProjectRouteAuth {
     // 1 + 2: does the bearer match SOME project's per-project token?
     // `project_for_token` returns an owned String (the value lives behind
-    // the registry's RwLock), so compare via `as_str()`.
+    // the registry's RwLock).
     if let Some(owner) = registry.project_for_token(bearer) {
         if owner == url_project_id {
             return ProjectRouteAuth::ProjectToken;
         }
-        return ProjectRouteAuth::WrongProject;
+        // The URL segment may be a SLUG that canonicalizes to `owner`
+        // (the handler accepts id-OR-slug). We DON'T do the DB lookup
+        // here — this fn stays pure/fast — so we hand the owner back and
+        // let `require_auth` canonicalize + re-compare before refusing
+        // (v0.2.77 Part 8 Task 4d). The direct id match above covers the
+        // hot path with no DB round-trip.
+        return ProjectRouteAuth::WrongProject { owner };
     }
     // 3: global token?
     if constant_time_eq(bearer.as_bytes(), global_token.as_bytes()) {
@@ -427,6 +439,58 @@ fn evaluate_project_route_auth(
     }
     // 4: matches nothing.
     ProjectRouteAuth::NoMatch
+}
+
+/// v0.2.77 Part 8 Task 4d — does the scoped-token owner canonicalize to
+/// the same project the URL segment names?
+///
+/// Called only from the `WrongProject` arm, i.e. AFTER a direct id
+/// compare (`owner == url_segment`) already failed. The URL segment may
+/// be a SLUG (the config handler accepts id-OR-slug), so we resolve it to
+/// a canonical id via `get_project` then `get_project_by_slug` — mirroring
+/// the handler — and return `true` iff that canonical id equals `owner`.
+///
+/// Fails CLOSED: no DB handle wired, an unresolvable segment, or a DB
+/// error all return `false` (keep the 403). A token minted for project A
+/// addressed at project B's id/slug therefore still hard-403s — this only
+/// rescues the case where the URL's slug and the token both name the SAME
+/// project.
+fn scoped_token_owns_url_project(
+    req: &Request<Body>,
+    owner: &str,
+    url_segment: &str,
+) -> bool {
+    let Some(db_handle) = req.extensions().get::<LauncherDbHandle>().cloned() else {
+        return false; // cannot canonicalize → fail closed.
+    };
+    let db = &db_handle.0;
+    // id first, slug fallback — same order as config_api's handler.
+    let canonical = match db.get_project(url_segment) {
+        Ok(Some(p)) => p.id,
+        Ok(None) => match db.get_project_by_slug(url_segment) {
+            Ok(Some(p)) => p.id,
+            Ok(None) => return false, // unknown segment → keep the 403.
+            Err(e) => {
+                eprintln!(
+                    "[vct-hub] auth: slug canonicalization lookup failed for {:?} ({}); \
+                     refusing (fail closed).",
+                    url_segment, e
+                );
+                return false;
+            }
+        },
+        Err(e) => {
+            eprintln!(
+                "[vct-hub] auth: id canonicalization lookup failed for {:?} ({}); \
+                 refusing (fail closed).",
+                url_segment, e
+            );
+            return false;
+        }
+    };
+    // Constant-time compare of the canonical id against the token owner —
+    // consistent with the rest of the auth-boundary comparisons.
+    constant_time_eq(canonical.as_bytes(), owner.as_bytes())
 }
 
 /// v0.2.77 Part 8 Task 4a — attempt a lazy-mint for a mid-session-added
@@ -544,7 +608,18 @@ pub async fn require_auth(req: Request<Body>, next: Next) -> Response {
                 warn_legacy_global_env_once(url_project_id);
                 return next.run(req).await;
             }
-            ProjectRouteAuth::WrongProject => {
+            ProjectRouteAuth::WrongProject { owner } => {
+                // v0.2.77 Part 8 Task 4d — slug canonicalization. The
+                // direct id compare in evaluate_project_route_auth failed,
+                // but the URL segment may be a SLUG that canonicalizes to
+                // `owner` (the config handler accepts id-OR-slug, so a
+                // scoped-token call legitimately addressed by slug must not
+                // spuriously 403). Resolve the segment → id and re-compare
+                // against the token owner. Only NOW do we touch the DB
+                // (the hot path — direct id match — never gets here).
+                if scoped_token_owns_url_project(&req, &owner, url_project_id) {
+                    return next.run(req).await;
+                }
                 return forbidden_response(
                     "this per-project token does not authorize the project in the \
                      URL; a token minted for project A cannot read project B",
@@ -1076,11 +1151,12 @@ mod tests {
             evaluate_project_route_auth("proj-a", "token-a", global, &reg),
             ProjectRouteAuth::ProjectToken
         ));
-        // Wrong project's token → hard 403.
-        assert!(matches!(
+        // Wrong project's token → WrongProject carrying the real owner
+        // (so the caller can attempt slug canonicalization before 403).
+        assert_eq!(
             evaluate_project_route_auth("proj-a", "token-b", global, &reg),
-            ProjectRouteAuth::WrongProject
-        ));
+            ProjectRouteAuth::WrongProject { owner: "proj-b".to_string() }
+        );
         // Global token → compat allow (default flag).
         assert!(matches!(
             evaluate_project_route_auth("proj-a", global, global, &reg),
@@ -1092,11 +1168,13 @@ mod tests {
             ProjectRouteAuth::NoMatch
         ));
         // A project token whose URL project has no registry entry still
-        // 403s if the token belongs to some OTHER project.
-        assert!(matches!(
+        // yields WrongProject (owner = token's real project) if the token
+        // belongs to some OTHER project. The caller's slug-canonicalization
+        // fallback then decides — here there's no DB, so it fails closed.
+        assert_eq!(
             evaluate_project_route_auth("proj-unknown", "token-a", global, &reg),
-            ProjectRouteAuth::WrongProject
-        ));
+            ProjectRouteAuth::WrongProject { owner: "proj-a".to_string() }
+        );
     }
 
     #[tokio::test]
@@ -1518,5 +1596,126 @@ mod tests {
         unsafe {
             std::env::remove_var("VCT_STATE_DIR");
         }
+    }
+
+    // ── v0.2.77 Part 8 Task 4d: slug canonicalization in auth ──────────
+
+    /// Router with a DB + a PRE-SEEDED registry (project already has a
+    /// scoped token) so we can address it by SLUG and prove the auth layer
+    /// canonicalizes slug→id before the owner comparison.
+    fn router_with_db_and_tokens(
+        global_token: &str,
+        db: LauncherDbHandle,
+        tokens: &[(&str, &str)],
+    ) -> Router {
+        let auth_state = AuthState::new(global_token.to_string());
+        let mut map = std::collections::HashMap::new();
+        for (pid, tok) in tokens {
+            map.insert(pid.to_string(), tok.to_string());
+        }
+        let registry = ProjectTokenRegistry::from_map(map);
+        Router::new()
+            .route("/api/v1/projects/{id}/env", get(|| async { "env here" }))
+            .route(
+                "/api/v1/projects/{id}/config",
+                get(|| async { "config here" }),
+            )
+            .layer(axum::middleware::from_fn(require_auth))
+            .layer(axum::Extension(auth_state))
+            .layer(axum::Extension(registry))
+            .layer(axum::Extension(db))
+    }
+
+    /// A scoped token addressed by the project's SLUG (which canonicalizes
+    /// to the token owner's id) must AUTHORIZE — not spuriously 403. This
+    /// is the exact bug 4d fixes: the handler accepts id-OR-slug, so the
+    /// auth layer must canonicalize before comparing owner vs URL segment.
+    #[tokio::test]
+    async fn scoped_token_addressed_by_slug_is_authorized() {
+        let db = vct_launcher_core::db::Db::open_in_memory().unwrap();
+        // seed_project_row sets slug == name.
+        seed_project_row(&db, "pid-x", "myslug", "/tmp/x");
+        let handle = LauncherDbHandle(std::sync::Arc::new(db));
+        let app = router_with_db_and_tokens("global-tok", handle, &[("pid-x", "tok-x")]);
+        let base = spawn_router(app).await;
+        let client = reqwest::Client::new();
+
+        // Address by SLUG, present pid-x's scoped token. Pre-4d this was a
+        // spurious WrongProject 403 ("pid-x" != "myslug"); post-4d the auth
+        // layer canonicalizes "myslug" → "pid-x" and allows.
+        let resp = client
+            .get(format!("{}/api/v1/projects/myslug/config", base))
+            .header("Authorization", "Bearer tok-x")
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a scoped token addressed by its project's slug must authorize"
+        );
+
+        // Sanity: addressing by the canonical id still works (the hot path
+        // that never needed canonicalization).
+        let resp_id = client
+            .get(format!("{}/api/v1/projects/pid-x/config", base))
+            .header("Authorization", "Bearer tok-x")
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp_id.status(), StatusCode::OK);
+    }
+
+    /// A token minted for project A, addressed at project B's SLUG, is
+    /// STILL a hard 403 — canonicalization rescues only the same-project
+    /// case, never a genuine cross-project boundary crossing.
+    #[tokio::test]
+    async fn scoped_token_for_other_project_by_slug_still_403() {
+        let db = vct_launcher_core::db::Db::open_in_memory().unwrap();
+        seed_project_row(&db, "pid-a", "slug-a", "/tmp/a");
+        seed_project_row(&db, "pid-b", "slug-b", "/tmp/b");
+        let handle = LauncherDbHandle(std::sync::Arc::new(db));
+        let app = router_with_db_and_tokens(
+            "global-tok",
+            handle,
+            &[("pid-a", "tok-a"), ("pid-b", "tok-b")],
+        );
+        let base = spawn_router(app).await;
+        let client = reqwest::Client::new();
+
+        // Project A's token addressed at project B's slug → canonicalizes
+        // to pid-b, which != owner pid-a → hard 403.
+        let resp = client
+            .get(format!("{}/api/v1/projects/slug-b/config", base))
+            .header("Authorization", "Bearer tok-a")
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "cross-project token addressed by the OTHER project's slug must still 403"
+        );
+    }
+
+    /// An UNKNOWN slug (no project) with a valid-but-other-project token
+    /// keeps the 403 (canonicalization fails closed on an unresolvable
+    /// segment — no accidental allow).
+    #[tokio::test]
+    async fn scoped_token_with_unknown_slug_stays_403() {
+        let db = vct_launcher_core::db::Db::open_in_memory().unwrap();
+        seed_project_row(&db, "pid-a", "slug-a", "/tmp/a");
+        let handle = LauncherDbHandle(std::sync::Arc::new(db));
+        let app = router_with_db_and_tokens("global-tok", handle, &[("pid-a", "tok-a")]);
+        let base = spawn_router(app).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .get(format!("{}/api/v1/projects/no-such-slug/config", base))
+            .header("Authorization", "Bearer tok-a")
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 }
