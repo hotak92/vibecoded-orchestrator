@@ -43,7 +43,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (new exit code `5` for the shell pair; `Forbidden` — NOT a
     `HubUnreachable` subclass — for Python) instead of mislabeling it
     "hub unreachable", so a scoped-token misconfiguration is not masked by
-    an env-var fallback.
+    an env-var fallback. The `vct_retrieval_tuning_get.{sh,ps1}` wrappers
+    now propagate that exit `5` too (they previously let a `403` fall
+    through into the "hub unreachable → read retrieval-tuning.toml" branch,
+    silently masking the refusal); and the launcher-keychain SECRETS
+    resolvers (`vco_lib.agent_secrets._hub_get`,
+    `vct_secrets_resolve.{sh,ps1}`) classify a `403` distinctly rather than
+    raising/returning "hub unreachable".
   - **`vct` miss hint (4b):** a `403` from the keychain probe no longer
     recommends `vct set` (which would fork a divergent on-disk copy); it
     points at the resolver instead.

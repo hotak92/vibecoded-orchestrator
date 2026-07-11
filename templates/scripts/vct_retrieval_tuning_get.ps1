@@ -20,6 +20,7 @@
 #   2  project not registered
 #   3  service misconfigured
 #   4  field not found
+#   5  forbidden (hub refused the token; no file fallback)
 #   64 usage error
 #
 # Hub discovery is delegated to vct_project_config.ps1 (the sibling
@@ -162,10 +163,19 @@ if ($hubRc -eq 0 -and $hubBody) {
 
 # Propagate hub-side hard errors (2 / 3 / 4) directly; 1 (hub unreachable)
 # triggers the file fallback below.
+#
+# v0.2.77 L3-F2: rc=5 is FORBIDDEN (the hub refused the token on the gated
+# /env|/config route). A refusal must NEVER fall back to the local TOML —
+# that would silently mask a scoped-token misconfiguration and emit a bogus
+# "hub unreachable" diagnostic. Propagate exit 5 with an honest message.
 switch ($hubRc) {
     2 { exit 2 }
     3 { exit 3 }
     4 { exit 4 }
+    5 {
+        Write-VctWarn "hub refused the request (403 forbidden) — present a scoped hub.token.<project_id> or set VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to reopen the compat window; NOT falling back to the local TOML"
+        exit 5
+    }
 }
 
 Write-VctWarn "hub unreachable; reading <vct_root_dir>/retrieval-tuning.toml directly"

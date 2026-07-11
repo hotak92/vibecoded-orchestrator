@@ -241,7 +241,7 @@ When `VCT_STATE_DIR` is non-default, boot registration prints a warning — the 
 - `templates/scripts/vct_project_config.ps1` (PowerShell 7+, Windows hooks)
 - `vco_lib/project_config.py` (`from vco_lib.project_config import resolve, ProjectConfig` — used by `install.py`, MCPs, and any Python tooling)
 
-Discovery: `VCT_HUB_PORT` env → `<vct_root_dir>/hub.port` → `7700` default; token: `VCT_HUB_TOKEN` env → `<vct_root_dir>/hub.token`. All clients enforce the same exit-code shape (0 success / 1 hub unreachable / 2 project not registered / 3 service misconfigured / 4 field not found / 64 usage error). Stderr emissions are rate-limited per `(pid, error_kind)` to one line per 5 minutes — `VCO_HOOK_DEBUG=1` bypasses the limit.
+Discovery: `VCT_HUB_PORT` env → `<vct_root_dir>/hub.port` → `7700` default; token: `VCT_HUB_TOKEN` env → `<vct_root_dir>/hub.token`. All clients enforce the same exit-code shape (0 success / 1 hub unreachable / 2 project not registered / 3 service misconfigured / 4 field not found / 5 forbidden — hub refused the token on `/env`|`/config`, callers MUST NOT env/file-fallback / 64 usage error). Stderr emissions are rate-limited per `(pid, error_kind)` to one line per 5 minutes — `VCO_HOOK_DEBUG=1` bypasses the limit.
 
 **v0.2.20 → v0.2.21 cutover sentinel**: when `install.py` deploys `vct-hub` for the first time, it writes `<vct_root_dir>/v0.2.21-cutover.flag` BEFORE starting the hub. The v0.2.21 launcher reads this flag on startup and skips its own in-process services watcher (knowing the hub will take it over). `install.py` deletes the flag after `vct-hub` responds to `/api/v1/health`. Leftover sentinels are harmless — the hub's first successful `/api/v1/health` clears the contention.
 

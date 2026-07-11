@@ -27,6 +27,8 @@
 #   2  project not registered
 #   3  service misconfigured (no primary KG binding)
 #   4  field not found
+#   5  forbidden (hub refused the token on /env|/config; NO file fallback —
+#      a refusal must never silently fall back to the local TOML)
 #   64 usage error
 #
 # Hub-down fallback: if the hub is unreachable, the script falls back
@@ -146,6 +148,7 @@ Exit codes:
   2  project not registered
   3  service misconfigured
   4  field not found
+  5  forbidden (hub refused the token; no file fallback)
   64 usage error
 EOF
 }
@@ -233,9 +236,19 @@ if isinstance(data, dict) and key in data:
 
     # Map the resolver-client exit codes to our shape. Non-1 errors
     # propagate; rc=1 (hub unreachable) triggers file fallback.
+    #
+    # v0.2.77 L3-F2: rc=5 is FORBIDDEN (the hub refused the token on the
+    # gated /env|/config route). A refusal must NEVER fall back to the local
+    # TOML — that would silently mask a scoped-token misconfiguration and
+    # emit a bogus "hub unreachable" diagnostic. Propagate exit 5 with an
+    # honest message instead.
     case "$rc" in
         2|3|4)
             exit "$rc"
+            ;;
+        5)
+            err "hub refused the request (403 forbidden) — present a scoped hub.token.<project_id> or set VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to reopen the compat window; NOT falling back to the local TOML"
+            exit 5
             ;;
     esac
 
