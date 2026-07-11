@@ -62,7 +62,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use vct_launcher_core::db::Db;
 use vct_launcher_core::services::boot_token;
@@ -76,14 +76,20 @@ pub const PROJECT_TOKEN_PREFIX: &str = "hub.token.";
 /// In-memory registry of per-project resolver tokens, populated at hub
 /// startup. Shared into the auth middleware as an axum extension.
 ///
-/// Wrapped in `Arc` so the middleware closure clones cheaply (one atomic
-/// increment per request). The map is immutable after construction —
-/// we never mutate it while the server runs (mid-session project adds
-/// wait for the next startup; see the module doc).
+/// Wrapped in `Arc<RwLock<..>>` so the middleware closure clones cheaply
+/// (one atomic increment per request) AND a mid-session project add can
+/// lazily mint its token into the LIVE registry without a hub restart
+/// (v0.2.77 Part 8 Task 4a). Reads (the per-request reverse-lookup) take
+/// the read lock; the rare lazy-mint takes the write lock. Before 4a the
+/// map was an immutable `Arc<HashMap>` and a mid-session-added project had
+/// to wait for the next startup — which stranded its resolver once the
+/// global-token compat window closed (the flip). Startup re-mint is
+/// unchanged: `mint_project_tokens` still rebuilds the whole map on every
+/// boot, so lazy-minted tokens rotate exactly like startup-minted ones.
 #[derive(Clone)]
 pub struct ProjectTokenRegistry {
     /// project_id → token. Empty when no projects are registered.
-    by_project: Arc<HashMap<String, String>>,
+    by_project: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl ProjectTokenRegistry {
@@ -91,7 +97,7 @@ impl ProjectTokenRegistry {
     /// still boots; every resolver falls back to the global token).
     pub fn empty() -> Self {
         Self {
-            by_project: Arc::new(HashMap::new()),
+            by_project: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -99,15 +105,25 @@ impl ProjectTokenRegistry {
     /// tests; production uses [`mint_project_tokens`].
     pub fn from_map(map: HashMap<String, String>) -> Self {
         Self {
-            by_project: Arc::new(map),
+            by_project: Arc::new(RwLock::new(map)),
         }
+    }
+
+    /// Acquire the read guard, recovering a poisoned lock (a panic while
+    /// the write lock was held must not permanently 500 every auth call —
+    /// the map is plain data, so the poisoned contents are still valid).
+    fn read_map(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, String>> {
+        self.by_project.read().unwrap_or_else(|p| p.into_inner())
     }
 
     /// The token minted for `project_id`, if any. `None` when the
     /// project has no per-project token (not registered at startup, or
-    /// added mid-session).
-    pub fn token_for(&self, project_id: &str) -> Option<&str> {
-        self.by_project.get(project_id).map(String::as_str)
+    /// added mid-session before its lazy-mint fired).
+    ///
+    /// Returns an owned `String` (not a borrow) because the value lives
+    /// behind the `RwLock` — the guard cannot outlive this call.
+    pub fn token_for(&self, project_id: &str) -> Option<String> {
+        self.read_map().get(project_id).cloned()
     }
 
     /// Reverse lookup: which project (if any) does this bearer token
@@ -121,27 +137,42 @@ impl ProjectTokenRegistry {
     ///   * bearer == token_for(OTHER_project) → hard 403 (valid token,
     ///     wrong project);
     ///   * bearer matches no project token → fall through to the global
-    ///     token check (compat) → 401 if that also fails.
-    pub fn project_for_token(&self, bearer: &str) -> Option<&str> {
-        let mut matched: Option<&str> = None;
-        for (pid, tok) in self.by_project.iter() {
+    ///     token check (compat / lazy-mint) → 401 if that also fails.
+    pub fn project_for_token(&self, bearer: &str) -> Option<String> {
+        let map = self.read_map();
+        let mut matched: Option<String> = None;
+        for (pid, tok) in map.iter() {
             // Walk EVERY entry (no early break) so the number of
             // comparisons doesn't leak how far down the map a match sat.
             if boot_token::constant_time_eq(bearer.as_bytes(), tok.as_bytes()) {
-                matched = Some(pid.as_str());
+                matched = Some(pid.clone());
             }
         }
         matched
     }
 
+    /// Insert (or overwrite) a freshly-minted token for `project_id` into
+    /// the LIVE registry. Used only by the lazy-mint path (4a); startup
+    /// minting builds a fresh map wholesale via [`from_map`]. Idempotent
+    /// from the caller's view — re-inserting the same id just replaces the
+    /// value (the lazy-mint path only calls this when no entry existed, so
+    /// in practice this is an insert, not an overwrite).
+    pub fn insert(&self, project_id: String, token: String) {
+        let mut map = self
+            .by_project
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        map.insert(project_id, token);
+    }
+
     /// Number of registered per-project tokens. Test/diagnostic aid.
     pub fn len(&self) -> usize {
-        self.by_project.len()
+        self.read_map().len()
     }
 
     /// Whether the registry holds no tokens.
     pub fn is_empty(&self) -> bool {
-        self.by_project.is_empty()
+        self.read_map().is_empty()
     }
 }
 
@@ -216,6 +247,114 @@ pub fn mint_project_tokens(db: &Db) -> ProjectTokenRegistry {
     cleanup_stale_project_tokens(&live_ids);
 
     ProjectTokenRegistry::from_map(map)
+}
+
+/// Lazily mint a per-project token for a project ADDED while the hub was
+/// already running (v0.2.77 Part 8 Task 4a).
+///
+/// ─── Why ────────────────────────────────────────────────────────────
+/// The hub mints tokens at startup only (see the module doc). A project
+/// added mid-session has no `hub.token.<id>` file, so its resolver falls
+/// back to the global `hub.token`. Before the flip that "just worked"
+/// (compat window). AFTER the flip the global token is refused on
+/// `/env` + `/config`, so a mid-session-added project's resolver would be
+/// stranded with a 403 until the next hub restart. Lazy-mint closes that
+/// gap self-serve: on the first request for such a project, we mint its
+/// scoped token, write the file, register it, and let the request
+/// proceed — so the NEXT request already finds the scoped file and rides
+/// the per-project token like every startup-minted project.
+///
+/// ─── Contract ───────────────────────────────────────────────────────
+/// * `url_segment` is the raw `{id}` from the URL — either a project id
+///   OR a slug (the config handler accepts both). We canonicalize via
+///   `get_project` then `get_project_by_slug`, mirroring the handler.
+/// * Returns `Some((canonical_id, token))` ONLY when the segment resolves
+///   to a REAL project row in `launcher.db`. An UNKNOWN segment (no id
+///   and no slug match) returns `None` — the caller keeps the 401/403 it
+///   would otherwise return, so an attacker cannot force a token file to
+///   be written for an arbitrary id.
+/// * IDEMPOTENT: if the project already has a registry entry (a race with
+///   another in-flight request, or startup already minted it), we return
+///   the EXISTING token rather than rotating it — never overwrite a live
+///   token mid-session.
+/// * Soft-fail: a CSPRNG failure or an un-writable token file returns
+///   `None` (the caller keeps its refusal) rather than panicking. The
+///   0o600 write discipline is identical to `mint_project_tokens`.
+/// * STARTUP-REGENERATION INVARIANT preserved: the file we write is
+///   cleaned up / regenerated on the next startup exactly like any other
+///   `hub.token.<id>` (it is keyed by the canonical id, which is a live
+///   project, so `cleanup_stale_project_tokens` keeps it and the next
+///   `mint_project_tokens` rotates it).
+pub fn lazy_mint_for_project(
+    registry: &ProjectTokenRegistry,
+    db: &Db,
+    url_segment: &str,
+) -> Option<(String, String)> {
+    // 1. Canonicalize the URL segment → a real project id. Mirror the
+    //    config handler: id first, slug fallback. A DB error or a segment
+    //    matching neither → None (no mint, caller keeps its refusal).
+    let canonical_id = match db.get_project(url_segment) {
+        Ok(Some(p)) => p.id,
+        Ok(None) => match db.get_project_by_slug(url_segment) {
+            Ok(Some(p)) => p.id,
+            Ok(None) => return None, // genuinely unknown → stay refused.
+            Err(e) => {
+                eprintln!(
+                    "[vct-hub] project_tokens: lazy-mint slug lookup failed for {:?} ({}); \
+                     leaving the request refused.",
+                    url_segment, e
+                );
+                return None;
+            }
+        },
+        Err(e) => {
+            eprintln!(
+                "[vct-hub] project_tokens: lazy-mint id lookup failed for {:?} ({}); \
+                 leaving the request refused.",
+                url_segment, e
+            );
+            return None;
+        }
+    };
+
+    // 2. Idempotent: if a token already exists for the canonical id (this
+    //    project was in fact registered — e.g. a concurrent request just
+    //    minted it, or the caller addressed it by slug while the id form
+    //    is already registered), return the existing token untouched.
+    if let Some(existing) = registry.token_for(&canonical_id) {
+        return Some((canonical_id, existing));
+    }
+
+    // 3. Mint + persist (0o600) + register. Soft-fail on either failure.
+    let token = match boot_token::generate_token() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "[vct-hub] project_tokens: lazy-mint CSPRNG failed for {} ({}); \
+                 leaving the request refused.",
+                canonical_id, e
+            );
+            return None;
+        }
+    };
+    let path = project_token_path(&canonical_id);
+    if let Err(e) = boot_token::write_token_file(&path, &token) {
+        eprintln!(
+            "[vct-hub] project_tokens: lazy-mint could not write {} ({}); \
+             leaving the request refused.",
+            path.display(),
+            e
+        );
+        return None;
+    }
+    registry.insert(canonical_id.clone(), token.clone());
+    eprintln!(
+        "[vct-hub] project_tokens: lazy-minted a per-project token for {} \
+         (added while the hub was running); its resolver will use the scoped \
+         token on the next request.",
+        canonical_id
+    );
+    Some((canonical_id, token))
 }
 
 /// Remove `hub.token.<id>` files whose `<id>` is not in `live_ids`.
@@ -301,12 +440,14 @@ mod tests {
         m.insert("proj-b".to_string(), "token-b".to_string());
         let reg = ProjectTokenRegistry::from_map(m);
 
-        assert_eq!(reg.token_for("proj-a"), Some("token-a"));
-        assert_eq!(reg.token_for("proj-b"), Some("token-b"));
+        // token_for / project_for_token return owned String (values live
+        // behind the RwLock) — compare via as_deref().
+        assert_eq!(reg.token_for("proj-a").as_deref(), Some("token-a"));
+        assert_eq!(reg.token_for("proj-b").as_deref(), Some("token-b"));
         assert_eq!(reg.token_for("proj-c"), None);
 
-        assert_eq!(reg.project_for_token("token-a"), Some("proj-a"));
-        assert_eq!(reg.project_for_token("token-b"), Some("proj-b"));
+        assert_eq!(reg.project_for_token("token-a").as_deref(), Some("proj-a"));
+        assert_eq!(reg.project_for_token("token-b").as_deref(), Some("proj-b"));
         assert_eq!(reg.project_for_token("garbage"), None);
         assert_eq!(reg.len(), 2);
         assert!(!reg.is_empty());
@@ -335,7 +476,7 @@ mod tests {
                 assert!(path.exists(), "token file for {} must exist", pid);
                 let on_disk = std::fs::read_to_string(&path).unwrap();
                 assert_eq!(
-                    reg.token_for(pid),
+                    reg.token_for(pid).as_deref(),
                     Some(on_disk.trim()),
                     "registry token must match the file for {}",
                     pid
@@ -354,8 +495,8 @@ mod tests {
             // Distinct tokens per project.
             assert_ne!(reg.token_for("pid-1"), reg.token_for("pid-2"));
             // Reverse lookup pins each token to its project.
-            let ta = reg.token_for("pid-1").unwrap().to_string();
-            assert_eq!(reg.project_for_token(&ta), Some("pid-1"));
+            let ta = reg.token_for("pid-1").unwrap();
+            assert_eq!(reg.project_for_token(&ta).as_deref(), Some("pid-1"));
         });
     }
 
@@ -423,6 +564,122 @@ mod tests {
                 !root.join("hub.token.orphan").exists(),
                 "orphan file cleaned when no projects are live"
             );
+        });
+    }
+
+    // ── v0.2.77 Part 8 Task 4a: lazy-mint ─────────────────────────────
+
+    /// The registry is now interior-mutable: a live `insert` is visible
+    /// to a subsequent read on the SAME (cloned) handle. This is the
+    /// property lazy-mint relies on — the middleware clones the registry
+    /// per request, so a write on one clone must be seen by the next.
+    #[test]
+    fn registry_insert_is_visible_across_clones() {
+        let reg = ProjectTokenRegistry::empty();
+        let clone = reg.clone();
+        assert_eq!(reg.token_for("p"), None);
+        clone.insert("p".to_string(), "tok".to_string());
+        // The write via `clone` is visible via `reg` (shared Arc<RwLock>).
+        assert_eq!(reg.token_for("p").as_deref(), Some("tok"));
+        assert_eq!(reg.project_for_token("tok").as_deref(), Some("p"));
+    }
+
+    /// Lazy-mint for a project ADDED mid-session (a DB row exists but no
+    /// registry entry): mints the token, writes the 0o600 file, registers
+    /// it, and returns (canonical_id, token).
+    #[test]
+    fn lazy_mint_writes_file_and_registers_for_db_known_project() {
+        with_state_dir(|root| {
+            let db = Db::open_in_memory().unwrap();
+            seed_project(&db, "added-pid", "Added", "/tmp/added");
+            // Empty registry (project appeared AFTER startup mint).
+            let reg = ProjectTokenRegistry::empty();
+
+            let out = lazy_mint_for_project(&reg, &db, "added-pid")
+                .expect("db-known project must lazy-mint");
+            assert_eq!(out.0, "added-pid");
+
+            let path = root.join("hub.token.added-pid");
+            assert!(path.exists(), "lazy-minted token file must be written");
+            let on_disk = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(on_disk.trim(), out.1, "file must match returned token");
+            assert_eq!(reg.token_for("added-pid").as_deref(), Some(out.1.as_str()));
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "lazy-minted file must be 0o600");
+            }
+        });
+    }
+
+    /// Lazy-mint resolves a SLUG segment to the canonical id (the config
+    /// handler accepts id-OR-slug, so lazy-mint must too).
+    #[test]
+    fn lazy_mint_resolves_slug_to_canonical_id() {
+        with_state_dir(|root| {
+            let db = Db::open_in_memory().unwrap();
+            // seed_project sets slug == name (see the INSERT).
+            seed_project(&db, "slug-pid", "myslug", "/tmp/slug");
+            let reg = ProjectTokenRegistry::empty();
+
+            let out = lazy_mint_for_project(&reg, &db, "myslug")
+                .expect("slug must resolve + mint");
+            assert_eq!(out.0, "slug-pid", "returns the canonical id, not the slug");
+            // File is keyed by the canonical id, NOT the slug.
+            assert!(root.join("hub.token.slug-pid").exists());
+            assert!(!root.join("hub.token.myslug").exists());
+        });
+    }
+
+    /// An UNKNOWN segment (no id and no slug match) does NOT mint — the
+    /// caller keeps its 401/403. This is the "attacker can't force a token
+    /// file for an arbitrary id" guard.
+    #[test]
+    fn lazy_mint_refuses_unknown_segment() {
+        with_state_dir(|root| {
+            let db = Db::open_in_memory().unwrap();
+            let reg = ProjectTokenRegistry::empty();
+
+            assert!(lazy_mint_for_project(&reg, &db, "ghost").is_none());
+            assert!(!root.join("hub.token.ghost").exists());
+            assert!(reg.is_empty());
+        });
+    }
+
+    /// Idempotent: lazy-mint for a project that ALREADY has a registry
+    /// entry returns the EXISTING token, never rotating it (a live token
+    /// must not change mid-session under a race).
+    #[test]
+    fn lazy_mint_is_idempotent_returns_existing_token() {
+        with_state_dir(|_root| {
+            let db = Db::open_in_memory().unwrap();
+            seed_project(&db, "idem-pid", "Idem", "/tmp/idem");
+            let reg = ProjectTokenRegistry::empty();
+
+            let first = lazy_mint_for_project(&reg, &db, "idem-pid").unwrap();
+            let second = lazy_mint_for_project(&reg, &db, "idem-pid").unwrap();
+            assert_eq!(first.1, second.1, "second lazy-mint must NOT rotate the token");
+        });
+    }
+
+    /// STARTUP-REGENERATION INVARIANT: a lazy-minted token is rotated by
+    /// the next startup mint exactly like a startup-minted one (the file
+    /// is keyed by a live project id, so cleanup keeps it and the next
+    /// mint overwrites it with a fresh token).
+    #[test]
+    fn lazy_minted_token_is_regenerated_on_next_startup() {
+        with_state_dir(|_root| {
+            let db = Db::open_in_memory().unwrap();
+            seed_project(&db, "rot-pid", "Rot", "/tmp/rot");
+            let reg = ProjectTokenRegistry::empty();
+
+            let lazy = lazy_mint_for_project(&reg, &db, "rot-pid").unwrap().1;
+            // Next startup re-mints wholesale.
+            let reg2 = mint_project_tokens(&db);
+            let after = reg2.token_for("rot-pid").unwrap();
+            assert_ne!(lazy, after, "startup mint must rotate the lazy-minted token");
         });
     }
 }

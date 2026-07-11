@@ -101,7 +101,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::project_tokens::ProjectTokenRegistry;
+use crate::modules_api::LauncherDbHandle;
+use crate::project_tokens::{self, ProjectTokenRegistry};
 // v0.2.54 Track I: the token primitives (CSPRNG generation, 0o600
 // persistence, constant-time compare, Bearer parsing) moved to
 // `vct_launcher_core::services::boot_token` so the launcher's diagrams
@@ -409,6 +410,8 @@ fn evaluate_project_route_auth(
     registry: &ProjectTokenRegistry,
 ) -> ProjectRouteAuth {
     // 1 + 2: does the bearer match SOME project's per-project token?
+    // `project_for_token` returns an owned String (the value lives behind
+    // the registry's RwLock), so compare via `as_str()`.
     if let Some(owner) = registry.project_for_token(bearer) {
         if owner == url_project_id {
             return ProjectRouteAuth::ProjectToken;
@@ -424,6 +427,33 @@ fn evaluate_project_route_auth(
     }
     // 4: matches nothing.
     ProjectRouteAuth::NoMatch
+}
+
+/// v0.2.77 Part 8 Task 4a — attempt a lazy-mint for a mid-session-added
+/// project and report whether the current request may proceed.
+///
+/// Called ONLY from the `GlobalTokenRefused` arm — i.e. the bearer is the
+/// global `hub.token` (same-user trust) and the compat window is closed.
+/// Pulls the `LauncherDbHandle` the server injected as a request
+/// extension; if it is absent (a test harness that installs only
+/// AuthState + registry, or a wiring bug) we CANNOT resolve the id → do
+/// NOT proceed (fail closed: keep the 403). Delegates the DB lookup +
+/// mint + file write + registration to `project_tokens::lazy_mint_for_
+/// project`, which returns `Some` only for a DB-known project (unknown id
+/// → `None` → keep the 403).
+///
+/// Returns `true` iff a token was minted (or already existed) for a real
+/// project, meaning this request is now authorized to proceed.
+fn lazy_mint_and_proceed(
+    req: &Request<Body>,
+    registry: &ProjectTokenRegistry,
+    url_project_id: &str,
+) -> bool {
+    let Some(db_handle) = req.extensions().get::<LauncherDbHandle>().cloned() else {
+        // No DB handle wired — cannot resolve the project. Fail closed.
+        return false;
+    };
+    project_tokens::lazy_mint_for_project(registry, &db_handle.0, url_project_id).is_some()
 }
 
 /// 403 for a scoped-credential boundary violation (wrong project token,
@@ -521,6 +551,19 @@ pub async fn require_auth(req: Request<Body>, next: Next) -> Response {
                 );
             }
             ProjectRouteAuth::GlobalTokenRefused => {
+                // v0.2.77 Part 8 Task 4a — lazy-mint rescue. The bearer IS
+                // the global hub.token (proven above — same-user trust,
+                // 0o600), and the legacy compat window is closed. If this
+                // {id} resolves to a REAL project that has no scoped token
+                // yet (added while the hub was running), mint it inline,
+                // write the 0o600 file + register it, and PROCEED — so this
+                // first request succeeds and the resolver rides the scoped
+                // token from the next request. A garbage bearer never gets
+                // here (it is NoMatch), and an UNKNOWN {id} does not mint
+                // (lazy_mint returns None) → we keep the 403.
+                if lazy_mint_and_proceed(&req, &registry, url_project_id) {
+                    return next.run(req).await;
+                }
                 return forbidden_response(
                     "the global hub.token is no longer accepted on /env + /config \
                      (VCT_HUB_LEGACY_GLOBAL_ENV=0); present the per-project token \
@@ -1335,5 +1378,145 @@ mod tests {
             .await
             .expect("hub reachable");
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ── v0.2.77 Part 8 Task 4a: lazy-mint through the middleware ───────
+
+    /// Router shaped like the real server for the lazy-mint path: global
+    /// token via AuthState, an (initially empty) ProjectTokenRegistry, AND
+    /// the `LauncherDbHandle` extension the lazy-mint helper needs to
+    /// resolve the URL id → a real project. Returns the registry so the
+    /// test can observe the lazy-minted entry after the request.
+    fn router_with_db_for_lazy_mint(
+        global_token: &str,
+        db: LauncherDbHandle,
+    ) -> (Router, ProjectTokenRegistry) {
+        let auth_state = AuthState::new(global_token.to_string());
+        let registry = ProjectTokenRegistry::empty();
+        let app = Router::new()
+            .route("/api/v1/projects/{id}/env", get(|| async { "env here" }))
+            .route(
+                "/api/v1/projects/{id}/config",
+                get(|| async { "config here" }),
+            )
+            .layer(axum::middleware::from_fn(require_auth))
+            .layer(axum::Extension(auth_state))
+            .layer(axum::Extension(registry.clone()))
+            .layer(axum::Extension(db));
+        (app, registry)
+    }
+
+    fn seed_project_row(db: &vct_launcher_core::db::Db, id: &str, name: &str, folder: &str) {
+        let now = chrono::Utc::now().timestamp_millis();
+        let guard = db.lock();
+        guard
+            .execute(
+                "INSERT INTO projects (id, name, folder_path, host, slug, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'base', ?2, ?4, ?4)",
+                rusqlite::params![id, name, folder, now],
+            )
+            .unwrap();
+    }
+
+    /// Flag OFF + global token + a project that exists in the DB but has
+    /// NO registry entry (added mid-session) → lazy-mint rescues it: the
+    /// request PROCEEDS (200) and the scoped token is now registered +
+    /// written to disk, so the next request rides the per-project token.
+    #[tokio::test]
+    async fn lazy_mint_rescues_db_known_project_when_flag_off() {
+        // Hold the flag lock for the whole test AND isolate VCT_STATE_DIR
+        // (lazy-mint writes hub.token.<id> there). The LegacyFlagGuard
+        // serialises against the other flag tests; the state-dir set is
+        // safe under that same held lock.
+        let _g = LegacyFlagGuard::set("0");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Safety: LegacyFlagGuard holds LEGACY_FLAG_SERIALIZE + tests run
+        // single-threaded (RUST_TEST_THREADS=1 for env-mutating tests).
+        unsafe {
+            std::env::set_var("VCT_STATE_DIR", tmp.path());
+        }
+
+        let db = vct_launcher_core::db::Db::open_in_memory().unwrap();
+        seed_project_row(&db, "mid-pid", "MidSession", "/tmp/mid");
+        let handle = LauncherDbHandle(std::sync::Arc::new(db));
+        let (app, registry) = router_with_db_for_lazy_mint("global-tok", handle);
+        let base = spawn_router(app).await;
+        let client = reqwest::Client::new();
+
+        // Registry starts empty — no scoped token for mid-pid yet.
+        assert_eq!(registry.token_for("mid-pid"), None);
+
+        // First request rides the global token; flag off → would be 403,
+        // but lazy-mint rescues it → 200.
+        let resp = client
+            .get(format!("{}/api/v1/projects/mid-pid/config", base))
+            .header("Authorization", "Bearer global-tok")
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "lazy-mint must rescue a DB-known mid-session project"
+        );
+
+        // The scoped token is now registered AND on disk.
+        let minted = registry
+            .token_for("mid-pid")
+            .expect("lazy-mint must register the token");
+        let path = tmp.path().join("hub.token.mid-pid");
+        assert!(path.exists(), "lazy-minted token file must be written");
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), minted);
+
+        // A follow-up request presenting the freshly-minted SCOPED token
+        // authorizes via the ProjectToken path (no global token needed).
+        let resp2 = client
+            .get(format!("{}/api/v1/projects/mid-pid/config", base))
+            .header("Authorization", format!("Bearer {}", minted))
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp2.status(), StatusCode::OK);
+
+        unsafe {
+            std::env::remove_var("VCT_STATE_DIR");
+        }
+    }
+
+    /// Flag OFF + global token + an UNKNOWN id (no DB row) → NO lazy-mint;
+    /// the 403 stands and no token file is written. Guards against an
+    /// attacker forcing a token file for an arbitrary id.
+    #[tokio::test]
+    async fn lazy_mint_does_not_rescue_unknown_id_when_flag_off() {
+        let _g = LegacyFlagGuard::set("0");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("VCT_STATE_DIR", tmp.path());
+        }
+
+        let db = vct_launcher_core::db::Db::open_in_memory().unwrap();
+        // No projects seeded.
+        let handle = LauncherDbHandle(std::sync::Arc::new(db));
+        let (app, registry) = router_with_db_for_lazy_mint("global-tok", handle);
+        let base = spawn_router(app).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .get(format!("{}/api/v1/projects/ghost-pid/config", base))
+            .header("Authorization", "Bearer global-tok")
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "an unknown id must NOT be lazy-minted; the 403 stands"
+        );
+        assert_eq!(registry.token_for("ghost-pid"), None);
+        assert!(!tmp.path().join("hub.token.ghost-pid").exists());
+
+        unsafe {
+            std::env::remove_var("VCT_STATE_DIR");
+        }
     }
 }
