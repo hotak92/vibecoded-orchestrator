@@ -59,6 +59,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shell-injection scan, Build Anchor + file backup, pre-Edit KG
   suggestion) are unchanged. (9-bis)
 
+### Fixed
+- **RL citation labels are now recovered for the hook-path retrieval
+  cohort.** Hook-triggered KG searches (the `pre_edit_kg_search`
+  cohort, ~87% of all retrievals) stage a hook-derived query that never
+  appears verbatim as a KG tool-use in the session transcript, so the
+  Stop-hook citation drain's query-matcher could never locate them —
+  their citation labels were left every turn and eventually discarded at
+  the pending-file TTL (observed live: 6 citation events against 16,341
+  retrievals). The drain now falls back, **only** for hook-source
+  payloads whose query-match fails, to anchoring the answer window by
+  timestamp (the first assistant message at/after the retrieval's
+  `ts_ms`). The existing 25k-token gate and terminal-session floor apply
+  unchanged, non-hook (MCP) payloads keep the exact prior behaviour, and
+  there is no schema change and no change to the telemetry opt-out
+  semantics. This restores the label half of the training corpus for the
+  dominant cohort, equally with or without the RL module installed. (9-bis)
+
 ## [0.2.76] - 2026-07-10
 
 ### Security

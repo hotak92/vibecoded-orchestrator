@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json as _json
 import os as _os
+from datetime import datetime as _datetime, timezone as _timezone
 from pathlib import Path  # used in string annotations (load_messages arg)
 
 __all__ = [
@@ -34,6 +35,7 @@ __all__ = [
     "find_kg_positions",
     "extract_answer_window",
     "match_position_for_query",
+    "match_position_by_timestamp",
     "token_estimate",
 ]
 
@@ -277,4 +279,57 @@ def match_position_for_query(
         return None
     if pos_idx is not None and pos_idx < len(kg_positions):
         return kg_positions[pos_idx]
+    return None
+
+
+def _message_ts_ms(msg: dict) -> "int | None":
+    """Epoch-ms of a transcript message's top-level ISO-8601 ``timestamp``.
+
+    Claude Code stamps every transcript line with e.g. ``2026-07-11T06:10:02.138Z``.
+    Returns the value in epoch milliseconds, or None when the field is absent /
+    unparseable (soft-fail — the caller treats None as "no timestamp signal")."""
+    ts = msg.get("timestamp")
+    if not isinstance(ts, str) or not ts:
+        return None
+    try:
+        # ``fromisoformat`` handles the trailing ``Z`` only from Py3.11; normalise
+        # it to ``+00:00`` so older interpreters parse the same string.
+        norm = ts[:-1] + "+00:00" if ts.endswith("Z") else ts
+        dt = _datetime.fromisoformat(norm)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except (ValueError, TypeError):
+        return None
+
+
+def match_position_by_timestamp(
+    messages: list[dict],
+    ts_ms: "int | float | None",
+) -> "tuple[int, int] | None":
+    """Anchor an answer window by TIME rather than by transcript query-match.
+
+    The hook-cohort fallback (v0.2.77 9-bis): a hook-staged retrieval carries a
+    hook-derived query that never appears as a KG ``tool_use`` in the transcript,
+    so ``match_position_for_query`` can never locate it and its citation label
+    is lost. When that match fails, anchor instead on the FIRST assistant message
+    whose transcript ``timestamp`` is at/after the retrieval's ``ts_ms`` — that is
+    the start of the answer the retrieval fed into. Returns ``(msg_idx, -1)`` so
+    ``extract_answer_window`` accumulates from block 0 of that message onward (its
+    skip predicate is ``blk_idx <= start_blk_idx``; ``-1`` skips nothing). The
+    existing 25k gate + terminal floor in the drain then apply UNCHANGED — this
+    only changes WHERE the window starts, never whether/when it is emitted.
+
+    Returns None when ``ts_ms`` is missing or no assistant message is stamped
+    at/after it (e.g. the answer isn't flushed yet — the drain leaves the file to
+    retry, exactly as an unmatched query does today).
+    """
+    if not isinstance(ts_ms, (int, float)) or ts_ms <= 0:
+        return None
+    for msg_idx, msg in enumerate(messages):
+        if msg.get("type") != "assistant":
+            continue
+        msg_ts = _message_ts_ms(msg)
+        if msg_ts is not None and msg_ts >= ts_ms:
+            return (msg_idx, -1)
     return None

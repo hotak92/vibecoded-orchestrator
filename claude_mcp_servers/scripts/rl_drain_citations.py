@@ -7,7 +7,12 @@ with the session_id + transcript_path Claude Code delivers on Stop stdin. For
 every staged pending file belonging to the session it:
 
   1. Loads the transcript ONCE.
-  2. Maps each pending file's (query, seq) to its KG-call position.
+  2. Maps each pending file's (query, seq) to its KG-call position. For a
+     hook-source payload whose hook-derived query has no matching KG tool_use
+     in the transcript (the ~87% hook cohort), falls back to a TIMESTAMP
+     anchor — the first assistant message at/after the retrieval's ts_ms —
+     so that cohort's citation labels are recovered rather than lost at TTL
+     (v0.2.77 9-bis).
   3. Extracts the cumulative answer window from that position to end-of-
      transcript (accumulates across human turns — the V52-N behaviour).
   4. ⚠️ ACCUMULATE-DON'T-DROP: if the window is still BELOW the token gate,
@@ -109,6 +114,7 @@ def drain_session(
         find_kg_positions,
         extract_answer_window,
         match_position_for_query,
+        match_position_by_timestamp,
         token_estimate,
     )
     from claude_mcp_servers.rl_client.citation_pending import (
@@ -169,9 +175,27 @@ def drain_session(
             messages, kg_positions, query_snippet, pos_idx
         )
         if matched is None:
-            # Could not locate this search in the transcript yet — leave it.
-            summary["left"] += 1
-            continue
+            # v0.2.77 9-bis — hook-cohort citation-label recovery.
+            #
+            # The hook path (task_type "pre_edit_kg_search", source "hook") stages
+            # a hook-DERIVED query that never appears verbatim as a KG tool_use in
+            # the transcript, so match_position_for_query can NEVER locate it and
+            # ~87% of retrievals (the hook cohort) died unlabeled at the TTL sweep
+            # — defeating F-QUEUE's stated purpose of recovering exactly that
+            # cohort. When (and only when) the query-match fails AND this is a
+            # hook-source payload, anchor the answer window by TIMESTAMP: the
+            # first assistant message stamped at/after the retrieval's ts_ms is
+            # the start of the answer it fed into. The window then flows through
+            # the SAME 25k gate + terminal floor below — no schema change, no
+            # opt-out change, only a different anchor for a payload the
+            # query-matcher structurally can't serve. Non-hook (mcp) payloads keep
+            # the exact current behaviour: a failed query-match still leaves them.
+            if payload.get("source") == "hook":
+                matched = match_position_by_timestamp(messages, payload.get("ts_ms"))
+            if matched is None:
+                # Could not locate this search in the transcript yet — leave it.
+                summary["left"] += 1
+                continue
 
         start_msg_idx, start_blk_idx = matched
         answer, _complete = extract_answer_window(messages, start_msg_idx, start_blk_idx)
