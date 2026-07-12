@@ -18,6 +18,11 @@ Environment variables:
   CODE_EMBED_PORT         Server port (default: 11440)
   CODE_EMBED_BATCH_SIZE   Max batch size (default: 32)
   CODE_EMBED_MAX_CONCURRENT  Max in-flight requests before shedding with 503 (default: 4)
+  CODE_EMBED_IDLE_UNLOAD_SECS  Idle seconds before the GPU model (~7.25 GB CodeSage
+                          weights) is unloaded to free VRAM; the next request
+                          transparently lazy-reloads it. 0 = never unload
+                          (keep resident for the process lifetime). Default: 300.
+                          gpu backend only — the ollama backend holds no in-process weights.
   OLLAMA_URL              Ollama API URL (default: http://localhost:11435)
   CODE_EMBED_INSTRUCTION  Query instruction prefix (default: "" — CodeSage needs none)
   CODE_EMBED_MAX_SEQ_LEN  Max sequence length (default: model default)
@@ -59,6 +64,24 @@ DTYPE = os.getenv("CODE_EMBED_DTYPE", "bfloat16")
 PORT = int(os.getenv("CODE_EMBED_PORT", "11440"))
 BATCH_SIZE = int(os.getenv("CODE_EMBED_BATCH_SIZE", "32"))
 MAX_CONCURRENT = int(os.getenv("CODE_EMBED_MAX_CONCURRENT", "4"))  # max in-flight requests before shed
+
+
+def _resolve_idle_unload_secs() -> float:
+    """Idle seconds before the GPU model is unloaded. 0 = never; a bad/negative
+    value coerces to the 300 s default (conservative: never a shorter-than-asked
+    window that would thrash the reload). Read once at import — the timer honours
+    it for the process lifetime."""
+    raw = os.getenv("CODE_EMBED_IDLE_UNLOAD_SECS", "300")
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return 300.0
+    if val < 0:
+        return 300.0
+    return val
+
+
+IDLE_UNLOAD_SECS = _resolve_idle_unload_secs()  # 0 = never unload
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
 INSTRUCTION = os.getenv("CODE_EMBED_INSTRUCTION", "")
 MAX_SEQ_LEN = os.getenv("CODE_EMBED_MAX_SEQ_LEN", "")
@@ -80,6 +103,12 @@ else:
 # Backend: GPU (sentence-transformers)
 # ---------------------------------------------------------------------------
 _st_model = None  # lazy-loaded
+# v0.2.79 §C: cache the embedding dimension the first time the model loads. It
+# is a fixed model property, so ``/health`` can report ``dim`` WITHOUT forcing a
+# reload of an idle-unloaded model — otherwise every liveness probe would
+# immediately re-materialise the 7.25 GB weights and the model would never stay
+# unloaded. Survives unload (``_st_model = None`` does not clear this).
+_st_model_dim: int | None = None
 
 
 def _load_gpu_model():
@@ -127,6 +156,8 @@ def _load_gpu_model():
 
     _st_model = SentenceTransformer(MODEL_NAME, **kwargs)
     dim = _st_model.get_sentence_embedding_dimension()
+    global _st_model_dim
+    _st_model_dim = dim  # cache for /health so idle-unload survives liveness probes
     logger.info("Model loaded in %.1fs — dim=%d, device=%s", time.time() - t0, dim, device)
     return _st_model
 
@@ -238,6 +269,134 @@ def _should_shed() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Idle model unload (v0.2.79 §C) — release the ~7.25 GB CodeSage VRAM when idle
+# ---------------------------------------------------------------------------
+# ``_st_model`` holds the CodeSage-Large-v2 weights (~7.25 GB VRAM) for the
+# process lifetime. On a workstation the user shares the GPU with other tools,
+# so we unload the weights after ``IDLE_UNLOAD_SECS`` of no ``/embed`` traffic
+# and lazy-reload them on the next request (``_load_gpu_model`` is already lazy).
+#
+# ``_last_used`` is a MONOTONIC timestamp (``time.monotonic``, not wall clock —
+# immune to NTP steps) stamped by both endpoints on every request. It seeds to
+# "now" at import so a service that never receives a request still ages toward
+# the idle deadline from startup rather than from epoch 0.
+_last_used: float = time.monotonic()
+_idle_task: "asyncio.Task | None" = None
+
+
+def _stamp_used() -> None:
+    """Record request activity for the idle-unload timer. Called by both
+    endpoints. Monotonic so an NTP/clock adjustment never makes the model look
+    idle (or busy) spuriously."""
+    global _last_used
+    _last_used = time.monotonic()
+
+
+async def _maybe_unload_idle_model(now: float | None = None) -> bool:
+    """Unload the GPU model if it has been idle past ``IDLE_UNLOAD_SECS``.
+
+    Returns True iff a model was actually unloaded. Safe to call with any
+    backend and whether or not a model is loaded — a no-op in every case where
+    the condition isn't met.
+
+    CRITICAL (v0.2.79 §C, review C.3): the unload MUST acquire the SAME
+    ``_inference_lock`` the endpoints hold across ``run_in_executor(encode)``,
+    and re-check the idle condition UNDER the lock (double-checked locking).
+    Both ``/embed`` endpoints hold that lock for the whole executor await, and
+    the reload path (``embed`` → ``_embed_gpu`` → ``_load_gpu_model``) also runs
+    inside it. Without the lock, ``torch.cuda.empty_cache()`` could free buffers
+    a concurrent executor-thread ``encode`` still references → CUDA fault /
+    corrupt embeddings.
+    """
+    global _st_model
+    if BACKEND != "gpu" or IDLE_UNLOAD_SECS <= 0:
+        return False
+    if _st_model is None:
+        return False
+    if now is None:
+        now = time.monotonic()
+    # Cheap pre-check OUTSIDE the lock to avoid taking it every poll. The
+    # authoritative re-check happens UNDER the lock below.
+    if _in_flight != 0 or (now - _last_used) <= IDLE_UNLOAD_SECS:
+        return False
+
+    async with _get_lock():
+        # Double-checked: re-evaluate under the lock. ``_in_flight`` and
+        # ``_last_used`` can change between the pre-check and acquiring the
+        # lock (a request may have arrived and incremented ``_in_flight``
+        # before taking the lock itself). Recompute ``now`` so a request that
+        # landed during lock contention refreshes the idle window.
+        now = time.monotonic()
+        if _st_model is None or _in_flight != 0 or (now - _last_used) <= IDLE_UNLOAD_SECS:
+            return False
+
+        # C.2: log before/after allocated VRAM for observability. This frees the
+        # WEIGHTS (~7.25 GB), not the CUDA context (a few hundred MB persists
+        # per-process until exit) — an expected, documented residual.
+        before = _cuda_memory_allocated()
+        _st_model = None
+        _empty_cuda_cache()
+        after = _cuda_memory_allocated()
+        if before is not None and after is not None:
+            logger.info(
+                "Idle-unloaded GPU model after %.0fs idle — VRAM allocated "
+                "%.0f MB → %.0f MB (freed %.0f MB; CUDA context residual "
+                "persists until process exit)",
+                now - _last_used, before / 1e6, after / 1e6,
+                max(0.0, (before - after)) / 1e6,
+            )
+        else:
+            logger.info(
+                "Idle-unloaded GPU model after %.0fs idle (torch.cuda "
+                "memory stats unavailable — cpu/mps backend or no CUDA)",
+                now - _last_used,
+            )
+        return True
+
+
+def _cuda_memory_allocated() -> float | None:
+    """Return the currently-allocated CUDA bytes, or None when torch/CUDA is
+    unavailable (cpu/mps backend, no GPU). Best-effort observability only —
+    never raises."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return float(torch.cuda.memory_allocated())
+    except Exception:  # noqa: BLE001 — observability must never crash the timer
+        pass
+    return None
+
+
+def _empty_cuda_cache() -> None:
+    """Return freed CUDA blocks to the driver. Guarded: ``empty_cache`` is
+    CUDA-only, so a cpu/mps host (or a box without torch) must never crash the
+    idle timer — soft-fail to a no-op (review C.2 requirement)."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001 — cuda-only op; cpu/mps → harmless no-op
+        pass
+
+
+async def _idle_unload_loop(poll_secs: float) -> None:
+    """Background task: periodically check whether the GPU model has gone idle
+    and unload it if so. Runs for the process lifetime; cancellation (shutdown)
+    is a clean exit."""
+    try:
+        while True:
+            await asyncio.sleep(poll_secs)
+            try:
+                await _maybe_unload_idle_model()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 — one bad poll must not kill the loop
+                logger.warning("Idle-unload check failed (continuing): %s", e)
+    except asyncio.CancelledError:
+        return
+
+
+# ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Code Embedding Service", version="1.0.0")
@@ -278,6 +437,7 @@ async def embed_endpoint(req: EmbedRequest):
 
     sem = _get_semaphore()
     _in_flight += 1
+    _stamp_used()  # v0.2.79 §C: mark activity so the idle-unload timer resets
     try:
         async with sem:
             t0 = time.time()
@@ -290,6 +450,7 @@ async def embed_endpoint(req: EmbedRequest):
             elapsed = time.time() - t0
     finally:
         _in_flight -= 1
+        _stamp_used()  # re-stamp on completion — idle measured from last activity
 
     dim = len(vecs[0]) if vecs else 0
     logger.info(
@@ -336,6 +497,7 @@ async def ollama_compat_endpoint(req: OllamaEmbedRequest):
         )
 
     _in_flight += 1
+    _stamp_used()  # v0.2.79 §C: mark activity so the idle-unload timer resets
     try:
         async with _get_semaphore():
             async with _get_lock():
@@ -343,13 +505,23 @@ async def ollama_compat_endpoint(req: OllamaEmbedRequest):
                 vecs = await loop.run_in_executor(None, embed, [req.prompt], False)
     finally:
         _in_flight -= 1
+        _stamp_used()  # re-stamp on completion — idle measured from last activity
     return {"embedding": vecs[0]}
 
 
 @app.get("/health")
 async def health():
     try:
-        dim = get_dim()
+        # v0.2.79 §C: for the gpu backend, do NOT force a model reload just to
+        # report ``dim`` — a liveness probe hitting /health must not undo an
+        # idle-unload. Use the dim cached at first load; only fall through to
+        # ``get_dim()`` (which may load) when the model has never loaded yet.
+        if BACKEND == "gpu":
+            dim = _st_model_dim if _st_model_dim is not None else get_dim()
+            model_loaded = _st_model is not None
+        else:
+            dim = get_dim()
+            model_loaded = True  # ollama backend holds no in-process weights
         return {
             "status": "ok",
             "backend": BACKEND,
@@ -362,6 +534,9 @@ async def health():
             # actually meant "in flight", not "queued"; the key was mis-named).
             "in_flight": _in_flight,
             "inference_busy": _get_lock().locked(),
+            # v0.2.79 §C: idle-unload observability.
+            "model_loaded": model_loaded,
+            "idle_unload_secs": IDLE_UNLOAD_SECS,
         }
     except Exception as e:
         # Log the full error internally; return only a generic message in the
@@ -374,10 +549,43 @@ async def health():
 
 @app.on_event("startup")
 async def startup():
+    global _idle_task
     logger.info("Starting code embedding service: backend=%s model=%s port=%d", BACKEND, MODEL_NAME, PORT)
     if BACKEND == "gpu":
         # Pre-load model on startup
         _load_gpu_model()
+        # Fresh activity stamp so the idle window starts from a loaded model,
+        # not from import time (which may predate the pre-load by seconds).
+        _stamp_used()
+        # v0.2.79 §C: launch the idle-unload timer (gpu backend only; the
+        # ollama backend holds no in-process weights). Poll cadence is a
+        # fraction of the idle window (min 5 s, max 60 s) so an idle model is
+        # freed within roughly one poll of crossing the deadline.
+        if IDLE_UNLOAD_SECS > 0:
+            poll = max(5.0, min(60.0, IDLE_UNLOAD_SECS / 10.0))
+            _idle_task = asyncio.create_task(_idle_unload_loop(poll))
+            logger.info(
+                "Idle-unload timer active: model unloads after %.0fs idle "
+                "(poll every %.0fs); set CODE_EMBED_IDLE_UNLOAD_SECS=0 to disable",
+                IDLE_UNLOAD_SECS, poll,
+            )
+        else:
+            logger.info(
+                "Idle-unload disabled (CODE_EMBED_IDLE_UNLOAD_SECS=0) — GPU model "
+                "stays resident for the process lifetime"
+            )
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    global _idle_task
+    if _idle_task is not None:
+        _idle_task.cancel()
+        try:
+            await _idle_task
+        except asyncio.CancelledError:
+            pass
+        _idle_task = None
 
 
 # ---------------------------------------------------------------------------

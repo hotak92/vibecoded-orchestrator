@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.79] - 2026-07-12
+
+### Fixed
+- **Orchestrator updates no longer stop on the divergence modal when the merge
+  would actually succeed.** Having files from a previous build present is the
+  normal state of an update, not a conflict. Previously, if any tracked file was
+  locally modified *and* also changed upstream, the update showed the "local
+  clone has diverged" modal even when the merge itself was clean. Now, before
+  falling back to the modal, the update probes whether the `--autostash` pop
+  would actually conflict on each such file (a per-file 3-way check against the
+  real merged result); if every one merges cleanly, the update proceeds
+  automatically. Genuine conflicts still surface the modal, and the existing
+  post-merge safety net still catches anything the probe can't prove — so no
+  local edit is ever silently lost. Locally-rebuilt launcher binaries under
+  `launcher/dist/` are excluded from this check (the update regenerates them).
+
+### Changed
+- **Embedding parallelism now gates on live *available* RAM, sampled in real
+  time.** The per-machine embed-concurrency budget previously used total RAM
+  measured once at install. On a machine where other applications are using
+  memory, that could over-commit. The admission gate now checks live available
+  memory before starting each additional embedding worker and waits if memory is
+  tight, while always allowing at least one worker to run (never stalls). The GPU
+  (VRAM) path is unchanged.
+- **The code-embedding service now releases its GPU model after 5 minutes idle.**
+  The CodeSage model (~7 GB of VRAM) previously stayed resident for the life of
+  the process. It now unloads after a configurable idle period
+  (`CODE_EMBED_IDLE_UNLOAD_SECS`, default 300; 0 disables) and lazily reloads on
+  the next request, freeing VRAM when embedding is idle. The unload is
+  concurrency-safe (it never frees memory an in-flight request is using). The
+  text-embedding (Ollama) model is intentionally left resident for latency.
+
 ## [0.2.78] - 2026-07-11
 
 ### Fixed

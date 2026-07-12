@@ -378,21 +378,32 @@ pub(crate) fn detect_ram_gb_sysinfo() -> u64 {
     (bytes as f64 / 1024.0 / 1024.0 / 1024.0).round() as u64
 }
 
-/// Parse the `MemTotal:` line out of `/proc/meminfo` content.
-/// Returns the value in kB. Public for testing.
-pub fn parse_meminfo_total_kb(meminfo: &str) -> Option<u64> {
+/// Parse an arbitrary `<Field>:` line out of `/proc/meminfo` content, returning
+/// its value in kB. The single-source primitive for every `/proc/meminfo`
+/// field read in the launcher (`MemTotal:` here for install-time RAM detection,
+/// `MemAvailable:` for the runtime embed-admission memory gate in
+/// `commands::embed_admission`) — do NOT hand-roll a second copy of this
+/// strip-prefix / first-token / parse loop (CLAUDE.md: extract-before-duplicate).
+///
+/// `field` is the literal line prefix INCLUDING the trailing colon
+/// (e.g. `"MemTotal:"`). Returns `None` when the field is absent or malformed.
+/// Public for testing + cross-module reuse.
+pub fn parse_meminfo_field_kb(meminfo: &str, field: &str) -> Option<u64> {
     for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("MemTotal:") {
+        if let Some(rest) = line.strip_prefix(field) {
             // Expected: "MemTotal:       65857132 kB"
-            let kb: u64 = rest
-                .split_whitespace()
-                .next()?
-                .parse()
-                .ok()?;
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
             return Some(kb);
         }
     }
     None
+}
+
+/// Parse the `MemTotal:` line out of `/proc/meminfo` content.
+/// Returns the value in kB. Public for testing. Thin wrapper over
+/// [`parse_meminfo_field_kb`] — the shared parse lives there.
+pub fn parse_meminfo_total_kb(meminfo: &str) -> Option<u64> {
+    parse_meminfo_field_kb(meminfo, "MemTotal:")
 }
 
 /// Snap MemTotal (kB) to the closest common DDR stick capacity in

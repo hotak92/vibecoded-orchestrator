@@ -1231,21 +1231,79 @@ fn win_quote(s: &str) -> String {
 /// `compute_theirs_sha`) — we pass a concrete SHA rather than the
 /// `vco_upstream/<branch>` ref so this can't race an upstream push that
 /// lands between the fetch and the probe.
+///
+/// v0.2.79 §A: this is now the thin boolean VIEW over
+/// `committed_divergence_merged_tree_oid` (the SSOT that also feeds the
+/// pop-probe). `resolve_divergence_pull_plan` consumes the OID helper directly
+/// (it needs the tree, not just the bool), so this wrapper's only in-tree
+/// callers are the v0.2.56 probe tests that assert the boolean contract — hence
+/// `allow(dead_code)` outside `cfg(test)`. Keep it: it documents + pins the
+/// clean/conflict semantics independently of the OID plumbing.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn committed_divergence_merges_cleanly(
     install_path: &Path,
     theirs: &str,
 ) -> Result<bool, String> {
+    // Derive the boolean from the SAME `merge-tree --write-tree` call the
+    // v0.2.79 pop-probe uses to read the merged tree (one source of truth —
+    // see `committed_divergence_merged_tree_oid`). `Some(oid)` = clean merge
+    // (exit 0), `None` = conflict / merge-couldn't-start (any non-zero).
+    Ok(committed_divergence_merged_tree_oid(install_path, theirs)
+        .await?
+        .is_some())
+}
+
+/// v0.2.79 §A — run `git merge-tree --write-tree HEAD <theirs>` and return the
+/// resulting merged-tree OID when the committed divergence merges cleanly.
+///
+/// This is the shared primitive behind BOTH:
+///   * `committed_divergence_merges_cleanly` (the boolean gate — `is_some()`), and
+///   * the v0.2.79 pop-probe (`pop_probe_all_clean`), which reads per-file blobs
+///     out of `<merged-tree-oid>` to model what the `--autostash` POP will see.
+///
+/// Exit-code contract (git >= 2.38, `man git-merge-tree`): exit 0 = clean
+/// (stdout's FIRST line is the merged-tree OID), exit 1 = content conflict,
+/// exit >=2 (git uses 128) = the merge couldn't even start (unrelated
+/// histories / missing object). Verified empirically on git 2.43:
+///   - non-overlapping edits on different lines → exit 0, single-line OID;
+///   - same-line divergent edits → exit 1, multi-section stdout.
+///
+/// Returns:
+///   - `Ok(Some(oid))` — clean; `oid` is the merged tree, readable via
+///     `git show <oid>:<path>` for any path present in the merged tree.
+///   - `Ok(None)` — conflict (exit 1) OR merge couldn't start (>=2): every
+///     non-zero outcome is conservatively "not clean" (no OID).
+///   - `Err(_)` — subprocess spawn failure ONLY (caller treats as "can't
+///     probe" → conservative FfOnly).
+pub(crate) async fn committed_divergence_merged_tree_oid(
+    install_path: &Path,
+    theirs: &str,
+) -> Result<Option<String>, String> {
     let out = tokio::process::Command::new("git").silent()
         .args(["merge-tree", "--write-tree", "HEAD", theirs])
         .current_dir(install_path)
         .output()
         .await
         .map_err(|e| format!("git merge-tree spawn failed: {}", e))?;
-    // Exit 0 = clean merge. Exit 1 = conflicts. Any other non-zero
-    // (git uses 128 for fatal errors like unrelated histories / missing
-    // object, not 2) = the merge couldn't even start. Only exit 0 is
-    // safe to auto-merge; EVERY non-zero outcome keeps the modal.
-    Ok(out.status.success())
+    if !out.status.success() {
+        // Exit 1 (conflict) or >=2 (couldn't start) → no clean tree.
+        return Ok(None);
+    }
+    // Exit 0: the first stdout line is the merged-tree OID. (On a clean merge
+    // that's the ONLY line; the extra "Conflicted file info" / message sections
+    // only appear on the exit-1 path, which we already returned None for.)
+    let oid = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if oid.is_empty() {
+        // Defensive: exit 0 but no OID printed (shouldn't happen) → treat as
+        // "can't prove a usable tree" rather than fabricate one.
+        Ok(None)
+    } else {
+        Ok(Some(oid))
+    }
 }
 
 /// v0.2.58: the precise pop-conflict-risk check that replaces the blunt
@@ -1371,6 +1429,214 @@ pub(crate) async fn tracked_modified_overlapping_upstream(
 }
 
 // ---------------------------------------------------------------------------
+// v0.2.79 §A — pop-probe: model the `--autostash` POP per risk file
+// ---------------------------------------------------------------------------
+//
+// THE PROBLEM v0.2.79 §A solves: pre-v0.2.79, `resolve_divergence_pull_plan`
+// bailed straight to `FfOnly` (the divergence modal) the moment the
+// `tracked-modified ∩ upstream-changed` pop-conflict-risk set was NON-EMPTY.
+// But a NON-EMPTY risk set does NOT mean the `--autostash` POP would actually
+// conflict: the pop is a 3-way merge (base = pre-merge HEAD:file, and the two
+// sides are the merged-result:file and the user's working edit), and that
+// 3-way can be perfectly clean even when both HEAD and upstream touched the
+// file — as long as the edits don't overlap. The user's report (2026-07-12,
+// ×2): "we must NOT stop on the modal when files from a previous build are
+// present — that's EXPECTED." The defensive fix: before bailing, PROBE whether
+// the pop would conflict; if every risk file pop-probes clean, route to
+// `RealMerge` instead of the modal.
+//
+// DATA-SAFETY (A.3): the pop-probe is an OPTIMIZATION, not the safety net of
+// record. It uses `git merge-file` (line-based, content-only), while the real
+// pop uses merge-ort (rename/mode/symlink aware), so the probe CAN false-CLEAN
+// on rare tree-aware cases (mode-only change, rename-with-edit). This is NOT
+// silent data loss: BOTH update surfaces already run a post-pull autostash-pop
+// BACKSTOP (installer.rs:~4638-4700 + self_update.rs:~798-831) that detects the
+// `UU`/dangling-stash AFTER a RealMerge exits 0 and routes to the modal without
+// proceeding on a broken tree — the stash stays intact, the flow aborts before
+// install.py/restart. The pop-probe only avoids the modal on the common CLEAN
+// case; the backstop absorbs its false-CLEANs. NEVER remove that backstop.
+
+/// Paths to EXCLUDE from the pop-conflict-risk set before pop-probing (A.6).
+///
+/// `launcher/dist/**` holds the compiled launcher/hub/updater binaries. On a
+/// compile-from-source install, `install.py --update` REGENERATES these
+/// immediately AFTER the merge, so their merge-time content is moot — a
+/// dirtied dist binary should not force the divergence modal. Worse, a rebuilt
+/// binary vs a merged binary is a BINARY 3-way: `do_3way_merge`'s NUL heuristic
+/// would return `Err` → the probe conservatively keeps it in the risk set →
+/// modal, re-introducing the exact complaint. Excluding these exact regenerated
+/// paths is safe because they are overwritten post-merge regardless.
+///
+/// Scope: TIGHT — only `launcher/dist/` (NOT a broad `*bin*` / `*.wasm` glob).
+/// A download-user never dirties dist, so this exclusion is a NO-OP for the
+/// primary (binary-download) case; it only helps compile-from-source users.
+const DIST_BINARY_EXCLUDE_PREFIXES: &[&str] = &["launcher/dist/"];
+
+/// True when `rel_path` is a regenerated dist binary that should be excluded
+/// from the pop-conflict-risk set before probing (A.6). Path separators are
+/// normalised to `/` first so this matches on Windows (`launcher\dist\...`).
+fn is_dist_binary_excluded(rel_path: &str) -> bool {
+    let normalised = rel_path.replace('\\', "/");
+    DIST_BINARY_EXCLUDE_PREFIXES
+        .iter()
+        .any(|prefix| normalised.starts_with(prefix))
+}
+
+/// Outcome of pop-probing a single risk file.
+#[derive(Debug, PartialEq, Eq)]
+enum PopProbe {
+    /// The `--autostash` POP would apply cleanly for this file → does not
+    /// block the auto-merge.
+    Clean,
+    /// The POP would conflict (content conflict, OR a tree-op like
+    /// modify/delete or add-over-modified) → the whole plan must stay FfOnly.
+    Conflict,
+}
+
+/// v0.2.79 §A — pop-probe ONE risk-set file: would the `--autostash` POP
+/// conflict for it?
+///
+/// Models the real stash-pop 3-way (verified empirically — reviews/
+/// v0279-plan-review-2026-07-12.md §A.1):
+///   * base   = `HEAD:<file>` (the pre-merge HEAD — the tree the stash is
+///              recorded against; NOT the merge-base, which can differ),
+///   * ours   = the working-tree bytes of `<file>` (the user's uncommitted edit),
+///   * theirs = `<merged_tree_oid>:<file>` (what the merge produced).
+/// (OURS/THEIRS labels only affect marker text, not the clean/conflict exit —
+/// verified — so this orientation decides conflict-vs-clean correctly.)
+///
+/// A.2 TREE-OP GUARD (runs FIRST, before any content merge): if the file is
+/// DELETED by the merge (`read_blob_at_rev(merged_tree_oid, file) == Ok(None)`)
+/// or ADDED by the merge over a tracked-modified path
+/// (`read_blob_at_rev(HEAD, file) == Ok(None)`), the real pop is ALWAYS a
+/// modify/delete (or add/add) conflict. Decide that as `Conflict` DIRECTLY —
+/// do NOT feed an empty side to `merge-file` and rely on the incidental
+/// empty-side conflict (that invariant is fragile; make it explicit).
+///
+/// Best-effort: any git/IO error → `Conflict` (conservative — an unprovable
+/// file must not be waved through to a silent auto-merge).
+async fn pop_probe_file(
+    install_path: &Path,
+    head: &str,
+    merged_tree_oid: &str,
+    file: &str,
+) -> PopProbe {
+    // A.2 — THEIRS side (merged tree). Ok(None) = deleted-by-merge → modify/delete.
+    let theirs = match read_blob_at_rev(install_path, merged_tree_oid, file).await {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            eprintln!(
+                "[vct] pop_probe_file: {} is deleted-by-merge (absent from merged tree) — \
+                 modify/delete conflict → keeping FfOnly.",
+                file
+            );
+            return PopProbe::Conflict;
+        }
+        Err(e) => {
+            eprintln!(
+                "[vct] pop_probe_file: read merged-tree blob for {} failed ({}) — \
+                 conservative Conflict.",
+                file, e
+            );
+            return PopProbe::Conflict;
+        }
+    };
+    // A.2 — BASE side (pre-merge HEAD). Ok(None) = added-over-a-tracked-modified
+    // path (shouldn't happen — a risk-set file is tracked-modified, so it IS at
+    // HEAD — but decide it explicitly rather than merging an empty base).
+    let base = match read_blob_at_rev(install_path, head, file).await {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            eprintln!(
+                "[vct] pop_probe_file: {} absent at HEAD but in the tracked-modified risk set \
+                 (add-over-modified) — conflict → keeping FfOnly.",
+                file
+            );
+            return PopProbe::Conflict;
+        }
+        Err(e) => {
+            eprintln!(
+                "[vct] pop_probe_file: read HEAD blob for {} failed ({}) — conservative Conflict.",
+                file, e
+            );
+            return PopProbe::Conflict;
+        }
+    };
+    // OURS side = current working-tree bytes (the user's uncommitted edit).
+    let ours = match tokio::fs::read(install_path.join(file)).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!(
+                "[vct] pop_probe_file: read working-tree bytes for {} failed ({}) — \
+                 conservative Conflict.",
+                file, e
+            );
+            return PopProbe::Conflict;
+        }
+    };
+    // A.5 — REUSE the existing tested 3-way primitive (`do_3way_merge`); do NOT
+    // hand-roll a second `git merge-file`. It handles the binary-NUL heuristic
+    // (→ Err) and the exit-code mapping. `Err` (binary content, subprocess
+    // failure) → conservative Conflict (can't prove clean).
+    match do_3way_merge(&ours, &base, &theirs).await {
+        Ok(ThreeWayResult::Clean(_)) => PopProbe::Clean,
+        Ok(ThreeWayResult::Conflict) => {
+            eprintln!(
+                "[vct] pop_probe_file: 3-way pop-probe CONFLICTS for {} → keeping FfOnly.",
+                file
+            );
+            PopProbe::Conflict
+        }
+        Err(e) => {
+            eprintln!(
+                "[vct] pop_probe_file: 3-way pop-probe errored for {} ({}) — conservative \
+                 Conflict.",
+                file, e
+            );
+            PopProbe::Conflict
+        }
+    }
+}
+
+/// v0.2.79 §A — would the `--autostash` POP apply cleanly for EVERY file in the
+/// pop-conflict-risk set (after excluding regenerated dist binaries, A.6)?
+///
+/// Returns `true` ONLY when every remaining risk file pop-probes `Clean`. Any
+/// single `Conflict` (content OR tree-op) → `false` (the plan stays FfOnly).
+/// An empty risk set (all excluded, or none to begin with) → `true` trivially —
+/// but note the caller only invokes this when the risk set is non-empty.
+///
+/// `head` is the pre-merge HEAD (the stash base); `merged_tree_oid` is from
+/// `committed_divergence_merged_tree_oid`. Excludes `launcher/dist/**` first
+/// (A.6): those are overwritten by `install.py --update` right after the merge,
+/// so their merge-time content is moot and a binary 3-way would falsely block.
+async fn pop_probe_all_clean(
+    install_path: &Path,
+    head: &str,
+    merged_tree_oid: &str,
+    risk: &[String],
+) -> bool {
+    for file in risk {
+        // Sentinel entries from the risk-check's error paths
+        // ("<status-read-failed>", "<risk-check-failed>", "<no-merge-base>")
+        // are not real files — they mean "we couldn't prove safety". A caller
+        // never reaches here with those (they short-circuit to FfOnly upstream),
+        // but be defensive: treat as unprovable → not clean.
+        if file.starts_with('<') {
+            return false;
+        }
+        // A.6 — regenerated dist binaries are overwritten post-merge; skip.
+        if is_dist_binary_excluded(file) {
+            continue;
+        }
+        if pop_probe_file(install_path, head, merged_tree_oid, file).await == PopProbe::Conflict {
+            return false;
+        }
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
 // Shared divergence pull-strategy decision (v0.2.71 Piece 3)
 // ---------------------------------------------------------------------------
 
@@ -1483,11 +1749,11 @@ pub(crate) fn is_pull_conflict(err: &str) -> bool {
         || lower.contains("autostash")
 }
 
-/// Decide the pull strategy for a divergence-aware update. This is the EXACT
-/// logic that lived inline in `update_orchestrator` (installer.rs, pre-v0.2.71)
-/// — extracted verbatim so the two update surfaces share ONE decision.
+/// Decide the pull strategy for a divergence-aware update. This is the SINGLE
+/// source of truth shared by both update surfaces (installer::update_orchestrator
+/// and self_update::apply_launcher_update).
 ///
-/// Decision tree (preserved from the inline block):
+/// Decision tree (v0.2.79 §A — the pop-probe generalises the v0.2.58 gate):
 ///   - `pre_merge_committed` (the A0 pre-merge synthesized a commit) →
 ///     `RebaseAutostash` (the rebase arm owns the advanced HEAD).
 ///   - else resolve `theirs` (upstream tip):
@@ -1495,20 +1761,31 @@ pub(crate) fn is_pull_conflict(err: &str) -> bool {
 ///         the bare pull surfaces the real error / the modal).
 ///       - `Ok(Some(theirs))`:
 ///           - compute `base` (merge-base; `None`/`Err` → flattened to None).
-///           - `pop_conflict_risk`:
-///               - base `Some` → `tracked_modified_overlapping_upstream`
-///                 (Err → sentinel "<risk-check-failed>" = risky).
-///               - base `None` → sentinel "<no-merge-base>" = risky.
-///           - if `pop_conflict_risk` NON-empty → `FfOnly` (the modal
-///             surfaces if non-FF; never --autostash over a real overlap).
-///           - else `committed_divergence_merges_cleanly`:
-///               - `Ok(true)` → `RealMerge`.
-///               - `Ok(false)` / `Err` → `FfOnly`.
+///           - `pop_conflict_risk` = `tracked_modified_overlapping_upstream`
+///             (base `Some`; Err → sentinel = risky) or sentinel (base `None`).
+///           - compute the merged-tree OID via
+///             `committed_divergence_merged_tree_oid`:
+///               - `None` (committed divergence conflicts / probe failed) →
+///                 `FfOnly` ALWAYS (never auto-merge over a real merge conflict).
+///               - `Some(oid)` (the merge itself is clean):
+///                   - `pop_conflict_risk` EMPTY → `RealMerge` (the common
+///                     committed-KG-divergence case).
+///                   - `pop_conflict_risk` NON-EMPTY → pop-probe each risk file
+///                     against `oid` (v0.2.79 §A; dist binaries excluded):
+///                       - every file pop-probes CLEAN → `RealMerge` (no modal).
+///                       - any file pop-probes CONFLICT → `FfOnly`.
+///
+/// PRE-v0.2.79 a NON-EMPTY pop_conflict_risk short-circuited to `FfOnly`
+/// immediately; the pop-probe now checks whether the `--autostash` POP would
+/// ACTUALLY conflict before bailing to the modal (user report 2026-07-12:
+/// "don't stop on the modal when files from a previous build are present").
+///
+/// DATA-SAFETY: the pop-probe is an OPTIMISATION (line-based); the post-pull
+/// autostash-pop BACKSTOP on both surfaces (installer.rs + self_update.rs) is the
+/// safety net of record that catches any tree-aware false-CLEAN after the fact.
 ///
 /// Best-effort throughout: any resolution/probe failure keeps `FfOnly` so the
 /// legacy non-FF path surfaces the modal — we never auto-merge on uncertainty.
-/// The `eprintln!` diagnostics match the originals so existing log-based
-/// debugging is unchanged.
 pub(crate) async fn resolve_divergence_pull_plan(
     repo: &Path,
     branch: &str,
@@ -1544,39 +1821,76 @@ pub(crate) async fn resolve_divergence_pull_plan(
                     vec!["<no-merge-base>".to_string()]
                 }
             };
-            if !pop_conflict_risk.is_empty() {
-                eprintln!(
-                    "[vct] resolve_divergence_pull_plan: {} tracked file(s) locally-modified AND \
-                     upstream-changed (autostash-pop-conflict risk) — keeping --ff-only; \
-                     modal surfaces if non-FF.",
-                    pop_conflict_risk.len()
-                );
-                PullPlan::FfOnly
-            } else {
-                // Tree carries no pop-conflict risk. Now confirm the merge
-                // itself is conflict-free (stateless merge-tree).
-                match committed_divergence_merges_cleanly(repo, &theirs).await {
-                    Ok(clean) => {
-                        if clean {
-                            eprintln!(
-                                "[vct] resolve_divergence_pull_plan: committed local divergence \
-                                 merges cleanly with upstream AND no pop-conflict risk — routing \
-                                 through a real merge (no modal)."
-                            );
-                            PullPlan::RealMerge
-                        } else {
-                            PullPlan::FfOnly
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[vct] resolve_divergence_pull_plan: merge-tree probe failed ({}) — \
-                             keeping --ff-only; modal will surface on non-FF.",
-                            e
-                        );
-                        PullPlan::FfOnly
-                    }
+            // Compute the merged-tree OID ONCE up front (stateless merge-tree,
+            // writes NOTHING to the working tree/index). It gates BOTH arms:
+            //   * Some(oid) = the committed divergence merges cleanly — required
+            //     for ANY auto-merge, and (v0.2.79 §A) it is also the THEIRS
+            //     source the pop-probe reads per-file blobs from.
+            //   * None      = conflict / merge-couldn't-start → FfOnly always.
+            //   * Err       = subprocess spawn failure → conservative FfOnly.
+            let merged_tree_oid = match committed_divergence_merged_tree_oid(repo, &theirs).await {
+                Ok(oid) => oid,
+                Err(e) => {
+                    eprintln!(
+                        "[vct] resolve_divergence_pull_plan: merge-tree probe failed ({}) — \
+                         keeping --ff-only; modal will surface on non-FF.",
+                        e
+                    );
+                    None
                 }
+            };
+            let merged_tree_oid = match merged_tree_oid {
+                Some(oid) => oid,
+                // Committed divergence itself conflicts (or the probe couldn't
+                // run) → never auto-merge; keep the modal.
+                None => return PullPlan::FfOnly,
+            };
+
+            if !pop_conflict_risk.is_empty() {
+                // v0.2.79 §A — a NON-EMPTY pop-conflict-risk set does NOT by
+                // itself mean the `--autostash` POP would conflict. The merge
+                // itself is already proven clean (merged_tree_oid is Some);
+                // now PROBE whether the POP (a 3-way per risk file) would
+                // conflict. If every risk file pops clean → RealMerge (no
+                // modal, the user's report); any conflict → FfOnly.
+                //
+                // DATA-SAFETY (A.3): the probe is line-based (git merge-file),
+                // the real pop is tree-aware (merge-ort), so a rare false-CLEAN
+                // is possible. That is NOT silent data loss — the post-pull
+                // autostash-pop BACKSTOP (installer.rs + self_update.rs) detects
+                // any UU/dangling-stash AFTER the RealMerge exits 0 and routes to
+                // the modal without proceeding on a broken tree. The probe only
+                // avoids the modal on the common clean case. Do NOT weaken that
+                // backstop.
+                if pop_probe_all_clean(repo, "HEAD", &merged_tree_oid, &pop_conflict_risk).await {
+                    eprintln!(
+                        "[vct] resolve_divergence_pull_plan: {} tracked file(s) locally-modified \
+                         AND upstream-changed, but the autostash POP pop-probes CLEAN for every \
+                         one (dist binaries excluded) — routing through a real merge (no modal). \
+                         The post-pull backstop remains the safety net for any tree-aware \
+                         false-CLEAN.",
+                        pop_conflict_risk.len()
+                    );
+                    PullPlan::RealMerge
+                } else {
+                    eprintln!(
+                        "[vct] resolve_divergence_pull_plan: {} tracked file(s) locally-modified \
+                         AND upstream-changed, and the autostash POP would CONFLICT for at least \
+                         one — keeping --ff-only; modal surfaces if non-FF.",
+                        pop_conflict_risk.len()
+                    );
+                    PullPlan::FfOnly
+                }
+            } else {
+                // Tree carries no pop-conflict risk AND the merge is clean
+                // (merged_tree_oid is Some) — the common committed-KG-divergence
+                // case. Route through a real merge (no modal).
+                eprintln!(
+                    "[vct] resolve_divergence_pull_plan: committed local divergence merges cleanly \
+                     with upstream AND no pop-conflict risk — routing through a real merge \
+                     (no modal)."
+                );
+                PullPlan::RealMerge
             }
         }
         // Upstream tip not resolvable (no fetch yet / detached) — let the bare
@@ -3883,6 +4197,306 @@ mod tests {
             PullPlan::RealMerge,
             "clean committed divergence should fold via RealMerge on BOTH surfaces"
         );
+    }
+
+    // ───── v0.2.79 §A — pop-probe hardening ─────
+    //
+    // These tests pin the new behaviour: a NON-EMPTY pop-conflict-risk set no
+    // longer short-circuits to FfOnly — the plan pop-probes whether the
+    // `--autostash` POP would actually conflict, and RealMerges when it wouldn't.
+    // They reuse init_repo_pair / push_upstream_change / write_local_mod.
+
+    /// FAILING-FIRST (i): a tracked file locally-modified (uncommitted) in a
+    /// region that DOESN'T overlap upstream's change is BOTH tracked-modified
+    /// AND upstream-changed → in the risk set. Pre-v0.2.79 this returned FfOnly
+    /// (modal) immediately. The pop-probe shows the POP merges cleanly →
+    /// RealMerge. Fails on the pre-change code (which never pop-probed).
+    #[tokio::test]
+    async fn resolve_plan_dirty_but_pop_clean_is_real_merge() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+
+        // Upstream edits the FIRST line of CLAUDE.md (base is "# base\nLine A\nLine B\n").
+        push_upstream_change(&seed, &local, "CLAUDE.md", "# base UPSTREAM\nLine A\nLine B\n");
+        // Local edits a DIFFERENT, non-overlapping line (Line B) — uncommitted.
+        // Same file → tracked-modified ∩ upstream-changed → NON-EMPTY risk set,
+        // but the 3-way POP folds cleanly (disjoint regions).
+        write_local_mod(&local, "CLAUDE.md", "# base\nLine A\nLine B LOCAL\n");
+
+        let plan = resolve_divergence_pull_plan(&local, "main", false).await;
+        assert_eq!(
+            plan,
+            PullPlan::RealMerge,
+            "a tracked file locally-modified in a NON-overlapping region (pop-probes \
+             clean) must RealMerge, NOT bail to the modal (v0.2.79 §A). This FAILS \
+             on the pre-pop-probe code, which returned FfOnly for any non-empty risk set."
+        );
+    }
+
+    /// (ii) dirty-AND-pop-conflicts: local edits the SAME line upstream changed
+    /// (uncommitted) → the POP would conflict → FfOnly (modal preserved).
+    #[tokio::test]
+    async fn resolve_plan_dirty_and_pop_conflicts_is_ff_only() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+
+        // Upstream rewrites Line A.
+        push_upstream_change(&seed, &local, "CLAUDE.md", "# base\nLine A UPSTREAM\nLine B\n");
+        // Local rewrites the SAME line differently (uncommitted) → real POP conflict.
+        write_local_mod(&local, "CLAUDE.md", "# base\nLine A LOCAL\nLine B\n");
+
+        let plan = resolve_divergence_pull_plan(&local, "main", false).await;
+        assert_eq!(
+            plan,
+            PullPlan::FfOnly,
+            "an overlapping same-line local+upstream edit pop-probes CONFLICT → \
+             keep --ff-only so the modal surfaces"
+        );
+    }
+
+    /// (iii) byte-identical F1 fast-path → RealMerge. F1
+    /// (auto_restore_byte_identical_tracked_mods) discards a tracked mod whose
+    /// working bytes == the incoming blob BEFORE resolve_divergence_pull_plan.
+    /// After F1 the tree is clean for that path, so the risk set is empty and
+    /// the plan RealMerges. This composes with the pop-probe (A.4): F1 shrinks
+    /// the risk set; the probe never sees the F1-restored file.
+    #[tokio::test]
+    async fn resolve_plan_byte_identical_f1_fastpath_is_real_merge() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+
+        // Upstream changes CLAUDE.md to a specific new content.
+        let incoming = "# base\nLine A\nLine B\nUPSTREAM ADDED\n";
+        push_upstream_change(&seed, &local, "CLAUDE.md", incoming);
+        // Local working tree happens to hold the EXACT incoming bytes (uncommitted)
+        // — e.g. the user already pulled these via a previous build. F1 must
+        // restore it (byte-identical) so it drops out of the risk set.
+        write_local_mod(&local, "CLAUDE.md", incoming);
+
+        // Run F1 exactly as both update surfaces do, BEFORE the plan.
+        let restored = auto_restore_byte_identical_tracked_mods(&local, "main").await;
+        assert_eq!(restored, 1, "F1 must restore the byte-identical tracked mod");
+
+        let plan = resolve_divergence_pull_plan(&local, "main", false).await;
+        assert_eq!(
+            plan,
+            PullPlan::RealMerge,
+            "after F1 discards the byte-identical mod, the tree is clean for that \
+             path → empty risk set → RealMerge"
+        );
+    }
+
+    /// (iv) REGRESSION GUARD: clean tree, non-FF, committed KG divergence,
+    /// merge-tree clean, EMPTY risk set → RealMerge (the normal 3rd-party
+    /// download-user case). Proves the pop-probe change didn't break the
+    /// common path (this is the pre-v0.2.79 RealMerge case, must stay RealMerge).
+    #[tokio::test]
+    async fn resolve_plan_clean_tree_non_ff_merge_tree_clean_is_real_merge() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+
+        // Upstream advances an unrelated tracked file (non-FF for local).
+        push_upstream_change(&seed, &local, "vco_lib/foo.py", "def base(): pass\ndef up(): pass\n");
+        // Local COMMITS a brand-new KG node upstream never touched (clean tree).
+        commit_local_change(&local, "knowledge/concepts/kguser.md", "# kg\nnode\n");
+        refetch_upstream(&local);
+
+        let plan = resolve_divergence_pull_plan(&local, "main", false).await;
+        assert_eq!(
+            plan,
+            PullPlan::RealMerge,
+            "clean tree + non-FF committed KG divergence with empty risk set must \
+             still RealMerge (regression guard for the common download-user case)"
+        );
+    }
+
+    /// (v) A.2 modify/delete: upstream DELETES a file that is locally-modified
+    /// (uncommitted) in the working tree. merge-tree merges cleanly (deletes
+    /// it), so the file is ABSENT from the merged tree → the A.2 tree-op guard
+    /// classifies it CONFLICT (modify/delete) DIRECTLY → FfOnly.
+    #[tokio::test]
+    async fn resolve_plan_modify_delete_is_ff_only() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+
+        // Upstream DELETES vco_lib/foo.py (it exists in the seed at merge-base).
+        std::fs::remove_file(seed.join("vco_lib/foo.py")).unwrap();
+        run_git(&seed, &["rm", "vco_lib/foo.py"]);
+        run_git(&seed, &["commit", "-m", "upstream deletes foo.py"]);
+        run_git(&seed, &["push", "origin", "main"]);
+        run_git(&local, &["fetch", "vco_upstream"]);
+        // Local MODIFIES the same file (uncommitted) → tracked-modified ∩
+        // upstream-changed (delete counts as a change) → risk set.
+        write_local_mod(&local, "vco_lib/foo.py", "def base(): pass\ndef local_wip(): pass\n");
+
+        let plan = resolve_divergence_pull_plan(&local, "main", false).await;
+        assert_eq!(
+            plan,
+            PullPlan::FfOnly,
+            "upstream-delete of a locally-modified file is a modify/delete conflict \
+             (A.2 tree-op guard) → keep --ff-only"
+        );
+    }
+
+    /// (v-bis) Direct A.2 tree-op guard unit: pop_probe_file returns Conflict
+    /// when the file is deleted-by-merge (absent from the merged tree), WITHOUT
+    /// feeding an empty side to merge-file. Pins the guard as DECIDED, not
+    /// incidental (the review's A.2 concern).
+    #[tokio::test]
+    async fn pop_probe_file_modify_delete_is_conflict_via_tree_op_guard() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+
+        std::fs::remove_file(seed.join("vco_lib/foo.py")).unwrap();
+        run_git(&seed, &["rm", "vco_lib/foo.py"]);
+        run_git(&seed, &["commit", "-m", "delete"]);
+        run_git(&seed, &["push", "origin", "main"]);
+        run_git(&local, &["fetch", "vco_upstream"]);
+        write_local_mod(&local, "vco_lib/foo.py", "def base(): pass\nlocal\n");
+
+        let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+        let merged_oid = committed_divergence_merged_tree_oid(&local, &theirs)
+            .await
+            .unwrap()
+            .expect("delete merges cleanly → Some(oid)");
+        // The merged tree lacks vco_lib/foo.py → tree-op guard → Conflict.
+        let probe = pop_probe_file(&local, "HEAD", &merged_oid, "vco_lib/foo.py").await;
+        assert_eq!(
+            probe,
+            PopProbe::Conflict,
+            "a deleted-by-merge file must be Conflict via the A.2 tree-op guard"
+        );
+    }
+
+    /// (vi) A.3 BACKSTOP: the pop-probe is line-based and CAN false-CLEAN on a
+    /// tree-aware divergence the real merge-ort pop would conflict on. We can't
+    /// easily construct such a case in a unit test AND drive the full pull, so
+    /// we assert the two load-bearing halves of the safety argument:
+    ///   (a) the probe returns Clean for a non-overlapping content edit (the
+    ///       optimisation works), AND
+    ///   (b) the post-pull autostash-pop BACKSTOP exists on both surfaces
+    ///       (installer.rs + self_update.rs) as the safety net of record — pinned
+    ///       by a source-presence assertion so a future refactor that removes it
+    ///       trips this test (the probe's false-CLEANs would then become silent).
+    #[tokio::test]
+    async fn resolve_plan_pop_probe_clean_and_backstop_is_present() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+
+        // (a) probe returns Clean for a non-overlapping edit.
+        push_upstream_change(&seed, &local, "CLAUDE.md", "# base UP\nLine A\nLine B\n");
+        write_local_mod(&local, "CLAUDE.md", "# base\nLine A\nLine B LOCAL\n");
+        let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+        let merged_oid = committed_divergence_merged_tree_oid(&local, &theirs)
+            .await
+            .unwrap()
+            .expect("non-overlapping edits merge cleanly");
+        assert_eq!(
+            pop_probe_file(&local, "HEAD", &merged_oid, "CLAUDE.md").await,
+            PopProbe::Clean,
+            "non-overlapping content edit must pop-probe Clean (the optimisation)"
+        );
+
+        // (b) the post-pull backstop is the safety net of record — assert BOTH
+        // update surfaces still detect a conflicted autostash-pop after the fact.
+        // Pinning the source presence makes the A.3 data-safety argument a
+        // regression-tested contract, not just a comment.
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let installer_src =
+            std::fs::read_to_string(manifest_dir.join("src/commands/installer.rs")).unwrap();
+        let self_update_src =
+            std::fs::read_to_string(manifest_dir.join("src/commands/self_update.rs")).unwrap();
+        assert!(
+            installer_src.contains("--diff-filter=U")
+                || installer_src.contains("collect_conflicted_files")
+                || installer_src.contains("autostash"),
+            "installer.rs must retain the post-pull autostash-pop conflict backstop \
+             (A.3 safety net of record for pop-probe false-CLEANs)"
+        );
+        assert!(
+            self_update_src.contains("--diff-filter=U")
+                || self_update_src.contains("autostash"),
+            "self_update.rs must retain the post-pull autostash-pop conflict backstop \
+             (A.3 safety net of record for pop-probe false-CLEANs)"
+        );
+    }
+
+    /// (vii) A.6 dist-binary allowlist: a dirtied `launcher/dist/**` file is
+    /// EXCLUDED from the risk set before probing (install.py regenerates it
+    /// post-merge) → no modal. A dirtied NON-dist binary is NOT excluded and a
+    /// binary 3-way Errs → conservative Conflict → modal.
+    #[tokio::test]
+    async fn resolve_plan_dirtied_dist_binary_no_modal_nondist_binary_modal() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+
+        // Seed a tracked dist binary AND a tracked non-dist binary at the base,
+        // then have upstream change BOTH (so both are upstream-changed), and
+        // dirty BOTH locally with divergent BINARY content.
+        let dist_rel = "launcher/dist/vct-launcher";
+        let nondist_rel = "assets/blob.bin";
+        // base versions (committed via seed → push).
+        std::fs::create_dir_all(seed.join("launcher/dist")).unwrap();
+        std::fs::create_dir_all(seed.join("assets")).unwrap();
+        std::fs::write(seed.join(dist_rel), b"\x00BINbase\x00").unwrap();
+        std::fs::write(seed.join(nondist_rel), b"\x00BLOBbase\x00").unwrap();
+        run_git(&seed, &["add", "."]);
+        run_git(&seed, &["commit", "-m", "seed binaries"]);
+        run_git(&seed, &["push", "origin", "main"]);
+        run_git(&local, &["fetch", "vco_upstream"]);
+        run_git(&local, &["merge", "--ff-only", "vco_upstream/main"]);
+
+        // Upstream changes BOTH binaries.
+        std::fs::write(seed.join(dist_rel), b"\x00BINupstream\x00").unwrap();
+        std::fs::write(seed.join(nondist_rel), b"\x00BLOBupstream\x00").unwrap();
+        run_git(&seed, &["add", "."]);
+        run_git(&seed, &["commit", "-m", "upstream binaries"]);
+        run_git(&seed, &["push", "origin", "main"]);
+        run_git(&local, &["fetch", "vco_upstream"]);
+
+        // --- Case A: ONLY the dist binary is dirtied locally → excluded → the
+        // risk set becomes empty after exclusion → RealMerge (no modal).
+        write_local_mod(&local, dist_rel, "\x00BINlocal\x00");
+        let plan_dist = resolve_divergence_pull_plan(&local, "main", false).await;
+        assert_eq!(
+            plan_dist,
+            PullPlan::RealMerge,
+            "a dirtied launcher/dist/** binary is regenerated by install.py post-merge \
+             → excluded from the risk set → no modal (A.6)"
+        );
+
+        // --- Case B: also dirty the NON-dist binary → NOT excluded → binary
+        // 3-way Errs → conservative Conflict → FfOnly (modal).
+        write_local_mod(&local, nondist_rel, "\x00BLOBlocal\x00");
+        let plan_nondist = resolve_divergence_pull_plan(&local, "main", false).await;
+        assert_eq!(
+            plan_nondist,
+            PullPlan::FfOnly,
+            "a dirtied NON-dist binary is not excluded; a binary 3-way can't prove \
+             clean → conservative Conflict → modal (A.6 tight scope)"
+        );
+    }
+
+    /// A.6 unit: the dist-binary exclusion predicate matches launcher/dist paths
+    /// (incl. Windows separators) and NOT arbitrary binaries.
+    #[test]
+    fn dist_binary_exclude_predicate_is_tightly_scoped() {
+        assert!(is_dist_binary_excluded("launcher/dist/vct-launcher"));
+        assert!(is_dist_binary_excluded("launcher/dist/nested/vct-hub"));
+        assert!(is_dist_binary_excluded("launcher\\dist\\vct-updater")); // Windows sep
+        // NOT excluded — tight scope (not a broad *bin* / *.wasm glob).
+        assert!(!is_dist_binary_excluded("assets/blob.bin"));
+        assert!(!is_dist_binary_excluded("launcher/src-tauri/target/release/x"));
+        assert!(!is_dist_binary_excluded("dist/foo")); // top-level dist, not launcher/dist
+        assert!(!is_dist_binary_excluded("CLAUDE.md"));
     }
 
     // ─── launcher_update_diverged durable-logging writer ──────────────────
