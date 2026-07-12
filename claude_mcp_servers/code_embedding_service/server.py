@@ -313,6 +313,16 @@ async def _maybe_unload_idle_model(now: float | None = None) -> bool:
         return False
     if _st_model is None:
         return False
+    # Whether the caller pinned the clock. When `now` is injected (tests, or a
+    # caller that already sampled), we must NOT re-sample under the lock — the
+    # idle math has to stay on the SAME clock the caller reasoned about.
+    # Re-sampling would (a) make the function untestable via an injected `now`
+    # and (b) on a host whose `time.monotonic()` is smaller than `_last_used`
+    # (a fresh runner started after `_last_used` was stamped in a DIFFERENT
+    # epoch — e.g. a test that sets `_last_used=1000.0`), spuriously read the
+    # window as "not idle". The production poll loop calls with `now=None`, so
+    # it still gets a fresh sample for the contention-refresh case.
+    now_injected = now is not None
     if now is None:
         now = time.monotonic()
     # Cheap pre-check OUTSIDE the lock to avoid taking it every poll. The
@@ -324,9 +334,12 @@ async def _maybe_unload_idle_model(now: float | None = None) -> bool:
         # Double-checked: re-evaluate under the lock. ``_in_flight`` and
         # ``_last_used`` can change between the pre-check and acquiring the
         # lock (a request may have arrived and incremented ``_in_flight``
-        # before taking the lock itself). Recompute ``now`` so a request that
-        # landed during lock contention refreshes the idle window.
-        now = time.monotonic()
+        # before taking the lock itself). Recompute ``now`` ONLY when the
+        # caller did not pin it, so a request that landed during lock
+        # contention refreshes the idle window on the production path, while an
+        # injected `now` stays authoritative.
+        if not now_injected:
+            now = time.monotonic()
         if _st_model is None or _in_flight != 0 or (now - _last_used) <= IDLE_UNLOAD_SECS:
             return False
 

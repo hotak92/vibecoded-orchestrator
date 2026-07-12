@@ -114,6 +114,31 @@ def test_unload_fires_after_idle_window():
     assert es._st_model is None
 
 
+def test_unload_uses_injected_now_even_when_real_monotonic_is_low(monkeypatch):
+    """REGRESSION GUARD (incident #4, v0.2.79): the under-lock re-check must
+    honor an injected `now` and NOT re-sample `time.monotonic()`. On a fresh CI
+    runner `time.monotonic()` can be SMALLER than a test's `_last_used`
+    (different clock epochs), so re-sampling under the lock read the window as
+    "not idle" and returned False — 4 tests passed locally (high uptime) but
+    failed in CI. Force a low monotonic and assert the injected `now` still
+    drives the decision."""
+    monkeypatch.setattr(es.time, "monotonic", lambda: 500.0)  # < _last_used
+    es.BACKEND = "gpu"
+    es.IDLE_UNLOAD_SECS = 10.0
+    es._st_model = MagicMock(name="loaded_model")
+    es._in_flight = 0
+    es._last_used = 1000.0
+    now = 1000.0 + 11.0
+
+    unloaded = asyncio.run(es._maybe_unload_idle_model(now=now))
+
+    assert unloaded is True, (
+        "injected now must be authoritative under the lock even when "
+        "time.monotonic() is lower than _last_used (fresh-runner clock)"
+    )
+    assert es._st_model is None
+
+
 def test_no_unload_before_idle_window():
     """LEAVE-ALONE: not yet idle long enough → model stays loaded."""
     es.BACKEND = "gpu"
