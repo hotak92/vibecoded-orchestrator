@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.78] - 2026-07-11
+
+### Fixed
+- **Orchestrator-update divergence modal now handles every outcome without a
+  terminal.** A cluster of update-flow fixes so a GUI-only user always
+  completes an update — auto-merge, safe auto-resolve, a guided choice for
+  genuine conflicts, and automatic post-choice continuation:
+  - **Untracked-file collisions no longer dead-end the merge.** When an update
+    adds a new file whose path already exists locally as an *untracked* file,
+    git refuses to overwrite it. Previously this refusal was mis-routed into
+    the editor-resolve conflict modal (which cannot apply to untracked files —
+    there is nothing to merge). Now the update classifies each collision:
+    a local file **byte-identical** to the incoming version is safely
+    auto-removed so the merge brings in the tracked copy; a file whose content
+    **differs** surfaces a keep-mine / take-upstream choice in the modal and
+    records an `UPDATE_DEFERRED.md` entry so your Claude agent can resolve it —
+    never a silent overwrite, never lost local work. Byte-identity is verified
+    by content hash against the incoming blob, never by timestamp or size.
+  - **Uncommitted tracked files that already match the incoming version no
+    longer force the divergence modal.** If a tracked file was locally edited
+    to be byte-identical to what upstream ships, the update now restores it
+    automatically before deciding the merge strategy (both the MenuBar
+    "Continue Update" surface and the Preferences → Updates surface). Files
+    with genuinely different content still surface the modal.
+  - **"Continue Update" no longer shows a red failure banner when there is
+    nothing to resume.** If a merge/rebase was aborted (so HEAD never moved),
+    the resume path now clears its own stale state and reports success — the
+    update badge clears automatically instead of leaving a scary error.
+  - The merge and rebase choices in the divergence modal already ran the full
+    post-update sequence (install refresh + binary swap + restart) on success;
+    a regression guard now pins that wiring so a future refactor can't silently
+    drop the auto-continue.
+
+### Internal
+- `knowledge/.node_formats.json` (the runtime-generated KG retrieval-summary
+  sidecar) is now git-ignored so a normal working session can never dirty a
+  tracked file and trip the update divergence modal.
+- Release tooling: `scripts/pre-ship-check.sh` no longer produces a spurious
+  pytest failure when run with `GH_TOKEN` set (which its own GitHub API gates
+  require). The `pytest` gate now scrubs `GH_TOKEN` / `GITHUB_TOKEN` from the
+  test subprocess so it matches the CI environment (where the secrets-primitive
+  test asserting a token must not leak from the parent env sees none).
+
 ## [0.2.77] - 2026-07-11
 
 ### Security

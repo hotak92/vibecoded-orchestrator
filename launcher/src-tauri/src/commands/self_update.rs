@@ -725,6 +725,23 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
     // whether the pull fast-forwards or produces a merge commit — a RealMerge
     // leaves HEAD a merge commit but the set of files that changed vs. our old
     // HEAD is identical, which is what drives the rebuild decision.
+    // v0.2.78 ITEM #0 (F1): same pre-plan auto-restore as the MenuBar surface
+    // (one home — `auto_restore_byte_identical_tracked_mods`). A tracked file
+    // whose working-tree content already == the incoming upstream blob is not a
+    // real modification and must not force the resync modal via the
+    // pop-conflict-risk set. Byte-identity-gated; divergent files left alone.
+    let f1_restored =
+        crate::commands::git_user_editable_merge::auto_restore_byte_identical_tracked_mods(
+            &repo, &branch,
+        )
+        .await;
+    if f1_restored > 0 {
+        eprintln!(
+            "[vct] apply_launcher_update: F1 auto-restored {} byte-identical tracked file(s) \
+             before divergence-plan resolution",
+            f1_restored
+        );
+    }
     let plan = crate::commands::git_user_editable_merge::resolve_divergence_pull_plan(
         &repo, &branch, false,
     )

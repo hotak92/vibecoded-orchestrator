@@ -389,6 +389,247 @@ async fn read_blob_at_rev(
     Ok(Some(out.stdout))
 }
 
+/// v0.2.78 ITEM #0 — byte-identity classifier (ONE shared home for F1+F2).
+///
+/// Compare the on-disk bytes of `path` (relative to `install_path`) against
+/// the blob that revision `theirs` would bring in for that path. Returns
+/// `true` ONLY on an exact byte match — never mtime/size (data-safety rule:
+/// auto-resolve only on byte-identity). Used by BOTH:
+///   * F1 — a TRACKED uncommitted file whose content == the incoming upstream
+///     blob is not a real conflict → auto-restore (`git checkout -- <f>`).
+///   * F2 — an UNTRACKED file colliding with an incoming upstream-ADDED blob;
+///     if byte-identical (our stale mirror / a superseded copy) → auto-remove
+///     the local file so the merge brings in the tracked version.
+///
+/// Reuses `read_blob_at_rev` (the existing `git show <sha>:<path>` reader) for
+/// the incoming side. A missing incoming blob (`Ok(None)`) or an unreadable
+/// local file → `false` (conservative: not identical ⇒ never auto-resolve).
+pub(crate) async fn local_matches_incoming_blob(
+    install_path: &Path,
+    theirs: &str,
+    path: &str,
+) -> bool {
+    let incoming = match read_blob_at_rev(install_path, theirs, path).await {
+        Ok(Some(bytes)) => bytes,
+        // No incoming blob, or a git error: cannot prove identity → not a match.
+        Ok(None) | Err(_) => return false,
+    };
+    let abs = install_path.join(path);
+    match tokio::fs::read(&abs).await {
+        Ok(local_bytes) => local_bytes == incoming,
+        // Unreadable local file → cannot prove identity → not a match.
+        Err(_) => false,
+    }
+}
+
+/// v0.2.78 ITEM #0 — list files ADDED by upstream between `<base>` and
+/// `<theirs>` (i.e. new-in-release tracked files). These are the paths whose
+/// presence as an UNTRACKED local file makes `git merge` abort with
+/// "untracked working tree files would be overwritten by merge" (F2). Uses
+/// `--diff-filter=A` (Added only) with `-z` for LITERAL NUL-separated paths
+/// (same `core.quotePath` correctness reasoning as
+/// `tracked_modified_overlapping_upstream`). Never raises; on any git error
+/// returns an empty list (conservative — the caller then treats nothing as an
+/// auto-resolvable collision and the existing conflict flow surfaces).
+pub(crate) async fn upstream_added_paths(
+    install_path: &Path,
+    base: &str,
+    theirs: &str,
+) -> Vec<String> {
+    let spec = format!("{}...{}", base, theirs);
+    let out = tokio::process::Command::new("git")
+        .silent()
+        .args(["diff", "--name-only", "--diff-filter=A", "-z", &spec])
+        .current_dir(install_path)
+        .output()
+        .await;
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// v0.2.78 ITEM #0 — list UNTRACKED working-tree files (porcelain `??`),
+/// relative POSIX paths. Sibling of the tracked-only walk in
+/// `tracked_modified_overlapping_upstream` (which deliberately EXCLUDES
+/// untracked). Used to intersect with `upstream_added_paths` so F2 can find
+/// the exact collision set. Never raises; git error → empty list.
+///
+/// `--untracked-files=all` is REQUIRED: without it git's default `normal` mode
+/// COLLAPSES a wholly-untracked directory to a single `?? dir/` entry instead of
+/// listing each file (`?? dir/a.py`, `?? dir/b.py`). The live 2026-07-11 case
+/// (`vco_lib/` entirely untracked locally, upstream adds `vco_lib/*.py`) would
+/// then report `vco_lib/` — which never intersects the file-granular
+/// `upstream_added_paths` set, silently missing the collision. `-uall` forces
+/// per-file granularity so the intersection is exact.
+pub(crate) async fn list_untracked_files(install_path: &Path) -> Vec<String> {
+    let out = tokio::process::Command::new("git")
+        .silent()
+        .args(["status", "--porcelain", "--untracked-files=all", "-z"])
+        .current_dir(install_path)
+        .output()
+        .await;
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let mut untracked = Vec::new();
+    let bytes = out.stdout;
+    let mut records = bytes.split(|b| *b == 0u8).peekable();
+    while let Some(rec) = records.next() {
+        if rec.len() < 4 {
+            continue;
+        }
+        // Untracked entries are `??` in both status columns.
+        if rec[0] == b'?' && rec[1] == b'?' {
+            if let Ok(path) = std::str::from_utf8(&rec[3..]) {
+                if !path.is_empty() {
+                    untracked.push(path.to_string());
+                }
+            }
+        } else if rec[0] == b'R' || rec[0] == b'C' {
+            // Rename/copy emit a second NUL record (old path) — consume it.
+            let _ = records.next();
+        }
+    }
+    untracked
+}
+
+/// v0.2.78 ITEM #0 — the untracked-collision classification for F2.
+///
+/// Given the incoming-added set (`upstream_added_paths`) ∩ the local untracked
+/// set (`list_untracked_files`), split each colliding path into:
+///   * `identical` — local bytes == incoming blob → safe to AUTO-REMOVE the
+///     local file so the merge brings in the tracked version (no data lost:
+///     the content is byte-for-byte what upstream ships).
+///   * `divergent` — local bytes differ → must NOT be silently removed; surface
+///     a keep-mine/take-upstream choice + a deferral. Never auto-resolved.
+///
+/// This is the classify step ONLY (no filesystem mutation) so it is trivially
+/// unit-testable and the act/leave-alone decision is separated from the I/O.
+pub(crate) struct UntrackedCollisions {
+    pub identical: Vec<String>,
+    pub divergent: Vec<String>,
+}
+
+pub(crate) async fn classify_untracked_collisions(
+    install_path: &Path,
+    base: &str,
+    theirs: &str,
+) -> UntrackedCollisions {
+    let added: std::collections::HashSet<String> =
+        upstream_added_paths(install_path, base, theirs)
+            .await
+            .into_iter()
+            .collect();
+    let untracked = list_untracked_files(install_path).await;
+    let mut identical = Vec::new();
+    let mut divergent = Vec::new();
+    for path in untracked {
+        if !added.contains(&path) {
+            continue; // not a collision with an incoming-added file
+        }
+        if local_matches_incoming_blob(install_path, theirs, &path).await {
+            identical.push(path);
+        } else {
+            divergent.push(path);
+        }
+    }
+    UntrackedCollisions {
+        identical,
+        divergent,
+    }
+}
+
+/// v0.2.78 ITEM #0 (F1) — auto-restore TRACKED uncommitted files whose working-
+/// tree content is BYTE-IDENTICAL to the incoming upstream blob. Such a file is
+/// not a real modification (its content already equals what upstream ships), so
+/// it must NOT count toward the `tracked_modified_overlapping_upstream`
+/// pop-conflict-risk set that forces the divergence modal. `git checkout -- <f>`
+/// discards the (identical) working-tree change, cleaning the tree so the probe
+/// sees no risk and the auto-merge proceeds.
+///
+/// This is the tracked-file sibling of the F2 untracked auto-remove — both gate
+/// the mutation on the SAME byte-identity check (`local_matches_incoming_blob`).
+/// Called by BOTH update surfaces (installer::update_orchestrator +
+/// self_update::apply_launcher_update) right before `resolve_divergence_pull_plan`
+/// so the two can't drift.
+///
+/// DATA-SAFETY: only touches files where working-tree bytes == incoming blob
+/// (nothing is lost — the discarded content is byte-for-byte the merge target).
+/// A file whose content differs is LEFT ALONE (it stays in the risk set → modal).
+/// Best-effort: base/theirs unresolvable → no-op (returns 0); a checkout failure
+/// on one file logs + skips it (that file simply stays in the risk set).
+/// Returns the number of files actually restored.
+pub(crate) async fn auto_restore_byte_identical_tracked_mods(
+    install_path: &Path,
+    branch: &str,
+) -> usize {
+    let theirs = match compute_theirs_sha(install_path, branch).await {
+        Ok(Some(t)) => t,
+        Ok(None) | Err(_) => return 0,
+    };
+    let base = match compute_base_sha(install_path, branch).await {
+        Ok(Some(b)) => b,
+        Ok(None) | Err(_) => return 0,
+    };
+
+    // Only files that are BOTH tracked-modified-overlapping-upstream (the exact
+    // set that would force the modal) are candidates — restoring a file upstream
+    // didn't change would be pointless (it can't pop-conflict anyway). Reuse the
+    // existing risk-set probe so we consider precisely the modal-forcing set.
+    let risk = match tracked_modified_overlapping_upstream(install_path, &base, &theirs).await {
+        Ok(set) => set,
+        Err(_) => return 0, // probe failed → conservative: restore nothing.
+    };
+
+    let mut restored = 0usize;
+    for path in risk {
+        // Sentinel entries from the probe's error paths ("<status-read-failed>"
+        // etc.) are not real paths — skip anything that isn't a real file.
+        if path.starts_with('<') {
+            continue;
+        }
+        if !local_matches_incoming_blob(install_path, &theirs, &path).await {
+            continue; // genuinely divergent → leave alone (stays modal-forcing).
+        }
+        // Byte-identical: discard the working-tree change.
+        let out = tokio::process::Command::new("git")
+            .silent()
+            .args(["checkout", "--", &path])
+            .current_dir(install_path)
+            .output()
+            .await;
+        match out {
+            Ok(o) if o.status.success() => {
+                restored += 1;
+                eprintln!(
+                    "[vct] auto_restore_byte_identical_tracked_mods: restored {} \
+                     (working-tree content == incoming upstream blob)",
+                    path
+                );
+            }
+            Ok(o) => eprintln!(
+                "[vct] auto_restore_byte_identical_tracked_mods: git checkout -- {} \
+                 failed ({}); leaving it in the risk set",
+                path,
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Err(e) => eprintln!(
+                "[vct] auto_restore_byte_identical_tracked_mods: git checkout -- {} \
+                 spawn failed ({}); leaving it in the risk set",
+                path, e
+            ),
+        }
+    }
+    restored
+}
+
 /// Build the `GlobSet` from `USER_EDITABLE_PATTERNS`. Built once per
 /// call; cheap enough (six patterns) that caching across calls is
 /// unnecessary. Returns `Err` on a malformed pattern (a programming
@@ -2814,6 +3055,214 @@ mod tests {
         assert!(
             !clean,
             "expected CONFLICT (not clean) for overlapping same-line edits",
+        );
+    }
+
+    // ───── v0.2.78 ITEM #0 — byte-identity classifier (F1 + F2) ─────
+
+    /// F2 keystone: an UNTRACKED local file that is byte-identical to an
+    /// incoming upstream-ADDED blob must classify as `identical` (safe to
+    /// auto-remove so the merge brings in the tracked version). This is the
+    /// exact shape of the live 2026-07-11 failure (stale vco_lib mirror files
+    /// present locally untracked, identical to what 0.2.77 shipped).
+    #[tokio::test]
+    async fn v0278_untracked_collision_byte_identical_classifies_identical() {
+        skip_if_no_git!();
+        let (tmp, _remote, local) = init_repo_pair();
+        let seed = tmp.path().join("seed");
+
+        // UPSTREAM adds a brand-new tracked file.
+        let body = "def new_upstream_fn():\n    return 42\n";
+        push_upstream_change(&seed, &local, "vco_lib/new_mod.py", body);
+
+        // LOCAL has that SAME path present but UNTRACKED, byte-identical.
+        write_local_mod(&local, "vco_lib/new_mod.py", body);
+
+        let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
+        let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+
+        // Helper-level assertions.
+        assert!(
+            upstream_added_paths(&local, &base, &theirs)
+                .await
+                .contains(&"vco_lib/new_mod.py".to_string()),
+            "upstream_added_paths must include the new-in-release file",
+        );
+        assert!(
+            list_untracked_files(&local)
+                .await
+                .contains(&"vco_lib/new_mod.py".to_string()),
+            "the local copy must be seen as untracked",
+        );
+        assert!(
+            local_matches_incoming_blob(&local, &theirs, "vco_lib/new_mod.py").await,
+            "byte-identical local must match the incoming blob",
+        );
+
+        let c = classify_untracked_collisions(&local, &base, &theirs).await;
+        assert_eq!(
+            c.identical,
+            vec!["vco_lib/new_mod.py".to_string()],
+            "byte-identical untracked collision must classify as `identical`",
+        );
+        assert!(
+            c.divergent.is_empty(),
+            "no divergent collisions expected",
+        );
+    }
+
+    /// F2: an UNTRACKED local file that DIFFERS from the incoming upstream
+    /// blob must classify as `divergent` (never auto-removed; needs a
+    /// keep-mine/take-upstream choice). Leave-alone half of the act/leave
+    /// pair.
+    #[tokio::test]
+    async fn v0278_untracked_collision_divergent_classifies_divergent() {
+        skip_if_no_git!();
+        let (tmp, _remote, local) = init_repo_pair();
+        let seed = tmp.path().join("seed");
+
+        push_upstream_change(
+            &seed,
+            &local,
+            "vco_lib/new_mod.py",
+            "def upstream_version():\n    return 1\n",
+        );
+        // LOCAL untracked copy with DIFFERENT content.
+        write_local_mod(
+            &local,
+            "vco_lib/new_mod.py",
+            "def my_local_hack():\n    return 999\n",
+        );
+
+        let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
+        let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+
+        assert!(
+            !local_matches_incoming_blob(&local, &theirs, "vco_lib/new_mod.py").await,
+            "divergent local must NOT match the incoming blob",
+        );
+        let c = classify_untracked_collisions(&local, &base, &theirs).await;
+        assert_eq!(
+            c.divergent,
+            vec!["vco_lib/new_mod.py".to_string()],
+            "divergent untracked collision must classify as `divergent`",
+        );
+        assert!(
+            c.identical.is_empty(),
+            "no identical collisions expected",
+        );
+    }
+
+    /// A file that is untracked locally but is NOT part of the upstream-added
+    /// set (upstream didn't add it) is NOT a collision — must appear in
+    /// neither bucket. Guards against over-eager removal of pure-local scratch
+    /// (KG nodes, notes) that merely happens to be untracked.
+    #[tokio::test]
+    async fn v0278_untracked_non_collision_is_ignored() {
+        skip_if_no_git!();
+        let (tmp, _remote, local) = init_repo_pair();
+        let seed = tmp.path().join("seed");
+
+        // UPSTREAM adds an unrelated file.
+        push_upstream_change(&seed, &local, "vco_lib/added.py", "x = 1\n");
+        // LOCAL untracked scratch that upstream never touched.
+        write_local_mod(
+            &local,
+            "knowledge/concepts/my-scratch-note.md",
+            "# scratch\npersonal\n",
+        );
+
+        let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
+        let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+        let c = classify_untracked_collisions(&local, &base, &theirs).await;
+        assert!(
+            c.identical.is_empty() && c.divergent.is_empty(),
+            "a non-collision untracked file must not be classified as a collision \
+             (identical={:?}, divergent={:?})",
+            c.identical,
+            c.divergent,
+        );
+    }
+
+    // ───── v0.2.78 ITEM #0 (F1) — tracked byte-identical auto-restore ─────
+
+    /// ACT: a TRACKED file locally modified to be byte-identical to what
+    /// upstream changes it to is auto-restored (working-tree change discarded)
+    /// and thereby DROPS from the pop-conflict-risk set → no modal. Data-safe:
+    /// the discarded content equals the merge target.
+    #[tokio::test]
+    async fn v0278_f1_restores_byte_identical_tracked_mod() {
+        skip_if_no_git!();
+        let (tmp, _remote, local) = init_repo_pair();
+        let seed = tmp.path().join("seed");
+
+        // UPSTREAM changes CLAUDE.md to a specific new content.
+        let upstream_body = "# base\nLine A\nLine B\nLine C upstream\n";
+        push_upstream_change(&seed, &local, "CLAUDE.md", upstream_body);
+
+        // LOCAL modifies CLAUDE.md (uncommitted, tracked) to the EXACT same
+        // bytes upstream will bring in.
+        write_local_mod(&local, "CLAUDE.md", upstream_body);
+
+        // Precondition: this file IS in the pop-conflict-risk set (tracked-mod
+        // ∩ upstream-changed) → would force the modal without F1.
+        let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
+        let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+        let risk_before = tracked_modified_overlapping_upstream(&local, &base, &theirs)
+            .await
+            .unwrap();
+        assert!(
+            risk_before.contains(&"CLAUDE.md".to_string()),
+            "precondition: byte-identical tracked mod must start in the risk set",
+        );
+
+        // ACT.
+        let restored = auto_restore_byte_identical_tracked_mods(&local, "main").await;
+        assert_eq!(restored, 1, "the byte-identical tracked mod must be restored");
+
+        // The tree is now clean for CLAUDE.md → risk set no longer contains it.
+        let risk_after = tracked_modified_overlapping_upstream(&local, &base, &theirs)
+            .await
+            .unwrap();
+        assert!(
+            !risk_after.contains(&"CLAUDE.md".to_string()),
+            "after F1 restore, CLAUDE.md must no longer be a pop-conflict risk",
+        );
+    }
+
+    /// LEAVE-ALONE: a TRACKED file locally modified to content that DIFFERS
+    /// from the incoming upstream version is NOT restored (real divergence must
+    /// keep forcing the modal). Data-safety: local edit preserved.
+    #[tokio::test]
+    async fn v0278_f1_leaves_divergent_tracked_mod_alone() {
+        skip_if_no_git!();
+        let (tmp, _remote, local) = init_repo_pair();
+        let seed = tmp.path().join("seed");
+
+        push_upstream_change(&seed, &local, "CLAUDE.md", "# base\nLine A\nUPSTREAM\n");
+        // LOCAL modifies the SAME file to DIFFERENT content.
+        let my_edit = "# base\nLine A\nMY LOCAL EDIT\n";
+        write_local_mod(&local, "CLAUDE.md", my_edit);
+
+        let restored = auto_restore_byte_identical_tracked_mods(&local, "main").await;
+        assert_eq!(restored, 0, "divergent tracked mod must NOT be restored");
+
+        // Local edit preserved on disk.
+        let on_disk = std::fs::read_to_string(local.join("CLAUDE.md")).unwrap();
+        assert_eq!(
+            on_disk, my_edit,
+            "a divergent local edit must be left untouched (data-safety)",
+        );
+
+        // And it must STILL be in the risk set (modal still forced).
+        let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
+        let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+        let risk = tracked_modified_overlapping_upstream(&local, &base, &theirs)
+            .await
+            .unwrap();
+        assert!(
+            risk.contains(&"CLAUDE.md".to_string()),
+            "a divergent tracked mod must remain a pop-conflict risk",
         );
     }
 

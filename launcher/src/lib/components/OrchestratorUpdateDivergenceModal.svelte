@@ -52,6 +52,21 @@
     git_stderr: string;
   };
 
+  // v0.2.78 ITEM #0 (F2): payload for an UNTRACKED-file collision where the
+  // local file's content DIFFERS from the incoming upstream-added blob. The
+  // byte-identical case is auto-resolved in Rust before we ever get here; this
+  // event only fires for genuine divergence, which can't be auto-removed
+  // without risking local-work loss. Per the sanctioned VCO "not auto-solvable
+  // → defer to the user's Claude agent" mechanism, an UPDATE_DEFERRED.md row is
+  // written alongside this payload; the modal shows the files + the exact
+  // keep-mine/take-upstream commands and points at that agent-resolvable path.
+  type OrchestratorUntrackedCollisionPayload = {
+    event: 'orchestrator_untracked_collision';
+    operation: 'merge' | 'rebase';
+    branch: string;
+    divergent_files: string[];
+  };
+
   let {
     payload,
     installPath,
@@ -70,6 +85,10 @@
   let rebaseFailed = $state(false);
   let lastError = $state<string | null>(null);
   let conflict = $state<OrchestratorConflictPayload | null>(null);
+  // v0.2.78 ITEM #0 (F2): set when a merge/rebase surfaces a DIVERGENT
+  // untracked-collision payload. Rendered as an informational chooser +
+  // agent-deferral pointer (no auto-resolve — data-safety).
+  let untrackedCollision = $state<OrchestratorUntrackedCollisionPayload | null>(null);
   let copyHint = $state<string | null>(null);
   // Ref to each action button so we can focus the "currently primary"
   // one. Svelte 5 doesn't allow conditional bind:this, so we bind each
@@ -129,6 +148,26 @@
     return null;
   }
 
+  /**
+   * v0.2.78 ITEM #0 (F2): parse a Tauri error as a DIVERGENT untracked-collision
+   * payload. Returns null for any other shape.
+   */
+  function parseUntrackedCollision(
+    raw: unknown,
+  ): OrchestratorUntrackedCollisionPayload | null {
+    if (typeof raw !== 'string') return null;
+    if (!raw.startsWith('{')) return null;
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.event === 'orchestrator_untracked_collision') {
+        return parsed as OrchestratorUntrackedCollisionPayload;
+      }
+    } catch {
+      // not JSON
+    }
+    return null;
+  }
+
   async function runMerge() {
     busy = true;
     busyOp = 'merge';
@@ -141,8 +180,11 @@
       onClose();
     } catch (e) {
       const conf = parseConflictError(e);
+      const untracked = parseUntrackedCollision(e);
       if (conf) {
         conflict = conf;
+      } else if (untracked) {
+        untrackedCollision = untracked;
       } else {
         lastError = `Merge failed: ${e}`;
         mergeFailed = true;
@@ -163,8 +205,11 @@
       onClose();
     } catch (e) {
       const conf = parseConflictError(e);
+      const untracked = parseUntrackedCollision(e);
       if (conf) {
         conflict = conf;
+      } else if (untracked) {
+        untrackedCollision = untracked;
       } else {
         lastError = `Rebase failed: ${e}`;
         rebaseFailed = true;
@@ -248,6 +293,77 @@
     installPath={installPath}
     onClose={dismissConflict}
   />
+{:else if untrackedCollision}
+  <!-- v0.2.78 ITEM #0 (F2): DIVERGENT untracked-file collision. The
+       byte-identical case is auto-resolved in Rust; this UI only appears for
+       genuine divergence, which we never auto-remove (data-safety). We show
+       the files + the two safe resolutions, and point the user at their Claude
+       agent, which has an UPDATE_DEFERRED.md entry to resolve it for them. -->
+  <button
+    type="button"
+    class="dvg-backdrop"
+    aria-label="Close dialog"
+    onclick={cancel}
+    onkeydown={onBackdropKey}
+  ></button>
+  <div
+    class="dvg-modal"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="utc-title"
+    tabindex="-1"
+    onkeydown={onModalKey}
+  >
+    <header class="dvg-header">
+      <h3 id="utc-title">Local files clash with new files in this update</h3>
+      <p class="dvg-summary">
+        {untrackedCollision.divergent_files.length} untracked file{untrackedCollision
+          .divergent_files.length === 1
+          ? ''
+          : 's'} in your clone {untrackedCollision.divergent_files.length === 1
+          ? 'has'
+          : 'have'} the same path as a file this update adds, but different
+        contents. To avoid discarding your version, the update paused instead of
+        overwriting {untrackedCollision.divergent_files.length === 1 ? 'it' : 'them'}.
+      </p>
+    </header>
+
+    <div class="dvg-body">
+      <section class="dvg-section">
+        <h4>Affected files</h4>
+        <ul class="dvg-files-list">
+          {#each untrackedCollision.divergent_files as f (f)}
+            <li><code>{f}</code></li>
+          {/each}
+        </ul>
+      </section>
+
+      <section class="dvg-section">
+        <p>
+          Your Claude agent can resolve this for you — this update wrote an entry
+          to <code>.claude/context/UPDATE_DEFERRED.md</code> describing exactly
+          what to do. Open Claude in this project and ask it to resolve the
+          pending update action.
+        </p>
+        <p class="utc-manual-hint">
+          Prefer to do it yourself? For each file, either <strong>take the
+          update's version</strong> (delete your local copy) or <strong>keep
+          yours</strong> (rename it aside, e.g. to <code>&lt;file&gt;.local-backup</code>),
+          then run the update again.
+        </p>
+      </section>
+    </div>
+
+    <footer class="dvg-actions">
+      <button type="button" class="dvg-btn" onclick={openClone}>
+        Open clone folder
+      </button>
+      <button type="button" class="dvg-btn dvg-btn-primary" onclick={cancel}>
+        Close
+      </button>
+      {#if copyHint}<span class="dvg-copy-hint">{copyHint}</span>{/if}
+    </footer>
+  </div>
 {:else}
   <!-- Backdrop is a real button so click+keyboard dismissal are both
        accessible. The modal itself stops propagation so clicks inside
@@ -755,6 +871,14 @@
   .dvg-btn-primary .dvg-btn-sub {
     color: var(--color-text);
     opacity: 0.85;
+  }
+
+  /* v0.2.78 ITEM #0 (F2): secondary "do it yourself" hint under the
+   * agent-resolution guidance in the untracked-collision modal. */
+  .utc-manual-hint {
+    margin-top: 8px;
+    font-size: 12px;
+    opacity: 0.8;
   }
 
   .dvg-manual-link {

@@ -4492,6 +4492,26 @@ pub async fn update_orchestrator<R: Runtime>(
     // commit; if the user updated inside the post-tag binary-refresh window,
     // `WaitForBinaryRefresh`'s `--ff-only` re-pull soft-fails+times out and
     // the v0.2.55 finalize recovery handles it (self-heals next update).
+    // v0.2.78 ITEM #0 (F1): before deciding the pull plan, auto-restore any
+    // TRACKED uncommitted file whose working-tree content is byte-identical to
+    // the incoming upstream blob. Such a file is not a real modification (its
+    // content already == the merge target), so it should not force the
+    // divergence modal via the pop-conflict-risk set. Byte-identity-gated
+    // (never mtime/size); divergent files are left in the risk set → modal.
+    // Shared helper — the self_update surface calls the SAME fn (one home).
+    let f1_restored =
+        crate::commands::git_user_editable_merge::auto_restore_byte_identical_tracked_mods(
+            &install_path,
+            &pull_branch,
+        )
+        .await;
+    if f1_restored > 0 {
+        eprintln!(
+            "[vct] update_orchestrator: F1 auto-restored {} byte-identical tracked file(s) \
+             before divergence-plan resolution",
+            f1_restored
+        );
+    }
     let pull_plan = crate::commands::git_user_editable_merge::resolve_divergence_pull_plan(
         &install_path,
         &pull_branch,
@@ -5315,6 +5335,195 @@ fn serialize_orchestrator_conflict_error(
         "{{\"event\":\"orchestrator_update_conflict\",\"operation\":\"{}\",\"branch\":\"{}\",\"conflicted_files\":{},\"git_stderr\":\"{}\"}}",
         operation, branch, files_field, stderr_esc
     )
+}
+
+/// v0.2.78 ITEM #0 (F2) — serialize the UNTRACKED-collision payload the
+/// divergence modal renders as a keep-mine / take-upstream chooser. Distinct
+/// `event` from `orchestrator_update_conflict` so the Svelte side does NOT show
+/// the editor-resolve conflict modal (which is inapplicable to untracked files —
+/// there is no `UU`, no `<<<<<<<` marker to edit). Same JSON-escape machinery as
+/// `serialize_orchestrator_conflict_error` (one home for the escaper).
+fn serialize_untracked_collision_error(
+    operation: &str,
+    branch: &str,
+    divergent_files: &[String],
+) -> String {
+    let files_field: String = {
+        let parts: Vec<String> = divergent_files
+            .iter()
+            .map(|p| format!("\"{}\"", crate::commands::self_update::json_escape(p)))
+            .collect();
+        format!("[{}]", parts.join(","))
+    };
+    format!(
+        "{{\"event\":\"orchestrator_untracked_collision\",\"operation\":\"{}\",\"branch\":\"{}\",\"divergent_files\":{}}}",
+        operation, branch, files_field
+    )
+}
+
+/// v0.2.78 ITEM #0 (F2 keystone) — pre-pull untracked-collision handler, the
+/// ONE home shared by `merge_orchestrator_with_upstream` and
+/// `rebase_orchestrator_onto_upstream`. Runs BEFORE the git pull/rebase so a
+/// new-in-release file present locally UNTRACKED can't make git abort with
+/// "untracked working tree files would be overwritten by merge" (which the old
+/// code mis-routed into the editor-resolve conflict modal).
+///
+/// Returns:
+///   * `Ok(())` — no collisions, OR every collision was byte-identical to the
+///     incoming blob and safely auto-removed (act path). The caller proceeds
+///     with the pull; the merge now brings in the tracked version.
+///   * `Err(payload)` — at least one DIVERGENT collision (local bytes differ
+///     from incoming). NOTHING is removed (leave-alone path). The caller must
+///     restore binaries + hub and return this payload; the divergence modal
+///     then offers keep-mine / take-upstream. A deferral row is ALSO written
+///     (via the shared `emit_deferral_entry`) so a terminal Claude agent can
+///     resolve it — modal alone is insufficient (user ruling 2026-07-11).
+///
+/// Data-safety: identical files are removed ONLY on a byte-identity match
+/// (`local_matches_incoming_blob`, `git cat-file`/`git show` compare — never
+/// mtime/size). Divergent files are NEVER touched here. Best-effort: if base or
+/// theirs can't be resolved, returns `Ok(())` (the subsequent git pull surfaces
+/// any real problem via the existing conflict flow — we never guess).
+async fn handle_untracked_collisions_pre_pull(
+    install_path: &Path,
+    operation: &str,
+    branch: &str,
+) -> Result<(), String> {
+    use crate::commands::git_user_editable_merge::{
+        classify_untracked_collisions, compute_base_sha, compute_theirs_sha,
+    };
+
+    let theirs = match compute_theirs_sha(install_path, branch).await {
+        Ok(Some(t)) => t,
+        // Upstream tip unresolvable → let the pull surface it. No collision work.
+        Ok(None) | Err(_) => return Ok(()),
+    };
+    let base = match compute_base_sha(install_path, branch).await {
+        Ok(Some(b)) => b,
+        // No merge-base → let the pull/modal handle it; don't guess a collision.
+        Ok(None) | Err(_) => return Ok(()),
+    };
+
+    let collisions = classify_untracked_collisions(install_path, &base, &theirs).await;
+
+    if collisions.identical.is_empty() && collisions.divergent.is_empty() {
+        return Ok(()); // no collisions — nothing to do.
+    }
+
+    // DIVERGENT first: if ANY divergent collision exists, we must NOT remove
+    // even the identical ones (removing some-but-not-all and then bailing would
+    // leave the tree half-changed). Leave the whole set alone, write the
+    // deferral, and surface the modal payload.
+    if !collisions.divergent.is_empty() {
+        eprintln!(
+            "[vct] {}: {} divergent untracked collision(s) with upstream-added \
+             files — surfacing keep-mine/take-upstream choice (no auto-removal): {:?}",
+            operation,
+            collisions.divergent.len(),
+            collisions.divergent,
+        );
+        write_untracked_collision_deferral(install_path, operation, branch, &collisions.divergent);
+        return Err(serialize_untracked_collision_error(
+            operation,
+            branch,
+            &collisions.divergent,
+        ));
+    }
+
+    // ACT: every collision is byte-identical to the incoming blob — auto-remove
+    // the local untracked copies so the merge brings in the tracked version.
+    // (This is the live 2026-07-11 case: stale vco_lib mirror files identical to
+    // what 0.2.77 shipped.)
+    for path in &collisions.identical {
+        let abs = install_path.join(path);
+        match std::fs::remove_file(&abs) {
+            Ok(()) => eprintln!(
+                "[vct] {}: auto-removed byte-identical untracked file {} \
+                 (== incoming upstream blob) so the merge can take the tracked version",
+                operation, path,
+            ),
+            Err(e) => {
+                // Could not remove → do NOT proceed as if resolved; the pull
+                // would abort on it. Surface as a divergent-style modal so the
+                // user is never left with a silent half-state.
+                eprintln!(
+                    "[vct] {}: failed to auto-remove byte-identical untracked {}: {} \
+                     — surfacing modal instead of proceeding",
+                    operation, path, e,
+                );
+                write_untracked_collision_deferral(
+                    install_path,
+                    operation,
+                    branch,
+                    &collisions.identical,
+                );
+                return Err(serialize_untracked_collision_error(
+                    operation,
+                    branch,
+                    &collisions.identical,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// v0.2.78 ITEM #0 (F2) — write an UPDATE_DEFERRED.md row for a divergent
+/// untracked collision, via the shared `services::deferral::emit_deferral_entry`
+/// (Python SSOT `vco_lib.deferral_report`; injection-safe). Addressed to the
+/// user's Claude agent so the state is resolvable from a terminal too — the GUI
+/// modal alone is not sufficient (user ruling 2026-07-11). Best-effort: a
+/// failure logs and is swallowed (deferrals are FYI; never mask the update).
+fn write_untracked_collision_deferral(
+    install_path: &Path,
+    operation: &str,
+    branch: &str,
+    divergent_files: &[String],
+) {
+    let files_list = divergent_files.join(", ");
+    let detected = format!(
+        "During the orchestrator {op} ({branch}), these UNTRACKED local files collide with \
+         files newly ADDED by upstream in this release, and their content DIFFERS from the \
+         incoming version: {files}. git refuses to overwrite untracked files, so the {op} \
+         cannot complete until each is resolved.",
+        op = operation,
+        branch = branch,
+        files = files_list,
+    );
+    let why = "Auto-removal was withheld because the local content is NOT byte-identical to \
+        the incoming upstream version — removing it could discard local work. The launcher \
+        surfaces a keep-mine / take-upstream choice in the divergence modal; this deferral \
+        mirrors that state for terminal Claude sessions.";
+    // command_to_apply must PASS the argparse-sweep guard (a runnable shell
+    // block). Offer both directions explicitly; the user/agent picks one.
+    let first = divergent_files.first().cloned().unwrap_or_default();
+    let command = format!(
+        "```bash\n\
+         # For EACH colliding file, choose ONE:\n\
+         #   (a) TAKE UPSTREAM (discard your local copy):\n\
+         rm -- \"{first}\"   # then re-run the update (launcher 'Continue Update' or `python install.py --update`)\n\
+         #   (b) KEEP MINE (set your copy aside, take upstream, reconcile by hand):\n\
+         #   mv -- \"{first}\" \"{first}.local-backup\"   # then re-run the update; your copy is preserved at *.local-backup\n\
+         ```",
+        first = first,
+    );
+
+    let fields = crate::services::deferral::DeferralEntryFields {
+        condition_id: "untracked_collision_divergent",
+        title: "Untracked local files collide with upstream-added files (content differs)",
+        detected: &detected,
+        why_deferred: why,
+        command_to_apply: &command,
+        severity: "warning",
+    };
+    if let Err(e) =
+        crate::services::deferral::emit_deferral_entry(install_path, install_path, &fields)
+    {
+        eprintln!(
+            "[vct] {}: could not emit untracked_collision_divergent deferral (non-fatal): {}",
+            operation, e,
+        );
+    }
 }
 
 /// Detect whether git stderr indicates a merge or rebase produced
@@ -6215,6 +6424,28 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
     // so the deferral lands regardless of pull outcome. Best-effort.
     maybe_emit_pre_merge_deferrals(&install_path, &pre_merge_outcomes, &pull_branch);
 
+    // v0.2.78 ITEM #0 (F2 keystone): handle UNTRACKED-file collisions with
+    // upstream-added files BEFORE the pull. A new-in-release file present
+    // locally untracked makes `git pull` abort ("untracked working tree files
+    // would be overwritten by merge"), which the old code mis-routed into the
+    // editor-resolve conflict modal (inapplicable to untracked files). Here we
+    // auto-remove byte-identical copies (safe — same bytes upstream ships) and
+    // surface a keep-mine/take-upstream modal + deferral for divergent ones.
+    // Err ⇒ divergent collision (or an un-removable identical one): restore the
+    // pre-pull binary renames + hub and return the payload (never proceed on a
+    // tree the pull would abort on).
+    emit_progress(&window, "update", "Checking for untracked-file collisions...", 8.0);
+    if let Err(collision_payload) =
+        handle_untracked_collisions_pre_pull(&install_path, "merge", &pull_branch).await
+    {
+        abort_update_restore_binaries_and_hub(
+            &install_path,
+            pre_pull_renamed.as_deref(),
+            pre_pull_renamed_hub.as_deref(),
+        );
+        return Err(collision_payload);
+    }
+
     // Pull WITHOUT --ff-only, explicitly as a merge (--no-rebase). The
     // explicit reconcile flag is REQUIRED on git 2.34+: without it git
     // refuses a divergent pull with "Need to specify how to reconcile
@@ -6457,6 +6688,21 @@ pub async fn rebase_orchestrator_onto_upstream<R: Runtime>(
             pre_pull_renamed_hub.as_deref(),
         );
         return Err(format!("git fetch failed: {}", stderr));
+    }
+
+    // v0.2.78 ITEM #0 (F2 keystone): same untracked-collision handling as the
+    // merge path — one shared home (`handle_untracked_collisions_pre_pull`).
+    // Runs after the fetch (so base/theirs resolve) and before the rebase.
+    emit_progress(&window, "update", "Checking for untracked-file collisions...", 15.0);
+    if let Err(collision_payload) =
+        handle_untracked_collisions_pre_pull(&install_path, "rebase", &pull_branch).await
+    {
+        abort_update_restore_binaries_and_hub(
+            &install_path,
+            pre_pull_renamed.as_deref(),
+            pre_pull_renamed_hub.as_deref(),
+        );
+        return Err(collision_payload);
     }
 
     emit_progress(&window, "update", "Rebasing local onto upstream...", 20.0);
@@ -7143,6 +7389,17 @@ async fn detect_remaining_conflict_markers(repo: &Path) -> Vec<String> {
 static RESUME_IN_FLIGHT: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
+/// v0.2.78 ITEM #0 (F4) — decide whether a resume request is a benign no-op:
+/// the recorded conflict SHA is non-empty AND HEAD still equals it, i.e. the
+/// merge/rebase was aborted (nothing advanced), so there is nothing to resume.
+/// Extracted as a pure fn so the decision is unit-testable without a Tauri
+/// AppHandle. An EMPTY `sha_at_conflict` (older sentinels that didn't record
+/// it) is NOT a benign no-op — we can't prove HEAD didn't move, so we let the
+/// normal resume path run its other guards (conservative).
+fn resume_head_unchanged_is_benign_noop(sha_at_conflict: &str, head_sha: &str) -> bool {
+    !sha_at_conflict.is_empty() && head_sha == sha_at_conflict
+}
+
 /// Resume an `update_orchestrator` flow that halted at a merge/rebase
 /// conflict. The user has already resolved the conflict (manually OR via
 /// CLI `git add` + `git commit` / `git rebase --continue`); this command
@@ -7270,26 +7527,35 @@ pub async fn resume_orchestrator_update<R: Runtime>(
     }
 
     // Verify HEAD actually advanced past the conflict SHA. If it didn't,
-    // the user aborted via CLI and the sentinel is stale — clear it and
-    // tell the GUI.
+    // the user aborted the merge/rebase (via CLI or the modal's Abort) — the
+    // sentinel is stale but the state is BENIGN: there is simply nothing to
+    // resume. v0.2.78 ITEM #0 (F4): pre-v0.2.78 this returned an `Err`, which
+    // the Svelte `resumeUpdate()` catch rendered as a RED "Update FAILED"
+    // banner + told the user to manually refresh — a scary dead-end for a
+    // no-op. Now we self-clear the sentinel + solo deferral (as before) AND
+    // return a SUCCESS-shaped result so the caller's success path runs
+    // `orchestrator.checkStatus()`, which re-detects the (now-clean) state and
+    // clears the UpdateBadge automatically — no red banner, no manual refresh.
     let head_sha = read_head_sha(&install_path).await.unwrap_or_default();
-    if !sentinel.sha_at_conflict.is_empty() && head_sha == sentinel.sha_at_conflict {
+    if resume_head_unchanged_is_benign_noop(&sentinel.sha_at_conflict, &head_sha) {
         clear_update_resume_sentinel(&install_path);
         clear_update_resume_deferral_if_solo(&install_path);
         write_audit(
-            "update_orchestrator_resume_rejected",
+            "update_orchestrator_resume_resolved_noop",
             serde_json::json!({
                 "reason": "head_unchanged",
                 "sha_at_conflict": sentinel.sha_at_conflict,
                 "install_path": path,
             }),
         );
-        return Err(
-            "Working tree HEAD has not moved since the conflict — looks \
-             like the merge was aborted from the command line. No resume \
-             needed. Refreshing the launcher should clear this banner."
+        return Ok(InstallResult {
+            success: true,
+            install_path: path,
+            message: "No resume needed — the merge/rebase was aborted, so there is \
+                      nothing to continue. The update badge will clear automatically."
                 .to_string(),
-        );
+            system,
+        });
     }
 
     // Scan for stray conflict markers. If the user committed a file with
@@ -14498,6 +14764,252 @@ MemAvailable:   23456789 kB
                 .success());
         }
 
+        /// v0.2.78 ITEM #0: push a NEW file to upstream (adds a tracked file in
+        /// the merge-base..theirs range) via the seed workdir, then re-fetch
+        /// vco_upstream in the local clone. Sibling of `init_remote_and_clone`'s
+        /// inline upstream-advance. `seed` is `<tmp>/seed`.
+        fn push_upstream_added_file(seed: &Path, local: &Path, file: &str, body: &str) {
+            let abs = seed.join(file);
+            if let Some(p) = abs.parent() {
+                std::fs::create_dir_all(p).unwrap();
+            }
+            std::fs::write(&abs, body).unwrap();
+            for args in [
+                vec!["add", file],
+                vec!["commit", "-m", "upstream adds file"],
+                vec!["push", "origin", "main"],
+            ] {
+                assert!(StdCommand::new("git")
+                    .silent()
+                    .args(&args)
+                    .current_dir(seed)
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            assert!(StdCommand::new("git")
+                .silent()
+                .args(["fetch", "vco_upstream"])
+                .current_dir(local)
+                .status()
+                .unwrap()
+                .success());
+        }
+
+        // ─── v0.2.78 ITEM #0 (F2 keystone) — untracked-collision handling ───
+        // "Test the decision, not just the happy path": BOTH the ACT branch
+        // (byte-identical untracked collision → auto-removed, Ok) and the
+        // LEAVE-ALONE branch (divergent → nothing removed, Err payload +
+        // deferral) get a test. These exercise the SHARED handler
+        // `handle_untracked_collisions_pre_pull` end-to-end against real git.
+
+        /// ACT: an untracked local file byte-identical to an incoming
+        /// upstream-added blob is auto-removed so the merge can proceed → Ok(()),
+        /// and the local file is gone. This is the exact live 2026-07-11 case.
+        #[tokio::test]
+        async fn v0278_pre_pull_auto_removes_byte_identical_untracked_collision() {
+            skip_if_no_git!();
+            let (tmp, _remote, local) = init_remote_and_clone();
+            let seed = tmp.path().join("seed");
+
+            let body = "def shipped():\n    return 1\n";
+            push_upstream_added_file(&seed, &local, "vco_lib/new_mod.py", body);
+            // Local UNTRACKED copy, byte-identical to what upstream ships.
+            let local_file = local.join("vco_lib/new_mod.py");
+            std::fs::create_dir_all(local_file.parent().unwrap()).unwrap();
+            std::fs::write(&local_file, body).unwrap();
+
+            let res = handle_untracked_collisions_pre_pull(&local, "merge", "main").await;
+            assert!(
+                res.is_ok(),
+                "byte-identical untracked collision must be auto-resolved (Ok): {:?}",
+                res
+            );
+            assert!(
+                !local_file.exists(),
+                "the byte-identical untracked file must have been auto-removed",
+            );
+        }
+
+        /// LEAVE-ALONE: a DIVERGENT untracked collision is NOT removed; the
+        /// handler returns the untracked-collision payload (Err) and writes a
+        /// deferral row. Data-safety: the local file must still exist afterward.
+        #[tokio::test]
+        async fn v0278_pre_pull_surfaces_divergent_untracked_collision_and_defers() {
+            skip_if_no_git!();
+            let (tmp, _remote, local) = init_remote_and_clone();
+            let seed = tmp.path().join("seed");
+
+            push_upstream_added_file(
+                &seed,
+                &local,
+                "vco_lib/new_mod.py",
+                "def upstream():\n    return 1\n",
+            );
+            // Local UNTRACKED copy with DIFFERENT content.
+            let local_file = local.join("vco_lib/new_mod.py");
+            std::fs::create_dir_all(local_file.parent().unwrap()).unwrap();
+            std::fs::write(&local_file, "def my_local():\n    return 999\n").unwrap();
+
+            let res = handle_untracked_collisions_pre_pull(&local, "merge", "main").await;
+            let payload = res.expect_err("divergent collision must surface an Err payload");
+
+            // Payload is the untracked-collision event listing the file.
+            let v: serde_json::Value =
+                serde_json::from_str(&payload).expect("payload must be valid JSON");
+            assert_eq!(v["event"], "orchestrator_untracked_collision");
+            assert_eq!(v["operation"], "merge");
+            let files = v["divergent_files"].as_array().expect("array");
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0], "vco_lib/new_mod.py");
+
+            // Leave-alone: the divergent local file must NOT have been removed.
+            assert!(
+                local_file.exists(),
+                "a DIVERGENT untracked file must never be auto-removed (data-safety)",
+            );
+
+            // A deferral row must have been written (agent-resolvable channel).
+            // Best-effort emit: assert only when python+vco_lib are resolvable
+            // (the writer soft-fails otherwise). Presence of the file with our
+            // condition id is the signal.
+            let deferred = local.join(".claude/context/UPDATE_DEFERRED.md");
+            if deferred.exists() {
+                let content = std::fs::read_to_string(&deferred).unwrap();
+                assert!(
+                    content.contains("untracked_collision_divergent"),
+                    "deferral must carry the untracked_collision_divergent condition id;\n{}",
+                    content
+                );
+            } else {
+                eprintln!(
+                    "[test] deferral file absent — python/vco_lib not resolvable in this \
+                     test env; skipping deferral-content assertion (emit is best-effort)"
+                );
+            }
+        }
+
+        /// REGRESSION (the live 2026-07-11 shape): the ENTIRE `vco_lib/`
+        /// directory is untracked locally while upstream adds files under it.
+        /// `git status --porcelain` (default `normal`) collapses this to a
+        /// single `?? vco_lib/` entry — which never intersects the file-granular
+        /// upstream-added set unless `list_untracked_files` uses `-uall`. Without
+        /// the fix the collision goes UNDETECTED and this test's Ok+removed
+        /// assertions fail. See KG git-status-collapses-untracked-directories.
+        #[tokio::test]
+        async fn v0278_pre_pull_detects_wholly_untracked_directory_collision() {
+            skip_if_no_git!();
+            let (tmp, _remote, local) = init_remote_and_clone();
+            let seed = tmp.path().join("seed");
+
+            // Upstream adds TWO files under a directory that does not yet exist
+            // in the local clone → locally the whole dir is untracked.
+            let body_a = "def a():\n    return 1\n";
+            let body_b = "def b():\n    return 2\n";
+            push_upstream_added_file(&seed, &local, "vco_lib/mod_a.py", body_a);
+            push_upstream_added_file(&seed, &local, "vco_lib/mod_b.py", body_b);
+
+            // Local UNTRACKED copies, byte-identical (the whole dir is new).
+            let dir = local.join("vco_lib");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("mod_a.py"), body_a).unwrap();
+            std::fs::write(dir.join("mod_b.py"), body_b).unwrap();
+
+            // Sanity: confirm git DOES collapse this to `?? vco_lib/` under the
+            // default mode (documents the reason for -uall).
+            let normal = StdCommand::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(&local)
+                .output()
+                .unwrap();
+            let normal_str = String::from_utf8_lossy(&normal.stdout);
+            assert!(
+                normal_str.lines().any(|l| l.trim() == "?? vco_lib/"),
+                "precondition: default git status must collapse the dir; got:\n{}",
+                normal_str
+            );
+
+            let res = handle_untracked_collisions_pre_pull(&local, "merge", "main").await;
+            assert!(
+                res.is_ok(),
+                "wholly-untracked-dir byte-identical collision must auto-resolve: {:?}",
+                res
+            );
+            assert!(
+                !dir.join("mod_a.py").exists() && !dir.join("mod_b.py").exists(),
+                "both byte-identical untracked files must have been auto-removed",
+            );
+        }
+
+        /// v0.2.78 ITEM #0 (F3) — SOURCE-SHAPE guard: the finalize tail
+        /// (`run_post_pull_install_and_restart`, which runs install.py --update +
+        /// binary refresh + hub restart) MUST remain wired on every post-choice
+        /// success path, so a GUI-only user auto-continues without a terminal:
+        ///   * `merge_orchestrator_with_upstream` success,
+        ///   * `rebase_orchestrator_onto_upstream` success,
+        ///   * `resolve_conflict_and_resume` (both keep-mine/take-upstream) →
+        ///     delegates to `resume_orchestrator_update` which itself finalizes.
+        /// This is the F3 residual: the wiring already exists (verified 2026-07-11);
+        /// this guard catches a future refactor silently dropping it — a
+        /// behavioral test can't reach it without a real install + restart.
+        ///
+        /// Needles are ASSEMBLED FROM SPLIT LITERALS so the test's own source
+        /// (included via include_str! — this test IS in installer.rs) does not
+        /// match its own needle. See KG
+        /// source-shape-guard-tests-split-literal-needles-2026-07-02.
+        #[test]
+        fn v0278_f3_finalize_tail_stays_wired_on_success_paths() {
+            let src = include_str!("installer.rs");
+            // Split-literal assembly: neither of these string literals, as
+            // written here, equals the runtime call token we count.
+            let finalize_call = concat!("run_post_pull_install", "_and_restart(");
+            let resume_call = concat!("resume_orchestrator", "_update(app, path, window)");
+
+            let finalize_hits = src.matches(finalize_call).count();
+            // merge success + rebase success + resolve_conflict_and_resume all
+            // call the finalize tail directly (3 call-sites). If a refactor drops
+            // one, this trips.
+            assert!(
+                finalize_hits >= 3,
+                "expected >=3 run_post_pull_install_and_restart call-sites on the \
+                 update success paths (merge, rebase, resolve-resume); found {}. A \
+                 finalize call was likely dropped — GUI-only auto-continue would break.",
+                finalize_hits
+            );
+
+            // resolve_conflict_and_resume's tail must delegate to the resume
+            // command (which finalizes) — the keep-mine/take-upstream → auto-
+            // continue story depends on this exact delegation.
+            assert!(
+                src.contains(resume_call),
+                "resolve_conflict_and_resume must delegate to resume_orchestrator_update \
+                 so the conflict-resolution path auto-continues to finalize",
+            );
+        }
+
+        /// A pure-local untracked scratch file that upstream did NOT add is NOT
+        /// a collision → handler returns Ok and the file is untouched. Guards
+        /// against over-eager removal of KG nodes / notes.
+        #[tokio::test]
+        async fn v0278_pre_pull_ignores_non_collision_untracked_scratch() {
+            skip_if_no_git!();
+            let (tmp, _remote, local) = init_remote_and_clone();
+            let seed = tmp.path().join("seed");
+            // Upstream adds an UNRELATED file.
+            push_upstream_added_file(&seed, &local, "vco_lib/added.py", "x = 1\n");
+            // Local untracked scratch upstream never touched.
+            let scratch = local.join("knowledge/concepts/scratch.md");
+            std::fs::create_dir_all(scratch.parent().unwrap()).unwrap();
+            std::fs::write(&scratch, "# scratch\n").unwrap();
+
+            let res = handle_untracked_collisions_pre_pull(&local, "merge", "main").await;
+            assert!(res.is_ok(), "non-collision must be Ok: {:?}", res);
+            assert!(
+                scratch.exists(),
+                "pure-local untracked scratch must never be removed",
+            );
+        }
+
         // v0.2.63: the HEAD-advance backstop — test BOTH the abort case (HEAD
         // behind upstream) and the proceed case (HEAD at upstream tip), per the
         // "test the decision, not just the happy path" rule for branches that
@@ -15302,6 +15814,37 @@ severity_max: critical\n\
             assert!(
                 read_update_resume_sentinel(&local).is_none(),
                 "fresh fixture must have no sentinel"
+            );
+        }
+
+        // ─── v0.2.78 ITEM #0 (F4) — benign-noop resume decision ───
+
+        /// The head-unchanged decision: HEAD == recorded conflict SHA (and the
+        /// SHA is non-empty) ⇒ benign no-op (the merge/rebase was aborted;
+        /// nothing to resume). This is the branch that now self-clears + returns
+        /// a SUCCESS-shaped result instead of a red-banner Err.
+        #[test]
+        fn v0278_f4_resume_head_unchanged_is_benign_noop_decision() {
+            // ACT: same non-empty SHA on both sides → benign no-op.
+            assert!(
+                resume_head_unchanged_is_benign_noop("abc123", "abc123"),
+                "HEAD == conflict SHA (non-empty) must be a benign no-op",
+            );
+            // LEAVE-ALONE: HEAD advanced past the conflict SHA → a real resume
+            // (must NOT be treated as a no-op — the finalize tail should run).
+            assert!(
+                !resume_head_unchanged_is_benign_noop("abc123", "def456"),
+                "HEAD advanced → not a no-op; the resume must proceed to finalize",
+            );
+            // EMPTY conflict SHA (older sentinels) → cannot prove HEAD didn't
+            // move → NOT a benign no-op (let the other guards run).
+            assert!(
+                !resume_head_unchanged_is_benign_noop("", ""),
+                "empty conflict SHA must not be classified as a benign no-op",
+            );
+            assert!(
+                !resume_head_unchanged_is_benign_noop("", "abc123"),
+                "empty conflict SHA (any HEAD) must not be a benign no-op",
             );
         }
 

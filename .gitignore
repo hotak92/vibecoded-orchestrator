@@ -279,6 +279,14 @@ knowledge/inbox/
 knowledge/daily/
 knowledge/_drafts/
 
+# Runtime-generated KG retrieval-summary sidecar (written by
+# generate-kg-summary.py / sync_knowledge_graph.py KG-4 into the ACTIVE
+# project's knowledge/ dir). Machine-local + regenerable — must never be
+# tracked, or a normal session would dirty a tracked file and trip the
+# orchestrator-update divergence modal every release (v0.2.78 ITEM #0 F5).
+# The shipped authoring seed lives at templates/knowledge/.node_formats.json.
+knowledge/.node_formats.json
+
 # VS Code per-machine tasks (settings.json already covered earlier)
 .vscode/tasks.json
 

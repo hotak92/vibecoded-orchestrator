@@ -307,7 +307,19 @@ echo "  [running pytest tests/ ...]"
 # 5 spurious failures that vanished once REPO_ROOT was on PYTHONPATH (the same
 # commit passes 7170/0/35 with the prepend). The canonical test recipe uses the
 # same prepend; the gate must match it or it lies.
-if PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:$PYTHONPATH}" "${_PYTEST_CMD[@]}" tests/ -q --tb=no > /tmp/preship-pytest.log 2>&1; then
+#
+# SECRET-ENV TRAP (v0.2.78): this script's OWN gh-based gates (CodeQL /
+# Dependabot / workflow-green checks) require a real GH_TOKEN in the caller's
+# env. But `tests/test_agent_secrets.py::test_exec_injects_env_not_argv`
+# asserts `GH_TOKEN not in os.environ` (a secret must reach the child via
+# injected env, never leak from the parent). So running pre-ship-check with
+# GH_TOKEN set — the normal way, so its gh gates work — would FALSELY fail that
+# one pytest, even though CI (which runs pytest with no GH_TOKEN in-env) is
+# green. Scrub the secret-shaped resolver vars from the pytest child's env so
+# the gate reflects the CI condition, not the launcher's own gh needs. `env -u`
+# only unsets for this child; the parent keeps GH_TOKEN for the later gh gates.
+if env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN \
+    PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:$PYTHONPATH}" "${_PYTEST_CMD[@]}" tests/ -q --tb=no > /tmp/preship-pytest.log 2>&1; then
     gate_pass "pytest tests/"
 else
     gate_fail "pytest tests/" "See /tmp/preship-pytest.log (cmd: ${_PYTEST_CMD[*]})"
