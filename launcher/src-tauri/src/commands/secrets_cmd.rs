@@ -287,17 +287,35 @@ pub async fn set_secret_v2(
     db: State<'_, Db>,
 ) -> Result<(), String> {
     // Validate value against the manifest regex if provided.
-    if let Some(pattern) = validation_regex.as_deref() {
+    //
+    // v0.2.80 A4: whether a manifest regex matched also decides which keychain
+    // write path we take. The `secrets::set` chokepoint refuses a blob-shaped
+    // value by default; but a module MAY legitimately declare a multi-line
+    // secret (e.g. a PEM the allowlist doesn't recognise) whose shape its
+    // manifest `validation_regex` vouches for. When a regex matched, the
+    // manifest is the authority on the value's shape → route to the
+    // `set_allowing_multiline` opt-out. With NO manifest regex the caller has
+    // vouched nothing, so the default guarded `set` (blob-rejecting) applies.
+    let manifest_vouched_shape = if let Some(pattern) = validation_regex.as_deref() {
         let re = regex::Regex::new(pattern)
             .map_err(|e| format!("invalid validation regex: {}", e))?;
         if !re.is_match(&value) {
             return Err("value does not match validation pattern".into());
         }
-    }
+        true
+    } else {
+        false
+    };
 
     enforce_scope_invariants(&scope, &project_id, &db)?;
     let scope_enum = scope_from_manifest(&scope, &project_id);
-    secrets::set(scope_enum, &module_id, &key, &value)?;
+    if manifest_vouched_shape {
+        // Manifest regex matched → the manifest authors the value's shape.
+        // control-char + over-long-github_pat gates still apply inside.
+        secrets::set_allowing_multiline(scope_enum, &module_id, &key, &value)?;
+    } else {
+        secrets::set(scope_enum, &module_id, &key, &value)?;
+    }
     // Setting a value implicitly activates the entry. Covers both the
     // first Set and any later Update / "Set as new value" path. Without
     // this, an entry that was Unset and then re-Set without going through

@@ -149,6 +149,7 @@
 //! Worst-case added latency on the failure path: 150ms pacing + 50ms
 //! + 250ms + 1000ms = ~1.45s before propagating an error.
 
+use crate::secret_value_shape;
 use keyring::Entry;
 
 const SERVICE_PREFIX: &str = "vct";
@@ -549,7 +550,93 @@ pub fn keyring_probe_available() -> bool {
     .unwrap_or(false)
 }
 
+// ─── Write chokepoint (v0.2.80 A4) ────────────────────────────────────────
+//
+// Every production keychain write funnels through `set` on every OS. Before
+// v0.2.80 the shape guard lived only at the app-crate READ boundaries; the
+// actual writers (GUI `set_secret_v2`, hub `/migrate`, ~35 call-sites) reached
+// `set` unguarded, so a blob pasted in the GUI or POSTed to `/migrate` was
+// laundered into the keychain. Guarding per-call-site is the N-copies
+// anti-pattern; instead the guard lives HERE, at the one function every writer
+// must pass through, so it is structurally unbypassable.
+//
+//   * `set`                    — the default write: refuses a blob-shaped value.
+//   * `set_allowing_multiline` — the opt-out for a caller that has vouched the
+//                                value legitimately spans multiple lines (a
+//                                manifest-declared multi-line secret). It still
+//                                rejects control chars + an over-long github_pat
+//                                (allow_multiline does NOT bypass those).
+//   * `set_raw`                — PRIVATE. The bare keychain write, no shape
+//                                guard. Only `set` / `set_allowing_multiline`
+//                                may reach it, so no writer can skip the guard.
+//
+// The value NEVER appears in an error: the guard surfaces the reason slug +
+// byte-length only.
+
+/// Guarded keychain write — the default write path for a single-well-formed
+/// secret. Rejects a blob-shaped value (embedded newline with no recognised
+/// structure, a `KEY=value` continuation line, a control char, or an over-long
+/// `github_pat`) BEFORE it can reach the OS keychain, returning a metadata-only
+/// error (reason slug + byte-length, never the value).
+///
+/// A legit multi-line secret (PEM/cert/OpenSSH — matched by the predicate's
+/// allowlist) passes. A caller that must store a *non-allowlisted* multi-line
+/// value it has independently vouched for uses [`set_allowing_multiline`].
 pub fn set(
+    scope: SecretScope<'_>,
+    module_id: &str,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    if let Err(reason) =
+        secret_value_shape::is_single_line_secret(value, false, key)
+    {
+        // Metadata only: reason slug + byte-length. NEVER the value.
+        return Err(format!(
+            "keyring set refused: value shape {} ({} bytes)",
+            reason,
+            value.len()
+        ));
+    }
+    set_raw(scope, module_id, key, value)
+}
+
+/// Guarded keychain write for a caller-vouched MULTI-LINE value.
+///
+/// Same as [`set`] but passes `allow_multiline = true` to the shape predicate:
+/// an unrecognised multi-line value (one that isn't a PEM/cert the allowlist
+/// already accepts) is permitted because the CALLER has established, out of
+/// band, that a multi-line value is legitimate here (e.g. a module manifest
+/// whose `validation_regex` matched the pasted value). The control-char and
+/// over-long-`github_pat` gates are NOT bypassed by `allow_multiline` — a
+/// control char or a 200+char single-line github_pat is still refused. Use this
+/// ONLY where a multi-line value is provably legitimate; the default
+/// [`set`] is the safe choice everywhere else.
+pub fn set_allowing_multiline(
+    scope: SecretScope<'_>,
+    module_id: &str,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    if let Err(reason) =
+        secret_value_shape::is_single_line_secret(value, true, key)
+    {
+        // Metadata only: reason slug + byte-length. NEVER the value.
+        return Err(format!(
+            "keyring set refused: value shape {} ({} bytes)",
+            reason,
+            value.len()
+        ));
+    }
+    set_raw(scope, module_id, key, value)
+}
+
+/// The bare keychain write — PRIVATE, no shape guard. Reached ONLY through the
+/// guarded [`set`] / [`set_allowing_multiline`] wrappers, so every writer pays
+/// the guard. The `mock_set` early-return is here (not in the wrappers) so it
+/// fires for BOTH guarded paths and so a guard-failure `Err` from the wrappers
+/// short-circuits before any mock/keychain interaction.
+fn set_raw(
     scope: SecretScope<'_>,
     module_id: &str,
     key: &str,
@@ -1808,6 +1895,227 @@ mod tests {
              the retry_with_backoff closure (found {paced} paced \
              construction sites, expected 3) — an unpaced `Entry::new` burst \
              is the exact gnome-keyring crash P9 fixed"
+        );
+    }
+
+    // ─── v0.2.80 A4: the `set` write chokepoint is guarded ────────────────
+    //
+    // These pin the INVARIANT the A4 refactor exists to enforce: every
+    // production keychain write funnels through the guarded `set` /
+    // `set_allowing_multiline`, and a blob is refused BEFORE it reaches the
+    // keychain. The unit legs drive the guard through the thread-local mock
+    // (no OS keychain). The source-scan leg proves the guard is structurally
+    // unbypassable — no production code outside this file writes the keychain
+    // via the raw `keyring` primitive.
+
+    /// The default guarded `set` refuses a blob (a `KEY=value` continuation
+    /// line after a token on line 0) with a metadata-only error — reason slug
+    /// present, value ABSENT — and does NOT write the mock store. A plain
+    /// single-line value and a legit PEM both pass and DO write.
+    #[test]
+    fn set_refuses_blob_and_accepts_single_line_and_pem() {
+        let _g = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+
+        // ACT: a blob is refused before it reaches the keychain.
+        let blob = "tok\nKEY=v";
+        let err = set(scope, "mod", "blob_key", blob)
+            .expect_err("blob-shaped value must be refused by the guard");
+        assert!(
+            err.contains("blob_key_eq_continuation"),
+            "error must carry the reason slug; got {err:?}"
+        );
+        assert!(
+            !err.contains("KEY=v") && !err.contains("tok"),
+            "the value must NEVER appear in the error; got {err:?}"
+        );
+        // Refusal happens before the write — nothing landed in the store.
+        assert!(
+            get(scope, "mod", "blob_key").unwrap().is_none(),
+            "a refused blob must not be written to the keychain"
+        );
+
+        // LEAVE-ALONE: a plain single-line value passes and is written.
+        set(scope, "mod", "plain", "plain-token-123").unwrap();
+        assert_eq!(
+            get(scope, "mod", "plain").unwrap().as_deref(),
+            Some("plain-token-123")
+        );
+
+        // LEAVE-ALONE: a legit multi-line PEM passes the allowlist under the
+        // DEFAULT guard (no opt-out needed) and is written verbatim.
+        let pem =
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIB\nAAAA\n-----END RSA PRIVATE KEY-----";
+        set(scope, "deploy", "deploy_key", pem).unwrap();
+        assert_eq!(get(scope, "deploy", "deploy_key").unwrap().as_deref(), Some(pem));
+    }
+
+    /// `set_allowing_multiline` accepts a caller-vouched multi-line value that
+    /// the default guard would refuse — BUT it still rejects a control char and
+    /// an over-long `github_pat` (those gates are not bypassed by
+    /// `allow_multiline`).
+    #[test]
+    fn set_allowing_multiline_accepts_vouched_but_still_blocks_control_and_long_pat() {
+        let _g = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+
+        // A non-allowlisted multi-line value: refused by default `set`,
+        // accepted by the opt-out.
+        let vouched = "line-one\nline-two-no-blob-signature";
+        assert!(
+            set(scope, "mod", "ml_default", vouched).is_err(),
+            "default set must refuse an unrecognised multi-line value"
+        );
+        set_allowing_multiline(scope, "mod", "ml_optout", vouched)
+            .expect("opt-out must accept a caller-vouched multi-line value");
+        assert_eq!(
+            get(scope, "mod", "ml_optout").unwrap().as_deref(),
+            Some(vouched)
+        );
+
+        // Control char: STILL refused under the opt-out.
+        let ctrl = "a\u{7}b";
+        let err = set_allowing_multiline(scope, "mod", "ctrl", ctrl)
+            .expect_err("control char must be refused even under allow_multiline");
+        assert!(
+            err.contains("control_char"),
+            "control-char refusal must carry its slug; got {err:?}"
+        );
+        assert!(get(scope, "mod", "ctrl").unwrap().is_none());
+
+        // Over-long single-line github_pat: STILL refused under the opt-out.
+        let long_pat = "ghp_".to_string() + &"A".repeat(210);
+        let err = set_allowing_multiline(scope, "mod", "github_pat", &long_pat)
+            .expect_err("over-long github_pat must be refused even under allow_multiline");
+        assert!(
+            err.contains("github_pat_over_200"),
+            "over-long github_pat refusal must carry its slug; got {err:?}"
+        );
+        assert!(get(scope, "mod", "github_pat").unwrap().is_none());
+    }
+
+    /// STRUCTURAL ENFORCEMENT (v0.2.80 A4 / audit §5.1). The unit legs above
+    /// drive `set`; but a future edit could re-introduce a raw keychain write
+    /// that bypasses the guard entirely — `keyring::Entry::new(..).set_password`
+    /// straight to the OS store. This test walks the WHOLE launcher Rust source
+    /// (app crate + vct-launcher-core + vct-hub) and asserts that the ONLY file
+    /// which calls the raw keychain-write primitive `.set_password(` is THIS
+    /// file (`secrets.rs`). Every other production write must go through
+    /// `secrets::set` / `secrets::set_allowing_multiline`, which are guarded.
+    ///
+    /// How the negative is guaranteed: if someone adds
+    /// `Entry::new(svc, k)?.set_password(v)` in, say, `secrets_cmd.rs` to skip
+    /// the guard, that file now contains `.set_password(` and the scan below
+    /// pushes it into `offenders`, failing the test. (Verified while writing
+    /// this test by temporarily grepping for `.set_password(` across the tree:
+    /// the only production match is in `secrets.rs`; comments elsewhere say
+    /// `set_password` WITHOUT the `(` and so don't match the `.set_password(`
+    /// needle.)
+    #[test]
+    fn set_password_is_only_called_from_secrets_rs() {
+        use std::path::{Path, PathBuf};
+
+        // `CARGO_MANIFEST_DIR` for this crate = launcher/src-tauri/vct-launcher-core.
+        // The three crate source roots live under launcher/src-tauri/{src,
+        // vct-launcher-core/src, vct-hub/src}. Walk up one level to the
+        // src-tauri root, then scan each crate's `src`.
+        let core_manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let src_tauri_root = core_manifest
+            .parent()
+            .expect("vct-launcher-core has a parent (src-tauri)")
+            .to_path_buf();
+
+        let scan_roots = [
+            src_tauri_root.join("src"),                    // app crate
+            src_tauri_root.join("vct-launcher-core").join("src"),
+            src_tauri_root.join("vct-hub").join("src"),
+        ];
+
+        // The raw keychain-write primitive. A `.set_password(` call is a
+        // DIRECT keychain write; the only legitimate site is this file's
+        // `set_raw` + `keyring_probe_available` canary.
+        const RAW_WRITE_NEEDLE: &str = ".set_password(";
+        // The one file allowed to contain it.
+        const ALLOWED_FILE: &str = "secrets.rs";
+
+        fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+            let entries = match std::fs::read_dir(dir) {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect_rs_files(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let mut files: Vec<PathBuf> = Vec::new();
+        for root in &scan_roots {
+            collect_rs_files(root, &mut files);
+        }
+        assert!(
+            files.len() > 50,
+            "source scan found only {} .rs files — the scan roots are wrong \
+             ({:?}); refusing to pass a scan that walked nothing",
+            files.len(),
+            scan_roots
+        );
+
+        // Detect the needle only in CODE, not in `//` line comments or `///`
+        // doc comments (several files mention the historical
+        // `Entry::new(..).set_password("canary")` shape in prose). For each
+        // line we scan only the portion before the first `//`. This is a
+        // deliberately simple lexer — it does not model string literals that
+        // themselves contain `//` — which is sound here because a real keychain
+        // write is `expr.set_password(arg)` code, never buried inside a string,
+        // and this file's own `RAW_WRITE_NEEDLE` literal lives after a `//`-free
+        // `const` line (so `secrets.rs` still self-matches as the allowed site).
+        fn code_before_line_comment(line: &str) -> &str {
+            match line.find("//") {
+                Some(idx) => &line[..idx],
+                None => line,
+            }
+        }
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut saw_allowed = false;
+        for path in &files {
+            let is_allowed = path.file_name().and_then(|n| n.to_str()) == Some(ALLOWED_FILE);
+            let text = match std::fs::read_to_string(path) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let has_code_write = text
+                .lines()
+                .any(|line| code_before_line_comment(line).contains(RAW_WRITE_NEEDLE));
+            if has_code_write {
+                if is_allowed {
+                    saw_allowed = true;
+                } else {
+                    offenders.push(path.display().to_string());
+                }
+            }
+        }
+
+        assert!(
+            saw_allowed,
+            "expected `{}` in {} (the guarded chokepoint's own keychain write) \
+             — scan may be reading the wrong tree",
+            RAW_WRITE_NEEDLE, ALLOWED_FILE
+        );
+        assert!(
+            offenders.is_empty(),
+            "raw keychain write `{}` found OUTSIDE {} — every production write \
+             must go through the guarded `secrets::set` / \
+             `secrets::set_allowing_multiline` chokepoint, not a bare \
+             `keyring::Entry` primitive. Offending files:\n  {}",
+            RAW_WRITE_NEEDLE,
+            ALLOWED_FILE,
+            offenders.join("\n  ")
         );
     }
 }

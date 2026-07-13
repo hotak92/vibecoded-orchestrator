@@ -23,6 +23,10 @@ pub mod paths;
 pub mod process;
 pub mod python_resolve;
 pub mod registry;
+// v0.2.80 A4: the single-line secret-value shape predicate lives in core so
+// the `secrets::set` write chokepoint (this crate) can call it; the app crate
+// re-exports it from here. See `secret_value_shape.rs` header.
+pub mod secret_value_shape;
 pub mod secrets;
 pub mod services;
 pub mod state;
