@@ -66,6 +66,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tauri::{command, State};
 
+use crate::commands::secret_value_shape;
 use crate::db::Db;
 use crate::secrets::{self, SecretScope};
 
@@ -289,7 +290,7 @@ pub async fn register_secret_from_source(
     //    captures the closure sees nothing.
     let mut value = match strategy {
         SourceStrategy::EnvFile => read_env_value_for_key(&path, &key)?,
-        SourceStrategy::VctSecretsFile => read_whole_file_trimmed(&path)?,
+        SourceStrategy::VctSecretsFile => read_whole_file_trimmed(&path, &key)?,
     };
 
     // 4. Write to the shared user keychain. `secrets::set` does NOT log
@@ -533,13 +534,36 @@ fn read_env_value_for_key(path: &Path, key: &str) -> Result<String, String> {
 
 /// Read a whole file (~/.vct-secrets/shared/<key>), trim trailing
 /// whitespace, return as the secret value. Empty files are rejected.
-fn read_whole_file_trimmed(path: &Path) -> Result<String, String> {
+///
+/// BOUNDARY #3 (v0.2.80 Part A): after trimming, the value is shape-checked
+/// against the single-line secret predicate (`key_name` = the key it's stored
+/// under, so the github_pat length heuristic applies where relevant). A blob —
+/// multiple secrets glued together (a token on line 0 + `KEY=value`
+/// continuation lines), an embedded newline, or a control char — is REJECTED
+/// here with a metadata-only error, so a corrupted file-store value is never
+/// laundered into the keychain by `register_secret_from_source`. Legit
+/// multi-line secrets (PEM/cert/OpenSSH) pass. The error carries the reason
+/// slug + byte-length ONLY — never the value.
+fn read_whole_file_trimmed(path: &Path, key: &str) -> Result<String, String> {
     let txt = fs::read_to_string(path).map_err(|e| {
         format!("read vct-secrets file {}: {}", path.display(), e)
     })?;
     let trimmed = txt.trim().to_string();
     if trimmed.is_empty() {
         return Err(format!("file {} is empty", path.display()));
+    }
+    if let Err(reason) =
+        secret_value_shape::is_single_line_secret(&trimmed, false, key)
+    {
+        // Metadata-only: reason slug + byte-length. NEVER the value.
+        return Err(format!(
+            "value in {} is not a well-formed single secret (reason: {}, \
+             bytes: {}); run `vct doctor` / `vct recover-blob` to inspect \
+             and split it",
+            path.display(),
+            reason,
+            trimmed.len()
+        ));
     }
     Ok(trimmed)
 }
@@ -638,7 +662,10 @@ mod tests {
         let p = tmp();
         let f = p.join("github_pat");
         fs::write(&f, "ghp_secrettoken\n\n").unwrap();
-        assert_eq!(read_whole_file_trimmed(&f).unwrap(), "ghp_secrettoken");
+        assert_eq!(
+            read_whole_file_trimmed(&f, "github_pat").unwrap(),
+            "ghp_secrettoken"
+        );
         fs::remove_dir_all(&p).ok();
     }
 
@@ -647,8 +674,47 @@ mod tests {
         let p = tmp();
         let f = p.join("empty");
         fs::write(&f, "   \n\n").unwrap();
-        let err = read_whole_file_trimmed(&f).unwrap_err();
+        let err = read_whole_file_trimmed(&f, "empty").unwrap_err();
         assert!(err.contains("empty"), "err: {}", err);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    // BOUNDARY #3 (v0.2.80 Part A): a blob file-store value is rejected with a
+    // metadata-only error and never returned for a keychain write.
+    #[test]
+    fn read_whole_file_trimmed_rejects_blob() {
+        let p = tmp();
+        let f = p.join("github_pat");
+        // Token on line 0 + a `KEY=` continuation line = classic blob shape.
+        fs::write(
+            &f,
+            "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\nOPENAI_API_KEY=sk-fake\n",
+        )
+        .unwrap();
+        let err = read_whole_file_trimmed(&f, "github_pat").unwrap_err();
+        assert!(
+            err.contains("blob_key_eq_continuation"),
+            "expected reason slug in err, got: {}",
+            err
+        );
+        // The error MUST NOT leak the value.
+        assert!(!err.contains("ghp_AAAA"), "err leaked value: {}", err);
+        assert!(!err.contains("sk-fake"), "err leaked value: {}", err);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    // A legit PEM multi-line secret passes the shape check.
+    #[test]
+    fn read_whole_file_trimmed_accepts_pem() {
+        let p = tmp();
+        let f = p.join("deploy_key");
+        fs::write(
+            &f,
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIB\nAAAA\n-----END RSA PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let got = read_whole_file_trimmed(&f, "deploy_key").unwrap();
+        assert!(got.starts_with("-----BEGIN RSA PRIVATE KEY-----"));
         fs::remove_dir_all(&p).ok();
     }
 
@@ -854,5 +920,106 @@ mod tests {
         out.sort();
         assert_eq!(out, vec!["github_pat".to_string(), "vercel_token".to_string()]);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Cross-language parity (v0.2.80 Part A) ───────────────────────────
+    //
+    // The Rust leg of the shared `tests/fixtures/secret_value_shape_parity.json`.
+    // `tests/test_secret_value_shape.py` consumes the SAME fixture for the
+    // Python SSOT `vco_lib.secret_value_shape`, and `tools/vct-secrets/tests/
+    // test_vct.sh` for the bash mirror. A divergence in ANY mirror fails that
+    // language's parity leg. Python is the SSOT (A>B>C); the fixture locks the
+    // Rust + bash mirrors to it. Fixture path resolved from `CARGO_MANIFEST_DIR`
+    // (= `launcher/src-tauri/`) → two parents up to the repo root (same walk as
+    // `env_secrets_migrate.rs`'s parity test).
+
+    #[derive(serde::Deserialize)]
+    struct ShapeFixture {
+        #[serde(rename = "_format_version", default)]
+        format_version: u32,
+        cases: Vec<ShapeCase>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ShapeCase {
+        name: String,
+        value: String,
+        key_name: String,
+        expect_ok: bool,
+        expect_reason: String,
+        expect_taxonomy: String,
+    }
+
+    fn load_shape_fixture() -> ShapeFixture {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("CARGO_MANIFEST_DIR must have two parents (repo layout)");
+        let fixture_path = repo_root
+            .join("tests")
+            .join("fixtures")
+            .join("secret_value_shape_parity.json");
+        assert!(
+            fixture_path.exists(),
+            "Parity fixture missing: {} — shared with \
+             tests/test_secret_value_shape.py + tools/vct-secrets/tests/test_vct.sh",
+            fixture_path.display()
+        );
+        let raw = std::fs::read_to_string(&fixture_path)
+            .unwrap_or_else(|e| panic!("read {}: {}", fixture_path.display(), e));
+        let fix: ShapeFixture = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("parse {}: {}", fixture_path.display(), e));
+        assert_eq!(
+            fix.format_version, 1,
+            "Fixture _format_version != 1 — coordinate the bump with the Python side"
+        );
+        assert!(!fix.cases.is_empty(), "Fixture has no cases");
+        fix
+    }
+
+    #[test]
+    fn secret_value_shape_parity_matches_shared_fixture() {
+        let fix = load_shape_fixture();
+        let mut failures: Vec<String> = Vec::new();
+
+        for case in &fix.cases {
+            // Predicate parity: (ok, reason) must match expect_ok / expect_reason
+            // for each case (allow_multiline=false, per the fixture contract).
+            let got = secret_value_shape::is_single_line_secret(
+                &case.value,
+                false,
+                &case.key_name,
+            );
+            let (got_ok, got_reason): (bool, &str) = match got {
+                Ok(()) => (true, ""),
+                Err(r) => (false, r),
+            };
+            if got_ok != case.expect_ok || got_reason != case.expect_reason {
+                failures.push(format!(
+                    "  [{}] predicate: got (ok={}, reason={:?}), \
+                     expected (ok={}, reason={:?})",
+                    case.name, got_ok, got_reason, case.expect_ok, case.expect_reason
+                ));
+            }
+
+            // Taxonomy parity (bonus leg): classify_secret_value must match
+            // expect_taxonomy.
+            let got_tax = secret_value_shape::classify_secret_value(&case.value, &case.key_name);
+            if got_tax != case.expect_taxonomy {
+                failures.push(format!(
+                    "  [{}] taxonomy: got {:?}, expected {:?}",
+                    case.name, got_tax, case.expect_taxonomy
+                ));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "Rust secret-value-shape predicate diverges from the shared fixture \
+             (tests/fixtures/secret_value_shape_parity.json) — Python SSOT is \
+             vco_lib/secret_value_shape.py:\n{}",
+            failures.join("\n")
+        );
     }
 }

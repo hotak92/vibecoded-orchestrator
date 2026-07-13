@@ -270,6 +270,63 @@ Every `exec` / `get` / `set` / `revoke` writes one JSON line to `audit.log`:
 Never logs the value. Purpose: forensics — if a secret is suspected
 leaked, who requested it recently?
 
+### Secret value shape — the single-line write invariant
+
+Each file in the store holds **one secret**, and the resolver reads the
+**whole file** (stripping one trailing newline). So a file that holds a
+MULTI-LINE BLOB — several secrets glued together, e.g. a classic PAT on line 0
+plus `KEY=value` continuation lines — is read as a single multi-line
+"password", which `git push` / `gh` reject silently. To prevent that, every
+write boundary shape-checks the value first.
+
+The predicate lives in ONE place — `vco_lib/secret_value_shape.py`
+(`is_single_line_secret`, `classify_secret_value`) — the Python source of truth
+under the A>B>C cross-language rule. The bash `vct` CLI
+(`_is_single_line_secret`) and the Rust import path (`secrets_import.rs`) mirror
+it, all three locked to the canonical fixture
+`tests/fixtures/secret_value_shape_parity.json`.
+
+**Accepted** (write proceeds):
+
+- a **single-line** value (after stripping trailing whitespace/newlines, no
+  interior `\n` / `\r`), OR
+- a recognised **legitimate multi-line secret** — currently the PEM / OpenSSH
+  family: first non-empty line `-----BEGIN … (PRIVATE KEY|CERTIFICATE|PUBLIC
+  KEY)-----` and last non-empty line the matching `-----END …-----`. This
+  allowlist is a named, extensible set; a PEM key is accepted WITHOUT needing
+  any opt-in flag.
+
+**Rejected** (the write is refused; `vct set` points at `--allow-multiline` or
+`vct recover-blob`):
+
+- a multi-line value that is NOT an allowlisted format and has a **blob
+  signature** — any post-first-line matching `(export )?KEY=` anchored at
+  **column 0** (reason `blob_key_eq_continuation`). The column-0 anchor
+  deliberately does not fire on indented JSON/YAML continuations or PEM base64
+  body lines;
+- any other multi-line value (reason `embedded_newline`);
+- a value containing an embedded control character (reason `control_char`);
+- a `github_pat`-named value of length ≥ 200 (reason `github_pat_over_200`) —
+  the "concatenated writes" heuristic.
+
+`vct set --allow-multiline` is an explicit escape hatch for a multi-line format
+the allowlist does not yet recognise; it still refuses control chars and
+over-long `github_pat` values.
+
+**Corruption taxonomy** (`classify_secret_value` → the doctor + recovery branch
+on it):
+
+| Tag | Meaning | Fix |
+|---|---|---|
+| `ok` | single well-formed value | none |
+| `legit_multiline` | PEM / cert / OpenSSH key | none — never flagged |
+| `blob` | multi-secret concatenation (multi-line / column-0 `KEY=` lines) | `vct recover-blob` splits it (backs up first, recovers **every** embedded line, collision-safe) |
+| `length_corruption` | a single-line malformed token (e.g. a `ghp_` value whose length ≠ 40, no embedded newline) | **manual** — nothing to split; re-issue or delete the token |
+
+`length_corruption` is classified DISTINCTLY from `blob` so the doctor never
+tells you to "split" a key that has nothing to split. Recovering a `blob` is a
+mechanical split; a `length_corruption` needs a human to re-issue the credential.
+
 ---
 
 ## Integration patterns

@@ -183,6 +183,7 @@ pub mod update_handoff;
 pub mod retrieval_tuning;
 pub mod rl_settings;
 pub mod runtime_install;
+pub mod secret_value_shape;
 pub mod secrets_cmd;
 pub mod secrets_import;
 pub mod self_update;

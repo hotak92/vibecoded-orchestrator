@@ -16,6 +16,20 @@ ROOT="${VCT_SECRETS_DIR:-$HOME/.vct-secrets}"
 DRY_RUN=0
 if [ "${1:-}" = "--dry-run" ]; then DRY_RUN=1; fi
 
+# Shared secret-shape predicate (bash mirror of the Python SSOT). ONE copy,
+# sourced by both `vct` and this script (SHARED-CODE RULE — no duplication).
+# CDPATH= prefixes the `cd` (neutralises a user CDPATH); not a var assignment.
+# shellcheck disable=SC1007
+_MS_SELF_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)
+# shellcheck source=lib/secret_shape.sh
+if [ -r "$_MS_SELF_DIR/lib/secret_shape.sh" ]; then
+    . "$_MS_SELF_DIR/lib/secret_shape.sh"
+else
+    printf 'migrate-shared: error: shared predicate missing at %s/lib/secret_shape.sh — broken install\n' \
+        "$_MS_SELF_DIR" >&2
+    exit 1
+fi
+
 # Known flat-shared secrets (per design doc §Migration / Current state inventory).
 KNOWN_FLAT=(
     claude_code_oauth_token
@@ -46,6 +60,28 @@ for key in "${KNOWN_FLAT[@]}"; do
         skipped=$((skipped+1))
         continue
     fi
+    # Write-time shape guard (Part A): never migrate a multi-secret BLOB into the
+    # shared store — that would faithfully propagate the corruption. Shape-check
+    # the SOURCE via the shared predicate; on a blob, SKIP (leave the source in
+    # place, nothing lost), drop an empty `.needs-split` marker beside it, and
+    # loudly warn to run `vct recover-blob`. Never read/print the value.
+    src_val=$(cat -- "$src"; printf x); src_val=${src_val%x}
+    if ! reason=$(_is_single_line_secret "$src_val" "$key" 0); then
+        unset src_val
+        printf '  SKIP %s — source is a malformed/blob value (reason: %s). Left in place; not migrated. Run: vct recover-blob --shared --key %s\n' \
+            "$key" "$reason" "$key" >&2
+        # Empty marker file next to the source (chmod 600). Idempotent: skip if present.
+        marker="$src.needs-split"
+        if [ $DRY_RUN -eq 1 ]; then
+            printf '  would mark: %s.needs-split\n' "$key" >&2
+        elif [ ! -e "$marker" ]; then
+            : > "$marker"
+            chmod 600 "$marker" 2>/dev/null || true
+        fi
+        skipped=$((skipped+1))
+        continue
+    fi
+    unset src_val
     if [ $DRY_RUN -eq 1 ]; then
         printf '  would move: %s → shared/%s\n' "$key" "$key"
     else

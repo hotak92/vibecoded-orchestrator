@@ -22,6 +22,27 @@ VCT_SECRETS_DIR="${VCT_SECRETS_DIR:-$HOME/.vct-secrets}"
 AUDIT_LOG="$VCT_SECRETS_DIR/audit.log"
 VERSION="0.1.0-phase1"
 
+# ---------- Shared secret-shape predicate (bash mirror of the Python SSOT) ----------
+# tools/vct-secrets/lib/secret_shape.sh defines _is_single_line_secret() and
+# _classify_secret_value(), the bash mirror of vco_lib/secret_value_shape.py
+# (locked by tests/fixtures/secret_value_shape_parity.json). ONE copy, sourced
+# by both this CLI and migrate-shared.sh (SHARED-CODE RULE — no duplication).
+# The lib lives next to this script even when `vct` is deployed to
+# ~/.vct-secrets/vct (install materialises the whole tools/vct-secrets tree).
+# CDPATH= prefixes the `cd` (neutralises a user CDPATH); not a var assignment.
+# shellcheck disable=SC1007
+_VCT_SELF_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)
+# shellcheck source=lib/secret_shape.sh
+if [ -r "$_VCT_SELF_DIR/lib/secret_shape.sh" ]; then
+    . "$_VCT_SELF_DIR/lib/secret_shape.sh"
+else
+    # Loud-fail: a broken deployment missing the shared predicate must NOT
+    # silently write unguarded (the write-time guard is the whole point).
+    printf 'vct: error: shared predicate missing at %s/lib/secret_shape.sh — broken install\n' \
+        "$_VCT_SELF_DIR" >&2
+    exit 1
+fi
+
 # Env vars to preserve into child when not --preserve-env.
 # Covers locale, terminal, PATH, home — drops everything else.
 PRESERVE_ENV_VARS=(PATH HOME USER LOGNAME TERM LANG SHELL PWD TMPDIR)
@@ -182,6 +203,166 @@ ensure_root() {
     fi
 }
 
+# ---------- Canonical deferral bridge (recover-blob collision, ruling #6) ----------
+#
+# recover-blob's collision handling must NOT hand-roll an UPDATE_DEFERRED writer.
+# The canonical emitter is vco_lib.deferral_report (DeferralReport + safe_emit_
+# entry), the SAME SSOT the Rust launcher shells out to (services/deferral.rs::
+# emit_deferral_entry). deferral_report.py has NO CLI entrypoint, so we invoke it
+# via an inline `python - <<PY` heredoc — mirroring the Rust bridge. On ANY
+# failure (no python, no repo root, import error, bad target folder) we SOFT-FAIL
+# to a clear stderr message (key names only) and never crash recover-blob, never
+# fabricate a .claude/ tree in a non-project dir.
+
+# _resolve_vco_python — echo a python interpreter that can import vco_lib, or
+# empty on none found. Mirrors resolve_python_for_vco_lib()'s RT-4 ladder:
+#   1. $VCT_PYTHON            (explicit override — interpreter binary)
+#   2. $VCT_VENV              (venv dir or interpreter binary)
+#   3. $VCT_INSTALL_ROOT      (<root>/.venv, <root>/claude_mcp_servers/.venv)
+#   4. walk up from this script (≤8 hops) probing the same two venv layouts
+#   5. python3 on PATH        (last resort)
+_resolve_vco_python() {
+    local c
+    # 1. $VCT_PYTHON — explicit interpreter path.
+    if [ -n "${VCT_PYTHON:-}" ] && [ -x "${VCT_PYTHON}" ]; then
+        printf '%s' "$VCT_PYTHON"; return 0
+    fi
+    # 2. $VCT_VENV — venv dir or interpreter binary.
+    if [ -n "${VCT_VENV:-}" ]; then
+        for c in "$VCT_VENV/bin/python" "$VCT_VENV/bin/python3" "$VCT_VENV/Scripts/python.exe"; do
+            [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+        done
+        [ -x "${VCT_VENV}" ] && { printf '%s' "$VCT_VENV"; return 0; }
+    fi
+    # 3. $VCT_INSTALL_ROOT — two known venv layouts.
+    if [ -n "${VCT_INSTALL_ROOT:-}" ]; then
+        for c in "$VCT_INSTALL_ROOT/.venv/bin/python" "$VCT_INSTALL_ROOT/.venv/bin/python3" \
+                 "$VCT_INSTALL_ROOT/claude_mcp_servers/.venv/bin/python" \
+                 "$VCT_INSTALL_ROOT/claude_mcp_servers/.venv/bin/python3"; do
+            [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+        done
+    fi
+    # 4. Walk up from this script's dir (≤8 hops).
+    local cur="$_VCT_SELF_DIR" i
+    for i in 1 2 3 4 5 6 7 8; do
+        for c in "$cur/.venv/bin/python" "$cur/.venv/bin/python3" \
+                 "$cur/claude_mcp_servers/.venv/bin/python" \
+                 "$cur/claude_mcp_servers/.venv/bin/python3"; do
+            [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+        done
+        [ "$cur" = "/" ] && break
+        cur=$(dirname "$cur")
+    done
+    # 5. PATH fallback.
+    if command -v python3 >/dev/null 2>&1; then
+        printf 'python3'; return 0
+    fi
+    printf ''
+    return 1
+}
+
+# _resolve_vco_lib_root — echo a directory that contains an importable
+# `vco_lib` package (has vco_lib/deferral_report.py), or empty. Checked:
+#   1. $VCT_INSTALL_ROOT
+#   2. walk up from this script's dir (≤8 hops)
+_resolve_vco_lib_root() {
+    if [ -n "${VCT_INSTALL_ROOT:-}" ] && [ -f "$VCT_INSTALL_ROOT/vco_lib/deferral_report.py" ]; then
+        printf '%s' "$VCT_INSTALL_ROOT"; return 0
+    fi
+    local cur="$_VCT_SELF_DIR" i
+    for i in 1 2 3 4 5 6 7 8; do
+        if [ -f "$cur/vco_lib/deferral_report.py" ]; then
+            printf '%s' "$cur"; return 0
+        fi
+        [ "$cur" = "/" ] && break
+        cur=$(dirname "$cur")
+    done
+    printf ''
+    return 1
+}
+
+# _resolve_deferral_target_folder — echo the project/orchestrator folder whose
+# .claude/context/UPDATE_DEFERRED.md the deferral lands in, or empty (rootless).
+#   (a) walk up from PWD for a .vct-project → the containing project root
+#   (b) else the resolvable vco_lib root (orchestrator/install root)
+#   (c) else empty → caller soft-fails to a stderr message
+# NEVER fabricate a .claude/ tree — only return a folder that already looks like
+# a managed project (has a .vct-project, a .claude/ dir, or is the vco_lib root).
+_resolve_deferral_target_folder() {
+    local cur
+    cur=$(pwd -P 2>/dev/null) || cur=""
+    while [ -n "$cur" ] && [ "$cur" != "/" ]; do
+        if [ -f "$cur/.vct-project" ] || [ -d "$cur/.claude" ]; then
+            printf '%s' "$cur"; return 0
+        fi
+        cur=$(dirname "$cur")
+    done
+    local root
+    if root=$(_resolve_vco_lib_root) && [ -n "$root" ] && [ -d "$root/.claude" ]; then
+        printf '%s' "$root"; return 0
+    fi
+    printf ''
+    return 1
+}
+
+# emit_blob_collision_deferral KEY BACKUP_PATH  — route a secret_blob_collision
+# through the canonical Python emitter. Key names only; NO values. Soft-fails to
+# a stderr message when python / vco_lib root / project folder can't resolve.
+emit_blob_collision_deferral() {
+    local key="$1" backup="$2"
+    local py root folder
+    py=$(_resolve_vco_python)
+    root=$(_resolve_vco_lib_root)
+    folder=$(_resolve_deferral_target_folder)
+    if [ -z "$py" ] || [ -z "$root" ] || [ -z "$folder" ]; then
+        warn "recover-blob: collision on key '$key' (kept the existing standalone value; \
+extracted copy differs). Could not record an UPDATE_DEFERRED entry (no VCO install / project \
+folder resolved). Blob backup: $backup. Reconcile the two values manually."
+        return 1
+    fi
+    # Pass all data via argv (never inline into the program text) so a key name
+    # can't break the heredoc. The heredoc program reads sys.argv only.
+    if "$py" - "$root" "$folder" "$key" "$backup" <<'PY' 2>/dev/null; then
+import sys
+root, folder, key, backup = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+sys.path.insert(0, root)
+from pathlib import Path
+from vco_lib.deferral_report import DeferralReport, safe_emit_entry
+report = DeferralReport.read(Path(folder))
+safe_emit_entry(
+    report,
+    condition_id="secret_blob_collision",
+    title="Secret blob recovery — key collision (standalone kept)",
+    detected=(
+        f"'vct recover-blob' split a multi-secret blob and found key '{key}' already "
+        f"exists as a standalone secret with a DIFFERENT value. The standalone value "
+        f"was KEPT (never overwritten); the blob-embedded copy was left in the backup."
+    ),
+    why_deferred=(
+        "The two values differ and recover-blob cannot know which is correct — "
+        "resolving requires a human decision."
+    ),
+    command_to_apply=(
+        f"# Compare the standalone value with the blob-embedded copy in the backup, "
+        f"then keep the correct one:\n"
+        f"#   backup: {backup}\n"
+        f"#   key:    {key}\n"
+        f"# (values are NOT shown here; inspect the chmod-600 files directly)"
+    ),
+    severity="warning",
+)
+report.write(Path(folder))
+PY
+        printf 'vct: recorded UPDATE_DEFERRED entry (secret_blob_collision) for key %s in %s\n' \
+            "$key" "$folder" >&2
+        return 0
+    fi
+    warn "recover-blob: collision on key '$key' (kept the existing standalone value). \
+The canonical deferral emitter failed (python/import error). Blob backup: $backup. \
+Reconcile the two values manually."
+    return 1
+}
+
 # JSON-escape a string (minimal: quotes, backslashes, control chars).
 json_escape() {
     local s=$1
@@ -251,10 +432,15 @@ SUBCOMMANDS:
   list [--project NAME]
         List secret keys (names only) for a project, or shared if no --project.
 
-  set --project NAME --key KEY [--confirm-tty]
+  set --project NAME --key KEY [--confirm-tty] [--allow-multiline]
         Store a secret. Value read from stdin ONLY (never from argv).
         Refuses interactive TTY stdin unless --confirm-tty given.
         --project stays REQUIRED for writes (writing should be deliberate).
+        Rejects a multi-secret BLOB (a bare token + KEY=value continuation
+        lines) at the write boundary — a single file must hold ONE secret.
+        A legitimate multi-line secret (PEM/cert/OpenSSH) is accepted
+        automatically; pass --allow-multiline only for a multi-line format
+        the allowlist does not yet recognise.
 
   get --key KEY [--project NAME] [--trusted]
         Print a secret value to stdout. Requires --trusted when stdout is a TTY
@@ -289,14 +475,28 @@ SUBCOMMANDS:
         and store each key into the project. Renames source → FILE.migrated
         on success (not in --dry-run).
 
-  doctor
+  recover-blob [--key KEY] [--project NAME | --shared] [--all]
+        Split a multi-secret BLOB file (a bare token on line 0 + KEY=value
+        continuation lines) into separate standalone secret files. OPT-IN,
+        never auto-mutates. Backs up the blob to .<key>.blob-backup-<ts>
+        first, then extracts every worth-saving line. If an extracted key
+        already exists standalone with a DIFFERENT value, the standalone is
+        KEPT (never overwritten) and the conflict is recorded in the
+        project's UPDATE_DEFERRED.md. Idempotent: a re-run on a clean file
+        is a no-op. Never prints a secret value.
+        --key targets one file; --all scans the scope for blobs.
+
+  doctor [--fix-shape]
         Audit dir/file permissions. Fixes chmod to 700/600 where needed.
         Also shape-checks GitHub token files (any key named github_pat
-        or github_pat.*): warns when the content doesn't match a known
-        GitHub token shape (classic ghp_* 40 chars, fine-grained
-        github_pat_* ~93 chars, App ghs_*/gho_* 40 chars) or contains
-        embedded whitespace. Reads ONLY github_pat-named files for the
-        shape check; never prints secret contents.
+        or github_pat.*): classifies each as ok / blob / length_corruption
+        / legit_multiline and warns with the right remediation (blob →
+        recover-blob; length_corruption → manual re-issue; PEM → note).
+        Reads ONLY github_pat-named files for the shape check; never prints
+        secret contents.
+        --fix-shape additionally RUNS recover-blob on every blob-classified
+        github_pat file (length_corruption / legit_multiline are never
+        auto-mutated). Without --fix-shape, doctor never mutates a secret.
 
   detect-project
         Walks up from PWD to find a .vct-project file; echoes its content.
@@ -351,12 +551,13 @@ cmd_list() {
 }
 
 cmd_set() {
-    local project="" key="" confirm_tty=0
+    local project="" key="" confirm_tty=0 allow_multiline=0
     while [ $# -gt 0 ]; do
         case $1 in
             --project) project=$2; shift 2 ;;
             --key) key=$2; shift 2 ;;
             --confirm-tty) confirm_tty=1; shift ;;
+            --allow-multiline) allow_multiline=1; shift ;;
             --value|--value=*)
                 die "set: --value is forbidden (secrets must come from stdin)"
                 ;;
@@ -385,6 +586,25 @@ cmd_set() {
     chmod 600 "$tmp"
     # shellcheck disable=SC2094
     cat > "$tmp" || { rm -f "$tmp"; die "set: stdin read failed"; }
+
+    # Write-time shape guard (Part A). Read the buffered value back binary-safe
+    # (never echo it) and run the parity-locked single-line predicate. A blob is
+    # rejected HERE — the origin boundary — instead of being faithfully written
+    # and later handed multi-line to git/gh. A legit PEM passes without the flag
+    # (the predicate accepts the allowlisted format); --allow-multiline is the
+    # escape hatch for a multi-line format the allowlist doesn't yet recognise.
+    local _val _reason
+    _val=$(cat -- "$tmp"; printf x); _val=${_val%x}
+    if ! _reason=$(_is_single_line_secret "$_val" "$key" "$allow_multiline"); then
+        rm -f "$tmp"
+        die "set: refusing to store a malformed/blob value for $project/$key (reason: $_reason). \
+A single secret file must hold ONE secret. If this is a legitimate multi-line secret the \
+allowlist doesn't recognise, re-run with --allow-multiline. If this is several secrets glued \
+together (a blob), recover them with 'vct recover-blob --project $project --key $key' after \
+storing the raw file, or split them into separate keys."
+    fi
+    unset _val
+
     mv "$tmp" "$target"
     chmod 600 "$target"
     audit "set" "$project" "$(json_array_from_list "$key")" ""
@@ -675,6 +895,271 @@ cmd_migrate_from_env() {
     fi
 }
 
+# ---------- recover-blob (Part B) ----------
+#
+# Given a multi-secret BLOB file (a bare token on line 0 + KEY=value continuation
+# lines), split every worth-saving line into its own standalone secret file.
+# OPT-IN only — never auto-mutates. Direct file-ops (NOT `vct set`, which would
+# reject the blob) but every written key is audit-logged ("recover-blob").
+#
+# Steps (Opus review #6/#8, ruling #1/#2/#4):
+#   1. Idempotency FIRST — if the file is already single-line-clean → exit 0 no-op
+#      (no backup, no split). Re-running twice is safe.
+#   2. Back up the blob → `.<key>.blob-backup-<ts>` (chmod 600). Nothing destroyed.
+#   3. Classify line 0 — if `^(export )?WORD=` it is itself a KEY= line (extract to
+#      its own key; WARN the base key had no bare token). Else line 0 = base value.
+#   4. Split ALL `(export )?KEY=value` lines → key `KEY`, value only (awk first-`=`
+#      split preserves `==` base64 padding + `=` inside the value).
+#   5. Collision — if an extracted KEY already exists standalone: same hash → drop
+#      (redundant); differ → KEEP standalone, emit a CANONICAL UPDATE_DEFERRED entry.
+#   6. Verify post-split shapes (single-line, predicate-ok) without printing.
+#   7. Print a summary (key names only). NEVER print a secret value.
+
+# _recover_one_blob PROJECT KEY FILEPATH → recover a single blob file in place.
+# Returns 0 on success (recovered or idempotent no-op), non-zero on hard error.
+_recover_one_blob() {
+    local project="$1" key="$2" src="$3"
+    local scope_dir; scope_dir=$(dirname "$src")
+
+    # (1) Idempotency: already single-line-clean → no-op.
+    local cur reason
+    cur=$(cat -- "$src"; printf x); cur=${cur%x}
+    if reason=$(_is_single_line_secret "$cur" "$key" 0); then
+        printf 'vct: recover-blob: %s/%s is already single-line-clean — nothing to do.\n' \
+            "$project" "$key" >&2
+        unset cur
+        return 0
+    fi
+    # A control_char / length-corruption single-line value is NOT a splittable
+    # blob — recovery is manual. Guard: only proceed for multi-line blobs.
+    local tax
+    tax=$(_classify_secret_value "$cur" "$key")
+    if [ "$tax" = "length_corruption" ]; then
+        warn "recover-blob: $project/$key is length_corruption (malformed single-line token, \
+reason: $reason) — nothing to split. Re-issue or delete the token manually."
+        unset cur
+        return 1
+    fi
+
+    # (2) Back up before any mutation.
+    local ts backup
+    ts=$(date -u +%Y%m%dT%H%M%SZ)
+    backup="$scope_dir/.$key.blob-backup-$ts"
+    cp -- "$src" "$backup"
+    chmod 600 "$backup"
+    printf 'vct: recover-blob: backed up %s/%s → %s\n' "$project" "$key" "$(basename "$backup")" >&2
+
+    # Normalise line endings for splitting (same as the predicate's line model).
+    local normalized
+    normalized=$(printf '%s' "$cur" | _secret_shape_normalize_lines)
+    unset cur
+
+    # (3)+(4) Walk the lines. Line 0: bare token → base key; else if `KEY=` →
+    # extract as its own key (warn: base had no bare token). Lines 1+: every
+    # `(export )?KEY=` continuation → extracted. `written_keys` holds ONLY the
+    # extracted continuation keys (NOT the base key, which targets `src` itself).
+    local -a written_keys=()
+    local base_had_token=0
+    local n=0 line
+    # Collect extracted value files in a private work dir so a value never lives
+    # in a variable longer than necessary and is never echoed.
+    local work; work=$(mktemp -d "$scope_dir/.recover.$key.XXXXXX") || { warn "recover-blob: mktemp -d failed"; return 1; }
+    chmod 700 "$work"
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [ "$n" -eq 0 ]; then
+            if [[ "$line" =~ $_SECRET_SHAPE_BLOB_RE ]]; then
+                # Line 0 is itself a KEY= line → the base key had no bare token.
+                warn "recover-blob: $project/$key line 0 is a 'KEY=' line (no bare base token) \
+— likely fully misfiled; extracting it as its own key."
+                _recover_extract_kv "$line" "$work" written_keys
+            else
+                # Line 0 is the base-key value (bare token) — recorded for the
+                # in-place base rewrite below (NOT added to written_keys).
+                base_had_token=1
+            fi
+        else
+            if [[ "$line" =~ $_SECRET_SHAPE_BLOB_RE ]]; then
+                _recover_extract_kv "$line" "$work" written_keys
+            fi
+            # Non-KEY= continuation lines (blank, comments, base64 fragments) are
+            # dropped — they are not standalone secrets. The full original is
+            # preserved in the backup for manual inspection.
+        fi
+        n=$((n + 1))
+    done < <(printf '%s' "$normalized")
+
+    # (5) Install each EXTRACTED continuation key — collision-aware. (The base
+    # key is handled separately below since its target is `src` itself.)
+    local recovered=0 dropped=0 deferred=0 kept=0
+    local wk wpath standalone
+    for wk in "${written_keys[@]}"; do
+        wpath="$work/$wk"
+        [ -f "$wpath" ] || continue
+        standalone="$scope_dir/$wk"
+        if [ "$standalone" = "$src" ]; then
+            # An extracted key whose name equals the blob's own key. Skip the
+            # collision path — the base-rewrite below owns `src`. (Rare: a KEY=
+            # line inside the blob repeats the file's own key name.)
+            dropped=$((dropped + 1))
+            continue
+        fi
+        if [ -f "$standalone" ]; then
+            if cmp -s -- "$wpath" "$standalone"; then
+                # Same value → drop the extracted copy (redundant).
+                dropped=$((dropped + 1))
+            else
+                # Differ → KEEP standalone, never overwrite. Emit canonical deferral.
+                kept=$((kept + 1))
+                if emit_blob_collision_deferral "$wk" "$backup"; then
+                    deferred=$((deferred + 1))
+                fi
+            fi
+        else
+            # No collision → install the extracted key.
+            mv -- "$wpath" "$standalone"
+            chmod 600 "$standalone"
+            audit "recover-blob" "$project" "$(json_array_from_list "$wk")" "source=$key"
+            recovered=$((recovered + 1))
+        fi
+    done
+
+    # Clean the work dir (any leftover / redundant value files removed).
+    rm -rf -- "$work"
+
+    # (6) Base key: if line 0 was a bare token, rewrite `src` to hold ONLY that
+    # token (the blob file becomes a clean single-line secret). If line 0 was
+    # itself a KEY= line we already extracted it; leave the original in place
+    # (backed up) + warn, since blindly deleting it could lose unreconciled data.
+    if [ "$base_had_token" -eq 1 ]; then
+        local token
+        token=$(printf '%s' "$normalized" | sed -n '1p')
+        printf '%s' "$token" > "$src"
+        chmod 600 "$src"
+        audit "recover-blob" "$project" "$(json_array_from_list "$key")" "base-token"
+        # Confirm it's clean now (never print the value).
+        local check
+        check=$(cat -- "$src"; printf x); check=${check%x}
+        if ! _is_single_line_secret "$check" "$key" 0 >/dev/null; then
+            warn "recover-blob: $project/$key still not single-line-clean after split — inspect $backup"
+        fi
+        unset check token
+    else
+        warn "recover-blob: $project/$key had no bare base token (line 0 was a KEY= line). \
+The original file is left in place and backed up at $(basename "$backup"); review + revoke it \
+manually once you've confirmed every embedded key was recovered."
+    fi
+    unset normalized
+
+    # (7) Summary (key names only).
+    printf 'vct: recover-blob: %s/%s — recovered %d key(s), %d redundant dropped, %d collision(s) kept-standalone (%d deferred). Backup: %s\n' \
+        "$project" "$key" "$recovered" "$dropped" "$kept" "$deferred" "$(basename "$backup")" >&2
+    return 0
+}
+
+# _recover_extract_kv LINE WORKDIR WRITTEN_KEYS_ARRAYNAME — split a single
+# `(export )?KEY=value` line, write value → WORKDIR/KEY (chmod 600), append KEY
+# to the named array. First-`=` split via awk (preserves `==` + `=` in value).
+# Never echoes the value.
+_recover_extract_kv() {
+    local line="$1" work="$2" arrname="$3"
+    # Strip a leading `export ` (with the intervening blanks) from the key side.
+    local kv="$line"
+    case "$kv" in
+        export[[:blank:]]*) kv=$(printf '%s' "$kv" | sed 's/^export[[:blank:]][[:blank:]]*//') ;;
+    esac
+    # First-`=` split.
+    local ekey eval
+    ekey=$(printf '%s' "$kv" | awk '{ i=index($0,"="); if (i>0) print substr($0,1,i-1) }')
+    # value = everything after the first `=`.
+    eval=$(printf '%s' "$kv" | awk '{ i=index($0,"="); if (i>0) print substr($0,i+1) }')
+    # Validate the extracted key name (path-safe, [A-Za-z0-9_.-], 1..128).
+    if [ -z "$ekey" ] || [ "${#ekey}" -gt 128 ]; then
+        warn "recover-blob: skipping unparseable KEY= line (invalid key length)"
+        return 0
+    fi
+    case "$ekey" in
+        *..*|*/*|.*|-*) warn "recover-blob: skipping unsafe extracted key: $ekey"; return 0 ;;
+    esac
+    if printf '%s' "$ekey" | LC_ALL=C grep -q '[^A-Za-z0-9_.-]'; then
+        warn "recover-blob: skipping extracted key with invalid chars: $ekey"
+        return 0
+    fi
+    printf '%s' "$eval" > "$work/$ekey"
+    chmod 600 "$work/$ekey"
+    unset eval
+    # Append to the caller's array by name (bash nameref-free for 3.2 compat).
+    eval "$arrname+=(\"\$ekey\")"
+}
+
+cmd_recover_blob() {
+    local project="" key="" fix_all=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --project) project=$2; shift 2 ;;
+            --key) key=$2; shift 2 ;;
+            # --shared is the default scope (an explicit alias for "no --project").
+            --shared) project=""; shift ;;
+            --all) fix_all=1; shift ;;
+            -h|--help) cmd_help; return 0 ;;
+            *) die "recover-blob: unknown arg: $1 (expected [--key KEY] [--project NAME | --shared] [--all])" ;;
+        esac
+    done
+    ensure_root
+
+    # Resolve the scope directory.
+    local scope_dir scope_label
+    if [ -n "$project" ]; then
+        validate_name "project" "$project"
+        scope_dir="$VCT_SECRETS_DIR/projects/$project"
+        scope_label="$project"
+    else
+        # Default (and --shared) → shared scope.
+        scope_dir="$VCT_SECRETS_DIR/shared"
+        scope_label="shared"
+        project="shared"
+    fi
+
+    if [ ! -d "$scope_dir" ]; then
+        die_code 2 "recover-blob: no such scope directory for $scope_label"
+    fi
+
+    if [ -n "$key" ]; then
+        validate_name "key" "$key"
+        local src="$scope_dir/$key"
+        [ -f "$src" ] || die_code 2 "recover-blob: not found — $scope_label/$key"
+        _recover_one_blob "$scope_label" "$key" "$src"
+        return $?
+    fi
+
+    if [ "$fix_all" -eq 1 ]; then
+        # Scan every regular file in the scope; recover the ones the predicate
+        # flags as blobs. Skip dotfiles, _README.md, and existing backups.
+        local f base processed=0
+        for f in "$scope_dir"/*; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f")
+            case "$base" in .*|_README.md) continue ;; esac
+            local v
+            v=$(cat -- "$f"; printf x); v=${v%x}
+            if _is_single_line_secret "$v" "$base" 0 >/dev/null; then
+                unset v; continue   # already clean
+            fi
+            unset v
+            # Only auto-recover splittable blobs (not length_corruption).
+            local tx; tx=$(cat -- "$f"; printf x); tx=${tx%x}
+            local tcls; tcls=$(_classify_secret_value "$tx" "$base"); unset tx
+            [ "$tcls" = "blob" ] || continue
+            _recover_one_blob "$scope_label" "$base" "$f"
+            processed=$((processed + 1))
+        done
+        printf 'vct: recover-blob --all: processed %d blob(s) in %s.\n' "$processed" "$scope_label" >&2
+        return 0
+    fi
+
+    die "recover-blob: pass --key KEY to recover one blob, or --all to scan the scope"
+}
+
 # can-read — probe whether a key resolves, without reading the value.
 # Exit 0 = resolvable, 1 = not. Prints nothing (script-friendly).
 cmd_can_read() {
@@ -729,20 +1214,65 @@ cmd_resolve() {
 #   fine-grained PAT  github_pat_[A-Za-z0-9_]{82} (93 chars)
 #   App installation  ghs_[A-Za-z0-9]{36}        (40 chars)
 #   OAuth token       gho_[A-Za-z0-9]{36}        (40 chars)
+#
+# Part C taxonomy: before the known-shape regex, classify the value's
+# corruption MODE via the shared predicate so the remediation is right:
+#   * blob              → several secrets glued together → `vct recover-blob`
+#                         can split them (a `printf | vct set` re-set can't
+#                         recover the other embedded keys, and post-Part-A
+#                         `vct set` would REJECT the blob anyway).
+#   * length_corruption → a single-line malformed/partial token (nothing to
+#                         split) → manual re-issue or delete.
+#   * legit_multiline   → an allowlisted PEM/cert/OpenSSH under a github_pat
+#                         name is unusual but structurally valid → note, don't
+#                         flag as corrupt.
+#   * ok                → fall through to the known-GitHub-shape regex.
 _doctor_check_github_pat_shape() {
     local f=$1
-    local val len
-    # Strip trailing newlines only — embedded whitespace is itself a defect.
-    val=$(cat -- "$f"; printf x); val=${val%x}
+    local raw val len key
+    key=$(basename "$f")
+    # Read the RAW content (control chars / newlines intact) for the taxonomy;
+    # never print it.
+    raw=$(cat -- "$f"; printf x); raw=${raw%x}
+
+    # Empty file — flag distinctly (no shape to classify).
+    val="$raw"
     while [ "${val%$'\n'}" != "$val" ]; do val=${val%$'\n'}; done
     len=${#val}
     if [ "$len" -eq 0 ]; then
         warn "token-shape: $f is EMPTY"
         return 1
     fi
+
+    # Part C: classify the corruption mode.
+    local tax
+    tax=$(_classify_secret_value "$raw" "$key")
+    case "$tax" in
+        blob)
+            warn "token-shape: $f is a BLOB (several secrets glued together, $len+ chars). gh/git \
+gets a multi-line 'password' and auth fails silently. Recover the embedded keys with: \
+vct recover-blob --key $key $([ "${f#*/shared/}" != "$f" ] && printf -- '--shared' || printf -- '--project <name>')"
+            return 1
+            ;;
+        length_corruption)
+            warn "token-shape: $f is LENGTH-CORRUPTION (a single-line malformed/partial token, \
+$len chars — nothing to split). Manual fix: re-issue or delete the token, then re-set with: \
+printf %s \"\$TOKEN\" | vct set --key $key"
+            return 1
+            ;;
+        legit_multiline)
+            warn "token-shape: $f is a legitimate multi-line secret (PEM/cert/OpenSSH) stored \
+under a github_pat name — unusual but structurally valid; not a GitHub token."
+            return 1
+            ;;
+    esac
+
+    # tax == ok → single-line, well-formed shape. Keep the pre-existing
+    # embedded-whitespace guard (a single interior space is single-line but
+    # still breaks gh/git) then the known-GitHub-shape regex.
     case "$val" in
         *' '*|*$'\t'*|*$'\n'*|*$'\r'*)
-            warn "token-shape: $f contains embedded whitespace/newlines ($len chars) — gh/git will reject it. Re-set with: printf %s \"\$TOKEN\" | vct set --project shared --key $(basename "$f")"
+            warn "token-shape: $f contains embedded whitespace/newlines ($len chars) — gh/git will reject it. Re-set with: printf %s \"\$TOKEN\" | vct set --project shared --key $key"
             return 1
             ;;
     esac
@@ -754,6 +1284,14 @@ _doctor_check_github_pat_shape() {
 }
 
 cmd_doctor() {
+    local fix_shape=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --fix-shape) fix_shape=1; shift ;;
+            -h|--help) cmd_help; return 0 ;;
+            *) die "doctor: unknown arg: $1 (expected [--fix-shape])" ;;
+        esac
+    done
     ensure_root
     local issues=0 fixed=0
     # Check root dir
@@ -799,15 +1337,48 @@ cmd_doctor() {
     # github_pat entries cost real debugging time (the "401 Bad
     # credentials with a 330-char blob" class). Check any key named
     # github_pat or github_pat.* in shared/ and projects/*/.
+    #
+    # With --fix-shape: for any BLOB-classified github_pat file, actively run
+    # the recovery (Part B) instead of only warning. length_corruption /
+    # legit_multiline are NOT auto-fixed (nothing to split / nothing wrong) —
+    # they still warn. A doctor run WITHOUT --fix-shape never mutates a secret.
+    local recovered_blobs=0
     while IFS= read -r f; do
         [ -z "$f" ] && continue
         if ! _doctor_check_github_pat_shape "$f"; then
             issues=$((issues+1))
+            if [ "$fix_shape" -eq 1 ]; then
+                # Only splittable blobs are auto-recovered.
+                local raw tax
+                raw=$(cat -- "$f"; printf x); raw=${raw%x}
+                tax=$(_classify_secret_value "$raw" "$(basename "$f")")
+                unset raw
+                if [ "$tax" = "blob" ]; then
+                    # Derive scope + key from the path.
+                    local base scope proj
+                    base=$(basename "$f")
+                    if [ "${f#*/shared/}" != "$f" ]; then
+                        scope="shared"; proj="shared"
+                    else
+                        # projects/<name>/<key>
+                        proj=$(basename "$(dirname "$f")")
+                        scope="$proj"
+                    fi
+                    if _recover_one_blob "$scope" "$base" "$f"; then
+                        recovered_blobs=$((recovered_blobs + 1))
+                    fi
+                fi
+            fi
         fi
     done < <(find "$VCT_SECRETS_DIR/shared" "$VCT_SECRETS_DIR/projects" \
                   -type f \( -name 'github_pat' -o -name 'github_pat.*' \) 2>/dev/null)
 
-    printf 'vct doctor: %d issues fixed, %d remaining.\n' "$fixed" "$issues" >&2
+    if [ "$fix_shape" -eq 1 ]; then
+        printf 'vct doctor: %d perms fixed, %d shape issue(s) found, %d blob(s) recovered.\n' \
+            "$fixed" "$issues" "$recovered_blobs" >&2
+    else
+        printf 'vct doctor: %d issues fixed, %d remaining.\n' "$fixed" "$issues" >&2
+    fi
     return 0
 }
 
@@ -850,6 +1421,7 @@ main() {
         revoke)            cmd_revoke "$@" ;;
         copy)              cmd_copy "$@" ;;
         migrate-from-env)  cmd_migrate_from_env "$@" ;;
+        recover-blob)      cmd_recover_blob "$@" ;;
         doctor)            cmd_doctor "$@" ;;
         detect-project)    cmd_detect_project "$@" ;;
         help|--help|-h)    cmd_help ;;

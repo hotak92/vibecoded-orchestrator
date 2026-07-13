@@ -8822,6 +8822,30 @@ pub(crate) fn migrate_github_pat_file_to_keychain(
         return Ok(report);
     }
 
+    // BOUNDARY #5 (v0.2.80 Part A): shape-check before laundering into the OS
+    // keychain. A blob (a token on line 0 + `KEY=value` continuation lines, an
+    // embedded newline, or a control char) is NOT migrated — that would copy a
+    // corrupted multi-secret value into the keychain, from where it propagates
+    // to every project's env-pair. Soft-fail: leave the file untouched, do NOT
+    // call `secrets::set`, and do NOT flip `APP_STATE_KEY_GITHUB_PAT_MIGRATED`
+    // (so the migration re-attempts after the user fixes the file). The hint
+    // carries the reason slug + byte-length ONLY — never the value.
+    if let Err(reason) = crate::commands::secret_value_shape::is_single_line_secret(
+        trimmed,
+        false,
+        GITHUB_PAT_KEY,
+    ) {
+        report.warnings.push(format!(
+            "github_pat file at {} is a blob (reason: {}, bytes: {}); not \
+             migrated. Run `vct doctor` / `vct recover-blob` to split it, then \
+             re-run the migration.",
+            path.display(),
+            reason,
+            trimmed.len()
+        ));
+        return Ok(report);
+    }
+
     if let Err(e) = secrets::set(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY, trimmed) {
         // Keychain unreachable — leave the file alone, do NOT flip the
         // flag, so the next call retries. The user's PAT is still on
@@ -8895,11 +8919,41 @@ pub(crate) fn migrate_github_pat_file_to_keychain(
 /// Used by `has_github_pat` / `get_github_pat_preview` to surface
 /// pre-migration values until the user's next `register_github_pat`
 /// call pulls them into the keychain.
+///
+/// BOUNDARY #4 (v0.2.80 Part A — HIGHEST BLAST RADIUS): this feeds
+/// `github_pat_for_env` → `write_project_env_files` writes `GITHUB_TOKEN` into
+/// EVERY registered project's env-pair, and it fires AUTOMATICALLY on env-file
+/// builds (not an explicit import click). A blob here (a token on line 0 + a
+/// `KEY=value` continuation line, an embedded newline, or a control char) would
+/// be handed to `git push` / `gh` as a multi-line password → silent auth
+/// failure across every project. So the trimmed content is shape-checked; a
+/// blob is treated as if there were NO legacy file (returns `None`), and a
+/// remediation hint is logged (reason slug + byte-length ONLY, never the value).
 fn github_pat_from_legacy_file() -> Option<String> {
     let p = github_pat_resolve_existing_file()?;
     let raw = std::fs::read_to_string(&p).ok()?;
     let trimmed = raw.trim().to_string();
-    if trimmed.is_empty() { None } else { Some(trimmed) }
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Err(reason) = crate::commands::secret_value_shape::is_single_line_secret(
+        &trimmed,
+        false,
+        GITHUB_PAT_KEY,
+    ) {
+        // Blob-shaped legacy file → refuse to propagate it. Metadata only:
+        // reason slug + byte-length, NEVER the value.
+        eprintln!(
+            "[vct] github_pat legacy file at {} is not a well-formed single \
+             secret (reason: {}, bytes: {}); skipping env-pair propagation. \
+             Run `vct doctor` / `vct recover-blob` to inspect and split it.",
+            p.display(),
+            reason,
+            trimmed.len()
+        );
+        return None;
+    }
+    Some(trimmed)
 }
 
 #[command]
