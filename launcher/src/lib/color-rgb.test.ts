@@ -9,7 +9,7 @@
 //      exists anywhere under launcher/src (the three per-component copies
 //      that this module replaced must stay deleted).
 
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -76,10 +76,13 @@ describe('getColorRgb — one home', () => {
 
     const offenders: string[] = [];
     const walk = (dir: string): void => {
-      for (const entry of readdirSync(dir)) {
+      // `withFileTypes` classifies each entry from the single readdir call,
+      // so there is no separate stat() check-then-use (avoids the TOCTOU
+      // pattern CodeQL flags as js/file-system-race).
+      for (const dirent of readdirSync(dir, { withFileTypes: true })) {
+        const entry = dirent.name;
         const full = join(dir, entry);
-        const st = statSync(full);
-        if (st.isDirectory()) {
+        if (dirent.isDirectory()) {
           if (entry === 'node_modules' || entry === '.svelte-kit' || entry === 'build') continue;
           walk(full);
           continue;
