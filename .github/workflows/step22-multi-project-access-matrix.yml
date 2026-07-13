@@ -98,7 +98,7 @@ jobs:
       # smoke-only into a hard requirement.
       VCT_CONTAINER_RUNTIME: ${{ matrix.runtime }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

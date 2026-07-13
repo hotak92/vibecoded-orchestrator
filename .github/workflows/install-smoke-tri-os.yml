@@ -189,7 +189,7 @@ jobs:
       #    misses on different OSes are by design.
       # ----------------------------------------------------------------
       - name: Cache pip
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cache/pip
@@ -525,7 +525,7 @@ jobs:
       # ----------------------------------------------------------------
       - name: Upload diagnostics on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: install-smoke-diagnostics-${{ matrix.target }}
           path: |

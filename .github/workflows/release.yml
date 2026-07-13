@@ -129,7 +129,7 @@ jobs:
     outputs:
       is_binary_refresh: ${{ steps.refresh_guard.outputs.is_binary_refresh }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Only HEAD is needed to read its subject. A shallow fetch keeps
           # this guard fast.
@@ -195,7 +195,7 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         # v0.2.64 (P3 — CONCERN-1): fetch FULL history (depth 0), not the
         # default shallow depth 1. Gate 3 (dist freshness) compares against the
         # previous tag, and from v0.2.64 on that previous tag may be a
@@ -534,7 +534,7 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v6
         with:
@@ -1293,7 +1293,7 @@ jobs:
           fi
         id: token_check
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # v0.2.17 fix (post-v0.2.16 release): explicitly check out
           # `main`, NOT the tag's commit. When the release tag is
@@ -1324,19 +1324,19 @@ jobs:
       #   launcher/dist/<target>/vct-launcher[.exe]
       #   launcher/dist/<target>/vct-launcher[.exe].metadata.json
       - name: Download linux-x64 binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: vct-launcher-linux-x64
           path: _dist-artifacts/linux-x64
 
       - name: Download windows-x64 binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: vct-launcher-windows-x64
           path: _dist-artifacts/windows-x64
 
       - name: Download macos-arm64 binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: vct-launcher-macos-arm64
           path: _dist-artifacts/macos-arm64
@@ -1856,7 +1856,7 @@ jobs:
           fi
           echo "SUPABASE_PROJECT_REF is set: ${PROJECT_REF}"
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         if: steps.token_check.outputs.skip != 'true'
         with:
           # Check out the tag's commit so the functions + migrations we
@@ -1876,7 +1876,7 @@ jobs:
       # ci-deploy.md § "Known limitations".
       - name: Set up Supabase CLI
         if: steps.token_check.outputs.skip != 'true'
-        uses: supabase/setup-cli@v1
+        uses: supabase/setup-cli@v3
         with:
           version: latest
 
