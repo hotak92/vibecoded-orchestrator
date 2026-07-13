@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.80] - 2026-07-13
+
+### Security
+- **Secret values are now shape-checked at every write boundary, so a multi-line
+  "blob" can no longer be silently stored where it breaks `git push`/`gh` auth.**
+  A file-store or keychain secret that is actually several secrets glued together
+  (a token on line 0 followed by `KEY=value` config lines) used to be written
+  and served whole, making authentication fail with an opaque error. A single
+  shared validator now rejects such a value at write time across all three
+  languages that write secrets — Python (`vco_lib/secret_value_shape.py`, the
+  source of truth), Rust, and the bash `vct` CLI — pinned together by one parity
+  fixture. Legitimate multi-line secrets (PEM private keys) are recognised and
+  allowed; only blob-shaped values are refused. Error messages carry a reason
+  code and byte-length only — never the secret value.
+- **The keychain write path is guarded at one chokepoint instead of per
+  call-site.** Every keychain write across the launcher, hub, and installer now
+  routes through a single guarded `secrets::set` (the raw writer is private), so
+  the GUI "add secret" box, the install-time `/migrate` route, and every other
+  writer are covered on every OS by construction — a new bypass is a compile
+  error, backed by a source-scan test. A module that legitimately stores a
+  multi-line value opts in explicitly via its manifest validation rule.
+- **Windows now best-effort restricts the hub bearer token + lockfiles to the
+  owning user.** These files were written `0o600` on Unix but with the default
+  ACL on Windows; the token gates every hub route including the secret resolver.
+  Windows writes now attempt an owner-only ACL (best-effort `icacls`, soft-fail
+  with a log line — the write never fails over an ACL-tighten error).
+
+### Added
+- **`vct recover-blob` (and `vct doctor --fix-shape`) splits a corrupt secret
+  blob back into proper keys.** It backs up the blob first, recovers *every*
+  embedded line (not just line 0), and on a collision keeps the existing
+  standalone value while recording the conflict in the project's
+  `UPDATE_DEFERRED.md` via the canonical deferral mechanism. No value is ever
+  printed; it is a no-op on an already-clean file.
+- **`vct doctor` now classifies secret corruption modes** — blob vs
+  length-corrupted token vs legitimate multi-line — so the remediation it
+  suggests matches the actual problem.
+
+### Fixed
+- **PowerShell security hooks now send block messages to stderr**, matching the
+  bash hooks, so a blocked SSRF/injection command shows its guidance instead of
+  an unhelpful "no stderr output" render on Windows. Enforcement was already
+  correct on both OSes; only the message surfacing was wrong.
+- **The Windows secret resolver now falls through on an empty hub value** to the
+  file store and `.env`, matching the POSIX resolver, instead of returning the
+  empty string as the resolved secret.
+
 ## [0.2.79] - 2026-07-12
 
 ### Fixed

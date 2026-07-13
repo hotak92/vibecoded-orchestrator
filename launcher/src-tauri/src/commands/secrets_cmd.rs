@@ -1566,8 +1566,8 @@ mod tests {
     /// docstring for the user-secret regression context. This test
     /// covers the strip side of the same flow.
     #[tokio::test]
-    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env"]
-    #[ignore = "Phase 0.B Part 2: user-secret refresh deferred to Phase 0.E; \
+    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env. \
+                Also Phase 0.B Part 2: user-secret refresh deferred to Phase 0.E; \
                 see set_secret_v2_triggers_env_refresh docstring"]
     async fn delete_secret_v2_strips_secret_from_env_surfaces() {
         // Serialize against other keychain-touching tests across
@@ -1809,8 +1809,8 @@ mod tests {
     /// Phase 0.B Part 2 (2026-05-25): see `set_secret_v2_triggers_env_refresh`
     /// docstring; this test pins fan-out propagation across projects.
     #[tokio::test]
-    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env"]
-    #[ignore = "Phase 0.B Part 2: user-secret refresh deferred to Phase 0.E; \
+    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env. \
+                Also Phase 0.B Part 2: user-secret refresh deferred to Phase 0.E; \
                 see set_secret_v2_triggers_env_refresh docstring"]
     async fn set_secret_v2_global_user_bucket_propagates_to_all_registered_projects() {
         // Serialize against other keychain-touching tests across
@@ -1874,8 +1874,8 @@ mod tests {
     /// Phase 0.B Part 2 (2026-05-25): see `set_secret_v2_triggers_env_refresh`
     /// docstring; this test pins fan-out strip across projects.
     #[tokio::test]
-    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env"]
-    #[ignore = "Phase 0.B Part 2: user-secret refresh deferred to Phase 0.E; \
+    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env. \
+                Also Phase 0.B Part 2: user-secret refresh deferred to Phase 0.E; \
                 see set_secret_v2_triggers_env_refresh docstring"]
     async fn delete_secret_v2_shared_user_bucket_strips_from_all_projects() {
         // Serialize against other keychain-touching tests across
@@ -1952,8 +1952,8 @@ mod tests {
     /// Phase 0.B Part 2 (2026-05-25): see `set_secret_v2_triggers_env_refresh`
     /// docstring; this test pins fan-out strip across projects.
     #[tokio::test]
-    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env"]
-    #[ignore = "Phase 0.B Part 2: user-secret refresh deferred to Phase 0.E; \
+    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env. \
+                Also Phase 0.B Part 2: user-secret refresh deferred to Phase 0.E; \
                 see set_secret_v2_triggers_env_refresh docstring"]
     async fn delete_secret_v2_global_user_bucket_strips_from_all_projects() {
         // Serialize against other keychain-touching tests across
