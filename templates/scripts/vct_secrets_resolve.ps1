@@ -1,4 +1,5 @@
-﻿# vct_secrets_resolve.ps1 — agent-facing secret resolver. PowerShell
+﻿# OS-EXEMPT-PARITY: 2026-07-13 one-directional align-to-sh — the 200-with-empty-value 200-handler now treats an empty-string hub value as a miss (exit 4, fall through) to MATCH vct_secrets_resolve.sh, which already does this via `[[ -z "$val" ]]`. The .sh is already correct, so there is NO Bash-side change to co-modify.
+# vct_secrets_resolve.ps1 — agent-facing secret resolver. PowerShell
 # counterpart of `vct_secrets_resolve.sh`.
 #
 # ONE RESOLUTION CHAIN (v0.2.73 unification — MUST MATCH the other two
@@ -283,7 +284,14 @@ function Read-KeyHub {
                 return @{ ExitCode = 4 }
             }
             $val = $obj.PSObject.Properties[$Key]
-            if ($null -eq $val) {
+            # Treat BOTH an absent field AND a present-but-empty-string
+            # value as a miss (exit 4 → fall through to file-store / .env
+            # tiers). This matches vct_secrets_resolve.sh's `[[ -z "$val" ]]`
+            # 200-handler, where bash cannot distinguish "field absent"
+            # from "field is empty string" — both yield empty $val and
+            # both fall through. Windows previously returned the empty
+            # string as a resolved SUCCESS, diverging from Linux.
+            if ($null -eq $val -or [string]::IsNullOrEmpty($val.Value)) {
                 Write-Err "hub returned 200 but no $Key field; body=$($result.Body)"
                 return @{ ExitCode = 4 }
             }

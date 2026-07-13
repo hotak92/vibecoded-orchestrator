@@ -176,9 +176,14 @@ if ($ToolName -eq "WebFetch") {
         # outbound HTTP doesn't go through this WebFetch SSRF guard.
         $whitelisted = $url -match '(localhost:(8081|8082|11435|11440|7860)|127\.0\.0\.1:(8081|8082|11435|11440|7860))'
         if (-not $whitelisted -and $url -match '(localhost|127\.|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2[0-9]|3[01])\.\d+\.|192\.168\.\d+\.|169\.254\.\d+\.|0\.0\.0\.0|::1)') {
-            Write-Output "SSRF guard: '$url' targets a private/internal network address."
-            Write-Output "   Whitelisted localhost services: Weaviate (:8081), Ollama (:11435), code-embed (:11440), Gradio (:7860)"
-            Write-Output "   To allow additional services, add to whitelist in .claude/hooks/pre-tool-use.ps1"
+            # Route the block message to STDERR (matches pre-tool-use.sh).
+            # Claude Code's PreToolUse runner discards plain stdout — an
+            # exit-2 hook with only-stdout renders as "hook error: No
+            # stderr output". [Console]::Error.WriteLine goes to the true
+            # stderr stream (Write-Output / the PS error stream would not).
+            [Console]::Error.WriteLine("SSRF guard: '$url' targets a private/internal network address.")
+            [Console]::Error.WriteLine("   Whitelisted localhost services: Weaviate (:8081), Ollama (:11435), code-embed (:11440), Gradio (:7860)")
+            [Console]::Error.WriteLine("   To allow additional services, add to whitelist in .claude/hooks/pre-tool-use.ps1")
             $urlEsc = $url -replace '\\', '\\\\' -replace '"', '\"'
             Write-SecurityLine "{""timestamp"":""$ts"",""event"":""ssrf_blocked"",""url"":""$urlEsc""}"
             exit 2
@@ -195,10 +200,12 @@ if ($ToolName -eq "Bash") {
     elseif ($cmd -match '(?i)base64\s+-d.*\|\s*(ba)?sh\b') { $injection = "base64-decoded pipe to shell" }
 
     if ($injection) {
-        Write-Output "Shell injection guard: detected '$injection' in Bash command."
+        # Route the block message to STDERR (matches pre-tool-use.sh) —
+        # see the SSRF-guard branch above for why plain stdout is dropped.
+        [Console]::Error.WriteLine("Shell injection guard: detected '$injection' in Bash command.")
         $preview = if ($cmd.Length -gt 120) { $cmd.Substring(0, 120) } else { $cmd }
-        Write-Output "   Blocked command preview: $preview"
-        Write-Output "   If this is intentional, run the command manually in a terminal."
+        [Console]::Error.WriteLine("   Blocked command preview: $preview")
+        [Console]::Error.WriteLine("   If this is intentional, run the command manually in a terminal.")
         $previewEsc = ($preview -replace '\\', '\\\\' -replace '"', '\"')
         Write-SecurityLine "{""timestamp"":""$ts"",""event"":""shell_injection_blocked"",""pattern"":""$injection"",""cmd_preview"":""$previewEsc""}"
         exit 2
@@ -211,8 +218,11 @@ if ($ToolName -eq "Bash") {
             $secOut = $cmd | & $PY $SecurityScript 2>&1
             $secExit = $LASTEXITCODE
             if ($secExit -eq 2) {
-                Write-Output "Bash security scanner blocked this command:"
-                Write-Output "   $secOut"
+                # Route to STDERR (matches pre-tool-use.sh's bash-security
+                # branch) — same stdout-discard rationale as the SSRF /
+                # injection guards above.
+                [Console]::Error.WriteLine("Bash security scanner blocked this command:")
+                [Console]::Error.WriteLine("   $secOut")
                 $detail = if ("$secOut".Length -gt 200) { "$secOut".Substring(0,200) } else { "$secOut" }
                 $detailEsc = $detail -replace '\\', '\\\\' -replace '"', '\"'
                 $cmdPreview = if ($cmd.Length -gt 80) { $cmd.Substring(0,80) } else { $cmd }
@@ -348,8 +358,12 @@ if ($ToolName -eq "Write" -or $ToolName -eq "Edit") {
                 }
                 if (-not $alreadyRead) {
                     $bn = Split-Path $filePath -Leaf
-                    Write-Output "Build Anchor Protocol: '$bn' has not been Read this session."
-                    Write-Output "    Use the Read tool on this file before overwriting it with Write."
+                    # Route to STDERR (matches pre-tool-use.sh's Build Anchor
+                    # branch) — same stdout-discard rationale as the guards
+                    # above; an exit-2 hook with only-stdout renders as
+                    # "hook error: No stderr output".
+                    [Console]::Error.WriteLine("Build Anchor Protocol: '$bn' has not been Read this session.")
+                    [Console]::Error.WriteLine("    Use the Read tool on this file before overwriting it with Write.")
                     $fpEsc = $filePath -replace '\\', '\\\\' -replace '"', '\"'
                     Write-SecurityLine "{""timestamp"":""$ts"",""event"":""anchor_blocked"",""file"":""$fpEsc"",""tool"":""Write""}"
                     exit 2

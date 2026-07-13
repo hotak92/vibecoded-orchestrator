@@ -49,6 +49,10 @@ use std::path::PathBuf;
 
 use vct_launcher_core::paths::vct_root_dir;
 use vct_launcher_core::process::pid_is_alive;
+// Only used by the Windows write path (owner-only DACL tighten). On Unix
+// the mode(0o600) open handles restriction, so this import would be dead.
+#[cfg(not(unix))]
+use vct_launcher_core::services::boot_token::restrict_file_to_owner_windows;
 
 /// File where the hub persists its PID on startup.
 pub const PID_FILE: &str = "hub.pid";
@@ -527,6 +531,11 @@ pub fn write_pid_and_identity(pid: u32, identity: &str) -> Result<(), String> {
     {
         std::fs::write(&path, body)
             .map_err(|e| format!("write {}: {}", path.display(), e))?;
+        // Best-effort owner-only DACL on Windows (defense-in-depth on top
+        // of the user-profile default ACL). Shared helper with the token
+        // writer so the lockfile and token surfaces can't drift; soft-fails
+        // without touching the write result. See boot_token.rs.
+        restrict_file_to_owner_windows(&path);
     }
 
     Ok(())

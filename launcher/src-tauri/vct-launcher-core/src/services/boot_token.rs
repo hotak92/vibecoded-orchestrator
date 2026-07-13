@@ -14,7 +14,9 @@
 // middleware, error envelopes) stay in each server; this module owns:
 //
 //   * token generation from the OS CSPRNG,
-//   * 0o600-mode persistence (Unix; default ACL on Windows),
+//   * 0o600-mode persistence (Unix) / best-effort owner-only DACL on
+//     Windows (default ACL + a best-effort `icacls` tighten; see
+//     `restrict_file_to_owner_windows`),
 //   * constant-time comparison,
 //   * Bearer-scheme parsing from a raw header VALUE string.
 
@@ -52,11 +54,16 @@ pub fn generate_token() -> Result<String, String> {
 ///      exists with the umask's default mode.
 ///   3. Write the token bytes.
 ///
-/// On Windows we fall through to a plain `std::fs::write`. The default
-/// ACL on a file under the user's profile dir is already same-user-only
-/// (the user owns it; siblings on the same machine can't read it
-/// without admin). Setting NTFS ACLs from Rust without the `windows`
-/// crate is heavy; we accept the default-ACL posture and document it.
+/// On Windows the default ACL on a file under the user's profile dir is
+/// already same-user-only (the user owns it; siblings on the same
+/// machine can't read it without admin). As DEFENSE-IN-DEPTH — not
+/// because that default is wrong — we ALSO best-effort tighten the DACL
+/// to owner-only after writing via [`restrict_file_to_owner_windows`]
+/// (an `icacls` shell-out). That tighten is soft-fail: if `icacls` is
+/// missing or errors, we log and keep the file (never fail the write
+/// over an ACL-hardening miss — conservative-defaults-on-best-effort
+/// rule). Pulling the `windows` crate's `SetNamedSecurityInfo` would be
+/// heavier for the same effect, so we stay dependency-light.
 pub fn write_token_file(path: &Path, token: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -83,9 +90,100 @@ pub fn write_token_file(path: &Path, token: &str) -> Result<(), String> {
     {
         std::fs::write(path, token.as_bytes())
             .map_err(|e| format!("write {}: {}", path.display(), e))?;
+        // Best-effort owner-only DACL; soft-fails without touching the
+        // write result. See restrict_file_to_owner_windows.
+        restrict_file_to_owner_windows(path);
     }
 
     Ok(())
+}
+
+/// Best-effort tighten a file's DACL to owner-only on Windows.
+///
+/// This is the SHARED Windows-ACL-hardening helper called by every
+/// writer of a same-user-only credential/lockfile (`hub.token`,
+/// per-project `hub.token.<id>`, boot tokens, `hub.pid`) — one
+/// implementation so the token surface and the lockfile surface can't
+/// drift (mirrors the shared-writer discipline this module was extracted
+/// for).
+///
+/// Rationale for the `icacls` shell-out (vs the `windows` crate's
+/// `SetNamedSecurityInfo`): the crate route needs the heavy
+/// `Win32_Security` feature set and hand-rolled SID/ACL construction for
+/// a once-per-startup hardening step. `icacls` ships in-box on every
+/// supported Windows and expresses "strip inheritance, grant only the
+/// current user Full" in one command — dependency-light and robust.
+/// `%USERNAME%` is resolved via the `USERNAME` env var (present in every
+/// interactive/service session); if it's somehow absent we skip rather
+/// than guess an identity.
+///
+/// Contract: NEVER fails the caller. Any error (icacls missing, spawn
+/// failure, non-zero exit, missing `USERNAME`) is logged at warn/debug
+/// and swallowed — the file is already written and, per the default-ACL
+/// posture above, still same-user-readable in practice. On non-Windows
+/// this is a no-op (the Unix path already restricts via `mode(0o600)`).
+///
+/// Security note: we pass the username and path as separate argv entries
+/// (never shell-interpolated), so a hostile `USERNAME` cannot inject
+/// extra icacls arguments — `Command::arg` does no shell parsing.
+#[allow(unused_variables)]
+pub fn restrict_file_to_owner_windows(path: &Path) {
+    #[cfg(windows)]
+    {
+        use crate::process::CommandExt as _;
+
+        let username = match std::env::var("USERNAME") {
+            Ok(u) if !u.trim().is_empty() => u,
+            _ => {
+                // No stable identity to grant to — leave the default ACL
+                // in place rather than guess. Soft-fail.
+                eprintln!(
+                    "[boot_token] restrict_file_to_owner_windows: USERNAME unset; \
+                     leaving default ACL on {}",
+                    path.display()
+                );
+                return;
+            }
+        };
+
+        // icacls <path> /inheritance:r /grant:r "<user>:F"
+        //   /inheritance:r  -> remove inherited ACEs (break inheritance)
+        //   /grant:r "<u>:F" -> replace grants: only <u> gets Full
+        // Result: owner-only DACL, no inherited-from-parent access.
+        let grant = format!("{}:F", username);
+        let output = std::process::Command::new("icacls")
+            .arg(path)
+            .arg("/inheritance:r")
+            .arg("/grant:r")
+            .arg(&grant)
+            .silent()
+            .output();
+
+        match output {
+            Ok(o) if o.status.success() => {
+                // Success is the quiet path; nothing to surface.
+            }
+            Ok(o) => {
+                // Non-zero exit: keep the file, log the code. Do NOT log
+                // stderr verbatim to avoid surfacing the path/user in a
+                // way that could aid enumeration; the exit code is enough.
+                eprintln!(
+                    "[boot_token] restrict_file_to_owner_windows: icacls exited {} \
+                     for {} (default ACL retained; write is intact)",
+                    o.status.code().unwrap_or(-1),
+                    path.display()
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[boot_token] restrict_file_to_owner_windows: icacls spawn failed \
+                     ({}) for {} (default ACL retained; write is intact)",
+                    e,
+                    path.display()
+                );
+            }
+        }
+    }
 }
 
 /// Read a token file, trimming trailing whitespace/newline. Clients
@@ -199,6 +297,35 @@ mod tests {
         write_token_file(&path, "first").unwrap();
         write_token_file(&path, "second").unwrap();
         assert_eq!(read_token_file(&path).unwrap(), "second");
+    }
+
+    // The ACL tighten must NEVER make the write fail. On Unix the helper
+    // is a no-op; on Windows it's best-effort and soft-fails. Either way
+    // write_token_file returns Ok and the content round-trips. This
+    // exercises the branch on both OSes (the Windows branch runs the
+    // icacls shell-out; the test asserts the *write* still succeeds
+    // regardless of the icacls outcome).
+    #[test]
+    fn write_token_file_succeeds_regardless_of_acl_tighten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acl.token");
+        write_token_file(&path, "acltok").expect("write must not fail on ACL tighten");
+        assert_eq!(read_token_file(&path).unwrap(), "acltok");
+    }
+
+    // The shared ACL helper must be callable on any OS without panicking
+    // and without disturbing an already-written file. On non-Windows it's
+    // a compile-time no-op; on Windows it best-effort-tightens and returns
+    // even when icacls is unavailable.
+    #[test]
+    fn restrict_file_to_owner_windows_never_panics_and_preserves_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.token");
+        std::fs::write(&path, "content").unwrap();
+        // Must not panic, must not fail the caller (returns unit).
+        restrict_file_to_owner_windows(&path);
+        // File and its content survive the call on every OS.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "content");
     }
 
     #[test]
