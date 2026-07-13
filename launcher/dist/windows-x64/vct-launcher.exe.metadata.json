@@ -1,8 +1,8 @@
 {
-  "source_sha": "960ae91969615ab44554286bc403e81884d30629",
-  "source_short_sha": "960ae91",
+  "source_sha": "c6d22298dd5bd9bf1fc13ebc92578e3060871ec1",
+  "source_short_sha": "c6d2229",
   "source_hash": "179b370c1564e8ca0236debd4e95cddb608a84a8",
-  "built_at": "2026-07-12T17:07:55Z",
+  "built_at": "2026-07-13T15:08:38Z",
   "launcher_version": "0.2.79",
   "host_target": "windows-x64",
   "binary_name": "vct-launcher.exe",
