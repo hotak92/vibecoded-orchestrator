@@ -218,8 +218,7 @@
           {
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/pre-vercel-token-guard.ps1 \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_USER_MESSAGE\"",
-            "timeout": 2,
-            "if": "Bash(*vercel*--token*)"
+            "timeout": 2
           }
         ]
       },
@@ -270,8 +269,7 @@
           {
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/pre-diagram-path-validation.ps1",
-            "timeout": 3,
-            "if": "Write(.claude/diagrams/**)|Edit(.claude/diagrams/**)"
+            "timeout": 3
           }
         ]
       },
@@ -395,20 +393,31 @@
           {
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/py-compile-check.ps1",
-            "timeout": 10,
-            "if": "Write(*.py)"
+            "timeout": 10
           }
         ]
       },
       {
-        "matcher": "Edit|Write",
+        "matcher": "Edit",
         "hooks": [
           {
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/kg-summary-generator.ps1",
             "timeout": 5,
             "async": true,
-            "if": "Edit(knowledge/**/*.md)|Write(knowledge/**/*.md)"
+            "if": "Edit(knowledge/**/*.md)"
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/kg-summary-generator.ps1",
+            "timeout": 5,
+            "async": true,
+            "if": "Write(knowledge/**/*.md)"
           }
         ]
       },
