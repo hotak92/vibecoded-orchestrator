@@ -106,15 +106,39 @@ _FORBIDDEN_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _GITHUB_PAT_KEY_RE = re.compile(r"^github_pat(?:[._-].*)?$", re.IGNORECASE)
 
 
+def _split_lines_cr_lf(value: str) -> List[str]:
+    """Split ``value`` on ``\\r\\n`` / ``\\n`` / lone ``\\r`` boundaries ONLY.
+
+    Deliberately NOT ``str.splitlines()``: the stdlib method also splits on the
+    Unicode line separators U+2028, U+2029, U+0085 and the C1/C0 separators
+    0x1c–0x1e, which the Rust (``secret_value_shape.rs``) and bash
+    (``lib/secret_shape.sh``) mirrors do NOT — they split on ``\\n``/``\\r`` only,
+    matching the documented line model ("no embedded ``\\n``/``\\r``"). Using
+    ``splitlines`` here would make Python the cross-language outlier (a PEM whose
+    body contained a U+2028 would be judged legit by Python but a blob-newline by
+    the mirrors). Normalise CRLF/CR → LF, then split on LF, so all three agree.
+    A trailing boundary yields no spurious empty final element (mirrors the
+    Rust ``splitlines`` + bash behaviour).
+    """
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+    parts = normalized.split("\n")
+    # Drop a single trailing empty element produced by a final newline, matching
+    # Python's own ``splitlines`` (and the Rust/bash mirrors) which do not emit a
+    # trailing empty line.
+    if parts and parts[-1] == "":
+        parts.pop()
+    return parts
+
+
 def _non_empty_lines(value: str) -> List[str]:
     """Return the value's lines with empty / whitespace-only lines removed.
 
-    Splits on both ``\\n`` and ``\\r`` boundaries (``str.splitlines`` handles
-    ``\\r\\n``, ``\\n`` and lone ``\\r`` uniformly). Trailing whitespace on each
-    line is stripped so a PEM whose lines have trailing spaces still matches the
-    BEGIN/END anchors.
+    Splits on ``\\n`` / ``\\r`` / ``\\r\\n`` ONLY (via :func:`_split_lines_cr_lf`,
+    NOT ``str.splitlines``) so the line model matches the Rust + bash mirrors
+    exactly. Trailing whitespace on each line is stripped so a PEM whose lines
+    have trailing spaces still matches the BEGIN/END anchors.
     """
-    return [ln.rstrip() for ln in value.splitlines() if ln.strip()]
+    return [ln.rstrip() for ln in _split_lines_cr_lf(value) if ln.strip()]
 
 
 def _is_legit_multiline(value: str) -> bool:
@@ -144,8 +168,12 @@ def _has_blob_signature(value: str) -> bool:
     bare token and the following lines are ``KEY=value`` assignments. The
     column-0 anchor deliberately does NOT fire on indented continuations
     (leading whitespace → not column 0) or PEM base64 bodies (no ``WORD=``).
+
+    Splits on ``\\n``/``\\r`` only (:func:`_split_lines_cr_lf`, NOT
+    ``str.splitlines``) so the post-first-line scan matches the Rust + bash
+    mirrors exactly.
     """
-    lines = value.splitlines()
+    lines = _split_lines_cr_lf(value)
     for line in lines[1:]:
         if _BLOB_KEY_EQ_RE.match(line):
             return True

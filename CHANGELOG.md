@@ -53,6 +53,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The Windows secret resolver now falls through on an empty hub value** to the
   file store and `.env`, matching the POSIX resolver, instead of returning the
   empty string as the resolved secret.
+- **The secret-shape validator's line model is now identical across all three
+  languages.** The Python source of truth split lines on the Unicode separators
+  U+2028/U+2029/U+0085 (via `str.splitlines`) while the Rust and bash mirrors
+  split on `\n`/`\r` only; a value containing one of those rare separators could
+  be judged differently on different platforms. Python now splits on `\n`/`\r`
+  only, matching the mirrors and the documented contract, and the parity fixture
+  now covers these cases so the three can never drift.
 
 ## [0.2.79] - 2026-07-12
 
