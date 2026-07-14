@@ -10,13 +10,13 @@
 //! `projects_v2::` path; the setter Tauri commands stay in the facade and
 //! reach these + the constant through the glob re-export).
 //!
-//! The other SETTING_KEY_SHARED_KG_* constants + PROJECT_SETTINGS_MODULE_ID
+//! The other SETTING_KEY_SHARED_KG_* constants + KG_GATE_MODULE_ID
 //! stay in the facade and are pulled in via `super::`.
 
 use crate::db::Db;
 
 use super::{
-    PROJECT_SETTINGS_MODULE_ID, SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY,
+    KG_GATE_MODULE_ID, SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY,
     SETTING_KEY_SHARED_KG_WRITE_DISABLED,
 };
 
@@ -33,12 +33,12 @@ pub(crate) fn _migrate_shared_kg_setting(db: &Db, project_id: &str) -> Result<Op
     // Canonical row wins outright — drop any stale legacy row to avoid
     // confusing future reads.
     if let Some(canonical) =
-        db.get_setting(project_id, PROJECT_SETTINGS_MODULE_ID, SETTING_KEY_SHARED_KG_WRITE_DISABLED)?
+        db.get_setting(project_id, KG_GATE_MODULE_ID, SETTING_KEY_SHARED_KG_WRITE_DISABLED)?
     {
         // Best-effort cleanup of legacy row; never fail the migration over it.
         let _ = db.delete_setting(
             project_id,
-            PROJECT_SETTINGS_MODULE_ID,
+            KG_GATE_MODULE_ID,
             SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY,
         );
         return Ok(Some(canonical.as_bool().unwrap_or(false)));
@@ -46,18 +46,18 @@ pub(crate) fn _migrate_shared_kg_setting(db: &Db, project_id: &str) -> Result<Op
 
     // Otherwise check the legacy row and forward it.
     if let Some(legacy) =
-        db.get_setting(project_id, PROJECT_SETTINGS_MODULE_ID, SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY)?
+        db.get_setting(project_id, KG_GATE_MODULE_ID, SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY)?
     {
         let bool_val = legacy.as_bool().unwrap_or(false);
         db.set_setting(
             project_id,
-            PROJECT_SETTINGS_MODULE_ID,
+            KG_GATE_MODULE_ID,
             SETTING_KEY_SHARED_KG_WRITE_DISABLED,
             &serde_json::Value::Bool(bool_val),
         )?;
         let _ = db.delete_setting(
             project_id,
-            PROJECT_SETTINGS_MODULE_ID,
+            KG_GATE_MODULE_ID,
             SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY,
         );
         eprintln!(
@@ -97,7 +97,7 @@ pub fn get_shared_kg_read_disabled(db: &Db, project_id: &str) -> Result<bool, St
     let val = db
         .get_setting(
             project_id,
-            PROJECT_SETTINGS_MODULE_ID,
+            KG_GATE_MODULE_ID,
             SETTING_KEY_SHARED_KG_READ_DISABLED,
         )?
         .and_then(|v| v.as_bool())

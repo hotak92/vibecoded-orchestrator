@@ -303,6 +303,32 @@ function createProjectsStore() {
       return updated;
     },
 
+    /**
+     * GAP-2 (2026-07-14) — read the project's SHARED_SECRETS_READ_DISABLED
+     * toggle for the SecretsTab. Mirror of the shared-KG read gate getter.
+     */
+    async getSharedSecretsReadDisabled(id: string): Promise<boolean> {
+      return invoke<boolean>('get_shared_secrets_read_disabled_cmd', {
+        projectId: id,
+      });
+    },
+
+    /**
+     * GAP-2 (2026-07-14) — toggle the project's bulk "disable shared
+     * secrets" opt-out. When `true`, the project omits the user-shared
+     * secrets bucket from its `/env` pairs (enforced server-side). Refreshes
+     * the launcher-owned env surfaces + writes the file-store marker.
+     * Surfaces any non-fatal warnings as toasts.
+     */
+    async setSharedSecretsReadDisabled(id: string, readDisabled: boolean): Promise<boolean> {
+      const result = await invoke<{ read_disabled: boolean; warnings: string[] }>(
+        'set_shared_secrets_read_disabled',
+        { projectId: id, readDisabled },
+      );
+      for (const w of result.warnings) toast.error(w);
+      return result.read_disabled;
+    },
+
     async switchHost(id: string, newHost: ProjectHost): Promise<SwitchHostResult> {
       const result = await invoke<SwitchHostResult>('switch_project_host_v2', {
         id,

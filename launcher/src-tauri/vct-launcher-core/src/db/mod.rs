@@ -43,6 +43,12 @@ pub mod project_setups;
 pub mod log_tail;
 pub mod secret_active;
 pub mod secret_grants;
+// 2026-07-14 GAP-1/GAP-2 (secrets non-root wiring): the canonical
+// module_settings addressing constants (shared by every KG-gate + secrets-gate
+// surface, fixing the 2026-07-14 split-brain) + the env-migration scope policy
+// (S1) and shared-secrets read gate (S2).
+pub mod module_settings_keys;
+pub mod secret_scope_policy;
 pub mod app_state;
 pub mod audit_types;
 pub mod orchestrator_root_helpers;

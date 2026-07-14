@@ -564,10 +564,16 @@ class TestAuditAndOfferEnvSecretMigration:
         deferral = install_py.DeferralReport()
         with mock.patch("sys.stdin.isatty", return_value=True), \
              mock.patch("builtins.input", return_value="y"), \
+             mock.patch(
+                 "vco_lib.project_config._resolve_project_id",
+                 return_value="proj-registered-id",
+             ), \
              mock.patch.object(
                  install_py,
                  "_post_secrets_to_hub",
-                 return_value=(["GITHUB_TOKEN", "OPENAI_API_KEY"], []),
+                 return_value=(
+                     ["GITHUB_TOKEN", "OPENAI_API_KEY"], [], "per_project",
+                 ),
              ) as hub:
             install_py._audit_and_offer_env_secret_migration(
                 tmp_path, deferral, None, _make_args(),
@@ -576,6 +582,8 @@ class TestAuditAndOfferEnvSecretMigration:
             payload = hub.call_args[0][0]
             payload_keys = {item["key"] for item in payload}
             assert payload_keys == {"GITHUB_TOKEN", "OPENAI_API_KEY"}
+            # GAP-1: the resolved project id is forwarded to the hub.
+            assert hub.call_args.kwargs.get("project_id") == "proj-registered-id"
         # .env was rewritten with sentinels.
         rewritten = env_path.read_text()
         assert "GITHUB_TOKEN=__vco_keychain__" in rewritten
@@ -607,6 +615,10 @@ class TestAuditAndOfferEnvSecretMigration:
         deferral = install_py.DeferralReport()
         with mock.patch("sys.stdin.isatty", return_value=True), \
              mock.patch("builtins.input", return_value="y"), \
+             mock.patch(
+                 "vco_lib.project_config._resolve_project_id",
+                 return_value="proj-registered-id",
+             ), \
              mock.patch.object(
                  install_py,
                  "_post_secrets_to_hub",
@@ -637,3 +649,97 @@ class TestAuditAndOfferEnvSecretMigration:
             inp.assert_called()
             # Hub was NOT called (user said "n")
             hub.assert_not_called()
+
+    # ─── GAP-1 (2026-07-14): per-project CLI scope routing ────────────
+
+    def test_unregistered_non_root_defers_instead_of_migrating(
+        self, tmp_path: Path,
+    ) -> None:
+        """A fresh UNREGISTERED non-root adopt must DEFER (not migrate to
+        Shared through the CLI back-door — that would leak per-project
+        credentials machine-wide)."""
+        from vco_lib.project_config import ProjectNotFound
+
+        env_path = tmp_path / ".env"
+        original = "CLIENTA_DB_PASSWORD=pw-real\n"
+        env_path.write_text(original)
+        deferral = install_py.DeferralReport()
+        with mock.patch("sys.stdin.isatty", return_value=True), \
+             mock.patch("builtins.input", return_value="y"), \
+             mock.patch(
+                 "vco_lib.project_config._resolve_project_id",
+                 side_effect=ProjectNotFound("not registered"),
+             ), \
+             mock.patch.object(install_py, "_post_secrets_to_hub") as hub:
+            install_py._audit_and_offer_env_secret_migration(
+                tmp_path, deferral, None, _make_args(),
+            )
+            # The hub is NEVER called for an unregistered non-root project.
+            hub.assert_not_called()
+        # .env untouched.
+        assert env_path.read_text() == original
+        # A deferral was recorded pointing at registering + re-migrating.
+        assert len(deferral.entries) == 1
+        entry = deferral.entries[0]
+        assert entry.condition_id == "env_secrets_project_not_registered"
+        assert entry.severity == "info"
+
+    def test_clone_root_unregistered_still_migrates_as_shared(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The orchestrator clone root, even when not registered yet, migrates
+        with project_id=None (hub writes Shared — correct for root)."""
+        from vco_lib.project_config import ProjectNotFound
+
+        env_path = tmp_path / ".env"
+        env_path.write_text("OPENAI_API_KEY=sk-real\n")
+        deferral = install_py.DeferralReport()
+        # Make the audited project_root look like the clone root by pointing
+        # install.py's __file__ at tmp_path.
+        monkeypatch.setattr(install_py, "__file__", str(tmp_path / "install.py"))
+        with mock.patch("sys.stdin.isatty", return_value=True), \
+             mock.patch("builtins.input", return_value="y"), \
+             mock.patch(
+                 "vco_lib.project_config._resolve_project_id",
+                 side_effect=ProjectNotFound("root not registered yet"),
+             ), \
+             mock.patch.object(
+                 install_py,
+                 "_post_secrets_to_hub",
+                 return_value=(["OPENAI_API_KEY"], [], "shared"),
+             ) as hub:
+            install_py._audit_and_offer_env_secret_migration(
+                tmp_path, deferral, None, _make_args(),
+            )
+            hub.assert_called_once()
+            # Root path → project_id forwarded as None (hub writes Shared).
+            assert hub.call_args.kwargs.get("project_id") is None
+        # No deferral — the root migration proceeded.
+        assert deferral.entries == []
+
+    def test_old_hub_no_scope_field_prints_reScope_notice(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """When a project_id was sent but the hub omits `scope` (old hub), the
+        user is told the keys landed in Shared + to re-scope."""
+        env_path = tmp_path / ".env"
+        env_path.write_text("GITHUB_TOKEN=ghp_real\n")
+        deferral = install_py.DeferralReport()
+        with mock.patch("sys.stdin.isatty", return_value=True), \
+             mock.patch("builtins.input", return_value="y"), \
+             mock.patch(
+                 "vco_lib.project_config._resolve_project_id",
+                 return_value="proj-id",
+             ), \
+             mock.patch.object(
+                 install_py,
+                 "_post_secrets_to_hub",
+                 # scope=None simulates a hub that predates GAP-1.
+                 return_value=(["GITHUB_TOKEN"], [], None),
+             ):
+            install_py._audit_and_offer_env_secret_migration(
+                tmp_path, deferral, None, _make_args(),
+            )
+        out = capsys.readouterr().out
+        assert "predates per-project secret migration" in out
+        assert "SHARED keychain bucket" in out

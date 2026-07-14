@@ -33,16 +33,31 @@
 //! the keychain itself — so the gate matches the underlying resource's
 //! threat model.
 //!
-//! ## Storage shape
+//! ## Storage shape (GAP-1, 2026-07-14 — scope is now project-aware)
 //!
-//! Migrated secrets land in:
-//!   * Scope:     `SecretScope::Shared { project_id: SENTINEL_SHARED }`
-//!   * Module ID: `"user"`
-//!   * Key:       the original env var name (e.g. `OPENAI_API_KEY`)
+//! The scope is decided by ONE policy function —
+//! `vct_launcher_core::db::secret_scope_policy::decide_env_migration_scope`
+//! (S1) — from the request's optional `project_id`:
 //!
-//! This is the same `(scope, module_id)` tuple `register_secret_from_source`
-//! and the SecretsPanel "Shared (this user)" tab use, so the migrated
-//! values become immediately visible/editable in the launcher GUI.
+//!   * `project_id` ABSENT → `SecretScope::Shared { SENTINEL_SHARED }`.
+//!     Preserves the V47-C contract for install.py's original caller, which
+//!     runs on a FRESH ADOPT before the project is registered and therefore
+//!     structurally has no id to send. Root installs also land here (the
+//!     orchestrator-root row is host=orchestrator_root → Shared).
+//!   * `project_id` PRESENT + host = base/mao →
+//!     `SecretScope::PerProject { project_id }`. The owning project's
+//!     credential stays that project's — it does NOT leak into every other
+//!     registered project's `/env` (the cross-tenant leak this fixes).
+//!   * `project_id` PRESENT + host = orchestrator_root → `Shared` (root
+//!     secrets are legitimately machine-wide, user-stated).
+//!   * `project_id` PRESENT but unknown → 404 `project_not_found`, NOTHING
+//!     written (a caller bug; guessing Shared would recreate the leak).
+//!
+//! Module ID is always `"user"` (the SecretsPanel bucket). The response's
+//! `scope` field (`"shared"` | `"per_project"`) tells the caller where the
+//! keys landed. For the per-project arm the handler ALSO registers a
+//! `project_secret_refs` row (`resolution="keychain-per-project"`) so the
+//! per-project SecretsTab lists the freshly-migrated key.
 //!
 //! ## Value-handling discipline
 //!
@@ -98,6 +113,14 @@ pub struct MigrateSecretItem {
 #[derive(Debug, Deserialize)]
 pub struct MigrateSecretsRequest {
     pub secrets: Vec<MigrateSecretItem>,
+    /// GAP-1 (2026-07-14): the launcher.db project id that OWNS this `.env`.
+    /// Per-REQUEST (all three callers migrate exactly one project's `.env`
+    /// per call). ABSENT → back-compat Shared scope (old callers, and
+    /// install.py's pre-registration fresh-adopt contract). PRESENT → the
+    /// scope policy (S1) decides Shared (root) vs PerProject (base/mao); an
+    /// unknown id is a hard 404, nothing written.
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 /// Per-failure detail returned in the `failed` array. NEVER includes the
@@ -124,6 +147,12 @@ pub struct MigrateFailure {
 pub struct MigrateSecretsResponse {
     pub migrated: Vec<String>,
     pub failed: Vec<MigrateFailure>,
+    /// GAP-1 (2026-07-14): where the keys landed — `"shared"` or
+    /// `"per_project"`. Additive: old callers (install.py pre-GAP-1) read
+    /// only `migrated`/`failed` and ignore this; new callers use it for
+    /// user-facing copy AND to detect an old hub (a response WITHOUT `scope`
+    /// means the hub predates per-project migration → keys went to Shared).
+    pub scope: String,
 }
 
 // ─── Error helpers ──────────────────────────────────────────────────────
@@ -192,6 +221,33 @@ async fn migrate_secrets(
         );
     }
 
+    // GAP-1 (2026-07-14): decide the destination scope ONCE, via the shared
+    // policy (S1). An explicit-but-unknown project_id is a hard 404 — nothing
+    // is written, because a silent Shared write would recreate the exact
+    // cross-tenant leak this endpoint's fix prevents. The error carries the
+    // id only (never a secret value).
+    let migration_scope = match vct_launcher_core::db::secret_scope_policy::decide_env_migration_scope(
+        &_h.0,
+        req.project_id.as_deref(),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "project_not_found",
+                format!("cannot resolve migration scope: {}", e),
+            );
+        }
+    };
+
+    // Static scope descriptor for the write + active-flag + response, so the
+    // per-item loop below never re-derives the branch.
+    use vct_launcher_core::db::secret_scope_policy::EnvMigrationScope;
+    let (scope_str, slot_project_id, response_scope) = match &migration_scope {
+        EnvMigrationScope::Shared => ("shared", SENTINEL_SHARED, "shared"),
+        EnvMigrationScope::PerProject(pid) => ("per_project", pid.as_str(), "per_project"),
+    };
+
     let mut migrated: Vec<String> = Vec::with_capacity(req.secrets.len());
     let mut failed: Vec<MigrateFailure> = Vec::new();
 
@@ -222,15 +278,24 @@ async fn migrate_secrets(
             continue;
         }
 
-        // Write to the shared user-bucket (matches `secrets_import.rs`).
-        let scope = vct_launcher_core::secrets::SecretScope::Shared {
-            project_id: SENTINEL_SHARED,
+        // GAP-1: write to the scope S1 decided (Shared or the owning
+        // project's PerProject slot). Both arms go through the SAME guarded
+        // `secrets::set` chokepoint (v0.2.80 write-guard applies
+        // automatically — do NOT use `set_allowing_multiline`).
+        let scope = match &migration_scope {
+            EnvMigrationScope::Shared => vct_launcher_core::secrets::SecretScope::Shared {
+                project_id: SENTINEL_SHARED,
+            },
+            EnvMigrationScope::PerProject(pid) => {
+                vct_launcher_core::secrets::SecretScope::PerProject { project_id: pid }
+            }
         };
         match vct_launcher_core::secrets::set(scope, IMPORT_MODULE_ID, &item.key, &item.value) {
             Ok(()) => {
                 // Mark active in the DB so the SecretsPanel renders the
                 // entry as "set + active" immediately. Mirrors the post-
-                // write step in `register_secret_from_source`.
+                // write step in `register_secret_from_source` (shared arm)
+                // and the manual add-form (per-project arm).
                 //
                 // E-4 (v0.2.73): a `mark_secret_active` failure is NOT
                 // silently swallowed. The prior code logged + counted the
@@ -249,8 +314,8 @@ async fn migrate_secrets(
                 // keychain value is left in place (idempotent: a retry's
                 // `secrets::set` overwrites it, then re-attempts the flag).
                 if let Err(e) = _h.0.mark_secret_active(
-                    "shared",
-                    SENTINEL_SHARED,
+                    scope_str,
+                    slot_project_id,
                     IMPORT_MODULE_ID,
                     &item.key,
                 ) {
@@ -272,6 +337,50 @@ async fn migrate_secrets(
                     });
                     continue;
                 }
+
+                // GAP-3 fold-in (per-project arm only): register a
+                // `project_secret_refs` row so the per-project SecretsTab
+                // (which renders from `list_project_secret_refs`) LISTS the
+                // migrated key. Shared entries are deliberately ref-less (the
+                // hub /env 4th loop enumerates active-state, not refs, for
+                // shared/global keys). A ref failure is treated like a
+                // mark-active failure: item into failed[], keychain value
+                // left in place (retry is idempotent).
+                if let EnvMigrationScope::PerProject(pid) = &migration_scope {
+                    if let Err(e) = _h.0.set_project_secret_ref(
+                        pid,
+                        &item.key,
+                        "keychain-per-project",
+                        None,
+                        Some(&item.key),
+                        Some("user"),
+                        &[],
+                        "Migrated from .env (V47-C keychain migration)",
+                        Some(true),
+                    ) {
+                        eprintln!(
+                            "[vct-hub secrets_api] set_project_secret_ref failed \
+                             for key {:?}: {} (keychain write + active-flag \
+                             succeeded but the per-project ref row did not land, \
+                             so the SecretsTab would not list it; reporting as \
+                             failed so the caller retries)",
+                            item.key, e,
+                        );
+                        failed.push(MigrateFailure {
+                            key: item.key,
+                            error: format!(
+                                "keychain write + active flag succeeded but \
+                                 registering the per-project secret ref failed: \
+                                 {} (the value is stored + served but not yet \
+                                 listed in the SecretsTab; retry to re-attempt \
+                                 the ref)",
+                                e
+                            ),
+                        });
+                        continue;
+                    }
+                }
+
                 migrated.push(item.key);
             }
             Err(e) => {
@@ -285,7 +394,11 @@ async fn migrate_secrets(
 
     (
         StatusCode::OK,
-        Json(MigrateSecretsResponse { migrated, failed }),
+        Json(MigrateSecretsResponse {
+            migrated,
+            failed,
+            scope: response_scope.to_string(),
+        }),
     )
         .into_response()
 }
@@ -420,6 +533,7 @@ mod tests {
                     value: "sk-def456".to_string(),
                 },
             ],
+            project_id: None,
         };
         let body_ok: Result<
             Json<MigrateSecretsRequest>,
@@ -439,6 +553,8 @@ mod tests {
             vec!["GITHUB_TOKEN".to_string(), "OPENAI_API_KEY".to_string()]
         );
         assert!(body.failed.is_empty(), "no failures: {:?}", body.failed);
+        // GAP-1: absent project_id → Shared scope in the response.
+        assert_eq!(body.scope, "shared");
 
         // Verify the keychain mock got the writes at the canonical slot.
         let scope = secrets::SecretScope::Shared {
@@ -471,6 +587,7 @@ mod tests {
                     value: "rejected".to_string(),
                 },
             ],
+            project_id: None,
         };
         let body_ok: Result<
             Json<MigrateSecretsRequest>,
@@ -519,6 +636,7 @@ mod tests {
                 key: "GITHUB_TOKEN".to_string(),
                 value: "ghp_secretvalue".to_string(),
             }],
+            project_id: None,
         };
         let body_ok: Result<
             Json<MigrateSecretsRequest>,
@@ -572,6 +690,7 @@ mod tests {
                 key: "VALID_KEY".to_string(),
                 value: "".to_string(),
             }],
+            project_id: None,
         };
         let body_ok: Result<
             Json<MigrateSecretsRequest>,
@@ -603,6 +722,7 @@ mod tests {
                 key: "FAILING_KEY".to_string(),
                 value: "doesnt_matter".to_string(),
             }],
+            project_id: None,
         };
         let body_ok: Result<
             Json<MigrateSecretsRequest>,
@@ -623,6 +743,202 @@ mod tests {
             !body.failed[0].error.contains("doesnt_matter"),
             "error leaked value: {}",
             body.failed[0].error
+        );
+    }
+
+    // ─── GAP-1: project-aware scope routing ───────────────────────────
+
+    use vct_launcher_core::db::models::ProjectHost;
+    use vct_launcher_core::db::secret_active::resolve_active_user_secret_pairs_for_requester;
+
+    fn seed_project(db: &Db, id: &str, host: ProjectHost) {
+        db.insert_project(id, id, &format!("/tmp/{}", id), host, id)
+            .expect("insert_project");
+    }
+
+    fn migrate_one(
+        handle: &LauncherDbHandle,
+        key: &str,
+        value: &str,
+        project_id: Option<&str>,
+    ) -> MigrateSecretsResponse {
+        let req = MigrateSecretsRequest {
+            secrets: vec![MigrateSecretItem {
+                key: key.to_string(),
+                value: value.to_string(),
+            }],
+            project_id: project_id.map(str::to_string),
+        };
+        let body_ok: Result<
+            Json<MigrateSecretsRequest>,
+            axum::extract::rejection::JsonRejection,
+        > = Ok(Json(req));
+        // Drive synchronously on the CURRENT thread via a current-thread
+        // runtime so the thread-local MockGuard set by the caller stays in
+        // scope for the whole handler + body read. `migrate_secrets` never
+        // spawns tasks, so the future never migrates off this thread.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let body_bytes = rt.block_on(async {
+            let resp = migrate_secrets(State(handle.clone()), body_ok)
+                .await
+                .into_response();
+            axum::body::to_bytes(resp.into_body(), 1024 * 1024).await
+        });
+        serde_json::from_slice(&body_bytes.unwrap()).unwrap()
+    }
+
+    #[test]
+    fn migrate_with_project_id_writes_per_project_scope() {
+        let _g = secrets::for_tests::MockGuard::new();
+        let db = Db::open_in_memory().expect("in-memory db");
+        seed_project(&db, "proj-a", ProjectHost::Base);
+        let handle = LauncherDbHandle(Arc::new(db));
+
+        let body = migrate_one(&handle, "CLIENTA_DB_PASSWORD", "pw-a", Some("proj-a"));
+        assert_eq!(body.migrated, vec!["CLIENTA_DB_PASSWORD".to_string()]);
+        assert!(body.failed.is_empty(), "failures: {:?}", body.failed);
+        assert_eq!(body.scope, "per_project");
+
+        // (a) value readable at PerProject, ABSENT at Shared.
+        let per = secrets::SecretScope::PerProject { project_id: "proj-a" };
+        assert_eq!(
+            secrets::get(per, IMPORT_MODULE_ID, "CLIENTA_DB_PASSWORD").unwrap().as_deref(),
+            Some("pw-a")
+        );
+        let shared = secrets::SecretScope::Shared { project_id: SENTINEL_SHARED };
+        assert_eq!(
+            secrets::get(shared, IMPORT_MODULE_ID, "CLIENTA_DB_PASSWORD").unwrap(),
+            None,
+            "per-project migrate must NOT write the shared slot"
+        );
+
+        // (b) active for proj-a, NOT resolvable for another project.
+        let own = resolve_active_user_secret_pairs_for_requester(&handle.0, "proj-a", "proj-a");
+        assert!(own.iter().any(|(k, _)| k == "CLIENTA_DB_PASSWORD"));
+        let other = resolve_active_user_secret_pairs_for_requester(&handle.0, "other", "other");
+        assert!(
+            !other.iter().any(|(k, _)| k == "CLIENTA_DB_PASSWORD"),
+            "per-project secret leaked into another project's /env: {:?}",
+            other
+        );
+
+        // (c) project_secret_refs row exists with keychain-per-project.
+        let refs = handle.0.list_project_secret_refs("proj-a").unwrap();
+        let r = refs
+            .iter()
+            .find(|r| r.secret_key == "CLIENTA_DB_PASSWORD")
+            .expect("ref row for migrated key");
+        assert_eq!(r.resolution, "keychain-per-project");
+        assert!(r.is_set, "migrated per-project ref must be is_set=true");
+    }
+
+    #[test]
+    fn migrate_orchestrator_root_project_stays_shared() {
+        let _g = secrets::for_tests::MockGuard::new();
+        let db = Db::open_in_memory().expect("in-memory db");
+        seed_project(&db, "proj-root", ProjectHost::OrchestratorRoot);
+        let handle = LauncherDbHandle(Arc::new(db));
+
+        let body = migrate_one(&handle, "ROOT_SHARED_KEY", "rv", Some("proj-root"));
+        assert_eq!(body.migrated, vec!["ROOT_SHARED_KEY".to_string()]);
+        assert_eq!(body.scope, "shared");
+
+        // Landed in Shared, NOT PerProject; no ref row.
+        let shared = secrets::SecretScope::Shared { project_id: SENTINEL_SHARED };
+        assert_eq!(
+            secrets::get(shared, IMPORT_MODULE_ID, "ROOT_SHARED_KEY").unwrap().as_deref(),
+            Some("rv")
+        );
+        let refs = handle.0.list_project_secret_refs("proj-root").unwrap();
+        assert!(
+            !refs.iter().any(|r| r.secret_key == "ROOT_SHARED_KEY"),
+            "shared (root) migrate must not register a per-project ref"
+        );
+    }
+
+    #[test]
+    fn migrate_unknown_project_id_404s_and_writes_nothing() {
+        let _g = secrets::for_tests::MockGuard::new();
+        let db = Db::open_in_memory().expect("in-memory db");
+        let handle = LauncherDbHandle(Arc::new(db));
+
+        let req = MigrateSecretsRequest {
+            secrets: vec![MigrateSecretItem {
+                key: "SHOULD_NOT_LAND".to_string(),
+                value: "leak-me".to_string(),
+            }],
+            project_id: Some("ghost-project".to_string()),
+        };
+        let body_ok: Result<
+            Json<MigrateSecretsRequest>,
+            axum::extract::rejection::JsonRejection,
+        > = Ok(Json(req));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (status, body_bytes) = rt.block_on(async {
+            let resp = migrate_secrets(State(handle.clone()), body_ok)
+                .await
+                .into_response();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            (status, bytes)
+        });
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            body.get("error").and_then(|e| e.get("code")).and_then(|v| v.as_str()),
+            Some("project_not_found")
+        );
+        // Error must never leak the value.
+        let text = String::from_utf8_lossy(&body_bytes);
+        assert!(!text.contains("leak-me"), "404 leaked the value: {}", text);
+
+        // NOTHING written in either slot; no active rows.
+        let shared = secrets::SecretScope::Shared { project_id: SENTINEL_SHARED };
+        assert_eq!(
+            secrets::get(shared, IMPORT_MODULE_ID, "SHOULD_NOT_LAND").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn migrate_per_project_ref_failure_lands_in_failed() {
+        // Keychain write + mark-active succeed, but the ref row insert fails
+        // (table dropped). The item must land in failed[], never migrated[],
+        // and the keychain value stays (retry-idempotent).
+        let _g = secrets::for_tests::MockGuard::new();
+        let db = Db::open_in_memory().expect("in-memory db");
+        seed_project(&db, "proj-b", ProjectHost::Base);
+        db.lock()
+            .execute("DROP TABLE project_secret_refs", [])
+            .expect("drop table");
+        let handle = LauncherDbHandle(Arc::new(db));
+
+        let body = migrate_one(&handle, "REF_FAIL_KEY", "vv", Some("proj-b"));
+        assert!(
+            body.migrated.is_empty(),
+            "ref failure must NOT count as migrated: {:?}",
+            body.migrated
+        );
+        assert_eq!(body.failed.len(), 1);
+        assert_eq!(body.failed[0].key, "REF_FAIL_KEY");
+        assert!(
+            body.failed[0].error.contains("per-project secret ref"),
+            "error should explain the ref failure: {}",
+            body.failed[0].error
+        );
+        assert!(!body.failed[0].error.contains("vv"), "error leaked value");
+
+        // Keychain value present (retry-idempotent).
+        let per = secrets::SecretScope::PerProject { project_id: "proj-b" };
+        assert_eq!(
+            secrets::get(per, IMPORT_MODULE_ID, "REF_FAIL_KEY").unwrap().as_deref(),
+            Some("vv")
         );
     }
 }

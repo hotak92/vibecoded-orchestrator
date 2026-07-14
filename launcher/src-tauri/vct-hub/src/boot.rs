@@ -318,6 +318,7 @@ fn warn_if_non_default_state_dir() {
 /// systemd's parser accepts single-quoted tokens with embedded single
 /// quotes escaped via `\'`. Guards against installation paths
 /// containing spaces or shell metacharacters.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // any-OS for unit tests (see doc)
 fn shell_single_quote(path: &Path) -> String {
     let s = path.display().to_string();
     let escaped = s.replace('\'', r"'\''");
@@ -355,6 +356,7 @@ fn xml_escape(s: &str) -> String {
 /// state dir, returns the same text every time. Kept top-level (not
 /// inside the `linux` module) so the unit tests can exercise it on any
 /// OS, not just Linux.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // any-OS for unit tests (see doc)
 fn render_systemd_unit(bin: &Path, state_dir: &Path) -> String {
     const TEMPLATE: &str = include_str!("../templates/vct-hub.service.template");
     TEMPLATE

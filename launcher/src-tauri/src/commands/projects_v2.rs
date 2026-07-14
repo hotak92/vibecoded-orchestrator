@@ -161,7 +161,28 @@ pub struct UpdateProjectResult {
 /// MEDIUM-1 (2026-05-01): sentinel module_id used for project-level settings
 /// stored in the `module_settings` k/v table. Settings under this id apply
 /// to the project itself rather than any installed module.
+///
+/// NOTE (2026-07-14): the shared-KG gate flags MOVED OFF this sentinel onto
+/// the canonical [`KG_GATE_MODULE_ID`] (`"orchestrator-core"`). Storing the
+/// gate rows here caused a split-brain: this writer used `"__project__"` but
+/// the hub `/config` resolver + Python env projection read
+/// `"orchestrator-core"`, so the toggle read false on those surfaces. This
+/// const is retained ONLY for callers that legitimately still use the
+/// project-scoped sentinel (if any) — the KG gates no longer do. Currently
+/// unreferenced after the 2026-07-14 gate move; kept + `allow(dead_code)`ed
+/// so a future project-scoped (non-orchestrator-core) setting has a named
+/// home rather than a bare `"__project__"` literal.
+#[allow(dead_code)]
 pub const PROJECT_SETTINGS_MODULE_ID: &str = "__project__";
+
+/// 2026-07-14 split-brain fix: the CANONICAL module_id for per-project KG
+/// gate rows (`shared_kg_read_disabled` / `shared_kg_write_disabled`) +
+/// their legacy alias. Re-exported from the ONE shared home
+/// (`vct_launcher_core::db::module_settings_keys`) so every reader/writer
+/// (this file's setters + getters, the hub `config_api.rs`, the Python
+/// `config_projection.py`) addresses the identical namespace. Do NOT
+/// hardcode `"orchestrator-core"` or `"__project__"` for these keys again.
+pub const KG_GATE_MODULE_ID: &str = crate::db::module_settings_keys::ORCHESTRATOR_CORE_MODULE_ID;
 
 /// Per-project setting key for the SHARED_KG_WRITE_DISABLED toggle (asymmetric
 /// model since 2026-05-01: gates WRITES to the shared KG; reads are always on).
@@ -186,8 +207,9 @@ pub const SETTING_KEY_SHARED_KG_OPT_OUT: &str = SETTING_KEY_SHARED_KG_WRITE_DISA
 // migration) + the SETTING_KEY_SHARED_KG_READ_DISABLED constant were
 // extracted verbatim to the `shared_kg_settings` submodule in v0.2.77
 // Part 7d. The facade re-exports every symbol; the other SETTING_KEY_*
-// consts + PROJECT_SETTINGS_MODULE_ID stay here, pulled into the submodule
-// via `super::`.
+// consts + KG_GATE_MODULE_ID stay here, pulled into the submodule
+// via `super::` (the submodule reads/writes the gate rows under
+// KG_GATE_MODULE_ID after the 2026-07-14 split-brain fix).
 mod shared_kg_settings;
 pub(crate) use shared_kg_settings::*;
 
@@ -4614,7 +4636,7 @@ pub async fn set_shared_kg_write_disabled(
     // backstops `get_shared_kg_write_disabled`.
     db.set_setting(
         &project_id,
-        PROJECT_SETTINGS_MODULE_ID,
+        KG_GATE_MODULE_ID,
         SETTING_KEY_SHARED_KG_WRITE_DISABLED,
         &serde_json::Value::Bool(write_disabled),
     )?;
@@ -4623,7 +4645,7 @@ pub async fn set_shared_kg_write_disabled(
     // but proactively clearing here keeps the DB tidy.
     let _ = db.delete_setting(
         &project_id,
-        PROJECT_SETTINGS_MODULE_ID,
+        KG_GATE_MODULE_ID,
         SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY,
     );
 
@@ -4699,7 +4721,7 @@ pub async fn set_shared_kg_read_disabled(
 
     db.set_setting(
         &project_id,
-        PROJECT_SETTINGS_MODULE_ID,
+        KG_GATE_MODULE_ID,
         SETTING_KEY_SHARED_KG_READ_DISABLED,
         &serde_json::Value::Bool(read_disabled),
     )?;
@@ -8296,7 +8318,7 @@ mod tests {
         // Persist true under the canonical key.
         db.set_setting(
             &pid,
-            PROJECT_SETTINGS_MODULE_ID,
+            KG_GATE_MODULE_ID,
             SETTING_KEY_SHARED_KG_WRITE_DISABLED,
             &serde_json::Value::Bool(true),
         ).unwrap();
@@ -8305,7 +8327,7 @@ mod tests {
         // Flip to false.
         db.set_setting(
             &pid,
-            PROJECT_SETTINGS_MODULE_ID,
+            KG_GATE_MODULE_ID,
             SETTING_KEY_SHARED_KG_WRITE_DISABLED,
             &serde_json::Value::Bool(false),
         ).unwrap();
@@ -8332,13 +8354,13 @@ mod tests {
         // pre-rename launcher).
         db.set_setting(
             &pid,
-            PROJECT_SETTINGS_MODULE_ID,
+            KG_GATE_MODULE_ID,
             SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY,
             &serde_json::Value::Bool(true),
         ).unwrap();
         // Sanity: no canonical row yet.
         assert!(db
-            .get_setting(&pid, PROJECT_SETTINGS_MODULE_ID, SETTING_KEY_SHARED_KG_WRITE_DISABLED)
+            .get_setting(&pid, KG_GATE_MODULE_ID, SETTING_KEY_SHARED_KG_WRITE_DISABLED)
             .unwrap()
             .is_none());
 
@@ -8347,11 +8369,11 @@ mod tests {
 
         // After the read: canonical row exists, legacy row removed.
         let canonical = db
-            .get_setting(&pid, PROJECT_SETTINGS_MODULE_ID, SETTING_KEY_SHARED_KG_WRITE_DISABLED)
+            .get_setting(&pid, KG_GATE_MODULE_ID, SETTING_KEY_SHARED_KG_WRITE_DISABLED)
             .unwrap();
         assert_eq!(canonical, Some(serde_json::Value::Bool(true)));
         let legacy = db
-            .get_setting(&pid, PROJECT_SETTINGS_MODULE_ID, SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY)
+            .get_setting(&pid, KG_GATE_MODULE_ID, SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY)
             .unwrap();
         assert!(legacy.is_none(), "legacy row must be deleted after migration");
 
@@ -8377,13 +8399,13 @@ mod tests {
 
         db.set_setting(
             &pid,
-            PROJECT_SETTINGS_MODULE_ID,
+            KG_GATE_MODULE_ID,
             SETTING_KEY_SHARED_KG_WRITE_DISABLED,
             &serde_json::Value::Bool(false),
         ).unwrap();
         db.set_setting(
             &pid,
-            PROJECT_SETTINGS_MODULE_ID,
+            KG_GATE_MODULE_ID,
             SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY,
             &serde_json::Value::Bool(true),
         ).unwrap();
@@ -8392,7 +8414,7 @@ mod tests {
                    "canonical 'false' must win over legacy 'true'");
         // Legacy row pruned.
         let legacy = db
-            .get_setting(&pid, PROJECT_SETTINGS_MODULE_ID, SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY)
+            .get_setting(&pid, KG_GATE_MODULE_ID, SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY)
             .unwrap();
         assert!(legacy.is_none());
     }
@@ -8414,7 +8436,7 @@ mod tests {
         // Set the canonical row → both functions return true.
         db.set_setting(
             &pid,
-            PROJECT_SETTINGS_MODULE_ID,
+            KG_GATE_MODULE_ID,
             SETTING_KEY_SHARED_KG_WRITE_DISABLED,
             &serde_json::Value::Bool(true),
         ).unwrap();
@@ -8442,7 +8464,7 @@ mod tests {
         // Simulate the legacy command: same DB write the new command does.
         db.set_setting(
             &pid,
-            PROJECT_SETTINGS_MODULE_ID,
+            KG_GATE_MODULE_ID,
             SETTING_KEY_SHARED_KG_WRITE_DISABLED,
             &serde_json::Value::Bool(true),
         ).unwrap();

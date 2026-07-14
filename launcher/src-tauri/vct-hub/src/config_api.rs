@@ -673,9 +673,17 @@ async fn project_config(
     // Default false — match the access-matrix audit's "asymmetric
     // shared-KG access" model where reads are always allowed but
     // writes can be locally gated.
+    // v0.2.80: module id + setting keys come from the SHARED module
+    // `module_settings_keys` — the 2026-07-14 split-brain (writer used
+    // "__project__", readers "orchestrator-core", toggle silently
+    // ineffective) is prevented by every surface importing ONE constant.
     let shared_kg_write_disabled = h
         .0
-        .get_setting(&project.id, "orchestrator-core", "shared_kg_write_disabled")
+        .get_setting(
+            &project.id,
+            vct_launcher_core::db::module_settings_keys::ORCHESTRATOR_CORE_MODULE_ID,
+            vct_launcher_core::db::module_settings_keys::SETTING_KEY_SHARED_KG_WRITE_DISABLED,
+        )
         .ok()
         .flatten()
         .and_then(|v| v.as_bool())
@@ -685,10 +693,14 @@ async fn project_config(
     // → orchestrator-core). Symmetric mirror of the write gate above.
     // Default false (reads allowed). Pre-v0.2.46 the read path was
     // unconditional, so no historical rows exist under any prior key —
-    // no migration helper needed.
+    // migration 040 canonicalizes any legacy "__project__" rows.
     let shared_kg_read_disabled = h
         .0
-        .get_setting(&project.id, "orchestrator-core", "shared_kg_read_disabled")
+        .get_setting(
+            &project.id,
+            vct_launcher_core::db::module_settings_keys::ORCHESTRATOR_CORE_MODULE_ID,
+            vct_launcher_core::db::module_settings_keys::SETTING_KEY_SHARED_KG_READ_DISABLED,
+        )
         .ok()
         .flatten()
         .and_then(|v| v.as_bool())

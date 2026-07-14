@@ -111,6 +111,48 @@ _SECRET_SHAPED_SUBSTRINGS = (
 )
 
 
+#: FN-5b (2026-07-14): weaviate_mcp submodules the code-graph analyzer + the
+#: weaviate MCP import directly. After the editable install, these MUST all be
+#: importable in the resolved venv; a silent import failure here surfaces later
+#: as an opaque runtime crash, so install.py runs the verify script below and
+#: LOUD-FAILS the install with the missing-module list on error. There is NO
+#: sys.path shim that makes these importable from a bare checkout — a failed
+#: editable install is a BROKEN install, not a degraded one.
+WEAVIATE_MCP_REQUIRED_SUBMODULES: tuple[str, ...] = (
+    "weaviate_mcp.chunking",
+    "weaviate_mcp.code_ranking",
+    "weaviate_mcp.rl_state",
+    "weaviate_mcp.embeddings",
+    "weaviate_mcp.rl_enrichment",
+)
+
+
+def build_weaviate_mcp_import_verify_script() -> str:
+    """Return a ``python -c`` script that imports each required weaviate_mcp
+    submodule and exits non-zero (with a stderr list) if any fail.
+
+    Pure builder — install.py runs the returned string in the resolved venv
+    via ``_run_logged_subprocess(..., on_failure="exit")`` so a broken
+    editable install aborts loudly instead of degrading silently (FN-5b).
+    """
+    mods = ", ".join(repr(m) for m in WEAVIATE_MCP_REQUIRED_SUBMODULES)
+    return (
+        "import importlib, sys\n"
+        f"mods = [{mods}]\n"
+        "missing = []\n"
+        "for m in mods:\n"
+        "    try:\n"
+        "        importlib.import_module(m)\n"
+        "    except Exception as exc:\n"
+        "        missing.append(f'{m}: {type(exc).__name__}: {exc}')\n"
+        "if missing:\n"
+        "    sys.stderr.write('unimportable weaviate_mcp submodules:\\n')\n"
+        "    for line in missing:\n"
+        "        sys.stderr.write('  - ' + line + '\\n')\n"
+        "    sys.exit(1)\n"
+    )
+
+
 def _is_secret_shaped_env_key(key: str) -> bool:
     """True iff `key` looks like a credential. See module docstring.
 

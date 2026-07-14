@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{command, State};
 
 use crate::db::Db;
+use crate::db::{module_settings_keys, secret_scope_policy};
 use crate::secrets::{self, SecretScope};
 
 // ─── Secrets ────────────────────────────────────────────────────────────
@@ -2218,6 +2219,10 @@ mod tests {
     // WITHOUT a live hub, so the success/partial/down branches are covered.
 
     fn hub_resp(migrated: &[&str], failed: &[&str]) -> HubMigrateResponse {
+        hub_resp_scoped(migrated, failed, "shared")
+    }
+
+    fn hub_resp_scoped(migrated: &[&str], failed: &[&str], scope: &str) -> HubMigrateResponse {
         HubMigrateResponse {
             migrated: migrated.iter().map(|s| s.to_string()).collect(),
             failed: failed
@@ -2227,6 +2232,7 @@ mod tests {
                     error: "boom".to_string(),
                 })
                 .collect(),
+            scope: scope.to_string(),
         }
     }
 
@@ -2243,12 +2249,27 @@ mod tests {
         assert_eq!(result.migrated, vec!["OPENAI_API_KEY".to_string()]);
         assert!(result.failed.is_empty());
         assert!(result.error.is_none());
+        // GAP-1: the hub's scope flows through to the FE result verbatim.
+        assert_eq!(result.scope, "shared");
         // The .env is rewritten: only the migrated key gets the sentinel,
         // PLAIN is byte-identical, structure (export prefix + comment) kept.
         assert_eq!(
             new_env.as_deref(),
             Some("export OPENAI_API_KEY=__vco_keychain__  # team\nPLAIN=keep\n")
         );
+    }
+
+    #[test]
+    fn migration_outcome_threads_per_project_scope() {
+        // GAP-1: a per-project hub response surfaces `scope == "per_project"`
+        // so SecretsTab renders the "this project's scope" banner + the
+        // command triggers the per-project env refresh.
+        let env = "CLIENTA_DB_PASSWORD=pw\n";
+        let hub = hub_resp_scoped(&["CLIENTA_DB_PASSWORD"], &[], "per_project");
+        let (result, _new_env) = build_migration_outcome(env, &hub);
+        assert!(result.ok);
+        assert_eq!(result.scope, "per_project");
+        assert_eq!(result.migrated, vec!["CLIENTA_DB_PASSWORD".to_string()]);
     }
 
     #[test]
@@ -2296,6 +2317,7 @@ mod tests {
             migrated: vec![],
             failed: vec![],
             error: Some(HUB_UNREACHABLE_CLI_FALLBACK.to_string()),
+            scope: "shared".to_string(),
         };
         assert!(!down.ok);
         assert!(down.migrated.is_empty());
@@ -2345,6 +2367,12 @@ pub struct MigrateEnvSecretsResult {
     pub migrated: Vec<String>,
     pub failed: Vec<String>,
     pub error: Option<String>,
+    /// GAP-1 (2026-07-14): where the hub landed the keys — `"shared"` or
+    /// `"per_project"`. SecretsTab uses it to say "migrated to THIS
+    /// project's scope" vs "…to the shared scope (orchestrator root)".
+    /// Defaults to `"shared"` when the hub predates the `scope` field
+    /// (mixed-version window during self-update).
+    pub scope: String,
 }
 
 /// The CLI-fallback guidance surfaced when the hub can't be reached. Kept
@@ -2368,6 +2396,16 @@ struct HubMigrateFailure {
 struct HubMigrateResponse {
     migrated: Vec<String>,
     failed: Vec<HubMigrateFailure>,
+    /// GAP-1 (2026-07-14): `"shared"` | `"per_project"`. `#[serde(default)]`
+    /// tolerates an OLDER hub (mixed-version self-update window) whose
+    /// response omits the field → defaults to `"shared"`, the correct value
+    /// for that hub since it only ever wrote the shared bucket.
+    #[serde(default = "default_shared_scope")]
+    scope: String,
+}
+
+fn default_shared_scope() -> String {
+    "shared".to_string()
 }
 
 /// Read the hub port + token the same way `hub_proxy.rs` does (re-read
@@ -2394,6 +2432,7 @@ fn hub_port_token() -> Result<(u16, String), String> {
 /// written to disk).
 async fn post_secrets_to_hub(
     secrets: &[EnvSecret],
+    project_id: Option<&str>,
 ) -> Result<HubMigrateResponse, String> {
     let (port, token) = hub_port_token()?;
     let client = reqwest::Client::builder()
@@ -2401,12 +2440,18 @@ async fn post_secrets_to_hub(
         .build()
         .map_err(|e| format!("http client: {}", e))?;
     let url = format!("http://127.0.0.1:{}/api/v1/secrets/migrate", port);
-    let payload = serde_json::json!({
+    // GAP-1: forward the owning project id so the hub's scope policy (S1)
+    // routes the keys to this project's scope (or Shared for the
+    // orchestrator root). No scope logic here — the hub decides.
+    let mut payload = serde_json::json!({
         "secrets": secrets
             .iter()
             .map(|s| serde_json::json!({ "key": s.key, "value": s.value }))
             .collect::<Vec<_>>(),
     });
+    if let Some(pid) = project_id {
+        payload["project_id"] = serde_json::Value::String(pid.to_string());
+    }
     let resp = client
         .post(&url)
         .bearer_auth(&token)
@@ -2458,6 +2503,7 @@ fn build_migration_outcome(
             migrated,
             failed: failed_keys,
             error,
+            scope: hub.scope.clone(),
         },
         new_env,
     )
@@ -2484,6 +2530,7 @@ pub async fn migrate_env_secrets_from_dotenv(
                 migrated: vec![],
                 failed: vec![],
                 error: None,
+                scope: "shared".to_string(),
             });
         }
         Err(e) => return Err(format!("read {}: {}", env_path.display(), e)),
@@ -2495,11 +2542,17 @@ pub async fn migrate_env_secrets_from_dotenv(
             migrated: vec![],
             failed: vec![],
             error: None,
+            scope: "shared".to_string(),
         });
     }
 
-    // 3. POST to the hub. Hub-unreachable → CLI-fallback, nothing written.
-    let hub = match post_secrets_to_hub(&candidates).await {
+    // 3. POST to the hub, forwarding this project's id so the hub's scope
+    //    policy (S1) routes the keys per-project (or Shared for the
+    //    orchestrator root). The id is already resolved above — pre-GAP-1
+    //    it was used only to find `.env` and then dropped, which is the bug
+    //    that migrated a per-project secret into the shared bucket.
+    //    Hub-unreachable → CLI-fallback, nothing written.
+    let hub = match post_secrets_to_hub(&candidates, Some(&project_id)).await {
         Ok(h) => h,
         Err(_) => {
             return Ok(MigrateEnvSecretsResult {
@@ -2507,6 +2560,7 @@ pub async fn migrate_env_secrets_from_dotenv(
                 migrated: vec![],
                 failed: vec![],
                 error: Some(HUB_UNREACHABLE_CLI_FALLBACK.to_string()),
+                scope: "shared".to_string(),
             });
         }
     };
@@ -2517,7 +2571,158 @@ pub async fn migrate_env_secrets_from_dotenv(
         write_env_atomically(&env_path, &text)
             .map_err(|e| format!("rewrite {}: {}", env_path.display(), e))?;
     }
+
+    // 5. On a per-project migration that landed keys, refresh this project's
+    //    env surfaces so the freshly-scoped secrets appear immediately —
+    //    same soft-fail contract as the manual add-form's post-write refresh.
+    if result.scope == "per_project" && !result.migrated.is_empty() {
+        refresh_env_after_user_secret_change(
+            &db,
+            &project_id,
+            "per_project",
+            "user",
+            "migrate_env_secrets_from_dotenv",
+        );
+    }
+
     Ok(result)
+}
+
+// ─── GAP-2 (2026-07-14): bulk "disable shared secrets" opt-out ───────────
+//
+// Mirror of the shared-KG read gate (`set_shared_kg_read_disabled`,
+// `commands/projects_v2.rs`). When ON, this project omits the user-shared
+// secrets bucket from its `/env` pairs (enforced server-side in the core
+// resolver `resolve_active_user_secret_pairs_for_requester`). Backed by the
+// SAME `module_settings` storage the KG gate uses, addressed via the ONE
+// shared policy home (`secret_scope_policy` / `module_settings_keys`) so no
+// second module_id namespace can drift in (the KG-gate split-brain lesson).
+//
+// Scope decision (recorded here + in the resolver comment): the gate covers
+// the USER shared bucket (`module_id='user'`) only. Orchestrator-bundled /
+// module-manifest SHARED secrets (e.g. `github_pat`) are NOT gated — they are
+// infrastructure the project's hooks need (git push), and per-key pause
+// already covers them.
+
+/// Result of a GAP-2 toggle write. Carries any non-fatal warnings (env
+/// refresh / marker write) the UI should surface without treating them as
+/// failures.
+#[derive(Debug, Clone, Serialize)]
+pub struct SharedSecretsToggleResult {
+    pub read_disabled: bool,
+    pub warnings: Vec<String>,
+}
+
+/// Read the per-project SHARED_SECRETS_READ_DISABLED gate for the launcher
+/// GUI's SecretsTab. Mirror of `get_shared_kg_read_disabled_cmd`.
+#[command]
+pub async fn get_shared_secrets_read_disabled_cmd(
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<bool, String> {
+    Ok(secret_scope_policy::shared_secrets_read_disabled(
+        &db,
+        &project_id,
+    ))
+}
+
+/// Persist the per-project SHARED_SECRETS_READ_DISABLED toggle and refresh
+/// this project's env surfaces so the change takes effect immediately.
+/// Mirror of `set_shared_kg_read_disabled`.
+#[command]
+pub async fn set_shared_secrets_read_disabled(
+    project_id: String,
+    read_disabled: bool,
+    db: State<'_, Db>,
+) -> Result<SharedSecretsToggleResult, String> {
+    let row = db
+        .get_project(&project_id)?
+        .ok_or_else(|| format!("project {} not found", project_id))?;
+
+    // 1. Persist to module_settings under the canonical orchestrator-core id
+    //    (binding constraint 3: reuse Db::set_setting, no new accessor).
+    db.set_setting(
+        &project_id,
+        module_settings_keys::ORCHESTRATOR_CORE_MODULE_ID,
+        module_settings_keys::SETTING_KEY_SHARED_SECRETS_READ_DISABLED,
+        &serde_json::Value::Bool(read_disabled),
+    )?;
+
+    let mut warnings: Vec<String> = Vec::new();
+
+    // 2. Refresh env surfaces so shared keys are emitted/stripped now. The
+    //    gate lives in the core resolver, so the writer re-reads the flag on
+    //    this refresh — same soft-fail contract as the KG toggle.
+    if let Err(e) = crate::commands::projects_v2::refresh_project_env_with_db(&db, &project_id) {
+        let msg = format!(
+            "shared-secrets read-disabled env refresh failed: {}. Toggle \
+             persisted to DB but env files may be stale until the next refresh.",
+            e
+        );
+        eprintln!("[vct] warning: {}", msg);
+        warnings.push(msg);
+    }
+
+    // 3. Companion file-store marker (S5): the documented
+    //    `~/.vct-secrets/projects/<NAME>/.no-shared-fallback` gate for the
+    //    hub-independent tier-2 file store. Best-effort — a marker write/remove
+    //    failure is a warning, never an Err (conservative soft-fail).
+    if let Some(shared_dir) = vct_secrets_shared_dir_for_marker() {
+        let proj_dir = shared_dir.join("projects").join(&row.name);
+        let marker = proj_dir.join(".no-shared-fallback");
+        if read_disabled {
+            if let Err(e) = std::fs::create_dir_all(&proj_dir)
+                .and_then(|()| std::fs::write(&marker, b""))
+            {
+                let msg = format!(
+                    "could not create the file-store .no-shared-fallback marker \
+                     at {}: {} (keychain-side gate is active; file-store tier-2 \
+                     shared fallback is not gated until the marker exists)",
+                    marker.display(),
+                    e
+                );
+                eprintln!("[vct] warning: {}", msg);
+                warnings.push(msg);
+            }
+        } else if marker.exists() {
+            if let Err(e) = std::fs::remove_file(&marker) {
+                let msg = format!(
+                    "could not remove the file-store .no-shared-fallback marker \
+                     at {}: {} (keychain-side gate is off; file-store tier-2 may \
+                     still skip shared until the marker is removed)",
+                    marker.display(),
+                    e
+                );
+                eprintln!("[vct] warning: {}", msg);
+                warnings.push(msg);
+            }
+        }
+    }
+
+    // 4. Audit (metadata only — never a value).
+    db.audit(
+        "project_shared_secrets_read_disabled",
+        Some(&project_id),
+        None,
+        &serde_json::json!({ "read_disabled": read_disabled }),
+    )?;
+
+    Ok(SharedSecretsToggleResult {
+        read_disabled,
+        warnings,
+    })
+}
+
+/// Resolve the `~/.vct-secrets/` root (parent of `shared/`) cross-OS for the
+/// per-project marker. Kept local to avoid coupling secrets_cmd to
+/// secrets_import's `shared/`-suffixed helper.
+fn vct_secrets_shared_dir_for_marker() -> Option<std::path::PathBuf> {
+    let home = if cfg!(target_os = "windows") {
+        std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
+    } else {
+        std::env::var_os("HOME")
+    }?;
+    Some(std::path::PathBuf::from(home).join(".vct-secrets"))
 }
 
 /// Atomic `.env` rewrite: write a sibling temp file (0o600 on Unix so the

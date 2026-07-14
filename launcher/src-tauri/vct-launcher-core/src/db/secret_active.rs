@@ -889,14 +889,26 @@ pub fn resolve_active_user_secret_pairs_for_requester(
         requester_project_id,
         &mut out,
     );
-    resolve_one_bucket(
+    // GAP-2 (2026-07-14): the requester project can bulk opt out of ALL
+    // user-shared secrets via the `shared_secrets_read_disabled` gate
+    // (mirror of the shared-KG read gate). When set, the shared bucket is
+    // omitted entirely for this requester — per-key pause still covers
+    // individual keys, and per_project / global buckets are untouched
+    // (global is machine-wide with distinct semantics). Gating on the
+    // REQUESTER (not `project_id`) matches the per-requester pause model.
+    if !crate::db::secret_scope_policy::shared_secrets_read_disabled(
         own_db,
-        &shared_keys,
-        "shared",
-        "_user_shared_",
         requester_project_id,
-        &mut out,
-    );
+    ) {
+        resolve_one_bucket(
+            own_db,
+            &shared_keys,
+            "shared",
+            "_user_shared_",
+            requester_project_id,
+            &mut out,
+        );
+    }
     resolve_one_bucket(
         own_db,
         &global_keys,
@@ -1600,6 +1612,88 @@ mod tests {
             resolve_active_user_secret_pairs_for_requester(&db, "other-proj", "other-proj").len(),
             1,
             "the pause is per-requester: other projects still resolve the shared key"
+        );
+    }
+
+    /// GAP-2 (2026-07-14): the bulk `shared_secrets_read_disabled` gate drops
+    /// the ENTIRE shared bucket for the opted-out requester while leaving
+    /// other requesters (and the opted-out project's own per-project keys)
+    /// untouched. Tests BOTH the act (opt-out drops shared) and the
+    /// leave-alone case (other project still resolves it) per the
+    /// destructive-branch test rule.
+    #[test]
+    fn user_pairs_resolver_honors_bulk_shared_secrets_opt_out() {
+        use crate::db::module_settings_keys::{
+            ORCHESTRATOR_CORE_MODULE_ID, SETTING_KEY_SHARED_SECRETS_READ_DISABLED,
+        };
+        use crate::db::models::ProjectHost;
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let db = Db::open_in_memory().unwrap();
+        let opted_out = "proj-opt-out";
+        let normal = "proj-normal";
+        // module_settings.project_id FKs to projects(id) — seed the row the
+        // opt-out gate is stored against.
+        db.insert_project(opted_out, opted_out, "/tmp/opt-out", ProjectHost::Base, opted_out)
+            .unwrap();
+
+        // A shared user key, active for everyone.
+        crate::secrets::set(
+            crate::secrets::SecretScope::Shared { project_id: "_user_shared_" },
+            "user",
+            "EXAMPLE_SHARED_KEY",
+            "shared-val",
+        )
+        .unwrap();
+        db.mark_secret_active("shared", "_user_shared_", "user", "EXAMPLE_SHARED_KEY")
+            .unwrap();
+        // The opted-out project ALSO owns a per-project key — it must keep
+        // resolving even when the shared bucket is gated.
+        crate::secrets::set(
+            crate::secrets::SecretScope::PerProject { project_id: opted_out },
+            "user",
+            "EXAMPLE_OWN_KEY",
+            "own-val",
+        )
+        .unwrap();
+        db.mark_secret_active("per_project", opted_out, "user", "EXAMPLE_OWN_KEY")
+            .unwrap();
+
+        // Before opt-out: BOTH projects resolve the shared key.
+        assert!(
+            resolve_active_user_secret_pairs_for_requester(&db, opted_out, opted_out)
+                .iter()
+                .any(|(k, _)| k == "EXAMPLE_SHARED_KEY"),
+            "pre-opt-out: shared key must resolve"
+        );
+
+        // Opt the one project out via the canonical gate row.
+        db.set_setting(
+            opted_out,
+            ORCHESTRATOR_CORE_MODULE_ID,
+            SETTING_KEY_SHARED_SECRETS_READ_DISABLED,
+            &serde_json::Value::Bool(true),
+        )
+        .unwrap();
+
+        // ACT: opted-out requester no longer resolves the shared key…
+        let opted = resolve_active_user_secret_pairs_for_requester(&db, opted_out, opted_out);
+        assert!(
+            !opted.iter().any(|(k, _)| k == "EXAMPLE_SHARED_KEY"),
+            "opt-out must drop the shared bucket: {:?}",
+            opted.iter().map(|(k, _)| k).collect::<Vec<_>>()
+        );
+        // …but its OWN per-project key still resolves.
+        assert!(
+            opted.iter().any(|(k, _)| k == "EXAMPLE_OWN_KEY"),
+            "opt-out must NOT drop the project's own per-project keys"
+        );
+
+        // LEAVE-ALONE: a different project (no opt-out row) still resolves it.
+        assert!(
+            resolve_active_user_secret_pairs_for_requester(&db, normal, normal)
+                .iter()
+                .any(|(k, _)| k == "EXAMPLE_SHARED_KEY"),
+            "the opt-out is per-requester: other projects still resolve the shared key"
         );
     }
 

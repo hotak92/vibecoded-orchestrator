@@ -68,7 +68,6 @@ fn silent_command<S: AsRef<std::ffi::OsStr>>(program: S) -> TokioCommand {
     let mut cmd = TokioCommand::new(program);
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         // CREATE_NO_WINDOW = 0x08000000 (winbase.h). Suppresses console
         // allocation for the child. Mandatory on Windows for parent
         // processes built with `windows_subsystem = "windows"`.

@@ -3107,6 +3107,52 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+
+def run_update_reprojection_step(
+    *,
+    print_fn: Any = print,
+    log_event: Any | None = None,
+) -> None:
+    """install.py ``--update`` wiring for :func:`reproject_all_registered_projects`.
+
+    Extracted from install.py main() (ratchet: flow logic lives in vco_lib,
+    the monolith gets a thin call). Behavior:
+
+    - :class:`DbUnreachable` -> quiet no-op — fresh install pre-launcher-boot,
+      the same posture as the orchestrator-root backfill's ``db_unreachable``
+      arm (the first project add creates launcher.db; later ``--update`` runs
+      re-project then).
+    - Per-project failures already emitted canonical deferral entries inside
+      the sweep (``codegraph_access_list_reprojection_failed``); here they are
+      only COUNTED for the operator summary.
+    - Never raises past DbUnreachable handling: the update must not die on a
+      summary/logging problem (the sweep itself did the real work).
+    """
+    try:
+        outcomes = reproject_all_registered_projects(log_event=log_event)
+    except DbUnreachable:
+        return
+    migrated = sum(1 for o in outcomes if o["status"] == "migrated")
+    failed = sum(1 for o in outcomes if o["status"] == "failed")
+    if outcomes:
+        msg = f"  Access-list re-projection: {migrated} project(s) re-projected"
+        if failed:
+            msg += f", {failed} deferred (see UPDATE_DEFERRED.md)"
+        try:
+            print_fn(msg)
+        except Exception:
+            pass
+    if log_event is not None:
+        try:
+            log_event(
+                "9/10", "info",
+                "reproject_all_registered_projects "
+                f"migrated={migrated} failed={failed}",
+            )
+        except Exception:
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)

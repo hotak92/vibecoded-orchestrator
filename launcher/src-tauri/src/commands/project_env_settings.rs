@@ -1353,6 +1353,11 @@ fn resolve_user_secret_state(db: &Db, project_id: &str) -> (Vec<(String, String)
         out_pairs: &mut Vec<(String, String)>,
         out_known: &mut Vec<String>,
         already_emitted: &std::collections::HashSet<String>,
+        // GAP-2 (2026-07-14): when true, keys STILL enter `out_known` (so the
+        // env writer strips any previously-emitted copies) but are NEVER
+        // emitted into `out_pairs` — the bulk shared-secrets opt-out posture.
+        // Only the shared bucket passes `true` here (gated on the flag).
+        emit_disabled: bool,
     ) {
         for key in keys {
             // The known-keys list always carries the key (drives strip
@@ -1361,6 +1366,11 @@ fn resolve_user_secret_state(db: &Db, project_id: &str) -> (Vec<(String, String)
             // multiple buckets.
             if !out_known.iter().any(|k| k == key) {
                 out_known.push(key.clone());
+            }
+            // GAP-2: opt-out project → key is known (→ stripped) but never
+            // emitted as a pair. Exactly the inactive-key posture.
+            if emit_disabled {
+                continue;
             }
             // Skip emit if a previous bucket already populated this key.
             // Bucket order = per-project → shared → global, so
@@ -1406,12 +1416,19 @@ fn resolve_user_secret_state(db: &Db, project_id: &str) -> (Vec<(String, String)
         &mut pairs,
         &mut known_keys,
         &emitted,
+        false, // per-project bucket is never bulk-gated
     );
     for (k, _) in pairs.iter() {
         emitted.insert(k.clone());
     }
 
-    // 2. Shared bucket.
+    // 2. Shared bucket. GAP-2: gate on the per-project bulk opt-out. When
+    //    the flag is on, shared keys land in `known_keys` (stripped from env
+    //    surfaces) but never in `pairs`. Reads the SAME canonical gate the
+    //    core resolver uses (one home, `secret_scope_policy`), so the env
+    //    writer and the hub /env resolver never disagree.
+    let shared_secrets_read_disabled =
+        crate::db::secret_scope_policy::shared_secrets_read_disabled(db, project_id);
     let shared_pairs_start = pairs.len();
     resolve_one_bucket(
         db,
@@ -1424,12 +1441,14 @@ fn resolve_user_secret_state(db: &Db, project_id: &str) -> (Vec<(String, String)
         &mut pairs,
         &mut known_keys,
         &emitted,
+        shared_secrets_read_disabled,
     );
     for (k, _) in &pairs[shared_pairs_start..] {
         emitted.insert(k.clone());
     }
 
-    // 3. Global bucket.
+    // 3. Global bucket. Machine-wide with distinct semantics — NOT covered
+    //    by the shared opt-out (per-key pause still applies).
     resolve_one_bucket(
         db,
         &global_keys,
@@ -1439,6 +1458,7 @@ fn resolve_user_secret_state(db: &Db, project_id: &str) -> (Vec<(String, String)
         &mut pairs,
         &mut known_keys,
         &emitted,
+        false, // global bucket is never bulk-gated
     );
 
     (pairs, known_keys)

@@ -67,10 +67,10 @@ impl CommandExt for tokio::process::Command {
     fn silent(mut self) -> Self {
         #[cfg(windows)]
         {
-            // tokio::process::Command on Windows wraps std::process::Command
-            // and exposes the same `creation_flags` method via the same
-            // CommandExt trait from std::os::windows::process.
-            use std::os::windows::process::CommandExt as _;
+            // tokio::process::Command exposes `creation_flags` as an INHERENT
+            // method on Windows — no std CommandExt trait import needed (the
+            // import was flagged unused by the windows-gnu cross-build,
+            // v0.2.80 warning sweep).
             self.creation_flags(0x0800_0000);
         }
         self

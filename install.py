@@ -4850,10 +4850,17 @@ def _ensure_running_under_mcp_venv() -> None:
 # `~/.claude.json` (which has had `_is_secret_shaped_env_key` filtering
 # since PR-23 / v0.2.12) — this closes the gap on the per-project surface.
 #
-# Migration semantics (matches commands/secrets_import.rs):
-#   * Scope:    Shared { project_id: SENTINEL_SHARED }  (one slot per user)
+# Migration semantics (GAP-1, 2026-07-14 — scope is now project-aware):
+#   * Scope:    decided hub-side from the resolved project id —
+#               PerProject { project_id } for a registered base/mao project
+#               (the OWNING project's keychain), Shared { SENTINEL_SHARED }
+#               for the orchestrator root or a pre-registration adopt.
 #   * Module:   "user"
 #   * Key:      original env var name (e.g. "OPENAI_API_KEY")
+#
+# The CLI resolves the launcher.db project id via the hub by-path lookup and
+# forwards it; the hub's scope policy (S1) decides Shared vs PerProject. An
+# UNREGISTERED non-root project defers (no CLI back-door to Shared).
 #
 # Post-migration the `.env` value is replaced with `__vco_keychain__`;
 # the bundled secrets-resolver helper at
@@ -4863,99 +4870,24 @@ def _ensure_running_under_mcp_venv() -> None:
 
 def _post_secrets_to_hub(
     secrets_payload: list[dict],
-) -> tuple[list[str], list[dict]]:
-    """POST to ``/api/v1/secrets/migrate`` and return ``(migrated, failed)``.
+    project_id: str | None = None,
+) -> tuple[list[str], list[dict], str | None]:
+    """POST to the hub's ``/secrets/migrate`` (delegates to the extracted
+    helper; kept as an install.py name so existing tests can mock it).
 
-    ``secrets_payload`` is ``[{"key": str, "value": str}, ...]``. The hub
-    routes each pair into the user-shared keychain bucket (same slot the
-    SecretsPanel's "Shared (this user)" tab writes to).
-
-    Returns:
-      * ``migrated`` — list of keys the hub confirmed it wrote.
-      * ``failed`` — list of ``{"key": str, "error": str}`` for entries
-        the hub could not write (transient keyring errors, permission
-        denied, etc.).
-
-    Raises ``RuntimeError`` only when the hub itself is unreachable or
-    returns a non-2xx response — those are install-blocking failures
-    that the caller should surface as a deferral.
-
-    Discovery: uses ``vco_lib.project_config._discover_hub`` so the
-    install path picks up the same port + token the resolver clients
-    use (no duplicated env-var probing).
+    Returns ``(migrated, failed, scope)``; ``scope`` is ``None`` on an old
+    hub. Raises ``RuntimeError`` when the hub is unreachable / non-2xx. See
+    ``vco_lib.install_env_secret_scope.post_secrets_to_hub`` for the contract.
     """
-    # Lazy imports: keep install.py's import surface stable when V47-C
-    # isn't exercised on this run (most installs).
-    import json
-    try:
-        import requests
-    except ImportError as exc:
-        raise RuntimeError(
-            "V47-C: cannot migrate secrets — `requests` not importable; "
-            "is the MCP venv active?"
-        ) from exc
-
-    from vco_lib.project_config import _discover_hub, HubUnreachable
-
-    try:
-        port, token = _discover_hub()
-    except HubUnreachable as exc:
-        raise RuntimeError(f"V47-C: hub unreachable: {exc}") from exc
-
-    url = f"http://127.0.0.1:{port}/api/v1/secrets/migrate"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-    body = json.dumps({"secrets": secrets_payload}).encode("utf-8")
-    try:
-        resp = requests.post(url, data=body, headers=headers, timeout=(2.0, 30.0))
-    except requests.RequestException as exc:
-        raise RuntimeError(f"V47-C: POST {url} failed: {exc}") from exc
-
-    if resp.status_code >= 400:
-        raise RuntimeError(
-            f"V47-C: hub returned HTTP {resp.status_code}: "
-            f"{resp.text[:300]!r}"
-        )
-
-    try:
-        data = resp.json()
-    except ValueError as exc:
-        raise RuntimeError(
-            f"V47-C: hub response not JSON: {resp.text[:300]!r}"
-        ) from exc
-
-    migrated = list(data.get("migrated") or [])
-    failed = list(data.get("failed") or [])
-    return migrated, failed
+    from vco_lib.install_env_secret_scope import post_secrets_to_hub
+    return post_secrets_to_hub(secrets_payload, project_id=project_id)
 
 
 def _print_secrets_migration_details() -> None:
-    """Print the long-form explanation shown on the ``details`` prompt option."""
-    print()
-    print("  What this does:")
-    print("    1. Reads each secret-shaped key/value from your `.env`")
-    print("    2. POSTs the values to your local vct-hub on 127.0.0.1")
-    print("    3. The hub writes them to the OS keychain (libsecret on")
-    print("       Linux, Keychain on macOS, Credential Manager on Windows)")
-    print("    4. The .env values are replaced with `__vco_keychain__`")
-    print("       so bundled tooling knows to ask the hub at runtime")
-    print()
-    print("  What this does NOT do:")
-    print("    * No values leave your machine. The hub binds 127.0.0.1.")
-    print("    * Your `.env` file is NOT deleted — the keys stay there")
-    print("      with a sentinel value so .env-aware tools keep working.")
-    print("    * Already-migrated entries (value == `__vco_keychain__`)")
-    print("      are silently skipped.")
-    print()
-    print("  Why migrate:")
-    print("    * Keychain encrypts secrets at rest (libsecret/Keychain).")
-    print("    * Plaintext .env is readable by ANY process running as you,")
-    print("      including a rogue `pip install` or browser extension.")
-    print("    * Launcher GUI can rotate/pause/revoke keys without you")
-    print("      having to grep through .env files.")
-    print()
+    """Print the long-form V47-C migration explanation (delegates to the
+    extracted helper so install.py stays thin)."""
+    from vco_lib.install_env_secret_scope import print_secrets_migration_details
+    print_secrets_migration_details()
 
 
 def _audit_and_offer_env_secret_migration(
@@ -5126,12 +5058,36 @@ def _audit_and_offer_env_secret_migration(
             )
             return
 
-        # User said Y — POST to hub, rewrite .env on success.
+        # User said Y — resolve the OWNING project id (GAP-1) so the hub routes
+        # the secrets per-project. The scope decision + deferral construction
+        # live in vco_lib.install_env_secret_scope (the by-path resolver is
+        # reused there; no second client).
+        from vco_lib.install_env_secret_scope import (
+            resolve_env_secret_migration_target,
+        )
+
+        _target = resolve_env_secret_migration_target(
+            project_root, Path(__file__).resolve().parent, env_path, sorted_keys,
+        )
+        if _target.action == "defer":
+            print(
+                "  This project is not registered with the launcher yet, "
+                "so its secrets cannot be scoped to it."
+            )
+            print("  Keeping secrets in .env; deferring the migration.")
+            if _target.deferral is not None:
+                deferral_report.add_entry(_target.deferral)
+            return
+        pid = _target.project_id
+
+        # POST to hub, rewrite .env on success.
         secrets_payload = [
             {"key": c.key, "value": c.value} for c in candidates
         ]
         try:
-            migrated, failed = _post_secrets_to_hub(secrets_payload)
+            migrated, failed, migrate_scope = _post_secrets_to_hub(
+                secrets_payload, project_id=pid,
+            )
         except RuntimeError as exc:
             print(f"  Migration failed: {exc}")
             print("  Keeping secrets in .env (no changes made).")
@@ -5174,6 +5130,15 @@ def _audit_and_offer_env_secret_migration(
                 )
             )
             return
+
+        # E3 (GAP-1): old-hub detection + destination notice (helper builds the
+        # one-liner: old hub → "landed in Shared, re-scope"; else confirms the
+        # scope the hub reported).
+        if migrated:
+            from vco_lib.install_env_secret_scope import format_scope_notice
+            _notice = format_scope_notice(pid, migrate_scope)
+            if _notice:
+                print(f"  {_notice}")
 
         # Rewrite .env: only the keys the hub confirmed.
         if migrated:
@@ -6487,16 +6452,9 @@ def main() -> int:
         # this code path (`mode == "install"` above).
         _cleanup_legacy_bash_env_shim(args)
 
-        # Phase 0.B Part 2 (2026-05-25): a single call to
-        # `_backfill_code_graph_project_env` (now backed by the Python
-        # `vco_lib.config_projection.apply_project_env` contract) projects
-        # the FULL canonical env (KG_COLLECTION, DEVELOPMENT_COLLECTION,
-        # SHARED_KG_COLLECTION, PROJECT_NAME, CODE_GRAPH_PROJECT,
-        # ACTIVE_EMBEDDING, service URLs/ports, access lists) — replacing
-        # the historical two-step (PR-7 PROJECT_NAME+CODE_GRAPH backfill
-        # plus v0.2.28 KG_COLLECTION+SHARED+DEV backfill). The contract
-        # reads launcher.db directly; any per-key drift between disk and
-        # DB is corrected on every `--update` pass.
+        # Phase 0.B Part 2 (2026-05-25): projects the FULL canonical env for
+        # the orchestrator root via vco_lib.config_projection.apply_project_env
+        # (reads launcher.db; corrects per-key drift on every --update pass).
         _backfill_result = _backfill_code_graph_project_env()
         if _backfill_result["action"] == "applied":
             print(
@@ -6519,6 +6477,11 @@ def main() -> int:
             f"_backfill_code_graph_project_env action={_backfill_result['action']}",
             data=_backfill_result,
         )
+
+        # v0.2.80 GAP-CG-1: re-project ALL projects (name-form access lists);
+        # semantics + posture documented on run_update_reprojection_step.
+        from vco_lib.config_projection import run_update_reprojection_step
+        run_update_reprojection_step(print_fn=print, log_event=_log_install_event)
 
         # PR-22 (v0.2.12, 2026-05-16): rename legacy
         # `docker-compose.override.yml` to `compose.override.yaml` so
@@ -11449,8 +11412,15 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
 
     print("[4/10] Installing weaviate_mcp (editable) ... ", end="", flush=True)
     _log_install_event("4/10", "start", "pip install -e claude_mcp_servers/ (weaviate_mcp)")
-    # v0.2.53 DEDUP-1: silent-hang fix. Soft-fail (on_failure="return")
-    # because sys.path fallback keeps consumer scripts working.
+    # v0.2.53 DEDUP-1: silent-hang fix. Soft-fail (on_failure="return") on the
+    # pip step itself — a transient network/pip hiccup should not abort the
+    # whole install; the returncode gate below reports it and re-run repairs.
+    # NOTE (2026-07-14, FN-5b): the OLD "sys.path fallback keeps consumer
+    # scripts working" rationale is DEAD. weaviate_mcp's submodules (chunking,
+    # code_ranking, rl_state, embeddings, rl_enrichment) import ONLY when the
+    # package is properly editable-installed into the resolved venv — no
+    # sys.path shim makes them work from a bare checkout. A failed/partial
+    # editable install is a BROKEN install; the FN-5b verify below hard-fails.
     mcp_editable_result = _run_logged_subprocess(
         [str(venv_python), "-m", "pip", "install",
          *_pip_install_flags(),
@@ -11467,10 +11437,37 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
         ],
     )
     if mcp_editable_result.returncode != 0:
-        # Soft-fail: don't kill the whole install — sys.path fallbacks still work.
+        # The pip step failed. Report + return (re-run repairs); the verify
+        # below would fail too, so surface the pip failure as the root cause.
         return
     print("OK")
     _log_install_event("4/10", "ok", "weaviate_mcp editable install completed")
+
+    # FN-5b (2026-07-14): verify the editable install actually made
+    # weaviate_mcp's submodules importable — a "successful" pip step can still
+    # leave a broken package (stale .egg-link, partial link, missing transitive
+    # dep). The analyzer + MCP import these directly, so a silent import failure
+    # surfaces later as an opaque crash; loud-fail with the missing list instead.
+    print("[4/10] Verifying weaviate_mcp submodules import ... ", end="", flush=True)
+    _log_install_event("4/10", "start", "verify weaviate_mcp submodule imports (FN-5b)")
+    from vco_lib.install_mcp import build_weaviate_mcp_import_verify_script
+    _run_logged_subprocess(
+        [str(venv_python), "-c", build_weaviate_mcp_import_verify_script()],
+        step="4/10", phase_label="verify-weaviate_mcp-submodule-imports",
+        timeout=120,
+        cwd=str(PROJECT_ROOT),
+        env=_pip_subprocess_env(),
+        on_failure="exit",
+        fail_message="FAIL",
+        user_hint_lines=[
+            "weaviate_mcp is pip-installed but a submodule cannot be imported "
+            "(see the list above) — a BROKEN install, not a degraded one.",
+            "Fix: re-run 'python install.py --update'; if it persists, check the "
+            "venv for a stale weaviate_mcp .egg-link or a missing transitive dep.",
+        ],
+    )
+    print("OK")
+    _log_install_event("4/10", "ok", "weaviate_mcp submodule imports verified (FN-5b)")
 
 
 # ---------------------------------------------------------------------------

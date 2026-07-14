@@ -195,6 +195,13 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: the DB schema is at the level this code expects (refuse to start if
 #: launcher.db is somehow ahead — user downgraded orchestrator while running
 #: on newer DB).
+#: 40 = migration 040_shared_kg_gate_module_id_canonicalize.sql (2026-07-14
+#: split-brain fix — relocates the shared-KG gate flags
+#: shared_kg_read_disabled / shared_kg_write_disabled / shared_kg_opt_out
+#: from module_settings.module_id='__project__' (the launcher GUI writer) to
+#: the canonical 'orchestrator-core' (what the hub /config resolver + this
+#: Python env projection already read). Newer value wins on conflict; legacy
+#: rows deleted. Bumped ATOMICALLY with mig 040's Rust registration.
 #: 39 = migration 039_rl_events_quarantine.sql (RL-14, v0.2.75 — nullable
 #: rl_events.quarantined_at/quarantine_reason marker columns + partial index;
 #: poisoned rows are marked, not deleted, and excluded from training reads).
@@ -206,7 +213,7 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: 37 = migration 037_code_graph_build_pid.sql (code_graph_builds.pid, R-4 —
 #: registers the detached install-spawned resync walk so the GUI shows it and
 #: the boot sweep can death-detect it).
-LAUNCHER_DB_TABLE_SET_VERSION = 39
+LAUNCHER_DB_TABLE_SET_VERSION = 40
 
 
 # ===========================================================================

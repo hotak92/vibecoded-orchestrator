@@ -213,6 +213,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "rl_events quarantine marker (RL-14, v0.2.75). Nullable quarantined_at (unix-ms) + quarantine_reason (stable tag, e.g. 'score_out_of_range') columns + partial index on marked rows. Poisoned telemetry rows (historical out-of-range node scores pre-dating the v0.2.70 F-E writer clamp) are MARKED rather than deleted so query-distribution signal survives while training-data reads (hub GET /rl/events + the module DB API events route) exclude them by default. The one-time marking pass for the historical score>1.0 class runs Rust-side (Db::backfill_quarantine_out_of_range from Db::open, guarded by app_state 'rl_events.quarantine_backfill_v1') — payload_json is writer-supplied TEXT the hub never JSON-validates, so a SQL json_each pass would hard-fail the whole migration on one malformed row; the Rust pass skips unparseable payloads softly. Plain additive ALTER TABLE + partial index — idempotent via the runner's version check, not self-transactional. LAUNCHER_DB_TABLE_SET_VERSION bumps 38->39 atomically with this migration (B-2).",
         sql: include_str!("migrations/039_rl_events_quarantine.sql"),
     },
+    Migration {
+        version: 40,
+        description: "canonicalize the shared-KG gate module_id (2026-07-14 split-brain fix). The per-project gate flags shared_kg_read_disabled / shared_kg_write_disabled / shared_kg_opt_out were WRITTEN under module_settings.module_id='__project__' by the launcher GUI setters/getters (commands/projects_v2.rs) but READ under 'orchestrator-core' by the hub /config resolver (vct-hub/src/config_api.rs) + the Python env projection (vco_lib/config_projection.py) — same key, two namespaces, so the GUI toggle read FALSE on the hub + Python surfaces. The writers/getters are now repointed to the canonical 'orchestrator-core' id (db/module_settings_keys.rs::ORCHESTRATOR_CORE_MODULE_ID). This migration relocates existing '__project__' rows for these three keys onto the canonical id: rows with no canonical counterpart flip module_id in place; when both exist the NEWER value (higher rowid == later write) wins; the legacy '__project__' row is then deleted. Idempotent via the runner's version check (a manual re-run finds no '__project__' rows left). Plain UPDATE/DELETE — not self-transactional; rides the runner's outer transaction. LAUNCHER_DB_TABLE_SET_VERSION bumps 39->40 atomically with this migration (B-2).",
+        sql: include_str!("migrations/040_shared_kg_gate_module_id_canonicalize.sql"),
+    },
 ];
 
 /// Migrations whose .sql manages its OWN `BEGIN`/`COMMIT` boundary.
@@ -2192,5 +2197,188 @@ mod tests {
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         apply(&conn).expect("first apply");
         apply(&conn).expect("second apply (idempotent)");
+    }
+
+    // ─── Migration 040 — shared-KG gate module_id canonicalize ─────────
+
+    /// Seed a minimal projects row so module_settings' FK is satisfied.
+    fn seed_project_row_for_mig(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, slug, created_at, updated_at)
+             VALUES (?1, ?1, ?2, 'base', ?1, 0, 0)",
+            rusqlite::params![id, format!("/tmp/{}", id)],
+        )
+        .expect("seed project row");
+    }
+
+    fn read_setting(conn: &Connection, project_id: &str, module_id: &str, key: &str) -> Option<String> {
+        use rusqlite::OptionalExtension as _;
+        conn.query_row(
+            "SELECT setting_value FROM module_settings
+              WHERE project_id = ?1 AND module_id = ?2 AND setting_key = ?3",
+            rusqlite::params![project_id, module_id, key],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    /// A gate row stored ONLY under the legacy `__project__` sentinel is
+    /// relocated to `orchestrator-core` with its value intact; the legacy
+    /// row is removed.
+    #[test]
+    fn migration_040_relocates_legacy_only_gate_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 39).expect("apply through v39");
+        seed_project_row_for_mig(&conn, "p1");
+
+        // Legacy row under __project__, no canonical row.
+        conn.execute(
+            "INSERT INTO module_settings (project_id, module_id, setting_key, setting_value)
+             VALUES ('p1', '__project__', 'shared_kg_read_disabled', 'true')",
+            [],
+        )
+        .unwrap();
+
+        apply(&conn).expect("apply 40");
+
+        // Relocated to orchestrator-core, value preserved.
+        assert_eq!(
+            read_setting(&conn, "p1", "orchestrator-core", "shared_kg_read_disabled"),
+            Some("true".to_string())
+        );
+        // Legacy row gone.
+        assert_eq!(
+            read_setting(&conn, "p1", "__project__", "shared_kg_read_disabled"),
+            None
+        );
+    }
+
+    /// When BOTH rows exist, the NEWER (higher-rowid) value wins. Here the
+    /// legacy row is inserted AFTER the canonical row → legacy value wins.
+    #[test]
+    fn migration_040_newer_value_wins_on_conflict() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 39).expect("apply through v39");
+        seed_project_row_for_mig(&conn, "p1");
+
+        // Canonical row first (older/lower rowid) = false.
+        conn.execute(
+            "INSERT INTO module_settings (project_id, module_id, setting_key, setting_value)
+             VALUES ('p1', 'orchestrator-core', 'shared_kg_write_disabled', 'false')",
+            [],
+        )
+        .unwrap();
+        // Legacy row after (newer/higher rowid) = true → must win.
+        conn.execute(
+            "INSERT INTO module_settings (project_id, module_id, setting_key, setting_value)
+             VALUES ('p1', '__project__', 'shared_kg_write_disabled', 'true')",
+            [],
+        )
+        .unwrap();
+
+        apply(&conn).expect("apply 40");
+
+        assert_eq!(
+            read_setting(&conn, "p1", "orchestrator-core", "shared_kg_write_disabled"),
+            Some("true".to_string()),
+            "the newer (legacy-row) value must overwrite the older canonical value"
+        );
+        assert_eq!(
+            read_setting(&conn, "p1", "__project__", "shared_kg_write_disabled"),
+            None,
+            "legacy row must be deleted after the move"
+        );
+    }
+
+    /// When both rows exist and the CANONICAL row is newer, it is kept and
+    /// the legacy row is simply dropped.
+    #[test]
+    fn migration_040_keeps_newer_canonical_and_drops_legacy() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 39).expect("apply through v39");
+        seed_project_row_for_mig(&conn, "p1");
+
+        // Legacy row first (older) = true.
+        conn.execute(
+            "INSERT INTO module_settings (project_id, module_id, setting_key, setting_value)
+             VALUES ('p1', '__project__', 'shared_kg_read_disabled', 'true')",
+            [],
+        )
+        .unwrap();
+        // Canonical row after (newer) = false → must be kept.
+        conn.execute(
+            "INSERT INTO module_settings (project_id, module_id, setting_key, setting_value)
+             VALUES ('p1', 'orchestrator-core', 'shared_kg_read_disabled', 'false')",
+            [],
+        )
+        .unwrap();
+
+        apply(&conn).expect("apply 40");
+
+        assert_eq!(
+            read_setting(&conn, "p1", "orchestrator-core", "shared_kg_read_disabled"),
+            Some("false".to_string()),
+            "the newer canonical value must be preserved"
+        );
+        assert_eq!(
+            read_setting(&conn, "p1", "__project__", "shared_kg_read_disabled"),
+            None
+        );
+    }
+
+    /// Migration 040 must not touch unrelated `__project__` rows (only the
+    /// three gate keys move).
+    #[test]
+    fn migration_040_leaves_unrelated_project_rows_alone() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 39).expect("apply through v39");
+        seed_project_row_for_mig(&conn, "p1");
+
+        conn.execute(
+            "INSERT INTO module_settings (project_id, module_id, setting_key, setting_value)
+             VALUES ('p1', '__project__', 'some_other_setting', '\"keep\"')",
+            [],
+        )
+        .unwrap();
+
+        apply(&conn).expect("apply 40");
+
+        assert_eq!(
+            read_setting(&conn, "p1", "__project__", "some_other_setting"),
+            Some("\"keep\"".to_string()),
+            "non-gate __project__ rows must be untouched"
+        );
+        assert_eq!(
+            read_setting(&conn, "p1", "orchestrator-core", "some_other_setting"),
+            None
+        );
+    }
+
+    /// Migration 040 is idempotent (runner version-gate; a manual re-run of
+    /// the SQL finds no legacy rows left and is a no-op).
+    #[test]
+    fn migration_040_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 39).expect("apply through v39");
+        seed_project_row_for_mig(&conn, "p1");
+        conn.execute(
+            "INSERT INTO module_settings (project_id, module_id, setting_key, setting_value)
+             VALUES ('p1', '__project__', 'shared_kg_write_disabled', 'true')",
+            [],
+        )
+        .unwrap();
+        apply(&conn).expect("first apply 40");
+        // Re-apply the raw SQL: nothing left to move, no error.
+        conn.execute_batch(MIGRATIONS[39].sql).expect("re-apply 40 raw");
+        assert_eq!(
+            read_setting(&conn, "p1", "orchestrator-core", "shared_kg_write_disabled"),
+            Some("true".to_string())
+        );
     }
 }

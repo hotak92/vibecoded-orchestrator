@@ -145,6 +145,9 @@ pub fn read_identity() -> Option<String> {
 /// POSITIVELY confirmed, so a hub we cannot identify is never killed. A
 /// DIFFERENT version IS positive confirmation; same-version-can't-tell is
 /// NOT.
+// `pid` is consumed only by the /proc identity probe (linux branch); other
+// OSes conservatively return false below (v0.2.80 windows-warning sweep).
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 pub fn running_hub_is_stale(pid: u32, recorded_identity: Option<&str>) -> bool {
     #[cfg(target_os = "linux")]
     {

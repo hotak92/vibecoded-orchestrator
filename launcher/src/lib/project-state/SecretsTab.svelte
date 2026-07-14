@@ -3,12 +3,19 @@
   import { goto } from '$app/navigation';
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
+  import { projects as projectsStore } from '$lib/stores/projects';
   import type { ProjectSecretRef } from '$lib/types/project-state';
 
   let { projectId }: { projectId: string } = $props();
 
   let refs = $state<ProjectSecretRef[]>([]);
   let loading = $state(true);
+
+  // GAP-2 (2026-07-14): per-project bulk "disable shared secrets" toggle.
+  // Mirror of the IdentityTab shared-KG read gate. When ON, this project
+  // omits the user-shared secrets bucket from its resolved /env pairs.
+  let sharedSecretsReadDisabled = $state(false);
+  let togglingSharedSecrets = $state(false);
 
   // v0.2.46 V47-C followup (landed with V47-G-final): "Migrate from .env"
   // surface. Lets the user re-run V47-C's keychain migration from the
@@ -23,6 +30,9 @@
     migrated: string[];
     failed: string[];
     error?: string;
+    // GAP-1 (2026-07-14): where the keys landed — "shared" | "per_project".
+    // Optional so an older Rust build (no `scope`) still parses during dev.
+    scope?: string;
   };
   let lastMigration = $state<MigrationResult | null>(null);
 
@@ -30,8 +40,26 @@
     loading = true;
     try {
       refs = await invoke<ProjectSecretRef[]>('list_project_secret_refs', { projectId });
+      // Load the GAP-2 toggle state alongside the refs.
+      sharedSecretsReadDisabled = await projectsStore.getSharedSecretsReadDisabled(projectId);
     } catch (e) { toast.error(e); }
     finally { loading = false; }
+  }
+
+  async function toggleSharedSecrets() {
+    if (togglingSharedSecrets) return;
+    const next = !sharedSecretsReadDisabled;
+    togglingSharedSecrets = true;
+    // Optimistic flip; revert on error (IdentityTab toggle pattern).
+    sharedSecretsReadDisabled = next;
+    try {
+      sharedSecretsReadDisabled = await projectsStore.setSharedSecretsReadDisabled(projectId, next);
+    } catch (e) {
+      sharedSecretsReadDisabled = !next;
+      toast.error(e);
+    } finally {
+      togglingSharedSecrets = false;
+    }
   }
 
   function deepLinkSet(_key: string) {
@@ -132,7 +160,15 @@
   {#if lastMigration}
     <div class="ps-migration-result" class:ps-migration-ok={lastMigration.ok}>
       {#if lastMigration.ok && lastMigration.migrated.length > 0}
-        <strong>Migrated:</strong> {lastMigration.migrated.join(', ')}
+        <strong>Migrated {lastMigration.migrated.length} secret(s)</strong>
+        {#if lastMigration.scope === 'per_project'}
+          to <strong>this project's</strong> keychain scope:
+        {:else if lastMigration.scope === 'shared'}
+          to the <strong>shared</strong> keychain scope (orchestrator root):
+        {:else}
+          :
+        {/if}
+        {lastMigration.migrated.join(', ')}
         {#if lastMigration.failed.length > 0}
           <br/><strong>Failed:</strong> {lastMigration.failed.join(', ')}
         {/if}
@@ -143,6 +179,24 @@
       {/if}
     </div>
   {/if}
+
+  <div class="ps-shared-secrets-block">
+    <label class="ps-shared-secrets-toggle">
+      <input
+        type="checkbox"
+        checked={sharedSecretsReadDisabled}
+        disabled={togglingSharedSecrets}
+        onchange={toggleSharedSecrets}
+      />
+      <span>Disable shared secrets for this project</span>
+    </label>
+    <p class="ps-hint">
+      When on, this project does NOT resolve user-shared secrets (the
+      "Shared (this user)" bucket). Per-project and infrastructure secrets
+      (e.g. <code>github_pat</code>) are unaffected. Mirrors the shared-KG
+      read gate on the Identity tab.
+    </p>
+  </div>
 
   {#if loading}
     <p class="ps-empty">Loading…</p>
@@ -209,4 +263,8 @@
   .ps-migration-result { background: rgba(255,99,99,0.08); border: 1px solid rgba(255,99,99,0.25); border-radius: 4px; padding: 8px 12px; margin: 8px 0 12px; font-size: 11px; color: #f99; }
   .ps-migration-result.ps-migration-ok { background: rgba(0,191,166,0.08); border-color: rgba(0,191,166,0.25); color: #0fc; }
   .ps-migration-result em { color: #aaa; font-style: italic; }
+  .ps-shared-secrets-block { margin: 4px 0 14px; padding: 10px 12px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 4px; }
+  .ps-shared-secrets-toggle { display: flex; align-items: center; gap: 8px; font-size: 12px; cursor: pointer; }
+  .ps-shared-secrets-toggle input { cursor: pointer; }
+  .ps-shared-secrets-block .ps-hint { margin: 6px 0 0; }
 </style>
