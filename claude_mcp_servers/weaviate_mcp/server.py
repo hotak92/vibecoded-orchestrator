@@ -57,6 +57,53 @@ from typing import Any, Optional, List, Dict
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
+# ─── Package-identity bootstrap (v0.2.81) ─────────────────────────────────────
+# The launcher starts this MCP as a BARE SCRIPT:
+#   ``<venv>/python <install>/claude_mcp_servers/weaviate_mcp/server.py``
+# (verified in ``launcher/src-tauri/src/mcp_registration.rs`` — ``args`` is the
+# raw server.py path, NOT ``python -m weaviate_mcp.server``). Run that way,
+# server.py is ``__main__`` with an EMPTY ``__package__``, so a bare relative
+# import (``from .chunking import Chunker``, ``from . import embeddings``) raises
+# ``ImportError: attempted relative import with no known parent package`` and —
+# more insidiously — any SUBMODULE imported off the bare-script fallback path
+# (``import embeddings`` → top-level, ``__package__ == ''``) then hard-fails at
+# QUERY TIME on its OWN ``from . import server`` (embeddings.py does this inside
+# _get_embedding_service etc.). That was the fatal ``hybrid_search`` failure.
+#
+# The ROOT fix is to establish REAL package identity BEFORE any relative import,
+# so exactly ONE import path (``from .X import Y``) works for BOTH supported
+# entry points (bare-script ``python server.py`` AND package ``python -m`` /
+# ``import weaviate_mcp.server`` used by the test suite). No per-site
+# ``try/except ImportError`` fallbacks are needed once identity is real — a
+# broken relative import then means a broken install and MUST raise loudly at
+# startup, never silently degrade to a second module object that fails mid-query.
+#
+# This block ONLY manipulates Python import identity (sys.path / __package__ /
+# sys.modules). It does NOT resolve collections/paths/config — the existing
+# vct-hub → launcher-DB resolution (``_config_field`` and the
+# ``weaviate-kg: resolved collections (...)`` log line) is untouched.
+#
+# When server.py is imported AS A PACKAGE (``__package__`` already set to
+# ``weaviate_mcp`` or ``claude_mcp_servers.weaviate_mcp``), this is a pure no-op.
+if __package__ in (None, ""):
+    import importlib as _bootstrap_importlib
+    _pkg_dir = Path(__file__).resolve().parent            # …/weaviate_mcp
+    _pkg_parent = str(_pkg_dir.parent)                    # …/claude_mcp_servers
+    if _pkg_parent not in sys.path:
+        # Prepend so ``weaviate_mcp`` (and its ``_lib`` sibling) resolve as a
+        # real top-level package regardless of the launcher's cwd.
+        sys.path.insert(0, _pkg_parent)
+    # Register the package object so ``from .X`` has a known parent.
+    _bootstrap_importlib.import_module("weaviate_mcp")
+    __package__ = "weaviate_mcp"
+    # CRUX — one canonical ``server`` object across every import style:
+    # the running module IS ``__main__``. Bind it under its package key so a
+    # submodule's ``from . import server`` / ``from .server import X`` resolves
+    # to THIS SAME object (the one actually serving requests) instead of
+    # importing a SECOND, uninitialised ``weaviate_mcp.server`` — which would
+    # desync the re-exported functions (config read twice, test patches missed).
+    sys.modules["weaviate_mcp.server"] = sys.modules["__main__"]
+
 # v0.2.52 (Known Issue 6, Sub-issue A): silence the
 # ``AuthlibDeprecationWarning: authlib.jose module is deprecated`` noise
 # that ``weaviate-client``'s transitive ``authlib`` dependency emits during
@@ -89,27 +136,21 @@ from weaviate.classes.query import Filter, MetadataQuery
 import aiohttp
 
 # Import Chunker for splitting large node content before embedding.
-# Two import styles: relative (when used as a package) and direct (when run as script).
-try:
-    from .chunking import Chunker
-except ImportError:
-    from chunking import Chunker  # noqa: E402 — server.py run directly via python
+# REQUIRED shipped submodule — the package-identity bootstrap above makes this
+# ONE relative import resolve under BOTH entry points (bare-script + package),
+# so no import fallback is needed. A failure here means a broken install and
+# MUST raise loudly at startup (no silent degrade).
+from .chunking import Chunker  # noqa: E402 — after bootstrap
 
 # v0.2.72 (P1/P2 integration): the SHARED code-retrieval pipeline. Both this
 # MCP (`search_code_graph`) and the CLI (`query_code_graph.py::search_by_concept`)
 # call `run_code_retrieval_pipeline` so floor/rerank/collapse/tier can't diverge.
-try:
-    from .code_ranking import (
-        run_code_retrieval_pipeline,
-        resolve_retrieval_floor,
-        resolve_post_rerank_floor,
-    )
-except ImportError:
-    from code_ranking import (  # noqa: E402 — server.py run directly via python
-        run_code_retrieval_pipeline,
-        resolve_retrieval_floor,
-        resolve_post_rerank_floor,
-    )
+# REQUIRED shipped submodule — see the bootstrap note above.
+from .code_ranking import (  # noqa: E402 — after bootstrap
+    run_code_retrieval_pipeline,
+    resolve_retrieval_floor,
+    resolve_post_rerank_floor,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -735,13 +776,10 @@ RL_SERVER_URL = os.getenv("RL_SERVER_URL", "http://localhost:11439")
 #     via the ``server`` proxy, so a ``monkeypatch.setattr(srv, "_RL_*", …)``
 #     still rebinds the surface the moved functions read (the patch surface is,
 #     and stays, ``server``; only the DEFINITION home moved).
-# Relative when imported as a package; absolute when run directly as a script
-# (mirrors the ``from .embeddings`` / ``from .rl_enrichment`` guards — REQUIRED
-# so the MCP starts under the launcher's bare-script ``python .../server.py``).
-try:
-    from . import rl_state as _rl_state  # noqa: E402 — package-relative
-except ImportError:
-    import rl_state as _rl_state  # type: ignore  # noqa: E402 — run directly
+# REQUIRED shipped submodule. The package-identity bootstrap at the top of this
+# file makes this ONE relative import resolve under BOTH entry points, so no
+# bare-script fallback is needed (a failure here = broken install → raise loudly).
+from . import rl_state as _rl_state  # noqa: E402 — after bootstrap
 # Over-fetch multiplier: fetch this many × limit from Weaviate, pass all to RL
 # server for reranking. (v0.2.75 P3f promotes this to KG_OVERFETCH_MULTIPLIER.)
 _RL_OVERFETCH = _rl_state._RL_OVERFETCH
@@ -778,11 +816,10 @@ ACTIVE_EMBEDDING = _config_field("active_embedding", "ACTIVE_EMBEDDING", "qwen3"
 # re-exported here so bare ``server.<name>`` reads + test patches on the server
 # object keep working. Imported early (embeddings has no module-level ``server``
 # dependency — its ``server.<name>`` reads are call-time — so this is safe before
-# the late functions-re-export block). Bare-script fallback mirrors that block.
-try:
-    from . import embeddings as _embeddings  # noqa: E402 — package-relative
-except ImportError:
-    import embeddings as _embeddings  # type: ignore  # noqa: E402 — run directly
+# the late functions-re-export block).
+# REQUIRED shipped submodule — the package-identity bootstrap makes this ONE
+# relative import resolve under BOTH entry points (no fallback; loud-fail if broken).
+from . import embeddings as _embeddings  # noqa: E402 — after bootstrap
 LEGACY_TEXT_EMBEDDING_MODEL = _embeddings.LEGACY_TEXT_EMBEDDING_MODEL
 OPENAI_EMBEDDING_MODEL = _embeddings.OPENAI_EMBEDDING_MODEL
 OPENAI_API_KEY = _embeddings.OPENAI_API_KEY
@@ -3491,54 +3528,31 @@ _EMBED_SERVICE_RETRY_WINDOW = 10.0  # don't re-probe failed construction more th
 # ``_embed_service_construction_failed_at`` / ``_EMBED_SERVICE_RETRY_WINDOW``
 # stay ABOVE (tests poke ``server._cached_embed_service``); the extracted
 # accessor reads/writes them via the ``server`` module object.
-# Two import styles (mirrors the ``from .chunking``/``from .code_ranking``
-# guards above): relative when server is imported as a package
-# (``weaviate_mcp.server``), absolute when it is run DIRECTLY as a script
-# (``python .../weaviate_mcp/server.py`` — the launcher's actual MCP invocation,
-# where ``__package__`` is empty and a bare relative import raises
-# "attempted relative import with no known parent package"). The
-# ``except ImportError`` fallback is REQUIRED for M-1's extracted modules —
-# without it the weaviate-kg MCP fails to start for every user.
-try:
-    from .embeddings import (  # noqa: E402 — re-export after config constants above
-        _get_embedding_service,
-        get_ollama_embedding,
-        get_legacy_text_embedding,
-        get_openai_embedding,
-        get_embedding,
-        _get_both_embeddings,
-        _get_all_kg_embeddings,
-        _get_all_code_embeddings,
-        _scheme_for_collection,
-        _primary_named_vector,
-        _get_search_vector,
-        count_tokens_async,
-        get_code_embedding,
-        _inline_code_embed_http,
-        get_code_query_embedding,
-        _active_code_query_slot,
-        get_legacy_code_embedding,
-    )
-except ImportError:
-    from embeddings import (  # type: ignore  # noqa: E402 — server.py run directly
-        _get_embedding_service,
-        get_ollama_embedding,
-        get_legacy_text_embedding,
-        get_openai_embedding,
-        get_embedding,
-        _get_both_embeddings,
-        _get_all_kg_embeddings,
-        _get_all_code_embeddings,
-        _scheme_for_collection,
-        _primary_named_vector,
-        _get_search_vector,
-        count_tokens_async,
-        get_code_embedding,
-        _inline_code_embed_http,
-        get_code_query_embedding,
-        _active_code_query_slot,
-        get_legacy_code_embedding,
-    )
+# REQUIRED shipped submodule (M-1's extracted embed layer). The package-identity
+# bootstrap at the top of this file makes this ONE relative import resolve under
+# BOTH entry points — the launcher's bare-script ``python .../server.py`` (where
+# ``__package__`` was formerly empty) AND the package import path. No fallback:
+# a failure here is a broken install and MUST raise loudly at startup, never
+# silently degrade to a second module object that fails mid-query.
+from .embeddings import (  # noqa: E402 — after bootstrap, re-export post config
+    _get_embedding_service,
+    get_ollama_embedding,
+    get_legacy_text_embedding,
+    get_openai_embedding,
+    get_embedding,
+    _get_both_embeddings,
+    _get_all_kg_embeddings,
+    _get_all_code_embeddings,
+    _scheme_for_collection,
+    _primary_named_vector,
+    _get_search_vector,
+    count_tokens_async,
+    get_code_embedding,
+    _inline_code_embed_http,
+    get_code_query_embedding,
+    _active_code_query_slot,
+    get_legacy_code_embedding,
+)
 
 
 def serialize_datetime(value):
@@ -3838,9 +3852,13 @@ def _enrich_with_adjacent_chunks(coll, results: list[dict], collection_name: str
 # constants stay defined ON THIS module (below / above) — rl_client and the
 # tests reach them via `srv.<name>`; the extracted functions read them via
 # `server.<name>`.
-# Relative when imported as a package; absolute when run directly as a script
-# (see the ``from .embeddings`` guard above — same REQUIRED fallback so the MCP
-# starts under the launcher's ``python .../weaviate_mcp/server.py`` invocation).
+# REQUIRED shipped submodule (M-1's extracted RL layer). The package-identity
+# bootstrap at the top of this file makes this ONE relative import resolve under
+# BOTH entry points; no fallback (loud-fail if broken — see the ``from .embeddings``
+# note above). NB: rl_enrichment.py keeps its own ``_LazyServerProxy`` for its
+# ``server.<name>`` reads — that is a re-import-SAFETY device (proven by
+# tests/test_v0273_rl_enrichment_reimport_safety.py), NOT an import fallback, so
+# it stays untouched by this fix.
 _RL_ENRICHMENT_EXPORTS = (
     "_rl_load_messages", "_rl_find_kg_positions", "_rl_extract_answer_window",
     "_resolve_claude_session_dir", "_rl_find_all_transcripts_in_dir",
@@ -3862,10 +3880,7 @@ _RL_ENRICHMENT_EXPORTS = (
     "_rl_enrichment_gate_open", "_rl_enrichment_consumer_exists",
     "_rl_enrich_gate_reset_for_test",
 )
-try:
-    from . import rl_enrichment as _rl_enrichment  # noqa: E402 — package-relative
-except ImportError:
-    import rl_enrichment as _rl_enrichment  # type: ignore  # noqa: E402 — run directly
+from . import rl_enrichment as _rl_enrichment  # noqa: E402 — after bootstrap
 for _name in _RL_ENRICHMENT_EXPORTS:  # re-export into server's namespace
     globals()[_name] = getattr(_rl_enrichment, _name)
 del _name
