@@ -1154,19 +1154,43 @@ def _fetch_code_graph_access_list(
 ) -> list[str]:
     """Resolve the ``VCT_CODE_GRAPH_ACCESS_LIST`` value.
 
-    Mirrors Rust's ``resolve_code_graph_access_peers``: join
-    ``codegraph_access`` to ``projects`` on the grantor side, pull the
-    grantor's slug. Excludes self (the project always has access to its
-    own codegraph; the env var carries PEERS only).
+    Join ``codegraph_access`` to ``projects`` on the grantor side, pull
+    the grantor's display ``name``. Excludes self (the project always
+    has access to its own codegraph; the env var carries PEERS only).
+
+    Why ``p.name`` and NOT ``p.slug`` (GAP-CG-1 fix, 2026-07-14): the
+    analyzer writes each project's Code* classes under
+    ``canonical_class_prefix(NAME)_Code*`` and stamps the ``project``
+    property = NAME (``analyze_code_graph.py`` — the ``--project
+    <project.name>`` arg). The MCP/CLI consumer sanitises each list
+    entry through the SAME underscore-preserving canonical rule to
+    rebuild the peer's class prefix AND uses the raw entry as the
+    ``project``-property filter value (``kg_access.py`` /
+    ``weaviate_mcp/server.py``). A slug (lowercased/hyphenated) diverges
+    from the name on BOTH derived values (``"Client Alpha"`` → analyzer
+    prefix ``ClientAlpha`` + filter ``Client Alpha``; slug
+    ``client-alpha`` → reader prefix ``Client_alpha`` + filter
+    ``client-alpha``) → the peer's collections aren't found and the
+    filter never matches → silent zero peer results. Emitting the NAME
+    makes writer/reader prefix + filter agree for ANY project name.
+
+    This converges on the sibling ``_fetch_diagram_access_list`` in this
+    module, which already does ``SELECT p.name`` for the identical
+    writer/reader-parity reason (fixed in ``70381fa9`` for diagrams five
+    days after this resolver was born slug-based in ``8170b0bf`` — an
+    unreconciled omission, now closed).
+
+    Blank names are filtered (defensive against malformed DB rows;
+    mirrors the diagrams resolver's ``if r["name"]`` guard).
     """
     cur = conn.cursor()
     cur.execute(
-        "SELECT p.slug FROM codegraph_access ca "
+        "SELECT p.name FROM codegraph_access ca "
         "JOIN projects p ON p.id = ca.grantor_project_id "
         "WHERE ca.grantee_project_id = ? AND ca.access_level = 'read'",
         (project_id,),
     )
-    return sorted({str(r["slug"]) for r in cur.fetchall()})
+    return sorted({str(r["name"]) for r in cur.fetchall() if r["name"]})
 
 
 def _fetch_diagram_access_list(
@@ -1180,12 +1204,14 @@ def _fetch_diagram_access_list(
     each name through ``_sanitize_collection_prefix`` and appends
     ``_Diagrams`` to derive the canonical Weaviate class name.
 
-    Why ``p.name`` and not ``p.slug`` (as ``VCT_CODE_GRAPH_ACCESS_LIST``
-    uses): the diagrams collection-prefix derivation is currently keyed
-    on the project NAME (sanitised) — same rule the launcher's
-    ``project_diagrams`` indexer uses when it writes
+    Why ``p.name`` and not ``p.slug``: the diagrams collection-prefix
+    derivation is keyed on the project NAME (sanitised) — same rule the
+    launcher's ``project_diagrams`` indexer uses when it writes
     ``<SanitizedName>_Diagrams`` rows into Weaviate. Switching to slugs
     would create a prefix mismatch between writer and reader.
+    ``VCT_CODE_GRAPH_ACCESS_LIST`` carries NAMES for the same reason
+    (converged 2026-07-14, GAP-CG-1) — the two access-list resolvers
+    now agree on the identity form.
 
     Excludes self by construction — the ``diagram_access`` schema's
     grantor/grantee pair is always cross-project (no self-grants).
@@ -1985,6 +2011,170 @@ def apply_project_env(
     return report
 
 
+# ─── Update-time migration: re-project ALL registered projects ──────────
+#
+# GAP-CG-1 (2026-07-14) changed the FORM of the value emitted into
+# ``VCT_CODE_GRAPH_ACCESS_LIST`` (grantor slug → grantor NAME). Existing
+# installs carry the stale slug form on disk until the next re-projection.
+# ``apply_project_env`` already OVERWRITES canonical keys with the
+# DB-resolved value, so a single re-projection pass per project migrates
+# the value automatically — no bespoke slug→name rewriter needed. This
+# helper is the ALL-PROJECTS driver the orchestrator update flow calls so
+# every project's on-disk env is brought to the name-based form in one
+# pass, with a per-project deferral on failure (never a silent half-
+# migration). It REUSES the existing projection machinery
+# (``list_registered_projects`` + ``project_env_from_db`` +
+# ``apply_project_env``) — it is NOT a second projector.
+
+
+class ProjectReprojectOutcome(TypedDict):
+    """Per-project result of :func:`reproject_all_registered_projects`."""
+
+    project_id: str
+    project_name: str
+    status: str  # "migrated" | "failed" | "skipped"
+    detail: str
+    keys_written: list[str]
+
+
+def reproject_all_registered_projects(
+    *,
+    db_path: Path | None = None,
+    surfaces: Iterable[str] | None = None,
+    deferral_report: Any | None = None,
+    log_event: Any | None = None,
+) -> list[ProjectReprojectOutcome]:
+    """Re-project every registered project's canonical env from launcher.db.
+
+    The single ALL-PROJECTS driver for the orchestrator update flow.
+    After GAP-CG-1 flipped the ``VCT_CODE_GRAPH_ACCESS_LIST`` producer
+    from grantor-slug to grantor-name, this pass migrates every project's
+    on-disk env (``.claude/settings.json`` + ``.claude/env``) to the new
+    name-based form by delegating to the canonical projection machinery
+    — ``project_env_from_db`` (which now emits names) +
+    ``apply_project_env`` (which OVERWRITES the canonical key). No
+    per-slug rewriting: correctness follows from re-running the producer.
+
+    Failure discipline (USER decision 2026-07-14): on ANY per-project
+    failure, emit a deferral entry naming the affected project via the
+    canonical deferral system (``deferral_report`` argument →
+    ``deferral_report.safe_emit_entry``) rather than half-migrating
+    silently. A single project's failure never aborts the sweep — the
+    remaining projects still migrate, and each failure gets its own
+    deferral row + ``"failed"`` outcome.
+
+    Cleanup semantics: the migration IS the cleanup. Re-projecting a
+    project OVERWRITES the stale slug-form ``VCT_CODE_GRAPH_ACCESS_LIST``
+    with the name-form value (and DROPS the key entirely when the project
+    has no code-graph grants — ``project_env_from_db`` omits empty keys
+    and ``apply_project_env`` treats omission as signal-to-remove). So no
+    separate dead-slug-data deletion step is needed: the stale value only
+    lives in the env surfaces this pass rewrites, and it is gone the
+    moment migration succeeds for that project. Projects whose migration
+    FAILED keep their old (working-or-not) env untouched — the deferral
+    tells the user to re-run ``python -m vco_lib.config_projection
+    reproject-all`` once the underlying cause (unreachable project folder,
+    permission error) is fixed.
+
+    Args:
+        db_path: Optional launcher.db override (tests pin this).
+        surfaces: Optional surface list forwarded to ``apply_project_env``
+            (defaults to the canonical settings.json + .claude/env pair).
+        deferral_report: Optional ``DeferralReport`` accumulator. When
+            provided, per-project failures emit a ``codegraph_access_list_
+            reprojection_failed`` deferral entry. ``None`` → no deferral
+            (the ``"failed"`` outcome still records the cause in-memory).
+        log_event: Optional ``(step, phase, detail)`` logger forwarded to
+            ``safe_emit_entry`` for its own soft-fail path.
+
+    Returns:
+        One :class:`ProjectReprojectOutcome` per registered project, in
+        the DB's deterministic ``ORDER BY name`` order.
+
+    Raises:
+        DbUnreachable: when the launcher DB itself is missing/unopenable
+            (a whole-sweep precondition failure — distinct from a single
+            project's failure, which is caught + deferred). The caller's
+            update flow should treat this as "launcher never booted" and
+            skip the migration (matching ``_backfill_code_graph_project_
+            env``'s ``db_unreachable`` no-op posture).
+    """
+    # list_registered_projects raises DbUnreachable on a missing DB — let
+    # it propagate (whole-sweep precondition, not a per-project failure).
+    projects = list_registered_projects(db_path=db_path)
+
+    # Deferral emitter is imported lazily + soft: a missing deferral_report
+    # module must not break the migration (the sweep still runs, failures
+    # still record their cause in the returned outcomes).
+    _safe_emit_entry = None
+    if deferral_report is not None:
+        try:
+            from vco_lib.deferral_report import safe_emit_entry as _safe_emit_entry
+        except Exception:  # noqa: BLE001 — deferral is best-effort telemetry
+            _safe_emit_entry = None
+
+    outcomes: list[ProjectReprojectOutcome] = []
+    for proj in projects:
+        pid = str(proj.get("id", ""))
+        pname = str(proj.get("name", "")) or pid
+        try:
+            bundle = project_env_from_db(pid, db_path=db_path)
+            report = apply_project_env(bundle, surfaces=surfaces)
+            keys_written: set[str] = set()
+            for _surface_keys in report.values():
+                keys_written.update(_surface_keys)
+            outcomes.append(
+                ProjectReprojectOutcome(
+                    project_id=pid,
+                    project_name=pname,
+                    status="migrated",
+                    detail="re-projected canonical env (name-based access list)",
+                    keys_written=sorted(keys_written),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — one project's failure never aborts the sweep
+            detail = f"{type(exc).__name__}: {exc}"
+            outcomes.append(
+                ProjectReprojectOutcome(
+                    project_id=pid,
+                    project_name=pname,
+                    status="failed",
+                    detail=detail,
+                    keys_written=[],
+                )
+            )
+            if _safe_emit_entry is not None:
+                _safe_emit_entry(
+                    deferral_report,
+                    condition_id="codegraph_access_list_reprojection_failed",
+                    title=(
+                        f"code-graph access-list migration failed for "
+                        f"project {pname!r}"
+                    ),
+                    detected=(
+                        f"re-projecting {pname!r} (id={pid}) to migrate its "
+                        f"VCT_CODE_GRAPH_ACCESS_LIST from grantor-slug to "
+                        f"grantor-name form failed: {detail}"
+                    ),
+                    why_deferred=(
+                        "The orchestrator update flipped the code-graph "
+                        "access-list identity form (slug → name, GAP-CG-1). "
+                        "This project could not be re-projected, so its "
+                        "VCT_CODE_GRAPH_ACCESS_LIST may still carry stale "
+                        "slug-form entries — cross-project code-graph reads "
+                        "from it will silently return zero peer rows until "
+                        "re-projection succeeds."
+                    ),
+                    command_to_apply=(
+                        "python -m vco_lib.config_projection reproject-all"
+                    ),
+                    severity="warning",
+                    log_event=log_event,
+                    log_step="codegraph-access-list-migration",
+                )
+    return outcomes
+
+
 # ─── Phase 0.E: user-secret writer ──────────────────────────────────────
 
 
@@ -2775,6 +2965,47 @@ def _cli_from_db(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cli_reproject_all(args: argparse.Namespace) -> int:
+    """``python -m vco_lib.config_projection reproject-all``.
+
+    Update-time migration entry point: re-project EVERY registered
+    project's canonical env so a stale slug-form
+    ``VCT_CODE_GRAPH_ACCESS_LIST`` is replaced by the name-form value
+    (GAP-CG-1). Prints a JSON summary of per-project outcomes. Failures
+    are recorded per-project (and, in a full install run, deferred via
+    the caller's DeferralReport) — this CLI reports them but exits 0
+    unless the launcher DB itself is unreachable (exit 3), matching the
+    "launcher never booted → no-op" posture of the update flow.
+    """
+    surfaces = (
+        [s.strip() for s in args.surfaces.split(",") if s.strip()]
+        if args.surfaces
+        else None
+    )
+    try:
+        outcomes = reproject_all_registered_projects(
+            db_path=Path(args.db_path) if args.db_path else None,
+            surfaces=surfaces,
+        )
+    except DbUnreachable as exc:
+        print(
+            json.dumps({"error": "db_unreachable", "message": str(exc)}),
+            file=sys.stderr,
+        )
+        return 3
+
+    migrated = [o for o in outcomes if o["status"] == "migrated"]
+    failed = [o for o in outcomes if o["status"] == "failed"]
+    summary = {
+        "total": len(outcomes),
+        "migrated": len(migrated),
+        "failed": len(failed),
+        "outcomes": outcomes,
+    }
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m vco_lib.config_projection",
@@ -2852,6 +3083,27 @@ def _build_parser() -> argparse.ArgumentParser:
     p_us_known.add_argument("--json", action="store_true")
     p_us_known.set_defaults(handler=_cli_user_secret_known_keys)
 
+    # GAP-CG-1 (2026-07-14) update-time migration: re-project every
+    # registered project so the code-graph access list migrates from
+    # grantor-slug to grantor-name form. Invoked by the orchestrator
+    # update flow (install.py --update / launcher update path).
+    p_reproj = sub.add_parser(
+        "reproject-all",
+        help="re-project EVERY registered project's canonical env "
+             "(migrates VCT_CODE_GRAPH_ACCESS_LIST slug→name form)",
+    )
+    p_reproj.add_argument(
+        "--db-path", default=None,
+        help="override launcher DB path (defaults to ~/.vct/launcher.db)",
+    )
+    p_reproj.add_argument(
+        "--surfaces", default=None,
+        help="comma-separated subset of "
+             "claude_settings_json,claude_env,vscode_settings_json "
+             "(default: claude_settings_json,claude_env)",
+    )
+    p_reproj.set_defaults(handler=_cli_reproject_all)
+
     return p
 
 
@@ -2873,11 +3125,13 @@ __all__ = [
     "ProjectEnvBundle",
     "ProjectNotFound",
     "UserSecretBundle",
+    "ProjectReprojectOutcome",
     "apply_project_env",
     "apply_user_secrets",
     "list_canonical_keys",
     "list_registered_projects",
     "project_env_from_db",
+    "reproject_all_registered_projects",
     "resolve_project_folder",
     "user_secret_known_keys_from_db",
 ]

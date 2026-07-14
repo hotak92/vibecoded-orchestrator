@@ -228,6 +228,53 @@ def test_package_import_path_is_unaffected_and_bootstrap_is_noop():
     )
 
 
+def test_bare_script_reconciles_repo_root_package_key_to_main():
+    """FN-4: the paid-tier rl_client imports the server via its REPO-ROOT
+    package path (``from claude_mcp_servers.weaviate_mcp.server import …``,
+    ``from claude_mcp_servers.weaviate_mcp import server``). After a
+    bare-script load, ``sys.modules['claude_mcp_servers.weaviate_mcp.server']``
+    must be the SAME running ``__main__`` object — otherwise those call-time
+    imports RE-EXECUTE server.py as a SECOND module (config read twice, the
+    cached embed service + test patches missed)."""
+    driver = textwrap.dedent(
+        f"""
+        import sys, asyncio
+        SERVER = {str(SERVER_PY)!r}
+        REPO_ROOT = {str(REPO_ROOT)!r}
+        # Make the repo root importable (a bare-script launch from an install
+        # tree where claude_mcp_servers is a top-level package).
+        if REPO_ROOT not in sys.path:
+            sys.path.insert(0, REPO_ROOT)
+        def _noop(coro, *a, **k):
+            try: coro.close()
+            except Exception: pass
+        asyncio.run = _noop
+        main = sys.modules["__main__"]
+        main.__file__ = SERVER
+        exec(compile(open(SERVER).read(), SERVER, "exec"), main.__dict__)
+        # BOTH package keys resolve to the ONE running object.
+        assert sys.modules.get("weaviate_mcp.server") is main, "short key"
+        assert sys.modules.get("claude_mcp_servers.weaviate_mcp.server") is main, (
+            "repo-root key must reconcile to __main__ (rl_client import path)"
+        )
+        # `from claude_mcp_servers.weaviate_mcp import server` reaches it too.
+        from claude_mcp_servers.weaviate_mcp import server as s3
+        assert s3 is main, "repo-root from-import resolved a SECOND object"
+        import claude_mcp_servers.weaviate_mcp.server as s4
+        assert s4 is main, "repo-root direct import resolved a SECOND object"
+        print("REPO_ROOT_ALIAS_OK")
+        """
+    )
+    r = _run_driver(driver)
+    assert r.returncode == 0 and "REPO_ROOT_ALIAS_OK" in r.stdout, (
+        f"repo-root package-key reconciliation failed.\nrc={r.returncode}\n"
+        f"stdout:\n{r.stdout[-2000:]}\nstderr:\n{r.stderr[-2000:]}"
+    )
+    assert "ImportWarning" not in r.stderr, (
+        f"ImportWarning on repo-root alias exec:\n{r.stderr[-2000:]}"
+    )
+
+
 def test_no_dual_import_fallback_remains_for_shipped_submodules():
     """Ruling: REQUIRED shipped-submodule relative imports must be PLAIN
     ``from .X import Y`` with NO ``try/except ImportError`` fallback (the
@@ -258,4 +305,52 @@ def test_no_dual_import_fallback_remains_for_shipped_submodules():
         "server.py still contains a top-level-import fallback for an extracted "
         "shipped submodule — the package-identity bootstrap makes the plain "
         f"relative import work for both entry points, so remove these: {hits}"
+    )
+
+
+def test_no_bare_name_imports_of_shipped_submodules_anywhere_in_package():
+    """FN-6: grep the WHOLE ``weaviate_mcp/`` package for a BARE-NAME import
+    of any of the five extracted shipped submodules (``chunking``,
+    ``code_ranking``, ``rl_state``, ``embeddings``, ``rl_enrichment``).
+
+    A bare-name import (``import embeddings`` / ``from embeddings import X``)
+    resolves the submodule as a SECOND top-level module object with
+    ``__package__ == ''`` when the package dir is on sys.path — the exact
+    dual-object hazard the package-identity bootstrap + the FN-6 script-dir
+    sys.path neutralization prevent. Every intra-package reference MUST be
+    the relative ``from .X`` / ``from . import X`` form. This source-level
+    guard catches a regression across the ENTIRE package, not just
+    server.py."""
+    import re as _re
+
+    submods = ("chunking", "code_ranking", "rl_state", "embeddings", "rl_enrichment")
+    # Bare-name import forms (NO leading dot):
+    #   ``import <sub>`` / ``import <sub> as X``
+    #   ``from <sub> import …``
+    # The relative forms (``from .<sub>``, ``from . import <sub>``) have a
+    # leading dot after ``from``/before the name and are NOT matched.
+    bare_patterns = []
+    for sub in submods:
+        bare_patterns.append(
+            (_re.compile(rf"^\s*import\s+{sub}(\s|$|\s+as\s)", _re.MULTILINE),
+             f"import {sub}")
+        )
+        bare_patterns.append(
+            (_re.compile(rf"^\s*from\s+{sub}\s+import\s", _re.MULTILINE),
+             f"from {sub} import")
+        )
+
+    pkg_dir = PKG_PARENT / "weaviate_mcp"
+    offenders: list[str] = []
+    for py in sorted(pkg_dir.rglob("*.py")):
+        text = py.read_text(encoding="utf-8")
+        for pat, label in bare_patterns:
+            if pat.search(text):
+                offenders.append(f"{py.relative_to(PKG_PARENT)}: {label}")
+
+    assert not offenders, (
+        "a bare-name import of a shipped submodule leaked into the "
+        "weaviate_mcp package — use the relative form (from .X import Y) so "
+        "the package-identity bootstrap keeps ONE module object per submodule. "
+        f"Offenders: {offenders}"
     )

@@ -40,7 +40,15 @@
 //!
 //! Symmetric rule for `codegraph_access_list`: reflects only
 //! `codegraph_access` rows where the grantor granted `read` to this
-//! project (and the project's own slug is added implicitly).
+//! project (and the project's own NAME is added implicitly). The list
+//! carries grantor display NAMES (not slugs) — GAP-CG-1 fix
+//! (2026-07-14): the code-graph analyzer writes each project's Code*
+//! classes under `canonical_class_prefix(NAME)` and stamps the
+//! `project` property = NAME, so the MCP/CLI consumer must rebuild each
+//! peer's prefix + filter from the NAME. Emitting slugs diverged on
+//! both derived values → silent zero peer rows. This mirrors the
+//! `diagrams_access_list` resolver, which already emits NAMES for the
+//! same writer/reader-parity reason.
 //!
 //! ─── 503 vs 500 ──────────────────────────────────────────────────
 //!
@@ -606,15 +614,15 @@ async fn project_config(
     };
 
     // 5. Codegraph access matrix (grantee = this project) joined to
-    // grantor slug. We could compose this from existing helpers
-    // (`codegraph_list_grants_to` + per-row `get_project`), but a
-    // single JOIN keeps the read set small and avoids N+1 round-
-    // trips through the SQLite mutex. The JOIN is defined inline
-    // rather than in vct-launcher-core/db/access.rs because this is
-    // the only caller — moving it would add API surface without a
-    // second consumer to justify the move. If a second caller
-    // appears in v0.2.22+, promote it then.
-    let cg_access_slugs = match list_codegraph_grantor_slugs_for_grantee(&h.0, &project.id) {
+    // grantor NAME (GAP-CG-1 fix, 2026-07-14 — was slug). We could
+    // compose this from existing helpers (`codegraph_list_grants_to` +
+    // per-row `get_project`), but a single JOIN keeps the read set
+    // small and avoids N+1 round-trips through the SQLite mutex. The
+    // JOIN is defined inline rather than in vct-launcher-core/db/
+    // access.rs because this is the only caller — moving it would add
+    // API surface without a second consumer to justify the move. If a
+    // second caller appears in v0.2.22+, promote it then.
+    let cg_access_names = match list_codegraph_grantor_names_for_grantee(&h.0, &project.id) {
         Ok(v) => v,
         Err(e) => return db_error_response("list codegraph access", e),
     };
@@ -965,21 +973,44 @@ async fn project_config(
     )
     .await;
 
-    // Codegraph collection prefix: bind row first, slug-derived
-    // fallback otherwise. Matches the Python analyzer's
-    // `_sanitize_collection_prefix`; the launcher's
-    // `project_naming::canonical_class_prefix` is the canonical
-    // spec but lives in the launcher crate (not core), so we inline
-    // an ASCII-safe sanitiser here — used ONLY for the fallback
-    // path. The Cargo workspace's `project_naming_parity` test
-    // pins the canonical version; this inline copy is intentionally
-    // simple because the fallback fires only when a project hasn't
-    // run codegraph analysis yet (no bind row), in which case any
-    // ASCII-safe prefix is acceptable as a placeholder.
+    // Codegraph collection prefix: bind row first, canonical-NAME-derived
+    // fallback otherwise (GAP-CG-3 fix, 2026-07-14).
+    //
+    // The fallback MUST match the analyzer's WRITE prefix, because it can
+    // fire AFTER a project has been analyzed (binding-row race — a
+    // /config read before `populate_codegraph_binding` commits — or a
+    // corrupted DB), not just "before first analysis". The old premise
+    // ("any ASCII-safe prefix is acceptable as a placeholder ... the
+    // fallback only fires before first analysis") was WRONG: a divergent
+    // placeholder silently mis-routes the read to a non-existent
+    // collection → 0 results, no signal. So we now derive from
+    // `project.name` via the SAME `canonical_class_prefix` the analyzer +
+    // the launcher's binding-seed use (promoted into vct-launcher-core by
+    // GAP-CG-3 specifically so this crate can call it — one SSOT, no
+    // third mirror). Only when `canonical_class_prefix` REJECTS the name
+    // (pathological: empty / all-symbol / leading-non-letter) do we fall
+    // to the old inline slug sanitiser as a last resort, logging a
+    // WARNING so the mis-route is at least visible.
     let code_graph_collection_prefix = cg_binding
         .as_ref()
         .map(|b| b.collection_prefix.clone())
-        .unwrap_or_else(|| sanitize_collection_prefix(&project.slug));
+        .unwrap_or_else(|| {
+            match vct_launcher_core::project_naming::canonical_class_prefix(&project.name) {
+                Ok(prefix) => prefix,
+                Err(e) => {
+                    let fallback = sanitize_collection_prefix(&project.slug);
+                    eprintln!(
+                        "[vct-hub config_api] code-graph prefix fallback: \
+                         canonical_class_prefix({:?}) rejected ({}); using \
+                         slug-sanitised placeholder {:?} — this diverges from \
+                         the analyzer's write prefix, so cross-check the project \
+                         name if code-graph reads return nothing",
+                        project.name, e, fallback
+                    );
+                    fallback
+                }
+            }
+        });
 
     // KG access list: filter access_level='none' out, add own
     // primary collection (always implicit), sort + dedup.
@@ -994,10 +1025,17 @@ async fn project_config(
     kg_access_list.sort();
     kg_access_list.dedup();
 
-    // Codegraph access list: grantor slugs only, plus own slug.
-    let mut codegraph_access_list = cg_access_slugs;
-    if !codegraph_access_list.iter().any(|s| s == &project.slug) {
-        codegraph_access_list.push(project.slug.clone());
+    // Codegraph access list: grantor NAMES only, plus own NAME
+    // (GAP-CG-1 fix, 2026-07-14 — was slug on both). The consumer
+    // sanitises each entry through `canonical_class_prefix` to rebuild
+    // the peer's write prefix AND uses the raw NAME as the `project`-
+    // property filter, so the identity form MUST be the NAME the
+    // analyzer stamped. Own entry flips to the project's own NAME too —
+    // consistent with `CODE_GRAPH_PROJECT` (= project NAME) so self +
+    // peer resolve through the same rule.
+    let mut codegraph_access_list = cg_access_names;
+    if !codegraph_access_list.iter().any(|s| s == &project.name) {
+        codegraph_access_list.push(project.name.clone());
     }
     codegraph_access_list.sort();
     codegraph_access_list.dedup();
@@ -1184,33 +1222,41 @@ fn single_field_response(
 }
 
 /// JOIN over `codegraph_access` (grantee filter) + `projects`
-/// (grantor slug lookup). Returns the list of grantor slugs whose
-/// codegraph this project may query.
+/// (grantor NAME lookup). Returns the list of grantor display NAMES
+/// whose codegraph this project may query.
+///
+/// GAP-CG-1 fix (2026-07-14): was `list_codegraph_grantor_slugs_for_
+/// grantee` selecting `p.slug`. The consumer derives each peer's
+/// Weaviate class prefix via `canonical_class_prefix(entry)` AND uses
+/// `entry` as the `project`-property filter — both must be the NAME the
+/// analyzer wrote (a slug diverges on both). Converged on the
+/// `list_diagram_grantor_names_for_grantee` sibling below, which
+/// already selects `p.name` for the same reason.
 ///
 /// This is inlined here rather than added to
 /// `vct-launcher-core/src/db/access.rs` because it's the only
 /// caller of this particular shape and the launcher GUI uses a
 /// different access pattern (per-grantor lookup, not bulk). When a
 /// second caller materialises, promote this to a core helper.
-fn list_codegraph_grantor_slugs_for_grantee(
+fn list_codegraph_grantor_names_for_grantee(
     db: &vct_launcher_core::db::Db,
     grantee_project_id: &str,
 ) -> Result<Vec<String>, String> {
     let guard = db.lock();
     let mut stmt = guard
         .prepare(
-            "SELECT p.slug
+            "SELECT p.name
                FROM codegraph_access ca
                JOIN projects p ON p.id = ca.grantor_project_id
               WHERE ca.grantee_project_id = ?1
                 AND ca.access_level = 'read'",
         )
-        .map_err(|e| format!("prepare list_codegraph_grantor_slugs: {}", e))?;
+        .map_err(|e| format!("prepare list_codegraph_grantor_names: {}", e))?;
     let rows = stmt
         .query_map(params![grantee_project_id], |r| r.get::<_, String>(0))
-        .map_err(|e| format!("query list_codegraph_grantor_slugs: {}", e))?;
+        .map_err(|e| format!("query list_codegraph_grantor_names: {}", e))?;
     rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("collect list_codegraph_grantor_slugs: {}", e))
+        .map_err(|e| format!("collect list_codegraph_grantor_names: {}", e))
 }
 
 /// JOIN over ``diagram_access`` (grantee filter) + ``projects``
@@ -1540,6 +1586,61 @@ mod tests {
         }
     }
 
+    /// Seed a full project (all KG + codegraph bindings, so `/config`
+    /// resolves 200 not 503) then override its `name` + `slug` to
+    /// arbitrary values. Used by the GAP-CG-1/CG-2 fixtures that need a
+    /// grantor whose NAME differs from its SLUG (a two-token / spaced
+    /// name) — `seed_full_project` alone hardcodes name="Test Display
+    /// Name", which can't exercise the slug≠name divergence.
+    fn seed_full_project_named(
+        handle: &LauncherDbHandle,
+        id: &str,
+        name: &str,
+        slug: &str,
+    ) {
+        // Seed with the slug as the binding key (matches seed_full_project's
+        // capitalise(slug) convention), then override name + slug.
+        seed_full_project(handle, id, slug);
+        let now = chrono::Utc::now().timestamp_millis();
+        let guard = handle.0.lock();
+        guard
+            .execute(
+                "UPDATE projects SET name = ?1, slug = ?2, updated_at = ?3 WHERE id = ?4",
+                rusqlite::params![name, slug, now, id],
+            )
+            .unwrap();
+    }
+
+    /// Seed a project with a primary KG binding (so `/config` resolves
+    /// 200, not 503) but DELIBERATELY NO `project_codegraph_bindings`
+    /// row — so the GAP-CG-3 code-graph-prefix FALLBACK path fires. Used
+    /// by the fallback tests to prove the fallback derives from the NAME
+    /// via canonical_class_prefix, not the divergent slug sanitiser.
+    fn seed_project_kg_only_no_codegraph_binding(
+        handle: &LauncherDbHandle,
+        id: &str,
+        name: &str,
+        slug: &str,
+    ) {
+        let folder = format!("/tmp/test-cg-nobind-{}", id);
+        seed_project(&handle.0, id, name, &folder, slug);
+        // Primary KG binding is required for a 200 /config response;
+        // the codegraph binding is intentionally OMITTED.
+        handle
+            .0
+            .set_project_kg_binding(
+                id,
+                "primary",
+                &format!("{}_KnowledgeGraph", capitalize(slug)),
+                Some("qwen3-embedding:0.6b"),
+                Some(1024),
+                None,
+                None,
+                &empty_json_obj(),
+            )
+            .unwrap();
+    }
+
     #[test]
     fn claude_session_dir_handles_underscores() {
         // v0.2.31 regression test: the citation-monitor bug was caused
@@ -1754,13 +1855,19 @@ mod tests {
         let kg_strs: Vec<&str> = kg_list.iter().filter_map(|v| v.as_str()).collect();
         assert!(kg_strs.contains(&"Myproject_KnowledgeGraph"));
 
-        // codegraph_access_list: own slug is always present.
+        // codegraph_access_list: own NAME is always present (GAP-CG-1
+        // fix 2026-07-14 — was own slug). seed_full_project stamps
+        // name="Test Display Name", slug="myproject"; the own entry is
+        // now the NAME so it matches what the analyzer wrote.
         let cg_list = body
             .get("codegraph_access_list")
             .and_then(|v| v.as_array())
             .expect("codegraph_access_list");
         let cg_strs: Vec<&str> = cg_list.iter().filter_map(|v| v.as_str()).collect();
-        assert!(cg_strs.contains(&"myproject"));
+        assert!(cg_strs.contains(&"Test Display Name"));
+        // The slug must NOT appear (it diverges from the analyzer's
+        // write prefix + project filter for a name≠slug project).
+        assert!(!cg_strs.contains(&"myproject"));
     }
 
     /// v0.2.46 Decision C — `development_collection` derives from the
@@ -1942,12 +2049,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_codegraph_access_list_resolves_grantor_slugs() {
-        // Two projects; project A grants project B read access to A's
-        // codegraph. B's resolver response must list A's slug.
+    async fn config_codegraph_access_list_resolves_grantor_names() {
+        // GAP-CG-1 fix (2026-07-14): the codegraph access list carries
+        // grantor NAMES, not slugs. Two projects; project A grants
+        // project B read access to A's codegraph. B's resolver response
+        // must list A's NAME.
+        //
+        // GAP-CG-2 regression fixture: A's name ("Project Alpha", two
+        // tokens) DIFFERS from its slug ("project-alpha") so a producer
+        // that still emitted slugs would fail this assertion — the
+        // slug≠name divergence the fix closes is actually exercised.
+        // seed_full_project hardcodes name="Test Display Name" for every
+        // project, so we seed full projects (bindings → 200 not 503) then
+        // override each to a distinct two-token name + hyphenated slug.
         let (base, h) = spawn_config_api_hub().await;
-        seed_full_project(&h, "proj-a", "project-a");
-        seed_full_project(&h, "proj-b", "project-b");
+        seed_full_project_named(&h, "proj-a", "Project Alpha", "project-alpha");
+        seed_full_project_named(&h, "proj-b", "Project Beta", "project-beta");
         h.0.codegraph_grant("proj-a", "proj-b", "read").unwrap();
 
         let resp = reqwest::get(format!("{}/projects/proj-b/config", base))
@@ -1963,10 +2080,19 @@ mod tests {
             .filter_map(|v| v.as_str().map(String::from))
             .collect();
 
-        assert!(cg_list.contains(&"project-a".to_string()));
-        assert!(cg_list.contains(&"project-b".to_string()));
+        // The grantor's NAME (two tokens) and B's own NAME are present.
+        assert!(
+            cg_list.contains(&"Project Alpha".to_string()),
+            "expected grantor NAME 'Project Alpha' in {:?}",
+            cg_list
+        );
+        assert!(cg_list.contains(&"Project Beta".to_string()));
+        // The SLUGS must NOT appear — they diverge from the analyzer's
+        // write prefix + project filter for a name≠slug project.
+        assert!(!cg_list.contains(&"project-alpha".to_string()));
+        assert!(!cg_list.contains(&"project-beta".to_string()));
 
-        // Inverse: A's response must NOT contain B's slug (no grant the other way).
+        // Inverse: A's response must NOT contain B's name (no grant the other way).
         let resp_a = reqwest::get(format!("{}/projects/proj-a/config", base))
             .await
             .expect("hub reachable");
@@ -1978,8 +2104,73 @@ mod tests {
             .iter()
             .filter_map(|v| v.as_str().map(String::from))
             .collect();
-        assert!(cg_list_a.contains(&"project-a".to_string()));
-        assert!(!cg_list_a.contains(&"project-b".to_string()));
+        assert!(cg_list_a.contains(&"Project Alpha".to_string()));
+        assert!(!cg_list_a.contains(&"Project Beta".to_string()));
+    }
+
+    #[tokio::test]
+    async fn config_code_graph_prefix_fallback_uses_canonical_name_not_slug() {
+        // GAP-CG-3 fix (2026-07-14): when a project has NO
+        // project_codegraph_bindings row (binding-row race / corrupted
+        // DB), the /config resolver derives the code-graph prefix from
+        // the project NAME via canonical_class_prefix — MATCHING the
+        // analyzer's write prefix — NOT the old divergent inline
+        // sanitiser over the slug.
+        //
+        // Name "Client Alpha" → canonical_class_prefix → "ClientAlpha".
+        // The old slug fallback ("client-alpha") produced "Client_alpha"
+        // (underscore where the analyzer wrote none) → silent 0-results.
+        // seed_project_kg_only_no_codegraph_binding inserts the projects
+        // row + a primary KG binding (so /config resolves 200 not 503)
+        // but NO codegraph binding, so the fallback path fires.
+        let (base, h) = spawn_config_api_hub().await;
+        seed_project_kg_only_no_codegraph_binding(
+            &h, "p-nobind", "Client Alpha", "client-alpha",
+        );
+
+        let resp = reqwest::get(format!("{}/projects/p-nobind/config", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        let prefix = body
+            .get("code_graph_collection_prefix")
+            .and_then(|v| v.as_str())
+            .expect("code_graph_collection_prefix");
+        assert_eq!(
+            prefix, "ClientAlpha",
+            "fallback must derive the code-graph prefix from the NAME via \
+             canonical_class_prefix (matches the analyzer's write prefix), \
+             not the underscore-inserting slug sanitiser"
+        );
+        // The old divergent slug-fallback value must NOT be produced.
+        assert_ne!(prefix, "Client_alpha");
+    }
+
+    #[tokio::test]
+    async fn config_code_graph_prefix_fallback_pathological_name_uses_slug() {
+        // GAP-CG-3 leave-alone case: when canonical_class_prefix REJECTS
+        // the name (pathological — here all-symbol → SanitizesToEmpty /
+        // LeadingNonLetter), the resolver falls to the old inline
+        // slug-sanitised placeholder (last resort) rather than 500-ing.
+        // The slug "sym-proj" sanitises to "Sym_proj".
+        let (base, h) = spawn_config_api_hub().await;
+        seed_project_kg_only_no_codegraph_binding(
+            &h, "p-patho", "!!!", "sym-proj",
+        );
+
+        let resp = reqwest::get(format!("{}/projects/p-patho/config", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        let prefix = body
+            .get("code_graph_collection_prefix")
+            .and_then(|v| v.as_str())
+            .expect("code_graph_collection_prefix");
+        // Falls back to the slug-sanitised placeholder (Sym_proj) — the
+        // response still resolves; a WARNING was logged to stderr.
+        assert_eq!(prefix, "Sym_proj");
     }
 
     #[tokio::test]

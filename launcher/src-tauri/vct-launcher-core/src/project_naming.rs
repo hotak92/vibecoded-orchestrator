@@ -22,6 +22,17 @@
 //! case-insensitive Weaviate class-name collision wedge (bug 0.6 / 0.7).
 //! This module + the Python sibling + the shared fixture are the
 //! single-source-of-truth fix.
+//!
+//! GAP-CG-3 (2026-07-14): PROMOTED from the Tauri-side launcher crate
+//! (`launcher/src-tauri/src/project_naming.rs`) into `vct-launcher-core`
+//! so `vct-hub`'s `config_api::resolve_project_config` can call the SAME
+//! canonical rule over the project NAME when its code-graph binding row
+//! is absent (the fallback previously used a DIVERGENT inline sanitizer
+//! over the SLUG). The app crate now re-exports this module
+//! (`pub use vct_launcher_core::project_naming;` in `src/lib.rs`), so the
+//! six in-crate consumers and the `project_naming_parity.rs` integration
+//! test (which imports via `vct_launcher_temp_lib::project_naming`)
+//! compile unchanged. A > B > C: one SSOT, no third mirror.
 
 use std::fmt;
 

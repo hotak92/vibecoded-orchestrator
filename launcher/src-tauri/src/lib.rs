@@ -14,7 +14,6 @@ mod hub_status;
 mod installer_engine;
 mod project_backfill;
 mod mcp_registration;
-pub mod project_naming;
 mod quit_dialog;
 mod tray;
 
@@ -34,6 +33,12 @@ pub use vct_launcher_core::config;
 pub use vct_launcher_core::db;
 pub use vct_launcher_core::manifest;
 pub use vct_launcher_core::paths;
+// v0.2.81 GAP-CG-3: project_naming moved to vct-launcher-core (so
+// vct-hub can call canonical_class_prefix for its code-graph prefix
+// fallback). Re-exported here so `crate::project_naming::…` at the six
+// in-crate consumers AND `vct_launcher_temp_lib::project_naming::…` in
+// tests/project_naming_parity.rs resolve unchanged.
+pub use vct_launcher_core::project_naming;
 pub use vct_launcher_core::registry;
 pub use vct_launcher_core::secrets;
 pub use vct_launcher_core::state;
@@ -2529,6 +2534,10 @@ pub fn run() {
             // button. Returns an "unavailable" error today; full Rust
             // wrapper queued for v0.2.47.
             commands::secrets_cmd::migrate_env_secrets_from_dotenv,
+            // GAP-2 (2026-07-14): per-project bulk "disable shared secrets"
+            // opt-out toggle (mirror of the shared-KG read gate).
+            commands::secrets_cmd::get_shared_secrets_read_disabled_cmd,
+            commands::secrets_cmd::set_shared_secrets_read_disabled,
             // 0.2.x backlog #3: shared-tab key-collision shadow badge.
             commands::secrets_cmd::list_user_secret_keys_v2,
             // Bug H (v0.2.8 / Phase 5): register secrets by KEY only.

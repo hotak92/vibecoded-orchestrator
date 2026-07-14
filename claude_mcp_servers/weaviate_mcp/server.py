@@ -103,6 +103,70 @@ if __package__ in (None, ""):
     # importing a SECOND, uninitialised ``weaviate_mcp.server`` — which would
     # desync the re-exported functions (config read twice, test patches missed).
     sys.modules["weaviate_mcp.server"] = sys.modules["__main__"]
+    # FN-4: the paid-tier rl_client imports the server via its REPO-ROOT
+    # package path (``from claude_mcp_servers.weaviate_mcp.server import …``
+    # / ``from claude_mcp_servers.weaviate_mcp import server`` — see
+    # rl_client/citation_compute.py:87, search_pipeline.py, etc.). Under the
+    # bare-script launch only ``weaviate_mcp`` is on sys.path, so those
+    # call-time imports would RE-EXECUTE server.py as a SECOND module object
+    # (config read twice, test patches / cached embed service missed, the
+    # same dual-object hazard the ``weaviate_mcp.server`` alias above fixes
+    # for the short package path). Alias the repo-root package keys to the
+    # SAME running objects too. Import the namespace PARENT
+    # (``claude_mcp_servers.weaviate_mcp``) first so ``from
+    # claude_mcp_servers.weaviate_mcp import server`` has a known parent, then
+    # reconcile the ``.server`` submodule key to ``__main__``.
+    #
+    # Guarded on the parent import succeeding: ``claude_mcp_servers`` is a
+    # real package only when the REPO ROOT (the parent of
+    # ``claude_mcp_servers/``) is import-visible. In the bare-script launch it
+    # usually is NOT (only ``claude_mcp_servers/`` is on sys.path), so we put
+    # the repo root on sys.path first. This block runs ONLY in the bare-script
+    # branch — package-mode imports (where the two keys are legitimately
+    # distinct test doubles) never reach here, preserving the
+    # ``s1 is not s2`` package-mode contract.
+    _repo_root = str(_pkg_dir.parent.parent)              # …/<repo> (parent of claude_mcp_servers)
+    if _repo_root not in sys.path:
+        sys.path.append(_repo_root)
+    try:
+        _bootstrap_importlib.import_module("claude_mcp_servers.weaviate_mcp")
+        sys.modules["claude_mcp_servers.weaviate_mcp.server"] = sys.modules["__main__"]
+    except ImportError:
+        # Repo-root package not importable (e.g. a relocated/renamed install
+        # tree where ``claude_mcp_servers`` isn't a top-level package name).
+        # rl_client is a PAID optional module; its call-time imports already
+        # soft-fail when absent, so a missing repo-root alias degrades to
+        # "RL features off", not a crash. The short ``weaviate_mcp.server``
+        # alias above is the load-bearing one and is unconditional.
+        pass
+
+    # FN-6: neutralize the script-dir sys.path[0] entry that Python adds
+    # automatically for a bare-script launch (``python .../weaviate_mcp/
+    # server.py`` prepends ``…/weaviate_mcp`` — the package dir ITSELF — to
+    # sys.path[0]). With the package dir on the path, a stray BARE-NAME
+    # submodule import anywhere (``import embeddings`` instead of
+    # ``from .embeddings``) would resolve ``embeddings`` as a SECOND
+    # top-level module object with ``__package__ == ''`` — the exact dual-
+    # object hazard the package-identity bootstrap fixes for the canonical
+    # ``.X`` imports. Dropping the package-dir entry makes any such stray
+    # bare-name import FAIL LOUDLY (ModuleNotFoundError) instead of silently
+    # minting a dual. The parent dir (``claude_mcp_servers/``, prepended
+    # above) stays, so the ``weaviate_mcp`` / ``_lib`` packages still
+    # resolve. Match by RESOLVED path so a relative sys.path[0] ("") or a
+    # symlinked launch dir is caught too.
+    def _bootstrap_is_pkg_dir(entry: str) -> bool:
+        # Empty string / "." both denote the cwd, which for a bare-script
+        # launch IS the launch dir — but the script-dir entry Python injects
+        # is the absolute package dir. Treat "" / "." as NOT the package dir
+        # (they may be a legitimate cwd) and only strip resolved matches of
+        # _pkg_dir; the explicit-string checks catch the un-resolvable cases.
+        if entry in ("", "."):
+            return False
+        try:
+            return Path(entry).resolve() == _pkg_dir
+        except (OSError, ValueError):
+            return entry == str(_pkg_dir)
+    sys.path[:] = [p for p in sys.path if not _bootstrap_is_pkg_dir(p)]
 
 # v0.2.52 (Known Issue 6, Sub-issue A): silence the
 # ``AuthlibDeprecationWarning: authlib.jose module is deprecated`` noise
@@ -135,22 +199,51 @@ import weaviate
 from weaviate.classes.query import Filter, MetadataQuery
 import aiohttp
 
+# FN-5a (v0.2.81): the six REQUIRED shipped-submodule relative imports below
+# (`.chunking`, `.code_ranking`, `.rl_state`, `.embeddings` ×2, `.rl_enrichment`)
+# are enriched-and-re-raised on ImportError — still LOUD (no fallback), but with
+# an actionable note. The package-identity bootstrap above makes each relative
+# import resolve under BOTH entry points, so a failure here means a BROKEN
+# install; the note names the remediation instead of leaving a bare
+# "attempted relative import" / "No module named" trace. ``add_note`` is
+# Python 3.11+ (the shipped venv is 3.12); guarded for older interpreters.
+def _reraise_shipped_submodule_import(exc: "ImportError", submodule: str) -> None:
+    """Enrich a shipped-submodule ImportError with remediation, then re-raise.
+
+    LOUD by design — ``.chunking`` / ``.embeddings`` / … are shipped parts of
+    every healthy weaviate_mcp install, so a failed relative import IS a broken
+    install. No fallback: we re-raise so startup fails visibly (never a silent
+    degrade to a second module object that fails mid-query).
+    """
+    _note = (
+        f"weaviate-kg: required shipped submodule '{submodule}' is missing — "
+        f"broken install; run `python install.py --update` from the "
+        f"orchestrator root to repair it."
+    )
+    if hasattr(exc, "add_note"):
+        exc.add_note(_note)  # type: ignore[attr-defined]  # Python 3.11+
+        raise exc
+    # Pre-3.11 interpreters: re-raise with the note folded into the message.
+    raise ImportError(f"{exc} — {_note}") from exc
+
+
 # Import Chunker for splitting large node content before embedding.
-# REQUIRED shipped submodule — the package-identity bootstrap above makes this
-# ONE relative import resolve under BOTH entry points (bare-script + package),
-# so no import fallback is needed. A failure here means a broken install and
-# MUST raise loudly at startup (no silent degrade).
-from .chunking import Chunker  # noqa: E402 — after bootstrap
+try:
+    from .chunking import Chunker  # noqa: E402 — after bootstrap
+except ImportError as _exc:
+    _reraise_shipped_submodule_import(_exc, ".chunking")
 
 # v0.2.72 (P1/P2 integration): the SHARED code-retrieval pipeline. Both this
 # MCP (`search_code_graph`) and the CLI (`query_code_graph.py::search_by_concept`)
 # call `run_code_retrieval_pipeline` so floor/rerank/collapse/tier can't diverge.
-# REQUIRED shipped submodule — see the bootstrap note above.
-from .code_ranking import (  # noqa: E402 — after bootstrap
-    run_code_retrieval_pipeline,
-    resolve_retrieval_floor,
-    resolve_post_rerank_floor,
-)
+try:
+    from .code_ranking import (  # noqa: E402 — after bootstrap
+        run_code_retrieval_pipeline,
+        resolve_retrieval_floor,
+        resolve_post_rerank_floor,
+    )
+except ImportError as _exc:
+    _reraise_shipped_submodule_import(_exc, ".code_ranking")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -161,107 +254,114 @@ logger = logging.getLogger(__name__)
 # `.claude/settings.json env`. The handler exits cleanly with code 0;
 # Claude Code respawns us on the next request with fresh env. See
 # claude_mcp_servers/_lib/sighup_handler.py for the full design rationale.
-# Import is best-effort: when the MCP is run via
-# `python <install>/claude_mcp_servers/weaviate_mcp/server.py` the parent
-# dir (claude_mcp_servers/) needs to be on sys.path for `_lib` to resolve.
-try:
-    from _lib.sighup_handler import register_sighup_exit_handler  # type: ignore
-except ImportError:
-    # Ensure the parent dir is on sys.path then retry once.
-    _parent_dir = str(Path(__file__).resolve().parent.parent)
-    if _parent_dir not in sys.path:
-        sys.path.insert(0, _parent_dir)
-    try:
-        from _lib.sighup_handler import register_sighup_exit_handler  # type: ignore
-    except ImportError:
-        # _lib missing entirely (e.g. partial install) — soft-fail. The
-        # MCP still works, it just won't auto-reload env on SIGHUP. The
-        # launcher's manual "Reload MCPs" button falls back to a hard
-        # kill in that case.
-        def register_sighup_exit_handler(_logger):  # type: ignore[no-redef]
-            return False
+#
+# v0.2.81: ``_lib.sighup_handler`` is a SHIPPED part of every healthy
+# install, so a failed import is a BROKEN install — resolve it through the
+# shared ``_lib.bootstrap.import_lib_member`` helper, which owns the
+# parent-dir retry ONCE and LOUD-FAILS (naming ``install.py --update``)
+# instead of the pre-fix silent ``register_sighup_exit_handler → False``
+# stub that hid the breakage and quietly dropped SIGHUP env-reload. Put
+# ``claude_mcp_servers/`` on sys.path first (unavoidable: ``_lib.bootstrap``
+# itself needs it) — the bare-script bootstrap above already did this, but
+# the package-import path (tests) may not have.
+_mcp_root = str(Path(__file__).resolve().parent.parent)  # …/claude_mcp_servers
+if _mcp_root not in sys.path:
+    sys.path.insert(0, _mcp_root)
+from _lib.bootstrap import import_lib_member  # noqa: E402 — after sys.path setup
+register_sighup_exit_handler = import_lib_member(
+    "sighup_handler", "register_sighup_exit_handler"
+)
 register_sighup_exit_handler(logger)
 
-# v0.2.18: EmbeddingService (vco_lib) — centralised dispatcher for
-# embed calls and slot resolution. Replaces the per-helper Ollama /
-# CodeEmbed / OpenAI HTTP calls that used to live as
-# `get_ollama_embedding` / `get_code_embedding` / `_get_all_kg_embeddings`
-# / `_get_search_vector` here. Those helpers still exist as thin
-# adapters that call EmbeddingService — keeping the function names
-# preserves every callsite in this module unchanged.
+# vco_lib import discipline (v0.2.81): ``vco_lib`` is a SHIPPED part of
+# every healthy VCO install (editable-installed into the resolved venv),
+# so an ``import vco_lib`` that fails means a BROKEN install — surface it
+# LOUDLY (CLAUDE.md rule). The pre-fix ``try/except → HAS_*=False + inline
+# legacy body`` guards below limped onto pre-v0.2.18 inline-copy
+# implementations that MASKED the breakage (a silent inline-copy degrade,
+# exactly what the SSOT rule forbids). They are now enrich-and-re-raise:
+# a failed vco_lib import fails startup visibly, naming ``install.py
+# --update``. The dead inline-legacy bodies in the consumer helpers below
+# (``_sanitize_collection_prefix`` / ``_code_sanitize_collection_prefix``)
+# are deleted with them — the ``_HAS_*`` flags are now always True.
 #
-# Import is graceful: if vco_lib isn't on sys.path (rare; partial
-# install), the helpers fall through to their pre-v0.2.18 inline
-# HTTP-call bodies. This lets the MCP boot on a half-migrated install
-# instead of crashing at import time.
+# NOTE — this is DISTINCT from the per-CALL runtime fallbacks inside the
+# shipped ``embeddings.py`` (e.g. inline Ollama HTTP when ``svc.embed_text``
+# RAISES mid-session): those are legitimate functionality-preserving
+# degrades for a live backend hiccup, not import-time broken-install
+# masking, and they stay. Here we only remove the IMPORT-TIME masking.
+def _reraise_vco_lib_import(exc: "ImportError", what: str) -> None:
+    """Enrich a vco_lib ImportError with remediation, then re-raise LOUD.
+
+    ``vco_lib`` is shipped; a failed import is a broken install. No
+    fallback — startup must fail visibly rather than degrade to a
+    silent inline copy that masks the breakage.
+    """
+    _note = (
+        f"weaviate-kg: required vco_lib member '{what}' is not importable — "
+        f"this is a BROKEN orchestrator install (vco_lib is editable-installed "
+        f"into every healthy install). Run `python install.py --update` from "
+        f"the orchestrator root to repair it."
+    )
+    if hasattr(exc, "add_note"):
+        exc.add_note(_note)  # type: ignore[attr-defined]  # Python 3.11+
+        raise exc
+    raise ImportError(f"{exc} — {_note}") from exc
+
+
+# v0.2.18: EmbeddingService (vco_lib) — centralised dispatcher for embed
+# calls and slot resolution. The per-helper adapters in ``embeddings.py``
+# call it; a failed import = broken install → loud-fail (was: silent
+# HAS_EMBEDDING_SERVICE=False + inline legacy bodies).
+_vco_lib_parent = Path(__file__).resolve().parent.parent.parent
+if str(_vco_lib_parent) not in sys.path:
+    sys.path.insert(0, str(_vco_lib_parent))
 try:
-    _vco_lib_parent = Path(__file__).resolve().parent.parent.parent
-    if str(_vco_lib_parent) not in sys.path:
-        sys.path.insert(0, str(_vco_lib_parent))
     from vco_lib.embedding_service import (
         EmbeddingService,
-        NoEmbeddingBackendError,
+        # NoEmbeddingBackendError is re-exported for embeddings.py's dynamic
+        # ``server.NoEmbeddingBackendError`` access (ruff can't see it).
+        NoEmbeddingBackendError,  # noqa: F401
     )
-    HAS_EMBEDDING_SERVICE = True
-except Exception as _embed_import_err:  # pragma: no cover (rare half-install)
-    logger.warning(
-        "EmbeddingService import failed (%s) — falling back to legacy "
-        "inline embed helpers. Run install.py --update to refresh vco_lib.",
-        _embed_import_err,
-    )
-    HAS_EMBEDDING_SERVICE = False
-    EmbeddingService = None  # type: ignore[assignment]
-    NoEmbeddingBackendError = Exception  # type: ignore[assignment]
+except ImportError as _embed_import_err:
+    _reraise_vco_lib_import(_embed_import_err, "embedding_service.EmbeddingService")
+# Always available now (loud-fail above if not) — kept as a True constant
+# because ``embeddings.py`` and other call-sites reference it by name.
+HAS_EMBEDDING_SERVICE = True
 
 # v0.2.34 cr-b2 (2026-05-25): canonical sanitiser for Weaviate class
-# prefixes. The diagrams-collection naming bug (silent cross-project
-# visibility break for any project with non-alphanumeric chars) was
-# caused by `_sanitize_collection_prefix` re-implementing a divergent
-# rule. Lock onto Python's source-of-truth instead — see the docstring
-# on `_sanitize_collection_prefix` below for the full rationale.
-# Import is graceful for the same reason as EmbeddingService: a
-# half-installed env shouldn't crash the MCP at first call.
+# prefixes (diagrams/KG underscore-DROPPING rule). SHIPPED — a failed
+# import = broken install → loud-fail (was: silent inline re-implementation).
 try:
     from vco_lib.project_init import (
         sanitize_for_weaviate_class as _canonical_sanitize_for_weaviate_class,
     )
-    _HAS_CANONICAL_SANITIZER = True
-except Exception as _sanitiser_import_err:  # pragma: no cover (rare half-install)
-    logger.warning(
-        "vco_lib.project_init.sanitize_for_weaviate_class import failed (%s) "
-        "— falling back to inline implementation. Run install.py --update "
-        "to refresh vco_lib.",
-        _sanitiser_import_err,
+except ImportError as _sanitiser_import_err:
+    _reraise_vco_lib_import(
+        _sanitiser_import_err, "project_init.sanitize_for_weaviate_class"
     )
-    _HAS_CANONICAL_SANITIZER = False
-    _canonical_sanitize_for_weaviate_class = None  # type: ignore[assignment]
+_HAS_CANONICAL_SANITIZER = True
 
 # v0.2.74 (BLOCKER-1): the code-graph reader prefix is the underscore-PRESERVING
 # `canonical_class_prefix` (the SSOT the ANALYZER writes with + launcher.db
 # `project_codegraph_bindings.collection_prefix` uses), NOT the underscore-
-# DROPPING `sanitize_for_weaviate_class` used for diagrams/KG. Masked until now
-# only because `VibeCodedOrchestrator` has no underscore — but ANY underscored
-# code prefix made the MCP READ a different class than the analyzer WROTE →
-# silent 0-results + a latent duplicate-generator. Import the preserving rule
-# separately; a code-graph-ONLY sanitizer (`_code_sanitize_collection_prefix`,
-# below) routes the Code* class-name construction through it, while diagrams/KG
-# stay on the dropping `_sanitize_collection_prefix` (pinned by
+# DROPPING `sanitize_for_weaviate_class` used for diagrams/KG. A code-graph-ONLY
+# sanitizer (`_code_sanitize_collection_prefix`, below) routes the Code*
+# class-name construction through it, while diagrams/KG stay on the dropping
+# `_sanitize_collection_prefix` (pinned by
 # `tests/test_diagrams_class_name_parity.py` + the Rust mirror — do NOT merge).
+# SHIPPED — a failed import = broken install → loud-fail (was: silent fallback
+# to the dropping rule, which read a DIFFERENT class than the analyzer wrote
+# for any underscored project name → silent 0-results + latent dup-generator).
 try:
     from vco_lib.project_naming import (
         canonical_class_prefix as _canonical_class_prefix,
     )
-    _HAS_CODE_CANONICAL_PREFIX = True
-except Exception as _code_prefix_import_err:  # pragma: no cover (rare half-install)
-    logger.warning(
-        "vco_lib.project_naming.canonical_class_prefix import failed (%s) — "
-        "code-graph collection resolution falls back to the underscore-dropping "
-        "rule (correct only for non-underscored project names). Run install.py "
-        "--update to refresh vco_lib.",
-        _code_prefix_import_err,
+except ImportError as _code_prefix_import_err:
+    _reraise_vco_lib_import(
+        _code_prefix_import_err, "project_naming.canonical_class_prefix"
     )
-    _HAS_CODE_CANONICAL_PREFIX = False
-    _canonical_class_prefix = None  # type: ignore[assignment]
+_HAS_CODE_CANONICAL_PREFIX = True
 
 
 # ─── v0.2.21 Step 18: per-project config resolver ───────────────────────
@@ -278,23 +378,23 @@ except Exception as _code_prefix_import_err:  # pragma: no cover (rare half-inst
 # time — the hub's TTL semantics keep callers fresh-enough (cf. parent
 # plan §8.3). A SIGHUP triggers process exit + relaunch (sighup_handler
 # above), so a launcher GUI edit propagates within the next request.
+# SHIPPED — a failed IMPORT of vco_lib.project_config = broken install →
+# loud-fail (was: silent _HAS_PROJECT_CONFIG=False). This is DISTINCT from
+# the RUNTIME hub-unreachable degrade: `_try_resolve_project_config()`
+# below still returns None (→ env fallback) when the live hub is down /
+# the project isn't registered — a legitimate, documented degrade that is
+# NOT a broken install. Only the import itself loud-fails here.
+_vco_lib_parent_for_pc = Path(__file__).resolve().parent.parent.parent
+if str(_vco_lib_parent_for_pc) not in sys.path:
+    sys.path.insert(0, str(_vco_lib_parent_for_pc))
 try:
-    _vco_lib_parent_for_pc = Path(__file__).resolve().parent.parent.parent
-    if str(_vco_lib_parent_for_pc) not in sys.path:
-        sys.path.insert(0, str(_vco_lib_parent_for_pc))
     from vco_lib.project_config import resolve as _resolve_project_config  # type: ignore[import-not-found]
-    from vco_lib.project_config import ResolverError as _ResolverError  # type: ignore[import-not-found]
-    _HAS_PROJECT_CONFIG = True
-except Exception as _pc_import_err:  # pragma: no cover (rare half-install)
-    logger.warning(
-        "vco_lib.project_config import failed (%s) — falling back to env "
-        "vars for KG_COLLECTION / SHARED_KG_COLLECTION / DEVELOPMENT_COLLECTION "
-        "/ ACTIVE_EMBEDDING / CODE_GRAPH_PROJECT. Run install.py --update.",
-        _pc_import_err,
-    )
-    _HAS_PROJECT_CONFIG = False
-    _resolve_project_config = None  # type: ignore[assignment]
-    _ResolverError = Exception  # type: ignore[assignment]
+    # NOTE: the former ``ResolverError as _ResolverError`` import was dead code
+    # (only ever assigned in the deleted except-fallback, never referenced) —
+    # removed with the fallback per the v0.2.81 cleanup directive.
+except ImportError as _pc_import_err:
+    _reraise_vco_lib_import(_pc_import_err, "project_config.resolve")
+_HAS_PROJECT_CONFIG = True
 
 
 _resolved_project_config = None  # cached resolve() result (or None if unreachable)
@@ -336,8 +436,9 @@ def _try_resolve_project_config():
         return _resolved_project_config
     if os.environ.get("VCT_DISABLE_HUB_RESOLVER"):
         return None
-    if not _HAS_PROJECT_CONFIG or _resolve_project_config is None:
-        return None
+    # v0.2.81: the import-time guard now loud-fails on a broken vco_lib, so
+    # `_resolve_project_config` is always a real callable here — the old
+    # `if not _HAS_PROJECT_CONFIG` early-return is dead and was removed.
     try:
         # NEW-6 (2026-05-28): prefer CLAUDE_PROJECT_DIR over Path(__file__)
         # so MCP subprocesses launched against different workspaces resolve
@@ -778,8 +879,12 @@ RL_SERVER_URL = os.getenv("RL_SERVER_URL", "http://localhost:11439")
 #     and stays, ``server``; only the DEFINITION home moved).
 # REQUIRED shipped submodule. The package-identity bootstrap at the top of this
 # file makes this ONE relative import resolve under BOTH entry points, so no
-# bare-script fallback is needed (a failure here = broken install → raise loudly).
-from . import rl_state as _rl_state  # noqa: E402 — after bootstrap
+# bare-script fallback is needed (a failure here = broken install → raise loudly
+# with remediation, via _reraise_shipped_submodule_import — FN-5a).
+try:
+    from . import rl_state as _rl_state  # noqa: E402 — after bootstrap
+except ImportError as _exc:
+    _reraise_shipped_submodule_import(_exc, ".rl_state")
 # Over-fetch multiplier: fetch this many × limit from Weaviate, pass all to RL
 # server for reranking. (v0.2.75 P3f promotes this to KG_OVERFETCH_MULTIPLIER.)
 _RL_OVERFETCH = _rl_state._RL_OVERFETCH
@@ -818,8 +923,12 @@ ACTIVE_EMBEDDING = _config_field("active_embedding", "ACTIVE_EMBEDDING", "qwen3"
 # dependency — its ``server.<name>`` reads are call-time — so this is safe before
 # the late functions-re-export block).
 # REQUIRED shipped submodule — the package-identity bootstrap makes this ONE
-# relative import resolve under BOTH entry points (no fallback; loud-fail if broken).
-from . import embeddings as _embeddings  # noqa: E402 — after bootstrap
+# relative import resolve under BOTH entry points (no fallback; loud-fail with
+# remediation via _reraise_shipped_submodule_import — FN-5a).
+try:
+    from . import embeddings as _embeddings  # noqa: E402 — after bootstrap
+except ImportError as _exc:
+    _reraise_shipped_submodule_import(_exc, ".embeddings")
 LEGACY_TEXT_EMBEDDING_MODEL = _embeddings.LEGACY_TEXT_EMBEDDING_MODEL
 OPENAI_EMBEDDING_MODEL = _embeddings.OPENAI_EMBEDDING_MODEL
 OPENAI_API_KEY = _embeddings.OPENAI_API_KEY
@@ -2946,29 +3055,14 @@ def _sanitize_collection_prefix(name: str) -> str:
     consuming the shared JSON fixture at
     ``tests/fixtures/diagrams_class_name_parity.json``.
 
-    Fallback: if ``vco_lib`` isn't importable (half-installed env),
-    re-implements the same rule inline. The fallback path is
-    behaviour-identical to the imported function — kept so the MCP
-    boots on partial installs rather than crashing at first call.
+    v0.2.81: the import-time ``_HAS_CANONICAL_SANITIZER`` fallback (a
+    silent inline re-implementation on a broken vco_lib) is GONE — a
+    failed ``vco_lib.project_init`` import now loud-fails at module load
+    (see the guard above). ``sanitize_for_weaviate_class`` never raises
+    (returns ``"vct"`` on garbage input), so no runtime safety net is
+    needed here.
     """
-    if _HAS_CANONICAL_SANITIZER:
-        try:
-            return _canonical_sanitize_for_weaviate_class(name)
-        except Exception:
-            # Defensive: never let a sanitiser exception take the MCP down.
-            # Falls through to the inline implementation below.
-            pass
-
-    # Inline fallback — behaviour-identical to
-    # `sanitize_for_weaviate_class`. Kept for partial-install resilience.
-    base = name or ""
-    parts = [p for p in re.split(r"[^A-Za-z0-9]+", base) if p]
-    if not parts:
-        return "vct"
-    pascal = "".join(p[:1].upper() + p[1:] for p in parts)
-    if not pascal or not pascal[0].isalpha():
-        return "vct"
-    return pascal
+    return _canonical_sanitize_for_weaviate_class(name)
 
 
 def _code_sanitize_collection_prefix(name: str) -> str:
@@ -2984,19 +3078,23 @@ def _code_sanitize_collection_prefix(name: str) -> str:
     to the writer's for ANY project name — including underscored ones — without
     splitting diagrams/KG resolution.
 
-    Fallback: when `canonical_class_prefix` isn't importable (half-install), fall
-    back to the dropping sanitizer — correct only for non-underscored names, but
-    keeps the MCP booting rather than crashing (same posture as the shared one).
+    v0.2.81: the import-time ``_HAS_CODE_CANONICAL_PREFIX`` fallback (a
+    silent degrade to the dropping rule on a broken vco_lib) is GONE — a
+    failed ``vco_lib.project_naming`` import now loud-fails at module load
+    (see the guard above). The remaining ``try/except`` is a RUNTIME
+    safety net, NOT import-masking: ``canonical_class_prefix`` RAISES
+    ``ValueError`` for a pathological project name (empty / all-symbol /
+    leading-non-letter), and a bad name must not crash the MCP mid-query
+    — it degrades to the dropping sanitizer (which returns ``"vct"`` for
+    such input) so the tool still responds. This is functionality-
+    preserving, not a broken-install mask.
     """
-    if _HAS_CODE_CANONICAL_PREFIX:
-        try:
-            return _canonical_class_prefix(name)
-        except Exception:  # never let a sanitiser exception take the MCP down
-            pass
-    # Half-install fallback: the dropping rule (parity holds for names with no
-    # underscore, which is the common case; underscored names degrade to the
-    # pre-fix behaviour until vco_lib is refreshed).
-    return _sanitize_collection_prefix(name)
+    try:
+        return _canonical_class_prefix(name)
+    except ValueError:
+        # Pathological project name (canonical rule rejects it). Degrade
+        # to the dropping sanitizer's "vct" fallback rather than crash.
+        return _sanitize_collection_prefix(name)
 
 
 def _code_collection(base: str) -> str:
@@ -3534,25 +3632,28 @@ _EMBED_SERVICE_RETRY_WINDOW = 10.0  # don't re-probe failed construction more th
 # ``__package__`` was formerly empty) AND the package import path. No fallback:
 # a failure here is a broken install and MUST raise loudly at startup, never
 # silently degrade to a second module object that fails mid-query.
-from .embeddings import (  # noqa: E402 — after bootstrap, re-export post config
-    _get_embedding_service,
-    get_ollama_embedding,
-    get_legacy_text_embedding,
-    get_openai_embedding,
-    get_embedding,
-    _get_both_embeddings,
-    _get_all_kg_embeddings,
-    _get_all_code_embeddings,
-    _scheme_for_collection,
-    _primary_named_vector,
-    _get_search_vector,
-    count_tokens_async,
-    get_code_embedding,
-    _inline_code_embed_http,
-    get_code_query_embedding,
-    _active_code_query_slot,
-    get_legacy_code_embedding,
-)
+try:
+    from .embeddings import (  # noqa: E402 — after bootstrap, re-export post config
+        _get_embedding_service,
+        get_ollama_embedding,
+        get_legacy_text_embedding,
+        get_openai_embedding,
+        get_embedding,
+        _get_both_embeddings,
+        _get_all_kg_embeddings,
+        _get_all_code_embeddings,
+        _scheme_for_collection,
+        _primary_named_vector,
+        _get_search_vector,
+        count_tokens_async,
+        get_code_embedding,
+        _inline_code_embed_http,
+        get_code_query_embedding,
+        _active_code_query_slot,
+        get_legacy_code_embedding,
+    )
+except ImportError as _exc:
+    _reraise_shipped_submodule_import(_exc, ".embeddings")
 
 
 def serialize_datetime(value):
@@ -3880,7 +3981,10 @@ _RL_ENRICHMENT_EXPORTS = (
     "_rl_enrichment_gate_open", "_rl_enrichment_consumer_exists",
     "_rl_enrich_gate_reset_for_test",
 )
-from . import rl_enrichment as _rl_enrichment  # noqa: E402 — after bootstrap
+try:
+    from . import rl_enrichment as _rl_enrichment  # noqa: E402 — after bootstrap
+except ImportError as _exc:
+    _reraise_shipped_submodule_import(_exc, ".rl_enrichment")
 for _name in _RL_ENRICHMENT_EXPORTS:  # re-export into server's namespace
     globals()[_name] = getattr(_rl_enrichment, _name)
 del _name
@@ -5433,7 +5537,12 @@ async def _hybrid_search_body(
     # cross-module deprecation channel (single message at a time today;
     # future paid modules write the SAME keys when their poller fires).
     try:
-        from rl_client import _deprecation_warning as _rl_dep_warning
+        # FN-4: canonical package path (was bare ``rl_client``) so this
+        # resolves to the ONE rl_client package identity, not a second
+        # top-level copy on the bare-script sys.path. RL is a PAID optional
+        # module, so the deprecation-banner surface stays best-effort
+        # (soft-fail when absent) — legitimate, not broken-install masking.
+        from claude_mcp_servers.rl_client import _deprecation_warning as _rl_dep_warning
         dep_banner = _rl_dep_warning()
     except Exception:  # noqa: BLE001 — best-effort surface, never block
         dep_banner = None
@@ -6290,8 +6399,21 @@ async def search_code_graph(
         # collapse before trimming to `limit`. Matches the CLI over-fetch.
         _fetch_limit = max(1, 2 * limit)
 
+        # Lens-B (v0.2.81): per-collection bookkeeping so the aggregate can
+        # distinguish "no semantic matches" from "collections not found /
+        # project not analyzed / stale slug-form peer entry". Mirrors
+        # hybrid_search's classification (schema-missing vs generic). Reset
+        # each _gather_candidates call; we trust the FIRST (unfiltered-by-
+        # layer-retry) gather's classification for the aggregate signal.
+        _cg_successful_collections: list[str] = []
+        _cg_failed_schema: list[str] = []
+        _cg_failed_other: list[tuple[str, str]] = []
+
         def _gather_candidates(apply_layer: bool) -> list[dict]:
             gathered: list[dict] = []
+            _cg_successful_collections.clear()
+            _cg_failed_schema.clear()
+            _cg_failed_other.clear()
             for coll_name in collections:
                 try:
                     coll = client.collections.get(coll_name)
@@ -6377,8 +6499,29 @@ async def search_code_graph(
                         except Exception:  # noqa: BLE001 — never blocks search
                             pass
                         gathered.append(cand)
+                    # Reached here → the collection exists and the query ran
+                    # (0+ rows). Record success so the aggregate can tell
+                    # "collection present, no matches" from "collection absent".
+                    _cg_successful_collections.append(coll_name)
                 except Exception as e:
+                    # Keep the per-collection soft-skip (legitimate for the
+                    # some-exist fan-out case), but CLASSIFY + RECORD so the
+                    # aggregate branch below can turn an all-absent fan-out
+                    # from a silent count:0 into a loud, actionable signal
+                    # (Lens-B). Mirror hybrid_search's classification: a
+                    # schema-missing collection (never created / project not
+                    # analyzed / stale slug-form peer prefix) vs a generic
+                    # failure. Unreachable / auth bubble out of the try (they
+                    # apply to the whole instance, not one collection) — the
+                    # outer handlers catch them.
                     logger.warning(f"search_code_graph: {coll_name} failed: {e}")
+                    _classified = _classify_weaviate_failure(e)
+                    if isinstance(_classified, (WeaviateUnreachable, WeaviateAuthError)):
+                        raise
+                    if isinstance(_classified, WeaviateSchemaError):
+                        _cg_failed_schema.append(coll_name)
+                    else:
+                        _cg_failed_other.append((coll_name, str(e)))
             return gathered
 
         candidates = _gather_candidates(apply_layer=True)
@@ -6402,6 +6545,60 @@ async def search_code_graph(
                     "layer filter ignored — the layer property is not populated "
                     "on this index"
                 )
+
+        # Lens-B (v0.2.81): if EVERY targeted collection was absent/failed (no
+        # successful query), the empty result is NOT "no semantic matches" — it
+        # is "collections not found / project not analyzed / stale slug-form
+        # peer entry". Return a LOUD, actionable signal (mirrors hybrid_search's
+        # all-collections-failed branch + query_code_structure's not-found
+        # hint) instead of a silent `count: 0` success that hides GAP-CG-1/CG-3.
+        # Keep the per-collection soft-skip above for the some-exist case.
+        if (
+            not _cg_successful_collections
+            and (_cg_failed_schema or _cg_failed_other)
+        ):
+            _self_prefix = (
+                _code_sanitize_collection_prefix(effective_project)
+                if effective_project else "(none — cross-tenant search)"
+            )
+            _all_failed_names = _cg_failed_schema + [
+                n for n, _ in _cg_failed_other
+            ]
+            _other_detail = (
+                "; errors: "
+                + "; ".join(f"{n}: {r}" for n, r in _cg_failed_other)
+                if _cg_failed_other else ""
+            )
+            _remediation = (
+                " Next steps: (1) if this is a PEER grant, the "
+                "VCT_CODE_GRAPH_ACCESS_LIST entry must be the grantor's project "
+                "NAME (not a slug or the Weaviate collection prefix — the "
+                "slug-vs-prefix trap); (2) if the project was never analyzed, "
+                "run `.claude/scripts/code-graph-analyze . --project <name>`; "
+                "(3) verify the resolved CODE_GRAPH_PROJECT / prefix matches the "
+                "analyzer's write prefix (check the 'weaviate-kg: resolved "
+                "collections' startup log for what this MCP subprocess sees)."
+            )
+            _err_msg = (
+                f"search_code_graph: no code-graph collections found for "
+                f"project '{effective_project or '(all projects)'}' "
+                f"(resolved self-prefix '{_self_prefix}'). "
+                f"{len(_all_failed_names)} collection(s) absent/failed: "
+                f"{', '.join(_all_failed_names)}{_other_detail}.{_remediation}"
+            )
+            logger.warning(_err_msg)
+            return json.dumps(
+                {
+                    "success": False,
+                    "query": query,
+                    "scope": scope,
+                    "count": 0,
+                    "results": [],
+                    "error": _err_msg,
+                    "collections_missing": _all_failed_names,
+                },
+                indent=2,
+            )
 
         # v0.2.72 (P1/P2/P3/P4): run the SHARED pipeline — two-stage per-slot
         # floor (retrieval 0.16 / post-rerank 0.22 for CodeSage) + relationship
@@ -6763,6 +6960,19 @@ async def search_code_graph(
         if layer_note:
             # LAYER-FILTER TRAP: tell the caller the layer filter was dropped.
             response_payload["note"] = layer_note
+        # Lens-B (v0.2.81): partial fan-out — SOME collections resolved but
+        # others were absent/failed (a stale slug-form peer entry, or a peer
+        # whose code graph was never analyzed). The self results are intact, so
+        # this stays a success, but surface the skipped peers in a `degraded`
+        # note so they are VISIBLE rather than silently dropped (mirrors
+        # semantic_graph_search's degraded.schema_missing annotation).
+        if _cg_failed_schema or _cg_failed_other:
+            _degraded: dict = {}
+            if _cg_failed_schema:
+                _degraded["schema_missing"] = _cg_failed_schema
+            if _cg_failed_other:
+                _degraded["errors"] = {n: r for n, r in _cg_failed_other}
+            response_payload["degraded"] = {"failed_collections": _degraded}
         return _large_result(response_payload)
 
     except WeaviateUnreachable as exc:
@@ -7899,18 +8109,19 @@ if __name__ == "__main__":
     # progress. Breaks the Windows MCP fork-bomb (~97 python +
     # ~77 node processes the user reported on 2026-06-09) by making
     # every respawn during the update window exit immediately.
-    try:
-        from _lib.update_gate import exit_if_update_in_progress  # type: ignore
-    except ImportError:
-        _parent_dir = str(Path(__file__).resolve().parent.parent)
-        if _parent_dir not in sys.path:
-            sys.path.insert(0, _parent_dir)
-        try:
-            from _lib.update_gate import exit_if_update_in_progress  # type: ignore
-        except ImportError:
-            exit_if_update_in_progress = None  # type: ignore
-    if exit_if_update_in_progress is not None:
-        exit_if_update_in_progress("weaviate-kg MCP")
+    #
+    # v0.2.81: ``_lib.update_gate`` is SHIPPED; resolve it via the shared
+    # ``import_lib_member`` helper, which LOUD-FAILS (naming ``install.py
+    # --update``) if it's missing. The pre-fix silent
+    # ``exit_if_update_in_progress = None`` stub disabled the fork-bomb
+    # guard with no signal — the MOST dangerous of the masking stubs
+    # (it re-armed the very fork-bomb the gate prevents). ``_mcp_root``
+    # (``claude_mcp_servers/``) is already on sys.path from the module-load
+    # bootstrap; ``import_lib_member`` handles the parent-dir retry itself.
+    exit_if_update_in_progress = import_lib_member(
+        "update_gate", "exit_if_update_in_progress"
+    )
+    exit_if_update_in_progress("weaviate-kg MCP")
 
     # v0.2.74 T5-1 ROOT FIX: reap any OTHER weaviate_mcp subprocess that is
     # provably stale — cross-workspace AND (spawned by our own parent = a
@@ -7923,27 +8134,31 @@ if __name__ == "__main__":
     # simply coexist. (The per-tool-call _assert_workspace_unchanged check is
     # NOT a runtime mitigation here — a stdio MCP's env never mutates, so it
     # only guards exotic in-process env changes; see its docstring.)
+    # v0.2.81: ``vco_lib.mcp_singleton`` is SHIPPED — a failed IMPORT is a
+    # broken install → loud-fail (was: silent ``reap_stale_weaviate_mcp =
+    # None`` stub that disabled the single-instance reaper with no signal).
+    # ``vco_lib``'s parent is already on sys.path from the module-load
+    # guards; retry the parent-dir insert defensively before the loud-fail.
+    _vco_lib_parent_for_reap = str(Path(__file__).resolve().parent.parent.parent)
+    if _vco_lib_parent_for_reap not in sys.path:
+        sys.path.insert(0, _vco_lib_parent_for_reap)
     try:
         from vco_lib.mcp_singleton import reap_stale_weaviate_mcp  # type: ignore
-    except ImportError:
-        _parent_dir = str(Path(__file__).resolve().parent.parent.parent)
-        if _parent_dir not in sys.path:
-            sys.path.insert(0, _parent_dir)
-        try:
-            from vco_lib.mcp_singleton import reap_stale_weaviate_mcp  # type: ignore
-        except ImportError:
-            reap_stale_weaviate_mcp = None  # type: ignore
-    if reap_stale_weaviate_mcp is not None:
-        try:
-            _reaped = reap_stale_weaviate_mcp(_MODULE_LOAD_WORKSPACE)
-            if _reaped:
-                logger.info(
-                    "weaviate-kg: reaped %d stale weaviate_mcp subprocess(es) "
-                    "for a clean single-instance-per-workspace start (T5-1).",
-                    _reaped,
-                )
-        except Exception as _reap_exc:  # noqa: BLE001 — never block startup
-            logger.debug("weaviate-kg: stale-MCP reap raised (%s); continuing", _reap_exc)
+    except ImportError as _singleton_import_err:
+        _reraise_vco_lib_import(_singleton_import_err, "mcp_singleton.reap_stale_weaviate_mcp")
+    # The IMPORT loud-fails above; the RUNTIME reap stays best-effort per its
+    # docstring (a failed reap — e.g. no reapable peers, permission — must
+    # never block THIS process from starting).
+    try:
+        _reaped = reap_stale_weaviate_mcp(_MODULE_LOAD_WORKSPACE)
+        if _reaped:
+            logger.info(
+                "weaviate-kg: reaped %d stale weaviate_mcp subprocess(es) "
+                "for a clean single-instance-per-workspace start (T5-1).",
+                _reaped,
+            )
+    except Exception as _reap_exc:  # noqa: BLE001 — never block startup
+        logger.debug("weaviate-kg: stale-MCP reap raised (%s); continuing", _reap_exc)
 
     logger.info(f"Starting Claude Orchestrator Weaviate MCP Server")
     logger.info(f"Primary Collection: {KG_COLLECTION}")

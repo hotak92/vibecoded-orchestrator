@@ -7,45 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-- **Cross-project code-graph access now works for projects whose name differs
-  from their slug (the normal case).** The two `VCT_CODE_GRAPH_ACCESS_LIST`
-  producers (the Python config projection and the vct-hub `/config` resolver)
-  emitted grantor **slugs**, but the MCP/CLI consumer rebuilds each peer's
-  Weaviate class prefix + `project` filter from the grantor **name** (what the
-  analyzer wrote). For any project with a space/hyphen/dot in its name, the
-  slug diverged on both derived values → the peer's collections were never
-  found and cross-project `search_code_graph` / `query_code_structure`
-  silently returned zero peer rows. Both producers now emit grantor NAMES
-  (converging on the diagrams access-list resolver, which already did). No DB
-  schema change. **Remediation for existing installs:** re-run a bundle update
-  or any launcher env refresh (or `python -m vco_lib.config_projection
-  reproject-all`) to re-project the access list into name form; the
-  orchestrator update flow migrates every registered project automatically.
-- **`search_code_graph` now distinguishes "no matches" from "collections not
-  found."** When every targeted code-graph collection is missing (project never
-  analyzed, or a stale slug-form peer entry), the tool returns a LOUD, actionable
-  error naming the resolved prefix + failed collections + remediation, instead
-  of a silent `count: 0` success. Partial fan-out surfaces skipped peers in a
-  `degraded.schema_missing` note. Genuinely-empty-but-existing collections still
-  return a clean `count: 0`.
-- **The vct-hub code-graph prefix FALLBACK (no binding row) now derives from the
-  project NAME via the canonical rule**, matching the analyzer's write prefix,
-  instead of a divergent inline sanitizer over the slug — closing a latent
-  silent-zero when the binding row is briefly absent (race / corrupted DB). The
-  `canonical_class_prefix` sanitizer was promoted into `vct-launcher-core` so the
-  hub can call the single source of truth (no third mirror).
-- **weaviate-kg MCP: broken-install import masking removed.** The bare-script
-  launch now aliases the repo-root package keys (`claude_mcp_servers.weaviate_mcp
-  .server`) to the one running server object so the paid-tier RL client can't
-  re-execute server.py as a second module; the `vco_lib.*` / `_lib.*` import
-  guards (embedding service, sanitizers, project config, update gate, singleton
-  reaper, SIGHUP handler) now LOUD-FAIL on a broken install (naming `install.py
-  --update`) instead of silently degrading to inline-legacy bodies / no-op stubs.
-  Legitimate runtime degrades (hub-unreachable → env fallback, pathological name
-  → dropping sanitizer, per-call embed-backend fallback, RL paid-module absence)
-  are preserved.
-
 ## [0.2.80] - 2026-07-13
 
 ### Security
@@ -110,6 +71,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   be judged differently on different platforms. Python now splits on `\n`/`\r`
   only, matching the mirrors and the documented contract, and the parity fixture
   now covers these cases so the three can never drift.
+
+- **Cross-project code-graph access now works for projects whose name differs
+  from their slug (the normal case).** The two `VCT_CODE_GRAPH_ACCESS_LIST`
+  producers (the Python config projection and the vct-hub `/config` resolver)
+  emitted grantor **slugs**, but the MCP/CLI consumer rebuilds each peer's
+  Weaviate class prefix + `project` filter from the grantor **name** (what the
+  analyzer wrote). For any project with a space/hyphen/dot in its name, the
+  slug diverged on both derived values → the peer's collections were never
+  found and cross-project `search_code_graph` / `query_code_structure`
+  silently returned zero peer rows. Both producers now emit grantor NAMES
+  (converging on the diagrams access-list resolver, which already did). No DB
+  schema change. **Remediation for existing installs:** re-run a bundle update
+  or any launcher env refresh (or `python -m vco_lib.config_projection
+  reproject-all`) to re-project the access list into name form; the
+  orchestrator update flow migrates every registered project automatically.
+- **`search_code_graph` now distinguishes "no matches" from "collections not
+  found."** When every targeted code-graph collection is missing (project never
+  analyzed, or a stale slug-form peer entry), the tool returns a LOUD, actionable
+  error naming the resolved prefix + failed collections + remediation, instead
+  of a silent `count: 0` success. Partial fan-out surfaces skipped peers in a
+  `degraded.schema_missing` note. Genuinely-empty-but-existing collections still
+  return a clean `count: 0`.
+- **The vct-hub code-graph prefix FALLBACK (no binding row) now derives from the
+  project NAME via the canonical rule**, matching the analyzer's write prefix,
+  instead of a divergent inline sanitizer over the slug — closing a latent
+  silent-zero when the binding row is briefly absent (race / corrupted DB). The
+  `canonical_class_prefix` sanitizer was promoted into `vct-launcher-core` so the
+  hub can call the single source of truth (no third mirror).
+- **weaviate-kg MCP: broken-install import masking removed.** The bare-script
+  launch now aliases the repo-root package keys (`claude_mcp_servers.weaviate_mcp
+  .server`) to the one running server object so the paid-tier RL client can't
+  re-execute server.py as a second module; the `vco_lib.*` / `_lib.*` import
+  guards (embedding service, sanitizers, project config, update gate, singleton
+  reaper, SIGHUP handler) now LOUD-FAIL on a broken install (naming `install.py
+  --update`) instead of silently degrading to inline-legacy bodies / no-op stubs.
+  Legitimate runtime degrades (hub-unreachable → env fallback, pathological name
+  → dropping sanitizer, per-call embed-backend fallback, RL paid-module absence)
+  are preserved.
 
 ## [0.2.79] - 2026-07-12
 

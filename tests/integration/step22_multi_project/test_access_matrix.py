@@ -12,8 +12,9 @@ projects + asymmetric access-matrix rows, then proves that:
    collections that project's ``kg_collection_access`` rows + its
    own primary KG binding would imply — and NOTHING else.
 3. The ``codegraph_access_list`` for each project matches EXACTLY
-   the grantor slugs that ``codegraph_access`` rows + its own slug
-   would imply — and NOTHING else.
+   the grantor NAMES that ``codegraph_access`` rows + its own name
+   would imply — and NOTHING else (GAP-CG-1 fix 2026-07-14: was
+   grantor slugs; the consumer needs the analyzer-stamped NAME).
 4. The single-field key= shortcut produces identical results to the
    full envelope (no client-side reassembly drift).
 5. The resolver client script ``vct_project_config.sh`` returns the
@@ -21,7 +22,7 @@ projects + asymmetric access-matrix rows, then proves that:
 6. The 'none' access-level rows are filtered out of `kg_access_list`
    (explicit-deny pathway).
 7. Cross-project codegraph reads stay scoped per the grant matrix —
-   ``codegraph_access_list`` contains the GRANTOR's slug (because B
+   ``codegraph_access_list`` contains the GRANTOR's NAME (because B
    was granted read on A's codegraph), not the GRANTEE's.
 
 These 7 assertions together cover acceptance criterion properties
@@ -50,6 +51,7 @@ if str(_TESTS_DIR.parent) not in sys.path:
 
 from tests.common.sandbox import compute_run_id, teardown_sandbox  # noqa: E402
 from tests.integration.step22_multi_project.fixture import (  # noqa: E402
+    CANONICAL_PROJECTS,
     FixtureResult,
     HubProc,
     ProjectSpec,
@@ -199,15 +201,34 @@ def _expected_kg_access_list(
 def _expected_codegraph_access_list(project: ProjectSpec) -> list[str]:
     """Compute the resolver's expected codegraph_access_list.
 
+    GAP-CG-1 fix (2026-07-14): the list carries grantor display NAMES,
+    not slugs — the consumer rebuilds each peer's Weaviate class prefix +
+    ``project`` filter from the NAME the analyzer wrote (a slug diverges
+    on both). The step22 fixture's projects already have two-token
+    display names that differ from their slugs (``"Project A (Alpha)"``
+    vs ``proj-a-alpha``), so this assertion now genuinely exercises the
+    slug≠name divergence the fix closes.
+
     From fixture.py: A grants B read on A's codegraph (and that's
-    the only grant). So:
-        A receives nothing → [A]              (own slug only)
-        B receives [A] (from A) → [A, B]      (with own slug added)
-        C receives nothing → [C]              (own slug only)
+    the only grant). So (by NAME):
+        A receives nothing → [A]              (own name only)
+        B receives [A] (from A) → [A, B]      (with own name added)
+        C receives nothing → [C]              (own name only)
     """
+    a = _spec_by_slug("proj-a-alpha")
+    b = _spec_by_slug("proj-b-beta")
     if project.slug == "proj-b-beta":
-        return sorted(["proj-a-alpha", "proj-b-beta"])
-    return [project.slug]
+        return sorted([a.display_name, b.display_name])
+    return [project.display_name]
+
+
+def _spec_by_slug(slug: str) -> ProjectSpec:
+    """Look up a canonical fixture ProjectSpec by slug (module-level so the
+    expectation helper can resolve grantor NAMES from their slugs)."""
+    for spec in CANONICAL_PROJECTS:
+        if spec.slug == slug:
+            return spec
+    raise KeyError(slug)
 
 
 # ─── Tests ───────────────────────────────────────────────────────
@@ -314,17 +335,22 @@ def test_kg_access_list_filters_explicit_none_rows(
 def test_codegraph_access_list_matches_grant_matrix(
     fixture_result: FixtureResult, hub: HubProc
 ) -> None:
-    """Property (6) — codegraph_access_list contains GRANTOR slugs
-    (not grantee), plus own slug, sorted + deduped.
+    """Property (6) — codegraph_access_list contains GRANTOR NAMES
+    (not grantee), plus own name, sorted + deduped. GAP-CG-1 fix
+    (2026-07-14): was grantor slugs; the consumer rebuilds each peer's
+    prefix + project filter from the analyzer-stamped NAME, so the list
+    must carry NAMES. The fixture's two-token display names
+    (``"Project A (Alpha)"`` vs slug ``proj-a-alpha``) make this
+    assertion exercise the slug≠name divergence the fix closes.
 
-    The grant in fixture.py is A→B (A grants B read). So:
-        * B's list MUST contain 'proj-a-alpha' (the grantor it reads from).
-        * A's list MUST NOT contain 'proj-b-beta' (A is the grantor,
+    The grant in fixture.py is A→B (A grants B read). So (by NAME):
+        * B's list MUST contain 'Project A (Alpha)' (the grantor it reads).
+        * A's list MUST NOT contain 'Project B (Beta)' (A is the grantor,
           and B has not granted A back).
         * C's list MUST NOT contain either A or B (no grants involve C).
 
     Catches the common direction-flip bug where grantor + grantee
-    are swapped in the JOIN."""
+    are swapped in the JOIN, AND the GAP-CG-1 identity-form bug."""
     for p in fixture_result.projects:
         status, body = _hub_get(
             hub, f"projects/{p.project_id}/config", project_id=p.project_id

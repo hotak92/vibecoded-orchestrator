@@ -42,6 +42,7 @@ from vco_lib.config_projection import (
     list_canonical_keys,
     list_registered_projects,
     project_env_from_db,
+    reproject_all_registered_projects,
     resolve_project_folder,
 )
 
@@ -761,8 +762,15 @@ def test_from_db_kg_access_list_strips_self_and_shared(tmp_path: Path) -> None:
 
 
 def test_from_db_codegraph_access_list(tmp_path: Path) -> None:
-    """``VCT_CODE_GRAPH_ACCESS_LIST`` carries the grantor project slugs
-    (sorted+deduped, no self)."""
+    """``VCT_CODE_GRAPH_ACCESS_LIST`` carries the grantor project NAMES
+    (sorted+deduped, no self) — GAP-CG-1 fix 2026-07-14.
+
+    The analyzer writes each project's Code* classes under
+    ``canonical_class_prefix(NAME)`` and stamps ``project`` = NAME, and
+    the MCP/CLI consumer sanitises each list entry through the same
+    canonical rule to rebuild the peer's prefix + filter. Emitting slugs
+    (lowercased/hyphenated) diverged from both derived values → silent
+    zero peer results. Names make writer/reader agree."""
     db = tmp_path / "launcher.db"
     proj = tmp_path / "p"
     proj.mkdir()
@@ -779,13 +787,157 @@ def test_from_db_codegraph_access_list(tmp_path: Path) -> None:
         ],
     )
     env = project_env_from_db("grantee", db_path=db)["canonical_env"]
-    assert env["VCT_CODE_GRAPH_ACCESS_LIST"] == "alpha,beta"
+    assert env["VCT_CODE_GRAPH_ACCESS_LIST"] == "Alpha,Beta"
+
+
+def test_from_db_codegraph_access_list_two_token_name_slug_diverges(
+    tmp_path: Path,
+) -> None:
+    """GAP-CG-2 regression: a grantor whose NAME differs from its SLUG
+    (a two-token / spaced name) must surface the NAME in the access
+    list, never the slug. This is the fixture that actually exercises the
+    slug≠name divergence GAP-CG-1 fixed — single-token fixtures (where
+    slug == name) never manifest the bug.
+
+    Name ``"Proj A Alpha"`` → analyzer prefix ``ProjAAlpha`` + filter
+    ``Proj A Alpha``; slug ``proj-a-alpha`` → reader prefix
+    ``Proj_a_alpha`` + filter ``proj-a-alpha``. Emitting the NAME is the
+    only form the consumer can rebuild the write prefix + filter from."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="grantee", project_name="Grantee",
+        project_folder=str(proj), project_slug="grantee",
+        extra_projects=[
+            ("a", "Proj A Alpha", "/tmp/a", "proj-a-alpha"),
+            ("b", "Beta", "/tmp/b", "beta"),
+        ],
+        codegraph_access=[
+            ("a", "read"),
+            ("b", "read"),
+        ],
+    )
+    env = project_env_from_db("grantee", db_path=db)["canonical_env"]
+    # The two-token NAME (with spaces) is carried verbatim — NOT the
+    # hyphenated slug ``proj-a-alpha``.
+    assert env["VCT_CODE_GRAPH_ACCESS_LIST"] == "Beta,Proj A Alpha"
+    assert "proj-a-alpha" not in env["VCT_CODE_GRAPH_ACCESS_LIST"]
+
+
+# ─── GAP-CG-1 update-time migration: reproject_all_registered_projects ────
+
+
+def test_reproject_all_migrates_stale_slug_access_list_to_names(
+    tmp_path: Path,
+) -> None:
+    """UPDATE-TIME MIGRATION (USER decision 2026-07-14): re-projecting all
+    registered projects OVERWRITES a stale slug-form
+    VCT_CODE_GRAPH_ACCESS_LIST with the name-form value on disk. This is
+    the migration + cleanup in one pass — the stale slug value only lives
+    in the env surface this pass rewrites, so it is gone the moment
+    migration succeeds. No separate dead-data deletion step needed."""
+    db = tmp_path / "launcher.db"
+    grantee = tmp_path / "grantee"
+    grantee.mkdir()
+    claude = grantee / ".claude"
+    claude.mkdir()
+    # Pre-seed a STALE settings.json carrying the retired slug-form value.
+    (claude / "settings.json").write_text(
+        json.dumps(
+            {"env": {"VCT_CODE_GRAPH_ACCESS_LIST": "proj-a-alpha,beta"}}
+        ),
+        encoding="utf-8",
+    )
+    _make_launcher_db(
+        db, project_id="grantee", project_name="Grantee",
+        project_folder=str(grantee), project_slug="grantee",
+        extra_projects=[
+            ("a", "Proj A Alpha", "/tmp/a", "proj-a-alpha"),
+            ("b", "Beta", "/tmp/b", "beta"),
+        ],
+        codegraph_access=[("a", "read"), ("b", "read")],
+    )
+
+    outcomes = reproject_all_registered_projects(
+        db_path=db, surfaces=["claude_settings_json"]
+    )
+
+    # Every registered project attempted; grantee migrated. (The extra
+    # projects "a"/"b" have folder_path /tmp/a,/tmp/b which do not exist —
+    # their apply may fail, but that MUST NOT abort the grantee migration.)
+    grantee_outcome = next(o for o in outcomes if o["project_id"] == "grantee")
+    assert grantee_outcome["status"] == "migrated"
+
+    data = json.loads((claude / "settings.json").read_text())
+    # Migrated from stale slug-form → name-form. Slug is GONE.
+    assert data["env"]["VCT_CODE_GRAPH_ACCESS_LIST"] == "Beta,Proj A Alpha"
+    assert "proj-a-alpha" not in data["env"]["VCT_CODE_GRAPH_ACCESS_LIST"]
+
+
+def test_reproject_all_defers_on_per_project_failure_without_aborting(
+    tmp_path: Path,
+) -> None:
+    """USER decision 2026-07-14: on ANY per-project failure, emit a
+    deferral naming the project — never a silent half-migration. One
+    project's failure must NOT abort the sweep."""
+    from vco_lib.deferral_report import DeferralReport
+
+    db = tmp_path / "launcher.db"
+    good = tmp_path / "good"
+    good.mkdir()
+    (good / ".claude").mkdir()
+    # "bad" project's folder_path points at a NON-EXISTENT path so its
+    # apply_project_env write fails (can't create the .claude dir under a
+    # missing parent tree with a file in the way).
+    bad_folder = tmp_path / "bad_missing" / "nested" / "deeper"
+    # Create a FILE where "bad_missing" should be a dir → mkdir fails.
+    (tmp_path / "bad_missing").write_text("not a dir", encoding="utf-8")
+
+    _make_launcher_db(
+        db, project_id="good", project_name="Good",
+        project_folder=str(good), project_slug="good",
+        extra_projects=[
+            ("bad", "Bad Project", str(bad_folder), "bad-project"),
+        ],
+    )
+
+    report = DeferralReport()
+    outcomes = reproject_all_registered_projects(
+        db_path=db,
+        surfaces=["claude_settings_json"],
+        deferral_report=report,
+    )
+
+    by_id = {o["project_id"]: o for o in outcomes}
+    # Sweep did NOT abort: the good project still migrated.
+    assert by_id["good"]["status"] == "migrated"
+    # The bad project failed and got a deferral naming it.
+    assert by_id["bad"]["status"] == "failed"
+    entries = report.entries
+    assert any(
+        e.condition_id == "codegraph_access_list_reprojection_failed"
+        and "Bad Project" in (e.title + e.detected)
+        for e in entries
+    ), f"expected a per-project deferral naming 'Bad Project'; got {entries}"
+
+
+def test_reproject_all_db_unreachable_raises(tmp_path: Path) -> None:
+    """A missing launcher DB is a whole-sweep precondition failure (the
+    'launcher never booted' case) — raises DbUnreachable so the update
+    flow can no-op, distinct from a per-project failure (which is
+    caught + deferred)."""
+    with pytest.raises(DbUnreachable):
+        reproject_all_registered_projects(
+            db_path=tmp_path / "does-not-exist.db"
+        )
 
 
 def test_from_db_diagram_access_list_emits_grantor_names(tmp_path: Path) -> None:
     """v0.2.34 A7: ``VCT_DIAGRAMS_ACCESS_LIST`` carries grantor project
-    NAMES (display names — distinct from VCT_CODE_GRAPH_ACCESS_LIST
-    which carries slugs)."""
+    NAMES (display names). Since GAP-CG-1 (2026-07-14)
+    ``VCT_CODE_GRAPH_ACCESS_LIST`` carries NAMES too — the two
+    access-list resolvers now agree on the identity form."""
     db = tmp_path / "launcher.db"
     proj = tmp_path / "p"
     proj.mkdir()
