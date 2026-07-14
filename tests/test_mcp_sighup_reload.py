@@ -173,24 +173,53 @@ class SighupTriggersCleanExitTest(unittest.TestCase):
 class McpServersWireSighupHandlerTest(unittest.TestCase):
     """Regression guard: both shipped MCPs MUST register the handler.
 
-    A future refactor that drops the import or the
-    ``register_sighup_exit_handler(logger)`` call would silently break
-    the env-reload UX. Static grep catches that at test time.
+    A future refactor that drops the handler REGISTRATION (the
+    ``register_sighup_exit_handler(logger)`` call) or the RESOLUTION of
+    that function would silently break the env-reload UX. Static grep
+    catches that at test time.
+
+    v0.2.81 re-anchor: search_mcp now RESOLVES the handler through the
+    shared ``_lib.bootstrap.import_lib_member`` helper (loud-fail on a
+    missing shipped ``_lib``) instead of the direct
+    ``from _lib.sighup_handler import ...`` line, so the resolution marker
+    is now per-server. The INTENT is unchanged (the handler is wired +
+    called); the assertion just accepts EITHER resolution mechanism.
+    weaviate_mcp still uses the direct import — its marker is unchanged.
     """
 
-    EXPECTED_IMPORT_MARKERS = (
+    # The call marker is invariant across both servers.
+    CALL_MARKER = "register_sighup_exit_handler(logger)"
+    # Either the direct import OR the shared-helper resolution proves the
+    # function is genuinely resolved before it is called. Matched against a
+    # whitespace-collapsed copy of the source so line-wrapping / indentation
+    # of the ``import_lib_member(...)`` call can't make the marker fragile
+    # (the exact fragility the KG monolith-extraction hazard node warns
+    # about for source-grepping structural tests).
+    RESOLUTION_MARKERS = (
         "from _lib.sighup_handler import register_sighup_exit_handler",
-        "register_sighup_exit_handler(logger)",
+        'import_lib_member( "sighup_handler", "register_sighup_exit_handler" )',
+        'import_lib_member("sighup_handler", "register_sighup_exit_handler")',
     )
+
+    @staticmethod
+    def _collapse_ws(text: str) -> str:
+        return " ".join(text.split())
 
     def _assert_wires_handler(self, server_path: Path) -> None:
         text = server_path.read_text(encoding="utf-8")
-        for marker in self.EXPECTED_IMPORT_MARKERS:
-            self.assertIn(
-                marker,
-                text,
-                f"{server_path.relative_to(REPO_ROOT)} missing PR-42 marker: {marker!r}",
-            )
+        self.assertIn(
+            self.CALL_MARKER,
+            text,
+            f"{server_path.relative_to(REPO_ROOT)} missing PR-42 call marker: "
+            f"{self.CALL_MARKER!r}",
+        )
+        collapsed = self._collapse_ws(text)
+        self.assertTrue(
+            any(self._collapse_ws(m) in collapsed for m in self.RESOLUTION_MARKERS),
+            f"{server_path.relative_to(REPO_ROOT)} does not resolve "
+            f"register_sighup_exit_handler via a direct import or the shared "
+            f"_lib.bootstrap.import_lib_member helper",
+        )
 
     def test_weaviate_mcp_wires_handler(self) -> None:
         self._assert_wires_handler(MCP_DIR / "weaviate_mcp" / "server.py")

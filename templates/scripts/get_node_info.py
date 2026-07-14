@@ -74,9 +74,18 @@ except Exception:
             out.append(shared_kg)
         return out
 
-# Try to import query logger
+# Try to import query logger.
+#
+# v0.2.81 FN-2: target the SHIPPED `weaviate_mcp.query_logger` package
+# module. The pre-fix bare `from query_logger import ...` could never
+# resolve on a standard install (no `weaviate_mcp/` dir on sys.path;
+# weaviate_mcp is pip-installed editable) → HAS_LOGGER silently False on
+# every install → kg-info telemetry lost. The guard is retained because
+# telemetry is optional-by-design (a partial install must still answer
+# `info`/`connections`); with the package target it passes on every
+# healthy install and only trips on a broken one.
 try:
-    from query_logger import ToolUsageLogger
+    from weaviate_mcp.query_logger import ToolUsageLogger
     HAS_LOGGER = True
 except Exception as e:
     HAS_LOGGER = False

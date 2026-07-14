@@ -117,10 +117,18 @@ from vco_lib.embedding_service import (
     NoEmbeddingBackendError,
 )
 
-# Try to import query logger
+# Try to import query logger.
+#
+# v0.2.81 FN-2: target the SHIPPED `weaviate_mcp.query_logger` package
+# module and DROP the dead `.claude/logs` sys.path insert — that dir holds
+# no query_logger.py, so the pre-fix bare `from query_logger import ...`
+# could never resolve → HAS_LOGGER silently False on every install → every
+# kg-sync (the hook that fires on knowledge/ edits) lost its telemetry
+# row. The guard is retained because telemetry is optional-by-design (a
+# partial install must still sync the node); with the package target it
+# passes on every healthy install and only trips on a broken one.
 try:
-    sys.path.insert(0, str(_PROJECT_HOME / ".claude" / "logs"))
-    from query_logger import ToolUsageLogger
+    from weaviate_mcp.query_logger import ToolUsageLogger
     HAS_LOGGER = True
 except Exception as e:
     HAS_LOGGER = False

@@ -120,7 +120,7 @@ Ollama silently truncates input beyond an embedder's effective context, so chunk
 ### Chunking for Large Documents
 
 ```python
-from chunking import Chunker, TokenCounter
+from weaviate_mcp.chunking import Chunker, TokenCounter
 import uuid
 
 # for_model() resolves the per-model budget; the Chunker derives min/max/target from it

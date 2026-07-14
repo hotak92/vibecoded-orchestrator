@@ -1037,7 +1037,7 @@
     "summary": "Weaviate with Ollama embeddings enforces per-model token budgets (10k for `qwen3-embedding:0.6b`, 4k for `snowflake-arctic-embed2`) that silently truncate oversize input; documents exceeding the budget must be chunked with shared metadata and a `source_node_id` UUID for deduplication during semantic search queries.",
     "generated_at": "2026-06-27T17:54:24.052249+00:00",
     "backend": "cli",
-    "content_hash": "9da2a2b00fd28760",
+    "content_hash": "72f4031692e2fb5b",
     "total_chunks": 1
   },
   "knowledge/tools/weaviate.md": {
@@ -1049,7 +1049,7 @@
     "chunk_summaries": {
       "1.0": "Introduces Weaviate as an open-source vector database for semantic search, covering four core capabilities: HNSW-based similarity search, property filtering with GraphQL/gRPC, knowledge graph relationships, and multi-tenant namespace isolation."
     },
-    "content_hash": "cf829145fe1cb37f",
+    "content_hash": "5afa0e65da462d91",
     "total_chunks": 7
   }
 }

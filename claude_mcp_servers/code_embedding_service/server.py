@@ -609,19 +609,23 @@ if __name__ == "__main__":
     # progress. Same shape as the MCP server gates — prevents the
     # ensure-containers hook from spawning a GPU model load mid-update,
     # which would race the launcher's binary refresh.
-    try:
-        from _lib.update_gate import exit_if_update_in_progress  # type: ignore
-    except ImportError:
-        from pathlib import Path as _Path
-        _parent_dir = str(_Path(__file__).resolve().parent.parent)
-        if _parent_dir not in sys.path:
-            sys.path.insert(0, _parent_dir)
-        try:
-            from _lib.update_gate import exit_if_update_in_progress  # type: ignore
-        except ImportError:
-            exit_if_update_in_progress = None  # type: ignore
-    if exit_if_update_in_progress is not None:
-        exit_if_update_in_progress("code-embedding service")
+    #
+    # `_lib.update_gate` is SHIPPED; import_lib_member LOUD-FAILS if it's
+    # missing. The pre-fix silent `exit_if_update_in_progress = None` stub
+    # disabled the mid-update GPU-load guard on the exact broken-install
+    # path most likely to be mid-update. When this service runs as a bare
+    # script (container / ensure-containers hook) sys.path[0] is the
+    # server's own dir, so the parent (claude_mcp_servers/) must be
+    # inserted for `_lib` to resolve.
+    from pathlib import Path as _Path
+    _mcp_root = str(_Path(__file__).resolve().parent.parent)
+    if _mcp_root not in sys.path:
+        sys.path.insert(0, _mcp_root)
+    from _lib.bootstrap import import_lib_member
+    exit_if_update_in_progress = import_lib_member(
+        "update_gate", "exit_if_update_in_progress"
+    )
+    exit_if_update_in_progress("code-embedding service")
 
     # Detect import path: standalone (container) vs package (python -m ...)
     try:

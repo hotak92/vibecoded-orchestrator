@@ -270,5 +270,144 @@ class CliCallSiteContractTests(unittest.TestCase):
                 )
 
 
+class QueryLoggerImportTargetTests(unittest.TestCase):
+    """v0.2.81 FN-2 — the three KG CLIs import ToolUsageLogger from the
+    SHIPPED ``weaviate_mcp.query_logger`` package module, NOT the dead
+    bare ``query_logger`` top-level name.
+
+    Pre-fix all three did ``from query_logger import ToolUsageLogger``,
+    which could NEVER resolve on a standard install (no ``weaviate_mcp/``
+    dir on sys.path; ``weaviate_mcp`` is pip-installed as an editable
+    package). So ``HAS_LOGGER`` was silently ``False`` on EVERY install →
+    the kg-search / kg-info / kg-sync telemetry rows (tool_usage.jsonl,
+    consumed by RL + analytics) were never written. The guarded
+    ``try/except`` is retained (telemetry is optional-by-design at the CLI
+    level — a partial / free-tier install without the orchestrator venv
+    must still search/sync), but the import TARGET must be the package
+    path so it actually resolves on every healthy install.
+
+    These are source-text scans (the scripts talk to a live Weaviate;
+    exec'ing them in a unit test is not cheap) that pin the import target
+    so the dead bare import can't regress.
+    """
+
+    SCRIPTS = (
+        "templates/scripts/search_knowledge.py",
+        "templates/scripts/get_node_info.py",
+        "templates/scripts/sync_knowledge_graph.py",
+    )
+
+    def test_each_script_imports_query_logger_from_package(self) -> None:
+        for rel in self.SCRIPTS:
+            with self.subTest(script=rel):
+                src = (REPO_ROOT / rel).read_text(encoding="utf-8")
+                self.assertIn(
+                    "from weaviate_mcp.query_logger import ToolUsageLogger",
+                    src,
+                    f"{rel}: must import ToolUsageLogger from the shipped "
+                    f"weaviate_mcp.query_logger package",
+                )
+
+    def test_no_dead_bare_query_logger_import(self) -> None:
+        """No script may keep the dead bare ``from query_logger import``
+        as an actual import statement (comments naming it are fine)."""
+        import re
+
+        # Match a real import statement at line start (optionally indented),
+        # not a mention inside a `#`-comment line.
+        pat = re.compile(r"^\s*from query_logger import ", re.MULTILINE)
+        for rel in self.SCRIPTS:
+            with self.subTest(script=rel):
+                src = (REPO_ROOT / rel).read_text(encoding="utf-8")
+                self.assertIsNone(
+                    pat.search(src),
+                    f"{rel}: dead bare `from query_logger import` "
+                    f"must not be an import statement (use "
+                    f"`from weaviate_mcp.query_logger import ...`)",
+                )
+
+    def test_import_target_actually_resolves(self) -> None:
+        """The package import the scripts now use must be importable in a
+        healthy install — so the dead-import fix genuinely restores
+        telemetry rather than swapping one unresolvable name for another.
+        """
+        mcp_dir = REPO_ROOT / "claude_mcp_servers"
+        if str(mcp_dir) not in sys.path:
+            sys.path.insert(0, str(mcp_dir))
+        from weaviate_mcp.query_logger import ToolUsageLogger  # noqa: F401
+
+        # The three log_kg_* classmethods the CLIs call must exist on it.
+        for method in ("log_kg_search", "log_kg_info", "log_kg_sync"):
+            self.assertTrue(
+                hasattr(ToolUsageLogger, method),
+                f"ToolUsageLogger missing {method} (API drift)",
+            )
+
+    def test_sync_dropped_dead_claude_logs_syspath_insert(self) -> None:
+        """FN-2 also removed the dead ``.claude/logs`` sys.path insert in
+        sync_knowledge_graph.py — that dir never held query_logger.py, so
+        the insert only added a nonexistent path before an import that
+        would fail anyway. Guard against it creeping back."""
+        src = (REPO_ROOT / "templates/scripts/sync_knowledge_graph.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn(
+            'sys.path.insert(0, str(_PROJECT_HOME / ".claude" / "logs"))',
+            src,
+            "sync_knowledge_graph.py must not re-add the dead .claude/logs "
+            "sys.path insert",
+        )
+
+
+class ProcessDocumentsChunkingImportTests(unittest.TestCase):
+    """v0.2.81 FN-1 — process_documents.py must import chunking from the
+    ``weaviate_mcp.chunking`` PACKAGE, not the top-level ``chunking`` name,
+    and must NOT put ``weaviate_mcp/`` (the package DIR) on sys.path.
+
+    Putting the package dir on sys.path made ``chunking`` importable as a
+    TOP-LEVEL module (``from chunking import ...``) while the script's own
+    ``sync_knowledge_graph`` import pulls the SAME source file as the
+    ``weaviate_mcp.chunking`` submodule — two distinct module objects for
+    one file (``weaviate_mcp.chunking is not chunking``). That
+    dual-module-object hazard is the same class the ``10f418d7``
+    package-identity fix eliminated for the MCP server; process_documents.py
+    is a bare-script CLI that hit it too.
+    """
+
+    SCRIPT = "templates/scripts/process_documents.py"
+
+    def test_imports_chunking_from_package(self) -> None:
+        src = (REPO_ROOT / self.SCRIPT).read_text(encoding="utf-8")
+        self.assertIn(
+            "from weaviate_mcp.chunking import chunk_text, TokenCounter",
+            src,
+            "process_documents.py must import chunk_text/TokenCounter from "
+            "the weaviate_mcp.chunking package",
+        )
+
+    def test_no_toplevel_chunking_import(self) -> None:
+        import re
+
+        pat = re.compile(r"^\s*from chunking import ", re.MULTILINE)
+        src = (REPO_ROOT / self.SCRIPT).read_text(encoding="utf-8")
+        self.assertIsNone(
+            pat.search(src),
+            "process_documents.py must not import the top-level `chunking` "
+            "module (dual-module-object hazard)",
+        )
+
+    def test_does_not_put_weaviate_mcp_package_dir_on_syspath(self) -> None:
+        """The identity-safe pattern inserts the PARENT
+        (claude_mcp_servers/) so the PACKAGE resolves — never the package
+        dir itself (which would re-enable top-level submodule imports)."""
+        src = (REPO_ROOT / self.SCRIPT).read_text(encoding="utf-8")
+        self.assertNotIn(
+            'sys.path.insert(0, str(_MCP_DIR / "weaviate_mcp"))',
+            src,
+            "process_documents.py must not put the weaviate_mcp/ package "
+            "dir on sys.path (re-introduces the dual-module-object hazard)",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

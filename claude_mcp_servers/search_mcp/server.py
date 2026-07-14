@@ -48,20 +48,23 @@ logger = logging.getLogger(__name__)
 # `.claude/settings.json env`. The handler exits cleanly with code 0;
 # Claude Code respawns us on the next request with fresh env. See
 # claude_mcp_servers/_lib/sighup_handler.py for the full design rationale.
-try:
-    from _lib.sighup_handler import register_sighup_exit_handler  # type: ignore
-except ImportError:
-    # Make `_lib` resolvable when this file is run as a script via
-    # `python <install>/claude_mcp_servers/search_mcp/server.py`.
-    _parent_dir = str(Path(__file__).resolve().parent.parent)
-    if _parent_dir not in sys.path:
-        sys.path.insert(0, _parent_dir)
-    try:
-        from _lib.sighup_handler import register_sighup_exit_handler  # type: ignore
-    except ImportError:
-        # _lib missing entirely (e.g. partial install) — soft-fail.
-        def register_sighup_exit_handler(_logger):  # type: ignore[no-redef]
-            return False
+#
+# `_lib` is a SHIPPED component of every healthy install. When this file
+# runs as a bare script (`python <install>/claude_mcp_servers/search_mcp/
+# server.py`) sys.path[0] is the server's OWN dir, so the parent dir
+# (claude_mcp_servers/) must be inserted first for `_lib` to resolve at
+# all. That minimal insert is the ONLY thing done inline; the shared
+# `_lib.bootstrap.import_lib_member` then owns the retry+LOUD-FAIL for the
+# real member import (a missing `_lib` = broken install; the pre-fix
+# silent `register_sighup_exit_handler → False` stub masked that and
+# disabled SIGHUP env-reload with no signal).
+_mcp_root = str(Path(__file__).resolve().parent.parent)  # …/claude_mcp_servers
+if _mcp_root not in sys.path:
+    sys.path.insert(0, _mcp_root)
+from _lib.bootstrap import import_lib_member  # noqa: E402
+register_sighup_exit_handler = import_lib_member(
+    "sighup_handler", "register_sighup_exit_handler"
+)
 register_sighup_exit_handler(logger)
 
 # ---------------------------------------------------------------------------
@@ -328,17 +331,20 @@ if __name__ == "__main__":
     # progress. Breaks the Windows MCP fork-bomb (~97 python +
     # ~77 node processes the user reported on 2026-06-09) by making
     # every respawn during the update window exit immediately.
-    try:
-        from _lib.update_gate import exit_if_update_in_progress  # type: ignore
-    except ImportError:
-        _parent_dir = str(Path(__file__).resolve().parent.parent)
-        if _parent_dir not in sys.path:
-            sys.path.insert(0, _parent_dir)
-        try:
-            from _lib.update_gate import exit_if_update_in_progress  # type: ignore
-        except ImportError:
-            exit_if_update_in_progress = None  # type: ignore
-    if exit_if_update_in_progress is not None:
-        exit_if_update_in_progress("search MCP")
+    #
+    # `_lib.update_gate` is SHIPPED; import_lib_member LOUD-FAILS if it's
+    # missing. The pre-fix silent `exit_if_update_in_progress = None` stub
+    # was especially dangerous here: it disabled the fork-bomb guard on the
+    # exact broken-install path most likely to be mid-update, silently
+    # re-arming the loop the gate exists to break. (`_lib` is already on
+    # sys.path from the SIGHUP bootstrap at module import; the insert is
+    # idempotent-safe if this block is ever reached first.)
+    _mcp_root = str(Path(__file__).resolve().parent.parent)
+    if _mcp_root not in sys.path:
+        sys.path.insert(0, _mcp_root)
+    exit_if_update_in_progress = import_lib_member(
+        "update_gate", "exit_if_update_in_progress"
+    )
+    exit_if_update_in_progress("search MCP")
 
     mcp.run()

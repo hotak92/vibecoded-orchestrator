@@ -48,7 +48,7 @@ superseded_by: "Weaviate"
 
 **Implementation**:
 ```python
-from chunking import Chunker, TokenCounter
+from weaviate_mcp.chunking import Chunker, TokenCounter
 
 chunker = Chunker.for_model(active_model)  # resolves the per-model budget
 token_count = TokenCounter.count_tokens(content)
@@ -66,7 +66,7 @@ if token_count <= chunker.max_tokens:
 
 **Implementation**:
 ```python
-from chunking import Chunker, TokenCounter
+from weaviate_mcp.chunking import Chunker, TokenCounter
 import uuid
 
 chunker = Chunker.for_model(active_model)
@@ -108,7 +108,7 @@ if token_count > chunker.max_tokens:
 
 **Implementation**:
 ```python
-from chunking import Chunker, TokenCounter
+from weaviate_mcp.chunking import Chunker, TokenCounter
 
 # Truncate query if it exceeds the active model's budget
 budget = Chunker.for_model(active_model).max_tokens

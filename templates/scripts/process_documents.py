@@ -53,7 +53,19 @@ def _resolve_mcp_servers_dir() -> Path:
 
 
 _MCP_DIR = _resolve_mcp_servers_dir()
-sys.path.insert(0, str(_MCP_DIR / "weaviate_mcp"))
+# v0.2.81 FN-1: DO NOT insert `_MCP_DIR/"weaviate_mcp"` on sys.path.
+# Doing so made `chunking` importable as a TOP-LEVEL module (`from
+# chunking import ...`) while this script's `sync_knowledge_graph` import
+# pulls the SAME file as the `weaviate_mcp.chunking` PACKAGE submodule —
+# two distinct module objects for one source file (the dual-module-object
+# hazard: `weaviate_mcp.chunking is not chunking`). weaviate_mcp is
+# pip-installed as an editable package by install.py (A1, v0.2.38), so the
+# package import below resolves without any weaviate_mcp/ dir on sys.path;
+# adding `_MCP_DIR` (the PARENT, claude_mcp_servers/) is only needed for
+# no-pip environments and is identity-safe because it makes the PACKAGE
+# resolvable, not the submodule as a top-level name.
+if str(_MCP_DIR) not in sys.path:
+    sys.path.insert(0, str(_MCP_DIR))
 # v0.2.18: make vco_lib (EmbeddingService) importable.
 _VCO_LIB_PARENT = _MCP_DIR.parent
 if str(_VCO_LIB_PARENT) not in sys.path:
@@ -75,7 +87,7 @@ from vco_lib.embedding_service import (
     EmbeddingService,
     NoEmbeddingBackendError,
 )
-from chunking import chunk_text, TokenCounter
+from weaviate_mcp.chunking import chunk_text, TokenCounter
 from weaviate.classes.query import Filter
 from weaviate.classes.config import Configure, Property, DataType
 

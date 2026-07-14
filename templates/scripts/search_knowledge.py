@@ -137,9 +137,22 @@ except Exception:
     NoEmbeddingBackendError = Exception  # type: ignore[assignment]
 
 
-# Try to import query logger
+# Try to import query logger.
+#
+# v0.2.81 FN-2: the target is the SHIPPED `weaviate_mcp.query_logger`
+# package module — the pre-fix bare `from query_logger import ...` could
+# NEVER resolve on a standard install (no `weaviate_mcp/` dir is on
+# sys.path here; weaviate_mcp is pip-installed as an editable package), so
+# HAS_LOGGER was silently False on EVERY install → total telemetry loss
+# for the kg-search CLI + every pre-tool-use hook that shells it. The
+# guard is RETAINED because telemetry is optional-by-design at the CLI
+# level (a partial / free-tier install without the orchestrator venv
+# still needs search to work; a missing logger must degrade the jsonl
+# row, never crash the user-facing search). With the package target the
+# guard now passes on every HEALTHY install and only trips on a genuinely
+# broken one.
 try:
-    from query_logger import ToolUsageLogger
+    from weaviate_mcp.query_logger import ToolUsageLogger
     HAS_LOGGER = True
 except Exception as e:
     HAS_LOGGER = False
