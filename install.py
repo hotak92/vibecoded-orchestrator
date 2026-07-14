@@ -5998,6 +5998,8 @@ def main() -> int:
             "--skip-materialize-claude-dir set; .claude/ left untouched",
         )
 
+    _project_init.materialize_root_knowledge(PROJECT_ROOT, log_event=_log_install_event)  # Step 4d (v0.2.81): seed root knowledge/ == shared
+
     # Step 5c (v0.2.54 S-3): agent-facing secrets-schema doc. Only-if-
     # missing, so user edits survive every --update.
     _materialize_vct_secrets_shared_readme(PROJECT_ROOT)

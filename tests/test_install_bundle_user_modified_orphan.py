@@ -392,5 +392,201 @@ class UserAddedFileConflictsWithNewShippedPathTests(unittest.TestCase):
         self.assertTrue(report.has_condition("bundle_user_modified_preserved"))
 
 
+# ---------------------------------------------------------------------------
+# v0.2.81: knowledge-retirement branch (curated nodes go root-only)
+# ---------------------------------------------------------------------------
+
+
+class KnowledgeRetirementTests(unittest.TestCase):
+    """v0.2.81 data-safety branch: on a NON-root project's first post-.81
+    update, prior curated `knowledge/**` manifest entries that are no longer
+    shipped must NOT be orphan-deleted (mass-delete) NOR orphan-preserved
+    (113-file deferral). They go into `knowledge-retired`: file left on disk
+    UNTOUCHED, manifest entry pruned, NO deferral. Root targets are exempt —
+    a curated node genuinely removed from templates/knowledge/ still
+    orphan-processes normally at the root."""
+
+    def _make_orch_with_knowledge(self, root: Path) -> None:
+        _make_fake_orchestrator(root)
+        kg = root / "templates" / "knowledge"
+        kg.mkdir(parents=True, exist_ok=True)
+        (kg / "TAG_HIERARCHY.md").write_text("# tags\nv1\n", encoding="utf-8")
+        concepts = kg / "concepts"
+        concepts.mkdir(exist_ok=True)
+        (concepts / "alpha.md").write_text("# Alpha\nshipped-v1\n", encoding="utf-8")
+        (concepts / "beta.md").write_text("# Beta\nshipped-v1\n", encoding="utf-8")
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="vct-bundle-kgretire-"))
+        self.orch = self.tmp / "orchestrator"
+        self.orch.mkdir()
+        self._make_orch_with_knowledge(self.orch)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(str(self.tmp), ignore_errors=True)
+
+    def _seed_pre81_nonroot_project(self, proj: Path) -> tuple[str, str]:
+        """Simulate a project installed BEFORE v0.2.81: curated knowledge
+        files on disk + recorded in the manifest. Returns the two curated
+        rels (hash-matching, user-modified)."""
+        # Install as if this WERE the root once to lay down curated nodes +
+        # a manifest that lists them, then re-target as non-root on update.
+        # Simplest deterministic path: force the enumerator to include
+        # curated by installing with folder == orch (root) into a temp, then
+        # copy the resulting knowledge/ + manifest into the non-root project.
+        root_stage = self.tmp / "root_stage"
+        root_stage.mkdir()
+        self._make_orch_with_knowledge(root_stage)  # its own templates
+        project_init.install_project_bundle(
+            root_stage, orchestrator_root=root_stage, update_mode=False,
+        )
+        import shutil
+        # Copy knowledge/ + the manifest into the non-root project.
+        shutil.copytree(root_stage / "knowledge", proj / "knowledge")
+        (proj / ".claude").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(
+            root_stage / ".claude" / ".vco-manifest.json",
+            proj / ".claude" / ".vco-manifest.json",
+        )
+        return "knowledge/concepts/alpha.md", "knowledge/concepts/beta.md"
+
+    def test_retirement_act_leaves_disk_prunes_manifest_no_deferral(self):
+        """The ACT case of the destructive-gate: a curated node whose hash
+        still matches the shipped baseline (would be orphan-DELETED) and a
+        user-modified one (would be orphan-PRESERVED + deferred) BOTH stay on
+        disk, land in `knowledge-retired`, are pruned from the manifest, and
+        emit NO deletion deferral."""
+        proj = self.tmp / "nonroot_project"
+        proj.mkdir()
+        rel_untouched, rel_modified = self._seed_pre81_nonroot_project(proj)
+
+        # User modifies one of the two curated copies.
+        modified_disk = proj / Path(rel_modified)
+        modified_disk.write_text("# Beta\nUSER EDIT\n", encoding="utf-8")
+        untouched_disk = proj / Path(rel_untouched)
+        untouched_before = untouched_disk.read_text(encoding="utf-8")
+
+        result = project_init.install_project_bundle(
+            proj, orchestrator_root=self.orch, update_mode=True,
+        )
+
+        # Both curated rels retired.
+        self.assertIn(rel_untouched, result["actions"]["knowledge-retired"])
+        self.assertIn(rel_modified, result["actions"]["knowledge-retired"])
+        # NEITHER in orphan buckets.
+        self.assertNotIn(rel_untouched, result["actions"]["orphan-deleted"])
+        self.assertNotIn(rel_untouched, result["actions"]["orphan-preserved"])
+        self.assertNotIn(rel_modified, result["actions"]["orphan-deleted"])
+        self.assertNotIn(rel_modified, result["actions"]["orphan-preserved"])
+        # BOTH files still on disk, bytes untouched (leave-alone).
+        self.assertTrue(untouched_disk.exists())
+        self.assertEqual(untouched_disk.read_text(encoding="utf-8"), untouched_before)
+        self.assertTrue(modified_disk.exists())
+        self.assertEqual(modified_disk.read_text(encoding="utf-8"), "# Beta\nUSER EDIT\n")
+        # Manifest pruned of both.
+        manifest = json.loads(
+            (proj / ".claude" / ".vco-manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertNotIn(rel_untouched, manifest["files"])
+        self.assertNotIn(rel_modified, manifest["files"])
+        # NO deletion deferral for these files.
+        report = DeferralReport.read(proj)
+        self.assertFalse(
+            report.has_condition("bundle_user_modified_deletion_preserved"),
+            "retirement must NOT emit an orphan-deletion deferral",
+        )
+
+    def test_retirement_matches_windows_shaped_manifest_keys(self):
+        """FINAL-REVIEW B1 (Windows-only silent mass-delete): pre-v0.2.81
+        manifest keys are raw `dest_rel` = `str(Path("knowledge") / rel)`,
+        so on Windows they are backslash-shaped (`knowledge\\concepts\\a.md`).
+        The retirement branch must normalize the separator BEFORE its
+        `startswith("knowledge/")` test — otherwise a Windows non-root
+        project's first post-.81 update MISSES retirement, the curated copies
+        fall into the orphan machinery, and get MASS-DELETED (+ deferrals +
+        re-embed). Runs on POSIX by rewriting the manifest keys to the
+        Windows form; the fix makes retirement fire before any disk logic, so
+        the assertion is deterministic cross-OS."""
+        proj = self.tmp / "nonroot_win_project"
+        proj.mkdir()
+        rel_untouched, rel_modified = self._seed_pre81_nonroot_project(proj)
+
+        # Rewrite the manifest so the curated keys are BACKSLASH-shaped, as a
+        # real Windows pre-.81 install would have recorded them. Disk paths
+        # stay POSIX (this test host); only the manifest keys are Windows-form.
+        manifest_path = proj / ".claude" / ".vco-manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        win_untouched = rel_untouched.replace("/", "\\")
+        win_modified = rel_modified.replace("/", "\\")
+        for posix_key, win_key in ((rel_untouched, win_untouched),
+                                   (rel_modified, win_modified)):
+            if posix_key in manifest["files"]:
+                manifest["files"][win_key] = manifest["files"].pop(posix_key)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        untouched_disk = proj / Path(rel_untouched)
+        untouched_before = untouched_disk.read_text(encoding="utf-8")
+
+        result = project_init.install_project_bundle(
+            proj, orchestrator_root=self.orch, update_mode=True,
+        )
+
+        # Windows-shaped keys must land in retirement, NOT the orphan buckets.
+        self.assertIn(win_untouched, result["actions"]["knowledge-retired"])
+        self.assertIn(win_modified, result["actions"]["knowledge-retired"])
+        self.assertNotIn(win_untouched, result["actions"]["orphan-deleted"])
+        self.assertNotIn(win_modified, result["actions"]["orphan-deleted"])
+        # File NOT deleted (the mass-delete the bug would have caused).
+        self.assertTrue(untouched_disk.exists())
+        self.assertEqual(untouched_disk.read_text(encoding="utf-8"), untouched_before)
+        # No deletion deferral.
+        report = DeferralReport.read(proj)
+        self.assertFalse(
+            report.has_condition("bundle_user_modified_deletion_preserved"),
+            "Windows-shaped retirement must NOT emit an orphan-deletion deferral",
+        )
+
+    def test_retirement_leave_alone_inverse_root_orphan_still_deletes(self):
+        """The LEAVE-ALONE inverse of the exemption: at the ROOT, a curated
+        node genuinely removed from templates/knowledge/ is orphan-DELETED
+        normally (hash-matching) — proving the retirement branch is
+        non-root-scoped, not a blanket knowledge exemption."""
+        root = self.tmp / "root_target"
+        root.mkdir()
+        self._make_orch_with_knowledge(root)
+        project_init.install_project_bundle(
+            root, orchestrator_root=root, update_mode=False,
+        )
+        # Upstream removes concepts/beta.md from the root's own templates.
+        (root / "templates" / "knowledge" / "concepts" / "beta.md").unlink()
+
+        result = project_init.install_project_bundle(
+            root, orchestrator_root=root, update_mode=True,
+        )
+        rel = "knowledge/concepts/beta.md"
+        # Root target → NOT retired; normal orphan semantics (hash-matching
+        # → safe delete).
+        self.assertNotIn(rel, result["actions"]["knowledge-retired"])
+        self.assertIn(rel, result["actions"]["orphan-deleted"])
+        self.assertFalse((root / Path(rel)).exists())
+
+    def test_retirement_allowlist_files_never_retired(self):
+        """Allowlisted per-project files (TAG_HIERARCHY.md) are in ops for
+        every target, so they're re-shipped/preserved normally and never
+        land in `knowledge-retired`."""
+        proj = self.tmp / "nonroot_allowlist"
+        proj.mkdir()
+        self._seed_pre81_nonroot_project(proj)
+
+        result = project_init.install_project_bundle(
+            proj, orchestrator_root=self.orch, update_mode=True,
+        )
+        rel = "knowledge/TAG_HIERARCHY.md"
+        self.assertNotIn(rel, result["actions"]["knowledge-retired"])
+        # It IS re-shipped (still on disk).
+        self.assertTrue((proj / Path(rel)).exists())
+
+
 if __name__ == "__main__":
     unittest.main()

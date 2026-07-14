@@ -29,7 +29,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 #
 # MAIN_SPAN: strict — main() must not grow AT ALL. New steps go into
 # helper functions / vco_lib modules called from main().
-_MAIN_SPAN_MAX = 1668
+# v0.2.81 Step 4c: +1 (1668→1669) for the single
+# `_project_init.materialize_root_knowledge(...)` call line + its blank
+# separator in main(). ALL substantive logic (enumeration gate + skip-existing/
+# symlink-guard write + self-print + soft-fail + logging via callback) lives in
+# vco_lib.project_init.{materialize_root_knowledge,_materialize_root_knowledge_impl};
+# the residual install.py delta is the one irreducible glue line (must supply
+# install.py's module-global PROJECT_ROOT + _log_install_event). Same
+# "inseparable thin-shim" precedent as the codegraph-ts / 5c lines in the TOTAL
+# block below. Re-pinned UP by 1 to the new measured span.
+_MAIN_SPAN_MAX = 1669
 
 # TOTAL: strict — measured exactly, no headroom. Additions require
 # extraction to vco_lib, not a bump.
@@ -86,6 +95,11 @@ _MAIN_SPAN_MAX = 1668
 # callers; the Rust build_canonical_env_text is the sole .env renderer and
 # vco_lib.env_template.list_canonical_env_template_keys is the Python key
 # authority). Re-pinned DOWNWARD to the new measured value.
+# v0.2.81 Step 4c: the only install.py addition is the single main() call line
+# + its blank separator (see MAIN_SPAN note above); materialize_root_knowledge
+# + its impl helper live entirely in vco_lib.project_init. Total measured at
+# 24809 = the existing pin (HEAD carried 2 lines of slack here), so the TOTAL
+# pin stays UNCHANGED at 24809 — the addition fit the existing budget exactly.
 _TOTAL_LINES_MAX = 24809
 
 

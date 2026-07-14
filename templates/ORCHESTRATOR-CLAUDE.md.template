@@ -521,6 +521,7 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 - Cross-project patterns visible to every workspace.
 - Auto-merged into `hybrid_search` results — read access is unconditional.
 - Write to it explicitly with `store_knowledge_node(scope="shared", ...)`. Per-project gate `SHARED_KG_WRITE_DISABLED=true` refuses such writes with a clear error (no silent reroute to project KG).
+- **Bundled curated set (v0.2.81, root-only)**: the orchestrator's ~115 curated nodes are materialized ONCE into the orchestrator root's `knowledge/` (== the shared collection, by adopt-and-route) via `install.py` Step 4d → the Step 7c KG-sync. Non-root projects do NOT receive per-project copies — they read the curated set via the shared-read fan-out. Setting `SHARED_KG_READ_DISABLED=true` on a project forgoes the bundled curated nodes for it (deliberate accept-loss; no fallback per-project copy). Existing pre-.81 per-project copies are left in place forever and their manifest entries quietly retired on the first post-.81 bundle update.
 
 **3. Code Graph** (Weaviate collections):
 - **CodeModule** — files with imports and metrics (`path`, `language`, `module_summary`, `loc`, `complexity`).

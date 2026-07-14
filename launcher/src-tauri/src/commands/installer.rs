@@ -424,6 +424,19 @@ fn parse_managed_paths_text(text: &'static str) -> Vec<&'static str> {
 /// customizations on bundle update — same shape as agents / skills /
 /// hooks. Result: zero conflicts on KG content across updates.
 ///
+/// 2026-07-15 (v0.2.81): curated `templates/knowledge/**` nodes now ship
+/// ROOT-ONLY. They are materialized ONCE into the orchestrator root's
+/// `knowledge/` (== the shared collection, by adopt-and-route) via
+/// install.py Step 4d + the `_enumerate_bundle_files` gate; non-root
+/// projects read them via the shared-read fan-out (no per-project copy /
+/// no per-project re-embed). Only the `_PER_PROJECT_KNOWLEDGE_FILES`
+/// allowlist (TAG_HIERARCHY.md, VOCABULARY.md, .node_formats.json,
+/// .node_embeddings.README.txt) still ships per-project. Existing
+/// per-project copies from pre-.81 installs are left in place forever
+/// (never-delete-user-data) and their manifest entries are quietly
+/// retired on the first post-.81 bundle update (`knowledge-retired`
+/// action bucket — no disk op, no deferral).
+///
 /// **Explicitly excluded:** `install.py` / `install.sh` / `install.ps1`
 /// (orchestrator entry points), `state/` (per-install metadata; the
 /// 2026-05 VideoFrames over-copy bug traced to this entry being copied

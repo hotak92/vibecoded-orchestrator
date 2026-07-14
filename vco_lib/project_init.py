@@ -3320,6 +3320,13 @@ def _enumerate_bundle_files(
     bodies resolves to that folder. Defaults to the orchestrator root
     (matches old behaviour for orchestrator self-installs).
 
+    v0.2.81: `project_root` ALSO gates curated `templates/knowledge/**`
+    inclusion — only the orchestrator-root target (`project_root is None`
+    or `project_root ≡ orchestrator_root`) receives the ~115 curated nodes;
+    non-root projects get only the `_PER_PROJECT_KNOWLEDGE_FILES` allowlist
+    and read the curated set via the shared-read fan-out. See
+    `_enumerate_knowledge_ops` + `_is_root_bundle_target`.
+
     Layout:
       .claude/hooks/<name>.{sh,ps1}        from templates/hooks/  (skip _lib)
       .claude/hooks/_lib/<name>.{sh,ps1}   from templates/hooks/_lib/  (always overwrite)
@@ -3462,48 +3469,83 @@ def _enumerate_bundle_files(
                 always_overwrite=False,
             ))
 
-    # v0.2.52 V52-C: shipped KG nodes (orchestrator's curated set) live
-    # under `templates/knowledge/` and are materialized into
-    # `<project>/knowledge/` here. Pre-V52-C the curated set lived at
-    # `knowledge/` in the source tree and was copied through
-    # `ORCHESTRATOR_MANAGED_PATHS`; that mixed shipped + user-authored
-    # nodes in the same directory and caused merge conflicts on update
-    # (modify-vs-delete races against user-modified nodes).
-    #
-    # `always_overwrite=False` is critical: user customizations to
-    # shipped nodes are PRESERVED across bundle updates via the
-    # manifest-driven hash compare in `_plan_bundle_action` (same V47-A
-    # pattern as agents / skills / hooks). User-authored nodes not
-    # shipped by the orchestrator survive automatically — they aren't
-    # in the bundle ops list so they're never touched.
-    #
-    # Recursive walk: enumerates every file (.md, .json metadata like
-    # `.node_formats.json`, etc.) under `templates/knowledge/`. The
-    # destination preserves the relative path beneath `knowledge/`.
-    knowledge_src = templates / "knowledge"
-    if knowledge_src.exists():
-        for f in sorted(knowledge_src.rglob("*")):
-            if f.is_dir():
-                continue
-            rel_in_knowledge = f.relative_to(knowledge_src)
-            dest_rel = str(Path("knowledge") / rel_in_knowledge)
-            ops.append(_BundleFileOp(
-                dest_rel=dest_rel,
-                source_abs=f,
-                source_rel=str(f.relative_to(orchestrator_root)),
-                transform=None,
-                always_overwrite=False,
-                # v0.2.57: regenerated per-project caches (e.g.
-                # `.node_formats.json`, the KG-summary cache) diverge from
-                # the shipped seed the moment the project is used — that
-                # is EXPECTED, not a user customization. Flagging them
-                # `regenerated_data` routes _file_action to `keep-regenerated`
-                # (silent keep-local, NO bundle_user_modified_preserved
-                # warning) instead of `preserve`. Schema-bump regeneration
-                # is gated by the artifact_schema_versions DB registry.
-                regenerated_data=_is_regenerated_data_file(dest_rel),
-            ))
+    # v0.2.52 V52-C / v0.2.81: shipped KG nodes live under
+    # `templates/knowledge/`. Curated nodes (concepts/tools/models/patterns)
+    # now ship ROOT-ONLY — materialized once into the orchestrator root's
+    # `knowledge/` (== the shared collection) and read by non-root projects
+    # via the shared-read fan-out. See `_enumerate_knowledge_ops` for the
+    # gate + the `_PER_PROJECT_KNOWLEDGE_FILES` allowlist that still ships
+    # per-project. The gate keys on PATH identity (target ≡ orchestrator
+    # root), never on collection names.
+    ops.extend(_enumerate_knowledge_ops(
+        orchestrator_root,
+        include_curated=_is_root_bundle_target(orchestrator_root, project_root),
+    ))
 
+    return ops
+
+
+def _enumerate_knowledge_ops(
+    orchestrator_root: Path,
+    *,
+    include_curated: bool,
+) -> list[_BundleFileOp]:
+    """Enumerate the `templates/knowledge/**` → `knowledge/**` copy ops.
+
+    Single enumerator with two consumers (one-concern-one-home):
+      - `_enumerate_bundle_files` (gate) calls it with
+        `include_curated=_is_root_bundle_target(...)`.
+      - `materialize_root_knowledge` (install.py Step 4d) calls it with
+        `include_curated=True`.
+
+    When `include_curated=False` (a NON-root project), only the depth-1
+    files in `_PER_PROJECT_KNOWLEDGE_FILES` are emitted — the ~115 curated
+    nodes under concepts/ tools/ models/ patterns/ are skipped. Match is on
+    `rel_in_knowledge` having exactly ONE path component AND the name being
+    allowlisted, so a curated node accidentally placed at the top level in a
+    future release is NOT silently shipped per-project.
+
+    Pre-V52-C the curated set lived at `knowledge/` in the source tree and
+    was copied through `ORCHESTRATOR_MANAGED_PATHS`; that mixed shipped +
+    user-authored nodes in one directory and caused merge conflicts on
+    update (modify-vs-delete races). V52-C moved it to `templates/knowledge/`
+    + the bundle path; v0.2.81 makes the curated set root-only to stop
+    duplicating it (disk + per-project embeddings) into every project.
+
+    `always_overwrite=False` throughout: user customizations to a shipped
+    node are PRESERVED across bundle updates via the manifest-driven hash
+    compare (same V47-A pattern as agents / skills / hooks).
+    """
+    ops: list[_BundleFileOp] = []
+    knowledge_src = orchestrator_root / "templates" / "knowledge"
+    if not knowledge_src.exists():
+        return ops
+    for f in sorted(knowledge_src.rglob("*")):
+        if f.is_dir():
+            continue
+        rel_in_knowledge = f.relative_to(knowledge_src)
+        if not include_curated:
+            # Non-root target: ship ONLY the depth-1 allowlisted files.
+            is_top_level = len(rel_in_knowledge.parts) == 1
+            if not (is_top_level and rel_in_knowledge.name in _PER_PROJECT_KNOWLEDGE_FILES):
+                continue
+        dest_rel = str(Path("knowledge") / rel_in_knowledge)
+        ops.append(_BundleFileOp(
+            dest_rel=dest_rel,
+            source_abs=f,
+            source_rel=str(f.relative_to(orchestrator_root)),
+            transform=None,
+            always_overwrite=False,
+            # v0.2.57: regenerated per-project caches (e.g.
+            # `.node_formats.json`, the KG-summary cache) diverge from the
+            # shipped seed the moment the project is used — that is
+            # EXPECTED, not a user customization. Flagging them
+            # `regenerated_data` routes _file_action to `keep-regenerated`
+            # (silent keep-local, NO bundle_user_modified_preserved warning)
+            # instead of `preserve`. Schema-bump regeneration is gated by
+            # the artifact_schema_versions DB registry.
+            regenerated_data=_is_regenerated_data_file(dest_rel),
+        ))
     return ops
 
 
@@ -3525,6 +3567,205 @@ def _is_regenerated_data_file(dest_rel: str) -> bool:
     """True if `dest_rel` is a regenerated per-project data file (not a
     user-customizable bundle template). See `_REGENERATED_DATA_BASENAMES`."""
     return Path(dest_rel).name in _REGENERATED_DATA_BASENAMES
+
+
+# v0.2.81: TOP-LEVEL files under templates/knowledge/ that KEEP shipping into
+# EVERY project even after the curated node set became root-only. Narrow,
+# explicit allowlist (matched only at depth 1 — see `_enumerate_knowledge_ops`)
+# so a curated node accidentally placed at the top level in a future release is
+# never silently shipped per-project. Rationale per entry:
+#   - .node_formats.json         regenerated per-project cache SEED consumed by
+#                                the kg_node_formats schema pipeline
+#                                (`run_node_formats_schema_check`); NOT curated
+#                                content. Gating it breaks new-project schema
+#                                bootstrap.
+#   - TAG_HIERARCHY.md /         per-project tag/vocabulary AUTHORING conventions
+#     VOCABULARY.md              for the project's OWN nodes. Excluded from
+#                                Weaviate sync anyway (sync_knowledge_graph.py
+#                                EXCLUDED_FILES) → 2 disk files, ZERO embeddings.
+#   - .node_embeddings.README.txt  sidecar docs for the project-local knowledge/.
+_PER_PROJECT_KNOWLEDGE_FILES: frozenset = frozenset({
+    "TAG_HIERARCHY.md",
+    "VOCABULARY.md",
+    ".node_formats.json",
+    ".node_embeddings.README.txt",
+})
+
+
+def _is_root_bundle_target(
+    orchestrator_root: Path,
+    project_root: Path | None,
+) -> bool:
+    """True iff the bundle target IS the orchestrator clone itself.
+
+    Drives the v0.2.81 root-only gate for curated `templates/knowledge/**`
+    nodes: the curated set is materialized ONCE into the orchestrator
+    root's `knowledge/` (== the shared collection, by definition — see
+    install.py adopt-and-route) and NON-root projects read it via the
+    shared-read fan-out, never a per-project copy.
+
+    - `project_root is None` → True. Legacy self-install default: the
+      `_enumerate_bundle_files` docstring already defines `None` as
+      "defaults to the orchestrator root".
+    - else → `_canonical_path_eq(project_root, orchestrator_root)` (symlink-
+      + case-safe). Keyed on PATH identity, NOT on any collection-name
+      comparison, so it can never disagree with the single root≡shared
+      authority.
+
+    Conservative failure mode inherited from `_canonical_path_eq`: a
+    resolve error yields False → the target is treated as NON-root → curated
+    knowledge is NOT shipped there (fails toward less materialization, never
+    toward writing curated nodes into the wrong project's tree).
+    """
+    if project_root is None:
+        return True
+    return _canonical_path_eq(project_root, orchestrator_root)
+
+
+def materialize_root_knowledge(
+    install_root: Path,
+    log_event: Optional[Callable[..., None]] = None,
+) -> dict:
+    """install.py Step 4d: materialize `templates/knowledge/**` → the
+    orchestrator root's `knowledge/**` (v0.2.81).
+
+    The curated bundled KG set now lives ONCE, in the orchestrator root's
+    `knowledge/` (== the shared collection, by adopt-and-route definition).
+    This function guarantees PRESENCE of that set on disk so the existing
+    Step 7c KG-sync seeds the canonical/shared collection with it. Non-root
+    projects then read the curated nodes via the shared-read fan-out, with
+    no per-project copy.
+
+    Deterministic seed (NOT a per-add "seed-if-empty"): runs on fresh AND
+    `--update`, same as Step 4b/9b. Skip-existing so user-edited root nodes
+    are never clobbered — full template refresh for the root remains the
+    "Update bundle" / "Update all" channel (which runs `install_project_bundle`
+    on the root, gate passes → knowledge included, with manifest + orphan
+    semantics). Step 4d only guarantees presence for the seed.
+
+    Prints its own `[4d/10]` step banner (same self-print precedent as Step
+    9b `_install_agents_and_skills`) and — like the install.py step helpers
+    that receive a callback — is fully SOFT-FAIL: any unexpected exception is
+    caught, logged via `log_event`, and returned as an error rather than
+    aborting the install. `log_event(step, phase, detail, data=...)` mirrors
+    install.py's `_log_install_event` signature; None disables logging.
+
+    Args:
+        install_root: the orchestrator clone root (install.py PROJECT_ROOT).
+        log_event: optional install.py `_log_install_event`-shaped callback.
+
+    Returns:
+        {"installed": int, "skipped": int, "errors": [str],
+         "symlink_redirects": int}
+
+    Semantics (parity with the Step 9b agents/skills idiom,
+    install.py:23665-23695):
+        - symlink guard: if `knowledge/`, a subdir, or a per-file target is
+          a symlink VCO refuses to write through, content lands at a
+          `.vco-new` sibling (V47-B) and `symlink_redirects` is incremented.
+        - `os.path.lexists(dest)` on a non-symlink dest → skip (dangling
+          symlink counts as occupied; never overwrite a present node).
+        - else atomic write via `_write_file_atomic` (tempfile + os.replace;
+          per-file AND full-ancestor symlink guard — a symlinked intermediate
+          dir like knowledge/concepts/ is redirected too, not written
+          through). A `.vco-new` redirect increments `symlink_redirects`
+          AND `installed` (knowledge ops carry transform=None).
+        - per-file Exception → collected in `errors`, loop continues
+          (soft-fail; a partial seed is better than an aborted install).
+        - `templates/knowledge/` missing → all-zero result, no raise.
+        - idempotent: a second call → installed=0, skipped=N.
+    """
+    import os as _os
+
+    def _emit(phase: str, detail: str, data=None) -> None:
+        if log_event is None:
+            return
+        try:
+            log_event("4d/10", phase, detail, data=data)
+        except TypeError:
+            try:
+                log_event("4d/10", phase, detail)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    out: dict = {
+        "installed": 0, "skipped": 0, "errors": [], "symlink_redirects": 0,
+    }
+
+    print("[4d/10] Materializing curated knowledge/ (root-only) ... ",
+          flush=True)
+    try:
+        return _materialize_root_knowledge_impl(
+            install_root, out, _os=_os, emit=_emit,
+        )
+    except Exception as e:  # soft-fail: never abort the install
+        err = f"{type(e).__name__}: {e}"
+        out["errors"].append(err)
+        _emit("warn", f"materialize_root_knowledge failed: {err}",
+              data={"error": err})
+        print(f"[4d/10] warning: {err} (continuing)", flush=True)
+        return out
+
+
+def _materialize_root_knowledge_impl(
+    install_root: Path, out: dict, *, _os, emit,
+) -> dict:
+    """Core of `materialize_root_knowledge` (kept separate so the public
+    entry point can wrap it in the soft-fail try)."""
+    ops = _enumerate_knowledge_ops(install_root, include_curated=True)
+    if not ops:
+        emit("ok", "templates/knowledge/ absent — nothing to materialize",
+             data={"installed": 0, "skipped": 0})
+        return out
+
+    # Redirect the whole knowledge/ subtree once if the dir itself is a
+    # blocking symlink (same as Step 9b routes .claude/ to a sibling).
+    knowledge_dir = install_root / "knowledge"
+    if is_symlink_blocking(knowledge_dir):
+        knowledge_dir = compute_vco_new_path(knowledge_dir)
+        out["symlink_redirects"] += 1
+
+    for op in ops:
+        # op.dest_rel is "knowledge/<rel>"; rebase onto the (possibly
+        # redirected) knowledge_dir so the subtree redirect is honoured.
+        rel_below = Path(op.dest_rel).relative_to("knowledge")
+        dest = knowledge_dir / rel_below
+        try:
+            # Skip-existing seed: never overwrite a present node (lexists
+            # so a dangling non-symlink-blocked path counts as occupied).
+            # A symlinked dest is NOT a skip — _write_file_atomic refuses
+            # to write through it and lands the content at the `.vco-new`
+            # sibling (V47-B), preserving the documented per-file redirect
+            # contract (redirect counts as installed too).
+            if (not is_symlink_blocking(dest)
+                    and _os.path.lexists(_os.fspath(dest))):
+                out["skipped"] += 1
+                continue
+            data = op.source_abs.read_bytes()
+            if op.transform is not None:  # knowledge ops ship transform=None
+                data = op.transform(data)
+            # Atomic write + FULL ancestor symlink guard (walks intermediate
+            # dirs — a symlinked knowledge/concepts/ redirects to
+            # knowledge/concepts.vco-new/<name>, the gap the old inline
+            # copyfile loop missed). Returns the redirect Path or None.
+            redirect = _write_file_atomic(dest, data)
+            if redirect is not None:
+                out["symlink_redirects"] += 1
+            out["installed"] += 1
+        except Exception as e:
+            out["errors"].append(f"{op.dest_rel}: {type(e).__name__}: {e}")
+            continue
+
+    emit("ok",
+         f"materialized {out['installed']} / skipped {out['skipped']} "
+         f"curated knowledge file(s)",
+         data={k: (v if not isinstance(v, list) else len(v))
+               for k, v in out.items()})
+    print(f"[4d/10] done ({out['installed']} new, {out['skipped']} kept, "
+          f"{len(out['errors'])} error(s)).", flush=True)
+    return out
 
 
 def _stale_orchestrator_root_heal_match(
@@ -8015,7 +8256,8 @@ def install_project_bundle(
                         ("create", "overwrite", "always-overwrite",
                          "noop", "preserve", "skip-existing",
                          "skip-disabled", "keep-regenerated",
-                         "orphan-deleted", "orphan-preserved")},
+                         "orphan-deleted", "orphan-preserved",
+                         "knowledge-retired")},
             "settings_action": "",
             "manifest_written": False,
             "vco_version": "unknown",
@@ -8028,6 +8270,12 @@ def install_project_bundle(
         if orchestrator_root is not None
         else _find_orchestrator_root_from_module()
     )
+
+    # v0.2.81: one authority for "is this bundle target the orchestrator
+    # root?" — drives both the curated-knowledge gate (via
+    # `_enumerate_bundle_files` → `_enumerate_knowledge_ops`) and the
+    # knowledge-retirement branch in the orphan loop below.
+    is_root_target = _is_root_bundle_target(orchestrator_root, folder)
 
     result: dict = {
         "folder": str(folder),
@@ -8042,11 +8290,15 @@ def install_project_bundle(
         # because hash matched what we previously shipped (user
         # untouched); `orphan-preserved` = kept on disk because user
         # modified vs the prior shipped hash.
+        # v0.2.81: `knowledge-retired` = prior curated knowledge/ entries
+        # that went root-only. Non-root: left on disk (never deleted, never
+        # deferred), only pruned from the manifest. See the orphan loop.
         "actions": {k: [] for k in
                     ("create", "overwrite", "always-overwrite",
                      "noop", "preserve", "skip-existing",
                      "skip-disabled", "keep-regenerated",
-                     "orphan-deleted", "orphan-preserved")},
+                     "orphan-deleted", "orphan-preserved",
+                     "knowledge-retired")},
         "settings_action": "",
         "manifest_written": False,
         "vco_version": _resolve_vco_version(orchestrator_root),
@@ -8282,6 +8534,7 @@ def install_project_bundle(
     # it.
     orphan_deleted: list[str] = []
     orphan_preserved: list[str] = []
+    knowledge_retired: list[str] = []
     prior_files: dict = manifest.get("files", {}) or {}
     new_files_keys = set(new_files.keys())
     # Compute orphans BEFORE we also include user-modified preserves —
@@ -8291,7 +8544,32 @@ def install_project_bundle(
     seen_in_ops = {op.dest_rel for op in ops}
     for prior_rel, prior_entry in prior_files.items():
         if prior_rel in seen_in_ops:
-            # Re-shipped this run; not an orphan.
+            # Re-shipped this run; not an orphan. (The allowlisted per-
+            # project knowledge files — TAG_HIERARCHY.md etc. — are in ops
+            # for every target, so they're excluded from retirement here.)
+            continue
+        # v0.2.81 knowledge-retirement branch (data-safety, constraint 3):
+        # on a NON-root project the ~115 curated `knowledge/**` entries are
+        # no longer shipped, so they'd otherwise fall into the orphan
+        # machinery below — case (b) would DELETE them from disk and case
+        # (c) would emit a 113-file deferral. Both are forbidden. Instead:
+        # leave the file on disk UNTOUCHED (now user-owned state, the
+        # logical completion of V52-C), and simply DON'T carry the manifest
+        # entry forward (it falls out of `new_files` → pruned on rewrite).
+        # No disk op, no deferral. Root targets skip this branch entirely so
+        # a curated node genuinely deleted from templates/knowledge/ still
+        # orphan-processes normally at the root.
+        # Normalize the separator BEFORE the prefix test: manifest keys are
+        # raw `dest_rel` = `str(Path("knowledge") / rel)`, host-OS-shaped
+        # (`knowledge\concepts\foo.md` on Windows). Without this, a Windows
+        # non-root project's first post-v0.2.81 update would MISS this branch
+        # → fall into the orphan machinery → MASS-DELETE the curated copies +
+        # emit deferrals + spawn a re-embed (all three data-safety violations
+        # decision 5 forbids). Mirrors `_classify_bundle_op_kind` (which
+        # `.replace("\\", "/")` before its own prefix check) and the Rust
+        # `is_kg_or_docs_rel_path` normalizer — cross-OS parity.
+        if not is_root_target and prior_rel.replace("\\", "/").startswith("knowledge/"):
+            knowledge_retired.append(prior_rel)
             continue
         prior_hash = (prior_entry or {}).get("sha256", "")
         target_path = folder / prior_rel
@@ -8332,6 +8610,12 @@ def install_project_bundle(
 
     result["actions"]["orphan-deleted"] = orphan_deleted
     result["actions"]["orphan-preserved"] = orphan_preserved
+    result["actions"]["knowledge-retired"] = knowledge_retired
+    if knowledge_retired:
+        _log("4.bundle.knowledge_retired", "info",
+             f"retired {len(knowledge_retired)} curated knowledge/ manifest "
+             f"entries (files left on disk, read via shared collection)",
+             data={"count": len(knowledge_retired)})
 
     # Smart-merge settings.json template separately. The template carries
     # the orchestrator's hooks block + permissions defaults. The merge
@@ -9135,6 +9419,48 @@ def _reconcile_bundle_deferrals(
         report.write(folder)
 
 
+def _canonical_path_eq(
+    a: "str | Path",
+    b: "str | Path",
+    *,
+    is_windows: Optional[bool] = None,
+) -> bool:
+    """Canonical filesystem-path equality (symlink- + case-safe).
+
+    Resolves BOTH operands via ``Path.resolve()`` (collapses ``..``,
+    follows symlinks) and compares. On Windows the comparison is
+    case-insensitive (NTFS is case-preserving but case-insensitive), which
+    mirrors the lowercase-string compare the four in-function ``_path_eq``
+    closures used before this extraction (the single home for that logic,
+    per the one-concern-one-home rule).
+
+    Conservative failure mode: any ``OSError`` / ``RuntimeError`` /
+    ``ValueError`` (e.g. embedded-NUL path) / ``TypeError`` while resolving
+    either operand → ``False``. Callers that use this as a "is this the
+    root?" gate therefore fail toward *less* action (a target is treated as
+    NON-root, so curated knowledge is NOT shipped) rather than toward
+    writing into the wrong place.
+
+    ``is_windows`` is injectable so the Windows case-fold branch can be
+    unit-tested on any host (defaults to the real platform when None).
+    """
+    if is_windows is None:
+        import platform as _platform
+        is_windows = _platform.system().lower().startswith("win")
+    try:
+        ap = Path(a).resolve()
+        bp = Path(b).resolve()
+    except (OSError, RuntimeError, ValueError, TypeError):
+        # ValueError: embedded NUL byte / bad path; TypeError: non-path
+        # input. Any malformed operand → conservative False (the four
+        # migrated DB-row call-sites never hit these; the root-gate call-
+        # site benefits from the wider guard).
+        return False
+    if is_windows:
+        return str(ap).lower() == str(bp).lower()
+    return ap == bp
+
+
 def _find_orchestrator_root_from_module() -> Path:
     """Walk up from this module's location looking for `vct-module.json`.
     Used when callers don't pass `--orchestrator-root` explicitly."""
@@ -9273,18 +9599,6 @@ def _apply_canonical_env_via_config_projection(
         result["action"] = "db_unreachable"
         return result
 
-    import platform as _platform
-    is_windows = _platform.system().lower().startswith("win")
-
-    def _path_eq(a: str, b: Path) -> bool:
-        try:
-            ap = Path(a).resolve()
-        except (OSError, RuntimeError):
-            return False
-        if is_windows:
-            return str(ap).lower() == str(b).lower()
-        return ap == b
-
     import sqlite3 as _sqlite3
     try:
         conn = _sqlite3.connect(
@@ -9303,7 +9617,7 @@ def _apply_canonical_env_via_config_projection(
         except _sqlite3.Error:
             rows = []
         for row_id, row_folder in rows:
-            if _path_eq(row_folder or "", folder_canonical):
+            if _canonical_path_eq(row_folder or "", folder_canonical):
                 project_id = str(row_id)
                 break
     finally:
@@ -9686,7 +10000,6 @@ def _read_codegraph_binding_override(folder: Path) -> dict:
     """
     import json as _json
     import os as _os
-    import platform as _platform
     import sqlite3 as _sqlite3
 
     out: dict = {"collection_prefix": None, "has_manual_override": False}
@@ -9703,17 +10016,6 @@ def _read_codegraph_binding_override(folder: Path) -> dict:
     except (OSError, RuntimeError):
         return out
 
-    is_windows = _platform.system().lower().startswith("win")
-
-    def _path_eq(a: str, b: Path) -> bool:
-        try:
-            ap = Path(a).resolve()
-        except (OSError, RuntimeError):
-            return False
-        if is_windows:
-            return str(ap).lower() == str(b).lower()
-        return ap == b
-
     try:
         conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
     except _sqlite3.Error:
@@ -9728,7 +10030,7 @@ def _read_codegraph_binding_override(folder: Path) -> dict:
             return out
         project_id = None
         for row_id, row_folder in rows:
-            if _path_eq(row_folder or "", folder_canonical):
+            if _canonical_path_eq(row_folder or "", folder_canonical):
                 project_id = row_id
                 break
         if project_id is None:
@@ -9785,7 +10087,6 @@ def _read_kg_binding_override(folder: Path) -> dict:
     """
     import json as _json
     import os as _os
-    import platform as _platform
     import sqlite3 as _sqlite3
 
     out: dict = {
@@ -9807,17 +10108,6 @@ def _read_kg_binding_override(folder: Path) -> dict:
     except (OSError, RuntimeError):
         return out
 
-    is_windows = _platform.system().lower().startswith("win")
-
-    def _path_eq(a: str, b: Path) -> bool:
-        try:
-            ap = Path(a).resolve()
-        except (OSError, RuntimeError):
-            return False
-        if is_windows:
-            return str(ap).lower() == str(b).lower()
-        return ap == b
-
     try:
         conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
     except _sqlite3.Error:
@@ -9832,7 +10122,7 @@ def _read_kg_binding_override(folder: Path) -> dict:
             return out
         project_id = None
         for row_id, row_folder in rows:
-            if _path_eq(row_folder or "", folder_canonical):
+            if _canonical_path_eq(row_folder or "", folder_canonical):
                 project_id = row_id
                 break
         if project_id is None:
@@ -9892,7 +10182,6 @@ def _read_kg_collection_from_launcher_db(folder: Path) -> dict:
     written from a different drive-letter casing on the same OS.
     """
     import os as _os
-    import platform as _platform
     import sqlite3 as _sqlite3
 
     out: dict = {}
@@ -9912,17 +10201,6 @@ def _read_kg_collection_from_launcher_db(folder: Path) -> dict:
     except (OSError, RuntimeError):
         return out
 
-    is_windows = _platform.system().lower().startswith("win")
-
-    def _path_eq(a: str, b: Path) -> bool:
-        try:
-            ap = Path(a).resolve()
-        except (OSError, RuntimeError):
-            return False
-        if is_windows:
-            return str(ap).lower() == str(b).lower()
-        return ap == b
-
     try:
         conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
     except _sqlite3.Error:
@@ -9938,7 +10216,7 @@ def _read_kg_collection_from_launcher_db(folder: Path) -> dict:
             return out
         project_id = None
         for row_id, row_folder in rows:
-            if _path_eq(row_folder or "", folder_canonical):
+            if _canonical_path_eq(row_folder or "", folder_canonical):
                 project_id = row_id
                 break
         if project_id is None:

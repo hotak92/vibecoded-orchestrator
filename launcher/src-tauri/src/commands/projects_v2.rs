@@ -6782,6 +6782,39 @@ mod tests {
     }
 
     #[test]
+    fn envelope_change_detector_false_for_knowledge_retired_only() {
+        // v0.2.81: a non-root project's first post-.81 update RETIRES the ~113
+        // curated knowledge/ manifest entries (files LEFT on disk, only the
+        // manifest is pruned). `knowledge-retired` is NOT a content-changing
+        // bucket, so a retirement-only update must NOT spawn a re-embed.
+        let retired = serde_json::json!({
+            "actions": {
+                "create": [], "overwrite": [], "always-overwrite": [],
+                "noop": [], "preserve": [], "skip-existing": [],
+                "skip-disabled": [], "keep-regenerated": [],
+                "orphan-deleted": [], "orphan-preserved": [],
+                "knowledge-retired": [
+                    "knowledge/concepts/alpha.md",
+                    "knowledge/concepts/beta.md",
+                    "knowledge/tools/weaviate.md",
+                ],
+            }
+        });
+        assert!(
+            !envelope_kg_or_docs_content_changed(&retired),
+            "knowledge-retired is a leave-on-disk / prune-manifest action; it \
+             must NOT be treated as a KG content change"
+        );
+        assert!(
+            !should_spawn_kg_sync_on_bundle(
+                false,
+                envelope_kg_or_docs_content_changed(&retired)
+            ),
+            "a retirement-only UPDATE must NOT spawn a re-embed"
+        );
+    }
+
+    #[test]
     fn envelope_change_detector_conservative_on_missing_or_bad_actions() {
         // No actions key → assume changed (spawn, safe-but-slow).
         let no_actions = serde_json::json!({ "folder": "/x" });

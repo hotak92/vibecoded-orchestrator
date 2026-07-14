@@ -118,6 +118,17 @@ claude_mcp_servers/weaviate_mcp/*_tool_usage.jsonl
 .claude/scripts/
 .claude/settings.json
 CLAUDE.local.md
+# v0.2.81 Step 4d: the curated KG set is shipped ONLY in templates/knowledge/
+# and materialized into the orchestrator root's knowledge/ at install time
+# (install.py Step 4d → the root ≡ shared collection). Same rationale as the
+# .claude/{hooks,scripts,settings.json} block above: anything generated from a
+# template at install time must NOT ship in the public repo — only the template
+# ships. This keeps Step 4d's ~119 materialized files out of `git status`
+# noise + accidental commits. Directory-level ignore: a trailing-slash ignore
+# affects only UNTRACKED files, so the maintainer's private fork (which COMMITS
+# curated root nodes) keeps them tracked — do NOT add a `!knowledge/...`
+# negation here, it would re-include on the public side.
+/knowledge/
 
 # Internal dev artifacts — must not be tracked in the public repo. The
 # orchestrator-self's local .claude/context/ may exist on contributor

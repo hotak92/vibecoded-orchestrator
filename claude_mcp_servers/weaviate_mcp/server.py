@@ -2334,7 +2334,11 @@ KG_COLLECTION = _config_field(
 # `vco_lib/project_init.py::_LEGACY_SHARED_KG_NAME` for the pre-v0.2.12
 # legacy alias and `_LEGACY_SHARED_KG_NAME_LOWERCASE_C` for the v0.2.12–
 # v0.2.22 alias). The bundled cross-project KG is seeded at install time
-# from vibecoded-orchestrator/knowledge/.
+# from vibecoded-orchestrator/knowledge/ — which, as of v0.2.81, is itself
+# materialized ONCE from templates/knowledge/ by install.py Step 4d
+# (root ≡ shared collection). Non-root projects no longer carry per-project
+# copies of the curated set; they read it here via the shared-read fan-out
+# (_kg_search_collections), opt-out via SHARED_KG_READ_DISABLED.
 #
 # Asymmetric access (2026-05-01): SHARED_KG_COLLECTION is ALWAYS exposed to
 # read paths when set. There is no per-project read opt-out — every project

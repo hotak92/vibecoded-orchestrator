@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.81] - 2026-07-15
+
+### Changed
+- **Bundled curated KG nodes now ship root-only — non-root projects no longer
+  receive per-project copies.** Before v0.2.81, adding a project copied the
+  orchestrator's ~115 curated `templates/knowledge/**` nodes onto that project's
+  disk AND re-embedded all of them into the project's own Weaviate collection —
+  the same content duplicated into every project, which no per-collection dedup
+  can collapse. The curated set now lives ONCE in the orchestrator root's
+  `knowledge/` (which **is** the shared collection, by adopt-and-route) and
+  non-root projects read it for free via the existing shared-read fan-out.
+  `_enumerate_bundle_files` stops emitting curated knowledge ops for non-root
+  targets; only four top-level files still ship per-project (the
+  `_PER_PROJECT_KNOWLEDGE_FILES` allowlist: `TAG_HIERARCHY.md`, `VOCABULARY.md`
+  — both sync-excluded authoring conventions — plus the regenerated
+  `.node_formats.json` schema-pipeline seed and its README sidecar).
+
+### Fixed
+- **Fresh installs now deterministically seed the shared collection with the
+  bundled curated nodes.** A new `install.py` Step 4d
+  (`materialize_root_knowledge`) materializes `templates/knowledge/**` into the
+  orchestrator root's `knowledge/` (skip-existing; symlink-guarded; soft-fail)
+  BEFORE the Step 7c KG-sync, on both fresh install and `--update`. This closes
+  a pre-existing gap where nothing in `install.py` populated the root
+  `knowledge/`, so on a machine where the root "Update bundle" had never run the
+  shared collection carried ZERO bundled nodes. Existing users get it backfilled
+  on their first v0.2.81 `install.py --update`.
+
+### Migration / behavior notes
+- **Accept-loss opt-out (documented, by design):** a project with
+  `SHARED_KG_READ_DISABLED=true` gets NEITHER a per-project copy NOR shared
+  reads, so it no longer sees the bundled curated nodes. There is intentionally
+  no fallback per-project copy — opting out of the shared collection means
+  opting out of the bundled curated set (its own `knowledge/` nodes are
+  unaffected).
+- **Never delete user data / never re-embed:** existing pre-.81 per-project
+  `knowledge/` copies are LEFT on disk forever as user-owned files, and their
+  per-project embeddings are left in Weaviate (no collection drop, no re-embed).
+  On the first post-.81 bundle update of each project, the now-unshipped curated
+  manifest entries are quietly RETIRED — a new `knowledge-retired` action bucket
+  prunes them from `.vco-manifest.json` with no disk op and no deferral (the
+  orphan machinery is explicitly exempted for them so it can neither mass-delete
+  them nor emit a ~115-file deferral). Root targets keep full orphan semantics.
+- **Non-goal (deliberate, not built):** an optional `vct` cleanup command to
+  prune untouched bundled copies from old projects is intentionally out of scope
+  for v0.2.81. The stale copies are harmless (user-owned, unmanaged); a future
+  release may add opt-in cleanup.
+
 ## [0.2.80] - 2026-07-14
 
 ### Security

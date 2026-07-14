@@ -37,15 +37,16 @@ def _fake_repo_source(root: Path) -> Path:
     behind — the same way ``README.md`` and ``scripts/foo.sh`` test
     the broader "not in allowlist → not copied" contract.
 
-    V52-C note (v0.2.52): ``knowledge/`` was REMOVED from the install
-    whitelist. The source still has a ``knowledge/`` directory (it's a
-    legitimate user-state location), but ``apply_conflict_strategy``
-    must NOT copy it into the target. Shipped KG nodes are now
-    bundle-materialized from ``templates/knowledge/`` via
-    ``_enumerate_bundle_files``; the manifest-tracked path preserves
-    user customizations on update (V47-A pattern). This fixture
-    keeps the ``knowledge/`` dir so the tests can assert it stays
-    behind (mirrors the CLAUDE.md negative-assertion pattern).
+    V52-C note (v0.2.52 / v0.2.81): ``knowledge/`` was REMOVED from the
+    install whitelist. The source still has a ``knowledge/`` directory
+    (it's a legitimate user-state location), but ``apply_conflict_strategy``
+    must NOT copy it into the target. Shipped KG nodes are materialized from
+    ``templates/knowledge/`` via ``_enumerate_bundle_files`` — ROOT-ONLY as
+    of v0.2.81 (into the orchestrator root's ``knowledge/`` == the shared
+    collection; non-root projects read it via the shared-read fan-out). The
+    manifest-tracked root path preserves user customizations on update (V47-A
+    pattern). This fixture keeps the ``knowledge/`` dir so the tests can
+    assert it stays behind (mirrors the CLAUDE.md negative-assertion pattern).
     """
     p = root / "src"
     p.mkdir(parents=True, exist_ok=True)

@@ -98,13 +98,15 @@ class ManagedPathsLockstepTests(unittest.TestCase):
         ``templates/CLAUDE.md.template`` via the project-bootstrapper,
         not via the install whitelist.
 
-        Note (V52-C, v0.2.52): ``knowledge`` is intentionally NOT in
-        this set anymore. KG nodes are USER-CURATED state. The
-        orchestrator's curated KG set lives under
-        ``templates/knowledge/`` and is bundle-materialized into
-        ``<project>/knowledge/`` by ``_enumerate_bundle_files`` —
-        manifest-tracked with the V47-A hash-compare pattern so user
-        edits are preserved on update."""
+        Note (V52-C, v0.2.52 / v0.2.81): ``knowledge`` is intentionally
+        NOT in this set anymore. KG nodes are USER-CURATED state. The
+        orchestrator's curated KG set lives under ``templates/knowledge/``.
+        As of v0.2.81 it is materialized ROOT-ONLY — into the orchestrator
+        root's ``knowledge/`` (== the shared collection) via install.py
+        Step 4c + the ``_enumerate_bundle_files`` gate — and non-root
+        projects read it via the shared-read fan-out (no per-project copy).
+        Root materialization is manifest-tracked with the V47-A hash-compare
+        pattern so user edits are preserved on update."""
         py = self._python_set()
         required = {
             ".claude",

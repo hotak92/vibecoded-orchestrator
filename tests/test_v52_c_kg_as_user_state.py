@@ -1,42 +1,40 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""V52-C (v0.2.52) — KG nodes as user-curated state.
+"""V52-C (v0.2.52) + v0.2.81 — KG nodes as user-curated state, root-only.
 
-The orchestrator's curated KG node set lives under
-``templates/knowledge/`` and is materialized into ``<project>/knowledge/``
-by ``vco_lib.project_init._enumerate_bundle_files``. The
-manifest-driven hash compare in ``install_project_bundle`` (V47-A
-pattern) preserves user customizations across bundle updates — same
-behavior as agents / skills / hooks.
+The orchestrator's curated KG node set lives under ``templates/knowledge/``.
 
-This file pins five contracts:
+V52-C (v0.2.52) moved it there (out of the source-tree ``knowledge/`` that the
+legacy ``ORCHESTRATOR_MANAGED_PATHS`` whitelist copied) and materialized it
+into ``<project>/knowledge/`` via ``install_project_bundle`` with V47-A
+manifest-hash preserve semantics.
 
-1. **Fresh-install materialization** — every file under
-   ``templates/knowledge/`` reaches ``<project>/knowledge/`` with the
-   correct relative path. Nested subdirectories preserved.
+**v0.2.81 evolution — root-only**: the curated set now ships ONLY to the
+orchestrator-root target (``project_root is None`` or ``project_root ≡
+orchestrator_root``). It lives once in the root's ``knowledge/`` (== the shared
+collection by adopt-and-route definition) and non-root projects read it via the
+shared-read fan-out — no per-project copy. Only the depth-1
+``_PER_PROJECT_KNOWLEDGE_FILES`` allowlist (TAG_HIERARCHY.md, VOCABULARY.md,
+.node_formats.json, .node_embeddings.README.txt) still ships per-project.
 
-2. **Update flow preserves user-modified nodes** — when a user has
-   edited a previously-shipped node, a bundle update via
-   ``install_project_bundle(update_mode=True)`` PRESERVES the user's
-   bytes on disk (action: ``preserve``) and emits the
-   ``bundle_user_modified_preserved`` deferral so Claude Code on next
-   session knows about the conflict.
+This file pins the contracts:
 
-3. **Update flow overwrites untouched shipped nodes** — when the
-   orchestrator's source bytes change but the user never edited the
-   file (installed_hash == manifest's prior shipped hash), update
-   OVERWRITES with the new version (action: ``overwrite``).
-
-4. **User-authored nodes survive unconditionally** — nodes in
-   ``<project>/knowledge/`` that the orchestrator never shipped are
-   NOT in ``manifest["files"]`` and are never visited by the install
-   bundle machinery. They survive every bundle install / update run
-   even when the orchestrator's ``templates/knowledge/`` is empty.
-
+1. **Root-target materialization** — for a root install (folder ≡ orch root)
+   every file under ``templates/knowledge/`` reaches ``<root>/knowledge/`` with
+   the correct relative path; nested subdirectories preserved.
+2. **Non-root gate** — for a non-root project only the allowlisted top-level
+   files ship; the curated ``concepts/`` / ``models/`` / ``tools/`` /
+   ``patterns/`` nodes are NOT materialized.
+3. **Update flow (root)** preserves user-modified nodes / overwrites untouched
+   nodes / honours ``force`` — unchanged semantics, at the root.
+4. **User-authored nodes survive unconditionally** — nodes the orchestrator
+   never shipped are never visited by the bundle machinery, root or non-root.
 5. **``knowledge`` is out of the install whitelist** — the legacy
-   `apply_conflict_strategy` whitelist-copy path NEVER touches the
-   user's ``knowledge/`` directory. This is the structural fix that
-   prevents the v0.2.51 modify-vs-delete merge conflict.
+   ``apply_conflict_strategy`` path never touches ``knowledge/``.
+6. **Source-tree invariant** — ``templates/knowledge/`` exists and is
+   non-empty; root ``knowledge/`` is never git-TRACKED in the public repo
+   (Step 4c may create it on an installed machine, so filesystem-absence is no
+   longer the invariant — "never committed" is).
 
 The fixtures mirror ``tests/test_install_bundle.py::_make_fake_orchestrator``
 but extend it with a ``templates/knowledge/`` subtree.
@@ -44,8 +42,8 @@ but extend it with a ``templates/knowledge/`` subtree.
 from __future__ import annotations
 
 import json
-import platform
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -126,6 +124,21 @@ def _make_fake_orchestrator_with_knowledge(root: Path) -> None:
     )
 
 
+# Curated (non-allowlisted) rels that should NEVER ship to a non-root project.
+_CURATED_RELS = [
+    "knowledge/concepts/foo.md",
+    "knowledge/concepts/bar.md",
+    "knowledge/models/qwen.md",
+    "knowledge/tools/weaviate.md",
+]
+# Allowlisted top-level rels that ship to EVERY project.
+_ALLOWLISTED_RELS = [
+    "knowledge/TAG_HIERARCHY.md",
+    "knowledge/VOCABULARY.md",
+    "knowledge/.node_formats.json",
+]
+
+
 # ---------------------------------------------------------------------------
 # Contract 5: `knowledge` out of the install whitelist
 # ---------------------------------------------------------------------------
@@ -134,12 +147,10 @@ def _make_fake_orchestrator_with_knowledge(root: Path) -> None:
 class KnowledgeOutOfWhitelistTests(unittest.TestCase):
     """`knowledge` must NOT be in `ORCHESTRATOR_MANAGED_PATHS`.
 
-    Mirrors the PR-31 `test_install_no_claude_md_copy.py` shape but for
-    the V52-C `knowledge` removal. The legacy whitelist-copy path
-    (`apply_conflict_strategy`) iterates this constant; with
-    `knowledge` out of it, the user's `knowledge/` directory is
-    never visited by that path. This is the structural fix that
-    prevents the v0.2.51 modify-vs-delete merge conflict at root.
+    The legacy whitelist-copy path (`apply_conflict_strategy`) iterates
+    this constant; with `knowledge` out of it, the user's `knowledge/`
+    directory is never visited by that path. This is the structural fix
+    that prevents the v0.2.51 modify-vs-delete merge conflict at root.
     """
 
     def test_knowledge_not_in_orchestrator_managed_paths(self):
@@ -197,14 +208,14 @@ class KnowledgeOutOfWhitelistTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Contract 1: Fresh-install materialization
+# Contract 1 & 2: Root-target full materialization vs non-root gate
 # ---------------------------------------------------------------------------
 
 
 class FreshInstallMaterializationTests(unittest.TestCase):
-    """`install_project_bundle` materializes every file under
-    `templates/knowledge/` into `<project>/knowledge/` with the
-    correct relative path. Nested subdirectories preserved."""
+    """v0.2.81: root-target installs (folder ≡ orch root) materialize every
+    file under `templates/knowledge/`; non-root projects get only the
+    allowlisted top-level files."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="vct-v52c-fresh-"))
@@ -217,119 +228,127 @@ class FreshInstallMaterializationTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_all_shipped_files_materialized(self):
+    # -- Root-target: full curated set -------------------------------------
+
+    def test_root_target_all_shipped_files_materialized(self):
+        """Root install (folder == orch root) ships the FULL curated set."""
         result = project_init.install_project_bundle(
-            self.proj,
+            self.orch,  # folder == orchestrator root → root target
             orchestrator_root=self.orch,
             update_mode=False,
         )
         self.assertEqual(result["errors"], [])
-        # Every file we put under templates/knowledge/ must appear
-        # under <project>/knowledge/ in the "create" action bucket.
-        expected_rels = [
-            "knowledge/TAG_HIERARCHY.md",
-            "knowledge/VOCABULARY.md",
-            "knowledge/.node_formats.json",
-            "knowledge/concepts/foo.md",
-            "knowledge/concepts/bar.md",
-            "knowledge/models/qwen.md",
-            "knowledge/tools/weaviate.md",
-        ]
+        expected_rels = _ALLOWLISTED_RELS + _CURATED_RELS
         for rel in expected_rels:
-            # On Linux the dest_rel uses forward slashes from PosixPath;
-            # we keep the assertion in `str(Path(...))` shape for
-            # cross-platform stability.
             dest_rel = str(Path(rel))
             self.assertIn(
                 dest_rel, result["actions"]["create"],
                 f"{rel} missing from create actions: "
                 f"{result['actions']['create']}",
             )
-            # File must actually exist on disk with shipped bytes.
-            on_disk = self.proj / Path(rel)
+            on_disk = self.orch / Path(rel)
             self.assertTrue(on_disk.exists(),
                             f"{rel} not materialized on disk")
-            # Markdown nodes embed `shipped-v1` as a literal string
-            # for content provenance; the `.node_formats.json` metadata
-            # file uses JSON shape `{"shipped":"v1"}`. Both forms imply
-            # the same provenance — substring match `"v1"` covers both.
-            self.assertIn(
-                "v1",
-                on_disk.read_text(encoding="utf-8"),
-            )
+            self.assertIn("v1", on_disk.read_text(encoding="utf-8"))
 
-    def test_nested_subdirectories_preserved(self):
-        """`templates/knowledge/concepts/foo.md` must land at
-        `<project>/knowledge/concepts/foo.md`, not flattened."""
+    def test_root_target_none_project_root_ships_full_set(self):
+        """`project_root=None` (legacy self-install default) is a root
+        target — full curated set ships. Uses `_enumerate_bundle_files`
+        directly since `install_project_bundle` always passes folder."""
+        ops = project_init._enumerate_bundle_files(self.orch, project_root=None)
+        dests = {op.dest_rel for op in ops}
+        for rel in _CURATED_RELS + _ALLOWLISTED_RELS:
+            self.assertIn(str(Path(rel)), dests, f"{rel} missing for root None")
+
+    def test_root_target_nested_subdirectories_preserved(self):
         project_init.install_project_bundle(
-            self.proj,
+            self.orch,
             orchestrator_root=self.orch,
             update_mode=False,
         )
-        nested = self.proj / "knowledge" / "concepts" / "foo.md"
+        nested = self.orch / "knowledge" / "concepts" / "foo.md"
         self.assertTrue(nested.exists(),
                         "Nested subdirectory structure lost during materialization")
-        # And not at the flattened path.
-        self.assertFalse((self.proj / "knowledge" / "foo.md").exists())
+        self.assertFalse((self.orch / "knowledge" / "foo.md").exists())
 
-    def test_non_markdown_metadata_files_copied(self):
-        """`.node_formats.json` (and any other non-.md files) must be
-        byte-copied. The materializer is recursive over the whole
-        `templates/knowledge/` tree, not filtered by extension."""
+    def test_root_target_non_markdown_metadata_files_copied(self):
         project_init.install_project_bundle(
-            self.proj,
+            self.orch,
             orchestrator_root=self.orch,
             update_mode=False,
         )
-        metadata = self.proj / "knowledge" / ".node_formats.json"
+        metadata = self.orch / "knowledge" / ".node_formats.json"
         self.assertTrue(metadata.exists())
-        # Bytes byte-identical to source.
         src = self.orch / "templates" / "knowledge" / ".node_formats.json"
-        self.assertEqual(
-            metadata.read_bytes(),
-            src.read_bytes(),
-        )
+        self.assertEqual(metadata.read_bytes(), src.read_bytes())
 
-    def test_manifest_tracks_knowledge_files(self):
-        """Every shipped KG file lands in `.vco-manifest.json["files"]`
-        with a SHA256. Without this entry, the update-mode hash compare
-        can't tell whether the user edited the file (case b vs case c
-        in `_plan_bundle_action`)."""
+    def test_root_target_manifest_tracks_knowledge_files(self):
         project_init.install_project_bundle(
-            self.proj,
+            self.orch,
             orchestrator_root=self.orch,
             update_mode=False,
         )
-        manifest_path = self.proj / ".claude" / ".vco-manifest.json"
+        manifest_path = self.orch / ".claude" / ".vco-manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        # Sample a few entries.
         for rel in (
             "knowledge/TAG_HIERARCHY.md",
             "knowledge/concepts/foo.md",
             "knowledge/.node_formats.json",
         ):
-            self.assertIn(rel, manifest["files"],
-                          f"{rel} missing from manifest")
+            self.assertIn(rel, manifest["files"], f"{rel} missing from manifest")
             self.assertEqual(len(manifest["files"][rel]["sha256"]), 64)
+
+    # -- Non-root: allowlist-only ------------------------------------------
+
+    def test_non_root_only_allowlisted_files_ship(self):
+        """A non-root project gets ONLY the 4 allowlisted top-level files;
+        curated nodes are NOT materialized."""
+        result = project_init.install_project_bundle(
+            self.proj,  # folder != orch root → non-root
+            orchestrator_root=self.orch,
+            update_mode=False,
+        )
+        self.assertEqual(result["errors"], [])
+        created = set(result["actions"]["create"])
+        for rel in _ALLOWLISTED_RELS:
+            self.assertIn(str(Path(rel)), created,
+                          f"allowlisted {rel} should ship per-project")
+            self.assertTrue((self.proj / Path(rel)).exists())
+        for rel in _CURATED_RELS:
+            self.assertNotIn(str(Path(rel)), created,
+                             f"curated {rel} MUST NOT ship to a non-root project")
+            self.assertFalse((self.proj / Path(rel)).exists(),
+                             f"curated {rel} leaked onto disk in a non-root project")
+
+    def test_non_root_curated_subdirs_absent_on_disk(self):
+        project_init.install_project_bundle(
+            self.proj,
+            orchestrator_root=self.orch,
+            update_mode=False,
+        )
+        # No curated subdirectories at all under the non-root knowledge/.
+        for sub in ("concepts", "models", "tools", "patterns"):
+            self.assertFalse((self.proj / "knowledge" / sub).exists(),
+                             f"curated subdir {sub}/ present in non-root project")
 
 
 # ---------------------------------------------------------------------------
-# Contract 2 & 3: Update flow preserves modified, overwrites untouched
+# Contract 3: Update flow at the ROOT preserves modified, overwrites untouched
 # ---------------------------------------------------------------------------
 
 
 class UpdateFlowPreservationTests(unittest.TestCase):
-    """V47-A hash-compare semantics applied to knowledge/ files:
+    """V47-A hash-compare semantics applied to knowledge/ files AT THE ROOT
+    (the only target that materializes curated nodes as of v0.2.81):
     untouched → overwrite; modified → preserve + deferral."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="vct-v52c-update-"))
+        # folder == orchestrator root → root target (curated nodes ship).
         self.orch = self.tmp / "orchestrator"
-        self.proj = self.tmp / "project"
         self.orch.mkdir()
-        self.proj.mkdir()
         _make_fake_orchestrator_with_knowledge(self.orch)
-        # First install: lay down the v1 baseline + manifest.
+        self.proj = self.orch  # root install target
         first = project_init.install_project_bundle(
             self.proj,
             orchestrator_root=self.orch,
@@ -341,17 +360,12 @@ class UpdateFlowPreservationTests(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _bump_shipped_node(self, rel: str, new_content: str) -> None:
-        """Mutate the source to simulate the orchestrator publishing
-        a new version of a shipped KG node."""
         (self.orch / "templates" / "knowledge" / Path(rel)).write_text(
             new_content, encoding="utf-8",
         )
 
     def test_update_overwrites_user_untouched_nodes(self):
-        """User never edited `concepts/foo.md`; orchestrator publishes
-        v2. Update overwrites with v2."""
         installed = self.proj / "knowledge" / "concepts" / "foo.md"
-        # Sanity: file is at v1 after first install.
         self.assertIn("shipped-v1", installed.read_text(encoding="utf-8"))
 
         self._bump_shipped_node("concepts/foo.md",
@@ -365,18 +379,11 @@ class UpdateFlowPreservationTests(unittest.TestCase):
                       result["actions"]["overwrite"])
         self.assertNotIn("knowledge/concepts/foo.md",
                          result["actions"]["preserve"])
-        # File on disk now carries v2 bytes.
         self.assertIn("shipped-v2", installed.read_text(encoding="utf-8"))
 
     def test_update_preserves_user_modified_nodes(self):
-        """User edited `concepts/bar.md`; orchestrator publishes v2.
-        Update PRESERVES the user's bytes on disk and emits the
-        `bundle_user_modified_preserved` deferral."""
         installed = self.proj / "knowledge" / "concepts" / "bar.md"
-        installed.write_text(
-            "# Bar concept\nUSER EDIT\n",
-            encoding="utf-8",
-        )
+        installed.write_text("# Bar concept\nUSER EDIT\n", encoding="utf-8")
 
         self._bump_shipped_node("concepts/bar.md",
                                 "# Bar concept\nshipped-v2\n")
@@ -385,18 +392,14 @@ class UpdateFlowPreservationTests(unittest.TestCase):
             orchestrator_root=self.orch,
             update_mode=True,
         )
-        # File appears in PRESERVE bucket — not overwritten.
         self.assertIn("knowledge/concepts/bar.md",
                       result["actions"]["preserve"])
         self.assertNotIn("knowledge/concepts/bar.md",
                          result["actions"]["overwrite"])
-        # User bytes on disk untouched.
         self.assertEqual(
             installed.read_text(encoding="utf-8"),
             "# Bar concept\nUSER EDIT\n",
         )
-        # Deferral emitted so Claude Code on next session sees the
-        # conflict and can offer a merge.
         report = DeferralReport.read(self.proj)
         self.assertTrue(
             report.has_condition("bundle_user_modified_preserved"),
@@ -409,13 +412,8 @@ class UpdateFlowPreservationTests(unittest.TestCase):
                       "deferral body must name the preserved file")
 
     def test_update_force_overwrites_user_modifications(self):
-        """With `force=True`, even user-modified nodes get overwritten.
-        Same escape hatch as agents/skills (`install-bundle --force`)."""
         installed = self.proj / "knowledge" / "concepts" / "foo.md"
-        installed.write_text(
-            "# Foo concept\nUSER EDIT\n",
-            encoding="utf-8",
-        )
+        installed.write_text("# Foo concept\nUSER EDIT\n", encoding="utf-8")
         self._bump_shipped_node("concepts/foo.md",
                                 "# Foo concept\nshipped-v2\n")
         project_init.install_project_bundle(
@@ -424,8 +422,7 @@ class UpdateFlowPreservationTests(unittest.TestCase):
             update_mode=True,
             force=True,
         )
-        self.assertIn("shipped-v2",
-                      installed.read_text(encoding="utf-8"))
+        self.assertIn("shipped-v2", installed.read_text(encoding="utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -434,17 +431,17 @@ class UpdateFlowPreservationTests(unittest.TestCase):
 
 
 class UserAuthoredNodesSurviveTests(unittest.TestCase):
-    """Nodes the orchestrator never shipped (user-authored locals) are
-    NOT in `manifest["files"]`. The bundle install machinery never
-    visits them — they survive every install / update run."""
+    """Nodes the orchestrator never shipped (user-authored locals) are NOT in
+    `manifest["files"]`. The bundle install machinery never visits them — they
+    survive every install / update run. Exercised at the ROOT (where curated
+    nodes materialize, so the orphan/retirement paths are fully in play)."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="vct-v52c-user-"))
         self.orch = self.tmp / "orchestrator"
-        self.proj = self.tmp / "project"
         self.orch.mkdir()
-        self.proj.mkdir()
         _make_fake_orchestrator_with_knowledge(self.orch)
+        self.proj = self.orch  # root target
         project_init.install_project_bundle(
             self.proj,
             orchestrator_root=self.orch,
@@ -455,8 +452,6 @@ class UserAuthoredNodesSurviveTests(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_user_authored_node_survives_update(self):
-        """Drop a user-only `.md` into `knowledge/` and run an update.
-        File must be untouched (NOT in any action bucket)."""
         user_node = self.proj / "knowledge" / "concepts" / "my-local-pattern.md"
         user_node.write_text(
             "# My local pattern\nuser-authored, never shipped\n",
@@ -468,31 +463,25 @@ class UserAuthoredNodesSurviveTests(unittest.TestCase):
             orchestrator_root=self.orch,
             update_mode=True,
         )
-        # File still on disk, unchanged.
         self.assertTrue(user_node.exists())
         self.assertEqual(
             user_node.read_text(encoding="utf-8"),
             "# My local pattern\nuser-authored, never shipped\n",
         )
-        # Not in ANY action bucket — the bundle never saw it.
         rel = "knowledge/concepts/my-local-pattern.md"
         for bucket in (
             "create", "overwrite", "always-overwrite", "preserve",
             "noop", "skip-existing", "skip-disabled",
-            "orphan-deleted", "orphan-preserved",
+            "orphan-deleted", "orphan-preserved", "knowledge-retired",
         ):
             self.assertNotIn(rel, result["actions"][bucket],
                              f"User-authored node leaked into '{bucket}' bucket — "
                              "bundle path should never visit it")
 
     def test_user_authored_node_not_in_manifest(self):
-        """The manifest tracks ONLY shipped files. User-authored locals
-        must never be added to `manifest["files"]` — that would let
-        the orphan-resolution loop see them on a future update."""
         user_node = self.proj / "knowledge" / "concepts" / "my-local-pattern.md"
         user_node.write_text("user-only\n", encoding="utf-8")
 
-        # Run update to refresh manifest.
         project_init.install_project_bundle(
             self.proj,
             orchestrator_root=self.orch,
@@ -510,14 +499,12 @@ class UserAuthoredNodesSurviveTests(unittest.TestCase):
         )
 
     def test_user_authored_node_survives_when_shipped_set_shrinks(self):
-        """V52-C edge case: orchestrator removes ALL shipped knowledge
-        files in a future release. User-authored nodes still must
-        survive (they're never in the orphan-deletion candidate set
-        because they were never in `manifest["files"]`)."""
+        """Orchestrator removes ALL shipped knowledge files in a future
+        release. User-authored nodes still survive (never in the orphan
+        candidate set). At the ROOT the removed curated nodes orphan-delete."""
         user_node = self.proj / "knowledge" / "concepts" / "my-local-pattern.md"
         user_node.write_text("user-only\n", encoding="utf-8")
 
-        # Wipe the orchestrator's shipped set entirely.
         shutil.rmtree(self.orch / "templates" / "knowledge")
         (self.orch / "templates" / "knowledge").mkdir()
 
@@ -526,16 +513,8 @@ class UserAuthoredNodesSurviveTests(unittest.TestCase):
             orchestrator_root=self.orch,
             update_mode=True,
         )
-        # User node still present + untouched.
         self.assertTrue(user_node.exists())
-        self.assertEqual(
-            user_node.read_text(encoding="utf-8"),
-            "user-only\n",
-        )
-        # Shipped nodes that the orchestrator no longer ships are
-        # orphan-deleted (since they match the prior-shipped hash).
-        # The user-authored node is NOT in that list — its presence
-        # there would mean the orphan loop picked it up incorrectly.
+        self.assertEqual(user_node.read_text(encoding="utf-8"), "user-only\n")
         self.assertNotIn(
             "knowledge/concepts/my-local-pattern.md",
             result["actions"]["orphan-deleted"],
@@ -547,15 +526,12 @@ class UserAuthoredNodesSurviveTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Source-tree invariant: templates/knowledge/ exists in this repo
+# Source-tree invariant: templates/knowledge/ exists; root knowledge/ untracked
 # ---------------------------------------------------------------------------
 
 
 class SourceTreeInvariantTests(unittest.TestCase):
-    """Lightweight sanity check that the V52-C move actually landed at
-    the orchestrator-source level. If a future refactor moves shipped
-    KG nodes back to `knowledge/`, this test catches it before the
-    install path does."""
+    """Lightweight sanity check that the V52-C move landed and stays landed."""
 
     def test_templates_knowledge_directory_exists(self):
         tk = REPO_ROOT / "templates" / "knowledge"
@@ -567,32 +543,53 @@ class SourceTreeInvariantTests(unittest.TestCase):
             "or moved back to `knowledge/`.",
         )
 
-    def test_root_knowledge_directory_absent(self):
-        """The legacy `knowledge/` directory at the orchestrator root
-        must NOT exist. If a contributor accidentally re-adds it (e.g.
-        copies user-state from VCO_dev back into the public repo),
-        this test catches it before the install path does."""
-        legacy = REPO_ROOT / "knowledge"
-        self.assertFalse(
-            legacy.exists(),
-            f"Legacy `{legacy}` directory present. V52-C moved the "
-            "shipped KG set to `templates/knowledge/`. A `knowledge/` "
-            "directory at the orchestrator root would either get "
-            "double-shipped (if `knowledge` is re-added to the install "
-            "whitelist) or silently ignored — neither is desirable.",
+    def test_root_knowledge_directory_not_git_tracked(self):
+        """v0.2.81: the root `knowledge/` directory must NOT be git-TRACKED
+        in the public repo. install.py Step 4c CREATES it on any installed
+        machine (materializing the curated set into root == shared), so
+        filesystem-absence is no longer the invariant — "never committed to
+        the public repo" is. A `.gitignore /knowledge/` rule keeps Step 4c's
+        output out of `git status` noise + accidental commits.
+
+        Skips gracefully when git is unavailable (CI without a checkout)."""
+        try:
+            proc = subprocess.run(
+                ["git", "ls-files", "--", "knowledge/"],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (FileNotFoundError, subprocess.SubprocessError, OSError):
+            self.skipTest("git unavailable — cannot assert git-index state")
+            return
+        if proc.returncode != 0:
+            self.skipTest(
+                "git ls-files failed (not a repo checkout?) — "
+                f"stderr: {proc.stderr.strip()}"
+            )
+            return
+        tracked = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+        self.assertEqual(
+            tracked, [],
+            "The root `knowledge/` directory has git-TRACKED files:\n"
+            + "\n".join(tracked)
+            + "\nv0.2.81 ships the curated KG set from `templates/knowledge/` "
+            "and materializes it into root `knowledge/` at install time "
+            "(Step 4c). The public repo must NOT commit those nodes — add "
+            "`/knowledge/` to .gitignore and `git rm --cached` any tracked "
+            "node. (The maintainer's private fork may commit curated root "
+            "nodes; a `/knowledge/` ignore only affects UNTRACKED files, so "
+            "already-tracked fork nodes stay tracked.)",
         )
 
     def test_templates_knowledge_has_at_least_one_md_file(self):
-        """The orchestrator's curated KG set should not be empty in a
-        shipped release. A trivial `templates/knowledge/` with zero
-        files would mean the V52-C move incorrectly dropped content."""
         tk = REPO_ROOT / "templates" / "knowledge"
         md_count = sum(1 for _ in tk.rglob("*.md"))
         self.assertGreater(
             md_count, 0,
-            f"templates/knowledge/ has 0 markdown files. The V52-C "
-            "move was supposed to relocate the curated KG set (113 .md "
-            "files at v0.2.52 ship time) into this directory.",
+            "templates/knowledge/ has 0 markdown files. The V52-C move was "
+            "supposed to relocate the curated KG set into this directory.",
         )
 
 
