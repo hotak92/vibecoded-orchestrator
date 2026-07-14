@@ -151,12 +151,17 @@ pub fn restrict_file_to_owner_windows(path: &Path) {
         //   /grant:r "<u>:F" -> replace grants: only <u> gets Full
         // Result: owner-only DACL, no inherited-from-parent access.
         let grant = format!("{}:F", username);
+        // `.silent()` consumes `self` (by value), so it must come FIRST on the
+        // freshly-constructed owned Command — chaining it after `.arg()` (which
+        // returns `&mut Command`) is E0507 "cannot move out of a mutable
+        // reference". This matches the established call pattern elsewhere
+        // (e.g. module_supervisor.rs: `Command::new(x).silent().arg(...)`).
         let output = std::process::Command::new("icacls")
+            .silent()
             .arg(path)
             .arg("/inheritance:r")
             .arg("/grant:r")
             .arg(&grant)
-            .silent()
             .output();
 
         match output {
