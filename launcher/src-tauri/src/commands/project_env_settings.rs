@@ -1205,8 +1205,20 @@ fn resolve_kg_access_peers(
 /// Extract peer project names whose code graph the given project can read.
 /// Reads the `codegraph_access` table for rows where `grantee_project_id =
 /// project_id` and `access_level = 'read'`, then resolves grantor IDs to
-/// human-readable project names. Sorted by sanitized peer name for
-/// deterministic env output. Soft-fail to empty list on any DB error.
+/// project NAMES. Sorted for deterministic env output. Soft-fail to empty
+/// list on any DB error.
+///
+/// v0.2.80 (GAP-CG-1, third producer): this writer previously emitted the
+/// SANITIZED PREFIX (`sanitize_kg_collection(name)`) — neither the slug the
+/// hub/Python producers used to emit nor the NAME the consumers expect. The
+/// `VCT_CODE_GRAPH_ACCESS_LIST` contract is grantor NAMES (what the analyzer
+/// stamped in the `project` property; consumers derive the class prefix
+/// themselves) — converging with `config_api.rs::
+/// list_codegraph_grantor_names_for_grantee` and
+/// `config_projection.py::_fetch_code_graph_access_list`. A prefix-form entry
+/// made the MCP's `project`-property filter miss every peer row (silent
+/// zeros) and kept REGRESSING the env value on every launcher-side refresh
+/// after install.py's name-form re-projection.
 fn resolve_code_graph_access_peers(db: &Db, project_id: &str) -> Vec<String> {
     let rows = match db.codegraph_list_grants_to(project_id) {
         Ok(r) => r,
@@ -1220,13 +1232,11 @@ fn resolve_code_graph_access_peers(db: &Db, project_id: &str) -> Vec<String> {
         if grantor_id == project_id {
             continue;
         }
-        // Resolve grantor's name → sanitized prefix (matches the per-project
-        // code-graph collection naming `<Sanitized>_CodeFunction` etc.).
         match db.get_project(&grantor_id) {
             Ok(Some(row)) => {
-                let sanitized = sanitize_kg_collection(&row.name);
-                if !sanitized.is_empty() {
-                    peers.insert(sanitized);
+                let name = row.name.trim().to_string();
+                if !name.is_empty() {
+                    peers.insert(name);
                 }
             }
             // Dangling grantor (project deleted): skip silently.
@@ -1596,6 +1606,39 @@ mod tests {
         assert!(!s.shared_kg_read_disabled);
         assert!(!s.use_gpu);
         assert!(s.cpu_only);
+    }
+
+    #[test]
+    fn resolve_code_graph_access_peers_emits_grantor_names_not_prefixes() {
+        // v0.2.80 GAP-CG-1 third producer: the env writer must emit the
+        // grantor's NAME — not the sanitized class prefix it used to emit,
+        // and not the slug the hub/Python producers used to emit. Fixture
+        // deliberately has name ≠ slug ≠ prefix ("Client Alpha" /
+        // "client-alpha" / "ClientAlpha") so any regression to either wrong
+        // form fails. Act + leave-alone: non-read grants and self-grants are
+        // excluded.
+        use crate::db::models::ProjectHost;
+        let db = Db::open_in_memory().unwrap();
+        db.insert_project("me", "My_Project", "/tmp/me", ProjectHost::Base, "my-project")
+            .unwrap();
+        db.insert_project(
+            "peer",
+            "Client Alpha",
+            "/tmp/peer",
+            ProjectHost::Base,
+            "client-alpha",
+        )
+        .unwrap();
+        db.insert_project("none", "No Grant", "/tmp/none", ProjectHost::Base, "no-grant")
+            .unwrap();
+        db.codegraph_grant("peer", "me", "read").unwrap();
+        db.codegraph_grant("none", "me", "none").unwrap();
+
+        let peers = resolve_code_graph_access_peers(&db, "me");
+        assert_eq!(peers, vec!["Client Alpha".to_string()]);
+        // Explicit negatives: neither the prefix nor the slug form.
+        assert!(!peers.contains(&"ClientAlpha".to_string()));
+        assert!(!peers.contains(&"client-alpha".to_string()));
     }
 
     #[test]

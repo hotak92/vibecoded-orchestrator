@@ -6478,10 +6478,11 @@ def main() -> int:
             data=_backfill_result,
         )
 
-        # v0.2.80 GAP-CG-1: re-project ALL projects (name-form access lists);
-        # semantics + posture documented on run_update_reprojection_step.
+        # v0.2.80 GAP-CG-1: re-project ALL projects (name-form lists); the
+        # deferral_report threading is LOAD-BEARING (review B2, None-guarded).
         from vco_lib.config_projection import run_update_reprojection_step
-        run_update_reprojection_step(print_fn=print, log_event=_log_install_event)
+        run_update_reprojection_step(print_fn=print, log_event=_log_install_event,
+                                     deferral_report=_deferral_report)
 
         # PR-22 (v0.2.12, 2026-05-16): rename legacy
         # `docker-compose.override.yml` to `compose.override.yaml` so

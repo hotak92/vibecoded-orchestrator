@@ -3112,6 +3112,7 @@ def run_update_reprojection_step(
     *,
     print_fn: Any = print,
     log_event: Any | None = None,
+    deferral_report: Any | None = None,
 ) -> None:
     """install.py ``--update`` wiring for :func:`reproject_all_registered_projects`.
 
@@ -3122,14 +3123,19 @@ def run_update_reprojection_step(
       the same posture as the orchestrator-root backfill's ``db_unreachable``
       arm (the first project add creates launcher.db; later ``--update`` runs
       re-project then).
-    - Per-project failures already emitted canonical deferral entries inside
-      the sweep (``codegraph_access_list_reprojection_failed``); here they are
-      only COUNTED for the operator summary.
+    - ``deferral_report`` MUST be threaded from the caller for per-project
+      failures to land in UPDATE_DEFERRED.md: the sweep's ``safe_emit_entry``
+      is None-guarded, so omitting it silently drops the entries while the
+      summary below still says "N deferred" — the exact masking false-signal
+      the 2026-07-14 final review flagged (B2). install.py passes its live
+      ``_deferral_report``.
     - Never raises past DbUnreachable handling: the update must not die on a
       summary/logging problem (the sweep itself did the real work).
     """
     try:
-        outcomes = reproject_all_registered_projects(log_event=log_event)
+        outcomes = reproject_all_registered_projects(
+            log_event=log_event, deferral_report=deferral_report
+        )
     except DbUnreachable:
         return
     migrated = sum(1 for o in outcomes if o["status"] == "migrated")

@@ -46,6 +46,13 @@ except Exception:
 fp = (d.get("tool_input") or {}).get("file_path", "") if isinstance(d, dict) else ""
 if not fp:
     sys.exit(0)
+if not fp.endswith(".py"):
+    # v0.2.80: the settings matcher is bare `Write` (the old `if:
+    # "Write(*.py)"` never matched — hook-if regression fix), so the
+    # .py gate lives HERE. Without it every non-Python Write produced a
+    # false "SyntaxError" and compiling a Python-parsable non-.py file
+    # dropped __pycache__ next to user files (final-review B1).
+    sys.exit(0)
 try:
     py_compile.compile(fp, doraise=True)
     sys.stdout.write("OK")

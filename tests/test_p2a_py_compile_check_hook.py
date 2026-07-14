@@ -131,5 +131,38 @@ def test_templates_reference_named_hook_not_inline():
     )
 
 
+def test_non_python_write_is_silent(tmp_path):
+    """v0.2.80 final-review B1: the settings matcher is bare `Write` (the old
+    `if: "Write(*.py)"` never matched), so the hook itself must gate on the
+    .py suffix — a non-Python Write must produce NO output (previously every
+    .md/.json/.rs Write surfaced a false `py_compile: ... SyntaxError`)."""
+    f = tmp_path / "notes.md"
+    f.write_text("# heading\n\nnot python ( at all:\n")
+    res = _run_sh(json.dumps({"tool_input": {"file_path": str(f)}}))
+    assert res.returncode == 0
+    assert res.stdout.strip() == "", res.stdout
+
+
+def test_python_parsable_non_py_file_not_compiled(tmp_path):
+    """B1 pollution case: a .json that happens to parse as a Python
+    expression must NOT be compiled — pre-fix it compiled clean and dropped
+    `__pycache__/<name>.cpython-*.pyc` next to the user's file."""
+    f = tmp_path / "sample.json"
+    f.write_text('{"a": 1}\n')
+    res = _run_sh(json.dumps({"tool_input": {"file_path": str(f)}}))
+    assert res.returncode == 0
+    assert res.stdout.strip() == "", res.stdout
+    assert not (tmp_path / "__pycache__").exists(), "bytecode pollution"
+
+
+def test_py_suffix_gate_present_in_both_hook_siblings():
+    """Source guard: the .py gate must exist in BOTH the .sh and .ps1 hooks
+    (they self-filter now that the matcher is bare Write)."""
+    sh = HOOK_SH.read_text(encoding="utf-8")
+    ps1 = HOOK_PS1.read_text(encoding="utf-8")
+    assert 'endswith(".py")' in sh, ".sh lost the .py suffix gate"
+    assert "EndsWith('.py')" in ps1, ".ps1 lost the .py suffix gate"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

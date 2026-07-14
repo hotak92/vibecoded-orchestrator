@@ -7,9 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.80] - 2026-07-13
+## [0.2.80] - 2026-07-14
 
 ### Security
+- **A non-root project's `.env` secrets now migrate to that project's own
+  scope instead of the machine-wide shared store.** The three `.env`-migration
+  writers (the hub `/migrate` route, the GUI import, and the CLI) hardcoded the
+  shared scope and dropped the owning project id, so a per-project credential
+  (e.g. a client's DB password) migrated from that project's Secrets tab
+  became resolvable by *every* registered project on the machine. Migration is
+  now project-scoped for non-root projects (the orchestrator root's secrets
+  legitimately stay shared). This is forward-looking: newly-migrated secrets
+  land in the right scope; existing already-shared secrets are left untouched
+  (VCO never auto-mutates a stored secret) and can be re-scoped manually from
+  the Secrets tab.
 - **Secret values are now shape-checked at every write boundary, so a multi-line
   "blob" can no longer be silently stored where it breaks `git push`/`gh` auth.**
   A file-store or keychain secret that is actually several secrets glued together
@@ -44,8 +55,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`vct doctor` now classifies secret corruption modes** — blob vs
   length-corrupted token vs legitimate multi-line — so the remediation it
   suggests matches the actual problem.
+- **Per-project opt-out from shared secrets.** A project's Secrets tab now has
+  a toggle to exclude that project from resolving the machine-wide shared
+  secrets, mirroring the existing shared-KG read/write toggles. Previously only
+  per-key pausing existed; there was no project-level switch.
 
 ### Fixed
+- **The Identity-tab "exclude from shared KG" toggles now actually take
+  effect.** The read/write-disabled toggles wrote their flag under one
+  module-settings key while the hub config resolver and the Python env
+  projection read a different key, so the toggle silently did nothing (since
+  v0.2.46). Both sides now use one shared constant; a launcher-DB migration
+  moves any previously-saved-but-ineffective toggle to the canonical key so
+  past choices finally apply.
 - **Four hooks that had been silently disabled since v0.2.76/77 fire again:
   KG-node summary generation, diagram path validation, Python compile checks,
   and the Vercel token guard.** The hook-latency work had added `if` conditions

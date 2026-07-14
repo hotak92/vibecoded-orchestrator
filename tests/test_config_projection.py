@@ -1697,3 +1697,50 @@ def test_list_registered_projects_db_missing(tmp_path: Path) -> None:
     """DB file absent → :class:`DbUnreachable`."""
     with pytest.raises(DbUnreachable):
         list_registered_projects(db_path=tmp_path / "does-not-exist.db")
+
+
+def test_run_update_reprojection_step_threads_deferral_report(monkeypatch, capsys):
+    """v0.2.80 final-review B2: the install.py --update wiring MUST pass the
+    live deferral report into the sweep — the sweep's ``safe_emit_entry`` is
+    None-guarded, so a dropped kwarg silently loses every per-project failure
+    entry while the operator summary still says "N deferred".
+    Act: the SAME report object reaches the sweep. Leave-alone: DbUnreachable
+    stays a quiet no-op."""
+    import vco_lib.config_projection as cp
+
+    seen: dict = {}
+
+    def _fake_sweep(*, log_event=None, deferral_report=None):
+        seen["deferral_report"] = deferral_report
+        seen["log_event"] = log_event
+        return [
+            {
+                "project_id": "p1",
+                "project_name": "P One",
+                "status": "failed",
+                "detail": "boom",
+                "keys_written": [],
+            }
+        ]
+
+    monkeypatch.setattr(cp, "reproject_all_registered_projects", _fake_sweep)
+    sentinel_report = object()
+    cp.run_update_reprojection_step(
+        print_fn=print, log_event=None, deferral_report=sentinel_report
+    )
+    assert seen["deferral_report"] is sentinel_report, (
+        "deferral_report kwarg not threaded — per-project failures would be "
+        "silently dropped (B2)"
+    )
+    out = capsys.readouterr().out
+    assert "1 deferred" in out
+
+    # Leave-alone: DbUnreachable is a quiet no-op (no summary, no raise).
+    def _raise_unreachable(**_kw):
+        raise cp.DbUnreachable("no db")
+
+    monkeypatch.setattr(cp, "reproject_all_registered_projects", _raise_unreachable)
+    cp.run_update_reprojection_step(
+        print_fn=print, log_event=None, deferral_report=sentinel_report
+    )
+    assert capsys.readouterr().out == ""
