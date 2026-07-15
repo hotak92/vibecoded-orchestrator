@@ -87,7 +87,11 @@ $patterns = @(
     @{ Label = "AWS access key";          Re = 'AKIA[A-Z0-9]{16}' },
     @{ Label = "GitHub token";            Re = 'gh[pousr]_[a-zA-Z0-9]{36}' },
     @{ Label = "GitHub fine-grained PAT"; Re = 'github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}' },
-    @{ Label = "PEM private key";         Re = 'BEGIN (RSA |EC |OPENSSH |)PRIVATE KEY' },
+    # "PEM private key" is NOT in this table — v0.2.82 moved it to a
+    # dedicated plausible-body check below (MUST MATCH the .sh sibling's
+    # check_pem_key): the bare BEGIN-marker regex re-alerted on every edit
+    # of files that carry the marker as a literal (pattern tables, the
+    # secrets.rs write-guard stub fixture).
     @{ Label = "Generic secret";          Re = '(SECRET|API_KEY|ACCESS_TOKEN|PRIVATE_KEY)\s*[:=]\s*["''][a-zA-Z0-9+/=_\-]{32,}' },
     @{ Label = "Generic secret (unquoted)"; Re = '(SECRET|API_KEY|ACCESS_TOKEN|PRIVATE_KEY)\s*[:=]\s*[a-zA-Z0-9+/=_\-]{32,}' },
     @{ Label = "Hook leak-test marker";   Re = 'VCT_HOOK_LEAK_PROBE_a3f7c2' }
@@ -99,6 +103,22 @@ try { $content = Get-Content -LiteralPath $EditedFile -Raw -ErrorAction Stop } c
 $alerts = @()
 foreach ($p in $patterns) {
     if ($content -match $p.Re) { $alerts += $p.Label }
+}
+
+# v0.2.82: PEM detection requires a PLAUSIBLE key body (>=256 base64 chars
+# after the BEGIN marker, before -----END). A real private-key body is
+# >=1600 chars; stub fixtures (secrets.rs write-guard leave-alone test:
+# 13 chars) must not alert. MUST MATCH the .sh sibling's check_pem_key.
+$pemMatches = [regex]::Matches($content, 'BEGIN (RSA |EC |OPENSSH |)PRIVATE KEY')
+foreach ($pm in $pemMatches) {
+    $start = $pm.Index + $pm.Length
+    $len = [Math]::Min(8192, $content.Length - $start)
+    if ($len -le 0) { continue }
+    $window = $content.Substring($start, $len)
+    $endIdx = $window.IndexOf('-----END')
+    $body = if ($endIdx -ge 0) { $window.Substring(0, $endIdx) } else { $window }
+    $b64 = ($body -replace '[^A-Za-z0-9+/=]', '')
+    if ($b64.Length -ge 256) { $alerts += "PEM private key"; break }
 }
 
 if ($alerts.Count -gt 0) {
@@ -138,12 +158,38 @@ if ($alerts.Count -gt 0) {
     $line = $entry | ConvertTo-Json -Compress -Depth 5
     try { Add-Content -Path $AlertLog -Value $line -ErrorAction Stop } catch { }
 
+    # v0.2.82: desktop-toast DEDUP — same (file, patterns) key notifies at
+    # most once per 6h. JSONL log + model envelope stay per-event (forensics
+    # and agent awareness are never rate-limited — only the human toast).
+    # MUST MATCH the .sh sibling's dedup (same file, same key derivation).
+    $dedupFile = Join-Path $ProjectRoot ".claude/logs/.cred_alert_notify_dedup"
+    $ttlSecs = 21600
+    $shouldNotify = $true
+    $dedupKey = $null
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $keyBytes = [System.Text.Encoding]::UTF8.GetBytes("$EditedFile|$($alerts -join ' ')")
+        $dedupKey = ([System.BitConverter]::ToString($sha.ComputeHash($keyBytes)) -replace '-', '').Substring(0, 16).ToLower()
+    } catch { }
+    $nowEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    if ($dedupKey -and (Test-Path $dedupFile)) {
+        try {
+            $lastLine = Select-String -Path $dedupFile -Pattern "^$dedupKey " | Select-Object -Last 1
+            if ($lastLine) {
+                $lastTs = [int64](($lastLine.Line -split ' ')[1])
+                if (($nowEpoch - $lastTs) -lt $ttlSecs) { $shouldNotify = $false }
+            }
+        } catch { }
+    }
     $NotifyScript = Join-Path $ProjectRoot ".claude/scripts/notify.py"
-    if ($PY -and (Test-Path $NotifyScript)) {
+    if ($shouldNotify -and $PY -and (Test-Path $NotifyScript)) {
         try {
             & $PY $NotifyScript "Claude Code Security Alert" $msg `
                 --urgency critical --icon dialog-warning 2>$null | Out-Null
         } catch { }
+        if ($dedupKey) {
+            try { Add-Content -Path $dedupFile -Value "$dedupKey $nowEpoch" -ErrorAction Stop } catch { }
+        }
     }
     # Surface the alert to the model via the PostToolUse JSON envelope
     # (`hookSpecificOutput.additionalContext`). Plain stdout from

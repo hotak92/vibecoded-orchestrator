@@ -50,6 +50,18 @@ FAKE_CLASSIC_PAT = "ghp_" + ("c" * 36)
 FAKE_UNQUOTED_ENV = "API_KEY=" + ("d" * 40)
 # Legacy QUOTED generic secret (must still fire).
 FAKE_QUOTED_SECRET = 'API_KEY="' + ("e" * 40) + '"'
+# v0.2.82: PEM plausible-body rule. The STUB mirrors the secrets.rs
+# write-guard fixture shape (13-char body — a pattern literal, not a leak);
+# the PLAUSIBLE one has a >=256-char base64-ish body (real keys are >=1600).
+PEM_STUB = (
+    "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIB\nAAAA\n"
+    "-----END RSA PRIVATE KEY-----"
+)
+PEM_PLAUSIBLE = (
+    "-----BEGIN RSA PRIVATE KEY-----\n"
+    + ("M" * 64 + "\n") * 5
+    + "-----END RSA PRIVATE KEY-----"
+)
 
 
 def _run_sh_scanner(tmp_path: Path, file_body: str) -> subprocess.CompletedProcess:
@@ -103,6 +115,52 @@ class TestShScannerShapes:
         # (leave-alone case).
         alerts = _run_sh_scanner(tmp_path, "API_KEY=on\nDEBUG=true\n")
         assert "Generic secret" not in alerts, alerts
+
+
+@pytest.mark.skipif(_IS_WINDOWS, reason="bash hook; .ps1 covered separately")
+class TestShPemPlausibleBodyAndNotifyDedup:
+    """v0.2.82: (a) PEM alerts require a plausible key body — pattern
+    literals / stub fixtures (secrets.rs write-guard test) must not alert
+    on every edit; (b) the desktop toast dedupes per (file, patterns) key
+    while the JSONL forensic log stays per-event."""
+
+    def test_pem_stub_body_does_not_alert(self, tmp_path):
+        # Fails on pre-v0.2.82 scanners (bare BEGIN-marker regex fired).
+        alerts = _run_sh_scanner(tmp_path, PEM_STUB)
+        assert "PEM private key" not in alerts, alerts
+
+    def test_pem_plausible_body_still_alerts(self, tmp_path):
+        # Leave-alone: a real-shaped key body must keep firing.
+        alerts = _run_sh_scanner(tmp_path, PEM_PLAUSIBLE)
+        assert "PEM private key" in alerts, alerts
+
+    def test_desktop_notify_deduped_but_jsonl_per_event(self, tmp_path):
+        proj = tmp_path / "proj"
+        scripts = proj / ".claude" / "scripts"
+        scripts.mkdir(parents=True, exist_ok=True)
+        calls = proj / "notify_calls.txt"
+        # Stub notify.py records each invocation; the hook calls it as
+        # `$PY notify.py "Claude Code Security Alert" "$MSG" ...`.
+        (scripts / "notify.py").write_text(
+            "import sys, pathlib\n"
+            "p = pathlib.Path(" + repr(str(calls)) + ")\n"
+            "with p.open('a', encoding='utf-8') as f:\n"
+            "    f.write(' '.join(sys.argv[1:]) + '\\n')\n",
+            encoding="utf-8",
+        )
+        _run_sh_scanner(tmp_path, FAKE_CLASSIC_PAT)
+        alerts = _run_sh_scanner(tmp_path, FAKE_CLASSIC_PAT)
+        # JSONL: BOTH events logged (forensics never rate-limited).
+        assert alerts.count("GitHub token") == 2, alerts
+        # Toast: exactly ONE notify call across the two runs.
+        n_calls = (
+            len(calls.read_text(encoding="utf-8").splitlines())
+            if calls.exists() else 0
+        )
+        assert n_calls == 1, (
+            f"expected exactly 1 desktop notification, got {n_calls} "
+            "(dedup regressed — the 2026-07-15 toast-storm shape)"
+        )
 
 
 def test_github_pat_shape_matches_canonical_anchor():
@@ -273,6 +331,15 @@ class TestPs1ScannerParity:
     def test_ps1_unquoted_env_assignment_fires(self, tmp_path):
         alerts = self._run_ps1(tmp_path, FAKE_UNQUOTED_ENV)
         assert "Generic secret (unquoted)" in alerts, alerts
+
+    def test_ps1_pem_stub_body_does_not_alert(self, tmp_path):
+        # v0.2.82 parity with the .sh plausible-body rule.
+        alerts = self._run_ps1(tmp_path, PEM_STUB)
+        assert "PEM private key" not in alerts, alerts
+
+    def test_ps1_pem_plausible_body_still_alerts(self, tmp_path):
+        alerts = self._run_ps1(tmp_path, PEM_PLAUSIBLE)
+        assert "PEM private key" in alerts, alerts
 
 
 if __name__ == "__main__":

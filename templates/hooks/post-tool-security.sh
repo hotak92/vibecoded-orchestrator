@@ -107,7 +107,33 @@ check_pattern "GitHub token"             'gh[pousr]_[a-zA-Z0-9]{36}'
 # false-positives on Rust release-binary rodata identifier soup; here it
 # also keeps us from matching identifiers like `get_github_pat_preview`.
 check_pattern "GitHub fine-grained PAT"  'github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}'
-check_pattern "PEM private key"          'BEGIN (RSA |EC |OPENSSH |)PRIVATE KEY'
+# v0.2.82: PEM detection requires a PLAUSIBLE key body, not just the BEGIN
+# marker. Pattern-definition/test files legitimately contain the marker as a
+# literal (vct-launcher-core/src/secrets.rs ships a 13-char stub PEM as the
+# write-guard's leave-alone fixture) and were re-alerting on EVERY edit. A
+# real private-key body is >=1600 base64 chars; requiring >=256 keeps every
+# real leak detectable while ignoring obvious stubs. Needs a multi-line
+# window that grep -E can't express, hence $PY.
+check_pem_key() {
+    if "$PY" - "$EDITED_FILE" <<'PYEOF' 2>/dev/null
+import re, sys
+try:
+    text = open(sys.argv[1], encoding="utf-8", errors="ignore").read()
+except Exception:
+    sys.exit(1)
+for m in re.finditer(r"BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY", text):
+    window = text[m.end():m.end() + 8192]
+    end = window.find("-----END")
+    body = window if end < 0 else window[:end]
+    if len(re.sub(r"[^A-Za-z0-9+/=]", "", body)) >= 256:
+        sys.exit(0)  # plausible real key -> alert
+sys.exit(1)  # marker(s) without a plausible body -> stub/pattern, no alert
+PYEOF
+    then
+        ALERTS+=("PEM private key")
+    fi
+}
+check_pem_key
 check_pattern "Generic secret"           '(SECRET|API_KEY|ACCESS_TOKEN|PRIVATE_KEY)\s*[:=]\s*["'"'"'][a-zA-Z0-9+/=_\-]{32,}'
 # D-13 (v0.2.75): unquoted-assignment variant of the generic-secret
 # pattern. The quoted form above requires an opening quote after the
@@ -156,10 +182,30 @@ sys.stdout.write(json.dumps({
         printf '%s\n' "$JSONL" >> "$ALERT_LOG" 2>/dev/null || true
     fi
     # Cross-platform notification (Linux/macOS/Windows). See audit F2.
-    if [ -n "${PY:-}" ] && [ -f "$PROJECT_ROOT/.claude/scripts/notify.py" ]; then
+    # v0.2.82: desktop-toast DEDUP — the SAME (file, patterns) alert notifies
+    # at most once per 6h window. Repeated edits of a file that legitimately
+    # trips a pattern were emitting an identical toast PER EDIT (hundreds
+    # during an agent session on secrets.rs). Forensics are NOT rate-limited:
+    # the JSONL log above and the model envelope below stay per-event — only
+    # the human toast is deduped.
+    NOTIFY_DEDUP_FILE="$PROJECT_ROOT/.claude/logs/.cred_alert_notify_dedup"
+    NOTIFY_TTL_SECS=21600
+    DEDUP_KEY=$(printf '%s|%s' "$EDITED_FILE" "${ALERTS[*]}" | "$PY" -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:16])' 2>/dev/null)
+    NOW_EPOCH=$(date +%s)
+    SHOULD_NOTIFY=1
+    if [ -n "$DEDUP_KEY" ] && [ -f "$NOTIFY_DEDUP_FILE" ]; then
+        LAST_TS=$(grep "^$DEDUP_KEY " "$NOTIFY_DEDUP_FILE" 2>/dev/null | tail -1 | cut -d' ' -f2)
+        if [ -n "$LAST_TS" ] && [ $((NOW_EPOCH - LAST_TS)) -lt "$NOTIFY_TTL_SECS" ]; then
+            SHOULD_NOTIFY=0
+        fi
+    fi
+    if [ "$SHOULD_NOTIFY" = "1" ] && [ -n "${PY:-}" ] && [ -f "$PROJECT_ROOT/.claude/scripts/notify.py" ]; then
         "$PY" "$PROJECT_ROOT/.claude/scripts/notify.py" \
             "Claude Code Security Alert" "$MSG" \
             --urgency critical --icon dialog-warning 2>/dev/null || true
+        if [ -n "$DEDUP_KEY" ]; then
+            printf '%s %s\n' "$DEDUP_KEY" "$NOW_EPOCH" >> "$NOTIFY_DEDUP_FILE" 2>/dev/null || true
+        fi
     fi
     # Surface the alert to the model via the PostToolUse JSON envelope
     # (`hookSpecificOutput.additionalContext`). Plain stdout from
