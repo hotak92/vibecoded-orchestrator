@@ -876,6 +876,56 @@ pub fn resume_pending_builds(
                 continue;
             }
         };
+        // v0.2.82 (WP-3 C4): orchestrator-ROOT boot-resume skip. A legacy /
+        // stale PENDING row whose folder canonicalizes to the orchestrator root
+        // would, on resume, re-spawn the analyzer under the DISPLAY-name
+        // identity and resurrect the dual-writer the P2 update-path skip closed
+        // for the update flow (prune=false on resume, so no wipe risk — but a
+        // dupe-minting risk). We REUSE the SAME pure decision helper as the
+        // update path (`projects_v2::update_should_skip_root_autobuild`) rather
+        // than a diverging copy, with `is_initial_create = false` (a resume is
+        // never an initial create). Root is resolved DB-first via the canonical
+        // resolver (portability: no literal paths); unresolvable → fail-open
+        // (helper returns false → we respawn as before). On a positive match we
+        // SKIP the respawn AND clear the PENDING row (mark SKIPPED) so it does
+        // not resurrect on every subsequent boot.
+        let orchestrator_root = crate::services::vco_lib_bridge::resolve_orchestrator_root(&db);
+        let is_root = crate::commands::projects_v2::update_should_skip_root_autobuild(
+            std::path::Path::new(&project.folder_path),
+            orchestrator_root,
+            false,
+        );
+        if is_root {
+            eprintln!(
+                "[vct] code-graph boot-resume: skipping + clearing PENDING build \
+                 for orchestrator-root project {} ({}). The root's code graph is \
+                 rebuilt by the install.py resync (single-writer identity); \
+                 respawning here would mint duplicate rows under the display-name \
+                 identity.",
+                project.id, project.folder_path
+            );
+            if let Err(e) = db.upsert_code_graph_build(
+                &project.id,
+                build_status::SKIPPED,
+                Some(chrono::Utc::now().timestamp_millis()),
+                Some(chrono::Utc::now().timestamp_millis()),
+                Some(0),
+                0,
+                None,
+                false,
+                Some("boot-resume skipped: orchestrator root is rebuilt by install.py resync"),
+                None,
+            ) {
+                eprintln!(
+                    "[vct] warning: could not clear root PENDING code-graph build for {}: {}. \
+                     It may re-appear as pending on the next boot (harmless — it will be \
+                     skipped again).",
+                    project.id, e
+                );
+            }
+            continue;
+        }
+
         // Boot-resume of a pending row: we don't know whether the
         // original rebuild_code_graph asked for prune_stale, and a
         // resumed build is more conservative than an explicit user
@@ -1072,11 +1122,164 @@ async fn run_build_task(
     // (the ~7-9% of over-budget Function/Class rows P3 chunking invalidated),
     // while already-current rows hash-skip. No Rust-side flag is needed —
     // keeping the gate Python-side avoids forking the logic across languages.
+    // v0.2.82 (WP-3 G3 task 1): resolve the CANONICAL code-graph identity via
+    // the ONE SSOT helper (binding prefix → sanitized display name → raw name
+    // + WARN). `project_name` here is the DISPLAY name every caller passed
+    // (rebuild / create-update / boot-resume). Feeding it raw to `--project`
+    // was the dual-writer bug: the per-edit hooks stamp the binding prefix, so
+    // the launcher must too. From here on `canonical_identity` is what we feed
+    // the analyzer AND what we use for the post-build backfill / provenance.
+    let canonical_identity = {
+        let db = app.state::<Db>();
+        resolve_codegraph_identity(&db, &project_id, &project_name)
+    };
+
+    // v0.2.82 (WP-3 G3 task 2): pre-build identity migration. When the display
+    // name differs from the canonical identity, rows may already exist under
+    // the OLD `project` property (the display name) from earlier launcher runs.
+    // Migrate them into the canonical identity BEFORE this build so the build's
+    // `--prune-stale` doesn't reap the old-identity rows (and so we don't keep
+    // two writers). Cheap gate: skip entirely when the names already match
+    // (the common case pays one string compare). Soft-fail: a migration error
+    // is logged and the build PROCEEDS under the canonical identity — never
+    // abort, never fall back to the old identity (that would mint fresh dupes).
+    if project_name.trim() != canonical_identity {
+        // Dry-run probe first (count-only) so we skip the real migration when
+        // no old-identity rows exist. Per the standing rule: NO global timeout.
+        // The db handle (dropped before the analyzer spawn to avoid holding the
+        // lock across the subprocess) resolves the interpreter + orchestrator
+        // root inside `configure_vco_lib_command`.
+        let db = app.state::<Db>();
+        match run_wp2_identity_migration(
+            &db,
+            &canonical_identity,
+            project_name.trim(),
+            &canonical_identity,
+            true, // dry_run: probe
+        )
+        .await
+        {
+            Ok(probe) if probe.moved + probe.deduped + probe.left > 0 => {
+                // Old-identity rows exist → run the real migration.
+                match run_wp2_identity_migration(
+                    &db,
+                    &canonical_identity,
+                    project_name.trim(),
+                    &canonical_identity,
+                    false,
+                )
+                .await
+                {
+                    Ok(s) => {
+                        let detail = format!(
+                            "identity migration '{}' → '{}': moved={} deduped={} left={} failures={}",
+                            project_name.trim(),
+                            canonical_identity,
+                            s.moved,
+                            s.deduped,
+                            s.left,
+                            s.failures,
+                        );
+                        eprintln!("[vct] code-graph {}", detail);
+                        emit_build(
+                            &app,
+                            &project_id,
+                            build_status::RUNNING,
+                            0,
+                            Some("migrate-identity"),
+                            None,
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[vct] warning: code-graph identity migration '{}' → '{}' failed: {} \
+                             — proceeding with the build under the canonical identity \
+                             (old-identity rows, if any, will be pruned when their files \
+                             next change, not silently duplicated).",
+                            project_name.trim(),
+                            canonical_identity,
+                            e
+                        );
+                    }
+                }
+            }
+            Ok(_) => {
+                // No old-identity rows — nothing to migrate.
+            }
+            Err(e) => {
+                eprintln!(
+                    "[vct] warning: code-graph identity migration probe for '{}' → '{}' \
+                     failed: {} — proceeding with the build under the canonical identity.",
+                    project_name.trim(),
+                    canonical_identity,
+                    e
+                );
+            }
+        }
+    }
+
+    // v0.2.82 (WP-3 G3 task 5, UPGRADED): classify an embedding-space change.
+    // (a) Deliberate configured-profile change (app_state[default_code_embedding]
+    //     differs from the binding's stored space) → force-recreate this build
+    //     (the ONE legitimate auto re-embed — a genuine one-time migration).
+    // (b) Transient hardware-ladder tier drift is handled POST-build (warn only,
+    //     see the provenance persist below) — it must not trigger anything here.
+    let force_recreate_for_profile_change = {
+        let db = app.state::<Db>();
+        let binding = db.get_project_codegraph_binding(&project_id).ok().flatten();
+        let configured = db.app_state_get("default_code_embedding").ok().flatten();
+        let action = classify_embedding_change(
+            configured.as_deref(),
+            binding.as_ref().and_then(|b| b.embedding_model.as_deref()),
+            binding.as_ref().and_then(|b| b.embedding_dim),
+            None, // no live provenance yet — that governs branch (b), post-build
+            None,
+        );
+        if action == EmbeddingChangeAction::ForceRecreate {
+            let stored = binding
+                .as_ref()
+                .map(|b| {
+                    format!(
+                        "{}/{}",
+                        b.embedding_model.as_deref().unwrap_or("?"),
+                        b.embedding_dim.unwrap_or(0)
+                    )
+                })
+                .unwrap_or_else(|| "?".to_string());
+            let want = configured.as_deref().unwrap_or("?");
+            eprintln!(
+                "[vct] code-graph: embedding profile changed for '{}' (stored {} → configured {}) \
+                 — full re-embed (one-time migration) via --force-recreate",
+                canonical_identity, stored, want
+            );
+            emit_build(
+                &app,
+                &project_id,
+                build_status::RUNNING,
+                0,
+                Some("reembed-profile-change"),
+                None,
+            );
+            true
+        } else {
+            false
+        }
+    };
+
     let mut args: Vec<String> = vec![
         folder_path.clone(),
         "--project".to_string(),
-        project_name.clone(),
+        canonical_identity.clone(),
     ];
+    // v0.2.82 (WP-3 task 5a): a deliberate embedding-profile change drops +
+    // recreates all five per-project collections so the whole graph is
+    // re-embedded into the new vector space in ONE visible build. This is the
+    // existing consented destructive path (`create_collections(force=True)`);
+    // it is gated STRICTLY on a configured-profile mismatch, never on a
+    // transient hardware-ladder tier drift.
+    if force_recreate_for_profile_change {
+        args.push("--force-recreate".to_string());
+    }
     // v0.2.73 (CG-3): Joern CFG/PDG extraction removed (zero readers of
     // cfg_summary/data_flow_vars) — no `--cfg`/`--pdg` are passed. The analyzer
     // no longer accepts those flags.
@@ -1279,7 +1482,13 @@ async fn run_build_task(
 
     let finished_at = chrono::Utc::now().timestamp_millis();
 
-    let (status_str, files_analyzed, error_msg, log_tail, joern_used) = match output {
+    // v0.2.82 (WP-3 G6 task 4): the success arm also parses the analyzer's
+    // machine-readable `CODEGRAPH_PROVENANCE` line so we can persist the
+    // embedding model/dim + analyzed commit into the binding below. Carried out
+    // of the match as the 6th tuple element — `Some` only on a successful run
+    // that emitted a well-formed line; `None` on failure OR a parse miss (an
+    // older analyzer / crash — absent provenance is honest, we write nothing).
+    let (status_str, files_analyzed, error_msg, log_tail, joern_used, provenance) = match output {
         Ok(out) => {
             let stdout_str = String::from_utf8_lossy(&out.stdout).to_string();
             let stderr_str = String::from_utf8_lossy(&out.stderr).to_string();
@@ -1304,12 +1513,14 @@ async fn run_build_task(
                     )),
                     _ => None,
                 };
+                let prov = parse_codegraph_provenance(&stdout_str);
                 (
                     status.to_string(),
                     count,
                     error_msg,
                     Some(tail),
                     false, // joern_used: v0.2.73 CG-3 removed Joern CFG/PDG (zero readers)
+                    prov,
                 )
             } else {
                 let head = stderr_str
@@ -1328,6 +1539,7 @@ async fn run_build_task(
                     )),
                     Some(tail),
                     false, // joern_used: v0.2.73 CG-3 removed Joern CFG/PDG (zero readers)
+                    None,
                 )
             }
         }
@@ -1337,6 +1549,7 @@ async fn run_build_task(
             Some(format!("could not spawn code-graph-analyze: {}", e)),
             None,
             false,
+            None,
         ),
     };
 
@@ -1370,6 +1583,99 @@ async fn run_build_task(
         None,
         error_msg.as_deref(),
     );
+
+    // v0.2.82 (WP-3): post-build riders. Only on a build whose inserts
+    // succeeded (SUCCESS or PARTIAL — PARTIAL still wrote rows; only the stale
+    // prune was incomplete). A FAILED / SKIPPED build wrote nothing to persist
+    // provenance for or backfill.
+    let inserts_succeeded =
+        status_str == build_status::SUCCESS || status_str == build_status::PARTIAL;
+    if inserts_succeeded {
+        // ── Task 4 + 5b: persist provenance / surface a live-tier drift ──
+        if let Some(prov) = provenance.as_ref() {
+            let db = app.state::<Db>();
+            let binding = db.get_project_codegraph_binding(&project_id).ok().flatten();
+            let configured = db.app_state_get("default_code_embedding").ok().flatten();
+            // Re-classify with the LIVE provenance now available. Branch (a)
+            // (ForceRecreate) already ran THIS build with --force-recreate, so
+            // its stored space is about to be replaced — write the new model/dim
+            // straight through. Branch (b) (WarnDrift): same configured profile
+            // but the live tier differs from the binding — warn and do NOT
+            // overwrite the stored model/dim (only advance commit/timestamp).
+            let action = classify_embedding_change(
+                configured.as_deref(),
+                binding.as_ref().and_then(|b| b.embedding_model.as_deref()),
+                binding.as_ref().and_then(|b| b.embedding_dim),
+                Some(prov.model.as_str()),
+                Some(prov.dim),
+            );
+            let write_model_dim = match action {
+                EmbeddingChangeAction::WarnDrift => {
+                    let stored = binding
+                        .as_ref()
+                        .map(|b| {
+                            format!(
+                                "{}/{}",
+                                b.embedding_model.as_deref().unwrap_or("?"),
+                                b.embedding_dim.unwrap_or(0)
+                            )
+                        })
+                        .unwrap_or_else(|| "?".to_string());
+                    let warning = format!(
+                        "embedding tier drift for '{}': stored {}, this run used {}/{} \
+                         (same configured profile — likely a transient hardware-ladder \
+                         fallback). No rebuild triggered; the stored space is unchanged. \
+                         If you deliberately changed the code-embedding model, run a \
+                         consented full rebuild (--force-recreate) for a consistent \
+                         vector space.",
+                        canonical_identity, stored, prov.model, prov.dim
+                    );
+                    eprintln!("[vct] code-graph: {}", warning);
+                    // Surface verbatim to the GUI via app_state (D1: detection
+                    // only — no automatic destructive action on tier drift).
+                    let _ = db.app_state_set(
+                        &format!("codegraph.embedding_drift.{}", project_id),
+                        &warning,
+                    );
+                    false
+                }
+                // ForceRecreate ran this build; None = same space. Both write
+                // the fresh model/dim through (they are consistent with the
+                // vectors just written).
+                _ => {
+                    // Clear any stale drift warning now that the space is
+                    // consistent again.
+                    let _ = db
+                        .app_state_set(&format!("codegraph.embedding_drift.{}", project_id), "");
+                    true
+                }
+            };
+            persist_codegraph_provenance(
+                &db,
+                &project_id,
+                &canonical_identity,
+                prov,
+                write_model_dim,
+                finished_at,
+            );
+        }
+
+        // ── Task 6: non-root metadata backfill rider ──
+        // After a successful NON-root build, top up is_test/doc metadata for
+        // rows the launcher build path never backfilled. The orchestrator ROOT
+        // gets its backfill through the install.py resync path, so skip it here
+        // to avoid a redundant detached run.
+        let db = app.state::<Db>();
+        let is_non_root = db
+            .get_project(&project_id)
+            .ok()
+            .flatten()
+            .map(|p| !matches!(p.host, vct_launcher_core::db::models::ProjectHost::OrchestratorRoot))
+            .unwrap_or(true);
+        if is_non_root {
+            spawn_metadata_backfill(&db, canonical_identity.clone());
+        }
+    }
 }
 
 /// Helper: resolve the launcher Db from the AppHandle and write a row.
@@ -1646,6 +1952,553 @@ pub(crate) fn success_or_partial_status(prune_failures: Option<u32>) -> &'static
         build_status::PARTIAL
     } else {
         build_status::SUCCESS
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// v0.2.82 (WP-3 / G3+G6): code-graph identity SSOT, provenance parsing,
+// embedding-space change classification.
+//
+// The analyzer stamps every row's `project` PROPERTY with the raw `--project`
+// value it was given (`CodeGraphAnalyzer.project_name`), NOT the sanitized
+// collection prefix. The per-edit hooks resolve `--from-resolver` →
+// `code_graph_collection_prefix` (= the binding's `collection_prefix`), so a
+// hook-driven row lands with `project = "VibeCodedOrchestrator"`. When the
+// launcher spawned the analyzer with the DISPLAY name ("VibeCoded
+// Orchestrator") the launcher-driven rows landed with a DIFFERENT `project`
+// property in the SAME collection — every spaced-name project accumulated
+// duplicate UUIDs, and each run's `--prune-stale` reaped the OTHER writer's
+// rows. The identity SSOT below makes every launcher spawn surface stamp the
+// SAME identity the hooks do (the binding prefix), closing the dual-writer.
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Where a resolved code-graph identity came from — surfaced in the WARN log
+/// so a misconfigured project is diagnosable without re-deriving the chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdentitySource {
+    /// The project's `project_codegraph_bindings.collection_prefix` (canonical
+    /// — matches what the per-edit hooks stamp via `--from-resolver`).
+    BindingPrefix,
+    /// No non-empty binding prefix; derived from the display name via the same
+    /// Rust sanitizer that produces the KG-collection basename (fixture-locked
+    /// to the analyzer's `_canonical_class_prefix`, so the derived value equals
+    /// what the analyzer would itself compute from this display name).
+    SanitizedName,
+    /// Sanitizing the display name produced nothing usable (all-non-alnum /
+    /// empty) and even the sanitizer's `"vct"` sentinel would be misleading —
+    /// last resort is the raw display name, logged at WARN.
+    RawNameFallback,
+}
+
+/// Pure identity picker (act + leave-alone unit-tested). Given the binding's
+/// stored `collection_prefix` (if any) and the project display name, return the
+/// canonical code-graph identity to feed `--project` PLUS its provenance.
+///
+/// Precedence (plan §WP-3 task 1):
+///   1. non-empty binding `collection_prefix` → use verbatim (canonical).
+///   2. else `sanitize_kg_collection(display_name)` — unless that sanitizer hit
+///      its `"vct"` sentinel on a name that itself contains NO alphanumerics
+///      (a genuinely unusable name), in which case
+///   3. the raw display name, flagged `RawNameFallback` so the caller WARNs.
+///
+/// Note: `sanitize_kg_collection` returns `"vct"` both for empty/all-symbol
+/// input AND for a leading-digit result. We only treat the FORMER as the
+/// last-resort case; a leading-digit name still sanitizes to a usable `"vct"`
+/// class (Weaviate-legal) and is NOT downgraded to the raw name.
+pub(crate) fn pick_codegraph_identity(
+    binding_prefix: Option<&str>,
+    display_name: &str,
+) -> (String, IdentitySource) {
+    if let Some(prefix) = binding_prefix {
+        let trimmed = prefix.trim();
+        if !trimmed.is_empty() {
+            return (trimmed.to_string(), IdentitySource::BindingPrefix);
+        }
+    }
+    let sanitized =
+        crate::commands::projects_v2::sanitize_kg_collection(display_name);
+    // The sanitizer fell back to its "vct" sentinel. Distinguish "the name had
+    // usable alnum but started with a digit" (keep the sentinel — it's a real,
+    // Weaviate-legal class) from "the name had NO usable alnum at all" (raw
+    // fallback so the WARN names the real display string).
+    let has_alnum = display_name.chars().any(|c| c.is_ascii_alphanumeric());
+    if sanitized == "vct" && !has_alnum {
+        return (display_name.to_string(), IdentitySource::RawNameFallback);
+    }
+    (sanitized, IdentitySource::SanitizedName)
+}
+
+/// Identity SSOT — the ONE home every launcher spawn surface calls to resolve
+/// the `--project` argument (no per-site copies; plan §WP-3 task 1). Reads the
+/// project's codegraph binding, delegates the DECISION to the pure
+/// [`pick_codegraph_identity`], and emits a WARN on the raw-name last resort.
+pub(crate) fn resolve_codegraph_identity(db: &Db, project_id: &str, display_name: &str) -> String {
+    let binding = db.get_project_codegraph_binding(project_id).ok().flatten();
+    let (identity, source) =
+        pick_codegraph_identity(binding.as_ref().map(|b| b.collection_prefix.as_str()), display_name);
+    if source == IdentitySource::RawNameFallback {
+        eprintln!(
+            "[vct] warning: code-graph identity for project {} could not be \
+             derived from a binding prefix or a sanitizable display name \
+             ('{}'); falling back to the raw display name. Rows may not match \
+             the per-edit hooks' identity — set a code-graph collection prefix \
+             in the launcher's Identity tab.",
+            project_id, display_name
+        );
+    }
+    identity
+}
+
+/// Machine-readable code-graph provenance parsed from the analyzer's stdout
+/// (v0.2.82 G6). Built by `vco_lib.codegraph_guards.provenance_line`; the
+/// NORMATIVE format is one line, fixed token order, single spaces:
+///   `CODEGRAPH_PROVENANCE model=<model> dim=<dim> embed_revision=<int> analyzed_commit=<sha|none>`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodegraphProvenance {
+    pub model: String,
+    pub dim: i64,
+    pub embed_revision: i64,
+    /// `Some(sha)` on a git tree; `None` when the analyzer printed the literal
+    /// `none` (non-git tree / git absent). Distinguished so we never persist
+    /// the string "none" as a commit sha.
+    pub analyzed_commit: Option<String>,
+}
+
+/// Parse the LAST `CODEGRAPH_PROVENANCE` line from analyzer stdout.
+///
+/// Conservative (plan DO NOT "no silent fallback"): returns `None` on ANY
+/// shape violation — no line, missing token, non-integer dim/revision. A miss
+/// means the caller writes NOTHING (absent provenance is honest; an older
+/// analyzer that never printed the line must not clobber a good binding).
+///
+/// Keyed by `key=value` tokens rather than positional split so a future token
+/// re-order in `provenance_line` doesn't silently misparse; `model` is read as
+/// the single whitespace-delimited token after `model=` (code model ids never
+/// contain spaces — `codesage-large-v2`, `qwen3-embedding:0.6b`).
+pub(crate) fn parse_codegraph_provenance(stdout: &str) -> Option<CodegraphProvenance> {
+    // Scan bottom-up: the LAST occurrence wins (one line per successful run,
+    // but a re-run's stdout could carry an earlier stale line in a combined
+    // buffer — the freshest line is authoritative).
+    for line in stdout.lines().rev() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("CODEGRAPH_PROVENANCE ") else {
+            continue;
+        };
+        let mut model: Option<String> = None;
+        let mut dim: Option<i64> = None;
+        let mut rev: Option<i64> = None;
+        let mut commit: Option<Option<String>> = None;
+        for tok in rest.split_whitespace() {
+            let Some((k, v)) = tok.split_once('=') else {
+                continue;
+            };
+            match k {
+                "model" => model = Some(v.to_string()),
+                "dim" => dim = v.parse::<i64>().ok(),
+                "embed_revision" => rev = v.parse::<i64>().ok(),
+                "analyzed_commit" => {
+                    commit = Some(if v == "none" { None } else { Some(v.to_string()) })
+                }
+                _ => {}
+            }
+        }
+        // Strict: every token must be present AND well-formed. Any miss →
+        // treat the whole line as garbled and keep scanning older lines.
+        match (model, dim, rev, commit) {
+            (Some(model), Some(dim), Some(embed_revision), Some(analyzed_commit)) => {
+                return Some(CodegraphProvenance {
+                    model,
+                    dim,
+                    embed_revision,
+                    analyzed_commit,
+                });
+            }
+            _ => continue,
+        }
+    }
+    None
+}
+
+/// Normalize a code-embedding model id to its FAMILY so two spellings of the
+/// same model compare equal (`codesage/codesage-large-v2` vs
+/// `codesage-large-v2`; `openai-text-embedding-3-small` vs
+/// `text-embedding-3-small`). Pure; used by the embedding-change classifier.
+pub(crate) fn normalize_code_model_family(model_id: &str) -> String {
+    let m = model_id.trim().to_ascii_lowercase();
+    // Drop any org/vendor path prefix (`codesage/…`, `jinaai/…`).
+    let base = m.rsplit('/').next().unwrap_or(&m);
+    if base.contains("codesage") {
+        "codesage".to_string()
+    } else if base.contains("qwen3") {
+        "qwen3".to_string()
+    } else if base.contains("jina") {
+        "jina".to_string()
+    } else if base.contains("text-embedding-3-small") {
+        "openai-3-small".to_string()
+    } else if base.contains("text-embedding-3-large") {
+        "openai-3-large".to_string()
+    } else {
+        base.to_string()
+    }
+}
+
+/// Map a code-embedding model id to its vector dimensionality, or `None` for an
+/// unknown model. Dim is the SOUND vector-space discriminator (2048 vs 1024 vs
+/// 768 vs 1536 are unambiguous), so the classifier keys on it as the primary
+/// signal and uses the family only as a same-dim tie-break.
+pub(crate) fn code_model_dim(model_id: &str) -> Option<i64> {
+    match normalize_code_model_family(model_id).as_str() {
+        "codesage" => Some(2048),
+        "qwen3" => Some(1024),
+        "jina" => Some(768),
+        "openai-3-small" => Some(1536),
+        "openai-3-large" => Some(3072),
+        _ => None,
+    }
+}
+
+/// The action the pre-build embedding-change check yields (plan §WP-3 task 5,
+/// UPGRADED by the coordinator to a two-branch policy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmbeddingChangeAction {
+    /// No stored binding model/dim, or the configured profile matches the
+    /// stored space — proceed normally, nothing to warn or migrate.
+    None,
+    /// (a) The user-CONFIGURED code-embedding profile genuinely differs from
+    /// the stored vector space (different dim, or same dim + different family).
+    /// The vectors are in the wrong space → the ONE legitimate auto re-embed:
+    /// pass `--force-recreate` so THIS build migrates the whole collection to
+    /// the new space in a single visible GUI build.
+    ForceRecreate,
+    /// (b) Same configured profile, but the PARSED provenance (the live
+    /// hardware-ladder tier actually used this run) differs from the stored
+    /// binding. Boundary machines flip tiers under RAM/VRAM pressure — auto
+    /// re-embedding here would ping-pong. Warn only; do NOT overwrite the
+    /// binding, do NOT trigger anything destructive.
+    WarnDrift,
+}
+
+/// PURE classifier for the pre-build embedding-space change (act +
+/// leave-alone + both-empty + only-binding-empty unit-tested).
+///
+/// Inputs:
+///   * `configured_model` — the user-CONFIGURED code-embedding profile
+///     (`app_state[default_code_embedding]`). `None`/empty when unset.
+///   * `stored_model` / `stored_dim` — the binding's last-written space (from a
+///     prior successful build's provenance). Treated as "known" only when the
+///     model is non-empty AND the dim is present and > 0.
+///   * `parsed_model` / `parsed_dim` — provenance from THIS run's stdout (the
+///     live tier actually used), if the line parsed.
+///
+/// Branch order:
+///   1. No known stored space → `None` (first build, or a binding never
+///      stamped — nothing to compare against; the build stamps it fresh).
+///   2. Configured profile KNOWN and differs from the stored space (dim
+///      mismatch, or same dim + different family) → `ForceRecreate` (branch a).
+///   3. Configured profile matches (or is unknown) BUT this run's parsed
+///      provenance differs from the stored space → `WarnDrift` (branch b).
+///   4. Otherwise → `None`.
+///
+/// `ForceRecreate` outranks `WarnDrift`: a deliberate config change is a real
+/// migration even if the live tier also happens to have drifted.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn classify_embedding_change(
+    configured_model: Option<&str>,
+    stored_model: Option<&str>,
+    stored_dim: Option<i64>,
+    parsed_model: Option<&str>,
+    parsed_dim: Option<i64>,
+) -> EmbeddingChangeAction {
+    // The stored space is "known" only when BOTH the model is non-empty and the
+    // dim is a positive integer. A NULL/empty/zero binding is a first build.
+    let stored = match (stored_model.map(str::trim).filter(|s| !s.is_empty()), stored_dim) {
+        (Some(m), Some(d)) if d > 0 => Some((normalize_code_model_family(m), d)),
+        _ => None,
+    };
+    let Some((stored_family, stored_dim)) = stored else {
+        return EmbeddingChangeAction::None;
+    };
+
+    // Same-space test: same dim AND same family.
+    let same_space = |model: &str, dim: i64| -> bool {
+        dim == stored_dim && normalize_code_model_family(model) == stored_family
+    };
+
+    // (a) Deliberate configured-profile change → real migration.
+    if let Some(cfg_model) = configured_model.map(str::trim).filter(|s| !s.is_empty()) {
+        // Resolve the configured profile's dim from its known mapping; if the
+        // model id is unknown we can't assert a mismatch on dim, so fall back
+        // to a family compare (conservative: only ForceRecreate on a POSITIVE
+        // family difference, never on "unknown vs known").
+        let cfg_dim = code_model_dim(cfg_model);
+        let differs = match cfg_dim {
+            Some(d) => !same_space(cfg_model, d),
+            None => {
+                // Unknown configured model: only a family difference is a
+                // positive signal (dim is unknowable). Avoids force-recreating
+                // on an id we simply don't have in the table.
+                normalize_code_model_family(cfg_model) != stored_family
+            }
+        };
+        if differs {
+            return EmbeddingChangeAction::ForceRecreate;
+        }
+    }
+
+    // (b) Configured profile matches (or is unset/unknown-and-same-family) but
+    // the live tier this run differs from the stored space → warn only.
+    if let (Some(pm), Some(pd)) = (parsed_model, parsed_dim) {
+        if !same_space(pm, pd) {
+            return EmbeddingChangeAction::WarnDrift;
+        }
+    }
+
+    EmbeddingChangeAction::None
+}
+
+/// Parsed counts from WP-2's identity-migration CLI summary line
+/// `IDENTITY_MIGRATION moved=N deduped=N left=N failures=N`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct IdentityMigrationSummary {
+    pub moved: u64,
+    pub deduped: u64,
+    pub left: u64,
+    pub failures: u64,
+}
+
+/// Parse the LAST `IDENTITY_MIGRATION` summary line from the WP-2 CLI's stdout.
+/// Conservative: returns `None` unless every one of the four `key=value`
+/// integer tokens is present and well-formed.
+pub(crate) fn parse_identity_migration_summary(stdout: &str) -> Option<IdentityMigrationSummary> {
+    for line in stdout.lines().rev() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("IDENTITY_MIGRATION ") else {
+            continue;
+        };
+        let (mut moved, mut deduped, mut left, mut failures) = (None, None, None, None);
+        for tok in rest.split_whitespace() {
+            let Some((k, v)) = tok.split_once('=') else { continue };
+            match k {
+                "moved" => moved = v.parse::<u64>().ok(),
+                "deduped" => deduped = v.parse::<u64>().ok(),
+                "left" => left = v.parse::<u64>().ok(),
+                "failures" => failures = v.parse::<u64>().ok(),
+                _ => {}
+            }
+        }
+        if let (Some(moved), Some(deduped), Some(left), Some(failures)) =
+            (moved, deduped, left, failures)
+        {
+            return Some(IdentityMigrationSummary { moved, deduped, left, failures });
+        }
+    }
+    None
+}
+
+/// Resolve the python interpreter + orchestrator root for a
+/// `python -m vco_lib.<module>` spawn, and configure a tokio `Command` to run
+/// from the DB-backed orchestrator root (so the `vco_lib` implicit-namespace
+/// package resolves by CWD) with `VCT_INSTALL_ROOT` set explicitly.
+///
+/// PORTABILITY (user directive 2026-07-15): never assume a machine-specific
+/// layout. The root comes from `services::vco_lib_bridge::resolve_orchestrator_root`
+/// (DB cache → walk-up from `current_exe`, the SAME canonical resolver the
+/// analyzer spawn + config-projection apply use). The interpreter comes from the
+/// shared RT-4 ladder `python_resolve::resolve_python_for_vco_lib` (VCT_VENV →
+/// `<root>/.venv` → `<root>/claude_mcp_servers/.venv` → system). Returns `Err`
+/// when either is unresolvable (fresh machine / no clone on disk) so the caller
+/// fail-opens with a log and skips the spawn — never guesses a path, never
+/// panics.
+fn configure_vco_lib_command(db: &Db, module: &str) -> Result<tokio::process::Command, String> {
+    let python = vct_launcher_core::python_resolve::resolve_python_for_vco_lib()
+        .ok_or_else(|| {
+            "no vco_lib-capable python interpreter resolved (VCT_VENV / \
+             <root>/.venv / <root>/claude_mcp_servers/.venv / system python3)"
+                .to_string()
+        })?;
+    let root = crate::services::vco_lib_bridge::resolve_orchestrator_root(db).ok_or_else(|| {
+        "orchestrator root unresolvable (no DB-cached install path and no clone \
+         discoverable by walking up from the launcher binary) — cannot locate \
+         the vco_lib package"
+            .to_string()
+    })?;
+    let mut cmd = tokio::process::Command::new(&python).silent();
+    cmd.arg("-m")
+        .arg(module)
+        // Run from the orchestrator root so `-m vco_lib.<module>` resolves the
+        // implicit-namespace package by CWD (vco_lib is NOT pip-installed),
+        // mirroring `projects_v2::build_migrate_command`'s `.current_dir(root)`.
+        .current_dir(&root)
+        // Belt-and-suspenders: also export VCT_INSTALL_ROOT so any downstream
+        // `vco_lib` sys.path bootstrap that reads the env (not just CWD)
+        // resolves too — matches the analyzer spawn's explicit env set.
+        .env("VCT_INSTALL_ROOT", &root)
+        .stdin(std::process::Stdio::null());
+    Ok(cmd)
+}
+
+// ─── WP-2 identity-migration CLI invocation (ISOLATED — see contract note) ───
+//
+// ⚠️ WP-2 (`vco_lib.codegraph_vector_copy`) is being implemented IN PARALLEL
+// with this WP; its module does not yet exist at this WP's base commit. This
+// function is the SOLE place that shells out to it, coded against the brief's
+// contract so the coordinator can adjust a single call-site if WP-2's merged
+// reality deviates:
+//
+//   python -m vco_lib.codegraph_vector_copy --migrate-identity \
+//       --prefix <collection_prefix> --from <old_identity> --to <canonical> [--dry-run]
+//   → stdout summary line: `IDENTITY_MIGRATION moved=N deduped=N left=N failures=N`
+//
+// Semantics used here: `--prefix` is the collection prefix (canonical == `to`
+// for the identity migration); `--from` is the OLD `project` property value
+// (the display name the launcher used to stamp); `--to` is the canonical
+// identity. Per the standing rule there is NO global timeout — WP-2's per-row
+// soft-fail is its guard.
+//
+/// Run the WP-2 identity migration synchronously and return its parsed summary.
+/// `dry_run` requests a count-only probe (no row moves). Soft-fail: any spawn /
+/// interpreter / root / non-zero-exit / unparseable-summary condition returns
+/// `Err` with a human message; the caller logs it honestly and PROCEEDS under
+/// the canonical identity (never aborts the build, never falls back to the old
+/// identity — that would mint fresh dupes).
+async fn run_wp2_identity_migration(
+    db: &Db,
+    collection_prefix: &str,
+    from_identity: &str,
+    to_identity: &str,
+    dry_run: bool,
+) -> Result<IdentityMigrationSummary, String> {
+    let mut cmd = configure_vco_lib_command(db, "vco_lib.codegraph_vector_copy")?;
+    cmd.arg("--migrate-identity")
+        .arg("--prefix")
+        .arg(collection_prefix)
+        .arg("--from")
+        .arg(from_identity)
+        .arg("--to")
+        .arg(to_identity);
+    if dry_run {
+        cmd.arg("--dry-run");
+    }
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| format!("spawn codegraph_vector_copy: {}", e))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let head = stderr
+            .lines()
+            .chain(stdout.lines())
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("no output");
+        return Err(format!(
+            "codegraph_vector_copy exited {}: {}",
+            out.status.code().unwrap_or(-1),
+            head.chars().take(200).collect::<String>()
+        ));
+    }
+    parse_identity_migration_summary(&stdout)
+        .ok_or_else(|| "codegraph_vector_copy produced no parseable IDENTITY_MIGRATION line".to_string())
+}
+
+/// Fire-and-forget the non-root metadata backfill (plan §WP-3 task 6, C2).
+/// After a successful non-root build, spawn
+/// `python -m vco_lib.codegraph_resync --backfill-metadata --project <canonical>`
+/// DETACHED (mirrors the launcher's other detached `python -m` idioms —
+/// `.silent()` + null stdin, no `.await` on completion). Soft-fail throughout:
+/// a missing interpreter / unresolvable root / spawn error is logged and
+/// swallowed — the backfill is a best-effort metadata top-up (`is_test`/`doc`),
+/// never a build gate.
+fn spawn_metadata_backfill(db: &Db, canonical_identity: String) {
+    let mut cmd = match configure_vco_lib_command(db, "vco_lib.codegraph_resync") {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "[vct] warning: metadata backfill for '{}' skipped — {}. \
+                 is_test/doc flags will be topped up on the next backfill run.",
+                canonical_identity, e
+            );
+            return;
+        }
+    };
+    cmd.arg("--backfill-metadata").arg("--project").arg(&canonical_identity);
+    tokio::spawn(async move {
+        let mut cmd = cmd;
+        match cmd.output().await {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                eprintln!(
+                    "[vct] warning: metadata backfill for '{}' exited {}: {}",
+                    canonical_identity,
+                    out.status.code().unwrap_or(-1),
+                    stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("no stderr")
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[vct] warning: metadata backfill for '{}' failed to spawn: {}",
+                    canonical_identity, e
+                );
+            }
+        }
+    });
+}
+
+/// Persist code-graph provenance into the project's binding after a successful
+/// build (plan §WP-3 task 4). Reads the existing binding to preserve
+/// `collection_prefix` / `enabled` / `config`, then writes the parsed
+/// `embedding_model` / `embedding_dim` (unless the caller suppressed the
+/// model/dim write — branch (b) drift must NOT overwrite the stored space) plus
+/// `last_analyzed_commit` / `last_analyzed_at`. Soft-fail: a DB hiccup is
+/// logged, never propagated (the build already succeeded).
+///
+/// `write_model_dim` is `false` for the WarnDrift case so a transient
+/// hardware-ladder tier does not overwrite the user's real space in the binding
+/// (the commit/timestamp still advance — the build genuinely ran).
+fn persist_codegraph_provenance(
+    db: &Db,
+    project_id: &str,
+    canonical_identity: &str,
+    prov: &CodegraphProvenance,
+    write_model_dim: bool,
+    analyzed_at: i64,
+) {
+    let existing = db.get_project_codegraph_binding(project_id).ok().flatten();
+    // Preserve the canonical prefix. Prefer the existing binding's prefix; if
+    // there is no binding yet, seed it with the identity we just built under.
+    let collection_prefix = existing
+        .as_ref()
+        .map(|b| b.collection_prefix.clone())
+        .unwrap_or_else(|| canonical_identity.to_string());
+    let (embedding_model, embedding_dim) = if write_model_dim {
+        (Some(prov.model.clone()), Some(prov.dim))
+    } else {
+        // Keep whatever the binding already stored (drift must not overwrite).
+        (
+            existing.as_ref().and_then(|b| b.embedding_model.clone()),
+            existing.as_ref().and_then(|b| b.embedding_dim),
+        )
+    };
+    let enabled = existing.as_ref().map(|b| b.enabled).unwrap_or(true);
+    let config = existing
+        .as_ref()
+        .map(|b| b.config.clone())
+        .unwrap_or(serde_json::Value::Null);
+    if let Err(e) = db.set_project_codegraph_binding(
+        project_id,
+        &collection_prefix,
+        embedding_model.as_deref(),
+        embedding_dim,
+        prov.analyzed_commit.as_deref(),
+        Some(analyzed_at),
+        enabled,
+        &config,
+    ) {
+        eprintln!(
+            "[vct] warning: could not persist code-graph provenance for {}: {}",
+            project_id, e
+        );
     }
 }
 
@@ -2324,6 +3177,432 @@ mod build_tests {
         }
 
         fs::remove_dir_all(&d).ok();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // v0.2.82 (WP-3): identity SSOT, provenance parsing, embedding-change
+    // classification, resume root-skip decision.
+    // ═══════════════════════════════════════════════════════════════════
+
+    use vct_launcher_core::db::models::ProjectHost;
+    use vct_launcher_core::db::Db;
+
+    // ─── T14: identity matrix (pure `pick_codegraph_identity`) ───────────
+
+    #[test]
+    fn identity_prefers_binding_prefix_verbatim() {
+        let (id, src) = pick_codegraph_identity(Some("VibeCodedOrchestrator"), "VibeCoded Orchestrator");
+        assert_eq!(id, "VibeCodedOrchestrator");
+        assert_eq!(src, IdentitySource::BindingPrefix);
+    }
+
+    #[test]
+    fn identity_trims_binding_prefix() {
+        let (id, src) = pick_codegraph_identity(Some("  MyProj  "), "My Proj");
+        assert_eq!(id, "MyProj");
+        assert_eq!(src, IdentitySource::BindingPrefix);
+    }
+
+    #[test]
+    fn identity_falls_back_to_sanitized_name_when_no_binding() {
+        // No binding prefix → sanitize the spaced display name (== analyzer's
+        // canonical class prefix, fixture-locked).
+        let (id, src) = pick_codegraph_identity(None, "VibeCoded Orchestrator");
+        assert_eq!(id, "VibeCodedOrchestrator");
+        assert_eq!(src, IdentitySource::SanitizedName);
+    }
+
+    #[test]
+    fn identity_falls_back_to_sanitized_name_when_binding_empty() {
+        // Empty / whitespace-only binding prefix is treated as absent.
+        let (id, src) = pick_codegraph_identity(Some("   "), "Acme App");
+        assert_eq!(id, "AcmeApp");
+        assert_eq!(src, IdentitySource::SanitizedName);
+    }
+
+    #[test]
+    fn identity_leading_digit_name_keeps_sentinel_not_raw() {
+        // "123 Go" sanitizes to the Weaviate-legal "vct" sentinel (leading
+        // digit) — a usable class, NOT the raw-name last resort.
+        let (id, src) = pick_codegraph_identity(None, "123 Go");
+        assert_eq!(id, "vct");
+        assert_eq!(src, IdentitySource::SanitizedName);
+    }
+
+    #[test]
+    fn identity_last_resort_raw_name_when_unsanitizable() {
+        // A name with NO alphanumerics can't sanitize to anything meaningful →
+        // raw fallback so the WARN names the real display string.
+        let (id, src) = pick_codegraph_identity(None, "***");
+        assert_eq!(id, "***");
+        assert_eq!(src, IdentitySource::RawNameFallback);
+    }
+
+    // ─── T14: SSOT wiring against a real Db (binding present / absent) ───
+
+    #[test]
+    fn resolve_identity_reads_binding_prefix_from_db() {
+        let db = Db::open_in_memory().unwrap();
+        let pid = uuid::Uuid::new_v4().to_string();
+        db.insert_project(&pid, "Spaced Name", "/tmp/spaced", ProjectHost::Base, "spaced")
+            .unwrap();
+        db.set_project_codegraph_binding(
+            &pid,
+            "CanonicalPrefix",
+            Some("codesage-large-v2"),
+            Some(2048),
+            None,
+            None,
+            true,
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+        // Even though the display name is "Spaced Name", the binding prefix wins.
+        assert_eq!(
+            resolve_codegraph_identity(&db, &pid, "Spaced Name"),
+            "CanonicalPrefix"
+        );
+    }
+
+    #[test]
+    fn resolve_identity_sanitizes_when_no_binding_row() {
+        let db = Db::open_in_memory().unwrap();
+        let pid = uuid::Uuid::new_v4().to_string();
+        db.insert_project(&pid, "Spaced Name", "/tmp/spaced2", ProjectHost::Base, "spaced2")
+            .unwrap();
+        // No codegraph binding → sanitized display name.
+        assert_eq!(
+            resolve_codegraph_identity(&db, &pid, "Spaced Name"),
+            "SpacedName"
+        );
+    }
+
+    // ─── T16: provenance parser (well-formed → parsed / garbled → None) ──
+
+    #[test]
+    fn provenance_parses_well_formed_line() {
+        let stdout = "some log\n\
+            CODEGRAPH_PROVENANCE model=codesage-large-v2 dim=2048 embed_revision=3 analyzed_commit=abc123\n\
+            Files analyzed: 42\n";
+        let prov = parse_codegraph_provenance(stdout).expect("should parse");
+        assert_eq!(prov.model, "codesage-large-v2");
+        assert_eq!(prov.dim, 2048);
+        assert_eq!(prov.embed_revision, 3);
+        assert_eq!(prov.analyzed_commit.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn provenance_none_commit_becomes_option_none() {
+        let stdout =
+            "CODEGRAPH_PROVENANCE model=qwen3-embedding:0.6b dim=1024 embed_revision=2 analyzed_commit=none\n";
+        let prov = parse_codegraph_provenance(stdout).expect("should parse");
+        assert_eq!(prov.model, "qwen3-embedding:0.6b");
+        assert_eq!(prov.dim, 1024);
+        assert_eq!(prov.analyzed_commit, None);
+    }
+
+    #[test]
+    fn provenance_last_occurrence_wins() {
+        let stdout = "CODEGRAPH_PROVENANCE model=old dim=768 embed_revision=1 analyzed_commit=aaa\n\
+            CODEGRAPH_PROVENANCE model=new dim=2048 embed_revision=3 analyzed_commit=bbb\n";
+        let prov = parse_codegraph_provenance(stdout).expect("should parse");
+        assert_eq!(prov.model, "new");
+        assert_eq!(prov.dim, 2048);
+        assert_eq!(prov.analyzed_commit.as_deref(), Some("bbb"));
+    }
+
+    #[test]
+    fn provenance_missing_line_returns_none() {
+        assert!(parse_codegraph_provenance("just some\nnormal output\n").is_none());
+    }
+
+    #[test]
+    fn provenance_garbled_line_returns_none() {
+        // Non-integer dim → the whole line is rejected (conservative).
+        let stdout =
+            "CODEGRAPH_PROVENANCE model=x dim=notanumber embed_revision=3 analyzed_commit=abc\n";
+        assert!(parse_codegraph_provenance(stdout).is_none());
+    }
+
+    #[test]
+    fn provenance_missing_token_returns_none() {
+        // No `analyzed_commit` token at all → rejected.
+        let stdout = "CODEGRAPH_PROVENANCE model=x dim=2048 embed_revision=3\n";
+        assert!(parse_codegraph_provenance(stdout).is_none());
+    }
+
+    // ─── model/dim mapping + family normalization ───────────────────────
+
+    #[test]
+    fn model_family_normalizes_spellings() {
+        assert_eq!(normalize_code_model_family("codesage/codesage-large-v2"), "codesage");
+        assert_eq!(normalize_code_model_family("codesage-large-v2"), "codesage");
+        assert_eq!(normalize_code_model_family("openai-text-embedding-3-small"), "openai-3-small");
+        assert_eq!(normalize_code_model_family("text-embedding-3-small"), "openai-3-small");
+        assert_eq!(normalize_code_model_family("qwen3-embedding:0.6b"), "qwen3");
+    }
+
+    #[test]
+    fn model_dim_maps_known_families() {
+        assert_eq!(code_model_dim("codesage/codesage-large-v2"), Some(2048));
+        assert_eq!(code_model_dim("qwen3-embedding:0.6b"), Some(1024));
+        assert_eq!(code_model_dim("jina-embeddings-v2-base-code"), Some(768));
+        assert_eq!(code_model_dim("text-embedding-3-small"), Some(1536));
+        assert_eq!(code_model_dim("some-unknown-model"), None);
+    }
+
+    // ─── T17-adjacent: embedding-change classifier (two-branch policy) ──
+
+    #[test]
+    fn embedding_change_none_when_no_stored_space() {
+        // First build: no stored model/dim → nothing to compare, no action.
+        assert_eq!(
+            classify_embedding_change(Some("codesage-large-v2"), None, None, None, None),
+            EmbeddingChangeAction::None
+        );
+    }
+
+    #[test]
+    fn embedding_change_none_when_only_binding_dim_missing() {
+        // Model present but dim absent → not a "known" stored space → None.
+        assert_eq!(
+            classify_embedding_change(
+                Some("qwen3-embedding:0.6b"),
+                Some("codesage-large-v2"),
+                None,
+                None,
+                None
+            ),
+            EmbeddingChangeAction::None
+        );
+    }
+
+    #[test]
+    fn embedding_change_force_recreate_on_configured_profile_change() {
+        // (a) Configured profile qwen3 (1024) but stored codesage (2048) →
+        // genuine space change → force-recreate.
+        assert_eq!(
+            classify_embedding_change(
+                Some("qwen3-embedding:0.6b"),
+                Some("codesage-large-v2"),
+                Some(2048),
+                None,
+                None
+            ),
+            EmbeddingChangeAction::ForceRecreate
+        );
+    }
+
+    #[test]
+    fn embedding_change_none_when_configured_matches_stored() {
+        // Configured codesage matches stored codesage/2048 (even with the
+        // slash-form spelling) → no action.
+        assert_eq!(
+            classify_embedding_change(
+                Some("codesage/codesage-large-v2"),
+                Some("codesage-large-v2"),
+                Some(2048),
+                None,
+                None
+            ),
+            EmbeddingChangeAction::None
+        );
+    }
+
+    #[test]
+    fn embedding_change_warn_drift_on_live_tier_only() {
+        // (b) Configured profile matches stored (codesage/2048), but THIS run's
+        // provenance says jina/768 (a transient hardware-ladder fallback) →
+        // warn-only, NOT force-recreate.
+        assert_eq!(
+            classify_embedding_change(
+                Some("codesage-large-v2"),
+                Some("codesage-large-v2"),
+                Some(2048),
+                Some("jina-embeddings-v2-base-code"),
+                Some(768)
+            ),
+            EmbeddingChangeAction::WarnDrift
+        );
+    }
+
+    #[test]
+    fn embedding_change_force_recreate_outranks_drift() {
+        // Configured change AND live-tier drift both present → ForceRecreate wins.
+        assert_eq!(
+            classify_embedding_change(
+                Some("qwen3-embedding:0.6b"),
+                Some("codesage-large-v2"),
+                Some(2048),
+                Some("jina-embeddings-v2-base-code"),
+                Some(768)
+            ),
+            EmbeddingChangeAction::ForceRecreate
+        );
+    }
+
+    #[test]
+    fn embedding_change_none_when_unset_configured_and_matching_live() {
+        // Configured profile unset, live tier matches stored → None (nothing to
+        // warn about — the build used the same space).
+        assert_eq!(
+            classify_embedding_change(
+                None,
+                Some("codesage-large-v2"),
+                Some(2048),
+                Some("codesage-large-v2"),
+                Some(2048)
+            ),
+            EmbeddingChangeAction::None
+        );
+    }
+
+    #[test]
+    fn embedding_change_unknown_configured_same_family_no_action() {
+        // Unknown configured id but same family as stored → no positive
+        // difference signal → None (conservative: don't force-recreate on an
+        // id we don't have a dim for).
+        assert_eq!(
+            classify_embedding_change(
+                Some("codesage-some-future-variant"),
+                Some("codesage-large-v2"),
+                Some(2048),
+                None,
+                None
+            ),
+            EmbeddingChangeAction::None
+        );
+    }
+
+    // ─── IDENTITY_MIGRATION summary parser (WP-2 contract) ──────────────
+
+    #[test]
+    fn identity_migration_summary_parses_all_tokens() {
+        let s = parse_identity_migration_summary(
+            "noise\nIDENTITY_MIGRATION moved=5 deduped=2 left=1 failures=0\ntrailing\n",
+        )
+        .expect("should parse");
+        assert_eq!(s.moved, 5);
+        assert_eq!(s.deduped, 2);
+        assert_eq!(s.left, 1);
+        assert_eq!(s.failures, 0);
+    }
+
+    #[test]
+    fn identity_migration_summary_none_on_missing_token() {
+        assert!(parse_identity_migration_summary("IDENTITY_MIGRATION moved=5 deduped=2 left=1\n").is_none());
+        assert!(parse_identity_migration_summary("no summary here\n").is_none());
+    }
+
+    // ─── T15: resume root-skip decision (act + leave-alone + fail-open) ──
+    //
+    // The full `resume_pending_builds` needs an AppHandle we can't cheaply
+    // build in a unit test; the GATING DECISION is the reused pure helper
+    // `projects_v2::update_should_skip_root_autobuild`, exercised here at the
+    // exact call shape codegraph.rs uses (is_initial_create = false) so a
+    // regression in how WP-3 wires it is caught.
+
+    #[test]
+    fn resume_skip_acts_on_root_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        // Root folder == resolved orchestrator root, resume path → SKIP.
+        assert!(crate::commands::projects_v2::update_should_skip_root_autobuild(
+            &root,
+            Some(root.clone()),
+            false,
+        ));
+    }
+
+    #[test]
+    fn resume_skip_leaves_non_root_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("orchestrator");
+        let project = tmp.path().join("user-project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        // A normal user project → respawn (no skip).
+        assert!(!crate::commands::projects_v2::update_should_skip_root_autobuild(
+            &project,
+            Some(root),
+            false,
+        ));
+    }
+
+    #[test]
+    fn resume_skip_fails_open_when_root_unresolvable() {
+        // Fresh machine / no DB row → root unresolvable → fail-open (respawn as
+        // before, never panic, never guess a path).
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!crate::commands::projects_v2::update_should_skip_root_autobuild(
+            tmp.path(),
+            None,
+            false,
+        ));
+    }
+
+    // ─── provenance persist: WarnDrift preserves stored model/dim ───────
+
+    #[test]
+    fn persist_provenance_writes_model_dim_when_flagged() {
+        let db = Db::open_in_memory().unwrap();
+        let pid = uuid::Uuid::new_v4().to_string();
+        db.insert_project(&pid, "Proj", "/tmp/pp", ProjectHost::Base, "pp").unwrap();
+        db.set_project_codegraph_binding(
+            &pid,
+            "Proj",
+            Some("codesage-large-v2"),
+            Some(2048),
+            None,
+            None,
+            true,
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+        let prov = CodegraphProvenance {
+            model: "qwen3-embedding:0.6b".to_string(),
+            dim: 1024,
+            embed_revision: 3,
+            analyzed_commit: Some("deadbeef".to_string()),
+        };
+        // write_model_dim = true → overwrite stored space + commit.
+        persist_codegraph_provenance(&db, &pid, "Proj", &prov, true, 1_700_000_000_000);
+        let b = db.get_project_codegraph_binding(&pid).unwrap().unwrap();
+        assert_eq!(b.embedding_model.as_deref(), Some("qwen3-embedding:0.6b"));
+        assert_eq!(b.embedding_dim, Some(1024));
+        assert_eq!(b.last_analyzed_commit.as_deref(), Some("deadbeef"));
+        assert_eq!(b.collection_prefix, "Proj"); // preserved
+    }
+
+    #[test]
+    fn persist_provenance_preserves_stored_model_dim_on_drift() {
+        let db = Db::open_in_memory().unwrap();
+        let pid = uuid::Uuid::new_v4().to_string();
+        db.insert_project(&pid, "Proj", "/tmp/pp2", ProjectHost::Base, "pp2").unwrap();
+        db.set_project_codegraph_binding(
+            &pid,
+            "Proj",
+            Some("codesage-large-v2"),
+            Some(2048),
+            None,
+            None,
+            true,
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+        let prov = CodegraphProvenance {
+            model: "jina-embeddings-v2-base-code".to_string(),
+            dim: 768,
+            embed_revision: 3,
+            analyzed_commit: Some("cafe".to_string()),
+        };
+        // write_model_dim = false (WarnDrift) → keep stored model/dim, only
+        // advance the commit/timestamp.
+        persist_codegraph_provenance(&db, &pid, "Proj", &prov, false, 1_700_000_000_001);
+        let b = db.get_project_codegraph_binding(&pid).unwrap().unwrap();
+        assert_eq!(b.embedding_model.as_deref(), Some("codesage-large-v2"));
+        assert_eq!(b.embedding_dim, Some(2048));
+        assert_eq!(b.last_analyzed_commit.as_deref(), Some("cafe")); // commit still advances
     }
 }
 
