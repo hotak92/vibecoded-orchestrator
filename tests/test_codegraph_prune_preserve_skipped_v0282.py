@@ -332,3 +332,55 @@ def test_incremental_branch_records_prefilter_discovery_source_shape() -> None:
     assert filter_idx != -1 and record_idx < filter_idx, (
         "PRE-filter discovery recording must run BEFORE _filter_changed_files"
     )
+
+
+# ---------------------------------------------------------------------------
+# 8. RIDER B (v0.2.82): a module-write FAILURE must leave the file OUT of the
+#    walked set → it stays in the preserve set → its rows survive the prune.
+#    (Integration twin of test_codegraph_guards_v0282.py::test_T7_*.)
+# ---------------------------------------------------------------------------
+
+
+def test_module_write_failure_keeps_rows_preserved(analyzer_mod) -> None:
+    """Rider b: marking a file walked only AFTER the module write succeeds means
+    a mid-file transient failure preserves that file's rows on `--prune-stale`.
+
+    Drives the real `_create_or_update_module` (write raises) then the prune,
+    asserting the file's function rows are NOT deleted. FAIL-ON-BASE: base
+    marked the file walked at the method ENTRY, so a failed write dropped it
+    from the preserve set → its rows were pruned.
+    """
+    from datetime import datetime, timezone
+
+    analyzer = _make_analyzer(analyzer_mod)
+    analyzer._prune_discovered_paths = {"src/broken.py"}
+    analyzer._prune_walked_paths = set()
+
+    # store_entity raises → the module insert path fails mid-file.
+    def _boom_store_entity(entity):
+        raise RuntimeError("transient weaviate 503")
+
+    analyzer.store_entity = _boom_store_entity
+
+    with pytest.raises(RuntimeError):
+        analyzer._create_or_update_module(
+            "src/broken.py", "python", 1, 1.0,
+            datetime.now(tz=timezone.utc), "hash", [], "summary",
+        )
+    assert "src/broken.py" not in analyzer._prune_walked_paths
+
+    # The file is discovered-but-not-walked → in the preserve set → its rows
+    # survive the prune.
+    functions = _FakeCollection(
+        "Test_CodeFunction",
+        [_row("f-broken", "TestProject", "file_path", "src/broken.py")],
+        ["project", "file_path"],
+    )
+    preserve = analyzer._prune_discovered_paths - analyzer._prune_walked_paths
+    pruned, _failures = analyzer._prune_collection(
+        functions, visited_uuids=set(), preserve_paths=preserve,
+    )
+    assert pruned == 0 and functions.deleted == [], (
+        "a file whose module write RAISED must keep its rows (preserved), "
+        "never pruned (rider b)"
+    )

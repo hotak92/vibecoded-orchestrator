@@ -105,10 +105,15 @@ def extract_cpp_file(
         class_lines = source_lines[max(0, start_line - 1):_class_end_line]
         class_body = '\n'.join(class_lines)
         signature = f"class {cname}"
-        # Eager embed (computed at produce time — matches the imperative site).
-        embedding = helpers.generate_embedding(
-            f"{signature}\nMethods: {', '.join(methods[:10])}\n{class_body[:500]}"
-        )
+        # v0.2.82 (G1 task 2): defer the class embed so `_resolve_deferred_embed`
+        # SKIP/STAMPs a hash-matched class row on a metadata-only revision bump
+        # (this cpp CLASS site embedded EAGERLY pre-G1, defeating the guard).
+        # The embed text is BYTE-IDENTICAL to the eager form — the closure just
+        # delays the same `generate_embedding(<custom text>)` call. Default-arg
+        # capture (sig/mth/cb) pins each loop iteration's own values. For an
+        # over-budget (multi-chunk) class the chunk fan-out re-embeds per chunk
+        # regardless — this vector is used only on the single-chunk write.
+        _emb_methods = list(methods[:10])
         entities.append(CodeEntity(
             kind=KIND_CLASS, file_path_rel=relative_path,
             name=cname, full_name=f"{file_path.stem}.{cname}",
@@ -116,7 +121,12 @@ def extract_cpp_file(
             start_line=start_line, end_line=start_line + len(class_lines),
             project=helpers.project_name,
             extras={"methods": methods[:20]},
-            vector=helpers.shape_for_insert(embedding) if embedding else None,
+            deferred_embed=(
+                lambda sig=signature, mth=_emb_methods, cb=class_body:
+                helpers.generate_embedding(
+                    f"{sig}\nMethods: {', '.join(mth)}\n{cb[:500]}"
+                )
+            ),
         ))
         stats['classes'] += 1
 

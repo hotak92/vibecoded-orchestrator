@@ -326,6 +326,10 @@ _EMBED_REVISION_PROP = "embed_revision"
 _EMBED_REVISION_VECTORLESS = 0
 
 
+def _noop_mark(_path: str) -> None:
+    """Fallback for the ``_mark_file_walked`` getattr guard (minimal test stubs)."""
+
+
 def _stable_scalar(value: Any) -> str:
     """Render a property value into a stable, order-independent string.
 
@@ -531,6 +535,10 @@ try:
         path_is_ignored,  # noqa: F401 — re-exported (parity test asserts identity)
         path_reachable_on_disk,
     )
+    # v0.2.82 (G1): the ONE pure re-embed/patch/skip guard, under a namespace
+    # alias — its `classify_row` (embed decision SKIP/STAMP/EMBED) is DISTINCT
+    # from codegraph_row_classify.classify_row (prune owed/not_owed/purgeable).
+    from vco_lib import codegraph_guards as _guards
     # P2f (v0.2.76): the CodeEntity IR + its insert_params/identity mapping.
     # Extractors emit a typed entity and call `self.store_entity(...)` instead
     # of hand-building the `insert_params` dict + repeating the identity-key
@@ -2302,18 +2310,20 @@ class CodeGraphAnalyzer:
             if isinstance(props, dict) and not props.get("project_source"):
                 props["project_source"] = current_source
 
-        # v0.2.52 (V52-O.4): stamp `file_path` on CodeFunction + CodeClass
-        # rows from the per-call `file_path_rel` argument so consumers can
-        # filter / scope by source file without joining through the `module`
-        # reference. Scope check via the collection name: only Function /
-        # Class get the property (CodeModule already has `path`; CodeAPI /
-        # CodeInteraction aren't file-anchored in the same way). Defensive:
-        # don't clobber if the caller pre-set the property; skip on empty
-        # `file_path_rel` so the property stays NULL rather than empty
-        # string for forward-compat / cross-reference paths.
+        # v0.2.52 (V52-O.4): stamp `file_path` from the per-call `file_path_rel`
+        # so consumers can scope by source file without the `module` join.
+        # v0.2.82 (rider a): CodeAPI + CodeInteraction ALSO get it (their store
+        # sites carry a producing file) so the prune anchor resolution can reap
+        # their orphaned rows. `file_path` is in `_CONTENT_HASH_EXCLUDE` → zero
+        # re-write of a matched row. Don't clobber a preset value; skip on empty.
         if file_path_rel:
             coll_name = getattr(collection, "name", "") or ""
-            if coll_name.endswith("CodeFunction") or coll_name.endswith("CodeClass"):
+            if (
+                coll_name.endswith("CodeFunction")
+                or coll_name.endswith("CodeClass")
+                or coll_name.endswith("CodeAPI")
+                or coll_name.endswith("CodeInteraction")
+            ):
                 props = insert_params.get("properties")
                 if isinstance(props, dict) and not props.get("file_path"):
                     props["file_path"] = file_path_rel
@@ -2780,138 +2790,112 @@ class CodeGraphAnalyzer:
             )
 
         # Single chunk → the entity fits; not our path. Return None so the
-        # caller does the ordinary single-object write (which re-uses the
-        # already-computed vector in insert_params — no needless re-embed).
+        # caller does the ordinary single-object write (the deferred-embed
+        # resolver decides SKIP/STAMP/EMBED there — no needless re-embed).
         if len(chunk_texts) <= 1:
             return None
 
         total = len(chunk_texts)
+
+        # Derive per-chunk UUIDs + content hashes ONCE (reused by the stamp
+        # precheck AND the embed loop). The guard stays I/O-free; inject the
+        # analyzer's module-local UUID + content-hash seeds.
+        _coll_name = getattr(collection, "name", "") or ""
+        chunk_uuids, chunk_hashes = _guards.chunk_identities(
+            chunk_texts, props, is_function, identity_key, total,
+            uuid_fn=lambda key: _deterministic_uuid(
+                self.project_name, file_path_rel, key,
+                project_source=current_source_for_uuid,
+            ),
+            hash_fn=lambda cp: _content_hash_for_object(_coll_name, cp),
+        )
+
+        # v0.2.82 (G1 task 3): multi-chunk STAMP precheck — a metadata-only
+        # revision bump PATCHes (never re-embeds) a byte-identical, same-count
+        # multi-chunk entity (D1 extended to the 7-9% tail); ANY non-stampable
+        # chunk → full re-embed below. getattr-guarded for minimal test stubs.
+        _stamper = getattr(self, "_maybe_stamp_all_chunks", None)
+        if callable(_stamper) and _stamper(
+            collection, chunk_uuids, chunk_hashes, total,
+        ):
+            return chunk_uuids[0]
+
         canonical_uuid: Optional[str] = None
         for i, chunk_text in enumerate(chunk_texts):
-            # Per-chunk UUID: chunk_num is mixed into the identity key so N
-            # chunks of the same entity don't collide on one UUID. chunk 0 uses
-            # the bare identity_key so its UUID is byte-identical to the
-            # pre-chunking single-object UUID for that entity (canonical, and
-            # stable across a fits→over-budget transition for chunk 0).
-            if i == 0:
-                chunk_uuid = _deterministic_uuid(
-                    self.project_name, file_path_rel, identity_key,
-                    project_source=current_source_for_uuid,
-                )
-            else:
-                chunk_uuid = _deterministic_uuid(
-                    self.project_name, file_path_rel, f"{identity_key}::{i}",
-                    project_source=current_source_for_uuid,
-                )
-
-            # Re-embed THIS chunk's text (each chunk gets its own vector).
+            # Re-embed THIS chunk (own vector); guards builds its insert_params.
             chunk_vec = _shape_for_insert(generate_embedding(chunk_text))
-
-            # Build per-chunk insert_params: copy the shared props, override the
-            # body field with this chunk's text, stamp chunk_num/total_chunks.
-            # References + non-body props are identical across chunks (they all
-            # describe the same entity).
-            chunk_props = dict(props)
-            if is_function:
-                chunk_props["function_body"] = chunk_text
-            else:
-                chunk_props["class_body"] = chunk_text
-            chunk_props["chunk_num"] = i
-            chunk_props["total_chunks"] = total
-            # Recompute content_hash per chunk (the body differs), else the
-            # tombstone-skip would compare against the wrong hash. Drop any
-            # inherited hash so `_write_one_object` re-stamps from this chunk.
-            chunk_props.pop("content_hash", None)
-
-            chunk_params = dict(insert_params)
-            chunk_params["properties"] = chunk_props
-            if chunk_vec:
-                chunk_params["vector"] = chunk_vec
-            elif "vector" in chunk_params:
-                # No vector for this chunk (embed failed) → don't carry the
-                # parent's vector, which belongs to the full-body text.
-                del chunk_params["vector"]
-
+            chunk_params = _guards.build_chunk_write_params(
+                insert_params, props, chunk_text, is_function, i, total,
+                chunk_vec,
+            )
             written = self._write_one_object(
-                collection, chunk_uuid, chunk_params, identity_key,
+                collection, chunk_uuids[i], chunk_params, identity_key,
             )
             if i == 0:
                 canonical_uuid = written
         return canonical_uuid
 
+    def _maybe_stamp_all_chunks(
+        self, collection, chunk_uuids: List[str], chunk_hashes: List[str],
+        total: int,
+    ) -> bool:
+        """v0.2.82 (G1 task 3): thin seam over ``guards.stamp_all_chunks`` (which
+        owns the read-all-first / patch-only-if-all-stampable discipline). This
+        supplies the I/O: fingerprint read + the per-chunk revision PATCH (also
+        marks the row visited). True → all stamped (skip embeds); False → embed.
+        """
+        def _patch(cu: str) -> bool:
+            try:
+                collection.data.update(
+                    uuid=cu,
+                    properties={_EMBED_REVISION_PROP: CODEGRAPH_EMBED_REVISION},
+                )
+            except Exception:  # noqa: BLE001 — a patch failure → re-embed (safe)
+                return False
+            if self._track_visited:
+                self.visited_uuids.add((getattr(collection, "name", ""), cu))
+            self._embed_revision_patched = (
+                getattr(self, "_embed_revision_patched", 0) + 1
+            )
+            return True
+
+        return _guards.stamp_all_chunks(
+            chunk_uuids, chunk_hashes, total,
+            current_revision=CODEGRAPH_EMBED_REVISION,
+            floor_revision=_EMBED_SPACE_COMPATIBLE_FROM_REVISION,
+            vectorless_sentinel=_EMBED_REVISION_VECTORLESS,
+            read_fp=lambda cu: self._read_existing_object_fingerprint(
+                collection, cu, want_total_chunks=True,
+            ),
+            patch_rev=_patch,
+        )
+
     def _read_existing_object_fingerprint(
         self, collection, det_uuid: str, want_total_chunks: bool = False,
     ) -> Optional[Dict[str, Any]]:
-        """Point-read an existing object's tombstone-skip fingerprint by UUID.
-
-        v0.2.73 (FIX-B2): single home for the ``content_hash`` +
-        ``embed_revision`` point-read that both the EMBED-skip precheck (in
-        ``_dedup_insert``, BEFORE the embed) and the WRITE-skip decision (in
-        ``_write_one_object``) share. Hoisting the read out of
-        ``_write_one_object`` lets ``_dedup_insert`` decide "this object is
-        unchanged" BEFORE calling the (expensive) embedder — a 1-line edit to a
-        50-func file then runs 1 embed instead of ~51.
-
-        Returns a dict ``{"content_hash": str, "embed_revision": Any,
-        "total_chunks": int|None}`` on a successful read, or ``None`` when the
-        object is absent OR the read cannot be performed (no ``.query`` attr on
-        a mocked/older client, fetch raises, etc.). A ``None`` return means
-        "unknown" → every caller MUST fall through to embed+write (fail-safe:
-        never skip on uncertainty).
-
-        ``want_total_chunks`` requests the ``total_chunks`` property too (only
-        valid for chunkable Function/Class collections — Module/API/Interaction
-        schemas lack it and an unknown return_property errors the read).
+        """Thin seam over ``guards.read_object_fingerprint`` (v0.2.82) — the
+        point-read body lives in vco_lib now; this is the analyzer-side seam its
+        two callers share. See the guard helper for the full contract.
         """
-        try:
-            query = getattr(collection, "query", None)
-            fetch_by_id = getattr(query, "fetch_object_by_id", None) if query else None
-            if not callable(fetch_by_id):
-                return None
-            read_props = ["content_hash", _EMBED_REVISION_PROP]
-            if want_total_chunks:
-                read_props.append("total_chunks")
-            existing = fetch_by_id(det_uuid, return_properties=read_props)
-            if existing is None:
-                return None
-            existing_props = getattr(existing, "properties", None) or {}
-            total_chunks: Optional[int] = None
-            if want_total_chunks:
-                try:
-                    total_chunks = int(existing_props.get("total_chunks") or 1)
-                except (TypeError, ValueError):
-                    total_chunks = 1
-            return {
-                "content_hash": existing_props.get("content_hash") or "",
-                "embed_revision": existing_props.get(_EMBED_REVISION_PROP),
-                "total_chunks": total_chunks,
-            }
-        except Exception:  # noqa: BLE001 — any read failure → unknown → write
-            return None
+        return _guards.read_object_fingerprint(
+            collection, det_uuid, _EMBED_REVISION_PROP,
+            want_total_chunks=want_total_chunks,
+        )
 
     def _fingerprint_matches(
         self, stored_hash: str, stored_rev: Any, content_hash: str,
     ) -> bool:
-        """The v0.2.72 (P7) FINGERPRINT GATE, factored (FIX-B2, single home).
-
-        Return True (SKIP is safe) ONLY when BOTH:
-          (a) the content is byte-identical (``stored_hash == content_hash``,
-              both non-empty), AND
-          (b) the stored row was embedded under the CURRENT embedding-generation
-              revision (``stored_rev == CODEGRAPH_EMBED_REVISION``).
-
-        A NULL / mismatched ``embed_revision`` (pre-migration row, or a row
-        written before a chunking-scheme bump) FORCES a re-embed even when the
-        body text is unchanged — that is exactly the over-budget-entity resync
-        P7 targets. Fail-safe: any uncertainty upstream (empty hash, absent
-        row, read error) never reaches here as a match, so the default is
-        embed+write, never a wrong skip.
+        """The v0.2.72 (P7) FINGERPRINT GATE — SKIP decision. v0.2.82 (G1): the
+        rule lives in ``guards.classify_row``; this name is the test seam. SKIP
+        → True; STAMP / EMBED → False (caller then runs the D1 stamp, then a
+        re-embed). Fail-safe: any uncertainty is EMBED → False here.
         """
-        if not content_hash or not stored_hash:
-            return False
-        if stored_hash != content_hash:
-            return False
-        return stored_rev == CODEGRAPH_EMBED_REVISION
+        return _guards.classify_row(
+            stored_hash, stored_rev, content_hash,
+            current_revision=CODEGRAPH_EMBED_REVISION,
+            floor_revision=_EMBED_SPACE_COMPATIBLE_FROM_REVISION,
+            vectorless_sentinel=_EMBED_REVISION_VECTORLESS,
+        ) is _guards.RowAction.SKIP
 
     def _resolve_deferred_embed(
         self, collection, insert_params: dict, identity_key: str,
@@ -2941,17 +2925,17 @@ class CodeGraphAnalyzer:
             doubt), so the write proceeds exactly as before.
 
         The ``_deferred_embed`` key is popped here so it never reaches
-        Weaviate's ``replace()``/``insert()`` splat. Call sites that still set
-        ``vector`` eagerly (Module/API/Interaction — non-chunkable, cheap embed,
-        or already-cheap ``generate_embedding``) are untouched: this method is a
-        no-op when ``_deferred_embed`` is absent.
+        Weaviate's ``replace()``/``insert()`` splat. v0.2.82 (G1 task 2): ALL
+        five entity types now defer (Module/API/Interaction converted from eager
+        ``vector`` to a deferred closure), so this resolver's SKIP/STAMP path
+        covers every collection — a metadata-only revision bump re-embeds
+        NOTHING. Still a no-op when ``_deferred_embed`` is absent (test stub).
 
-        CONSERVATIVE: for chunkable entities the content_hash stored on the
-        canonical row (chunk 0) includes ``chunk_num=0``; the skip precheck
-        stamps ``chunk_num``/``total_chunks`` onto a scratch copy of the props
-        so the computed hash matches the stored canonical hash exactly — an
-        over-budget (multi-chunk) entity therefore never spuriously matches a
-        single-chunk stored hash (its total differs) and correctly re-embeds.
+        CONSERVATIVE: for chunkable entities the precheck stamps
+        ``chunk_num=0``/``total_chunks=1`` onto a scratch props copy so the
+        computed hash matches the stored canonical (chunk-0) hash exactly — an
+        over-budget (multi-chunk) entity's total differs → no spurious match →
+        it correctly re-embeds.
         """
         deferred = insert_params.pop("_deferred_embed", None)
         if deferred is None:
@@ -3066,47 +3050,20 @@ class CodeGraphAnalyzer:
         self, fp: Mapping[str, Any], content_hash: str, is_chunkable: bool,
     ) -> bool:
         """D1 classifier: True iff a stale row needs only an `embed_revision`
-        metadata PATCH (its vector is still valid), NOT a re-embed.
-
-        Safe (stamp-only) requires ALL of:
-          * content byte-identical (``stored_hash == content_hash``) — same
-            semantic content, so the stored vector still represents it;
-          * the stored row HAS a vector — proxied by a POSITIVE stored
-            revision. A row is stamped ``CODEGRAPH_EMBED_REVISION`` only when a
-            vector was present at write time, else ``_EMBED_REVISION_VECTORLESS``
-            (0). So ``stored_rev > 0`` ⇒ vector present; ``0`` / NULL ⇒
-            vectorless → must re-embed;
-          * the stored vector is in the CURRENT embedding space —
-            ``stored_rev >= _EMBED_SPACE_COMPATIBLE_FROM_REVISION`` (a bump that
-            changed the model/chunking raises that floor → those rows re-embed);
-          * the row is genuinely stale — ``stored_rev < CODEGRAPH_EMBED_REVISION``
-            (an at-current row was already handled by _fingerprint_matches);
-          * single-chunk — a chunkable entity that is now over-budget needs a
-            real chunk-split + re-embed, never a stamp. ``total_chunks <= 1``.
-        Any read uncertainty (NULL/non-int revision) → False → re-embed.
+        PATCH (vector still valid), NOT a re-embed. v0.2.82 (G1): the rule lives
+        in ``guards.classify_row``; this name is the seam. The single-object
+        path passes total=1, so a stored ``total_chunks > 1`` is a count
+        mismatch → EMBED (pre-G1 multi-chunk carve-out). STAMP → True; else False.
         """
-        stored_hash = fp.get("content_hash") or ""
-        if not content_hash or stored_hash != content_hash:
-            return False
-        stored_rev_raw = fp.get("embed_revision")
-        try:
-            stored_rev = int(stored_rev_raw)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            return False  # NULL / non-int → unknown → re-embed (fail-safe)
-        if stored_rev <= _EMBED_REVISION_VECTORLESS:
-            return False  # vectorless (0) or negative → must embed
-        if stored_rev < _EMBED_SPACE_COMPATIBLE_FROM_REVISION:
-            return False  # vector in a stale embedding space → must re-embed
-        if stored_rev >= CODEGRAPH_EMBED_REVISION:
-            return False  # not stale (matches would have skipped) — no stamp
-        # Over-budget multi-chunk entity → needs a real chunk split, not a stamp.
-        if is_chunkable:
-            try:
-                if int(fp.get("total_chunks") or 1) > 1:
-                    return False
-            except (TypeError, ValueError):
-                return False
-        return True
+        return _guards.classify_row(
+            fp.get("content_hash") or "", fp.get("embed_revision"), content_hash,
+            current_revision=CODEGRAPH_EMBED_REVISION,
+            floor_revision=_EMBED_SPACE_COMPATIBLE_FROM_REVISION,
+            vectorless_sentinel=_EMBED_REVISION_VECTORLESS,
+            is_chunkable=is_chunkable,
+            stored_total_chunks=fp.get("total_chunks"),
+            computed_total_chunks=1,
+        ) is _guards.RowAction.STAMP
 
     @staticmethod
     def _run_deferred_embed_into(insert_params: dict, deferred) -> None:
@@ -3449,21 +3406,24 @@ class CodeGraphAnalyzer:
                     f"Plan C language-property migration on {label} skipped: {e}"
                 )
 
-
     def _ensure_file_path_property(self):
-        """v0.2.52 (V52-O.4) schema migration: add `file_path` to CodeFunction
-        + CodeClass so consumers can filter / scope by source file without
-        joining through the `module` reference. The property mirrors
-        ``CodeModule.path``. Pre-V52-O.4 rows show NULL until they're touched
-        by a re-analyze. Idempotent + soft-fail per collection.
+        """v0.2.52 (V52-O.4): add `file_path` (mirrors ``CodeModule.path``) to
+        the file-anchored non-Module collections. Idempotent + soft-fail.
 
-        Only Function + Class get the new property; Module already has `path`,
-        and API / Interaction rows are not file-anchored in the same way
-        (an interaction row can cross multiple files).
+        v0.2.82 (rider a): CodeAPI + CodeInteraction also gain it so the
+        deleted-file sweep + prune anchor resolution can reap orphaned rows of
+        removed files (preserve-all before, since anchor-less). ``file_path`` is
+        in ``_CONTENT_HASH_EXCLUDE`` → stamping never perturbs a content hash →
+        zero re-write of matched rows. Analyzer-only (NOT in codegraph_schema.py,
+        which owns only migration-edge props — file_path predates it, parity
+        scope excludes it). Legacy anchor-less rows converge on next file change
+        (DEFERRAL D3).
         """
         collections = [
-            ("CodeFunction", self.functions_collection),
-            ("CodeClass",    self.classes_collection),
+            ("CodeFunction",    self.functions_collection),
+            ("CodeClass",       self.classes_collection),
+            ("CodeAPI",         self.apis_collection),
+            ("CodeInteraction", self.interactions_collection),
         ]
         desc = (
             "Repo-relative POSIX path of the source file "
@@ -4856,10 +4816,11 @@ class CodeGraphAnalyzer:
                 f"{ix['protocol']} {ix['endpoint']} "
                 f"[{ix['confidence']}]"
             )
-            embedding = generate_embedding(description)
             references = {"source_module": module_uuid}
             if func_uuid:
                 references["source_function"] = func_uuid
+            # v0.2.82 (G1 task 2): deferred closure (not eager `vector`) so
+            # `_resolve_deferred_embed` SKIP/STAMPs a hash-matched row. Pins d.
             entity = CodeEntity(
                 kind=KIND_INTERACTION, file_path_rel=file_path_rel,
                 extras={
@@ -4876,7 +4837,9 @@ class CodeGraphAnalyzer:
                     "_identity_key": f"ix::{ix.get('source','')}::{ix.get('endpoint','')}",
                 },
                 references=references,
-                vector=_shape_for_insert(embedding) if embedding else None,
+                deferred_embed=(
+                    lambda d=description: generate_embedding(d)
+                ),
             )
             try:
                 self.store_entity(entity)
@@ -5333,12 +5296,17 @@ class CodeGraphAnalyzer:
         if not rel_path:
             return 0
         deleted_total = 0
-        # (collection attr, file-path property name) for the file-anchored
-        # collections. Module uses `path`; Function/Class use `file_path`.
+        # (collection attr, anchor prop). Module uses `path`; the rest use
+        # `file_path`. v0.2.82 (rider a): API + Interaction joined the set (they
+        # now carry `file_path`) → a deleted file's rows are reaped too.
+        # `_delete_file_rows_exact` schema-probes the anchor → legacy
+        # anchor-less collections degrade cleanly (no delete).
         targets = [
             (getattr(self, "modules_collection", None), "path"),
             (getattr(self, "functions_collection", None), "file_path"),
             (getattr(self, "classes_collection", None), "file_path"),
+            (getattr(self, "apis_collection", None), "file_path"),
+            (getattr(self, "interactions_collection", None), "file_path"),
         ]
         # Exact-string predicate on the RAW stored path — never a token filter.
         def _is_this_file(raw_path, _props):
@@ -5423,11 +5391,14 @@ class CodeGraphAnalyzer:
             stored_rev = (getattr(obj, "properties", None) or {}).get(
                 _EMBED_REVISION_PROP
             )
-            try:
-                if stored_rev is not None and int(stored_rev) == CODEGRAPH_EMBED_REVISION:
-                    return obj.uuid
-            except (TypeError, ValueError):
-                pass
+            # v0.2.82 (G1): rev-equality delegates to the ONE guard helper (the
+            # file-set probe above stays here). Skip the file ONLY when the
+            # module row is NOT stale; a stamp-owed row (floor ≤ rev < current)
+            # IS stale → re-walk, so the per-object D1 stamp can fire.
+            if not _guards.is_row_revision_stale(
+                stored_rev, CODEGRAPH_EMBED_REVISION
+            ):
+                return obj.uuid
             # Absent / NULL / older / unparseable revision → the file's rows
             # were embedded under a previous scheme → do NOT skip the file.
             return None
@@ -5488,6 +5459,18 @@ class CodeGraphAnalyzer:
 
         return float(complexity)
 
+    def _mark_file_walked(self, path: str) -> None:
+        """Record ``path`` as WALKED (module write reached). ``discovered −
+        walked`` in the prune pass is the skipped-but-present preserve set.
+        Rider b (v0.2.82): the caller invokes this ONLY AFTER the module write
+        succeeds — a mid-file write failure leaves the file OUT of the walked set
+        (preserved, never pruned). getattr-guarded (state + call site) so minimal
+        test stubs stay constructible.
+        """
+        _walked = getattr(self, "_prune_walked_paths", None)
+        if _walked is not None and self._track_visited and path:
+            _walked.add(path.replace("\\", "/"))
+
     def _create_or_update_module(self, path: str, language: str, loc: int,
                                  complexity: float, last_modified: datetime,
                                  file_hash: str, imports: List[str], module_summary: str) -> str:
@@ -5510,16 +5493,6 @@ class CodeGraphAnalyzer:
         # Fall back to `self._current_language` (dispatcher-set) so direct
         # callers without a `language=` argument still get the right value.
         canonical_lang = _canonical_lang_id(language) or self._current_language or ""
-
-        # v0.2.82 — mark this file as actually WALKED (module write reached).
-        # Every extractor funnels its writes through here (via
-        # `write_file_extraction`), so `discovered − walked` in the prune
-        # pass is exactly the set of skipped-but-present files whose rows
-        # must be preserved. Same gate as visited_uuids. getattr-guarded so
-        # stub analyzers in tests (SimpleNamespace) stay constructible.
-        _walked = getattr(self, "_prune_walked_paths", None)
-        if _walked is not None and self._track_visited and path:
-            _walked.add(path.replace("\\", "/"))
 
         # v0.2.47 (extras): source-root tag goes onto both update + insert
         # paths so re-analyzes of pre-v0.2.47 rows backfill the property
@@ -5579,10 +5552,12 @@ class CodeGraphAnalyzer:
             # Still record as visited so --prune-stale doesn't delete it.
             if self._track_visited:
                 self.visited_uuids.add((self.modules_collection.name, cached_uuid))
+            getattr(self, "_mark_file_walked", _noop_mark)(path)  # rider b
             return cached_uuid
 
-        # Create new - generate embedding from module_summary
-        embedding = embed_module(module_summary)
+        # Create new — module_summary embedded LAZILY. v0.2.82 (G1 task 2): a
+        # deferred closure (not eager `vector`) so `_resolve_deferred_embed`
+        # SKIP/STAMPs a hash-matched module row. Default-arg pins module_summary.
 
         # CodeModule has a distinct property set (no name/full_name) and keys on
         # ``module::<path>``; the whole set + identity ride in ``extras``. The
@@ -5607,7 +5582,9 @@ class CodeGraphAnalyzer:
         uuid = self.store_entity(CodeEntity(
             kind=KIND_MODULE, file_path_rel=path,
             extras=module_extras,
-            vector=_shape_for_insert(embedding) if embedding else None,
+            deferred_embed=(
+                lambda ms=module_summary: embed_module(ms)
+            ),
         ))
 
         # C-12 (v0.2.75 P2c): key by (project_source, relpath). Two
@@ -5617,6 +5594,10 @@ class CodeGraphAnalyzer:
         # the cache layer. ``cache_key`` was computed above for the update
         # branch; reuse it so insert + update agree on the key.
         self.module_cache[cache_key] = uuid
+        # v0.2.82 (rider b): mark WALKED only AFTER the write succeeded, so a
+        # mid-file write failure leaves the file in the PRESERVE set (see
+        # _mark_file_walked). getattr-guarded for minimal test stubs.
+        getattr(self, "_mark_file_walked", _noop_mark)(path)
         return uuid
 
     # v0.2.77 Part 5 (CG-2): the former ``_extract_function_calls`` (Python
@@ -7247,6 +7228,9 @@ def main():
             )
             return 4
 
+        # v0.2.82 (G6, WP-3 contract): one NORMATIVE provenance line at
+        # successful run end (WP-3's launcher parser reads the last occurrence).
+        _print_codegraph_provenance(embedding_service, repo_path)
         return 0
 
     finally:
@@ -7256,6 +7240,22 @@ def main():
                 embedding_service.close()
             except Exception:
                 pass
+
+
+def _print_codegraph_provenance(
+    embedding_service: "Optional[EmbeddingService]", repo_path: Path,
+) -> None:
+    """v0.2.82 (G6): print the ONE provenance line WP-3 parses (built by
+    ``guards.provenance_line`` — model/dim from the EmbeddingService, commit via
+    git, soft-fail to ``none``). Never raises."""
+    print(
+        _guards.provenance_line(
+            getattr(embedding_service, "code_model_id", ""),
+            getattr(embedding_service, "code_dim", 0),
+            CODEGRAPH_EMBED_REVISION, repo_path,
+        ),
+        flush=True,
+    )
 
 
 def _emit_code_graph_deferral_no_backend(install_root: Path, exc: Exception) -> None:

@@ -118,7 +118,9 @@ def extract_proto_file(
         end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 30)
         class_body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
         signature = f"message {mname}"
-        embedding = helpers.generate_embedding(f"Proto message: {mname}\n{class_body[:400]}")
+        # v0.2.82 (G1 task 2): defer the class embed (this proto message CLASS
+        # site embedded EAGERLY pre-G1, defeating the guard). Embed text is
+        # BYTE-IDENTICAL to the eager form; default-arg capture pins mname/body.
         entities.append(CodeEntity(
             kind=KIND_CLASS, file_path_rel=relative_path,
             name=mname, full_name=f"{pkg}.{mname}",
@@ -126,7 +128,10 @@ def extract_proto_file(
             start_line=start_line, end_line=end_line,
             project=helpers.project_name,
             extras={"methods": []},
-            vector=helpers.shape_for_insert(embedding) if embedding else None,
+            deferred_embed=(
+                lambda mn=mname, cb=class_body:
+                helpers.generate_embedding(f"Proto message: {mn}\n{cb[:400]}")
+            ),
         ))
         stats['classes'] += 1
 
@@ -137,7 +142,8 @@ def extract_proto_file(
             f"gRPC {entry['service']}.{entry['method']} "
             f"({entry['input']}) → ({entry['output']}) [{pkg}]"
         )
-        embedding = helpers.generate_embedding(api_desc)
+        # v0.2.82 (G1 task 2): defer the API embed (SKIP/STAMP on a
+        # metadata-only revision bump). Default-arg capture pins api_desc.
         entities.append(CodeEntity(
             kind=KIND_API, file_path_rel=relative_path,
             extras={
@@ -146,7 +152,9 @@ def extract_proto_file(
                 "parameters": [entry['input']], "returns": entry['output'],
                 "project": helpers.project_name, "proxy_target": "",
             },
-            vector=helpers.shape_for_insert(embedding) if embedding else None,
+            deferred_embed=(
+                lambda d=api_desc: helpers.generate_embedding(d)
+            ),
         ))
         stats['apis'] += 1
 

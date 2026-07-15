@@ -492,10 +492,11 @@ def extract_csharp_file(
                 ctrl_route = '/' + base_route_m.group(1).strip('/')
             full_route = ctrl_route + ('/' if ctrl_route else '') + route.lstrip('/')
             api_desc = f"C# ASP.NET {http_method} {full_route} → {ns}.{enclosing}.{mname}"
-            api_embedding = helpers.generate_embedding(api_desc)
             # The handler edge points at the FUNCTION emitted just above; the
             # writer resolves ``_handler_full_name`` -> that function's UUID
             # (references={"handler": func_uuid} in the imperative extractor).
+            # v0.2.82 (G1 task 2): defer the API embed (SKIP/STAMP on a
+            # metadata-only revision bump). Default-arg capture pins api_desc.
             entities.append(CodeEntity(
                 kind=KIND_API, file_path_rel=relative_path,
                 extras={
@@ -505,7 +506,9 @@ def extract_csharp_file(
                     "project": helpers.project_name, "proxy_target": "",
                     "_handler_full_name": full_name,
                 },
-                vector=helpers.shape_for_insert(api_embedding) if api_embedding else None,
+                deferred_embed=(
+                    lambda d=api_desc: helpers.generate_embedding(d)
+                ),
             ))
             stats.setdefault('apis', 0)
             stats['apis'] += 1

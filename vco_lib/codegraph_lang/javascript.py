@@ -510,8 +510,9 @@ def extract_js_file(
         if proxy_target:
             description += f" [proxies to {proxy_target}]"
 
-        embedding = helpers.generate_embedding(description)
-
+        # v0.2.82 (G1 task 2): defer the API embed — a zero-arg closure instead
+        # of an eager vector, so `_resolve_deferred_embed` SKIP/STAMPs a
+        # hash-matched API row on a metadata-only revision bump (ZERO re-embeds).
         entities.append(CodeEntity(
             kind=KIND_API, file_path_rel=relative_path,
             extras={
@@ -523,7 +524,9 @@ def extract_js_file(
                 "project": helpers.project_name,
                 "proxy_target": proxy_target or "",
             },
-            vector=helpers.shape_for_insert(embedding) if embedding else None,
+            deferred_embed=(
+                lambda d=description: helpers.generate_embedding(d)
+            ),
         ))
         stats['apis'] += 1
 

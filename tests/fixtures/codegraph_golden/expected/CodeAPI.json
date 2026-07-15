@@ -4,6 +4,7 @@
     "content_hash": "db3e8ff9c5859254b0b769147a9169358cb4dcdeff227fdfa6d557b5283535fb",
     "embed_revision": 0,
     "endpoint": "/api/items/add",
+    "file_path": "src/Inventory.cs",
     "language": "csharp",
     "method": "POST",
     "parameters": [],
@@ -16,31 +17,8 @@
     "content_hash": "344272cd3177c9fb02be43a6742d146d12a79728138d31e0d2b8be61338e55e6",
     "embed_revision": 0,
     "endpoint": "/api/items/all",
+    "file_path": "src/Inventory.cs",
     "language": "csharp",
-    "method": "GET",
-    "parameters": [],
-    "project": "GoldenProj",
-    "proxy_target": "",
-    "returns": ""
-  },
-  {
-    "api_description": "POST /items/create (authenticated) -> createItem",
-    "content_hash": "a223b91e3cbe04d4e2bd3744084b2791e76b474890bb83c0ba6b11fe4815b072",
-    "embed_revision": 0,
-    "endpoint": "/items/create",
-    "language": "javascript",
-    "method": "POST",
-    "parameters": [],
-    "project": "GoldenProj",
-    "proxy_target": "",
-    "returns": ""
-  },
-  {
-    "api_description": "GET /items/list (public) -> listItems",
-    "content_hash": "4815e3b154d1d690985d92fe077cf6c3880f9f56a60488abe1bced057aff284f",
-    "embed_revision": 0,
-    "endpoint": "/items/list",
-    "language": "javascript",
     "method": "GET",
     "parameters": [],
     "project": "GoldenProj",
@@ -52,6 +30,7 @@
     "content_hash": "f6aeb0015ca08da1f9df850bcf4a14cfb13b58500292bb42c85f0e194e62c1c3",
     "embed_revision": 0,
     "endpoint": "grpc:catalog.v1.CatalogService/GetProduct",
+    "file_path": "src/catalog.proto",
     "language": "proto",
     "method": "gRPC",
     "parameters": [
@@ -66,6 +45,7 @@
     "content_hash": "f110e80b57a0a2d2140f90d7ac7a25f7bb0471e0ca8acef94b4fafa2da3911bb",
     "embed_revision": 0,
     "endpoint": "grpc:catalog.v1.CatalogService/ListProducts",
+    "file_path": "src/catalog.proto",
     "language": "proto",
     "method": "gRPC",
     "parameters": [
@@ -74,5 +54,31 @@
     "project": "GoldenProj",
     "proxy_target": "",
     "returns": "ProductList"
+  },
+  {
+    "api_description": "POST /items/create (authenticated) -> createItem",
+    "content_hash": "a223b91e3cbe04d4e2bd3744084b2791e76b474890bb83c0ba6b11fe4815b072",
+    "embed_revision": 0,
+    "endpoint": "/items/create",
+    "file_path": "src/routes.js",
+    "language": "javascript",
+    "method": "POST",
+    "parameters": [],
+    "project": "GoldenProj",
+    "proxy_target": "",
+    "returns": ""
+  },
+  {
+    "api_description": "GET /items/list (public) -> listItems",
+    "content_hash": "4815e3b154d1d690985d92fe077cf6c3880f9f56a60488abe1bced057aff284f",
+    "embed_revision": 0,
+    "endpoint": "/items/list",
+    "file_path": "src/routes.js",
+    "language": "javascript",
+    "method": "GET",
+    "parameters": [],
+    "project": "GoldenProj",
+    "proxy_target": "",
+    "returns": ""
   }
 ]
