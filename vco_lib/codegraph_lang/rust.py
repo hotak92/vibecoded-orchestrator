@@ -33,7 +33,7 @@ from vco_lib.codegraph_entities import (
 from vco_lib.codegraph_lang._shared import (
     _extract_balanced_block,
     _extract_external_calls,
-    _is_minified_content,
+    run_pure_extractor,
 )
 
 
@@ -401,38 +401,14 @@ def extract_rust_file(
 def analyze_rust_file(ctx: Any, file_path: Path, repo_root: Path) -> Dict[str, int]:
     """Thin shim over the pure :func:`extract_rust_file` producer.
 
-    Keeps the walk-time I/O + unchanged-skip gate analyzer-side (short-circuit
-    preserved — the extractor is only called when the file is NOT skipped), then
-    ``extract`` -> ``ctx.write_file_extraction`` -> stats dict. Signature +
-    dispatch registration are unchanged."""
-    stats = {'modules': 0, 'classes': 0, 'functions': 0}
-
-    content = file_path.read_text(encoding='utf-8', errors='ignore')
-    # CG-5 (v0.2.75 P3d): skip machine-minified content at walk time (skip +
-    # log; NEVER delete existing rows — the orphan-clear owns deletion). One
-    # home: _is_minified_content. A genuine long-line first-party file simply
-    # isn't re-indexed this run.
-    if _is_minified_content(content):
-        try:
-            _rel_min = file_path.relative_to(repo_root).as_posix()
-        except Exception:  # noqa: BLE001
-            _rel_min = str(file_path)
-        print(f"⏭️  Skipping {_rel_min} (looks minified/generated)")
-        return {'modules': 0, 'classes': 0, 'functions': 0}
-
-    file_hash = hashlib.sha256(content.encode()).hexdigest()
-    relative_path = file_path.relative_to(repo_root).as_posix()
-
-    if ctx._get_existing_module(relative_path, file_hash):
-        print(f"⏭️  Skipping {relative_path} (unchanged)")
-        return stats
-
-    fx = extract_rust_file(content, file_path, repo_root, _helpers(ctx))
-    return ctx.write_file_extraction(fx)
-
-
-def _helpers(ctx: Any) -> Any:
-    """Wrap ``ctx`` in the narrow ExtractorHelpers protocol (imported lazily to
-    avoid a hard import cycle at module load — same idiom the analyzer uses)."""
-    from vco_lib.codegraph_lang._shared import ExtractorHelpers
-    return ExtractorHelpers(ctx)
+    v0.2.82 (G4): the hand-copied walk-time I/O + skip-gate twin was BYTE-
+    EQUIVALENT to :func:`vco_lib.codegraph_lang._shared.run_pure_extractor`
+    (same CG-5 minified skip + message, same ``_get_existing_module`` gate +
+    message, same ``extract`` -> ``write_file_extraction`` -> stats). Routing
+    through the shared shim removes the duplication (A>B>C modularity rule); the
+    golden suite pins that stored output is unchanged. Signature + dispatch
+    registration are unchanged."""
+    return run_pure_extractor(
+        ctx, file_path, repo_root, extract_rust_file,
+        {'modules': 0, 'classes': 0, 'functions': 0},
+    )
