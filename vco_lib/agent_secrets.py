@@ -77,6 +77,7 @@ __all__ = [
     "AccessDenied",
     "Forbidden",
     "HubUnreachable",
+    "KeychainLocked",
     "ProjectNotFound",
     "SecretNotFound",
     "exec_with_secrets",
@@ -86,6 +87,35 @@ __all__ = [
 
 class SecretNotFound(ResolverError):
     """The key resolves nowhere (hub + file store both came up empty)."""
+
+
+class KeychainLocked(ResolverError):
+    """The hub could not read the OS keychain (503 ``keychain_locked`` /
+    ``keychain_error``) — v0.2.82 WP-4a.
+
+    Distinct from :class:`AccessDenied` (``key_not_active``): a locked or
+    read-erroring keychain is NOT an authorization decision, it is an
+    *unavailability* of tier 1's backing store. The hub cannot honestly
+    report whether the key exists — so a partial/absent answer here means
+    "we could not look," not "the key isn't authorized here."
+
+    ``keychain_locked`` (503): the whole store is locked — the hub refuses
+    the full-env AND ``?key=`` forms before constructing any Entry.
+    ``keychain_error`` (503): a per-key non-lock keychain read failed on a
+    ``?key=`` lookup (the key may exist but is currently unreadable).
+
+    Deliberately NOT a :class:`HubUnreachable` subclass — the hub was
+    reachable and answered; only its keychain backing was unavailable. The
+    diagnostic must name the lock/error state (unlock the login keychain,
+    or open the launcher), not "hub down."
+
+    :func:`get` still consults the file store (tier 2) and project ``.env``
+    (tier 3) on this error: those are INDEPENDENT sanctioned stores, not a
+    keychain fallback, so a locked keychain must not strand a file-store or
+    ``.env`` key. This is honest, not a silent downgrade — the final
+    all-miss message names both the locked-keychain state and the
+    file-store miss.
+    """
 
 
 class AccessDenied(ResolverError):
@@ -283,6 +313,40 @@ def _hub_get(key: str, project: Optional[str]) -> str:
             f"hub.token.{pid}, or set VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub "
             "to reopen the one-release compat window"
         )
+    if resp.status_code == 503:
+        # v0.2.82 WP-4a: the hub reached its keychain but could not read it.
+        # `keychain_locked` — the whole OS keychain is locked (refused for
+        # BOTH the full-env and `?key=` forms before any Entry is built);
+        # `keychain_error` — a per-key non-lock keychain read failed on this
+        # `?key=` lookup. Both are UNAVAILABILITY of tier 1's backing store,
+        # NOT an authorization decision, so they map to the distinct
+        # `KeychainLocked` (never `AccessDenied`/`key_not_active`). Any OTHER
+        # 503 (e.g. a future `service_misconfigured`) stays HubUnreachable via
+        # the tail. `get()` still consults the file store + .env on this error
+        # (independent sanctioned stores — see KeychainLocked's docstring).
+        code = None
+        try:
+            err = resp.json()
+            if isinstance(err, dict):
+                code = (err.get("error") or {}).get("code")
+        except ValueError:
+            code = None
+        if code in ("keychain_locked", "keychain_error"):
+            locked = code == "keychain_locked"
+            raise KeychainLocked(
+                f"hub could not read the OS keychain for {key!r} "
+                f"(project={pid}, code={code!r}): "
+                + (
+                    "the login keychain is locked"
+                    if locked
+                    else "a per-key keychain read failed (the key may exist "
+                    "but is currently unreadable)"
+                )
+                + " — unlock the login keychain or open the launcher to "
+                "restore secret resolution"
+            )
+        # Fall through: any other 503 is a hub-side condition, not a keychain
+        # unavailability. Keep the historical HubUnreachable classification.
     if resp.status_code == 404:
         code = None
         try:
@@ -344,6 +408,14 @@ def get(
             enabled the file store is consulted first (a legitimate secrets
             tier); a subsequent miss surfaces as SecretNotFound whose message
             names the 403.
+        KeychainLocked: the hub could not read the OS keychain (503
+            ``keychain_locked`` / ``keychain_error``) AND the file store +
+            project ``.env`` also had no copy (or fallback is disabled). The
+            file store IS still consulted on this error (an independent
+            sanctioned store, not a keychain fallback — see
+            :class:`KeychainLocked`); this exception surfaces only when that
+            miss ALSO happens, and its message names both the locked-keychain
+            state and the file-store miss.
     """
     if not key or not key.strip():
         raise SecretNotFound("empty key")
@@ -352,7 +424,14 @@ def get(
     hub_error: Optional[ResolverError] = None
     try:
         return _hub_get(key, project)
-    except (HubUnreachable, ProjectNotFound, SecretNotFound, AccessDenied, Forbidden) as exc:
+    except (
+        HubUnreachable,
+        ProjectNotFound,
+        SecretNotFound,
+        AccessDenied,
+        Forbidden,
+        KeychainLocked,
+    ) as exc:
         # AccessDenied (key_not_active) intentionally falls through to
         # the file store: the hub can't tell "explicitly paused" from
         # "never declared" (live-verified 2026-06-11), and hard-failing
@@ -368,6 +447,15 @@ def get(
         # user-owned, not the masked-misconfig env values. The distinct
         # `Forbidden` type keeps the DIAGNOSTIC honest (no "hub unreachable"
         # mislabel) while preserving the legitimate fallback.
+        #
+        # v0.2.82 WP-4a: KeychainLocked (503 keychain_locked/keychain_error)
+        # ALSO falls through. A locked keychain is an UNAVAILABILITY of tier
+        # 1's backing store, not an authorization decision — the file store
+        # and project .env are INDEPENDENT sanctioned stores, so a locked
+        # keychain must not strand a key that lives there. This is honest,
+        # not a downgrade: the file store never depended on the keychain, and
+        # the distinct `KeychainLocked` type keeps the diagnostic accurate so
+        # a full-chain miss names the lock state (not "hub down").
         hub_error = exc
 
     if allow_file_fallback:
@@ -383,6 +471,23 @@ def get(
 
     if isinstance(hub_error, AccessDenied):
         raise hub_error
+    if isinstance(hub_error, KeychainLocked):
+        # v0.2.82 WP-4a: the keychain was unreadable AND the file store +
+        # project .env also missed (or fallback was disabled). Surface the
+        # distinct KeychainLocked so the caller can branch on the honest
+        # state, with a message naming BOTH the lock and the file-store miss.
+        _tier3_dir = _dotenv_dir(project)
+        _tier3_desc = (
+            str(_tier3_dir / ".env") if _tier3_dir is not None
+            else "skipped (bare project NAME — tier 3 needs a path)"
+        )
+        raise KeychainLocked(
+            f"hub keychain is locked; key {key!r} also absent from file store "
+            f"({_secrets_root()}) and project .env ({_tier3_desc}) "
+            f"(tiers 2+3 checked={allow_file_fallback}) — unlock the login "
+            "keychain or open the launcher. "
+            f"Underlying hub state: {hub_error}"
+        ) from hub_error
     if isinstance(hub_error, SecretNotFound) or allow_file_fallback:
         _tier3_dir = _dotenv_dir(project)
         _tier3_desc = (
