@@ -1218,39 +1218,46 @@ async fn run_build_task(
         }
     }
 
-    // v0.2.82 (WP-3 G3 task 5, UPGRADED): classify an embedding-space change.
-    // (a) Deliberate configured-profile change (app_state[default_code_embedding]
-    //     differs from the binding's stored space) → force-recreate this build
-    //     (the ONE legitimate auto re-embed — a genuine one-time migration).
+    // v0.2.82 (WP-3 G3 task 5, UPGRADED; FIX-A hardened): classify an
+    // embedding-space change.
+    // (a) Deliberate configured-profile change — the CONFIGURED profile NOW
+    //     (app_state[default_code_embedding]) differs from the CONFIGURED
+    //     profile recorded when the binding was last built
+    //     (`config_json.configured_profile`) → force-recreate this build (the
+    //     ONE legitimate auto re-embed — a genuine one-time migration).
     // (b) Transient hardware-ladder tier drift is handled POST-build (warn only,
     //     see the provenance persist below) — it must not trigger anything here.
+    // FIX-A: the trigger is config-to-config, never config-to-delivered, and is
+    // additionally gated on `last_analyzed_at IS NOT NULL` (a real prior build)
+    // so SEEDED bindings (hardcoded codesage/2048, never built) and ladder
+    // fallbacks can never mass-destroy vectors fleet-wide.
     let force_recreate_for_profile_change = {
         let db = app.state::<Db>();
         let binding = db.get_project_codegraph_binding(&project_id).ok().flatten();
         let configured = db.app_state_get("default_code_embedding").ok().flatten();
+        let stored_configured_profile = binding
+            .as_ref()
+            .and_then(|b| read_configured_profile(&b.config));
+        let stored_analyzed = binding
+            .as_ref()
+            .map(|b| b.last_analyzed_at.is_some())
+            .unwrap_or(false);
         let action = classify_embedding_change(
             configured.as_deref(),
+            stored_configured_profile.as_deref(),
+            stored_analyzed,
             binding.as_ref().and_then(|b| b.embedding_model.as_deref()),
             binding.as_ref().and_then(|b| b.embedding_dim),
             None, // no live provenance yet — that governs branch (b), post-build
             None,
         );
         if action == EmbeddingChangeAction::ForceRecreate {
-            let stored = binding
-                .as_ref()
-                .map(|b| {
-                    format!(
-                        "{}/{}",
-                        b.embedding_model.as_deref().unwrap_or("?"),
-                        b.embedding_dim.unwrap_or(0)
-                    )
-                })
-                .unwrap_or_else(|| "?".to_string());
+            let prev_cfg = stored_configured_profile.as_deref().unwrap_or("?");
             let want = configured.as_deref().unwrap_or("?");
             eprintln!(
-                "[vct] code-graph: embedding profile changed for '{}' (stored {} → configured {}) \
-                 — full re-embed (one-time migration) via --force-recreate",
-                canonical_identity, stored, want
+                "[vct] code-graph: configured embedding profile changed for '{}' \
+                 (was {} → now {}) — full re-embed (one-time migration) via --force-recreate",
+                canonical_identity, prev_cfg, want
             );
             emit_build(
                 &app,
@@ -1596,14 +1603,26 @@ async fn run_build_task(
             let db = app.state::<Db>();
             let binding = db.get_project_codegraph_binding(&project_id).ok().flatten();
             let configured = db.app_state_get("default_code_embedding").ok().flatten();
+            let stored_configured_profile = binding
+                .as_ref()
+                .and_then(|b| read_configured_profile(&b.config));
+            let stored_analyzed = binding
+                .as_ref()
+                .map(|b| b.last_analyzed_at.is_some())
+                .unwrap_or(false);
             // Re-classify with the LIVE provenance now available. Branch (a)
             // (ForceRecreate) already ran THIS build with --force-recreate, so
             // its stored space is about to be replaced — write the new model/dim
             // straight through. Branch (b) (WarnDrift): same configured profile
             // but the live tier differs from the binding — warn and do NOT
             // overwrite the stored model/dim (only advance commit/timestamp).
+            // FIX-A: the ForceRecreate gate is config-to-config, so the live
+            // tier drifting from the delivered space now STRUCTURALLY lands in
+            // WarnDrift (branch b) rather than force-recreating.
             let action = classify_embedding_change(
                 configured.as_deref(),
+                stored_configured_profile.as_deref(),
+                stored_analyzed,
                 binding.as_ref().and_then(|b| b.embedding_model.as_deref()),
                 binding.as_ref().and_then(|b| b.embedding_dim),
                 Some(prov.model.as_str()),
@@ -1656,6 +1675,7 @@ async fn run_build_task(
                 &canonical_identity,
                 prov,
                 write_model_dim,
+                configured.as_deref(),
                 finished_at,
             );
         }
@@ -2157,46 +2177,125 @@ pub(crate) fn code_model_dim(model_id: &str) -> Option<i64> {
     }
 }
 
+/// The `config_json` key holding the CONFIGURED code-embedding profile that was
+/// in effect when the binding was last built (v0.2.82 FIX-A). This is the
+/// config-to-config anchor the classifier compares against — NOT the delivered
+/// model/dim. Seeds and hardware-ladder fallbacks never write it.
+pub(crate) const CONFIGURED_PROFILE_KEY: &str = "configured_profile";
+
+/// Read the persisted `configured_profile` out of a binding's `config` JSON.
+/// Defensive: returns `None` for a non-object config, a missing key, a
+/// non-string value, or an empty/whitespace string. Pure.
+pub(crate) fn read_configured_profile(config: &serde_json::Value) -> Option<String> {
+    config
+        .get(CONFIGURED_PROFILE_KEY)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Return `config` with `configured_profile` set to `profile`, PRESERVING every
+/// other key. If `config` is not a JSON object (e.g. the seed's `null`), start
+/// a fresh object rather than clobbering unknown structure. Pure — the caller
+/// persists the result. This is the "read/merge defensively — unknown keys
+/// preserved" contract from the FIX-A design.
+pub(crate) fn merge_configured_profile(
+    config: &serde_json::Value,
+    profile: &str,
+) -> serde_json::Value {
+    let mut obj = match config {
+        serde_json::Value::Object(map) => map.clone(),
+        _ => serde_json::Map::new(),
+    };
+    obj.insert(
+        CONFIGURED_PROFILE_KEY.to_string(),
+        serde_json::Value::String(profile.to_string()),
+    );
+    serde_json::Value::Object(obj)
+}
+
 /// The action the pre-build embedding-change check yields (plan §WP-3 task 5,
-/// UPGRADED by the coordinator to a two-branch policy).
+/// UPGRADED by the coordinator to a two-branch policy; v0.2.82 FIX-A hardened
+/// the ForceRecreate gate to a CONFIG-to-CONFIG comparison).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EmbeddingChangeAction {
-    /// No stored binding model/dim, or the configured profile matches the
-    /// stored space — proceed normally, nothing to warn or migrate.
+    /// No stored provenance to compare against, or the CONFIGURED profile at
+    /// this build matches the CONFIGURED profile recorded at the last build —
+    /// proceed normally, nothing to warn or migrate.
     None,
-    /// (a) The user-CONFIGURED code-embedding profile genuinely differs from
-    /// the stored vector space (different dim, or same dim + different family).
-    /// The vectors are in the wrong space → the ONE legitimate auto re-embed:
-    /// pass `--force-recreate` so THIS build migrates the whole collection to
-    /// the new space in a single visible GUI build.
+    /// (a) The user-CONFIGURED code-embedding profile at THIS build genuinely
+    /// differs from the CONFIGURED profile recorded when the binding was last
+    /// built (the `configured_profile` stamped into the binding's provenance).
+    /// This is a deliberate user-directed migration → the ONE legitimate auto
+    /// re-embed: pass `--force-recreate` so THIS build migrates the whole
+    /// collection to the new space in a single visible GUI build.
+    ///
+    /// v0.2.82 FIX-A: keyed on config-to-config, NOT config-to-delivered. A
+    /// binding whose stored MODEL differs from the configured profile because
+    /// a hardware-ladder tier fell back (e.g. configured codesage delivered
+    /// qwen3 under VRAM pressure), or a SEEDED binding (hardcoded
+    /// codesage/2048, never actually built), must NOT reach here — only a real
+    /// change of the CONFIGURED profile does.
     ForceRecreate,
     /// (b) Same configured profile, but the PARSED provenance (the live
     /// hardware-ladder tier actually used this run) differs from the stored
-    /// binding. Boundary machines flip tiers under RAM/VRAM pressure — auto
-    /// re-embedding here would ping-pong. Warn only; do NOT overwrite the
+    /// binding's space. Boundary machines flip tiers under RAM/VRAM pressure —
+    /// auto re-embedding here would ping-pong. Warn only; do NOT overwrite the
     /// binding, do NOT trigger anything destructive.
     WarnDrift,
 }
 
 /// PURE classifier for the pre-build embedding-space change (act +
-/// leave-alone + both-empty + only-binding-empty unit-tested).
+/// leave-alone + both-empty + only-binding-empty + config-to-config
+/// unit-tested).
 ///
-/// Inputs:
-///   * `configured_model` — the user-CONFIGURED code-embedding profile
+/// # v0.2.82 FIX-A — why ForceRecreate is now config-to-config
+///
+/// The ForceRecreate branch used to compare the CONFIGURED profile against the
+/// binding's stored MODEL/DIM (the *delivered* space). That was a false-positive
+/// generator fleet-wide: every binding is SEEDED with a hardcoded
+/// `codesage-large-v2`/`2048` that was never produced by a real build, while
+/// `app_state[default_code_embedding]` defaults to `qwen3-embedding:0.6b` on
+/// the majority of machines (hardware ladder, <12 GB VRAM). Configured qwen3 vs
+/// stored codesage ⇒ ForceRecreate ⇒ `--force-recreate` DROPS all five
+/// collections on the next build of nearly every project. It also ping-ponged:
+/// a configured-codesage machine that fell back to qwen3 under VRAM pressure
+/// stored qwen3, then force-recreated forever because configured ≠ delivered.
+///
+/// The FIX: a deliberate change is detected by comparing the CONFIGURED profile
+/// NOW against the CONFIGURED profile that was in effect when the binding was
+/// last built (persisted as `configured_profile` in the binding's `config_json`
+/// provenance). Seeds and ladder fallbacks never write that field on their own,
+/// so they can never masquerade as a deliberate change.
+///
+/// # Inputs
+///   * `configured_model` — the user-CONFIGURED code-embedding profile NOW
 ///     (`app_state[default_code_embedding]`). `None`/empty when unset.
-///   * `stored_model` / `stored_dim` — the binding's last-written space (from a
-///     prior successful build's provenance). Treated as "known" only when the
-///     model is non-empty AND the dim is present and > 0.
+///   * `stored_configured_profile` — the CONFIGURED profile in effect when the
+///     binding was last built (parsed from `binding.config_json`'s
+///     `configured_profile` key). `None`/empty when the binding has no real
+///     provenance yet (fresh seed, or a pre-FIX-A binding built before this
+///     field existed). This is the config-to-config anchor.
+///   * `stored_analyzed` — `true` iff `last_analyzed_at IS NOT NULL`, i.e. a
+///     real build has run for this binding. Belt-and-braces "known" gate: NO
+///     destructive branch fires unless a real build has produced provenance.
+///   * `stored_model` / `stored_dim` — the binding's last-written vector space
+///     (delivered). Used ONLY for the WarnDrift (live-tier) comparison, never
+///     for ForceRecreate. "Known" only when the model is non-empty AND the dim
+///     is present and > 0.
 ///   * `parsed_model` / `parsed_dim` — provenance from THIS run's stdout (the
 ///     live tier actually used), if the line parsed.
 ///
-/// Branch order:
-///   1. No known stored space → `None` (first build, or a binding never
-///      stamped — nothing to compare against; the build stamps it fresh).
-///   2. Configured profile KNOWN and differs from the stored space (dim
-///      mismatch, or same dim + different family) → `ForceRecreate` (branch a).
-///   3. Configured profile matches (or is unknown) BUT this run's parsed
-///      provenance differs from the stored space → `WarnDrift` (branch b).
+/// # Branch order
+///   1. No real prior build (`!stored_analyzed`) → `None`. A seeded/unbuilt
+///      binding is never a migration source: the first real build stamps its
+///      provenance and it becomes protected going forward.
+///   2. A real `stored_configured_profile` is present AND the configured
+///      profile NOW differs from it (config-to-config) → `ForceRecreate`
+///      (branch a — the genuine deliberate change).
+///   3. Otherwise, if this run's parsed provenance differs from the stored
+///      space → `WarnDrift` (branch b — live-tier / ladder-fallback drift).
 ///   4. Otherwise → `None`.
 ///
 /// `ForceRecreate` outranks `WarnDrift`: a deliberate config change is a real
@@ -2204,52 +2303,54 @@ pub(crate) enum EmbeddingChangeAction {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn classify_embedding_change(
     configured_model: Option<&str>,
+    stored_configured_profile: Option<&str>,
+    stored_analyzed: bool,
     stored_model: Option<&str>,
     stored_dim: Option<i64>,
     parsed_model: Option<&str>,
     parsed_dim: Option<i64>,
 ) -> EmbeddingChangeAction {
-    // The stored space is "known" only when BOTH the model is non-empty and the
-    // dim is a positive integer. A NULL/empty/zero binding is a first build.
-    let stored = match (stored_model.map(str::trim).filter(|s| !s.is_empty()), stored_dim) {
-        (Some(m), Some(d)) if d > 0 => Some((normalize_code_model_family(m), d)),
-        _ => None,
-    };
-    let Some((stored_family, stored_dim)) = stored else {
+    // Belt-and-braces "known" gate: no destructive branch may fire unless a
+    // REAL build has run for this binding (last_analyzed_at IS NOT NULL). A
+    // seed carries hardcoded model/dim but has never been analyzed, so it can
+    // never be a migration source.
+    if !stored_analyzed {
         return EmbeddingChangeAction::None;
-    };
+    }
 
-    // Same-space test: same dim AND same family.
-    let same_space = |model: &str, dim: i64| -> bool {
-        dim == stored_dim && normalize_code_model_family(model) == stored_family
-    };
+    let cfg_now = configured_model.map(str::trim).filter(|s| !s.is_empty());
 
-    // (a) Deliberate configured-profile change → real migration.
-    if let Some(cfg_model) = configured_model.map(str::trim).filter(|s| !s.is_empty()) {
-        // Resolve the configured profile's dim from its known mapping; if the
-        // model id is unknown we can't assert a mismatch on dim, so fall back
-        // to a family compare (conservative: only ForceRecreate on a POSITIVE
-        // family difference, never on "unknown vs known").
-        let cfg_dim = code_model_dim(cfg_model);
-        let differs = match cfg_dim {
-            Some(d) => !same_space(cfg_model, d),
-            None => {
-                // Unknown configured model: only a family difference is a
-                // positive signal (dim is unknowable). Avoids force-recreating
-                // on an id we simply don't have in the table.
-                normalize_code_model_family(cfg_model) != stored_family
-            }
-        };
-        if differs {
+    // (a) Deliberate configured-profile change → real migration. Compared
+    // CONFIG-to-CONFIG: the profile configured NOW vs the profile that was
+    // configured when the binding was last built. Seeds / ladder fallbacks do
+    // NOT populate `stored_configured_profile`, so they never reach here.
+    let stored_cfg = stored_configured_profile
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let (Some(cfg_model), Some(prev_cfg)) = (cfg_now, stored_cfg) {
+        // Compare by normalized family (spelling-invariant: `codesage/...` vs
+        // `codesage-large-v2` are the same configured profile). Dim is a
+        // tie-break for same-family collisions that don't exist in practice,
+        // so family equality is the sound test.
+        if normalize_code_model_family(cfg_model) != normalize_code_model_family(prev_cfg) {
             return EmbeddingChangeAction::ForceRecreate;
         }
     }
 
-    // (b) Configured profile matches (or is unset/unknown-and-same-family) but
-    // the live tier this run differs from the stored space → warn only.
-    if let (Some(pm), Some(pd)) = (parsed_model, parsed_dim) {
-        if !same_space(pm, pd) {
-            return EmbeddingChangeAction::WarnDrift;
+    // (b) Configured profile unchanged (or no config-to-config anchor yet) but
+    // the live tier this run differs from the stored DELIVERED space → warn
+    // only. The stored space is "known" only when both model and dim are set.
+    let stored = match (stored_model.map(str::trim).filter(|s| !s.is_empty()), stored_dim) {
+        (Some(m), Some(d)) if d > 0 => Some((normalize_code_model_family(m), d)),
+        _ => None,
+    };
+    if let Some((stored_family, stored_dim)) = stored {
+        if let (Some(pm), Some(pd)) = (parsed_model, parsed_dim) {
+            let same_space =
+                pd == stored_dim && normalize_code_model_family(pm) == stored_family;
+            if !same_space {
+                return EmbeddingChangeAction::WarnDrift;
+            }
         }
     }
 
@@ -2456,12 +2557,23 @@ fn spawn_metadata_backfill(db: &Db, canonical_identity: String) {
 /// `write_model_dim` is `false` for the WarnDrift case so a transient
 /// hardware-ladder tier does not overwrite the user's real space in the binding
 /// (the commit/timestamp still advance — the build genuinely ran).
+///
+/// FIX-A (v0.2.82): `configured_profile` records the CONFIGURED code-embedding
+/// profile (`app_state[default_code_embedding]`) that was in effect for THIS
+/// build, merged into the binding's `config_json` (preserving every other key).
+/// This is the config-to-config anchor the pre-build classifier reads next
+/// time: after the FIRST real build a seeded/unbuilt binding gains provenance
+/// and is thereafter protected from the fleet-wide false positive. When the
+/// configured profile is unresolvable (`None`/empty) we leave any existing
+/// stored anchor untouched rather than clobbering it with a blank.
+#[allow(clippy::too_many_arguments)]
 fn persist_codegraph_provenance(
     db: &Db,
     project_id: &str,
     canonical_identity: &str,
     prov: &CodegraphProvenance,
     write_model_dim: bool,
+    configured_profile: Option<&str>,
     analyzed_at: i64,
 ) {
     let existing = db.get_project_codegraph_binding(project_id).ok().flatten();
@@ -2481,10 +2593,17 @@ fn persist_codegraph_provenance(
         )
     };
     let enabled = existing.as_ref().map(|b| b.enabled).unwrap_or(true);
-    let config = existing
+    let base_config = existing
         .as_ref()
         .map(|b| b.config.clone())
         .unwrap_or(serde_json::Value::Null);
+    // Stamp the config-to-config anchor. A resolvable configured profile is
+    // recorded (merged, unknown keys preserved); an unresolvable one leaves the
+    // prior config untouched (never clobber a real anchor with a blank).
+    let config = match configured_profile.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(profile) => merge_configured_profile(&base_config, profile),
+        None => base_config,
+    };
     if let Err(e) = db.set_project_codegraph_binding(
         project_id,
         &collection_prefix,
@@ -3351,76 +3470,183 @@ mod build_tests {
         assert_eq!(code_model_dim("some-unknown-model"), None);
     }
 
-    // ─── T17-adjacent: embedding-change classifier (two-branch policy) ──
+    // ─── T17-adjacent: embedding-change classifier (config-to-config) ──
+    //
+    // Signature (FIX-A):
+    //   classify_embedding_change(
+    //     configured_model,             // configured profile NOW
+    //     stored_configured_profile,    // configured profile at last build (anchor)
+    //     stored_analyzed,              // last_analyzed_at IS NOT NULL
+    //     stored_model, stored_dim,     // delivered space (WarnDrift only)
+    //     parsed_model, parsed_dim,     // live tier this run
+    //   )
 
     #[test]
     fn embedding_change_none_when_no_stored_space() {
-        // First build: no stored model/dim → nothing to compare, no action.
+        // First build: not analyzed, no stored space → nothing to compare.
         assert_eq!(
-            classify_embedding_change(Some("codesage-large-v2"), None, None, None, None),
+            classify_embedding_change(
+                Some("codesage-large-v2"),
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+            ),
             EmbeddingChangeAction::None
+        );
+    }
+
+    // ─── FIX-A (a): the fleet-wide false positive is NEUTRALIZED ──────────
+    //
+    // Seeded binding — model/dim set to the hardcoded codesage/2048 seed,
+    // config_json null (no configured_profile anchor), last_analyzed_at NULL
+    // (never actually built) — with configured=qwen3 (the hardware-ladder
+    // default on the majority of machines). Pre-FIX-A this returned
+    // ForceRecreate → --force-recreate DROPPED all five collections on the
+    // next build of nearly every project. Post-FIX-A → None (the belt-and-
+    // braces `stored_analyzed=false` gate alone stops it; there is also no
+    // config anchor to differ against).
+    #[test]
+    fn embedding_change_no_force_recreate_on_seeded_binding_qwen3() {
+        assert_eq!(
+            classify_embedding_change(
+                Some("qwen3-embedding:0.6b"), // configured (ladder default)
+                None,                         // no configured_profile anchor (seed)
+                false,                        // last_analyzed_at NULL (never built)
+                Some("codesage-large-v2"),    // hardcoded seed model
+                Some(2048),                   // hardcoded seed dim
+                None,
+                None,
+            ),
+            EmbeddingChangeAction::None,
+            "seeded binding must not trigger the fleet-wide force-recreate"
+        );
+    }
+
+    // A binding that HAS been analyzed but predates the configured_profile
+    // anchor (pre-FIX-A build) still must not force-recreate on config-vs-
+    // delivered: no anchor ⇒ no config-to-config signal. This is the second
+    // guard rail behind the stored_analyzed gate.
+    #[test]
+    fn embedding_change_no_force_recreate_without_config_anchor() {
+        assert_eq!(
+            classify_embedding_change(
+                Some("qwen3-embedding:0.6b"),
+                None,                      // no anchor (pre-FIX-A binding)
+                true,                      // but a real build ran
+                Some("codesage-large-v2"),
+                Some(2048),
+                None,
+                None,
+            ),
+            EmbeddingChangeAction::None,
+            "config-vs-delivered must never force-recreate without a config anchor"
         );
     }
 
     #[test]
     fn embedding_change_none_when_only_binding_dim_missing() {
-        // Model present but dim absent → not a "known" stored space → None.
+        // Analyzed, config anchor matches configured, model present but dim
+        // absent → not a "known" delivered space for WarnDrift → None.
         assert_eq!(
             classify_embedding_change(
                 Some("qwen3-embedding:0.6b"),
-                Some("codesage-large-v2"),
+                Some("qwen3-embedding:0.6b"),
+                true,
+                Some("qwen3-embedding:0.6b"),
                 None,
                 None,
-                None
+                None,
             ),
             EmbeddingChangeAction::None
         );
     }
 
+    // ─── FIX-A (c): the GENUINE deliberate change still fires ─────────────
+    //
+    // Real provenance: configured_profile anchor = X (codesage), configured
+    // NOW = Y (qwen3). This is a real user-directed migration — the ONE
+    // legitimate auto re-embed MUST still fire.
     #[test]
-    fn embedding_change_force_recreate_on_configured_profile_change() {
-        // (a) Configured profile qwen3 (1024) but stored codesage (2048) →
-        // genuine space change → force-recreate.
+    fn embedding_change_force_recreate_on_real_configured_profile_change() {
         assert_eq!(
             classify_embedding_change(
-                Some("qwen3-embedding:0.6b"),
-                Some("codesage-large-v2"),
+                Some("qwen3-embedding:0.6b"),  // configured NOW = Y
+                Some("codesage-large-v2"),     // configured_profile anchor = X
+                true,                          // real prior build
+                Some("codesage-large-v2"),     // delivered space (was codesage)
                 Some(2048),
                 None,
-                None
+                None,
             ),
-            EmbeddingChangeAction::ForceRecreate
+            EmbeddingChangeAction::ForceRecreate,
+            "a genuine change of the configured profile must still migrate"
         );
     }
 
     #[test]
-    fn embedding_change_none_when_configured_matches_stored() {
-        // Configured codesage matches stored codesage/2048 (even with the
+    fn embedding_change_none_when_configured_matches_anchor() {
+        // Configured codesage matches the anchor codesage (even with the
         // slash-form spelling) → no action.
         assert_eq!(
             classify_embedding_change(
                 Some("codesage/codesage-large-v2"),
                 Some("codesage-large-v2"),
+                true,
+                Some("codesage-large-v2"),
                 Some(2048),
                 None,
-                None
+                None,
             ),
             EmbeddingChangeAction::None
         );
     }
 
+    // ─── FIX-A (b): ladder fallback lands in WarnDrift, not ForceRecreate ─
+    //
+    // Configured profile is UNCHANGED (anchor codesage == configured
+    // codesage) but the binding's DELIVERED space is qwen3/1024 — the classic
+    // ping-pong: a prior build fell back under VRAM pressure and stored qwen3.
+    // Pre-FIX-A (config-vs-delivered) this returned ForceRecreate forever.
+    // Post-FIX-A the config-to-config compare is equal, and the live tier
+    // (qwen3/1024) still differs from the delivered space's WarnDrift compare
+    // — but here the delivered space IS qwen3, so we exercise the drift via a
+    // live tier that differs from the stored delivered space.
+    #[test]
+    fn embedding_change_ladder_fallback_warn_drift_not_force_recreate() {
+        // Anchor == configured (codesage), delivered stored = qwen3/1024 (a
+        // prior fallback), live tier this run = jina/768 (drifted again).
+        assert_eq!(
+            classify_embedding_change(
+                Some("codesage-large-v2"),        // configured NOW
+                Some("codesage-large-v2"),        // anchor (unchanged)
+                true,                             // real prior build
+                Some("qwen3-embedding:0.6b"),     // delivered space (fallback)
+                Some(1024),
+                Some("jina-embeddings-v2-base-code"), // live tier drifted again
+                Some(768),
+            ),
+            EmbeddingChangeAction::WarnDrift,
+            "same configured profile + a live-tier drift must warn, never migrate"
+        );
+    }
+
     #[test]
     fn embedding_change_warn_drift_on_live_tier_only() {
-        // (b) Configured profile matches stored (codesage/2048), but THIS run's
-        // provenance says jina/768 (a transient hardware-ladder fallback) →
-        // warn-only, NOT force-recreate.
+        // (b) Configured profile matches anchor (codesage/2048 delivered), but
+        // THIS run's provenance says jina/768 (a transient hardware-ladder
+        // fallback) → warn-only, NOT force-recreate.
         assert_eq!(
             classify_embedding_change(
                 Some("codesage-large-v2"),
                 Some("codesage-large-v2"),
+                true,
+                Some("codesage-large-v2"),
                 Some(2048),
                 Some("jina-embeddings-v2-base-code"),
-                Some(768)
+                Some(768),
             ),
             EmbeddingChangeAction::WarnDrift
         );
@@ -3428,14 +3654,17 @@ mod build_tests {
 
     #[test]
     fn embedding_change_force_recreate_outranks_drift() {
-        // Configured change AND live-tier drift both present → ForceRecreate wins.
+        // Real configured change (anchor codesage → configured qwen3) AND
+        // live-tier drift both present → ForceRecreate wins.
         assert_eq!(
             classify_embedding_change(
                 Some("qwen3-embedding:0.6b"),
                 Some("codesage-large-v2"),
+                true,
+                Some("codesage-large-v2"),
                 Some(2048),
                 Some("jina-embeddings-v2-base-code"),
-                Some(768)
+                Some(768),
             ),
             EmbeddingChangeAction::ForceRecreate
         );
@@ -3443,15 +3672,42 @@ mod build_tests {
 
     #[test]
     fn embedding_change_none_when_unset_configured_and_matching_live() {
-        // Configured profile unset, live tier matches stored → None (nothing to
-        // warn about — the build used the same space).
+        // Configured profile unset, live tier matches delivered → None (nothing
+        // to warn about — the build used the same space).
         assert_eq!(
             classify_embedding_change(
                 None,
                 Some("codesage-large-v2"),
+                true,
+                Some("codesage-large-v2"),
                 Some(2048),
                 Some("codesage-large-v2"),
-                Some(2048)
+                Some(2048),
+            ),
+            EmbeddingChangeAction::None
+        );
+    }
+
+    // ─── FIX-A (d): leave-alone — both empty / no binding → None ──────────
+    #[test]
+    fn embedding_change_leave_alone_both_empty() {
+        // No configured profile, no anchor, not analyzed, no delivered space,
+        // no live tier → the pure leave-alone case.
+        assert_eq!(
+            classify_embedding_change(None, None, false, None, None, None, None),
+            EmbeddingChangeAction::None
+        );
+        // Configured set but nothing else known (fresh project, first build) →
+        // still None (the belt-and-braces gate).
+        assert_eq!(
+            classify_embedding_change(
+                Some("qwen3-embedding:0.6b"),
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
             ),
             EmbeddingChangeAction::None
         );
@@ -3459,19 +3715,53 @@ mod build_tests {
 
     #[test]
     fn embedding_change_unknown_configured_same_family_no_action() {
-        // Unknown configured id but same family as stored → no positive
-        // difference signal → None (conservative: don't force-recreate on an
-        // id we don't have a dim for).
+        // Unknown configured id but same family as the anchor → no positive
+        // difference signal → None (family-invariant compare).
         assert_eq!(
             classify_embedding_change(
                 Some("codesage-some-future-variant"),
                 Some("codesage-large-v2"),
+                true,
+                Some("codesage-large-v2"),
                 Some(2048),
                 None,
-                None
+                None,
             ),
             EmbeddingChangeAction::None
         );
+    }
+
+    // ─── FIX-A: config_json helpers (read/merge, unknown keys preserved) ──
+    #[test]
+    fn configured_profile_read_and_merge_preserve_unknown_keys() {
+        // Read: missing / non-object / non-string / blank → None.
+        assert_eq!(read_configured_profile(&serde_json::Value::Null), None);
+        assert_eq!(read_configured_profile(&serde_json::json!({})), None);
+        assert_eq!(
+            read_configured_profile(&serde_json::json!({"configured_profile": 42})),
+            None
+        );
+        assert_eq!(
+            read_configured_profile(&serde_json::json!({"configured_profile": "  "})),
+            None
+        );
+        assert_eq!(
+            read_configured_profile(
+                &serde_json::json!({"configured_profile": " qwen3-embedding:0.6b "})
+            )
+            .as_deref(),
+            Some("qwen3-embedding:0.6b")
+        );
+        // Merge preserves every other key and starts fresh on a non-object.
+        let merged = merge_configured_profile(
+            &serde_json::json!({"other": "keep", "n": 7}),
+            "codesage-large-v2",
+        );
+        assert_eq!(merged["other"], serde_json::json!("keep"));
+        assert_eq!(merged["n"], serde_json::json!(7));
+        assert_eq!(merged["configured_profile"], serde_json::json!("codesage-large-v2"));
+        let from_null = merge_configured_profile(&serde_json::Value::Null, "qwen3-embedding:0.6b");
+        assert_eq!(from_null["configured_profile"], serde_json::json!("qwen3-embedding:0.6b"));
     }
 
     // ─── IDENTITY_MIGRATION summary parser (WP-2 contract) ──────────────
@@ -3565,13 +3855,28 @@ mod build_tests {
             embed_revision: 3,
             analyzed_commit: Some("deadbeef".to_string()),
         };
-        // write_model_dim = true → overwrite stored space + commit.
-        persist_codegraph_provenance(&db, &pid, "Proj", &prov, true, 1_700_000_000_000);
+        // write_model_dim = true → overwrite stored space + commit. FIX-A:
+        // the configured profile ("qwen3-embedding:0.6b") is stamped into
+        // config_json as the config-to-config anchor for the NEXT build.
+        persist_codegraph_provenance(
+            &db,
+            &pid,
+            "Proj",
+            &prov,
+            true,
+            Some("qwen3-embedding:0.6b"),
+            1_700_000_000_000,
+        );
         let b = db.get_project_codegraph_binding(&pid).unwrap().unwrap();
         assert_eq!(b.embedding_model.as_deref(), Some("qwen3-embedding:0.6b"));
         assert_eq!(b.embedding_dim, Some(1024));
         assert_eq!(b.last_analyzed_commit.as_deref(), Some("deadbeef"));
         assert_eq!(b.collection_prefix, "Proj"); // preserved
+        // FIX-A: config anchor persisted.
+        assert_eq!(
+            read_configured_profile(&b.config).as_deref(),
+            Some("qwen3-embedding:0.6b")
+        );
     }
 
     #[test]
@@ -3597,12 +3902,62 @@ mod build_tests {
             analyzed_commit: Some("cafe".to_string()),
         };
         // write_model_dim = false (WarnDrift) → keep stored model/dim, only
-        // advance the commit/timestamp.
-        persist_codegraph_provenance(&db, &pid, "Proj", &prov, false, 1_700_000_000_001);
+        // advance the commit/timestamp. FIX-A: the configured profile is still
+        // the anchor (codesage — unchanged) and is stamped/kept in config_json.
+        persist_codegraph_provenance(
+            &db,
+            &pid,
+            "Proj",
+            &prov,
+            false,
+            Some("codesage-large-v2"),
+            1_700_000_000_001,
+        );
         let b = db.get_project_codegraph_binding(&pid).unwrap().unwrap();
         assert_eq!(b.embedding_model.as_deref(), Some("codesage-large-v2"));
         assert_eq!(b.embedding_dim, Some(2048));
         assert_eq!(b.last_analyzed_commit.as_deref(), Some("cafe")); // commit still advances
+        // FIX-A: config anchor present even on the drift path.
+        assert_eq!(
+            read_configured_profile(&b.config).as_deref(),
+            Some("codesage-large-v2")
+        );
+    }
+
+    // ─── FIX-A: persist leaves a real anchor untouched when configured is
+    //     unresolvable, and preserves unknown config keys ─────────────────
+    #[test]
+    fn persist_provenance_keeps_anchor_and_unknown_keys() {
+        let db = Db::open_in_memory().unwrap();
+        let pid = uuid::Uuid::new_v4().to_string();
+        db.insert_project(&pid, "Proj", "/tmp/pp3", ProjectHost::Base, "pp3").unwrap();
+        // Seed a binding that already carries a real anchor + an unrelated key.
+        db.set_project_codegraph_binding(
+            &pid,
+            "Proj",
+            Some("codesage-large-v2"),
+            Some(2048),
+            None,
+            Some(1_699_999_999_000),
+            true,
+            &serde_json::json!({"configured_profile": "codesage-large-v2", "keep": "me"}),
+        )
+        .unwrap();
+        let prov = CodegraphProvenance {
+            model: "codesage-large-v2".to_string(),
+            dim: 2048,
+            embed_revision: 3,
+            analyzed_commit: Some("beef".to_string()),
+        };
+        // configured_profile = None (unresolvable) → do NOT clobber the anchor.
+        persist_codegraph_provenance(&db, &pid, "Proj", &prov, true, None, 1_700_000_000_002);
+        let b = db.get_project_codegraph_binding(&pid).unwrap().unwrap();
+        assert_eq!(
+            read_configured_profile(&b.config).as_deref(),
+            Some("codesage-large-v2"),
+            "an unresolvable configured profile must not blank the stored anchor"
+        );
+        assert_eq!(b.config["keep"], serde_json::json!("me"), "unknown keys preserved");
     }
 }
 
