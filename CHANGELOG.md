@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`--prune-stale` no longer deletes the code graph of fully-unchanged
+  projects.** The per-file unchanged gate (and `--incremental`'s pre-dispatch
+  filter) skipped files before anything marked their rows "visited", so a
+  prune run on a converged project deleted its ENTIRE graph (2026-07-15
+  incident: two projects wiped to 0 objects by the post-update autobuild).
+  The analyzer now records discovered-vs-walked files and the prune preserves
+  rows anchored to skipped-but-present files (new `vco_lib/codegraph_prune.py`;
+  regression tests proven to fail on the previous code).
+- **The per-project update flow no longer autobuilds the orchestrator-root
+  project.** install.py's revision-gated resync owns root analysis; the
+  launcher autobuild raced it under a different `--project` identity
+  (display name vs codegraph binding name), writing duplicate rows under
+  distinct deterministic UUIDs and letting each run's prune reap the other
+  identity's rows.
+
 ## [0.2.81] - 2026-07-15
 
 ### Changed

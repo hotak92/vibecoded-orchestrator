@@ -563,6 +563,11 @@ try:
     # Dependency-free to import (tree-sitter grammars are lazy-loaded inside
     # the facade, guarded, soft-fail); Python stays ast-based.
     from vco_lib.codegraph_calls import extract_call_names as _extract_call_names
+    # v0.2.82: per-collection stale-row prune (incl. the skipped-but-present
+    # preserve exemption from the 2026-07-15 wipe incident) lives in vco_lib
+    # so the analyzer monolith stays flat (P2f ratchet). `_prune_collection`
+    # is a thin shim over it.
+    from vco_lib.codegraph_prune import prune_collection as _prune_collection_impl
 except ImportError as _exc:  # noqa: F841 — used in the message below
     sys.stderr.write(
         "analyze_code_graph: vco_lib not importable — VCO install is broken; "
@@ -1591,6 +1596,21 @@ class CodeGraphAnalyzer:
         # the collection boundary. Empty by default — does NOT affect normal runs.
         self.visited_uuids: Set[Tuple[str, str]] = set()
         self._track_visited: bool = False
+
+        # v0.2.82 — prune-preserve path tracking (incident 2026-07-15: a
+        # fully-unchanged project had EVERY file short-circuited by the
+        # per-file gate (`_get_existing_module` hit), so nothing populated
+        # `visited_uuids`, and `--prune-stale` deleted the project's entire
+        # code graph). `discovered` records every file the dispatcher handed
+        # to an extractor this run; `walked` records the subset whose module
+        # row was actually (re)written (`_create_or_update_module` — the
+        # universal write choke-point every extractor funnels through).
+        # `discovered − walked` = files present on disk that were SKIPPED
+        # (unchanged / minified / parse-failure) — their rows must be
+        # PRESERVED by the prune, not deleted. Populated only when
+        # `_track_visited` is True (same gate as `visited_uuids`).
+        self._prune_discovered_paths: Set[str] = set()
+        self._prune_walked_paths: Set[str] = set()
 
         # v0.2.18 (Plan C) — canonical language ID for the language currently
         # being analyzed. Set by the dispatcher in `analyze_repository` from the
@@ -3880,6 +3900,10 @@ class CodeGraphAnalyzer:
         if prune_stale:
             self._track_visited = True
             self.visited_uuids = set()  # fresh state per run
+            # v0.2.82 — prune-preserve tracking resets with the visited set
+            # (same lifecycle; see __init__ for why these exist).
+            self._prune_discovered_paths = set()
+            self._prune_walked_paths = set()
 
         stats = {
             'modules': 0,
@@ -4034,6 +4058,13 @@ class CodeGraphAnalyzer:
                             continue
                         if incremental:
                             all_files = files
+                            # v0.2.82 (review blocker 1): record the PRE-filter
+                            # discovery — `--incremental` drops unchanged files
+                            # BEFORE dispatch; without this a `--prune-stale`
+                            # run would delete their rows (same wipe class as
+                            # the unchanged-skip: not-walked ≠ stale).
+                            for _f_disc in all_files:
+                                self._record_discovered_path(_f_disc, source_root)
                             files = self._filter_changed_files(
                                 source_root, all_files, since_commit=since_commit,
                             )
@@ -4113,6 +4144,8 @@ class CodeGraphAnalyzer:
                         # Progress emission must never block analysis.
                         pass
                 seen_files += 1
+                # v0.2.82 — record dispatched files for the prune-preserve set.
+                self._record_discovered_path(f, source_root)
                 try:
                     result = analyze_fn(f, source_root)
                     stats['modules']  += result.get('modules', 0)
@@ -4225,6 +4258,24 @@ class CodeGraphAnalyzer:
 
         return stats
 
+    def _record_discovered_path(self, f, source_root) -> None:
+        """v0.2.82 — record a file DISCOVERED on disk this run (POSIX rel,
+        the exact shape extractors store into CodeModule.path / entity
+        file_path) for the prune-preserve set (``discovered − walked`` =
+        skipped-but-present files whose rows must survive ``--prune-stale``).
+        TWO call sites: the dispatch loop (every dispatched file) and the
+        incremental branch's PRE-filter list (review blocker 1: unchanged
+        files are dropped before dispatch — not-walked ≠ stale). Gated on
+        ``_track_visited`` so non-prune runs pay nothing.
+        """
+        if not self._track_visited:
+            return
+        try:
+            rel = f.relative_to(source_root).as_posix()
+        except Exception:  # noqa: BLE001 — defensive: odd roots
+            rel = str(f).replace("\\", "/")
+        self._prune_discovered_paths.add(rel)
+
     def _prune_stale_objects(self) -> int:
         """Delete code-graph objects that were not visited this run.
 
@@ -4276,6 +4327,21 @@ class CodeGraphAnalyzer:
         for coll_name, uid in self.visited_uuids:
             per_collection_visited.setdefault(coll_name, set()).add(uid)
 
+        # v0.2.82 — preserve set: files the dispatcher discovered on disk but
+        # whose extraction never wrote a module row (unchanged-skip / minified
+        # / parse-failure). Their rows are ALIVE, just not re-walked; deleting
+        # them is the 2026-07-15 whole-graph-wipe incident. Rows anchored to
+        # these paths are preserved by `_prune_collection`.
+        preserve_paths: Set[str] = (
+            getattr(self, "_prune_discovered_paths", set())
+            - getattr(self, "_prune_walked_paths", set())
+        )
+        if preserve_paths:
+            print(
+                f"🛡️  Prune-preserve: {len(preserve_paths)} skipped-but-present "
+                f"file(s) — their rows are exempt from stale pruning"
+            )
+
         collections = [
             self.modules_collection,
             self.classes_collection,
@@ -4297,6 +4363,7 @@ class CodeGraphAnalyzer:
             visited = per_collection_visited.get(coll.name, set())
             pruned, failures = self._prune_collection(
                 coll, visited, language_scope=scope_lang,
+                preserve_paths=preserve_paths,
             )
             if pruned:
                 print(f"🧹 Pruned {pruned} stale objects from {coll.name}")
@@ -4324,98 +4391,21 @@ class CodeGraphAnalyzer:
         collection,
         visited_uuids: Set[str],
         language_scope: str = "",
+        preserve_paths: Optional[Set[str]] = None,
     ) -> Tuple[int, int]:
-        """Delete every object in ``collection`` whose project matches
-        ``self.project_name`` AND whose UUID is not in ``visited_uuids``.
-
-        v0.2.18 (Plan C): when ``language_scope`` is a non-empty canonical
-        language ID, additionally filter by ``language == language_scope``
-        (case-insensitive, after `_canonical_lang_id` normalisation so
-        legacy mixed-case rows like `"Python"` are recognised as matching
-        `"python"`). Rows with no `language` property are treated as
-        unknown-language and PRESERVED — they predate the v0.2.18 schema
-        migration and the next full re-analyze (no `--language`) will
-        repopulate them.
-
-        Why filter on the ``project`` property as well as the
-        collection name: a per-project collection like
-        ``MyProject_CodeFunction`` should always belong to a single
-        project, but defensive in case the schema ever permits
-        cross-project sharing. The double-filter is essentially free
-        (no extra query roundtrip beyond the initial enumerate).
-
-        v0.2.73 (C-11 / RT-3): returns ``(pruned, failures)`` so callers can
-        flip the build status success→partial when deletes fail. Before this
-        change a per-row ``delete_by_id`` failure only ``logger.warning``'d and
-        was invisible — a build with hundreds of Weaviate-500 prune failures
-        (stale per-shard prop-length tracker state on a pre-chunking
-        collection) reported ``success`` over silently-stale data. Now every
-        failure increments a counter that propagates to the run's exit status
-        and the machine-readable ``PRUNE_FAILURES=N`` summary line.
+        """Thin shim over ``vco_lib.codegraph_prune.prune_collection`` (the
+        v0.2.82 extraction — full semantics, history and the 2026-07-15
+        wipe-incident rationale live in that module's docstring). Kept as a
+        method so every existing call-site and test keeps its signature.
         """
-        pruned = 0
-        failures = 0
-        # Read `language` only when needed so a missing-property collection
-        # (pre-migration) doesn't 422 the enumerate. Weaviate returns None
-        # for missing-on-row props which we treat as "unknown language".
-        return_props = ["project"]
-        if language_scope:
-            return_props.append("language")
-
-        try:
-            for obj in collection.iterator(
-                return_properties=return_props,
-            ):
-                props = obj.properties or {}
-                obj_project = props.get("project")
-                # Only consider objects belonging to this project. Foreign-
-                # project rows (shouldn't exist in per-project collections,
-                # but defensive) are left alone.
-                if obj_project not in (None, "", self.project_name):
-                    continue
-
-                # Plan C: language-scoped filter. Rows without a language
-                # property (pre-v0.2.18 data) are PRESERVED — they need a
-                # full re-analyze to repopulate the field. Rows with a
-                # language other than the scope are out-of-scope this run.
-                if language_scope:
-                    row_lang = _canonical_lang_id(props.get("language"))
-                    if not row_lang:
-                        # Unknown / pre-migration row → preserve.
-                        continue
-                    if row_lang != language_scope:
-                        # Different-language row → preserve (this is the
-                        # entire point of language-scoped prune).
-                        continue
-
-                if str(obj.uuid) in visited_uuids:
-                    continue
-                try:
-                    collection.data.delete_by_id(uuid=str(obj.uuid))
-                    pruned += 1
-                except Exception as exc:
-                    # v0.2.73 (C-11 / RT-3): count the failure so it can flip
-                    # the build status. A recurring signature here is the
-                    # Weaviate-500 "subtract prop lengths: property not found"
-                    # on delete — stale per-shard prop-length tracker state on a
-                    # pre-chunking collection carried across Weaviate upgrades.
-                    # It is upstream shard state, NOT a VCO logic bug, so we
-                    # never auto-drop the collection; the consented
-                    # drop-and-rebuild path is surfaced in main() instead.
-                    failures += 1
-                    logger.warning(
-                        f"Failed to prune {obj.uuid} from {collection.name}: {exc}"
-                    )
-        except Exception as exc:
-            # Iterating a freshly-created collection can fail if it
-            # has no data yet; treat as zero-prune. This is an enumeration
-            # failure (not a per-row delete failure) — we cannot tell how many
-            # rows were owed, so we do NOT count it as a prune failure here;
-            # a walk that produced zero visited UUIDs against a populated
-            # collection is caught by higher-level insert-error accounting.
-            logger.debug(f"Prune enumeration on {collection.name} failed: {exc}")
-
-        return pruned, failures
+        return _prune_collection_impl(
+            collection,
+            visited_uuids,
+            project_name=self.project_name,
+            canonical_lang_id=_canonical_lang_id,
+            language_scope=language_scope,
+            preserve_paths=preserve_paths,
+        )
 
     def _single_file_dispatch(
         self,
@@ -5520,6 +5510,16 @@ class CodeGraphAnalyzer:
         # Fall back to `self._current_language` (dispatcher-set) so direct
         # callers without a `language=` argument still get the right value.
         canonical_lang = _canonical_lang_id(language) or self._current_language or ""
+
+        # v0.2.82 — mark this file as actually WALKED (module write reached).
+        # Every extractor funnels its writes through here (via
+        # `write_file_extraction`), so `discovered − walked` in the prune
+        # pass is exactly the set of skipped-but-present files whose rows
+        # must be preserved. Same gate as visited_uuids. getattr-guarded so
+        # stub analyzers in tests (SimpleNamespace) stay constructible.
+        _walked = getattr(self, "_prune_walked_paths", None)
+        if _walked is not None and self._track_visited and path:
+            _walked.add(path.replace("\\", "/"))
 
         # v0.2.47 (extras): source-root tag goes onto both update + insert
         # paths so re-analyzes of pre-v0.2.47 rows backfill the property

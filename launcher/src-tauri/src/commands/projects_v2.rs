@@ -926,35 +926,65 @@ pub(crate) async fn apply_post_bundle_steps(
     // create behavior). On update, `is_initial_create=false` →
     // prune_stale=true so any rows for files the user deleted between
     // create and update are reaped. Closes audit AF-6 (G4.4).
+    //
+    // v0.2.82 (2026-07-15 incident): on the UPDATE path, skip the autobuild
+    // for the project whose folder IS the orchestrator root. `install.py
+    // --update` already schedules the revision-gated background resync for
+    // the root repo (vco_lib::codegraph_resync), and running BOTH meant two
+    // full analyzers racing on the same collections — worse, with different
+    // `--project` identities (this path passes the launcher display name,
+    // e.g. "VibeCoded Orchestrator"; the resync uses the codegraph binding
+    // name "VibeCodedOrchestrator"), stamping duplicate rows under distinct
+    // deterministic UUIDs and letting each run's prune reap the other
+    // identity's rows. One writer for root: the resync. Fail-open: if the
+    // root cannot be resolved, keep the pre-v0.2.82 behaviour.
+    let is_orchestrator_root_update = update_should_skip_root_autobuild(
+        folder,
+        crate::services::vco_lib_bridge::resolve_orchestrator_root(db),
+        is_initial_create,
+    );
+    // (decision logic lives in `update_should_skip_root_autobuild` below —
+    // pure + unit-tested for both the act and the leave-alone cases.)
+    if is_orchestrator_root_update {
+        eprintln!(
+            "[vct] codegraph autobuild skipped for {} (orchestrator root — \
+             install.py's revision-gated resync owns root analysis)",
+            project_id
+        );
+    }
     let now = chrono::Utc::now().timestamp_millis();
     let prune_stale = !is_initial_create;
-    if let Err(e) = db.upsert_code_graph_build(
-        project_id,
-        build_status::PENDING,
-        Some(now),
-        None,
-        None,
-        0,
-        None,
-        false,
-        None,
-        None,
-    ) {
-        eprintln!("[vct] warning: could not queue code-graph build for {}: {}", project_id, e);
-    } else {
-        codegraph::spawn_initial_build(
-            app.clone(),
-            project_id.to_string(),
-            project_name.to_string(),
-            folder_path_str.clone(),
-            // First-time builds for a freshly-created project: no
-            // pre-existing per-project code-graph rows can possibly
-            // be stale, so --prune-stale is a no-op here. Pass false
-            // explicitly to avoid the iterator-then-delete pass.
-            // Re-builds (update path) set this to `true` to reap
-            // rows referencing files the user deleted post-create.
-            prune_stale,
-        );
+    // Root-update: skip both the pending-row insert and the spawn (no
+    // dangling PENDING pill in the GUI for a build that will never run).
+    if !is_orchestrator_root_update {
+        if let Err(e) = db.upsert_code_graph_build(
+            project_id,
+            build_status::PENDING,
+            Some(now),
+            None,
+            None,
+            0,
+            None,
+            false,
+            None,
+            None,
+        ) {
+            eprintln!("[vct] warning: could not queue code-graph build for {}: {}", project_id, e);
+        } else {
+            codegraph::spawn_initial_build(
+                app.clone(),
+                project_id.to_string(),
+                project_name.to_string(),
+                folder_path_str.clone(),
+                // First-time builds for a freshly-created project: no
+                // pre-existing per-project code-graph rows can possibly
+                // be stale, so --prune-stale is a no-op here. Pass false
+                // explicitly to avoid the iterator-then-delete pass.
+                // Re-builds (update path) set this to `true` to reap
+                // rows referencing files the user deleted post-create.
+                prune_stale,
+            );
+        }
     }
 
     // KG auto-sync (2026-05-12): kick off the initial `kg-sync --all`
@@ -6702,9 +6732,77 @@ pub async fn perform_hard_cut(
     })
 }
 
+/// v0.2.82 (2026-07-15 incident): should the per-project UPDATE flow skip the
+/// code-graph autobuild because this project IS the orchestrator root?
+///
+/// `install.py --update` already schedules the revision-gated background
+/// resync for the root repo; a concurrent launcher autobuild raced it under a
+/// DIFFERENT `--project` identity (display name "VibeCoded Orchestrator" vs
+/// binding name "VibeCodedOrchestrator"), stamping duplicate rows and letting
+/// each run's prune reap the other identity's rows. One writer for root: the
+/// resync.
+///
+/// Pure decision helper (unit-tested for act + leave-alone):
+/// * initial CREATE never skips (root registration wants its first build);
+/// * unresolvable orchestrator root → fail-open `false` (pre-v0.2.82
+///   behaviour — the analyzer-side prune-preserve is the wipe protection);
+/// * both sides canonicalized before compare so symlinked clones match.
+pub(crate) fn update_should_skip_root_autobuild(
+    folder: &std::path::Path,
+    orchestrator_root: Option<std::path::PathBuf>,
+    is_initial_create: bool,
+) -> bool {
+    if is_initial_create {
+        return false;
+    }
+    match orchestrator_root {
+        None => false,
+        Some(root) => {
+            let canon_root = root.canonicalize().unwrap_or(root);
+            let canon_folder = folder
+                .canonicalize()
+                .unwrap_or_else(|_| folder.to_path_buf());
+            canon_root == canon_folder
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── v0.2.82: root-autobuild skip gate (act + leave-alone) ──────────
+
+    #[test]
+    fn root_autobuild_skip_acts_on_update_of_root_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        assert!(update_should_skip_root_autobuild(&root, Some(root.clone()), false));
+    }
+
+    #[test]
+    fn root_autobuild_skip_leaves_non_root_projects_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("orchestrator");
+        let project = tmp.path().join("some-project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        assert!(!update_should_skip_root_autobuild(&project, Some(root), false));
+    }
+
+    #[test]
+    fn root_autobuild_skip_leaves_initial_create_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        // Even a folder == root does NOT skip on the CREATE path.
+        assert!(!update_should_skip_root_autobuild(&root, Some(root.clone()), true));
+    }
+
+    #[test]
+    fn root_autobuild_skip_fails_open_when_root_unresolvable() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!update_should_skip_root_autobuild(tmp.path(), None, false));
+    }
 
     // ─── v0.2.71 Piece 5b: kg-sync spawn gate (skip-when-unchanged) ─────
 
