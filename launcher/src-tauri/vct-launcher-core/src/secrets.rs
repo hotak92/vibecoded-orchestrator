@@ -199,6 +199,207 @@ impl<'a> SecretScope<'a> {
 // 'static + Send for the bounded-timeout worker; the structural guard
 // `p9_source_shape_entry_construction_inside_retried_closure` pins the shape.
 
+// ─── Call context + lock-state honesty (v0.2.82 WP-4a / G5) ───────────────
+//
+// The four-layer defence above (single-threaded tests + mutex + pacing +
+// backoff + bounded worker) prevents/rides-out a gnome-keyring SIGTRAP under
+// burst. It does NOT address the SECOND half of the G5 incident: after the
+// daemon crash-restarts, the login collection comes back LOCKED, and the next
+// Secret-Service access from ANY code path pops the OS unlock dialog. A
+// BACKGROUND path (daily weights poll, hub `/env` resolution for hooks/MCPs,
+// coordination page-mount fetch) that trips that dialog does so with zero user
+// context — the user sees a bare "unlock your keyring" prompt they can't place.
+// keyring-rs maps a dismissed prompt to `Error::Prompt` → `NoStorageAccess`,
+// which `is_transient` correctly treats as NON-transient (no retry storm), but
+// the dialog still popped and the caller still failed opaquely.
+//
+// Fix: classify every call as Interactive or Background. A Background call on
+// Linux PROBES the default collection's `Locked` property FIRST — a pure D-Bus
+// property read (`org.freedesktop.Secret.Collection.Locked`) that never
+// prompts and never attempts an unlock — and, when locked, returns the
+// distinct `KeychainError::Locked` state IMMEDIATELY, WITHOUT constructing a
+// `keyring::Entry` (Entry construction is itself a session negotiation that a
+// background read must not perform against a locked store). Interactive calls
+// skip the probe and proceed exactly as before — a user who just clicked
+// "reveal secret" has the context to answer an unlock dialog.
+//
+// No new retry / auto-unlock / auto-heal is added (standing rule): a locked
+// keychain is an honest terminal state surfaced to the caller, not something
+// this layer tries to fix.
+
+/// Whether a keychain access originates from an explicit user action on a
+/// secrets-bearing surface (`Interactive`) or from a background poll / spawn /
+/// hub-resolution / page-mount fetch (`Background`).
+///
+/// The distinction drives ONE behavioural difference: a `Background` call on
+/// Linux probes the collection lock state first and short-circuits to
+/// `KeychainError::Locked` (no Entry construction, no prompt) when the store is
+/// locked. `Interactive` never probes — the user is present and can answer an
+/// OS unlock dialog if one appears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallContext {
+    /// Explicit user click on a secrets-bearing action (SecretsPanel
+    /// save/reveal, OnboardingWizard, license activation). May prompt.
+    Interactive,
+    /// Poll / spawn / hub-resolution / page-mount fetch. Must never prompt;
+    /// probes lock state and soft-fails `Locked` instead.
+    Background,
+}
+
+/// A keychain access outcome that distinguishes a LOCKED store from every
+/// other failure, so callers (and the hub `/env` route) can surface honest
+/// states — `keychain_locked` vs `keychain_error` vs the ordinary
+/// key-not-present miss — instead of collapsing them all into one opaque
+/// `Err(String)`.
+///
+/// This is deliberately NOT `keyring::Error` (which isn't uniformly `Send`
+/// across the bounded-timeout worker channel and carries no launcher-level
+/// "locked" notion — a dismissed prompt is `NoStorageAccess`, indistinguishable
+/// at that layer from an access-denied ACL).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeychainError {
+    /// The OS keychain / login collection is LOCKED. A background read
+    /// detected this via the lock-state probe and refused to prompt. The
+    /// remedy is a user unlock, not a retry.
+    Locked,
+    /// Any other keychain failure (daemon error after retries, timeout,
+    /// worker wedged, shape error). Carries a human-readable detail string;
+    /// NEVER a secret value.
+    Other(String),
+}
+
+impl std::fmt::Display for KeychainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeychainError::Locked => write!(
+                f,
+                "OS keychain is locked — unlock your login keychain or open \
+                 the launcher to restore secret resolution"
+            ),
+            KeychainError::Other(detail) => write!(f, "{}", detail),
+        }
+    }
+}
+
+impl std::error::Error for KeychainError {}
+
+/// Probe whether the OS default Secret-Service collection is currently LOCKED,
+/// WITHOUT constructing a `keyring::Entry` and WITHOUT ever prompting.
+///
+/// Returns:
+///   * `Some(true)`  — collection is locked (a background read must soft-fail).
+///   * `Some(false)` — collection is unlocked (proceed).
+///   * `None`        — UNKNOWN: the probe could not determine lock state
+///                     (no Secret-Service backend, D-Bus unreachable, non-Linux
+///                     platform). Callers proceed as before — we cannot be
+///                     stricter without breaking non-SecretService setups.
+///
+/// Implementation (Linux): opens a Secret-Service session with
+/// `EncryptionType::Plain` and a ZERO max-prompt-timeout (so no unlock dialog
+/// can ever appear), fetches the default collection, and reads its `Locked`
+/// D-Bus property. That property read is a plain `Get` — it neither unlocks
+/// nor prompts. The whole probe runs inside the bounded-timeout worker so a
+/// wedged D-Bus daemon yields `None` (UNKNOWN) rather than hanging.
+///
+/// macOS / Windows: always `None` (Unlocked-equivalent → proceed). The
+/// apple-native ACL prompt model and Windows Credential Manager have different
+/// semantics that need their own investigation (see DEFERRALS D4 in the
+/// v0.2.82 plan). Documented here so a future maintainer doesn't mistake the
+/// `None` for an oversight.
+#[cfg(target_os = "linux")]
+pub fn probe_default_collection_locked() -> Option<bool> {
+    // Allow tests to inject a deterministic lock state without a live D-Bus.
+    #[cfg(any(test, debug_assertions))]
+    if let Some(forced) = test_probe_override() {
+        return forced;
+    }
+    // Run the D-Bus property read on the bounded-timeout worker: a wedged
+    // Secret Service must not hang the probe. A timeout / worker-stuck →
+    // UNKNOWN (None), the conservative "proceed as today" default.
+    run_keychain_with_timeout(probe_default_collection_locked_blocking).unwrap_or(None)
+}
+
+/// The blocking body of the Linux lock probe (runs on the worker thread).
+/// Separated so the timeout wrapper stays thin and the D-Bus calls are all in
+/// one place. Any error in the negotiation / property read → `None` (UNKNOWN).
+#[cfg(target_os = "linux")]
+fn probe_default_collection_locked_blocking() -> Option<bool> {
+    use dbus_secret_service::{EncryptionType, SecretService};
+    // `Plain` avoids a Diffie-Hellman handshake; timeout 0 guarantees no
+    // unlock prompt can appear (the crate cancels any prompt immediately).
+    let ss = SecretService::connect_with_max_prompt_timeout(EncryptionType::Plain, 0).ok()?;
+    let collection = ss.get_default_collection().ok()?;
+    // `is_locked()` is a pure `Get` of the `Locked` property — no unlock, no
+    // prompt. An error here (e.g. no default collection) → UNKNOWN.
+    collection.is_locked().ok()
+}
+
+/// Non-Linux platforms have no Secret-Service `Locked` probe. Always UNKNOWN →
+/// callers proceed as before. (macOS apple-native / Windows Credential Manager
+/// prompt semantics are out of scope this release — DEFERRALS D4.)
+#[cfg(not(target_os = "linux"))]
+pub fn probe_default_collection_locked() -> Option<bool> {
+    None
+}
+
+/// Test seam: force the lock probe to a fixed answer so the Background-context
+/// path can be exercised without a live D-Bus. `Some(Some(true))` = locked,
+/// `Some(Some(false))` = unlocked, `Some(None)` = UNKNOWN, `None` = no override
+/// (use the real probe). RAII guard is [`TestProbeGuard`].
+#[cfg(any(test, debug_assertions))]
+static TEST_PROBE_OVERRIDE: std::sync::Mutex<Option<Option<bool>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(any(test, debug_assertions))]
+fn test_probe_override() -> Option<Option<bool>> {
+    *TEST_PROBE_OVERRIDE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// Test-only RAII guard forcing [`probe_default_collection_locked`] to a fixed
+/// answer for the guard's lifetime. Restores the previous value on drop.
+#[cfg(any(test, debug_assertions))]
+pub struct TestProbeGuard {
+    prev: Option<Option<bool>>,
+}
+
+#[cfg(any(test, debug_assertions))]
+impl TestProbeGuard {
+    /// `locked`: `Some(true)` = locked, `Some(false)` = unlocked, `None` =
+    /// UNKNOWN (probe indeterminate).
+    pub fn new(locked: Option<bool>) -> Self {
+        let mut slot = TEST_PROBE_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = *slot;
+        *slot = Some(locked);
+        Self { prev }
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+impl Drop for TestProbeGuard {
+    fn drop(&mut self) {
+        let mut slot = TEST_PROBE_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner());
+        *slot = self.prev;
+    }
+}
+
+/// Test seam: counts `keyring::Entry` constructions inside the guarded get/set/
+/// delete hot paths. A Background call that short-circuits on a locked probe
+/// must NOT increment this (T18). Only compiled in test/debug builds.
+#[cfg(any(test, debug_assertions))]
+pub static ENTRY_CONSTRUCTION_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Record one `Entry::new` construction (test/debug builds only). Called from
+/// the production hot-path closures so the count reflects real construction,
+/// not a test double.
+#[cfg(any(test, debug_assertions))]
+#[inline]
+fn note_entry_construction() {
+    ENTRY_CONSTRUCTION_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// 0.1.7 H1 (2026-05-08): retry on transient daemon-hiccup errors.
 /// 2026-05-13 upgrade: 1 retry → 3 attempts with progressive backoff
 /// after a fresh SIGTRAP crash on the user's machine confirmed the
@@ -210,6 +411,16 @@ impl<'a> SecretScope<'a> {
 /// / `Ambiguous` (permanent shape errors) all propagate immediately —
 /// retrying any of them won't change the outcome and would just add
 /// latency to every error.
+///
+/// v0.2.82 (WP-4a / G5c) — WHY the prompt path can't be reached by a retry:
+/// keyring-rs maps a DISMISSED OS unlock prompt to `Error::Prompt` →
+/// `NoStorageAccess`. Because `NoStorageAccess` is NON-transient here, a
+/// dismissed prompt (or a locked store) propagates on the FIRST attempt — the
+/// `PlatformFailure` retry loop is never entered for it, so no retry can
+/// re-pop the unlock dialog. (Prompts arise only from unlock ATTEMPTS; the
+/// lock-state probe added in WP-4a reads the `Locked` property and never
+/// attempts an unlock, so it can't prompt either.) A dismissed prompt is a
+/// final answer. Pinned by `is_transient_no_storage_access_is_not_retried_g5c`.
 fn is_transient(err: &keyring::Error) -> bool {
     matches!(err, keyring::Error::PlatformFailure(_))
 }
@@ -308,6 +519,276 @@ impl Drop for TestSpacingGuard {
     fn drop(&mut self) {
         let mut slot = TEST_SPACING_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner());
         *slot = self.prev;
+    }
+}
+
+/// Test-only RAII guard pinning the cross-process pace file to an isolated
+/// path (usually a `tempfile::TempDir` child) for the guard's lifetime.
+/// Restores the previous override on drop. Unix-only (the pace module is
+/// `cfg(unix)`).
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub struct TestPacePathGuard {
+    prev: Option<std::path::PathBuf>,
+}
+
+#[cfg(all(unix, any(test, debug_assertions)))]
+impl TestPacePathGuard {
+    pub fn new(path: std::path::PathBuf) -> Self {
+        cross_process_pace::reset_warn_latch_for_test();
+        let prev = cross_process_pace::set_test_pace_path(Some(path));
+        Self { prev }
+    }
+    /// Read-back of the last-call timestamp the pace file holds (nanos).
+    pub fn pace_timestamp(&self) -> Option<u128> {
+        cross_process_pace::read_pace_timestamp_for_test()
+    }
+    /// How many degrade-warns were emitted since this guard reset the latch.
+    pub fn warn_count(&self) -> usize {
+        cross_process_pace::WARN_COUNT.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(all(unix, any(test, debug_assertions)))]
+impl Drop for TestPacePathGuard {
+    fn drop(&mut self) {
+        cross_process_pace::set_test_pace_path(self.prev.take());
+        cross_process_pace::reset_warn_latch_for_test();
+    }
+}
+
+// ─── Cross-PROCESS pacing (v0.2.82 WP-4a / G5), unix-only ─────────────────────
+//
+// `paced_call` above serializes keychain hits WITHIN one process. The G5
+// incident showed that's not enough: "Update all projects" runs the launcher
+// GUI + vct-hub (+ CLI + tests) as SEPARATE processes, each with its own
+// `LAST_KEYRING_CALL` pacer, so the daemon still saw a machine-level burst and
+// SIGTRAPed. This layer adds a kernel-level `flock(EXCLUSIVE)` on
+// `<vct_root>/keyring.pace` HELD ACROSS the keychain op, so at most ONE VCO
+// process touches gnome-keyring at a time machine-wide.
+//
+// Mechanics per call:
+//   1. flock(EXCLUSIVE) the pace file (blocks until we own it).
+//   2. Read the last-call timestamp stored in the file; sleep any remaining
+//      `MIN_CALL_SPACING` (cross-process spacing, mirrors the in-process gate).
+//   3. Write the new timestamp.
+//   4. Run the op WHILE STILL HOLDING the lock (so no sibling process can
+//      interleave a concurrent daemon request).
+//   5. Drop the guard → flock(LOCK_UN). Crash-safety: the kernel releases the
+//      lock on process death, so a crashed holder never wedges the others.
+//
+// Fallbacks (each logs EXACTLY ONE warn, then degrades to in-process pacing =
+// today's behaviour):
+//   * pace file uncreatable (root dir unwritable) → per-process pacing only.
+//   * non-unix (windows-native / apple-native have no crashy daemon) →
+//     per-process pacing only (the whole module is `cfg(unix)`; the
+//     `run_with_cross_process_pace` shim is a pass-through elsewhere).
+//
+// The `MIN_CALL_SPACING` test override (`with_test_spacing` / `TestSpacingGuard`)
+// extends here too via `current_spacing()`, so the suite stays fast.
+#[cfg(unix)]
+mod cross_process_pace {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::io::AsRawFd;
+    use std::path::PathBuf;
+
+    /// Where the cross-process pace/lock file lives. One per user, alongside
+    /// the other launcher state (`hub.pid`, `hub.token`, …) so every VCO
+    /// process resolves the SAME path. Resolution reuses `paths::vct_root_dir`
+    /// (honours `VCT_STATE_DIR`), so a dev launcher and a prod launcher pace
+    /// against their own root — correct, since they hit distinct state but the
+    /// SAME OS keychain… note: the OS keychain is shared per-OS-user
+    /// regardless of VCT_STATE_DIR. To serialize against the daemon (not just
+    /// within one root) the lock path is intentionally NOT under vct_root when
+    /// an override is present for tests; production always uses vct_root.
+    fn pace_file_path() -> PathBuf {
+        // Test seam: let a test pin the pace file to an isolated temp path so
+        // it neither touches the user's real vct_root nor races with the
+        // process-global `VCT_STATE_DIR` env.
+        #[cfg(any(test, debug_assertions))]
+        if let Some(p) = test_pace_path_override() {
+            return p;
+        }
+        crate::paths::vct_root_dir().join("keyring.pace")
+    }
+
+    /// One-shot warn de-dup: we emit the "degraded to in-process pacing" warn
+    /// at most once per process to avoid log spam on a persistently-unwritable
+    /// root. `false` → not yet warned.
+    static WARNED_ONCE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Test-visible count of warns actually emitted (so T20 can assert
+    /// "exactly one warn" without scraping stderr). Incremented in lock-step
+    /// with the real `eprintln`.
+    #[cfg(any(test, debug_assertions))]
+    pub(in crate::secrets) static WARN_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn warn_once(msg: &str) {
+        if !WARNED_ONCE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            #[cfg(any(test, debug_assertions))]
+            WARN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            eprintln!("[vct-secrets] WARN: {msg}");
+        }
+    }
+
+    /// Test-only reset of the one-shot warn latch (so consecutive test cases
+    /// each get a fresh "have we warned yet" state).
+    #[cfg(any(test, debug_assertions))]
+    pub(in crate::secrets) fn reset_warn_latch_for_test() {
+        WARNED_ONCE.store(false, std::sync::atomic::Ordering::SeqCst);
+        WARN_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    static TEST_PACE_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+    #[cfg(any(test, debug_assertions))]
+    fn test_pace_path_override() -> Option<PathBuf> {
+        TEST_PACE_PATH.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Test-only: pin the pace file path (RAII via [`super::TestPacePathGuard`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(in crate::secrets) fn set_test_pace_path(p: Option<PathBuf>) -> Option<PathBuf> {
+        let mut slot = TEST_PACE_PATH.lock().unwrap_or_else(|p| p.into_inner());
+        std::mem::replace(&mut *slot, p)
+    }
+
+    /// Test-only: read back the stored last-call timestamp (nanos) from the
+    /// pace file, so T20 can assert two paced calls wrote monotonic stamps.
+    #[cfg(any(test, debug_assertions))]
+    pub(in crate::secrets) fn read_pace_timestamp_for_test() -> Option<u128> {
+        let path = pace_file_path();
+        std::fs::read_to_string(path).ok()?.trim().parse::<u128>().ok()
+    }
+
+    /// RAII holder of the exclusive cross-process file lock. Dropping releases
+    /// it (explicit LOCK_UN, kernel also releases on close/death). The `_file`
+    /// handle is held only to keep `fd` valid for the guard's lifetime — the
+    /// fd is a borrow of it (mirrors `test_serialize::file_lock::FileLock`).
+    struct PaceLock {
+        _file: std::fs::File,
+        fd: std::os::unix::io::RawFd,
+    }
+
+    impl Drop for PaceLock {
+        fn drop(&mut self) {
+            unsafe {
+                libc::flock(self.fd, libc::LOCK_UN);
+            }
+        }
+    }
+
+    /// Acquire the exclusive lock and enforce cross-process spacing. Returns
+    /// the held lock guard on success, or `None` if the pace file is
+    /// uncreatable / flock fails (caller then degrades to in-process pacing).
+    ///
+    /// `spacing` is threaded in (not read from the parent module directly) so
+    /// the test override applies identically to the cross-process gate.
+    fn acquire_and_space(spacing: std::time::Duration) -> Option<PaceLock> {
+        let path = pace_file_path();
+        // The pace file lives under vct_root; create the dir if absent so a
+        // fresh install (root not yet mkdir'd) still paces rather than warning.
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut file = match std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                warn_once(&format!(
+                    "cannot open keyring pace file {path:?}: {e} — cross-process \
+                     keyring pacing disabled (in-process pacing still active)"
+                ));
+                return None;
+            }
+        };
+        let fd = file.as_raw_fd();
+        // LOCK_EX blocks until acquired. A held keychain op is bounded by the
+        // caller's timeout worker, so the wait here is bounded transitively.
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            warn_once(&format!(
+                "flock(LOCK_EX) failed on {path:?}: {err} — cross-process \
+                 keyring pacing disabled (in-process pacing still active)"
+            ));
+            return None;
+        }
+        // We do all I/O on the ORIGINAL `file` (whose fd `fd` we locked), then
+        // MOVE it into the guard so the very fd holding the flock stays open
+        // for the guard's whole lifetime and `Drop` LOCK_UNs that same fd.
+        // (A dup'd clone would share the lock but leave `Drop` unlocking a
+        // closed fd — a silent no-op — so we deliberately don't clone.)
+        //
+        // Read the stored last-call timestamp (nanos since the UNIX epoch, a
+        // process-shared reference) and sleep the remaining spacing.
+        let now = std::time::SystemTime::now();
+        let mut buf = String::new();
+        let _ = file.seek(SeekFrom::Start(0));
+        if file.read_to_string(&mut buf).is_ok() {
+            if let Ok(prev_nanos) = buf.trim().parse::<u128>() {
+                if let Ok(now_since_epoch) = now.duration_since(std::time::UNIX_EPOCH) {
+                    let now_nanos = now_since_epoch.as_nanos();
+                    if now_nanos > prev_nanos {
+                        let elapsed = std::time::Duration::from_nanos(
+                            (now_nanos - prev_nanos).min(u64::MAX as u128) as u64,
+                        );
+                        if elapsed < spacing {
+                            std::thread::sleep(spacing - elapsed);
+                        }
+                    }
+                    // If now <= prev (clock skew / same instant), fall through:
+                    // we still write a fresh timestamp below, spacing best-effort.
+                }
+            }
+        }
+        // Write the new (post-sleep) timestamp so the NEXT process spaces off
+        // when WE started the op.
+        if let Ok(since_epoch) =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        {
+            let _ = file.seek(SeekFrom::Start(0));
+            let _ = file.set_len(0);
+            let _ = write!(file, "{}", since_epoch.as_nanos());
+            let _ = file.flush();
+        }
+        Some(PaceLock { _file: file, fd })
+    }
+
+    /// Run `op` under the cross-process pace/lock. The lock is HELD for the
+    /// whole `op` so no sibling VCO process interleaves a concurrent daemon
+    /// request. On any file-lock failure, `op` still runs (degraded to
+    /// in-process pacing) — a soft-fail, never a hard block on the user's
+    /// secret read.
+    pub(super) fn run_with_cross_process_pace<T>(op: impl FnOnce() -> T) -> T {
+        let spacing = super::current_spacing();
+        // Hold the guard across `op`; drop (unlock) after.
+        let _guard = acquire_and_space(spacing);
+        op()
+    }
+}
+
+/// Cross-process pacing shim. On unix, serializes the keychain op across ALL
+/// VCO processes via a held flock (see `cross_process_pace`). On non-unix it's
+/// a pass-through (those platforms lack the crashy daemon). Called from inside
+/// the bounded-timeout worker, wrapping the full `retry_with_backoff` op, so a
+/// wedged flock or op is still bounded by `KEYCHAIN_OP_TIMEOUT`.
+#[inline]
+fn with_cross_process_pace<T>(op: impl FnOnce() -> T) -> T {
+    #[cfg(unix)]
+    {
+        cross_process_pace::run_with_cross_process_pace(op)
+    }
+    #[cfg(not(unix))]
+    {
+        op()
     }
 }
 
@@ -598,7 +1079,11 @@ pub fn set(
             value.len()
         ));
     }
-    set_raw(scope, module_id, key, value)
+    // Writes are Interactive in practice (a user saved a secret). No Background
+    // write site exists today; if one appears, add a `set_with_context` twin
+    // rather than defaulting a background write to Interactive.
+    set_raw(scope, module_id, key, value, CallContext::Interactive)
+        .map_err(|e| e.to_string())
 }
 
 /// Guarded keychain write for a caller-vouched MULTI-LINE value.
@@ -628,7 +1113,8 @@ pub fn set_allowing_multiline(
             value.len()
         ));
     }
-    set_raw(scope, module_id, key, value)
+    set_raw(scope, module_id, key, value, CallContext::Interactive)
+        .map_err(|e| e.to_string())
 }
 
 /// The bare keychain write — PRIVATE, no shape guard. Reached ONLY through the
@@ -636,41 +1122,111 @@ pub fn set_allowing_multiline(
 /// the guard. The `mock_set` early-return is here (not in the wrappers) so it
 /// fires for BOTH guarded paths and so a guard-failure `Err` from the wrappers
 /// short-circuits before any mock/keychain interaction.
+///
+/// v0.2.82 (WP-4a): honours `ctx`. A `Background` write against a LOCKED store
+/// short-circuits to `KeychainError::Locked` BEFORE any Entry construction.
+/// (Writes are almost always `Interactive` in practice — a user saved a
+/// secret — but the parameter is threaded uniformly so the whole surface obeys
+/// the same lock policy.)
 fn set_raw(
     scope: SecretScope<'_>,
     module_id: &str,
     key: &str,
     value: &str,
-) -> Result<(), String> {
+    ctx: CallContext,
+) -> Result<(), KeychainError> {
+    // Lock gate FIRST — a locked Background write short-circuits before any
+    // keychain-access stage (mock or real).
+    if let Some(locked) = background_lock_gate(ctx) {
+        return Err(locked);
+    }
+    #[cfg(any(test, debug_assertions))]
+    note_entry_construction();
     #[cfg(any(test, debug_assertions))]
     if let Some(result) = for_tests::mock_set(scope, module_id, key, value) {
-        return result;
+        return result.map_err(KeychainError::Other);
     }
     // v0.2.76 (A4): own the (service, key, value) so the job closure is
     // 'static + Send, then run it on the bounded-timeout worker. The timeout
     // wraps OUTSIDE pacing/backoff — the closure IS the full retry_with_backoff
-    // call (v0.2.72 P9 semantics unchanged inside).
+    // call (v0.2.72 P9 semantics unchanged inside). v0.2.82 (WP-4a): the
+    // cross-process flock wraps OUTSIDE retry_with_backoff so the lock is held
+    // across every attempt but INSIDE the timeout worker so a wedged flock is
+    // still bounded.
     let service = scope.service_name(module_id);
     let key = key.to_string();
     let value = value.to_string();
     run_keychain_with_timeout(move || {
-        // v0.2.72 (P9): build the Entry INSIDE the closure so `Entry::new`'s
-        // D-Bus construction shares the same paced_call + backoff as the op.
-        retry_with_backoff(|| Entry::new(&service, &key)?.set_password(&value))
-            .map_err(|err| format!("keyring set: {}", err))
+        with_cross_process_pace(|| {
+            // v0.2.72 (P9): build the Entry INSIDE the closure so `Entry::new`'s
+            // D-Bus construction shares the same paced_call + backoff as the op.
+            retry_with_backoff(|| Entry::new(&service, &key)?.set_password(&value))
+                .map_err(|err| format!("keyring set: {}", err))
+        })
     })
-    .map_err(|to| format!("keyring set: {}", to))??;
+    .map_err(|to| KeychainError::Other(format!("keyring set: {}", to)))?
+    .map_err(KeychainError::Other)?;
     Ok(())
 }
 
-pub fn get(
+/// Lock-state gate for a `Background` call. Returns `Some(KeychainError::Locked)`
+/// when the context is `Background` AND the lock probe reports LOCKED — so the
+/// caller short-circuits WITHOUT constructing a `keyring::Entry` and WITHOUT
+/// prompting. `Interactive` calls, and `Background` calls where the probe is
+/// UNKNOWN (`None`) or reports unlocked, return `None` → proceed as before.
+///
+/// A `None` probe result (no Secret-Service backend, D-Bus unreachable,
+/// non-Linux) means we cannot be stricter without breaking non-SecretService
+/// setups, so we proceed and let the ordinary error path handle any failure.
+fn background_lock_gate(ctx: CallContext) -> Option<KeychainError> {
+    if ctx != CallContext::Background {
+        return None;
+    }
+    match probe_default_collection_locked() {
+        Some(true) => Some(KeychainError::Locked),
+        // Unlocked → proceed. UNKNOWN → proceed (can't be stricter); a debug
+        // line aids diagnosis without spamming production logs.
+        Some(false) => None,
+        None => {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[vct-secrets] debug: lock-state probe indeterminate; \
+                 proceeding with background keychain read"
+            );
+            None
+        }
+    }
+}
+
+/// Read a secret, choosing the [`CallContext`]. A `Background` read against a
+/// LOCKED store returns `Err(KeychainError::Locked)` WITHOUT constructing an
+/// `Entry` or prompting; `Interactive` reads proceed unconditionally.
+///
+/// Returns `Ok(None)` for a genuine key-not-present miss (distinct from
+/// `Err(Locked)` / `Err(Other)`).
+pub fn get_with_context(
     scope: SecretScope<'_>,
     module_id: &str,
     key: &str,
-) -> Result<Option<String>, String> {
+    ctx: CallContext,
+) -> Result<Option<String>, KeychainError> {
+    // Lock gate FIRST — a Background read against a locked store must not even
+    // reach the keychain-access stage (mock or real). This ordering is what
+    // T18's construction-counting seam pins: a locked Background call leaves
+    // the count at 0.
+    if let Some(locked) = background_lock_gate(ctx) {
+        return Err(locked);
+    }
+    // Test/debug seam: past the lock gate we have committed to a keychain
+    // access (mock OR real Entry construction). Placed BEFORE the mock check so
+    // it fires on both the mock-proceed and real-proceed paths; T18 asserts it
+    // stays 0 for a locked Background call and increments once for a
+    // proceeding call.
+    #[cfg(any(test, debug_assertions))]
+    note_entry_construction();
     #[cfg(any(test, debug_assertions))]
     if let Some(result) = for_tests::mock_get(scope, module_id, key) {
-        return result;
+        return result.map_err(KeychainError::Other);
     }
     // v0.2.76 (A4): own (service, key) → 'static + Send job → bounded-timeout
     // worker. keyring::Error is not Send-safe to carry across the channel
@@ -679,29 +1235,47 @@ pub fn get(
     let service = scope.service_name(module_id);
     let key = key.to_string();
     run_keychain_with_timeout(move || {
-        // v0.2.72 (P9): build the Entry INSIDE the closure.
-        match retry_with_backoff(|| Entry::new(&service, &key)?.get_password()) {
-            Ok(v) => Ok(Some(v)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(err) => Err(format!("keyring get: {}", err)),
-        }
+        with_cross_process_pace(|| {
+            // v0.2.72 (P9): build the Entry INSIDE the closure.
+            match retry_with_backoff(|| Entry::new(&service, &key)?.get_password()) {
+                Ok(v) => Ok(Some(v)),
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(err) => Err(format!("keyring get: {}", err)),
+            }
+        })
     })
-    .map_err(|to| format!("keyring get: {}", to))?
+    .map_err(|to| KeychainError::Other(format!("keyring get: {}", to)))?
+    .map_err(KeychainError::Other)
 }
 
-pub fn is_set(
+/// Presence check with an explicit [`CallContext`]. `Background` against a
+/// locked store → `Err(KeychainError::Locked)` (NOT `Ok(false)` — a locked
+/// store cannot honestly claim a key is absent).
+pub fn is_set_with_context(
     scope: SecretScope<'_>,
     module_id: &str,
     key: &str,
-) -> Result<bool, String> {
-    Ok(get(scope, module_id, key)?.is_some())
+    ctx: CallContext,
+) -> Result<bool, KeychainError> {
+    Ok(get_with_context(scope, module_id, key, ctx)?.is_some())
 }
 
-pub fn delete(
+/// Delete with an explicit [`CallContext`]. `Background` against a locked store
+/// → `Err(KeychainError::Locked)` (deletes are essentially always Interactive,
+/// but the surface is uniform).
+pub fn delete_with_context(
     scope: SecretScope<'_>,
     module_id: &str,
     key: &str,
-) -> Result<(), String> {
+    ctx: CallContext,
+) -> Result<(), KeychainError> {
+    // Lock gate FIRST — a locked Background delete short-circuits before any
+    // keychain-access stage (mock or real).
+    if let Some(locked) = background_lock_gate(ctx) {
+        return Err(locked);
+    }
+    #[cfg(any(test, debug_assertions))]
+    note_entry_construction();
     #[cfg(any(test, debug_assertions))]
     if for_tests::mock_delete(scope, module_id, key) {
         return Ok(());
@@ -711,14 +1285,49 @@ pub fn delete(
     let service = scope.service_name(module_id);
     let key = key.to_string();
     run_keychain_with_timeout(move || {
-        // v0.2.72 (P9): build the Entry INSIDE the closure.
-        match retry_with_backoff(|| Entry::new(&service, &key)?.delete_credential()) {
-            Ok(()) => Ok(()),
-            Err(keyring::Error::NoEntry) => Ok(()), // already gone — treat as success
-            Err(err) => Err(format!("keyring delete: {}", err)),
-        }
+        with_cross_process_pace(|| {
+            // v0.2.72 (P9): build the Entry INSIDE the closure.
+            match retry_with_backoff(|| Entry::new(&service, &key)?.delete_credential()) {
+                Ok(()) => Ok(()),
+                Err(keyring::Error::NoEntry) => Ok(()), // already gone — treat as success
+                Err(err) => Err(format!("keyring delete: {}", err)),
+            }
+        })
     })
-    .map_err(|to| format!("keyring delete: {}", to))?
+    .map_err(|to| KeychainError::Other(format!("keyring delete: {}", to)))?
+    .map_err(KeychainError::Other)
+}
+
+/// Read a secret (Interactive context — the back-compat default). Existing
+/// call-sites keep working unchanged; Background call-sites are migrated to
+/// [`get_with_context`] explicitly (see the WP-4a call-site classification).
+pub fn get(
+    scope: SecretScope<'_>,
+    module_id: &str,
+    key: &str,
+) -> Result<Option<String>, String> {
+    get_with_context(scope, module_id, key, CallContext::Interactive)
+        .map_err(|e| e.to_string())
+}
+
+/// Presence check (Interactive context — back-compat default).
+pub fn is_set(
+    scope: SecretScope<'_>,
+    module_id: &str,
+    key: &str,
+) -> Result<bool, String> {
+    is_set_with_context(scope, module_id, key, CallContext::Interactive)
+        .map_err(|e| e.to_string())
+}
+
+/// Delete (Interactive context — back-compat default).
+pub fn delete(
+    scope: SecretScope<'_>,
+    module_id: &str,
+    key: &str,
+) -> Result<(), String> {
+    delete_with_context(scope, module_id, key, CallContext::Interactive)
+        .map_err(|e| e.to_string())
 }
 
 /// Return a masked preview of a non-sensitive value (never for sensitive
@@ -1061,6 +1670,13 @@ pub mod for_tests {
         // Entry is consumed (one-shot) when the failure fires.
         static MOCK_FAIL_KEYS: RefCell<HashSet<String>> =
             RefCell::new(HashSet::new());
+
+        // v0.2.82 (WP-4a): keys registered to make the next `mock_get` return
+        // a NON-lock keychain Err (models a transient daemon read failure mid-
+        // request). One-shot, consumed on fire. Used to drive the hub `/env`
+        // `keychain_error` (503) vs `key_not_active` (404) distinction (T19).
+        static MOCK_FAIL_GET_KEYS: RefCell<HashSet<String>> =
+            RefCell::new(HashSet::new());
     }
 
     /// Enable the thread-local mock keychain for this thread.
@@ -1088,6 +1704,7 @@ pub mod for_tests {
             *cell.borrow_mut() = None;
         });
         MOCK_FAIL_KEYS.with(|cell| cell.borrow_mut().clear());
+        MOCK_FAIL_GET_KEYS.with(|cell| cell.borrow_mut().clear());
     }
 
     /// Empty the thread-local mock store without disabling it.
@@ -1103,6 +1720,20 @@ pub mod for_tests {
             }
         });
         MOCK_FAIL_KEYS.with(|cell| cell.borrow_mut().clear());
+        MOCK_FAIL_GET_KEYS.with(|cell| cell.borrow_mut().clear());
+    }
+
+    /// Register `key` to make the **next** `secrets::get` (any context) targeting
+    /// it return a NON-lock keychain `Err` (a `KeychainError::Other`). Models a
+    /// transient daemon read failure DURING a request — distinct from a
+    /// key-not-present miss. One-shot: consumed when it fires.
+    ///
+    /// The mock must be active. Used by the hub `/env` tests (T19) to drive the
+    /// `keychain_error` (503) vs `key_not_active` (404) distinction.
+    pub fn fail_next_get(key: &str) {
+        MOCK_FAIL_GET_KEYS.with(|cell| {
+            cell.borrow_mut().insert(key.to_string());
+        });
     }
 
     /// Register `key` (keychain username) to fail on the **next** `secrets::set`
@@ -1214,6 +1845,14 @@ pub mod for_tests {
         MOCK_STORE.with(|cell| {
             let slot = cell.borrow();
             slot.as_ref().map(|map| {
+                // v0.2.82: injected one-shot read failure (models a transient
+                // daemon error mid-request, NOT a miss). Consumed on fire.
+                let should_fail = MOCK_FAIL_GET_KEYS.with(|fc| fc.borrow_mut().remove(key));
+                if should_fail {
+                    return Err(format!(
+                        "mock keychain get failure injected for key: {key}"
+                    ));
+                }
                 let service = scope.service_name(module_id);
                 Ok(map.get(&(service, key.to_string())).cloned())
             })
@@ -2116,6 +2755,223 @@ mod tests {
             RAW_WRITE_NEEDLE,
             ALLOWED_FILE,
             offenders.join("\n  ")
+        );
+    }
+
+    // ─── v0.2.82 WP-4a (G5): lock-state honesty + cross-process pacing ────────
+
+    /// T18 — the headline. A `Background` read against a FAKE-LOCKED store
+    /// returns `KeychainError::Locked` WITHOUT reaching the keychain-access
+    /// stage — proven by the construction-counting seam staying at 0. The
+    /// SAME fake lock under `Interactive` PROCEEDS (skips the probe), reaching
+    /// the access stage (count increments) and resolving via the mock.
+    ///
+    /// FAIL-ON-BASE: base has no `CallContext` / no probe — a background read
+    /// would construct an Entry (or hit the mock) regardless of lock state, so
+    /// `Locked` is unreachable there. This test does not compile on base
+    /// (the API doesn't exist), which IS the fail-on-base proof for the new
+    /// surface; the behavioural fail-on-base is demonstrated in the throwaway
+    /// base worktree run recorded in the WP-4a report.
+    #[test]
+    fn background_read_on_locked_store_short_circuits_without_entry() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _g = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+        // Seed a value so a proceeding read would find something.
+        set(scope, "mod", "k", "v").unwrap();
+
+        // ACT: fake the store LOCKED, do a Background read.
+        ENTRY_CONSTRUCTION_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+        let _probe = TestProbeGuard::new(Some(true)); // locked
+        let bg = get_with_context(scope, "mod", "k", CallContext::Background);
+        assert_eq!(
+            bg,
+            Err(KeychainError::Locked),
+            "background read on a locked store must return Locked"
+        );
+        assert_eq!(
+            ENTRY_CONSTRUCTION_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a locked Background read must NOT reach the keychain-access stage \
+             (no Entry construction / no mock hit)"
+        );
+
+        // LEAVE-ALONE: Interactive with the SAME fake lock proceeds — it does
+        // not probe, reaches the access stage (count increments), resolves via
+        // the mock.
+        let inter = get_with_context(scope, "mod", "k", CallContext::Interactive);
+        assert_eq!(inter, Ok(Some("v".to_string())));
+        assert_eq!(
+            ENTRY_CONSTRUCTION_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an Interactive read proceeds to the access stage exactly once"
+        );
+    }
+
+    /// A Background read where the probe reports UNLOCKED proceeds normally.
+    #[test]
+    fn background_read_on_unlocked_store_proceeds() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _g = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+        set(scope, "mod", "k2", "v2").unwrap();
+        let _probe = TestProbeGuard::new(Some(false)); // unlocked
+        assert_eq!(
+            get_with_context(scope, "mod", "k2", CallContext::Background),
+            Ok(Some("v2".to_string())),
+        );
+    }
+
+    /// A Background read where the probe is INDETERMINATE (UNKNOWN → None)
+    /// proceeds — we cannot be stricter without breaking non-SecretService
+    /// setups.
+    #[test]
+    fn background_read_on_unknown_probe_proceeds() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _g = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+        set(scope, "mod", "k3", "v3").unwrap();
+        let _probe = TestProbeGuard::new(None); // UNKNOWN
+        assert_eq!(
+            get_with_context(scope, "mod", "k3", CallContext::Background),
+            Ok(Some("v3".to_string())),
+        );
+    }
+
+    /// `is_set_with_context` under a locked Background probe returns
+    /// `Err(Locked)` — NOT `Ok(false)`. A locked store cannot honestly claim a
+    /// key is absent (that would be a silent downgrade).
+    #[test]
+    fn background_is_set_on_locked_store_is_locked_not_false() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _g = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+        let _probe = TestProbeGuard::new(Some(true));
+        assert_eq!(
+            is_set_with_context(scope, "mod", "absent", CallContext::Background),
+            Err(KeychainError::Locked),
+        );
+    }
+
+    /// Back-compat: the un-suffixed `get` behaves as `Interactive` — it does
+    /// NOT probe, so a fake-locked store still resolves via the mock.
+    #[test]
+    fn plain_get_is_interactive_and_ignores_lock_probe() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _g = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+        set(scope, "mod", "bc", "bcv").unwrap();
+        let _probe = TestProbeGuard::new(Some(true)); // locked, but Interactive ignores it
+        assert_eq!(get(scope, "mod", "bc").unwrap().as_deref(), Some("bcv"));
+    }
+
+    /// `KeychainError::Locked` renders an honest, actionable message; the
+    /// `Other` variant carries its detail verbatim.
+    #[test]
+    fn keychain_error_display_is_honest() {
+        assert!(KeychainError::Locked
+            .to_string()
+            .contains("keychain is locked"));
+        assert_eq!(
+            KeychainError::Other("boom".into()).to_string(),
+            "boom"
+        );
+    }
+
+    /// T22 — `is_transient` matrix pin, extended for the G5c invariant:
+    /// `NoStorageAccess` (where keyring maps a dismissed unlock Prompt) is
+    /// NON-transient, so the PlatformFailure retry path can NEVER be reached by
+    /// a locked/prompt-dismissed store — no retry can re-pop the dialog.
+    #[test]
+    fn is_transient_no_storage_access_is_not_retried_g5c() {
+        let nsa: Box<dyn std::error::Error + Send + Sync> = "store locked / prompt dismissed".into();
+        assert!(
+            !is_transient(&keyring::Error::NoStorageAccess(nsa)),
+            "NoStorageAccess (dismissed-prompt / locked) must be NON-transient \
+             so no retry re-pops the unlock dialog (G5c)"
+        );
+        let pf: Box<dyn std::error::Error + Send + Sync> = "daemon hiccup".into();
+        assert!(
+            is_transient(&keyring::Error::PlatformFailure(pf)),
+            "only PlatformFailure is transient"
+        );
+        assert!(!is_transient(&keyring::Error::NoEntry));
+    }
+
+    /// T20 — cross-process flock pacing: two sequential paced calls through the
+    /// file gate write MONOTONIC timestamps to the pace file, and the second
+    /// pays the (test-shrunk) spacing. Uses an isolated temp pace path so no
+    /// real vct_root is touched.
+    #[cfg(unix)]
+    #[test]
+    fn cross_process_pace_writes_monotonic_timestamps() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let guard = TestPacePathGuard::new(dir.path().join("keyring.pace"));
+        let _sp = TestSpacingGuard::new(std::time::Duration::from_millis(30));
+
+        // First paced op establishes a timestamp.
+        with_cross_process_pace(|| ());
+        let t1 = guard.pace_timestamp().expect("pace file has a timestamp");
+
+        // Second op back-to-back must pay ≥~20ms spacing and write a later ts.
+        let start = std::time::Instant::now();
+        with_cross_process_pace(|| ());
+        let elapsed = start.elapsed();
+        let t2 = guard.pace_timestamp().expect("pace file still has a timestamp");
+
+        assert!(t2 >= t1, "pace timestamps must be monotonic: {t2} >= {t1}");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(20),
+            "back-to-back paced op must wait ~spacing; got {:?}",
+            elapsed
+        );
+        assert_eq!(guard.warn_count(), 0, "healthy pace path must not warn");
+    }
+
+    /// T20 (fallback leg) — an UNWRITABLE pace path degrades to in-process
+    /// pacing with EXACTLY ONE warn, and the op still runs (soft-fail, never a
+    /// hard block on the user's secret read).
+    #[cfg(unix)]
+    #[test]
+    fn cross_process_pace_unwritable_path_warns_once_and_proceeds() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        // A file used AS a directory parent → create_dir_all + open both fail.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir.path().join("iamafile");
+        std::fs::write(&blocker, b"x").unwrap();
+        // pace path = <file>/sub/keyring.pace — parent creation fails because
+        // `blocker` is a regular file, not a directory.
+        let guard = TestPacePathGuard::new(blocker.join("sub").join("keyring.pace"));
+
+        let mut ran = false;
+        with_cross_process_pace(|| ran = true);
+        assert!(ran, "op must still run when the pace file is unwritable");
+        assert_eq!(
+            guard.warn_count(),
+            1,
+            "an unwritable pace path must warn exactly once (one-shot latch)"
+        );
+
+        // A second attempt must NOT warn again (one-shot).
+        with_cross_process_pace(|| ());
+        assert_eq!(guard.warn_count(), 1, "the degrade warn is one-shot per latch");
+    }
+
+    /// The Linux lock probe, run for real against whatever Secret-Service (if
+    /// any) is on the test host, must NEVER panic and must return one of the
+    /// three documented states. Ignored in headless CI (no D-Bus session);
+    /// run locally with `--ignored` for a live check.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a live D-Bus session bus; run locally with --ignored"]
+    fn live_lock_probe_returns_a_tristate() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        // No override → the real D-Bus probe. Must be Some(true)/Some(false)/None.
+        let r = probe_default_collection_locked();
+        assert!(
+            matches!(r, Some(true) | Some(false) | None),
+            "probe returned an impossible value: {r:?}"
         );
     }
 }

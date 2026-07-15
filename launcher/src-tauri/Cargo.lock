@@ -5372,6 +5372,7 @@ version = "0.2.81"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "dbus-secret-service",
  "directories",
  "dunce",
  "gethostname",

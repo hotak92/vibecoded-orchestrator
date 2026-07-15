@@ -834,6 +834,32 @@ pub fn resolve_active_user_secret_pairs_for_requester(
     project_id: &str,
     requester_project_id: &str,
 ) -> Vec<(String, String)> {
+    // Back-compat wrapper: existing callers (tests + any Interactive caller)
+    // ignore the degradation signal. The hub uses the `_with_degraded` twin.
+    resolve_active_user_secret_pairs_for_requester_with_degraded(
+        own_db,
+        project_id,
+        requester_project_id,
+    )
+    .0
+}
+
+/// Same as [`resolve_active_user_secret_pairs_for_requester`] but also returns
+/// a `keychain_degraded` flag: `true` when a NON-lock keychain error was hit
+/// while reading any key (so the caller can surface an honest degraded state
+/// rather than silently omitting the key). Reads run in `Background` context —
+/// this helper serves the hub `/env` resolution, never a user click.
+///
+/// v0.2.82 (WP-4a): the keychain read used to be `if let Ok(Some(val))`, which
+/// swallowed a LOCKED / errored store as an ordinary miss (a silent downgrade).
+/// The hub now probes lock state once per request BEFORE calling this, so a
+/// locked store never reaches here; a per-key `Err` that DOES slip through
+/// (transient daemon error mid-request) flips the degraded flag.
+pub fn resolve_active_user_secret_pairs_for_requester_with_degraded(
+    own_db: &Db,
+    project_id: &str,
+    requester_project_id: &str,
+) -> (Vec<(String, String)>, bool) {
     fn resolve_one_bucket(
         own_db: &Db,
         keys: &[String],
@@ -841,6 +867,7 @@ pub fn resolve_active_user_secret_pairs_for_requester(
         slot_project_id: &str,
         requester_project_id: &str,
         out: &mut Vec<(String, String)>,
+        degraded: &mut bool,
     ) {
         for key in keys {
             // First-bucket-wins on collisions.
@@ -867,9 +894,26 @@ pub fn resolve_active_user_secret_pairs_for_requester(
                     project_id: slot_project_id,
                 },
             };
-            if let Ok(Some(val)) = crate::secrets::get(scope, "user", key) {
-                if !val.trim().is_empty() {
-                    out.push((key.clone(), val));
+            match crate::secrets::get_with_context(
+                scope,
+                "user",
+                key,
+                crate::secrets::CallContext::Background,
+            ) {
+                Ok(Some(val)) => {
+                    if !val.trim().is_empty() {
+                        out.push((key.clone(), val));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    // Never silently omit: a real keychain error marks the
+                    // whole resolution degraded so the hub surfaces it.
+                    eprintln!(
+                        "[vct-secrets] WARN: keychain read failed for user secret \
+                         {key:?} ({scope_str}): {e} — resolution marked degraded"
+                    );
+                    *degraded = true;
                 }
             }
         }
@@ -881,6 +925,7 @@ pub fn resolve_active_user_secret_pairs_for_requester(
 
     let mut out: Vec<(String, String)> =
         Vec::with_capacity(per_project_keys.len() + shared_keys.len() + global_keys.len());
+    let mut degraded = false;
     resolve_one_bucket(
         own_db,
         &per_project_keys,
@@ -888,6 +933,7 @@ pub fn resolve_active_user_secret_pairs_for_requester(
         project_id,
         requester_project_id,
         &mut out,
+        &mut degraded,
     );
     // GAP-2 (2026-07-14): the requester project can bulk opt out of ALL
     // user-shared secrets via the `shared_secrets_read_disabled` gate
@@ -907,6 +953,7 @@ pub fn resolve_active_user_secret_pairs_for_requester(
             "_user_shared_",
             requester_project_id,
             &mut out,
+            &mut degraded,
         );
     }
     resolve_one_bucket(
@@ -916,8 +963,9 @@ pub fn resolve_active_user_secret_pairs_for_requester(
         "_global_",
         requester_project_id,
         &mut out,
+        &mut degraded,
     );
-    out
+    (out, degraded)
 }
 
 #[cfg(test)]
