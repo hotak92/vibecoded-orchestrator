@@ -290,6 +290,76 @@ case "$forbidden_err" in
     *) assert_eq "1" "0" "test_vct_secrets_resolve_forbidden_msg_is_honest (got: $forbidden_err)" ;;
 esac
 
+# ── Test 4c (v0.2.82 WP-4a): 503 keychain_locked → exit 6, honest msg ────
+# A LOCKED OS keychain must classify distinctly (exit 6) rather than the
+# pre-fix "hub unreachable" (exit 1) catch-all mislabel. With no file store
+# / .env copy, exit 6 surfaces after the fallback chain also misses.
+cat >"$scratch/responses/GET_projects_p1_env_key=LOCKED_KEY.json.status" <<'STATUS'
+503
+STATUS
+cat >"$scratch/responses/GET_projects_p1_env_key=LOCKED_KEY.json" <<'JSON'
+{"error": {"code": "keychain_locked", "message": "OS keychain is locked"}}
+JSON
+
+set +e
+locked_err=$(VCT_HUB_PORT="$HUB_PORT" VCT_SECRETS_DIR="$scratch/empty-store" "$RESOLVER" p1 LOCKED_KEY 2>&1 1>/dev/null)
+rc=$?
+set -e
+assert_eq "$rc" "6" "test_vct_secrets_resolve_exits_6_when_keychain_locked"
+case "$locked_err" in
+    *"keychain"*"locked"*) assert_eq "0" "0" "test_vct_secrets_resolve_locked_msg_is_honest" ;;
+    *) assert_eq "1" "0" "test_vct_secrets_resolve_locked_msg_is_honest (got: $locked_err)" ;;
+esac
+
+# ── Test 4d (v0.2.82 WP-4a): 503 keychain_error → exit 6, per-key msg ────
+# A per-key non-lock keychain read failure also classifies as exit 6, but
+# the message names the per-key read failure, not "the whole store is
+# locked".
+cat >"$scratch/responses/GET_projects_p1_env_key=UNREADABLE_KEY.json.status" <<'STATUS'
+503
+STATUS
+cat >"$scratch/responses/GET_projects_p1_env_key=UNREADABLE_KEY.json" <<'JSON'
+{"error": {"code": "keychain_error", "message": "per-key read failed"}}
+JSON
+
+set +e
+unreadable_err=$(VCT_HUB_PORT="$HUB_PORT" VCT_SECRETS_DIR="$scratch/empty-store" "$RESOLVER" p1 UNREADABLE_KEY 2>&1 1>/dev/null)
+rc=$?
+set -e
+assert_eq "$rc" "6" "test_vct_secrets_resolve_exits_6_when_keychain_error"
+case "$unreadable_err" in
+    *"unreadable"*) assert_eq "0" "0" "test_vct_secrets_resolve_keychain_error_msg_is_honest" ;;
+    *) assert_eq "1" "0" "test_vct_secrets_resolve_keychain_error_msg_is_honest (got: $unreadable_err)" ;;
+esac
+
+# ── Test 4e (v0.2.82 WP-4a): 503 keychain_locked still falls to store ───
+# The keychain is an INDEPENDENT store from ~/.vct-secrets, so a locked
+# keychain must NOT strand a file-store copy — tier 2 still answers (exit 0).
+echo -n "synthetic-store-copy-while-locked" >"$VCT_SECRETS_DIR/shared/LOCKED_KEY"
+set +e
+out=$(VCT_HUB_PORT="$HUB_PORT" "$RESOLVER" p1 LOCKED_KEY 2>/dev/null)
+rc=$?
+set -e
+assert_eq "$rc" "0" "test_chain_keychain_locked_falls_to_file_store/exit_code"
+assert_eq "$out" "synthetic-store-copy-while-locked" "test_chain_keychain_locked_falls_to_file_store/value"
+rm -f "$VCT_SECRETS_DIR/shared/LOCKED_KEY"
+
+# ── Test 4f (v0.2.82 WP-4a): other 503 stays exit 1 (hub unreachable) ───
+# Only keychain_locked / keychain_error map to exit 6; any OTHER 503 keeps
+# the catch-all exit 1.
+cat >"$scratch/responses/GET_projects_p1_env_key=MISCONF_KEY.json.status" <<'STATUS'
+503
+STATUS
+cat >"$scratch/responses/GET_projects_p1_env_key=MISCONF_KEY.json" <<'JSON'
+{"error": {"code": "service_misconfigured", "message": "no KG binding"}}
+JSON
+
+set +e
+VCT_HUB_PORT="$HUB_PORT" VCT_SECRETS_DIR="$scratch/empty-store" "$RESOLVER" p1 MISCONF_KEY 2>/dev/null
+rc=$?
+set -e
+assert_eq "$rc" "1" "test_vct_secrets_resolve_other_503_stays_exit_1"
+
 # ── Test 5: by-path resolution, then read ───────────────────────────────
 # Encode the test path the way the resolver does.
 test_folder="/tmp/test-folder-$$"

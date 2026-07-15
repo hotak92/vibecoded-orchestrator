@@ -18,9 +18,12 @@ parse cases. Auto-skipped when no PowerShell runtime (``pwsh`` /
 """
 from __future__ import annotations
 
+import contextlib
+import http.server
 import shutil
 import socket
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -159,3 +162,116 @@ def test_never_prints_values_on_miss(tmp_path, secrets_dir, dotenv_proj):
         assert leaked not in combined
     # Miss diagnostic names the tiers consulted.
     assert "tier 1" in cp.stderr and "tier 3" in cp.stderr
+
+
+# ─── v0.2.82 WP-4a/4b: live-hub 503 keychain-state behaviour ────────────
+#
+# The dead-port tests above only exercise tier-1-unreachable → file-store /
+# .env. To pin the NEW 503 keychain_locked / keychain_error classification
+# (exit 6) at RUNTIME — and the Invoke-Hub fix that makes error-status arms
+# reachable on pwsh 7 / .NET Core at all — we spin up a tiny fake hub that
+# returns a canned 503, the same way the .sh suite does.
+
+
+@contextlib.contextmanager
+def _fake_hub(status: int, body: str):
+    """Serve exactly one canned (status, body) for any GET; yields the port."""
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a, **k):  # noqa: D401 — silence the fake hub
+            pass
+
+        def do_GET(self):  # noqa: N802 — http.server API
+            payload = body.encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _H)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield port
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def _run_resolver_live(
+    tmp_path: Path, arg1: str, key: str, secrets_dir: Path, port: int
+) -> subprocess.CompletedProcess:
+    """Invoke the ps1 resolver against a LIVE hub on ``port`` (token via env)."""
+    import os
+
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": str(tmp_path / "home"),
+        "VCT_HUB_PORT": str(port),
+        "VCT_STATE_DIR": str(tmp_path / "empty-state"),
+        "VCT_HUB_TOKEN": "canary-token",
+        "VCT_SECRETS_DIR": str(secrets_dir),
+    }
+    (tmp_path / "home").mkdir(exist_ok=True)
+    return subprocess.run(
+        [_PWSH, "-NoProfile", "-NonInteractive", "-File", str(RESOLVER), arg1, key],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+
+
+def test_live_503_keychain_locked_exits_6(tmp_path, secrets_dir):
+    """A hub 503 keychain_locked → exit 6 (NOT the pre-fix exit-1 catch-all),
+    with an honest message naming the lock state."""
+    body = '{"error": {"code": "keychain_locked", "message": "OS keychain is locked"}}'
+    with _fake_hub(503, body) as port:
+        cp = _run_resolver_live(tmp_path, "p1", "LOCKED_KEY", secrets_dir, port)
+    assert cp.returncode == 6, f"stderr={cp.stderr}"
+    low = cp.stderr.lower()
+    assert "keychain" in low and "locked" in low
+
+
+def test_live_503_keychain_error_exits_6(tmp_path, secrets_dir):
+    """A per-key 503 keychain_error → exit 6, message names the per-key read
+    failure (not the whole-store lock)."""
+    body = '{"error": {"code": "keychain_error", "message": "per-key read failed"}}'
+    with _fake_hub(503, body) as port:
+        cp = _run_resolver_live(tmp_path, "p1", "UNREADABLE_KEY", secrets_dir, port)
+    assert cp.returncode == 6, f"stderr={cp.stderr}"
+    assert "unreadable" in cp.stderr.lower()
+
+
+def test_live_503_keychain_locked_falls_to_file_store(tmp_path, secrets_dir):
+    """The keychain is independent of ~/.vct-secrets — a locked keychain must
+    NOT strand a file-store copy (exit 0, value returned)."""
+    (secrets_dir / "shared" / "LOCKED_KEY").write_text(
+        "store-copy-while-locked", encoding="utf-8"
+    )
+    body = '{"error": {"code": "keychain_locked", "message": "locked"}}'
+    with _fake_hub(503, body) as port:
+        cp = _run_resolver_live(tmp_path, "p1", "LOCKED_KEY", secrets_dir, port)
+    assert cp.returncode == 0, f"stderr={cp.stderr}"
+    assert cp.stdout == "store-copy-while-locked"
+
+
+def test_live_other_503_stays_exit_1(tmp_path, secrets_dir):
+    """Only keychain_locked / keychain_error map to exit 6; any OTHER 503
+    keeps the historical exit 1."""
+    body = '{"error": {"code": "service_misconfigured", "message": "no KG binding"}}'
+    with _fake_hub(503, body) as port:
+        cp = _run_resolver_live(tmp_path, "p1", "MISCONF_KEY", secrets_dir, port)
+    assert cp.returncode == 1, f"stderr={cp.stderr}"
+
+
+def test_live_404_key_not_active_still_exit_3(tmp_path, secrets_dir):
+    """Regression guard: the Invoke-Hub body-read fix must not perturb the
+    404 key_not_active → exit 3 mapping (it was ALSO unreachable pre-fix on
+    pwsh 7, so this pins the intended behaviour)."""
+    body = '{"error": {"code": "key_not_active", "message": "paused"}}'
+    with _fake_hub(404, body) as port:
+        cp = _run_resolver_live(tmp_path, "p1", "PAUSED_KEY", secrets_dir, port)
+    assert cp.returncode == 3, f"stderr={cp.stderr}"

@@ -18,10 +18,13 @@
 #           the miss diagnostic says so).
 #
 # Fall-through: tier 1 -> 2 on hub unreachable / project not registered /
-# 401 / key_not_active; tier 2 -> 3 on file absent/unreadable. All-miss
-# -> non-zero exit preserving the tier-1 exit-code contract below (exit
-# 3 `key_not_active` only after tiers 2 and 3 also missed). Errors name
-# the KEY and the tiers consulted -- NEVER the value.
+# 401 / key_not_active / 403 forbidden / 503 keychain_locked |
+# keychain_error (the OS keychain is locked/unreadable -- the file store
+# never depended on it, so a locked keychain must not strand a file-store
+# key); tier 2 -> 3 on file absent/unreadable. All-miss -> non-zero exit
+# preserving the tier-1 exit-code contract below (exit 3 `key_not_active`
+# only after tiers 2 and 3 also missed). Errors name the KEY and the tiers
+# consulted -- NEVER the value.
 #
 # Tier-3 parsing rule (identical x3): line-oriented; accept `KEY=VALUE`
 # and `export KEY=VALUE`; strip one matching pair of single/double
@@ -38,6 +41,8 @@
 #         3  key not active for this project
 #         4  key not found in hub response
 #         5  forbidden (hub refused the token on /env; scoped token required)
+#         6  keychain locked/unreadable (hub 503 keychain_locked or
+#            keychain_error; unlock the login keychain or open the launcher)
 #       Non-zero codes mean the key ALSO missed the file store and the
 #       project `.env`.
 #
@@ -169,12 +174,27 @@ function Invoke-Hub {
         }
         return $null  # connection refused / DNS / etc.
     } catch {
-        # Newer .NET wraps the same in System.Net.Http.HttpRequestException.
-        if ($_.Exception.Response) {
-            $resp = $_.Exception.Response
+        # Newer .NET (PowerShell 7 / .NET Core) wraps an HTTP error status in
+        # System.Net.Http.HttpRequestException. The response object is already
+        # DISPOSED by the time the exception propagates, so reading the body
+        # via `$resp.Content.ReadAsStringAsync().Result` throws "Cannot access
+        # a disposed object" — which, under `$ErrorActionPreference='Stop'`,
+        # aborts the resolver with a bare exit 1 and NO status classification
+        # (every error-status arm — 403 / 404 / 503 — was unreachable on
+        # pwsh 7). Instead read the body PowerShell already captured for us in
+        # `$_.ErrorDetails.Message` (verbatim response body on a failed
+        # Invoke-WebRequest) and the status from the still-readable
+        # `$_.Exception.Response.StatusCode`. This makes the 404/403/503 arms
+        # actually reach their switch on modern .NET. Verified 2026-07-15
+        # against pwsh 7 with a fake 503 hub.
+        $resp = $_.Exception.Response
+        if ($null -ne $resp) {
+            $status = [int]$resp.StatusCode
+            $body = $_.ErrorDetails.Message
+            if ($null -eq $body) { $body = "" }
             return @{
-                Status = [int]$resp.StatusCode
-                Body   = ($resp.Content.ReadAsStringAsync().Result)
+                Status = $status
+                Body   = $body
             }
         }
         return $null
@@ -327,6 +347,40 @@ function Read-KeyHub {
             # tiers), so exit 5 only surfaces if those also miss.
             Write-Err "hub returned 403 forbidden for $Key (project $pid_): the global hub.token is refused on /env (per-project token required) or a token for another project was presented. Present the scoped hub.token.$pid_, or set VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to reopen the compat window."
             return @{ ExitCode = 5 }
+        }
+        503 {
+            # v0.2.82 WP-4a: the hub reached its keychain but could NOT read
+            # it. `keychain_locked` — the whole OS keychain is locked (refused
+            # for both the full-env and ?key= forms before any Entry is
+            # built); `keychain_error` — a per-key non-lock keychain read
+            # failed on this ?key= lookup. Both are UNAVAILABILITY of tier 1's
+            # backing store, NOT an authorization decision (unlike the 404
+            # key_not_active arm above), so they classify distinctly as exit 6
+            # with an HONEST message naming the lock/error state — NOT the
+            # misleading "hub unreachable" the Default arm would emit. The
+            # outer chain still consults the file store + project .env
+            # (INDEPENDENT sanctioned stores that never depended on the
+            # keychain), so exit 6 only surfaces if those also miss. Any OTHER
+            # 503 keeps the Default arm's exit 1. Mirrors the .sh `503)` arm
+            # and agent_secrets.py's 503 branch.
+            try {
+                $obj = $result.Body | ConvertFrom-Json
+                $code503 = $obj.error.code
+            } catch { $code503 = "unknown" }
+            switch ($code503) {
+                "keychain_locked" {
+                    Write-Err "hub could not read the OS keychain for $Key (project $pid_): the login keychain is locked — unlock the login keychain or open the launcher to restore secret resolution."
+                    return @{ ExitCode = 6 }
+                }
+                "keychain_error" {
+                    Write-Err "hub could not read the OS keychain for $Key (project $pid_): a per-key keychain read failed (the key may exist but is currently unreadable) — unlock the login keychain or open the launcher to restore secret resolution."
+                    return @{ ExitCode = 6 }
+                }
+                Default {
+                    Write-Err "hub returned status 503 (code $code503); body=$($result.Body)"
+                    return @{ ExitCode = 1 }
+                }
+            }
         }
         400 {
             Write-Err "hub rejected request: $($result.Body)"

@@ -18,8 +18,11 @@
 #
 # Fall-through: tier 1 → 2 on hub unreachable / project not registered /
 # 401 / key_not_active (the hub cannot distinguish "paused" from "never
-# declared", and the file store is an independent store); tier 2 → 3 on
-# file absent/unreadable. All-miss → non-zero exit preserving the tier-1
+# declared", and the file store is an independent store) / 403 forbidden /
+# 503 keychain_locked | keychain_error (the OS keychain is
+# locked/unreadable — the file store never depended on it, so a locked
+# keychain must not strand a file-store key); tier 2 → 3 on file
+# absent/unreadable. All-miss → non-zero exit preserving the tier-1
 # exit-code contract below (exit 3 `key_not_active` is only returned
 # after tiers 2 and 3 also missed). Errors name the KEY and the tiers
 # consulted — NEVER the value.
@@ -38,7 +41,11 @@
 #                   3=key not active for this project, 4=key not found
 #                   in the hub's response (treated like 3 for callers),
 #                   5=forbidden (hub refused the token on /env — scoped
-#                   hub.token.<id> required / wrong project).
+#                   hub.token.<id> required / wrong project),
+#                   6=keychain locked/unreadable (hub 503 keychain_locked
+#                   or keychain_error — the OS keychain is locked or a
+#                   per-key read failed; unlock the login keychain or open
+#                   the launcher).
 #                   Non-zero codes mean the key ALSO missed the file
 #                   store and the project `.env`.
 #
@@ -440,6 +447,40 @@ read_key_hub() {
             err "hub returned 403 forbidden for $key (project $pid): the global hub.token is refused on /env (per-project token required) or a token for another project was presented. Present the scoped hub.token.$pid, or set VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to reopen the compat window."
             return 5
             ;;
+        503)
+            # v0.2.82 WP-4a: the hub reached its keychain but could NOT read
+            # it. `keychain_locked` — the whole OS keychain is locked (refused
+            # for both the full-env and ?key= forms before any Entry is
+            # built); `keychain_error` — a per-key non-lock keychain read
+            # failed on this ?key= lookup. Both are UNAVAILABILITY of tier 1's
+            # backing store, NOT an authorization decision (unlike the 404
+            # key_not_active arm above), so they classify distinctly as exit 6
+            # with an HONEST message naming the lock/error state — NOT the
+            # misleading "hub unreachable" the catch-all would emit. The outer
+            # read_key chain still consults the file store (tier 2) + project
+            # .env (tier 3) — INDEPENDENT sanctioned stores that never
+            # depended on the keychain — so a locked keychain does not strand
+            # a file-store key; exit 6 only surfaces if those also miss. Any
+            # OTHER 503 (e.g. a future service_misconfigured) keeps the
+            # catch-all exit 1. Mirrors `agent_secrets.py`'s 503 branch and
+            # `vct_secrets_resolve.ps1`'s `503 {` arm.
+            local code503
+            code503=$(json_extract "$body" '.error.code')
+            case "$code503" in
+                keychain_locked)
+                    err "hub could not read the OS keychain for $key (project $pid): the login keychain is locked — unlock the login keychain or open the launcher to restore secret resolution."
+                    return 6
+                    ;;
+                keychain_error)
+                    err "hub could not read the OS keychain for $key (project $pid): a per-key keychain read failed (the key may exist but is currently unreadable) — unlock the login keychain or open the launcher to restore secret resolution."
+                    return 6
+                    ;;
+                *)
+                    err "hub returned status 503 (code $code503); body=$body"
+                    return 1
+                    ;;
+            esac
+            ;;
         400)
             err "hub rejected request: $body"
             return 4
@@ -626,6 +667,7 @@ Exit codes (non-zero = key ALSO missed the file store + project .env):
   3  key not active for this project
   4  key not found in hub response
   5  forbidden (hub refused the token on /env; scoped token required)
+  6  keychain locked/unreadable (hub 503; unlock login keychain / open launcher)
 EOF
         exit 64
     fi
