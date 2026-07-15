@@ -68,6 +68,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The PowerShell secrets resolver's error-status arms (403/404/503) were
   unreachable on pwsh 7 (disposed-response read aborted the script);
   errors are now classified from the captured error body.
+- The credential scanner (post-tool-security hook) alerted on PEM *marker
+  literals* (pattern tables, write-guard stub fixtures) on every edit and
+  re-toasted identical alerts per edit. PEM detection now requires a
+  plausible key body (≥120 base64 chars — catches real EC P-256 keys the
+  earlier draft's 256 floor missed, ignores stubs), and the desktop toast
+  dedupes per (file, patterns) with a 6h TTL while the forensic JSONL log
+  and the model-facing alert stay per-event. Both .sh and .ps1 siblings.
+- The search MCP wrapper no longer discards the secrets resolver's stderr
+  and now classifies the forbidden / keychain-locked exit codes, so a
+  locked keychain reaches the operator instead of failing silently.
 
 ## [0.2.81] - 2026-07-15
 
