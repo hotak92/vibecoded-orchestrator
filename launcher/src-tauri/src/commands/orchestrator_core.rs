@@ -379,10 +379,20 @@ pub async fn code_graph_reanalyze_current(
         .get_project(&project_id)?
         .ok_or_else(|| format!("project {} not found", project_id))?;
 
+    // v0.2.82 (WP-3 G3 task 1, pipeline J): feed the CANONICAL code-graph
+    // identity, not the raw display name — the SSOT helper resolves the binding
+    // prefix (== what per-edit hooks stamp) so this reanalyze does not mint a
+    // second identity's worth of duplicate rows.
+    let identity = crate::commands::codegraph::resolve_codegraph_identity(
+        &db,
+        &project_id,
+        &project.name,
+    );
+
     let mut cmd = build_script_command(&folder, "code-graph-analyze")?;
     cmd.arg(".")
         .arg("--project")
-        .arg(&project.name)
+        .arg(&identity)
         .arg("--incremental")
         .arg("--prune-stale");
 
@@ -431,10 +441,19 @@ pub async fn code_graph_prune_stale(
         .get_project(&project_id)?
         .ok_or_else(|| format!("project {} not found", project_id))?;
 
+    // v0.2.82 (WP-3 G3 task 1, pipeline L): CANONICAL identity — same SSOT as
+    // pipeline J above. A prune-stale walk that stamped the display name would
+    // reap the hook-identity rows; feed the binding prefix so both writers agree.
+    let identity = crate::commands::codegraph::resolve_codegraph_identity(
+        &db,
+        &project_id,
+        &project.name,
+    );
+
     let mut cmd = build_script_command(&folder, "code-graph-analyze")?;
     cmd.arg(".")
         .arg("--project")
-        .arg(&project.name)
+        .arg(&identity)
         .arg("--prune-stale");
 
     let started = std::time::Instant::now();
