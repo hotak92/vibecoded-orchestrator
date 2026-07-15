@@ -190,6 +190,27 @@ class _Coll:
         # Back-reference to the owning client for cross-collection ref
         # resolution; set by _Client (None for stand-alone collections).
         self.client: Optional["_Client"] = None
+        # v0.2.82 live-dry-run fix: when set, the fake enforces the LIVE
+        # semantics that requesting a non-schema property fails the whole
+        # iterate (GRPC "no such prop"), and exposes the schema via
+        # `config.get().properties` for the migration's probe. None keeps
+        # the pre-fix permissive behavior (probe soft-fails → full list).
+        self.schema_props: Optional[set] = None
+
+    @property
+    def config(self):
+        coll = self
+
+        class _Cfg:
+            def get(self):
+                if coll.schema_props is None:
+                    raise RuntimeError("no schema configured on this fake")
+                return types.SimpleNamespace(
+                    properties=[types.SimpleNamespace(name=n)
+                                for n in sorted(coll.schema_props)]
+                )
+
+        return _Cfg()
 
     # B2: the REAL weaviate-client v4.21 Collection.iterator has NO `filters`
     # kwarg. The fake MUST mirror that signature so a regression that re-adds a
@@ -198,6 +219,14 @@ class _Coll:
     def iterator(self, include_vector=False, return_metadata=None,
                  return_properties=None, return_references=None, after=None,
                  cache_size=None):
+        if self.schema_props is not None and return_properties:
+            missing = [p for p in return_properties
+                       if p not in self.schema_props]
+            if missing:
+                raise RuntimeError(
+                    f"no such prop with name '{missing[0]}' found in class "
+                    f"'{self.name}' in the schema."
+                )
         for u, row in list(self.rows.items()):
             props = dict(row["properties"])
             if return_properties:
@@ -1004,3 +1033,58 @@ def _assert_no_embedder(monkeypatch):
                     assert bad not in low, (
                         f"vector purity violation: import of {n!r} in codegraph_vector_copy"
                     )
+
+
+# ───────── v0.2.82 live-dry-run fix: legacy schema without file_path ─────────
+# Found by the FIRST live dry-run on the incident machine: pre-.82
+# CodeAPI/CodeInteraction collections lack the NEW `file_path` property (the
+# analyzer's ensure-props adds it on the first post-update run, which happens
+# AFTER the pre-build migration). Requesting it 422'd the whole iterate, the
+# per-collection soft-fail swallowed it, and the summary said failures=0 over
+# two collections it never read.
+
+
+def test_legacy_schema_without_file_path_iterates_and_leaves_rows():
+    """A pre-.82 CodeAPI collection (no `file_path` in schema) must still be
+    READ (props filtered to schema-present ones); its spaced rows fall into
+    LEFT+counted via the self-neutralizing UUID-reproduction check — never a
+    collection-wide silent skip. FAILS on the pre-fix code (iterate raises →
+    swallowed → left==0, failures==0)."""
+    api = _Coll("P_CodeAPI", {
+        "api-1": {
+            "properties": {
+                "project": "Old Name", "project_source": "/src",
+                "endpoint": "/x", "method": "GET",
+            },
+            "vector": _named_vec(1.0), "references": None,
+        },
+    })
+    # The REAL pre-.82 API schema surface: no `file_path`.
+    api.schema_props = {"project", "project_source", "endpoint", "method"}
+    client = _empty_five("P", {"CodeAPI": api})
+    summary = vc.migrate_project_identity(
+        client, "P", "Old Name", "NewName", dry_run=True,
+        uuid_builder=lambda *a, **k: "never-matching-uuid",
+    )
+    assert summary.failures == 0, summary.summary_line()
+    assert summary.left >= 1, (
+        "legacy-schema API row must be LEFT+counted, not silently skipped: "
+        + summary.summary_line()
+    )
+
+
+def test_iterate_failure_counts_into_failures():
+    """An unreadable collection is a coverage FAILURE, not a clean skip — the
+    machine-readable summary must never report all-zero success over a
+    collection it could not read. FAILS on the pre-fix code (warning only,
+    failures==0)."""
+    class _BoomColl(_Coll):
+        def iterator(self, *a, **k):
+            raise RuntimeError("boom (injected iterate failure)")
+
+    boom = _BoomColl("P_CodeFunction", {})
+    client = _empty_five("P", {"CodeFunction": boom})
+    summary = vc.migrate_project_identity(
+        client, "P", "Old Name", "NewName", dry_run=True,
+    )
+    assert summary.failures >= 1, summary.summary_line()

@@ -575,6 +575,19 @@ def _iter_project_rows(coll, base: str, old_identity: str):
     error the caller's per-collection try/except soft-fails the collection.
     """
     want_props = _row_return_properties(base)
+    # v0.2.82 live-dry-run fix: requesting a property the LIVE schema lacks
+    # 422s the whole iterate. `file_path` on CodeAPI/CodeInteraction is a NEW
+    # v0.2.82 schema property — pre-.82 collections don't have it until the
+    # analyzer's ensure-props runs post-update, and the pre-build migration
+    # runs BEFORE the analyzer. Probe the schema (same pattern as
+    # codegraph_prune) and request only present props; a row missing its path
+    # prop then simply fails UUID reproduction and is LEFT + counted (the
+    # self-neutralizing reconstruction check — never a wrong mint).
+    try:
+        schema_props = {p.name for p in coll.config.get().properties}
+        want_props = [p for p in want_props if p in schema_props]
+    except Exception:  # noqa: BLE001 — probe is best-effort; keep full list
+        pass
     for obj in coll.iterator(return_properties=want_props):
         props = getattr(obj, "properties", None) or {}
         if props.get("project") != old_identity:
@@ -730,6 +743,11 @@ def migrate_project_identity(
             logger.warning(
                 "identity migration: iterate %s failed: %s", coll_name, exc
             )
+            # v0.2.82 live-dry-run fix: an unreadable collection is a FAILURE
+            # of the migration's coverage, not a clean skip — count it so the
+            # machine-readable summary can never report all-zero success over
+            # a collection it could not even read (honest-signal rule).
+            counters["failures"] += 1
             continue
 
         plans: List[_RowPlan] = []
