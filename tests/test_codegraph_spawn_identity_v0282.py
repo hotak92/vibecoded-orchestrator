@@ -29,8 +29,11 @@ _RS_ROOT = REPO_ROOT / "launcher" / "src-tauri"
 
 _CODEGRAPH_RS = _RS_ROOT / "src" / "commands" / "codegraph.rs"
 _ORCH_CORE_RS = _RS_ROOT / "src" / "commands" / "orchestrator_core.rs"
+# v0.2.82 coordinator follow-up (WP-3 flagged it as out-of-scope): the
+# Re-analyze modal surface also spawns the analyzer and must use the SSOT.
+_REANALYZE_RS = _RS_ROOT / "src" / "commands" / "codegraph_reanalyze.rs"
 
-_OWNED_FILES = (_CODEGRAPH_RS, _ORCH_CORE_RS)
+_OWNED_FILES = (_CODEGRAPH_RS, _ORCH_CORE_RS, _REANALYZE_RS)
 
 
 def _read(path: Path) -> str:
@@ -99,6 +102,24 @@ def test_no_raw_display_name_fed_to_project_flag() -> None:
 
 
 # ── Every `--project` feed site routes through the resolved identity ────────
+
+def test_reanalyze_surface_resolves_identity() -> None:
+    """The Re-analyze modal (7th surface) resolves the canonical identity
+    before spawning — `run_reanalysis_with_stream` must be fed the resolved
+    `identity`, never `project.name` raw."""
+    content = _read(_REANALYZE_RS)
+    assert "resolve_codegraph_identity" in content, (
+        "codegraph_reanalyze.rs no longer resolves the canonical identity — "
+        "the Re-analyze button would stamp display-name rows again "
+        "(dual-writer duplicate UUIDs)."
+    )
+    assert re.search(
+        r"run_reanalysis_with_stream\(\s*&identity\b", content
+    ), "run_reanalysis_with_stream must receive the resolved identity"
+    assert not re.search(
+        r"run_reanalysis_with_stream\(\s*&project\.name\b", content
+    ), "raw project.name fed to the reanalyze spawn"
+
 
 def test_orchestrator_core_surfaces_resolve_identity() -> None:
     """Both orchestrator_core spawn surfaces (reanalyze J + prune-stale L) call

@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`vco_lib/codegraph_guards.py`** — ONE decision home for SKIP / STAMP /
+  EMBED per code-graph row (content-hash + embed-revision + compatibility
+  floor). The analyzer, the resync driver's stale counting, and the chunk
+  writer all delegate to it; a metadata-only revision bump now costs one
+  re-walk and ZERO embeds across every collection type, including
+  multi-chunk entities (previously Module/API/Interaction embedded eagerly
+  and chunked entities re-embedded every chunk).
+- **`vco_lib/codegraph_vector_copy.py`** — row-level vector-copy primitive
+  (named vectors round-tripped verbatim, confirm-before-delete) and a
+  project-identity migration CLI (`--migrate-identity`): re-derives
+  deterministic UUIDs under the canonical identity, deduplicates
+  collision rows, and never recomputes an embedding.
+- **Launcher codegraph identity SSOT** — every analyzer spawn surface
+  (build, rebuild, boot-resume, re-analyze, prune-stale) resolves
+  `--project` from the codegraph binding prefix via one helper; a pre-build
+  probe migrates rows stamped with a stale display-name identity. Build
+  provenance (`CODEGRAPH_PROVENANCE` model/dim/revision/commit) is parsed
+  and persisted into `project_codegraph_bindings`.
+- **Keychain lock awareness** — background operations probe the OS keyring
+  lock state (prompt-free) and report `keychain_locked` instead of
+  triggering the system unlock dialog; vct-hub `/env` distinguishes
+  `keychain_locked` / `keychain_error` / `key_not_active`; Python/sh/ps1
+  resolvers classify the new states (sh/ps1 exit 6) with the file store as
+  the documented second tier. Keychain D-Bus access is now paced
+  machine-wide via a cross-process file lock (gnome-keyring burst-crash
+  mitigation).
+
+### Changed
+- A deliberate embedding-profile change now triggers a one-time full
+  rebuild (the vectors are genuinely in a new space) on the next build;
+  transient hardware-tier drift is surfaced as a warning only and never
+  rewrites binding provenance or triggers re-embeds.
+- Legacy CodeAPI/CodeInteraction rows without a `file_path` anchor are
+  actively backfilled from their stored references during metadata
+  backfill (no lazy convergence; zero re-embeds).
+
 ### Fixed
 - **`--prune-stale` no longer deletes the code graph of fully-unchanged
   projects.** The per-file unchanged gate (and `--incremental`'s pre-dispatch
@@ -21,7 +58,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   launcher autobuild raced it under a different `--project` identity
   (display name vs codegraph binding name), writing duplicate rows under
   distinct deterministic UUIDs and letting each run's prune reap the other
-  identity's rows.
+  identity's rows. Boot-resume applies the same root skip, and the
+  Re-analyze modal now resolves the canonical identity too.
+- Worktree-guard tests leaked a real commit + registered worktree into the
+  host repository when run from a repo root; they now run in isolated tmp
+  repos and assert the host repo is untouched (permanent tripwire).
+- The daily weights poll conflated a keychain read error with the
+  free-tier state; the two are now distinguished and logged honestly.
+- The PowerShell secrets resolver's error-status arms (403/404/503) were
+  unreachable on pwsh 7 (disposed-response read aborted the script);
+  errors are now classified from the captured error body.
 
 ## [0.2.81] - 2026-07-15
 

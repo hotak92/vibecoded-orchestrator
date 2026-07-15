@@ -186,8 +186,16 @@ pub async fn reanalyze_code_graph(
 
     let folder = PathBuf::from(&project.folder_path);
     let lang_arg = language.as_deref().map(str::to_string);
+    // v0.2.82 (identity SSOT, 7th surface): resolve the canonical codegraph
+    // identity (binding collection_prefix → sanitizer parity → display name)
+    // exactly like every other spawn surface — passing `project.name` raw
+    // stamped display-name rows (spaced names → duplicate UUIDs vs the
+    // hook/resync identity). See codegraph.rs::resolve_codegraph_identity.
+    let identity = crate::commands::codegraph::resolve_codegraph_identity(
+        &db, &project_id, &project.name,
+    );
     let report =
-        run_reanalysis_with_stream(&project.name, &folder, lang_arg.as_deref(), &app).await?;
+        run_reanalysis_with_stream(&identity, &folder, lang_arg.as_deref(), &app).await?;
 
     // Audit log so Settings → Audit shows when Re-analyze was clicked.
     // Soft-fail: don't block the success return on a DB hiccup.
