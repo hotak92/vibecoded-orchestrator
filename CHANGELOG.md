@@ -39,7 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A deliberate embedding-profile change now triggers a one-time full
   rebuild (the vectors are genuinely in a new space) on the next build;
   transient hardware-tier drift is surfaced as a warning only and never
-  rewrites binding provenance or triggers re-embeds.
+  rewrites binding provenance or triggers re-embeds. Note: bindings
+  created before v0.2.82 have no configured-profile anchor yet — their
+  first post-update build stamps it (warn-only until then), after which
+  profile-change migration is automatic.
 - Legacy CodeAPI/CodeInteraction rows without a `file_path` anchor are
   actively backfilled from their stored references during metadata
   backfill (no lazy convergence; zero re-embeds).
