@@ -100,8 +100,14 @@ project_path="${VCT_PROJECT_PATH:-$PWD}"
 if [[ -n "${GITHUB_TOKEN:-}" ]]; then
     : # already in env via launcher's per-project env-file emission
 elif [[ -n "$RESOLVER" ]]; then
+    # Capture ONLY stdout (the secret value) via command substitution. The
+    # resolver's stderr carries the operator-facing diagnostic (e.g. "keychain
+    # locked") — we deliberately do NOT swallow it with `2>/dev/null` so a
+    # locked/unreadable keychain reaches the operator instead of vanishing into
+    # a bare "could not resolve github_pat". Only stdout is captured by $(...),
+    # so letting stderr through does not pollute GITHUB_TOKEN.
     set +e
-    GITHUB_TOKEN=$("$RESOLVER" "$project_path" github_pat 2>/dev/null)
+    GITHUB_TOKEN=$("$RESOLVER" "$project_path" github_pat)
     rc=$?
     set -e
     case "$rc" in
@@ -120,6 +126,20 @@ elif [[ -n "$RESOLVER" ]]; then
             ;;
         4)
             echo "[search-mcp-wrapper] WARN: github_pat not declared by any installed module nor by the orchestrator's bundled_secrets for $project_path" >&2
+            ;;
+        5)
+            # Hub refused the token on /env — a scoped hub.token.<id> is
+            # required (or the token was for the wrong project). See
+            # vct_secrets_resolve.sh's exit-code contract (5 = forbidden).
+            echo "[search-mcp-wrapper] ERROR: hub refused the token resolving github_pat for $project_path (forbidden — a project-scoped hub token is required); restart the launcher/session so a fresh scoped token is minted" >&2
+            exit 1
+            ;;
+        6)
+            # OS keychain is locked or a per-key read failed (hub 503
+            # keychain_locked / keychain_error). The resolver already printed a
+            # keychain-specific diagnostic to stderr (now visible — see above).
+            echo "[search-mcp-wrapper] ERROR: OS keychain is locked or unreadable resolving github_pat for $project_path; unlock the login keychain (or open the launcher) and retry" >&2
+            exit 1
             ;;
         *)
             echo "[search-mcp-wrapper] WARN: resolver exited with code $rc" >&2

@@ -32,6 +32,8 @@ _ORCH_CORE_RS = _RS_ROOT / "src" / "commands" / "orchestrator_core.rs"
 # v0.2.82 coordinator follow-up (WP-3 flagged it as out-of-scope): the
 # Re-analyze modal surface also spawns the analyzer and must use the SSOT.
 _REANALYZE_RS = _RS_ROOT / "src" / "commands" / "codegraph_reanalyze.rs"
+# M5 (FIX-B pin-only): pipeline I's pre-existing resolver lives here.
+_EXTRAS_RS = _RS_ROOT / "src" / "commands" / "project_codegraph_extras.rs"
 
 _OWNED_FILES = (_CODEGRAPH_RS, _ORCH_CORE_RS, _REANALYZE_RS)
 
@@ -205,4 +207,73 @@ def test_boot_resume_reuses_shared_root_skip_helper() -> None:
     ), (
         "resume_pending_builds must reuse projects_v2::"
         "update_should_skip_root_autobuild — no diverging root-skip copy."
+    )
+
+
+# ── M5: both code-graph identity resolution homes are BINDING-FIRST ──────────
+#
+# Two resolvers derive a project's code-graph identity/prefix:
+#   * the WP-3 SSOT `pick_codegraph_identity` (codegraph.rs) — used by every
+#     analyzer SPAWN surface. Binding `collection_prefix` first, else the
+#     SANITIZED DISPLAY NAME.
+#   * the pre-existing `resolve_collection_prefix` (project_codegraph_extras.rs,
+#     "pipeline I") — used by the extra-paths add/list surfaces. Binding
+#     `collection_prefix` first, else a sanitized SLUG.
+#
+# FIX-B does NOT refactor the Rust (per the plan — the divergence is only in the
+# FALLBACK, and the fallback is only reachable BEFORE a project has ever been
+# analyzed, i.e. before a binding row exists; once analyzed, BOTH resolve from
+# the SAME binding `collection_prefix` and cannot disagree). This pin freezes
+# the load-bearing invariant that matters: BOTH homes are binding-first. If a
+# future edit inverts either to fallback-first, the display-name/slug divergence
+# would become reachable on a POPULATED project (real dual-writer dupes) and
+# this pin trips at CI time.
+
+
+def test_M5_both_identity_homes_are_binding_first() -> None:
+    """Pin: both `pick_codegraph_identity` (SSOT) and `resolve_collection_prefix`
+    (pipeline I) consult the codegraph BINDING before any fallback. The
+    fallback-only divergence (sanitized display-name vs sanitized slug) is
+    reachable ONLY pre-populate (no binding row yet); once a binding exists both
+    return its `collection_prefix` verbatim, so they cannot disagree on an
+    analyzed project. Do NOT "fix" the divergence by refactoring the Rust — this
+    test locks the binding-first ordering that keeps it harmless."""
+    assert _EXTRAS_RS.is_file(), f"M5 pinned file missing: {_EXTRAS_RS}"
+
+    # ── SSOT home (codegraph.rs :: pick_codegraph_identity) ──
+    cg = _read(_CODEGRAPH_RS)
+    m = re.search(
+        r"fn pick_codegraph_identity\b.*?\n\}", cg, re.DOTALL
+    )
+    assert m is not None, "pick_codegraph_identity not found in codegraph.rs"
+    ssot_body = m.group(0)
+    # The FIRST decision inside the body must be the binding-prefix branch,
+    # returning BindingPrefix BEFORE the sanitize_kg_collection fallback.
+    bind_pos = ssot_body.find("IdentitySource::BindingPrefix")
+    sanitize_pos = ssot_body.find("sanitize_kg_collection")
+    assert bind_pos != -1, "pick_codegraph_identity no longer returns BindingPrefix"
+    assert sanitize_pos != -1, "pick_codegraph_identity lost its sanitize fallback"
+    assert bind_pos < sanitize_pos, (
+        "pick_codegraph_identity is no longer BINDING-FIRST — the binding-prefix "
+        "branch must be reached before the sanitized-display-name fallback."
+    )
+
+    # ── pipeline I home (project_codegraph_extras.rs :: resolve_collection_prefix) ──
+    ex = _read(_EXTRAS_RS)
+    m2 = re.search(
+        r"fn resolve_collection_prefix\b.*?\n\}\n", ex, re.DOTALL
+    )
+    assert m2 is not None, "resolve_collection_prefix not found in extras.rs"
+    pi_body = m2.group(0)
+    # The binding read + `return Ok(b.collection_prefix)` must precede the slug
+    # fallback (`project.slug`).
+    binding_read_pos = pi_body.find("get_project_codegraph_binding")
+    slug_pos = pi_body.find("project.slug")
+    assert binding_read_pos != -1, (
+        "resolve_collection_prefix no longer reads the codegraph binding"
+    )
+    assert slug_pos != -1, "resolve_collection_prefix lost its slug fallback"
+    assert binding_read_pos < slug_pos, (
+        "resolve_collection_prefix is no longer BINDING-FIRST — the binding "
+        "`collection_prefix` must be returned before the slug fallback."
     )

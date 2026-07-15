@@ -61,6 +61,12 @@ from typing import Any, Callable, Optional
 # so both paths share the SSOT.
 from vco_lib.symlink_handler import compute_vco_new_path, is_symlink_blocking
 from vco_lib import weaviate_helpers as _wh
+# v0.2.82 L4: the ONE home for named-vector round-trip cleaning (dropping
+# configured-but-empty ``{slot: []}`` slots that weaviate rejects on re-insert).
+# LOUD-FAIL import (no fallback): a broken vco_lib install must surface, never
+# silently inline-degrade. MUST MATCH the sibling call site in
+# vco_lib/codegraph_vector_copy.py.
+from vco_lib.weaviate_vectors import clean_named_vector
 
 # Default Weaviate port. Canonical value lives in
 # ``vco_lib.weaviate_helpers`` (v0.2.77 Part 7a convergence); re-exported
@@ -1413,7 +1419,11 @@ def _copy_collection_with_vectors(
                 # Drop the empty entries so only populated slots round-
                 # trip; the destination's missing slots stay empty (same
                 # observable state as the source).
-                vec_clean = {k: v for k, v in vec.items() if v}
+                # v0.2.82 L4: the rule now lives once in
+                # vco_lib.weaviate_vectors.clean_named_vector. MUST MATCH the
+                # sibling call site in vco_lib/codegraph_vector_copy.py (both
+                # route through this helper — no second inline dict-comp).
+                vec_clean = clean_named_vector(vec)
                 bw.add_object(
                     properties=obj.properties,
                     uuid=obj.uuid,

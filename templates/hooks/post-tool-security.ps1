@@ -105,10 +105,12 @@ foreach ($p in $patterns) {
     if ($content -match $p.Re) { $alerts += $p.Label }
 }
 
-# v0.2.82: PEM detection requires a PLAUSIBLE key body (>=256 base64 chars
-# after the BEGIN marker, before -----END). A real private-key body is
-# >=1600 chars; stub fixtures (secrets.rs write-guard leave-alone test:
-# 13 chars) must not alert. MUST MATCH the .sh sibling's check_pem_key.
+# v0.2.82: PEM detection requires a PLAUSIBLE key body (>=120 base64 chars
+# after the BEGIN marker, before -----END). An RSA key body is >=1600 chars,
+# but a real EC SEC1 P-256 key body is only ~164 chars — the earlier >=256
+# floor SILENTLY MISSED every EC key. 120 stays above the 13-char secrets.rs
+# write-guard stub while catching P-256 EC keys. MUST MATCH the .sh sibling's
+# check_pem_key body floor.
 $pemMatches = [regex]::Matches($content, 'BEGIN (RSA |EC |OPENSSH |)PRIVATE KEY')
 foreach ($pm in $pemMatches) {
     $start = $pm.Index + $pm.Length
@@ -118,7 +120,7 @@ foreach ($pm in $pemMatches) {
     $endIdx = $window.IndexOf('-----END')
     $body = if ($endIdx -ge 0) { $window.Substring(0, $endIdx) } else { $window }
     $b64 = ($body -replace '[^A-Za-z0-9+/=]', '')
-    if ($b64.Length -ge 256) { $alerts += "PEM private key"; break }
+    if ($b64.Length -ge 120) { $alerts += "PEM private key"; break }
 }
 
 if ($alerts.Count -gt 0) {

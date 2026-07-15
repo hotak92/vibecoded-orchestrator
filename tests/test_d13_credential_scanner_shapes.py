@@ -62,6 +62,17 @@ PEM_PLAUSIBLE = (
     + ("M" * 64 + "\n") * 5
     + "-----END RSA PRIVATE KEY-----"
 )
+# v0.2.82 M2: a real EC SEC1 P-256 private key body is only ~164 base64 chars
+# (RSA bodies are >=1600). The earlier >=256 floor SILENTLY MISSED every EC key.
+# This synthetic EC-shaped body is 164 base64 chars (128 across two 64-char
+# lines + a 36-char tail) — deliberately BETWEEN the 120 floor (must alert) and
+# the old 256 floor (would NOT have alerted): the fail-without proof for M2.
+PEM_EC_P256 = (
+    "-----BEGIN EC PRIVATE KEY-----\n"
+    + ("M" * 64 + "\n") * 2
+    + ("M" * 36 + "\n")
+    + "-----END EC PRIVATE KEY-----"
+)
 
 
 def _run_sh_scanner(tmp_path: Path, file_body: str) -> subprocess.CompletedProcess:
@@ -133,6 +144,18 @@ class TestShPemPlausibleBodyAndNotifyDedup:
         # Leave-alone: a real-shaped key body must keep firing.
         alerts = _run_sh_scanner(tmp_path, PEM_PLAUSIBLE)
         assert "PEM private key" in alerts, alerts
+
+    def test_pem_ec_p256_body_alerts(self, tmp_path):
+        # M2 fail-without: an EC SEC1 P-256 body (~164 base64 chars) PASSED
+        # SILENTLY at the old >=256 floor. At the 120 floor it MUST alert.
+        alerts = _run_sh_scanner(tmp_path, PEM_EC_P256)
+        assert "PEM private key" in alerts, alerts
+
+    def test_pem_stub_still_below_lowered_floor(self, tmp_path):
+        # Leave-alone under the lowered floor: the 13-char secrets.rs stub must
+        # STILL not alert even at the 120 floor (it is far below 120).
+        alerts = _run_sh_scanner(tmp_path, PEM_STUB)
+        assert "PEM private key" not in alerts, alerts
 
     def test_desktop_notify_deduped_but_jsonl_per_event(self, tmp_path):
         proj = tmp_path / "proj"
@@ -339,6 +362,12 @@ class TestPs1ScannerParity:
 
     def test_ps1_pem_plausible_body_still_alerts(self, tmp_path):
         alerts = self._run_ps1(tmp_path, PEM_PLAUSIBLE)
+        assert "PEM private key" in alerts, alerts
+
+    def test_ps1_pem_ec_p256_body_alerts(self, tmp_path):
+        # M2 parity: the EC SEC1 P-256 body (~164 chars) must alert at the
+        # lowered 120 floor on the Windows sibling too.
+        alerts = self._run_ps1(tmp_path, PEM_EC_P256)
         assert "PEM private key" in alerts, alerts
 
 
