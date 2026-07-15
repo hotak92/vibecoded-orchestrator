@@ -1031,6 +1031,69 @@ pub fn keyring_probe_available() -> bool {
     .unwrap_or(false)
 }
 
+// ─── Backend availability (v0.2.82 CI fix) ───────────────────────────────
+//
+// "keychain_degraded" (hub /env → 503 `keychain_error`) means a keychain
+// that NORMALLY WORKS failed a read. On hosts with NO Secret Service
+// backend at all (headless CI, servers), every keychain read errors by
+// construction — that is not degradation, it is the pre-v0.2.82
+// no-keychain reality: consumers must fall through to the legacy miss path
+// (file store / `key_not_active`). Memoized once per process: backend
+// availability is a property of the host session, not of individual reads
+// (a daemon that dies mid-run is real degradation and stays reported).
+
+#[cfg(any(test, debug_assertions))]
+static TEST_BACKEND_AVAILABILITY_OVERRIDE: std::sync::Mutex<Option<bool>> =
+    std::sync::Mutex::new(None);
+
+/// Test-only RAII guard forcing `keychain_backend_available()` to a fixed
+/// value (mirrors `TestProbeGuard`). Lets degraded-state tests assert the
+/// 503 envelopes on headless CI where the real backend is absent, and lets
+/// the no-backend regression test simulate headless on a desktop.
+#[cfg(any(test, debug_assertions))]
+pub struct TestBackendAvailabilityGuard {
+    prev: Option<bool>,
+}
+
+#[cfg(any(test, debug_assertions))]
+impl TestBackendAvailabilityGuard {
+    pub fn new(available: bool) -> Self {
+        let mut slot = TEST_BACKEND_AVAILABILITY_OVERRIDE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = *slot;
+        *slot = Some(available);
+        Self { prev }
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+impl Drop for TestBackendAvailabilityGuard {
+    fn drop(&mut self) {
+        let mut slot = TEST_BACKEND_AVAILABILITY_OVERRIDE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *slot = self.prev;
+    }
+}
+
+/// Whether this host has a WORKING keychain backend at all (memoized).
+/// See the module-section comment above for the degraded-vs-no-backend
+/// distinction this powers.
+pub fn keychain_backend_available() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        if let Some(v) = *TEST_BACKEND_AVAILABILITY_OVERRIDE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+        {
+            return v;
+        }
+    }
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(keyring_probe_available)
+}
+
 // ─── Write chokepoint (v0.2.80 A4) ────────────────────────────────────────
 //
 // Every production keychain write funnels through `set` on every OS. Before

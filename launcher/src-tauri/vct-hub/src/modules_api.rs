@@ -541,6 +541,20 @@ struct ProjectEnvQuery {
     key: Option<String>,
 }
 
+/// v0.2.82 CI fix — the ONE degraded-policy home: mark the request
+/// keychain-degraded ONLY when this host has a working keychain backend.
+/// An errored read on a NO-backend host (headless CI, servers — every read
+/// fails by construction) is the legacy no-keychain reality, not
+/// degradation: those requests must fall through to the miss path (file
+/// store / `key_not_active`) exactly as pre-v0.2.82. See
+/// `vct_launcher_core::secrets::keychain_backend_available` (memoized;
+/// test-overridable via `TestBackendAvailabilityGuard`).
+fn mark_keychain_degraded(flag: &mut bool) {
+    if vct_launcher_core::secrets::keychain_backend_available() {
+        *flag = true;
+    }
+}
+
 async fn project_env(
     State(h): State<LauncherDbHandle>,
     Path(project_id): Path<String>,
@@ -577,6 +591,9 @@ async fn project_env(
     }
     // Per-key non-lock keychain errors set this flag (never silently omit a
     // key). Surfaced as `keychain_error` (503) on a `?key=` miss and as the
+    // v0.2.82 CI fix: the degraded marker below is availability-gated via
+    // `mark_keychain_degraded` — see that helper's doc for the
+    // no-backend-host (headless CI/server) distinction.
     // additive `X-VCT-Secrets-Degraded` header on a full-env response.
     let mut keychain_degraded = false;
 
@@ -692,7 +709,7 @@ async fn project_env(
                          {:?} (project {}): {} — env marked degraded",
                         s.key, project.id, e
                     );
-                    keychain_degraded = true;
+                    mark_keychain_degraded(&mut keychain_degraded);
                 }
             }
         }
@@ -764,7 +781,7 @@ async fn project_env(
                              {:?} (project {}): {} — env marked degraded",
                             bs.key, project.id, e
                         );
-                        keychain_degraded = true;
+                        mark_keychain_degraded(&mut keychain_degraded);
                     }
                 }
             }
@@ -808,7 +825,7 @@ async fn project_env(
                                  github_pat slot (project {}): {} — env marked degraded",
                                 project.id, e
                             );
-                            keychain_degraded = true;
+                            mark_keychain_degraded(&mut keychain_degraded);
                         }
                     }
                 }
@@ -857,7 +874,7 @@ async fn project_env(
             &project.id,
         );
     if user_degraded {
-        keychain_degraded = true;
+        mark_keychain_degraded(&mut keychain_degraded);
     }
     for (key, val) in user_pairs {
         if env.contains_key(&key) {
@@ -921,7 +938,7 @@ async fn project_env(
                          {:?} (owner {}, grantee {}): {} — env marked degraded",
                         g.key, g.owner_project_id, project.id, e
                     );
-                    keychain_degraded = true;
+                    mark_keychain_degraded(&mut keychain_degraded);
                 }
             }
         }
@@ -1979,6 +1996,9 @@ mod tests {
         let _lock = h1_lock();
         let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
         let _probe = vct_launcher_core::secrets::TestProbeGuard::new(Some(false)); // unlocked
+        // v0.2.82 CI fix: degraded is availability-gated; force "backend
+        // available" so this asserts the degraded path on headless CI too.
+        let _avail = vct_launcher_core::secrets::TestBackendAvailabilityGuard::new(true);
         let (base, h) = spawn_modules_api_hub().await;
         seed_project(&h.0, "de-proj", "Degraded Project", "/tmp/de-proj");
 
@@ -2015,6 +2035,8 @@ mod tests {
         let _lock = h1_lock();
         let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
         let _probe = vct_launcher_core::secrets::TestProbeGuard::new(Some(false));
+        // v0.2.82 CI fix: see T19a — force backend-available for CI parity.
+        let _avail = vct_launcher_core::secrets::TestBackendAvailabilityGuard::new(true);
         let (base, h) = spawn_modules_api_hub().await;
         seed_project(&h.0, "de-proj2", "Degraded Project 2", "/tmp/de-proj2");
 
@@ -2039,6 +2061,48 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("keychain_error"),
             "degraded full-env must carry the additive header"
+        );
+    }
+
+    /// v0.2.82 CI regression (the exact red that blocked the tag): on a host
+    /// with NO keychain backend (headless CI/servers), an errored keychain
+    /// read is the legacy no-keychain reality — a missing key must stay 404
+    /// `key_not_active`, never 503 `keychain_error`.
+    #[tokio::test]
+    async fn hub_env_no_backend_host_missing_key_stays_404() {
+        let _lock = h1_lock();
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let _probe = vct_launcher_core::secrets::TestProbeGuard::new(Some(false));
+        // Simulate the headless-CI reality regardless of this machine's
+        // desktop keyring.
+        let _avail = vct_launcher_core::secrets::TestBackendAvailabilityGuard::new(false);
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "nb-proj", "No Backend Project", "/tmp/nb-proj");
+
+        // An active key whose read errors (as EVERY read does with no
+        // backend) → with availability=false this is NOT degradation.
+        vct_launcher_core::secrets::set(
+            vct_launcher_core::secrets::SecretScope::PerProject { project_id: "nb-proj" },
+            "user",
+            "NB_KEY",
+            "synthetic-not-a-real-secret",
+        )
+        .unwrap();
+        h.0.mark_secret_active("per_project", "nb-proj", "user", "NB_KEY").unwrap();
+        vct_launcher_core::secrets::for_tests::fail_next_get("NB_KEY");
+
+        let resp = reqwest::get(format!("{}/projects/nb-proj/env?key=NB_KEY", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(
+            resp.status(), 404,
+            "no-backend host: errored read must fall through to the miss \
+             path, never 503 keychain_error"
+        );
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.pointer("/error/code").and_then(|v| v.as_str()),
+            Some("key_not_active"),
         );
     }
 
