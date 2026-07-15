@@ -65,10 +65,38 @@ pub async fn coordination_get_config(
         .get_setting(&project_id, MODULE_ID, "TELEGRAM_GROUP_CHAT_ID")?
         .and_then(|v| v.as_str().map(str::to_string));
 
-    // Secrets (presence only for key + telegram token; URL is returned)
-    let supabase_url = secrets::get(scope, MODULE_ID, "SUPABASE_URL")?;
-    let supabase_key_set = secrets::is_set(scope, MODULE_ID, "SUPABASE_KEY")?;
-    let telegram_bot_token_set = secrets::is_set(scope, MODULE_ID, "TELEGRAM_BOT_TOKEN")?;
+    // Secrets (presence only for key + telegram token; URL is returned).
+    //
+    // v0.2.82 (WP-4a): this is a page-mount fetch (Background) — it must NEVER
+    // pop an OS unlock dialog. A locked/errored keychain must not be conflated
+    // with "secret set" either; on such an error we report the field as
+    // not-present (this is a display-only presence indicator, not a security
+    // gate) and log the reason, rather than prompting or erroring the page.
+    let bg = secrets::CallContext::Background;
+    let read_presence = |key: &str| -> bool {
+        match secrets::is_set_with_context(scope, MODULE_ID, key, bg) {
+            Ok(present) => present,
+            Err(e) => {
+                eprintln!(
+                    "[vct-coordination] keychain read for {key:?} unavailable \
+                     ({e}); reporting not-set for this page load"
+                );
+                false
+            }
+        }
+    };
+    let supabase_url = match secrets::get_with_context(scope, MODULE_ID, "SUPABASE_URL", bg) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "[vct-coordination] keychain read for SUPABASE_URL unavailable \
+                 ({e}); reporting unset for this page load"
+            );
+            None
+        }
+    };
+    let supabase_key_set = read_presence("SUPABASE_KEY");
+    let telegram_bot_token_set = read_presence("TELEGRAM_BOT_TOKEN");
 
     Ok(CoordinationConfig {
         project_id,

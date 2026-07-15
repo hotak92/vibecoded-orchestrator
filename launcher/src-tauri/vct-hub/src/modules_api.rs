@@ -558,6 +558,28 @@ async fn project_env(
         Err(e) => return db_error_response("get project (env)", e),
     };
 
+    // v0.2.82 (WP-4a / G5): probe the OS keychain lock state ONCE per request
+    // (Background context — this is a hook/MCP resolution path, never a user
+    // click). A LOCKED store cannot honestly report which keys exist: a partial
+    // env would be a SILENT DOWNGRADE (a consumer testing `if OPENAI_API_KEY`
+    // would see "unset" and fall back to a degraded mode with no signal that
+    // the real cause was a locked keychain). So a locked store yields 503
+    // `keychain_locked` for BOTH the full-env and `?key=` forms, returned
+    // BEFORE any resolution loop constructs an Entry. UNKNOWN / unlocked →
+    // proceed (the per-key Err path below handles individual failures).
+    if let Some(true) = vct_launcher_core::secrets::probe_default_collection_locked() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "keychain_locked",
+            "OS keychain is locked — unlock your login keychain or open the \
+             launcher to restore secret resolution",
+        );
+    }
+    // Per-key non-lock keychain errors set this flag (never silently omit a
+    // key). Surfaced as `keychain_error` (503) on a `?key=` miss and as the
+    // additive `X-VCT-Secrets-Degraded` header on a full-env response.
+    let mut keychain_degraded = false;
+
     let mut env = serde_json::Map::new();
     env.insert("VCT_PROJECT_ID".into(), serde_json::Value::String(project.id.clone()));
     env.insert("VCT_PROJECT_HOST".into(), serde_json::Value::String(project.host.as_str().into()));
@@ -651,8 +673,27 @@ async fn project_env(
                 "shared" => vct_launcher_core::secrets::SecretScope::Shared { project_id: SENTINEL_SHARED },
                 _ => vct_launcher_core::secrets::SecretScope::PerProject { project_id: &project.id },
             };
-            if let Ok(Some(val)) = vct_launcher_core::secrets::get(scope, &manifest.id, &s.key) {
-                env.insert(s.key.clone(), serde_json::Value::String(val));
+            // v0.2.82 (WP-4a): Background read; a non-lock keychain Err flips
+            // the request-degraded flag (surfaced honestly below) instead of
+            // silently omitting the key. Ok(None) = genuine miss → skip.
+            match vct_launcher_core::secrets::get_with_context(
+                scope,
+                &manifest.id,
+                &s.key,
+                vct_launcher_core::secrets::CallContext::Background,
+            ) {
+                Ok(Some(val)) => {
+                    env.insert(s.key.clone(), serde_json::Value::String(val));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!(
+                        "[vct-hub] WARN: keychain read failed for module secret \
+                         {:?} (project {}): {} — env marked degraded",
+                        s.key, project.id, e
+                    );
+                    keychain_degraded = true;
+                }
             }
         }
     }
@@ -704,10 +745,26 @@ async fn project_env(
                 _ => vct_launcher_core::secrets::SecretScope::PerProject { project_id: &project.id },
             };
             if active {
-                if let Ok(Some(val)) = vct_launcher_core::secrets::get(scope, &bs.module_id, &bs.key) {
-                    if !val.trim().is_empty() {
-                        env.insert(bs.key.clone(), serde_json::Value::String(val));
-                        continue;
+                match vct_launcher_core::secrets::get_with_context(
+                    scope,
+                    &bs.module_id,
+                    &bs.key,
+                    vct_launcher_core::secrets::CallContext::Background,
+                ) {
+                    Ok(Some(val)) => {
+                        if !val.trim().is_empty() {
+                            env.insert(bs.key.clone(), serde_json::Value::String(val));
+                            continue;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!(
+                            "[vct-hub] WARN: keychain read failed for bundled secret \
+                             {:?} (project {}): {} — env marked degraded",
+                            bs.key, project.id, e
+                        );
+                        keychain_degraded = true;
                     }
                 }
             }
@@ -733,9 +790,25 @@ async fn project_env(
                     &project.id,
                 );
                 if legacy_active {
-                    if let Ok(Some(val)) = vct_launcher_core::secrets::get(scope, legacy_module_id, &bs.key) {
-                        if !val.trim().is_empty() {
-                            env.insert(bs.key.clone(), serde_json::Value::String(val));
+                    match vct_launcher_core::secrets::get_with_context(
+                        scope,
+                        legacy_module_id,
+                        &bs.key,
+                        vct_launcher_core::secrets::CallContext::Background,
+                    ) {
+                        Ok(Some(val)) => {
+                            if !val.trim().is_empty() {
+                                env.insert(bs.key.clone(), serde_json::Value::String(val));
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            eprintln!(
+                                "[vct-hub] WARN: keychain read failed for legacy \
+                                 github_pat slot (project {}): {} — env marked degraded",
+                                project.id, e
+                            );
+                            keychain_degraded = true;
                         }
                     }
                 }
@@ -774,13 +847,19 @@ async fn project_env(
     // File-store-only keys (`vct set`) still 404 here — correctly, per
     // keychain-source semantics — and resolve via tier 2 of the resolver
     // chain in `vct_secrets_resolve.sh|.ps1` / `agent_secrets.py`.
-    for (key, val) in
-        vct_launcher_core::db::secret_active::resolve_active_user_secret_pairs_for_requester(
+    // v0.2.82 (WP-4a): the `_with_degraded` twin flags a non-lock keychain
+    // error hit while resolving user secrets so we surface it honestly rather
+    // than silently dropping a key.
+    let (user_pairs, user_degraded) =
+        vct_launcher_core::db::secret_active::resolve_active_user_secret_pairs_for_requester_with_degraded(
             &h.0,
             &project.id,
             &project.id,
-        )
-    {
+        );
+    if user_degraded {
+        keychain_degraded = true;
+    }
+    for (key, val) in user_pairs {
         if env.contains_key(&key) {
             continue;
         }
@@ -826,8 +905,24 @@ async fn project_env(
             let scope = vct_launcher_core::secrets::SecretScope::PerProject {
                 project_id: &g.owner_project_id,
             };
-            if let Ok(Some(val)) = vct_launcher_core::secrets::get(scope, &g.module_id, &g.key) {
-                env.insert(g.key.clone(), serde_json::Value::String(val));
+            match vct_launcher_core::secrets::get_with_context(
+                scope,
+                &g.module_id,
+                &g.key,
+                vct_launcher_core::secrets::CallContext::Background,
+            ) {
+                Ok(Some(val)) => {
+                    env.insert(g.key.clone(), serde_json::Value::String(val));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!(
+                        "[vct-hub] WARN: keychain read failed for granted secret \
+                         {:?} (owner {}, grantee {}): {} — env marked degraded",
+                        g.key, g.owner_project_id, project.id, e
+                    );
+                    keychain_degraded = true;
+                }
             }
         }
     }
@@ -851,6 +946,21 @@ async fn project_env(
                 single.insert(want.to_string(), v.clone());
                 Json(serde_json::Value::Object(single)).into_response()
             }
+            // v0.2.82 (WP-4a): a MISS while the request is keychain-degraded is
+            // NOT an honest "key not active" — the key might exist but the
+            // keychain read errored. Return 503 `keychain_error` so the caller
+            // distinguishes "genuinely not authorized here" (404) from "we
+            // could not read the keychain" (503, retry/unlock).
+            None if keychain_degraded => error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "keychain_error",
+                format!(
+                    "key {:?} could not be resolved for project {}: a keychain read \
+                     failed during this request (the key may exist but is \
+                     currently unreadable) — check the OS keychain and retry",
+                    want, project.id
+                ),
+            ),
             None => error_response(
                 StatusCode::NOT_FOUND,
                 "key_not_active",
@@ -863,7 +973,18 @@ async fn project_env(
         };
     }
 
-    Json(serde_json::Value::Object(env)).into_response()
+    // Full-env form. When a per-key keychain error degraded the resolution,
+    // attach the ADDITIVE `X-VCT-Secrets-Degraded` header (body shape unchanged
+    // for compat) so a caller can detect that the env may be missing keys due
+    // to a keychain fault rather than genuine absence.
+    let mut resp = Json(serde_json::Value::Object(env)).into_response();
+    if keychain_degraded {
+        if let Ok(hv) = axum::http::HeaderValue::from_str("keychain_error") {
+            resp.headers_mut()
+                .insert("X-VCT-Secrets-Degraded", hv);
+        }
+    }
+    resp
 }
 
 /// PR-3 Commit 3 (2026-05-06): pure helper for the gate decision used by
@@ -1806,6 +1927,140 @@ mod tests {
         assert_eq!(
             body.get("EXAMPLE_API_TOKEN").and_then(|v| v.as_str()),
             Some("synthetic-not-a-real-secret")
+        );
+    }
+
+    // ─── v0.2.82 WP-4a (G5): hub /env honest keychain states (T19) ───────────
+
+    /// T19a — a LOCKED keychain yields 503 `keychain_locked` for BOTH the
+    /// full-env form and the `?key=` form, returned BEFORE any resolution loop
+    /// (no silent partial env, no prompt). MUST fail on base (base has no lock
+    /// probe → it would build a partial env / 404 the key).
+    #[tokio::test]
+    async fn hub_env_locked_keychain_returns_503_both_forms() {
+        let _lock = h1_lock();
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        // Force the store LOCKED for this request.
+        let _probe = vct_launcher_core::secrets::TestProbeGuard::new(Some(true));
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "lk-proj", "Locked Project", "/tmp/lk-proj");
+
+        // Full-env form.
+        let resp = reqwest::get(format!("{}/projects/lk-proj/env", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 503, "full-env under lock must be 503");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.pointer("/error/code").and_then(|v| v.as_str()),
+            Some("keychain_locked"),
+            "full-env locked envelope: {body}"
+        );
+
+        // ?key= form → same 503 keychain_locked (NOT 404 key_not_active).
+        let resp2 = reqwest::get(format!("{}/projects/lk-proj/env?key=ANYTHING", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp2.status(), 503, "?key= under lock must be 503");
+        let body2: serde_json::Value = resp2.json().await.expect("json body");
+        assert_eq!(
+            body2.pointer("/error/code").and_then(|v| v.as_str()),
+            Some("keychain_locked"),
+            "?key= locked envelope: {body2}"
+        );
+    }
+
+    /// T19b — a per-key NON-lock keychain Err (transient daemon read failure
+    /// mid-request, probe UNLOCKED) surfaces as 503 `keychain_error` on a
+    /// `?key=` miss (NOT 404 `key_not_active`), and adds the
+    /// `X-VCT-Secrets-Degraded` header to the full-env response.
+    #[tokio::test]
+    async fn hub_env_per_key_error_is_keychain_error_not_key_not_active() {
+        let _lock = h1_lock();
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let _probe = vct_launcher_core::secrets::TestProbeGuard::new(Some(false)); // unlocked
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "de-proj", "Degraded Project", "/tmp/de-proj");
+
+        // An active user secret whose keychain READ is forced to error.
+        vct_launcher_core::secrets::set(
+            vct_launcher_core::secrets::SecretScope::PerProject { project_id: "de-proj" },
+            "user",
+            "DEGRADED_KEY",
+            "synthetic-not-a-real-secret",
+        )
+        .unwrap();
+        h.0.mark_secret_active("per_project", "de-proj", "user", "DEGRADED_KEY")
+            .unwrap();
+        vct_launcher_core::secrets::for_tests::fail_next_get("DEGRADED_KEY");
+
+        // ?key= for the errored key → 503 keychain_error (the key exists but is
+        // unreadable — NOT an honest "not active").
+        let resp = reqwest::get(format!("{}/projects/de-proj/env?key=DEGRADED_KEY", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 503, "errored ?key= must be 503");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.pointer("/error/code").and_then(|v| v.as_str()),
+            Some("keychain_error"),
+            "errored ?key= envelope: {body}"
+        );
+    }
+
+    /// T19b (full-env leg) — the degraded header appears on the full-env
+    /// response when a per-key read errored.
+    #[tokio::test]
+    async fn hub_env_degraded_full_env_carries_header() {
+        let _lock = h1_lock();
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let _probe = vct_launcher_core::secrets::TestProbeGuard::new(Some(false));
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "de-proj2", "Degraded Project 2", "/tmp/de-proj2");
+
+        vct_launcher_core::secrets::set(
+            vct_launcher_core::secrets::SecretScope::PerProject { project_id: "de-proj2" },
+            "user",
+            "DEGRADED_KEY2",
+            "synthetic-not-a-real-secret",
+        )
+        .unwrap();
+        h.0.mark_secret_active("per_project", "de-proj2", "user", "DEGRADED_KEY2")
+            .unwrap();
+        vct_launcher_core::secrets::for_tests::fail_next_get("DEGRADED_KEY2");
+
+        let resp = reqwest::get(format!("{}/projects/de-proj2/env", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200, "full-env degraded is still 200 (additive header)");
+        assert_eq!(
+            resp.headers()
+                .get("X-VCT-Secrets-Degraded")
+                .and_then(|v| v.to_str().ok()),
+            Some("keychain_error"),
+            "degraded full-env must carry the additive header"
+        );
+    }
+
+    /// T19c — a genuinely not-declared key still 404s `key_not_active` when the
+    /// keychain is healthy (the three states stay distinct).
+    #[tokio::test]
+    async fn hub_env_genuine_miss_still_404_key_not_active() {
+        let _lock = h1_lock();
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let _probe = vct_launcher_core::secrets::TestProbeGuard::new(Some(false));
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "ok-proj", "Healthy Project", "/tmp/ok-proj");
+
+        let resp = reqwest::get(format!("{}/projects/ok-proj/env?key=NEVER_DECLARED", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 404, "genuine miss must be 404");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.pointer("/error/code").and_then(|v| v.as_str()),
+            Some("key_not_active"),
+            "genuine-miss envelope: {body}"
         );
     }
 

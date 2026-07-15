@@ -1890,13 +1890,37 @@ pub fn run() {
                         vct_launcher_core::db::license_keys::keychain_username_for(
                             vct_launcher_core::db::license_keys::ORCHESTRATOR_MODULE_ID,
                         );
-                    let key = match crate::secrets::get(
+                    // v0.2.82 (WP-4a / C7): Background context — this is a 24h
+                    // timer poll, never a user click, so it must NOT pop an OS
+                    // unlock dialog. It also must NOT conflate a locked/errored
+                    // keychain with "free tier": the pre-fix `_ => return None`
+                    // mapped BOTH `Err(_)` and `Ok(None)` to free-tier, silently
+                    // degrading a licensed install for that poll cycle. Now a
+                    // locked/errored read is logged distinctly and skips the
+                    // poll (honest "couldn't check" — NOT "unlicensed").
+                    let key = match crate::secrets::get_with_context(
                         crate::secrets::SecretScope::Global,
                         "licensing",
                         &username,
+                        crate::secrets::CallContext::Background,
                     ) {
                         Ok(Some(k)) if !k.trim().is_empty() => k,
-                        _ => return None,
+                        // Genuine free tier: no key present.
+                        Ok(Some(_)) | Ok(None) => return None,
+                        // Locked / errored keychain: skip this poll cycle
+                        // WITHOUT downgrading to free-tier classification.
+                        Err(e) => {
+                            eprintln!(
+                                "[vct-launcher] weights poll skipped: keychain \
+                                 {} (not a free-tier signal — the license may \
+                                 still be valid; unlock the keychain to re-check)",
+                                match e {
+                                    crate::secrets::KeychainError::Locked => "locked".to_string(),
+                                    crate::secrets::KeychainError::Other(d) => format!("error: {d}"),
+                                }
+                            );
+                            return None;
+                        }
                     };
                     let hash = crate::commands::module_service::machine_id_hash_for_poll();
                     Some((key, hash))
@@ -3570,5 +3594,60 @@ mod orphan_reaper_tests {
             Some(v) => std::env::set_var("VCT_STATE_DIR", v),
             None => std::env::remove_var("VCT_STATE_DIR"),
         }
+    }
+}
+
+// ─── v0.2.82 WP-4a (G5 / C7): weights-poll keychain honesty ───────────────────
+//
+// The daily weights-poll license_reader closure is defined inline in `run()`,
+// so it can't be unit-tested in isolation. These SOURCE-SHAPE pins guard the
+// two invariants the WP-4a fix establishes: (1) the read runs in `Background`
+// context (no OS unlock prompt from a 24h timer), and (2) a locked/errored
+// keychain is NOT collapsed to the free-tier `None` — the pre-fix `_ => None`
+// silently downgraded a licensed install for that poll cycle (C7).
+#[cfg(test)]
+mod weights_poll_keychain_shape_tests {
+    /// The weights closure must read the license key with `get_with_context`
+    /// in `Background` context — never the plain `get` (which is Interactive
+    /// and may prompt).
+    #[test]
+    fn weights_poll_reads_license_key_in_background_context() {
+        let src = include_str!("lib.rs");
+        let flat: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        // Assembled from split literals so this test's own source can't match.
+        let needle =
+            String::from("crate::secrets::get_with_context(") + "crate::secrets::SecretScope::Global";
+        assert!(
+            flat.contains(needle.as_str()),
+            "the weights poll must read the license key via get_with_context \
+             (Background), not the Interactive `get` — a 24h timer must never \
+             pop an OS unlock dialog"
+        );
+        assert!(
+            flat.contains("CallContext::Background"),
+            "the weights-poll license read must pass CallContext::Background"
+        );
+    }
+
+    /// The weights closure must have a DISTINCT `Err(e)` branch that skips the
+    /// poll WITHOUT classifying the install as free-tier, and log a
+    /// skip-with-reason line (C7). Pinned by the presence of the honest
+    /// skip-log string, which only the Err branch emits.
+    #[test]
+    fn weights_poll_does_not_conflate_keychain_error_with_free_tier() {
+        let src = include_str!("lib.rs");
+        assert!(
+            src.contains("weights poll skipped: keychain"),
+            "a locked/errored keychain must log a distinct skip-with-reason \
+             (C7) — NOT silently fall through to the free-tier `None` path"
+        );
+        // The Err branch must match on KeychainError::Locked so the message
+        // distinguishes locked from other errors.
+        let flat: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains("KeychainError::Locked"),
+            "the weights-poll Err branch must distinguish a locked keychain \
+             from a generic error for an honest skip message"
+        );
     }
 }

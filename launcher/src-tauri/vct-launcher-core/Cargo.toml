@@ -121,6 +121,19 @@ schemars = { version = "0.8", features = ["preserve_order"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# v0.2.82 (WP-4a / G5): Secret-Service Collection `Locked` property probe for
+# the keychain lock-state check. This is the SAME crate `keyring`'s
+# `sync-secret-service` feature pulls (already resolved at 4.1.0 in the
+# lockfile), added here as a direct edge so `secrets.rs` can read
+# `org.freedesktop.Secret.Collection.Locked` on the default collection WITHOUT
+# constructing a `keyring::Entry` (which would negotiate a session and, on a
+# locked collection reached by a background read, risk popping the OS unlock
+# dialog). Features left at default (none) to match keyring's own spec — one
+# compilation unit, zero net build size. Linux-only to mirror keyring's own
+# `cfg(target_os = "linux")` gate (macOS uses apple-native; see DEFERRALS D4).
+[target.'cfg(target_os = "linux")'.dependencies]
+dbus-secret-service = "4.1"
+
 # Windows-specific (pid_is_alive uses OpenProcess + CloseHandle)
 # v0.2.49: `winreg` reads HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid
 # in `licensing::machine_id_hash` for platform-stable machine binding.
