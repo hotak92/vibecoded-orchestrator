@@ -42,6 +42,79 @@ SH = REPO_ROOT / "templates" / "hooks" / "worktree-guard.sh"
 PS1 = REPO_ROOT / "templates" / "hooks" / "worktree-guard.ps1"
 
 
+# ── HOST-REPO LEAK TRIPWIRE + HARD ENV ISOLATION ──────────────────────────
+# WP-5 (v0.2.82): the dynamic half of this file runs the *creating*
+# worktree-guard hook (sh + ps1) against a real repo — the same leak surface
+# as test_worktree_guard_hook.py. If a test failed to isolate, the hook would
+# create a worktree of the HOST repo and any in-worktree commit would land a
+# real object + registered worktree in the host ``.git``. The two autouse
+# fixtures below make that impossible: ``_isolate_env`` chdirs into the tmp
+# dir and scrubs host-redirecting env vars (the hook subprocesses also get an
+# explicit ``cwd=`` — see ``_run_sh`` / ``_run_ps1``), and
+# ``_host_repo_unchanged`` snapshots the host repo HEAD + worktree
+# registrations before each test and asserts them unchanged after. Mirrors the
+# guard in test_worktree_guard_hook.py — keep the two in step.
+
+_LEAK_ENV_KEYS = ("CLAUDE_PROJECT_DIR", "GIT_DIR", "GIT_WORK_TREE")
+
+
+def _host_repo_state() -> tuple[str, str]:
+    """(HEAD, sorted worktree-list) of the repo THIS test file lives in.
+
+    Explicit ``git -C REPO_ROOT`` so the probe ignores the test's own chdir.
+    Worktree registrations live in the shared common-dir, so a stray worktree
+    created under REPO_ROOT's toplevel surfaces here. Empty strings when
+    REPO_ROOT is not a git repo → the guard degrades to a no-op.
+    """
+    def _git_out(*args: str) -> str:
+        try:
+            return subprocess.run(
+                ["git", "-C", str(REPO_ROOT), *args],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+        except (subprocess.CalledProcessError, OSError):
+            return ""
+
+    head = _git_out("rev-parse", "HEAD")
+    if not head:
+        return ("", "")
+    wt_raw = _git_out("worktree", "list", "--porcelain")
+    wt = "\n".join(sorted(
+        line for line in wt_raw.splitlines() if line.startswith("worktree ")
+    ))
+    return (head, wt)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Hard isolation: chdir into the per-test tmp dir and scrub env vars that
+    could point the hook at the host repo. Autouse for every test here."""
+    for key in _LEAK_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.chdir(tmp_path)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _host_repo_unchanged():
+    """Permanent tripwire: the HOST repo (this file's repo) HEAD + worktree
+    registrations MUST be identical before and after every test."""
+    before = _host_repo_state()
+    yield
+    after = _host_repo_state()
+    assert before == after, (
+        "worktree-guard parity test LEAKED into the host repo — HEAD or "
+        "worktree registrations changed.\n"
+        f"  before: {before!r}\n"
+        f"  after:  {after!r}\n"
+        "A test ran the creating hook / committed against the host repo "
+        "instead of an isolated tmp repo. Ensure the payload cwd + "
+        "CLAUDE_PROJECT_DIR + the hook subprocess cwd all point at a tmp repo."
+    )
+
+
 def _sh_text() -> str:
     return SH.read_text(encoding="utf-8")
 
@@ -202,6 +275,8 @@ def _worktree_paths(root: Path) -> list[str]:
 
 def _run_sh(payload: dict, project_dir: Path, extra_env: dict | None = None):
     env = os.environ.copy()
+    for _k in _LEAK_ENV_KEYS:
+        env.pop(_k, None)
     env["CLAUDE_PROJECT_DIR"] = str(project_dir)
     if extra_env:
         env.update(extra_env)
@@ -211,6 +286,7 @@ def _run_sh(payload: dict, project_dir: Path, extra_env: dict | None = None):
         capture_output=True,
         text=True,
         env=env,
+        cwd=str(project_dir),
         timeout=60,
     )
 
@@ -218,6 +294,8 @@ def _run_sh(payload: dict, project_dir: Path, extra_env: dict | None = None):
 def _run_ps1(payload: dict, project_dir: Path, extra_env: dict | None = None):
     assert _PS is not None
     env = os.environ.copy()
+    for _k in _LEAK_ENV_KEYS:
+        env.pop(_k, None)
     env["CLAUDE_PROJECT_DIR"] = str(project_dir)
     if extra_env:
         env.update(extra_env)
@@ -227,6 +305,7 @@ def _run_ps1(payload: dict, project_dir: Path, extra_env: dict | None = None):
         capture_output=True,
         text=True,
         env=env,
+        cwd=str(project_dir),
         timeout=60,
     )
 

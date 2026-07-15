@@ -58,6 +58,90 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 HOOK_PATH = REPO_ROOT / "templates" / "hooks" / "worktree-guard.sh"
 
 
+# ── HOST-REPO LEAK TRIPWIRE + HARD ENV ISOLATION ──────────────────────────
+# WP-5 (v0.2.82): the worktree-guard hook is a *creating* hook — it runs a
+# REAL ``git worktree add --detach <toplevel>/.claude/worktrees/<id> HEAD``
+# on whatever repo its resolved CWD/CLAUDE_PROJECT_DIR sits in. If a test
+# does not isolate (ambient CWD == the host repo, a pre-set CLAUDE_PROJECT_DIR,
+# or a payload whose ``cwd`` points at the host), the hook creates a worktree
+# of the HOST repo and a subsequent in-worktree commit lands a real object +
+# registered worktree in the host ``.git`` — the exact leak that put author
+# "t"/file "f.txt"/msg "in-worktree" into the host history (removed by rebase).
+# Two permanent guards below make that class of leak impossible:
+#   1. ``_isolate_env`` — chdir into the per-test tmp dir and scrub the env
+#      vars that could point the hook at the host repo. Every hook subprocess
+#      also gets an explicit ``cwd=`` (see ``_run_hook``).
+#   2. ``_host_repo_unchanged`` — snapshot the HOST repo (the repo THIS test
+#      file lives in) HEAD + worktree registrations before each test and
+#      assert them unchanged after. A tripwire that fails LOUD the instant a
+#      future edit re-introduces the leak.
+
+# Env keys that could redirect the hook's repo resolution at the host repo.
+_LEAK_ENV_KEYS = ("CLAUDE_PROJECT_DIR", "GIT_DIR", "GIT_WORK_TREE")
+
+
+def _host_repo_state() -> tuple[str, str]:
+    """(HEAD, sorted worktree-list) of the repo THIS test file lives in.
+
+    Uses ``git -C REPO_ROOT`` explicitly so the probe is unaffected by the
+    test's own chdir. Worktree registrations live in the shared common-dir,
+    so a stray worktree created under REPO_ROOT's toplevel (even from a linked
+    worktree checkout) surfaces here. Returns empty strings if REPO_ROOT is
+    not a git repo (e.g. an exported source tree) so the guard degrades to a
+    no-op rather than erroring.
+    """
+    def _git_out(*args: str) -> str:
+        try:
+            return subprocess.run(
+                ["git", "-C", str(REPO_ROOT), *args],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+        except (subprocess.CalledProcessError, OSError):
+            return ""
+
+    head = _git_out("rev-parse", "HEAD")
+    if not head:
+        return ("", "")
+    wt_raw = _git_out("worktree", "list", "--porcelain")
+    wt = "\n".join(sorted(
+        line for line in wt_raw.splitlines() if line.startswith("worktree ")
+    ))
+    return (head, wt)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Hard isolation: chdir into the per-test tmp dir (so ambient CWD is
+    never the host repo) and scrub env vars that could point the hook at the
+    host repo. Autouse → applies to every test in this module."""
+    for key in _LEAK_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.chdir(tmp_path)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _host_repo_unchanged():
+    """Permanent tripwire: the HOST repo (this file's repo) HEAD + worktree
+    registrations MUST be identical before and after every test. If a hook
+    invocation ever creates a worktree of / commits into the host repo, this
+    fails LOUD instead of silently polluting it."""
+    before = _host_repo_state()
+    yield
+    after = _host_repo_state()
+    assert before == after, (
+        "worktree-guard test LEAKED into the host repo — HEAD or worktree "
+        "registrations changed.\n"
+        f"  before: {before!r}\n"
+        f"  after:  {after!r}\n"
+        "A test invoked the creating hook / committed against the host repo "
+        "instead of an isolated tmp repo. Ensure the payload cwd + "
+        "CLAUDE_PROJECT_DIR + the hook subprocess cwd all point at a tmp repo."
+    )
+
+
 def _expected_wt_path(repo: Path, raw_id: str) -> Path:
     """The path the hook derives for ``raw_id`` — mirrors the hook's
     sanitize_id + the v0.2.74 M-3 hash suffix (`<token>-<sha256[:8]>`)."""
@@ -123,6 +207,11 @@ def _run_hook(
     extra_env: dict | None = None,
 ) -> subprocess.CompletedProcess:
     env = os.environ.copy()
+    # Scrub host-redirecting env vars, THEN pin CLAUDE_PROJECT_DIR at the
+    # isolated project dir — so the hook's ``PROJECT_ROOT`` / ``GIT_SCOPE_DIR``
+    # can never resolve into the host repo (WP-5 leak guard).
+    for _k in _LEAK_ENV_KEYS:
+        env.pop(_k, None)
     env["CLAUDE_PROJECT_DIR"] = str(project_dir)
     if extra_env:
         env.update(extra_env)
@@ -133,6 +222,10 @@ def _run_hook(
         capture_output=True,
         text=True,
         env=env,
+        # Explicit cwd at the isolated project dir: the hook falls back to
+        # ``$PWD`` when neither the payload cwd nor CLAUDE_PROJECT_DIR resolve,
+        # so it must never inherit the ambient (possibly host-repo) CWD.
+        cwd=str(project_dir),
         timeout=30,
     )
 
