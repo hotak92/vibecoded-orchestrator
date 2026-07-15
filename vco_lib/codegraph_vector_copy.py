@@ -55,7 +55,13 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
+
+# v0.2.82 L4: the ONE home for named-vector round-trip cleaning (dropping
+# configured-but-empty ``{slot: []}`` slots weaviate rejects on re-insert).
+# LOUD-FAIL import (no fallback): a broken vco_lib install must surface. MUST
+# MATCH the sibling call site in vco_lib/project_init.py.
+from vco_lib.weaviate_vectors import clean_named_vector
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +77,35 @@ _CODEGRAPH_BASES: Tuple[str, ...] = (
     "CodeModule", "CodeClass", "CodeFunction", "CodeAPI", "CodeInteraction",
 )
 _CHUNKABLE_BASES: frozenset = frozenset({"CodeClass", "CodeFunction"})
+
+# ── Cross-reference topology (MUST MATCH the analyzer's ReferenceProperty
+# blocks in templates/scripts/analyze_code_graph.py) ─────────────────────────
+#
+# Each entry maps a base → the reference-property NAMES it carries. These edges
+# are load-bearing: ``query_code_structure`` reads them (return_references +
+# Filter.by_ref) and WP-2's own backfill repairs them. Because the copied row
+# keeps its verbatim content_hash + embed_revision, the analyzer SKIPs it on
+# every future walk — so if the migration doesn't carry the references, the
+# edges are lost FOREVER (never re-created). References cross collections, so
+# the UUID-remap map that B3 builds spans ALL FIVE collections.
+#
+# Reference target collections (for docs; the migration remaps via a GLOBAL
+# old→new UUID map so it does not need to know the target base per name):
+#   CodeModule       imports          → CodeModule
+#   CodeClass        module           → CodeModule
+#                    extends          → CodeClass
+#   CodeFunction     module           → CodeModule
+#                    calls            → CodeFunction
+#   CodeAPI          handler          → CodeFunction
+#   CodeInteraction  source_function  → CodeFunction
+#                    source_module    → CodeModule
+_REFERENCE_NAMES: Dict[str, Tuple[str, ...]] = {
+    "CodeModule": ("imports",),
+    "CodeClass": ("module", "extends"),
+    "CodeFunction": ("module", "calls"),
+    "CodeAPI": ("handler",),
+    "CodeInteraction": ("source_function", "source_module"),
+}
 
 # The stored property whose value the deterministic UUID mixes as ``file_path``.
 # CodeModule keys the SEED file slot on ``path``; the rest carry ``file_path``.
@@ -121,7 +156,10 @@ def _load_analyzer_uuid_builder() -> Callable[..., str]:
             "_deterministic_uuid — the analyzer contract changed; refusing to "
             "guess a UUID seed."
         )
-    return builder
+    # ``getattr`` types ``builder`` as ``object``; the ``callable`` guard above
+    # proved it is a callable — cast to the declared return type so the
+    # signature stays honest (type-only, zero behaviour change).
+    return cast("Callable[..., str]", builder)
 
 
 def _posix_normalize(path_value: Any) -> str:
@@ -183,16 +221,15 @@ def _identity_key_for_row(base: str, props: Dict[str, Any]) -> Optional[str]:
             return None
         return f"{endpoint or ''}:{method or ''}"
     if base == "CodeInteraction":
-        # ``ix::<source>::<endpoint>``. The source token is not stored; only
-        # reconstructable when the row carries an explicit source hint. We do
-        # NOT guess (a wrong identity_key mints a wrong UUID → a silent orphan),
-        # so absent-source interaction rows are LEFT + counted (D3-shaped:
-        # they converge when their file is re-walked under the new identity).
-        source = props.get("source") or props.get("source_entity")
-        endpoint = props.get("endpoint")
-        if not source or not endpoint:
-            return None
-        return f"ix::{source}::{endpoint}"
+        # ``ix::<source>::<endpoint>``. The source token is NEVER a stored
+        # property (M1: it's the interaction's source-entity name at extraction
+        # time; the schema carries no ``source``/``source_entity`` column — see
+        # the analyzer's CodeInteraction Property list). So this shape is always
+        # unreconstructable from stored props: we return None (LEFT + counted),
+        # never guessing a wrong identity_key that would mint a wrong UUID and
+        # silently orphan the row. These rows converge when their file is
+        # re-walked under the new identity (D3-shaped).
+        return None
     return None
 
 
@@ -252,6 +289,94 @@ def _vector_is_present(vec: Any) -> bool:
         return bool(vec)
 
 
+def _query_references_for(base: str):
+    """Build the ``return_references`` argument for ``base``'s reference names.
+
+    Uses weaviate v4's ``QueryReference(link_on=<name>)`` so a point-read
+    resolves each cross-reference to its target object(s). Returns ``None`` for
+    a base with no references (never asks for an empty reference set). Imported
+    lazily so the module loads without a live weaviate (mirrors the historic
+    ``_iter_project_rows`` local-import contract that tests monkeypatch).
+    """
+    names = _REFERENCE_NAMES.get(base) or ()
+    if not names:
+        return None
+    from weaviate.classes.query import QueryReference
+
+    return [QueryReference(link_on=n) for n in names]
+
+
+def _read_reference_targets(src_obj, base: str) -> Dict[str, List[str]]:
+    """Extract ``{ref_name: [target_uuid, ...]}`` from a fetched source object.
+
+    A fetched object's ``.references`` is ``{name: _CrossReference}`` where the
+    cross-reference exposes ``.objects`` (a list of resolved target objects,
+    each carrying ``.uuid``). weaviate only resolves LIVE targets, so a stored
+    beacon to a since-deleted object simply does not appear (it is dropped at
+    read time — the conservative outcome). Absent/None references → empty dict.
+    Soft-fail: any shape surprise yields the names we could read, never raises.
+    """
+    out: Dict[str, List[str]] = {}
+    refs = getattr(src_obj, "references", None)
+    if not refs:
+        return out
+    for name in _REFERENCE_NAMES.get(base, ()):  # only the schema's ref names
+        try:
+            cross = refs.get(name) if hasattr(refs, "get") else None
+            if cross is None:
+                continue
+            objs = getattr(cross, "objects", None) or []
+            targets = [str(getattr(o, "uuid", "")) for o in objs]
+            targets = [t for t in targets if t]
+            if targets:
+                out[name] = targets
+        except Exception as exc:  # noqa: BLE001 — a bad ref name never aborts
+            logger.debug("vector-copy: reading ref %s on %s failed: %s", name, base, exc)
+    return out
+
+
+def _remap_reference_targets(
+    ref_targets: Dict[str, List[str]],
+    uuid_map: Dict[str, str],
+    is_live: Optional[Callable[[str], bool]] = None,
+) -> Tuple[Dict[str, List[str]], int]:
+    """Remap every reference target UUID through ``uuid_map``; return the write
+    dict + the count of targets DROPPED (dangling/unmappable).
+
+    Per-target rule (B3):
+      * ``t in uuid_map``            → the target is being migrated → use the
+                                       NEW uuid (else it dangles once the old
+                                       target row is deleted). [remapped]
+      * ``t not in uuid_map`` but it
+        resolves to a live object    → keep ``t`` verbatim (a valid non-migrated
+                                       target; its UUID is unchanged). [kept]
+      * ``t`` neither in the map nor
+        a live object                → DROP that single target + count it (a
+                                       dangling beacon) — never guess. [dropped]
+
+    ``is_live`` answers "does this UUID currently resolve to a live row?" (across
+    every collection). When ``None`` every target is treated as live (kept) — a
+    conservative default that never drops. In production, weaviate's
+    ``return_references`` only surfaces LIVE targets, so ``is_live`` is
+    effectively always True for what's read and the drop branch never fires; it
+    is a defensive counter exercised by the unit tests.
+    """
+    remapped: Dict[str, List[str]] = {}
+    dropped = 0
+    for name, targets in ref_targets.items():
+        kept: List[str] = []
+        for t in targets:
+            if t in uuid_map:
+                kept.append(uuid_map[t])          # remapped
+            elif is_live is None or is_live(t):
+                kept.append(t)                     # kept (valid non-migrated)
+            else:
+                dropped += 1                       # dangling → drop + count
+        if kept:
+            remapped[name] = kept
+    return remapped, dropped
+
+
 def copy_one_row_with_vector(
     src_coll,
     dest_coll,
@@ -260,12 +385,24 @@ def copy_one_row_with_vector(
     *,
     return_properties: Optional[List[str]] = None,
     project_override: Optional[str] = None,
+    references: Optional[Dict[str, List[str]]] = None,
 ) -> CopyOutcome:
-    """Copy ONE row (props + vector) from ``src_uuid`` to ``dest_uuid``.
+    """Copy ONE row (props + vector + references) from ``src_uuid`` to
+    ``dest_uuid``.
 
     The vector is carried VERBATIM (named-vector dict written back unchanged —
-    ZERO embedding computed). ``project_override`` replaces the ``project``
-    property on the destination (the whole point of an identity migration).
+    ZERO embedding computed) after :func:`clean_named_vector` drops any
+    configured-but-empty ``{slot: []}`` slots weaviate would reject on write
+    (B4). ``project_override`` replaces the ``project`` property on the
+    destination (the whole point of an identity migration).
+
+    ``references`` (B3) is the ALREADY-REMAPPED cross-reference write dict
+    ``{ref_name: [target_uuid, ...]}`` — the caller reads the source row's
+    references, remaps every target through the migration's global old→new UUID
+    map, and passes the result here so it is written on insert/replace. Without
+    it the copied row would carry ZERO references and — because it keeps its
+    verbatim content_hash/embed_revision, so the analyzer SKIPs it forever — its
+    edges (imports/extends/calls/handler/source_*) would be lost permanently.
 
     Collision handling (dest already present):
       * dest exists WITH a vector → it is a true duplicate of the source (same
@@ -293,6 +430,17 @@ def copy_one_row_with_vector(
     if project_override is not None:
         src_props["project"] = project_override
 
+    # B4: strip configured-but-empty named-vector slots BEFORE any write — a
+    # ``{slot: []}`` round-trips on mixed-slot installs and weaviate rejects it
+    # with WeaviateInvalidInputError('Invalid vectors: [].'). MUST MATCH the
+    # sibling call in vco_lib/project_init.py::_copy_collection_with_vectors.
+    write_vec = clean_named_vector(src_vec)
+
+    # Only pass ``references=`` when there is at least one edge to write — the
+    # weaviate insert/replace ``references`` kwarg tolerates None/absent but a
+    # ``{}`` from a base with no refs is simply omitted.
+    write_refs = references or None
+
     # 2. Collision probe on the destination.
     dest_obj = _fetch_with_vector(dest_coll, dest_uuid)
     if dest_obj is not None:
@@ -306,7 +454,8 @@ def copy_one_row_with_vector(
         # Vectorless dest → replace it with the good source vector (never drop).
         try:
             dest_coll.data.replace(
-                uuid=dest_uuid, properties=src_props, vector=src_vec,
+                uuid=dest_uuid, properties=src_props, vector=write_vec,
+                references=write_refs,
             )
         except Exception as exc:  # noqa: BLE001 — replace failed → leave source
             return CopyOutcome("failed", dest_uuid, f"vectorless-dest replace failed: {exc}")
@@ -317,7 +466,8 @@ def copy_one_row_with_vector(
     # 3. Fresh insert at the destination UUID with the verbatim vector.
     try:
         dest_coll.data.insert(
-            properties=src_props, uuid=dest_uuid, vector=src_vec,
+            properties=src_props, uuid=dest_uuid, vector=write_vec,
+            references=write_refs,
         )
     except Exception as exc:  # noqa: BLE001 — insert failed → leave source
         return CopyOutcome("failed", dest_uuid, f"insert failed: {exc}")
@@ -385,11 +535,23 @@ class MigrationSummary:
     deduped: int = 0
     left: int = 0
     failures: int = 0
+    #: B3 — cross-reference targets DROPPED because they were dangling
+    #: (neither in the migration's old→new UUID map nor a currently-live UUID).
+    #: A diagnostic counter only; NOT part of the machine-readable summary line
+    #: (the Rust parser keys on moved/deduped/left/failures — adding a token
+    #: would be tolerated by its unknown-key skip but T8 pins the exact line,
+    #: so refs_dropped surfaces via the log, not the parsed line).
+    refs_dropped: int = 0
     #: Per-collection breakdown (name → dict of the four counters) for logs.
     per_collection: Dict[str, Dict[str, int]] = field(default_factory=dict)
 
     def summary_line(self) -> str:
-        """The machine-readable one-liner WP-3's launcher parser keys on."""
+        """The machine-readable one-liner WP-3's launcher parser keys on.
+
+        Deliberately the FOUR canonical counters only — byte-identical to the
+        pre-B3 contract so the Rust ``parse_identity_migration_summary`` and the
+        T8 pin both keep matching. ``refs_dropped`` is logged separately.
+        """
         return (
             f"IDENTITY_MIGRATION moved={self.moved} deduped={self.deduped} "
             f"left={self.left} failures={self.failures}"
@@ -401,16 +563,22 @@ def _iter_project_rows(coll, base: str, old_identity: str):
     ``project == old_identity``.
 
     Reads only the properties the migration needs (the path + identity-bearing
-    fields + chunk props for chunkable collections + ``project``). A filtered
-    server-side query is preferred; on any filter/iterator error the caller's
-    per-collection try/except soft-fails the whole collection.
-    """
-    from weaviate.classes.query import Filter
+    fields + chunk props for chunkable collections + ``project``).
 
+    B2: weaviate-client v4.21's ``Collection.iterator`` has NO ``filters``
+    kwarg (only ``include_vector`` / ``return_metadata`` / ``return_properties``
+    / ``return_references`` / ``after`` / ``cache_size``) — an earlier draft
+    passed ``filters=`` and every call raised ``TypeError`` that the caller's
+    per-collection soft-fail swallowed, yielding an all-zero no-op migration.
+    We iterate UNFILTERED and filter client-side on ``project == old_identity``
+    (the same pattern :mod:`vco_lib.codegraph_prune` uses). On any iterator
+    error the caller's per-collection try/except soft-fails the collection.
+    """
     want_props = _row_return_properties(base)
-    flt = Filter.by_property("project").equal(old_identity)
-    for obj in coll.iterator(return_properties=want_props, filters=flt):
+    for obj in coll.iterator(return_properties=want_props):
         props = getattr(obj, "properties", None) or {}
+        if props.get("project") != old_identity:
+            continue
         yield str(obj.uuid), dict(props)
 
 
@@ -419,6 +587,15 @@ def _row_return_properties(base: str) -> List[str]:
 
     Enough to (a) reconstruct the identity_key, (b) know the path for UUID
     re-derivation, and (c) know the chunk shape for chunkable collections.
+
+    EVERY name here MUST be a real schema property of ``base`` — asking weaviate
+    for a non-schema property 422s the whole read. (M1: an earlier draft
+    requested ``source`` / ``source_entity`` for CodeInteraction; those are NOT
+    schema properties — the interaction's source token is an extraction-time
+    value that is never stored — so requesting them would 422 the whole
+    collection once the iterate runs unfiltered. CodeInteraction's identity_key
+    is therefore honestly unreconstructable and its rows are LEFT + counted;
+    they converge when their file is re-walked under the new identity.)
     """
     props = {"project", "project_source"}
     props.add(_PATH_PROP.get(base, "file_path"))
@@ -429,7 +606,10 @@ def _row_return_properties(base: str) -> List[str]:
     elif base == "CodeAPI":
         props.update({"endpoint", "method"})
     elif base == "CodeInteraction":
-        props.update({"endpoint", "source", "source_entity", "raw_target"})
+        # Schema-present props only (see docstring + analyzer schema block).
+        # No ``source``/``source_entity`` (non-schema) → identity_key stays
+        # unreconstructable → row left + counted, honestly.
+        props.update({"endpoint", "raw_target"})
     return sorted(props)
 
 
@@ -475,26 +655,36 @@ def migrate_project_identity(
     uuid_builder: Optional[Callable[..., str]] = None,
 ) -> MigrationSummary:
     """Migrate every ``project == old_identity`` row under ``prefix`` to be
-    keyed under ``new_identity`` — copying vectors VERBATIM, deduping, and
-    deleting confirmed-migrated sources.
+    keyed under ``new_identity`` — copying vectors AND references VERBATIM,
+    deduping, and deleting confirmed-migrated sources.
 
-    For each of the 5 collections ``<prefix>_<base>``:
-      1. iterate rows where ``project == old_identity``;
-      2. reconstruct the identity_key from stored props (per shape); an
-         unreconstructable row is LEFT + counted (never guessed);
-      3. re-derive the destination UUID under ``new_identity`` (REUSING the
-         analyzer's ``_deterministic_uuid``), trying the RAW stored path first
-         and the ``\\``→``/`` normalized form second (prefer-exact);
-      4. copy the row+vector to the destination (collision rule in
-         :func:`copy_one_row_with_vector`), overriding the ``project`` property;
-      5. on a positively-confirmed destination (fresh copy, replaced vectorless,
-         or a pre-existing vector-bearing dest) delete the SOURCE. A source is
-         NEVER deleted without that confirmation.
+    TWO PASSES (B3 — references cross collections, so the old→new UUID map must
+    be built for ALL FIVE collections before any row is copied):
 
-    ``dry_run=True`` reads + classifies but performs NO writes/deletes — the
-    counters describe what WOULD happen. Per-row and per-collection soft-fail:
-    a single bad row/collection never aborts the whole migration (there is no
-    global timeout — per-row soft-fail is the guard, per project rule).
+    PASS 1 (plan): for each of the 5 collections ``<prefix>_<base>``, iterate
+      rows where ``project == old_identity`` and, per row:
+        1. reconstruct the identity_key from stored props (per shape); an
+           unreconstructable row is LEFT + counted (never guessed);
+        2. re-derive the destination UUID under ``new_identity`` (REUSING the
+           analyzer's ``_deterministic_uuid``), trying the RAW stored path first
+           and the ``\\``→``/`` normalized form second (prefer-exact); a row
+           whose stored UUID no candidate reproduces is LEFT + counted.
+      The reconstructable rows populate a GLOBAL ``old_uuid → new_uuid`` map
+      (spanning all five collections) used to remap cross-references in pass 2.
+
+    PASS 2 (execute): for each planned row, read it WITH its vector AND its
+      cross-references, remap every reference target through the global map
+      (in-map → new uuid; valid non-migrated target → keep; dangling → drop +
+      count), then copy the row+vector+remapped-references to the destination
+      (collision rule in :func:`copy_one_row_with_vector`), overriding
+      ``project``. On a positively-confirmed destination delete the SOURCE — a
+      source is NEVER deleted without that confirmation.
+
+    ``dry_run=True`` runs pass 1 (planning + classification) but performs NO
+    writes/deletes — the counters describe what WOULD happen. Per-row and
+    per-collection soft-fail: a single bad row/collection never aborts the whole
+    migration (there is no global timeout — per-row soft-fail is the guard, per
+    project rule).
 
     NOTE (coordinator/user): running this on the ROOT project performs exactly
     the pending spaced-root dedup cleanup under the collision rule. Get explicit
@@ -515,17 +705,23 @@ def migrate_project_identity(
 
     builder = uuid_builder or _load_analyzer_uuid_builder()
 
+    # ── PASS 1: plan every collection, building the GLOBAL old→new UUID map ──
+    # per_collection_plans[coll_name] = (coll, base, [ _RowPlan, ... ])
+    per_collection_plans: Dict[str, Tuple[Any, str, List["_RowPlan"]]] = {}
+    # counters per collection accumulate `left` in pass 1, the rest in pass 2.
+    per_collection_counters: Dict[str, Dict[str, int]] = {}
+    uuid_map: Dict[str, str] = {}
+
     for base in _CODEGRAPH_BASES:
         coll_name = f"{prefix}_{base}"
         counters = {"moved": 0, "deduped": 0, "left": 0, "failures": 0}
+        per_collection_counters[coll_name] = counters
         try:
             if hasattr(client.collections, "exists") and not client.collections.exists(coll_name):
-                summary.per_collection[coll_name] = counters
                 continue
             coll = client.collections.get(coll_name)
         except Exception as exc:  # noqa: BLE001 — per-collection soft-fail
             logger.warning("identity migration: cannot open %s: %s", coll_name, exc)
-            summary.per_collection[coll_name] = counters
             continue
 
         try:
@@ -534,17 +730,63 @@ def migrate_project_identity(
             logger.warning(
                 "identity migration: iterate %s failed: %s", coll_name, exc
             )
-            summary.per_collection[coll_name] = counters
             continue
 
+        plans: List[_RowPlan] = []
         for src_uuid, props in rows:
-            outcome = _migrate_one_row(
-                coll, base, src_uuid, props, old_identity, new_identity,
-                builder, dry_run=dry_run,
+            plan = _plan_one_row(
+                base, src_uuid, props, old_identity, new_identity, builder,
             )
-            counters[outcome] += 1
+            if plan is None:
+                counters["left"] += 1  # unreconstructable identity/seed
+                continue
+            plans.append(plan)
+            uuid_map[plan.src_uuid] = plan.dest_uuid
+        per_collection_plans[coll_name] = (coll, base, plans)
 
-        for k in counters:
+    # A liveness resolver over the whole client: "does this UUID currently
+    # resolve to a live row in ANY of the five collections?" Used to decide
+    # keep-vs-drop for a reference target that is NOT being migrated. Only the
+    # collections we opened are probed (a missing/absent collection just never
+    # matches). weaviate's read already pre-filters dangling beacons, so this is
+    # defensive — it fires only for a target read back that no longer resolves.
+    opened_colls = [c for (c, _b, _p) in per_collection_plans.values()]
+
+    def _is_live(uuid: str) -> bool:
+        for c in opened_colls:
+            try:
+                data = getattr(c, "data", None)
+                exists = getattr(data, "exists", None) if data else None
+                if callable(exists) and exists(uuid):
+                    return True
+            except Exception:  # noqa: BLE001 — a probe failure is not "live"
+                continue
+        return False
+
+    # ── PASS 2: execute copies with remapped references (skipped on dry-run) ──
+    for coll_name, (coll, base, plans) in per_collection_plans.items():
+        counters = per_collection_counters[coll_name]
+        for plan in plans:
+            if dry_run:
+                # Classify without writing: probe the destination to predict
+                # move vs dedup (no references read; nothing is written).
+                dest_obj = _fetch_with_vector(coll, plan.dest_uuid)
+                if dest_obj is not None and _vector_is_present(
+                    getattr(dest_obj, "vector", None)
+                ):
+                    counters["deduped"] += 1
+                else:
+                    counters["moved"] += 1
+                continue
+            outcome_key, dropped = _execute_one_row(
+                coll, base, plan, new_identity, uuid_map, _is_live,
+            )
+            counters[outcome_key] += 1
+            summary.refs_dropped += dropped
+
+    # ── Aggregate the per-collection counters into the summary + log ──
+    for coll_name, counters in per_collection_counters.items():
+        for k in ("moved", "deduped", "left", "failures"):
             setattr(summary, k, getattr(summary, k) + counters[k])
         summary.per_collection[coll_name] = counters
         if any(counters.values()):
@@ -555,27 +797,44 @@ def migrate_project_identity(
                 " (dry-run)" if dry_run else "",
             )
 
+    if summary.refs_dropped:
+        logger.info(
+            "identity migration: dropped %d dangling cross-reference target(s) "
+            "(beacons pointing at rows neither migrated nor currently live)",
+            summary.refs_dropped,
+        )
+
     return summary
 
 
-def _migrate_one_row(
-    coll,
+@dataclass
+class _RowPlan:
+    """A pass-1 plan for one reconstructable row: everything pass 2 needs to
+    copy it WITHOUT re-reading the identity-bearing props."""
+
+    src_uuid: str
+    dest_uuid: str
+
+
+def _plan_one_row(
     base: str,
     src_uuid: str,
     props: Dict[str, Any],
     old_identity: str,
     new_identity: str,
     builder: Callable[..., str],
-    *,
-    dry_run: bool,
-) -> str:
-    """Migrate ONE source row; return the counter key it lands in
-    (``"moved"`` | ``"deduped"`` | ``"left"`` | ``"failures"``).
+) -> Optional["_RowPlan"]:
+    """Pass-1 planning for ONE source row.
+
+    Returns a :class:`_RowPlan` (src_uuid + derived dest_uuid) for a
+    reconstructable row, or ``None`` when the row is unreconstructable (the
+    caller counts it as ``left``). Performs NO writes — purely identity/seed
+    reconstruction.
 
     A chunkable row carries a per-chunk identity: chunk 0 keys on the bare
     identity_key, chunk ``i`` on ``<key>::<i>`` (the analyzer/guards rule). The
     migration derives the SAME per-chunk key from the row's stored ``chunk_num``
-    so each chunk row moves to its own correct destination UUID (T11).
+    so each chunk row plans its own correct destination UUID (T11).
     """
     identity_key = _identity_key_for_row(base, props)
     if identity_key is None:
@@ -583,7 +842,7 @@ def _migrate_one_row(
             "identity migration: %s row %s has unreconstructable identity_key "
             "(shape=%s) — left in place", base, src_uuid, base,
         )
-        return "left"
+        return None
 
     # Chunk-aware identity_key: chunk i>0 keys on ``<key>::<i>``. chunk_num is
     # stored only on chunkable collections; absent/0 → the bare (chunk-0) key.
@@ -600,10 +859,7 @@ def _migrate_one_row(
 
     # Try each candidate file-path form (RAW first, then POSIX-normalized) and
     # prefer the one whose re-derived SOURCE UUID matches this row's actual UUID
-    # (i.e. the shape the original UUID was minted from). If NEITHER matches the
-    # source, we still migrate under the RAW form's destination (best-effort:
-    # the row exists, its identity is what it is — but we log the mismatch so a
-    # genuinely-unreconstructable seed is visible rather than silently wrong).
+    # (i.e. the shape the original UUID was minted from).
     candidates = _candidate_file_paths(props, base)
     chosen_fp: Optional[str] = None
     for fp in candidates:
@@ -627,7 +883,7 @@ def _migrate_one_row(
             "source UUID (candidates=%r) — left in place",
             base, src_uuid, candidates,
         )
-        return "left"
+        return None
 
     try:
         dest_uuid = _dest_uuid_for(
@@ -638,14 +894,38 @@ def _migrate_one_row(
             "identity migration: %s row %s — dest UUID derivation failed: %s",
             base, src_uuid, exc,
         )
-        return "failures"
+        # A dest-derivation failure with a reproduced source seed is genuinely
+        # anomalous; leave the row (counted as left, not a mid-write failure).
+        return None
 
-    if dry_run:
-        # Classify without writing: probe the destination to predict move vs dedup.
-        dest_obj = _fetch_with_vector(coll, dest_uuid)
-        if dest_obj is not None and _vector_is_present(getattr(dest_obj, "vector", None)):
-            return "deduped"
-        return "moved"
+    return _RowPlan(src_uuid=src_uuid, dest_uuid=dest_uuid)
+
+
+def _execute_one_row(
+    coll,
+    base: str,
+    plan: "_RowPlan",
+    new_identity: str,
+    uuid_map: Dict[str, str],
+    is_live: Callable[[str], bool],
+) -> Tuple[str, int]:
+    """Pass-2 execution for ONE planned row. Returns ``(counter_key, refs_dropped)``
+    where ``counter_key`` is ``"moved"`` | ``"deduped"`` | ``"failures"``.
+
+    Reads the row WITH its cross-references, remaps every target through the
+    global ``uuid_map`` (B3), copies the row+vector+references to the
+    destination, and — on a positively-confirmed destination — deletes the
+    source.
+    """
+    src_uuid, dest_uuid = plan.src_uuid, plan.dest_uuid
+
+    # Read the source's cross-references and remap them through the global
+    # old→new map: in-map → new uuid; live non-migrated target → keep; anything
+    # else → dropped + counted. weaviate returns only live targets, so a
+    # production read never yields a dangling one; the drop branch counts an
+    # edge beacon that is neither migrated nor currently live.
+    ref_targets = _read_source_references(coll, base, src_uuid)
+    write_refs, dropped = _remap_reference_targets(ref_targets, uuid_map, is_live)
 
     # IMPORTANT: read the FULL source row (return_properties=None) for the copy
     # — the ``return_props`` iterator subset is ONLY the identity-reconstruction
@@ -656,26 +936,56 @@ def _migrate_one_row(
         coll, coll, src_uuid, dest_uuid,
         return_properties=None,
         project_override=new_identity,
+        references=write_refs,
     )
     if outcome.status == "failed":
         logger.warning(
             "identity migration: %s row %s → %s not confirmed (%s) — source left",
             base, src_uuid, dest_uuid, outcome.message,
         )
-        return "failures"
+        return "failures", dropped
 
     # Destination positively confirmed — safe to delete the source. src == dest
     # only when old==new (guarded out) so this never deletes the row we wrote.
     if src_uuid == dest_uuid:
         # Defensive: identical UUID (shouldn't happen — project seed differs).
         # Do NOT delete the row we just wrote.
-        return "moved" if outcome.status != "exists_with_vector" else "deduped"
+        key = "deduped" if outcome.status == "exists_with_vector" else "moved"
+        return key, dropped
     if not _delete_row(coll, src_uuid):
         # Dest is confirmed (data preserved) but the source delete failed → a
         # leftover dup, counted as a failure event (NOT data loss).
-        return "failures"
+        return "failures", dropped
 
-    return "deduped" if outcome.status == "exists_with_vector" else "moved"
+    return ("deduped" if outcome.status == "exists_with_vector" else "moved"), dropped
+
+
+def _read_source_references(coll, base: str, src_uuid: str) -> Dict[str, List[str]]:
+    """Point-read ``src_uuid`` WITH its cross-references; return
+    ``{ref_name: [target_uuid, ...]}``. Empty dict on absence/error/no-refs.
+
+    Uses ``fetch_object_by_id(..., return_references=[QueryReference(...)])`` so
+    each reference resolves to its target object(s) (whose ``.uuid`` we read).
+    Soft-fail: any read error → empty dict (the copy proceeds with no refs
+    rather than aborting — a missing ref is recoverable on a future full walk).
+    """
+    want_refs = _query_references_for(base)
+    if want_refs is None:
+        return {}
+    try:
+        query = getattr(coll, "query", None)
+        fetch_by_id = getattr(query, "fetch_object_by_id", None) if query else None
+        if not callable(fetch_by_id):
+            return {}
+        obj = fetch_by_id(src_uuid, return_references=want_refs)
+        if obj is None:
+            return {}
+        return _read_reference_targets(obj, base)
+    except Exception as exc:  # noqa: BLE001 — ref read failure → no refs carried
+        logger.debug(
+            "vector-copy: reference read for %s (%s) failed: %s", src_uuid, base, exc
+        )
+        return {}
 
 
 # ── copy_rows_with_vectors: the batch primitive (Task 1 public entry) ────────

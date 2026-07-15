@@ -110,10 +110,13 @@ check_pattern "GitHub fine-grained PAT"  'github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]
 # v0.2.82: PEM detection requires a PLAUSIBLE key body, not just the BEGIN
 # marker. Pattern-definition/test files legitimately contain the marker as a
 # literal (vct-launcher-core/src/secrets.rs ships a 13-char stub PEM as the
-# write-guard's leave-alone fixture) and were re-alerting on EVERY edit. A
-# real private-key body is >=1600 base64 chars; requiring >=256 keeps every
-# real leak detectable while ignoring obvious stubs. Needs a multi-line
-# window that grep -E can't express, hence $PY.
+# write-guard's leave-alone fixture) and were re-alerting on EVERY edit.
+# BODY FLOOR = 120 base64 chars. An RSA key body is >=1600 chars, but a real
+# EC SEC1 P-256 key body is only ~164 chars — the earlier >=256 floor SILENTLY
+# MISSED every EC key (the smallest real leak we must still catch). 120 stays
+# comfortably above the 13-char secrets.rs stub while catching P-256 EC keys.
+# MUST MATCH the .ps1 sibling's $b64.Length floor. Needs a multi-line window
+# that grep -E can't express, hence $PY.
 check_pem_key() {
     if "$PY" - "$EDITED_FILE" <<'PYEOF' 2>/dev/null
 import re, sys
@@ -125,7 +128,7 @@ for m in re.finditer(r"BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY", text):
     window = text[m.end():m.end() + 8192]
     end = window.find("-----END")
     body = window if end < 0 else window[:end]
-    if len(re.sub(r"[^A-Za-z0-9+/=]", "", body)) >= 256:
+    if len(re.sub(r"[^A-Za-z0-9+/=]", "", body)) >= 120:
         sys.exit(0)  # plausible real key -> alert
 sys.exit(1)  # marker(s) without a plausible body -> stub/pattern, no alert
 PYEOF

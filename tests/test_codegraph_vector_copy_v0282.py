@@ -48,21 +48,53 @@ def uuid_builder():
 # ─────────────────────────── fakes (weaviate v4 shape) ───────────────────────
 
 
+class _CrossRef:
+    """Stand-in for weaviate's ``_CrossReference`` — exposes ``.objects``, a
+    list of resolved target objects (each carrying ``.uuid``)."""
+
+    def __init__(self, objects):
+        self.objects = objects
+
+
 class _Obj:
     """A fetched object: ``.uuid``, ``.properties`` (dict), ``.vector`` (named-
-    vector dict, or None for a vectorless row)."""
+    vector dict, or None for a vectorless row), ``.references`` (dict
+    ``{name: _CrossRef}`` or None)."""
 
-    def __init__(self, uuid: str, properties: Dict[str, Any], vector: Any):
+    def __init__(self, uuid: str, properties: Dict[str, Any], vector: Any,
+                 references: Any = None):
         self.uuid = uuid
         self.properties = dict(properties)
         self.vector = vector
+        self.references = references
+
+
+def _resolve_refs(coll: "_Coll", src_uuid: str, want_names):
+    """Build a ``{name: _CrossRef}`` dict for ``src_uuid`` from the collection's
+    stored reference beacons.
+
+    The fake surfaces EVERY stored beacon UUID (whether or not its target row
+    still exists) so the migration's own ``is_live`` probe — not the read — makes
+    the keep-vs-drop decision. Real weaviate ``return_references`` pre-filters
+    dangling beacons, so in production the drop branch never fires; the fake
+    returns dangling beacons too specifically to EXERCISE that defensive branch
+    (B3's dangling-ref-counted test)."""
+    stored = coll.rows.get(str(src_uuid), {}).get("references") or {}
+    out = {}
+    for name in (want_names or []):
+        targets = stored.get(name) or []
+        objs = [_Obj(str(t), {}, None) for t in targets]
+        if objs:
+            out[name] = _CrossRef(objs)
+    return out
 
 
 class _Query:
     def __init__(self, coll: "_Coll"):
         self._coll = coll
 
-    def fetch_object_by_id(self, uuid, include_vector=False, return_properties=None):
+    def fetch_object_by_id(self, uuid, include_vector=False, return_properties=None,
+                           return_references=None):
         self._coll.fetch_calls.append(str(uuid))
         row = self._coll.rows.get(str(uuid))
         if row is None:
@@ -71,7 +103,12 @@ class _Query:
         if return_properties:
             props = {k: props.get(k) for k in return_properties}
         vec = row["vector"] if include_vector else None
-        return _Obj(str(uuid), props, vec)
+        references = None
+        if return_references:
+            # return_references is a list of _FakeQueryReference(link_on=name).
+            want_names = [getattr(r, "link_on", r) for r in return_references]
+            references = _resolve_refs(self._coll, str(uuid), want_names)
+        return _Obj(str(uuid), props, vec, references)
 
     def fetch_objects(self, filters=None, limit=None, return_properties=None,
                       return_references=None):
@@ -98,9 +135,11 @@ class _Data:
             raise RuntimeError("insert boom (injected)")
         self._coll.rows[str(uuid)] = {
             "properties": dict(properties or {}), "vector": vector,
+            "references": dict(references) if references else None,
         }
         self._coll.inserts.append(
-            {"uuid": str(uuid), "properties": dict(properties or {}), "vector": vector}
+            {"uuid": str(uuid), "properties": dict(properties or {}),
+             "vector": vector, "references": dict(references) if references else None}
         )
         return _uuid_mod.uuid4()
 
@@ -109,9 +148,11 @@ class _Data:
             raise RuntimeError("replace boom (injected)")
         self._coll.rows[str(uuid)] = {
             "properties": dict(properties or {}), "vector": vector,
+            "references": dict(references) if references else None,
         }
         self._coll.replaces.append(
-            {"uuid": str(uuid), "properties": dict(properties or {}), "vector": vector}
+            {"uuid": str(uuid), "properties": dict(properties or {}),
+             "vector": vector, "references": dict(references) if references else None}
         )
 
     def update(self, uuid=None, properties=None):
@@ -133,7 +174,8 @@ class _Data:
 class _Coll:
     def __init__(self, name: str, rows: Optional[Dict[str, dict]] = None):
         self.name = name
-        # rows: uuid -> {"properties": {...}, "vector": <dict|None>}
+        # rows: uuid -> {"properties": {...}, "vector": <dict|None>,
+        #                "references": {name: [target_uuid, ...]} | None}
         self.rows: Dict[str, dict] = rows or {}
         self.insert_raises = False
         self.replace_raises = False
@@ -145,15 +187,27 @@ class _Coll:
         self.deletes: List[str] = []
         self.query = _Query(self)
         self.data = _Data(self)
+        # Back-reference to the owning client for cross-collection ref
+        # resolution; set by _Client (None for stand-alone collections).
+        self.client: Optional["_Client"] = None
 
-    def iterator(self, return_properties=None, filters=None):
+    # B2: the REAL weaviate-client v4.21 Collection.iterator has NO `filters`
+    # kwarg. The fake MUST mirror that signature so a regression that re-adds a
+    # `filters=` call fails loudly here (it did NOT before — the old fake
+    # declared a phantom `filters=None`, masking the TypeError).
+    def iterator(self, include_vector=False, return_metadata=None,
+                 return_properties=None, return_references=None, after=None,
+                 cache_size=None):
         for u, row in list(self.rows.items()):
-            if filters is not None and not filters.matches(row["properties"]):
-                continue
             props = dict(row["properties"])
             if return_properties:
                 props = {k: props.get(k) for k in return_properties}
-            yield _Obj(u, props, None)
+            vec = row["vector"] if include_vector else None
+            refs = None
+            if return_references:
+                want_names = [getattr(r, "link_on", r) for r in return_references]
+                refs = _resolve_refs(self, str(u), want_names)
+            yield _Obj(u, props, vec, refs)
 
 
 class _Filter:
@@ -190,13 +244,24 @@ class _FilterFactory:
         return _FilterBuilder(prop)
 
 
+class _FakeQueryReference:
+    """Stand-in for weaviate's ``QueryReference(link_on=<name>)`` — the copy
+    reads ``.link_on`` to know which reference to resolve."""
+
+    def __init__(self, link_on=None, **_kw):
+        self.link_on = link_on
+
+
 @pytest.fixture(autouse=True)
 def _patch_weaviate_filter(monkeypatch):
-    """Inject the fake ``Filter`` into the module's local import site so the
-    migration's ``_iter_project_rows`` filter builds without a live weaviate."""
+    """Inject the fake ``Filter`` + ``QueryReference`` into the module's local
+    import site. B2 removed the ``_iter_project_rows`` filter (v4.21 iterator
+    has no ``filters`` kwarg), but ``fetch_objects`` in older paths + the B3
+    ``_query_references_for`` still import from ``weaviate.classes.query`` — the
+    fake keeps those imports resolving without a live weaviate."""
     fake_query = types.ModuleType("weaviate.classes.query")
     fake_query.Filter = _FilterFactory
-    fake_query.QueryReference = object  # not exercised in this file
+    fake_query.QueryReference = _FakeQueryReference
     import sys
     monkeypatch.setitem(sys.modules, "weaviate.classes.query", fake_query)
     yield
@@ -209,6 +274,11 @@ class _Client:
             exists=lambda n: n in self._colls,
             get=lambda n: self._colls[n],
         )
+        # Wire each collection back to this client so cross-collection
+        # reference resolution (imports→CodeModule, module→CodeModule, etc.)
+        # can find live targets in a DIFFERENT collection than the source's.
+        for c in self._colls.values():
+            c.client = self
 
     def close(self):  # pragma: no cover — never own-built in tests
         pass
@@ -217,6 +287,43 @@ class _Client:
 def _named_vec(*vals):
     """A named-vector dict as weaviate returns for include_vector=True."""
     return {"codesage_embed": list(vals)}
+
+
+# ─────────────────────────── B2: iterator signature pin ──────────────────────
+
+
+def test_B2_real_client_iterator_has_no_filters_kwarg():
+    """B2 (fail-on-base proof): weaviate-client v4.21's ``Collection.iterator``
+    has NO ``filters`` kwarg. The pre-fix migration passed ``filters=`` and
+    every call raised ``TypeError`` that the per-collection soft-fail swallowed
+    → an all-zero no-op migration. This pin imports the REAL client class and
+    asserts the phantom kwarg is absent, so:
+      * if a future client version ADDS a ``filters`` kwarg, we learn (and can
+        switch back to a server-side filter);
+      * if the migration RE-introduces a ``filters=`` call against this client,
+        the live smoke would ``TypeError`` again — this test is the cheap guard.
+
+    Shaped to FAIL LOUDLY if weaviate is absent (this repo treats a missing dep
+    as a broken install, not a skip): the import is unconditional, so a missing
+    weaviate raises ImportError here rather than silently passing.
+    """
+    import inspect
+
+    import weaviate.collections.collection as _collmod
+
+    sig = inspect.signature(_collmod.Collection.iterator)
+    assert "filters" not in sig.parameters, (
+        "Collection.iterator now HAS a `filters` kwarg — if intentional, the "
+        "migration may switch back to a server-side filter; until then "
+        "_iter_project_rows MUST iterate unfiltered + filter client-side "
+        f"(current params: {list(sig.parameters)})."
+    )
+    # And the kwargs the migration DOES use must exist (guards a rename).
+    for needed in ("return_properties", "return_references", "include_vector"):
+        assert needed in sig.parameters, (
+            f"Collection.iterator lost the `{needed}` kwarg the migration relies "
+            f"on (params: {list(sig.parameters)})."
+        )
 
 
 # ─────────────────────── copy primitive: purity + confirm ────────────────────
@@ -237,6 +344,40 @@ def test_copy_one_row_moves_vector_verbatim(uuid_builder):
     assert written["vector"] == vec  # verbatim, byte-identical
     assert written["vector"] is not None
     assert written["properties"]["project"] == "New"  # override applied
+
+
+def test_B4_copy_strips_empty_named_vector_slot_before_write(uuid_builder):
+    """B4 (fail-on-base proof): a mixed-slot vector round-trips the CONFIGURED-
+    but-empty slot as ``{slot: []}``; passing that back to insert raises
+    ``WeaviateInvalidInputError('Invalid vectors: [].')`` on real weaviate. The
+    copy must strip empty slots (clean_named_vector) before the write so only
+    the populated slot is sent."""
+    # Source vector: codesage populated, openai configured-but-empty.
+    mixed = {"codesage_embed": [0.1, 0.2], "openai_embed": []}
+
+    class _RejectEmptySlotData(_Data):
+        def insert(self, properties=None, references=None, uuid=None, vector=None):
+            # Mirror weaviate: an empty-LIST slot value is rejected.
+            if isinstance(vector, dict):
+                for slot, val in vector.items():
+                    if isinstance(val, list) and len(val) == 0:
+                        raise RuntimeError(f"Invalid vectors: [] (slot {slot})")
+            return super().insert(
+                properties=properties, references=references, uuid=uuid, vector=vector,
+            )
+
+    src = _Coll("P_CodeFunction", {
+        "src-uuid": {"properties": {"full_name": "m.f", "project": "Old"}, "vector": mixed},
+    })
+    src.data = _RejectEmptySlotData(src)
+    outcome = vc.copy_one_row_with_vector(
+        src, src, "src-uuid", "dest-uuid", project_override="New",
+    )
+    assert outcome.status == "copied", outcome.message
+    written = src.rows["dest-uuid"]["vector"]
+    # Only the populated slot survives; the empty slot was dropped pre-write.
+    assert written == {"codesage_embed": [0.1, 0.2]}
+    assert "openai_embed" not in written
 
 
 def test_copy_confirms_write_before_reporting_success():
@@ -562,6 +703,146 @@ def test_T12_unreconstructable_source_uuid_is_left(uuid_builder, monkeypatch):
     assert summary.left == 1
     assert summary.moved == 0
     assert "totally-alien-uuid" in func.rows  # left in place
+
+
+# ─────────────────── B3: cross-reference survival + remap ────────────────────
+
+
+def _module_row(uuid_builder, project, mod_path):
+    """Build a CodeModule row keyed on ``module::<path>`` for ``project``."""
+    ik = f"module::{mod_path}"
+    su = uuid_builder(project, mod_path, ik, project_source="")
+    return su, {
+        "properties": {"path": mod_path, "project": project, "project_source": ""},
+        "vector": _named_vec(0.9),
+    }
+
+
+def test_B3_migration_carries_and_remaps_references(uuid_builder, monkeypatch):
+    """B3 (fail-on-base proof): the migrated destination row carries its
+    cross-references, with every target UUID REMAPPED to the target's NEW
+    (migrated) UUID. Without the fix the copied row carried ZERO references and
+    — keeping its verbatim content_hash/embed_revision, so the analyzer SKIPs it
+    forever — the edges were lost permanently.
+
+    Setup: a CodeFunction ``mod.foo`` whose ``module`` ref points at a
+    CodeModule ``src/a.py`` (both migrated). After migration the destination
+    function's ``module`` ref must point at the module's NEW UUID.
+    """
+    _assert_no_embedder(monkeypatch)
+    old, new = "Old Name", "NewName"
+    mod_path, fp, ik = "src/a.py", "src/a.py", "mod.foo"
+
+    mod_su, mod_row = _module_row(uuid_builder, old, mod_path)
+    func_su = uuid_builder(old, fp, ik, project_source="")
+    # The function's stored `module` beacon points at the module's OLD uuid.
+    func_row = {
+        "properties": {
+            "full_name": ik, "file_path": fp, "project": old, "project_source": "",
+            "content_hash": "deadbeef", "embed_revision": 7,
+        },
+        "vector": _named_vec(0.5, 0.6),
+        "references": {"module": [mod_su]},
+    }
+    module = _Coll("NewName_CodeModule", {mod_su: mod_row})
+    func = _Coll("NewName_CodeFunction", {func_su: func_row})
+    client = _empty_five("NewName", overrides={
+        "CodeModule": module, "CodeFunction": func,
+    })
+
+    summary = vc.migrate_project_identity(
+        client, "NewName", old, new, uuid_builder=uuid_builder,
+    )
+
+    mod_du = uuid_builder(new, mod_path, f"module::{mod_path}", project_source="")
+    func_du = uuid_builder(new, fp, ik, project_source="")
+    assert summary.moved == 2                    # module + function both moved
+    assert summary.refs_dropped == 0
+    # The migrated function's `module` ref points at the module's NEW uuid.
+    dest_refs = func.rows[func_du]["references"]
+    assert dest_refs is not None, "references were dropped on the copy (B3 regressed)"
+    assert dest_refs["module"] == [mod_du], dest_refs
+    # And the verbatim body metadata survived (content_hash / embed_revision).
+    assert func.rows[func_du]["properties"]["content_hash"] == "deadbeef"
+    assert func.rows[func_du]["properties"]["embed_revision"] == 7
+
+
+def test_B3_reference_to_unmigrated_row_is_kept(uuid_builder, monkeypatch):
+    """B3: a reference whose target is NOT being migrated (a valid, live,
+    non-migrated row — e.g. a cross-project or already-canonical module) keeps
+    its ORIGINAL UUID (still valid), never remapped, never dropped."""
+    _assert_no_embedder(monkeypatch)
+    old, new = "Old Name", "NewName"
+    fp, ik = "src/a.py", "mod.foo"
+    func_su = uuid_builder(old, fp, ik, project_source="")
+
+    # A pre-existing module row that is NOT part of the old-identity migration
+    # set (its project is already the canonical `new`), so it stays live and is
+    # never remapped. Its UUID is a fixed, valid beacon target.
+    live_mod_uuid = "11111111-2222-3333-4444-555555555555"
+    module = _Coll("NewName_CodeModule", {
+        live_mod_uuid: {
+            "properties": {"path": "src/canon.py", "project": new,
+                           "project_source": ""},
+            "vector": _named_vec(0.9),
+        },
+    })
+    func = _Coll("NewName_CodeFunction", {
+        func_su: {
+            "properties": {"full_name": ik, "file_path": fp, "project": old,
+                           "project_source": ""},
+            "vector": _named_vec(0.5),
+            "references": {"module": [live_mod_uuid]},
+        },
+    })
+    client = _empty_five("NewName", overrides={
+        "CodeModule": module, "CodeFunction": func,
+    })
+
+    summary = vc.migrate_project_identity(
+        client, "NewName", old, new, uuid_builder=uuid_builder,
+    )
+    func_du = uuid_builder(new, fp, ik, project_source="")
+    assert summary.moved == 1                     # only the function migrated
+    assert summary.refs_dropped == 0
+    # The live, non-migrated target's UUID is KEPT verbatim.
+    assert func.rows[func_du]["references"]["module"] == [live_mod_uuid]
+    # The live module row itself is untouched (still under `new`, not migrated).
+    assert live_mod_uuid in module.rows
+
+
+def test_B3_dangling_reference_is_dropped_and_counted(uuid_builder, monkeypatch):
+    """B3: a reference whose target is neither being migrated NOR a currently-
+    live UUID (a dangling beacon) is DROPPED from the copied row and COUNTED in
+    ``summary.refs_dropped`` — never guessed at a wrong target."""
+    _assert_no_embedder(monkeypatch)
+    old, new = "Old Name", "NewName"
+    fp, ik = "src/a.py", "mod.foo"
+    func_su = uuid_builder(old, fp, ik, project_source="")
+
+    dangling_uuid = "deadbeef-0000-0000-0000-000000000000"  # resolves to nothing
+    func = _Coll("NewName_CodeFunction", {
+        func_su: {
+            "properties": {"full_name": ik, "file_path": fp, "project": old,
+                           "project_source": ""},
+            "vector": _named_vec(0.5),
+            # `calls` points at a target that exists in NO collection.
+            "references": {"calls": [dangling_uuid]},
+        },
+    })
+    client = _empty_five("NewName", overrides={"CodeFunction": func})
+
+    summary = vc.migrate_project_identity(
+        client, "NewName", old, new, uuid_builder=uuid_builder,
+    )
+    func_du = uuid_builder(new, fp, ik, project_source="")
+    assert summary.moved == 1
+    # The dangling `calls` beacon was dropped (never resolved by the fake read,
+    # so it never even reaches the write dict) — and counted.
+    assert summary.refs_dropped == 1
+    dest_refs = func.rows[func_du]["references"]
+    # No `calls` edge written (the only target was dangling).
+    assert not dest_refs or "calls" not in dest_refs, dest_refs
 
 
 # ── dry-run classifies without writing ──
