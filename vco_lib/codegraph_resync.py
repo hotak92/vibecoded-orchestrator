@@ -139,6 +139,17 @@ from vco_lib.codegraph_row_classify import (  # noqa: E402 — grouped with the 
     path_reachable_on_disk,
 )
 
+# v0.2.82 (WP-2 task 3): the resync's "owed work" staleness + the convergence
+# report's embed-vs-stamp split delegate to the ONE pure guards module, so the
+# resync count can never drift from what the analyzer's re-walk actually does.
+# ``codegraph_row_classify.classify_row`` (imported above) is a DIFFERENT,
+# reachability-aware classifier — the guards helpers are imported under
+# namespaced aliases to keep the two unmistakably separate.
+from vco_lib.codegraph_guards import (  # noqa: E402 — grouped with the notes above
+    classify_stale_kind as _guards_classify_stale_kind,
+    is_row_revision_stale as _guards_is_row_revision_stale,
+)
+
 #: Backwards-compat alias (pre-v0.2.75 module-local name).
 _path_reachable_on_disk = path_reachable_on_disk
 
@@ -464,13 +475,12 @@ def _count_stale_in_collection(
             if reachable_fn is None:
                 # Pre-R3 tier: no root/predicate → revision-only counting
                 # (classify_row would fail open toward "owed" for every
-                # path-bearing row anyway; keep the cheap explicit check).
-                rev = props.get("embed_revision")
-                try:
-                    is_stale = rev is None or int(rev) != int(current_revision)
-                except (TypeError, ValueError):
-                    is_stale = True
-                if is_stale:
+                # path-bearing row anyway). v0.2.82 (WP-2 task 3): the inline
+                # NULL/int-mismatch check is now the ONE guards helper, so the
+                # resync count and the analyzer's re-walk agree by construction.
+                if _guards_is_row_revision_stale(
+                    props.get("embed_revision"), int(current_revision)
+                ):
                     stale += 1
                 continue
             # v0.2.75 (P1b-1): ONE shared decision — count iff "owed".
@@ -604,6 +614,85 @@ def count_stale_rows(
                 return None
             counts[coll_name] = n
         return counts
+    finally:
+        if own_client:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def classify_stale_kinds(
+    project_name: str,
+    *,
+    current_revision: Optional[int] = None,
+    floor_revision: int = 1,
+    analyzer_path: Optional[Path] = None,
+    client=None,
+    weaviate_url: Optional[str] = None,
+    grpc_port: Optional[int] = None,
+) -> Optional[dict]:
+    """v0.2.82 (WP-2 task 3): split the owed rows into ``embed_owed`` vs
+    ``stamp_owed`` for the driver's convergence REPORT (reporting only).
+
+    The owed-gate semantics are UNCHANGED: a ``stamp_owed`` row still counts as
+    owed work (the pass that stamps it is cheap). This just lets the driver say
+    WHY the remaining work is owed — a metadata-only revision bump produces
+    ``stamp_owed`` rows (cheap ``data.update``, no re-embed), whereas a genuine
+    embedding-space change produces ``embed_owed`` rows. Uses the SAME guards
+    classifier (:func:`codegraph_guards.classify_stale_kind`) the analyzer's
+    per-row decision uses, so the report can never disagree with the walk.
+
+    Returns ``{"embed_owed": N, "stamp_owed": M}`` (across the three
+    file-anchored probe collections), or ``None`` when undeterminable (Weaviate
+    down / prefix unresolvable). ``floor_revision`` defaults to 1 (the current
+    ``_EMBED_SPACE_COMPATIBLE_FROM_REVISION``); callers that resolve a bumped
+    floor pass it explicitly.
+    """
+    if not project_name:
+        return None
+    if current_revision is None:
+        current_revision = _resolve_embed_revision(analyzer_path)
+    prefix = _collection_prefix(project_name)
+    if prefix is None:
+        return None
+
+    own_client = False
+    if client is None:
+        client = _build_client(weaviate_url, grpc_port)
+        if client is None:
+            return None
+        own_client = True
+
+    split = {"embed_owed": 0, "stamp_owed": 0}
+    try:
+        for base in _RESYNC_PROBE_BASES:
+            coll_name = f"{prefix}_{base}"
+            try:
+                if hasattr(client.collections, "exists") and not client.collections.exists(coll_name):
+                    continue
+                coll = client.collections.get(coll_name)
+            except Exception as exc:  # noqa: BLE001 — undeterminable
+                logger.warning(
+                    "codegraph stale-kind: cannot open %s: %s", coll_name, exc
+                )
+                return None
+            try:
+                for obj in coll.iterator(return_properties=["embed_revision"]):
+                    props = getattr(obj, "properties", None) or {}
+                    kind = _guards_classify_stale_kind(
+                        props.get("embed_revision"),
+                        current_revision=int(current_revision),
+                        floor_revision=int(floor_revision),
+                    )
+                    if kind in split:
+                        split[kind] += 1
+            except Exception as exc:  # noqa: BLE001 — undeterminable
+                logger.warning(
+                    "codegraph stale-kind: scan failed on %s: %s", coll_name, exc
+                )
+                return None
+        return split
     finally:
         if own_client:
             try:
@@ -780,6 +869,160 @@ _BACKFILL_BASES: dict = {
 }
 
 
+# ── v0.2.82 (Task 4, user scope-add — overrides plan D3): file_path backfill ──
+# for legacy anchor-less CodeAPI / CodeInteraction rows.
+#
+# WHY (rejecting D3's lazy convergence): pre-v0.2.82 CodeAPI/CodeInteraction
+# rows carried NO `file_path`, so the prune anchor-resolution could not reap the
+# orphaned rows of a deleted file. Plan D3 accepted "they converge when their
+# file next changes". The user rejected that: updating users must get old rows
+# migrated to the anchored format automatically. This backfill resolves each
+# anchor-less row's `file_path` from its stored REFERENCE to a file-anchored
+# collection (which DOES carry file_path/path) and PATCHes it in.
+#
+# Reference map (VERIFIED against the schema blocks, analyze_code_graph.py
+# ~2062-2115 as merged):
+#   CodeAPI         → `handler`         → CodeFunction (has `file_path`)
+#   CodeInteraction → `source_function` → CodeFunction (has `file_path`)
+#                     `source_module`   → CodeModule   (has `path`) — fallback
+#
+# PATCH-only + content-hash-EXCLUDED: `file_path` is in the analyzer's
+# `_CONTENT_HASH_EXCLUDE`, so writing it NEVER perturbs a matched row's content
+# hash → ZERO re-writes / re-embeds (a call-count test pins this). Rows whose
+# reference is absent/unresolvable are LEFT + counted (conservative: never guess
+# an anchor). This is not "legacy support" — it is a metadata migration the
+# WP-3 post-build backfill rider runs automatically on every non-root update.
+_ANCHOR_BACKFILL_REFS: dict = {
+    # base → ordered list of (reference_property, target_path_property). The
+    # first reference that resolves to a non-empty path wins.
+    "CodeAPI": [("handler", "file_path")],
+    "CodeInteraction": [
+        ("source_function", "file_path"),
+        ("source_module", "path"),
+    ],
+}
+
+
+def _backfill_anchor_file_paths(
+    client,
+    prefix: str,
+    *,
+    counts: dict,
+) -> tuple:
+    """v0.2.82 (Task 4): PATCH `file_path` onto anchor-less CodeAPI/Interaction
+    rows by resolving their stored reference to a file-anchored collection.
+
+    Mutates ``counts`` in place (``{collection_name: rows_updated}``) and returns
+    ``(backfilled, unresolvable)`` totals for the machine-readable CLI line.
+
+    Idempotent (rows that already carry a non-empty file_path are skipped by the
+    cheap NULL-probe gate); per-collection + per-row soft-fail; NO global
+    timeout. A reference read uses ``QueryReference`` with an inline
+    ``return_properties=[<target path prop>]`` so the referenced row's path
+    arrives with the API/Interaction row in ONE iterator pass. Unresolvable rows
+    (no reference, dangling target, target lacks a path) are LEFT + counted.
+    """
+    backfilled = 0
+    unresolvable = 0
+    try:
+        from weaviate.classes.query import Filter, QueryReference
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("codegraph anchor-backfill: weaviate query API unavailable: %s", exc)
+        return backfilled, unresolvable
+
+    for base, ref_specs in _ANCHOR_BACKFILL_REFS.items():
+        coll_name = f"{prefix}_{base}"
+        try:
+            if hasattr(client.collections, "exists") and not client.collections.exists(coll_name):
+                continue
+            coll = client.collections.get(coll_name)
+
+            # Cheap gate: a collection with no missing-file_path row is skipped
+            # entirely (steady-state cost ≈ one point query per collection).
+            # `file_path` may not even be a schema property on a pre-rider-a
+            # class — probe failure → scan anyway (fail-open toward the work).
+            try:
+                probe = coll.query.fetch_objects(
+                    filters=Filter.by_property("file_path").is_none(True),
+                    limit=1,
+                )
+                if not getattr(probe, "objects", None):
+                    counts[coll_name] = 0
+                    continue
+            except Exception:  # noqa: BLE001 — unindexed / absent prop → scan
+                pass
+
+            # One combined reference query per spec: fetch the row + its target's
+            # path inline. Build the QueryReference list once.
+            query_refs = [
+                QueryReference(link_on=ref_prop, return_properties=[target_prop])
+                for ref_prop, target_prop in ref_specs
+            ]
+
+            updated = 0
+            left = 0
+            for obj in coll.iterator(
+                return_properties=["file_path"],
+                return_references=query_refs,
+            ):
+                props = getattr(obj, "properties", None) or {}
+                if props.get("file_path"):
+                    continue  # already anchored (idempotent)
+                resolved_path = _resolve_anchor_from_refs(obj, ref_specs)
+                if not resolved_path:
+                    left += 1
+                    continue
+                try:
+                    coll.data.update(
+                        uuid=obj.uuid, properties={"file_path": resolved_path},
+                    )
+                    updated += 1
+                except Exception as exc:  # noqa: BLE001 — per-row soft-fail
+                    logger.warning(
+                        "codegraph anchor-backfill: update failed on %s/%s: %s",
+                        coll_name, obj.uuid, exc,
+                    )
+                    left += 1
+            counts[coll_name] = updated
+            backfilled += updated
+            unresolvable += left
+            if updated or left:
+                logger.info(
+                    "codegraph anchor-backfill: %s — %d anchored, %d unresolvable",
+                    coll_name, updated, left,
+                )
+        except Exception as exc:  # noqa: BLE001 — per-collection soft-fail
+            logger.warning("codegraph anchor-backfill: %s failed: %s", coll_name, exc)
+    return backfilled, unresolvable
+
+
+def _resolve_anchor_from_refs(obj, ref_specs) -> str:
+    """Resolve the first non-empty target path from a row's references.
+
+    ``obj.references`` is a dict ``{ref_prop: [ref_obj, ...]}`` where each
+    ``ref_obj.properties`` carries the inline-fetched target path. Returns the
+    first non-empty path in ``ref_specs`` order, or ``""`` when none resolve
+    (dangling reference, missing target, target lacks a path). Never raises.
+    """
+    refs = getattr(obj, "references", None) or {}
+    if not isinstance(refs, dict):
+        return ""
+    for ref_prop, target_prop in ref_specs:
+        try:
+            targets = refs.get(ref_prop)
+            objects = getattr(targets, "objects", None) if targets is not None else None
+            if objects is None and isinstance(targets, list):
+                objects = targets
+            for target in objects or []:
+                tprops = getattr(target, "properties", None) or {}
+                path = tprops.get(target_prop)
+                if path:
+                    return str(path)
+        except Exception:  # noqa: BLE001 — a bad ref shape → try the next spec
+            continue
+    return ""
+
+
 def backfill_codegraph_metadata(
     project_name: str,
     *,
@@ -819,8 +1062,11 @@ def backfill_codegraph_metadata(
         logger.warning(
             "codegraph backfill: _extract_docstring unavailable — doc half skipped"
         )
-    if is_test_fn is None and extract_fn is None:
-        return counts
+    # NOTE (v0.2.82 Task 4): the anchor `file_path` backfill for CodeAPI/
+    # CodeInteraction is INDEPENDENT of the is_test/doc helpers, so we do NOT
+    # early-return when both are None — the client is still opened and the
+    # anchor pass still runs. Only when BOTH the metadata helpers are absent do
+    # we skip the metadata loop (via the per-half `is not None` guards below).
 
     own_client = False
     if client is None:
@@ -836,7 +1082,10 @@ def backfill_codegraph_metadata(
             logger.warning("codegraph backfill: Filter unavailable: %s", exc)
             return counts
 
-        for base, (path_prop, body_prop) in _BACKFILL_BASES.items():
+        _run_metadata_half = is_test_fn is not None or extract_fn is not None
+        for base, (path_prop, body_prop) in (
+            _BACKFILL_BASES.items() if _run_metadata_half else []
+        ):
             coll_name = f"{prefix}_{base}"
             try:
                 if hasattr(client.collections, "exists") and not client.collections.exists(coll_name):
@@ -910,6 +1159,17 @@ def backfill_codegraph_metadata(
                     )
             except Exception as exc:  # noqa: BLE001 — per-collection soft-fail
                 logger.warning("codegraph backfill: %s failed: %s", coll_name, exc)
+
+        # v0.2.82 (Task 4): anchor `file_path` onto legacy CodeAPI/Interaction
+        # rows from their stored reference to a file-anchored collection. Runs
+        # unconditionally (independent of the is_test/doc helpers). The two
+        # totals are surfaced under reserved summary keys the CLI prints as a
+        # machine-readable line.
+        anchored, unresolvable = _backfill_anchor_file_paths(
+            client, prefix, counts=counts,
+        )
+        counts["_file_path_backfilled"] = anchored
+        counts["_file_path_unresolvable"] = unresolvable
         return counts
     finally:
         if own_client:
@@ -1261,9 +1521,27 @@ def run_resync_and_verify(
     stale_desc = (
         str(sum(counts.values())) if counts is not None else "unverifiable"
     )
+    # v0.2.82 (WP-2 task 3): report WHY the remaining rows are owed —
+    # embed_owed (a re-walk re-embeds) vs stamp_owed (a cheap metadata patch).
+    # Reporting ONLY: the owed-gate semantics are unchanged (stamp-owed still
+    # counts as owed above). Soft-fail — a report-split failure never changes
+    # the driver's exit or the ledger entry.
+    split_desc = ""
+    if counts is not None and sum(counts.values()) > 0:
+        try:
+            split = classify_stale_kinds(
+                project_name, analyzer_path=Path(analyzer_path),
+            )
+            if split is not None:
+                split_desc = (
+                    f", embed_owed={split.get('embed_owed', 0)} "
+                    f"stamp_owed={split.get('stamp_owed', 0)}"
+                )
+        except Exception as exc:  # noqa: BLE001 — reporting must not crash the child
+            logger.debug("resync driver: stale-kind split failed: %s", exc)
     print(
         f"[resync-driver] NOT converged (analyzer exit {rc}, "
-        f"stale rows: {stale_desc})",
+        f"stale rows: {stale_desc}{split_desc})",
         flush=True,
     )
     _record_unconverged_deferral(repo_root, project_name, counts, resume_cmd)
@@ -1695,9 +1973,19 @@ def _main(argv: Optional[list] = None) -> int:
     elif args.backfill_metadata:
         logging.basicConfig(level=logging.INFO)
         counts = backfill_codegraph_metadata(args.project)
+        # The reserved `_file_path_*` summary keys are totals, not per-collection
+        # row counts — exclude them from the updated-rows sum.
+        anchored = int(counts.pop("_file_path_backfilled", 0)) if counts else 0
+        unresolvable = int(counts.pop("_file_path_unresolvable", 0)) if counts else 0
         total = sum(counts.values()) if counts else 0
         logger.info("codegraph metadata backfill complete: %d row(s) updated (%s)",
                     total, counts)
+        # v0.2.82 (Task 4): machine-readable anchor-backfill summary line WP-3's
+        # rider (and the user) can parse from the CLI output.
+        print(
+            f"file_path_backfilled={anchored} unresolvable={unresolvable}",
+            flush=True,
+        )
     return 0
 
 

@@ -729,3 +729,242 @@ def test_r1_vectorless_rev0_row_is_in_stale_set(analyzer_mod):
     )
     stub = _R1Stub(analyzer_mod, modules, classes, functions)
     assert stub._get_existing_module("pkg/mod.py", "deadbeef") is None
+
+# ─────────────── v0.2.82 (WP-2 task 3): resync ⇄ guards parity ───────────────
+#
+# The resync's inline "owed work" staleness now delegates to
+# `guards.is_row_revision_stale`, and the driver's convergence report splits
+# embed_owed vs stamp_owed via `guards.classify_stale_kind`. These tests pin the
+# delegation (fail-without: the pre-WP-2 resync had a private inline check and no
+# classify_stale_kinds function — this section cannot run on base).
+
+import types as _types  # noqa: E402 — WP-2 section appended below the file body
+
+import vco_lib.codegraph_resync as _cr  # noqa: E402
+import vco_lib.codegraph_guards as _guards  # noqa: E402
+
+
+class _StaleIterColl:
+    """A collection whose aggregate is unavailable (forces the per-row scan in
+    `_count_stale_in_collection`), yielding the given embed_revision rows."""
+
+    def __init__(self, name, revs):
+        self.name = name
+        self._revs = revs
+        self.aggregate = _types.SimpleNamespace(
+            over_all=lambda **kw: (_ for _ in ()).throw(RuntimeError("no agg"))
+        )
+
+    def iterator(self, return_properties=None):
+        for i, rev in enumerate(self._revs):
+            yield _types.SimpleNamespace(
+                uuid=f"u{i}", properties={"embed_revision": rev}
+            )
+
+
+def test_wp2_count_stale_delegates_to_guards():
+    """`_count_stale_in_collection` (pre-R3 tier) counts exactly the rows
+    `guards.is_row_revision_stale` calls stale — NULL, junk, 0, and any
+    != current; a current row is NOT counted."""
+    current = 3
+    revs = [None, "junk", 0, 1, current, current]  # 4 stale, 2 current
+    coll = _StaleIterColl("P_CodeFunction", revs)
+    n = _cr._count_stale_in_collection(coll, current)  # reachable_fn=None
+    expected = sum(1 for r in revs if _guards.is_row_revision_stale(r, current))
+    assert n == expected == 4
+
+
+class _KindColl:
+    def __init__(self, name, revs):
+        self.name = name
+        self._revs = revs
+
+    def iterator(self, return_properties=None):
+        for i, rev in enumerate(self._revs):
+            yield _types.SimpleNamespace(
+                uuid=f"u{i}", properties={"embed_revision": rev}
+            )
+
+
+def _kind_client(colls):
+    return _types.SimpleNamespace(
+        collections=_types.SimpleNamespace(
+            exists=lambda n: n in colls, get=lambda n: colls[n],
+        ),
+        close=lambda: None,
+    )
+
+
+def test_wp2_classify_stale_kinds_split(monkeypatch):
+    """The convergence report split matches `guards.classify_stale_kind` per row
+    across {NULL, 0, floor-1, floor, current} (floor=2, current=3)."""
+    monkeypatch.setattr(_cr, "_collection_prefix", lambda name: "P")
+    floor, current = 2, 3
+    # embed_owed: NULL, 0, floor-1(=1). stamp_owed: floor(=2). current: 3.
+    func = _KindColl("P_CodeFunction", [None, 0, 1, 2, 3])
+    colls = {
+        "P_CodeModule": _KindColl("P_CodeModule", []),
+        "P_CodeClass": _KindColl("P_CodeClass", []),
+        "P_CodeFunction": func,
+    }
+    split = _cr.classify_stale_kinds(
+        "P", current_revision=current, floor_revision=floor,
+        client=_kind_client(colls),
+    )
+    assert split == {"embed_owed": 3, "stamp_owed": 1}
+
+
+# ─────────────── v0.2.82 (Task 4): anchor file_path backfill ─────────────────
+#
+# Legacy CodeAPI/CodeInteraction rows carry no file_path; this backfill resolves
+# it from their reference to a file-anchored collection and PATCHes it in
+# (data.update — content-hash-EXCLUDED → zero re-embeds). fail-without: the
+# pre-Task-4 backfill had no anchor pass and no reserved summary keys.
+
+
+class _RefObj:
+    """A referenced target object with inline-fetched properties."""
+
+    def __init__(self, properties):
+        self.properties = dict(properties)
+
+
+class _AnchorColl:
+    """A CodeAPI/Interaction fake: rows carry properties + a references dict
+    {ref_prop: SimpleNamespace(objects=[_RefObj,...])}."""
+
+    def __init__(self, name, rows, probe_has_missing=True):
+        self.name = name
+        self._rows = rows  # list of (uuid, props, references-dict)
+        self.updates = []
+        self.iter_calls = 0
+        self.query = _types.SimpleNamespace(
+            fetch_objects=lambda **kw: _types.SimpleNamespace(
+                objects=([object()] if probe_has_missing else [])
+            )
+        )
+        self.data = _types.SimpleNamespace(
+            update=lambda uuid, properties: self.updates.append(
+                {"uuid": uuid, "properties": properties}
+            )
+        )
+
+    def iterator(self, return_properties=None, return_references=None):
+        self.iter_calls += 1
+        for u, props, refs in self._rows:
+            obj = _types.SimpleNamespace(uuid=u, properties=dict(props))
+            obj.references = refs
+            yield obj
+
+
+def _anchor_client(api=None, interaction=None):
+    colls = {}
+    if api is not None:
+        colls["P_CodeAPI"] = api
+    if interaction is not None:
+        colls["P_CodeInteraction"] = interaction
+    return _types.SimpleNamespace(
+        collections=_types.SimpleNamespace(
+            exists=lambda n: n in colls, get=lambda n: colls[n],
+        ),
+        close=lambda: None,
+    )
+
+
+def _ref_dict(ref_prop, target_path_prop, path):
+    return {
+        ref_prop: _types.SimpleNamespace(
+            objects=[_RefObj({target_path_prop: path})]
+        )
+    }
+
+
+def test_task4_anchor_backfill_fills_from_handler_ref():
+    """A CodeAPI row with empty file_path is anchored from its `handler`
+    reference's CodeFunction.file_path (fail-without/pass-with)."""
+    api = _AnchorColl("P_CodeAPI", [
+        ("a0", {"file_path": None}, _ref_dict("handler", "file_path", "src/api.py")),
+    ])
+    counts = {}
+    backfilled, unresolvable = _cr._backfill_anchor_file_paths(
+        _anchor_client(api=api), "P", counts=counts,
+    )
+    assert backfilled == 1
+    assert unresolvable == 0
+    assert api.updates == [{"uuid": "a0", "properties": {"file_path": "src/api.py"}}]
+    assert counts["P_CodeAPI"] == 1
+
+
+def test_task4_anchor_backfill_interaction_source_function():
+    """A CodeInteraction row anchors from `source_function` (preferred over the
+    `source_module` fallback)."""
+    ix = _AnchorColl("P_CodeInteraction", [
+        ("i0", {"file_path": None},
+         _ref_dict("source_function", "file_path", "src/caller.py")),
+    ])
+    counts = {}
+    backfilled, unresolvable = _cr._backfill_anchor_file_paths(
+        _anchor_client(interaction=ix), "P", counts=counts,
+    )
+    assert backfilled == 1
+    assert ix.updates[0]["properties"]["file_path"] == "src/caller.py"
+
+
+def test_task4_anchor_backfill_unresolvable_left_and_counted():
+    """A row whose reference is absent/dangling is LEFT (no update) + counted."""
+    api = _AnchorColl("P_CodeAPI", [
+        ("a0", {"file_path": None}, {}),                       # no refs at all
+        ("a1", {"file_path": None},
+         {"handler": _types.SimpleNamespace(objects=[])}),     # dangling ref
+    ])
+    counts = {}
+    backfilled, unresolvable = _cr._backfill_anchor_file_paths(
+        _anchor_client(api=api), "P", counts=counts,
+    )
+    assert backfilled == 0
+    assert unresolvable == 2
+    assert api.updates == []          # LEFT — never guessed
+
+
+def test_task4_anchor_backfill_skips_already_anchored_idempotent():
+    """A row that already has a non-empty file_path is skipped (idempotent);
+    a second run over an all-anchored collection updates nothing."""
+    api = _AnchorColl("P_CodeAPI", [
+        ("a0", {"file_path": "src/already.py"},
+         _ref_dict("handler", "file_path", "src/api.py")),
+    ])
+    counts = {}
+    backfilled, unresolvable = _cr._backfill_anchor_file_paths(
+        _anchor_client(api=api), "P", counts=counts,
+    )
+    assert backfilled == 0
+    assert api.updates == []          # already anchored → no write
+
+
+def test_task4_anchor_backfill_no_reembed_only_file_path_patched():
+    """file_path is content-hash-EXCLUDED, so the backfill's data.update writes
+    ONLY {file_path: ...} — never a body/hash/vector field — proving a matched
+    row is not re-embedded (the update payload is the assertion)."""
+    api = _AnchorColl("P_CodeAPI", [
+        ("a0", {"file_path": None},
+         _ref_dict("handler", "file_path", "src/api.py")),
+    ])
+    counts = {}
+    _cr._backfill_anchor_file_paths(_anchor_client(api=api), "P", counts=counts)
+    assert len(api.updates) == 1
+    payload = api.updates[0]["properties"]
+    assert set(payload.keys()) == {"file_path"}   # ONLY file_path — zero re-embed
+
+
+def test_task4_backfill_surfaces_reserved_summary_keys(monkeypatch):
+    """`backfill_codegraph_metadata` returns the reserved `_file_path_*` totals
+    so the CLI can print the machine-readable anchor-backfill line."""
+    monkeypatch.setattr(_cr, "_collection_prefix", lambda name: "P")
+    monkeypatch.setattr(_cr, "_resolve_metadata_helpers", lambda: (None, None))
+    api = _AnchorColl("P_CodeAPI", [
+        ("a0", {"file_path": None},
+         _ref_dict("handler", "file_path", "src/api.py")),
+    ])
+    result = _cr.backfill_codegraph_metadata("P", client=_anchor_client(api=api))
+    assert result["_file_path_backfilled"] == 1
+    assert result["_file_path_unresolvable"] == 0

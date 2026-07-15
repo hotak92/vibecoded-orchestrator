@@ -727,7 +727,16 @@ def test_backfill_per_collection_error_isolated(monkeypatch):
 def test_backfill_noop_without_helpers(monkeypatch):
     monkeypatch.setattr(cr, "_collection_prefix", lambda name: "Proj")
     monkeypatch.setattr(cr, "_resolve_metadata_helpers", lambda: (None, None))
-    assert cr.backfill_codegraph_metadata("Proj", client=object()) == {}
+    # v0.2.82 (Task 4): the anchor `file_path` backfill for CodeAPI/Interaction
+    # is INDEPENDENT of the is_test/doc helpers, so the function no longer
+    # early-returns `{}` when both are None — it still opens the client and runs
+    # the anchor pass. With `client=object()` (no `.collections`) the anchor
+    # pass soft-fails per-collection to zero, leaving ONLY the two reserved
+    # summary keys at 0. The is_test/doc half is still fully skipped.
+    result = cr.backfill_codegraph_metadata("Proj", client=object())
+    assert result == {"_file_path_backfilled": 0, "_file_path_unresolvable": 0}
+    # No per-collection metadata key was produced (metadata half skipped).
+    assert not any(k.startswith("Proj_") for k in result)
 
 
 def test_spawn_launches_backfill_child(monkeypatch, tmp_path):
