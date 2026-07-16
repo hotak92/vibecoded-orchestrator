@@ -56,6 +56,7 @@ import sys
 import time
 from pathlib import Path
 
+from vco_lib.atomic import exclusive_file_lock
 from vco_lib.paths import vct_root_dir
 
 
@@ -109,43 +110,14 @@ def _ensure_cache_dir() -> Path:
 
 
 # ─── File locking (best-effort, cross-platform) ─────────────────────────
-
-
-def _acquire_lock(lockfile: Path):
-    """Open the lockfile and acquire an exclusive flock.
-
-    Returns the open file handle; the caller must close it (releases the
-    lock implicitly). On Windows ``fcntl`` is unavailable — we open the
-    file but skip locking; POSIX ``O_APPEND`` atomicity is approximated
-    by ``open(..., 'a')`` for short writes on Windows.
-    """
-    lockfile.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(lockfile, "a+")
-    try:
-        import fcntl  # noqa: PLC0415 — POSIX-only, deferred import
-
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-    except (ImportError, AttributeError, OSError):
-        # Windows or filesystem without flock — best-effort fallthrough.
-        pass
-    return fh
-
-
-def _release_lock(fh) -> None:
-    """Release flock (if held) and close the lockfile handle."""
-    try:
-        import fcntl  # noqa: PLC0415
-
-        try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-        except (OSError, ValueError):
-            pass
-    except (ImportError, AttributeError):
-        pass
-    try:
-        fh.close()
-    except Exception:
-        pass
+#
+# v0.2.83 (WP-B1): the ``fcntl.flock`` idiom that used to live here as the
+# ``_acquire_lock`` / ``_release_lock`` pair now lives ONCE in
+# ``vco_lib.atomic.exclusive_file_lock`` (one-concern-one-home). This module
+# keeps its own lockfile PATH (``resolver_warn.jsonl.lock`` under ``cache/``);
+# only the acquire/release MECHANISM is delegated (imported at module top).
+# Behaviour is identical: real ``LOCK_EX`` on POSIX, best-effort no-lock on
+# Windows.
 
 
 # ─── Process-kind derivation ────────────────────────────────────────────
@@ -315,14 +287,17 @@ def record_emit(error_kind: str, detail: str = "") -> None:
     }
 
     lockfile = _lockfile_path()
-    fh = _acquire_lock(lockfile)
     try:
-        _append_row(jsonl, row)
-        _maybe_rotate(jsonl)
+        with exclusive_file_lock(lockfile):
+            try:
+                _append_row(jsonl, row)
+                _maybe_rotate(jsonl)
+            except OSError:
+                pass
     except OSError:
+        # Opening the lockfile itself failed (unwritable cache dir) — the
+        # warning is already on stderr; dropping suppression state is fine.
         pass
-    finally:
-        _release_lock(fh)
 
 
 def emit_warning_if_allowed(error_kind: str, detail: str = "") -> bool:

@@ -433,10 +433,13 @@ def _default_deferral_writer(
     ``_write_node_formats_migration_deferral``). Soft-fail → False.
     """
     try:
-        from .deferral_report import DeferralEntry, DeferralReport
+        # v0.2.83 (WP-B1): the read/add/write triplet moved to the ONE emitter
+        # home (vco_lib.deferral_emit) — locked read-modify-write, foreign
+        # entries preserved. Loud-fail import per the vco_lib invariant.
+        from .deferral_emit import DeferralEntry, emit
 
-        report = DeferralReport.read(clone_root)
-        report.add_entry(
+        wrote = emit(
+            clone_root,
             DeferralEntry(
                 condition_id="hard_cut_performed",
                 severity="info",
@@ -462,10 +465,10 @@ def _default_deferral_writer(
                     "python -m vco_lib.project_init dismiss-deferral "
                     f"--folder {str(clone_root)!r} --condition-id hard_cut_performed"
                 ),
-            )
+            ),
+            log=logger,
         )
-        report.write(clone_root)
-        return True
+        return bool(wrote)
     except Exception as exc:  # never block the hard cut on a deferral write
         logger.warning(
             "_default_deferral_writer: hard_cut_performed write failed (%s)", exc

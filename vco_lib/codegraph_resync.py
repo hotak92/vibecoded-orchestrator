@@ -1349,15 +1349,19 @@ def build_unconverged_deferral(
 
 def _resolve_persisted_resync_deferral(repo_root: Path) -> None:
     """Remove a persisted resync ledger entry (converged). Read-merge-write
-    like every non-install.py deferral writer; soft-fail with a log line."""
+    like every non-install.py deferral writer; soft-fail with a log line.
+
+    v0.2.83 (WP-B1): routed through the ONE emitter home
+    (vco_lib.deferral_emit) — locked read-modify-write, foreign entries
+    preserved. ``resolve_conditions`` returns how many of the given IDs were
+    present (and dropped), so the "resolved" log line still fires only when the
+    entry actually existed."""
     try:
-        from vco_lib.deferral_report import DeferralReport
+        from vco_lib.deferral_emit import resolve_conditions
 
         folder = Path(repo_root)
-        report = DeferralReport.read(folder)
-        if report.has_condition(_CONDITION_ID):
-            report.mark_resolved(_CONDITION_ID)
-            report.write(folder)
+        removed = resolve_conditions(folder, (_CONDITION_ID,), log=logger)
+        if removed:
             logger.info("resync driver: resolved persisted resync deferral")
     except Exception as exc:  # noqa: BLE001 — cleanup is best-effort
         logger.warning("resync driver: could not resolve deferral: %s", exc)
@@ -1369,17 +1373,19 @@ def _record_unconverged_deferral(
     counts: Optional[dict],
     resume_cmd: str,
 ) -> None:
-    """Persist the one-time unconverged entry. Read-merge-write; soft-fail."""
+    """Persist the one-time unconverged entry. Read-merge-write; soft-fail.
+
+    v0.2.83 (WP-B1): routed through the ONE emitter home
+    (vco_lib.deferral_emit) — locked read-modify-write, foreign entries
+    preserved."""
     try:
         entry = build_unconverged_deferral(project_name, counts, resume_cmd)
         if entry is None:
             return
-        from vco_lib.deferral_report import DeferralReport
+        from vco_lib.deferral_emit import emit
 
         folder = Path(repo_root)
-        report = DeferralReport.read(folder)
-        report.add_entry(entry)
-        report.write(folder)
+        emit(folder, entry, log=logger)
         print(
             "[resync-driver] one-time deferral recorded in "
             f"{folder / '.claude' / 'context' / 'UPDATE_DEFERRED.md'}",
