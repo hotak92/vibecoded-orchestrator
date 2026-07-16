@@ -140,6 +140,18 @@ def install_fake_deferral_emit() -> types.ModuleType:
     existing = sys.modules.get("vco_lib.deferral_emit")
     if existing is not None:
         return existing
+    # v0.2.83 coordinator fix: the REAL module always wins when importable.
+    # The original guard only consulted sys.modules, so at conftest time
+    # (before anything imported vco_lib.deferral_emit) the fake silently
+    # SHADOWED WP-B1's real module on the merged tree — every in-process
+    # test validated the fake, not the shipped emitter. Import-first makes
+    # this helper a true no-op once the real module exists; the fake is
+    # only reachable on a tree where vco_lib/deferral_emit.py is absent.
+    try:
+        import vco_lib.deferral_emit as _real  # noqa: PLC0415 — lazy by design
+        return _real
+    except ImportError:
+        pass
     mod = types.ModuleType("vco_lib.deferral_emit")
     mod.LOCK_REL = LOCK_REL
     mod.locked_report = locked_report

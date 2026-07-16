@@ -48,65 +48,6 @@ from pathlib import Path
 import pytest
 
 
-# v0.2.83 PLAN-v0283 WP-B2 test-infra shim: the deferral producers in
-# vco_lib/project_init.py now emit through the ONE locked emitter home
-# `vco_lib.deferral_emit` (WP-B1's module, authored in a PARALLEL worktree).
-# Until WP-B1 merges, that module does not exist in a stand-alone WP-B2
-# worktree, so the function-level `from vco_lib import deferral_emit` in the
-# migrated emit paths would ImportError (soft-failed → deferrals silently not
-# written → many pre-existing suites break).
-#
-# (1) IN-PROCESS tests: inject a FAITHFUL fake into sys.modules (real
-#     DeferralReport read/add/write/mark_resolved semantics). Idempotent + a
-#     NO-OP once the real module lands (leaves an already-registered module
-#     untouched).
-# (2) SUBPROCESS tests (`python -m vco_lib.project_init ...`): a child process
-#     resolves `vco_lib.deferral_emit` ONLY as a real file inside the vco_lib
-#     package dir. If (and ONLY if) the real module is absent, materialize the
-#     faithful fake at `vco_lib/deferral_emit.py` for the session and remove it
-#     on teardown. This is a TRANSIENT test-infra file (never committed); once
-#     WP-B1's real `vco_lib/deferral_emit.py` exists, this block is a total
-#     no-op and the coordinator can drop this whole shim.
-try:  # noqa: SIM105 — explicit for clarity
-    from tests._v0283_deferral_emit_fake import install_fake_deferral_emit
-    install_fake_deferral_emit()
-except Exception:  # noqa: BLE001 — never let a test-infra shim break collection
-    pass
-
-
-@pytest.fixture(scope="session", autouse=True)
-def _materialize_deferral_emit_for_subprocesses():
-    """See the block above (2). Creates a transient vco_lib/deferral_emit.py
-    from the faithful fake ONLY when the real module is absent, so subprocess
-    tests (`python -m vco_lib.project_init`) can resolve it. Self-cleaning; a
-    no-op once WP-B1 lands."""
-    repo_root = Path(__file__).resolve().parent.parent
-    target = repo_root / "vco_lib" / "deferral_emit.py"
-    created = False
-    if not target.exists():
-        try:
-            fake_src = (Path(__file__).resolve().parent
-                        / "_v0283_deferral_emit_fake.py").read_text(encoding="utf-8")
-            # Prepend a marker so anyone inspecting the tree knows it's transient.
-            header = (
-                "# TRANSIENT TEST SHIM (v0.2.83 WP-B2 conftest) — auto-created "
-                "because WP-B1's real vco_lib/deferral_emit.py is not yet merged "
-                "into this worktree. Removed on session teardown. DO NOT COMMIT.\n"
-            )
-            target.write_text(header + fake_src, encoding="utf-8")
-            created = True
-        except OSError:
-            created = False
-    try:
-        yield
-    finally:
-        if created:
-            try:
-                target.unlink()
-            except OSError:
-                pass
-
-
 @pytest.fixture(scope="session", autouse=True)
 def _guard_repo_tracked_files_against_install_pollution():
     """Restore the repo's tracked ``CLAUDE.md`` + remove a repo-root
