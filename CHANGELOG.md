@@ -7,6 +7,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.83] - 2026-07-16
+
+### Fixed — launcher update detection ("no update available" incident)
+- **`check_for_updates` can no longer silently report "up to date" when the
+  check itself failed** (installer.rs): every remote-check failure branch
+  (upstream-remote setup, fetch, branch detection, `rev-list`, count parse —
+  the `rev-list` branch previously produced NO log at all) now populates two
+  new `UpdateStatus` fields, `remote_check_ok` / `remote_check_error`, and the
+  three spawn-level early-returns that could kill the whole status chain are
+  soft-fails. The frontend renders a distinct amber "Couldn't check for
+  updates — retrying automatically" badge state (with a Retry now action)
+  instead of nothing, schedules fast retries (30s/90s/300s, capped,
+  single-flight) instead of waiting for the hourly poll, and never paints
+  "Up to date" for a failed check — including when the status call itself
+  dies (tracked via an explicit last-check-outcome tri-state; no amber flash
+  before the first completed check).
+- **ONE serialized fetch home kills the startup fetch race** — the
+  historical "update shows only after a restart" bug: the orchestrator badge
+  check and the launcher self-update daily check both `git fetch` the same
+  repo at first-start-after->24h; the loser of the `.git/FETCH_HEAD.lock`
+  race soft-failed into a false "no update". All production fetches now go
+  through `serialized_fetch_upstream` (process-wide mutex,
+  `--no-write-fetch-head` on git ≥ 2.29, policy-preserving retry ladders,
+  and a per-attempt 30s timeout so a black-holed connection can never wedge
+  update checking until relaunch).
+- **`safeInvoke` catches rejections** — a Tauri command error mid-status-check
+  previously propagated as an unhandled rejection and silently killed the
+  entire check chain.
+- **The right-sidebar "Check Update" button is real now** — it was a
+  hardcoded stub that always displayed "Up to date" after 1 second without
+  calling anything. It now drives the real check via `updater.manualCheck()`
+  and reports the actual outcome.
+
+### Fixed / Added — deferral system (UPDATE_DEFERRED auto-resolution)
+- **`vco_lib/deferral_emit.py`** — the ONE emitter home: every UPDATE_DEFERRED
+  writer (≈20 read-modify-write triplets across `project_init.py`,
+  `hard_cut.py`, `embedding_service.py`, `codegraph_resync.py`, the dismiss
+  command, `InstallDeferralFlow.finalize`, and install.py's lightweight path)
+  now serializes on one cross-platform file lock
+  (`.claude/context/.update-deferred.lock` via `vco_lib/atomic.py::
+  exclusive_file_lock`). The Rust writers participate too: the launcher's
+  python-delegation chokepoint routes through the locked emitter and the four
+  direct Rust writers hold the same lock file via flock
+  (`deferral_lock.rs`, byte-identical lock path pinned by a cross-language
+  parity test).
+- **Provably-safe deferrals now auto-resolve** (each writes a loud log line +
+  an `auto-resolutions.jsonl` audit row; genuinely human-judgement cases
+  still defer): byte-identical compose-override pairs are recognized as the
+  sanctioned C-RT-5 mirror (no more noise deferral; both files kept);
+  yaml-semantically-equal pairs re-mirror to canonical bytes; stale
+  compose deferral records (`filename_conflict` / `renamed` /
+  `rename_failed`) self-clear once the condition no longer holds — replayed
+  onto the install run report so `finalize()` cannot resurrect them (and a
+  condition_id that is simultaneously auto-resolved for one directory pair
+  and freshly active for another is never replayed); the four inert legacy
+  `.vscode` MCP env keys auto-prune (parse-safe, fallback to deferral);
+  user-modified files whose bundle entries were deleted upstream auto-keep +
+  retire their manifest entries; EMPTY legacy codegraph collections
+  auto-drop (re-probed immediately before the drop; non-empty or case-only
+  candidates still defer); `user_secret_values_retained_in_tree` actually
+  self-clears now (reconciler flag was missing); `template_review_pending`
+  gains content-keyed dismissal memory (re-emits only when VCO ships a
+  genuinely new reference template).
+- **searxng remnant producer retired** — its remediation advised
+  `rm -r claude_mcp_servers/searxng`, which is harmful to users running
+  their own searxng MCP; existing entries self-clear.
+
+### Added — third-party MCP preservation guarantee (pinned by tests)
+- User-installed MCPs (any name — searxng, Jira, Gmail, …) are preserved
+  AND working across install/update/uninstall on every OS: files under
+  `claude_mcp_servers/` that VCO didn't ship are never touched; third-party
+  entries in the global `~/.claude.json` survive every VCO writer
+  byte-for-byte; the per-project default-disable gate applies only to VCO's
+  own bundled servers; uninstall scrubs only positively-VCO-shaped entries
+  (path inside the install root with a component-boundary check — a sibling
+  `…/vco-tools/` install can no longer be mistaken for VCO's — or
+  playwright's exact npx fingerprint) and now also removes VCO's own
+  mermaid/excalidraw/playwright entries it previously left behind.
+- **`vco_lib/mcp_scan_rules.toml`** — one committed rule table for MCP
+  scan/registration data (default entry names, allowed env keys,
+  secret-shaped needles, deprecated registry, bundled/default-disabled sets,
+  uninstall-scrub lists), parsed by both Python and Rust with
+  cross-language parity tests; fixes two stale-literal drifts (install.py's
+  2-name `bundled_names`; the uninstall scrub set). Ships via
+  orchestrator-managed-paths so table edits propagate to existing installs.
+
+### Fixed — misc
+- `deferral_emit`'s loud-log path delivered nothing for plain-callable
+  loggers (eager `getattr` default) — every project_init auto-resolution now
+  actually prints its line.
+- Keychain-backed tests serialize on the production `keyring.pace` flock
+  (test-only), eliminating cross-process flakes against a running launcher.
+
 ## [0.2.82] - 2026-07-16
 
 ### Added

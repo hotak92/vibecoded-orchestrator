@@ -2166,6 +2166,11 @@ pub(crate) fn normalize_code_model_family(model_id: &str) -> String {
 /// unknown model. Dim is the SOUND vector-space discriminator (2048 vs 1024 vs
 /// 768 vs 1536 are unambiguous), so the classifier keys on it as the primary
 /// signal and uses the family only as a same-dim tie-break.
+///
+/// v0.2.83 note: the production caller was removed by the v0.2.82 B1
+/// config-to-config rework; the dim ladder is kept as the spec table its
+/// test module pins (and for the next dim-aware consumer).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn code_model_dim(model_id: &str) -> Option<i64> {
     match normalize_code_model_family(model_id).as_str() {
         "codesage" => Some(2048),
