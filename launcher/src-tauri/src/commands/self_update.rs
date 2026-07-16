@@ -634,6 +634,22 @@ const FETCH_RETRY_DELAYS_MS: [u64; 4] = [1_000, 5_000, 30_000, 120_000];
 #[cfg(test)]
 const FETCH_RETRY_DELAYS_MS: [u64; 4] = [1, 5, 30, 120];
 
+/// M-2 (v0.2.83): per-ATTEMPT timeout for the serialized upstream fetch. A
+/// single `git fetch` runs under `.output().await` with NO cap; because
+/// `locked_fetch_with_retry` holds `UPSTREAM_FETCH_LOCK` across the whole ladder,
+/// one hung fetch (dead network, hung credential helper, stuck DNS) would stall
+/// the badge check, the daily check, AND every update/merge/rebase behind the
+/// lock forever. The plan required keeping `run_git`'s 30s cap semantics on this
+/// path — only `.silent()` had survived the D5 extraction. Each attempt is now
+/// wrapped in `tokio::time::timeout`; a timeout is a RETRYABLE error (the ladder
+/// re-tries, the lock is released on the outer future's drop). Production: 30s.
+/// Under `cfg(test)` it is milliseconds so the never-resolving-attempt
+/// regression test settles fast.
+#[cfg(not(test))]
+const FETCH_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const FETCH_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(50);
+
 /// Fetch the canonical upstream (NOT `origin`) with retry-on-failure.
 /// Caller MUST have run `ensure_upstream_remote` first.
 ///
@@ -680,7 +696,25 @@ where
             let delay = Duration::from_millis(delays[attempt - 1]);
             tokio::time::sleep(delay).await;
         }
-        match attempt_fn().await {
+        // M-2 (v0.2.83): cap each attempt so one hung fetch can't stall the
+        // whole ladder (and everything queued behind UPSTREAM_FETCH_LOCK)
+        // forever. A timeout is treated as a retryable error — the ladder
+        // continues, and on exhaustion the timeout message is surfaced to the
+        // UI. The lock is held by the OUTER `locked_fetch_with_retry` future;
+        // returning here releases it on drop, so a subsequent caller proceeds.
+        let attempt_result = match tokio::time::timeout(
+            FETCH_ATTEMPT_TIMEOUT,
+            attempt_fn(),
+        )
+        .await
+        {
+            Ok(inner) => inner,
+            Err(_elapsed) => Err(format!(
+                "git fetch timed out after {}s",
+                FETCH_ATTEMPT_TIMEOUT.as_secs().max(1)
+            )),
+        };
+        match attempt_result {
             Ok(()) => {
                 if attempt > 0 {
                     eprintln!(
@@ -2260,6 +2294,98 @@ mod tests {
         assert!(
             !overlap_detected.load(Ordering::SeqCst),
             "UPSTREAM_FETCH_LOCK must serialize concurrent fetches — two attempts overlapped"
+        );
+    }
+
+    /// M-2 (v0.2.83): a never-resolving fetch attempt must TIME OUT (retryable
+    /// Err) rather than hang the ladder — and it must NOT poison
+    /// `UPSTREAM_FETCH_LOCK`. A `std::future::pending()` attempt (mirrors a
+    /// `git fetch` stuck on a dead network under the global lock) is capped by
+    /// `FETCH_ATTEMPT_TIMEOUT` (ms-scaled under cfg(test)); the call returns the
+    /// timeout error, and a SUBSEQUENT `locked_fetch_with_retry` proceeds —
+    /// proving the lock was released when the timed-out attempt's future dropped.
+    #[tokio::test]
+    async fn never_resolving_attempt_times_out_and_releases_lock() {
+        // Empty delays slice → no retry ladder: the single attempt hangs, so
+        // the timeout is the ONLY thing that can end it.
+        let hung = locked_fetch_with_retry(Path::new("/tmp/fake"), &[], || {
+            // Never resolves — simulates a fetch subprocess stuck forever.
+            std::future::pending::<Result<(), String>>()
+        })
+        .await;
+
+        assert!(
+            hung.is_err(),
+            "a never-resolving attempt must surface a timeout error, not hang"
+        );
+        let msg = hung.unwrap_err();
+        assert!(
+            msg.contains("timed out"),
+            "the surfaced error must name the timeout, got: {msg:?}"
+        );
+
+        // The lock must be free now: a follow-up fetch (bounded so if the lock
+        // were still held, THIS would block and the test would hang) completes.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let follow_up = tokio::time::timeout(
+            Duration::from_secs(5),
+            locked_fetch_with_retry(Path::new("/tmp/fake"), &[], move || {
+                let calls_c = calls_c.clone();
+                async move {
+                    calls_c.fetch_add(1, Ordering::SeqCst);
+                    Ok::<(), String>(())
+                }
+            }),
+        )
+        .await;
+
+        assert!(
+            follow_up.is_ok(),
+            "the UPSTREAM_FETCH_LOCK must have been released after the timeout — \
+             a subsequent fetch blocked (deadlock) instead of proceeding"
+        );
+        assert!(
+            follow_up.unwrap().is_ok(),
+            "the follow-up fetch attempt should succeed"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the follow-up attempt must have actually run (lock was free)"
+        );
+    }
+
+    /// M-2 companion: a timeout is RETRYABLE — with a non-empty delays ladder a
+    /// first-attempt hang is followed by a retry that succeeds. Proves the
+    /// timeout error flows through the same retry path as a git failure.
+    #[tokio::test]
+    async fn timeout_is_retryable_and_a_later_attempt_can_succeed() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        // One-element delays slice → two attempts total. First hangs (times
+        // out), second returns Ok.
+        let result = fetch_with_retry(Path::new("/tmp/fake"), &[1], move || {
+            let calls_c = calls_c.clone();
+            async move {
+                let n = calls_c.fetch_add(1, Ordering::SeqCst) + 1;
+                if n < 2 {
+                    // First attempt hangs → the per-attempt timeout fires.
+                    std::future::pending::<Result<(), String>>().await
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "a timed-out first attempt must retry; the second attempt succeeds"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "exactly two attempts: the hung one (timed out) then the good one"
         );
     }
 

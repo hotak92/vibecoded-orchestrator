@@ -79,12 +79,33 @@ def _log(log: Any, level: str, msg: str) -> None:
     """Emit ``msg`` at ``level`` via the caller's logger (if given) else ours.
 
     ``log`` may be a stdlib ``logging.Logger`` (has the level methods) — the
-    common case. Anything falsy routes to this module's logger. A logging
-    failure is swallowed: a deferral write must never break on a log line.
+    common case — OR a PLAIN CALLABLE (e.g. ``project_init._log_auto``, which
+    all 8 producer call-sites pass). A plain function has no ``.info`` attribute,
+    so the historical ``getattr(target, level, target.info)`` evaluated its
+    ``target.info`` DEFAULT eagerly and raised ``AttributeError`` before
+    ``getattr`` ran — silently dropping the loud line to the handler-less module
+    logger. The callable-first branch fixes that: a plain callable is invoked
+    directly with the message; only a real Logger (or falsy → module logger)
+    takes the ``getattr(..., level)`` path. A logging failure is swallowed: a
+    deferral write must never break on a log line.
     """
+    if callable(log) and not isinstance(log, logging.Logger):
+        # Plain callable (e.g. a one-arg log function). Call it with the message.
+        try:
+            log(msg)
+        except Exception:  # noqa: BLE001 — logging must never raise into the caller
+            try:
+                logger.info(msg)
+            except Exception:  # noqa: BLE001
+                pass
+        return
     target = log if log is not None else logger
     try:
-        getattr(target, level, target.info)(msg)
+        _level_method = getattr(target, level, None)
+        if _level_method is not None:
+            _level_method(msg)
+        else:
+            target.info(msg)
     except Exception:  # noqa: BLE001 — logging must never raise into the caller
         try:
             logger.info(msg)

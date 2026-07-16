@@ -680,6 +680,18 @@ mod cross_process_pace {
         }
     }
 
+    /// T-1 (v0.2.83), TEST/DEBUG ONLY: set true while a keychain test holds the
+    /// production `keyring.pace` flock via `test_serialize::keychain_serialize_lock`.
+    /// `acquire_and_space` then SKIPS re-acquiring the (non-reentrant) flock so a
+    /// test that holds the lock AND calls the real `secrets::set` — which runs
+    /// `with_cross_process_pace` on the worker thread — does NOT deadlock against
+    /// its own held lock. Compiled out entirely in release builds (the whole
+    /// `if` below is `#[cfg(any(test, debug_assertions))]`), so PRODUCTION paths
+    /// are byte-identical to pre-T-1.
+    #[cfg(any(test, debug_assertions))]
+    pub(in crate::secrets) static TEST_HOLDS_PRODUCTION_PACE:
+        std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
     /// Acquire the exclusive lock and enforce cross-process spacing. Returns
     /// the held lock guard on success, or `None` if the pace file is
     /// uncreatable / flock fails (caller then degrades to in-process pacing).
@@ -688,6 +700,20 @@ mod cross_process_pace {
     /// the test override applies identically to the cross-process gate.
     fn acquire_and_space(spacing: std::time::Duration) -> Option<PaceLock> {
         let path = pace_file_path();
+        // T-1 reentrancy skip (test/debug only; compiled out in release). If a
+        // keychain test already holds the production pace flock (via
+        // `keychain_serialize_lock`) AND this call resolves to the SAME real
+        // production file, re-acquiring it here (on the worker thread, a
+        // different fd) would block forever — flock is not reentrant across fds.
+        // Skip only in that exact case: a test that pins the pace path to its own
+        // temp file (`TestPacePathGuard`) is exercising the REAL pacing on an
+        // ISOLATED file and must NOT be skipped (no deadlock — different file).
+        #[cfg(any(test, debug_assertions))]
+        if TEST_HOLDS_PRODUCTION_PACE.load(std::sync::atomic::Ordering::SeqCst)
+            && test_pace_path_override().is_none()
+        {
+            return None;
+        }
         // The pace file lives under vct_root; create the dir if absent so a
         // fresh install (root not yet mkdir'd) still paces rather than warning.
         if let Some(parent) = path.parent() {
@@ -772,6 +798,66 @@ mod cross_process_pace {
         // Hold the guard across `op`; drop (unlock) after.
         let _guard = acquire_and_space(spacing);
         op()
+    }
+
+    /// T-1 (v0.2.83), TEST/DEBUG ONLY: RAII holder of the PRODUCTION
+    /// `<vct_root>/keyring.pace` flock for a keychain test's whole lifetime, so a
+    /// `cargo test --workspace` process serializes against a RUNNING launcher
+    /// (which paces on that SAME file via `run_with_cross_process_pace`) — the
+    /// live-launcher-vs-test race that flaked `github_pat_keychain_tests`.
+    ///
+    /// While held, `TEST_HOLDS_PRODUCTION_PACE` is set so the test's OWN real
+    /// `secrets::set` (which runs `acquire_and_space` on the worker thread) skips
+    /// re-acquiring the non-reentrant flock instead of self-deadlocking. Drop
+    /// clears the flag and releases the flock (kernel also releases on close).
+    ///
+    /// Returns `None` on any flock failure (unwritable root / no flock support) —
+    /// the caller degrades to the test lockfile + in-process serialization
+    /// (pre-T-1 behaviour; a soft degrade, never a block).
+    #[cfg(any(test, debug_assertions))]
+    pub(in crate::secrets) struct TestProductionPaceGuard {
+        _lock: PaceLock,
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    impl Drop for TestProductionPaceGuard {
+        fn drop(&mut self) {
+            // Clear the reentrancy flag FIRST, then `_lock`'s Drop LOCK_UNs.
+            TEST_HOLDS_PRODUCTION_PACE
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    pub(in crate::secrets) fn acquire_production_pace_lock_for_test(
+    ) -> Option<TestProductionPaceGuard> {
+        use std::os::unix::io::AsRawFd;
+        // The REAL production pace path (bypass any test path override — the
+        // live launcher only ever locks this file).
+        let path = crate::paths::vct_root_dir().join("keyring.pace");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .ok()?;
+        let fd = file.as_raw_fd();
+        // Blocking exclusive lock — the SAME LOCK_EX the launcher's
+        // `acquire_and_space` uses, so we queue behind its held-lock windows.
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        if rc != 0 {
+            return None;
+        }
+        // Now that WE hold it, set the flag so this process's nested
+        // `acquire_and_space` (the test's own `set`) skips re-acquisition.
+        TEST_HOLDS_PRODUCTION_PACE.store(true, std::sync::atomic::Ordering::SeqCst);
+        Some(TestProductionPaceGuard {
+            _lock: PaceLock { _file: file, fd },
+        })
     }
 }
 
@@ -1467,18 +1553,26 @@ pub mod test_serialize {
 
     static KEYCHAIN_SERIALIZE: Mutex<()> = Mutex::new(());
 
-    /// Combined guard holding BOTH the in-process mutex (drops first)
-    /// and the cross-process file lock (drops second when its Drop
-    /// runs after the field-ordering rule).
+    /// Combined guard holding the in-process mutex, the test-only cross-process
+    /// file lock, AND (T-1, v0.2.83) the PRODUCTION `<vct_root>/keyring.pace`
+    /// flock so a `cargo test --workspace` process serializes against a RUNNING
+    /// launcher (which paces on that same file), not just against sibling test
+    /// binaries.
     ///
-    /// Drop order in Rust is field-declaration order — `_proc_lock`
-    /// drops first (releases the in-process mutex), then `_file_lock`
-    /// (releases the kernel-level file lock). This is the correct
-    /// order: we want other in-process readers to proceed BEFORE we
-    /// hand the cross-process baton to a sibling test binary.
+    /// Drop order in Rust is field-declaration order — `_proc_lock` drops first
+    /// (releases the in-process mutex), then `_file_lock` (the test lockfile),
+    /// then `_prod_pace_guard` (the production pace flock + reentrancy flag)
+    /// LAST. Correct order: let in-process readers proceed first, hand the
+    /// test-binary baton on next, and only THEN release the production baton to
+    /// a waiting launcher.
     pub struct KeychainGuard {
         _proc_lock: MutexGuard<'static, ()>,
         _file_lock: Option<file_lock::FileLock>,
+        /// T-1: production keyring.pace flock (unix; `None` on any flock
+        /// failure — degrades to the test lockfile only). Field only exists on
+        /// unix (the `cross_process_pace` module is `cfg(unix)`).
+        #[cfg(unix)]
+        _prod_pace_guard: Option<super::cross_process_pace::TestProductionPaceGuard>,
     }
 
     /// Acquire the process-wide keychain-test mutex. Recovers from
@@ -1505,7 +1599,18 @@ pub mod test_serialize {
     /// pattern-match on the guard type, the field is also called `_lock`
     /// in the test modules' EnvGuard structs which take this by value.
     pub fn keychain_serialize_lock() -> KeychainGuard {
-        // Acquire the cross-process file lock FIRST. If we acquired
+        // T-1 (v0.2.83): acquire the PRODUCTION keyring.pace flock FIRST so we
+        // serialize against a running launcher before taking the test-side
+        // batons. This is safe against self-deadlock: while held it sets
+        // `TEST_HOLDS_PRODUCTION_PACE`, so the test's OWN real `secrets::set`
+        // (which runs `acquire_and_space` on the worker thread) SKIPS the nested
+        // flock re-acquire instead of blocking on it. (unix only; `None` on
+        // flock failure → degrades to the test lockfile.)
+        #[cfg(unix)]
+        let prod_pace_guard =
+            super::cross_process_pace::acquire_production_pace_lock_for_test();
+
+        // Acquire the cross-process test lockfile next. If we acquired
         // the in-process mutex first and then blocked on flock(), we'd
         // hold the in-process mutex across the blocking-syscall wait,
         // pinning every other sibling-test thread in the same binary
@@ -1518,6 +1623,8 @@ pub mod test_serialize {
         KeychainGuard {
             _proc_lock: proc_lock,
             _file_lock: file_lock,
+            #[cfg(unix)]
+            _prod_pace_guard: prod_pace_guard,
         }
     }
 
@@ -3019,6 +3126,97 @@ mod tests {
         // A second attempt must NOT warn again (one-shot).
         with_cross_process_pace(|| ());
         assert_eq!(guard.warn_count(), 1, "the degrade warn is one-shot per latch");
+    }
+
+    /// T-1 (v0.2.83): `keychain_serialize_lock()` holds the PRODUCTION
+    /// `keyring.pace` flock while alive (serializing against a running launcher),
+    /// and sets `TEST_HOLDS_PRODUCTION_PACE` so a nested `acquire_and_space`
+    /// (the test's own real `set`, run on the worker thread) does NOT deadlock.
+    ///
+    /// Proof of exclusivity: with the guard held, a NON-BLOCKING flock on the
+    /// same real pace file from a separate fd fails (EWOULDBLOCK); after drop it
+    /// succeeds. Proof of no-self-deadlock: while the guard is held,
+    /// `with_cross_process_pace(op)` (the SAME wrapper `secrets::set` uses)
+    /// returns promptly — the reentrancy skip fires — rather than hanging on the
+    /// held flock. The pace file is the real `<vct_root>/keyring.pace`; touching
+    /// it is benign (the launcher creates/locks it anyway) and the keychain lock
+    /// serializes every keychain test so only one holds it at a time.
+    #[cfg(unix)]
+    #[test]
+    fn keychain_serialize_lock_holds_pace_and_is_reentrant_for_nested_ops() {
+        use std::os::unix::io::AsRawFd;
+
+        let pace_path = crate::paths::vct_root_dir().join("keyring.pace");
+
+        let probe_blocked;
+        let nested_ran;
+        {
+            let _guard = test_serialize::keychain_serialize_lock();
+            if !pace_path.exists() {
+                eprintln!(
+                    "[vct-tests] keyring.pace absent after guard (root unwritable) \
+                     — skipping T-1 exclusivity assertion"
+                );
+                return;
+            }
+            // (a) A separate fd cannot take the exclusive lock while we hold it.
+            let probe = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&pace_path)
+                .expect("open pace file for probe");
+            let rc = unsafe {
+                libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
+            };
+            probe_blocked = rc != 0;
+            if rc == 0 {
+                unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_UN) };
+            }
+
+            // (b) NO self-deadlock: the SAME wrapper secrets::set uses runs
+            // promptly under the held guard (reentrancy skip fires). If the skip
+            // were absent, this call would block forever on the held flock and
+            // the test would hang (caught by the harness timeout, but the assert
+            // documents intent).
+            let mut ran = false;
+            with_cross_process_pace(|| ran = true);
+            nested_ran = ran;
+            // _guard drops here → clears the flag, releases the flock.
+        }
+
+        // After drop, the flag is cleared and the flock is free.
+        assert!(
+            !cross_process_pace::TEST_HOLDS_PRODUCTION_PACE
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the reentrancy flag must be cleared once the guard drops"
+        );
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&pace_path)
+            .expect("open pace file post-drop");
+        let rc_after =
+            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let probe_after = rc_after == 0;
+        if rc_after == 0 {
+            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_UN) };
+        }
+
+        assert!(
+            probe_blocked,
+            "while the guard is held, the production keyring.pace flock must be \
+             EXCLUSIVE (a concurrent launcher acquire must block)"
+        );
+        assert!(
+            nested_ran,
+            "a nested with_cross_process_pace op must run (no self-deadlock via \
+             the reentrancy skip) while the guard holds the pace flock"
+        );
+        assert!(
+            probe_after,
+            "after the guard drops, the pace flock must be free for the next \
+             acquirer (no leaked lock)"
+        );
     }
 
     /// The Linux lock probe, run for real against whatever Secret-Service (if

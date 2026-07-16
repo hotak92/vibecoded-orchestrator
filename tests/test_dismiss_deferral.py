@@ -295,6 +295,85 @@ def test_json_mode_writes_only_to_stdout(
 # that would have caught the original silent breakage.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# N-1 (v0.2.83): the dismiss write must go through the SHARED deferral file
+# lock (deferral_emit.locked_report), not a direct un-locked read-modify-write.
+# ---------------------------------------------------------------------------
+
+def test_dismiss_write_goes_through_the_shared_lock(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The resolve→write must acquire the shared deferral file lock.
+
+    Observable: the lock token file (``.claude/context/.update-deferred.lock``)
+    is created when ``exclusive_file_lock`` is entered. If dismiss still did a
+    direct un-locked write, the lock file would never appear.
+    """
+    from vco_lib.deferral_emit import LOCK_REL
+
+    _seed_deferrals(tmp_path, ["bundle_user_modified_preserved", "keep_me"])
+    lock_path = tmp_path / LOCK_REL
+    assert not lock_path.exists(), "precondition: no lock file yet"
+
+    exit_code, out, _ = _run(
+        _make_args(tmp_path, "bundle_user_modified_preserved"), capsys,
+    )
+    assert exit_code == 0
+    payload = json.loads(out)
+    assert payload["dismissed"] is True
+    assert payload["remaining"] == 1  # keep_me survives
+    # The shared lock file was created → the write ran under the lock.
+    assert lock_path.exists(), (
+        "dismiss must route its write through deferral_emit.locked_report — "
+        "the shared lock file should exist after the dismiss"
+    )
+
+
+def test_dismiss_enters_locked_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch,
+) -> None:
+    """Direct assertion: ``deferral_emit.locked_report`` is entered exactly
+    once during a dismissing call (monkeypatch spy)."""
+    import vco_lib.deferral_emit as de
+
+    real_locked_report = de.locked_report
+    calls = {"n": 0}
+
+    def _spy(folder):
+        calls["n"] += 1
+        return real_locked_report(folder)
+
+    # project_init does `from vco_lib import deferral_emit as _de` at call time,
+    # then `_de.locked_report(folder)` — patch the attribute on the module.
+    monkeypatch.setattr(de, "locked_report", _spy)
+
+    _seed_deferrals(tmp_path, ["template_review_pending"])
+    exit_code, out, _ = _run(
+        _make_args(tmp_path, "template_review_pending"), capsys,
+    )
+    assert exit_code == 0
+    assert json.loads(out)["dismissed"] is True
+    assert calls["n"] == 1, (
+        "dismiss must enter deferral_emit.locked_report exactly once for the "
+        "resolve→write (N-1)"
+    )
+
+
+def test_dismiss_remaining_count_reflects_locked_reread(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The reported `remaining` comes from the LOCKED re-read of the report
+    after the resolve — the authoritative post-write disk state."""
+    _seed_deferrals(tmp_path, ["a_cond", "b_cond", "c_cond"])
+    exit_code, out, _ = _run(_make_args(tmp_path, "b_cond"), capsys)
+    assert exit_code == 0
+    payload = json.loads(out)
+    assert payload["remaining"] == 2
+    # And on disk exactly the two survivors remain.
+    remaining_ids = {e.condition_id for e in DeferralReport.read(tmp_path).entries}
+    assert remaining_ids == {"a_cond", "c_cond"}
+
+
 def test_argparse_registers_dismiss_deferral_subcommand() -> None:
     """The `dismiss-deferral` subcommand must be reachable via the
     top-level arg parser. Pre-fix this raised 'invalid choice'."""

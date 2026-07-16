@@ -490,14 +490,18 @@ def _scan_stale_mcp_entries(
         if isinstance(args, list) and args and isinstance(args[0], str):
             first_arg = args[0]
         for candidate in (cmd, first_arg):
-            if not candidate or not candidate.startswith(("/", "C:\\", "c:\\", "\\\\")):
+            if not candidate or not _looks_absolute_path(candidate):
                 continue
             # Anchor: only flag paths that look like vco install layouts
             # (claude_mcp_servers/ or .venv/). Otherwise we'd flag every
             # user-added MCP that lives in /usr/bin/foo.
             if "claude_mcp_servers" not in candidate and ".venv" not in candidate:
                 continue
-            if not candidate.startswith(install_root_str):
+            # M-3: component-aware boundary — a path OUTSIDE the current install
+            # root is stale. A sibling-prefix path (<root>-tools/...) is now
+            # correctly treated as outside (the raw startswith mis-read it as
+            # inside and skipped flagging it).
+            if not _path_is_inside_install_root(candidate, install_root_str):
                 stale.append((name, candidate, entry))
                 break
     return stale
@@ -770,10 +774,9 @@ def _scan_deprecated_mcp_entries(
         for candidate in (cmd, first_arg):
             if not candidate:
                 continue
-            # Only consider absolute paths (cross-OS).
-            if not candidate.startswith(("/", "C:\\", "c:\\", "\\\\")):
-                continue
-            if candidate.startswith(install_root_str):
+            # M-3: component-aware inside-root check (a sibling-prefix path like
+            # <root>-tools/... no longer matches) + any drive letter.
+            if _path_is_inside_install_root(candidate, install_root_str):
                 matched_path = candidate
                 break
         if not matched_path:
@@ -808,15 +811,69 @@ def _scan_deprecated_mcp_entries(
 # ---------------------------------------------------------------------------
 
 
+# M-3 (v0.2.83): a raw ``startswith`` prefix test collides on sibling paths that
+# SHARE a prefix but are NOT nested — ``/home/u/vco-tools/...`` "startswith"
+# ``/home/u/vco``, so a user's third-party MCP living at a sibling-prefix path
+# was mis-classified as VCO-owned and DELETED on uninstall. The absolute-path
+# gate ALSO missed non-C drive letters (only ``C:\`` / ``c:\`` were accepted, so
+# a ``D:\...`` VCO path fell through). These two helpers are the ONE home for
+# both concerns — every path-inside-install-root scanner routes through them.
+
+#: Absolute-path prefixes we accept, cross-OS. POSIX root ``/``, UNC ``\\``,
+#: and ANY ``<letter>:\`` drive (matched via the regex below, not this tuple —
+#: kept for the fast bail on the common POSIX/UNC cases).
+_WINDOWS_DRIVE_ABS_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _looks_absolute_path(candidate: str) -> bool:
+    """True iff ``candidate`` is an absolute path we should path-match.
+
+    Cross-OS: POSIX (``/...``), UNC (``\\\\host\\share``), and any Windows drive
+    (``C:\\``, ``D:\\``, ``z:/`` …). Fixes the pre-M-3 gate that hard-coded only
+    ``C:``/``c:`` and so ignored ``D:\\``-shaped VCO install roots."""
+    if not candidate:
+        return False
+    if candidate.startswith(("/", "\\\\")):
+        return True
+    return bool(_WINDOWS_DRIVE_ABS_RE.match(candidate))
+
+
+def _path_is_inside_install_root(candidate: str, install_root_str: str) -> bool:
+    """True iff absolute ``candidate`` is ``install_root_str`` itself or a path
+    NESTED beneath it — with a COMPONENT boundary, so a sibling that merely
+    shares a string prefix (``/home/u/vco-tools`` vs root ``/home/u/vco``) is
+    NOT a match (M-3).
+
+    Cross-OS by design: the ``~/.claude.json`` may hold Windows-shaped paths
+    (backslash separators, drive letters) even when this code runs on a POSIX
+    host, so ``pathlib.is_relative_to`` — which only understands the NATIVE
+    separator — is unreliable here. Instead, both sides are normalized (``\\``
+    → ``/``) and compared on a trailing-separator boundary. Never raises — a
+    bad path returns False."""
+    if not _looks_absolute_path(candidate):
+        return False
+    # Normalize separators so a Windows-shaped candidate gates correctly on a
+    # POSIX host (and vice versa). We intentionally do NOT case-fold: matching
+    # the pre-M-3 case-sensitive startswith exactly (only the boundary changed).
+    cand = candidate.replace("\\", "/")
+    root = install_root_str.replace("\\", "/").rstrip("/")
+    if not root:
+        return False
+    if cand == root:
+        return True
+    return cand.startswith(root + "/")
+
+
 def _mcp_entry_path_inside_install_root(entry: dict, install_root: Path) -> bool:
     """True iff the entry's ``command`` or ``args[0]`` is an ABSOLUTE path
     starting inside ``install_root`` — the same positive-ownership predicate
     :func:`_scan_deprecated_mcp_entries` / :func:`_scan_stale_mcp_entries`
     use to tell "our" entry from a user-added one at an unrelated path.
 
-    Cross-OS: only absolute paths (``/``, ``C:\\``, ``c:\\``, ``\\\\``-UNC)
+    Cross-OS: only absolute paths (POSIX ``/``, UNC ``\\\\``, any ``<drive>:\\``)
     are considered; ``npx``-launched entries have no such path and return
-    False here (playwright is handled separately)."""
+    False here (playwright is handled separately). M-3: a sibling-prefix path
+    (``<root>-tools/...``) no longer matches — the boundary is component-aware."""
     if not isinstance(entry, dict):
         return False
     install_root_str = str(install_root.resolve())
@@ -828,9 +885,7 @@ def _mcp_entry_path_inside_install_root(entry: dict, install_root: Path) -> bool
     for candidate in (cmd, first_arg):
         if not candidate:
             continue
-        if not candidate.startswith(("/", "C:\\", "c:\\", "\\\\")):
-            continue
-        if candidate.startswith(install_root_str):
+        if _path_is_inside_install_root(candidate, install_root_str):
             return True
     return False
 
