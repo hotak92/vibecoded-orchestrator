@@ -73,6 +73,17 @@ from vco_lib.weaviate_vectors import clean_named_vector
 # here for the many in-tree + test references to ``project_init.DEFAULT_WEAVIATE_PORT``.
 DEFAULT_WEAVIATE_PORT = _wh.DEFAULT_WEAVIATE_PORT
 
+
+def _log_auto(msg: str) -> None:
+    """Loud, honest one-line log to stderr for v0.2.83 auto-resolution paths
+    that have no ``log_event`` callback in scope (module-level producer
+    helpers). Kept on stderr so ``--json`` CLI surfaces stay parseable on
+    stdout. Never raises."""
+    try:
+        print(f"[vct] {msg}", file=sys.stderr)
+    except Exception:  # noqa: BLE001 — logging must never break the caller
+        pass
+
 # X-1 / v0.2.76: the underscore-DROPPING sanitizer moved to
 # ``vco_lib.codegraph_naming`` — the ONE naming home. These aliases keep the
 # historical private names resolving to the canonical source. ``_SAFE_CLASS_RE``
@@ -2866,7 +2877,8 @@ def _write_bootstrap_deferral(
     Lazy import of `vco_lib.deferral_report` so non-bootstrap code paths
     don't pull the module.
     """
-    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+    from vco_lib.deferral_report import DeferralEntry
+    from vco_lib import deferral_emit as _de
 
     # v0.2.15: drive the restart command off the actual host container
     # name (canonical `vco_weaviate`, but `weaviate` or `weaviate_claude`
@@ -2939,9 +2951,11 @@ def _write_bootstrap_deferral(
             "knowledge/concepts/weaviate-schema-evolution.md",
         ],
     )
-    report = DeferralReport.read(project_folder)
-    report.add_entry(entry)
-    report.write(project_folder)
+    # v0.2.83 PLAN-v0283 WP-B2: emission goes through the ONE locked emitter
+    # home (vco_lib.deferral_emit) — read-modify-write under an exclusive
+    # file lock so a concurrent detached writer (codegraph resync, install
+    # finalize) can't drop this entry.
+    _de.emit(project_folder, entry)
 
 
 # ---------------------------------------------------------------------------
@@ -4326,7 +4340,8 @@ def _emit_user_modified_deferral(
     """
     if not modified_files:
         return
-    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+    from vco_lib.deferral_report import DeferralEntry
+    from vco_lib import deferral_emit as _de
 
     files_md = _format_file_list_md(sorted(modified_files))
     # Item 4 (Gap 7, 2026-05-13): emit $VCT_ORCHESTRATOR_ROOT instead of a
@@ -4396,9 +4411,8 @@ def _emit_user_modified_deferral(
         severity="info",
         kg_node_refs=[],
     )
-    report = DeferralReport.read(folder)
-    report.add_entry(entry)
-    report.write(folder)
+    # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
+    _de.emit(folder, entry)
 
 
 def _emit_symlink_redirect_deferral(
@@ -4424,12 +4438,15 @@ def _emit_symlink_redirect_deferral(
     """
     if not events:
         return
-    from vco_lib.deferral_report import DeferralReport
+    from vco_lib import deferral_emit as _de
     from vco_lib.symlink_handler import emit_symlink_deferral_multi
 
-    report = DeferralReport.read(folder)
-    emit_symlink_deferral_multi(report, events, install_root=install_root)
-    report.write(folder)
+    # v0.2.83 PLAN-v0283 WP-B2: read-modify-write under the shared exclusive
+    # lock. emit_symlink_deferral_multi mutates the report in place (multiple
+    # (orig, vco_new) pairs fold into ONE consolidated entry), so we use the
+    # locked_report context manager rather than the single-entry emit sugar.
+    with _de.locked_report(folder) as report:
+        emit_symlink_deferral_multi(report, events, install_root=install_root)
 
 
 def _emit_orphan_preserved_deferral(
@@ -4455,7 +4472,8 @@ def _emit_orphan_preserved_deferral(
     """
     if not orphan_files:
         return
-    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+    from vco_lib.deferral_report import DeferralEntry
+    from vco_lib import deferral_emit as _de
 
     files_md = _format_file_list_md(sorted(orphan_files))
     cmd = (
@@ -4494,9 +4512,8 @@ def _emit_orphan_preserved_deferral(
         severity="info",
         kg_node_refs=[],
     )
-    report = DeferralReport.read(folder)
-    report.add_entry(entry)
-    report.write(folder)
+    # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
+    _de.emit(folder, entry)
 
 
 def _emit_skipped_existing_deferral(
@@ -4520,7 +4537,8 @@ def _emit_skipped_existing_deferral(
     """
     if not skipped_files:
         return
-    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+    from vco_lib.deferral_report import DeferralEntry
+    from vco_lib import deferral_emit as _de
 
     files_md = _format_file_list_md(sorted(skipped_files))
     # Item 4 (Gap 7, 2026-05-13): emit $VCT_ORCHESTRATOR_ROOT (set by
@@ -4558,9 +4576,8 @@ def _emit_skipped_existing_deferral(
         severity="info",
         kg_node_refs=[],
     )
-    report = DeferralReport.read(folder)
-    report.add_entry(entry)
-    report.write(folder)
+    # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
+    _de.emit(folder, entry)
 
 
 # ---------------------------------------------------------------------------
@@ -5076,6 +5093,161 @@ def _normalise_for_diff(text: str) -> list[str]:
     return lines
 
 
+# ---------------------------------------------------------------------------
+# v0.2.83 PLAN-v0283 B-F7 + D9: content-keyed `template_review_pending`
+# dismissal memory.
+#
+# `template_review_pending` re-fires on EVERY bundle update for any project
+# whose CLAUDE.md / CONTEXT_STATE.md / MEMORY.md meaningfully differ from the
+# shipping reference — which is essentially every established project, forever.
+# Most users dismiss it every time. B-F7 gives the dismissal a MEMORY: at
+# dismissal time we snapshot the sha256 of each reference sidecar
+# (`.claude/context/templates/<NAME>.reference.md`) into the manifest under
+# `dismissals.template_review_pending.reference_hashes`. On the next run the
+# producer suppresses re-emission WHILE every stored reference hash still
+# matches the current sidecar — i.e. VCO has NOT shipped a genuinely new
+# reference since the dismissal. The moment VCO ships a new reference (any
+# stored hash mismatches, or a tracked sidecar is missing/newly appears) the
+# nudge re-emits so the user learns about the new guidance. Deterministic and
+# content-keyed — supersedes the companion file's 90-day timer proposal.
+#
+# schema_version STAYS 2 (additive optional key; readers default when absent,
+# matching the v1->v2 precedent documented above the manifest constants).
+# ---------------------------------------------------------------------------
+
+# `template_review_pending` diverged-file rel-paths (live files) mapped to the
+# base name used as the dismissal-hash key + the reference sidecar rel-path.
+# Derived ONCE from `_PROJECT_LEVEL_TEMPLATES` so it can never drift from the
+# template set the divergence check actually walks.
+_TEMPLATE_REVIEW_DISMISSAL_KEY = "template_review_pending"
+
+
+def _template_reference_sidecars() -> dict[str, Path]:
+    """Map dismissal-hash key (template BASE name, e.g. ``"CLAUDE.md"``) to the
+    reference-sidecar rel-path under the project folder.
+
+    Single source of truth = ``_PROJECT_LEVEL_TEMPLATES``. The base name is the
+    live file's ``.name`` (``CLAUDE.md`` / ``CONTEXT_STATE.md`` / ``MEMORY.md``)
+    so the key is stable regardless of where the live file lives (root vs
+    ``.claude/``).
+    """
+    out: dict[str, Path] = {}
+    for _template_name, live_rel, ref_rel in _PROJECT_LEVEL_TEMPLATES:
+        out[Path(live_rel).name] = Path(ref_rel)
+    return out
+
+
+def _current_template_reference_hashes(folder: Path) -> dict[str, str]:
+    """sha256 of each EXISTING reference sidecar, keyed by template base name.
+
+    A missing sidecar is OMITTED (its key is absent) — the divergence check
+    only writes a sidecar when the live file already exists, so absence is a
+    legitimate state. Read/hash errors also omit the key (conservative: an
+    unhashable sidecar behaves like a changed one at compare time).
+    """
+    from vco_lib.hashing import sha256_file
+
+    hashes: dict[str, str] = {}
+    for base_name, ref_rel in _template_reference_sidecars().items():
+        ref_path = folder / ref_rel
+        if not ref_path.is_file():
+            continue
+        try:
+            hashes[base_name] = sha256_file(ref_path)
+        except Exception:  # noqa: BLE001 — unhashable sidecar → omit (treated as changed)
+            continue
+    return hashes
+
+
+def _stored_template_dismissal_hashes(folder: Path) -> Optional[dict[str, str]]:
+    """Return the reference-hash snapshot stored at the last dismissal, or
+    ``None`` when there is no recorded dismissal.
+
+    Reads ``dismissals.template_review_pending.reference_hashes`` from the
+    manifest. ``None`` (no dismissal recorded) is distinct from ``{}`` (a
+    dismissal recorded when NO sidecars existed) — both are handled by the
+    suppression predicate.
+    """
+    manifest = _read_manifest(folder)
+    dismissals = manifest.get("dismissals")
+    if not isinstance(dismissals, dict):
+        return None
+    entry = dismissals.get(_TEMPLATE_REVIEW_DISMISSAL_KEY)
+    if not isinstance(entry, dict):
+        return None
+    stored = entry.get("reference_hashes")
+    if not isinstance(stored, dict):
+        return None
+    # Coerce to a clean str->str map (defensive against manifest tampering).
+    return {str(k): str(v) for k, v in stored.items() if isinstance(v, str)}
+
+
+def _template_review_dismissal_suppresses(folder: Path) -> bool:
+    """True when a prior dismissal is still valid: EVERY stored reference hash
+    equals the CURRENT sidecar hash (VCO shipped no new reference since the
+    dismissal). Any missing/changed reference ⇒ False (re-emit).
+
+    Suppression rule (D9):
+      * No dismissal recorded (``stored is None``) ⇒ False (never suppress).
+      * A stored key whose sidecar is now missing/unhashable (absent from
+        ``current``) ⇒ changed ⇒ False.
+      * A stored key whose current hash differs ⇒ changed ⇒ False.
+      * All stored keys present AND equal ⇒ True (suppress). An empty stored
+        map (dismissed when no sidecars existed) trivially satisfies "all
+        equal" — but if sidecars EXIST now that weren't hashed at dismissal
+        time, that's a genuinely new reference set, so those are treated as
+        changed too (an empty stored map with any current sidecar ⇒ False).
+    """
+    stored = _stored_template_dismissal_hashes(folder)
+    if stored is None:
+        return False
+    current = _current_template_reference_hashes(folder)
+    if not stored:
+        # Dismissed when no sidecars were hashed. If sidecars exist now, that's
+        # new reference content the user hasn't reviewed → re-emit.
+        return not current
+    for base_name, stored_hash in stored.items():
+        if current.get(base_name) != stored_hash:
+            return False
+    # Every recorded reference still matches. A NEW sidecar that wasn't part of
+    # the dismissal snapshot is also "new content" → re-emit.
+    for base_name in current:
+        if base_name not in stored:
+            return False
+    return True
+
+
+def _store_template_review_dismissal(folder: Path) -> None:
+    """Snapshot the current reference-sidecar hashes into the manifest under
+    ``dismissals.template_review_pending`` (D9 writer).
+
+    Best-effort + SILENT: called from ``_cmd_dismiss_deferral`` AFTER the
+    dismissal itself succeeds. Never raises into the caller and never writes to
+    stdout/stderr (the dismiss command's JSON payload + stderr contract must
+    stay byte-stable). A missing manifest is created (schema_version 2); a
+    corrupt manifest is replaced with a fresh schema-2 shell carrying only the
+    dismissal (the manifest's `files`/`preserved_files` will be rebuilt on the
+    next install run).
+    """
+    try:
+        manifest = _read_manifest(folder)
+        dismissals = manifest.get("dismissals")
+        if not isinstance(dismissals, dict):
+            dismissals = {}
+        dismissals[_TEMPLATE_REVIEW_DISMISSAL_KEY] = {
+            "reference_hashes": _current_template_reference_hashes(folder),
+            "dismissed_at": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+        }
+        manifest["dismissals"] = dismissals
+        # Preserve schema_version; _read_manifest already defaults it to 2.
+        manifest.setdefault("schema_version", _MANIFEST_SCHEMA_VERSION)
+        _write_manifest_atomic(folder, manifest)
+    except Exception:  # noqa: BLE001 — dismissal memory is best-effort
+        pass
+
+
 def _emit_template_review_pending_deferral(
     folder: Path,
     *,
@@ -5089,10 +5261,22 @@ def _emit_template_review_pending_deferral(
     on-disk file to match the reference, dismissing the deferral, or
     simply ignoring it (severity is `info` — the project is functional;
     this is a "you might want to look at this" nudge, not a blocker).
+
+    v0.2.83 PLAN-v0283 B-F7 + D9: content-keyed dismissal memory. When the
+    user previously dismissed this nudge AND no reference sidecar has changed
+    since (VCO shipped no new guidance), suppress re-emission. The moment VCO
+    ships a new reference, the dismissal snapshot no longer matches and the
+    nudge re-emits.
     """
     if not diverged_files:
         return
-    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+    # v0.2.83 B-F7/D9: honour a still-valid content-keyed dismissal.
+    if _template_review_dismissal_suppresses(folder):
+        _log_auto("template_review_pending suppressed (references unchanged "
+                  "since dismissal)")
+        return
+    from vco_lib.deferral_report import DeferralEntry
+    from vco_lib import deferral_emit as _de
 
     files_md = _format_file_list_md(sorted(diverged_files))
     cmd = (
@@ -5132,9 +5316,8 @@ def _emit_template_review_pending_deferral(
         severity="info",
         kg_node_refs=[],
     )
-    report = DeferralReport.read(folder)
-    report.add_entry(entry)
-    report.write(folder)
+    # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
+    _de.emit(folder, entry)
 
 
 def _install_project_level_templates(
@@ -5483,7 +5666,8 @@ def _emit_migrate_required_deferral(
     """
     if not plan_entries:
         return
-    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+    from vco_lib.deferral_report import DeferralEntry
+    from vco_lib import deferral_emit as _de
 
     # Render the per-collection action plan as a bullet list. Sorted for
     # determinism so deferral .md doesn't churn between runs that produce
@@ -5567,9 +5751,8 @@ def _emit_migrate_required_deferral(
         severity="warning",
         kg_node_refs=[],
     )
-    report = DeferralReport.read(folder)
-    report.add_entry(entry)
-    report.write(folder)
+    # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
+    _de.emit(folder, entry)
 
 
 def _cleanup_legacy_bash_env_in_project(
@@ -5775,8 +5958,16 @@ def _emit_legacy_vscode_mcp_env_deferral(
 
     Severity is `info`: the keys are functionally inert. Cleanup is
     hygiene, not a correctness fix.
+
+    v0.2.83 PLAN-v0283 B-F4 note: this emitter is now the FALLBACK path. The
+    default flow auto-prunes the inert keys (see
+    ``_autoprune_legacy_vscode_mcp_env_keys`` + the call site in
+    ``install_project_bundle``); this deferral is only emitted when the
+    auto-prune could not run (unexpected shape / write error). Kept intact so
+    direct callers + the fallback still produce the historical entry.
     """
-    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+    from vco_lib.deferral_report import DeferralEntry
+    from vco_lib import deferral_emit as _de
 
     keys = detection.get("keys", [])
     settings_rel = detection.get("file", ".vscode/settings.json")
@@ -5835,9 +6026,83 @@ def _emit_legacy_vscode_mcp_env_deferral(
             "knowledge/concepts/rl-telemetry-silent-suppression-on-schema-failure.md",
         ],
     )
-    report = DeferralReport.read(folder)
-    report.add_entry(entry)
-    report.write(folder)
+    # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
+    _de.emit(folder, entry)
+
+
+def _autoprune_legacy_vscode_mcp_env_keys(folder: Path, detection: dict) -> bool:
+    """v0.2.83 PLAN-v0283 B-F4: auto-prune the 4 inert legacy MCP_* keys from
+    ``.vscode/settings.json``'s ``claude-code.env`` block.
+
+    The keys (``MCP_WEAVIATE_SERVER`` / ``MCP_PYTHON`` / ``MCP_OLLAMA_SERVER`` /
+    ``MCP_PYTHONPATH``) have been functionally inert since v0.2.12 (PR-27) and
+    only bake the user's on-disk layout into the tree — deleting exactly those
+    four keys is provably non-destructive to project behaviour, so it is a
+    DEFAULT-ON automation (D8): no env gate.
+
+    Guard (D8/B-F4): proceed ONLY when ``settings.json`` parses via
+    ``json.loads`` to a dict AND ``"claude-code.env"`` is a dict. Otherwise
+    return ``False`` (caller falls back to the deferral). An empty
+    ``claude-code.env`` dict is LEFT in place (conservative — we prune keys, we
+    don't restructure the file). Any write error also returns ``False`` so the
+    caller emits today's deferral instead.
+
+    Returns:
+        ``True``  — the keys were pruned + written; ``record_auto_resolution``
+                    was recorded; NO deferral should be emitted.
+        ``False`` — could not safely prune (unexpected shape / read / write
+                    error); the caller MUST fall back to the deferral.
+    """
+    from vco_lib.atomic import atomic_write_text
+    from vco_lib import deferral_emit as _de
+
+    settings_rel = detection.get("file", ".vscode/settings.json")
+    keys = list(detection.get("keys", []) or [])
+    if not keys:
+        return False
+
+    settings_file = folder / settings_rel
+    try:
+        raw = settings_file.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        # Unparseable (JSONC / trailing-comma user edits) → keep today's
+        # no-op-detection behaviour; do NOT push the user toward fixing JSON.
+        return False
+    if not isinstance(data, dict):
+        return False
+    env_block = data.get("claude-code.env")
+    if not isinstance(env_block, dict):
+        return False
+
+    # Prune exactly the 4 canonical legacy keys that are present.
+    to_delete = [
+        k for k in _LEGACY_VSCODE_MCP_ENV_KEY_PREFIXES if k in env_block
+    ]
+    if not to_delete:
+        return False
+    for k in to_delete:
+        del env_block[k]
+    data["claude-code.env"] = env_block  # empty dict left in place if now empty
+
+    # Re-serialise with a stable indent + trailing newline (match VS Code's
+    # 4-space convention used elsewhere for these settings files).
+    try:
+        serialised = json.dumps(data, indent=4) + "\n"
+        atomic_write_text(settings_file, serialised)
+    except (OSError, TypeError, ValueError):
+        # Write / serialisation failure → fall back to the deferral.
+        return False
+
+    _de.record_auto_resolution(
+        folder,
+        "legacy_vscode_mcp_env_keys_present",
+        "pruned_inert_vscode_mcp_keys",
+        f"removed {len(to_delete)} inert legacy MCP_* key(s) "
+        f"({', '.join(sorted(to_delete))}) from {settings_rel}",
+        log=_log_auto,
+    )
+    return True
 
 
 def _emit_bash_env_cleanup_deferral(
@@ -5857,7 +6122,8 @@ def _emit_bash_env_cleanup_deferral(
     The action field in `cleanup_result` is encoded into the detected
     block so the operator can tell at a glance what went wrong.
     """
-    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+    from vco_lib.deferral_report import DeferralEntry
+    from vco_lib import deferral_emit as _de
 
     action = cleanup_result.get("action", "unknown")
     detail = cleanup_result.get("detail", "")
@@ -5927,9 +6193,8 @@ def _emit_bash_env_cleanup_deferral(
             "knowledge/concepts/lean-ctx-shim-disabled.md",
         ],
     )
-    report = DeferralReport.read(folder)
-    report.add_entry(entry)
-    report.write(folder)
+    # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
+    _de.emit(folder, entry)
 
 
 # ---------------------------------------------------------------------------
@@ -5991,7 +6256,8 @@ def _emit_chunker_resync_deferral(
     Severity is `info` — searches still WORK, they just return less
     relevant top-k results. The user can defer the re-sync indefinitely.
     """
-    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+    from vco_lib.deferral_report import DeferralEntry
+    from vco_lib import deferral_emit as _de
 
     detected = (
         f"This project's `.vco-manifest.json` recorded `vco_version="
@@ -6043,9 +6309,8 @@ def _emit_chunker_resync_deferral(
             "knowledge/concepts/parallel-pr-coordination-gotchas-2026-05-10.md",
         ],
     )
-    report = DeferralReport.read(folder)
-    report.add_entry(entry)
-    report.write(folder)
+    # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
+    _de.emit(folder, entry)
 
 
 # ---------------------------------------------------------------------------
@@ -6083,6 +6348,107 @@ _LEGACY_COMPOSE_OVERRIDE_NAME = "docker-compose.override.yml"
 _CANONICAL_COMPOSE_OVERRIDE_NAME = "compose.override.yaml"
 _COMPOSE_OVERRIDE_SEARCH_SUBDIRS = ("infrastructure", "claude_mcp_servers")
 
+# v0.2.83 PLAN-v0283 B-F2: the compose-override condition the reconciliation
+# clears. SCOPE = `compose_override_filename_conflict` ONLY — that is the
+# HUMAN-JUDGEMENT deferral that pre-.83 persisted FOREVER after the user
+# resolved the pair (the incident this fix targets). The informational
+# `compose_override_renamed` / `compose_override_rename_failed` records are
+# one-shot notices of a completed/failed action; they are NOT reconciled here
+# (a) because their "condition" doesn't recur (`add_entry` is last-write-wins
+# per condition_id) and (b) so the historical idempotency contract holds —
+# a second producer run on an already-migrated tree still returns None.
+_COMPOSE_OVERRIDE_RECONCILE_CONDITION_IDS = (
+    "compose_override_filename_conflict",
+)
+
+
+def _classify_compose_override_conflict(legacy_path: Path, canonical_path: Path) -> str:
+    """v0.2.83 PLAN-v0283 B-F2: classify a coexisting legacy+canonical compose
+    override pair for auto-resolution.
+
+    Returns one of:
+      * ``"identical"``     — byte-for-byte identical. The v0.2.54 C-RT-5 mirror
+        (``volumes.rs`` writes the SAME body to BOTH names by design) so this is
+        the SANCTIONED pair. B-F2(i): suppress the deferral, KEEP BOTH FILES.
+      * ``"semantic_equal"`` — bytes differ but ``yaml.safe_load`` of each parses
+        cleanly AND compares equal (comment/whitespace drift only). B-F2(ii):
+        re-mirror the legacy file to the canonical bytes (canonical wins per the
+        user's "update to use the new one" ruling), NO deferral.
+      * ``"divergent"``     — genuinely different (parse failure on either side,
+        yaml unavailable, or parsed-unequal). B-F2(iii): keep today's
+        ``compose_override_filename_conflict`` deferral verbatim.
+
+    Conservative on every uncertainty: unreadable file, import-yaml failure, or
+    a parse error anywhere ⇒ ``"divergent"`` (defer to human judgement).
+    """
+    try:
+        legacy_bytes = legacy_path.read_bytes()
+        canonical_bytes = canonical_path.read_bytes()
+    except OSError:
+        return "divergent"
+    if legacy_bytes == canonical_bytes:
+        return "identical"
+    # Byte-different → try a semantic (YAML-structure) comparison.
+    try:
+        import yaml  # PyYAML — a hard dep of the orchestrator venv.
+    except ImportError:
+        # yaml unavailable → cannot prove semantic equality → conservative.
+        return "divergent"
+    try:
+        legacy_doc = yaml.safe_load(legacy_bytes.decode("utf-8"))
+        canonical_doc = yaml.safe_load(canonical_bytes.decode("utf-8"))
+    except (yaml.YAMLError, UnicodeDecodeError, ValueError):
+        return "divergent"
+    # Only claim semantic equality for a MEANINGFUL parsed structure. A
+    # comment-only / empty override parses to ``None`` (or a bare scalar), and
+    # two byte-different comment-only files must NOT be read as "identical
+    # config" (that would re-mirror away genuine hand-edits with no config to
+    # prove equivalence). Require BOTH sides to be a non-empty mapping/sequence
+    # (a real compose document is a mapping) before treating them as equal.
+    if not isinstance(legacy_doc, (dict, list)) or not legacy_doc:
+        return "divergent"
+    if not isinstance(canonical_doc, (dict, list)) or not canonical_doc:
+        return "divergent"
+    if legacy_doc == canonical_doc:
+        return "semantic_equal"
+    return "divergent"
+
+
+def _reconcile_compose_override_deferrals(
+    install_root: Path,
+    *,
+    active_condition_ids: set[str],
+) -> list[str]:
+    """v0.2.83 PLAN-v0283 B-F2: drop the stale compose-override CONFLICT deferral.
+
+    When a previously-deferred ``compose_override_filename_conflict`` no longer
+    holds this run (the conflicting pair became absent / identical / re-mirrored
+    — i.e. it is NOT in ``active_condition_ids``, the set this run re-emitted),
+    resolve the on-disk entry. Scoped to the conflict condition only (see the
+    constant's docstring): the informational rename/rename-failed records are
+    left to last-write-wins so idempotency holds.
+
+    Returns the list of condition_ids actually resolved (for the additive
+    ``auto_resolved`` return key + ``record_auto_resolution`` bookkeeping).
+    Soft-fail: never raises.
+    """
+    from vco_lib import deferral_emit as _de
+    from vco_lib.deferral_report import DeferralReport
+
+    try:
+        on_disk = DeferralReport.read(install_root)
+    except Exception:  # noqa: BLE001 — unparseable report → nothing to reconcile
+        return []
+    present = {e.condition_id for e in on_disk.entries}
+    stale = [
+        cid for cid in _COMPOSE_OVERRIDE_RECONCILE_CONDITION_IDS
+        if cid in present and cid not in active_condition_ids
+    ]
+    if not stale:
+        return []
+    _de.resolve_conditions(install_root, stale, log=_log_auto)
+    return stale
+
 
 def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[dict]:
     """Detect any legacy `docker-compose.override.yml` files under
@@ -6094,9 +6460,15 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
     legacy file found:
 
     - If the target `compose.override.yaml` already exists in the same
-      directory: emit a `compose_override_filename_conflict` deferral
-      entry listing both paths. Do NOT rename — the operator resolves
-      manually (the legacy and canonical files may have diverged).
+      directory: CLASSIFY the pair (v0.2.83 PLAN-v0283 B-F2):
+        * byte-identical (the v0.2.54 C-RT-5 mirror) → auto-resolve by
+          SUPPRESSION: no deferral, KEEP BOTH FILES, record an auto-resolution.
+        * yaml-semantically-equal (comment/whitespace drift only) → re-mirror
+          the legacy file to the canonical bytes (canonical wins), no deferral,
+          record an auto-resolution.
+        * genuinely divergent (parse failure / parsed-unequal / yaml missing)
+          → keep today's `compose_override_filename_conflict` deferral verbatim.
+      Do NOT rename in any conflict case.
     - Else: rename via `Path.rename()`. Emit a `compose_override_renamed`
       deferral entry naming both the old and new absolute paths so the
       operator can see the migration in the next-session report.
@@ -6117,22 +6489,28 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
 
     Returns:
         A dict shaped like ``{"action": "<...>", "renamed": [paths...],
-        "conflicts": [(old, new), ...], "errors": [(path, err), ...]}``
-        when at least one legacy file was detected, else ``None``. The
-        caller is expected to log + emit deferrals based on this; this
-        function itself emits the deferral entries directly so
-        callers can stay terse.
+        "conflicts": [(old, new), ...], "errors": [(path, err), ...],
+        "auto_resolved": [...]}`` when at least one legacy file was detected
+        OR at least one stale compose deferral was reconciled, else ``None``.
+        The ``auto_resolved`` key (v0.2.83 additive — install.py:6497 reads
+        only ``action``/``renamed``/``conflicts``/``errors`` so its shape is
+        unchanged) lists a human-readable summary per auto-resolution. The
+        caller logs based on this; this function emits the deferral entries
+        directly so callers can stay terse.
 
     PR-22 (2026-05-16). See:
     - knowledge/concepts/podman-compose-override-comment-yaml-drift-footgun.md
     - .claude/context/PUBLIC_REPO_FIXES_REPORT_2026-05-16.md (Fixes 1, 2, 11)
     """
-    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+    from vco_lib.deferral_report import DeferralEntry
+    from vco_lib import deferral_emit as _de
+    from vco_lib.atomic import atomic_write_bytes
 
     install_root = Path(install_root)
     renamed: list[tuple[Path, Path]] = []
     conflicts: list[tuple[Path, Path]] = []
     errors: list[tuple[Path, str]] = []
+    auto_resolved: list[str] = []
 
     for subdir in _COMPOSE_OVERRIDE_SEARCH_SUBDIRS:
         legacy_path = install_root / subdir / _LEGACY_COMPOSE_OVERRIDE_NAME
@@ -6140,9 +6518,62 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
             continue
         target_path = install_root / subdir / _CANONICAL_COMPOSE_OVERRIDE_NAME
         if target_path.exists():
-            # Conflict: user has both. Don't overwrite their canonical
-            # file with the legacy one (or vice versa) — emit a
-            # deferral and let the operator resolve manually.
+            # v0.2.83 B-F2: both exist — classify before deferring.
+            classification = _classify_compose_override_conflict(
+                legacy_path, target_path,
+            )
+            if classification == "identical":
+                # B-F2(i): the sanctioned v0.2.54 C-RT-5 mirror. Suppress the
+                # deferral, KEEP BOTH FILES (deleting the legacy name breaks
+                # docker-compose-v1 auto-load AND loops the mirror-writer).
+                detail = (
+                    f"byte-identical compose override pair (sanctioned "
+                    f"C-RT-5 mirror) — kept both `{legacy_path}` and "
+                    f"`{target_path}`"
+                )
+                _de.record_auto_resolution(
+                    install_root,
+                    "compose_override_filename_conflict",
+                    "kept_identical_mirror_pair",
+                    detail,
+                    log=_log_auto,
+                )
+                auto_resolved.append(detail)
+                continue
+            if classification == "semantic_equal":
+                # B-F2(ii): comment/whitespace drift only. Canonical content
+                # wins — re-mirror the legacy file to the canonical bytes so
+                # the pair is byte-identical again (a no-op mirror on the next
+                # run). Semantics are provably preserved (yaml.safe_load equal).
+                try:
+                    canonical_bytes = target_path.read_bytes()
+                    atomic_write_bytes(legacy_path, canonical_bytes)
+                except OSError as exc:
+                    # Re-mirror failed → fall back to the human deferral so the
+                    # drift is still surfaced (never silently drop it).
+                    conflicts.append((legacy_path, target_path))
+                    _log_auto(
+                        f"compose override re-mirror failed for "
+                        f"{legacy_path}: {type(exc).__name__}: {exc} — "
+                        "kept conflict deferral"
+                    )
+                    continue
+                detail = (
+                    f"re-mirrored semantically-identical compose override "
+                    f"`{legacy_path}` to canonical bytes from `{target_path}` "
+                    "(comment/whitespace drift only)"
+                )
+                _de.record_auto_resolution(
+                    install_root,
+                    "compose_override_filename_conflict",
+                    "remirrored_semantic_equal_override",
+                    detail,
+                    log=_log_auto,
+                )
+                auto_resolved.append(detail)
+                continue
+            # B-F2(iii): genuinely divergent — keep today's deferral. Don't
+            # overwrite the canonical file with the legacy one (or vice versa).
             conflicts.append((legacy_path, target_path))
             continue
         try:
@@ -6153,18 +6584,47 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
             # (e.g. user mounted the install root noexec/ro for hardening).
             errors.append((legacy_path, f"{type(exc).__name__}: {exc}"))
 
+    # v0.2.83 B-F2 reconciliation: compute the condition_ids this run
+    # (re-)emits, then clear any STALE compose-override deferral (a
+    # previously-deferred pair now absent/identical/re-mirrored, or a settled
+    # rename/rename-failed). This is the first reconciliation the compose
+    # producer has ever had — pre-.83 a resolved conflict persisted forever.
+    active_ids: set[str] = set()
+    if renamed:
+        active_ids.add("compose_override_renamed")
+    if conflicts:
+        active_ids.add("compose_override_filename_conflict")
+    if errors:
+        active_ids.add("compose_override_rename_failed")
+    reconciled = _reconcile_compose_override_deferrals(
+        install_root, active_condition_ids=active_ids,
+    )
+    for cid in reconciled:
+        auto_resolved.append(f"cleared stale {cid} deferral (no longer applies)")
+
     if not renamed and not conflicts and not errors:
+        # Nothing to emit. Return a dict ONLY when we auto-resolved / reconciled
+        # something (so the caller can log it); else None (true no-op).
+        if auto_resolved:
+            return {
+                "action": "auto_resolved",
+                "renamed": [],
+                "conflicts": [],
+                "errors": [],
+                "auto_resolved": auto_resolved,
+            }
         return None
 
-    # Emit deferral entries (separate condition_id per outcome class so
-    # the operator can see at a glance what happened).
-    report = DeferralReport.read(install_root)
+    # Emit deferral entries via the ONE locked emitter home (separate
+    # condition_id per outcome class so the operator can see at a glance what
+    # happened). Batched so foreign entries are preserved + the write is atomic.
+    _pending_entries: list[DeferralEntry] = []
 
     if renamed:
         renamed_lines = "\n".join(
             f"- `{old}` → `{new}`" for old, new in renamed
         )
-        report.add_entry(DeferralEntry(
+        _pending_entries.append(DeferralEntry(
             condition_id="compose_override_renamed",
             title="Legacy compose override renamed to podman-compose auto-load name",
             detected=(
@@ -6199,7 +6659,7 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
             f"- legacy: `{old}` -- canonical: `{new}`"
             for old, new in conflicts
         )
-        report.add_entry(DeferralEntry(
+        _pending_entries.append(DeferralEntry(
             condition_id="compose_override_filename_conflict",
             title="Both legacy and canonical compose override files present",
             detected=(
@@ -6234,7 +6694,7 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
         error_lines = "\n".join(
             f"- `{path}`: {err}" for path, err in errors
         )
-        report.add_entry(DeferralEntry(
+        _pending_entries.append(DeferralEntry(
             condition_id="compose_override_rename_failed",
             title="Legacy compose override rename failed",
             detected=(
@@ -6261,7 +6721,10 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
             ],
         ))
 
-    report.write(install_root)
+    # v0.2.83 PLAN-v0283 WP-B2: batch-emit via the ONE locked emitter home
+    # (read-modify-write under the exclusive lock; foreign entries preserved).
+    if _pending_entries:
+        _de.emit_entries(install_root, _pending_entries, log=_log_auto)
 
     return {
         "action": (
@@ -6273,6 +6736,9 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
         "renamed": [(str(o), str(n)) for o, n in renamed],
         "conflicts": [(str(o), str(n)) for o, n in conflicts],
         "errors": [(str(p), e) for p, e in errors],
+        # v0.2.83 additive key (install.py:6497 does not read it — frozen
+        # contract preserved).
+        "auto_resolved": auto_resolved,
     }
 
 
@@ -6939,7 +7405,8 @@ def _emit_legacy_kg_deferral(
     """
     if not candidates:
         return
-    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+    from vco_lib.deferral_report import DeferralEntry
+    from vco_lib import deferral_emit as _de
 
     detected_lines = _format_legacy_kg_detected(candidates)
     cmd = _format_legacy_kg_command(project_name, weaviate_url, candidates)
@@ -6974,9 +7441,93 @@ def _emit_legacy_kg_deferral(
         kg_node_refs=[],
     )
 
-    report = DeferralReport.read(folder)
-    report.add_entry(entry)
-    report.write(folder)
+    # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
+    _de.emit(folder, entry)
+
+
+def _autodrop_empty_codegraph_candidates(
+    folder: Path,
+    candidates: list[dict],
+    weaviate_url: str,
+) -> tuple[list[str], list[dict]]:
+    """v0.2.83 PLAN-v0283 B-F6: auto-drop EMPTY legacy code-graph candidates.
+
+    Code-graph collections are regenerated from source, so an EMPTY legacy
+    class is a zero-cost orphaned shell — dropping it is provably
+    non-destructive (default-ON, no env gate). The KG-family is NEVER touched
+    here (this is only ever called with code-graph candidates; KG data is not
+    regenerable — out of scope by design).
+
+    Per candidate, drop ONLY when ALL of:
+      * ``object_count == 0`` at detect time, AND
+      * ``case_only`` is False (a case-only variant refers to the SAME logical
+        collection — dropping it would destroy live data; BUG-1 invariant), AND
+      * a RE-PROBE via ``_http_count_objects`` IMMEDIATELY before the drop still
+        returns exactly 0 (guards a row that filled in between detect and drop).
+    After a successful ``_delete_class`` a POST-DROP re-probe confirms the class
+    is gone (count is None/0 → absent). Any deviation (count>0, count unknown
+    None, re-probe mismatch, delete error, post-probe still populated) ⇒ the
+    candidate STAYS in the deferred remainder (conservative: defer to human).
+
+    Weaviate unreachable ⇒ re-probe returns None ⇒ nothing dropped (existing
+    soft-fail). Never raises.
+
+    Returns ``(dropped_class_names, remaining_candidates)``.
+    """
+    from vco_lib import deferral_emit as _de
+
+    dropped: list[str] = []
+    remaining: list[dict] = []
+    for cand in candidates:
+        class_name = cand.get("class_name") or ""
+        count = cand.get("object_count")
+        case_only = bool(cand.get("case_only"))
+        # Only empty, non-case-only candidates are drop-eligible.
+        if not class_name or case_only or count != 0:
+            remaining.append(cand)
+            continue
+        # Re-probe IMMEDIATELY before the drop (re-probe-before-acting).
+        try:
+            live_count = _http_count_objects(class_name, weaviate_url)
+        except Exception:  # noqa: BLE001 — treat probe failure as unknown
+            live_count = None
+        if live_count != 0:
+            # Filled in since detect, or unknown (None) → do NOT drop.
+            remaining.append(cand)
+            continue
+        # Drop, then POST-DROP re-probe to confirm absence.
+        try:
+            _delete_class(class_name, weaviate_url=weaviate_url)
+        except Exception as exc:  # noqa: BLE001 — drop failed → keep deferred
+            _log_auto(
+                f"codegraph auto-drop failed for {class_name}: "
+                f"{type(exc).__name__}: {exc} — kept in deferral"
+            )
+            remaining.append(cand)
+            continue
+        try:
+            post_count = _http_count_objects(class_name, weaviate_url)
+        except Exception:  # noqa: BLE001
+            post_count = None
+        # A dropped class aggregates to 0 (empty) or None (class missing) —
+        # both mean "gone". A positive count means the drop didn't take.
+        if isinstance(post_count, int) and post_count > 0:
+            _log_auto(
+                f"codegraph auto-drop of {class_name} did not take "
+                f"(post-probe count={post_count}) — kept in deferral"
+            )
+            remaining.append(cand)
+            continue
+        dropped.append(class_name)
+        _de.record_auto_resolution(
+            folder,
+            "codegraph_collection_legacy_candidates",
+            "dropped_empty_legacy_codegraph_class",
+            f"dropped empty legacy code-graph class `{class_name}` "
+            "(re-probed 0 before + absent after) — regenerable from source",
+            log=_log_auto,
+        )
+    return dropped, remaining
 
 
 def _emit_legacy_codegraph_deferral(
@@ -6996,7 +7547,8 @@ def _emit_legacy_codegraph_deferral(
     """
     if not candidates:
         return
-    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+    from vco_lib.deferral_report import DeferralEntry
+    from vco_lib import deferral_emit as _de
 
     detected_lines = _format_legacy_kg_detected(candidates)  # same renderer
     cmd = _format_legacy_codegraph_command(project_name, weaviate_url, candidates)
@@ -7029,9 +7581,8 @@ def _emit_legacy_codegraph_deferral(
         kg_node_refs=[],
     )
 
-    report = DeferralReport.read(folder)
-    report.add_entry(entry)
-    report.write(folder)
+    # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
+    _de.emit(folder, entry)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -7465,7 +8016,8 @@ def _emit_orphan_code_collections_deferral(
             )
         except Exception:
             pass
-    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+    from vco_lib.deferral_report import DeferralEntry
+    from vco_lib import deferral_emit as _de
 
     total_mb = detection.get("total_reclaim_bytes", 0) / (1024 * 1024)
     detected_bits = []
@@ -7513,9 +8065,8 @@ def _emit_orphan_code_collections_deferral(
         severity="warning",
         kg_node_refs=[],
     )
-    report = DeferralReport.read(folder)
-    report.add_entry(entry)
-    report.write(folder)
+    # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
+    _de.emit(folder, entry)
     return True
 
 
@@ -7685,7 +8236,8 @@ def _emit_codegraph_prefix_drift_deferral(
     weaviate_url: Optional[str] = None,
 ) -> None:
     """Emit `codegraph_prefix_drift_detected` (consent — never auto-migrate)."""
-    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+    from vco_lib.deferral_report import DeferralEntry
+    from vco_lib import deferral_emit as _de
 
     wv = weaviate_url or _weaviate_url_default()
     old_classes = ", ".join(f"{old_prefix}{s}" for s in _CODEGRAPH_SUFFIXES)
@@ -7723,9 +8275,8 @@ def _emit_codegraph_prefix_drift_deferral(
         severity="warning",
         kg_node_refs=[],
     )
-    report = DeferralReport.read(folder)
-    report.add_entry(entry)
-    report.write(folder)
+    # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
+    _de.emit(folder, entry)
 
 
 # ---------------------------------------------------------------------------
@@ -7918,7 +8469,8 @@ def _emit_safe_add_skipped_env_merge_deferral(
         be committed. Skipping it only costs the ``source ./.env`` convenience
         for users who specifically relied on that committed file.
     """
-    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+    from vco_lib.deferral_report import DeferralEntry
+    from vco_lib import deferral_emit as _de
 
     live_rel = ".env"
     vco_env_rel = ".claude/env"
@@ -7983,9 +8535,67 @@ def _emit_safe_add_skipped_env_merge_deferral(
         command_to_apply=cmd,
         severity="info",
     )
-    report = DeferralReport.read(folder)
-    report.add_entry(entry)
-    report.write(folder)
+    # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
+    _de.emit(folder, entry)
+
+
+def _has_user_secret_shaped_line(path: Path) -> bool:
+    """v0.2.83 PLAN-v0283 B-F8: does ``path`` carry a secret-shaped
+    managed-block line? Extracted (unchanged semantics) from the closure that
+    used to live inside ``_emit_user_secret_values_retained_deferral`` so the
+    reconciler can RE-DETECT the same state (single home, one concern).
+
+    - ``.claude/env``: a ``export KEY="..."`` line inside the managed block.
+    - ``.claude/settings.json``: an ``env`` key that ``is_secret_shaped_env_key``
+      flags (the SINGLE secret-shape home — never a substring fork).
+
+    No value is ever read/printed — only a pattern/shape match. Soft-fails to
+    ``False`` on any read/parse error.
+    """
+    if not path.is_file():
+        return False
+    # Sentinel regex: a managed-block line that looks like a secret export.
+    secret_line_pattern = r'export\s+[A-Z_][A-Z0-9_]*="'
+    try:
+        text = path.read_text(encoding="utf-8")
+        if path.name == "env":
+            from vco_lib.config_projection import (
+                CLAUDE_ENV_MANAGED_BEGIN,
+                CLAUDE_ENV_MANAGED_END,
+            )
+            begin = text.find(CLAUDE_ENV_MANAGED_BEGIN)
+            end = text.find(CLAUDE_ENV_MANAGED_END)
+            if begin == -1 or end == -1:
+                return False
+            managed_block = text[begin:end]
+            return bool(re.search(secret_line_pattern, managed_block))
+        elif path.name == "settings.json":
+            try:
+                data = json.loads(text)
+                env_block = data.get("env", {})
+                if not isinstance(env_block, dict):
+                    return False
+                from vco_lib.secrets_audit import is_secret_shaped_env_key
+                for key in env_block:
+                    if is_secret_shaped_env_key(key):
+                        return True
+            except Exception:  # noqa: BLE001 — malformed settings.json → soft no-detection
+                return False
+        return False
+    except Exception:
+        return False
+
+
+def _scan_user_secret_values_retained(folder: Path) -> bool:
+    """v0.2.83 PLAN-v0283 B-F8: True when a secret-shaped managed-block line
+    survives in EITHER VCO env surface (``.claude/env`` or
+    ``.claude/settings.json``). Shared by the emitter and the reconciler so the
+    self-clear decision uses the SAME detection the emit uses (no drift)."""
+    folder = Path(folder)
+    return (
+        _has_user_secret_shaped_line(folder / ".claude" / "env")
+        or _has_user_secret_shaped_line(folder / ".claude" / "settings.json")
+    )
 
 
 def _emit_user_secret_values_retained_deferral(folder: Path) -> None:
@@ -8014,67 +8624,13 @@ def _emit_user_secret_values_retained_deferral(folder: Path) -> None:
       * The next refresh will scrub it automatically.
       * No immediate action required — just awareness + precaution.
     """
-    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+    from vco_lib.deferral_report import DeferralEntry
+    from vco_lib import deferral_emit as _de
 
-    # Cheap scan: look for a secret-shaped managed-block line. No value parsing
-    # (never print a value). We check BOTH surfaces (.claude/env + settings.json)
-    # to catch either pre-fix projection output.
-    env_path = folder / ".claude" / "env"
-    settings_path = folder / ".claude" / "settings.json"
-
-    # Sentinel regex: a managed-block line that looks like a secret export.
-    # Pattern: after "# user secrets" header, any line with `export KEY="..."`.
-    # We don't validate the key name — just look for secret-shaped syntax.
-    secret_line_pattern = r'export\s+[A-Z_][A-Z0-9_]*="'
-
-    def _has_secret_shaped_line(path: Path) -> bool:
-        if not path.is_file():
-            return False
-        try:
-            import json
-            import re
-            text = path.read_text(encoding="utf-8")
-
-            if path.name == "env":
-                # Shell env file: scan within the managed block.
-                from vco_lib.config_projection import (
-                    CLAUDE_ENV_MANAGED_BEGIN,
-                    CLAUDE_ENV_MANAGED_END,
-                )
-                begin = text.find(CLAUDE_ENV_MANAGED_BEGIN)
-                end = text.find(CLAUDE_ENV_MANAGED_END)
-                if begin == -1 or end == -1:
-                    return False
-                managed_block = text[begin:end]
-                return bool(re.search(secret_line_pattern, managed_block))
-
-            elif path.name == "settings.json":
-                # JSON settings file: check for secret-shaped keys in the env block.
-                try:
-                    data = json.loads(text)
-                    env_block = data.get("env", {})
-                    if not isinstance(env_block, dict):
-                        return False
-                    # Secret-shape detection uses the SINGLE HOME
-                    # (vco_lib.secrets_audit.is_secret_shaped_env_key —
-                    # token-based, mirrors install.py::_is_secret_shaped_env_key).
-                    # Do NOT fork a substring list here (B-3 regression). A
-                    # canonical VCO routing key is never secret-shaped by that
-                    # predicate, so no extra allowlist is needed.
-                    from vco_lib.secrets_audit import is_secret_shaped_env_key
-                    for key in env_block:
-                        if is_secret_shaped_env_key(key):
-                            return True
-                except Exception:  # noqa: BLE001 — malformed settings.json → soft no-detection
-                    return False
-            return False
-        except Exception:
-            return False
-
-    has_secret_in_env = _has_secret_shaped_line(env_path)
-    has_secret_in_settings = _has_secret_shaped_line(settings_path)
-
-    if not (has_secret_in_env or has_secret_in_settings):
+    # Cheap scan (no value parsing — never print a value) across BOTH surfaces.
+    # v0.2.83 B-F8: routed through the shared module-level detector so the
+    # reconciler's self-clear uses the SAME logic.
+    if not _scan_user_secret_values_retained(folder):
         return  # No pre-fix artifacts; don't emit.
 
     # The rotate advice is CONDITIONAL IN PROSE ("if this project's git has a
@@ -8116,9 +8672,8 @@ def _emit_user_secret_values_retained_deferral(folder: Path) -> None:
         ),
         severity="warning",
     )
-    report = DeferralReport.read(folder)
-    report.add_entry(entry)
-    report.write(folder)
+    # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
+    _de.emit(folder, entry)
 
 
 def _emit_safe_add_git_exclude_deferral(
@@ -8131,7 +8686,8 @@ def _emit_safe_add_git_exclude_deferral(
     git-ignored so it doesn't get confused about why `git status` is clean for
     `.claude/` etc. The tracked `.gitignore` is intentionally untouched.
     """
-    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+    from vco_lib.deferral_report import DeferralEntry
+    from vco_lib import deferral_emit as _de
 
     added = git_result.get("added", [])
     added_str = ", ".join(added) if added else "(none)"
@@ -8168,9 +8724,8 @@ def _emit_safe_add_git_exclude_deferral(
         command_to_apply=cmd,
         severity="info",
     )
-    report = DeferralReport.read(folder)
-    report.add_entry(entry)
-    report.write(folder)
+    # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
+    _de.emit(folder, entry)
 
 
 def install_project_bundle(
@@ -8267,7 +8822,7 @@ def install_project_bundle(
                          "noop", "preserve", "skip-existing",
                          "skip-disabled", "keep-regenerated",
                          "orphan-deleted", "orphan-preserved",
-                         "knowledge-retired")},
+                         "orphan-retired", "knowledge-retired")},
             "settings_action": "",
             "manifest_written": False,
             "vco_version": "unknown",
@@ -8308,7 +8863,7 @@ def install_project_bundle(
                      "noop", "preserve", "skip-existing",
                      "skip-disabled", "keep-regenerated",
                      "orphan-deleted", "orphan-preserved",
-                     "knowledge-retired")},
+                     "orphan-retired", "knowledge-retired")},
         "settings_action": "",
         "manifest_written": False,
         "vco_version": _resolve_vco_version(orchestrator_root),
@@ -8544,6 +9099,7 @@ def install_project_bundle(
     # it.
     orphan_deleted: list[str] = []
     orphan_preserved: list[str] = []
+    orphan_retired: list[str] = []  # v0.2.83 B-F5: kept-on-disk, manifest-retired
     knowledge_retired: list[str] = []
     prior_files: dict = manifest.get("files", {}) or {}
     new_files_keys = set(new_files.keys())
@@ -8612,15 +9168,47 @@ def install_project_bundle(
                 # Dry-run: still report the would-be deletion.
                 orphan_deleted.append(prior_rel)
         else:
-            # Case (c) — user-modified. Preserve on disk; keep manifest
-            # entry so a FUTURE shipped version of this file (should it
-            # come back) can recognize the prior baseline.
-            orphan_preserved.append(prior_rel)
-            new_files[prior_rel] = prior_entry
+            # Case (c) — user-modified, upstream-deleted.
+            # v0.2.83 PLAN-v0283 B-F5: AUTO-KEEP + RETIRE. The file is NEVER
+            # deleted (it's the user's now — the logical completion of "VCO no
+            # longer manages this file"). Instead of emitting a deferral +
+            # keeping the manifest entry forever, we RETIRE the manifest entry
+            # (drop it from `new_files` → pruned on rewrite) and record an
+            # auto-resolution. `orphan_preserved` is left empty for this file,
+            # so no `bundle_user_modified_deletion_preserved` deferral is
+            # emitted AND `still_orphan_preserved` stays False → the reconciler
+            # clears any pre-existing stale entry. Mirrors the v0.2.81
+            # knowledge-retirement branch (keep on disk, drop manifest entry).
+            orphan_retired.append(prior_rel)
+            # (intentionally NOT: orphan_preserved.append / new_files[...] = ...)
 
     result["actions"]["orphan-deleted"] = orphan_deleted
     result["actions"]["orphan-preserved"] = orphan_preserved
+    result["actions"]["orphan-retired"] = orphan_retired
     result["actions"]["knowledge-retired"] = knowledge_retired
+    # v0.2.83 B-F5: one honest auto-resolution record per retired orphan (file
+    # kept on disk, manifest entry dropped). Best-effort — never abort install.
+    if orphan_retired and not dry_run:
+        try:
+            from vco_lib import deferral_emit as _de
+            for _rel in orphan_retired:
+                _de.record_auto_resolution(
+                    folder,
+                    "bundle_user_modified_deletion_preserved",
+                    "retired_orphan_manifest_entry",
+                    f"kept user-modified upstream-deleted file `{_rel}` on disk "
+                    "and retired its .vco-manifest.json entry (no longer "
+                    "VCO-managed)",
+                    log=_log_auto,
+                )
+        except Exception as _exc:  # noqa: BLE001 — bookkeeping is best-effort
+            _log("4.bundle.orphan_retired", "warn",
+                 f"orphan-retire auto-resolution record failed: {_exc}")
+    if orphan_retired:
+        _log("4.bundle.orphan_retired", "info",
+             f"retired {len(orphan_retired)} user-modified orphan manifest "
+             f"entries (files left on disk, no longer VCO-managed)",
+             data={"count": len(orphan_retired)})
     if knowledge_retired:
         _log("4.bundle.knowledge_retired", "info",
              f"retired {len(knowledge_retired)} curated knowledge/ manifest "
@@ -8792,20 +9380,38 @@ def install_project_bundle(
     # v0.2.24 RL-defect-2026-05-22 Fix 2 (cleanup hygiene): detect legacy
     # MCP_* keys in `.vscode/settings.json claude-code.env` (pre-v0.2.12
     # writes; inert post-PR-27 but bake the user's on-disk layout into
-    # the project tree). Detection-only — per user policy 2026-05-22
-    # we never auto-overwrite user-edited files; emit a deferral entry
-    # recommending cleanup and let the user decide.
+    # the project tree).
+    #
+    # v0.2.83 PLAN-v0283 B-F4: these 4 keys are provably inert, so we now
+    # AUTO-PRUNE them (default ON, no env gate) rather than merely nudging.
+    # `_autoprune_legacy_vscode_mcp_env_keys` deletes exactly the 4 keys via a
+    # JSON parse/edit/atomic-write and records an auto-resolution. When it
+    # can't run safely (unparseable JSONC / unexpected shape / write error) it
+    # returns False and we FALL BACK to the historical deferral. After a
+    # successful prune the keys are gone, so `legacy_vscode_mcp_detected`
+    # stays False → the reconciler clears any pre-existing stale entry.
     legacy_vscode_mcp_detected = False
     if not dry_run:
         try:
             vscode_mcp_detect = _detect_legacy_vscode_mcp_env_keys(folder)
             result["legacy_vscode_mcp_env"] = vscode_mcp_detect
             if vscode_mcp_detect["action"] == "detected":
-                legacy_vscode_mcp_detected = True
-                _emit_legacy_vscode_mcp_env_deferral(folder, vscode_mcp_detect)
-                _log("4.bundle.legacy_vscode_mcp", "ok",
-                     f"legacy_vscode_mcp_env: detected {len(vscode_mcp_detect['keys'])} key(s)",
-                     data=vscode_mcp_detect)
+                if _autoprune_legacy_vscode_mcp_env_keys(folder, vscode_mcp_detect):
+                    # Auto-pruned — no deferral, entry (if any) self-clears.
+                    result["legacy_vscode_mcp_autopruned"] = True
+                    _log("4.bundle.legacy_vscode_mcp", "ok",
+                         f"legacy_vscode_mcp_env: auto-pruned "
+                         f"{len(vscode_mcp_detect['keys'])} inert key(s)",
+                         data=vscode_mcp_detect)
+                else:
+                    # Fallback: could not safely prune → emit the deferral.
+                    legacy_vscode_mcp_detected = True
+                    _emit_legacy_vscode_mcp_env_deferral(folder, vscode_mcp_detect)
+                    _log("4.bundle.legacy_vscode_mcp", "ok",
+                         f"legacy_vscode_mcp_env: detected "
+                         f"{len(vscode_mcp_detect['keys'])} key(s) "
+                         "(auto-prune unavailable — deferral emitted)",
+                         data=vscode_mcp_detect)
             else:
                 _log("4.bundle.legacy_vscode_mcp", "ok",
                      f"legacy_vscode_mcp_env: {vscode_mcp_detect['action']}",
@@ -9123,13 +9729,45 @@ def install_project_bundle(
                     f"legacy-KG deferral write failed: {err}"
                 )
 
+        # v0.2.83 PLAN-v0283 B-F6: auto-drop EMPTY legacy code-graph candidates
+        # (re-probe-before-drop + post-drop probe; case_only NEVER dropped; KG
+        # family UNTOUCHED — only this codegraph list is passed). The deferral
+        # is emitted ONLY for the NON-droppable remainder, and the reconciler's
+        # self-clear flag uses the remainder too (so an all-empty run clears any
+        # stale codegraph deferral).
+        codegraph_dropped: list[str] = []
+        legacy_codegraph_remaining = legacy_codegraph_candidates
         if legacy_codegraph_candidates:
+            try:
+                codegraph_dropped, legacy_codegraph_remaining = (
+                    _autodrop_empty_codegraph_candidates(
+                        folder, legacy_codegraph_candidates, weaviate_url,
+                    )
+                )
+                if codegraph_dropped:
+                    result["codegraph_autodropped"] = codegraph_dropped
+                    _log("4.bundle.legacy-codegraph", "ok",
+                         f"auto-dropped {len(codegraph_dropped)} empty legacy "
+                         f"code-graph class(es)",
+                         data={"dropped": codegraph_dropped})
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                _log("4.bundle.legacy-codegraph", "error",
+                     f"legacy-codegraph auto-drop failed: {err}",
+                     data={"error": err})
+                result["warnings"].append(
+                    f"legacy-codegraph auto-drop failed: {err}"
+                )
+                # Conservative on error: defer the whole set.
+                legacy_codegraph_remaining = legacy_codegraph_candidates
+
+        if legacy_codegraph_remaining:
             try:
                 _emit_legacy_codegraph_deferral(
                     folder,
                     project_name=derived_project_name,
                     weaviate_url=weaviate_url,
-                    candidates=legacy_codegraph_candidates,
+                    candidates=legacy_codegraph_remaining,
                 )
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
@@ -9142,7 +9780,8 @@ def install_project_bundle(
 
         # Surface in result for caller introspection / Tauri visibility.
         result["legacy_kg_candidates"] = legacy_kg_candidates
-        result["legacy_codegraph_candidates"] = legacy_codegraph_candidates
+        # v0.2.83 B-F6: report the NON-dropped remainder (what actually deferred).
+        result["legacy_codegraph_candidates"] = legacy_codegraph_remaining
 
         # v0.2.73 FIX-C-RECUR wiring (F1): run the code-graph prefix-drift
         # forward-guard ONCE per bundle install/update, right beside the legacy
@@ -9180,7 +9819,10 @@ def install_project_bundle(
                 still_skipped_existing=bool(skipped_existing_paths),
                 still_template_review_pending=bool(template_review_diverged),
                 still_legacy_kg=bool(legacy_kg_candidates),
-                still_legacy_codegraph=bool(legacy_codegraph_candidates),
+                # v0.2.83 B-F6: use the NON-dropped remainder — an all-empty run
+                # (everything auto-dropped) leaves no remainder → the stale
+                # codegraph deferral self-clears.
+                still_legacy_codegraph=bool(legacy_codegraph_remaining),
                 # v0.2.24 §A0 (2026-05-22): include the new orphan-
                 # preserved condition so a future run that has no
                 # remaining orphans (user deleted them, or upstream
@@ -9355,6 +9997,7 @@ def _reconcile_bundle_deferrals(
     still_orphan_preserved: bool = False,
     still_legacy_vscode_mcp: bool = False,
     still_stale_wrapper: Optional[bool] = None,
+    still_user_secret_retained: Optional[bool] = None,
 ) -> None:
     """Trim bundle-specific deferral entries that this install resolved.
 
@@ -9367,8 +10010,24 @@ def _reconcile_bundle_deferrals(
     `DeferralReport.write` already deletes the file when the entry list
     becomes empty, so this function is the single place where "force-
     resolved → stale deferral cleanup" happens.
+
+    v0.2.83 PLAN-v0283:
+      * B-F8: `user_secret_values_retained_in_tree` now self-clears here. When
+        the caller passes ``still_user_secret_retained=None`` (default) AND the
+        entry is present on disk, we RE-DETECT via
+        ``_scan_user_secret_values_retained`` (the SAME scan the emitter uses);
+        once the next env-projection refresh scrubbed the value, the entry
+        clears. An explicit bool overrides the probe (mirrors the stale-wrapper
+        contract). Note: this condition is FOREIGN to install.py's owned set
+        (S-8) — it is only ever cleared HERE, on the bundle-update path.
+      * B-F9: every clear records an ``auto-resolutions.jsonl`` line + loud log
+        via ``record_auto_resolution`` (no silent mutations).
+      * Write now routes through the ONE locked emitter home
+        (``deferral_emit.locked_report``) so a concurrent detached writer can't
+        drop entries mid-reconcile.
     """
     from vco_lib.deferral_report import DeferralReport
+    from vco_lib import deferral_emit as _de
 
     bundle_conditions = {
         "bundle_user_modified_preserved": still_user_modified,
@@ -9387,12 +10046,13 @@ def _reconcile_bundle_deferrals(
         # v0.2.24 §A0 (2026-05-22): orphan-preserved bookkeeping. When
         # the user deletes the orphan file manually (or upstream
         # re-adds it), `still_orphan_preserved` becomes False and the
-        # next install clears the stale deferral entry.
+        # next install clears the stale deferral entry. v0.2.83 B-F5 makes
+        # this the self-clear for the "retire the manifest entry" path too.
         "bundle_user_modified_deletion_preserved": still_orphan_preserved,
         # v0.2.24 RL-defect Fix 2 (2026-05-22): legacy .vscode MCP_*
         # detection is recomputed every install — when the user removes
-        # the inert keys (via the deferral's command) the next install
-        # sees `action=none` and clears the stale entry.
+        # the inert keys (via the deferral's command OR the v0.2.83 B-F4
+        # auto-prune) the next install sees `action=none` and clears it.
         "legacy_vscode_mcp_env_keys_present": still_legacy_vscode_mcp,
     }
 
@@ -9413,20 +10073,48 @@ def _reconcile_bundle_deferrals(
             else still_stale_wrapper
         )
 
+    # v0.2.83 B-F8: user_secret_values_retained_in_tree self-clear. Only probe
+    # when the entry is actually present (avoid needless FS reads). None ⇒
+    # re-detect via the shared scan; explicit bool overrides.
+    if "user_secret_values_retained_in_tree" in initial_ids:
+        bundle_conditions["user_secret_values_retained_in_tree"] = (
+            _scan_user_secret_values_retained(folder)
+            if still_user_secret_retained is None
+            else still_user_secret_retained
+        )
+
     if not initial_ids & set(bundle_conditions):
         # Nothing on-disk we own → no reconciliation to do.
         return
 
-    changed = False
-    for condition_id, still_applicable in bundle_conditions.items():
-        if not still_applicable and report.has_condition(condition_id):
-            report.mark_resolved(condition_id)
-            changed = True
+    # Which owned conditions are on-disk AND no longer applicable this run.
+    to_resolve = [
+        cid for cid, still_applicable in bundle_conditions.items()
+        if not still_applicable and cid in initial_ids
+    ]
+    if not to_resolve:
+        return
 
-    if changed:
-        # write() unlinks the file if the entry list is now empty,
-        # otherwise atomic-writes the trimmed report.
-        report.write(folder)
+    # Route the mutate+write through the ONE locked emitter home so a
+    # concurrent detached writer can't clobber the trimmed report. mark_resolved
+    # inside the lock re-reads from disk (locked_report reads at enter), then the
+    # context-exit write unlinks the file if the entry list is now empty.
+    resolved_ids: list[str] = []
+    with _de.locked_report(folder) as locked:
+        for cid in to_resolve:
+            if locked.has_condition(cid):
+                locked.mark_resolved(cid)
+                resolved_ids.append(cid)
+
+    # B-F9: one honest auto-resolution record per cleared condition.
+    for cid in resolved_ids:
+        _de.record_auto_resolution(
+            folder,
+            cid,
+            "reconciled_stale_bundle_deferral",
+            "condition no longer applies on this bundle update — cleared",
+            log=_log_auto,
+        )
 
 
 def _canonical_path_eq(
@@ -11332,12 +12020,15 @@ def _cmd_migrate_collections(args: argparse.Namespace) -> int:
             # entry. Soft-fail — never abort the update over a deferral
             # housekeeping write.
             try:
-                from vco_lib.deferral_report import DeferralReport
-
-                report = DeferralReport.read(resolved_folder)
-                if report.has_condition("schema_migration_required"):
-                    report.mark_resolved("schema_migration_required")
-                    report.write(resolved_folder)
+                # v0.2.83 PLAN-v0283 WP-B2: resolve via the ONE locked emitter
+                # home (read-modify-write under the exclusive lock; foreign
+                # entries preserved). resolve_conditions returns the count it
+                # actually cleared, so the flag is set only when it fired.
+                from vco_lib import deferral_emit as _de
+                cleared = _de.resolve_conditions(
+                    resolved_folder, ["schema_migration_required"],
+                )
+                if cleared:
                     result["stale_migrate_deferral_cleared"] = True
                     # stderr (not stdout) so `--json` output stays parseable.
                     print(
@@ -12021,8 +12712,21 @@ def _cmd_dismiss_deferral(args: argparse.Namespace) -> int:
 
     report.mark_resolved(condition_id)
     # `report.write` deletes the file when the entry list is empty and
-    # strips the CLAUDE.md reminder block — both desired here.
+    # strips the CLAUDE.md reminder block — both desired here. NOTE: this is a
+    # user-initiated single-shot CLI resolve on the ALREADY-PARSED report (with
+    # the malformed-file exit-1 detection above), NOT a fresh-emit clobber path,
+    # so it stays on the direct write rather than routing through
+    # deferral_emit's locked read-modify-write (which would re-read from disk
+    # and change the `remaining` count the JSON payload reports).
     report.write(folder)
+
+    # v0.2.83 PLAN-v0283 B-F7 + D9: content-keyed dismissal memory. When the
+    # user dismisses `template_review_pending`, snapshot the current reference-
+    # sidecar hashes so the producer suppresses re-emission until VCO ships a
+    # genuinely new reference. Best-effort + SILENT (never touches the JSON
+    # payload / stderr contract, never raises).
+    if condition_id == "template_review_pending":
+        _store_template_review_dismissal(folder)
 
     payload = {
         "dismissed": True,
@@ -12485,11 +13189,9 @@ def _cmd_migrate_schema(args: argparse.Namespace) -> int:
             try:
                 entry = sregen.build_reingest_incomplete_entry(regen, folder)
                 if entry is not None:
-                    from .deferral_report import DeferralReport
-
-                    report_file = DeferralReport.read(folder)
-                    report_file.add_entry(entry)
-                    report_file.write(folder)
+                    # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked home.
+                    from vco_lib import deferral_emit as _de
+                    _de.emit(folder, entry)
                     result["reingest_deferral_written"] = True
             except Exception as exc:  # never block on a deferral write
                 print(
@@ -12553,12 +13255,9 @@ def _cmd_migrate_schema(args: argparse.Namespace) -> int:
         entries = smr.build_deferral_entries(report)
         if entries:
             try:
-                from .deferral_report import DeferralReport
-
-                report_file = DeferralReport.read(folder)
-                for entry in entries:
-                    report_file.add_entry(entry)
-                report_file.write(folder)
+                # v0.2.83 PLAN-v0283 WP-B2: batch-emit via the ONE locked home.
+                from vco_lib import deferral_emit as _de
+                _de.emit_entries(folder, entries)
                 deferral_written = True
             except Exception as exc:  # never block the probe
                 print(
@@ -12681,9 +13380,10 @@ def _write_formats_migration_deferral(
     the project's Claude how to regenerate manually. Generic home (v0.2.73
     M2) — per-artifact wrappers below supply the artifact-specific text."""
     try:
-        from vco_lib.deferral_report import DeferralEntry, DeferralReport
-        report = DeferralReport.read(folder)
-        report.add_entry(DeferralEntry(
+        from vco_lib.deferral_report import DeferralEntry
+        from vco_lib import deferral_emit as _de
+        # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
+        _de.emit(folder, DeferralEntry(
             condition_id=condition_id,
             severity="info",
             title=title,
@@ -12705,7 +13405,6 @@ def _write_formats_migration_deferral(
                 f"--condition-id {condition_id}"
             ),
         ))
-        report.write(folder)
     except Exception as exc:  # never block the update flow
         print(f"[{log_tag}] deferral write failed (non-fatal): {exc}", file=sys.stderr)
 

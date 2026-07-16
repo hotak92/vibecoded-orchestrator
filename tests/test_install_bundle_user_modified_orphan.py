@@ -29,6 +29,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+# v0.2.83 PLAN-v0283 WP-B2: install the WP-B1 deferral_emit fake BEFORE
+# importing project_init so the function-level `from vco_lib import
+# deferral_emit` in the migrated emit paths resolves (the real module lands in
+# a parallel worktree). Degrades to a no-op once the real module exists.
+from tests._v0283_deferral_emit_fake import install_fake_deferral_emit  # noqa: E402
+
+install_fake_deferral_emit()
+
 from vco_lib import project_init  # noqa: E402
 from vco_lib.deferral_report import DeferralReport  # noqa: E402
 
@@ -121,12 +129,14 @@ class OrphanDetectionTests(unittest.TestCase):
         report = DeferralReport.read(self.proj)
         self.assertFalse(report.has_condition("bundle_user_modified_deletion_preserved"))
 
-    def test_orphan_user_modified_is_preserved_with_deferral(self):
-        """When the orchestrator stops shipping `foo.sh` AND the user
-        edited their installed copy (hash differs from prior shipped),
-        the orphan-detection logic MUST preserve the file on disk and
-        emit `bundle_user_modified_deletion_preserved` so the user
-        knows VCO no longer manages it."""
+    def test_orphan_user_modified_is_retired_no_deferral(self):
+        """v0.2.83 PLAN-v0283 B-F5: when the orchestrator stops shipping
+        `foo.sh` AND the user edited their installed copy (hash differs from
+        prior shipped), the file is AUTO-KEPT (never deleted) and its manifest
+        entry is RETIRED — NO deferral. Pre-.83 this emitted
+        `bundle_user_modified_deletion_preserved`; the deferral was pure noise
+        (the file is never deleted anyway), so B-F5 replaces it with a silent
+        retire + an auto-resolutions.jsonl record."""
         installed = self._foo_hook_path()
         # User modifies their installed copy.
         installed.write_text("# USER CUSTOM CONTENT\n", encoding="utf-8")
@@ -140,39 +150,44 @@ class OrphanDetectionTests(unittest.TestCase):
         ext = "ps1" if platform.system() == "Windows" else "sh"
         rel = str(Path(".claude") / "hooks" / f"foo.{ext}")
 
-        # Action recorded as orphan-preserved.
-        self.assertIn(rel, result["actions"]["orphan-preserved"],
-                      f"expected {rel} in orphan-preserved: {result['actions']}")
-        # File still on disk WITH user content.
-        self.assertTrue(installed.exists(), "user-modified orphan should be preserved")
+        # v0.2.83 B-F5: recorded as orphan-RETIRED, NOT orphan-preserved.
+        self.assertIn(rel, result["actions"]["orphan-retired"],
+                      f"expected {rel} in orphan-retired: {result['actions']}")
+        self.assertNotIn(rel, result["actions"]["orphan-preserved"])
+        # File still on disk WITH user content (NEVER deleted).
+        self.assertTrue(installed.exists(), "user-modified orphan must be kept on disk")
         self.assertEqual(
             installed.read_text(encoding="utf-8"), "# USER CUSTOM CONTENT\n",
             "user content must be untouched",
         )
-        # Manifest still carries the entry (so a future re-ship can recognize the baseline).
+        # v0.2.83 B-F5: manifest entry is RETIRED (dropped) so a future run
+        # no longer re-detects the file as an orphan → the retire is one-shot.
         manifest = json.loads(
             (self.proj / ".claude" / ".vco-manifest.json").read_text(encoding="utf-8")
         )
-        self.assertIn(rel, manifest["files"],
-                      "manifest should preserve orphan entry for user-modified files")
-        # Deferral entry emitted.
+        self.assertNotIn(rel, manifest["files"],
+                         "manifest entry should be retired for user-modified orphan")
+        # v0.2.83 B-F5: NO deferral emitted.
         report = DeferralReport.read(self.proj)
-        self.assertTrue(
+        self.assertFalse(
             report.has_condition("bundle_user_modified_deletion_preserved"),
-            f"missing deferral; entries: {[e.condition_id for e in report.entries]}",
+            f"B-F5 must NOT emit the deletion-preserved deferral; entries: "
+            f"{[e.condition_id for e in report.entries]}",
         )
-        # Deferral lists the affected file in the on-disk markdown body
-        # (the DeferralReport parser captures `detected` as a single line
-        # of the markdown, but the rendered file contains the full multi-
-        # line file bullet list).
-        deferred = self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md"
-        self.assertTrue(deferred.exists(), "UPDATE_DEFERRED.md should be written")
-        body = deferred.read_text(encoding="utf-8")
-        self.assertIn(rel, body, "deferral body should list the orphan file")
-        self.assertIn(
-            "## bundle_user_modified_deletion_preserved",
-            body,
-            "deferral body should carry the condition_id header",
+        # v0.2.83 B-F9: an auto-resolution record was written.
+        jsonl = self.proj / ".claude" / "logs" / "auto-resolutions.jsonl"
+        self.assertTrue(jsonl.exists(), "B-F9 auto-resolutions.jsonl must be written")
+        rows = [
+            r for r in jsonl.read_text(encoding="utf-8").splitlines() if r.strip()
+        ]
+        parsed = [json.loads(r) for r in rows]
+        self.assertTrue(
+            any(
+                p["condition_id"] == "bundle_user_modified_deletion_preserved"
+                and p["action"] == "retired_orphan_manifest_entry"
+                for p in parsed
+            ),
+            f"expected a retire auto-resolution row; got {parsed}",
         )
 
     def test_orphan_missing_on_disk_is_silently_dropped(self):
@@ -206,35 +221,56 @@ class OrphanDetectionTests(unittest.TestCase):
         report = DeferralReport.read(self.proj)
         self.assertFalse(report.has_condition("bundle_user_modified_deletion_preserved"))
 
-    def test_orphan_deferral_clears_when_user_resolves(self):
-        """After an orphan-preserved deferral fires, the user has two
-        options: keep the file (dismiss) or delete it. If they delete
-        it manually, the NEXT install run must clear the stale deferral
-        entry via the reconcile pass."""
+    def test_orphan_retire_is_one_shot_and_never_deferred(self):
+        """v0.2.83 PLAN-v0283 B-F5: the auto-keep+retire is one-shot and never
+        produces a deferral to clear. Pre-.83 the first update emitted
+        `bundle_user_modified_deletion_preserved` and a later update (after the
+        user deleted the file) cleared it via reconcile. Under B-F5 the FIRST
+        update already retires the manifest entry with NO deferral, so:
+          * the first update writes no deletion-preserved deferral, AND
+          * a second update sees no manifest entry → nothing to re-detect,
+            still no deferral (idempotent).
+        Also pins the pre-existing stale-entry self-clear: if a legacy
+        deletion-preserved entry is on disk, the retire run clears it."""
         installed = self._foo_hook_path()
         installed.write_text("# USER CUSTOM\n", encoding="utf-8")
         self._delete_foo_from_orchestrator()
 
-        # First update: emits the deferral.
-        project_init.install_project_bundle(
-            self.proj, orchestrator_root=self.orch, update_mode=True,
-        )
-        self.assertTrue(
-            DeferralReport.read(self.proj)
-            .has_condition("bundle_user_modified_deletion_preserved")
-        )
+        # Seed a PRE-EXISTING stale deferral (as if written by a pre-.83 run)
+        # so we can pin the reconciler self-clear on the retire path.
+        _seed = DeferralReport.read(self.proj)
+        from vco_lib.deferral_report import DeferralEntry
+        _seed.add_entry(DeferralEntry(
+            condition_id="bundle_user_modified_deletion_preserved",
+            title="legacy stale entry",
+            detected="pre-.83 entry",
+            why_deferred="pre-.83",
+            command_to_apply="noop",
+            severity="info",
+        ))
+        _seed.write(self.proj)
 
-        # User deletes the orphan manually.
-        installed.unlink()
-
-        # Second update: orphan is gone → reconcile should drop the deferral.
+        # First update: retires the manifest entry, clears the stale deferral,
+        # emits NO new deletion-preserved deferral.
         project_init.install_project_bundle(
             self.proj, orchestrator_root=self.orch, update_mode=True,
         )
         self.assertFalse(
             DeferralReport.read(self.proj)
             .has_condition("bundle_user_modified_deletion_preserved"),
-            "reconcile should have cleared the resolved deferral",
+            "retire run must clear any pre-existing deletion-preserved deferral "
+            "and emit none",
+        )
+        self.assertTrue(installed.exists(), "the file must stay on disk")
+
+        # Second update: manifest no longer tracks the file → idempotent no-op,
+        # still no deferral.
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=True,
+        )
+        self.assertFalse(
+            DeferralReport.read(self.proj)
+            .has_condition("bundle_user_modified_deletion_preserved"),
         )
 
 
