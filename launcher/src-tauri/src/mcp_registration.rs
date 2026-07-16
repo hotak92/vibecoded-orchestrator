@@ -1397,4 +1397,151 @@ mod tests {
 
         fs::remove_file(&target).ok();
     }
+
+    // ── v0.2.83 (WP-B3): third-party MCP preservation guarantee ─────────
+    //
+    // A user may run their OWN MCP servers (searxng, Jira, Gmail, whatever) —
+    // present AND working. Every VCO writer to ~/.claude.json must leave those
+    // entries byte-for-byte intact (command, args, env), including any
+    // secret-shaped env key: the env allowlist/secret-filter applies ONLY to
+    // VCO's OWN bundled entries (which VCO composes fresh), never to entries
+    // VCO does not own. These pins fail if a future edit widens any writer to
+    // touch unknown mcpServers keys.
+
+    #[test]
+    fn third_party_mcp_survives_default_registration_byte_for_byte() {
+        let root = make_pseudo_install_root();
+        let target = tmp_target();
+
+        // A user-added third-party MCP with a FULL entry, including a
+        // secret-shaped env key that VCO WOULD strip from its OWN entries.
+        let third_party = serde_json::json!({
+            "type": "stdio",
+            "command": "/opt/jira-mcp/bin/jira-mcp",
+            "args": ["--project", "ACME", "serve"],
+            "env": {
+                "JIRA_API_TOKEN": "super-secret-do-not-touch",
+                "JIRA_BASE_URL": "https://acme.atlassian.net"
+            }
+        });
+        fs::write(
+            &target,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": { "jira": third_party.clone() }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        register_default_orchestrator_mcps(&root, ServicePorts::default(), Some(&target), None)
+            .unwrap();
+
+        let raw = fs::read_to_string(&target).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        // Byte-for-byte survival: the whole entry object is unchanged,
+        // secret env key included (VCO's secret-filter is scoped to its own
+        // bundled entries, never a user's).
+        assert_eq!(
+            json["mcpServers"]["jira"], third_party,
+            "third-party MCP entry must survive a VCO defaults write byte-for-byte"
+        );
+        assert_eq!(
+            json["mcpServers"]["jira"]["env"]["JIRA_API_TOKEN"],
+            "super-secret-do-not-touch",
+            "VCO must NOT strip secret-shaped env keys from entries it does not own"
+        );
+        // And VCO's own entries were still added alongside.
+        assert!(json["mcpServers"]["weaviate-kg"].is_object());
+
+        fs::remove_file(&target).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn ex_vco_named_searxng_entry_treated_as_user_property() {
+        // VCO used to ship a `searxng` compose service pre-v0.2.11 (never an
+        // MCP entry). Today VCO ships NO searxng at all — so a `searxng`
+        // mcpServers entry is USER PROPERTY (they may deliberately run their
+        // own searxng MCP) and must NOT be cleaned up as a "VCO leftover".
+        let root = make_pseudo_install_root();
+        let target = tmp_target();
+
+        let user_searxng = serde_json::json!({
+            "type": "stdio",
+            "command": "/home/dev/my-searxng-mcp/serve.py",
+            "args": ["--port", "8888"],
+            "env": { "SEARXNG_URL": "http://localhost:8888" }
+        });
+        fs::write(
+            &target,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": { "searxng": user_searxng.clone() }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        register_default_orchestrator_mcps(&root, ServicePorts::default(), Some(&target), None)
+            .unwrap();
+
+        let raw = fs::read_to_string(&target).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            json["mcpServers"]["searxng"], user_searxng,
+            "an ex-VCO-named `searxng` entry is user property and must survive untouched"
+        );
+
+        fs::remove_file(&target).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scan_stale_leaves_third_party_entries_untouched() {
+        // scan_stale_mcp_entries only flags absolute paths containing vco
+        // install tokens (claude_mcp_servers / .venv) OUTSIDE install_root.
+        // Third-party MCPs — including a user's own searxng — at unrelated
+        // paths or via npx must NEVER be classified stale (== never rewritten).
+        let root = make_pseudo_install_root();
+        let target = tmp_target();
+        fs::write(
+            &target,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    // user's own searxng at an unrelated absolute path
+                    "searxng": {"command": "/usr/local/bin/searxng-mcp"},
+                    // npx-launched third party (relative command)
+                    "gmail": {"command": "npx", "args": ["-y", "@acme/gmail-mcp"]},
+                    // vco-shaped path but INSIDE install_root → not stale
+                    "weaviate-kg": {
+                        "command": root.join("claude_mcp_servers/weaviate_mcp/server.py")
+                            .display().to_string()
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let stale = scan_stale_mcp_entries(&root, Some(&target));
+        let stale_names: Vec<&str> = stale.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            !stale_names.contains(&"searxng"),
+            "a user's own searxng at an unrelated path must not be flagged stale: {:?}",
+            stale_names
+        );
+        assert!(
+            !stale_names.contains(&"gmail"),
+            "an npx-launched third-party MCP must not be flagged stale: {:?}",
+            stale_names
+        );
+        assert!(
+            !stale_names.contains(&"weaviate-kg"),
+            "a vco-shaped path INSIDE install_root is current, not stale: {:?}",
+            stale_names
+        );
+
+        fs::remove_file(&target).ok();
+        fs::remove_dir_all(&root).ok();
+    }
 }

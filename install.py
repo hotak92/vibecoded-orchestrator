@@ -190,6 +190,12 @@ _INSTALL_OWNED_CONDITION_IDS = frozenset({
     "multi_candidate_prefix_adopt",
     "launcher_install_path_seed_unavailable",
     "orchestrator_root_kg_collection_locked",
+    # retired v0.2.83 (WP-B3): the producer that emitted this was removed —
+    # VCO no longer ships searxng, so an on-disk searxng dir / a `searxng` MCP
+    # entry is USER property (they may run their own), NOT a VCO leftover, and
+    # the old `rm -r claude_mcp_servers/searxng` remediation was harmful to
+    # such users. ID kept here so any stale on-disk entry from a pre-.83 run
+    # drop-when-absent self-clears on the next single-final-write.
     "searxng_removed_from_default_install",
     "ollama_mcp_deprecated",
     "search_mcp_simplified",
@@ -3967,7 +3973,9 @@ def _run_lightweight(args: argparse.Namespace) -> int:
     # SEARXNG_URL + GITHUB_TOKEN are no longer needed in the search MCP env.
     # Surface deferral notices so existing users know to clean up manually.
     if not getattr(args, "suppress_mcp_deprecation_warnings", False):
-        _check_searxng_remnants(PROJECT_ROOT, _lightweight_deferral)
+        # v0.2.83 (WP-B3): searxng-remnant producer RETIRED (harmful `rm -r`
+        # advice for users running their own searxng); ID self-clears — see
+        # the note in _INSTALL_OWNED_CONDITION_IDS.
         _check_ollama_mcp_remnants(_lightweight_deferral)
         _check_search_mcp_env_obsolete(_lightweight_deferral)
     _materialize_boot_service(PROJECT_ROOT, None, args,
@@ -6639,14 +6647,13 @@ def main() -> int:
     # but no install.py run (false-positive observed in wizard 2026-05-06).
     _write_install_manifest(sysinfo, args, install_method="install.py")
 
-    # PR-14b (v0.2.11 MCP simplification): SearXNG no longer ships in the
-    # default compose stack; Ollama MCP is dropped from the default install;
-    # SEARXNG_URL + GITHUB_TOKEN are no longer needed in the search MCP env.
-    # Surface deferral notices so existing users know to clean up manually.
-    # Soft-fail: each helper catches its own errors; install completes even
-    # if all three checks fail.
+    # PR-14b (v0.2.11 MCP simplification): Ollama MCP dropped from the default
+    # install; SEARXNG_URL + GITHUB_TOKEN no longer needed in the search MCP
+    # env. Surface deferral notices so existing users know to clean up.
+    # Soft-fail: each helper catches its own errors; install completes even if
+    # both checks fail. (v0.2.83 WP-B3: the searxng-remnant check was RETIRED —
+    # see the note in _INSTALL_OWNED_CONDITION_IDS.)
     if not getattr(args, "suppress_mcp_deprecation_warnings", False):
-        _check_searxng_remnants(PROJECT_ROOT, _deferral_report)
         _check_ollama_mcp_remnants(_deferral_report)
         _check_search_mcp_env_obsolete(_deferral_report)
 
@@ -18809,69 +18816,6 @@ def _materialize_boot_service_windows(
 # ---------------------------------------------------------------------------
 # PR-14b: MCP simplification — deprecation deferral helpers (v0.2.11)
 # ---------------------------------------------------------------------------
-
-def _check_searxng_remnants(
-    install_path: Path,
-    deferral_report: "DeferralReport",
-) -> None:
-    """Emit a deferral when pre-0.2.11 SearXNG artefacts are found on disk.
-
-    SearXNG was removed from the default compose stack in v0.2.11.  The
-    search MCP now ships only ``search_papers`` (OpenAlex + arXiv); the
-    web/code-search tools that depended on SearXNG are gone.
-
-    This helper is soft-fail throughout — any I/O error is caught and
-    logged; install completes regardless.
-
-    Args:
-        install_path:    Orchestrator project root (typically ``PROJECT_ROOT``).
-        deferral_report: Run-scoped :class:`DeferralReport` to append the
-            entry to when artefacts are found.
-    """
-    try:
-        found_paths: list[str] = []
-        searxng_dir = install_path / "claude_mcp_servers" / "searxng"
-        if searxng_dir.exists():
-            found_paths.append(str(searxng_dir))
-        searxng_tpl = install_path / "templates" / "searxng" / "settings.yml.template"
-        if searxng_tpl.exists():
-            found_paths.append(str(searxng_tpl))
-
-        if not found_paths:
-            return
-
-        paths_str = "\n".join(f"  - {p}" for p in found_paths)
-        rm_args = " ".join(found_paths)
-        deferral_report.add_entry(
-            DeferralEntry(
-                condition_id="searxng_removed_from_default_install",
-                title="SearXNG artefacts from pre-0.2.11 install detected",
-                detected=(
-                    f"SearXNG no longer ships by default in v0.2.11. "
-                    f"Existing local settings preserved at:\n{paths_str}"
-                ),
-                why_deferred=(
-                    "Automatic removal of user-customised SearXNG settings "
-                    "would discard any secret_key or engine list the user "
-                    "configured. Manual review required before deletion."
-                ),
-                command_to_apply=(
-                    f"rm -r {rm_args}\n"
-                    "podman rm -f $(podman ps -a --filter name=searxng -q) 2>/dev/null || true\n"
-                    "# Search narrowed to academic-paper search (search_papers MCP)."
-                ),
-                severity="info",
-                kg_node_refs=[
-                    "knowledge/concepts/orchestrator-mcp-servers.md",
-                ],
-            )
-        )
-    except Exception as exc:  # noqa: BLE001 — soft-fail
-        _log_install_event(
-            "searxng_remnants_check", "warn",
-            f"could not check SearXNG remnants: {exc}",
-        )
-
 
 def _check_ollama_mcp_remnants(
     deferral_report: "DeferralReport",
