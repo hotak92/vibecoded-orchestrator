@@ -57,6 +57,9 @@ type OrchValue = {
   version: string;
   installPath: string;
   updateStatus: Record<string, unknown> | null;
+  // v0.2.83 (N-4): mirror the real orchestrator store field the updater now
+  // derives its amber `remoteCheckFailed` from.
+  lastCheckFailed: boolean | null;
 };
 
 const orchStore = writable<OrchValue>({
@@ -64,6 +67,7 @@ const orchStore = writable<OrchValue>({
   version: '0.2.82',
   installPath: '/install/root',
   updateStatus: null,
+  lastCheckFailed: null,
 });
 
 let nextStoreValue: OrchValue | null = null;
@@ -110,11 +114,19 @@ function status(
 }
 
 function value(updateStatus: Record<string, unknown> | null): OrchValue {
+  // v0.2.83 (N-4): compute lastCheckFailed EXACTLY as the real orchestrator
+  // store does on a completed installed-check, so the updater's derivation is
+  // exercised against realistic store shapes: a null status OR an explicit
+  // remote_check_ok===false is a failed check; anything else (incl. a MISSING
+  // remote_check_ok, older Rust) is healthy.
+  const lastCheckFailed =
+    updateStatus === null || updateStatus.remote_check_ok === false;
   return {
     status: 'installed',
     version: '0.2.82',
     installPath: '/install/root',
     updateStatus,
+    lastCheckFailed,
   };
 }
 
@@ -192,8 +204,14 @@ describe('manualCheck (D6)', () => {
     expect(outcome).toBe('check_failed');
     const s = get(updater);
     expect(s.checking).toBe(false);
-    // No updateStatus ⇒ nothing to paint (remoteCheckFailed needs a status
-    // object with remote_check_ok===false), but crucially NOT 'up_to_date'.
+    // v0.2.83 (N-4): a null updateStatus completed check now DOES paint amber —
+    // the derivation reads the orchestrator store's explicit lastCheckFailed
+    // (true here), not the (null) updateStatus. Pre-N-4 this rendered NOTHING,
+    // silently implying "up to date" for a check that actually failed.
+    expect(s.remoteCheckFailed).toBe(true);
+    // No status object ⇒ no error string to surface (the badge falls back to
+    // the generic "Couldn't check for updates" copy).
+    expect(s.remoteCheckError).toBeNull();
     expect(s.kind).toBeNull();
   });
 
@@ -238,6 +256,32 @@ describe('remoteCheckFailed derivation (D3) via syncFromOrchestrator', () => {
   it('is false when the remote check succeeded', async () => {
     orchStore.set(value(status({ remote_check_ok: true })));
     updater.syncFromOrchestrator();
+    expect(get(updater).remoteCheckFailed).toBe(false);
+  });
+
+  // v0.2.83 (N-4): the two cases the OLD (updateStatus-derived) logic got wrong.
+  it('N-4: is TRUE for a null-status completed check (amber derivable, not blank)', async () => {
+    // updateStatus === null but the check COMPLETED and FAILED → lastCheckFailed
+    // true. The old `!!us && ...` derivation returned false here (blank badge).
+    orchStore.set(value(null));
+    updater.syncFromOrchestrator();
+    const s = get(updater);
+    expect(s.remoteCheckFailed).toBe(true);
+    expect(s.kind).toBeNull();
+    expect(s.remoteCheckError).toBeNull();
+  });
+
+  it('N-4: is FALSE before the first completed check (lastCheckFailed=null → no amber flash)', async () => {
+    // Simulate the pre-check store state directly (lastCheckFailed null).
+    orchStore.set({
+      status: 'installed',
+      version: '0.2.82',
+      installPath: '/install/root',
+      updateStatus: null,
+      lastCheckFailed: null,
+    });
+    updater.syncFromOrchestrator();
+    // null !== true → no amber during startup, even though updateStatus is null.
     expect(get(updater).remoteCheckFailed).toBe(false);
   });
 });

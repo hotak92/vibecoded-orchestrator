@@ -6348,17 +6348,36 @@ _LEGACY_COMPOSE_OVERRIDE_NAME = "docker-compose.override.yml"
 _CANONICAL_COMPOSE_OVERRIDE_NAME = "compose.override.yaml"
 _COMPOSE_OVERRIDE_SEARCH_SUBDIRS = ("infrastructure", "claude_mcp_servers")
 
-# v0.2.83 PLAN-v0283 B-F2: the compose-override condition the reconciliation
-# clears. SCOPE = `compose_override_filename_conflict` ONLY — that is the
+# v0.2.83 PLAN-v0283 B-F2 + N-2: the compose-override conditions the
+# reconciliation clears when they NO LONGER HOLD this run.
+#
+# B-F2 (original scope): `compose_override_filename_conflict` — the
 # HUMAN-JUDGEMENT deferral that pre-.83 persisted FOREVER after the user
-# resolved the pair (the incident this fix targets). The informational
-# `compose_override_renamed` / `compose_override_rename_failed` records are
-# one-shot notices of a completed/failed action; they are NOT reconciled here
-# (a) because their "condition" doesn't recur (`add_entry` is last-write-wins
-# per condition_id) and (b) so the historical idempotency contract holds —
-# a second producer run on an already-migrated tree still returns None.
+# resolved the pair (the incident this fix targets).
+#
+# N-2 (v0.2.83, user "fix-everything" directive): ALSO reconcile the two
+# informational one-shot records. B2 originally excluded them citing (a)
+# "their condition doesn't recur" and (b) the idempotency contract — but a
+# stale one-shot notice STILL lingers on disk forever once its action settled,
+# which is the same class of never-clearing cruft the conflict fix targets:
+#   * `compose_override_renamed`  — cleared when the rename is COMPLETE (the
+#     legacy path is gone this run, so nothing is re-emitted → the record is a
+#     settled notice of a past migration).
+#   * `compose_override_rename_failed` — cleared when the failure NO LONGER
+#     recurs (the conflict/FS error is gone this run → nothing re-emitted).
+# The "condition no longer holds" test is the SAME `not in active_condition_ids`
+# gate the conflict uses: `active_ids` is computed FROM the producer's own
+# path walk (`renamed`/`errors` populated this run), so a record only clears
+# when the producer positively re-detected NO recurrence. Idempotency is
+# preserved DIFFERENTLY than B2 assumed: the producer's RETURN VALUE is
+# orthogonal to disk reconciliation — a second run that clears a stale record
+# returns a non-None `auto_resolved` dict THAT RUN, then converges to None on
+# the third run (record already gone). See `test_idempotent_after_rename`
+# (updated with an N-2 comment).
 _COMPOSE_OVERRIDE_RECONCILE_CONDITION_IDS = (
     "compose_override_filename_conflict",
+    "compose_override_renamed",
+    "compose_override_rename_failed",
 )
 
 
@@ -6419,18 +6438,27 @@ def _reconcile_compose_override_deferrals(
     *,
     active_condition_ids: set[str],
 ) -> list[str]:
-    """v0.2.83 PLAN-v0283 B-F2: drop the stale compose-override CONFLICT deferral.
+    """v0.2.83 PLAN-v0283 B-F2 + N-2: drop STALE compose-override deferrals.
 
-    When a previously-deferred ``compose_override_filename_conflict`` no longer
-    holds this run (the conflicting pair became absent / identical / re-mirrored
-    — i.e. it is NOT in ``active_condition_ids``, the set this run re-emitted),
-    resolve the on-disk entry. Scoped to the conflict condition only (see the
-    constant's docstring): the informational rename/rename-failed records are
-    left to last-write-wins so idempotency holds.
+    When a previously-deferred compose-override condition no longer holds this
+    run — i.e. it is NOT in ``active_condition_ids``, the set this run re-emitted
+    from its own path walk — resolve the on-disk entry. Scope
+    (``_COMPOSE_OVERRIDE_RECONCILE_CONDITION_IDS``):
+      * ``compose_override_filename_conflict`` — the pair became absent /
+        identical / re-mirrored (B-F2).
+      * ``compose_override_renamed`` — the rename is complete (legacy path gone
+        this run → not re-emitted) (N-2).
+      * ``compose_override_rename_failed`` — the failure no longer recurs
+        (conflict / FS error gone this run → not re-emitted) (N-2).
 
     Returns the list of condition_ids actually resolved (for the additive
-    ``auto_resolved`` return key + ``record_auto_resolution`` bookkeeping).
-    Soft-fail: never raises.
+    ``auto_resolved`` / ``auto_resolved_condition_ids`` return keys + the
+    ``record_auto_resolution`` bookkeeping). Because these IDs are FOREIGN to
+    install.py (project_init emits them), the caller MUST replay each into the
+    run-scoped ``DeferralReport`` via ``mark_resolved`` (see B-1 /
+    ``install._replay_compose_override_resolutions``) or ``finalize()``'s
+    late-merge would resurrect a record we just cleared on disk. Soft-fail:
+    never raises.
     """
     from vco_lib import deferral_emit as _de
     from vco_lib.deferral_report import DeferralReport

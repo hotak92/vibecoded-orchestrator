@@ -859,15 +859,41 @@ class DetectAndRenameLegacyComposeOverrideTests(unittest.TestCase):
         )
 
     def test_idempotent_after_rename(self):
-        """Second call on a tree with no legacy files returns None."""
+        """Convergence after a rename: run1 renames + emits the notice; run2
+        RECONCILES the now-stale ``compose_override_renamed`` record (returns a
+        non-None auto_resolved dict — v0.2.83 PLAN-v0283 N-2); run3 is a true
+        no-op (record already cleared) → None."""
         legacy = self.install_root / "infrastructure" / "docker-compose.override.yml"
         legacy.write_text("services: {}\n")
-        project_init._detect_and_rename_legacy_compose_override(self.install_root)
-        # Second pass: no-op.
-        result = project_init._detect_and_rename_legacy_compose_override(
+        first = project_init._detect_and_rename_legacy_compose_override(
             self.install_root,
         )
-        self.assertIsNone(result)
+        self.assertEqual(first["action"], "renamed")
+        self.assertIn("compose_override_renamed", self._read_deferral_ids())
+
+        # v0.2.83 PLAN-v0283 N-2: second pass now reconciles the settled
+        # one-shot notice (legacy gone this run → record stale → cleared).
+        # The RETURN value changed from None (pre-N-2) to an auto_resolved dict;
+        # the reconciliation is on-DISK and orthogonal to whether the producer
+        # renamed anything this run.
+        second = project_init._detect_and_rename_legacy_compose_override(
+            self.install_root,
+        )
+        self.assertIsNotNone(second)
+        self.assertEqual(second["action"], "auto_resolved")
+        self.assertIn(
+            "compose_override_renamed",
+            second["auto_resolved_condition_ids"],
+        )
+        # The stale record is gone from disk.
+        self.assertNotIn("compose_override_renamed", self._read_deferral_ids())
+
+        # v0.2.83 PLAN-v0283 N-2: third pass is a TRUE no-op — nothing to
+        # rename AND nothing left to reconcile → None (stable convergence).
+        third = project_init._detect_and_rename_legacy_compose_override(
+            self.install_root,
+        )
+        self.assertIsNone(third)
 
     def test_mixed_rename_and_conflict(self):
         """One legacy in `infrastructure/` (renamed), one legacy+canonical

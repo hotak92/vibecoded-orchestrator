@@ -60,8 +60,21 @@ from vco_lib.deferral_report import DeferralEntry, DeferralReport  # noqa: E402
 from vco_lib.install_deferral_flow import InstallDeferralFlow  # noqa: E402
 
 _CONFLICT_CID = "compose_override_filename_conflict"
+_RENAMED_CID = "compose_override_renamed"
+_RENAME_FAILED_CID = "compose_override_rename_failed"
 _LEGACY = "docker-compose.override.yml"
 _CANONICAL = "compose.override.yaml"
+
+
+def _stale_record(cid: str) -> DeferralEntry:
+    return DeferralEntry(
+        condition_id=cid,
+        title=f"stale {cid}",
+        detected="a prior run emitted this one-shot notice",
+        why_deferred="informational",
+        command_to_apply="noop",
+        severity="info",
+    )
 
 
 def _infra(root: Path) -> Path:
@@ -185,6 +198,115 @@ def test_without_replay_the_entry_resurrects(tmp_path: Path) -> None:
     assert after.has_condition(_CONFLICT_CID), (
         "control: without the mark_resolved replay, the seeded conflict "
         "resurrects at finalize (this is the bug B-1 fixes)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# N-2 (v0.2.83): the two one-shot informational records — compose_override_renamed
+# and compose_override_rename_failed — now RECONCILE when their condition no
+# longer holds, AND (applying the B-1 lesson) survive the seed→finalize
+# choreography because they are FOREIGN, non-install-owned IDs replayed via the
+# same auto_resolved_condition_ids channel.
+# ---------------------------------------------------------------------------
+
+def test_renamed_and_rename_failed_are_foreign_to_install() -> None:
+    from vco_lib.deferral_report import condition_is_owned
+
+    for cid in (_RENAMED_CID, _RENAME_FAILED_CID):
+        assert cid not in install._INSTALL_OWNED_CONDITION_IDS
+        assert not condition_is_owned(
+            cid,
+            install._INSTALL_OWNED_CONDITION_IDS,
+            install._INSTALL_OWNED_CONDITION_PREFIXES,
+        ), f"{cid} must be FOREIGN for the N-2 resurrection risk to apply"
+
+
+def _run_selfclear_scenario(tmp_path: Path, stale_cid: str) -> None:
+    """Prior run left ``stale_cid`` on disk; THIS run has no legacy file (the
+    action settled), so the producer reconciles it. Drive the full
+    seed → producer → replay → finalize choreography and assert the record does
+    NOT resurrect."""
+    prior = DeferralReport()
+    prior.add_entry(_stale_record(stale_cid))
+    prior.write(tmp_path)
+    assert DeferralReport.read(tmp_path).has_condition(stale_cid)
+
+    # No legacy file this run → the settled one-shot condition no longer holds.
+    _infra(tmp_path)  # empty dir, no legacy/canonical files
+
+    flow = _new_flow(tmp_path)
+    flow.seed()
+    assert flow.report.has_condition(stale_cid), (
+        "premise: seed imports the FOREIGN one-shot record into the run report"
+    )
+
+    result = project_init._detect_and_rename_legacy_compose_override(tmp_path)
+    assert result is not None, "producer must return a dict when it reconciles"
+    assert stale_cid in result.get("auto_resolved_condition_ids", []), (
+        f"producer must report {stale_cid} as reconciled (N-2 scope)"
+    )
+
+    _replay_caller_resolution(flow.report, result)
+    assert not flow.report.has_condition(stale_cid), (
+        "the replay must drop the stale record from the run report in memory"
+    )
+
+    flow.finalize()
+
+    after = DeferralReport.read(tmp_path)
+    assert not after.has_condition(stale_cid), (
+        f"N-2: the reconciled {stale_cid} must NOT resurrect through "
+        "seed→finalize (foreign ID replayed via auto_resolved_condition_ids)"
+    )
+
+
+def test_stale_renamed_record_selfclears_through_finalize(tmp_path: Path) -> None:
+    _run_selfclear_scenario(tmp_path, _RENAMED_CID)
+
+
+def test_stale_rename_failed_record_selfclears_through_finalize(
+    tmp_path: Path,
+) -> None:
+    _run_selfclear_scenario(tmp_path, _RENAME_FAILED_CID)
+
+
+def test_without_replay_stale_renamed_resurrects(tmp_path: Path) -> None:
+    """Control: without the caller replay, the seeded stale renamed record is
+    rewritten to disk at finalize — the N-2 resurrection the replay eliminates.
+    """
+    prior = DeferralReport()
+    prior.add_entry(_stale_record(_RENAMED_CID))
+    prior.write(tmp_path)
+
+    _infra(tmp_path)
+
+    flow = _new_flow(tmp_path)
+    flow.seed()
+    project_init._detect_and_rename_legacy_compose_override(tmp_path)
+    # DELIBERATELY skip the replay → reproduce the resurrection.
+    flow.finalize()
+
+    after = DeferralReport.read(tmp_path)
+    assert after.has_condition(_RENAMED_CID), (
+        "control: without the mark_resolved replay, the seeded renamed record "
+        "resurrects at finalize (the N-2 resurrection the replay fixes)"
+    )
+
+
+def test_active_renamed_this_run_is_not_reconciled(tmp_path: Path) -> None:
+    """Leave-alone: when the producer ACTUALLY renames a legacy file THIS run,
+    the fresh compose_override_renamed record must be EMITTED, not reconciled
+    away (it is in active_condition_ids)."""
+    infra = _infra(tmp_path)
+    (infra / _LEGACY).write_bytes(b"services: {}\n")  # legacy present, no canonical
+
+    result = project_init._detect_and_rename_legacy_compose_override(tmp_path)
+    assert result is not None
+    assert result["action"] == "renamed"
+    # The fresh notice is emitted on disk, NOT in the auto_resolved set.
+    assert DeferralReport.read(tmp_path).has_condition(_RENAMED_CID)
+    assert _RENAMED_CID not in result.get("auto_resolved_condition_ids", []), (
+        "a rename that HAPPENED this run must emit the notice, not reconcile it"
     )
 
 

@@ -15,6 +15,7 @@
 // drive `setTimeout` with vitest fake timers to assert the cadence + caps.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { get } from 'svelte/store';
 
 // ---------------------------------------------------------------------------
 // $lib/tauri mock. `orchestrator.ts` imports { invoke, safeInvoke, listen }.
@@ -215,5 +216,75 @@ describe('orchestrator retry scheduling (D3)', () => {
 
     await vi.advanceTimersByTimeAsync(600_000);
     expect(checkForUpdatesCalls()).toBe(1); // the retry never fired
+  });
+});
+
+// ---------------------------------------------------------------------------
+// N-4 (v0.2.83): the store tracks an EXPLICIT lastCheckFailed outcome so the
+// amber "couldn't check" badge can render even when updateStatus is null (the
+// case the old derivation silently dropped).
+// ---------------------------------------------------------------------------
+describe('orchestrator lastCheckFailed tracking (N-4)', () => {
+  it('is null before the first completed check (no amber flash at startup)', async () => {
+    // Fresh store, no checkStatus() yet.
+    expect(get(orchestrator).lastCheckFailed).toBeNull();
+  });
+
+  it('is true after a completed check with a NULL updateStatus (command soft-failed)', async () => {
+    nextUpdateStatus = null; // check_for_updates soft-failed to null
+
+    await orchestrator.checkStatus();
+
+    // The completed check FAILED — amber must be derivable even though
+    // updateStatus is null (the exact gap N-4 closes).
+    expect(get(orchestrator).lastCheckFailed).toBe(true);
+    expect(get(orchestrator).updateStatus).toBeNull();
+  });
+
+  it('is true after remote_check_ok === false', async () => {
+    nextUpdateStatus = status({ remote_check_ok: false, remote_check_error: 'fetch failed' });
+
+    await orchestrator.checkStatus();
+
+    expect(get(orchestrator).lastCheckFailed).toBe(true);
+  });
+
+  it('is false after a successful check (remote_check_ok === true)', async () => {
+    nextUpdateStatus = status({ remote_check_ok: true });
+
+    await orchestrator.checkStatus();
+
+    expect(get(orchestrator).lastCheckFailed).toBe(false);
+  });
+
+  it('is false after a MISSING remote_check_ok (older Rust — treated healthy)', async () => {
+    nextUpdateStatus = status(); // no health fields
+
+    await orchestrator.checkStatus();
+
+    expect(get(orchestrator).lastCheckFailed).toBe(false);
+  });
+
+  it('is false when not installed (no remote to check → no amber)', async () => {
+    installed = false;
+
+    await orchestrator.checkStatus();
+
+    expect(get(orchestrator).status).toBe('not_installed');
+    expect(get(orchestrator).lastCheckFailed).toBe(false);
+  });
+
+  it('flips false→true→false as the remote check recovers then fails then recovers', async () => {
+    nextUpdateStatus = status({ remote_check_ok: true });
+    await orchestrator.checkStatus();
+    expect(get(orchestrator).lastCheckFailed).toBe(false);
+
+    nextUpdateStatus = status({ remote_check_ok: false });
+    await orchestrator.checkStatus();
+    expect(get(orchestrator).lastCheckFailed).toBe(true);
+
+    nextUpdateStatus = status({ remote_check_ok: true });
+    await orchestrator.checkStatus();
+    expect(get(orchestrator).lastCheckFailed).toBe(false);
   });
 });
