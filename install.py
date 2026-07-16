@@ -5242,6 +5242,33 @@ def _audit_and_offer_env_secret_migration(
         )
 
 
+def _replay_compose_override_resolutions(override_result, deferral_report) -> None:
+    """B-1 (v0.2.83): replay the compose-override producer's on-disk
+    auto-resolutions into the RUN-scoped ``deferral_report``.
+
+    ``_detect_and_rename_legacy_compose_override`` clears
+    ``compose_override_*`` condition IDs ON DISK this run (identical/semantic-
+    equal suppression + the reconcile-clear). Those IDs are FOREIGN to
+    install.py (project_init emits them), so ``InstallDeferralFlow.seed()``
+    imported them into the run report at the top of ``main()``. Without
+    replaying the resolution, ``finalize()``'s P1 pre-write re-merge would
+    rewrite the still-in-memory entry back to disk — a resurrection every
+    update. ``mark_resolved`` drops the in-memory copy AND tombstones the ID so
+    the late merge cannot re-import the (already-cleared) on-disk copy. This is
+    the R-6 owed-probe pattern (install.py ``_trigger_codegraph_embed_resync``).
+
+    Soft-fail per ID: a bad ID logs a warning, never crashes the install.
+    """
+    for cid in (override_result or {}).get("auto_resolved_condition_ids", ()):
+        try:
+            deferral_report.mark_resolved(cid)
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            _log_install_event(
+                "9/10", "warn",
+                f"could not mark_resolved compose deferral {cid!r}: {exc}",
+            )
+
+
 def main() -> int:
     # v0.2.53 bootstrap mode (Track B / docs/INSTALL_ARCHITECTURE_v2.md §3):
     # short-circuit BEFORE _ensure_running_under_mcp_venv() so the bootstrap
@@ -6505,6 +6532,7 @@ def main() -> int:
             from vco_lib.project_init import _detect_and_rename_legacy_compose_override
             _override_rename = _detect_and_rename_legacy_compose_override(PROJECT_ROOT)
             if _override_rename is not None:
+                _replay_compose_override_resolutions(_override_rename, _deferral_report)  # B-1 (v0.2.83)
                 print(
                     f"  compose override rename: action="
                     f"{_override_rename['action']}, "

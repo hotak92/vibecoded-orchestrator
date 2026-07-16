@@ -210,6 +210,93 @@ class RecordAutoResolutionTests(_TmpFolder):
             record_auto_resolution(self.folder, "c", "a", "d", log=log)
 
 
+class PlainCallableLogTests(_TmpFolder):
+    """M-1 (v0.2.83): ``_log`` must route to a PLAIN CALLABLE log.
+
+    All 8 project_init producer call-sites pass ``log=_log_auto`` — a plain
+    one-arg function, NOT a ``logging.Logger``. The historical
+    ``getattr(target, level, target.info)`` evaluated its ``target.info``
+    default EAGERLY; a plain function has no ``.info`` attribute so it raised
+    ``AttributeError`` before ``getattr`` ran, dropping the loud line to the
+    handler-less module logger. These pins prove the callable path works and
+    the Logger path is unregressed.
+    """
+
+    def test_record_auto_resolution_calls_plain_callable_log(self):
+        seen: list[str] = []
+
+        def _plain_log(msg: str) -> None:  # shape of project_init._log_auto
+            seen.append(msg)
+
+        record_auto_resolution(
+            self.folder, "compose_override_filename_conflict",
+            "kept_identical_mirror_pair", "byte-identical pair",
+            log=_plain_log,
+        )
+        # The loud line reached the plain callable (pre-M-1 it went to the
+        # handler-less module logger and was dropped).
+        self.assertTrue(seen, "the plain-callable log must receive the loud line")
+        joined = "\n".join(seen)
+        self.assertIn(
+            "auto-resolved: compose_override_filename_conflict", joined
+        )
+        self.assertIn("kept_identical_mirror_pair", joined)
+
+    def test_plain_callable_log_prints_to_stderr_when_it_does(self):
+        # Prove the WHOLE stderr path: a _log_auto-shaped callable that prints
+        # to stderr must actually emit (this is the real production shape —
+        # project_init._log_auto does `print(..., file=sys.stderr)`).
+        import io
+        import contextlib
+
+        def _stderr_log(msg: str) -> None:
+            print(f"[vct] {msg}", file=sys.stderr)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            record_auto_resolution(
+                self.folder, "cond_x", "did_thing", "details",
+                log=_stderr_log,
+            )
+        out = buf.getvalue()
+        self.assertIn("auto-resolved: cond_x", out)
+        self.assertIn("did_thing", out)
+
+    def test_emit_entries_soft_fail_line_reaches_plain_callable(self):
+        # The soft-fail branch of emit_entries also routes through _log with a
+        # "warning" level. Force a failure and assert a plain callable sees it.
+        seen: list[str] = []
+
+        def _plain_log(msg: str) -> None:
+            seen.append(msg)
+
+        with mock.patch(
+            "vco_lib.deferral_emit.locked_report",
+            side_effect=RuntimeError("boom"),
+        ):
+            wrote = emit_entries(self.folder, (_entry("c"),), log=_plain_log)
+        self.assertFalse(wrote)
+        self.assertTrue(seen, "soft-fail warning must reach the plain callable")
+        self.assertIn("emit_entries failed", "\n".join(seen))
+
+    def test_logger_path_still_works(self):
+        # Control: a real logging.Logger still routes via its level method.
+        log = logging.getLogger("test_m1_logger_control")
+        with self.assertLogs(log, level="INFO") as cm:
+            record_auto_resolution(
+                self.folder, "cond_y", "act_y", "det_y", log=log,
+            )
+        self.assertIn("auto-resolved: cond_y", "\n".join(cm.output))
+
+    def test_none_log_routes_to_module_logger(self):
+        # Control: log=None uses the module logger at the requested level.
+        with self.assertLogs("vco_lib.deferral_emit", level="INFO") as cm:
+            record_auto_resolution(
+                self.folder, "cond_z", "act_z", "det_z", log=None,
+            )
+        self.assertIn("auto-resolved: cond_z", "\n".join(cm.output))
+
+
 class WindowsDegradationTests(_TmpFolder):
     """exclusive_file_lock must still yield + write when fcntl is unavailable
     (Windows / a filesystem without flock) — best-effort no-lock."""

@@ -42,7 +42,9 @@ from vco_lib.install_mcp import (  # noqa: E402
     _UNINSTALL_SCRUB_MCP_NAMES,
     _UNINSTALL_SCRUB_SHAPE_GATED,
     _is_vco_shaped_playwright_entry,
+    _looks_absolute_path,
     _mcp_entry_path_inside_install_root,
+    _path_is_inside_install_root,
     uninstall_scrub_mcp_names,
 )
 
@@ -292,6 +294,80 @@ class TestShapePredicates(_ScrubTestBase):
         )
         self.assertFalse(
             _is_vco_shaped_playwright_entry({"command": "node", "args": []})
+        )
+
+
+# ── M-3: path-prefix collision — sibling-prefix + non-C drive-letter ──────
+class TestM3PathPrefixCollision(_ScrubTestBase):
+    """A raw ``startswith`` prefix test collided on sibling paths that share a
+    string prefix but are NOT nested. With install root ``.../install``, a
+    third-party MCP at ``.../install-tools/...`` "startswith" the root and was
+    wrongly scrubbed. The component-aware boundary fixes this. Also: the abs-
+    path gate accepted only ``C:``/``c:`` drives — a ``D:\\`` VCO path was
+    ignored (never matched inside-root). Both fixed here."""
+
+    def _sibling_prefix_path(self) -> str:
+        # install_root is <root>/install; the sibling is <root>/install-tools.
+        return str(self.root / "install-tools" / ".venv" / "bin" / "python")
+
+    # LEAVE-ALONE: sibling-prefix third-party entry must SURVIVE ------------
+    def test_shape_gated_sibling_prefix_entry_survives(self) -> None:
+        # A user's mermaid living at <install_root>-tools/... shares the root's
+        # string prefix but is NOT inside it → NOT VCO-shaped → survives.
+        self._write({
+            "mermaid": {
+                "command": self._sibling_prefix_path(),
+                "args": ["-m", "someones_mermaid"],
+            },
+        })
+        self.assertNotIn(
+            "mermaid", self._scrub(),
+            "sibling-prefix path must NOT be classified as inside the install "
+            "root — the raw startswith bug scrubbed it",
+        )
+
+    def test_predicate_false_for_sibling_prefix(self) -> None:
+        self.assertFalse(
+            _mcp_entry_path_inside_install_root(
+                {"command": self._sibling_prefix_path()}, self.install_root
+            ),
+            "sibling-prefix path is not nested under the install root",
+        )
+
+    def test_predicate_true_for_genuine_nesting(self) -> None:
+        # Control: a genuinely nested path (VCO's own) still matches.
+        self.assertTrue(
+            _mcp_entry_path_inside_install_root(
+                {"command": self._vco_python()}, self.install_root
+            )
+        )
+
+    def test_path_helper_sibling_prefix_and_nesting(self) -> None:
+        root = "/home/u/vco"
+        self.assertFalse(_path_is_inside_install_root("/home/u/vco-tools/x", root))
+        self.assertFalse(_path_is_inside_install_root("/home/u/vcofoo", root))
+        self.assertTrue(_path_is_inside_install_root("/home/u/vco/.venv/py", root))
+        self.assertTrue(_path_is_inside_install_root("/home/u/vco", root))
+
+    # Non-C drive letters now recognized as absolute -----------------------
+    def test_d_drive_path_is_absolute(self) -> None:
+        self.assertTrue(_looks_absolute_path(r"D:\vco\.venv\python.exe"))
+        self.assertTrue(_looks_absolute_path(r"E:\anything"))
+        self.assertTrue(_looks_absolute_path(r"z:/vco"))
+        # And a relative / launcher-style command is still not absolute.
+        self.assertFalse(_looks_absolute_path("npx"))
+        self.assertFalse(_looks_absolute_path("python"))
+        self.assertFalse(_looks_absolute_path(""))
+
+    def test_d_drive_nested_path_matches_install_root(self) -> None:
+        # A VCO install rooted on D:\ — a nested command must be inside-root.
+        root = r"D:\vco"
+        self.assertTrue(
+            _path_is_inside_install_root(r"D:\vco\.venv\Scripts\python.exe", root)
+        )
+        # ...and a D:\ sibling-prefix path must NOT match.
+        self.assertFalse(
+            _path_is_inside_install_root(r"D:\vco-tools\serve.py", root)
         )
 
 

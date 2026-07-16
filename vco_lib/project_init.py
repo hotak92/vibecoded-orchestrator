@@ -6447,6 +6447,18 @@ def _reconcile_compose_override_deferrals(
     if not stale:
         return []
     _de.resolve_conditions(install_root, stale, log=_log_auto)
+    # v0.2.83 B-1: leave a visible trail for each reconciled condition. Before
+    # this the reconcile branch cleared the on-disk entry via resolve_conditions
+    # but never wrote an auto-resolutions.jsonl row (the caller appended to a
+    # list nobody replayed), so a self-clear was invisible in the audit log.
+    for cid in stale:
+        _de.record_auto_resolution(
+            install_root,
+            cid,
+            "reconciled_stale_compose_override",
+            f"cleared stale {cid} deferral (condition no longer holds this run)",
+            log=_log_auto,
+        )
     return stale
 
 
@@ -6511,6 +6523,13 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
     conflicts: list[tuple[Path, Path]] = []
     errors: list[tuple[Path, str]] = []
     auto_resolved: list[str] = []
+    # v0.2.83 B-1: the CONDITION IDs this run auto-resolved on disk, for the
+    # additive ``auto_resolved_condition_ids`` return key. install.py's caller
+    # replays each into the RUN-scoped DeferralReport via ``mark_resolved`` so
+    # the A-2 seed → finalize P1 late-merge cannot resurrect an entry we just
+    # cleared on disk (the resolve_conditions tombstone is per-instance — it
+    # lives on the throwaway report inside locked_report, not on the run report).
+    auto_resolved_condition_ids: set[str] = set()
 
     for subdir in _COMPOSE_OVERRIDE_SEARCH_SUBDIRS:
         legacy_path = install_root / subdir / _LEGACY_COMPOSE_OVERRIDE_NAME
@@ -6539,6 +6558,7 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
                     log=_log_auto,
                 )
                 auto_resolved.append(detail)
+                auto_resolved_condition_ids.add("compose_override_filename_conflict")
                 continue
             if classification == "semantic_equal":
                 # B-F2(ii): comment/whitespace drift only. Canonical content
@@ -6571,6 +6591,7 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
                     log=_log_auto,
                 )
                 auto_resolved.append(detail)
+                auto_resolved_condition_ids.add("compose_override_filename_conflict")
                 continue
             # B-F2(iii): genuinely divergent — keep today's deferral. Don't
             # overwrite the canonical file with the legacy one (or vice versa).
@@ -6601,6 +6622,7 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
     )
     for cid in reconciled:
         auto_resolved.append(f"cleared stale {cid} deferral (no longer applies)")
+        auto_resolved_condition_ids.add(cid)
 
     if not renamed and not conflicts and not errors:
         # Nothing to emit. Return a dict ONLY when we auto-resolved / reconciled
@@ -6612,6 +6634,10 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
                 "conflicts": [],
                 "errors": [],
                 "auto_resolved": auto_resolved,
+                # v0.2.83 B-1 additive: the caller replays these into the
+                # run-scoped DeferralReport (mark_resolved) so seed→finalize
+                # cannot resurrect an entry we just cleared on disk.
+                "auto_resolved_condition_ids": sorted(auto_resolved_condition_ids),
             }
         return None
 
@@ -6739,6 +6765,10 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
         # v0.2.83 additive key (install.py:6497 does not read it — frozen
         # contract preserved).
         "auto_resolved": auto_resolved,
+        # v0.2.83 B-1 additive: condition IDs this run cleared on disk. The
+        # install.py caller replays them into the run-scoped DeferralReport
+        # (mark_resolved) so seed→finalize cannot resurrect them.
+        "auto_resolved_condition_ids": sorted(auto_resolved_condition_ids),
     }
 
 
@@ -12710,15 +12740,24 @@ def _cmd_dismiss_deferral(args: argparse.Namespace) -> int:
             print("no matching deferral", file=sys.stderr)
         return 0
 
-    report.mark_resolved(condition_id)
-    # `report.write` deletes the file when the entry list is empty and
-    # strips the CLAUDE.md reminder block — both desired here. NOTE: this is a
-    # user-initiated single-shot CLI resolve on the ALREADY-PARSED report (with
-    # the malformed-file exit-1 detection above), NOT a fresh-emit clobber path,
-    # so it stays on the direct write rather than routing through
-    # deferral_emit's locked read-modify-write (which would re-read from disk
-    # and change the `remaining` count the JSON payload reports).
-    report.write(folder)
+    # N-1 (v0.2.83): route the resolve→write through the SHARED deferral file
+    # lock (deferral_emit.locked_report) so a concurrent writer — a mid-run
+    # install.py finalize(), a detached resync child — cannot interleave its
+    # read/write pair with ours and drop entries. The earlier direct
+    # `report.write(folder)` here was the LAST un-locked read-modify-write on
+    # the deferral file. The malformed-file / no-match exit paths above already
+    # returned, so reaching here means we WILL mutate. The `remaining` count now
+    # comes from the LOCKED re-read (authoritative post-write disk state) rather
+    # than the pre-lock in-memory parse — a concurrent writer's committed
+    # entries are correctly reflected. Flat call-site (NOT nested inside another
+    # locked_report) — the non-reentrancy contract holds.
+    from vco_lib import deferral_emit as _de
+
+    with _de.locked_report(folder) as locked:
+        locked.mark_resolved(condition_id)
+        remaining = len(locked.entries)
+    # `locked_report` writes + deletes-when-empty + strips the CLAUDE.md
+    # reminder block on exit — same side effects as the prior direct write.
 
     # v0.2.83 PLAN-v0283 B-F7 + D9: content-keyed dismissal memory. When the
     # user dismisses `template_review_pending`, snapshot the current reference-
@@ -12731,7 +12770,7 @@ def _cmd_dismiss_deferral(args: argparse.Namespace) -> int:
     payload = {
         "dismissed": True,
         "condition_id": condition_id,
-        "remaining": len(report.entries),
+        "remaining": remaining,
         "reason": "dismissed",
     }
     if args.json:
