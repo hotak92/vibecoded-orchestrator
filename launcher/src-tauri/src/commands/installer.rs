@@ -7215,6 +7215,14 @@ fn write_update_resume_deferral(
         );
         return;
     }
+    // v0.2.83 WP-B6: hold the shared UPDATE_DEFERRED lock across the tmp-write +
+    // rename so this standalone full-rewrite serializes with every other writer
+    // on `<install_path>/.claude/context/.update-deferred.lock`. Standalone by
+    // design (the sentinel's whole point is "install.py never ran" → Python
+    // cannot be assumed), so we take the flock directly. Best-effort (real flock
+    // on POSIX, no-lock on Windows). Held until return.
+    let _deferral_lock =
+        vct_launcher_core::services::deferral_lock::lock_folder(install_path);
     let now = chrono::Utc::now().to_rfc3339();
     let op_phrase = if operation == "rebase" { "rebase" } else { "merge" };
     let install_root_display = install_path.display();
@@ -7383,6 +7391,13 @@ async fn write_resume_sentinel_and_deferral(
 /// re-write handle the surgical removal. This avoids destroying
 /// unrelated deferrals.
 fn clear_update_resume_deferral_if_solo(install_path: &Path) {
+    // v0.2.83 WP-B6: hold the shared UPDATE_DEFERRED lock around the whole
+    // read → solo-decision → delete (.md + .json sidecar) cycle so a concurrent
+    // writer cannot add an entry between our read and our unlink (which would
+    // make us delete a file that is no longer solo). Best-effort (real flock on
+    // POSIX, no-lock on Windows). Held for the function's whole lifetime.
+    let _deferral_lock =
+        vct_launcher_core::services::deferral_lock::lock_folder(install_path);
     let target = install_path.join(".claude/context/UPDATE_DEFERRED.md");
     let Ok(content) = std::fs::read_to_string(&target) else {
         return;
@@ -15704,6 +15719,97 @@ MemAvailable:   23456789 kB
                 body.contains("(rebase on `main`)"),
                 "rebase op must be reflected in Detected copy; got: {body}"
             );
+        }
+
+        /// WP-B6 (v0.2.83): `write_update_resume_deferral` must hold the shared
+        /// UPDATE_DEFERRED flock across its tmp-write + rename. Observable proof:
+        /// hold the SAME folder's flock on a background thread for a fixed
+        /// window; the writer on the main thread must BLOCK until release, so its
+        /// wall-clock duration is >= the window. POSIX-only. ms-scaled.
+        #[cfg(unix)]
+        #[test]
+        fn write_update_resume_deferral_serializes_on_shared_lock() {
+            use std::sync::mpsc;
+            use std::time::{Duration, Instant};
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let install = dir.path().to_path_buf();
+            std::fs::create_dir_all(install.join(".claude/context")).unwrap();
+
+            const HOLD: Duration = Duration::from_millis(300);
+            let folder = install.clone();
+            let (ready_tx, ready_rx) = mpsc::channel::<()>();
+            let holder = std::thread::spawn(move || {
+                let guard =
+                    vct_launcher_core::services::deferral_lock::lock_folder(&folder);
+                ready_tx.send(()).unwrap();
+                std::thread::sleep(HOLD);
+                drop(guard);
+            });
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+            let started = Instant::now();
+            write_update_resume_deferral(&install, "merge", "main");
+            let waited = started.elapsed();
+
+            assert!(
+                waited >= HOLD - Duration::from_millis(80),
+                "write_update_resume_deferral did not block on the shared lock \
+                 (waited {waited:?}, expected >= ~{HOLD:?})",
+            );
+            assert!(
+                install.join(".claude/context/UPDATE_DEFERRED.md").is_file(),
+                "deferral must land after acquiring the lock"
+            );
+            holder.join().unwrap();
+        }
+
+        /// WP-B6 (v0.2.83): `clear_update_resume_deferral_if_solo` must hold the
+        /// shared UPDATE_DEFERRED flock across its read → solo-decision → delete
+        /// cycle. Same serialization proof as the writer test. POSIX-only.
+        #[cfg(unix)]
+        #[test]
+        fn clear_update_resume_deferral_if_solo_serializes_on_shared_lock() {
+            use std::sync::mpsc;
+            use std::time::{Duration, Instant};
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let install = dir.path().to_path_buf();
+            let ctx = install.join(".claude/context");
+            std::fs::create_dir_all(&ctx).unwrap();
+            // A solo update_resume_required deferral so the clear will unlink it.
+            std::fs::write(
+                ctx.join("UPDATE_DEFERRED.md"),
+                "---\ncondition_ids: [update_resume_required]\n---\n\n# VCO Update Deferred\n\n## update_resume_required (warning)\n\n**Title**: foo\n\n---\n",
+            )
+            .unwrap();
+
+            const HOLD: Duration = Duration::from_millis(300);
+            let folder = install.clone();
+            let (ready_tx, ready_rx) = mpsc::channel::<()>();
+            let holder = std::thread::spawn(move || {
+                let guard =
+                    vct_launcher_core::services::deferral_lock::lock_folder(&folder);
+                ready_tx.send(()).unwrap();
+                std::thread::sleep(HOLD);
+                drop(guard);
+            });
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+            let started = Instant::now();
+            clear_update_resume_deferral_if_solo(&install);
+            let waited = started.elapsed();
+
+            assert!(
+                waited >= HOLD - Duration::from_millis(80),
+                "clear_update_resume_deferral_if_solo did not block on the shared \
+                 lock (waited {waited:?}, expected >= ~{HOLD:?})",
+            );
+            assert!(
+                !ctx.join("UPDATE_DEFERRED.md").exists(),
+                "solo entry must be cleared after acquiring the lock"
+            );
+            holder.join().unwrap();
         }
 
         // ─── v0.2.55: launcher_update_diverged durable-logging writer ─────

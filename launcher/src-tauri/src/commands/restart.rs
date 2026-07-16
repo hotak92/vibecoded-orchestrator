@@ -353,6 +353,15 @@ pub async fn restart_launcher<R: Runtime>(
 /// Returns Ok(()) on success OR when the file doesn't exist (nothing
 /// to clear). Returns Err(String) on I/O failure mid-write.
 fn clear_restart_deferral(install_root: &Path) -> Result<(), String> {
+    // v0.2.83 WP-B6: hold the shared UPDATE_DEFERRED lock around the whole
+    // read → strip → rewrite/delete cycle so a concurrent writer (a Python
+    // `deferral_emit` writer, or another Rust direct writer) cannot interleave
+    // and drop entries / resurrect the banner. Best-effort: on POSIX this is a
+    // real flock; on Windows it degrades to no-lock (symmetric with the Python
+    // side). Held for the function's whole lifetime via `_deferral_lock`.
+    let _deferral_lock =
+        vct_launcher_core::services::deferral_lock::lock_folder(install_root);
+
     let target = install_root
         .join(".claude")
         .join("context")
@@ -920,5 +929,62 @@ stub: true
             assert_eq!(subdir, "linux-x64");
             assert_eq!(fname, "vct-launcher");
         }
+    }
+
+    /// WP-B6 (v0.2.83): `clear_restart_deferral` must hold the shared
+    /// UPDATE_DEFERRED flock across its read → strip → rewrite/delete cycle.
+    /// Observable proof of serialization: hold the SAME folder's flock on a
+    /// background thread for a fixed window, then call `clear_restart_deferral`
+    /// on the main thread — it must BLOCK on the flock until the window ends,
+    /// so the call's wall-clock duration is >= the hold window. POSIX-only
+    /// (the flock is a no-op on Windows, matching the Python side). ms-scaled.
+    #[cfg(unix)]
+    #[test]
+    fn clear_restart_deferral_serializes_on_shared_lock() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dot_claude = tmp.path().join(".claude").join("context");
+        std::fs::create_dir_all(&dot_claude).expect("mkdir");
+        let target = dot_claude.join("UPDATE_DEFERRED.md");
+        std::fs::write(
+            &target,
+            "---\ncondition_ids: [launcher_restart_required]\n---\n\n# VCO Update Deferred\n\n## launcher_restart_required (info)\n\n**Title**: foo\n\n---\n",
+        )
+        .expect("write");
+
+        const HOLD: Duration = Duration::from_millis(300);
+        let folder = tmp.path().to_path_buf();
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+
+        // Background thread grabs the shared lock, signals ready, holds it, releases.
+        let holder = std::thread::spawn(move || {
+            let guard =
+                vct_launcher_core::services::deferral_lock::lock_folder(&folder);
+            ready_tx.send(()).expect("signal ready");
+            std::thread::sleep(HOLD);
+            drop(guard); // release → the main thread's blocked flock returns.
+        });
+
+        // Wait until the holder actually owns the lock before we race for it.
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("holder must acquire the lock");
+
+        let started = Instant::now();
+        clear_restart_deferral(tmp.path()).expect("clear");
+        let waited = started.elapsed();
+
+        // The clear could only proceed AFTER the holder released, so it must
+        // have blocked for ~the remaining hold window. Allow scheduling slack.
+        assert!(
+            waited >= HOLD - Duration::from_millis(80),
+            "clear_restart_deferral did not block on the shared lock \
+             (waited {waited:?}, expected >= ~{HOLD:?}) — the flock is not held \
+             across the read-modify-write cycle",
+        );
+        assert!(!target.exists(), "clear should have unlinked the solo entry");
+        holder.join().expect("holder joins");
     }
 }

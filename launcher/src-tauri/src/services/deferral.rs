@@ -9,7 +9,21 @@
 //! read/parse cycle (condition-id dedup on `add_entry`). Rather than
 //! re-implement that markdown machinery in Rust, the launcher's various
 //! deferral emitters all shell out to a tiny `python -c` snippet that
-//! imports `DeferralEntry` + `DeferralReport` and appends one entry.
+//! imports the Python emitter and appends one entry.
+//!
+//! ## v0.2.83 WP-B6 — routes through the LOCKED emitter
+//!
+//! The `-c` snippet now imports `DeferralEntry` + `emit` from
+//! `vco_lib.deferral_emit` (NOT the raw `DeferralReport.read/add_entry/write`
+//! triplet it used through v0.2.82). `deferral_emit.emit` holds an exclusive
+//! `flock` on `<folder>/.claude/context/.update-deferred.lock` for the whole
+//! read → mutate → write cycle, so ALL SIX delegating call-sites below now
+//! serialize on the SAME lock as every other UPDATE_DEFERRED writer (the
+//! Python install-flow / project-init writers, and — via
+//! `vct_launcher_core::services::deferral_lock` — the launcher's DIRECT
+//! `std::fs` deferral writers). Behaviour is otherwise identical: foreign
+//! entries are preserved (last-write-wins per condition_id) and a failure maps
+//! to a subprocess non-zero exit, which this writer surfaces as `Err`.
 //!
 //! Before this module, SIX call-sites carried a byte-for-byte copy of the
 //! same three helpers each — `py_quote` (Python-string escaper),
@@ -98,33 +112,7 @@ pub fn emit_deferral_entry(
     let python = vct_launcher_core::python_resolve::resolve_python_for_vco_lib()
         .ok_or_else(|| "no python interpreter found to emit deferral".to_string())?;
 
-    let root_py = py_quote(&sys_path_root.to_string_lossy());
-    let folder_py = py_quote(&report_folder.to_string_lossy());
-    let cid_py = py_quote(fields.condition_id);
-    let title_py = py_quote(fields.title);
-    let det_py = py_quote(fields.detected);
-    let why_py = py_quote(fields.why_deferred);
-    let cmd_py = py_quote(fields.command_to_apply);
-    let sev_py = py_quote(fields.severity);
-
-    let script = format!(
-        "import sys\n\
-         sys.path.insert(0, {root_py})\n\
-         from pathlib import Path\n\
-         from vco_lib.deferral_report import DeferralEntry, DeferralReport\n\
-         folder = Path({folder_py})\n\
-         report = DeferralReport.read(folder)\n\
-         entry = DeferralEntry(\n\
-         \x20\x20\x20\x20condition_id={cid_py},\n\
-         \x20\x20\x20\x20title={title_py},\n\
-         \x20\x20\x20\x20detected={det_py},\n\
-         \x20\x20\x20\x20why_deferred={why_py},\n\
-         \x20\x20\x20\x20command_to_apply={cmd_py},\n\
-         \x20\x20\x20\x20severity={sev_py},\n\
-         )\n\
-         report.add_entry(entry)\n\
-         report.write(folder)\n",
-    );
+    let script = build_deferral_emit_script(sys_path_root, report_folder, fields);
 
     let status = std::process::Command::new(&python)
         .silent()
@@ -136,6 +124,59 @@ pub fn emit_deferral_entry(
         Ok(s) => Err(format!("deferral helper exited {}", s)),
         Err(e) => Err(format!("deferral helper spawn failed: {}", e)),
     }
+}
+
+/// Build the injection-safe `python -c` payload that emits one deferral entry.
+///
+/// v0.2.83 WP-B6: routes through the LOCKED emitter `vco_lib.deferral_emit`
+/// (`DeferralEntry` + `emit`), NOT the raw `DeferralReport.read/add_entry/write`
+/// triplet used through v0.2.82. `deferral_emit.emit` holds an exclusive `flock`
+/// on `<folder>/.claude/context/.update-deferred.lock` for the whole
+/// read → mutate → write cycle, so all six delegating Rust call-sites serialize
+/// on the SAME lock as every other UPDATE_DEFERRED writer (Python writers, and —
+/// via [`vct_launcher_core::services::deferral_lock`] — the launcher's direct
+/// `std::fs` deferral writers).
+///
+/// `emit` preserves FOREIGN entries (last-write-wins per condition_id) and
+/// swallows I/O errors internally, returning `True` when the report holds ≥1
+/// entry after the write (our single add always does unless the add raised) and
+/// `False` on error. The payload maps `False` → `sys.exit(1)` so the caller's
+/// "subprocess non-zero ⇒ `Err`" soft-fail posture stays byte-for-byte
+/// identical to the pre-WP-B6 raw-write payload.
+///
+/// Extracted as a pure helper so the structural payload test can assert the
+/// snippet references `vco_lib.deferral_emit` without spawning a subprocess.
+fn build_deferral_emit_script(
+    sys_path_root: &Path,
+    report_folder: &Path,
+    fields: &DeferralEntryFields<'_>,
+) -> String {
+    let root_py = py_quote(&sys_path_root.to_string_lossy());
+    let folder_py = py_quote(&report_folder.to_string_lossy());
+    let cid_py = py_quote(fields.condition_id);
+    let title_py = py_quote(fields.title);
+    let det_py = py_quote(fields.detected);
+    let why_py = py_quote(fields.why_deferred);
+    let cmd_py = py_quote(fields.command_to_apply);
+    let sev_py = py_quote(fields.severity);
+
+    format!(
+        "import sys\n\
+         sys.path.insert(0, {root_py})\n\
+         from pathlib import Path\n\
+         from vco_lib.deferral_emit import DeferralEntry, emit\n\
+         folder = Path({folder_py})\n\
+         entry = DeferralEntry(\n\
+         \x20\x20\x20\x20condition_id={cid_py},\n\
+         \x20\x20\x20\x20title={title_py},\n\
+         \x20\x20\x20\x20detected={det_py},\n\
+         \x20\x20\x20\x20why_deferred={why_py},\n\
+         \x20\x20\x20\x20command_to_apply={cmd_py},\n\
+         \x20\x20\x20\x20severity={sev_py},\n\
+         )\n\
+         ok = emit(folder, entry)\n\
+         sys.exit(0 if ok else 1)\n",
+    )
 }
 
 /// Quote `s` as a Python double-quoted string literal, escaping
@@ -165,6 +206,51 @@ pub fn py_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WP-B6 (v0.2.83): the chokepoint payload MUST route through the LOCKED
+    /// emitter `vco_lib.deferral_emit` (`emit`), NOT the raw
+    /// `DeferralReport.read/add_entry/write` triplet — that is what serializes
+    /// all six delegating call-sites on the shared file lock. Structural pin:
+    /// if a refactor reverts the import, this fails.
+    #[test]
+    fn payload_routes_through_locked_deferral_emit() {
+        let fields = DeferralEntryFields {
+            condition_id: "some_cond",
+            title: "T",
+            detected: "D",
+            why_deferred: "W",
+            command_to_apply: "cmd",
+            severity: "warning",
+        };
+        let script = build_deferral_emit_script(
+            Path::new("/orch/root"),
+            Path::new("/proj/folder"),
+            &fields,
+        );
+        // Locked emitter import + call.
+        assert!(
+            script.contains("from vco_lib.deferral_emit import DeferralEntry, emit"),
+            "payload must import from the LOCKED emitter vco_lib.deferral_emit; got:\n{script}"
+        );
+        assert!(
+            script.contains("ok = emit(folder, entry)"),
+            "payload must call emit(folder, entry); got:\n{script}"
+        );
+        // Soft-fail posture preserved: False ⇒ non-zero exit ⇒ caller Err.
+        assert!(
+            script.contains("sys.exit(0 if ok else 1)"),
+            "payload must map emit()==False to a non-zero exit; got:\n{script}"
+        );
+        // The pre-WP-B6 raw triplet must be GONE (no unlocked read/write path).
+        assert!(
+            !script.contains("DeferralReport"),
+            "payload must NOT reference the unlocked DeferralReport writer; got:\n{script}"
+        );
+        assert!(
+            !script.contains("report.write"),
+            "payload must NOT call the unlocked report.write; got:\n{script}"
+        );
+    }
 
     #[test]
     fn py_quote_escapes_injection_chars() {
