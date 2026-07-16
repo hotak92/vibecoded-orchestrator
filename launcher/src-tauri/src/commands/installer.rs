@@ -11532,10 +11532,19 @@ MemAvailable:   23456789 kB
                 forbidden
             );
         }
-        // 4. MCP scrub must preserve user's other servers.
+        // 4. MCP scrub must preserve user's other servers. v0.2.83 (WP-B5):
+        // the inline `orchestrator_mcps` allow-list literal moved to the
+        // shared table-sourced helper `vco_lib.install_mcp.
+        // uninstall_scrub_mcp_names` (positive-ID scrub: VCO-shaped paths
+        // inside the install root + playwright's exact npx fingerprint;
+        // act/leave-alone behavior pinned by
+        // tests/test_v0283_uninstall_scrub_migration.py). The structural pin
+        // here asserts the delegation — a blanket `mcpServers` wipe or a
+        // fresh inline literal would break it.
         assert!(
-            body.contains("orchestrator_mcps"),
-            "_run_uninstall must allow-list orchestrator MCPs only (preserving user MCPs)"
+            body.contains("_uninstall_scrub_mcp_names"),
+            "_run_uninstall must delegate MCP scrubbing to the table-sourced \
+             allow-list helper (preserving user MCPs)"
         );
     }
 
