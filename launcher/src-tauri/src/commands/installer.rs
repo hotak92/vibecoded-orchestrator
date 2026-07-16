@@ -923,6 +923,20 @@ pub struct UpdateStatus {
     /// the sidecar metadata is absent (e.g. dev build running from
     /// `cargo run` with no dist artifacts staged).
     pub on_disk_binary_version: String,
+    /// NEW v0.2.83 (D2 / A-RC1): honest remote-check health. `false` means the
+    /// remote signal is UNKNOWN — the fetch / rev-parse / rev-list chain could
+    /// not complete — NOT "up to date". Pre-v0.2.83 every failure in the remote
+    /// section silently left `remote_ahead=false`, indistinguishable from a
+    /// genuine "no update"; the frontend then rendered nothing (the first-start
+    /// bug). `true` on the success path AND for non-git installs (remote check
+    /// is not applicable there — `install_stale`/`binary_stale` carry the
+    /// banner, and retrying a non-checkout is pointless).
+    pub remote_check_ok: bool,
+    /// NEW v0.2.83 (D2 / A-RC1): concise last-stderr-line / stage label for the
+    /// failure that set `remote_check_ok=false`. `None` on success and for
+    /// non-git installs. The frontend surfaces this in the badge popover
+    /// ("Couldn't check for updates — <error>") and schedules fast retries.
+    pub remote_check_error: Option<String>,
 }
 
 /// Check for updates across all three signals (git, manifest, binary).
@@ -936,6 +950,14 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
 
     // Defaults — populated below when sources are available.
     let mut remote_ahead = false;
+    // v0.2.83 (D2): honest remote-check health. Default ok=true / error=None so
+    // a non-git install (which never enters the remote section) reports
+    // "not applicable, no retry needed". The git branch below flips these to
+    // false + a concise error on ANY failure so the frontend can render an
+    // amber "couldn't check" state and schedule retries instead of a silent
+    // false "up to date" (A-RC1).
+    let mut remote_check_ok = true;
+    let mut remote_check_error: Option<String> = None;
     let mut source_version = String::new();
     let mut installed_version = String::new();
     let running_version = env!("CARGO_PKG_VERSION").to_string();
@@ -956,86 +978,154 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
     //    auto-creates / corrects the remote on every call.
     if p.join(".git").exists() {
         // Pin the upstream remote BEFORE any network ops. Soft-fail: on
-        // error (e.g. corrupt .git/config) leave remote_ahead at false
-        // and let the install_stale / binary_stale signals carry the
-        // banner, matching the pre-existing soft-fail posture for the
-        // fetch step below.
+        // error (e.g. corrupt .git/config) mark the remote check as failed
+        // (health field) and let the install_stale / binary_stale signals
+        // carry the banner. v0.2.83 (D2): this used to leave remote_ahead at
+        // false SILENTLY — now every failure branch populates
+        // remote_check_ok/error so the frontend can honestly show
+        // "couldn't check" and retry.
         if let Err(e) = crate::commands::self_update::ensure_upstream_remote(&p).await {
             eprintln!(
                 "[vct] check_for_updates: ensure_upstream_remote failed at {} ({}), skipping remote check",
                 p.display(),
                 e
             );
+            remote_check_ok = false;
+            remote_check_error = Some(format!("ensure_upstream_remote: {}", e));
+        } else if let Err(e) =
+            // v0.2.83 (D5): the SINGLE serialized fetch home — Quick policy
+            // (short retry, `--no-write-fetch-head`, process-wide mutex) so
+            // this startup check never races the self-update daily check on
+            // `.git/FETCH_HEAD.lock` (A-RC3). Was a hand-rolled `git fetch`
+            // whose spawn error hard-`?`'d the whole command (a hidden A-RC4
+            // trigger) — now a soft-fail into the health fields.
+            crate::commands::self_update::serialized_fetch_upstream(
+                &p,
+                crate::commands::self_update::FetchPolicy::Quick,
+                None,
+            )
+            .await
+        {
+            // git fetch failed — likely offline / no network / lock
+            // contention that even the retry couldn't clear. Don't hard-fail
+            // the whole status check; surface it as an UNKNOWN remote state
+            // (not a false "up to date"). The other signals still work.
+            eprintln!(
+                "[vct] check_for_updates: git fetch failed at {} ({}), remote state unknown",
+                p.display(),
+                e
+            );
+            remote_check_ok = false;
+            remote_check_error = Some(e);
         } else {
-            let fetch = tokio::process::Command::new("git").silent()
+            // Detect the current branch so we know which upstream ref
+            // to compare against. Default to `main` on any error —
+            // matches the convention everywhere else in self_update.rs.
+            // v0.2.83 (D2): a rev-parse SPAWN error used to `?` out of the
+            // whole command (A-RC4). It is now a soft-fail: we mark the
+            // health field, but STILL fall back to `main` and proceed — the
+            // rev-list below is the real signal and may well succeed.
+            let branch = match tokio::process::Command::new("git")
+                .silent()
+                .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                .current_dir(&p)
+                .output()
+                .await
+            {
+                Ok(branch_output) => {
+                    if branch_output.status.success() {
+                        let b = String::from_utf8_lossy(&branch_output.stdout)
+                            .trim()
+                            .to_string();
+                        if b.is_empty() || b == "HEAD" {
+                            "main".to_string()
+                        } else {
+                            b
+                        }
+                    } else {
+                        "main".to_string()
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[vct] check_for_updates: branch rev-parse spawn failed at {} ({}), assuming main",
+                        p.display(),
+                        e
+                    );
+                    remote_check_ok = false;
+                    remote_check_error = Some(format!("branch rev-parse: {}", e));
+                    "main".to_string()
+                }
+            };
+
+            // Count commits we're behind the upstream branch. Replaces
+            // the pre-v0.2.21 `git status --branch.ab` parse which
+            // only worked when tracking was configured against
+            // `origin/<branch>` — that conventional tracking config
+            // is exactly the foot-gun Design B is removing.
+            // v0.2.83 (D2): spawn error, non-zero exit, AND count-parse
+            // failure each used to be COMPLETELY SILENT (remote_ahead stayed
+            // false with no log). All three now populate the health fields.
+            match tokio::process::Command::new("git")
+                .silent()
                 .args([
-                    "fetch",
-                    "--quiet",
-                    crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+                    "rev-list",
+                    "--count",
+                    &format!(
+                        "HEAD..{}/{}",
+                        crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+                        branch
+                    ),
                 ])
                 .current_dir(&p)
                 .output()
                 .await
-                .map_err(|e| format!("git fetch failed: {}", e))?;
-
-            if !fetch.status.success() {
-                // git fetch failed — likely offline or no network. Don't
-                // hard-fail the whole status check; just leave remote_ahead
-                // at its default (false). The other signals still work.
-                eprintln!(
-                    "[vct] check_for_updates: git fetch failed at {}, skipping remote check",
-                    p.display()
-                );
-            } else {
-                // Detect the current branch so we know which upstream ref
-                // to compare against. Default to `main` on any error —
-                // matches the convention everywhere else in self_update.rs.
-                let branch_output = tokio::process::Command::new("git").silent()
-                    .args(["rev-parse", "--abbrev-ref", "HEAD"])
-                    .current_dir(&p)
-                    .output()
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let branch = if branch_output.status.success() {
-                    let b = String::from_utf8_lossy(&branch_output.stdout)
-                        .trim()
-                        .to_string();
-                    if b.is_empty() || b == "HEAD" {
-                        "main".to_string()
-                    } else {
-                        b
-                    }
-                } else {
-                    "main".to_string()
-                };
-
-                // Count commits we're behind the upstream branch. Replaces
-                // the pre-v0.2.21 `git status --branch.ab` parse which
-                // only worked when tracking was configured against
-                // `origin/<branch>` — that conventional tracking config
-                // is exactly the foot-gun Design B is removing.
-                let revlist = tokio::process::Command::new("git").silent()
-                    .args([
-                        "rev-list",
-                        "--count",
-                        &format!(
-                            "HEAD..{}/{}",
-                            crate::commands::self_update::VCO_UPSTREAM_REMOTE,
-                            branch
-                        ),
-                    ])
-                    .current_dir(&p)
-                    .output()
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                if revlist.status.success() {
+            {
+                Ok(revlist) if revlist.status.success() => {
                     let raw = String::from_utf8_lossy(&revlist.stdout)
                         .trim()
                         .to_string();
-                    if let Ok(n) = raw.parse::<u32>() {
-                        remote_ahead = n > 0;
+                    match raw.parse::<u32>() {
+                        Ok(n) => {
+                            remote_ahead = n > 0;
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[vct] check_for_updates: rev-list count parse failed at {} (raw={:?}, {})",
+                                p.display(),
+                                raw,
+                                e
+                            );
+                            remote_check_ok = false;
+                            remote_check_error =
+                                Some(format!("rev-list count parse: {}", e));
+                        }
                     }
+                }
+                Ok(revlist) => {
+                    let stderr = String::from_utf8_lossy(&revlist.stderr)
+                        .trim()
+                        .to_string();
+                    eprintln!(
+                        "[vct] check_for_updates: rev-list exited non-zero at {} ({})",
+                        p.display(),
+                        stderr
+                    );
+                    remote_check_ok = false;
+                    remote_check_error = Some(if stderr.is_empty() {
+                        "rev-list exited non-zero".to_string()
+                    } else {
+                        format!("rev-list: {}", stderr)
+                    });
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[vct] check_for_updates: rev-list spawn failed at {} ({})",
+                        p.display(),
+                        e
+                    );
+                    remote_check_ok = false;
+                    remote_check_error = Some(format!("rev-list spawn: {}", e));
                 }
             }
         }
@@ -1109,6 +1199,8 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
         installed_version,
         running_version,
         on_disk_binary_version,
+        remote_check_ok,
+        remote_check_error,
     })
 }
 
@@ -4390,24 +4482,22 @@ pub async fn update_orchestrator<R: Runtime>(
     // `git show <sha>:<path>`; without a recent fetch the local refs
     // are stale and pre-merge sees no upstream changes.
     emit_progress(&window, "update", "Fetching upstream for pre-merge...", 7.0);
-    let fetch_for_premerge = tokio::process::Command::new("git").silent()
-        .args([
-            "fetch",
-            crate::commands::self_update::VCO_UPSTREAM_REMOTE,
-            &pull_branch,
-        ])
-        .current_dir(&install_path)
-        .output()
-        .await;
-    // Soft-fail: if fetch fails the bare pull below will surface the
-    // real error. We still attempt pre-merge with whatever refs exist.
-    if let Ok(out) = &fetch_for_premerge {
-        if !out.status.success() {
-            eprintln!(
-                "[vct] update_orchestrator: pre-merge fetch returned non-zero: {} — continuing",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
+    // v0.2.83 (D5): route through the single serialized fetch home (Quick
+    // policy, branch refspec). Soft-fail posture preserved: if the fetch fails
+    // the bare pull below surfaces the real error; we still attempt pre-merge
+    // with whatever refs exist. The mutex + `--no-write-fetch-head` protect
+    // against the FETCH_HEAD race with the startup badge check (A-RC3).
+    if let Err(e) = crate::commands::self_update::serialized_fetch_upstream(
+        &install_path,
+        crate::commands::self_update::FetchPolicy::Quick,
+        Some(&pull_branch),
+    )
+    .await
+    {
+        eprintln!(
+            "[vct] update_orchestrator: pre-merge fetch failed: {} — continuing",
+            e
+        );
     }
     let pre_merge_outcomes = run_pre_merge_user_editable(&install_path, &pull_branch).await;
 
@@ -6406,23 +6496,20 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
     // Best-effort: failures fall through to the bare pull which will
     // surface the original error via the existing B4 modal flow.
     emit_progress(&window, "update", "Fetching upstream for pre-merge...", 7.0);
-    let fetch_for_premerge = tokio::process::Command::new("git").silent()
-        .args([
-            "fetch",
-            crate::commands::self_update::VCO_UPSTREAM_REMOTE,
-            &pull_branch,
-        ])
-        .current_dir(&install_path)
-        .output()
-        .await;
-    if let Ok(out) = &fetch_for_premerge {
-        if !out.status.success() {
-            eprintln!(
-                "[vct] merge_orchestrator_with_upstream: pre-merge fetch returned non-zero: {} \
-                 — continuing",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
+    // v0.2.83 (D5): single serialized fetch home (Quick, branch refspec).
+    // Soft-fail posture preserved — failures fall through to the bare pull
+    // which surfaces the original error via the existing B4 modal flow.
+    if let Err(e) = crate::commands::self_update::serialized_fetch_upstream(
+        &install_path,
+        crate::commands::self_update::FetchPolicy::Quick,
+        Some(&pull_branch),
+    )
+    .await
+    {
+        eprintln!(
+            "[vct] merge_orchestrator_with_upstream: pre-merge fetch failed: {} — continuing",
+            e
+        );
     }
     let pre_merge_outcomes = run_pre_merge_user_editable(&install_path, &pull_branch).await;
 
@@ -6682,25 +6769,25 @@ pub async fn rebase_orchestrator_onto_upstream<R: Runtime>(
     // --rebase` so a partial network failure doesn't leave us with a
     // half-applied rebase.
     emit_progress(&window, "update", "Fetching upstream for rebase...", 10.0);
-    let fetch = tokio::process::Command::new("git").silent()
-        .args([
-            "fetch",
-            crate::commands::self_update::VCO_UPSTREAM_REMOTE,
-            &pull_branch,
-        ])
-        .current_dir(&install_path)
-        .output()
-        .await
-        .map_err(|e| format!("git fetch failed: {}", e))?;
-
-    if !fetch.status.success() {
-        let stderr = String::from_utf8_lossy(&fetch.stderr);
+    // v0.2.83 (D5): single serialized fetch home (Quick, branch refspec).
+    // HARD-fail posture preserved — a rebase needs a fresh upstream ref, so on
+    // fetch failure we restore the pre-pull binary/hub renames and abort rather
+    // than risk a half-applied rebase. `serialized_fetch_upstream` collapses
+    // spawn error + non-zero exit into one error string (the last git stderr
+    // line), so a single failure branch replaces the former two.
+    if let Err(e) = crate::commands::self_update::serialized_fetch_upstream(
+        &install_path,
+        crate::commands::self_update::FetchPolicy::Quick,
+        Some(&pull_branch),
+    )
+    .await
+    {
         abort_update_restore_binaries_and_hub(
             &install_path,
             pre_pull_renamed.as_deref(),
             pre_pull_renamed_hub.as_deref(),
         );
-        return Err(format!("git fetch failed: {}", stderr));
+        return Err(format!("git fetch failed: {}", e));
     }
 
     // v0.2.78 ITEM #0 (F2 keystone): same untracked-collision handling as the
@@ -15987,6 +16074,141 @@ severity_max: critical\n\
             assert!(
                 !local.join(".claude/context/UPDATE_DEFERRED.md").exists(),
                 "abort must clear the solo deferral"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // v0.2.83 (D2 / A-RC1): honest remote-check health in check_for_updates.
+    //
+    // A rev-list failure used to be COMPLETELY SILENT (remote_ahead stayed
+    // false, indistinguishable from "up to date"). These tests pin that the
+    // health fields (remote_check_ok / remote_check_error) are now populated
+    // on the failure branches, and left ok=true/None for a non-git install.
+    //
+    // The rev-list-failure pin uses a PATH-shim fake `git` (Unix only) that
+    // passes remote/fetch/rev-parse and fails rev-list — mirroring the Python
+    // suite's PATH-shim idiom. Guarded with GLOBAL_ENV_MUTEX (via
+    // `with_env_vars`) because it mutates PATH process-globally.
+    // ------------------------------------------------------------------
+    mod remote_check_health_tests {
+        use super::super::*;
+
+        #[tokio::test]
+        async fn non_git_dir_reports_remote_check_ok_true_no_error() {
+            // No `.git/` → the remote section is skipped entirely. That is
+            // "not applicable", not a failure: ok=true, error=None, and there
+            // is nothing to retry. install_stale / binary_stale carry the
+            // banner instead.
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let status = check_for_updates(tmp.path().to_str().unwrap().to_string())
+                .await
+                .expect("check_for_updates should not hard-fail on a non-git dir");
+            assert!(
+                status.remote_check_ok,
+                "non-git dir must report remote_check_ok=true (not applicable)"
+            );
+            assert!(
+                status.remote_check_error.is_none(),
+                "non-git dir must have no remote_check_error, got {:?}",
+                status.remote_check_error
+            );
+            assert!(
+                !status.remote_ahead,
+                "non-git dir cannot be remote_ahead"
+            );
+        }
+
+        /// REGRESSION PIN (A-RC1): a rev-list failure must set
+        /// remote_check_ok=false + populate remote_check_error — NOT silently
+        /// leave remote_ahead=false. A PATH-shim fake `git` passes
+        /// remote/fetch/rev-parse and fails ONLY rev-list.
+        ///
+        /// Plain `#[test]` (not `#[tokio::test]`): we build our OWN
+        /// single-thread runtime INSIDE `with_env_vars` so the PATH override
+        /// covers the whole async invocation. `#[tokio::test]` would already
+        /// hold a runtime and forbid the nested `block_on`.
+        #[cfg(unix)]
+        #[test]
+        fn rev_list_failure_populates_health_fields_not_silent() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let repo = tmp.path().join("repo");
+            // `.git/` must exist for check_for_updates to enter the remote
+            // section — a bare dir is enough; our fake git never inspects it.
+            std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+            // A fake `git` that dispatches by subcommand: succeeds for
+            // --version / remote / fetch / rev-parse, FAILS for rev-list.
+            let shim_dir = tmp.path().join("bin");
+            std::fs::create_dir_all(&shim_dir).unwrap();
+            let git_shim = shim_dir.join("git");
+            std::fs::write(
+                &git_shim,
+                r#"#!/bin/sh
+# Fake git for the rev-list-failure regression pin. Dispatch on the first
+# non-flag argument so `git --version`, `git remote ...`, `git fetch ...`,
+# `git rev-parse ...` all succeed but `git rev-list ...` fails.
+for arg in "$@"; do
+  case "$arg" in
+    --*) continue ;;
+    version) echo "git version 2.43.5"; exit 0 ;;
+    remote) exit 0 ;;
+    fetch) exit 0 ;;
+    rev-parse) echo "main"; exit 0 ;;
+    rev-list) echo "fatal: bad revision 'HEAD..vco_upstream/main'" 1>&2; exit 128 ;;
+    *) exit 0 ;;
+  esac
+done
+exit 0
+"#,
+            )
+            .unwrap();
+            let mut perms = std::fs::metadata(&git_shim).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&git_shim, perms).unwrap();
+
+            // Prepend the shim dir to PATH so our fake `git` wins. Guarded by
+            // GLOBAL_ENV_MUTEX so concurrent env-mutating tests don't race.
+            let orig_path = std::env::var("PATH").unwrap_or_default();
+            let new_path = format!("{}:{}", shim_dir.display(), orig_path);
+            let repo_str = repo.to_str().unwrap().to_string();
+
+            // `with_env_vars` holds the mutex and runs the closure; we drive
+            // the async command on a fresh single-thread runtime INSIDE it so
+            // PATH stays overridden for the whole invocation.
+            let status = std::cell::RefCell::new(None);
+            vct_launcher_core::test_env::with_env_vars(
+                &[("PATH", Some(new_path.as_str()))],
+                || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    let s = rt.block_on(check_for_updates(repo_str.clone())).expect(
+                        "check_for_updates must NOT hard-fail on a rev-list failure",
+                    );
+                    *status.borrow_mut() = Some(s);
+                },
+            );
+            let status = status.into_inner().expect("status captured");
+
+            assert!(
+                !status.remote_check_ok,
+                "rev-list failure MUST set remote_check_ok=false (was silent pre-v0.2.83)"
+            );
+            let err = status
+                .remote_check_error
+                .expect("rev-list failure MUST populate remote_check_error");
+            assert!(
+                err.contains("rev-list"),
+                "error must name the rev-list stage, got: {}",
+                err
+            );
+            assert!(
+                !status.remote_ahead,
+                "a failed rev-list cannot conclude remote_ahead=true"
             );
         }
     }

@@ -32,6 +32,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{LazyLock, OnceLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -424,11 +425,206 @@ async fn ls_remote_sha(repo: &Path, branch: &str) -> Result<String, String> {
         .ok_or_else(|| format!("ls-remote returned empty output for {}", branch))
 }
 
-/// Retry delays for `fetch_upstream`. Total wall-time across all retries
-/// is 1+5+30+120 = 156 seconds — long enough to absorb transient network
-/// blips at boot (Wi-Fi reconnect, VPN handshake, DNS stagger) but short
-/// enough that a check truly stuck on a dead network surfaces as an error
-/// to the UI within a few minutes rather than silently hanging.
+// ---------------------------------------------------------------------------
+// v0.2.83 A-F1 / D5: one serialized fetch home.
+// ---------------------------------------------------------------------------
+//
+// Root cause A-RC3 (INVESTIGATION-v0283): two independent startup actors —
+// the orchestrator badge check (`installer::check_for_updates`) and the
+// launcher self-update daily check (`check_for_launcher_update`) — `git fetch`
+// the SAME repo concurrently. Concurrent fetches contend on
+// `.git/FETCH_HEAD.lock`; the loser errors and soft-fails to a false
+// "no update available" (the historical first-start-after-release bug). This
+// helper is the SINGLE production fetch invocation: every caller funnels
+// through it (A>B>C rule — no second `git fetch` implementation), it serializes
+// our own two callers behind a process-wide mutex, and it appends
+// `--no-write-fetch-head` (git >=2.29) so FETCH_HEAD is never written at all —
+// immune to that whole lock class even against EXTERNAL fetchers (VS Code
+// autofetch, a CLI in another terminal). The retry ladder still covers residual
+// transient failures (index.lock from external processes, network blips).
+
+/// Process-wide serialization for upstream fetches. Our two startup actors
+/// (badge check + self-update daily check) fetch the SAME install-root repo;
+/// without this lock they race on `.git/FETCH_HEAD.lock` and the loser
+/// soft-fails to a false "no update" (A-RC3). A single mutex for the whole
+/// process is sufficient because both actors operate on the one install-root
+/// clone; holding it across a fetch merely queues the (rare) concurrent second
+/// fetch behind the first rather than letting them collide.
+static UPSTREAM_FETCH_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Cached result of the `git --version` >=2.29 probe. `None` until first
+/// probed; `Some(true)` when git supports `--no-write-fetch-head`. Probed once
+/// per process (D4) — the git binary can't change under a running launcher.
+static GIT_SUPPORTS_NO_WRITE_FETCH_HEAD: OnceLock<bool> = OnceLock::new();
+
+/// Fetch retry policy (D5). Selects the backoff ladder + extra fetch flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FetchPolicy {
+    /// One retry with a short (~2s) backoff. Used by the interactive /
+    /// startup-latency-sensitive surfaces (badge check, pre-merge/rebase
+    /// fetches) where a long 156s ladder would stall the UI. FETCH_HEAD
+    /// contention is already covered by `--no-write-fetch-head` + the mutex,
+    /// so a single quick retry is enough for the residual index.lock case.
+    Quick,
+    /// The existing v0.2.32 UB1 ladder (1/5/30/120s, 5 attempts, 156s upper
+    /// bound). Used by the launcher self-update paths that must absorb a
+    /// transient network blip at boot rather than surface a false negative.
+    Persistent,
+    /// `Persistent` + `--tags`. Used by `get_latest_source_release_tag` so the
+    /// local `.git/refs/tags/` reflects the newest release tag.
+    Tags,
+}
+
+/// Quick-policy backoff: a single retry after ~2s. Under `cfg(test)` the unit
+/// is milliseconds (matching `FETCH_RETRY_DELAYS_MS`) so tests don't burn
+/// wall-time; production interprets it as seconds.
+#[cfg(not(test))]
+const QUICK_FETCH_DELAYS_MS: [u64; 1] = [2_000];
+#[cfg(test)]
+const QUICK_FETCH_DELAYS_MS: [u64; 1] = [2];
+
+/// Parse a `git --version` line ("git version X.Y[.Z][ (extra)]") and return
+/// whether the version is >= 2.29 (the release that added
+/// `--no-write-fetch-head`). Any parse failure returns `false` — we omit the
+/// flag conservatively rather than pass an option an older git rejects.
+fn git_version_supports_no_write_fetch_head(version_line: &str) -> bool {
+    // Expect a token literally equal to "version" followed by the number.
+    let mut toks = version_line.split_whitespace();
+    // Skip up to and including the "version" word so a prefix like
+    // "git version 2.43.5" or a vendored "git version 2.43.5 (Apple Git-...)"
+    // both work.
+    let ver = loop {
+        match toks.next() {
+            Some("version") => match toks.next() {
+                Some(v) => break v,
+                None => return false,
+            },
+            Some(_) => continue,
+            None => return false,
+        }
+    };
+    let mut parts = ver.split('.');
+    let major: u32 = match parts.next().and_then(|s| s.parse().ok()) {
+        Some(m) => m,
+        None => return false,
+    };
+    let minor: u32 = match parts.next().and_then(|s| s.parse().ok()) {
+        Some(m) => m,
+        None => return false,
+    };
+    (major, minor) >= (2, 29)
+}
+
+/// Probe `git --version` ONCE per process and cache whether
+/// `--no-write-fetch-head` is supported (git >= 2.29, D4). Cheap: a single
+/// short-lived subprocess the first time, cached thereafter.
+async fn supports_no_write_fetch_head() -> bool {
+    if let Some(cached) = GIT_SUPPORTS_NO_WRITE_FETCH_HEAD.get() {
+        return *cached;
+    }
+    let supported = match TokioCommand::new("git")
+        .silent()
+        .arg("--version")
+        .output()
+        .await
+    {
+        Ok(out) if out.status.success() => {
+            let line = String::from_utf8_lossy(&out.stdout);
+            git_version_supports_no_write_fetch_head(line.trim())
+        }
+        _ => false,
+    };
+    // First writer wins; a concurrent probe computes the same value.
+    let _ = GIT_SUPPORTS_NO_WRITE_FETCH_HEAD.set(supported);
+    *GIT_SUPPORTS_NO_WRITE_FETCH_HEAD.get().unwrap_or(&supported)
+}
+
+/// The ONE production upstream fetch (D5). Serializes our own callers behind
+/// `UPSTREAM_FETCH_LOCK`, appends `--no-write-fetch-head` when git supports it,
+/// and retries per `policy`. Caller MUST have run `ensure_upstream_remote`
+/// first (unchanged contract).
+///
+/// `refspec`: `None` fetches the remote's default refspecs (`vco_upstream`);
+/// `Some(branch)` fetches exactly that branch (`vco_upstream <branch>`) —
+/// matching the pre-existing invocation shapes of the migrated call-sites.
+///
+/// Returns `Ok(())` on the first successful attempt; on exhaustion returns the
+/// last non-empty git stderr line (or a sentinel when git drained stderr).
+pub(crate) async fn serialized_fetch_upstream(
+    repo: &Path,
+    policy: FetchPolicy,
+    refspec: Option<&str>,
+) -> Result<(), String> {
+    let no_write_fetch_head = supports_no_write_fetch_head().await;
+
+    let attempt = || async {
+        let mut args: Vec<&str> = vec!["fetch", "--quiet"];
+        if matches!(policy, FetchPolicy::Tags) {
+            args.push("--tags");
+        }
+        if no_write_fetch_head {
+            args.push("--no-write-fetch-head");
+        }
+        args.push(VCO_UPSTREAM_REMOTE);
+        if let Some(branch) = refspec {
+            args.push(branch);
+        }
+        let fetch = TokioCommand::new("git")
+            .silent()
+            .args(&args)
+            .current_dir(repo)
+            .output()
+            .await
+            .map_err(|e| format!("git fetch spawn: {}", e))?;
+        if fetch.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&fetch.stderr).to_string();
+        // Surface the last non-empty stderr line — git pipes one final
+        // human-readable summary there; preceding lines are usually progress
+        // noise.
+        let last = stderr
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .last()
+            .unwrap_or("")
+            .to_string();
+        Err(last)
+    };
+
+    let delays: &[u64] = match policy {
+        FetchPolicy::Quick => &QUICK_FETCH_DELAYS_MS,
+        FetchPolicy::Persistent | FetchPolicy::Tags => &FETCH_RETRY_DELAYS_MS,
+    };
+    locked_fetch_with_retry(repo, delays, attempt).await
+}
+
+/// Acquire the process-wide `UPSTREAM_FETCH_LOCK` for the WHOLE retry sequence
+/// (so a second caller queues behind us rather than racing on FETCH_HEAD —
+/// A-RC3), then run `fetch_with_retry`. Factored out of
+/// `serialized_fetch_upstream` so the concurrent-serialization regression test
+/// can inject a fake attempt (that flips an in-flight flag) and prove no two
+/// attempts overlap under the lock. The fetch is a short op; the (rare)
+/// concurrent second fetch simply waits.
+async fn locked_fetch_with_retry<F, Fut>(
+    repo: &Path,
+    delays: &[u64],
+    attempt_fn: F,
+) -> Result<(), String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let _lock = UPSTREAM_FETCH_LOCK.lock().await;
+    fetch_with_retry(repo, delays, attempt_fn).await
+}
+
+/// Retry delays for the `Persistent` fetch policy. Total wall-time across all
+/// retries is 1+5+30+120 = 156 seconds — long enough to absorb transient
+/// network blips at boot (Wi-Fi reconnect, VPN handshake, DNS stagger) but
+/// short enough that a check truly stuck on a dead network surfaces as an
+/// error to the UI within a few minutes rather than silently hanging.
 ///
 /// Under `cfg(test)` the unit is milliseconds so the retry tests don't
 /// burn 156s of CI wall-time. Production code interprets the same values
@@ -451,50 +647,37 @@ const FETCH_RETRY_DELAYS_MS: [u64; 4] = [1, 5, 30, 120];
 /// v0.2.32 UB1 (2026-05-23): replaces the single-shot `git fetch` that
 /// left the launcher stuck on stale state after a transient network
 /// hiccup at boot — symptom: badge never refreshes without restart.
+///
+/// v0.2.83 (D5): now a thin wrapper over `serialized_fetch_upstream` with the
+/// `Persistent` policy (the same 156s ladder, preserving UB1) — the actual
+/// fetch + retry + serialization live in the single shared home.
 async fn fetch_upstream(repo: &Path) -> Result<(), String> {
-    let try_once = || async {
-        let fetch = tokio::process::Command::new("git").silent()
-            .args(["fetch", "--quiet", VCO_UPSTREAM_REMOTE])
-            .current_dir(repo)
-            .output()
-            .await
-            .map_err(|e| format!("git fetch spawn: {}", e))?;
-        if fetch.status.success() {
-            return Ok(());
-        }
-        let stderr = String::from_utf8_lossy(&fetch.stderr).to_string();
-        // Surface the last non-empty stderr line — git pipes one final
-        // human-readable summary there; preceding lines are usually
-        // progress noise.
-        let last = stderr
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .last()
-            .unwrap_or("")
-            .to_string();
-        Err(last)
-    };
-    fetch_with_retry(repo, try_once).await
+    serialized_fetch_upstream(repo, FetchPolicy::Persistent, None).await
 }
 
 /// Inner retry loop, parametrised over the actual fetch attempt so unit
 /// tests can swap in a closure that simulates failures without invoking
 /// a real `git` binary. The first attempt is immediate; subsequent
-/// attempts sleep for `FETCH_RETRY_DELAYS_MS[i-1]` before retrying.
+/// attempts sleep for `delays[i-1]` before retrying (the `delays` slice
+/// selects the policy's backoff ladder — Quick vs Persistent).
 ///
 /// `repo` is passed through for diagnostic logging only — the closure
 /// already captures the directory it needs.
-async fn fetch_with_retry<F, Fut>(repo: &Path, mut attempt_fn: F) -> Result<(), String>
+async fn fetch_with_retry<F, Fut>(
+    repo: &Path,
+    delays: &[u64],
+    mut attempt_fn: F,
+) -> Result<(), String>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
 {
     let mut last_err: Option<String> = None;
     // First attempt is index 0 (no delay); subsequent attempts wait
-    // FETCH_RETRY_DELAYS_MS[attempt - 1].
-    for attempt in 0..=FETCH_RETRY_DELAYS_MS.len() {
+    // delays[attempt - 1].
+    for attempt in 0..=delays.len() {
         if attempt > 0 {
-            let delay = Duration::from_millis(FETCH_RETRY_DELAYS_MS[attempt - 1]);
+            let delay = Duration::from_millis(delays[attempt - 1]);
             tokio::time::sleep(delay).await;
         }
         match attempt_fn().await {
@@ -1384,11 +1567,10 @@ pub async fn get_latest_source_release_tag() -> Result<Option<String>, String> {
     // network is dead we still try to read whatever tags the local
     // .git/refs/tags/ directory already has.
     let _ = ensure_upstream_remote(&repo).await;
-    let _ = run_git(
-        &repo,
-        &["fetch", "--tags", "--quiet", VCO_UPSTREAM_REMOTE],
-    )
-    .await;
+    // v0.2.83 (D5): route the tags fetch through the single serialized home
+    // (Tags policy = Persistent ladder + `--tags`). Still soft-fail — if the
+    // network is dead we read whatever tags `.git/refs/tags/` already has.
+    let _ = serialized_fetch_upstream(&repo, FetchPolicy::Tags, None).await;
 
     // `git describe --tags --abbrev=0` returns the closest reachable tag.
     // On a clean release-tag head it's the tag itself; on a branch ahead
@@ -1852,7 +2034,7 @@ mod tests {
     async fn fetch_upstream_with_retry_succeeds_first_attempt() {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_c = calls.clone();
-        let result = fetch_with_retry(Path::new("/tmp/fake"), move || {
+        let result = fetch_with_retry(Path::new("/tmp/fake"), &FETCH_RETRY_DELAYS_MS, move || {
             let calls_c = calls_c.clone();
             async move {
                 calls_c.fetch_add(1, Ordering::SeqCst);
@@ -1872,7 +2054,7 @@ mod tests {
     async fn fetch_upstream_with_retry_succeeds_on_third_attempt() {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_c = calls.clone();
-        let result = fetch_with_retry(Path::new("/tmp/fake"), move || {
+        let result = fetch_with_retry(Path::new("/tmp/fake"), &FETCH_RETRY_DELAYS_MS, move || {
             let calls_c = calls_c.clone();
             async move {
                 let n = calls_c.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1896,7 +2078,7 @@ mod tests {
     async fn fetch_upstream_with_retry_fails_after_all_attempts() {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_c = calls.clone();
-        let result = fetch_with_retry(Path::new("/tmp/fake"), move || {
+        let result = fetch_with_retry(Path::new("/tmp/fake"), &FETCH_RETRY_DELAYS_MS, move || {
             let calls_c = calls_c.clone();
             async move {
                 let n = calls_c.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1927,7 +2109,7 @@ mod tests {
         // Some git failure modes (network reset mid-transfer) drain stderr
         // before exit. The helper must still return a non-empty error
         // string in that case so the UI doesn't render a blank toast.
-        let result = fetch_with_retry(Path::new("/tmp/fake"), move || async move {
+        let result = fetch_with_retry(Path::new("/tmp/fake"), &FETCH_RETRY_DELAYS_MS, move || async move {
             Err::<(), String>(String::new())
         })
         .await;
@@ -1936,6 +2118,148 @@ mod tests {
         assert!(
             !err.is_empty(),
             "error should be non-empty even when every attempt returned empty stderr"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // v0.2.83 A-F1 / D5: one serialized fetch home.
+    // ---------------------------------------------------------------------
+
+    /// D4: parse `git --version` and gate `--no-write-fetch-head` on >=2.29.
+    #[test]
+    fn git_version_parser_gates_no_write_fetch_head_flag() {
+        // Below the 2.29 threshold → flag omitted.
+        assert!(!git_version_supports_no_write_fetch_head("git version 2.28.0"));
+        assert!(!git_version_supports_no_write_fetch_head("git version 2.17.1"));
+        assert!(!git_version_supports_no_write_fetch_head("git version 1.9.5"));
+        // At / above the threshold → flag included.
+        assert!(git_version_supports_no_write_fetch_head("git version 2.29.0"));
+        assert!(git_version_supports_no_write_fetch_head("git version 2.43.5"));
+        assert!(git_version_supports_no_write_fetch_head("git version 3.0.0"));
+        // Vendored suffixes (macOS/Homebrew/MinGW) still parse.
+        assert!(git_version_supports_no_write_fetch_head(
+            "git version 2.43.5 (Apple Git-154)"
+        ));
+        assert!(git_version_supports_no_write_fetch_head(
+            "git version 2.44.0.windows.1"
+        ));
+        // Garbage / unexpected shapes → conservative false (omit the flag).
+        assert!(!git_version_supports_no_write_fetch_head("garbage"));
+        assert!(!git_version_supports_no_write_fetch_head(""));
+        assert!(!git_version_supports_no_write_fetch_head("git version"));
+        assert!(!git_version_supports_no_write_fetch_head("git version x.y.z"));
+        assert!(!git_version_supports_no_write_fetch_head("2.29.0"));
+    }
+
+    /// D5 Quick policy: exactly one retry (2 attempts total) before giving up,
+    /// and the error carries git's LAST stderr line (most-recent failure).
+    #[tokio::test]
+    async fn quick_policy_retries_once_then_reports_last_stderr() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let result =
+            fetch_with_retry(Path::new("/tmp/fake"), &QUICK_FETCH_DELAYS_MS, move || {
+                let calls_c = calls_c.clone();
+                async move {
+                    let n = calls_c.fetch_add(1, Ordering::SeqCst) + 1;
+                    Err(format!("fatal: could not read from remote (attempt {})", n))
+                }
+            })
+            .await;
+        assert!(result.is_err(), "Quick policy should fail after its retries");
+        // Quick = 1 immediate attempt + 1 delayed retry = 2 total (matches
+        // QUICK_FETCH_DELAYS_MS.len() + 1).
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "Quick policy makes exactly 2 attempts (1 immediate + 1 retry)"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("attempt 2"),
+            "error must carry the LAST attempt's stderr line, got: {}",
+            err
+        );
+    }
+
+    /// D5 Quick policy: a first-attempt failure that then succeeds on the
+    /// single retry returns Ok (the transient index.lock / FETCH_HEAD case).
+    #[tokio::test]
+    async fn quick_policy_succeeds_on_the_one_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let result =
+            fetch_with_retry(Path::new("/tmp/fake"), &QUICK_FETCH_DELAYS_MS, move || {
+                let calls_c = calls_c.clone();
+                async move {
+                    let n = calls_c.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n < 2 {
+                        Err("Unable to create '.git/FETCH_HEAD.lock': File exists.".into())
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+        assert!(result.is_ok(), "should recover on the single retry");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// REGRESSION PIN (A-RC3): `locked_fetch_with_retry` serializes concurrent
+    /// callers behind `UPSTREAM_FETCH_LOCK` — two tasks fetching the same repo
+    /// never run their attempts concurrently. Each injected attempt flips an
+    /// AtomicBool "in-flight" and asserts it was NOT already set; a yield +
+    /// tiny sleep inside the critical section widens the overlap window so an
+    /// UNSERIALIZED implementation would reliably observe in_flight==true and
+    /// fail. With the lock, the flag is never observed already-true.
+    #[tokio::test]
+    async fn concurrent_fetches_are_serialized_by_the_process_lock() {
+        use std::sync::atomic::AtomicBool;
+
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let overlap_detected = Arc::new(AtomicBool::new(false));
+
+        let make_task = || {
+            let in_flight = in_flight.clone();
+            let overlap_detected = overlap_detected.clone();
+            async move {
+                // NOTE: pass an empty delays slice so a fetch failure would NOT
+                // retry — but our injected attempt always succeeds, so the
+                // critical section runs exactly once per task, cleanly.
+                let in_flight_a = in_flight.clone();
+                let overlap_a = overlap_detected.clone();
+                locked_fetch_with_retry(Path::new("/tmp/fake"), &[], move || {
+                    let in_flight_a = in_flight_a.clone();
+                    let overlap_a = overlap_a.clone();
+                    async move {
+                        // If another task is already inside the critical
+                        // section, the lock failed to serialize us.
+                        if in_flight_a.swap(true, Ordering::SeqCst) {
+                            overlap_a.store(true, Ordering::SeqCst);
+                        }
+                        // Widen the window: force a scheduler hand-off so an
+                        // unserialized peer would interleave here.
+                        tokio::task::yield_now().await;
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        in_flight_a.store(false, Ordering::SeqCst);
+                        Ok::<(), String>(())
+                    }
+                })
+                .await
+                .expect("attempt succeeds");
+            }
+        };
+
+        // Run several concurrent tasks to make an unserialized failure reliable.
+        let t1 = tokio::spawn(make_task());
+        let t2 = tokio::spawn(make_task());
+        let t3 = tokio::spawn(make_task());
+        let t4 = tokio::spawn(make_task());
+        let (_, _, _, _) = tokio::join!(t1, t2, t3, t4);
+
+        assert!(
+            !overlap_detected.load(Ordering::SeqCst),
+            "UPSTREAM_FETCH_LOCK must serialize concurrent fetches — two attempts overlapped"
         );
     }
 
