@@ -31,15 +31,21 @@ use super::Db;
 /// MCP server names shipped by the orchestrator. Anything else gets
 /// `is_user_added = true` and surfaces in the Custom MCP tab.
 ///
-/// Source-of-truth: this list mirrors the orchestrator's MCP registration
-/// code path. Adding a new bundled MCP requires updating BOTH this list
-/// AND the install-side registration. Keep it sorted.
+/// Source-of-truth: `vco_lib/mcp_scan_rules.toml` [bundled].all_names
+/// (v0.2.83 WP-B5). This compiled `&[&str]` is the zero-runtime-failure
+/// mirror (the launcher is the repair tool — it must build this set even
+/// when the project venv / on-disk .toml is unavailable, exactly the
+/// `bundled_versions` precedent). The same-crate drift test
+/// `bundled_mcp_names_matches_table` binds it to
+/// `crate::mcp_scan_rules::bundled_mcp_names()`, so a table edit that isn't
+/// mirrored here trips a test in this crate — no silent drift. Keep sorted.
 ///
 /// References:
-///  - `install.py:6584` — uninstall scrubs entries with these names from
-///    `~/.claude.json::mcpServers`. Same set, same semantics.
-///  - `vct-coordination` is included even though install.py's uninstall
-///    list also includes it; it's an orchestrator-shipped MCP.
+///  - Uninstall scrub uses a DISTINCT set — `mcp_scan_rules.toml`
+///    [bundled].uninstall_scrub_names (install.py) — NOT this list, because
+///    the scrub rationale differs (code-embedding is a backend service,
+///    vct-coordination is Pro-tier). Don't conflate them.
+///  - `vct-coordination` is an orchestrator-shipped MCP (Pro-tier).
 ///  - `playwright` is the default-enabled browser-automation MCP
 ///    (`KNOWN_ISSUES.md` "First-install grew by ~150 MB for Playwright
 ///    MCP" entry).
@@ -70,6 +76,10 @@ pub const BUNDLED_MCP_NAMES: &[&str] = &[
 /// Keep this list narrow — most bundled MCPs should default to on so the
 /// orchestrator "just works". This list is the explicit opt-out for the
 /// few that don't apply universally.
+///
+/// Source-of-truth: `vco_lib/mcp_scan_rules.toml` [bundled].default_disabled
+/// (v0.2.83 WP-B5), same compiled-mirror + drift-test discipline as
+/// `BUNDLED_MCP_NAMES` (see `bundled_mcp_default_disabled_matches_table`).
 pub const BUNDLED_MCP_DEFAULT_DISABLED: &[&str] = &[
     "excalidraw",
     "mermaid",
@@ -346,6 +356,40 @@ mod tests {
             sorted.as_slice(),
             BUNDLED_MCP_NAMES,
             "BUNDLED_MCP_NAMES must be sorted + unique"
+        );
+    }
+
+    // ── v0.2.83 (WP-B5): the bundled name sets are sourced from the shared
+    // rule table. These drift tests bind the compiled `&[&str]` mirrors to
+    // `crate::mcp_scan_rules` (which parses vco_lib/mcp_scan_rules.toml), so a
+    // table edit that isn't mirrored here trips a failure in THIS crate — the
+    // same "sourced from + compiled-copy-drift-test" discipline the Rust
+    // ALLOWED_ENV_KEYS / DEFAULT_MCP_ENTRY_NAMES use for the same table.
+
+    #[test]
+    fn bundled_mcp_names_matches_table() {
+        let table: Vec<&str> = crate::mcp_scan_rules::bundled_mcp_names()
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(
+            BUNDLED_MCP_NAMES, table.as_slice(),
+            "BUNDLED_MCP_NAMES (compiled) drifted from mcp_scan_rules.toml \
+             [bundled].all_names. Update both in one commit."
+        );
+    }
+
+    #[test]
+    fn bundled_default_disabled_matches_table() {
+        let table: Vec<&str> = crate::mcp_scan_rules::bundled_mcp_default_disabled()
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(
+            BUNDLED_MCP_DEFAULT_DISABLED, table.as_slice(),
+            "BUNDLED_MCP_DEFAULT_DISABLED (compiled) drifted from \
+             mcp_scan_rules.toml [bundled].default_disabled. Update both in \
+             one commit."
         );
     }
 

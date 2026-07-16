@@ -114,6 +114,24 @@ _SECRET_SHAPED_SUBSTRINGS = mcp_scan_rules.secret_shaped_needles()
 # entries`` asserts its emit order equals this list so the two cannot drift.
 _DEFAULT_MCP_ENTRY_NAMES: tuple[str, ...] = mcp_scan_rules.default_mcp_entry_names()
 
+# The MCP names install.py's uninstaller scrubs from the user's GLOBAL
+# ~/.claude.json. v0.2.83 WP-B5: sourced from ``vco_lib/mcp_scan_rules.toml``
+# ([bundled].uninstall_scrub_names). This is a DISTINCT set from
+# ``_DEFAULT_MCP_ENTRY_NAMES`` / bundled all_names by design — it carries the
+# backend ``code-embedding`` service id and the Pro-tier ``vct-coordination``
+# id whose scrub rationale differs from the registration set (see the .toml
+# header). The prior install.py copy had DRIFTED (missing
+# mermaid/excalidraw/playwright); this closes that drift.
+_UNINSTALL_SCRUB_MCP_NAMES: tuple[str, ...] = mcp_scan_rules.uninstall_scrub_mcp_names()
+
+# The subset of _UNINSTALL_SCRUB_MCP_NAMES removed ONLY when the on-disk entry
+# is positively VCO-shaped (these three ids are also valid third-party MCP
+# names, so a bare name match cannot prove ownership). The remaining scrub
+# names are VCO-exclusive ids and are removed by name.
+_UNINSTALL_SCRUB_SHAPE_GATED: frozenset[str] = frozenset(
+    mcp_scan_rules.uninstall_scrub_shape_gated_mcp_names()
+)
+
 
 #: FN-5b (2026-07-14): weaviate_mcp submodules the code-graph analyzer + the
 #: weaviate MCP import directly. After the editable install, these MUST all be
@@ -764,6 +782,130 @@ def _scan_deprecated_mcp_entries(
             continue
         results.append((name, matched_path, entry, dep_info))
     return results
+
+
+# ---------------------------------------------------------------------------
+# Uninstall scrub (v0.2.83 WP-B5)
+#
+# install.py's uninstaller removes VCO's OWN MCP entries from the user's
+# global ~/.claude.json, leaving the user's third-party MCPs alone. The name
+# set is sourced from mcp_scan_rules.toml ([bundled].uninstall_scrub_names);
+# the DECISION of which on-disk entries to remove lives here as a pure,
+# unit-testable function (no writes, no PROJECT_ROOT reads) — install.py's
+# _run_uninstall is the thin orchestration shim that reads/writes the JSON.
+#
+# Ownership gate: five of the scrub names are VCO-EXCLUSIVE ids
+# (weaviate-kg / search / ollama / code-embedding / vct-coordination) — an
+# entry by that name is unambiguously ours, so it is removed by NAME (the
+# pre-v0.2.83 behavior, unchanged). The other three
+# (mermaid / excalidraw / playwright) are ALSO legitimate third-party MCP
+# ids, so they are removed ONLY when the on-disk entry is positively
+# VCO-shaped — otherwise a user's own mermaid/excalidraw/playwright would be
+# destroyed on uninstall. "VCO-shaped" = the same install_root-anchored
+# predicate the deprecated/stale scanners use, PLUS playwright's exact
+# `npx -y @playwright/mcp@latest` launch fingerprint (playwright is the one
+# VCO entry with no install_root path — see _build_python_mcp_entries).
+# ---------------------------------------------------------------------------
+
+
+def _mcp_entry_path_inside_install_root(entry: dict, install_root: Path) -> bool:
+    """True iff the entry's ``command`` or ``args[0]`` is an ABSOLUTE path
+    starting inside ``install_root`` — the same positive-ownership predicate
+    :func:`_scan_deprecated_mcp_entries` / :func:`_scan_stale_mcp_entries`
+    use to tell "our" entry from a user-added one at an unrelated path.
+
+    Cross-OS: only absolute paths (``/``, ``C:\\``, ``c:\\``, ``\\\\``-UNC)
+    are considered; ``npx``-launched entries have no such path and return
+    False here (playwright is handled separately)."""
+    if not isinstance(entry, dict):
+        return False
+    install_root_str = str(install_root.resolve())
+    cmd = entry.get("command", "") if isinstance(entry.get("command"), str) else ""
+    first_arg = ""
+    args = entry.get("args", [])
+    if isinstance(args, list) and args and isinstance(args[0], str):
+        first_arg = args[0]
+    for candidate in (cmd, first_arg):
+        if not candidate:
+            continue
+        if not candidate.startswith(("/", "C:\\", "c:\\", "\\\\")):
+            continue
+        if candidate.startswith(install_root_str):
+            return True
+    return False
+
+
+def _is_vco_shaped_playwright_entry(entry: dict) -> bool:
+    """True iff the entry is VCO's EXACT playwright launch fingerprint:
+    ``command == "npx"`` and ``args == ["-y", "@playwright/mcp@latest"]`` —
+    the invocation both builders emit (``_build_python_mcp_entries`` /
+    ``mcp_registration.rs::build_default_mcp_entries``). A user's own
+    playwright (a different tag, missing ``-y``, or an absolute path) does
+    NOT match, so it survives uninstall."""
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("command") != "npx":
+        return False
+    args = entry.get("args")
+    return args == ["-y", "@playwright/mcp@latest"]
+
+
+def _is_vco_shaped_scrub_entry(
+    name: str, entry: dict, install_root: Path
+) -> bool:
+    """True iff the shape-gated entry ``name`` (mermaid/excalidraw/playwright)
+    is positively identifiable as VCO's own. playwright uses the npx
+    fingerprint; mermaid/excalidraw use the install_root-anchored path
+    predicate (their VCO entries run ``<install_root>/.venv/... -m
+    claude_mcp_servers.wrappers.*_proxy``)."""
+    if name == "playwright":
+        return _is_vco_shaped_playwright_entry(entry) or (
+            _mcp_entry_path_inside_install_root(entry, install_root)
+        )
+    return _mcp_entry_path_inside_install_root(entry, install_root)
+
+
+def uninstall_scrub_mcp_names(
+    install_root: Path,
+    claude_json: Path,
+) -> list[str]:
+    """Pure decision function: which ``~/.claude.json mcpServers`` keys the
+    uninstaller should remove.
+
+    A name is removed when it is a VCO scrub name AND either
+      (a) it is a VCO-EXCLUSIVE id (removed by name), or
+      (b) it is a shape-gated id (mermaid/excalidraw/playwright) whose on-disk
+          entry is positively VCO-shaped.
+
+    Returns the list of keys to delete, in the order they appear in the
+    on-disk mcpServers dict. No writes, no side effects."""
+    if not claude_json.is_file():
+        return []
+    try:
+        data = json.loads(claude_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    mcp_servers = data.get("mcpServers", {})
+    if not isinstance(mcp_servers, dict):
+        return []
+
+    scrub_names = set(_UNINSTALL_SCRUB_MCP_NAMES)
+    to_remove: list[str] = []
+    for name, entry in mcp_servers.items():
+        if name not in scrub_names:
+            continue  # user's own MCP — never touched
+        if name in _UNINSTALL_SCRUB_SHAPE_GATED:
+            # Dual-use id: remove ONLY if positively VCO-shaped, else leave the
+            # user's own entry alone.
+            if not isinstance(entry, dict) or not _is_vco_shaped_scrub_entry(
+                name, entry, install_root
+            ):
+                continue
+        # VCO-exclusive id (or a confirmed-VCO shape-gated id) → remove.
+        to_remove.append(name)
+    return to_remove
 
 
 def _detect_deprecated_mcp_entries(

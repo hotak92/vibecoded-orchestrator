@@ -140,15 +140,36 @@ def default_mcp_entry_names(path: Path | None = None) -> tuple[str, ...]:
 
 def bundled_mcp_names(path: Path | None = None) -> tuple[str, ...]:
     """Every orchestrator-shipped MCP name (superset of
-    default_mcp_entry_names). Used for is_user_added classification + the
-    uninstall scrub. NOTE (WP-B4): the Python uninstall-scrub CONSUMER
-    (install.py) is not yet migrated onto this — see the .toml header."""
+    default_mcp_entry_names). Used for is_user_added classification. The
+    launcher's Rust ``BUNDLED_MCP_NAMES`` is sourced from this same key
+    (v0.2.83 WP-B5). NOTE: the uninstall scrub uses the DISTINCT
+    :func:`uninstall_scrub_mcp_names` list, not this one — see the .toml
+    header for why the two sets differ."""
     return tuple(_rules(path)["bundled"]["all_names"])
 
 
 def default_disabled_mcp_names(path: Path | None = None) -> tuple[str, ...]:
     """Bundled MCPs that ship default-disabled per project."""
     return tuple(_rules(path)["bundled"]["default_disabled"])
+
+
+def uninstall_scrub_mcp_names(path: Path | None = None) -> tuple[str, ...]:
+    """MCP names install.py's uninstaller removes from the user's GLOBAL
+    ~/.claude.json. DISTINCT from :func:`bundled_mcp_names` by design (it
+    carries the backend ``code-embedding`` service id and the Pro-tier
+    ``vct-coordination`` id, whose scrub rationale differs from the
+    registration set — see the .toml header). ORDER not semantically
+    significant, but kept sorted for readability + a stable equality pin."""
+    return tuple(_rules(path)["bundled"]["uninstall_scrub_names"])
+
+
+def uninstall_scrub_shape_gated_mcp_names(path: Path | None = None) -> tuple[str, ...]:
+    """The subset of :func:`uninstall_scrub_mcp_names` scrubbed ONLY when the
+    on-disk entry is positively VCO-shaped. These three ids
+    (mermaid / excalidraw / playwright) are also valid third-party MCP names,
+    so a bare name match cannot prove ownership; the other scrub names are
+    VCO-exclusive and removed by name."""
+    return tuple(_rules(path)["bundled"]["uninstall_scrub_shape_gated"])
 
 
 def deprecated_default_mcps(path: Path | None = None) -> dict[str, dict[str, str]]:

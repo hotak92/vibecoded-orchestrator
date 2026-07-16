@@ -99,6 +99,15 @@ pub struct McpScanRules {
     pub secret_shaped_needles: Vec<String>,
     /// [entries].default_names — order-significant (builder emit order).
     pub default_mcp_entry_names: Vec<String>,
+    /// [bundled].all_names — every orchestrator-shipped MCP name (superset of
+    /// default_mcp_entry_names). The source-of-truth for
+    /// `project_mcp_servers::BUNDLED_MCP_NAMES` (v0.2.83 WP-B5). Kept sorted.
+    pub bundled_mcp_names: Vec<String>,
+    /// [bundled].default_disabled — bundled MCPs that ship default-disabled
+    /// per project. The source-of-truth for
+    /// `project_mcp_servers::BUNDLED_MCP_DEFAULT_DISABLED` (WP-B5). Subset of
+    /// bundled_mcp_names.
+    pub bundled_mcp_default_disabled: Vec<String>,
 }
 
 // ── Wire schema (serde) ────────────────────────────────────────────────────
@@ -108,6 +117,13 @@ struct RawTable {
     format_version: Option<u32>,
     env: RawEnv,
     entries: RawEntries,
+    // Optional at the WIRE level so the loader's minimal round-trip test
+    // fixtures (which omit [bundled]) still parse; the REAL embedded table
+    // always carries it, and `bundled_mcp_names_load_expected_values` pins
+    // that. A malformed/partial [bundled] in the real file surfaces as an
+    // empty slice, which the same-crate WP-B5 drift test flags immediately.
+    #[serde(default)]
+    bundled: RawBundled,
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,6 +135,14 @@ struct RawEnv {
 #[derive(Debug, Deserialize)]
 struct RawEntries {
     default_names: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawBundled {
+    #[serde(default)]
+    all_names: Vec<String>,
+    #[serde(default)]
+    default_disabled: Vec<String>,
 }
 
 /// Parse a TOML string into [`McpScanRules`]. Validates `format_version`.
@@ -139,6 +163,8 @@ pub fn parse_str(toml_text: &str) -> Result<McpScanRules, McpScanRulesError> {
         allowed_global_env_keys: raw.env.allowed_global_keys,
         secret_shaped_needles: raw.env.secret_shaped_needles,
         default_mcp_entry_names: raw.entries.default_names,
+        bundled_mcp_names: raw.bundled.all_names,
+        bundled_mcp_default_disabled: raw.bundled.default_disabled,
     })
 }
 
@@ -179,6 +205,19 @@ pub fn default_mcp_entry_names() -> &'static [String] {
     &RULES.default_mcp_entry_names
 }
 
+/// Every orchestrator-shipped MCP name (superset of
+/// [`default_mcp_entry_names`]). Source-of-truth for
+/// `project_mcp_servers::BUNDLED_MCP_NAMES` (v0.2.83 WP-B5).
+pub fn bundled_mcp_names() -> &'static [String] {
+    &RULES.bundled_mcp_names
+}
+
+/// Bundled MCPs that ship default-disabled per project. Source-of-truth for
+/// `project_mcp_servers::BUNDLED_MCP_DEFAULT_DISABLED` (v0.2.83 WP-B5).
+pub fn bundled_mcp_default_disabled() -> &'static [String] {
+    &RULES.bundled_mcp_default_disabled
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +247,35 @@ mod tests {
         assert_eq!(
             r.default_mcp_entry_names,
             vec!["weaviate-kg", "search", "playwright", "mermaid", "excalidraw"],
+        );
+    }
+
+    /// WP-B5: the [bundled] section drives project_mcp_servers'
+    /// BUNDLED_MCP_NAMES / BUNDLED_MCP_DEFAULT_DISABLED. Pin the embedded
+    /// values so a future table edit updates this assertion in the same
+    /// commit (mirrors `embedded_rules_load_expected_values`).
+    #[test]
+    fn bundled_names_load_expected_values() {
+        let r = &*RULES;
+        assert_eq!(
+            r.bundled_mcp_names,
+            vec![
+                "code-embedding",
+                "excalidraw",
+                "mermaid",
+                "ollama",
+                "playwright",
+                "search",
+                "vct-coordination",
+                "weaviate-kg",
+            ],
+        );
+        assert_eq!(r.bundled_mcp_default_disabled, vec!["excalidraw", "mermaid"]);
+        // Accessors return the same slices.
+        assert_eq!(bundled_mcp_names(), r.bundled_mcp_names.as_slice());
+        assert_eq!(
+            bundled_mcp_default_disabled(),
+            r.bundled_mcp_default_disabled.as_slice()
         );
     }
 

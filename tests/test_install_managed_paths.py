@@ -59,6 +59,11 @@ EXPECTED_MANAGED_PATHS: tuple[str, ...] = (
     # ``vco_lib/bundled_versions.py`` docstring. The whitelist entry
     # updated in lockstep so update propagation still finds it.)
     "vco_lib/bundled_mcp_versions.toml",
+    # v0.2.83 WP-B5: the cross-language MCP scan/registration rule table
+    # (WP-B4). Listed here so ``update_orchestrator_at`` propagates future
+    # EDITS of the table to existing installs — same wheel-packaged,
+    # self-propagating shape as ``bundled_mcp_versions.toml`` above.
+    "vco_lib/mcp_scan_rules.toml",
 )
 
 

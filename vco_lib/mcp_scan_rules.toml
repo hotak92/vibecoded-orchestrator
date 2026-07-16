@@ -177,6 +177,48 @@ default_disabled = [
     "mermaid",
 ]
 
+# ── Uninstall scrub set ────────────────────────────────────────────────────
+# The MCP names install.py's uninstaller removes from the user's GLOBAL
+# ~/.claude.json (never the user's OWN, non-VCO MCPs). This is a DISTINCT
+# list from all_names / default_names on PURPOSE — do NOT "unify" it:
+#   • It INCLUDES `code-embedding`, which is a backend FastAPI service, not a
+#     registered MCP entry — but if a stray code-embedding entry exists it
+#     must be scrubbed.
+#   • It INCLUDES `vct-coordination`, which is a Pro-tier MCP that is NOT in
+#     default_names (never default-registered) — but a Pro user WILL have it
+#     and uninstall must remove it.
+#   • It OMITS `ollama` from being *builder-composed*, yet ollama IS scrubbed
+#     (it was a legacy default-registered MCP; a leftover entry must go).
+# The rationale set differs from the registration set, so the list stays its
+# own datum. Keep sorted. (v0.2.83 WP-B5: was hand-typed in install.py and had
+# DRIFTED — it was missing mermaid/excalidraw/playwright, leaving VCO's own
+# entries in ~/.claude.json after uninstall.)
+uninstall_scrub_names = [
+    "code-embedding",
+    "excalidraw",
+    "mermaid",
+    "ollama",
+    "playwright",
+    "search",
+    "vct-coordination",
+    "weaviate-kg",
+]
+
+# The subset of uninstall_scrub_names that is removed ONLY when the on-disk
+# ~/.claude.json entry is POSITIVELY VCO-shaped (its command / args point at
+# THIS install, or match VCO's exact launch fingerprint). These three names
+# are also legitimate THIRD-PARTY MCP ids — a user may run their own mermaid,
+# excalidraw, or playwright — so a bare name match is not enough to prove the
+# entry is ours. The other five scrub names are VCO-exclusive ids (a
+# `weaviate-kg` / `code-embedding` / `vct-coordination` entry is unambiguously
+# ours), so they are removed by name as before (no behavior change for them).
+# Every name here MUST also be in uninstall_scrub_names. Keep sorted.
+uninstall_scrub_shape_gated = [
+    "excalidraw",
+    "mermaid",
+    "playwright",
+]
+
 # ── Deprecated-default MCP registry ────────────────────────────────────────
 # MCPs that used to be in the default install set but were dropped. On every
 # --update, ~/.claude.json is scanned for these names; a match whose command

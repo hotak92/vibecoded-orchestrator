@@ -10554,6 +10554,12 @@ mod tests {
             // wheel-packaging rationale. Whitelist entry updated in
             // lockstep so update propagation still finds it.
             "vco_lib/bundled_mcp_versions.toml",
+            // v0.2.83 WP-B5: the cross-language MCP scan/registration rule
+            // table (WP-B4). Listed here so `update_orchestrator_at` pushes
+            // future EDITS of the table into every existing install — same
+            // wheel-packaged, self-propagating shape as
+            // `bundled_mcp_versions.toml` above.
+            "vco_lib/mcp_scan_rules.toml",
         ];
         let actual: Vec<&str> = ORCHESTRATOR_MANAGED_PATHS.iter().copied().collect();
         assert_eq!(
