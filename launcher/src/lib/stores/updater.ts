@@ -227,17 +227,21 @@ function createUpdaterStore() {
       return;
     }
     const kind = pickKind(o.updateStatus);
-    // v0.2.83 (WP-A2 / D3): the amber "couldn't check for updates" state is
-    // ONLY meaningful when there is no real pending update to surface. If a
+    // v0.2.83 (WP-A2 / D3 + N-4): the amber "couldn't check for updates" state
+    // is ONLY meaningful when there is no real pending update to surface. If a
     // real `kind` is active (remote_ahead / install_stale / …), that takes
-    // precedence and the amber state is suppressed — a stale
-    // remote_check_ok=false from a prior poll must not paint amber over a
-    // genuine update badge. `remote_check_ok === false` (explicit) is the
-    // only failure signal; a MISSING field (older Rust) is treated as
-    // healthy, matching the orchestrator store's back-compat rule.
+    // precedence and the amber state is suppressed — a stale failed check from
+    // a prior poll must not paint amber over a genuine update badge.
+    //
+    // N-4: derive from the orchestrator store's EXPLICIT `lastCheckFailed`, NOT
+    // from the live `updateStatus`. The old `!!us && us.remote_check_ok===false`
+    // derivation rendered NOTHING when the check itself soft-failed to a null
+    // `updateStatus` (the command errored) — the exact silent gap N-4 closes.
+    // `lastCheckFailed` is `true` for BOTH a null-status completed check AND an
+    // explicit `remote_check_ok===false`; `null` before the first completed
+    // check (so no amber flash during startup); `false` on success.
     const us = o.updateStatus;
-    const remoteCheckFailed =
-      !!us && us.remote_check_ok === false && kind === null;
+    const remoteCheckFailed = o.lastCheckFailed === true && kind === null;
     const remoteCheckError = remoteCheckFailed
       ? (us?.remote_check_error ?? null)
       : null;

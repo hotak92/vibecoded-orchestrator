@@ -116,6 +116,21 @@ interface OrchestratorState {
   /** v0.2.16 (W4 / 0.5): full three-state update status. Null until
    *  the first `checkStatus()` resolves. */
   updateStatus: UpdateStatus | null;
+  /** v0.2.83 (N-4): explicit last-remote-check outcome, decoupled from
+   *  `updateStatus` (which is set to `null` when the check itself soft-fails,
+   *  losing the "the check FAILED" signal). Values:
+   *    - `null`  — no completed check yet (before the first attempt); the
+   *                amber "couldn't check" badge must NOT render (no startup
+   *                flash);
+   *    - `true`  — the last COMPLETED check ended with `updateStatus === null`
+   *                (command soft-failed) OR `remote_check_ok === false` (probe
+   *                couldn't determine remote state);
+   *    - `false` — the last completed check succeeded (or there was no remote
+   *                to check, e.g. not_installed).
+   *  `updater.ts::doSync` derives its `remoteCheckFailed` from THIS, so the
+   *  amber badge renders after ANY failed check — including a null-status one
+   *  the old `!!us && ...` derivation silently dropped. */
+  lastCheckFailed: boolean | null;
   system: SystemDetection | null;
   progress: InstallProgress | null;
   error: string | null;
@@ -187,6 +202,8 @@ function createOrchestratorStore() {
     version: '',
     updateAvailable: false,
     updateStatus: null,
+    // v0.2.83 (N-4): null = no completed check yet → no amber flash at startup.
+    lastCheckFailed: null,
     system: null,
     progress: null,
     error: null,
@@ -276,16 +293,8 @@ function createOrchestratorStore() {
                 || updateStatus.binary_stale
                 || !!updateStatus.merge_resolved_incomplete)
             : false;
-          update((s) => ({
-            ...s,
-            status: 'installed',
-            version: version ?? s.version,
-            updateAvailable,
-            updateStatus: updateStatus ?? null,
-            installPath: currentPath,
-          }));
 
-          // v0.2.83 (WP-A2 / D3): remote-check retry episode management.
+          // v0.2.83 (WP-A2 / D3 + N-4): remote-check retry episode management.
           // Treat a MISSING remote_check_ok as healthy (older Rust
           // back-compat) — only an EXPLICIT `=== false` is a failed check.
           // A null updateStatus (the command itself soft-failed to null via
@@ -293,6 +302,21 @@ function createOrchestratorStore() {
           // state, so retry rather than pretend "up to date".
           const remoteCheckFailed =
             updateStatus === null || updateStatus.remote_check_ok === false;
+
+          update((s) => ({
+            ...s,
+            status: 'installed',
+            version: version ?? s.version,
+            updateAvailable,
+            updateStatus: updateStatus ?? null,
+            // N-4: persist the EXPLICIT last-check outcome so the amber badge
+            // can render even when updateStatus is null (which would otherwise
+            // erase the "check failed" signal). This is a COMPLETED check, so
+            // it is never left at the pre-check `null`.
+            lastCheckFailed: remoteCheckFailed,
+            installPath: currentPath,
+          }));
+
           if (remoteCheckFailed) {
             scheduleRemoteCheckRetry();
           } else {
@@ -300,8 +324,16 @@ function createOrchestratorStore() {
             cancelScheduledRetry();
           }
         } else {
-          update((s) => ({ ...s, status: 'not_installed', installPath: currentPath, updateStatus: null }));
-          // Not installed ⇒ there is no remote to check; end any episode.
+          // N-4: not installed ⇒ there is no remote to check → the check did
+          // not FAIL (lastCheckFailed=false, so no amber badge), and any
+          // pending retry episode ends.
+          update((s) => ({
+            ...s,
+            status: 'not_installed',
+            installPath: currentPath,
+            updateStatus: null,
+            lastCheckFailed: false,
+          }));
           cancelScheduledRetry();
         }
       } catch (err) {
