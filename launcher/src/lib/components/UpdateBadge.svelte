@@ -27,6 +27,12 @@
 
   let popoverOpen = $state(false);
   let wrapperEl = $state<HTMLDivElement | null>(null);
+  // v0.2.83 (WP-A2 / D3): the amber remote-check-failed badge has its own
+  // popover + wrapper ref (it renders in a separate branch from the normal
+  // update badge, and the two are mutually exclusive via `amberVisible`'s
+  // `kind === null` guard).
+  let amberPopoverOpen = $state(false);
+  let amberWrapperEl = $state<HTMLDivElement | null>(null);
 
   const orchState = $derived($orchestrator);
   const upd = $derived($updater);
@@ -124,6 +130,13 @@
     if (popoverOpen && wrapperEl && !wrapperEl.contains(e.target as Node)) {
       popoverOpen = false;
     }
+    if (
+      amberPopoverOpen &&
+      amberWrapperEl &&
+      !amberWrapperEl.contains(e.target as Node)
+    ) {
+      amberPopoverOpen = false;
+    }
   }
 
   async function handleAction() {
@@ -167,8 +180,28 @@
     updater.dismiss();
   }
 
+  // v0.2.83 (WP-A2 / D3): manual "Retry now" from the amber remote-check-
+  // failed popover. Delegates to the ONE real check entry point in the
+  // updater store — the same flow RightSidebar's "Check Update" uses. We
+  // don't branch on the result here: the store's derived state
+  // (remoteCheckFailed / kind) re-renders the badge to whatever the check
+  // resolved to (still amber, a real update badge, or gone).
+  async function handleRetryNow() {
+    await updater.manualCheck();
+    amberPopoverOpen = false;
+  }
+
   // Don't render anything if no update or already dismissed for this version.
   const visible = $derived(upd.available && !upd.dismissed && upd.kind !== null);
+
+  // v0.2.83 (WP-A2 / D3): the amber "couldn't check for updates" state.
+  // Shown ONLY when the remote check failed AND there is no real pending
+  // update to render (the store's `remoteCheckFailed` already encodes the
+  // `kind === null` guard, but we re-assert it here so a stale flag can
+  // never paint amber over a genuine update badge). This is a distinct,
+  // lower-urgency signal from the teal/pink/purple update kinds — the check
+  // is unknown, not "up to date", and it retries on its own.
+  const amberVisible = $derived(upd.remoteCheckFailed && upd.kind === null);
 </script>
 
 <svelte:window onclick={handleClickOutside} />
@@ -227,6 +260,58 @@
               Working…
             {:else}
               {kindCopy.buttonLabel}
+            {/if}
+          </button>
+        </div>
+      </div>
+    {/if}
+  </div>
+{/if}
+
+<!-- v0.2.83 (WP-A2 / D3): amber "couldn't check for updates" badge. Renders
+     only when the remote check failed AND no real update kind is active
+     (mutually exclusive with the block above). Distinct amber color so it
+     reads as "unknown, retrying" — NOT "up to date" and NOT a pending
+     update. The check retries automatically in the background; "Retry now"
+     lets the user force it. -->
+{#if amberVisible}
+  <div class="update-wrapper" bind:this={amberWrapperEl}>
+    <button
+      class="update-trigger kind-check-failed"
+      onclick={(e) => { e.stopPropagation(); amberPopoverOpen = !amberPopoverOpen; }}
+      title="Couldn't check for updates — retrying automatically"
+    >
+      <!-- alert-triangle: reads as "attention, but not an error" -->
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+        <line x1="12" y1="9" x2="12" y2="13"/>
+        <line x1="12" y1="17" x2="12.01" y2="17"/>
+      </svg>
+      <span class="update-dot dot-amber"></span>
+    </button>
+
+    {#if amberPopoverOpen}
+      <div class="update-popover">
+        <div class="popover-header">
+          <span class="popover-title">Couldn't check for updates</span>
+        </div>
+        <p class="popover-desc">
+          {#if upd.remoteCheckError}
+            Couldn't check for updates — {upd.remoteCheckError}. Retrying automatically.
+          {:else}
+            Couldn't check for updates. Retrying automatically.
+          {/if}
+        </p>
+        <div class="popover-actions">
+          <button
+            class="btn-3d btn-3d-primary btn-3d-sm"
+            onclick={handleRetryNow}
+            disabled={upd.checking}
+          >
+            {#if upd.checking}
+              Checking…
+            {:else}
+              Retry now
             {/if}
           </button>
         </div>
@@ -300,8 +385,26 @@
     }
   }
 
+  /* v0.2.83 (WP-A2 / D3): amber "couldn't check for updates" state. A
+     warning-amber (#f1c40f) distinct from the teal (available), pink
+     (restart) and purple (resume) update kinds — signals "unknown, not up
+     to date" without the urgency of a real pending update. Matches the
+     amber `sidebar-info-status-warn` used elsewhere in the launcher. */
+  .update-trigger.kind-check-failed {
+    border-color: rgba(241, 196, 15, 0.5);
+    color: #f1c40f;
+  }
+  .update-trigger.kind-check-failed:hover {
+    background: rgba(241, 196, 15, 0.08);
+    border-color: rgba(241, 196, 15, 0.7);
+  }
+
   @keyframes spin {
     to { transform: rotate(360deg); }
+  }
+
+  .update-dot.dot-amber {
+    background: #f1c40f;
   }
 
   .update-dot {

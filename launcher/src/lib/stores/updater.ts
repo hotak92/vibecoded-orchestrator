@@ -16,7 +16,7 @@
 
 import { writable, get } from 'svelte/store';
 import { invoke, tauriAvailable } from '$lib/tauri';
-import { orchestrator } from './orchestrator';
+import { orchestrator, cancelScheduledRetry } from './orchestrator';
 // M-P1-5: scope the seen-version flag by install_root so two clones
 // on the same machine maintain independent dismissal state. The
 // helper transparently migrates the legacy unscoped key on first
@@ -113,6 +113,23 @@ interface UpdaterState {
   /** v0.2.23 (B4 / D19): when non-null, render the divergence modal
    *  instead of the popover error. Cleared by the modal's onClose. */
   nonFf: OrchestratorNonFfPayload | null;
+  /** v0.2.83 (WP-A2 / D6): a `manualCheck()` (RightSidebar "Check Update"
+   *  button, or the badge's "Retry now") is in flight. Drives the button's
+   *  "Checking…" label so the user gets honest feedback instead of the old
+   *  setTimeout fake. Distinct from `updating`, which means an actual
+   *  install/update/restart is running. */
+  checking: boolean;
+  /** v0.2.83 (WP-A2 / D3): the last `check_for_updates` could NOT determine
+   *  remote state (`remote_check_ok === false`) AND there is no real pending
+   *  update to show (kind === null). When true, `UpdateBadge` renders the
+   *  amber "couldn't check, retrying" state instead of nothing — the badge
+   *  must NEVER silently imply "up to date" when the check actually failed.
+   *  Derived in `syncFromOrchestrator()` from the orchestrator store. */
+  remoteCheckFailed: boolean;
+  /** v0.2.83 (WP-A2 / D3): the concise error/stage label from the failed
+   *  remote check (`updateStatus.remote_check_error`), surfaced in the
+   *  amber popover copy. Null when the check succeeded or is not applicable. */
+  remoteCheckError: string | null;
 }
 
 // Synchronous loadSeen for the initial store value. When the lazy
@@ -186,7 +203,75 @@ function createUpdaterStore() {
     error: null,
     dismissed: false,
     nonFf: null,
+    checking: false,
+    remoteCheckFailed: false,
+    remoteCheckError: null,
   });
+
+  // Local implementation shared by the public `syncFromOrchestrator` method
+  // and `manualCheck`. Kept as a plain function (not a `this.`-method call)
+  // so it's robust against `this`-binding — an internal caller never has to
+  // worry about how the method was invoked.
+  function doSync() {
+    const o = get(orchestrator);
+    const installed = o.status === 'installed' || o.status === 'updating';
+    if (!installed) {
+      update((s) => ({
+        ...s,
+        available: false,
+        kind: null,
+        // Not installed ⇒ no remote to check; clear the amber state too.
+        remoteCheckFailed: false,
+        remoteCheckError: null,
+      }));
+      return;
+    }
+    const kind = pickKind(o.updateStatus);
+    // v0.2.83 (WP-A2 / D3): the amber "couldn't check for updates" state is
+    // ONLY meaningful when there is no real pending update to surface. If a
+    // real `kind` is active (remote_ahead / install_stale / …), that takes
+    // precedence and the amber state is suppressed — a stale
+    // remote_check_ok=false from a prior poll must not paint amber over a
+    // genuine update badge. `remote_check_ok === false` (explicit) is the
+    // only failure signal; a MISSING field (older Rust) is treated as
+    // healthy, matching the orchestrator store's back-compat rule.
+    const us = o.updateStatus;
+    const remoteCheckFailed =
+      !!us && us.remote_check_ok === false && kind === null;
+    const remoteCheckError = remoteCheckFailed
+      ? (us?.remote_check_error ?? null)
+      : null;
+    if (kind !== null) {
+      // v0.2.16 (W4): the dismissal marker now keys on
+      // `<kind>:<version-snapshot>` so dismissing one kind (e.g.
+      // install_stale@0.2.15) doesn't suppress a later kind
+      // (binary_stale@0.2.16). Version snapshot is the current
+      // installed version; flipping kinds OR upgrading versions
+      // re-shows the badge.
+      const versionSnapshot = us
+        ? `${us.source_version}|${us.installed_version}|${us.on_disk_binary_version}|${us.running_version}`
+        : (o.version || '');
+      const marker = `${kind}:${versionSnapshot}`;
+      update((s) => ({
+        ...s,
+        available: true,
+        kind,
+        dismissed: s.lastSeenVersion === marker ? s.dismissed : false,
+        // A real update takes precedence — never paint amber over it.
+        remoteCheckFailed,
+        remoteCheckError,
+      }));
+    } else {
+      update((s) => ({
+        ...s,
+        available: false,
+        kind: null,
+        dismissed: false,
+        remoteCheckFailed,
+        remoteCheckError,
+      }));
+    }
+  }
 
   return {
     subscribe,
@@ -194,34 +279,72 @@ function createUpdaterStore() {
     /** Pull update status from the orchestrator store. Re-shows the toast
      * if the underlying version changed since the last dismissal. */
     syncFromOrchestrator() {
+      doSync();
+    },
+
+    /**
+     * v0.2.83 (WP-A2 / D6): the ONE real update-check entry point behind
+     * every manual "check for updates" surface — RightSidebar's "Check
+     * Update" button (which used to be a setTimeout fake, A-RC5) and the
+     * UpdateBadge amber-state "Retry now" button. Runs the actual backend
+     * check and reports the outcome so the caller can render honest copy.
+     *
+     * Contract:
+     *   - browser mode (no Tauri) ⇒ 'check_failed' (nothing to check);
+     *   - sets `checking: true` for the duration (drives the button label);
+     *   - awaits `orchestrator.checkStatus()` — after A-F3 this never throws,
+     *     so we don't need a try/catch here; a failed backend probe surfaces
+     *     as a null updateStatus or remote_check_ok===false, both handled;
+     *   - reads the freshly-updated orchestrator store: a null updateStatus
+     *     OR remote_check_ok===false ⇒ 'check_failed' (we couldn't determine
+     *     remote state — never report 'up_to_date' in that case);
+     *   - syncs our derived state; a real pending update (kind !== null) ⇒
+     *     un-dismiss the badge so it re-shows even if previously dismissed,
+     *     and report 'available';
+     *   - otherwise ⇒ 'up_to_date'.
+     *
+     * A manual check also cancels any pending remote-check retry (D3
+     * single-flight "cancel + replace") — the checkStatus() it runs will
+     * re-arm the episode if the remote is still unreachable, or reset it on
+     * success.
+     */
+    async manualCheck(): Promise<'available' | 'up_to_date' | 'check_failed'> {
+      if (!tauriAvailable()) {
+        // No backend to ask. Surface honestly; do NOT touch store state
+        // beyond clearing any leftover `checking` flag (there won't be one,
+        // but keep the invariant that checking is false when idle).
+        update((s) => ({ ...s, checking: false }));
+        return 'check_failed';
+      }
+      // Cancel + replace the scheduled retry: the checkStatus() below is the
+      // fresh attempt, and it will re-schedule (fail) or reset (success).
+      cancelScheduledRetry();
+      update((s) => ({ ...s, checking: true }));
+      try {
+        await orchestrator.checkStatus();
+      } finally {
+        update((s) => ({ ...s, checking: false }));
+      }
       const o = get(orchestrator);
-      const installed = o.status === 'installed' || o.status === 'updating';
-      if (!installed) {
-        update((s) => ({ ...s, available: false, kind: null }));
-        return;
+      const us = o.updateStatus;
+      // Couldn't determine remote state ⇒ honest 'check_failed'. A missing
+      // remote_check_ok (older Rust) is treated as healthy — only an explicit
+      // false, or a null status (command soft-failed), is a failure.
+      if (us === null || us.remote_check_ok === false) {
+        // Refresh derived state (paints the amber remote-check-failed badge
+        // when appropriate) before reporting.
+        doSync();
+        return 'check_failed';
       }
-      const kind = pickKind(o.updateStatus);
+      doSync();
+      const kind = pickKind(us);
       if (kind !== null) {
-        // v0.2.16 (W4): the dismissal marker now keys on
-        // `<kind>:<version-snapshot>` so dismissing one kind (e.g.
-        // install_stale@0.2.15) doesn't suppress a later kind
-        // (binary_stale@0.2.16). Version snapshot is the current
-        // installed version; flipping kinds OR upgrading versions
-        // re-shows the badge.
-        const us = o.updateStatus;
-        const versionSnapshot = us
-          ? `${us.source_version}|${us.installed_version}|${us.on_disk_binary_version}|${us.running_version}`
-          : (o.version || '');
-        const marker = `${kind}:${versionSnapshot}`;
-        update((s) => ({
-          ...s,
-          available: true,
-          kind,
-          dismissed: s.lastSeenVersion === marker ? s.dismissed : false,
-        }));
-      } else {
-        update((s) => ({ ...s, available: false, kind: null, dismissed: false }));
+        // Un-dismiss so a previously-dismissed badge re-shows on an explicit
+        // user-initiated check (they asked; show them the answer).
+        update((s) => ({ ...s, dismissed: false }));
+        return 'available';
       }
+      return 'up_to_date';
     },
 
     dismiss() {

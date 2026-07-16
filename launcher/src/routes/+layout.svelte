@@ -282,6 +282,14 @@
     // check on layout mount (regardless of which route the launcher
     // opened to) and re-poll once an hour. Cheap: each check is a
     // single file-existence probe + manifest read.
+    //
+    // v0.2.83 (WP-A2 / D3): this hourly poll is the SLOW backstop. When a
+    // `checkStatus()` lands `remote_check_ok === false` (the remote probe
+    // couldn't determine whether an update exists — the historical
+    // first-start-after-release miss), the orchestrator store now schedules
+    // its OWN short-burst retries (30s / 90s / 300s, capped) instead of
+    // waiting up to an hour here. So this interval stays a plain hourly
+    // refresh; the fast recovery lives in the store, not in this component.
     void orchestrator.checkStatus();
     const orchStatusInterval = setInterval(
       () => void orchestrator.checkStatus(),

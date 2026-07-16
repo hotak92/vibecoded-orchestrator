@@ -83,6 +83,24 @@ export interface UpdateStatus {
   installed_version: string;
   running_version: string;
   on_disk_binary_version: string;
+  /** v0.2.83 (WP-A2 / D2): honest remote-check health. Mirror of the two
+   *  fields WP-A1 added to Rust `installer::UpdateStatus`.
+   *
+   *  `remote_check_ok === false` means the `git fetch` / `rev-list` probe
+   *  could NOT determine whether the remote is ahead — the signal is
+   *  UNKNOWN, NOT "up to date". `remote_check_error` carries a concise
+   *  stage-label / last-stderr-line for the popover copy. On success (or in
+   *  the non-git / not-applicable case) Rust returns `remote_check_ok=true`
+   *  with `remote_check_error=null`.
+   *
+   *  Both are OPTIONAL for back-compat: a launcher running against a
+   *  pre-v0.2.83 Rust binary returns neither field. Readers MUST treat a
+   *  MISSING `remote_check_ok` as `true` (healthy) — an absent field is the
+   *  old "no health surface" world, where the check either worked or
+   *  soft-failed to `remote_ahead=false`; scheduling a retry there would be
+   *  a pointless storm. Only an explicit `=== false` is a failed check. */
+  remote_check_ok?: boolean;
+  remote_check_error?: string | null;
 }
 
 type OrchestratorStatus = 'unknown' | 'not_installed' | 'installed' | 'installing' | 'updating' | 'error';
@@ -101,6 +119,61 @@ interface OrchestratorState {
   system: SystemDetection | null;
   progress: InstallProgress | null;
   error: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Remote-check retry scheduling (v0.2.83, WP-A2 / D3)
+// ---------------------------------------------------------------------------
+//
+// When a `checkStatus()` lands `remote_check_ok === false`, the remote signal
+// is UNKNOWN — not "up to date". Rather than wait up to an hour for the next
+// poll (A-RC2), the store schedules a short burst of retries.
+//
+// Policy (D3):
+//   - delays 30s → 90s → 300s, capped at 3 retries per failure episode;
+//   - single-flight: at most ONE pending timer. Scheduling again while a
+//     timer is armed is a no-op (no stacking); a manual check cancels +
+//     replaces the pending timer;
+//   - an episode RESETS (retry counter → 0, pending timer cleared) the moment
+//     a check lands `remote_check_ok !== false` (ok, or MISSING = older Rust
+//     back-compat = treated as ok). Only an explicit `=== false` keeps the
+//     episode alive.
+//
+// The timer lives at module scope (not in the store value) so it survives
+// store subscription churn and so `cancelScheduledRetry()` — exported for
+// tests and for `manualCheck()`'s "cancel + replace" contract — can reach it.
+
+const RETRY_DELAYS_MS = [30_000, 90_000, 300_000] as const;
+const MAX_RETRIES = RETRY_DELAYS_MS.length; // cap 3 per episode
+
+let retryTimer: ReturnType<typeof setTimeout> | null = null;
+let retryAttempt = 0; // 0-based index into RETRY_DELAYS_MS for the NEXT retry
+
+/** Cancel any pending remote-check retry and reset the episode counter.
+ *  Idempotent. Exported for `manualCheck()` (cancel + replace) and tests. */
+export function cancelScheduledRetry(): void {
+  if (retryTimer !== null) {
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
+  retryAttempt = 0;
+}
+
+/** Arm the next remote-check retry if the episode has budget left. Honors
+ *  single-flight: does nothing when a timer is already pending. Called by
+ *  `checkStatus()` after a failed remote check. */
+function scheduleRemoteCheckRetry(): void {
+  if (retryTimer !== null) return; // single-flight: never stack timers
+  if (retryAttempt >= MAX_RETRIES) return; // episode budget exhausted
+  const delay = RETRY_DELAYS_MS[retryAttempt];
+  retryAttempt += 1;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    // The retry itself re-runs the full status check. If it fails again,
+    // checkStatus() re-arms the next tier (up to the cap); if it succeeds,
+    // checkStatus() resets the episode.
+    void orchestrator.checkStatus();
+  }, delay);
 }
 
 // ---------------------------------------------------------------------------
@@ -150,59 +223,94 @@ function createOrchestratorStore() {
      * existing install is discoverable.
      */
     async checkStatus(): Promise<void> {
-      // 1. Known-install discovery. Returns a real path (Some) or null when
-      //    no install is detected. Tauri-less environments (browser mode)
-      //    return null from safeInvoke — treat the same as "no install".
-      const knownPath = await safeInvoke<string | null>('get_known_install_path');
+      // v0.2.83 (WP-A2 / A-F3): belt-and-braces try/catch. safeInvoke already
+      // maps a rejected command to null (A-RC4 fix), so each step below is
+      // individually null-guarded — but wrapping the whole body means that
+      // even an UNEXPECTED throw (a bug in one of these steps, a non-invoke
+      // exception) degrades this ONE poll instead of rejecting into the
+      // fire-and-forget caller (`void orchestrator.checkStatus()` at mount /
+      // hourly poll / retry timer) and silently killing the store update.
+      // One failed step degrades one signal only; the store is never left in
+      // a half-updated inconsistent state by an escaping exception.
+      try {
+        // 1. Known-install discovery. Returns a real path (Some) or null when
+        //    no install is detected. Tauri-less environments (browser mode)
+        //    return null from safeInvoke — treat the same as "no install".
+        const knownPath = await safeInvoke<string | null>('get_known_install_path');
 
-      // 2. Default-path probe — used both as the wizard pre-fill and as a
-      //    Tauri-availability gate. Browser mode short-circuits here.
-      const defaultPath = await safeInvoke<string>('get_default_install_path');
-      if (defaultPath === null) return;
+        // 2. Default-path probe — used both as the wizard pre-fill and as a
+        //    Tauri-availability gate. Browser mode short-circuits here.
+        const defaultPath = await safeInvoke<string>('get_default_install_path');
+        if (defaultPath === null) return;
 
-      let currentPath = knownPath ?? '';
+        let currentPath = knownPath ?? '';
 
-      if (!currentPath) {
-        // No discoverable install — fall back to the stored installPath
-        // (if user already picked one in the wizard) or the OS-aware
-        // default. This matches the old behavior for fresh-install users.
-        let stored = '';
-        const unsub = subscribe((s) => { stored = s.installPath; });
-        unsub();
-        currentPath = stored || defaultPath;
-      }
+        if (!currentPath) {
+          // No discoverable install — fall back to the stored installPath
+          // (if user already picked one in the wizard) or the OS-aware
+          // default. This matches the old behavior for fresh-install users.
+          let stored = '';
+          const unsub = subscribe((s) => { stored = s.installPath; });
+          unsub();
+          currentPath = stored || defaultPath;
+        }
 
-      // Push the resolved path through the store so the wizard pre-fills
-      // correctly (Bug A's UX requirement: the install_path must flow from
-      // discovery → store → wizard input).
-      update((s) => ({ ...s, installPath: currentPath }));
+        // Push the resolved path through the store so the wizard pre-fills
+        // correctly (Bug A's UX requirement: the install_path must flow from
+        // discovery → store → wizard input).
+        update((s) => ({ ...s, installPath: currentPath }));
 
-      const installed = await safeInvoke<boolean>('check_install_status', { path: currentPath });
-      if (installed === null) return;
+        const installed = await safeInvoke<boolean>('check_install_status', { path: currentPath });
+        if (installed === null) return;
 
-      if (installed) {
-        const version = await safeInvoke<string>('get_installed_version', { path: currentPath });
-        // v0.2.16 (W4 / 0.5): check_for_updates now returns the full
-        // UpdateStatus struct. Keep the legacy boolean as a derived
-        // any-of-three signal for old consumers that only care about
-        // "is there something to do?".
-        const updateStatus = await safeInvoke<UpdateStatus>('check_for_updates', { path: currentPath });
-        const updateAvailable = updateStatus
-          ? (updateStatus.remote_ahead
-              || updateStatus.install_stale
-              || updateStatus.binary_stale
-              || !!updateStatus.merge_resolved_incomplete)
-          : false;
-        update((s) => ({
-          ...s,
-          status: 'installed',
-          version: version ?? s.version,
-          updateAvailable,
-          updateStatus: updateStatus ?? null,
-          installPath: currentPath,
-        }));
-      } else {
-        update((s) => ({ ...s, status: 'not_installed', installPath: currentPath, updateStatus: null }));
+        if (installed) {
+          const version = await safeInvoke<string>('get_installed_version', { path: currentPath });
+          // v0.2.16 (W4 / 0.5): check_for_updates now returns the full
+          // UpdateStatus struct. Keep the legacy boolean as a derived
+          // any-of-three signal for old consumers that only care about
+          // "is there something to do?".
+          const updateStatus = await safeInvoke<UpdateStatus>('check_for_updates', { path: currentPath });
+          const updateAvailable = updateStatus
+            ? (updateStatus.remote_ahead
+                || updateStatus.install_stale
+                || updateStatus.binary_stale
+                || !!updateStatus.merge_resolved_incomplete)
+            : false;
+          update((s) => ({
+            ...s,
+            status: 'installed',
+            version: version ?? s.version,
+            updateAvailable,
+            updateStatus: updateStatus ?? null,
+            installPath: currentPath,
+          }));
+
+          // v0.2.83 (WP-A2 / D3): remote-check retry episode management.
+          // Treat a MISSING remote_check_ok as healthy (older Rust
+          // back-compat) — only an EXPLICIT `=== false` is a failed check.
+          // A null updateStatus (the command itself soft-failed to null via
+          // safeInvoke) is ALSO a failed check: we couldn't determine remote
+          // state, so retry rather than pretend "up to date".
+          const remoteCheckFailed =
+            updateStatus === null || updateStatus.remote_check_ok === false;
+          if (remoteCheckFailed) {
+            scheduleRemoteCheckRetry();
+          } else {
+            // Successful (or not-applicable) remote check ⇒ end the episode.
+            cancelScheduledRetry();
+          }
+        } else {
+          update((s) => ({ ...s, status: 'not_installed', installPath: currentPath, updateStatus: null }));
+          // Not installed ⇒ there is no remote to check; end any episode.
+          cancelScheduledRetry();
+        }
+      } catch (err) {
+        // An unexpected throw slipped past the per-step null guards. Log a
+        // breadcrumb and leave the store as-is; the next poll (or a manual
+        // check) retries. We deliberately do NOT schedule a remote-check
+        // retry here — this path is an internal error, not a "remote is
+        // unknown" health signal, so it must not masquerade as one.
+        console.error('checkStatus', err);
       }
     },
 

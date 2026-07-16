@@ -10,10 +10,12 @@
   //   launch and remember the last-launched id in localStorage.
 
   import { onMount } from 'svelte';
+  import { get } from 'svelte/store';
   import { getVersion } from '@tauri-apps/api/app';
   import { currentUser } from '$lib/stores/auth';
   import { projects, selectedProject } from '$lib/stores/projects';
   import { orchestrator } from '$lib/stores/orchestrator';
+  import { updater } from '$lib/stores/updater';
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import { ui } from '$lib/stores/ui';
@@ -269,6 +271,12 @@
   let pickerValue = $state<string>('');
 
   let updateStatus = $state<string | null>(null);
+  // v0.2.83 (WP-A2 / D6): when a manual check fails, stash the concise error
+  // for the button's `title` attr so the user can hover for detail without
+  // opening the badge popover.
+  let updateCheckError = $state<string | null>(null);
+  // Guards the 4s auto-clear timer so back-to-back clicks don't leak timers.
+  let updateCheckClearTimer: ReturnType<typeof setTimeout> | null = null;
 
   const pState = $derived($projects);
   const current = $derived($selectedProject);
@@ -334,15 +342,42 @@
     if (v) void doLaunch(v);
   }
 
-  function handleCheckUpdate() {
+  // v0.2.83 (WP-A2 / D6, A-RC5): the "Check Update" button used to be a pure
+  // setTimeout fake that ALWAYS rendered "Checking… → Up to date" with no
+  // backend call — a lying control on the primary right-rail surface. It now
+  // delegates to `updater.manualCheck()`, the ONE real update-check entry
+  // point (shared with the UpdateBadge amber "Retry now" button), and renders
+  // the ACTUAL outcome. "Up to date" is reachable only when the backend
+  // actually reports no pending update AND a successful remote check.
+  async function handleCheckUpdate() {
     if (!selectedApp) return;
+    // Clear any pending auto-clear from a previous click so the label from
+    // THIS check isn't wiped early.
+    if (updateCheckClearTimer !== null) {
+      clearTimeout(updateCheckClearTimer);
+      updateCheckClearTimer = null;
+    }
+    updateCheckError = null;
     updateStatus = 'Checking…';
-    setTimeout(() => {
-      updateStatus = 'Up to date';
-      setTimeout(() => {
-        updateStatus = null;
-      }, 2000);
-    }, 1000);
+    const outcome = await updater.manualCheck();
+    switch (outcome) {
+      case 'available':
+        updateStatus = 'Update available — see badge';
+        break;
+      case 'up_to_date':
+        updateStatus = 'Up to date';
+        break;
+      case 'check_failed':
+        updateStatus = 'Check failed';
+        // Surface the concise remote-check error (if any) via the title attr.
+        updateCheckError = get(updater).remoteCheckError;
+        break;
+    }
+    updateCheckClearTimer = setTimeout(() => {
+      updateStatus = null;
+      updateCheckError = null;
+      updateCheckClearTimer = null;
+    }, 4000);
   }
 </script>
 
@@ -388,6 +423,8 @@
           <button
             class="btn-3d btn-3d-ghost btn-3d-sm sidebar-action-btn"
             onclick={handleCheckUpdate}
+            disabled={updateStatus === 'Checking…'}
+            title={updateCheckError ?? ''}
           >
             {updateStatus ?? 'Check Update'}
           </button>
