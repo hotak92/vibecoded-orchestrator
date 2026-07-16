@@ -8,6 +8,16 @@
 pub mod picker;
 pub mod runtime;
 
+// v0.2.83 WP-B6: cross-writer file lock for the `UPDATE_DEFERRED.{md,json}`
+// read-modify-write cycle. The Python emitter (`vco_lib.deferral_emit`) holds an
+// exclusive `flock` on `<folder>/.claude/context/.update-deferred.lock`; the
+// launcher's DIRECT `std::fs` deferral writers (which run mid-update when Python
+// can't be assumed) acquire the SAME lock via `lock_folder` so the two languages
+// serialize instead of clobbering each other. POSIX `flock`, best-effort no-lock
+// on Windows (symmetric with the Python side). `LOCK_REL` is string-pinned to the
+// Python constant by `tests/test_deferral_lock_parity.py`.
+pub mod deferral_lock;
+
 // v0.2.62: per-service adoption state (`<vct_root_dir>/services.toml`).
 // MOVED here from `launcher/src-tauri/src/services/adoption.rs` so the
 // hub-side infra watchdog (`vct-hub::infra_watchdog`) can read the same

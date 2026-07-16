@@ -2020,6 +2020,15 @@ pub(crate) fn write_launcher_update_diverged_deferral(
         );
         return;
     }
+    // v0.2.83 WP-B6: hold the shared UPDATE_DEFERRED lock across the tmp-write +
+    // rename so this standalone full-rewrite serializes with every other writer
+    // (Python `deferral_emit` writers, and the other Rust direct writers) on
+    // `<install_path>/.claude/context/.update-deferred.lock`. Standalone by
+    // design (install.py did NOT complete → Python cannot be assumed), so we
+    // take the flock directly in Rust rather than route through Python.
+    // Best-effort (real flock on POSIX, no-lock on Windows). Held until return.
+    let _deferral_lock =
+        vct_launcher_core::services::deferral_lock::lock_folder(install_path);
     let now = chrono::Utc::now().to_rfc3339();
     let install_root_display = install_path.display();
 
@@ -4542,6 +4551,61 @@ mod tests {
         assert!(body.contains("aaaa111"), "local sha must appear");
         assert!(body.contains("bbbb222"), "remote sha must appear");
         assert!(body.contains("python install.py --update"), "CLI recovery");
+    }
+
+    /// WP-B6 (v0.2.83): `write_launcher_update_diverged_deferral` must hold the
+    /// shared UPDATE_DEFERRED flock across its tmp-write + rename. Observable
+    /// proof: hold the SAME folder's flock on a background thread for a fixed
+    /// window; the writer called on the main thread must BLOCK until release, so
+    /// its wall-clock duration is >= the hold window. POSIX-only (no-op flock on
+    /// Windows, symmetric with the Python side). ms-scaled.
+    #[cfg(unix)]
+    #[test]
+    fn launcher_update_diverged_serializes_on_shared_lock() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let install = dir.path().to_path_buf();
+        // Materialise .claude/context so the lockfile's parent exists up-front
+        // (the writer also mkdir's it, but the holder thread needs it first).
+        std::fs::create_dir_all(install.join(".claude/context")).expect("mkdir");
+
+        const HOLD: Duration = Duration::from_millis(300);
+        let folder = install.clone();
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let guard =
+                vct_launcher_core::services::deferral_lock::lock_folder(&folder);
+            ready_tx.send(()).expect("signal ready");
+            std::thread::sleep(HOLD);
+            drop(guard);
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("holder must acquire the lock");
+
+        let started = Instant::now();
+        write_launcher_update_diverged_deferral(
+            &install,
+            "main",
+            LauncherUpdateDivergedKind::GitPullFailed {
+                detail: "fatal: broken repo".into(),
+            },
+        );
+        let waited = started.elapsed();
+
+        assert!(
+            waited >= HOLD - Duration::from_millis(80),
+            "write_launcher_update_diverged_deferral did not block on the shared \
+             lock (waited {waited:?}, expected >= ~{HOLD:?})",
+        );
+        // Write still landed once the lock was free.
+        assert!(
+            install.join(".claude/context/UPDATE_DEFERRED.md").is_file(),
+            "deferral must be written after acquiring the lock"
+        );
+        holder.join().expect("holder joins");
     }
 
     #[test]
