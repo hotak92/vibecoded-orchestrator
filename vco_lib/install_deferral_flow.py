@@ -48,6 +48,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
+from vco_lib.atomic import exclusive_file_lock
+from vco_lib.deferral_emit import LOCK_REL
 from vco_lib.deferral_report import DeferralReport
 
 
@@ -115,14 +117,26 @@ class InstallDeferralFlow:
         install.py's historical behaviour. This is the only ``write`` call
         in the flow — and, by the structural guards, in the whole
         install.py choreography.
+
+        v0.2.83 (WP-B1): the late-merge + write run inside the SHARED
+        deferral file lock (``<folder>/.claude/context/.update-deferred.lock``
+        — the SAME lock ``vco_lib.deferral_emit`` uses). A detached child
+        (codegraph resync, embedding-failure path) that read-modify-writes the
+        report mid-run now serializes against this finalize instead of
+        interleaving its read/write pair with ours and dropping entries. Only
+        mutual exclusion is added — the merge/tombstone semantics are
+        unchanged (the re-merge still reads the child's committed state
+        because the child's write completed under the same lock before we
+        acquired it).
         """
         late_merged = 0
         merge_error: Optional[str] = None
-        try:
-            late_merged = self._merge_foreign_from_disk()
-        except Exception as exc:  # noqa: BLE001 — re-merge is best-effort
-            merge_error = str(exc)
-        wrote_entries = self.report.write(self.folder)
+        with exclusive_file_lock(self.folder / LOCK_REL):
+            try:
+                late_merged = self._merge_foreign_from_disk()
+            except Exception as exc:  # noqa: BLE001 — re-merge is best-effort
+                merge_error = str(exc)
+            wrote_entries = self.report.write(self.folder)
         return FinalizeResult(
             late_merged=late_merged,
             merge_error=merge_error,

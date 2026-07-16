@@ -683,12 +683,13 @@ def _write_failure_deferral(exc: "NoEmbeddingBackendError") -> None:
     if exc.install_root is None:
         return
     try:
-        # Local import: avoid circular-import risk if deferral_report ever
+        # Local import: avoid circular-import risk if deferral_emit ever
         # imports from embedding_service (it doesn't today, but the import
         # is cheap and the safety margin is worth it on the error path).
-        from vco_lib.deferral_report import DeferralEntry, DeferralReport
+        # v0.2.83 (WP-B1): routed through the ONE emitter home
+        # (vco_lib.deferral_emit) — locked read-modify-write.
+        from vco_lib.deferral_emit import DeferralEntry, emit
 
-        report = DeferralReport.read(exc.install_root)
         backends = ", ".join(exc.attempted_backends) or "(none)"
         per_backend_lines: list[str] = []
         for backend, msg in sorted(exc.error_per_backend.items()):
@@ -719,7 +720,8 @@ def _write_failure_deferral(exc: "NoEmbeddingBackendError") -> None:
                 kg_refs.append(str(hint_md))
         kg_refs.append(str(_failure_jsonl_path()))
 
-        report.add_entry(
+        emit(
+            exc.install_root,
             DeferralEntry(
                 condition_id=_DEFERRAL_CONDITION_ID,
                 title="Embedding backend unreachable; KG seed deferred",
@@ -728,9 +730,9 @@ def _write_failure_deferral(exc: "NoEmbeddingBackendError") -> None:
                 command_to_apply=command_to_apply,
                 severity="warning",
                 kg_node_refs=kg_refs,
-            )
+            ),
+            log=logger,
         )
-        report.write(exc.install_root)
     except Exception as e:  # noqa: BLE001 — soft-fail on the error path
         logger.warning("Failed to write embedding failure deferral entry: %s", e)
 
@@ -743,16 +745,13 @@ def _clear_failure_deferral(install_root: Path | None) -> None:
     if install_root is None:
         return
     try:
-        from vco_lib.deferral_report import DeferralReport
+        # v0.2.83 (WP-B1): resolve through the ONE emitter home — the locked
+        # read-modify-write reads the current report, tombstones + drops the
+        # condition, and writes once (deleting the file when empty).
+        # resolve_conditions is a safe no-op when the entry isn't present.
+        from vco_lib.deferral_emit import resolve_conditions
 
-        report = DeferralReport.read(install_root)
-        # mark_resolved is a no-op when the entry isn't present, so this
-        # is safe to call unconditionally.
-        existing_ids = {e.condition_id for e in report.entries}
-        if _DEFERRAL_CONDITION_ID not in existing_ids:
-            return
-        report.mark_resolved(_DEFERRAL_CONDITION_ID)
-        report.write(install_root)
+        resolve_conditions(install_root, (_DEFERRAL_CONDITION_ID,), log=logger)
     except Exception as e:  # noqa: BLE001 — soft-fail; success path must not fail
         logger.debug("Failed to clear embedding failure deferral entry: %s", e)
 
