@@ -1,108 +1,148 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""B-3 (v0.2.73) — cross-language parity for the secret-shaped-key denylist.
+"""Cross-language parity for the secret-shaped-key needle set.
 
-The "is this env key credential-shaped?" needle set is duplicated across FOUR
+The "is this env key credential-shaped?" needle set feeds several
 implementations that MUST agree, or a credential-named key could leak into
-``~/.claude.json`` from one registration path while another drops it (the exact
-leak the denylist exists to prevent — see B-3 finding):
+``~/.claude.json`` from one registration path while another drops it (the
+exact leak the denylist exists to prevent — B-3 finding v0.2.73).
 
-  * ``vco_lib/install_mcp.py::_SECRET_SHAPED_SUBSTRINGS`` (Python, canonical —
-    moved here from install.py by IN-1 in v0.2.73; install.py re-imports it)
-  * ``vco_lib/secrets_audit.py::_SECRET_SHAPED_SUBSTRINGS`` (Python mirror)
-  * ``launcher/src-tauri/src/mcp_registration.rs``       (Rust ``needles`` array)
+v0.2.83 WP-B4 re-anchored this parity on a SINGLE SOURCE OF TRUTH:
+``vco_lib/mcp_scan_rules.toml`` ([env].secret_shaped_needles). The needle
+DATA now lives once in that table; the consumers read it:
 
-Each side already has its OWN unit test, but NONE asserts the Python list ==
-the Rust list. This module is that single durable guard. It does NOT edit the
-needle lists — it parses all three source-of-truth definitions and asserts they
-are byte-identical sets, and that the `KEY`/`*_KEY` extra rule is present in
-every implementation. Full de-dup to one shared source is impractical across
-Rust/Python; a parity test is the right "mirror-don't-fork" enforcement.
+  * ``vco_lib/install_mcp.py::_SECRET_SHAPED_SUBSTRINGS``  — table read
+    (``mcp_scan_rules.secret_shaped_needles()``); install.py re-imports it.
+  * ``launcher/src-tauri/src/mcp_registration.rs``          — table read
+    (``vct_launcher_core::mcp_scan_rules::secret_shaped_needles()`` inside
+    ``is_secret_shaped_env_key``).
+  * ``vco_lib/secrets_audit.py::_SECRET_SHAPED_SUBSTRINGS`` — a DELIBERATE
+    mirror (the secrets-audit subsystem is out of WP-B4's MCP-registration
+    scope). This test keeps it locked to the same set as the table so it
+    can't silently drift.
 
-A future PR that adds e.g. ``CREDENTIAL`` to only one implementation trips this
-test loudly at CI time rather than shipping a silent divergence.
+The segment-split + ``KEY``/``*_KEY`` suffix PREDICATE stays language-local
+(control-flow, not data). This test also asserts that extra rule text is
+present in every implementation.
+
+A future PR that adds e.g. ``CREDENTIAL`` to the table (or to only one
+mirror) trips this test loudly at CI time.
 """
 
 from __future__ import annotations
 
-import re
+import sys
+import tomllib
 from pathlib import Path
 
 import pytest
 
 _REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
 
-# IN-1 (v0.2.73): the canonical _SECRET_SHAPED_SUBSTRINGS definition + the
-# _is_secret_shaped_env_key `KEY`/`*_KEY` rule moved from install.py into
-# vco_lib/install_mcp.py (install.py now re-imports both). The parity guard
-# reads the definition from its new home.
-_INSTALL_MCP_PY = _REPO / "vco_lib" / "install_mcp.py"
+# The cross-language SSOT table.
+_SCAN_RULES_TOML = _REPO / "vco_lib" / "mcp_scan_rules.toml"
+
+# The deliberate secrets-audit mirror (kept in a separate subsystem).
 _SECRETS_AUDIT_PY = _REPO / "vco_lib" / "secrets_audit.py"
-_MCP_REGISTRATION_RS = (
-    _REPO / "launcher" / "src-tauri" / "src" / "mcp_registration.rs"
-)
 
+# The Rust registrar (must reference the loader, not a literal needle array).
+_MCP_REGISTRATION_RS = _REPO / "launcher" / "src-tauri" / "src" / "mcp_registration.rs"
 
-def _parse_python_substrings(source_path: Path) -> set[str]:
-    """Extract the string literals from the ``_SECRET_SHAPED_SUBSTRINGS`` tuple
-    in a Python source file (works for the plain tuple and the ``: Tuple[...]``
-    annotated form)."""
-    text = source_path.read_text(encoding="utf-8")
-    # Match `_SECRET_SHAPED_SUBSTRINGS ... = ( ... )` up to the closing paren.
-    m = re.search(
-        r"_SECRET_SHAPED_SUBSTRINGS[^\n=]*=\s*\((?P<body>.*?)\)",
-        text,
-        re.DOTALL,
-    )
-    assert m is not None, f"could not find _SECRET_SHAPED_SUBSTRINGS in {source_path}"
-    literals = re.findall(r'"([^"]+)"', m.group("body"))
-    return set(literals)
-
-
-def _parse_rust_needles(source_path: Path) -> set[str]:
-    """Extract the string literals from the Rust ``let needles = [ ... ];``
-    array inside ``is_secret_shaped_env_key``."""
-    text = source_path.read_text(encoding="utf-8")
-    m = re.search(r"let\s+needles\s*=\s*\[(?P<body>.*?)\]", text, re.DOTALL)
-    assert m is not None, f"could not find `needles` array in {source_path}"
-    literals = re.findall(r'"([^"]+)"', m.group("body"))
-    return set(literals)
+# The Python MCP-rules loader source (install_mcp reads through it).
+_INSTALL_MCP_PY = _REPO / "vco_lib" / "install_mcp.py"
 
 
 #: The canonical needle set (asserted identical across every implementation).
 _EXPECTED_NEEDLES = {"TOKEN", "SECRET", "PAT", "PASSWORD", "PASS", "AUTH"}
 
 
-def test_install_py_needles_match_expected():
-    assert _parse_python_substrings(_INSTALL_MCP_PY) == _EXPECTED_NEEDLES
+def _table_needles() -> set[str]:
+    """Independent pure-tomllib re-parse of the SSOT table (does NOT import
+    our loader — so a loader bug is caught too)."""
+    data = tomllib.loads(_SCAN_RULES_TOML.read_text(encoding="utf-8"))
+    return set(data["env"]["secret_shaped_needles"])
 
 
-def test_secrets_audit_needles_match_install_py():
-    install = _parse_python_substrings(_INSTALL_MCP_PY)
-    audit = _parse_python_substrings(_SECRETS_AUDIT_PY)
-    assert audit == install, (
+def _parse_python_substrings_literal(source_path: Path) -> set[str]:
+    """Extract the string literals from a ``_SECRET_SHAPED_SUBSTRINGS = ( ... )``
+    tuple literal in a Python source file (used for the deliberate
+    secrets_audit.py mirror, which is still a literal)."""
+    import re
+
+    text = source_path.read_text(encoding="utf-8")
+    m = re.search(
+        r"_SECRET_SHAPED_SUBSTRINGS[^\n=]*=\s*\((?P<body>.*?)\)",
+        text,
+        re.DOTALL,
+    )
+    assert m is not None, f"could not find _SECRET_SHAPED_SUBSTRINGS literal in {source_path}"
+    return set(re.findall(r'"([^"]+)"', m.group("body")))
+
+
+def test_table_needles_match_expected():
+    """The SSOT table itself carries exactly the canonical needle set."""
+    assert _table_needles() == _EXPECTED_NEEDLES
+
+
+def test_install_mcp_sources_needles_from_table():
+    """install_mcp's runtime ``_SECRET_SHAPED_SUBSTRINGS`` equals the table.
+
+    Read at RUNTIME (not by grep) — the value is now a table read, so the
+    old literal-grep is gone. This proves the consumer actually loads the
+    SSOT, not a stale copy."""
+    from vco_lib import install_mcp
+
+    assert set(install_mcp._SECRET_SHAPED_SUBSTRINGS) == _table_needles()
+
+
+def test_install_mcp_does_not_hardcode_a_needle_literal():
+    """install_mcp must NOT re-introduce a literal needle tuple — it reads
+    the table. Guards against a future 'convenience' inline copy."""
+    import re
+
+    text = _INSTALL_MCP_PY.read_text(encoding="utf-8")
+    # A literal assignment would look like `_SECRET_SHAPED_SUBSTRINGS = ("TOKEN", ...)`.
+    literal = re.search(
+        r"_SECRET_SHAPED_SUBSTRINGS[^\n=]*=\s*\(\s*\"",
+        text,
+    )
+    assert literal is None, (
+        "vco_lib/install_mcp.py must source _SECRET_SHAPED_SUBSTRINGS from "
+        "mcp_scan_rules.secret_shaped_needles(), not a hard-coded tuple "
+        "literal (WP-B4 SSOT)."
+    )
+
+
+def test_secrets_audit_mirror_matches_table():
+    """The DELIBERATE secrets_audit.py mirror equals the table's needle set.
+
+    secrets_audit.py belongs to a separate subsystem and keeps its literal;
+    this lock ensures it can't drift from the SSOT."""
+    audit = _parse_python_substrings_literal(_SECRETS_AUDIT_PY)
+    assert audit == _table_needles(), (
         "vco_lib/secrets_audit.py::_SECRET_SHAPED_SUBSTRINGS drifted from "
-        f"vco_lib/install_mcp.py: install={sorted(install)} audit={sorted(audit)}"
+        f"mcp_scan_rules.toml: audit={sorted(audit)} table={sorted(_table_needles())}"
     )
 
 
-def test_rust_needles_match_python():
-    """The Rust mcp_registration.rs needle array MUST equal the Python set."""
-    py = _parse_python_substrings(_INSTALL_MCP_PY)
-    rust = _parse_rust_needles(_MCP_REGISTRATION_RS)
-    assert rust == py, (
-        "launcher/src-tauri/src/mcp_registration.rs `needles` drifted from "
-        f"vco_lib/install_mcp.py::_SECRET_SHAPED_SUBSTRINGS: python={sorted(py)} "
-        f"rust={sorted(rust)}. Update BOTH (mirror-don't-fork)."
+def test_rust_reads_needles_from_table_not_literal():
+    """The Rust registrar's ``is_secret_shaped_env_key`` must read the needle
+    set from the shared loader, NOT a hard-coded array. WP-B4 removed the
+    ``let needles = ["TOKEN", ...]`` literal in favour of a table read."""
+    text = _MCP_REGISTRATION_RS.read_text(encoding="utf-8")
+    assert "mcp_scan_rules::secret_shaped_needles()" in text, (
+        "mcp_registration.rs must obtain needles via "
+        "vct_launcher_core::mcp_scan_rules::secret_shaped_needles() (WP-B4 SSOT)."
     )
+    # And the old literal array must be gone.
+    import re
 
-
-def test_all_three_agree_transitively():
-    """One assertion that pins all three sources to the same set."""
-    install = _parse_python_substrings(_INSTALL_MCP_PY)
-    audit = _parse_python_substrings(_SECRETS_AUDIT_PY)
-    rust = _parse_rust_needles(_MCP_REGISTRATION_RS)
-    assert install == audit == rust == _EXPECTED_NEEDLES
+    assert re.search(r"let\s+needles\s*=\s*\[\s*\"", text) is None, (
+        "mcp_registration.rs still has a literal `let needles = [\"...\"]` "
+        "array — it must read the table instead (WP-B4)."
+    )
 
 
 @pytest.mark.parametrize(
@@ -110,9 +150,9 @@ def test_all_three_agree_transitively():
     [_INSTALL_MCP_PY, _SECRETS_AUDIT_PY, _MCP_REGISTRATION_RS],
 )
 def test_key_extra_rule_present_in_every_impl(source_path):
-    """Every implementation adds the same extra `KEY` / `*_KEY` rule beyond the
-    needle segments. Assert the rule text is present so a copy that drops it
-    (and would then MISS `OPENAI_API_KEY` etc.) trips this test."""
+    """Every implementation adds the same extra `KEY` / `*_KEY` predicate rule
+    beyond the needle segments. Assert the rule text is present so a copy that
+    drops it (and would then MISS `OPENAI_API_KEY` etc.) trips this test."""
     text = source_path.read_text(encoding="utf-8")
     # Python: `upper == "KEY" or upper.endswith("_KEY")`
     # Rust:   `upper == "KEY" || upper.ends_with("_KEY")`

@@ -224,7 +224,16 @@ fn atomic_write_json(path: &Path, value: &serde_json::Value) -> Result<(), Strin
 ///     this global allowlist, the per-project value gets overridden the
 ///     WRONG WAY due to Claude Code's precedence. MUST stay project-scoped.
 ///
-/// MUST stay in sync with install.py::_ALLOWED_GLOBAL_ENV_KEYS.
+/// v0.2.83 WP-B4 — SINGLE SOURCE OF TRUTH is
+/// `vco_lib/mcp_scan_rules.toml` ([env].allowed_global_keys), the SAME file
+/// Python's `_ALLOWED_GLOBAL_ENV_KEYS` reads. This `&[&str]` is a
+/// compiled-in COPY kept for the crate's `&str` call-sites (dashboard.rs
+/// comment ref, the two scan loops below). It is drift-LOCKED to the table
+/// by `mcp_scan_rules_allowed_env_keys_matches_table` (reads the .toml at
+/// test time) + the cross-language `tests/test_mcp_scan_rules_parity.py`.
+/// Edit the .toml, then this copy, then run the tests — they fail loudly on
+/// any mismatch. Do NOT hand-edit this without the .toml (the sanctioned
+/// compiled-copy-with-parity-test pattern, CLAUDE.md A>B>C tier B).
 const ALLOWED_ENV_KEYS: &[&str] = &[
     "WEAVIATE_URL",
     "OLLAMA_URL",
@@ -324,16 +333,20 @@ pub fn resolve_venv_python(install_root: &Path) -> Option<PathBuf> {
 /// `PASS`. Additionally flags exact `KEY` and `*_KEY` (catches
 /// `STRIPE_KEY`, `OPENAI_API_KEY`, etc.).
 ///
-/// MUST stay in sync with the Python mirror in
-/// install.py::_is_secret_shaped_env_key.
+/// v0.2.83 WP-B4: the needle DATA is SOURCED from
+/// `vco_lib/mcp_scan_rules.toml` ([env].secret_shaped_needles) via the core
+/// loader — the SAME table Python's `_SECRET_SHAPED_SUBSTRINGS` reads. The
+/// segment-split + `KEY`/`*_KEY` suffix PREDICATE below stays language-local
+/// (it is control-flow, not data). `tests/test_secret_shaped_needles_parity.py`
+/// anchors every impl on the table.
 pub fn is_secret_shaped_env_key(key: &str) -> bool {
     let upper = key.to_ascii_uppercase();
-    let needles = ["TOKEN", "SECRET", "PAT", "PASSWORD", "PASS", "AUTH"];
+    let needles = vct_launcher_core::mcp_scan_rules::secret_shaped_needles();
     // Split into segments on `_` and `-`, then check each segment for an
     // exact match against the needle list.
     let segments: Vec<&str> = upper.split(|c: char| c == '_' || c == '-').collect();
     for needle in needles.iter() {
-        if segments.iter().any(|s| s == needle) {
+        if segments.iter().any(|s| *s == needle.as_str()) {
             return true;
         }
     }
@@ -526,13 +539,24 @@ pub fn build_default_mcp_entries(
 }
 
 /// Names of the bundled MCPs whose canonical `~/.claude.json` entries are
-/// composed by `build_default_mcp_entries`. Single source of truth for
-/// "which ids must be (re)registered with the canonical builder shape" —
-/// the GUI toggle path (`dashboard.rs::toggle_mcp_server_inner`) and the
-/// stale-rewrite partition below both consult this list, and the
+/// composed by `build_default_mcp_entries`. The set that "which ids must be
+/// (re)registered with the canonical builder shape" — the GUI toggle path
+/// (`dashboard.rs::toggle_mcp_server_inner`) and the stale-rewrite partition
+/// below both consult this list, and the
 /// `default_mcp_entry_names_matches_builder_output` unit test pins it
 /// against the builder's actual output so the two cannot drift (the
 /// pre-v0.2.73 catalog disagreements are audit findings F-1/F-2/F-3).
+///
+/// v0.2.83 WP-B4 — SINGLE SOURCE OF TRUTH is
+/// `vco_lib/mcp_scan_rules.toml` ([entries].default_names), the SAME file
+/// Python's `_DEFAULT_MCP_ENTRY_NAMES` reads. This `&[&str]` is a
+/// compiled-in COPY kept for the crate's `&str` call-sites (maintenance.rs
+/// tests iterate + `.contains` it, the rewrite partition below borrows it).
+/// It is drift-LOCKED to the table by
+/// `mcp_scan_rules_default_entry_names_matches_table` (reads the .toml at
+/// test time) + the cross-language `tests/test_mcp_scan_rules_parity.py`.
+/// Edit the .toml, then this copy, then run the tests (sanctioned
+/// compiled-copy-with-parity-test pattern, CLAUDE.md A>B>C tier B).
 pub const DEFAULT_MCP_ENTRY_NAMES: &[&str] =
     &["weaviate-kg", "search", "playwright", "mermaid", "excalidraw"];
 
@@ -1171,6 +1195,64 @@ mod tests {
             "DEFAULT_MCP_ENTRY_NAMES must equal build_default_mcp_entries output (same order)"
         );
         fs::remove_dir_all(&root).ok();
+    }
+
+    // ── v0.2.83 WP-B4: compiled-copy ⇄ table drift locks ────────────────
+    //
+    // ALLOWED_ENV_KEYS and DEFAULT_MCP_ENTRY_NAMES are compiled-in `&[&str]`
+    // copies of DATA whose single source of truth is
+    // `vco_lib/mcp_scan_rules.toml`. These tests read the committed .toml at
+    // test time and assert the compiled copies equal it — so a table edit
+    // that isn't mirrored into the copy (or vice-versa) fails loudly. The
+    // sanctioned compiled-copy-with-parity-test pattern (CLAUDE.md A>B>C B).
+    //
+    // Both go through `vct_launcher_core::mcp_scan_rules::RULES`, the same
+    // compile-time-embedded loader `is_secret_shaped_env_key`'s needles read
+    // at runtime — so all three consumers agree with the table.
+
+    #[test]
+    fn mcp_scan_rules_allowed_env_keys_matches_table() {
+        let table = vct_launcher_core::mcp_scan_rules::allowed_global_env_keys();
+        let compiled: Vec<&str> = ALLOWED_ENV_KEYS.to_vec();
+        let from_table: Vec<&str> = table.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            compiled, from_table,
+            "ALLOWED_ENV_KEYS (compiled) drifted from \
+             mcp_scan_rules.toml [env].allowed_global_keys. Edit the .toml \
+             and this const together."
+        );
+    }
+
+    #[test]
+    fn mcp_scan_rules_default_entry_names_matches_table() {
+        let table = vct_launcher_core::mcp_scan_rules::default_mcp_entry_names();
+        let compiled: Vec<&str> = DEFAULT_MCP_ENTRY_NAMES.to_vec();
+        let from_table: Vec<&str> = table.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            compiled, from_table,
+            "DEFAULT_MCP_ENTRY_NAMES (compiled) drifted from \
+             mcp_scan_rules.toml [entries].default_names. Edit the .toml \
+             and this const together."
+        );
+    }
+
+    #[test]
+    fn is_secret_shaped_reads_needles_from_table() {
+        // The predicate's needle DATA comes from the table — a smoke check
+        // that a key built from a table needle is flagged, and a non-needle
+        // env key is not. (The full needle-set parity lives in
+        // tests/test_secret_shaped_needles_parity.py.)
+        let needles = vct_launcher_core::mcp_scan_rules::secret_shaped_needles();
+        assert!(!needles.is_empty(), "needle table must be non-empty");
+        for n in needles.iter() {
+            let key = format!("MY_{}", n);
+            assert!(
+                is_secret_shaped_env_key(&key),
+                "a key ending in table needle `{}` must be flagged",
+                n
+            );
+        }
+        assert!(!is_secret_shaped_env_key("WEAVIATE_URL"));
     }
 
     /// F-2: the per-id helper composes the SAME canonical entry the
