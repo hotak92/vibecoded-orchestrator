@@ -160,6 +160,25 @@ class WheelPackagingTests(unittest.TestCase):
             "test's module docstring.",
         )
 
+    def test_wheel_includes_mcp_scan_rules_toml(self) -> None:
+        """v0.2.83 WP-B4: ``mcp_scan_rules.toml`` (the cross-language MCP
+        scan/registration rule table) MUST be a member of the built wheel.
+        Without it, ``vco_lib.mcp_scan_rules.load_mcp_scan_rules()`` raises
+        RuntimeError at import of ``install_mcp`` (which reads the table for
+        its allowlist / needles / entry-names / deprecated registry) →
+        install / MCP-registration path breaks. Same wheel-inclusion
+        discipline as ``bundled_mcp_versions.toml``."""
+        assert self.wheel_path is not None
+        with zipfile.ZipFile(self.wheel_path) as z:
+            names = z.namelist()
+        self.assertIn(
+            "vco_lib/mcp_scan_rules.toml", names,
+            "vco_lib/mcp_scan_rules.toml MUST be inside the wheel. Without "
+            "it, vco_lib.install_mcp raises RuntimeError at import (it reads "
+            "the table for the env allowlist, secret needles, default entry "
+            "names, and deprecated registry).",
+        )
+
     def test_wheel_includes_excalidraw_vendored_entrypoint(self) -> None:
         """The Excalidraw wrapper proxy spawns Node on
         ``vco_lib/excalidraw_mcp_fork/dist/mcp/index.js``. That file

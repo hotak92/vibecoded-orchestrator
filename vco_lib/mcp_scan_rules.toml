@@ -1,0 +1,194 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# MCP scan / registration rule DATA — cross-language single source of truth
+# (v0.2.83 WP-B4). One committed table both Rust and Python PARSE.
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# ## Why this file exists (A>B>C rule, CLAUDE.md "Share, don't mirror")
+#
+# The MCP scan/registration rule DATA used to live TWICE — once in Rust
+# (`launcher/src-tauri/src/mcp_registration.rs` + `vct-launcher-core/src/db/
+# project_mcp_servers.rs`) and once in Python (`vco_lib/install_mcp.py` +
+# `install.py`). WP-B3 pinned both sides with tests, but two hand-maintained
+# copies of the SAME data always drift (they already had — see the DRIFT NOTES
+# below). This file eliminates the mirror at the SOURCE by tier (B) of the
+# A>B>C rule: ONE committed rule table both languages parse at load time.
+#
+# Tier (A) — shared Python-SSOT-via-subprocess — was REJECTED here: the
+# launcher is the REPAIR tool; it must build these rule sets even when the
+# project venv is broken, so it cannot shell out to Python to get them.
+#
+# Tier (B) — this file. Rust embeds it at COMPILE time via `include_str!`
+# (zero runtime failure mode: the table ships in the repo the launcher is
+# built from — exactly the `bundled_mcp_versions.toml` precedent). Python
+# parses it at runtime with `tomllib` and LOUD-FAILS if it is missing (the
+# vco_lib invariant: a broken install is broken, never silently degraded).
+#
+# ## Loaders (parse THIS file — never re-type its contents in code)
+#
+#   * Rust:   launcher/src-tauri/vct-launcher-core/src/mcp_scan_rules.rs
+#             (include_str! at compile time; consumed by mcp_registration.rs
+#              in the main crate + project_mcp_servers.rs in this crate)
+#   * Python: vco_lib/mcp_scan_rules.py  (tomllib; consumed by
+#             vco_lib/install_mcp.py + install.py)
+#   * Parity: tests/test_mcp_scan_rules_parity.py (triangulation: independent
+#             re-parse == Python loader; grep-pins the Rust include path) and
+#             launcher/src-tauri/tests/mcp_scan_rules_parity.rs (Rust-visible
+#             rules == this committed file, read at test time).
+#
+# ## Propagation
+#
+# Listed in `orchestrator-managed-paths.txt` so `update_orchestrator_at`
+# pushes new editions of this table into every existing install (same as
+# bundled_mcp_versions.toml).
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# INVENTORY — every rule datum that WAS double-homed, classified.
+# (see WP-B4 report for the full file:line map)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# EXTRACTED here (tier B), was mirrored, now single-homed:
+#   • [env].allowed_global_keys       ← Rust ALLOWED_ENV_KEYS
+#                                        ⇄ Python _ALLOWED_GLOBAL_ENV_KEYS
+#   • [env].secret_shaped_needles     ← Rust `needles` array
+#                                        ⇄ Python _SECRET_SHAPED_SUBSTRINGS
+#   • [entries].default_names         ← Rust DEFAULT_MCP_ENTRY_NAMES
+#                                        ⇄ Python _build_python_mcp_entries order
+#                                        (+ FIXES the drifted install.py:21662
+#                                         stale copy `{weaviate-kg, search}`)
+#   • [bundled].all_names             ← Rust BUNDLED_MCP_NAMES
+#                                        ⇄ Python install.py uninstall scrub set
+#                                        (+ FIXES that drifted copy too)
+#   • [bundled].default_disabled      ← Rust BUNDLED_MCP_DEFAULT_DISABLED
+#   • [deprecated.*]                  ← Python _DEPRECATED_DEFAULT_MCPS
+#                                        (Python-only today; data lives here so
+#                                         a future Rust consumer reads the same)
+#
+# STAYED language-local (pure control-flow / not DATA — DELIBERATELY not here):
+#   • is_secret_shaped_env_key() segment-split logic, the `KEY`/`*_KEY` suffix
+#     rule → identical PREDICATE in both languages; only its needle DATA is
+#     shared. The predicate is control-flow, so it stays mirrored (its data
+#     input comes from [env].secret_shaped_needles). A separate parity test
+#     (test_secret_shaped_needles_parity.py) already locks the `KEY` rule text.
+#   • filter_env_for_global_json / _filter_env_for_global_json → control-flow
+#     over [env].allowed_global_keys.
+#   • The stale-path anchor tokens ("claude_mcp_servers", ".venv") + absolute-
+#     path prefixes ("/","C:\\",...) in scan_stale_mcp_entries: these are
+#     scan HEURISTIC constants tightly coupled to per-language path handling
+#     (Rust `fs::canonicalize` vs Python `Path.resolve`); moving them here
+#     buys little and risks divergent interpretation. Left mirrored; noted for
+#     a possible future pass if they ever grow.
+#   • Per-MCP ENTRY SHAPES (command/args/env for weaviate-kg, search's
+#     wrapper.sh-vs-python OS branch, the wrapper `-m module` args, playwright
+#     npx args): these are BUILD LOGIC with OS branching + path composition,
+#     not flat rule data. build_default_mcp_entries / _build_python_mcp_entries
+#     stay mirrored (already parity-tested by shape assertions); only their
+#     NAME LIST + ordering is sourced from [entries].default_names.
+#   • Default service PORTS (DEFAULT_WEAVIATE_PORT etc.): owned by the
+#     installer.rs / install.py port-resolution subsystem (FORBIDDEN file
+#     installer.rs), out of WP-B4 scope. Not moved.
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# SCHEMA (format_version 1)
+# ═══════════════════════════════════════════════════════════════════════════
+
+format_version = 1
+
+# ── Env-key gates for ~/.claude.json mcpServers.*.env ──────────────────────
+[env]
+# Allowlist of env keys that MAY be written into ~/.claude.json
+# mcpServers.*.env. Everything else (per-project keys, secrets) is dropped.
+# ORDER IS SIGNIFICANT to the Python tuple / Rust slice equality tests —
+# keep it stable.
+#
+# CRITICAL CONTRACT (Issue H.1, mcp-instability audit 2026-05-16): Claude
+# Code applies ~/.claude.json mcpServers.*.env keys LAST to MCP subprocesses,
+# so they WIN against .claude/settings.json env. Only TRULY machine-invariant
+# keys belong here (service URLs/ports, PYTHONPATH, ACTIVE_EMBEDDING).
+# Removed in PR-43: RL_SERVER_URL, EMBEDDING_MODEL (per-project overrides).
+allowed_global_keys = [
+    "WEAVIATE_URL",
+    "OLLAMA_URL",
+    "GRPC_PORT",
+    "PYTHONPATH",
+    "ACTIVE_EMBEDDING",
+    "CODE_EMBED_SERVICE_URL",
+]
+
+# Credential-shaped needle SEGMENTS. A key is secret-shaped if ANY of these
+# appears as a whole `_`/`-`-delimited segment (so PYTHONPATH does NOT match
+# PAT, COMPASS does NOT match PASS). The predicate ALSO flags exact `KEY` and
+# `*_KEY` — that suffix rule is control-flow, NOT data, so it stays in each
+# language's is_secret_shaped_env_key (locked by the needles parity test).
+secret_shaped_needles = [
+    "TOKEN",
+    "SECRET",
+    "PAT",
+    "PASSWORD",
+    "PASS",
+    "AUTH",
+]
+
+# ── Builder-composed default MCP entries ───────────────────────────────────
+[entries]
+# The MCPs whose canonical ~/.claude.json entries are composed by the entry
+# builder (Rust build_default_mcp_entries / Python _build_python_mcp_entries).
+# ORDER IS SIGNIFICANT: the builders emit entries in this order and both
+# sides' shape tests assert `names == this list`. This is the "which ids does
+# the registrar own / can rewrite" set — the rewrite-partition + toggle path
+# consult it.
+#
+# NOT the same as [bundled].all_names below: this is the narrower set the
+# entry BUILDER produces. code-embedding / ollama / vct-coordination are
+# orchestrator-shipped (bundled) but NOT builder-composed, so they are in
+# all_names but NOT here.
+default_names = [
+    "weaviate-kg",
+    "search",
+    "playwright",
+    "mermaid",
+    "excalidraw",
+]
+
+# ── Full orchestrator-shipped MCP name set ─────────────────────────────────
+[bundled]
+# Every MCP name the orchestrator ships. Used for (a) is_user_added
+# classification (anything NOT here is user-added → Custom-MCP tab), and
+# (b) the uninstall scrub (only these names are removed from ~/.claude.json;
+# the user's own MCPs are left alone). SUPERSET of [entries].default_names.
+# Keep sorted.
+all_names = [
+    "code-embedding",
+    "excalidraw",
+    "mermaid",
+    "ollama",
+    "playwright",
+    "search",
+    "vct-coordination",
+    "weaviate-kg",
+]
+
+# Bundled MCPs that ship DEFAULT-DISABLED per project (user opts in via the
+# launcher GUI). Every name here MUST also be in all_names. Keep narrow.
+default_disabled = [
+    "excalidraw",
+    "mermaid",
+]
+
+# ── Deprecated-default MCP registry ────────────────────────────────────────
+# MCPs that used to be in the default install set but were dropped. On every
+# --update, ~/.claude.json is scanned for these names; a match whose command
+# path is INSIDE install_root ("our" entry) gets a consent-prompted-removal
+# deferral. Python-only consumer today (_DEPRECATED_DEFAULT_MCPS); the data
+# lives here so a future Rust consumer reads the identical registry.
+#
+# One [deprecated.<name>] table per deprecated MCP. Fields:
+#   removed_in      — release the MCP left the default set
+#   reason          — human-readable why (shown in the deferral)
+#   opt_in_manifest — bundled-module manifest to re-add it, if any
+[deprecated.ollama]
+removed_in = "v0.2.11"
+reason = "Ollama MCP server dropped from default install (PR-14a). The tools it exposed (chat / read_document / read_image) are redundant with Claude's native capabilities. Ollama remains as embedding infrastructure (Weaviate vectorizers); only the MCP tool-surface was removed."
+opt_in_manifest = "launcher/bundled_manifests/vct-ollama.json"

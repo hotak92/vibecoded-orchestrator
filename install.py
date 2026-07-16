@@ -19031,6 +19031,7 @@ def _check_search_mcp_env_obsolete(
 
 from vco_lib.install_mcp import (  # noqa: E402
     _ALLOWED_GLOBAL_ENV_KEYS,
+    _DEFAULT_MCP_ENTRY_NAMES,
     _DEPRECATED_DEFAULT_MCPS,
     _SECRET_SHAPED_SUBSTRINGS,
     _build_python_mcp_entries,
@@ -21654,12 +21655,20 @@ def _rewrite_stale_mcp_entries(
 
     # Hand off to the same writer the fresh install uses. We call
     # `_register_mcps` directly — it will overwrite ONLY the bundled
-    # entries (weaviate-kg, search). Stale entries with those exact
-    # names get overwritten by definition; non-bundled stale entries
-    # (e.g. a hand-added MCP at an old install path) are NOT in the
-    # bundled set and therefore NOT touched. We surface that asymmetry
-    # in the report.
-    bundled_names = {"weaviate-kg", "search"}
+    # entries. Stale entries with those exact names get overwritten by
+    # definition; non-bundled stale entries (e.g. a hand-added MCP at an
+    # old install path) are NOT in the bundled set and therefore NOT
+    # touched. We surface that asymmetry in the report.
+    #
+    # v0.2.83 WP-B4: this set is now sourced from the cross-language rule
+    # table (mcp_scan_rules.toml [entries].default_names) via
+    # `_DEFAULT_MCP_ENTRY_NAMES` — the SAME set the Rust rewrite partition
+    # uses (mcp_registration.rs::DEFAULT_MCP_ENTRY_NAMES). The prior
+    # hand-typed `{"weaviate-kg", "search"}` had DRIFTED (missing
+    # playwright/mermaid/excalidraw), so an accepted stale mermaid/
+    # excalidraw/playwright entry was wrongly reported "not rewritten" —
+    # the exact drift F-2 fixed on the Rust side in v0.2.73.
+    bundled_names = set(_DEFAULT_MCP_ENTRY_NAMES)
     non_bundled_accepted = [n for n in accepted if n not in bundled_names]
     bundled_accepted = [n for n in accepted if n in bundled_names]
 
@@ -21685,7 +21694,7 @@ def _rewrite_stale_mcp_entries(
     if non_bundled_accepted:
         summary_lines.append(
             "Accepted but NOT rewritten (entry name is outside the bundled "
-            f"set — orchestrator owns weaviate-kg/search only): "
+            f"set — orchestrator owns {', '.join(sorted(bundled_names))}): "
             f"{', '.join(non_bundled_accepted)}. "
             "Edit ~/.claude.json manually if you want these repointed."
         )

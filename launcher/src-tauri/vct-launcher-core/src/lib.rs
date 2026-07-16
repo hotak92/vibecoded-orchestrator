@@ -18,6 +18,13 @@ pub mod db;
 // supervisor-image-resolution-variant-gap-2026-06-04.md.
 pub mod licensing;
 pub mod manifest;
+// v0.2.83 WP-B4: cross-language MCP scan/registration rule table loader.
+// Promoted into the core crate (like `bundled_versions`) so BOTH the
+// launcher app crate's `mcp_registration.rs` AND this crate's
+// `db/project_mcp_servers.rs` can read the same committed
+// `vco_lib/mcp_scan_rules.toml` (one home for the rule DATA). Rust embeds
+// the .toml at compile time via `include_str!`; Python parses the same file.
+pub mod mcp_scan_rules;
 pub mod orchestrator_manifest;
 pub mod paths;
 pub mod process;

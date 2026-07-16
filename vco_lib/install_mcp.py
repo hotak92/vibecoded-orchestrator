@@ -37,6 +37,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from vco_lib import mcp_scan_rules
 from vco_lib.deferral_report import DeferralEntry, DeferralReport
 
 
@@ -74,41 +75,44 @@ from vco_lib.deferral_report import DeferralEntry, DeferralReport
 # confirming the per-project env channel is sufficient.
 # ---------------------------------------------------------------------------
 
-# Env-key allowlist for ~/.claude.json mcpServers.*.env. MUST stay in sync
-# with launcher/src-tauri/src/mcp_registration.rs::ALLOWED_ENV_KEYS.
+# Env-key allowlist for ~/.claude.json mcpServers.*.env.
+#
+# v0.2.83 WP-B4: this list is now SOURCED from the cross-language rule table
+# ``vco_lib/mcp_scan_rules.toml`` ([env].allowed_global_keys) — the SAME file
+# ``launcher/src-tauri/src/mcp_registration.rs`` embeds via ``include_str!``.
+# One committed table, both languages parse it (A>B>C tier B). It is no longer
+# a hand-maintained literal that must "stay in sync" with the Rust copy — a
+# parity test (tests/test_mcp_scan_rules_parity.py) locks both sides to the
+# table. See the .toml header for the full rationale.
 #
 # CRITICAL CONTRACT (see Issue H.1 from mcp-instability audit 2026-05-16):
 # Anthropic semantics say "project scope overrides user scope" for env
 # vars, but Claude Code applies ~/.claude.json mcpServers.*.env keys LAST
 # to MCP subprocesses — so they WIN against .claude/settings.json env.
-# This is the wrong direction for any per-project-varying value.
-#
-# Therefore this allowlist is restricted to keys that are TRULY
-# machine-invariant (same value across every workspace on the user's
-# machine): service URLs/ports, PYTHONPATH (resolves to the install_root),
-# and ACTIVE_EMBEDDING (the embedding-mode toggle is machine-wide because
-# it determines which named-vector Weaviate column is queried).
-#
-# Removed in PR-43 (post-PR-23): RL_SERVER_URL (varies per user setup —
-# the maintainer install runs a dedicated port-11442 service, MAO uses 11439, etc.),
-# EMBEDDING_MODEL (users may want per-project override; if it's in this
-# global allowlist, the per-project .claude/settings.json env value gets
-# overridden the WRONG WAY due to Claude Code's precedence).
-_ALLOWED_GLOBAL_ENV_KEYS = (
-    "WEAVIATE_URL",
-    "OLLAMA_URL",
-    "GRPC_PORT",
-    "PYTHONPATH",
-    "ACTIVE_EMBEDDING",
-    "CODE_EMBED_SERVICE_URL",
-)
+# This is the wrong direction for any per-project-varying value. The
+# allowlist is therefore restricted to keys that are TRULY machine-invariant
+# (service URLs/ports, PYTHONPATH, ACTIVE_EMBEDDING). Removed in PR-43:
+# RL_SERVER_URL, EMBEDDING_MODEL (per-project overrides). Edit the .toml to
+# change this set, never here.
+_ALLOWED_GLOBAL_ENV_KEYS = mcp_scan_rules.allowed_global_env_keys()
 
-# Patterns that MUST be silently dropped (secrets). Case-insensitive
-# substring match for the "contains" group; plus the explicit `_KEY` /
-# `KEY` rule for the suffix group. Mirrors mcp_registration.rs.
-_SECRET_SHAPED_SUBSTRINGS = (
-    "TOKEN", "SECRET", "PAT", "PASSWORD", "PASS", "AUTH",
-)
+# Credential-shaped needle segments that MUST be dropped (secrets).
+# v0.2.83 WP-B4: sourced from ``vco_lib/mcp_scan_rules.toml``
+# ([env].secret_shaped_needles) — the same table the Rust ``needles`` array
+# reads. The segment-split + ``KEY``/``*_KEY`` suffix PREDICATE below stays
+# language-local (it is control-flow, not data); only its needle DATA is
+# shared. tests/test_secret_shaped_needles_parity.py anchors every impl on
+# the table.
+_SECRET_SHAPED_SUBSTRINGS = mcp_scan_rules.secret_shaped_needles()
+
+# The MCP ids whose ~/.claude.json entries are composed by the entry builder
+# below (the registrar-owned / rewritable set). v0.2.83 WP-B4: sourced from
+# ``vco_lib/mcp_scan_rules.toml`` ([entries].default_names) — the SAME set
+# ``mcp_registration.rs::DEFAULT_MCP_ENTRY_NAMES`` reads. Callers that used to
+# hand-type ``{"weaviate-kg", "search"}`` (a drifted subset — see the
+# install.py rewrite-partition) MUST use this instead. ``_build_python_mcp_
+# entries`` asserts its emit order equals this list so the two cannot drift.
+_DEFAULT_MCP_ENTRY_NAMES: tuple[str, ...] = mcp_scan_rules.default_mcp_entry_names()
 
 
 #: FN-5b (2026-07-14): weaviate_mcp submodules the code-graph analyzer + the
@@ -316,13 +320,26 @@ def _build_python_mcp_entries(
         "env": excalidraw_env,
     }
 
-    return [
+    entries = [
         ("weaviate-kg", weaviate_entry, weaviate_dropped),
         ("search", search_entry, search_dropped),
         ("playwright", playwright_entry, playwright_dropped),
         ("mermaid", mermaid_entry, mermaid_dropped),
         ("excalidraw", excalidraw_entry, excalidraw_dropped),
     ]
+    # WP-B4 drift guard: the builder's emit ORDER must equal the table's
+    # [entries].default_names. The entry SHAPES (command/args/env, OS
+    # branching) stay language-local build logic — only the name list +
+    # ordering is sourced from the table. A new bundled MCP added to the
+    # builder but not the table (or vice-versa) trips this immediately.
+    emitted_names = tuple(name for name, _, _ in entries)
+    if emitted_names != _DEFAULT_MCP_ENTRY_NAMES:
+        raise RuntimeError(
+            "MCP entry builder drifted from mcp_scan_rules.toml "
+            f"[entries].default_names: builder emits {emitted_names}, table "
+            f"says {_DEFAULT_MCP_ENTRY_NAMES}. Update both in one commit."
+        )
+    return entries
 
 
 def _python_fallback_write_mcp_entries(
@@ -672,25 +689,15 @@ def _consent_for_stale_entries(
 #: Registry of MCPs that used to be in the default install set but were
 #: later removed.  Any entry in this dict will be scanned for in
 #: ~/.claude.json on every --update run.
-_DEPRECATED_DEFAULT_MCPS: dict[str, dict] = {
-    "ollama": {
-        "removed_in": "v0.2.11",
-        "reason": (
-            "Ollama MCP server dropped from default install (PR-14a). "
-            "The tools it exposed (chat / read_document / read_image) are "
-            "redundant with Claude's native capabilities. Ollama remains as "
-            "embedding infrastructure (Weaviate vectorizers); only the MCP "
-            "tool-surface was removed."
-        ),
-        "opt_in_manifest": "launcher/bundled_manifests/vct-ollama.json",
-    },
-    # Future deprecations go here, e.g.:
-    # "coordination": {
-    #     "removed_in": "vX.Y.Z",
-    #     "reason": "...",
-    #     "opt_in_manifest": "launcher/bundled_manifests/vct-coordination.json",
-    # },
-}
+#:
+#: v0.2.83 WP-B4: sourced from ``vco_lib/mcp_scan_rules.toml`` ([deprecated.*])
+#: — one committed table both Rust and Python parse. Add a future deprecation
+#: as a ``[deprecated.<name>]`` table there, NOT here. Each value carries
+#: ``removed_in`` / ``reason`` / ``opt_in_manifest`` (empty string when a
+#: field is absent). Shape is identical to the pre-WP-B4 literal so every
+#: consumer (``_scan_deprecated_mcp_entries`` / ``_detect_deprecated_mcp_
+#: entries``) is unchanged.
+_DEPRECATED_DEFAULT_MCPS: dict[str, dict] = mcp_scan_rules.deprecated_default_mcps()
 
 
 def _scan_deprecated_mcp_entries(
