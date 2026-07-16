@@ -34,14 +34,15 @@ THIS test guards:
     literals equal the table (grep the source, so a drift trips without
     spawning cargo).
 
-PENDING FOLLOW-UP (NOT asserted here, by design): ``mcp_scan_rules.toml`` is
-NOT yet listed in ``orchestrator-managed-paths.txt``. Adding it (so
-``update_orchestrator_at`` propagates table edits to existing installs)
-requires a coordinated 3-line change that touches ``installer.rs`` — a file
-outside WP-B4's ownership. It is reported as a sequenced follow-up. Until
-then the table still ships from install time (it lives in the repo / wheel);
-only the incremental propagation of table EDITS to already-installed clones
-is deferred. See the WP-B4 report.
+PROPAGATION (v0.2.83 WP-B5, gap now CLOSED): ``mcp_scan_rules.toml`` is listed
+in ``orchestrator-managed-paths.txt`` so ``update_orchestrator_at`` propagates
+future table EDITS into every existing install (same self-propagating shape as
+``bundled_mcp_versions.toml``). WP-B4 left this deferred because it needed a
+coordinated 3-line change touching ``installer.rs`` (the managed-paths test
+constant); WP-B5 landed it. ``test_table_is_in_managed_paths`` below now
+asserts it, and ``tests/test_install_managed_paths.py`` /
+``tests/test_managed_paths_consistency.py`` pin the .txt ↔ Python ↔ Rust
+three-way consistency.
 
 If a future refactor changes either parser (or a compiled copy) without
 updating the .toml, one of these guards trips first.
@@ -197,10 +198,97 @@ class McpScanRulesParityTests(unittest.TestCase):
             "[entries].default_names. Update both in one commit.",
         )
 
-    # NOTE: a `test_table_is_in_managed_paths` assertion is deliberately
-    # ABSENT — adding mcp_scan_rules.toml to orchestrator-managed-paths.txt
-    # requires editing installer.rs (out of WP-B4 ownership). Reported as a
-    # sequenced follow-up; see the module docstring.
+    # ── WP-B5: propagation gap closed ──────────────────────────────────
+    def test_table_is_in_managed_paths(self) -> None:
+        """v0.2.83 WP-B5: mcp_scan_rules.toml is now listed in
+        orchestrator-managed-paths.txt so update_orchestrator_at propagates
+        future table edits to existing installs. (The .txt ↔ Python ↔ Rust
+        three-way consistency is pinned by test_install_managed_paths.py /
+        test_managed_paths_consistency.py; here we just assert the entry is
+        present in the source-of-truth file.)"""
+        managed = (REPO_ROOT / "orchestrator-managed-paths.txt").read_text(
+            encoding="utf-8"
+        )
+        entries = {
+            ln.strip()
+            for ln in managed.splitlines()
+            if ln.strip() and not ln.strip().startswith("#")
+        }
+        self.assertIn(
+            "vco_lib/mcp_scan_rules.toml", entries,
+            "mcp_scan_rules.toml must be in orchestrator-managed-paths.txt so "
+            "table edits propagate to existing installs (WP-B5).",
+        )
+
+    # ── WP-B5: Set Y (uninstall scrub) + Set Z (bundled name sets) ─────
+    def test_uninstall_scrub_names_match_table(self) -> None:
+        from vco_lib import install_mcp
+
+        table = tuple(_independent_parse()["bundled"]["uninstall_scrub_names"])
+        self.assertEqual(tuple(install_mcp._UNINSTALL_SCRUB_MCP_NAMES), table)
+        self.assertEqual(
+            mcp_scan_rules.uninstall_scrub_mcp_names(), table
+        )
+
+    def test_uninstall_scrub_shape_gated_match_table(self) -> None:
+        from vco_lib import install_mcp
+
+        table = set(_independent_parse()["bundled"]["uninstall_scrub_shape_gated"])
+        self.assertEqual(set(install_mcp._UNINSTALL_SCRUB_SHAPE_GATED), table)
+        self.assertEqual(
+            set(mcp_scan_rules.uninstall_scrub_shape_gated_mcp_names()), table
+        )
+
+    def test_shape_gated_is_subset_of_scrub_names(self) -> None:
+        parsed = _independent_parse()["bundled"]
+        self.assertTrue(
+            set(parsed["uninstall_scrub_shape_gated"]).issubset(
+                set(parsed["uninstall_scrub_names"])
+            ),
+            "every shape-gated name must also be an uninstall scrub name",
+        )
+
+    def test_scrub_set_is_distinct_from_registration_set(self) -> None:
+        # The scrub set carries VCO-exclusive ids whose rationale differs
+        # from the builder-composed set — it must NOT be silently unified
+        # with default_names. code-embedding (backend service) and
+        # vct-coordination (Pro-tier) are in the scrub set but NOT the
+        # builder set.
+        parsed = _independent_parse()
+        scrub = set(parsed["bundled"]["uninstall_scrub_names"])
+        default_names = set(parsed["entries"]["default_names"])
+        self.assertIn("code-embedding", scrub)
+        self.assertIn("vct-coordination", scrub)
+        self.assertNotIn("code-embedding", default_names)
+        self.assertNotIn("vct-coordination", default_names)
+
+    def test_bundled_names_accessor_matches_table(self) -> None:
+        table_all = tuple(_independent_parse()["bundled"]["all_names"])
+        self.assertEqual(mcp_scan_rules.bundled_mcp_names(), table_all)
+        table_dis = tuple(_independent_parse()["bundled"]["default_disabled"])
+        self.assertEqual(mcp_scan_rules.default_disabled_mcp_names(), table_dis)
+
+    def test_rust_bundled_mcp_names_match_table(self) -> None:
+        # The compiled Rust BUNDLED_MCP_NAMES / BUNDLED_MCP_DEFAULT_DISABLED
+        # literals (project_mcp_servers.rs) must equal the table — the
+        # compiled-copy-drift shape used for ALLOWED_ENV_KEYS. A same-crate
+        # cargo test also pins this; grep-pinning here trips without cargo.
+        rust_path = (
+            REPO_ROOT / "launcher" / "src-tauri" / "vct-launcher-core"
+            / "src" / "db" / "project_mcp_servers.rs"
+        )
+        src = rust_path.read_text(encoding="utf-8")
+        rust_all = _rust_string_array(src, "BUNDLED_MCP_NAMES")
+        rust_dis = _rust_string_array(src, "BUNDLED_MCP_DEFAULT_DISABLED")
+        self.assertEqual(
+            rust_all, list(_independent_parse()["bundled"]["all_names"]),
+            "Rust BUNDLED_MCP_NAMES drifted from [bundled].all_names.",
+        )
+        self.assertEqual(
+            rust_dis, list(_independent_parse()["bundled"]["default_disabled"]),
+            "Rust BUNDLED_MCP_DEFAULT_DISABLED drifted from "
+            "[bundled].default_disabled.",
+        )
 
 
 if __name__ == "__main__":

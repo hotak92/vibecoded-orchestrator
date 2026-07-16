@@ -19043,6 +19043,7 @@ from vco_lib.install_mcp import (  # noqa: E402
     _python_fallback_write_mcp_entries,
     _scan_deprecated_mcp_entries,
     _scan_stale_mcp_entries,
+    uninstall_scrub_mcp_names as _uninstall_scrub_mcp_names,
 )
 
 
@@ -24674,20 +24675,24 @@ def _run_uninstall(args: argparse.Namespace) -> int:
             audit.append(f"WARN: could not remove {launcher_db}: {e}")
 
     # Step 4: scrub orchestrator MCP entries from ~/.claude.json.
+    #
+    # The scrub NAME set + the VCO-shape ownership gate live in
+    # vco_lib.install_mcp (sourced from mcp_scan_rules.toml
+    # [bundled].uninstall_scrub_names) — this shim only reads/writes the JSON.
+    # VCO-exclusive ids (weaviate-kg / search / ollama / code-embedding /
+    # vct-coordination) are removed by name; the dual-use ids
+    # (mermaid / excalidraw / playwright) are removed ONLY when the on-disk
+    # entry is positively VCO-shaped, so a user's own mermaid/excalidraw/
+    # playwright survives uninstall. (v0.2.83 WP-B5 — closes the drift where
+    # the prior hand-typed set was missing mermaid/excalidraw/playwright.)
     if will_clean_claude_json and _confirm(f"Remove orchestrator MCP entries from {claude_json}?"):
         try:
-            data = json.loads(claude_json.read_text())
-            removed_keys: list[str] = []
-            mcp = data.get("mcpServers", {})
-            # Only orchestrator-shipped MCPs get removed; user's other MCPs stay.
-            orchestrator_mcps = {
-                "weaviate-kg", "ollama", "search", "code-embedding", "vct-coordination",
-            }
-            for key in list(mcp.keys()):
-                if key in orchestrator_mcps:
-                    del mcp[key]
-                    removed_keys.append(key)
+            removed_keys = _uninstall_scrub_mcp_names(PROJECT_ROOT, claude_json)
             if removed_keys:
+                data = json.loads(claude_json.read_text())
+                mcp = data.get("mcpServers", {})
+                for key in removed_keys:
+                    mcp.pop(key, None)
                 claude_json.write_text(json.dumps(data, indent=2))
                 audit.append(f"removed MCP entries {sorted(removed_keys)} from {claude_json}")
             else:
