@@ -112,10 +112,6 @@ class DeferralLockPathParityTests(unittest.TestCase):
         self.assertEqual(py, EXPECTED_LOCK_REL)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 def test_lightweight_install_write_is_lock_wrapped() -> None:
     """v0.2.83 re-review N-NEW-1: the lightweight install path's
     merge_from_disk + write was the LAST un-locked production RMW of
@@ -131,7 +127,22 @@ def test_lightweight_install_write_is_lock_wrapped() -> None:
         "the lightweight merge+write must run under exclusive_file_lock on "
         "the shared deferral LOCK_REL (N-NEW-1)"
     )
-    # And the write itself must still be inside the same with-block: it must
-    # appear before the enclosing try's except line that follows the block.
+    # And the write itself must be INSIDE the with-block: both the
+    # merge_from_disk call and the write must be indented DEEPER than the
+    # `with` statement (dedenting the write out of the lock must fail here).
+    # NOTE: the with-statement uses the local import alias (`_xlock`), so key
+    # on "with " + a lock-ish call rather than the imported symbol name.
+    with_line = next(
+        l for l in window.splitlines()
+        if l.lstrip().startswith("with ") and "lock" in l.lower()
+    )
+    with_indent = len(with_line) - len(with_line.lstrip())
     tail = src[start:start + 600]
-    assert "_lightweight_deferral.write(_lightweight_folder)" in tail
+    write_line = next(l for l in tail.splitlines() if "_lightweight_deferral.write(_lightweight_folder)" in l)
+    assert (len(write_line) - len(write_line.lstrip())) > with_indent, (
+        "the write must be indented inside the exclusive_file_lock with-block"
+    )
+
+
+if __name__ == "__main__":
+    unittest.main()

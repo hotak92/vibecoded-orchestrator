@@ -6665,7 +6665,10 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
                 # v0.2.83 B-1 additive: the caller replays these into the
                 # run-scoped DeferralReport (mark_resolved) so seed→finalize
                 # cannot resurrect an entry we just cleared on disk.
-                "auto_resolved_condition_ids": sorted(auto_resolved_condition_ids),
+                # M-NEW-1 symmetry note: no active-cid subtraction needed on THIS
+            # return path — it is only reachable when renamed/conflicts/errors
+            # are all empty, so active_ids is empty by construction.
+            "auto_resolved_condition_ids": sorted(auto_resolved_condition_ids),
             }
         return None
 
