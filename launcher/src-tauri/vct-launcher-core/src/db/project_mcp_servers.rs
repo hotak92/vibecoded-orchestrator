@@ -622,4 +622,71 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("invalid mcp.source"), "got: {}", err);
     }
+
+    // ── v0.2.83 (WP-B3): third-party MCP "present AND working" guarantee ──
+    //
+    // A user's own MCP (searxng, Jira, Gmail, …) must not be silenced by the
+    // per-project gate: the BUNDLED_MCP_DEFAULT_DISABLED opt-out applies ONLY
+    // to VCO's own bundled servers, never to third-party names. And when the
+    // populate flow registers a third-party row it must land ENABLED so the
+    // MCP actually fires. These pins guard against a future edit that widens
+    // the default-disabled gate to unknown names.
+
+    #[test]
+    fn third_party_names_are_never_default_disabled() {
+        // searxng is the spicy case: VCO no longer ships it, so a user's own
+        // searxng MCP is third-party property — it must NOT be default-off.
+        for name in ["searxng", "jira", "gmail", "my-custom-mcp"] {
+            assert!(
+                !is_default_disabled_mcp(name),
+                "third-party MCP '{}' must never be default-disabled (it is \
+                 user property and must fire out of the box)",
+                name
+            );
+            assert!(
+                !is_bundled_mcp(name),
+                "third-party MCP '{}' must not be classified as a VCO bundled \
+                 server",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn third_party_mcp_registers_enabled_and_user_added() {
+        // A populate/register of a user's own searxng lands enabled=true and
+        // is_user_added=true — present AND working.
+        let db = make_db_with_project("p1", "Acme");
+        let cfg = serde_json::json!({
+            "command": "/home/dev/my-searxng-mcp/serve.py",
+            "args": ["--port", "8888"],
+        });
+        let row = db
+            .register_project_mcp_server(
+                "p1",
+                "searxng",
+                true, // caller computes is_user_added = !is_bundled_mcp("searxng")
+                "user",
+                None,
+                None,
+                Some("/home/dev/my-searxng-mcp/serve.py"),
+                &cfg,
+            )
+            .unwrap();
+        assert!(row.enabled, "third-party MCP must register ENABLED (working)");
+        assert!(row.is_user_added);
+
+        // Survives a re-populate (mimics install --update re-running populate):
+        // the user's row is untouched — re-registering only bundled VCO servers
+        // never drops or disables an unknown one.
+        db.register_project_mcp_server(
+            "p1", "weaviate-kg", false, "bundled", None, None, None,
+            &serde_json::json!({"command": "x"}),
+        )
+        .unwrap();
+        let rows = db.list_project_mcp_servers("p1").unwrap();
+        let searxng = rows.iter().find(|r| r.mcp_name == "searxng").expect("searxng row survives");
+        assert!(searxng.enabled, "user's searxng must stay enabled after a VCO re-populate");
+        assert!(searxng.is_user_added);
+    }
 }
