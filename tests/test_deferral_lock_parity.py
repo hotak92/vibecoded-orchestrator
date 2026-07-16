@@ -114,3 +114,24 @@ class DeferralLockPathParityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_lightweight_install_write_is_lock_wrapped() -> None:
+    """v0.2.83 re-review N-NEW-1: the lightweight install path's
+    merge_from_disk + write was the LAST un-locked production RMW of
+    UPDATE_DEFERRED. Structural pin (same idiom as the v0.2.75 flow tests):
+    the write must sit inside an ``exclusive_file_lock`` on the shared
+    ``deferral_emit.LOCK_REL`` path."""
+    src = (REPO_ROOT / "install.py").read_text(encoding="utf-8")
+    start = src.find("_lightweight_deferral.merge_from_disk(")
+    assert start != -1, "lightweight merge_from_disk site exists"
+    # Look back a bounded window for the lock context manager.
+    window = src[max(0, start - 600):start]
+    assert "exclusive_file_lock" in window and "LOCK_REL" in window, (
+        "the lightweight merge+write must run under exclusive_file_lock on "
+        "the shared deferral LOCK_REL (N-NEW-1)"
+    )
+    # And the write itself must still be inside the same with-block: it must
+    # appear before the enclosing try's except line that follows the block.
+    tail = src[start:start + 600]
+    assert "_lightweight_deferral.write(_lightweight_folder)" in tail

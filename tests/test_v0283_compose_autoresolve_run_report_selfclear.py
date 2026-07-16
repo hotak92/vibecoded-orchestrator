@@ -310,5 +310,57 @@ def test_active_renamed_this_run_is_not_reconciled(tmp_path: Path) -> None:
     )
 
 
+
+
+def test_mixed_identical_and_divergent_pairs_keeps_fresh_conflict(
+    tmp_path: Path,
+) -> None:
+    """v0.2.83 re-review M-NEW-1: condition_ids are SHARED across directory
+    pairs. A byte-identical pair in ``infrastructure/`` (auto-resolved) plus a
+    DIVERGENT pair in ``claude_mcp_servers/`` (fresh conflict emitted THIS run
+    under the SAME cid) must NOT tombstone the cid on the run report — that
+    would let finalize() clobber the fresh human-judgement deferral. The
+    producer must subtract ACTIVE cids from ``auto_resolved_condition_ids``.
+    """
+    # A prior run deferred a conflict (any pair); this run re-evaluates.
+    prior = DeferralReport()
+    prior.add_entry(_stale_conflict_entry())
+    prior.write(tmp_path)
+
+    # infrastructure/: byte-identical pair (the sanctioned C-RT-5 mirror).
+    infra = _infra(tmp_path)
+    body = b"services:\n  weaviate: {}\n"
+    (infra / _LEGACY).write_bytes(body)
+    (infra / _CANONICAL).write_bytes(body)
+
+    # claude_mcp_servers/: genuinely DIVERGENT pair -> fresh conflict this run.
+    mcp = tmp_path / "claude_mcp_servers"
+    mcp.mkdir(parents=True, exist_ok=True)
+    (mcp / _LEGACY).write_bytes(b"services:\n  a: {image: x}\n")
+    (mcp / _CANONICAL).write_bytes(b"services:\n  a: {image: y}\n")
+
+    flow = _new_flow(tmp_path)
+    flow.seed()
+    assert flow.report.has_condition(_CONFLICT_CID)
+
+    result = project_init._detect_and_rename_legacy_compose_override(tmp_path)
+    assert result is not None
+
+    # The cid is ACTIVE this run (divergent pair) => it must NOT be replayed.
+    assert _CONFLICT_CID not in result.get("auto_resolved_condition_ids", []), (
+        "an actively-emitted cid must never appear in the replay set "
+        "(M-NEW-1: replaying it tombstones the FRESH conflict)"
+    )
+
+    # Full choreography: replay (a no-op for this cid) then finalize.
+    _replay_caller_resolution(flow.report, result)
+    flow.finalize()
+
+    on_disk = DeferralReport.read(tmp_path)
+    assert on_disk.has_condition(_CONFLICT_CID), (
+        "the fresh divergent-pair conflict must SURVIVE finalize()"
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

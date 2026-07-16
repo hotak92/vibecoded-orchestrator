@@ -4001,12 +4001,20 @@ def _run_lightweight(args: argparse.Namespace) -> int:
         # an empty lightweight run would unlink both UPDATE_DEFERRED.{md,json}
         # and strip the CLAUDE.md reminder, silently destroying them. Seed
         # foreign-only (same owned exclusions as the full path) before writing.
-        _lightweight_deferral.merge_from_disk(
-            _lightweight_folder,
-            exclude_ids=_INSTALL_OWNED_CONDITION_IDS,
-            exclude_prefixes=_INSTALL_OWNED_CONDITION_PREFIXES,
-        )
-        _lightweight_deferral.write(_lightweight_folder)
+        # v0.2.83 re-review N-NEW-1: hold the shared cross-writer lock for the
+        # whole merge+write window — this was the last un-locked production
+        # RMW of UPDATE_DEFERRED; the lightweight path runs during launcher
+        # "Update orchestrator", exactly when the flocked Rust writers and
+        # detached children are active.
+        from vco_lib.atomic import exclusive_file_lock as _xlock
+        from vco_lib.deferral_emit import LOCK_REL as _lock_rel
+        with _xlock(_lightweight_folder / _lock_rel):
+            _lightweight_deferral.merge_from_disk(
+                _lightweight_folder,
+                exclude_ids=_INSTALL_OWNED_CONDITION_IDS,
+                exclude_prefixes=_INSTALL_OWNED_CONDITION_PREFIXES,
+            )
+            _lightweight_deferral.write(_lightweight_folder)
     except Exception as _exc:  # noqa: BLE001 — soft-fail
         _log_install_event(
             "lightweight", "warn",

@@ -6796,7 +6796,19 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
         # v0.2.83 B-1 additive: condition IDs this run cleared on disk. The
         # install.py caller replays them into the run-scoped DeferralReport
         # (mark_resolved) so seed→finalize cannot resurrect them.
-        "auto_resolved_condition_ids": sorted(auto_resolved_condition_ids),
+        #
+        # v0.2.83 re-review M-NEW-1: subtract cids that are ALSO ACTIVE this
+        # run. condition_ids are shared across directory pairs — with a
+        # byte-identical pair in one subdir (auto-resolved) AND a divergent
+        # pair in another (fresh conflict emitted THIS run under the SAME
+        # cid), replaying the cid would tombstone the run report and finalize
+        # would clobber the fresh human-judgement deferral. A cid that is
+        # simultaneously auto-resolved (for one pair) and active (for
+        # another) must stay alive; the resolved pair's cleanup is complete
+        # on disk regardless.
+        "auto_resolved_condition_ids": sorted(
+            auto_resolved_condition_ids - active_ids
+        ),
     }
 
 
