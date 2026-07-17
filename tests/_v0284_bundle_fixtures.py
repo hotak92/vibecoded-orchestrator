@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""Shared bundle-install test fixtures for v0.2.84 WP-4 (PLAN-v0284 A4:
+"""Shared bundle-install test fixtures for v0.2.84 WP-4 (PLAN-v0284 AMENDMENTS A4:
 one-concern-one-home — a single fake-orchestrator + non-root helper instead of a
 per-file copy).
 

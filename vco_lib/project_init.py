@@ -210,10 +210,14 @@ def _dev_diagrams_from_primary(primary: str, basename_fallback: str) -> tuple[st
     sanitized-name basename — mirroring config_projection's
     ``project_env_from_db`` and the hub's Decision C.
 
-    This is the SAME rule WP-2 realizes in ``config_projection`` (D1); it is
-    inlined here for the pre-WP-2-merge window so the D3 binding-first bootstrap
-    /migrate resolution doesn't name-derive dev when the primary binding is
-    known. See the FINAL REPORT note for the coordinator's WP-2 integration.
+    This is the SAME rule config_projection's ``_derive_dev_diagrams_from_kg``
+    realizes (D1). It is retained here for the two remaining project_init
+    call-sites that resolve a primary from an ON-DISK settings.json env pin (the
+    D3 resolver's settings-fallback tier + ``_backfill_kg_collection_env_in_project``),
+    which the config_projection seam — a launcher.db resolver — does not cover.
+    The launcher.db binding resolution itself now routes through the seam (see
+    :func:`_resolve_bundle_collection_names_binding_first`), so this helper is no
+    longer the launcher.db-derivation home — only the on-disk-env derivation.
     """
     if primary.endswith("_KnowledgeGraph"):
         stem = primary[: -len("_KnowledgeGraph")]
@@ -224,22 +228,32 @@ def _dev_diagrams_from_primary(primary: str, basename_fallback: str) -> tuple[st
 def _resolve_bundle_collection_names_binding_first(
     project_name: str,
     project_folder: Optional[Path],
+    *,
+    db_path: Optional[Path] = None,
 ) -> dict:
     """v0.2.84 PLAN-v0284 D3 (P2 / ruling R3): binding-first collection names.
 
     Returns the SAME dict shape as :func:`derive_project_collection_names` but
-    resolves the KG/Dev/Diagrams names in this priority order so bootstrap /
-    migrate NEVER create a name-derived collection when a binding resolves a
-    different primary (the R3 re-creator fix — the incident's empty
-    ``VibeCodedOrchestrator_Development`` shells were re-created because these
-    two flows name-derived from the launcher DISPLAY name):
+    resolves the KG/Dev/Diagrams names so bootstrap / migrate NEVER create a
+    name-derived collection when a binding resolves a different primary (the R3
+    re-creator fix — the incident's empty ``VibeCodedOrchestrator_Development``
+    shells were re-created because these two flows name-derived from the launcher
+    DISPLAY name):
 
-      1. Explicit ``KG_COLLECTION`` in the target project's
-         ``.claude/settings.json`` ``env`` block (the user's / a prior
-         projection's on-disk pin). Dev/Diagrams via the D1 suffix-swap rule.
-      2. launcher.db ``project_kg_bindings(role='primary')`` via the existing
-         read-only reader :func:`_read_kg_collection_from_launcher_db`. Same
-         suffix-swap.
+      1. AUTHORITATIVE — the WP-2 ``config_projection`` one-rule seam
+         :func:`~vco_lib.config_projection.resolve_collection_names_for_folder`
+         (launcher.db ``project_kg_bindings(role='primary')`` binding-first, with
+         the shared D1 dev/diagrams derivation). When the folder is registered
+         its binding WINS — that is the R3 pin. Per the planner-approved D3
+         contract, ``DbUnreachable`` (no launcher) OR ``ProjectNotFound``
+         (unregistered folder) are BOTH the signal that "no binding is
+         resolvable", NOT a fatal error — fall through to the on-disk pin / name
+         derivation below.
+      2. On-disk ``KG_COLLECTION`` pin in the target project's
+         ``.claude/settings.json`` ``env`` block (a prior projection's value the
+         seam can't see when the launcher DB is unreachable / the folder is
+         unregistered — e.g. a standalone CLI bootstrap). Dev/Diagrams via the
+         shared :func:`_dev_diagrams_from_primary` (== D1's rule).
       3. :func:`derive_project_collection_names` last resort — the genuinely
          binding-less fresh-create path (correct: the binding is then seeded to
          match). ``shared`` binding / shared-KG defaults are left to the caller's
@@ -248,11 +262,13 @@ def _resolve_bundle_collection_names_binding_first(
     Soft-fail throughout: any read/parse error falls through to the next tier.
     ``project_folder=None`` (no target folder) short-circuits to tier 3.
 
-    NOTE for WP-2 integration: tiers 1-2's dev/diagrams derivation reuses the
-    inlined :func:`_dev_diagrams_from_primary` (== D1's rule). Once WP-2's
-    ``config_projection`` one-rule helper merges, this resolver's tier-2 read
-    should route through it; the CALLERS (bootstrap_collections,
-    _cmd_migrate_collections) do not change.
+    Args:
+        project_name: raw project display name (drives the name-derived base +
+            last resort).
+        project_folder: the target project folder (``None`` → tier 3).
+        db_path: optional launcher.db override, threaded straight into the seam
+            (tests pin this; the bootstrap/migrate call-sites leave it ``None``
+            so the seam resolves the real ``~/.vct/launcher.db``).
     """
     base = derive_project_collection_names(project_name)
     if project_folder is None:
@@ -267,7 +283,31 @@ def _resolve_bundle_collection_names_binding_first(
         out["diagrams_collection"] = diagrams
         return out
 
-    # Tier 1: explicit KG_COLLECTION in the project's settings.json env.
+    # Tier 1 (AUTHORITATIVE): the config_projection one-rule seam (launcher.db
+    # binding-first). D3 integration (WP-2 landed): the local
+    # `_read_kg_collection_from_launcher_db` tier is DELETED — the seam owns the
+    # launcher.db read + the folder→id canonicalization (symlink/trailing-slash
+    # pitfalls have ONE home there) + the shared dev/diagrams derivation.
+    try:
+        from vco_lib.config_projection import (
+            DbUnreachable,
+            ProjectNotFound,
+            resolve_collection_names_for_folder,
+        )
+        names = resolve_collection_names_for_folder(folder, db_path=db_path)
+        out = dict(base)
+        out["kg_collection"] = names["kg_collection"]
+        out["development_collection"] = names["development_collection"]
+        out["diagrams_collection"] = names["diagrams_collection"]
+        return out
+    except (DbUnreachable, ProjectNotFound):
+        # Both = "no binding resolvable" (no launcher / unregistered folder) →
+        # fall through to the on-disk pin, then name derivation. NOT fatal.
+        pass
+    except Exception:  # noqa: BLE001 — any other seam error → conservative fallthrough
+        pass
+
+    # Tier 2: on-disk KG_COLLECTION pin in the project's settings.json env.
     try:
         settings_file = folder / ".claude" / "settings.json"
         if settings_file.is_file():
@@ -277,15 +317,6 @@ def _resolve_bundle_collection_names_binding_first(
                 kg = env.get("KG_COLLECTION") if isinstance(env, dict) else None
                 if isinstance(kg, str) and kg:
                     return _apply_primary(kg)
-    except Exception:  # noqa: BLE001 — soft-fail to the next tier
-        pass
-
-    # Tier 2: launcher.db primary binding (read-only).
-    try:
-        db = _read_kg_collection_from_launcher_db(folder)
-        primary = db.get("primary_kg_collection") if isinstance(db, dict) else None
-        if isinstance(primary, str) and primary:
-            return _apply_primary(primary)
     except Exception:  # noqa: BLE001 — soft-fail to the last-resort derivation
         pass
 
@@ -4495,7 +4526,7 @@ def _backup_bytes_for_adoption(
     raise as "do NOT adopt" and fall back to preserve + deferral (never destroy
     bytes without a captured copy).
 
-    v0.2.84 PLAN-v0284 A4: ``dest_rel`` is host-OS-shaped (``_enumerate_bundle_
+    v0.2.84 PLAN-v0284 AMENDMENTS A4: ``dest_rel`` is host-OS-shaped (``_enumerate_bundle_
     files`` builds it via ``str(Path(...))`` → ``knowledge\\concepts\\foo.md`` on
     Windows). We normalize the separator to ``/`` via the shared
     ``vco_lib.paths.to_posix_rel`` helper (the v0.2.81 lesson — never inline a
