@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.84] - 2026-07-17
+
+### Fixed — v0.2.83 dogfood findings (live update-all verification)
+
+- **Stale code-graph identities now heal on every owning flow, not just
+  launcher builds** — the v0.2.82 pre-build identity migration only ran on
+  launcher build surfaces, but the orchestrator ROOT project deliberately
+  skips autobuild/boot-resume, so the one project with the dual-identity
+  problem was the one project nothing migrated. New `--sweep` mode in
+  `vco_lib.codegraph_vector_copy` (aggregate distinct stale identities per
+  prefix family, migrate each — vectors copied verbatim, zero re-embeds);
+  invoked unconditionally by `install.py --update` (NOT gated by the
+  embed-revision owed-probe: identity-stale rows can be revision-current),
+  by the resync pre-analyze, by launcher builds (generalized — also heals
+  renamed non-root projects), and fire-and-forget on the update-path root
+  skip.
+- **ONE collection-naming rule across hub, launcher, and python**
+  (`vct-launcher-core::collection_naming` + the config_projection
+  realization): dev/diagrams collections derive by suffix-swap from the
+  RESOLVED primary KG binding (hub "Decision C"), never re-derived from the
+  display name. Fixes the drift that pointed `DEVELOPMENT_COLLECTION` at an
+  empty name-derived collection while the real docs lived in the KG-paired
+  one — including the dead `archive`-role lookup that silently reverted
+  manual corrections on every env re-projection. Existing installs
+  auto-repoint on their next update (pointer fix only — no data movement,
+  no re-embedding) with an audit row in `auto-resolutions.jsonl` per
+  changed value; `bootstrap_collections`/`migrate-collections` are
+  binding-first, so dropped legacy shells are never re-created.
+- **Orphan-collection deferrals are reference-checked** — the detector no
+  longer claims "no callers / safe to drop" without consulting the project's
+  env surfaces and launcher.db resolution; when a binding-paired sibling
+  holds the data, the entry says so.
+- **`user_secret_values_retained_in_tree` false positive eliminated** — the
+  `.claude/env` branch matched ANY uppercase export in the managed block
+  (i.e. every config line on every safe-add install, forever). It now parses
+  each line's KEY and flags only genuinely secret-shaped keys with values
+  (single secret-shape home: `secrets_audit.is_secret_shaped_env_key`);
+  existing false-positive entries self-clear on the next update.
+- **VCO-shipped codefiles are adopted, not preserved-and-nagged** (user
+  directive: users aren't expected to edit VCO codefiles): update mode now
+  refreshes shipped hooks/scripts/agents/skills/compose whose bytes drifted
+  (including manifest-less files from pre-manifest or pre-history-rewrite
+  installs) — with the original bytes backed up to
+  `.claude/backups/bundle-adoptions/<timestamp>/` first (backup failure ⇒
+  the old preserve+deferral behavior; bytes are never destroyed without a
+  captured copy), a loud one-time notice + audit rows instead of an eternal
+  `bundle_user_modified_preserved` deferral. Per-project `knowledge/` stays
+  fully preserved (user-owned KG state, not code). `--force` keeps its
+  historical meaning.
+- **gnome-keyring crash pressure removed** — the v0.2.82 pacing wrote its
+  timestamp BEFORE the operation, so back-to-back serialized reads had
+  ~zero real idle gap (measured 5-690µs); the daemon (gnome-keyring 46.x)
+  assert-crashes under such sustained traffic even when serialized. The
+  pace gap is now measured from operation END; the hub resolves each
+  `/env` request through a per-request, memory-only, write-invalidated
+  secret-read session (never persisted); and the launcher's settings
+  populate no longer performs keychain reads at all — its secret values
+  were discarded by every consumer since the v0.2.73 strip-only invariant
+  (measured: 6 projects × update-all now performs 0 populate-side keychain
+  value reads, and repeated hub reads dedupe per request).
+- Test-infra hardening: analyzer-spawning tests resolve the VCO venv
+  python via the canonical chain instead of bare `python3` (no more false
+  reds on machines without a global weaviate-client); the
+  `_cmd_migrate_collections` env injection is scoped (it had polluted the
+  suite twice); managed-env line parsing has one home (`vco_lib/envfile.py`);
+  Windows-separator regression pins guard the adoption/knowledge-preserve
+  paths.
+
 ## [0.2.83] - 2026-07-16
 
 ### Fixed — launcher update detection ("no update available" incident)
