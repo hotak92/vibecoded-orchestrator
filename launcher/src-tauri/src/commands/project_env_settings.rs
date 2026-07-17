@@ -1041,9 +1041,33 @@ pub fn populate(
         .flatten()
         .unwrap_or(false);
 
-    let kg_basename = sanitize_kg_collection(project_name);
-    let own_kg = format!("{}_KnowledgeGraph", kg_basename);
-    let own_dev = format!("{}_Development", kg_basename);
+    // v0.2.84 D1 (P2): KG + dev collection names come from the ONE rule in
+    // `vct_launcher_core::collection_naming::resolve_project_collections` —
+    // binding-first (`project_kg_bindings(role='primary')`) with a
+    // name-derived last resort, dev/diagrams by suffix-swap off the
+    // resolved KG (slug fallback for a custom-rename primary). This is the
+    // SAME rule the hub's `config_api` and the python `config_projection`
+    // delegate to, closing the v0.2.83 dogfood P2 drift where `populate()`
+    // name-derived the dev name from the DISPLAY name and stranded the
+    // binding-paired `<KG>_Development` docs store (was
+    // `sanitize_kg_collection(project_name)` here — the exact violation
+    // the file's own SSOT comment below flags for CODE_GRAPH_PROJECT).
+    //
+    // Slug: resolve from the project row when we have a project_id (drives
+    // the dev/diagrams non-canonical fallback, matching the hub's
+    // `project.slug`); None in test contexts → the rule seeds the fallback
+    // off the name (never reached when the primary is canonical).
+    let project_slug: Option<String> = project_id
+        .and_then(|pid| db.get_project(pid).ok().flatten())
+        .map(|row| row.slug);
+    let collections = crate::collection_naming::resolve_project_collections(
+        db,
+        project_id,
+        project_name,
+        project_slug.as_deref(),
+    );
+    let own_kg = collections.kg;
+    let own_dev = collections.dev;
 
     // v0.2.76 (seams-lens #1): CODE_GRAPH_PROJECT — binding-first, matching the
     // hub resolver + `config_projection.project_env_from_db`. NEVER re-derive a
@@ -1072,38 +1096,43 @@ pub fn populate(
         None => Vec::new(),
     };
 
-    // 0.1.7 fork-readiness sweep (2026-05-08): the OnboardingWizard's
-    // GitHub PAT is now in the OS keychain (replaces the legacy
-    // `~/.vct-secrets/shared/github_pat` file). Resolve here so the
-    // env-pair builder in `write_project_env_files` can emit
-    // `GITHUB_TOKEN=<value>` to all 3 install surfaces. Soft-fail
-    // (None) on keychain unreachable / no entry / paused — the
-    // pair-builder omits the key in that case, matching the
-    // VCT_ORCHESTRATOR_ROOT / VCT_KG_ACCESS_LIST semantics.
+    // v0.2.84 D8.1 (P7): populate() NO LONGER resolves secret VALUES.
     //
-    // See `commands::installer::github_pat_from_keychain` for the
-    // (scope, module_id, key) tuple + active-flag gate.
-    let github_token = crate::commands::installer::github_pat_for_env(db);
+    // The GitHub PAT keychain read (`github_pat_for_env`) is removed here —
+    // it was a PURE-WASTE read on every populate(). The v0.2.73 strip-only
+    // WRITE INVARIANT (projects_v2.rs:3393-3431) forces the writer to emit
+    // NOTHING for GITHUB_TOKEN (the canonical value arm is `None`; the
+    // explicit `let _ = (&settings.user_secret_pairs, &settings.github_token)`
+    // no-op keeps the fields honest), so populate's resolved token value was
+    // read from the OS keychain and then discarded — one gnome-keyring
+    // Secret Service round-trip per project, per populate, for nothing. On
+    // update-all over K projects × ~6 populate call-sites that is ~6K
+    // wasted Secret Service reads that provably contributed to the P7
+    // keyring SIGTRAP recurrence. NOT feature removal (no production
+    // consumer of the VALUE exists — verified; the hub has its OWN
+    // keychain loop in vct-hub's /env resolver). See PLAN v0.2.84 D8.1.
+    let github_token: Option<String> = None;
 
-    // Subagent G (2026-05-08): resolve user-set per-project secrets so
-    // they auto-emit into all 3 launcher-managed env surfaces.
+    // Subagent G (2026-05-08): the user-secret STRIP set (KEY names only).
     //
-    // Two parallel outputs:
-    //   * `user_secret_pairs`: (KEY, VALUE) for entries that are both
-    //     active under the cross-launcher gate AND keychain-present.
-    //     The env writer EMITS these.
-    //   * `user_secret_known_keys`: every KEY ever observed in the
-    //     per-project user-bucket regardless of active flag. Used as
-    //     the STRIP set so paused / removed secrets get out of the
-    //     surfaces (otherwise a previously-emitted secret persists
-    //     stale even after the GUI says it's off).
+    // v0.2.84 D8.1: split from the value-resolving `resolve_user_secret_state`
+    // — populate now calls `resolve_user_secret_known_keys`, which reads
+    // ONLY launcher.db (the three key-name lists), NEVER the OS keychain.
+    //   * `user_secret_pairs`: forced EMPTY. The env writer discards it
+    //     anyway (v0.2.73 strip-only invariant) — resolving the values was
+    //     pure keychain waste (the load-bearing bulk of the per-project
+    //     read multiplier behind the P7 SIGTRAP).
+    //   * `user_secret_known_keys`: every KEY ever observed in the three
+    //     user buckets regardless of active flag — the STRIP set the writer
+    //     needs so paused / removed secrets get scrubbed from the surfaces.
+    //     Still populated (DB-only, no keychain).
     //
-    // Without `project_id` (test contexts where the project row hasn't
-    // been inserted yet) we skip the resolution — empty pairs + empty
-    // known set means the writer behaves identically to pre-Subagent-G.
-    let (user_secret_pairs, user_secret_known_keys) = match project_id {
-        Some(pid) => resolve_user_secret_state(db, pid),
-        None => (Vec::new(), Vec::new()),
+    // Without `project_id` (test contexts) we skip resolution — empty pairs
+    // + empty known set, identical to before.
+    let user_secret_pairs: Vec<(String, String)> = Vec::new();
+    let user_secret_known_keys = match project_id {
+        Some(pid) => resolve_user_secret_known_keys(db, pid),
+        None => Vec::new(),
     };
 
     ProjectEnvSettings {
@@ -1284,6 +1313,51 @@ fn resolve_code_graph_project(db: &Db, project_id: Option<&str>, project_name: &
         .unwrap_or_else(|_| sanitize_kg_collection(project_name))
 }
 
+/// v0.2.84 D8.1 (P7): resolve JUST the user-secret STRIP set — every KEY
+/// name ever observed across the three SecretsPanel buckets (per-project,
+/// shared, global) — WITHOUT touching the OS keychain.
+///
+/// This is the DB-only half split out of [`resolve_user_secret_state`].
+/// `populate()` calls THIS (not the value-resolving variant) because the
+/// env writer never emits secret VALUES (v0.2.73 strip-only invariant,
+/// projects_v2.rs:3393-3431) — it only needs the known-key set to STRIP
+/// paused / removed secrets from the surfaces. Resolving the values was a
+/// pure-waste keychain read per key per project (a load-bearing driver of
+/// the P7 gnome-keyring SIGTRAP recurrence under update-all).
+///
+/// Ordering + de-duplication are BYTE-IDENTICAL to
+/// [`resolve_user_secret_state`]'s `known_keys` output: per-project keys
+/// first (in the DB's list order), then shared keys not already present,
+/// then global keys not already present. This parity is load-bearing —
+/// the writer's strip set must match what the old (value-resolving) path
+/// produced or a paused secret could leak or a live one vanish.
+///
+/// Soft-fail: the three list reads soft-fail to empty inside their `db`
+/// helpers; this function never panics.
+fn resolve_user_secret_known_keys(db: &Db, project_id: &str) -> Vec<String> {
+    // Same three DB reads `resolve_user_secret_state` performs — key NAMES
+    // only, no keychain values. (`db.list_*_user_secret_keys` are the
+    // DB-only readers; the keychain access lived solely in the value arm.)
+    let per_project_keys = db.list_user_secret_keys_for_project(project_id);
+    let shared_keys = db.list_shared_user_secret_keys();
+    let global_keys = db.list_global_user_secret_keys();
+
+    let mut known_keys: Vec<String> =
+        Vec::with_capacity(per_project_keys.len() + shared_keys.len() + global_keys.len());
+    // Dedup-preserving push in bucket order — mirrors `resolve_one_bucket`'s
+    // `out_known` accumulation exactly (per-project → shared → global).
+    for key in per_project_keys
+        .into_iter()
+        .chain(shared_keys)
+        .chain(global_keys)
+    {
+        if !known_keys.iter().any(|k| *k == key) {
+            known_keys.push(key);
+        }
+    }
+    known_keys
+}
+
 /// Subagent G (2026-05-08), broadened by H2 (2026-05-08): resolve the
 /// user-bucket secret state for the env-pair builder. Covers all THREE
 /// SecretsPanel tabs:
@@ -1336,6 +1410,15 @@ fn resolve_code_graph_project(db: &Db, project_id: Option<&str>, project_name: &
 /// `module_id='installer'`. This function only enumerates
 /// `module_id='user'` rows. The two flows never enumerate each
 /// other's entries — there is zero overlap.
+///
+/// v0.2.84 D8.1 (P7): `populate()` no longer calls this — it calls the
+/// DB-only [`resolve_user_secret_known_keys`] instead (the env writer
+/// discards the VALUES anyway, so resolving them was pure keychain waste).
+/// This value-resolving variant is RETAINED (not deleted) because it is
+/// the reference for the hub's parallel user-secret bucket loop and the
+/// `known_keys`-parity test below pins the two in lockstep. Test-only
+/// after the split, hence the `not(test)` dead-code allow.
+#[cfg_attr(not(test), allow(dead_code))]
 fn resolve_user_secret_state(db: &Db, project_id: &str) -> (Vec<(String, String)>, Vec<String>) {
     // Per-project bucket (existing behaviour, byte-identical to pre-H2).
     let per_project_keys = db.list_user_secret_keys_for_project(project_id);
@@ -2516,6 +2599,257 @@ mod tests {
         assert!(
             !should_regenerate_env_for_project(&db, "ghost", &env_path),
             "expected false: no binding rows → nothing to regenerate against"
+        );
+    }
+
+    // ─── v0.2.84 WP-2 (P2 D1): populate() delegates to the ONE rule ─────
+
+    /// FAIL-WITHOUT-FIX PIN (P2 no-name-derivation-when-binding-resolves):
+    /// a project whose primary KG binding is `VCODev_KnowledgeGraph` but
+    /// whose DISPLAY NAME name-derives to `VibeCodedOrchestrator_*` ⇒
+    /// populate() yields dev `VCODev_Development` (suffix-swap off the
+    /// BINDING), NOT `VibeCodedOrchestrator_Development`.
+    ///
+    /// Fails on the pre-fix tree where populate did
+    /// `own_dev = format!("{}_Development", sanitize_kg_collection(name))`.
+    #[test]
+    fn populate_dev_suffix_swaps_from_binding_not_display_name() {
+        use crate::db::models::ProjectHost;
+        let db = Db::open_in_memory().unwrap();
+        db.insert_project(
+            "vco-root",
+            "VibeCoded Orchestrator",
+            "/tmp/vct-test-vco-root",
+            ProjectHost::Base,
+            "vibecoded-orchestrator",
+        )
+        .unwrap();
+        db.set_project_kg_binding(
+            "vco-root",
+            "primary",
+            "VCODev_KnowledgeGraph",
+            None, None, None, None,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+
+        let s = populate(&db, "VibeCoded Orchestrator", Some("vco-root"));
+        assert_eq!(s.kg_collection, "VCODev_KnowledgeGraph");
+        assert_eq!(
+            s.dev_collection, "VCODev_Development",
+            "populate dev must suffix-swap off the resolved binding, NOT \
+             name-derive from the display name (P2 regression was \
+             VibeCodedOrchestrator_Development)"
+        );
+    }
+
+    /// Non-`_KnowledgeGraph` primary (custom-rename) ⇒ populate dev falls
+    /// back to the slug-sanitized name, byte-matching the hub + python.
+    #[test]
+    fn populate_dev_slug_fallback_for_non_canonical_primary() {
+        use crate::db::models::ProjectHost;
+        let db = Db::open_in_memory().unwrap();
+        db.insert_project(
+            "p-weird",
+            "Weird Project",
+            "/tmp/vct-test-p-weird",
+            ProjectHost::Base,
+            "weirdproject",
+        )
+        .unwrap();
+        db.set_project_kg_binding(
+            "p-weird",
+            "primary",
+            "WeirdName_Custom",
+            None, None, None, None,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+
+        let s = populate(&db, "Weird Project", Some("p-weird"));
+        assert_eq!(s.kg_collection, "WeirdName_Custom");
+        assert_eq!(s.dev_collection, "Weirdproject_Development");
+    }
+
+    // ─── v0.2.84 WP-2 (P7 D8.1): populate() reads ZERO keychain values ──
+
+    /// FAIL-WITHOUT-FIX PIN (P7 read-count): with the mock keychain guard,
+    /// populate() for a project with an active user secret + a PAT present
+    /// performs ZERO keychain VALUE reads.
+    ///
+    /// Counter mechanism (no secrets.rs edit): register a one-shot
+    /// `fail_next_get` on the PAT slot AND the active user-secret slot.
+    /// If populate READ either value, the mock consumes that fail inside
+    /// populate. After populate we probe each slot with a direct
+    /// `secrets::get` — a returned `Err` proves the fail was STILL pending
+    /// (populate never read it → zero reads); an `Ok(value)` would prove
+    /// populate consumed it (a read happened → the pin fails).
+    ///
+    /// Fails on the pre-fix tree: pre-D8.1 populate called
+    /// `github_pat_for_env` (1 PAT read) + `resolve_user_secret_state`
+    /// (one `secrets::get` per active key), so both probes would return
+    /// `Ok` and the assertions flip.
+    #[test]
+    fn populate_reads_zero_keychain_values() {
+        use crate::db::models::ProjectHost;
+        use crate::secrets::{self, SecretScope};
+
+        let _g = secrets::for_tests::MockGuard::new();
+        let db = Db::open_in_memory().unwrap();
+        db.insert_project(
+            "p-secrets",
+            "SecretsProject",
+            "/tmp/vct-test-p-secrets",
+            ProjectHost::Base,
+            "secretsproject",
+        )
+        .unwrap();
+        db.set_project_kg_binding(
+            "p-secrets",
+            "primary",
+            "SecretsProject_KnowledgeGraph",
+            None, None, None, None,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+
+        // Seed a PAT value (shared-scope) + mark active. `SENTINEL_SHARED`
+        // is a private installer const; use its literal value (matches
+        // `config_projection._USER_SECRET_PROJECT_ID_SHARED`).
+        let pat_scope = SecretScope::Shared {
+            project_id: "_user_shared_",
+        };
+        secrets::set(
+            pat_scope,
+            crate::commands::installer::GITHUB_PAT_MODULE_ID,
+            crate::commands::installer::GITHUB_PAT_KEY,
+            "ghp_canary_value",
+        )
+        .unwrap();
+        db.mark_secret_active(
+            "shared",
+            "_user_shared_",
+            crate::commands::installer::GITHUB_PAT_MODULE_ID,
+            crate::commands::installer::GITHUB_PAT_KEY,
+        )
+        .unwrap();
+
+        // Seed an ACTIVE per-project user secret (value + active flag) so
+        // pre-D8.1 populate WOULD have read its value.
+        let user_scope = SecretScope::PerProject {
+            project_id: "p-secrets",
+        };
+        secrets::set(user_scope, "user", "MY_API_KEY", "secret-value").unwrap();
+        db.mark_secret_active("per_project", "p-secrets", "user", "MY_API_KEY")
+            .unwrap();
+
+        // Arm one-shot read-failures on BOTH value slots. If populate reads
+        // either, it consumes the fail inside populate.
+        secrets::for_tests::fail_next_get(
+            crate::commands::installer::GITHUB_PAT_KEY,
+        );
+        secrets::for_tests::fail_next_get("MY_API_KEY");
+
+        let s = populate(&db, "SecretsProject", Some("p-secrets"));
+
+        // D8.1 contract: no VALUES resolved.
+        assert!(
+            s.github_token.is_none(),
+            "populate must not resolve the PAT value (D8.1)"
+        );
+        assert!(
+            s.user_secret_pairs.is_empty(),
+            "populate must not resolve user-secret values (D8.1)"
+        );
+        // But the STRIP set (DB-only) IS still populated.
+        assert!(
+            s.user_secret_known_keys.iter().any(|k| k == "MY_API_KEY"),
+            "populate must still resolve the DB-only known-keys strip set"
+        );
+
+        // Probe: the fails must be STILL PENDING (populate read neither
+        // value). A pending fail ⇒ direct get returns Err; a consumed fail
+        // ⇒ get returns Ok (which would mean populate read it — pin fails).
+        assert!(
+            secrets::get(
+                pat_scope,
+                crate::commands::installer::GITHUB_PAT_MODULE_ID,
+                crate::commands::installer::GITHUB_PAT_KEY,
+            )
+            .is_err(),
+            "PAT fail-get was consumed → populate READ the PAT value \
+             (regression: D8.1 must eliminate that read)"
+        );
+        assert!(
+            secrets::get(user_scope, "user", "MY_API_KEY").is_err(),
+            "user-secret fail-get was consumed → populate READ the value \
+             (regression: D8.1 must eliminate that read)"
+        );
+    }
+
+    // ─── v0.2.84 WP-2 (P7 D8.1): known-keys parity across the split ─────
+
+    /// `resolve_user_secret_known_keys` (DB-only) must produce a
+    /// `known_keys` list BYTE-IDENTICAL to the value-resolving
+    /// `resolve_user_secret_state`'s second tuple element — the strip set
+    /// the writer depends on. Proves the split preserved the ordering +
+    /// de-dup contract (per-project → shared → global, first-seen wins).
+    #[test]
+    fn known_keys_split_matches_full_resolver() {
+        use crate::db::models::ProjectHost;
+        use crate::secrets::{self, SecretScope};
+
+        let _g = secrets::for_tests::MockGuard::new();
+        let db = Db::open_in_memory().unwrap();
+        db.insert_project(
+            "p-keys",
+            "KeysProject",
+            "/tmp/vct-test-p-keys",
+            ProjectHost::Base,
+            "keysproject",
+        )
+        .unwrap();
+
+        // Per-project keys (two), one shared (also duplicated per-project to
+        // exercise the de-dup), one global.
+        for (scope_str, pid, scope) in [
+            ("per_project", "p-keys", SecretScope::PerProject { project_id: "p-keys" }),
+        ] {
+            for key in ["ZED_KEY", "ALPHA_KEY"] {
+                secrets::set(scope, "user", key, "v").unwrap();
+                db.mark_secret_active(scope_str, pid, "user", key).unwrap();
+            }
+        }
+        // Shared bucket: one new key + one colliding with a per-project key.
+        secrets::set(
+            SecretScope::Shared { project_id: "_user_shared_" },
+            "user",
+            "SHARED_ONLY",
+            "v",
+        )
+        .unwrap();
+        db.mark_secret_active("shared", "_user_shared_", "user", "SHARED_ONLY")
+            .unwrap();
+        secrets::set(
+            SecretScope::Shared { project_id: "_user_shared_" },
+            "user",
+            "ALPHA_KEY",
+            "v",
+        )
+        .unwrap();
+        db.mark_secret_active("shared", "_user_shared_", "user", "ALPHA_KEY")
+            .unwrap();
+        // Global bucket: one new key.
+        secrets::set(SecretScope::Global, "user", "GLOBAL_ONLY", "v").unwrap();
+        db.mark_secret_active("global", "_global_", "user", "GLOBAL_ONLY")
+            .unwrap();
+
+        let (_pairs, full_known) = resolve_user_secret_state(&db, "p-keys");
+        let split_known = resolve_user_secret_known_keys(&db, "p-keys");
+        assert_eq!(
+            split_known, full_known,
+            "the DB-only known-keys split must byte-match the full \
+             resolver's known_keys (ordering + de-dup contract)"
         );
     }
 }

@@ -263,7 +263,19 @@ def test_from_db_minimal_project(tmp_path: Path) -> None:
 
 
 def test_from_db_with_kg_bindings(tmp_path: Path) -> None:
-    """KG binding rows override sanitized-name defaults."""
+    """KG binding rows override sanitized-name defaults.
+
+    v0.2.84 D1 (P2): the dead `role='archive'` → DEVELOPMENT_COLLECTION
+    priority is REMOVED (no writer ever created an archive binding, so it
+    always name-derived and reverted the hub/launcher's correct value —
+    the P2 drift). DEVELOPMENT_COLLECTION now derives from the RESOLVED
+    primary KG by the ONE rule, exactly like DIAGRAMS_COLLECTION: suffix-
+    swap when the primary ends `_KnowledgeGraph`, else the slug-sanitized
+    fallback (converging on the hub's byte-exact behavior). This fixture's
+    primary `MyKnowledgeGraph` does NOT end with `_KnowledgeGraph` (no
+    underscore separator), so BOTH dev and diagrams take the slug fallback:
+    slug `demo-project` → `_sanitize_collection_prefix` → `Demo_project`.
+    """
     db = tmp_path / "launcher.db"
     proj = tmp_path / "p"
     proj.mkdir()
@@ -272,20 +284,22 @@ def test_from_db_with_kg_bindings(tmp_path: Path) -> None:
         kg_bindings={
             "primary": "MyKnowledgeGraph",
             "shared": "TeamSharedKG",
+            # v0.2.84 D1: an `archive` row no longer influences the dev
+            # collection — the role is dead and ignored (kept here to prove
+            # it's now inert, not that it drives the value).
             "archive": "MyDev",
         },
     )
     env = project_env_from_db("x", db_path=db)["canonical_env"]
     assert env["KG_COLLECTION"] == "MyKnowledgeGraph"
     assert env["SHARED_KG_COLLECTION"] == "TeamSharedKG"
-    assert env["DEVELOPMENT_COLLECTION"] == "MyDev"
-    # Phase 1.5 — diagrams derived from the primary KG via suffix swap.
-    # "MyKnowledgeGraph" does NOT end with "_KnowledgeGraph" (no
-    # underscore separator), so suffix swap doesn't apply and the
-    # sanitized-project-name fallback fires → "X_Diagrams" (project
-    # name "X" → sanitized "X"). This confirms the rule degrades
-    # gracefully when bindings carry non-canonical names.
-    assert env["DIAGRAMS_COLLECTION"] == "X_Diagrams"
+    # v0.2.84 D1: archive-role priority gone → dev = slug-fallback (primary
+    # is non-canonical). Was "MyDev" (dead archive binding) pre-0.2.84.
+    assert env["DEVELOPMENT_COLLECTION"] == "Demo_project_Development"
+    # v0.2.84 D1: diagrams fallback converges on the SLUG-based sanitizer
+    # (was the name-derived "X_Diagrams" pre-0.2.84). Both dev and diagrams
+    # now share the one non-canonical fallback.
+    assert env["DIAGRAMS_COLLECTION"] == "Demo_project_Diagrams"
 
 
 # ─── v0.2.72 R1 (F5 residual) — shared-KG app_state override ─────────────

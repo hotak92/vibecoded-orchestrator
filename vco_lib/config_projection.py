@@ -1423,6 +1423,79 @@ def _sanitize_kg_collection(project_name: str) -> str:
     return sanitized
 
 
+def _sanitize_collection_prefix(slug: str) -> str:
+    """Slug → class-prefix sanitiser, underscore-PRESERVING.
+
+    v0.2.84 D1 (P2): the Python mirror of the hub's
+    ``sanitize_collection_prefix`` (now
+    ``vct_launcher_core::collection_naming::sanitize_collection_prefix``,
+    config_api.rs pre-move). Used for the dev / diagrams NON-canonical
+    fallback — the custom-rename case where the primary KG binding exists
+    but doesn't end ``_KnowledgeGraph`` — so this projection converges on
+    the hub's byte-exact fallback (previously it name-derived via
+    :func:`_sanitize_kg_collection`, drifting from the hub's slug-derived
+    value; that drift is the P2 finding).
+
+    DISTINCT from :func:`_sanitize_kg_collection` (underscore-DROPPING,
+    ``"Vct"`` fallback — drives the KG BASENAME) and from
+    ``vco_lib.project_naming.canonical_class_prefix`` (the codegraph SSOT).
+    Do NOT collapse the three: they are three different rules with three
+    different fallbacks. This one mirrors the hub's fallback verbatim:
+
+      1. Replace non-alphanumeric ASCII chars with ``_``.
+      2. Trim leading/trailing ``_``, then capitalize the first character.
+      3. If empty after trimming, return ``"Project"``.
+
+    Parity with the Rust home is pinned by
+    ``tests/test_v0284_dev_collection_one_rule.py`` (and byte-matches the
+    hub's ``config_development_collection_falls_back_to_slug_for_non_
+    canonical_primary`` test: slug ``"weirdproject"`` → ``"Weirdproject"``).
+    """
+    out_chars: list[str] = []
+    for ch in slug:
+        if ch.isascii() and ch.isalnum():
+            out_chars.append(ch)
+        else:
+            out_chars.append("_")
+    trimmed = "".join(out_chars).strip("_")
+    if not trimmed:
+        return "Project"
+    return trimmed[0].upper() + trimmed[1:]
+
+
+def _derive_dev_diagrams_from_kg(
+    kg_collection: str, slug: str
+) -> tuple[str, str]:
+    """v0.2.84 D1 (P2) — the ONE python dev/diagrams derivation site.
+
+    Given a RESOLVED (binding-first) primary KG collection name + the
+    project slug, return ``(development_collection, diagrams_collection)``
+    by the one rule (== hub v0.2.46 Decision C +
+    ``vct_launcher_core::collection_naming::derive_sibling_collection``):
+
+      * suffix-swap when ``kg_collection`` ends ``_KnowledgeGraph``
+        (basename + ``_Development`` / ``_Diagrams``);
+      * else — the custom-rename case (primary binding doesn't end
+        ``_KnowledgeGraph``) — ``_sanitize_collection_prefix(slug)`` +
+        the suffix (the SLUG-based, underscore-PRESERVING sanitizer,
+        byte-matching the hub).
+
+    Pure string logic (no DB / no probe). Extracted so
+    :func:`project_env_from_db` and the read-only
+    :func:`resolve_project_collection_names` share ONE derivation home —
+    the structural parity pins key on this being the single site.
+    """
+    if kg_collection.endswith("_KnowledgeGraph"):
+        basename = kg_collection[: -len("_KnowledgeGraph")]
+        dev = basename + "_Development"
+        diagrams = basename + "_Diagrams"
+    else:
+        prefix = _sanitize_collection_prefix(slug)
+        dev = f"{prefix}_Development"
+        diagrams = f"{prefix}_Diagrams"
+    return dev, diagrams
+
+
 # ─── Exceptions ─────────────────────────────────────────────────────────
 
 
@@ -1587,26 +1660,25 @@ def project_env_from_db(
             else:
                 resolved_default = shared_kg_default
             shared_kg = kg_bindings.get("shared", resolved_default)
-        dev_collection = kg_bindings.get(
-            "archive", f"{sanitized}_Development"
+        # v0.2.84 D1 (P2) — DEVELOPMENT_COLLECTION (and DIAGRAMS_COLLECTION)
+        # derive from the RESOLVED primary KG by the ONE rule
+        # (`_derive_dev_diagrams_from_kg`, == hub v0.2.46 Decision C +
+        # `vct_launcher_core::collection_naming`). The dead
+        # `kg_bindings.get("archive", ...)` priority is REMOVED: no
+        # installer / launcher / migration ever writes a `role='archive'`
+        # binding, so that lookup ALWAYS name-derived from the display name
+        # (`{sanitized}_Development`) and LIVE-REVERTED the hub/launcher's
+        # correct binding-paired value on every install-bundle / update —
+        # the exact P2 drift (the 340-row `VCODev_Development` docs store
+        # stranded when the display name resolved to
+        # `VibeCodedOrchestrator_Development`). The derivation suffix-swaps
+        # off `kg_collection`, which is ITSELF binding-first (:1558 above),
+        # so a `primary` override carries through; the non-`_KnowledgeGraph`
+        # fallback (custom-rename primary) uses the SLUG-based sanitizer to
+        # byte-match the hub. Both dev + diagrams share the one derivation.
+        dev_collection, diagrams_collection = _derive_dev_diagrams_from_kg(
+            kg_collection, proj.slug
         )
-
-        # Phase 1.5 — Diagrams collection. The launcher's DB doesn't (yet)
-        # have a kg_bindings role for diagrams; derive from the primary
-        # KG collection via the canonical suffix swap so an explicit
-        # `primary` override (e.g. a user-renamed `MyKG`) carries through
-        # to `MyKG_Diagrams` correctly. Falls back to the sanitized-name
-        # default when the primary doesn't end with `_KnowledgeGraph`.
-        # Mirrors `vco_lib.project_init.derive_project_collection_names`'s
-        # rule (`<sanitized>_Diagrams`) — both code paths must agree on
-        # the same canonical name or the indexer would write to one
-        # collection while the MCP reads from another.
-        if kg_collection.endswith("_KnowledgeGraph"):
-            diagrams_collection = (
-                kg_collection[: -len("_KnowledgeGraph")] + "_Diagrams"
-            )
-        else:
-            diagrams_collection = f"{sanitized}_Diagrams"
 
         # Access lists.
         kg_access = _fetch_kg_access_list(
@@ -1890,6 +1962,149 @@ def project_env_from_db(
     }
 
 
+class ProjectCollectionNames(TypedDict):
+    """Binding-first KG / development / diagrams collection names for one
+    project — the read-only seam for WP-4's D3 (bootstrap/migrate).
+
+    Same ONE rule as :func:`project_env_from_db` (they share the
+    :func:`_derive_dev_diagrams_from_kg` derivation), but WITHOUT the full
+    env bundle: callers that only need the three collection names (fresh
+    create / migrate dispatch) read this instead of building a whole
+    bundle.
+    """
+
+    kg_collection: str
+    development_collection: str
+    diagrams_collection: str
+
+
+def resolve_project_collection_names(
+    project_id: str,
+    *,
+    db_path: Path | None = None,
+) -> ProjectCollectionNames:
+    """Resolve a project's KG / development / diagrams collection names
+    binding-first from launcher.db (v0.2.84 D1 — the read-only seam WP-4's
+    D3 bootstrap/migrate call).
+
+    Resolution (identical to :func:`project_env_from_db`, via the shared
+    :func:`_derive_dev_diagrams_from_kg`):
+
+      * KG = ``project_kg_bindings(role='primary').collection_name`` when a
+        row exists; else ``_sanitize_kg_collection(name)_KnowledgeGraph``
+        (name-derived last resort — a project with NO primary binding yet,
+        e.g. fresh create before the binding is seeded).
+      * dev / diagrams = suffix-swap off the resolved KG, slug-fallback for
+        a non-``_KnowledgeGraph`` primary (custom-rename).
+
+    Read-only: opens launcher.db read-only, never writes. Use this to
+    resolve names BEFORE creating collections so bootstrap/migrate honor an
+    existing binding instead of re-deriving from the display name (the R3
+    re-creator fix).
+
+    Args:
+        project_id: The launcher project id (or slug — resolved the same
+            way :func:`project_env_from_db` resolves it).
+        db_path: Optional launcher.db override (tests pin this).
+
+    Returns:
+        :class:`ProjectCollectionNames`.
+
+    Raises:
+        ProjectNotFound: no project row for ``project_id``.
+        DbUnreachable: launcher.db missing / unopenable.
+    """
+    if db_path is None:
+        db_path = _resolve_launcher_db_path()
+    try:
+        conn = _open_db_read_only(db_path)
+    except FileNotFoundError as exc:
+        raise DbUnreachable(str(exc)) from exc
+    except sqlite3.OperationalError as exc:
+        raise DbUnreachable(
+            f"cannot open launcher.db at {db_path}: {exc}"
+        ) from exc
+    try:
+        proj = _fetch_project_row(conn, project_id)
+        kg_bindings = _fetch_kg_bindings(conn, project_id)
+        sanitized = _sanitize_kg_collection(proj.name)
+        kg_collection = kg_bindings.get(
+            "primary", f"{sanitized}_KnowledgeGraph"
+        )
+        dev_collection, diagrams_collection = _derive_dev_diagrams_from_kg(
+            kg_collection, proj.slug
+        )
+        return ProjectCollectionNames(
+            kg_collection=kg_collection,
+            development_collection=dev_collection,
+            diagrams_collection=diagrams_collection,
+        )
+    finally:
+        conn.close()
+
+
+def resolve_collection_names_for_folder(
+    folder: Path,
+    *,
+    db_path: Path | None = None,
+) -> ProjectCollectionNames:
+    """Folder-shaped read-only seam for WP-4's D3 (v0.2.84 D1/D3).
+
+    The D3 bootstrap/migrate call-sites are folder+name shaped (the Rust
+    launcher passes ``--project-folder`` to bootstrap-collections /
+    migrate-collections). This maps a project FOLDER to its registered
+    ``project_id`` — canonicalizing BOTH sides with :meth:`Path.resolve`
+    first, so a symlinked / trailing-slash / relative folder still matches
+    the stored ``folder_path`` — then delegates to
+    :func:`resolve_project_collection_names` (NO second rule copy). The
+    folder→id canonicalization lives HERE (next to the other read helpers),
+    not in the ``project_init`` mega-file, because the matching pitfalls
+    (symlinks, trailing slashes) must have ONE home.
+
+    Args:
+        folder: The project folder to resolve.
+        db_path: Optional launcher.db override (tests pin this).
+
+    Returns:
+        :class:`ProjectCollectionNames` for the matched project.
+
+    Raises:
+        ProjectNotFound: no registered project's folder_path canonicalizes
+            to ``folder`` (e.g. a standalone CLI bootstrap on a folder the
+            launcher never saw). Callers should treat this — like
+            :class:`DbUnreachable` — as the signal to fall back to the
+            name-derived last resort (D1's no-binding path), NOT as fatal.
+        DbUnreachable: launcher.db missing / unopenable.
+    """
+    # list_registered_projects raises DbUnreachable on a missing DB — let
+    # it propagate (same no-launcher posture the caller falls back on).
+    projects = list_registered_projects(db_path=db_path)
+
+    def _canon(p: Path) -> Path:
+        # resolve() collapses symlinks + `..` + trailing slashes to a
+        # canonical absolute path. strict=False so a folder that doesn't
+        # exist on disk (rare — a stale row) still normalizes rather than
+        # raising; the comparison then simply won't match.
+        try:
+            return p.resolve()
+        except OSError:
+            return p.absolute()
+
+    target = _canon(folder)
+    for proj in projects:
+        stored = str(proj.get("folder_path", ""))
+        if not stored:
+            continue
+        if _canon(Path(stored)) == target:
+            return resolve_project_collection_names(
+                str(proj["id"]), db_path=db_path
+            )
+    raise ProjectNotFound(
+        f"no registered project folder matches {folder} "
+        f"(canonicalized {target})"
+    )
+
+
 # ─── apply_project_env ──────────────────────────────────────────────────
 
 
@@ -1906,6 +2121,123 @@ _ALL_SURFACES: tuple[str, ...] = (
     _SURFACE_CLAUDE_ENV,
     _SURFACE_VSCODE_SETTINGS,
 )
+
+
+# v0.2.84 D2 (P2) — env-repoint audit.
+#
+# Once D1 lands, the next `apply_project_env` on an existing install
+# naturally OVERWRITES a stale name-derived DEVELOPMENT_COLLECTION /
+# KG_COLLECTION with the binding-paired name — that IS the migration (no
+# data movement, ever; it's a pointer fix). D2 makes that self-repair
+# VISIBLE: when the writer changes an on-disk value of one of these two
+# keys, we append a `dev_collection_env_repointed` auto-resolution row
+# (v0.2.83 JSONL home) so a dogfooder can see the convergence in
+# `.claude/logs/auto-resolutions.jsonl`. NO deferral entry is ever created
+# under this id — it is a record of a self-resolved condition, not a
+# pending one. Guard: no row when old == new (no noise on the steady state).
+_REPOINT_AUDITED_KEYS: tuple[str, ...] = ("KG_COLLECTION", "DEVELOPMENT_COLLECTION")
+_REPOINT_CONDITION_ID = "dev_collection_env_repointed"
+
+
+def _read_surface_canonical_value(
+    path: Path, key: str, *, env_key: str
+) -> Optional[str]:
+    """Read the current on-disk value of one canonical env KEY from a
+    JSON env surface (settings.json / vscode settings.json).
+
+    Returns the string value under ``root[env_key][key]`` when present and
+    a string; ``None`` when the file is missing / malformed / the key is
+    absent. Soft-fail throughout (audit reads never break a write).
+    """
+    if not path.exists():
+        return None
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    block = parsed.get(env_key)
+    if not isinstance(block, dict):
+        return None
+    val = block.get(key)
+    return val if isinstance(val, str) else None
+
+
+def _read_managed_env_canonical_value(path: Path, key: str) -> Optional[str]:
+    """Read the current on-disk value of one canonical env KEY from the
+    ``.claude/env`` managed block (``export KEY="value"``).
+
+    Returns the unescaped string value when a matching export line exists
+    inside the BEGIN/END managed block; ``None`` otherwise. Soft-fail:
+    missing file / no marker / no matching line → ``None``.
+    """
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    begin_idx = text.find(CLAUDE_ENV_MANAGED_BEGIN)
+    if begin_idx == -1:
+        return None
+    end_off = text[begin_idx:].find(CLAUDE_ENV_MANAGED_END)
+    if end_off == -1:
+        return None
+    block_text = text[begin_idx: begin_idx + end_off]
+    prefix = f'export {key}="'
+    for line in block_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(prefix) and stripped.endswith('"'):
+            raw = stripped[len(prefix): -1]
+            # Reverse the writer's only escape (`"` → `\"`).
+            return raw.replace('\\"', '"')
+    return None
+
+
+def _emit_repoint_audit_rows(
+    project_root: Path,
+    old_values: Mapping[str, Optional[str]],
+    new_env: Mapping[str, str],
+) -> None:
+    """Emit a `dev_collection_env_repointed` audit row per audited key whose
+    on-disk value the writer CHANGED (v0.2.84 D2).
+
+    ``old_values`` maps each audited KEY to the representative pre-write
+    on-disk value (or ``None`` when the key was absent). A row is emitted
+    only when the key is present in ``new_env`` AND the old value was a
+    non-empty string that DIFFERS from the new value — a genuine repoint of
+    an existing value (a first-time write, where old is ``None`` / empty,
+    is NOT a repoint and stays silent). Best-effort: import + write are
+    soft; a failure never breaks the surface writes that already happened.
+    """
+    changed: list[tuple[str, str, str]] = []
+    for key in _REPOINT_AUDITED_KEYS:
+        new_val = new_env.get(key)
+        old_val = old_values.get(key)
+        if new_val is None:
+            continue
+        if not old_val:
+            # Absent or empty on disk → first write, not a repoint.
+            continue
+        if old_val != new_val:
+            changed.append((key, old_val, new_val))
+    if not changed:
+        return
+    try:
+        from vco_lib.deferral_emit import record_auto_resolution
+    except Exception:  # noqa: BLE001 — the audit trail is best-effort
+        return
+    for key, old_val, new_val in changed:
+        try:
+            record_auto_resolution(
+                project_root,
+                _REPOINT_CONDITION_ID,
+                action="repointed",
+                detail=f"{key}: {old_val} → {new_val}",
+            )
+        except Exception:  # noqa: BLE001 — never break the write path
+            pass
 
 
 def apply_project_env(
@@ -1964,6 +2296,32 @@ def apply_project_env(
     env = bundle["canonical_env"]
     canonical_keys = list_canonical_keys()
 
+    # v0.2.84 D2 (P2): snapshot the on-disk KG_COLLECTION /
+    # DEVELOPMENT_COLLECTION values BEFORE writing so we can emit a repoint
+    # audit row when the writer changes one. Read from the surfaces we're
+    # about to write, in production-surface priority (settings.json →
+    # .claude/env → vscode); the first non-None wins as the representative
+    # old value (all production surfaces normally carry the same value).
+    # Best-effort: soft-fail reads never affect the write.
+    old_repoint_values: dict[str, Optional[str]] = {
+        key: None for key in _REPOINT_AUDITED_KEYS
+    }
+    for key in _REPOINT_AUDITED_KEYS:
+        if _SURFACE_CLAUDE_SETTINGS in surfaces_seq:
+            old_repoint_values[key] = _read_surface_canonical_value(
+                project_root / ".claude" / "settings.json", key, env_key="env"
+            )
+        if old_repoint_values[key] is None and _SURFACE_CLAUDE_ENV in surfaces_seq:
+            old_repoint_values[key] = _read_managed_env_canonical_value(
+                project_root / ".claude" / "env", key
+            )
+        if old_repoint_values[key] is None and _SURFACE_VSCODE_SETTINGS in surfaces_seq:
+            old_repoint_values[key] = _read_surface_canonical_value(
+                project_root / ".vscode" / "settings.json",
+                key,
+                env_key="claude-code.env",
+            )
+
     # v0.2.75 P3: the user-secret EMIT arm is retired — the combined
     # path is STRIP-ONLY too (same contract as apply_user_secrets; the
     # low-level `_with_user_secrets`-mirroring writer params survive
@@ -2007,6 +2365,12 @@ def apply_project_env(
             user_secret_strip_keys=us_strip_keys,
         )
         report[_SURFACE_VSCODE_SETTINGS] = keys
+
+    # v0.2.84 D2 (P2): emit a `dev_collection_env_repointed` audit row for
+    # each audited key whose existing on-disk value the write just changed
+    # (old != new, old non-empty). Runs AFTER the surface writes so the
+    # audit reflects a completed repoint. Best-effort — never raises.
+    _emit_repoint_audit_rows(project_root, old_repoint_values, env)
 
     return report
 
