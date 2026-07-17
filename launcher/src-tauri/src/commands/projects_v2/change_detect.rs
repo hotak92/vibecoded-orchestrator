@@ -13,6 +13,17 @@
 /// gate the kg-sync re-embed; `noop` / `preserve` / `keep-regenerated` /
 /// `skip-*` / `orphan-preserved` all leave the on-disk content as-is, so they
 /// must NOT trigger a re-embed.
+///
+/// v0.2.85 D9 note: `adopt` is DELIBERATELY absent here even though it rewrites
+/// on-disk bytes. An `adopt` entry can never be a KG/docs content change, for
+/// two DISTINCT reasons: (a) `knowledge/**` diverging is classified `preserve`,
+/// never `adopt` (the D3 carve-out — user-owned KG state is never overwritten);
+/// (b) `docs/**` is never adopted because it is never ENUMERATED as a bundle op
+/// at all (no op targets it, so no action bucket — `adopt` included — can carry
+/// a docs path). Either way, omitting `adopt` from this gate is correct: adding
+/// it could only produce false-positive re-embeds. The `adopted` tally
+/// (UpdateSummary) is honesty-only (D9) and does not — must not — feed this
+/// content-change gate.
 pub(crate) const BUNDLE_CONTENT_CHANGING_BUCKETS: [&str; 4] =
     ["create", "overwrite", "always-overwrite", "orphan-deleted"];
 

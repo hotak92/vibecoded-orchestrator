@@ -14,9 +14,12 @@ Stub modules verify only the import contract + interface.
 (vco_lib.manifest — the sixth v0.2.53 skeleton — was DELETED in v0.2.75:
 its three stubs only raised NotImplementedError with a "lands in v0.2.54"
 promise that never materialised, and it accumulated zero production
-callers. The live manifest writers remain
-``project_init._write_manifest_atomic`` and
-``install.py::_refresh_orchestrator_self_vco_manifest``.)
+callers. As of v0.2.85 (PLAN-v0285 WP-1) the SINGLE live manifest writer is
+``project_init._write_manifest_atomic``: install.py's own
+``_refresh_orchestrator_self_vco_manifest`` was DELETED when the root install
+moved to the delegated ``install-bundle`` path, so there is now exactly one
+manifest writer — the F-NEW-1 clobber-by-second-writer defect is gone by
+construction.)
 """
 
 from __future__ import annotations

@@ -381,7 +381,19 @@ class UpdateFlowPreservationTests(unittest.TestCase):
                          result["actions"]["preserve"])
         self.assertIn("shipped-v2", installed.read_text(encoding="utf-8"))
 
-    def test_update_preserves_user_modified_nodes(self):
+    def test_update_preserves_user_modified_nodes_SILENTLY_no_deferral(self):
+        """v0.2.85 NEW-1 (contract CHANGED): a divergent user-owned knowledge
+        node is PRESERVED on disk (classified `preserve`, in the actions
+        envelope) but does NOT emit a `bundle_user_modified_preserved` deferral.
+
+        Rationale: that deferral's advertised remediation is `--update --force`,
+        which is a deliberate NO-OP for knowledge (B-1: force never destroys user
+        KG state). Emitting it would (a) advertise a dead command, and (b) let a
+        later `--force` run dishonestly auto-resolve an entry naming a
+        still-divergent node (the Fable v0.2.85 re-review's NEW-1). Divergent
+        user knowledge is the EXPECTED steady state — silent, like
+        `keep-regenerated`. (This test previously asserted the deferral DID fire,
+        which encoded the emit/clear flap.)"""
         installed = self.proj / "knowledge" / "concepts" / "bar.md"
         installed.write_text("# Bar concept\nUSER EDIT\n", encoding="utf-8")
 
@@ -392,6 +404,7 @@ class UpdateFlowPreservationTests(unittest.TestCase):
             orchestrator_root=self.orch,
             update_mode=True,
         )
+        # Preserved on disk + classified preserve (envelope stays truthful).
         self.assertIn("knowledge/concepts/bar.md",
                       result["actions"]["preserve"])
         self.assertNotIn("knowledge/concepts/bar.md",
@@ -400,29 +413,91 @@ class UpdateFlowPreservationTests(unittest.TestCase):
             installed.read_text(encoding="utf-8"),
             "# Bar concept\nUSER EDIT\n",
         )
+        # But NO deferral — knowledge preservation is silent (NEW-1).
         report = DeferralReport.read(self.proj)
-        self.assertTrue(
+        self.assertFalse(
             report.has_condition("bundle_user_modified_preserved"),
-            "`bundle_user_modified_preserved` deferral missing — "
-            "the user-modification preservation path didn't emit it",
+            "a divergent knowledge node must NOT emit the --force-remediated "
+            "deferral (its force remediation is a no-op — NEW-1)",
         )
-        body = (self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md") \
-            .read_text(encoding="utf-8")
-        self.assertIn("knowledge/concepts/bar.md", body,
-                      "deferral body must name the preserved file")
 
-    def test_update_force_overwrites_user_modifications(self):
+    def test_force_on_preserved_knowledge_does_not_flap_deferral(self):
+        """v0.2.85 NEW-1 regression: the emit→dishonest-clear→re-emit flap. A
+        normal update preserves a divergent knowledge node (no deferral, per the
+        test above). A subsequent `--update --force` run must NOT write a false
+        'condition no longer applies' auto-resolution for it (there was no entry
+        to resolve, and the node is still divergent + still preserved). The
+        knowledge stays on disk under force (B-1)."""
+        installed = self.proj / "knowledge" / "concepts" / "bar.md"
+        installed.write_text("# Bar concept\nUSER EDIT\n", encoding="utf-8")
+        self._bump_shipped_node("concepts/bar.md",
+                                "# Bar concept\nshipped-v2\n")
+        # Normal update — preserves, no deferral.
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=True)
+        self.assertFalse(
+            DeferralReport.read(self.proj).has_condition(
+                "bundle_user_modified_preserved"))
+
+        # Force run — knowledge survives (B-1), no deferral appears or flaps.
+        res = project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=True, force=True)
+        self.assertEqual(installed.read_text(encoding="utf-8"),
+                         "# Bar concept\nUSER EDIT\n",
+                         "force must not overwrite user knowledge (B-1)")
+        self.assertIn("knowledge/concepts/bar.md", res["actions"]["preserve"])
+        self.assertFalse(
+            DeferralReport.read(self.proj).has_condition(
+                "bundle_user_modified_preserved"),
+            "force run must not resurrect/flap a knowledge preserve deferral",
+        )
+        # No dishonest auto-resolution audit row for the knowledge node.
+        auto_res = self.proj / ".claude" / "context" / "auto-resolutions.jsonl"
+        if auto_res.exists():
+            self.assertNotIn(
+                "bundle_user_modified_preserved", auto_res.read_text("utf-8"),
+                "force run wrote a false auto-resolution for a knowledge preserve",
+            )
+
+    def test_update_force_PRESERVES_user_knowledge_never_destroys(self):
+        """v0.2.85 B-1 (data-loss fix): `--force` must NOT overwrite a
+        user-edited `knowledge/**` KG node. Knowledge is USER-OWNED state
+        (v0.2.81) and the root's `knowledge/` is gitignored (no git recovery)
+        and takes NO adoption backup on the force→overwrite branch, so a force
+        overwrite would be unrecoverable data loss. Force is scoped to the code
+        surface (hooks/scripts/agents/skills/compose); knowledge stays
+        `preserve` regardless of `--force`.
+
+        (This test previously asserted the OPPOSITE — that force overwrites the
+        node — which encoded the B-1 data-loss bug as intended behavior. The
+        Fable v0.2.85 review reproduced the loss end-to-end; the contract is now
+        inverted to the safe one.)"""
         installed = self.proj / "knowledge" / "concepts" / "foo.md"
         installed.write_text("# Foo concept\nUSER EDIT\n", encoding="utf-8")
         self._bump_shipped_node("concepts/foo.md",
                                 "# Foo concept\nshipped-v2\n")
-        project_init.install_project_bundle(
+        result = project_init.install_project_bundle(
             self.proj,
             orchestrator_root=self.orch,
             update_mode=True,
             force=True,
         )
-        self.assertIn("shipped-v2", installed.read_text(encoding="utf-8"))
+        # The user's edit SURVIVES; shipped bytes did NOT land.
+        body = installed.read_text(encoding="utf-8")
+        self.assertIn("USER EDIT", body,
+                      "force overwrote a user knowledge node — B-1 data loss")
+        self.assertNotIn("shipped-v2", body)
+        # Classified preserve (not overwrite), so it is surfaced, not silently lost.
+        rels = [p for p in result["actions"]["preserve"]]
+        self.assertTrue(
+            any(str(p).replace("\\", "/").endswith("knowledge/concepts/foo.md")
+                for p in rels),
+            f"knowledge node must be classified preserve under force; got {rels}",
+        )
+        self.assertNotIn(
+            "knowledge/concepts/foo.md",
+            [str(p).replace("\\", "/") for p in result["actions"]["overwrite"]],
+        )
 
 
 # ---------------------------------------------------------------------------

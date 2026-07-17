@@ -139,6 +139,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from vco_lib import bundled_versions as _bundled_versions  # noqa: E402
 from vco_lib import launcher_db_writer as _launcher_db_writer  # noqa: E402
 from vco_lib import project_init as _project_init  # noqa: E402
+from vco_lib import self_install as _self_install  # noqa: E402
 from vco_lib import weaviate_helpers as _wh  # noqa: E402
 from vco_lib import secrets_audit as _secrets_audit  # noqa: E402
 from vco_lib.deferral_report import (  # noqa: E402
@@ -178,6 +179,15 @@ _INSTALL_OWNED_CONDITION_IDS = frozenset({
     "weaviate_unreachable_at_update",
     "rebuild_pending_seed",
     "podman_daemon_start_failed",
+    # retired v0.2.85 (PLAN-v0285 D3, searxng-precedent from WP-B3): the
+    # producer (_emit_self_materialize_preserved_deferral, called from the old
+    # Step 5b _materialize_orchestrator_self_claude_dir) was DELETED when root
+    # install moved to the delegated install-bundle path. Root now ADOPTS a
+    # drifted runtime copy with a timestamped backup (D3) instead of
+    # preserving + nagging — the same policy the launcher already applied to
+    # the root folder since v0.2.84. ID kept here so any stale on-disk entry
+    # from a pre-.85 run drop-when-absent self-clears on the next
+    # single-final-write (InstallDeferralFlow.finalize).
     "orchestrator_self_user_modified_preserved",
     "compose_overlay_ambiguous",
     "dual_ollama_detected",
@@ -251,7 +261,6 @@ from vco_lib.symlink_handler import (  # noqa: E402
     check_vco_new_collision,
     compute_vco_new_path,
     emit_symlink_deferral,
-    emit_symlink_deferral_multi,
     is_symlink_blocking,
 )
 # v0.2.68: hardware-aware embedding/summary backend selectors extracted
@@ -2411,7 +2420,14 @@ def update_merge_notification_block(
 
 def _copy_recursive(src: Path, dst: Path) -> int:
     """Plain recursive copy. Symlinks are resolved (file content follows).
-    Returns the number of files copied."""
+    Returns the number of files copied.
+
+    copy2-audit (v0.2.85 D7): the copy2 sites in this function and in
+    _copy_recursive_preserve below belong to the V47-B adopt-project mode — a
+    separate pre-existing feature, NOT the root-bundle materialize that WP-1
+    replaced. Left unchanged to keep WP-1 scoped to root delegation; atomic
+    conversion of the adopt path is a follow-up (E5-class polish).
+    """
     if src.is_dir():
         dst.mkdir(parents=True, exist_ok=True)
         total = 0
@@ -5277,6 +5293,107 @@ def _replay_compose_override_resolutions(override_result, deferral_report) -> No
             )
 
 
+def _run_root_claude_dir_install(args: argparse.Namespace) -> dict:
+    """Step 5b (v0.2.85, PLAN-v0285 D1/D2/D4/D5): delegate the orchestrator-
+    self runtime ``.claude/`` install to the shared ``install-bundle`` engine.
+
+    The root becomes a subprocess client of the project contract — same argv
+    shape, same ``--json`` envelope, same parse-failure posture as the
+    launcher (``launcher/src-tauri/.../projects_v2.rs``). This replaces the
+    deleted Steps 5b (``_materialize_orchestrator_self_claude_dir``) and 9b
+    (``_install_agents_and_skills``): root no longer has its own enumeration,
+    4-action classifier, manifest writer, settings merge, or symlink/deferral
+    accumulators — the ONE bundle engine owns them (R-A), which also fixes
+    F-NEW-1 (the old writer rebuilt the manifest from only hooks/scripts/
+    settings, clobbering the agents/skills/knowledge entries the launcher
+    wrote on every ``install.py --update``).
+
+    Returns the bundle result envelope (also used by tests / callers wanting
+    the action counts). Soft-fail throughout — a parse/launch failure yields a
+    PARTIAL warning and the install continues (mirrors the launcher).
+
+    Living in install.py (not vco_lib) because it is the thin orchestration
+    shim that must supply install.py's module globals (``PROJECT_ROOT``,
+    ``_log_install_event``) and call the kept in-process ``_materialize_
+    orchestrator_self_claude_md``; the SUBSTANTIVE spawn+parse logic lives in
+    ``vco_lib.self_install``.
+    """
+    # D4 update-mode rule: a re-run over an installed root is an update by
+    # construction — the .vco-manifest.json is the installed marker (same
+    # marker family the bundle itself consults). --update forces update mode;
+    # otherwise the manifest's presence decides.
+    manifest = PROJECT_ROOT / ".claude" / ".vco-manifest.json"
+    update_mode = bool(getattr(args, "update", False)) or manifest.exists()
+
+    # D5 flag mapping (no feature removal, no legacy branches):
+    #   --skip-materialize-claude-dir → skip hooks/scripts/settings kinds
+    #       (agents/skills/knowledge STILL install — matching the pre-v0.2.85
+    #       behaviour where Step 9b ran despite this flag).
+    #   --no-agents / --no-skills → skip the agents / skills kinds.
+    #   --force-materialize-claude-dir → --force.
+    #   adopt-preview (--adopt-project-dry-run) → --dry-run. That flag
+    #       early-exits main() before this step today, so in practice it
+    #       resolves to False; threaded defensively for a future non-exiting
+    #       preview path.
+    skip_kinds: set[str] = set()
+    if getattr(args, "skip_materialize_claude_dir", False):
+        skip_kinds.update(_self_install.SKIP_MATERIALIZE_CLAUDE_DIR_KINDS)
+    if not getattr(args, "with_agents", True):
+        skip_kinds.add("agents")
+    if not getattr(args, "with_skills", True):
+        skip_kinds.add("skills")
+
+    # --no-hooks is an HONEST no-op (D5): it NEVER prevented hook installation
+    # (the pre-v0.2.85 Step 5b always materialized hooks regardless; only
+    # --skip-materialize-claude-dir skipped them). The supported disable is
+    # VCT_DISABLE_HOOKS=1 (per-shell, not an install-time toggle).
+    if not getattr(args, "with_hooks", True):
+        _log_install_event(
+            "5b/10", "info",
+            "--no-hooks is a no-op: hooks always install (never gated by this "
+            "flag). Use VCT_DISABLE_HOOKS=1 to disable hook execution per "
+            "shell, or --skip-materialize-claude-dir to skip the hooks/"
+            "scripts/settings bundle kinds.",
+        )
+
+    result = _self_install.run_root_bundle_install(
+        PROJECT_ROOT,
+        update_mode=update_mode,
+        force=bool(getattr(args, "force_materialize_claude_dir", False)),
+        dry_run=bool(getattr(args, "adopt_project_dry_run", False)),
+        skip_kinds=frozenset(skip_kinds),
+        log_event=_log_install_event,
+    )
+
+    # Human output continuity: render the SAME lines the install-bundle CLI's
+    # non-JSON branch prints (one home via format_bundle_result_lines — D2)
+    # under the "[5b/10]" banner (matching this step's `_log_install_event`
+    # step-id) so existing log/UX scrapers keep working. On a parse failure the
+    # envelope carries a PARTIAL warning and the install continues.
+    print("[5b/10] Installing orchestrator .claude/ via install-bundle ...")
+    for line in _self_install.format_bundle_result_lines(result):
+        print(line)
+
+    # Step 4c (v0.2.50 Track A): render the orchestrator's own CLAUDE.md AUTO
+    # block. A different concern from the bundle (CLAUDE.md is outside the ops
+    # set), so it is NOT delegated; kept in-process. Previously invoked at the
+    # tail of _materialize_orchestrator_self_claude_dir; now called here since
+    # that function was deleted.
+    #
+    # v0.2.85 M-3: preserve the two pre-delegation gates the old Step 5b tail
+    # had — (a) DRY-RUN must mutate nothing (an adopt-preview run only reports),
+    # and (b) --skip-materialize-claude-dir skipped the whole materialize block
+    # including this CLAUDE.md render (it is part of the ".claude/ materialize"
+    # surface that flag names). Both are no-ops today in practice (the
+    # adopt-preview flag early-exits main() before this step, and CLAUDE.md is
+    # idempotent), but gating keeps the flag semantics honest and dry-run pure.
+    _skip_claude_dir = bool(getattr(args, "skip_materialize_claude_dir", False))
+    _dry = bool(getattr(args, "adopt_project_dry_run", False))
+    if not _dry and not _skip_claude_dir:
+        _materialize_orchestrator_self_claude_md(PROJECT_ROOT)
+    return result
+
+
 def main() -> int:
     # v0.2.53 bootstrap mode (Track B / docs/INSTALL_ARCHITECTURE_v2.md §3):
     # short-circuit BEFORE _ensure_running_under_mcp_venv() so the bootstrap
@@ -5535,7 +5652,10 @@ def main() -> int:
     parser.add_argument("--with-hooks", action="store_true", default=True,
                         help="Install Claude Code hooks + merge .claude/settings.json (default: on)")
     parser.add_argument("--no-hooks", dest="with_hooks", action="store_false",
-                        help="Skip installing hooks and the settings.json template")
+                        help="Deprecated no-op (v0.2.85 D5): hooks always install "
+                             "via the bundle engine; this flag never prevented "
+                             "them. To disable hooks at runtime set "
+                             "VCT_DISABLE_HOOKS=1. Kept for CLI back-compat.")
     parser.add_argument("--no-compile", dest="compile_pyc", action="store_false", default=True,
                         help="Skip the bytecode-compile step (Step 11b). First import of "
                              "orchestrator modules will be ~50-200ms slower; useful for "
@@ -5569,18 +5689,20 @@ def main() -> int:
                         help="Skip rendering .claude/{hooks,scripts,settings.json} "
                              "from templates/ (PR-39, v0.2.12). Useful in tests or "
                              "when targeting a pre-populated .claude/ directory.")
-    # v0.2.54 Track D (Theme 5): the orchestrator-self materialize now
-    # hash-compares against .claude/.vco-self-manifest.json and PRESERVES
-    # user-modified hook/script copies (emitting an
-    # orchestrator_self_user_modified_preserved deferral) instead of
-    # silently overwriting them. This flag accepts the template versions
-    # for every preserved file.
+    # v0.2.85 (PLAN-v0285 D1/D3): the root's .claude/ now installs through the
+    # SAME bundle engine as projects. A divergent runtime code copy (hook /
+    # script / agent / skill) is ADOPTED with a timestamped backup by default
+    # (not preserved + nagged — the v0.2.84 D7 policy, now applied at the root
+    # too). `--force` maps to the bundle's `--force`: take the shipped bytes with
+    # NO backup — EXCEPT user-owned `knowledge/**`, which stays preserved even
+    # under --force (v0.2.85 B-1: never destroy user KG state; root knowledge is
+    # gitignored + un-backed-up on this branch).
     parser.add_argument("--force-materialize-claude-dir", action="store_true",
                         default=False,
-                        help="Overwrite user-modified .claude/{hooks,scripts} "
-                             "files with the current template versions (the "
-                             "default since v0.2.54 is to preserve them and "
-                             "emit a deferral entry).")
+                        help="Overwrite divergent .claude/{hooks,scripts,agents,"
+                             "skills} runtime files with the current shipped "
+                             "versions, no backup (default: adopt-with-backup). "
+                             "User knowledge/** is preserved regardless.")
     parser.add_argument("--no-resume", action="store_true", default=False,
                         help="Disable resume-from-log. Forces every step to run "
                              "even if state/logs/install.jsonl says a previous "
@@ -6021,25 +6143,15 @@ def main() -> int:
     # Step 5: Install/update Python dependencies
     _install_requirements(venv_python, dev=args.dev)
 
-    # Step 5b: Materialize orchestrator-self .claude/ from templates.
-    # PR-39 (v0.2.12): the public repo no longer ships .claude/{hooks,
-    # scripts,settings.json}; install.py renders them from templates/ at
-    # install time (and on every --update). Runs AFTER _install_requirements
-    # so any Python scripts can use the venv, and BEFORE _seed_weaviate so
-    # the orchestrator's KG-sync hooks are in place when seeding runs.
-    if not getattr(args, "skip_materialize_claude_dir", False):
-        _materialize_orchestrator_self_claude_dir(
-            PROJECT_ROOT,
-            deferral_report=_deferral_report,
-            force_overwrite=getattr(
-                args, "force_materialize_claude_dir", False,
-            ),
-        )
-    else:
-        _log_install_event(
-            "4b/10", "skip",
-            "--skip-materialize-claude-dir set; .claude/ left untouched",
-        )
+    # Step 5b (v0.2.85, PLAN-v0285 D1/D2): install the orchestrator-self runtime
+    # .claude/ by DELEGATING to the SAME install-bundle engine the launcher
+    # uses. Thin shim — the D4 update-mode rule + D5 flag mapping + delegated
+    # call + human rendering live in _run_root_claude_dir_install (a helper, so
+    # main()'s span stays flat per the install_main_ratchet). Runs BEFORE
+    # _seed_weaviate so the KG-sync hooks exist when seeding runs. Replaces the
+    # deleted Steps 5b/9b (bespoke materialize + agents/skills install), also
+    # fixing F-NEW-1 (one manifest writer remains by construction).
+    _run_root_claude_dir_install(args)
 
     _project_init.materialize_root_knowledge(PROJECT_ROOT, log_event=_log_install_event)  # Step 4d (v0.2.81): seed root knowledge/ == shared
 
@@ -6588,12 +6700,14 @@ def main() -> int:
         data=_vscode_excludes_result,
     )
 
-    # Step 9b: Install agents and skills from templates/
-    # v0.2.70 FIX-3 (secondary): thread the live deferral report so symlinked
-    # .claude/agents | .claude/skills targets emit a deferral (previously this
-    # call passed no report -> the 5 emit_symlink_deferral calls were
-    # guarded-out and a symlinked agents/skills dir redirected SILENTLY).
-    _install_agents_and_skills(args, deferral_report=_deferral_report)
+    # Step 9b (RETIRED v0.2.85, PLAN-v0285 D1): agents/skills/hooks/settings
+    # are now installed by the delegated install-bundle call in Step 5b above
+    # (the root is a subprocess client of the same engine the launcher uses).
+    # The old _install_agents_and_skills + _install_hooks_and_settings +
+    # settings-merge helpers were deleted — a single classifier/enumerator/
+    # manifest-writer/settings-merge remains (R-A). The v0.2.70 FIX-3
+    # symlink-deferral consolidation for .claude/{agents,skills} is now
+    # provided BY the bundle path's consolidated symlink deferral.
 
     # Step 10: Check Claude CLI
     _check_claude_cli()
@@ -9633,6 +9747,10 @@ def _install_vendored_lean_ctx() -> str | None:
         dest = dest_dir / "lean-ctx"
     try:
         dest_dir.mkdir(parents=True, exist_ok=True)
+        # copy2-audit (v0.2.85 D7): KEEP — lean-ctx tool installer, a separate
+        # concern from root-bundle delegation (out of WP-1 scope). Copies the
+        # vendored prebuilt into ~/.local/bin; a partial copy soft-fails via
+        # the except below. Atomic conversion is a follow-up improvement.
         shutil.copy2(src, dest)
         if os_name != "Windows":
             os.chmod(dest, 0o755)
@@ -11516,541 +11634,6 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
     _log_install_event("4/10", "ok", "weaviate_mcp submodule imports verified (FN-5b)")
 
 
-# ---------------------------------------------------------------------------
-# Step 5b: Materialize orchestrator-self .claude/ from templates
-#
-# PR-39 (v0.2.12, 2026-05-16). Before this PR the public repo shipped:
-#   1. 50 .claude/hooks/*.{sh,ps1} files byte-identical with templates/hooks/*
-#      (CI gate check_template_drift.py enforced parity — pure duplication).
-#   2. 36 .claude/scripts/*.py files where templates were NEWER (post commit
-#      c209261 per-project portability fix never reached the active copies).
-#   3. .claude/settings.json — bash-flavored Linux/macOS-only assembled
-#      artifact that would break on Windows installs without bash.
-#
-# User direction (2026-05-16): "anything that is or will be generated from a
-# template at install time should NOT ship in the public repo. Only ship the
-# template itself." Templates are now the single source of truth; this
-# function renders the orchestrator-self's runtime .claude/ from them at
-# install time (and on every --update). Downstream user projects already
-# went through this template-driven render via vco_lib.project_init —
-# orchestrator-self now uses the same pipeline.
-# ---------------------------------------------------------------------------
-
-def _load_self_materialize_prior_hashes(install_root: Path) -> dict:
-    """Read the prior-shipped hashes from
-    ``<install_root>/.claude/.vco-manifest.json`` (the V0243-4 manifest
-    rewritten by :func:`_refresh_orchestrator_self_vco_manifest` after
-    every materialize run).
-
-    Returns ``{".claude/hooks/<name>": "<sha256>", ...}``. Missing or
-    corrupt manifest → empty dict (the git-history heal in
-    ``_self_materialize_file_action`` covers pre-manifest installs).
-    """
-    target = install_root / ".claude" / ".vco-manifest.json"
-    try:
-        data = json.loads(target.read_text(encoding="utf-8"))
-        files = data.get("files") if isinstance(data, dict) else None
-        if isinstance(files, dict):
-            return {
-                k: (v or {}).get("sha256", "")
-                for k, v in files.items()
-                if isinstance(v, dict)
-            }
-    except (OSError, json.JSONDecodeError):
-        pass
-    return {}
-
-
-def _self_materialize_file_action(
-    src: Path,
-    target: Path,
-    prior_hash: str,
-    install_root: Path,
-) -> tuple[str, bytes]:
-    """Per-file decision for the orchestrator-self materialize — the
-    v0.2.54 Track D backport of ``vco_lib.project_init._file_action``'s
-    bundle-path semantics (hash-compare + preserve, instead of the
-    pre-fix unconditional overwrite that silently destroyed runtime-copy
-    edits like the 118-line agent-skill-keyword-match divergence observed
-    in the field).
-
-    Returns (action, source_bytes) where action is one of:
-      "create"    — target missing.
-      "noop"      — target identical to the current template.
-      "overwrite" — target matches the prior-shipped hash (manifest) OR
-                    any historical shipped version (git-history heal,
-                    v0.2.31 pattern) → user untouched, safe to update.
-      "preserve"  — target diverges from every shipped version → user-
-                    modified; skip + defer.
-    """
-    source_bytes = src.read_bytes()
-    if not target.exists():
-        return ("create", source_bytes)
-    installed_hash = _project_init._file_sha256(target)
-    new_hash = _project_init._bytes_sha256(source_bytes)
-    if installed_hash == new_hash:
-        return ("noop", source_bytes)
-    if prior_hash and installed_hash == prior_hash:
-        return ("overwrite", source_bytes)
-    # Pre-manifest installs (every install before v0.2.54) have no
-    # prior_hash. Walk the template's git history: installed content
-    # matching ANY shipped version = "VCO-shipped, just stale" → safe
-    # to overwrite. Genuinely user-edited content matches nothing →
-    # preserve. (Same discipline as project_init._file_action's
-    # v0.2.31 heal — without it, the first post-v0.2.54 update would
-    # freeze every stale-but-untouched runtime copy forever.)
-    if _project_init._installed_matches_template_history(
-        src, installed_hash, install_root,
-    ):
-        return ("overwrite", source_bytes)
-    return ("preserve", source_bytes)
-
-
-def _emit_self_materialize_preserved_deferral(
-    deferral_report: "DeferralReport | None",
-    preserved: list,
-    install_root: Path,
-) -> None:
-    """Emit ``orchestrator_self_user_modified_preserved``: the
-    orchestrator-self materialize found runtime copies in
-    ``.claude/{hooks,scripts}`` that diverge from every shipped template
-    version and left them in place."""
-    if deferral_report is None or not preserved:
-        return
-    try:
-        file_list = _project_init._format_file_list_md(
-            [f".claude/{p}" for p in preserved],
-        )
-        deferral_report.add_entry(
-            DeferralEntry(
-                condition_id="orchestrator_self_user_modified_preserved",
-                title=(
-                    f"{len(preserved)} user-modified .claude/ file(s) "
-                    "preserved during materialize"
-                ),
-                detected=(
-                    "While rendering the orchestrator's runtime .claude/ "
-                    "from templates/, these files diverged from every "
-                    "version VCO ever shipped (manifest hash + git-history "
-                    "walk) and were PRESERVED on disk:\n" + file_list
-                ),
-                why_deferred=(
-                    "Pre-v0.2.54 this step silently overwrote runtime "
-                    "copies, destroying local edits (dogfooded features, "
-                    "hotfixes applied directly to .claude/scripts/). The "
-                    "preserved files may now LAG the shipped templates — "
-                    "diff them and either port your changes INTO "
-                    "templates/ (so they ship) or accept the template "
-                    "versions."
-                ),
-                command_to_apply=(
-                    "# Compare each preserved file against its template:\n"
-                    "#   diff .claude/scripts/<name> templates/scripts/<name>\n"
-                    "# Accept the template versions for ALL preserved files:\n"
-                    "python install.py --update --force-materialize-claude-dir"
-                ),
-                severity="warning",
-                kg_node_refs=[],
-            )
-        )
-    except Exception as exc:  # noqa: BLE001 — soft-fail by design
-        _log_install_event(
-            "4b/10", "warn",
-            f"could not emit orchestrator_self_user_modified_preserved "
-            f"deferral: {exc}",
-        )
-
-
-def _materialize_orchestrator_self_claude_dir(
-    install_root: Path,
-    deferral_report: "DeferralReport | None" = None,
-    force_overwrite: bool = False,
-) -> None:
-    """Render the orchestrator-self's runtime .claude/ contents from templates.
-
-    Copies ``templates/hooks/*`` → ``<install_root>/.claude/hooks/`` and
-    ``templates/scripts/*`` → ``<install_root>/.claude/scripts/`` preserving
-    executable bits, then renders the OS-appropriate
-    ``templates/settings.json.{linux,windows}.template`` to
-    ``<install_root>/.claude/settings.json``.
-
-    v0.2.54 Track D (Theme 5): per-file hash-compare with preserve-and-
-    defer semantics, backported from the per-project bundle path
-    (``project_init._file_action``). A runtime copy that diverges from
-    every shipped template version (self-manifest hash + git-history
-    heal) is PRESERVED and listed in an
-    ``orchestrator_self_user_modified_preserved`` deferral entry instead
-    of silently overwritten. ``--force-materialize-claude-dir`` accepts
-    the template versions. ``hooks/_lib`` subdirs remain always-
-    overwrite (not user-customisable — same contract as the bundle
-    path). Prior-shipped hashes come from ``.claude/.vco-manifest.json``
-    (rewritten with template hashes by
-    ``_refresh_orchestrator_self_vco_manifest`` right after this
-    function runs).
-
-    Idempotent: re-running converges on the current templates for every
-    file the user hasn't touched. Users running ``install.py --update``
-    after a ``git pull`` get the latest hook/script/settings content
-    automatically.
-
-    Soft-fail: if any individual template file is missing for some reason,
-    a warning is logged and the install continues — a partial hook set
-    is better than aborting an entire install over a single file. The
-    settings.json render is also soft-fail (skipped with warning) so a
-    missing OS template doesn't kill the install on an unexpected
-    platform.
-
-    v0.2.46 V47-B (Gap B): if ``.claude/`` (or ``.claude/hooks/`` /
-    ``.claude/scripts/``) is a symlink, VCO writes its content to a
-    sibling ``.vco-new`` path and emits a deferral entry. The original
-    symlink is preserved. Symlinks at individual file targets are also
-    caught — the symlinked file is left alone and VCO's content lands
-    at the sibling.
-
-    Honors ``--skip-materialize-claude-dir`` for tests / special-case
-    installs targeting a pre-populated .claude/ directory.
-    """
-    claude_dir = install_root / ".claude"
-    templates_dir = install_root / "templates"
-
-    print("[4b/10] Materializing orchestrator .claude/ from templates ... ",
-          end="", flush=True)
-    _log_install_event("4b/10", "start",
-                       "rendering .claude/{hooks,scripts,settings.json}")
-
-    copied_hooks = 0
-    copied_scripts = 0
-    warnings: list[str] = []
-    # v0.2.70 FIX-3 (Stream B sibling): accumulate every (symlink, .vco-new)
-    # redirect pair across the materialize so we can emit ONE consolidated
-    # deferral via emit_symlink_deferral_multi. Calling the single-pair
-    # emit_symlink_deferral once per redirect would silently DROP all but the
-    # last (DeferralReport.add_entry is last-write-wins per condition_id, and
-    # all 8 redirects share SYMLINK_PRESERVED_CONDITION_ID) -- the exact bug
-    # class Stream B fixed for the bundle path.
-    symlink_events: list[tuple[Path, Path]] = []
-    # v0.2.54 Track D: hash-compare bookkeeping. Prior-shipped hashes
-    # come from .claude/.vco-manifest.json (rewritten with TEMPLATE
-    # hashes by _refresh_orchestrator_self_vco_manifest after this
-    # function). `preserved` collects ".claude/"-relative paths (e.g.
-    # "scripts/foo.py") left in place because they diverge from every
-    # shipped version.
-    prior_hashes = _load_self_materialize_prior_hashes(install_root)
-    preserved: list = []
-
-    # v0.2.46 V47-B (Gap B): if .claude/ itself is a symlink, redirect
-    # the entire materialization to a sibling .vco-new tree. This catches
-    # the symlinked-claude-dir case where the user pointed .claude at a
-    # shared workflow tree — VCO refuses to touch it.
-    if is_symlink_blocking(claude_dir):
-        vco_new_claude = compute_vco_new_path(claude_dir)
-        symlink_events.append((claude_dir, vco_new_claude))
-        warnings.append(
-            f".claude/ is a symlink — materializing into "
-            f"{vco_new_claude.name} instead (see UPDATE_DEFERRED.md)"
-        )
-        claude_dir = vco_new_claude
-
-    # 1. Hooks: templates/hooks/* → .claude/hooks/* preserving exec bit.
-    hooks_src = templates_dir / "hooks"
-    hooks_dst = claude_dir / "hooks"
-    if not hooks_src.is_dir():
-        warnings.append(f"templates/hooks/ missing at {hooks_src}")
-    else:
-        # v0.2.46 V47-B: symlinked .claude/hooks/ → redirect to sibling.
-        if is_symlink_blocking(hooks_dst):
-            vco_new_hooks = compute_vco_new_path(hooks_dst)
-            symlink_events.append((hooks_dst, vco_new_hooks))
-            warnings.append(
-                f".claude/hooks is a symlink — writing into "
-                f"{vco_new_hooks.name} instead"
-            )
-            hooks_dst = vco_new_hooks
-
-        hooks_dst.mkdir(parents=True, exist_ok=True)
-        # v0.2.54 Track G (G-4): filter by the shared hook-flavour globs.
-        # Pre-G-4 this loop copied every file via iterdir() — which DID
-        # ship both .sh + .ps1 flavours, but by accident rather than
-        # policy, and would also have shipped any stray non-hook file
-        # someone dropped into templates/hooks/. Now the both-flavours
-        # policy is explicit and shared with Step 9b + project_init.
-        from vco_lib.bundle_globs import hook_globs as _hook_globs
-        from fnmatch import fnmatch as _fnmatch
-        for src in hooks_src.iterdir():
-            if not src.is_file():
-                continue  # Skip _lib/ and other subdirs; handled below.
-            if not any(_fnmatch(src.name, g) for g in _hook_globs()):
-                continue  # Not a hook flavour we ship (.sh / .ps1 only).
-            target = hooks_dst / src.name
-            # v0.2.46 V47-B: individual hook file is a symlink → skip
-            # the in-place copy; land VCO's version at the sibling.
-            if is_symlink_blocking(target):
-                vco_new_file = compute_vco_new_path(target)
-                symlink_events.append((target, vco_new_file))
-                try:
-                    shutil.copy2(src, vco_new_file)
-                except OSError as e:
-                    warnings.append(
-                        f"failed to copy {src.name} to .vco-new sibling: {e}"
-                    )
-                continue
-            try:
-                # v0.2.54 Track D: hash-compare instead of unconditional
-                # overwrite. User-modified runtime copies are preserved
-                # + deferred (see _self_materialize_file_action).
-                prior_hash = prior_hashes.get(
-                    str(Path(".claude") / "hooks" / src.name), "",
-                )
-                action, _source_bytes = _self_materialize_file_action(
-                    src, target, prior_hash, install_root,
-                )
-                if action == "preserve" and not force_overwrite:
-                    preserved.append(f"hooks/{src.name}")
-                    continue
-                if action != "noop":
-                    shutil.copy2(src, target)
-                # v0.2.53 belt-and-braces: install.py's pre-existing test
-                # `test_install_into_fresh_target_linux` caught 3 v0.2.52
-                # hooks shipped with mode 664 (no exec bit). Without exec
-                # bit, Claude Code refuses to fire the hook on POSIX. Defend
-                # by force-setting 0o755 on every .sh hook target — copy2
-                # preserves source mode, so any contributor who commits a
-                # 664-mode hook silently disables it without this fix.
-                if src.suffix == ".sh":
-                    try:
-                        os.chmod(target, 0o755)
-                    except OSError as chmod_e:
-                        warnings.append(
-                            f"failed to chmod 755 {src.name}: {chmod_e}"
-                        )
-                copied_hooks += 1
-            except OSError as e:
-                warnings.append(f"failed to copy {src.name}: {e}")
-        # Also copy nested helper dirs (e.g. _lib/) that ship alongside.
-        for sub in hooks_src.iterdir():
-            if sub.is_dir():
-                dst_sub = hooks_dst / sub.name
-                # v0.2.46 V47-B: never rmtree a symlinked subdir; land
-                # at sibling instead.
-                if is_symlink_blocking(dst_sub):
-                    vco_new_sub = compute_vco_new_path(dst_sub)
-                    symlink_events.append((dst_sub, vco_new_sub))
-                    try:
-                        shutil.copytree(sub, vco_new_sub)
-                    except OSError as e:
-                        warnings.append(
-                            f"failed to copy hooks subdir "
-                            f"{sub.name} to .vco-new sibling: {e}"
-                        )
-                    continue
-                if os.path.lexists(os.fspath(dst_sub)):
-                    shutil.rmtree(dst_sub)
-                try:
-                    shutil.copytree(sub, dst_sub)
-                except OSError as e:
-                    warnings.append(f"failed to copy hooks subdir {sub.name}: {e}")
-
-    # 2. Scripts: same pattern.
-    scripts_src = templates_dir / "scripts"
-    scripts_dst = claude_dir / "scripts"
-    if not scripts_src.is_dir():
-        warnings.append(f"templates/scripts/ missing at {scripts_src}")
-    else:
-        # v0.2.46 V47-B: symlinked .claude/scripts/ → redirect to sibling.
-        if is_symlink_blocking(scripts_dst):
-            vco_new_scripts = compute_vco_new_path(scripts_dst)
-            symlink_events.append((scripts_dst, vco_new_scripts))
-            warnings.append(
-                f".claude/scripts is a symlink — writing into "
-                f"{vco_new_scripts.name} instead"
-            )
-            scripts_dst = vco_new_scripts
-
-        scripts_dst.mkdir(parents=True, exist_ok=True)
-        for src in scripts_src.iterdir():
-            if not src.is_file():
-                continue
-            target = scripts_dst / src.name
-            # v0.2.46 V47-B: individual script file is a symlink → skip.
-            if is_symlink_blocking(target):
-                vco_new_file = compute_vco_new_path(target)
-                symlink_events.append((target, vco_new_file))
-                try:
-                    shutil.copy2(src, vco_new_file)
-                except OSError as e:
-                    warnings.append(
-                        f"failed to copy {src.name} to .vco-new sibling: {e}"
-                    )
-                continue
-            try:
-                # v0.2.54 Track D: same hash-compare contract as hooks.
-                prior_hash = prior_hashes.get(
-                    str(Path(".claude") / "scripts" / src.name), "",
-                )
-                action, _source_bytes = _self_materialize_file_action(
-                    src, target, prior_hash, install_root,
-                )
-                if action == "preserve" and not force_overwrite:
-                    preserved.append(f"scripts/{src.name}")
-                    continue
-                if action != "noop":
-                    shutil.copy2(src, target)
-                copied_scripts += 1
-            except OSError as e:
-                warnings.append(f"failed to copy {src.name}: {e}")
-
-    # 3. settings.json: OS-dispatch + render.
-    if platform.system() == "Windows":
-        settings_template = templates_dir / "settings.json.windows.template"
-    else:
-        settings_template = templates_dir / "settings.json.linux.template"
-    if not settings_template.is_file():
-        warnings.append(f"settings template missing at {settings_template}")
-    else:
-        try:
-            settings_dst = claude_dir / "settings.json"
-            settings_dst.parent.mkdir(parents=True, exist_ok=True)
-
-            # v0.2.46 V47-B (Gap B): symlinked settings.json → write to
-            # sibling. Catches the case where the user symlinks
-            # settings.json to a shared config tree across projects.
-            if is_symlink_blocking(settings_dst):
-                vco_new_settings = compute_vco_new_path(settings_dst)
-                symlink_events.append((settings_dst, vco_new_settings))
-                warnings.append(
-                    f".claude/settings.json is a symlink — writing into "
-                    f"{vco_new_settings.name} instead"
-                )
-                settings_dst = vco_new_settings
-
-            # v0.2.30 fix: preserve existing settings.json's `env` block on
-            # re-render. Pre-v0.2.30 this code unconditionally overwrote
-            # settings.json with the rendered template — which has NO env
-            # block. Result: any user-customized `env.KG_COLLECTION` (e.g.
-            # a per-project override pointing at the project's legacy
-            # collection name) was silently wiped on every
-            # `install.py --update` run, then the downstream
-            # `_backfill_kg_collection_env_in_project` step re-derived a
-            # default that didn't match what the user had set. Symptom:
-            # `hybrid_search` returns 0 results because the MCP queries
-            # the wrong collection. Now: when settings.json already
-            # exists, merge the template's hooks/permissions block in but
-            # PRESERVE the user's env, _comment, and any other top-level
-            # keys. Fresh installs see no change (template wins).
-            rendered = settings_template.read_text(encoding="utf-8")
-            # Placeholder substitution (no-op today: the OS templates are
-            # fully concrete and ship without `{{PROJECT_NAME}}` markers).
-            rendered = rendered.replace("{{PROJECT_NAME}}",
-                                        "VibeCoded Orchestrator")
-
-            if settings_dst.is_file():
-                # Existing settings.json — merge additively. Preserve
-                # any top-level key the template doesn't declare (in
-                # particular `env`, `_comment`, `_env_comment`), and
-                # take the template's version for keys it does declare
-                # (`hooks`, `permissions`, `$schema`, `_template_origin`).
-                try:
-                    existing = json.loads(
-                        settings_dst.read_text(encoding="utf-8")
-                    )
-                    rendered_obj = json.loads(rendered)
-                    if isinstance(existing, dict) and isinstance(
-                        rendered_obj, dict
-                    ):
-                        merged = dict(existing)  # start with user state
-                        for k, v in rendered_obj.items():
-                            # Template wins for hook/permission/schema
-                            # keys (those are the "shipped contract").
-                            # User wins for env-shaped keys (preserved
-                            # via NOT overwriting from template). The
-                            # rendered template has no `env` key, so
-                            # `existing.env` survives by construction —
-                            # this is the load-bearing invariant.
-                            merged[k] = v
-                        settings_dst.write_text(
-                            json.dumps(merged, indent=2) + "\n",
-                            encoding="utf-8",
-                        )
-                    else:
-                        # User had unparseable JSON — refuse to clobber.
-                        warnings.append(
-                            "settings.json present but unparseable; left untouched"
-                        )
-                except (OSError, json.JSONDecodeError) as e:
-                    warnings.append(
-                        f"settings.json merge failed ({e}); left untouched"
-                    )
-            else:
-                # Fresh install — write the template as-is. The
-                # downstream `_backfill_code_graph_project_env` +
-                # `_backfill_kg_collection_env_in_project` steps add
-                # the env block.
-                settings_dst.write_text(rendered, encoding="utf-8")
-        except OSError as e:
-            warnings.append(f"failed to render settings.json: {e}")
-
-    # v0.2.70 FIX-3: emit ONE consolidated symlink deferral covering every
-    # (symlink, .vco-new) redirect this run hit. Replaces the 8 single-pair
-    # emits that collapsed to last-write-wins under the shared condition_id.
-    if symlink_events and deferral_report is not None:
-        emit_symlink_deferral_multi(
-            deferral_report, symlink_events, install_root=install_root,
-        )
-
-    # v0.2.54 Track D: surface preserved (user-modified) runtime copies.
-    # Informational, not a failure — but they must be visible: the
-    # preserved files now LAG the shipped templates until the user diffs
-    # + reconciles (or re-runs with --force-materialize-claude-dir).
-    if preserved:
-        _emit_self_materialize_preserved_deferral(
-            deferral_report, preserved, install_root,
-        )
-        warnings.append(
-            f"{len(preserved)} user-modified file(s) preserved (not "
-            f"overwritten): {', '.join(sorted(preserved)[:10])}"
-            + (" ..." if len(preserved) > 10 else "")
-            + " — see UPDATE_DEFERRED.md"
-        )
-        _log_install_event(
-            "4b/10", "info",
-            f"preserved {len(preserved)} user-modified .claude/ file(s)",
-            data={"preserved": sorted(preserved)},
-        )
-
-    if warnings:
-        print("PARTIAL")
-        for w in warnings:
-            print(f"  ! {w}")
-        _log_install_event(
-            "4b/10", "warn",
-            f"materialized {copied_hooks} hooks + {copied_scripts} scripts "
-            f"with {len(warnings)} warnings",
-            data={"warnings": warnings,
-                  "copied_hooks": copied_hooks,
-                  "copied_scripts": copied_scripts},
-        )
-    else:
-        print(f"OK ({copied_hooks} hooks, {copied_scripts} scripts)")
-        _log_install_event(
-            "4b/10", "ok",
-            f"materialized {copied_hooks} hooks + {copied_scripts} scripts",
-            data={"copied_hooks": copied_hooks,
-                  "copied_scripts": copied_scripts},
-        )
-
-    # V0243-4: on orchestrator-root installs, refresh .vco-manifest.json
-    # with current shipped-file SHA256s + bump vco_version. Only runs after
-    # templates have been copied (so hashes reflect the latest on-disk state).
-    if _is_orchestrator_root_install():
-        _refresh_orchestrator_self_vco_manifest(install_root)
-
-    # v0.2.50 Track A: also materialize the orchestrator's own CLAUDE.md
-    # from templates/ORCHESTRATOR-CLAUDE.md.template. Idempotent — runs on
-    # every install + --update. Preserves user content outside the AUTO
-    # markers; replaces the AUTO block with freshly rendered template.
-    _materialize_orchestrator_self_claude_md(install_root)
-
-
 def _materialize_orchestrator_self_claude_md(install_root: Path) -> None:
     """v0.2.50 Track A: render templates/ORCHESTRATOR-CLAUDE.md.template
     to ``<install_root>/CLAUDE.md``.
@@ -12168,187 +11751,6 @@ def _materialize_vct_secrets_shared_readme(install_root: Path) -> None:
         _log_install_event(
             "5c/10", "warn",
             f"failed to materialize vct-secrets shared _README.md: {result.message}",
-        )
-
-
-def _refresh_orchestrator_self_vco_manifest(install_root: Path) -> None:
-    """V0243-4: rewrite `<install_root>/.claude/.vco-manifest.json` with
-    current shipped-file SHA256 hashes + bump `vco_version` to the current
-    HEAD commit from ``_read_git_rev()[0]``.
-
-    Only called from the orchestrator-root install path (after templates are
-    copied by ``_materialize_orchestrator_self_claude_dir``).  Per-project
-    installs have their manifest written by
-    ``vco_lib.project_init.install_project_bundle``.
-
-    The manifest tracks every file that install.py copies from
-    ``templates/`` to ``.claude/`` — hooks, scripts, and the rendered
-    settings.json.  Agents and skills are NOT included because their
-    source-of-truth is ``templates/{agents,skills}/`` and they are written
-    by the per-project bundle path, not by the orchestrator-self path.
-
-    Soft-fail throughout: any OSError is logged but does not abort the
-    install.  A missing or stale manifest is only a cosmetic issue (the
-    launcher's bundle-update flow will notice the drift on the next
-    per-project update pass).
-    """
-    import hashlib as _hashlib
-    import datetime as _dt
-
-    claude_dir = install_root / ".claude"
-    manifest_path = claude_dir / ".vco-manifest.json"
-
-    # Collect shipped files that were just materialised.
-    file_entries: dict[str, dict] = {}
-    templates_dir = install_root / "templates"
-
-    def _sha256_file(p: Path) -> str:
-        h = _hashlib.sha256()
-        try:
-            with open(p, "rb") as fh:
-                for chunk in iter(lambda: fh.read(65536), b""):
-                    h.update(chunk)
-        except OSError:
-            return ""
-        return h.hexdigest()
-
-    # Hooks (top-level files only — _lib/ sub-tree handled below).
-    #
-    # v0.2.54 Track D: hash the TEMPLATE source, not the destination.
-    # The manifest's `sha256` is the prior-SHIPPED hash consumed by both
-    # the per-project bundle `_file_action` and the orchestrator-self
-    # materialize's hash-compare. Pre-fix the two were identical (the
-    # materialize overwrote unconditionally, so dst == src); with
-    # preserve-and-defer semantics a user-modified dst can diverge —
-    # recording the dst hash would make the NEXT run see
-    # installed == prior-shipped and overwrite the very file the
-    # previous run preserved.
-    hooks_src = templates_dir / "hooks"
-    if hooks_src.is_dir():
-        for src in hooks_src.iterdir():
-            if not src.is_file():
-                continue
-            rel = str(Path(".claude") / "hooks" / src.name)
-            src_rel = str(src.relative_to(install_root))
-            file_entries[rel] = {
-                "sha256": _sha256_file(src),
-                "source": src_rel,
-            }
-        # _lib/ subdirectory.
-        lib_src = hooks_src / "_lib"
-        if lib_src.is_dir():
-            for src in lib_src.iterdir():
-                if not src.is_file():
-                    continue
-                rel = str(Path(".claude") / "hooks" / "_lib" / src.name)
-                src_rel = str(src.relative_to(install_root))
-                file_entries[rel] = {
-                    "sha256": _sha256_file(src),
-                    "source": src_rel,
-                }
-
-    # Scripts.
-    scripts_src = templates_dir / "scripts"
-    if scripts_src.is_dir():
-        for src in scripts_src.iterdir():
-            if not src.is_file():
-                continue
-            rel = str(Path(".claude") / "scripts" / src.name)
-            src_rel = str(src.relative_to(install_root))
-            # v0.2.54 Track D: template hash (= prior-shipped), not dst.
-            # See the hooks comment above for why this is load-bearing.
-            file_entries[rel] = {
-                "sha256": _sha256_file(src),
-                "source": src_rel,
-            }
-
-    # settings.json (rendered from template — hash the on-disk result).
-    settings_dst = claude_dir / "settings.json"
-    if platform.system() == "Windows":
-        settings_src_name = "settings.json.windows.template"
-    else:
-        settings_src_name = "settings.json.linux.template"
-    settings_src = templates_dir / settings_src_name
-    if settings_src.is_file():
-        rel = str(Path(".claude") / "settings.json")
-        file_entries[rel] = {
-            "sha256": _sha256_file(
-                settings_dst if settings_dst.exists() else settings_src
-            ),
-            "source": str(settings_src.relative_to(install_root)),
-        }
-
-    # Determine vco_version.
-    commit, _ = _read_git_rev()
-    vco_version = commit or "unknown"
-
-    now_str = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    # Read existing manifest to preserve preserved_files section.
-    existing: dict = {}
-    if manifest_path.is_file():
-        try:
-            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception:
-            existing = {}
-
-    manifest_payload = {
-        "schema_version": 2,
-        "vco_version": vco_version,
-        "installed_at": existing.get("installed_at", now_str),
-        "updated_at": now_str,
-        "files": file_entries,
-        "preserved_files": existing.get("preserved_files", {}),
-    }
-
-    try:
-        # v0.2.46 V47-B (Gap B): if .claude/ itself is a symlink, write
-        # the manifest to a sibling .vco-new tree. os.replace() on a
-        # symlinked DESTINATION would replace the symlink itself on POSIX
-        # (silently destroying the user's link); on Windows it errors.
-        # Either is unacceptable per the hard rule.
-        target_claude = claude_dir
-        if is_symlink_blocking(target_claude):
-            target_claude = compute_vco_new_path(target_claude)
-            target_claude.mkdir(parents=True, exist_ok=True)
-            manifest_path_effective = target_claude / ".vco-manifest.json"
-        else:
-            claude_dir.mkdir(parents=True, exist_ok=True)
-            manifest_path_effective = manifest_path
-
-        # v0.2.46 V47-B: also guard the manifest file itself.
-        if is_symlink_blocking(manifest_path_effective):
-            manifest_path_effective = compute_vco_new_path(
-                manifest_path_effective
-            )
-
-        payload_bytes = (json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n")
-        # Atomic write via tempfile + replace.
-        import tempfile as _tf
-        fd, tmp_path = _tf.mkstemp(
-            dir=str(manifest_path_effective.parent),
-            suffix=".tmp", prefix=".vco-manifest-",
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(payload_bytes)
-            os.replace(tmp_path, str(manifest_path_effective))
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-        _log_install_event(
-            "4b/10", "ok",
-            f"V0243-4: refreshed .vco-manifest.json "
-            f"({len(file_entries)} files, vco_version={vco_version!r})",
-            data={"file_count": len(file_entries), "vco_version": vco_version},
-        )
-    except OSError as exc:
-        _log_install_event(
-            "4b/10", "warn",
-            f"V0243-4: could not write .vco-manifest.json: {exc}",
         )
 
 
@@ -19390,6 +18792,11 @@ def _try_cargo_tauri_build(install_root: Path) -> Optional[Path]:
     if src is None:
         return None
     try:
+        # copy2-audit (v0.2.85 D7/E5): KEEP — dist-staging family. Stages a
+        # freshly built launcher binary into launcher/dist/; the running
+        # launcher reads the INSTALLED binary, not this staged copy, and the
+        # binary swap has its own os.replace/rename dance (see the block near
+        # _refresh_dist_binary). Conversion is polish, not a data-safety fix.
         shutil.copy2(src, target_path)
         if not platform.system().lower().startswith("win"):
             target_path.chmod(0o755)
@@ -20658,6 +20065,9 @@ def _try_cargo_build_vct_hub(install_root: Path) -> Optional[Path]:
     if src is None or not src.is_file():
         return None
     try:
+        # copy2-audit (v0.2.85 D7/E5): KEEP — dist-staging family (vct-hub
+        # binary). Same rationale as the launcher-binary stage above: the
+        # running hub reads the installed binary, not this staged copy.
         shutil.copy2(src, target_path)
         if not platform.system().lower().startswith("win"):
             target_path.chmod(0o755)
@@ -21685,6 +21095,9 @@ def _rewrite_stale_mcp_entries(
         ts = int(time.time())
         bak_rewrite = claude_json.with_name(claude_json.name + f".bak-rewrite-{ts}")
         try:
+            # copy2-audit (v0.2.85 D7): KEEP — fresh timestamped backup
+            # destination (`.bak-rewrite-<ts>`), never overwrites a live
+            # target, so non-atomicity cannot destroy data.
             shutil.copy2(claude_json, bak_rewrite)
             output_fn(f"  Snapshot saved: {bak_rewrite}")
         except OSError as exc:
@@ -21973,6 +21386,9 @@ def _remove_deprecated_mcp_entries(
         ts = int(time.time())
         bak_path = claude_json.with_name(claude_json.name + f".bak-depr-remove-{ts}")
         try:
+            # copy2-audit (v0.2.85 D7): KEEP — fresh timestamped backup
+            # destination (`.bak-depr-remove-<ts>`), never overwrites a live
+            # target.
             shutil.copy2(claude_json, bak_path)
             output_fn(f"  Snapshot saved: {bak_path}")
         except OSError as exc:
@@ -22044,6 +21460,10 @@ def _remove_deprecated_mcp_entries(
                         removed_names.append(name)
             try:
                 if claude_json.is_file():
+                    # copy2-audit (v0.2.85 D7): KEEP — `.bak` snapshot
+                    # destination (nothing reads it as a live config); the
+                    # live `claude_json` write below is atomic via .tmp +
+                    # os.replace.
                     bak = claude_json.with_suffix(claude_json.suffix + ".bak")
                     shutil.copy2(claude_json, bak)
                 tmp = claude_json.with_suffix(claude_json.suffix + ".tmp")
@@ -23606,346 +23026,6 @@ def _cleanup_legacy_bash_env_shim(args: argparse.Namespace) -> None:
                         f"  legacy BASH_ENV cleanup: shim disable failed "
                         f"({type(e).__name__}: {e}) — re-run after fixing"
                     )
-
-
-# ---------------------------------------------------------------------------
-# Step 9b: Install agents + skills from templates/
-# ---------------------------------------------------------------------------
-
-def _install_agents_and_skills(
-    args: argparse.Namespace,
-    deferral_report: "DeferralReport | None" = None,
-) -> None:
-    """Copy agents and skills from templates/ into .claude/, substituting paths.
-
-    Bundled agents live at templates/agents/free/. Skills live at templates/skills/.
-
-    Placeholder substitutions applied to copied files:
-        {{ORCHESTRATOR_ROOT}} → this install directory
-        {{PROJECTS_ROOT}}     → parent directory
-        {{HOME}}              → user home directory
-
-    v0.2.46 V47-B (Gap B): symlinks at any agent/skill target are left
-    alone; VCO's content lands at a ``.vco-new`` sibling and a deferral
-    entry is emitted. Uses ``os.path.lexists`` (not ``Path.exists``) for
-    the "is this already present?" check so dangling symlinks aren't
-    silently treated as "vacant slot".
-    """
-    print("[9b/10] Installing agents, skills, and hooks ... ", flush=True)
-
-    templates_dir = PROJECT_ROOT / "templates"
-    claude_dir = PROJECT_ROOT / ".claude"
-    agents_dst = claude_dir / "agents"
-    skills_dst = claude_dir / "skills"
-
-    subs = {
-        "{{ORCHESTRATOR_ROOT}}": str(PROJECT_ROOT),
-        "{{PROJECTS_ROOT}}": str(PROJECT_ROOT.parent),
-        "{{HOME}}": str(Path.home()),
-    }
-
-    # v0.2.70 FIX-3 (secondary): accumulate (symlink, .vco-new) redirect pairs
-    # so we emit ONE consolidated deferral (emit_symlink_deferral_multi) at the
-    # end instead of N single-pair emits that collapse to last-write-wins under
-    # the shared SYMLINK_PRESERVED_CONDITION_ID.
-    symlink_events: list[tuple[Path, Path]] = []
-
-    def _copy_with_subs(src: Path, dst: Path) -> None:
-        content = src.read_text(encoding="utf-8")
-        for key, val in subs.items():
-            content = content.replace(key, val)
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        dst.write_text(content, encoding="utf-8")
-
-    # v0.2.46 V47-B: if .claude/ is a symlink, refuse to mkdir() over it
-    # or write through it. The whole agents/skills install routes into
-    # a sibling .vco-new tree.
-    if is_symlink_blocking(claude_dir):
-        vco_new_claude = compute_vco_new_path(claude_dir)
-        symlink_events.append((claude_dir, vco_new_claude))
-        claude_dir = vco_new_claude
-        agents_dst = claude_dir / "agents"
-        skills_dst = claude_dir / "skills"
-
-    installed_agents = 0
-    skipped_agents = 0
-    if args.with_agents:
-        # v0.2.46 V47-B: if .claude/agents/ is a symlink, route to sibling.
-        if is_symlink_blocking(agents_dst):
-            vco_new_agents = compute_vco_new_path(agents_dst)
-            symlink_events.append((agents_dst, vco_new_agents))
-            agents_dst = vco_new_agents
-
-        agents_dst.mkdir(parents=True, exist_ok=True)
-        free_src = templates_dir / "agents" / "free"
-        if free_src.exists():
-            for agent_file in sorted(free_src.glob("*.md")):
-                target = agents_dst / agent_file.name
-                # v0.2.46 V47-B: per-file symlink → land at sibling.
-                if is_symlink_blocking(target):
-                    vco_new_target = compute_vco_new_path(target)
-                    symlink_events.append((target, vco_new_target))
-                    _copy_with_subs(agent_file, vco_new_target)
-                    continue
-                # Use lexists so dangling symlinks count as "occupied".
-                if os.path.lexists(os.fspath(target)):
-                    skipped_agents += 1
-                    continue
-                _copy_with_subs(agent_file, target)
-                installed_agents += 1
-
-    installed_skills = 0
-    skipped_skills = 0
-    if args.with_skills:
-        skills_src = templates_dir / "skills"
-        if skills_src.exists():
-            # v0.2.46 V47-B: if .claude/skills/ is a symlink, route to sibling.
-            if is_symlink_blocking(skills_dst):
-                vco_new_skills = compute_vco_new_path(skills_dst)
-                symlink_events.append((skills_dst, vco_new_skills))
-                skills_dst = vco_new_skills
-
-            skills_dst.mkdir(parents=True, exist_ok=True)
-            for skill_dir in sorted(p for p in skills_src.iterdir() if p.is_dir()):
-                target = skills_dst / skill_dir.name
-                # v0.2.46 V47-B: per-skill symlink → land at sibling.
-                if is_symlink_blocking(target):
-                    vco_new_target = compute_vco_new_path(target)
-                    symlink_events.append((target, vco_new_target))
-                    target = vco_new_target
-                elif os.path.lexists(os.fspath(target)):
-                    skipped_skills += 1
-                    continue
-                target.mkdir(parents=True, exist_ok=True)
-                for f in skill_dir.rglob("*"):
-                    rel = f.relative_to(skill_dir)
-                    out = target / rel
-                    if f.is_dir():
-                        out.mkdir(parents=True, exist_ok=True)
-                    elif f.suffix == ".md":
-                        _copy_with_subs(f, out)
-                    else:
-                        out.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(f, out)
-                installed_skills += 1
-
-    # v0.2.70 FIX-3 (secondary): emit ONE consolidated symlink deferral for
-    # every agents/skills redirect this run hit, instead of N single-pair emits
-    # that collapsed to last-write-wins under the shared condition_id.
-    if symlink_events and deferral_report is not None:
-        emit_symlink_deferral_multi(
-            deferral_report, symlink_events, install_root=PROJECT_ROOT,
-        )
-
-    parts = []
-    if args.with_agents:
-        parts.append(f"{installed_agents} agents"
-                     + (f" ({skipped_agents} already present)" if skipped_agents else ""))
-    if args.with_skills:
-        parts.append(f"{installed_skills} skills"
-                     + (f" ({skipped_skills} already present)" if skipped_skills else ""))
-    # Hooks + settings.json (gated on --with-hooks; default on).
-    hooks_summary = _install_hooks_and_settings(args)
-    if hooks_summary:
-        parts.append(hooks_summary)
-
-    if not parts:
-        print("  skipped (--no-agents --no-skills --no-hooks)")
-    else:
-        print("  " + ", ".join(parts))
-
-
-def _settings_template_for_os(templates_dir: Path) -> Path:
-    """Return the OS-specific settings.json template path.
-
-    Two templates ship in templates/: settings.json.linux.template (bash
-    hooks) and settings.json.windows.template (PowerShell hooks). They are
-    identical except for the `command` strings inside `hooks.*.hooks`. See
-    audit F1 (P0).
-    """
-    if platform.system() == "Windows":
-        return templates_dir / "settings.json.windows.template"
-    return templates_dir / "settings.json.linux.template"
-
-
-def _install_hooks_and_settings(args: argparse.Namespace) -> str:
-    """Copy hooks from templates/hooks/ into .claude/hooks/, scripts from
-    templates/scripts/ into .claude/scripts/, and smart-merge the OS-specific
-    settings template into .claude/settings.json.
-
-    Hooks and scripts are byte-copied (no placeholder substitution) so every
-    project carries identical files. They read VCT_INSTALL_ROOT,
-    KG_COLLECTION, WEAVIATE_URL, etc. at runtime; the launcher exports
-    VCT_INSTALL_ROOT per-project.
-
-    Hook flavours: BOTH `.sh` and `.ps1` are copied on every OS (v0.2.54
-    Track G G-4, routed through `vco_lib.bundle_globs.hook_globs()` — the
-    same policy as the per-project bundle path in `project_init`). The
-    pre-G-4 native-flavour-only policy (audit F1) broke dual-boot / WSL-
-    crossover setups where the same folder is opened from both shells.
-
-    settings.json merge rules (only when target file already exists):
-      * recursive dict merge — template provides defaults, user keys win on conflict
-      * `hooks.{Event}` arrays: append template entries that don't already exist
-        (compared by `command` string equality on the inner-hooks list); never
-        replace user-customized commands.
-
-    Returns a one-line summary string for the caller to print, or "" when the
-    install was skipped (e.g. --no-hooks or templates missing).
-    """
-    if not getattr(args, "with_hooks", True):
-        return ""
-
-    templates_dir = PROJECT_ROOT / "templates"
-    hooks_src = templates_dir / "hooks"
-    scripts_src = templates_dir / "scripts"
-    settings_template = _settings_template_for_os(templates_dir)
-    if not hooks_src.exists():
-        return ""
-
-    from vco_lib.bundle_globs import hook_globs, script_patterns
-    claude_dir = PROJECT_ROOT / ".claude"
-    hooks_dst = claude_dir / "hooks"
-    hooks_dst.mkdir(parents=True, exist_ok=True)
-
-    installed_hooks = 0
-    skipped_hooks = 0  # kept for the summary string; always 0 after the P2.2 fix.
-    hook_files: list[Path] = []
-    for hook_glob in hook_globs():
-        hook_files.extend(hooks_src.glob(hook_glob))
-    for hook_file in sorted(set(hook_files)):
-        target = hooks_dst / hook_file.name
-        # Always overwrite top-level hooks. Same rationale as `_lib/` below:
-        # hooks are NOT user-customisable; they're canonical orchestrator
-        # runtime. Pre-fix behaviour was skip-if-exists, which meant
-        # install.py re-runs never updated hooks — discovered after the
-        # 2026-05-08 stdin-JSON contract migration didn't reach
-        # already-installed orchestrators until users manually deleted hook
-        # files first. If a user truly needs to bypass a hook, the supported
-        # path is VCT_DISABLE_HOOKS=1, not hand-editing the file.
-        # copy2 preserves the executable bit and mtime — important for hooks.
-        shutil.copy2(hook_file, target)
-        installed_hooks += 1
-
-    # Library files sourced by hooks (e.g. _lib/find-python.sh on POSIX,
-    # _lib/find-python.ps1 on Windows). Live under .claude/hooks/_lib/.
-    # Always overwrite — they're not user-customisable and stale copies
-    # would defeat their portability purpose. See audit F6.
-    lib_src = hooks_src / "_lib"
-    if lib_src.exists():
-        lib_dst = hooks_dst / "_lib"
-        lib_dst.mkdir(parents=True, exist_ok=True)
-        lib_files: list[Path] = []
-        for hook_glob in hook_globs():
-            lib_files.extend(lib_src.glob(hook_glob))
-        for lib_file in sorted(set(lib_files)):
-            shutil.copy2(lib_file, lib_dst / lib_file.name)
-
-    # Scripts referenced by hooks (e.g. precompact_prune.py). Live alongside
-    # hooks under .claude/scripts/. Some scripts may not exist if the
-    # installation predates them — that's fine, the hooks ?-guard against
-    # missing files.
-    installed_scripts = 0
-    skipped_scripts = 0
-    if scripts_src.exists():
-        scripts_dst = claude_dir / "scripts"
-        scripts_dst.mkdir(parents=True, exist_ok=True)
-        # Glob all script types: Python modules, shell wrappers (no ext or .sh),
-        # and PowerShell wrappers (.ps1). Previously only *.py was copied which
-        # left kg-search, kg-sync, code-graph-* etc. missing from user projects.
-        # v0.2.54 Track G (G-4): pattern list shared with the per-project
-        # bundle path via vco_lib.bundle_globs (the two copies had drifted).
-        seen: set[str] = set()
-        for pattern in script_patterns():
-            for script_file in sorted(scripts_src.glob(pattern)):
-                if script_file.name in seen or script_file.is_dir():
-                    continue
-                seen.add(script_file.name)
-                target = scripts_dst / script_file.name
-                if target.exists():
-                    skipped_scripts += 1
-                    continue
-                shutil.copy2(script_file, target)
-                installed_scripts += 1
-
-    settings_action = _merge_settings_template(
-        settings_template, claude_dir / "settings.json"
-    )
-
-    summary = f"{installed_hooks} hooks"
-    if skipped_hooks:
-        summary += f" ({skipped_hooks} already present)"
-    if installed_scripts or skipped_scripts:
-        summary += f", {installed_scripts} scripts"
-        if skipped_scripts:
-            summary += f" ({skipped_scripts} already present)"
-    if settings_action:
-        summary += f", settings.json {settings_action}"
-    return summary
-
-
-def _merge_settings_template(template_path: Path, target_path: Path) -> str:
-    """Smart-merge settings.json.template into target. Returns one of:
-    'created', 'merged', 'unchanged', or '' (template missing).
-    """
-    if not template_path.exists():
-        return ""
-    template_data = json.loads(template_path.read_text(encoding="utf-8"))
-
-    if not target_path.exists():
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        target_path.write_text(
-            json.dumps(template_data, indent=2) + "\n", encoding="utf-8"
-        )
-        return "created"
-
-    try:
-        existing = json.loads(target_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        # Don't overwrite a malformed user file silently — leave it alone.
-        return "unchanged (user file unparseable)"
-
-    merged = _smart_merge_settings(existing, template_data)
-    if merged == existing:
-        return "unchanged"
-    target_path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
-    return "merged"
-
-
-def _smart_merge_settings(user: dict, template: dict) -> dict:
-    """Recursive dict merge. User wins on scalar/leaf conflicts. For the special
-    `hooks.{Event}` lists, append template entries whose inner `command` strings
-    aren't already present in user's config.
-    """
-    out = dict(user)
-    for key, tval in template.items():
-        if key not in out:
-            out[key] = tval
-            continue
-        uval = out[key]
-        if key == "hooks" and isinstance(uval, dict) and isinstance(tval, dict):
-            out[key] = _merge_hooks_block(uval, tval)
-        elif isinstance(uval, dict) and isinstance(tval, dict):
-            out[key] = _smart_merge_settings(uval, tval)
-        # else: user wins — leave uval untouched.
-    return out
-
-
-def _merge_hooks_block(user_hooks: dict, template_hooks: dict) -> dict:
-    """Merge per-event hook arrays.
-
-    v0.2.70 (Stream G): delegates to the SINGLE shared implementation
-    ``vco_lib.project_init._merge_hooks_for_bundle`` (one concern, one home).
-    Previously this orchestrator-self path and the per-project bundle path had
-    TWO independent append-only copies; both shared the same bug — when a
-    VCO-shipped hook's command form changed (e.g. a backslash path-separator
-    fix on Windows) the merge STACKED the new command next to the stale broken
-    one (which kept firing and failing). The shared helper now SUPERSEDES a
-    stale VCO hook (same `.claude/hooks/<name>` identity, different string)
-    rather than stacking, while preserving a user's own custom hooks. Keeping
-    one implementation prevents the two from drifting again.
-    """
-    return _project_init._merge_hooks_for_bundle(user_hooks, template_hooks)
 
 
 # ---------------------------------------------------------------------------

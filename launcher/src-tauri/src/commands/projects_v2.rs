@@ -106,6 +106,17 @@ pub struct UpdateSummary {
     /// during a first-install run. Always 0 on update_mode=true.
     /// Included for symmetry with the JSON envelope.
     pub skipped_existing: u32,
+    /// v0.2.85 D9 (launcher honesty): files ADOPTED this run — a divergent
+    /// bundle-shipped file whose CURRENT bytes were backed up to
+    /// `.claude/backups/bundle-adoptions/<ts>/` before the shipped version was
+    /// written (v0.2.84 D7 policy). Without this field an adoption-only update
+    /// toasts "0 preserved / 0 changed" — dishonest-by-omission; the envelope
+    /// `warnings` already carry the one-time NOTICE, so this is the tally only.
+    /// Tallied from `actions.adopt` in the SHARED spawn core (D12) so create
+    /// and update surface it uniformly (create runs first-install skip-existing
+    /// today → ~0, but the field is populated the same way on both paths — no
+    /// second dishonest surface).
+    pub adopted: u32,
     /// Number of `errors[]` entries in the JSON envelope (per-file write
     /// failures, manifest write failure, etc.). Each is also surfaced as
     /// a warning string in `UpdateProjectResult.warnings`.
@@ -129,6 +140,47 @@ pub struct UpdateSummary {
 }
 
 impl UpdateSummary {
+    /// v0.2.85 D9/D12: tally the per-action counts from a parsed install-bundle
+    /// `--json` envelope. Extracted as a pure function (one home) so the SHARED
+    /// spawn core (`run_install_bundle_core`) and the PIN-P1 canned-envelope
+    /// unit test share the exact same tally logic — no drifting inline copy.
+    ///
+    /// Sets every count bucket (incl. `adopted` — D9 honesty) + `errors_count`
+    /// + `kg_or_docs_content_changed` (via `envelope_kg_or_docs_content_changed`).
+    /// Soft-fail: a missing/empty `actions` array counts as 0 for that bucket;
+    /// an entirely missing/unexpected `actions` shape yields a zeroed summary
+    /// with `kg_or_docs_content_changed = true` (conservative, matches the
+    /// inspector's own posture).
+    fn from_bundle_envelope(v: &serde_json::Value) -> UpdateSummary {
+        let actions = v.get("actions").and_then(|a| a.as_object());
+        let count_for = |k: &str| -> u32 {
+            actions
+                .and_then(|map| map.get(k))
+                .and_then(|x| x.as_array())
+                .map(|a| a.len() as u32)
+                .unwrap_or(0)
+        };
+        UpdateSummary {
+            created: count_for("create"),
+            overwritten: count_for("overwrite"),
+            preserved: count_for("preserve"),
+            noop: count_for("noop"),
+            always_overwritten: count_for("always-overwrite"),
+            skipped_existing: count_for("skip-existing"),
+            // D9: adopted tallied here, in the shared home, so create + update
+            // both surface it uniformly.
+            adopted: count_for("adopt"),
+            errors_count: v
+                .get("errors")
+                .and_then(|x| x.as_array())
+                .map(|a| a.len() as u32)
+                .unwrap_or(0),
+            // v0.2.71 Piece 5b: the inspector is conservative on an
+            // unparseable/unexpected `actions` shape (returns true → spawn).
+            kg_or_docs_content_changed: envelope_kg_or_docs_content_changed(v),
+        }
+    }
+
     /// Total operations classified across all action buckets. Used in
     /// tests to verify counts tally with the JSON envelope.
     #[allow(dead_code)]
@@ -139,6 +191,7 @@ impl UpdateSummary {
             + self.noop
             + self.always_overwritten
             + self.skipped_existing
+            + self.adopted
     }
 }
 
@@ -1351,79 +1404,303 @@ pub(crate) async fn run_bootstrap_collections(folder: &Path, project_name: &str)
     warnings
 }
 
-/// PR 4 (2026-05-01): subprocess-call vco_lib.project_init install-bundle.
+/// v0.2.85 D12 (AMENDMENT A6 / rulings R-A + R-C): the mode discriminant for
+/// the ONE shared install-bundle spawn+parse core (`run_install_bundle_core`).
 ///
-/// Same soft-fail discipline as `run_bootstrap_collections`. JSON `errors[]`
-/// entries (per-file write failures) become individual warnings. The function
-/// never blocks project creation.
-// v0.2.63: `safe_add` threads the per-add "Safe add" flag through to the
-// Python `install-bundle` as `--safe-add`. Under safe-add the Python step
-// (a) records the `safe_add_skipped_env_merge` deferral when it sees the
-// `.env.vco.reference` sidecar the Rust side wrote, and (b) appends VCO-created
-// paths to the project's local-only `.git/info/exclude`. No effect when false.
-pub(crate) async fn run_install_bundle(folder: &Path, safe_add: bool) -> Vec<String> {
-    let mut warnings: Vec<String> = Vec::new();
+/// The add-project (create) and update flows drove ~120-line mirror argv
+/// builders that diverged ONLY on: (a) the mode flag appended (`--safe-add`
+/// conditionally, vs `--update` always), (b) whether an `UpdateSummary` is
+/// tallied, (c) the human-readable warning strings/prefixes. This enum carries
+/// that delta so the skeleton is written once. Every string a `classify_warning`
+/// / `warning-severity.ts` severity check keys off (the `"unparseable"` /
+/// `"preserved"` substrings) is produced HERE, byte-identical per mode — do NOT
+/// paraphrase these strings without updating both severity classifiers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BundleMode {
+    /// add-project / first install. `safe_add` threads the per-add "Safe add"
+    /// flag through as `--safe-add` (v0.2.63): the Python step records the
+    /// `safe_add_skipped_env_merge` deferral when it sees the
+    /// `.env.vco.reference` sidecar the Rust side wrote, and appends VCO-created
+    /// paths to the project's local-only `.git/info/exclude`. No effect when
+    /// false.
+    Create { safe_add: bool },
+    /// manifest-driven `--update`: hash-based drift detection, adopt-with-backup
+    /// on divergent shipped files, preserve on `knowledge/**`.
+    Update,
+}
 
-    let system = match detect_system().await {
-        Ok(s) => s,
-        Err(e) => {
-            warnings.push(format!(
+impl BundleMode {
+    /// The `--`-flag this mode appends to the base argv (`None` for the
+    /// create-default path so its argv stays byte-identical to today).
+    fn mode_flag(self) -> Option<&'static str> {
+        match self {
+            BundleMode::Create { safe_add: true } => Some("--safe-add"),
+            BundleMode::Create { safe_add: false } => None,
+            BundleMode::Update => Some("--update"),
+        }
+    }
+
+    /// Prefix on each Python-emitted `warnings[]` line + the parse-failure
+    /// notice (`install-bundle` on create, `install-bundle --update` on update).
+    /// The human toast text keys off it AND the parse-failure notice keeps its
+    /// `"produced unparseable output"` suffix — see `parse_failure_warning`.
+    fn warning_prefix(self) -> &'static str {
+        match self {
+            BundleMode::Create { .. } => "install-bundle",
+            BundleMode::Update => "install-bundle --update",
+        }
+    }
+
+    // ── The early-return soft-fail warnings, BYTE-IDENTICAL per mode. ─────────
+    // These reproduce the exact pre-refactor strings from each of the two
+    // ~120-line mirrors (A6 constraint: "warning strings byte-identical per
+    // mode"). They are prose, not just a swapped phrase, so each mode owns its
+    // full message here rather than composing from a shared template — that is
+    // the reviewable way to prove no drift. `classify_warning` (project_setup.rs)
+    // + its TS mirror key severity off `"failed to start"` / `"error"` /
+    // `"unparseable"`; every message below preserves those substrings.
+
+    /// `detect_system()` failed — no OS/python probe.
+    fn detect_system_failed_warning(self, e: &dyn std::fmt::Display) -> String {
+        match self {
+            BundleMode::Create { .. } => format!(
                 "install-bundle skipped: detect_system failed: {}. \
                  Per-project hooks/scripts/agents/skills will not be installed \
                  — Claude Code session running in this folder won't have the \
                  orchestrator's automation. Manual fix: run \
                  `python -m vco_lib.project_init install-bundle --folder <path>`.",
                 e
-            ));
-            return warnings;
+            ),
+            BundleMode::Update => format!(
+                "install-bundle --update skipped: detect_system failed: {}. \
+                 No new orchestrator-shipped files will land in this project. \
+                 Manual fix: `python -m vco_lib.project_init install-bundle \
+                 --folder <path> --update`.",
+                e
+            ),
         }
-    };
-    if !system.has_python {
-        warnings.push(
-            "install-bundle skipped: no Python 3.11+ on PATH. \
-             Hooks/scripts/agents/skills not installed; install Python and \
-             re-run setup."
-            .to_string(),
-        );
-        return warnings;
     }
 
-    let orch_root: PathBuf = match find_local_repo_root() {
-        Ok(p) => p,
-        Err(e) => {
-            warnings.push(format!(
+    /// No Python 3.11+ on PATH.
+    fn no_python_warning(self) -> String {
+        match self {
+            BundleMode::Create { .. } => {
+                "install-bundle skipped: no Python 3.11+ on PATH. \
+                 Hooks/scripts/agents/skills not installed; install Python and \
+                 re-run setup."
+                    .to_string()
+            }
+            BundleMode::Update => {
+                "install-bundle --update skipped: no Python 3.11+ on PATH. \
+                 Install Python and re-click \"Update bundle\"."
+                    .to_string()
+            }
+        }
+    }
+
+    /// Orchestrator root (where vco_lib lives) could not be found.
+    fn orch_root_not_found_warning(self, e: &dyn std::fmt::Display) -> String {
+        match self {
+            BundleMode::Create { .. } => format!(
                 "install-bundle skipped: orchestrator root not found: {}. \
                  Per-project hooks/scripts/agents/skills will not be installed.",
                 e
-            ));
-            return warnings;
+            ),
+            BundleMode::Update => format!(
+                "install-bundle --update skipped: orchestrator root not found: {}. \
+                 No new orchestrator-shipped files will land in this project.",
+                e
+            ),
         }
+    }
+
+    /// The subprocess itself failed to spawn (fork/exec error).
+    fn subprocess_start_failed_warning(self, e: &dyn std::fmt::Display) -> String {
+        match self {
+            BundleMode::Create { .. } => format!(
+                "install-bundle subprocess failed to start: {}. \
+                 Hooks/scripts/agents/skills not installed.",
+                e
+            ),
+            BundleMode::Update => format!(
+                "install-bundle --update subprocess failed to start: {}. \
+                 Project files unchanged.",
+                e
+            ),
+        }
+    }
+
+    /// The JSON parse-failure notice (the v0.2.84 incident shape). MUST keep the
+    /// `"produced unparseable output"` substring (severity classifiers) + the
+    /// per-mode prefix; only the trailing consequence differs.
+    fn parse_failure_warning(self, parse_err: &dyn std::fmt::Display, tail: &str) -> String {
+        match self {
+            BundleMode::Create { .. } => format!(
+                "install-bundle produced unparseable output ({}): \
+                 stderr tail: {}. Hooks/scripts/agents/skills may be incomplete.",
+                parse_err, tail
+            ),
+            BundleMode::Update => format!(
+                "install-bundle --update produced unparseable output ({}): \
+                 stderr tail: {}. Project files may be partially updated.",
+                parse_err, tail
+            ),
+        }
+    }
+}
+
+/// v0.2.85 D12 (A6): the ONE argv builder for the launcher's install-bundle
+/// spawn. Both the create and update Rust flows (via `run_install_bundle_core`)
+/// and the D12 pins (PIN-P2 mode-flag, PIN-P3 create byte-fidelity) go through
+/// here, so the argv shape cannot drift between modes.
+///
+/// The base args are byte-identical to BOTH pre-refactor mirrors; the per-mode
+/// flag position is MODE-SPECIFIC to preserve each pre-D12 mirror's byte order:
+/// create appends the optional `--safe-add` AFTER `--json` (create-default is
+/// byte-identical to pre-v0.2.63); update places `--update` BEFORE `--json`
+/// (matching the old update wrapper + the WP-1 `root_bundle_argv` client). The
+/// python binary itself (`system.python_cmd`) is NOT part of this vector — the
+/// caller sets it as the `Command` program.
+///
+/// Cross-language pin: `vco_lib/self_install.py::root_bundle_argv` emits the
+/// SAME flag set for the root client (WP-1). The parity test
+/// `tests/test_v0285_install_parity.py` asserts the two stay in lockstep.
+fn build_bundle_argv(folder_str: &str, templates_str: &str, mode: BundleMode) -> Vec<String> {
+    let mut argv: Vec<String> = vec![
+        "-m".into(),
+        "vco_lib.project_init".into(),
+        "install-bundle".into(),
+        "--folder".into(),
+        folder_str.into(),
+        "--orchestrator-root".into(),
+        templates_str.into(),
+        "--project-folder".into(),
+        folder_str.into(),
+    ];
+    // Byte-order parity with the pre-D12 mirrors is MODE-SPECIFIC (the two
+    // functions this replaced did NOT agree on where the mode flag sat relative
+    // to `--json`):
+    //   - create (`run_install_bundle`): pushed `--json` FIRST, then optionally
+    //     `--safe-add` — so the flag lands AFTER `--json`.
+    //   - update (`run_install_bundle_update_with_root`): pushed `--update`
+    //     THEN `--json` — so the flag lands BEFORE `--json`.
+    // argparse is order-insensitive so both invoke identically, but the argv is
+    // an explicit machine contract pinned byte-for-byte (PIN-P3 + the
+    // cross-language `root_bundle_argv` pin, which follows the update order
+    // `--update --json`). Reproduce each mode's HISTORICAL position exactly so
+    // the refactor is a pure extraction, not a silent argv change.
+    match mode {
+        BundleMode::Update => {
+            // flag before --json (matches base update + WP-1 root_bundle_argv)
+            if let Some(flag) = mode.mode_flag() {
+                argv.push(flag.into());
+            }
+            argv.push("--json".into());
+        }
+        BundleMode::Create { .. } => {
+            // --json first, then the optional --safe-add (byte-identical to
+            // pre-v0.2.63 create-default, which has no mode flag at all)
+            argv.push("--json".into());
+            if let Some(flag) = mode.mode_flag() {
+                argv.push(flag.into());
+            }
+        }
+    }
+    argv
+}
+
+/// v0.2.85 D12 (A6): the ONE spawn+parse skeleton shared by both the
+/// add-project and update Rust flows. Replaces the two ~120-line argv-builder
+/// mirrors (`run_install_bundle` create, `run_install_bundle_update_with_root`
+/// update). `run_root_bundle_install` in `vco_lib/self_install.py` is the THIRD
+/// client of this same CLI contract — a Python re-implementation, NOT a caller
+/// (cross-language; the shared thing is the argv shape + parse posture, per E7).
+///
+/// Returns `(warnings, summary)`:
+///   - `warnings` is the same soft-fail surface both wrappers had (per-file
+///     `errors[]`, prefixed `warnings[]`, parse-failure notice).
+///   - `summary` is `None` in create mode (the caller discards it) and
+///     `Some(UpdateSummary)` in update mode. The `adopted` tally (D9) is
+///     populated in BOTH modes from `actions.adopt` — uniform honesty; create
+///     runs first-install skip-existing today so adopt is ~0, but the surface
+///     is not dishonest.
+///
+/// `orchestrator_root_override`: test seam. `None` → `find_local_repo_root()`
+/// resolves BOTH the vco_lib root (cwd) and the templates root. `Some(p)` →
+/// vco_lib still resolves from the real clone (cwd, so the package imports) but
+/// templates/ + infrastructure/ come from `p` (a controlled fake tree). Create
+/// production callers pass `None` (behaviour identical to pre-refactor).
+///
+/// Windows `CREATE_NO_WINDOW`, `.silent()`, and `stdin(null)` are preserved.
+async fn run_install_bundle_core(
+    folder: &Path,
+    orchestrator_root_override: Option<&Path>,
+    mode: BundleMode,
+) -> (Vec<String>, Option<UpdateSummary>) {
+    let mut warnings: Vec<String> = Vec::new();
+    // Only Update mode carries a summary. v0.2.71 Piece 5b: start CONSERVATIVE
+    // — every soft-fail early-return below and the JSON-parse-failure arm leave
+    // `kg_or_docs_content_changed = true`, so the kg-sync spawn gate falls back
+    // to spawning (safe-but-slow) whenever we could NOT positively confirm that
+    // no KG/docs content changed. Only the successful-parse arm flips it to the
+    // precise computed value. Create mode never tallies a summary, so its slot
+    // stays `None`.
+    let mut summary: Option<UpdateSummary> = match mode {
+        BundleMode::Update => Some(UpdateSummary {
+            // The ONLY non-Default field: conservative start (spawn kg-sync
+            // unless a parsed envelope proves nothing KG/docs changed).
+            kg_or_docs_content_changed: true,
+            ..UpdateSummary::default()
+        }),
+        BundleMode::Create { .. } => None,
+    };
+    let prefix = mode.warning_prefix();
+
+    let system = match detect_system().await {
+        Ok(s) => s,
+        Err(e) => {
+            warnings.push(mode.detect_system_failed_warning(&e));
+            return (warnings, summary);
+        }
+    };
+    if !system.has_python {
+        warnings.push(mode.no_python_warning());
+        return (warnings, summary);
+    }
+
+    // Resolve TWO roots:
+    //   - `vco_lib_root`: where vco_lib/ lives (always the real installed
+    //     orchestrator clone — the Python package must be importable). Becomes
+    //     the subprocess cwd. (Pre-refactor create called this `orch_root` and
+    //     passed it as BOTH cwd AND --orchestrator-root; with override=None the
+    //     two roots coincide, so create's argv + cwd are byte-identical.)
+    //   - `templates_root`: where templates/ + infrastructure/ live. By default
+    //     same as vco_lib_root; tests override to a fake orchestrator tree.
+    let vco_lib_root: PathBuf = match find_local_repo_root() {
+        Ok(p) => p,
+        Err(e) => {
+            warnings.push(mode.orch_root_not_found_warning(&e));
+            return (warnings, summary);
+        }
+    };
+    let templates_root: PathBuf = match orchestrator_root_override {
+        Some(p) => p.to_path_buf(),
+        None => vco_lib_root.clone(),
     };
 
     let folder_str = folder.to_string_lossy().to_string();
-    let orch_str = orch_root.to_string_lossy().to_string();
+    let templates_str = templates_root.to_string_lossy().to_string();
     let mut cmd = tokio::process::Command::new(&system.python_cmd).silent();
-    cmd.args([
-        "-m",
-        "vco_lib.project_init",
-        "install-bundle",
-        "--folder",
-        &folder_str,
-        "--orchestrator-root",
-        &orch_str,
-        "--project-folder",
-        &folder_str,
-        "--json",
-    ])
-    .current_dir(&orch_root)
-    .stdin(std::process::Stdio::null());
-
-    // v0.2.63 Safe add: only attach the flag when ON so the default path's argv
-    // is byte-identical to pre-v0.2.63 (no behaviour change; the install-bundle
-    // argv-shape parity tests keep passing for the default).
-    if safe_add {
-        cmd.arg("--safe-add");
-    }
+    // Base argv — byte-identical to both pre-refactor mirrors. The per-mode
+    // flag (if any) is appended AFTER, so the create-default (`safe_add=false`)
+    // argv is byte-identical to pre-v0.2.63 and the existing argv-shape parity
+    // tests (and D12's PIN-P3) keep passing unmodified. Built via the ONE
+    // shared argv builder (`build_bundle_argv`) so PIN-P2/PIN-P3 can pin the
+    // exact byte layout without a subprocess and neither side can drift.
+    let argv = build_bundle_argv(&folder_str, &templates_str, mode);
+    cmd.args(&argv)
+        .current_dir(&vco_lib_root)
+        .stdin(std::process::Stdio::null());
 
     #[cfg(windows)]
     {
@@ -1434,12 +1711,8 @@ pub(crate) async fn run_install_bundle(folder: &Path, safe_add: bool) -> Vec<Str
     let out = match cmd.output().await {
         Ok(o) => o,
         Err(e) => {
-            warnings.push(format!(
-                "install-bundle subprocess failed to start: {}. \
-                 Hooks/scripts/agents/skills not installed.",
-                e
-            ));
-            return warnings;
+            warnings.push(mode.subprocess_start_failed_warning(&e));
+            return (warnings, summary);
         }
     };
 
@@ -1448,38 +1721,89 @@ pub(crate) async fn run_install_bundle(folder: &Path, safe_add: bool) -> Vec<Str
 
     match serde_json::from_str::<serde_json::Value>(&stdout) {
         Ok(v) => {
+            // Tally per-action counts (Update mode only) via the ONE shared
+            // pure tally (`UpdateSummary::from_bundle_envelope`) — same logic
+            // the PIN-P1 canned-envelope unit test exercises, no drifting inline
+            // copy. Includes the `adopted` (D9) tally + the v0.2.71 Piece 5b
+            // `kg_or_docs_content_changed` computation. Create mode has no
+            // summary slot, so the tally is skipped there (create still runs
+            // first-install skip-existing today = adopt ~0).
+            if let Some(s) = summary.as_mut() {
+                *s = UpdateSummary::from_bundle_envelope(&v);
+            }
+
             if let Some(errs) = v.get("errors").and_then(|x| x.as_array()) {
                 for e in errs {
                     let p = e.get("path").and_then(|c| c.as_str()).unwrap_or("?");
                     let msg = e.get("error").and_then(|c| c.as_str()).unwrap_or("?");
-                    warnings.push(format!(
-                        "install-bundle file error on {}: {}",
-                        p, msg
-                    ));
+                    warnings.push(format!("{} file error on {}: {}", prefix, p, msg));
                 }
             }
             if let Some(ws) = v.get("warnings").and_then(|x| x.as_array()) {
                 for w in ws {
                     if let Some(s) = w.as_str() {
-                        warnings.push(format!("install-bundle: {}", s));
+                        warnings.push(format!("{}: {}", prefix, s));
                     }
                 }
             }
+
+            // Update mode: if preserve > 0, surface a friendly pointer so the
+            // user knows the deferral .md exists with manual-merge instructions.
+            // (Create mode never preserves — first install is skip-existing.)
+            if let Some(s) = summary.as_ref() {
+                if s.preserved > 0 {
+                    warnings.push(format!(
+                        "{} user-modified file(s) preserved during update. \
+                         See {}/.claude/context/UPDATE_DEFERRED.md for the \
+                         `bundle_user_modified_preserved` entry (lists each \
+                         preserved file + the explicit `--force` command to \
+                         accept the orchestrator's shipped versions).",
+                        s.preserved, folder_str
+                    ));
+                }
+            }
+
             if !out.status.success() {
-                eprintln!("[vct] install-bundle exit {} (errors surfaced via warnings)", out.status);
+                eprintln!(
+                    "[vct] {} exit {} (errors surfaced via warnings)",
+                    prefix, out.status
+                );
             }
         }
         Err(parse_err) => {
-            warnings.push(format!(
-                "install-bundle produced unparseable output ({}): \
-                 stderr tail: {}. Hooks/scripts/agents/skills may be incomplete.",
-                parse_err,
-                stderr.lines().rev().take(3)
-                    .collect::<Vec<_>>().into_iter().rev()
-                    .collect::<Vec<_>>().join(" | ")
-            ));
+            // The parse-failure notice MUST keep the `"unparseable output"`
+            // substring (both `classify_warning` in project_setup.rs and the TS
+            // mirror key severity off it) and the per-mode prefix. `mode`
+            // supplies the byte-exact string (trailing consequence differs).
+            let tail = stderr
+                .lines()
+                .rev()
+                .take(3)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join(" | ");
+            warnings.push(mode.parse_failure_warning(&parse_err, &tail));
         }
     }
+    (warnings, summary)
+}
+
+/// PR 4 (2026-05-01): subprocess-call vco_lib.project_init install-bundle.
+///
+/// Same soft-fail discipline as `run_bootstrap_collections`. JSON `errors[]`
+/// entries (per-file write failures) become individual warnings. The function
+/// never blocks project creation.
+///
+/// v0.2.85 D12 (A6): thin wrapper over `run_install_bundle_core` in create
+/// mode. Discards the (always-`None`) summary and returns just warnings — the
+/// public signature and byte-exact behaviour are unchanged from pre-refactor.
+// v0.2.63: `safe_add` threads the per-add "Safe add" flag through to the
+// Python `install-bundle` as `--safe-add`.
+pub(crate) async fn run_install_bundle(folder: &Path, safe_add: bool) -> Vec<String> {
+    let (warnings, _summary) =
+        run_install_bundle_core(folder, None, BundleMode::Create { safe_add }).await;
     warnings
 }
 
@@ -1520,187 +1844,20 @@ pub(crate) use change_detect::*;
 /// install-bundle resolves templates from a controlled fake tree rather
 /// than the running launcher's real orchestrator clone. Production
 /// callers always pass `None` and get `find_local_repo_root()`.
+///
+/// v0.2.85 D12 (A6): thin wrapper over `run_install_bundle_core` in update
+/// mode. The summary is always populated in update mode (the core returns
+/// `Some`), so `unwrap_or_default()` never actually defaults here — it only
+/// satisfies the `Option -> UpdateSummary` shape the public signature promises.
+/// Behaviour (warning strings, argv, `kg_or_docs_content_changed` conservative
+/// posture, tallies) is byte-identical to the pre-refactor mirror.
 pub(crate) async fn run_install_bundle_update_with_root(
     folder: &Path,
     orchestrator_root_override: Option<&Path>,
 ) -> (Vec<String>, UpdateSummary) {
-    let mut warnings: Vec<String> = Vec::new();
-    let mut summary = UpdateSummary::default();
-    // v0.2.71 Piece 5b: start CONSERVATIVE. Every soft-fail early-return below
-    // (Python missing, orch root unfindable, subprocess fail-to-start) and the
-    // JSON-parse-failure arm leave this `true`, so the kg-sync spawn gate falls
-    // back to spawning (safe-but-slow) whenever we could NOT positively confirm
-    // that no KG/docs content changed. Only the successful-parse path flips it
-    // to the precise computed value via `envelope_kg_or_docs_content_changed`.
-    summary.kg_or_docs_content_changed = true;
-
-    let system = match detect_system().await {
-        Ok(s) => s,
-        Err(e) => {
-            warnings.push(format!(
-                "install-bundle --update skipped: detect_system failed: {}. \
-                 No new orchestrator-shipped files will land in this project. \
-                 Manual fix: `python -m vco_lib.project_init install-bundle \
-                 --folder <path> --update`.",
-                e
-            ));
-            return (warnings, summary);
-        }
-    };
-    if !system.has_python {
-        warnings.push(
-            "install-bundle --update skipped: no Python 3.11+ on PATH. \
-             Install Python and re-click \"Update bundle\"."
-            .to_string(),
-        );
-        return (warnings, summary);
-    }
-
-    // Resolve TWO roots:
-    //   - `vco_lib_root`: where vco_lib/ lives (always the real installed
-    //     orchestrator clone — the Python package must be importable).
-    //   - `templates_root`: where templates/ + infrastructure/ live. By
-    //     default same as vco_lib_root, but tests can override to a fake
-    //     orchestrator tree to validate behaviour against controlled
-    //     templates without touching the host's real bundle.
-    let vco_lib_root: PathBuf = match find_local_repo_root() {
-        Ok(p) => p,
-        Err(e) => {
-            warnings.push(format!(
-                "install-bundle --update skipped: orchestrator root not found: {}. \
-                 No new orchestrator-shipped files will land in this project.",
-                e
-            ));
-            return (warnings, summary);
-        }
-    };
-    let templates_root: PathBuf = match orchestrator_root_override {
-        Some(p) => p.to_path_buf(),
-        None => vco_lib_root.clone(),
-    };
-
-    let folder_str = folder.to_string_lossy().to_string();
-    let templates_str = templates_root.to_string_lossy().to_string();
-    let mut cmd = tokio::process::Command::new(&system.python_cmd).silent();
-    cmd.args([
-        "-m",
-        "vco_lib.project_init",
-        "install-bundle",
-        "--folder",
-        &folder_str,
-        "--orchestrator-root",
-        &templates_str,
-        "--project-folder",
-        &folder_str,
-        "--update",
-        "--json",
-    ])
-    .current_dir(&vco_lib_root)
-    .stdin(std::process::Stdio::null());
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
-
-    let out = match cmd.output().await {
-        Ok(o) => o,
-        Err(e) => {
-            warnings.push(format!(
-                "install-bundle --update subprocess failed to start: {}. \
-                 Project files unchanged.",
-                e
-            ));
-            return (warnings, summary);
-        }
-    };
-
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-
-    match serde_json::from_str::<serde_json::Value>(&stdout) {
-        Ok(v) => {
-            // Tally per-action counts. Use unwrap_or(&Vec::new()) semantics
-            // by treating a missing array as "0 entries"; that's the same
-            // soft-fail discipline as the bootstrap subprocess wrapper.
-            let actions = v.get("actions").and_then(|a| a.as_object());
-            if let Some(map) = actions {
-                let count_for = |k: &str| -> u32 {
-                    map.get(k)
-                        .and_then(|x| x.as_array())
-                        .map(|a| a.len() as u32)
-                        .unwrap_or(0)
-                };
-                summary.created = count_for("create");
-                summary.overwritten = count_for("overwrite");
-                summary.preserved = count_for("preserve");
-                summary.noop = count_for("noop");
-                summary.always_overwritten = count_for("always-overwrite");
-                summary.skipped_existing = count_for("skip-existing");
-            }
-
-            // v0.2.71 Piece 5b: decide whether this update touched any
-            // knowledge/**/*.md or docs/**/*.md content. Inspect the parsed
-            // envelope (not the flattened counts — those lose the path detail)
-            // so the kg-sync spawn gate can skip a full re-embed when nothing
-            // relevant changed. Conservative: an unparseable / unexpected
-            // `actions` shape yields `true` (assume changed → spawn).
-            summary.kg_or_docs_content_changed = envelope_kg_or_docs_content_changed(&v);
-
-            if let Some(errs) = v.get("errors").and_then(|x| x.as_array()) {
-                summary.errors_count = errs.len() as u32;
-                for e in errs {
-                    let p = e.get("path").and_then(|c| c.as_str()).unwrap_or("?");
-                    let msg = e.get("error").and_then(|c| c.as_str()).unwrap_or("?");
-                    warnings.push(format!(
-                        "install-bundle --update file error on {}: {}",
-                        p, msg
-                    ));
-                }
-            }
-
-            if let Some(ws) = v.get("warnings").and_then(|x| x.as_array()) {
-                for w in ws {
-                    if let Some(s) = w.as_str() {
-                        warnings.push(format!("install-bundle --update: {}", s));
-                    }
-                }
-            }
-
-            // If preserve > 0, surface a friendly pointer so the user
-            // knows the deferral .md exists with manual-merge instructions.
-            if summary.preserved > 0 {
-                warnings.push(format!(
-                    "{} user-modified file(s) preserved during update. \
-                     See {}/.claude/context/UPDATE_DEFERRED.md for the \
-                     `bundle_user_modified_preserved` entry (lists each \
-                     preserved file + the explicit `--force` command to \
-                     accept the orchestrator's shipped versions).",
-                    summary.preserved, folder_str
-                ));
-            }
-
-            if !out.status.success() {
-                eprintln!(
-                    "[vct] install-bundle --update exit {} (errors surfaced via warnings)",
-                    out.status
-                );
-            }
-        }
-        Err(parse_err) => {
-            warnings.push(format!(
-                "install-bundle --update produced unparseable output ({}): \
-                 stderr tail: {}. Project files may be partially updated.",
-                parse_err,
-                stderr.lines().rev().take(3)
-                    .collect::<Vec<_>>().into_iter().rev()
-                    .collect::<Vec<_>>().join(" | ")
-            ));
-        }
-    }
-
-    (warnings, summary)
+    let (warnings, summary) =
+        run_install_bundle_core(folder, orchestrator_root_override, BundleMode::Update).await;
+    (warnings, summary.unwrap_or_default())
 }
 
 /// PR 5 (2026-05-01): pre-update Weaviate schema-drift probe.
@@ -9699,6 +9856,334 @@ mod tests {
         // total_ops() is the sum of every action bucket.
         assert!(summary.total_ops() > 0,
                 "expected at least one op to have been classified");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ─── v0.2.85 D9 (launcher honesty) + D12 (A6 shared spawn core) ──────────
+
+    /// PIN-P1 (FAIL-WITHOUT-FIX, D9): a canned envelope with two `adopt`
+    /// entries tallies `UpdateSummary.adopted == 2`.
+    ///
+    /// Pre-fix this test does not COMPILE (the `adopted` field did not exist),
+    /// which is the strongest form of fail-without-fix. It drives the ONE
+    /// shared pure tally (`UpdateSummary::from_bundle_envelope`) — the exact
+    /// logic `run_install_bundle_core` uses — with no subprocess, so it pins the
+    /// tally itself, not just the field's presence.
+    #[test]
+    fn pin_p1_adopt_entries_tally_into_summary() {
+        let envelope = serde_json::json!({
+            "actions": {
+                "adopt": [".claude/hooks/foo.sh", ".claude/scripts/bar.py"],
+                "create": [".claude/agents/new.md"],
+                "overwrite": [],
+                "preserve": [],
+                "noop": [],
+                "always-overwrite": [],
+                "skip-existing": [],
+            },
+            "errors": [],
+        });
+        let summary = UpdateSummary::from_bundle_envelope(&envelope);
+        assert_eq!(summary.adopted, 2, "two adopt entries → adopted == 2");
+        // Sanity: the other buckets are tallied alongside, unaffected.
+        assert_eq!(summary.created, 1);
+        assert_eq!(summary.overwritten, 0);
+        assert_eq!(summary.errors_count, 0);
+        // total_ops() now includes adopted (2 adopt + 1 create == 3).
+        assert_eq!(summary.total_ops(), 3);
+    }
+
+    /// D9: adopt lives under `knowledge/**` NEVER (D3 carve-out), so the
+    /// content-change gate (`envelope_kg_or_docs_content_changed`) must ignore
+    /// an adopt bucket even when its path is under knowledge/. Belt-and-braces
+    /// for the change_detect adopt-tolerance comment.
+    #[test]
+    fn d9_adopt_bucket_never_triggers_kg_docs_content_change() {
+        // A (hypothetical) adopt entry under knowledge/ must NOT flip the gate —
+        // adopt is not in BUNDLE_CONTENT_CHANGING_BUCKETS. (In practice D3 keeps
+        // knowledge/ on preserve so this never happens; the gate is robust
+        // regardless.)
+        let envelope = serde_json::json!({
+            "actions": { "adopt": ["knowledge/concepts/x.md"] },
+        });
+        assert!(
+            !envelope_kg_or_docs_content_changed(&envelope),
+            "adopt bucket must not be a content-change trigger"
+        );
+        // Contrast: a real content-changing bucket under knowledge/ DOES flip it.
+        let envelope2 = serde_json::json!({
+            "actions": { "overwrite": ["knowledge/concepts/x.md"] },
+        });
+        assert!(
+            envelope_kg_or_docs_content_changed(&envelope2),
+            "overwrite under knowledge/ must trigger a content change"
+        );
+    }
+
+    /// PIN-P3 (leave-alone, D12): the create-mode argv with `safe_add=false`
+    /// equals the pre-refactor argv vector EXACTLY. If either the shared argv
+    /// builder or the pre-refactor contract drifts, this breaks.
+    ///
+    /// Plan citation: PLAN-v0285-install-parity.md AMENDMENT A6 PIN-P3
+    /// ("the create-mode argv with `safe_add=false` equals the pre-refactor argv
+    /// vector exactly"). The pre-refactor create builder (`run_install_bundle`
+    /// at projects_v2.rs:1406-1417 @ base a4a07fa3) pushed exactly these args;
+    /// `--safe-add` was appended ONLY when the flag was ON.
+    #[test]
+    fn pin_p3_create_argv_default_is_byte_identical_to_pre_refactor() {
+        let folder = "/tmp/proj";
+        let orch = "/tmp/orch";
+        // The EXPECTED vector, maintained explicitly (drift-detector).
+        let expected: Vec<&str> = vec![
+            "-m",
+            "vco_lib.project_init",
+            "install-bundle",
+            "--folder",
+            folder,
+            "--orchestrator-root",
+            orch,
+            "--project-folder",
+            folder,
+            "--json",
+        ];
+        let got = build_bundle_argv(folder, orch, BundleMode::Create { safe_add: false });
+        assert_eq!(
+            got,
+            expected.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "create-default argv must be byte-identical to the pre-refactor mirror"
+        );
+    }
+
+    /// PIN-P3b (FAIL-WITHOUT-FIX, v0.2.85 M-1 review): the UPDATE-mode argv
+    /// byte ORDER — the EXACT axis the D12 integration regressed (`--json
+    /// --update` instead of the base `--update --json`) and that PIN-P3 above
+    /// missed (it pins only `Create{safe_add:false}`, which carries no mode
+    /// flag, so its order is invariant to the bug; PIN-P2 uses `.any()`
+    /// membership, which is order-blind). Per the coordinator's KG node
+    /// `shared-core-extraction-must-pin-the-byte-order-axis-2026-07-17`: pin
+    /// EVERY mode/branch whose output differs, with whole-Vec equality (not
+    /// membership). Update: `--update` BEFORE `--json` (base
+    /// run_install_bundle_update_with_root order + the WP-1 root_bundle_argv
+    /// client). Create{safe_add:true}: `--json` THEN `--safe-add` (base
+    /// run_install_bundle order).
+    #[test]
+    fn pin_p3b_update_and_safeadd_argv_byte_order() {
+        let folder = "/tmp/proj";
+        let orch = "/tmp/orch";
+
+        let update_expected: Vec<&str> = vec![
+            "-m", "vco_lib.project_init", "install-bundle",
+            "--folder", folder, "--orchestrator-root", orch,
+            "--project-folder", folder,
+            "--update", "--json", // <-- mode flag BEFORE --json (the pinned axis)
+        ];
+        assert_eq!(
+            build_bundle_argv(folder, orch, BundleMode::Update),
+            update_expected.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "UPDATE argv must be `--update --json` (base order); a `--json --update` \
+             regression is the exact D12 incident this pin guards"
+        );
+
+        let safeadd_expected: Vec<&str> = vec![
+            "-m", "vco_lib.project_init", "install-bundle",
+            "--folder", folder, "--orchestrator-root", orch,
+            "--project-folder", folder,
+            "--json", "--safe-add", // <-- create pushes --json first, then the flag
+        ];
+        assert_eq!(
+            build_bundle_argv(folder, orch, BundleMode::Create { safe_add: true }),
+            safeadd_expected.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "safe-add create argv must be `--json --safe-add` (base create order)"
+        );
+    }
+
+    /// PIN-P2 (act, D12): each mode emits the correct mode flag — create
+    /// (safe_add) → `--safe-add`, update → `--update`, and they are mutually
+    /// exclusive (XOR). Also pins the per-mode warning prefix used by the
+    /// parse-failure notice (severity-keyed downstream by `classify_warning`).
+    #[test]
+    fn pin_p2_mode_flag_and_warning_prefix_per_mode() {
+        let folder = "/tmp/proj";
+        let orch = "/tmp/orch";
+
+        // Create (default) — NO mode flag (byte-identical to pre-v0.2.63).
+        let create = build_bundle_argv(folder, orch, BundleMode::Create { safe_add: false });
+        assert!(!create.iter().any(|a| a == "--safe-add"));
+        assert!(!create.iter().any(|a| a == "--update"));
+
+        // Create (safe-add) — `--safe-add`, and NOT `--update`.
+        let safe = build_bundle_argv(folder, orch, BundleMode::Create { safe_add: true });
+        assert!(safe.iter().any(|a| a == "--safe-add"), "safe-add must add --safe-add");
+        assert!(!safe.iter().any(|a| a == "--update"), "create must never add --update");
+
+        // Update — `--update`, and NOT `--safe-add` (XOR).
+        let update = build_bundle_argv(folder, orch, BundleMode::Update);
+        assert!(update.iter().any(|a| a == "--update"), "update must add --update");
+        assert!(!update.iter().any(|a| a == "--safe-add"), "update must never add --safe-add");
+
+        // Warning-prefix per mode (parse-failure notice keeps its byte-exact
+        // `"produced unparseable output"` substring + the per-mode prefix).
+        let create_pf =
+            BundleMode::Create { safe_add: false }.parse_failure_warning(&"boom", "tail");
+        assert!(create_pf.starts_with("install-bundle produced unparseable output"));
+        assert!(!create_pf.contains("install-bundle --update"));
+        let update_pf = BundleMode::Update.parse_failure_warning(&"boom", "tail");
+        assert!(update_pf.starts_with("install-bundle --update produced unparseable output"));
+    }
+
+    /// D12 byte-fidelity: every per-mode soft-fail warning string produced by
+    /// the shared core's `BundleMode` methods is byte-identical to the
+    /// pre-refactor mirror (base a4a07fa3). The expected literals below are
+    /// transcribed verbatim from `run_install_bundle` (create) /
+    /// `run_install_bundle_update_with_root` (update) at base — if the shared
+    /// core paraphrases any of them (which would silently reclassify severity
+    /// in `classify_warning` / warning-severity.ts), this breaks.
+    #[test]
+    fn d12_per_mode_warning_strings_are_byte_identical_to_base() {
+        let create = BundleMode::Create { safe_add: false };
+        let update = BundleMode::Update;
+        let e = "boom";
+
+        // detect_system failed.
+        assert_eq!(
+            create.detect_system_failed_warning(&e),
+            "install-bundle skipped: detect_system failed: boom. \
+             Per-project hooks/scripts/agents/skills will not be installed \
+             — Claude Code session running in this folder won't have the \
+             orchestrator's automation. Manual fix: run \
+             `python -m vco_lib.project_init install-bundle --folder <path>`."
+        );
+        assert_eq!(
+            update.detect_system_failed_warning(&e),
+            "install-bundle --update skipped: detect_system failed: boom. \
+             No new orchestrator-shipped files will land in this project. \
+             Manual fix: `python -m vco_lib.project_init install-bundle \
+             --folder <path> --update`."
+        );
+
+        // no Python.
+        assert_eq!(
+            create.no_python_warning(),
+            "install-bundle skipped: no Python 3.11+ on PATH. \
+             Hooks/scripts/agents/skills not installed; install Python and \
+             re-run setup."
+        );
+        assert_eq!(
+            update.no_python_warning(),
+            "install-bundle --update skipped: no Python 3.11+ on PATH. \
+             Install Python and re-click \"Update bundle\"."
+        );
+
+        // orchestrator root not found.
+        assert_eq!(
+            create.orch_root_not_found_warning(&e),
+            "install-bundle skipped: orchestrator root not found: boom. \
+             Per-project hooks/scripts/agents/skills will not be installed."
+        );
+        assert_eq!(
+            update.orch_root_not_found_warning(&e),
+            "install-bundle --update skipped: orchestrator root not found: boom. \
+             No new orchestrator-shipped files will land in this project."
+        );
+
+        // subprocess failed to start.
+        assert_eq!(
+            create.subprocess_start_failed_warning(&e),
+            "install-bundle subprocess failed to start: boom. \
+             Hooks/scripts/agents/skills not installed."
+        );
+        assert_eq!(
+            update.subprocess_start_failed_warning(&e),
+            "install-bundle --update subprocess failed to start: boom. \
+             Project files unchanged."
+        );
+
+        // parse failure (the v0.2.84 incident shape — keeps "unparseable output").
+        assert_eq!(
+            create.parse_failure_warning(&"pe", "TAIL"),
+            "install-bundle produced unparseable output (pe): \
+             stderr tail: TAIL. Hooks/scripts/agents/skills may be incomplete."
+        );
+        assert_eq!(
+            update.parse_failure_warning(&"pe", "TAIL"),
+            "install-bundle --update produced unparseable output (pe): \
+             stderr tail: TAIL. Project files may be partially updated."
+        );
+    }
+
+    /// PIN-P2 (act, refactor-safety, subprocess leg): a real create-mode run and
+    /// a real update-mode run against the same fake-orchestrator fixture each
+    /// still emit the correct mode-flag behaviour end-to-end. Create seeds a
+    /// fresh tree (manifest written, skip-existing on any pre-existing shipped
+    /// dest); update reclassifies against the manifest. Reuses the :9287/:9389
+    /// fixture idioms. (The exact argv-byte pin is PIN-P2/PIN-P3 above — no
+    /// subprocess; this leg proves the wrappers thread the mode through the real
+    /// spawn without regressing behaviour.)
+    #[test]
+    fn pin_p2_create_and_update_runs_thread_mode_through_core() {
+        let Some(_py) = pick_python() else {
+            eprintln!("[skip] no python on PATH");
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-p2-mode-{}", uuid::Uuid::new_v4().simple()
+        ));
+        let fake_orch = tmp.join("orch");
+        let proj = tmp.join("proj");
+        std::fs::create_dir_all(&fake_orch).unwrap();
+        std::fs::create_dir_all(&proj).unwrap();
+        make_fake_orchestrator(&fake_orch);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // CREATE-mode wrapper: production caller uses find_local_repo_root()
+        // for the orchestrator root, so we can't override the fake tree through
+        // run_install_bundle. Instead pin create-mode's contract directly:
+        // build_bundle_argv in create mode carries --json and no --update.
+        let create_argv = build_bundle_argv(
+            &proj.to_string_lossy(),
+            &fake_orch.to_string_lossy(),
+            BundleMode::Create { safe_add: false },
+        );
+        assert!(create_argv.iter().any(|a| a == "--json"));
+        assert!(!create_argv.iter().any(|a| a == "--update"));
+
+        // UPDATE-mode wrapper end-to-end (the test seam accepts an override).
+        // First seed a manifest via a direct create-mode CLI subprocess, then
+        // run the update wrapper — a clean re-run yields noop/always-overwrite.
+        let py = pick_python().unwrap();
+        let real_root = real_repo_root();
+        let seed = std::process::Command::new(&py).silent()
+            .args([
+                "-m", "vco_lib.project_init", "install-bundle",
+                "--folder", &proj.to_string_lossy(),
+                "--orchestrator-root", &fake_orch.to_string_lossy(),
+                "--json",
+            ])
+            .current_dir(&real_root)
+            .output()
+            .expect("seed subprocess failed to start");
+        assert!(seed.status.success(), "seed must succeed: {}",
+                String::from_utf8_lossy(&seed.stderr));
+
+        let (warnings, summary) = rt.block_on(
+            run_install_bundle_update_with_root(&proj, Some(&fake_orch))
+        );
+        // Update classified at least one op (noop/always-overwrite dominate on
+        // an unchanged orchestrator) and produced no parse-failure warning
+        // (which is what a dropped mode flag / broken argv would cause).
+        assert!(summary.total_ops() > 0,
+                "update wrapper must classify ops; summary={:?}", summary);
+        assert!(
+            !warnings.iter().any(|w| w.contains("unparseable output")),
+            "update wrapper must not hit the parse-failure arm; warnings={:?}",
+            warnings
+        );
+        assert_eq!(summary.errors_count, 0, "clean re-run has no errors");
 
         std::fs::remove_dir_all(&tmp).ok();
     }

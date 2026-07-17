@@ -39,19 +39,39 @@ def test_script_patterns_include_workflow_wrappers():
 
 def test_no_resurrected_inline_copies():
     """Neither install.py nor project_init may re-grow a private flavour
-    policy / pattern list. String-level guard: both files must reference the
-    shared module, and the old native-only accessor must stay dead."""
+    policy / pattern list. String-level guard: the old native-only accessor
+    must stay dead, and project_init (the ONE bundle engine) must reference the
+    shared module.
+
+    v0.2.85 (PLAN-v0285 WP-1) UPDATE: install.py no longer references
+    ``vco_lib.bundle_globs`` at all — its bespoke Step-5b/9b hook/script
+    materialize was DELETED and the root now DELEGATES to the install-bundle
+    engine (project_init), which is the single home for the glob policy. So the
+    guard for install.py is now inverted: it must have NO private flavour
+    accessor (the resurrection risk) — but requiring a bundle_globs REFERENCE
+    would force a copy back into install.py, defeating the delegation. Only
+    project_init must still reference the shared module.
+    """
     install_py = (REPO_ROOT / "install.py").read_text(encoding="utf-8")
     project_init = (REPO_ROOT / "vco_lib" / "project_init.py").read_text(
         encoding="utf-8"
     )
-    assert "vco_lib.bundle_globs" in install_py
+    # project_init (the bundle engine) still owns + references the shared globs.
     assert "vco_lib.bundle_globs" in project_init
+    # Neither file may resurrect a private native-flavour-only accessor.
     assert "def _hook_glob_for_os" not in install_py, (
         "native-flavour-only accessor resurrected in install.py"
     )
     assert "def _hook_glob_for_os" not in project_init, (
         "legacy single-glob accessor resurrected in project_init"
+    )
+    # install.py must NOT re-grow a private hook/script flavour policy: since
+    # v0.2.85 it delegates, so it should carry no bundle-globs import at all
+    # (a re-appearance would signal a resurrected inline enumeration).
+    assert "from vco_lib.bundle_globs import" not in install_py, (
+        "install.py re-grew a bundle-globs import — the root install "
+        "delegates to the bundle engine (PLAN-v0285 D1); it must not "
+        "re-enumerate hooks/scripts itself"
     )
 
 

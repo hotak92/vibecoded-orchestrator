@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.85] - 2026-07-17
+
+### Changed — root/project install parity (root delegates to the ONE bundle engine)
+
+- **The orchestrator root now installs through the same `install-bundle`
+  engine (and the same `--json` machine contract) as every project.**
+  `install.py`'s Steps 5b + 9b — its bespoke `.claude/` materialize, agents/
+  skills install, and their own enumeration / classifier / manifest writer /
+  settings merges — were DELETED (~936 LOC out of `install.py`) and replaced by
+  a single delegated subprocess call to `vco_lib.self_install.
+  run_root_bundle_install`, with the exact argv shape the launcher uses. Root,
+  launcher-create, and launcher-update are now three clients of one CLI
+  contract, so a defect on one surface is caught on all three by one test
+  family (this closes the class behind the v0.2.84 stdout-pollution incident).
+  New contract doc: `docs/INSTALL_PARITY.md`.
+- **Launcher: the add-project and update flows share one spawn core.** The two
+  ~120-line argv-builder mirrors (`run_install_bundle` create /
+  `run_install_bundle_update_with_root` update) now delegate to one
+  `build_bundle_argv` + `BundleMode` core; both mode argv orders are byte-pinned.
+- **Root now adopts drifted shipped files with a timestamped backup** (the
+  v0.2.84 policy, now applied at the root too) instead of preserving-and-nagging;
+  the `orchestrator_self_user_modified_preserved` deferral is retired
+  (drop-when-absent self-clear). Root file writes go through the atomic,
+  symlink-guarded writer (the non-atomic `shutil.copy2` sites on live targets
+  are gone).
+
+### Added
+
+- `--skip-kind {agents,skills,hooks,scripts,settings}` on `install-bundle`
+  (repeatable) with orphan-safe three-leg semantics (excluded from enumeration
+  AND orphan processing; prior manifest entries carried forward verbatim).
+- `UpdateSummary.adopted` tally so adoption-only updates report honestly instead
+  of "0 changed".
+
+### Fixed
+
+- **Root manifest clobber (F-NEW-1):** the root's manifest had two writers, and
+  `install.py`'s rebuilt `files` from only hooks/scripts/settings — so every
+  `install.py --update` destroyed the agents/skills manifest entries the
+  launcher wrote (the likely origin of the field's "manifest-less stale files").
+  One writer remains by construction.
+- **Adoption NOTICE was printed to stdout** (the `--json` machine contract),
+  making `install-bundle --update --json` unparseable and surfacing a false
+  "Project files may be partially updated" in update-all — moved to stderr,
+  pinned twice (folded in from the v0.2.84 dogfood, commit `a4a07fa3`).
+- **`--force` no longer overwrites user-owned `knowledge/**` KG nodes** (they
+  stay `preserve` — root knowledge is gitignored + un-backed-up, so a force
+  overwrite was unrecoverable data loss). Divergent user knowledge is now
+  tracked silently (no `bundle_user_modified_preserved` deferral — its `--force`
+  remediation is a deliberate no-op for knowledge, so emitting it would advertise
+  a dead command and flap the deferral). Code-surface preserves are unaffected.
+- **`--skip-kind` runs no longer falsely auto-resolve deferrals** for the kinds
+  they skip (the reconciler holds file-inspection conditions when the view is
+  partial, avoiding a dishonest "condition no longer applies" audit row).
+- Root `.claude/` install subprocess now pins its `PYTHONPATH` to the running
+  package root so the child imports the same `vco_lib` as the parent.
+
 ## [0.2.84] - 2026-07-17
 
 ### Fixed — v0.2.83 dogfood findings (live update-all verification)

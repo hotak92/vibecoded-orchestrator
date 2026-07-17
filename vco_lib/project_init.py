@@ -61,6 +61,11 @@ from typing import Any, Callable, Optional
 # orchestrator-self path; the helpers live in ``vco_lib.symlink_handler``
 # so both paths share the SSOT.
 from vco_lib.symlink_handler import compute_vco_new_path, is_symlink_blocking
+# v0.2.85 PLAN-v0285 D6/D11: the shared separator-normalization helper, imported
+# at module level so `_bundle_op_kind` (a module-level function) can use it. The
+# in-function local imports of `to_posix_rel` elsewhere in this file are left as
+# they are — pre-existing, and harmless (same object).
+from vco_lib.paths import to_posix_rel
 from vco_lib import weaviate_helpers as _wh
 # v0.2.82 L4: the ONE home for named-vector round-trip cleaning (dropping
 # configured-but-empty ``{slot: []}`` slots that weaviate rejects on re-insert).
@@ -3184,6 +3189,68 @@ def _write_bootstrap_deferral(
 _MANIFEST_REL = Path(".claude") / ".vco-manifest.json"
 _MANIFEST_SCHEMA_VERSION = 2
 
+# v0.2.85 PLAN-v0285 D2 (one-concern-one-home): the install-bundle result
+# envelope schema has ONE declared home. install.py's WP-1 delegated call and
+# the launcher (WP-3) are both subprocess clients that parse this envelope; the
+# parity tests import these constants so a schema drift breaks in exactly one
+# place. See docs/INSTALL_PARITY.md.
+#
+# `BUNDLE_ACTION_KEYS` is an ORDERED tuple, NOT a frozenset, deliberately: the
+# `result["actions"]` dict is built via `{k: [] for k in BUNDLE_ACTION_KEYS}`
+# and `json.dumps` preserves insertion order, so the ordering IS load-bearing
+# for the byte-identical-default-envelope pins (PIN-S2 / PIN-S3). A frozenset's
+# non-deterministic iteration order would change the emitted JSON bytes. The
+# plan calls it a "frozenset" for its set-membership role (the parity tests
+# assert `set(result["actions"]) <= set(BUNDLE_ACTION_KEYS)`); set semantics are
+# still available via `set(BUNDLE_ACTION_KEYS)` / `x in BUNDLE_ACTION_KEYS`.
+# BOTH result-dict construction sites in `install_project_bundle` (the main
+# return and the missing-folder early return) derive their action-key set from
+# this ONE tuple — no drifting literals.
+BUNDLE_ACTION_KEYS: tuple[str, ...] = (
+    "create",
+    "overwrite",
+    "always-overwrite",
+    "noop",
+    "preserve",
+    "adopt",              # v0.2.84 D7: shipped-file adoption
+    "skip-existing",
+    "skip-disabled",      # Wave 2 D, 2026-05-22
+    "keep-regenerated",   # v0.2.57: regen'd data, no warn
+    "orphan-deleted",     # v0.2.24 §A0
+    "orphan-preserved",   # v0.2.24 §A0
+    "orphan-retired",     # v0.2.83 B-F5
+    "knowledge-retired",  # v0.2.81 root-only curated KG
+)
+
+# Top-level envelope keys ALWAYS present on a successful `install_project_bundle`
+# return (additive keys like `adopt_backup_dir` / `skip_kinds` / `templates` /
+# `rl_client_setup` are omitted here — they appear only conditionally). Used by
+# the parity tests as `set(result) >= BUNDLE_RESULT_TOP_KEYS`. A frozenset is
+# correct here: these are only ever compared by set-membership, never used to
+# build an order-sensitive dict.
+BUNDLE_RESULT_TOP_KEYS: frozenset[str] = frozenset({
+    "folder",
+    "orchestrator_root",
+    "update_mode",
+    "force",
+    "dry_run",
+    "actions",
+    "settings_action",
+    "manifest_written",
+    "vco_version",
+    "warnings",
+    "errors",
+})
+
+# v0.2.85 PLAN-v0285 D6: the set of `--skip-kind` values accepted by the CLI and
+# the `skip_kinds` param. `agents`/`skills`/`hooks`/`scripts` are enumeration
+# KINDS (a file's kind is derived from its `.claude/<bucket>/` dest_rel prefix by
+# `_bundle_op_kind`); `settings` is NOT an op but the separate settings-merge
+# step, so it is handled specially (skipping it leaves `settings_action == ""`).
+BUNDLE_SKIP_KINDS: frozenset[str] = frozenset({
+    "agents", "skills", "hooks", "scripts", "settings",
+})
+
 # v0.2.84 PLAN-v0284 D7 (P5/R2): shipped-file adoption backups. When an update
 # ADOPTS a divergent bundle file, the CURRENT bytes are first copied here (one
 # `<UTC-basic-ts>` sub-dir per install run) before the shipped bytes overwrite
@@ -4117,6 +4184,36 @@ def _classify_bundle_op_kind(dest_rel: str) -> Optional[tuple[str, str]]:
     return None
 
 
+def _bundle_op_kind(dest_rel: str) -> Optional[str]:
+    """Map a bundle `dest_rel` to its enumeration KIND for `--skip-kind`
+    (v0.2.85 PLAN-v0285 D6).
+
+    Returns one of `"hooks"`, `"scripts"`, `"agents"`, `"skills"`, or None
+    (for anything not covered by a skip-kind — infrastructure compose files,
+    curated/per-project knowledge nodes, `.vscode/tasks.json`, etc.).
+
+    `hooks` INCLUDES `.claude/hooks/_lib/...` (the always-overwrite lib files
+    ship as part of the hooks kind). `settings` is deliberately absent: the
+    settings.json smart-merge is NOT an enumerated op, so it is skipped at the
+    merge call-site, not here.
+
+    Cross-OS: `dest_rel` carries the host separator (`\\` on Windows). Normalize
+    via the shared `to_posix_rel` helper before the prefix test — the same
+    discipline the knowledge-retirement branch and `_classify_bundle_op_kind`
+    already use.
+    """
+    normalized = to_posix_rel(dest_rel)
+    if normalized.startswith(".claude/hooks/"):
+        return "hooks"
+    if normalized.startswith(".claude/scripts/"):
+        return "scripts"
+    if normalized.startswith(".claude/agents/"):
+        return "agents"
+    if normalized.startswith(".claude/skills/"):
+        return "skills"
+    return None
+
+
 def _installed_matches_template_history(
     template_source: Path,
     installed_hash: str,
@@ -4385,10 +4482,9 @@ def _file_action(
     # on-disk `.md`). Adopting a user-modified KG node would DESTROY the user's
     # own knowledge content ("never destroy user data"). So a divergent
     # `knowledge/**` file stays `preserve` (the standing behavior, pinned by
-    # test_v52_c_kg_as_user_state.py). Normalize the separator before the prefix
-    # test (Windows dest_rel = `knowledge\...`) via the shared helper.
-    from vco_lib.paths import to_posix_rel as _to_posix_rel
-    if _to_posix_rel(op.dest_rel).startswith("knowledge/"):
+    # test_v52_c_kg_as_user_state.py). Separator-normalized via the shared
+    # `_is_knowledge_dest` (ONE home; also drives the NEW-1 deferral split).
+    if _is_knowledge_dest(op.dest_rel):
         return ("preserve", source_bytes)
     #
     # `_file_action` only CLASSIFIES — the backup-then-write-shipped machinery
@@ -9130,6 +9226,16 @@ def _emit_safe_add_git_exclude_deferral(
     _de.emit(folder, entry)
 
 
+def _is_knowledge_dest(dest_rel: str) -> bool:
+    """True iff `dest_rel` is a user-owned `knowledge/**` node.
+
+    ONE home for the knowledge-path test used by the B-1 preserve carve-out and
+    the NEW-1 deferral-accounting split. Separator-normalized (Windows dest_rel
+    is `knowledge\\...`) via the shared `to_posix_rel` — never inline the prefix
+    test (the v0.2.81 lesson)."""
+    return to_posix_rel(dest_rel).startswith("knowledge/")
+
+
 def install_project_bundle(
     folder: Path,
     orchestrator_root: Optional[Path] = None,
@@ -9141,6 +9247,7 @@ def install_project_bundle(
     project_name: Optional[str] = None,
     log_event: Optional[Callable[..., None]] = None,
     safe_add: bool = False,
+    skip_kinds: frozenset[str] = frozenset(),
 ) -> dict:
     """Install (or update) the per-project Claude bundle in `folder`.
 
@@ -9172,6 +9279,17 @@ def install_project_bundle(
             ``safe_add_git_exclude_updated`` deferral. The ``.claude/settings.json``
             and ``.vscode/settings.json`` merges are UNCHANGED under safe-add
             (those files are rarely committed).
+        skip_kinds: v0.2.85 PLAN-v0285 D6 — a set of enumeration KINDS to skip
+            entirely (subset of ``BUNDLE_SKIP_KINDS``:
+            ``{agents, skills, hooks, scripts, settings}``). A skipped kind is
+            (1) excluded from enumeration (its ops are never written), (2)
+            excluded from orphan processing (a prior manifest entry of that kind
+            is NEVER orphan-deleted / orphan-retired), and (3) its prior manifest
+            entries are carried forward VERBATIM into the new manifest — so a
+            skipped-hooks run never DELETES the user's installed hooks. Default
+            (empty frozenset) is byte-identical to the historical behaviour. Used
+            by install.py's WP-1 delegated call to map the legacy
+            ``--skip-materialize-claude-dir`` flag (→ skip hooks/scripts/settings).
 
     Returns a JSON-serialisable dict:
       {
@@ -9197,6 +9315,9 @@ def install_project_bundle(
         # only when >=1 file was adopted this run). Additive — install.py
         # call-sites are untouched.
         "adopt_backup_dir": <rel> | absent,
+        # v0.2.85 D6: the sorted list of kinds skipped this run (additive; only
+        # present when non-empty, so the default-run envelope is unchanged).
+        "skip_kinds": [<kind>...],          # absent when skip_kinds is empty
         "settings_action": "created"|"merged"|"unchanged"|"unchanged (user file unparseable)"|"" ,
         "manifest_written": bool,
         "vco_version": str,
@@ -9216,20 +9337,24 @@ def install_project_bundle(
         except TypeError:
             log_event(step, phase, detail)
 
+    # v0.2.85 PLAN-v0285 D6: normalize + validate skip_kinds once, up front, so
+    # both the enumeration filter and the orphan-loop carry-forward see the same
+    # canonical set. Unknown kinds are dropped (defensive — the CLI's `choices`
+    # already gates the surface, but a direct Python caller could pass garbage).
+    skip_kinds = frozenset(skip_kinds) & BUNDLE_SKIP_KINDS
+
     folder = Path(folder).resolve()
     if not folder.exists() or not folder.is_dir():
+        # v0.2.85 D2: action-key set derived from the ONE schema tuple
+        # (BUNDLE_ACTION_KEYS) — no drifting literal. This is the early-return
+        # (missing-folder) construction site.
         return {
             "folder": str(folder),
             "orchestrator_root": "",
             "update_mode": bool(update_mode),
             "force": bool(force),
             "dry_run": bool(dry_run),
-            "actions": {k: [] for k in
-                        ("create", "overwrite", "always-overwrite",
-                         "noop", "preserve", "adopt", "skip-existing",
-                         "skip-disabled", "keep-regenerated",
-                         "orphan-deleted", "orphan-preserved",
-                         "orphan-retired", "knowledge-retired")},
+            "actions": {k: [] for k in BUNDLE_ACTION_KEYS},
             "settings_action": "",
             "manifest_written": False,
             "vco_version": "unknown",
@@ -9272,18 +9397,23 @@ def install_project_bundle(
         # v0.2.81: `knowledge-retired` = prior curated knowledge/ entries
         # that went root-only. Non-root: left on disk (never deleted, never
         # deferred), only pruned from the manifest. See the orphan loop.
-        "actions": {k: [] for k in
-                    ("create", "overwrite", "always-overwrite",
-                     "noop", "preserve", "adopt", "skip-existing",
-                     "skip-disabled", "keep-regenerated",
-                     "orphan-deleted", "orphan-preserved",
-                     "orphan-retired", "knowledge-retired")},
+        # v0.2.85 D2: action-key set derived from the ONE schema tuple
+        # (BUNDLE_ACTION_KEYS) — no drifting literal. This is the main
+        # (success-path) construction site.
+        "actions": {k: [] for k in BUNDLE_ACTION_KEYS},
         "settings_action": "",
         "manifest_written": False,
         "vco_version": _resolve_vco_version(orchestrator_root),
         "warnings": [],
         "errors": [],
     }
+
+    # v0.2.85 PLAN-v0285 D6: additive envelope key. ONLY present when a kind was
+    # actually skipped, so the default (no-skip) run's envelope is byte-identical
+    # to the historical shape (PIN-S2). Sorted for a deterministic, diffable
+    # value across callers/OSes.
+    if skip_kinds:
+        result["skip_kinds"] = sorted(skip_kinds)
 
     if not orchestrator_root.exists():
         result["errors"].append({
@@ -9340,6 +9470,18 @@ def install_project_bundle(
     # files (no longer diverged) automatically fall off.
     new_preserved: dict[str, dict] = {}
     user_modified_paths: list[str] = []
+    # v0.2.85 NEW-1 (B-1 follow-up): divergent user-owned `knowledge/**` nodes
+    # are classified `preserve` (never adopted/overwritten — the B-1 carve-out),
+    # but they are the EXPECTED steady state, NOT a "shipped file the user must
+    # reconcile". They are tracked SEPARATELY from `user_modified_paths` so they
+    # never enter the `bundle_user_modified_preserved` deferral accounting: that
+    # deferral's remediation is `--update --force`, which by B-1 is a deliberate
+    # no-op for knowledge — emitting it would advertise a dead command and, worse,
+    # a later `--force` run (where `still_user_modified` goes False) would
+    # dishonestly auto-resolve an entry naming a still-divergent node. Parallel to
+    # `keep-regenerated`: recorded in the manifest's `preserved` map for audit,
+    # but silent (no deferral, no warning, no emit/clear flap).
+    knowledge_preserved_paths: list[str] = []
     skipped_existing_paths: list[str] = []
     # v0.2.84 PLAN-v0284 D7 (P5/R2): shipped-file adoption. `adopted_paths`
     # collects the dest_rels adopted this run (shipped bytes written after a
@@ -9350,8 +9492,21 @@ def install_project_bundle(
     _adopt_backup_ts: Optional[str] = None
 
     ops = _enumerate_bundle_files(orchestrator_root, project_root=folder)
+    # v0.2.85 PLAN-v0285 D6 LEG 1 (exclude from enumeration): drop the ops of
+    # any skipped file-kind BEFORE the classify/write loop, so a skipped kind's
+    # files are never touched on disk. `settings` is NOT a file-kind (it is the
+    # separate settings-merge step, gated at its own call-site below), so it
+    # never appears in `ops` and is a no-op here. Legs 2-3 (orphan exclusion +
+    # manifest carry-forward) live in the orphan loop — WITHOUT them the orphan
+    # loop would see the still-tracked-but-not-re-shipped entries as orphans and
+    # DELETE the user's installed files (the exact hazard PIN-S1 pins).
+    _op_kinds_to_skip = skip_kinds & {"agents", "skills", "hooks", "scripts"}
+    if _op_kinds_to_skip:
+        ops = [op for op in ops
+               if _bundle_op_kind(op.dest_rel) not in _op_kinds_to_skip]
     _log("4.bundle", "start",
-         f"enumerate: {len(ops)} ops",
+         f"enumerate: {len(ops)} ops"
+         + (f" (skip_kinds={sorted(skip_kinds)})" if skip_kinds else ""),
          data={"folder": str(folder), "ops": len(ops)})
 
     for op in ops:
@@ -9378,8 +9533,24 @@ def install_project_bundle(
         # noise). This also keeps the `--force` self-clear path unchanged (force
         # runs never populate `user_modified_paths` → reconciler clears the
         # stale `bundle_user_modified_preserved` entry).
+        #
+        # EXCEPTION (v0.2.85 B-1, "never destroy user data"): a divergent
+        # `knowledge/**` KG node was classified `preserve` by the carve-out in
+        # `_file_action` precisely because it is USER-OWNED state, not a stale
+        # shipped codefile. `--force` must NOT silently overwrite it — the root's
+        # `knowledge/` is gitignored (no git recovery) and no adoption backup is
+        # taken on this branch, so the user's edits would be unrecoverable. Force
+        # is scoped to the code surface (hooks/scripts/agents/skills/compose);
+        # knowledge stays `preserve` regardless of `--force`. (The `--force
+        # --force`-to-discard-knowledge use case does not exist: the user resyncs
+        # KG from Weaviate or edits the .md directly, never by forcing a bundle.)
         if force and update_mode and action in ("preserve", "adopt"):
-            action = "overwrite"
+            from vco_lib.paths import to_posix_rel as _to_posix_rel_force
+            if _to_posix_rel_force(op.dest_rel).startswith("knowledge/"):
+                # knowledge stays preserve — force never destroys user KG state
+                pass
+            else:
+                action = "overwrite"
 
         # Compute the new shipped hash regardless of action — needed for
         # manifest update on every file we recognize.
@@ -9448,9 +9619,18 @@ def install_project_bundle(
 
             # Fall-through: when `action` was flipped to "preserve" above (backup
             # failure), do the preserve bookkeeping now (single home for that
-            # logic mirrors the `if action == "preserve"` block below).
+            # logic mirrors the `if action == "preserve"` block below). NOTE: a
+            # knowledge/** node never reaches THIS block — it is classified
+            # `preserve` directly (not `adopt`), so the adopt-backup-failure
+            # fallback can't produce it; still, route by dest for symmetry so the
+            # two preserve bookkeeping sites stay identical (NEW-1).
             if action == "preserve":
-                user_modified_paths.append(op.dest_rel)
+                if _is_knowledge_dest(op.dest_rel):
+                    knowledge_preserved_paths.append(op.dest_rel)
+                    _preserve_reason = "knowledge-preserve"
+                else:
+                    user_modified_paths.append(op.dest_rel)
+                    _preserve_reason = "preserve"
                 existing = manifest.get("files", {}).get(op.dest_rel)
                 if existing is not None:
                     new_files[op.dest_rel] = existing
@@ -9458,11 +9638,19 @@ def install_project_bundle(
                     "shipped_sha256": shipped_hash,
                     "preserved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "shipped_source": op.source_rel,
-                    "reason": "preserve",
+                    "reason": _preserve_reason,
                 }
 
         elif action == "preserve":
-            user_modified_paths.append(op.dest_rel)
+            # v0.2.85 NEW-1: route user-owned knowledge/** to the SILENT
+            # preserve list (no deferral), code-surface files to the deferred
+            # `user_modified_paths`. See the knowledge_preserved_paths comment.
+            if _is_knowledge_dest(op.dest_rel):
+                knowledge_preserved_paths.append(op.dest_rel)
+                _preserve_reason = "knowledge-preserve"
+            else:
+                user_modified_paths.append(op.dest_rel)
+                _preserve_reason = "preserve"
             # Keep the manifest's prior entry (don't update hash) so the
             # next update still recognizes the prior baseline.
             existing = manifest.get("files", {}).get(op.dest_rel)
@@ -9474,7 +9662,7 @@ def install_project_bundle(
                 "shipped_sha256": shipped_hash,
                 "preserved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "shipped_source": op.source_rel,
-                "reason": "preserve",
+                "reason": _preserve_reason,
             }
 
         elif action == "skip-existing":
@@ -9613,6 +9801,24 @@ def install_project_bundle(
             # project knowledge files — TAG_HIERARCHY.md etc. — are in ops
             # for every target, so they're excluded from retirement here.)
             continue
+        # v0.2.85 PLAN-v0285 D6 LEGS 2+3 (exclude from orphan processing +
+        # carry manifest entry forward VERBATIM): a prior manifest entry whose
+        # KIND was skipped this run is NOT an orphan — LEG 1 deliberately dropped
+        # its op from enumeration, so its absence from `seen_in_ops` is expected,
+        # NOT "upstream deleted it". Without this branch the orphan machinery
+        # below would (case b) DELETE the user's installed hook/script/agent/
+        # skill from disk or (case c) retire+auto-resolve it — destroying files
+        # the user asked us to leave alone. Carry the prior entry forward
+        # byte-identically so a later non-skipping run still recognizes the
+        # shipped baseline. Cross-OS: `_bundle_op_kind` normalizes the separator
+        # (Windows manifest keys carry `\\`). This branch precedes the
+        # knowledge-retirement branch: `settings` is never a manifest file-kind,
+        # and the four file-kinds are disjoint from `knowledge/**`, so ordering
+        # is safe either way — but skip-kind carry-forward is the more specific
+        # intent and takes precedence.
+        if _op_kinds_to_skip and _bundle_op_kind(prior_rel) in _op_kinds_to_skip:
+            new_files[prior_rel] = prior_entry
+            continue
         # v0.2.81 knowledge-retirement branch (data-safety, constraint 3):
         # on a NON-root project the ~115 curated `knowledge/**` entries are
         # no longer shipped, so they'd otherwise fall into the orphan
@@ -9717,8 +9923,15 @@ def install_project_bundle(
     # Smart-merge settings.json template separately. The template carries
     # the orchestrator's hooks block + permissions defaults. The merge
     # logic mirrors install.py:_merge_settings_template + _smart_merge_settings.
+    #
+    # v0.2.85 PLAN-v0285 D6 (settings skip): `settings` is the ONLY skip-kind
+    # that is not a file-kind — it names this merge step, not an enumerated op.
+    # Skipping it leaves `.claude/settings.json` untouched and `settings_action`
+    # as the default "" (asserted by the skip-settings test). install.py's WP-1
+    # maps `--skip-materialize-claude-dir` to `--skip-kind ... settings` so the
+    # legacy "don't rewrite my settings" intent is preserved.
     settings_template = _settings_template_path(orchestrator_root)
-    if settings_template.exists():
+    if "settings" not in skip_kinds and settings_template.exists():
         try:
             settings_target = folder / ".claude" / "settings.json"
             settings_action, settings_redirect = _merge_settings_template_for_bundle(
@@ -10106,6 +10319,12 @@ def install_project_bundle(
                     f"symlink-redirect deferral write failed: {err}"
                 )
 
+        # NEW-1: `user_modified_paths` holds ONLY code-surface preserves now
+        # (knowledge/** went to `knowledge_preserved_paths`), so `not force` is
+        # sound again — every file here IS resolved by a subsequent `--force`
+        # run (the deferral's advertised remediation), and none is a knowledge
+        # node whose force is a no-op. The reconciler's `not force` clear is
+        # likewise honest by construction.
         if update_mode and user_modified_paths and not force:
             try:
                 _emit_user_modified_deferral(
@@ -10375,12 +10594,27 @@ def install_project_bundle(
                 f"codegraph prefix-drift detection failed: {err}"
             )
 
-        # Reconcile + trim: drop entries this install resolved.
+        # v0.2.85 M-1 (skip-kind reconciler honesty): a `--skip-kind` run does
+        # NOT classify the skipped kinds' files, so `user_modified_paths` /
+        # `orphan_preserved` / `skipped_existing_paths` are computed over an
+        # INCOMPLETE view. Auto-resolving a file-inspection-derived deferral from
+        # that partial view would drop a still-applicable entry (and write a
+        # FALSE "condition no longer applies" audit row) for a file we never
+        # looked at — exactly the dishonest-auto-resolution class v0.2.83 killed.
+        # When any kind was skipped, hold those three conditions conservatively
+        # `still_*=True` (do not clear what we did not inspect); the next FULL
+        # run reconciles them honestly. Conditions unaffected by skip-kinds
+        # (template review, legacy kg/codegraph/vscode) reconcile as usual.
+        _skipped_any = bool(skip_kinds)
         try:
             _reconcile_bundle_deferrals(
                 folder,
-                still_user_modified=bool(user_modified_paths) and not force,
-                still_skipped_existing=bool(skipped_existing_paths),
+                still_user_modified=(
+                    _skipped_any or (bool(user_modified_paths) and not force)
+                ),
+                still_skipped_existing=(
+                    _skipped_any or bool(skipped_existing_paths)
+                ),
                 still_template_review_pending=bool(template_review_diverged),
                 still_legacy_kg=bool(legacy_kg_candidates),
                 # v0.2.83 B-F6: use the NON-dropped remainder — an all-empty run
@@ -10390,8 +10624,9 @@ def install_project_bundle(
                 # v0.2.24 §A0 (2026-05-22): include the new orphan-
                 # preserved condition so a future run that has no
                 # remaining orphans (user deleted them, or upstream
-                # re-added) clears the stale deferral.
-                still_orphan_preserved=bool(orphan_preserved),
+                # re-added) clears the stale deferral. v0.2.85 M-1: held True
+                # under any skip so a skipped-kind orphan is not falsely cleared.
+                still_orphan_preserved=(_skipped_any or bool(orphan_preserved)),
                 # v0.2.24 RL-defect Fix 2 (2026-05-22): include the
                 # legacy .vscode MCP_* env detection so a future run
                 # where the user has cleaned the keys clears the entry.
@@ -13129,9 +13364,49 @@ def _bundle_update_pointer_heal() -> None:
         return  # sqlite lock / any error → soft-fail.
 
 
+def format_bundle_result_lines(result: dict) -> list[str]:
+    """Render an `install_project_bundle` result envelope as human-readable
+    lines (the NON-`--json` output).
+
+    v0.2.85 PLAN-v0285 D2 (one-concern-one-home): extracted VERBATIM from
+    `_cmd_install_bundle`'s non-JSON branch so install.py's WP-1 delegated call
+    (`vco_lib.self_install`) and the CLI render the human summary through the
+    SAME code — no drifting second renderer. Each list element is one line (no
+    trailing newline); the CLI prints them via `print("\\n".join(lines))`, which
+    produces byte-identical output to the historical sequential `print()` calls
+    (PIN-S3 golden pin). Pure: no side effects, no I/O.
+    """
+    lines: list[str] = []
+    lines.append(f"folder: {result['folder']}")
+    lines.append(f"orchestrator_root: {result['orchestrator_root']}")
+    lines.append(f"update_mode: {result['update_mode']}  dry_run: {result['dry_run']}")
+    for category, paths in result["actions"].items():
+        if not paths:
+            continue
+        lines.append(f"  {category} ({len(paths)}):")
+        for p in paths[:8]:
+            lines.append(f"    {p}")
+        if len(paths) > 8:
+            lines.append(f"    ... +{len(paths) - 8} more")
+    if result["settings_action"]:
+        lines.append(f"  settings.json: {result['settings_action']}")
+    if result["manifest_written"]:
+        # noqa: F541 — VERBATIM extraction of the historical renderer (PLAN-v0285
+        # D2 / PIN-S3). The `f` prefix carries no placeholder but is preserved
+        # byte-for-byte from the pre-v0.2.85 `_cmd_install_bundle` source so the
+        # golden byte-parity pin proves a faithful extraction.
+        lines.append(f"  manifest written: .claude/.vco-manifest.json")  # noqa: F541
+    for w in result["warnings"]:
+        lines.append(f"  WARNING {w}")
+    for err in result["errors"]:
+        lines.append(f"  ERROR {err.get('path', '?')}: {err['error']}")
+    return lines
+
+
 def _cmd_install_bundle(args: argparse.Namespace) -> int:
     """`install-bundle --folder <path> [--orchestrator-root <path>]
-    [--update] [--force] [--dry-run] [--project-folder <path>] --json`
+    [--update] [--force] [--dry-run] [--project-folder <path>]
+    [--skip-kind KIND ...] --json`
 
     Copies `templates/` + `infrastructure/` into the user project folder.
     See `install_project_bundle` for full semantics.
@@ -13167,29 +13442,19 @@ def _cmd_install_bundle(args: argparse.Namespace) -> int:
         write_env=bool(getattr(args, "write_env", False)),
         project_name=getattr(args, "project_name", None) or None,
         safe_add=bool(getattr(args, "safe_add", False)),  # v0.2.63
+        # v0.2.85 D6: repeatable --skip-kind. `argparse` collects into a list
+        # (empty when the flag is absent); coerce to the frozenset the function
+        # expects. Choices are enforced by argparse so no validation needed here.
+        skip_kinds=frozenset(getattr(args, "skip_kind", None) or ()),
     )
     if args.json:
         print(json.dumps(result))
     else:
-        print(f"folder: {result['folder']}")
-        print(f"orchestrator_root: {result['orchestrator_root']}")
-        print(f"update_mode: {result['update_mode']}  dry_run: {result['dry_run']}")
-        for category, paths in result["actions"].items():
-            if not paths:
-                continue
-            print(f"  {category} ({len(paths)}):")
-            for p in paths[:8]:
-                print(f"    {p}")
-            if len(paths) > 8:
-                print(f"    ... +{len(paths) - 8} more")
-        if result["settings_action"]:
-            print(f"  settings.json: {result['settings_action']}")
-        if result["manifest_written"]:
-            print(f"  manifest written: .claude/.vco-manifest.json")
-        for w in result["warnings"]:
-            print(f"  WARNING {w}")
-        for err in result["errors"]:
-            print(f"  ERROR {err.get('path', '?')}: {err['error']}")
+        # v0.2.85 D2: render via the ONE shared home. `print("\n".join(...))`
+        # reproduces the historical sequential-`print()` bytes exactly (PIN-S3).
+        lines = format_bundle_result_lines(result)
+        if lines:
+            print("\n".join(lines))
     # R8 (v0.2.76): after a real bundle UPDATE, run the machine-wide shared-KG
     # pointer-drift heal (idempotent, soft-fail) so users who only ever run
     # bundle-updates still get the pointer converged. Skipped on dry-run.
@@ -14347,6 +14612,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "emits a safe_add_skipped_env_merge deferral) and append "
             "VCO-created paths to the LOCAL-only .git/info/exclude (never the "
             "tracked .gitignore). Default OFF = auto-merge as before."
+        ),
+    )
+    p_bundle.add_argument(
+        "--skip-kind", action="append", dest="skip_kind", default=None,
+        choices=sorted(BUNDLE_SKIP_KINDS),
+        metavar="{agents,skills,hooks,scripts,settings}",
+        help=(
+            "v0.2.85: skip an entire install KIND (repeatable). A skipped kind "
+            "is excluded from enumeration AND orphan processing, and its prior "
+            "manifest entries are carried forward verbatim (so a skipped kind's "
+            "installed files are NEVER deleted). Used by install.py to map the "
+            "legacy --skip-materialize-claude-dir flag (→ hooks scripts "
+            "settings)."
         ),
     )
     p_bundle.add_argument(

@@ -100,7 +100,13 @@ _MAIN_SPAN_MAX = 1669
 # + its impl helper live entirely in vco_lib.project_init. Total measured at
 # 24809 = the existing pin (HEAD carried 2 lines of slack here), so the TOTAL
 # pin stays UNCHANGED at 24809 — the addition fit the existing budget exactly.
-_TOTAL_LINES_MAX = 24809
+# v0.2.85 (PLAN-v0285 D1): root install now DELEGATES to the one bundle engine —
+# Steps 5b + 9b (the bespoke .claude/ materialize + agents/skills install, their
+# classifier / manifest writer / settings merges) were DELETED (~936 LOC out).
+# Measured 23,889. Re-pinned DOWNWARD to 24089 (measured + a small headroom) per
+# the "update only DOWNWARD" discipline, so the slack-guard (`total > max-1200`)
+# stays meaningful and regrowth can't hide under the old 24809 budget.
+_TOTAL_LINES_MAX = 24089
 
 
 def _measure() -> tuple:
