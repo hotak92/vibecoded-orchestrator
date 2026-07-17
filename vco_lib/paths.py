@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 def to_posix_rel(rel: "str | Path") -> str:
     """Normalize a relative path to POSIX separators (``\\`` → ``/``).
 
-    v0.2.84 PLAN-v0284 A4 (one-concern-one-home): the ``str(rel).replace("\\",
+    v0.2.84 PLAN-v0284 AMENDMENTS A4 (one-concern-one-home): the ``str(rel).replace("\\",
     "/")`` idiom (v0.2.81 lesson — Windows manifest keys / ``dest_rel`` values
     carry ``\\`` separators) was duplicated across ~15 call-sites. This is the
     single shared home so manifest-key comparisons, orphan-scan prefix checks,
