@@ -442,8 +442,12 @@ class InstallBundleUpdateModeTests(unittest.TestCase):
         # copy now matches the bumped template.
         self.assertEqual(self._foo_path().read_text(encoding="utf-8"), new_content)
 
-    def test_update_preserves_user_modified_files(self):
-        # User modified the installed file.
+    def test_update_adopts_user_modified_files(self):
+        # v0.2.84 PLAN-v0284 D7 (P5/R2): a user-modified file at a VCO-shipped
+        # destination is now ADOPTED (refreshed to shipped bytes) with a
+        # timestamped backup of the prior bytes — NOT frozen forever + nagged.
+        # (Was `test_update_preserves_user_modified_files`, which asserted the
+        # pre-.84 preserve+deferral semantics R2 explicitly retired.)
         self._foo_path().write_text("USER EDIT\n", encoding="utf-8")
         # Orchestrator also bumped.
         self._bump_orchestrator_foo("#!/bin/sh\necho v2\n")
@@ -453,16 +457,20 @@ class InstallBundleUpdateModeTests(unittest.TestCase):
         )
         is_windows = platform.system() == "Windows"
         ext = "ps1" if is_windows else "sh"
-        self.assertIn(
-            str(Path(".claude") / "hooks" / f"foo.{ext}"),
-            result["actions"]["preserve"],
-        )
-        # User content untouched.
-        self.assertEqual(self._foo_path().read_text(encoding="utf-8"), "USER EDIT\n")
-
-        # Deferral entry emitted.
+        rel = str(Path(".claude") / "hooks" / f"foo.{ext}")
+        self.assertIn(rel, result["actions"]["adopt"])
+        self.assertNotIn(rel, result["actions"]["preserve"])
+        # Shipped bytes now on disk (the divergent stale file was refreshed).
+        self.assertEqual(self._foo_path().read_text(encoding="utf-8"),
+                         "#!/bin/sh\necho v2\n")
+        # Prior bytes captured under the run's backup dir.
+        backup_dir = result["adopt_backup_dir"]
+        backup = self.proj / backup_dir / ".claude" / "hooks" / f"foo.{ext}"
+        self.assertTrue(backup.exists(), f"backup missing at {backup}")
+        self.assertEqual(backup.read_text(encoding="utf-8"), "USER EDIT\n")
+        # NO eternal deferral — adoption is a one-time notice.
         report = DeferralReport.read(self.proj)
-        self.assertTrue(report.has_condition("bundle_user_modified_preserved"))
+        self.assertFalse(report.has_condition("bundle_user_modified_preserved"))
 
     def test_force_overwrites_user_modifications(self):
         self._foo_path().write_text("USER EDIT\n", encoding="utf-8")
@@ -501,12 +509,16 @@ class InstallBundleUpdateModeTests(unittest.TestCase):
         # Content reverted to shipped version.
         self.assertNotIn("USER LIB EDIT", lib_target.read_text(encoding="utf-8"))
 
-    def test_manifest_round_trip_preserves_prior_hash_on_preserve(self):
-        # When a file is preserved (user-modified), its manifest entry must
-        # retain the prior-shipped hash so a future update can still
-        # recognize the original baseline.
+    def test_manifest_round_trip_advances_hash_on_adopt(self):
+        # v0.2.84 PLAN-v0284 D7 (P5/R2): a user-modified file is now ADOPTED,
+        # so the manifest entry ADVANCES to the newly-shipped hash (the file on
+        # disk IS the shipped version after adoption) — the pre-.84 "carry the
+        # prior v1 hash so preserve can recognize the baseline" contract is gone
+        # because there is no preserve anymore. (Was
+        # `test_manifest_round_trip_preserves_prior_hash_on_preserve`.)
         self._foo_path().write_text("USER EDIT\n", encoding="utf-8")
-        self._bump_orchestrator_foo("v2 content\n")
+        new_body = "v2 content\n"
+        self._bump_orchestrator_foo(new_body)
         project_init.install_project_bundle(
             self.proj, orchestrator_root=self.orch, update_mode=True,
         )
@@ -515,9 +527,11 @@ class InstallBundleUpdateModeTests(unittest.TestCase):
         )
         ext = "ps1" if platform.system() == "Windows" else "sh"
         rel = str(Path(".claude") / "hooks" / f"foo.{ext}")
-        # The manifest entry should still be present (carrying the v1 hash —
-        # NOT v2 — so the next update knows what we originally shipped).
         self.assertIn(rel, manifest["files"])
+        # Manifest hash now matches the SHIPPED bytes (adoption wrote them).
+        import hashlib
+        expected = hashlib.sha256(new_body.encode("utf-8")).hexdigest()
+        self.assertEqual(manifest["files"][rel]["sha256"], expected)
 
     def test_update_picks_up_newly_shipped_file(self):
         """PR 5 (2026-05-01): a file that the orchestrator only ships
@@ -600,13 +614,13 @@ class InstallBundleUpdateModeTests(unittest.TestCase):
         self.assertNotEqual(new_hash, prior_hash,
                             "manifest must advance to the new shipped hash on overwrite")
 
-    def test_update_preserves_user_modified_with_deferral_entry(self):
-        """PR 5 (2026-05-01): explicit, narrow case for the `preserve`
-        branch + matching deferral entry. The PR 4 sibling test
-        `test_update_preserves_user_modified_files` covers the basic
-        case; this one additionally asserts that the deferral entry
-        contains the offending file's rel path AND the suggested
-        `--force` command.
+    def test_update_adopts_user_modified_with_notice_not_deferral(self):
+        """v0.2.84 PLAN-v0284 D7 (P5/R2): a user-modified bundle file is ADOPTED
+        with a timestamped backup and a ONE-TIME notice — NOT an eternal
+        `bundle_user_modified_preserved` deferral. (Was
+        `test_update_preserves_user_modified_with_deferral_entry`, which pinned
+        the pre-.84 preserve+deferral semantics R2 retired.) The JSONL
+        auto-resolution trail records the adoption per file.
         """
         is_windows = platform.system() == "Windows"
         ext = "ps1" if is_windows else "sh"
@@ -615,26 +629,35 @@ class InstallBundleUpdateModeTests(unittest.TestCase):
         # User edits the installed file — diverges from prior-shipped hash.
         self._foo_path().write_text("MY CUSTOM HOOK\n", encoding="utf-8")
         # Orchestrator also bumped (so we're not in the noop branch).
-        self._bump_orchestrator_foo("#!/bin/sh\necho v_pr5\n")
+        new_body = "#!/bin/sh\necho v_pr5\n"
+        self._bump_orchestrator_foo(new_body)
 
         result = project_init.install_project_bundle(
             self.proj, orchestrator_root=self.orch, update_mode=True,
         )
-        self.assertIn(rel, result["actions"]["preserve"],
-                      f"user-modified file should be preserved: {result['actions']}")
-        # On-disk content untouched.
-        self.assertEqual(self._foo_path().read_text(encoding="utf-8"),
-                         "MY CUSTOM HOOK\n")
+        self.assertIn(rel, result["actions"]["adopt"],
+                      f"user-modified file should be adopted: {result['actions']}")
+        # On-disk content refreshed to shipped bytes.
+        self.assertEqual(self._foo_path().read_text(encoding="utf-8"), new_body)
+        # Prior bytes captured in the backup.
+        backup = self.proj / result["adopt_backup_dir"] / ".claude" / "hooks" / f"foo.{ext}"
+        self.assertTrue(backup.exists())
+        self.assertEqual(backup.read_text(encoding="utf-8"), "MY CUSTOM HOOK\n")
 
-        # Deferral entry exists, names the file, points to --force.
-        deferral_path = self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md"
-        self.assertTrue(deferral_path.exists(),
-                        f"expected deferral .md at {deferral_path}")
-        body = deferral_path.read_text(encoding="utf-8")
-        self.assertIn("bundle_user_modified_preserved", body)
-        self.assertIn(f"foo.{ext}", body)
-        self.assertIn("--force", body,
-                      "deferral entry must surface the --force escape hatch")
+        # NO eternal preserve deferral. The reconciler self-clears (no file
+        # landed in user_modified_paths this run).
+        report = DeferralReport.read(self.proj)
+        self.assertFalse(report.has_condition("bundle_user_modified_preserved"))
+
+        # Adoption is recorded in the auto-resolutions.jsonl trail.
+        jsonl = self.proj / ".claude" / "logs" / "auto-resolutions.jsonl"
+        self.assertTrue(jsonl.exists(), f"expected JSONL trail at {jsonl}")
+        rows = [json.loads(ln) for ln in jsonl.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        self.assertTrue(
+            any(r["action"] == "adopted_shipped_file" and f"foo.{ext}" in r["detail"]
+                for r in rows),
+            f"expected an adopted_shipped_file row; got {rows}",
+        )
 
     def test_update_force_overwrites_user_modified(self):
         """PR 5 (2026-05-01): `force=True` + `update_mode=True` → user-modified
@@ -700,9 +723,12 @@ class InstallBundleUpdateModeTests(unittest.TestCase):
             update_mode=True, dry_run=True,
         )
         # Classification still happens — dry_run only blocks mutations.
+        # v0.2.84 D7 (P5/R2): the user-modified file classifies as `adopt` now
+        # (classification is mode-independent; dry_run only blocks the FS write
+        # + backup below).
         rel_foo = str(Path(".claude") / "hooks" / f"foo.{ext}")
         rel_new = str(Path(".claude") / "hooks" / f"dryrun_new.{ext}")
-        self.assertIn(rel_foo, result["actions"]["preserve"])
+        self.assertIn(rel_foo, result["actions"]["adopt"])
         self.assertIn(rel_new, result["actions"]["create"])
         # On-disk: foo untouched.
         self.assertEqual(self._foo_path().read_text(encoding="utf-8"), user_content)
@@ -720,15 +746,16 @@ class InstallBundleUpdateModeTests(unittest.TestCase):
         self.assertFalse(deferral_path.exists(),
                          f"dry_run must not emit deferral .md")
 
-    def test_user_modified_deferral_grouped_per_project(self):
-        """Per coordinator directive 2026-05-01: when multiple files are
-        preserved during update, only ONE deferral entry is emitted (per-
-        project grouping, not per-file).
+    def test_multiple_user_modified_files_adopted_under_one_backup_dir(self):
+        """v0.2.84 PLAN-v0284 D7 (P5/R2): when multiple bundle files diverge,
+        all are ADOPTED under ONE per-run backup dir with no eternal deferral.
+        (Was `test_user_modified_deferral_grouped_per_project`, which pinned the
+        pre-.84 single-grouped-deferral semantics R2 retired.)
 
         Critical assertions:
-        - `bundle_user_modified_preserved` deferral exists.
-        - Exactly ONE entry with that condition_id.
-        - Markdown body lists ALL preserved file rel-paths.
+        - both files land in `actions["adopt"]`.
+        - both prior copies land under the SAME `adopt_backup_dir`.
+        - NO `bundle_user_modified_preserved` deferral entry.
         """
         is_windows = platform.system() == "Windows"
         ext = "ps1" if is_windows else "sh"
@@ -743,24 +770,29 @@ class InstallBundleUpdateModeTests(unittest.TestCase):
             "v2 kg\n", encoding="utf-8",
         )
 
-        project_init.install_project_bundle(
+        result = project_init.install_project_bundle(
             self.proj, orchestrator_root=self.orch, update_mode=True,
         )
-        # Files untouched.
-        self.assertEqual(foo.read_text(encoding="utf-8"), "USER FOO\n")
-        self.assertEqual(kg.read_text(encoding="utf-8"), "USER KG\n")
-        # Deferral has exactly ONE entry with the right condition_id.
+        # Both files refreshed to shipped bytes.
+        self.assertEqual(foo.read_text(encoding="utf-8"), "v2 foo\n")
+        self.assertEqual(kg.read_text(encoding="utf-8"), "v2 kg\n")
+        rel_foo = str(Path(".claude") / "hooks" / f"foo.{ext}")
+        rel_kg = str(Path(".claude") / "scripts" / "kg-search")
+        self.assertIn(rel_foo, result["actions"]["adopt"])
+        self.assertIn(rel_kg, result["actions"]["adopt"])
+        # ONE per-run backup dir holds BOTH prior copies.
+        backup_root = self.proj / result["adopt_backup_dir"]
+        self.assertEqual(
+            (backup_root / ".claude" / "hooks" / f"foo.{ext}").read_text(encoding="utf-8"),
+            "USER FOO\n",
+        )
+        self.assertEqual(
+            (backup_root / ".claude" / "scripts" / "kg-search").read_text(encoding="utf-8"),
+            "USER KG\n",
+        )
+        # No eternal deferral.
         report = DeferralReport.read(self.proj)
-        preserve_entries = [e for e in report.entries
-                            if e.condition_id == "bundle_user_modified_preserved"]
-        self.assertEqual(len(preserve_entries), 1,
-                         f"expected exactly 1 grouped entry, got {len(preserve_entries)}")
-        # Both files listed in the on-disk markdown body.
-        body = (self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md") \
-            .read_text(encoding="utf-8")
-        self.assertIn("## bundle_user_modified_preserved (info)", body)
-        self.assertIn(f"foo.{ext}", body)
-        self.assertIn("kg-search", body)
+        self.assertFalse(report.has_condition("bundle_user_modified_preserved"))
 
 
 class SmartMergeSettingsTests(unittest.TestCase):
@@ -1318,8 +1350,17 @@ class DeferralCommandPortabilityTests(unittest.TestCase):
         self.assertNotIn(str(self.orch), deferral,
                          f"orchestrator path leaked: deferral contains {self.orch!s}")
 
-    def test_user_modified_command_uses_env_var(self):
-        """Same invariant for the update-mode preserve deferral."""
+    def test_user_modified_adopted_emits_no_preserve_deferral(self):
+        """v0.2.84 PLAN-v0284 D7 (P5/R2): an update-mode user-modified bundle
+        file is ADOPTED — so there is NO `bundle_user_modified_preserved`
+        deferral to leak an orchestrator-path literal. (Was
+        `test_user_modified_command_uses_env_var`, which pinned the pre-.84
+        preserve-deferral path-portability invariant; the first-install
+        skip-existing sibling `test_skip_existing_command_uses_env_var` still
+        exercises the env-var invariant on the producer that survives, and the
+        backup-failure fallback keeps the same producer — see
+        tests/test_v0284_bundle_adoption_leavealone.py.)
+        """
         is_windows = platform.system() == "Windows"
         ext = "ps1" if is_windows else "sh"
         # Seed install + user modification.
@@ -1331,14 +1372,13 @@ class DeferralCommandPortabilityTests(unittest.TestCase):
         (self.orch / "templates" / "hooks" / f"foo.{ext}").write_text(
             "v2\n", encoding="utf-8",
         )
-        project_init.install_project_bundle(
+        result = project_init.install_project_bundle(
             self.proj, orchestrator_root=self.orch, update_mode=True,
         )
-        deferral = (self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md") \
-            .read_text(encoding="utf-8")
-        self.assertIn("$VCT_ORCHESTRATOR_ROOT", deferral)
-        self.assertNotIn(str(self.orch), deferral,
-                         f"orchestrator path leaked: deferral contains {self.orch!s}")
+        rel = str(Path(".claude") / "hooks" / f"foo.{ext}")
+        self.assertIn(rel, result["actions"]["adopt"])
+        report = DeferralReport.read(self.proj)
+        self.assertFalse(report.has_condition("bundle_user_modified_preserved"))
 
 
 class DeferralFileListCapTests(unittest.TestCase):
@@ -1433,35 +1473,53 @@ class DeferralReconcileTests(unittest.TestCase):
             "--update --force must clear stale bundle_skipped_existing_files deferral",
         )
 
-    def test_force_update_clears_stale_user_modified_deferral(self):
-        """`bundle_user_modified_preserved` written during a non-force
-        --update → resolved by a follow-up --update --force. Stale entry
-        must be removed.
+    def test_stale_user_modified_deferral_self_clears_on_adopt(self):
+        """v0.2.84 PLAN-v0284 D7 (P5/R2): a pre-existing (stale)
+        `bundle_user_modified_preserved` entry — e.g. left by a pre-.84 install
+        — SELF-CLEARS on the next normal --update run, because adoption never
+        populates `user_modified_paths` so the reconciler's
+        `still_user_modified` is False. (Was
+        `test_force_update_clears_stale_user_modified_deferral`, which relied on
+        a non-force update EMITTING the deferral; adoption retired that path, so
+        we seed the stale entry directly and prove the natural self-clear.)
         """
+        from vco_lib.deferral_report import DeferralEntry, DeferralReport as DR
         is_windows = platform.system() == "Windows"
         ext = "ps1" if is_windows else "sh"
         # Seed.
         project_init.install_project_bundle(
             self.proj, orchestrator_root=self.orch, update_mode=False,
         )
-        # User modifies + orchestrator bumps → --update preserves.
+        # Simulate a pre-.84 stale preserve deferral on disk.
+        report = DR.read(self.proj)
+        report.add_entry(DeferralEntry(
+            condition_id="bundle_user_modified_preserved",
+            title="stale pre-.84 preserve",
+            detected="stale",
+            why_deferred="stale",
+            command_to_apply="noop",
+            severity="info",
+        ))
+        report.write(self.proj)
+        self.assertTrue(
+            DR.read(self.proj).has_condition("bundle_user_modified_preserved"))
+
+        # User modifies + orchestrator bumps → --update ADOPTS (no preserve),
+        # and the reconciler self-clears the stale entry.
         foo = self.proj / ".claude" / "hooks" / f"foo.{ext}"
         foo.write_text("USER EDIT\n", encoding="utf-8")
         (self.orch / "templates" / "hooks" / f"foo.{ext}").write_text(
             "v2\n", encoding="utf-8",
         )
-        project_init.install_project_bundle(
+        result = project_init.install_project_bundle(
             self.proj, orchestrator_root=self.orch, update_mode=True,
         )
-        report = DeferralReport.read(self.proj)
-        self.assertTrue(report.has_condition("bundle_user_modified_preserved"))
-
-        # Force resolves it.
-        project_init.install_project_bundle(
-            self.proj, orchestrator_root=self.orch,
-            update_mode=True, force=True,
+        self.assertIn(str(Path(".claude") / "hooks" / f"foo.{ext}"),
+                      result["actions"]["adopt"])
+        self.assertFalse(
+            DR.read(self.proj).has_condition("bundle_user_modified_preserved"),
+            "stale preserve deferral must self-clear after adoption",
         )
-        self.assertFalse(self._deferral_path().exists())
 
     def test_reconcile_preserves_unrelated_conditions(self):
         """Only `bundle_*` condition_ids are owned by install_bundle. Other
@@ -1509,26 +1567,24 @@ class DeferralReconcileTests(unittest.TestCase):
         """
         is_windows = platform.system() == "Windows"
         ext = "ps1" if is_windows else "sh"
-        # Seed install + user-modify a file so --update writes the
-        # bundle_user_modified_preserved entry.
+        # Seed install.
         project_init.install_project_bundle(
             self.proj, orchestrator_root=self.orch, update_mode=False,
         )
-        foo = self.proj / ".claude" / "hooks" / f"foo.{ext}"
-        foo.write_text("USER FOO\n", encoding="utf-8")
-        (self.orch / "templates" / "hooks" / f"foo.{ext}").write_text(
-            "v2 foo\n", encoding="utf-8",
-        )
-        project_init.install_project_bundle(
-            self.proj, orchestrator_root=self.orch, update_mode=True,
-        )
-        self.assertTrue(self._deferral_path().exists())
-
-        # Manually inject a stale bundle_skipped_existing_files entry into
-        # the deferral file (simulates a prior fresh-install run that left
-        # it behind — the user-project starting condition).
+        # v0.2.84 PLAN-v0284 D7 (P5/R2): adoption retired the non-force
+        # preserve-deferral path, so seed BOTH stale bundle deferrals directly
+        # (simulates a pre-.84 run that left them behind — the starting
+        # condition this test exercises).
         from vco_lib.deferral_report import DeferralEntry, DeferralReport as DR
         report = DR.read(self.proj)
+        report.add_entry(DeferralEntry(
+            condition_id="bundle_user_modified_preserved",
+            title="Pretend stale preserve",
+            detected="Pretend.",
+            why_deferred="Pretend.",
+            command_to_apply="echo replay",
+            severity="info",
+        ))
         report.add_entry(DeferralEntry(
             condition_id="bundle_skipped_existing_files",
             title="Pretend stale skipped",
@@ -1538,6 +1594,7 @@ class DeferralReconcileTests(unittest.TestCase):
             severity="info",
         ))
         report.write(self.proj)
+        self.assertTrue(self._deferral_path().exists())
 
         # Now run --update --force: resolves the user-modified entry only.
         # The stale skipped-existing entry should be cleared too (its
@@ -1836,9 +1893,12 @@ class ManifestPreservedFilesTests(unittest.TestCase):
         # have shipped at install time.
         self.assertIn(f"foo.{ext}", entry["shipped_source"])
 
-    def test_preserve_in_update_mode_records_preserved_entry(self):
-        """`--update` with a user-modified file → `preserved_files` records
-        the entry with reason='preserve'.
+    def test_adopt_in_update_mode_records_no_preserved_entry(self):
+        """v0.2.84 PLAN-v0284 D7 (P5/R2): `--update` with a user-modified file
+        now ADOPTS it, so `preserved_files` does NOT record a `reason='preserve'`
+        entry (the file was refreshed, not preserved) and its `files` hash
+        advances to the shipped bytes. (Was
+        `test_preserve_in_update_mode_records_preserved_entry`.)
         """
         is_windows = platform.system() == "Windows"
         ext = "ps1" if is_windows else "sh"
@@ -1849,8 +1909,9 @@ class ManifestPreservedFilesTests(unittest.TestCase):
         # User edits foo.sh, orchestrator bumps it too.
         foo = self.proj / ".claude" / "hooks" / f"foo.{ext}"
         foo.write_text("USER EDIT\n", encoding="utf-8")
+        new_body = "#!/bin/sh\necho v_pf\n"
         (self.orch / "templates" / "hooks" / f"foo.{ext}").write_text(
-            "#!/bin/sh\necho v_pf\n", encoding="utf-8",
+            new_body, encoding="utf-8",
         )
 
         project_init.install_project_bundle(
@@ -1858,8 +1919,14 @@ class ManifestPreservedFilesTests(unittest.TestCase):
         )
         m = self._manifest()
         rel = str(Path(".claude") / "hooks" / f"foo.{ext}")
-        self.assertIn(rel, m["preserved_files"])
-        self.assertEqual(m["preserved_files"][rel]["reason"], "preserve")
+        # NOT preserved — adopted.
+        self.assertNotIn(rel, m["preserved_files"])
+        # `files` hash advanced to shipped bytes.
+        import hashlib
+        self.assertEqual(
+            m["files"][rel]["sha256"],
+            hashlib.sha256(new_body.encode("utf-8")).hexdigest(),
+        )
 
     def test_force_resolves_preserved_entry_in_manifest(self):
         """`--update --force` overwrites a preserved file → the manifest's

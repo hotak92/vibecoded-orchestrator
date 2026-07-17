@@ -136,9 +136,14 @@ class OrphanAutoKeepTests(unittest.TestCase):
 
     # -- LEAVE-ALONE --------------------------------------------------------
 
-    def test_leave_alone_still_shipped_user_modified_file_preserved(self):
-        """A user-modified file that is STILL shipped (NOT an orphan) still
-        emits `bundle_user_modified_preserved` — B-F5 must not touch this."""
+    def test_leave_alone_still_shipped_user_modified_file_adopted_not_orphaned(self):
+        """A user-modified file that is STILL shipped (NOT an orphan) goes
+        through the per-op loop — B-F5 (orphan auto-keep) must NOT touch it.
+
+        v0.2.84 PLAN-v0284 D7 (P5/R2): the per-op outcome is now `adopt` (was
+        `preserve`); the B-F5 invariant this test guards is UNCHANGED — the file
+        is NOT orphan-retired and does NOT emit the upstream-DELETION deferral.
+        """
         installed = self._foo_hook_path()
         installed.write_text("# USER EDIT\n", encoding="utf-8")
         # NOTE: we do NOT delete foo from the orchestrator — it is still shipped,
@@ -148,11 +153,13 @@ class OrphanAutoKeepTests(unittest.TestCase):
             self.proj, orchestrator_root=self.orch, update_mode=True,
         )
         rel = self._rel()
-        # Preserve action + the DIFFERENT deferral.
-        self.assertIn(rel, result["actions"]["preserve"])
+        # Per-op adopt (NOT the orphan loop).
+        self.assertIn(rel, result["actions"]["adopt"])
         self.assertNotIn(rel, result["actions"]["orphan-retired"])
         report = DeferralReport.read(self.proj)
-        self.assertTrue(report.has_condition("bundle_user_modified_preserved"))
+        # No eternal preserve deferral (adoption retired it) and — the B-F5
+        # invariant — no upstream-DELETION deferral either.
+        self.assertFalse(report.has_condition("bundle_user_modified_preserved"))
         self.assertFalse(
             report.has_condition("bundle_user_modified_deletion_preserved")
         )

@@ -389,16 +389,17 @@ class UserAddedFileConflictsWithNewShippedPathTests(unittest.TestCase):
             f"missing deferral; entries: {[e.condition_id for e in report.entries]}",
         )
 
-    def test_update_mode_user_pre_existing_file_without_manifest_entry_preserved(self):
-        """Edge: user manually adds a file that the orchestrator only
-        starts shipping NOW (no prior manifest entry). In update mode
-        this should go through `preserve` (no prior baseline known →
-        default to safety) and emit `bundle_user_modified_preserved`.
+    def test_update_mode_user_pre_existing_file_without_manifest_entry_adopted(self):
+        """v0.2.84 PLAN-v0284 D7 (P5/R2): a manifest-LESS file at a shipped
+        destination (`.claude/scripts/`) whose bytes match no history is now
+        ADOPTED (refreshed to shipped bytes + timestamped backup + one-time
+        notice), NOT frozen-forever `preserve`. This is the EXACT P5 incident
+        shape (pre-manifest / pre-history-rewrite stale files). (Was
+        `test_update_mode_user_pre_existing_file_without_manifest_entry_preserved`.)
 
-        This matches the legacy contract — we re-test here because
-        the orphan-detection logic must NOT touch files that the new
-        ops DOES re-ship (they go through the regular per-op loop, not
-        the orphan loop)."""
+        We still guard the orphan-detection invariant: a re-shipped file goes
+        through the per-op loop (adopt), NOT the orphan loop.
+        """
         # First install with the fake orchestrator's set.
         project_init.install_project_bundle(
             self.proj, orchestrator_root=self.orch, update_mode=False,
@@ -418,14 +419,17 @@ class UserAddedFileConflictsWithNewShippedPathTests(unittest.TestCase):
             self.proj, orchestrator_root=self.orch, update_mode=True,
         )
         rel = str(Path(".claude") / "scripts" / "fresh_helper.py")
-        # No prior manifest entry → `_file_action` returns preserve.
-        self.assertIn(rel, result["actions"]["preserve"],
-                      f"expected preserve for user-added file: {result['actions']}")
-        # User content untouched.
-        self.assertEqual(new_target.read_text(encoding="utf-8"), "# USER OWNS THIS\n")
-        # Deferral entry.
+        # No prior manifest entry + no history match → adopt (P5).
+        self.assertIn(rel, result["actions"]["adopt"],
+                      f"expected adopt for manifest-less shipped file: {result['actions']}")
+        # Shipped bytes on disk; user's prior bytes captured in the backup.
+        self.assertEqual(new_target.read_text(encoding="utf-8"), "# orchestrator version\n")
+        backup = self.proj / result["adopt_backup_dir"] / ".claude" / "scripts" / "fresh_helper.py"
+        self.assertTrue(backup.exists())
+        self.assertEqual(backup.read_text(encoding="utf-8"), "# USER OWNS THIS\n")
+        # NO eternal deferral.
         report = DeferralReport.read(self.proj)
-        self.assertTrue(report.has_condition("bundle_user_modified_preserved"))
+        self.assertFalse(report.has_condition("bundle_user_modified_preserved"))
 
 
 # ---------------------------------------------------------------------------

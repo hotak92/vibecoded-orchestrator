@@ -229,9 +229,17 @@ class StaleOrchRootHealTests(unittest.TestCase):
             self.assertNotIn(agent_rel, result["actions"]["preserve"])
 
     def test_heal_does_NOT_overwrite_user_modifications(self):
-        """Counter-test: if the user actually edited the file (e.g. added
-        a custom tool entry), heal must NOT fire — falls through to
-        `preserve` so the user's edit isn't clobbered.
+        """Counter-test: when the user actually edited the file (added a custom
+        note), the stale-root HEAL must NOT fire (the round-trip no longer
+        matches).
+
+        v0.2.84 PLAN-v0284 D7 (P5/R2): agents ARE VCO codefiles, so the divergent
+        file is now ADOPTED (refreshed to shipped bytes) with the user's prior
+        bytes captured in a timestamped backup — NOT silently frozen. The KEY
+        heal-specific invariant this test guards remains true: the heal branch
+        did not misclassify the edited file as `overwrite`; it fell through to
+        the terminal adopt path (proving the round-trip guard rejected the
+        tampered bytes). User content is never lost — it lives in the backup.
         """
         with tempfile.TemporaryDirectory() as tmp_root:
             tmp = Path(tmp_root)
@@ -255,12 +263,15 @@ class StaleOrchRootHealTests(unittest.TestCase):
             result = project_init.install_project_bundle(
                 project, orchestrator_root=new_orch, update_mode=True,
             )
-            survived = agent_path.read_text(encoding="utf-8")
-            # User edit is intact.
-            self.assertIn("# user note\n", survived)
             agent_rel = str(Path(".claude") / "agents" / "coder.md")
-            self.assertIn(agent_rel, result["actions"]["preserve"])
+            # Adopted (heal did NOT fire — the tampered bytes failed the
+            # round-trip), never overwrite/heal.
+            self.assertIn(agent_rel, result["actions"]["adopt"])
             self.assertNotIn(agent_rel, result["actions"]["overwrite"])
+            # User bytes are preserved in the backup (never lost).
+            backup = project / result["adopt_backup_dir"] / ".claude" / "agents" / "coder.md"
+            self.assertTrue(backup.exists())
+            self.assertIn("# user note\n", backup.read_text(encoding="utf-8"))
 
 
 # ---------------------------------------------------------------------------
