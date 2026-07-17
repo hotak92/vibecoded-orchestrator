@@ -10141,9 +10141,16 @@ def install_project_bundle(
                 _ADOPT_BACKUPS_REL / _adopt_backup_ts
             )
             result["adopt_backup_dir"] = adopt_backup_dir_rel
-            # (i) stdout NOTICE block. Printed to stdout (not stderr) so the
-            # CLI human-readable path and the launcher's stdout reader both see
-            # it. Kept compact + bounded via `_format_file_list_md`.
+            # (i) NOTICE block → STDERR. v0.2.84 hotfix: this printed to
+            # stdout, which is the MACHINE CONTRACT under `--json` (the CLI
+            # emits `json.dumps(result)` there and the launcher parses it) —
+            # so any project with adoptable files made `install-bundle
+            # --update --json` unparseable ("expected value at line 2 column
+            # 2"), surfacing a false "Project files may be partially updated"
+            # in the launcher's update-all report. stderr is the SAME stream
+            # `_log_auto` already uses for the audit lines, for exactly this
+            # reason, and the launcher surfaces its tail — so the notice stays
+            # just as visible to humans without corrupting the contract.
             notice_paths = _format_file_list_md(
                 sorted(rel for rel, _ in adopted_paths)
             )
@@ -10155,6 +10162,7 @@ def install_project_bundle(
                 "  Your previous bytes were backed up (kept forever; prune "
                 f"when you no longer need them) under:\n    {adopt_backup_dir_rel}\n"
                 f"{notice_paths}\n",
+                file=sys.stderr,
                 flush=True,
             )
             result["warnings"].append(
