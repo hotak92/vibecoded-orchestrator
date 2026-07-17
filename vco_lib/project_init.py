@@ -42,6 +42,7 @@ Internal aliases (path-based, for back-compat with install.py callers):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -83,6 +84,37 @@ def _log_auto(msg: str) -> None:
         print(f"[vct] {msg}", file=sys.stderr)
     except Exception:  # noqa: BLE001 — logging must never break the caller
         pass
+
+
+@contextlib.contextmanager
+def _scoped_environ(*keys: str):
+    """v0.2.84 PLAN-v0284 (review F3): snapshot the listed ``os.environ`` keys on
+    entry and restore them on exit, so a function that INJECTS process-env values
+    (to feed a synchronous callee — e.g. ``migrate_collections`` reads env, and a
+    child ``subprocess.run(env=dict(os.environ))`` inherits the injected values)
+    never LEAKS those values into the caller's process env after it returns.
+
+    Restore semantics (per key): a key that was PRESENT is restored to its exact
+    prior value; a key that was ABSENT is removed again. The restore runs in a
+    ``finally`` so an exception in the body still leaves the environment pristine.
+    This was a real defect: ``_cmd_migrate_collections`` set KG/DEV/DIAGRAMS_COLLECTION
+    and never reverted them, polluting the in-process test suite (observed twice).
+
+    IMPORTANT: any child process the body spawns via ``env=dict(os.environ)`` must
+    be spawned INSIDE the ``with`` block (before the restore) so it captures the
+    injected values — the subprocess CONTRACT is preserved because ``subprocess.run``
+    is synchronous and completes before the ``finally`` reverts the parent's env.
+    """
+    _sentinel = object()
+    _saved = {k: os.environ.get(k, _sentinel) for k in keys}
+    try:
+        yield
+    finally:
+        for k, prev in _saved.items():
+            if prev is _sentinel:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = prev
 
 # X-1 / v0.2.76: the underscore-DROPPING sanitizer moved to
 # ``vco_lib.codegraph_naming`` — the ONE naming home. These aliases keep the
@@ -9206,6 +9238,13 @@ def install_project_bundle(
         else _find_orchestrator_root_from_module()
     )
 
+    # v0.2.84 PLAN-v0284 AMENDMENTS A4 (review F5, one-concern-one-home): the shared
+    # separator-normalization helper, imported ONCE for the whole function. Used by
+    # the exec-bit `/scripts/` checks below AND the adopt-notice backup-dir join —
+    # replacing the inline `op.dest_rel.replace("\\", "/")` duplicates (identical
+    # behavior for these `str` dest_rels: `to_posix_rel` IS `str(rel).replace("\\", "/")`).
+    from vco_lib.paths import to_posix_rel as _to_posix_rel
+
     # v0.2.81: one authority for "is this bundle target the orchestrator
     # root?" — drives both the curated-knowledge gate (via
     # `_enumerate_bundle_files` → `_enumerate_knowledge_ops`) and the
@@ -9383,7 +9422,7 @@ def install_project_bundle(
                     # Backup captured — write the shipped bytes.
                     try:
                         mode: Optional[int] = None
-                        if op.dest_rel.endswith((".sh",)) or "/scripts/" in op.dest_rel.replace("\\", "/"):
+                        if op.dest_rel.endswith((".sh",)) or "/scripts/" in _to_posix_rel(op.dest_rel):
                             mode = 0o700
                         _redirect = _write_file_atomic(target_path, source_bytes, mode=mode)
                         if _redirect is not None:
@@ -9501,7 +9540,7 @@ def install_project_bundle(
                 try:
                     mode: Optional[int] = None
                     # Preserve executable bit for shell scripts on POSIX.
-                    if op.dest_rel.endswith((".sh",)) or "/scripts/" in op.dest_rel.replace("\\", "/"):
+                    if op.dest_rel.endswith((".sh",)) or "/scripts/" in _to_posix_rel(op.dest_rel):
                         # Many launcher scripts have no extension (kg-search,
                         # code-graph-query, cost-summary). Mark all of
                         # .claude/scripts/ + *.sh as executable. 0o700
@@ -10092,7 +10131,7 @@ def install_project_bundle(
         # never land in `user_modified_paths` (only the backup-failure fallback
         # does, and that path re-emits the deferral for exactly those files).
         if adopted_paths and _adopt_backup_ts is not None:
-            from vco_lib.paths import to_posix_rel as _to_posix_rel
+            # `_to_posix_rel` imported once at the top of this function (F5).
             adopt_backup_dir_rel = _to_posix_rel(
                 _ADOPT_BACKUPS_REL / _adopt_backup_ts
             )
@@ -12224,398 +12263,409 @@ def _cmd_migrate_collections(args: argparse.Namespace) -> int:
         )
         return 2
 
-    if not all_projects:
-        # v0.2.84 PLAN-v0284 D3 (P2 / ruling R3): resolve BINDING-FIRST when a
-        # `--project-folder` is available (update step 3 walks the CORRECT
-        # collection family instead of the display-name-derived one). Pre-.84
-        # this name-derived from `--name`, so a diverged binding made the
-        # migrate dispatcher walk the wrong `<DisplayName>_*` family. Falls back
-        # to the identical name-derived set when no folder / no binding.
-        _mig_folder = getattr(args, "project_folder", None)
-        _mig_folder_path = Path(_mig_folder).resolve() if _mig_folder else None
-        derived = _resolve_bundle_collection_names_binding_first(
-            args.name, _mig_folder_path,
-        )
-        # Inject env so migrate_collections picks them up. We don't mutate
-        # the caller's environment beyond this process — argparse callers
-        # are typically the Rust subprocess or a CLI invocation, not a long-
-        # lived shell.
-        os.environ["KG_COLLECTION"] = derived["kg_collection"]
-        os.environ["DEVELOPMENT_COLLECTION"] = derived["development_collection"]
-        # v0.2.54 Track D (live-test finding): DIAGRAMS_COLLECTION must be
-        # scoped to --name too. Pre-fix, only KG + Dev were overridden, so
-        # an AMBIENT DIAGRAMS_COLLECTION (e.g. exported by the invoking
-        # project's .claude/settings.json env into the shell) leaked into
-        # the plan — `migrate-collections --name OtherProject
-        # --force-rebuild` would then drop + rebuild the CURRENT project's
-        # live Diagrams collection, violating the documented "--name scopes
-        # the work to THIS project's collections" contract.
-        os.environ["DIAGRAMS_COLLECTION"] = derived["diagrams_collection"]
-
-        # Build a minimal Namespace-like for migrate_collections dispatch.
-        # v0.2.73 FIX-D4: thread --name + --index-type so _build_plan can add
-        # the (GATED) code-graph collections when hfresh is requested.
-        ns = argparse.Namespace(
-            force_rebuild=bool(args.force_rebuild),
-            name=args.name,
-            index_type=getattr(args, "index_type", None),
-        )
-        result = migrate_collections(
-            ns,
-            dry_run=bool(args.dry_run),
-            weaviate_url=args.weaviate_url,
-        )
-    else:
-        # --all-projects path: skip the per-project KG/Dev env-driven
-        # dispatch; the v0.2.18 helper below walks every KG-shaped
-        # collection on the server directly.
-        result = {"plan": [], "dry_run": bool(args.dry_run), "errors": []}
-
-    result.setdefault("deferral_emitted", False)
-    # v0.2.55 (stale-migration-deferral fix): True when a clean dry-run
-    # cleared a stale `schema_migration_required` entry left by an earlier
-    # update.
-    result.setdefault("stale_migrate_deferral_cleared", False)
-    result.setdefault("v0218_schema_reports", [])
-
-    # v0.2.18: additive migration to the new 5-slot KG + 6-slot Code
-    # catalog. This handles three things:
-    #   1. KG/Dev: the existing migrate_collections smart-dispatch
-    #      already handles named-vector slot additions via the `copy`
-    #      action. For dry-run we don't re-walk these (they're in
-    #      `result["plan"]`). For wet-run we still re-run the additive
-    #      helper to handle the shared KG (which the existing path
-    #      doesn't visit) and to surface a unified report.
-    #   2. Code-graph: the existing path never touched these. v0.2.18
-    #      adds them via the additive helper.
-    #   3. --all-projects: walks every collection.
-    #
-    # Always-on by default (matches the v0.2.18 acceptance criteria);
-    # `--no-include-code` opts out for callers who want pre-v0.2.18
-    # KG-only behavior (kept for bisectability).
-    include_code = getattr(args, "include_code", True)
-    if include_code:
-        try:
-            from vco_lib.weaviate_schema import (
-                CODE_NAMED_VECTORS,
-                KG_NAMED_VECTORS,
-                enumerate_code_collections,
-                enumerate_kg_collections,
-                migrate_collection_to_target,
+    # v0.2.84 PLAN-v0284 (review F3): scope the KG/DEV/DIAGRAMS_COLLECTION
+    # injection below to THIS call. Pre-.84 these env keys were set on
+    # `os.environ` and never restored, leaking into the in-process test
+    # suite (observed twice). The `with` block reverts them on exit; the
+    # synchronous callees (`migrate_collections` reads env; the reingest
+    # `subprocess.run(env=dict(os.environ))` inherits the injected values)
+    # all run INSIDE the block, so the subprocess contract is preserved.
+    with _scoped_environ(
+        "KG_COLLECTION", "DEVELOPMENT_COLLECTION", "DIAGRAMS_COLLECTION",
+    ):
+        if not all_projects:
+            # v0.2.84 PLAN-v0284 D3 (P2 / ruling R3): resolve BINDING-FIRST when a
+            # `--project-folder` is available (update step 3 walks the CORRECT
+            # collection family instead of the display-name-derived one). Pre-.84
+            # this name-derived from `--name`, so a diverged binding made the
+            # migrate dispatcher walk the wrong `<DisplayName>_*` family. Falls back
+            # to the identical name-derived set when no folder / no binding.
+            _mig_folder = getattr(args, "project_folder", None)
+            _mig_folder_path = Path(_mig_folder).resolve() if _mig_folder else None
+            derived = _resolve_bundle_collection_names_binding_first(
+                args.name, _mig_folder_path,
             )
+            # Inject env so migrate_collections picks them up. The enclosing
+            # `_scoped_environ` block (review F3) reverts these three keys on
+            # exit, so even a long-lived caller (the in-process test suite) sees
+            # its prior env restored — the injection is visible only for the
+            # duration of this synchronous dispatch.
+            os.environ["KG_COLLECTION"] = derived["kg_collection"]
+            os.environ["DEVELOPMENT_COLLECTION"] = derived["development_collection"]
+            # v0.2.54 Track D (live-test finding): DIAGRAMS_COLLECTION must be
+            # scoped to --name too. Pre-fix, only KG + Dev were overridden, so
+            # an AMBIENT DIAGRAMS_COLLECTION (e.g. exported by the invoking
+            # project's .claude/settings.json env into the shell) leaked into
+            # the plan — `migrate-collections --name OtherProject
+            # --force-rebuild` would then drop + rebuild the CURRENT project's
+            # live Diagrams collection, violating the documented "--name scopes
+            # the work to THIS project's collections" contract.
+            os.environ["DIAGRAMS_COLLECTION"] = derived["diagrams_collection"]
 
-            project_name_arg = None if all_projects else args.name
-            weaviate_url = args.weaviate_url
-            dry_run = bool(args.dry_run)
-
-            # KG-shaped collections (per-project + shared KG when relevant).
-            for coll in enumerate_kg_collections(
-                project_name=project_name_arg, weaviate_url=weaviate_url,
-            ):
-                if dry_run:
-                    # Dry-run: planned-only entry; no Weaviate writes.
-                    result["v0218_schema_reports"].append({
-                        "collection": coll,
-                        "action": "v0218_schema_check",
-                        "added_slots": [],
-                        "skipped_slots": [],
-                        "errors": [],
-                        "objects_copied": 0,
-                        "dry_run": True,
-                    })
-                else:
-                    report = migrate_collection_to_target(
-                        coll, KG_NAMED_VECTORS,
-                        weaviate_url=weaviate_url,
-                    )
-                    result["v0218_schema_reports"].append({
-                        "collection": report.collection,
-                        "added_slots": report.added_slots,
-                        "skipped_slots": report.skipped_slots,
-                        "errors": report.errors,
-                        "objects_copied": report.objects_copied,
-                    })
-                    if report.errors:
-                        for e in report.errors:
-                            result["errors"].append({
-                                "collection": report.collection,
-                                "action": "v0218_schema",
-                                "error": f"slot {e['slot']}: {e['reason']}",
-                            })
-
-            # Code-graph collections (per-project Code* OR all server-wide).
-            for coll in enumerate_code_collections(
-                project_name=project_name_arg, weaviate_url=weaviate_url,
-            ):
-                if dry_run:
-                    result["v0218_schema_reports"].append({
-                        "collection": coll,
-                        "action": "v0218_schema_check",
-                        "added_slots": [],
-                        "skipped_slots": [],
-                        "errors": [],
-                        "objects_copied": 0,
-                        "dry_run": True,
-                    })
-                else:
-                    report = migrate_collection_to_target(
-                        coll, CODE_NAMED_VECTORS,
-                        weaviate_url=weaviate_url,
-                    )
-                    result["v0218_schema_reports"].append({
-                        "collection": report.collection,
-                        "added_slots": report.added_slots,
-                        "skipped_slots": report.skipped_slots,
-                        "errors": report.errors,
-                        "objects_copied": report.objects_copied,
-                    })
-                    if report.errors:
-                        for e in report.errors:
-                            result["errors"].append({
-                                "collection": report.collection,
-                                "action": "v0218_schema",
-                                "error": f"slot {e['slot']}: {e['reason']}",
-                            })
-        except Exception as e:
-            # v0.2.18 helper should not break the existing migrate flow.
-            # If the helper fails (Weaviate down, import-time issue, etc.),
-            # report it in errors[] and continue. The legacy KG/Dev path
-            # has already run and its result["plan"] is intact.
-            result["errors"].append({
-                "collection": None,
-                "action": "v0218_schema",
-                "error": f"v0.2.18 schema helper failed: "
-                         f"{type(e).__name__}: {e}",
-            })
-
-    # v0.2.54 Track D (P0-2): rebuild recovery for the CLI path. The
-    # `rebuild` action drops + recreates the collection with the target
-    # schema (see migrate_collections), but the CLI handler historically
-    # had NO re-ingest step — install.py's `_seed_weaviate` only runs on
-    # the install.py call path. Since the `schema_migration_required`
-    # deferral's `command_to_apply` points users at exactly this CLI,
-    # following the documented recovery command used to leave the KG
-    # empty until the next full install.py run.
-    #
-    # Recovery contract:
-    #   * wet-run only (dry-run has nothing to recover);
-    #   * when `--project-folder` is given, run the project's bundled
-    #     `.claude/scripts/sync_knowledge_graph.py --all` with THIS
-    #     interpreter (the orchestrator venv — it has weaviate +
-    #     weaviate_mcp importable) so knowledge/ + docs/ re-ingest
-    #     immediately;
-    #   * when `--project-folder` is absent, we cannot locate the .md
-    #     sources — surface `reingest_required` in the JSON envelope and
-    #     print the exact kg-sync command so neither a human nor an LLM
-    #     agent mistakes "schema recreated" for "data restored".
-    project_folder = getattr(args, "project_folder", None)
-    rebuilt_collections = [
-        e["collection"] for e in result.get("plan", [])
-        if e.get("action") == "rebuild"
-    ]
-    result.setdefault("reingest_required", False)
-    result.setdefault("reingest", None)
-    if rebuilt_collections and not bool(args.dry_run):
-        if project_folder:
-            folder = Path(project_folder).resolve()
-            sync_script = (
-                folder / ".claude" / "scripts" / "sync_knowledge_graph.py"
+            # Build a minimal Namespace-like for migrate_collections dispatch.
+            # v0.2.73 FIX-D4: thread --name + --index-type so _build_plan can add
+            # the (GATED) code-graph collections when hfresh is requested.
+            ns = argparse.Namespace(
+                force_rebuild=bool(args.force_rebuild),
+                name=args.name,
+                index_type=getattr(args, "index_type", None),
             )
-            if sync_script.is_file():
-                import subprocess  # local import — module convention
+            result = migrate_collections(
+                ns,
+                dry_run=bool(args.dry_run),
+                weaviate_url=args.weaviate_url,
+            )
+        else:
+            # --all-projects path: skip the per-project KG/Dev env-driven
+            # dispatch; the v0.2.18 helper below walks every KG-shaped
+            # collection on the server directly.
+            result = {"plan": [], "dry_run": bool(args.dry_run), "errors": []}
 
-                sync_env = dict(os.environ)
-                if args.weaviate_url:
-                    sync_env["WEAVIATE_URL"] = args.weaviate_url
-                print(
-                    f"  re-ingesting after rebuild of "
-                    f"{', '.join(rebuilt_collections)} via {sync_script} ...",
-                    file=sys.stderr,
+        result.setdefault("deferral_emitted", False)
+        # v0.2.55 (stale-migration-deferral fix): True when a clean dry-run
+        # cleared a stale `schema_migration_required` entry left by an earlier
+        # update.
+        result.setdefault("stale_migrate_deferral_cleared", False)
+        result.setdefault("v0218_schema_reports", [])
+
+        # v0.2.18: additive migration to the new 5-slot KG + 6-slot Code
+        # catalog. This handles three things:
+        #   1. KG/Dev: the existing migrate_collections smart-dispatch
+        #      already handles named-vector slot additions via the `copy`
+        #      action. For dry-run we don't re-walk these (they're in
+        #      `result["plan"]`). For wet-run we still re-run the additive
+        #      helper to handle the shared KG (which the existing path
+        #      doesn't visit) and to surface a unified report.
+        #   2. Code-graph: the existing path never touched these. v0.2.18
+        #      adds them via the additive helper.
+        #   3. --all-projects: walks every collection.
+        #
+        # Always-on by default (matches the v0.2.18 acceptance criteria);
+        # `--no-include-code` opts out for callers who want pre-v0.2.18
+        # KG-only behavior (kept for bisectability).
+        include_code = getattr(args, "include_code", True)
+        if include_code:
+            try:
+                from vco_lib.weaviate_schema import (
+                    CODE_NAMED_VECTORS,
+                    KG_NAMED_VECTORS,
+                    enumerate_code_collections,
+                    enumerate_kg_collections,
+                    migrate_collection_to_target,
                 )
-                try:
-                    proc = subprocess.run(
-                        [sys.executable, str(sync_script), "--all"],
-                        cwd=str(folder),
-                        env=sync_env,
-                        timeout=900,
+
+                project_name_arg = None if all_projects else args.name
+                weaviate_url = args.weaviate_url
+                dry_run = bool(args.dry_run)
+
+                # KG-shaped collections (per-project + shared KG when relevant).
+                for coll in enumerate_kg_collections(
+                    project_name=project_name_arg, weaviate_url=weaviate_url,
+                ):
+                    if dry_run:
+                        # Dry-run: planned-only entry; no Weaviate writes.
+                        result["v0218_schema_reports"].append({
+                            "collection": coll,
+                            "action": "v0218_schema_check",
+                            "added_slots": [],
+                            "skipped_slots": [],
+                            "errors": [],
+                            "objects_copied": 0,
+                            "dry_run": True,
+                        })
+                    else:
+                        report = migrate_collection_to_target(
+                            coll, KG_NAMED_VECTORS,
+                            weaviate_url=weaviate_url,
+                        )
+                        result["v0218_schema_reports"].append({
+                            "collection": report.collection,
+                            "added_slots": report.added_slots,
+                            "skipped_slots": report.skipped_slots,
+                            "errors": report.errors,
+                            "objects_copied": report.objects_copied,
+                        })
+                        if report.errors:
+                            for e in report.errors:
+                                result["errors"].append({
+                                    "collection": report.collection,
+                                    "action": "v0218_schema",
+                                    "error": f"slot {e['slot']}: {e['reason']}",
+                                })
+
+                # Code-graph collections (per-project Code* OR all server-wide).
+                for coll in enumerate_code_collections(
+                    project_name=project_name_arg, weaviate_url=weaviate_url,
+                ):
+                    if dry_run:
+                        result["v0218_schema_reports"].append({
+                            "collection": coll,
+                            "action": "v0218_schema_check",
+                            "added_slots": [],
+                            "skipped_slots": [],
+                            "errors": [],
+                            "objects_copied": 0,
+                            "dry_run": True,
+                        })
+                    else:
+                        report = migrate_collection_to_target(
+                            coll, CODE_NAMED_VECTORS,
+                            weaviate_url=weaviate_url,
+                        )
+                        result["v0218_schema_reports"].append({
+                            "collection": report.collection,
+                            "added_slots": report.added_slots,
+                            "skipped_slots": report.skipped_slots,
+                            "errors": report.errors,
+                            "objects_copied": report.objects_copied,
+                        })
+                        if report.errors:
+                            for e in report.errors:
+                                result["errors"].append({
+                                    "collection": report.collection,
+                                    "action": "v0218_schema",
+                                    "error": f"slot {e['slot']}: {e['reason']}",
+                                })
+            except Exception as e:
+                # v0.2.18 helper should not break the existing migrate flow.
+                # If the helper fails (Weaviate down, import-time issue, etc.),
+                # report it in errors[] and continue. The legacy KG/Dev path
+                # has already run and its result["plan"] is intact.
+                result["errors"].append({
+                    "collection": None,
+                    "action": "v0218_schema",
+                    "error": f"v0.2.18 schema helper failed: "
+                             f"{type(e).__name__}: {e}",
+                })
+
+        # v0.2.54 Track D (P0-2): rebuild recovery for the CLI path. The
+        # `rebuild` action drops + recreates the collection with the target
+        # schema (see migrate_collections), but the CLI handler historically
+        # had NO re-ingest step — install.py's `_seed_weaviate` only runs on
+        # the install.py call path. Since the `schema_migration_required`
+        # deferral's `command_to_apply` points users at exactly this CLI,
+        # following the documented recovery command used to leave the KG
+        # empty until the next full install.py run.
+        #
+        # Recovery contract:
+        #   * wet-run only (dry-run has nothing to recover);
+        #   * when `--project-folder` is given, run the project's bundled
+        #     `.claude/scripts/sync_knowledge_graph.py --all` with THIS
+        #     interpreter (the orchestrator venv — it has weaviate +
+        #     weaviate_mcp importable) so knowledge/ + docs/ re-ingest
+        #     immediately;
+        #   * when `--project-folder` is absent, we cannot locate the .md
+        #     sources — surface `reingest_required` in the JSON envelope and
+        #     print the exact kg-sync command so neither a human nor an LLM
+        #     agent mistakes "schema recreated" for "data restored".
+        project_folder = getattr(args, "project_folder", None)
+        rebuilt_collections = [
+            e["collection"] for e in result.get("plan", [])
+            if e.get("action") == "rebuild"
+        ]
+        result.setdefault("reingest_required", False)
+        result.setdefault("reingest", None)
+        if rebuilt_collections and not bool(args.dry_run):
+            if project_folder:
+                folder = Path(project_folder).resolve()
+                sync_script = (
+                    folder / ".claude" / "scripts" / "sync_knowledge_graph.py"
+                )
+                if sync_script.is_file():
+                    import subprocess  # local import — module convention
+
+                    sync_env = dict(os.environ)
+                    if args.weaviate_url:
+                        sync_env["WEAVIATE_URL"] = args.weaviate_url
+                    print(
+                        f"  re-ingesting after rebuild of "
+                        f"{', '.join(rebuilt_collections)} via {sync_script} ...",
+                        file=sys.stderr,
                     )
-                    result["reingest"] = {
-                        "script": str(sync_script),
-                        "returncode": proc.returncode,
-                    }
-                    if proc.returncode != 0:
+                    try:
+                        proc = subprocess.run(
+                            [sys.executable, str(sync_script), "--all"],
+                            cwd=str(folder),
+                            env=sync_env,
+                            timeout=900,
+                        )
+                        result["reingest"] = {
+                            "script": str(sync_script),
+                            "returncode": proc.returncode,
+                        }
+                        if proc.returncode != 0:
+                            result["reingest_required"] = True
+                            result["errors"].append({
+                                "collection": None,
+                                "action": "reingest",
+                                "error": (
+                                    f"post-rebuild re-ingest exited "
+                                    f"{proc.returncode}; run "
+                                    f"`.claude/scripts/kg-sync --all` from "
+                                    f"{folder} to restore the dropped data"
+                                ),
+                            })
+                    except (OSError, subprocess.TimeoutExpired) as e:
                         result["reingest_required"] = True
                         result["errors"].append({
                             "collection": None,
                             "action": "reingest",
                             "error": (
-                                f"post-rebuild re-ingest exited "
-                                f"{proc.returncode}; run "
+                                f"post-rebuild re-ingest failed to run: "
+                                f"{type(e).__name__}: {e}; run "
                                 f"`.claude/scripts/kg-sync --all` from "
                                 f"{folder} to restore the dropped data"
                             ),
                         })
-                except (OSError, subprocess.TimeoutExpired) as e:
+                else:
                     result["reingest_required"] = True
                     result["errors"].append({
                         "collection": None,
                         "action": "reingest",
                         "error": (
-                            f"post-rebuild re-ingest failed to run: "
-                            f"{type(e).__name__}: {e}; run "
-                            f"`.claude/scripts/kg-sync --all` from "
-                            f"{folder} to restore the dropped data"
+                            f"rebuild dropped {', '.join(rebuilt_collections)} "
+                            f"but {sync_script} is missing — run "
+                            f"`.claude/scripts/kg-sync --all` from {folder} "
+                            f"to restore the data"
                         ),
                     })
             else:
                 result["reingest_required"] = True
-                result["errors"].append({
-                    "collection": None,
-                    "action": "reingest",
-                    "error": (
-                        f"rebuild dropped {', '.join(rebuilt_collections)} "
-                        f"but {sync_script} is missing — run "
-                        f"`.claude/scripts/kg-sync --all` from {folder} "
-                        f"to restore the data"
-                    ),
-                })
-        else:
-            result["reingest_required"] = True
-            print(
-                "  NOTE: rebuild recreated "
-                f"{', '.join(rebuilt_collections)} with the target schema "
-                "but the data was NOT re-ingested (no --project-folder "
-                "given). Run `.claude/scripts/kg-sync --all` from the "
-                "project folder to restore it.",
-                file=sys.stderr,
-            )
-
-    # PR 5: drift-detection deferral (pre-update path).
-    if project_folder and bool(args.dry_run) and not result["errors"] and not all_projects:
-        # v0.2.70: `copy` is ALWAYS lossless — the staging double-copy
-        # round-trips every EXISTING UUID + named vector + property byte-for-byte
-        # via `_copy_collection_with_vectors` (no re-embedding; the live
-        # collection is not dropped until the staging swap's count-match
-        # assertion passes). So `copy` must AUTO-APPLY without consent — only
-        # genuinely data-losing actions defer, and `action == "rebuild"` is the
-        # exact lossy set here. `legacy_single_vector` classifies `rebuild`
-        # (never `copy`). A same-name/different-dim slot is INVISIBLE to
-        # `_schema_delta` (name-only comparison): on its own it yields `noop`;
-        # when it COEXISTS with a genuinely-missing slot, `_classify_action`
-        # returns `copy` (driven by the missing slot) and the mismatch slot
-        # rides along — but copy still only round-trips the EXISTING vectors
-        # verbatim (it neither fixes nor worsens the dim-mismatch, and never
-        # re-embeds/drops), so it remains lossless + data-safe. Genuine
-        # dim-mismatch remediation is owned by the schema_migration_runner
-        # subsystem (it defers). The dry-run plan strips `delta`, leaving
-        # `action` as the only signal here — sufficient given that proof.
-        #
-        # NOTE: this auto-apply is NEW behavior, NOT a mirror of
-        # `install.py --update` (whose drift detector EXCLUDES the additive
-        # v0.2.18 slots and never reaches the apply for an additive 3->5 drift).
-        # It is justified purely by losslessness. The launcher's WET follow-up
-        # that actually applies the additive subset lives in
-        # `projects_v2.rs::run_migrate_dry_run` (the dry-run probe here only
-        # stops deferring — it never mutates).
-        destructive = [
-            e for e in result.get("plan", [])
-            if e.get("action") == "rebuild"
-        ]
-        resolved_folder = Path(project_folder).resolve()
-        if destructive:
-            try:
-                _emit_migrate_required_deferral(
-                    resolved_folder,
-                    project_name=args.name,
-                    weaviate_url=args.weaviate_url or _weaviate_url_default(),
-                    plan_entries=destructive,
-                )
-                result["deferral_emitted"] = True
-            except Exception as e:
-                # Soft-fail: a deferral write failure must not abort the
-                # whole update flow. Report via errors[] so the Rust caller
-                # surfaces it as a warning toast.
-                result["errors"].append({
-                    "collection": None,
-                    "action": "deferral",
-                    "error": f"migrate-required deferral write failed: "
-                             f"{type(e).__name__}: {e}",
-                })
-        else:
-            # v0.2.55 (stale-migration-deferral fix): the dry-run is CLEAN (no
-            # copy/rebuild needed). PRE-v0.2.55 this branch did nothing, so
-            # a `schema_migration_required` entry written by an EARLIER
-            # update (when a migration WAS pending) survived forever even
-            # after the migration was applied or the schema healed —
-            # exactly the stale-deferral carry-forward bug (the entry was re-read by
-            # `DeferralReport.read()` on every subsequent bundle update and
-            # never cleared because the emitter is gated on `destructive`).
-            # Re-probe-clears-stale, matching the Track D `--apply-deferred`
-            # discipline: a clean dry-run IS the re-probe; clear the stale
-            # entry. Soft-fail — never abort the update over a deferral
-            # housekeeping write.
-            try:
-                # v0.2.83 PLAN-v0283 WP-B2: resolve via the ONE locked emitter
-                # home (read-modify-write under the exclusive lock; foreign
-                # entries preserved). resolve_conditions returns the count it
-                # actually cleared, so the flag is set only when it fired.
-                from vco_lib import deferral_emit as _de
-                cleared = _de.resolve_conditions(
-                    resolved_folder, ["schema_migration_required"],
-                )
-                if cleared:
-                    result["stale_migrate_deferral_cleared"] = True
-                    # stderr (not stdout) so `--json` output stays parseable.
-                    print(
-                        "  [ok] schema_migration_required: dry-run clean — "
-                        "cleared stale migration deferral (no copy/rebuild "
-                        "needed).",
-                        file=sys.stderr,
-                    )
-            except Exception as e:
-                # Housekeeping only — report but don't fail.
-                result["errors"].append({
-                    "collection": None,
-                    "action": "deferral-clear",
-                    "error": f"stale migrate-deferral clear failed: "
-                             f"{type(e).__name__}: {e}",
-                })
-
-    if args.json:
-        print(json.dumps(result))
-    else:
-        print(
-            f"dry_run: {result['dry_run']}  "
-            f"deferral_emitted: {result['deferral_emitted']}  "
-            f"reingest_required: {result.get('reingest_required', False)}"
-        )
-        for entry in result["plan"]:
-            print(
-                f"  {entry['action']:13s} {entry['collection']}  "
-                f"objects_copied={entry['objects_copied']}  "
-                f"elapsed_ms={entry['elapsed_ms']}"
-            )
-        if result["v0218_schema_reports"]:
-            print()
-            print("v0.2.18 multi-slot schema migration:")
-            print(f"  {'COLLECTION':45s}  ADDED  SKIPPED  ERRORS  COPIED")
-            for r in result["v0218_schema_reports"]:
-                added = len(r.get("added_slots") or [])
-                skipped = len(r.get("skipped_slots") or [])
-                errors = len(r.get("errors") or [])
-                copied = r.get("objects_copied", 0)
                 print(
-                    f"  {r['collection']:45s}  "
-                    f"{added:5d}  {skipped:7d}  {errors:6d}  {copied:6d}"
+                    "  NOTE: rebuild recreated "
+                    f"{', '.join(rebuilt_collections)} with the target schema "
+                    "but the data was NOT re-ingested (no --project-folder "
+                    "given). Run `.claude/scripts/kg-sync --all` from the "
+                    "project folder to restore it.",
+                    file=sys.stderr,
                 )
-                if r.get("added_slots"):
-                    print(f"      + added: {', '.join(r['added_slots'])}")
-                if r.get("errors"):
-                    for e in r["errors"]:
-                        print(f"      ! {e['slot']}: {e['reason']}")
-        for err in result["errors"]:
-            print(f"  ERROR {err.get('collection') or '(global)'}: {err['error']}")
-    return 1 if result["errors"] else 0
+
+        # PR 5: drift-detection deferral (pre-update path).
+        if project_folder and bool(args.dry_run) and not result["errors"] and not all_projects:
+            # v0.2.70: `copy` is ALWAYS lossless — the staging double-copy
+            # round-trips every EXISTING UUID + named vector + property byte-for-byte
+            # via `_copy_collection_with_vectors` (no re-embedding; the live
+            # collection is not dropped until the staging swap's count-match
+            # assertion passes). So `copy` must AUTO-APPLY without consent — only
+            # genuinely data-losing actions defer, and `action == "rebuild"` is the
+            # exact lossy set here. `legacy_single_vector` classifies `rebuild`
+            # (never `copy`). A same-name/different-dim slot is INVISIBLE to
+            # `_schema_delta` (name-only comparison): on its own it yields `noop`;
+            # when it COEXISTS with a genuinely-missing slot, `_classify_action`
+            # returns `copy` (driven by the missing slot) and the mismatch slot
+            # rides along — but copy still only round-trips the EXISTING vectors
+            # verbatim (it neither fixes nor worsens the dim-mismatch, and never
+            # re-embeds/drops), so it remains lossless + data-safe. Genuine
+            # dim-mismatch remediation is owned by the schema_migration_runner
+            # subsystem (it defers). The dry-run plan strips `delta`, leaving
+            # `action` as the only signal here — sufficient given that proof.
+            #
+            # NOTE: this auto-apply is NEW behavior, NOT a mirror of
+            # `install.py --update` (whose drift detector EXCLUDES the additive
+            # v0.2.18 slots and never reaches the apply for an additive 3->5 drift).
+            # It is justified purely by losslessness. The launcher's WET follow-up
+            # that actually applies the additive subset lives in
+            # `projects_v2.rs::run_migrate_dry_run` (the dry-run probe here only
+            # stops deferring — it never mutates).
+            destructive = [
+                e for e in result.get("plan", [])
+                if e.get("action") == "rebuild"
+            ]
+            resolved_folder = Path(project_folder).resolve()
+            if destructive:
+                try:
+                    _emit_migrate_required_deferral(
+                        resolved_folder,
+                        project_name=args.name,
+                        weaviate_url=args.weaviate_url or _weaviate_url_default(),
+                        plan_entries=destructive,
+                    )
+                    result["deferral_emitted"] = True
+                except Exception as e:
+                    # Soft-fail: a deferral write failure must not abort the
+                    # whole update flow. Report via errors[] so the Rust caller
+                    # surfaces it as a warning toast.
+                    result["errors"].append({
+                        "collection": None,
+                        "action": "deferral",
+                        "error": f"migrate-required deferral write failed: "
+                                 f"{type(e).__name__}: {e}",
+                    })
+            else:
+                # v0.2.55 (stale-migration-deferral fix): the dry-run is CLEAN (no
+                # copy/rebuild needed). PRE-v0.2.55 this branch did nothing, so
+                # a `schema_migration_required` entry written by an EARLIER
+                # update (when a migration WAS pending) survived forever even
+                # after the migration was applied or the schema healed —
+                # exactly the stale-deferral carry-forward bug (the entry was re-read by
+                # `DeferralReport.read()` on every subsequent bundle update and
+                # never cleared because the emitter is gated on `destructive`).
+                # Re-probe-clears-stale, matching the Track D `--apply-deferred`
+                # discipline: a clean dry-run IS the re-probe; clear the stale
+                # entry. Soft-fail — never abort the update over a deferral
+                # housekeeping write.
+                try:
+                    # v0.2.83 PLAN-v0283 WP-B2: resolve via the ONE locked emitter
+                    # home (read-modify-write under the exclusive lock; foreign
+                    # entries preserved). resolve_conditions returns the count it
+                    # actually cleared, so the flag is set only when it fired.
+                    from vco_lib import deferral_emit as _de
+                    cleared = _de.resolve_conditions(
+                        resolved_folder, ["schema_migration_required"],
+                    )
+                    if cleared:
+                        result["stale_migrate_deferral_cleared"] = True
+                        # stderr (not stdout) so `--json` output stays parseable.
+                        print(
+                            "  [ok] schema_migration_required: dry-run clean — "
+                            "cleared stale migration deferral (no copy/rebuild "
+                            "needed).",
+                            file=sys.stderr,
+                        )
+                except Exception as e:
+                    # Housekeeping only — report but don't fail.
+                    result["errors"].append({
+                        "collection": None,
+                        "action": "deferral-clear",
+                        "error": f"stale migrate-deferral clear failed: "
+                                 f"{type(e).__name__}: {e}",
+                    })
+
+        if args.json:
+            print(json.dumps(result))
+        else:
+            print(
+                f"dry_run: {result['dry_run']}  "
+                f"deferral_emitted: {result['deferral_emitted']}  "
+                f"reingest_required: {result.get('reingest_required', False)}"
+            )
+            for entry in result["plan"]:
+                print(
+                    f"  {entry['action']:13s} {entry['collection']}  "
+                    f"objects_copied={entry['objects_copied']}  "
+                    f"elapsed_ms={entry['elapsed_ms']}"
+                )
+            if result["v0218_schema_reports"]:
+                print()
+                print("v0.2.18 multi-slot schema migration:")
+                print(f"  {'COLLECTION':45s}  ADDED  SKIPPED  ERRORS  COPIED")
+                for r in result["v0218_schema_reports"]:
+                    added = len(r.get("added_slots") or [])
+                    skipped = len(r.get("skipped_slots") or [])
+                    errors = len(r.get("errors") or [])
+                    copied = r.get("objects_copied", 0)
+                    print(
+                        f"  {r['collection']:45s}  "
+                        f"{added:5d}  {skipped:7d}  {errors:6d}  {copied:6d}"
+                    )
+                    if r.get("added_slots"):
+                        print(f"      + added: {', '.join(r['added_slots'])}")
+                    if r.get("errors"):
+                        for e in r["errors"]:
+                            print(f"      ! {e['slot']}: {e['reason']}")
+            for err in result["errors"]:
+                print(f"  ERROR {err.get('collection') or '(global)'}: {err['error']}")
+        return 1 if result["errors"] else 0
 
 
 def _cmd_bootstrap_collections(args: argparse.Namespace) -> int:

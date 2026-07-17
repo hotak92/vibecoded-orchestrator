@@ -21,10 +21,30 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import resolve_analyzer_python  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LIB_DIR = REPO_ROOT / "templates" / "hooks" / "_lib"
 CG_SH = LIB_DIR / "codegraph-query.sh"
 HOOKS = REPO_ROOT / "templates" / "hooks"
+
+
+def _analyzer_python() -> str:
+    """v0.2.84 (review T-2): the venv-resolved interpreter for spawning the REAL
+    ``analyze_code_graph.py`` (which ``import weaviate`` at module load). Skips the
+    test when no interpreter with weaviate-client is resolvable — bare system
+    ``python3`` would exit 1 with "weaviate-client not installed" BEFORE the G5
+    guard runs, yielding a misleading pass/fail. Shared resolver lives in
+    ``tests/conftest.py`` (one-concern-one-home)."""
+    py = resolve_analyzer_python()
+    if py is None:
+        pytest.skip(
+            "no Python interpreter with weaviate-client importable "
+            "($VCT_VENV / $VCT_INSTALL_ROOT/.venv / repo .venv / sys.executable) — "
+            "the analyzer's module-level `import weaviate` would exit 1 before the "
+            "G5 guard, so this test cannot observe the guard's real behavior"
+        )
+    return py
 
 
 def _has_bash() -> bool:
@@ -53,7 +73,10 @@ pytestmark = pytest.mark.skipif(not _has_bash(), reason="bash required")
 
 def _gate(fn: str, arg: str) -> bool:
     """Run a gate function from codegraph-query.sh; return True iff it fires (0)."""
-    py = shutil.which("python3") or "python3"
+    # v0.2.84 (review T-2): prefer the venv-resolved interpreter, but these gate
+    # functions are PURE BASH (they never invoke `$PY`), so a plain system python3
+    # is a fine fallback — no weaviate needed, no skip.
+    py = resolve_analyzer_python() or shutil.which("python3") or "python3"
     script = (
         f'export PY="{py}"\n'
         f'. "{CG_SH}"\n'
@@ -127,7 +150,9 @@ def test_pattern_gate_skips_non_symbols(pat) -> None:
 # codegraph_extract_symbol — query isolation
 # --------------------------------------------------------------------------
 def test_extract_symbol_isolates_token() -> None:
-    py = shutil.which("python3") or "python3"
+    # v0.2.84 (review T-2): pure-bash extract fn (never uses `$PY`); venv-resolved
+    # interpreter preferred, system python3 an acceptable fallback (no weaviate).
+    py = resolve_analyzer_python() or shutil.which("python3") or "python3"
     script = (
         f'export PY="{py}"\n. "{CG_SH}"\n'
         'echo "[$(codegraph_extract_symbol \'grep -rn "migrate_collections" .\')]"\n'
@@ -232,7 +257,7 @@ def test_g5_guard_refuses_worktree_basename_without_project(tmp_path: Path) -> N
     analyzer = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
     env = {k: v for k, v in os.environ.items() if k not in ("CODE_GRAPH_PROJECT", "PROJECT_NAME")}
     r = subprocess.run(
-        [shutil.which("python3") or "python3", str(analyzer), "."],
+        [_analyzer_python(), str(analyzer), "."],
         cwd=str(wt), capture_output=True, text=True, timeout=60, env=env,
     )
     assert r.returncode == 1, f"expected refusal exit 1; got {r.returncode}\n{r.stderr[-400:]}"
@@ -251,7 +276,7 @@ def test_g5_guard_allows_explicit_project_from_worktree(tmp_path: Path) -> None:
     env = {k: v for k, v in os.environ.items() if k not in ("CODE_GRAPH_PROJECT", "PROJECT_NAME")}
     try:
         r = subprocess.run(
-            [shutil.which("python3") or "python3", str(analyzer), ".", "--project", "CanonicalProj"],
+            [_analyzer_python(), str(analyzer), ".", "--project", "CanonicalProj"],
             cwd=str(wt), capture_output=True, text=True, timeout=60, env=env,
         )
         assert "refusing to mint" not in r.stderr, (
@@ -282,7 +307,7 @@ def test_g5_guard_does_not_false_refuse_legit_wt_named_project(tmp_path: Path) -
     analyzer = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
     env = {k: v for k, v in os.environ.items() if k not in ("CODE_GRAPH_PROJECT", "PROJECT_NAME")}
     r = subprocess.run(
-        [shutil.which("python3") or "python3", str(analyzer), "."],
+        [_analyzer_python(), str(analyzer), "."],
         cwd=str(legit), capture_output=True, text=True, timeout=60, env=env,
     )
     assert "refusing to mint" not in r.stderr, (
@@ -301,7 +326,7 @@ def test_g5_guard_refuses_explicit_worktree_relative_project(tmp_path: Path) -> 
     analyzer = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
     env = {k: v for k, v in os.environ.items() if k not in ("CODE_GRAPH_PROJECT", "PROJECT_NAME")}
     r = subprocess.run(
-        [shutil.which("python3") or "python3", str(analyzer), ".", "--project", "vco-wt/bug1"],
+        [_analyzer_python(), str(analyzer), ".", "--project", "vco-wt/bug1"],
         cwd=str(plain), capture_output=True, text=True, timeout=60, env=env,
     )
     assert r.returncode == 1, f"expected refusal exit 1; got {r.returncode}\n{r.stderr[-400:]}"
@@ -322,7 +347,7 @@ def test_g5_guard_allows_explicit_legit_wt_substring_project(tmp_path: Path) -> 
     env = {k: v for k, v in os.environ.items() if k not in ("CODE_GRAPH_PROJECT", "PROJECT_NAME")}
     try:
         r = subprocess.run(
-            [shutil.which("python3") or "python3", str(analyzer), ".", "--project", "SwiftlyTyped"],
+            [_analyzer_python(), str(analyzer), ".", "--project", "SwiftlyTyped"],
             cwd=str(plain), capture_output=True, text=True, timeout=60, env=env,
         )
         assert "refusing to mint" not in r.stderr, (
