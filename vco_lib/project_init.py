@@ -105,13 +105,14 @@ def _scoped_environ(*keys: str):
     injected values — the subprocess CONTRACT is preserved because ``subprocess.run``
     is synchronous and completes before the ``finally`` reverts the parent's env.
     """
-    _sentinel = object()
-    _saved = {k: os.environ.get(k, _sentinel) for k in keys}
+    # None marks "was absent" — a real env value can never be None, and this
+    # keeps the mapping typed dict[str, str | None] (pyright-clean restore).
+    _saved: dict[str, str | None] = {k: os.environ.get(k) for k in keys}
     try:
         yield
     finally:
         for k, prev in _saved.items():
-            if prev is _sentinel:
+            if prev is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = prev
@@ -320,12 +321,16 @@ def _resolve_bundle_collection_names_binding_first(
     # `_read_kg_collection_from_launcher_db` tier is DELETED — the seam owns the
     # launcher.db read + the folder→id canonicalization (symlink/trailing-slash
     # pitfalls have ONE home there) + the shared dev/diagrams derivation.
+    # Import OUTSIDE the try so the except clause's exception names are always
+    # bound (vco_lib.config_projection ships with every healthy install —
+    # loud-fail import per the vco_lib invariant).
+    from vco_lib.config_projection import (
+        DbUnreachable,
+        ProjectNotFound,
+        resolve_collection_names_for_folder,
+    )
+
     try:
-        from vco_lib.config_projection import (
-            DbUnreachable,
-            ProjectNotFound,
-            resolve_collection_names_for_folder,
-        )
         names = resolve_collection_names_for_folder(folder, db_path=db_path)
         out = dict(base)
         out["kg_collection"] = names["kg_collection"]
