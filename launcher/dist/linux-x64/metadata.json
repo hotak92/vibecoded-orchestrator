@@ -1,8 +1,8 @@
 {
   "binary_name": "vct-launcher",
-  "built_at": "2026-07-17T00:28:34Z",
+  "built_at": "2026-07-17T13:21:23Z",
   "os": "linux-x64",
-  "size_bytes": 31207352,
-  "source_sha": "92838737bae70af858bff2280c86306f7d35233b",
-  "version": "0.2.83"
+  "size_bytes": 31224376,
+  "source_sha": "76d844bfa4df8047c657b15f4b8884621bca8883",
+  "version": "0.2.84"
 }
