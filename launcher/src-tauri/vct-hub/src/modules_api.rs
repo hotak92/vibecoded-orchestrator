@@ -589,6 +589,21 @@ async fn project_env(
              launcher to restore secret resolution",
         );
     }
+
+    // v0.2.84 (D8.2): open ONE memory-only read-through secret session for the
+    // WHOLE request. Every `secrets::get_with_context` call below — the module
+    // loop, the orchestrator-bundled loop, the user-bucket resolver (in
+    // `db::secret_active`), and the cross-project grants loop — runs on this
+    // same thread with NO `.await` between them, so they all share this
+    // thread-local memo transparently: a key that appears in more than one loop
+    // (e.g. a shared `github_pat` declared bundled AND present in the user
+    // bucket) hits the OS keychain exactly ONCE per request instead of once per
+    // occurrence. Under `Update all projects` this collapses the per-project ×
+    // per-key daemon fan-out that reproduced the P7 gnome-keyring SIGTRAP. The
+    // session is torn down (memo dropped, nothing persisted) when `_secret_session`
+    // drops at the end of the handler. Must NOT be held across an `.await` —
+    // this handler has none in the resolution region (verified).
+    let _secret_session = vct_launcher_core::secrets::SecretReadSession::new();
     // Per-key non-lock keychain errors set this flag (never silently omit a
     // key). Surfaced as `keychain_error` (503) on a `?key=` miss and as the
     // v0.2.82 CI fix: the degraded marker below is availability-gated via
@@ -1910,6 +1925,143 @@ mod tests {
     // current-thread runtime, so the axum handler executes on the same
     // thread that enabled the mock. Fixtures are synthetic (no real key
     // names, no real values).
+
+    /// v0.2.84 (D8.2) — the per-request `SecretReadSession` is REQUEST-SCOPED,
+    /// never a persistent cross-request cache. Two consecutive `/env` requests
+    /// for the same key each perform their OWN keychain read (the memo from the
+    /// first request is torn down at its handler's end). This pins the
+    /// memory-only / no-persistence invariant at the integration boundary: a
+    /// future change that made the session a `static` cross-request cache would
+    /// serve a stale secret after rotation and would trip this test (the second
+    /// request's read count would not increase).
+    ///
+    /// Runs on the current-thread runtime, so the handler shares this test's
+    /// thread + mock keychain + the `ENTRY_CONSTRUCTION_COUNT` seam.
+    #[tokio::test]
+    async fn hub_env_secret_session_is_request_scoped_not_persistent() {
+        let _lock = h1_lock();
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let _probe = vct_launcher_core::secrets::TestProbeGuard::new(Some(false)); // unlocked
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "rs-proj", "Request Scoped Project", "/tmp/rs-proj");
+
+        vct_launcher_core::secrets::set(
+            vct_launcher_core::secrets::SecretScope::PerProject { project_id: "rs-proj" },
+            "user",
+            "RS_TOKEN",
+            "synthetic-not-a-real-secret",
+        )
+        .unwrap();
+        h.0.mark_secret_active("per_project", "rs-proj", "user", "RS_TOKEN")
+            .unwrap();
+
+        use std::sync::atomic::Ordering;
+        // Request 1.
+        let before1 = vct_launcher_core::secrets::ENTRY_CONSTRUCTION_COUNT.load(Ordering::SeqCst);
+        let r1 = reqwest::get(format!("{}/projects/rs-proj/env?key=RS_TOKEN", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(r1.status(), 200);
+        let after1 = vct_launcher_core::secrets::ENTRY_CONSTRUCTION_COUNT.load(Ordering::SeqCst);
+        assert!(
+            after1 > before1,
+            "request 1 must perform at least one keychain read"
+        );
+
+        // Request 2 — a SEPARATE request → a SEPARATE session. The key is read
+        // from the keychain AGAIN (nothing persisted from request 1).
+        let before2 = after1;
+        let r2 = reqwest::get(format!("{}/projects/rs-proj/env?key=RS_TOKEN", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(r2.status(), 200);
+        let body: serde_json::Value = r2.json().await.expect("json body");
+        assert_eq!(
+            body.get("RS_TOKEN").and_then(|v| v.as_str()),
+            Some("synthetic-not-a-real-secret")
+        );
+        let after2 = vct_launcher_core::secrets::ENTRY_CONSTRUCTION_COUNT.load(Ordering::SeqCst);
+        assert!(
+            after2 > before2,
+            "request 2 must re-read the keychain (the per-request session does \
+             NOT persist across requests — memory-only, request-scoped)"
+        );
+    }
+
+    /// v0.2.84 (D8.2, A3 non-root + per-project ruling) — two DIFFERENT
+    /// (non-root) projects requesting `/env` get INDEPENDENT per-request
+    /// sessions: the memo is keyed per request, so project A's cached value can
+    /// NEVER bleed into project B's response. Both projects declare the SAME env
+    /// key name with DIFFERENT values under their own per-project buckets; each
+    /// request must return ITS OWN project's value.
+    ///
+    /// This is the concrete guard against a regression that promoted the
+    /// session to a cross-request/cross-project cache (which would serve A's
+    /// secret to B). Both projects use non-orchestrator-root folders.
+    #[tokio::test]
+    async fn hub_env_sessions_are_independent_across_projects() {
+        let _lock = h1_lock();
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let _probe = vct_launcher_core::secrets::TestProbeGuard::new(Some(false)); // unlocked
+        let (base, h) = spawn_modules_api_hub().await;
+
+        // Two distinct NON-ROOT projects (folders ≠ orchestrator root).
+        seed_project(&h.0, "proj-a", "Project A", "/tmp/non-root-a");
+        seed_project(&h.0, "proj-b", "Project B", "/tmp/non-root-b");
+
+        // Same key name, DIFFERENT values, each in its own per-project bucket.
+        vct_launcher_core::secrets::set(
+            vct_launcher_core::secrets::SecretScope::PerProject { project_id: "proj-a" },
+            "user",
+            "SHARED_NAME_TOKEN",
+            "value-belongs-to-A",
+        )
+        .unwrap();
+        vct_launcher_core::secrets::set(
+            vct_launcher_core::secrets::SecretScope::PerProject { project_id: "proj-b" },
+            "user",
+            "SHARED_NAME_TOKEN",
+            "value-belongs-to-B",
+        )
+        .unwrap();
+        h.0.mark_secret_active("per_project", "proj-a", "user", "SHARED_NAME_TOKEN")
+            .unwrap();
+        h.0.mark_secret_active("per_project", "proj-b", "user", "SHARED_NAME_TOKEN")
+            .unwrap();
+
+        // Request A → A's value. Then request B → B's value (no bleed of A's
+        // cached value into B's independent session).
+        let ra = reqwest::get(format!("{}/projects/proj-a/env?key=SHARED_NAME_TOKEN", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(ra.status(), 200);
+        let ba: serde_json::Value = ra.json().await.expect("json body A");
+        assert_eq!(
+            ba.get("SHARED_NAME_TOKEN").and_then(|v| v.as_str()),
+            Some("value-belongs-to-A")
+        );
+
+        let rb = reqwest::get(format!("{}/projects/proj-b/env?key=SHARED_NAME_TOKEN", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(rb.status(), 200);
+        let bb: serde_json::Value = rb.json().await.expect("json body B");
+        assert_eq!(
+            bb.get("SHARED_NAME_TOKEN").and_then(|v| v.as_str()),
+            Some("value-belongs-to-B"),
+            "project B must get ITS OWN value — no cross-project session bleed"
+        );
+
+        // And A again, to prove B's request did not corrupt A's resolution.
+        let ra2 = reqwest::get(format!("{}/projects/proj-a/env?key=SHARED_NAME_TOKEN", base))
+            .await
+            .expect("hub reachable");
+        let ba2: serde_json::Value = ra2.json().await.expect("json body A2");
+        assert_eq!(
+            ba2.get("SHARED_NAME_TOKEN").and_then(|v| v.as_str()),
+            Some("value-belongs-to-A")
+        );
+    }
 
     /// A per-project user key (active row + keychain value) resolves
     /// through `GET /env?key=` — the sanctioned agent path.

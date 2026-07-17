@@ -185,6 +185,189 @@ impl<'a> SecretScope<'a> {
     }
 }
 
+// ─── Per-request secret-read session (v0.2.84 D8.2, memory-only) ─────────────
+//
+// The P7 gnome-keyring SIGTRAP reproduced under `install-bundle --update` +
+// `Update all projects`, where the hub `/env` route resolves EVERY active
+// secret key ONCE PER PROJECT — so a shared key like `github_pat` is read from
+// the daemon N times per update-all (once per project), all back-to-back. A
+// per-REQUEST read-through memo collapses the module/bundled/user loops'
+// overlapping keys down to ONE daemon read per distinct key per request,
+// cutting the daemon traffic that drove the crash.
+//
+// Hard invariants (pinned by `session_is_memory_only_no_persistence`):
+//   * MEMORY-ONLY. The memo lives in a thread-local `SessionState`; it is
+//     NEVER written to any file, NEVER stored in a `static` beyond the session
+//     object, and NEVER survives the request. A persistent or cross-run secret
+//     cache is FORBIDDEN — a stale secret served after a rotation is a
+//     correctness AND security defect.
+//   * WRITE-THROUGH HONEST. A module-level generation counter is bumped by
+//     every successful `set`/`delete`. Each memo entry records the generation
+//     it was cached at; a lookup is a HIT only when the recorded generation
+//     still equals the current one. So a `set`/`delete` anywhere (this session
+//     or another thread) invalidates the memo — a subsequent read re-hits the
+//     keychain and sees the new value.
+//   * REQUEST-SCOPED. `SecretReadSession` is RAII: `new()` installs a fresh
+//     empty memo (saving any outer one for nesting); `Drop` restores the outer
+//     value, dropping this session's memo. Outside any session, reads behave
+//     exactly as pre-v0.2.84 (no memo consulted, no entry recorded).
+//   * ERRORS ARE NOT MEMOIZED. Only a successful `Ok(Some)` / `Ok(None)` is
+//     cached. A transient keychain `Err` must stay retryable and must keep
+//     flipping the hub's honest `keychain_degraded` flag on every occurrence.
+//   * LOCK POSTURE UNCHANGED. The memo is consulted AFTER the Background
+//     lock-probe gate (G5/T18 posture byte-identical): a locked Background call
+//     still short-circuits to `KeychainError::Locked` and never serves a cached
+//     value. The memo only skips the Entry construction + daemon round-trip on
+//     an already-successful read within the same request.
+
+/// Process-wide monotonic generation counter. Bumped by every successful
+/// keychain `set`/`delete`. `SecretReadSession` memo entries are tagged with
+/// the generation at which they were cached and are only served while that tag
+/// still matches — so any write/delete transparently invalidates the memo
+/// (write-through honesty). Never reset; wraps far beyond any realistic run.
+static SECRET_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read the current secret generation (see [`SECRET_GENERATION`]).
+#[inline]
+fn current_secret_generation() -> u64 {
+    SECRET_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Bump the secret generation, invalidating every outstanding memo entry.
+/// Called from the `set`/`delete` chokepoints on a SUCCESSFUL write/delete
+/// (both the real keychain path and the test mock path).
+#[inline]
+fn bump_secret_generation() {
+    SECRET_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// A single cached read outcome: the resolved value (`Some`) or a genuine
+/// key-not-present miss (`None`), tagged with the generation at which it was
+/// captured. Errors are never cached, so only successful outcomes appear here.
+#[derive(Clone)]
+struct MemoEntry {
+    /// `Some(value)` for a resolved secret; `None` for a genuine miss.
+    value: Option<String>,
+    /// Generation counter value at capture time; the entry is a valid hit
+    /// only while this equals [`current_secret_generation`].
+    gen: u64,
+}
+
+/// The per-session read-through memo. Keyed by `(service_name, key)` — the same
+/// (scope, module_id) → service string + key tuple that uniquely identifies a
+/// keychain row.
+#[derive(Default)]
+struct SessionState {
+    memo: std::collections::HashMap<(String, String), MemoEntry>,
+}
+
+thread_local! {
+    /// The ambient session for the current thread, if any. `Some` for the
+    /// lifetime of a [`SecretReadSession`] guard; `None` otherwise (reads then
+    /// behave exactly as pre-v0.2.84). Held in a `RefCell` so the read hot-path
+    /// can both consult and populate it. NEVER a global `static` value store —
+    /// the whole point is that it is torn down per request.
+    static SECRET_SESSION: std::cell::RefCell<Option<SessionState>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII per-request secret-read session. While alive, every
+/// [`get_with_context`] call on this thread consults (and populates) a
+/// memory-only read-through memo, so repeated reads of the same
+/// `(scope, module_id, key)` within one request hit the OS keychain exactly
+/// ONCE. Dropping the guard tears the memo down (nothing persists).
+///
+/// Nesting is supported: a `new()` saves any outer session and restores it on
+/// `Drop`, so an inner scope gets a fresh memo without corrupting the outer
+/// one. The hub creates exactly one per `/env` request; there is no other
+/// caller today.
+///
+/// The guard is intentionally `!Send` (it borrows a thread-local): a session
+/// is valid only for a contiguous synchronous read sequence on one thread,
+/// which is exactly how the hub `/env` handler uses it (no `.await` between the
+/// resolution loops). Do NOT hold one across an `.await`.
+#[must_use = "a SecretReadSession only memoizes reads while it is alive"]
+pub struct SecretReadSession {
+    /// The outer session (if any) to restore on drop — supports nesting.
+    prev: Option<SessionState>,
+    /// A `SecretReadSession` must not cross threads (it borrows a thread-local).
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl SecretReadSession {
+    /// Begin a fresh memory-only read session on the current thread. Any
+    /// existing session is saved and restored on drop (nesting).
+    pub fn new() -> Self {
+        let prev = SECRET_SESSION.with(|cell| {
+            cell.borrow_mut().replace(SessionState::default())
+        });
+        Self {
+            prev,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    /// Test-only: how many distinct `(service, key)` entries this thread's
+    /// active session has memoized. `None` when no session is active.
+    #[cfg(any(test, debug_assertions))]
+    pub fn memoized_len() -> Option<usize> {
+        SECRET_SESSION.with(|cell| cell.borrow().as_ref().map(|s| s.memo.len()))
+    }
+}
+
+impl Default for SecretReadSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for SecretReadSession {
+    fn drop(&mut self) {
+        // Restore the outer session (or clear to None). This DROPS this
+        // session's memo — the memory-only guarantee: nothing survives the
+        // request.
+        SECRET_SESSION.with(|cell| {
+            *cell.borrow_mut() = self.prev.take();
+        });
+    }
+}
+
+/// Look up `(service, key)` in the active session's memo, if any. Returns
+/// `Some(value)` only for a still-current entry (generation matches). A missing
+/// entry, a stale entry (generation bumped by a `set`/`delete`), or no active
+/// session all yield `None` → the caller performs a real keychain read.
+fn session_memo_lookup(service: &str, key: &str) -> Option<Option<String>> {
+    SECRET_SESSION.with(|cell| {
+        let session = cell.borrow();
+        let session = session.as_ref()?;
+        let entry = session.memo.get(&(service.to_string(), key.to_string()))?;
+        if entry.gen == current_secret_generation() {
+            Some(entry.value.clone())
+        } else {
+            None
+        }
+    })
+}
+
+/// Record a SUCCESSFUL read outcome (`Some(value)` or a genuine `None` miss)
+/// into the active session's memo, tagged with the current generation. No-op
+/// when no session is active. Errors are never recorded here (callers only call
+/// this on `Ok`).
+fn session_memo_store(service: &str, key: &str, value: &Option<String>) {
+    SECRET_SESSION.with(|cell| {
+        if let Some(session) = cell.borrow_mut().as_mut() {
+            session.memo.insert(
+                (service.to_string(), key.to_string()),
+                MemoEntry {
+                    value: value.clone(),
+                    gen: current_secret_generation(),
+                },
+            );
+        }
+    });
+}
+
 // v0.2.72 (P9) rationale (kept for the maintainer): `Entry::new` is itself a
 // D-Bus Secret-Service negotiation on Linux (`sync-secret-service`).
 // Constructing it OUTSIDE the pacing layer meant a burst of N secret ops fired
@@ -460,22 +643,48 @@ static LAST_KEYRING_CALL: std::sync::Mutex<Option<std::time::Instant>> =
 /// the 150ms gate again — that's intentional, the daemon needs the
 /// same minimum break before each request.
 ///
+/// v0.2.84 (D8.3, release-gap fix): the last-call timestamp is recorded
+/// AFTER `f` COMPLETES, not before it. The pre-fix code stamped op-START,
+/// so an op that itself took ≥ `MIN_CALL_SPACING` (a slow daemon read)
+/// left ~0 idle gap between one op's END and the next op's START —
+/// sustained back-to-back daemon traffic under full pacing compliance,
+/// which is the load the P7 gnome-keyring SIGTRAP reproduced under. By
+/// stamping op-END, the NEXT call spaces off the previous op's COMPLETION
+/// so the daemon always sees ≥ `MIN_CALL_SPACING` of true idle between
+/// consecutive requests. The spacing VALUE is unchanged (150ms).
+///
 /// Test-visible: `MIN_CALL_SPACING` can be overridden inside `#[cfg(test)]`
 /// via `with_test_spacing` to keep the test suite fast. Production
 /// callers always pay the full 150ms.
 fn paced_call<T>(f: impl FnOnce() -> T) -> T {
     let spacing = current_spacing();
     {
-        let mut last = LAST_KEYRING_CALL.lock().unwrap_or_else(|p| p.into_inner());
+        // First lock acquisition: WAIT out the remaining spacing from the
+        // previous op's END. The wait happens under the lock so concurrent
+        // in-process callers serialise on the spacing requirement (contract
+        // unchanged). We deliberately do NOT stamp a start-time here — the
+        // stamp is written after `f` below (D8.3).
+        let last = LAST_KEYRING_CALL.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(prev) = *last {
             let elapsed = prev.elapsed();
             if elapsed < spacing {
                 std::thread::sleep(spacing - elapsed);
             }
         }
+    }
+    // `f` runs OUTSIDE the lock (contract unchanged — concurrent callers
+    // serialise on spacing, not on the closure body).
+    let result = f();
+    {
+        // Second (brief) acquisition: record the op's COMPLETION time so the
+        // NEXT call measures its idle gap from when THIS op finished, not
+        // when it started (D8.3). In production `paced_call` runs on the
+        // single-threaded keychain worker inside the held cross-process
+        // flock, so no concurrent writer races this update.
+        let mut last = LAST_KEYRING_CALL.lock().unwrap_or_else(|p| p.into_inner());
         *last = Some(std::time::Instant::now());
     }
-    f()
+    result
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -680,6 +889,27 @@ mod cross_process_pace {
         }
     }
 
+    impl PaceLock {
+        /// Stamp the pace file with the CURRENT time (nanos since the UNIX
+        /// epoch), overwriting the previous value. Called by
+        /// `run_with_cross_process_pace` AFTER the keychain op completes, while
+        /// the flock is STILL HELD, so the next process (which reads this stamp
+        /// under its own flock acquisition) spaces off when WE FINISHED the op
+        /// — a true daemon idle gap between one op's END and the next op's
+        /// START (v0.2.84 D8.3). The pre-fix code stamped op-START inside
+        /// `acquire_and_space`, so a slow op (≥ spacing) left ~0 gap.
+        fn record_completion_timestamp(&mut self) {
+            if let Ok(since_epoch) =
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            {
+                let _ = self._file.seek(SeekFrom::Start(0));
+                let _ = self._file.set_len(0);
+                let _ = write!(self._file, "{}", since_epoch.as_nanos());
+                let _ = self._file.flush();
+            }
+        }
+    }
+
     /// T-1 (v0.2.83), TEST/DEBUG ONLY: set true while a keychain test holds the
     /// production `keyring.pace` flock via `test_serialize::keychain_serialize_lock`.
     /// `acquire_and_space` then SKIPS re-acquiring the (non-reentrant) flock so a
@@ -771,20 +1001,17 @@ mod cross_process_pace {
                         }
                     }
                     // If now <= prev (clock skew / same instant), fall through:
-                    // we still write a fresh timestamp below, spacing best-effort.
+                    // the completion stamp written after the op (below) still
+                    // records a fresh timestamp, spacing best-effort.
                 }
             }
         }
-        // Write the new (post-sleep) timestamp so the NEXT process spaces off
-        // when WE started the op.
-        if let Ok(since_epoch) =
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        {
-            let _ = file.seek(SeekFrom::Start(0));
-            let _ = file.set_len(0);
-            let _ = write!(file, "{}", since_epoch.as_nanos());
-            let _ = file.flush();
-        }
+        // v0.2.84 (D8.3): we DELIBERATELY do NOT write a timestamp here. The
+        // pre-fix code stamped op-START at this point, which — for an op that
+        // itself took ≥ MIN_CALL_SPACING — left ~0 idle gap between one op's
+        // END and the next op's START. The stamp is now written by
+        // `run_with_cross_process_pace` AFTER the op completes (op-END), while
+        // this same flock is still held, via `PaceLock::record_completion_timestamp`.
         Some(PaceLock { _file: file, fd })
     }
 
@@ -796,8 +1023,19 @@ mod cross_process_pace {
     pub(super) fn run_with_cross_process_pace<T>(op: impl FnOnce() -> T) -> T {
         let spacing = super::current_spacing();
         // Hold the guard across `op`; drop (unlock) after.
-        let _guard = acquire_and_space(spacing);
-        op()
+        let mut guard = acquire_and_space(spacing);
+        let result = op();
+        // v0.2.84 (D8.3): stamp the pace file with the op's COMPLETION time
+        // WHILE the flock is still held, so the next process spaces off when we
+        // FINISHED (true daemon idle gap), not when we started. On the degraded
+        // path (`acquire_and_space` returned `None` — unwritable pace file or
+        // the T-1 reentrancy skip) there is no stamp to write; in-process
+        // pacing carries the gap (unchanged soft-fail behaviour).
+        if let Some(g) = guard.as_mut() {
+            g.record_completion_timestamp();
+        }
+        // `guard` drops here → flock(LOCK_UN), after the completion stamp.
+        result
     }
 
     /// T-1 (v0.2.83), TEST/DEBUG ONLY: RAII holder of the PRODUCTION
@@ -1293,7 +1531,12 @@ fn set_raw(
     note_entry_construction();
     #[cfg(any(test, debug_assertions))]
     if let Some(result) = for_tests::mock_set(scope, module_id, key, value) {
-        return result.map_err(KeychainError::Other);
+        result.map_err(KeychainError::Other)?;
+        // v0.2.84 (D8.2): a successful write bumps the generation so any live
+        // session memo entry for this (or any) key is invalidated — write-
+        // through honesty on the mock path too.
+        bump_secret_generation();
+        return Ok(());
     }
     // v0.2.76 (A4): own the (service, key, value) so the job closure is
     // 'static + Send, then run it on the bounded-timeout worker. The timeout
@@ -1315,6 +1558,9 @@ fn set_raw(
     })
     .map_err(|to| KeychainError::Other(format!("keyring set: {}", to)))?
     .map_err(KeychainError::Other)?;
+    // v0.2.84 (D8.2): successful real write — invalidate outstanding memo
+    // entries (write-through honesty). Reached only after both `?` above pass.
+    bump_secret_generation();
     Ok(())
 }
 
@@ -1362,39 +1608,66 @@ pub fn get_with_context(
     // Lock gate FIRST — a Background read against a locked store must not even
     // reach the keychain-access stage (mock or real). This ordering is what
     // T18's construction-counting seam pins: a locked Background call leaves
-    // the count at 0.
+    // the count at 0. The gate stays BEFORE the session memo (v0.2.84 D8.4):
+    // a locked store is an honest terminal state, never overridden by a cached
+    // value, so the resilience posture is byte-identical.
     if let Some(locked) = background_lock_gate(ctx) {
         return Err(locked);
     }
-    // Test/debug seam: past the lock gate we have committed to a keychain
-    // access (mock OR real Entry construction). Placed BEFORE the mock check so
-    // it fires on both the mock-proceed and real-proceed paths; T18 asserts it
-    // stays 0 for a locked Background call and increments once for a
+    // v0.2.84 (D8.2): per-request read-through memo. A HIT returns the cached
+    // outcome WITHOUT constructing an Entry or hitting the daemon — so a memo
+    // hit does NOT increment the entry-construction count (correct: no keychain
+    // access happened). Consulted AFTER the lock gate (posture unchanged) and
+    // only when a `SecretReadSession` is active on this thread; outside a
+    // session `session_memo_lookup` is always `None` → pre-v0.2.84 behaviour.
+    let service = scope.service_name(module_id);
+    if let Some(cached) = session_memo_lookup(&service, key) {
+        return Ok(cached);
+    }
+    // Test/debug seam: past the lock gate + memo miss we have committed to a
+    // keychain access (mock OR real Entry construction). Placed BEFORE the mock
+    // check so it fires on both the mock-proceed and real-proceed paths; T18
+    // asserts it stays 0 for a locked Background call and increments once for a
     // proceeding call.
     #[cfg(any(test, debug_assertions))]
     note_entry_construction();
     #[cfg(any(test, debug_assertions))]
     if let Some(result) = for_tests::mock_get(scope, module_id, key) {
-        return result.map_err(KeychainError::Other);
+        let outcome = result.map_err(KeychainError::Other)?;
+        // Cache the successful mock outcome (value or genuine miss) so the
+        // session memo path is exercised under the test mock exactly as it is
+        // against the real keychain.
+        session_memo_store(&service, key, &outcome);
+        return Ok(outcome);
     }
     // v0.2.76 (A4): own (service, key) → 'static + Send job → bounded-timeout
     // worker. keyring::Error is not Send-safe to carry across the channel
     // uniformly, so classify NoEntry INSIDE the job and return a plain
-    // Result<Option<String>, String>.
-    let service = scope.service_name(module_id);
-    let key = key.to_string();
-    run_keychain_with_timeout(move || {
-        with_cross_process_pace(|| {
-            // v0.2.72 (P9): build the Entry INSIDE the closure.
-            match retry_with_backoff(|| Entry::new(&service, &key)?.get_password()) {
-                Ok(v) => Ok(Some(v)),
-                Err(keyring::Error::NoEntry) => Ok(None),
-                Err(err) => Err(format!("keyring get: {}", err)),
-            }
+    // Result<Option<String>, String>. v0.2.84 (D8.2): the outer `service`
+    // String + `key` &str are retained for the post-read memo store, so the
+    // closure gets its OWN shadowed owned copies (spelling `Entry::new(&service,
+    // &key)` preserved verbatim for the P9 structural guard).
+    let outcome = {
+        let service = service.clone();
+        let key = key.to_string();
+        run_keychain_with_timeout(move || {
+            with_cross_process_pace(|| {
+                // v0.2.72 (P9): build the Entry INSIDE the closure.
+                match retry_with_backoff(|| Entry::new(&service, &key)?.get_password()) {
+                    Ok(v) => Ok(Some(v)),
+                    Err(keyring::Error::NoEntry) => Ok(None),
+                    Err(err) => Err(format!("keyring get: {}", err)),
+                }
+            })
         })
-    })
-    .map_err(|to| KeychainError::Other(format!("keyring get: {}", to)))?
-    .map_err(KeychainError::Other)
+        .map_err(|to| KeychainError::Other(format!("keyring get: {}", to)))?
+        .map_err(KeychainError::Other)?
+    };
+    // Memoize the SUCCESSFUL outcome only (errors already propagated via `?`, so
+    // they are never cached — a transient failure stays retryable and keeps
+    // flipping the hub's honest degraded flag on every occurrence).
+    session_memo_store(&service, key, &outcome);
+    Ok(outcome)
 }
 
 /// Presence check with an explicit [`CallContext`]. `Background` against a
@@ -1427,6 +1700,9 @@ pub fn delete_with_context(
     note_entry_construction();
     #[cfg(any(test, debug_assertions))]
     if for_tests::mock_delete(scope, module_id, key) {
+        // v0.2.84 (D8.2): a successful delete bumps the generation so any live
+        // session memo entry is invalidated (write-through honesty, mock path).
+        bump_secret_generation();
         return Ok(());
     }
     // v0.2.76 (A4): own (service, key) → 'static + Send job → bounded-timeout
@@ -1444,7 +1720,11 @@ pub fn delete_with_context(
         })
     })
     .map_err(|to| KeychainError::Other(format!("keyring delete: {}", to)))?
-    .map_err(KeychainError::Other)
+    .map_err(KeychainError::Other)?;
+    // v0.2.84 (D8.2): successful real delete — invalidate outstanding memo
+    // entries (write-through honesty). Reached only after both `?` above pass.
+    bump_secret_generation();
+    Ok(())
 }
 
 /// Read a secret (Interactive context — the back-compat default). Existing
@@ -3233,6 +3513,375 @@ mod tests {
         assert!(
             matches!(r, Some(true) | Some(false) | None),
             "probe returned an impossible value: {r:?}"
+        );
+    }
+
+    // ─── v0.2.84 (D8.3): pacing RELEASE-GAP regression pins ───────────────────
+    //
+    // The pre-fix code stamped the pace timestamp at op-START. An op that
+    // itself ran ≥ spacing (a slow daemon read) therefore left ~0 idle between
+    // one op's END and the next op's START — the sustained back-to-back daemon
+    // traffic the P7 SIGTRAP reproduced under. The fix stamps op-END, so the
+    // next op always spaces ≥ spacing from the previous op's COMPLETION.
+    //
+    // These pins FAIL pre-fix: pre-fix the measured gap is ~0.
+
+    /// REGRESSION PIN (cross-process): an injected op that sleeps > spacing
+    /// makes the NEXT op observe ≥ spacing of true idle measured from the FIRST
+    /// op's COMPLETION. Fails pre-fix (start-stamped ⇒ ~0 gap).
+    #[cfg(unix)]
+    #[test]
+    fn cross_process_pace_gap_measured_from_op_end_release_gap_d83() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _pace = TestPacePathGuard::new(dir.path().join("keyring.pace"));
+        let spacing = std::time::Duration::from_millis(60);
+        let _sp = TestSpacingGuard::new(spacing);
+
+        // op1 runs LONGER than spacing, then records the instant it FINISHED.
+        let mut op1_end: Option<std::time::Instant> = None;
+        with_cross_process_pace(|| {
+            std::thread::sleep(spacing * 2);
+            op1_end = Some(std::time::Instant::now());
+        });
+        let op1_end = op1_end.expect("op1 recorded its completion instant");
+
+        // op2 back-to-back records the instant its body STARTED. The pace layer
+        // must have made op2 wait ≥ spacing from op1's END before running it.
+        let mut op2_start: Option<std::time::Instant> = None;
+        with_cross_process_pace(|| {
+            op2_start = Some(std::time::Instant::now());
+        });
+        let op2_start = op2_start.expect("op2 recorded its start instant");
+
+        let gap = op2_start.saturating_duration_since(op1_end);
+        // Allow a small scheduler slack below the nominal spacing.
+        assert!(
+            gap >= spacing - std::time::Duration::from_millis(15),
+            "op2 must start ≥ ~spacing ({spacing:?}) after op1 END; \
+             gap was {gap:?} (pre-fix start-stamp regression = ~0)"
+        );
+    }
+
+    /// REGRESSION PIN (in-process `paced_call`): same release-gap semantics for
+    /// the per-process pacer. An op sleeping > spacing ⇒ the next `paced_call`
+    /// waits ≥ spacing measured from the first op's completion. Fails pre-fix.
+    #[test]
+    fn paced_call_gap_measured_from_op_end_release_gap_d83() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let spacing = std::time::Duration::from_millis(50);
+        let _sp = TestSpacingGuard::new(spacing);
+
+        // Establish a baseline op END far enough back that the FIRST op below
+        // pays no spacing (idle gap already exceeded).
+        paced_call(|| ());
+        std::thread::sleep(spacing * 2);
+
+        // op1 runs longer than spacing and records its completion instant.
+        let mut op1_end: Option<std::time::Instant> = None;
+        paced_call(|| {
+            std::thread::sleep(spacing * 2);
+            op1_end = Some(std::time::Instant::now());
+        });
+        let op1_end = op1_end.expect("op1 completion recorded");
+
+        // op2 back-to-back: its body must start ≥ spacing after op1's END.
+        let mut op2_start: Option<std::time::Instant> = None;
+        paced_call(|| {
+            op2_start = Some(std::time::Instant::now());
+        });
+        let op2_start = op2_start.expect("op2 start recorded");
+
+        let gap = op2_start.saturating_duration_since(op1_end);
+        assert!(
+            gap >= spacing - std::time::Duration::from_millis(12),
+            "in-process paced_call must space op2 ≥ ~spacing ({spacing:?}) from \
+             op1 END; gap was {gap:?} (pre-fix start-stamp regression = ~0)"
+        );
+    }
+
+    // ─── v0.2.84 (D8.2): SecretReadSession memo tests ─────────────────────────
+
+    /// Dedupe: the SAME (scope, module_id, key) requested twice inside one
+    /// session performs exactly ONE underlying keychain read (Entry
+    /// construction). The second read is served from the memo — proven by the
+    /// entry-construction counter staying flat across the second call.
+    #[test]
+    fn session_dedupes_repeated_reads_one_underlying_read() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _mock = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+        set(scope, "mod", "k1", "v1").unwrap();
+
+        let session = SecretReadSession::new();
+        // Counter baseline AFTER opening the session (the set above and any
+        // prior activity are excluded).
+        let base = ENTRY_CONSTRUCTION_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+
+        let first = get(scope, "mod", "k1").unwrap();
+        assert_eq!(first.as_deref(), Some("v1"));
+        let after_first = ENTRY_CONSTRUCTION_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            after_first - base,
+            1,
+            "first read in a session must perform exactly one underlying read"
+        );
+
+        let second = get(scope, "mod", "k1").unwrap();
+        assert_eq!(second.as_deref(), Some("v1"));
+        let after_second = ENTRY_CONSTRUCTION_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            after_second, after_first,
+            "second read of the same key in one session must be served from the \
+             memo (zero additional underlying reads)"
+        );
+        assert_eq!(SecretReadSession::memoized_len(), Some(1));
+        drop(session);
+    }
+
+    /// A genuine key-not-present MISS is also memoized: two reads of a missing
+    /// key perform one underlying read, and both return `Ok(None)`.
+    #[test]
+    fn session_memoizes_genuine_miss() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _mock = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+
+        let _session = SecretReadSession::new();
+        let base = ENTRY_CONSTRUCTION_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(get(scope, "mod", "absent").unwrap(), None);
+        assert_eq!(get(scope, "mod", "absent").unwrap(), None);
+        let delta = ENTRY_CONSTRUCTION_COUNT.load(std::sync::atomic::Ordering::SeqCst) - base;
+        assert_eq!(delta, 1, "a memoized miss reads the keychain exactly once");
+    }
+
+    /// Generation bump: a `set` DURING an active session invalidates the memo,
+    /// so the NEXT read of that key hits the keychain again and sees the new
+    /// value (write-through honesty).
+    #[test]
+    fn session_set_bumps_generation_and_invalidates_memo() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _mock = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+        set(scope, "mod", "k1", "v1").unwrap();
+
+        let _session = SecretReadSession::new();
+        assert_eq!(get(scope, "mod", "k1").unwrap().as_deref(), Some("v1"));
+
+        // Rotate the value mid-session — this must bump the generation and make
+        // the cached "v1" stale.
+        set(scope, "mod", "k1", "v2").unwrap();
+
+        let base = ENTRY_CONSTRUCTION_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        let after = get(scope, "mod", "k1").unwrap();
+        let delta = ENTRY_CONSTRUCTION_COUNT.load(std::sync::atomic::Ordering::SeqCst) - base;
+        assert_eq!(
+            after.as_deref(),
+            Some("v2"),
+            "post-write read must see the rotated value, not the stale memo"
+        );
+        assert_eq!(
+            delta, 1,
+            "the stale memo entry must force a fresh underlying read after a set"
+        );
+    }
+
+    /// A `delete` mid-session likewise bumps the generation; the next read
+    /// re-hits the keychain and now observes the miss.
+    #[test]
+    fn session_delete_bumps_generation_and_invalidates_memo() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _mock = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+        set(scope, "mod", "k1", "v1").unwrap();
+
+        let _session = SecretReadSession::new();
+        assert_eq!(get(scope, "mod", "k1").unwrap().as_deref(), Some("v1"));
+        delete(scope, "mod", "k1").unwrap();
+        assert_eq!(
+            get(scope, "mod", "k1").unwrap(),
+            None,
+            "after a delete the memo is invalidated and the read observes the miss"
+        );
+    }
+
+    /// Drop clears the session: after the guard drops, a repeated read of the
+    /// same key performs a FRESH underlying read (the memo did not persist).
+    /// Also proves a NEW session snapshots the CURRENT generation.
+    #[test]
+    fn session_drop_clears_memo() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _mock = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+        set(scope, "mod", "k1", "v1").unwrap();
+
+        {
+            let _session = SecretReadSession::new();
+            assert_eq!(get(scope, "mod", "k1").unwrap().as_deref(), Some("v1"));
+            assert_eq!(SecretReadSession::memoized_len(), Some(1));
+        } // session dropped here
+
+        // No active session → memo helpers report None and reads are un-memoized.
+        assert_eq!(SecretReadSession::memoized_len(), None);
+
+        let session2 = SecretReadSession::new();
+        let base = ENTRY_CONSTRUCTION_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(get(scope, "mod", "k1").unwrap().as_deref(), Some("v1"));
+        let delta = ENTRY_CONSTRUCTION_COUNT.load(std::sync::atomic::Ordering::SeqCst) - base;
+        assert_eq!(
+            delta, 1,
+            "a fresh session must re-read the keychain (the prior session's memo \
+             did not survive its Drop)"
+        );
+        drop(session2);
+    }
+
+    /// Outside any session, reads are NEVER memoized: two consecutive reads of
+    /// the same key each perform an underlying read (pre-v0.2.84 behaviour).
+    #[test]
+    fn no_session_means_no_memoization() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _mock = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+        set(scope, "mod", "k1", "v1").unwrap();
+        // No SecretReadSession in scope.
+        let base = ENTRY_CONSTRUCTION_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(get(scope, "mod", "k1").unwrap().as_deref(), Some("v1"));
+        assert_eq!(get(scope, "mod", "k1").unwrap().as_deref(), Some("v1"));
+        let delta = ENTRY_CONSTRUCTION_COUNT.load(std::sync::atomic::Ordering::SeqCst) - base;
+        assert_eq!(delta, 2, "without a session, each read hits the keychain");
+    }
+
+    /// Nesting: an inner session gets a fresh memo and restores the outer one on
+    /// drop — the outer memo is not corrupted.
+    #[test]
+    fn session_nesting_restores_outer() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _mock = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+        set(scope, "mod", "outer", "vo").unwrap();
+
+        let _outer = SecretReadSession::new();
+        assert_eq!(get(scope, "mod", "outer").unwrap().as_deref(), Some("vo"));
+        assert_eq!(SecretReadSession::memoized_len(), Some(1));
+        {
+            let _inner = SecretReadSession::new();
+            // Fresh memo for the inner scope.
+            assert_eq!(SecretReadSession::memoized_len(), Some(0));
+            assert_eq!(get(scope, "mod", "outer").unwrap().as_deref(), Some("vo"));
+            assert_eq!(SecretReadSession::memoized_len(), Some(1));
+        }
+        // Outer memo restored intact (still has its single entry).
+        assert_eq!(SecretReadSession::memoized_len(), Some(1));
+    }
+
+    /// A3 (non-root + per-project): the memo is keyed by the FULL
+    /// `(service, key)` tuple, so within one session two DIFFERENT per-project
+    /// scopes (distinct project ids, e.g. non-root projects) that share a key
+    /// NAME do NOT collide — each resolves to its own value with its own single
+    /// underlying read. Guards against a memo keyed on the bare key name (which
+    /// would bleed one project's secret into another).
+    #[test]
+    fn session_keys_on_full_scope_no_cross_project_collision() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _mock = for_tests::MockGuard::new();
+        // Two distinct NON-ROOT per-project scopes, same key name.
+        let scope_a = SecretScope::PerProject { project_id: "non-root-proj-a" };
+        let scope_b = SecretScope::PerProject { project_id: "non-root-proj-b" };
+        set(scope_a, "user", "TOKEN", "value-A").unwrap();
+        set(scope_b, "user", "TOKEN", "value-B").unwrap();
+
+        let _session = SecretReadSession::new();
+        // First reads: two distinct tuples → two underlying reads, correct values.
+        assert_eq!(get(scope_a, "user", "TOKEN").unwrap().as_deref(), Some("value-A"));
+        assert_eq!(get(scope_b, "user", "TOKEN").unwrap().as_deref(), Some("value-B"));
+        assert_eq!(
+            SecretReadSession::memoized_len(),
+            Some(2),
+            "distinct per-project scopes must occupy distinct memo slots"
+        );
+
+        // Repeat reads: served from memo, each still its OWN value (no bleed).
+        let base = ENTRY_CONSTRUCTION_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(get(scope_a, "user", "TOKEN").unwrap().as_deref(), Some("value-A"));
+        assert_eq!(get(scope_b, "user", "TOKEN").unwrap().as_deref(), Some("value-B"));
+        let delta = ENTRY_CONSTRUCTION_COUNT.load(std::sync::atomic::Ordering::SeqCst) - base;
+        assert_eq!(delta, 0, "both repeat reads must be memo hits (zero new reads)");
+    }
+
+    /// STRUCTURAL never-persist pin (D8.2 hard invariant): the session module
+    /// stores secret values ONLY inside the thread-local `SECRET_SESSION`
+    /// `SessionState` — never in a file, never in a value-bearing `static`. This
+    /// pin greps the SOURCE of this module so a future edit that persists the
+    /// memo (a file write, or a `static` value store) trips it. It complements
+    /// the behavioural Drop-clears test above with a source-shape guarantee.
+    #[test]
+    fn session_is_memory_only_no_persistence() {
+        let src = include_str!("secrets.rs");
+
+        // Analyse ONLY the session region between two source sentinels, so this
+        // test's own body (which necessarily names the forbidden tokens) is
+        // excluded from every scan. The region spans the `struct SessionState`
+        // declaration through the end-of-session marker; every session helper
+        // (memo lookup/store, the `SecretReadSession` RAII guard, the
+        // thread_local slot) lives inside it.
+        let start = src
+            .find("struct SessionState")
+            .expect("SessionState marker present");
+        let end = src
+            .find("// v0.2.72 (P9) rationale")
+            .expect("end-of-session-region marker present");
+        assert!(end > start, "session region markers must be ordered");
+        let session_region = &src[start..end];
+
+        // Guard 1: the session memo store must be a THREAD-LOCAL, not a plain
+        // cross-thread `static`. The only `SECRET_SESSION:` declaration in the
+        // region must sit INSIDE a `thread_local!` block (a plain module-level
+        // `static SECRET_SESSION: RefCell<…>` wouldn't even compile — RefCell is
+        // !Sync — but the source pin documents the intent explicitly). Needle
+        // assembled from SPLIT literals so this test's own body can't match the
+        // scan (mirrors the P9 guard idiom).
+        let tl_idx = session_region
+            .find("thread_local!")
+            .expect("the session memo must live in a thread_local! block");
+        let decl_needle = String::from("SECRET_SESSION") + ":";
+        let decl_idx = session_region
+            .find(decl_needle.as_str())
+            .expect("SECRET_SESSION slot must be declared in the region");
+        assert!(
+            tl_idx < decl_idx,
+            "SECRET_SESSION must be declared INSIDE the thread_local! block \
+             (a plain cross-thread `static` would outlive the request and cross \
+             threads — forbidden)"
+        );
+
+        // Guard 2: no file-write / filesystem API is used anywhere in the
+        // SESSION machinery. The pace file legitimately writes a TIMESTAMP (not
+        // a secret) but that lives OUTSIDE this region; the session helpers must
+        // touch no filesystem — a secret memo is MEMORY-ONLY.
+        for forbidden in [
+            "std::fs::",
+            "File::",
+            "OpenOptions",
+            "write!(",
+            "fs::write",
+            ".flush()",
+        ] {
+            assert!(
+                !session_region.contains(forbidden),
+                "session region must not perform filesystem I/O; found {forbidden:?} \
+                 — a secret memo must be MEMORY-ONLY (D8.2)"
+            );
+        }
+
+        // Guard 3: the generation counter exists (write-through invalidation is
+        // wired) and set/delete bump it. Split-literal needle so the assert text
+        // itself can't satisfy the whole-file scan.
+        let gen_static_needle = String::from("static ") + "SECRET_GENERATION";
+        assert!(
+            src.contains(gen_static_needle.as_str())
+                && src.contains("fn bump_secret_generation"),
+            "the write-through generation counter must exist and be bumped"
         );
     }
 }
