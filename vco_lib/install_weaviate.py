@@ -448,3 +448,418 @@ def _prune_stale_kg_rows(
             f"V0243-6: batch delete failed for {collection_name!r}: {exc}",
             data={"collection": collection_name, "error": str(exc)[:200]},
         )
+
+
+# ─── v0.2.84 (D5/P3): honest orphan-collection reference check ────────────────
+#
+# The keys whose values may point at a Development collection on any env
+# surface. DEVELOPMENT_COLLECTION is the direct pointer; KG_COLLECTION is the
+# sibling from which the paired Development name is derived by suffix-swap
+# (``<X>_KnowledgeGraph`` → ``<X>_Development``), so a KG surface that names the
+# candidate's own KG prefix is ALSO a reference (P2's repoint will converge the
+# dev pointer to match it).
+_DEV_REFERENCE_KEYS = ("DEVELOPMENT_COLLECTION", "KG_COLLECTION")
+
+
+def _dev_from_kg_name(kg_name: str) -> Optional[str]:
+    """Suffix-swap ``<X>_KnowledgeGraph`` → ``<X>_Development`` (the one dev
+    derivation rule; returns ``None`` for a non-``_KnowledgeGraph`` name)."""
+    suffix = "_KnowledgeGraph"
+    if kg_name.endswith(suffix):
+        return kg_name[: -len(suffix)] + "_Development"
+    return None
+
+
+def _managed_env_value(text: str, key: str) -> Optional[str]:
+    """Extract ``export KEY="value"`` (or ``KEY=value``) from the ``.claude/env``
+    managed block in ``text``; ``None`` when absent.
+
+    CRLF-safe (A3/A4): splits on universal newlines and ``.strip()``s each line
+    so a Windows ``\\r\\n``-terminated managed block parses identically to a
+    ``\\n`` one. Scoped to the managed region only (between the shared
+    BEGIN/END sentinels) so a user's own out-of-block export can never be read
+    as a VCO-managed value. Strips one matching pair of single/double quotes;
+    NO variable expansion. First match wins.
+
+    v0.2.84 NOTE: dedup candidate with ``vco_lib.project_init``'s managed-block
+    scan (:8615 ``_has_user_secret_shaped_line``) and
+    ``vco_lib.agent_secrets._parse_dotenv_value`` — the coordinator reconciles
+    these onto ONE shared home at merge/fix-pass time. Kept local here for the
+    ownership walls this cycle (project_init.py is WP-4's, config_projection.py
+    is WP-2's).
+    """
+    # Import the managed-block sentinels from the canonical home (read-only —
+    # no ownership conflict; the exact idiom project_init's scan uses).
+    try:
+        from vco_lib.config_projection import (
+            CLAUDE_ENV_MANAGED_BEGIN,
+            CLAUDE_ENV_MANAGED_END,
+        )
+    except Exception:  # noqa: BLE001 — partial install: parse the whole text
+        CLAUDE_ENV_MANAGED_BEGIN = None
+        CLAUDE_ENV_MANAGED_END = None
+
+    block = text
+    if CLAUDE_ENV_MANAGED_BEGIN and CLAUDE_ENV_MANAGED_END:
+        begin = text.find(CLAUDE_ENV_MANAGED_BEGIN)
+        end = text.find(CLAUDE_ENV_MANAGED_END)
+        if begin == -1 or end == -1 or end < begin:
+            return None  # no managed block → nothing VCO-managed to read
+        block = text[begin:end]
+
+    for line in block.splitlines():  # universal-newline split → CRLF-safe
+        s = line.strip()  # trailing \r stripped here too
+        if s.startswith("export "):
+            s = s[len("export "):].lstrip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        k, _, v = s.partition("=")
+        if k.strip() != key:
+            continue
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+            v = v[1:-1]
+        return v
+    return None
+
+
+def _settings_json_env_value(text: str, key: str) -> Optional[str]:
+    """Read ``env[key]`` from a ``.claude/settings.json`` document; ``None`` on
+    absence or any parse error (soft-fail)."""
+    import json as _json
+
+    try:
+        data = _json.loads(text)
+    except Exception:  # noqa: BLE001 — malformed settings.json → no reference
+        return None
+    if not isinstance(data, dict):
+        return None
+    env_block = data.get("env")
+    if not isinstance(env_block, dict):
+        return None
+    value = env_block.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def dev_collection_is_referenced(
+    candidate: str, folder: Path,
+) -> "tuple[bool, str]":
+    """v0.2.84 (D5/P3): is the Development collection ``candidate`` referenced
+    by ANY live configuration surface? Returns ``(referenced, surface)`` where
+    ``surface`` names WHERE the reference was found (empty when not referenced).
+
+    Consulted surfaces (first hit wins — the honest orphan detector must not
+    claim "no callers" while a surface literally names the collection):
+
+      (a) the root's ``<folder>/.claude/settings.json`` ``env`` block —
+          DEVELOPMENT_COLLECTION==candidate, OR KG_COLLECTION whose suffix-swap
+          sibling ==candidate (P2 will repoint the dev pointer to match).
+      (b) the root's ``<folder>/.claude/env`` managed block — same two keys,
+          CRLF-safe managed-block parse.
+      (c) the process env (``DEVELOPMENT_COLLECTION``/``KG_COLLECTION``) — the
+          existing pre-v0.2.84 check, kept and generalized to the sibling rule.
+      (d) launcher.db resolution when reachable — the orchestrator-root
+          project's DB-resolved DEVELOPMENT_COLLECTION (via the read-only
+          config_projection projection, the SAME rule the hub serves). This
+          catches the case where the on-disk env hasn't been repointed yet but
+          the binding already names the paired dev collection.
+
+    Soft-fail throughout: an unreadable file / unreachable DB / import error on
+    ONE surface never raises — it simply contributes no reference (the next
+    surface is still consulted). A ``candidate`` that is empty/whitespace is
+    treated as un-referenced (nothing to match).
+    """
+    candidate = (candidate or "").strip()
+    if not candidate:
+        return (False, "")
+    folder = Path(folder)
+
+    def _matches(dev_value: Optional[str], kg_value: Optional[str]) -> bool:
+        if dev_value and dev_value.strip() == candidate:
+            return True
+        if kg_value and _dev_from_kg_name(kg_value.strip()) == candidate:
+            return True
+        return False
+
+    # (a) settings.json env
+    settings_path = folder / ".claude" / "settings.json"
+    if settings_path.is_file():
+        try:
+            text = settings_path.read_text(encoding="utf-8")
+            if _matches(
+                _settings_json_env_value(text, "DEVELOPMENT_COLLECTION"),
+                _settings_json_env_value(text, "KG_COLLECTION"),
+            ):
+                return (True, ".claude/settings.json::env")
+        except Exception:  # noqa: BLE001 — soft-fail this surface only
+            pass
+
+    # (b) .claude/env managed block
+    env_path = folder / ".claude" / "env"
+    if env_path.is_file():
+        try:
+            text = env_path.read_text(encoding="utf-8")
+            if _matches(
+                _managed_env_value(text, "DEVELOPMENT_COLLECTION"),
+                _managed_env_value(text, "KG_COLLECTION"),
+            ):
+                return (True, ".claude/env managed block")
+        except Exception:  # noqa: BLE001 — soft-fail this surface only
+            pass
+
+    # (c) process env (the existing pre-v0.2.84 check, generalized to sibling).
+    import os as _os
+
+    if _matches(
+        _os.environ.get("DEVELOPMENT_COLLECTION"),
+        _os.environ.get("KG_COLLECTION"),
+    ):
+        return (True, "process env")
+
+    # (d) launcher.db resolution (read-only) when reachable. Resolve the
+    # orchestrator-root project's DB-projected DEVELOPMENT_COLLECTION/KG the
+    # hub would serve and compare. Best-effort: any import/DB error → skip.
+    try:
+        from vco_lib import config_projection as _cp
+
+        db_path = _cp._resolve_launcher_db_path()
+        if db_path and Path(db_path).is_file():
+            # Find the project whose folder is this orchestrator root.
+            # ``list_registered_projects`` yields ``{id, name, slug,
+            # folder_path, folder}`` dicts.
+            for proj in _cp.list_registered_projects(db_path=db_path):
+                if not isinstance(proj, dict):
+                    continue
+                pfolder = proj.get("folder_path") or proj.get("folder")
+                pid = proj.get("id")
+                if not pfolder or not pid:
+                    continue
+                try:
+                    same = Path(pfolder).resolve() == folder.resolve()
+                except Exception:  # noqa: BLE001
+                    same = str(pfolder) == str(folder)
+                if not same:
+                    continue
+                bundle = _cp.project_env_from_db(pid, db_path=db_path)
+                # ProjectEnvBundle is a TypedDict with the flat map under
+                # ``canonical_env`` (never an ``.env`` attribute).
+                env_map = None
+                if isinstance(bundle, dict):
+                    env_map = bundle.get("canonical_env")
+                if isinstance(env_map, dict) and _matches(
+                    env_map.get("DEVELOPMENT_COLLECTION"),
+                    env_map.get("KG_COLLECTION"),
+                ):
+                    return (True, "launcher.db resolution")
+                break  # matched the root project row; no need to scan further
+    except Exception:  # noqa: BLE001 — DB unreachable / partial → skip surface
+        pass
+
+    return (False, "")
+
+
+def paired_dev_sibling(candidate: str, folder: Path) -> Optional[str]:
+    """Resolve the CONFIGURED Development collection name (the sibling the docs
+    actually live in) for enriching the orphan deferral, or ``None`` when it is
+    the same as ``candidate`` / cannot be resolved.
+
+    Reads the same surfaces as :func:`dev_collection_is_referenced` in priority
+    order (settings.json env → .claude/env → process env → launcher.db),
+    preferring an explicit DEVELOPMENT_COLLECTION and falling back to the
+    KG-derived sibling. Returns the first configured dev name that DIFFERS from
+    ``candidate`` (the orphan) — that is the data-holding target worth naming.
+    Soft-fails to ``None``.
+    """
+    candidate = (candidate or "").strip()
+    folder = Path(folder)
+
+    def _pick(dev_value: Optional[str], kg_value: Optional[str]) -> Optional[str]:
+        if dev_value and dev_value.strip() and dev_value.strip() != candidate:
+            return dev_value.strip()
+        if kg_value:
+            derived = _dev_from_kg_name(kg_value.strip())
+            if derived and derived != candidate:
+                return derived
+        return None
+
+    # (a) settings.json env
+    settings_path = folder / ".claude" / "settings.json"
+    if settings_path.is_file():
+        try:
+            text = settings_path.read_text(encoding="utf-8")
+            got = _pick(
+                _settings_json_env_value(text, "DEVELOPMENT_COLLECTION"),
+                _settings_json_env_value(text, "KG_COLLECTION"),
+            )
+            if got:
+                return got
+        except Exception:  # noqa: BLE001
+            pass
+
+    # (b) .claude/env managed block
+    env_path = folder / ".claude" / "env"
+    if env_path.is_file():
+        try:
+            text = env_path.read_text(encoding="utf-8")
+            got = _pick(
+                _managed_env_value(text, "DEVELOPMENT_COLLECTION"),
+                _managed_env_value(text, "KG_COLLECTION"),
+            )
+            if got:
+                return got
+        except Exception:  # noqa: BLE001
+            pass
+
+    # (c) process env
+    import os as _os
+
+    got = _pick(
+        _os.environ.get("DEVELOPMENT_COLLECTION"),
+        _os.environ.get("KG_COLLECTION"),
+    )
+    if got:
+        return got
+
+    # (d) launcher.db resolution
+    try:
+        from vco_lib import config_projection as _cp
+
+        db_path = _cp._resolve_launcher_db_path()
+        if db_path and Path(db_path).is_file():
+            for proj in _cp.list_registered_projects(db_path=db_path):
+                if not isinstance(proj, dict):
+                    continue
+                pfolder = proj.get("folder_path") or proj.get("folder")
+                pid = proj.get("id")
+                if not pfolder or not pid:
+                    continue
+                try:
+                    same = Path(pfolder).resolve() == folder.resolve()
+                except Exception:  # noqa: BLE001
+                    same = str(pfolder) == str(folder)
+                if not same:
+                    continue
+                bundle = _cp.project_env_from_db(pid, db_path=db_path)
+                env_map = bundle.get("canonical_env") if isinstance(bundle, dict) else None
+                if isinstance(env_map, dict):
+                    got = _pick(
+                        env_map.get("DEVELOPMENT_COLLECTION"),
+                        env_map.get("KG_COLLECTION"),
+                    )
+                    if got:
+                        return got
+                break
+    except Exception:  # noqa: BLE001
+        pass
+
+    return None
+
+
+def build_orphan_dev_deferral(
+    candidate: str,
+    folder: Path,
+    weaviate_url: str,
+    class_map: dict,
+    count_fn: Callable[[str, str], "Optional[int]"],
+    *,
+    log_event: Optional[Callable] = None,
+):
+    """v0.2.84 (D5/P3): decide whether the orphan-Development-collection
+    deferral should be emitted, and build it. Returns a ``DeferralEntry`` when
+    ``candidate`` is present in ``class_map``, UNreferenced by any live config
+    surface, and holds 0 rows; ``None`` otherwise (present-but-referenced,
+    non-empty, absent, or undeterminable row count).
+
+    This is the whole (a) branch of install.py's
+    ``_emit_orchestrator_root_schema_deferrals`` (the install.py ratchet keeps
+    real logic in vco_lib). ``count_fn(weaviate_url, class_name) -> Optional[int]``
+    is install.py's ``_count_weaviate_class_objects`` (``None`` = unknown, never
+    treated as 0). ``log_event`` is the optional install-time logger.
+
+    Honest states:
+      * present + referenced ⇒ log "referenced by <surface> — not an orphan"
+        and return None (P2's repoint will converge the pointer).
+      * present + unreferenced + 0 rows ⇒ build + return the entry, enriched
+        with the binding-paired sibling collection when it exists and holds
+        rows (the real target the docs live in).
+      * present + unreferenced + non-zero/unknown rows ⇒ return None (not empty
+        / can't confirm empty — never a destructive drop we can't justify).
+
+    Conservative default: an unexpected error in the reference check is treated
+    as REFERENCED (returns None) so a destructive-drop deferral is never emitted
+    on a check we could not positively complete.
+    """
+    def _log(step: str, phase: str, detail: str = "") -> None:
+        if log_event is not None:
+            try:
+                log_event(step, phase, detail)
+            except TypeError:  # logger with a data= kwarg
+                log_event(step, phase, detail, data=None)
+
+    candidate = (candidate or "").strip()
+    if not candidate or candidate not in class_map:
+        return None
+
+    try:
+        referenced, ref_surface = dev_collection_is_referenced(candidate, folder)
+    except Exception as exc:  # noqa: BLE001 — reference check must never wedge
+        referenced, ref_surface = (True, f"check-error ({exc})")
+    if referenced:
+        _log(
+            "7e/10", "info",
+            f"V0243-13(a): {candidate!r} is referenced by {ref_surface} — "
+            f"NOT an orphan (P2 repoint will converge it); no deferral emitted",
+        )
+        return None
+
+    row_count = count_fn(weaviate_url, candidate)
+    if row_count is None or row_count != 0:
+        return None
+
+    # Enrichment: name the binding-paired sibling when it exists and holds rows.
+    sibling_note = ""
+    try:
+        sibling = paired_dev_sibling(candidate, folder)
+    except Exception:  # noqa: BLE001
+        sibling = None
+    if sibling and sibling in class_map:
+        sib_rows = count_fn(weaviate_url, sibling)
+        if sib_rows is not None and sib_rows > 0:
+            sibling_note = (
+                f"  The binding-paired Development collection `{sibling}` is "
+                f"the configured target and holds {sib_rows} row(s)."
+            )
+
+    from vco_lib.deferral_report import DeferralEntry
+
+    _log(
+        "7e/10", "info",
+        f"V0243-13(a): orphan {candidate!r} deferral emitted (0 rows)",
+    )
+    return DeferralEntry(
+        condition_id="orphan_orchestrator_development_collection",
+        title=(
+            f"Orphan Weaviate collection `{candidate}` has 0 rows and no callers"
+        ),
+        detected=(
+            f"The Weaviate collection `{candidate}` exists at {weaviate_url} "
+            f"with 0 stored objects.  It was created by older install.py "
+            f"versions and is no longer populated (all docs/ sync now targets "
+            f"per-project Development collections).  No live config surface "
+            f"(settings.json env, .claude/env, process env, launcher.db) "
+            f"references it.  Dropping it is safe.{sibling_note}"
+        ),
+        why_deferred=(
+            "DROP is a destructive Weaviate operation even when the collection "
+            "is empty — it cannot be undone without a full re-seed.  User "
+            "consent required."
+        ),
+        command_to_apply=(
+            f"# Delete the orphan collection via the Weaviate REST API:\n"
+            f"curl -X DELETE {weaviate_url}/v1/schema/{candidate}\n"
+            f"# Or open the Weaviate console at {weaviate_url} and delete the "
+            f"class from the Schema tab."
+        ),
+        severity="info",
+        kg_node_refs=[],
+    )

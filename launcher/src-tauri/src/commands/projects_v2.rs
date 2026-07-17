@@ -951,6 +951,16 @@ pub(crate) async fn apply_post_bundle_steps(
              install.py's revision-gated resync owns root analysis)",
             project_id
         );
+        // v0.2.84 (D4/P1): a launcher-driven "Update all" heals a root that
+        // never runs install.py --update. The autobuild (and its pre-build
+        // identity sweep) is skipped above, so fire-and-forget the python
+        // identity SWEEP CLI for the root prefix here — detached + soft-fail,
+        // same `--sweep` engine install.py's shim uses. This closes the P1 gap
+        // for the launcher update path without resurrecting the dual-writer
+        // (the sweep only migrates rows onto the canonical identity; it never
+        // spawns the analyzer). Boot-resume stays sweep-free (boot must be
+        // fast — see codegraph.rs::resume_pending_builds root-skip comment).
+        spawn_root_identity_sweep(app, db, project_id, project_name);
     }
     let now = chrono::Utc::now().timestamp_millis();
     let prune_stale = !is_initial_create;
@@ -1870,6 +1880,122 @@ async fn build_migrate_command(
     }
 
     Ok(cmd)
+}
+
+/// v0.2.84 (D4/P1): fire-and-forget the python code-graph identity SWEEP for
+/// the orchestrator ROOT on the launcher UPDATE path. The root autobuild (and
+/// its in-build pre-sweep) is skipped in `apply_post_bundle_steps`; without
+/// this, a launcher-driven "Update all" would never heal a root whose rows
+/// carry a stale `project` identity (the P1 gap for the launcher path, mirror
+/// of install.py's `_trigger_codegraph_identity_sweep`).
+///
+/// Detached + soft-fail throughout (mirrors `spawn_metadata_backfill`): a
+/// missing python / unresolvable root / spawn error is logged and swallowed —
+/// this is best-effort healing, never a gate. The sweep engine only migrates
+/// rows onto the canonical identity; it does NOT spawn the analyzer, so there
+/// is no dual-writer risk. The canonical prefix comes from the code-graph
+/// binding (SSOT), falling back to `resolve_codegraph_identity` when no binding
+/// row exists yet.
+fn spawn_root_identity_sweep(
+    app: &tauri::AppHandle,
+    db: &Db,
+    project_id: &str,
+    project_name: &str,
+) {
+    // Canonical identity == the code-graph collection prefix the analyzer
+    // stamps (`project == <prefix>`). Binding row first (SSOT), then the shared
+    // resolver's derivation.
+    let canonical = db
+        .get_project_codegraph_binding(project_id)
+        .ok()
+        .flatten()
+        .map(|b| b.collection_prefix.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| codegraph::resolve_codegraph_identity(db, project_id, project_name));
+    if canonical.is_empty() {
+        return; // no resolvable identity → nothing to sweep
+    }
+
+    let orch_root = match find_local_repo_root() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "[vct] warning: root identity sweep skipped for {} — \
+                 orchestrator root not found: {}",
+                project_id, e
+            );
+            return;
+        }
+    };
+    let py_cmd: PathBuf = match resolve_python_for_vco_lib_local() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[vct] warning: root identity sweep skipped for {} — \
+                 no vco_lib-capable python resolved",
+                project_id
+            );
+            return;
+        }
+    };
+
+    let mut cmd = tokio::process::Command::new(&py_cmd).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.codegraph_vector_copy")
+        .arg("--migrate-identity")
+        .arg("--prefix")
+        .arg(&canonical)
+        .arg("--to")
+        .arg(&canonical)
+        .arg("--sweep")
+        .current_dir(&orch_root)
+        // Mirror configure_vco_lib_command: export VCT_INSTALL_ROOT so the
+        // vco_lib sys.path bootstrap resolves even when CWD is not read.
+        .env("VCT_INSTALL_ROOT", &orch_root)
+        .stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    let project_id = project_id.to_string();
+    // Keep the app handle in scope for parity with the launcher's other
+    // detached spawns (and future emit needs); the sweep itself is fire-and-
+    // forget — nothing awaits its completion.
+    let _ = app;
+    tauri::async_runtime::spawn(async move {
+        let mut cmd = cmd;
+        match cmd.output().await {
+            Ok(out) if out.status.success() => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if let Some(line) =
+                    stdout.lines().rev().find(|l| l.contains("IDENTITY_MIGRATION"))
+                {
+                    eprintln!(
+                        "[vct] code-graph root identity sweep ({}): {}",
+                        project_id,
+                        line.trim()
+                    );
+                }
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                eprintln!(
+                    "[vct] warning: root identity sweep for {} exited {}: {}",
+                    project_id,
+                    out.status.code().unwrap_or(-1),
+                    stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("no stderr")
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[vct] warning: root identity sweep for {} failed to spawn: {}",
+                    project_id, e
+                );
+            }
+        }
+    });
 }
 
 pub(crate) async fn run_migrate_dry_run(
