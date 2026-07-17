@@ -8897,6 +8897,16 @@ def _has_user_secret_shaped_line(path: Path) -> bool:
     # config-projection writer emits). Captures KEY and the double-quoted value
     # so we can shape-check the key and test the value for non-emptiness. We do
     # NOT retain / log the value — only ``bool(value)`` participates.
+    #
+    # NOTE (v0.2.84 fix-pass): this scan deliberately does NOT route through the
+    # shared `vco_lib.envfile` line parser (which the sibling readers
+    # `install_weaviate._managed_env_value` + `agent_secrets._parse_dotenv_value`
+    # now share). Its parse is a DIFFERENT contract: a start-anchored regex that
+    # (a) REQUIRES the literal `export` keyword, (b) matches ONLY a double-quoted
+    # value, and (c) tolerates trailing content after the closing quote. The
+    # generic line parser widens (a)/(b) and narrows (c), so consolidating here
+    # would change edge behavior for hand-edited managed blocks. The shared home
+    # covers the two byte-identical readers; this stays a distinct policy.
     _managed_export_re = re.compile(
         r'^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([^"]*)"',
         re.MULTILINE,
