@@ -825,6 +825,142 @@ def migrate_project_identity(
     return summary
 
 
+def _distinct_stale_identities(client, prefix: str, canonical: str) -> List[str]:
+    """Discover every ``project`` value ≠ ``canonical`` present in the 5
+    ``<prefix>_<base>`` code-graph classes (v0.2.84 D4 — the identity sweep).
+
+    SAFE BY CONSTRUCTION: code-graph classes are per-project-prefix, so any
+    ``project`` value inside the prefix family that is not the canonical
+    identity is a STALE identity (an old display name, a pre-rename identity).
+    Cross-project code-graph access is fan-out to OTHER prefixes, never shared
+    classes, so there is no legitimate foreign identity inside this prefix's
+    own five classes.
+
+    Enumeration is a single ``project``-only iterator scan per class (the
+    cheapest read that surfaces distinct values on EVERY weaviate-client
+    version — ``aggregate.over_all(group_by=...)`` shapes differ across
+    versions and are not relied on; the callers gate this scan behind a cheap
+    filtered aggregate probe so it is paid only when there IS stale work).
+    Per-collection soft-fail: an unreadable/absent class contributes nothing
+    (never a guess). Order is deterministic (sorted) so the migration order is
+    stable across runs.
+    """
+    found: set = set()
+    if not prefix or not canonical:
+        return []
+    for base in _CODEGRAPH_BASES:
+        coll_name = f"{prefix}_{base}"
+        try:
+            if (
+                hasattr(client.collections, "exists")
+                and not client.collections.exists(coll_name)
+            ):
+                continue
+            coll = client.collections.get(coll_name)
+        except Exception as exc:  # noqa: BLE001 — per-collection soft-fail
+            logger.warning("identity sweep: cannot open %s: %s", coll_name, exc)
+            continue
+        try:
+            for obj in coll.iterator(return_properties=["project"]):
+                props = getattr(obj, "properties", None) or {}
+                value = props.get("project")
+                if isinstance(value, str) and value and value != canonical:
+                    found.add(value)
+        except Exception as exc:  # noqa: BLE001 — per-collection soft-fail
+            logger.warning(
+                "identity sweep: enumerate %s failed: %s", coll_name, exc
+            )
+            continue
+    return sorted(found)
+
+
+def sweep_stale_identities(
+    prefix: str,
+    canonical: str,
+    *,
+    client=None,
+    dry_run: bool = False,
+) -> List[MigrationSummary]:
+    """Migrate EVERY stale ``project`` identity under ``prefix`` onto
+    ``canonical`` (v0.2.84 D4). Returns one :class:`MigrationSummary` per
+    distinct stale identity found (empty list when the prefix is already
+    single-identity — the cheap converged path).
+
+    This generalizes :func:`migrate_project_identity` (which migrates ONE
+    known ``old → new`` pair) to the case where the OLD identities are not
+    known a priori — the root project that was never renamed through the
+    launcher, and any non-root project whose display name was changed BEFORE
+    the v0.2.82 pre-build migration existed (R1). It discovers the stale
+    identities via :func:`_distinct_stale_identities`, then runs the SAME
+    per-pair migration engine for each — same vectors-verbatim copy, same
+    dedup/collision rule, same per-row soft-fail, same
+    ``IDENTITY_MIGRATION`` summary line per identity.
+
+    ``client`` may be supplied by a caller that already owns a live
+    connection (the CLI builds + closes its own). When ``client is None`` a
+    connection is built via :func:`_build_client`; on a Weaviate-unavailable
+    failure an empty list is returned (soft no-op — never a guess).
+
+    ``dry_run=True`` classifies without writing/deleting (each summary
+    describes what WOULD move) — the probe path the owning flows use to decide
+    whether a real sweep is owed.
+    """
+    if not prefix or not canonical:
+        logger.warning(
+            "identity sweep: missing prefix/canonical — no-op (prefix=%r "
+            "canonical=%r)", prefix, canonical,
+        )
+        return []
+
+    own_client = False
+    if client is None:
+        client = _build_client()
+        own_client = True
+    if client is None:
+        # Weaviate unavailable — soft no-op (the CLI emits a summary line).
+        return []
+
+    summaries: List[MigrationSummary] = []
+    try:
+        stale = _distinct_stale_identities(client, prefix, canonical)
+        if not stale:
+            logger.info(
+                "identity sweep: %s already single-identity (%r) — nothing to "
+                "migrate%s", prefix, canonical, " (dry-run)" if dry_run else "",
+            )
+            return []
+        logger.info(
+            "identity sweep: %s — %d stale identit%s to migrate onto %r: %s%s",
+            prefix, len(stale), "y" if len(stale) == 1 else "ies", canonical,
+            ", ".join(repr(s) for s in stale),
+            " (dry-run)" if dry_run else "",
+        )
+        for old_identity in stale:
+            try:
+                summary = migrate_project_identity(
+                    client, prefix, old_identity, canonical, dry_run=dry_run,
+                )
+            except Exception as exc:  # noqa: BLE001 — one identity never aborts the sweep
+                logger.warning(
+                    "identity sweep: migration of %r → %r failed: %s",
+                    old_identity, canonical, exc,
+                )
+                # Record a failure-signal summary so the sweep can never
+                # report all-zero success over an identity it could not migrate.
+                failed = MigrationSummary()
+                failed.failures += 1
+                summaries.append(failed)
+                continue
+            summaries.append(summary)
+    finally:
+        if own_client:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001
+                pass
+    return summaries
+
+
 @dataclass
 class _RowPlan:
     """A pass-1 plan for one reconstructable row: everything pass 2 needs to
@@ -1100,13 +1236,29 @@ def _cli(argv: Optional[List[str]] = None) -> int:
         "--dry-run", action="store_true",
         help="Classify without writing/deleting (report what WOULD happen).",
     )
+    parser.add_argument(
+        "--sweep", action="store_true",
+        help=(
+            "Sweep mode (v0.2.84): migrate EVERY stale project identity under "
+            "--prefix onto --to (the canonical identity). Mutually exclusive "
+            "with --from (which pins ONE old identity)."
+        ),
+    )
     parser.add_argument("--weaviate-url", default=None)
     parser.add_argument("--grpc-port", type=int, default=None)
     args = parser.parse_args(argv)
 
     if not args.migrate_identity:
         parser.error("nothing to do — pass --migrate-identity")
-    if not (args.prefix and args.from_identity and args.to_identity):
+    # v0.2.84 (D4): --sweep discovers the OLD identities itself (they are not
+    # known a priori for a root that was never renamed through the launcher /
+    # a pre-migration rename), so it takes --prefix + --to but NOT --from.
+    if args.sweep:
+        if args.from_identity:
+            parser.error("--sweep is mutually exclusive with --from")
+        if not (args.prefix and args.to_identity):
+            parser.error("--migrate-identity --sweep requires --prefix and --to")
+    elif not (args.prefix and args.from_identity and args.to_identity):
         parser.error("--migrate-identity requires --prefix, --from and --to")
 
     logging.basicConfig(
@@ -1120,6 +1272,21 @@ def _cli(argv: Optional[List[str]] = None) -> int:
         print(MigrationSummary().summary_line(), flush=True)
         return 1
     try:
+        if args.sweep:
+            # One IDENTITY_MIGRATION line per discovered stale identity, plus a
+            # final aggregate line the launcher parser keys on (last occurrence).
+            summaries = sweep_stale_identities(
+                args.prefix, args.to_identity,
+                client=client, dry_run=args.dry_run,
+            )
+            for summary in summaries:
+                print(summary.summary_line(), flush=True)
+            aggregate = MigrationSummary()
+            for summary in summaries:
+                for k in ("moved", "deduped", "left", "failures"):
+                    setattr(aggregate, k, getattr(aggregate, k) + getattr(summary, k))
+            print(aggregate.summary_line(), flush=True)
+            return 0
         summary = migrate_project_identity(
             client, args.prefix, args.from_identity, args.to_identity,
             dry_run=args.dry_run,

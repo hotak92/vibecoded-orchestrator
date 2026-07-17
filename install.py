@@ -6418,7 +6418,7 @@ def main() -> int:
         # it fires only when work is actually owed, and a POSITIVE zero
         # resolves the pending resync deferral instead of spawning.
         if _seed_succeeded and getattr(args, "update", False):
-            _trigger_codegraph_embed_resync(_deferral_report)
+            _trigger_codegraph_maintenance(_deferral_report)
 
         # PR-34 (v0.2.12, Group M): detect the pre-rename shared-KG class
         # left over from a pre-v0.2.12 install. Emit a deferral pointing
@@ -16246,6 +16246,18 @@ def _run_schema_migration_scripts(deferral_report: "DeferralReport") -> None:
     _emit_lowercase_codegraph_cleanup_deferrals(deferral_report)
 
 
+def _trigger_codegraph_maintenance(deferral_report: "DeferralReport") -> None:
+    """v0.2.84 (D4/P1): ordered code-graph maintenance run on ``--update`` —
+    FIRST heal any stale ``project`` identity (unconditional; NOT gated by the
+    R-6 owed-probe, since identity-stale rows can be embed-revision current so
+    the owed-probe reports "not owed" while the dual identity persists; root is
+    the ONE project no autobuild path migrates), THEN the revision-gated embed
+    resync. One call site keeps main()'s span flat. Both steps soft-fail.
+    """
+    _trigger_codegraph_identity_sweep(deferral_report)
+    _trigger_codegraph_embed_resync(deferral_report)
+
+
 def _trigger_codegraph_embed_resync(deferral_report: "DeferralReport") -> None:
     """v0.2.72 (P7) thin shim: trigger the revision-gated code-graph resync.
 
@@ -16342,6 +16354,32 @@ def _trigger_codegraph_embed_resync(deferral_report: "DeferralReport") -> None:
             "codegraph_resync", "warn",
             f"resync skipped for {project_name}: {result.message}",
         )
+
+
+def _trigger_codegraph_identity_sweep(deferral_report: "DeferralReport") -> None:
+    """v0.2.84 (D4/P1) thin shim: delegate the root identity sweep to
+    ``vco_lib.codegraph_resync.identity_sweep_if_stale`` (install.py ratchet).
+    Soft-fail: any error is logged, never crashes the update.
+    """
+    del deferral_report  # audit recorded inside the helper; kept for parity
+    try:
+        from vco_lib.codegraph_resync import identity_sweep_if_stale
+        project_name = _derive_orchestrator_project_name()
+        moved = identity_sweep_if_stale(PROJECT_ROOT, project_name)
+    except Exception as exc:  # noqa: BLE001 — never crash the update
+        _log_install_event(
+            "codegraph_identity_sweep", "warn",
+            f"codegraph identity sweep raised: {exc}",
+        )
+        return
+    if moved > 0:
+        print(f"  → code-graph identity sweep: migrated {moved} row(s) onto the "
+              f"canonical identity for {project_name}")
+    _log_install_event(
+        "codegraph_identity_sweep", "ok",
+        (f"identity sweep migrated {moved} row(s) for {project_name}"
+         if moved > 0 else f"no stale identity to sweep for {project_name}"),
+    )
 
 
 def _run_additive_temporal_props_migration(
@@ -16883,57 +16921,25 @@ def _emit_orchestrator_root_schema_deferrals(
     }
 
     # ── (a) Orphan VibeCodedOrchestrator_Development ──────────────────────
-    # v0.2.46 post-adversarial: gate the "orphan" claim on the collection
-    # NOT being the current project's canonical Development collection.
-    # On an orchestrator-clone install (.claude/env sets
-    # DEVELOPMENT_COLLECTION=VibeCodedOrchestrator_Development) this IS
-    # the canonical dev collection — install.py creates it via the dev-
-    # collection bootstrap, then the per-project Development hooks
-    # populate it. Pre-fix, the install would create the collection,
-    # then this detector would re-emit the orphan deferral every run,
-    # causing an apply-deferred infinite loop that blocked the
-    # no-deferred-fixes rule at tag time.
-    orphan_dev = "VibeCodedOrchestrator_Development"
-    _current_dev_collection = os.environ.get("DEVELOPMENT_COLLECTION", "")
-    if orphan_dev in class_map and orphan_dev != _current_dev_collection:
-        # Only emit if the collection appears to have 0 or very few rows.
-        row_count = _count_weaviate_class_objects(weaviate_url, orphan_dev)
-        if row_count is not None and row_count == 0:
-            deferral_report.add_entry(
-                DeferralEntry(
-                    condition_id="orphan_orchestrator_development_collection",
-                    title=(
-                        f"Orphan Weaviate collection `{orphan_dev}` "
-                        f"has 0 rows and no callers"
-                    ),
-                    detected=(
-                        f"The Weaviate collection `{orphan_dev}` exists at "
-                        f"{weaviate_url} with 0 stored objects.  It was "
-                        f"created by older install.py versions and is no "
-                        f"longer populated (all docs/ sync now targets "
-                        f"per-project Development collections).  Dropping "
-                        f"it is safe."
-                    ),
-                    why_deferred=(
-                        "DROP is a destructive Weaviate operation even when "
-                        "the collection is empty — it cannot be undone without "
-                        "a full re-seed.  User consent required."
-                    ),
-                    command_to_apply=(
-                        f"# Delete the orphan collection via the Weaviate REST API:\n"
-                        f"curl -X DELETE "
-                        f"{weaviate_url}/v1/schema/{orphan_dev}\n"
-                        f"# Or open the Weaviate console at {weaviate_url} "
-                        f"and delete the class from the Schema tab."
-                    ),
-                    severity="info",
-                    kg_node_refs=[],
-                )
-            )
-            _log_install_event(
-                "7e/10", "info",
-                f"V0243-13(a): orphan {orphan_dev!r} deferral emitted (0 rows)",
-            )
+    # v0.2.84 (D5/P3): the WHOLE emit decision — reference check across ALL
+    # live config surfaces (settings.json env, .claude/env managed block
+    # CRLF-safe, process env, launcher.db resolution), 0-row gate, and
+    # data-holding-sibling enrichment — is delegated to the helper module
+    # (install.py ratchet). It returns a ready DeferralEntry only when the
+    # collection is present, UNreferenced, and empty; None otherwise. This
+    # fixes the dogfood incident where P2's freshly-written settings.json
+    # LITERALLY referenced the collection while this detector still called it
+    # "no callers, safe to drop".
+    _orphan_entry = _install_weaviate.build_orphan_dev_deferral(
+        "VibeCodedOrchestrator_Development",
+        PROJECT_ROOT,
+        weaviate_url,
+        class_map,
+        _count_weaviate_class_objects,
+        log_event=_log_install_event,
+    )
+    if _orphan_entry is not None:
+        deferral_report.add_entry(_orphan_entry)
 
     # ── (b) linksTo property drift ─────────────────────────────────────────
     shared_kg = os.environ.get("SHARED_KG_COLLECTION", "") or ""

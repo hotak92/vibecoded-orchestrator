@@ -896,6 +896,15 @@ pub fn resume_pending_builds(
             false,
         );
         if is_root {
+            // v0.2.84 (D4/P1): this boot-resume skip stays SWEEP-FREE by
+            // design. Boot must stay fast — the identity sweep is owned by the
+            // UPDATE flows (install.py --update via
+            // `_trigger_codegraph_identity_sweep`, and the launcher update-path
+            // root-skip's fire-and-forget in projects_v2.rs), NOT by boot. A
+            // stale root identity is healed at the next update, not on every
+            // launcher start. (Non-root boot-resume respawns run the normal
+            // `spawn_initial_build` → `migrate_stale_identities_for_build`
+            // sweep as part of their build; only the root skip is sweep-free.)
             eprintln!(
                 "[vct] code-graph boot-resume: skipping + clearing PENDING build \
                  for orchestrator-root project {} ({}). The root's code graph is \
@@ -1134,89 +1143,19 @@ async fn run_build_task(
         resolve_codegraph_identity(&db, &project_id, &project_name)
     };
 
-    // v0.2.82 (WP-3 G3 task 2): pre-build identity migration. When the display
-    // name differs from the canonical identity, rows may already exist under
-    // the OLD `project` property (the display name) from earlier launcher runs.
-    // Migrate them into the canonical identity BEFORE this build so the build's
-    // `--prune-stale` doesn't reap the old-identity rows (and so we don't keep
-    // two writers). Cheap gate: skip entirely when the names already match
-    // (the common case pays one string compare). Soft-fail: a migration error
-    // is logged and the build PROCEEDS under the canonical identity — never
-    // abort, never fall back to the old identity (that would mint fresh dupes).
-    if project_name.trim() != canonical_identity {
-        // Dry-run probe first (count-only) so we skip the real migration when
-        // no old-identity rows exist. Per the standing rule: NO global timeout.
-        // The db handle (dropped before the analyzer spawn to avoid holding the
-        // lock across the subprocess) resolves the interpreter + orchestrator
-        // root inside `configure_vco_lib_command`.
-        let db = app.state::<Db>();
-        match run_wp2_identity_migration(
-            &db,
-            &canonical_identity,
-            project_name.trim(),
-            &canonical_identity,
-            true, // dry_run: probe
-        )
-        .await
-        {
-            Ok(probe) if probe.moved + probe.deduped + probe.left > 0 => {
-                // Old-identity rows exist → run the real migration.
-                match run_wp2_identity_migration(
-                    &db,
-                    &canonical_identity,
-                    project_name.trim(),
-                    &canonical_identity,
-                    false,
-                )
-                .await
-                {
-                    Ok(s) => {
-                        let detail = format!(
-                            "identity migration '{}' → '{}': moved={} deduped={} left={} failures={}",
-                            project_name.trim(),
-                            canonical_identity,
-                            s.moved,
-                            s.deduped,
-                            s.left,
-                            s.failures,
-                        );
-                        eprintln!("[vct] code-graph {}", detail);
-                        emit_build(
-                            &app,
-                            &project_id,
-                            build_status::RUNNING,
-                            0,
-                            Some("migrate-identity"),
-                            None,
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[vct] warning: code-graph identity migration '{}' → '{}' failed: {} \
-                             — proceeding with the build under the canonical identity \
-                             (old-identity rows, if any, will be pruned when their files \
-                             next change, not silently duplicated).",
-                            project_name.trim(),
-                            canonical_identity,
-                            e
-                        );
-                    }
-                }
-            }
-            Ok(_) => {
-                // No old-identity rows — nothing to migrate.
-            }
-            Err(e) => {
-                eprintln!(
-                    "[vct] warning: code-graph identity migration probe for '{}' → '{}' \
-                     failed: {} — proceeding with the build under the canonical identity.",
-                    project_name.trim(),
-                    canonical_identity,
-                    e
-                );
-            }
-        }
-    }
+    // v0.2.82 (WP-3 G3 task 2) → v0.2.84 (D4/P1): pre-build identity SWEEP.
+    // Rows may already exist under a STALE `project` property (an old display
+    // name the launcher used to stamp, or a pre-rename identity) from earlier
+    // launcher runs. Migrate them into the canonical identity BEFORE this build
+    // so the build's `--prune-stale` doesn't reap the old-identity rows (and so
+    // we don't keep two writers). Behaviour-preserving extraction (was inlined
+    // here at v0.2.82): probe → migrate → soft-fail-proceed, same log/emit
+    // shapes. GENERALIZED to a sweep (v0.2.84): the v0.2.82 form only migrated
+    // the CURRENT display name, missing rows left under a PRIOR name after a
+    // rename — the sweep discovers every stale identity (R1). Runs even when
+    // the display name already equals the canonical identity (a prior-name
+    // remnant can persist under a now-matching display name).
+    migrate_stale_identities_for_build(&app, &project_id, &canonical_identity).await;
 
     // v0.2.82 (WP-3 G3 task 5, UPGRADED; FIX-A hardened): classify an
     // embedding-space change.
@@ -2445,32 +2384,37 @@ fn configure_vco_lib_command(db: &Db, module: &str) -> Result<tokio::process::Co
 
 // ─── WP-2 identity-migration CLI invocation (ISOLATED — see contract note) ───
 //
-// ⚠️ WP-2 (`vco_lib.codegraph_vector_copy`) is being implemented IN PARALLEL
-// with this WP; its module does not yet exist at this WP's base commit. This
-// function is the SOLE place that shells out to it, coded against the brief's
-// contract so the coordinator can adjust a single call-site if WP-2's merged
-// reality deviates:
+// The SOLE place that shells out to `vco_lib.codegraph_vector_copy`. Two
+// shapes, both emitting the same machine-readable summary line:
 //
+//   # pinned single old→new identity (from_identity = Some):
 //   python -m vco_lib.codegraph_vector_copy --migrate-identity \
 //       --prefix <collection_prefix> --from <old_identity> --to <canonical> [--dry-run]
-//   → stdout summary line: `IDENTITY_MIGRATION moved=N deduped=N left=N failures=N`
 //
-// Semantics used here: `--prefix` is the collection prefix (canonical == `to`
-// for the identity migration); `--from` is the OLD `project` property value
-// (the display name the launcher used to stamp); `--to` is the canonical
-// identity. Per the standing rule there is NO global timeout — WP-2's per-row
-// soft-fail is its guard.
+//   # v0.2.84 (D4/P1) SWEEP — discover every stale identity (from_identity = None):
+//   python -m vco_lib.codegraph_vector_copy --migrate-identity \
+//       --prefix <collection_prefix> --to <canonical> --sweep [--dry-run]
+//   → stdout: one `IDENTITY_MIGRATION ...` line per stale identity, then a
+//     FINAL aggregate `IDENTITY_MIGRATION moved=N deduped=N left=N failures=N`
+//     line — the parser keys on the LAST occurrence.
+//
+// Semantics: `--prefix` is the collection prefix (== `to` for the identity
+// migration); `--from` (single mode) is the OLD `project` property value; `--to`
+// is the canonical identity. Per the standing rule there is NO global timeout —
+// WP-2's per-row soft-fail is its guard.
 //
 /// Run the WP-2 identity migration synchronously and return its parsed summary.
-/// `dry_run` requests a count-only probe (no row moves). Soft-fail: any spawn /
-/// interpreter / root / non-zero-exit / unparseable-summary condition returns
-/// `Err` with a human message; the caller logs it honestly and PROCEEDS under
-/// the canonical identity (never aborts the build, never falls back to the old
-/// identity — that would mint fresh dupes).
+/// `from_identity = Some(old)` pins one old→new migration; `from_identity = None`
+/// requests the v0.2.84 SWEEP (`--sweep`) that discovers + migrates EVERY stale
+/// identity under the prefix (covers a root / renamed non-root whose old
+/// identities are not known a priori). `dry_run` requests a count-only probe.
+/// Soft-fail: any spawn / interpreter / root / non-zero-exit / unparseable
+/// condition returns `Err`; the caller logs it honestly and PROCEEDS under the
+/// canonical identity (never aborts, never falls back to an old identity).
 async fn run_wp2_identity_migration(
     db: &Db,
     collection_prefix: &str,
-    from_identity: &str,
+    from_identity: Option<&str>,
     to_identity: &str,
     dry_run: bool,
 ) -> Result<IdentityMigrationSummary, String> {
@@ -2478,10 +2422,16 @@ async fn run_wp2_identity_migration(
     cmd.arg("--migrate-identity")
         .arg("--prefix")
         .arg(collection_prefix)
-        .arg("--from")
-        .arg(from_identity)
         .arg("--to")
         .arg(to_identity);
+    match from_identity {
+        Some(old) => {
+            cmd.arg("--from").arg(old);
+        }
+        None => {
+            cmd.arg("--sweep");
+        }
+    }
     if dry_run {
         cmd.arg("--dry-run");
     }
@@ -2505,6 +2455,89 @@ async fn run_wp2_identity_migration(
     }
     parse_identity_migration_summary(&stdout)
         .ok_or_else(|| "codegraph_vector_copy produced no parseable IDENTITY_MIGRATION line".to_string())
+}
+
+/// v0.2.84 (D4/P1): pre-build stale-identity SWEEP — extracted (behaviour-
+/// preserving) from `run_build_task`'s v0.2.82 inline block and generalized
+/// from the single display-name→canonical migration to a full sweep that
+/// discovers EVERY stale `project` identity under the prefix (covers rows left
+/// under a PRIOR name after a rename — the v0.2.82 form only checked the
+/// current display name; R1). Same discipline as the inline block: a cheap
+/// dry-run probe first, run the real migration only when the probe reports
+/// pending rows, and SOFT-FAIL — a probe/migration error is logged and the
+/// build PROCEEDS under the canonical identity (never aborts, never falls back
+/// to an old identity — that would mint fresh dupes). Same log/emit shapes as
+/// before (`[vct] code-graph identity migration ...` + a `migrate-identity`
+/// RUNNING emit on a real migration).
+///
+/// The prefix is the canonical identity itself (code-graph classes are keyed
+/// `<canonical>_<Base>`; the analyzer stamps `project == <canonical>`), so a
+/// separate prefix argument would be redundant.
+async fn migrate_stale_identities_for_build(
+    app: &AppHandle,
+    project_id: &str,
+    canonical_identity: &str,
+) {
+    // The db handle resolves the interpreter + orchestrator root inside
+    // `configure_vco_lib_command`. `from_identity = None` selects the sweep.
+    let db = app.state::<Db>();
+    match run_wp2_identity_migration(
+        &db,
+        canonical_identity,
+        None, // sweep: discover every stale identity
+        canonical_identity,
+        true, // dry_run: probe
+    )
+    .await
+    {
+        Ok(probe) if probe.moved + probe.deduped + probe.left > 0 => {
+            // Stale-identity rows exist → run the real sweep.
+            match run_wp2_identity_migration(
+                &db,
+                canonical_identity,
+                None,
+                canonical_identity,
+                false,
+            )
+            .await
+            {
+                Ok(s) => {
+                    let detail = format!(
+                        "identity migration (sweep) → '{}': moved={} deduped={} left={} failures={}",
+                        canonical_identity, s.moved, s.deduped, s.left, s.failures,
+                    );
+                    eprintln!("[vct] code-graph {}", detail);
+                    emit_build(
+                        app,
+                        project_id,
+                        build_status::RUNNING,
+                        0,
+                        Some("migrate-identity"),
+                        None,
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[vct] warning: code-graph identity sweep → '{}' failed: {} \
+                         — proceeding with the build under the canonical identity \
+                         (old-identity rows, if any, will be pruned when their files \
+                         next change, not silently duplicated).",
+                        canonical_identity, e
+                    );
+                }
+            }
+        }
+        Ok(_) => {
+            // No stale-identity rows — nothing to migrate.
+        }
+        Err(e) => {
+            eprintln!(
+                "[vct] warning: code-graph identity sweep probe for '{}' \
+                 failed: {} — proceeding with the build under the canonical identity.",
+                canonical_identity, e
+            );
+        }
+    }
 }
 
 /// Fire-and-forget the non-root metadata backfill (plan §WP-3 task 6, C2).
@@ -3787,6 +3820,38 @@ mod build_tests {
     fn identity_migration_summary_none_on_missing_token() {
         assert!(parse_identity_migration_summary("IDENTITY_MIGRATION moved=5 deduped=2 left=1\n").is_none());
         assert!(parse_identity_migration_summary("no summary here\n").is_none());
+    }
+
+    // v0.2.84 (D4/P1): the `--sweep` CLI emits ONE IDENTITY_MIGRATION line per
+    // discovered stale identity, then a FINAL aggregate line — the parser keys
+    // on the LAST occurrence (the aggregate) so the launcher reads the summed
+    // counts. This pins that Rust↔Python sweep contract.
+    #[test]
+    fn identity_migration_summary_sweep_uses_last_aggregate_line() {
+        let sweep_stdout = concat!(
+            "INFO ...: identity sweep: P — 2 identities to migrate\n",
+            "IDENTITY_MIGRATION moved=2 deduped=100 left=0 failures=0\n",
+            "IDENTITY_MIGRATION moved=3 deduped=200 left=1 failures=0\n",
+            "IDENTITY_MIGRATION moved=5 deduped=300 left=1 failures=0\n", // aggregate
+        );
+        let s = parse_identity_migration_summary(sweep_stdout).expect("should parse");
+        // The aggregate (last line) — NOT a per-identity line.
+        assert_eq!(s.moved, 5);
+        assert_eq!(s.deduped, 300);
+        assert_eq!(s.left, 1);
+        assert_eq!(s.failures, 0);
+    }
+
+    // v0.2.84 (D4/P1): a converged sweep (no stale identities) emits a single
+    // all-zero aggregate line — the launcher's `probe.moved + deduped + left
+    // == 0` gate then correctly skips the real migration (leave-alone).
+    #[test]
+    fn identity_migration_summary_sweep_all_zero_is_converged() {
+        let s = parse_identity_migration_summary(
+            "IDENTITY_MIGRATION moved=0 deduped=0 left=0 failures=0\n",
+        )
+        .expect("should parse");
+        assert_eq!(s.moved + s.deduped + s.left, 0);
     }
 
     // ─── T15: resume root-skip decision (act + leave-alone + fail-open) ──

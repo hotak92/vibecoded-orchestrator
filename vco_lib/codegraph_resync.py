@@ -1491,6 +1491,19 @@ def run_resync_and_verify(
     Always returns 0: the deferral (not the exit code) carries the signal;
     nothing waits on this process.
     """
+    # v0.2.84 (D4/P1): pre-analyze identity sweep. Mirrors the Rust pre-build
+    # rationale (codegraph.rs::migrate_stale_identities_for_build): migrate any
+    # stale ``project`` identity onto the canonical prefix BEFORE the full walk
+    # so a ``--prune-stale`` pass cannot reap old-identity rows and so we never
+    # keep two writers. Probe-first + soft-fail inside the helper — a no-op when
+    # the prefix is already single-identity (the common converged case pays one
+    # cheap aggregate). Never gates the analyzer.
+    try:
+        identity_sweep_if_stale(Path(repo_root), project_name)
+    except Exception as exc:  # noqa: BLE001 — sweep must never block the walk
+        print(f"[resync-driver] identity sweep raised (soft-fail): {exc}",
+              flush=True)
+
     argv = [
         sys.executable, str(analyzer_path), str(repo_root),
         "--project", project_name,
@@ -1552,6 +1565,156 @@ def run_resync_and_verify(
     )
     _record_unconverged_deferral(repo_root, project_name, counts, resume_cmd)
     return 0
+
+
+def _probe_stale_identity_count(
+    client, prefix: str, canonical: str,
+) -> Optional[int]:
+    """Cheap gate for :func:`identity_sweep_if_stale`: total count of rows whose
+    ``project`` ≠ ``canonical`` across the 5 ``<prefix>_<base>`` classes, via a
+    filtered aggregate (the cheapest read — no per-row scan). ``None`` when the
+    probe is undeterminable on EVERY class (Weaviate down / prefix unresolvable
+    / aggregate shape unsupported) so the caller never treats "can't tell" as
+    "converged". ``0`` means every class positively reported zero stale rows.
+
+    Soft-fail per class: an aggregate error on one class does not poison the
+    others (it contributes ``undeterminable``, not ``0``).
+    """
+    try:
+        from weaviate.classes.query import Filter
+    except Exception as exc:  # noqa: BLE001 — no client lib → undeterminable
+        logger.warning("identity sweep probe: Filter unavailable: %s", exc)
+        return None
+    any_determinable = False
+    total = 0
+    for base in _CODEGRAPH_BASES:
+        coll_name = f"{prefix}_{base}"
+        try:
+            if (
+                hasattr(client.collections, "exists")
+                and not client.collections.exists(coll_name)
+            ):
+                # Absent class = zero stale rows there (positively determinable).
+                any_determinable = True
+                continue
+            coll = client.collections.get(coll_name)
+            flt = Filter.by_property("project").not_equal(canonical)
+            agg = coll.aggregate.over_all(filters=flt, total_count=True)
+            count = getattr(agg, "total_count", None)
+            if count is not None:
+                any_determinable = True
+                total += int(count)
+        except Exception as exc:  # noqa: BLE001 — one class undeterminable
+            logger.debug(
+                "identity sweep probe: aggregate %s failed: %s", coll_name, exc
+            )
+            continue
+    return total if any_determinable else None
+
+
+def identity_sweep_if_stale(
+    repo_root: Path, project_name: str,
+) -> int:
+    """v0.2.84 (D4/P1): migrate any STALE code-graph ``project`` identity for
+    ``project_name`` onto its canonical prefix, if (and only if) stale rows
+    exist. Returns the number of rows moved+deduped (0 when nothing was stale).
+
+    Owned by the root's install.py --update flow (via the thin shim
+    ``install._trigger_codegraph_identity_sweep``) AND run pre-analyze inside
+    :func:`run_resync_and_verify`. Distinct from the R-6 embed-resync gate:
+    identity-stale rows can be embed-revision-CURRENT (a renamed project's rows
+    carry the old ``project`` value but a fresh ``embed_revision``), so the
+    owed-probe would report "not owed" while the dual identity persists — this
+    is exactly why the sweep must run UNCONDITIONALLY, not behind that gate.
+
+    Mechanism (all in :mod:`vco_lib.codegraph_vector_copy`, the ONE identity
+    engine): resolve the canonical prefix → cheap filtered-aggregate probe
+    (``project != canonical``) → only on a POSITIVE-nonzero probe run the real
+    :func:`~vco_lib.codegraph_vector_copy.sweep_stale_identities`. Soft-fail
+    throughout — a missing helper / Weaviate-down / prefix-unresolvable
+    condition logs and returns 0 (never crashes the caller; never guesses).
+
+    On a real migration (moved+deduped > 0) it records an auto-resolution audit
+    row (``codegraph_identity_migrated``) so the healing leaves a visible trail
+    — a loud log line + a JSONL entry under ``<repo_root>/.claude/logs``.
+    """
+    if not project_name:
+        return 0
+    try:
+        from vco_lib.codegraph_vector_copy import sweep_stale_identities
+    except Exception as exc:  # noqa: BLE001 — missing helper must not wedge caller
+        logger.warning("identity sweep: engine unavailable: %s", exc)
+        return 0
+
+    prefix = _collection_prefix(project_name)
+    if not prefix:
+        # Prefix unresolvable → do NOTHING (never guess a prefix — the
+        # conservative default the whole module already uses).
+        return 0
+    # For code-graph the analyzer stamps ``project == <collection prefix>`` (the
+    # canonical identity), so the sweep's ``canonical`` IS the prefix here.
+    canonical = prefix
+
+    client = _build_client()
+    if client is None:
+        return 0
+    moved_deduped = 0
+    try:
+        probe = _probe_stale_identity_count(client, prefix, canonical)
+        if probe == 0:
+            # Positively single-identity — cheap converged path, no scan/migrate.
+            logger.info(
+                "identity sweep: %s already single-identity (%r) — nothing owed",
+                prefix, canonical,
+            )
+            return 0
+        # probe is None (undeterminable) OR > 0: fall through to the engine.
+        # The engine's own enumerate scan is the authoritative discovery; on an
+        # undeterminable probe we proceed (conservative: never skip on
+        # uncertainty), on a positive probe we know there is work.
+        summaries = sweep_stale_identities(
+            prefix, canonical, client=client, dry_run=False,
+        )
+        moved = sum(s.moved for s in summaries)
+        deduped = sum(s.deduped for s in summaries)
+        left = sum(s.left for s in summaries)
+        failures = sum(s.failures for s in summaries)
+        moved_deduped = moved + deduped
+        if summaries:
+            logger.info(
+                "identity sweep: %s — %d identit%s migrated onto %r "
+                "(moved=%d deduped=%d left=%d failures=%d)",
+                prefix, len(summaries), "y" if len(summaries) == 1 else "ies",
+                canonical, moved, deduped, left, failures,
+            )
+        if moved_deduped > 0:
+            # B-F9 (no silent mutations): a real identity migration is a healing
+            # action on the user's data — record the audit trail.
+            try:
+                from vco_lib.deferral_emit import record_auto_resolution
+                record_auto_resolution(
+                    Path(repo_root),
+                    "codegraph_identity_migrated",
+                    action="migrated stale code-graph identity",
+                    detail=(
+                        f"prefix={prefix} → canonical={canonical}: "
+                        f"moved={moved} deduped={deduped} left={left} "
+                        f"failures={failures}"
+                    ),
+                    log=logger,
+                )
+            except Exception as exc:  # noqa: BLE001 — audit is best-effort
+                logger.warning(
+                    "identity sweep: could not record auto-resolution: %s", exc
+                )
+    except Exception as exc:  # noqa: BLE001 — sweep must never crash the caller
+        logger.warning("identity sweep: raised (soft-fail): %s", exc)
+    finally:
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return moved_deduped
 
 
 def spawn_background_resync(
