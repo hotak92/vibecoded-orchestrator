@@ -29,6 +29,12 @@ pub mod webkit_preflight;
 // existing `crate::db::Db` / `crate::manifest::*` / etc. usage across
 // the launcher continues to resolve. Only the DEFINITION moved; the
 // public surface is unchanged.
+// v0.2.84 D1 (P2): the ONE collection-naming rule lives in
+// vct-launcher-core so BOTH vct-hub's config_api AND this app crate's
+// `project_env_settings::populate` delegate to the same
+// `resolve_project_collections`. Re-exported so `crate::collection_naming::…`
+// resolves in the in-crate consumer (`populate`).
+pub use vct_launcher_core::collection_naming;
 pub use vct_launcher_core::config;
 pub use vct_launcher_core::db;
 pub use vct_launcher_core::manifest;

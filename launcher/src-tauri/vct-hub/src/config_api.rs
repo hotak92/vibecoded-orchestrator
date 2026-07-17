@@ -951,16 +951,24 @@ async fn project_config(
     // `_KnowledgeGraph` (e.g. a custom-rename install), fall back to a
     // slug-sanitized derivation.
     //
+    // v0.2.84 D1 (P2): the suffix-swap / slug-fallback rule now lives ONCE
+    // in `vct_launcher_core::collection_naming::derive_sibling_collection`
+    // — the launcher's `populate()` and the python `config_projection`
+    // delegate to the SAME rule, so the dev-collection name can no longer
+    // drift across the three writers. We pass the ALREADY casing-rebound
+    // `kg_collection` (the rebind is layered on the KG above), so the
+    // sibling is derived from the on-disk-cased basename exactly as the
+    // prior inline block did — byte-identical output.
+    //
     // NEW-2 (v0.2.53) — the suffix-swap candidate is then rebound to
     // on-disk casing via `resolve_existing_casing_for_class`. The
     // rebind is the load-bearing fix for the dev-collection case-mismatch
     // symptom (Symptom B).
-    let development_candidate = if kg_collection.ends_with("_KnowledgeGraph") {
-        let basename = &kg_collection[..kg_collection.len() - "_KnowledgeGraph".len()];
-        format!("{}_Development", basename)
-    } else {
-        format!("{}_Development", sanitize_collection_prefix(&project.slug))
-    };
+    let development_candidate = vct_launcher_core::collection_naming::derive_sibling_collection(
+        &kg_collection,
+        vct_launcher_core::collection_naming::DEV_SUFFIX,
+        &project.slug,
+    );
     let development_collection = crate::weaviate_schema_probe::resolve_existing_casing_for_class(
         &probe_weaviate_url,
         &development_candidate,
@@ -971,14 +979,14 @@ async fn project_config(
     // unwrapped from the Option above. Suffix swap mirrors the Python
     // contract; the slug-sanitized fallback handles the non-canonical
     // rename case (primary binding doesn't end with `_KnowledgeGraph`).
+    // v0.2.84 D1 — same ONE-rule delegation as development above.
     //
     // NEW-2 (v0.2.53) — same case-rebind treatment as development above.
-    let diagrams_candidate = if kg_collection.ends_with("_KnowledgeGraph") {
-        let basename = &kg_collection[..kg_collection.len() - "_KnowledgeGraph".len()];
-        format!("{}_Diagrams", basename)
-    } else {
-        format!("{}_Diagrams", sanitize_collection_prefix(&project.slug))
-    };
+    let diagrams_candidate = vct_launcher_core::collection_naming::derive_sibling_collection(
+        &kg_collection,
+        vct_launcher_core::collection_naming::DIAGRAMS_SUFFIX,
+        &project.slug,
+    );
     let diagrams_collection = crate::weaviate_schema_probe::resolve_existing_casing_for_class(
         &probe_weaviate_url,
         &diagrams_candidate,
@@ -1444,42 +1452,28 @@ fn claude_session_dir_for(workspace_path: &StdPath) -> PathBuf {
 
 /// Inline ASCII-safe slug → class-prefix sanitiser.
 ///
-/// Used ONLY for the fallback when `project_codegraph_bindings`
-/// has no row for this project (codegraph hasn't been analysed
-/// yet). The launcher's `project_naming::canonical_class_prefix`
-/// is the spec'd version; we don't depend on it here because that
-/// module lives in the Tauri-side launcher crate, not in
-/// vct-launcher-core, and hauling it into core to satisfy a
-/// fallback path would expand the workspace's public-API surface
-/// area for no gain. The fallback only fires before first
-/// analysis; once analysis runs, the binding row carries the
-/// canonical prefix and this function is bypassed.
+/// v0.2.84 D1 (P2): PROMOTED into
+/// `vct_launcher_core::collection_naming::sanitize_collection_prefix`
+/// (the ONE collection-naming home) and re-exported here as a thin alias
+/// so the two call-sites in this file (the codegraph-prefix fallback at
+/// ~:1021 and the dev/diagrams slug-fallback, now inside
+/// `collection_naming::derive_sibling_collection`) keep resolving
+/// `sanitize_collection_prefix(...)` unchanged. Byte-identical to the
+/// prior file-local `fn`.
+///
+/// Used ONLY for fallbacks: the codegraph-prefix fallback when
+/// `project_codegraph_bindings` has no row yet, and the dev/diagrams
+/// non-`_KnowledgeGraph` slug fallback (custom-rename installs). Distinct
+/// from `project_naming::canonical_class_prefix` (the codegraph SSOT) and
+/// from `sanitize_kg_collection` (underscore-DROPPING KG basename); see
+/// the `collection_naming` module docstring.
 ///
 /// Algorithm (mirrors `_sanitize_collection_prefix` in the Python
 /// analyzer):
 ///   1. Replace non-alphanumeric ASCII chars with `_`.
-///   2. Capitalize the first character.
-///   3. If empty after step 1, return `Project`.
-fn sanitize_collection_prefix(slug: &str) -> String {
-    let mut out = String::with_capacity(slug.len());
-    for ch in slug.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    let trimmed = out.trim_matches('_');
-    if trimmed.is_empty() {
-        return "Project".to_string();
-    }
-    let mut chars = trimmed.chars();
-    let first = chars.next().unwrap().to_ascii_uppercase();
-    let mut result = String::with_capacity(trimmed.len());
-    result.push(first);
-    result.extend(chars);
-    result
-}
+///   2. Trim leading/trailing `_`, capitalize the first character.
+///   3. If empty after trimming, return `Project`.
+use vct_launcher_core::collection_naming::sanitize_collection_prefix;
 
 // ─── Tests ────────────────────────────────────────────────────────
 

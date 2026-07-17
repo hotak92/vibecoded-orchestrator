@@ -8556,6 +8556,12 @@ fn github_pat_resolve_existing_file() -> Option<PathBuf> {
 ///
 /// Soft-fail: any error short-circuits to `None` so env-file writes
 /// never block on a keychain hiccup.
+///
+// v0.2.84 PLAN D8.1: populate() no longer resolves the PAT (P7 dead-read
+// elimination); sole remaining callers are this module's keychain tests.
+// Fn kept — it is the documented resolver for the shared-scope PAT slot
+// and the natural home if a value-consumer ever returns.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn github_pat_for_env(db: &Db) -> Option<String> {
     if let Some(v) = github_pat_from_keychain(db) {
         return Some(v);

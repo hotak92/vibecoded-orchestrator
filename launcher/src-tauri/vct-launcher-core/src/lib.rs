@@ -9,6 +9,14 @@
 //! their respective Cargo.toml.
 
 pub mod bundled_versions;
+// v0.2.84 P2 (D1): the ONE collection-naming rule (KG / dev / diagrams),
+// binding-first + suffix-swap + slug-fallback, NO Weaviate probing. The
+// single Rust home; BOTH vct-hub's `config_api` AND the launcher app crate's
+// `project_env_settings::populate` delegate here so the dev-collection name
+// can never drift across the three writers again (the v0.2.83 dogfood P2
+// finding). The `sanitize_collection_prefix` slug-sanitizer was promoted
+// here from `config_api.rs` (one home); the hub re-exports it.
+pub mod collection_naming;
 pub mod config;
 pub mod db;
 // v0.2.49: shared license + machine-binding helpers used by the launcher

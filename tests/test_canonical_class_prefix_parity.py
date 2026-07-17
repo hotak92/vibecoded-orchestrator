@@ -234,6 +234,17 @@ def test_no_fifth_sanitizer_in_vco_lib() -> None:
         # Endorsed wrappers (delegate to SSOTs).
         ("config_projection.py", "_sanitize_kg_collection"),
         ("codegraph_to_mermaid.py", "_sanitize_collection_prefix"),
+        # v0.2.84 D1 (P2): the ENDORSED Python mirror of the hub's
+        # ``vct_launcher_core::collection_naming::sanitize_collection_prefix``
+        # (the underscore-PRESERVING slug→prefix rule the dev/diagrams
+        # NON-canonical fallback uses). This is a DELIBERATE, hub-parity-
+        # locked rule distinct from both SSOTs above (it mirrors the Rust
+        # ``sanitize_collection_prefix`` byte-for-byte — see the parity test
+        # ``tests/test_v0284_dev_collection_one_rule.py::
+        # test_python_sanitizer_byte_matches_hub_pinned_cases``). It is NOT
+        # a 5th competing rule for the KG basename — it is the ONE python
+        # home for the hub's existing dev/diagrams fallback sanitizer.
+        ("config_projection.py", "_sanitize_collection_prefix"),
     }
 
     # Patterns we recognise as sanitizer-shape function names.
