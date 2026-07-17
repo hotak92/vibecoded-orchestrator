@@ -351,17 +351,29 @@ fn session_memo_lookup(service: &str, key: &str) -> Option<Option<String>> {
 }
 
 /// Record a SUCCESSFUL read outcome (`Some(value)` or a genuine `None` miss)
-/// into the active session's memo, tagged with the current generation. No-op
+/// into the active session's memo, tagged with `read_gen` — the generation
+/// SNAPSHOTTED BY THE CALLER *before* the underlying keychain read began. No-op
 /// when no session is active. Errors are never recorded here (callers only call
 /// this on `Ok`).
-fn session_memo_store(service: &str, key: &str, value: &Option<String>) {
+///
+/// v0.2.84 (review F2 — TOCTOU close): the entry MUST carry the PRE-READ
+/// generation, never `current_secret_generation()` read here at store time. If a
+/// concurrent `set`/`delete` bumps the generation DURING the read (between the
+/// caller's snapshot and this store), tagging with the post-bump value would make
+/// the stale pre-write outcome look CURRENT — a subsequent `session_memo_lookup`
+/// (which compares `entry.gen == current_secret_generation()`) would then serve
+/// the value the caller read *before* the concurrent write. Tagging with the
+/// pre-read snapshot means the mid-read bump leaves `entry.gen < current`, so the
+/// entry reads as stale and the next lookup re-hits the keychain. Write-through
+/// honesty holds even across a read that races a write.
+fn session_memo_store(service: &str, key: &str, value: &Option<String>, read_gen: u64) {
     SECRET_SESSION.with(|cell| {
         if let Some(session) = cell.borrow_mut().as_mut() {
             session.memo.insert(
                 (service.to_string(), key.to_string()),
                 MemoEntry {
                     value: value.clone(),
-                    gen: current_secret_generation(),
+                    gen: read_gen,
                 },
             );
         }
@@ -1624,6 +1636,15 @@ pub fn get_with_context(
     if let Some(cached) = session_memo_lookup(&service, key) {
         return Ok(cached);
     }
+    // v0.2.84 (review F2 — TOCTOU close): SNAPSHOT the generation NOW, BEFORE the
+    // underlying keychain read starts, and tag the memo entry with this value.
+    // A concurrent `set`/`delete` that bumps the generation DURING the read then
+    // leaves `read_gen < current_secret_generation()`, so the entry is stale on
+    // the next `session_memo_lookup` and the following read re-hits the keychain
+    // — the memo can never serve a value the read observed *before* a racing
+    // write. (Tagging at store time would capture the post-bump generation and
+    // mis-classify the stale value as current.)
+    let read_gen = current_secret_generation();
     // Test/debug seam: past the lock gate + memo miss we have committed to a
     // keychain access (mock OR real Entry construction). Placed BEFORE the mock
     // check so it fires on both the mock-proceed and real-proceed paths; T18
@@ -1634,10 +1655,18 @@ pub fn get_with_context(
     #[cfg(any(test, debug_assertions))]
     if let Some(result) = for_tests::mock_get(scope, module_id, key) {
         let outcome = result.map_err(KeychainError::Other)?;
+        // v0.2.84 (review F2): fire the mid-read hook AFTER the value has been
+        // read but BEFORE the memo store — the exact TOCTOU window. A test
+        // installs a hook that performs a concurrent `set`/`delete` (bumping the
+        // generation) to prove the entry, tagged with the PRE-read generation,
+        // is invalidated even though `outcome` already captured the pre-write
+        // value. No-op in prod.
+        #[cfg(any(test, debug_assertions))]
+        for_tests::fire_mid_read_hook();
         // Cache the successful mock outcome (value or genuine miss) so the
         // session memo path is exercised under the test mock exactly as it is
-        // against the real keychain.
-        session_memo_store(&service, key, &outcome);
+        // against the real keychain. Tagged with the PRE-read generation (F2).
+        session_memo_store(&service, key, &outcome, read_gen);
         return Ok(outcome);
     }
     // v0.2.76 (A4): own (service, key) → 'static + Send job → bounded-timeout
@@ -1663,10 +1692,16 @@ pub fn get_with_context(
         .map_err(|to| KeychainError::Other(format!("keyring get: {}", to)))?
         .map_err(KeychainError::Other)?
     };
+    // v0.2.84 (review F2): mid-read hook, real-keychain path — same TOCTOU
+    // window (value read, not yet stored). No-op in prod / when unarmed.
+    #[cfg(any(test, debug_assertions))]
+    for_tests::fire_mid_read_hook();
     // Memoize the SUCCESSFUL outcome only (errors already propagated via `?`, so
     // they are never cached — a transient failure stays retryable and keeps
-    // flipping the hub's honest degraded flag on every occurrence).
-    session_memo_store(&service, key, &outcome);
+    // flipping the hub's honest degraded flag on every occurrence). Tagged with
+    // the PRE-read generation snapshot (F2) so a write that raced this read
+    // invalidates the entry rather than being masked by it.
+    session_memo_store(&service, key, &outcome, read_gen);
     Ok(outcome)
 }
 
@@ -2127,6 +2162,36 @@ pub mod for_tests {
         // `keychain_error` (503) vs `key_not_active` (404) distinction (T19).
         static MOCK_FAIL_GET_KEYS: RefCell<HashSet<String>> =
             RefCell::new(HashSet::new());
+
+        // v0.2.84 (review F2): a one-shot callback fired by `get_with_context`
+        // in the TOCTOU window between its pre-read generation snapshot and the
+        // memo store. A test installs a hook that performs a concurrent
+        // `set`/`delete` (bumping the generation) to prove the entry, tagged
+        // with the PRE-read generation, is invalidated. Consumed on fire so it
+        // only perturbs ONE read.
+        #[allow(clippy::type_complexity)]
+        static MID_READ_HOOK: RefCell<Option<Box<dyn FnOnce()>>> =
+            const { RefCell::new(None) };
+    }
+
+    /// Register a one-shot callback to run inside `get_with_context`'s TOCTOU
+    /// window (after it snapshots the generation, before it stores the memo
+    /// entry). Models a concurrent write landing DURING a read. Consumed on
+    /// fire. Test-only.
+    pub fn set_mid_read_hook(hook: Box<dyn FnOnce()>) {
+        MID_READ_HOOK.with(|cell| {
+            *cell.borrow_mut() = Some(hook);
+        });
+    }
+
+    /// Fire (and consume) the registered mid-read hook, if any. Called from
+    /// `get_with_context` under `cfg(any(test, debug_assertions))`; a no-op when
+    /// no hook is registered.
+    pub(super) fn fire_mid_read_hook() {
+        let hook = MID_READ_HOOK.with(|cell| cell.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     /// Enable the thread-local mock keychain for this thread.
@@ -2155,6 +2220,9 @@ pub mod for_tests {
         });
         MOCK_FAIL_KEYS.with(|cell| cell.borrow_mut().clear());
         MOCK_FAIL_GET_KEYS.with(|cell| cell.borrow_mut().clear());
+        // v0.2.84 (F2): drop any un-fired mid-read hook so it never leaks into
+        // a subsequent mock session on this thread.
+        MID_READ_HOOK.with(|cell| *cell.borrow_mut() = None);
     }
 
     /// Empty the thread-local mock store without disabling it.
@@ -2171,6 +2239,8 @@ pub mod for_tests {
         });
         MOCK_FAIL_KEYS.with(|cell| cell.borrow_mut().clear());
         MOCK_FAIL_GET_KEYS.with(|cell| cell.borrow_mut().clear());
+        // v0.2.84 (F2): also drop any pending mid-read hook.
+        MID_READ_HOOK.with(|cell| *cell.borrow_mut() = None);
     }
 
     /// Register `key` to make the **next** `secrets::get` (any context) targeting
@@ -3702,6 +3772,95 @@ mod tests {
             get(scope, "mod", "k1").unwrap(),
             None,
             "after a delete the memo is invalidated and the read observes the miss"
+        );
+    }
+
+    /// v0.2.84 (review F2 — TOCTOU): a concurrent `set` that lands DURING a read
+    /// (between the pre-read generation snapshot and the memo store) must
+    /// INVALIDATE the entry, so the NEXT read re-hits the keychain and sees the
+    /// rotated value — the memo can never serve the value the read observed
+    /// *before* the racing write. FAILS WITHOUT THE FIX: if the memo entry were
+    /// tagged with the generation read at STORE time, it would capture the
+    /// post-bump generation and mask the rotation (the second read would serve
+    /// the stale "v1").
+    #[test]
+    fn session_concurrent_set_mid_read_invalidates_memo_toctou() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _mock = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+        set(scope, "mod", "k1", "v1").unwrap();
+
+        let _session = SecretReadSession::new();
+
+        // Arm a one-shot hook that fires INSIDE get_with_context's TOCTOU window
+        // (value already read into `outcome`, not yet stored). It rotates the
+        // value — a concurrent write landing mid-read — which bumps the
+        // generation. The first read still returns the pre-write "v1" (it was
+        // captured before the hook fired), but the memo entry must be tagged
+        // with the PRE-read generation, so it is stale immediately.
+        for_tests::set_mid_read_hook(Box::new(|| {
+            set(SecretScope::Global, "mod", "k1", "v2").unwrap();
+        }));
+
+        // First read: returns the value observed at read time ("v1"), then the
+        // hook rotates to "v2" before the store commits.
+        let first = get(scope, "mod", "k1").unwrap();
+        assert_eq!(
+            first.as_deref(),
+            Some("v1"),
+            "the read captured the pre-write value (hook fires after the read)"
+        );
+
+        // The memo entry, tagged with the PRE-read generation, is now stale
+        // (the hook bumped the generation). The next read MUST re-hit the
+        // keychain and observe the rotated value.
+        let base = ENTRY_CONSTRUCTION_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        let second = get(scope, "mod", "k1").unwrap();
+        let delta = ENTRY_CONSTRUCTION_COUNT.load(std::sync::atomic::Ordering::SeqCst) - base;
+        assert_eq!(
+            second.as_deref(),
+            Some("v2"),
+            "a write that raced the read must invalidate the memo — the next \
+             read must see the rotated value, not the stale pre-write outcome"
+        );
+        assert_eq!(
+            delta, 1,
+            "the stale (pre-read-generation-tagged) entry must force a fresh \
+             underlying read after the mid-read write"
+        );
+    }
+
+    /// F2 companion — the mid-read write need not touch the SAME key. Because the
+    /// generation counter is process-wide, a concurrent write to ANY secret
+    /// during our read of `k1` bumps it; the pre-read-generation tag then marks
+    /// our `k1` entry stale. Proves the invalidation is generation-driven (not
+    /// value-diff-driven) and that a racing write to a sibling key does not
+    /// silently poison the memo with a value tagged as current.
+    #[test]
+    fn session_concurrent_sibling_write_mid_read_invalidates_memo() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _mock = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+        set(scope, "mod", "k1", "v1").unwrap();
+
+        let _session = SecretReadSession::new();
+
+        // Hook writes a DIFFERENT key mid-read of k1 — still bumps the global
+        // generation. k1's value is unchanged, but its memo entry (pre-read gen)
+        // must still be invalidated by the generation bump.
+        for_tests::set_mid_read_hook(Box::new(|| {
+            set(SecretScope::Global, "mod", "sibling", "sv").unwrap();
+        }));
+
+        assert_eq!(get(scope, "mod", "k1").unwrap().as_deref(), Some("v1"));
+
+        let base = ENTRY_CONSTRUCTION_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(get(scope, "mod", "k1").unwrap().as_deref(), Some("v1"));
+        let delta = ENTRY_CONSTRUCTION_COUNT.load(std::sync::atomic::Ordering::SeqCst) - base;
+        assert_eq!(
+            delta, 1,
+            "a generation bump from a sibling-key write during the read must \
+             invalidate the k1 entry (generation-driven, not value-driven)"
         );
     }
 

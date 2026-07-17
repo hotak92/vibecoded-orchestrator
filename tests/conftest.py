@@ -42,10 +42,98 @@ References:
 """
 from __future__ import annotations
 
+import functools
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _weaviate_importable(python_exe: str) -> bool:
+    """True iff `python_exe -c 'import weaviate'` succeeds. Soft: any spawn
+    error (missing interpreter, timeout) is treated as not-importable."""
+    try:
+        r = subprocess.run(
+            [python_exe, "-c", "import weaviate"],
+            capture_output=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
+
+
+@functools.lru_cache(maxsize=None)
+def _resolve_analyzer_python_cached(vct_venv: str, install_root: str) -> str | None:
+    """Resolution body, memoized on the env inputs that steer it (so a test that
+    manipulates ``$VCT_VENV`` / ``$VCT_INSTALL_ROOT`` gets a fresh resolution
+    rather than a stale cached path). The subprocess ``import weaviate`` probe is
+    the expensive part; caching per-env avoids re-spawning it across the several
+    analyzer-spawning tests in one run."""
+    candidates: list[str] = []
+
+    def _venv_pythons(venv_dir: Path) -> list[str]:
+        return [
+            str(venv_dir / "bin" / "python"),
+            str(venv_dir / "bin" / "python3"),
+            str(venv_dir / "Scripts" / "python.exe"),
+        ]
+
+    if vct_venv:
+        candidates.extend(_venv_pythons(Path(vct_venv)))
+        candidates.append(vct_venv)  # in case $VCT_VENV is the python itself
+
+    if install_root:
+        candidates.extend(_venv_pythons(Path(install_root) / ".venv"))
+
+    candidates.extend(_venv_pythons(_REPO_ROOT / ".venv"))
+
+    for cand in candidates:
+        if Path(cand).exists() and _weaviate_importable(cand):
+            return cand
+
+    # Last resort: the pytest runner's own interpreter, but ONLY if it can
+    # import weaviate (the canonical case — the suite runs under the VCO venv).
+    if _weaviate_importable(sys.executable):
+        return sys.executable
+
+    return None
+
+
+def resolve_analyzer_python() -> str | None:
+    """v0.2.84 PLAN-v0284 (review T-2, one-concern-one-home): resolve the Python
+    interpreter that tests must use to spawn ``analyze_code_graph.py`` and other
+    scripts that ``import weaviate`` at module load.
+
+    Bare ``shutil.which("python3")`` resolves the SYSTEM python, which on most
+    machines (and CI without a global weaviate-client) fails the analyzer's
+    module-level ``import weaviate`` — the analyzer then exits 1 with
+    "weaviate-client not installed" BEFORE reaching the G5 worktree guard, so the
+    g5-guard tests observed the wrong exit/stderr (false red).
+
+    Resolution order (mirrors ``templates/hooks/_lib/resolve-vco-venv.sh`` tiers
+    1→2→4, the canonical VCO-venv chain), returning the FIRST candidate whose
+    interpreter can ``import weaviate``:
+
+      1. ``$VCT_VENV`` explicit override — ``$VCT_VENV/bin/python`` (POSIX) /
+         ``$VCT_VENV/Scripts/python.exe`` (Windows).
+      2. ``$VCT_INSTALL_ROOT/.venv`` — launcher-provided canonical venv.
+      3. ``<repo>/.venv`` — orchestrator-clone fallback.
+      4. ``sys.executable`` — the interpreter running pytest, IF it can import
+         weaviate (the suite is meant to run under the VCO venv, so this is the
+         common hit).
+
+    Returns the resolved interpreter path, or ``None`` when NONE can import
+    weaviate — callers must ``pytest.skip`` with a clear reason rather than
+    spawn a python that will crash at import and yield a misleading result.
+    """
+    return _resolve_analyzer_python_cached(
+        os.environ.get("VCT_VENV", "").strip(),
+        os.environ.get("VCT_INSTALL_ROOT", "").strip(),
+    )
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -775,6 +775,14 @@ impl ProjectEnvSettings {
             ollama_port: DEFAULT_OLLAMA_PORT,
             code_embed_port: DEFAULT_CODE_EMBED_PORT,
             container_runtime: None,
+            // v0.2.84 PLAN-v0284 D1 (review F4): name-derived KG/dev names here are the
+            // SANCTIONED last resort — `with_defaults` has NO `Db` handle, so there is no
+            // `project_kg_bindings` row to honor. D1's rule ("primary = binding when a row
+            // exists; else `sanitize(name)_KnowledgeGraph`") reduces to the else-branch when
+            // no binding is reachable; `dev` is the `_KnowledgeGraph`→`_Development` suffix
+            // swap of that basename. Any DB-backed caller goes through `populate` →
+            // `collection_naming::resolve_project_collections` (the binding-first path); this
+            // default-only constructor never overrides a binding because it can't see one.
             kg_collection: format!("{}_KnowledgeGraph", kg_basename),
             dev_collection: format!("{}_Development", kg_basename),
             shared_kg_collection: LAST_RESORT_SHARED_KG_COLLECTION.to_string(),
