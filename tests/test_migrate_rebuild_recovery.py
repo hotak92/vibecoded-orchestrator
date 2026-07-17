@@ -140,6 +140,28 @@ class TestCliReingestAfterRebuild(unittest.TestCase):
     """Fixes 2+3: the CLI handler re-ingests (or loudly refuses to claim
     success) whenever the plan contained a rebuild."""
 
+    def setUp(self):
+        # `_cmd_migrate_collections` name-scopes by WRITING KG_COLLECTION /
+        # DEVELOPMENT_COLLECTION / DIAGRAMS_COLLECTION into os.environ from
+        # `--name Foo` (documented side effect). Every test below invokes it,
+        # so without this backup/restore the process-global `KG_COLLECTION`
+        # would leak `Foo_KnowledgeGraph` into later-collected tests — e.g.
+        # `test_stage1_projectinit_v0273.py` reads it via
+        # `_live_kg_collection_binding()` and mis-excludes a legacy candidate.
+        # Mirrors the sibling classes' env-isolation pattern in this file.
+        self._env_backup = {
+            k: os.environ.get(k)
+            for k in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION",
+                      "DIAGRAMS_COLLECTION")
+        }
+
+    def tearDown(self):
+        for k, v in self._env_backup.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
     def _run_cmd(self, args, canned):
         with mock.patch.object(project_init, "migrate_collections",
                                return_value=canned), \

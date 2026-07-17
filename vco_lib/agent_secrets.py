@@ -200,23 +200,15 @@ def _parse_dotenv_value(text: str, key: str) -> Optional[str]:
     ``KEY=VALUE`` and ``export KEY=VALUE``; strip one matching pair of
     single/double quotes; NO variable expansion, NO command
     substitution; first match wins. Never logs the value.
+
+    The line-level parse is shared with the two managed-block env readers via
+    ``vco_lib.envfile`` (v0.2.84 fix-pass — one concern, one home). A bare
+    ``.env`` has no managed block, so no BEGIN/END markers are passed: the
+    WHOLE file is parsed (unchanged semantics).
     """
-    for line in text.splitlines():
-        s = line.strip()
-        if s.startswith("export "):
-            s = s[len("export "):].lstrip()
-        if not s or s.startswith("#"):
-            continue
-        if "=" not in s:
-            continue
-        k, _, v = s.partition("=")
-        if k.strip() != key:
-            continue
-        v = v.strip()
-        if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
-            v = v[1:-1]
-        return v
-    return None
+    from vco_lib.envfile import env_value
+
+    return env_value(text, key)
 
 
 def _dotenv_dir(project: Optional[str]) -> Optional[Path]:

@@ -2284,10 +2284,27 @@ class MigrateRequiredDeferralTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="vct-migrate-required-"))
         self.proj = self.tmp / "project"
         self.proj.mkdir()
+        # `_cmd_migrate_collections` name-scopes by WRITING KG_COLLECTION /
+        # DEVELOPMENT_COLLECTION / DIAGRAMS_COLLECTION into os.environ from
+        # `--name` (documented side effect). The CLI tests below invoke it
+        # with name="Foo" / "VideoFrames", so without this backup/restore the
+        # process-global KG_COLLECTION would leak into later-collected tests
+        # (e.g. test_stage1_projectinit_v0273.py reads it via
+        # _live_kg_collection_binding() and mis-excludes a legacy candidate).
+        self._env_backup = {
+            k: os.environ.get(k)
+            for k in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION",
+                      "DIAGRAMS_COLLECTION")
+        }
 
     def tearDown(self):
         import shutil
         shutil.rmtree(str(self.tmp), ignore_errors=True)
+        for k, v in self._env_backup.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
     def test_emit_migrate_required_deferral_rebuild_only_contract_v0270(self):
         # v0.2.70: the gate (`_cmd_migrate_collections`) now filters the plan

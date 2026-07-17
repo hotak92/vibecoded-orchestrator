@@ -481,15 +481,18 @@ def _managed_env_value(text: str, key: str) -> Optional[str]:
     as a VCO-managed value. Strips one matching pair of single/double quotes;
     NO variable expansion. First match wins.
 
-    v0.2.84 NOTE: dedup candidate with ``vco_lib.project_init``'s managed-block
-    scan (:8615 ``_has_user_secret_shaped_line``) and
-    ``vco_lib.agent_secrets._parse_dotenv_value`` — the coordinator reconciles
-    these onto ONE shared home at merge/fix-pass time. Kept local here for the
-    ownership walls this cycle (project_init.py is WP-4's, config_projection.py
-    is WP-2's).
+    Line-level parsing (CRLF-safe split, ``export`` prefix, quote strip, managed
+    block scoping) is shared with ``vco_lib.agent_secrets._parse_dotenv_value``
+    via ``vco_lib.envfile`` (v0.2.84 fix-pass — one concern, one home). Only the
+    POLICY (key lookup, managed-block scope) stays here. (``project_init``'s
+    secret-shape scan is a lookalike but a DIFFERENT parse contract — see the
+    NOTE there — so it keeps its own regex and does not route through envfile.)
     """
-    # Import the managed-block sentinels from the canonical home (read-only —
-    # no ownership conflict; the exact idiom project_init's scan uses).
+    from vco_lib.envfile import env_value
+
+    # Import the managed-block sentinels from the canonical home (read-only).
+    # When they can't be resolved (partial install) fall back to parsing the
+    # whole text — the historic behaviour.
     try:
         from vco_lib.config_projection import (
             CLAUDE_ENV_MANAGED_BEGIN,
@@ -499,28 +502,11 @@ def _managed_env_value(text: str, key: str) -> Optional[str]:
         CLAUDE_ENV_MANAGED_BEGIN = None
         CLAUDE_ENV_MANAGED_END = None
 
-    block = text
-    if CLAUDE_ENV_MANAGED_BEGIN and CLAUDE_ENV_MANAGED_END:
-        begin = text.find(CLAUDE_ENV_MANAGED_BEGIN)
-        end = text.find(CLAUDE_ENV_MANAGED_END)
-        if begin == -1 or end == -1 or end < begin:
-            return None  # no managed block → nothing VCO-managed to read
-        block = text[begin:end]
-
-    for line in block.splitlines():  # universal-newline split → CRLF-safe
-        s = line.strip()  # trailing \r stripped here too
-        if s.startswith("export "):
-            s = s[len("export "):].lstrip()
-        if not s or s.startswith("#") or "=" not in s:
-            continue
-        k, _, v = s.partition("=")
-        if k.strip() != key:
-            continue
-        v = v.strip()
-        if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
-            v = v[1:-1]
-        return v
-    return None
+    return env_value(
+        text, key,
+        begin_marker=CLAUDE_ENV_MANAGED_BEGIN,
+        end_marker=CLAUDE_ENV_MANAGED_END,
+    )
 
 
 def _settings_json_env_value(text: str, key: str) -> Optional[str]:
