@@ -52,11 +52,14 @@ def _seed_secret_deferral(folder: Path) -> None:
 
 # The self-clear is exercised on the settings.json surface because its
 # secret-shape detector (`is_secret_shaped_env_key`) precisely distinguishes a
-# real secret key (STALE_SECRET) from a routing key (KG_COLLECTION). The
-# `.claude/env` surface uses a COARSE regex that flags ANY managed-block
-# `export KEY="..."` line (a pre-existing S-8 property), so a routing-only env
-# never reads "clean" there — the settings surface is the realistic self-clear
-# signal and is what these tests drive.
+# real secret key (STALE_SECRET) from a routing key (KG_COLLECTION).
+#
+# v0.2.84 PLAN-v0284 D6 (P4): the `.claude/env` surface ALSO routes through
+# `is_secret_shaped_env_key` now (+ a non-empty-value check), so a routing-only
+# managed block reads "clean" there too — the pre-.84 COARSE-regex property
+# (any managed-block `export KEY="..."` tripped it) is GONE. These tests keep
+# driving the settings surface as the canonical self-clear signal; the D6
+# behaviour on the env surface is pinned in test_v0284_secret_shape_env_scan.py.
 def _write_dirty_settings(folder: Path) -> None:
     claude = folder / ".claude"
     claude.mkdir(parents=True, exist_ok=True)

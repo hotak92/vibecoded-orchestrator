@@ -31,6 +31,22 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+def to_posix_rel(rel: "str | Path") -> str:
+    """Normalize a relative path to POSIX separators (``\\`` → ``/``).
+
+    v0.2.84 PLAN-v0284 A4 (one-concern-one-home): the ``str(rel).replace("\\",
+    "/")`` idiom (v0.2.81 lesson — Windows manifest keys / ``dest_rel`` values
+    carry ``\\`` separators) was duplicated across ~15 call-sites. This is the
+    single shared home so manifest-key comparisons, orphan-scan prefix checks,
+    and the P5 adoption-backup mirror all agree on the same normalization.
+
+    Pure + dependency-free (safe to import from anywhere). Does NOT resolve,
+    absolutize, or touch the filesystem — it only swaps the separator so a
+    host-OS-shaped ``dest_rel`` can be compared / joined POSIX-uniformly.
+    """
+    return str(rel).replace("\\", "/")
+
+
 def vct_root_dir() -> Path:
     """Return the launcher's state-root directory.
 

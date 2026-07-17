@@ -199,6 +199,100 @@ def derive_project_collection_names(project_name: str) -> dict:
     }
 
 
+def _dev_diagrams_from_primary(primary: str, basename_fallback: str) -> tuple[str, str]:
+    """The v0.2.84 PLAN-v0284 D1 one-rule dev/diagrams derivation.
+
+    Given a resolved PRIMARY KG collection, return
+    ``(development_collection, diagrams_collection)`` by suffix-swapping the
+    ``_KnowledgeGraph`` tail (``VCODev_KnowledgeGraph`` → ``VCODev_Development``
+    / ``VCODev_Diagrams``). When the primary does NOT end with
+    ``_KnowledgeGraph`` (a user-renamed custom primary), fall back to the
+    sanitized-name basename — mirroring config_projection's
+    ``project_env_from_db`` and the hub's Decision C.
+
+    This is the SAME rule WP-2 realizes in ``config_projection`` (D1); it is
+    inlined here for the pre-WP-2-merge window so the D3 binding-first bootstrap
+    /migrate resolution doesn't name-derive dev when the primary binding is
+    known. See the FINAL REPORT note for the coordinator's WP-2 integration.
+    """
+    if primary.endswith("_KnowledgeGraph"):
+        stem = primary[: -len("_KnowledgeGraph")]
+        return f"{stem}_Development", f"{stem}_Diagrams"
+    return f"{basename_fallback}_Development", f"{basename_fallback}_Diagrams"
+
+
+def _resolve_bundle_collection_names_binding_first(
+    project_name: str,
+    project_folder: Optional[Path],
+) -> dict:
+    """v0.2.84 PLAN-v0284 D3 (P2 / ruling R3): binding-first collection names.
+
+    Returns the SAME dict shape as :func:`derive_project_collection_names` but
+    resolves the KG/Dev/Diagrams names in this priority order so bootstrap /
+    migrate NEVER create a name-derived collection when a binding resolves a
+    different primary (the R3 re-creator fix — the incident's empty
+    ``VibeCodedOrchestrator_Development`` shells were re-created because these
+    two flows name-derived from the launcher DISPLAY name):
+
+      1. Explicit ``KG_COLLECTION`` in the target project's
+         ``.claude/settings.json`` ``env`` block (the user's / a prior
+         projection's on-disk pin). Dev/Diagrams via the D1 suffix-swap rule.
+      2. launcher.db ``project_kg_bindings(role='primary')`` via the existing
+         read-only reader :func:`_read_kg_collection_from_launcher_db`. Same
+         suffix-swap.
+      3. :func:`derive_project_collection_names` last resort — the genuinely
+         binding-less fresh-create path (correct: the binding is then seeded to
+         match). ``shared`` binding / shared-KG defaults are left to the caller's
+         existing ``_SHARED_KG_NAME`` handling.
+
+    Soft-fail throughout: any read/parse error falls through to the next tier.
+    ``project_folder=None`` (no target folder) short-circuits to tier 3.
+
+    NOTE for WP-2 integration: tiers 1-2's dev/diagrams derivation reuses the
+    inlined :func:`_dev_diagrams_from_primary` (== D1's rule). Once WP-2's
+    ``config_projection`` one-rule helper merges, this resolver's tier-2 read
+    should route through it; the CALLERS (bootstrap_collections,
+    _cmd_migrate_collections) do not change.
+    """
+    base = derive_project_collection_names(project_name)
+    if project_folder is None:
+        return base
+    folder = Path(project_folder)
+
+    def _apply_primary(primary: str) -> dict:
+        out = dict(base)
+        out["kg_collection"] = primary
+        dev, diagrams = _dev_diagrams_from_primary(primary, base["kg_basename"])
+        out["development_collection"] = dev
+        out["diagrams_collection"] = diagrams
+        return out
+
+    # Tier 1: explicit KG_COLLECTION in the project's settings.json env.
+    try:
+        settings_file = folder / ".claude" / "settings.json"
+        if settings_file.is_file():
+            data = json.loads(settings_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                env = data.get("env")
+                kg = env.get("KG_COLLECTION") if isinstance(env, dict) else None
+                if isinstance(kg, str) and kg:
+                    return _apply_primary(kg)
+    except Exception:  # noqa: BLE001 — soft-fail to the next tier
+        pass
+
+    # Tier 2: launcher.db primary binding (read-only).
+    try:
+        db = _read_kg_collection_from_launcher_db(folder)
+        primary = db.get("primary_kg_collection") if isinstance(db, dict) else None
+        if isinstance(primary, str) and primary:
+            return _apply_primary(primary)
+    except Exception:  # noqa: BLE001 — soft-fail to the last-resort derivation
+        pass
+
+    # Tier 3: name-derived last resort (fresh create — binding seeded to match).
+    return base
+
+
 def derive_project_code_prefix(project_name: str) -> str:
     """Return the canonical CODE-GRAPH collection prefix for a project.
 
@@ -2592,7 +2686,19 @@ def bootstrap_collections(
             log_event(step, phase, detail)
 
     weaviate_url = weaviate_url or _weaviate_url_default()
-    derived = derive_project_collection_names(project_name)
+    # v0.2.84 PLAN-v0284 D3 (P2 / ruling R3): resolve the collection names
+    # BINDING-FIRST (settings.json env → launcher.db primary binding →
+    # name-derived last resort). Pre-.84 this name-derived from the DISPLAY
+    # name on EVERY create AND update, so a project whose binding primary
+    # (e.g. `VCODev_KnowledgeGraph`) differed from its display name
+    # ("VibeCoded Orchestrator") got empty `VibeCodedOrchestrator_*` shells
+    # created — and re-created after the operator dropped them (the R3
+    # re-creator). With a `project_folder` we now honor the binding; without
+    # one (or with no binding at all) this falls back to the identical
+    # name-derived set (fresh-create — the binding is then seeded to match).
+    derived = _resolve_bundle_collection_names_binding_first(
+        project_name, project_folder,
+    )
     result: dict = {
         "weaviate_reachable": False,
         "restart_attempted": False,
@@ -3009,6 +3115,17 @@ def _write_bootstrap_deferral(
 
 _MANIFEST_REL = Path(".claude") / ".vco-manifest.json"
 _MANIFEST_SCHEMA_VERSION = 2
+
+# v0.2.84 PLAN-v0284 D7 (P5/R2): shipped-file adoption backups. When an update
+# ADOPTS a divergent bundle file, the CURRENT bytes are first copied here (one
+# `<UTC-basic-ts>` sub-dir per install run) before the shipped bytes overwrite
+# them — so the adoption never destroys the user's on-disk bytes without a
+# captured copy. This tree is DELIBERATELY excluded from both the manifest
+# ownership set (backups are never in `_enumerate_bundle_files` → never enter
+# `new_files`) and the orphan scan (which walks only prior manifest entries), so
+# it can never itself be classified, adopted, or deleted. Kept forever
+# (small, user-prunable — see the adoption NOTICE text).
+_ADOPT_BACKUPS_REL = Path(".claude") / "backups" / "bundle-adoptions"
 
 
 # ---------------------------------------------------------------------------
@@ -4029,8 +4146,18 @@ def _file_action(
       "create"          — target missing, write source.
       "overwrite"       — file exists, content matches manifest's prior-shipped
                           hash → safe to update with new shipped content.
+      "adopt"           — v0.2.84 D7 (P5/R2): file exists at a bundle-shipped
+                          destination and diverges from the shipped bytes
+                          (manifest-hash-mismatch OR manifest-less-no-history-
+                          match). The loop backs up the CURRENT bytes then
+                          writes the shipped bytes (users are not expected to
+                          edit VCO codefiles). On backup-write failure the loop
+                          FALLS BACK to "preserve" + deferral (never destroy
+                          bytes without a captured copy).
       "preserve"        — file exists, user-modified vs manifest. Skip; emit
-                          deferral.
+                          deferral. v0.2.84 D7: this action is no longer produced
+                          by the default classification path — the loop only
+                          reaches it via the adopt backup-failure fallback.
       "keep-regenerated"— v0.2.57: `op.regenerated_data=True` file (e.g.
                           `.node_formats.json`) that diverged because the
                           project REGENERATED it. Keep local, NO warning /
@@ -4169,8 +4296,41 @@ def _file_action(
     if op.regenerated_data:
         return ("keep-regenerated", source_bytes)
 
-    # Default to safety: user-modified (or unknown provenance).
-    return ("preserve", source_bytes)
+    # v0.2.84 PLAN-v0284 D7 (P5, ruling R2): the two terminal "preserve"
+    # outcomes we reach here — (a) manifest-hash-mismatch (KNOWN user-modified,
+    # `prior_hash` present but `installed_hash != prior_hash`) and (b)
+    # manifest-less-no-history-match (`prior_hash == ""` and the file matched
+    # no template-git-history sha) — ADOPT the shipped bytes by default, EXCEPT
+    # for user-owned `knowledge/**` KG nodes (see below).
+    #
+    # R2 verbatim: "we don't expect users to edit any VCO CODEFILE". The
+    # bundle-shipped destination set that R2 covers is the CODE surface:
+    # `.claude/hooks/*`, `.claude/scripts/*`, `.claude/agents/*.md`,
+    # `.claude/skills/**`, `infrastructure/` compose (per the P5 anchor). For
+    # those, a divergent copy is a STALE shipped version — the old `preserve`
+    # outcome froze them forever + nagged with an eternal deferral (P5 incident:
+    # 11 files stuck), so we adopt.
+    #
+    # `knowledge/**` is DIFFERENT: KG nodes are USER-OWNED state (v0.2.81 made
+    # per-project knowledge user-owned — the orphan loop's knowledge-retirement
+    # branch already treats it as such, and drop-collections re-syncs from the
+    # on-disk `.md`). Adopting a user-modified KG node would DESTROY the user's
+    # own knowledge content ("never destroy user data"). So a divergent
+    # `knowledge/**` file stays `preserve` (the standing behavior, pinned by
+    # test_v52_c_kg_as_user_state.py). Normalize the separator before the prefix
+    # test (Windows dest_rel = `knowledge\...`) via the shared helper.
+    from vco_lib.paths import to_posix_rel as _to_posix_rel
+    if _to_posix_rel(op.dest_rel).startswith("knowledge/"):
+        return ("preserve", source_bytes)
+    #
+    # `_file_action` only CLASSIFIES — the backup-then-write-shipped machinery
+    # (and the backup-write-failure fallback to today's preserve + deferral)
+    # lives in the loop, which has the `folder`/`target_path` context the backup
+    # path needs. Other genuinely user-owned surfaces (CLAUDE.md,
+    # CONTEXT_STATE.md, MEMORY.md, .env) are NOT in this `ops` set at all — they
+    # flow through separate template/settings paths that are UNCHANGED. Both
+    # heal paths above stay plain `overwrite` (provably VCO bytes, no backup).
+    return ("adopt", source_bytes)
 
 
 def _write_file_atomic(target: Path, data: bytes, *, mode: Optional[int] = None) -> Optional[Path]:
@@ -4301,6 +4461,68 @@ def _write_file_atomic(target: Path, data: bytes, *, mode: Optional[int] = None)
     # structured `symlink_preserved_under_install_path` deferral. None on a
     # normal write.
     return redirect_target
+
+
+def _adopt_backup_timestamp() -> str:
+    """UTC basic-ISO timestamp for the per-run adoption-backup sub-dir.
+
+    Basic ISO (``20260717T031500Z``) rather than extended (with ``:``) so the
+    directory name is filesystem-safe on Windows (``:`` is illegal in NTFS
+    path components). One value is computed per install run and reused for
+    every file adopted in that run (a single ``<ts>`` dir per run per D7).
+    """
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _backup_bytes_for_adoption(
+    folder: Path, dest_rel: str, ts: str, current_bytes: bytes,
+) -> str:
+    """v0.2.84 PLAN-v0284 D7 (P5/R2): copy the CURRENT on-disk bytes of a file
+    about to be ADOPTED into the per-run backup tree, atomically.
+
+    Backup layout::
+
+        <folder>/.claude/backups/bundle-adoptions/<ts>/<dest_rel>
+
+    ``dest_rel`` is the bundle destination-relative path (e.g.
+    ``.claude/hooks/foo.sh``), reused verbatim under the timestamp dir so the
+    backup mirrors the project tree and is trivially discoverable. Uses the
+    shared ``_write_file_atomic`` primitive (parents created, atomic replace,
+    symlink guards apply).
+
+    Returns the backup path RELATIVE to ``folder`` (POSIX-normalised, for the
+    NOTICE / JSONL trail). Raises on any write failure — the caller MUST treat a
+    raise as "do NOT adopt" and fall back to preserve + deferral (never destroy
+    bytes without a captured copy).
+
+    v0.2.84 PLAN-v0284 A4: ``dest_rel`` is host-OS-shaped (``_enumerate_bundle_
+    files`` builds it via ``str(Path(...))`` → ``knowledge\\concepts\\foo.md`` on
+    Windows). We normalize the separator to ``/`` via the shared
+    ``vco_lib.paths.to_posix_rel`` helper (the v0.2.81 lesson — never inline a
+    2nd copy) and JOIN via the individual POSIX parts so the backup mirror tree
+    is byte-identical across OSes AND stays path-length-aware (component-wise
+    join, no monolithic string that could overflow a Windows MAX_PATH check).
+    """
+    from vco_lib.paths import to_posix_rel
+    rel_parts = PurePosixPath(to_posix_rel(dest_rel)).parts
+    backup_abs = folder / _ADOPT_BACKUPS_REL / ts
+    for part in rel_parts:
+        backup_abs = backup_abs / part
+    # `_write_file_atomic` may redirect through a symlink-blocking `.vco-new`
+    # sibling; if it does, the ORIGINAL backup destination did not receive the
+    # bytes. Treat a redirect as a backup failure (be conservative — we must
+    # have the bytes at the documented path before we overwrite the original).
+    redirect = _write_file_atomic(backup_abs, current_bytes)
+    if redirect is not None:
+        raise OSError(
+            f"adoption backup for {dest_rel} was redirected to a .vco-new "
+            f"sibling ({redirect}) — refusing to adopt without a captured copy "
+            "at the documented backup path"
+        )
+    backup_rel = PurePosixPath(to_posix_rel(str(_ADOPT_BACKUPS_REL))) / ts
+    for part in rel_parts:
+        backup_rel = backup_rel / part
+    return str(backup_rel)
 
 
 def _format_file_list_md(paths: list[str], cap: int = 100) -> str:
@@ -8618,17 +8840,36 @@ def _has_user_secret_shaped_line(path: Path) -> bool:
     used to live inside ``_emit_user_secret_values_retained_deferral`` so the
     reconciler can RE-DETECT the same state (single home, one concern).
 
-    - ``.claude/env``: a ``export KEY="..."`` line inside the managed block.
+    - ``.claude/env``: a ``export KEY="..."`` line inside the managed block
+      whose KEY ``is_secret_shaped_env_key`` flags AND whose quoted value is
+      non-empty (v0.2.84 PLAN-v0284 D6 / P4).
     - ``.claude/settings.json``: an ``env`` key that ``is_secret_shaped_env_key``
       flags (the SINGLE secret-shape home — never a substring fork).
 
-    No value is ever read/printed — only a pattern/shape match. Soft-fails to
-    ``False`` on any read/parse error.
+    No value is ever read/printed — only a pattern/shape + emptiness match.
+    Soft-fails to ``False`` on any read/parse error.
+
+    v0.2.84 PLAN-v0284 D6 (P4): the ``.claude/env`` branch used to match a
+    COARSE regex (``export\\s+[A-Z_][A-Z0-9_]*="``) that flagged EVERY uppercase
+    export in the managed block — so every safe-add project (23/23 pure-config
+    exports, zero secrets) re-emitted the ``user_secret_values_retained_in_tree``
+    deferral forever and the reconciler's re-detect could never self-clear it.
+    Both surfaces now route through the SINGLE secret-shape home
+    (``vco_lib.secrets_audit.is_secret_shaped_env_key``); the ``.claude/env``
+    branch additionally requires a non-empty quoted value (an empty
+    ``export FOO_TOKEN=""`` carries no VALUE to worry about).
     """
     if not path.is_file():
         return False
-    # Sentinel regex: a managed-block line that looks like a secret export.
-    secret_line_pattern = r'export\s+[A-Z_][A-Z0-9_]*="'
+    from vco_lib.secrets_audit import is_secret_shaped_env_key
+    # A managed-block export line: `export KEY="value"` (the canonical shape the
+    # config-projection writer emits). Captures KEY and the double-quoted value
+    # so we can shape-check the key and test the value for non-emptiness. We do
+    # NOT retain / log the value — only ``bool(value)`` participates.
+    _managed_export_re = re.compile(
+        r'^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([^"]*)"',
+        re.MULTILINE,
+    )
     try:
         text = path.read_text(encoding="utf-8")
         if path.name == "env":
@@ -8641,14 +8882,24 @@ def _has_user_secret_shaped_line(path: Path) -> bool:
             if begin == -1 or end == -1:
                 return False
             managed_block = text[begin:end]
-            return bool(re.search(secret_line_pattern, managed_block))
+            # D6 (P4): flag ONLY when a secret-SHAPED key carries a non-empty
+            # value. Pure-config routing keys (KG_COLLECTION, WEAVIATE_URL, ...)
+            # are never secret-shaped, so a config-only managed block reads
+            # clean and the deferral can self-clear.
+            for m in _managed_export_re.finditer(managed_block):
+                key, value = m.group(1), m.group(2)
+                if is_secret_shaped_env_key(key) and value != "":
+                    return True
+            return False
         elif path.name == "settings.json":
+            # settings.json branch UNCHANGED (v0.2.84 D6): keys already
+            # route through the single secret-shape home. No value check here
+            # (the env-key MAP has no ``export KEY="..."`` quoting to inspect).
             try:
                 data = json.loads(text)
                 env_block = data.get("env", {})
                 if not isinstance(env_block, dict):
                     return False
-                from vco_lib.secrets_audit import is_secret_shaped_env_key
                 for key in env_block:
                     if is_secret_shaped_env_key(key):
                         return True
@@ -8857,12 +9108,17 @@ def install_project_bundle(
             "always-overwrite": [<rel>...],
             "noop": [<rel>...],
             "preserve": [<rel>...],
+            "adopt": [<rel>...],                # v0.2.84 D7: shipped-file adoption
             "skip-existing": [<rel>...],
             "skip-disabled": [<rel>...],        # Wave 2 D, 2026-05-22
             "keep-regenerated": [<rel>...],     # v0.2.57: regen'd data, no warn
             "orphan-deleted": [<rel>...],       # v0.2.24 §A0
             "orphan-preserved": [<rel>...],     # v0.2.24 §A0
         },
+        # v0.2.84 D7: relative path of the per-run adoption-backup dir (present
+        # only when >=1 file was adopted this run). Additive — install.py
+        # call-sites are untouched.
+        "adopt_backup_dir": <rel> | absent,
         "settings_action": "created"|"merged"|"unchanged"|"unchanged (user file unparseable)"|"" ,
         "manifest_written": bool,
         "vco_version": str,
@@ -8892,7 +9148,7 @@ def install_project_bundle(
             "dry_run": bool(dry_run),
             "actions": {k: [] for k in
                         ("create", "overwrite", "always-overwrite",
-                         "noop", "preserve", "skip-existing",
+                         "noop", "preserve", "adopt", "skip-existing",
                          "skip-disabled", "keep-regenerated",
                          "orphan-deleted", "orphan-preserved",
                          "orphan-retired", "knowledge-retired")},
@@ -8933,7 +9189,7 @@ def install_project_bundle(
         # deferred), only pruned from the manifest. See the orphan loop.
         "actions": {k: [] for k in
                     ("create", "overwrite", "always-overwrite",
-                     "noop", "preserve", "skip-existing",
+                     "noop", "preserve", "adopt", "skip-existing",
                      "skip-disabled", "keep-regenerated",
                      "orphan-deleted", "orphan-preserved",
                      "orphan-retired", "knowledge-retired")},
@@ -9000,6 +9256,13 @@ def install_project_bundle(
     new_preserved: dict[str, dict] = {}
     user_modified_paths: list[str] = []
     skipped_existing_paths: list[str] = []
+    # v0.2.84 PLAN-v0284 D7 (P5/R2): shipped-file adoption. `adopted_paths`
+    # collects the dest_rels adopted this run (shipped bytes written after a
+    # timestamped backup of the current bytes). ONE `<UTC-basic-ts>` dir per run
+    # under `.claude/backups/bundle-adoptions/`, computed lazily on the first
+    # adoption so a run with zero adoptions creates no backup dir.
+    adopted_paths: list[tuple[str, str]] = []  # (dest_rel, backup_rel)
+    _adopt_backup_ts: Optional[str] = None
 
     ops = _enumerate_bundle_files(orchestrator_root, project_root=folder)
     _log("4.bundle", "start",
@@ -9022,8 +9285,15 @@ def install_project_bundle(
             result["errors"].append({"path": op.dest_rel, "error": err})
             continue
 
-        # Honour --force: in update mode, treat preserve as overwrite.
-        if force and update_mode and action == "preserve":
+        # Honour --force: in update mode, treat preserve/adopt as a plain
+        # overwrite. v0.2.84 D7 (P5): `adopt` already writes shipped bytes, but
+        # under --force we short-circuit to `overwrite` so force keeps its exact
+        # historical meaning — take the shipped version with NO adoption backup
+        # (the user explicitly asked to discard local edits; a backup would be
+        # noise). This also keeps the `--force` self-clear path unchanged (force
+        # runs never populate `user_modified_paths` → reconciler clears the
+        # stale `bundle_user_modified_preserved` entry).
+        if force and update_mode and action in ("preserve", "adopt"):
             action = "overwrite"
 
         # Compute the new shipped hash regardless of action — needed for
@@ -9035,7 +9305,78 @@ def install_project_bundle(
         # what's on disk — noop / always-overwrite cases).
         record_in_manifest = False
 
-        if action == "preserve":
+        if action == "adopt":
+            # v0.2.84 PLAN-v0284 D7 (P5/R2): shipped-file adoption. Back up the
+            # CURRENT on-disk bytes to `.claude/backups/bundle-adoptions/<ts>/`
+            # (never destroy bytes without a captured copy), THEN write the
+            # shipped bytes and record the manifest entry (as `overwrite` would).
+            # Backup-write failure ⇒ NO adoption: fall back to today's
+            # `preserve` + `bundle_user_modified_preserved` deferral so the
+            # divergent file is still surfaced. Dry-run never mutates the FS.
+            if dry_run:
+                # Planning preview: report the would-be adoption, no backup, no
+                # write, no manifest claim (mirrors dry-run for overwrite/create,
+                # which also skip the FS write and manifest record below).
+                pass
+            else:
+                try:
+                    current_bytes = target_path.read_bytes()
+                    if _adopt_backup_ts is None:
+                        _adopt_backup_ts = _adopt_backup_timestamp()
+                    backup_rel = _backup_bytes_for_adoption(
+                        folder, op.dest_rel, _adopt_backup_ts, current_bytes,
+                    )
+                except Exception as e:
+                    # Backup failed → do NOT adopt. Fall back to preserve.
+                    err = f"{type(e).__name__}: {e}"
+                    _log("4.bundle.adopt", "warn",
+                         f"{op.dest_rel}: adoption backup failed ({err}) — "
+                         "falling back to preserve + deferral",
+                         data={"path": op.dest_rel, "error": err})
+                    result["warnings"].append(
+                        f"adoption backup failed for {op.dest_rel} ({err}); "
+                        "preserved local file + deferral emitted"
+                    )
+                    action = "preserve"
+                else:
+                    # Backup captured — write the shipped bytes.
+                    try:
+                        mode: Optional[int] = None
+                        if op.dest_rel.endswith((".sh",)) or "/scripts/" in op.dest_rel.replace("\\", "/"):
+                            mode = 0o700
+                        _redirect = _write_file_atomic(target_path, source_bytes, mode=mode)
+                        if _redirect is not None:
+                            symlink_redirect_events.append((target_path, _redirect))
+                    except Exception as e:
+                        err = f"{type(e).__name__}: {e}"
+                        _log("4.bundle.adopt", "error",
+                             f"{op.dest_rel}: shipped write failed after backup: {err}",
+                             data={"path": op.dest_rel, "error": err})
+                        result["errors"].append({"path": op.dest_rel, "error": err})
+                        # Bytes were backed up but the shipped write failed —
+                        # do NOT claim the manifest entry, do NOT record an
+                        # adoption. The on-disk file is unchanged (atomic write
+                        # never partially replaced it). Skip to the next op.
+                        continue
+                    adopted_paths.append((op.dest_rel, backup_rel))
+                    record_in_manifest = True
+
+            # Fall-through: when `action` was flipped to "preserve" above (backup
+            # failure), do the preserve bookkeeping now (single home for that
+            # logic mirrors the `if action == "preserve"` block below).
+            if action == "preserve":
+                user_modified_paths.append(op.dest_rel)
+                existing = manifest.get("files", {}).get(op.dest_rel)
+                if existing is not None:
+                    new_files[op.dest_rel] = existing
+                new_preserved[op.dest_rel] = {
+                    "shipped_sha256": shipped_hash,
+                    "preserved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "shipped_source": op.source_rel,
+                    "reason": "preserve",
+                }
+
+        elif action == "preserve":
             user_modified_paths.append(op.dest_rel)
             # Keep the manifest's prior entry (don't update hash) so the
             # next update still recognizes the prior baseline.
@@ -9693,6 +10034,63 @@ def install_project_bundle(
                 result["warnings"].append(
                     f"user-modified deferral write failed: {err}"
                 )
+
+        # v0.2.84 PLAN-v0284 D7 (P5/R2): shipped-file adoption NOTICE. When one
+        # or more divergent bundle files were adopted this run, surface a
+        # ONE-TIME visible notice — NOT an eternal deferral. Three surfaces:
+        #   (i)   a stdout NOTICE block listing adopted paths + the backup dir,
+        #   (ii)  one `record_auto_resolution` JSONL row + loud log PER FILE
+        #         (v0.2.83 B-F9 shape), keyed to `bundle_user_modified_preserved`
+        #         so the audit trail ties to the retired deferral condition,
+        #   (iii) additive `result["adopt_backup_dir"]` (the `actions.adopt`
+        #         list is populated by the per-op tail append; both are
+        #         additive-only — install.py call-sites are untouched).
+        # Backups are kept forever (small, user-prunable). The reconciler's
+        # `still_user_modified=bool(user_modified_paths)` naturally clears any
+        # STALE `bundle_user_modified_preserved` entry because adopted files
+        # never land in `user_modified_paths` (only the backup-failure fallback
+        # does, and that path re-emits the deferral for exactly those files).
+        if adopted_paths and _adopt_backup_ts is not None:
+            from vco_lib.paths import to_posix_rel as _to_posix_rel
+            adopt_backup_dir_rel = _to_posix_rel(
+                _ADOPT_BACKUPS_REL / _adopt_backup_ts
+            )
+            result["adopt_backup_dir"] = adopt_backup_dir_rel
+            # (i) stdout NOTICE block. Printed to stdout (not stderr) so the
+            # CLI human-readable path and the launcher's stdout reader both see
+            # it. Kept compact + bounded via `_format_file_list_md`.
+            notice_paths = _format_file_list_md(
+                sorted(rel for rel, _ in adopted_paths)
+            )
+            print(
+                "\n[vct] NOTICE — shipped-file adoption (v0.2.84):\n"
+                f"  {len(adopted_paths)} bundle file(s) at VCO-shipped "
+                "destinations diverged from the shipped version and were "
+                "ADOPTED (refreshed to the current shipped bytes).\n"
+                "  Your previous bytes were backed up (kept forever; prune "
+                f"when you no longer need them) under:\n    {adopt_backup_dir_rel}\n"
+                f"{notice_paths}\n",
+                flush=True,
+            )
+            result["warnings"].append(
+                f"{len(adopted_paths)} VCO-shipped file(s) adopted (refreshed); "
+                f"prior bytes backed up under {adopt_backup_dir_rel}"
+            )
+            # (ii) one auto-resolution record per adopted file.
+            try:
+                from vco_lib import deferral_emit as _de_adopt
+                for rel, backup_rel in adopted_paths:
+                    _de_adopt.record_auto_resolution(
+                        folder,
+                        "bundle_user_modified_preserved",
+                        "adopted_shipped_file",
+                        f"{rel} (backup: {backup_rel})",
+                        log=_log_auto,
+                    )
+            except Exception as e:  # noqa: BLE001 — the JSONL trail is best-effort
+                _log("4.bundle.adopt", "warn",
+                     f"adoption auto-resolution record failed: "
+                     f"{type(e).__name__}: {e}")
 
         if skipped_existing_paths:
             try:
@@ -10514,6 +10912,13 @@ def _apply_standalone_env(
         # will settle the final prefix on first analysis.
         code_graph_project = sanitized
 
+    # v0.2.84 PLAN-v0284 D1/D3 last-resort clause: this is the no-DB standalone
+    # path (--write-env without a reachable launcher.db), so there is NO binding
+    # to resolve from — name derivation is the CORRECT last resort here (per D1,
+    # name-derivation survives only in genuinely binding-less contexts). The
+    # DB-backed / settings-pinned writers (config_projection.project_env_from_db,
+    # the Rust populate(), and D3's binding-first bootstrap/migrate) resolve
+    # binding-first; this path only ever runs when they can't.
     kg_collection = f"{sanitized}_KnowledgeGraph"
     dev_collection = f"{sanitized}_Development"
     diagrams_collection = f"{sanitized}_Diagrams"
@@ -11182,12 +11587,18 @@ def _backfill_kg_collection_env_in_project(
         resolved["SHARED_KG_COLLECTION"] = db_shared
 
     # DEVELOPMENT_COLLECTION — derived by suffix swap from the primary.
+    # v0.2.84 PLAN-v0284 D3/D1: route BOTH the suffix-swap and the name-derived
+    # fallback through the ONE-rule helper `_dev_diagrams_from_primary` so the
+    # dev-name derivation has a single home (== config_projection's future
+    # one-rule realization + the hub's Decision C). Same resolved value as
+    # before for both the binding-first primary and the name-derived last
+    # resort — just no longer an inline duplicate of the rule.
     if "DEVELOPMENT_COLLECTION" not in env:
         primary = env.get("KG_COLLECTION", "")
-        if isinstance(primary, str) and primary.endswith("_KnowledgeGraph"):
-            dev_name = primary[: -len("_KnowledgeGraph")] + "_Development"
-        else:
-            dev_name = f"{_derive_basename()}_Development"
+        primary = primary if isinstance(primary, str) else ""
+        dev_name, _diagrams = _dev_diagrams_from_primary(
+            primary, _derive_basename(),
+        )
         env["DEVELOPMENT_COLLECTION"] = dev_name
         added.append("DEVELOPMENT_COLLECTION")
         resolved["DEVELOPMENT_COLLECTION"] = dev_name
@@ -11773,7 +12184,17 @@ def _cmd_migrate_collections(args: argparse.Namespace) -> int:
         return 2
 
     if not all_projects:
-        derived = derive_project_collection_names(args.name)
+        # v0.2.84 PLAN-v0284 D3 (P2 / ruling R3): resolve BINDING-FIRST when a
+        # `--project-folder` is available (update step 3 walks the CORRECT
+        # collection family instead of the display-name-derived one). Pre-.84
+        # this name-derived from `--name`, so a diverged binding made the
+        # migrate dispatcher walk the wrong `<DisplayName>_*` family. Falls back
+        # to the identical name-derived set when no folder / no binding.
+        _mig_folder = getattr(args, "project_folder", None)
+        _mig_folder_path = Path(_mig_folder).resolve() if _mig_folder else None
+        derived = _resolve_bundle_collection_names_binding_first(
+            args.name, _mig_folder_path,
+        )
         # Inject env so migrate_collections picks them up. We don't mutate
         # the caller's environment beyond this process — argparse callers
         # are typically the Rust subprocess or a CLI invocation, not a long-
