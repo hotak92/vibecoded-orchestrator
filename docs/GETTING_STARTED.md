@@ -24,7 +24,7 @@ What gets auto-installed when missing:
   - macOS: `brew install podman`, then `podman machine init && podman machine start` (one-time prereq — both commands must complete before re-running the installer)
   - Windows: `winget install RedHat.Podman` (requires WSL2: `wsl --install`)
 
-Auto-start behaviour for the Podman daemon (v0.2.51+): if Podman is installed but the daemon/socket is not responding, `install.py` attempts `systemctl --user start podman.socket` (Linux) or `podman machine start` (macOS/Windows) before giving up. If the start fails (e.g. machine not yet initialized), a deferral entry is written to `.claude/context/UPDATE_DEFERRED.md` with the exact manual command to run — no destructive auto-init.
+Auto-start behaviour for the Podman daemon: if Podman is installed but the daemon/socket is not responding, `install.py` attempts `systemctl --user start podman.socket` (Linux) or `podman machine start` (macOS/Windows) before giving up. If the start fails (e.g. machine not yet initialized), a deferral entry is written to `.claude/context/UPDATE_DEFERRED.md` with the exact manual command to run — no destructive auto-init.
 
 On Linux (Fedora/RHEL/CentOS) with SELinux in `Enforcing` mode, the bootstrap prepass detects this and the install adds `:Z` to bind-mount volume args automatically. On hosts with an NVIDIA GPU, the install prints the distro-specific install hint for `nvidia-container-toolkit` when missing — the GPU itself is detected, the toolkit is not auto-installed.
 
@@ -54,7 +54,7 @@ Or, after cloning, double-click the file for your OS:
 
 1. **Python detect** — OS-aware candidate cascade. macOS tries Apple Silicon Homebrew under `/opt/homebrew/opt/python@3.13/` first, then PATH; Linux tries PATH then `/home/linuxbrew/.linuxbrew/bin/`; Windows uses the Python Launcher (`py -3.13` first) then PATH. Each candidate is version-probed (`>= 3.11` required). If none qualifies, the shim prints the distro-specific install hint (apt/dnf/pacman/zypper/apk on Linux, `brew install python@3.13` on macOS, `winget install Python.Python.3.13` on Windows) and on interactive runs offers to install via the package manager.
 
-2. **Bootstrap prepass** — `install.py --bootstrap --json` runs as a read-only system-detection probe, writing a versioned JSON envelope to `state/logs/bootstrap-prepass.json`. The envelope contains detected Python/Node/Podman/Docker versions, GPU vendor + VRAM, RAM, OS / distro / package manager, resolved paths (install root, launcher binary, dist subdir), Weaviate / Ollama / code-embed / vct-hub endpoints, and a `missing_prereqs` list with per-tool install hints. Side-effect policy: no file writes, no network, no prompts; every probe has a timeout. Failure here is logged and ignored — the full install runs regardless. Schema: [`docs/INSTALL_ARCHITECTURE_v2.md` §3](INSTALL_ARCHITECTURE_v2.md#3-target-architecture-installpy---bootstrap-mode). The `--bootstrap` flag is mutually exclusive with `--update` / `--lightweight` / `--uninstall` and is invoked alone in its own process by the shim.
+2. **Bootstrap prepass** — `install.py --bootstrap --json` runs as a read-only system-detection probe, writing a versioned JSON envelope to `state/logs/bootstrap-prepass.json`. The envelope contains detected Python/Node/Podman/Docker versions, GPU vendor + VRAM, RAM, OS / distro / package manager, resolved paths (install root, launcher binary, dist subdir), Weaviate / Ollama / code-embed / vct-hub endpoints, and a `missing_prereqs` list with per-tool install hints. Side-effect policy: no file writes, no network, no prompts; every probe has a timeout. Failure here is logged and ignored — the full install runs regardless. Schema: [`docs/INSTALL_ARCHITECTURE_v2.md` §3](INSTALL_ARCHITECTURE_v2.md#3-installpy---bootstrap-mode). The `--bootstrap` flag is mutually exclusive with `--update` / `--lightweight` / `--uninstall` and is invoked alone in its own process by the shim.
 
 3. **Full install** — `install.py <forwarded args>` runs the canonical 10-step flow: Python check, system detection, optional companions (lean-ctx), venv, dependencies, containers, Ollama models, Weaviate collections + KG seeding, MCP server registration in `~/.claude.json`, and Claude CLI check. The shim forwards every user-supplied flag verbatim (so `bash first-install.sh --update`, `--gpu`, `--cpu-only`, etc. all work).
 
@@ -64,7 +64,7 @@ Flags the shim itself consumes: `--no-auto-launch` (skip the post-install launch
 
 After install, double-click `start-launcher.<ext>` for your OS to start the launcher GUI.
 
-> **Where prebuilt binaries come from (and which clone ref to track).** The launcher/hub/updater binaries that the post-install step downloads come from the **GitHub Release `.zip` assets**, and the in-GUI "Update orchestrator" button updates by **pulling `main`**. Both of those paths are always correct. The in-repo prebuilt binaries under `launcher/dist/` are committed by CI *after* a tag is cut (a `chore(binary): refresh ... [skip ci]` commit), so historically a `git checkout <tag>` for some tags landed vN source next to the previous cycle's binaries. Since v0.2.64 the release workflow **re-points the tag onto that refresh commit**, so `git checkout v0.2.64` (and later) is self-consistent. Still, the recommended dev-clone posture is to **track `main`** (or use the Release `.zip` assets) rather than pinning to a tag and expecting matching prebuilt binaries — `main` always carries the freshest binaries.
+> **Where prebuilt binaries come from (and which clone ref to track).** The launcher/hub/updater binaries that the post-install step downloads come from the **GitHub Release `.zip` assets**, and the in-GUI "Update orchestrator" button updates by **pulling `main`**. Both of those paths are always correct. The in-repo prebuilt binaries under `launcher/dist/` are committed by CI *after* a tag is cut (a `chore(binary): refresh ... [skip ci]` commit); the release workflow **re-points each tag onto that refresh commit**, so a `git checkout <tag>` is self-consistent. Still, the recommended dev-clone posture is to **track `main`** (or use the Release `.zip` assets) rather than pinning to a tag and expecting matching prebuilt binaries — `main` always carries the freshest binaries.
 
 **Time budget**: ~5 min of interactive prompts, then 10–30 min for container images and model downloads (~5 GB; GPU mode pulls an additional ~2.5 GB). Re-runs reuse cached images.
 
@@ -74,7 +74,7 @@ After install, double-click `start-launcher.<ext>` for your OS to start the laun
 
 #### CI smoke
 
-`install-smoke-tri-os.yml` runs the actual shims end-to-end on ubuntu-22.04, ubuntu-24.04, macos-14, windows-latest, and fedora-40 every PR + push to main + daily at 06:00 UTC. The Fedora job exercises SELinux `:Z` mount handling; the Ubuntu jobs exercise libwebkit2gtk-4.0/4.1 fallback; macOS exercises the Apple Silicon Homebrew cascade and bash 3.2; Windows exercises `first-install.bat` in real `cmd.exe` (the older `installer-smoke.yml` Windows job runs under `shell: bash`, which never reaches the BAT code path). Pre-ship gate 22 blocks release tags when this workflow is red on main.
+`install-smoke-tri-os.yml` runs the actual shims end-to-end on ubuntu-22.04, ubuntu-24.04, macos-14, windows-latest, and fedora-40 every PR + push to main + daily at 06:00 UTC. The Fedora job exercises SELinux `:Z` mount handling; the Ubuntu jobs exercise libwebkit2gtk-4.0/4.1 fallback; macOS exercises the Apple Silicon Homebrew cascade and bash 3.2; Windows exercises `first-install.bat` in real `cmd.exe` (the separate `installer-smoke.yml` Windows job runs under `shell: bash`, which never reaches the BAT code path). Pre-ship gate 22 blocks release tags when this workflow is red on main.
 
 ### For advanced users: run install.py directly
 
@@ -101,7 +101,7 @@ python3 install.py --bootstrap                            # human-readable summa
 3. Starts Weaviate and Ollama in containers and waits for them to be ready
 4. Pulls embedding models (`qwen3-embedding:0.6b` by default; CodeSage-Large-v2 on GPU installs; the code backend's fallback chain is CodeSage → qwen3 → Jina, picked at construction time)
 5. Writes `.env`, `.claude/settings.json` (canonical MCP-env channel — propagates to MCP subprocesses on every Claude Code surface), and `.claude/env` (POSIX shell-sourceable copy). `.vscode/settings.json` is touched only for VS Code editor preferences (Pylance/watcher excludes); `.vscode/tasks.json` is written so VS Code auto-starts `vct-hub` on `folderOpen`
-6. Copies 44 agent templates into `.claude/agents/` and 53 skill templates into `.claude/skills/`; renders 36 hooks (both `.sh` and `.ps1` per hook on every OS — cross-OS workflows don't get stale orphans) into `.claude/hooks/`
+6. Copies 44 agent templates into `.claude/agents/` and 53 skill templates into `.claude/skills/`; renders 45 hooks (both `.sh` and `.ps1` per hook on every OS — cross-OS workflows don't get stale orphans) into `.claude/hooks/`
 7. Registers four MCP servers in `~/.claude.json`: `weaviate-kg` (semantic + graph search) and `search` (academic-paper search via OpenAlex + arXiv) are **enabled by default per project**; `mermaid` (Mermaid diagram describe/extract) and `excalidraw` (Excalidraw diagram describe/extract) are **registered but default-disabled per project** via `BUNDLED_MCP_DEFAULT_DISABLED` at `launcher/src-tauri/vct-launcher-core/src/db/project_mcp_servers.rs:73-76` (`claude mcp list` shows them connected, but their tools are not callable until you opt in via the launcher's Diagrams tab). A fifth MCP — `playwright` (browser automation) — is **enabled by default** and invoked separately via `npx -y @playwright/mcp@latest`; install.py pre-caches it at `_install_playwright_browsers`. Opt out with `VCT_SKIP_PLAYWRIGHT=1`. The code-embedding service is a backend HTTP service on `:11440`, not an MCP — it's started in step 3 alongside Weaviate/Ollama. The `vct-coordination` MCP is **Pro-tier** and excluded from the default install
 8. Deploys the detached `vct-hub` binary alongside the launcher, invokes `vct-hub --start-if-not-running`, probes `/health`. The hub listens on `127.0.0.1:7700` by default (`VCT_HUB_PORT` to override); auth via fresh-per-startup bearer token at `<vct_root>/hub.token` (mode `0o600`)
 
@@ -109,10 +109,10 @@ python3 install.py --bootstrap                            # human-readable summa
 
 The code-graph subsystem embeds source code into Weaviate for semantic search. Two backends ship:
 
-- **CodeSage-Large-v2** (2048-dim, Apache 2.0) — the default on NVIDIA hosts with ≥4 GB VRAM. Runs inside `infrastructure/codesage/Dockerfile.cuda` and listens on `:11440`. The bundled image is **CUDA-only by default**; the `Dockerfile.cuda` variant is the one the install pulls when it detects an NVIDIA GPU + drivers + ≥4 GB VRAM.
-- **Ollama fallback** — for hosts without a workstation-class NVIDIA GPU. The code-embed service exposes the same `:11440` HTTP API but routes embed requests through Ollama on `:11435`. The stock fallback model is `unclemusclez/jina-embeddings-v2-base-code:latest` (768-dim, code-specialized); hosts with 6-12 GB of GPU VRAM are tiered up to `qwen3-embedding:0.6b` (1024-dim) instead. Lower quality than CodeSage but works on every CPU and on Apple Silicon. AMD/ROCm hosts also use this path regardless of VRAM — CodeSage has no ROCm build, while Ollama itself IS ROCm-accelerated via the rocm compose overlay, so the embedding still runs on the GPU.
+- **CodeSage-Large-v2** (2048-dim, Apache 2.0) — the default on NVIDIA hosts with ≥12 GB VRAM. Runs inside `infrastructure/codesage/Dockerfile.cuda` and listens on `:11440`. The bundled image is **CUDA-only by default**; the `Dockerfile.cuda` variant is the one the install pulls when it detects an NVIDIA GPU + drivers + ≥12 GB VRAM.
+- **Ollama fallback** — for hosts without a workstation-class NVIDIA GPU. The code-embed service exposes the same `:11440` HTTP API but routes embed requests through Ollama on `:11435`. The stock fallback model is `unclemusclez/jina-embeddings-v2-base-code:latest` (768-dim, code-specialized, the universal CPU / low-VRAM floor); hosts with 6-12 GB of GPU VRAM are tiered up to `qwen3-embedding:0.6b` (1024-dim) instead. Lower quality than CodeSage but works on every CPU and on Apple Silicon. AMD/ROCm hosts also use this path regardless of VRAM — CodeSage has no ROCm build, while Ollama itself IS ROCm-accelerated via the rocm compose overlay, so the embedding still runs on the GPU.
 
-Apple Silicon + macOS Intel users get the Ollama-based code embedding via the standard install — no extra flags, no manual Dockerfile swap. The hardware detection step (step 2) classifies the host as "Apple Silicon" and the embedding-backend resolver picks Ollama automatically; the CodeSage Dockerfile is skipped entirely (it would not build on the host's image-pull architecture anyway). A native Metal-accelerated CodeSage variant is on the v0.3.0+ roadmap. (Correction v0.2.54: the blocker is NOT upstream Metal wheels — stock torch has shipped MPS for years and `code_embedding_service/server.py` now auto-probes `mps` for native non-container runs; the remaining gap is an arm64 container image with stock torch.)
+Apple Silicon + macOS Intel users get the Ollama-based code embedding via the standard install — no extra flags, no manual Dockerfile swap. The hardware detection step (step 2) classifies the host as "Apple Silicon" and the embedding-backend resolver picks Ollama automatically; the CodeSage Dockerfile is skipped entirely (it would not build on the host's image-pull architecture anyway). A native Metal-accelerated CodeSage variant is on the roadmap — `code_embedding_service/server.py` already auto-probes `mps` for native non-container runs; the remaining gap is an arm64 container image with stock torch.
 
 ### Common install flags
 
@@ -158,11 +158,11 @@ The chosen action per service is recorded in `~/.vct/services.toml` and re-read 
 When install adopts an existing Weaviate, it must not pollute the host with bare top-level `KnowledgeGraph` / `Development` collections — many users run Weaviate with per-project namespacing (`MyProject_KnowledgeGraph`, etc.). Adopt mode therefore:
 
 1. **Derives the per-install KG name from the project basename** — installing in `~/projects/myapp/` writes to `Myapp_KnowledgeGraph` and `Myapp_Development`. Hyphens / underscores in the basename are PascalCased; pure-punctuation basenames fall back to `vct_KnowledgeGraph`.
-2. **Honors `KG_COLLECTION` / `DEVELOPMENT_COLLECTION` env vars** if set (typically via `.claude/settings.json` `env` — the canonical channel; the historical `.vscode/settings.json` `claude-code.env` source was removed in v0.2.12 / PR-27 because it didn't propagate to MCP subprocesses on Linux) — explicit override wins over the basename derivation.
+2. **Honors `KG_COLLECTION` / `DEVELOPMENT_COLLECTION` env vars** if set (typically via `.claude/settings.json` `env` — the canonical channel; `.vscode/settings.json` `claude-code.env` does not propagate to MCP subprocesses) — explicit override wins over the basename derivation.
 3. **Skips creation of any collection that already exists** under the resolved name.
 4. **Skips a `Development` collection entirely** if the host already has any `<X>_development` (the host's namespacing wins).
 5. **Announces every proposed creation and waits for confirmation** in interactive mode. Pass `--yes` for non-interactive runs.
-6. **Does not auto-adopt cross-project shared KGs** like an existing `ClaudeKnowledgeGraph`. The orchestrator runs an orphan-prune sync that deletes entries whose `file_path` no longer exists in the active project, so two installs sharing one collection would silently delete each other's entries. vco always creates its own `VibeCodedOrchestrator_KnowledgeGraph` (renamed from `VibeCodedTools_KnowledgeGraph` in v0.2.12; existing installs can use the launcher's Identity tab picker to designate the old class as canonical).
+6. **Does not auto-adopt cross-project shared KGs** like an existing `ClaudeKnowledgeGraph`. The orchestrator runs an orphan-prune sync that deletes entries whose `file_path` no longer exists in the active project, so two installs sharing one collection would silently delete each other's entries. vco always creates its own `VibeCodedOrchestrator_KnowledgeGraph` (installs whose shared collection carries a different name can use the launcher's Identity tab picker to designate that existing class as canonical).
 
 When install starts its own Weaviate (no adoption), bare `KnowledgeGraph` / `Development` defaults are kept — there's nothing else in the instance to namespace against.
 
@@ -177,7 +177,7 @@ python install.py --skip-collections      # bootstrap-only opt-out (still seeds)
 
 #### Gating writes to the shared cross-project KG
 
-Set `SHARED_KG_WRITE_DISABLED=true` in `.env` (or in the install environment) to refuse `store_knowledge_node(scope="shared")` calls from this project. Reads of `VibeCodedOrchestrator_KnowledgeGraph` (renamed from `VibeCodedTools_KnowledgeGraph` in v0.2.12) remain on (asymmetric model since 2026-05-01: every project always reads the shared KG; the gate is write-only). Legacy alias `SHARED_KG_OPT_OUT` kept for ~3 releases.
+Set `SHARED_KG_WRITE_DISABLED=true` in `.env` (or in the install environment) to refuse `store_knowledge_node(scope="shared")` calls from this project. Reads of `VibeCodedOrchestrator_KnowledgeGraph` remain on (asymmetric model: every project always reads the shared KG; the gate is write-only). `SHARED_KG_OPT_OUT` is accepted as a legacy alias.
 
 #### Lock file: `~/.vct/services.toml`
 
@@ -215,10 +215,10 @@ After install, open the `vibecoded-orchestrator` directory in one of the three s
 On session start, the following hooks fire automatically (`SessionStart` matcher: `startup`):
 
 1. `ensure-containers.sh` — checks that Weaviate, Ollama, and the code-embedding service are running; starts them if not
-2. `session-start-ensure-hub.sh` (v0.2.21+) — probes `vct-hub /health`, runs `vct-hub --start-if-not-running` if not. The hub outlives the launcher GUI, so projects opened directly via the CLI or VS Code still get the resolver
+2. `session-start-ensure-hub.sh` — probes `vct-hub /health`, runs `vct-hub --start-if-not-running` if not. The hub outlives the launcher GUI, so projects opened directly via the CLI or VS Code still get the resolver
 3. `session-start-kg-loader.sh` — displays KG resource paths
-4. `context-size-check.sh` — warns if `.claude/CONTEXT_STATE.md` is over 200 lines
-5. `embedding-failures-surface.sh` (v0.2.18+) — if `.claude/context/EMBEDDING_FAILURES.md` exists (written by `vco_lib.embedding_service` when a backend was unreachable), surfaces a Claude-readable hint on the next chat start. Auto-clears on the next successful embed
+4. `context-size-check.sh` — warns if `.claude/CONTEXT_STATE.md` is over 500 lines
+5. `embedding-failures-surface.sh` — if `.claude/context/EMBEDDING_FAILURES.md` exists (written by `vco_lib.embedding_service` when a backend was unreachable), surfaces a Claude-readable hint on the next chat start. Auto-clears on the next successful embed
 6. `compact-context-reinject.sh` (on resume after compaction) — reinjects `CONTEXT_STATE.md`, recent commits, and any active plan
 
 Verify MCP servers connected:
@@ -234,7 +234,7 @@ claude mcp list
 # is Pro-tier and excluded from the default install.
 ```
 
-Verify the hub is up (v0.2.21+):
+Verify the hub is up:
 
 ```bash
 vct-hub --status                                # CLI helper
@@ -258,15 +258,15 @@ Claude will analyze the codebase and write these files into the target project:
 
 It also queues a background code graph analysis of the target project.
 
-Alternatively, use the VCT Launcher GUI: it runs the same configuration wizard visually and writes both env files (`.claude/settings.json` env + `.claude/env`) in lockstep so the CLI, VS Code extension, and Claude Desktop app all see the same MCP environment. As of v0.2.12 (PR-27, 2026-05-16) the launcher no longer writes `.vscode/settings.json` `claude-code.env` — empirical sentinel testing showed that block did not propagate to MCP subprocesses on Linux Claude Code 2.1.143.
+Alternatively, use the VCT Launcher GUI: it runs the same configuration wizard visually and writes both env files (`.claude/settings.json` env + `.claude/env`) in lockstep so the CLI, VS Code extension, and Claude Desktop app all see the same MCP environment. The launcher does not write `.vscode/settings.json` `claude-code.env` — that block does not propagate to MCP subprocesses on Linux.
 
 ### Background tasks the launcher fans out on Add project
 
 The `create_project_v2` Tauri command returns the moment bundle install finishes; three background tasks then run in parallel so a project with pre-existing content lands fully indexed without you running CLI commands by hand:
 
 1. **Code graph build** (`commands::codegraph::spawn_initial_build`) — runs `code-graph-analyze` over the project root.
-2. **KG sync** (`commands::kg_sync::spawn_initial_sync`, added 0.2.2) — runs `.claude/scripts/kg-sync --all` against `knowledge/**/*.md` and `docs/**/*.md`. Idempotent at the Weaviate layer (UUIDs derived from node title); safe to re-run.
-3. **KG summaries** (`commands::kg_summary::spawn_initial_summary`, added 0.2.3) — runs `.claude/scripts/generate-kg-summary.py` per file. Picks the first available backend: `claude` CLI on PATH → Ollama at `KG_SUMMARY_OLLAMA_URL` (default `http://localhost:11435`, model `KG_SUMMARY_OLLAMA_MODEL`, default `qwen3.5:9b`) → `ANTHROPIC_API_KEY` direct → silent skip. Content-hashes each node, so re-runs are a cheap no-op for unchanged nodes.
+2. **KG sync** (`commands::kg_sync::spawn_initial_sync`) — runs `.claude/scripts/kg-sync --all` against `knowledge/**/*.md` and `docs/**/*.md`. Idempotent at the Weaviate layer (UUIDs derived from node title); safe to re-run.
+3. **KG summaries** (`commands::kg_summary::spawn_initial_summary`) — runs `.claude/scripts/generate-kg-summary.py` per file. Picks the first available backend: `claude` CLI on PATH → Ollama at `KG_SUMMARY_OLLAMA_URL` (default `http://localhost:11435`, model `KG_SUMMARY_OLLAMA_MODEL`, default `qwen3.5:9b`) → `ANTHROPIC_API_KEY` direct → silent skip. Content-hashes each node, so re-runs are a cheap no-op for unchanged nodes.
 
 Each task surfaces its progress in the GUI:
 
@@ -299,10 +299,10 @@ Once a project is configured, here is what fires on normal use:
 - Injects matches into the context window before Claude generates a response
 
 **On every file edit** (`PostToolUse` hook on `Edit`/`Write`):
-- Files under `knowledge/` sync to Weaviate (per-project `<KG_COLLECTION>`; content-hash skip on unchanged nodes since v0.2.17)
-- Files under `docs/` sync to the development collection (per-project `<DEVELOPMENT_COLLECTION>`; gained content-hash + status parity with KG in v0.2.18 — ~820x faster on unchanged content)
-- Code files are queued for code graph re-analysis (`code-graph-incremental.{sh,ps1}` — invokes `analyze --incremental --language <lang> --prune-stale` since v0.2.18, scoped per-language so deleted files in one language never wipe rows from another)
-- A credential scan runs on the written file (`post-tool-security.sh` — sentinel renamed in v0.2.16 to avoid false positives on docs that quote the marker)
+- Files under `knowledge/` sync to Weaviate (per-project `<KG_COLLECTION>`; content-hash skip on unchanged nodes)
+- Files under `docs/` sync to the development collection (per-project `<DEVELOPMENT_COLLECTION>`; same content-hash + status handling as the KG — unchanged content is a cheap no-op)
+- Code files are queued for code graph re-analysis (`code-graph-incremental.{sh,ps1}` — invokes `analyze --incremental --language <lang> --prune-stale`, scoped per-language so deleted files in one language never wipe rows from another)
+- A credential scan runs on the written file (`post-tool-security.sh`)
 
 **On session end** (`Stop` hook):
 - Cost data appended to `~/.claude/metrics/costs.jsonl`
@@ -366,7 +366,7 @@ Tools the installer detects and integrates with when present, but doesn't requir
 - lower token costs per session
 - faster response time on commands that produce verbose output
 
-The orchestrator's installer detects lean-ctx automatically. As of v0.2.11 the wiring is via a PreToolUse hook (`.claude/hooks/lean-ctx-rewrite.{sh,ps1}`) that rewrites each `Bash(<cmd>)` tool call to `lean-ctx -c '<cmd>'`. The hook is a no-op if lean-ctx isn't on `PATH`. The earlier `BASH_ENV` shim approach (which sourced a per-project script into every non-interactive Bash subprocess) was disabled in v0.2.11 after a fork-bomb incident on lean-ctx 3.x — the stub file lives on disk as a `return 0` no-op for defense-in-depth.
+The orchestrator's installer detects lean-ctx automatically. The wiring is a PreToolUse hook (`.claude/hooks/lean-ctx-rewrite.{sh,ps1}`) that rewrites each `Bash(<cmd>)` tool call to `lean-ctx -c '<cmd>'`. The hook is a no-op if lean-ctx isn't on `PATH`.
 
 Bypass / override matrix:
 
@@ -377,7 +377,7 @@ Bypass / override matrix:
 | Per-project default = off | Add `VCO_LEAN_CTX_DEFAULT=off` to `.claude/env` |
 | Disable all VCO hooks (debug only) | `export VCT_DISABLE_HOOKS=1` |
 
-Footgun (mitigated in v0.2.75): lean-ctx in default mode can swallow stderr from `git commit` to zero output when a pre-commit hook fails. The rewrite hook now **auto-bypasses `git commit` and `git push`** (they run raw, uncompressed — no more silent hook-failed commits). For any *other* command that exits non-zero with no message, retry under `lean-ctx bypass "..."`.
+Footgun note: lean-ctx in default mode can swallow stderr from failing commands. The rewrite hook **auto-bypasses `git commit` and `git push`** (they run raw, uncompressed — a pre-commit hook failure is never silenced). For any *other* command that exits non-zero with no message, retry under `lean-ctx bypass "..."`.
 
 Install:
 ```bash
@@ -388,7 +388,7 @@ curl -fsSL https://leanctx.com/install.sh | sh
 
 Skip with `--no-lean-ctx` if you don't want the auto-detection prompt.
 
-## vct-hub: project + secrets resolver (v0.2.21+)
+## vct-hub: project + secrets resolver
 
 `vct-hub` is a small detached `axum` HTTP service that the launcher, the MCP servers, and the bundled scripts all hit instead of reading process-scoped env vars directly. It exists because `os.getenv("KG_COLLECTION")` (and the like) tended to drift between surfaces — different Claude Code surfaces, different shells, different subagent contexts could each end up with a slightly different snapshot of the per-project config.
 
@@ -397,13 +397,13 @@ Skip with `--no-lean-ctx` if you don't want the auto-detection prompt.
 | HTTP listener | `http://127.0.0.1:7700` (default; `VCT_HUB_PORT` to override; falls back to `<vct_root>/hub.port`) | All `/api/v1/*` routes require `Authorization: Bearer <token>`, except `/health` |
 | Token | `<vct_root>/hub.token` (mode `0o600`) | Regenerated on every hub startup. Read by every resolver client |
 | Lockfile | `<vct_root>/hub.pid` | Single-instance per user |
-| CLI | `vct-hub --start-if-not-running` / `--status` / `--stop` / `--foreground` | Also `--register-boot` / `--unregister-boot` / `--boot-status` for the OS auto-start (systemd-user / launchd / Windows Scheduled Task; **default off in v0.2.21**, user opts in via launcher Preferences) |
+| CLI | `vct-hub --start-if-not-running` / `--status` / `--stop` / `--foreground` | Also `--register-boot` / `--unregister-boot` / `--boot-status` for the OS auto-start (systemd-user / launchd / Windows Scheduled Task; **default off**, user opts in via launcher Preferences) |
 
 Key endpoints (auth required):
 
 - `GET /api/v1/projects/{id-or-slug}/config` — resolves KG collection, codegraph prefix, embedding model id, and access-matrix lists for the named project. Use this instead of trusting an inherited env var.
 - `GET /api/v1/projects/{id}/env` — resolves secrets from the OS keychain (e.g. shared `github_pat`, `openai_api_key`).
-- `GET /api/v1/services/status` — services snapshot (v0.2.21 returns a degraded skeleton; full supervisor relocation lands later).
+- `GET /api/v1/services/status` — services snapshot.
 
 Resolver client libraries ship in the install bundle: `templates/scripts/vct_project_config.sh` (bash), `templates/scripts/vct_project_config.ps1` (PowerShell 7+), and `vco_lib/project_config.py` (Python). They each discover the hub via `$VCT_HUB_PORT` → `<vct_root>/hub.port` → `7700`, and the token via `$VCT_HUB_TOKEN` → `<vct_root>/hub.token`. The Python client retries on `401` with cache invalidation (so a token rotation mid-session doesn't strand a long-running script).
 

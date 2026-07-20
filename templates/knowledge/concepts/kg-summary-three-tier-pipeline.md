@@ -3,7 +3,7 @@ title: KG-Summary Three-Tier Generation Pipeline
 type: concept
 tags: [orchestrator, kg, hooks, ollama, claude-code, summarization, low-level-implementation, cross-platform]
 created: 2026-04-27T05:30:00Z
-updated: 2026-06-25T00:00:00Z
+updated: 2026-07-20T00:00:00Z
 status: active
 ---
 
@@ -13,12 +13,13 @@ Auto-generated 2-3 sentence summaries for every KG node, written to `knowledge/.
 
 ## Backend selection (auto, in order)
 
-1. **`claude` CLI on PATH** — best quality, requires CLI install (Max sub OAuth or API key).
+1. **`claude` CLI on PATH** — best quality, requires CLI install (Max sub OAuth or API key). Gated by a smoke-test, not just `--version`, so an installed-but-unauthenticated CLI doesn't get picked.
 2. **Ollama (local, FREE)** at `http://localhost:11435` — works for any orchestrator user since Ollama is already required for embeddings.
-3. **`ANTHROPIC_API_KEY` direct** — opt-in fallback, cost warning logged.
-4. **Silent skip** — friendly log line, exits 0.
+3. **OpenAI API (opt-in)** — gated by the `kg_summary_openai_consent` app_state key (default false; set via launcher Preferences → KG Summaries; operator bypass `--force-api`). Costs apply.
+4. **`ANTHROPIC_API_KEY` direct** — opt-in fallback, cost warning logged.
+5. **Silent skip** — friendly log line, exits 0.
 
-Forced via env: `KG_SUMMARY_BACKEND=cli|ollama|api|skip`.
+Forced via env: `KG_SUMMARY_BACKEND=cli|ollama|api|openai|skip` (`api` = Anthropic direct, `openai` = OpenAI).
 
 ## Ollama defaults (per [[uses::Ollama]] family)
 

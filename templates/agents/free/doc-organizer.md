@@ -29,12 +29,12 @@ You do NOT create new documentation unless explicitly requested.
 - projects/, concepts/, tools/, models/, hardware/, research/
 - Format: Markdown with YAML frontmatter (Obsidian-style)
 - Size limits: <300 (high-level), <200 (mid-level), <150 (low-level) lines
-- Synced to Weaviate `ClaudeKnowledgeGraph` collection
+- Synced to the per-project Weaviate KG collection (name from `KG_COLLECTION`)
 
 **docs/** - Verbose project documentation
 - workflow/, research/, references/, guides/, archive/
 - No size limits (can be long)
-- Synced to `ClaudeOrchestrator_development` Weaviate collection
+- Synced to the `[Project]_development` Weaviate collection (name from `DEVELOPMENT_COLLECTION`)
 
 **.claude/context/** - Working context
 - CONTEXT_STATE.md (50-150 lines, current work)
@@ -85,7 +85,7 @@ Update `CONTEXT_STATE.md` during cleanup:
 - Standard archival (>60 days old, clearly superseded)
 - WikiLink updates after moves
 
-## Tool Usage Patterns (Claude 4.5 Optimized)
+## Tool Usage Patterns (Claude Optimized)
 
 **Read before editing**:
 ```bash
@@ -450,6 +450,33 @@ Date: 2026-01-28
 **WikiLinks**:
 - Total: 67 links checked
 - Updated: 12 links (after moves/merges)
+- Broken: 0 (all valid)
+
+**YAML frontmatter**:
+- Files with frontmatter: 23/23 in knowledge/ (100%)
+- Required fields present: title, type, tags (all files)
+
+## Structure Compliance
+
+✅ **knowledge/** - Only cross-project patterns and concepts
+✅ **docs/** - Only project-specific guides and references
+✅ **Root** - Only essential files (4 files: README, CHANGELOG, LICENSE, CONTRIBUTING)
+✅ **Archives** - All dated with YYYY-MM-DD prefix
+✅ **WikiLinks** - All valid, updated after moves
+✅ **YAML frontmatter** - Consistent across all knowledge nodes
+
+## Next Steps
+
+1. **Sync to Weaviate**: Run `.claude/scripts/kg-sync --all` (file moves/merges affect KG)
+2. **Spot-check**: Review merged files for quality (vlm-patterns.md, auth-patterns.md)
+3. **Update CLAUDE.md**: If structure significantly changed (currently OK)
+
+## Token Efficiency Impact
+
+- Before: ~150 tokens to list scattered duplicates
+- After: ~50 tokens to find canonical docs
+- **Savings**: 67% reduction in navigation overhead
+```
 
 ## Search Systems
 
@@ -498,49 +525,14 @@ Date: 2026-01-28
 
 ## Storage Systems
 
-**1. Knowledge Graph** (knowledge/ → ClaudeKnowledgeGraph):
+**1. Knowledge Graph** (knowledge/ → per-project KG collection, name from `KG_COLLECTION`):
 - Properties: title, content, file_path, node_type, tags, links, typed_links, created_at, updated_at, valid_from, valid_until, status
 - RDF-based typed WikiLinks: [[uses::]], [[implements::]], [[extends::]], [[buildsOn::]], [[relatedTo::]]
-- Concise (<300 lines), shared across ALL projects
+- Concise (<300 lines); the separate shared collection (`SHARED_KG_COLLECTION`, default `VibeCodedOrchestrator_KnowledgeGraph`) is auto-merged into reads across all projects
 
 **2. Code Graph** (Weaviate collections):
-- CodeModule, CodeClass, CodeFunction, CodeAPI
+- CodeModule, CodeClass, CodeFunction, CodeAPI, CodeInteraction
 - Semantic search by purpose + structural queries
 
 **3. Development Collection** (docs/ → [Project]_development):
 - Verbose project-specific docs, auto-syncs
-
-## Success Criteria
-
-- Clear folder structure
-- No duplicates
-- Consistent naming
-- WikiLinks updated
-- Archive organized
-- Organization documented
-- Broken: 0 (all valid)
-
-**YAML frontmatter**:
-- Files with frontmatter: 23/23 in knowledge/ (100%)
-- Required fields present: title, type, tags (all files)
-
-## Structure Compliance
-
-✅ **knowledge/** - Only cross-project patterns and concepts
-✅ **docs/** - Only project-specific guides and references
-✅ **Root** - Only essential files (4 files: README, CHANGELOG, LICENSE, CONTRIBUTING)
-✅ **Archives** - All dated with YYYY-MM-DD prefix
-✅ **WikiLinks** - All valid, updated after moves
-✅ **YAML frontmatter** - Consistent across all knowledge nodes
-
-## Next Steps
-
-1. **Sync to Weaviate**: Run `.claude/scripts/kg-sync --all` (file moves/merges affect KG)
-2. **Spot-check**: Review merged files for quality (vlm-patterns.md, auth-patterns.md)
-3. **Update CLAUDE.md**: If structure significantly changed (currently OK)
-
-## Token Efficiency Impact
-
-- Before: ~150 tokens to list scattered duplicates
-- After: ~50 tokens to find canonical docs
-- **Savings**: 67% reduction in navigation overhead

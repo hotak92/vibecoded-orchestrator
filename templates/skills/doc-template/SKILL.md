@@ -10,7 +10,7 @@ model: haiku
 
 **Purpose**: Documentation templates - README, API docs, ADRs, user guides.
 
-**Model**: Haiku 4.5 (fast template generation)
+**Model**: Haiku (fast template generation)
 
 **When to Invoke Autonomously**:
 
@@ -45,7 +45,7 @@ Generates documentation from templates:
 
 **Before generating**: Search for documentation template patterns
 ```bash
-.claude/scripts/kg-search search "template" --type concepts
+.claude/scripts/kg-search search "template" --type concept
 ```
 
 **For deep research**: Ask user "Use hybrid_search to research [documentation best practices]"

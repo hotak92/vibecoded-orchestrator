@@ -12,7 +12,7 @@ effort: high
 
 **Purpose**: Keep project documentation organized, up-to-date, and prevent catastrophic forgetting through systematic knowledge extraction.
 
-**Model**: Sonnet 4.5 (complex reorganization and knowledge synthesis)
+**Model**: Sonnet (complex reorganization and knowledge synthesis)
 
 **When to Use**:
 - CLAUDE.md >800 lines and disorganized
@@ -46,7 +46,7 @@ You maintain documentation health by:
 - Standard archival (>30 days old, clearly superseded)
 - Status tag assignments based on git history and content
 
-## Tool Usage Patterns (Claude 4.5 Optimized)
+## Tool Usage Patterns (Claude Optimized)
 
 **Read before editing**:
 ```bash
@@ -158,7 +158,7 @@ Bash find docs/ -name "*.md" -mtime -7
 - Target: DECISIONS_LOG.md (preserve rationale)
 ```
 
-**Motivation** (Claude 4.5): "Extraction prevents re-encountering solved problems. Status tags enable quick filtering (show only IMPLEMENTED, hide DISCARDED)."
+**Motivation** (Claude): "Extraction prevents re-encountering solved problems. Status tags enable quick filtering (show only IMPLEMENTED, hide DISCARDED)."
 
 ### Phase 3: Create/Update Canonical Docs (30-60 min)
 
@@ -424,7 +424,7 @@ Date: 2026-01-28
 - `hybrid_search` - Keyword + semantic across KG + docs (default search tool, ~1-2s)
 - `semantic_graph_search` - GraphRAG with WikiLink traversal (~1-2s)
 
-**3. Code Graph (Semantic Code Search)** (NEW):
+**3. Code Graph (Semantic Code Search)**:
 - `search_code_graph` - Find code by purpose/concept (~200-500ms)
 - `query_code_structure` - Dependencies, callers, inheritance (~50-100ms)
 - CLI: `.claude/scripts/code-graph-query search "auth middleware"`
@@ -436,12 +436,12 @@ Date: 2026-01-28
 **kg-search** (keyword search, ~100ms):
 ```bash
 # Inputs: QUERY [--type TYPE] [--tags TAGS] [--limit N]
-.claude/scripts/kg-search search "documentation maintenance" --type concepts
+.claude/scripts/kg-search search "documentation maintenance" --type concept
 .claude/scripts/kg-search search "knowledge curation" --tags documentation
 .claude/scripts/kg-info info "Doc Cleanup Pattern"
 ```
 - `search QUERY`: Keyword search across titles/content
-- `--type`: Filter by type (concepts, projects, tools, models, hardware, research, patterns)
+- `--type`: Filter by type (project, concept, tool, research, model, hardware)
 - `--tags`: Filter by tags (e.g., --tags documentation,maintenance)
 - `--limit`: Max results (default varies)
 - `info "Title"`: Get full node details by exact title
@@ -474,7 +474,7 @@ Date: 2026-01-28
 .claude/scripts/kg-duplicates [--threshold 0.95]
 ```
 
-**Code Graph** (NEW):
+**Code Graph**:
 ```bash
 .claude/scripts/code-graph-analyze /path/to/repo [--project NAME] [--incremental]
 .claude/scripts/code-graph-query search "auth middleware" [--collection TYPE] [--limit N]
@@ -491,18 +491,19 @@ Date: 2026-01-28
 
 ## Storage Systems
 
-**1. Knowledge Graph** (knowledge/ → ClaudeKnowledgeGraph):
+**1. Knowledge Graph** (knowledge/ → per-project KG collection, name from `KG_COLLECTION`):
 - Cross-project patterns, concepts, learnings
 - RDF-based typed WikiLinks: [[uses::Tool]], [[implements::Concept]], [[extends::Parent]], [[buildsOn::Work]], [[relatedTo::Node]]
 - Properties: title, content, file_path, node_type, tags, links, typed_links, created_at, updated_at, valid_from, valid_until, status
 - Temporal queries supported
 - Search: kg-search or Weaviate MCP
 
-**2. Code Graph** (Weaviate collections) (NEW):
+**2. Code Graph** (Weaviate collections):
 - CodeModule: Files with imports and metrics
 - CodeClass: Classes with inheritance
 - CodeFunction: Functions with call graphs
 - CodeAPI: API endpoints with handlers
+- CodeInteraction: Cross-service calls (HTTP/gRPC/message-queue)
 - Semantic + structural queries
 - Search: search_code_graph or code-graph-query CLI
 

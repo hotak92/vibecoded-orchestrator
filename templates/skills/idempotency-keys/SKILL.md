@@ -11,7 +11,7 @@ effort: high
 
 **Purpose**: Design the idempotency strategy for any state-changing operation — webhook handlers, payment endpoints, workflow steps, message-queue consumers. Decides: where the key comes from, where it's stored, for how long, what happens on collision, how it threads through downstream side effects.
 
-**Model**: Opus 4.7
+**Model**: Opus
 
 ## When to invoke autonomously
 
@@ -258,7 +258,6 @@ After designing, write a project node `knowledge/projects/idempotency-{operation
 
 ## Knowledge Systems
 
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
 
 **Decision tree**:
 - Known terms → `kg-search` CLI

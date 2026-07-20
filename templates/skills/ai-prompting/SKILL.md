@@ -10,7 +10,7 @@ model: haiku
 
 **Purpose**: Quick tips and templates for effective prompt engineering - few-shot examples, chain-of-thought patterns, constraint specification, output formatting.
 
-**Model**: Haiku 4.5 (fast, practical prompt improvement)
+**Model**: Haiku (fast, practical prompt improvement)
 
 **When to Invoke Autonomously**:
 
@@ -58,7 +58,7 @@ For detailed examples of each pattern, see [examples/prompt-patterns.md](example
 
 **Before implementing**: Search for proven patterns
 ```bash
-.claude/scripts/kg-search search "prompt-engineering" --type concepts
+.claude/scripts/kg-search search "prompt-engineering" --type concept
 ```
 
 **For deep research**: Ask user "Use hybrid_search to research [prompting techniques]"

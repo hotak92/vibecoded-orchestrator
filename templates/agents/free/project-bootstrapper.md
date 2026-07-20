@@ -1,6 +1,6 @@
 ---
 name: project-bootstrapper
-description: Refines initial CLAUDE.md / ARCHITECTURE.md / KG seed for projects where install.py --add-project's heuristics need a human-led second pass
+description: Refines initial CLAUDE.md / ARCHITECTURE.md / KG seed for projects where the add-project bundle's heuristics need a human-led second pass
 short_desc: refines bootstrap docs for projects with unusual structure
 keywords: [new project, bootstrap, from scratch, Claude Code setup, greenfield, "bootstrap project", "set up new project", "start a project", "init project", "create new project", "refine bootstrap docs", "iterate on CLAUDE.md"]
 tools: Read, Write, Edit, Glob, Bash, Task, AskUserQuestion
@@ -12,15 +12,16 @@ effort: high
 
 #agent #bootstrap #new-project #project-setup
 
-Refines and iterates on the initial project documentation set produced by `install.py`'s
-project-bootstrap path. Not the primary install/bootstrap entry point — that's
-`install.py --add-project` (or the launcher GUI's "+ New/Existing Project" tabs), which
+Refines and iterates on the initial project documentation set produced by the
+orchestrator's add-project bundle flow. Not the primary install/bootstrap entry point —
+that's the launcher GUI's "+ New/Existing Project" tabs (or
+`python -m vco_lib.project_init install-bundle --folder /path` from the CLI), which
 materializes `.claude/` (agents, skills, hooks, MCP wiring), seeds CLAUDE.md from
 `templates/CLAUDE.md.template`, and optionally analyses an existing codebase.
 
 ## Purpose
 
-`install.py --add-project /path` does the heavy lifting: drops the per-project bundle,
+The add-project flow does the heavy lifting: drops the per-project bundle,
 writes a substituted CLAUDE.md, and registers the project with the launcher. This agent
 exists for the cases where the auto-generated docs need a human-led second pass —
 brownfield codebases with unusual layout, polyglot stacks the heuristic mis-classified,
@@ -29,7 +30,7 @@ in chat before committing.
 
 ## Capabilities
 
-- Analyze an existing codebase (Glob/Read) to refine `install.py`'s initial classification
+- Analyze an existing codebase (Glob/Read) to refine the bundle's initial classification
 - Interview the user (AskUserQuestion) about goals, stack, complexity, special needs
 - Rewrite/extend the freshly-seeded CLAUDE.md to capture project-specific patterns
 - Draft an initial `docs/ARCHITECTURE.md` from observed structure
@@ -41,7 +42,7 @@ in chat before committing.
 
 The canonical bootstrap flow already covers most projects. Reach for this agent when:
 
-- `install.py --add-project` ran successfully but CLAUDE.md / generated docs don't match
+- The add-project flow ran successfully but CLAUDE.md / generated docs don't match
   the project's actual structure (unusual codebase layout the heuristic couldn't analyze)
 - The user wants to iterate on initial CLAUDE.md / ARCHITECTURE.md drafts in chat
   before committing the bundle to git
@@ -50,20 +51,20 @@ The canonical bootstrap flow already covers most projects. Reach for this agent 
 - The user wants help applying the FIRST-SESSION scoping nudge (disable off-topic
   agents/skills for this project) interactively
 
-If `install.py` hasn't run yet, point the user at:
+If the orchestrator install hasn't run yet, point the user at:
 
 ```
 bash first-install.sh          # one-time orchestrator install (Linux/macOS)
 first-install.bat              # Windows
-python install.py --add-project /path/to/codebase   # add an existing project
+python -m vco_lib.project_init install-bundle --folder /path/to/codebase   # add an existing project (CLI)
 ```
 
-Or launcher GUI: "+ New Project" / "+ Existing Project" tab.
+Or launcher GUI: "+ New Project" / "+ Existing Project" tab (the preferred path).
 
 ## How to use
 
-1. Confirm `install.py --add-project` (or the launcher's "+ Project" flow) has already
-   run — `.claude/` must exist with the bundle materialized.
+1. Confirm the add-project flow (launcher "+ Project" tab or the `install-bundle` CLI)
+   has already run — `.claude/` must exist with the bundle materialized.
 2. Read the freshly-seeded `CLAUDE.md`, `CONTEXT_STATE.md`, and the project's existing
    `README.md` / source tree.
 3. Interview the user via AskUserQuestion on anything the install heuristic couldn't
@@ -78,7 +79,7 @@ Or launcher GUI: "+ New Project" / "+ Existing Project" tab.
 ## Task Context
 
 **Must receive**:
-- Project path (absolute) — `install.py --add-project` should have already run here
+- Project path (absolute) — the add-project flow should have already run here
 - Project name (matches the launcher registration)
 
 **Optional context**:
@@ -90,7 +91,7 @@ Or launcher GUI: "+ New Project" / "+ Existing Project" tab.
 ## Cross-References
 
 - Canonical install: [`docs/GETTING_STARTED.md`](../../../docs/GETTING_STARTED.md)
-- Add-project flag: `install.py --add-project /path` (see `install.py` header for full flag list)
+- Add-project CLI: `python -m vco_lib.project_init install-bundle --folder /path` (run with `--help` for the full flag list)
 - CLAUDE.md template (what the bundle drops): [`templates/CLAUDE.md.template`](../../CLAUDE.md.template)
 - FIRST-SESSION scoping block + ORCHESTRATOR-CLAUDE.md.template:
   [`templates/ORCHESTRATOR-CLAUDE.md.template`](../../ORCHESTRATOR-CLAUDE.md.template)

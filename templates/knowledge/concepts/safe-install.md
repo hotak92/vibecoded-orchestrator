@@ -3,13 +3,17 @@ title: Safe-Install — Content-Based Service Detection
 type: concept
 tags: [install, weaviate, ollama, podman, services, low-level-implementation, vibecoded-orchestrator]
 created: 2026-04-27T18:30:00Z
-updated: 2026-05-16T20:30:00Z
+updated: 2026-07-20T00:00:00Z
 status: active
 ---
 
 # Safe-Install — Content-Based Service Detection
 
 `install.py` probes each backing service (Weaviate, Ollama, code-embed) by **fingerprinting the response** rather than checking container names. This lets the orchestrator coexist safely with foreign services on the canonical ports without modifying them.
+
+**Not to be confused with "Safe add"** — a distinct per-project protection mechanism in the project-add flow (`vco_lib/project_init.py`): with Safe add ON, VCO leaves the project-root `.env` untouched (it may be VCS-tracked), writing the full env to `.claude/settings.json` `env` + `.claude/env` instead, and mirroring the intended `.env` keys to an inert `.env.vco.reference` sidecar. Safe-*install* is about backing SERVICES on ports; Safe *add* is about a project's `.env` FILE.
+
+**Where the logic lives**: the service probe/decision logic described here runs in `install.py`. The orchestrator-root `.claude/` content install itself is delegated (install.py Step 5b) to the one bundle engine — `vco_lib/self_install.py::run_root_bundle_install` runs `python -m vco_lib.project_init install-bundle --json` in a subprocess; there is no separate root-install code path.
 
 ## What it is
 
@@ -134,6 +138,6 @@ adopt-vs-not question, the weaker signal is correct.
 - `docs/GETTING_STARTED.md` "Coexisting with other Weaviate or Ollama installs"
 - [[Cross-OS Hook Portability]]
 - [[buildsOn::Launcher Container Lifecycle]]
-- [[relatedTo::Shared Knowledge Graph Cross-Project]]
+- [[relatedTo::Shared Knowledge Graph (Cross-Project)]]
 - [[relatedTo::vct-infrastructure-bugs-2026-05-05]]
 - [[uses::Podman]]

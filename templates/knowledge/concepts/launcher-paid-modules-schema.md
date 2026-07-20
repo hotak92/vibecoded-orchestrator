@@ -3,7 +3,7 @@ title: Launcher Paid Modules — Supabase Schema (004_paid_modules.sql)
 type: concept
 tags: [launcher, supabase, schema, paid-modules, licensing, commercial, partially-superseded, low-level-implementation]
 created: 2026-04-23T16:20:00Z
-updated: 2026-06-25T00:00:00Z
+updated: 2026-07-20T00:00:00Z
 status: active
 implementation: "Migration 004_paid_modules.sql lives in the launcher's Supabase project under supabase/migrations/. The launcher-side mirror of per-module entitlements is tier_cache.module_licenses (read via is_module_licensed_v2)."
 ---
@@ -12,7 +12,7 @@ implementation: "Migration 004_paid_modules.sql lives in the launcher's Supabase
 
 ⚠️ **Partially-superseded** (2026-05-26): the `profiles.paid_modules` JSONB column described below was designed in the pre-v0.2.33 architecture, intended to be read by a single `validate-module` endpoint at runtime. v0.2.33+ uses a three-endpoint design instead (`validate-tier` + `rl-artifact-url` + `module-catalog`) and the source-of-truth for per-module entitlements lives in `tier_cache.module_licenses` on the launcher side, with server-authoritative checks at `rl-artifact-url` via its server-to-server call to `validate-tier`. The `profiles.paid_modules` column shape is still RELEVANT for org-side persistence of which modules a user owns (especially when Lemon Squeezy webhooks fire post-purchase) once Path B (LS-variant licensing) ships, but the launcher-side runtime flow has evolved away from this single-endpoint design.
 
-See [[Pre-install catalog architecture — L0 public endpoint + post-install on-disk manifest]] for the current install-time gate + [[Server-Side Admin License Validation]] for the production deployment status. See [[validate-module Supabase Edge Function]] for the superseded single-endpoint design and the migration path away from it.
+The current install-time gate is the pre-install catalog architecture (L0 public endpoint + post-install on-disk manifest); server-side admin license validation covers the production deployment status; the superseded single-endpoint design was the validate-module Supabase Edge Function.
 
 ## Original design (preserved below — superseded for runtime flow)
 
@@ -89,7 +89,7 @@ This endpoint and the `profiles.paid_modules` JSONB column / `upsert_paid_module
 
 ### Launcher Rust side (`src-tauri/src/commands/modules.rs`)
 
-The launcher's install/uninstall flow for paid modules will call `validate-module` at install time and read `active_paid_modules` view to gate UI access. See [[relatedTo::VCT Launcher Hub Architecture]].
+The launcher's install/uninstall flow for paid modules will call `validate-module` at install time and read `active_paid_modules` view to gate UI access.
 
 ## Commercial flow
 
@@ -116,9 +116,5 @@ Telegram MCP module active in Claude Code
 
 ## Related
 
-- [[relatedTo::VCT Launcher Hub Architecture]]
-- [[relatedTo::validate-module edge function]] (to be created)
-- [[relatedTo::Telegram as Standalone Paid Module]] (first consumer)
-- [[relatedTo::VCT Coordination MCP — Standalone Product]] (future consumer if marketed as paid)
 - Migration file: `supabase/migrations/004_paid_modules.sql`
 - Webhook: `supabase/functions/lemon-squeezy-webhook/index.ts`

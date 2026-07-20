@@ -4,7 +4,7 @@ description: Systematically extract knowledge from scattered documentation to pr
 short_desc: extract knowledge from scattered docs (structured)
 keywords: [documentation extraction, catastrophic forgetting, status tags, scattered docs, before archiving, "scattered documentation", "knowledge extraction", "before archival", "extract knowledge from docs", "pull info from documentation"]
 argument-hint: "[source-path-or-pattern]"
-tools: Read, Write, Grep, Glob, Bash, Task
+allowed-tools: Read, Write, Grep, Glob, Bash, Task
 model: sonnet
 ---
 

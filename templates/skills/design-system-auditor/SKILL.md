@@ -1,7 +1,7 @@
 ---
 name: design-system-auditor
 description: Audits a design system for token drift, contrast violations, type-scale inconsistency, and Figma-to-code parity gaps. Use when inheriting an existing design system, before a major redesign, or when developers and designers report "the colors don't match" or "spacing feels off."
-short_desc: design system audit: tokens, contrast, parity
+short_desc: "design system audit: tokens, contrast, parity"
 keywords: [design system audit, Figma to code, token drift, design tokens, spacing system, "color contrast", "typography system", "audit design system", "Figma sync", "colors don't match", "design parity", "inherited design system"]
 model: opus
 effort: high
@@ -209,7 +209,7 @@ Don't recommend a tool the team isn't equipped to maintain. A maintained 5-color
 Search before auditing:
 - `hybrid_search("design tokens architecture")`
 - `hybrid_search("WCAG 2.2 contrast")`
-- `kg-search search "color management" --type concepts`
+- `kg-search search "color management" --type concept`
 
 Capture findings:
 - Drift pattern that recurs across projects → `knowledge/patterns/`

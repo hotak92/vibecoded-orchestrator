@@ -1,4 +1,4 @@
-# macOS install — best-effort (v0.2.53+)
+# macOS install — best-effort
 
 This doc covers the macOS install walkthrough, first-launch user experience, auto-start setup, troubleshooting, and uninstall. It is the canonical reference linked from the README, release notes, and the `release.yml` workflow header comment.
 
@@ -7,7 +7,7 @@ This doc covers the macOS install walkthrough, first-launch user experience, aut
 - **Apple Silicon (M1/M2/M3/M4) only.** Intel x86_64 builds are NOT shipped — see "Why no Intel build?" below.
 - Binaries are **ad-hoc codesigned** (`codesign --force --deep --sign -`) but NOT signed with an Apple Developer ID. Gatekeeper warns on first launch; you bypass it once and the binary runs normally afterwards.
 - Full Developer ID + notarization is **deferred** to a follow-up patch once Apple credentials are provisioned. Until then, you'll see the "can't be verified by Apple" dialog the first time.
-- The dist binary lives at [`launcher/dist/macos-arm64/vct-launcher`](../launcher/dist/macos-arm64/). The historical `launcher/dist/experimental_macOS/` path was retired in v0.2.53 — install scripts and `start-launcher.command` now consume `macos-arm64/` only. Existing checkouts that still have the legacy directory can leave it; nothing reads from it.
+- The dist binary lives at [`launcher/dist/macos-arm64/vct-launcher`](../launcher/dist/macos-arm64/). `launcher/dist/experimental_macOS/` is retained as a legacy fallback in the binary-discovery search order (`start-launcher.command` and `scripts/post-install-launcher.sh` check it after `macos-arm64/`); releases only populate `macos-arm64/`.
 
 ## Install walkthrough
 
@@ -42,16 +42,16 @@ podman machine start
 
 The bootstrap prepass detects `podman.machine_running == false` and surfaces this in the envelope's `missing_prereqs` array; `install.py` writes an `UPDATE_DEFERRED.md` entry with the exact commands if it reaches the container step before the machine is up.
 
-### V52-M hook fix (relevant if you upgraded from v0.2.52)
+### Hook exec bits
 
-Three hooks added in v0.2.52 — `pre-bash-context-inject`, `post-bash-context-record`, `post-edit-outcome` — shipped without the POSIX exec bit, so they were silently dead on macOS (and Linux). v0.2.53 fixes the source files and `install.py` now explicitly `os.chmod(0o755)`s every hook script it materializes into `.claude/hooks/`. If you upgrade in place and find these hooks still inert, re-run `install.py --update` from the install root.
+`install.py` explicitly `os.chmod(0o755)`s every hook script it materializes into `.claude/hooks/`, so hooks never go silently dead due to a missing POSIX exec bit. If a hook seems inert (registered in `.claude/settings.json` but never fires), re-run `python install.py --update` from the install root — the chmod pass reactivates any non-executable hook script.
 
 ## Supported targets
 
 | Target | Status | Why |
 |---|---|---|
 | `aarch64-apple-darwin` (Apple Silicon) | **Shipped** | GitHub-hosted `macos-latest` runner produces this natively. |
-| `x86_64-apple-darwin` (Intel) | **Not shipped** | The `macos-13` GitHub-runner image was fully deprecated 2025-12-04; v0.1.5's release matrix entry queued for 23h47m with no runner pickup. Apple stopped selling Intel Macs in late 2023. Revisit if user demand surfaces — cross-compile path is `--target x86_64-apple-darwin` from the arm64 runner. |
+| `x86_64-apple-darwin` (Intel) | **Not shipped** | GitHub hosts no Intel macOS runners (the `macos-13` image is deprecated), and Apple stopped selling Intel Macs in late 2023. Revisit if user demand surfaces — cross-compile path is `--target x86_64-apple-darwin` from the arm64 runner. |
 
 ## First launch (Gatekeeper bypass)
 
@@ -205,11 +205,11 @@ rm -rf "$HOME/.vct"
 
 ## Why no Intel build?
 
-The `macos-13` GitHub-runner image was fully deprecated 2025-12-04 (actions/runner-images #13046). The v0.1.5 release run's Intel matrix entry queued for 23h47m with no runner pickup, then aborted. We removed the entry on 2026-05-01.
+GitHub Actions hosts no Intel macOS runners (the `macos-13` image — the last Intel one — is deprecated; actions/runner-images #13046), so CI cannot produce a natively-built and smoke-tested Intel binary.
 
 Cross-compiling from the arm64 runner with `--target x86_64-apple-darwin` is technically possible but:
 
-- Tauri's bundling chain plus the SvelteKit frontend embedding have repeatedly had cross-target paper cuts on this path; locking it in for v0.2.x without a real Intel-Mac smoke test would be irresponsible.
+- Tauri's bundling chain plus the SvelteKit frontend embedding have cross-target paper cuts on this path; shipping it without a real Intel-Mac smoke test would be irresponsible.
 - Apple stopped selling Intel Macs in late 2023. The active cohort is shrinking month-over-month; for a tier-2 alpha, it's not worth blocking releases on.
 
 If you have an Intel Mac and need a build, the build script `scripts/build-bundled-launcher.sh` runs identically on Intel Darwin — you can build locally:

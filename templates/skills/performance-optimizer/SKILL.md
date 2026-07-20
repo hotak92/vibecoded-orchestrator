@@ -1,7 +1,7 @@
 ---
 name: performance-optimizer
 description: Cross-domain performance analysis and optimization guidance (frontend render, backend queries, AI model inference)
-short_desc: perf analysis: frontend, backend, AI inference
+short_desc: "perf analysis: frontend, backend, AI inference"
 keywords: [performance optimization, render performance, query optimization, inference latency, bottleneck, "query performance", slow, "slow app", "make it faster", "performance issue", latency, "optimize performance", "speed up"]
 model: sonnet
 ---
@@ -10,7 +10,7 @@ model: sonnet
 
 **Purpose**: Cross-domain performance analysis and optimization guidance (frontend render, backend queries, AI model inference).
 
-**Model**: Sonnet 4.5 (balanced reasoning for profiling and optimization)
+**Model**: Sonnet (balanced reasoning for profiling and optimization)
 
 ## When to Invoke Autonomously
 
@@ -75,7 +75,7 @@ Performance issue in:
 
 **Before optimizing**: Search for proven optimization patterns
 ```bash
-.claude/scripts/kg-search search "performance" --type concepts
+.claude/scripts/kg-search search "performance" --type concept
 ```
 
 **For deep research**: Ask user "Use hybrid_search to research [optimization techniques]"

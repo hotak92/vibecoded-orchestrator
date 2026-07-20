@@ -10,7 +10,7 @@ model: sonnet
 
 **Purpose**: Expert guidance on database design, schema optimization, query performance, and database technology selection.
 
-**Model**: Sonnet 4.5 (balanced reasoning for database architecture decisions)
+**Model**: Sonnet (balanced reasoning for database architecture decisions)
 
 **When to Invoke Autonomously**:
 
@@ -60,8 +60,6 @@ Compares databases:
 - **Neo4j**: Graph data, relationship queries
 - **Weaviate/Pinecone**: Vector search, RAG, semantic search
 
-For detailed comparisons, see [examples/database-comparison.md](examples/database-comparison.md).
-
 ### 2. Schema Design Principles
 
 - **Normalization**: 1NF, 2NF, 3NF (reduce redundancy, ensure integrity)
@@ -100,13 +98,11 @@ For detailed comparisons, see [examples/database-comparison.md](examples/databas
 
 ## Output Format
 
-See [template.md](template.md) for database design documentation structure.
-
 ## Quick Workflow Reference
 
 **Before implementing**: Search for proven patterns
 ```bash
-.claude/scripts/kg-search search "database" --type concepts
+.claude/scripts/kg-search search "database" --type concept
 ```
 
 **For deep research**: Ask user "Use hybrid_search to research [database design]"
@@ -120,11 +116,6 @@ After database design:
 2. Link to database technology node
 3. Capture optimization patterns
 4. Tag with scale tier and technology
-
-## Supporting Files
-
-- **Template**: Use [template.md](template.md) for database design documentation
-- **Examples**: See [examples/database-comparison.md](examples/database-comparison.md) and [examples/schema-examples.md](examples/schema-examples.md)
 
 ## Success Metrics
 

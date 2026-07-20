@@ -5,9 +5,9 @@ Config layout follows one rule: **minimal global, maximum per-project**.
 ## What this means
 
 - **Global `~/.claude/settings.json`**: user preferences only — effort level, output tokens, universal permission denies. No project paths, no MCP server URLs, no environment variables that any specific project depends on.
-- **Per-project `.claude/settings.json`**: per-project permissions and hook registrations, plus an `env` block read by Claude Code (CLI, Desktop app, AND the VS Code extension) and propagated to MCP subprocesses. This is the **canonical per-project MCP env channel** as of v0.2.12 (PR-27, 2026-05-16): empirical sentinel testing on Linux Claude Code 2.1.143 confirmed that `.vscode/settings.json` `claude-code.env` does NOT propagate to MCP subprocesses, so the launcher no longer writes that key. See PR-27 commit message + `docs/CLAUDE_CODE_COMPATIBILITY.md` → "Per-project env files" for the full empirical trace.
+- **Per-project `.claude/settings.json`**: per-project permissions and hook registrations, plus an `env` block read by Claude Code (CLI, Desktop app, AND the VS Code extension) and propagated to MCP subprocesses. This is the **canonical per-project MCP env channel**. Do not use `.vscode/settings.json` `claude-code.env` for these keys — empirical sentinel testing on Linux confirmed that block does NOT propagate to MCP subprocesses, and the launcher does not write it. See `docs/CLAUDE_CODE_COMPATIBILITY.md` → "Per-project env files".
 - **Per-project `.claude/env`**: POSIX shell-sourceable env file with the same values, for CLI users who source it from their shell rc via the `tools/claude` wrapper.
-- **Per-project `.vscode/settings.json`**: VS Code editor preferences only (Pylance excludes, file-watcher excludes, formatter settings). The launcher's Python-side `_backfill_vscode_excludes_in_project` manages the Pylance/watcher exclude block; the launcher does NOT touch any `claude-code.env` block here. Since v0.2.21 the launcher also writes `.vscode/tasks.json` with a `folderOpen` task that ensures `vct-hub` is running for VS Code users (Step 8).
+- **Per-project `.vscode/settings.json`**: VS Code editor preferences only (Pylance excludes, file-watcher excludes, formatter settings). The launcher's Python-side `_backfill_vscode_excludes_in_project` manages the Pylance/watcher exclude block; the launcher does NOT touch any `claude-code.env` block here. The launcher also writes `.vscode/tasks.json` with a `folderOpen` task that ensures `vct-hub` is running for VS Code users (Step 8).
 - **Per-project secrets**: stored in the OS keychain via the VCT Launcher GUI — not in env files, not in JSON configs. The launcher knows about per-project scoping, so an OpenAI key for one project doesn't leak into another. A small set of shared secrets (`github_pat`, `openai_api_key`) lives under SENTINEL_SHARED / `module_id=user` and is resolved by the hub for every project — see "Secrets" below.
 
 ## Why
@@ -16,12 +16,12 @@ It prevents cross-contamination. Global settings apply to every project you open
 
 ## Setup for new users
 
-1. Copy `.vscode/settings.json.example` to `.vscode/settings.json` and adjust as needed for editor preferences (Pylance excludes, formatter settings). The example file no longer ships a `claude-code.env` block — per-project MCP env now lives in `.claude/settings.json` `env` instead (see the v0.2.12 PR-27 note above).
+1. Copy `.vscode/settings.json.example` to `.vscode/settings.json` and adjust as needed for editor preferences (Pylance excludes, formatter settings). The example file carries no `claude-code.env` block — per-project MCP env lives in `.claude/settings.json` `env` (see the note above).
 2. The VCT Launcher creates a per-project `.env` from a canonical template when you register a project (see "`.env` template management" below). For non-launcher CLI users, copy `.env.example` manually.
 3. Let `install.py` wire the rest (venv, containers, KG collection creation, `vct-hub` binary placement + boot sentinel).
 4. Launch via the VCT Launcher GUI (manages secrets, tier gating, module installs). Secrets entered via the GUI (or via the OnboardingWizard at first run) are immediately resolvable by the hub for every registered project.
 
-## Install entry-point flow (v0.2.53+)
+## Install entry-point flow
 
 `first-install.{sh,command,bat}` (Linux / macOS / Windows) and `install.ps1` (PowerShell) are thin shims around `install.py`. The shim sequence per invocation:
 
@@ -52,7 +52,7 @@ The envelope is also useful as a diagnostic artifact: when reporting an install 
 
 Both `install.py` Step 9 and the launcher's `create_project_v2` Tauri command call `ensure_project_env_template` (Python: `_ensure_env_template`; Rust: `ensure_project_env_template`) on the project root. The behaviour is:
 
-- **`.env` missing** → write a fresh canonical template with all known keys. Active keys (`KG_COLLECTION`, `PROJECT_NAME`, `DEVELOPMENT_COLLECTION`, `SHARED_KG_COLLECTION`) get values substituted from the project name. Optional keys (LLM API keys, `GITHUB_TOKEN`, RL module URLs, `VCT_TELEMETRY`) stay commented out. (`CONVERSATION_COLLECTION` removed 2026-04-30 — capture flow deprecated.)
+- **`.env` missing** → write a fresh canonical template with all known keys. Active keys (`KG_COLLECTION`, `PROJECT_NAME`, `DEVELOPMENT_COLLECTION`, `SHARED_KG_COLLECTION`) get values substituted from the project name. Optional keys (LLM API keys, `GITHUB_TOKEN`, RL module URLs, `VCT_TELEMETRY`) stay commented out.
 - **`.env` exists** → diff against the canonical key list. Any keys not yet present (commented or active) get appended in a marked block tagged `# added by vco YYYY-MM-DD`. The user's existing values are preserved verbatim — never overwritten.
 - **Idempotent** — a second invocation against an up-to-date file is a no-op.
 
@@ -88,7 +88,7 @@ VCT_TELEMETRY
 | MCP env (URLs, collection names, paths) — every Claude Code surface (CLI / Desktop / VS Code extension) AND MCP subprocesses | `.claude/settings.json` → `env` | per-project | launcher's `write_project_env_files` |
 | MCP env, POSIX shell-sourceable copy (for the `tools/claude` wrapper) | `.claude/env` | per-project | launcher's `write_project_env_files` |
 | VS Code editor preferences (Pylance excludes, formatOnSave, etc.) | `.vscode/settings.json` | per-project | launcher's Python `_backfill_vscode_excludes_in_project` + you |
-| VS Code `folderOpen` task that ensures `vct-hub` is running (v0.2.21+) | `.vscode/tasks.json` | per-project | install.py Step 8 / `update_project_v2` bundle update |
+| VS Code `folderOpen` task that ensures `vct-hub` is running | `.vscode/tasks.json` | per-project | install.py Step 8 / `update_project_v2` bundle update |
 | Shell/script env | `.env` | per-project | you, `.env.example` template |
 | Project permissions + hooks | `.claude/settings.json` | per-project | install.py + launcher |
 | Secrets (license keys, API tokens) | OS keychain | per-project (with shared bucket for `github_pat` / `openai_api_key`) | launcher GUI / OnboardingWizard only |
@@ -113,34 +113,35 @@ If you see any of these in your global `~/.claude/settings.json`, move them to t
 Per-project env vars (KG / codegraph / embedding selections, service URLs) flow through a fixed 5-level precedence chain. Higher levels override lower ones; consumers (MCP subprocesses, hooks, install.py, the launcher) all resolve through this chain so the active workspace's identity is consistent:
 
 1. **vct-hub resolved values** (highest precedence). When the hub is running on `http://127.0.0.1:7700` (port configurable via `VCT_HUB_PORT`), MCP startup queries `GET /api/v1/projects/{id}/config` and uses the hub's resolved per-project record from `launcher.db`.
-2. **`.claude/settings.json` `env` block**. The canonical per-project channel — written by the launcher's `write_project_env_files`, read by every Claude Code surface (CLI, Desktop app, VS Code extension) and propagated to MCP subprocesses. Replaced the `.vscode/settings.json claude-code.env` surface in v0.2.12 (PR-27, 2026-05-16) after empirical testing on Linux Claude Code 2.1.143 confirmed that surface does not propagate to MCP subprocesses.
+2. **`.claude/settings.json` `env` block**. The canonical per-project channel — written by the launcher's `write_project_env_files`, read by every Claude Code surface (CLI, Desktop app, VS Code extension) and propagated to MCP subprocesses. (`.vscode/settings.json` `claude-code.env` is NOT part of this chain — that surface does not propagate to MCP subprocesses on Linux.)
 3. **`.claude/env`** (POSIX shell-sourceable). Same keys as #2; used by CLI users sourcing it from a shell rc via the `tools/claude` wrapper.
 4. **`~/.claude.json` `mcpServers.<name>.env`**. The launcher intentionally restricts this surface to machine-invariant keys (e.g. `WEAVIATE_URL`); per-project keys like `KG_COLLECTION` are dropped here. See `launcher/src-tauri/src/mcp_registration.rs::ALLOWED_ENV_KEYS`.
-5. **Bundled defaults** baked into `claude_mcp_servers/weaviate_mcp/server.py` (lowest precedence). Reaching this layer is logged at WARNING level. Explicit empty-string env values for `KG_COLLECTION` are coerced to the default rather than used literally (v0.2.27 fix).
+5. **Bundled defaults** baked into `claude_mcp_servers/weaviate_mcp/server.py` (lowest precedence). Reaching this layer is logged at WARNING level. Explicit empty-string env values for `KG_COLLECTION` are coerced to the default rather than used literally.
 
 The MCP startup log emits a `weaviate-kg: resolved collections (...)` line showing what the subprocess actually picked up plus the resolution source (env / hub / default); this is the diagnostic to grep for when a project is silently using the wrong KG.
 
 ## Knowledge graph env vars
 
-The MCP server (`claude_mcp_servers/weaviate_mcp/server.py`) reads these on startup, resolved through the 5-level chain above. The launcher's `write_project_env_files` writes the canonical per-project values into both `.claude/env` (POSIX shell-sourceable) and `.claude/settings.json::env` (the channel that actually propagates to MCP subprocesses on Linux). The historical third surface (`.vscode/settings.json` `claude-code.env`) was removed in v0.2.12 (PR-27, 2026-05-16); see the bullet at the top of this file for the empirical-trace KG node.
+The MCP server (`claude_mcp_servers/weaviate_mcp/server.py`) reads these on startup, resolved through the 5-level chain above. The launcher's `write_project_env_files` writes the canonical per-project values into both `.claude/env` (POSIX shell-sourceable) and `.claude/settings.json::env` (the channel that actually propagates to MCP subprocesses on Linux).
 
 | Var | Default | What it does |
 |---|---|---|
 | `KG_COLLECTION` | `<ProjectName>` | Per-project Weaviate collection. Knowledge nodes from `knowledge/` land here. |
 | `DEVELOPMENT_COLLECTION` | `<ProjectName>_development` | Per-project Weaviate collection for `docs/`. Auto-paired with KG by the launcher. Same chunker + named-vector slot logic as KG. |
-| `SHARED_KG_COLLECTION` | `VibeCodedOrchestrator_KnowledgeGraph` (renamed from `VibeCodedTools_KnowledgeGraph` in v0.2.12) | Cross-project shared KG. All projects on this machine query it alongside their own KG. Seeded by `install.py` Step 7d from `vibecoded-orchestrator/knowledge/`. Users with data under the old name can designate it as canonical via the launcher's Identity tab "Manage shared KG collection" picker — see PR-26 Group E. |
-| `SHARED_KG_WRITE_DISABLED` | `false` | Per-project WRITE gate (asymmetric model since 2026-05-01). Set to `true` (or `1`/`yes`) to refuse `store_knowledge_node(scope="shared")` calls from this project. **Reads are unconditional** — every project always queries the shared KG when configured. |
-| `SHARED_KG_OPT_OUT` | `false` | Legacy alias of `SHARED_KG_WRITE_DISABLED`. Kept for back-compat ~3 releases (target removal: 2026-08). The canonical key wins when both are set. NOTE: pre-2026-05-01 this also gated reads — that behaviour is gone. |
+| `SHARED_KG_COLLECTION` | `VibeCodedOrchestrator_KnowledgeGraph` | Cross-project shared KG. All projects on this machine query it alongside their own KG. Seeded at install from the orchestrator root's `knowledge/` (the bundled curated set materializes once at the root; non-root projects read it via the shared-KG fan-out). Users migrating from an install whose shared collection has a different name can designate that collection as canonical via the launcher's Identity tab "Manage shared KG collection" picker. |
+| `SHARED_KG_READ_DISABLED` | `false` | Per-project READ gate. Set to `true` (or `1`/`yes`) to exclude the shared collection from `hybrid_search` / `semantic_graph_search` results on this project — reads fall back to the per-project KG only. No legacy alias. |
+| `SHARED_KG_WRITE_DISABLED` | `false` | Per-project WRITE gate. Set to `true` (or `1`/`yes`) to refuse `store_knowledge_node(scope="shared")` calls from this project. |
+| `SHARED_KG_OPT_OUT` | `false` | Legacy alias of `SHARED_KG_WRITE_DISABLED` (write gate only — it never affects reads). Kept for back-compat; the canonical key wins when both are set. |
 | `SHARED_KG_NODE_FORMATS` | (unset) | Override path for the shared KG's `.node_formats.json` sidecar. Used by tests; in production the sidecar is read from `<orchestrator>/knowledge/.node_formats.json` via `_SERVER_INFERRED_BASE`. |
 | `KG_TIER_MIN` / `KG_TIER_SINGLE_CHUNK` / `KG_TIER_THREE_CHUNKS` / `KG_TIER_FULL` | `0.42` / `0.55` / `0.65` / `0.75` | Score thresholds for the auto-tier retrieval system. See `knowledge/concepts/score-driven-retrieval-tiers.md`. |
 
-**Asymmetric semantics (since 2026-05-01)**: `SHARED_KG_WRITE_DISABLED=true` refuses `store_knowledge_node(scope="shared")` calls with a clear error (`"Shared KG writes are disabled for this project. Set SHARED_KG_WRITE_DISABLED=false to enable, or use scope='project' for the per-project KG."`) — NOT a silent reroute to the project KG. `hybrid_search` / `semantic_graph_search` continue to merge the shared collection regardless of the gate; reads are never disabled per-project. Pre-2026-05-01 the same flag also zeroed reads — that behaviour is gone, by design.
+**Gate semantics**: the two gates are symmetric and independent. `SHARED_KG_WRITE_DISABLED=true` refuses `store_knowledge_node(scope="shared")` calls with a clear error — NOT a silent reroute to the project KG. `SHARED_KG_READ_DISABLED=true` excludes the shared collection from `hybrid_search` / `semantic_graph_search` on this project. With both unset (the default), every project reads AND can write the shared collection. To fully sever a project from the shared KG, set both to `true`.
 
 **Power-user override**: point `SHARED_KG_COLLECTION` at a private team-shared collection (e.g. `AcmeTeam_SharedKG`) to share knowledge across an internal team without exposing it via the public bundled name.
 
-## Embedding configuration (v0.2.18+)
+## Embedding configuration
 
-The `EmbeddingService` (in `vco_lib/embedding_service.py`) is the unified entry point for KG + code-graph embeddings. It replaces the older code paths that read `ACTIVE_EMBEDDING` directly and hardcoded slot selection (KG-W1 audit). Configuration is purely env-driven; the launcher writes the resolved values into `.claude/settings.json::env`.
+The `EmbeddingService` (in `vco_lib/embedding_service.py`) is the unified entry point for KG + code-graph embeddings. Configuration is purely env-driven; the launcher writes the resolved values into `.claude/settings.json::env`.
 
 | Var | Values | What it does |
 |---|---|---|
@@ -160,12 +161,12 @@ The `EmbeddingService` (in `vco_lib/embedding_service.py`) is the unified entry 
 
 Secrets never live in env files or JSON configs. They live in the OS keychain (macOS Keychain, Linux Secret Service, Windows Credential Manager) and are written by the launcher's GUI or the OnboardingWizard.
 
-**Shared bucket** (visible to every base-host project on this user account): declared in `vct-module.json::bundled_secrets[]`. The hub's `/api/v1/projects/{id}/env` resolver finds these via SENTINEL_SHARED + `module_id=user` (formerly `installer` pre-2026-05-10; both writer paths now land at the same row).
+**Shared bucket** (visible to every base-host project on this user account): declared in `vct-module.json::bundled_secrets[]`. The hub's `/api/v1/projects/{id}/env` resolver finds these via SENTINEL_SHARED + `module_id=user`.
 
 | Slot | Written by | Consumed by |
 |---|---|---|
 | `github_pat` | OnboardingWizard `register_github_pat` step OR Preferences → Special Secrets → SecretsPanel "Shared (this user)" tab | `claude_mcp_servers/search_mcp/wrapper.sh` (exported as `GITHUB_TOKEN`), bundled hooks that need to talk to GitHub |
-| `openai_api_key` (v0.2.18+) | OnboardingWizard OpenAI step OR Preferences → Special Secrets | `vco_lib/embedding_service.py` when `ACTIVE_EMBEDDING=openai` or as multi-slot fallback. Validated via `GET /v1/models/text-embedding-3-small` — no token consumption, no billing entry. |
+| `openai_api_key` | OnboardingWizard OpenAI step OR Preferences → Special Secrets | `vco_lib/embedding_service.py` when `ACTIVE_EMBEDDING=openai` or as multi-slot fallback. Validated via `GET /v1/models/text-embedding-3-small` — no token consumption, no billing entry. |
 
 **Per-module / per-project secrets**: paid modules declare their own `bundled_secrets[]` in their manifest; the launcher's SecretsPanel surfaces a tab per scope. Per-project license keys, API tokens, and module-specific secrets are scoped by `project_id` and never leak across projects.
 
@@ -192,7 +193,7 @@ The launcher enforces four independent cross-project access matrices, each backe
 
 **Why KG grants by default but code-graph denies.** The KG read gate rejects any collection without an explicit row — so without the auto-grant, a fresh project's searches against its own KG would fail on day one. The default-grant seeds the project's own KG plus the machine-shared KG (knowledge is intentionally cross-project value: a pattern learned in one project is usually useful in the next). Source code is the opposite: it is proprietary and per-tenant, so code-graph (and diagrams, which follow the same shape) stay empty until you deliberately grant one project read access to another's. Secrets follow the same default-deny posture — cross-project reads require an explicit grant, and even a shared-scope secret can be paused for a specific requester. See the KG-vs-code-graph asymmetry table in the project `CLAUDE.md` for the read-fan-out consequences of this design.
 
-## vct-hub (since v0.2.21)
+## vct-hub
 
 A detached local HTTP server (port 7700 default) that serves as the single source of truth for project config + secrets resolution. Lives in `launcher/dist/<arch>/vct-hub`. Outlives the launcher GUI: close the GUI, the hub keeps running so hooks / MCPs / shell scripts still resolve config.
 
@@ -201,7 +202,7 @@ A detached local HTTP server (port 7700 default) that serves as the single sourc
 | `VCT_HUB_PORT` env | `7700` | Hub port override. Falls back to `<vct_root_dir>/hub.port` (written on startup), then `7700`. |
 | `VCT_HUB_TOKEN` env | (unset) | Hub auth token override (tests / dev). Production reads from `<vct_root_dir>/hub.token`. |
 | `VCT_STATE_DIR` env | `$HOME/.vct` | Root directory for `hub.port`, `hub.token`, `hub.pid`, `cache/`, etc. Resolution: `VCT_STATE_DIR` → `~/.vct/` → relative `./.vct/` last-resort fallback. Setting this lets dev launchers run side-by-side with production without contaminating state. |
-| `<vct_root_dir>/hub.token` | — | Bearer token (32 bytes hex, OS CSPRNG). Regenerated on every hub startup, mode `0o600` on Unix. Required on every `/api/v1/*` route except `/api/v1/health` — but as of v0.2.77 the two per-project `/env` + `/config` routes require a project-scoped `hub.token.<project_id>` and refuse this global token by default (`VCT_HUB_LEGACY_GLOBAL_ENV=1` on the hub reopens a one-release compat window). Never appears in argv — clients read the file and pass via `Authorization: Bearer ...` header. |
+| `<vct_root_dir>/hub.token` | — | Bearer token (32 bytes hex, OS CSPRNG). Regenerated on every hub startup, mode `0o600` on Unix. Required on every `/api/v1/*` route except `/api/v1/health` — but the two per-project `/env` + `/config` routes require a project-scoped `hub.token.<project_id>` and refuse this global token by default (`VCT_HUB_LEGACY_GLOBAL_ENV=1` on the hub reopens a compat window). Never appears in argv — clients read the file and pass via `Authorization: Bearer ...` header. |
 | `<vct_root_dir>/hub.port` | — | Plain integer, the port the hub bound to. Written before `hub.token` so a racing client either sees neither file or both. |
 | `<vct_root_dir>/hub.pid` | — | Single-instance lockfile. Contains the running hub's PID. CLI checks it via OS-specific liveness probe (`kill(pid, 0)` on Unix, `OpenProcess` on Windows) + a `TcpListener::bind` probe on the hub port. |
 
@@ -217,7 +218,7 @@ vct-hub --unregister-boot        # remove boot autostart
 vct-hub --boot-status            # check whether boot autostart is registered
 ```
 
-**Boot autostart** is OS-specific and DEFAULT-OFF in v0.2.21. Users opt in via launcher GUI Preferences (Step 13 follow-up). Backends:
+**Boot autostart** is OS-specific and DEFAULT-OFF. Users opt in via launcher GUI Preferences. Backends:
 
 - Linux: systemd-user unit (`~/.config/systemd/user/vct-hub.service`).
 - macOS: `launchd` plist (`~/Library/LaunchAgents/com.vibecodedtools.vct-hub.plist`).
@@ -229,10 +230,10 @@ When `VCT_STATE_DIR` is non-default, boot registration prints a warning — the 
 
 | Endpoint | Purpose | Notes |
 |---|---|---|
-| `GET /api/v1/health` | Liveness probe | No auth required. (Corrected v0.2.54, live-verified: the bare `/health` path does NOT exist — it hits the auth layer and returns 401, not a liveness answer.) |
+| `GET /api/v1/health` | Liveness probe | No auth required. (The bare `/health` path does NOT exist — it hits the auth layer and returns 401, not a liveness answer.) |
 | `GET /api/v1/projects/{id-or-slug}/config` | Resolver: KG collection, codegraph prefix, embedding selections, access-matrix lists, service URLs | Accepts UUID or slug as the `{id}` path arg (try-UUID-then-slug fallback). Replaces per-process `os.getenv("KG_COLLECTION")` etc. drift. Returns 503 when primary KG binding is missing (caller-actionable). |
 | `GET /api/v1/projects/{id}/env?key=<slot>` | Secrets resolver | Resolves via per-project keychain row first; falls back to SENTINEL_SHARED + `module_id=user` for shared slots declared in `vct-module.json::bundled_secrets[]`. |
-| `GET /api/v1/services/status` | Services snapshot | v0.2.21 returns a degraded skeleton (`degraded: true`, no per-service runtime). Full supervisor relocation to the hub (Step 24 Stream B) lands later; until then the `/services/{start,stop,restart}` routes return `501 not_implemented`. |
+| `GET /api/v1/services/status` | Services snapshot | Returns a degraded skeleton (`degraded: true`, no per-service runtime). The `/services/{start,stop,restart}` routes return `501 not_implemented`. |
 | `GET /api/v1/projects/by-path?path=<abs-path>` | Path → project UUID | Used by resolver clients before fetching `/config`. Returns 404 with `project_not_found` when the path isn't registered. |
 
 **Resolver clients** discover the hub via the same chain:
@@ -243,9 +244,9 @@ When `VCT_STATE_DIR` is non-default, boot registration prints a warning — the 
 
 Discovery: `VCT_HUB_PORT` env → `<vct_root_dir>/hub.port` → `7700` default; token: `VCT_HUB_TOKEN` env → `<vct_root_dir>/hub.token`. All clients enforce the same exit-code shape (0 success / 1 hub unreachable / 2 project not registered / 3 service misconfigured / 4 field not found / 5 forbidden — hub refused the token on `/env`|`/config`, callers MUST NOT env/file-fallback / 64 usage error). Stderr emissions are rate-limited per `(pid, error_kind)` to one line per 5 minutes — `VCO_HOOK_DEBUG=1` bypasses the limit.
 
-**v0.2.20 → v0.2.21 cutover sentinel**: when `install.py` deploys `vct-hub` for the first time, it writes `<vct_root_dir>/v0.2.21-cutover.flag` BEFORE starting the hub. The v0.2.21 launcher reads this flag on startup and skips its own in-process services watcher (knowing the hub will take it over). `install.py` deletes the flag after `vct-hub` responds to `/api/v1/health`. Leftover sentinels are harmless — the hub's first successful `/api/v1/health` clears the contention.
+**Cutover sentinel**: when `install.py` deploys `vct-hub` for the first time, it writes `<vct_root_dir>/v0.2.21-cutover.flag` (literal filename) BEFORE starting the hub. The launcher reads this flag on startup and skips its own in-process services watcher (knowing the hub will take it over). `install.py` deletes the flag after `vct-hub` responds to `/api/v1/health`. Leftover sentinels are harmless — the hub's first successful `/api/v1/health` clears the contention.
 
-## Paid-module license framework (v0.2.14+)
+## Paid-module license framework
 
 This repo is fully functional standalone. Optional paid modules (RL retrieval reranking, MAO multi-agent runtime, specialist agent packs) activate only when a license key is present. Without a key, retrieval falls back to plain Weaviate cosine ordering — nothing breaks.
 
@@ -300,15 +301,19 @@ MCP servers are registered in the user's `~/.claude.json`. Each launches via the
 - Command: `claude_mcp_servers/.venv/bin/python claude_mcp_servers/weaviate_mcp/server.py`
 - Env: `WEAVIATE_URL`, `OLLAMA_URL`, `EMBEDDING_MODEL`, `KG_COLLECTION`, `SHARED_KG_COLLECTION`, `DEVELOPMENT_COLLECTION`, `GRPC_PORT`, `SHARED_KG_WRITE_DISABLED` (write gate; legacy alias `SHARED_KG_OPT_OUT` kept for ~3 releases), plus the EmbeddingService vars (`ACTIVE_EMBEDDING`, `OPENAI_API_KEY`, `CODE_EMBED_SERVICE_URL`, etc.).
 
-**search** — academic paper search via OpenAlex and arXiv (narrowed to `search_papers` only in v0.2.11; `web_search`, `search_code`, and `fetch_page` removed as redundant with Claude's built-in WebFetch and web capabilities).
+**search** — academic paper search via OpenAlex and arXiv.
 - Command (Unix): `claude_mcp_servers/search_mcp/wrapper.sh` — exports `GITHUB_TOKEN` from the keychain (env-first then resolver), then `exec`s the real server.
 - Command (Windows): `claude_mcp_servers/.venv/Scripts/python.exe claude_mcp_servers/search_mcp/server.py` (no wrapper; PowerShell resolver client handles the secret).
 - Env: `OPENALEX_EMAIL` (optional, gives polite-pool priority on OpenAlex API); `GITHUB_TOKEN` (resolved at wrapper startup from the `github_pat` shared keychain slot).
-- Tools: `search_papers` only.
+- Tools: `search_papers` only. (Claude's built-in WebFetch covers ad-hoc web retrieval, so no general web-search tool is exposed.)
 
-**Removed in v0.2.11**: the **ollama** MCP (`chat`, `read_document`, `read_image`) was removed as redundant. Claude's native reasoning, `Read` tool, and built-in vision handle the same use cases at higher quality. Ollama continues running as infrastructure for Weaviate text embeddings and the code-embedding service CPU fallback. The **SearXNG** container was also removed from the default stack — `search_papers` calls OpenAlex and arXiv directly without a local search proxy. See `knowledge/concepts/mcp-simplification-v0211.md` for the full rationale.
+**mermaid** and **excalidraw** — diagram describe/extract servers. Registered in `~/.claude.json` at install but **per-project default-disabled**: `claude mcp list` shows them Connected, yet their tools aren't callable until you opt in via the launcher's Diagrams tab.
 
-**Stale MCP cleanup**: `install.py --rewrite-stale-mcps` (added in v0.2.12 / PR-33) detects deprecated MCP entries left over from older versions in `~/.claude.json` and offers consent-prompted auto-rewrite. Run after upgrading from pre-v0.2.11 installs.
+**playwright** — browser automation, enabled by default and invoked separately via `npx -y @playwright/mcp@latest`. `install.py` pre-caches it (opt out with `VCT_SKIP_PLAYWRIGHT=1`).
+
+**Not MCPs**: Ollama runs as infrastructure only (Weaviate text embeddings + code-embedding service CPU fallback) — there is no Ollama MCP server; Claude's native reasoning, `Read` tool, and built-in vision cover analysis, document reading, and image tasks. The code-embedding FastAPI service on port 11440 is likewise backend infrastructure. `search_papers` calls OpenAlex and arXiv directly — no local search proxy runs in the default container stack.
+
+**Stale MCP cleanup**: `install.py --rewrite-stale-mcps` detects deprecated MCP entries left over from older versions in `~/.claude.json` and offers consent-prompted auto-rewrite. Run after upgrading from an older install.
 
 ## Agents and skills
 
@@ -344,8 +349,8 @@ Set these before running `bash first-install.sh` (or export them for the duratio
 | `VCT_STATE_DIR=/path` | Override `~/.vct/` as the launcher state-root. Lets dev launchers run alongside production without contaminating state. Hub binaries pick this up automatically; resolver clients honour it too. |
 | `VCT_DISABLE_HOOKS=1` | See section below. |
 | `VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY=1` | **Test-only sentinel** consumed by `launcher/src-tauri/src/hub_launcher.rs:84`. When set, the launcher's hub-binary discovery skips steps 4 and 5 (in-tree dist resolution via `current_exe()` walking) and returns `None` if no other candidate matched. Production code never sets this — it exists so `cargo test` runs against `target/debug/` (where sibling cargo invocations may leave a real `vct-hub` binary) can deterministically assert "no hub anywhere". Do NOT use this as a user workaround for hub-start failures; the correct path for that is `vct-hub --start-if-not-running` (see TROUBLESHOOTING.md). |
-| `VCT_RL_PULL_TOKEN_ENDPOINT=<url>` | (v0.2.45 V45-D) Runtime override for the RL module's paid-module pull-token gateway URL. Short-circuits the L0 catalog / L1 manifest / hardcoded-default resolution chain inside `installer_engine::request_pull_token` and POSTs the license-key request to `<url>` verbatim. Use when the on-disk endpoint is wrong (manifest still carries a `placeholder.<tld>` URL, tenant has migrated, gateway is being staged behind a custom domain). Empty / whitespace-only values are ignored. Per-module-id generalization (`VCT_<MODULE_ID>_PULL_TOKEN_ENDPOINT`) is on the v0.2.46-46-2 backlog; the V45-D shape is intentionally module-id-flavoured so that the upgrade is backwards-compatible. |
-| `VCT_MODULE_PULL_TIMEOUT_SECS=<n>` | (v0.2.66) Upper bound, in seconds, on a single module-image `podman`/`docker pull` during a module install or update. Default `1800` (30 min). The bound exists to catch a genuinely *stalled* registry (network black hole, half-open connection, a registry that accepts the connection but never streams layers) — without it, a stalled pull leaves the install row wedged at `status='installing'` forever (the pull future never resolves). On timeout the pull is killed and the install transitions to `status='error'` with an actionable message, then becomes retry-eligible. Raise it for unusually large GPU-variant images on a slow link. A zero, negative, or non-numeric value is **ignored** and the default is used — the bound is never disabled (a stalled pull must always be able to fail). |
+| `VCT_RL_PULL_TOKEN_ENDPOINT=<url>` | Runtime override for the RL module's paid-module pull-token gateway URL. Short-circuits the L0 catalog / L1 manifest / hardcoded-default resolution chain inside `installer_engine::request_pull_token` and POSTs the license-key request to `<url>` verbatim. Use when the on-disk endpoint is wrong (manifest still carries a `placeholder.<tld>` URL, tenant has migrated, gateway is being staged behind a custom domain). Empty / whitespace-only values are ignored. |
+| `VCT_MODULE_PULL_TIMEOUT_SECS=<n>` | Upper bound, in seconds, on a single module-image `podman`/`docker pull` during a module install or update. Default `1800` (30 min). The bound exists to catch a genuinely *stalled* registry (network black hole, half-open connection, a registry that accepts the connection but never streams layers) — without it, a stalled pull leaves the install row wedged at `status='installing'` forever (the pull future never resolves). On timeout the pull is killed and the install transitions to `status='error'` with an actionable message, then becomes retry-eligible. Raise it for unusually large GPU-variant images on a slow link. A zero, negative, or non-numeric value is **ignored** and the default is used — the bound is never disabled (a stalled pull must always be able to fail). |
 
 ## Disabling hooks for debugging or CI
 
@@ -368,19 +373,17 @@ env VCT_DISABLE_HOOKS=1 python install.py --quiet
 
 The guard sits **after** the credential-scrub block in every hook, so secrets are still stripped from the env even when the hook itself no-ops. Coverage is asserted by `tests/test_hooks_disable_guard.py` — a regression that adds a new hook without the guard fails CI.
 
-## Vision and image analysis (v0.2.11+)
+## Vision and image analysis
 
-The `read_image` Ollama MCP tool was removed in v0.2.11. For image analysis, pass the image file path to Claude using the native `Read` tool — Claude's built-in vision handles it directly. This approach is simpler, requires no local GPU, and works on any hardware.
-
-For historical reference on the memory-aware gating that `read_image` implemented, see `knowledge/concepts/read-image-memory-aware-gating.md` (marked deprecated).
+For image analysis, pass the image file path to Claude using the native `Read` tool — Claude's built-in vision handles it directly. This approach is simple, requires no local GPU, and works on any hardware.
 
 ## Sharing knowledge across projects
 
-By default, every project queries both its per-project KG and a shared cross-project collection (`VibeCodedOrchestrator_KnowledgeGraph` since v0.2.12 — renamed from `VibeCodedTools_KnowledgeGraph`). Knowledge nodes captured in one project are visible to all others without re-explaining context.
+By default, every project queries both its per-project KG and a shared cross-project collection (`VibeCodedOrchestrator_KnowledgeGraph`). Knowledge nodes captured in one project are visible to all others without re-explaining context.
 
 Three control points:
 
-- **`SHARED_KG_COLLECTION`** — name of the shared collection. Default `VibeCodedOrchestrator_KnowledgeGraph`. Override to point at a private team-shared collection (`AcmeTeam_SharedKG`) without exposing it via the public bundled name. The launcher's Identity tab ships a "Manage shared KG collection" picker (PR-26 Group E, v0.2.12) that surfaces every orchestrator-shaped class on your Weaviate and lets you pick which one is canonical — useful when migrating from a pre-v0.2.12 install with data still under `VibeCodedTools_KnowledgeGraph`.
+- **`SHARED_KG_COLLECTION`** — name of the shared collection. Default `VibeCodedOrchestrator_KnowledgeGraph`. Override to point at a private team-shared collection (`AcmeTeam_SharedKG`) without exposing it via the public bundled name. The launcher's Identity tab ships a "Manage shared KG collection" picker that surfaces every orchestrator-shaped class on your Weaviate and lets you pick which one is canonical — useful when migrating from an older install whose shared collection has a different name.
 - **`SHARED_KG_WRITE_DISABLED=true`** — per-project WRITE gate. Refuses `store_knowledge_node(scope="shared")` from this project with a clear error. Reads of the shared collection remain unconditional — knowledge accumulation across projects is the headline value prop. Legacy alias: `SHARED_KG_OPT_OUT` (kept for ~3 releases, target removal 2026-08).
 - **`store_knowledge_node(scope="shared")`** — explicit write to the shared collection. The default scope is `"project"` so arbitrary projects don't pollute the shared collection by accident.
 
@@ -425,9 +428,7 @@ The `vco` console-script is registered on PATH automatically when
 `pyproject.toml` after creating `.venv/`, so `vco` lands at
 `.venv/bin/vco` on Unix and `.venv\Scripts\vco.exe` on Windows). For
 manual / out-of-band installs, run `pip install -e .` from the repo root
-into any venv. Until v0.2.34 the same surface shipped as
-`scripts/vco{,.ps1}` shim wrappers; those were removed once packaging
-landed. Fall back to `python -m vco_lib.cli <subcommand>` if for any
+into any venv. Fall back to `python -m vco_lib.cli <subcommand>` if for any
 reason the entry point isn't on PATH. Phase 0 ships two acceptance
 verifiers:
 

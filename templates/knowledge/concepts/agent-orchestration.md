@@ -3,7 +3,7 @@ title: Agent Orchestration
 type: concept
 tags: [AI, agents, orchestration, LLM, workflow, coordination, agentic, mid-level-architecture]
 created: 2026-02-26T00:00:00Z
-updated: 2026-06-25T00:00:00Z
+updated: 2026-07-20T00:00:00Z
 status: active
 ---
 
@@ -126,7 +126,7 @@ async def orchestrate_with_retry(task, max_retries=3):
 
 ## This Project's Orchestration
 
-The Claude Orchestrator project uses:
+The orchestrator uses:
 - **Claude Code Agent tool** for ad-hoc agent spawning
 - **Blackboard pattern** for multi-step task lists (CONTEXT_STATE.md)
 - **MCP servers** as tools accessible to all agents
@@ -137,9 +137,5 @@ Generic multi-agent orchestration patterns apply across many frameworks.
 ## Related Links
 
 [[relatedTo::Multi-Agent Systems]]
-[[relatedTo::Blackboard Architecture for Multi-Agent Coordination]]
-[[relatedTo::Claude Code Agent Teams]]
 [[relatedTo::Agentic LLM Workflows]]
-[[relatedTo::Autonomous Orchestration Comparison]]
-[[relatedTo::Claude Flow Orchestration Platform]]
 [[relatedTo::Model Context Protocol]]

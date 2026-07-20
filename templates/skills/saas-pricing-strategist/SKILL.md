@@ -11,7 +11,7 @@ effort: high
 
 **Purpose**: Apply solo-founder pricing playbook to a real product. Output a concrete pricing redesign with rollout plan — not generic advice.
 
-**Model**: Opus 4.7.
+**Model**: Opus.
 
 ## When to invoke
 
@@ -147,7 +147,6 @@ The user may ask for changes that are common and wrong. Challenge with evidence:
 
 ## Knowledge Systems
 
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
 
 **Decision tree**:
 - Pricing patterns and rationale → `hybrid_search("saas pricing tier structure")` (Weaviate MCP)

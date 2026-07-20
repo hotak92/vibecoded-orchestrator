@@ -14,7 +14,7 @@ effort: high
 
 **Why this exists**: most science is interdisciplinary. A biologist needs a stats consultation framed for biology, then a chemistry consultation framed for chemistry, then a physics-informed-ML consultation framed for both. Maintaining 30 separate agent files for 30 disciplines is unmaintainable. One agent that parameterises on the discipline solves it.
 
-**Model**: Opus 4.7 — broad cross-disciplinary knowledge, good calibration on what it does and doesn't know within a discipline. Use Opus only when the consultation requires deep multi-step reasoning specific to the discipline (e.g. a chemistry mechanism with subtle electronic-structure implications).
+**Model**: Opus — broad cross-disciplinary knowledge, good calibration on what it does and doesn't know within a discipline. A cheaper tier is acceptable for routine consultations; keep Opus when the consultation requires deep multi-step reasoning specific to the discipline (e.g. a chemistry mechanism with subtle electronic-structure implications).
 
 ## How to Spawn
 
@@ -236,7 +236,7 @@ The result: future invocations of the same discipline benefit from accumulated K
 
 ## Knowledge Systems
 
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
+> **Full reference**: the "Search Systems" and "Knowledge Graph" sections of this project's `CLAUDE.md`.
 
 **Decision tree** for this agent:
 - Prior consultations in the same discipline → `hybrid_search("[discipline] [topic]")` first.

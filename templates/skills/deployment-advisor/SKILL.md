@@ -10,7 +10,7 @@ model: sonnet
 
 **Purpose**: Deployment strategy guidance - platform selection, CI/CD pipeline design, environment configuration, monitoring.
 
-**Model**: Sonnet 4.5
+**Model**: Sonnet
 
 ## When to Invoke Autonomously
 
@@ -61,7 +61,7 @@ model: sonnet
 
 **Before recommending**: Search for proven deployment patterns
 ```bash
-.claude/scripts/kg-search search "deployment" --type concepts
+.claude/scripts/kg-search search "deployment" --type concept
 ```
 
 **For deep research**: Ask user "Use hybrid_search to research [platform comparison]"

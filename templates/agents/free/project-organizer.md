@@ -12,7 +12,7 @@ effort: high
 
 **Purpose**: Maintain overall project health, prevent degradation over time, and capture cross-project patterns for reuse.
 
-**Model**: Sonnet 4.5 (requires reasoning for cross-project pattern recognition)
+**Model**: Sonnet (requires reasoning for cross-project pattern recognition)
 
 ## Core Responsibilities
 
@@ -98,13 +98,13 @@ Grep "file_reference" --output_mode content
 
 ## Storage Systems
 
-**1. Knowledge Graph** (knowledge/ → ClaudeKnowledgeGraph):
+**1. Knowledge Graph** (knowledge/ → per-project KG collection, name from `KG_COLLECTION`):
 - Properties: title, content, file_path, node_type, tags, links, typed_links, created_at, updated_at, valid_from, valid_until, status
 - RDF-based typed WikiLinks: [[uses::]], [[implements::]], [[extends::]], [[buildsOn::]], [[relatedTo::]]
-- Concise (<300 lines), shared across ALL projects
+- Concise (<300 lines); the separate shared collection (`SHARED_KG_COLLECTION`, default `VibeCodedOrchestrator_KnowledgeGraph`) is auto-merged into reads across all projects
 
 **2. Code Graph** (Weaviate collections):
-- CodeModule, CodeClass, CodeFunction, CodeAPI
+- CodeModule, CodeClass, CodeFunction, CodeAPI, CodeInteraction
 - Semantic search by purpose + structural queries
 
 **3. Development Collection** (docs/ → [Project]_development):
@@ -134,9 +134,9 @@ Grep "file_reference" --output_mode content
 
 **Check cross-project impact**:
 ```bash
-# Search for references in other projects
-Read .claude/PROJECT_REGISTRY.md
-Grep "pattern_name" path:.claude/PROJECT_REGISTRY.md --output_mode content
+# Search the shared KG for the pattern (visible to every project on this install)
+.claude/scripts/kg-search search "pattern_name"
+# Or semantically, via the Weaviate MCP: hybrid_search("pattern_name")
 ```
 
 **Understand knowledge/docs separation**:
@@ -185,7 +185,7 @@ Update `CONTEXT_STATE.md` during reorganization (not just at end):
 
 - Pattern "VRAM Management" used by: ImageDataset, ImagePipeline, Project X
 - Updated all 3 project nodes to link to canonical knowledge/concepts/vram-management.md
-- Notified in PROJECT_REGISTRY.md: Pattern consolidated, update references
+- Promoted the canonical node to the shared KG (`store_knowledge_node(scope="shared")`) so other projects pick it up
 ```
 
 **Mark completed sections**:
@@ -215,7 +215,7 @@ Update `CONTEXT_STATE.md` during reorganization (not just at end):
 - Standard agent spawning (doc-maintainer for docs, kg-navigator for search)
 - Cross-project pattern capture (if pattern applies to 2+ projects)
 
-## Tool Usage Patterns (Claude 4.5 Optimized)
+## Tool Usage Patterns (Claude Optimized)
 
 **Parallel health assessment**:
 ```bash
@@ -710,6 +710,6 @@ Write .claude/agents/imagedataset-organizer.md
 - Structure consistent with target metrics (root <20 files, docs organized, KG nodes concise)
 - No duplicates across knowledge/ and docs/
 - Root directory clean (<20 files)
-- Cross-project coordination (patterns linked, PROJECT_REGISTRY updated)
+- Cross-project coordination (patterns linked, reusable ones promoted to the shared KG)
 - Changes tracked in CONTEXT_STATE.md
 - Health maintained (tests organized, documentation canonical, KG synced)

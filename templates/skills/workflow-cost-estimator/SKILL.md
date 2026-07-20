@@ -11,7 +11,7 @@ effort: high
 
 **Purpose**: Calculate the realistic monthly cost of a workflow BEFORE it ships, so the team knows what they're committing to. Covers LLM tokens, third-party API spend, workflow-engine cost, queue/storage cost. Outputs an envelope at current volume and at 10x scale, with sensitivity analysis on the biggest line items.
 
-**Model**: Opus 4.7
+**Model**: Opus
 
 ## Why this skill exists
 
@@ -57,13 +57,13 @@ Cost per call = (input_tokens × input_price_per_M) + (output_tokens × output_p
 Monthly cost = Cost per call × calls per day × 30
 ```
 
-**Reference prices** (2026-05; verify current via provider docs before quoting):
+**Reference prices** (verify current via provider docs before quoting):
 
 | Model | $/M input | $/M output | Cached input* |
 |---|---|---|---|
-| Claude Haiku 4.5 | $0.80 | $4.00 | discounted 90% |
-| Claude Opus 4.7 | $3.00 | $15.00 | discounted 90% |
-| Claude Opus 4.5 | $15.00 | $75.00 | discounted 90% |
+| Claude Haiku | $1.00 | $5.00 | reads ~0.1x (≈90% discount) |
+| Claude Sonnet | $3.00 | $15.00 | reads ~0.1x (≈90% discount) |
+| Claude Opus | $5.00 | $25.00 | reads ~0.1x (≈90% discount) |
 | GPT-4o | $2.50 | $10.00 | discounted 50% |
 | GPT-4o-mini | $0.15 | $0.60 | discounted 50% |
 | Gemini 2.0 Flash | $0.10 | $0.40 | varies |
@@ -212,7 +212,6 @@ After estimating, write a project node `knowledge/projects/cost-{workflow}.md` w
 
 ## Knowledge Systems
 
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
 
 **Decision tree**:
 - Known terms → `kg-search` CLI

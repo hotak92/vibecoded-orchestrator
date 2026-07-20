@@ -10,7 +10,7 @@ model: haiku
 
 **Purpose**: Quick VRAM/RAM calculations, hardware recommendations, feasibility checks for AI models.
 
-**Model**: Haiku 4.5
+**Model**: Haiku
 
 ## When to Invoke Autonomously
 
@@ -49,8 +49,6 @@ model: haiku
 - Calculate combined VRAM for running multiple models
 - Suggest offloading strategies if tight
 - Account for shared context when applicable
-
-**See**: `examples/calculations.md` for formulas, `examples/gpu-specs.md` for hardware details, `scripts/vram_calculator.py` for automated calculations
 
 ## Quick Workflow Reference
 

@@ -193,7 +193,7 @@ Prioritize test quality and coverage over validation:
   **Bad**: "Tests pass!"
   **Good**: "Implementation accepts unsanitized input. Before writing tests, this needs validation for: (1) SQL injection, (2) XSS, (3) path traversal. Should I test current behavior or wait for validation to be added?"
 
-## Claude 4.x Test Quality
+## Claude Test Quality
 
 **Explicit test cases** (not vague):
 - ❌ "Test all scenarios"
@@ -994,14 +994,14 @@ When testing complete, report in CONTEXT_STATE.md:
 
 ## Knowledge Systems
 
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
+> **Full reference**: the "Search Systems" and "Knowledge Graph" sections of this project's `CLAUDE.md`.
 
 **Decision tree**:
 - Known terms → `kg-search` CLI (fast, ~100ms)
 - Conceptual → `hybrid_search` MCP
 - Relationships → `semantic_graph_search` MCP
 - Code by purpose → `search_code_graph` MCP
-- Quick analysis: use Claude directly (Ollama MCP removed in v0.2.11 as redundant)
+- Quick analysis: use Claude directly (no separate local-LLM tool is needed)
 - Literal strings → Grep
 ## Success Criteria
 

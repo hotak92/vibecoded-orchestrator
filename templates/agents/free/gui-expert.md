@@ -452,20 +452,20 @@ When delivering implementations:
 
 ## Knowledge Systems
 
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
+> **Full reference**: the "Search Systems" and "Knowledge Graph" sections of this project's `CLAUDE.md`.
 
 **Decision tree**:
 - Known terms → `kg-search` CLI (fast, ~100ms)
 - Conceptual → `hybrid_search` MCP
 - Relationships → `semantic_graph_search` MCP
 - Code by purpose → `search_code_graph` MCP
-- Quick analysis: use Claude directly (Ollama MCP removed in v0.2.11 as redundant)
+- Quick analysis: use Claude directly (no separate local-LLM tool is needed)
 - Literal strings → Grep
 ## Workflow Infrastructure
 
 ### Storage Systems
 
-**1. Knowledge Graph** (ClaudeKnowledgeGraph collection):
+**1. Knowledge Graph** (per-project KG collection, name from `KG_COLLECTION`):
 - **Purpose**: Cross-project patterns, concepts, and learnings
 - **Location**: `knowledge/` directory (concepts/, tools/, models/, projects/)
 - **Format**: Obsidian-style .md with YAML frontmatter
@@ -496,9 +496,9 @@ Use `gr.Accordion(open=False)` for advanced options that most users don't need.
 [code examples...]
 ```
 
-**2. Code Graph** (4 Weaviate collections):
+**2. Code Graph** (5 Weaviate collections):
 - **Purpose**: Semantic code search and structural analysis
-- **Collections**: CodeModule, CodeClass, CodeFunction, CodeAPI
+- **Collections**: CodeModule, CodeClass, CodeFunction, CodeAPI, CodeInteraction
 - **Search**: search_code_graph (semantic), query_code_structure (structural)
 - **When to use**: Finding existing Gradio implementations, understanding code structure
 
@@ -506,19 +506,13 @@ Use `gr.Accordion(open=False)` for advanced options that most users don't need.
 - **Purpose**: Verbose project documentation
 - **Location**: `docs/`, `documentation/`, `references/` directories
 - **Search**: Weaviate MCP semantic search
-- **When to use**: Project-specific GUI specifications, requirements
-
-**4. Conversation Collections**:
-- **Purpose**: Decisions and discoveries from conversations
-- **Auto-captured**: User messages automatically synced
-- **Search**: Weaviate MCP semantic search
-- **When to use**: Recalling past design decisions
+- **When to use**: Project-specific GUI specifications, requirements, past design decisions
 
 ### Scripts Available
 
 **Knowledge Graph**:
 ```bash
-.claude/scripts/kg-search search "Gradio patterns" --type concepts
+.claude/scripts/kg-search search "Gradio patterns" --type concept
 .claude/scripts/kg-info info "Gradio Framework"
 .claude/scripts/kg-sync knowledge/concepts/my-pattern.md
 ```

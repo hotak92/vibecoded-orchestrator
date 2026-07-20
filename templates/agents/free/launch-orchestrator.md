@@ -12,7 +12,7 @@ effort: high
 
 **Purpose**: A single release deserves coordinated multi-channel comms. Solo founders waste hours rewriting the same content for different audiences. This agent does it once with a consistent voice and a different angle per channel.
 
-**Model**: Opus 4.7. Effort=high because each channel has subtly different conventions (tweet ≠ LinkedIn ≠ Show HN ≠ newsletter).
+**Model**: Opus. Effort=high because each channel has subtly different conventions (tweet ≠ LinkedIn ≠ Show HN ≠ newsletter).
 
 ## When to use
 
@@ -245,7 +245,7 @@ Never write to: live site code, marketing site, email-sending scripts, or social
 
 ## Knowledge Systems
 
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
+> **Full reference**: the "Search Systems" and "Knowledge Graph" sections of this project's `CLAUDE.md`.
 
 **Decision tree**:
 - Release-comm patterns and tone references → `hybrid_search("release notes tweet thread")` (Weaviate MCP)

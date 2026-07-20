@@ -1,7 +1,9 @@
 # Telemetry
 
 Telemetry is **opt-in, off by default, and never sends data without an
-explicit `VIBECODED_TELEMETRY=true` environment variable**.
+explicit `VCT_TELEMETRY=true` environment variable** (`VIBECODED_TELEMETRY`
+is accepted as a back-compat alias; the canonical key wins when both are
+set).
 
 ## Endpoint configuration
 
@@ -38,7 +40,7 @@ user-identifying information beyond an installer-generated UUID hash.
 # Default location:
 cat ~/.vibecoded/telemetry_pending.jsonl | jq .
 
-# Or via the `vco` CLI (shipped in 0.2.0; binary at launcher/tools/vct-cli/):
+# Or via the `vco` CLI (built from launcher/tools/vct-cli/):
 vco telemetry status
 ```
 
@@ -47,8 +49,8 @@ Each line is one event. Safe to delete or hand-edit at any time.
 ## Disabling telemetry
 
 The `.env` written by `install.py` defaults to `VCT_TELEMETRY=false`
-(canonical key since 2026-05-01; `VIBECODED_TELEMETRY` is read as a
-back-compat alias). To turn it back off after opting in:
+(the canonical key; `VIBECODED_TELEMETRY` is read as a back-compat
+alias). To turn it back off after opting in:
 
 ```bash
 echo "VCT_TELEMETRY=false" >> .env
@@ -65,7 +67,7 @@ Until then telemetry stays local, on disk, and visible.
 
 ## RL retrieval telemetry — what is collected and what it means
 
-The RL retrieval reranker (Pro/MAO modules) keeps a **separate** telemetry path from the install/hardware collector above. This section documents its current-state data posture. Read it before enabling any upload endpoint — no Supabase-side upload path for this data is live yet, and this section MUST land before one is.
+The RL retrieval reranker (Pro/MAO modules) keeps a **separate** telemetry path from the install/hardware collector above. This section documents its current-state data posture. Read it before enabling any upload endpoint — no Supabase-side upload path for this data is live.
 
 **What is uploaded on consent.** When RL online training is enabled, an upload carries the **query embedding** (`query_emb`) plus a per-retrieved-node **embedding vector** (`emb`). The raw query **text is stripped** — it is not uploaded. What ships are the numeric vectors and the retrieval outcome labels used to train the reranker.
 

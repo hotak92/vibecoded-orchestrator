@@ -23,9 +23,9 @@ mcpServers:
 
 Before coordinating complex work:
 ```bash
-.claude/scripts/kg-search search "workflow" --type concepts
-.claude/scripts/kg-search search "parallel" --type concepts
-.claude/scripts/kg-search search "coordination" --type concepts
+.claude/scripts/kg-search search "workflow" --type concept
+.claude/scripts/kg-search search "parallel" --type concept
+.claude/scripts/kg-search search "coordination" --type concept
 ```
 
 Find proven coordination strategies from past projects.
@@ -510,13 +510,13 @@ def verify_task_complete(self, task_id):
 
 ## Storage Systems
 
-**1. Knowledge Graph** (knowledge/ → ClaudeKnowledgeGraph):
+**1. Knowledge Graph** (knowledge/ → per-project KG collection, name from `KG_COLLECTION`):
 - Properties: title, content, file_path, node_type, tags, links, typed_links, created_at, updated_at, valid_from, valid_until, status
 - RDF-based typed WikiLinks: [[uses::]], [[implements::]], [[extends::]], [[buildsOn::]], [[relatedTo::]]
-- Concise (<300 lines), shared across ALL projects
+- Concise (<300 lines); the separate shared collection (`SHARED_KG_COLLECTION`, default `VibeCodedOrchestrator_KnowledgeGraph`) is auto-merged into reads across all projects
 
 **2. Code Graph** (Weaviate collections):
-- CodeModule, CodeClass, CodeFunction, CodeAPI
+- CodeModule, CodeClass, CodeFunction, CodeAPI, CodeInteraction
 - Semantic search by purpose + structural queries
 
 **3. Development Collection** (docs/ → [Project]_development):

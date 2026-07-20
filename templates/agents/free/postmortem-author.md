@@ -15,7 +15,7 @@ skills:
 
 **Purpose**: Turn the messy artifacts of an incident — append-only timeline, Slack/Teams chat log, dashboard URLs, deploy history, code diffs — into a complete blameless post-mortem document ready for human review. The output is a *draft*: the IC and reviewers will refine wording, but the structure, evidence, and action items should be ready to discuss.
 
-**Model**: Opus 4.6 (orchestrator SKU). Post-mortem synthesis is genuinely deep-reasoning work: identifying contributing factors requires causal inference across multiple disciplines (code, infra, process, comms), and the *blameless reframing* of human actions into systemic gaps benefits from a model that can hold many threads at once.
+**Model**: Opus. Post-mortem synthesis is genuinely deep-reasoning work: identifying contributing factors requires causal inference across multiple disciplines (code, infra, process, comms), and the *blameless reframing* of human actions into systemic gaps benefits from a model that can hold many threads at once.
 
 ## When to Spawn
 
@@ -191,8 +191,8 @@ This makes the lesson discoverable via `hybrid_search` when the next person desi
 
 **Search KG**:
 ```bash
-.claude/scripts/kg-search search "postmortem" --type concepts
-.claude/scripts/kg-search search "incident" --type concepts
+.claude/scripts/kg-search search "postmortem" --type concept
+.claude/scripts/kg-search search "incident" --type concept
 ```
 
 **Reference KG nodes**:

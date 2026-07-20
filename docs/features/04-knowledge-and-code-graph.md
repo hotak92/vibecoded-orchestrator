@@ -105,7 +105,7 @@ Stores chunks from files dropped in `documents/`. Created on demand by `process_
 `hybrid_search` searches `KG_COLLECTION`, `SHARED_KG_COLLECTION` (if set), and `DEVELOPMENT_COLLECTION` (if set) in parallel, merges results, and deduplicates by `file_path`. Agent callers never need to manage routing.
 
 ### Per-project KG routing via `KG_COLLECTION` env var
-Each project sets `KG_COLLECTION` in `.claude/settings.json` `env` — the canonical per-project MCP env channel since v0.2.12 (PR-27, 2026-05-16). Opening a different project workspace redirects all KG reads/writes to that project's collection without code changes. Pre-v0.2.12 the launcher also wrote the same value to `.vscode/settings.json` `claude-code.env`, but empirical sentinel testing on Linux Claude Code 2.1.143 showed that block did not propagate to MCP subprocesses, so the launcher no longer writes it.
+Each project sets `KG_COLLECTION` in `.claude/settings.json` `env` — the canonical per-project MCP env channel. Opening a different project workspace redirects all KG reads/writes to that project's collection without code changes. The launcher does not write `.vscode/settings.json` `claude-code.env` for this: empirical sentinel testing on Linux showed that block does not propagate to MCP subprocesses.
 
 ---
 
@@ -232,7 +232,7 @@ Since v0.2.70 the orchestrator's curated seed nodes ship a **pre-built** `templa
 ### `.node_formats.json` sidecar
 JSON file at `knowledge/.node_formats.json`. Maps `file_path → {title, description, summary, chunk_summaries, total_chunks, generated_at, content_hash}`. Used by `hybrid_search`'s `detail` parameter: `"titles"` skips it, `"descriptions"` returns the 3-4 sentence description, `"full"` returns up to 300 chars of raw content.
 
-A sibling **`.node_embeddings.<slot>.json`** sidecar format (per named-vector slot, e.g. `qwen3_embed` / `arctic2_embed`) is defined as of v0.2.70 to let `sync_knowledge_graph.py` ingest a pre-computed node vector instead of computing one at install time — gated on a content-hash staleness check AND an active-slot match (never ingests a vector from a different embedding model). The ingest plumbing ships inert: no `.node_embeddings.*.json` is shipped yet, so installs compute embeddings as before until a future update populates the vector files.
+A sibling **`.node_embeddings.<slot>.json`** sidecar format (per named-vector slot, e.g. `qwen3_embed` / `arctic2_embed`) is defined to let `sync_knowledge_graph.py` ingest a pre-computed node vector instead of computing one at install time — gated on a content-hash staleness check AND an active-slot match (never ingests a vector from a different embedding model). The ingest plumbing ships inert: no `.node_embeddings.*.json` is shipped yet, so installs compute embeddings as before until a future update populates the vector files.
 
 ### `detect_duplicates.py`
 Semantic duplicate detection with configurable threshold (`DEFAULT_SIMILARITY_THRESHOLD = 0.95`). Three detection methods: semantic similarity (Weaviate vector distance), Levenshtein distance on filenames, title substring matching. `--auto-merge` for high-confidence cases.

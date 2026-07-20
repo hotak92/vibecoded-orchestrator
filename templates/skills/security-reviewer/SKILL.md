@@ -10,7 +10,7 @@ model: opus
 
 **Purpose**: Cross-layer security analysis (frontend XSS/CSRF, backend injection, AI prompt injection, infrastructure).
 
-**Model**: Opus 4.5 (expert security reasoning, attack surface analysis)
+**Model**: Opus (expert security reasoning, attack surface analysis)
 
 ## When to Invoke Autonomously
 
@@ -81,7 +81,7 @@ Code involves:
 
 **Before reviewing**: Search for security patterns and vulnerabilities
 ```bash
-.claude/scripts/kg-search search "security" --type concepts
+.claude/scripts/kg-search search "security" --type concept
 ```
 
 **For deep research**: Ask user "Use hybrid_search to research [vulnerability type]"

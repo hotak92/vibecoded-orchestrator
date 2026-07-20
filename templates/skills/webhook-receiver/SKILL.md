@@ -1,7 +1,7 @@
 ---
 name: webhook-receiver
 description: Hardens an inbound webhook endpoint with HMAC signature verification, timestamp replay protection, idempotency, schema validation, async processing, and dead-letter handling. Use when designing a new webhook receiver or auditing an existing one
-short_desc: webhook receiver: HMAC, replay protection, idempotency
+short_desc: "webhook receiver: HMAC, replay protection, idempotency"
 keywords: [webhook, HMAC, signature verification, replay protection, dead-letter, X-Hub-Signature, idempotency, retry-safe, DLQ]
 model: opus
 effort: high
@@ -11,7 +11,7 @@ effort: high
 
 **Purpose**: Produce a production-grade webhook receiver — not a `flask.route("/webhook", methods=["POST"])` that returns 200 and hopes for the best. Covers HMAC verification, replay protection, idempotency, payload validation, async dispatch, dead-letter queue, observability.
 
-**Model**: Opus 4.7
+**Model**: Opus
 
 ## When to invoke autonomously
 
@@ -245,7 +245,6 @@ After completing, document the receiver in `knowledge/projects/webhook-{provider
 
 ## Knowledge Systems
 
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
 
 **Decision tree**:
 - Known terms → `kg-search` CLI

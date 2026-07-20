@@ -1,7 +1,7 @@
 ---
 name: experiment-designer
 description: Designs experiments from a hypothesis - proposes controls, power analysis, randomisation, blinding, preregistration checklist, and expected confounders - before any data is collected
-short_desc: study design: controls, power, preregistration
+short_desc: "study design: controls, power, preregistration"
 keywords: [experiment design, randomisation, blinding, preregistration, confounders, power analysis, reproducibility, "design an experiment", "study design", "A/B test design", "before collecting data", "experimental controls", RCT]
 tools: Read, Write, Edit, WebSearch, Bash
 model: opus
@@ -12,7 +12,7 @@ effort: xhigh
 
 **Purpose**: Given a research hypothesis or question, produce a publication-grade experimental design — controls, sample size, randomisation, blinding, primary vs secondary outcomes, expected confounders, statistical analysis plan, and a preregistration document — *before* data collection begins. Designed for the moment when a PI says "I want to test X" and a clear, defensible design is more valuable than fast pilot data.
 
-**Model**: Opus 4.5/4.6 — experiment design is a genuinely deep-reasoning task across statistics, domain knowledge, ethics, and feasibility. Sonnet under-performs on multi-objective trade-offs (cost vs power vs ethics vs feasibility). The cost of a poorly designed experiment is months of wasted lab time; Opus's premium is trivial in comparison.
+**Model**: Opus — experiment design is a genuinely deep-reasoning task across statistics, domain knowledge, ethics, and feasibility. Sonnet under-performs on multi-objective trade-offs (cost vs power vs ethics vs feasibility). The cost of a poorly designed experiment is months of wasted lab time; Opus's premium is trivial in comparison.
 
 ## Core Responsibilities
 
@@ -361,7 +361,7 @@ After the design, the agent writes:
 
 ## Knowledge Systems
 
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
+> **Full reference**: the "Search Systems" and "Knowledge Graph" sections of this project's `CLAUDE.md`.
 
 **Decision tree** for this agent:
 - Prior similar designs in the lab → `hybrid_search`.

@@ -1,6 +1,6 @@
 # Agents, Skills & Hooks
 
-The Claude Code automation surface: 44 bundled agents, 53 skills, and 36 hooks (most wired in default `.claude/settings.json`; some available but not wired). Templates in `templates/agents/` and `templates/skills/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
+The Claude Code automation surface: 44 bundled agents, 53 skills, and 45 hooks (43 event-registered in the default `.claude/settings.json`; 2 invoked by sibling hooks rather than registered). Templates in `templates/agents/` and `templates/skills/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
 
 For the MCP servers that agents use → see [02-mcps-and-agents.md](02-mcps-and-agents.md).
 
@@ -127,7 +127,7 @@ Agents with `isolation: worktree` run in a temporary git worktree (isolated bran
 
 ## `orchestrator-tools` MCP (referenced in templates)
 
-Agent frontmatter `mcpServers: orchestrator-tools` references `{{ORCHESTRATOR_ROOT}}/claude_mcp_servers/orchestrator_tools_mcp/server.py`. The implementation is not present in the OSS bundle (paid module). Free-tier agents use `weaviate-kg` and `search` MCPs directly. The `ollama` MCP was removed in v0.2.11.
+Agent frontmatter `mcpServers: orchestrator-tools` references `{{ORCHESTRATOR_ROOT}}/claude_mcp_servers/orchestrator_tools_mcp/server.py`. The implementation is not present in the OSS bundle (paid module). Free-tier agents use `weaviate-kg` and `search` MCPs directly.
 
 ### Graceful degradation behaviour
 Seven agents reference `orchestrator-tools` in their frontmatter as of v0.1.0: `coder`, `tester`, `planner`, `expert-coder`, `project-architect`, `project-coordinator`, `ai-agentic-architect`. The OSS bundle does not ship this MCP server. Claude Code silently ignores MCP entries it cannot find on disk, so the agents install and start cleanly — calls to `orchestrator-tools` tools fail at runtime, not at install time.
@@ -405,4 +405,4 @@ The `project-coordinator` agent implements a blackboard pattern: agents voluntee
 Several hooks spawn background Claude Code agents for heavyweight tasks: `kg-summary-generator.sh` → Haiku agent to update KG summaries; `post-git-commit-kg-sync.sh` → Haiku agent to sync KG after commits. All delegating hooks guard with `CLAUDE_CODE_DISABLE_AUTO_MEMORY` to prevent infinite recursion inside subprocesses.
 
 ### `VCT_DISABLE_HOOKS=1` escape hatch
-Set in your shell (or in `.claude/settings.json` under `env` — the canonical per-project env channel since v0.2.12 / PR-27) to skip all hooks for that session. Every hook checks this variable as its first act.
+Set in your shell (or in `.claude/settings.json` under `env` — the canonical per-project env channel) to skip all hooks for that session. Every hook checks this variable as its first act.

@@ -277,7 +277,7 @@ When delivering a prompt for the designer:
 
 Before crafting, search:
 - `hybrid_search("AI image generation 2026")`
-- `kg-search search "ComfyUI" --type tools`
+- `kg-search search "ComfyUI" --type tool`
 - `hybrid_search("brand-consistent imagery")`
 
 Capture:

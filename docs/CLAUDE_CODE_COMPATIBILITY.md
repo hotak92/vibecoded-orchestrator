@@ -43,26 +43,19 @@ carrying the same env values (`KG_COLLECTION`, `PROJECT_NAME`,
    values. Useful for users who launch `claude` from a shell wrapper
    (see Option A below) or who want to source it manually.
 
-> **v0.2.12 (PR-27, 2026-05-16) — third surface removed.** Pre-v0.2.12
-> the launcher also wrote `.vscode/settings.json` `claude-code.env`
-> as a third surface. Empirical sentinel testing on Linux Claude Code
-> 2.1.143 confirmed that block does NOT propagate to MCP subprocesses
-> on Linux — the chat process didn't see those env vars either. Writing
-> the key caused user confusion ("I edited the file but nothing
-> changed"). The write was removed; `.claude/settings.json` `env`
-> remains the canonical channel. See the PR-27 commit message for the
-> full empirical trace, including the `/proc/<mcp_pid>/environ`
-> sentinel-test methodology used to verify propagation behaviour.
->
+> **Note on `.vscode/settings.json`**: the `claude-code.env` block in
+> `.vscode/settings.json` does NOT propagate to MCP subprocesses on
+> Linux (verified empirically via `/proc/<mcp_pid>/environ` sentinel
+> testing) — do not use it for per-project MCP/KG env vars;
+> `.claude/settings.json` `env` is the canonical channel.
 > `.vscode/settings.json` is still useful for VS Code editor
 > preferences (Pylance excludes, file-watcher excludes, formatter
 > settings), and the launcher's Python-side
-> `_backfill_vscode_excludes_in_project` still manages the
-> Pylance/watcher exclude block. It just no longer carries
-> `claude-code.env`.
+> `_backfill_vscode_excludes_in_project` manages the Pylance/watcher
+> exclude block. It does not carry `claude-code.env`.
 
-The CLI doesn't auto-source `.claude/env`. With (1) in place this is
-no longer required for KG routing, but the wrapper is still useful if
+The CLI doesn't auto-source `.claude/env`. With (1) in place it is
+not required for KG routing, but the wrapper is still useful if
 you want extra env vars beyond the four the launcher manages. Three
 ways to wire it in:
 
@@ -104,18 +97,15 @@ ceremony, easiest to forget.
 
 ## Known caveats
 
-- **Stop-event hooks** (refreshed 2026-05-11): `Stop`, `StopFailure`,
-  `SessionEnd` are documented universally per the current
+- **Stop-event hooks**: `Stop`, `StopFailure`, `SessionEnd` are
+  documented universally per the
   [hooks reference](https://code.claude.com/docs/en/hooks) — no
-  VS Code carve-out. The earlier note here claimed VS Code didn't
-  fire these in v2.1.x; that claim no longer matches the official
-  docs, and the [VS Code feature-gap table](https://code.claude.com/docs/en/vs-code)
+  VS Code carve-out, and the
+  [VS Code feature-gap table](https://code.claude.com/docs/en/vs-code)
   doesn't list hook events as missing. The orchestrator's
   `notify-stop.sh` and `cost-tracker.sh` should fire on every
-  surface that loads `.claude/settings.json`. (Empirical probe in
-  VS Code v2.1.138+ recommended before relying on this; if the
-  hooks don't fire in practice, file via `/feedback` since docs
-  claim parity.)
+  surface that loads `.claude/settings.json`. (If the hooks don't
+  fire in practice, file via `/feedback` since docs claim parity.)
 - **Backgrounded subagents**: spawning `run_in_background: true` agents
   works on all three surfaces, but the notification format differs.
 - **Effort levels**: `/effort high|max` works on all surfaces but is
@@ -134,11 +124,9 @@ second file stays around for shell-wrapper users:
   extend it with extra env vars beyond the four the launcher manages.
 
 Because both files carry the same values, there's no precedence
-conflict to reason about. v0.2.12 (PR-27, 2026-05-16) dropped the
-historical third surface (`.vscode/settings.json` `claude-code.env`)
-because it did not propagate to MCP subprocesses on Linux — see the
-"Per-project env files" section above for the empirical-trace
-reference.
+conflict to reason about. `.vscode/settings.json` `claude-code.env`
+is not one of them — it does not propagate to MCP subprocesses on
+Linux (see the "Per-project env files" section above).
 
 ## Linux Desktop app gap
 

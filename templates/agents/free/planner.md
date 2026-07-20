@@ -147,7 +147,7 @@ Use command-line tools for known terms:
 .claude/scripts/kg-search search "authentication patterns"
 
 # Filter by type
-.claude/scripts/kg-search search "API design" --type concepts
+.claude/scripts/kg-search search "API design" --type concept
 
 # Filter by tags
 .claude/scripts/kg-search search "error handling" --tags python
@@ -190,7 +190,7 @@ Nodes from `knowledge/` directory containing cross-project patterns:
 User: "Plan user authentication system"
 
 Your process:
-1. Search: .claude/scripts/kg-search search "authentication" --type concepts
+1. Search: .claude/scripts/kg-search search "authentication" --type concept
 2. Find: OAuth2 pattern node from ProjectX
 3. Review: Read the OAuth2 pattern implementation details
 4. Plan: Adapt OAuth2 pattern to current requirements
@@ -206,7 +206,7 @@ Your process:
 
 ## Search Project-Specific Context
 
-If planning for a specific project, search its documentation and conversations.
+If planning for a specific project, search its documentation.
 
 ### Project Documentation (technical docs, architecture)
 
@@ -214,7 +214,7 @@ Ask Claude Code: "Search [ProjectName]_development for [topic]"
 
 **Examples**:
 - "Search MyProject_development for authentication architecture"
-- "Search ClaudeOrchestrator_development for MCP integration patterns"
+- "Search [Project]_development for MCP integration patterns"
 
 **Returns**: Documentation from that project's `docs/` directory
 
@@ -357,7 +357,7 @@ Read tests/test_module.py
 # DON'T: Read files one at a time sequentially
 ```
 
-**Why parallel**: Claude 4.5 excels at parallel execution - 3 files in 10 seconds instead of 30 seconds
+**Why parallel**: Claude excels at parallel execution - 3 files in 10 seconds instead of 30 seconds
 
 - Identify patterns to follow
 - Note integration points
@@ -467,17 +467,17 @@ Write plan to `.claude/context/plans/YYYY-MM-DD_<task-slug>.md`:
 ### Step 4: Handoff to Coder Agent
 
 **Select appropriate model**:
-- **Haiku 4.5**: Simple tasks
+- **Haiku**: Simple tasks
   - CRUD operations (<200 lines)
   - Formatting, linting, basic refactoring
   - Simple tests, documentation updates
   - Following clear patterns with minimal decisions
-- **Sonnet 4.5**: Complex features (DEFAULT)
+- **Sonnet**: Complex features (DEFAULT)
   - Multi-file implementations (200-1000 lines)
   - Refactoring with architectural changes
   - Complex algorithms, optimization
   - Integration of multiple components
-- **Opus 4.5**: Critical systems
+- **Opus**: Critical systems
   - Security-sensitive code (auth, encryption, payment)
   - Novel algorithms (no prior art in knowledge graph)
   - High-stakes systems (data integrity, compliance)
@@ -491,9 +491,9 @@ Write plan to `.claude/context/plans/YYYY-MM-DD_<task-slug>.md`:
 
 **Keep handoff <500 tokens** - details are in plan file.
 
-**NEVER use `run_in_background: true`** - background agents cannot use ANY tools (Read/Write/Edit/Bash all fail). Always spawn coder WITHOUT background flag.
+Spawn the coder synchronously when the handoff needs immediate back-and-forth; use `run_in_background: true` for long, independent implementation work where you only need the final report.
 
-## Claude 4.x Optimization
+## Claude Optimization
 
 ### Be Explicit, Not Implicit
 
@@ -670,14 +670,14 @@ Decision: B because we have multiple API instances and need consistent rate limi
 
 ## Knowledge Systems
 
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
+> **Full reference**: the "Search Systems" and "Knowledge Graph" sections of this project's `CLAUDE.md`.
 
 **Decision tree**:
 - Known terms → `kg-search` CLI (fast, ~100ms)
 - Conceptual → `hybrid_search` MCP
 - Relationships → `semantic_graph_search` MCP
 - Code by purpose → `search_code_graph` MCP
-- Quick analysis: use Claude directly (Ollama MCP removed in v0.2.11 as redundant)
+- Quick analysis: use Claude directly (no separate local-LLM tool is needed)
 - Literal strings → Grep
 ## Success Criteria
 

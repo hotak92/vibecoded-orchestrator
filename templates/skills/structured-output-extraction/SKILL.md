@@ -11,7 +11,7 @@ effort: high
 
 **Purpose**: Design a pipeline that turns messy unstructured input (PDFs, emails, transcripts, HTML, customer-support tickets) into validated structured data matching a strict schema. Covers schema design, prompt structure, validate-correct loop, fallback strategies, observability, and cost/latency budgeting.
 
-**Model**: Opus 4.7
+**Model**: Opus
 
 ## When to invoke autonomously
 
@@ -211,7 +211,7 @@ Sample math for the design:
 Invoice extraction:
 - Input tokens: avg 5K (PDF text)
 - Output tokens: avg 500
-- Model: Opus 4.7 ($3/M input, $15/M output)
+- Model: Claude Sonnet ($3/M input, $15/M output)
 - Cost per extraction: 5K × $3/M + 500 × $15/M = $0.015 + $0.0075 = $0.0225
 - Volume: 10K/day
 - Daily cost: $225
@@ -314,7 +314,6 @@ After designing, write `knowledge/projects/extraction-{task}.md` capturing the c
 
 ## Knowledge Systems
 
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
 
 **Decision tree**:
 - Known terms → `kg-search` CLI

@@ -12,7 +12,7 @@ allowed-tools: Read, Write, WebSearch, Bash
 
 **Purpose**: Triage a research question + dataset description into a defensible statistical analysis plan. Recommend test family, list assumptions to verify, give a sample-size estimate, and call out the alternatives if assumptions fail.
 
-**Model**: Opus 4.7 — strong reasoning for choosing between methods; cheaper than Opus for this routine task.
+**Model**: Opus — strong reasoning for choosing between methods.
 
 **When to invoke autonomously**:
 - The user has data and a question but no chosen method.

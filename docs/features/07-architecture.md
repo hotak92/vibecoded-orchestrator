@@ -36,7 +36,7 @@ All writes to `~/.claude.json` use atomic write semantics (write to a temp file,
 `tools/claude` is a drop-in wrapper script that auto-sources `$PWD/.claude/env` before exec'ing the real `claude` binary. Enable via symlink (`~/.local/bin/claude`) or shell alias. See `docs/CLAUDE_CODE_COMPATIBILITY.md` §Option A.
 
 ### VS Code extension surface
-`.claude/settings.json` `env` provides per-project env to the VS Code extension AND to MCP subprocesses spawned from the extension session — this is the canonical channel since v0.2.12 (PR-27, 2026-05-16). The historical `.vscode/settings.json` `claude-code.env` block was removed because empirical sentinel testing on Linux Claude Code 2.1.143 showed it did not propagate to MCP subprocesses. `.vscode/settings.json` is still used for VS Code editor preferences (Pylance excludes, file-watcher excludes, formatter settings).
+`.claude/settings.json` `env` provides per-project env to the VS Code extension AND to MCP subprocesses spawned from the extension session — this is the canonical channel. The `.vscode/settings.json` `claude-code.env` block is not used for this: empirical sentinel testing on Linux showed it does not propagate to MCP subprocesses. `.vscode/settings.json` is used for VS Code editor preferences only (Pylance excludes, file-watcher excludes, formatter settings).
 
 ### Claude Desktop app surface
 `.claude/settings.json` `env` block is the only path that reaches Desktop app users (macOS / Windows). MCP servers still connect via `~/.claude.json`. Linux Desktop app is an upstream gap (Anthropic doesn't ship it yet); Linux users must use CLI.

@@ -185,7 +185,7 @@ Each fail becomes a recommendation with effort estimate.
 Search before designing:
 - `hybrid_search("brand identity systems")` — find prior work in this project
 - `hybrid_search("design tokens DTCG")` — token architecture patterns
-- `kg-search search "color management" --type concepts`
+- `kg-search search "color management" --type concept`
 
 Capture new patterns:
 - New token tier structure discovered → `knowledge/concepts/`

@@ -3,7 +3,7 @@ name: workflow-maintain
 description: Analyzes project workflow setup and suggests/creates needed automation for hooks, scripts, skills, and agents
 short_desc: audit and improve project workflow automation
 keywords: ["workflow automation", "project setup", "automation audit", "audit workflow", "setup workflow", "improve workflow", "add automation", "workflow improvement", "automate this task"]
-tools: Read, Write, Edit, Grep, Glob, Bash, Task
+allowed-tools: Read, Write, Edit, Grep, Glob, Bash, Task
 model: sonnet
 ---
 
@@ -99,12 +99,12 @@ Validates generated automation:
 
 ### Context Reminder Hook
 **Trigger**: Project has CONTEXT_STATE.md
-**Creates**: user-prompt-submit.sh hook
+**Creates**: user-prompt-submit-context-reminder.sh hook (hook filenames are qualified: `<event>-<purpose>.sh`)
 **Purpose**: Remind to update context during active work
 
 ### Session Start Hook
 **Trigger**: Project has knowledge graph OR complex setup
-**Creates**: session-start.sh hook
+**Creates**: session-start-context-loader.sh hook
 **Purpose**: Auto-load relevant context at session start
 
 ### Post-Edit Hook
@@ -163,8 +163,8 @@ Claude: [Scans project, shows recommendations]
 
 User: /workflow-maintain create all
 Claude: [Creates all recommended automation]
-  - Created: .claude/hooks/user-prompt-submit.sh
-  - Created: .claude/hooks/session-start.sh
+  - Created: .claude/hooks/user-prompt-submit-context-reminder.sh
+  - Created: .claude/hooks/session-start-context-loader.sh
   - Created: .claude/scripts/doc-check
   - Updated: .claude/CLAUDE.md
   - Updated: .claude/settings.json
@@ -174,7 +174,7 @@ Claude: [Creates all recommended automation]
 ```
 User: /workflow-maintain create context-reminder
 Claude: [Creates context reminder hook]
-  - Created: .claude/hooks/user-prompt-submit.sh
+  - Created: .claude/hooks/user-prompt-submit-context-reminder.sh
   - Configured: Every 10 messages, 15min threshold
   - Updated: .claude/settings.json
 ```

@@ -6,125 +6,96 @@ keywords: [context state, CONTEXT_STATE, session tracking, task lifecycle, conte
 model: haiku
 ---
 
-# Context Management Commands (Haiku)
+# Context Management Commands
 
-**Purpose**: Efficient context state inspection, task lifecycle management, and session tracking.
+**Purpose**: Efficient inspection and maintenance of `.claude/CONTEXT_STATE.md` — the project's active working memory (current task, recent progress, next steps, blockers).
 
-**Model**: Haiku 4.5 (sub-second execution, token-efficient getter commands)
+**Model**: Haiku (fast execution, token-efficient targeted reads)
 
-**Token Cost**: VERY LOW (getter commands, not full file reads)
+**Token Cost**: LOW (targeted section reads, not full-file dumps)
+
+---
+
+## How it works
+
+Every subcommand below is carried out by Claude with ordinary tools (`Read` with `offset`/`limit`, `Grep` for section headers, `Edit` for appends, `Bash` for `wc -l`) against `.claude/CONTEXT_STATE.md` and `.claude/context/`. There is no separate binary — the value of this skill is the discipline: read only the section you need, report tersely, and keep the state file current.
 
 ---
 
 ## When to Invoke (Autonomous Suggestion)
 
-Claude Code should proactively suggest `/context` commands when:
+Suggest `/context` subcommands when:
 
 ```
-IF (user asks "what's the status?") → suggest /context status
-IF (user seems lost) → suggest /context summary
-IF (Claude context filled >60%) → suggest /context summary
-IF (session >30 minutes) → suggest /context update
-IF (switching tasks) → suggest /context pause
-IF (completed milestone) → suggest /context complete
+IF (user asks "what's the status?") → /context status
+IF (user seems lost) → /context summary
+IF (session >30 minutes of work) → /context update
+IF (completed a milestone) → /context complete
 ```
 
 ---
 
-## Available Commands
+## Subcommands
 
 ### 1. Status Check (Most Used)
-```bash
+```
 /context status
 ```
-Returns single-line task status (~50 tokens).
+Grep `CONTEXT_STATE.md` for the current-task heading and report a single-line status. Do not read the whole file.
 
 ### 2. Quick Summary
-```bash
+```
 /context summary
 ```
-Returns status + current work + blockers (~500 tokens).
+Read the current-task, recent-progress, and blockers sections and report a short summary (a few lines each).
 
 ### 3. Blockers Check
-```bash
+```
 /context blockers
 ```
-Returns just current blockers (~100 tokens).
+Report only the blockers section (or "no blockers recorded").
 
 ### 4. Recent Activity Log
-```bash
+```
 /context log [n]
 ```
-Returns last N log entries (~150 tokens per 5 entries).
+Report the last N entries of the session-log / recent-progress section (default 5).
 
 ### 5. Context Size Check
-```bash
+```
 /context size
 ```
-Returns line count, token estimate, warns if >200 lines.
+Run `wc -l .claude/CONTEXT_STATE.md` and report the line count. Target is 250-350 lines; the `context-size-check` hook warns (without truncating) at 500 lines. If over target, offer to trim by archiving completed items.
 
-### 6. Pause Task
-```bash
-/context pause [optional-note]
+### 6. Update Session Log
 ```
-Saves to `TEMP_MEMORY_[task].md`, resets to IDLE.
-
-### 7. Resume Task
-```bash
-/context resume [taskname]
-```
-Restores from `TEMP_MEMORY_[task].md`.
-
-### 8. Complete Task
-```bash
-/context complete [optional-note]
-```
-Archives to `.claude/context/archive/`, resets to IDLE.
-
-### 9. Update Session Log
-```bash
 /context update "Message"
 ```
-Adds timestamped entry to Session Log.
+Append a timestamped entry to the session-log / recent-progress section via `Edit`.
 
----
+### 7. Complete Task
+```
+/context complete [optional-note]
+```
+Move the current task's block into `.claude/context/archive/` (one file per completed task, dated), then reset the current-task section in `CONTEXT_STATE.md`. Never delete content — archive it.
 
-## Token Savings
-
-**Before** (reading full CONTEXT_STATE.md):
-- 3 status checks: 7,500 tokens
-- 5 log reviews: 1,500 tokens
-- 1 summary: 1,000 tokens
-- **Total**: 10,000 tokens
-
-**After** (using /context commands):
-- 3 status checks: 150 tokens
-- 5 log reviews: 500 tokens
-- 1 summary: 500 tokens
-- **Total**: 1,150 tokens
-- **Savings**: 88%
+**Task switching**: there is no separate pause/resume mechanism. To switch tasks, first run `/context update` recording exactly where the current task stands (files touched, next step, open questions), then update the current-task section for the new task. The recorded state is how future sessions resume the old task.
 
 ---
 
 ## Rules for Claude Code
 
-1. **Always use getters first**: Never read full CONTEXT_STATE.md
-2. **Update frequently**: Run `/context update` after every 5-10 actions
-3. **Suggest appropriately**: Offer relevant commands when user asks about status
-4. **Pause before switching**: Always `/context pause` when switching tasks
-5. **Keep minimal**: Target <80 lines for CONTEXT_STATE.md
-6. **Internal usage**: Use `/context status` silently before expensive operations
-
----
-
-## Supporting Files
-
-- **Examples**: See [examples/usage-patterns.md](examples/usage-patterns.md) for common workflows
+1. **Targeted reads first**: use `Grep`/`offset`/`limit` on `CONTEXT_STATE.md` instead of reading the full file for a status question.
+2. **Update during work**: add a `/context update` entry after significant progress, not just at session end.
+3. **Suggest appropriately**: offer the matching subcommand when the user asks about status.
+4. **Record before switching**: always write the current state down before changing tasks.
+5. **Keep it lean**: target 250-350 lines for `CONTEXT_STATE.md` (hard warning at 500 via the `context-size-check` hook); archive completed work to `.claude/context/archive/`.
 
 ---
 
 ## Success Metrics
 
-- ✅ Token usage reduced by >80% for context operations
-- ✅ Commands execute in <2 seconds
-- ✅ Users understand current task state instantly
+- Status questions answered from a section read, not a full-file read
+- `CONTEXT_STATE.md` stays within its target size
+- Completed tasks end up in `.claude/context/archive/`, never deleted
+- A fresh session can resume any recorded task from the state file alone

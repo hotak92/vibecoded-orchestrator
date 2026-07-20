@@ -12,7 +12,7 @@ tags:
 - mid-level-architecture
 - typescript
 created: 2026-01-28 19:00:00+00:00
-updated: 2026-04-05T14:33:08Z
+updated: 2026-07-20T00:00:00Z
 valid_from: 2026-01-28 19:00:00+00:00
 valid_until: null
 status: active
@@ -60,40 +60,39 @@ Match model capability and cost to task complexity:
 - When available
 
 ### 2. Agent Specialization
-Dedicated agents for specific roles:
+Dedicated agents for specific role archetypes (exact names vary per install — check the bundled roster in `.claude/agents/` and `.claude/skills/`):
 
-**Planning Agents**:
-- `orchestrator` - Workflow coordination
-- `planner` - Requirements and design
-- `architect` - Architecture decisions (Opus)
+**Planning roles**:
+- a planning agent — requirements analysis and design (e.g. `planner`)
+- an architecture consultant — high-stakes design decisions on a premium model tier (often shipped as a skill, e.g. `/architect`)
 
-**Implementation Agents**:
-- `coder` - Code implementation
-- `helper-scripter` - Automation scripts
-- `tester` - Test creation and verification
+**Implementation roles**:
+- a coding agent — code implementation (e.g. `coder`)
+- an automation-script agent — helper scripts and tooling (e.g. `helper-scripter`)
+- a testing agent — test creation and verification (e.g. `tester`)
 
-**Maintenance Agents**:
-- `memory-manager` - Context management
-- `doc-maintainer` - Documentation sync
-- `code-reviewer` - Quality assurance (Opus)
+**Maintenance roles**:
+- a documentation-sync agent (e.g. `doc-maintainer`)
+- context/working-memory curation — typically the main session itself, via the working-memory-document discipline
+- a code-review capability on a premium tier (e.g. a `code-review-expert` skill)
 
 ### 3. Workflow Orchestration
-Orchestrator coordinates agent interactions:
+The main session (acting as coordinator) sequences agent interactions:
 
 **Simple Flow**:
 ```
-coder → tester → memory-manager
+coder → tester → doc-maintainer
 ```
 
 **Complex Flow**:
 ```
-orchestrator → memory-manager → planner →
-coder → tester → doc-maintainer → memory-manager
+coordinator → planner → coder → tester → doc-maintainer
+(coordinator updates working memory between phases)
 ```
 
 **Parallel Flow**:
 ```
-orchestrator → [agent-1, agent-2, agent-3] → aggregator
+coordinator → [agent-1, agent-2, agent-3] → aggregator
 ```
 
 ### 4. Context Management
@@ -173,13 +172,13 @@ User-invoked workflows:
 **Solution**: Concise handoffs, file references
 
 **Challenge**: Agent coordination complexity
-**Solution**: Orchestrator agent for complex workflows
+**Solution**: Main-session coordination for complex workflows
 
 **Challenge**: Cost tracking
 **Solution**: Model strategy documentation, usage monitoring
 
 **Challenge**: Quality consistency
-**Solution**: Quality gates via hooks, code review agent
+**Solution**: Quality gates via hooks, code-review skill
 
 ## Related Patterns
 - **Chain of Thought** - Sequential reasoning

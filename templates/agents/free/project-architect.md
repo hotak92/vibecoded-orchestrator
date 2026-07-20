@@ -23,7 +23,7 @@ skills:
 
 **Purpose**: End-to-end project design from requirements analysis through architecture and implementation planning, coordinating sustained multi-file work.
 
-**Model**: Sonnet 4.5 (balanced quality for complex project planning, sustained work)
+**Model**: Sonnet (balanced quality for complex project planning, sustained work)
 
 ## Role
 
@@ -32,9 +32,9 @@ Design complete systems and architectures from requirements analysis through imp
 ## Search Architecture Patterns
 
 Before designing, find existing patterns:
-- `.claude/scripts/kg-search search "architecture" --type concepts`
-- `.claude/scripts/kg-search search "[pattern]" --type concepts`
-- Review similar projects: `.claude/scripts/kg-search search "[domain]" --type projects`
+- `.claude/scripts/kg-search search "architecture" --type concept`
+- `.claude/scripts/kg-search search "[pattern]" --type concept`
+- Review similar projects: `.claude/scripts/kg-search search "[domain]" --type project`
 
 Adapt proven architectures to current needs.
 
@@ -665,13 +665,13 @@ After project architecture:
 
 ## Storage Systems
 
-**1. Knowledge Graph** (knowledge/ → ClaudeKnowledgeGraph):
+**1. Knowledge Graph** (knowledge/ → per-project KG collection, name from `KG_COLLECTION`):
 - Properties: title, content, file_path, node_type, tags, links, typed_links, created_at, updated_at, valid_from, valid_until, status
 - RDF-based typed WikiLinks: [[uses::]], [[implements::]], [[extends::]], [[buildsOn::]], [[relatedTo::]]
-- Concise (<300 lines), shared across ALL projects
+- Concise (<300 lines); the separate shared collection (`SHARED_KG_COLLECTION`, default `VibeCodedOrchestrator_KnowledgeGraph`) is auto-merged into reads across all projects
 
 **2. Code Graph** (Weaviate collections):
-- CodeModule, CodeClass, CodeFunction, CodeAPI
+- CodeModule, CodeClass, CodeFunction, CodeAPI, CodeInteraction
 - Semantic search by purpose + structural queries
 
 **3. Development Collection** (docs/ → [Project]_development):

@@ -1,7 +1,7 @@
 ---
 name: debug-expert
 description: Investigate complex bugs, intermittent failures, performance degradations, and system-wide issues requiring deep reasoning across multiple components
-short_desc: investigate hard bugs: flaky, intermittent, races
+short_desc: "investigate hard bugs: flaky, intermittent, races"
 keywords: ["intermittent failure", "flaky test", "performance degradation", "race condition", "system-wide bug", "root cause", "hard to reproduce", "weird bug", heisenbug, "debug this", "why does this fail"]
 model: opus
 ---
@@ -10,7 +10,7 @@ model: opus
 
 **Purpose**: Investigate complex bugs, intermittent failures, performance degradations, and system-wide issues requiring deep reasoning across multiple components.
 
-**Model**: Opus 4.5 (handles ambiguity, traces root causes, forms hypotheses)
+**Model**: Opus (handles ambiguity, traces root causes, forms hypotheses)
 
 **When to Invoke Autonomously**:
 
@@ -80,8 +80,6 @@ Bug is:
 
 ## Output Format
 
-See [template.md](template.md) for debug investigation report structure.
-
 ## Integration with Knowledge Graph
 
 After debugging:
@@ -97,19 +95,11 @@ After debugging:
 - **Inversion**: Ask "when does X work?" instead of "why does X fail?"
 - **Minimal Reproduction**: Reduce to smallest test case that triggers bug
 
-For detailed strategies, see [examples/debugging-strategies.md](examples/debugging-strategies.md).
-
-## Supporting Files
-
-- **Template**: Use [template.md](template.md) for investigation report format
-- **Checklist**: See [examples/investigation-checklist.md](examples/investigation-checklist.md) for systematic debugging steps
-- **Strategies**: See [examples/debugging-strategies.md](examples/debugging-strategies.md) for investigation approaches
-
 ## Quick Workflow Reference
 
 **Before debugging**: Search for similar bugs and solutions
 ```bash
-.claude/scripts/kg-search search "bug-category" --type concepts
+.claude/scripts/kg-search search "bug-category" --type concept
 ```
 
 **For deep research**: Ask user "Use hybrid_search to research [error pattern]"

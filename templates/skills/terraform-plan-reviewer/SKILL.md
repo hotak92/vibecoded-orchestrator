@@ -11,7 +11,7 @@ effort: high
 
 **Purpose**: Read a `terraform plan` (or `tofu plan`) output and identify changes that warrant human attention before `apply` — destructive replacements, blast-radius issues, IAM widening, drift, hardcoded secrets, and module/provider version concerns.
 
-**Model**: Opus 4.7 at high effort. Plan review is pattern-matching at scale across many resource kinds; deep reasoning helps with cross-resource implications (e.g., subnet replacement triggers NAT gateway replacement triggers EIP reallocation).
+**Model**: Opus at high effort. Plan review is pattern-matching at scale across many resource kinds; deep reasoning helps with cross-resource implications (e.g., subnet replacement triggers NAT gateway replacement triggers EIP reallocation).
 
 ## When to Invoke Autonomously
 
@@ -175,7 +175,7 @@ If approved, suggest applying in this sequence:
 
 **Search KG for established patterns**:
 ```bash
-.claude/scripts/kg-search search "terraform plan review" --type concepts
+.claude/scripts/kg-search search "terraform plan review" --type concept
 .claude/scripts/kg-search search "IAM least privilege" --tags security
 ```
 

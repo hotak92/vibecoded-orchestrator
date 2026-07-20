@@ -25,7 +25,7 @@ isolation: worktree
 ## Search Before Creating Scripts
 
 Check for similar automation:
-- `.claude/scripts/kg-search search "automation" --type tools`
+- `.claude/scripts/kg-search search "automation" --type tool`
 - `.claude/scripts/kg-search search "script" --tags python`
 - Review existing: `.claude/scripts/` and `~/.claude/scripts/`
 
@@ -165,7 +165,7 @@ Prioritize script safety and reliability over validation:
 - When uncertain about security implications, research first
 - Avoid confirming that fragile patterns are "good enough"
 
-## Claude 4.x Script Quality
+## Claude Script Quality
 
 Scripts must have **explicit error handling**, not vague placeholders.
 
@@ -252,7 +252,7 @@ log_error() {
 log_error "Database connection failed" "Check if Weaviate is running: docker ps"
 ```
 
-**Why Claude 4.x needs this**:
+**Why Claude needs this**:
 1. **Explicit over implicit**: "Handle errors" → Specify exactly what errors and how
 2. **Motivation**: Explain WHY design choices matter (for maintainability, security, reliability)
 3. **No placeholders**: TODO/FIXME comments are tech debt, implement now or document explicitly
@@ -568,7 +568,7 @@ def search_knowledge(query: str, limit: int = 5) -> list:
 
     # Search with error handling
     try:
-        collection = client.collections.get("ClaudeKnowledgeGraph")
+        collection = client.collections.get(os.environ.get("KG_COLLECTION", "ClaudeKnowledgeGraph"))
         results = collection.query.near_text(
             query=query,
             limit=limit,
@@ -691,7 +691,7 @@ esac
 **Search for patterns FIRST**:
 ```bash
 # Before creating new hook
-.claude/scripts/kg-search search "hook patterns" --type concepts
+.claude/scripts/kg-search search "hook patterns" --type concept
 
 # Before writing bash wrapper
 Search knowledge graph for "bash venv activation patterns"
@@ -700,7 +700,7 @@ Search knowledge graph for "bash venv activation patterns"
 .claude/scripts/kg-search search "security validation" --tags implementation
 
 # Before creating code graph script
-.claude/scripts/kg-search search "AST parsing" --type tools
+.claude/scripts/kg-search search "AST parsing" --type tool
 .claude/scripts/code-graph-query search "semantic code search patterns"
 
 # Before implementing background maintenance

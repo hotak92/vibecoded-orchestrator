@@ -3,7 +3,7 @@ title: Parallel-agent worktree isolation discipline
 type: concept
 tags: [mid-level-architecture, orchestration, agents, gotcha, claude-code, harness, worktree, lessons-learned]
 created: 2026-06-09T00:00:00Z
-updated: 2026-06-09T00:00:00Z
+updated: 2026-07-20T00:00:00Z
 valid_from: 2026-06-09T00:00:00Z
 valid_until: null
 status: active
@@ -131,6 +131,6 @@ Suspect this footgun if any of these appear in a subagent's reply:
 
 ## Related
 
-- [[agent-orchestration]] — parent doc for multi-agent dispatch patterns
-- [[agentic-llm-workflows]] — coordination patterns across agents
+- [[relatedTo::Agent Orchestration]] — parent doc for multi-agent dispatch patterns
+- [[relatedTo::Agentic LLM Workflows]] — coordination patterns across agents
 - v0.2.52 backlog § V52-AE (in-repo only; private operational plan)

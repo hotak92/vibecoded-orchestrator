@@ -10,7 +10,7 @@ model: sonnet
 
 **Purpose**: Quick guidance on choosing AI models (LLM/VLM/Embedding) based on task, VRAM, cost, and quality requirements.
 
-**Model**: Sonnet 4.5 (balanced reasoning for model comparison)
+**Model**: Sonnet (balanced reasoning for model comparison)
 
 **When to Invoke Autonomously**:
 
@@ -88,7 +88,7 @@ See [template.md](template.md) for complete model recommendation structure.
 
 **Before implementing**: Search for proven patterns
 ```bash
-.claude/scripts/kg-search search "llm" --type models
+.claude/scripts/kg-search search "llm" --type model
 ```
 
 **For deep research**: Ask user "Use hybrid_search to research [model selection]"

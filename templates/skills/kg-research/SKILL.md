@@ -11,25 +11,23 @@ model: sonnet
 
 **Purpose**: Deep research using ONLY knowledge graph and semantic search tools. Forces KG-first approach by restricting access to file tools.
 
-**Model**: Sonnet 4.5 (semantic search requires intelligent query formulation)
+**Model**: Sonnet (semantic search requires intelligent query formulation)
 
 **When to Use**: Research tasks, pattern discovery, concept exploration, finding related work
 
 ---
 
-## Available Tools (KG/Semantic ONLY)
+## Available Tools (weaviate-kg MCP — the real tool surface)
 
-**ALLOWED**:
-- `hybrid_search(query, limit)` - Keyword + semantic across KG + docs (most comprehensive; default search tool)
-- `semantic_graph_search(query, depth)` - Graph traversal via WikiLinks
-- `search_code_graph(query, collection, project, limit)` - Semantic code search
-- `query_code_structure(query_type, target, project)` - Dependencies, callers, inheritance
-- `get_node_connections(title)` - Explore specific node relationships
-- `get_collection_schema(collection_name)` - Inspect collection structure
-- `get_collection_tags(collection_name)` - List available tags
-- `search_recent_work(days, node_type, limit)` - Time-based queries
-- `search_documentation(query, limit, collections)` - Project docs search
-- `list_collections()` - Available collections
+**ALLOWED** (read/search):
+- `hybrid_search(query, limit=5, node_type=None, tags=None, days=None, detail="auto")` — combined keyword + semantic search across the per-project KG, shared KG, and project docs (collections are scoped automatically — no collection parameter needed). **Default and first search tool.** `node_type` filters by type (`project`, `concept`, `tool`, `model`, `hardware`, `research`); `tags` filters by tag list; `days=N` restricts to recently-updated nodes.
+- `semantic_graph_search(query, limit=5, depth=2, detail="auto")` — GraphRAG: semantic matches PLUS their connected neighbors via typed WikiLinks (`uses`, `implements`, `extends`, `buildsOn`, `relatedTo`). Use for "what relates to X?", dependency chains, and exploring a node's connections. `depth` max 3.
+- `search_code_graph(query, scope="all", limit=8, expand_hops=0, layer=None, project=None, detail="auto")` — find code by purpose/concept. `scope` is `"all"` | `"code"` (functions/classes/modules) | `"interaction"` (APIs, cross-service calls). `expand_hops` 1-2 follows call edges from the seed results.
+- `query_code_structure(query_type, target, project=None)` — exact structural queries: `dependencies`, `imports`, `callers`, `methods`, `extends`, `interactions`, `path` (target `"source.func->dest.func"`), `composes`, `composed_by`, `type_users`.
+
+**Available but out of scope for research** (this skill is read-only):
+- `store_knowledge_node(title, content, node_type, tags, links, file_path, scope)` — the KG write tool. Use it AFTER research, or hand findings to a documentation agent, to persist newly-identified gaps as nodes.
+- `describe_excalidraw(file_path)` — describes an Excalidraw diagram file; only relevant when a node references one.
 
 **FORBIDDEN** (enforced by skill constraints):
 - ❌ Read - No file reading (use semantic search instead)
@@ -48,40 +46,40 @@ model: sonnet
 Task: "Find all multi-agent coordination patterns"
 
 Step 1: hybrid_search("multi-agent coordination patterns", limit=10)
-→ Returns: Keyword + semantic + graph results (most comprehensive)
-→ Review: Titles and summaries of top matches
+→ Returns: keyword + semantic results across project KG, shared KG, and docs
+→ Review: titles, scores, and per-result detail tier
 ```
 
 ### 2. Deep Dive with Semantic Graph Search
 
 ```
 Step 2: semantic_graph_search("blackboard architecture", depth=2)
-→ Returns: Starting node + connected concepts via WikiLinks
+→ Returns: primary matches + connected concepts via WikiLinks
 → Explore: [[uses::Tool]], [[implements::Pattern]], [[relatedTo::Concept]]
 ```
 
 ### 3. Code Examples via Code Graph
 
 ```
-Step 3: search_code_graph("agent coordination", collection="CodeFunction")
-→ Returns: Real implementations with signatures and docs
-→ Filter: By project, language, or complexity
+Step 3: search_code_graph("agent coordination", scope="code")
+→ Returns: real implementations with signatures and summaries
+→ Narrow: expand_hops=1 to pull in direct callers/callees
 ```
 
 ### 4. Connections and Relationships
 
 ```
-Step 4: get_node_connections("Blackboard Architecture")
-→ Returns: All WikiLink relationships (incoming + outgoing)
-→ Discover: What uses it, what it implements, related concepts
+Step 4: semantic_graph_search("Blackboard Architecture", depth=2)
+→ Returns: the node plus its WikiLink neighborhood (incoming + outgoing)
+→ Discover: what uses it, what it implements, related concepts
 ```
 
 ### 5. Time-Based Context
 
 ```
-Step 5: search_recent_work(days=30, node_type="research")
-→ Returns: Recent research nodes
-→ Context: What's been studied lately
+Step 5: hybrid_search("recent research", node_type="research", days=30)
+→ Returns: research nodes updated in the last 30 days
+→ Context: what's been studied lately
 ```
 
 ---
@@ -96,7 +94,7 @@ Query: "How does self-consistency voting work?"
 Best approach:
 1. hybrid_search("self-consistency voting LLM") - Cast wide net
 2. semantic_graph_search("voting mechanisms", depth=2) - Explore related
-3. get_node_connections("CISC Voting") - If specific node known
+3. semantic_graph_search("CISC Voting", depth=1) - If specific node known
 ```
 
 ### For Code Patterns
@@ -105,7 +103,7 @@ Best approach:
 Query: "Find examples of agent communication protocols"
 
 Best approach:
-1. search_code_graph("agent communication protocol", collection="CodeClass")
+1. search_code_graph("agent communication protocol", scope="code")
 2. hybrid_search("agent communication patterns") - Find conceptual docs
 3. query_code_structure("dependencies", "agent_coordinator.py") - See what it uses
 ```
@@ -128,9 +126,9 @@ Best approach:
 Query: "What research have we done on context limits?"
 
 Best approach:
-1. search_recent_work(days=90, node_type="research") - Recent research
-2. hybrid_search("context limits RLM adaptive") - Conceptual search
-3. search_documentation("context management", collections=["ClaudeOrchestrator_development"])
+1. hybrid_search("context limits", node_type="research", days=90) - Recent research
+2. hybrid_search("context limits adaptive loading") - Conceptual search
+   (project docs are included automatically — no separate docs tool)
 ```
 
 ---
@@ -145,7 +143,7 @@ Always structure research findings as:
 ## Query Used
 - Semantic: `hybrid_search("...")`
 - Graph: `semantic_graph_search("...", depth=N)`
-- Code: `search_code_graph("...", collection="...")`
+- Code: `search_code_graph("...", scope="...")`
 
 ## Key Findings
 
@@ -198,7 +196,7 @@ Always structure research findings as:
 ✅ **Do say**: "Let me search for that concept: `hybrid_search('concept')`"
 
 ❌ **Don't say**: "I'll grep for that pattern"
-✅ **Do say**: "Let me search code graph: `search_code_graph('pattern', collection='CodeFunction')`"
+✅ **Do say**: "Let me search code graph: `search_code_graph('pattern', scope='code')`"
 
 ❌ **Don't say**: "I can't find information without reading files"
 ✅ **Do say**: "The KG doesn't have this concept yet - that's a gap to fill"
@@ -220,7 +218,7 @@ Skill response:
 ## Query Strategy
 1. hybrid_search("multi-agent planning LLM") - Comprehensive search
 2. semantic_graph_search("planning algorithms", depth=3) - Graph traversal
-3. search_code_graph("planning", collection="CodeClass") - Implementation examples
+3. search_code_graph("planning", scope="code") - Implementation examples
 
 ## Key Findings
 
@@ -252,39 +250,41 @@ Skill response:
 
 ---
 
-## Collections Available (for context)
+## Collections Searched (for context)
+
+`hybrid_search` scopes these automatically — you never pass a collection name:
 
 **Knowledge Graph**:
-- `ClaudeKnowledgeGraph` - Shared cross-project patterns (161 nodes)
-- `[ProjectName]_KnowledgeGraph` - Per-project KG collections (one per project)
+- `<ProjectName>_KnowledgeGraph` — the per-project KG (name from the `KG_COLLECTION` env var)
+- Shared cross-project KG (name from `SHARED_KG_COLLECTION`, default `VibeCodedOrchestrator_KnowledgeGraph`) — auto-merged into every read
 
 **Development Docs**:
-- `ClaudeOrchestrator_development` - Orchestrator docs
-- `[Project]_development` - Project-specific docs
+- `<ProjectName>_development` — verbose project docs (name from `DEVELOPMENT_COLLECTION`)
 
-**Code Graph**:
+**Code Graph** (searched by `search_code_graph` / `query_code_structure`):
 - `CodeModule` - Files with imports and metrics
 - `CodeClass` - Classes with inheritance
 - `CodeFunction` - Functions with call graphs
 - `CodeAPI` - API endpoints with handlers
+- `CodeInteraction` - Cross-service calls (HTTP, gRPC, message queues)
 
 ---
 
 ## Pro Tips
 
-1. **Start broad, narrow down**: `hybrid_search` → `semantic_graph_search` → `get_node_connections`
+1. **Start broad, narrow down**: `hybrid_search` → `semantic_graph_search` → targeted `semantic_graph_search(depth=1)` on a known node title
 2. **Follow WikiLinks**: They reveal non-obvious connections
 3. **Use depth=2-3 for graph search**: Balances discovery vs overwhelming results
-4. **Check recent work first**: `search_recent_work` shows what's been studied
+4. **Check recent work first**: `hybrid_search(..., days=30)` shows what's been studied lately
 5. **Cross-reference code and concepts**: `search_code_graph` + `hybrid_search` = complete picture
-6. **Tag-based filtering**: Use `get_collection_tags` to discover available filters
-7. **Multiple collections**: Search both shared KG + project-specific for complete context
+6. **Filter by type and tags**: `node_type` and `tags` on `hybrid_search` narrow noisy result sets
+7. **Trust the auto-scoping**: per-project and shared collections are merged for you — no need to search each separately
 
 ---
 
 ## When This Skill Fails (Known Limitations)
 
-1. **Concept not in KG**: Skill will identify gap, can't create nodes (use different agent)
+1. **Concept not in KG**: Skill will identify the gap; persist it afterwards via `store_knowledge_node` or hand off to a documentation agent
 2. **Need file line numbers**: Code graph has functions, not line-by-line detail (use Read after research)
 3. **Need to see actual code**: Semantic search finds functions, Read needed for implementation (two-step)
 4. **Very recent changes**: KG may not be synced yet (hooks sync on edit, but async)
@@ -301,7 +301,7 @@ Skill response:
 - Avoid reinventing solutions that exist in KG
 
 **After implementation**:
-- Document new patterns in KG (different agent)
+- Document new patterns in KG (`store_knowledge_node`, or a documentation agent)
 - Link to related concepts (WikiLinks)
 - Tag appropriately for future discovery
 

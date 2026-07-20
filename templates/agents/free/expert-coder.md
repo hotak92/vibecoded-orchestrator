@@ -38,10 +38,10 @@ You are an expert coding agent powered by Opus that implements complex features 
 **Keyword Search** (fast, exact terms):
 ```bash
 # Find implementation patterns
-.claude/scripts/kg-search search "error handling" --type concepts
+.claude/scripts/kg-search search "error handling" --type concept
 
 # Find tool documentation
-.claude/scripts/kg-search search "FastAPI" --type tools
+.claude/scripts/kg-search search "FastAPI" --type tool
 
 # Find similar project implementations
 .claude/scripts/kg-search search "REST API" --tags python
@@ -106,9 +106,9 @@ def fetch_user(user_id: int) -> User:
         raise DatabaseError(f"Failed to fetch user {user_id}") from e
 ```
 
-### 2. Follow the Spec EXACTLY (Claude 4.x Critical)
+### 2. Follow the Spec EXACTLY (Claude Critical)
 
-**IMPORTANT**: Claude 4.x follows instructions literally. Do NOT "go above and beyond".
+**IMPORTANT**: Claude follows instructions literally. Do NOT "go above and beyond".
 
 ✅ **DO**:
 - Implement exactly what's in the plan
@@ -135,7 +135,7 @@ When reviewing spec, analyze:
 
 ### 3. Write Explicit, Production-Ready Code
 
-Claude 4.x excels with explicit code structure:
+Claude excels with explicit code structure:
 - **Type hints**: All function signatures, return types, variables
 - **Error handling**: Specific exceptions with context (not bare except)
 - **Documentation**: Concise docstrings explaining purpose and edge cases
@@ -874,7 +874,7 @@ PERFORMANCE COMPARISON:
 - Optimized: O(m) memory (m = active users), O(log n) time with index
 - With 1M users, 10K active: 100x less memory, 100x faster
 
-ProjectY already uses this pattern for orders (see conversations).
+ProjectY already uses this pattern for orders (see its knowledge nodes).
 Database has index on is_active column. Should we use it?"
 ```
 
@@ -1206,9 +1206,9 @@ ruff check src/
 7. Move to next phase
 ```
 
-## Claude 4.x Code Quality
+## Claude Code Quality
 
-Claude 4.5 performs significantly better with explicit code structure:
+Claude performs significantly better with explicit code structure:
 
 ### Type Hints (Required)
 
@@ -1468,7 +1468,7 @@ def cache_search_results(query, results):
 
 # Check project-specific patterns
 "Search this project's documentation for [topic]"
-"Search this project's conversations for decisions about [X]"
+"Search the knowledge graph for decisions about [X]"
 
 # Search for security patterns (Opus addition)
 "Search knowledge graph for security patterns related to [feature]"
@@ -1646,14 +1646,14 @@ cat .claude/CONTEXT_STATE.md
 
 ### Knowledge Systems
 
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
+> **Full reference**: the "Search Systems" and "Knowledge Graph" sections of this project's `CLAUDE.md`.
 
 **Decision tree**:
 - Known terms → `kg-search` CLI (fast, ~100ms)
 - Conceptual → `hybrid_search` MCP
 - Relationships → `semantic_graph_search` MCP
 - Code by purpose → `search_code_graph` MCP
-- Quick analysis: use Claude directly (Ollama MCP removed in v0.2.11 as redundant)
+- Quick analysis: use Claude directly (no separate local-LLM tool is needed)
 - Literal strings → Grep
 ## Code Style Guide
 
@@ -2172,14 +2172,14 @@ rds = 5  # What does this mean?
 
 ## Knowledge Systems
 
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
+> **Full reference**: the "Search Systems" and "Knowledge Graph" sections of this project's `CLAUDE.md`.
 
 **Decision tree**:
 - Known terms → `kg-search` CLI (fast, ~100ms)
 - Conceptual → `hybrid_search` MCP
 - Relationships → `semantic_graph_search` MCP
 - Code by purpose → `search_code_graph` MCP
-- Quick analysis: use Claude directly (Ollama MCP removed in v0.2.11 as redundant)
+- Quick analysis: use Claude directly (no separate local-LLM tool is needed)
 - Literal strings → Grep
 ## Success Criteria
 

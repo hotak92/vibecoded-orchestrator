@@ -69,8 +69,8 @@ You will receive:
 ### Tools Available
 
 - **Weaviate Python client**: Query all collections
-  - ClaudeKnowledgeGraph
-  - CodeModule, CodeClass, CodeFunction, CodeAPI
+  - the per-project KG collection (name from the `KG_COLLECTION` env var, e.g. `MyProject_KnowledgeGraph`)
+  - CodeModule, CodeClass, CodeFunction, CodeAPI, CodeInteraction
 
 - **maintain_knowledge_graph.py**: Script at `.claude/scripts/maintain_knowledge_graph.py`
   - Use with `--check` for validation only
@@ -113,7 +113,7 @@ You will receive:
 
 **Mode**: full
 
-**Collections**: all (ClaudeKnowledgeGraph, CodeModule, CodeClass, CodeFunction, CodeAPI)
+**Collections**: all (per-project KG, CodeModule, CodeClass, CodeFunction, CodeAPI, CodeInteraction)
 
 **Expected**:
 1. Run all health checks on all collections
@@ -185,27 +185,6 @@ for function in code_functions:
     for called in function.calls:
         if not query_by_full_name(called):
             report_error(f"{function.full_name} calls non-existent {called}")
-```
-
-## Knowledge Systems
-
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
-
-**Decision tree**:
-- Known terms → `kg-search` CLI (fast, ~100ms)
-- Conceptual → `hybrid_search` MCP
-- Relationships → `semantic_graph_search` MCP
-- Code by purpose → `search_code_graph` MCP
-- Quick analysis: use Claude directly (Ollama MCP removed in v0.2.11 as redundant)
-- Literal strings → Grep
-## Success Criteria
-
-- All graph checks complete
-- Issues categorized (ERROR/WARNING/INFO)
-- Actionable fixes provided
-- Report generated
-- Health metrics calculated
-- Maintenance queue populated
 ```
 
 **2. Orphaned Entities**:
@@ -282,7 +261,7 @@ Write to `.claude/logs/graph_health_report.md`:
 **Duration**: 8 minutes 23 seconds
 
 ## Summary
-- ✅ 347 nodes checked (ClaudeKnowledgeGraph)
+- ✅ 347 nodes checked (per-project KG collection)
 - ✅ 156 code entities checked (Code Graph)
 - ⚠️ 3 errors found
 - ⚠️ 7 warnings found
@@ -402,6 +381,20 @@ Write to `.claude/logs/graph_health_report.md`:
 ## Next Health Check
 - Recommended: 1 week (Sunday 2026-02-05 3:00 AM)
 ```
+
+---
+
+## Knowledge Systems
+
+> **Full reference**: the "Search Systems" and "Knowledge Graph" sections of this project's `CLAUDE.md`.
+
+**Decision tree**:
+- Known terms → `kg-search` CLI (fast, ~100ms)
+- Conceptual → `hybrid_search` MCP
+- Relationships → `semantic_graph_search` MCP
+- Code by purpose → `search_code_graph` MCP
+- Quick analysis: use Claude directly (no separate local-LLM tool is needed)
+- Literal strings → Grep
 
 ---
 

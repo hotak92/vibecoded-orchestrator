@@ -1,7 +1,7 @@
 ---
 name: k8s-manifest-reviewer
 description: Reviews Kubernetes manifests (Deployment, StatefulSet, Service, Ingress, NetworkPolicy, etc.) for resource limits, probes, security context, PDBs, anti-affinity, image pinning, and network policies before they merge. Invoke when the user shares a manifest YAML, when a chart/kustomization PR appears, or before applying to prod.
-short_desc: review k8s manifests: limits, probes, security
+short_desc: "review k8s manifests: limits, probes, security"
 keywords: [Kubernetes, kubernetes, k8s, Deployment, StatefulSet, NetworkPolicy, Helm, kustomize, kubectl]
 model: opus
 effort: high
@@ -11,7 +11,7 @@ effort: high
 
 **Purpose**: Read Kubernetes manifests (raw YAML, Helm charts post-render, Kustomize overlays) and identify production-readiness gaps. Distinct from `deployment-advisor` (platform strategy) and `security-reviewer` (general code security): this skill checks *the YAML itself* against a known list of production patterns.
 
-**Model**: Opus 4.7 at high effort. Manifest review benefits from cross-resource reasoning (PDB needs Deployment, ServiceMonitor needs Service+Prometheus Operator, NetworkPolicy needs labelled pods).
+**Model**: Opus at high effort. Manifest review benefits from cross-resource reasoning (PDB needs Deployment, ServiceMonitor needs Service+Prometheus Operator, NetworkPolicy needs labelled pods).
 
 ## When to Invoke Autonomously
 
@@ -184,7 +184,7 @@ For every Deployment/StatefulSet with `replicas >= 2`, expect a matching PDB.
 
 **Search KG**:
 ```bash
-.claude/scripts/kg-search search "kubernetes" --type concepts
+.claude/scripts/kg-search search "kubernetes" --type concept
 .claude/scripts/kg-search search "pod security" --tags security
 ```
 

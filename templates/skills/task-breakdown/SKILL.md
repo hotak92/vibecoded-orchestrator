@@ -10,7 +10,7 @@ model: sonnet
 
 **Purpose**: Break complex features into implementable tasks with estimates, dependencies, and risk assessment.
 
-**Model**: Sonnet 4.5 (balanced reasoning for task decomposition and estimation)
+**Model**: Sonnet (balanced reasoning for task decomposition and estimation)
 
 ## When to Invoke Autonomously
 
@@ -77,7 +77,7 @@ Feature work:
 
 **Before planning**: Search for task breakdown and estimation patterns
 ```bash
-.claude/scripts/kg-search search "planning" --type concepts
+.claude/scripts/kg-search search "planning" --type concept
 ```
 
 **For deep research**: Ask user "Use hybrid_search to research [estimation techniques]"

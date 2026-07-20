@@ -11,7 +11,7 @@ effort: high
 
 **Purpose**: Take a service description (what it does, who uses it, traffic shape) and produce: a chosen SLI, an SLO target with rationale, a 30-day error budget, and a complete set of Prometheus recording + alerting rules using the multi-window multi-burn-rate pattern.
 
-**Model**: Opus 4.7 at high effort. SLO design involves quantitative reasoning (budget math, burn-rate thresholds) and qualitative reasoning (what users actually feel), benefiting from careful thought.
+**Model**: Opus at high effort. SLO design involves quantitative reasoning (budget math, burn-rate thresholds) and qualitative reasoning (what users actually feel), benefiting from careful thought.
 
 ## When to Invoke Autonomously
 
@@ -226,8 +226,8 @@ Then the burn-rate alerts compare this ratio against `error_budget = 1 - 0.99 = 
 
 **Search KG**:
 ```bash
-.claude/scripts/kg-search search "SLO error budget" --type concepts
-.claude/scripts/kg-search search "prometheus alerting" --type concepts
+.claude/scripts/kg-search search "SLO error budget" --type concept
+.claude/scripts/kg-search search "prometheus alerting" --type concept
 ```
 
 **For deep research**: invoke `hybrid_search("multi-window multi-burn-rate alerts")`. The KG node `slo-error-budget-multi-burn-rate-alerts` is the primary reference.

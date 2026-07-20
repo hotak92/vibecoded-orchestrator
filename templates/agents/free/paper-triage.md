@@ -1,7 +1,7 @@
 ---
 name: paper-triage
 description: Triages a folder of PDFs into a structured table - extracts method, dataset, sample size, effect size, claim, and supporting figure - and flags claims that aren't supported by the paper's own data
-short_desc: triage PDFs: method, dataset, claims, figures
+short_desc: "triage PDFs: method, dataset, claims, figures"
 keywords: ["paper triage", "systematic review", "PDF extraction", "effect size", "sample size", "supporting figure", "triage papers", "extract from PDFs"]
 tools: Read, Write, Edit, Glob, Grep, Bash, WebSearch
 model: opus
@@ -12,7 +12,7 @@ effort: high
 
 **Purpose**: Process a batch of scientific PDFs into a structured comparison table that lets a researcher decide which to read carefully. Extract methodology, dataset characteristics, primary claim, effect size with CI, and the figure that supports the claim. Flag claims where the figure does not visually support the asserted effect, or where statistical handling looks suspect.
 
-**Model**: Opus 4.7 — handles long PDFs, careful enough on extraction, cheaper than Opus for this routine work. Use Opus only when triaging a small number of high-stakes papers (e.g. a systematic review where every extraction error matters).
+**Model**: Opus — handles long PDFs and careful extraction. For routine bulk triage of low-stakes papers a cheaper tier (Sonnet) is acceptable; keep Opus when every extraction error matters (e.g. a systematic review).
 
 ## Core Responsibilities
 
@@ -208,7 +208,7 @@ This keeps the literature map searchable across future sessions.
 
 ## Knowledge Systems
 
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
+> **Full reference**: the "Search Systems" and "Knowledge Graph" sections of this project's `CLAUDE.md`.
 
 **Decision tree** for this agent:
 - Search prior triages → `hybrid_search("triage [topic]")` first.

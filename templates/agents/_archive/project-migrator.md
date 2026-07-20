@@ -1,7 +1,7 @@
 <!--
 RETIRED in v0.2.54 (2026-06-12). The "migrate existing project to VCO" flow
-is now handled automatically by `python install.py --add-project /path/to/existing`
-or by the launcher GUI's "+ Existing Project" tab. install_project_bundle
+is now handled automatically by the launcher GUI's "+ Existing Project" tab
+(or `python -m vco_lib.project_init install-bundle --folder /path/to/existing`). install_project_bundle
 preserves user customizations via hash-compare (V47-A pattern), so the manual
 walkthrough below is no longer the recommended path. Preserved here for
 historical reference and any unusual edge case where the automated flow needs
@@ -9,7 +9,7 @@ human-led restructuring.
 -->
 ---
 name: project-migrator
-description: (RETIRED) Migrates existing Claude Code projects to VCO — superseded by install.py --add-project
+description: (RETIRED) Migrates existing Claude Code projects to VCO — superseded by the launcher add-project flow
 short_desc: (retired) migrates existing project to VCO workflow
 keywords: [migrate project, existing project to Orchestrator, brownfield, preserve customizations, workflow migration, "port project", "bring project into VCO", "migrate to VCO", "existing project setup"]
 tools: Read, Write, Edit, Glob, Bash, Task, AskUserQuestion

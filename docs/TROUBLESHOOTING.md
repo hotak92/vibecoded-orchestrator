@@ -395,7 +395,7 @@ If stuck, manually pull inside the container:
 podman exec vco_ollama ollama pull qwen3-embedding:0.6b
 ```
 
-> The canonical container name is `vco_ollama` (per `vco_lib/containers.py::CANONICAL_CONTAINERS`, since v0.2.15). The legacy name `ollama_claude` is preserved as an alias in `HISTORICAL_ALIASES` for backward compatibility — both work, but new docs and tooling use the canonical form.
+> The canonical container name is `vco_ollama` (per `vco_lib/containers.py::CANONICAL_CONTAINERS`). The legacy name `ollama_claude` is preserved as an alias in `HISTORICAL_ALIASES` for backward compatibility — both work, but docs and tooling use the canonical form.
 
 ## MCP connection failures in Claude Code
 
@@ -405,21 +405,25 @@ Symptom: Claude says "MCP server weaviate-kg is not connected" or tool calls lik
 
 ```bash
 claude mcp list
-# Expected: weaviate-kg ✓ Connected, search ✓ Connected
+# Expected: weaviate-kg ✓ Connected, search ✓ Connected,
+#           mermaid ✓ Connected, excalidraw ✓ Connected
+# mermaid + excalidraw show Connected but their tools are per-project
+# default-disabled until you opt in via the launcher's Diagrams tab.
+# playwright also appears (enabled by default, via npx).
 # (coordination is optional; lean-ctx / vct-coordination may also appear if installed.)
 ```
 
-> **"Where is the `ollama` MCP / `chat` / `read_image` tool?"** Removed in v0.2.11. Claude's native reasoning and the built-in `Read` tool (which handles images via vision) cover those use cases at higher quality. Ollama still runs as infrastructure on `:11435` — it powers Weaviate's text embeddings and the code-embedding service CPU fallback — but it is no longer exposed as an MCP tool. See `knowledge/concepts/mcp-simplification-v0211.md` if you need the full rationale.
+> **"Where is the `ollama` MCP / `chat` / `read_image` tool?"** There is no Ollama MCP. Claude's native reasoning and the built-in `Read` tool (which handles images via vision) cover those use cases at higher quality. Ollama runs as infrastructure on `:11435` — it powers Weaviate's text embeddings and the code-embedding service CPU fallback — and is not exposed as an MCP tool.
 
 **Common causes**:
 
 1. **Editor opened before containers started**: restart your Claude Code session (VS Code window reload, restart the CLI, or reopen Claude Desktop) once `docker ps` / `podman ps` shows Weaviate + Ollama running.
-2. **Wrong Python in MCP config**: `MCP_PYTHON` must point at the `install.py`-created venv, not system Python — check `.claude/settings.json` → `env` (the canonical channel since v0.2.12; CLI / Desktop app / VS Code extension all read it, and MCP subprocesses inherit from it). The historical `.vscode/settings.json` `claude-code.env` surface was removed in v0.2.12 (PR-27) because that block didn't propagate to MCP subprocesses on Linux Claude Code 2.1.143 (empirical sentinel testing confirmed; that's why the surface was dropped). If you're migrating from a pre-v0.2.12 install and your project relied on `claude-code.env`, copy the keys into `.claude/settings.json` `env` — same shape, different file.
-3. **Embedding model mismatch**: `ACTIVE_EMBEDDING` must match a model actually loaded by Ollama. Default is `qwen3` with model `qwen3-embedding:0.6b`. Verify with `podman exec vco_ollama ollama list` (the canonical container name since v0.2.15; legacy `ollama_claude` still works as an alias).
+2. **Wrong Python in MCP config**: `MCP_PYTHON` must point at the `install.py`-created venv, not system Python — check `.claude/settings.json` → `env` (the canonical channel; CLI / Desktop app / VS Code extension all read it, and MCP subprocesses inherit from it). Do NOT put these keys in `.vscode/settings.json` `claude-code.env` — that block does not propagate to MCP subprocesses on Linux (empirical sentinel testing confirmed). If your project has keys there, copy them into `.claude/settings.json` `env` — same shape, different file.
+3. **Embedding model mismatch**: `ACTIVE_EMBEDDING` must match a model actually loaded by Ollama. Default is `qwen3` with model `qwen3-embedding:0.6b`. Verify with `podman exec vco_ollama ollama list` (the canonical container name; legacy `ollama_claude` still works as an alias).
 
-## vct-hub troubleshooting (v0.2.21+)
+## vct-hub troubleshooting
 
-Since v0.2.21 the launcher's HTTP hub is a detached binary (`vct-hub`) shipped alongside `vct-launcher` in `launcher/dist/<arch>/`. It outlives the launcher GUI: close the GUI and hooks, MCP servers, and resolver clients can still reach the hub on `http://127.0.0.1:7700`. It is started by `install.py`'s post-install step, by the `session-start-ensure-hub.sh` Claude Code hook, by `.vscode/tasks.json` on `folderOpen`, and by the launcher itself on GUI start. See `launcher/src-tauri/vct-hub/src/{lifecycle,lockfile,auth,boot}.rs` for the implementation.
+The launcher's HTTP hub is a detached binary (`vct-hub`) shipped alongside `vct-launcher` in `launcher/dist/<arch>/`. It outlives the launcher GUI: close the GUI and hooks, MCP servers, and resolver clients can still reach the hub on `http://127.0.0.1:7700`. It is started by `install.py`'s post-install step, by the `session-start-ensure-hub.sh` Claude Code hook, by `.vscode/tasks.json` on `folderOpen`, and by the launcher itself on GUI start. See `launcher/src-tauri/vct-hub/src/{lifecycle,lockfile,auth,boot}.rs` for the implementation.
 
 ### Quick health check
 
@@ -442,7 +446,7 @@ If `--status` says `stale`, run `vct-hub --start-if-not-running` — it cleans u
 The hub binds `127.0.0.1` (loopback-only) by default, so a leaked `hub.token` cannot be used from another machine on your LAN. Two things widen the bind to `0.0.0.0` (all interfaces):
 
 1. **A hub-consuming module is installed** (v0.2.75+, automatic). Global container modules — the RL reranker is the canonical one — read their data from the hub via `host.containers.internal`, which **never** resolves to the host's own `127.0.0.1` on **any** OS: on Linux (native podman/docker) it maps to a bridge-gateway or host LAN IP; on macOS and Windows the container runtime runs inside a VM whose view of "the host" is the VM boundary. A loopback-only hub is therefore unreachable from containers everywhere, and `0.0.0.0` is the only runtime-agnostic bind that works on all three OSes. The widen state is derived from the launcher DB's global module install rows: it is set by installing such a module, dropped when the last one is uninstalled, and re-evaluated on **every** hub start (install.py post-step, the SessionStart hook, the launcher GUI, and the CLI all just start the same binary). No flag file to manage.
-2. **You set `VCT_HUB_BIND_ALL=1`** (or `true`) — the manual opt-in, unchanged since v0.2.73.
+2. **You set `VCT_HUB_BIND_ALL=1`** (or `true`) — the manual opt-in.
 
 An explicit `VCT_HUB_BIND_ALL` setting wins in **both** directions: `VCT_HUB_BIND_ALL=0` (or any non-truthy value) forces loopback even while a module is installed — the hub logs a loud warning because that module's container cannot reach it.
 
@@ -512,7 +516,7 @@ Every `/api/v1/*` route (except `/health`) requires `Authorization: Bearer <toke
 
 The two per-project routes — `GET /api/v1/projects/{id}/env` and `GET /api/v1/projects/{id}/config` — accept a **project-scoped** bearer (`hub.token.<project_id>`) in addition to the global `hub.token`. The hub mints one scoped token per registered project at startup (mode `0o600` on Unix; default same-user ACL on Windows), rotates them each start, and removes the file for a deleted project. The bundled resolvers already prefer the scoped token — they read `hub.token.<id>` first and fall back to `hub.token` when it is absent (a project added while the hub runs, or a pre-v0.2.76 hub). `VCT_HUB_TOKEN` (env) overrides both.
 
-- **`403 forbidden` with `"a token minted for project A cannot read project B"`**: you presented one project's scoped token on a DIFFERENT project's route. A scoped token never crosses the project boundary — use the token for the project in the URL (`hub.token.<that-id>`), or, only if the hub was started with `VCT_HUB_LEGACY_GLOBAL_ENV=1`, the global `hub.token` (the compat window is closed by default as of v0.2.77).
+- **`403 forbidden` with `"a token minted for project A cannot read project B"`**: you presented one project's scoped token on a DIFFERENT project's route. A scoped token never crosses the project boundary — use the token for the project in the URL (`hub.token.<that-id>`), or, only if the hub was started with `VCT_HUB_LEGACY_GLOBAL_ENV=1`, the global `hub.token` (the compat window is closed by default).
 
   ```bash
   # POSIX: read a scoped token for the exact project in the URL
@@ -523,7 +527,7 @@ The two per-project routes — `GET /api/v1/projects/{id}/env` and `GET /api/v1/
   Get-Content "$env:VCT_STATE_DIR\hub.token.<project_id>" -Raw
   ```
 
-- **`403 forbidden` naming `VCT_HUB_LEGACY_GLOBAL_ENV`**: as of v0.2.77 the global-token compat window is **closed by default** on these routes — the hub refuses the coarse global `hub.token` on `/env` + `/config`. Present the per-project token instead (the bundled resolvers do this automatically; the hub also lazy-mints a scoped token for a project added mid-session). If a bespoke caller genuinely cannot migrate yet, set `VCT_HUB_LEGACY_GLOBAL_ENV=1` (or `true`/`TRUE`/`yes`) on the **hub process** and restart it to re-open the window for one more release. **Unset, `0`, `false`, `no`, or any typo all DENY** (fail-closed) — unsetting the flag does NOT re-enable the compat path anymore (that was the v0.2.76 behaviour). The escape hatch is removed in a future release.
+- **`403 forbidden` naming `VCT_HUB_LEGACY_GLOBAL_ENV`**: the global-token compat window is **closed by default** on these routes — the hub refuses the coarse global `hub.token` on `/env` + `/config`. Present the per-project token instead (the bundled resolvers do this automatically; the hub also lazy-mints a scoped token for a project added mid-session). If a bespoke caller genuinely cannot migrate yet, set `VCT_HUB_LEGACY_GLOBAL_ENV=1` (or `true`/`TRUE`/`yes`) on the **hub process** and restart it to re-open the window. **Unset, `0`, `false`, `no`, or any typo all DENY** (fail-closed). The escape hatch is scheduled for removal.
 
 ### Boot autostart not firing
 
@@ -567,7 +571,7 @@ When `install.py` upgrades a v0.2.20 install to v0.2.21, it writes a sentinel at
 
 If `install.py` is killed mid-cutover (Ctrl-C, OOM, power loss), the sentinel persists and the v0.2.21 launcher refuses to start its services watcher indefinitely — symptom: Weaviate/Ollama not auto-restarting when they crash.
 
-**Auto-recovery (since v0.2.21 launcher startup)**: when the sentinel is older than **60 seconds AND** `vct-hub` is already reachable, the launcher deletes the sentinel itself and starts the embedded watcher (see `launcher/src-tauri/src/lib.rs` around the `cutover_sentinel_present` check). So in most cases, restarting the launcher fixes it.
+**Auto-recovery (launcher startup)**: when the sentinel is older than **60 seconds AND** `vct-hub` is already reachable, the launcher deletes the sentinel itself and starts the embedded watcher (see `launcher/src-tauri/src/lib.rs` around the `cutover_sentinel_present` check). So in most cases, restarting the launcher fixes it.
 
 **Manual recovery** (if auto-delete doesn't kick in — sentinel is fresh, or `vct-hub` is also down):
 
@@ -605,7 +609,7 @@ The free Ollama path (`qwen3-embedding:0.6b`) is unaffected; switch back in the 
 
 ## Shared KG looks empty after upgrading from <v0.2.12
 
-In v0.2.12 the bundled shared collection was renamed from `VibeCodedTools_KnowledgeGraph` to `VibeCodedOrchestrator_KnowledgeGraph` (PR-26 / Group E). Fresh installs land on the new name; pre-v0.2.12 installs already have data under the old name and `hybrid_search` queries the new (empty) one.
+The bundled shared collection is named `VibeCodedOrchestrator_KnowledgeGraph`; some older installs have data under the previous name `VibeCodedTools_KnowledgeGraph`. Fresh installs land on the current name; an older install with data under the previous name will find `hybrid_search` querying the current (empty) one.
 
 Two paths:
 

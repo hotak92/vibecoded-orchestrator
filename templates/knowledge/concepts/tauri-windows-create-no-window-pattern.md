@@ -3,7 +3,7 @@ title: Tauri Windows CREATE_NO_WINDOW subprocess pattern
 type: concept
 tags: [tauri, windows, rust, subprocess, GUI, console-flash, fork-bomb, windows_subsystem, low-level-implementation]
 created: 2026-05-26T15:00:00Z
-updated: 2026-06-25T15:00:00Z
+updated: 2026-07-20T00:00:00Z
 valid_from: 2026-05-26T00:00:00Z
 valid_until: null
 status: active
@@ -128,7 +128,7 @@ Granularity importante: snapshot a >200ms perde flash sub-frame. Per audit compl
 
 ## Storia / scoperte
 
-Scoperto in [[VibeCoded-Orchestrator-Launcher]] durante session debug del fork bomb Windows post-install. L'audit ha trovato che la vasta maggioranza dei `Command::new` call sites del launcher era priva di `CREATE_NO_WINDOW`. Bastavano una decina di subprocess concorrenti al boot per causare cascata visiva di console flash sufficiente a mascherare la GUI principale.
+Scoperto nel launcher dell'orchestratore durante session debug del fork bomb Windows post-install. L'audit ha trovato che la vasta maggioranza dei `Command::new` call sites del launcher era priva di `CREATE_NO_WINDOW`. Bastavano una decina di subprocess concorrenti al boot per causare cascata visiva di console flash sufficiente a mascherare la GUI principale.
 
 Il fix usa la versione centralizzata con trait `silent()`.
 

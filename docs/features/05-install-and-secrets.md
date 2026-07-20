@@ -2,20 +2,20 @@
 
 From first clone to a running orchestrator: first-install shims (Linux / macOS / Windows), the Python installer with its new `--bootstrap` probe mode, container lifecycle, sanity checks, uninstall, and the `vct-secrets` primitive that keeps API keys out of `.env`. Code lives in `first-install.{sh,command,bat}`, `install.py`, `install.sh`, `install.ps1`, `uninstall.sh`, `scripts/post-install-launcher.{sh,ps1}`, `infrastructure/`, `scripts/`, `vco_lib/`, and `tools/vct-secrets/`.
 
-For the design behind the v0.2.53 install changes (why `--bootstrap` is additive and read-only, why the shims stay multi-language, why DEDUPs land in tiers across two releases) see [INSTALL_ARCHITECTURE_v2.md](../INSTALL_ARCHITECTURE_v2.md).
+For the install architecture design (why `--bootstrap` is additive and read-only, why the shims stay multi-language) see [INSTALL_ARCHITECTURE_v2.md](../INSTALL_ARCHITECTURE_v2.md).
 
 ---
 
-## First-Install Shims (v0.2.53 — 3-step sequence)
+## First-Install Shims (3-step sequence)
 
-`first-install.{sh,command,bat}` are the user-facing entry points. As of v0.2.53 each is a thin Python-detect + dispatch wrapper that runs the same three-step sequence (`first-install.sh:1-106`, `first-install.command:1-131`, `first-install.bat:1-626`):
+`first-install.{sh,command,bat}` are the user-facing entry points. Each is a thin Python-detect + dispatch wrapper that runs the same three-step sequence (`first-install.sh:1-106`, `first-install.command:1-131`, `first-install.bat:1-712`):
 
 1. **Python detect** — OS-aware candidate cascade. macOS adds `/opt/homebrew/opt/python@3.13/bin/python3.13` + `/opt/homebrew/bin/python3.{13,12,11}` to PATH probes. Linux adds Linuxbrew (`/home/linuxbrew/.linuxbrew/bin/python3.{13,12,11}`). Windows uses the Python Launcher (`py -3.13` → `py -3.12` → `py -3.11` → `python.exe` → `python3.exe`). All shims verify `>= 3.11` via `python -c 'import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)'`.
-2. **Bootstrap prepass** — `"$PYTHON" install.py --bootstrap --json > state/logs/bootstrap-prepass.json 2>/dev/null || true`. Read-only system-detection probe. Best-effort: failure does NOT block the full install (`|| true` on POSIX; `goto :continue` on Windows). The envelope's schema is at `docs/schemas/install-bootstrap-envelope-v1.json` (schema_version=1, see §3.3 of INSTALL_ARCHITECTURE_v2.md).
+2. **Bootstrap prepass** — `"$PYTHON" install.py --bootstrap --json > state/logs/bootstrap-prepass.json 2>/dev/null || true`. Read-only system-detection probe. Best-effort: failure does NOT block the full install (`|| true` on POSIX; `goto :continue` on Windows). The envelope's schema is at `docs/schemas/install-bootstrap-envelope-v1.json` (schema_version=1, see [INSTALL_ARCHITECTURE_v2.md §3](../INSTALL_ARCHITECTURE_v2.md#3-installpy---bootstrap-mode)).
 3. **Full install** — `"$PYTHON" install.py <forwarded args>`. The canonical 10-step flow. ARGS array preserves quoting; `--non-interactive` is translated to `--yes` (legacy alias). `--no-auto-launch` is intercepted by the shim and used to gate step 4.
-4. **Launcher post-install (auto-spawn)** — `scripts/post-install-launcher.{sh,ps1}` is invoked when install succeeded AND `--no-auto-launch` was NOT passed AND the post-install script is executable. Soft-fail: a broken launcher spawn does not mask a successful install. This auto-spawn was missing in the v0.2.52 line and was restored in the v0.2.53 integration splice (commit `372571a5`).
+4. **Launcher post-install (auto-spawn)** — `scripts/post-install-launcher.{sh,ps1}` is invoked when install succeeded AND `--no-auto-launch` was NOT passed AND the post-install script is executable. Soft-fail: a broken launcher spawn does not mask a successful install.
 
-**Shim sizes**: `first-install.sh` 106 LoC, `first-install.command` 131 LoC, `first-install.bat` 626 LoC (still inline-implements `post-install-launcher.sh` until the full PowerShell port in v0.2.54 — see §13.1 of INSTALL_ARCHITECTURE_v2.md). The Track G design target of "thin ~30-60 LoC shims" was relaxed in implementation to accommodate the 3-step sequence (prepass + install + launcher post-install) and the per-OS install-hint blocks. Argv passthrough is verbatim via `"$@"` (POSIX) / `%*` (cmd.exe).
+**Shim sizes**: `first-install.sh` 106 LoC, `first-install.command` 131 LoC, `first-install.bat` 712 LoC (the `.bat` inline-implements the `post-install-launcher.sh` logic — CMD batch cannot call the POSIX script). The shims are larger than a bare forwarder because they carry the 3-step sequence (prepass + install + launcher post-install) and the per-OS install-hint blocks. Argv passthrough is verbatim via `"$@"` (POSIX) / `%*` (cmd.exe).
 
 ### Bootstrap envelope at `state/logs/bootstrap-prepass.json`
 
@@ -109,7 +109,7 @@ Switches the installer to uninstall mode. Pairs with `--keep-data`, `--remove-pr
 ## Installation Steps
 
 ### Step ordering (1/10 … 10/10)
-install.py runs 10 numbered steps: (1) Python version, (2) system detection, (2b) optional companions, (3) embedding config, (4) venv creation, (5) pip install, (6) container services + model pull, (7b) Weaviate collection bootstrap, (8) `state/` creation, (9) `.env` write, (9b) agents/skills, (10) Claude CLI check. Followed by an optional Step 11b (bytecode pre-compile, opt-out via `--no-compile`).
+install.py runs 10 numbered steps: (1) Python version, (2) system detection, (2b) optional companions, (3) venv creation, (4) dependency install (pip + editable `vco` CLI and `weaviate_mcp`), (5) container services, (5b) orchestrator-root `.claude/` install via the ONE bundle engine (`install-bundle`), (6) Ollama wait, (7) model pull, (7b) Weaviate collection bootstrap, (8) `state/` creation + `vct-hub` deploy/start, (9) configuration write, (10) Claude CLI check. Followed by Step 11 (initial code graph analysis) and an optional Step 11b (bytecode pre-compile, opt-out via `--no-compile`).
 
 ### Idempotency
 Each step checks before acting. Venv creation is skipped if `.venv/bin/python` exists. `.env` write is skipped if `.env` already exists. Agents/skills skip files already present. Weaviate collection creation is skipped per-collection if it already exists (tolerates 422 "already exists" race). Container start probes service ports first and skips services already running.

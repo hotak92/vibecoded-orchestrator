@@ -200,10 +200,10 @@ Operators can set `VCT_VALIDATE_TIER_URL` to point at a staging or dev validate-
 `licensing.rs` includes source-level audit tests: (1) default validate URL must not contain `supabase.co`, (2) production source must not contain bypass symbols (`MAINTAINER_TOKEN`, `ed25519_dalek`, etc.). Run as Rust unit tests to prevent accidental regression.
 
 ### Admin-only Routes
-`/admin/diagnostic`, `/admin/feature-flags`. Gated by `tier === 'admin'` in `+layout.svelte`. Client-side check is UX only; each admin tab re-validates server-side. (`/admin/license-issuance-test` — a backend-less placeholder — was removed in v0.2.54 Track H.)
+`/admin/diagnostic`, `/admin/feature-flags`. Gated by `tier === 'admin'` in `+layout.svelte`. Client-side check is UX only; each admin tab re-validates server-side.
 
-### Dev Mode Activation Codes
-Removed in v0.2.54 Track H together with the legacy `licenses.ts` store that implemented them (`test-<app>` codes validated client-side against a localStorage portfolio). Dev-time license testing goes through the ActivationModal against a staging `VCT_VALIDATE_TIER_URL` endpoint.
+### Dev-Time License Testing
+Dev-time license testing goes through the ActivationModal against a staging `VCT_VALIDATE_TIER_URL` endpoint — there are no client-side test activation codes.
 
 ---
 
@@ -502,7 +502,7 @@ Returns the current high-water sequence number. The UI calls this once at load t
 
 ## Hub HTTP API — Routes
 
-The hub HTTP server (`hub/server.rs`, port 7700) nests four sub-routers under `/api/v1`. All routes bind to `127.0.0.1` only and require `Authorization: Bearer <token>` (token at `~/.vct/hub.token`) — except the two per-project `/env` + `/config` routes, which as of v0.2.77 require the project-SCOPED `hub.token.<project_id>` and refuse the global token by default (see [Auth Token](#auth-token-vcthubtoken)). CORS is permissive because the auth gate is on the bearer token, not the origin (see also [CORS Wildcard](#cors-wildcard)). Routes by source module:
+The hub HTTP server (`hub/server.rs`, port 7700) nests four sub-routers under `/api/v1`. All routes bind to `127.0.0.1` only and require `Authorization: Bearer <token>` (token at `~/.vct/hub.token`) — except the two per-project `/env` + `/config` routes, which require the project-SCOPED `hub.token.<project_id>` and refuse the global token by default (see [Auth Token](#auth-token-vcthubtoken)). CORS is permissive because the auth gate is on the bearer token, not the origin (see also [CORS Wildcard](#cors-wildcard)). Routes by source module:
 
 ### Core operations (`hub/api.rs`)
 - `GET /api/v1/health` — liveness probe; returns `{ok: true, version}`.
@@ -758,7 +758,7 @@ Backed by `quit_dialog.rs` and `tauri-plugin-dialog` (native dialog on each OS).
 
 ## Headless CLI (`vco`)
 
-The launcher CLI was renamed from `vct` to `vco` in commit `0d9a458` to avoid colliding with the `vct` bash secrets tool. Full reference: [`launcher/docs/CLI.md`](../../launcher/docs/CLI.md).
+The launcher CLI binary is named `vco` (not `vct`) to avoid colliding with the `vct` bash secrets tool. Full reference: [`launcher/docs/CLI.md`](../../launcher/docs/CLI.md).
 
 ### Build & Install
 `tools/vct-cli/install.sh` runs `cargo build --release` and copies the binary to `~/.local/bin/vco`. Built independently from the Tauri app.

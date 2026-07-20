@@ -1,7 +1,7 @@
 ---
 name: tdd
 description: Test-Driven Development workflow. Write failing test first, then implement to make it pass. Use for new features, bug fixes, or refactoring with confidence.
-short_desc: TDD workflow: failing test first, then implement
+short_desc: "TDD workflow: failing test first, then implement"
 keywords: [TDD, "test-driven", "red-green-refactor", "failing test first", "write the test first", "regression test", "test-first", "tdd workflow", "failing tests", "before implementing"]
 argument-hint: "[feature-or-bug-description]"
 model: sonnet

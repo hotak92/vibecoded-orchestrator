@@ -37,7 +37,7 @@ You are a specialized agent that maintains knowledge graph quality by extracting
    - Validate relationship types against [knowledge/VOCABULARY.md](../knowledge/VOCABULARY.md)
 
 2. **Update Weaviate cross-references**:
-   - Query ClaudeKnowledgeGraph collection
+   - Query the per-project KG collection (name from the `KG_COLLECTION` env var)
    - Create cross-references between source and target nodes
    - Use relationship types: uses, implements, extends, buildsOn, relatedTo
    - Handle bidirectional linking where appropriate
@@ -49,9 +49,9 @@ You are a specialized agent that maintains knowledge graph quality by extracting
    - Don't auto-merge (requires human review)
 
 4. **Infer missing relationships**:
-   - Use Claude's reasoning directly (Ollama MCP was removed in v0.2.11 as
-     redundant). If you've opted into the `vct-ollama` module, you can
-     route to local inference for cost reasons; otherwise, reason in-context.
+   - Use Claude's reasoning directly. If you've opted into the `vct-ollama`
+     module, you can route to local inference for cost reasons; otherwise,
+     reason in-context.
    - Example: "Node A uses Redis for caching" → Create `[[uses::Redis]]` link
    - Only suggest, don't auto-add (preserve manual control)
 
@@ -70,24 +70,23 @@ You will receive:
 
 ### Tools Available
 
-- **sync_knowledge_graph.py**: Script at `.claude/scripts/sync_knowledge_graph.py`
-  - Use with `--file <path>` for single node update
+- **kg-sync**: CLI wrapper at `.claude/scripts/kg-sync` (auto-activates the venv)
+  - Use with `<path>` for single node update
   - Use with `--all` for bulk sync
   - Handles parsing, validation, Weaviate sync
 
-- **detect_duplicates.py**: Script at `.claude/scripts/detect_duplicates.py`
+- **kg-duplicates**: CLI wrapper at `.claude/scripts/kg-duplicates`
   - Use with `--threshold 0.95` for strict matching
   - Outputs markdown report to `.claude/logs/duplicates_report.md`
 
-- **Weaviate Python client**: Direct access to ClaudeKnowledgeGraph
+- **Weaviate Python client**: Direct access to the per-project KG collection
   - Query by title to find target nodes
   - Create cross-references via `data.reference_add()`
   - Use GraphQL for relationship traversal
 
-- **Ollama (opt-in)**: Free LLM for relationship inference. The Ollama
-  MCP wrapper was removed in v0.2.11 as redundant; available via opt-in
-  `vct-ollama` module if you want local inference instead of Claude.
-  - Model: granite4:7b-a1b-h (fast, good for extraction)
+- **Ollama (opt-in)**: local LLM for relationship inference, available via
+  the opt-in `vct-ollama` module if you want local inference instead of Claude.
+  - Model: `granite4:7b` (fast, good for extraction)
   - Use for: Extracting implicit relationships from text
 
 ### Critical Rules
@@ -124,7 +123,7 @@ You will receive:
 1. Parse 2 markdown files
 2. Extract typed WikiLinks (uses, implements, etc.)
 3. Query Weaviate for target nodes
-4. Create cross-references in ClaudeKnowledgeGraph
+4. Create cross-references in the per-project KG collection
 5. Run duplicate check (threshold 0.95)
 6. Write report to .claude/logs/maintenance_report.md
 ```
@@ -211,27 +210,6 @@ Write to `.claude/logs/maintenance_report.md`:
 - acme [[relatedTo::Acme Patterns]]
 
 ## Weaviate Updates
-```
-
-## Knowledge Systems
-
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
-
-**Decision tree**:
-- Known terms → `kg-search` CLI (fast, ~100ms)
-- Conceptual → `hybrid_search` MCP
-- Relationships → `semantic_graph_search` MCP
-- Code by purpose → `search_code_graph` MCP
-- Quick analysis: use Claude directly (Ollama MCP removed in v0.2.11 as redundant)
-- Literal strings → Grep
-## Success Criteria
-
-- All nodes processed
-- Relationships extracted correctly
-- Cross-references updated
-- Duplicates detected
-- Suggestions documented
-- Report generated
 - Cross-references created: 8
 - Bidirectional links: 4 (for project ↔ concept)
 
@@ -249,6 +227,20 @@ None
 - ✅ Knowledge graph cross-references up to date
 - ⚠️ Review 2 suggestions above (optional)
 ```
+
+---
+
+## Knowledge Systems
+
+> **Full reference**: the "Search Systems" and "Knowledge Graph" sections of this project's `CLAUDE.md`.
+
+**Decision tree**:
+- Known terms → `kg-search` CLI (fast, ~100ms)
+- Conceptual → `hybrid_search` MCP
+- Relationships → `semantic_graph_search` MCP
+- Code by purpose → `search_code_graph` MCP
+- Quick analysis: use Claude directly (no separate local-LLM tool is needed)
+- Literal strings → Grep
 
 ---
 

@@ -1,6 +1,6 @@
 # Update Recovery — how the orchestrator self-update protects itself, and what to do when it doesn't
 
-> **Scope note (v0.2.54)**: this document covers the UPDATE-mechanics half
+> **Scope note**: this document covers the UPDATE-mechanics half
 > (lockfiles, sentinels, the stage1 updater, toasts, manual recovery).
 > The broader post-install verification flow (containers, MCPs, Weaviate,
 > hub health) is in this same folder:
@@ -19,14 +19,14 @@ that went sideways. Every state file below names its exact path.
 
 ## The four update entry paths
 
-All four share the same protected tail since v0.2.54 (P0-7 hoist):
+All four share the same protected tail:
 
 | Path | Trigger | Shared protections |
 |---|---|---|
 | Update | Settings → Updates → "Update orchestrator" | MCP kill-sweep, update gate, binary-wait, stage1 handoff, gate disarm before restart |
-| Merge | divergence modal → "Merge" | same (added v0.2.54 — previously had none) |
-| Rebase | divergence modal → "Rebase" | same (added v0.2.54 — previously had none) |
-| Resume | purple "Continue Update" MenuBar badge | same (gate disarm added v0.2.54) |
+| Merge | divergence modal → "Merge" | same |
+| Rebase | divergence modal → "Rebase" | same |
+| Resume | purple "Continue Update" MenuBar badge | same |
 
 ---
 
@@ -40,7 +40,7 @@ All four share the same protected tail since v0.2.54 (P0-7 hoist):
 - **While fresh** (its embedded `expected_completion_by` deadline, 15 min
   from the last phase advance): every orchestrator MCP spawn exits with
   **code 75** instead of starting; the `session-start-ensure-hub` hook
-  and the launcher's boot-time hub respawn also skip (v0.2.54 C-7).
+  and the launcher's boot-time hub respawn also skip.
 - **Symptom: "all my MCPs exit 75"** → this file is present and fresh.
   - During a real update: expected, resolves itself within minutes.
   - With NO update running: the previous update crashed inside its
@@ -56,12 +56,12 @@ All four share the same protected tail since v0.2.54 (P0-7 hoist):
   binary on disk is still Windows-locked and `vct-updater.exe` must
   perform the swap after the launcher exits.
 - Consumed by the updater on full success. **Kept on swap failure**
-  (v0.2.54 C-4) so a later boot still finds the trail.
+  so a later boot still finds the trail.
 - A lock with NO `update.result.json` sibling that is >10 min old means
   the updater crashed; the next launcher boot reports "update may have
   failed" and removes it.
 
-### `<vct_root>/update.result.json` (authoritative swap outcome, v0.2.54 C-4)
+### `<vct_root>/update.result.json` (authoritative swap outcome)
 
 - Written by `vct-updater` AFTER the swaps and BEFORE relaunching the
   launcher. Shape:
@@ -79,21 +79,20 @@ All four share the same protected tail since v0.2.54 (P0-7 hoist):
 - Plain text, overwritten each handoff. Lines to look for:
   - `swap OK: <path>` / `swap FAILED <path>: MoveFileExW failed: GetLastError=32`
     (32 = ERROR_SHARING_VIOLATION → something still held the binary;
-    since v0.2.54 the hub is kept stopped through the handoff, so the
+    the hub is kept stopped through the handoff, so the
     usual culprits are antivirus/indexer).
   - `parent <pid> did NOT exit within 30s — aborting swap` (exit 4;
     the lock is removed, nothing was changed on disk).
   - `outcome recorded: success=… → …update.result.json`
   - `relaunch spawned: …` / `relaunch FAILED …`
 
-### `<install_root>/.claude/state/orchestrator-update-resume-needed.json` (resume sentinel, v0.2.51 Bug A)
+### `<install_root>/.claude/state/orchestrator-update-resume-needed.json` (resume sentinel)
 
 - Written when a merge/rebase halts at a conflict. Drives the purple
   **"Continue Update"** MenuBar badge.
 - Cleared by: clicking Continue Update (resume path), aborting the
-  merge, a fresh "Update orchestrator" run, and — since v0.2.54 (C-6) —
-  by any successful terminal `python install.py --update` (the
-  deferral's "Option B" promise is now true).
+  merge, a fresh "Update orchestrator" run, and
+  by any successful terminal `python install.py --update`.
 - **Symptom: badge persists after you already finished the update** →
   pre-v0.2.54 behaviour; either update the orchestrator or delete the
   sentinel file manually (safe once `git status` in the install root
@@ -126,7 +125,7 @@ All four share the same protected tail since v0.2.54 (P0-7 hoist):
 
 ---
 
-## Ordering guarantees (v0.2.54, for maintainers)
+## Ordering guarantees (for maintainers)
 
 The shared finalize tail (`installer.rs::finalize_update_and_restart`)
 enforces, in order:

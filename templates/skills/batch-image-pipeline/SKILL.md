@@ -263,7 +263,7 @@ Script when: 20+ outputs, monthly+ recurring, regulated output (icon set / print
 Before scripting, search:
 - `hybrid_search("image pipeline patterns")`
 - `hybrid_search("color management ICC")`
-- `kg-search search "ffmpeg" --type tools`
+- `kg-search search "ffmpeg" --type tool`
 
 Capture reusable scripts:
 - New asset pipeline that generalizes → `knowledge/patterns/` (with the script)

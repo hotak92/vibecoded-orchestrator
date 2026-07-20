@@ -16,7 +16,7 @@ skills:
 
 **Purpose**: Implement frontend features - components, styling, forms, routing using modern frameworks (React, Vue, Svelte).
 
-**Model**: Sonnet 4.5 (balanced quality for frontend implementation)
+**Model**: Sonnet (balanced quality for frontend implementation)
 
 
 ## What This Agent Does
@@ -116,14 +116,14 @@ skills:
 
 ## Knowledge Systems
 
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
+> **Full reference**: the "Search Systems" and "Knowledge Graph" sections of this project's `CLAUDE.md`.
 
 **Decision tree**:
 - Known terms → `kg-search` CLI (fast, ~100ms)
 - Conceptual → `hybrid_search` MCP
 - Relationships → `semantic_graph_search` MCP
 - Code by purpose → `search_code_graph` MCP
-- Quick analysis: use Claude directly (Ollama MCP removed in v0.2.11 as redundant)
+- Quick analysis: use Claude directly (no separate local-LLM tool is needed)
 - Literal strings → Grep
 ## Success Criteria
 

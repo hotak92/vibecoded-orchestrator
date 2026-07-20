@@ -3,7 +3,7 @@ title: Orchestrator Update Resume — Bug A (v0.2.51)
 type: concept
 tags: [installer, launcher, update-flow, recovery, bug-fix, v0251, low-level-implementation]
 created: 2026-06-09T00:00:00Z
-updated: 2026-06-09T00:00:00Z
+updated: 2026-07-20T00:00:00Z
 valid_from: 2026-06-09T00:00:00Z
 valid_until: null
 status: active
@@ -29,7 +29,7 @@ early without re-running install.py either.
 
 ## Fix architecture
 
-Five-piece change:
+Six-piece resolution surface:
 
 ### 1. Resume sentinel (Rust)
 
@@ -89,6 +89,24 @@ The Python emitter `_emit_update_resume_required_deferral` in `install.py`
 mirrors the Rust writer; useful when install.py itself wants to re-emit
 during `--apply-deferred`.
 
+### 6. One-click auto-resolve paths (V52-A/B)
+
+The conflict modal offers two one-click resolutions alongside "Abort &
+restore" and manual resolution:
+
+- `keep_local_and_continue_update` — resolves every conflicted file in
+  favor of the LOCAL side, then continues the update.
+- `accept_upstream_and_continue_update` — resolves in favor of UPSTREAM
+  (discards local changes to the conflicted files), then continues.
+
+Both are thin wrappers over a shared `resolve_conflict_and_resume`
+implementation (`commands/installer.rs`) that performs the resolution
+(checkout + add + commit/continue) and delegates straight into
+`resume_orchestrator_update` for the post-merge tail — same sentinel
+verification, audit logging, and single-flight guard. A click with no
+sentinel present (stale view, e.g. user aborted via CLI meanwhile) is
+refused with an `update_orchestrator_one_click_rejected` audit entry.
+
 ## State machine
 
 ```
@@ -130,6 +148,11 @@ during `--apply-deferred`.
                                                                         ▼
                                                                        DONE
 ```
+
+In addition to the manual-resolve branch drawn above, the modal's two
+one-click buttons (keep-local / accept-upstream) auto-resolve the conflict
+and enter the same `resume_orchestrator_update` path directly — no wait for
+the poll to detect a clean tree.
 
 ## Why the conflict modal polls instead of relying only on the badge
 

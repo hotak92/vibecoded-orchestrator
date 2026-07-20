@@ -10,7 +10,7 @@ model: sonnet
 
 **Purpose**: Expert guidance on API design including REST vs GraphQL vs gRPC selection, endpoint patterns, authentication strategies, and versioning.
 
-**Model**: Sonnet 4.5 (balanced reasoning for API architecture decisions)
+**Model**: Sonnet (balanced reasoning for API architecture decisions)
 
 ## Capabilities
 
@@ -78,7 +78,7 @@ See [template.md](template.md) for complete API design documentation structure.
 
 **Before implementing**: Search for proven patterns
 ```bash
-.claude/scripts/kg-search search "api-design" --type concepts
+.claude/scripts/kg-search search "api-design" --type concept
 ```
 
 **For deep research**: Ask user "Use hybrid_search to research [API patterns]"

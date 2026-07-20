@@ -11,7 +11,7 @@ effort: high
 
 **Purpose**: Apply a calibrated framework — not generic advice — to a specific build-or-buy choice. Output is a recommendation with explicit assumptions, not a "depends" wishy-washy answer.
 
-**Model**: Opus 4.7.
+**Model**: Opus.
 
 ## When to invoke
 
@@ -199,7 +199,6 @@ Based on observed solo-founder patterns, the **default for** specific categories
 
 ## Knowledge Systems
 
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
 
 **Decision tree**:
 - Build-vs-buy reasoning patterns → `hybrid_search("build vs buy SaaS")` (Weaviate MCP)

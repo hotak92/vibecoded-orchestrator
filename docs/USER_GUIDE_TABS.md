@@ -489,14 +489,13 @@ DB; the binding row is the launcher's record of what those should be.
 The harness's `weaviate-kg` MCP server reads `KG_COLLECTION` and
 `SHARED_KG_COLLECTION` from its env (set in
 `<project>/.claude/settings.json` under `env` — the canonical
-channel since v0.2.12 / PR-27, 2026-05-16). The launcher writes
+channel). The launcher writes
 the binding row AND the per-project env via `write_project_env_files`,
 so editing a binding row is normally accompanied by a launcher-
-driven env refresh. The historical `.vscode/settings.json`
-`claude-code.env` surface was removed because that block didn't
-propagate to MCP subprocesses on Linux Claude Code 2.1.143 —
-see `docs/CLAUDE_CODE_COMPATIBILITY.md` for the empirical-trace
-reference. If you edit a binding by hand outside the launcher,
+driven env refresh. The `.vscode/settings.json`
+`claude-code.env` block is NOT used — it doesn't
+propagate to MCP subprocesses on Linux —
+see `docs/CLAUDE_CODE_COMPATIBILITY.md`. If you edit a binding by hand outside the launcher,
 also update `.claude/settings.json` `env` for the change to take
 effect in MCP subprocesses.
 
@@ -649,7 +648,7 @@ tabs are user preferences, not facts to be silently overwritten.
    underlying Weaviate data orphans the old collection and produces
    empty search results. If a rename is necessary, do all three:
    update the binding, update `.claude/settings.json` env (the
-   canonical MCP-env channel since v0.2.12 / PR-27), and
+   canonical MCP-env channel), and
    re-run the analyzer (for code graph) or `kg-sync --all` (for KG).
 7. **`source = "bundled"` is reserved for orchestrator-shipped
    rows.** Manually-registered rows should use `source = "project"`

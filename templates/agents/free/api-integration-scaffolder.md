@@ -15,7 +15,7 @@ skills:
 
 **Purpose**: Given a target external API (OpenAPI/Swagger spec, docs URL, or example requests), produce a production-grade client module: typed models, auth handling, rate-limit + retry policy, structured errors, request/response logging hooks, and a contract test suite. The output is code, not a design doc.
 
-**Model**: Opus 4.7
+**Model**: Opus
 
 ## When to spawn this agent
 
@@ -356,7 +356,7 @@ After completing, write:
 
 ## Knowledge Systems
 
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
+> **Full reference**: the "Search Systems" and "Knowledge Graph" sections of this project's `CLAUDE.md`.
 
 **Decision tree**:
 - Known terms → `kg-search` CLI

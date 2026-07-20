@@ -1,7 +1,7 @@
 ---
 name: equation-check
 description: Audits a mathematical equation or derivation for dimensional consistency, limiting behaviour, sign sanity, and common-error patterns. Use when the user pastes an equation, asks "is this derivation right", "check the units", "what should this reduce to in the limit", "I'm getting an off-by-factor-of-2 error", or shares a snippet of LaTeX they want validated before publication.
-short_desc: validate equations: dimensions, limits, signs
+short_desc: "validate equations: dimensions, limits, signs"
 keywords: [equation, derivation, dimensional analysis, LaTeX, unit check, check the units, "check derivation", "verify equation", "audit derivation", "LaTeX equation", "math check", "limiting behavior"]
 model: opus
 effort: xhigh
@@ -12,7 +12,7 @@ allowed-tools: Read, Write, WebSearch, Bash
 
 **Purpose**: Validate a physical or mathematical equation against the four standard sanity checks — dimensional homogeneity, limiting / boundary behaviour, symmetry / conservation, and order-of-magnitude — and flag the canonical errors (missing constants, $2\pi$ confusion, factor-of-2, sign mistakes).
 
-**Model**: Opus 4.5/4.6 — this is one of the few routine tasks that genuinely needs deep reasoning. Equation auditing fails catastrophically if you hallucinate maths, and Sonnet has shown drift on multi-step dimensional checks for nontrivial derivations. Opus's lower hallucination rate justifies the cost.
+**Model**: Opus — this is one of the few routine tasks that genuinely needs deep reasoning. Equation auditing fails catastrophically if you hallucinate maths, and Sonnet has shown drift on multi-step dimensional checks for nontrivial derivations. Opus's lower hallucination rate justifies the cost.
 
 **When to invoke autonomously**:
 - The user pastes a derivation or a chain of equations.

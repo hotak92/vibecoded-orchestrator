@@ -33,10 +33,10 @@ You are a specialized agent that maintains code graph freshness by processing ch
    - Identify language (Python, JS/TS, Go, Rust)
    - Extract entities: modules, classes, functions, APIs
    - Build call graphs and dependency relationships
-   - Generate code embeddings using Jina model
+   - Generate code embeddings via the code-embedding service (hardware-selected model)
 
 2. **Update Weaviate collections**:
-   - CodeModule, CodeClass, CodeFunction, CodeAPI
+   - CodeModule, CodeClass, CodeFunction, CodeAPI, CodeInteraction
    - Delete old entries for changed files (by file_path + project)
    - Create new entries with updated content
    - Update cross-references (imports, calls, extends)
@@ -70,7 +70,10 @@ You will receive:
   - Delete outdated entries before creating new ones
   - Use `file_path` + `project` as composite key
 
-- **Ollama**: Jina code embeddings via `http://localhost:11435/api/embeddings`
+- **Code-embedding service**: `http://localhost:11440` — model selected by the
+  hardware-spec ladder: CodeSage-Large-v2 (2048-dim, GPU ≥12 GB VRAM) →
+  `qwen3-embedding:0.6b` (1024-dim) → `jina-embeddings-v2-base-code` (768-dim,
+  CPU floor, via Ollama)
 
 ### Critical Rules
 
@@ -85,7 +88,7 @@ You will receive:
 
 - ✅ All changed files processed without crashes
 - ✅ Weaviate collections updated correctly (no duplicates)
-- ✅ Entities have valid embeddings (Jina model working)
+- ✅ Entities have valid embeddings (code-embedding service working)
 - ✅ Cross-references created where applicable
 - ✅ Maintenance report written with status summary
 - ✅ Total time < 5 minutes for typical update (10-20 files)
@@ -108,7 +111,7 @@ You will receive:
 1. Parse 3 files, extract entities
 2. Delete old entries for these 3 files from Weaviate
 3. Create new entries with updated code
-4. Generate embeddings using Jina
+4. Generate embeddings via the code-embedding service
 5. Update cross-references (function calls, imports)
 6. Write report to .claude/logs/maintenance_report.md
 ```
@@ -125,9 +128,10 @@ You will receive:
 - If still fails, abort and report error
 - Don't leave partial updates
 
-**If Jina embeddings fail**:
-- Try fallback to snowflake-arctic-embed2
-- If both fail, create entity without embedding (warning in report)
+**If code embeddings fail**:
+- The code-embedding service falls back down the hardware ladder
+  (CodeSage-Large-v2 → `qwen3-embedding:0.6b` → `jina-embeddings-v2-base-code`)
+- If all backends fail, create entity without embedding (warning in report)
 
 ### Performance Targets
 
@@ -157,27 +161,6 @@ Write to `.claude/logs/maintenance_report.md`:
 ## Files Processed
 1. src/api/handlers.py (5 functions, 2 classes)
 2. src/utils/validators.py (3 functions, 1 class)
-```
-
-## Knowledge Systems
-
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
-
-**Decision tree**:
-- Known terms → `kg-search` CLI (fast, ~100ms)
-- Conceptual → `hybrid_search` MCP
-- Relationships → `semantic_graph_search` MCP
-- Code by purpose → `search_code_graph` MCP
-- Quick analysis: use Claude directly (Ollama MCP removed in v0.2.11 as redundant)
-- Literal strings → Grep
-## Success Criteria
-
-- All changed files processed
-- Entities created/updated correctly
-- Cross-references accurate
-- Code-to-KG links established
-- Performance targets met
-- Report generated
 3. tests/test_api.py (2 functions, 1 module)
 
 ## Weaviate Updates
@@ -186,7 +169,7 @@ Write to `.claude/logs/maintenance_report.md`:
 - Updated cross-references: 8
 
 ## Embeddings
-- Generated: 12 embeddings (Jina model)
+- Generated: 12 embeddings (code-embedding service)
 - Failed: 0
 
 ## Errors
@@ -196,6 +179,20 @@ None
 - ✅ Code graph is up to date
 - No manual intervention needed
 ```
+
+---
+
+## Knowledge Systems
+
+> **Full reference**: the "Search Systems" and "Knowledge Graph" sections of this project's `CLAUDE.md`.
+
+**Decision tree**:
+- Known terms → `kg-search` CLI (fast, ~100ms)
+- Conceptual → `hybrid_search` MCP
+- Relationships → `semantic_graph_search` MCP
+- Code by purpose → `search_code_graph` MCP
+- Quick analysis: use Claude directly (no separate local-LLM tool is needed)
+- Literal strings → Grep
 
 ---
 

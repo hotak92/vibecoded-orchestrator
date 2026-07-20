@@ -10,7 +10,7 @@ model: opus
 
 **Purpose**: Expert guidance on cross-domain architecture decisions, technology selection, and infrastructure design requiring deep analysis of tradeoffs and long-term implications.
 
-**Model**: Opus 4.5 (expert reasoning for complex architectural decisions, handles multi-domain tradeoffs)
+**Model**: Opus (expert reasoning for complex architectural decisions, handles multi-domain tradeoffs)
 
 **When to Invoke Autonomously**:
 
@@ -60,8 +60,6 @@ Provides comparisons across domains:
 - **ML/AI**: Training (PyTorch/TensorFlow/JAX), Serving (Ollama/vLLM/TGI)
 - **Data**: Batch (Airflow/Dagster/Prefect), Streaming (Kafka/RabbitMQ/Redis)
 
-For detailed comparisons, see [examples/tech-comparisons.md](examples/tech-comparisons.md).
-
 ### 2. Architecture Pattern Selection
 
 Compares patterns:
@@ -93,13 +91,11 @@ Approaches for:
 
 ## Output Format
 
-See [template.md](template.md) for architecture consultation structure.
-
 ## Quick Workflow Reference
 
 **Before implementing**: Search for proven patterns
 ```bash
-.claude/scripts/kg-search search "architecture" --type concepts
+.claude/scripts/kg-search search "architecture" --type concept
 ```
 
 **For deep research**: Ask user "Use hybrid_search to research [technology selection]"
@@ -114,11 +110,6 @@ After architecture consultation:
 3. Capture rationale and tradeoffs
 4. Tag with domain, scale, and technology stack
 5. Reference in project node
-
-## Supporting Files
-
-- **Template**: Use [template.md](template.md) for consultation report format
-- **Examples**: See [examples/tech-comparisons.md](examples/tech-comparisons.md) for technology selection examples
 
 ## Success Metrics
 

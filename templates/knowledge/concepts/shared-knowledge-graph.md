@@ -3,7 +3,7 @@ title: Shared Knowledge Graph (Cross-Project)
 type: concept
 tags: [knowledge-graph, weaviate, vibecoded-tools, mid-level-architecture, retrieval]
 created: 2026-04-27T00:00:00Z
-updated: 2026-06-25T00:00:00Z
+updated: 2026-07-20T00:00:00Z
 status: active
 ---
 
@@ -11,7 +11,8 @@ status: active
 
 The vibecoded orchestrator ships with a **cross-project shared KG** — a single
 Weaviate collection (`VibeCodedOrchestrator_KnowledgeGraph`) seeded at install
-time from `vibecoded-orchestrator/knowledge/`. Every project on the machine
+time by materializing the curated bundled node set (`templates/knowledge/**`)
+into the orchestrator root's `knowledge/`. Every project on the machine
 queries both its own per-project KG **and** the shared KG by default; results
 are merged, de-duped, and re-ranked together. Two legacy-cased collection names
 are still recognised, and users with data under a different name can designate
@@ -56,9 +57,21 @@ project A           project B           project C
         └─────────────┴──────────────────────┘
 ```
 
-The shared collection is bootstrapped once per Weaviate instance by `install.py`
-Step 7d. Re-running install on an existing system is a no-op (existing-class
-detection + per-file upsert in `sync_knowledge_graph.py`).
+The curated bundled node set materializes ONCE into the orchestrator root's
+`knowledge/` — which IS the shared collection, by definition — via `install.py`
+Step 4d (`vco_lib.project_init.materialize_root_knowledge`), then syncs to
+Weaviate through the standard KG sync. Non-root projects never receive
+per-project copies of the curated set; they read it exclusively through the
+shared-KG read fan-out described below. Only a small depth-1 allowlist
+(`TAG_HIERARCHY.md`, `VOCABULARY.md`, and sidecar seeds) still ships into
+every project's `knowledge/`. Re-running install on an existing system is
+idempotent (manifest-driven hash compare + per-file upsert in
+`sync_knowledge_graph.py`). Per-project copies of curated nodes seeded by
+installs that predate the root-only model are left in place, never deleted;
+their manifest entries are quietly retired on the project's next bundle
+update. A project that sets `SHARED_KG_READ_DISABLED=true` forgoes the curated
+set for that project (deliberate accept-loss; there is no fallback
+per-project copy).
 
 ## Default behaviour
 
@@ -122,7 +135,7 @@ shared-KG hits get rich content; low-relevance hits get the LLM summary.
 Threshold env vars (`KG_TIER_MIN`, `KG_TIER_SINGLE_CHUNK`, etc.) apply
 uniformly across both collections.
 
-See `[[relatedTo::score-driven-retrieval-tiers]]` for the tier semantics.
+See `[[relatedTo::Score-Driven Retrieval Tiers]]` for the tier semantics.
 
 ## Failure modes
 
@@ -171,6 +184,5 @@ its name.
 
 ## See also
 
-- `[[relatedTo::score-driven-retrieval-tiers]]` — tier system used for both collections
-- `[[uses::weaviate-knowledge-graph]]` — underlying vector store
-- `[[implements::dual-collection-merge-pattern]]` — search-time merge approach
+- `[[relatedTo::Score-Driven Retrieval Tiers]]` — tier system used for both collections
+- `[[uses::Weaviate]]` — underlying vector store

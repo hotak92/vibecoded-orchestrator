@@ -6,10 +6,6 @@ keywords: ["scattered documentation", "extraction report", "knowledge extraction
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
 effort: high
-hooks:
-  PreToolUse:
-    matcher: "Write|Edit"
-    command: "./.claude/scripts/validate-readonly.sh"
 ---
 
 # Document Extractor Agent
@@ -130,7 +126,7 @@ Prioritize accurate knowledge extraction over speed:
 **Bad**: "Great documentation! Extracting everything..."
 **Good**: "Documentation has gaps in [X, Y]. Extracting what's available, flagging missing context."
 
-## Claude 4.x Documentation Quality
+## Claude Documentation Quality
 
 **Explicit extraction rules** (not "extract appropriately"):
 
@@ -481,7 +477,7 @@ Create structured extraction report organized by target document:
 5. **Preserve User Voice**: When extracting user preferences, keep their wording
 6. **Flag Contradictions**: If documents contradict each other, note both versions and flag for user review
 7. **Challenge Poor Quality**: If documentation lacks context, rationale, or evidence, flag it before extracting
-8. **Use Explicit Rules**: Apply categorization decision tree and status determination rules (see Claude 4.x section)
+8. **Use Explicit Rules**: Apply categorization decision tree and status determination rules (see Claude section)
 9. **Incremental Processing**: For large documents, read by section, document findings after each
 10. **Search First**: Check knowledge graph for similar document processing patterns before starting
 
@@ -505,7 +501,7 @@ Create structured extraction report organized by target document:
 - `hybrid_search` - Keyword + semantic across KG + docs (default search tool, ~1-2s)
 - `semantic_graph_search` - GraphRAG with WikiLink traversal (~1-2s)
 
-**3. Code Graph (Semantic Code Search)** (NEW):
+**3. Code Graph (Semantic Code Search)**:
 - `search_code_graph` - Find code by purpose/concept (~200-500ms)
 - `query_code_structure` - Dependencies, callers, inheritance (~50-100ms)
 - CLI: `.claude/scripts/code-graph-query search "pattern name"`
@@ -517,12 +513,12 @@ Create structured extraction report organized by target document:
 **kg-search** (keyword search, ~100ms):
 ```bash
 # Inputs: QUERY [--type TYPE] [--tags TAGS] [--limit N]
-.claude/scripts/kg-search search "documentation patterns" --type concepts
+.claude/scripts/kg-search search "documentation patterns" --type concept
 .claude/scripts/kg-search search "knowledge extraction" --tags documentation
 .claude/scripts/kg-info info "Documentation Structure Pattern"
 ```
 - `search QUERY`: Keyword search across titles/content
-- `--type`: Filter by type (concepts, projects, tools, models, hardware, research, patterns)
+- `--type`: Filter by type (project, concept, tool, research, model, hardware)
 - `--tags`: Filter by tags (e.g., --tags documentation,extraction)
 - `--limit`: Max results (default varies)
 - `info "Title"`: Get full node details by exact title
@@ -555,7 +551,7 @@ Create structured extraction report organized by target document:
 .claude/scripts/kg-duplicates [--threshold 0.95]
 ```
 
-**Code Graph** (NEW):
+**Code Graph**:
 ```bash
 .claude/scripts/code-graph-analyze /path/to/repo [--project NAME] [--incremental]
 .claude/scripts/code-graph-query search "pattern name" [--collection TYPE] [--limit N]
@@ -572,18 +568,19 @@ Create structured extraction report organized by target document:
 
 ## Storage Systems
 
-**1. Knowledge Graph** (knowledge/ → ClaudeKnowledgeGraph):
+**1. Knowledge Graph** (knowledge/ → per-project KG collection, name from `KG_COLLECTION`):
 - Cross-project patterns, concepts, learnings
 - RDF-based typed WikiLinks: [[uses::Tool]], [[implements::Concept]], [[extends::Parent]], [[buildsOn::Work]], [[relatedTo::Node]]
 - Properties: title, content, file_path, node_type, tags, links, typed_links, created_at, updated_at, valid_from, valid_until, status
 - Temporal queries supported
 - Search: kg-search or Weaviate MCP
 
-**2. Code Graph** (Weaviate collections) (NEW):
+**2. Code Graph** (Weaviate collections):
 - CodeModule: Files with imports and metrics
 - CodeClass: Classes with inheritance
 - CodeFunction: Functions with call graphs
 - CodeAPI: API endpoints with handlers
+- CodeInteraction: Cross-service calls (HTTP/gRPC/message-queue)
 - Semantic + structural queries
 - Search: search_code_graph or code-graph-query CLI
 

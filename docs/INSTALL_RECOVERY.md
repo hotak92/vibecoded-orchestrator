@@ -8,7 +8,7 @@ with each event capturing what step ran, what phase it reached, and any
 relevant detail. The launcher also appends events when it spawns at end of
 install or when its first-start wizard fires.
 
-## Read the bootstrap envelope too (v0.2.53+)
+## Read the bootstrap envelope too
 
 If `<repo_root>/state/logs/bootstrap-prepass.json` exists, read it BEFORE
 diving into `install.jsonl`. The envelope is a versioned, read-only snapshot
@@ -76,8 +76,9 @@ JSON record, which you should skip rather than abort on).
 - `1/10` … `10/10` — main install.py phases (Python → system → venv →
   deps → services → Ollama → models → collections → seed → state-dir →
   .env → claude-cli)
-- `2b/10`, `7b/10`, `7c/10` — sub-steps (optional companions like lean-ctx,
-  collection bootstrap, Weaviate seeding)
+- `2b/10`, `5b/10`, `7b/10`, `7c/10` — sub-steps (optional companions like
+  lean-ctx, the root `.claude/` bundle install, collection bootstrap,
+  Weaviate seeding)
 - `session` — meta-event: install.py session start/ok markers
 - `choices` — install-time decisions (optional companions, embedding mode, container
   runtime). `detail` is the choice name, `data.value` is the chosen
@@ -139,8 +140,7 @@ healthy `.venv/` AND matching state hashes, and passes `--lightweight`
 `python install.py --lightweight --lightweight-old-path /old/path`
 directly.
 
-**Tauri command** (used by the launcher's onboarding wizard + a future
-Settings → Install Diagnostics panel):
+**Tauri command** (used by the launcher's onboarding wizard):
 
 ```rust
 read_install_log() -> InstallLog {
@@ -207,7 +207,7 @@ the user loses:
   graph visualisation, score-driven retrieval tier inspection)
 - **Code graph dashboard** (CodeFunction/Class/Module/API/Interaction
   views, cross-service interaction map, similar-code search)
-- **Hook toggles** (per-project enable/disable for the 23 shipped
+- **Hook toggles** (per-project enable/disable for the 45 shipped
   hooks: KG-summary, RL-context, security scan, audit, etc.)
 - **Audit log viewer** (filterable, with cli/gui/api source attribution)
 - **Module install/uninstall flow** (paid module catalog, license
@@ -312,7 +312,7 @@ clean cargo caches: `cargo clean --manifest-path launcher/src-tauri/Cargo.toml`.
 If Cargo or npm registry calls fail, check `~/.npmrc`, `~/.cargo/config.toml`,
 proxy env vars (`HTTP_PROXY`, `HTTPS_PROXY`).
 
-#### f. V52-M: bundled hooks dead because they shipped without exec bit (FIX in v0.2.53)
+#### f. Hooks silently dead (missing exec bit)
 
 Symptom: `claude mcp list` is healthy, hook registrations in
 `.claude/settings.json` look correct, but `bash-context-inject.sh`,
@@ -321,25 +321,22 @@ Symptom: `claude mcp list` is healthy, hook registrations in
 no hook stderr under `.claude/logs/`, no observable side effects. (The
 dated `*_tool_usage.jsonl` file is written by the weaviate MCP's query
 logger, not by the hooks, so its absence is NOT a hook-health signal.)
-Cause (pre-v0.2.53): a subset of `templates/hooks/*.sh`
-were committed with mode `0644`, `shutil.copy2` preserved that mode
-into the project, and POSIX Claude Code refuses to invoke a
-non-executable hook script.
+Cause: a hook script on disk without the POSIX exec bit (e.g. copied by
+an external tool that dropped the mode) — POSIX Claude Code refuses to
+invoke a non-executable hook script.
 
 Fix path on a fresh install or upgrade:
 
 ```bash
 cd <repo_root>
-python install.py --update   # install.py:11299 force-chmods every copied
-                              # *.sh hook target to 0o755 after copy2 —
-                              # any silently-dead hook is now activated
+python install.py --update   # force-chmods every materialized *.sh hook
+                              # target to 0o755 — any silently-dead hook
+                              # is now activated
 ```
 
 No data side effects; `--update` is idempotent. If hooks still don't
 fire, check `.claude/settings.json` hook registrations were not
 inadvertently removed (PreToolUse / PostToolUse matchers absent).
-The chmod-0755 pass also covered a v0.2.52 UTF-8 BOM regression on a
-couple of `.ps1` siblings; same recovery command.
 
 #### g. Hub binary not discoverable
 
@@ -412,7 +409,7 @@ have access to all of it**:
 
 - `hybrid_search` MCP for "tauri build webkit2gtk linux 2026" type
   questions (the bundled KG has hardware/Linux-distro hints)
-- your own reasoning for quick error analysis (the Ollama MCP was removed in v0.2.11; Claude's built-in reasoning handles this directly)
+- your own reasoning for quick error analysis (Ollama runs as embedding infrastructure, not an MCP tool; Claude's built-in reasoning handles this directly)
 - `Read` tool with `offset`/`limit` for parsing the install log if it's large
 - `query_code_structure` MCP if you need to understand what file
   references the failing build artifact
@@ -595,30 +592,27 @@ Both the launcher (Rust) and `install.py` (Python) emit a
 }
 ```
 
-`read_install_log` (Tauri command) and the Diagnostics panel surface this
-event so the user can see which strategy ran and what it touched.
+`read_install_log` (Tauri command) surfaces this event so the launcher
+can show which strategy ran and what it touched.
 
 ---
 
-## localStorage flag scoping migration (v0.2.53)
+## localStorage update-dismissal flag scoping
 
-In v0.2.52 and earlier, the launcher's "you have an update available"
-dismissal flag was stored under the unscoped localStorage key
-`dismissed_update_version` (one master plan name in early drafts). In
-v0.2.53 the real code uses the install-path-scoped key
-`vct.update.seen_version` (see `launcher/src/lib/stores/updater.ts`),
-threaded through `getInstallScopedFlag` / `setInstallScopedFlag` in
+The launcher's "you have an update available" dismissal flag is stored
+under the install-path-scoped localStorage key `vct.update.seen_version`
+(see `launcher/src/lib/stores/updater.ts`), threaded through
+`getInstallScopedFlag` / `setInstallScopedFlag` in
 `launcher/src/lib/stores/install-state-store.ts`. This lets a user
 running multiple VCO installs from the same browser session dismiss
 the banner per-install rather than globally.
 
-A one-shot legacy-cleanup migration runs at launcher boot: any
-unscoped `dismissed_update_version` value is dropped on first start
-after upgrade. No user action required. The migration is silent — it
-does not surface to the GUI or `install.jsonl`. If a user reports
-"the dismissal sticky doesn't persist any more after upgrade", that
-is the expected one-time effect of the scoping move; their next
-dismissal will persist (under the new scoped key).
+A one-shot legacy-cleanup runs at launcher boot: any unscoped
+`dismissed_update_version` value left by an older install is dropped.
+No user action required; the cleanup is silent — it does not surface to
+the GUI or `install.jsonl`. If a user reports "the dismissal sticky
+didn't persist once", that is the expected one-time effect of the
+cleanup; their next dismissal persists (under the scoped key).
 
 This is a one-off behavioural blip, not a recovery scenario. Don't
-re-implement the old key as a workaround.
+re-implement the unscoped key as a workaround.

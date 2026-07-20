@@ -3,7 +3,7 @@ title: Hybrid Search - Combining Keyword and Semantic Retrieval
 type: concept
 tags: [AI, search, hybrid-search, BM25, semantic-search, ranking, vector-database, mid-level-architecture]
 created: 2026-02-27T00:00:00Z
-updated: 2026-04-05T14:33:28Z
+updated: 2026-07-20T00:00:00Z
 valid_from: 2026-02-27T00:00:00Z
 valid_until: null
 status: active
@@ -259,9 +259,6 @@ metrics = {
 - [ ] Set up monitoring dashboard
 - [ ] Document weighting decisions for your domain
 
-[[relatedTo::RAG Pipeline]]
-[[relatedTo::Semantic Search and Text Embeddings]]
+[[relatedTo::RAG Pattern]]
 [[relatedTo::Semantic Search]]
-[[relatedTo::BM25 Ranking Algorithm]]
-[[relatedTo::Vector Database - Architecture and Applications]]
 [[uses::Weaviate]]

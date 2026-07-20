@@ -12,7 +12,7 @@ allowed-tools: Read, Write, Bash, Glob, Grep
 
 **Purpose**: Walk a project repository against the four-layer reproducibility checklist (environment pinning, data versioning, workflow orchestration, deterministic randomness) and produce a specific, actionable remediation list. Designed to be run before manuscript submission, before sharing code with collaborators, or after the first "I can't reproduce your result" email.
 
-**Model**: Opus 4.7 — broad knowledge of ecosystems (Python, R, Julia, conda, container) and ability to read code at scale.
+**Model**: Opus — broad knowledge of ecosystems (Python, R, Julia, conda, container) and ability to read code at scale.
 
 **When to invoke autonomously**:
 - The user mentions "I'm about to submit", "share with reviewers", "reproducibility", or "rerun".

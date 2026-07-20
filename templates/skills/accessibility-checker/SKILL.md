@@ -10,7 +10,7 @@ model: haiku
 
 **Purpose**: Quick A11y review - WCAG 2.1 checklist, screen reader compatibility, keyboard navigation, color contrast.
 
-**Model**: Haiku 4.5 (fast accessibility checking)
+**Model**: Haiku (fast accessibility checking)
 
 **When to Invoke Autonomously**:
 
@@ -58,7 +58,7 @@ See [template.md](template.md) for structured review format.
 
 **Before implementing**: Search for proven patterns
 ```bash
-.claude/scripts/kg-search search "accessibility" --type concepts
+.claude/scripts/kg-search search "accessibility" --type concept
 ```
 
 **For deep research**: Ask user "Use hybrid_search to research [a11y topic]"

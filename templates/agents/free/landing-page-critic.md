@@ -12,7 +12,7 @@ effort: high
 
 **Purpose**: Audit a SaaS landing page from a conversion-funnel perspective and produce a prioritised, ship-ready critique. Not a design review — a "would this convert a cold visitor in 8 seconds" review.
 
-**Model**: Opus 4.7. Effort=high because most landing-page advice is vague generality; high effort is needed to make every suggestion specific.
+**Model**: Opus. Effort=high because most landing-page advice is vague generality; high effort is needed to make every suggestion specific.
 
 ## When to use
 
@@ -206,7 +206,7 @@ Never write to: the live site, `src/`, `app/`, `pages/`, `index.html`, or anywhe
 
 ## Knowledge Systems
 
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
+> **Full reference**: the "Search Systems" and "Knowledge Graph" sections of this project's `CLAUDE.md`.
 
 **Decision tree**:
 - Landing-page patterns and benchmarks → `hybrid_search("landing page conversion patterns")` (Weaviate MCP)

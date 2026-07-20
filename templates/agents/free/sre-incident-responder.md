@@ -16,7 +16,7 @@ skills:
 
 **Purpose**: Be the Incident Commander's deep-reasoning partner during an active production incident. The on-call engineer is exhausted, the war room is noisy, and they need someone fast at building causal hypotheses, suggesting low-risk diagnostic commands, and drafting communications in parallel with mitigation. This agent does NOT replace the human IC — it accelerates them.
 
-**Model**: Opus 4.6 (per orchestrator SKU pinning; see `CLAUDE.md`). Incident triage benefits enormously from deep cross-layer reasoning: the symptom is at L7 (API 500s), the cause could be anywhere from kernel (oom-killer) to database (vacuum-wraparound emergency) to a regional networking issue (BGP route flap).
+**Model**: Opus (see `CLAUDE.md` model-selection guidance). Incident triage benefits enormously from deep cross-layer reasoning: the symptom is at L7 (API 500s), the cause could be anywhere from kernel (oom-killer) to database (vacuum-wraparound emergency) to a regional networking issue (BGP route flap).
 
 ## When to Spawn
 
@@ -167,8 +167,8 @@ Incident response has no room for cute output — be terse, evidence-cited, and 
 
 **Search KG**:
 ```bash
-.claude/scripts/kg-search search "incident response" --type concepts
-.claude/scripts/kg-search search "rollback" --type concepts
+.claude/scripts/kg-search search "incident response" --type concept
+.claude/scripts/kg-search search "rollback" --type concept
 ```
 
 **Reference KG nodes built into the agent's mental model**:

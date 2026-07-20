@@ -15,7 +15,7 @@ Tiers form a strict ordering (`TIER_ORDER` in `VCThelpers/license/validator.py`)
 Unlocks: `knowledge_graph`, `code_graph`, `hooks`, `hybrid_search`. No license key, no network call, no expiry. Fail-open design means any network or validation failure falls back here.
 
 ### Pro tier
-Adds: `rl_retrieval`, `auto_update`, `curated_agent_packs`. Requires a valid Lemon Squeezy license key mapped to a Pro variant. (`watermark_disabled` was removed in v0.2.54 — the watermark feature never shipped a consumer.)
+Adds: `rl_retrieval`, `auto_update`, `curated_agent_packs`. Requires a valid Lemon Squeezy license key mapped to a Pro variant.
 
 ### MAO tier
 Adds: `multi_agent_orchestration`. Requires an MAO-tier LS license. Intended for teams running the full multi-agent orchestrator stack.

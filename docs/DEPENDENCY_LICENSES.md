@@ -1,6 +1,6 @@
 # Dependency Licensing Audit
 
-**Generated**: 2026-04-23
+**Generated**: 2026-04-23 (`pip-licenses` full-closure run); direct-dependency table re-verified against `requirements.txt` and the installed closure on 2026-07-20
 **Target license for this project**: AGPL-3.0
 **Auditor**: `pip-licenses` on full transitive closure of `requirements.txt`
 
@@ -57,22 +57,22 @@ Users install these via their container runtime; we don't redistribute binaries.
 
 | Package | Version | License | AGPL-compatible | Notes |
 |---|---|---|---|---|
-| `aiohttp` | 3.13.3 | Apache-2.0 AND MIT | YES |  |
-| `fastapi` | 0.129.0 | MIT | YES |  |
-| `fastmcp` | 2.14.3 | Apache-2.0 | YES |  |
+| `aiohttp` | 3.13.5 | Apache-2.0 AND MIT | YES |  |
+| `asyncpg` | 0.31.0 | Apache-2.0 | YES |  |
+| `fastapi` | 0.136.1 | MIT | YES |  |
 | `httpx` | 0.28.1 | BSD License | YES |  |
-| `mcp` | 1.25.0 | MIT License | YES |  |
-| `ollama` | 0.6.1 | MIT | YES |  |
-| `psutil` | 7.2.1 | BSD-3-Clause | YES |  |
-| `pydantic` | 2.12.5 | MIT | YES |  |
+| `mcp` | 1.27.0 | MIT License | YES |  |
+| `ollama` | 0.6.2 | MIT | YES |  |
+| `psutil` | 7.2.2 | BSD-3-Clause | YES |  |
+| `pydantic` | 2.13.4 | MIT | YES |  |
 | `PyYAML` | 6.0.3 | MIT License | YES |  |
-| `requests` | 2.32.5 | Apache Software License | YES |  |
-| `sentence-transformers` | 5.4.0 | Apache Software License | YES |  |
-| `torch` | 2.9.1 | BSD-3-Clause | YES |  |
-| `transformers` | 4.57.5 | Apache Software License | YES |  |
-| `uvicorn` | 0.40.0 | BSD-3-Clause | YES |  |
+| `requests` | 2.33.1 | Apache Software License | YES |  |
+| `sentence-transformers` | 5.4.1 | Apache Software License | YES |  |
+| `torch` | 2.11.0 | BSD-3-Clause | YES |  |
+| `transformers` | 4.49.0 | Apache Software License | YES | Deliberately capped `<4.50.0` in `requirements.txt` — CodeSage-Large-v2 (Conv1D) is incompatible with transformers ≥ 4.50; do not bump past the cap. |
+| `uvicorn` | 0.46.0 | BSD-3-Clause | YES |  |
 | `watchdog` | 6.0.0 | Apache Software License | YES |  |
-| `weaviate-client` | 4.19.2 | BSD 3-clause | YES |  |
+| `weaviate-client` | 4.21.0 | BSD 3-clause | YES |  |
 
 ### Transitive dependencies (pulled in by direct deps)
 

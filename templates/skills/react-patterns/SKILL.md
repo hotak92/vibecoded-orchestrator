@@ -10,7 +10,7 @@ model: sonnet
 
 **Purpose**: React best practices - component patterns, state management selection, performance optimization, testing strategies.
 
-**Model**: Sonnet 4.5 (balanced reasoning for React architecture)
+**Model**: Sonnet (balanced reasoning for React architecture)
 
 ## When to Invoke Autonomously
 
@@ -70,7 +70,7 @@ model: sonnet
 
 **Before implementing**: Search for proven React patterns
 ```bash
-.claude/scripts/kg-search search "react" --type concepts
+.claude/scripts/kg-search search "react" --type concept
 ```
 
 **For deep research**: Ask user "Use hybrid_search to research [React pattern comparison]"

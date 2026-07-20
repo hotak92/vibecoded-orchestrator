@@ -28,8 +28,8 @@ agents/skills/hooks for the orchestrator clone itself. This agent exists for cas
   network failure during Ollama model pull) and the user needs help diagnosing the
   failure + re-running with the right recovery flags
 - The user wants to make a deliberate choice about install variants
-  (`--cpu-only`, `--no-containers`, `--low-resource`, `--skip-ollama`,
-  `--skip-weaviate-bootstrap`) and needs the trade-offs explained
+  (`--cpu-only`, `--no-containers`, `--low-resource`, `--skip-models`,
+  `--skip-collections`) and needs the trade-offs explained
 - Pre-install environment audit (does podman work? are ports 8081/11435/11440/7700
   free? is Python 3.10+ available?) before triggering the install
 
@@ -121,7 +121,7 @@ For finer-grained control, the user can drive `install.py` directly with flags â
 1. Read `install.log` (or whatever the user piped install output to) and identify the failing step.
 2. Check `.claude/context/UPDATE_DEFERRED.md` for any deferral entries.
 3. Probe the suspected blocker (port conflict, container daemon, network, disk).
-4. Recommend a targeted re-run (`python install.py --resume`, `--skip-weaviate-bootstrap`,
+4. Recommend a targeted re-run (`python install.py --update`, `--skip-collections`,
    `--cpu-only`, etc.) instead of a full reinstall.
 
 ## Task Context

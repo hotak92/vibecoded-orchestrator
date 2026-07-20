@@ -3,7 +3,7 @@ title: Hook Discipline — VCT_DISABLE_HOOKS Escape Hatch
 type: concept
 tags: [hooks, debugging, ci, security, low-level-implementation, vibecoded-orchestrator]
 created: 2026-04-27T18:30:00Z
-updated: 2026-06-25T00:00:00Z
+updated: 2026-07-20T00:00:00Z
 status: active
 ---
 
@@ -24,7 +24,7 @@ fi
 
 Coverage: every shell hook in the orchestrator. Verified in CI by `pytest tests/test_hooks_disable_guard.py` which greps each hook for the guard and asserts presence. Adding a new hook without the guard fails CI.
 
-**Coverage**: all 36 top-level shell hooks under `.claude/hooks/` carry the guard (the helper libraries under `.claude/hooks/_lib/` are sourced fragments, not standalone hooks, and are out of scope).
+**Coverage**: every top-level shell hook under `.claude/hooks/` carries the guard, enforced by `tests/test_hooks_disable_guard.py` (the helper libraries under `.claude/hooks/_lib/` are sourced fragments, not standalone hooks, and are out of scope).
 
 **`set -e` / `pipefail` discipline**: CI gate `check_hook_set_directives.py` enforces that any hook using `set -e` MUST also enable `pipefail` (i.e., `set -euo pipefail`). New hooks that violate the pattern fail the gate.
 

@@ -15,7 +15,7 @@ skills:
 
 **Purpose**: Turn a business-process description ("when a customer signs a deal in HubSpot, create a project in Notion, post to Slack, kick off onboarding emails in Customer.io") into a concrete, implementation-ready workflow design — with the right engine chosen, idempotency designed in, retries and DLQs specified, observability hooks defined, and cost estimated.
 
-**Model**: Opus 4.7
+**Model**: Opus
 
 ## Why this agent exists (vs. ai-agentic-architect or ai-llm-expert)
 
@@ -251,7 +251,7 @@ After completing the design, ALWAYS:
 
 ## Knowledge Systems
 
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
+> **Full reference**: the "Search Systems" and "Knowledge Graph" sections of this project's `CLAUDE.md`.
 
 **Decision tree**:
 - Known terms → `kg-search` CLI (fast, ~100ms)

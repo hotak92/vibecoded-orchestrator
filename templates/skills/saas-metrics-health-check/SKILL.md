@@ -11,7 +11,7 @@ effort: high
 
 **Purpose**: Turn a messy customer/subscription CSV into a defensible SaaS health report with a single recommended action.
 
-**Model**: Opus 4.7.
+**Model**: Opus.
 
 ## When to invoke
 
@@ -177,7 +177,6 @@ If they don't have export data, the skill should not invent numbers — instead 
 
 ## Knowledge Systems
 
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
 
 **Decision tree**:
 - SaaS-metric definitions and patterns → `hybrid_search("SaaS metrics LTV churn definition")` (Weaviate MCP)

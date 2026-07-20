@@ -10,7 +10,7 @@ model: opus
 
 **Purpose**: Design complex system architectures, evaluate tradeoffs, and make critical technical decisions requiring deep reasoning.
 
-**Model**: Opus 4.5 (expert reasoning, handles ambiguity, considers edge cases)
+**Model**: Opus (expert reasoning, handles ambiguity, considers edge cases)
 
 **When to Invoke Autonomously**:
 
@@ -78,13 +78,11 @@ Is this task:
 
 ## Output Format
 
-See [template.md](template.md) for architecture proposal structure.
-
 ## Quick Workflow Reference
 
 **Before implementing**: Search for proven patterns
 ```bash
-.claude/scripts/kg-search search "architecture" --type concepts
+.claude/scripts/kg-search search "architecture" --type concept
 ```
 
 **For deep research**: Ask user "Use hybrid_search to research [system design]"
@@ -101,19 +99,13 @@ After completing architecture work:
 
 ## Knowledge Systems
 
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
-
 **Decision tree**:
 - Known terms → `kg-search` CLI (fast, ~100ms)
 - Conceptual → `hybrid_search` MCP
 - Relationships → `semantic_graph_search` MCP
 - Code by purpose → `search_code_graph` MCP
-- Quick analysis: use Claude directly (Ollama MCP removed in v0.2.11 as redundant)
+- Quick analysis: use Claude directly (no separate local-LLM MCP needed)
 - Literal strings → Grep
-## Supporting Files
-
-- **Template**: Use [template.md](template.md) for architecture proposal format
-- **Examples**: See [examples/](examples/) for good/bad architecture decisions
 
 ## Success Metrics
 

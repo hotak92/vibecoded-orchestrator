@@ -1,7 +1,7 @@
 ---
 name: hpc-submit
 description: Generates HPC job-submission scripts (SLURM, PBS/Torque, SGE/UGE, LSF) from a Python/R/Julia script with sensible resource estimates, partition selection, module loading, and container setup. Use when the user asks "how do I submit this to SLURM", "write me a sbatch script", "I need to run this on the cluster", "what resources should I request", or describes a script they want to run at scale.
-short_desc: HPC job script: SLURM/PBS/SGE/LSF generators
+short_desc: "HPC job script: SLURM/PBS/SGE/LSF generators"
 keywords: [SLURM, sbatch, PBS, Torque, LSF, SGE, srun, qsub]
 model: opus
 effort: high
@@ -12,7 +12,7 @@ allowed-tools: Read, Write, Bash, Glob
 
 **Purpose**: Take a user's compute script and produce a working submission script for the relevant HPC scheduler, with resource requests calibrated to the workload, environment setup that matches typical cluster conventions, and the gotchas that bite first-time users.
 
-**Model**: Opus 4.7 — straightforward generation task that benefits from broad knowledge of scheduler dialects.
+**Model**: Opus — straightforward generation task that benefits from broad knowledge of scheduler dialects.
 
 **When to invoke autonomously**:
 - The user mentions SLURM, sbatch, qsub, bsub, "the cluster", "HPC", a known partition name, or a queue manager.

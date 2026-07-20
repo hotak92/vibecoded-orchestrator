@@ -10,7 +10,7 @@ model: opus
 
 **Purpose**: Deep code analysis identifying subtle bugs, security issues, performance problems, and architectural concerns requiring expert-level reasoning.
 
-**Model**: Opus 4.5 (detects non-obvious issues, understands system-wide implications)
+**Model**: Opus (detects non-obvious issues, understands system-wide implications)
 
 **When to Invoke Autonomously**:
 
@@ -83,13 +83,11 @@ Code change is:
 
 ## Output Format
 
-See [template.md](template.md) for code review report structure.
-
 ## Quick Workflow Reference
 
 **Before implementing**: Search for proven patterns
 ```bash
-.claude/scripts/kg-search search "code-review" --type concepts
+.claude/scripts/kg-search search "code-review" --type concept
 ```
 
 **For deep research**: Ask user "Use hybrid_search to research [security patterns]"
@@ -98,14 +96,12 @@ See [template.md](template.md) for code review report structure.
 
 ## Knowledge Systems
 
-> **Full reference**: [`~/.claude/shared/KNOWLEDGE_SYSTEMS.md`](~/.claude/shared/KNOWLEDGE_SYSTEMS.md)
-
 **Decision tree**:
 - Known terms → `kg-search` CLI (fast, ~100ms)
 - Conceptual → `hybrid_search` MCP
 - Relationships → `semantic_graph_search` MCP
 - Code by purpose → `search_code_graph` MCP
-- Quick analysis: use Claude directly (Ollama MCP removed in v0.2.11 as redundant)
+- Quick analysis: use Claude directly (no separate local-LLM MCP needed)
 - Literal strings → Grep
 ## Integration with Knowledge Graph
 
@@ -114,11 +110,6 @@ After reviewing code:
 2. If common mistake: Add to `knowledge/anti-patterns/[mistake-name].md`
 3. Link to relevant security/performance concepts
 4. Tag with domain and severity
-
-## Supporting Files
-
-- **Template**: Use [template.md](template.md) for review report format
-- **Checklist**: See [examples/review-checklist.md](examples/review-checklist.md) for comprehensive review criteria
 
 ## Success Metrics
 

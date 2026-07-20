@@ -323,7 +323,7 @@ Push back when scripting is the wrong tool.
 
 Before scripting, search:
 - `hybrid_search("Photoshop UXP plugin patterns")`
-- `kg-search search "ExtendScript" --type concepts`
+- `kg-search search "ExtendScript" --type concept`
 - `hybrid_search("batch image processing")`
 
 Capture:

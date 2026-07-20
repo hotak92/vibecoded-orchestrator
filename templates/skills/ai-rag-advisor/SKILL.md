@@ -1,7 +1,7 @@
 ---
 name: ai-rag-advisor
 description: Expert guidance on RAG (Retrieval-Augmented Generation) system design including chunking strategies, embedding selection, retrieval methods, and vector database choices
-short_desc: RAG design: chunking, retrieval, vector DB choice
+short_desc: "RAG design: chunking, retrieval, vector DB choice"
 keywords: ["RAG pipeline", "design a RAG system", "chunking strategy", "vector database", "choose an embedding model", "hybrid retrieval", "improve retrieval quality", "which vector database", "RAG evaluation"]
 model: sonnet
 ---
@@ -10,7 +10,7 @@ model: sonnet
 
 **Purpose**: Expert guidance on RAG (Retrieval-Augmented Generation) system design including chunking strategies, embedding selection, retrieval methods, and vector database choices.
 
-**Model**: Sonnet 4.5 (balanced reasoning for RAG architecture, up-to-date on 2026 techniques)
+**Model**: Sonnet (balanced reasoning for RAG architecture, up-to-date on 2026 techniques)
 
 ## This Workflow's RAG Implementation (Reference)
 
@@ -23,10 +23,10 @@ When providing RAG guidance, you can reference this workflow's working implement
 
 **Vector Database**: Weaviate
 - Production-ready, scalable
-- Collections: `ClaudeKnowledgeGraph`, `[Project]_development`
+- Collections: `[Project]_KnowledgeGraph` (per-project KG, name from `KG_COLLECTION`; a shared cross-project collection, default `VibeCodedOrchestrator_KnowledgeGraph`, is auto-merged into reads), `[Project]_development`
 - Auto-sync via hooks when source files change
 
-**Embeddings**: snowflake-arctic-embed2
+**Embeddings**: qwen3-embedding:0.6b
 - Provider: Ollama (local, free, no API costs)
 - Dimensions: 1024
 - Quality: High performance on MTEB benchmarks
@@ -50,13 +50,13 @@ When providing RAG guidance, you can reference this workflow's working implement
 - Benefit: Human-readable, git-friendly, LLM-friendly
 
 **Collections Strategy**:
-- `ClaudeKnowledgeGraph`: Concise cross-project patterns (<300 lines/node)
+- `[Project]_KnowledgeGraph` + shared KG: Concise patterns (<300 lines/node)
 - `[Project]_development`: Verbose project-specific docs (no size limit)
 **Performance**:
 - Keyword search: ~100ms (file-based)
 - Semantic search: ~500ms (Weaviate)
 - Graph traversal: ~1-2s (Weaviate with WikiLink following)
-- Coverage: 31 nodes, growing organically
+- Coverage: grows organically as knowledge nodes are added
 
 This is a working implementation that balances performance, cost (free local embeddings), and quality. Use it as reference when advising on RAG systems.
 

@@ -2,7 +2,7 @@
 
 > ⚠️ **PRE-ALPHA — DO NOT TRUST THE OUTPUT WITHOUT MANUAL VERIFICATION.**
 >
-> This pipeline ships in v0.2.34 but is explicitly experimental. Known limitations:
+> This pipeline is explicitly experimental. Known limitations:
 > - **Edge coverage is partial.** The code-graph schema captures `calls` / `imports` / `extends` / `composes` / `interactions`, but not every real edge of those kinds lands in Weaviate (parser misses, dynamic dispatch, conditional imports). Diagrams will under-report.
 > - **Seed resolution is heuristic.** `Function → Class → Module` order means a symbol that exists at two levels resolves to the function and silently ignores the class/module version. Disambiguate by passing the fully-qualified name.
 > - **Mermaid auto-layout degrades past ~50 nodes.** The default `--max-nodes 50` cap is the empirical ceiling for readability; the CLI truncates rather than producing a "ball of yarn" render.
@@ -11,7 +11,7 @@
 >
 > **Always verify a generated diagram against the source code before sharing it or making decisions from it.** Report surprising omissions or wrong edges so the pipeline can improve; do not silently work around them.
 
-**Phase 3 of the diagrams-integration plan** (maintainer-side internal notes). Status: shipped pre-alpha in v0.2.34.
+**Phase 3 of the diagrams-integration plan** (maintainer-side internal notes). Status: pre-alpha — verify all output against the source before sharing.
 
 Turns a subgraph rooted at one code symbol into a Mermaid `flowchart TD`, writes it under `.claude/diagrams/codegraph/`, and indexes it so `hybrid_search` can find it later. Pairs with the `/codegraph-diagram` slash skill — same arguments, same output.
 
