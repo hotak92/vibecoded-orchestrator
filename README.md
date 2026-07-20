@@ -62,13 +62,9 @@ One-liner (Linux / macOS):
 git clone https://github.com/hotak92/vibecoded-orchestrator.git && cd vibecoded-orchestrator && bash first-install.sh
 ```
 
-`first-install.{sh,command,bat}` is a thin OS shim (~100 LoC) that runs three steps: (1) detect a usable Python 3.11+ via an OS-aware candidate cascade and prompt to install via the platform package manager if missing (Homebrew on macOS, apt/dnf/pacman/zypper/apk on Linux, winget on Windows); (2) run `install.py --bootstrap --json` — a read-only system-detection prepass that writes a diagnostic envelope to [`state/logs/bootstrap-prepass.json`](docs/INSTALL_ARCHITECTURE_v2.md#3-installpy---bootstrap-mode) (Python/Node/Podman versions, GPU, RAM, OS, package-manager advice); (3) run `install.py` for the canonical 10-step install. On success, `scripts/post-install-launcher.sh` auto-spawns the launcher GUI — pass `--no-auto-launch` to skip.
+`first-install.{sh,command,bat}` is a thin OS shim that (1) finds a usable Python 3.11+ (offering to install one via Homebrew / apt / dnf / pacman / zypper / apk / winget if missing), (2) runs a read-only system-detection prepass that writes a diagnostic report to `state/logs/bootstrap-prepass.json` — no side effects, and a failure there never blocks the install — then (3) runs `install.py` for the canonical install. On success the launcher GUI auto-starts (pass `--no-auto-launch` to skip). Root install and per-project bundle install share one engine — the orchestrator's own `.claude/` goes through the same code path the launcher uses for your projects. Full detail: [`docs/INSTALL_ARCHITECTURE_v2.md`](docs/INSTALL_ARCHITECTURE_v2.md) and [`docs/INSTALL_PARITY.md`](docs/INSTALL_PARITY.md).
 
-The bootstrap prepass has no install side effects; failure there does not block the full install. It exists to make failed installs diagnosable without re-running probes by hand.
-
-Root install and per-project bundle install share one engine (`python -m vco_lib.project_init install-bundle`) — the orchestrator's own `.claude/` is installed through the same code path the launcher uses for your projects. See [`docs/INSTALL_PARITY.md`](docs/INSTALL_PARITY.md).
-
-Tri-OS install smoke CI (`install-smoke-tri-os.yml`) runs the actual `first-install.{sh,command,bat}` end-to-end on ubuntu-22.04, ubuntu-24.04, macos-14, windows-latest, and fedora-40 on every PR + push to main + daily at 06:00 UTC; pre-ship gate 22 blocks release tags when this workflow is red on main.
+The entry points run end-to-end in CI on Ubuntu 22.04/24.04, Fedora 40, macOS 14, and Windows on every PR and daily; a red run blocks release tags.
 
 Allow ~5–10 min plus first-run image downloads (~5 GB: Weaviate + Ollama qwen3 weights, +2.5 GB if GPU mode pulls CodeSage-Large-v2).
 
@@ -76,9 +72,7 @@ If anything fails partway through, paste [`docs/INSTALL_RECOVERY.md`](docs/INSTA
 
 ## Who this is for
 
-If you use **VS Code (or any IDE) with [Claude Code](https://claude.ai/code)**, this is for you. The orchestrator runs entirely in the background — it indexes your knowledge, your codebase, your tool calls, and feeds Claude richer context every time you talk to it. **Your workflow doesn't change.**
-
-If you don't use Claude Code: the KG, code graph, MCP servers, and launcher GUI all work standalone, but the value is highest when there's an AI client driving them. See [Compatibility](#compatibility).
+If you use **VS Code (or any IDE) with [Claude Code](https://claude.ai/code)**, this is for you: the orchestrator indexes your knowledge and your codebase in the background and feeds Claude richer context every time you talk to it. If you don't use Claude Code, the KG, code graph, MCP servers, and launcher GUI all work standalone, but the value is highest when there's an AI client driving them. See [Compatibility](#compatibility).
 
 ## Where this fits
 
@@ -95,7 +89,7 @@ VCO sits on top of Claude Code rather than replacing your AI assistant. The comp
 | Pricing model | $20/mo SaaS | $10–20/user/mo | BYOA + cloud compute | $20/mo + usage | Per-token OpenAI | Free + your LLM | Free + your LLM | **Free + your Claude sub; €19/mo Pro** |
 | Polished v1 product (vs. alpha) | Yes | Yes | Yes | Yes | Yes | Yes | Yes | **No — alpha** |
 
-**Reading the table**: Cursor, Copilot, Augment, and Devin are closed all-in-ones — they ship the editor, the AI, the context layer, and the cloud, bundled. Aider, Cline, Continue, and Codex CLI are open-source / BYOL but lack persistent memory and (in most cases) a structural code graph. VCO is the combination that doesn't otherwise exist: open-source, local, BYO-Claude-subscription, *and* it has both persistent memory and a code graph. The trade you're making for that is product polish — VCO is alpha, the others are stable v1+.
+**Reading the table**: Cursor, Copilot, Augment, and Devin are closed all-in-ones — they ship the editor, the AI, the context layer, and the cloud, bundled. Aider, Cline, and Codex CLI are open-source / BYOL but lack persistent memory and (in most cases) a structural code graph. VCO is the combination that doesn't otherwise exist: open-source, local, BYO-Claude-subscription, *and* it has both persistent memory and a code graph. The trade you're making for that is product polish — VCO is alpha, the others are stable v1+.
 
 Competitor products move fast — verify the row you care about before quoting.
 
@@ -130,50 +124,20 @@ Claude generates response, edits files
 
 ### What runs when you add a project
 
-When you click **Add project** in the launcher GUI, the project is usable
-the moment bundle install finishes — and three background tasks then fan
-out in parallel, so a project with pre-existing `knowledge/**/*.md`,
-`docs/**/*.md`, or source code lands fully indexed without manual CLI
-invocations:
+When you click **Add project** in the launcher GUI, the project is usable the moment bundle install finishes — and three background tasks fan out in parallel, so a repo with pre-existing `knowledge/**/*.md`, `docs/**/*.md`, or source code lands fully indexed without manual CLI invocations:
 
-1. **Code graph build** — `code-graph-analyze` over the project root,
-   populating `CodeModule` / `CodeClass` / `CodeFunction` / `CodeAPI` /
-   `CodeInteraction` collections.
-2. **KG sync** — `.claude/scripts/kg-sync --all` walks
-   `knowledge/**/*.md` and `docs/**/*.md` and embeds them into the
-   per-project Weaviate collections (`<Project>_KnowledgeGraph` and
-   `<Project>_Development`).
-3. **KG summaries** — `.claude/scripts/generate-kg-summary.py` over
-   each `knowledge/**/*.md` file, producing the
-   `knowledge/.node_formats.json` sidecar consumed by
-   `hybrid_search`'s `summary` tier. Three-tier backend fallback:
-   `claude` CLI on PATH → Ollama at `KG_SUMMARY_OLLAMA_URL` (default
-   `http://localhost:11435`, model `qwen3.5:9b`) →
-   `ANTHROPIC_API_KEY` direct → silent skip.
+1. **Code graph build** — structural analysis over the project root, populating the `CodeModule` / `CodeClass` / `CodeFunction` / `CodeAPI` / `CodeInteraction` collections.
+2. **KG sync** — walks `knowledge/**/*.md` and `docs/**/*.md` and embeds them into the per-project Weaviate collections.
+3. **KG summaries** — LLM-written node summaries consumed by `hybrid_search`'s `summary` tier (backend fallback: `claude` CLI → local Ollama → `ANTHROPIC_API_KEY` → skip; summaries backfill later as you edit nodes if no backend is available).
 
-The project page shows three stacked status banners (KG summaries,
-KG sync, code graph build) under the project header — `pending` /
-`running` / `failed` always visible, `success` / `skipped` auto-hide
-30 s after completion. The project header carries three retry
-buttons (`Re-build code graph`, `Re-sync KG`, `Re-build KG summaries`).
-The launcher's boot sweep marks any `running` rows left behind by a
-prior crash as `failed` with `"launcher crashed mid-run; click Retry
-to re-run"`, and re-spawns any `pending` rows. The summariser
-content-hashes each node, so retries on an already-summarised
-project are a cheap no-op.
-
-If neither `claude` CLI nor Ollama is available when the KG-summary
-task runs, the third banner goes yellow `skipped` after the first
-node and shows the install hint under `Show details`; summaries then
-backfill incrementally as you edit nodes in Claude Code sessions via
-the `PostToolUse` hook `kg-summary-generator.{sh,ps1}`.
+Each task gets a status banner on the project page (`pending` / `running` / `failed`, with `Show details` and `Retry`); runs interrupted by a crash are marked failed and retryable, and retries are cheap no-ops for already-indexed content. Full walkthrough: [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md#background-tasks-the-launcher-fans-out-on-add-project).
 
 ## Under the hood
 
 - **Knowledge Graph** — Obsidian-style markdown nodes with typed WikiLinks, indexed in Weaviate via qwen3 embeddings (1024-dim, local). Optional OpenAI embeddings.
 - **Code Graph** — per-language structural analysis across 10+ languages, populating `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction` collections. Call edges (`callers` / `path` queries) come from Python's `ast`; installing the optional `codegraph-ts` extra (`pip install '.[codegraph-ts]'`, opt out at install with `VCT_SKIP_CODEGRAPH_TS=1`) adds tree-sitter grammars so call edges extend to rust, go, javascript, typescript, java, c#, c/c++, ruby, lua, and bash. Without the extra those languages simply get no call edges (the rest of the graph is unaffected).
-- **45 automation hooks** — context injection on prompt submit, KG/code-graph auto-sync on file edit, credential scans, compaction-preserving context replay, security checks. 43 are event-registered in `settings.json`; 2 more (`kg-sync-on-edit`, `code-graph-incremental`) run as helpers invoked by sibling hooks. Linux/macOS use `.sh`; Windows ships a native `.ps1` sibling for every hook. Plus the `vct-hub` background service that resolves per-project config for hooks, MCPs, and scripts.
-- **MCP servers (default install)** — 4 registered in `~/.claude.json` at install: `weaviate-kg` (semantic + graph search + code graph) and `search` (academic papers via OpenAlex + arXiv) are **enabled by default per project**; `mermaid` and `excalidraw` are **registered but default-disabled per project** — `claude mcp list` shows them connected, but their tools aren't callable until you opt in via the launcher's Diagrams tab. A fifth MCP — `playwright` — is **enabled by default** and invoked separately via `npx -y @playwright/mcp@latest` (pre-cached at install; opt out with `VCT_SKIP_PLAYWRIGHT=1`). The `vct-coordination` MCP is **Pro-tier** and excluded from the default install. All local, no per-tool API keys. Ollama runs as backend infrastructure (Weaviate vectorizer + code-embed CPU fallback), and the CodeSage code-embedding FastAPI service runs locally on port 11440 — neither is an MCP.
+- **45 automation hooks** — context injection on prompt submit, KG/code-graph auto-sync on file edit, credential scans, compaction-preserving context replay, security checks. 43 are event-registered in `settings.json`; 2 more (`kg-sync-on-edit`, `code-graph-incremental`) run as helpers invoked by sibling hooks. Every hook ships as `.sh` (Linux/macOS) with a native `.ps1` sibling (Windows). The `vct-hub` background service resolves per-project config for hooks, MCPs, and scripts.
+- **MCP servers (default install)** — 4 registered in `~/.claude.json` at install: `weaviate-kg` (semantic + graph search + code graph) and `search` (academic papers via OpenAlex + arXiv) are **enabled by default per project**; `mermaid` and `excalidraw` are **registered but default-disabled** — connected in `claude mcp list`, tools not callable until you opt in via the launcher's Diagrams tab. A fifth MCP — `playwright` — is **enabled by default**, invoked via `npx -y @playwright/mcp@latest` (pre-cached at install; opt out with `VCT_SKIP_PLAYWRIGHT=1`). The `vct-coordination` MCP is **Pro-tier**. All local, no per-tool API keys. Ollama (Weaviate vectorizer + embedding fallback) and the code-embedding FastAPI service on port 11440 are backend infrastructure, not MCPs.
 - **Secrets primitive** — OS-keychain storage (launcher-managed) plus a chmod-600 file store under `~/.vct-secrets/`, resolved through the `vct` CLI and the `vct-hub` service. Agents inject credentials into child processes by key name (`vct exec --secret KEY=ENV_VAR -- cmd`) instead of printing them; a hook blocks env-grepping for tokens. See [`docs/VCT_SECRETS_PRIMITIVE.md`](docs/VCT_SECRETS_PRIMITIVE.md).
 - **44 agents + 53 skills** — shipped via `install.py` templates. Agents handle planning, coding, testing, doc maintenance, KG navigation, code-graph health. Skills cover security review, debugging, architecture, RAG advisory, accessibility, etc.
 - **Workflow plumbing** — session state tracking (`CONTEXT_STATE.md`), plan files, memory management, pre-/post-compact context replay so a `/compact` doesn't lose your thread.
@@ -289,7 +253,7 @@ The whole repository is AGPL-3.0. The codebase you see here is the Free tier —
 
 | Tier            | Price                | What you get                                                                                  |
 |-----------------|----------------------|-----------------------------------------------------------------------------------------------|
-| **Free**        | €0                   | Full orchestrator: KG, code graph, 45 hooks, 4 default MCP servers in `~/.claude.json` (weaviate-kg + search enabled per project; mermaid + excalidraw registered but default-disabled until opt-in) + playwright via npx, 44 agents, 53 skills. AGPL-3.0. |
+| **Free**        | €0                   | Full orchestrator: KG, code graph, 45 hooks, 44 agents, 53 skills, all default MCP servers (see [Under the hood](#under-the-hood)). AGPL-3.0. |
 | **Pro**         | €19/month            | Free + RL-scored retrieval reranking module + coordination layer (Telegram groups + shared decision/task channels). Modules ship as separate signed binaries via the launcher. Self-host the coordination DB at no extra cost, or use our hosted instance for a small additional fee. |
 | **Enterprise**  | Contact us           | Free + commercial AGPL exemption, priority support, custom SLAs. [team@vibecodedtools.com](mailto:team@vibecodedtools.com) |
 
