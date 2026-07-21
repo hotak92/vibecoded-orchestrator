@@ -16,7 +16,7 @@ _(List the primary languages, frameworks, and infrastructure. Examples: "Python 
 
 - Project root: `{{PROJECT_ROOT}}`
 - Orchestrator (VibeCoded Orchestrator): `{{ORCHESTRATOR_ROOT}}` — source-of-truth for hooks, scripts, agents, skills shipped under `.claude/`.
-- KG nodes: `knowledge/` (per-project KG; the shared cross-project KG is auto-merged into every search — name set by `SHARED_KG_COLLECTION` env, default `VibeCodedOrchestrator_KnowledgeGraph`). The orchestrator's ~113 bundled *curated* nodes are NOT copied into this project — they live once in the shared collection (materialized into the orchestrator root's `knowledge/` at install time) and reach your searches via the shared-read fan-out. Setting `SHARED_KG_READ_DISABLED=true` forgoes those bundled nodes for this project (deliberate accept-loss); your own `knowledge/` nodes are unaffected.
+- KG nodes: `knowledge/` (per-project KG; the shared cross-project KG is auto-merged into every search — name set by `SHARED_KG_COLLECTION` env, default `VibeCodedOrchestrator_KnowledgeGraph`). The orchestrator's ~117 bundled *curated* nodes are NOT copied into this project — they live once in the shared collection (materialized into the orchestrator root's `knowledge/` at install time) and reach your searches via the shared-read fan-out. Setting `SHARED_KG_READ_DISABLED=true` forgoes those bundled nodes for this project (deliberate accept-loss); your own `knowledge/` nodes are unaffected.
 - Active context: `.claude/CONTEXT_STATE.md` (current task, recent progress, blockers).
 - Active plans: `.claude/context/plans/` (referenced, not auto-loaded).
 

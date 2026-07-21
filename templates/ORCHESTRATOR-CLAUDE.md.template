@@ -20,12 +20,12 @@ This block appears on every new project until you remove it. It's NOT for you to
 
 2. **Once you understand the project**, offer the scoping choice. Use AskUserQuestion (or plain prose if AskUserQuestion isn't available). Suggested phrasing:
 
-   > VCO ships with 44 agents, 53 skills, and 36 hooks pre-registered for this project. Most of them are off-topic for what you've described. Want me to scope this project — disable the agents/skills that don't apply to your stack, leaving just the relevant ones? Pros: cleaner Agents/Skills tabs, less noise in `@agent-*` autocomplete, faster mental model of what's available. Cons: if the project's scope expands later, you'll have to re-enable items manually (one click each from the launcher's per-project Agents/Skills tabs). If you'd rather keep everything visible and triage on demand, that's also a valid choice — just say "keep all" and I'll skip this.
+   > VCO ships with 44 agents, 53 skills, and 45 hooks pre-registered for this project. Most of them are off-topic for what you've described. Want me to scope this project — disable the agents/skills that don't apply to your stack, leaving just the relevant ones? Pros: cleaner Agents/Skills tabs, less noise in `@agent-*` autocomplete, faster mental model of what's available. Cons: if the project's scope expands later, you'll have to re-enable items manually (one click each from the launcher's per-project Agents/Skills tabs). If you'd rather keep everything visible and triage on demand, that's also a valid choice — just say "keep all" and I'll skip this.
 
 3. **If the user says yes**, do it via the launcher's enabled-toggle APIs (NOT by deleting files):
    - Tauri commands `set_project_agent_enabled` / `set_project_skill_enabled` / `set_project_hook_enabled` (callable from the launcher GUI's per-project tabs).
    - SQL fallback if you have direct DB access: `UPDATE project_agents SET enabled = 0 WHERE project_id = ? AND agent_name IN (...)` (same for `project_skills` / `project_hooks`).
-   - WHY not delete the `.md` files: `install-bundle --update` is idempotent UPSERT, so disabled rows survive bundle updates. Deleting the files would cause the next bundle update to re-add them (and the user has to re-disable). The enabled-flag pattern is the supported one.
+   - Disable via toggle, not by deleting the `.md` files: `install-bundle --update` is an idempotent UPSERT, so disabled rows survive bundle updates. Deleting a file just makes the next bundle update re-add it.
 
 4. **Decide which to disable** by reading: the user's project description, `.claude/CONTEXT_STATE.md` (if present), the agent/skill `description:` frontmatter (one-line summary of what each does), and your judgement. Bias toward keeping a small core (planner, coder, tester, doc-extractor, kg-navigator) + everything that maps to the user's stack/goal. When unsure about a borderline item, default to ENABLED — the user can always disable later from the launcher.
 
@@ -33,9 +33,9 @@ This block appears on every new project until you remove it. It's NOT for you to
    ```bash
    python .claude/scripts/cleanup-setup-sections.py
    ```
-   The script strips ALL `BEGIN: SETUP-ONLY` blocks at once — fine in practice because by the time the user has done the scoping pass, the other two SETUP-ONLY blocks ("First-Run Setup" and "Verifying Installation") have also served their purpose.
+   The script strips ALL `BEGIN: SETUP-ONLY` blocks at once (this one plus the "First-Run Setup" and "Verifying Installation" blocks), which have all served their purpose by the time the scoping pass is done.
 
-**Why this block exists**: every project that gets VCO installed inherits the full agent/skill catalog, but a project's actual domain rarely needs all 44+53 of them. Disabling the off-topic ones at project-start time is a 30-second improvement to every future session's mental model — and the user almost always forgets to do it unless prompted explicitly. The nudge here makes it a deliberate first-session choice rather than a deferred housekeeping task that never happens.
+A project's actual domain rarely needs the full agent/skill catalog. Scoping off-topic items at project-start is a one-time cleanup that keeps every future session's mental model focused; the nudge makes it a deliberate first-session choice rather than housekeeping that never happens.
 <!-- END: SETUP-ONLY -->
 
 # VibeCoded Orchestrator — Project Instructions
@@ -99,9 +99,9 @@ A short rule that applies to every code change you make, not just VCO ones.
 3. **Migrate the existing call-sites** to import the shared helper.
 4. **Then add your new call-site** that also calls the shared helper.
 
-Steps 2–3 cost time you didn't budget for. They are still cheaper than letting the duplication grow another generation. Track J of this cycle exists specifically to clean up duplications that earlier cycles deferred; do not add to its queue.
+Steps 2–3 cost time you didn't budget for. They are still cheaper than letting the duplication grow another generation.
 
-**Same principle for file size**: if your change would add more than ~50 contiguous lines to a file already past ~5,000 lines (`install.py` is past 25,000 today), extract the new logic into a new module instead. Mega-scripts make every future audit and refactor more expensive.
+**Same principle for file size**: if your change would add more than ~50 contiguous lines to a file already past ~5,000 lines, extract the new logic into a new module instead. Mega-scripts make every future audit and refactor more expensive.
 
 When extraction is genuinely hard (the new logic depends on local mutable state in a long sequential flow), extract the pure portion to a helper module and leave a thin orchestration shim in the original file. Document the split in a comment so the next editor does not merge them back.
 
@@ -127,7 +127,7 @@ When extraction is genuinely hard (the new logic depends on local mutable state 
 4. CHANGELOG.md `[Unreleased]` section is EMPTY (all entries moved into the tagged version block).
 5. Every audit/review artifact under `.claude/context/reviews/` for the current cycle has been reconciled (no `IN-SCOPE` items still pending; all `OUT-OF-SCOPE` items have explicit user-approval rationale recorded inline).
 
-**Why this rule exists**: v0.2.40 shipped 18 agent landings + R3-R5 follow-ups all flagged "ops follow-up needed" / "container-side TODO" / "dead code, cleanup next release". v0.2.41 was a CI-gate hotfix that ALSO shipped with installer-smoke still red + Weaviate-bootstrap still failing + 4 deferred items. Each chained bugfix release erodes the user-facing credibility of every prior tag. User correction 2026-05-31: "do not push a release if you are deferring fixing some issue with the release. Fix first then push."
+Each chained bugfix release erodes the credibility of every prior tag, so the rule is absolute: fix first, then push.
 
 **How to apply when scope feels too big**: ask the user "this would push v0.2.X out by N days — accept defer with explicit rationale OR cut scope from this release?" Then act on whichever they choose. Don't decide unilaterally to defer.
 
@@ -139,7 +139,7 @@ When extraction is genuinely hard (the new logic depends on local mutable state 
 
 **Before answering any non-trivial question:**
 1. Read `.claude/CONTEXT_STATE.md` — current task, recent progress, blockers.
-2. **Check `.claude/context/UPDATE_DEFERRED.md`** if present (added v0.2.51) — it lists conditions the last `install.py --update` could not auto-resolve. **If you find a `update_resume_required` entry**, the user's previous orchestrator update halted at a merge conflict, the conflict was resolved outside the launcher, but `install.py --update` and the launcher binary refresh never ran. **Surface this at session start before any other work** and tell the user: "Your previous orchestrator update is incomplete. Either click the **Continue Update** button in the launcher's MenuBar (top-right purple badge), OR run `python install.py --update` from the install root. Then quit + relaunch the launcher so the freshly-built binary loads." Reason it matters: `.claude/hooks/`, MCP server registrations, and the launcher binary may not match the freshly-merged source; running other automation against mismatched state can corrupt project metadata. The deferral self-clears on the next successful install.py run.
+2. **Check `.claude/context/UPDATE_DEFERRED.md`** if present — it lists conditions the last `install.py --update` could not auto-resolve. **If you find an `update_resume_required` entry**, a previous orchestrator update halted at a merge conflict that was resolved outside the launcher, but `install.py --update` and the launcher binary refresh never ran. **Surface this before any other work** and tell the user: "Your previous orchestrator update is incomplete. Either click the **Continue Update** button in the launcher's MenuBar (top-right purple badge), OR run `python install.py --update` from the install root. Then quit + relaunch the launcher so the freshly-built binary loads." It matters because `.claude/hooks/`, MCP registrations, and the launcher binary may not match the freshly-merged source, and running other automation against mismatched state can corrupt project metadata. The deferral self-clears on the next successful install.py run.
 3. For architecture/system questions → check `docs/features/` (per-area design notes: MCPs + agents, code graph, KG, RL retrieval, install flow, etc.) if the project has one.
 4. For any other project question → search the KG / code graph **before** generating a response.
 
@@ -183,7 +183,7 @@ These four persistence layers exist for a reason — future-you, future-agents, 
 - Cache mentally for 20–30 minutes — don't re-read the same file repeatedly within a session.
 - Limit shell output: `| head -30` or `2>&1 | tail -20`.
 - Skip echoing after writes; trust the tool result.
-- Spawn agents for multi-file ops (cap at 3 parallel).
+- Spawn agents for multi-file ops (cap 3 concurrent EDITORS per shared tree; read-only agents may run wider).
 
 **Large Documents (>20 pages)**: Skim ToC/structure first, then targeted section reads; note discoveries as you go.
 
@@ -309,18 +309,18 @@ status: active  # active, archived, deprecated, idea
 
 **Per-project isolation**: `KG_COLLECTION` (per-project KG) and `SHARED_KG_COLLECTION` (cross-project shared, default `VibeCodedOrchestrator_KnowledgeGraph`) are set per-project via `.claude/settings.json` `env` — **the canonical channel** that propagates to MCP subprocesses on every Claude Code surface (CLI, Desktop app, VS Code extension). The active workspace determines the active KG, not which project is being discussed. The launcher's Identity tab "Manage shared KG collection" picker lets you designate an existing orchestrator-shaped class as canonical (useful when migrating from an older install whose shared collection had a different name).
 
-> ⚠️ **`.vscode/settings.json claude-code.env` does NOT propagate to MCP subprocesses on Linux** (sentinel testing 2026-05-16 against Claude Code 2.1.143; see PR-27 / v0.2.12 commit). Editing the VS Code key for KG / code-graph routing is a common footgun — values look correct in the workspace settings but the MCP subprocess sees nothing and falls back to bundled defaults. Always use `.claude/settings.json env` for KG / code-graph / embedding env vars; the launcher's per-project Identity tab writes this file. Verify with the MCP startup log line `weaviate-kg: resolved collections (...)` which shows what the subprocess actually picked up + the resolution source (env / hub / default). When a fallback to defaults happens, the MCP also emits a WARNING pointing at the same canonical channel.
+> ⚠️ **`.vscode/settings.json claude-code.env` does NOT propagate to MCP subprocesses on Linux.** Editing the VS Code key for KG / code-graph routing is a common footgun — values look correct in the workspace settings but the MCP subprocess sees nothing and falls back to bundled defaults. Always use `.claude/settings.json env` for KG / code-graph / embedding env vars; the launcher's per-project Identity tab writes this file. Verify with the MCP startup log line `weaviate-kg: resolved collections (...)` which shows what the subprocess actually picked up + the resolution source (env / hub / default). When a fallback to defaults happens, the MCP also emits a WARNING pointing at the same canonical channel.
 
 **Precedence order** (highest to lowest, where the resolved value reaches MCP subprocesses):
 1. vct-hub-resolved values (when the launcher is running; the MCP queries `vct-hub` on import and the hub returns the per-project ProjectConfig from `launcher.db`).
 2. Env vars from `.claude/settings.json env` (cross-editor canonical).
 3. Env vars from `.claude/env` (shell-sourced — CLI users who source it from their rc).
 4. Env vars from `~/.claude.json mcpServers.weaviate-kg.env` (the launcher intentionally restricts this to truly machine-invariant keys like `WEAVIATE_URL`; `KG_COLLECTION`-shape per-project keys are dropped from this surface, see `launcher/src-tauri/src/mcp_registration.rs::ALLOWED_ENV_KEYS`).
-5. Bundled defaults baked into `claude_mcp_servers/weaviate_mcp/server.py` (last-resort fallback; logged at WARNING when reached, and explicit empty-string env values for `KG_COLLECTION` are coerced to this default rather than used literally — see v0.2.27 fix).
+5. Bundled defaults baked into `claude_mcp_servers/weaviate_mcp/server.py` (last-resort fallback; logged at WARNING when reached, and explicit empty-string env values for `KG_COLLECTION` are coerced to this default rather than used literally).
 
-> **Safe add (v0.2.63+) and the env channels**: when a project is added with "Safe add" ON, VCO writes `.claude/settings.json` `env` and `.claude/env` UNCONDITIONALLY (so MCP routing and the `source .claude/env` shell channel are fully active), and leaves the project-root `.env` untouched — it may be VCS-tracked/committed. So under safe-add, `source .claude/env` gives you the full VCO env (KG_COLLECTION etc.) WITHOUT risking the committed `.env`; the intended `.env` keys are mirrored to an inert `.env.vco.reference` sidecar plus a `safe_add_skipped_env_merge` deferral. Per-project KG routing is NOT degraded by safe-add — only the `source ./.env` convenience is skipped.
+> **Safe add and the env channels**: when a project is added with "Safe add" ON, VCO writes `.claude/settings.json` `env` and `.claude/env` UNCONDITIONALLY (so MCP routing and the `source .claude/env` shell channel are fully active), and leaves the project-root `.env` untouched — it may be VCS-tracked/committed. So under safe-add, `source .claude/env` gives you the full VCO env (KG_COLLECTION etc.) WITHOUT risking the committed `.env`; the intended `.env` keys are mirrored to an inert `.env.vco.reference` sidecar plus a `safe_add_skipped_env_merge` deferral. Per-project KG routing is NOT degraded by safe-add — only the `source ./.env` convenience is skipped.
 
-**Shared-KG access gates**: every project reads the shared KG by default when `SHARED_KG_COLLECTION` is set (knowledge accumulates across all projects). Two symmetric per-project gates exist (canonical from v0.2.46 onward):
+**Shared-KG access gates**: every project reads the shared KG by default when `SHARED_KG_COLLECTION` is set (knowledge accumulates across all projects). Two symmetric per-project gates exist:
 - `SHARED_KG_READ_DISABLED=true` — excludes the shared collection from `hybrid_search` / `semantic_graph_search` results on this project. Reads fall back to the per-project KG only.
 - `SHARED_KG_WRITE_DISABLED=true` — refuses writes to the shared collection from this project (`store_knowledge_node(scope='shared')` returns an error rather than silently rerouting).
 
@@ -387,7 +387,7 @@ PowerShell variants (`*.ps1`) ship for Windows users.
   - `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction` — code entities
 - **Access**: Weaviate MCP tools (`hybrid_search`, `semantic_graph_search`, `store_knowledge_node`, `search_code_graph`, `query_code_structure`).
 
-**Configuration channel for `install.py` and its sync subprocess** (v0.2.52 V52-AJ): `install.py` runs `python sync_knowledge_graph.py` in a subprocess that does NOT read `.claude/env` (shell-sourced only by `BASH_ENV` for hook subprocesses) and does NOT read `.claude/settings.json` (Claude Code surface, MCP subprocesses only). The active-embedding choice for the install-time KG seed resolves via this chain:
+**Configuration channel for `install.py` and its sync subprocess**: `install.py` runs `python sync_knowledge_graph.py` in a subprocess that does NOT read `.claude/env` (shell-sourced only by `BASH_ENV` for hook subprocesses) and does NOT read `.claude/settings.json` (Claude Code surface, MCP subprocesses only). The active-embedding choice for the install-time KG seed resolves via this chain:
 
 1. **`ACTIVE_EMBEDDING` env var** in the shell that ran `install.py`. Set this BEFORE running install.py if you want to override (e.g. `ACTIVE_EMBEDDING=arctic python install.py --update`).
 2. **`launcher.db app_state[embedding.active_profile]`** — written by the launcher GUI's Identity tab → Embedding selector AND by install.py's preset chooser. Install.py reads this as fallback when the env is absent, then threads `ACTIVE_EMBEDDING` + `EMBEDDING_MODEL` into the `sync_knowledge_graph.py` subprocess env. This is the canonical channel for "I picked arctic in the launcher; install should honor that" without needing to set env vars.
@@ -397,7 +397,7 @@ If you find install.py running with the wrong embedding (e.g. stuck at 40-50% on
 
 ### Ollama Local LLM
 - **URL**: `http://localhost:11435`
-- **Purpose**: Local embeddings for Weaviate; code-embedding service CPU fallback. Not exposed as an MCP tool to Claude (the Ollama MCP was removed because Claude's native reasoning, `Read` tool, and built-in vision handle the same use cases at higher quality).
+- **Purpose**: Local embeddings for Weaviate; code-embedding service CPU fallback. Ollama is backend infrastructure, not an MCP tool — for reasoning, file reading, and vision, use Claude's native capabilities (`Read`, built-in vision) directly.
 - **Models**:
   - `qwen3-embedding:0.6b` — text embeddings (1024 dim, primary; needs `num_ctx=8192`)
   - KG-summary generation models (fallback only — see below): `gemma4:e4b` (low-VRAM/CPU), `qwen3.5:9b` (16 GB+ VRAM). Used by `generate-kg-summary.py` only when the `claude` CLI is not on PATH.
@@ -414,7 +414,7 @@ If you find install.py running with the wrong embedding (e.g. stuck at 40-50% on
 - **URL**: `http://127.0.0.1:7700` (default; configurable via `VCT_HUB_PORT`)
 - **Purpose**: Detached background service that resolves per-project configuration (KG collection, codegraph prefix, embedding model, secrets) for hooks, MCPs, and scripts. Started by `install.py`'s post-install step, by the `session-start-ensure-hub.sh` Claude Code hook on every session, and by the launcher GUI. Outlives the launcher GUI (close the GUI; hooks/MCPs/scripts still reach the hub).
 - **Lockfile**: `<vct_root_dir>/hub.pid` — single-instance per user. CLI: `vct-hub --start-if-not-running` / `--stop` / `--status` / `--register-boot` / `--unregister-boot` / `--boot-status` / `--foreground`.
-- **Auth**: bearer token at `<vct_root_dir>/hub.token` (regenerated every startup, mode 0o600), required on every `/api/v1/*` route except `/api/v1/health` (liveness probe — no auth). **v0.2.77:** the two per-project routes `/env` and `/config` require a PROJECT-SCOPED token `hub.token.<project_id>` — the coarse global `hub.token` is REFUSED there by default (the bundled resolvers already prefer the scoped token; the hub lazy-mints one for a mid-session project). Set `VCT_HUB_LEGACY_GLOBAL_ENV=1` on the hub to reopen the one-release compat window. Every OTHER `/api/v1/*` route still accepts the global token.
+- **Auth**: bearer token at `<vct_root_dir>/hub.token` (regenerated every startup, mode 0o600), required on every `/api/v1/*` route except `/api/v1/health` (liveness probe — no auth). The two per-project routes `/env` and `/config` require a PROJECT-SCOPED token `hub.token.<project_id>` — the coarse global `hub.token` is REFUSED there (the bundled resolvers already prefer the scoped token; the hub lazy-mints one for a mid-session project). Every OTHER `/api/v1/*` route accepts the global token.
 - **Key endpoints**:
   - `GET /api/v1/projects/{id-or-slug}/config` — resolver for KG collection / codegraph prefix / embedding model / access-matrix lists.
   - `GET /api/v1/projects/{id}/env` — secrets resolver.
@@ -437,7 +437,7 @@ A fifth MCP — **playwright** (browser automation) — is enabled by default an
 **Free-tier RL gate** — retrieval reranking skips RL when `feature_enabled("rl_retrieval") == False`. Pro/MAO licenses unlock RL; free-tier users get plain Weaviate cosine ordering. Nothing breaks when the gate is closed — retrieval just falls back to base scores.
 
 ### Hook System
-Located in `.claude/hooks/` — automated workflow actions. On Windows the bash hooks need WSL2 to fire automatically (the `.ps1` siblings are the native-Windows code path).
+Located in `.claude/hooks/` — automated workflow actions. On Windows the bash hooks need WSL2 to fire automatically (the `.ps1` siblings are the native-Windows code path). The list below is a representative subset by event; the full inventory is 45 hook scripts (43 event-registered in `.claude/settings.json`, plus `kg-sync-on-edit.sh` and `code-graph-incremental.sh` which are invoked by sibling hooks) — `ls .claude/hooks/*.sh` enumerates them.
 
 **SessionStart (startup)**:
 - `ensure-containers.sh` — auto-start Podman/Docker containers (Weaviate, Ollama, code-embed) if not running (background).
@@ -459,16 +459,12 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 - `diff-context-inject.sh` — section-level diffs of `CONTEXT_STATE.md` (70–90% token savings after the first prompt).
 
 **PreToolUse**:
-- `pre-tool-use.sh` — SSRF guard + shell-injection scan + Build Anchor / file backup + pre-Edit KG suggestion (matcher: `*`). (The dated `*_tool_usage.jsonl` file is written by the weaviate MCP's query logger, not this hook; the TOUCAN tool-call collector was retired in v0.2.77.)
-- `pre-edit-context-inject.sh` — KG + code-graph search before `Edit` (~1.3 s cold cache-miss, ~0.1 s warm cache-hit — v0.2.77 moved the cache replay before the search launch so a warm hit no longer pays for the query) (matcher: `Edit(*)`).
+- `pre-tool-use.sh` — SSRF guard + shell-injection scan + Build Anchor / file backup + pre-Edit KG suggestion (matcher: `*`).
+- `pre-edit-context-inject.sh` — KG + code-graph search before `Edit`; a warm cache hit replays without re-running the query (matcher: `Edit(*)`).
 
 **PostToolUse**:
 - `post-file-edit.sh` — auto-sync on file edits: `knowledge/` → KG, `docs/` → development collection, code files → code-graph queue; duplicate detection every 10 edits (matcher: `Edit(*)|Write(*)`).
-- `py_compile` — syntax check on Python writes (matcher: `Write(*.py)`).
-- `ruff` — `ruff check --fix --quiet` auto-fix (background) (matcher: `Edit(*.py)|Write(*.py)`).
-- `pyright` — type checking (background, non-blocking) (matcher: `Edit(*.py)|Write(*.py)`).
-- KG auto-sync — sync knowledge nodes to Weaviate on edit (matcher: `Edit(knowledge/**/*.md)|Write(knowledge/**/*.md)`).
-- document processing — process uploaded documents (matcher: `Write(documents/**/*.md)|Write(documents/**/*.pdf)`).
+- `py-compile-check.sh` — syntax check on Python writes (matcher: `Write(*.py)`).
 - `post-tool-security.sh` — credential scan on written files (matcher: `Edit(*)|Write(*)`).
 
 **ConfigChange**:
@@ -481,7 +477,7 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 **StopFailure**:
 - `stop-failure-notify.sh` — urgent notification + failure logging to `~/.claude/metrics/failures.jsonl`.
 
-**All available hook events** (as of Claude Code v2.1.81):
+**All available hook events**:
 
 | Event | Can Block? | Notes |
 |---|---|---|
@@ -521,7 +517,7 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 - Cross-project patterns visible to every workspace.
 - Auto-merged into `hybrid_search` results — read access is unconditional.
 - Write to it explicitly with `store_knowledge_node(scope="shared", ...)`. Per-project gate `SHARED_KG_WRITE_DISABLED=true` refuses such writes with a clear error (no silent reroute to project KG).
-- **Bundled curated set (v0.2.81, root-only)**: the orchestrator's ~115 curated nodes are materialized ONCE into the orchestrator root's `knowledge/` (== the shared collection, by adopt-and-route) via `install.py` Step 4d → the Step 7c KG-sync. Non-root projects do NOT receive per-project copies — they read the curated set via the shared-read fan-out. Setting `SHARED_KG_READ_DISABLED=true` on a project forgoes the bundled curated nodes for it (deliberate accept-loss; no fallback per-project copy). Existing pre-.81 per-project copies are left in place forever and their manifest entries quietly retired on the first post-.81 bundle update.
+- **Bundled curated set (root-only)**: the orchestrator's ~117 curated nodes are materialized ONCE into the orchestrator root's `knowledge/` (== the shared collection, by adopt-and-route). Non-root projects do NOT receive per-project copies — they read the curated set via the shared-read fan-out, which keeps ~117 duplicate `.md` files and their embeddings out of every project. Setting `SHARED_KG_READ_DISABLED=true` on a project forgoes the bundled curated nodes for it (deliberate accept-loss; there is no fallback per-project copy). See `knowledge/concepts/shared-knowledge-graph.md`.
 
 **3. Code Graph** (Weaviate collections):
 - **CodeModule** — files with imports and metrics (`path`, `language`, `module_summary`, `loc`, `complexity`).
@@ -564,7 +560,7 @@ KG and code graph look similar on the surface (both are per-project Weaviate col
 
 Code graph rows are not cross-project value by default. Source code from one project is rarely relevant to another project's reasoning — and worse, auto-merging would leak proprietary or sensitive source across tenants (a freelancer working on Client A's codebase + Client B's codebase in the same install does NOT want Client A's code surfacing in Client B's `search_code_graph` results). So code graph **opts in** to cross-project visibility via explicit `codegraph_access` grants (the launcher's Codegraph → CrossProjectAccessTab GUI), and the orchestrator-clone / public-repo-clone case is handled via `project_codegraph_extra_paths` (you tell your project's code graph "also walk THIS path under my own collection") rather than via a shared collection.
 
-**Practical implication for agents**: when you write code that traverses peer collections, use the right helper — KG fan-out reads `SHARED_KG_COLLECTION` + `VCT_KG_ACCESS_LIST`; code-graph fan-out reads only `VCT_CODE_GRAPH_ACCESS_LIST` (no shared default). If you find yourself thinking "let me add a `SHARED_CODE_GRAPH_COLLECTION` env for symmetry," STOP — that would invert this design and silently leak code across tenants. Grep confirms: `grep -rn "SHARED_CODE_GRAPH" launcher/ claude_mcp_servers/ vco_lib/` returns zero hits today; keep it that way.
+**Practical implication for agents**: when you write code that traverses peer collections, use the right helper — KG fan-out reads `SHARED_KG_COLLECTION` + `VCT_KG_ACCESS_LIST`; code-graph fan-out reads only `VCT_CODE_GRAPH_ACCESS_LIST` (no shared default). Do NOT add a `SHARED_CODE_GRAPH_COLLECTION` env "for symmetry" — that would invert this design and silently leak code across tenants. There is intentionally no such env anywhere in the codebase; keep it that way.
 
 ---
 
@@ -626,10 +622,12 @@ The installer drops a default set of agents into `.claude/agents/` and skills in
 **Invoke skills**: `/skill-name` (e.g. `/architect`, `/tdd`).
 **Spawn agents**: `@agent-name (Model)` via the Agent tool. (`Task` is a legacy alias for `Agent`.)
 
-**Model Selection**:
-- **Opus**: complex tradeoffs, security review, deep debugging — sparingly.
-- **Sonnet**: implementation, planning, guidance — default.
-- **Haiku**: simple tasks, calculations, tests — freely.
+**Model Selection** (subagents inherit the session model by default — usually the right choice):
+- **Inherit (default)**: planning, reasoning, code implementation, review — leave `model` unset so the subagent runs on the session's model.
+- **Fable**: the deepest-reasoning tier — final plans, adversarial reviews, the hardest architecture/debugging work, and authoring load-bearing instruction files. When the session already runs Fable, "inherit" delivers it; set `model: fable` explicitly when a Fable-quality result must not depend on the session's model.
+- **Opus**: implementation work packages in a plan→implement→review pipeline, heavy batch work you deliberately offload (e.g. multi-document editing in ONE agent with full context), complex tradeoffs, security review.
+- **Sonnet**: high-volume read-and-report fan-outs (audits, sweeps, translation) where breadth matters more than depth.
+- **Haiku**: mechanical single-purpose tasks — simple calculations, formatting, small verifications.
 
 **When to Spawn**:
 - Task parallel to current work.
@@ -652,7 +650,7 @@ Success Criteria: What "done" looks like
 Output: Where to save
 ```
 
-**Parallel agents on the same git repo**: when spawning 2+ agents that will edit the same working tree, give each one an isolated git worktree (Agent-tool `isolation: "worktree"`, or instruct the agent in its prompt to `git worktree add` and work there). Otherwise concurrent `git checkout` / staging operations clobber each other and you can lose work. Single-agent work doesn't need this. Cap at 3 parallel agents to avoid context overflow on return.
+**Parallel agents on the same git repo**: when spawning 2+ agents that will edit the same working tree, either give each one an isolated git worktree (Agent-tool `isolation: "worktree"`, or instruct the agent to `git worktree add` and work there) OR assign strictly disjoint file sets and forbid ALL git commands in their briefs (the coordinator runs git). Concurrent `git checkout` / `stash` / staging operations are tree-global and clobber each other — that is the failure the rule prevents. The cap of 3 concurrent agents applies to agents that EDIT the same tree; read-only agents (audits, searches) and agents on different repos may fan out wider.
 
 **Skill Frontmatter** (in `.claude/skills/NAME/SKILL.md`):
 - VS Code validates: `name`, `description`, `argument-hint`, `disable-model-invocation`, `user-invocable`, `compatibility`, `license`, `metadata`.
@@ -695,14 +693,11 @@ Output: Where to save
 
 Override symmetry is intentional: with project default `on`, `lean-ctx bypass "<cmd>"` still produces raw output. With default `off`, prefixing `lean-ctx -c "<cmd>"` still produces compressed output.
 
-**⚠️ Known footgun — silent stderr swallowing on `git commit` (auto-mitigated in v0.2.75)**: `lean-ctx`'s default mode can swallow stderr from `git commit` to the point where a hook-failed commit returns exit code 1 with **zero output**, making the failure invisible. Symptom: `git commit` returns exit 1 but no error message; subsequent `git status` shows the file is staged but uncommitted.
+**The rewrite hook auto-bypasses `git commit` and `git push`** — they run RAW (uncompressed) so their stderr is always visible. This matters because `lean-ctx`'s compression can otherwise swallow stderr from a hook-failed `git commit`, leaving it to return exit code 1 with zero output (the file stays staged but uncommitted, with no visible reason). The step-aside keys on the FINAL `&&`-segment, so `git log && git commit` also runs the commit raw, while `echo git commit` (not a real commit) is still compressed.
 
-**As of v0.2.75 the rewrite hook auto-bypasses `git commit` and `git push`** — they run RAW (uncompressed) so their stderr is always visible; you no longer need the manual workaround for those two commands. The step-aside keys on the FINAL `&&`-segment, so `git log && git commit` also runs the commit raw, while `echo git commit` (not a real commit) is still compressed.
-
-For any OTHER command that returns silent non-zero (rare — e.g. a bespoke tool with a failing hook), the manual bypass still applies:
+For any OTHER command that returns silent non-zero (rare — e.g. a bespoke tool with a failing hook), use the manual bypass so its stderr surfaces:
 
 ```bash
-# Only needed now for non-commit/push commands that exit non-zero silently:
 lean-ctx bypass "some-tool --that-fails-quietly"
 ```
 
@@ -783,12 +778,12 @@ The toast summarises the result ("5 files updated, 2 user-modifications preserve
 - Active plans: `.claude/context/plans/`.
 - Tag hierarchy: `knowledge/TAG_HIERARCHY.md`.
 - Score-tier reference: `knowledge/concepts/score-driven-retrieval-tiers.md`.
-- Plan mode: `claude --plan` or `/plan` (read-only exploration).
+- Plan mode: `claude --permission-mode plan` (read-only exploration).
 - Compact with focus: `/compact focus on <topic>`.
-- Fix from PR: `claude --from-pr <PR-URL>`.
+- Resume a PR-linked session: `claude --from-pr <PR>`.
 
 **Default ports**: Weaviate `8081` (HTTP) / `50052` (gRPC), Ollama `11435` (embeddings + KG-summary generation), code-embed service `11440` (optional GPU), vct-hub `7700`.
-**Default models**: text embeddings `qwen3-embedding:0.6b` (1024-dim); code embeddings selected by hardware-spec ladder — CodeSage-Large-v2 (2048-dim, VRAM >=12 GB) / `qwen3-embedding:0.6b` (1024-dim, VRAM >=6 GB or capable CPU) / `jina-embeddings-v2-base-code` (768-dim, CPU / low-VRAM floor, via Ollama). KG-summary generation uses a three-tier fallback in `generate-kg-summary.py`: (1) `claude` CLI on PATH (best quality, uses your Claude subscription / API key), (2) local Ollama models (`qwen3.5:9b` for 16 GB+ VRAM / `gemma4:e4b` for low-VRAM/CPU), (3) Anthropic API direct (if `ANTHROPIC_API_KEY` is set). Force a tier via `KG_SUMMARY_BACKEND=cli|ollama|api|skip`.
+**Default models**: text embeddings `qwen3-embedding:0.6b` (1024-dim); code embeddings selected by hardware-spec ladder — CodeSage-Large-v2 (2048-dim, VRAM >=12 GB) / `qwen3-embedding:0.6b` (1024-dim, VRAM >=6 GB or capable CPU) / `jina-embeddings-v2-base-code` (768-dim, CPU / low-VRAM floor, via Ollama). KG-summary generation uses a three-tier fallback in `generate-kg-summary.py`: (1) `claude` CLI on PATH (best quality, uses your Claude subscription / API key), (2) local Ollama models (`qwen3.5:9b` for 16 GB+ VRAM / `gemma4:e4b` for low-VRAM/CPU), (3) Anthropic API direct (if `ANTHROPIC_API_KEY` is set). Force a tier via `KG_SUMMARY_BACKEND=cli|ollama|api|openai|skip` (`api` = Anthropic API, `openai` = OpenAI, consent-gated).
 
 ---
 
@@ -836,7 +831,7 @@ VCO ships a secrets primitive so agents never scrape the environment for tokens.
 
 If you're seeing this orchestrator for the first time, here's the 60-second mental model:
 
-- **What it is**: an infrastructure layer for Claude Code that adds persistent memory (KG), semantic code search (code graph), and ~36 hooks that run automatically. You keep using Claude Code the way you already do; the orchestrator works in the background via hooks and MCP servers.
+- **What it is**: an infrastructure layer for Claude Code that adds persistent memory (KG), semantic code search (code graph), and 45 hooks that run automatically. You keep using Claude Code the way you already do; the orchestrator works in the background via hooks and MCP servers.
 - **What runs locally**: Weaviate (vector DB) on `:8081`, Ollama (local LLM + embeddings) on `:11435`. Both started automatically by the `SessionStart` hook if not already running.
 - **Free vs Pro**: this repo is fully functional standalone. Optional paid modules (RL retrieval reranking, MAO multi-agent runtime, specialist agent packs) activate only when a license key is present. Without a key, retrieval falls back to cosine ordering — nothing breaks.
 
