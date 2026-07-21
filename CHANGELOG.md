@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **lean-ctx never wraps credential-bearing commands (SEC-RAW)**: the
+  `lean-ctx-rewrite` hook pair now scans each Bash command for credential
+  patterns (auth headers, `user:pass` flags, secret-shaped env-var names,
+  well-known token literals, the vct-secrets tooling) and runs any match raw,
+  uncompressed — lean-ctx's own wrap heuristic is not credential-aware and
+  wrapped inline auth commands could fail with valid tokens.
+
 ## [0.2.86] - 2026-07-21
 
 ### Changed — documentation refresh (repo-wide)
