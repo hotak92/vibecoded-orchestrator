@@ -275,7 +275,7 @@ These are used **exclusively** to refine the RL reranker. The training pipeline 
 
 Embeddings are aggregated, irreversible representations — we can't reconstruct the source text from the vectors we receive.
 
-**Toggle off anytime**: Settings → Telemetry → Disable, or `VCT_TELEMETRY=0` in `.env`. Disabling stops collection immediately; previously-collected data isn't deleted retroactively unless you email `privacy@vibecodedtools.it`.
+**Toggle off anytime**: Settings → Telemetry → Disable, or `VCT_TELEMETRY=0` in `.env`. Disabling stops collection immediately; previously-collected data isn't deleted retroactively unless you email `team@vibecodedtools.com`.
 
 ## Licensing
 
