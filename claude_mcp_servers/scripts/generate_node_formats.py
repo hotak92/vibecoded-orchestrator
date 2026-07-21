@@ -249,7 +249,18 @@ def get_chunks_from_weaviate(title: str) -> list[tuple[int, str]]:
 
 
 def content_hash(text: str) -> str:
-    """Short stable hash for dedup against re-runs (matches generate-kg-summary.py).
+    """Canonical short stable hash for dedup against re-runs.
+
+    MUST be called with the FULL file text (frontmatter + body, unstripped) so
+    the stored `content_hash` equals the CANONICAL scheme used by BOTH
+    `generate-kg-summary.py` (runtime) and
+    `scripts/build_shipped_kg_node_formats.py` (the shipped-sidecar builder):
+    `sha256(full_file_text)[:16]`. The builder looks up private sidecar entries
+    by this exact key, so a mismatch makes freshly generated summaries INVISIBLE
+    to the ship path (they get reported stale/missing and the user regenerates
+    locally — a quiet degradation). See the 2026-07-20 sidecar-hash-mismatch KG
+    node; before that fix this generator hashed `body.strip()` (frontmatter
+    stripped) instead of the full text, diverging from canonical.
 
     STORAGE-LAYER hash: answers "is this sidecar already current so I can skip
     re-generating it" — deliberately sha256[:16], distinct from the RETRIEVAL
@@ -259,6 +270,80 @@ def content_hash(text: str) -> str:
     converged. See the v0.2.70 dedup triage.
     """
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _legacy_content_hash(body: str) -> str:
+    """The PRE-2026-07-20 storage hash scheme: sha256(body.strip())[:16].
+
+    Kept for exactly one purpose — detecting sidecar entries keyed under the old
+    (frontmatter-stripped body) scheme so `rekey_legacy_entries` can silently
+    migrate them to the canonical full-text key WITHOUT regenerating the summary.
+    Do NOT use this for storing new entries; `content_hash(full_file_text)` is
+    canonical.
+    """
+    return hashlib.sha256(body.strip().encode("utf-8")).hexdigest()[:16]
+
+
+def rekey_legacy_entries(db: dict) -> int:
+    """Silently re-key sidecar entries from the legacy hash scheme to canonical.
+
+    For each entry whose stored `content_hash` does NOT match the canonical
+    full-text hash of its node file, but DOES match the legacy `body.strip()`
+    hash of that same file, overwrite the stored hash with the canonical value —
+    WITHOUT regenerating the (still-valid) summary. This preserves skip-unchanged
+    correctness across the transition: a node that was summarized under the old
+    scheme and is byte-unchanged will now be recognized as current, not
+    regenerated.
+
+    Entries that match neither scheme (genuinely stale, or already canonical) are
+    left untouched — the normal skip/regenerate logic handles them.
+
+    F-13 (intentional): a node whose FRONTMATTER-only changed since its last
+    summarize still matches the legacy body-hash (the legacy scheme hashed the
+    body alone), so it is re-keyed to canonical-of-current-file WITHOUT
+    regenerating. This is deliberate, not a missed-regeneration bug: the summary
+    describes the BODY, which is unchanged, and the old body-only scheme would
+    never have regenerated on a frontmatter-only edit either.
+
+    Returns the number of entries re-keyed (for logging).
+    """
+    rekeyed = 0
+    for rel_path, entry in db.items():
+        stored = entry.get("content_hash")
+        if not stored:
+            continue
+        # Resolve the node file for this entry. Keys are stored relative to the
+        # project root (e.g. "knowledge/concepts/foo.md"); the KNOWLEDGE_DIR
+        # override maps <root>/knowledge → KNOWLEDGE_DIR, so strip a leading
+        # "knowledge/" and resolve under KNOWLEDGE_DIR.
+        #
+        # F-4: normalize `\`→`/` first — on Windows the DB keys come from
+        # `str(Path.relative_to(...))` and use `\`, which would never match the
+        # `knowledge/` prefix (the same v0.2.81/v0.2.85 manifest-separator
+        # lesson). Without this, Windows + --knowledge-dir override falls to the
+        # PROJECT_ROOT branch, the node file isn't found, the entry is skipped,
+        # and legacy entries silently REGENERATE (LLM cost) instead of re-keying.
+        rel = rel_path.replace("\\", "/")
+        node_prefix = KNOWLEDGE_DIR.name + "/"
+        if rel.startswith(node_prefix):
+            node_file = KNOWLEDGE_DIR / rel[len(node_prefix):]
+        else:
+            node_file = PROJECT_ROOT / rel
+        if not node_file.is_file():
+            continue
+        try:
+            full_text = node_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        canonical = content_hash(full_text)
+        if stored == canonical:
+            continue  # already canonical
+        parsed = parse_frontmatter(node_file)
+        body = parsed[1] if parsed else full_text
+        if stored == _legacy_content_hash(body):
+            entry["content_hash"] = canonical
+            rekeyed += 1
+    return rekeyed
 
 
 def parse_frontmatter(file_path: Path) -> Optional[tuple[str, str, str]]:
@@ -290,12 +375,47 @@ def load_formats_db() -> dict:
 
 
 def save_formats_db(db: dict) -> None:
-    """Save the sidecar JSON formats database."""
+    """Save the sidecar JSON formats database ATOMICALLY.
+
+    F-7: `.node_formats.json` holds EVERY node's LLM summary; a plain
+    truncate-write here means a kill mid-save corrupts the whole DB
+    (regenerable, but at full LLM-regeneration cost). Write to a tempfile in
+    the SAME directory (so os.replace stays on one filesystem), fsync, then
+    os.replace into place — either the old DB survives intact or the fully
+    written new one does, never a truncated file. Self-contained (no vco_lib
+    import) because this script runs from the MCP venv, which is not
+    guaranteed to have vco_lib on its path; the primitive is trivial. This
+    body is kept BYTE-IDENTICAL between the public and private copies of the
+    script.
+    """
     import json
-    FORMATS_FILE.write_text(
-        json.dumps(db, indent=2, ensure_ascii=False),
-        encoding="utf-8",
+    import os
+    import tempfile
+
+    payload = json.dumps(db, indent=2, ensure_ascii=False)
+    parent = FORMATS_FILE.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=FORMATS_FILE.name + ".",
+        suffix=".tmp",
+        dir=str(parent),
     )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(payload)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                # fsync can fail on pseudo-filesystems; don't fail the write.
+                pass
+        os.replace(tmp_path, str(FORMATS_FILE))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def has_formats(rel_path: str, db: dict, c_hash: str | None = None) -> bool:
@@ -378,8 +498,13 @@ def process_node(
     frontmatter, body, title = result
     rel_path = str(file_path.relative_to(PROJECT_ROOT)) if file_path.is_relative_to(PROJECT_ROOT) else str(file_path)
 
+    # Summarize the body (frontmatter is metadata, not prose to summarize) but
+    # HASH the full file text — canonical scheme, shared with the runtime
+    # generate-kg-summary.py and the shipped-sidecar builder. Hashing the
+    # stripped body here would key entries under a scheme the builder can't
+    # look up (2026-07-20 sidecar-hash-mismatch fix).
     full_content = body.strip()
-    c_hash = content_hash(full_content)
+    c_hash = content_hash(file_path.read_text(encoding="utf-8"))
 
     # Skip if entry is complete AND content hash matches (no edits since last gen)
     if not force and has_formats(rel_path, db, c_hash):
@@ -493,6 +618,16 @@ def main() -> None:
     # Load sidecar formats database
     db = load_formats_db()
 
+    # Silently migrate any entries still keyed under the legacy body.strip()
+    # hash scheme to the canonical full-text key (no summary regeneration). This
+    # preserves skip-unchanged correctness across the 2026-07-20 hash-scheme
+    # transition — a byte-unchanged node summarized under the old scheme is now
+    # recognized as current instead of being needlessly regenerated.
+    n_rekeyed = rekey_legacy_entries(db)
+    if n_rekeyed:
+        print(f"Re-keyed {n_rekeyed} legacy sidecar entr"
+              f"{'y' if n_rekeyed == 1 else 'ies'} to canonical full-text hash.")
+
     # Collect files to process
     if args.all:
         files = find_all_nodes()
@@ -530,8 +665,10 @@ def main() -> None:
             msg = status.replace("error:", "")
             print(f"[{i}/{total}] ERROR {rel}: {msg}")
 
-    # Save the formats database
-    if generated > 0 and not args.dry_run:
+    # Save the formats database when anything changed: new summaries generated,
+    # OR legacy entries re-keyed to canonical (the re-key must persist even if no
+    # node needed regeneration, else the migration is lost on the next run).
+    if (generated > 0 or n_rekeyed > 0) and not args.dry_run:
         save_formats_db(db)
         print(f"Saved formats to {FORMATS_FILE}")
 
