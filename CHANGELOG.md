@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.86] - 2026-07-21
+
+### Changed — documentation refresh (repo-wide)
+
+- **Full documentation pass against the current codebase**: README, `docs/`
+  (features, install, architecture, licensing), bundled agent/skill templates,
+  and the 117 curated knowledge-graph template nodes were reviewed and brought
+  in line with the shipped v0.2.85 behavior. Counts, ports, model names, MCP
+  surface, and install-flow descriptions now match the source of truth
+  (44 agents / 53 skills / 45 hooks / 4 MCP servers + playwright).
+- **README rewritten for accessibility** — same coverage, ~10% shorter, with a
+  per-system "what you feel" framing; telemetry-deletion contact routes to the
+  wired `team@` alias.
+- **MCP tool descriptions rewritten to the tool-definition standard**
+  (`weaviate-kg`, `search`): detailed when/when-not guidance and accurate
+  parameter semantics — including `semantic_graph_search`'s connected-node
+  behavior, which the old text described incorrectly.
+- **Instruction-file templates state current systems only**
+  (`ORCHESTRATOR-CLAUDE.md.template`, `CLAUDE.md.template`): full model-selection
+  guidance, exact hook inventory (45 = 43 event-registered + 2 hook-invoked),
+  parallel-agent rules scoped to editors on a shared tree, current CLI flags.
+- `docs/DEPENDENCY_LICENSES.md` regenerated against the reference environment
+  (84 verified rows); `coder`/`expert-coder` agent templates deduplicated;
+  `claude-code-cli-headless` knowledge node refreshed.
+
+### Fixed
+
+- **KG-summary sidecar hash scheme** (`generate_node_formats.py`): the generator
+  stored a body-only hash while the shipped-sidecar builder and runtime
+  summarizer key on the canonical full-text `sha256[:16]` — so shipped summaries
+  could never be matched for reuse and were silently regenerated. The generator
+  now hashes the full file text, re-keys legacy entries in place (no
+  regeneration cost), normalizes Windows path separators in re-key lookups, and
+  writes the sidecar atomically. Regression tests pin the `process_node` call
+  site, not just the hash function.
+
+### Added
+
+- **`vco_lib.atomic.atomic_copy_file`** — shared temp+fsync+rename copy
+  primitive with `copy2` metadata semantics and symlink-safe ancestor
+  redirection. The 7 `install.py` live-overwrite `shutil.copy2` sites (dist
+  binaries, adopted project files, lean-ctx companion) now use it, so an
+  interrupted copy can no longer truncate a live destination.
+- **RL-13 supervisor image-variant live smoke test** (env-gated, `#[ignore]`):
+  pins variant-aware pre-pull against a real container runtime, with a
+  runtime-agnostic cache probe (podman `image exists` / docker `image inspect`).
+
 ## [0.2.85] - 2026-07-17
 
 ### Changed — root/project install parity (root delegates to the ONE bundle engine)
