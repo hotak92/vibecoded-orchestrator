@@ -177,6 +177,91 @@ def test_sh_source_mentions_must_match_ps1():
         assert "MUST MATCH" in src
 
 
+# ─── SEC-RAW: credential-bearing commands step aside (2026-07-21) ────────
+# lean-ctx's own wrap heuristic is not credential-aware; wrapped inline
+# commands carrying auth material have 401'd with valid tokens and a
+# multi-line wrap corruption once leaked a secret into error output. The
+# hook now scans the WHOLE command against a credential pattern list and
+# emits nothing (raw) on any hit — before lean-ctx is ever invoked.
+
+
+class TestSecRawSecretsStepAside:
+    def _run_with_binary(self, cmd: str, tmp_path: Path):
+        home = tmp_path / "home"
+        _make_fake_lean_ctx(home / ".cargo" / "bin")
+        return _run_sh(cmd, cargo_bin=home / ".cargo" / "bin",
+                       strip_path=True, fake_home=home)
+
+    @pytest.mark.parametrize("cmd", [
+        'curl -s -H "Authorization: Bearer ATATTfaketok12345" https://x.test/',
+        "curl -s -u user@example.test:ATATTfaketok12345 https://x.test/",
+        'curl -H "X-Api-Key: abcdef123456" https://x.test/',
+        'T=$JIRA_TOKEN; curl -s https://x.test/',
+        "MY_API_KEY=abc123 ./run.sh",
+        "vct exec --secret k=ENV -- cmd",
+        ".claude/scripts/vct_secrets_resolve.sh . github_pat",
+        "echo ghp_0123456789abcdef",
+        'wget --password hunter2 https://x.test/',
+        # credential in a NON-final && segment still disqualifies the wrap
+        'curl -u a@b.test:tok123 https://x.test/ && echo done',
+    ])
+    def test_credential_command_passes_through_raw(self, cmd, tmp_path):
+        res = self._run_with_binary(cmd, tmp_path)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() == "", (
+            f"credential-bearing command must run raw, got rewrite for: {cmd}"
+        )
+
+    @pytest.mark.parametrize("cmd", [
+        "ls -la",
+        "grep -rn pattern src/",
+        "curl -s https://example.test/health",
+        "python3 -m pytest tests/ -q",
+    ])
+    def test_benign_command_still_rewritten(self, cmd, tmp_path):
+        res = self._run_with_binary(cmd, tmp_path)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() != "", (
+            f"benign command must still be rewritten: {cmd}"
+        )
+
+
+def _extract_patterns(src: str, quote: str) -> list[str]:
+    """Pull the pattern literals between the SEC-RAW markers. `quote` is the
+    string delimiter used by that language ('"' for the sh-embedded python
+    raw strings, "'" for PowerShell)."""
+    begin = src.index("SEC-RAW-PATTERNS-BEGIN")
+    end = src.index("SEC-RAW-PATTERNS-END")
+    block = src[begin:end]
+    out = []
+    for line in block.splitlines():
+        line = line.strip().rstrip(",")
+        if quote == '"' and line.startswith('r"') and line.endswith('"'):
+            out.append(line[2:-1])
+        elif quote == "'" and line.startswith("'") and line.endswith("'"):
+            out.append(line[1:-1])
+    return out
+
+
+def test_sec_raw_pattern_list_parity_sh_ps1():
+    """The credential pattern lists in the two siblings are byte-identical
+    (C-mirror discipline: same data, thin per-language wrapper)."""
+    sh_patterns = _extract_patterns(SH_HOOK.read_text(encoding="utf-8"), '"')
+    ps1_patterns = _extract_patterns(PS1_HOOK.read_text(encoding="utf-8"), "'")
+    assert sh_patterns, "sh SEC-RAW pattern block missing or unparsed"
+    assert sh_patterns == ps1_patterns, (
+        "SEC-RAW pattern lists diverged between .sh and .ps1"
+    )
+
+
+def test_sec_raw_patterns_are_valid_in_python_re():
+    """Every shipped pattern must compile — a bad pattern would make the
+    scan raise and silently fall back to the compressed path."""
+    import re as _re
+    for p in _extract_patterns(SH_HOOK.read_text(encoding="utf-8"), '"'):
+        _re.compile(p)
+
+
 # ─── pwsh-gated .ps1 behavioural parity ──────────────────────────────────
 
 
@@ -217,6 +302,15 @@ class TestPs1Parity:
         res = self._run_ps1("ls -la", tmp_path, on_path=True)
         assert res.returncode == 0, res.stderr
         assert res.stdout.strip() != "", "ps1 non-git command must rewrite"
+
+    def test_ps1_credential_command_passes_through_raw(self, tmp_path):
+        res = self._run_ps1(
+            'curl -s -H "Authorization: Bearer ATATTfaketok12345" https://x.test/',
+            tmp_path, on_path=True)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() == "", (
+            "ps1 credential-bearing command must run raw"
+        )
 
 
 # ─── vco_lib.install_companions.ensure_discovered_lean_ctx_on_path ───────

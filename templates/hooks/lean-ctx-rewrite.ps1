@@ -83,6 +83,17 @@ try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 # `git log && git commit` passes through (the commit governs) while
 # `echo git commit` (benign echo) is still compressed. MUST MATCH
 # lean-ctx-rewrite.sh (Python parse there; native ConvertFrom-Json here).
+#
+# SEC-RAW (2026-07-21): credential-bearing commands ALSO run raw. lean-ctx's
+# wrap heuristic is not credential-aware: wrapped inline commands carrying
+# auth material have returned 401 with VALID tokens, and a multi-line wrap
+# corruption once leaked a secret into error output. Deterministic guard at
+# THIS layer: any credential pattern anywhere in the command (auth headers,
+# user:pass flags, secret-shaped env-var names, well-known token literals,
+# the vct-secrets tooling) -> emit nothing, command runs raw. Scans the
+# WHOLE command, not just the final `&&` segment. Pattern list between
+# SEC-RAW-PATTERNS-BEGIN/END MUST MATCH lean-ctx-rewrite.sh (parity-pinned
+# by tests/test_d11_trimb_lean_ctx_discovery_and_git_bypass.py).
 if ($HookStdin) {
     try {
         $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
@@ -91,6 +102,25 @@ if ($HookStdin) {
             $cmd = [string]$payload.tool_input.command
         }
         if ($cmd -and $cmd.Trim()) {
+            # SEC-RAW-PATTERNS-BEGIN
+            $secretPatterns = @(
+                '(?i)\bauthorization\s*:',
+                '(?i)\b(x-api-key|private-token|x-auth-token|api-key)\s*:',
+                '(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}',
+                '(?i)\bbasic\s+[A-Za-z0-9+/=]{8,}',
+                '(?:^|\s)(?:-u|--user|--proxy-user)\s+[^\s:]+:\S',
+                '--(?:password|http-password|api-key|token|access-token)[= ]',
+                '\$\{?[A-Za-z_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|CREDENTIAL)',
+                '\b[A-Za-z_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|CREDENTIAL)[A-Za-z_]*=\S',
+                '\bvct\s+(?:exec|get)\b',
+                'vct_secrets_resolve',
+                'agent_secrets',
+                '\b(?:ATATT[A-Za-z0-9_=-]{8,}|ghp_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|ghs_[A-Za-z0-9]{8,}|glpat-[A-Za-z0-9_-]{8,}|xox[bpoas]-[A-Za-z0-9-]{8,}|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{20,})'
+            )
+            # SEC-RAW-PATTERNS-END
+            foreach ($p in $secretPatterns) {
+                if ([regex]::IsMatch($cmd, $p)) { exit 0 }
+            }
             $seg = ($cmd -split '&&')[-1].Trim()
             $toks = $seg -split '\s+'
             if ($toks.Count -ge 2 -and $toks[0] -eq 'git' -and

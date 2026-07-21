@@ -94,17 +94,33 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # `&&`-segment so `git log && git commit` still passes through (the commit
 # governs) while `echo git commit` (a benign echo, not a real commit) is
 # still compressed. MUST MATCH templates/hooks/lean-ctx-rewrite.ps1.
+#
+# SEC-RAW (2026-07-21): credential-bearing commands ALSO run raw. lean-ctx's
+# wrap heuristic is not credential-aware: wrapped inline commands carrying
+# auth material have returned 401 with VALID tokens (field incident, Jira
+# basic-auth curl), and a multi-line wrap corruption once leaked a secret
+# into error output. The guard is deterministic at THIS layer: if ANY part
+# of the command matches a credential pattern (auth headers, user:pass
+# flags, secret-shaped env-var names, well-known token literals, the
+# vct-secrets tooling), the hook emits nothing and the command runs raw.
+# Losing compression for one call is strictly safer than corrupting or
+# leaking a credential. Unlike the git gate, this scans the WHOLE command,
+# not just the final `&&` segment — a credential anywhere disqualifies the
+# wrap. Pattern list between SEC-RAW-PATTERNS-BEGIN/END MUST MATCH
+# lean-ctx-rewrite.ps1 (parity-pinned by
+# tests/test_d11_trimb_lean_ctx_discovery_and_git_bypass.py).
 _lc_cmd="$(cat 2>/dev/null || true)"
 if [ -n "$_lc_cmd" ]; then
     PYBIN_BP="$(command -v python3 || command -v python || true)"
     if [ -n "$PYBIN_BP" ]; then
-        # Parse tool_input.command, take the last `&&` segment, strip lead
-        # whitespace, and check its leading tokens. Python keeps the JSON +
-        # segment logic robust vs brittle shell string-splitting. Prints
-        # "raw" when we must step aside, empty otherwise. Conservative: any
-        # parse failure prints nothing → normal (compressed) path continues.
+        # Parse tool_input.command, run the SEC-RAW credential scan over the
+        # whole command, then the TRIM-b git check on the last `&&` segment.
+        # Python keeps the JSON + regex logic robust vs brittle shell string
+        # splitting. Prints "raw" when we must step aside, empty otherwise.
+        # Conservative: any parse failure prints nothing → normal
+        # (compressed) path continues.
         _lc_decision="$(printf '%s' "$_lc_cmd" | "$PYBIN_BP" -c '
-import json, sys
+import json, re, sys
 try:
     d = json.load(sys.stdin)
     cmd = (d.get("tool_input") or {}).get("command", "")
@@ -112,6 +128,26 @@ except Exception:
     sys.exit(0)
 if not isinstance(cmd, str) or not cmd.strip():
     sys.exit(0)
+# SEC-RAW-PATTERNS-BEGIN
+_SECRET_PATTERNS = (
+    r"(?i)\bauthorization\s*:",
+    r"(?i)\b(x-api-key|private-token|x-auth-token|api-key)\s*:",
+    r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}",
+    r"(?i)\bbasic\s+[A-Za-z0-9+/=]{8,}",
+    r"(?:^|\s)(?:-u|--user|--proxy-user)\s+[^\s:]+:\S",
+    r"--(?:password|http-password|api-key|token|access-token)[= ]",
+    r"\$\{?[A-Za-z_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|CREDENTIAL)",
+    r"\b[A-Za-z_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|CREDENTIAL)[A-Za-z_]*=\S",
+    r"\bvct\s+(?:exec|get)\b",
+    r"vct_secrets_resolve",
+    r"agent_secrets",
+    r"\b(?:ATATT[A-Za-z0-9_=-]{8,}|ghp_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|ghs_[A-Za-z0-9]{8,}|glpat-[A-Za-z0-9_-]{8,}|xox[bpoas]-[A-Za-z0-9-]{8,}|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{20,})",
+)
+# SEC-RAW-PATTERNS-END
+for _p in _SECRET_PATTERNS:
+    if re.search(_p, cmd):
+        sys.stdout.write("raw")
+        sys.exit(0)
 # FINAL && segment governs (last command actually run in the chain).
 seg = cmd.split("&&")[-1].strip()
 toks = seg.split()
