@@ -32,6 +32,11 @@ Public surface:
 * :func:`atomic_write_text` — write str to file, atomically.
 * :func:`atomic_write_bytes` — write bytes to file, atomically.
 * :func:`atomic_write_json` — write JSON object, atomically.
+* :func:`atomic_copy_file` — copy a file to a destination atomically,
+  metadata-preserving (``copy2`` semantic), with an optional V47-B
+  symlink-safe redirect and a best-effort ``soft_fail`` mode. Added in
+  the pre-beta cycle (WP-E) as the shared replacement for install.py's
+  raw ``shutil.copy2`` overwrite sites.
 * :func:`exclusive_file_lock` — cross-platform exclusive file lock
   (``contextmanager``); best-effort no-lock on platforms without
   ``fcntl`` (Windows).
@@ -57,9 +62,10 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
 import tempfile
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Optional
 
 
 def atomic_write_text(
@@ -143,6 +149,187 @@ def atomic_write_bytes(
         except OSError:
             pass
         raise
+
+
+def atomic_copy_file(
+    src: Path,
+    dst: Path,
+    *,
+    preserve_metadata: bool = True,
+    symlink_safe: bool = False,
+    fsync: bool = True,
+    soft_fail: bool = False,
+    on_error: Optional[Any] = None,
+) -> Optional[Path]:
+    """Copy the file ``src`` to ``dst`` atomically, metadata-preserving.
+
+    The drop-in replacement for ``shutil.copy2(src, dst)`` at call sites
+    that overwrite (or may overwrite) an existing destination: unlike
+    ``copy2``, which ``open(dst, "wb")``-truncates the FINAL path and
+    streams into it, this writes the bytes to a tempfile in ``dst``'s
+    parent directory, fsyncs, then ``os.replace``'s it into place. A
+    kill / power-loss / disk-full mid-copy therefore leaves either the
+    old file intact or the fully-written new one — never a truncated
+    node the next step would consume.
+
+    Args:
+        src: Source file to copy (read whole into memory once, like the
+            small config/binary files at the migrated install.py sites).
+        dst: Destination path. Overwritten atomically if it exists.
+        preserve_metadata: When True (default) copy ``src``'s stat
+            metadata (mtime, mode, …) onto the result via
+            :func:`shutil.copystat` — the ``copy2`` semantic. A
+            ``copystat`` failure is NOT swallowed: it PROPAGATES (raising
+            by default, or routed through ``soft_fail`` / ``on_error``
+            when set) so partial-success — a dest left at ``mkstemp``'s
+            0600 mode with ``src``'s mtime un-applied — is never silent.
+            This matches ``shutil.copy2``, which also propagates copystat
+            errors (F-2).
+        symlink_safe: When True, if ``dst`` (or any ancestor directory
+            under it) is a symlink, VCO does NOT write through it. The
+            redirect happens at the SAME LEVEL the symlink lives, matching
+            the NEW-8 convention at ``project_init._write_file_atomic``:
+            if ``dst`` itself is the symlink the bytes land at ``dst``'s
+            ``.vco-new`` sibling; if an ANCESTOR is the symlink the bytes
+            land under that ancestor's ``.vco-new`` sibling with the path
+            tail replicated (``.claude`` symlinked + ``dst
+            == .claude/agents/x`` → ``.claude.vco-new/agents/x``). Either
+            way nothing is written through the link into its target, and
+            the redirect Path is returned. When False (default) the caller
+            is responsible for any symlink decision BEFORE calling (the
+            install.py adopt-project sites already gate on
+            ``is_symlink_blocking`` / preserve upstream, so they pass False
+            to stay behaviour-identical).
+        fsync: Whether to fsync the tempfile before rename (default
+            True). See :func:`atomic_write_bytes`.
+        soft_fail: When True, an ``OSError`` / ``shutil.Error`` during
+            the copy is swallowed (``on_error`` is invoked if given) and
+            ``None`` is returned instead of raising — for best-effort
+            call sites that already sat inside a ``try/except OSError``.
+            When False (default) the exception propagates, for load-
+            bearing copies.
+        on_error: Optional callable invoked with the caught exception
+            when ``soft_fail`` swallows it (e.g. a logger). Ignored when
+            ``soft_fail`` is False.
+
+    Returns:
+        The Path the bytes actually landed at: normally ``dst``; the
+        ``.vco-new`` redirect target when ``symlink_safe`` redirected
+        around a symlink (leaf sibling for a symlinked ``dst``, or the
+        ancestor's ``.vco-new`` sibling + replicated tail for a symlinked
+        ancestor); or ``None`` when ``soft_fail`` swallowed an error.
+
+    Note:
+        This helper reads ``src`` fully into memory. That matches every
+        migrated call site (config JSON, per-file bundle nodes, launcher
+        / hub binaries in the tens-of-MB range). It is NOT intended for
+        arbitrarily-large streams; those should keep a streaming copy.
+    """
+    src = Path(src)
+    dst = Path(dst)
+    target = dst
+    try:
+        if symlink_safe:
+            # V47-B: never write through a symlink at the destination or
+            # any ancestor under it. Redirect at the SAME LEVEL the
+            # symlink lives — mirroring the established NEW-8 convention at
+            # project_init.py:4540-4590 so the tempfile+os.replace never
+            # touch the symlink's target directory:
+            #   * dst itself is a symlink  → `.vco-new` sibling of dst.
+            #   * an ANCESTOR is a symlink → `.vco-new` sibling of THAT
+            #     ancestor, with the path tail below it replicated
+            #     (e.g. `.claude` symlinked, dst `.claude/agents/coder.md`
+            #     → `.claude.vco-new/agents/coder.md`). A leaf-level
+            #     `.vco-new` sibling would still sit INSIDE the symlinked
+            #     directory and land bytes in the link's target — the bug
+            #     F-1 fixes.
+            redirect = _symlink_safe_redirect_target(dst)
+            if redirect is not None:
+                target = redirect
+
+        data = src.read_bytes()
+        atomic_write_bytes(target, data, fsync=fsync)
+        if preserve_metadata:
+            # F-2: match copy2's failure semantics — copy2 PROPAGATES a
+            # copystat error, so we must NOT silently swallow it. Let it
+            # flow to the outer handler below, which raises (default) or
+            # routes through soft_fail/on_error. A silent pass here left the
+            # dest at mkstemp's 0600 mode + src mtime un-applied with no
+            # signal (partial-success drift). NOTE: the bytes are already
+            # durably written by this point, so under soft_fail the dest is
+            # a complete file with best-effort (possibly un-copied) metadata
+            # — still safer than a truncated copy2.
+            shutil.copystat(str(src), str(target))
+        return target
+    except (OSError, shutil.Error) as exc:
+        if soft_fail:
+            if on_error is not None:
+                try:
+                    on_error(exc)
+                except Exception:  # noqa: BLE001 — logger must not re-raise
+                    pass
+            return None
+        raise
+
+
+def _symlink_safe_redirect_target(dst: Path) -> Optional[Path]:
+    """Compute the V47-B ``.vco-new`` redirect target for ``dst`` when a
+    symlink blocks the write, or ``None`` when no symlink is in the way.
+
+    Mirrors the established NEW-8 convention at
+    :func:`vco_lib.project_init._write_file_atomic` (project_init.py:4540-4590)
+    so the redirect happens at the SAME LEVEL the symlink lives, never at
+    the leaf when the symlink is an ancestor:
+
+      * ``dst`` itself is a symlink  → ``compute_vco_new_path(dst)``
+        (leaf sibling — correct, the symlink is the leaf).
+      * an ANCESTOR of ``dst`` is a symlink → ``.vco-new`` sibling of THAT
+        ancestor with the path tail below it replicated. E.g. ``.claude``
+        is a symlink and ``dst == .claude/agents/coder.md`` →
+        ``.claude.vco-new/agents/coder.md``. This is the key correctness
+        point of F-1: a leaf-level ``child.txt.vco-new`` would still resolve
+        INSIDE the symlinked directory, so the bytes would land in the
+        link's target — which the "hands-off symlinks" rule forbids.
+
+    Returns the redirect target Path, or ``None`` when neither ``dst`` nor
+    any ancestor is a symlink (the caller writes straight to ``dst``).
+    """
+    from vco_lib.symlink_handler import (  # noqa: PLC0415
+        compute_vco_new_path,
+        is_symlink_blocking,
+    )
+
+    # Case 1: dst itself is a symlink → leaf sibling (the symlink IS the leaf).
+    if is_symlink_blocking(dst):
+        return compute_vco_new_path(dst)
+
+    # Case 2: walk ancestors; redirect at the FIRST symlinked ancestor,
+    # replicating the path tail below it under the ancestor's .vco-new
+    # sibling (exactly like project_init.py NEW-8).
+    ancestor = dst.parent
+    seen: set[str] = set()
+    while True:
+        ancestor_str = os.fspath(ancestor)
+        if ancestor_str in seen:  # defensive: cyclic / root fixed point
+            return None
+        seen.add(ancestor_str)
+        try:
+            blocked = is_symlink_blocking(ancestor)
+        except OSError:
+            return None
+        if blocked:
+            vco_new_anc = compute_vco_new_path(ancestor)
+            try:
+                rel = dst.relative_to(ancestor)
+            except ValueError:
+                # Defensive: shouldn't happen on the ancestor walk; fall
+                # back to the filename only.
+                rel = Path(dst.name)
+            return vco_new_anc / rel
+        parent = ancestor.parent
+        if parent == ancestor:  # reached filesystem root
+            return None
+        ancestor = parent
 
 
 def atomic_write_json(

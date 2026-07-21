@@ -110,7 +110,14 @@ def ensure_discovered_lean_ctx_on_path(
         except OSError:
             pass
         dest_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dest)
+        # F-11: overwrite the same ~/.local/bin/lean-ctx dest that
+        # install.py's migrated site writes — route through the shared
+        # atomic primitive (one-concern-one-home) so a mid-copy crash
+        # can't leave a truncated binary on PATH. Reads the (small) binary
+        # fully into memory, which atomic_copy_file explicitly supports.
+        from vco_lib.atomic import atomic_copy_file  # noqa: PLC0415
+
+        atomic_copy_file(src, dest)
         if os_name != "Windows":
             os.chmod(dest, 0o755)
         return str(dest)

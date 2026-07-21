@@ -266,12 +266,16 @@ class PinR2RootAdoptionTests(unittest.TestCase):
 # PIN-R3 — structural single-engine (FAIL-WITHOUT-FIX)
 # ---------------------------------------------------------------------------
 
-# Post-audit copy2 ratchet (PLAN-v0285 D7): the 8 Step-5b/9b copy2 sites were
-# deleted; 15 remain (adopt-project mode, dist-staging family, claude.json
-# backups — all KEPT with per-site justification comments, none convertible
-# under WP-1's root-delegation scope). This constant is a ratchet: it may only
-# DROP in future work, never rise silently.
-_MAX_INSTALL_COPY2 = 15
+# Post-audit copy2 ratchet (PLAN-v0285 D7, tightened pre-beta F-11): the
+# Step-5b/9b copy2 sites were deleted. The remaining `shutil.copy2(` string
+# occurrences are the dist-staging family + the 3 claude.json `.bak` backups
+# (all KEPT with per-site justification comments) plus one comment mention —
+# grep-string count = 8 today. The pre-beta WP-E audit moved the live-overwrite
+# copy2 sites onto atomic_copy_file; nothing convertible remains, so the ratchet
+# is dropped from 15 to the current 8 (F-11: no silent headroom for new copy2
+# sites to creep in). This constant is a ratchet: it may only DROP in future
+# work, never rise silently.
+_MAX_INSTALL_COPY2 = 8
 
 
 class PinR3StructuralSingleEngineTests(unittest.TestCase):

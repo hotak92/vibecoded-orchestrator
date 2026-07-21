@@ -137,6 +137,7 @@ if str(PROJECT_ROOT) not in sys.path:
 # Moved to vco_lib.project_init in PR 2 — kept as shim for existing
 # callers; will be removed in PR 9 (cleanup).
 from vco_lib import bundled_versions as _bundled_versions  # noqa: E402
+from vco_lib.atomic import atomic_copy_file as _atomic_copy_file  # noqa: E402
 from vco_lib import launcher_db_writer as _launcher_db_writer  # noqa: E402
 from vco_lib import project_init as _project_init  # noqa: E402
 from vco_lib import self_install as _self_install  # noqa: E402
@@ -2422,11 +2423,15 @@ def _copy_recursive(src: Path, dst: Path) -> int:
     """Plain recursive copy. Symlinks are resolved (file content follows).
     Returns the number of files copied.
 
-    copy2-audit (v0.2.85 D7): the copy2 sites in this function and in
-    _copy_recursive_preserve below belong to the V47-B adopt-project mode — a
-    separate pre-existing feature, NOT the root-bundle materialize that WP-1
-    replaced. Left unchanged to keep WP-1 scoped to root delegation; atomic
-    conversion of the adopt path is a follow-up (E5-class polish).
+    copy2-audit (pre-beta WP-E): the per-file byte-copy in this function and
+    in _copy_recursive_preserve below is the V47-B adopt-project mode. The
+    v0.2.81 lesson (see KG step4d-write-consolidation) applied here: the raw
+    ``shutil.copy2`` overwrote the FINAL path non-atomically, so a mid-copy
+    crash left a truncated adopted file. Routed through the shared
+    ``vco_lib.atomic.atomic_copy_file`` (tempfile + fsync + os.replace, copy2
+    metadata semantic). ``symlink_safe=False`` because the caller already
+    gated any symlink/preserve decision upstream (this function resolves
+    symlinks by design); errors propagate as before (default soft_fail=False).
     """
     if src.is_dir():
         dst.mkdir(parents=True, exist_ok=True)
@@ -2435,7 +2440,15 @@ def _copy_recursive(src: Path, dst: Path) -> int:
             total += _copy_recursive(entry, dst / entry.name)
         return total
     dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
+    # F-3: dest-symlink drift (accepted). In the overwrite_all adopt mode a
+    # pre-existing dst CAN be a user symlink. Old copy2 wrote THROUGH the
+    # link, clobbering the link's TARGET file (link preserved). atomic_copy_
+    # file's os.replace instead REPLACES the link with a regular file, leaving
+    # the target's data untouched. Not byte-identical to the old behaviour, but
+    # the drift direction is SAFER (V47-B philosophy — the link target survives)
+    # and this plain path is deliberately the non-preserve one; the symlink-
+    # aware guard lives in _copy_recursive_preserve (is_symlink_blocking gated).
+    _atomic_copy_file(src, dst)
     return 1
 
 
@@ -2507,7 +2520,9 @@ def _copy_recursive_preserve(
     if is_symlink_blocking(dst):
         vco_new = compute_vco_new_path(dst)
         vco_new.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, vco_new)
+        # WP-E: atomic sibling write (fresh .vco-new dest; symlink already
+        # decided above, so symlink_safe=False keeps behaviour identical).
+        _atomic_copy_file(src, vco_new)
         if deferral_report is not None:
             emit_symlink_deferral(
                 deferral_report, dst, vco_new, install_root=install_root
@@ -2521,12 +2536,17 @@ def _copy_recursive_preserve(
     if rel in preserve and os.path.lexists(os.fspath(dst)):
         sibling = _new_sibling_path(dst)
         sibling.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, sibling)
+        # WP-E: atomic .new sibling write (preserve-user-modified path).
+        _atomic_copy_file(src, sibling)
         preserved_present.append(rel)
         return 1, 1
 
     dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
+    # WP-E: atomic overwrite of the (non-symlink, non-preserved) dest. dst is
+    # guaranteed not a blocking symlink here (is_symlink_blocking gate above),
+    # so symlink_safe=False is behaviour-identical to the old copy2 overwrite,
+    # minus the truncate-on-crash window.
+    _atomic_copy_file(src, dst)
     return 1, 0
 
 
@@ -9747,11 +9767,14 @@ def _install_vendored_lean_ctx() -> str | None:
         dest = dest_dir / "lean-ctx"
     try:
         dest_dir.mkdir(parents=True, exist_ok=True)
-        # copy2-audit (v0.2.85 D7): KEEP — lean-ctx tool installer, a separate
-        # concern from root-bundle delegation (out of WP-1 scope). Copies the
-        # vendored prebuilt into ~/.local/bin; a partial copy soft-fails via
-        # the except below. Atomic conversion is a follow-up improvement.
-        shutil.copy2(src, dest)
+        # WP-E: atomic copy of the vendored lean-ctx prebuilt into
+        # ~/.local/bin. This overwrites any prior lean-ctx in place, so the
+        # atomic temp+replace prevents a killed copy from leaving a truncated
+        # binary on PATH. Raises on error → the existing `except (OSError,
+        # shutil.Error)` below still prints + returns None (behaviour-
+        # identical). symlink_safe=False: ~/.local/bin/lean-ctx is a plain
+        # file VCO owns.
+        _atomic_copy_file(src, dest)
         if os_name != "Windows":
             os.chmod(dest, 0o755)
         return str(dest)
@@ -18792,12 +18815,16 @@ def _try_cargo_tauri_build(install_root: Path) -> Optional[Path]:
     if src is None:
         return None
     try:
-        # copy2-audit (v0.2.85 D7/E5): KEEP — dist-staging family. Stages a
-        # freshly built launcher binary into launcher/dist/; the running
-        # launcher reads the INSTALLED binary, not this staged copy, and the
-        # binary swap has its own os.replace/rename dance (see the block near
-        # _refresh_dist_binary). Conversion is polish, not a data-safety fix.
-        shutil.copy2(src, target_path)
+        # WP-E: atomic staging of a freshly built launcher binary into
+        # launcher/dist/. This overwrites the previous dist binary in place;
+        # the atomic temp+replace closes the truncate-on-crash window (a
+        # killed copy previously left a partial dist binary a later
+        # _refresh_dist_binary run could stage). The RUNNING launcher reads
+        # the INSTALLED binary, never this dist copy, so there is no
+        # open-file-lock concern here (unlike the _refresh_dist_binary swap,
+        # which keeps its purpose-built Windows-lock dance). Raises on error →
+        # the existing `except OSError` still returns None.
+        _atomic_copy_file(src, target_path)
         if not platform.system().lower().startswith("win"):
             target_path.chmod(0o755)
     except OSError:
@@ -19623,6 +19650,14 @@ def _refresh_dist_binary_after_rebuild(
         # ``.new`` staging handle the running-.exe lock case that os.replace
         # cannot); os.replace onto an open .exe raises the same
         # SHARING_VIOLATION we already handle there.
+        #
+        # copy2-audit (WP-E): the four ``shutil.copy2`` calls in THIS block
+        # are deliberately NOT routed through ``vco_lib.atomic.atomic_copy_file``.
+        # This is a purpose-built swap dance (POSIX temp+chmod+os.replace here,
+        # plus the Windows SHARING_VIOLATION rename-fallback + ``.new`` stage1
+        # handoff below) that the generic helper does not — and must not —
+        # replicate; converting them would regress the running-.exe lock
+        # handling. Kept with per-call justification.
         if platform.system().lower().startswith("win"):
             shutil.copy2(src, dist_path)
             swap_succeeded = True
@@ -20065,10 +20100,12 @@ def _try_cargo_build_vct_hub(install_root: Path) -> Optional[Path]:
     if src is None or not src.is_file():
         return None
     try:
-        # copy2-audit (v0.2.85 D7/E5): KEEP — dist-staging family (vct-hub
-        # binary). Same rationale as the launcher-binary stage above: the
-        # running hub reads the installed binary, not this staged copy.
-        shutil.copy2(src, target_path)
+        # WP-E: atomic staging of the vct-hub binary into launcher/dist/.
+        # Same rationale as the launcher-binary stage above: the running hub
+        # reads the installed binary, not this staged copy, so no open-file
+        # lock concern; the atomic write closes the truncate-on-crash window.
+        # Raises on error → the existing `except OSError` still returns None.
+        _atomic_copy_file(src, target_path)
         if not platform.system().lower().startswith("win"):
             target_path.chmod(0o755)
     except OSError:
@@ -21095,9 +21132,10 @@ def _rewrite_stale_mcp_entries(
         ts = int(time.time())
         bak_rewrite = claude_json.with_name(claude_json.name + f".bak-rewrite-{ts}")
         try:
-            # copy2-audit (v0.2.85 D7): KEEP — fresh timestamped backup
+            # copy2-audit (WP-E re-affirmed): KEEP — fresh timestamped backup
             # destination (`.bak-rewrite-<ts>`), never overwrites a live
-            # target, so non-atomicity cannot destroy data.
+            # target, so non-atomicity cannot destroy data. (The live
+            # claude.json write downstream is already atomic.)
             shutil.copy2(claude_json, bak_rewrite)
             output_fn(f"  Snapshot saved: {bak_rewrite}")
         except OSError as exc:
@@ -21386,7 +21424,7 @@ def _remove_deprecated_mcp_entries(
         ts = int(time.time())
         bak_path = claude_json.with_name(claude_json.name + f".bak-depr-remove-{ts}")
         try:
-            # copy2-audit (v0.2.85 D7): KEEP — fresh timestamped backup
+            # copy2-audit (WP-E re-affirmed): KEEP — fresh timestamped backup
             # destination (`.bak-depr-remove-<ts>`), never overwrites a live
             # target.
             shutil.copy2(claude_json, bak_path)
@@ -21460,7 +21498,7 @@ def _remove_deprecated_mcp_entries(
                         removed_names.append(name)
             try:
                 if claude_json.is_file():
-                    # copy2-audit (v0.2.85 D7): KEEP — `.bak` snapshot
+                    # copy2-audit (WP-E re-affirmed): KEEP — `.bak` snapshot
                     # destination (nothing reads it as a live config); the
                     # live `claude_json` write below is atomic via .tmp +
                     # os.replace.
