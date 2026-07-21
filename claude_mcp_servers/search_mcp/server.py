@@ -80,9 +80,9 @@ mcp = FastMCP(
         "citation-sorted) and arXiv (CS/ML/physics preprints, relevance-sorted). "
         "Use search_papers() for literature search, discovering influential "
         "papers, and locating the latest preprints. Rate-limited: OpenAlex 1 req/s, "
-        "arXiv 0.333 req/s. For general web search, GitHub code search, or "
-        "fetching arbitrary URLs use Claude's built-in WebSearch and WebFetch — "
-        "those tools were dropped from this MCP in v0.2.11 to avoid duplication."
+        "arXiv 0.333 req/s. This MCP exposes ONLY search_papers — for general "
+        "web search, GitHub code search, or fetching arbitrary URLs use "
+        "Claude's built-in WebSearch and WebFetch instead."
     )
 )
 
@@ -180,7 +180,10 @@ async def search_papers(
     year_from: int = 0,
 ) -> str:
     """
-    Search academic papers (free, no subscription required).
+    Search academic papers (free, no subscription required). Returns paper
+    METADATA — title, authors, year, abstract excerpt (max 500 chars), DOI,
+    URL, citation count — not full text or PDFs; to read a paper, fetch its
+    URL with WebFetch.
 
     Sources:
       openalex — 240M works, CC0 license, citation graphs, sorted by citations.
@@ -188,9 +191,14 @@ async def search_papers(
       arxiv    — CS/ML/physics preprints, sorted by relevance.
                  Best for: latest research, technical reports not yet peer-reviewed.
 
+    Example: search_papers("retrieval augmented generation evaluation",
+    source="arxiv", year_from=2024) for recent RAG-evaluation preprints.
+    When NOT to use: general web content, news, blogs, or code — use
+    Claude's built-in WebSearch instead.
+
     Args:
         query:     Natural language search query.
-        limit:     Max results (1-25, default 10).
+        limit:     Max results (1-25, default 10; out-of-range values are clamped).
         source:    'openalex' (default) or 'arxiv'.
         year_from: Include only papers from this year onwards (0 = no filter).
 

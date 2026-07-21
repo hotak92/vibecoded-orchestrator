@@ -838,7 +838,8 @@ mcp = FastMCP(
         "Only fall back to Grep for exact literal strings (variable names, error messages). "
         "Tool order: hybrid_search (concepts) → semantic_graph_search (relationships) → "
         "search_code_graph (code by purpose) → query_code_structure (callers, deps, inheritance). "
-        "store_knowledge_node persists new knowledge (scope='project' default, scope='shared' for cross-project)."
+        "store_knowledge_node persists new knowledge (scope='project' default, scope='shared' for cross-project). "
+        "describe_excalidraw inspects .excalidraw diagram files that hybrid_search returns as diagram results."
     )
 )
 
@@ -4229,17 +4230,24 @@ async def semantic_graph_search(
 
     When to use: "what depends on X?", "what concepts are related to Y?",
     "show me the network around Z". Best for exploring connections.
+    Example: semantic_graph_search("update deferral pattern") returns matching
+    nodes plus the concepts they link to via [[uses::...]] / [[buildsOn::...]].
     When NOT to use: simple factual lookups — use hybrid_search instead.
 
     Args:
         query: Natural language query describing the concept to explore
         limit: Max primary results (default: 5). Connected nodes are additional.
-        depth: Graph traversal depth (default: 2, max: 3). Higher depth finds
-               more distant connections but returns more results.
+        depth: 1 = primary matches only, no neighbor fetch. 2 (default) or
+               higher = also fetch the nodes WikiLinked from the primary
+               matches (one hop, up to 10 neighbors). Values above 2 behave
+               the same as 2.
         detail: Verbosity tier per result (default "auto"). See hybrid_search
             for the full tier semantics. Auto-mode applies per-result score
-            tiering to primary results. Connected nodes always use the
-            "summary" tier — see Decision note below.
+            tiering to primary results. Connected nodes always render at the
+            "summary" tier regardless of this value — graph topology, not
+            relevance score, selected them, so they carry no score to tier on.
+        include_stale: Default False excludes nodes whose valid_until date has
+            passed. Pass True only when superseded knowledge is wanted.
 
     Returns:
         JSON with primary_results (direct matches) + connected_nodes (graph
@@ -5072,14 +5080,19 @@ async def hybrid_search(
 
     Automatically searches project KG, shared KG, and project docs. No need
     to specify collections — scoping is handled transparently via env vars.
-    Pass days=N to filter by recency (replaces search_recent_work).
+    Pass days=N to filter by recency.
 
     When to use: asking "how does X work?", "what patterns exist for Y?",
     "what was decided about Z?", or any question about concepts, architecture,
     decisions, or project knowledge.
+    Example: hybrid_search("embedding model fallback strategy") finds nodes
+    about hardware-tiered embedding selection even if none contain that
+    exact phrase.
 
     When NOT to use: searching for exact literal strings like variable names,
-    error messages, or specific file paths — use Grep for those instead.
+    error messages, or specific file paths — use Grep for those instead. For
+    finding code entities by purpose, use search_code_graph; for exploring
+    how KG concepts link to each other, use semantic_graph_search.
 
     Args:
         query: Natural language query describing what you want to find
@@ -5087,8 +5100,11 @@ async def hybrid_search(
         node_type: Filter by type (project, concept, tool, model, hardware, research)
         tags: Filter by tags (e.g., ["AI", "python"])
         days: If set, only return nodes updated in the last N days
+        include_stale: Default False excludes nodes whose valid_until date has
+            passed (superseded knowledge). Pass True only when you deliberately
+            need expired/superseded nodes (audits, history research).
         detail: Verbosity tier per result. Default "auto" — selected per result by
-            relevance score (calibrated thresholds, see _TIER_THRESHOLDS):
+            relevance score (thresholds env-tunable via KG_TIER_*):
               - score < 0.42  → discarded (noise)
               - 0.42..0.55    → "summary" (LLM description, ~6 lines)
               - 0.55..0.65    → "single_chunk" (matched chunk, ~2000 chars)
@@ -5097,13 +5113,11 @@ async def hybrid_search(
             Explicit overrides apply uniformly to all results:
               - "titles"        → title + file_path + node_type only
               - "summary"       → LLM description / summary / 200-char content
+                                  ("descriptions" is an accepted alias)
               - "single_chunk"  → matched chunk only
               - "three_chunks"  → 3 chunks centred on hit
-              - "full"          → whole node (or 300-char snippet for unchunked)
-            Legacy aliases (kept for backward compat):
-              - "descriptions"  → "summary"
-              - (old) "full"    → unchanged behaviour, now also assembles chunks
-                                  for chunked nodes when available
+              - "full"          → whole node (assembled from chunks when the node
+                                  is chunked; 300-char snippet for unchunked)
 
     Returns:
         JSON with deduplicated results ranked by combined semantic + keyword score.
@@ -5772,7 +5786,17 @@ async def store_knowledge_node(
     scope: str = "project",
 ) -> str:
     """
-    Create/update a knowledge node.
+    Create or update a knowledge-graph node: writes the markdown file to the
+    project's knowledge/ folder AND upserts its embedding into Weaviate, so
+    the node is immediately findable via hybrid_search. Upsert semantics —
+    same file_path with identical content is skipped; changed content is
+    re-written and re-embedded.
+
+    When to use: persisting a non-obvious learning, decision rationale,
+    architecture pattern, or gotcha so future sessions can retrieve it.
+    When NOT to use: if you can write files directly, prefer writing the
+    knowledge/**/*.md file yourself (a PostToolUse hook auto-syncs it to
+    Weaviate); this tool is the path for agents without file-write access.
 
     Args:
         title: Node title (unique per file)
@@ -5785,14 +5809,18 @@ async def store_knowledge_node(
                    Absolute paths work even when KG_BASE_DIR is not configured.
                    If omitted, path is auto-derived from title and node_type.
         scope: "project" (default) — writes to KG_COLLECTION (project-scoped).
-               "shared" — writes to SHARED_KG_COLLECTION (cross-project knowledge).
+               "shared" — writes to SHARED_KG_COLLECTION (cross-project
+               knowledge, visible to every project on this machine); use for
+               patterns genuinely reusable beyond this project.
                Falls back to KG_COLLECTION if SHARED_KG_COLLECTION is not configured.
-               Refuses (does NOT silently fall back) when
-               SHARED_KG_WRITE_DISABLED=true for this project — see the
-               module docstring for the asymmetric read/write semantic.
+               scope="shared" returns an error (does NOT silently fall back to
+               the project KG) when SHARED_KG_WRITE_DISABLED=true for this
+               project — on that error, either keep the knowledge project-scoped
+               or ask the user to lift the gate.
 
     Returns:
-        JSON with success status and file_written flag
+        JSON with success status, file_written flag, and absolute_path of the
+        markdown file (check these to confirm where the node landed).
     """
     try:
         # v0.2.74 T5-1 backstop (defense-in-depth): refuse-loud on subprocess
@@ -6282,7 +6310,12 @@ async def search_code_graph(
 
     When to use: "find the function that handles X", "where is Y implemented?",
     "what code deals with Z?". Best for discovering code by intent.
+    Example: search_code_graph("retry logic for hub requests") surfaces
+    backoff/timeout helpers even when their names contain neither "retry"
+    nor "hub".
     When NOT to use: searching for exact function/variable names — use Grep.
+    Once you know the entity's name, use query_code_structure for its exact
+    callers/dependencies.
 
     Args:
         query: Natural language description of the code you're looking for
@@ -6296,8 +6329,10 @@ async def search_code_graph(
                matching). If the filter yields zero candidates (the `layer`
                property is unpopulated on many indexes), the search re-runs
                without it and the response carries a "note" explaining that.
-        project: Project name override. Omit to use workspace default.
-        detail: Verbosity per result (default "auto"):
+        project: Project name override. Omit to use the workspace default;
+                 pass "" (empty string) to search across all projects.
+        detail: Verbosity per result (default "auto"; any other value than the
+            three below is treated as "auto"):
             - "auto"   → score-tiered per result via the code-calibrated gate
                          (_CODE_TIER_THRESHOLDS, env-overridable CODE_TIER_*):
                            score < min          → dropped (min derives from the
@@ -7238,6 +7273,8 @@ def query_code_structure(
 
     When to use: "what calls function X?", "what does module Y depend on?",
     "find the call path from A to B", "what classes extend Z?".
+    Example: query_code_structure("callers", "auth.validate_token") lists
+    every function that calls validate_token.
     When NOT to use: discovering code by concept — use search_code_graph.
 
     Args:
@@ -7254,7 +7291,8 @@ def query_code_structure(
             - "type_users": functions using a given type in annotations
         target: The code entity to query (full_name for functions/classes,
                 file path for modules, arrow-separated pair for "path")
-        project: Optional project name filter. Omit for workspace default.
+        project: Optional project name filter. Omit for the workspace default;
+                 pass "" (empty string) to query across all projects.
 
     Returns:
         JSON with the structural query results (entity names, file paths,
