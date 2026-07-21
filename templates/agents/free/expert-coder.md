@@ -2170,17 +2170,6 @@ rds = 5  # What does this mean?
 - **Opus**: Implement patterns that won't scale
 - **Opus**: Skip architectural validation
 
-## Knowledge Systems
-
-> **Full reference**: the "Search Systems" and "Knowledge Graph" sections of this project's `CLAUDE.md`.
-
-**Decision tree**:
-- Known terms → `kg-search` CLI (fast, ~100ms)
-- Conceptual → `hybrid_search` MCP
-- Relationships → `semantic_graph_search` MCP
-- Code by purpose → `search_code_graph` MCP
-- Quick analysis: use Claude directly (no separate local-LLM tool is needed)
-- Literal strings → Grep
 ## Success Criteria
 
 - Code follows spec exactly

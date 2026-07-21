@@ -1,8 +1,8 @@
 # Dependency Licensing Audit
 
-**Generated**: 2026-04-23 (`pip-licenses` full-closure run); direct-dependency table re-verified against `requirements.txt` and the installed closure on 2026-07-20
+**Generated**: 2026-07-21 (`pip-licenses` full-closure run against the reference install environment; direct + transitive + NVIDIA tables regenerated from the live `requirements.txt` closure)
 **Target license for this project**: AGPL-3.0
-**Auditor**: `pip-licenses` on full transitive closure of `requirements.txt`
+**Auditor**: `pip-licenses` on the full transitive closure of `requirements.txt`, resolved from the reference install environment
 
 ## Summary
 
@@ -30,13 +30,22 @@ The NVIDIA CUDA libraries are a special case. They're proprietary, but transitiv
 4. Flag any license containing AGPL/GPL/Proprietary/LGPL keywords for manual review.
 5. Document rationale for anything flagged.
 
-Command used to reproduce:
+Command used to reproduce (read-only — install the tools into a THROWAWAY venv, never into the install environment being audited, then point them at it with `--python`):
 
 ```bash
-# From vibecoded-orchestrator root after install.py
-.venv/bin/pip install pip-licenses pipdeptree
-.venv/bin/pip-licenses --format=markdown --order=license > /tmp/licenses-full.md
-.venv/bin/pipdeptree --packages $(grep -v '^#' requirements.txt | grep -v '^$' | sed 's/[>=<~!].*//' | tr '\n' ',')
+# 1. Isolated tool venv (does not touch the environment under audit)
+python3 -m venv /tmp/piplic-venv
+/tmp/piplic-venv/bin/pip install pip-licenses
+
+# 2. Read the license metadata of the target install environment
+/tmp/piplic-venv/bin/pip-licenses \
+    --python /path/to/install/env/bin/python \
+    --format=markdown --with-urls --order=name > /tmp/licenses-full.md
+
+# 3. Restrict to the requirements.txt transitive closure
+#    (walk each root's Requires-Dist over the installed metadata; drop
+#    extras-only deps) so unrelated packages in a shared dev environment
+#    don't leak into the audit.
 ```
 
 ## Infrastructure services (not Python deps)
@@ -60,143 +69,109 @@ Users install these via their container runtime; we don't redistribute binaries.
 | `aiohttp` | 3.13.5 | Apache-2.0 AND MIT | YES |  |
 | `asyncpg` | 0.31.0 | Apache-2.0 | YES |  |
 | `fastapi` | 0.136.1 | MIT | YES |  |
-| `httpx` | 0.28.1 | BSD License | YES |  |
-| `mcp` | 1.27.0 | MIT License | YES |  |
+| `httpx` | 0.28.1 | BSD-3-Clause | YES |  |
+| `mcp` | 1.27.0 | MIT | YES |  |
 | `ollama` | 0.6.2 | MIT | YES |  |
 | `psutil` | 7.2.2 | BSD-3-Clause | YES |  |
 | `pydantic` | 2.13.4 | MIT | YES |  |
-| `PyYAML` | 6.0.3 | MIT License | YES |  |
-| `requests` | 2.33.1 | Apache Software License | YES |  |
-| `sentence-transformers` | 5.4.1 | Apache Software License | YES |  |
+| `PyYAML` | 6.0.3 | MIT | YES |  |
+| `requests` | 2.33.1 | Apache-2.0 | YES |  |
+| `sentence-transformers` | 5.4.1 | Apache-2.0 | YES |  |
 | `torch` | 2.11.0 | BSD-3-Clause | YES |  |
-| `transformers` | 4.49.0 | Apache Software License | YES | Deliberately capped `<4.50.0` in `requirements.txt` — CodeSage-Large-v2 (Conv1D) is incompatible with transformers ≥ 4.50; do not bump past the cap. |
+| `transformers` | 4.49.0 | Apache-2.0 | YES | Deliberately capped `<4.50.0` in `requirements.txt` — CodeSage-Large-v2 (Conv1D) is incompatible with transformers ≥ 4.50; do not bump past the cap. |
 | `uvicorn` | 0.46.0 | BSD-3-Clause | YES |  |
-| `watchdog` | 6.0.0 | Apache Software License | YES |  |
-| `weaviate-client` | 4.21.0 | BSD 3-clause | YES |  |
+| `watchdog` | 6.0.0 | Apache-2.0 | YES |  |
+| `weaviate-client` | 4.21.0 | BSD-3-Clause | YES |  |
 
 ### Transitive dependencies (pulled in by direct deps)
 
 | Package | Version | License | AGPL-compatible | Notes |
 |---|---|---|---|---|
-| `aiohappyeyeballs` | 2.6.1 | Python Software Foundation License | YES |  |
-| `aiosignal` | 1.4.0 | Apache Software License | YES |  |
+| `aiohappyeyeballs` | 2.6.1 | PSF-2.0 | YES |  |
+| `aiosignal` | 1.4.0 | Apache-2.0 | YES |  |
 | `annotated-doc` | 0.0.4 | MIT | YES |  |
-| `annotated-types` | 0.7.0 | MIT License | YES |  |
-| `anyio` | 4.12.1 | MIT | YES |  |
-| `attrs` | 25.4.0 | MIT | YES |  |
-| `Authlib` | 1.6.6 | BSD License | YES |  |
-| `beartype` | 0.22.9 | MIT License | YES |  |
-| `certifi` | 2026.1.4 | Mozilla Public License 2.0 (MPL 2.0) | YES |  |
+| `annotated-types` | 0.7.0 | MIT | YES |  |
+| `anyio` | 4.13.0 | MIT | YES |  |
+| `attrs` | 26.1.0 | MIT | YES |  |
+| `Authlib` | 1.7.2 | BSD-3-Clause | YES |  |
+| `certifi` | 2026.4.22 | MPL-2.0 | YES |  |
 | `cffi` | 2.0.0 | MIT | YES |  |
-| `charset-normalizer` | 3.4.4 | MIT | YES |  |
-| `click` | 8.3.1 | BSD-3-Clause | YES |  |
-| `cloudpickle` | 3.1.2 | BSD License | YES |  |
-| `cryptography` | 46.0.3 | Apache-2.0 OR BSD-3-Clause | YES |  |
-| `cyclopts` | 4.4.5 | Apache-2.0 | YES |  |
-| `deprecation` | 2.1.0 | Apache Software License | YES |  |
-| `docstring_parser` | 0.17.0 | MIT License | YES |  |
-| `docutils` | 0.22.4 | BSD License; GNU General Public License (GPL); Public Domain | YES |  |
-| `exceptiongroup` | 1.3.1 | MIT License | YES |  |
-| `fakeredis` | 2.33.0 | BSD-3-Clause | YES |  |
-| `filelock` | 3.20.3 | Unlicense | YES |  |
+| `charset-normalizer` | 3.4.7 | MIT | YES |  |
+| `click` | 8.3.3 | BSD-3-Clause | YES |  |
+| `cryptography` | 48.0.0 | Apache-2.0 OR BSD-3-Clause | YES |  |
+| `cuda-pathfinder` | 1.5.4 | Apache-2.0 | YES | Open-source CUDA-library path helper (transitive via torch); NOT proprietary NVIDIA CUDA. |
+| `filelock` | 3.29.0 | MIT | YES |  |
 | `frozenlist` | 1.8.0 | Apache-2.0 | YES |  |
-| `fsspec` | 2026.1.0 | BSD-3-Clause | YES |  |
-| `grpcio` | 1.76.0 | Apache Software License | YES |  |
-| `h11` | 0.16.0 | MIT License | YES |  |
-| `hf-xet` | 1.2.0 | Apache-2.0 | YES |  |
+| `fsspec` | 2026.4.0 | BSD-3-Clause | YES |  |
+| `grpcio` | 1.78.0 | Apache-2.0 | YES |  |
+| `h11` | 0.16.0 | MIT | YES |  |
+| `hf-xet` | 1.5.0 | Apache-2.0 | YES |  |
 | `httpcore` | 1.0.9 | BSD-3-Clause | YES |  |
 | `httpx-sse` | 0.4.3 | MIT | YES |  |
-| `huggingface-hub` | 0.36.0 | Apache Software License | YES |  |
-| `idna` | 3.11 | BSD-3-Clause | YES |  |
-| `importlib_metadata` | 8.7.1 | Apache-2.0 | YES |  |
-| `Jinja2` | 3.1.6 | BSD License | YES |  |
+| `huggingface_hub` | 0.36.2 | Apache-2.0 | YES |  |
+| `idna` | 3.13 | BSD-3-Clause | YES |  |
+| `Jinja2` | 3.1.6 | BSD-3-Clause | YES |  |
 | `joblib` | 1.5.3 | BSD-3-Clause | YES |  |
+| `joserfc` | 1.6.5 | BSD-3-Clause | YES |  |
 | `jsonschema` | 4.26.0 | MIT | YES |  |
-| `jsonschema-path` | 0.3.4 | Apache Software License | YES |  |
 | `jsonschema-specifications` | 2025.9.1 | MIT | YES |  |
-| `markdown-it-py` | 4.0.0 | MIT License | YES |  |
 | `MarkupSafe` | 3.0.3 | BSD-3-Clause | YES |  |
-| `mdurl` | 0.1.2 | MIT License | YES |  |
-| `mpmath` | 1.3.0 | BSD License | YES |  |
-| `multidict` | 6.7.1 | Apache License 2.0 | YES |  |
+| `mpmath` | 1.3.0 | BSD-3-Clause | YES |  |
+| `multidict` | 6.7.1 | Apache-2.0 | YES |  |
 | `networkx` | 3.6.1 | BSD-3-Clause | YES |  |
-| `numpy` | 2.2.6 | BSD License | YES |  |
-| `openapi-pydantic` | 0.5.1 | MIT License | YES |  |
-| `opentelemetry-api` | 1.39.1 | Apache-2.0 | YES |  |
-| `opentelemetry-exporter-prometheus` | 0.60b1 | Apache-2.0 | YES |  |
-| `opentelemetry-instrumentation` | 0.60b1 | Apache-2.0 | YES |  |
-| `opentelemetry-sdk` | 1.39.1 | Apache-2.0 | YES |  |
-| `opentelemetry-semantic-conventions` | 0.60b1 | Apache-2.0 | YES |  |
-| `packaging` | 26.1 | Apache-2.0 OR BSD-2-Clause | YES |  |
-| `pathable` | 0.4.4 | Apache Software License | YES |  |
-| `platformdirs` | 4.5.1 | MIT | YES |  |
-| `prometheus_client` | 0.24.0 | Apache-2.0 AND BSD-2-Clause | YES |  |
-| `propcache` | 0.4.1 | Apache Software License | YES |  |
-| `protobuf` | 6.33.4 | 3-Clause BSD License | YES |  |
-| `py-key-value-aio` | 0.3.0 | Apache Software License | YES |  |
-| `py-key-value-shared` | 0.3.0 | Apache Software License | YES |  |
-| `pydantic_core` | 2.41.5 | MIT | YES |  |
-| `pydantic-settings` | 2.12.0 | MIT | YES |  |
-| `pydocket` | 0.16.6 | MIT License | YES |  |
-| `Pygments` | 2.19.2 | BSD License | YES |  |
-| `PyJWT` | 2.10.1 | MIT License | YES |  |
-| `pyperclip` | 1.11.0 | BSD License | YES |  |
-| `python-dotenv` | 1.2.1 | BSD-3-Clause | YES |  |
-| `python-json-logger` | 4.0.0 | BSD License | YES |  |
-| `python-multipart` | 0.0.21 | Apache-2.0 | YES |  |
-| `redis` | 7.1.0 | MIT | YES |  |
-| `referencing` | 0.36.2 | MIT | YES |  |
-| `regex` | 2025.11.3 | Apache-2.0 AND CNRI-Python | YES |  |
-| `rich` | 14.2.0 | MIT License | YES |  |
-| `rich-rst` | 1.3.2 | MIT | YES |  |
+| `numpy` | 2.4.4 | BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0 | YES |  |
+| `packaging` | 26.2 | Apache-2.0 OR BSD-2-Clause | YES |  |
+| `propcache` | 0.4.1 | Apache-2.0 | YES |  |
+| `protobuf` | 6.33.6 | BSD-3-Clause | YES |  |
+| `pycparser` | 3.0 | BSD-3-Clause | YES |  |
+| `pydantic_core` | 2.46.4 | MIT | YES |  |
+| `pydantic-settings` | 2.14.0 | MIT | YES |  |
+| `PyJWT` | 2.12.1 | MIT | YES |  |
+| `python-dotenv` | 1.2.2 | BSD-3-Clause | YES |  |
+| `python-multipart` | 0.0.27 | Apache-2.0 | YES |  |
+| `referencing` | 0.37.0 | MIT | YES |  |
+| `regex` | 2026.4.4 | Apache-2.0 AND CNRI-Python | YES |  |
 | `rpds-py` | 0.30.0 | MIT | YES |  |
-| `safetensors` | 0.7.0 | Apache Software License | YES |  |
+| `safetensors` | 0.7.0 | Apache-2.0 | YES |  |
 | `scikit-learn` | 1.8.0 | BSD-3-Clause | YES |  |
-| `scipy` | 1.17.0 | BSD License | YES |  |
-| `shellingham` | 1.5.4 | ISC License (ISCL) | YES |  |
-| `sortedcontainers` | 2.4.0 | Apache Software License | YES |  |
-| `sse-starlette` | 3.1.2 | BSD-3-Clause | YES |  |
-| `starlette` | 0.51.0 | BSD-3-Clause | YES |  |
-| `sympy` | 1.14.0 | BSD License | YES |  |
-| `threadpoolctl` | 3.6.0 | BSD License | YES |  |
-| `tokenizers` | 0.22.2 | Apache Software License | YES |  |
-| `tqdm` | 4.67.1 | MIT License; Mozilla Public License 2.0 (MPL 2.0) | YES |  |
-| `triton` | 3.5.1 | MIT License | YES |  |
-| `typer` | 0.19.2 | MIT License | YES |  |
+| `scipy` | 1.17.1 | BSD-3-Clause | YES |  |
+| `setuptools` | 81.0.0 | MIT | YES |  |
+| `sse-starlette` | 3.4.1 | BSD-3-Clause | YES |  |
+| `starlette` | 1.0.0 | BSD-3-Clause | YES |  |
+| `sympy` | 1.14.0 | BSD-3-Clause | YES |  |
+| `threadpoolctl` | 3.6.0 | BSD-3-Clause | YES |  |
+| `tokenizers` | 0.21.4 | Apache-2.0 | YES |  |
+| `tqdm` | 4.67.3 | MPL-2.0 AND MIT | YES |  |
+| `triton` | 3.6.0 | MIT | YES |  |
 | `typing_extensions` | 4.15.0 | PSF-2.0 | YES |  |
 | `typing-inspection` | 0.4.2 | MIT | YES |  |
 | `urllib3` | 2.6.3 | MIT | YES |  |
-| `validators` | 0.35.0 | MIT License | YES |  |
-| `websockets` | 16.0 | BSD-3-Clause | YES |  |
-| `wrapt` | 1.17.3 | BSD License | YES |  |
-| `yarl` | 1.22.0 | Apache Software License | YES |  |
+| `validators` | 0.35.0 | MIT | YES |  |
+| `yarl` | 1.23.0 | Apache-2.0 | YES |  |
 
 ### NVIDIA CUDA libraries (transitive via torch, GPU-only)
 
+As of `torch` 2.11 the CUDA runtime is pulled in through the `cuda-toolkit`
+meta-package (with `[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]`
+extras) plus a few directly-declared `nvidia-*-cu13` wheels — a packaging change
+from the earlier era of ~15 individual `nvidia-*-cu12` packages. The extras
+resolve to the same underlying proprietary CUDA-13 libraries; only those actually
+resolved in the reference environment are listed below. All are Linux-and-GPU-only
+(`platform_system == "Linux"`) and are pulled directly from PyPI under NVIDIA's
+EULA — we never redistribute them.
+
 | Package | Version | License | AGPL-compatible | Notes |
 |---|---|---|---|---|
-| `nvidia-cublas-cu12` | 12.8.4.1 | Other/Proprietary License | n/a | NVIDIA CUDA — transitive via torch. We do NOT redistribute; user pip install pulls under NVIDIA EULA. |
-| `nvidia-cuda-cupti-cu12` | 12.8.90 | Other/Proprietary License | n/a | NVIDIA CUDA — transitive via torch. We do NOT redistribute; user pip install pulls under NVIDIA EULA. |
-| `nvidia-cuda-nvrtc-cu12` | 12.8.93 | Other/Proprietary License | n/a | NVIDIA CUDA — transitive via torch. We do NOT redistribute; user pip install pulls under NVIDIA EULA. |
-| `nvidia-cuda-runtime-cu12` | 12.8.90 | Other/Proprietary License | n/a | NVIDIA CUDA — transitive via torch. We do NOT redistribute; user pip install pulls under NVIDIA EULA. |
-| `nvidia-cudnn-cu12` | 9.10.2.21 | Other/Proprietary License | n/a | NVIDIA CUDA — transitive via torch. We do NOT redistribute; user pip install pulls under NVIDIA EULA. |
-| `nvidia-cufft-cu12` | 11.3.3.83 | Other/Proprietary License | n/a | NVIDIA CUDA — transitive via torch. We do NOT redistribute; user pip install pulls under NVIDIA EULA. |
-| `nvidia-cufile-cu12` | 1.13.1.3 | Other/Proprietary License | n/a | NVIDIA CUDA — transitive via torch. We do NOT redistribute; user pip install pulls under NVIDIA EULA. |
-| `nvidia-curand-cu12` | 10.3.9.90 | Other/Proprietary License | n/a | NVIDIA CUDA — transitive via torch. We do NOT redistribute; user pip install pulls under NVIDIA EULA. |
-| `nvidia-cusolver-cu12` | 11.7.3.90 | Other/Proprietary License | n/a | NVIDIA CUDA — transitive via torch. We do NOT redistribute; user pip install pulls under NVIDIA EULA. |
-| `nvidia-cusparse-cu12` | 12.5.8.93 | Other/Proprietary License | n/a | NVIDIA CUDA — transitive via torch. We do NOT redistribute; user pip install pulls under NVIDIA EULA. |
-| `nvidia-cusparselt-cu12` | 0.7.1 | NVIDIA Proprietary Software | n/a | NVIDIA CUDA — transitive via torch. We do NOT redistribute; user pip install pulls under NVIDIA EULA. |
-| `nvidia-nccl-cu12` | 2.27.5 | Other/Proprietary License | n/a | NVIDIA CUDA — transitive via torch. We do NOT redistribute; user pip install pulls under NVIDIA EULA. |
-| `nvidia-nvjitlink-cu12` | 12.8.93 | Other/Proprietary License | n/a | NVIDIA CUDA — transitive via torch. We do NOT redistribute; user pip install pulls under NVIDIA EULA. |
-| `nvidia-nvshmem-cu12` | 3.3.20 | Other/Proprietary License | n/a | NVIDIA CUDA — transitive via torch. We do NOT redistribute; user pip install pulls under NVIDIA EULA. |
-| `nvidia-nvtx-cu12` | 12.8.90 | Other/Proprietary License | n/a | NVIDIA CUDA — transitive via torch. We do NOT redistribute; user pip install pulls under NVIDIA EULA. |
+| `cuda-bindings` | 13.2.0 | Other/Proprietary License | n/a | NVIDIA CUDA — transitive via torch. We do NOT redistribute; user pip install pulls under NVIDIA EULA. |
+| `cuda-toolkit` | 13.0.2 | Other/Proprietary License | n/a | NVIDIA CUDA meta-package (extras resolve to the proprietary CUDA-13 libs) — transitive via torch. We do NOT redistribute; user pip install pulls under NVIDIA EULA. |
+| `nvidia-cublas` | 13.1.0.3 | Other/Proprietary License | n/a | NVIDIA CUDA — transitive via torch. We do NOT redistribute; user pip install pulls under NVIDIA EULA. |
+| `nvidia-cudnn-cu13` | 9.19.0.56 | Other/Proprietary License | n/a | NVIDIA CUDA — transitive via torch. We do NOT redistribute; user pip install pulls under NVIDIA EULA. |
+| `nvidia-cusparselt-cu13` | 0.8.0 | NVIDIA Proprietary Software | n/a | NVIDIA CUDA — transitive via torch. We do NOT redistribute; user pip install pulls under NVIDIA EULA. |
+| `nvidia-nccl-cu13` | 2.28.9 | Other/Proprietary License | n/a | NVIDIA CUDA — transitive via torch. We do NOT redistribute; user pip install pulls under NVIDIA EULA. |
+| `nvidia-nvshmem-cu13` | 3.4.5 | Other/Proprietary License | n/a | NVIDIA CUDA — transitive via torch. We do NOT redistribute; user pip install pulls under NVIDIA EULA. |
 
 
 ## Notes on specific packages
-
-### `docutils` (triple-licensed BSD/GPL/Public Domain)
-
-`docutils` is licensed under `BSD License; GNU General Public License (GPL); Public Domain`. As a recipient we elect to use the BSD terms, which are AGPL-compatible. No action required.
 
 ### `certifi` / `tqdm` (MPL-2.0)
 
@@ -208,7 +183,9 @@ Dual-licensed. We elect MIT.
 
 ### NVIDIA CUDA library transitive deps
 
-The 15 `nvidia-*-cu12` packages listed above are proprietary, pulled in by `torch` when the user has a CUDA-capable GPU. We never bundle these in our repo, installers, or Docker images. Users who install torch with GPU support receive them directly from PyPI under NVIDIA's EULA, which is a matter between the user and NVIDIA.
+The NVIDIA CUDA packages listed above are proprietary, pulled in by `torch` when the user has a CUDA-capable GPU (Linux only). As of torch 2.11 they arrive via the `cuda-toolkit` meta-package extras plus a few directly-declared `nvidia-*-cu13` wheels, replacing the earlier flat set of `nvidia-*-cu12` packages; the exact resolved set depends on the torch wheel and platform. We never bundle any of them in our repo, installers, or Docker images. Users who install torch with GPU support receive them directly from PyPI under NVIDIA's EULA, which is a matter between the user and NVIDIA.
+
+The open-source `cuda-pathfinder` helper (Apache-2.0) is a separate, non-proprietary transitive dep and is listed in the transitive table above, not here.
 
 The `install.py --cpu-only` flag installs a CPU-only torch wheel that avoids these entirely.
 

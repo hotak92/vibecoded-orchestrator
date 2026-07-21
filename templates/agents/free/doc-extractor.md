@@ -1,7 +1,7 @@
 ---
 name: doc-extractor
-description: Extract knowledge from scattered documentation - read-only, no modifications
-short_desc: extract knowledge from docs (read-only)
+description: Extract knowledge from scattered documentation - reads sources read-only, writes extraction reports and canonical docs
+short_desc: extract knowledge from docs (read sources, write reports)
 keywords: ["scattered documentation", "extraction report", "knowledge extraction", "consolidate documentation", "documentation extraction", "extract from documentation", "summarize docs", "documentation review", "knowledge consolidation"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet

@@ -3,8 +3,8 @@ title: "Claude Code CLI - Headless & Scripted Usage"
 type: tool
 tags: [tool, AI, claude-code, CLI, headless, scripting, session-management, orchestration, low-level-implementation]
 created: 2026-02-18T00:00:00Z
-updated: 2026-06-25T00:00:00Z
-valid_until: 2026-08-31T00:00:00Z
+updated: 2026-07-21T00:00:00Z
+valid_until: 2027-08-31T00:00:00Z
 status: active
 ---
 
@@ -128,20 +128,19 @@ Hooks in `.claude/hooks/` fire normally in CLI mode — no rebuild needed.
 
 **Limitation**: In headless (`-p`) mode, Claude Code blocks this flag behind an interactive TTY dialog for safety. The dialog cannot be answered non-interactively.
 
-**Workaround**: Use `DevChannelAuthorizer` to prime a session via PTY, capture the authorized session ID, then resume it in headless mode:
+**Workaround pattern (external — NOT shipped by VCO)**: an orchestrator that wraps the CLI can prime a session via a PTY (so the TTY dialog can be answered once), capture the authorized session ID, then resume it in headless mode. The sketch below is an *illustrative* external wrapper — `DevChannelAuthorizer` is a name for that pattern, not a class VCO provides:
 
 ```python
-# Orchestrator initialization
-auth = DevChannelAuthorizer()
+# Illustrative external wrapper — implement in your own orchestrator; VCO ships no such class.
+auth = DevChannelAuthorizer()                    # your PTY-priming helper
 sess = await auth.prime(entry="<channel>", project_dir=project_dir)
 
-# Per-call
+# Per-call: build the resume argv, prepending to the headless call:
+#   ['--resume', '<sid>', '--dangerously-load-development-channels', '<channel>']
 argv = await auth.build_resume_argv(entry="<channel>", project_dir=project_dir, cached=sess)
-# Prepend to headless call:
-# ['--resume', '<sid>', '--dangerously-load-development-channels', '<channel>']
 ```
 
-See documentation for automated development channels authorization via PTY. Opt-out: set environment variable to disable.
+The mechanism to build yourself: prime the session interactively through a PTY, cache the resulting session ID, then resume it non-interactively with `--resume <sid>` plus the channel flag.
 
 ## Other Notable Flags
 
