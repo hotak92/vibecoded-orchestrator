@@ -2448,6 +2448,219 @@ mod tests {
         assert_eq!(resolve_variant_tag(&manifest, "0.2.8", GpuMode::Cuda), "0.2.8");
     }
 
+    // ─── RL-13: supervisor image-variant LIVE smoke ─────────────────────
+    //
+    // The pure unit tests above pin `resolve_image_ref` / `resolve_variant_tag`
+    // against synthetic fixtures. RL-13 (RL audit) asked for something a
+    // fixture test can NOT provide: a LIVE verification that, on a real host,
+    //   (1) the REAL on-disk installed manifest,
+    //   (2) piped through the REAL persisted `gpu_mode_decided` from the
+    //       host's `launcher.hardware_snapshot`,
+    //   (3) through the SHIPPED `resolve_image_ref`,
+    // yields a variant tag that MATCHES the host's actual hardware, and that
+    //   (4) the SHIPPED `pre_pull_with_auth_for_start` resolves that ref
+    //       against the real container runtime WITHOUT falling through to an
+    //       anonymous pull that 401s on the private GHCR package (the exact
+    //       v0.2.46-era supervisor bug this whole path was built to fix).
+    //
+    // Env-gated (`RL13_LIVE_SMOKE=1`) + `#[ignore]` so it never runs in the
+    // normal `cargo test` / CI battery — it depends on machine-local state
+    // (`~/.vct/launcher.db`, an installed `vct-rl-reranker` module, a
+    // container runtime, an activated license). Run it explicitly on a host
+    // that has the RL module installed:
+    //
+    //   RL13_LIVE_SMOKE=1 cargo test -p vct-launcher-core \
+    //       rl13_supervisor_image_variant_live_smoke -- --ignored --nocapture
+    //
+    // GpuMode ↔ variant-suffix rule this asserts (from `resolve_variant_tag`):
+    //   Cuda → `-cuda`, Rocm → `-rocm`, Cpu|Metal → `-cpu`.
+
+    /// F-6: runtime-agnostic "is this image in local cache?" probe.
+    /// `podman` has an `image exists` subcommand (exit 0/1, no output);
+    /// `docker` has NO such subcommand — `docker image inspect <ref>` is the
+    /// equivalent (exit 0 iff present). Without this branch a docker host would
+    /// always report `now_cached == false` even after a successful authed pull,
+    /// failing assertion (5a) spuriously.
+    async fn rl13_image_cached(runtime: &str, image_ref: &str) -> bool {
+        let args: [&str; 2] = if runtime == "docker" {
+            ["image", "inspect"]
+        } else {
+            // podman (and any podman-compatible runtime) — `image exists`.
+            ["image", "exists"]
+        };
+        tokio::process::Command::new(runtime)
+            .args([args[0], args[1], image_ref])
+            // docker's `image inspect` prints the full JSON on success; silence
+            // it so the smoke's stdout stays readable (podman `image exists` is
+            // already silent).
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Read `gpu_mode_decided` from the host's persisted hardware snapshot in
+    /// `launcher.db`. This is the SAME row + JSON shape the hub-side
+    /// `read_persisted_gpu_mode_for_supervisor` consumes (module_supervisor.rs);
+    /// replicated here (the hub crate's helper is private) so the smoke reads
+    /// exactly what the supervisor would read at container-start time.
+    fn rl13_read_persisted_gpu_mode() -> Option<GpuMode> {
+        let db_path = crate::db::db_path();
+        // Read-only URI open so we never contend with the hub's writer lock.
+        let uri = format!("file:{}?mode=ro", db_path.display());
+        let conn = rusqlite::Connection::open_with_flags(
+            &uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .ok()?;
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM app_state WHERE key = ?1",
+                rusqlite::params!["launcher.hardware_snapshot"],
+                |row| row.get(0),
+            )
+            .ok()?;
+        let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        let mode_str = v.get("gpu_mode_decided").and_then(|x| x.as_str())?;
+        serde_json::from_value::<GpuMode>(serde_json::Value::String(mode_str.to_string())).ok()
+    }
+
+    #[tokio::test]
+    #[ignore = "RL-13 live smoke — needs installed vct-rl-reranker + runtime; run with RL13_LIVE_SMOKE=1 --ignored"]
+    async fn rl13_supervisor_image_variant_live_smoke() {
+        if std::env::var("RL13_LIVE_SMOKE").ok().as_deref() != Some("1") {
+            eprintln!("RL13_LIVE_SMOKE!=1 — skipping (set it to run the live smoke).");
+            return;
+        }
+
+        // (1) Load the REAL installed manifest from disk.
+        let module_dir = crate::paths::vct_root_dir()
+            .join("modules")
+            .join("vct-rl-reranker");
+        let manifest_path = module_dir.join("vct-module.json");
+        let raw = std::fs::read_to_string(&manifest_path).unwrap_or_else(|e| {
+            panic!(
+                "RL-13 smoke: cannot read installed manifest at {}: {} \
+                 (is the vct-rl-reranker module installed on this host?)",
+                manifest_path.display(),
+                e
+            )
+        });
+        let manifest = crate::manifest::ModuleManifest::from_json(&raw)
+            .expect("RL-13 smoke: parse installed manifest");
+        assert_eq!(manifest.id, "vct-rl-reranker", "unexpected module id");
+        assert!(
+            manifest.runtime.gpu_image_variants.is_some(),
+            "RL-13 smoke: installed manifest must declare gpu_image_variants \
+             (else the variant path is untested)"
+        );
+        eprintln!(
+            "[RL-13] manifest: id={} version={} image={:?}",
+            manifest.id,
+            manifest.version,
+            manifest.install.container.as_ref().map(|c| &c.image)
+        );
+
+        // (2) Read the REAL persisted gpu_mode from the host snapshot.
+        let gpu_mode = rl13_read_persisted_gpu_mode().unwrap_or_else(|| {
+            panic!(
+                "RL-13 smoke: no gpu_mode_decided in launcher.hardware_snapshot \
+                 — cannot verify variant↔hardware match without it"
+            )
+        });
+        eprintln!("[RL-13] persisted gpu_mode_decided = {:?}", gpu_mode);
+
+        // (3) Drive the SHIPPED resolver with the manifest's declared
+        // image_ref template ({module_image}) — exactly as the supervisor does
+        // (module_supervisor.rs:159): first `RuntimeBlock::resolve_image_ref`
+        // yields the template, then the free `resolve_image_ref` substitutes
+        // + applies the GPU variant suffix.
+        let container_block = manifest
+            .install
+            .container
+            .as_ref()
+            .expect("RL-13 smoke: install.container block required");
+        let image_template = manifest
+            .runtime
+            .resolve_image_ref(container_block, &manifest.version);
+        let resolved =
+            resolve_image_ref(&image_template, &manifest, Some(gpu_mode)).expect("RL-13 smoke: resolve_image_ref");
+        eprintln!("[RL-13] RESOLVED image ref = {}", resolved);
+
+        // (3a) The resolved ref must carry NO unresolved template braces —
+        // the literal `{module_image}` left-behind was the v0.2.46-era bug
+        // signature (`module_installs.last_error`).
+        assert!(
+            !resolved.contains('{') && !resolved.contains('}'),
+            "RL-13 smoke: resolved ref still has unresolved placeholders: {}",
+            resolved
+        );
+
+        // (4) The variant suffix MUST match the host's hardware per the rule.
+        let expected_suffix = match gpu_mode {
+            GpuMode::Cuda => "-cuda",
+            GpuMode::Rocm => "-rocm",
+            GpuMode::Cpu | GpuMode::Metal => "-cpu",
+        };
+        assert!(
+            resolved.ends_with(expected_suffix),
+            "RL-13 smoke: resolved ref {} does not carry the {:?} variant suffix \
+             {} required by this host's gpu_mode",
+            resolved,
+            gpu_mode,
+            expected_suffix
+        );
+        // And it must be tagged with the manifest's own version (tag_from_version).
+        assert!(
+            resolved.contains(&format!(":{}", manifest.version)),
+            "RL-13 smoke: resolved ref {} does not carry manifest version {}",
+            resolved,
+            manifest.version
+        );
+
+        // (5) Drive the SHIPPED pre-pull against the REAL runtime. This is the
+        // load-bearing live half: if the image is cache-resident it returns
+        // Ok via the `<runtime> image exists` fast-path (proving the resolver
+        // named a real, pullable tag — NOT the anonymous-401 bug). If it is
+        // NOT cached, `pre_pull_with_auth_for_start` requests a pull token
+        // from the live gateway using the activated license and pulls with a
+        // per-pull authfile — proving the authed path end-to-end.
+        let runtime = detect_container_runtime(None)
+            .await
+            .expect("RL-13 smoke: a container runtime (podman/docker) must be present");
+        eprintln!("[RL-13] container runtime = {}", runtime);
+
+        let cached = rl13_image_cached(&runtime, &resolved).await;
+        eprintln!("[RL-13] image cache-resident before pre-pull = {}", cached);
+
+        pre_pull_with_auth_for_start(&manifest, &runtime, &resolved)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "RL-13 smoke: pre_pull_with_auth_for_start FAILED for {} — \
+                     this is the supervisor image-variant/auth path RL-13 verifies. \
+                     Error: {}",
+                    resolved, e
+                )
+            });
+
+        // (5a) After a successful pre-pull the image MUST be in local cache
+        // (either it already was, or the authed pull just landed it).
+        let now_cached = rl13_image_cached(&runtime, &resolved).await;
+        assert!(
+            now_cached,
+            "RL-13 smoke: image {} not in cache after a successful pre-pull",
+            resolved
+        );
+
+        eprintln!(
+            "[RL-13] PASS — gpu_mode={:?} → resolved={} → pre-pull OK (cached_before={}, cached_after={})",
+            gpu_mode, resolved, cached, now_cached
+        );
+    }
+
     #[test]
     fn build_podman_run_args_includes_port_mapping() {
         let manifest = make_manifest(true, true);
