@@ -7,7 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.87] - 2026-07-22
+
+### Changed
+
+- **Linux keychain access holds one persistent Secret Service connection**
+  (lazily created, reconnects if the daemon restarts, gracefully closed on
+  hub/launcher exit with a bounded non-blocking drain). Removes the per-
+  operation connect/disconnect churn that could crash gnome-keyring 46.1
+  mid-dispatch and leave the login keyring locked. Stored entries resolve
+  unchanged (on-disk scheme preserved and pinned by tests).
+- **RL retrieval telemetry now captures complete training examples**: code-
+  graph events carry embeddings; answer chunks persist as embeddings +
+  hashes (answer text is never stored); near-chunk context, per-slot
+  model/dim tags, and soft labels are logged; events are size-guarded with
+  a documented drop priority that never touches the core label or the core
+  net inputs. Chunk boundaries always follow the active model's own preset —
+  dual-embedding write never reduces active-slot chunk fidelity; a secondary
+  slot whose context window is smaller embeds a bounded sub-window and the
+  chunk is tagged (`secondary_truncated_slots`) so truncated vectors can be
+  partitioned at training time. A chunker-revision change now emits the
+  documented re-index deferral. `EMBEDDING_MODEL` overrides are honored in
+  chunk sizing, and MCP-path citations recover their retrieval pairing via
+  timestamp fallback.
+- **Arctic as an opt-in secondary embedding slot**
+  (`DUAL_EMBEDDING_ARCTIC_SECONDARY`): a qwen3-active install can collect
+  dual-space training data (`arctic2_embed`) without changing its active
+  retrieval model. Single-slot events remain fully valid — the dual fan-out
+  is additive and a failed secondary never affects the active-slot event.
+- **RL event ingestion accepts large embedding payloads**: the hub's
+  `rl/events` route sets an explicit 16 MiB body limit (embedding-heavy
+  events legitimately exceed the old 2 MB framework default), and the
+  client-side trim is now a pathological-case backstop only.
+- **RL serving port self-heals**: the launcher reconciles the module port
+  record to the actually-bound container port (introspection only — running
+  containers are never restarted).
+
+### Added
+
+- **Stale service-unit reconcile in the update flow**: user systemd units
+  created for this install whose entrypoint provably no longer resolves are
+  disabled and backup-moved (with a restore sidecar and a deferral record);
+  probe errors and ambiguous unit shapes are always left alone.
+- **Launcher surfaces for existing backends**: cross-project secret
+  grant/pause management in the Secrets panel, shared-KG write-gate toggle,
+  background-service-on-login toggle, stuck-container Recover action,
+  auto-retry opt-out for failed module installs, and a starter-diagram
+  command for the Diagrams tab.
+
 ### Fixed
+
+- **Launcher GUI honesty pass**: profile saves now actually persist (the
+  update was never awaited), placebo download preferences with no backing
+  implementation were removed, and error banners no longer swallow retry
+  failures silently.
+- **Embedding batch calls survive small-context models**: inputs exceeding a
+  model's context window are embedded over a bounded sub-window instead of
+  failing the request, and one oversized item no longer poisons the whole
+  batch.
+- **Test-suite hermeticity for RL telemetry**: the event poster refuses
+  writes from test contexts, so running the test suite can no longer insert
+  fixture events into the real event store.
 
 - **lean-ctx never wraps credential-bearing commands (SEC-RAW)**: the
   `lean-ctx-rewrite` hook pair now scans each Bash command for credential
