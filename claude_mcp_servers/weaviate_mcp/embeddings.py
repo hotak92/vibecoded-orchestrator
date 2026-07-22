@@ -309,6 +309,47 @@ async def _get_both_embeddings(text: str) -> tuple[list[float] | None, list[floa
     return ollama_vec, openai_vec
 
 
+async def _get_all_kg_embeddings_tagged(
+    text: str,
+) -> "tuple[dict[str, list[float]], list[str]]":
+    """Like ``_get_all_kg_embeddings`` but also returns the truncated-slot tag.
+
+    Returns ``(slots, secondary_truncated_slots)`` where the second element is the
+    sorted list of SECONDARY slot names whose vector was embedded from a bounded
+    leading sub-window on THIS call (R3-2). ``store_knowledge_node`` persists that
+    list as the ``secondary_truncated_slots`` chunk property so stored secondary
+    (e.g. arctic) vectors can be partitioned truncated-vs-full from stored data.
+
+    The tag is captured ATOMICALLY with the vectors via
+    ``EmbeddingService.embed_text_all_configured_tagged`` (inside the same
+    ``to_thread`` boundary), so a concurrent write can't reset the per-instance
+    truncated record between the embed and the read. The legacy inline-gather
+    fallback (EmbeddingService unavailable) has no per-model num_ctx bounding and
+    therefore reports an empty truncated list — no secondary was sub-windowed on
+    that path.
+    """
+    from . import server
+    svc = server._get_embedding_service()
+    if svc is not None:
+        try:
+            slots, truncated = await asyncio.to_thread(
+                svc.embed_text_all_configured_tagged, text
+            )
+            if slots:
+                return slots, list(truncated)
+            server.logger.warning(
+                "_get_all_kg_embeddings_tagged: EmbeddingService returned no "
+                "slots; falling back to inline gather"
+            )
+        except Exception as e:
+            server.logger.warning(
+                "_get_all_kg_embeddings_tagged via EmbeddingService failed (%s); "
+                "falling back to inline gather", e
+            )
+    # Inline fallback path bounds nothing → no secondary was truncated.
+    return (await _get_all_kg_embeddings(text)), []
+
+
 async def _get_all_kg_embeddings(text: str) -> dict[str, list[float]]:
     """Get all KG embedding variants — every reachable text backend.
 
@@ -319,7 +360,9 @@ async def _get_all_kg_embeddings(text: str) -> dict[str, list[float]]:
     half-migrated installs.
 
     Used by `store_knowledge_node` to populate every configured slot on
-    every write — so search-after-model-switch keeps working.
+    every write — so search-after-model-switch keeps working. For the
+    truncated-tag-carrying variant the write path uses, see
+    ``_get_all_kg_embeddings_tagged`` (R3-2).
     """
     from . import server
     svc = server._get_embedding_service()

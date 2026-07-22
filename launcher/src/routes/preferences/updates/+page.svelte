@@ -46,6 +46,9 @@
   let nonFastForward = $state<NonFastForwardError | null>(null);
   let userOwnedPaths = $state<string[]>([]);
   let autoCheckEnabled = $state(true);
+  // Auto-retry failed module installs on orchestrator update. Backend
+  // default is true; this toggle exposes the opt-out.
+  let autoRetryFailedInstalls = $state(true);
 
   // v0.2.35 Agent K — running-version display + binary-lag warning.
   // `runningVersion` is the launcher's compile-time CARGO_PKG_VERSION
@@ -126,6 +129,8 @@
       if (paths) userOwnedPaths = paths;
       const auto = await invoke<boolean>('get_auto_check_enabled');
       if (auto !== null) autoCheckEnabled = auto;
+      const retry = await invoke<boolean>('get_auto_retry_failed_installs_setting');
+      if (retry !== null) autoRetryFailedInstalls = retry;
     } catch (e) {
       console.warn('[updates] loadCached skipped:', e);
     }
@@ -253,6 +258,21 @@
     } catch (e) {
       toast.error(String(e));
       autoCheckEnabled = !enabled; // revert on failure
+    }
+  }
+
+  async function toggleAutoRetryFailedInstalls(enabled: boolean) {
+    autoRetryFailedInstalls = enabled;
+    try {
+      await invoke('set_auto_retry_failed_installs_setting', { enabled });
+      toast.success(
+        enabled
+          ? 'Auto-retry of failed module installs enabled'
+          : 'Auto-retry of failed module installs disabled',
+      );
+    } catch (e) {
+      toast.error(String(e));
+      autoRetryFailedInstalls = !enabled; // revert on failure
     }
   }
 
@@ -453,6 +473,14 @@
           onchange={(e) => toggleAutoCheck((e.target as HTMLInputElement).checked)}
         />
         <span>Check for updates automatically once per day</span>
+      </label>
+      <label class="upd-toggle">
+        <input
+          type="checkbox"
+          checked={autoRetryFailedInstalls}
+          onchange={(e) => toggleAutoRetryFailedInstalls((e.target as HTMLInputElement).checked)}
+        />
+        <span>Automatically retry failed module installs after an orchestrator update</span>
       </label>
     </section>
   </main>

@@ -978,6 +978,20 @@ pub fn run() {
                             running,
                         );
                     }
+                    // R2-4: chunker-REVISION deferral. Independent of the semver
+                    // boundary above (which only fired across the one-off v0.2.46
+                    // launcher-version crossing and never again). This compares
+                    // the live `_CHUNKER_REVISION` sentinel from chunking.py
+                    // against the persisted last-seen value and, on change, writes
+                    // the same re-sync deferral — the consumer the sentinel's own
+                    // contract comment always promised. Runs every boot (not
+                    // gated on VersionChanged) so a chunking.py revision bump
+                    // shipped without a launcher-version bump is still detected.
+                    // Soft-fails: any read/DB/python error Skips without blocking
+                    // boot.
+                    let _ = commands::chunker_revision_deferral::write_chunker_deferral_if_revision_changed(
+                        db.inner(),
+                    );
                     if matches!(
                         bust_outcome,
                         commands::module_catalog_client::VersionBustOutcome::VersionChanged { .. }
@@ -2217,6 +2231,7 @@ pub fn run() {
             commands::projects_v2::perform_hard_cut,
             commands::projects_v2::rename_project_v2,
             commands::projects_v2::set_shared_kg_write_disabled,
+            commands::projects_v2::get_shared_kg_write_disabled_cmd,
             // v0.2.46 Decision B — symmetric READ gate. Mirrors
             // set_shared_kg_write_disabled in shape; defaults off.
             commands::projects_v2::set_shared_kg_read_disabled,
@@ -2477,6 +2492,7 @@ pub fn run() {
             // names; renaming would break their stubs at merge time.
             commands::diagrams_cmd::list_project_diagrams,
             commands::diagrams_cmd::register_project_diagram,
+            commands::diagrams_cmd::create_starter_diagram_file,
             commands::diagrams_cmd::unregister_project_diagram,
             commands::diagrams_cmd::set_project_diagram_enabled,
             commands::diagrams_cmd::list_diagram_snapshots,
@@ -2559,6 +2575,7 @@ pub fn run() {
             commands::secrets_cmd::list_grants_for_project,
             commands::secrets_cmd::pause_secret_for_project,
             commands::secrets_cmd::resume_secret_for_project,
+            commands::secrets_cmd::is_secret_paused_for_requester,
             // v0.2.46 V47-C followup (landed with V47-G-final): stub Tauri
             // wrapper for the per-project SecretsTab's "Migrate from .env"
             // button. Returns an "unavailable" error today; full Rust
@@ -2912,6 +2929,10 @@ pub fn run() {
             commands::hub_proxy::hub_list_apps,
             commands::hub_proxy::hub_poll_messages,
             commands::hub_proxy::hub_data_catalog,
+            // Hub boot autostart toggle (Preferences → Startup). Wraps
+            // `vct-hub --{register,unregister,}-boot`.
+            commands::hub_proxy::get_hub_boot_autostart,
+            commands::hub_proxy::set_hub_boot_autostart,
             // Dashboard: tier, features, MCP management
             commands::dashboard::get_feature_flags,
             commands::dashboard::get_orchestrator_config,
@@ -2962,8 +2983,24 @@ pub fn run() {
             commands::update_handoff::prepare_windows_update_handoff,
             commands::update_handoff::get_update_recovery_report,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        // v0.3.0 (WP-K): build then run with a RunEvent handler so launcher
+        // exit gracefully closes the persistent keychain Secret-Service
+        // connection (Linux). `.run(context)` alone gives no exit hook; the
+        // callback form does. On `RunEvent::Exit` we drain the connection —
+        // one clean client disconnect at a controlled moment instead of an
+        // abrupt process-teardown mid-op (mitigates the gnome-keyring
+        // disconnect-mid-dispatch fragility). BOUNDED: the drain uses a
+        // `try_lock` with a ≤250ms deadline, so if the keychain worker is
+        // mid-op (e.g. parked on a user unlock prompt) the drain is SKIPPED and
+        // the process teardown closes the socket — exit is never stalled on a
+        // prompt. No-op on Windows / macOS.
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                vct_launcher_core::secrets::shutdown_keychain_connection();
+            }
+        });
 }
 
 // v0.2.21 Step 5: `pid_is_alive` moved to `vct-launcher-core::process`

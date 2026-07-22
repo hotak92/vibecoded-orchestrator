@@ -76,6 +76,14 @@ async fn run_foreground() {
     wait_for_shutdown_signal().await;
 
     eprintln!("[vct-hub] shutting down");
+    // v0.3.0 (WP-K): best-effort graceful close of the persistent keychain
+    // Secret-Service connection (Linux). One clean client disconnect at a
+    // controlled moment instead of an abrupt teardown mid-op — a mitigation of
+    // the gnome-keyring disconnect-mid-dispatch fragility. BOUNDED: the drain
+    // uses a `try_lock` with a ≤250ms deadline, so a keychain worker mid-op
+    // (e.g. parked on a user unlock prompt) is left to the abrupt process
+    // teardown rather than stalling hub shutdown. No-op on Windows / macOS.
+    vct_launcher_core::secrets::shutdown_keychain_connection();
     // F-6 (v0.2.73): pid-owned release — never remove a lockfile that a
     // NEWER hub has since claimed (stale-version takeover while we were
     // being signalled).

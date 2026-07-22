@@ -242,6 +242,12 @@ const MCP_RELEVANT_ENV_KEYS: &[&str] = &[
     "CODE_EMBED_URL",
     "CODE_EMBED_PORT",
     "CODE_EMBED_SERVICE_URL",
+    // NOTE (WP-Q item 3 / G6): RL_SERVER_URL / RL_SERVER_PORT are NOT listed
+    // here on purpose. Per the H.1 contract they are NOT projected into
+    // settings.json env at all — the MCP resolves the RL port live from the
+    // hub's ProjectConfig.rl_server_port (module_ports SoT), so there is no
+    // settings.json write to hash-gate a reload on. See
+    // tests/test_f7_mcp_relevant_env_keys_coverage.py DOCUMENTED_EXCLUSIONS.
     // --- search MCP ---
     "OPENALEX_EMAIL",
 ];

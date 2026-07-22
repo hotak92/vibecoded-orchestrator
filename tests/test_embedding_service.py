@@ -52,16 +52,19 @@ from vco_lib.embedding_providers.openai import (
     ValidationResult,
 )
 from vco_lib.embedding_service import (
+    ARCTIC_SECONDARY_MODEL,
     DEFAULT_CODE_MODEL,
     DEFAULT_EMBED_REQUEST_TIMEOUT_SECS,
     DEFAULT_TEXT_MODEL,
     DEFAULT_TEXT_SLOT,
+    DUAL_EMBEDDING_ARCTIC_SECONDARY_ENV,
     DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV,
     EMBED_REQUEST_TIMEOUT_ENV,
     OPENAI_MODEL_ID_PREFIX,
     EmbeddingService,
     ModelChoice,
     NoEmbeddingBackendError,
+    _resolve_arctic_secondary,
     _resolve_code_slot,
     _resolve_embed_request_timeout,
     _resolve_text_slot,
@@ -192,6 +195,10 @@ class _EnvIsolation:
         "VCT_ORCHESTRATOR_ROOT",
         # v0.2.71 Piece 5c: secondary-slot write toggle (default OFF).
         "DUAL_EMBEDDING_WRITE_ALL_SLOTS",
+        # WP-O: arctic-secondary opt-in (default OFF). Isolated so the host
+        # machine's flipped flag can't leak into these unit tests.
+        "DUAL_EMBEDDING_ARCTIC_SECONDARY",
+        "OPENAI_EMBEDDING_API_KEY",
     )
 
     def __enter__(self):
@@ -1435,12 +1442,20 @@ class EmbeddingServiceMethodTests(unittest.TestCase):
     def test_embed_text_all_configured_active_only(self):
         # qwen3 model, ollama reachable, no openai key — should produce
         # just qwen3_embed slot (no fallback duplicates).
-        svc, _ = _make_service_with_mocks(text_model=DEFAULT_TEXT_MODEL)
-        try:
-            result = svc.embed_text_all_configured("hello")
-            self.assertEqual(list(result.keys()), ["qwen3_embed"])
-        finally:
-            svc.close()
+        # Env-hermetic (WP-O): the default-OFF invariant is what this pins, so it
+        # must clear any ambient dual flags (WRITE_ALL / ARCTIC_SECONDARY) — an
+        # install that enables them in .claude/env would otherwise leak a secondary
+        # arctic slot in and the "active only" assertion fails (same env-leak class
+        # as R2-2).
+        with _EnvIsolation():
+            os.environ.pop(DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV, None)
+            os.environ.pop(DUAL_EMBEDDING_ARCTIC_SECONDARY_ENV, None)
+            svc, _ = _make_service_with_mocks(text_model=DEFAULT_TEXT_MODEL)
+            try:
+                result = svc.embed_text_all_configured("hello")
+                self.assertEqual(list(result.keys()), ["qwen3_embed"])
+            finally:
+                svc.close()
 
     def test_embed_text_all_configured_with_openai_fallback(self):
         # qwen3 is active; openai key is configured and valid. Both
@@ -2637,6 +2652,323 @@ class DualWriteAllSlotsToggleTests(unittest.TestCase):
                     slots,
                     f"active slot must always be written (toggle={toggle!r})",
                 )
+
+
+class ArcticSecondaryFanoutTests(unittest.TestCase):
+    """WP-O — arctic as a locally-served SECONDARY text slot (R2-5 fix).
+
+    A qwen3-ACTIVE install with ``DUAL_EMBEDDING_WRITE_ALL_SLOTS`` +
+    ``DUAL_EMBEDDING_ARCTIC_SECONDARY`` both on must fan out an ``arctic2_embed``
+    secondary vector (via Ollama ``snowflake-arctic-embed2:latest``) so the
+    arctic RL corpus fills without switching the ACTIVE model. Two-layer gating:
+    the master write-all gate AND the dedicated arctic gate must BOTH be on, and
+    arctic must not already be the active slot.
+    """
+
+    def test_arctic_resolver_default_off(self):
+        with _EnvIsolation():
+            os.environ.pop(DUAL_EMBEDDING_ARCTIC_SECONDARY_ENV, None)
+            self.assertFalse(
+                _resolve_arctic_secondary(),
+                "DUAL_EMBEDDING_ARCTIC_SECONDARY must default OFF (opt-in)",
+            )
+
+    def test_arctic_resolver_truthy_and_garbage(self):
+        for val, want in (
+            ("1", True), ("true", True), ("YES", True), ("On", True),
+            ("0", False), ("false", False), ("", False), ("maybe", False),
+        ):
+            with _EnvIsolation(), patch.dict(
+                os.environ, {DUAL_EMBEDDING_ARCTIC_SECONDARY_ENV: val}, clear=False
+            ):
+                self.assertEqual(_resolve_arctic_secondary(), want, f"{val!r}")
+
+    def test_qwen_active_arctic_secondary_on_writes_both_slots(self):
+        """RED-PROOF (i): qwen3 active + write-all + arctic-secondary → BOTH
+        qwen3_embed AND arctic2_embed present. On pre-WP-O code (no arctic fan-out
+        branch) the arctic slot is absent → this FAILS.
+        """
+        with _EnvIsolation(), patch.dict(
+            os.environ,
+            {
+                "ACTIVE_EMBEDDING": "qwen3",
+                DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV: "true",
+                DUAL_EMBEDDING_ARCTIC_SECONDARY_ENV: "true",
+            },
+            clear=False,
+        ):
+            svc, _ = _make_service_with_mocks(
+                text_model=DEFAULT_TEXT_MODEL,  # qwen3 active
+                ollama_ready=True,
+            )
+            try:
+                slots = svc.embed_text_all_configured("hello world")
+            finally:
+                svc.close()
+            self.assertEqual(svc.text_vector_slot, "qwen3_embed")
+            self.assertIn("qwen3_embed", slots, "active qwen3 slot must be written")
+            self.assertIn(
+                "arctic2_embed",
+                slots,
+                "arctic secondary must be fanned out on a qwen3-active install "
+                "when DUAL_EMBEDDING_ARCTIC_SECONDARY is on (R2-5 fix)",
+            )
+
+    def test_arctic_secondary_uses_arctic_model_id(self):
+        # The secondary arctic embed must call Ollama with the arctic model id
+        # (so num_ctx auto-resolves to arctic's 4 096, not qwen3's).
+        with _EnvIsolation(), patch.dict(
+            os.environ,
+            {
+                "ACTIVE_EMBEDDING": "qwen3",
+                DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV: "true",
+                DUAL_EMBEDDING_ARCTIC_SECONDARY_ENV: "true",
+            },
+            clear=False,
+        ):
+            svc, _ = _make_service_with_mocks(
+                text_model=DEFAULT_TEXT_MODEL, ollama_ready=True
+            )
+            try:
+                svc.embed_text_all_configured("hi")
+            finally:
+                svc.close()
+            called_models = {c.args[0] for c in svc.ollama.embed.call_args_list}
+            self.assertIn(
+                ARCTIC_SECONDARY_MODEL,
+                called_models,
+                "arctic secondary must embed via the arctic Ollama model id so "
+                "the per-model num_ctx (4 096) is used",
+            )
+
+    def test_arctic_gate_off_no_arctic_slot(self):
+        """RED-PROOF (ii)-partial: write-all ON but arctic gate OFF → no arctic
+        slot (the dedicated gate genuinely gates)."""
+        with _EnvIsolation(), patch.dict(
+            os.environ,
+            {
+                "ACTIVE_EMBEDDING": "qwen3",
+                DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV: "true",
+            },
+            clear=False,
+        ):
+            os.environ.pop(DUAL_EMBEDDING_ARCTIC_SECONDARY_ENV, None)
+            svc, _ = _make_service_with_mocks(
+                text_model=DEFAULT_TEXT_MODEL, ollama_ready=True
+            )
+            try:
+                slots = svc.embed_text_all_configured("hello")
+            finally:
+                svc.close()
+            self.assertNotIn(
+                "arctic2_embed",
+                slots,
+                "arctic gate OFF must NOT write the arctic secondary",
+            )
+
+    def test_dual_off_arctic_gate_on_is_single_slot(self):
+        """RED-PROOF (ii): master write-all OFF makes the arctic gate inert →
+        single active slot only, byte-identical to the default install (the
+        arctic gate never overrides the master gate)."""
+        with _EnvIsolation(), patch.dict(
+            os.environ,
+            {
+                "ACTIVE_EMBEDDING": "qwen3",
+                DUAL_EMBEDDING_ARCTIC_SECONDARY_ENV: "true",
+            },
+            clear=False,
+        ):
+            os.environ.pop(DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV, None)
+            svc, _ = _make_service_with_mocks(
+                text_model=DEFAULT_TEXT_MODEL, ollama_ready=True
+            )
+            try:
+                slots = svc.embed_text_all_configured("hello")
+            finally:
+                svc.close()
+            self.assertEqual(
+                set(slots.keys()),
+                {svc.text_vector_slot},
+                "write-all OFF must write ONLY the active slot even when the "
+                "arctic gate is on (master gate wins)",
+            )
+
+    def test_bounded_for_secondary_truncates_and_tags(self):
+        """WP-O rework: `_bounded_for_secondary` returns a bounded leading window +
+        truncated=True when the text exceeds the model's num_ctx char budget, and
+        (text, False) when it fits or the model is unregistered."""
+        from vco_lib.embedding_service import _bounded_for_secondary, _CHARS_PER_TOKEN
+        # arctic num_ctx = 4096 → char budget 4096*4.
+        budget = 4096 * _CHARS_PER_TOKEN
+        big = "x" * (budget + 5000)
+        sub, trunc = _bounded_for_secondary(big, ARCTIC_SECONDARY_MODEL)
+        self.assertTrue(trunc, "oversized text must be flagged truncated")
+        self.assertEqual(len(sub), budget, "sub-window must be exactly the char budget")
+        # Fits → no truncation.
+        small = "x" * 100
+        sub2, trunc2 = _bounded_for_secondary(small, ARCTIC_SECONDARY_MODEL)
+        self.assertFalse(trunc2)
+        self.assertEqual(sub2, small)
+        # Unregistered model → never bound (full text).
+        sub3, trunc3 = _bounded_for_secondary(big, "totally-unknown-model:42b")
+        self.assertFalse(trunc3)
+        self.assertEqual(sub3, big)
+
+    def test_oversized_chunk_tags_arctic_secondary_active_full_fidelity(self):
+        """WP-O rework RED-PROOF (tagged-degradation + active fidelity): a chunk
+        larger than arctic's num_ctx must (a) tag arctic2_embed in
+        last_secondary_truncated, (b) embed the arctic secondary from a BOUNDED
+        sub-window, while (c) the ACTIVE qwen3 slot is embedded from the FULL text.
+        Reverting `_bounded_for_secondary` to pass the full text to every secondary
+        would clear the tag → this fails.
+        """
+        from vco_lib.embedding_service import _CHARS_PER_TOKEN
+        with _EnvIsolation(), patch.dict(
+            os.environ,
+            {
+                "ACTIVE_EMBEDDING": "qwen3",
+                DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV: "true",
+                DUAL_EMBEDDING_ARCTIC_SECONDARY_ENV: "true",
+            },
+            clear=False,
+        ):
+            svc, _ = _make_service_with_mocks(
+                text_model=DEFAULT_TEXT_MODEL, ollama_ready=True
+            )
+            # A chunk sized to qwen3's xlarge budget (well over arctic's 4096 ctx).
+            big = "word " * (5000 * _CHARS_PER_TOKEN)  # far over arctic's char budget
+            captured: dict[str, int] = {}
+
+            def _embed(model, text, *a, **k):
+                captured[model] = len(text)
+                return [0.1, 0.2, 0.3]
+            svc.ollama.embed.side_effect = _embed
+            try:
+                slots = svc.embed_text_all_configured(big)
+                truncated = svc.last_secondary_truncated
+            finally:
+                svc.close()
+            # Both slots written.
+            self.assertIn("qwen3_embed", slots)
+            self.assertIn("arctic2_embed", slots)
+            # (a) arctic slot tagged truncated.
+            self.assertTrue(
+                truncated.get("arctic2_embed"),
+                "an oversized chunk must tag arctic2_embed as secondary-truncated",
+            )
+            # (b) arctic embedded from a BOUNDED sub-window (< full text).
+            arctic_len = captured[ARCTIC_SECONDARY_MODEL]
+            self.assertLess(
+                arctic_len, len(big),
+                "arctic secondary must embed a bounded sub-window, not the full chunk",
+            )
+            # (c) the ACTIVE qwen3 slot saw the FULL text (fidelity ≥ single-write).
+            self.assertEqual(
+                captured[DEFAULT_TEXT_MODEL], len(big),
+                "the ACTIVE slot must embed the FULL chunk — its fidelity must never "
+                "drop below single-write (no-functionality-loss rule)",
+            )
+            # active slot is NEVER in the truncation record.
+            self.assertNotIn("qwen3_embed", truncated)
+
+    def test_fitting_chunk_no_truncation_tag(self):
+        # A small chunk within arctic's window → both slots faithful, no tag.
+        with _EnvIsolation(), patch.dict(
+            os.environ,
+            {
+                "ACTIVE_EMBEDDING": "qwen3",
+                DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV: "true",
+                DUAL_EMBEDDING_ARCTIC_SECONDARY_ENV: "true",
+            },
+            clear=False,
+        ):
+            svc, _ = _make_service_with_mocks(
+                text_model=DEFAULT_TEXT_MODEL, ollama_ready=True
+            )
+            try:
+                svc.embed_text_all_configured("a short chunk")
+                truncated = svc.last_secondary_truncated
+            finally:
+                svc.close()
+            self.assertEqual(
+                truncated, {},
+                "a chunk within every secondary's num_ctx must tag nothing",
+            )
+
+    def test_arctic_secondary_failure_does_not_drop_active_slot(self):
+        """User ruling (2026-07-22): dual fan-out is ADDITIVE — a single-slot event
+        is a valid first-class training entry. A transient arctic-secondary embed
+        FAILURE must NOT drop the qwen3 active slot (nor mark it incomplete). The
+        active slot is embedded first and each secondary is soft-fail per-slot.
+        """
+        with _EnvIsolation(), patch.dict(
+            os.environ,
+            {
+                "ACTIVE_EMBEDDING": "qwen3",
+                DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV: "true",
+                DUAL_EMBEDDING_ARCTIC_SECONDARY_ENV: "true",
+            },
+            clear=False,
+        ):
+            svc, _ = _make_service_with_mocks(
+                text_model=DEFAULT_TEXT_MODEL, ollama_ready=True
+            )
+            # Make ONLY the arctic secondary embed raise; the active qwen3 embed
+            # (routed via the same adapter, different model id) still succeeds.
+            def _embed(model, text, *a, **k):
+                if model == ARCTIC_SECONDARY_MODEL:
+                    raise RuntimeError("arctic transiently down")
+                return [0.1, 0.2, 0.3]
+            svc.ollama.embed.side_effect = _embed
+            try:
+                slots = svc.embed_text_all_configured("hello")
+            finally:
+                svc.close()
+            self.assertIn(
+                "qwen3_embed", slots,
+                "a failed arctic secondary must NOT drop the qwen3 active slot — "
+                "the single-slot qwen3 event stays valid (additive fan-out ruling)",
+            )
+            self.assertNotIn(
+                "arctic2_embed", slots,
+                "the failed arctic slot is simply omitted (soft-fail per slot), "
+                "not fatal to the active event",
+            )
+
+    def test_arctic_active_no_self_duplication(self):
+        # When arctic IS the active slot, the arctic secondary branch must not
+        # re-write it (no self-duplication); qwen3 secondary still applies.
+        with _EnvIsolation(), patch.dict(
+            os.environ,
+            {
+                "EMBEDDING_MODEL": ARCTIC_SECONDARY_MODEL,
+                DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV: "true",
+                DUAL_EMBEDDING_ARCTIC_SECONDARY_ENV: "true",
+            },
+            clear=False,
+        ):
+            svc, _ = _make_service_with_mocks(
+                text_model=ARCTIC_SECONDARY_MODEL, ollama_ready=True
+            )
+            try:
+                slots = svc.embed_text_all_configured("hi")
+            finally:
+                svc.close()
+            self.assertEqual(svc.text_vector_slot, "arctic2_embed")
+            # arctic active + qwen3 secondary; arctic written once (as active).
+            self.assertIn("arctic2_embed", slots)
+            self.assertIn("qwen3_embed", slots)
+            # The arctic model id should be embedded exactly once (the active
+            # path), not twice (active + duplicated secondary).
+            arctic_calls = [
+                c for c in svc.ollama.embed.call_args_list
+                if c.args and c.args[0] == ARCTIC_SECONDARY_MODEL
+            ]
+            self.assertEqual(
+                len(arctic_calls), 1,
+                "arctic must be embedded once when active, not duplicated by the "
+                "secondary branch",
+            )
 
 
 if __name__ == "__main__":

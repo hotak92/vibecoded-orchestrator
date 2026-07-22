@@ -6692,10 +6692,96 @@ def _emit_chunker_resync_deferral(
         command_to_apply=cmd,
         severity="info",
         kg_node_refs=[
-            "knowledge/concepts/parallel-pr-coordination-gotchas-2026-05-10.md",
+            "knowledge/concepts/score-driven-retrieval-tiers.md",
         ],
     )
     # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
+    _de.emit(folder, entry)
+
+
+def current_chunker_revision() -> str:
+    """Return the live ``_CHUNKER_REVISION`` sentinel from chunking.py.
+
+    ONE reader for the sentinel string so both the Python-side callers and the
+    launcher (via a tiny ``python -c`` subprocess) agree on the current value.
+    The sentinel is bumped whenever MODEL_TOKEN_LIMITS / CHUNKING_PRESETS change
+    chunk boundaries; a mismatch against the launcher's last-seen value is what
+    triggers the re-sync deferral (R2-4).
+    """
+    # Import lazily: chunking.py lives under claude_mcp_servers/, not on the
+    # vco_lib import path by default. Resolve the repo root from this file.
+    import importlib.util
+
+    chunking_py = (
+        Path(__file__).resolve().parent.parent
+        / "claude_mcp_servers"
+        / "weaviate_mcp"
+        / "chunking.py"
+    )
+    spec = importlib.util.spec_from_file_location("_vco_chunking_rev", chunking_py)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load chunking.py at {chunking_py}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return str(mod._CHUNKER_REVISION)
+
+
+def _emit_chunker_revision_resync_deferral(
+    folder: Path,
+    prev_revision: str,
+    cur_revision: str,
+) -> None:
+    """Emit the chunker re-sync deferral keyed on a REVISION change (R2-4).
+
+    Parallel to ``_emit_chunker_resync_deferral`` (which keys on the v0.2.46
+    SEMVER boundary and therefore never fires again for current installs). This
+    variant fires whenever the ``_CHUNKER_REVISION`` sentinel string changes
+    across an update — the mechanism the sentinel's own contract comment always
+    promised but nothing consumed. Same condition_id + commands so the two paths
+    dedup to a single deferral entry and self-resolve identically.
+    """
+    from vco_lib.deferral_report import DeferralEntry
+    from vco_lib import deferral_emit as _de
+
+    detected = (
+        f"The KG chunker revision changed from `{prev_revision}` to "
+        f"`{cur_revision}` (see `_CHUNKER_REVISION` in "
+        f"`claude_mcp_servers/weaviate_mcp/chunking.py`). The chunk boundaries "
+        f"this revision produces differ from the rows already in this project's "
+        f"KG + code graph — search recall degrades on long answers because "
+        f"relevant content lives in a chunk the new preset would fold "
+        f"differently. Re-sync to re-chunk under the current revision."
+    )
+    cmd = (
+        "# Re-chunk this project's KG under the new revision:\n"
+        f"cd {folder}\n"
+        ".claude/scripts/kg-sync --all\n"
+        "\n"
+        "# Re-chunk this project's code graph under the new revision\n"
+        "# (drop + rebuild the 5 Code* classes so every entity re-embeds):\n"
+        ".claude/scripts/code-graph-analyze . --force-recreate\n"
+        "\n"
+        "# Both commands are heavy I/O (re-embeds every chunk via Ollama).\n"
+        "# Consider running them when you're not actively coding."
+    )
+    entry = DeferralEntry(
+        condition_id="chunker_preset_overhaul_pending",
+        title="KG + codegraph re-sync recommended (chunker revision changed)",
+        detected=detected,
+        why_deferred=(
+            "Auto-rechunking every KG row and code-graph entity at update "
+            "time would block boot for minutes and consume significant Ollama "
+            "GPU time. We defer the decision so the user can pick a quiet "
+            "moment. Searches WORK in the meantime — they just return less "
+            "relevant top-k results. Once you run the re-sync commands below, "
+            "this deferral self-resolves on the next bundle update."
+        ),
+        command_to_apply=cmd,
+        severity="info",
+        kg_node_refs=[
+            "knowledge/concepts/score-driven-retrieval-tiers.md",
+        ],
+    )
     _de.emit(folder, entry)
 
 

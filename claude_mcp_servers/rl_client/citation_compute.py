@@ -27,12 +27,27 @@ Tool RETURNS are already excluded upstream by the answer-window extractor.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["compute_citation", "CitationResult"]
+
+
+def _answer_chunk_hash(text: str) -> str:
+    """Stable content hash for one answer chunk (G4 cross-slot dedup key).
+
+    sha256 of the UTF-8 text, hex-truncated to 16 chars (64 bits — collision-safe
+    for the per-session chunk volume, a quarter the bytes of the full digest).
+    The hash is a DEDUP key only: it lets a de-dup pass pair the arctic-slot and
+    qwen-slot answer artifacts (same answer, same chunk boundaries only when the
+    two slots share a chunker preset; when presets differ the hashes differ and
+    both sets are simply kept). We never store the answer TEXT — the hash is
+    one-way, so nothing reconstructs the answer from it.
+    """
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
 
 
 class CitationResult(dict):
@@ -125,6 +140,13 @@ def compute_citation(
         return None
 
     answer_chunk_embs: list[list[float]] = []
+    # G4 (2026-07-22): collect a stable content hash per embedded chunk so the
+    # persisted answer artifacts can be de-duplicated across slots (the same
+    # answer embedded into the arctic + qwen slots shares hashes) WITHOUT storing
+    # the answer text (privacy — answer_text stays None by default). sha256 of
+    # the chunk text; only recorded for chunks that actually produced a vector so
+    # the two lists stay index-aligned.
+    answer_chunk_hashes: list[str] = []
     for chunk in chunks:
         text = getattr(chunk, "content", None) or (
             chunk if isinstance(chunk, str) else None
@@ -140,6 +162,7 @@ def compute_citation(
             continue
         if vec:
             answer_chunk_embs.append(vec)
+            answer_chunk_hashes.append(_answer_chunk_hash(text))
 
     if not answer_chunk_embs:
         return None
@@ -228,6 +251,17 @@ def compute_citation(
                 session_id=str(ctx.get("session_id") or ""),
                 fire_reason=str(ctx.get("fire_reason") or ""),
                 window_tokens=int(ctx.get("window_tokens") or 0),
+                # G4 (2026-07-22): persist the answer-chunk embeddings (in THIS
+                # event's embedding space) + their content hashes so citation
+                # labels can be re-derived offline for a second embedding profile
+                # or a retuned formula — the raw cosine_sims alone are frozen in
+                # the active space. Rounded + hashed by the writer.
+                answer_chunk_embs=answer_chunk_embs,
+                answer_chunk_hashes=answer_chunk_hashes,
+                # G5 (2026-07-22): forward the soft-label marker the drain stamps
+                # onto ctx for a below-terminal-floor answer window so the trainer
+                # can down-weight the weaker signal.
+                soft_label=bool(ctx.get("soft_label")),
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("citation_compute: writer.log_citations failed (%s)", exc)
@@ -235,6 +269,10 @@ def compute_citation(
 
     ctx["cosine_sims_computed"] = cosine_sims
     ctx["literal_cited_computed"] = literal_cited
+    # G4: stash the answer artifacts on ctx so a downstream /rl_update reuse (or a
+    # test) can read them without re-embedding.
+    ctx["answer_chunk_embs_computed"] = answer_chunk_embs
+    ctx["answer_chunk_hashes_computed"] = answer_chunk_hashes
 
     logger.debug(
         "citation_compute %s: %d cosine, %d literal-cited, %d cited",
@@ -314,6 +352,11 @@ def _write_other_slot_citation(
         return
 
     answer_chunk_embs: list[list[float]] = []
+    # G4: parallel content hashes for the OTHER-slot answer chunks (same dedup
+    # semantics as the active slot). When both slots share a chunker preset the
+    # hashes match the active-slot hashes 1:1 (same answer text, same boundaries)
+    # so a de-dup pass can pair the two spaces' answer artifacts.
+    answer_chunk_hashes: list[str] = []
     for chunk in chunks:
         text = getattr(chunk, "content", None) or (
             chunk if isinstance(chunk, str) else None
@@ -327,6 +370,7 @@ def _write_other_slot_citation(
             continue
         if vec:
             answer_chunk_embs.append(vec)
+            answer_chunk_hashes.append(_answer_chunk_hash(text))
     if not answer_chunk_embs:
         return
 
@@ -381,6 +425,14 @@ def _write_other_slot_citation(
             session_id=str(ctx.get("session_id") or ""),
             fire_reason=str(ctx.get("fire_reason") or ""),
             window_tokens=int(ctx.get("window_tokens") or 0),
+            # G4 (2026-07-22): persist the OTHER-slot answer-chunk embeddings +
+            # hashes so the SECOND RL net (the other embedding space) has its own
+            # replayable answer artifacts — this is what makes BOTH nets fully
+            # trainable-with-labels under dual-write, not just the active net.
+            answer_chunk_embs=answer_chunk_embs,
+            answer_chunk_hashes=answer_chunk_hashes,
+            # G5: mirror the soft-label marker onto the other-slot citation.
+            soft_label=bool(ctx.get("soft_label")),
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug("_write_other_slot_citation: log_citations failed (%s)", exc)

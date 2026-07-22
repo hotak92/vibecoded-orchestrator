@@ -832,6 +832,40 @@ pub async fn resume_secret_for_project(
     )
 }
 
+/// Read whether a secret is currently PAUSED for a specific requester
+/// (owner's per-`(key, requester)` pause). `true` = paused (inactive),
+/// `false` = active. Lets the SecretsPanel grants section render the
+/// correct Pause/Resume affordance on load rather than guessing.
+#[command]
+pub async fn is_secret_paused_for_requester(
+    scope: String,
+    project_id: String,
+    module_id: String,
+    key: String,
+    requester_project_id: String,
+    db: State<'_, Db>,
+) -> Result<bool, String> {
+    // `is_secret_active_for_requester` returns true when active; paused is the
+    // negation. R2-12: a DB error must NOT be masked as "active/not-paused"
+    // (`unwrap_or(true)` painted an UNKNOWN state as an authoritative "not
+    // paused", so the panel rendered a confident Pause affordance over a failed
+    // read). Surface the Err instead — the SecretsPanel's per-grant try/catch
+    // already degrades to `paused = false` on error (SecretsPanel.svelte
+    // `loadGrants`), so the RENDERING is identical to the old default but the
+    // path is honest: the error is visible to the caller / console rather than
+    // silently swallowed. A genuinely-missing row is `Ok(true)` (default-active)
+    // from the DB layer, so the default-on behaviour for absent rows is
+    // unchanged — only true DB FAILURES now propagate.
+    let active = db.is_secret_active_for_requester(
+        &scope,
+        &project_id,
+        &module_id,
+        &key,
+        &requester_project_id,
+    )?;
+    Ok(!active)
+}
+
 // ─── 0.2.x backlog #3: shared-tab key-collision detection ───────────────
 //
 // `list_user_secret_keys_v2` enumerates every user-bucket secret KEY the
@@ -2089,6 +2123,40 @@ mod tests {
         assert_eq!(scope_map["OPENAI_API_KEY"].len(), 2);
         // GITHUB_TOKEN only in shared → no collision.
         assert_eq!(scope_map["GITHUB_TOKEN"].len(), 1);
+    }
+
+    /// The grants-section Pause/Resume-per-requester decision logic: the
+    /// paused getter is `!is_secret_active_for_requester`, default-active
+    /// (not paused) on a missing row. Pins the pause → paused-true and
+    /// resume → paused-false transitions the `is_secret_paused_for_requester`
+    /// command reports to the UI.
+    #[test]
+    fn paused_for_requester_reflects_pause_then_resume() {
+        let db = make_db();
+        seed_project(&db, "owner", "OwnerProj");
+        seed_project(&db, "grantee", "GranteeProj");
+
+        // Default: no active-state row → active → not paused.
+        let active0 = db
+            .is_secret_active_for_requester("per_project", "owner", "user", "K", "grantee")
+            .unwrap_or(true);
+        assert!(!(!active0), "default state must be NOT paused");
+
+        // Pause for the grantee → active=false → paused=true.
+        db.mark_secret_inactive_for_requester("per_project", "owner", "user", "K", "grantee")
+            .unwrap();
+        let active1 = db
+            .is_secret_active_for_requester("per_project", "owner", "user", "K", "grantee")
+            .unwrap_or(true);
+        assert!(!active1, "after pause, active must be false (paused=true)");
+
+        // Resume (forget the row) → back to default active → not paused.
+        db.forget_secret_active_state_for_requester("per_project", "owner", "user", "K", "grantee")
+            .unwrap();
+        let active2 = db
+            .is_secret_active_for_requester("per_project", "owner", "user", "K", "grantee")
+            .unwrap_or(true);
+        assert!(active2, "after resume, active must be true (paused=false)");
     }
 
     /// Three-way collision (per_project + shared + global) is flagged on

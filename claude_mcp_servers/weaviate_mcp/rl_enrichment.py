@@ -1316,6 +1316,152 @@ def _emit_code_structure_telemetry(
         server.logger.debug("code structure emit failed (%s)", exc)
         return False
 
+def _code_node_text_for_reembed(props: dict) -> str:
+    """Return the richest re-embeddable code text from a candidate's properties.
+
+    G3 (2026-07-22): the CLI code path (``query_code_graph.py``, out of the MCP's
+    scope) fetches candidates WITHOUT ``include_vector``, so ``n_emb`` never
+    reaches the shared emitter → code_hook/code_cli events carried NO node
+    embeddings and the offline trainer skipped ~40% of the retrieval corpus. The
+    in-scope fix recovers the vector by RE-EMBEDDING the candidate's stored code
+    text (the same "regenerate from text" recovery the KG path uses via
+    _rl_refetch_node_vector). Preference order mirrors what the analyzer embeds:
+    the full body, then class body, then the module/api summary, then the
+    signature/name as a last resort. Returns "" when no text is available (the
+    caller then leaves the node vector-less, unchanged behaviour).
+    """
+    if not isinstance(props, dict):
+        return ""
+    for field in (
+        "function_body",
+        "class_body",
+        "module_summary",
+        "api_description",
+        "signature",
+        "full_name",
+    ):
+        val = props.get(field)
+        if val and isinstance(val, str) and val.strip():
+            return val
+    return ""
+
+
+# R2-6: per-emit recovery budget for the code-node vector re-embed loop. The
+# recovery runs on the SYNCHRONOUS hook/CLI path (query_code_graph.py invokes
+# _emit_code_retrieval_telemetry inline, inside the PreToolUse hook's window),
+# so an unbounded sequential re-embed loop reintroduces the "lock on retrieval"
+# class v0.2.73 fixed: a cold/hung code-embed backend (model cold-load 10-60 s is
+# routine at session start) × `limit` nodes could stall a hook for minutes. Since
+# the CLI now fetches include_vector (R2-6), the dominant path carries n_emb for
+# free and this recovery is the rare residual — bound it hard so even the residual
+# can never lock. Both knobs are env-tunable for ops.
+_RL_CODE_RECOVER_MAX_ENV = "RL_CODE_RECOVER_MAX_NODES"
+_RL_CODE_RECOVER_MAX_DEFAULT = 8  # at most N re-embeds per emit (skip the rest)
+_RL_CODE_RECOVER_DEADLINE_ENV = "RL_CODE_RECOVER_DEADLINE_S"
+_RL_CODE_RECOVER_DEADLINE_DEFAULT_S = 5.0  # total wall-clock cap across the loop
+
+
+def _rl_code_recover_budget() -> "tuple[int, float]":
+    """Resolve (max_nodes, deadline_seconds) for the recovery loop from env,
+    falling back to conservative defaults. Malformed env values fall back
+    silently (a bad tunable must never widen the budget or crash the emit)."""
+    try:
+        max_nodes = int(os.environ.get(_RL_CODE_RECOVER_MAX_ENV, "") or _RL_CODE_RECOVER_MAX_DEFAULT)
+    except (TypeError, ValueError):
+        max_nodes = _RL_CODE_RECOVER_MAX_DEFAULT
+    try:
+        deadline = float(
+            os.environ.get(_RL_CODE_RECOVER_DEADLINE_ENV, "") or _RL_CODE_RECOVER_DEADLINE_DEFAULT_S
+        )
+    except (TypeError, ValueError):
+        deadline = _RL_CODE_RECOVER_DEADLINE_DEFAULT_S
+    # Clamp to sane floors so a zero/negative tunable can't disable the recovery
+    # unintentionally (0 max = never recover; but a negative deadline must not
+    # loop forever — treat <=0 as "no deadline gate", the count gate still bounds).
+    return max(0, max_nodes), deadline
+
+
+def _rl_recover_code_node_vectors(nodes: list[dict], survivors: list[dict]) -> int:
+    """Attach ``n_emb`` to code nodes that lack it by re-embedding their text.
+
+    G3 (2026-07-22). ONE home for code-node vector recovery, called by the shared
+    ``_emit_code_retrieval_telemetry`` so BOTH the MCP path (already carries
+    ``n_emb`` from include_vector — this is then a no-op) and the CLI/hook path
+    (no vector) reach a trainable event through the SAME emitter — no per-path
+    copy of the recovery logic. Re-embeds via the code embedding service in the
+    ACTIVE code slot's space (so the recovered vector is same-space as the
+    event's embedding triple and the offline cosine is meaningful).
+
+    R2-6 per-emit budget: since this runs on the SYNCHRONOUS hook/CLI path, the
+    loop is HARD-bounded — at most ``max_nodes`` re-embeds AND a total wall-clock
+    deadline; whatever is left is skipped-and-logged (left vector-less, exactly
+    the prior best-effort behaviour) rather than stalling the hook. The CLI now
+    fetches include_vector (R2-6), so this recovery is the rare residual it was
+    designed to be. Budget knobs: ``RL_CODE_RECOVER_MAX_NODES`` (default 8),
+    ``RL_CODE_RECOVER_DEADLINE_S`` (default 5.0).
+
+    Gated + soft-fail: only fires for nodes that GENUINELY lack ``n_emb``; a
+    missing embedding service, an un-embeddable node (no text), or an embed error
+    just leaves that node vector-less (the prior behaviour) — never raises into
+    search. ``survivors`` carries each candidate's raw properties (``_p``); the
+    parallel ``nodes`` list is the emitter's per-node records (same order/length).
+
+    Returns the count of nodes whose vector was recovered (for telemetry/logging).
+    """
+    import time as _time
+
+    # Fast path: every node already has a vector (the MCP / CLI include_vector path).
+    if all(isinstance(n, dict) and n.get("n_emb") for n in nodes):
+        return 0
+    try:
+        svc = server._get_embedding_service()
+    except Exception:  # noqa: BLE001
+        svc = None
+    if svc is None or not hasattr(svc, "embed_code"):
+        return 0
+
+    max_nodes, deadline_s = _rl_code_recover_budget()
+    if max_nodes <= 0:
+        return 0  # budget disables recovery entirely
+    start = _time.monotonic()
+
+    recovered = 0
+    attempted = 0
+    skipped_budget = 0
+    for rec, cand in zip(nodes, survivors):
+        if not isinstance(rec, dict) or rec.get("n_emb"):
+            continue
+        props = cand.get("_p") if isinstance(cand, dict) else None
+        text = _code_node_text_for_reembed(props or {})
+        if not text:
+            continue
+        # Per-emit budget: stop once EITHER the count cap or the wall-clock
+        # deadline is hit — skip the rest (leave vector-less, as before) so a
+        # cold/hung backend can never lock the synchronous hook.
+        if attempted >= max_nodes:
+            skipped_budget += 1
+            continue
+        if deadline_s > 0 and (_time.monotonic() - start) >= deadline_s:
+            skipped_budget += 1
+            continue
+        attempted += 1
+        try:
+            vec = svc.embed_code(text)
+        except Exception as exc:  # noqa: BLE001 — recovery is best-effort
+            server.logger.debug("code n_emb recovery embed failed (%s)", exc)
+            continue
+        if vec:
+            rec["n_emb"] = list(vec)
+            recovered += 1
+    if recovered or skipped_budget:
+        server.logger.debug(
+            "code retrieval emit: recovered %d/%d node vector(s) via re-embed "
+            "(%d skipped by per-emit budget max=%d deadline=%.1fs)",
+            recovered, len(nodes), skipped_budget, max_nodes, deadline_s,
+        )
+    return recovered
+
+
 def _emit_code_retrieval_telemetry(
     *,
     query: str,
@@ -1412,6 +1558,11 @@ def _emit_code_retrieval_telemetry(
             return False
 
         nodes: list[dict] = []
+        # G3: keep the source candidate aligned index-for-index with ``nodes`` so
+        # the vector-recovery pass below re-embeds the RIGHT node's text even when
+        # some candidates are skipped (no title). Zipping ``nodes`` with
+        # ``survivors`` directly would misalign after any skip.
+        node_sources: list[dict] = []
         for i, c in enumerate(survivors):
             if not isinstance(c, dict):
                 continue
@@ -1453,9 +1604,24 @@ def _emit_code_retrieval_telemetry(
             if c.get("n_emb"):
                 rec["n_emb"] = c["n_emb"]
             nodes.append(rec)
+            node_sources.append(c)
 
         if not nodes:
             return False
+
+        # G3 (2026-07-22): recover per-node vectors for candidates that reached
+        # here WITHOUT one (the CLI/hook code path fetches no include_vector, so
+        # its survivors carry text but no ``n_emb``). ONE recovery home here in
+        # the shared emitter — re-embeds the node's stored code text in the active
+        # code slot so code_hook/code_cli events become trainable (they carried
+        # zero node embeddings before, and the offline trainer skips a node with
+        # no ``emb``/``n_emb``). No-op when every node already has a vector (the
+        # MCP include_vector path) or when the embed service is down. ``node_sources``
+        # is aligned index-for-index with ``nodes`` (both skip title-less candidates).
+        try:
+            _rl_recover_code_node_vectors(nodes, node_sources)
+        except Exception as exc:  # noqa: BLE001 — recovery never breaks the emit
+            server.logger.debug("code n_emb recovery raised (%s)", exc)
 
         # CODE embedding triple: slot-derived short source, the query
         # vector's ACTUAL dim, and the service-resolved model id when
@@ -1842,7 +2008,27 @@ def _rl_pack_linked_embs_for_node(
     matched_chunk = node.get("chunk_number")
     if source_id:
         siblings = sibling_objs_by_source_id.get(source_id) or []
-        for sib in siblings:
+        # G3/near-chunk (2026-07-22): order the extra chunks of THIS node by
+        # DISTANCE to the matched chunk so the immediate NEIGHBOURS (matched ± 1,
+        # ± 2, …) fill the limited linked slots first. The three_chunks / full
+        # detail tiers serve the matched chunk PLUS its neighbours as the scored
+        # context; logging those neighbour embeddings (not arbitrary far-away
+        # siblings) lets offline training reconstruct the exact window the model
+        # saw. When ``matched_chunk`` is unknown, fall back to natural order.
+        def _neighbour_key(sib):
+            try:
+                cn = sib.properties.get("chunk_num")
+            except (AttributeError, KeyError):
+                cn = None
+            if matched_chunk is None or cn is None:
+                return (1, 0)  # unknown distance sorts after known neighbours
+            try:
+                return (0, abs(int(cn) - int(matched_chunk)))
+            except (TypeError, ValueError):
+                return (1, 0)
+
+        ordered_siblings = sorted(siblings, key=_neighbour_key)
+        for sib in ordered_siblings:
             try:
                 sib_chunk = sib.properties.get("chunk_num")
             except (AttributeError, KeyError):
@@ -2666,6 +2852,24 @@ async def _resolve_dual_rl_log_inputs(
     """
     if not server._resolve_dual_rl_log_enabled():
         return None
+    # R2-17: short-circuit BEFORE the embed fan-out when no distinct OTHER slot
+    # can exist. ``configured_text_models()`` is the env-only SSOT for "which
+    # text slots a write populates"; when it resolves to a single model (the
+    # common single-model config: qwen3 active, no distinct secondary), the fan-out
+    # below would embed the query only to find no other slot and return None —
+    # one wasted query-embed per search. Skip it. This is cheap (env reads, no
+    # embedding) and mirrors the write-side slot set exactly.
+    try:
+        from vco_lib.embedding_service import configured_text_models
+        if len(configured_text_models()) <= 1:
+            return None
+    except Exception as exc:  # noqa: BLE001 — probe failure must not break logging
+        # Fall through to the full fan-out (fail-open): a broken probe must not
+        # silently disable dual-log, only skip the optimization.
+        server.logger.debug(
+            "_resolve_dual_rl_log_inputs: configured_text_models probe raised "
+            "(%s) — falling through to the full fan-out", exc
+        )
     try:
         svc = server._get_embedding_service()
         if svc is None:

@@ -325,8 +325,45 @@ try:
     )
 except ImportError as _embed_import_err:
     _reraise_vco_lib_import(_embed_import_err, "embedding_service.EmbeddingService")
-# Always available now (loud-fail above if not) — kept as a True constant
-# because ``embeddings.py`` and other call-sites reference it by name.
+
+
+def _active_chunk_model_id() -> str:
+    """Resolve the ACTIVE text model id for chunk sizing (WP-O rework, lazy).
+
+    Prefers the R2-3 ``resolve_active_text_model_id`` (honors EMBEDDING_MODEL /
+    OPENAI_EMBEDDING_MODEL / profile) so the active-slot chunk budget is sized to
+    the real active model — UNCLAMPED, active fidelity ≥ single-write baseline.
+
+    Imported LAZILY (not at module scope) with a loud-once fallback to the bare
+    ``EMBEDDING_MODEL`` env: a mid-update install whose stale site-packages vco_lib
+    predates R2-3 (the exact R2-9 stale-copy hazard) must still START and still
+    size chunks to the active model — the resolver's precedence collapses to
+    EMBEDDING_MODEL for the common (non-openai-active) case anyway, so the fallback
+    is behaviourally identical there. Never fails MCP startup.
+    """
+    try:
+        from vco_lib.embedding_service import resolve_active_text_model_id
+        return resolve_active_text_model_id()
+    except Exception as exc:  # noqa: BLE001 — degrade loudly to EMBEDDING_MODEL
+        logger.warning(
+            "weaviate-kg: resolve_active_text_model_id unavailable (%s) — sizing "
+            "chunks to EMBEDDING_MODEL=%r directly (identical for non-openai-active "
+            "installs). Run `python install.py --update` to refresh vco_lib.",
+            exc, EMBEDDING_MODEL,
+        )
+        return EMBEDDING_MODEL
+
+# WP-O rework (2026-07-22): the G5/fix-r2 min-across-slots chunk clamp that used
+# ``configured_text_models`` for active-slot sizing is REMOVED (it violated the
+# active-fidelity-≥-single-write rule). Active-slot chunk sizing now uses the R2-3
+# ``resolve_active_text_model_id`` resolver via the LAZY ``_active_chunk_model_id``
+# helper above (unclamped, loud-fallback to EMBEDDING_MODEL on a stale-copy
+# install); the secondary slots absorb any degradation via the tagged
+# bounded-sub-window path in ``embedding_service.embed_text_all_configured``. The
+# dual-log short-circuit (``rl_enrichment._resolve_dual_rl_log_inputs``) still
+# imports ``configured_text_models`` DIRECTLY from vco_lib where it is needed, so
+# the server-module alias + its R2-9 loud-fallback import (previously the only
+# chunk-sizing consumer) is no longer referenced and has been deleted.
 HAS_EMBEDDING_SERVICE = True
 
 # v0.2.34 cr-b2 (2026-05-25): canonical sanitiser for Weaviate class
@@ -3646,6 +3683,7 @@ try:
         get_embedding,
         _get_both_embeddings,
         _get_all_kg_embeddings,
+        _get_all_kg_embeddings_tagged,
         _get_all_code_embeddings,
         _scheme_for_collection,
         _primary_named_vector,
@@ -6178,7 +6216,27 @@ async def store_knowledge_node(
             # embed failure (the routine outage case) aborts with ZERO new rows
             # written and the stale rows still pending deletion below — no
             # partial-chunk state, no data loss.
-            chunker = Chunker.for_model(EMBEDDING_MODEL)
+            #
+            # WP-O rework (2026-07-22, no-functionality-loss rule):
+            # chunk boundaries follow the ACTIVE model's OWN preset — UNCLAMPED.
+            # The earlier G5/fix-r2 "min-across-slots" clamp sized boundaries to
+            # the TIGHTEST configured slot (e.g. arctic 4 096), which DEGRADED the
+            # active qwen3 slot's chunk fidelity below the single-write baseline —
+            # forbidden: a dual-write install must produce active-slot data ≥
+            # identical to single-write. So the ACTIVE slot keeps its full boundary
+            # budget here, and the SECONDARY slots absorb the degradation instead:
+            # embedding_service.embed_text_all_configured embeds each secondary
+            # from a BOUNDED, EXPLICITLY-TAGGED sub-window when the chunk exceeds
+            # that secondary's num_ctx (svc.last_secondary_truncated records which),
+            # rather than clamping the active chunk or letting Ollama/OpenAI
+            # silently truncate. The active model is resolved via the R2-3
+            # resolver so the openai-active case (empty EMBEDDING_MODEL +
+            # ACTIVE_EMBEDDING=openai) sizes to the OpenAI model, not a bare env
+            # read; single-write installs are byte-UNCHANGED (the resolver returns
+            # EMBEDDING_MODEL when set). Lazy resolver (loud-fallback to
+            # EMBEDDING_MODEL on a stale-copy install — never fails startup).
+            _active_chunk_model = _active_chunk_model_id()
+            chunker = Chunker.for_model(_active_chunk_model)
             raw_chunks = chunker.chunk_text(content, source_id=title)
             chunk_count = len(raw_chunks)
             prepared_inserts: list[tuple[dict, "list | dict | None"]] = []
@@ -6197,7 +6255,18 @@ async def store_knowledge_node(
                 if EMBEDDING_SOURCE == "weaviate":
                     prepared_inserts.append((chunk_props, None))
                 elif DUAL_EMBEDDING_ENABLED:
-                    vectors = await _get_all_kg_embeddings(chunk.content)
+                    # R3-2: capture which SECONDARY slots were embedded from a
+                    # bounded sub-window for THIS chunk (chunk exceeded that
+                    # model's num_ctx) and PERSIST it as a chunk property so the
+                    # stored secondary (e.g. arctic) vectors can be partitioned
+                    # truncated-vs-full from stored data alone. The active slot is
+                    # never truncated (full-fidelity), so an empty list means every
+                    # stored vector for this chunk is faithful. The tag is captured
+                    # atomically with the vectors (no cross-task race).
+                    vectors, truncated_slots = await _get_all_kg_embeddings_tagged(
+                        chunk.content
+                    )
+                    chunk_props["secondary_truncated_slots"] = truncated_slots
                     prepared_inserts.append(
                         (chunk_props, vectors if vectors else None)
                     )

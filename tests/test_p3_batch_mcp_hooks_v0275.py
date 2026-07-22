@@ -100,7 +100,17 @@ class TestKG5DegradedFallbackGate:
             calls["openai"] += 1
             return [0.5, 0.6]
 
-        env = {} if write_all_env is None else {"DUAL_EMBEDDING_WRITE_ALL_SLOTS": write_all_env}
+        # Env-hermetic: the write-all gate reads DUAL_EMBEDDING_WRITE_ALL_SLOTS
+        # from the process env. A host machine may export that flag (and
+        # DUAL_RL_LOG_ENABLED) as "true" via .claude/env, so a bare
+        # patch.dict(..., clear=False) inherits ON and the "default OFF" case would
+        # observe ON → false RED. Set BOTH dual flags EXPLICITLY for every case so
+        # the test never depends on the developer machine's project env:
+        #   - None      → both flags forced OFF (true default-OFF)
+        #   - "true"/…  → write-all set to the requested value, dual-log forced OFF
+        env = {"DUAL_EMBEDDING_WRITE_ALL_SLOTS": "", "DUAL_RL_LOG_ENABLED": ""}
+        if write_all_env is not None:
+            env["DUAL_EMBEDDING_WRITE_ALL_SLOTS"] = write_all_env
         with mock.patch.dict(os.environ, env, clear=False), \
                 mock.patch.object(srv, "_get_embedding_service", lambda: None), \
                 mock.patch.object(srv, "get_ollama_embedding", fake_ollama), \

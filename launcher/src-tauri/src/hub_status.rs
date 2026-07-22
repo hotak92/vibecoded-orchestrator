@@ -132,6 +132,102 @@ pub fn stop() -> StopOutcome {
     }
 }
 
+// ─── Boot autostart control (wraps `vct-hub --{register,unregister,}-boot`) ──
+//
+// The hub's cross-OS boot-autostart (vct-hub/src/boot.rs) is CLI-only.
+// These helpers invoke the SAME binary the launcher would start, via
+// `find_hub_binary`, so the GUI toggle and the CLI operate on one unit.
+
+/// Tri-state boot-autostart report for the GUI toggle. Mirrors the
+/// `vct-hub --boot-status` exit codes (0 enabled, 1 disabled, 2
+/// not-installed, 3 inspection error).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootAutostart {
+    /// Unit installed and will fire on login.
+    Enabled,
+    /// Unit present but not active, OR no unit registered. Both collapse
+    /// to "off" for the toggle — the user's mental model is a single
+    /// on/off switch, and re-registering is idempotent either way.
+    Disabled,
+    /// The host init system cannot be inspected (OS not supported, tool
+    /// missing). The GUI renders the toggle disabled with an explanatory
+    /// hint rather than a misleading "off".
+    Unsupported,
+}
+
+/// Query the hub's boot-autostart state by exit code. Synchronous — the
+/// Tauri wrapper runs it on a blocking task. Binary-not-found maps to
+/// `Unsupported` (nothing to inspect).
+pub fn boot_status() -> BootAutostart {
+    let Some(bin) = crate::hub_launcher::find_hub_binary() else {
+        return BootAutostart::Unsupported;
+    };
+    let out = Command::new(&bin)
+        .silent()
+        .arg("--boot-status")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match out {
+        Ok(status) => match status.code() {
+            Some(0) => BootAutostart::Enabled,
+            // 1 = disabled, 2 = not-installed → both are "off" for the toggle.
+            Some(1) | Some(2) => BootAutostart::Disabled,
+            // 3 = inspection error, or any other code → cannot determine.
+            _ => BootAutostart::Unsupported,
+        },
+        Err(_) => BootAutostart::Unsupported,
+    }
+}
+
+/// Enable boot autostart by invoking `vct-hub --register-boot` (idempotent;
+/// also enables-and-starts the unit). Returns `Ok(())` on success, `Err`
+/// with a user-readable message on failure.
+pub fn register_boot() -> Result<(), String> {
+    run_boot_op("--register-boot")
+}
+
+/// Disable boot autostart by invoking `vct-hub --unregister-boot`
+/// (idempotent — unregistering a never-registered unit is a no-op that
+/// still exits 0).
+pub fn unregister_boot() -> Result<(), String> {
+    run_boot_op("--unregister-boot")
+}
+
+/// Shared invoke path for the two mutating boot ops. Captures stderr so a
+/// failure (e.g. `systemctl` absent on a non-systemd Linux) reaches the
+/// user's toast instead of vanishing.
+fn run_boot_op(flag: &str) -> Result<(), String> {
+    let Some(bin) = crate::hub_launcher::find_hub_binary() else {
+        return Err(
+            "vct-hub binary not found; cannot change boot autostart. \
+             Reinstall or run the launcher from its install folder."
+                .to_string(),
+        );
+    };
+    let out = Command::new(&bin)
+        .silent()
+        .arg(flag)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("spawn vct-hub {}: {}", flag, e))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let code = out.status.code().unwrap_or(-1);
+        Err(format!(
+            "vct-hub {} exited {}: {}",
+            flag,
+            code,
+            stderr.trim()
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -150,9 +150,137 @@
 //! + 250ms + 1000ms = ~1.45s before propagating an error.
 
 use crate::secret_value_shape;
+// `keyring::Entry` remains the keychain primitive on Windows / macOS (their
+// native backends do not exhibit the connect-per-op daemon fragility the Linux
+// arm mitigates). On Linux the hot-path builds a `KeychainEntry` (below) that
+// routes through the process-wide persistent Secret-Service connection instead.
+#[cfg(not(target_os = "linux"))]
 use keyring::Entry;
 
 const SERVICE_PREFIX: &str = "vct";
+
+// ─── Keychain primitive abstraction (v0.3.0 WP-K) ─────────────────────────────
+//
+// The `set`/`get`/`delete` hot paths construct a `KeychainEntry` INSIDE the
+// `retry_with_backoff` closure (the P9 invariant: construction shares the same
+// paced_call + backoff as the op). `KeychainEntry` has one job — present the
+// exact `new(&service, &key)? -> { set_password / get_password /
+// delete_credential }` shape both platform arms need, so the closure spelling
+// (and the P9 structural pin) is identical everywhere:
+//
+//   * Linux  → delegates to `secrets_ss_connection`, which reuses ONE
+//              process-wide D-Bus Secret-Service session for get/set/delete AND
+//              the Background lock probe (K-2), so connect-per-op churn is cut,
+//              not merely halved. Errors are mapped to `keyring::Error` so the
+//              caller's transient/permanent classification (`is_transient`),
+//              retry loop, and `NoEntry` handling are byte-identical to the
+//              pre-persistent-connection path.
+//   * others → a thin newtype over `keyring::Entry` (unchanged behaviour).
+//
+// The methods return `keyring::Result<…>` so `retry_with_backoff`'s
+// `FnMut() -> keyring::Result<T>` closure signature is unchanged on both arms.
+// The raw keychain write primitive `.set_password(` therefore still appears
+// ONLY in this file (the Linux D-Bus writer in `secrets_ss_connection` uses the
+// dbus `Item::set_secret`, a different needle), preserving the A4 chokepoint
+// guard.
+
+/// A single keychain entry handle for one `(service, key)` pair. See the module
+/// section comment above for the two platform arms.
+struct KeychainEntry {
+    #[cfg(target_os = "linux")]
+    service: String,
+    #[cfg(target_os = "linux")]
+    key: String,
+    #[cfg(not(target_os = "linux"))]
+    inner: Entry,
+}
+
+/// Map a persistent-connection op error to the `keyring::Error` the caller's
+/// retry/classification layer already understands. A transient failure becomes
+/// `PlatformFailure` (retried by `retry_with_backoff`); a permanent failure
+/// becomes `NoStorageAccess` (NON-transient — never retried, so a locked /
+/// prompt-dismissed store can't re-pop the dialog via a retry, exactly as the
+/// keyring path behaves). `NoEntry` maps to `keyring::Error::NoEntry` so the
+/// get/delete `NoEntry` arms fire unchanged.
+#[cfg(target_os = "linux")]
+fn ss_error_to_keyring(err: crate::secrets_ss_connection::SsOpError) -> keyring::Error {
+    use crate::secrets_ss_connection::SsOpError;
+    match err {
+        SsOpError::NoEntry => keyring::Error::NoEntry,
+        SsOpError::Transient(_) => keyring::Error::PlatformFailure(Box::new(err)),
+        SsOpError::Permanent(_) => keyring::Error::NoStorageAccess(Box::new(err)),
+    }
+}
+
+impl KeychainEntry {
+    /// Construct a handle for `(service, key)`. On Linux this is cheap (it just
+    /// owns the two strings — the D-Bus session is the shared persistent one,
+    /// touched only when an op runs); on other platforms it builds a
+    /// `keyring::Entry` exactly as before.
+    #[cfg(target_os = "linux")]
+    fn new(service: &str, key: &str) -> keyring::Result<Self> {
+        Ok(Self {
+            service: service.to_string(),
+            key: key.to_string(),
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn new(service: &str, key: &str) -> keyring::Result<Self> {
+        Ok(Self {
+            inner: Entry::new(service, key)?,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_password(&self, value: &str) -> keyring::Result<()> {
+        crate::secrets_ss_connection::write_secret(&self.service, &self.key, value)
+            .map_err(ss_error_to_keyring)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn set_password(&self, value: &str) -> keyring::Result<()> {
+        self.inner.set_password(value)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn get_password(&self) -> keyring::Result<String> {
+        crate::secrets_ss_connection::read_secret(&self.service, &self.key)
+            .map_err(ss_error_to_keyring)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn get_password(&self) -> keyring::Result<String> {
+        self.inner.get_password()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn delete_credential(&self) -> keyring::Result<()> {
+        crate::secrets_ss_connection::remove_secret(&self.service, &self.key)
+            .map_err(ss_error_to_keyring)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn delete_credential(&self) -> keyring::Result<()> {
+        self.inner.delete_credential()
+    }
+}
+
+/// Best-effort graceful close of the persistent keychain connection. On Linux
+/// this drains the process-wide Secret-Service session (one clean disconnect at
+/// a controlled moment, instead of an abrupt teardown mid-op). No-op elsewhere.
+/// Called from the hub shutdown path and the launcher exit event.
+///
+/// Exit is BOUNDED, not unconditional: `secrets_ss_connection::shutdown` uses a
+/// `try_lock` with a short (≤250ms) deadline, so if the keychain worker is
+/// mid-op — including parked on an unbounded user unlock prompt — the drain is
+/// SKIPPED and the process teardown closes the socket abruptly (today's
+/// pre-persistent-connection behaviour). It therefore never stalls exit waiting
+/// on a prompt. No-op on Windows / macOS.
+pub fn shutdown_keychain_connection() {
+    #[cfg(target_os = "linux")]
+    crate::secrets_ss_connection::shutdown();
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum SecretScope<'a> {
@@ -489,12 +617,15 @@ impl std::error::Error for KeychainError {}
 ///                     platform). Callers proceed as before — we cannot be
 ///                     stricter without breaking non-SecretService setups.
 ///
-/// Implementation (Linux): opens a Secret-Service session with
-/// `EncryptionType::Plain` and a ZERO max-prompt-timeout (so no unlock dialog
-/// can ever appear), fetches the default collection, and reads its `Locked`
-/// D-Bus property. That property read is a plain `Get` — it neither unlocks
-/// nor prompts. The whole probe runs inside the bounded-timeout worker so a
-/// wedged D-Bus daemon yields `None` (UNKNOWN) rather than hanging.
+/// Implementation (Linux): fetches the default collection and reads its
+/// `Locked` D-Bus property. Both are plain reads (`ReadAlias` + `Get Locked`) —
+/// they neither unlock nor prompt. v0.3.0 (K-2): the reads go through the SHARED
+/// persistent Secret-Service session (the one get/set/delete reuse), so a
+/// Background probe no longer opens a fresh throw-away session per read; only if
+/// that shared connect fails does it fall back to a fresh
+/// `EncryptionType::Plain` + ZERO-max-prompt-timeout session. The whole probe
+/// runs inside the bounded-timeout worker so a wedged D-Bus daemon yields `None`
+/// (UNKNOWN) rather than hanging.
 ///
 /// macOS / Windows: always `None` (Unlocked-equivalent → proceed). The
 /// apple-native ACL prompt model and Windows Credential Manager have different
@@ -517,11 +648,37 @@ pub fn probe_default_collection_locked() -> Option<bool> {
 /// The blocking body of the Linux lock probe (runs on the worker thread).
 /// Separated so the timeout wrapper stays thin and the D-Bus calls are all in
 /// one place. Any error in the negotiation / property read → `None` (UNKNOWN).
+///
+/// v0.3.0 (K-2): route the probe through the SHARED persistent connection first,
+/// so a Background read no longer opens a fresh throw-away Secret-Service
+/// session per probe (the connect/disconnect churn WP-K exists to cut). The
+/// probe is two pure D-Bus reads (`ReadAlias` + `Get Locked`) that can NEVER
+/// unlock or prompt (see `secrets_ss_connection::probe_default_collection_locked`),
+/// so the shared connection's no-max-prompt-timeout does not risk a dialog. If
+/// the shared connect itself fails (transient/permanent), fall back to the
+/// ORIGINAL ephemeral 0-timeout session so the probe is no less capable than
+/// before.
 #[cfg(target_os = "linux")]
 fn probe_default_collection_locked_blocking() -> Option<bool> {
+    // Preferred path: reuse the shared session. `Ok(Some/None)` is a definite
+    // answer / UNKNOWN; `Err(_)` (shared connect or D-Bus failure) drops through
+    // to the ephemeral fallback below.
+    match crate::secrets_ss_connection::probe_default_collection_locked() {
+        Ok(answer) => return answer,
+        Err(_) => { /* fall through to the ephemeral probe */ }
+    }
+    probe_default_collection_locked_ephemeral()
+}
+
+/// Fallback lock probe on a fresh, isolated 0-max-prompt-timeout session — the
+/// original WP-4a probe. Used only when the shared connection is unavailable
+/// (so we never leave the Background gate blind just because the persistent
+/// session could not be established). `Plain` avoids a Diffie-Hellman handshake;
+/// timeout 0 guarantees no unlock prompt can appear (belt-and-suspenders, since
+/// the reads here also cannot prompt).
+#[cfg(target_os = "linux")]
+fn probe_default_collection_locked_ephemeral() -> Option<bool> {
     use dbus_secret_service::{EncryptionType, SecretService};
-    // `Plain` avoids a Diffie-Hellman handshake; timeout 0 guarantees no
-    // unlock prompt can appear (the crate cancels any prompt immediately).
     let ss = SecretService::connect_with_max_prompt_timeout(EncryptionType::Plain, 0).ok()?;
     let collection = ss.get_default_collection().ok()?;
     // `is_locked()` is a pure `Get` of the `Locked` property — no unlock, no
@@ -1354,7 +1511,11 @@ impl Drop for TestKeychainTimeoutGuard {
 /// safe to call from any crate that depends on vct-launcher-core.
 pub fn keyring_probe_available() -> bool {
     run_keychain_with_timeout(|| {
-        let entry = match Entry::new("vct.probe.keyring_available", "probe") {
+        // v0.3.0 (WP-K): the probe uses the SAME `KeychainEntry` primitive as
+        // the real ops, so on Linux it exercises the persistent Secret-Service
+        // connection (and reflects its reachability) rather than opening a
+        // separate one-shot session.
+        let entry = match KeychainEntry::new("vct.probe.keyring_available", "probe") {
             Ok(e) => e,
             Err(_) => return false,
         };
@@ -1562,9 +1723,11 @@ fn set_raw(
     let value = value.to_string();
     run_keychain_with_timeout(move || {
         with_cross_process_pace(|| {
-            // v0.2.72 (P9): build the Entry INSIDE the closure so `Entry::new`'s
-            // D-Bus construction shares the same paced_call + backoff as the op.
-            retry_with_backoff(|| Entry::new(&service, &key)?.set_password(&value))
+            // v0.2.72 (P9): build the entry INSIDE the closure so construction
+            // shares the same paced_call + backoff as the op. v0.3.0 (WP-K): on
+            // Linux `KeychainEntry` routes through the persistent Secret-Service
+            // connection (no per-op connect); elsewhere it wraps `keyring::Entry`.
+            retry_with_backoff(|| KeychainEntry::new(&service, &key)?.set_password(&value))
                 .map_err(|err| format!("keyring set: {}", err))
         })
     })
@@ -1681,8 +1844,9 @@ pub fn get_with_context(
         let key = key.to_string();
         run_keychain_with_timeout(move || {
             with_cross_process_pace(|| {
-                // v0.2.72 (P9): build the Entry INSIDE the closure.
-                match retry_with_backoff(|| Entry::new(&service, &key)?.get_password()) {
+                // v0.2.72 (P9): build the entry INSIDE the closure. v0.3.0
+                // (WP-K): `KeychainEntry` = persistent connection on Linux.
+                match retry_with_backoff(|| KeychainEntry::new(&service, &key)?.get_password()) {
                     Ok(v) => Ok(Some(v)),
                     Err(keyring::Error::NoEntry) => Ok(None),
                     Err(err) => Err(format!("keyring get: {}", err)),
@@ -1746,8 +1910,9 @@ pub fn delete_with_context(
     let key = key.to_string();
     run_keychain_with_timeout(move || {
         with_cross_process_pace(|| {
-            // v0.2.72 (P9): build the Entry INSIDE the closure.
-            match retry_with_backoff(|| Entry::new(&service, &key)?.delete_credential()) {
+            // v0.2.72 (P9): build the entry INSIDE the closure. v0.3.0 (WP-K):
+            // `KeychainEntry` = persistent connection on Linux.
+            match retry_with_backoff(|| KeychainEntry::new(&service, &key)?.delete_credential()) {
                 Ok(()) => Ok(()),
                 Err(keyring::Error::NoEntry) => Ok(()), // already gone — treat as success
                 Err(err) => Err(format!("keyring delete: {}", err)),
@@ -2421,6 +2586,54 @@ mod tests {
         assert_eq!(scope.service_name("mod"), "vct.p1.mod");
     }
 
+    // ─── v0.3.0 (WP-K): persistent Secret-Service connection surface ──────────
+
+    /// The graceful-close entry point exists and is a safe no-op to call
+    /// repeatedly (idempotent), so the hub-shutdown and launcher-exit call sites
+    /// can invoke it unconditionally. On Linux it drains the persistent
+    /// connection (the module's own test pins the slot-clearing); on other
+    /// platforms it is a no-op. Here we prove it is callable and idempotent from
+    /// the public surface without touching a real keychain.
+    #[test]
+    fn shutdown_keychain_connection_is_idempotent_public_noop_safe() {
+        // Serialize with keychain tests: on Linux this touches the module's
+        // process-wide connection slot, which other tests may lazily populate.
+        let _lock = test_serialize::keychain_serialize_lock();
+        shutdown_keychain_connection();
+        shutdown_keychain_connection();
+        #[cfg(target_os = "linux")]
+        {
+            // After the drain the module's connection slot is empty (a
+            // subsequent real op would lazily reconnect). We assert via the
+            // module's own idempotent shutdown, which leaves the slot cleared.
+            crate::secrets_ss_connection::shutdown();
+        }
+    }
+
+    /// A locked Background read STILL short-circuits to `Locked` without any
+    /// keychain access, regardless of the persistent-connection routing — the
+    /// lock-probe gate sits BEFORE `KeychainEntry` construction on every arm, so
+    /// WP-K did not weaken the G5 lock posture. (Mock-backed; no real daemon.)
+    #[test]
+    fn wpk_lock_gate_still_precedes_persistent_connection_path() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _g = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+        set(scope, "mod", "k", "v").unwrap();
+        ENTRY_CONSTRUCTION_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+        let _probe = TestProbeGuard::new(Some(true)); // locked
+        assert_eq!(
+            get_with_context(scope, "mod", "k", CallContext::Background),
+            Err(KeychainError::Locked),
+            "a locked Background read must still short-circuit under WP-K"
+        );
+        assert_eq!(
+            ENTRY_CONSTRUCTION_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the lock gate must precede any KeychainEntry construction"
+        );
+    }
+
     #[test]
     fn service_name_global_uses_global_segment() {
         let scope = SecretScope::Global;
@@ -3019,6 +3232,72 @@ mod tests {
         }
     }
 
+    /// K-2 STRUCTURAL PIN: the Background lock probe must route through the
+    /// SHARED persistent connection FIRST, and only fall back to a fresh
+    /// ephemeral session when the shared connect fails — so a Background read no
+    /// longer opens a throw-away Secret-Service session per probe (the churn WP-K
+    /// exists to cut). A behavioural pin needs a live daemon (the env-gated
+    /// wiring test in the persistent-connection module covers that); this
+    /// daemon-free source-shape pin asserts the SHIPPED routing: the blocking
+    /// probe body CALLS the shared-connection probe fn (a genuine call site,
+    /// counted after stripping comments) and preserves the ephemeral fallback fn.
+    ///
+    /// The scan strips `//` comments per line (so doc-comment mentions of the
+    /// name don't count) and the two needles are assembled from split literals
+    /// that never appear contiguously in this test's own source — so the ONLY
+    /// contiguous CODE occurrences are the real production call site and the real
+    /// fallback fn definition. FAIL-ON-REVERT: dropping the shared-connection
+    /// call and going straight to a per-probe ephemeral connect (the pre-K-2
+    /// shape) removes the only counted call site → 0 → reds this test.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn k2_lock_probe_routes_through_shared_connection_before_ephemeral() {
+        let src = include_str!("secrets.rs");
+
+        // Strip each line's `//` comment tail, then whitespace-flatten the CODE.
+        // (Doc comments mentioning the probe fn name must NOT count as call
+        // sites.)
+        fn code_before_line_comment(line: &str) -> &str {
+            match line.find("//") {
+                Some(idx) => &line[..idx],
+                None => line,
+            }
+        }
+        let code_flat: String = src
+            .lines()
+            .map(code_before_line_comment)
+            .collect::<String>()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+
+        // Needle for the shared-connection call SITE (note the trailing `(` — a
+        // call, not a mention). Assembled from split literals so no line in THIS
+        // test's own code can form it contiguously.
+        let shared_call_needle = String::from("secrets_ss_")
+            + "connection::probe_default_collection_"
+            + "locked(";
+        let shared_hits = code_flat.matches(shared_call_needle.as_str()).count();
+        assert_eq!(
+            shared_hits, 1,
+            "the Background lock probe must CALL the shared persistent-connection \
+             probe fn exactly once (found {shared_hits} call sites, expected 1); \
+             without it the probe reopens a throw-away session per read — the \
+             connect/disconnect churn K-2 removes"
+        );
+
+        // The ephemeral 0-timeout session must survive as a named FALLBACK fn
+        // (not inlined onto the hot path). Needle assembled from split literals.
+        let ephemeral_fn_needle = String::from("fnprobe_default_collection_")
+            + "locked_ephemeral(";
+        assert!(
+            code_flat.contains(ephemeral_fn_needle.as_str()),
+            "the ephemeral 0-timeout probe session must be preserved as a named \
+             FALLBACK fn so the probe is never left blind when the shared connect \
+             fails"
+        );
+    }
+
     /// P9 STRUCTURAL GUARD (v0.2.72 pre-gate audit F4; v0.2.76 A4 reshaped).
     /// The pacing tests above drive `retry_with_backoff` with STAND-IN
     /// closures, so reverting the P9 fix in the production fns (hoisting the
@@ -3040,20 +3319,24 @@ mod tests {
         let src = include_str!("secrets.rs");
         let flat: String = src.chars().filter(|c| !c.is_whitespace()).collect();
 
-        // The retried closure constructs the Entry as its first act, one per
+        // The retried closure constructs the entry as its first act, one per
         // hot-path fn. Needle assembled from SPLIT literals (never contiguous
         // in this test's own source) so the whitespace-stripped scan below
-        // cannot match THIS line.
+        // cannot match THIS line. v0.3.0 (WP-K): the construction spelling is
+        // now `KeychainEntry::new` (the platform-abstracting primitive that, on
+        // Linux, routes through the persistent Secret-Service connection); the
+        // pinned invariant — "construction lives INSIDE the paced+retried
+        // closure" — is unchanged, only the needle tracks the new spelling.
         let paced_needle =
-            String::from("retry_with_backoff(||Entry::new(&service,") + "&key)?";
+            String::from("retry_with_backoff(||KeychainEntry::new(&service,") + "&key)?";
 
         let paced = flat.matches(paced_needle.as_str()).count();
         assert_eq!(
             paced, 3,
-            "set/get/delete must each construct the keyring Entry INSIDE \
+            "set/get/delete must each construct the KeychainEntry INSIDE \
              the retry_with_backoff closure (found {paced} paced \
-             construction sites, expected 3) — an unpaced `Entry::new` burst \
-             is the exact gnome-keyring crash P9 fixed"
+             construction sites, expected 3) — an unpaced entry-construction \
+             burst is the exact gnome-keyring crash P9 fixed"
         );
     }
 
@@ -3275,6 +3558,145 @@ mod tests {
             RAW_WRITE_NEEDLE,
             ALLOWED_FILE,
             offenders.join("\n  ")
+        );
+    }
+
+    /// K-3 CHOKEPOINT EROSION GUARD. `secrets_ss_connection` introduced a SECOND
+    /// raw keychain-write path on Linux — `Item::set_secret(` (update in place)
+    /// and `Collection::create_item(` (create). Those needles are NOT the
+    /// `.set_password(` primitive the A4 scan above pins, so without this test a
+    /// future caller in vct-hub or the app crate could acquire an unguarded
+    /// write path (bypassing the value-shape guard, pacing, backoff, lock gate,
+    /// memo invalidation, and the test mock) and the A4 scan would not see it —
+    /// exactly the erosion the v0.2.80 secrets-set-chokepoint lesson locked
+    /// against. This test asserts two invariants across the WHOLE launcher Rust
+    /// tree:
+    ///   1. the raw dbus write primitives `.set_secret(` / `create_item(` appear
+    ///      ONLY in `secrets_ss_connection.rs`;
+    ///   2. the `secrets_ss_connection::` module path is referenced ONLY from
+    ///      `secrets.rs` (the guarded chokepoint) and `lib.rs` (the `mod`
+    ///      declaration) — so the module cannot grow a caller elsewhere.
+    /// Needles are assembled from SPLIT literals (never contiguous in this test's
+    /// own source) so this file cannot self-match its own scan.
+    #[test]
+    fn raw_ss_write_primitives_and_module_confined_to_secrets_and_lib() {
+        use std::path::{Path, PathBuf};
+
+        let core_manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let src_tauri_root = core_manifest
+            .parent()
+            .expect("vct-launcher-core has a parent (src-tauri)")
+            .to_path_buf();
+        let scan_roots = [
+            src_tauri_root.join("src"), // app crate
+            src_tauri_root.join("vct-launcher-core").join("src"),
+            src_tauri_root.join("vct-hub").join("src"),
+        ];
+
+        fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+            let entries = match std::fs::read_dir(dir) {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect_rs_files(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+        fn code_before_line_comment(line: &str) -> &str {
+            match line.find("//") {
+                Some(idx) => &line[..idx],
+                None => line,
+            }
+        }
+
+        let mut files: Vec<PathBuf> = Vec::new();
+        for root in &scan_roots {
+            collect_rs_files(root, &mut files);
+        }
+        assert!(
+            files.len() > 50,
+            "source scan found only {} .rs files — the scan roots are wrong ({:?})",
+            files.len(),
+            scan_roots
+        );
+
+        // Needles assembled from split literals so this test's own source never
+        // matches them. `set_secret_needle` = ".set_secret(" ; `create_item_needle`
+        // = "create_item(" ; `module_needle` = "secrets_ss_connection::".
+        let set_secret_needle = String::from(".set_") + "secret(";
+        let create_item_needle = String::from("create_") + "item(";
+        let module_needle = String::from("secrets_ss_") + "connection::";
+
+        // The one file allowed to contain the raw dbus write primitives.
+        const WRITE_ALLOWED: &str = "secrets_ss_connection.rs";
+        // The only two files allowed to reference the module path.
+        const MODULE_ALLOWED: [&str; 2] = ["secrets.rs", "lib.rs"];
+
+        let mut write_offenders: Vec<String> = Vec::new();
+        let mut module_offenders: Vec<String> = Vec::new();
+        let mut saw_write_allowed = false;
+        let mut saw_module_ref = false;
+        for path in &files {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let text = match std::fs::read_to_string(path) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let has_raw_write = text.lines().any(|line| {
+                let code = code_before_line_comment(line);
+                code.contains(set_secret_needle.as_str())
+                    || code.contains(create_item_needle.as_str())
+            });
+            if has_raw_write {
+                if name == WRITE_ALLOWED {
+                    saw_write_allowed = true;
+                } else {
+                    write_offenders.push(path.display().to_string());
+                }
+            }
+            let has_module_ref = text
+                .lines()
+                .any(|line| code_before_line_comment(line).contains(module_needle.as_str()));
+            if has_module_ref {
+                saw_module_ref = true;
+                if !MODULE_ALLOWED.contains(&name) {
+                    module_offenders.push(path.display().to_string());
+                }
+            }
+        }
+
+        assert!(
+            saw_write_allowed,
+            "expected the raw dbus write primitive in {WRITE_ALLOWED} (the Linux \
+             persistent-connection writer's own site) — scan may be reading the \
+             wrong tree"
+        );
+        assert!(
+            write_offenders.is_empty(),
+            "raw dbus keychain write primitive (the persistent-connection \
+             item-set / collection-create-item calls) found OUTSIDE \
+             {WRITE_ALLOWED} — every production write must go through the guarded \
+             `secrets::set` chokepoint, not a bare persistent-connection \
+             primitive. Offending files:\n  {}",
+            write_offenders.join("\n  ")
+        );
+        assert!(
+            saw_module_ref,
+            "expected `secrets_ss_connection::` to be referenced from \
+             `secrets.rs` — scan may be reading the wrong tree"
+        );
+        assert!(
+            module_offenders.is_empty(),
+            "`secrets_ss_connection::` referenced OUTSIDE {MODULE_ALLOWED:?} — the \
+             persistent-connection module is `pub(crate)` and must only be reached \
+             from the guarded `secrets` chokepoint (its `lib.rs` `mod` decl \
+             aside). Offending files:\n  {}",
+            module_offenders.join("\n  ")
         );
     }
 

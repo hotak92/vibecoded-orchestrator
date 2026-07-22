@@ -181,19 +181,40 @@ function createAuthStore() {
       }
     },
 
-    async updateProfile(name: string) {
+    async updateProfile(name: string): Promise<void> {
+      // Snapshot the current user id synchronously (no forward reference to
+      // the exported `auth` binding, which isn't assigned yet at closure
+      // creation). The no-op `update` reads the live state and returns it
+      // unchanged.
+      let userId: string | null = null;
       update((s) => {
-        if (!s.user) return s;
-        const updatedUser = { ...s.user, name };
-        // Update name only. RLS forbids the client from touching `apps`;
-        // sending it (even unchanged) would be rejected by the WITH CHECK
-        // clause in some configurations.
-        supabase
-          .from('profiles')
-          .update({ name })
-          .eq('id', s.user.id);
-        return { ...s, user: updatedUser };
+        userId = s.user?.id ?? null;
+        return s;
       });
+      if (!userId) return;
+
+      // supabase-js v2 query builders are thenables that only fire an HTTP
+      // request when awaited/`.then`'d. The builder MUST be awaited here or
+      // no write ever reaches Supabase (the pre-fix version discarded an
+      // un-awaited builder inside a synchronous store callback, so the row
+      // never changed and the name silently reverted on the next fetch).
+      //
+      // Update name only. RLS forbids the client from touching `apps`;
+      // sending it (even unchanged) would be rejected by the WITH CHECK
+      // clause in some configurations.
+      const { error } = await supabase
+        .from('profiles')
+        .update({ name })
+        .eq('id', userId);
+
+      if (error) {
+        // Surface the failure so the caller can show an honest error
+        // instead of an unconditional "Saved!".
+        throw new Error(error.message);
+      }
+
+      // Mutate the local store only AFTER the write confirms.
+      update((s) => (s.user ? { ...s, user: { ...s.user, name } } : s));
     },
   };
 }

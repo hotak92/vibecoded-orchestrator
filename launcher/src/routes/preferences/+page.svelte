@@ -6,13 +6,12 @@
   import { selectedProject } from '$lib/stores/projects';
   import { toast } from '$lib/stores/toast';
   import { ui } from '$lib/stores/ui';
-  // v0.2.23 F2 wave 2b (2026-05-21): Profile + Downloads sections
-  // relocated from the now-deleted user-icon Settings popover. The
-  // `auth` store handles the Supabase profile write; the `settings`
-  // store handles the per-machine launcher prefs (install path,
-  // auto-update, launch-on-startup) via localStorage.
+  // Profile section relocated from the now-deleted user-icon Settings
+  // popover. The `auth` store handles the Supabase profile write. (The
+  // former localStorage-only Downloads prefs were removed — they had no
+  // backend consumer; the Startup section below wires the one real knob,
+  // hub boot autostart.)
   import { auth, currentUser } from '$lib/stores/auth';
-  import { settings } from '$lib/stores/settings';
   import Toast from '$lib/components/Toast.svelte';
   import Dropdown from '$lib/components/Dropdown.svelte';
   import { focusOnMount, focusTrap } from '$lib/actions/focusManagement';
@@ -1384,30 +1383,72 @@
     if ($currentUser) editName = $currentUser.name;
   });
 
+  let profileError = $state<string | null>(null);
+  let savingProfile = $state(false);
+
   async function saveProfile() {
-    if (!editName.trim()) return;
-    await auth.updateProfile(editName.trim());
-    profileSaved = true;
-    setTimeout(() => { profileSaved = false; }, 2000);
+    if (!editName.trim() || savingProfile) return;
+    profileError = null;
+    savingProfile = true;
+    try {
+      // updateProfile now awaits the Supabase write and throws on failure —
+      // only show "Saved!" when the row actually changed.
+      await auth.updateProfile(editName.trim());
+      profileSaved = true;
+      setTimeout(() => { profileSaved = false; }, 2000);
+    } catch (e) {
+      profileError = e instanceof Error ? e.message : String(e);
+    } finally {
+      savingProfile = false;
+    }
   }
 
-  // ── Downloads / Install (v0.2.23 F2 wave 2b, relocated) ───────────────
-  // Three per-machine knobs that the `settings` store persists to
-  // localStorage (see $lib/stores/settings.ts). Local mirrors are kept
-  // in sync with the store via subscribe so updates from anywhere flow
-  // back into the inputs.
-  let installPath = $state('');
-  let autoUpdate = $state(true);
-  let launchOnStartup = $state(false);
+  // ── Startup (hub boot autostart) ──────────────────────────────────────
+  // The single real knob here is boot autostart for the background hub
+  // (vct-hub), which the resolver for hooks / MCPs / scripts talks to.
+  // Backed by `vct-hub --{register,unregister,}-boot` through the
+  // get/set_hub_boot_autostart Tauri commands. Tri-state so an
+  // un-inspectable host init system renders as disabled-with-hint rather
+  // than a lying "off".
+  //
+  // The former localStorage-only "Install location" / "Auto-update apps"
+  // controls were removed: they persisted and read back but had no
+  // backend consumer, so they never did anything.
+  let bootAutostartState = $state<'enabled' | 'disabled' | 'unsupported' | 'loading'>('loading');
+  let bootAutostartBusy = $state(false);
+  let bootAutostartError = $state<string | null>(null);
 
-  // $effect auto-unsubscribes on component destroy. Replaces the
-  // popover-era .subscribe() pattern that leaked one subscription per
-  // /preferences mount.
-  $effect(() => {
-    installPath = $settings.installPath;
-    autoUpdate = $settings.autoUpdate;
-    launchOnStartup = $settings.launchOnStartup;
-  });
+  async function loadBootAutostart() {
+    try {
+      const state = await invoke<string>('get_hub_boot_autostart');
+      bootAutostartState =
+        state === 'enabled' || state === 'disabled' || state === 'unsupported'
+          ? state
+          : 'unsupported';
+    } catch (e) {
+      // Command unreachable (browser mode / partial install) → treat as
+      // unsupported so the toggle disables itself rather than pretending.
+      bootAutostartState = 'unsupported';
+      console.warn('get_hub_boot_autostart failed', e);
+    }
+  }
+
+  async function toggleBootAutostart(event: Event) {
+    const target = event.currentTarget as HTMLInputElement;
+    const enable = target.checked;
+    bootAutostartBusy = true;
+    bootAutostartError = null;
+    try {
+      await invoke('set_hub_boot_autostart', { enabled: enable });
+      bootAutostartState = enable ? 'enabled' : 'disabled';
+    } catch (e) {
+      bootAutostartError = e instanceof Error ? e.message : String(e);
+      // Revert the checkbox to the last-known state on failure.
+      target.checked = bootAutostartState === 'enabled';
+    } finally {
+      bootAutostartBusy = false;
+    }
+  }
 
   // ── Shared services live status (v0.2.23 F2 wave 2b, relocated) ───────
   // Read-only probe of the per-machine Weaviate / Ollama / code_embed
@@ -1723,6 +1764,8 @@
     // v0.2.34 (Agent I): resolve the launcher's state-root for the
     // Preferences → Storage discoverability surface.
     void loadStateDir();
+    // Startup section: read the hub boot-autostart state.
+    void loadBootAutostart();
   });
   $effect(() => { if (project) void load(); });
   $effect(() => { if ($selectedProject) void loadRlLocalState(); });
@@ -2907,58 +2950,47 @@
           <p class="pr-pat-hint">Email cannot be changed here.</p>
         </div>
         <div class="pr-profile-actions">
-          <button class="pr-btn-primary" onclick={saveProfile}>
-            Save changes
+          <button class="pr-btn-primary" onclick={saveProfile} disabled={savingProfile}>
+            {savingProfile ? 'Saving…' : 'Save changes'}
           </button>
           {#if profileSaved}
             <span class="pr-profile-saved">Saved!</span>
+          {/if}
+          {#if profileError}
+            <span class="pr-profile-error">{profileError}</span>
           {/if}
         </div>
       </div>
     </section>
 
-    <!-- v0.2.23 F2 wave 2b: Downloads. Per-machine launcher prefs
-         persisted to localStorage by `$lib/stores/settings.ts`. -->
-    <section class="pr-section" aria-labelledby="pr-downloads-title">
-      <h2 class="pr-section-title" id="pr-downloads-title">Downloads</h2>
+    <!-- Startup: hub boot autostart. The single real per-machine startup
+         knob, backed by `vct-hub --{register,unregister,}-boot`. -->
+    <section class="pr-section" aria-labelledby="pr-startup-title">
+      <h2 class="pr-section-title" id="pr-startup-title">Startup</h2>
       <div class="pr-onboarding-row">
         <div class="pr-onboarding-text">
-          <strong>Install location</strong>
+          <strong>Start background service on login</strong>
           <span class="pr-onboarding-hint">
-            Where apps will be downloaded and installed.
+            Register the vct-hub background service to launch when you log in,
+            so Claude Code hooks, MCP servers, and scripts can reach it without
+            opening the launcher first. Default off.
           </span>
-        </div>
-        <input
-          class="pr-pat-input pr-downloads-input"
-          type="text"
-          bind:value={installPath}
-          onchange={() => settings.updateSetting('installPath', installPath)}
-        />
-      </div>
-      <div class="pr-onboarding-row">
-        <div class="pr-onboarding-text">
-          <strong>Auto-update apps</strong>
-          <span class="pr-onboarding-hint">
-            Automatically download and install app updates.
-          </span>
-        </div>
-        <input
-          type="checkbox"
-          bind:checked={autoUpdate}
-          onchange={() => settings.updateSetting('autoUpdate', autoUpdate)}
-        />
-      </div>
-      <div class="pr-onboarding-row">
-        <div class="pr-onboarding-text">
-          <strong>Launch on system startup</strong>
-          <span class="pr-onboarding-hint">
-            Start the launcher automatically when you log in to your machine.
-          </span>
+          {#if bootAutostartState === 'unsupported'}
+            <span class="pr-onboarding-hint pr-startup-unsupported">
+              Boot autostart isn't available on this machine (the host init
+              system can't be inspected). Use the launcher, or start the hub
+              manually from a session.
+            </span>
+          {/if}
+          {#if bootAutostartError}
+            <span class="pr-onboarding-hint pr-startup-error">{bootAutostartError}</span>
+          {/if}
         </div>
         <input
           type="checkbox"
-          bind:checked={launchOnStartup}
-          onchange={() => settings.updateSetting('launchOnStartup', launchOnStartup)}
+          checked={bootAutostartState === 'enabled'}
+          disabled={bootAutostartBusy || bootAutostartState === 'loading' || bootAutostartState === 'unsupported'}
+          onchange={toggleBootAutostart}
         />
       </div>
     </section>
@@ -3609,7 +3641,9 @@
   .pr-profile-label { font-size: 11px; color: #888; }
   .pr-profile-actions { display: flex; align-items: center; gap: 12px; margin-top: 4px; }
   .pr-profile-saved { font-size: 11.5px; color: rgb(0,191,166); font-weight: 500; }
-  .pr-downloads-input { max-width: 320px; flex-shrink: 0; }
+  .pr-profile-error { font-size: 11.5px; color: var(--color-pink); font-weight: 500; }
+  .pr-startup-unsupported { color: var(--color-muted); font-style: italic; }
+  .pr-startup-error { color: var(--color-pink); }
 
   /* Shared services list — port of .services-list from SettingsPanel. */
   .pr-services-row { align-items: flex-start; }

@@ -480,11 +480,21 @@ class CodeGraphQuery:
                 except Exception:
                     # Peer never indexed this base — skip silently.
                     continue
+                # R2-6: request the stored node vector for the active code slot
+                # (include_vector). This lets the retrieval-telemetry emitter's
+                # fast-path carry each node's ``n_emb`` for FREE — so the
+                # code_hook/code_cli events are trainable WITHOUT the emitter
+                # having to re-embed each vector-less node one-by-one on this
+                # synchronous hook path (the "lock on retrieval" hazard). The
+                # emitter's re-embed recovery is now the rare residual it was
+                # designed to be (cold-fetch races), bounded by a per-emit budget.
+                _code_slot = _active_code_vector_slot()
                 nv_kwargs = dict(
                     near_vector=query_embedding,
                     limit=_fetch_limit,
                     return_metadata=MetadataQuery(distance=True),
-                    target_vector=_active_code_vector_slot(),
+                    target_vector=_code_slot,
+                    include_vector=[_code_slot],
                 )
                 if project_filter:
                     nv_kwargs["filters"] = Filter.by_property("project").equal(project_filter)
@@ -515,13 +525,33 @@ class CodeGraphQuery:
             # non-divergence invariant).
             candidates: list[dict] = []
             for distance, source, obj in merged:
-                candidates.append({
+                cand = {
                     "_c": collection,
                     "_s": max(0.0, 1.0 - distance),
                     "_d": distance,
                     "_p": obj.properties,
                     "_src": source,
-                })
+                }
+                # R2-6: attach the stored node vector (fetched via include_vector
+                # above) as ``n_emb`` so the telemetry emitter's fast-path uses it
+                # directly instead of re-embedding. ``obj.vector`` is a
+                # dict[slot -> vector] for named-vector collections; pull the
+                # active code slot only. Soft-fail: a missing/oddly-shaped vector
+                # just leaves the candidate without ``n_emb`` (the emitter's
+                # bounded recovery then handles the rare residual).
+                try:
+                    _v = getattr(obj, "vector", None)
+                    if isinstance(_v, dict):
+                        _slot_vec = _v.get(_code_slot)
+                    elif isinstance(_v, list):
+                        _slot_vec = _v
+                    else:
+                        _slot_vec = None
+                    if _slot_vec:
+                        cand["n_emb"] = list(_slot_vec)
+                except Exception:
+                    pass
+                candidates.append(cand)
 
             # B2 (design audit): cull the excluded file's own entities BEFORE
             # the pipeline (pre-trim), so the +0.03 same-file anchor boost

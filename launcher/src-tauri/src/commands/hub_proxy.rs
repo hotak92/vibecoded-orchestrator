@@ -102,3 +102,41 @@ pub async fn hub_poll_messages(recipient: String) -> Result<Value, String> {
 pub async fn hub_data_catalog() -> Result<Value, String> {
     hub_get("/data/catalog").await
 }
+
+// ─── Hub boot autostart (wraps vct-hub --{register,unregister,}-boot) ────
+//
+// Surfaces the hub's cross-OS boot-autostart (default-OFF) to the launcher
+// Preferences toggle. The underlying ops spawn the vct-hub binary
+// synchronously, so each command runs on a blocking task to keep the async
+// runtime unblocked (per hub_status's contract note).
+
+/// Boot-autostart state for the Preferences toggle: `"enabled"`,
+/// `"disabled"`, or `"unsupported"` (host init system not inspectable).
+#[command]
+pub async fn get_hub_boot_autostart() -> Result<String, String> {
+    let state = tokio::task::spawn_blocking(crate::hub_status::boot_status)
+        .await
+        .map_err(|e| format!("get_hub_boot_autostart join error: {}", e))?;
+    Ok(match state {
+        crate::hub_status::BootAutostart::Enabled => "enabled",
+        crate::hub_status::BootAutostart::Disabled => "disabled",
+        crate::hub_status::BootAutostart::Unsupported => "unsupported",
+    }
+    .to_string())
+}
+
+/// Enable or disable hub boot autostart. `enabled=true` registers the OS
+/// unit (idempotent, also starts it); `false` unregisters it. Errors carry
+/// the underlying tool's stderr so the toggle can toast an honest reason.
+#[command]
+pub async fn set_hub_boot_autostart(enabled: bool) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        if enabled {
+            crate::hub_status::register_boot()
+        } else {
+            crate::hub_status::unregister_boot()
+        }
+    })
+    .await
+    .map_err(|e| format!("set_hub_boot_autostart join error: {}", e))?
+}

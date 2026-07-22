@@ -20,7 +20,8 @@
   // them parallel preserves the v0.2.2 mental model.
 
   import { onDestroy, onMount } from 'svelte';
-  import { listen, safeInvoke } from '$lib/tauri';
+  import { listen, invoke, safeInvoke } from '$lib/tauri';
+  import { toast } from '$lib/stores/toast';
   import type { KgSummaryStatus, KgSummaryView } from '$lib/types/launcher';
 
   interface Props {
@@ -45,11 +46,14 @@
     if (retrying) return;
     retrying = true;
     try {
-      await safeInvoke<void>('retry_kg_summary', { projectId });
+      // Strict invoke so a failed retry surfaces rather than no-op'ing.
+      await invoke<void>('retry_kg_summary', { projectId });
       expanded = false;
       dismissed = false;
     } catch (e) {
-      if (view) view = { ...view, error_message: e instanceof Error ? e.message : String(e) };
+      const msg = e instanceof Error ? e.message : String(e);
+      if (view) view = { ...view, error_message: msg };
+      toast.error(`KG summary retry failed: ${msg}`);
     } finally {
       retrying = false;
     }

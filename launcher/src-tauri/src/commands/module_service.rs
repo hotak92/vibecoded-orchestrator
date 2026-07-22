@@ -998,6 +998,149 @@ fn ensure_project_rl_port(db: &Db, project: &ProjectRow) -> Result<u16, String> 
     Ok(port)
 }
 
+/// Outcome of a per-project RL port reconcile — mirrors the core
+/// [`vct_launcher_core::db::module_ports::PortReconcileDecision`] with the
+/// side-effect step recorded, so callers/tests can assert the act vs
+/// leave-alone gate + whether env was re-projected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortReconcileOutcome {
+    /// The `module_ports` row was updated to `bound` (was `previous`) and env
+    /// row now records the live bound port (H.1: the hub serves the port
+    /// from this row via `ProjectConfig`; no env projection occurs).
+    Updated { previous: Option<u16>, bound: u16 },
+    /// The row already matched the running container's bound port — no write,
+    /// no re-projection.
+    AlreadyCurrent { port: u16 },
+    /// Left alone (no running container / no publishable bind, or an
+    /// introspection error). Carries a machine-readable reason.
+    LeftAlone { reason: &'static str },
+}
+
+/// WP-Q item 3 (G6): reconcile the `module_ports` row for the RL reranker to
+/// the ACTUALLY-BOUND host port of its RUNNING container so the hub's
+/// ProjectConfig resolver (and therefore the MCP's RLClient) reaches the right
+/// port.
+///
+/// Option (b) — RECORD REALITY, NEVER RESTART. This is the launcher's
+/// single-writer step (per the RL chat's ruling: launcher owns `module_ports`,
+/// trust boundary at launcher.db). It NEVER calls `start_container_for_module`
+/// / `podman run` — a running container's actual bind is ground truth, and
+/// restarting it would kill an in-flight training job (the option-a hazard the
+/// RL chat rejected).
+///
+/// The reconcile does NOT write any env: per the H.1 contract RL_SERVER_PORT /
+/// RL_SERVER_URL are DELIBERATELY not projected into `.claude/{settings.json,
+/// env}`. The per-project RL port is a HUB-RESOLVED value — the hub's `/config`
+/// endpoint sources `ProjectConfig.rl_server_port` straight from THIS
+/// `module_ports` row (config_api.rs, V52-AA v0.2.52), and the MCP reads it
+/// live. Updating the row IS the projection: the hub then serves the corrected
+/// port automatically, no env ceremony.
+///
+/// Flow:
+///   1. Resolve the container name from the manifest template + project slug.
+///   2. Read the container's actually-bound host port via `inspect`
+///      (introspection only). An error / no-running-container / no-bind →
+///      LEAVE ALONE (never guess a port).
+///   3. Compare against the `module_ports` row via the pure
+///      `decide_port_reconcile`. On a mismatch, UPDATE the row to the bound
+///      port (single-writer `set_module_port`).
+///
+/// Soft-fail throughout: any error logs + returns a `LeftAlone` outcome; this
+/// step must never break a resume sweep or an install.
+pub async fn reconcile_rl_port_to_bound(
+    db: &Db,
+    project: &ProjectRow,
+    manifest: &ModuleManifest,
+) -> PortReconcileOutcome {
+    let module_id = &manifest.id;
+
+    // Resolve the running container's name (manifest template + slug).
+    let name_template = manifest
+        .runtime
+        .resolve_container_name_template(module_id);
+    let container_name = match resolve_container_name(&name_template, &project.slug) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!(
+                "[module_service] port-reconcile: resolve_container_name({}/{}): {} — leaving alone",
+                project.id, module_id, e
+            );
+            return PortReconcileOutcome::LeftAlone { reason: "container_name_unresolved" };
+        }
+    };
+
+    // Production introspection: read the actually-bound host port via the
+    // container runtime (never restarts). An Err (no running container /
+    // runtime absent) → leave-alone; Ok(Some/None) feeds the decision.
+    let bound_result =
+        vct_launcher_core::services::container_runtime::read_bound_host_port(&container_name)
+            .await;
+    reconcile_rl_port_with_bound(db, project, module_id, bound_result).await
+}
+
+/// WP-Q item 3 (G6): the TESTABLE core of the reconcile — takes the
+/// already-resolved introspection result so the decision + side-effect gate
+/// (the DB row write — the sole effect per H.1) can be unit-tested without a live container.
+/// `bound_result` is exactly what `read_bound_host_port` returns:
+///   * `Ok(Some(port))` — a running container bound on `port`.
+///   * `Ok(None)`       — inspect succeeded but no publishable bind.
+///   * `Err(_)`         — introspection error (no running container / runtime).
+async fn reconcile_rl_port_with_bound(
+    db: &Db,
+    project: &ProjectRow,
+    module_id: &str,
+    bound_result: Result<Option<u16>, String>,
+) -> PortReconcileOutcome {
+    use vct_launcher_core::db::module_ports::{decide_port_reconcile, PortReconcileDecision};
+
+    let bound = match bound_result {
+        Ok(b) => b,
+        Err(e) => {
+            // Introspection error → leave alone + log. NEVER treat an error as
+            // "port gone" (option b conservative-on-doubt).
+            eprintln!(
+                "[module_service] port-reconcile: inspect {}/{} failed: {} — leaving alone",
+                project.id, module_id, e
+            );
+            return PortReconcileOutcome::LeftAlone { reason: "introspection_error" };
+        }
+    };
+
+    let row_port = db.get_module_port(&project.id, module_id).unwrap_or(None);
+    match decide_port_reconcile(row_port, bound) {
+        PortReconcileDecision::LeaveAlone { reason } => {
+            PortReconcileOutcome::LeftAlone { reason }
+        }
+        PortReconcileDecision::AlreadyCurrent { port } => {
+            PortReconcileOutcome::AlreadyCurrent { port }
+        }
+        PortReconcileDecision::UpdateRow { row, bound } => {
+            // Record reality: update the single-writer module_ports row to the
+            // live bind. This IS the projection: the hub's /config resolver
+            // sources ProjectConfig.rl_server_port from this exact row
+            // (config_api.rs, V52-AA), and the MCP's rl_enrichment._get_rl_client
+            // reads it live to reach the container — so correcting the row makes
+            // the hub serve the right port with NO env write (the H.1 contract:
+            // RL_SERVER_PORT/URL are NOT projected into .claude/{settings.json,
+            // env}; the per-project value flows through the hub-resolved
+            // ProjectConfig channel instead).
+            if let Err(e) = db.set_module_port(&project.id, module_id, bound) {
+                eprintln!(
+                    "[module_service] port-reconcile: set_module_port({}/{}, {}): {} — leaving alone",
+                    project.id, module_id, bound, e
+                );
+                return PortReconcileOutcome::LeftAlone { reason: "db_write_failed" };
+            }
+            eprintln!(
+                "[module_service] port-reconcile: {}/{} module_ports {:?} → {} (recorded live \
+                 container bind; hub ProjectConfig now serves the correct RL port)",
+                project.id, module_id, row, bound
+            );
+            PortReconcileOutcome::Updated { previous: row, bound }
+        }
+    }
+}
+
 /// Random port in `RL_PORT_RANGE_LO..=RL_PORT_RANGE_HI`. Tiny window
 /// (401 ports) — collisions are possible but rare; podman surfaces them
 /// at run time with a clear "address already in use" error.
@@ -2673,6 +2816,23 @@ where
         if let Some(ref container_name) = container_name_opt {
             let running = is_container_running(container_name).await.unwrap_or(false);
             if running {
+                // WP-Q item 3 (G6): the container is UP — reconcile its
+                // per-project module_ports row to the ACTUALLY-BOUND host port
+                // (option b: record reality, NEVER restart). This runs on the
+                // short-circuit path precisely BECAUSE we are not restarting: a
+                // running container's bind is ground truth, and a stale row
+                // would otherwise make the hub's ProjectConfig resolver hand the
+                // MCP the wrong port (rl_used:false forever). GLOBAL rows
+                // (project_id None) use the fixed GLOBAL_RL_PORT and have no
+                // per-project module_ports row, so we only reconcile per-project
+                // rows here. Soft-fail: the outcome is logged inside the helper;
+                // a reconcile hiccup never blocks the sweep.
+                if let Some(ref pid) = project_id_opt {
+                    if let Ok(Some(project)) = db.get_project(pid) {
+                        let _ =
+                            reconcile_rl_port_to_bound(db, &project, &manifest).await;
+                    }
+                }
                 continue;
             }
         }
@@ -5353,6 +5513,128 @@ mod tests {
             widen_restart_action(None, false, Some("127.0.0.1")),
             WidenAction::NothingHubDown,
             "no running hub → nothing to restart (ensure_hub_running follows)"
+        );
+    }
+
+    // ─── WP-Q item 3 (G6): reconcile_rl_port_with_bound act/leave-alone ─────
+
+    /// Stale row + a healthy container bound on ANOTHER port → the module_ports
+    /// row is UPDATED to the live bind (record reality) and the outcome reports
+    /// the change. The row is the hub's ProjectConfig.rl_server_port source, so
+    /// correcting it is the whole fix (no env write — the H.1 contract).
+    #[tokio::test]
+    async fn reconcile_stale_row_updates_to_running_container_bind() {
+        let (db, pid) = open_db_with_resume_project();
+        let project = db.get_project(&pid).expect("get_project").expect("row");
+        // Row says 11442; the running container is actually bound on 11450.
+        db.set_module_port(&pid, RL_RERANKER_MODULE_ID, 11442).unwrap();
+
+        let outcome = reconcile_rl_port_with_bound(
+            &db, &project, RL_RERANKER_MODULE_ID, Ok(Some(11450)),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            PortReconcileOutcome::Updated { previous: Some(11442), bound: 11450 },
+        );
+        // Row now records reality.
+        assert_eq!(
+            db.get_module_port(&pid, RL_RERANKER_MODULE_ID).unwrap(),
+            Some(11450),
+        );
+    }
+
+    /// No running container / no publishable bind (`Ok(None)`) → LEAVE ALONE;
+    /// the row is untouched (never invent a port).
+    #[tokio::test]
+    async fn reconcile_no_bound_leaves_row_alone() {
+        let (db, pid) = open_db_with_resume_project();
+        let project = db.get_project(&pid).expect("get_project").expect("row");
+        db.set_module_port(&pid, RL_RERANKER_MODULE_ID, 11442).unwrap();
+
+        let outcome = reconcile_rl_port_with_bound(
+            &db, &project, RL_RERANKER_MODULE_ID, Ok(None),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            PortReconcileOutcome::LeftAlone { reason: "no_running_container_or_no_bind" },
+        );
+        // Row unchanged.
+        assert_eq!(
+            db.get_module_port(&pid, RL_RERANKER_MODULE_ID).unwrap(),
+            Some(11442),
+        );
+    }
+
+    /// Introspection ERROR (`Err`) → LEAVE ALONE + log; the row is untouched.
+    /// An error must NEVER be read as "the port is gone".
+    #[tokio::test]
+    async fn reconcile_introspection_error_leaves_row_alone() {
+        let (db, pid) = open_db_with_resume_project();
+        let project = db.get_project(&pid).expect("get_project").expect("row");
+        db.set_module_port(&pid, RL_RERANKER_MODULE_ID, 11442).unwrap();
+
+        let outcome = reconcile_rl_port_with_bound(
+            &db, &project, RL_RERANKER_MODULE_ID,
+            Err("podman inspect returned non-zero (container absent)".into()),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            PortReconcileOutcome::LeftAlone { reason: "introspection_error" },
+        );
+        assert_eq!(
+            db.get_module_port(&pid, RL_RERANKER_MODULE_ID).unwrap(),
+            Some(11442),
+        );
+    }
+
+    /// Row already equals the running bind → AlreadyCurrent (no write, no
+    /// re-projection).
+    #[tokio::test]
+    async fn reconcile_matching_row_is_already_current() {
+        let (db, pid) = open_db_with_resume_project();
+        let project = db.get_project(&pid).expect("get_project").expect("row");
+        db.set_module_port(&pid, RL_RERANKER_MODULE_ID, 11450).unwrap();
+
+        let outcome = reconcile_rl_port_with_bound(
+            &db, &project, RL_RERANKER_MODULE_ID, Ok(Some(11450)),
+        )
+        .await;
+
+        assert_eq!(outcome, PortReconcileOutcome::AlreadyCurrent { port: 11450 });
+        assert_eq!(
+            db.get_module_port(&pid, RL_RERANKER_MODULE_ID).unwrap(),
+            Some(11450),
+        );
+    }
+
+    /// Never-allocated row (`None`) + a running container → the bind is
+    /// RECORDED (None → bound). This is the live-install case: the container
+    /// runs but no module_ports/env was ever projected.
+    #[tokio::test]
+    async fn reconcile_absent_row_records_running_bind() {
+        let (db, pid) = open_db_with_resume_project();
+        let project = db.get_project(&pid).expect("get_project").expect("row");
+        // No module_ports row set at all.
+        assert_eq!(db.get_module_port(&pid, RL_RERANKER_MODULE_ID).unwrap(), None);
+
+        let outcome = reconcile_rl_port_with_bound(
+            &db, &project, RL_RERANKER_MODULE_ID, Ok(Some(11450)),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            PortReconcileOutcome::Updated { previous: None, bound: 11450 },
+        );
+        assert_eq!(
+            db.get_module_port(&pid, RL_RERANKER_MODULE_ID).unwrap(),
+            Some(11450),
         );
     }
 }

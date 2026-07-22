@@ -255,10 +255,10 @@ Full ingestion pipeline: (1) chunk content to 800–2000 tokens, (2) store chunk
 ## Cross-Cutting Notes
 
 ### RL reranking integration (transparent)
-`hybrid_search` and `semantic_graph_search` optionally rerank results via an RL server at `RL_SERVER_URL` (default `http://localhost:11439`). When the RL server is unreachable, Weaviate-order top-k is returned unchanged. The over-fetch multiplier (`_RL_OVERFETCH = 2`) fetches 2× the requested limit from Weaviate before passing to the RL ranker.
+`hybrid_search` and `semantic_graph_search` optionally rerank results via an RL server (Pro/MAO reranker module) resolved from `RL_SERVER_URL` / `RL_SERVER_PORT`. When neither is set or the server is unreachable, the RL client is in disabled mode and Weaviate-order top-k is returned unchanged (`rl_used: false` on the event). The over-fetch multiplier fetches more than the requested limit from Weaviate before passing candidates to the RL ranker.
 
-### Detail expansion logging for RL training
-Each `hybrid_search` call logs `{query, detail_level, result_count, rl_bonus}` to `.claude/logs/YYYY-MM-DD_retrieval_expansion.jsonl`. Bonus values: `titles=0.0`, `descriptions=+0.3`, `full=+0.8`. Used to train retrieval expansion behavior.
+### Retrieval telemetry for RL training
+Every ranked-retrieval path (MCP `hybrid_search` / `semantic_graph_search` / `search_code_graph`, the pre-edit / pre-bash / subagent hook KG searches, and the `kg-search` / `code-graph-query` CLIs) emits an RL telemetry event through one chokepoint and POSTs it to the local `vct-hub`, which is the single writer of the `rl_events` table in `launcher.db`. The legacy JSONL sink under `~/.claude/retrieval_rl_data/` is frozen and no longer written. What each event carries, the dual-embedding gates, and the privacy posture are documented in [`TELEMETRY.md`](../TELEMETRY.md#rl-retrieval-telemetry--what-is-collected-and-what-it-means).
 
 ### `KG_BASE_DIR` env var
 When set, all path resolution (node writes, `kg-sync`, hook auto-sync) uses this as the project root. Enables using the same MCP server config across multiple projects — the KG collection in Weaviate is still distinguished by `KG_COLLECTION`.

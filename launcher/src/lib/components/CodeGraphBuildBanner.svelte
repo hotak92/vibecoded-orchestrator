@@ -16,7 +16,8 @@
   // error message, log tail, and a "Retry build" button.
 
   import { onDestroy, onMount } from 'svelte';
-  import { listen, safeInvoke } from '$lib/tauri';
+  import { listen, invoke, safeInvoke } from '$lib/tauri';
+  import { toast } from '$lib/stores/toast';
   import type {
     CodeGraphBuildView,
     CodeGraphBuildStatus,
@@ -66,11 +67,16 @@
     if (rerunning) return;
     rerunning = true;
     try {
-      await safeInvoke<void>('rebuild_code_graph', { projectId });
+      // Strict invoke so a failed rebuild surfaces — matches the project
+      // header's "Re-build code graph" button (invoke + toast), which the
+      // safeInvoke here previously diverged from.
+      await invoke<void>('rebuild_code_graph', { projectId });
       expanded = false;
       dismissed = false;
     } catch (e) {
-      if (view) view = { ...view, error_message: e instanceof Error ? e.message : String(e) };
+      const msg = e instanceof Error ? e.message : String(e);
+      if (view) view = { ...view, error_message: msg };
+      toast.error(`Code graph rebuild failed: ${msg}`);
     } finally {
       rerunning = false;
     }

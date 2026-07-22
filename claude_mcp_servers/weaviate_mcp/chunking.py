@@ -231,25 +231,53 @@ MODEL_TOKEN_LIMITS: dict[str, int] = {
 # Chunker revision sentinel. Bumped whenever MODEL_TOKEN_LIMITS or
 # CHUNKING_PRESETS change in a way that produces different chunk
 # boundaries — i.e. existing Weaviate rows are stale and recall
-# degrades. Read by the launcher's version-change startup hook
-# (see launcher/src-tauri/src/commands/module_catalog_client.rs::
-# bust_cache_if_launcher_version_changed for the existing pattern).
+# degrades.
 #
-# When the launcher detects this changed across an update, it should
-# write an UPDATE_DEFERRED.md entry telling the user to run
-# `.claude/scripts/kg-sync --all` + `code-graph-analyze . --force-recreate`
-# to re-chunk under the new presets (v0.2.75: the previously-documented
-# `--force` flags don't exist on either CLI — see
-# vco_lib/project_init.py::_emit_chunker_resync_deferral, the actual
-# emitter, and tests/test_deferral_command_argparse_sweep.py). Today this
-# is a manual user action — see https://github.com/hotak92/
-# vibecoded-orchestrator issue tracking #TBD for launcher-side automation.
+# CONSUMER (R2-4, 2026-07-22): the launcher reads this string on every boot via
+# vco_lib.project_init.current_chunker_revision() and compares it against the
+# persisted last-seen value (app_state `chunker.last_seen_revision`). On change
+# it writes an UPDATE_DEFERRED.md entry telling the user to run
+# `.claude/scripts/kg-sync --all` + `code-graph-analyze . --force-recreate` to
+# re-chunk under the new presets. See
+# launcher/src-tauri/src/commands/chunker_revision_deferral.rs::
+# write_chunker_deferral_if_revision_changed (the revision consumer) and
+# vco_lib/project_init.py::_emit_chunker_revision_resync_deferral (the emitter).
+# This SUPERSEDES the earlier "manual user action" note — bumping the string
+# below now actually fires the deferral. (The older semver-boundary check,
+# CHUNKER_BUMP_VERSION = "0.2.46", still exists but only ever fired across the
+# one-off v0.2.46 launcher-version crossing; the v0.2.75 `--force`-flag fix
+# applies to both emitters — the real drop+rebuild flag is `--force-recreate`,
+# guarded by tests/test_deferral_command_argparse_sweep.py.)
 #
 # Revision history:
+#   v0.2.88 (2026-07-22, WP-O rework — no-functionality-loss rule):
+#     REVERTED the v0.2.87 min-across-slots clamp. The ACTIVE slot's chunk
+#     boundaries must NEVER drop below the single-write baseline — a dual-write
+#     install must produce active-slot data ≥ identical to a single-write install.
+#     v0.2.87 clamped boundaries to the TIGHTEST slot (e.g. arctic 4 096), which
+#     DEGRADED the active qwen3 slot's chunk fidelity — forbidden. So active-slot
+#     chunk sizing now follows the ACTIVE model's OWN preset again (UNCLAMPED,
+#     identical to single-write); the SECONDARY slots absorb the degradation
+#     instead — embedding_service.embed_text_all_configured embeds each secondary
+#     from a BOUNDED, EXPLICITLY-TAGGED leading sub-window when the chunk exceeds
+#     that secondary's num_ctx (svc.last_secondary_truncated records which slots),
+#     never a silent Ollama/OpenAI truncation and never a clamp on the active
+#     chunk. BOUNDARY IMPACT: for the dual-write installs that ran v0.2.87 (arctic-
+#     or openai-secondary), active-slot boundaries now REVERT from the tight tier
+#     back to the active model's own tier → boundaries change for those users →
+#     the revision consumer surfaces a re-sync. SINGLE-model / non-dual installs:
+#     v0.2.87 was already byte-identical to them, and this rework keeps that — so
+#     NO change for the common install. ``chunking_preset_for_models`` /
+#     ``Chunker.for_models`` are retained (used by tests + as a min-across-slots
+#     utility) but are NO LONGER wired into the KG active-slot write path.
+#   v0.2.87 (2026-07-22): [SUPERSEDED by v0.2.88] dual-write min-across-slots chunk
+#     budget — clamped active-slot boundaries to the tightest configured slot's
+#     num_ctx. Reverted above because it reduced active-slot fidelity below the
+#     single-write baseline.
 #   v0.2.47.5 (2026-06-04): re-cast as num_ctx (was: model architectural max).
 #     Quadrupled qwen3 chunks (1500 → 13500 max tokens). 5-tier presets.
 #   pre-v0.2.47.5: 3-tier presets, MODEL_TOKEN_LIMITS = model architectural max.
-_CHUNKER_REVISION: str = "v0.2.47.5"
+_CHUNKER_REVISION: str = "v0.2.88"
 
 
 # Default chunking presets by model class.
@@ -288,13 +316,27 @@ def chunking_preset_for_model(model_name: str) -> tuple[int, int, int]:
     unknown model getting `large_context` will produce LARGER chunks
     than before.
     """
+    return _preset_for_limit(_num_ctx_for_model(model_name))
+
+
+def _num_ctx_for_model(model_name: str) -> "int | None":
+    """Resolve a model's ``num_ctx`` (MODEL_TOKEN_LIMITS value) with partial match.
+
+    Returns None when the name matches no registered entry (the caller then
+    applies the ``large_context`` default). Extracted so both the single-model
+    and multi-model preset resolvers share ONE lookup rule (no drift).
+    """
     limit = MODEL_TOKEN_LIMITS.get(model_name)
     if limit is None:
-        # Try partial match
         for key, val in MODEL_TOKEN_LIMITS.items():
             if key in model_name or model_name in key:
                 limit = val
                 break
+    return limit
+
+
+def _preset_for_limit(limit: "int | None") -> tuple[int, int, int]:
+    """Map a ``num_ctx`` to its chunking preset tier. None → large_context."""
     if limit is None:
         return CHUNKING_PRESETS["large_context"]
     if limit <= 512:
@@ -306,6 +348,54 @@ def chunking_preset_for_model(model_name: str) -> tuple[int, int, int]:
     if limit <= 8192:
         return CHUNKING_PRESETS["large_context"]
     return CHUNKING_PRESETS["xlarge_context"]
+
+
+def chunking_preset_for_models(model_names: "list[str]") -> tuple[int, int, int]:
+    """Return the preset sized to the TIGHTEST ``num_ctx`` across ``model_names``.
+
+    NOT WIRED INTO THE ACTIVE-SLOT WRITE PATH (WP-O rework, v0.2.88): the KG
+    active-slot chunker is sized to the ACTIVE model ALONE (unclamped) so its
+    fidelity never drops below the single-write baseline. This min-across-slots
+    helper is RETAINED as a utility (tests + any future consumer that genuinely
+    wants the tightest budget) but the dual-write degradation is now handled on the
+    SECONDARY side — ``EmbeddingService.embed_text_all_configured`` embeds each
+    secondary from a bounded, tagged sub-window rather than clamping the shared
+    chunk. Do NOT re-wire this into ``store_knowledge_node`` chunk sizing: that
+    reintroduces the active-fidelity regression this rework removed.
+
+    Historical rationale (kept for the utility's own contract): under
+    ``DUAL_EMBEDDING_WRITE_ALL_SLOTS`` the SAME chunk row is embedded into EVERY
+    configured text slot, and a chunk sized to a WIDE active model overflows a
+    NARROWER secondary's num_ctx. This helper returns the tier that fits the
+    tightest slot — the answer to "what single budget fits ALL slots" — which the
+    WP-O rework deliberately does NOT use for the active slot (it fits the
+    secondaries individually instead).
+
+    Contract:
+      * Empty list → ``large_context`` (same safe default as the single-model
+        unknown-model fallback).
+      * One model → identical to ``chunking_preset_for_model`` (min of a singleton
+        is itself) — so the non-dual path is byte-unchanged.
+      * Unknown model in the set → treated as the ``large_context`` num_ctx
+        (8 192) for the min, matching the single-model default; it never
+        WIDENS the budget beyond a known tighter slot.
+
+    Resolution is on ``num_ctx`` (the MODEL_TOKEN_LIMITS value), NOT on the preset
+    tuple, so the tightest actual context window governs even when two models map
+    to the same tier.
+    """
+    if not model_names:
+        return CHUNKING_PRESETS["large_context"]
+    # Default an unknown model to the large_context num_ctx so it can only make
+    # the budget TIGHTER via a known small slot, never spuriously wider.
+    _UNKNOWN_NUM_CTX = 8_192
+    min_ctx: "int | None" = None
+    for name in model_names:
+        ctx = _num_ctx_for_model(name)
+        if ctx is None:
+            ctx = _UNKNOWN_NUM_CTX
+        min_ctx = ctx if min_ctx is None else min(min_ctx, ctx)
+    return _preset_for_limit(min_ctx)
 
 
 class Chunker:
@@ -330,6 +420,28 @@ class Chunker:
     def for_model(cls, model_name: str) -> "Chunker":
         """Create a Chunker with preset token limits for the given embedding model."""
         min_t, max_t, target_t = chunking_preset_for_model(model_name)
+        return cls(min_tokens=min_t, max_tokens=max_t, target_tokens=target_t)
+
+    @classmethod
+    def for_models(cls, model_names: "list[str]") -> "Chunker":
+        """Create a Chunker sized to the TIGHTEST slot across ``model_names``.
+
+        NOT WIRED INTO THE ACTIVE-SLOT WRITE PATH (WP-O rework, v0.2.88): the KG
+        active-slot chunker is sized to the ACTIVE model ALONE (unclamped, via
+        ``Chunker.for_model``) so its fidelity never drops below the single-write
+        baseline. This min-across-slots factory is RETAINED as a utility (tests +
+        any future consumer that genuinely wants the tightest budget); the
+        dual-write degradation is now absorbed on the SECONDARY side —
+        ``EmbeddingService.embed_text_all_configured`` embeds each secondary from a
+        bounded, tagged sub-window rather than clamping the shared chunk. Do NOT
+        re-wire this into ``store_knowledge_node`` chunk sizing: that reintroduces
+        the active-fidelity regression this rework removed. See
+        ``chunking_preset_for_models`` for the full rationale.
+
+        Delegates to ``chunking_preset_for_models`` (the SSOT min-across-slots
+        resolver). With a single model this is identical to ``for_model``.
+        """
+        min_t, max_t, target_t = chunking_preset_for_models(model_names)
         return cls(min_tokens=min_t, max_tokens=max_t, target_tokens=target_t)
 
     def chunk_text(

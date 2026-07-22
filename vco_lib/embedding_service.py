@@ -914,6 +914,295 @@ def _resolve_write_all_slots() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+# ── WP-O (2026-07-22): arctic as a locally-served SECONDARY text slot ─────────
+#
+# R2-5 gap: the secondary text fan-out was qwen3 + openai ONLY, so a
+# qwen3-ACTIVE install could never populate the ``arctic2_embed`` named slot —
+# the user's arctic RL corpus stayed empty on their own machine (arctic only
+# ever appeared when it was the ACTIVE model). The user ruling: the dual-model
+# logging component EXISTS; make arctic work as the configured secondary rather
+# than forcing an ACTIVE switch.
+#
+# This adds a SECOND opt-in flag layered on top of ``DUAL_EMBEDDING_WRITE_ALL_SLOTS``:
+# arctic is fanned out to ``arctic2_embed`` (via Ollama
+# ``snowflake-arctic-embed2:latest``, 1024-dim) as a secondary ONLY WHEN:
+#
+#   1. ``DUAL_EMBEDDING_WRITE_ALL_SLOTS`` is on (the master secondary gate — no
+#      secondary is ever written without it), AND
+#   2. ``DUAL_EMBEDDING_ARCTIC_SECONDARY`` is on (this flag), AND
+#   3. arctic is NOT already the ACTIVE slot (no self-duplication).
+#
+# Why a DEDICATED flag rather than "arctic is always a secondary under write-all":
+# arctic is a locally-served Ollama model, so on a machine that has it pulled the
+# fan-out would double every KG write's embed cost silently the moment write-all
+# flips on. openai-secondary is self-gating (needs a key); qwen3-secondary is the
+# default-always-present model. arctic is neither — a user who wants the qwen3
+# corpus but not the arctic one must be able to keep it off. Default OFF; the
+# arctic corpus is opt-in exactly like the master write-all fan-out.
+#
+# The model id is resolvable via ``LEGACY_TEXT_EMBEDDING_MODEL`` in the MCP layer
+# for back-compat, but the canonical secondary-fan-out constant lives HERE (the
+# SSOT embedding layer). It maps to the ``arctic2_embed`` slot via TEXT_SLOT_MAP
+# (``snowflake-arctic-embed2`` → ``arctic2_embed``, 1024) — the SAME slot the
+# arctic-ACTIVE path and the dual-log other-slot resolver already use, so a
+# secondary-written arctic vector is byte-space-identical to an active one.
+DUAL_EMBEDDING_ARCTIC_SECONDARY_ENV = "DUAL_EMBEDDING_ARCTIC_SECONDARY"
+
+# Canonical Ollama model id for the arctic secondary slot. Matches
+# ``_model_id_for_active("arctic")`` and the MCP layer's
+# ``LEGACY_TEXT_EMBEDDING_MODEL`` default so every arctic embed — active,
+# secondary, or dual-log re-embed — hits the identical backend + num_ctx.
+ARCTIC_SECONDARY_MODEL = "snowflake-arctic-embed2:latest"
+
+
+def _resolve_arctic_secondary() -> bool:
+    """Return whether to fan out an arctic ``arctic2_embed`` SECONDARY slot.
+
+    Default FALSE (opt-in). This is a SECOND-layer gate: it only has any effect
+    when ``DUAL_EMBEDDING_WRITE_ALL_SLOTS`` is ALSO on (the master secondary gate)
+    AND arctic is not already the active slot. Any value other than a truthy
+    string ("1"/"true"/"yes"/"on", case-insensitive) resolves to False.
+
+    See ``DUAL_EMBEDDING_ARCTIC_SECONDARY_ENV`` for the full rationale.
+    """
+    raw = os.environ.get(DUAL_EMBEDDING_ARCTIC_SECONDARY_ENV, "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+# ── WP-O rework (2026-07-22, no-functionality-loss rule) ──────────────────────
+#
+# STANDING RULE: the ACTIVE slot's chunk fidelity must NEVER drop below the
+# single-write baseline. A dual-write install must produce active-slot data
+# byte-≥-identical to a single-write install. So chunk boundaries follow the
+# ACTIVE model's OWN preset (unclamped) — the min-across-slots clamp that the
+# G5/fix-r2 pass introduced is REMOVED from active-slot sizing (it degraded qwen3
+# to arctic's 4 096 tier). The SECONDARY slot is the degradable one.
+#
+# DEGRADATION MECHANISM (tagged, secondary-only): when a chunk exceeds a
+# secondary Ollama model's num_ctx, we embed a BOUNDED LEADING SUB-WINDOW of the
+# text (the model's own num_ctx worth) rather than handing the full chunk to
+# Ollama and letting it SILENTLY truncate at num_ctx. The sub-window boundary is
+# EXPLICIT and the fact is reported to the caller as ``truncated=True``. The KG
+# write path (``store_knowledge_node``) reads the per-call truncated set via
+# ``embed_text_all_configured_tagged`` and PERSISTS it as the
+# ``secondary_truncated_slots`` Weaviate chunk property (R3-2), so per-model
+# dataset assembly can partition/filter the truncated secondary vectors from
+# stored data alone (a truncated arctic vector is no longer indistinguishable
+# from a full-fidelity one in the DB). This is strictly better than the
+# silent-Ollama-truncation status quo (same coverage, now labelled AND
+# persisted) AND keeps the ACTIVE slot full-fidelity.
+#
+# We approximate the num_ctx-worth of text by a CHARACTER budget derived from
+# num_ctx (chars ≈ tokens × _CHARS_PER_TOKEN). This is a conservative UNDER-count
+# clamp — a few hundred chars short of the true token window is harmless (the
+# embedder simply sees slightly less than its max), whereas an over-count would
+# reintroduce the silent Ollama truncation we're eliminating. Exactness is not
+# required: the goal is "don't feed 13 500 tokens to a 4 096-ctx model", not
+# "fill the 4 096-ctx window to the last token".
+_CHARS_PER_TOKEN = 4  # conservative English heuristic (real ratio ~3.5-4.5)
+
+
+def _num_ctx_for_secondary(model_id: str) -> "int | None":
+    """Resolve a secondary model's num_ctx via the chunking SoT (soft-fail None).
+
+    Reuses ``MODEL_TOKEN_LIMITS`` (the single source of truth for per-model
+    num_ctx) with the same partial-match rule the Ollama adapter uses. Returns
+    None when the model isn't registered (caller then does NOT bound — an
+    unknown model gets the full text, same as before this rework).
+    """
+    try:
+        from claude_mcp_servers.weaviate_mcp.chunking import _num_ctx_for_model
+        return _num_ctx_for_model(model_id)
+    except Exception:  # noqa: BLE001 — best-effort; caller falls back to full text
+        return None
+
+
+def _bounded_for_model(text: str, model_id: str) -> "tuple[str, bool]":
+    """Return ``(text_or_subwindow, truncated)`` bounded to ``model_id``'s num_ctx.
+
+    ONE shared home for the "don't feed an over-num_ctx chunk to Ollama" rule
+    (WP-R 2026-07-22 generalised WP-O's secondary-only ``_bounded_for_secondary``
+    so the ACTIVE embed path can reuse it — no second copy).
+
+    If ``text`` fits within ``model_id``'s num_ctx character budget (or the model
+    is unregistered / measurement unavailable), returns ``(text, False)`` — a
+    faithful full vector. If it exceeds, returns the LEADING sub-window
+    (num_ctx × _CHARS_PER_TOKEN chars) and ``True`` so the caller can react
+    (tag/log). Never raises.
+
+    Two callers, same rule, different intent:
+      * SECONDARY-slot embed (WP-O): records the truncated slot in
+        ``_last_secondary_truncated``, which ``store_knowledge_node`` persists as
+        the ``secondary_truncated_slots`` chunk property (R3-2); the ACTIVE slot
+        stays full-fidelity.
+      * ACTIVE-slot batch embed (WP-R): prevents the Ollama ``/api/embed`` HTTP
+        400 ("input exceeds context length") + whole-batch rejection that a
+        small-num_ctx ACTIVE model (arctic 4 096, granite, embeddinggemma, …)
+        hit on a corpus whose chunks were sized for a larger model. Without this
+        bound, ONE oversized item 400'd the entire batch of 100 → 0 enriched.
+    """
+    num_ctx = _num_ctx_for_secondary(model_id)
+    if not num_ctx or num_ctx <= 0:
+        return text, False
+    char_budget = num_ctx * _CHARS_PER_TOKEN
+    if len(text) <= char_budget:
+        return text, False
+    return text[:char_budget], True
+
+
+# Back-compat alias: the WP-O secondary path + its tests reference the original
+# name. It is THE SAME rule (bound to the model's num_ctx) — a rename with an
+# alias, not a fork. Prefer ``_bounded_for_model`` in new code.
+_bounded_for_secondary = _bounded_for_model
+
+
+# WP-R: Ollama's ``/api/embed`` returns HTTP 400 with a body naming the context
+# length when a single input overflows the model's num_ctx. The message text has
+# been stable across Ollama versions ("input length exceeds the context length" /
+# "input exceeds context length"). We match on the durable substrings so the
+# per-item sub-window retry only fires for a genuine window overflow — a network
+# error / model-not-found / other 4xx must still raise so the caller sees it.
+_CONTEXT_OVERFLOW_MARKERS = (
+    "exceeds the context length",
+    "exceeds context length",
+    "context length",
+    "input length",
+)
+
+
+def _is_context_overflow_error(exc: BaseException) -> bool:
+    """True iff ``exc`` looks like an Ollama num_ctx overflow (WP-R).
+
+    Conservative substring match on the exception text. Non-overflow errors
+    (network, 404 model-not-found, malformed response) return False so they
+    propagate unchanged rather than triggering a futile sub-window retry.
+    """
+    msg = str(exc).lower()
+    # Require an HTTP-400-ish or explicit context phrase so a bare "length"
+    # mention elsewhere doesn't false-positive.
+    if "400" in msg or "context" in msg or "input length" in msg:
+        return any(m in msg for m in _CONTEXT_OVERFLOW_MARKERS)
+    return False
+
+
+def resolve_active_text_model_id() -> str:
+    """Return the ACTIVE text-slot model id, honoring the env override.
+
+    ONE resolution home for "which text model does the active slot use", shared
+    by ``EmbeddingService.for_project`` (constructs the live service) and
+    ``configured_text_models`` (env-only chunk-budget SSOT). Precedence mirrors
+    ``for_project`` exactly so the two never diverge:
+
+      1. ``EMBEDDING_MODEL`` env (non-empty) — the explicit per-project override
+         (config_projection / install.py subprocess thread). A custom-model
+         install (e.g. ``embeddinggemma:300m-bf16`` num_ctx 2 048) reaches here.
+      2. ``OPENAI_EMBEDDING_MODEL`` when the active profile is ``openai``.
+      3. ``_model_id_for_active(active)`` — derive from the resolved profile.
+
+    Before this helper existed, ``configured_text_models`` took ONLY leg 3, so a
+    custom ``EMBEDDING_MODEL`` install (profile qwen3) got xlarge chunks sized to
+    qwen3's 10 240-ctx fed to e.g. a 2 048-ctx embedder → silent truncation of the
+    ACTIVE slot (R2-3).
+    """
+    env_text_model = os.environ.get("EMBEDDING_MODEL", "").strip()
+    if env_text_model:
+        return env_text_model
+    active = _resolve_active_embedding()
+    if active == "openai":
+        return (
+            os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small").strip()
+            or "text-embedding-3-small"
+        )
+    return _model_id_for_active(active)
+
+
+def configured_text_models() -> "list[str]":
+    """Return the model ids of every TEXT slot a KG write would populate.
+
+    Dual-write slot-fan-out SSOT (2026-07-22): mirrors the slot fan-out of
+    ``EmbeddingService.embed_text_all_configured`` but env-only (no service
+    instance). This returns the WRITE-SET (which slots get embedded), NOT the
+    active-slot chunk budget. Under the WP-O rework (v0.2.88) the KG active-slot
+    chunker is sized to the ACTIVE model ALONE (unclamped) — this fan-out set is
+    NO LONGER wired into active-slot chunk sizing (that would clamp the active
+    slot to the tightest secondary and drop its fidelity below single-write). Any
+    min-across-slots collapse a caller runs over this list is a RETAINED UTILITY
+    (tests / future consumers), not the write-path boundary. The set is:
+
+      * the ACTIVE text model (always written) — resolved via
+        ``resolve_active_text_model_id()`` (honors the ``EMBEDDING_MODEL`` /
+        ``OPENAI_EMBEDDING_MODEL`` env override exactly like ``for_project``, so
+        a custom-model install is sized to its real ctx, not qwen3's — R2-3);
+      * ``DEFAULT_TEXT_MODEL`` (qwen3) as the secondary enrichment slot, IFF the
+        active slot isn't already qwen3 AND ``DUAL_EMBEDDING_WRITE_ALL_SLOTS`` is
+        on (this is exactly the ``embed_text_all_configured`` condition — the
+        Ollama-reachability check there is a runtime soft-fail, not a config
+        decision, so for chunk sizing we assume the configured slot is live);
+      * the arctic secondary (``ARCTIC_SECONDARY_MODEL``, num_ctx 4 096) IFF
+        ``DUAL_EMBEDDING_ARCTIC_SECONDARY`` is on AND the active slot isn't
+        already arctic AND write-all-slots is on (WP-O — the locally-served
+        secondary embedded alongside the active slot on a qwen3-active install).
+        Its 4 096 num_ctx is TIGHTER than qwen3's 10 240, but under the WP-O
+        rework the active chunk is NOT shrunk to fit it — instead this arctic
+        slot is embedded from a bounded, tagged sub-window when a chunk exceeds
+        4 096 (``embed_text_all_configured``), so the active slot keeps full
+        fidelity;
+      * the OpenAI text model IFF an OpenAI key is configured AND the active slot
+        isn't already OpenAI AND write-all-slots is on.
+
+    When write-all-slots is OFF this returns a single-element list (the active
+    model) — so any min-across-slots collapse a caller runs is a no-op and the
+    single-model preset is preserved byte-identically (no behaviour change for
+    the default install). The active-slot chunker sizes to that single active
+    model in every case (dual on or off) — see the WP-O rework note above.
+
+    Order: active model first, then secondaries. De-duplicated, order-preserving.
+    """
+    active_model = resolve_active_text_model_id()
+    models: list[str] = [active_model]
+
+    if not _resolve_write_all_slots():
+        return models
+
+    # Secondary qwen3 enrichment slot (unless active is already qwen3).
+    if active_model != DEFAULT_TEXT_MODEL:
+        models.append(DEFAULT_TEXT_MODEL)
+
+    # Secondary arctic slot (WP-O) — opt-in via DUAL_EMBEDDING_ARCTIC_SECONDARY,
+    # unless arctic is already the active slot. Mirrors the write-side condition
+    # in ``embed_text_all_configured`` exactly (the Ollama-reachability check
+    # there is a runtime soft-fail; for the write-set we assume the configured
+    # slot is live, same as the qwen3 secondary). Arctic's 4 096 num_ctx is
+    # tighter than qwen3's 10 240, but the WP-O rework does NOT clamp the active
+    # chunk to it — the arctic slot is embedded from a bounded, tagged sub-window
+    # instead (see the module note above). This entry only adds arctic to the
+    # WRITE fan-out; it does not size the active chunk boundary.
+    if _resolve_arctic_secondary() and "arctic" not in active_model.lower():
+        models.append(ARCTIC_SECONDARY_MODEL)
+
+    # Secondary OpenAI slot (unless active is already OpenAI) when a key exists.
+    # Presence of the key is the config signal; validity is a runtime concern.
+    if "openai" not in active_model.lower():
+        openai_key = (
+            os.environ.get("OPENAI_API_KEY", "").strip()
+            or os.environ.get("OPENAI_EMBEDDING_API_KEY", "").strip()
+        )
+        if openai_key:
+            openai_model = _to_openai_api_model(
+                os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+            )
+            models.append(openai_model)
+
+    # De-dup, order-preserving.
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in models:
+        if m and m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
+
+
 # v0.2.52 V52-AJ: active-embedding resolution helpers.
 #
 # Single canonical resolution path for the ACTIVE_EMBEDDING value:
@@ -1122,6 +1411,13 @@ class EmbeddingService:
         self._embed_memo_code: dict[str, list[float]] = {}
         self._embed_memo_cap: int = 512
 
+        # WP-O rework: per-call record of SECONDARY slots that were embedded from a
+        # bounded sub-window (chunk > that model's num_ctx). Reset at the start of
+        # every ``embed_text_all_configured`` call; read via
+        # ``last_secondary_truncated`` immediately after. The ACTIVE slot never
+        # appears here (it is always full-fidelity).
+        self._last_secondary_truncated: dict[str, bool] = {}
+
     # ---- construction --------------------------------------------------
 
     @classmethod
@@ -1173,30 +1469,18 @@ class EmbeddingService:
             or DEFAULT_CODE_EMBED_URL
         )
 
-        # v0.2.52 V52-AJ: env → launcher.db app_state → "qwen3" default.
-        # Env always wins (explicit user / install.py thread); launcher.db
-        # is the fallback for subprocesses that inherit an empty env
-        # (notably install.py's sync_knowledge_graph.py spawn on fresh
-        # CPU-only installs where the embedding choice lives only in
-        # the launcher's app_state). No back-compat fallback ladder —
-        # one canonical resolution path per the v0.2.52 "consistent" rule.
-        active = _resolve_active_embedding()
-        # Choose text model id with provider awareness.
-        env_text_model = os.environ.get("EMBEDDING_MODEL", "").strip()
-        if env_text_model:
-            text_model_id = env_text_model
-        elif active == "openai":
-            text_model_id = os.environ.get(
-                "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"
-            ).strip() or "text-embedding-3-small"
-        else:
-            # No EMBEDDING_MODEL env override → derive from the resolved
-            # ``active`` value. This is the install.py-Windows-CPU fix:
-            # when the launcher seeded ``active=arctic`` but install.py's
-            # subprocess inherited an empty EMBEDDING_MODEL, the previous
-            # code unconditionally picked DEFAULT_TEXT_MODEL (qwen3) and
-            # spent hours embedding on the wrong backend.
-            text_model_id = _model_id_for_active(active)
+        # v0.2.52 V52-AJ: the active-profile resolution (env → launcher.db
+        # app_state → "qwen3" default; env always wins) is now encapsulated
+        # inside ``resolve_active_text_model_id`` below (R2-3 unified the two
+        # sites). No separate ``_resolve_active_embedding()`` call is needed
+        # here — the previous local was dead after R2-3 routed resolution
+        # through the shared resolver (R3-11).
+        # Choose text model id with provider awareness. ONE resolution home
+        # shared with ``configured_text_models`` (R2-3): EMBEDDING_MODEL env wins,
+        # else OPENAI_EMBEDDING_MODEL when active=openai, else derive from the
+        # resolved profile (the install.py-Windows-CPU arctic fix — an empty
+        # EMBEDDING_MODEL must NOT collapse a seeded arctic profile to qwen3).
+        text_model_id = resolve_active_text_model_id()
 
         # Code model id. CODE_EMBED_BACKEND="ollama" means CPU fallback
         # via the qwen3 model; "service" means the FastAPI service.
@@ -1339,6 +1623,27 @@ class EmbeddingService:
     def text_vector_slot(self) -> str:
         """Named-vector slot the configured text model writes to."""
         return self._text_slot
+
+    @property
+    def last_secondary_truncated(self) -> "dict[str, bool]":
+        """SECONDARY slots embedded from a bounded sub-window on the last call.
+
+        Populated by ``embed_text_all_configured``: maps each secondary slot whose
+        embed used a bounded leading sub-window (chunk exceeded that model's
+        num_ctx) to ``True``. Empty when no secondary was truncated. The ACTIVE
+        slot is never present (always full-fidelity). A COPY is returned so callers
+        can't mutate instance state.
+
+        NOTE: for PERSISTING the tag alongside the vectors (the KG write path),
+        prefer ``embed_text_all_configured_tagged`` — it captures this set
+        ATOMICALLY with the vectors so a concurrent call from another task can't
+        reset the dict between the embed and this read (R3-2). This property is the
+        low-level in-process record; ``store_knowledge_node`` persists it as the
+        ``secondary_truncated_slots`` Weaviate chunk property, which lets stored
+        arctic (and other secondary) vectors be partitioned truncated-vs-full from
+        stored data alone.
+        """
+        return dict(self._last_secondary_truncated)
 
     @property
     def text_dim(self) -> int:
@@ -1573,6 +1878,18 @@ class EmbeddingService:
 
         Order is preserved. See provider docs for batch-size limits
         (CodeEmbed: 256, OpenAI: chunked at 100).
+
+        WP-R (2026-07-22): for the ACTIVE Ollama text model, each input is first
+        bounded to the model's own num_ctx via ``_bounded_for_model`` (the shared
+        WP-O sub-window rule), and a whole-batch ``/api/embed`` failure is
+        ISOLATED to a per-item retry so one oversized item can never fail the
+        batch. Root cause this closes: a small-num_ctx ACTIVE model (arctic
+        4 096, granite, embeddinggemma, bge-m3, …) on a corpus whose chunks were
+        sized for a larger model (qwen3 10 240) 400'd on any over-window item,
+        and Ollama's ``/api/embed`` rejects the ENTIRE batch of 100 if ANY single
+        input overflows → 100 % failure, 0 enriched (observed: 1 011/1 011 failed
+        on the KG+Development arctic enrich). OpenAI's adapter chunks + validates
+        its own token windows, so it keeps its straight batch path.
         """
         if not texts:
             return []
@@ -1580,9 +1897,123 @@ class EmbeddingService:
             return self._retry_once_on_503(
                 self.openai.embed_batch, self.text_model_id, texts
             )
-        return self._retry_once_on_503(
-            self.ollama.embed_batch, self.text_model_id, texts
-        )
+        return self._embed_ollama_batch_bounded(self.text_model_id, texts)
+
+    def _embed_ollama_batch_bounded(
+        self, model_id: str, texts: list[str]
+    ) -> list[list[float]]:
+        """Ollama batch embed with per-model sub-window bounding + failure isolation.
+
+        WP-R shared path for both ``embed_text_batch`` and the Ollama code
+        fallback in ``embed_code_batch`` (one home — search-before-add). Two
+        layers of protection against the num_ctx/whole-batch-rejection hazard:
+
+          1. PRE-BOUND every input to ``model_id``'s num_ctx (``_bounded_for_model``)
+             so an over-window chunk is trimmed to a leading sub-window BEFORE it
+             reaches Ollama. This is the primary fix — with it, the 400 never
+             fires in the common case. The trim is a fidelity loss on the ACTIVE
+             slot (the sub-window is embedded, not the full chunk), so a per-batch
+             trimmed-item count is logged at WARNING (R3-4 — loud degradation, the
+             delta's "never silent" rule); the alternative was Ollama's silent
+             whole-batch 400, strictly worse.
+          2. ISOLATE a whole-batch failure PER ITEM: if the single ``/api/embed``
+             batch call still raises (a pathological item, or a model whose true
+             tokenizer ratio is denser than the char heuristic), fall back to
+             per-item embed and COLLECT results — each item is retried alone under
+             a TIGHTER sub-window on a context-overflow error. A genuinely
+             un-embeddable item (still overflowing at the 512-char floor, or a
+             non-window error) yields an EMPTY-VECTOR SENTINEL (``[]``) for THAT
+             index only; every survivor keeps its computed vector. The consumer
+             (``embedding_enrichment._flush_batch``) already treats an empty
+             vector at an index as a per-object failure ("embed returned empty
+             vector") and enriches the rest — so one hard failure marks exactly
+             one uuid failed, never discarding the survivors (R3-4).
+
+        Order is preserved. Returns exactly ``len(texts)`` entries in both paths;
+        on the per-item fallback a failed index is ``[]`` (the caller's per-object
+        failure sentinel) rather than raising and dropping the survivors.
+        """
+        bounded_pairs = [_bounded_for_model(t, model_id) for t in texts]
+        bounded = [text for text, _ in bounded_pairs]
+        trimmed_count = sum(1 for _, truncated in bounded_pairs if truncated)
+        if trimmed_count:
+            # Loud-degradation: a bounded sub-window is a fidelity loss, not a
+            # no-op — record how many of this batch were trimmed so an
+            # arctic-active enrich over a qwen3-sized corpus is not silent.
+            logger.warning(
+                "Ollama batch embed: %d/%d input(s) exceeded model %r's num_ctx "
+                "and were embedded from a bounded leading sub-window (fidelity "
+                "loss on those items) to avoid a whole-batch context-overflow "
+                "rejection.",
+                trimmed_count, len(bounded), model_id,
+            )
+        try:
+            return self._retry_once_on_503(
+                self.ollama.embed_batch, model_id, bounded
+            )
+        except Exception as batch_exc:  # noqa: BLE001 — isolate to per-item
+            logger.warning(
+                "Ollama batch embed failed for %d input(s) with model %r (%s); "
+                "isolating to per-item embed so one un-embeddable item can't fail "
+                "the surviving items",
+                len(bounded), model_id, batch_exc,
+            )
+            results: list[list[float]] = []
+            hard_failures = 0
+            for text in bounded:
+                try:
+                    results.append(self._embed_ollama_one_bounded(model_id, text))
+                except Exception as item_exc:  # noqa: BLE001 — isolate per item
+                    # Empty-vector sentinel for THIS index only: the consumer
+                    # (_flush_batch) marks the matching uuid failed and continues.
+                    hard_failures += 1
+                    logger.warning(
+                        "Ollama per-item embed failed for one input with model "
+                        "%r (%s); marking that item failed (empty-vector "
+                        "sentinel) and preserving the batch's survivors",
+                        model_id, item_exc,
+                    )
+                    results.append([])
+            if hard_failures:
+                logger.warning(
+                    "Ollama per-item fallback: %d/%d input(s) still un-embeddable "
+                    "after the tighter sub-window retry (marked failed); %d "
+                    "survivor(s) embedded",
+                    hard_failures, len(bounded), len(bounded) - hard_failures,
+                )
+            return results
+
+    def _embed_ollama_one_bounded(self, model_id: str, text: str) -> list[float]:
+        """Embed ONE text via Ollama, retrying a context overflow under a tighter
+        sub-window (WP-R).
+
+        Already-bounded ``text`` is embedded once; on a context-overflow error
+        (Ollama HTTP 400 "input exceeds context length" — the char heuristic can
+        still under-shoot on very dense content, exactly what WP-P's live arctic
+        backfill hit) the text is halved and retried, down to a small floor.
+        Raises the last error if even the floor sub-window overflows, so the
+        caller's per-object soft-fail records THIS item and continues.
+        """
+        attempt = text
+        floor = 512  # chars; below this an overflow is not a window problem
+        while True:
+            try:
+                return self._retry_once_on_503(
+                    self.ollama.embed, model_id, attempt
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Only a genuine context overflow is retriable via a tighter
+                # window; anything else (network, model-not-found) propagates.
+                # At/below the floor, stop retrying and surface the error for
+                # THIS item so the caller's per-object soft-fail records it.
+                if not _is_context_overflow_error(exc) or len(attempt) <= floor:
+                    raise
+                attempt = attempt[: max(floor, len(attempt) // 2)]
+                logger.debug(
+                    "Ollama single embed context overflow with model %r; "
+                    "retrying under a tighter %d-char sub-window",
+                    model_id, len(attempt),
+                )
 
     def embed_code_batch(self, codes: list[str]) -> list[list[float]]:
         """Batched code embedding. Empty input → empty output.
@@ -1605,9 +2036,11 @@ class EmbeddingService:
             # cleanly and the caller's exception handler kicks in.
             if self.codeembed.is_reachable():
                 return self._retry_once_on_503(self.codeembed.embed_batch, codes)
-        return self._retry_once_on_503(
-            self.ollama.embed_batch, self.code_model_id, codes
-        )
+        # WP-R: the Ollama code fallback (e.g. jina/qwen3 code embeds served via
+        # Ollama on a CPU/low-VRAM floor) shares the same num_ctx/whole-batch
+        # hazard as the text path, so route it through the SAME bounded + isolated
+        # helper (one home) instead of a bare batch call.
+        return self._embed_ollama_batch_bounded(self.code_model_id, codes)
 
     # ---- multi-slot writes --------------------------------------------
 
@@ -1616,8 +2049,11 @@ class EmbeddingService:
 
         Returns ``{slot_name: vector}``. ALWAYS includes the active slot
         (``self._text_slot``). The SECONDARY enrichment slots (qwen3,
-        openai) are added only when ``DUAL_EMBEDDING_WRITE_ALL_SLOTS`` is
-        enabled (v0.2.71 Piece 5c — default OFF).
+        openai, and — WP-O, opt-in via ``DUAL_EMBEDDING_ARCTIC_SECONDARY`` —
+        arctic ``arctic2_embed``) are added only when
+        ``DUAL_EMBEDDING_WRITE_ALL_SLOTS`` is enabled (v0.2.71 Piece 5c —
+        default OFF). The arctic secondary is what lets a qwen3-active install
+        collect the arctic RL corpus without switching the ACTIVE model (R2-5).
 
         The secondary slots exist for the enrichment-migration path: when a
         user switches from qwen3 to OpenAI, a pre-populated qwen3_embed slot
@@ -1635,7 +2071,15 @@ class EmbeddingService:
         line is emitted. The caller can choose to retry just those.
         """
         result: dict[str, list[float]] = {}
-        # Active backend — ALWAYS written (this is the slot reads target).
+        # WP-O rework: per-call record of which SECONDARY slots were embedded from
+        # a BOUNDED sub-window (chunk exceeded that model's num_ctx). The ACTIVE
+        # slot is never here — it is always full-fidelity. Callers (dual-log
+        # tagging) read this via ``last_secondary_truncated`` right after the call.
+        self._last_secondary_truncated = {}
+        # Active backend — ALWAYS written (this is the slot reads target), from the
+        # FULL text. Active-slot fidelity is never reduced by the secondary fan-out
+        # (no-functionality-loss rule): chunk boundaries already follow the
+        # active model's own preset, and here the active embed sees the whole chunk.
         try:
             result[self._text_slot] = self._embed_text_via_active(text)
         except Exception as exc:
@@ -1646,14 +2090,55 @@ class EmbeddingService:
         if not _resolve_write_all_slots():
             return result
 
-        # qwen3 fallback if not already the active slot
+        # qwen3 fallback if not already the active slot. qwen3's num_ctx (10 240)
+        # is the WIDEST text tier, so a chunk sized to a tighter active model never
+        # exceeds it — but bound defensively anyway (a custom active model could be
+        # wider, e.g. bge-m3-vs-nothing edge cases) so the same tagged-degradation
+        # contract holds for every secondary.
         if self._text_slot != "qwen3_embed" and self.ollama.is_reachable():
             try:
-                result["qwen3_embed"] = self.ollama.embed(
-                    DEFAULT_TEXT_MODEL, text
-                )
+                sub, trunc = _bounded_for_secondary(text, DEFAULT_TEXT_MODEL)
+                result["qwen3_embed"] = self.ollama.embed(DEFAULT_TEXT_MODEL, sub)
+                if trunc:
+                    self._last_secondary_truncated["qwen3_embed"] = True
+                    logger.info(
+                        "qwen3 secondary embedded from a bounded sub-window "
+                        "(chunk exceeded qwen3 num_ctx); slot tagged truncated"
+                    )
             except Exception as exc:
                 logger.warning("qwen3 fallback embedding failed: %s", exc)
+        # Arctic SECONDARY slot (WP-O) — opt-in via DUAL_EMBEDDING_ARCTIC_SECONDARY,
+        # only when arctic isn't already the active slot and Ollama is up. This is
+        # what lets a qwen3-active install collect the arctic RL corpus without an
+        # ACTIVE switch (R2-5). Writes the SAME ``arctic2_embed`` slot the active
+        # path + the dual-log other-slot resolver use (TEXT_SLOT_MAP:
+        # snowflake-arctic-embed2 → arctic2_embed, 1024).
+        #
+        # SECONDARY DEGRADATION (no-functionality-loss rule): arctic's num_ctx (4 096) is
+        # NARROWER than qwen3's (10 240). Chunks are sized to the ACTIVE model, so
+        # on a qwen3-active install an oversized chunk would overflow arctic. Rather
+        # than hand the full chunk to Ollama and let it SILENTLY truncate at 4 096,
+        # we embed an EXPLICIT bounded leading sub-window and tag the slot
+        # ``arctic2_embed`` truncated — the active qwen3 slot keeps the full chunk,
+        # and per-model dataset assembly can partition the tagged-truncated arctic
+        # vectors cleanly.
+        if (
+            self._text_slot != "arctic2_embed"
+            and _resolve_arctic_secondary()
+            and self.ollama.is_reachable()
+        ):
+            try:
+                sub, trunc = _bounded_for_secondary(text, ARCTIC_SECONDARY_MODEL)
+                result["arctic2_embed"] = self.ollama.embed(ARCTIC_SECONDARY_MODEL, sub)
+                if trunc:
+                    self._last_secondary_truncated["arctic2_embed"] = True
+                    logger.info(
+                        "arctic secondary embedded from a bounded sub-window "
+                        "(chunk %d chars exceeded arctic num_ctx); slot tagged "
+                        "truncated (active slot unaffected)", len(text)
+                    )
+            except Exception as exc:
+                logger.warning("arctic secondary embedding failed: %s", exc)
         # OpenAI if not already and key configured + valid
         if "openai" not in self._text_slot and self.openai_api_key:
             if self.openai.validate().valid:
@@ -1670,12 +2155,49 @@ class EmbeddingService:
                             "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"
                         )
                     )
+                    # Bound the OpenAI secondary the same way (its 8 191 num_ctx is
+                    # tighter than qwen3's 10 240) — explicit sub-window + tag,
+                    # never a silent OpenAI-side truncation. (This is also the R2-4
+                    # boundary case; the active slot stays full-fidelity.)
+                    sub, trunc = _bounded_for_secondary(text, openai_model)
                     result["openai_text_embed"] = self.openai.embed(
-                        openai_model, text
+                        openai_model, sub
                     )
+                    if trunc:
+                        self._last_secondary_truncated["openai_text_embed"] = True
+                        logger.info(
+                            "OpenAI secondary embedded from a bounded sub-window "
+                            "(chunk exceeded openai num_ctx); slot tagged truncated"
+                        )
                 except Exception as exc:
                     logger.warning("OpenAI fallback embedding failed: %s", exc)
         return result
+
+    def embed_text_all_configured_tagged(
+        self, text: str
+    ) -> "tuple[dict[str, list[float]], list[str]]":
+        """Like ``embed_text_all_configured`` but returns the truncated-slot tag
+        ATOMICALLY with the vectors (R3-2).
+
+        Returns ``(slots, truncated_slot_names)`` where ``truncated_slot_names`` is
+        the sorted list of SECONDARY slot names whose vector was embedded from a
+        bounded leading sub-window on THIS call (a subset of ``slots``' keys; the
+        active slot is never included — it is always full-fidelity).
+
+        Reading ``last_secondary_truncated`` as a separate property call is
+        race-prone under concurrency (a second ``embed_text_all_configured`` from
+        another task resets the per-instance dict between the embed and the read).
+        Capturing it here — same call, before returning — closes that window so the
+        KG write can persist a truncated tag that FAITHFULLY matches the vectors it
+        stores. Callers that persist the tag (``store_knowledge_node`` writes it as
+        the ``secondary_truncated_slots`` chunk property) MUST use this, not the
+        property.
+        """
+        slots = self.embed_text_all_configured(text)
+        truncated = sorted(
+            name for name, flag in self._last_secondary_truncated.items() if flag
+        )
+        return slots, truncated
 
     def embed_code_all_configured(self, code: str) -> dict[str, list[float]]:
         """Embed ``code`` into the configured code slot(s).

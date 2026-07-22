@@ -23,7 +23,7 @@
 //! fallback — per the locked decision 2026-06-04).
 
 use axum::{
-    extract::{Query, State},
+    extract::{DefaultBodyLimit, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -33,9 +33,45 @@ use serde::{Deserialize, Serialize};
 
 use super::modules_api::LauncherDbHandle;
 
+/// Explicit request-body cap for the RL-events ingest routes (16 MiB).
+///
+/// WHY THE LIMIT IS 16 MiB (deliberate, not axum's 2 MB default): a single RL
+/// event carries the full v3 payload_json — a query embedding, per-node node
+/// embeddings + near-chunk `linked_embs`, and (on citation events) the
+/// answer-chunk embeddings. Under dual-write both embedding spaces are logged.
+/// A wide code retrieval (many nodes × 2048-dim CodeSage vectors) or an
+/// answer-heavy citation can legitimately exceed axum's 2 MB `Json` default,
+/// which would 413 the POST and lose the label SILENTLY (the Python writer
+/// soft-fails a rejected POST). Per the user rule "move the limit, never the
+/// data": we raise the CAP to fit the real data rather than trimming the event.
+///
+/// Trust posture that makes 16 MiB safe: these routes are localhost-only
+/// (the hub binds loopback by default), token-authed (the hub-wide
+/// `auth::require_auth` bearer layer wraps this router in `server.rs`), and
+/// written only by the trusted first-party MCP writer — not an open internet
+/// surface where a large body cap would be a DoS vector.
+///
+/// The Python emitter (`telemetry_writer.py::_wrap_for_hub`) still carries a
+/// client-side trim guard, but that is a PATHOLOGICAL-CASE BACKSTOP only —
+/// its default cap sits just under THIS 16 MiB (see
+/// `_HUB_PAYLOAD_MAX_BYTES_DEFAULT`). Normal events never approach either cap;
+/// the trim exists so a genuinely pathological event degrades to a loud
+/// warning + still-trainable core label rather than a silent 413.
+const RL_EVENTS_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 pub fn router() -> Router<LauncherDbHandle> {
     Router::new()
-        .route("/rl/events", post(post_event).get(list_events))
+        // The `/rl/events` method-router (POST + GET) gets the raised body
+        // limit — the `.layer` wraps the whole MethodRouter, so GET shares the
+        // 16 MiB cap too (harmless: GET bodies are ignored). `/count` and
+        // `/prune` are separate routes and keep axum's default (their bodies are
+        // tiny query/prune params).
+        .route(
+            "/rl/events",
+            post(post_event)
+                .get(list_events)
+                .layer(DefaultBodyLimit::max(RL_EVENTS_MAX_BODY_BYTES)),
+        )
         .route("/rl/events/count", get(count_events))
         .route("/rl/events/prune", post(prune_events))
 }
@@ -659,6 +695,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v["count"], 2, "badge semantics unchanged: all rows");
+    }
+
+    /// Item-1 (WP-Q): the RL-events POST route carries an EXPLICIT 16 MiB body
+    /// limit — a legitimately large event (embedding-heavy payload_json) that
+    /// exceeds axum's 2 MB `Json` default must be ACCEPTED, while a genuinely
+    /// pathological body over 16 MiB is rejected with 413 (never silently). We
+    /// build the oversized payload_json with a large filler string so the
+    /// SERIALIZED request body crosses the boundary being tested.
+    #[tokio::test]
+    async fn post_event_accepts_over_2mib_and_rejects_over_16mib() {
+        let base = spawn_test_hub().await;
+        let client = reqwest::Client::new();
+
+        // Helper: build a POST body whose payload_json contains a filler of
+        // `payload_bytes` bytes, so the serialized request body is ~that size
+        // plus the small envelope overhead.
+        let make_body = |payload_bytes: usize| {
+            let filler = "x".repeat(payload_bytes);
+            // Valid JSON payload_json string carrying the filler in a field.
+            let payload_json = format!(r#"{{"event":"retrieval","filler":"{}"}}"#, filler);
+            serde_json::json!({
+                "event_type": "retrieval",
+                "schema_version": 3,
+                "ts_ms": 1_700_000_000_000_i64,
+                "task_id": "big-event",
+                "payload_json": payload_json,
+            })
+        };
+
+        // ~3 MiB body: over axum's 2 MB default, well under 16 MiB → ACCEPTED.
+        let resp = client
+            .post(format!("{}/rl/events", base))
+            .json(&make_body(3 * 1024 * 1024))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "a ~3 MiB event (>2 MB axum default, <16 MiB cap) must be accepted, \
+             not 413'd — moving the limit, not the data"
+        );
+
+        // ~17 MiB body: over the explicit 16 MiB cap → 413 Payload Too Large.
+        let resp = client
+            .post(format!("{}/rl/events", base))
+            .json(&make_body(17 * 1024 * 1024))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+            "a >16 MiB body must be rejected with 413 (a loud cap, never silent \
+             data loss beyond the deliberate limit)"
+        );
     }
 
     #[tokio::test]

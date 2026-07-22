@@ -490,16 +490,17 @@
           category_path: category,
         },
       });
-      // Best-effort: ask the launcher to drop a starter file on disk so
-      // the user has something to render immediately. Treat absent
-      // command as "user will create file manually" with a hint toast.
+      // Drop a starter file on disk so the user has something renderable
+      // immediately. The command is non-clobbering — it leaves any
+      // pre-existing file untouched. On a genuine failure (permissions,
+      // path escape) fall back to the manual-file hint.
       try {
         await invoke('create_starter_diagram_file', {
           projectId,
           diagramId: row.id,
         });
       } catch (e) {
-        console.warn('[diagrams] starter-file helper not available:', e);
+        console.warn('[diagrams] starter-file creation failed:', e);
         toast.info(
           `Registered. Create ${filePath} manually to start editing.`,
         );

@@ -2017,6 +2017,97 @@ pub async fn bounded_authed_pull(
     })
 }
 
+// ─── Port reconciliation parser (WP-Q item 3 / G6) ─────────────────────
+
+/// WP-Q item 3 (G6): parse the FIRST published host port from a container
+/// runtime's `inspect --format '{{json .NetworkSettings.Ports}}'` output.
+///
+/// The JSON shape is a map of `"<port>/<proto>"` → array of
+/// `{"HostIp": "...", "HostPort": "<port>"}` (empty/`null` array when the
+/// port is exposed but not published). Both podman and docker emit this shape.
+/// The RL container publishes exactly one port, so returning the first parseable
+/// `HostPort` is sufficient and avoids coupling to the container's internal port.
+///
+/// PURE + CONSERVATIVE: returns `None` on any parse failure, an empty/`null`
+/// map, or no publishable HostPort — the caller then LEAVES THE ROW ALONE
+/// (never guesses a port). A `HostPort` of `"0"` (podman's placeholder for an
+/// unpublished mapping) is rejected as not-a-real-bind.
+pub fn parse_published_host_port(inspect_json: &str) -> Option<u16> {
+    let v: serde_json::Value = serde_json::from_str(inspect_json.trim()).ok()?;
+    let map = v.as_object()?;
+    // Iterate deterministically (sorted by the port key) so a multi-port
+    // container yields a stable choice; the RL container has exactly one.
+    let mut keys: Vec<&String> = map.keys().collect();
+    keys.sort();
+    for key in keys {
+        let bindings = match map.get(key) {
+            Some(serde_json::Value::Array(a)) => a,
+            _ => continue, // null / non-array → not published on this port.
+        };
+        for binding in bindings {
+            let host_port = binding
+                .get("HostPort")
+                .and_then(|hp| hp.as_str())
+                .and_then(|s| s.trim().parse::<u16>().ok());
+            if let Some(port) = host_port {
+                if port != 0 {
+                    return Some(port);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// WP-Q item 3 (G6): read the ACTUALLY-BOUND host port of a running container
+/// via `<runtime> inspect --format '{{json .NetworkSettings.Ports}}'`.
+///
+/// Returns:
+///   * `Ok(Some(port))` — the container is inspectable and publishes a port.
+///   * `Ok(None)` — inspect succeeded but no publishable host port was found
+///     (container has no port bindings, or the map is empty) — a clean
+///     "nothing to reconcile", NOT an error.
+///   * `Err(_)` — the runtime could not be detected, the inspect command
+///     failed to spawn, or returned non-zero (container absent / stopped).
+///     The caller treats `Err` as "introspection error → leave the row alone".
+///
+/// Never restarts or mutates the container — inspection only (option b: record
+/// reality). Bounded so a hung runtime can't stall the caller.
+pub async fn read_bound_host_port(container_name: &str) -> Result<Option<u16>, String> {
+    use crate::process::CommandExt as _;
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio::process::Command;
+
+    let runtime = detect_container_runtime(None).await?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(15),
+        Command::new(&runtime)
+            .silent()
+            .args([
+                "inspect",
+                "--format",
+                "{{json .NetworkSettings.Ports}}",
+                container_name,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output(),
+    )
+    .await
+    .map_err(|_| format!("{} inspect timed out for {}", runtime, container_name))?
+    .map_err(|e| format!("spawn {} inspect: {}", runtime, e))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "{} inspect returned non-zero for {} (container absent or stopped)",
+            runtime, container_name
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_published_host_port(&stdout))
+}
+
 // ─── Pre-pull-with-auth (v0.2.49) ──────────────────────────────────────
 
 /// Pre-pull the variant-correct image with proper auth context BEFORE
@@ -4060,5 +4151,50 @@ mod tests {
             !outcome.stderr.is_empty(),
             "non-zero pull must surface captured stderr for the caller",
         );
+    }
+
+    // ─── WP-Q item 3 (G6): parse_published_host_port ───────────────────────
+
+    #[test]
+    fn parse_published_host_port_reads_hostport() {
+        // The real RL container publishes its internal 11438 on a host port.
+        let json = r#"{"11438/tcp":[{"HostIp":"127.0.0.1","HostPort":"11450"}]}"#;
+        assert_eq!(parse_published_host_port(json), Some(11450));
+    }
+
+    #[test]
+    fn parse_published_host_port_empty_map_is_none() {
+        // No port bindings → nothing to reconcile (leave-alone, not an error).
+        assert_eq!(parse_published_host_port("{}"), None);
+    }
+
+    #[test]
+    fn parse_published_host_port_null_bindings_is_none() {
+        // Exposed but unpublished port → null array → None.
+        let json = r#"{"11438/tcp":null}"#;
+        assert_eq!(parse_published_host_port(json), None);
+    }
+
+    #[test]
+    fn parse_published_host_port_rejects_zero_placeholder() {
+        // Podman's "0" placeholder for an unpublished mapping is not a bind.
+        let json = r#"{"11438/tcp":[{"HostIp":"","HostPort":"0"}]}"#;
+        assert_eq!(parse_published_host_port(json), None);
+    }
+
+    #[test]
+    fn parse_published_host_port_garbage_is_none() {
+        assert_eq!(parse_published_host_port("not json"), None);
+        assert_eq!(parse_published_host_port(""), None);
+        assert_eq!(parse_published_host_port("null"), None);
+    }
+
+    #[test]
+    fn parse_published_host_port_multi_port_is_deterministic() {
+        // Two published ports → the smallest-keyed one is chosen (sorted keys),
+        // so the choice is stable across inspect-output ordering.
+        let json = r#"{"9000/tcp":[{"HostPort":"22000"}],"11438/tcp":[{"HostPort":"11450"}]}"#;
+        // Keys sort lexicographically: "11438/tcp" < "9000/tcp".
+        assert_eq!(parse_published_host_port(json), Some(11450));
     }
 }

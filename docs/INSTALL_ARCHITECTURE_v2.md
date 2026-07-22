@@ -260,6 +260,71 @@ abort the install.
 A re-run of `install.py` over an installed root is an update by
 construction: the presence of `.vco-manifest.json` is the installed marker.
 
+### Stale systemd-unit reconcile (Linux, update path only)
+
+On the update path, the installer reconciles user-level systemd units
+(`$HOME/.config/systemd/user/*.service`) whose entrypoint no longer resolves —
+the class that leaves a crash-looping unit behind after a module's runtime is
+repackaged. It runs only when `systemctl` is present and there is a user unit
+directory; it is a pure no-op on a fresh install and on non-Linux hosts.
+
+A unit is retired **only when it is provably broken**:
+
+- Its `ExecStart` is `<python> -m <module>`, references this install root, the
+  configured interpreter exists, and the module is **cleanly, provably not
+  importable** — verified by running `importlib.util.find_spec` in a subprocess
+  of the unit's *own* configured interpreter with the unit's `PYTHONPATH` (never
+  this process). A probe that errors, times out, or can't run (missing
+  interpreter, `-c`/`env -S` forms, PATH-relative interpreter) leaves the unit
+  alone.
+- Its `ExecStart` runs a script under this install root that is missing (or, for
+  a direct-exec head, not executable).
+
+**Leave-alone guarantees.** The reconcile is conservative on every ambiguity:
+importable modules, resolvable exec paths, foreign units (not referencing this
+root), unparseable `ExecStart` lines, symlinked units, unreadable units, and any
+probe that can't positively confirm the break are all left untouched. It
+**never deletes** — retirement is `systemctl --user disable --now` followed by a
+**backup-move** of the unit file. It never touches system-level units.
+
+**Backup location + restore sidecar.** The retired unit file is moved to
+`.claude/state/retired-units/` under the install root. A durable
+`<backup>.RESTORE.txt` sidecar is written next to the `.bak`, containing the
+exact restore command
+(`cp <backup> ~/.config/systemd/user/<unit> && systemctl --user daemon-reload &&
+systemctl --user enable --now <unit>`), shell-quoted for paths with spaces. An
+`append:` log for a retired unit that has grown past 10 MiB is rotated into the
+same backup directory; a smaller log is left in place.
+
+**Deferral record.** Each retirement writes a one-time record into
+`<root>/.claude/context/UPDATE_DEFERRED.md` (condition prefix
+`stale_unit_retired_`), naming the unit, the reason, and the restore command; it
+self-clears on the next run once the unit is gone. If `disable --now` succeeds
+but the backup-move fails, a warning-severity record still fires so the state
+change is never invisible.
+
+### Chunker-revision resync deferral
+
+The KG chunker carries a revision sentinel (`_CHUNKER_REVISION`) in
+`claude_mcp_servers/weaviate_mcp/chunking.py`. When a release changes chunk
+boundaries (chunk boundaries always follow the active model's preset; secondary
+slots absorb any context-window difference via tagged bounded sub-windows) —
+the revision is bumped. On the
+next update the launcher (and the Python emitter) compares the live revision
+against the persisted `chunker.last_seen_revision` marker and, on a change,
+writes a resync deferral to `UPDATE_DEFERRED.md` naming both revisions plus the
+commands the user runs to re-chunk and re-embed:
+
+```
+.claude/scripts/kg-sync --all
+.claude/scripts/code-graph-analyze . --force-recreate
+```
+
+It fires **once per revision** (the marker advances after the write; first boot
+seeds the marker without a deferral) and is independent of the file-hash bundle
+flow above — a revision change with no file changes still surfaces the resync
+prompt.
+
 ---
 
 ## 7. `start-launcher.*` autonomy + dist metadata

@@ -87,6 +87,25 @@ def _terminal_floor_tokens() -> int:
         return 2000
 
 
+# G5 (2026-07-22) — soft-label floor for dying-but-tiny answer windows.
+#
+# An aging pending file whose answer NEVER clears the 2 000-token terminal floor
+# used to be left every drain until the TTL sweep deleted it UNLABELED. That
+# censored the corpus toward long answers and starved the mcp_interactive cohort
+# (5 citations ever). Instead of dropping such a retrieval entirely, once the file
+# is at terminal age we compute a SOFT-labeled citation from whatever answer
+# window exists (as long as it clears a much lower floor — enough text for a
+# max-over-chunks cosine to mean anything). The event is marked ``soft_label:true``
+# + ``fire_reason=soft_terminal`` so the trainer can down-weight it (it is a
+# weaker signal than a full-window label) while still learning the retrieval's
+# below-threshold cosine maxima instead of seeing nothing.
+def _soft_label_floor_tokens() -> int:
+    try:
+        return int(os.getenv("RL_SOFT_CITATION_MIN_TOKENS", "200"))
+    except (TypeError, ValueError):
+        return 200
+
+
 def drain_session(
     session_id: str,
     transcript_path: "str | None",
@@ -182,15 +201,25 @@ def drain_session(
             # the transcript, so match_position_for_query can NEVER locate it and
             # ~87% of retrievals (the hook cohort) died unlabeled at the TTL sweep
             # — defeating F-QUEUE's stated purpose of recovering exactly that
-            # cohort. When (and only when) the query-match fails AND this is a
-            # hook-source payload, anchor the answer window by TIMESTAMP: the
-            # first assistant message stamped at/after the retrieval's ts_ms is
-            # the start of the answer it fed into. The window then flows through
-            # the SAME 25k gate + terminal floor below — no schema change, no
-            # opt-out change, only a different anchor for a payload the
-            # query-matcher structurally can't serve. Non-hook (mcp) payloads keep
-            # the exact current behaviour: a failed query-match still leaves them.
-            if payload.get("source") == "hook":
+            # cohort. When the query-match fails, anchor the answer window by
+            # TIMESTAMP: the first assistant message stamped at/after the
+            # retrieval's ts_ms is the start of the answer it fed into. The window
+            # then flows through the SAME gate + terminal floor below — no schema
+            # change, no opt-out change, only a different anchor for a payload the
+            # query-matcher structurally can't serve.
+            #
+            # G5 (2026-07-22): the timestamp fallback now ALSO covers the ``mcp``
+            # source. Previously it was hook-only, so an mcp_interactive retrieval
+            # whose query-match failed (or whose in-process monitor never fired —
+            # answers rarely reach the 25k gate) was left to die at the TTL sweep:
+            # mcp_interactive had FIVE citation events ever vs. 1 028 hook, the
+            # single worst under-labeled cohort. The mcp monitor deletes its own
+            # pending file on fire, so a surviving mcp pending file here means the
+            # monitor did NOT fire — exactly the case the drain must recover.
+            # Timestamp anchoring is safe for mcp too (the retrieval's ts_ms is
+            # stamped identically); the terminal floor below still gates it so a
+            # too-short answer accumulates rather than writing noise.
+            if payload.get("source") in ("hook", "mcp"):
                 matched = match_position_by_timestamp(messages, payload.get("ts_ms"))
             if matched is None:
                 # Could not locate this search in the transcript yet — leave it.
@@ -202,6 +231,7 @@ def drain_session(
         tok = token_count_fn(answer) if answer else 0
 
         fire_reason = "stop_drain"
+        soft_label = False
         if not answer.strip() or tok < gate:
             # v0.2.73 RL-4: terminal-session floor. An AGING pending file
             # (older than the terminal age, i.e. at real risk of dying at the
@@ -212,22 +242,32 @@ def drain_session(
             _ts_ms = payload.get("ts_ms")
             if isinstance(_ts_ms, (int, float)) and _ts_ms > 0:
                 _age_s = (time.time() * 1000.0 - float(_ts_ms)) / 1000.0
-            _terminal = (
+            _aged = (
                 answer.strip()
                 and _age_s is not None
                 and _age_s >= _terminal_age_seconds()
-                and tok >= _terminal_floor_tokens()
             )
-            if not _terminal:
-                # ⚠️ ACCUMULATE-DON'T-DROP: below the gate → keep the file so
-                # it can keep accumulating into subsequent turns. Never
-                # compute, never delete here. Compute+delete happens only
-                # at/above a gate (25k, or the terminal floor) or TTL.
+            _terminal = _aged and tok >= _terminal_floor_tokens()
+            if _terminal:
+                fire_reason = "terminal_floor"
+            elif _aged and tok >= _soft_label_floor_tokens():
+                # G5: the window will never clear the terminal floor but is aging
+                # toward a TTL death. Emit a SOFT-labeled citation from the
+                # below-threshold window (its cosine maxima ARE a signal, just a
+                # weaker one) rather than dropping the retrieval unlabeled. Marked
+                # so the trainer can down-weight it.
+                fire_reason = "soft_terminal"
+                soft_label = True
+            else:
+                # ⚠️ ACCUMULATE-DON'T-DROP: below every floor → keep the file so
+                # it can keep accumulating into subsequent turns. Never compute,
+                # never delete here. Compute+delete happens only at/above a gate
+                # (25k, terminal floor, or the soft-label floor at terminal age)
+                # or TTL.
                 summary["left"] += 1
                 continue
-            fire_reason = "terminal_floor"
 
-        # At/above the gate → compute + write + delete (one-shot).
+        # At/above a gate → compute + write + delete (one-shot).
         # v0.2.73 RL-6/RL-9: stamp the riders onto ctx so the citation event
         # stores where/why it fired. session_id prefers the value staged in
         # the ctx (RL-9 stage-time resolution), then the pending payload —
@@ -237,6 +277,12 @@ def drain_session(
             ctx["session_id"] = payload.get("session_id") or session_id or ""
         ctx["fire_reason"] = fire_reason
         ctx["window_tokens"] = tok
+        # G5: propagate the soft-label marker into the ctx so the citation event
+        # carries it (compute_citation forwards ctx fire_reason; the writer stores
+        # fire_reason verbatim, and the trainer can key its down-weight on
+        # fire_reason == "soft_terminal").
+        if soft_label:
+            ctx["soft_label"] = True
         try:
             result = compute_fn(task_id, answer, ctx, write=True)
         except Exception:

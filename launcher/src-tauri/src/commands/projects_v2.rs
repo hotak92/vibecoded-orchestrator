@@ -5009,6 +5009,18 @@ pub async fn get_shared_kg_read_disabled_cmd(
     get_shared_kg_read_disabled(&db, &project_id)
 }
 
+/// Tauri-exposed getter for the SHARED_KG_WRITE_DISABLED toggle. Mirror of
+/// `get_shared_kg_read_disabled_cmd`, used by the Identity tab to render
+/// the WRITE-gate checkbox on load. Triggers the legacy `shared_kg_opt_out`
+/// → `shared_kg_write_disabled` migration on read (idempotent).
+#[command]
+pub async fn get_shared_kg_write_disabled_cmd(
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<bool, String> {
+    get_shared_kg_write_disabled(&db, &project_id)
+}
+
 /// v0.2.46 Decision B — persist the symmetric SHARED_KG_READ_DISABLED
 /// toggle and refresh all per-project env surfaces so the new value
 /// takes effect immediately.

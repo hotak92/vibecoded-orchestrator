@@ -66,6 +66,12 @@ The audit log (`db.audit("secret_set", …)`) records `{key, scope, sensitive}` 
 **Delete the actual value from the keychain:**
 - Use the secrets panel's "Clear" action (calls `clear_secret_v2`), or remove it from the OS credential manager (`seahorse` / Keychain Access / Credential Manager). The DB ref will then flip to `missing` on next reload.
 
+**Grant a secret to another project, or pause it for one requester:**
+- The per-project SecretsPanel has a **"Cross-project access"** subsection. It lists **issued grants** (each `KEY → grantee`, with per-row **Pause** / **Resume** and **Revoke**) and **received grants** (read-only), plus a grant form (`KEY` + grantee-project dropdown + optional note).
+- **Grant**: pick a key you own, pick the grantee project, Save — the grantee can then resolve that key. Under the hood: `grant_secret` / `revoke_secret_grant_cmd`, with `list_grants_for_project` populating the lists.
+- **Pause / Resume**: pausing a `(key, requester)` pair makes the key resolve as inactive **for that one requester** without deleting the grant — the resolver returns `key_not_active` (exit 3 from `vct_secrets_resolve.sh`) for that project only. Resume re-activates it. Backed by `pause_secret_for_project` / `resume_secret_for_project`; the row's Pause/Resume state is read on load via `is_secret_paused_for_requester`.
+- This is the launcher surface for the cross-project grants and per-requester pauses that the resolver's permission matrix enforces — a secret resolves for a project only when it is active for that project as the requester.
+
 #### Field reference (SecretsTab columns)
 
 | Column        | Source                              | Meaning                                                                 |
@@ -498,6 +504,15 @@ propagate to MCP subprocesses on Linux —
 see `docs/CLAUDE_CODE_COMPATIBILITY.md`. If you edit a binding by hand outside the launcher,
 also update `.claude/settings.json` `env` for the change to take
 effect in MCP subprocesses.
+
+#### Shared-KG read / write gates (Identity tab)
+
+The Identity tab carries **two** symmetric shared-KG gate toggles for the project:
+
+- **Read gate** (`set_shared_kg_read_disabled` / `get_shared_kg_read_disabled_cmd`) — when on, the project's `hybrid_search` / `semantic_graph_search` exclude the shared collection; reads fall back to the per-project KG only. Env: `SHARED_KG_READ_DISABLED`.
+- **Write gate** (`set_shared_kg_write_disabled` / `get_shared_kg_write_disabled_cmd`) — when on, the project refuses writes to the shared collection; `store_knowledge_node(scope="shared")` returns an error rather than silently rerouting. Env: `SHARED_KG_WRITE_DISABLED`.
+
+Both toggles load on mount and on project change and revert the checkbox on a failed write. They map to the `SHARED_KG_READ_DISABLED` / `SHARED_KG_WRITE_DISABLED` env keys the `weaviate-kg` MCP reads.
 
 #### Field reference
 

@@ -43,6 +43,61 @@ logger = logging.getLogger(__name__)
 _DEFAULT_PORT = 7700
 _DEFAULT_TIMEOUT_S = 2.0
 
+# WP-R (2026-07-22): belt-and-braces hermeticity chokepoint. This module is the
+# SOLE place any RL event/prune reaches the REAL launcher.db (via vct-hub). Any
+# unit test that exercises a live code-search / KG-search entry point
+# (``search_code_graph``, ``CodeGraphQuery.search_by_concept``, the MCP tools)
+# flows through the shared telemetry emitter and, if nothing gates it, ends up
+# here — writing FIXTURE junk (dim 3/4 codesage ``code_hook``/``code_search``
+# events with titles like ``a.f``/``mod.self_fn``) into the live ``rl_events``
+# table. On a real install this accumulated thousands of junk rows plus a fresh
+# trickle every test run. The structural fix makes the tests hermetic (see
+# ``tests/conftest.py::_disable_rl_hub_writes_in_tests``, which sets
+# ``RL_HUB_POST_DISABLED=1`` suite-wide); THIS guard is the second line of
+# defence so ANY future test that reaches the poster — before it's added to the
+# suite, or via a path the conftest env doesn't cover — still cannot pollute the
+# real DB. Two independent sentinels:
+#   * ``PYTEST_CURRENT_TEST`` — pytest sets this automatically for the duration
+#     of every test; requires NO test-side cooperation, so it catches tests the
+#     author never thought about the hub in.
+#   * ``RL_HUB_POST_DISABLED`` — explicit opt-out the conftest sets (and any
+#     harness/red-proof can set) to assert "nothing must reach the real hub".
+# A truthy value at EITHER sentinel makes both posters a soft no-op (return the
+# same "event lost" contract the network-failure path returns), so the caller's
+# soft-fail flow is unchanged. Never raises.
+#
+# The ONE escape hatch is ``VCT_HUB_ALLOW_TEST_POST=1``: the file that DIRECTLY
+# tests the poster against a mock HTTP hub (tests/test_v0247_hub_writer.py) sets
+# it (via the conftest opt-out) so its round-trip assertions actually fire. It
+# overrides BOTH suppression legs. Nothing in production ever sets it.
+_HUB_POST_DISABLED_ENV = "RL_HUB_POST_DISABLED"
+_HUB_ALLOW_TEST_POST_ENV = "VCT_HUB_ALLOW_TEST_POST"
+
+
+def _in_test_context() -> bool:
+    """True iff RL hub writes must be suppressed for hermeticity (WP-R).
+
+    Suppressed when EITHER ``PYTEST_CURRENT_TEST`` (pytest-managed, present for
+    the whole test) OR the explicit ``RL_HUB_POST_DISABLED`` opt-out is truthy —
+    UNLESS the explicit ``VCT_HUB_ALLOW_TEST_POST`` escape hatch is set (the
+    poster's own direct-test file). Reads plain env vars, so it behaves
+    identically on every OS. A read that raises (never expected for os.environ,
+    but defensive) falls open to "not a test" = writes allowed — the guard must
+    never itself break a real production write.
+    """
+    try:
+        if os.environ.get(_HUB_ALLOW_TEST_POST_ENV, "").strip().lower() in (
+            "true", "1", "yes", "on",
+        ):
+            return False
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return True
+        return os.environ.get(_HUB_POST_DISABLED_ENV, "").strip().lower() in (
+            "true", "1", "yes", "on",
+        )
+    except Exception:  # noqa: BLE001 — env read must never break a write path
+        return False
+
 
 def _vct_root_dir() -> Path:
     """Resolve <vct_root>: delegates to ``vco_lib.paths.vct_root_dir``.
@@ -133,6 +188,15 @@ def post_rl_event(event: dict[str, Any], timeout: float = _DEFAULT_TIMEOUT_S) ->
         True if the hub returned 2xx; False otherwise (including the
         "hub not running" case where no token file exists).
     """
+    # WP-R: hermeticity chokepoint. Under a test context (PYTEST_CURRENT_TEST or
+    # the explicit RL_HUB_POST_DISABLED opt-out) suppress the write entirely so a
+    # test can never pollute the production rl_events table. Same "event lost"
+    # return (False) as the hub-not-running path, so the caller's soft-fail flow
+    # is unchanged.
+    if _in_test_context():
+        logger.debug("rl_events POST suppressed (test context)")
+        return False
+
     token = _read_hub_token()
     if token is None:
         logger.debug("rl_events POST skipped: no hub.token (hub not running?)")
@@ -163,12 +227,19 @@ def post_rl_event(event: dict[str, Any], timeout: float = _DEFAULT_TIMEOUT_S) ->
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return 200 <= resp.status < 300
     except urllib.error.HTTPError as e:
-        # The hub returned a structured 4xx/5xx. Log the status code so a
-        # writer bug (e.g. unknown event_type) is debuggable; the body
-        # has the error envelope but reading it here defeats the no-raise
-        # contract on closed connections, and the soft-fail caller doesn't
-        # need it.
-        logger.debug("rl_events POST returned HTTP %s", e.code)
+        # The hub returned a structured 4xx/5xx — the hub IS reachable but
+        # REJECTED this event, so the label is genuinely LOST (unlike a
+        # hub-not-running URLError, which is the expected off state). Log at
+        # WARNING so the loss is visible (R2-11): a 413 means the payload
+        # exceeded the 16 MiB axum body limit (raised from 2 MB by WP-Q; the
+        # explicit const lives in rl_events_api.rs). The client-side size guard in
+        # telemetry_writer._trim_event_to_payload_cap should keep events under
+        # it, so a 413 here signals a pathological event worth investigating; a
+        # 4xx/5xx otherwise signals a writer bug (e.g. unknown event_type). The
+        # error body carries the envelope but reading it here defeats the
+        # no-raise contract on closed connections, and the soft-fail caller
+        # doesn't need it.
+        logger.warning("rl_events POST returned HTTP %s (event dropped)", e.code)
         return False
     except urllib.error.URLError as e:
         # Connect-refused / DNS / TLS / etc. Most common: hub not running.
@@ -210,6 +281,15 @@ def post_rl_prune(
         project_id: Scope the prune to one project. None → all projects.
         timeout: Per-request timeout (s).
     """
+    # WP-R: hermeticity chokepoint (same as post_rl_event). The retention driver
+    # calls this inside ``log_retrieval`` on the write cadence, so a test that
+    # triggers a retrieval emit would otherwise reach the real hub's prune route.
+    # Under a test context, no-op with the "route unavailable" sentinel (None) so
+    # the driver treats it as "corpus untouched" and moves on.
+    if _in_test_context():
+        logger.debug("rl_events prune suppressed (test context)")
+        return None
+
     token = _read_hub_token()
     if token is None:
         logger.debug("rl_events prune skipped: no hub.token (hub not running?)")

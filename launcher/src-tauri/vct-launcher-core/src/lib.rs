@@ -49,6 +49,17 @@ pub mod registry;
 // re-exports it from here. See `secret_value_shape.rs` header.
 pub mod secret_value_shape;
 pub mod secrets;
+// v0.3.0 (WP-K): Linux-only persistent Secret-Service connection for the
+// keychain arm. Holds ONE process-wide D-Bus session (mutex-guarded,
+// reconnect-on-broken) so the daemon sees a long-lived client reused across ops
+// instead of a connect/disconnect per op — a mitigation of the gnome-keyring
+// disconnect-mid-dispatch fragility. `secrets` routes its Linux get/set/delete
+// AND its Background lock probe through this module; Windows/macOS keep using
+// `keyring::Entry`. `pub(crate)`: only `secrets` (same crate) may reach the raw
+// primitives — external code uses the guarded `secrets::*` chokepoint (K-3;
+// pinned by `raw_ss_write_primitives_and_module_confined_to_secrets_and_lib`).
+#[cfg(target_os = "linux")]
+pub(crate) mod secrets_ss_connection;
 pub mod services;
 pub mod state;
 #[cfg(any(test, debug_assertions))]

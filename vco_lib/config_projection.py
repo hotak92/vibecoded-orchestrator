@@ -493,6 +493,10 @@ _USER_SECRET_PROJECT_ID_SHARED = "_user_shared_"
 _USER_SECRET_PROJECT_ID_GLOBAL = "_global_"
 _USER_SECRET_MODULE_ID = "user"
 
+# WP-Q item 3 (G6): the RL reranker paid-module id, keyed in ``module_ports``
+# for the per-project RL serving port projection (RL_SERVER_PORT / RL_SERVER_URL).
+_RL_RERANKER_MODULE_ID = "vct-rl-reranker"
+
 
 @dataclass(frozen=True, slots=True)
 class _DbProjectRow:
@@ -1721,7 +1725,7 @@ def project_env_from_db(
             "dual_embedding_write_all_slots", default=False,
         )
         dual_rl_log_enabled = _fetch_module_setting_bool(
-            conn, project_id, "vct-rl-reranker",
+            conn, project_id, _RL_RERANKER_MODULE_ID,
             "dual_rl_log_enabled", default=False,
         )
         if active_embedding_override is not None:
@@ -1918,6 +1922,17 @@ def project_env_from_db(
     _set("OLLAMA_PORT", str(ollama_port_default))
     _set("CODE_EMBED_URL", code_embed_url)
     _set("CODE_EMBED_PORT", str(code_embed_port_default))
+
+    # NOTE (WP-Q item 3 / G6): RL_SERVER_PORT / RL_SERVER_URL are DELIBERATELY
+    # NOT projected here. Per the H.1 design contract (see
+    # vct-hub/src/config_api.rs::ProjectConfig.rl_server_port, V52-AA v0.2.52),
+    # the per-project RL serving port is a HUB-RESOLVED value, not a
+    # settings.json/.claude/env key: the MCP's rl_enrichment._get_rl_client
+    # reads it live from ProjectConfig.rl_server_port (sourced from the
+    # module_ports SoT). Projecting it into the global env allowlist would force
+    # the wrong precedence for a per-project value. The G6 reconcile therefore
+    # fixes the module_ports ROW (record reality); the hub then serves the
+    # correct port automatically — no env projection needed.
 
     if orchestrator_root is not None:
         # Use forward slashes on POSIX, backslashes on Windows — matches

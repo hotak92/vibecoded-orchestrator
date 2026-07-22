@@ -13,7 +13,8 @@
 
   import { onDestroy } from 'svelte';
   import { projectSetup } from '$lib/stores/project-setup';
-  import { safeInvoke } from '$lib/tauri';
+  import { invoke } from '$lib/tauri';
+  import { toast } from '$lib/stores/toast';
   import OperationProgressBanner from '$lib/components/OperationProgressBanner.svelte';
   import type { ProjectSetupPhase, ProjectSetupStatus } from '$lib/types/launcher';
 
@@ -74,7 +75,13 @@
   }
 
   async function retry(projectId: string) {
-    await safeInvoke<void>('retry_project_setup', { projectId });
+    // Strict invoke: a failed retry must surface, not vanish. A silent
+    // no-op leaves the banner stuck on "failed" with no explanation.
+    try {
+      await invoke<void>('retry_project_setup', { projectId });
+    } catch (e) {
+      toast.error(`Retry failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   // Build the view-model reactively. `now` is a $state so elapsed + auto-hide

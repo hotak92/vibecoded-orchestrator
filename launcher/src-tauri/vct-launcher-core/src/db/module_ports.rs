@@ -22,6 +22,59 @@ use rusqlite::{params, OptionalExtension};
 
 use super::Db;
 
+/// WP-Q item 3 (G6): the decision a port-reconcile pass makes for one
+/// `(project, module)`. The reconcile records REALITY (option b): it updates
+/// the `module_ports` row to the actually-bound host port of a running healthy
+/// container, and NEVER restarts the container. This enum is the pure decision
+/// (no I/O) so the act/leave-alone gate is unit-testable in isolation from
+/// container introspection + DB writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortReconcileDecision {
+    /// The container publishes `bound` and the DB row disagrees (`row`, which
+    /// may be `None` when never allocated) → write `bound` to the row.
+    UpdateRow { row: Option<u16>, bound: u16 },
+    /// The row already equals the bound port → nothing to do.
+    AlreadyCurrent { port: u16 },
+    /// No bound port was observed (no running container, or the container
+    /// publishes nothing) → leave the row alone. Carries a machine-readable
+    /// reason for the log/test.
+    LeaveAlone { reason: &'static str },
+}
+
+/// WP-Q item 3 (G6): PURE decision for the port reconcile.
+///
+/// Inputs:
+///   * `row_port`   — the current `module_ports` value (`None` = no row yet).
+///   * `bound_port` — the actually-bound host port of the RUNNING container
+///     (`None` = introspection found no running/published container).
+///
+/// Contract (option b — record reality, never restart, conservative on doubt):
+///   * `bound_port = None`  → `LeaveAlone` (no running container / no bind — we
+///     never invent a port).
+///   * `bound_port = Some(b)` and `row_port = Some(b)` → `AlreadyCurrent`.
+///   * `bound_port = Some(b)` and `row_port != Some(b)` → `UpdateRow` (the row
+///     is stale — a running container is the ground truth for where it binds).
+pub fn decide_port_reconcile(
+    row_port: Option<u16>,
+    bound_port: Option<u16>,
+) -> PortReconcileDecision {
+    match bound_port {
+        None => PortReconcileDecision::LeaveAlone {
+            reason: "no_running_container_or_no_bind",
+        },
+        Some(bound) => {
+            if row_port == Some(bound) {
+                PortReconcileDecision::AlreadyCurrent { port: bound }
+            } else {
+                PortReconcileDecision::UpdateRow {
+                    row: row_port,
+                    bound,
+                }
+            }
+        }
+    }
+}
+
 impl Db {
     /// Read a module's port for a project. Returns `Ok(None)` when no
     /// row exists (module not yet allocated, or wasn't part of the
@@ -223,6 +276,54 @@ mod tests {
             })
             .unwrap();
         assert_eq!(second, 11442);
+    }
+
+    // ─── WP-Q item 3 (G6): decide_port_reconcile (pure) ────────────────────
+
+    /// Stale row + a running container bound on a DIFFERENT port → UpdateRow
+    /// (the live container is ground truth; record reality).
+    #[test]
+    fn reconcile_stale_row_updates_to_bound_port() {
+        assert_eq!(
+            decide_port_reconcile(Some(11442), Some(11450)),
+            PortReconcileDecision::UpdateRow { row: Some(11442), bound: 11450 },
+        );
+    }
+
+    /// Never-allocated row (None) + a running container → UpdateRow(None → bound).
+    #[test]
+    fn reconcile_absent_row_records_bound_port() {
+        assert_eq!(
+            decide_port_reconcile(None, Some(11450)),
+            PortReconcileDecision::UpdateRow { row: None, bound: 11450 },
+        );
+    }
+
+    /// Row already equals the bound port → AlreadyCurrent (no write).
+    #[test]
+    fn reconcile_matching_row_is_already_current() {
+        assert_eq!(
+            decide_port_reconcile(Some(11450), Some(11450)),
+            PortReconcileDecision::AlreadyCurrent { port: 11450 },
+        );
+    }
+
+    /// No running container / no publishable bind → LeaveAlone (never invent
+    /// a port), regardless of what the row says.
+    #[test]
+    fn reconcile_no_bound_port_leaves_row_alone() {
+        assert_eq!(
+            decide_port_reconcile(Some(11442), None),
+            PortReconcileDecision::LeaveAlone {
+                reason: "no_running_container_or_no_bind",
+            },
+        );
+        assert_eq!(
+            decide_port_reconcile(None, None),
+            PortReconcileDecision::LeaveAlone {
+                reason: "no_running_container_or_no_bind",
+            },
+        );
     }
 
     /// Migration 014's backfill (in 017_module_ports.sql) populates the

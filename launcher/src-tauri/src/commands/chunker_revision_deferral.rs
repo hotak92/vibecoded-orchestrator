@@ -33,6 +33,15 @@ use vct_launcher_core::process::CommandExt as _;
 /// nudge.
 pub const CHUNKER_BUMP_VERSION: &str = "0.2.46";
 
+/// app_state key persisting the last-seen `_CHUNKER_REVISION` sentinel string
+/// (R2-4). Compared against the live value read from chunking.py each boot; a
+/// mismatch triggers the re-sync deferral. This is the REVISION-crossing check
+/// that the sentinel's own contract comment always promised — the
+/// `CHUNKER_BUMP_VERSION` semver check above only ever fires across the one-off
+/// v0.2.46 launcher-version boundary and never again for current installs, so
+/// the string sentinel had no consumer until now.
+pub(crate) const APP_STATE_KEY_CHUNKER_REVISION: &str = "chunker.last_seen_revision";
+
 /// Outcome of the deferral check. Exposed for tests; production
 /// callers can ignore the return value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,6 +271,209 @@ pub fn write_chunker_deferral_if_crossing_boundary(
     }
 }
 
+/// Outcome of the chunker-REVISION-change check (R2-4). Parallel to
+/// [`DeferralOutcome`] but keyed on the `_CHUNKER_REVISION` sentinel STRING, not
+/// the launcher semver. Exposed for tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevisionOutcome {
+    /// First boot with revision-tracking (no prior revision recorded). The key
+    /// is seeded to the current revision; no deferral is written. Note the
+    /// limitation: an install updating from a pre-revision-tracking version may
+    /// hold rows written under an OLDER chunker revision, and this seeding
+    /// cannot detect that (there is no prior marker to compare) — the launcher
+    /// semver boundary check covers the known historical preset change, and any
+    /// later revision bump is caught from the seeded marker onward.
+    FirstBoot,
+    /// The persisted revision matches the live one. No re-chunk needed.
+    Unchanged,
+    /// The revision changed; a re-sync deferral was written to the
+    /// orchestrator-root project (`projects_touched` = 1 on success, 0 when no
+    /// root row / folder missing / write failed). The marker is advanced so the
+    /// deferral fires once per revision, not every boot.
+    Changed {
+        prev: String,
+        current: String,
+        projects_touched: usize,
+    },
+    /// The live revision could not be read (python/repo-root unavailable) or a
+    /// DB read failed. Logged on stderr; treated as a no-op (next boot retries).
+    Skipped,
+}
+
+/// Read the live `_CHUNKER_REVISION` sentinel from `chunking.py` via the shared
+/// Python reader (`vco_lib.project_init.current_chunker_revision`). ONE reader
+/// so the launcher and Python agree on the value (A>B>C cross-language: shared
+/// code via subprocess). Returns `None` when python/repo-root is unavailable or
+/// the helper errors — the caller then Skips.
+fn read_current_chunker_revision() -> Option<String> {
+    let repo_root = super::installer::find_local_repo_root().ok()?;
+    let py = pick_python()?;
+    let repo_py = py_quote(&repo_root.to_string_lossy());
+    let script = format!(
+        "import sys\n\
+         sys.path.insert(0, {repo_py})\n\
+         from vco_lib.project_init import current_chunker_revision\n\
+         sys.stdout.write(current_chunker_revision())\n",
+    );
+    let output = std::process::Command::new(&py)
+        .silent()
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        eprintln!(
+            "[chunker-revision] reader exited {} — skipping",
+            output.status
+        );
+        return None;
+    }
+    let rev = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if rev.is_empty() {
+        eprintln!("[chunker-revision] reader returned empty string — skipping");
+        return None;
+    }
+    Some(rev)
+}
+
+/// Write the REVISION-change re-sync deferral to the orchestrator-root project.
+/// Mirrors [`write_deferral_for_root_project`] but routes to the revision-keyed
+/// Python emitter. Returns 1 on success, 0 otherwise. Soft-fails throughout.
+fn write_revision_deferral_for_root_project(db: &Db, prev: &str, current: &str) -> usize {
+    let guard = db.lock();
+    let folder_path_result: Result<String, rusqlite::Error> = guard.query_row(
+        "SELECT folder_path FROM projects WHERE host = 'orchestrator_root' LIMIT 1",
+        [],
+        |row| row.get(0),
+    );
+    drop(guard);
+
+    let folder_str = match folder_path_result {
+        Ok(s) => s,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return 0,
+        Err(e) => {
+            eprintln!(
+                "[chunker-revision] SELECT orchestrator-root failed: {} — skipping",
+                e
+            );
+            return 0;
+        }
+    };
+    let folder = PathBuf::from(&folder_str);
+    if !folder.is_dir() {
+        eprintln!(
+            "[chunker-revision] orchestrator-root folder missing on disk: {} — skipping",
+            folder_str
+        );
+        return 0;
+    }
+
+    let repo_root = match super::installer::find_local_repo_root() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[chunker-revision] cannot locate repo root: {} — skipping", e);
+            return 0;
+        }
+    };
+    let py = match pick_python() {
+        Some(p) => p,
+        None => {
+            eprintln!("[chunker-revision] no python to emit deferral — skipping");
+            return 0;
+        }
+    };
+    let repo_py = py_quote(&repo_root.to_string_lossy());
+    let folder_py = py_quote(&folder.to_string_lossy());
+    let prev_py = py_quote(prev);
+    let cur_py = py_quote(current);
+    let script = format!(
+        "import sys\n\
+         sys.path.insert(0, {repo_py})\n\
+         from pathlib import Path\n\
+         from vco_lib.project_init import _emit_chunker_revision_resync_deferral\n\
+         _emit_chunker_revision_resync_deferral(Path({folder_py}), {prev_py}, {cur_py})\n",
+    );
+    let status = std::process::Command::new(&py)
+        .silent()
+        .arg("-c")
+        .arg(&script)
+        .status();
+    match status {
+        Ok(s) if s.success() => 1,
+        Ok(s) => {
+            eprintln!("[chunker-revision] deferral python helper exited {}", s);
+            0
+        }
+        Err(e) => {
+            eprintln!("[chunker-revision] deferral python helper spawn failed: {}", e);
+            0
+        }
+    }
+}
+
+/// Public entry point (R2-4): fire the re-sync deferral when the live
+/// `_CHUNKER_REVISION` sentinel differs from the persisted last-seen value.
+///
+/// Called from `lib.rs::setup` on every boot (independent of the semver
+/// `write_chunker_deferral_if_crossing_boundary` hook, which only ever fired
+/// across the v0.2.46 launcher-version boundary). This is the consumer the
+/// sentinel's contract comment always described: bump `_CHUNKER_REVISION` in
+/// chunking.py whenever chunk boundaries change → the next boot detects the
+/// change → writes the re-sync deferral with the kg-sync/code-graph re-run
+/// commands → advances the marker so it fires exactly once per revision.
+///
+/// Soft-fails throughout: a read/DB/python failure Skips (no crash, next boot
+/// retries). First boot seeds the marker WITHOUT a deferral (rows are current
+/// by definition on a fresh revision-tracking install).
+pub fn write_chunker_deferral_if_revision_changed(db: &Db) -> RevisionOutcome {
+    let current = match read_current_chunker_revision() {
+        Some(r) => r,
+        None => return RevisionOutcome::Skipped,
+    };
+    let prior = match db.app_state_get(APP_STATE_KEY_CHUNKER_REVISION) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[chunker-revision] app_state_get failed: {} — skipping", e);
+            return RevisionOutcome::Skipped;
+        }
+    };
+    match prior.as_deref() {
+        None => {
+            // First boot with revision-tracking: seed WITHOUT a deferral. Rows
+            // already on disk were chunked under whatever revision shipped with
+            // this build, so there's nothing older to re-chunk against.
+            if let Err(e) = db.app_state_set(APP_STATE_KEY_CHUNKER_REVISION, &current) {
+                eprintln!("[chunker-revision] seed failed: {} — next boot retries", e);
+            }
+            RevisionOutcome::FirstBoot
+        }
+        Some(prev) if prev == current => RevisionOutcome::Unchanged,
+        Some(prev) => {
+            let prev = prev.to_string();
+            let touched = write_revision_deferral_for_root_project(db, &prev, &current);
+            // Advance the marker so the deferral fires once per revision, not
+            // every boot. Soft-fail: if this fails the deferral re-emits next
+            // boot but DeferralReport dedups by condition_id (no duplicate).
+            if let Err(e) = db.app_state_set(APP_STATE_KEY_CHUNKER_REVISION, &current) {
+                eprintln!(
+                    "[chunker-revision] marker advance failed: {} — deferral may re-emit (dedup'd)",
+                    e
+                );
+            }
+            eprintln!(
+                "[chunker-revision] revision changed {} → {}; wrote re-sync notice \
+                 to orchestrator-root project ({} written)",
+                prev, current, touched
+            );
+            RevisionOutcome::Changed {
+                prev,
+                current,
+                projects_touched: touched,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,5 +615,76 @@ mod tests {
         let db = Db::open_in_memory().expect("in-memory db");
         let outcome = write_chunker_deferral_if_crossing_boundary(&db, "garbage", "0.2.46");
         assert_eq!(outcome, DeferralOutcome::Skipped);
+    }
+
+    // ---- R2-4: revision-change consumer ----------------------------------- //
+
+    #[test]
+    fn revision_first_boot_seeds_marker_without_deferral() {
+        // No prior revision → FirstBoot (marker seeded, no re-chunk needed).
+        // If python/repo-root is unavailable the reader returns None → Skipped;
+        // accept either since the routing (not the reader) is under test here.
+        let db = Db::open_in_memory().expect("in-memory db");
+        let outcome = write_chunker_deferral_if_revision_changed(&db);
+        match outcome {
+            RevisionOutcome::FirstBoot => {
+                // Marker must now be set to the live revision.
+                let seeded = db
+                    .app_state_get(APP_STATE_KEY_CHUNKER_REVISION)
+                    .expect("app_state_get")
+                    .expect("marker seeded on first boot");
+                assert!(!seeded.is_empty(), "seeded revision must be non-empty");
+            }
+            RevisionOutcome::Skipped => {
+                eprintln!("skipping content assertion: revision reader unavailable");
+            }
+            other => panic!("expected FirstBoot or Skipped, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn revision_unchanged_is_noop() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        // Seed the marker to whatever the live reader returns (first call).
+        let first = write_chunker_deferral_if_revision_changed(&db);
+        if matches!(first, RevisionOutcome::Skipped) {
+            eprintln!("skipping: revision reader unavailable");
+            return;
+        }
+        // Second call with the SAME live revision → Unchanged.
+        let second = write_chunker_deferral_if_revision_changed(&db);
+        assert_eq!(second, RevisionOutcome::Unchanged);
+    }
+
+    #[test]
+    fn revision_change_advances_marker_and_reports_changed() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        // Force a STALE persisted revision so the live value (whatever it is)
+        // differs → Changed. No orchestrator-root row exists, so touched == 0,
+        // but the marker must still advance to the live value.
+        db.app_state_set(APP_STATE_KEY_CHUNKER_REVISION, "v0.0.0-stale")
+            .expect("seed stale marker");
+        let outcome = write_chunker_deferral_if_revision_changed(&db);
+        match outcome {
+            RevisionOutcome::Changed {
+                prev,
+                current,
+                projects_touched,
+            } => {
+                assert_eq!(prev, "v0.0.0-stale");
+                assert_ne!(current, "v0.0.0-stale", "current must be the live revision");
+                assert_eq!(projects_touched, 0, "no orchestrator-root row in in-memory db");
+                // Marker advanced to the live value → next boot is Unchanged.
+                let advanced = db
+                    .app_state_get(APP_STATE_KEY_CHUNKER_REVISION)
+                    .expect("app_state_get")
+                    .expect("marker present");
+                assert_eq!(advanced, current, "marker must advance to the live revision");
+            }
+            RevisionOutcome::Skipped => {
+                eprintln!("skipping: revision reader unavailable");
+            }
+            other => panic!("expected Changed or Skipped, got {:?}", other),
+        }
     }
 }

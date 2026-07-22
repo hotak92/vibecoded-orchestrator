@@ -39,6 +39,16 @@
   import { onMount } from 'svelte';
   import { secrets, lifecycleOf, type SecretEntry, type SecretScope } from '$lib/stores/secrets';
   import { selectedProject, projects } from '$lib/stores/projects';
+  import {
+    listGrantsForProject,
+    grantSecret,
+    revokeSecretGrant,
+    pauseSecretForProject,
+    resumeSecretForProject,
+    isSecretPausedForRequester,
+    type ProjectGrants,
+    type SecretGrant,
+  } from '$lib/stores/secret-grants';
 
   let scope = $state<SecretScope>('per_project');
 
@@ -291,6 +301,185 @@
 
   async function refreshProjects() {
     await projects.load();
+  }
+
+  // ─── Cross-project grants (per-project scope only) ───────────────────
+  // A per-project secret is normally visible only to the owning project.
+  // A grant lets a chosen OTHER project (the grantee) read a specific KEY.
+  // Backed by the shared secret-grants client (one home for the invoke
+  // shapes). Only meaningful on the per-project tab.
+  let grants = $state<ProjectGrants>({ issued: [], received: [] });
+  let grantsLoading = $state(false);
+  let grantsError = $state<string | null>(null);
+  // Grant form state.
+  let grantKey = $state('');
+  let grantGranteeId = $state<string | null>(null);
+  let grantNote = $state('');
+  let grantBusy = $state(false);
+
+  // Paused state per issued grant, keyed by `${key}::${granteeId}`. The
+  // owner can pause a granted secret for one grantee without revoking.
+  let grantPaused = $state<Record<string, boolean>>({});
+
+  // R2-16: monotonic generation token guarding against a stale-response race on
+  // fast project switches. Each loadGrants() bumps it; a call that finishes
+  // AFTER a newer call started must NOT clobber the newer results. (Mutations
+  // already use row-scoped ids so no wrong-project ACTION was ever possible —
+  // this is purely a render-correctness guard.)
+  let grantsLoadSeq = 0;
+
+  function grantPauseKey(key: string, granteeId: string): string {
+    return `${key}::${granteeId}`;
+  }
+
+  async function loadGrants() {
+    if (!formProjectId) {
+      grants = { issued: [], received: [] };
+      grantPaused = {};
+      return;
+    }
+    const mySeq = ++grantsLoadSeq;
+    grantsLoading = true;
+    grantsError = null;
+    try {
+      const loaded = await listGrantsForProject(formProjectId);
+      // Stale-response guard: a newer loadGrants started while we awaited →
+      // discard our results so we don't overwrite the newer project's grants.
+      if (mySeq !== grantsLoadSeq) return;
+      grants = loaded;
+      // Fetch the paused state for each issued grant so Pause/Resume renders
+      // correctly on load. R2-16: run the N probes in PARALLEL (Promise.all)
+      // instead of an await-in-loop — N sequential round-trips added avoidable
+      // latency on projects with many grants.
+      const pausedPairs = await Promise.all(
+        loaded.issued.map(async (g) => {
+          try {
+            const p = await isSecretPausedForRequester({
+              projectId: g.owner_project_id,
+              key: g.key,
+              requesterProjectId: g.grantee_project_id,
+              moduleId: g.module_id,
+            });
+            return [grantPauseKey(g.key, g.grantee_project_id), p] as const;
+          } catch {
+            // Soft-fail per grant: default not-paused (honest degrade — the
+            // backend now propagates DB errors, R2-12).
+            return [grantPauseKey(g.key, g.grantee_project_id), false] as const;
+          }
+        }),
+      );
+      // Second stale-response check after the parallel fan-out resolved.
+      if (mySeq !== grantsLoadSeq) return;
+      const paused: Record<string, boolean> = {};
+      for (const [k, v] of pausedPairs) paused[k] = v;
+      grantPaused = paused;
+    } catch (e) {
+      if (mySeq !== grantsLoadSeq) return;
+      grantsError = e instanceof Error ? e.message : String(e);
+    } finally {
+      // Only the newest in-flight load owns the loading flag.
+      if (mySeq === grantsLoadSeq) grantsLoading = false;
+    }
+  }
+
+  async function handleTogglePause(g: SecretGrant) {
+    grantsError = null;
+    grantBusy = true;
+    const k = grantPauseKey(g.key, g.grantee_project_id);
+    const currentlyPaused = grantPaused[k] === true;
+    try {
+      if (currentlyPaused) {
+        await resumeSecretForProject({
+          projectId: g.owner_project_id,
+          key: g.key,
+          requesterProjectId: g.grantee_project_id,
+          moduleId: g.module_id,
+        });
+      } else {
+        await pauseSecretForProject({
+          projectId: g.owner_project_id,
+          key: g.key,
+          requesterProjectId: g.grantee_project_id,
+          moduleId: g.module_id,
+        });
+      }
+      grantPaused = { ...grantPaused, [k]: !currentlyPaused };
+    } catch (e) {
+      grantsError = e instanceof Error ? e.message : String(e);
+    } finally {
+      grantBusy = false;
+    }
+  }
+
+  // Reload grants whenever the per-project selection changes (only on the
+  // per-project tab — grants are scope-specific).
+  $effect(() => {
+    void formProjectId;
+    void scope;
+    if (scope === 'per_project' && formProjectId) {
+      void loadGrants();
+    }
+  });
+
+  async function handleGrant() {
+    grantsError = null;
+    if (!formProjectId) {
+      grantsError = 'Pick the owning project first';
+      return;
+    }
+    if (!grantKey.trim()) {
+      grantsError = 'KEY is required';
+      return;
+    }
+    if (!grantGranteeId) {
+      grantsError = 'Pick a project to grant access to';
+      return;
+    }
+    if (grantGranteeId === formProjectId) {
+      grantsError = 'Owner and grantee must differ';
+      return;
+    }
+    grantBusy = true;
+    try {
+      await grantSecret({
+        ownerProjectId: formProjectId,
+        key: grantKey.trim(),
+        granteeProjectId: grantGranteeId,
+        note: grantNote.trim() || null,
+      });
+      grantKey = '';
+      grantGranteeId = null;
+      grantNote = '';
+      await loadGrants();
+    } catch (e) {
+      grantsError = e instanceof Error ? e.message : String(e);
+    } finally {
+      grantBusy = false;
+    }
+  }
+
+  async function handleRevokeGrant(g: SecretGrant) {
+    grantsError = null;
+    grantBusy = true;
+    try {
+      await revokeSecretGrant({
+        ownerProjectId: g.owner_project_id,
+        key: g.key,
+        granteeProjectId: g.grantee_project_id,
+        moduleId: g.module_id,
+      });
+      await loadGrants();
+    } catch (e) {
+      grantsError = e instanceof Error ? e.message : String(e);
+    } finally {
+      grantBusy = false;
+    }
+  }
+
+  // Human-friendly project label for a grant row's project id.
+  function projectLabel(id: string): string {
+    const p = allProjects.find((x) => x.id === id);
+    return p ? p.name : id;
   }
 </script>
 
@@ -586,6 +775,123 @@
         <div class="msg msg-error">{newError}</div>
       {/if}
     </div>
+
+    <!-- Cross-project grants: per-project secrets are private to the
+         owning project unless explicitly granted to another project.
+         Only shown on the per-project tab. -->
+    {#if scope === 'per_project'}
+      <div class="grants-section">
+        <h4 class="add-title">Cross-project access</h4>
+        <p class="grants-desc">
+          A per-project secret is visible only to the owning project. Grant a
+          specific KEY to another project so a module running there can read it.
+        </p>
+
+        {#if grantsError}
+          <div class="msg msg-error">{grantsError}</div>
+        {/if}
+
+        <!-- Grants this project issued (as owner). -->
+        {#if grantsLoading}
+          <p class="grants-hint">Loading grants…</p>
+        {:else if grants.issued.length === 0}
+          <p class="grants-hint">No secrets granted to other projects yet.</p>
+        {:else}
+          <div class="grants-list">
+            {#each grants.issued as g (`${g.key}::${g.grantee_project_id}`)}
+              {@const paused = grantPaused[grantPauseKey(g.key, g.grantee_project_id)] === true}
+              <div class="grant-row" class:grant-row-paused={paused}>
+                <div class="grant-info">
+                  <span class="grant-key mono">{g.key}</span>
+                  <span class="grant-arrow">→</span>
+                  <span class="grant-grantee">{projectLabel(g.grantee_project_id)}</span>
+                  {#if paused}
+                    <span class="grant-paused-badge">paused</span>
+                  {/if}
+                  {#if g.note}
+                    <span class="grant-note">{g.note}</span>
+                  {/if}
+                </div>
+                <div class="grant-actions">
+                  <button
+                    class="btn-3d btn-3d-ghost btn-3d-sm"
+                    onclick={() => handleTogglePause(g)}
+                    disabled={grantBusy}
+                    title={paused
+                      ? 'Resume: let the grantee read this secret again'
+                      : 'Pause: block the grantee from reading this secret without revoking the grant'}
+                  >
+                    {paused ? 'Resume' : 'Pause'}
+                  </button>
+                  <button
+                    class="btn-3d btn-3d-ghost btn-3d-sm"
+                    onclick={() => handleRevokeGrant(g)}
+                    disabled={grantBusy}
+                    title="Revoke this grant"
+                  >
+                    Revoke
+                  </button>
+                </div>
+              </div>
+            {/each}
+          </div>
+        {/if}
+
+        <!-- Grants this project received (as grantee) — read-only; revoke
+             is the owner's action, done from the owner's tab. -->
+        {#if grants.received.length > 0}
+          <p class="grants-hint grants-received-hint">Granted to this project:</p>
+          <div class="grants-list">
+            {#each grants.received as g (`${g.key}::${g.owner_project_id}`)}
+              <div class="grant-row grant-row-received">
+                <div class="grant-info">
+                  <span class="grant-grantee">{projectLabel(g.owner_project_id)}</span>
+                  <span class="grant-arrow">→</span>
+                  <span class="grant-key mono">{g.key}</span>
+                  {#if g.note}
+                    <span class="grant-note">{g.note}</span>
+                  {/if}
+                </div>
+              </div>
+            {/each}
+          </div>
+        {/if}
+
+        <!-- Grant form. -->
+        <div class="grant-form">
+          <input
+            type="text"
+            class="form-input form-input-sm mono"
+            placeholder="KEY to grant"
+            bind:value={grantKey}
+            autocomplete="off"
+          />
+          <select
+            class="form-input form-input-sm"
+            bind:value={grantGranteeId}
+          >
+            <option value={null}>— grant to project —</option>
+            {#each allProjects.filter((p) => p.id !== formProjectId) as p (p.id)}
+              <option value={p.id}>{p.name}</option>
+            {/each}
+          </select>
+          <input
+            type="text"
+            class="form-input form-input-sm"
+            placeholder="note (optional)"
+            bind:value={grantNote}
+            autocomplete="off"
+          />
+          <button
+            class="btn-3d btn-3d-primary btn-3d-sm"
+            onclick={handleGrant}
+            disabled={grantBusy || !formProjectId}
+          >
+            Grant
+          </button>
+        </div>
+      </div>
+    {/if}
   {/if}
 
   {#if sState.error}
@@ -905,6 +1211,119 @@
     text-transform: uppercase;
     letter-spacing: 0.5px;
     margin-bottom: 10px;
+  }
+
+  /* Cross-project grants subsection. */
+  .grants-section {
+    margin-top: 12px;
+    padding: 14px;
+    background: rgba(123, 95, 255, 0.04);
+    border: 1px solid rgba(123, 95, 255, 0.12);
+    border-radius: 10px;
+  }
+
+  .grants-desc {
+    font-size: 11px;
+    color: var(--color-muted);
+    margin-bottom: 10px;
+  }
+
+  .grants-hint {
+    font-size: 11px;
+    color: var(--color-muted);
+    font-style: italic;
+    margin: 6px 0;
+  }
+
+  .grants-received-hint {
+    margin-top: 12px;
+    font-style: normal;
+    font-weight: 600;
+    color: var(--color-mid);
+  }
+
+  .grants-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .grant-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 6px 8px;
+    background: rgba(255, 255, 255, 0.03);
+    border-radius: 6px;
+  }
+
+  .grant-row-received {
+    background: rgba(255, 255, 255, 0.015);
+  }
+
+  .grant-info {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+
+  .grant-key {
+    color: var(--color-text);
+    font-size: 11px;
+  }
+
+  .grant-arrow {
+    color: var(--color-muted);
+  }
+
+  .grant-grantee {
+    color: var(--color-purple);
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  .grant-note {
+    color: var(--color-muted);
+    font-size: 10px;
+    font-style: italic;
+  }
+
+  .grant-actions {
+    display: flex;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+
+  .grant-paused-badge {
+    font-size: 9px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #fbbf24;
+    background: rgba(245, 158, 11, 0.16);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
+  .grant-row-paused .grant-key,
+  .grant-row-paused .grant-grantee {
+    opacity: 0.55;
+  }
+
+  .grant-form {
+    display: flex;
+    gap: 6px;
+    margin-top: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .grant-form .form-input {
+    width: auto;
+    flex: 1 1 120px;
   }
 
   .add-row {

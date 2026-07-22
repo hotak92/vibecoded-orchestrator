@@ -111,6 +111,107 @@ pub async fn register_project_diagram(
     Ok(row)
 }
 
+/// Drop a best-effort starter file on disk for a freshly-registered
+/// diagram so the user has something renderable immediately. Invoked by
+/// DiagramsTab right after `register_project_diagram`.
+///
+/// Idempotent + non-clobbering: if a file already exists at the diagram's
+/// resolved path (user pre-created it, or a re-registration), we leave it
+/// untouched and return Ok — the register flow must not overwrite content.
+/// The path is resolved via the same `resolve_diagram_abs_path` +
+/// `write_file_atomic` primitives the snapshot/restore paths use, and the
+/// write is confined to the project folder (defence-in-depth check).
+///
+/// Content is a minimal valid seed per type: a one-node mermaid graph, or
+/// an empty Excalidraw scene document (the browser editor fills the rest).
+#[command]
+pub async fn create_starter_diagram_file(
+    project_id: String,
+    diagram_id: i64,
+    db: State<'_, Db>,
+) -> Result<(), String> {
+    create_starter_diagram_file_with_db(&db, &project_id, diagram_id).map(|_wrote| ())
+}
+
+/// Testable core of `create_starter_diagram_file` (takes `&Db` instead of
+/// `State<Db>`). Returns `Ok(true)` if it wrote a new file, `Ok(false)` if
+/// it left an existing file untouched (non-clobber), `Err` on a real
+/// failure.
+fn create_starter_diagram_file_with_db(
+    db: &Db,
+    project_id: &str,
+    diagram_id: i64,
+) -> Result<bool, String> {
+    let diagram = db
+        .get_diagram_by_id(diagram_id)?
+        .ok_or_else(|| format!("diagram {} not found", diagram_id))?;
+    // Guard: the diagram must belong to the caller's project. Prevents a
+    // caller from seeding files for another project's diagram id.
+    if diagram.project_id != project_id {
+        return Err(format!(
+            "create_starter_diagram_file: diagram {} does not belong to project {}",
+            diagram_id, project_id
+        ));
+    }
+
+    let abs_path = resolve_diagram_abs_path(db, &diagram)?;
+
+    // Defence-in-depth: confine the write to the project folder. Mirrors
+    // the boundary `write_text_file` enforces.
+    let project_folder = lookup_project_folder(db, &diagram.project_id)?;
+    let normalised = lexical_normalize(&abs_path);
+    let project_canonical = match dunce::canonicalize(&project_folder) {
+        Ok(p) => p,
+        Err(_) => lexical_normalize(&project_folder),
+    };
+    if !normalised.starts_with(&project_canonical) {
+        return Err(format!(
+            "create_starter_diagram_file: path {} escapes project folder {}",
+            normalised.display(),
+            project_canonical.display()
+        ));
+    }
+
+    // Non-clobbering: never overwrite an existing file.
+    if normalised.exists() {
+        return Ok(false);
+    }
+
+    let starter = starter_content_for(&diagram.diagram_type, &diagram.diagram_name);
+    write_file_atomic(&normalised, starter.as_bytes())?;
+
+    db.audit(
+        "diagram_starter_file_created",
+        Some(project_id),
+        None,
+        &serde_json::json!({
+            "diagram_id": diagram_id,
+            "type": diagram.diagram_type,
+        }),
+    )?;
+    Ok(true)
+}
+
+/// Minimal valid starter content per diagram type. Mermaid gets a single
+/// labelled node so the preview renders immediately; Excalidraw gets an
+/// empty-but-valid scene document the browser editor can open and populate.
+fn starter_content_for(diagram_type: &str, diagram_name: &str) -> String {
+    match diagram_type {
+        "mermaid" => format!(
+            "graph TD\n    start[\"{}\"]\n",
+            // Sanitise the label so a stray `\"` or newline can't break the
+            // one-node seed. Kept simple: strip quotes + control chars.
+            diagram_name.replace(['"', '\n', '\r'], " ")
+        ),
+        // "excalidraw" (and any future/unknown type) → empty scene doc.
+        // This is the canonical empty Excalidraw file shape.
+        _ => "{\n  \"type\": \"excalidraw\",\n  \"version\": 2,\n  \
+              \"source\": \"vct-launcher\",\n  \"elements\": [],\n  \
+              \"appState\": {},\n  \"files\": {}\n}\n"
+            .to_string(),
+    }
+}
+
 #[command]
 pub async fn unregister_project_diagram(
     project_id: String,
@@ -1400,6 +1501,110 @@ mod tests {
             .unwrap();
         let abs = resolve_diagram_abs_path(&db, &d).unwrap();
         assert_eq!(abs, PathBuf::from(&abs_path_str));
+    }
+
+    #[test]
+    fn starter_content_dispatches_by_type() {
+        // Mermaid → a one-node graph that renders immediately.
+        let m = starter_content_for("mermaid", "My Diagram");
+        assert!(m.starts_with("graph TD"), "mermaid seed: {}", m);
+        assert!(m.contains("My Diagram"), "label embedded: {}", m);
+        // Label sanitisation: a quote/newline in the name can't break the seed.
+        let m2 = starter_content_for("mermaid", "a\"b\nc");
+        assert!(!m2.contains('"') || m2.matches('"').count() == 2,
+            "quotes in the label are neutralised: {}", m2);
+        assert!(!m2.contains('\n') || m2.lines().count() <= 3,
+            "newline in the label doesn't add graph lines: {}", m2);
+
+        // Excalidraw (and unknown types) → an empty but valid scene doc.
+        let e = starter_content_for("excalidraw", "X");
+        let parsed: serde_json::Value = serde_json::from_str(&e).expect("valid JSON");
+        assert_eq!(parsed["type"], "excalidraw");
+        assert!(parsed["elements"].is_array());
+        let unknown = starter_content_for("something-new", "X");
+        assert!(serde_json::from_str::<serde_json::Value>(&unknown).is_ok(),
+            "unknown type falls back to a valid excalidraw doc");
+    }
+
+    #[test]
+    fn create_starter_file_writes_then_is_non_clobbering() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = make_db_with_project("p1", "Acme", dir.path());
+        let d = db
+            .register_diagram("p1", "x", "mermaid", ".claude/diagrams/g/x.mmd", "g")
+            .unwrap();
+
+        // First call: writes a fresh starter file.
+        let wrote = create_starter_diagram_file_with_db(&db, "p1", d.id).unwrap();
+        assert!(wrote, "first call should write");
+        let path = dir.path().join(".claude/diagrams/g/x.mmd");
+        let first = fs::read_to_string(&path).unwrap();
+        assert!(first.starts_with("graph TD"));
+
+        // Second call: leaves the existing file untouched (non-clobber).
+        let wrote2 = create_starter_diagram_file_with_db(&db, "p1", d.id).unwrap();
+        assert!(!wrote2, "second call must not clobber");
+        assert_eq!(fs::read_to_string(&path).unwrap(), first,
+            "content preserved on the non-clobber path");
+    }
+
+    #[test]
+    fn create_starter_command_name_matches_frontend_invoke() {
+        // Real source-scan trip-wire (R2-7) for the §3.1 MISMATCH class. The
+        // previous version asserted a literal against ITSELF (tautology — it
+        // could never fail on a rename). This reads the two OTHER call-sites of
+        // the command name and asserts each contains the literal, so renaming
+        // the Rust command without updating BOTH the FE invoke and the lib.rs
+        // registration reds this test — the exact silent regression it claims to
+        // trip on. (Same established pattern as the K-2/K-3 source-scan pins.)
+        const COMMAND_NAME: &str = "create_starter_diagram_file";
+
+        // CARGO_MANIFEST_DIR == launcher/src-tauri; its parent is launcher/.
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let launcher_dir = manifest_dir
+            .parent()
+            .expect("CARGO_MANIFEST_DIR must have a parent (launcher/)");
+
+        // 1) FE invoke — DiagramsTab.svelte must `invoke('create_starter_diagram_file'`.
+        let fe_path = launcher_dir
+            .join("src")
+            .join("lib")
+            .join("project-state")
+            .join("DiagramsTab.svelte");
+        let fe_src = std::fs::read_to_string(&fe_path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {}", fe_path.display(), e));
+        let fe_needle = format!("invoke('{}'", COMMAND_NAME);
+        assert!(
+            fe_src.contains(&fe_needle),
+            "DiagramsTab.svelte must invoke '{}' (looked for `{}`); a Rust-side \
+             rename without updating the FE silently re-breaks the starter-file flow",
+            COMMAND_NAME,
+            fe_needle,
+        );
+
+        // 2) Registration — lib.rs must list the command in the invoke_handler.
+        let reg_path = manifest_dir.join("src").join("lib.rs");
+        let reg_src = std::fs::read_to_string(&reg_path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {}", reg_path.display(), e));
+        let reg_needle = format!("create_starter_diagram_file");
+        assert!(
+            reg_src.contains(&reg_needle),
+            "lib.rs must register '{}' in generate_handler!; an unregistered \
+             command makes the FE invoke throw at runtime",
+            COMMAND_NAME,
+        );
+    }
+
+    #[test]
+    fn create_starter_file_rejects_wrong_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = make_db_with_project("p1", "Acme", dir.path());
+        let d = db
+            .register_diagram("p1", "x", "mermaid", ".claude/diagrams/g/x.mmd", "g")
+            .unwrap();
+        // A caller claiming a different project id for p1's diagram must fail.
+        let err = create_starter_diagram_file_with_db(&db, "p2", d.id).unwrap_err();
+        assert!(err.contains("does not belong"), "err: {}", err);
     }
 
     #[test]

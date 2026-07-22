@@ -14,7 +14,8 @@
   // `routes/project/[id]/+page.svelte`.
 
   import { onDestroy, onMount } from 'svelte';
-  import { listen, safeInvoke } from '$lib/tauri';
+  import { listen, invoke, safeInvoke } from '$lib/tauri';
+  import { toast } from '$lib/stores/toast';
   import type { KgSyncStatus, KgSyncView } from '$lib/types/launcher';
 
   interface Props {
@@ -39,11 +40,15 @@
     if (retrying) return;
     retrying = true;
     try {
-      await safeInvoke<void>('retry_kg_sync', { projectId });
+      // Strict invoke so a failed retry surfaces (safeInvoke swallowed the
+      // rejection, making this catch dead and the button a silent no-op).
+      await invoke<void>('retry_kg_sync', { projectId });
       expanded = false;
       dismissed = false;
     } catch (e) {
-      if (view) view = { ...view, error_message: e instanceof Error ? e.message : String(e) };
+      const msg = e instanceof Error ? e.message : String(e);
+      if (view) view = { ...view, error_message: msg };
+      toast.error(`KG sync retry failed: ${msg}`);
     } finally {
       retrying = false;
     }

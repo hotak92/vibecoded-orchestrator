@@ -236,3 +236,78 @@ def _disable_hub_resolver_in_tests(request):
                 os.environ.pop("VCT_DISABLE_HUB_RESOLVER", None)
             else:
                 os.environ["VCT_DISABLE_HUB_RESOLVER"] = prev
+
+
+# Test files that EXPLICITLY exercise the real hub poster (``post_rl_event`` /
+# ``post_rl_prune``) against a mock HTTP server and assert the POST happens — the
+# WP-R hermeticity guard must be OFF for these so their mock-hub round-trip fires.
+# This is the sibling of ``_RESOLVER_OPT_OUT_FILES`` for the hub-write axis; keep
+# it explicit so an accidentally-broken poster test surfaces loudly.
+_RL_HUB_WRITE_OPT_OUT_FILES = frozenset({
+    "test_v0247_hub_writer.py",  # directly tests post_rl_event/post_rl_prune HTTP
+})
+
+
+@pytest.fixture(autouse=True)
+def _disable_rl_hub_writes_in_tests(request):
+    """WP-R (2026-07-22): make RL telemetry hermetic — no test may write into the
+    real ``~/.vct/launcher.db`` ``rl_events`` table via vct-hub.
+
+    Root cause this closes: several suites drive a REAL code-search entry point
+    (``search_code_graph`` MCP tool, ``CodeGraphQuery.search_by_concept`` CLI)
+    with only Weaviate + the embedder stubbed. Those entry points call the
+    SHARED retrieval-telemetry emitter, which — when a local launcher hub is
+    running and ``RL_LOCAL_LOGGING_DISABLED`` is unset (the default in a bare
+    test run) — POSTs the fixture event to the live hub. Result: FIXTURE junk
+    (dim 3/4 codesage ``code_hook``/``code_search`` events with titles like
+    ``a.f`` / ``b.g`` / ``mod.self_fn``) landed in the live ``rl_events`` table
+    on EVERY test run — thousands of accumulated junk rows plus a fresh trickle
+    each run on any install where the hub is up during tests.
+
+    The structural fix is hermeticity: this autouse fixture sets
+    ``RL_HUB_POST_DISABLED=1`` for the WHOLE suite, which the sole real-hub
+    poster (``claude_mcp_servers.rl_client.hub_writer`` — both ``post_rl_event``
+    and ``post_rl_prune``) honours by short-circuiting to its "event lost"
+    soft-fail return. Tests that WANT to assert the emitted envelope already
+    inject a fake ``hub_post_fn`` into ``RLTelemetryWriter`` (e.g. the G3 / R2-11
+    / telemetry-triple suites) — those are unaffected because they never reach
+    the default poster. This mirrors the sibling
+    ``_disable_hub_resolver_in_tests`` convention (an autouse env-hardening
+    fixture is how this repo isolates the hub from tests).
+
+    Belt-and-braces: ``hub_writer`` ALSO checks ``PYTEST_CURRENT_TEST`` directly,
+    so any test that reaches the poster is covered even if this fixture were
+    somehow bypassed. Because that leg is unconditional under pytest, the files
+    in ``_RL_HUB_WRITE_OPT_OUT_FILES`` — which DO want to exercise the real
+    poster against a mock hub — receive a ``VCT_HUB_ALLOW_TEST_POST=1`` sentinel
+    that ``hub_writer._in_test_context`` treats as an explicit override, so those
+    (and only those) files bypass BOTH legs. The fixture restores the prior env
+    in ``finally`` so a test that sets the vars itself isn't clobbered.
+    """
+    test_file = request.node.fspath.basename
+    if test_file in _RL_HUB_WRITE_OPT_OUT_FILES:
+        # Poster-under-test: clear the disable AND set the explicit override so
+        # the PYTEST_CURRENT_TEST leg is neutralised for this file's mock-hub
+        # round-trip assertions.
+        prev_disable = os.environ.pop("RL_HUB_POST_DISABLED", None)
+        prev_allow = os.environ.get("VCT_HUB_ALLOW_TEST_POST")
+        os.environ["VCT_HUB_ALLOW_TEST_POST"] = "1"
+        try:
+            yield
+        finally:
+            if prev_disable is not None:
+                os.environ["RL_HUB_POST_DISABLED"] = prev_disable
+            if prev_allow is None:
+                os.environ.pop("VCT_HUB_ALLOW_TEST_POST", None)
+            else:
+                os.environ["VCT_HUB_ALLOW_TEST_POST"] = prev_allow
+        return
+    prev = os.environ.get("RL_HUB_POST_DISABLED")
+    os.environ["RL_HUB_POST_DISABLED"] = "1"
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("RL_HUB_POST_DISABLED", None)
+        else:
+            os.environ["RL_HUB_POST_DISABLED"] = prev

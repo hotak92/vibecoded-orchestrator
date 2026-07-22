@@ -34,6 +34,10 @@
     externally_managed: boolean;
     adoption_mode: 'unresolved' | 'adopt' | 'parallel' | 'refuse';
     container_name: string | null;
+    // True when the pinned container exists per `podman ps` but its main
+    // PID is dead (state-DB desync). Mirrors `ServiceRuntimeState.zombie`
+    // in launcher/src-tauri/src/commands/lifecycle.rs.
+    zombie?: boolean;
   }
   interface ServicesRuntimeSnapshot {
     services: ServiceRuntimeState[];
@@ -192,6 +196,22 @@
   }
   async function restartOne(name: string) {
     await runServiceAction(name, 'service_restart');
+  }
+
+  // Force-recover a zombie container (podman state-DB desync: `podman ps`
+  // says "Up" but the main PID is dead). Wired to `recover_zombie`, which
+  // force-removes the stale record and re-brings-up the stack.
+  async function recoverZombie(containerName: string) {
+    loading = true;
+    error = null;
+    try {
+      await invoke('recover_zombie', { containerName });
+      await refresh();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      loading = false;
+    }
   }
 
   async function resetAdoption() {
@@ -426,6 +446,12 @@
               {#if svc.externally_managed}
                 <span class="tag">external</span>
               {/if}
+              {#if svc.zombie}
+                <span
+                  class="tag tag-zombie"
+                  title="The container exists but its main process is dead (state-DB desync). Use Recover to force-remove and restart it."
+                >stuck</span>
+              {/if}
             </td>
             <td>{svc.port}</td>
             <td
@@ -469,6 +495,16 @@
               >
                 Re-detect
               </button>
+              {#if svc.zombie && svc.container_name}
+                <button
+                  onclick={() => svc.container_name && recoverZombie(svc.container_name)}
+                  disabled={loading}
+                  class="recover"
+                  title="Force-remove the stuck container and restart it"
+                >
+                  Recover
+                </button>
+              {/if}
             </td>
           </tr>
         {/each}
@@ -655,6 +691,15 @@
     border-radius: 3px;
     background: rgba(245, 158, 11, 0.2);
     color: #fbbf24;
+  }
+  .tag-zombie {
+    background: rgba(255, 79, 160, 0.18);
+    color: var(--color-pink, #ff4fa0);
+    font-weight: 600;
+  }
+  button.recover {
+    border-color: rgba(255, 79, 160, 0.5);
+    color: var(--color-pink, #ff4fa0);
   }
   .mode-cell {
     font-family: monospace;

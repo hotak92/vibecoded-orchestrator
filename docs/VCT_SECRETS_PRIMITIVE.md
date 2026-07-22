@@ -418,6 +418,17 @@ delete it once you've confirmed nothing references the old path.
 | Audit log append-only | File mode 600, owned by user; written with `O_APPEND` |
 | No network | Everything is local disk. No phone-home. |
 
+**Keychain connection posture (Linux, tier 1).** On Linux the launcher and hub
+hold a single, process-wide Secret Service (D-Bus) connection for keychain reads
+and writes, mutex-guarded and reconnected on a broken session, rather than
+opening and closing a session per operation. It is closed gracefully on hub
+shutdown and launcher exit (bounded, so it never stalls exit — if the connection
+is in use past the deadline, teardown is left to normal process exit). The
+established pacing, memoization, and locked-collection probe guards are unchanged
+around it, and the on-disk attribute/label scheme is byte-identical to the
+`keyring`-crate format so entries written either way are interchangeable.
+Windows and macOS keychain access is unchanged.
+
 ---
 
 ## What this primitive does NOT do

@@ -176,11 +176,9 @@
   let loadedCg = $state('');
 
   // v0.2.46 Decision B — per-project SHARED_KG_READ_DISABLED toggle.
-  // Symmetric mirror of the write-disable toggle (which has the same
-  // setter wired through `projectsStore.setSharedKgWriteDisabled` but
-  // no UI yet). When `true`, this project's hybrid_search /
-  // semantic_graph_search stop searching the shared KG. Default false
-  // (reads on, asymmetric-by-default).
+  // When `true`, this project's hybrid_search / semantic_graph_search
+  // stop searching the shared KG. Default false (reads on,
+  // asymmetric-by-default).
   let sharedKgReadDisabled = $state(false);
   let savingReadDisabled = $state(false);
 
@@ -212,6 +210,42 @@
       target.checked = sharedKgReadDisabled;
     } finally {
       savingReadDisabled = false;
+    }
+  }
+
+  // Per-project SHARED_KG_WRITE_DISABLED toggle. When `true`,
+  // store_knowledge_node(scope='shared') from this project is refused
+  // (the write reroute returns an error rather than silently landing in
+  // the per-project KG). Default false (writes on). Symmetric mirror of
+  // the read gate above.
+  let sharedKgWriteDisabled = $state(false);
+  let savingWriteDisabled = $state(false);
+
+  async function loadSharedKgWriteDisabled() {
+    try {
+      sharedKgWriteDisabled = await invoke<boolean>('get_shared_kg_write_disabled_cmd', { projectId });
+    } catch {
+      sharedKgWriteDisabled = false;
+    }
+  }
+
+  async function toggleSharedKgWriteDisabled(event: Event) {
+    const target = event.currentTarget as HTMLInputElement;
+    const newValue = target.checked;
+    savingWriteDisabled = true;
+    try {
+      await projectsStore.setSharedKgWriteDisabled(projectId, newValue);
+      sharedKgWriteDisabled = newValue;
+      toast.success(
+        newValue
+          ? 'Blocked shared KG writes from this project'
+          : 'Re-enabled shared KG writes',
+      );
+    } catch (e) {
+      toast.error(e);
+      target.checked = sharedKgWriteDisabled;
+    } finally {
+      savingWriteDisabled = false;
     }
   }
 
@@ -327,10 +361,12 @@
   onMount(load);
   onMount(loadDetectedKgClasses);
   onMount(loadSharedKgReadDisabled);
+  onMount(loadSharedKgWriteDisabled);
   $effect(() => {
     if (projectId) {
       void load();
       void loadSharedKgReadDisabled();
+      void loadSharedKgWriteDisabled();
     }
   });
 </script>
@@ -526,14 +562,11 @@
         </button>
       {/if}
 
-      <!-- v0.2.46 Decision B — symmetric READ gate. Hidden for the
-           orchestrator-root project (which IS the shared KG; excluding
-           it from its own reads makes no sense). For peer projects,
-           offers an opt-out toggle so users can run a project in
-           strict-isolation mode (no shared KG fan-out on
-           hybrid_search / semantic_graph_search). Default off (reads
-           on). The write-disable toggle has the same DB+env semantics
-           but no UI yet; both share the same persistence path. -->
+      <!-- v0.2.46 Decision B — symmetric READ + WRITE gates. Hidden for
+           the orchestrator-root project (which IS the shared KG; gating
+           it against its own collection makes no sense). For peer
+           projects, offer opt-out toggles so a project can run in
+           strict-isolation mode. Default off (reads + writes on). -->
       {#if !identity.is_orchestrator_root}
         <label class="ps-shared-kg-read-toggle">
           <input
@@ -549,6 +582,23 @@
               fanning out into <code>{sharedKgName}</code> for this
               project. The project's own primary KG and any peer-grant
               access remain searchable. Default off.
+            </span>
+          </span>
+        </label>
+        <label class="ps-shared-kg-read-toggle">
+          <input
+            type="checkbox"
+            checked={sharedKgWriteDisabled}
+            disabled={savingWriteDisabled}
+            onchange={toggleSharedKgWriteDisabled}
+          />
+          <span>
+            Block this project from writing to the shared KG
+            <span class="ps-form-hint" style="display: block; margin-top: 2px;">
+              When enabled, <code>store_knowledge_node(scope='shared')</code>
+              from this project is refused instead of writing to
+              <code>{sharedKgName}</code>. The project's own primary KG
+              writes are unaffected. Default off.
             </span>
           </span>
         </label>

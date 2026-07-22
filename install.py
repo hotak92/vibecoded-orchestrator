@@ -240,6 +240,12 @@ _INSTALL_OWNED_CONDITION_PREFIXES = (
     "schema_migration_required_",
     "deprecated_mcp_",
     "bundle_pin_drift_",
+    # Stale systemd user-unit retirement record (one per retired unit,
+    # ``stale_unit_retired_<unit-slug>``). Owned so the record drop-when-absent
+    # self-clears on the next single-final-write once the retirement is history
+    # (the unit is gone — it won't be re-detected, so the record served its
+    # one-time purpose of telling the user what changed + the restore command).
+    "stale_unit_retired_",
 )
 
 # Hygiene (v0.2.75): keep the Popen handles of deliberately-DETACHED children
@@ -4016,6 +4022,14 @@ def _run_lightweight(args: argparse.Namespace) -> int:
         _check_search_mcp_env_obsolete(_lightweight_deferral)
     _materialize_boot_service(PROJECT_ROOT, None, args,
                               deferral_report=_lightweight_deferral)
+    # NB (v0.3.0 L-3): the stale-unit reconcile is deliberately NOT called on
+    # the lightweight path. The launcher's lightweight argv is
+    # `install.py --quiet --lightweight [...]` with NO `--update`
+    # (installer.rs::build_lightweight_install_argv), so a reconcile call here
+    # would gate on `args.update` (False) and no-op — dead code. The launcher's
+    # real "Update orchestrator" (Settings→Updates) runs `install.py --update`
+    # (installer.rs::update_orchestrator), which is covered by the single call
+    # site in main(). One live wiring, no dead second leg.
     # v0.2.37: seed the launcher's install_path resolver on lightweight
     # too — the lightweight path is exactly what `--lightweight-old-path`
     # uses to relocate an install, so this is the canonical moment to
@@ -6990,6 +7004,7 @@ def main() -> int:
     # final write happens at line ~2181 below).
     _materialize_boot_service(PROJECT_ROOT, sysinfo, args,
                               deferral_report=_deferral_report)
+    _reconcile_stale_units_step(PROJECT_ROOT, args, _deferral_report)
 
     # v0.2.37 (2026-05-27): seed the launcher's install_path resolver
     # before next boot. The launcher's canonical
@@ -22062,6 +22077,60 @@ def _materialize_boot_service(
         _log_install_event(
             "boot-service", "warn",
             f"boot-service materialization raised: {exc.__class__.__name__}: {exc}",
+        )
+
+
+def _reconcile_stale_units_step(
+    install_root: Path,
+    args: argparse.Namespace,
+    deferral_report: Optional["DeferralReport"],
+) -> None:
+    """Thin shim over vco_lib.unit_reconcile.reconcile_stale_units.
+
+    Runs on the UPDATE path only (fresh installs create no stale units).
+    ALL logic lives in vco_lib.unit_reconcile; this shim only supplies the
+    install-context glue (the ``args.update`` gate + a _log_install_event
+    adapter) so install.py's main() stays a thin sequential flow. Linux-only,
+    graceful no-op elsewhere and when systemctl is absent.
+
+    Failure semantics (two DIFFERENT rules):
+      - N-5 loud-fail on import: ``unit_reconcile`` is a shipped vco_lib module;
+        an ``ImportError`` means a BROKEN install and must reach the user (per
+        the "loud-fail, never silent-fallback, on vco_lib imports" rule) — it is
+        NOT swallowed here.
+      - Soft-fail on the RECONCILE run itself: a runtime error inside the pass
+        (OSError, etc.) NEVER blocks the update — it is logged and swallowed.
+    """
+    # Fresh install (no --update) → nothing to reconcile.
+    if not getattr(args, "update", False):
+        return
+
+    # N-5: import OUTSIDE the soft-fail try — a missing/broken shipped module is
+    # an install-integrity failure that must surface loudly, not degrade to a
+    # warn. Only the reconcile RUN below is best-effort.
+    from vco_lib.unit_reconcile import reconcile_stale_units
+
+    # N-8: thread the reconcile log level into the install-event phase. The
+    # adapter accepts a ``level=`` keyword (unit_reconcile's _log opts in via it);
+    # a warning is logged as phase="warn", not flattened to "ok".
+    def _log_adapter(msg: str, level: str = "info") -> None:
+        phase = "warn" if level in ("warning", "warn", "error", "critical") else "ok"
+        _log_install_event("unit-reconcile", phase, msg)
+
+    try:
+        result = reconcile_stale_units(
+            install_root, deferral_report=deferral_report, log=_log_adapter,
+        )
+        if result.retired:
+            _log_install_event(
+                "unit-reconcile", "ok",
+                f"retired {len(result.retired)} stale systemd user unit(s)",
+                data={"units": [a.unit_name for a in result.retired]},
+            )
+    except Exception as exc:  # noqa: BLE001 — reconcile RUN never blocks the update
+        _log_install_event(
+            "unit-reconcile", "warn",
+            f"stale-unit reconcile raised: {exc.__class__.__name__}: {exc}",
         )
 
 

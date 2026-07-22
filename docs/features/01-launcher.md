@@ -125,7 +125,10 @@ Six commands cover the module catalog + lifecycle surface: `list_module_catalog(
 Settings split cleanly between global (one row per key in `db::settings`) and per-project (one row per `(project, module, key)` in `module_settings`). Secrets never live here — see [Secrets Management](#secrets-management).
 
 ### Settings Panel (`SettingsPanel.svelte`)
-Global settings: profile, downloads path, about. Backed by `db::settings` table (key/value JSON store).
+Global settings: profile, about. Backed by `db::settings` table (key/value JSON store).
+
+### Preferences → Startup: "Start background service on login"
+`/preferences` carries a **Startup** section with a single **"Start background service on login"** toggle. It registers/unregisters the `vct-hub` boot-autostart unit (cross-OS: systemd-user / launchd / Windows Scheduled Task) via `get_hub_boot_autostart` / `set_hub_boot_autostart`, wrapping `hub_status::{boot_status, register_boot, unregister_boot}`. It starts the background hub (not the launcher GUI) on login, so hooks / MCPs / scripts reach a resolver even before the GUI is opened. Tri-state: **enabled** / **disabled** / **unsupported** — when the host's init system can't be inspected the toggle is disabled with a hint rather than claiming a state it can't honor.
 
 ### Per-project Settings
 `module_settings` table stores per-(project, module) non-secret settings as JSON-encoded values. Unique constraint on `(project_id, module_id, setting_key)`.
@@ -137,7 +140,7 @@ Global settings: profile, downloads path, about. Backed by `db::settings` table 
 `project_codegraph_bindings` tracks collection prefix, embedding model, last analyzed git SHA, and an `enabled` toggle. Used by the `/codegraph` UI to show analysis currency.
 
 ### Global Settings Store
-`stores/settings.ts` provides a reactive Svelte store backed by `invoke('get_setting')` / `invoke('set_setting')`. Changes persist immediately to SQLite.
+Global settings persist immediately to SQLite via `invoke('get_setting')` / `invoke('set_setting')`. Each setting reads its value back from the backend on load and reverts the control on a failed write — there is no localStorage-only settings store.
 
 ---
 
@@ -270,6 +273,7 @@ Migration emits phase-level `volumes://migrate-progress` Tauri events so the UI 
 - **Runtime detection** (`services/runtime.rs`): podman-first universal preference, with macOS Podman Machine handling (`podman machine list` to detect a started VM and fall through to Docker if not).
 - **Adoption modes** (`services/adoption.rs`): when a foreign service is detected on a default port, `ExternalServicesDialog.svelte` prompts the user with `unresolved | adopt | parallel | refuse` modes. The chosen mode is written to `~/.vct/services.toml` — the same lock file install.py uses, so the launcher and installer never disagree.
 - **Frontend events**: `vct-services-lifecycle` (start/stop/restart progress) and `vct-external-services-detected` (adoption prompt trigger). Lets the UI render real-time state without polling.
+- **Zombie recovery**: when a service's runtime state reports `zombie: true` (a container stuck in a wedged state), the Services route renders a **"stuck"** badge in the Status cell and a **Recover** button (shown only when the service is zombie and has a container name). Recover calls `recover_zombie`; on failure it surfaces a page banner and refreshes the services snapshot.
 
 ---
 
@@ -611,7 +615,7 @@ Hub `cli_api.rs` mirrors audit operations with `via: "cli"` tagged in detail JSO
 - **Rebuild gating**: diff between current and target SHA is inspected. If only `launcher/src-tauri/**` changed → cargo build. If only `launcher/src/**` changed → npm build. Both → both. Saves 2-5 minutes when the change is frontend-only.
 - **Restart sequence**: writes `force_quit=true` to a transient state file, exec's the new binary, parent exits. The Quit confirmation dialog reads `force_quit` and skips the prompt.
 
-UI surface: `/preferences/updates` route with a manual check button + last-check timestamp + pending-pull preview.
+UI surface: `/preferences/updates` route with a manual check button + last-check timestamp + pending-pull preview. Its Settings section carries two toggles that read back from the backend on load and toast + revert on a failed write: the **auto-check** toggle (`get/set_auto_check_enabled`) and an **auto-retry failed module installs** opt-out (`get/set_auto_retry_failed_installs_setting`). The auto-retry behavior — retrying a failed module install on the next orchestrator update — runs by default; the toggle lets the user opt out.
 
 ### Re-Run Onboarding from Preferences
 `/preferences` includes a "Re-run onboarding" button that clears the `vct.onboarding_complete` localStorage flag and reloads. The 4-step wizard fires again; existing projects, settings, and secrets are unaffected. Useful after a hardware change (GPU added, RAM upgraded) when the user wants to re-run the infrastructure-detection step.

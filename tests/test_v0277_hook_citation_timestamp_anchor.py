@@ -10,10 +10,19 @@ and the TTL sweep deleted them unlabeled — ~87% of retrievals (the hook cohort
 lost their citation label (6 citation events vs 16,341 retrievals live).
 
 The fix (within the existing F-QUEUE design, no schema change, no opt-out change):
-when a ``source == "hook"`` payload's query-match fails, ``drain_session`` anchors
-the answer window by TIMESTAMP — the first assistant message at/after the
-retrieval's ``ts_ms`` — and the existing 25k gate + terminal floor apply
-unchanged.
+when a ``source in ("hook", "mcp")`` payload's query-match fails,
+``drain_session`` anchors the answer window by TIMESTAMP — the first assistant
+message at/after the retrieval's ``ts_ms`` — and the existing 25k gate + terminal
+floor apply unchanged.
+
+G5 (2026-07-22): the timestamp fallback was EXTENDED from hook-only to also cover
+the ``mcp`` source (see ``rl_drain_citations.py`` ~line 211). mcp_interactive was
+the single worst under-labeled cohort (five citation events ever) because its
+in-process monitor rarely reaches the 25k gate; a surviving mcp pending file at
+drain time means the monitor did not fire, exactly the case the drain must
+recover. The extension stays BOUNDED to the two known internal sources — an
+unknown/foreign ``source`` value is still left (no timestamp anchor), so a future
+source cannot silently inherit the fallback without an explicit code change.
 
 Tests aim at the REAL drain entry point (``rl_drain_citations.drain_session``)
 with mocked transcript fixtures.
@@ -21,10 +30,13 @@ with mocked transcript fixtures.
 Coverage:
   * ACT — a hook-cohort payload whose query has NO transcript tool_use match
     still gets computed via the timestamp window.
+  * ACT — an mcp-cohort payload whose query-match fails is ALSO computed via the
+    timestamp window (the G5 extension).
   * LEAVE-ALONE — a transcript-matched (query) payload takes the exact current
-    path; a NON-hook (mcp) payload with a failed query-match is still left;
-    a hook payload with no assistant message after ts_ms is still left (discarded
-    eventually by TTL, exactly as today).
+    path; an UNKNOWN/foreign ``source`` value with a failed query-match is still
+    left (the extension is bounded to hook+mcp); a hook payload with no assistant
+    message after ts_ms is still left (discarded eventually by TTL, exactly as
+    today).
 """
 
 from __future__ import annotations
@@ -222,9 +234,15 @@ class TestLeaveAloneCurrentPaths:
         # Query-anchored window starts at the matched search → includes answer_a.
         assert "QUERYANCHORED" in captured["answer"]
 
-    def test_non_hook_source_with_failed_match_is_left(self, tmp_path, monkeypatch) -> None:
-        """An mcp-source payload whose query-match fails is STILL left — the
-        timestamp fallback is hook-only, so non-hook behaviour is unchanged."""
+    def test_mcp_source_with_failed_match_is_computed(self, tmp_path, monkeypatch) -> None:
+        """G5 contract: an mcp-source payload whose query-match fails is now
+        RECOVERED via the timestamp anchor (previously it was left). mcp_interactive
+        was the worst under-labeled cohort; the drain must recover a surviving mcp
+        pending file (= its in-process monitor never fired).
+
+        Red-proof: reverting ``rl_drain_citations.py`` line ~222 to
+        ``payload.get("source") in ("hook",)`` makes this assert 0-computed and
+        1-left → deterministic FAIL, so the pin genuinely bites the mcp leg."""
         monkeypatch.setenv("RL_MIN_ANSWER_TOKENS_FOR_CITATION", "10")
         ts_ms = _now_ms()
         cp.stage_pending(
@@ -245,7 +263,39 @@ class TestLeaveAloneCurrentPaths:
         summary = drain.drain_session(
             "s", str(transcript), project_root=tmp_path, compute_fn=compute,
         )
-        assert seen["called"] == 0, "non-hook payload must NOT use the timestamp anchor"
+        assert seen["called"] == 1, "mcp payload must use the timestamp anchor (G5)"
+        assert seen["task_id"] == "mcp_task"
+        assert summary["computed"] == 1
+        assert summary["left"] == 0
+        assert len(cp.list_pending_for_session("s", tmp_path)) == 0
+
+    def test_unknown_source_with_failed_match_is_left(self, tmp_path, monkeypatch) -> None:
+        """The timestamp fallback is BOUNDED to the two known internal sources
+        (hook, mcp). A foreign/unknown ``source`` value whose query-match fails is
+        STILL left — a future source cannot silently inherit the fallback without
+        an explicit code change. This is the leave-alone half of the G5 extension."""
+        monkeypatch.setenv("RL_MIN_ANSWER_TOKENS_FOR_CITATION", "10")
+        ts_ms = _now_ms()
+        cp.stage_pending(
+            session_id="s", task_id="foreign_task", seq=None,
+            query="query with no transcript match",
+            ctx={"nodes": [{"title": "A", "n_emb": [0.1]}]},
+            source="some_future_source", project_root=tmp_path,
+        )
+        _force_pending_ts(cp.list_pending_for_session("s", tmp_path)[0], ts_ms)
+
+        big_answer = "synthesized answer text here " * 5
+        transcript = tmp_path / "t.jsonl"
+        _write_transcript(transcript, [
+            _assistant_tool("hybrid_search", {"query": "unrelated"}, ts_ms=ts_ms - 500),
+            _assistant_text(big_answer, ts_ms=ts_ms + 500),
+        ])
+
+        seen, compute = _make_compute_probe()
+        summary = drain.drain_session(
+            "s", str(transcript), project_root=tmp_path, compute_fn=compute,
+        )
+        assert seen["called"] == 0, "unknown source must NOT use the timestamp anchor"
         assert summary["computed"] == 0
         assert summary["left"] == 1
         assert len(cp.list_pending_for_session("s", tmp_path)) == 1

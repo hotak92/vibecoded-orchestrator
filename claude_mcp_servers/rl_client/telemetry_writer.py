@@ -94,6 +94,105 @@ _ONLINE_TRAINING_OPT_OUT_ENV_GLOBAL = "RL_ONLINE_TRAINING_DISABLED_GLOBAL"
 _EVENT_TYPE_RETRIEVAL = "rl_retrieval"
 _EVENT_TYPE_CITATIONS = "rl_citations"
 
+# WP-Q item 2 (was R2-11): client-side payload size cap — a PATHOLOGICAL-CASE
+# BACKSTOP, not the normal path. The hub's rl_events POST handler
+# (vct-hub/src/rl_events_api.rs) now sets an EXPLICIT 16 MiB ``DefaultBodyLimit``
+# on the ingest route (raised from axum's 2 MB default, per the user rule "move
+# the limit, never the data": embedding-heavy events — a wide code retrieval
+# with 2048-dim node vectors + near-chunk embeddings, or an answer-heavy
+# dual-write citation — can legitimately exceed 2 MB, and their labels must not
+# be lost). This client cap sits JUST UNDER that 16 MiB hub limit so a genuinely
+# pathological event still degrades LOUDLY: if serialized bytes exceed the cap we
+# DROP the OPTIONAL heavy embedding fields in a documented priority order so the
+# CORE event (citations/cosine_sims/scalars — the trainable label itself) always
+# survives, emitting a WARNING. Normal events never approach either cap — the
+# trim never fires in practice; it exists only so a runaway event never silently
+# 413s or produces a well-formed-but-untrainable row. Set below the hub's
+# 16 MiB (16,777,216 B) with ~777 KB headroom for the JSON envelope + HTTP
+# framing.
+_HUB_PAYLOAD_MAX_BYTES_ENV = "RL_HUB_PAYLOAD_MAX_BYTES"
+_HUB_PAYLOAD_MAX_BYTES_DEFAULT = 16_000_000  # ~15.26 MiB; hub cap is 16 MiB
+
+# Trim priority (dropped in this ORDER until the payload fits — never the core
+# event): NEAR-CHUNK/link embeddings first (per-node ``linked_embs`` — the
+# bulkiest field, up to 5+ vectors per node, and the trainer zero-pads when the
+# whole field is absent), THEN answer embeddings (``answer_chunk_embs`` —
+# needed only for cross-slot label re-derivation). This ORDER was corrected in
+# WP-M (linked_embs then answer_chunk_embs; core net inputs never trimmed) —
+# do NOT reorder.
+#
+# NEVER-trim class: alongside the label fields (citations, cosine_sims,
+# literal_cited, cross_encoder_cited, scalars), the CORE NET INPUTS are
+# untrimmable — ``query_emb`` (slot 0) and each node's own ``emb`` (the
+# matched-node vector, entity slot 1). An event without them is well-formed
+# but UNTRAINABLE (the sample extractor skips embedless nodes), which is
+# worse than a loud 413: the row looks healthy and poisons corpus stats.
+# If the event still exceeds the cap after both optional trims, it is posted
+# anyway and the hub's 413 surfaces at WARNING via hub_writer.
+#
+# ``linked_embs`` is only ever deleted WHOLE-FIELD (never element-wise), so
+# its index alignment with ``linked_type_names`` can never be corrupted.
+_TRIM_STEPS_NODE_EMB = ("linked_embs",)
+_TRIM_STEPS_EVENT_EMB = ("answer_chunk_embs",)
+
+
+def _resolve_hub_payload_max_bytes() -> int:
+    """Resolve the payload byte cap from env, else the conservative default.
+    A malformed/zero/negative override falls back to the default (a bad tunable
+    must never disable the guard)."""
+    try:
+        val = int(os.environ.get(_HUB_PAYLOAD_MAX_BYTES_ENV, "") or _HUB_PAYLOAD_MAX_BYTES_DEFAULT)
+    except (TypeError, ValueError):
+        return _HUB_PAYLOAD_MAX_BYTES_DEFAULT
+    return val if val > 0 else _HUB_PAYLOAD_MAX_BYTES_DEFAULT
+
+
+def _serialized_len(event_json: Dict[str, Any]) -> int:
+    """Byte length of the JSON serialization (UTF-8), the size the hub measures."""
+    return len(json.dumps(event_json).encode("utf-8"))
+
+
+def _trim_event_to_payload_cap(event_json: Dict[str, Any], max_bytes: int) -> "tuple[Dict[str, Any], List[str]]":
+    """Drop OPTIONAL heavy embedding fields until the serialized event fits
+    ``max_bytes`` (R2-11). Returns (possibly-mutated event, list of dropped
+    field labels for logging). NEVER drops the core label fields NOR the core
+    net inputs (``query_emb``, per-node ``emb``) — if even the stripped event
+    is over-cap the caller still posts it (better a loud 413 on a genuinely
+    pathological event than a well-formed-but-untrainable row).
+
+    Priority order (documented in the module constants): per-node
+    ``linked_embs`` (whole-field) first, then ``answer_chunk_embs``.
+    """
+    if _serialized_len(event_json) <= max_bytes:
+        return event_json, []
+
+    dropped: List[str] = []
+
+    # 1) Near-chunk (per-node) embeddings — the bulk. Strip from every node.
+    nodes = event_json.get("nodes")
+    if isinstance(nodes, list) and nodes:
+        for field in _TRIM_STEPS_NODE_EMB:
+            removed_any = False
+            for rec in nodes:
+                if isinstance(rec, dict) and field in rec:
+                    del rec[field]
+                    removed_any = True
+            if removed_any:
+                dropped.append(f"nodes.{field}")
+            if _serialized_len(event_json) <= max_bytes:
+                return event_json, dropped
+
+    # 2) Event-level embeddings — answer chunk embs. (query_emb is in the
+    # never-trim class and is deliberately absent from _TRIM_STEPS_EVENT_EMB.)
+    for field in _TRIM_STEPS_EVENT_EMB:
+        if field in event_json:
+            del event_json[field]
+            dropped.append(field)
+            if _serialized_len(event_json) <= max_bytes:
+                return event_json, dropped
+
+    return event_json, dropped
+
 
 def _env_truthy(name: str) -> bool:
     """True iff env var ``name`` is set to a truthy value ({true,1,yes,on}).
@@ -324,6 +423,9 @@ class RLTelemetryWriter:
         session_id: str = "",
         fire_reason: str = "",
         window_tokens: int = 0,
+        answer_chunk_embs: "Optional[List[List[float]]]" = None,
+        answer_chunk_hashes: "Optional[List[str]]" = None,
+        soft_label: bool = False,
     ) -> None:
         """Log a citation event to launcher.db (via hub) + (if consented) upload queue.
 
@@ -369,6 +471,9 @@ class RLTelemetryWriter:
                     session_id=session_id,
                     fire_reason=fire_reason,
                     window_tokens=window_tokens,
+                    answer_chunk_embs=answer_chunk_embs,
+                    answer_chunk_hashes=answer_chunk_hashes,
+                    soft_label=soft_label,
                 )
                 envelope = self._wrap_for_hub("citation", task_id, task_type, event)
                 self._last_envelope = envelope
@@ -388,6 +493,9 @@ class RLTelemetryWriter:
                 session_id=session_id,
                 fire_reason=fire_reason,
                 window_tokens=window_tokens,
+                answer_chunk_embs=answer_chunk_embs,
+                answer_chunk_hashes=answer_chunk_hashes,
+                soft_label=soft_label,
             )
             _enqueue(self._etype_citations, payload)
 
@@ -499,6 +607,9 @@ class RLTelemetryWriter:
         session_id: str = "",
         fire_reason: str = "",
         window_tokens: int = 0,
+        answer_chunk_embs: "Optional[List[List[float]]]" = None,
+        answer_chunk_hashes: "Optional[List[str]]" = None,
+        soft_label: bool = False,
     ) -> Dict[str, Any]:
         """Build the queue-bound payload for a citation event.
 
@@ -545,6 +656,17 @@ class RLTelemetryWriter:
             payload["fire_reason"] = str(fire_reason)
         if window_tokens:
             payload["window_tokens"] = int(window_tokens)
+        # G4 (2026-07-22): mirror the answer-chunk embeddings + hashes into the
+        # upload-queue payload so a consented cloud training corpus carries the
+        # same replayable answer artifacts as the local launcher.db event.
+        if answer_chunk_embs:
+            payload["answer_chunk_embs"] = [
+                _round_emb(e) for e in answer_chunk_embs if e
+            ]
+        if answer_chunk_hashes:
+            payload["answer_chunk_hashes"] = [str(h) for h in answer_chunk_hashes]
+        if soft_label:
+            payload["soft_label"] = True
         return payload
 
     # ---- v3 hub event builders (v0.2.47 RL-6c) -----------------------
@@ -603,6 +725,21 @@ class RLTelemetryWriter:
             for n in nodes
         ]
 
+        # WP-R defect-2 (R3-7 step 2): mirror the ENVELOPE's measured-dim fix into
+        # the payload-inner embedding_dim. When a query_emb is present its length
+        # is ground truth — writing the construction-time config dim beside a
+        # different-length vector is the exact historical escaper shape (e.g.
+        # embedding_dim: 2048 beside a len-3 query_emb), now merely one level
+        # deeper in payload_json. Measure from the vector we actually store so a
+        # payload_json reader sees a self-consistent event; fall back to the config
+        # dim only when no vector is carried.
+        _rounded_query_emb = (
+            _round_emb(query_emb) if query_emb is not None else None
+        )
+        _payload_dim = self._embedding_dim
+        if isinstance(_rounded_query_emb, list) and _rounded_query_emb:
+            _payload_dim = len(_rounded_query_emb)
+
         event: Dict[str, Any] = {
             "event": "retrieval",
             "schema_version": RLDataLogger.SCHEMA_VERSION,
@@ -613,12 +750,12 @@ class RLTelemetryWriter:
             "task_type": task_type,
             "query": (query or "")[:2000],
             "embedding_source": self._embedding_source,
-            "embedding_dim": self._embedding_dim,
+            "embedding_dim": _payload_dim,
             "embedding_model": self._embedding_model,
             "nodes": node_records,
         }
-        if query_emb is not None:
-            event["query_emb"] = _round_emb(query_emb)
+        if _rounded_query_emb is not None:
+            event["query_emb"] = _rounded_query_emb
         if failure_mode:
             event["failure_mode"] = str(failure_mode)
         if failed_collections:
@@ -644,6 +781,9 @@ class RLTelemetryWriter:
         session_id: str = "",
         fire_reason: str = "",
         window_tokens: int = 0,
+        answer_chunk_embs: "Optional[List[List[float]]]" = None,
+        answer_chunk_hashes: "Optional[List[str]]" = None,
+        soft_label: bool = False,
     ) -> Dict[str, Any]:
         """Build the v3 citation event JSON stored in launcher.db's payload_json."""
         event: Dict[str, Any] = {
@@ -654,6 +794,11 @@ class RLTelemetryWriter:
             "task_id": task_id,
             "task_type": task_type,
             "embedding_source": self._embedding_source,
+            # R3-7 step 3: the config dim is DELIBERATE here — a citation event
+            # carries no query/answer query-vector to measure against (the
+            # answer_chunk_embs are per-chunk, not the event's embedding space), so
+            # there is nothing to reconcile the dim to. Unlike the retrieval event
+            # (which measures from its query_emb), this is the config dim by design.
             "embedding_dim": self._embedding_dim,
             "embedding_model": self._embedding_model,
             "citations": {
@@ -680,6 +825,31 @@ class RLTelemetryWriter:
             event["fire_reason"] = str(fire_reason)
         if window_tokens:
             event["window_tokens"] = int(window_tokens)
+        # G4 (2026-07-22): persist the ANSWER-CHUNK EMBEDDINGS (not the answer
+        # text — privacy) that produced the cosine_sims labels, tagged implicitly
+        # by this event's embedding_source/dim/model triple. These let the offline
+        # trainer RE-DERIVE citation labels for a DIFFERENT embedding profile
+        # (the second RL net's space) or a retuned target formula WITHOUT the
+        # original answer — the cosine_sims scalars alone are frozen in the active
+        # space and cannot be replayed against a node vector in another space.
+        # ``answer_chunk_hashes`` (sha256 of each chunk's text) are stored in
+        # parallel for cross-slot dedup: the same answer embedded into arctic +
+        # qwen slots shares hashes, so a de-dup pass can pair the two slots'
+        # answer artifacts. Embeddings are rounded like every other stored vector
+        # (_round_emb, 4 dp). payload_json is stored verbatim by the hub → NO
+        # schema/Rust change (the rl_events rows already carry query_emb + node
+        # embeddings, proving the pipe accepts embedding payloads).
+        if answer_chunk_embs:
+            event["answer_chunk_embs"] = [
+                _round_emb(e) for e in answer_chunk_embs if e
+            ]
+        if answer_chunk_hashes:
+            event["answer_chunk_hashes"] = [str(h) for h in answer_chunk_hashes]
+        # G5 (2026-07-22): mark a below-terminal-floor soft label so the trainer
+        # can down-weight it (a shorter answer window is a weaker citation signal
+        # than a full one). Absent on the normal path (default False → omitted).
+        if soft_label:
+            event["soft_label"] = True
         return event
 
     def _wrap_for_hub(
@@ -697,18 +867,53 @@ class RLTelemetryWriter:
         (offline_trainer via the hub's GET endpoint) get bytewise-identical
         replayable events.
         """
+        # WP-Q item 2 (was R2-11): PATHOLOGICAL-CASE BACKSTOP. Cap the payload
+        # just below the hub's EXPLICIT 16 MiB axum body limit. Measure the
+        # serialized event and, if over-cap, drop OPTIONAL heavy embedding fields
+        # in a documented priority order (per-node linked_embs → answer embs),
+        # NEVER the core label nor the core net inputs (query_emb, nodes[].emb).
+        # Log at WARNING so a trimmed event is visible (a
+        # dropped embedding is a real, if recoverable, loss of training signal).
+        # Normal events never approach the cap — this branch only fires for a
+        # runaway/pathological event, never in steady state.
+        max_bytes = _resolve_hub_payload_max_bytes()
+        trimmed_event, dropped = _trim_event_to_payload_cap(event_json, max_bytes)
+        if dropped:
+            logger.warning(
+                "RL telemetry: %s event %s exceeded the %d-byte hub payload cap; "
+                "dropped optional embedding field(s) %s to keep the core label "
+                "(the hub's axum body limit is 16 MiB — see rl_events_api.rs)",
+                event_type, task_id, max_bytes, ", ".join(dropped),
+            )
+        # The envelope's denormalized embedding_dim must never disagree with a
+        # PRESENT payload vector: the payload's query_emb length is ground
+        # truth; the construction-time config dim is only the fallback for
+        # events that carry no vector (e.g. citations). Disagreement is logged
+        # so config-vs-actual drift stays visible. (query_emb is in the
+        # never-trim class, so measuring the trimmed event is safe.)
+        measured_dim = None
+        _qe = trimmed_event.get("query_emb")
+        if isinstance(_qe, list) and _qe:
+            measured_dim = len(_qe)
+            if self._embedding_dim and measured_dim != self._embedding_dim:
+                logger.warning(
+                    "RL telemetry: envelope embedding_dim %d != measured "
+                    "query_emb length %d for task %s — storing the measured "
+                    "length (payload is ground truth)",
+                    self._embedding_dim, measured_dim, task_id,
+                )
         return {
             "event_type": event_type,
-            "schema_version": int(event_json.get("schema_version") or RLDataLogger.SCHEMA_VERSION),
+            "schema_version": int(trimmed_event.get("schema_version") or RLDataLogger.SCHEMA_VERSION),
             "ts_ms": int(time.time() * 1000),
             "project_id": self._project_id,
             "project_name": self._project or None,
             "task_id": task_id,
             "task_type": task_type,
             "embedding_source": self._embedding_source or None,
-            "embedding_dim": self._embedding_dim or None,
+            "embedding_dim": measured_dim or self._embedding_dim or None,
             "embedding_model": self._embedding_model or None,
-            "payload_json": json.dumps(event_json),
+            "payload_json": json.dumps(trimmed_event),
         }
 
 
