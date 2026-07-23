@@ -256,7 +256,7 @@ per-project `enabled` flag and a `source` label.
 |---|---|
 | `agent_name` | Logical name. Unique per `(project_id, agent_name)`. From frontmatter `name:` or file stem. |
 | `source` | One of `bundled`, `user`, `paid-module`, `project`. The validator (`VALID_SOURCE`) rejects anything else. `bundled` = shipped with the orchestrator; `user` = user-scope `~/.claude/agents/`; `paid-module` = installed by a paid module; `project` = manually added in this project only. |
-| `source_module` | Optional module slug if `source = paid-module` (e.g. `vct-coordination`). |
+| `source_module` | Optional module slug if `source = paid-module` (e.g. `vct-rl-reranker`). |
 | `model` | Frontmatter `model:` value: `sonnet`, `opus`, `haiku`, `inherit`, or full model id. Display-only — the harness reads this from the `.md` itself. |
 | `enabled` | User-owned toggle. The harness still loads the `.md` regardless; `enabled=false` is a launcher-managed signal that downstream code can consult. **It does not delete the file or block the harness directly.** |
 | `file_path` | Absolute path to the `.md`. `null` for rows manually registered without a file. |

@@ -410,7 +410,7 @@ claude mcp list
 # mermaid + excalidraw show Connected but their tools are per-project
 # default-disabled until you opt in via the launcher's Diagrams tab.
 # playwright also appears (enabled by default, via npx).
-# (coordination is optional; lean-ctx / vct-coordination may also appear if installed.)
+# (lean-ctx or Pro-tier MCPs may also appear if installed.)
 ```
 
 > **"Where is the `ollama` MCP / `chat` / `read_image` tool?"** There is no Ollama MCP. Claude's native reasoning and the built-in `Read` tool (which handles images via vision) cover those use cases at higher quality. Ollama runs as infrastructure on `:11435` — it powers Weaviate's text embeddings and the code-embedding service CPU fallback — and is not exposed as an MCP tool.

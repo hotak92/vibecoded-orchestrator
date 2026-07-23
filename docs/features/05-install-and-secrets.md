@@ -196,7 +196,7 @@ Suppresses the volume cleanup step entirely. KG data and Ollama models are prese
 Both the installer and uninstaller explicitly state this. User's GitHub PAT, Supabase keys, etc. survive uninstall.
 
 ### Selective MCP entry removal
-The uninstaller removes exactly: `weaviate-kg`, `ollama`, `search`, `code-embedding`, `vct-coordination` from `~/.claude.json`, leaving any user-added servers intact.
+The uninstaller removes exactly: `weaviate-kg`, `ollama`, `search`, `code-embedding`, and VCO-registered Pro-tier MCPs from `~/.claude.json`, leaving any user-added servers intact.
 
 ---
 

@@ -55,7 +55,6 @@ These exist but are **not** in the OSS bundle:
 
 | Component | Description | Where |
 |---|---|---|
-| `coordination` MCP | Team coordination platform with Supabase backend | `hotak92/vct-coordination` (separate repo) |
 | `orchestrator_tools_mcp` | Pro-tier agent tooling MCP | Pro module, not bundled |
 | RL reranker | Reinforcement-learning result reranking server | Pro module; MCP falls through cleanly when absent |
 

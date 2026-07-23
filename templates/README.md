@@ -63,7 +63,6 @@ Other paid features are NOT shipped in this repo. Paid-module code is hosted sep
 
 Known paid modules, handled outside this repo:
 
-- **Coordination (Supabase backend)** — team coordination MCP with persistent cloud backend. Paid add-on.
 - **RL retrieval reranking** — per-project reranker trained over KG/codegraph retrieval. Paid add-on.
 
 The VCT Launcher is the gate: it validates the license, fetches the module from a private distribution server, and installs into `.claude/` or `claude_mcp_servers/`. The free repo only documents these modules' existence for discoverability, never their source.

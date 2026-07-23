@@ -10,7 +10,7 @@ Five MCP servers ship with VCO by default:
 
 Authoritative writer for the four Python MCPs: `launcher/src-tauri/src/mcp_registration.rs::build_default_mcp_entries`. Pure-Python fallback for installs that bypass the launcher: `install.py:20654-20661`. Playwright is invoked separately via `_install_playwright_browsers` (`install.py:24784-24858`) so users without npx still get the other four MCPs.
 
-The Python MCPs run from `claude_mcp_servers/.venv`. The `vct-coordination` MCP is Pro-tier and excluded from the default install — see `mcp_registration.rs:16` for the rationale. The `mermaid` + `excalidraw` default-disabled list at `project_mcp_servers.rs:73-76` keeps the per-project tool surface narrow for users who don't author diagrams; the GUI toggle flips them on without re-running install.py.
+The Python MCPs run from `claude_mcp_servers/.venv`. Pro-tier MCPs are excluded from the default install — see `mcp_registration.rs:16` for the rationale. The `mermaid` + `excalidraw` default-disabled list at `project_mcp_servers.rs:73-76` keeps the per-project tool surface narrow for users who don't author diagrams; the GUI toggle flips them on without re-running install.py.
 
 **Deliberately NOT MCPs**: Ollama runs as infrastructure only (Weaviate text embeddings + code-embedding CPU fallback) — there is no Ollama MCP; Claude's native reasoning, `Read` tool, and built-in vision serve chat, document-reading, and image use cases at higher quality. The Search MCP exposes `search_papers` only — Claude's built-in WebFetch covers ad-hoc web retrieval, and no local search proxy runs in the default container stack.
 

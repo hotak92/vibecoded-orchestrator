@@ -4,7 +4,7 @@
 
 ## Why this doc exists
 
-The Vibecoded Orchestrator is AGPL-3.0. Paid modules (`vct-rl-reranker`, future: `vct-coordination`, `MAO`, `telegram-module`) ship their source as **private** containers and the public AGPL repo carries only thin HTTP adapter clients. Mistakes in this boundary are catastrophic in three independent ways:
+The Vibecoded Orchestrator is AGPL-3.0. Paid modules (`vct-rl-reranker`, and future modules) ship their source as **private** containers and the public AGPL repo carries only thin HTTP adapter clients. Mistakes in this boundary are catastrophic in three independent ways:
 
 - **License**: private source landing in a public AGPL commit converts that source to AGPL by accidental publication. The author's commercial licensing of the paid module is then permanently compromised.
 - **Trust**: paying customers of the paid tier expect their cost to buy something that is not freely available. A leak invalidates that.
@@ -54,7 +54,6 @@ Canonical list (from the v0.2.22 leak-audit, extend as new modules land):
 - `rl_model.py`
 - `rl_server.py`
 - `offline_trainer.py`
-- `coordination_server.py` *(reserved for future `vct-coordination` paid module)*
 - `mao_engine.py` *(reserved for future MAO paid module)*
 - `telegram_bot_runtime.py` *(reserved for future Telegram paid module)*
 
@@ -150,8 +149,8 @@ The launcher resolves `{{project_id}}` to the active project's UUID and POSTs `h
       "max_attempts": 720,
       "terminal_success_values": ["done"],
       "terminal_failure_values": ["failed", "error"],
-      "progress_event": "vct-coordination://retrain-progress",
-      "failed_event":   "vct-coordination://retrain-failed"
+      "progress_event": "<module-id>://retrain-progress",
+      "failed_event":   "<module-id>://retrain-failed"
     }
   }
 }
@@ -219,7 +218,7 @@ When you add a new paid module, the relevant filename patterns from "Files that 
 
 Follow this procedure in order. Each step is independently verifiable; do not skip any.
 
-1. **Reserve the module id**. Pick a stable kebab-case identifier (`vct-coordination`, `mao`, `telegram-module`). This becomes the directory name in `paid-modules/<id>/`, the public adapter `claude_mcp_servers/<id>_client/`, the container image ref `ghcr.io/<owner>/<id>`, and the module-id string constant referenced from the launcher.
+1. **Reserve the module id**. Pick a stable kebab-case identifier (e.g. `vct-rl-reranker`). This becomes the directory name in `paid-modules/<id>/`, the public adapter `claude_mcp_servers/<id>_client/`, the container image ref `ghcr.io/<owner>/<id>`, and the module-id string constant referenced from the launcher.
 2. **Create the private repo first**. Initialize `paid-modules/<id>/` as a standalone git repo with its own private GitHub remote. Verify `git remote -v` shows the private URL, not the orchestrator's.
 3. **Update `.gitignore` in BOTH repos** (public AGPL repo and your private orchestrator clone) to add `claude_mcp_servers/<id>_server/` (defense-in-depth) — do this BEFORE writing any code.
 4. **Scaffold the public adapter**. Create `claude_mcp_servers/<id>_client/` with the whitelist files only (`__init__.py`, `client.py`, `schemas.py`, optionally `telemetry_writer.py`). The adapter must work in graceful-degraded mode when the paid container is absent.
