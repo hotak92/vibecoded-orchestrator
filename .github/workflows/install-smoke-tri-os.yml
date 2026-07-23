@@ -40,10 +40,6 @@ on:
       - ".github/workflows/install-smoke-tri-os.yml"
   push:
     branches: [main]
-  schedule:
-    # Daily 06:00 UTC. Catches drift introduced by upstream runner-image
-    # updates (e.g. new macos-14 base image dropping a tool we depended on).
-    - cron: "0 6 * * *"
   workflow_dispatch: {}
 
 permissions:

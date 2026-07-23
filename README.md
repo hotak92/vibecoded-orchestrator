@@ -64,7 +64,7 @@ git clone https://github.com/hotak92/vibecoded-orchestrator.git && cd vibecoded-
 
 `first-install.{sh,command,bat}` is a thin OS shim that (1) finds a usable Python 3.11+ (offering to install one via Homebrew / apt / dnf / pacman / zypper / apk / winget if missing), (2) runs a read-only system-detection prepass that writes a diagnostic report to `state/logs/bootstrap-prepass.json` — no side effects, and a failure there never blocks the install — then (3) runs `install.py` for the canonical install. On success the launcher GUI auto-starts (pass `--no-auto-launch` to skip). Root install and per-project bundle install share one engine — the orchestrator's own `.claude/` goes through the same code path the launcher uses for your projects. Full detail: [`docs/INSTALL_ARCHITECTURE_v2.md`](docs/INSTALL_ARCHITECTURE_v2.md) and [`docs/INSTALL_PARITY.md`](docs/INSTALL_PARITY.md).
 
-The entry points run end-to-end in CI on Ubuntu 22.04/24.04, Fedora 40, macOS 14, and Windows on every PR and daily; a red run blocks release tags.
+The entry points run end-to-end in CI on Ubuntu 22.04/24.04, Fedora 40, macOS 14, and Windows on every push to main and on installer-touching PRs; a red run blocks release tags.
 
 Allow ~5–10 min plus first-run image downloads (~5 GB: Weaviate + Ollama qwen3 weights, +2.5 GB if GPU mode pulls CodeSage-Large-v2).
 
