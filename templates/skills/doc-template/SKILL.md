@@ -1,6 +1,6 @@
 ---
 name: doc-template
-description: Documentation templates - README, API docs, ADRs, user guides
+description: Documentation templates for README, API docs, ADRs, user guides, contributing guidelines, and changelogs. Use when asked to "create a README", "document these API endpoints", "write an architecture decision record", "draft a user guide", or "set up a changelog". Not for bespoke long-form documentation requiring manual expertise or features already documented.
 short_desc: README/ADR/API-doc/user guide templates
 keywords: [README template, ADR, API documentation, user guide template, contributing guidelines, "write README", "write docs", "documentation template", "architecture decision record", "changelog template"]
 model: haiku
@@ -8,26 +8,7 @@ model: haiku
 
 # Doc Template (Haiku)
 
-**Purpose**: Documentation templates - README, API docs, ADRs, user guides.
-
-**Model**: Haiku (fast template generation)
-
-**When to Invoke Autonomously**:
-
-1. **README Generation**: "Create README for [project]"
-2. **API Documentation**: "Document API endpoints"
-3. **Architecture Decision Records**: "Document decision for [choice]"
-4. **User Guides**: "Create user guide for [feature]"
-
-**DO NOT invoke for**:
-- Complex documentation projects (manual writing)
-- Already-documented features
-
-## DO NOT invoke for
-
-- Complex documentation projects requiring manual expertise
-- Already-documented features
-- One-off documentation (use templates directory directly)
+Documentation templates for README, API docs, ADRs, user guides, contributing guidelines, and changelogs.
 
 ## What This Skill Does
 
@@ -39,18 +20,16 @@ Generates documentation from templates:
 - **Contributing Guidelines**: Contribution process, code standards
 - **Changelogs**: Version history following keep-a-changelog format
 
-**See**: `templates/` directory for all available templates
+**See**: the `templates/` directory (alongside this SKILL.md) for all available templates.
 
 ## Quick Workflow Reference
 
-**Before generating**: Search for documentation template patterns
+**Before generating**: search for documentation template patterns.
 ```bash
 .claude/scripts/kg-search search "template" --type concept
 ```
 
-**For deep research**: Ask user "Use hybrid_search to research [documentation best practices]"
-
-**Development env**: Python 3.12, Weaviate:8081, Ollama:11435, venv: `source claude_mcp_servers/.venv/bin/activate`
+**For deep research**: run `hybrid_search("<documentation best-practices topic>")` (Weaviate MCP).
 
 ## Success Metrics
 

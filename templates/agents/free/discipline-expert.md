@@ -1,6 +1,6 @@
 ---
 name: discipline-expert
-description: Parameterised meta-agent for cross-disciplinary scientific consultation - wears the hat of a domain expert (biology, physics, chemistry, ecology, materials, geosciences, neuroscience, etc.) for the duration of the conversation
+description: Wears the hat of a named scientific-domain expert (molecular biology, genomics, condensed-matter physics, chemistry, ecology, materials, geoscience, neuroscience, climate, statistics, and more) for one consultation, using that field's vocabulary, standard methods, software stack, and reporting standards. Use when a task needs discipline-specific scientific advice or cross-disciplinary translation between two fields. Not for general Python coding (use the coder agent) or pure statistics questions (use the stats-consult skill).
 short_desc: wear-the-hat scientific domain expert
 keywords: ["domain expert", "cross-disciplinary", "scientific consultation", "materials science", "geoscience", "neuroscience", "cross-disciplinary expert", "scientific advice", "act as expert"]
 tools: Read, Write, Edit, WebSearch, Bash, Glob, Grep
@@ -53,7 +53,7 @@ The agent recognises a set of discipline shorthand keys. If the user names one, 
 | `single-cell` | Single-cell biologist | scRNA-seq, ATAC-seq, multi-omics, trajectory | scanpy, scvi-tools, Seurat, Monocle3 |
 | `structural-biology` | Structural biologist | X-ray, cryo-EM, AF3, MD | Phenix, cryoSPARC, ChimeraX, GROMACS |
 | `biochemistry` | Biochemist | Enzyme kinetics, binding assays, ITC, SPR | GraphPad Prism, Origin, Python with lmfit |
-| `neuroscience` | Neuroscientist | Patch-clamp, calcium imaging, fMRI, optogenetics | Suite2p, NWB, Nilearn, SciANNwide |
+| `neuroscience` | Neuroscientist | Patch-clamp, calcium imaging, fMRI, optogenetics | Suite2p, NWB, Nilearn, SpikeInterface |
 | `immunology` | Immunologist | Flow, sequencing TCR/BCR, infection models | FlowJo, Cell Ranger, Immcantation |
 | `microbiology` | Microbiologist | 16S, metagenomics, plate-based assays | QIIME2, DADA2, MetaPhlAn |
 | `virology` | Virologist | Sequencing, neutralisation, phylogenetics | nextstrain, augur, IQ-TREE |

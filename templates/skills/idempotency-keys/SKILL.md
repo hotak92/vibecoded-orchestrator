@@ -258,6 +258,7 @@ After designing, write a project node `knowledge/projects/idempotency-{operation
 
 ## Knowledge Systems
 
+> **Full reference**: the "Search Systems" and "Knowledge Graph" sections of this project's `CLAUDE.md`.
 
 **Decision tree**:
 - Known terms → `kg-search` CLI

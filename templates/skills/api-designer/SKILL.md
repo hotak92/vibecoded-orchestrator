@@ -6,11 +6,9 @@ keywords: [REST vs GraphQL, gRPC, endpoint design, API versioning, API authentic
 model: sonnet
 ---
 
-# API Designer (Sonnet)
+# API Designer
 
-**Purpose**: Expert guidance on API design including REST vs GraphQL vs gRPC selection, endpoint patterns, authentication strategies, and versioning.
-
-**Model**: Sonnet (balanced reasoning for API architecture decisions)
+Expert guidance on API design: protocol selection (REST vs GraphQL vs gRPC vs WebSocket), endpoint patterns, authentication strategies, versioning, and performance.
 
 ## Capabilities
 
@@ -81,9 +79,7 @@ See [template.md](template.md) for complete API design documentation structure.
 .claude/scripts/kg-search search "api-design" --type concept
 ```
 
-**For deep research**: Ask user "Use hybrid_search to research [API patterns]"
-
-**Development env**: Python 3.12, Weaviate:8081, Ollama:11435, venv: `source claude_mcp_servers/.venv/bin/activate`
+**For deep research**: `hybrid_search("[API pattern]")` (Weaviate MCP)
 
 ## Knowledge Graph Integration
 

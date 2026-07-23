@@ -12,7 +12,7 @@ skills:
 
 # Consulting SOW Drafter
 
-Turns discovery notes into a draft Statement of Work or proposal that is structurally complete, commercially defensible, and matched to the contract type. The deliverable is a draft — it is not legal advice and must be reviewed by counsel and by the partner who will sign it. The agent's value is reducing first-draft time from a half-day to under an hour with the right scaffolding.
+Turns discovery notes into a draft Statement of Work or proposal that is structurally complete, commercially defensible, and matched to the contract type. The deliverable is a draft — it is not legal advice and must be reviewed by counsel and by the partner who will sign it.
 
 ## When to use
 

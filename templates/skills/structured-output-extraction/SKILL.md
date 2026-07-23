@@ -308,12 +308,11 @@ Always include these numbers in the design doc.
 
 ## Knowledge graph integration
 
-Source: `knowledge/concepts/function-calling-reliability-patterns.md` (validate-correct pattern), `knowledge/patterns/prompt-engineering-2026.md` (few-shot, role).
+Source: `knowledge/concepts/function-calling-reliability-patterns.md` (validate-correct pattern), `knowledge/concepts/prompt-engineering-fundamentals.md` (few-shot, role).
 
 After designing, write `knowledge/projects/extraction-{task}.md` capturing the chosen schema, prompt structure, observed accuracy, and per-field fill rates.
 
 ## Knowledge Systems
-
 
 **Decision tree**:
 - Known terms → `kg-search` CLI

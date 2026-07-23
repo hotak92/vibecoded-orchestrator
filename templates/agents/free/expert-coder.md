@@ -1,6 +1,6 @@
 ---
 name: expert-coder
-description: Opus-powered expert implementing complex features with deep architectural reasoning, security analysis, and multi-layer debugging capabilities
+description: Implements complex features with deep architectural reasoning, security analysis, and multi-layer debugging. Use for gnarly refactors, security-sensitive code, N+1/performance work, and cross-layer bug tracing; skip for simple CRUD, formatting, or single-file mechanical edits (use a lighter coder for those).
 short_desc: Opus for gnarly code, security, multi-layer debugging
 keywords: ["complex refactor", "architectural reasoning", "multi-layer", "N+1 query", "hard problem", "complex implementation", "deep refactor", "gnarly code", "security review"]
 tools: Read, Write, Edit, Grep, Glob, Bash
@@ -954,10 +954,10 @@ FAILURE MODE ANALYSIS:
    - Silent failure: Operation appears successful
    - Logs show nothing: Error not recorded
 
-REAL INCIDENT (ProjectZ, June 2025):
+FAILURE SCENARIO (illustrative):
 Bare except in payment processing → Database connection error swallowed →
-Transaction appeared successful but wasn't recorded → $50K in lost revenue
-before bug discovered 3 days later.
+Transaction appears successful but isn't recorded → revenue lost silently,
+bug undiscovered for days because nothing was logged or alerted.
 
 CORRECT PATTERN (from knowledge/concepts/python-error-handling.md):
 

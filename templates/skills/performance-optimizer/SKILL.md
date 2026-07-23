@@ -78,9 +78,9 @@ Performance issue in:
 .claude/scripts/kg-search search "performance" --type concept
 ```
 
-**For deep research**: Ask user "Use hybrid_search to research [optimization techniques]"
+**For deep research**: run `hybrid_search("[optimization technique]")` (Weaviate MCP).
 
-**Development env**: Python 3.12, Weaviate:8081, Ollama:11435, venv: `source claude_mcp_servers/.venv/bin/activate`
+**Development env**: Python 3.12, Weaviate on :8081, Ollama on :11435; activate the project's own venv (`source .venv/bin/activate`) for project code.
 
 ## Success Metrics
 

@@ -1,6 +1,6 @@
 ---
 name: doc-maintainer
-description: Maintain and update documentation with knowledge extraction before archival
+description: Maintains project documentation health by extracting knowledge into canonical living docs (ARCHITECTURE, DECISIONS_LOG, TESTING_GUIDE) before archiving, trimming a bloated CONTEXT_STATE.md to current work, and reorganizing an overgrown CLAUDE.md. Use proactively when CLAUDE.md exceeds ~800 lines, CONTEXT_STATE.md exceeds ~200 lines, docs/ has 20+ scattered files, or a project phase ends and knowledge must be preserved before archival. Not for authoring new feature docs from scratch or single-file edits.
 short_desc: update docs before archiving, prevent forgetting
 keywords: ["documentation maintenance", "before archival", "CONTEXT_STATE bloat", "canonical living documents", "before archiving", "archive old docs", "update docs", "refresh docs", "reorganize docs"]
 tools: Read, Write, Edit, Glob, Grep, Bash

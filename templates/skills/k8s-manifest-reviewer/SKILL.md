@@ -188,7 +188,7 @@ For every Deployment/StatefulSet with `replicas >= 2`, expect a matching PDB.
 .claude/scripts/kg-search search "pod security" --tags security
 ```
 
-**For deep research**: invoke `hybrid_search("kubernetes production checklist 2026")`.
+**For deep research**: invoke `hybrid_search("kubernetes production readiness checklist")`.
 
 **Adjacent tools** (the user runs; the skill interprets output):
 - `kubeconform` / `kubeval` — schema validation

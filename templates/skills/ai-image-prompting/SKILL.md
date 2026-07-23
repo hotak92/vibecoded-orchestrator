@@ -21,7 +21,7 @@ You craft prompts and ComfyUI workflow recipes for production use. A "lucky gene
 - ComfyUI workflow design for repeatable output
 - Translating an Art Director's brief into prompt + reference + control net
 
-## Models — 2026 landscape
+## Models — current landscape
 
 Choose the right model for the job — strengths differ substantially.
 

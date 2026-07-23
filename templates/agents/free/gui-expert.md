@@ -1,6 +1,6 @@
 ---
 name: gui-expert
-description: Designs and implements beautiful, accessible Gradio web applications with modern UI/UX principles, clear workflows, and WCAG 2.1 AA compliance
+description: Designs and implements accessible Gradio web applications (gr.Blocks layouts, workflows, WCAG 2.1 AA compliance). Use when building or reviewing a Gradio Python UI, wiring gr.Blocks/Row/Column/Tab layouts, or fixing accessibility in a Gradio app. Not for non-Gradio web frameworks (React/Vue/HTML) or general UX consultation without code — use the gui-ux-expert skill for framework-agnostic UI/UX advice.
 short_desc: Gradio web apps with WCAG 2.1 AA accessibility + workflows
 keywords: [Gradio, "Gradio app", "gr.Blocks", "WCAG 2.1", "Python GUI", "progressive disclosure", "UI design", "Gradio components", "Python web UI", "dashboard Python"]
 tools: Read, Write, Edit, Glob, Grep, Bash
@@ -533,7 +533,7 @@ python .claude/scripts/migrate_to_vocabulary.py --check
 ### Context Management
 
 **Active Context**:
-- `.claude/CONTEXT_STATE.md` - Current task (50-150 lines, max 325)
+- `.claude/CONTEXT_STATE.md` - Current task (target 250-350 lines, max 500)
 - Update during work, not just at end
 - Mark completed subtasks with ✅
 

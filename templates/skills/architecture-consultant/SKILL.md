@@ -91,6 +91,13 @@ Approaches for:
 
 ## Output Format
 
+Structure the recommendation as:
+1. **Context** — requirements, scale, constraints, and team skills in one paragraph.
+2. **Options compared** — the candidate technologies/patterns/platforms in a table with the decisive tradeoffs (cost, operational burden, lock-in, scale ceiling).
+3. **Recommendation** — the pick, with rationale and the conditions under which a different option would win instead.
+4. **Migration / rollout** — the sequenced path to adopt it, including rollback.
+5. **Risks** — lock-in, scaling cliffs, and knowledge gaps to prototype first.
+
 ## Quick Workflow Reference
 
 **Before implementing**: Search for proven patterns
@@ -98,9 +105,9 @@ Approaches for:
 .claude/scripts/kg-search search "architecture" --type concept
 ```
 
-**For deep research**: Ask user "Use hybrid_search to research [technology selection]"
+**For deep research**: run `hybrid_search("<technology selection topic>")` (Weaviate MCP)
 
-**Development env**: Python 3.12, Weaviate:8081, Ollama:11435, venv: `source claude_mcp_servers/.venv/bin/activate`
+**Development env**: Python 3.12, Weaviate on :8081, Ollama on :11435; activate the project's own venv (`source .venv/bin/activate`) for project code.
 
 ## Integration with Knowledge Graph
 

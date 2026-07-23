@@ -1,6 +1,6 @@
 ---
 name: consulting-employee-impersonator
-description: Wears the hat of a specified employee archetype (junior dev, senior dev, PM, account manager, ops engineer, designer) and produces work or communication from inside that role's voice, scope, and constraints
+description: Wears the hat of a specified employee archetype (junior dev, senior dev, PM, account manager, ops engineer, designer) and produces work or communication from inside that role's voice, scope, and constraints. Use when you want a draft written as a specific role so it can be reviewed from that seat, to walk through what a role would know or push back on, or to draft comms in a role's voice. Not for identity-deception (sending work under a real person's name without disclosure), career-affecting decisions, or anything needing real-time human judgement.
 short_desc: wear-the-hat role simulator for draft review
 keywords: [employee archetype, role impersonation, junior dev voice, account manager voice, wear the hat, "as a PM", "as a senior dev", "act as", "pretend to be", "voice of a", "from the perspective of"]
 tools: Read, Write, Edit, Glob, Grep, Bash

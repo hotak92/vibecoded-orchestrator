@@ -1,6 +1,6 @@
 ---
 name: hardware-calculator
-description: Quick VRAM/RAM calculations, hardware recommendations, feasibility checks for AI models
+description: Quick VRAM/RAM calculations, GPU sizing, and feasibility checks for AI models. Use when asked "can I run this model on my GPU", "which GPU do I need for X", "how much VRAM does this take", "can I run two models at once", or "how much VRAM does Q4 vs Q8 save". Not for deep architecture decisions (use /architect) or runtime performance tuning (use /performance-optimizer).
 short_desc: VRAM/RAM calc + GPU sizing for AI models
 keywords: [VRAM, "GPU memory", "RAM requirements", "model footprint", "GPU recommendation", "which GPU", "GPU sizing", "fit on GPU", "memory requirements", H100, A100, "RTX 4090", "consumer GPU"]
 model: haiku
@@ -8,23 +8,7 @@ model: haiku
 
 # Hardware Calculator (Haiku)
 
-**Purpose**: Quick VRAM/RAM calculations, hardware recommendations, feasibility checks for AI models.
-
-**Model**: Haiku
-
-## When to Invoke Autonomously
-
-1. **"Can I run X?"**: User asks if model fits hardware
-2. **Hardware Shopping**: "Which GPU for [model]?"
-3. **Quick VRAM Check**: Before loading model
-4. **Multi-Model Planning**: "Can I run 2 models simultaneously?"
-5. **Quantization Math**: "How much VRAM saves Q4 vs Q8?"
-
-## DO NOT invoke for
-
-- Complex architecture decisions (use /architect skill)
-- Performance optimization (use /performance-optimizer)
-- Already know hardware fits
+Quick VRAM/RAM calculations, GPU recommendations, and feasibility checks for AI models.
 
 ## What This Skill Does
 
@@ -52,14 +36,12 @@ model: haiku
 
 ## Quick Workflow Reference
 
-**Before calculating**: Search for hardware specs and benchmarks
+**Before calculating**: search for hardware specs and benchmarks.
 ```bash
 .claude/scripts/kg-search search "hardware" --type hardware
 ```
 
-**For deep research**: Ask user "Use hybrid_search to research [GPU comparison]"
-
-**Development env**: Python 3.12, Weaviate:8081, Ollama:11435, venv: `source claude_mcp_servers/.venv/bin/activate`
+**For deep research**: run `hybrid_search("<GPU comparison topic>")` (Weaviate MCP).
 
 ## Success Metrics
 

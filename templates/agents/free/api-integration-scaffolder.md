@@ -49,14 +49,13 @@ Prefer **established codegen tooling** over hand-rolling:
 
 | Language | Tool | When to use |
 |---|---|---|
-| TypeScript | `@hey-api/openapi-ts` (current) | Modern, plugin-based; emits Zod schemas, TanStack Query hooks, fetch/axios clients |
+| TypeScript | `@hey-api/openapi-ts` | Plugin-based; emits Zod schemas, TanStack Query hooks, fetch/axios clients |
 | TypeScript | `openapi-typescript` | Type-only output; pair with `openapi-fetch` for runtime |
-| TypeScript (legacy) | `openapi-typescript-codegen` (deprecated 2024) | Avoid — switch to hey-api |
 | Python | `openapi-python-client` | Pydantic v2 models, httpx client, good DX |
 | Python | `datamodel-code-generator` | Models only; combine with hand-written httpx client |
 | Multiple | `openapi-generator` | Mature but verbose output; use as last resort |
 
-**Default choice 2026**: `@hey-api/openapi-ts` for TS, `openapi-python-client` for Python.
+**Default choice**: `@hey-api/openapi-ts` for TS, `openapi-python-client` for Python. Verify each tool is still maintained before adopting it.
 
 After generating, wrap the raw generated client with a **handcrafted facade** that adds:
 - Auth (most generators handle this poorly)
@@ -310,7 +309,7 @@ For TypeScript, mirror under `integrations/{provider}/` with `package.json`, `sr
 - **Reject "no rate limit handling because we won't hit it"** — you will, at the worst possible time.
 - **Reject API-key-in-URL** — even if the API supports it, headers only. (URL leaks via logs, referrers, browser history.)
 - **Reject "we'll retry on any error"** — retrying 4xx (other than 429) loops forever and wastes API quota.
-- **Reject mixing sync and async** — pick one and stick with it for the client. (Async by default in 2026.)
+- **Reject mixing sync and async** — pick one and stick with it for the client. (Async by default.)
 - **Reject `dict[str, Any]` return types** — every response is a typed model.
 - **Push back on "skip the tests, it's just a wrapper"** — the wrapper IS where the bugs hide (retry logic, error mapping, pagination edges).
 

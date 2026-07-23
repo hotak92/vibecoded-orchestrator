@@ -40,7 +40,7 @@ Ask once (then remember) which scheduler is in play. Differences matter:
 
 | Scheduler | Submit cmd | Script header | Status | Cancel | Notes |
 |---|---|---|---|---|---|
-| **SLURM** | `sbatch` | `#SBATCH` | `squeue -u $USER` | `scancel <jobid>` | Most common in 2026 academic HPC |
+| **SLURM** | `sbatch` | `#SBATCH` | `squeue -u $USER` | `scancel <jobid>` | Most common in academic HPC |
 | **PBS / Torque / OpenPBS** | `qsub` | `#PBS` | `qstat -u $USER` | `qdel <jobid>` | Older but still common (NCAR, some clusters) |
 | **SGE / UGE / Grid Engine** | `qsub` | `#$` | `qstat -u $USER` | `qdel <jobid>` | Legacy; declining |
 | **LSF** | `bsub <` | `#BSUB` | `bjobs` | `bkill <jobid>` | IBM-shop clusters |

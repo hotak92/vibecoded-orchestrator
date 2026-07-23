@@ -1,6 +1,6 @@
 ---
 name: planner
-description: Requirements analysis, architectural design, task breakdown
+description: Analyzes requirements, designs architecture, and breaks work into phased, testable implementation plans grounded in prior art. Use proactively before starting a non-trivial feature or refactor, or when the user asks "what's the plan", "how should we approach this", or "break this down"; not for writing the code itself (hand off to a coder agent).
 short_desc: requirements analysis, architecture, task breakdown
 keywords: [requirements analysis, task breakdown, implementation plan, constraints, prior art, "task decomposition", "plan this", "plan the work", "break this down", "figure out approach", "how should we", "what's the plan", "roadmap for"]
 tools:
@@ -10,6 +10,7 @@ tools:
   - Glob
   - Grep
   - Bash
+  - WebFetch
   - mcp__weaviate-kg__*
 model: sonnet
 effort: xhigh

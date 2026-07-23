@@ -1,6 +1,6 @@
 ---
 name: react-patterns
-description: React best practices - component patterns, state management selection, performance optimization, testing strategies
+description: React best practices — component patterns, state-management selection (useState/Context/Zustand/Redux), performance optimization, and testing strategy. Use when structuring a complex React component, choosing a state solution, fixing excessive re-renders, or picking a testing approach. Not for trivial components (just write them) or non-React frameworks.
 short_desc: React component patterns, state, perf, testing strategy
 keywords: ["React hooks", useState, useEffect, "component state", useMemo, useCallback, Zustand, "React component", "React state", "React performance", "React testing", Redux, "React Context"]
 model: sonnet
@@ -73,9 +73,7 @@ model: sonnet
 .claude/scripts/kg-search search "react" --type concept
 ```
 
-**For deep research**: Ask user "Use hybrid_search to research [React pattern comparison]"
-
-**Development env**: Python 3.12, Weaviate:8081, Ollama:11435, venv: `source claude_mcp_servers/.venv/bin/activate`
+**For deep research**: `weaviate-kg:hybrid_search("React pattern comparison")` (Weaviate MCP)
 
 ## Success Metrics
 

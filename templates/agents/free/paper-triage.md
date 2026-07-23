@@ -1,9 +1,9 @@
 ---
 name: paper-triage
-description: Triages a folder of PDFs into a structured table - extracts method, dataset, sample size, effect size, claim, and supporting figure - and flags claims that aren't supported by the paper's own data
+description: Triages a folder of PDFs into a structured table - extracts method, dataset, sample size, effect size, claim, and supporting figure - and flags claims that aren't supported by the paper's own data. Use for batch triage across many papers (systematic-review screening, priority-read selection); not for reading or summarising a single paper.
 short_desc: "triage PDFs: method, dataset, claims, figures"
 keywords: ["paper triage", "systematic review", "PDF extraction", "effect size", "sample size", "supporting figure", "triage papers", "extract from PDFs"]
-tools: Read, Write, Edit, Glob, Grep, Bash, WebSearch
+tools: Read, Write, Edit, Glob, Grep, Bash, WebSearch, mcp__weaviate-kg__*, mcp__search__search_papers
 model: opus
 effort: high
 ---

@@ -1,6 +1,6 @@
 ---
 name: tester
-description: Test creation, verification, bug investigation with quality review
+description: Writes and runs pytest unit, integration, edge-case, and security tests; verifies behavior against the spec; investigates test failures to root cause; and reviews coverage for gaps. Use proactively after code changes that need test coverage, when a test is failing or flaky, or to harden an under-tested module. Not for writing the feature code itself (use the coder agent) or pure code review with no tests (use the code-review-expert skill).
 short_desc: writes pytest, integration tests, coverage review
 keywords: [pytest, "test coverage", "unit test", "integration test", "edge case", "regression test", "flaky test", "failing test first", "write tests", "add tests", "test suite", "coverage gap"]
 tools: Read, Write, Edit, Glob, Grep, Bash

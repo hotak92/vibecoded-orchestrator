@@ -31,8 +31,8 @@ You write automation scripts on demand. The designer describes what they need; y
 | **Cross-app, no Adobe Photoshop available** | Pillow / ImageMagick — see `batch-image-pipeline` skill |
 | **Heavy raw editing across hundreds of files** | Lightroom Classic + scripting (via `lr-plugin-sdk`) or Capture One |
 
-**UXP vs ExtendScript** (Adobe migration is in progress as of 2026):
-- New panels MUST be UXP — ExtendScript-based panels (CEP) are being phased out.
+**UXP vs ExtendScript**:
+- New panels MUST be UXP — ExtendScript-based panels (CEP) are the legacy path, being phased out by Adobe.
 - Standalone scripts (run via File → Scripts → Browse) — ExtendScript still works and is simpler to deliver as a one-off `.jsx` file.
 - Async I/O, modern syntax, Node-style modules — only UXP.
 
@@ -265,7 +265,7 @@ register(
 main()
 ```
 
-GIMP 3.0 (released 2025) moves toward Python 3 + GObject-introspection bindings; Script-Fu (Scheme dialect) remains supported but is the legacy path. Prefer Python.
+GIMP 3.x uses Python 3 + GObject-introspection bindings; Script-Fu (Scheme dialect) remains supported but is the legacy path. Prefer Python.
 
 ## Cross-platform notes
 

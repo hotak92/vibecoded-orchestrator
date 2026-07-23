@@ -1,6 +1,6 @@
 ---
 name: workflow-maintain
-description: Analyzes project workflow setup and suggests/creates needed automation for hooks, scripts, skills, and agents
+description: Analyzes a project's workflow setup and suggests or creates missing automation — hooks, helper scripts, skills, and agents — then audits existing automation for staleness. Use when bootstrapping a new project's automation, when a project has grown and repetitive manual steps recur, or when auditing workflow health. Not for simple single-file projects or one-off tasks.
 short_desc: audit and improve project workflow automation
 keywords: ["workflow automation", "project setup", "automation audit", "audit workflow", "setup workflow", "improve workflow", "add automation", "workflow improvement", "automate this task"]
 allowed-tools: Read, Write, Edit, Grep, Glob, Bash, Task
@@ -237,8 +237,6 @@ When creating new types of automation:
 - Generates files without showing full contents
 - Concise status updates
 - Delegates complex generation to scripts
-
-**Expected usage**: 1000-2000 tokens per invocation
 
 ## Success Metrics
 

@@ -177,6 +177,7 @@ If they don't have export data, the skill should not invent numbers — instead 
 
 ## Knowledge Systems
 
+> **Full reference**: the "Search Systems" and "Knowledge Graph" sections of this project's `CLAUDE.md`.
 
 **Decision tree**:
 - SaaS-metric definitions and patterns → `hybrid_search("SaaS metrics LTV churn definition")` (Weaviate MCP)

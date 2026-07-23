@@ -1,9 +1,9 @@
 ---
 name: experiment-designer
-description: Designs experiments from a hypothesis - proposes controls, power analysis, randomisation, blinding, preregistration checklist, and expected confounders - before any data is collected
+description: Designs experiments from a hypothesis - proposes controls, power analysis, randomisation, blinding, preregistration checklist, and expected confounders - before any data is collected. Use when a study needs a defensible design up front; not for running an analysis on existing data (use /stats-consult) or picking a single statistical test.
 short_desc: "study design: controls, power, preregistration"
 keywords: [experiment design, randomisation, blinding, preregistration, confounders, power analysis, reproducibility, "design an experiment", "study design", "A/B test design", "before collecting data", "experimental controls", RCT]
-tools: Read, Write, Edit, WebSearch, Bash
+tools: Read, Write, Edit, WebSearch, Bash, mcp__weaviate-kg__*, mcp__search__search_papers
 model: opus
 effort: xhigh
 ---

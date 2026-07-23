@@ -1,6 +1,6 @@
 ---
 name: database-advisor
-description: Expert guidance on database design, schema optimization, query performance, and database technology selection
+description: Expert guidance on database design, schema optimization, query performance, and database technology selection. Use when designing a schema from scratch, choosing between SQL/NoSQL/graph/vector databases, fixing a slow query, deciding on indexes, weighing normalize vs denormalize, or planning to scale a database under load. Not for writing a single simple CRUD query.
 short_desc: "DB choice, schema design, indexing, query perf"
 keywords: ["database schema", "query performance", "index design", "query optimization", "pick a database", "which database", "schema design", "slow query", "optimize query"]
 model: sonnet
@@ -8,24 +8,7 @@ model: sonnet
 
 # Database Advisor (Sonnet)
 
-**Purpose**: Expert guidance on database design, schema optimization, query performance, and database technology selection.
-
-**Model**: Sonnet (balanced reasoning for database architecture decisions)
-
-**When to Invoke Autonomously**:
-
-Use this skill when:
-1. **Schema Design**: "Design database schema for [application]"
-2. **Database Selection**: "SQL, NoSQL, graph, or vector database for [use case]?"
-3. **Query Optimization**: "Query too slow, how to optimize?"
-4. **Index Strategy**: "Which indexes to create for [access patterns]?"
-5. **Normalization Decisions**: "Should I normalize or denormalize for [performance/maintainability]?"
-6. **Scaling Strategy**: "Database can't handle load, how to scale?"
-
-**DO NOT invoke for**:
-- Simple CRUD queries (just write them)
-- Already-designed schema (use for optimization only)
-- Single table designs
+Expert guidance on database design, schema optimization, query performance, and database technology selection.
 
 ## Decision Tree
 
@@ -96,18 +79,14 @@ Compares databases:
 - **Sharding**: Scale writes (>100K QPS, complex)
 - **Caching**: Redis layer (reduces DB load 60-80%)
 
-## Output Format
-
 ## Quick Workflow Reference
 
-**Before implementing**: Search for proven patterns
+**Before implementing**: search for proven patterns.
 ```bash
 .claude/scripts/kg-search search "database" --type concept
 ```
 
-**For deep research**: Ask user "Use hybrid_search to research [database design]"
-
-**Development env**: Python 3.12, Weaviate:8081, Ollama:11435, venv: `source claude_mcp_servers/.venv/bin/activate`
+**For deep research**: run `hybrid_search("<database design topic>")` (Weaviate MCP).
 
 ## Integration with Knowledge Graph
 

@@ -199,7 +199,6 @@ Based on observed solo-founder patterns, the **default for** specific categories
 
 ## Knowledge Systems
 
-
 **Decision tree**:
 - Build-vs-buy reasoning patterns → `hybrid_search("build vs buy SaaS")` (Weaviate MCP)
 - Vendor landscape for a specific category → `WebFetch` competitor pricing pages

@@ -137,13 +137,11 @@ Do not auto-proceed to those followups; they involve different audiences and dif
 
 ## Knowledge graph integration
 
-Search the KG before assembling the digest:
+Search the KG before assembling the digest via the Weaviate MCP:
 
-```bash
-hybrid_search("portfolio status report patterns")
-hybrid_search("client engagement lifecycle")
-hybrid_search("consulting multi-tenancy isolation")
-```
+- `weaviate-kg:hybrid_search("portfolio status report patterns")`
+- `weaviate-kg:hybrid_search("client engagement lifecycle")`
+- `weaviate-kg:hybrid_search("consulting multi-tenancy isolation")`
 
 After producing a digest, if you discover a recurring pattern (e.g. "engagements past month 4 of fixed-price always go yellow"), write a KG node in `knowledge/concepts/` so future reviews can use it.
 

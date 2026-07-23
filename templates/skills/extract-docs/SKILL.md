@@ -1,10 +1,10 @@
 ---
 name: extract-docs
-description: Systematically extract knowledge from scattered documentation to prevent catastrophic forgetting. Creates structured extraction reports with status tags.
+description: Systematically extract knowledge from scattered documentation into structured reports with status tags ([IMPLEMENTED]/[DIDNT_WORK]/[FUTURE_IDEA]) to prevent catastrophic forgetting. Use when a project has 20+ scattered doc files, before archiving completed work, or when consolidating notes into canonical living documents. Not for well-organized docs or single-file extraction.
 short_desc: extract knowledge from scattered docs (structured)
 keywords: [documentation extraction, catastrophic forgetting, status tags, scattered docs, before archiving, "scattered documentation", "knowledge extraction", "before archival", "extract knowledge from docs", "pull info from documentation"]
 argument-hint: "[source-path-or-pattern]"
-allowed-tools: Read, Write, Grep, Glob, Bash, Task
+allowed-tools: Read, Write, Grep, Glob, Bash, Agent
 model: sonnet
 ---
 

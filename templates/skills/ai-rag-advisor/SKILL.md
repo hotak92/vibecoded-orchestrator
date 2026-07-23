@@ -1,16 +1,14 @@
 ---
 name: ai-rag-advisor
-description: Expert guidance on RAG (Retrieval-Augmented Generation) system design including chunking strategies, embedding selection, retrieval methods, and vector database choices
+description: Expert guidance on RAG (Retrieval-Augmented Generation) system design - chunking strategies, embedding model selection, retrieval methods (semantic/hybrid/graph/re-ranking), and vector database choice (Weaviate, Pinecone, Chroma, FAISS, Qdrant). Use when designing a RAG pipeline, choosing an embedding model or vector DB, or improving retrieval quality. For general model-selection questions unrelated to retrieval, use ai-model-selector instead.
 short_desc: "RAG design: chunking, retrieval, vector DB choice"
 keywords: ["RAG pipeline", "design a RAG system", "chunking strategy", "vector database", "choose an embedding model", "hybrid retrieval", "improve retrieval quality", "which vector database", "RAG evaluation"]
 model: sonnet
 ---
 
-# AI RAG Advisor (Sonnet)
+# AI RAG Advisor
 
 **Purpose**: Expert guidance on RAG (Retrieval-Augmented Generation) system design including chunking strategies, embedding selection, retrieval methods, and vector database choices.
-
-**Model**: Sonnet (balanced reasoning for RAG architecture, up-to-date on 2026 techniques)
 
 ## This Workflow's RAG Implementation (Reference)
 
@@ -52,6 +50,7 @@ When providing RAG guidance, you can reference this workflow's working implement
 **Collections Strategy**:
 - `[Project]_KnowledgeGraph` + shared KG: Concise patterns (<300 lines/node)
 - `[Project]_development`: Verbose project-specific docs (no size limit)
+
 **Performance**:
 - Keyword search: ~100ms (file-based)
 - Semantic search: ~500ms (Weaviate)

@@ -1,6 +1,6 @@
 ---
 name: orchestrator-installer
-description: Diagnoses partially-failed VCO installs and walks the user through install.py flag choices for finer-grained control
+description: Diagnoses partially-failed VCO orchestrator installs (container start failures, port conflicts, mid-run install.py exits, deferred items) and walks the user through install.py flag choices (--cpu-only, --no-containers, --low-resource, --skip-models, --skip-collections) plus pre-install environment audits. Use when an install broke or needs finer-grained control. Not the happy-path installer - the canonical first install is `bash first-install.sh` (Linux/macOS) or `first-install.bat` (Windows).
 short_desc: diagnoses partial-fail installs, advises on install.py flags
 keywords: ["fresh machine", "new machine install", "install Orchestrator", "cross-platform setup", "install VCO", "install on new machine", "set up VCO", "VCO install", "bootstrap VCO", "install failure", "install diagnostics", "partial install"]
 tools: Read, Write, Edit, Bash, Glob
@@ -9,8 +9,6 @@ effort: xhigh
 ---
 
 # Orchestrator Installer Agent
-
-#agent #installation #machine-setup #cross-platform
 
 Diagnoses partially-failed VCO installs and helps the user choose `install.py` flags
 when finer-grained control is needed. NOT the primary install path — that's

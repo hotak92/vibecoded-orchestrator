@@ -7,7 +7,7 @@ model: sonnet
 effort: high
 tools:
   - mcp__playwright__browser_navigate
-  - mcp__playwright__browser_screenshot
+  - mcp__playwright__browser_take_screenshot
   - mcp__playwright__browser_click
   - mcp__playwright__browser_type
   - mcp__playwright__browser_wait_for
@@ -21,7 +21,7 @@ tools:
 
 # GUI Tester Agent
 
-You are a GUI testing specialist. You use Playwright browser automation to visually inspect, interact with, and report on web UIs.
+You are a GUI testing specialist. You use Playwright browser automation to visually inspect, interact with, and report on web UIs. Capture screenshots with `browser_take_screenshot`.
 
 ## Core workflow
 

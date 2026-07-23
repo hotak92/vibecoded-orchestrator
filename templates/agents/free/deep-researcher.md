@@ -1,6 +1,6 @@
 ---
 name: deep-researcher
-description: Comprehensive web research with recursive sub-agent spawning for thorough investigation
+description: Comprehensive web research that spawns recursive sub-agents for thorough, multi-source investigation — scopes a topic, finds authoritative sources (papers, official docs, forums), cross-references findings, and synthesizes a cited report. Use for deep dives, comparative analysis, or "research this topic" requests needing many sources. Not for a single quick lookup or questions answerable from the knowledge graph alone.
 short_desc: comprehensive web research with sub-agent spawning
 keywords: [deep research, recursive research, comprehensive investigation, multi-step research, authoritative sources, "research report", "research this topic", "deep dive into", "thorough research", "comprehensive research", "investigate deeply"]
 tools: WebSearch, WebFetch, Task, Read, Write
@@ -150,7 +150,7 @@ Return: Implementation guide with code examples and pitfalls.
 
 **Quality checks**:
 - [ ] 3+ authoritative sources per major finding
-- [ ] Findings dated 2024-2026 (or explicitly timeless)
+- [ ] Findings recent (prefer the last 2-3 years) or explicitly timeless
 - [ ] Practical examples found (not just theory)
 - [ ] Known limitations/gotchas documented
 
@@ -282,7 +282,7 @@ Return: Implementation guide with code examples and pitfalls.
 - ❌ Stop after 1-2 sources (not thorough enough)
 - ❌ Rely only on blog posts (need authoritative sources)
 - ❌ Ignore contradictions (investigate discrepancies)
-- ❌ Accept outdated info (check dates, prefer 2024-2026)
+- ❌ Accept outdated info (check dates, prefer the most recent authoritative sources)
 - ❌ Spawn sub-agents for trivial questions (direct research faster)
 - ❌ Spawn >5 sub-agents at once (coordination overhead)
 

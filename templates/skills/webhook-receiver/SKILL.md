@@ -245,7 +245,6 @@ After completing, document the receiver in `knowledge/projects/webhook-{provider
 
 ## Knowledge Systems
 
-
 **Decision tree**:
 - Known terms → `kg-search` CLI
 - Conceptual → `hybrid_search` MCP

@@ -1,6 +1,6 @@
 ---
 name: security-reviewer
-description: Cross-layer security analysis (frontend XSS/CSRF, backend injection, AI prompt injection, infrastructure)
+description: Cross-layer security review covering frontend (XSS, CSRF, CSP), backend (SQL/NoSQL/command injection, path traversal, auth/authz, session management), AI (prompt injection, data exfiltration, output filtering), and infrastructure (exposed secrets, weak crypto, missing headers). Maps attack surface, threat-models entry points, and gives concrete remediation. Use when reviewing auth or input-handling code, before a production deploy, or after a vulnerability is discovered. Not for internal utilities with no external input or documentation-only changes.
 short_desc: XSS/CSRF/SQLi/prompt-injection cross-layer audit
 keywords: [XSS, CSRF, "SQL injection", "prompt injection", "security review", OWASP, "code review", "security audit", "pre-release review", "API authentication", "security check", "is this secure", "secure my app", "authentication review"]
 model: opus
@@ -84,9 +84,9 @@ Code involves:
 .claude/scripts/kg-search search "security" --type concept
 ```
 
-**For deep research**: Ask user "Use hybrid_search to research [vulnerability type]"
+**For deep research**: run `hybrid_search("<vulnerability type topic>")` (Weaviate MCP)
 
-**Development env**: Python 3.12, Weaviate:8081, Ollama:11435, venv: `source claude_mcp_servers/.venv/bin/activate`
+**Development env**: Python 3.12, Weaviate:8081, Ollama:11435. KG/code-graph scripts run through the `.claude/scripts/kg-*` and `.claude/scripts/code-graph-*` wrappers, which resolve the correct venv internally.
 
 ## Success Metrics
 

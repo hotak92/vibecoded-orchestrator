@@ -1,6 +1,6 @@
 ---
 name: helper-scripter
-description: Creates agents, skills, hooks, helper scripts. Self-improves automation system.
+description: Creates agents, skills, hooks, and helper scripts to automate repetitive workflows. Use when the user asks to write a script or hook, author an agent or skill definition, or eliminate a recurring manual pattern.
 short_desc: creates agents, skills, hooks, and automation scripts
 keywords: ["bash script", "shell script", "automation script", "helper script", "create a script", "write a hook", "create agent", "create skill", "slash command", "Claude Code hook"]
 tools: Read, Write, Edit, Grep, Glob, Bash
@@ -360,26 +360,42 @@ Create the right tool for the pattern:
 
 ## Tool Types Deep Dive
 
-### Skills (`.claude/skills/*.md`)
+### Skills (`.claude/skills/NAME/SKILL.md`)
+
+Each skill is a directory whose entrypoint is `SKILL.md` (YAML frontmatter + markdown instructions). The directory name becomes the `/command` name. Supporting files (templates, examples, scripts) live alongside `SKILL.md` and are loaded/executed only when needed — reference them from `SKILL.md`, one level deep.
 
 **When to create**:
-- Consultative advice needed repeatedly
-- Auto-invocation based on keywords
-- Quick interactions (<2000 tokens)
+- Consultative advice or a repeatable procedure needed across sessions
+- Auto-invocation based on the description matching the user's request
+- Instructions you keep re-pasting into chat
 - Cross-project applicability
 
-**Model selection**:
-- **Haiku**: Fast, cheap - file operations, simple checks, maintenance
-- **Sonnet**: Balanced - coordination, planning, code review
-- **Opus**: Expensive - architecture, research synthesis, complex reasoning
+**Frontmatter** (all fields optional; `description` strongly recommended):
+- `name` — lowercase letters/numbers/hyphens, max 64 chars (display name; the directory name sets the command).
+- `description` — third person, non-empty, max 1,024 chars. State WHAT the skill does AND WHEN to use it, with the trigger keywords a user would naturally type. Claude matches this text to decide auto-invocation; vague descriptions ("Helps with documents") never trigger.
+- `argument-hint`, `allowed-tools` (pre-approve tools for the invoking turn), `model`, `effort`, `context: fork` + `agent` (run in an isolated subagent), `hooks` — supported by the CLI runtime.
+- VCO extras: `keywords:` (list of literal trigger phrases) and `short_desc:` (one-line scope hint) feed the UserPromptSubmit keyword-suggester hook.
+- Invocation control: `disable-model-invocation: true` makes the skill user-only and removes its description from Claude's context — never set it on a bundled skill (they must stay autonomously invocable). `user-invocable: false` hides it from the `/` menu (Claude-only background knowledge).
 
-### Agents (`.claude/agents/*.md`)
+**Body**: keep `SKILL.md` under 500 lines; be concise (Claude already knows general programming — only add what it can't infer); use consistent terminology; provide one default approach with an escape hatch rather than many options; no time-sensitive content. `$ARGUMENTS` / `$0`, `$1`, ... substitute invocation arguments.
+
+### Agents (`.claude/agents/NAME.md`)
+
+A single markdown file: YAML frontmatter + a body that becomes the subagent's SYSTEM PROMPT (the subagent gets only this prompt plus basic environment info — write it self-contained).
 
 **When to create**:
-- Long-running multi-step work
-- Needs process isolation
-- Explicit spawn required
-- Substantial implementation
+- Long-running multi-step work with substantial output
+- Work that should stay out of the main conversation's context
+- Tool/permission restrictions need enforcing (e.g. read-only reviewer)
+- The same kind of worker keeps being spawned with the same instructions
+
+**Frontmatter** (`name` + `description` required):
+- `name` — unique, lowercase letters and hyphens.
+- `description` — when Claude should delegate to this agent. Claude auto-delegates by matching this against the task; include what the agent does, when to use it, and phrases like "use proactively" to encourage delegation.
+- Optional: `tools` / `disallowedTools` (allow/deny lists; inherits all if omitted), `model` (`sonnet` | `opus` | `haiku` | `fable` | full ID | `inherit`, default `inherit`), `permissionMode`, `maxTurns`, `effort`, `isolation: worktree`, `background`, `memory` (`user` | `project` | `local`), `skills` (preloaded full-content), `mcpServers`, `hooks`.
+- VCO extras: `keywords:` and `short_desc:` (same keyword-suggester hook as skills).
+
+**Model selection**: leave `model` unset (`inherit`) by default. Set `fable` for the deepest reasoning (final plans, adversarial review, hard architecture/debugging), `opus` for heavy offloaded implementation, `sonnet` for high-volume read-and-report fan-outs, `haiku` for mechanical single-purpose tasks.
 
 ### Hooks (`.claude/hooks/*.sh`)
 
@@ -711,7 +727,7 @@ Search knowledge graph for "bash venv activation patterns"
 - Core functionality only
 - Clear documentation
 - One example
-- <200 lines for Skills/Agents
+- Skills/Agents: start under 200 lines; never exceed the 500-line SKILL.md ceiling — split detail into supporting files instead
 
 **Use parallel tool calls** when reading examples/templates.
 

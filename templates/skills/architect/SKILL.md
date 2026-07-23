@@ -78,6 +78,13 @@ Is this task:
 
 ## Output Format
 
+Structure the deliverable as:
+1. **Problem restatement** — the requirement, constraints, and non-functional needs in one paragraph.
+2. **Options** — 2-3 candidate architectures, each with a component sketch (text diagram) and explicit pros/cons.
+3. **Recommendation** — the chosen option with the decision rationale ("X over Y because …").
+4. **Risks + mitigations** — technical risks, failure modes, and how each is handled.
+5. **Next steps** — what to prototype or validate first.
+
 ## Quick Workflow Reference
 
 **Before implementing**: Search for proven patterns
@@ -85,9 +92,9 @@ Is this task:
 .claude/scripts/kg-search search "architecture" --type concept
 ```
 
-**For deep research**: Ask user "Use hybrid_search to research [system design]"
+**For deep research**: run `hybrid_search("<system design topic>")` (Weaviate MCP)
 
-**Development env**: Python 3.12, Weaviate:8081, Ollama:11435, venv: `source claude_mcp_servers/.venv/bin/activate`
+**Development env**: Python 3.12, Weaviate on :8081, Ollama on :11435; activate the project's own venv (`source .venv/bin/activate`) for project code.
 
 ## Integration with Knowledge Graph
 

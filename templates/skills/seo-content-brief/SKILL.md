@@ -340,7 +340,7 @@ TL;DR (80 words):
 ## What this skill is NOT
 
 - Not a writer. You produce the brief; the user/writer produces the article.
-- Not a keyword researcher. The user provides the target keyword (or asks `/keyword-research` separately — not yet built).
+- Not a keyword researcher. The user provides the target keyword; keyword discovery is a separate step.
 - Not a Google. You don't have live SERP access unless WebFetch is available and the user authorizes URLs.
 - Not a backlink-build tool. You suggest a promo plan; the user executes.
 

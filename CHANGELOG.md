@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Bundled agent and skill templates reviewed against the official skill/
+  subagent authoring guidance**: frontmatter validated everywhere, vague or
+  mismatched descriptions rewritten with concrete trigger phrasing (skills
+  stay autonomously invocable — no invocation gates), narrative and
+  unverifiable-statistic content removed, stale tool/venv references fixed,
+  and the three authoring-guidance templates (prompt-engineer,
+  helper-scripter, ai-prompting) refreshed from the current official
+  documentation.
+
 ### Fixed
 
 - **Orchestrator update no longer dead-ends on an untracked-file collision.**

@@ -1,6 +1,6 @@
 ---
 name: task-breakdown
-description: Break complex features into implementable tasks with estimates, dependencies, and risk assessment
+description: Breaks a complex feature or epic into implementable 1-2 hour tasks with three-point effort estimates, a dependency graph plus critical path, and a technical/scope/dependency risk assessment. Use when the user says "break down [feature] into tasks", "estimate effort for [feature]", "what are the dependencies for [X]", or "plan the implementation of [Y]". Not for already-decomposed work or single-step tasks.
 short_desc: decompose feature into tasks, estimates, dependencies
 keywords: [task decomposition, effort estimation, dependency mapping, sprint planning, risk assessment, "implementation plan", "break into tasks", "task list for", "estimate this", "effort estimate", "decompose this"]
 model: sonnet
@@ -80,9 +80,9 @@ Feature work:
 .claude/scripts/kg-search search "planning" --type concept
 ```
 
-**For deep research**: Ask user "Use hybrid_search to research [estimation techniques]"
+**For deep research**: run `hybrid_search("<estimation techniques topic>")` (Weaviate MCP)
 
-**Development env**: Python 3.12, Weaviate:8081, Ollama:11435, venv: `source claude_mcp_servers/.venv/bin/activate`
+**Development env**: Python 3.12, Weaviate:8081, Ollama:11435. KG/code-graph scripts run through the `.claude/scripts/kg-*` and `.claude/scripts/code-graph-*` wrappers, which resolve the correct venv internally.
 
 ## Success Metrics
 

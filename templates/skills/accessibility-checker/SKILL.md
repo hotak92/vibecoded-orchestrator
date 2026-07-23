@@ -1,6 +1,6 @@
 ---
 name: accessibility-checker
-description: Quick A11y review - WCAG 2.1 checklist, screen reader compatibility, keyboard navigation, color contrast
+description: Quick accessibility review of UI code against a WCAG 2.1 AA checklist - semantic HTML, ARIA labels, keyboard navigation, focus management, color contrast, alt text, and form labels. Use when reviewing a component or page for a11y, checking WCAG compliance, or verifying screen-reader and keyboard support. For a full audit with automated tooling, hand off to a dedicated accessibility suite instead.
 short_desc: WCAG-2.1 / a11y compliance checklist review
 keywords: [WCAG, A11y, "screen reader", ARIA, "color contrast", "check accessibility", "WCAG compliance"]
 model: haiku
@@ -61,9 +61,7 @@ See [template.md](template.md) for structured review format.
 .claude/scripts/kg-search search "accessibility" --type concept
 ```
 
-**For deep research**: Ask user "Use hybrid_search to research [a11y topic]"
-
-**Development env**: Python 3.12, Weaviate:8081, Ollama:11435, venv: `source claude_mcp_servers/.venv/bin/activate`
+**For deep research**: `hybrid_search("[a11y topic]")` (Weaviate MCP)
 
 ## Success Metrics
 

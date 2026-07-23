@@ -1,28 +1,25 @@
 ---
 name: ai-model-selector
-description: Quick guidance on choosing AI models (LLM/VLM/Embedding) based on task, VRAM, cost, and quality requirements
+description: Quick guidance on choosing self-hosted AI models (LLM/VLM/Embedding) based on task, VRAM budget, cost, and quality requirements, including quantization level and VRAM sizing. Use when picking a model for a new task, checking what fits a VRAM limit, or comparing two models. Not for tasks already committed to a model or using a hosted API (OpenAI/Anthropic).
 short_desc: choose LLM/VLM/embedding model by task + VRAM
 keywords: ["model selection", "which model", "pick a model", "choose a model", "best model for", Qwen, Llama, Gemma, Mistral, "VRAM budget", "model cost", "model latency"]
 model: sonnet
 ---
 
-# AI Model Selector (Sonnet)
+# AI Model Selector
 
-**Purpose**: Quick guidance on choosing AI models (LLM/VLM/Embedding) based on task, VRAM, cost, and quality requirements.
+Quick guidance on choosing AI models (LLM/VLM/Embedding) based on task, VRAM, cost, and quality requirements.
 
-**Model**: Sonnet (balanced reasoning for model comparison)
+**When to invoke**:
 
-**When to Invoke Autonomously**:
-
-Use this skill when:
 1. **Starting AI Project**: "Which model should I use for [task]?"
 2. **VRAM Constraints**: "What fits in 16GB VRAM?"
 3. **Quality vs Speed**: "Need faster inference, which smaller model?"
 4. **Multi-Model Choice**: Embedding model, VLM, or LLM for task?
 5. **Quantization Decision**: "Should I quantize, and to what level?"
 
-**DO NOT invoke for**:
-- Already committed to specific model
+**Do NOT invoke for**:
+- Already committed to a specific model
 - Using enterprise/API models (not self-hosted)
 - Model choice is non-critical (prototyping)
 
@@ -76,9 +73,9 @@ Analyzes tradeoffs across quality tiers:
 ### 4. Quantization Recommendations
 
 Guidance on quantization levels:
-- **Q4_K_M**: Best balance (4-5% quality loss, 40% VRAM savings)
-- **Q5_K_M**: High quality (2-3% loss)
-- **Q8_0**: Near-FP16 quality (1% loss)
+- **Q4_K_M**: Best balance — noticeable VRAM savings over FP16 with minor quality loss (the common default)
+- **Q5_K_M**: Higher quality, slightly larger footprint than Q4_K_M
+- **Q8_0**: Near-FP16 quality, largest quantized footprint
 
 ## Output Format
 
@@ -91,9 +88,9 @@ See [template.md](template.md) for complete model recommendation structure.
 .claude/scripts/kg-search search "llm" --type model
 ```
 
-**For deep research**: Ask user "Use hybrid_search to research [model selection]"
+**For deep research**: `hybrid_search("model selection [task]")` (Weaviate MCP)
 
-**Development env**: Python 3.12, Weaviate:8081, Ollama:11435, venv: `source claude_mcp_servers/.venv/bin/activate`
+**Development env**: Python 3.12, Weaviate on :8081, Ollama on :11435. KG/code-graph scripts under `.claude/scripts/` activate the project venv automatically.
 
 ## Integration with Knowledge Graph
 

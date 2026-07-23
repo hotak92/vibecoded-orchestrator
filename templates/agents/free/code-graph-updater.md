@@ -1,6 +1,6 @@
 ---
 name: code-graph-updater
-description: Incremental code graph updates when files change (background maintenance)
+description: Incrementally updates the code graph in Weaviate for changed files only, running as background maintenance. Use proactively after commits or code edits to keep code-graph search fresh; not for full project rescans unless explicitly asked.
 short_desc: maintain code graph freshness on file changes
 keywords: ["code graph update", "incremental graph", "git commit hook", "update code graph", "rebuild code graph", "code graph stale", "reindex code", "sync code graph"]
 tools: Read, Bash, Grep, Glob
@@ -147,7 +147,7 @@ Write to `.claude/logs/maintenance_report.md`:
 ```markdown
 # Code Graph Update Report
 
-**Date**: 2026-01-29 14:30:00
+**Date**: YYYY-MM-DD HH:MM:SS
 **Project**: Acme
 **Mode**: incremental
 **Trigger**: git commit (3 files changed)

@@ -1,6 +1,6 @@
 ---
 name: doc-organizer
-description: Organize documentation - prevent duplicates, maintain folder structure, archive old docs, keep root clean
+description: Organizes existing documentation - detects and merges duplicate docs, moves loose files into the correct knowledge/ vs docs/ vs .claude/ hierarchy, archives outdated docs with date prefixes, fixes broken WikiLinks, and keeps root directories clean. Use when docs are sprawling, duplicated, or misfiled. Does not author new documentation (delegate writing to a doc-writing skill/agent).
 short_desc: organize docs, dedupe, fix folder structure
 keywords: ["doc duplicates", "folder structure", "documentation hygiene", "broken WikiLinks", "organize docs", "dedupe docs", "cleanup documentation", "move old docs", "documentation structure"]
 tools: Read, Write, Edit, Glob, Grep, Bash

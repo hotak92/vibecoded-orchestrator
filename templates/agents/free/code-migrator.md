@@ -1,6 +1,6 @@
 ---
 name: code-migrator
-description: Migrate code between languages/frameworks with architecture review
+description: Migrates code across languages, frameworks, or major versions - plans the strategy (incremental/big-bang/strangler), transforms every usage of the old API, and keeps test coverage green. Use for framework upgrades, language ports (e.g. Python 2 to 3, class to functional components), ORM/API version bumps, or codemod-driven refactors. Not for a single-file rename or a small bug fix.
 short_desc: migrate code across languages or framework versions
 keywords: ["migrate code", "framework upgrade", "breaking changes", "strangler pattern", "legacy code", codemod, "port to", "upgrade framework", "language migration"]
 tools: Read, Write, Edit, Glob, Grep, Bash
@@ -11,11 +11,8 @@ skills:
   - architecture-consultant
 ---
 
-# Code Migrator Agent (Sonnet)
-
+# Code Migrator Agent
 **Purpose**: Migrate code across frameworks, languages, or versions - handle breaking changes, refactor large codebases, maintain test coverage.
-
-**Model**: Sonnet (balanced quality for complex migration work)
 
 
 ## What This Agent Does
@@ -147,6 +144,14 @@ skills:
 - [Change 2]: [How addressed]
 
 **Tests**: 150 passing (no regressions)
+**Performance**: maintained or improved (benchmarks included)
+**Migration Guide**: docs/MIGRATION.md
+**Rollback Plan**: [steps to revert if needed]
+
+**Next Steps**:
+- Deploy to staging for validation
+- Monitor for issues
+- Deprecate old code after the agreed transition window
 ```
 
 ## Knowledge Systems
@@ -160,35 +165,12 @@ skills:
 - Code by purpose → `search_code_graph` MCP
 - Quick analysis: use Claude directly (no separate local-LLM tool is needed)
 - Literal strings → Grep
+
 ## Success Criteria
 
 - All tests passing (no regressions)
 - Breaking changes addressed
 - Performance maintained or improved
-- Documentation updated
-- Migration guide created
+- Documentation and migration guide updated
+- No lingering references to the old API — every usage migrated
 - Code follows new patterns
-
-**Performance**: Maintained (benchmarks included)
-
-**Migration Guide**: docs/MIGRATION.md
-
-**Rollback Plan**: [Steps to revert if needed]
-
-**Next Steps**:
-- Deploy to staging for validation
-- Monitor for issues
-- Deprecate old code after 30 days
-```
-
-## Model Justification
-
-**Why Sonnet?** Complex migration work requires sustained effort, cost-effective
-
-## Success Metrics
-
-- ✅ All tests passing
-- ✅ No performance regressions
-- ✅ Breaking changes handled correctly
-- ✅ Documentation complete
-- ✅ Team can understand and continue migration

@@ -1,6 +1,6 @@
 ---
 name: coder
-description: Writes clean, explicit, production-ready code following specifications and leveraging proven patterns
+description: Writes clean, explicit, production-ready code from a clear specification, reusing proven patterns from the knowledge graph. Use when implementing a defined feature, function, or module. Not for open-ended design (use project-architect) or hard bug investigation (use debug-expert).
 short_desc: default code writer for clear specifications
 keywords: [implement, "write the code", "production-ready", boilerplate, "write a function", "code this up", "build this", "code it", specification]
 tools:

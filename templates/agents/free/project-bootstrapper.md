@@ -3,14 +3,12 @@ name: project-bootstrapper
 description: Refines initial CLAUDE.md / ARCHITECTURE.md / KG seed for projects where the add-project bundle's heuristics need a human-led second pass
 short_desc: refines bootstrap docs for projects with unusual structure
 keywords: [new project, bootstrap, from scratch, Claude Code setup, greenfield, "bootstrap project", "set up new project", "start a project", "init project", "create new project", "refine bootstrap docs", "iterate on CLAUDE.md"]
-tools: Read, Write, Edit, Glob, Bash, Task, AskUserQuestion
+tools: Read, Write, Edit, Glob, Bash, Agent, AskUserQuestion
 model: sonnet
 effort: high
 ---
 
 # Project Bootstrapper Agent
-
-#agent #bootstrap #new-project #project-setup
 
 Refines and iterates on the initial project documentation set produced by the
 orchestrator's add-project bundle flow. Not the primary install/bootstrap entry point —
@@ -38,9 +36,9 @@ in chat before committing.
 - Suggest which bundled agents/skills/hooks to disable for this scope (per the
   ORCHESTRATOR-CLAUDE.md.template's FIRST-SESSION scoping nudge)
 
-## When to invoke this agent
+## Scope — cases this agent handles
 
-The canonical bootstrap flow already covers most projects. Reach for this agent when:
+The canonical bootstrap flow already covers most projects. This agent's cases are:
 
 - The add-project flow ran successfully but CLAUDE.md / generated docs don't match
   the project's actual structure (unusual codebase layout the heuristic couldn't analyze)

@@ -1,6 +1,6 @@
 ---
 name: project-organizer
-description: Maintain overall project health - coordinate agents, prevent degradation, capture cross-project patterns
+description: Maintains overall project health — assesses documentation/test/KG organization, coordinates specialist agents to consolidate scattered files, and captures cross-project patterns to the knowledge graph. Use when a project accumulates duplicate docs, a bloated CONTEXT_STATE.md, disorganized tests, or recurring "we solved this already" problems. Not for one-off single-file edits or bug fixes.
 short_desc: ongoing health hygiene, prevent degradation, patterns
 keywords: [project health, cross-project patterns, documentation hygiene, knowledge capture, prevent degradation, "project hygiene", "cleanup project", "organize project", "project cleanup", "clean up the project"]
 tools: Read, Write, Edit, Glob, Grep, Bash
@@ -10,9 +10,7 @@ effort: high
 
 # Project Organizer Agent
 
-**Purpose**: Maintain overall project health, prevent degradation over time, and capture cross-project patterns for reuse.
-
-**Model**: Sonnet (requires reasoning for cross-project pattern recognition)
+Maintain overall project health, prevent degradation over time, and capture cross-project patterns for reuse.
 
 ## Core Responsibilities
 
@@ -246,11 +244,11 @@ Bash ls tests/ && ls tests/conftest.py 2>/dev/null && ls tests/pytest.ini 2>/dev
 **Spawn agents in parallel** (non-blocking):
 ```bash
 # If multiple independent issues
-Task doc-maintainer (Sonnet) - consolidate docs
-Task kg-navigator (Sonnet) - find pattern gaps
+Agent doc-maintainer (Sonnet) - consolidate docs
+Agent kg-navigator (Sonnet) - find pattern gaps
 
 # Wait for results, then sequential tasks
-Task test-organizer (Haiku) - organize tests (depends on doc findings)
+Agent test-organizer (Haiku) - organize tests (depends on doc findings)
 ```
 
 ## Before Starting

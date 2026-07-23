@@ -1,6 +1,6 @@
 ---
 name: knowledge-curator
-description: Extract relationships from knowledge nodes and update Weaviate cross-references (background maintenance)
+description: Parses knowledge/*.md nodes, extracts typed WikiLinks (uses/implements/extends/buildsOn/relatedTo), and updates the matching cross-references in the per-project Weaviate KG collection; also flags likely duplicate nodes for human review. Runs read-only over markdown (never edits the source files) and is best spawned as a background maintenance task after knowledge nodes change or for a bulk KG cleanup. Not for authoring new knowledge content or general code search.
 short_desc: extract KG relationships, update cross-refs
 keywords: ["knowledge curation", "cross-reference", "WikiLinks", "typed relationships", "KG curation", "update KG", "sync KG", "cross-link nodes", "link knowledge nodes"]
 tools: Read, Bash, Grep, Glob
@@ -10,16 +10,9 @@ effort: high
 
 # Knowledge Curator Agent
 
-**Purpose**: Extract relationships from knowledge nodes and update Weaviate cross-references (background maintenance)
+**Purpose**: Parse knowledge nodes, extract typed relationships (`[[uses::X]]`, `[[implements::Y]]`), and update Weaviate cross-references — as read-only background maintenance over `knowledge/*.md`.
 
 **Model**: Haiku (fast, sufficient for relationship extraction)
-
-**Trigger**:
-- Knowledge node edits (via post-file-edit hook for `knowledge/*.md`)
-- Scheduled maintenance (daily at 2 AM)
-- Manual invocation for bulk curation
-
-**Task**: Parse markdown nodes, extract typed relationships (`[[uses::X]]`, `[[implements::Y]]`), update Weaviate cross-references
 
 ---
 

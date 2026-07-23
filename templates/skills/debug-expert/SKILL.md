@@ -80,6 +80,29 @@ Bug is:
 
 ## Output Format
 
+Report each investigation as:
+
+```markdown
+## Bug: [one-line summary]
+
+**Symptoms**: [what is observed — errors, timing, frequency]
+**Reproduction**: [steps, or "intermittent — reproduces ~1 in N"]
+
+### Hypotheses (ranked)
+1. [most likely cause] — [why, and the test that confirms/eliminates it]
+2. [next] — [...]
+
+### Investigation
+[evidence gathered: relevant code paths, log/trace findings, git changes examined]
+
+### Root Cause
+[specific code/config/data traced to; the failure chain that led to it]
+
+### Fix
+- **Immediate**: [minimal change that resolves it]
+- **Preventive**: [test, monitoring, or validation to stop recurrence]
+```
+
 ## Integration with Knowledge Graph
 
 After debugging:
@@ -102,9 +125,9 @@ After debugging:
 .claude/scripts/kg-search search "bug-category" --type concept
 ```
 
-**For deep research**: Ask user "Use hybrid_search to research [error pattern]"
+**For deep research**: run `hybrid_search("<error pattern topic>")` (Weaviate MCP)
 
-**Development env**: Python 3.12, Weaviate:8081, Ollama:11435, venv: `source claude_mcp_servers/.venv/bin/activate`
+**Development env**: Python 3.12, Weaviate:8081, Ollama:11435. Activate the project's own `.venv/` (`source .venv/bin/activate`); KG/code-graph via `.claude/scripts/kg-*` and `.claude/scripts/code-graph-*` wrappers, which handle their venv internally.
 
 ## Success Metrics
 

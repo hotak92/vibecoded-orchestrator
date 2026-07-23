@@ -1,6 +1,6 @@
 ---
 name: kg-navigator
-description: Navigate knowledge graph - search, explore connections, identify gaps (read-only)
+description: Navigates the knowledge graph (read-only) to surface relevant patterns and prior solutions before new work begins — searches nodes, explores WikiLink connections, traces cross-project patterns, and flags knowledge gaps. Use to check "have we solved this before", explore what relates to a concept, or find undocumented topics. Not for writing or editing KG nodes.
 short_desc: "navigate KG: search, explore, find gaps"
 keywords: ["knowledge graph", "KG node", "WikiLinks", "search KG", "explore KG", "KG connections", "navigate knowledge", "find KG gaps"]
 tools:

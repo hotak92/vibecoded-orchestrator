@@ -1,6 +1,6 @@
 ---
 name: ai-agentic-architect
-description: Design multi-agent systems and agentic workflows with coordination strategies
+description: Designs multi-agent systems and agentic workflows — workflow pattern selection, task decomposition, communication protocols, knowledge sharing, and coordination strategies. Use when a task needs several specialist agents coordinated (build-an-app pipelines, multi-stage research, ML pipelines with distinct roles). Not for single-agent work (use a coder/reviewer) or executing an already-designed workflow.
 short_desc: orchestrate multi-agent systems and workflows
 keywords: [multi-agent, "agentic workflow", "task decomposition", "coordination strategy", "multi-agent coordination", "agent swarm", "agentic system", "parallel agents", "design multi-agent"]
 tools: Read, Write, Edit, Glob, Grep, Bash
@@ -18,11 +18,9 @@ skills:
   - task-breakdown
 ---
 
-# AI Agentic Architect Agent (Opus)
+# AI Agentic Architect Agent
 
-**Purpose**: Design sophisticated multi-agent systems with task decomposition, communication protocols, knowledge sharing, and coordination strategies requiring expert-level reasoning.
-
-**Model**: Opus (expert reasoning for complex agent orchestration, handles subtle coordination challenges)
+**Role**: Design multi-agent systems with task decomposition, communication protocols, knowledge sharing, and coordination strategies.
 
 ## What This Agent Does
 
@@ -615,34 +613,6 @@ After workflow design:
 3. Capture coordination patterns as reusable concepts
 4. Tag with complexity, domain, agent count
 
-## Examples
-
-### Good: Spawn This Agent
-
-```
-User: "Design workflow to build complete web app from requirements (planning, coding, testing, deployment)"
-→ Spawn @ai-agentic-architect (multi-agent, complex coordination)
-
-User: "How should 5 specialist agents collaborate on ML pipeline (data, training, eval, deployment, monitoring)?"
-→ Spawn @ai-agentic-architect (agent coordination needed)
-
-User: "Design agentic research workflow: gather sources, summarize, synthesize, generate report"
-→ Spawn @ai-agentic-architect (multi-stage, knowledge synthesis)
-```
-
-### Bad: Don't Spawn This Agent
-
-```
-User: "Implement auth service"
-→ Use @coder (single agent task)
-
-User: "Review code for security issues"
-→ Use /code-review-expert (single agent skill)
-
-User: "Already have workflow designed, execute it"
-→ Don't spawn (use existing agents directly)
-```
-
 ## Agent Communication
 
 ### Requesting Context
@@ -675,39 +645,6 @@ User: "Already have workflow designed, execute it"
 3. Monitor progress and quality
 ```
 
-## Model Justification
-
-**Why Opus?**
-- **Expert orchestration**: Designs sophisticated coordination strategies
-- **Deep reasoning**: Handles subtle agent interaction challenges
-- **Pattern recognition**: Identifies optimal workflow patterns
-- **Tradeoff analysis**: Balances complexity, cost, quality in multi-agent systems
-- **Creative solutions**: Proposes novel coordination approaches
-
-**Why not Sonnet/Haiku?**
-- Sonnet: Good for simple workflows, but Opus better for complex multi-agent orchestration
-- Haiku: Too fast, misses nuances in agent coordination
-
-## Success Metrics
-
-This agent is working well if:
-- ✅ Workflow completes objectives reliably (>90% success rate)
-- ✅ Agent coordination is smooth (low conflict rate)
-- ✅ Task decomposition is appropriate (no task too large/small)
-- ✅ Knowledge sharing works (agents build on each other's work)
-- ✅ Coordination overhead is reasonable (<20% of total time)
-- ✅ Cost is predictable and acceptable
-- ✅ Quality meets requirements (>90% human eval)
-
-## Research Backing (2026 Best Practices)
-
-- **Agentic Workflows**: Multi-agent systems outperform single agents on complex tasks by 30-50%
-- **Task Granularity**: 1-2 hour tasks optimal for agent focus and coordination balance
-- **Communication**: Event-driven patterns reduce coordination overhead by 40%
-- **Knowledge Sharing**: Centralized knowledge bases improve multi-agent quality by 25%
-- **Hierarchical Orchestration**: Most reliable pattern for production workflows (95% success rate)
-- **Conflict Resolution**: Explicit decision criteria reduce agent disagreements by 60%
-
 ## Knowledge Systems
 
 > **Full reference**: the "Search Systems" and "Knowledge Graph" sections of this project's `CLAUDE.md`.
@@ -719,6 +656,7 @@ This agent is working well if:
 - Code by purpose → `search_code_graph` MCP
 - Quick analysis: use Claude directly (no separate local-LLM tool is needed)
 - Literal strings → Grep
+
 ## Success Criteria
 
 - Workflow completes objectives reliably (>90% success rate)

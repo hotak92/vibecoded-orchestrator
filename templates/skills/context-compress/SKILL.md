@@ -1,6 +1,6 @@
 ---
 name: context-compress
-description: Guide for using /compact (Claude Code built-in) with the pre-compact save pipeline. Shows what gets saved before compression and what gets reinjected after.
+description: Guide for using /compact (Claude Code built-in) with the pre-compact save pipeline — what gets saved before compression and reinjected after. Use when the context window is filling up, before a long implementation session, or when switching focus and you want to compact without losing task state. Not a substitute for /compact itself, which is a built-in command.
 short_desc: "/compact pipeline pre-save context guidance"
 keywords: ["compact context", "/compact", "context window", "/compact context", "compress context", "before compact", "context too large", "save context state"]
 argument-hint: "[focus-topic]"

@@ -1,18 +1,11 @@
 ---
 name: project-coordinator
-description: Coordinate multi-agent workflows and track progress
+description: Coordinates several agents running in parallel — tracks task dependencies, monitors progress, resolves blockers, and keeps CONTEXT_STATE.md reflecting the live state. Use proactively when a feature is broken into tasks spread across multiple agents, when a critical path or dependency graph needs managing, or when parallel work needs a status roll-up. Not for single-agent tasks or one-off implementation work.
 short_desc: runtime orchestration, agent coordination, progress
 keywords: ["multi-agent coordination", "dependency tracking", "blocker resolution", "parallel execution", "progress tracking", "coordinate agents", "track progress", "manage multiple agents", "orchestrate work"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
 effort: high
-mcpServers:
-  orchestrator-tools:
-    command: {{ORCHESTRATOR_ROOT}}/claude_mcp_servers/.venv/bin/python
-    args:
-      - {{ORCHESTRATOR_ROOT}}/claude_mcp_servers/orchestrator_tools_mcp/server.py
-    env:
-      PYTHONPATH: {{ORCHESTRATOR_ROOT}}/claude_mcp_servers
 ---
 
 # Project Coordinator Agent (Sonnet)
