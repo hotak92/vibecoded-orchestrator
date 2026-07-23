@@ -4663,6 +4663,49 @@ pub async fn update_orchestrator<R: Runtime>(
         // — it reads .git/MERGE_HEAD vs .git/rebase-merge on disk — so
         // this is for the user-facing message only, but accuracy matters.)
         let combined = format!("{}\n{}", stderr, stdout);
+
+        // v0.2.88 (F2-followup / FIELD DEFECT): the untracked-overwrite abort
+        // MUST be caught BEFORE `is_merge_or_rebase_conflict`. Both match the
+        // "would be overwritten by" substring, but this abort happens BEFORE any
+        // merge starts, so `collect_conflicted_files` (which reads UNMERGED INDEX
+        // entries) returns EMPTY — the field bug where the conflict modal
+        // rendered zero files and no actionable resolution, degrading to a bare
+        // FAILED toast. The colliding paths ARE in the stderr, unparsed.
+        //
+        // `update_orchestrator`'s inline pull is the ONE surface that lacked the
+        // pre-pull `handle_untracked_collisions_pre_pull` guard (which only
+        // fronts the modal-triggered merge/rebase resolvers). This POST-pull
+        // classifier closes that gap by parsing the file list out of the stderr
+        // and routing to the dedicated untracked-collision handler + event. The
+        // upstream tip was already fetched (serialized_fetch_upstream above), so
+        // `compute_theirs_sha` resolves and the byte-identity classification is
+        // exact. Best-effort: a parse-empty / resolution-empty result falls
+        // through to the existing conflict/non-FF paths → never worse than today.
+        if crate::commands::git_user_editable_merge::is_untracked_overwrite_abort(&combined) {
+            // v0.2.88 (NIT-10): pass the ACTUAL pull-plan op, not a hardcoded
+            // "merge". A rebase-plan abort otherwise mislabels the payload's
+            // `operation` field + the deferral prose as "merge" (git's own abort
+            // message even says "by checkout" for a rebase). Same
+            // RealMerge→"merge" / else→"rebase" mapping the conflict/pop paths use.
+            let overwrite_op = if auto_merge_committed_divergence {
+                "merge"
+            } else {
+                "rebase"
+            };
+            if let Some(payload) = handle_untracked_overwrite_post_pull(
+                &install_path,
+                overwrite_op,
+                &pull_branch,
+                &combined,
+            )
+            .await
+            {
+                return Err(payload);
+            }
+            // Parse yielded nothing actionable → fall through to the legacy
+            // paths below (raw error), never a wrong action.
+        }
+
         if is_merge_or_rebase_conflict(&combined) {
             let conflict_op = if auto_merge_committed_divergence {
                 "merge"
@@ -4765,13 +4808,48 @@ pub async fn update_orchestrator<R: Runtime>(
         let autostash_pop_failed = pull_combined.contains("autostash resulted in conflicts")
             || pull_combined.contains("Applying autostash");
         let unmerged = collect_conflicted_files(&install_path).await;
-        if !unmerged.is_empty() || autostash_pop_failed {
+        // v0.2.88 (NIT-12): the autostash marker can appear in git's output even
+        // when the pop LEFT NO unmerged index entries (e.g. "Applying autostash"
+        // on a clean apply). Routing to a conflict/pop modal on that shape shows
+        // "0 file(s)" with live buttons whose only effect would be a blind stash
+        // drop (the shape MAJOR-1 now also refuses). The index is the authority:
+        // NO unmerged entries ⇒ nothing to resolve ⇒ do NOT emit any conflict/pop
+        // modal; log and fall through to the normal path. The block is entered
+        // ONLY when the index actually carries unmerged entries.
+        if autostash_pop_failed && unmerged.is_empty() {
+            eprintln!(
+                "[vct] update_orchestrator: autostash marker present but the index has \
+                 NO unmerged entries — the pop left the tree clean; not emitting a \
+                 (would-be-empty) conflict modal, continuing the update."
+            );
+        }
+        if !unmerged.is_empty() {
+            // v0.2.88 (DEFECT 2 / FIELD DEFECT): distinguish "the merge/rebase
+            // itself conflicted" from "the merge SUCCEEDED but the --autostash
+            // POP of the local WIP stash conflicted". In the pop-conflict case,
+            // git prints "Merge made by the 'ort' strategy" (or fast-forward)
+            // BEFORE "Applying autostash resulted in conflicts. Your changes are
+            // safe in the stash." Labeling this as a merge failure is the field
+            // bug — the update's merge is DONE; only the local-WIP restore
+            // clashed (a user hand-edited a tracked file this release touched).
+            // Emit the DISTINCT `orchestrator_autostash_pop_conflict` event so
+            // the modal can say so honestly and offer keep-updated / keep-local.
+            let merge_succeeded = pull_combined.contains("Merge made by")
+                || pull_combined.contains("Fast-forward")
+                || pull_combined.contains("Successfully rebased");
+            let pop_conflict_after_success = autostash_pop_failed && merge_succeeded;
+
             eprintln!(
                 "[vct] update_orchestrator: pull exited 0 but the working tree has \
-                 {} unmerged file(s){} — an --autostash pop conflict (TOCTOU race). \
-                 Routing to the conflict modal instead of proceeding on a broken tree.",
+                 {} unmerged file(s){} — {}. Routing to the {} modal.",
                 unmerged.len(),
                 if autostash_pop_failed { " + autostash-conflict marker" } else { "" },
+                if pop_conflict_after_success {
+                    "the merge SUCCEEDED, only the autostash pop conflicted"
+                } else {
+                    "an --autostash pop conflict (TOCTOU race)"
+                },
+                if pop_conflict_after_success { "autostash-pop" } else { "conflict" },
             );
             // Restore the running binary + hub (we renamed/stopped pre-pull)
             // so the user can keep using the launcher after they resolve.
@@ -4780,6 +4858,35 @@ pub async fn update_orchestrator<R: Runtime>(
                 pre_pull_renamed.as_deref(),
                 pre_pull_renamed_hub.as_deref(),
             );
+
+            if pop_conflict_after_success {
+                // The merge landed; only the WIP restore clashed. Write a
+                // pop-conflict deferral (distinct condition id) + return the
+                // distinct event — NOT the generic conflict event that would
+                // mislabel a completed merge as a failure.
+                write_autostash_pop_conflict_deferral(&install_path, &pull_branch, &unmerged);
+                // Also write a resume sentinel so the resolution command
+                // (resolve_autostash_pop_and_retry) can delegate to the standard
+                // resume tail (install.py + binary refresh) after the user picks
+                // keep-updated / keep-local. `sha_at_conflict = old_sha` (the
+                // pre-merge HEAD) is guaranteed DIFFERENT from the now-advanced
+                // HEAD, so resume's HEAD-advance guard passes. Labeled
+                // "autostash-pop" to keep the operation semantics honest.
+                if let Some(old) = old_sha.as_deref() {
+                    write_update_resume_sentinel(
+                        &install_path,
+                        "autostash-pop",
+                        &pull_branch,
+                        old,
+                    );
+                }
+                return Err(serialize_autostash_pop_conflict_error(
+                    &pull_branch,
+                    &unmerged,
+                    pull_combined.trim(),
+                ));
+            }
+
             let conflict_op = if auto_merge_committed_divergence {
                 "merge"
             } else {
@@ -5440,6 +5547,48 @@ fn serialize_orchestrator_conflict_error(
     )
 }
 
+/// v0.2.88 (DEFECT 2 / FIELD DEFECT) — serialize the AUTOSTASH-POP conflict
+/// payload. This is a DISTINCT event from `orchestrator_update_conflict`: the
+/// merge/rebase itself SUCCEEDED, but `git pull --autostash`'s POP of the local
+/// WIP stash conflicted (a user hand-edited a tracked file that this release also
+/// touched). Labeling this as a "merge failure" is the field bug — the merge is
+/// done; only the local-WIP restore clashed. The user's changes are SAFE in the
+/// stash. The modal lists the pop-conflicted files and offers ONE direction for
+/// the WHOLE set (the backend `resolve_autostash_pop_and_retry` takes a single
+/// `keep_updated: bool` applied to every file — a mixed decision is a
+/// terminal-only path via the deferral):
+///   * keep the UPDATED version (drop the stashed local change), or
+///   * keep LOCAL (take the stashed change).
+/// EITHER way the discarded side is backed up to
+/// `.claude/state/update-collision-backups-<ts>/` first (MAJOR-2), so the choice
+/// is reversible.
+///
+/// Schema:
+///   {
+///     "event": "orchestrator_autostash_pop_conflict",
+///     "branch": "main",
+///     "conflicted_files": ["path/a", ...],
+///     "git_stderr": "<raw output>"
+///   }
+fn serialize_autostash_pop_conflict_error(
+    branch: &str,
+    conflicted_files: &[String],
+    git_stderr: &str,
+) -> String {
+    let stderr_esc = crate::commands::self_update::json_escape(git_stderr);
+    let files_field: String = {
+        let parts: Vec<String> = conflicted_files
+            .iter()
+            .map(|p| format!("\"{}\"", crate::commands::self_update::json_escape(p)))
+            .collect();
+        format!("[{}]", parts.join(","))
+    };
+    format!(
+        "{{\"event\":\"orchestrator_autostash_pop_conflict\",\"branch\":\"{}\",\"conflicted_files\":{},\"git_stderr\":\"{}\"}}",
+        branch, files_field, stderr_esc
+    )
+}
+
 /// v0.2.78 ITEM #0 (F2) — serialize the UNTRACKED-collision payload the
 /// divergence modal renders as a keep-mine / take-upstream chooser. Distinct
 /// `event` from `orchestrator_update_conflict` so the Svelte side does NOT show
@@ -5627,6 +5776,231 @@ fn write_untracked_collision_deferral(
             operation, e,
         );
     }
+}
+
+/// v0.2.88 (DEFECT 2 / FIELD DEFECT) — write an UPDATE_DEFERRED.md row for an
+/// autostash-pop conflict (merge succeeded; local-WIP restore clashed). Distinct
+/// condition id from the untracked-collision row. Agent-resolvable channel so a
+/// terminal user can also resolve; the modal alone is not sufficient.
+/// Best-effort: a failure logs and is swallowed.
+fn write_autostash_pop_conflict_deferral(
+    install_path: &Path,
+    branch: &str,
+    conflicted_files: &[String],
+) {
+    let files_list = conflicted_files.join(", ");
+    let detected = format!(
+        "The orchestrator update on {branch} MERGED SUCCESSFULLY, but restoring your local \
+         uncommitted changes (git --autostash pop) conflicted on: {files}. Your local changes \
+         are SAFE in the git stash. The update paused so you can choose one direction for the \
+         whole set — keep the updated version, or keep your local version — with the discarded \
+         side backed up first. (For a mixed keep-some / discard-some decision, resolve the \
+         files individually via the manual steps below.)",
+        branch = branch,
+        files = files_list,
+    );
+    let why = "The merge is complete — only the local-WIP restore clashed (you edited a tracked \
+        file this release also changed). Nothing was lost: `git stash list` still holds your \
+        changes. PREFERRED resolution: the launcher's autostash-pop modal (keep-updated / \
+        keep-local per set) backs up the discarded side and finishes the update in one click. \
+        The manual steps below are a fallback — they RE-PROBE before touching anything so a \
+        stale copy of this note (run after the pop was already resolved) can't drop an \
+        unrelated stash.";
+    let first = conflicted_files.first().cloned().unwrap_or_default();
+    // v0.2.88 (MAJOR-3): the manual block MUST NOT tell an agent to run a bare
+    // `git stash drop` — replayed against an already-resolved repo (this row is
+    // stale) that hits an UNRELATED stash. Re-probe first (unmerged files must
+    // still exist), and drop ONLY the SPECIFIC autostash entry by SHA, guarded
+    // on the re-probe. Framed as a FALLBACK to the launcher modal.
+    let command = format!(
+        "```bash\n\
+         # PREFERRED: click the launcher's autostash-pop modal (keep updated / keep\n\
+         # local). It backs up the discarded side and finishes the update. Use the\n\
+         # manual fallback below ONLY if you can't use the launcher.\n\
+         #\n\
+         # RE-PROBE FIRST — this note may be stale (the pop may already be resolved).\n\
+         # If the next command prints NOTHING, STOP: there is nothing to resolve and\n\
+         # you must NOT run any checkout/stash-drop (dropping the stash now would\n\
+         # destroy an unrelated stash).\n\
+         git diff --name-only --diff-filter=U   # must list the conflicted file(s)\n\
+         #\n\
+         # If (and only if) files are listed, for EACH one choose ONE:\n\
+         #   (a) KEEP THE UPDATED VERSION (discard your local change for this file):\n\
+         git checkout --ours -- \"{first}\" && git add -- \"{first}\"\n\
+         #   (b) KEEP YOUR LOCAL VERSION (take your stashed change):\n\
+         #   git checkout --theirs -- \"{first}\" && git add -- \"{first}\"\n\
+         #\n\
+         # After resolving ALL listed files, drop ONLY this autostash entry by SHA\n\
+         # (never a bare `git stash drop`, which targets stash@{{0}} — possibly an\n\
+         # unrelated stash). Confirm the SHA first, then drop it:\n\
+         SHA=$(git rev-parse --verify --quiet 'stash@{{0}}')\n\
+         [ -n \"$SHA\" ] && git stash drop 'stash@{{0}}'   # your WIP is now applied/discarded\n\
+         # then re-run the update (launcher Continue Update or `python install.py --update`)\n\
+         ```",
+        first = first,
+    );
+
+    let fields = crate::services::deferral::DeferralEntryFields {
+        condition_id: "autostash_pop_conflict",
+        title: "Update merged, but restoring your local changes conflicted (choose keep-updated or keep-local)",
+        detected: &detected,
+        why_deferred: why,
+        command_to_apply: &command,
+        severity: "warning",
+    };
+    if let Err(e) =
+        crate::services::deferral::emit_deferral_entry(install_path, install_path, &fields)
+    {
+        eprintln!(
+            "[vct] update_orchestrator: could not emit autostash_pop_conflict deferral \
+             (non-fatal): {}",
+            e,
+        );
+    }
+}
+
+/// v0.2.88 (F2-followup / FIELD DEFECT) — serialize the untracked-collision
+/// payload the divergence modal renders WITH a "Resolve & retry" affordance.
+///
+/// This is the enriched sibling of `serialize_untracked_collision_error` (which
+/// only ever listed DIVERGENT files for the pre-pull leave-alone path). This
+/// POST-pull payload carries the FULL parsed collision set split into:
+///   * `identical_files` — byte-identical to the incoming blob → the resolve
+///     command deletes them (no data loss).
+///   * `divergent_files` — content differs → the resolve command backs each up
+///     to `.claude/state/update-collision-backups-<ts>/` BEFORE deleting.
+/// so the modal can show the two groups and the user can click one button to
+/// resolve every path and re-run the update. Same JSON-escape machinery as the
+/// other serializers (one home for the escaper).
+fn serialize_untracked_collision_resolvable_error(
+    operation: &str,
+    branch: &str,
+    identical_files: &[String],
+    divergent_files: &[String],
+    git_stderr: &str,
+) -> String {
+    let to_json_array = |items: &[String]| -> String {
+        let parts: Vec<String> = items
+            .iter()
+            .map(|p| format!("\"{}\"", crate::commands::self_update::json_escape(p)))
+            .collect();
+        format!("[{}]", parts.join(","))
+    };
+    let stderr_esc = crate::commands::self_update::json_escape(git_stderr);
+    format!(
+        "{{\"event\":\"orchestrator_untracked_collision\",\"operation\":\"{}\",\"branch\":\"{}\",\
+         \"resolvable\":true,\"identical_files\":{},\"divergent_files\":{},\"git_stderr\":\"{}\"}}",
+        operation,
+        branch,
+        to_json_array(identical_files),
+        to_json_array(divergent_files),
+        stderr_esc,
+    )
+}
+
+/// v0.2.88 (F2-followup / FIELD DEFECT) — POST-pull untracked-overwrite handler.
+///
+/// `update_orchestrator`'s inline pull is the ONE surface that lacked the
+/// pre-pull `handle_untracked_collisions_pre_pull` guard. When that pull aborts
+/// with "untracked working tree files would be overwritten by merge", the
+/// colliding paths are ONLY in the stderr (nothing merged, so the index has no
+/// unmerged entries and `collect_conflicted_files` is empty). We parse them out,
+/// classify each against the incoming upstream blob, write the agent-resolvable
+/// deferral, and return the enriched `orchestrator_untracked_collision` payload
+/// so the modal renders the files + a "Resolve & retry" button.
+///
+/// Returns:
+///   * `Some(payload)` — at least one colliding path was parsed AND still exists
+///     on disk as a real untracked file (the resolvable state). The caller
+///     returns this so the modal surfaces.
+///   * `None` — nothing actionable (parse empty, or none of the parsed paths
+///     resolve to a real on-disk file). The caller falls through to the existing
+///     conflict/non-FF paths → NEVER worse than the pre-fix behavior.
+///
+/// Data-safety: this function performs NO filesystem mutation — it only
+/// classifies + defers + serializes. The actual delete/backup happens in the
+/// user-driven `resolve_untracked_collision_and_retry` command.
+async fn handle_untracked_overwrite_post_pull(
+    install_path: &Path,
+    operation: &str,
+    branch: &str,
+    combined_stderr: &str,
+) -> Option<String> {
+    use crate::commands::git_user_editable_merge::{
+        compute_theirs_sha, local_matches_incoming_blob, parse_untracked_overwrite_files,
+    };
+
+    let parsed = parse_untracked_overwrite_files(combined_stderr);
+    if parsed.is_empty() {
+        return None; // parse failure → fall through (never worse).
+    }
+
+    // Keep only paths that are REAL untracked files under the install root. A
+    // parsed path that doesn't resolve to a file (quoted/escaped path we didn't
+    // un-quote, or a race where it vanished) is dropped — we never act on a path
+    // we can't confirm on disk.
+    let mut present: Vec<String> = Vec::new();
+    for path in parsed {
+        // Refuse traversal / absolute paths defensively even at classify time.
+        if path.contains("..") || Path::new(&path).is_absolute() {
+            eprintln!(
+                "[vct] {}: skipping suspicious collision path from stderr: {:?}",
+                operation, path
+            );
+            continue;
+        }
+        if install_path.join(&path).is_file() {
+            present.push(path);
+        }
+    }
+    if present.is_empty() {
+        return None; // nothing on disk to resolve → fall through.
+    }
+
+    // Classify each present path against the incoming upstream blob. The tip was
+    // already fetched by the caller, so `theirs` resolves; if it can't, treat
+    // every path as divergent (conservative — back up before delete).
+    let theirs = compute_theirs_sha(install_path, branch).await.ok().flatten();
+    let mut identical: Vec<String> = Vec::new();
+    let mut divergent: Vec<String> = Vec::new();
+    for path in present {
+        let is_identical = match theirs.as_deref() {
+            Some(t) => local_matches_incoming_blob(install_path, t, &path).await,
+            None => false,
+        };
+        if is_identical {
+            identical.push(path);
+        } else {
+            divergent.push(path);
+        }
+    }
+
+    eprintln!(
+        "[vct] {}: untracked-overwrite abort parsed {} identical + {} divergent collision(s) \
+         from stderr — surfacing resolvable modal (no auto-mutation here)",
+        operation,
+        identical.len(),
+        divergent.len(),
+    );
+
+    // Deferral (agent-resolvable channel). Divergent files are the risky ones;
+    // if there are none, still record the identical set so a terminal user has a
+    // trace. Reuse the existing writer for the divergent case; for an
+    // identical-only set, list them too (they're safe to delete).
+    let defer_list = if divergent.is_empty() {
+        identical.clone()
+    } else {
+        divergent.clone()
+    };
+    write_untracked_collision_deferral(install_path, operation, branch, &defer_list);
+
+    Some(serialize_untracked_collision_resolvable_error(
+        operation,
+        branch,
+        &identical,
+        &divergent,
+        combined_stderr.trim(),
+    ))
 }
 
 /// Detect whether git stderr indicates a merge or rebase produced
@@ -6652,7 +7026,16 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
         let autostash_pop_failed = pull_combined.contains("autostash resulted in conflicts")
             || pull_combined.contains("Applying autostash");
         let unmerged = collect_conflicted_files(&install_path).await;
-        if !unmerged.is_empty() || autostash_pop_failed {
+        // v0.2.88 (NIT-12): the index is the authority. An autostash marker with
+        // NO unmerged entries means the pop applied clean — do NOT emit an empty
+        // "0 file(s)" conflict modal; fall through to the normal path.
+        if autostash_pop_failed && unmerged.is_empty() {
+            eprintln!(
+                "[vct] merge_orchestrator_with_upstream: autostash marker present but the \
+                 index has NO unmerged entries — the pop left the tree clean; continuing."
+            );
+        }
+        if !unmerged.is_empty() {
             eprintln!(
                 "[vct] merge_orchestrator_with_upstream: pull exited 0 but the working tree \
                  has {} unmerged file(s){} — an --autostash pop conflict. Routing to the \
@@ -6887,7 +7270,16 @@ pub async fn rebase_orchestrator_onto_upstream<R: Runtime>(
             || rebase_combined.contains("Applying autostash")
             || rebase_combined.contains("could not apply autostash");
         let unmerged = collect_conflicted_files(&install_path).await;
-        if !unmerged.is_empty() || autostash_pop_failed {
+        // v0.2.88 (NIT-12): the index is the authority. An autostash marker with
+        // NO unmerged entries means the pop applied clean — do NOT emit an empty
+        // "0 file(s)" conflict modal; fall through to the normal path.
+        if autostash_pop_failed && unmerged.is_empty() {
+            eprintln!(
+                "[vct] rebase_orchestrator_onto_upstream: autostash marker present but the \
+                 index has NO unmerged entries — the pop left the tree clean; continuing."
+            );
+        }
+        if !unmerged.is_empty() {
             eprintln!(
                 "[vct] rebase_orchestrator_onto_upstream: rebase exited 0 but the working tree \
                  has {} unmerged file(s){} — an --autostash pop conflict. Routing to the \
@@ -7515,6 +7907,38 @@ fn resume_head_unchanged_is_benign_noop(sha_at_conflict: &str, head_sha: &str) -
     !sha_at_conflict.is_empty() && head_sha == sha_at_conflict
 }
 
+/// v0.2.88 (DEFECT 3 / FIELD DEFECT) — outcome of the "nothing advanced past the
+/// conflict SHA" branch. The FIELD bug: when the FIRST update failure was a
+/// PRE-merge abort (untracked-collision), HEAD never moved, so this branch fires
+/// — but the pre-fix code returned a SUCCESS-shaped result ("badge will clear
+/// automatically"), which the GUI rendered as a jump-to-100% "done" even though
+/// NOTHING was applied and a real update was still pending (version still 0.2.86,
+/// badge still showing). This enum splits the two genuinely-different states so
+/// the command can be HONEST:
+///   * `TrulyNothingPending` — HEAD == conflict SHA AND upstream is NOT ahead:
+///     the merge was aborted and there is no pending update. Success-shaped is
+///     honest here (the badge really will clear).
+///   * `UpdateStillPending` — HEAD == conflict SHA BUT upstream IS still ahead:
+///     the update never landed. Route the user back to the NORMAL update (a full
+///     `update_orchestrator`), never a fake success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResumeNoopKind {
+    TrulyNothingPending,
+    UpdateStillPending { behind: u32 },
+}
+
+/// v0.2.88 (DEFECT 3) — classify the benign-noop branch. Pure fn (the
+/// upstream-behind count is passed in) so the honest-vs-fake decision is
+/// unit-testable without git/Tauri. `behind` is the number of commits local HEAD
+/// is behind the upstream tip (0 ⇒ up to date).
+pub(crate) fn classify_resume_noop(behind: u32) -> ResumeNoopKind {
+    if behind == 0 {
+        ResumeNoopKind::TrulyNothingPending
+    } else {
+        ResumeNoopKind::UpdateStillPending { behind }
+    }
+}
+
 /// Resume an `update_orchestrator` flow that halted at a merge/rebase
 /// conflict. The user has already resolved the conflict (manually OR via
 /// CLI `git add` + `git commit` / `git rebase --continue`); this command
@@ -7653,24 +8077,105 @@ pub async fn resume_orchestrator_update<R: Runtime>(
     // clears the UpdateBadge automatically — no red banner, no manual refresh.
     let head_sha = read_head_sha(&install_path).await.unwrap_or_default();
     if resume_head_unchanged_is_benign_noop(&sentinel.sha_at_conflict, &head_sha) {
+        // v0.2.88 (DEFECT 3 / FIELD DEFECT): HEAD didn't advance past the
+        // conflict SHA — nothing to RESUME. But that is TWO different states,
+        // and conflating them produced the field bug (fake 100% "done" while a
+        // real update was still pending). VERIFY the actual end state before
+        // declaring anything: is upstream still ahead of HEAD?
+        let resume_branch = if sentinel.branch.is_empty() {
+            resolve_pull_branch(&install_path).await
+        } else {
+            sentinel.branch.clone()
+        };
+        // v0.2.88 (MINOR-6): DISTINGUISH an Err from Ok(0). Pre-fix this was
+        // `.unwrap_or(0)`, which collapsed a behind-count ERROR (missing upstream
+        // ref, corrupted git) into `behind == 0` → TrulyNothingPending →
+        // success-shaped "already up to date" — the exact fake-success shape
+        // DEFECT 3 exists to kill, resurfacing on the error path. An
+        // unverifiable end state must be treated as NOT-verified, not as
+        // up-to-date. Capture the Result and branch on Err below.
+        let behind_res = crate::commands::self_update::count_commits_behind_upstream(
+            &install_path,
+            &resume_branch,
+        )
+        .await;
+        // Clear the stale sentinel + solo deferral in ALL sub-cases (the merge
+        // never advanced, so this sentinel is not resumable regardless — even
+        // when we cannot verify the behind-count).
         clear_update_resume_sentinel(&install_path);
         clear_update_resume_deferral_if_solo(&install_path);
-        write_audit(
-            "update_orchestrator_resume_resolved_noop",
-            serde_json::json!({
-                "reason": "head_unchanged",
-                "sha_at_conflict": sentinel.sha_at_conflict,
-                "install_path": path,
-            }),
-        );
-        return Ok(InstallResult {
-            success: true,
-            install_path: path,
-            message: "No resume needed — the merge/rebase was aborted, so there is \
-                      nothing to continue. The update badge will clear automatically."
-                .to_string(),
-            system,
-        });
+
+        let behind = match behind_res {
+            Ok(b) => b,
+            Err(e) => {
+                // Could NOT verify the end state → do NOT claim success. Tell the
+                // user honestly and route them to the normal update to be sure.
+                write_audit(
+                    "update_orchestrator_resume_rejected",
+                    serde_json::json!({
+                        "reason": "behind_count_unverifiable",
+                        "sha_at_conflict": sentinel.sha_at_conflict,
+                        "branch": resume_branch,
+                        "error": e,
+                        "install_path": path,
+                    }),
+                );
+                return Err(format!(
+                    "Nothing was resumed, and the update state could not be verified \
+                     (couldn't count commits behind {}/{}: {}). This was NOT confirmed as \
+                     a completed update. Click the update badge and run the normal update \
+                     to be sure you're on the latest version.",
+                    crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+                    resume_branch,
+                    e,
+                ));
+            }
+        };
+
+        match classify_resume_noop(behind) {
+            ResumeNoopKind::TrulyNothingPending => {
+                write_audit(
+                    "update_orchestrator_resume_resolved_noop",
+                    serde_json::json!({
+                        "reason": "head_unchanged_up_to_date",
+                        "sha_at_conflict": sentinel.sha_at_conflict,
+                        "install_path": path,
+                    }),
+                );
+                return Ok(InstallResult {
+                    success: true,
+                    install_path: path,
+                    message: "No resume needed — the merge/rebase was aborted and you are \
+                              already up to date. The update badge will clear automatically."
+                        .to_string(),
+                    system,
+                });
+            }
+            ResumeNoopKind::UpdateStillPending { behind } => {
+                // HONEST: nothing was resumed AND a real update is still pending.
+                // Do NOT return success (that was the fake-100% field bug). Tell
+                // the user to re-run the NORMAL update.
+                write_audit(
+                    "update_orchestrator_resume_rejected",
+                    serde_json::json!({
+                        "reason": "nothing_to_resume_but_update_pending",
+                        "sha_at_conflict": sentinel.sha_at_conflict,
+                        "behind": behind,
+                        "branch": resume_branch,
+                        "install_path": path,
+                    }),
+                );
+                return Err(format!(
+                    "Nothing to resume — the earlier update never applied (HEAD is still {} \
+                     commit(s) behind {}/{}), so there is no in-progress merge to continue. \
+                     This was NOT a completed update. Click the update badge and run the \
+                     normal update again to fetch and install the new version.",
+                    behind,
+                    crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+                    resume_branch,
+                ));
+            }
+        }
     }
 
     // Scan for stray conflict markers. If the user committed a file with
@@ -7686,6 +8191,33 @@ pub async fn resume_orchestrator_update<R: Runtime>(
             }),
         );
         let head = with_markers.iter().take(8).cloned().collect::<Vec<_>>();
+        let more = if with_markers.len() > head.len() {
+            ", …"
+        } else {
+            ""
+        };
+        // v0.2.88 (MINOR-9): the remediation differs by operation. A
+        // merge/rebase conflict is resolved by editing out the markers + `git
+        // add` + `git commit --amend`. An AUTOSTASH-POP conflict is a
+        // stash-apply conflict — `commit --amend` is WRONG (the merge already
+        // committed; the markers are in the working tree from the stash pop).
+        // The correct steps are `checkout --ours|--theirs` + `git add` + drop the
+        // specific stash entry (the deferral carries the full form). Route the
+        // pop case to those steps instead of misdirecting to `commit --amend`.
+        if sentinel.operation == "autostash-pop" {
+            return Err(format!(
+                "Found unresolved conflict markers from the local-change restore in {} \
+                 file(s): {}{}. For EACH file pick one side — `git checkout --ours -- \
+                 <file>` (keep the update) or `git checkout --theirs -- <file>` (keep your \
+                 edit) — then `git add -- <file>`, and finally `git stash drop 'stash@{{0}}'` \
+                 (see .claude/context/UPDATE_DEFERRED.md for the exact, re-probe-guarded \
+                 steps). Then click Finish Update again. Do NOT `git commit --amend` — the \
+                 merge already committed.",
+                with_markers.len(),
+                head.join(", "),
+                more,
+            ));
+        }
         return Err(format!(
             "Found unresolved conflict markers in {} file(s): {}{}. Open \
              each file, remove the `<<<<<<<` / `=======` / `>>>>>>>` \
@@ -7693,11 +8225,7 @@ pub async fn resume_orchestrator_update<R: Runtime>(
              then click Continue Update again.",
             with_markers.len(),
             head.join(", "),
-            if with_markers.len() > head.len() {
-                ", …"
-            } else {
-                ""
-            },
+            more,
         ));
     }
 
@@ -8216,6 +8744,666 @@ pub async fn accept_upstream_and_continue_update<R: Runtime>(
     window: Window,
 ) -> Result<InstallResult, String> {
     resolve_conflict_and_resume(app, path, window, ConflictResolutionSide::AcceptUpstream).await
+}
+
+/// v0.2.88 (F2-followup / FIELD DEFECT) — per-file disposition of ONE
+/// untracked-collision resolution. The decision (delete vs backup-then-delete
+/// vs refuse) is separated from the retry so it's unit-testable in isolation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CollisionFileResult {
+    /// Byte-identical to the incoming blob → deleted outright (no data lost).
+    Deleted { path: String },
+    /// Content differs → copied to the backup dir, THEN deleted.
+    BackedUpAndDeleted { path: String, backup: String },
+    /// Refused — path is tracked, outside the install root, contains `..`, or is
+    /// not a file. Left untouched; the retry will still abort on it (honest).
+    Refused { path: String, reason: String },
+}
+
+/// v0.2.88 (F2-followup / FIELD DEFECT) — trackedness of a collision path.
+/// Tri-state (MINOR-5): a git spawn failure must NOT be conflated with
+/// "untracked" — trackedness is unconfirmed, and the delete gate is destructive,
+/// so it must fail CLOSED (Unknown ⇒ refuse).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Trackedness {
+    /// `git ls-files --error-unmatch` exited 0 — path IS tracked.
+    Tracked,
+    /// `git ls-files --error-unmatch` exited non-zero — path is untracked.
+    Untracked,
+    /// The probe could not run (git missing/unspawnable) — trackedness
+    /// unconfirmed. A destructive gate MUST treat this as "may be tracked".
+    Unknown,
+}
+
+/// v0.2.88 (MINOR-5): decide whether the delete gate must REFUSE for a given
+/// trackedness. Refuse when the file is Tracked (deleting it is a working-tree
+/// edit, not a collision cleanup) OR when trackedness is Unknown (a git spawn
+/// failure means we could not positively confirm it is untracked, and the gate
+/// is destructive → fail closed). Only a positively-confirmed Untracked file
+/// may be deleted. Pure fn so the fail-closed decision is unit-testable.
+pub(crate) fn tracked_gate_refuses(t: Trackedness) -> bool {
+    !matches!(t, Trackedness::Untracked)
+}
+
+/// v0.2.88 (F2-followup / FIELD DEFECT) — is `rel_path` a git-TRACKED file in the
+/// clone? The resolution command MUST refuse to delete tracked files (removing a
+/// tracked file is a working-tree edit, not a collision cleanup). `git
+/// ls-files --error-unmatch -- <path>` exits 0 iff the path is tracked.
+///
+/// v0.2.88 (MINOR-5): returns a tri-state so a git SPAWN FAILURE (git
+/// missing/unspawnable) is Unknown — NOT conflated with "exit 1 = untracked" —
+/// letting the destructive delete gate fail closed (refuse on Unknown).
+async fn file_trackedness(install_path: &Path, rel_path: &str) -> Trackedness {
+    let out = tokio::process::Command::new("git")
+        .silent()
+        .args(["ls-files", "--error-unmatch", "--", rel_path])
+        .current_dir(install_path)
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => Trackedness::Tracked,
+        Ok(_) => Trackedness::Untracked,
+        // Spawn failure: cannot confirm untracked → fail closed downstream.
+        Err(_) => Trackedness::Unknown,
+    }
+}
+
+/// v0.2.88 (F2-followup / FIELD DEFECT) — resolve every untracked-collision file
+/// then retry the update. This is the "Resolve & retry" backend command the
+/// enriched `orchestrator_untracked_collision` modal calls.
+///
+/// Per file, with conservative refusals (soft-fail per file, never a crash):
+///   * refuse if the path contains `..`, is absolute, escapes the install root,
+///     is git-TRACKED, or is not a file on disk → `Refused` (left untouched).
+///   * if the working-tree bytes are byte-identical to the incoming upstream
+///     blob → `Deleted` (safe — the content is exactly what upstream ships).
+///   * else → COPY to `.claude/state/update-collision-backups-<ts>/<path>` FIRST,
+///     then delete (`BackedUpAndDeleted`). Backup-before-every-destructive-delete
+///     is the data-safety invariant; a backup failure aborts THAT file's delete
+///     (it stays `Refused`), never proceeding to delete without a backup.
+///
+/// After the per-file pass, if ANY file was actually removed (Deleted or
+/// BackedUpAndDeleted), re-enter the FULL `update_orchestrator` (fresh fetch +
+/// pull that now succeeds because the colliding untracked files are gone). If
+/// NOTHING was removed (every file Refused), return an honest error listing the
+/// refusals rather than a fake retry.
+#[command]
+pub async fn resolve_untracked_collision_and_retry<R: Runtime>(
+    app: AppHandle<R>,
+    path: String,
+    window: Window,
+    files: Vec<String>,
+) -> Result<InstallResult, String> {
+    let install_path = PathBuf::from(&path);
+    if !install_path.join(".git").exists() {
+        return Err("Not a git repository — cannot resolve collision".to_string());
+    }
+
+    let audit_app = app.clone();
+    let write_audit = move |operation: &str, detail: serde_json::Value| {
+        if let Some(db) = audit_app.try_state::<crate::db::Db>() {
+            let _ = db.audit(operation, None, None, &detail);
+        }
+    };
+
+    // Resolve the branch (for the incoming-blob comparison) and the upstream tip.
+    let branch = resolve_pull_branch(&install_path).await;
+    // The tip may be stale if no recent fetch; a Quick fetch keeps the
+    // byte-identity comparison honest. Best-effort — a fetch failure just means
+    // we treat more files as divergent (back them up), which is the safe side.
+    let _ = crate::commands::self_update::serialized_fetch_upstream(
+        &install_path,
+        crate::commands::self_update::FetchPolicy::Quick,
+        Some(&branch),
+    )
+    .await;
+    let theirs = crate::commands::git_user_editable_merge::compute_theirs_sha(&install_path, &branch)
+        .await
+        .ok()
+        .flatten();
+
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let backup_dir = install_path
+        .join(".claude")
+        .join("state")
+        .join(format!("update-collision-backups-{}", ts));
+
+    let results =
+        resolve_collision_files(&install_path, &files, theirs.as_deref(), &backup_dir).await;
+
+    let removed_any = results.iter().any(|r| {
+        matches!(
+            r,
+            CollisionFileResult::Deleted { .. } | CollisionFileResult::BackedUpAndDeleted { .. }
+        )
+    });
+    let refused: Vec<&CollisionFileResult> = results
+        .iter()
+        .filter(|r| matches!(r, CollisionFileResult::Refused { .. }))
+        .collect();
+
+    write_audit(
+        "update_orchestrator_untracked_collision_resolved",
+        serde_json::json!({
+            "install_path": path,
+            "branch": branch,
+            "removed_any": removed_any,
+            "results": results
+                .iter()
+                .map(|r| match r {
+                    CollisionFileResult::Deleted { path } =>
+                        serde_json::json!({"path": path, "disposition": "deleted"}),
+                    CollisionFileResult::BackedUpAndDeleted { path, backup } =>
+                        serde_json::json!({"path": path, "disposition": "backed_up_and_deleted", "backup": backup}),
+                    CollisionFileResult::Refused { path, reason } =>
+                        serde_json::json!({"path": path, "disposition": "refused", "reason": reason}),
+                })
+                .collect::<Vec<_>>(),
+        }),
+    );
+
+    if !removed_any {
+        // Nothing was cleared → a retry would abort on the same files. Be honest.
+        let detail = refused
+            .iter()
+            .map(|r| match r {
+                CollisionFileResult::Refused { path, reason } => format!("{} ({})", path, reason),
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "Could not clear any colliding file, so the update was not retried. \
+             Refused: {}. Resolve these manually (delete or move them aside) then re-run the update.",
+            if detail.is_empty() { "no eligible files".to_string() } else { detail }
+        ));
+    }
+
+    // A partial refusal is worth surfacing but not blocking — the retry will
+    // abort again on the still-present refused file(s) via the same modal, so
+    // the user gets another pass. Log it; proceed with the retry.
+    if !refused.is_empty() {
+        eprintln!(
+            "[vct] resolve_untracked_collision_and_retry: {} file(s) refused (left in place); \
+             retrying the update anyway — a still-colliding file re-surfaces the modal",
+            refused.len(),
+        );
+    }
+
+    // v0.2.88 (MAJOR-3): settle the `untracked_collision_divergent` deferral row
+    // NOW that its collision is resolved. install.py's owned-set self-clear is
+    // the primary lifecycle, but if the retry below errors before install.py's
+    // finalize runs, the stale row would keep nagging every session — settle it
+    // directly (locked, no-op if absent, best-effort).
+    if let Err(e) = crate::services::deferral::resolve_deferral_conditions(
+        &install_path,
+        &install_path,
+        &["untracked_collision_divergent"],
+    ) {
+        eprintln!(
+            "[vct] resolve_untracked_collision_and_retry: could not settle \
+             untracked_collision_divergent deferral (non-fatal): {}",
+            e
+        );
+    }
+
+    // Re-enter the full update. The colliding untracked files are gone, so the
+    // fresh pull proceeds (or surfaces a DIFFERENT, genuine issue via its own
+    // modal — which is correct).
+    update_orchestrator(app, path, window).await
+}
+
+/// v0.2.88 (F2-followup / FIELD DEFECT) — the pure per-file decision+I/O for
+/// `resolve_untracked_collision_and_retry`, split out so the act/leave-alone
+/// decision is unit-testable with injected paths (no Tauri app/window needed).
+///
+/// `theirs` is the upstream tip SHA (or `None` if unresolvable → every file is
+/// treated as divergent and backed up). `backup_dir` is created lazily on the
+/// first backup.
+async fn resolve_collision_files(
+    install_path: &Path,
+    files: &[String],
+    theirs: Option<&str>,
+    backup_dir: &Path,
+) -> Vec<CollisionFileResult> {
+    let install_canon =
+        dunce::canonicalize(install_path).unwrap_or_else(|_| install_path.to_path_buf());
+    let mut results = Vec::with_capacity(files.len());
+    for raw in files {
+        let path = raw.clone();
+
+        // Guard 1: traversal / absolute paths.
+        if path.contains("..") || Path::new(&path).is_absolute() {
+            results.push(CollisionFileResult::Refused {
+                path,
+                reason: "path is absolute or contains '..'".to_string(),
+            });
+            continue;
+        }
+
+        let abs = install_path.join(&path);
+
+        // Guard 2: must be a real file on disk.
+        if !abs.is_file() {
+            results.push(CollisionFileResult::Refused {
+                path,
+                reason: "not a file on disk".to_string(),
+            });
+            continue;
+        }
+
+        // Guard 3: must resolve WITHIN the install root (defense in depth vs.
+        // symlink escapes even after the `..` check).
+        let abs_canon = dunce::canonicalize(&abs).unwrap_or_else(|_| abs.clone());
+        if !abs_canon.starts_with(&install_canon) {
+            results.push(CollisionFileResult::Refused {
+                path,
+                reason: "resolves outside the install root".to_string(),
+            });
+            continue;
+        }
+
+        // Guard 4: never delete a git-TRACKED file. Removing a tracked file is a
+        // working-tree edit, not an untracked-collision cleanup. MINOR-5: also
+        // refuse when trackedness is UNKNOWN (a git spawn failure) — the gate is
+        // destructive, so an unconfirmed-untracked path fails closed.
+        let trackedness = file_trackedness(install_path, &path).await;
+        if tracked_gate_refuses(trackedness) {
+            let reason = match trackedness {
+                Trackedness::Unknown => "trackedness could not be confirmed (git \
+                    unavailable) — refusing to delete on an unverified gate"
+                    .to_string(),
+                _ => "file is git-tracked (not an untracked collision)".to_string(),
+            };
+            results.push(CollisionFileResult::Refused { path, reason });
+            continue;
+        }
+
+        // Decide: byte-identical → delete; else back up first.
+        let identical = match theirs {
+            Some(t) => {
+                crate::commands::git_user_editable_merge::local_matches_incoming_blob(
+                    install_path,
+                    t,
+                    &path,
+                )
+                .await
+            }
+            None => false,
+        };
+
+        if identical {
+            match std::fs::remove_file(&abs) {
+                Ok(()) => results.push(CollisionFileResult::Deleted { path }),
+                Err(e) => results.push(CollisionFileResult::Refused {
+                    path,
+                    reason: format!("delete failed: {}", e),
+                }),
+            }
+            continue;
+        }
+
+        // Divergent → COPY to the backup dir (preserving relative layout) BEFORE
+        // deleting. A backup failure means we do NOT delete (never destroy
+        // without a backup).
+        let backup_path = backup_dir.join(&path);
+        let backup_ok = (|| -> std::io::Result<()> {
+            if let Some(parent) = backup_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&abs, &backup_path)?;
+            Ok(())
+        })();
+        match backup_ok {
+            Ok(()) => match std::fs::remove_file(&abs) {
+                Ok(()) => results.push(CollisionFileResult::BackedUpAndDeleted {
+                    path,
+                    backup: backup_path.to_string_lossy().to_string(),
+                }),
+                Err(e) => results.push(CollisionFileResult::Refused {
+                    path,
+                    reason: format!("delete-after-backup failed: {}", e),
+                }),
+            },
+            Err(e) => results.push(CollisionFileResult::Refused {
+                path,
+                reason: format!("backup failed (delete withheld): {}", e),
+            }),
+        }
+    }
+    results
+}
+
+/// v0.2.88 (DEFECT 2 / FIELD DEFECT) — which side the user chose for an
+/// autostash-pop conflict resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AutostashPopSide {
+    /// Keep the UPDATED (merged) version → discard the stashed local WIP.
+    /// `git checkout --ours` (the merged tree is "ours" during a stash apply).
+    /// The discarded WIP (`:3:`) is backed up FIRST (MAJOR-2) — it exists ONLY
+    /// in the stash, so it must never be the unbacked side.
+    KeepUpdated,
+    /// Keep the LOCAL (stashed) version, backing up the updated version first.
+    /// `git checkout --theirs` (the stashed WIP is "theirs" during a stash apply).
+    KeepLocal,
+}
+
+/// v0.2.88 (MAJOR-2 / FIELD DEFECT) — the index stage number of the content
+/// that a given resolution direction DISCARDS, so the command can back it up
+/// before the checkout overwrites it. During an autostash-pop conflict the
+/// conflicted file's index carries stage 2 (`:2:`, "ours" = the merged/updated
+/// tree) and stage 3 (`:3:`, "theirs" = the user's stashed local WIP):
+///   * `KeepUpdated` (`checkout --ours`) discards the WIP → back up stage 3.
+///   * `KeepLocal`   (`checkout --theirs`) discards the merged tree → back up stage 2.
+/// Extracted as a pure fn so the backup-the-discarded-side invariant is
+/// unit-testable without a Tauri app (red-proof: KeepUpdated MUST back up 3,
+/// not 2 — the pre-fix code left the WIP unbacked).
+pub(crate) fn autostash_discarded_stage(side: AutostashPopSide) -> u8 {
+    match side {
+        AutostashPopSide::KeepUpdated => 3,
+        AutostashPopSide::KeepLocal => 2,
+    }
+}
+
+/// v0.2.88 (MAJOR-1 / FIELD DEFECT) — decide whether `git stash drop` may run.
+/// The autostash may ONLY be dropped when this call actually resolved at least
+/// one file AND a stash entry still exists. Dropping with `resolved_count == 0`
+/// (empty `target`: pop already resolved out-of-band, stale/empty modal payload)
+/// would destroy whatever the user has at `stash@{0}` — after an out-of-band
+/// resolution that is typically an UNRELATED user stash. Extracted as a pure fn
+/// so the "never drop on empty resolution" guard is unit-testable (red-proof:
+/// resolved_count==0 MUST be false even when a stash is present).
+pub(crate) fn should_drop_autostash(resolved_count: usize, stash_present: bool) -> bool {
+    resolved_count > 0 && stash_present
+}
+
+/// v0.2.88 (DEFECT 2 / FIELD DEFECT) — resolve every autostash-pop-conflicted
+/// file then finish the update. The merge already SUCCEEDED (HEAD is at upstream
+/// tip); only restoring the local WIP stash conflicted. The user's changes are
+/// safe in the stash.
+///
+/// Per file: back up the DISCARDED side FIRST (MAJOR-2: `:3:` WIP for
+/// KeepUpdated, `:2:` merged tree for KeepLocal) to
+/// `.claude/state/update-collision-backups-<ts>/`, then `git checkout
+/// --ours|--theirs -- <f>` + `git add -- <f>`. Only after ≥1 file is resolved
+/// AND a stash entry still exists is the autostash dropped (MAJOR-1); the
+/// dropped stash SHA is recorded in the audit event. Finally delegates to
+/// `resume_orchestrator_update` (install.py --update + binary refresh +
+/// auto-restart).
+///
+/// Refuses tracked-outside / traversal paths defensively; per-file soft-fail.
+#[command]
+pub async fn resolve_autostash_pop_and_retry<R: Runtime>(
+    app: AppHandle<R>,
+    path: String,
+    window: Window,
+    files: Vec<String>,
+    keep_updated: bool,
+) -> Result<InstallResult, String> {
+    let install_path = PathBuf::from(&path);
+    if !install_path.join(".git").exists() {
+        return Err("Not a git repository — cannot resolve autostash-pop conflict".to_string());
+    }
+    let side = if keep_updated {
+        AutostashPopSide::KeepUpdated
+    } else {
+        AutostashPopSide::KeepLocal
+    };
+
+    let audit_app = app.clone();
+    let write_audit = move |operation: &str, detail: serde_json::Value| {
+        if let Some(db) = audit_app.try_state::<crate::db::Db>() {
+            let _ = db.audit(operation, None, None, &detail);
+        }
+    };
+
+    // Determine the actual conflicted set from git (authoritative), intersected
+    // with the caller-supplied list as a sanity bound. If git reports none, the
+    // pop was already resolved out-of-band — fall through to the resume, which
+    // has its own no-op honesty (DEFECT 3).
+    let live_unmerged = collect_conflicted_files(&install_path).await;
+    let target: Vec<String> = if files.is_empty() {
+        live_unmerged.clone()
+    } else {
+        files
+            .into_iter()
+            .filter(|f| live_unmerged.contains(f))
+            .collect()
+    };
+
+    let flag = match side {
+        AutostashPopSide::KeepUpdated => "--ours",
+        AutostashPopSide::KeepLocal => "--theirs",
+    };
+
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let backup_dir = install_path
+        .join(".claude")
+        .join("state")
+        .join(format!("update-collision-backups-{}", ts));
+
+    // Track which files we actually checked out this call. `git stash drop`
+    // must be gated on POSITIVE evidence that we resolved at least one file —
+    // dropping the autostash when `target` is empty (pop already resolved
+    // out-of-band, a stale/empty modal payload) would silently destroy an
+    // UNRELATED user stash (MAJOR-1). See the guard after the loop.
+    let mut checked_out: Vec<String> = Vec::new();
+    // Backup paths captured so the audit event + result can report where the
+    // discarded side was preserved (MAJOR-2).
+    let mut backup_paths: Vec<String> = Vec::new();
+
+    for file in &target {
+        // Defensive: never touch traversal/absolute paths.
+        if file.contains("..") || Path::new(file).is_absolute() {
+            return Err(format!("Refusing to resolve suspicious path: {}", file));
+        }
+
+        // v0.2.88 (MAJOR-2 / FIELD DEFECT): ALWAYS back up the side we are about
+        // to DISCARD — for EITHER direction — before the checkout overwrites it.
+        //
+        // During an autostash-pop conflict the index carries:
+        //   * stage 2 (`:2:`) = "ours"   = the MERGED (updated) tree.
+        //   * stage 3 (`:3:`) = "theirs" = the user's STASHED local WIP.
+        // `checkout --ours` keeps the updated version and DISCARDS the user's
+        // WIP (`:3:`); `checkout --theirs` keeps the WIP and discards the
+        // updated version (`:2:`). The pre-fix code backed up ONLY the KeepLocal
+        // (`:2:`) side — which is ALSO recoverable from `git show HEAD:<path>`
+        // because the merge committed — and left the KeepUpdated (`:3:`) WIP side
+        // UNBACKED, then dropped the stash: the user's local edit became
+        // unrecoverable except via `git fsck --unreachable`. The backup effort was
+        // protecting the recoverable side and destroying the unrecoverable one.
+        // Backing up the DISCARDED stage for both arms fixes the asymmetry: the
+        // user's WIP is never the unbacked side.
+        let discarded_stage = autostash_discarded_stage(side);
+        let show = tokio::process::Command::new("git")
+            .silent()
+            .args(["show", &format!(":{}:{}", discarded_stage, file)])
+            .current_dir(&install_path)
+            .output()
+            .await
+            .map_err(|e| {
+                format!(
+                    "git show :{}:{} failed to spawn: {}",
+                    discarded_stage, file, e
+                )
+            })?;
+        if show.status.success() {
+            let backup_path = backup_dir.join(file);
+            let write_res = (|| -> std::io::Result<()> {
+                if let Some(parent) = backup_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&backup_path, &show.stdout)
+            })();
+            if let Err(e) = write_res {
+                return Err(format!(
+                    "Could not back up the discarded version of {} before applying your \
+                     choice: {}. Nothing was changed — retry.",
+                    file, e,
+                ));
+            }
+            backup_paths.push(backup_path.to_string_lossy().to_string());
+        }
+
+        let checkout = tokio::process::Command::new("git")
+            .silent()
+            .args(["checkout", flag, "--", file])
+            .current_dir(&install_path)
+            .output()
+            .await
+            .map_err(|e| format!("git checkout {} -- {} failed to spawn: {}", flag, file, e))?;
+        if !checkout.status.success() {
+            let stderr = String::from_utf8_lossy(&checkout.stderr);
+            write_audit(
+                "update_orchestrator_autostash_pop_resolve_failed",
+                serde_json::json!({
+                    "stage": "checkout",
+                    "file": file,
+                    "flag": flag,
+                    "stderr": stderr.to_string(),
+                    "install_path": path,
+                }),
+            );
+            return Err(format!(
+                "git checkout {} -- {} failed: {}. The file is still conflicted — retry or \
+                 resolve it manually.",
+                flag,
+                file,
+                stderr.trim(),
+            ));
+        }
+
+        let add = tokio::process::Command::new("git")
+            .silent()
+            .args(["add", "--", file])
+            .current_dir(&install_path)
+            .output()
+            .await
+            .map_err(|e| format!("git add -- {} failed to spawn: {}", file, e))?;
+        if !add.status.success() {
+            let stderr = String::from_utf8_lossy(&add.stderr);
+            return Err(format!(
+                "git add -- {} failed after checkout {}: {}.",
+                file,
+                flag,
+                stderr.trim(),
+            ));
+        }
+        checked_out.push(file.clone());
+    }
+
+    // v0.2.88 (MAJOR-1 / FIELD DEFECT): gate `git stash drop` on POSITIVE
+    // evidence we actually resolved a file this call. When `target` was empty —
+    // the pop was already resolved out-of-band, a stale modal payload, or the
+    // empty-`conflicted_files` payload the emitter can produce — the loop body
+    // never ran, so `checked_out` is empty. Dropping the autostash here would
+    // destroy whatever the user has at stash@{0}, which after an out-of-band
+    // resolution is typically an UNRELATED user stash (recoverable only via
+    // `git fsck --unreachable` until gc). Skip the drop entirely and fall
+    // straight through to the resume (which has its own no-op honesty, DEFECT 3).
+    // Cheap positive-evidence upgrade before the drop: verify `git stash list`
+    // is non-empty, and record the dropped stash SHA in the audit event so the
+    // action is recoverable-by-forensics if it was ever wrong.
+    let mut dropped_stash_sha: Option<String> = None;
+    if checked_out.is_empty() {
+        eprintln!(
+            "[vct] resolve_autostash_pop_and_retry: no files were resolved this call \
+             (target empty — pop already resolved out-of-band or stale payload); \
+             SKIPPING git stash drop to avoid destroying an unrelated user stash."
+        );
+    } else {
+        // Positive-evidence check: only drop when a stash entry actually exists.
+        let list = tokio::process::Command::new("git")
+            .silent()
+            .args(["stash", "list"])
+            .current_dir(&install_path)
+            .output()
+            .await;
+        let stash_present = matches!(
+            &list,
+            Ok(o) if o.status.success() && !o.stdout.is_empty()
+        );
+        // Pure decision (unit-tested): resolved≥1 AND a stash entry present.
+        if !should_drop_autostash(checked_out.len(), stash_present) {
+            eprintln!(
+                "[vct] resolve_autostash_pop_and_retry: resolved {} file(s) but the stash \
+                 list is empty (autostash already dropped) — nothing to drop.",
+                checked_out.len()
+            );
+        } else {
+            // Record the SHA of stash@{0} BEFORE dropping so the audit trail
+            // can point `git fsck` at it if the drop ever turns out wrong.
+            let sha = tokio::process::Command::new("git")
+                .silent()
+                .args(["rev-parse", "stash@{0}"])
+                .current_dir(&install_path)
+                .output()
+                .await;
+            if let Ok(o) = &sha {
+                if o.status.success() {
+                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if !s.is_empty() {
+                        dropped_stash_sha = Some(s);
+                    }
+                }
+            }
+            let drop = tokio::process::Command::new("git")
+                .silent()
+                .args(["stash", "drop"])
+                .current_dir(&install_path)
+                .output()
+                .await;
+            match drop {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => eprintln!(
+                    "[vct] resolve_autostash_pop_and_retry: git stash drop non-zero ({}); \
+                     continuing (the resolution is already staged)",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                Err(e) => eprintln!(
+                    "[vct] resolve_autostash_pop_and_retry: git stash drop spawn failed ({}); \
+                     continuing",
+                    e
+                ),
+            }
+        }
+    }
+
+    write_audit(
+        "update_orchestrator_autostash_pop_resolved",
+        serde_json::json!({
+            "side": if keep_updated { "keep_updated" } else { "keep_local" },
+            "resolved_count": checked_out.len(),
+            "resolved_files": checked_out,
+            "backup_paths": backup_paths,
+            "dropped_stash_sha": dropped_stash_sha,
+            "install_path": path,
+        }),
+    );
+
+    // v0.2.88 (MAJOR-3): settle the `autostash_pop_conflict` deferral row NOW.
+    // The pop is resolved; the resume tail below runs install.py (whose owned-set
+    // self-clear is the primary lifecycle), but settling here too means a resume
+    // that errors before install.py's finalize doesn't leave a stale row nagging
+    // — and, crucially, doesn't leave a stale row whose command block a future
+    // terminal agent could replay into a destructive `git stash drop` (MAJOR-3).
+    // Locked, no-op if absent, best-effort.
+    if let Err(e) = crate::services::deferral::resolve_deferral_conditions(
+        &install_path,
+        &install_path,
+        &["autostash_pop_conflict"],
+    ) {
+        eprintln!(
+            "[vct] resolve_autostash_pop_and_retry: could not settle \
+             autostash_pop_conflict deferral (non-fatal): {}",
+            e
+        );
+    }
+
+    // Finish the update: install.py --update + binary refresh + auto-restart.
+    // The merge already advanced HEAD past the sentinel's sha_at_conflict, and
+    // the conflict markers are gone, so resume's preconditions are satisfied.
+    resume_orchestrator_update(app, path, window).await
 }
 
 /// v0.2.16 (W4 / 0.5): "Pulled-but-not-installed" resolver. Runs
@@ -16201,6 +17389,294 @@ severity_max: critical\n\
             assert!(
                 !local.join(".claude/context/UPDATE_DEFERRED.md").exists(),
                 "abort must clear the solo deferral"
+            );
+        }
+
+        // ─── v0.2.88 (DEFECT 1) — POST-pull untracked-overwrite handler ───
+        // The field defect: update_orchestrator's inline pull aborted with the
+        // untracked-overwrite shape; the paths were only in the stderr and the
+        // conflict flow rendered an EMPTY list. handle_untracked_overwrite_post_pull
+        // parses them + classifies + returns the resolvable payload.
+
+        /// RED-PROOF: on the exact field stderr, the PRE-fix path
+        /// (collect_conflicted_files after an abort-before-merge) yields an EMPTY
+        /// list, while the parser extracts all three paths. This pins that the
+        /// fix actually changed behavior on the field shape.
+        #[tokio::test]
+        async fn v0288_post_pull_parses_field_stderr_where_index_is_empty() {
+            skip_if_no_git!();
+            let (_tmp, _remote, local) = init_remote_and_clone();
+
+            // No merge in progress → the index has no unmerged entries (the
+            // pre-fix source of the empty modal).
+            let index_unmerged = collect_conflicted_files(&local).await;
+            assert!(
+                index_unmerged.is_empty(),
+                "precondition: no unmerged index entries before any merge; got {:?}",
+                index_unmerged,
+            );
+
+            // The parser (pure) still recovers the paths from the field stderr.
+            let field = "error: The following untracked working tree files would be overwritten by merge:\n\tdocs/VCT_MODULE_MANIFEST_SPEC.md\n\ttests/test_dual_write_chunk_budget.py\n\ttests/test_wpr_arctic_num_ctx_batch_isolation.py\nPlease move or remove them before you merge.\nAborting\n";
+            let parsed =
+                crate::commands::git_user_editable_merge::parse_untracked_overwrite_files(field);
+            assert_eq!(parsed.len(), 3, "parser must recover all three field paths");
+        }
+
+        /// The handler classifies a byte-identical collision as `identical_files`
+        /// and returns the resolvable payload (no mutation here).
+        #[tokio::test]
+        async fn v0288_post_pull_classifies_identical_collision() {
+            skip_if_no_git!();
+            let (tmp, _remote, local) = init_remote_and_clone();
+            let seed = tmp.path().join("seed");
+            let body = "shipped = 1\n";
+            push_upstream_added_file(&seed, &local, "vco_lib/x.py", body);
+            // Local untracked copy, byte-identical to incoming.
+            let f = local.join("vco_lib/x.py");
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, body).unwrap();
+
+            let stderr = "error: The following untracked working tree files would be overwritten by merge:\n\tvco_lib/x.py\nPlease move or remove them before you merge.\nAborting\n";
+            let payload = handle_untracked_overwrite_post_pull(&local, "merge", "main", stderr)
+                .await
+                .expect("a present collision must produce a payload");
+            let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(v["event"], "orchestrator_untracked_collision");
+            assert_eq!(v["resolvable"], true);
+            assert_eq!(v["identical_files"].as_array().unwrap().len(), 1);
+            assert_eq!(v["divergent_files"].as_array().unwrap().len(), 0);
+            // No mutation in the handler — the file must still be present.
+            assert!(f.exists(), "handler must not delete anything (classify only)");
+        }
+
+        /// The handler falls through (returns None) when the parsed path is not a
+        /// real file on disk — the "never worse than current behavior" guard.
+        #[tokio::test]
+        async fn v0288_post_pull_returns_none_when_no_file_on_disk() {
+            skip_if_no_git!();
+            let (_tmp, _remote, local) = init_remote_and_clone();
+            let stderr = "error: The following untracked working tree files would be overwritten by merge:\n\tnot/here.py\nPlease move or remove them before you merge.\n";
+            let res = handle_untracked_overwrite_post_pull(&local, "merge", "main", stderr).await;
+            assert!(res.is_none(), "a non-existent parsed path must fall through (None)");
+        }
+
+        // ─── v0.2.88 (DEFECT 1) — resolve_collision_files decision tests ───
+        // "Test the decision, not just the happy path": identical→delete,
+        // divergent→backup+delete, tracked/outside-root→refuse.
+
+        /// identical → Deleted (no backup), file gone.
+        #[tokio::test]
+        async fn v0288_resolve_identical_deletes() {
+            skip_if_no_git!();
+            let (tmp, _remote, local) = init_remote_and_clone();
+            let seed = tmp.path().join("seed");
+            let body = "id = 1\n";
+            push_upstream_added_file(&seed, &local, "vco_lib/id.py", body);
+            let f = local.join("vco_lib/id.py");
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, body).unwrap();
+
+            let theirs = crate::commands::git_user_editable_merge::compute_theirs_sha(&local, "main")
+                .await
+                .unwrap()
+                .unwrap();
+            let backup = local.join(".claude/state/backups-test");
+            let results = resolve_collision_files(
+                &local,
+                &["vco_lib/id.py".to_string()],
+                Some(&theirs),
+                &backup,
+            )
+            .await;
+            assert_eq!(results.len(), 1);
+            assert!(
+                matches!(&results[0], CollisionFileResult::Deleted { path } if path == "vco_lib/id.py"),
+                "identical collision must be Deleted, got {:?}",
+                results[0],
+            );
+            assert!(!f.exists(), "identical file must be deleted");
+        }
+
+        /// divergent → BackedUpAndDeleted (backup exists, original gone).
+        #[tokio::test]
+        async fn v0288_resolve_divergent_backs_up_then_deletes() {
+            skip_if_no_git!();
+            let (tmp, _remote, local) = init_remote_and_clone();
+            let seed = tmp.path().join("seed");
+            push_upstream_added_file(&seed, &local, "vco_lib/d.py", "upstream = 1\n");
+            let f = local.join("vco_lib/d.py");
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            let local_body = "mine = 999\n";
+            std::fs::write(&f, local_body).unwrap();
+
+            let theirs = crate::commands::git_user_editable_merge::compute_theirs_sha(&local, "main")
+                .await
+                .unwrap()
+                .unwrap();
+            let backup = local.join(".claude/state/backups-test");
+            let results = resolve_collision_files(
+                &local,
+                &["vco_lib/d.py".to_string()],
+                Some(&theirs),
+                &backup,
+            )
+            .await;
+            assert_eq!(results.len(), 1);
+            match &results[0] {
+                CollisionFileResult::BackedUpAndDeleted { path, backup: bpath } => {
+                    assert_eq!(path, "vco_lib/d.py");
+                    let bcontent = std::fs::read_to_string(bpath).unwrap();
+                    assert_eq!(bcontent, local_body, "backup must preserve the local content");
+                }
+                other => panic!("divergent must be BackedUpAndDeleted, got {:?}", other),
+            }
+            assert!(!f.exists(), "divergent file must be deleted after backup");
+        }
+
+        /// tracked file → Refused (never delete a tracked file), file untouched.
+        #[tokio::test]
+        async fn v0288_resolve_refuses_tracked_file() {
+            skip_if_no_git!();
+            let (_tmp, _remote, local) = init_remote_and_clone();
+            // README is committed in init_remote_and_clone's seed → tracked.
+            let tracked_rel = "README.md";
+            let f = local.join(tracked_rel);
+            assert!(f.exists(), "precondition: tracked README present");
+
+            let backup = local.join(".claude/state/backups-test");
+            let results =
+                resolve_collision_files(&local, &[tracked_rel.to_string()], None, &backup).await;
+            assert_eq!(results.len(), 1);
+            assert!(
+                matches!(&results[0], CollisionFileResult::Refused { reason, .. } if reason.contains("tracked")),
+                "a tracked file must be Refused (tracked reason), got {:?}",
+                results[0],
+            );
+            assert!(f.exists(), "a refused tracked file must NOT be deleted");
+        }
+
+        /// traversal / outside-root path → Refused, nothing touched.
+        #[tokio::test]
+        async fn v0288_resolve_refuses_outside_root_and_traversal() {
+            skip_if_no_git!();
+            let (_tmp, _remote, local) = init_remote_and_clone();
+            let backup = local.join(".claude/state/backups-test");
+            let results = resolve_collision_files(
+                &local,
+                &[
+                    "../escape.py".to_string(),
+                    "/etc/passwd".to_string(),
+                ],
+                None,
+                &backup,
+            )
+            .await;
+            assert_eq!(results.len(), 2);
+            for r in &results {
+                assert!(
+                    matches!(r, CollisionFileResult::Refused { .. }),
+                    "traversal/absolute paths must be Refused, got {:?}",
+                    r,
+                );
+            }
+        }
+
+        // ─── v0.2.88 (MINOR-5) — tracked-gate fails CLOSED on Unknown ───
+
+        /// RED-PROOF of MINOR-5: the delete gate must refuse for Tracked AND for
+        /// Unknown (git spawn failure), deleting ONLY a positively-confirmed
+        /// Untracked file. Pre-fix `is_tracked_file` returned `false` on a spawn
+        /// error, so a git-missing world silently passed the gate.
+        #[test]
+        fn v0288_tracked_gate_fails_closed_on_unknown() {
+            assert!(
+                tracked_gate_refuses(Trackedness::Tracked),
+                "a tracked file must be refused",
+            );
+            assert!(
+                tracked_gate_refuses(Trackedness::Unknown),
+                "an UNKNOWN trackedness (git spawn failure) must FAIL CLOSED \
+                 (refuse) — the delete gate is destructive (MINOR-5)",
+            );
+            assert!(
+                !tracked_gate_refuses(Trackedness::Untracked),
+                "only a positively-confirmed untracked file may be deleted",
+            );
+        }
+
+        // ─── v0.2.88 (DEFECT 3) — resume no-op honesty ───
+
+        /// classify_resume_noop: behind==0 → TrulyNothingPending (honest success);
+        /// behind>0 → UpdateStillPending (route back to normal update, no fake
+        /// success). RED-PROOF of the fake-100% shape: pre-fix the benign-noop
+        /// branch returned success for BOTH; post-fix behind>0 is a distinct
+        /// "still pending" outcome the command surfaces as an Err.
+        #[test]
+        fn v0288_classify_resume_noop_splits_up_to_date_vs_pending() {
+            assert_eq!(classify_resume_noop(0), ResumeNoopKind::TrulyNothingPending);
+            assert_eq!(
+                classify_resume_noop(3),
+                ResumeNoopKind::UpdateStillPending { behind: 3 }
+            );
+            // The fake-100% shape is exactly "behind>0 treated as success". Pin
+            // that classify does NOT collapse it to TrulyNothingPending.
+            assert_ne!(
+                classify_resume_noop(1),
+                ResumeNoopKind::TrulyNothingPending,
+                "a pending update must NEVER classify as 'truly nothing pending' \
+                 (that was the fake-100% field bug)",
+            );
+        }
+
+        // ─── v0.2.88 (MAJOR-1) — autostash-pop drop guard ───
+
+        /// RED-PROOF of MAJOR-1: `git stash drop` may run ONLY when this call
+        /// actually resolved ≥1 file AND a stash entry is present. The field
+        /// bug was dropping the autostash when `target` was empty (pop already
+        /// resolved out-of-band), destroying an UNRELATED user stash. Pin that
+        /// resolved_count==0 is NEVER a drop, even with a stash present.
+        #[test]
+        fn v0288_should_drop_autostash_requires_positive_resolution() {
+            // The exact field-bug shape: nothing resolved, but a stash sits at
+            // stash@{0} (an unrelated user stash) — MUST NOT drop.
+            assert!(
+                !should_drop_autostash(0, true),
+                "dropping the autostash with zero resolved files would destroy an \
+                 unrelated user stash (MAJOR-1)",
+            );
+            // Nothing resolved, no stash: still no drop.
+            assert!(!should_drop_autostash(0, false));
+            // Resolved but the stash is already gone (dropped out-of-band): no drop.
+            assert!(!should_drop_autostash(3, false));
+            // The only case that drops: resolved ≥1 AND a stash present.
+            assert!(should_drop_autostash(1, true));
+            assert!(should_drop_autostash(5, true));
+        }
+
+        // ─── v0.2.88 (MAJOR-2) — back up the DISCARDED side, not the recoverable one ───
+
+        /// RED-PROOF of MAJOR-2: the resolver must back up the side it is about
+        /// to DISCARD. For KeepUpdated (`checkout --ours`) that is the user's
+        /// stashed WIP at stage 3 — which exists ONLY in the stash and is
+        /// unrecoverable after `git stash drop`. The pre-fix code backed up
+        /// stage 2 (the merged tree, recoverable from HEAD) and left stage 3
+        /// unbacked. Pin the correct stage per direction.
+        #[test]
+        fn v0288_autostash_backs_up_the_discarded_stage() {
+            // KeepUpdated discards the WIP → MUST back up stage 3 (the
+            // unrecoverable side), NOT stage 2.
+            assert_eq!(
+                autostash_discarded_stage(AutostashPopSide::KeepUpdated),
+                3,
+                "KeepUpdated discards the stashed WIP (stage 3) — that is the \
+                 side that must be backed up (MAJOR-2); backing up stage 2 left \
+                 the user's WIP as the unbacked side",
+            );
+            // KeepLocal discards the merged/updated tree → stage 2.
+            assert_eq!(
+                autostash_discarded_stage(AutostashPopSide::KeepLocal),
+                2,
             );
         }
     }

@@ -95,12 +95,19 @@ Every event is tagged with its embedding **space** — `embedding_source` / `emb
 
 ### Dual-embedding write + log (two nets, one search)
 
-When enabled, a single search collects a training example in **two** embedding spaces at once, so a per-model reranker can be trained for each. Two independent gates, both default off:
+When enabled, a single search collects a training example in **two** embedding spaces at once, so a per-model reranker can be trained for each. Three independent per-project toggles, all default off.
 
-- `DUAL_EMBEDDING_WRITE_ALL_SLOTS` — the KG write embeds each chunk into every configured text slot (not just the active one), so the second slot's named vectors stay populated for retrieval.
-- `DUAL_RL_LOG_ENABLED` — emits a **second** retrieval + citation event in the other slot's space, on a slot-suffixed `task_id` tagged with that slot's `embedding_source`.
+> **Enable these in the launcher, not by hand.** The canonical channel is the launcher's per-project **Dual embedding / RL logging** panel (`DualWriteFlagsPanel`). It writes the choices into `launcher.db` (`module_settings`), which is the single source of truth. On every install/update run — and whenever you toggle a checkbox — the launcher **projects** those DB values into `.claude/settings.json` and `.claude/env` as the env vars below. **Do NOT set these env vars by hand**: `config_projection.py` re-derives all three from the DB on every update and overwrites any manual edit (a hand-set value is silently reset on the next update). Editing `launcher.db` via the panel is the only setting that survives.
 
-Both must be truthy for a dual (other-slot) event to be written. A local secondary slot is opted in per model — `DUAL_EMBEDDING_ARCTIC_SECONDARY` adds `snowflake-arctic-embed2` (the `arctic2_embed` named vector) as the secondary alongside the active model. Chunk boundaries always follow the **active** model's own preset — dual-write never changes the active slot's chunk fidelity. When a chunk exceeds a secondary model's `num_ctx`, only that secondary's vector is computed over a bounded sub-window and the chunk is tagged in the persisted `secondary_truncated_slots` property, so truncated-vs-full secondary vectors can be partitioned at training time. A single-slot (non-dual) install keeps its single-model chunk sizing byte-for-byte.
+The projected on-disk env representation (read by the indexer / RL telemetry path — informational, not the thing you set):
+
+- `DUAL_EMBEDDING_WRITE_ALL_SLOTS` (DB: `orchestrator-core / dual_embedding_write_all_slots`) — the KG write embeds each chunk into every configured text slot (not just the active one), so the second slot's named vectors stay populated for retrieval.
+- `DUAL_RL_LOG_ENABLED` (DB: `vct-rl-reranker / dual_rl_log_enabled`) — emits a **second** retrieval + citation event in the other slot's space, on a slot-suffixed `task_id` tagged with that slot's `embedding_source`. **Depends on** dual-write: the panel force-enables dual-write when you turn this on, and disabling dual-write turns this off (the DB can never hold the incoherent log=on/write=off pair).
+- `DUAL_EMBEDDING_ARCTIC_SECONDARY` (DB: `orchestrator-core / dual_embedding_arctic_secondary`) — adds `snowflake-arctic-embed2` (the `arctic2_embed` named vector) as the secondary slot alongside the active model. **Independent** of the other two (no dependency either way).
+
+> **One-time migration (v0.2.88):** `DUAL_EMBEDDING_ARCTIC_SECONDARY` used to be env-only (no DB backing, no panel toggle) — it survived updates only by being unknown to the projection. It is now a normal projected key, so the launcher DB is the source of truth. **If you previously enabled it by hand-editing `.claude/env` or `.claude/settings.json`, it will read OFF after this update** (the DB default is off, and the DB now wins). Re-enable it ONCE via the panel — the toggle then persists across all future updates.
+
+`DUAL_EMBEDDING_WRITE_ALL_SLOTS` and `DUAL_RL_LOG_ENABLED` must both be truthy for a dual (other-slot) event to be written. Chunk boundaries always follow the **active** model's own preset — dual-write never changes the active slot's chunk fidelity. When a chunk exceeds a secondary model's `num_ctx`, only that secondary's vector is computed over a bounded sub-window and the chunk is tagged in the persisted `secondary_truncated_slots` property, so truncated-vs-full secondary vectors can be partitioned at training time. A single-slot (non-dual) install keeps its single-model chunk sizing byte-for-byte.
 
 ### Payload-size guard (drop priority)
 

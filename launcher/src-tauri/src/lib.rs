@@ -2413,6 +2413,10 @@ pub fn run() {
             commands::rl_settings::get_dual_embedding_write_all_slots,
             commands::rl_settings::set_dual_rl_log_enabled,
             commands::rl_settings::get_dual_rl_log_enabled,
+            // v0.2.88 (DEFECT 5): third dual-write flag (arctic secondary slot),
+            // now on the same DB→projection→env channel as its two siblings.
+            commands::rl_settings::set_dual_embedding_arctic_secondary,
+            commands::rl_settings::get_dual_embedding_arctic_secondary,
             // v0.2.71: GUI-only per-project worktree-repo mode (T-WT) — the
             // subagent-git modal's create-local/adopt/opt-out choice.
             commands::worktree_repo_mode::set_worktree_repo_mode,
@@ -2763,6 +2767,20 @@ pub fn run() {
             // `resolve_checkout_flag` in installer.rs handles that.
             commands::installer::keep_local_and_continue_update,
             commands::installer::accept_upstream_and_continue_update,
+            // v0.2.88 (F2-followup / FIELD DEFECT): "Resolve & retry" for the
+            // enriched orchestrator_untracked_collision modal. Deletes
+            // byte-identical colliding untracked files, backs up + deletes
+            // divergent ones (to .claude/state/update-collision-backups-<ts>/),
+            // then re-enters update_orchestrator. Refuses tracked / out-of-root
+            // paths; per-file soft-fail.
+            commands::installer::resolve_untracked_collision_and_retry,
+            // v0.2.88 (DEFECT 2 / FIELD DEFECT): "keep updated / keep local"
+            // resolver for the orchestrator_autostash_pop_conflict modal. The
+            // merge succeeded but the --autostash pop of local WIP conflicted;
+            // this resolves each file (checkout --ours/--theirs, backing up the
+            // updated version first for keep-local), drops the stash, then
+            // delegates to resume_orchestrator_update to finish install.py.
+            commands::installer::resolve_autostash_pop_and_retry,
             // v0.2.16 (W4 / 0.5): apply_pending_install resolves the
             // "Pulled-but-not-installed" banner state (source updated
             // via `git pull` outside the launcher; install-manifest

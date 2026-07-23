@@ -147,6 +147,9 @@ def test_dual_flag_keys_in_canonical_keys() -> None:
     keys = list_canonical_keys()
     assert "DUAL_EMBEDDING_WRITE_ALL_SLOTS" in keys
     assert "DUAL_RL_LOG_ENABLED" in keys
+    # v0.2.88 (DEFECT 5): the third dual-write flag joins the managed set so a
+    # hand-set env value is reconciled to the DB truth on every update.
+    assert "DUAL_EMBEDDING_ARCTIC_SECONDARY" in keys
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -293,6 +296,206 @@ def test_dual_flags_survive_simulated_update(tmp_path: Path) -> None:
         == pre_env["DUAL_EMBEDDING_WRITE_ALL_SLOTS"]
     )
     assert post_env["DUAL_RL_LOG_ENABLED"] == pre_env["DUAL_RL_LOG_ENABLED"]
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 4. v0.2.88 (DEFECT 5): arctic-secondary flag on the same channel
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_arctic_secondary_default_false_in_env(tmp_path: Path) -> None:
+    """No module_settings row ⇒ DUAL_EMBEDDING_ARCTIC_SECONDARY projects as
+    'false' (explicit, not omitted) so the OFF state is visible on disk."""
+    db = tmp_path / "launcher.db"
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    _make_launcher_db(db, project_id="a1", project_folder=str(folder))
+
+    env = project_env_from_db("a1", db_path=db)["canonical_env"]
+    assert env["DUAL_EMBEDDING_ARCTIC_SECONDARY"] == "false"
+
+
+def test_arctic_secondary_db_true_projects_env_true(tmp_path: Path) -> None:
+    """DB row dual_embedding_arctic_secondary=true ⇒ env carries 'true'.
+    Independent — the other two flags stay 'false' (no cascade)."""
+    db = tmp_path / "launcher.db"
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    _make_launcher_db(
+        db,
+        project_id="a2",
+        project_folder=str(folder),
+        module_settings=[
+            ("a2", "orchestrator-core", "dual_embedding_arctic_secondary", "true"),
+        ],
+    )
+
+    env = project_env_from_db("a2", db_path=db)["canonical_env"]
+    assert env["DUAL_EMBEDDING_ARCTIC_SECONDARY"] == "true"
+    # Independent of the other two.
+    assert env["DUAL_EMBEDDING_WRITE_ALL_SLOTS"] == "false"
+    assert env["DUAL_RL_LOG_ENABLED"] == "false"
+
+
+def test_arctic_secondary_reads_orchestrator_core_module_id(tmp_path: Path) -> None:
+    """The arctic-secondary flag is keyed under orchestrator-core. A row
+    mis-filed under vct-rl-reranker must NOT flip the env (pins the module_id
+    contract so a scope rename surfaces loudly)."""
+    db = tmp_path / "launcher.db"
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    _make_launcher_db(
+        db,
+        project_id="a3",
+        project_folder=str(folder),
+        module_settings=[
+            # Wrong scope on purpose — resolver reads orchestrator-core.
+            ("a3", "vct-rl-reranker", "dual_embedding_arctic_secondary", "true"),
+        ],
+    )
+    env = project_env_from_db("a3", db_path=db)["canonical_env"]
+    assert env["DUAL_EMBEDDING_ARCTIC_SECONDARY"] == "false"
+
+
+def test_arctic_secondary_db_wins_over_hand_set_env(tmp_path: Path) -> None:
+    """RED-PROOF (DEFECT 5): a hand-set env value and the DB value DISAGREE —
+    the projection re-derives DUAL_EMBEDDING_ARCTIC_SECONDARY from the DB, so
+    the DB wins. Pre-fix the key was UNKNOWN to the projection: it wasn't in
+    the canonical set, so a hand-set env survived (luck, not design). Now the
+    projection emits the DB-truth value regardless of any prior on-disk value.
+
+    We assert the projected canonical value matches the DB (not the phantom
+    hand-set 'true'), for BOTH DB states:
+      * DB says OFF (no row / false) → projection MUST emit 'false' even though
+        a user might have hand-set 'true' in .claude/env.
+      * DB says ON (row true)        → projection MUST emit 'true'.
+    Because the projection is a pure DB→env derivation (it does not read the
+    prior env), the canonical output is definitionally the DB truth — this
+    test pins that contract so a future refactor can't reintroduce an
+    env-passthrough that would let a hand-set value survive.
+    """
+    folder = tmp_path / "proj"
+    folder.mkdir()
+
+    # Case A: DB OFF — projection emits 'false' regardless of a phantom
+    # hand-set 'true'.
+    db_off = tmp_path / "launcher_off.db"
+    _make_launcher_db(db_off, project_id="a4", project_folder=str(folder))
+    env_off = project_env_from_db("a4", db_path=db_off)["canonical_env"]
+    assert env_off["DUAL_EMBEDDING_ARCTIC_SECONDARY"] == "false", (
+        "DB OFF must project 'false' — a hand-set env 'true' must NOT survive "
+        "(the projection re-derives from the DB every update)"
+    )
+
+    # Case B: DB ON — projection emits 'true'.
+    db_on = tmp_path / "launcher_on.db"
+    _make_launcher_db(
+        db_on,
+        project_id="a5",
+        project_folder=str(folder),
+        module_settings=[
+            ("a5", "orchestrator-core", "dual_embedding_arctic_secondary", "true"),
+        ],
+    )
+    env_on = project_env_from_db("a5", db_path=db_on)["canonical_env"]
+    assert env_on["DUAL_EMBEDDING_ARCTIC_SECONDARY"] == "true", (
+        "DB ON must project 'true' — the DB is the source of truth"
+    )
+
+
+def test_arctic_secondary_hand_set_env_file_flips_to_db_off(tmp_path: Path) -> None:
+    """v0.2.88 (NIT-13): END-TO-END red-proof — seed a REAL hand-set
+    ``DUAL_EMBEDDING_ARCTIC_SECONDARY=true`` in ``.claude/env`` (the exact
+    migration case named in MINOR-7: an env-only user updating to v0.2.88 with
+    the DB default OFF) and assert the WRITTEN file flips to ``false`` after the
+    projection runs. Unlike the pure DB→env-dict test above, this exercises
+    ``apply_project_env`` against an on-disk env file so the "hand-set value does
+    NOT survive an update" contract is pinned at the FILE level, not just the
+    projection's return value.
+    """
+    from vco_lib.config_projection import apply_project_env  # noqa: PLC0415
+
+    folder = tmp_path / "proj"
+    (folder / ".claude").mkdir(parents=True)
+    env_file = folder / ".claude" / "env"
+
+    # A user hand-set the flag ON in .claude/env before v0.2.88 (the value the
+    # projection now owns and re-derives from the DB).
+    env_file.write_text(
+        'export DUAL_EMBEDDING_ARCTIC_SECONDARY="true"\n', encoding="utf-8"
+    )
+
+    # DB has NO row → default OFF (the pre-0.2.88 env-only population is gone).
+    db_off = tmp_path / "launcher.db"
+    _make_launcher_db(db_off, project_id="n13", project_folder=str(folder))
+    bundle = project_env_from_db("n13", db_path=db_off)
+    apply_project_env(bundle, surfaces=("claude_env",))
+
+    written = env_file.read_text(encoding="utf-8")
+
+    # The projection writes its keys inside the `# vco-managed-begin/end` block
+    # and preserves user lines OUTSIDE it. The MANAGED value is what shell-source
+    # uses (top-to-bottom, the appended managed export is the LAST one to run and
+    # therefore wins over the user's pre-block line). Assert the managed block
+    # re-derived OFF.
+    begin = written.index("# vco-managed-begin")
+    end = written.index("# vco-managed-end")
+    managed = written[begin:end]
+    assert 'DUAL_EMBEDDING_ARCTIC_SECONDARY="false"' in managed, (
+        "the projection's MANAGED block must carry the DB-off value 'false' — "
+        "the hand-set env value does NOT survive the update (NIT-13); got "
+        "managed block:\n" + managed
+    )
+    assert 'DUAL_EMBEDDING_ARCTIC_SECONDARY="true"' not in managed, (
+        "the managed block must NOT carry the stale hand-set 'true'"
+    )
+    # The managed export is the effective value at shell-source time because it
+    # is appended AFTER any pre-block user line (last export wins). Pin ordering.
+    user_line_pos = written.index('export DUAL_EMBEDDING_ARCTIC_SECONDARY="true"')
+    managed_false_pos = written.index(
+        'export DUAL_EMBEDDING_ARCTIC_SECONDARY="false"'
+    )
+    assert managed_false_pos > user_line_pos, (
+        "the managed 'false' export must come AFTER the user's pre-block 'true' "
+        "so it wins at shell-source time"
+    )
+
+
+def test_arctic_secondary_survives_simulated_update(tmp_path: Path) -> None:
+    """Like the two siblings: the arctic-secondary flag lives in
+    module_settings (a DB table, not a bundled file), so re-running the
+    resolver (what an update does) leaves BOTH the DB row and the projected
+    env byte-identical."""
+    db = tmp_path / "launcher.db"
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    _make_launcher_db(
+        db,
+        project_id="a6",
+        project_folder=str(folder),
+        module_settings=[
+            ("a6", "orchestrator-core", "dual_embedding_arctic_secondary", "true"),
+        ],
+    )
+
+    conn = sqlite3.connect(str(db))
+    pre = _setting(conn, "a6", "orchestrator-core", "dual_embedding_arctic_secondary")
+    conn.close()
+    pre_env = project_env_from_db("a6", db_path=db)["canonical_env"]
+    assert pre is True
+    assert pre_env["DUAL_EMBEDDING_ARCTIC_SECONDARY"] == "true"
+
+    post_env = project_env_from_db("a6", db_path=db)["canonical_env"]
+
+    conn = sqlite3.connect(str(db))
+    post = _setting(conn, "a6", "orchestrator-core", "dual_embedding_arctic_secondary")
+    conn.close()
+    assert post == pre, "arctic-secondary row mutated by update"
+    assert (
+        post_env["DUAL_EMBEDDING_ARCTIC_SECONDARY"]
+        == pre_env["DUAL_EMBEDDING_ARCTIC_SECONDARY"]
+        == "true"
+    )
 
 
 if __name__ == "__main__":

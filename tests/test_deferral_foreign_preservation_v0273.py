@@ -179,6 +179,55 @@ class TestForeignSurvivesUpdateWrite(unittest.TestCase):
         after = DeferralReport.read(self.folder)
         self.assertTrue(after.has_condition("foreign_only"))
 
+    def test_collision_cids_drop_when_absent(self):
+        """v0.2.88 (MAJOR-3): once the two update-flow collision cids are in
+        install.py's owned set, a run that does NOT re-detect them (the GUI
+        resolved the collision) drops them on the single final write — even
+        with a genuine foreign entry present that must survive."""
+        prior = DeferralReport()
+        prior.add_entry(_entry("untracked_collision_divergent"))
+        prior.add_entry(_entry("autostash_pop_conflict"))
+        prior.add_entry(_entry("codegraph_embed_resync_pending"))  # foreign
+        prior.write(self.folder)
+
+        owned = {"untracked_collision_divergent", "autostash_pop_conflict"}
+        run = DeferralReport()
+        run.merge_from_disk(self.folder, exclude_ids=owned)
+        run.write(self.folder)
+
+        after = DeferralReport.read(self.folder)
+        cids = {e.condition_id for e in after.entries}
+        self.assertNotIn("untracked_collision_divergent", cids,
+                         "resolved untracked-collision row must self-clear")
+        self.assertNotIn("autostash_pop_conflict", cids,
+                         "resolved autostash-pop row must self-clear")
+        self.assertIn("codegraph_embed_resync_pending", cids,
+                      "a genuine foreign entry must still survive")
+
+    def test_resolve_conditions_settles_collision_rows(self):
+        """v0.2.88 (MAJOR-3): the GUI resolver's direct settle path
+        (`deferral_emit.resolve_conditions`) removes the two collision rows
+        immediately, deleting the file when nothing else remains."""
+        from vco_lib.deferral_emit import resolve_conditions  # noqa: PLC0415
+
+        prior = DeferralReport()
+        prior.add_entry(_entry("untracked_collision_divergent"))
+        prior.add_entry(_entry("autostash_pop_conflict"))
+        prior.write(self.folder)
+
+        removed = resolve_conditions(
+            self.folder,
+            ["untracked_collision_divergent", "autostash_pop_conflict"],
+        )
+        self.assertEqual(removed, 2, "both present rows must be counted resolved")
+        target = self.folder / ".claude" / "context" / "UPDATE_DEFERRED.md"
+        self.assertFalse(target.exists(),
+                         "settling the only two rows must delete the report file")
+        # Resolving absent ids again is a safe no-op (count 0).
+        self.assertEqual(
+            resolve_conditions(self.folder, ["autostash_pop_conflict"]), 0
+        )
+
 
 class TestInstallOwnershipSet(unittest.TestCase):
     """Guards on install.py's ownership constants (import-shape only —
@@ -197,6 +246,17 @@ class TestInstallOwnershipSet(unittest.TestCase):
         end = self.source.index("})", start)
         block = self.source[start:end]
         self.assertNotIn("codegraph_embed_resync_pending", block)
+
+    def test_update_flow_collision_cids_owned(self):
+        """v0.2.88 (MAJOR-3): the two launcher-emitted update-flow collision
+        deferrals must be in the owned set so a completed GUI resolution
+        drop-when-absent self-clears them (the exact update_resume_required
+        lifecycle) instead of nagging every session forever."""
+        start = self.source.index("_INSTALL_OWNED_CONDITION_IDS = frozenset({")
+        end = self.source.index("})", start)
+        block = self.source[start:end]
+        self.assertIn('"untracked_collision_divergent"', block)
+        self.assertIn('"autostash_pop_conflict"', block)
 
     def test_owned_set_and_prefixes_exist(self):
         self.assertIn("_INSTALL_OWNED_CONDITION_IDS = frozenset({", self.source)

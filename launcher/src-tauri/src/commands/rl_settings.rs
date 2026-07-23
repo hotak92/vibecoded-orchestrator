@@ -130,6 +130,17 @@ const DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY: &str = "dual_embedding_write_all_slots
 /// (T-C). Lives under `vct-rl-reranker` because it gates RL-specific logging.
 const DUAL_RL_LOG_ENABLED_KEY: &str = "dual_rl_log_enabled";
 
+/// v0.2.88 (DEFECT 5) — setting key for the per-project "also write embeddings
+/// into a SECONDARY arctic slot" flag. Consumed (via the projected
+/// `DUAL_EMBEDDING_ARCTIC_SECONDARY` env) by
+/// `vco_lib/embedding_service.py::_resolve_dual_embedding_arctic_secondary`.
+/// Orchestrator-core scope like `dual_embedding_write_all_slots` (an embedding
+/// indexing concern, not RL-specific). Added this cycle so all THREE dual-write
+/// flags share ONE canonical channel (DB → projection → env); pre-fix it was
+/// env-only and survived updates only by being UNKNOWN to the projection (luck,
+/// not design). Now the DB is the truth that POPULATES it.
+const DUAL_EMBEDDING_ARCTIC_SECONDARY_KEY: &str = "dual_embedding_arctic_secondary";
+
 fn set_bool_flag_for_module(
     db: &Db,
     project_id: &str,
@@ -417,6 +428,65 @@ pub async fn get_dual_rl_log_enabled(
         return Err("get_dual_rl_log_enabled: project_id required".into());
     }
     get_bool_flag_for_module(&db, &project_id, MODULE_ID, DUAL_RL_LOG_ENABLED_KEY)
+}
+
+/// v0.2.88 (DEFECT 5) — free-function core of `set_dual_embedding_arctic_secondary`.
+/// DB write + F5 env re-projection, testable without a Tauri runtime. Unlike the
+/// two sibling flags there is NO coherence cascade: the arctic-secondary slot is
+/// independent of the all-slots dual-write (a qwen3-active install can collect an
+/// arctic secondary corpus without also writing every named-vector slot).
+///
+/// `DUAL_EMBEDDING_ARCTIC_SECONDARY` is an env the embedding service reads, so the
+/// write re-projects the project's env files (soft-fail — the DB write is never
+/// rolled back on a projection warning).
+pub fn set_dual_embedding_arctic_secondary_with_db(
+    db: &Db,
+    project_id: &str,
+    value: bool,
+) -> Result<crate::commands::projects_v2::RefreshProjectEnvResult, String> {
+    if project_id.is_empty() {
+        return Err("set_dual_embedding_arctic_secondary: project_id required".into());
+    }
+    set_bool_flag_for_module(
+        db,
+        project_id,
+        ORCHESTRATOR_CORE_MODULE_ID,
+        DUAL_EMBEDDING_ARCTIC_SECONDARY_KEY,
+        value,
+    )?;
+    Ok(crate::commands::projects_v2::reproject_env_soft(db, project_id))
+}
+
+/// Set the per-project "also write embeddings into a secondary arctic slot"
+/// flag. Stored in `module_settings(project_id, "orchestrator-core",
+/// "dual_embedding_arctic_secondary")`. Default OFF when no row exists.
+///
+/// Independent of the other two dual-write flags — no cascade either way.
+#[command]
+pub async fn set_dual_embedding_arctic_secondary(
+    project_id: String,
+    value: bool,
+    db: State<'_, Db>,
+) -> Result<(), String> {
+    set_dual_embedding_arctic_secondary_with_db(&db, &project_id, value).map(|_| ())
+}
+
+/// Read back the persisted "also write embeddings into a secondary arctic slot"
+/// flag. Default `false` for a missing row (opt-in).
+#[command]
+pub async fn get_dual_embedding_arctic_secondary(
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<bool, String> {
+    if project_id.is_empty() {
+        return Err("get_dual_embedding_arctic_secondary: project_id required".into());
+    }
+    get_bool_flag_for_module(
+        &db,
+        &project_id,
+        ORCHESTRATOR_CORE_MODULE_ID,
+        DUAL_EMBEDDING_ARCTIC_SECONDARY_KEY,
+    )
 }
 
 // ─── Reset / retrain (STUBS for Stream 2) ───────────────────────────────
@@ -714,6 +784,81 @@ mod tests {
         assert!(
             !get_bool_flag_for_module(&db, p, MODULE_ID, DUAL_RL_LOG_ENABLED_KEY).unwrap(),
             "disabling the prerequisite must cascade the dependent off",
+        );
+    }
+
+    // ─── v0.2.88 (DEFECT 5): arctic-secondary dual-write flag ────────────
+
+    /// Default OFF on a missing row (opt-in), same as the two siblings.
+    #[test]
+    fn arctic_secondary_defaults_false() {
+        let (db, ids) = open_db_with_projects(1);
+        let p = &ids[0];
+        assert!(!get_bool_flag_for_module(
+            &db, p, ORCHESTRATOR_CORE_MODULE_ID, DUAL_EMBEDDING_ARCTIC_SECONDARY_KEY
+        )
+        .unwrap());
+    }
+
+    /// The arctic-secondary flag is INDEPENDENT: setting it does not touch the
+    /// other two dual flags, and vice versa (no cascade in either direction).
+    #[test]
+    fn arctic_secondary_is_independent_of_the_other_two() {
+        let (db, ids) = open_db_with_projects(1);
+        let p = &ids[0];
+
+        // Turn arctic-secondary ON — the other two must stay OFF.
+        set_dual_embedding_arctic_secondary_with_db(&db, p, true).unwrap();
+        assert!(get_bool_flag_for_module(
+            &db, p, ORCHESTRATOR_CORE_MODULE_ID, DUAL_EMBEDDING_ARCTIC_SECONDARY_KEY
+        )
+        .unwrap());
+        assert!(
+            !get_bool_flag_for_module(
+                &db, p, ORCHESTRATOR_CORE_MODULE_ID, DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY
+            )
+            .unwrap(),
+            "arctic-secondary must NOT force-enable write_all_slots",
+        );
+        assert!(
+            !get_bool_flag_for_module(&db, p, MODULE_ID, DUAL_RL_LOG_ENABLED_KEY).unwrap(),
+            "arctic-secondary must NOT touch dual_rl_log",
+        );
+
+        // Enabling write_all_slots must NOT flip arctic-secondary off.
+        set_dual_embedding_write_all_slots_with_db(&db, p, true).unwrap();
+        assert!(
+            get_bool_flag_for_module(
+                &db, p, ORCHESTRATOR_CORE_MODULE_ID, DUAL_EMBEDDING_ARCTIC_SECONDARY_KEY
+            )
+            .unwrap(),
+            "toggling write_all_slots must leave arctic-secondary untouched",
+        );
+
+        // Disabling write_all_slots (which cascades dual_rl_log off) must ALSO
+        // leave arctic-secondary untouched (it's not part of that cascade).
+        set_dual_embedding_write_all_slots_with_db(&db, p, false).unwrap();
+        assert!(
+            get_bool_flag_for_module(
+                &db, p, ORCHESTRATOR_CORE_MODULE_ID, DUAL_EMBEDDING_ARCTIC_SECONDARY_KEY
+            )
+            .unwrap(),
+            "the write_all_slots→dual_rl_log cascade must NOT reach arctic-secondary",
+        );
+    }
+
+    /// Setter re-projects env after the write (proof: seeded kg-access surfaces).
+    #[test]
+    fn arctic_secondary_setter_reprojects_env() {
+        let (db, ids) = open_db_with_projects(1);
+        let p = &ids[0];
+        db.kg_set_access(p, "PeerProj_KnowledgeGraph", "read").unwrap();
+        let r = set_dual_embedding_arctic_secondary_with_db(&db, p, true)
+            .expect("arctic-secondary setter must succeed");
+        assert_eq!(
+            r.kg_access_list,
+            vec!["PeerProj".to_string()],
+            "arctic-secondary setter must have run the env re-projection (populate)",
         );
     }
 }

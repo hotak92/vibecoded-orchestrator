@@ -314,6 +314,11 @@ _CANONICAL_KEYS: tuple[str, ...] = (
     #     T-C's ``TODO(T-B-flags)`` — T-C reads the env, this writes it.
     "DUAL_EMBEDDING_WRITE_ALL_SLOTS",
     "DUAL_RL_LOG_ENABLED",
+    # v0.2.88 (DEFECT 5): the third dual-write flag joins the managed set so a
+    # user's hand-set env value is reconciled to the DB truth on every update
+    # (the projection wins), like its two siblings. Pre-fix it was env-only and
+    # "survived" updates by being UNKNOWN here — luck, not design.
+    "DUAL_EMBEDDING_ARCTIC_SECONDARY",
     "PROJECT_NAME",
     "CODE_GRAPH_PROJECT",
     "ACTIVE_EMBEDDING",
@@ -1728,6 +1733,15 @@ def project_env_from_db(
             conn, project_id, _RL_RERANKER_MODULE_ID,
             "dual_rl_log_enabled", default=False,
         )
+        # v0.2.88 (DEFECT 5): third dual-write flag — the secondary arctic slot.
+        # Same orchestrator-core scope + default-false (opt-in) read shape as
+        # dual_embedding_write_all_slots. Independent (no coherence cascade). The
+        # hub resolver (config_api.rs) reads the identical row so a hub fetch and
+        # this projection cannot disagree.
+        dual_embedding_arctic_secondary = _fetch_module_setting_bool(
+            conn, project_id, "orchestrator-core",
+            "dual_embedding_arctic_secondary", default=False,
+        )
         if active_embedding_override is not None:
             active_embedding = active_embedding_override
         else:
@@ -1890,6 +1904,15 @@ def project_env_from_db(
         "true" if dual_embedding_write_all_slots else "false",
     )
     _set("DUAL_RL_LOG_ENABLED", "true" if dual_rl_log_enabled else "false")
+    # v0.2.88 (DEFECT 5): the DB is now the truth that POPULATES the arctic-
+    # secondary env (pre-fix it was env-only and survived updates only by being
+    # unknown to the projection). Consumer
+    # (embedding_service.py::_resolve_dual_embedding_arctic_secondary) parses
+    # {"1","true","yes","on"} truthily; emit lowercase to match.
+    _set(
+        "DUAL_EMBEDDING_ARCTIC_SECONDARY",
+        "true" if dual_embedding_arctic_secondary else "false",
+    )
     _set("PROJECT_NAME", proj.name)
     # A-8 (v0.2.73): KG_BASE_DIR mirrors the project folder so
     # .claude/settings.json::env and .claude/env agree with the value

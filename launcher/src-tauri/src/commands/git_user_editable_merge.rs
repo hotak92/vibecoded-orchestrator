@@ -1749,6 +1749,98 @@ pub(crate) fn is_pull_conflict(err: &str) -> bool {
         || lower.contains("autostash")
 }
 
+/// v0.2.88 (F2-followup) — is this git stderr the UNTRACKED-overwrite abort
+/// shape? i.e. git refused the operation BEFORE it started because a local
+/// UNTRACKED working-tree file would be clobbered by an incoming tracked file.
+///
+/// This is a DIFFERENT failure from the dirty-tree refusals in `is_pull_conflict`
+/// ("Your LOCAL CHANGES … would be overwritten" — a tracked-modified refusal).
+/// Both share the "would be overwritten by" substring, so `is_pull_conflict`
+/// ALSO matches this shape — but routing it there is exactly the field defect:
+/// the conflict flow's `collect_conflicted_files` reads UNMERGED INDEX entries,
+/// which are empty when the abort happened before any merge began. This
+/// classifier lets the caller catch the untracked-overwrite shape FIRST and
+/// route it to the dedicated untracked-collision handler instead.
+///
+/// Matches BOTH observed variants (git 2.34+):
+///   - merge:    "error: The following untracked working tree files would be
+///                overwritten by merge:"
+///   - checkout: "error: The following untracked working tree files would be
+///                overwritten by checkout:"
+///
+/// LOCALE NOTE: same C-locale assumption as `is_pull_conflict` — callers invoke
+/// git with `LC_ALL=C` so these English substrings are stable.
+pub(crate) fn is_untracked_overwrite_abort(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("untracked working tree files would be overwritten")
+}
+
+/// v0.2.88 (F2-followup) — parse the tab-prefixed file list out of an
+/// untracked-overwrite abort stderr (the shape `is_untracked_overwrite_abort`
+/// matches). git formats it as:
+///
+/// ```text
+/// error: The following untracked working tree files would be overwritten by merge:
+/// \tdocs/VCT_MODULE_MANIFEST_SPEC.md
+/// \ttests/test_dual_write_chunk_budget.py
+/// Please move or remove them before you merge.
+/// Aborting
+/// ```
+///
+/// We collect every TAB-prefixed line strictly BETWEEN the "would be overwritten
+/// by <op>:" header line and the "Please move or remove" trailer. Returns POSIX
+/// relative paths (git prints them forward-slashed on every OS).
+///
+/// Conservative by construction — this is the "never worse than current
+/// behavior" guard from the fix spec:
+///   * No header line present → empty list (the caller then falls back to the
+///     existing raw-error path; parse failure never degrades to a wrong action).
+///   * Header present but no tab-prefixed lines before the trailer → empty list.
+///   * Handles both `merge` and `checkout` header variants; also tolerates a
+///     missing trailer (collects tab lines until the first non-tab line).
+///
+/// git quotes paths containing "unusual" bytes (spaces are fine unquoted, but
+/// e.g. non-ASCII under default `core.quotePath=true` come wrapped in double
+/// quotes with C-style escapes). We DELIBERATELY do NOT attempt to un-quote:
+/// the resolution command gates every returned path through an on-disk existence
+/// + within-root check, and a quoted path simply won't match a real untracked
+/// file → it's skipped (soft-fail), never acted on. Un-quoting is a follow-up if
+/// a field case ever needs it; for now correctness-by-refusal is safer than a
+/// half-right un-escaper.
+pub(crate) fn parse_untracked_overwrite_files(err: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut in_block = false;
+    for line in err.lines() {
+        let lower = line.to_lowercase();
+        if !in_block {
+            // Enter the block on the header line (either op variant).
+            if lower.contains("untracked working tree files would be overwritten") {
+                in_block = true;
+            }
+            continue;
+        }
+        // Inside the block. The trailer ends it.
+        if lower.contains("please move or remove") {
+            break;
+        }
+        // git indents each path with a single leading TAB. A line that is not
+        // tab-prefixed (e.g. a blank line, "Aborting", or the trailer we didn't
+        // recognise) ends the file list — stop rather than swallow noise.
+        if let Some(rest) = line.strip_prefix('\t') {
+            let path = rest.trim_end_matches(['\r', '\n']).to_string();
+            if !path.is_empty() {
+                files.push(path);
+            }
+        } else if !line.trim().is_empty() {
+            // A non-empty, non-tab line inside the block that isn't the trailer
+            // → the file list is over. (A blank line is tolerated: git doesn't
+            // emit one here, but skipping it is harmless.)
+            break;
+        }
+    }
+    files
+}
+
 /// Decide the pull strategy for a divergence-aware update. This is the SINGLE
 /// source of truth shared by both update surfaces (installer::update_orchestrator
 /// and self_update::apply_launcher_update).
@@ -4024,6 +4116,74 @@ mod tests {
         // autostash"); a SUCCESS message "Applied autostash." would match too,
         // which is harmless because is_pull_conflict is only consulted after a
         // non-zero git exit. (Verified: clean autostash pulls exit 0.)
+    }
+
+    // ----- v0.2.88 (F2-followup): untracked-overwrite abort parser -----
+
+    /// The EXACT field stderr from the live failed update (verbatim event).
+    /// This is the load-bearing regression fixture — the parser MUST extract all
+    /// three colliding paths from it, and the pre-fix path (conflict flow +
+    /// `collect_conflicted_files`) yielded an EMPTY list, which is what the whole
+    /// fix exists to correct.
+    const FIELD_STDERR: &str = "error: The following untracked working tree files would be overwritten by merge:\n\tdocs/VCT_MODULE_MANIFEST_SPEC.md\n\ttests/test_dual_write_chunk_budget.py\n\ttests/test_wpr_arctic_num_ctx_batch_isolation.py\nPlease move or remove them before you merge.\nAborting\nMerge with strategy ort failed.\nApplied autostash.\n";
+
+    #[test]
+    fn untracked_overwrite_abort_is_classified() {
+        assert!(is_untracked_overwrite_abort(FIELD_STDERR));
+        // checkout variant
+        assert!(is_untracked_overwrite_abort(
+            "error: The following untracked working tree files would be overwritten by checkout:\n\tfoo.py\nPlease move or remove them before you switch branches.\nAborting"
+        ));
+        // NOT a tracked-modified refusal (that stays with is_pull_conflict).
+        assert!(!is_untracked_overwrite_abort(
+            "error: Your local changes to the following files would be overwritten by merge:\n\t.gitignore\nPlease commit your changes or stash them before you merge."
+        ));
+        assert!(!is_untracked_overwrite_abort(""));
+        assert!(!is_untracked_overwrite_abort("fatal: not a git repository"));
+    }
+
+    #[test]
+    fn parse_untracked_overwrite_files_extracts_field_paths() {
+        let files = parse_untracked_overwrite_files(FIELD_STDERR);
+        assert_eq!(
+            files,
+            vec![
+                "docs/VCT_MODULE_MANIFEST_SPEC.md".to_string(),
+                "tests/test_dual_write_chunk_budget.py".to_string(),
+                "tests/test_wpr_arctic_num_ctx_batch_isolation.py".to_string(),
+            ],
+            "parser must extract exactly the three colliding paths from the field stderr",
+        );
+    }
+
+    #[test]
+    fn parse_untracked_overwrite_files_handles_checkout_variant() {
+        let checkout = "error: The following untracked working tree files would be overwritten by checkout:\n\ta/one.py\n\tb/two.py\nPlease move or remove them before you switch branches.\nAborting\n";
+        let files = parse_untracked_overwrite_files(checkout);
+        assert_eq!(files, vec!["a/one.py".to_string(), "b/two.py".to_string()]);
+    }
+
+    #[test]
+    fn parse_untracked_overwrite_files_empty_when_no_header() {
+        // A stderr with no untracked-overwrite header → empty (conservative:
+        // caller falls back to raw-error path).
+        assert!(parse_untracked_overwrite_files("").is_empty());
+        assert!(parse_untracked_overwrite_files("fatal: unable to access remote").is_empty());
+        // Even a tracked-modified refusal (different shape) yields nothing — its
+        // paths belong to the dirty-tree flow, not the untracked-collision flow.
+        assert!(parse_untracked_overwrite_files(
+            "error: Your local changes to the following files would be overwritten by merge:\n\t.gitignore\nPlease commit your changes or stash them before you merge."
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn parse_untracked_overwrite_files_missing_trailer_stops_at_non_tab() {
+        // Tolerate a missing "Please move or remove" trailer: collect tab lines
+        // until the first non-tab, non-blank line.
+        let s = "error: The following untracked working tree files would be overwritten by merge:\n\tone.py\n\ttwo.py\nAborting\n";
+        let files = parse_untracked_overwrite_files(s);
+        assert_eq!(files, vec!["one.py".to_string(), "two.py".to_string()]);
     }
 
     // ----- v0.2.71 Piece 3: PullPlan + shared decision -----

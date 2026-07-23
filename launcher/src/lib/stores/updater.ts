@@ -98,6 +98,43 @@ export type OrchestratorNonFfPayload = {
   local_only_files?: string[];
 };
 
+/**
+ * v0.2.88 (DEFECT 1 / FIELD DEFECT): the enriched untracked-collision payload
+ * from `update_orchestrator` when its inline pull aborts with "untracked
+ * working tree files would be overwritten by merge". Mirrors Rust
+ * `serialize_untracked_collision_resolvable_error`.
+ *
+ * The pre-fix path routed this to the conflict modal with an EMPTY file list
+ * (dead-end). Now the parsed collision set is carried, split into byte-identical
+ * (safe delete) + divergent (backup-then-delete), and the modal offers a single
+ * "Resolve & retry" button (`resolve_untracked_collision_and_retry`).
+ */
+export type OrchestratorUntrackedCollisionResolvablePayload = {
+  event: 'orchestrator_untracked_collision';
+  operation: 'merge' | 'rebase';
+  branch: string;
+  /** Present ONLY on the resolvable POST-pull variant. The pre-pull leave-alone
+   *  variant (v0.2.78) omits it — the modal degrades to the informational view. */
+  resolvable?: boolean;
+  identical_files?: string[];
+  divergent_files: string[];
+  git_stderr?: string;
+};
+
+/**
+ * v0.2.88 (DEFECT 2 / FIELD DEFECT): the merge SUCCEEDED but the `--autostash`
+ * pop of the user's local WIP conflicted. Distinct from a merge failure — the
+ * update's merge is done; only restoring local changes clashed. The user's
+ * changes are safe in the git stash. Mirrors Rust
+ * `serialize_autostash_pop_conflict_error`.
+ */
+export type OrchestratorAutostashPopConflictPayload = {
+  event: 'orchestrator_autostash_pop_conflict';
+  branch: string;
+  conflicted_files: string[];
+  git_stderr: string;
+};
+
 interface UpdaterState {
   available: boolean;
   /** v0.2.16: which signal is currently being rendered. Drives copy +
@@ -113,6 +150,12 @@ interface UpdaterState {
   /** v0.2.23 (B4 / D19): when non-null, render the divergence modal
    *  instead of the popover error. Cleared by the modal's onClose. */
   nonFf: OrchestratorNonFfPayload | null;
+  /** v0.2.88 (DEFECT 1): when non-null, render the untracked-collision modal
+   *  (Resolve & retry) instead of a raw error toast. Cleared by onClose. */
+  untrackedCollision: OrchestratorUntrackedCollisionResolvablePayload | null;
+  /** v0.2.88 (DEFECT 2): when non-null, render the autostash-pop-conflict modal
+   *  (keep updated / keep local) instead of mislabeling it a merge failure. */
+  autostashPop: OrchestratorAutostashPopConflictPayload | null;
   /** v0.2.83 (WP-A2 / D6): a `manualCheck()` (RightSidebar "Check Update"
    *  button, or the badge's "Retry now") is in flight. Drives the button's
    *  "Checking…" label so the user gets honest feedback instead of the old
@@ -194,6 +237,46 @@ function parseNonFfError(raw: unknown): OrchestratorNonFfPayload | null {
   return null;
 }
 
+/**
+ * v0.2.88 (DEFECT 1): parse a Tauri error as the enriched untracked-collision
+ * payload. Returns null for any other shape.
+ */
+function parseUntrackedCollisionError(
+  raw: unknown
+): OrchestratorUntrackedCollisionResolvablePayload | null {
+  if (typeof raw !== 'string') return null;
+  if (!raw.startsWith('{')) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.event === 'orchestrator_untracked_collision') {
+      return parsed as OrchestratorUntrackedCollisionResolvablePayload;
+    }
+  } catch {
+    // not JSON
+  }
+  return null;
+}
+
+/**
+ * v0.2.88 (DEFECT 2): parse a Tauri error as the autostash-pop-conflict payload.
+ * Returns null for any other shape.
+ */
+function parseAutostashPopError(
+  raw: unknown
+): OrchestratorAutostashPopConflictPayload | null {
+  if (typeof raw !== 'string') return null;
+  if (!raw.startsWith('{')) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.event === 'orchestrator_autostash_pop_conflict') {
+      return parsed as OrchestratorAutostashPopConflictPayload;
+    }
+  } catch {
+    // not JSON
+  }
+  return null;
+}
+
 function createUpdaterStore() {
   const { subscribe, update } = writable<UpdaterState>({
     available: false,
@@ -203,6 +286,8 @@ function createUpdaterStore() {
     error: null,
     dismissed: false,
     nonFf: null,
+    untrackedCollision: null,
+    autostashPop: null,
     checking: false,
     remoteCheckFailed: false,
     remoteCheckError: null,
@@ -373,7 +458,14 @@ function createUpdaterStore() {
     /** Resolve `remote_ahead` — git pull + install.py --update. */
     async runUpdate(): Promise<void> {
       if (!tauriAvailable()) return;
-      update((s) => ({ ...s, updating: true, error: null, nonFf: null }));
+      update((s) => ({
+        ...s,
+        updating: true,
+        error: null,
+        nonFf: null,
+        untrackedCollision: null,
+        autostashPop: null,
+      }));
       try {
         await orchestrator.update_orchestrator();
         update((s) => ({
@@ -383,6 +475,8 @@ function createUpdaterStore() {
           kind: null,
           dismissed: false,
           nonFf: null,
+          untrackedCollision: null,
+          autostashPop: null,
         }));
         // Re-check to refresh the new install/binary state.
         await orchestrator.checkStatus();
@@ -392,7 +486,30 @@ function createUpdaterStore() {
         // an Error so we unwrap before parsing.
         const raw = e instanceof Error ? e.message : String(e);
         const nff = parseNonFfError(raw);
-        if (nff) {
+        // v0.2.88 (DEFECT 1 + DEFECT 2): the inline update pull can now surface
+        // TWO more structured, actionable events. Route each to its own modal
+        // instead of a dead-end toast.
+        const collision = parseUntrackedCollisionError(raw);
+        const pop = parseAutostashPopError(raw);
+        if (collision) {
+          update((s) => ({
+            ...s,
+            updating: false,
+            error: null,
+            nonFf: null,
+            untrackedCollision: collision,
+            autostashPop: null,
+          }));
+        } else if (pop) {
+          update((s) => ({
+            ...s,
+            updating: false,
+            error: null,
+            nonFf: null,
+            untrackedCollision: null,
+            autostashPop: pop,
+          }));
+        } else if (nff) {
           // Surface the modal instead of a toast — the user has a real
           // choice to make (merge vs rebase vs cancel) and the raw
           // git stderr is unactionable.
@@ -420,6 +537,16 @@ function createUpdaterStore() {
      */
     dismissNonFf() {
       update((s) => ({ ...s, nonFf: null }));
+    },
+
+    /** v0.2.88 (DEFECT 1): dismiss the untracked-collision modal. */
+    dismissUntrackedCollision() {
+      update((s) => ({ ...s, untrackedCollision: null }));
+    },
+
+    /** v0.2.88 (DEFECT 2): dismiss the autostash-pop-conflict modal. */
+    dismissAutostashPop() {
+      update((s) => ({ ...s, autostashPop: null }));
     },
 
     /**
@@ -489,6 +616,16 @@ function createUpdaterStore() {
           error: raw,
           nonFf: null,
         }));
+        // v0.2.88 (DEFECT 3): the resume can honestly report "nothing to resume
+        // but a real update is still pending" (the fake-100% field bug's fix).
+        // Re-check status so the UpdateBadge re-shows the genuine pending update
+        // and the user is routed back to the normal update, not left thinking
+        // the resume "did nothing" silently.
+        try {
+          await orchestrator.checkStatus();
+        } catch {
+          // Best-effort: a failed re-check leaves the honest error visible.
+        }
       }
     },
 

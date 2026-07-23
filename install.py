@@ -213,6 +213,20 @@ _INSTALL_OWNED_CONDITION_IDS = frozenset({
     "launcher_restart_required",
     "launcher_binary_swap_failed_locked",
     "update_resume_required",
+    # v0.2.88 (MAJOR-3): the two update-flow collision deferrals the launcher's
+    # Rust emitters write (untracked-collision resolvable modal +
+    # autostash-pop-conflict modal). Both are RESOLVED by a one-click GUI
+    # resolution that then chains into the resume/update tail — which runs
+    # install.py, whose single-final-write (InstallDeferralFlow.finalize)
+    # drop-when-absent self-clears any owned cid not re-detected this run. Owned
+    # here so a completed GUI resolution stops nagging (the exact lifecycle
+    # `update_resume_required` uses). Also settled directly by the resolver
+    # commands via `deferral_emit.resolve_conditions` (belt-and-suspenders). NOT
+    # re-emitted by install.py — the emitters are the launcher's, so a stale
+    # on-disk row simply drop-when-absent clears; a live collision re-writes it
+    # from the launcher on the next update attempt.
+    "untracked_collision_divergent",
+    "autostash_pop_conflict",
     "vct_hub_binary_unavailable",
     "mcp_registration_no_venv",
     "mcp_registration_python_fallback",

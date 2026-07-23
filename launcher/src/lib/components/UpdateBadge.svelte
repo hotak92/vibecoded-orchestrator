@@ -24,6 +24,8 @@
   import { updater } from '$lib/stores/updater';
   import { ui } from '$lib/stores/ui';
   import OrchestratorUpdateDivergenceModal from './OrchestratorUpdateDivergenceModal.svelte';
+  import OrchestratorUntrackedCollisionModal from './OrchestratorUntrackedCollisionModal.svelte';
+  import OrchestratorAutostashPopModal from './OrchestratorAutostashPopModal.svelte';
 
   let popoverOpen = $state(false);
   let wrapperEl = $state<HTMLDivElement | null>(null);
@@ -48,6 +50,30 @@
       case 'merge_resolved_incomplete': {
         const op = us?.resume_operation || 'update';
         const branch = us?.resume_branch || 'main';
+        // v0.2.88 (MINOR-9): the autostash-pop sentinel reuses this badge kind,
+        // but its story is DIFFERENT — the merge SUCCEEDED and only restoring
+        // local WIP clashed; it was NOT "resolved outside the launcher" (after a
+        // restart the modal is simply gone). Branch the copy so it doesn't
+        // misdescribe the state, and point at the deferral's per-file steps
+        // (the resume marker-scan's generic `commit --amend` remediation is
+        // wrong for a stash-pop conflict).
+        if (op === 'autostash-pop') {
+          return {
+            title: 'Finish Update',
+            desc:
+              `A recent update on \`${branch}\` merged successfully, but ` +
+              `restoring your uncommitted local changes (git \`--autostash\` ` +
+              `pop) conflicted, so \`install.py --update\` and the binary ` +
+              `refresh haven't run — last_installed_version is still ` +
+              `v${us?.installed_version || '?'} while source is ` +
+              `v${us?.source_version || '?'}. Resolve the conflicted file(s) ` +
+              `(the update wrote the exact per-file steps to ` +
+              `\`.claude/context/UPDATE_DEFERRED.md\`), then click Finish ` +
+              `Update.`,
+            buttonLabel: 'Finish Update',
+            actionKey: 'resume' as const,
+          };
+        }
         return {
           title: 'Continue Update',
           desc:
@@ -215,6 +241,28 @@
     payload={upd.nonFf}
     installPath={orchState.installPath}
     onClose={() => updater.dismissNonFf()}
+  />
+{/if}
+
+<!-- v0.2.88 (DEFECT 1 / FIELD DEFECT): untracked-file collision with a new-in-
+     release path. The parsed collision set + a "Resolve & retry" button (the
+     pre-fix dead-end empty conflict modal is what this replaces). -->
+{#if upd.untrackedCollision}
+  <OrchestratorUntrackedCollisionModal
+    payload={upd.untrackedCollision}
+    installPath={orchState.installPath}
+    onClose={() => updater.dismissUntrackedCollision()}
+  />
+{/if}
+
+<!-- v0.2.88 (DEFECT 2 / FIELD DEFECT): merge succeeded but the --autostash pop
+     of local WIP conflicted. Distinct from a merge failure; keep-updated /
+     keep-local per file. -->
+{#if upd.autostashPop}
+  <OrchestratorAutostashPopModal
+    payload={upd.autostashPop}
+    installPath={orchState.installPath}
+    onClose={() => updater.dismissAutostashPop()}
   />
 {/if}
 

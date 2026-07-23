@@ -383,6 +383,20 @@ struct ProjectConfigResponse {
     /// `dual_embedding_write_all_slots` above.
     #[serde(default)]
     dual_rl_log_enabled: bool,
+    /// v0.2.88 (DEFECT 5) — per-project "also write embeddings into a secondary
+    /// arctic slot" flag. Source: `module_settings(project_id,
+    /// "orchestrator-core", "dual_embedding_arctic_secondary")`. Default `false`
+    /// (opt-in). Independent of the other two dual flags (no cascade).
+    ///
+    /// Projected to `.claude/settings.json env` as
+    /// `DUAL_EMBEDDING_ARCTIC_SECONDARY` by `config_projection.py`; consumed by
+    /// `vco_lib/embedding_service.py::_resolve_dual_embedding_arctic_secondary`.
+    /// Before this cycle it was env-only (the DB knew nothing about it); it now
+    /// shares the same canonical DB→projection→env channel as its two siblings.
+    ///
+    /// Additive field — same back-fill/`schema_version` rationale as above.
+    #[serde(default)]
+    dual_embedding_arctic_secondary: bool,
     /// v0.2.40 R2 — RL Reranker per-project flags exposed for the
     /// in-container reader. Until v0.2.40 these three booleans were
     /// SETTER-only: the GUI checkboxes wrote them into
@@ -729,6 +743,16 @@ async fn project_config(
     let dual_rl_log_enabled = h
         .0
         .get_setting(&project.id, "vct-rl-reranker", "dual_rl_log_enabled")
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // v0.2.88 (DEFECT 5): third dual-write flag — the secondary arctic slot.
+    // Orchestrator-core scope like write_all_slots; independent (no cascade).
+    // Read on the same channel so the hub fetch + the Python projection agree.
+    let dual_embedding_arctic_secondary = h
+        .0
+        .get_setting(&project.id, "orchestrator-core", "dual_embedding_arctic_secondary")
         .ok()
         .flatten()
         .and_then(|v| v.as_bool())
@@ -1176,6 +1200,7 @@ async fn project_config(
         shared_kg_read_disabled,
         dual_embedding_write_all_slots,
         dual_rl_log_enabled,
+        dual_embedding_arctic_secondary,
         rl_use_global,
         rl_online_training_disabled,
         rl_global_training_source_flag,

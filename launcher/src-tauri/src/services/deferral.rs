@@ -126,6 +126,70 @@ pub fn emit_deferral_entry(
     }
 }
 
+/// v0.2.88 (MAJOR-3) — mark one or more deferral condition IDs RESOLVED on the
+/// on-disk report, under the shared deferral lock, via
+/// `vco_lib.deferral_emit.resolve_conditions`. This is the belt-and-suspenders
+/// companion to the install.py `_INSTALL_OWNED_CONDITION_IDS` self-clear: a GUI
+/// resolver (untracked-collision / autostash-pop modals) that resolves a
+/// collision but whose retry does NOT reach install.py (e.g. the resume errors
+/// before finalize) still settles its own row immediately, so the stale
+/// "pending action" nag + the destructive stale-command hazard don't outlive
+/// the fix.
+///
+/// `resolve_conditions` drops each present entry AND tombstones it for the
+/// locked cycle, deleting `UPDATE_DEFERRED.{md,json}` when no entries remain.
+/// Resolving an absent ID is a safe no-op. Best-effort: returns `Err` on any
+/// subprocess failure; callers log-and-swallow (a deferral-settle failure must
+/// never mask the resolution outcome).
+pub fn resolve_deferral_conditions(
+    sys_path_root: &Path,
+    report_folder: &Path,
+    condition_ids: &[&str],
+) -> Result<(), String> {
+    let python = vct_launcher_core::python_resolve::resolve_python_for_vco_lib()
+        .ok_or_else(|| "no python interpreter found to settle deferral".to_string())?;
+
+    let script = build_deferral_resolve_script(sys_path_root, report_folder, condition_ids);
+
+    let status = std::process::Command::new(&python)
+        .silent()
+        .arg("-c")
+        .arg(&script)
+        .status();
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!("deferral resolve helper exited {}", s)),
+        Err(e) => Err(format!("deferral resolve helper spawn failed: {}", e)),
+    }
+}
+
+/// Build the injection-safe `python -c` payload that marks condition IDs
+/// resolved via the LOCKED `vco_lib.deferral_emit.resolve_conditions`. Extracted
+/// as a pure helper so the structural payload test can assert the snippet
+/// without spawning a subprocess.
+fn build_deferral_resolve_script(
+    sys_path_root: &Path,
+    report_folder: &Path,
+    condition_ids: &[&str],
+) -> String {
+    let root_py = py_quote(&sys_path_root.to_string_lossy());
+    let folder_py = py_quote(&report_folder.to_string_lossy());
+    let ids_py: String = condition_ids
+        .iter()
+        .map(|c| py_quote(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "import sys\n\
+         sys.path.insert(0, {root_py})\n\
+         from pathlib import Path\n\
+         from vco_lib.deferral_emit import resolve_conditions\n\
+         folder = Path({folder_py})\n\
+         resolve_conditions(folder, [{ids_py}])\n\
+         sys.exit(0)\n",
+    )
+}
+
 /// Build the injection-safe `python -c` payload that emits one deferral entry.
 ///
 /// v0.2.83 WP-B6: routes through the LOCKED emitter `vco_lib.deferral_emit`
@@ -249,6 +313,35 @@ mod tests {
         assert!(
             !script.contains("report.write"),
             "payload must NOT call the unlocked report.write; got:\n{script}"
+        );
+    }
+
+    /// v0.2.88 (MAJOR-3): the settle payload MUST route through the LOCKED
+    /// `resolve_conditions` and pass every condition id as a quoted literal.
+    #[test]
+    fn resolve_payload_routes_through_locked_resolve_conditions() {
+        let script = build_deferral_resolve_script(
+            Path::new("/orch/root"),
+            Path::new("/proj/folder"),
+            &["untracked_collision_divergent", "autostash_pop_conflict"],
+        );
+        assert!(
+            script.contains("from vco_lib.deferral_emit import resolve_conditions"),
+            "settle payload must import the LOCKED resolve_conditions; got:\n{script}"
+        );
+        assert!(
+            script.contains("resolve_conditions(folder, ["),
+            "settle payload must call resolve_conditions(folder, [...]); got:\n{script}"
+        );
+        assert!(
+            script.contains("\"untracked_collision_divergent\"")
+                && script.contains("\"autostash_pop_conflict\""),
+            "settle payload must carry every condition id as a quoted literal; got:\n{script}"
+        );
+        // No unlocked writer path leaks in.
+        assert!(
+            !script.contains("DeferralReport"),
+            "settle payload must NOT reference the unlocked DeferralReport; got:\n{script}"
         );
     }
 

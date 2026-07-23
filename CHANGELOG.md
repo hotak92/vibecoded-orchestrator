@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Orchestrator update no longer dead-ends on an untracked-file collision.**
+  When a local untracked file sits at a path a new release adds, the update
+  pull aborts ("untracked working tree files would be overwritten by merge").
+  Previously this surfaced an empty conflict modal (no files, no resolution)
+  and degraded to a bare FAILED toast. The colliding paths are now parsed from
+  git's output, classified (byte-identical to the incoming version vs.
+  differing), and shown in a "Resolve & retry" modal: identical files are
+  removed, differing files are backed up to
+  `.claude/state/update-collision-backups-<ts>/` before removal, then the
+  update retries. A durable `UPDATE_DEFERRED.md` entry mirrors the state for
+  terminal Claude sessions.
+- **A successful merge whose local-change restore conflicts is no longer
+  mislabeled as a merge failure.** If the update merges cleanly but restoring
+  your uncommitted local edits (git `--autostash` pop) conflicts, the update
+  now reports a distinct "update installed — restoring your local changes
+  clashed" state (your changes stay safe in the git stash) with a
+  "keep updated version / keep local" chooser applied to the whole conflicted
+  set at once, instead of a generic merge-conflict failure. Whichever side is
+  discarded is backed up to `.claude/state/update-collision-backups-<ts>/`
+  first — so the choice is reversible. (For a mixed keep-some / discard-some
+  decision, resolve those files in a terminal per the
+  `UPDATE_DEFERRED.md` steps.)
+- **"Continue Update" no longer claims success while doing nothing.** When a
+  prior failed update left nothing to resume, the resume path now verifies the
+  end state: if the update never actually applied (HEAD still behind upstream),
+  it says so honestly and routes back to the normal update instead of jumping
+  to a fake 100% "done".
+
+### Changed
+
+- **Dual-embedding telemetry flags are documented as launcher toggles, not env
+  vars.** `docs/TELEMETRY.md` now directs users to the per-project Dual
+  embedding / RL logging panel (the launcher DB is the source of truth) and
+  describes `DUAL_EMBEDDING_WRITE_ALL_SLOTS` / `DUAL_RL_LOG_ENABLED` /
+  `DUAL_EMBEDDING_ARCTIC_SECONDARY` as the projected on-disk representation —
+  direct env edits are re-derived from the DB on every update and don't
+  survive.
+- **The arctic-secondary dual-write flag now shares one canonical channel with
+  its two siblings.** `DUAL_EMBEDDING_ARCTIC_SECONDARY` gains a toggle in the
+  Dual embedding / RL logging panel, launcher-DB persistence, and inclusion in
+  the config projection's managed keys — so all three dual-write flags are set
+  the same way and survive updates by design (the DB wins over any hand-set
+  env value), rather than the arctic flag surviving only by being unknown to
+  the projection. **One-time migration:** if you previously enabled
+  `DUAL_EMBEDDING_ARCTIC_SECONDARY` by editing an env file, it will read OFF
+  after this update (the DB default is off, and the DB now wins) — re-enable it
+  once via the panel and it persists thereafter.
+
 ## [0.2.87] - 2026-07-22
 
 ### Changed

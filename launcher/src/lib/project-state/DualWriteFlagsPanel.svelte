@@ -19,6 +19,11 @@
   //     therefore disabled until dual-write is ON, and turning dual-log ON
   //     force-enables dual-write (the backend setter cascades the same way,
   //     so the DB can never reach the incoherent log=true/write=false pair).
+  //   * dual_embedding_arctic_secondary (orchestrator-core) — v0.2.88
+  //     (DEFECT 5): also writes into a SECONDARY arctic slot. INDEPENDENT of
+  //     the two above (no cascade). Added so all three dual-write flags share
+  //     ONE canonical channel (DB → projection → env). Projects as
+  //     DUAL_EMBEDDING_ARCTIC_SECONDARY.
   //
   // Both choices survive bundle/orchestrator updates: they live in
   // module_settings, which no update path resets (only bundled files get
@@ -33,8 +38,10 @@
   let loading = $state(true);
   let savingWrite = $state(false);
   let savingLog = $state(false);
+  let savingArctic = $state(false);
   let dualWrite = $state(false);
   let dualLog = $state(false);
+  let arcticSecondary = $state(false);
 
   async function load(): Promise<void> {
     loading = true;
@@ -43,6 +50,10 @@
         projectId,
       });
       dualLog = await invoke<boolean>('get_dual_rl_log_enabled', { projectId });
+      arcticSecondary = await invoke<boolean>(
+        'get_dual_embedding_arctic_secondary',
+        { projectId },
+      );
     } catch (e) {
       toast.error(e);
     } finally {
@@ -95,6 +106,24 @@
       await load();
     } finally {
       savingLog = false;
+    }
+  }
+
+  // v0.2.88 (DEFECT 5): independent toggle — no cascade to/from the other two.
+  async function toggleArctic(next: boolean): Promise<void> {
+    savingArctic = true;
+    try {
+      await invoke('set_dual_embedding_arctic_secondary', {
+        projectId,
+        value: next,
+      });
+      await reproject();
+      arcticSecondary = next;
+    } catch (e) {
+      toast.error(e);
+      await load();
+    } finally {
+      savingArctic = false;
     }
   }
 
@@ -154,6 +183,26 @@
           above (you can't log into a slot that isn't populated). Enabling
           this auto-enables dual-write; disabling dual-write auto-disables
           this.
+        </small>
+      </span>
+    </label>
+
+    <!-- v0.2.88 (DEFECT 5): independent arctic-secondary toggle. -->
+    <label class="ps-flag-check">
+      <input
+        type="checkbox"
+        checked={arcticSecondary}
+        disabled={savingArctic}
+        onchange={(e) => toggleArctic((e.target as HTMLInputElement).checked)}
+      />
+      <span>
+        <strong>Write a secondary arctic embedding slot</strong>
+        <small>
+          Projects as <code>DUAL_EMBEDDING_ARCTIC_SECONDARY</code>. When ON, the
+          indexer also writes an <code>arctic</code> secondary slot alongside
+          the active slot (e.g. a qwen3-active install can collect an arctic
+          corpus for later reranking). Independent of the two above — no
+          dependency either way. Costs extra embed calls; opt-in.
         </small>
       </span>
     </label>
