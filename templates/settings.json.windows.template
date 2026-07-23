@@ -4,6 +4,7 @@
   "_comment": "Project-scoped Claude Code settings for VibeCoded Orchestrator-managed projects. Hooks fire by default \u2014 set VCT_DISABLE_HOOKS=1 in your shell to opt out per-shell, or remove blocks here for project-wide opt-out.",
   "permissions": {
     "allow": [
+      "Skill",
       "Bash(pytest *)",
       "Bash(python *)",
       "Bash(pip install *)",
