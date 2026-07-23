@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Bash-security scanner no longer false-positives on inert text, without
+  weakening real detection.** Commands that merely mention secret-shaped
+  identifiers or dangerous-looking strings inside quoted here-doc bodies,
+  single-quoted literals, or commit-message arguments are no longer flagged
+  as credential reads. The scanner distinguishes executed positions
+  (interpreter `-c`/`eval` payloads, command substitutions, process
+  substitutions fed to a shell) from inert data, so genuine exfiltration and
+  destructive commands in those positions still block.
+
 ### Changed
 
 - **Bundled agent and skill templates reviewed against the official skill/
