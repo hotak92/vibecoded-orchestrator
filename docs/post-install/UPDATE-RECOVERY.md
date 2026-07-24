@@ -156,7 +156,7 @@ Two caveats:
     reconciled diverged generated / release-controlled files
     (`launcher/package.json`, `launcher/package-lock.json`,
     `launcher/src-tauri/Cargo.lock`, or files under `launcher/dist/**`) to
-    upstream automatically (see the take-upstream note below). It names each
+    upstream automatically (see the take-upstream section above). It names each
     overwritten path, the action taken, and how to recover the committed
     case. No action needed; it self-clears on the next `install.py --update`.
 

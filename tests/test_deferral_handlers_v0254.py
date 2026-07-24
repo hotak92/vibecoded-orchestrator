@@ -283,49 +283,78 @@ class TestGeneratedFilesReconciledSelfClears(unittest.TestCase):
 class TestHubRestartFailedAfterAbortReprobe(unittest.TestCase):
     """v0.2.89: `hub_restart_failed_after_abort` is an ACTIONABLE failure
     record (the abort-path hub restart's health poll failed). It self-clears
-    ONLY once the on-disk hub sidecar version >= source (Step 8 refreshed +
-    restarted the hub); otherwise the actionable failure survives to the next
-    run. Re-probe discipline: act only on a confirmed premise change."""
+    ONLY once the on-disk hub sidecar version >= source (Step 8 refreshed the
+    hub binary) AND the live /health probe confirms the hub is UP (MAJOR-2 — a
+    caught-up binary is not proof the hub is running; Step 8 is soft-fail).
+    Otherwise the actionable failure survives to the next run. Re-probe
+    discipline: act only on a confirmed premise change."""
 
-    def test_resolved_when_hub_caught_up(self):
+    def test_resolved_when_hub_caught_up_and_healthy(self):
         with TemporaryDirectory() as td:
             folder = Path(td)
             _persist(folder, _entry("hub_restart_failed_after_abort"))
             _write_hub_sidecar(folder, "0.2.89")
             with mock.patch.object(
                 install, "_read_launcher_version", return_value="0.2.89"
+            ), mock.patch.object(
+                install, "_probe_vct_hub_health", return_value=True
             ):
                 result = _apply(folder)
             self.assertNotIn("hub_restart_failed_after_abort", _cids(result),
-                             "on-disk hub >= source = hub refreshed + "
-                             "restarted = failure resolved")
+                             "on-disk hub >= source AND /health live = hub "
+                             "refreshed + up = failure resolved")
 
-    def test_resolved_when_hub_ahead_of_source(self):
-        # >= not == : a hub sidecar ahead of source is still resolved.
+    def test_resolved_when_hub_ahead_of_source_and_healthy(self):
+        # >= not == : a hub sidecar ahead of source is still resolved (when up).
         with TemporaryDirectory() as td:
             folder = Path(td)
             _persist(folder, _entry("hub_restart_failed_after_abort"))
             _write_hub_sidecar(folder, "0.2.90")
             with mock.patch.object(
                 install, "_read_launcher_version", return_value="0.2.89"
+            ), mock.patch.object(
+                install, "_probe_vct_hub_health", return_value=True
             ):
                 result = _apply(folder)
             self.assertNotIn("hub_restart_failed_after_abort", _cids(result))
 
+    def test_preserved_when_version_caught_up_but_health_fails(self):
+        """MAJOR-2: version caught up BUT the live /health probe fails → the hub
+        binary was refreshed yet the hub is NOT up (Step 8 soft-failed). This is
+        exactly the 'hub down' state the entry records — PRESERVE it; clearing
+        on version alone would wrongly delete an actionable failure."""
+        with TemporaryDirectory() as td:
+            folder = Path(td)
+            _persist(folder, _entry("hub_restart_failed_after_abort"))
+            _write_hub_sidecar(folder, "0.2.89")
+            with mock.patch.object(
+                install, "_read_launcher_version", return_value="0.2.89"
+            ), mock.patch.object(
+                install, "_probe_vct_hub_health", return_value=False
+            ):
+                result = _apply(folder)
+            self.assertIn("hub_restart_failed_after_abort", _cids(result),
+                          "version caught up but hub down = keep the actionable "
+                          "failure record (MAJOR-2)")
+
     def test_preserved_when_hub_behind_source(self):
         """The actionable-failure-survives leg: on-disk hub < source means the
-        hub has NOT caught up, so the abort-time restart failure stands."""
+        hub has NOT caught up, so the abort-time restart failure stands. The
+        health probe is not even consulted (version gate fails first), but a
+        stubbed-live probe must NOT rescue a behind-version hub."""
         with TemporaryDirectory() as td:
             folder = Path(td)
             _persist(folder, _entry("hub_restart_failed_after_abort"))
             _write_hub_sidecar(folder, "0.2.60")
             with mock.patch.object(
                 install, "_read_launcher_version", return_value="0.2.89"
+            ), mock.patch.object(
+                install, "_probe_vct_hub_health", return_value=True
             ):
                 result = _apply(folder)
             self.assertIn("hub_restart_failed_after_abort", _cids(result),
                           "hub behind source = not caught up = keep the "
-                          "actionable failure record")
+                          "actionable failure record (even if /health is live)")
 
     def test_preserved_when_sidecar_missing(self):
         """Missing hub sidecar → cannot POSITIVELY confirm the hub caught up →
@@ -337,14 +366,16 @@ class TestHubRestartFailedAfterAbortReprobe(unittest.TestCase):
             _write_hub_sidecar(folder, None)  # sidecar intentionally absent
             with mock.patch.object(
                 install, "_read_launcher_version", return_value="0.2.89"
+            ), mock.patch.object(
+                install, "_probe_vct_hub_health", return_value=True
             ):
                 result = _apply(folder)
             self.assertIn("hub_restart_failed_after_abort", _cids(result),
                           "absent sidecar = unconfirmed = keep")
 
     def test_preserved_on_probe_exception(self):
-        """Any exception during the probe must preserve (never wrongly clear
-        an actionable failure)."""
+        """Any exception during the version re-probe must preserve (never
+        wrongly clear an actionable failure)."""
         with TemporaryDirectory() as td:
             folder = Path(td)
             _persist(folder, _entry("hub_restart_failed_after_abort"))
@@ -356,6 +387,24 @@ class TestHubRestartFailedAfterAbortReprobe(unittest.TestCase):
                 result = _apply(folder)
             self.assertIn("hub_restart_failed_after_abort", _cids(result),
                           "probe failure must NOT clear the entry")
+
+    def test_preserved_when_health_probe_raises(self):
+        """MAJOR-2: if the live /health probe itself RAISES (rather than
+        returning False), the handler must still PRESERVE — never wrongly clear
+        on an unconfirmable health state."""
+        with TemporaryDirectory() as td:
+            folder = Path(td)
+            _persist(folder, _entry("hub_restart_failed_after_abort"))
+            _write_hub_sidecar(folder, "0.2.89")
+            with mock.patch.object(
+                install, "_read_launcher_version", return_value="0.2.89"
+            ), mock.patch.object(
+                install, "_probe_vct_hub_health",
+                side_effect=RuntimeError("probe boom"),
+            ):
+                result = _apply(folder)
+            self.assertIn("hub_restart_failed_after_abort", _cids(result),
+                          "a raising health probe = unconfirmed = keep")
 
     def test_foreign_cid_not_in_owned_set(self):
         """FOREIGN (Rust-emitted): must NOT be in _INSTALL_OWNED_CONDITION_IDS

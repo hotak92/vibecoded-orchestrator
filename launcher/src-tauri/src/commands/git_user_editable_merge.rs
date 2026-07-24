@@ -214,7 +214,6 @@ pub(crate) const USER_EDITABLE_PATTERNS: &[&str] = &[
 ///   unblocking no-op. Including the glob closes the two cases the pop-probe's
 ///   dist EXCLUSION only softened (uncommitted-dirty dist still hit the
 ///   autostash-pop modal; committed-divergent dist still hit the B4 modal).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const GENERATED_RELEASE_CONTROLLED_PATTERNS: &[&str] = &[
     "launcher/package.json",
     "launcher/package-lock.json",
@@ -750,7 +749,6 @@ pub(crate) fn is_user_editable(rel_path: &str, globset: &GlobSet) -> bool {
 /// once per call; four patterns, so caching across calls is unnecessary.
 /// Returns `Err` on a malformed pattern (a programming error — the constant
 /// list is hand-curated, so this should never fire in production).
-#[cfg_attr(not(test), allow(dead_code))]
 fn build_generated_release_controlled_globset() -> Result<GlobSet, String> {
     let mut builder = GlobSetBuilder::new();
     for pattern in GENERATED_RELEASE_CONTROLLED_PATTERNS {
@@ -773,7 +771,6 @@ fn build_generated_release_controlled_globset() -> Result<GlobSet, String> {
 /// `is_user_editable`: identical `\`→`/` normalisation (the v0.2.81 B1
 /// Windows-separator lesson — git `-z` output is forward-slashed, but
 /// defense-in-depth against any backslash-bearing caller).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn is_generated_release_controlled(rel_path: &str, globset: &GlobSet) -> bool {
     let normalised = rel_path.replace('\\', "/");
     globset.is_match(&normalised)
@@ -878,6 +875,26 @@ fn sidecar_path_for(install_path: &Path, rel_path: &Path, theirs_sha: &str) -> P
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     parent.join(format!("{}.from-upstream-{}", stem, short))
+}
+
+/// v0.2.89 MINOR-2 — sidecar path for the PRE-RESTORE working-tree content of a
+/// worktree-divergent generated file, before the reconcile drops it with
+/// `git checkout HEAD -- <path>`. Lives under `.claude/context/` (untracked,
+/// never pulled), named `<basename>.pre-reconcile-<short-theirs>` so a
+/// discarded HAND edit (e.g. an intentional local `package.json` change that
+/// happened to be uncommitted) stays recoverable — mirrors A0's sidecar
+/// posture for the preserve-local class. `theirs_sha` gives a stable,
+/// collision-resistant suffix tied to the update.
+fn pre_reconcile_sidecar_path(install_path: &Path, rel_path: &str, theirs_sha: &str) -> PathBuf {
+    let short = short_sha(theirs_sha);
+    let base = Path::new(rel_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "worktree-file".to_string());
+    install_path
+        .join(".claude")
+        .join("context")
+        .join(format!("{}.pre-reconcile-{}", base, short))
 }
 
 /// Pre-merge user-editable files BEFORE the main `git pull`.
@@ -2151,12 +2168,12 @@ pub(crate) async fn resolve_divergence_pull_plan(
 /// empty sets (the caller then does nothing and the existing modal flow
 /// surfaces — never worse than today).
 ///
-/// v0.2.89 Phase 1: the classify/act/emit family is exercised by the Phase 1
-/// unit tests and WIRED into the two live update surfaces in Phase 2a/2b — so
-/// outside `cfg(test)` the fns have no in-tree caller YET. `allow(dead_code)`
-/// keeps the tree warning-free between phases; Phase 2a/2b removes it when the
-/// surfaces start calling these (mirrors `committed_divergence_merges_cleanly`).
-#[cfg_attr(not(test), allow(dead_code))]
+/// v0.2.89: the classify/act/emit family is WIRED into all three live update
+/// surfaces — `resolve_generated_files_to_upstream` runs inside
+/// `installer::update_orchestrator`, `installer::merge_orchestrator_with_upstream`,
+/// and `self_update::apply_launcher_update`, with `emit_generated_reconcile_deferrals`
+/// called by each surface AFTER the pull succeeds (MINOR-1). No `allow(dead_code)`
+/// is needed — these are reachable from non-test code.
 pub(crate) struct GeneratedDivergence {
     /// `HEAD:path` differs from `base:path` (the fork COMMITTED changes) AND
     /// upstream changed the path in `base..theirs`. Scoped to
@@ -2177,7 +2194,6 @@ pub(crate) struct GeneratedDivergence {
 /// modified-both-sides. Never raises; on any git error returns an empty set
 /// (conservative — the caller then treats nothing as committed-divergent and
 /// the existing flow surfaces).
-#[cfg_attr(not(test), allow(dead_code))]
 async fn diff_modified_allowlisted(
     install_path: &Path,
     from: &str,
@@ -2227,7 +2243,6 @@ async fn diff_modified_allowlisted(
 /// un-diverge) and the WORKTREE set (tracked-modified ∩ upstream-changed ∩
 /// allowlist — restorable with a plain checkout). Reuses
 /// `tracked_modified_overlapping_upstream` verbatim for the worktree side.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn classify_generated_divergence(
     install_path: &Path,
     base: &str,
@@ -2288,7 +2303,6 @@ pub(crate) async fn classify_generated_divergence(
 }
 
 /// v0.2.89 — outcome of `resolve_generated_files_to_upstream` (§4.2).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct GeneratedReconcileOutcome {
     /// Committed-divergent paths whose content was set to theirs' blob and
     /// folded into the synthetic reconcile commit.
@@ -2298,18 +2312,63 @@ pub(crate) struct GeneratedReconcileOutcome {
     /// True when a synthetic take-upstream commit was created. Threaded into
     /// `resolve_divergence_pull_plan` (§5).
     pub reconcile_committed: bool,
+    /// MINOR-1: the resolved upstream tip (`theirs`) at reconcile time. The
+    /// emitter needs it for the short-sha in the audit deferral, but the
+    /// deferral is now emitted by the CALL-SITE (post-pull-decision) rather
+    /// than inside this fn — because emitting injects the reminder block into
+    /// the tracked CLAUDE.md, which if done pre-decision would dirty CLAUDE.md
+    /// between the reconcile and the pull-plan resolution and could
+    /// self-inflict the divergence modal. Empty string when nothing was
+    /// reconciled (the emitter no-ops on an empty outcome anyway).
+    pub theirs_sha: String,
 }
 
 impl GeneratedReconcileOutcome {
     /// The empty (no-op) outcome — returned on any early conservative bail.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn none() -> Self {
         GeneratedReconcileOutcome {
             took_upstream: Vec::new(),
             restored_worktree: Vec::new(),
             reconcile_committed: false,
+            theirs_sha: String::new(),
         }
     }
+}
+
+/// v0.2.89 MINOR-3 — the commit-failure REVERT seam: after the synthetic
+/// reconcile commit fails, restore each taken path's working-tree + index back
+/// to HEAD's (= the fork's still-committed) content via `git checkout HEAD --
+/// <path>`. Extracted so the leave-alone leg of the destructive commit gate is
+/// unit-testable directly (a clean cross-OS commit-failure injection into the
+/// full `resolve_generated_files_to_upstream` flow is fragile; the revert logic
+/// itself is the load-bearing part). Best-effort per path (a failing revert
+/// cannot make things worse — the commit already failed, so nothing new was
+/// recorded). Returns the paths whose revert command exited 0.
+async fn revert_taken_checkouts_to_head(install_path: &Path, taken: &[String]) -> Vec<String> {
+    let mut reverted = Vec::new();
+    for path in taken {
+        let status = tokio::process::Command::new("git")
+            .silent()
+            .args(["checkout", "HEAD", "--", path])
+            .current_dir(install_path)
+            .status()
+            .await;
+        match status {
+            Ok(s) if s.success() => reverted.push(path.clone()),
+            Ok(s) => eprintln!(
+                "[vct] revert_taken_checkouts_to_head: git checkout HEAD -- {} exited {:?} \
+                 (best-effort revert; the failed commit recorded nothing)",
+                path,
+                s.code()
+            ),
+            Err(e) => eprintln!(
+                "[vct] revert_taken_checkouts_to_head: git checkout HEAD -- {} spawn failed ({}) \
+                 (best-effort revert)",
+                path, e
+            ),
+        }
+    }
+    reverted
 }
 
 /// v0.2.89 — F1-sibling entry point (§4.2): resolves theirs/base itself,
@@ -2322,11 +2381,31 @@ impl GeneratedReconcileOutcome {
 /// this fn never re-derives paths); skips `<`-prefixed sentinels; every path is
 /// used as a git pathspec relative to `install_path` (no absolute-path
 /// assembly, no deletion, no writes outside git's own worktree updates).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn resolve_generated_files_to_upstream(
     install_path: &Path,
     branch: &str,
 ) -> GeneratedReconcileOutcome {
+    // (0) MINOR-4 — refuse to run over an IN-PROGRESS merge/rebase. If
+    //     `.git/MERGE_HEAD` (or a rebase-{merge,apply} dir) exists and the only
+    //     unmerged path happens to be an allowlisted generated file, our
+    //     `checkout <theirs>` + bare synthetic commit would silently CONCLUDE
+    //     the pending merge as a mislabelled reconcile commit. A leftover
+    //     in-progress operation must be finished/aborted by the EXISTING flow,
+    //     never quietly wrapped up here. Conservative no-op → the existing
+    //     conflict/resume machinery surfaces (never worse than today). Same
+    //     probe shape the installer uses (`installer.rs::pending_op_kind`).
+    if install_path.join(".git").join("MERGE_HEAD").exists()
+        || install_path.join(".git").join("rebase-merge").exists()
+        || install_path.join(".git").join("rebase-apply").exists()
+    {
+        eprintln!(
+            "[vct] resolve_generated_files_to_upstream: an in-progress merge/rebase is present \
+             (.git/MERGE_HEAD or .git/rebase-*) — refusing to reconcile (the existing conflict/\
+             resume flow must conclude it, not this reconcile). No-op."
+        );
+        return GeneratedReconcileOutcome::none();
+    }
+
     // (1) resolve theirs/base; None/Err ⇒ conservative no-op.
     let theirs = match compute_theirs_sha(install_path, branch).await {
         Ok(Some(t)) => t,
@@ -2351,6 +2430,23 @@ pub(crate) async fn resolve_generated_files_to_upstream(
     for path in &divergence.committed {
         if path.starts_with('<') {
             continue; // sentinel — never act.
+        }
+        // NIT-4 (audit noise): a path where the fork and upstream both COMMITTED
+        // a change (both-modified → classified) can nonetheless have CONVERGED
+        // to the same content (HEAD:path byte-identical to theirs:path). Taking
+        // upstream for it is a genuine no-op — it contributes nothing to the
+        // synthetic commit and would only add noise to took_upstream. Skip it.
+        let head_blob = read_blob_at_rev(install_path, "HEAD", path).await.ok().flatten();
+        let theirs_blob = read_blob_at_rev(install_path, &theirs, path).await.ok().flatten();
+        if let (Some(h), Some(t)) = (&head_blob, &theirs_blob) {
+            if h == t {
+                eprintln!(
+                    "[vct] resolve_generated_files_to_upstream: {} already byte-identical to \
+                     upstream at HEAD — nothing to take (skipping, not audit-noise)",
+                    path
+                );
+                continue;
+            }
         }
         let out = tokio::process::Command::new("git")
             .silent()
@@ -2385,11 +2481,20 @@ pub(crate) async fn resolve_generated_files_to_upstream(
     }
 
     // (4) If ≥1 committed path was taken: synthetic commit, byte-for-byte the
-    //     A0 identity invocation (installer.rs run_pre_merge_user_editable). On
-    //     commit failure: best-effort revert (`git checkout HEAD -- <paths>`
-    //     restores the fork's committed content — a correct revert since HEAD
-    //     still holds it), leave reconcile_committed=false (→ modal flow
-    //     surfaces). Mirrors A0's failure-revert posture.
+    //     A0 identity invocation (installer.rs run_pre_merge_user_editable) —
+    //     BUT scoped to EXPLICIT PATHSPECS (`commit ... -- <the taken paths>`).
+    //     A pathspec-less commit would fold in ANY other staged change (e.g. a
+    //     user-staged `vco_lib/foo.py`), silently committing a NON-allowlisted
+    //     file under the mechanical identity + mislabelling it as a
+    //     reconcile. Pinning the pathspec also makes a NO-OP commit (nothing
+    //     staged for these exact paths) FAIL — the conservative arm below then
+    //     keeps `reconcile_committed=false`, so a second attempt (reconcile
+    //     commit already exists, nothing new to take) never falsely reports a
+    //     take-upstream that didn't happen. On commit failure: best-effort
+    //     revert (`git checkout HEAD -- <paths>` restores the fork's committed
+    //     content — a correct revert since HEAD still holds it), leave
+    //     reconcile_committed=false (→ modal flow surfaces). Mirrors A0's
+    //     failure-revert posture.
     if !committed_taken.is_empty() {
         let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
         let msg = format!(
@@ -2397,18 +2502,25 @@ pub(crate) async fn resolve_generated_files_to_upstream(
              (take-upstream) ({})",
             ts
         );
+        let mut commit_args: Vec<String> = vec![
+            "-c".to_string(),
+            "user.name=VCO Orchestrator".to_string(),
+            "-c".to_string(),
+            "user.email=orchestrator@vibecoded.tools".to_string(),
+            "commit".to_string(),
+            "--no-verify".to_string(),
+            "-m".to_string(),
+            msg,
+            // EXPLICIT pathspecs: commit ONLY the take-upstream paths, never
+            // whatever else happens to be staged in the user's index.
+            "--".to_string(),
+        ];
+        for path in &committed_taken {
+            commit_args.push(path.clone());
+        }
         let commit_result = tokio::process::Command::new("git")
             .silent()
-            .args([
-                "-c",
-                "user.name=VCO Orchestrator",
-                "-c",
-                "user.email=orchestrator@vibecoded.tools",
-                "commit",
-                "--no-verify",
-                "-m",
-                &msg,
-            ])
+            .args(&commit_args)
             .current_dir(install_path)
             .output()
             .await;
@@ -2418,20 +2530,37 @@ pub(crate) async fn resolve_generated_files_to_upstream(
                 outcome.reconcile_committed = true;
             }
             Ok(o) => {
-                eprintln!(
-                    "[vct] resolve_generated_files_to_upstream: reconcile commit failed \
-                     (exit {:?}): {} — reverting the take-upstream checkouts to HEAD",
-                    o.status.code(),
-                    String::from_utf8_lossy(&o.stderr).trim()
+                // NIT-4 (audit noise): a pathspec commit that finds NOTHING
+                // staged for the given paths ("nothing to commit" / "no changes
+                // added") is an EXPECTED no-op on an already-reconciled retry —
+                // not an error. Log it quietly; log any OTHER failure loudly.
+                let combined = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
                 );
-                for path in &committed_taken {
-                    let _ = tokio::process::Command::new("git")
-                        .silent()
-                        .args(["checkout", "HEAD", "--", path])
-                        .current_dir(install_path)
-                        .status()
-                        .await;
+                let nothing_to_commit = combined.contains("nothing to commit")
+                    || combined.contains("no changes added to commit")
+                    || combined.contains("nothing added to commit");
+                if nothing_to_commit {
+                    eprintln!(
+                        "[vct] resolve_generated_files_to_upstream: reconcile commit was a no-op \
+                         (nothing staged for the taken paths — already reconciled); reverting the \
+                         checkouts to HEAD (expected, not an error)"
+                    );
+                } else {
+                    eprintln!(
+                        "[vct] resolve_generated_files_to_upstream: reconcile commit failed \
+                         (exit {:?}): {} — reverting the take-upstream checkouts to HEAD",
+                        o.status.code(),
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    );
                 }
+                // MINOR-3: the leave-alone leg of the destructive gate — the
+                // synthetic commit failed (or no-op'd), so restore the fork's
+                // committed content (HEAD still holds it) and DO NOT claim a
+                // take-upstream.
+                revert_taken_checkouts_to_head(install_path, &committed_taken).await;
                 // reconcile_committed stays false; took_upstream stays empty.
             }
             Err(e) => {
@@ -2440,14 +2569,7 @@ pub(crate) async fn resolve_generated_files_to_upstream(
                      ({}) — reverting the take-upstream checkouts to HEAD",
                     e
                 );
-                for path in &committed_taken {
-                    let _ = tokio::process::Command::new("git")
-                        .silent()
-                        .args(["checkout", "HEAD", "--", path])
-                        .current_dir(install_path)
-                        .status()
-                        .await;
-                }
+                revert_taken_checkouts_to_head(install_path, &committed_taken).await;
             }
         }
     }
@@ -2469,6 +2591,42 @@ pub(crate) async fn resolve_generated_files_to_upstream(
         }
         if already_handled.contains(path) {
             continue; // the take-upstream checkout already cleaned this path.
+        }
+        // v0.2.89 MINOR-2: before the destructive `git checkout HEAD -- <path>`
+        // (which UNRECOVERABLY drops the uncommitted working-tree content),
+        // sidecar the pre-restore bytes to `.claude/context/<basename>.
+        // pre-reconcile-<short-theirs>`. Most worktree-divergent generated files
+        // are derived regenerations (a lockfile from `npm install`, a rebuilt
+        // dist binary) with nothing to preserve — but a fork COULD have an
+        // uncommitted HAND edit to `package.json`. Best-effort (mirrors A0's
+        // sidecar posture); a copy failure logs + proceeds (never blocks the
+        // reconcile).
+        let abs = install_path.join(path);
+        match std::fs::read(&abs) {
+            Ok(bytes) => {
+                let sidecar = pre_reconcile_sidecar_path(install_path, path, &theirs);
+                if let Err(e) = atomic_write(&sidecar, &bytes) {
+                    eprintln!(
+                        "[vct] resolve_generated_files_to_upstream: pre-restore sidecar write \
+                         failed for {} ({}): {} — proceeding with the restore (best-effort)",
+                        path,
+                        sidecar.display(),
+                        e
+                    );
+                } else {
+                    eprintln!(
+                        "[vct] resolve_generated_files_to_upstream: saved pre-restore content of \
+                         {} to {} before dropping the local regeneration",
+                        path,
+                        sidecar.display()
+                    );
+                }
+            }
+            Err(e) => eprintln!(
+                "[vct] resolve_generated_files_to_upstream: could not read {} to sidecar before \
+                 restore ({}) — proceeding (best-effort)",
+                path, e
+            ),
         }
         let out = tokio::process::Command::new("git")
             .silent()
@@ -2499,10 +2657,17 @@ pub(crate) async fn resolve_generated_files_to_upstream(
         }
     }
     outcome.restored_worktree = restored;
+    outcome.theirs_sha = theirs.clone();
 
-    // (6) Emit the audit-trail deferral (best-effort; never blocks the update).
-    emit_generated_reconcile_deferrals(install_path, &outcome, &theirs);
-
+    // (6) MINOR-1: the audit-trail deferral is NOT emitted here. Emitting
+    //     injects a reminder block into the TRACKED `<root>/CLAUDE.md`
+    //     (`vco_lib/deferral_report.py`), which would dirty CLAUDE.md BETWEEN
+    //     this reconcile and the subsequent `resolve_divergence_pull_plan` /
+    //     pull — on an otherwise-clean fork that self-inflicts the exact
+    //     pop-conflict modal this whole feature exists to avoid. The call-site
+    //     emits `emit_generated_reconcile_deferrals(install_path, &outcome)`
+    //     AFTER the pull decision is resolved (mirroring how
+    //     `write_launcher_update_diverged_deferral` is timed post-decision).
     outcome
 }
 
@@ -2512,17 +2677,21 @@ pub(crate) async fn resolve_generated_files_to_upstream(
 /// best-effort posture + markdown shape of the other deferral emitters so
 /// `vco_lib/deferral_report.py` round-trips it. A no-op when nothing was
 /// reconciled. I/O failure logs + never blocks the update.
-#[cfg_attr(not(test), allow(dead_code))]
+///
+/// MINOR-1: called by the CALL-SITE AFTER the pull-plan decision / pull, NOT
+/// inside `resolve_generated_files_to_upstream` — emitting injects a reminder
+/// block into the tracked CLAUDE.md, and doing so pre-decision would dirty
+/// CLAUDE.md and could self-inflict the divergence modal. The upstream tip is
+/// read from `outcome.theirs_sha` (captured at reconcile time).
 pub(crate) fn emit_generated_reconcile_deferrals(
     install_path: &Path,
     outcome: &GeneratedReconcileOutcome,
-    theirs_sha: &str,
 ) {
     if outcome.took_upstream.is_empty() && outcome.restored_worktree.is_empty() {
         return; // nothing reconciled — no entry.
     }
     let (title, detected, why_deferred, command_to_apply) =
-        build_generated_reconcile_deferral_text(outcome, theirs_sha);
+        build_generated_reconcile_deferral_text(outcome, &outcome.theirs_sha);
     let fields = crate::services::deferral::DeferralEntryFields {
         condition_id: "generated_files_reconciled",
         title: &title,
@@ -2542,11 +2711,22 @@ pub(crate) fn emit_generated_reconcile_deferrals(
     }
 }
 
+/// v0.2.89 MINOR-2 — true when a reconciled worktree path is a DERIVED artifact
+/// (a lockfile or a build output) that a tool regenerates, vs a hand-authorable
+/// MANIFEST (`launcher/package.json`). The audit text must not call a discarded
+/// `package.json` edit a "derived artifact" — that would be false. Normalises
+/// `\`→`/` for the same Windows-separator robustness the matchers use.
+fn is_worktree_derived_artifact(rel_path: &str) -> bool {
+    let p = rel_path.replace('\\', "/");
+    // package.json is the ONE hand-authorable manifest in the allowlist; every
+    // other entry (package-lock.json, Cargo.lock, launcher/dist/**) is derived.
+    p != "launcher/package.json"
+}
+
 /// v0.2.89 — build the four free-form deferral fields (§6.1 recovery text).
 /// Kept out of the emitter so the shape test can call it without spawning
 /// Python. `short_theirs` is the 7-char upstream tip; per-path the entry names
 /// the action + the recovery.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_generated_reconcile_deferral_text(
     outcome: &GeneratedReconcileOutcome,
     theirs_sha: &str,
@@ -2575,15 +2755,41 @@ pub(crate) fn build_generated_reconcile_deferral_text(
         ));
         shown += 1;
     }
+    // MINOR-2: a pre-restore sidecar preserves the dropped bytes under
+    // `.claude/context/<basename>.pre-reconcile-<short-theirs>` — name it so the
+    // recovery is discoverable. And be HONEST per-entry: `launcher/package.json`
+    // is a hand-authorable manifest, NOT a "derived artifact"; only the
+    // lockfiles / dist binaries are genuinely derived. Mislabelling a discarded
+    // package.json hand edit as "derived" would be false.
+    let mut any_worktree_manifest = false;
     for path in &outcome.restored_worktree {
         if shown >= CAP {
             break;
         }
-        bullets.push(format!(
-            "  - `{}` — dropped-local-regeneration (uncommitted local regeneration of a \
-             derived artifact discarded; the pull brought upstream's copy)",
-            path
-        ));
+        let sidecar_name = format!(
+            ".claude/context/{}.pre-reconcile-{}",
+            Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone()),
+            short_theirs
+        );
+        if is_worktree_derived_artifact(path) {
+            bullets.push(format!(
+                "  - `{}` — dropped-local-regeneration (uncommitted regeneration of a DERIVED \
+                 artifact discarded; the pull brought upstream's copy; pre-restore bytes saved to \
+                 `{}` if you need them)",
+                path, sidecar_name
+            ));
+        } else {
+            any_worktree_manifest = true;
+            bullets.push(format!(
+                "  - `{}` — dropped-local-worktree-edit (uncommitted local change to a \
+                 hand-authorable manifest discarded — NOT a derived artifact; the pull brought \
+                 upstream's copy; pre-restore bytes saved to `{}` for recovery)",
+                path, sidecar_name
+            ));
+        }
         shown += 1;
     }
     if n > CAP {
@@ -2601,17 +2807,26 @@ pub(crate) fn build_generated_reconcile_deferral_text(
         bullets.join("\n"),
     );
 
-    let why_deferred = String::from(
+    let mut why_deferred = String::from(
         "Take-upstream is not data loss here. For the COMMITTED case NOTHING is lost: the \
          reconcile commit's parent still holds the fork's content, and after the merge the \
          fork's original commits remain reachable ancestors — recover with `git log -- <path>` \
-         then `git checkout <sha> -- <path>`. For the WORKTREE case the discarded content is an \
-         uncommitted REGENERATION of a derived artifact (a lockfile from `npm install` / \
-         `cargo update`, or a locally rebuilt dist binary) — not recoverable via git, and \
-         acceptable precisely because it is derived: `npm install` / `cargo build` / \
-         `install.py --update` re-derives it. This entry names exactly what was overwritten so \
-         the change is auditable.",
+         then `git checkout <sha> -- <path>`. For the WORKTREE case the discarded content of a \
+         DERIVED artifact (a lockfile from `npm install` / `cargo update`, or a locally rebuilt \
+         dist binary) is acceptable precisely because it is derived: `npm install` / `cargo build` \
+         / `install.py --update` re-derives it. The pre-restore bytes are ALSO saved best-effort \
+         to `.claude/context/<basename>.pre-reconcile-<short-sha>` so even an uncommitted edit is \
+         recoverable. This entry names exactly what was overwritten so the change is auditable.",
     );
+    if any_worktree_manifest {
+        why_deferred.push_str(
+            " NOTE: one or more of the dropped worktree files is a hand-authorable MANIFEST \
+             (`launcher/package.json`), NOT a derived artifact — its uncommitted local edit was \
+             discarded in favour of upstream's copy. If that edit was intentional, recover it \
+             from the `.pre-reconcile-<short-sha>` sidecar named above (git cannot recover an \
+             uncommitted edit).",
+        );
+    }
 
     let mut cmd_lines: Vec<String> = vec![
         "# This reconcile requires NO action — the update proceeded normally.".to_string(),
@@ -5959,6 +6174,74 @@ mod tests {
         );
     }
 
+    /// (MINOR-2) a WORKTREE-divergent `launcher/package.json` (a hand-authorable
+    /// manifest, not a derived artifact) → after the reconcile: (a) a
+    /// pre-restore sidecar exists under `.claude/context/` carrying the dropped
+    /// bytes; (b) the deferral text names it accurately and does NOT call
+    /// package.json a "derived artifact".
+    #[tokio::test]
+    async fn worktree_package_json_sidecars_and_labels_honestly() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+        seed_generated_files(&seed, &local);
+
+        // Upstream advances package.json (so it's upstream-changed → in the risk
+        // set when locally modified).
+        push_upstream_change(
+            &seed,
+            &local,
+            "launcher/package.json",
+            "{\n  \"name\": \"vct\",\n  \"version\": \"0.2.89\"\n}\n",
+        );
+        // Local UNCOMMITTED HAND edit to package.json (a deliberate local pin —
+        // NOT a regeneration).
+        let hand_edit = "{\n  \"name\": \"vct\",\n  \"version\": \"0.0.1\",\n  \"myPin\": true\n}\n";
+        write_local_mod(&local, "launcher/package.json", hand_edit);
+
+        let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+        let outcome = resolve_generated_files_to_upstream(&local, "main").await;
+        assert!(
+            outcome.restored_worktree.contains(&"launcher/package.json".to_string()),
+            "package.json must be restored to HEAD; got {:?}",
+            outcome.restored_worktree
+        );
+
+        // (a) the pre-restore sidecar exists with the dropped hand-edit bytes.
+        let sidecar = pre_reconcile_sidecar_path(&local, "launcher/package.json", &theirs);
+        assert!(
+            sidecar.exists(),
+            "a pre-restore sidecar must exist at {}",
+            sidecar.display()
+        );
+        let recovered = std::fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(
+            recovered, hand_edit,
+            "the sidecar must carry the pre-restore hand edit verbatim"
+        );
+
+        // (b) the deferral text is honest: names package.json, does NOT call it a
+        // derived artifact, points at the sidecar recovery.
+        let (_title, detected, why, _cmd) =
+            build_generated_reconcile_deferral_text(&outcome, &theirs);
+        assert!(
+            detected.contains("launcher/package.json"),
+            "package.json must be named in the deferral; got {detected}"
+        );
+        assert!(
+            detected.contains("hand-authorable manifest") || detected.contains("NOT a derived"),
+            "package.json bullet must NOT claim 'derived artifact'; got {detected}"
+        );
+        assert!(
+            detected.contains("pre-reconcile-"),
+            "the deferral must name the sidecar recovery path; got {detected}"
+        );
+        assert!(
+            why.contains("MANIFEST") || why.contains("hand-authorable"),
+            "the why-text must flag the manifest-not-derived case; got {why}"
+        );
+    }
+
     /// (10) mixed: same path committed-divergent AND additionally
     /// worktree-dirty → ends with worktree+index+HEAD all == theirs blob.
     #[tokio::test]
@@ -6048,16 +6331,10 @@ mod tests {
         assert_eq!(head_before, head_after, "HEAD must not move for a source-only divergence");
     }
 
-    /// (12) per-file soft-fail: one committed-divergent path plus one
-    /// non-existent-at-theirs allowlisted path; the good one reconciles, the
-    /// bad one is dropped, and reconcile still commits.
-    #[tokio::test]
-    async fn act_soft_fails_per_file() {
-        skip_if_no_git!();
-        let (_tmp, _remote, local) = init_repo_pair();
-        let seed = _tmp.path().join("seed");
-        seed_generated_files(&seed, &local);
-
+    /// Seed both lockfiles diverged (committed) between upstream and fork.
+    /// Returns nothing; used by the two soft-fail tests below.
+    fn seed_two_committed_lockfile_divergence(seed: &Path, local: &Path) {
+        seed_generated_files(seed, local);
         // Upstream changes BOTH package-lock.json and Cargo.lock.
         std::fs::write(seed.join("launcher/package-lock.json"), "{\n  \"up\": true\n}\n").unwrap();
         std::fs::write(
@@ -6065,44 +6342,155 @@ mod tests {
             "# up\n[[package]]\nname = \"vct\"\nversion = \"9.9.9\"\n",
         )
         .unwrap();
-        run_git(&seed, &["add", "."]);
-        run_git(&seed, &["commit", "-m", "upstream changes both lockfiles"]);
-        run_git(&seed, &["push", "origin", "main"]);
-        run_git(&local, &["fetch", "vco_upstream"]);
+        run_git(seed, &["add", "."]);
+        run_git(seed, &["commit", "-m", "upstream changes both lockfiles"]);
+        run_git(seed, &["push", "origin", "main"]);
+        run_git(local, &["fetch", "vco_upstream"]);
 
         // Fork commits divergent bumps to BOTH.
-        write_local_mod(&local, "launcher/package-lock.json", "{\n  \"fork\": true\n}\n");
+        write_local_mod(local, "launcher/package-lock.json", "{\n  \"fork\": true\n}\n");
         write_local_mod(
-            &local,
+            local,
             "launcher/src-tauri/Cargo.lock",
             "# fork\n[[package]]\nname = \"vct\"\nversion = \"1.1.1\"\n",
         );
-        run_git(&local, &["add", "."]);
-        run_git(&local, &["commit", "-m", "fork bumps both lockfiles"]);
-        refetch_upstream(&local);
+        run_git(local, &["add", "."]);
+        run_git(local, &["commit", "-m", "fork bumps both lockfiles"]);
+        refetch_upstream(local);
+    }
 
-        // Inject a per-file failure: make the checkout of Cargo.lock fail by
-        // making its parent path unwritable is fragile cross-OS; instead assert
-        // the softer contract — the classify + act complete and package-lock is
-        // reconciled even if we (separately) verify a bad path is dropped below.
+    /// (12a — MINOR-3 checkout-failure arm) make ONE committed path
+    /// un-checkout-able (chmod its parent dir read-only on POSIX) → that path
+    /// stays divergent while the OTHER reconciles + commits. The leave-alone leg
+    /// of the per-file soft-fail gate, delivered for real (no happy-path proxy).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn act_soft_fails_when_one_checkout_cannot_write() {
+        skip_if_no_git!();
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+        seed_two_committed_lockfile_divergence(&seed, &local);
+
+        // Make `launcher/src-tauri/` read-only so `git checkout <theirs> --
+        // launcher/src-tauri/Cargo.lock` cannot write the file. package-lock.json
+        // (a different parent) still reconciles.
+        let cargo_parent = local.join("launcher/src-tauri");
+        let orig_perm = std::fs::metadata(&cargo_parent).unwrap().permissions();
+        std::fs::set_permissions(&cargo_parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+
         let outcome = resolve_generated_files_to_upstream(&local, "main").await;
+
+        // Restore permissions before any assertion so a failure doesn't leak a
+        // read-only dir into the tempdir cleanup.
+        std::fs::set_permissions(&cargo_parent, orig_perm).unwrap();
+
+        // The good path reconciled + committed.
         assert!(
             outcome.reconcile_committed,
-            "at least one path reconciled → a commit must exist"
+            "the writable path must still reconcile-commit despite the other failing"
         );
         assert!(
             outcome.took_upstream.contains(&"launcher/package-lock.json".to_string()),
-            "package-lock.json must reconcile; got {:?}",
+            "package-lock.json (writable parent) must reconcile; got {:?}",
             outcome.took_upstream
         );
+        // The un-writable path was DROPPED from took_upstream and stays divergent.
+        assert!(
+            !outcome
+                .took_upstream
+                .contains(&"launcher/src-tauri/Cargo.lock".to_string()),
+            "the un-checkout-able Cargo.lock must be dropped from took_upstream; got {:?}",
+            outcome.took_upstream
+        );
+        // Cargo.lock at HEAD still holds the fork's committed content (untouched).
+        assert_eq!(
+            blob_at(&local, "HEAD", "launcher/src-tauri/Cargo.lock"),
+            "# fork\n[[package]]\nname = \"vct\"\nversion = \"1.1.1\"\n",
+            "the failed path must retain the fork's committed content (left divergent)"
+        );
+    }
 
-        // Direct per-file soft-fail unit: acting on a path absent at theirs must
-        // not panic and must not fold it into took_upstream. We synthesise this
-        // by classifying against a theirs where an allowlisted path was ADDED
-        // only locally (absent upstream) — checkout <theirs> -- <path> fails.
-        // Covered structurally by the checkout error arm; the assertion above
-        // (a good path still reconciles) is the differential the house rule
-        // wants: one failure never blocks the others.
+    /// (12b — MINOR-3 commit-failure-revert arm) unit-test the revert seam
+    /// directly (a clean cross-OS commit-failure injection into the full flow is
+    /// fragile; the revert logic is the load-bearing leave-alone leg). Take
+    /// upstream for a committed path (staging it), then invoke the revert seam
+    /// and assert the working tree + index are restored to HEAD (the fork's
+    /// original committed content) with no new commit.
+    #[tokio::test]
+    async fn revert_seam_restores_head_after_commit_failure() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+        seed_generated_files(&seed, &local);
+
+        push_upstream_change(&seed, &local, "launcher/package-lock.json", "{\n  \"up\": true\n}\n");
+        let fork_lock = "{\n  \"fork\": true\n}\n";
+        commit_local_change(&local, "launcher/package-lock.json", fork_lock);
+        refetch_upstream(&local);
+
+        let head_before = {
+            let out = StdCommand::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&local)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // Simulate step 3: take upstream's blob into index+worktree (this is
+        // exactly what precedes the synthetic commit).
+        let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+        let take = StdCommand::new("git")
+            .args(["checkout", &theirs, "--", "launcher/package-lock.json"])
+            .current_dir(&local)
+            .status()
+            .unwrap();
+        assert!(take.success(), "the take-upstream checkout must succeed");
+        // Confirm the working tree is now upstream's (the state the commit would
+        // have recorded).
+        assert_eq!(
+            std::fs::read_to_string(local.join("launcher/package-lock.json")).unwrap(),
+            "{\n  \"up\": true\n}\n",
+            "precondition: the working tree holds upstream's blob before the revert"
+        );
+
+        // Now the commit "fails" — invoke the revert seam directly.
+        let reverted =
+            revert_taken_checkouts_to_head(&local, &["launcher/package-lock.json".to_string()]).await;
+        assert_eq!(
+            reverted,
+            vec!["launcher/package-lock.json".to_string()],
+            "the revert must report the path it restored"
+        );
+
+        // The working tree + index are back to the fork's original (HEAD) content.
+        assert_eq!(
+            std::fs::read_to_string(local.join("launcher/package-lock.json")).unwrap(),
+            fork_lock,
+            "the revert must restore the fork's committed content to the working tree"
+        );
+        let status = StdCommand::new("git")
+            .args(["status", "--porcelain", "--", "launcher/package-lock.json"])
+            .current_dir(&local)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "the path must be clean (index+worktree == HEAD) after the revert; got {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+        // No new commit was created (HEAD unchanged) — reconcile_committed=false
+        // is the caller's semantics; the seam itself never commits.
+        let head_after = {
+            let out = StdCommand::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&local)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(head_before, head_after, "the revert must not create a commit");
     }
 
     /// (13) commit identity works WITHOUT any user.name/user.email git config
@@ -6142,6 +6530,196 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
         assert_eq!(author, "VCO Orchestrator <orchestrator@vibecoded.tools>");
+    }
+
+    /// (MAJOR-1) the synthetic reconcile commit must be scoped to the taken
+    /// pathspecs ONLY — an UNRELATED user-staged change must NOT be folded into
+    /// it and must stay staged/uncommitted afterwards.
+    #[tokio::test]
+    async fn reconcile_commit_excludes_unrelated_staged_file() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+        seed_generated_files(&seed, &local);
+
+        // Upstream + fork diverge on the lockfile (the take-upstream class).
+        push_upstream_change(&seed, &local, "launcher/package-lock.json", "{\n  \"up\": true\n}\n");
+        commit_local_change(&local, "launcher/package-lock.json", "{\n  \"fork\": true\n}\n");
+        refetch_upstream(&local);
+
+        // The user STAGES an unrelated, non-allowlisted change BEFORE the
+        // reconcile runs (e.g. WIP on a source file).
+        write_local_mod(&local, "vco_lib/foo.py", "def user_wip(): pass\n");
+        run_git(&local, &["add", "vco_lib/foo.py"]);
+
+        let outcome = resolve_generated_files_to_upstream(&local, "main").await;
+        assert!(outcome.reconcile_committed, "the lockfile divergence must reconcile-commit");
+
+        // (a) the reconcile commit must NOT include the unrelated file.
+        let files_in_commit = {
+            let out = StdCommand::new("git")
+                .args(["show", "--name-only", "--format=", "HEAD"])
+                .current_dir(&local)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        assert!(
+            files_in_commit.contains("launcher/package-lock.json"),
+            "the reconcile commit must contain the taken lockfile; got {files_in_commit}"
+        );
+        assert!(
+            !files_in_commit.contains("vco_lib/foo.py"),
+            "the reconcile commit must NOT fold in the user-staged unrelated file; got {files_in_commit}"
+        );
+
+        // (b) the unrelated staged change is STILL staged/uncommitted after.
+        let staged = {
+            let out = StdCommand::new("git")
+                .args(["diff", "--cached", "--name-only"])
+                .current_dir(&local)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        assert!(
+            staged.contains("vco_lib/foo.py"),
+            "the user's unrelated staged change must survive the reconcile; got staged={staged}"
+        );
+    }
+
+    /// (MAJOR-1 second-attempt) a reconcile commit already exists AND an
+    /// unrelated staged change is present → the second reconcile finds NOTHING
+    /// generated to take, so `reconcile_committed` must be FALSE (the pathspec
+    /// commit no-ops → fails → conservative arm) — it must NOT falsely claim a
+    /// take-upstream that didn't happen.
+    #[tokio::test]
+    async fn reconcile_second_attempt_reports_false_when_nothing_taken() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+        seed_generated_files(&seed, &local);
+
+        push_upstream_change(&seed, &local, "launcher/package-lock.json", "{\n  \"up\": true\n}\n");
+        commit_local_change(&local, "launcher/package-lock.json", "{\n  \"fork\": true\n}\n");
+        refetch_upstream(&local);
+
+        // First reconcile takes upstream + commits.
+        let first = resolve_generated_files_to_upstream(&local, "main").await;
+        assert!(first.reconcile_committed, "first reconcile must commit");
+        // The lockfile now == upstream at HEAD, so a second reconcile finds NO
+        // committed divergence (base..HEAD no longer modifies it vs base..theirs).
+
+        // The user stages an unrelated change (the second-attempt false-positive
+        // shape: nothing generated to take, but the index is non-empty).
+        write_local_mod(&local, "vco_lib/foo.py", "def user_wip(): pass\n");
+        run_git(&local, &["add", "vco_lib/foo.py"]);
+
+        let head_before = {
+            let out = StdCommand::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&local)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        let second = resolve_generated_files_to_upstream(&local, "main").await;
+        assert!(
+            !second.reconcile_committed,
+            "a second reconcile with nothing generated to take must NOT report reconcile_committed"
+        );
+        assert!(
+            second.took_upstream.is_empty(),
+            "nothing may be reported as taken on the second attempt; got {:?}",
+            second.took_upstream
+        );
+
+        // HEAD must not move — no spurious reconcile commit folding the user's
+        // unrelated staged file under the mechanical identity.
+        let head_after = {
+            let out = StdCommand::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&local)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(
+            head_before, head_after,
+            "the second attempt must not create a commit (nothing generated to take)"
+        );
+        // And the user's unrelated staged change survives untouched.
+        let staged = {
+            let out = StdCommand::new("git")
+                .args(["diff", "--cached", "--name-only"])
+                .current_dir(&local)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        assert!(
+            staged.contains("vco_lib/foo.py"),
+            "the user's unrelated staged change must survive the second attempt; got {staged}"
+        );
+    }
+
+    /// (MINOR-4) an in-progress merge (`.git/MERGE_HEAD` present) → the
+    /// reconcile must be a NO-OP: no commit, `reconcile_committed=false`. A
+    /// leftover in-progress operation must be concluded by the existing flow,
+    /// never silently wrapped up as a mislabelled reconcile commit.
+    #[tokio::test]
+    async fn reconcile_bails_on_in_progress_merge() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+        seed_generated_files(&seed, &local);
+
+        // A committed lockfile divergence exists (the class the reconcile WOULD
+        // otherwise take) — proving the bail is about the merge state, not an
+        // empty classification.
+        push_upstream_change(&seed, &local, "launcher/package-lock.json", "{\n  \"up\": true\n}\n");
+        commit_local_change(&local, "launcher/package-lock.json", "{\n  \"fork\": true\n}\n");
+        refetch_upstream(&local);
+
+        // Simulate a leftover in-progress merge by writing a MERGE_HEAD sentinel
+        // (the only thing the bail probe checks). Point it at the fetched tip.
+        let their_sha = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+        std::fs::write(local.join(".git").join("MERGE_HEAD"), format!("{}\n", their_sha)).unwrap();
+
+        let head_before = {
+            let out = StdCommand::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&local)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        let outcome = resolve_generated_files_to_upstream(&local, "main").await;
+        assert!(
+            !outcome.reconcile_committed
+                && outcome.took_upstream.is_empty()
+                && outcome.restored_worktree.is_empty(),
+            "a reconcile over an in-progress merge must be a total no-op; got {:?}",
+            (
+                outcome.reconcile_committed,
+                &outcome.took_upstream,
+                &outcome.restored_worktree
+            )
+        );
+        let head_after = {
+            let out = StdCommand::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&local)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(
+            head_before, head_after,
+            "the reconcile must not create a commit while a merge is in progress"
+        );
     }
 
     // ───── Differential (MODAL → AUTO-RESOLVED) ─────
@@ -6410,6 +6988,86 @@ mod tests {
         );
     }
 
+    /// (MINOR-1) upstream changed CLAUDE.md (top region) AND the fork has a
+    /// committed lockfile divergence. The reconcile must (a) still auto-resolve
+    /// the lockfile (RealMerge, not the modal), and (b) NOT self-inflict a
+    /// CLAUDE.md-driven modal by dirtying the tracked CLAUDE.md via a pre-pull
+    /// deferral emit — the fix moved the emit to the CALL-SITE (post-pull). We
+    /// prove the reconcile fn leaves CLAUDE.md un-dirtied and the plan flips to
+    /// RealMerge; the emit is invoked explicitly AFTER, mirroring the real flow.
+    #[tokio::test]
+    async fn reconcile_does_not_self_inflict_claude_md_modal() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+        seed_generated_files(&seed, &local);
+
+        // Upstream ships a NEW lockfile (the take-upstream class) AND rewrites
+        // the FIRST line of CLAUDE.md — the exact incident's top-region churn.
+        std::fs::write(seed.join("launcher/package-lock.json"), "{\n  \"up\": true\n}\n").unwrap();
+        std::fs::write(seed.join("CLAUDE.md"), "# UPSTREAM HEADER\nLine A\nLine B\n").unwrap();
+        run_git(&seed, &["add", "."]);
+        run_git(&seed, &["commit", "-m", "upstream: lockfile + CLAUDE.md header"]);
+        run_git(&seed, &["push", "origin", "main"]);
+        run_git(&local, &["fetch", "vco_upstream"]);
+
+        // Fork COMMITS ONLY a divergent lockfile bump (CLAUDE.md is UNCHANGED
+        // locally — a clean fork on that file). This isolates the self-inflict
+        // hazard: if the reconcile emitted a deferral pre-pull it would inject a
+        // reminder block into CLAUDE.md, making the otherwise-clean CLAUDE.md
+        // tracked-modified and contaminating the pop-conflict-risk set.
+        commit_local_change(&local, "launcher/package-lock.json", "{\n  \"fork\": true\n}\n");
+        refetch_upstream(&local);
+
+        // Baseline: WITHOUT the reconcile the committed lockfile divergence is
+        // FfOnly (today's modal).
+        let baseline = resolve_divergence_pull_plan(&local, "main", false, false).await;
+        assert_eq!(baseline, PullPlan::FfOnly, "baseline must be FfOnly (the modal)");
+
+        // Run the reconcile. It must NOT dirty CLAUDE.md (the emit is deferred to
+        // the call-site).
+        let outcome = resolve_generated_files_to_upstream(&local, "main").await;
+        assert!(outcome.reconcile_committed, "the lockfile must reconcile-commit");
+
+        // (b) CLAUDE.md must be un-dirtied by the reconcile fn — no self-inflicted
+        // pop-conflict-risk contribution.
+        let claude_status = StdCommand::new("git")
+            .args(["status", "--porcelain", "--", "CLAUDE.md"])
+            .current_dir(&local)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&claude_status.stdout).trim().is_empty(),
+            "the reconcile must NOT dirty CLAUDE.md (self-inflicted modal risk); got {}",
+            String::from_utf8_lossy(&claude_status.stdout)
+        );
+
+        // (a) the plan flips to RealMerge — the lockfile auto-resolves, no modal.
+        let plan =
+            resolve_divergence_pull_plan(&local, "main", false, outcome.reconcile_committed).await;
+        assert_eq!(
+            plan,
+            PullPlan::RealMerge,
+            "after reconciling the lockfile the plan must RealMerge even with upstream CLAUDE.md \
+             churn (no self-inflicted CLAUDE.md modal)"
+        );
+
+        // The real pull the plan produces must exit 0 (upstream's CLAUDE.md
+        // fast-forwards onto the fork's unchanged CLAUDE.md — no conflict).
+        let args = plan.pull_args(crate::commands::self_update::VCO_UPSTREAM_REMOTE, "main");
+        let pull = StdCommand::new("git").args(&args).current_dir(&local).output().unwrap();
+        assert!(
+            pull.status.success(),
+            "the RealMerge pull must exit 0; stdout={} stderr={}",
+            String::from_utf8_lossy(&pull.stdout),
+            String::from_utf8_lossy(&pull.stderr)
+        );
+
+        // The call-site emit runs AFTER the pull (dirtying CLAUDE.md now is
+        // harmless — the pull is done, install.py --update self-clears it).
+        emit_generated_reconcile_deferrals(&local, &outcome);
+    }
+
     // ───── Audit (22) ─────
 
     /// (22) the deferral names each path, action, short theirs-sha, and recovery
@@ -6422,6 +7080,7 @@ mod tests {
             took_upstream: vec!["launcher/package-lock.json".to_string()],
             restored_worktree: vec!["launcher/src-tauri/Cargo.lock".to_string()],
             reconcile_committed: true,
+            theirs_sha: "7b255dd1234567890".to_string(),
         };
         let (title, detected, why, cmd) =
             build_generated_reconcile_deferral_text(&outcome, "7b255dd1234567890");
@@ -6492,8 +7151,9 @@ mod tests {
             took_upstream: vec!["launcher/package-lock.json".to_string()],
             restored_worktree: vec!["launcher/dist/linux-x64/vct-hub".to_string()],
             reconcile_committed: true,
+            theirs_sha: "7b255dd1234567890".to_string(),
         };
-        emit_generated_reconcile_deferrals(&fake_install, &outcome, "7b255dd1234567890");
+        emit_generated_reconcile_deferrals(&fake_install, &outcome);
 
         let deferred = fake_install
             .join(".claude")
@@ -6724,6 +7384,11 @@ mod tests {
             String::from_utf8_lossy(&pull.stdout),
             String::from_utf8_lossy(&pull.stderr)
         );
+
+        // (emit) v0.2.89 MINOR-1: the call-site emits the audit deferral AFTER
+        // the pull succeeds (mirroring the real update surfaces) — NOT inside
+        // resolve_generated_files_to_upstream. Assertion (e) below checks it.
+        emit_generated_reconcile_deferrals(&local, &outcome);
 
         // ASSERT (c): after the pull, package-lock.json + package.json blobs ==
         //             upstream's shipped copies (the security pin + upstream

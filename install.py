@@ -7853,17 +7853,35 @@ def _apply_deferred_entries(
                 # hub — an absent/unparseable sidecar means we cannot POSITIVELY
                 # confirm the hub caught up, so we keep the actionable entry
                 # (conservative: never wrongly clear a failure record).
-                resolved = bool(
+                version_caught_up = bool(
                     source_version and on_disk_hub_version
                     and _ge(on_disk_hub_version, source_version)
                 )
 
+                # v0.2.89 MAJOR-2: a caught-up sidecar VERSION only proves the
+                # hub BINARY was refreshed on disk — NOT that the hub is UP.
+                # Step 8 (_deploy_and_start_vct_hub) is soft-fail, so a run whose
+                # /health poll FAILED still reaches here; clearing the entry on
+                # version alone would wrongly delete an actionable "hub down"
+                # record while the hub is genuinely down. AND-in a LIVE health
+                # confirmation (reuse the existing probe — do NOT invent a new
+                # one). If the probe is unavailable/raises, PRESERVE (conservative:
+                # never wrongly clear an actionable failure).
+                health_ok = False
+                if version_caught_up:
+                    try:
+                        health_ok = _probe_vct_hub_health()
+                    except Exception:  # noqa: BLE001 — probe must never crash the handler
+                        health_ok = False
+
+                resolved = version_caught_up and health_ok
+
                 if resolved:
                     print(
                         f"  [ok]   {cid}: on-disk hub v{on_disk_hub_version} "
-                        f">= source v{source_version} — the hub has been "
-                        "refreshed and Step 8 restarted it; the abort-time "
-                        "restart failure is resolved. Marking resolved."
+                        f">= source v{source_version} AND /health is live — the "
+                        "hub has been refreshed and is UP; the abort-time restart "
+                        "failure is resolved. Marking resolved."
                     )
                     # Resolved: clear seeded copy + tombstone (P1, v0.2.75).
                     # FOREIGN cid (Rust-emitted, not in the owned set): the A-2
@@ -7872,13 +7890,26 @@ def _apply_deferred_entries(
                     # mark_resolved here the 'do NOT re-add' resolution is inert
                     # (same pattern launcher_update_diverged uses).
                     current_run_report.mark_resolved(cid)
-                else:
+                elif not version_caught_up:
                     print(
                         f"  [skip] {cid}: hub binary has not reached source "
                         f"v{source_version or '<unknown>'} yet (on-disk hub "
                         f"v{on_disk_hub_version or '<none>'}); the hub has not "
                         "caught up, so the abort-time restart failure stands. "
                         "Keeping entry."
+                    )
+                    current_run_report.add_entry(entry)
+                else:
+                    # Version caught up BUT the live /health probe did not confirm
+                    # the hub is up → the hub binary was refreshed but the hub is
+                    # NOT answering. This is EXACTLY the "hub down" state the entry
+                    # records — preserve it (never clear an actionable failure on
+                    # version alone).
+                    print(
+                        f"  [skip] {cid}: on-disk hub v{on_disk_hub_version} "
+                        f">= source v{source_version} BUT /health did not answer "
+                        "— the hub binary was refreshed yet the hub is NOT up; the "
+                        "abort-time restart failure still stands. Keeping entry."
                     )
                     current_run_report.add_entry(entry)
             except Exception as exc:  # noqa: BLE001 — soft-fail

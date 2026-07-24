@@ -971,13 +971,16 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
     // This is the SAME shared helper the installer surface calls (one home):
     // it classifies the allowlisted committed/worktree divergence, takes
     // upstream's blob (a synthetic take-upstream commit for the committed set,
-    // a restore-to-HEAD for the worktree set), and emits its own best-effort
-    // `generated_files_reconciled` audit deferral internally. Best-effort
-    // throughout: any per-file failure leaves that file divergent → it stays
-    // in the pop-conflict-risk / modal-forcing sets (never worse than today's
-    // resync modal). A divergent SOURCE file still surfaces the modal (a real
-    // breakage signal); only the "expected conflict" class (dep-bump /
-    // lockfile / dist divergence) is auto-resolved.
+    // a restore-to-HEAD for the worktree set). v0.2.89 MINOR-1: its
+    // `generated_files_reconciled` audit deferral is emitted by THIS surface
+    // AFTER the pull succeeds (search MINOR-1 below), NOT inside the helper — a
+    // pre-pull emit would dirty CLAUDE.md between the reconcile and the pull-plan
+    // decision and could self-inflict the resync modal. Best-effort throughout:
+    // any per-file failure leaves that file divergent → it stays in the
+    // pop-conflict-risk / modal-forcing sets (never worse than today's resync
+    // modal). A divergent SOURCE file still surfaces the modal (a real breakage
+    // signal); only the "expected conflict" class (dep-bump / lockfile / dist
+    // divergence) is auto-resolved.
     let gen_reconcile =
         crate::commands::git_user_editable_merge::resolve_generated_files_to_upstream(
             &repo, &branch,
@@ -1090,6 +1093,17 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
             detail,
         ));
     }
+
+    // v0.2.89 MINOR-1: emit the generated-file reconcile audit deferral HERE —
+    // AFTER the pull succeeded and the tree is confirmed clean, NOT inside the
+    // shared helper. Emitting injects a reminder block into the tracked
+    // CLAUDE.md; a pre-pull emit would dirty it and could self-inflict the
+    // resync modal. Best-effort (no-op when nothing was reconciled); self-clears
+    // on the install.py --update run inside finish_apply_after_pull below.
+    crate::commands::git_user_editable_merge::emit_generated_reconcile_deferrals(
+        &repo,
+        &gen_reconcile,
+    );
 
     finish_apply_after_pull(app, &repo, needs_cargo, needs_npm).await
 }

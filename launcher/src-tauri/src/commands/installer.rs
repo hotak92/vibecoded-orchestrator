@@ -3656,17 +3656,31 @@ fn ensure_hub_started_after_update(
             // file the conflict path writes. No retries, no binary swaps.
             let root_owned = root.clone();
             let install_owned = install_path.to_path_buf();
-            std::thread::spawn(move || {
-                if poll_hub_health_for_30s(&root_owned) {
-                    return; // hub came back healthy — nothing to report.
-                }
+            // NIT-2: `std::thread::spawn` PANICS on OS thread-creation failure —
+            // an unacceptable outcome inside a best-effort abort handler. Use
+            // `Builder::spawn` and log the Err instead; if the OS can't hand us a
+            // thread we simply forgo the async poll (the eprintln above already
+            // told the user the abort ran), never panicking the abort path.
+            if let Err(e) = std::thread::Builder::new()
+                .name("vct-hub-abort-health-poll".to_string())
+                .spawn(move || {
+                    if poll_hub_health_for_30s(&root_owned) {
+                        return; // hub came back healthy — nothing to report.
+                    }
+                    eprintln!(
+                        "[vct] abort_recovery: vct-hub did NOT become healthy within 30 s after \
+                         the update aborted; the hub is likely down. Restart the launcher or run \
+                         `vct-hub --start-if-not-running`. Writing a durable deferral note."
+                    );
+                    emit_hub_restart_failed_after_abort_deferral(&install_owned);
+                })
+            {
                 eprintln!(
-                    "[vct] abort_recovery: vct-hub did NOT become healthy within 30 s after the \
-                     update aborted; the hub is likely down. Restart the launcher or run \
-                     `vct-hub --start-if-not-running`. Writing a durable deferral note."
+                    "[vct] abort_recovery: could not spawn the background hub health-poll thread \
+                     ({}); skipping the async poll (best-effort — the abort itself completed).",
+                    e
                 );
-                emit_hub_restart_failed_after_abort_deferral(&install_owned);
-            });
+            }
             Ok(())
         }
     }
@@ -4818,11 +4832,11 @@ pub async fn update_orchestrator<R: Runtime>(
             gen_reconcile.restored_worktree.len(),
             gen_reconcile.reconcile_committed
         );
-        // The audit-trail deferral (`generated_files_reconciled`) is emitted
-        // INSIDE resolve_generated_files_to_upstream (step 6) as part of the
-        // shared helper's own best-effort tail — so it is NOT re-emitted here
-        // (the emit upserts by condition_id; a second call would only respawn
-        // the Python helper for no gain). Intentional, not an omission.
+        // v0.2.89 MINOR-1: the audit-trail deferral (`generated_files_reconciled`)
+        // is NOT emitted here — emitting injects a reminder block into the tracked
+        // CLAUDE.md, which pre-pull would dirty CLAUDE.md between this reconcile and
+        // the pull-plan decision below and could self-inflict the divergence modal.
+        // It is emitted AFTER the pull succeeds (search MINOR-1 below).
     }
     let pull_plan = crate::commands::git_user_editable_merge::resolve_divergence_pull_plan(
         &install_path,
@@ -5160,6 +5174,18 @@ pub async fn update_orchestrator<R: Runtime>(
 
     // v0.2.24 §A0 (Q1 fix): deferrals were already emitted BEFORE the
     // pull (see above) — no second call needed here.
+
+    // v0.2.89 MINOR-1: emit the generated-file reconcile audit deferral HERE —
+    // AFTER the pull succeeded, NOT inside resolve_generated_files_to_upstream.
+    // Emitting injects a reminder block into the tracked CLAUDE.md; doing it
+    // pre-pull would dirty CLAUDE.md between the reconcile and the pull-plan
+    // decision and could self-inflict the divergence modal on an otherwise-clean
+    // fork. Best-effort (no-op when nothing was reconciled). The deferral
+    // self-clears on the imminent install.py --update below.
+    crate::commands::git_user_editable_merge::emit_generated_reconcile_deferrals(
+        &install_path,
+        &gen_reconcile,
+    );
 
     // v0.2.63: HEAD-advance backstop. A pull that exited 0 but did NOT reach
     // the upstream tip (a non-FF that slipped through, an odd partial state)
@@ -7162,8 +7188,9 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
     // synthetic take-upstream commit it creates is folded by the merge pull's
     // own 3-way (identical end-tree blobs ⇒ trivially clean). Best-effort: a
     // per-file failure leaves that file divergent → today's conflict flow still
-    // surfaces (never worse than before). The audit deferral is emitted inside
-    // the shared helper (step 6), same as the update_orchestrator surface.
+    // surfaces (never worse than before). v0.2.89 MINOR-1: the audit deferral
+    // is emitted by THIS surface AFTER the merge pull succeeds (search MINOR-1
+    // below), NOT inside the helper — a pre-pull emit would dirty CLAUDE.md.
     emit_progress(&window, "update", "Reconciling generated files to upstream...", 9.0);
     let gen_reconcile =
         crate::commands::git_user_editable_merge::resolve_generated_files_to_upstream(
@@ -7343,6 +7370,16 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
 
     // v0.2.24 §A0 (Q1 fix): deferrals were already emitted BEFORE the
     // pull (see above) — no second call needed here.
+
+    // v0.2.89 MINOR-1: emit the generated-file reconcile audit deferral HERE —
+    // AFTER the merge pull succeeded, NOT inside the shared helper. Emitting
+    // injects a reminder block into the tracked CLAUDE.md; doing it pre-pull
+    // would dirty CLAUDE.md. Best-effort (no-op when nothing was reconciled);
+    // self-clears on the install.py --update run inside run_post_pull_* below.
+    crate::commands::git_user_editable_merge::emit_generated_reconcile_deferrals(
+        &install_path,
+        &gen_reconcile,
+    );
 
     run_post_pull_install_and_restart(
         app,
