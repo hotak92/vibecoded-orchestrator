@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Diverged generated / release-controlled files now reconcile to upstream
+  automatically during an update — no modal, no user action.** When an
+  installed fork has diverged from upstream on `launcher/package.json`,
+  `launcher/package-lock.json`, `launcher/src-tauri/Cargo.lock`, or anything
+  under `launcher/dist/**` (npm/cargo/build artifacts and the upstream-bumped
+  version field — files that conflict on essentially every release), the update
+  flow now takes upstream's copy for those files instead of surfacing the
+  divergence modal. Both a committed divergence (resolved via a synthetic
+  take-upstream commit whose parent still holds the fork's original content —
+  recoverable with `git log`/`git checkout`) and a working-tree-dirty
+  divergence (restored to HEAD before the pull takes upstream) are handled. A
+  divergent SOURCE file (Cargo.toml, tauri.conf.json, pyproject.toml,
+  vct-module.json, `*.py`, `*.rs`) still surfaces the modal — that is a real
+  breakage signal, not silently overwritten. Every reconcile writes a
+  `generated_files_reconciled` audit entry to `UPDATE_DEFERRED.md` naming each
+  overwritten path, the action taken, and the recovery path; the entry
+  self-clears on the next `install.py` run. Two forward-only caveats:
+  (a) the fix lives in the launcher's Rust reconcile path, NOT in
+  `.gitattributes` — a take-theirs merge driver is not a built-in git driver,
+  the launcher's own reconcile paths are driver-blind, and drivers are
+  forward-only, so a declarative `.gitattributes` approach cannot carry it;
+  (b) the update that applies a release is run by the *installed* launcher, so
+  the v0.2.88 → v0.2.89 hop is still executed by the v0.2.88 binary and can hit
+  the divergence modal one last time (the existing modal/resume flow handles
+  it) — v0.2.89-onward auto-resolves.
+
 ## [0.2.88] - 2026-07-23
 
 ### Fixed

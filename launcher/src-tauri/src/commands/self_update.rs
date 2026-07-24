@@ -936,7 +936,13 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
     // has no A0 pre-merge step (no synthetic commit) — so the plan is either
     // RealMerge (clean committed divergence, no pop-conflict risk) or FfOnly
     // (everything else, incl. a clean fast-forwardable tree). We never get
-    // RebaseAutostash here. The `needs_cargo`/`needs_npm` rebuild gating above
+    // RebaseAutostash here. v0.2.89 §4.3: BEFORE the plan resolves, the shared
+    // generated-file reconcile step (below) takes upstream's blob for any
+    // diverged allowlisted release-controlled file (lockfiles, package.json,
+    // Cargo.lock, dist/**) so the "expected conflict" class auto-resolves
+    // (RealMerge / fast-forward) instead of forcing this surface's resync
+    // modal; its take-upstream commit (if any) is threaded into the plan's
+    // 4th arg. The `needs_cargo`/`needs_npm` rebuild gating above
     // was computed from the pre-diff `HEAD..vco_upstream/<branch>` (the
     // upstream-changed set) BEFORE the pull, so it's correct regardless of
     // whether the pull fast-forwards or produces a merge commit — a RealMerge
@@ -959,11 +965,46 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
             f1_restored
         );
     }
+    // v0.2.89 §4.3: after F1 (byte-identical restore) and BEFORE the plan
+    // resolution, reconcile GENERATED / release-controlled files to upstream
+    // (take-upstream bias) — lockfiles, package.json, Cargo.lock, dist/**.
+    // This is the SAME shared helper the installer surface calls (one home):
+    // it classifies the allowlisted committed/worktree divergence, takes
+    // upstream's blob (a synthetic take-upstream commit for the committed set,
+    // a restore-to-HEAD for the worktree set), and emits its own best-effort
+    // `generated_files_reconciled` audit deferral internally. Best-effort
+    // throughout: any per-file failure leaves that file divergent → it stays
+    // in the pop-conflict-risk / modal-forcing sets (never worse than today's
+    // resync modal). A divergent SOURCE file still surfaces the modal (a real
+    // breakage signal); only the "expected conflict" class (dep-bump /
+    // lockfile / dist divergence) is auto-resolved.
+    let gen_reconcile =
+        crate::commands::git_user_editable_merge::resolve_generated_files_to_upstream(
+            &repo, &branch,
+        )
+        .await;
+    if gen_reconcile.reconcile_committed
+        || !gen_reconcile.took_upstream.is_empty()
+        || !gen_reconcile.restored_worktree.is_empty()
+    {
+        eprintln!(
+            "[vct] apply_launcher_update: reconciled generated/release-controlled file(s) to \
+             upstream — {} committed take-upstream, {} worktree-restored (reconcile_committed={})",
+            gen_reconcile.took_upstream.len(),
+            gen_reconcile.restored_worktree.len(),
+            gen_reconcile.reconcile_committed
+        );
+    }
     let plan = crate::commands::git_user_editable_merge::resolve_divergence_pull_plan(
-        // v0.2.89 Phase 1: the 4th arg (generated_reconcile_committed) is wired
-        // into this surface in Phase 2b; `false` preserves the exact
-        // pre-reconcile decision (no behaviour change) for the parallel phases.
-        &repo, &branch, false, false,
+        &repo,
+        &branch,
+        // v0.2.89 Phase 2b: this surface has no A0 pre-merge step, so
+        // `pre_merge_committed` is always false here (see the comment block
+        // above). The 4th arg threads the generated-file reconcile result: a
+        // synthetic take-upstream commit falls through to the merge-tree probe
+        // (→ RealMerge on clean end-trees) instead of forcing the modal.
+        false,
+        gen_reconcile.reconcile_committed,
     )
     .await;
     let pull_args = plan.pull_args(VCO_UPSTREAM_REMOTE, &branch);

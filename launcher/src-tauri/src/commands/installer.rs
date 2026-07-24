@@ -3464,28 +3464,69 @@ fn pre_pull_rename_vct_hub_binary(_install_path: &Path) -> Option<PathBuf> {
 /// silently drift if install.py ever renames the sentinel).
 const V0_2_21_CUTOVER_SENTINEL_NAME: &str = "v0.2.21-cutover.flag";
 
-/// Decide whether the redundant 30 s /health poll in
-/// `ensure_hub_started_after_update` should be skipped.
+/// v0.2.89 §7.5 — the caller context for `ensure_hub_started_after_update`.
 ///
-/// Contract (v0.2.22 Item #3): install.py is the authoritative health
-/// check on the update happy path — it writes the cutover sentinel
-/// BEFORE starting vct-hub and DELETES it AFTER /health returns 200.
-/// So when we land in the launcher's post-install hub-recovery path:
-///
-/// * Sentinel ABSENT → install.py confirmed health already → skip
-///   the 30 s poll (pure wall-clock cost, no signal value).
-/// * Sentinel PRESENT → install.py timed out, was killed, OR is
-///   still running (shouldn't be possible from our call site, but
-///   the precheck doesn't have to reason about that) → run the
-///   full poll as a second-chance probe.
-///
-/// Returns `true` when the poll should be SKIPPED.
-fn should_skip_redundant_health_poll(root: &Path) -> bool {
-    !root.join(V0_2_21_CUTOVER_SENTINEL_NAME).exists()
+/// The cutover-sentinel skip heuristic (below) is only VALID on the
+/// post-install happy path, where install.py ran and its own /health probe
+/// is the authoritative signal. On the ABORT-RECOVERY path (a merge/rebase
+/// conflict tore the update down before install.py ever ran), the sentinel is
+/// absent because it was NEVER WRITTEN — reading its absence as "health
+/// validated" is the verified §7.2 hole. Threading the context lets the pure
+/// decision fn refuse the skip on abort.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HubRestartContext {
+    /// After install.py finished (finalize / binary-refresh-timeout paths):
+    /// trust the cutover-sentinel skip heuristic (behaviour unchanged).
+    PostInstall,
+    /// After a merge/rebase conflict aborted the update BEFORE install.py ran:
+    /// ALWAYS run the health poll (the sentinel's happy-path contract does not
+    /// apply — install.py never validated anything).
+    AbortRecovery,
 }
 
-/// v0.2.21 Step 12 (B1 fix): bring the detached vct-hub back up after
-/// install.py finishes.
+/// Pure decision (v0.2.89 §7.5, unit-testable — plan test 20): should the
+/// redundant 30 s /health poll in `ensure_hub_started_after_update` be
+/// skipped?
+///
+/// Contract (v0.2.22 Item #3): on the POST-INSTALL path install.py is the
+/// authoritative health check — it writes the cutover sentinel BEFORE starting
+/// vct-hub and DELETES it AFTER /health returns 200. So there:
+///
+/// * Sentinel ABSENT → install.py confirmed health already → skip the 30 s
+///   poll (pure wall-clock cost, no signal value).
+/// * Sentinel PRESENT → install.py timed out, was killed, OR is still running
+///   (shouldn't be possible from our call site, but the precheck doesn't have
+///   to reason about that) → run the full poll as a second-chance probe.
+///
+/// v0.2.89 §7.2 correction: on the ABORT-RECOVERY path install.py NEVER RAN,
+/// so the sentinel is absent for a reason that has nothing to do with health —
+/// the skip heuristic is unsound there. `AbortRecovery` therefore ALWAYS runs
+/// the poll (returns `false`), regardless of the sentinel. `sentinel_present`
+/// is passed in (rather than probed here) so the decision is a pure fn.
+///
+/// Returns `true` when the poll should be SKIPPED.
+fn should_skip_redundant_health_poll_decision(
+    ctx: HubRestartContext,
+    sentinel_present: bool,
+) -> bool {
+    match ctx {
+        // Abort path: the sentinel contract does not apply — never skip.
+        HubRestartContext::AbortRecovery => false,
+        // Post-install path (unchanged): skip iff the sentinel is absent.
+        HubRestartContext::PostInstall => !sentinel_present,
+    }
+}
+
+/// Thin I/O wrapper over the pure decision: probes the cutover sentinel on
+/// disk, then defers to `should_skip_redundant_health_poll_decision`. Kept
+/// separate so the decision itself is testable without a filesystem.
+fn should_skip_redundant_health_poll(root: &Path, ctx: HubRestartContext) -> bool {
+    let sentinel_present = root.join(V0_2_21_CUTOVER_SENTINEL_NAME).exists();
+    should_skip_redundant_health_poll_decision(ctx, sentinel_present)
+}
+
+/// v0.2.21 Step 12 (B1 fix): bring the detached vct-hub back up after an
+/// update tears down or finishes.
 ///
 /// Runs `vct-hub --start-if-not-running` and then verifies that the
 /// hub has actually become reachable by reading `<vct_root_dir()>/
@@ -3503,7 +3544,26 @@ fn should_skip_redundant_health_poll(root: &Path) -> bool {
 /// `hub_launcher::ensure_hub_running`) will also try to start the
 /// hub when the new launcher process boots, so this function is
 /// primarily an early-warning system.
-fn ensure_hub_started_after_update(_install_path: &Path) -> Result<(), String> {
+///
+/// v0.2.89 §7.5 — `ctx` selects two behaviours:
+///
+/// * `PostInstall` (finalize / binary-refresh-timeout): behaviour UNCHANGED.
+///   The cutover-sentinel skip heuristic applies (install.py's own /health
+///   probe is authoritative), and the whole thing runs synchronously.
+/// * `AbortRecovery` (a merge/rebase conflict tore the update down BEFORE
+///   install.py ran): NEVER consult the sentinel (its happy-path contract does
+///   not apply — install.py never validated anything), so ALWAYS run the poll.
+///   And run that poll on a background `std::thread` so the conflict
+///   payload/modal isn't delayed up to 30 s (this fn is called synchronously
+///   from async command bodies). On poll failure the background thread emits a
+///   loud eprintln + a best-effort `hub_restart_failed_after_abort` deferral
+///   note into the SAME UPDATE_DEFERRED file the conflict path already writes.
+///   NO retries, NO binary swaps, NO auto-heal (the standing "post-update
+///   restart is EXPECTED" discipline).
+fn ensure_hub_started_after_update(
+    install_path: &Path,
+    ctx: HubRestartContext,
+) -> Result<(), String> {
     let Some(hub_bin) = crate::hub_launcher::find_hub_binary() else {
         eprintln!(
             "[vct] update_orchestrator: vct-hub binary not found on disk after install.py — \
@@ -3547,36 +3607,78 @@ fn ensure_hub_started_after_update(_install_path: &Path) -> Result<(), String> {
         }
     }
 
-    // v0.2.22 Item #3 — skip the redundant /health poll on the common-
-    // success path. install.py's own post-cutover probe (see
-    // `_VCT_HUB_CUTOVER_SENTINEL_NAME` in install.py, written BEFORE
-    // hub-start and deleted AFTER /health returns 200) is the
-    // authoritative health check during update. If we land here and
-    // the sentinel is ABSENT, install.py already validated /health —
-    // re-probing for 30 s is pure wall-clock cost with no signal
-    // value. If the sentinel is PRESENT (rare slow-path: install.py
-    // timed out, or was killed mid-cutover), we still run the full
-    // poll as a second-chance probe — this is the only codepath
-    // that gives the user a recovery story when install.py's own
-    // probe didn't see /health come up.
+    // v0.2.22 Item #3 / v0.2.89 §7.2 — skip the redundant /health poll only on
+    // the POST-INSTALL common-success path. install.py's own post-cutover probe
+    // (see `_VCT_HUB_CUTOVER_SENTINEL_NAME` in install.py, written BEFORE
+    // hub-start and deleted AFTER /health returns 200) is the authoritative
+    // health check DURING update. If we land here post-install and the sentinel
+    // is ABSENT, install.py already validated /health — re-probing for 30 s is
+    // pure wall-clock cost with no signal value. If the sentinel is PRESENT
+    // (rare slow-path: install.py timed out, or was killed mid-cutover), we
+    // still run the full poll as a second-chance probe.
+    //
+    // On the ABORT-RECOVERY path this heuristic is UNSOUND (§7.2): install.py
+    // never ran, so the sentinel is absent for a reason unrelated to health.
+    // `should_skip_redundant_health_poll` (via the pure decision fn) returns
+    // `false` unconditionally for `AbortRecovery`, so we always poll there.
     let root = vct_launcher_core::paths::vct_root_dir();
-    if should_skip_redundant_health_poll(&root) {
+    if should_skip_redundant_health_poll(&root, ctx) {
         eprintln!(
-            "[vct] update_orchestrator: cutover sentinel absent — install.py \
+            "[vct] update_orchestrator: cutover sentinel absent (post-install) — install.py \
              already validated /health; skipping redundant 30 s poll"
         );
         return Ok(());
     }
 
-    eprintln!(
-        "[vct] update_orchestrator: cutover sentinel still present at {} — \
-         install.py did not confirm /health; running full 30 s poll",
-        root.join(V0_2_21_CUTOVER_SENTINEL_NAME).display()
-    );
+    match ctx {
+        HubRestartContext::PostInstall => {
+            eprintln!(
+                "[vct] update_orchestrator: cutover sentinel still present at {} — \
+                 install.py did not confirm /health; running full 30 s poll",
+                root.join(V0_2_21_CUTOVER_SENTINEL_NAME).display()
+            );
+            // Synchronous poll — the post-install finalize path is not
+            // latency-sensitive (the launcher is about to restart anyway).
+            poll_hub_health_for_30s(&root);
+            Ok(())
+        }
+        HubRestartContext::AbortRecovery => {
+            eprintln!(
+                "[vct] abort_recovery: running vct-hub /health poll on a background thread \
+                 (never consulting the cutover sentinel — install.py did not run on the abort \
+                 path) so the conflict payload/modal is not delayed up to 30 s"
+            );
+            // v0.2.89 §7.5.2 — the abort path is reached mid-conflict, when the
+            // caller is assembling the conflict payload / returning the modal.
+            // Blocking up to 30 s here would stall that. Move the poll to a
+            // detached background thread; on failure it self-reports via a loud
+            // eprintln + a best-effort deferral note in the SAME UPDATE_DEFERRED
+            // file the conflict path writes. No retries, no binary swaps.
+            let root_owned = root.clone();
+            let install_owned = install_path.to_path_buf();
+            std::thread::spawn(move || {
+                if poll_hub_health_for_30s(&root_owned) {
+                    return; // hub came back healthy — nothing to report.
+                }
+                eprintln!(
+                    "[vct] abort_recovery: vct-hub did NOT become healthy within 30 s after the \
+                     update aborted; the hub is likely down. Restart the launcher or run \
+                     `vct-hub --start-if-not-running`. Writing a durable deferral note."
+                );
+                emit_hub_restart_failed_after_abort_deferral(&install_owned);
+            });
+            Ok(())
+        }
+    }
+}
 
-    // Poll up to 30 s for hub.port + hub.token to appear and /health
-    // to answer 200. The hub spawns a detached child and returns
-    // quickly; the child does the actual bind + DB migration.
+/// v0.2.89 §7.5 — poll up to 30 s for the hub's `hub.port` + `hub.token` to
+/// appear under `root` and for `/health` to answer 200. Returns `true` on a
+/// healthy probe, `false` on timeout. The hub spawns a detached child and
+/// returns quickly; the child does the actual bind + DB migration. Extracted so
+/// both the synchronous (PostInstall) and background-thread (AbortRecovery)
+/// arms share ONE poll implementation.
+fn poll_hub_health_for_30s(root: &Path) -> bool {
     let port_path = root.join("hub.port");
     let token_path = root.join("hub.token");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -3596,7 +3698,7 @@ fn ensure_hub_started_after_update(_install_path: &Path) -> Result<(), String> {
                         "[vct] update_orchestrator: vct-hub /health OK on 127.0.0.1:{}",
                         port
                     );
-                    return Ok(());
+                    return true;
                 }
             }
         }
@@ -3608,7 +3710,69 @@ fn ensure_hub_started_after_update(_install_path: &Path) -> Result<(), String> {
          launcher will start in hub-unavailable degraded mode. \
          User can retry via Stop menu → 'Start vct-hub'."
     );
-    Ok(())
+    false
+}
+
+/// v0.2.89 §7.5.3 — best-effort durable note that the hub did NOT come back up
+/// after an update aborted on a genuine (source-file) conflict. Lands in the
+/// SAME `.claude/context/UPDATE_DEFERRED.md` the conflict path already wrote to
+/// (via `write_resume_sentinel_and_deferral`), so a terminal Claude + the GUI
+/// see "hub did not come back; restart the launcher or run `vct-hub
+/// --start-if-not-running`". Routed through the shared locked deferral emitter
+/// (`crate::services::deferral::emit_deferral_entry`), the same shape the
+/// generated-reconcile audit note uses. Condition id
+/// `hub_restart_failed_after_abort`, severity `warning`. Best-effort throughout
+/// — an emit failure logs + is swallowed (it must NEVER mask the conflict
+/// outcome the caller is surfacing). NO retries, NO binary swaps, NO auto-heal.
+///
+/// Self-clear (plan §11 #4 follow-up — cross-file, NOT in this Phase-2a scope):
+/// install.py's condition-id dispatch (`install.py::_maybe_resolve_deferral*`)
+/// does NOT yet special-case `hub_restart_failed_after_abort`, so on the next
+/// successful install.py run the entry falls through the `else` → PRESERVED
+/// (never lost — the conservative default). A dedicated handler that re-probes
+/// the hub /health and marks it resolved when the hub is back up (mirroring the
+/// `generated_files_reconciled` / `launcher_update_diverged` legs) is the
+/// intended follow-up, owned by the install.py surface (Phase 2c / a follow-on).
+/// The entry is honest either way: if the hub really is still down when the user
+/// reads it, the note is correct; once install.py runs it will have restarted
+/// the hub, and the (harmless, informational) note is cleared by the user or by
+/// that follow-up handler.
+fn emit_hub_restart_failed_after_abort_deferral(install_path: &Path) {
+    let detected = "The orchestrator update aborted on a genuine (source-file) conflict, and the \
+                    launcher's best-effort `vct-hub --start-if-not-running` restart did NOT reach \
+                    a healthy `/health` within 30 s. The hub is likely stopped."
+        .to_string();
+    let why_deferred = "The update was rolled back cleanly (binaries reverted, conflict surfaced \
+                        for manual resolution) but the detached vct-hub — which resolves per-\
+                        project KG collections / secrets / embedding config for hooks + MCPs — \
+                        did not come back up on its own. Per the standing \"post-update restart \
+                        is EXPECTED; no auto-heal\" discipline, the launcher does NOT retry or \
+                        swap binaries; it records this so the stopped hub is diagnosable instead \
+                        of silently degrading every subsequent session."
+        .to_string();
+    let command_to_apply =
+        "Restart the launcher (its boot path starts the hub), or from a shell run \
+         `vct-hub --start-if-not-running` (check with `vct-hub --status`). Then resolve the \
+         update conflict as directed by the update_resume_required entry above."
+            .to_string();
+    let fields = crate::services::deferral::DeferralEntryFields {
+        condition_id: "hub_restart_failed_after_abort",
+        title: "vct-hub did not come back up after the update aborted",
+        detected: &detected,
+        why_deferred: &why_deferred,
+        command_to_apply: &command_to_apply,
+        severity: "warning",
+    };
+    if let Err(e) =
+        crate::services::deferral::emit_deferral_entry(install_path, install_path, &fields)
+    {
+        eprintln!(
+            "[vct] hub_restart_failed_after_abort: deferral emit failed: {} — the hub-down state \
+             may be missing from UPDATE_DEFERRED.md, but the hub is still down; restart the \
+             launcher or run `vct-hub --start-if-not-running`",
+            e
+        );
+    }
 }
 
 /// Best-effort blocking `GET http://127.0.0.1:<port>/health` probe.
@@ -4582,6 +4746,17 @@ pub async fn update_orchestrator<R: Runtime>(
     // resolve theirs/base + pop-conflict-risk + merge-tree probe → RealMerge
     // when clean & no risk, FfOnly otherwise (conservative on any uncertainty).
     //
+    // v0.2.89 addendum (current state): a take-upstream reconcile now FRONTS
+    // this decision. `resolve_generated_files_to_upstream` (wired just above,
+    // after F1) resolves GENERATED / release-controlled divergence (lockfiles /
+    // package.json / Cargo.lock / dist/**) to upstream BEFORE the plan runs, so
+    // the merge-tree probe below sees clean end-trees for that class and routes
+    // RealMerge (no modal) instead of FfOnly. Its `reconcile_committed` flag is
+    // threaded into the resolver so an A0 pre-merge commit + a reconcile commit
+    // together fall through to the probe rather than short-circuiting to rebase
+    // (§5). The v0.2.56/58 pop-conflict-risk / merge-tree machinery described
+    // above is UNCHANGED — it now just handles the SOURCE-file remainder.
+    //
     // v0.2.29/v0.2.56/v0.2.58 rationale (preserved): the RebaseAutostash arm
     // uses `--autostash` so in-progress WIP outside the allowlist doesn't
     // abort the rebase ("cannot pull with rebase: You have unstaged
@@ -4615,15 +4790,50 @@ pub async fn update_orchestrator<R: Runtime>(
             f1_restored
         );
     }
+    // v0.2.89 §4.3: after F1 (byte-identical restore) and BEFORE the plan
+    // resolution, reconcile GENERATED / release-controlled files to upstream
+    // (take-upstream bias) — lockfiles, package.json, Cargo.lock, dist/**.
+    // F1 first is cheap (it may byte-identically restore an allowlisted path
+    // for free); the reconcile then handles the byte-different remainder so
+    // the plan resolver below sees a cleaned tree/history and does NOT surface
+    // the modal for the "expected conflict" class (dep-bump / lockfile / dist
+    // divergence). A divergent SOURCE file still surfaces the modal (real
+    // breakage signal). Best-effort throughout: any per-file failure leaves
+    // that file divergent → it stays in the modal-forcing sets (never worse
+    // than today). Shared helper — the self_update surface calls the SAME fn.
+    let gen_reconcile =
+        crate::commands::git_user_editable_merge::resolve_generated_files_to_upstream(
+            &install_path,
+            &pull_branch,
+        )
+        .await;
+    if gen_reconcile.reconcile_committed
+        || !gen_reconcile.took_upstream.is_empty()
+        || !gen_reconcile.restored_worktree.is_empty()
+    {
+        eprintln!(
+            "[vct] update_orchestrator: reconciled generated/release-controlled file(s) to \
+             upstream — {} committed take-upstream, {} worktree-restored (reconcile_committed={})",
+            gen_reconcile.took_upstream.len(),
+            gen_reconcile.restored_worktree.len(),
+            gen_reconcile.reconcile_committed
+        );
+        // The audit-trail deferral (`generated_files_reconciled`) is emitted
+        // INSIDE resolve_generated_files_to_upstream (step 6) as part of the
+        // shared helper's own best-effort tail — so it is NOT re-emitted here
+        // (the emit upserts by condition_id; a second call would only respawn
+        // the Python helper for no gain). Intentional, not an omission.
+    }
     let pull_plan = crate::commands::git_user_editable_merge::resolve_divergence_pull_plan(
         &install_path,
         &pull_branch,
         pre_merge_committed,
-        // v0.2.89 Phase 1: the generated/release-controlled reconcile is wired
-        // into this surface in Phase 2a; passing `false` here preserves the
-        // exact pre-reconcile decision (no behaviour change) so the tree stays
-        // green for the parallel phases.
-        false,
+        // v0.2.89 §5: when the reconcile created a synthetic take-upstream
+        // commit, do NOT short-circuit to the rebase arm even if A0 also
+        // committed — fall through to the merge-tree probe (rebase would
+        // replay the fork's original dep-bump commit which conflicts
+        // regardless; the merge arm folds the clean end-trees).
+        gen_reconcile.reconcile_committed,
     )
     .await;
     // Retained for the conflict-op label below (the post-pull conflict +
@@ -4804,6 +5014,14 @@ pub async fn update_orchestrator<R: Runtime>(
     // modal + resume sentinel exactly like the non-zero conflict branch,
     // instead of silently continuing. Best-effort; never auto-proceed on a
     // tree we can't confirm clean.
+    //
+    // v0.2.89 addendum (current state): the generated/release-controlled
+    // reconcile (wired above, after F1) now FRONTS this backstop for the
+    // generated-file class — it restores those paths to HEAD before the pull,
+    // removing them from the pop-conflict-risk set, so a locally-rebuilt dist
+    // binary / regenerated lockfile no longer reaches this autostash-pop
+    // backstop. This block still guards the residual SOURCE-file TOCTOU race
+    // (its logic is unchanged).
     {
         let pull_combined = format!(
             "{}\n{}",
@@ -6406,8 +6624,9 @@ async fn finalize_update_and_restart<R: Runtime>(
             // The hub was stopped at the top of the caller's flow and
             // (post-C-1 reorder) has not been restarted yet. Bring it
             // back up so a binary-refresh timeout doesn't leave the user
-            // hub-less.
-            let _ = ensure_hub_started_after_update(install_path);
+            // hub-less. PostInstall: install.py ran on this path, so the
+            // cutover-sentinel skip heuristic is valid (behaviour unchanged).
+            let _ = ensure_hub_started_after_update(install_path, HubRestartContext::PostInstall);
             return Err(e);
         }
     }
@@ -6497,9 +6716,10 @@ async fn finalize_update_and_restart<R: Runtime>(
     // no-handoff path, AFTER the staging/handoff decision. See the
     // function docs for why this ordering is load-bearing on Windows.
     // Soft-fail: the launcher restart path itself also calls
-    // `hub_launcher::ensure_hub_running` on boot.
+    // `hub_launcher::ensure_hub_running` on boot. PostInstall: install.py
+    // completed on the finalize path, so the sentinel-skip heuristic applies.
     emit_progress(window, "update", "Starting vct-hub...", 97.0);
-    if let Err(e) = ensure_hub_started_after_update(install_path) {
+    if let Err(e) = ensure_hub_started_after_update(install_path, HubRestartContext::PostInstall) {
         eprintln!(
             "[vct] finalize_update_and_restart: ensure_hub_started_after_update \
              returned Err({}); continuing with launcher restart (hub will \
@@ -6653,6 +6873,12 @@ async fn assert_head_reached_upstream(install_path: &Path) -> Result<(), String>
 /// guarded before reverting, and the hub restart is best-effort (`let _ =`).
 /// Sites that do something extra (emit progress, write a sentinel) keep that
 /// part inline and call this for just the trio.
+///
+/// v0.2.89 §7.5 — every caller of THIS fn is an ABORT/failure/conflict branch
+/// where install.py did NOT run, so the hub restart uses
+/// `HubRestartContext::AbortRecovery`: the cutover-sentinel skip heuristic is
+/// refused (it never applies here) and the /health poll runs on a background
+/// thread so a genuine-conflict payload isn't stalled up to 30 s.
 fn abort_update_restore_binaries_and_hub(
     install_path: &Path,
     pre_pull_renamed: Option<&Path>,
@@ -6664,7 +6890,7 @@ fn abort_update_restore_binaries_and_hub(
     if let Some(backup) = pre_pull_renamed_hub {
         revert_pre_pull_rename(backup);
     }
-    let _ = ensure_hub_started_after_update(install_path);
+    let _ = ensure_hub_started_after_update(install_path, HubRestartContext::AbortRecovery);
 }
 
 async fn run_post_pull_install_and_restart<R: Runtime>(
@@ -6923,6 +7149,40 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
             pre_pull_renamed_hub.as_deref(),
         );
         return Err(collision_payload);
+    }
+
+    // v0.2.89 §4.3 (belt-and-braces): reconcile GENERATED / release-controlled
+    // files to upstream (take-upstream) BEFORE the direct merge pull. There is
+    // no plan resolver on THIS surface — the reconcile simply removes generated
+    // files (lockfiles / package.json / Cargo.lock / dist/**) from the conflict
+    // the `git pull --no-rebase --autostash` below would otherwise hit. Value:
+    // when the modal surfaced for a MIXED reason (a genuine source conflict +
+    // lockfile divergence), "Merge upstream" now conflicts ONLY on the source
+    // file and the conflict modal lists only genuinely-actionable paths. Any
+    // synthetic take-upstream commit it creates is folded by the merge pull's
+    // own 3-way (identical end-tree blobs ⇒ trivially clean). Best-effort: a
+    // per-file failure leaves that file divergent → today's conflict flow still
+    // surfaces (never worse than before). The audit deferral is emitted inside
+    // the shared helper (step 6), same as the update_orchestrator surface.
+    emit_progress(&window, "update", "Reconciling generated files to upstream...", 9.0);
+    let gen_reconcile =
+        crate::commands::git_user_editable_merge::resolve_generated_files_to_upstream(
+            &install_path,
+            &pull_branch,
+        )
+        .await;
+    if gen_reconcile.reconcile_committed
+        || !gen_reconcile.took_upstream.is_empty()
+        || !gen_reconcile.restored_worktree.is_empty()
+    {
+        eprintln!(
+            "[vct] merge_orchestrator_with_upstream: reconciled generated/release-controlled \
+             file(s) to upstream — {} committed take-upstream, {} worktree-restored \
+             (reconcile_committed={})",
+            gen_reconcile.took_upstream.len(),
+            gen_reconcile.restored_worktree.len(),
+            gen_reconcile.reconcile_committed
+        );
     }
 
     // Pull WITHOUT --ff-only, explicitly as a merge (--no-rebase). The
@@ -7193,6 +7453,20 @@ pub async fn rebase_orchestrator_onto_upstream<R: Runtime>(
         return Err(collision_payload);
     }
 
+    // v0.2.89 §4.3 — the generated/release-controlled take-upstream reconcile
+    // (`resolve_generated_files_to_upstream`, wired into `update_orchestrator`
+    // and `merge_orchestrator_with_upstream`) is DELIBERATELY NOT wired here.
+    // `git rebase` replays the fork's ORIGINAL generated-file commits (the local
+    // dep-bump / lockfile / dist commits) one-by-one onto upstream; those
+    // ORIGINAL commits replay BEFORE any synthetic reconcile commit could and
+    // conflict against upstream's changed blocks regardless — so a pre-rebase
+    // reconcile cannot un-conflict the rebase arm (a reconcile commit at the tip
+    // does nothing for commits that replay earlier in the series). The merge arm
+    // works because `git merge-tree`/`git pull --no-rebase` operate on END TREES
+    // (where ours == theirs for every reconciled path). The Rebase modal button
+    // therefore stays the honest surface for the user who explicitly chose to
+    // linearise: it will still conflict on the generated files, resolvable by
+    // hand or by re-running from the (auto-resolving) merge path.
     emit_progress(&window, "update", "Rebasing local onto upstream...", 20.0);
     let upstream_ref = format!(
         "{}/{}",
@@ -15370,7 +15644,9 @@ MemAvailable:   23456789 kB
             // The launcher's post-install hub-recovery code asks the
             // predicate "should we skip the redundant poll?" — answer
             // is YES, because the sentinel's absence IS the signal
-            // that install.py validated /health already.
+            // that install.py validated /health already. v0.2.89: this
+            // heuristic is only valid for PostInstall (the abort path
+            // is covered by `abort_context_never_skips_health_poll`).
             with_vct_state_dir(|root| {
                 // No sentinel file present. (with_vct_state_dir gives
                 // us a fresh tempdir, so nothing is in it by default.)
@@ -15378,8 +15654,9 @@ MemAvailable:   23456789 kB
                 assert!(!sentinel.exists(),
                     "precondition: sentinel should be absent in fresh state dir");
                 assert!(
-                    should_skip_redundant_health_poll(root),
-                    "absent sentinel → poll must be skipped (install.py confirmed /health)"
+                    should_skip_redundant_health_poll(root, HubRestartContext::PostInstall),
+                    "absent sentinel + PostInstall → poll must be skipped (install.py \
+                     confirmed /health)"
                 );
             });
         }
@@ -15399,10 +15676,57 @@ MemAvailable:   23456789 kB
                 assert!(sentinel.exists(),
                     "precondition: sentinel must exist after write");
                 assert!(
-                    !should_skip_redundant_health_poll(root),
-                    "present sentinel → poll MUST run (second-chance probe)"
+                    !should_skip_redundant_health_poll(root, HubRestartContext::PostInstall),
+                    "present sentinel + PostInstall → poll MUST run (second-chance probe)"
                 );
             });
+        }
+
+        // v0.2.89 §7.5 / plan test 20 — the pure decision fn. No filesystem;
+        // the sentinel-present flag is passed directly so the branch table is
+        // exhaustively pinned.
+        #[test]
+        fn abort_context_never_skips_health_poll() {
+            // The §7.2 hole: on the abort path install.py NEVER ran, so the
+            // cutover sentinel is absent for a reason unrelated to health.
+            // AbortRecovery must therefore run the poll REGARDLESS of the
+            // sentinel — both flag values return "do NOT skip".
+            assert!(
+                !should_skip_redundant_health_poll_decision(
+                    HubRestartContext::AbortRecovery,
+                    /* sentinel_present = */ false,
+                ),
+                "AbortRecovery must NOT skip even when the sentinel is absent \
+                 (install.py never validated /health on the abort path — the §7.2 hole)"
+            );
+            assert!(
+                !should_skip_redundant_health_poll_decision(
+                    HubRestartContext::AbortRecovery,
+                    /* sentinel_present = */ true,
+                ),
+                "AbortRecovery must NOT skip when the sentinel is present either"
+            );
+        }
+
+        #[test]
+        fn post_install_context_keeps_sentinel_semantics() {
+            // PostInstall behaviour is UNCHANGED from v0.2.22: skip iff the
+            // cutover sentinel is absent (install.py deleted it after /health
+            // returned 200), run the poll when it is still present.
+            assert!(
+                should_skip_redundant_health_poll_decision(
+                    HubRestartContext::PostInstall,
+                    /* sentinel_present = */ false,
+                ),
+                "PostInstall + absent sentinel → SKIP (install.py confirmed /health)"
+            );
+            assert!(
+                !should_skip_redundant_health_poll_decision(
+                    HubRestartContext::PostInstall,
+                    /* sentinel_present = */ true,
+                ),
+                "PostInstall + present sentinel → RUN the poll (second-chance probe)"
+            );
         }
 
         #[test]
@@ -15421,7 +15745,15 @@ MemAvailable:   23456789 kB
                     std::env::set_var("USERPROFILE", "/nonexistent-profile");
                 }
                 let install_path = std::env::temp_dir();
-                let result = ensure_hub_started_after_update(&install_path);
+                // v0.2.89: signature now takes a HubRestartContext. PostInstall
+                // exercises the same missing-binary early-return the pre-v0.2.89
+                // test covered (the binary lookup fails BEFORE the ctx branch, so
+                // either context returns Ok(()) here — PostInstall keeps this a
+                // fully synchronous, deterministic soft-fail).
+                let result = ensure_hub_started_after_update(
+                    &install_path,
+                    HubRestartContext::PostInstall,
+                );
                 assert!(result.is_ok(),
                     "missing binary should soft-fail to Ok(()), got {:?}",
                     result);

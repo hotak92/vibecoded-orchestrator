@@ -7747,6 +7747,38 @@ def _apply_deferred_entries(
                 )
                 current_run_report.add_entry(entry)
 
+        elif cid == "generated_files_reconciled":
+            # v0.2.89: the launcher writes this entry when an update
+            # reconciled diverged generated / release-controlled files
+            # (launcher/package.json, package-lock.json, Cargo.lock,
+            # launcher/dist/**) to upstream during a take-upstream merge
+            # (emitted by
+            # git_user_editable_merge.rs::emit_generated_reconcile_deferrals).
+            # It is an INFORMATIONAL/historical audit record — it names what
+            # was overwritten and how to recover — NOT a re-detected-per-run
+            # condition, so it is deliberately NOT in _INSTALL_OWNED_CONDITION_IDS
+            # (a foreign, Rust-emitted cid there would be silently clobbered on
+            # the next update — the A-2 data-loss bug).
+            #
+            # Self-clear on install.py: reaching THIS point means the pull +
+            # --update the reconcile was part of already succeeded (otherwise
+            # install.py would not be running). The reconcile happened during
+            # that merge and cannot be "still landing" — there is nothing to
+            # re-probe (unlike launcher_update_diverged, whose binary refresh
+            # may lag). So the record has served its one-time purpose of telling
+            # the user what changed + the recovery path; mark it resolved. The
+            # cid is FOREIGN (Rust-emitted, not in the owned set), so the A-2
+            # seed already imported the on-disk copy into current_run_report and
+            # the P1 pre-write re-merge would re-import it again — without
+            # mark_resolved here the entry would survive forever (the same
+            # pattern launcher_update_diverged uses for its resolved leg).
+            print(
+                f"  [ok]   {cid}: the update that reconciled the generated "
+                "files to upstream has completed — audit record served its "
+                "purpose. Marking resolved."
+            )
+            current_run_report.mark_resolved(cid)
+
         else:
             # Unknown condition: preserve it to avoid silently losing info.
             print(f"  [unknown] {cid}: no handler. Preserving entry.")

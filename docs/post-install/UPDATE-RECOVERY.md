@@ -30,6 +30,49 @@ All four share the same protected tail:
 
 ---
 
+## Generated / release-controlled files resolve to upstream automatically
+
+A fork often diverges from upstream on files it never hand-authored:
+`launcher/package.json`, `launcher/package-lock.json`,
+`launcher/src-tauri/Cargo.lock`, and anything under `launcher/dist/**`.
+These are npm/cargo/build artifacts plus the upstream-bumped version field —
+upstream refreshes them essentially every release, so a divergent fork
+conflicts on **every** update. That is an "expected conflict", not a real
+breakage.
+
+The update flow now takes upstream's copy for those files instead of surfacing
+the divergence modal:
+
+- **Committed divergence** (a fork that committed local dep bumps or rebuilt
+  binaries): resolved via a synthetic take-upstream commit. Nothing is lost —
+  the commit's parent still holds the fork's content, so recovery is a plain
+  `git log -- <path>` + `git checkout <sha> -- <path>`.
+- **Working-tree-dirty divergence** (an uncommitted `npm install` / `cargo
+  update` / local rebuild): the file is restored to HEAD before the pull, and
+  the pull then brings upstream's version. The discarded content is a derived
+  artifact that `npm install` / `cargo build` / `install.py --update`
+  re-derives.
+
+A divergent **source** file (`Cargo.toml`, `tauri.conf.json`, `pyproject.toml`,
+`vct-module.json`, `*.py`, `*.rs`) still surfaces the modal — a local edit
+there is a real signal, not silently overwritten. Each reconcile writes a
+`generated_files_reconciled` entry to `UPDATE_DEFERRED.md` naming exactly what
+was overwritten (see the condition-id list below).
+
+Two caveats:
+
+- The mechanism is the launcher's Rust reconcile path (the
+  `GENERATED_RELEASE_CONTROLLED_PATTERNS` class in
+  `launcher/src-tauri/src/commands/git_user_editable_merge.rs`), NOT a
+  `.gitattributes` merge driver: a take-theirs driver is not built into git,
+  the launcher's reconcile paths are driver-blind, and drivers are
+  forward-only.
+- The updater that applies a release is the *installed* launcher, so the first
+  update that ships this feature is still run by the prior binary and can hit
+  the modal one last time; the release after that auto-resolves.
+
+---
+
 ## State files and what each means
 
 ### `<vct_root>/.update-in-progress.json` (the "update gate", V52-AI)
@@ -109,6 +152,13 @@ All four share the same protected tail:
     fallback (overwrite, rename, stage1). Fix: close the launcher, run
     `python install.py --update` again.
   - `update_resume_required` — see resume sentinel above.
+  - `generated_files_reconciled` — informational audit record: an update
+    reconciled diverged generated / release-controlled files
+    (`launcher/package.json`, `launcher/package-lock.json`,
+    `launcher/src-tauri/Cargo.lock`, or files under `launcher/dist/**`) to
+    upstream automatically (see the take-upstream note below). It names each
+    overwritten path, the action taken, and how to recover the committed
+    case. No action needed; it self-clears on the next `install.py --update`.
 
 ---
 

@@ -77,9 +77,22 @@
 #     `.gitattributes` drivers entirely. So for an OVERLAPPING-append KG node
 #     the union driver (hand-run merges) is what folds it; the A0 path folds
 #     only the NON-overlapping case and sidecars the overlapping one.
-#   * launcher/dist/** binaries intentionally get NO driver: the auto-merge
-#     path resolves the normal binary-refresh case to upstream, and the
-#     divergence modal correctly surfaces on a rare genuine binary conflict.
+#   * launcher/dist/** binaries intentionally get NO driver — a merge driver
+#     could not carry this case anyway (see the take-upstream block below).
+#     Three sub-cases exist and they are resolved by DIFFERENT mechanisms:
+#       (a) local-unchanged + upstream-changed (binary-download users): the
+#           3-way merge folds trivially to upstream. This — and only this —
+#           is the case a driver-less merge already handled.
+#       (b) uncommitted-dirty dist (a compile-from-source rebuild left the
+#           binary modified in the working tree): the autostash POP 3-ways
+#           the binary and conflicts → autostash-pop modal.
+#       (c) committed-divergent dist (a fork that COMMITS rebuilt binaries):
+#           merge-tree conflicts on the binary → FfOnly → divergence modal.
+#     (b) and (c) are now resolved to upstream automatically by the
+#     GENERATED_RELEASE_CONTROLLED_PATTERNS take-upstream reconcile class in
+#     launcher/src-tauri/src/commands/git_user_editable_merge.rs (launcher/dist/**
+#     is on that allowlist). See the take-upstream block below for why the
+#     mechanism is Rust and not a merge driver.
 
 knowledge/**/*.md          merge=union
 
@@ -118,3 +131,41 @@ knowledge/**/*.md          merge=union
 # (clean-merge folds, real-conflict sidecars + defers) rather than union.
 .gitignore                 merge=union
 .gitattributes             merge=union
+
+# ---------------------------------------------------------------------------
+# v0.2.89: generated / release-controlled files get NO merge driver here — on
+# divergence they resolve TO UPSTREAM (take-upstream), the INVERSE bias from
+# the union driver above. Covered set: launcher/package.json,
+# launcher/package-lock.json, launcher/src-tauri/Cargo.lock, launcher/dist/**.
+# These are npm/cargo/build artifacts + the upstream-bumped version field;
+# they carry no hand-authored value on an installed instance and upstream
+# refreshes them essentially every release, so a divergent fork conflicts on
+# EVERY future update — the definition of an "expected conflict".
+#
+# WHY NOT a `.gitattributes` driver (the same honesty as the v0.2.71 block):
+#   1. theirs-bias is NOT a built-in git merge driver. Only `union` is usable
+#      without a per-clone `git config merge.<x>.driver` registration in the
+#      user's `.git/config` (see the union block above); a custom take-theirs
+#      driver would need that registration, which `.gitattributes` alone
+#      cannot supply — the same reason we avoid custom `ours`/`theirs` drivers
+#      for the KG nodes.
+#   2. drivers are FORWARD-ONLY (git reads them from the merge-base/HEAD side),
+#      so even a registered driver would not apply to the very update that
+#      first ships it — and it would do NOTHING for the committed-divergence
+#      case, which needs a synthetic commit to un-diverge history (a
+#      worktree/index operation alone cannot).
+#   3. the launcher's own reconcile paths are driver-BLIND: A0 uses
+#      `git merge-file` and the take-upstream class uses `git checkout
+#      <theirs> --`, neither of which consults `.gitattributes` drivers at all
+#      (same limitation documented for the A0 path above).
+# So the mechanism is the Rust reconcile class
+# GENERATED_RELEASE_CONTROLLED_PATTERNS in
+# launcher/src-tauri/src/commands/git_user_editable_merge.rs — it handles both
+# the committed-divergent case (synthetic take-upstream commit) and the
+# working-tree-dirty case (restore to HEAD before the pull takes upstream),
+# writes a `generated_files_reconciled` audit deferral, and (unlike a driver)
+# is disjoint-by-invariant from the USER_EDITABLE_PATTERNS preserve-local list.
+# A divergent SOURCE file (Cargo.toml, tauri.conf.json, pyproject.toml,
+# vct-module.json, *.py, *.rs) is deliberately NOT in the take-upstream set —
+# a local edit there is a meaningful signal the divergence modal should
+# surface, not silently overwrite.
