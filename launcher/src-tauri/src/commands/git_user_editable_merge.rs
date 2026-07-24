@@ -6519,4 +6519,340 @@ mod tests {
         );
         assert!(body.contains("took-upstream @ 7b255dd"), "action + short sha in {body}");
     }
+
+    // ───── Integration (Phase 3): end-to-end incident repro ─────
+
+    /// Copy the workspace's `vco_lib/*.py` into `dest/vco_lib/` so the
+    /// deferral emitter (which shells `python -c "import vco_lib..."` with
+    /// `sys_path_root = install_path`) can resolve the namespace package from
+    /// inside the scratch clone. Returns false when Python or the source
+    /// `vco_lib` are unavailable (caller then skips the deferral assertion).
+    /// Mirrors the setup in `reconcile_writes_deferral_naming_paths_and_recovery`.
+    fn install_vco_lib_into(dest: &Path) -> bool {
+        if vct_launcher_core::python_resolve::resolve_python_for_vco_lib_str().is_none() {
+            return false;
+        }
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let workspace_root = match Path::new(manifest_dir).parent().and_then(|p| p.parent()) {
+            Some(p) => p.to_path_buf(),
+            None => return false,
+        };
+        let src = workspace_root.join("vco_lib");
+        if !src.join("deferral_report.py").is_file() {
+            return false;
+        }
+        let dest_lib = dest.join("vco_lib");
+        if std::fs::create_dir_all(&dest_lib).is_err() {
+            return false;
+        }
+        for entry in std::fs::read_dir(&src).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file()
+                && entry.path().extension().map(|e| e == "py").unwrap_or(false)
+            {
+                let _ = std::fs::copy(entry.path(), dest_lib.join(entry.file_name()));
+            }
+        }
+        true
+    }
+
+    fn head_sha(repo: &Path) -> String {
+        let out = StdCommand::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// (Integration) The FULL v0.2.87 → v0.2.88 incident reproduced end-to-end
+    /// against real git: a fork with COMMITTED dep-bump divergence on BOTH
+    /// `launcher/package.json` + `launcher/package-lock.json`, an upstream that
+    /// advanced with a CONFLICTING lockfile/package.json refresh AND a
+    /// `launcher/dist/**` binary blob, run through the REAL update-flow
+    /// functions in order:
+    ///   `auto_restore_byte_identical_tracked_mods` (F1)
+    ///   → `resolve_generated_files_to_upstream` (the reconcile)
+    ///   → `resolve_divergence_pull_plan(.., false, reconcile_committed)`
+    ///   → execute the resulting `pull_args`.
+    ///
+    /// UNIQUE vs the Phase-1 unit tests (do NOT duplicate them):
+    ///   - test 15 (`plan_after_reconcile_is_realmerge_and_pull_succeeds`) runs
+    ///     the reconcile→plan→pull chain for a SINGLE lockfile only, and does
+    ///     NOT run F1 first nor assert the deferral;
+    ///   - test 19 (`dist_committed_divergence_reconciles`) covers a committed
+    ///     dist blob but stops at the plan (no real pull, no history check);
+    ///   - test 18 (`plan_source_conflict_stays_ffonly_after_reconcile`) is the
+    ///     source-conflict control on a lockfile-only shape.
+    /// This test is the one place the WHOLE incident shape (multi-file committed
+    /// bumps + a dist refresh) goes through the REAL flow order (F1 included),
+    /// executes the REAL pull, verifies the fork's ORIGINAL commit stays
+    /// reachable in history, AND checks the audit deferral was written — the
+    /// commit-real-bumps → real-pull → real-history-check the unit tests don't.
+    #[tokio::test]
+    async fn integration_incident_generated_divergence_auto_resolves_end_to_end() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+        seed_generated_files(&seed, &local);
+
+        // (1) Advance UPSTREAM: a conflicting lockfile refresh carrying the
+        //     immutable HIGH-advisory pin, a conflicting package.json version
+        //     bump, and a launcher/dist/** binary blob refresh — all in one
+        //     release commit (the v0.2.88 shape).
+        std::fs::write(
+            seed.join("launcher/package-lock.json"),
+            "{\n  \"name\": \"vct\",\n  \"lockfileVersion\": 3,\n  \
+             \"immutable\": \"4.3.9\",\n  \"upstream\": true\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            seed.join("launcher/package.json"),
+            "{\n  \"name\": \"vct\",\n  \"version\": \"0.2.88\",\n  \
+             \"dependencies\": {\n    \"mermaid\": \"11.15.0\"\n  }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            seed.join("launcher/dist/linux-x64/vct-hub"),
+            "UPSTREAM-BINARY-v0.2.88\n",
+        )
+        .unwrap();
+        run_git(&seed, &["add", "."]);
+        run_git(&seed, &["commit", "-m", "upstream v0.2.88: lockfile + package.json + dist refresh"]);
+        run_git(&seed, &["push", "origin", "main"]);
+        run_git(&local, &["fetch", "vco_upstream"]);
+
+        // (2) Fork COMMITS the field-observed local divergence: mermaid/supabase/
+        //     marked-style dep bumps on the SAME lines, different content from
+        //     upstream — no release rationale, exactly the incident.
+        std::fs::write(
+            local.join("launcher/package-lock.json"),
+            "{\n  \"name\": \"vct\",\n  \"lockfileVersion\": 3,\n  \
+             \"mermaid\": \"11.16.0\",\n  \"fork\": true\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            local.join("launcher/package.json"),
+            "{\n  \"name\": \"vct\",\n  \"version\": \"0.2.87\",\n  \
+             \"dependencies\": {\n    \"mermaid\": \"11.16.0\",\n    \
+             \"@supabase/supabase-js\": \"2.110.7\",\n    \"marked\": \"18.0.6\"\n  }\n}\n",
+        )
+        .unwrap();
+        run_git(&local, &["add", "."]);
+        run_git(&local, &["commit", "-m", "fork: local dep bumps (mermaid/supabase/marked)"]);
+        refetch_upstream(&local);
+
+        // Capture the fork's ORIGINAL divergence commit (the data-safety anchor)
+        // and its blobs BEFORE any reconcile.
+        let fork_commit = head_sha(&local);
+        let fork_lock_blob = blob_at(&local, &fork_commit, "launcher/package-lock.json");
+        let fork_pkg_blob = blob_at(&local, &fork_commit, "launcher/package.json");
+
+        // Make the deferral (assertion e) checkable by putting vco_lib inside
+        // the scratch clone (best-effort; assertion skipped if Python absent).
+        let deferral_checkable = install_vco_lib_into(&local);
+
+        // ── BASELINE (test-14 discipline): on THIS exact repo state, WITHOUT
+        //    running the reconcile, the plan is FfOnly (the pre-fix B4 modal).
+        //    Both sides changed the same committed generated blocks → the
+        //    merge-tree probe conflicts → FfOnly. Evaluating the plan is pure
+        //    (no mutation), so computing it here does not perturb the real flow
+        //    executed below on the same clone.
+        let baseline_plan = resolve_divergence_pull_plan(&local, "main", false, false).await;
+        assert_eq!(
+            baseline_plan,
+            PullPlan::FfOnly,
+            "BASELINE: without the reconcile the committed generated divergence must be FfOnly \
+             (the pre-fix B4 modal) — proving the flip below is real"
+        );
+
+        // ── REAL FLOW, in order ──────────────────────────────────────────────
+
+        // (F1) byte-identical restore first. The incident blobs are byte-
+        //      DIFFERENT + committed, so F1 restores nothing — but it runs in
+        //      the live flow, so it runs here (must not error / must not
+        //      un-diverge anything on its own).
+        let f1_restored = auto_restore_byte_identical_tracked_mods(&local, "main").await;
+        assert_eq!(
+            f1_restored, 0,
+            "F1 is byte-identity + uncommitted-only gated; the byte-different committed \
+             incident files are structurally beyond it"
+        );
+
+        // (reconcile) take-upstream for the committed generated files, folded
+        //             into ONE synthetic commit.
+        let outcome = resolve_generated_files_to_upstream(&local, "main").await;
+        assert!(
+            outcome.reconcile_committed,
+            "the reconcile must create a take-upstream commit for the committed generated \
+             divergence; took={:?}",
+            outcome.took_upstream
+        );
+        assert!(
+            outcome
+                .took_upstream
+                .contains(&"launcher/package-lock.json".to_string())
+                && outcome
+                    .took_upstream
+                    .contains(&"launcher/package.json".to_string()),
+            "both incident files must be taken from upstream; got {:?}",
+            outcome.took_upstream
+        );
+
+        // (plan) — the incident shape (no A0 commit): reconcile committed →
+        //         end-trees clean → RealMerge.
+        let plan =
+            resolve_divergence_pull_plan(&local, "main", false, outcome.reconcile_committed).await;
+        // ASSERT (a): plan == RealMerge (NOT the pre-fix FfOnly).
+        assert_eq!(
+            plan,
+            PullPlan::RealMerge,
+            "after the reconcile the incident plan must flip to RealMerge (was FfOnly)"
+        );
+
+        // (execute) the REAL pull the plan produces.
+        let args = plan.pull_args(crate::commands::self_update::VCO_UPSTREAM_REMOTE, "main");
+        let pull = StdCommand::new("git")
+            .args(&args)
+            .current_dir(&local)
+            .output()
+            .unwrap();
+        // ASSERT (b): the real `git pull` exits 0 — no conflict, no modal.
+        assert!(
+            pull.status.success(),
+            "the RealMerge pull must exit 0 (no conflict); stdout={} stderr={}",
+            String::from_utf8_lossy(&pull.stdout),
+            String::from_utf8_lossy(&pull.stderr)
+        );
+
+        // ASSERT (c): after the pull, package-lock.json + package.json blobs ==
+        //             upstream's shipped copies (the security pin + upstream
+        //             version present).
+        let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+        let merged_lock =
+            std::fs::read_to_string(local.join("launcher/package-lock.json")).unwrap();
+        let merged_pkg = std::fs::read_to_string(local.join("launcher/package.json")).unwrap();
+        assert_eq!(
+            merged_lock,
+            blob_at(&local, &theirs, "launcher/package-lock.json"),
+            "the merged lockfile must equal upstream's shipped blob"
+        );
+        assert_eq!(
+            merged_pkg,
+            blob_at(&local, &theirs, "launcher/package.json"),
+            "the merged package.json must equal upstream's shipped blob"
+        );
+        assert!(
+            merged_lock.contains("immutable") && merged_lock.contains("4.3.9"),
+            "upstream's security pin must be present after the merge; got {merged_lock}"
+        );
+
+        // ASSERT (d): the fork's ORIGINAL dep-bump commit is still reachable in
+        //             history — the data-safety guarantee. `git log` finds it
+        //             AND it is an ancestor of the new (merge) HEAD.
+        let log_finds_fork = StdCommand::new("git")
+            .args(["log", "--format=%H"])
+            .current_dir(&local)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&log_finds_fork.stdout).contains(&fork_commit),
+            "the fork's original commit must remain reachable via git log (data-safety)"
+        );
+        let is_ancestor = StdCommand::new("git")
+            .args(["merge-base", "--is-ancestor", &fork_commit, "HEAD"])
+            .current_dir(&local)
+            .status()
+            .unwrap();
+        assert!(
+            is_ancestor.success(),
+            "the fork's original commit must remain an ancestor of the merged HEAD"
+        );
+        // And the fork's original blobs are still recoverable from that commit.
+        assert_eq!(
+            blob_at(&local, &fork_commit, "launcher/package-lock.json"),
+            fork_lock_blob,
+            "the fork's original lockfile blob must be recoverable from history"
+        );
+        assert_eq!(
+            blob_at(&local, &fork_commit, "launcher/package.json"),
+            fork_pkg_blob,
+            "the fork's original package.json blob must be recoverable from history"
+        );
+
+        // ASSERT (e): a `generated_files_reconciled` deferral entry was written
+        //             naming the reconciled paths (skipped if Python absent).
+        if deferral_checkable {
+            let deferred = local.join(".claude").join("context").join("UPDATE_DEFERRED.md");
+            assert!(
+                deferred.exists(),
+                "the reconcile must write UPDATE_DEFERRED.md at {}",
+                deferred.display()
+            );
+            let body = std::fs::read_to_string(&deferred).unwrap();
+            assert!(
+                body.contains("## generated_files_reconciled"),
+                "the deferral must carry the generated_files_reconciled condition id; got {body}"
+            );
+            assert!(
+                body.contains("launcher/package-lock.json")
+                    && body.contains("launcher/package.json"),
+                "the deferral must name both reconciled incident paths; got {body}"
+            );
+            assert!(
+                body.contains("took-upstream @ "),
+                "the deferral must record the take-upstream action; got {body}"
+            );
+        } else {
+            eprintln!(
+                "skipping deferral assertion (e): python/vco_lib unavailable in scratch clone"
+            );
+        }
+    }
+
+    /// (Integration CONTROL) A repo whose committed divergence is on a SOURCE
+    /// file (`vco_lib/foo.py`) — NOT an allowlisted generated file — still
+    /// returns FfOnly AFTER the reconcile runs. Source stays modal: the
+    /// reconcile touches nothing outside its allowlist, so a genuine source
+    /// breakage signal is never silently swallowed. (This is the source-side
+    /// counterpart to the differential flip proven above; test 18 covers the
+    /// MIXED lockfile+source shape, this isolates the pure-source case through
+    /// the real reconcile call.)
+    #[tokio::test]
+    async fn integration_committed_source_divergence_stays_modal_after_reconcile() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+
+        // Upstream + fork both change the SAME line of a protected source file.
+        push_upstream_change(&seed, &local, "vco_lib/foo.py", "def upstream(): return 1\n");
+        commit_local_change(&local, "vco_lib/foo.py", "def fork(): return 2\n");
+        refetch_upstream(&local);
+
+        // Run the reconcile — it must find nothing to do (source is not in the
+        // generated allowlist) and must NOT create a commit.
+        let outcome = resolve_generated_files_to_upstream(&local, "main").await;
+        assert!(
+            !outcome.reconcile_committed,
+            "the reconcile must NOT commit for a pure committed-source divergence; took={:?}",
+            outcome.took_upstream
+        );
+        assert!(
+            outcome.took_upstream.is_empty() && outcome.restored_worktree.is_empty(),
+            "the reconcile must leave the source file untouched; took={:?} restored={:?}",
+            outcome.took_upstream,
+            outcome.restored_worktree
+        );
+
+        // Plan STILL FfOnly → the modal is the honest surface for the real
+        // source breakage.
+        let plan =
+            resolve_divergence_pull_plan(&local, "main", false, outcome.reconcile_committed).await;
+        assert_eq!(
+            plan,
+            PullPlan::FfOnly,
+            "a committed SOURCE-file divergence must keep the modal (FfOnly) even after the \
+             generated reconcile runs"
+        );
+    }
 }
