@@ -960,7 +960,10 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
         );
     }
     let plan = crate::commands::git_user_editable_merge::resolve_divergence_pull_plan(
-        &repo, &branch, false,
+        // v0.2.89 Phase 1: the 4th arg (generated_reconcile_committed) is wired
+        // into this surface in Phase 2b; `false` preserves the exact
+        // pre-reconcile decision (no behaviour change) for the parallel phases.
+        &repo, &branch, false, false,
     )
     .await;
     let pull_args = plan.pull_args(VCO_UPSTREAM_REMOTE, &branch);

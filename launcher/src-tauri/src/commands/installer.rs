@@ -4619,6 +4619,11 @@ pub async fn update_orchestrator<R: Runtime>(
         &install_path,
         &pull_branch,
         pre_merge_committed,
+        // v0.2.89 Phase 1: the generated/release-controlled reconcile is wired
+        // into this surface in Phase 2a; passing `false` here preserves the
+        // exact pre-reconcile decision (no behaviour change) so the tree stays
+        // green for the parallel phases.
+        false,
     )
     .await;
     // Retained for the conflict-op label below (the post-pull conflict +
