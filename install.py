@@ -7795,16 +7795,20 @@ def _apply_deferred_entries(
             #
             # Re-probe (mirrors launcher_update_diverged's hub leg): install.py
             # Step 8 restarts the hub (`--start-if-not-running`), so by the
-            # time this handler runs the hub is normally back up. The
-            # source-of-truth we can check WITHOUT depending on a live socket
-            # is the on-disk hub sidecar version
-            # (`vct-hub[.exe].metadata.json::launcher_version`) vs the source
-            # version: if the on-disk hub binary >= source, the hub has been
-            # refreshed and Step 8's start has run → the transient abort-time
-            # failure is resolved → mark_resolved. Else the hub genuinely has
-            # not caught up → [skip] and preserve so the entry survives to the
-            # next run. Any exception during the probe → preserve (never
-            # wrongly clear an actionable failure).
+            # time this handler runs the hub is normally back up. We resolve the
+            # 'hub down' record ONLY when BOTH are true:
+            #   (1) the on-disk hub sidecar version
+            #       (`vct-hub[.exe].metadata.json::launcher_version`) >= source
+            #       — proving the binary was REFRESHED, and
+            #   (2) a LIVE `_probe_vct_hub_health()` succeeds — proving the hub
+            #       is actually UP right now.
+            # (1) alone is insufficient (re-review MAJOR-2): Step 8 is soft-fail,
+            # so a run whose hub start FAILED its /health poll still reaches this
+            # handler with a freshly-deployed binary — clearing on version alone
+            # would delete an actionable 'hub down' record while the hub is
+            # genuinely down. If either check fails (or the probe raises), the
+            # entry is PRESERVED so it survives to the next run — never wrongly
+            # clear an actionable failure.
             try:
                 source_version = _read_launcher_version(project_root)
                 subdir, fname = _launcher_binary_relative_path()

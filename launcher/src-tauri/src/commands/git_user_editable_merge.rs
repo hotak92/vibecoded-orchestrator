@@ -880,17 +880,32 @@ fn sidecar_path_for(install_path: &Path, rel_path: &Path, theirs_sha: &str) -> P
 /// v0.2.89 MINOR-2 — sidecar path for the PRE-RESTORE working-tree content of a
 /// worktree-divergent generated file, before the reconcile drops it with
 /// `git checkout HEAD -- <path>`. Lives under `.claude/context/` (untracked,
-/// never pulled), named `<basename>.pre-reconcile-<short-theirs>` so a
+/// never pulled), named `<flattened-rel-path>.pre-reconcile-<short-theirs>` so a
 /// discarded HAND edit (e.g. an intentional local `package.json` change that
 /// happened to be uncommitted) stays recoverable — mirrors A0's sidecar
-/// posture for the preserve-local class. `theirs_sha` gives a stable,
-/// collision-resistant suffix tied to the update.
+/// posture for the preserve-local class. `theirs_sha` gives a stable suffix
+/// tied to the update.
+///
+/// v0.2.89 (re-review MINOR): the FULL relative path is flattened into the
+/// basename (`/` and `\` → `__`) rather than just `file_name()`. `launcher/
+/// dist/**` contains duplicate basenames across platform dirs (`metadata.json`
+/// ×3, `vct-hub`/`vct-launcher` sidecars ×2–3); a `file_name()`-only sidecar
+/// would map several worktree-divergent dist files to the SAME path in one run,
+/// and later backups would clobber earlier ones (the deferral would then promise
+/// recovery bytes that belong to a sibling file). Flattening the rel-path makes
+/// every sidecar unique. Still a single path segment under `.claude/context/`
+/// (no separators survive), so it cannot escape the directory.
 fn pre_reconcile_sidecar_path(install_path: &Path, rel_path: &str, theirs_sha: &str) -> PathBuf {
     let short = short_sha(theirs_sha);
-    let base = Path::new(rel_path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "worktree-file".to_string());
+    // Flatten the whole rel-path so same-basename files (dist platform dirs)
+    // never collide. Normalise both separators first (Windows-safe), then map
+    // to `__`. Empty (defensive) → a stable placeholder.
+    let flat = rel_path.replace('\\', "/").replace('/', "__");
+    let base = if flat.is_empty() {
+        "worktree-file".to_string()
+    } else {
+        flat
+    };
     install_path
         .join(".claude")
         .join("context")
@@ -2393,7 +2408,8 @@ pub(crate) async fn resolve_generated_files_to_upstream(
     //     in-progress operation must be finished/aborted by the EXISTING flow,
     //     never quietly wrapped up here. Conservative no-op → the existing
     //     conflict/resume machinery surfaces (never worse than today). Same
-    //     probe shape the installer uses (`installer.rs::pending_op_kind`).
+    //     probe shape the installer's abort/resume paths use (see
+    //     `abort_orchestrator_merge_or_rebase` + the resume state check).
     if install_path.join(".git").join("MERGE_HEAD").exists()
         || install_path.join(".git").join("rebase-merge").exists()
         || install_path.join(".git").join("rebase-apply").exists()
@@ -2766,14 +2782,17 @@ pub(crate) fn build_generated_reconcile_deferral_text(
         if shown >= CAP {
             break;
         }
-        let sidecar_name = format!(
-            ".claude/context/{}.pre-reconcile-{}",
-            Path::new(path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.clone()),
-            short_theirs
-        );
+        // Derive the sidecar name from the SAME builder that wrote it (relative
+        // form under `.claude/context/`) so the recovery text always points at
+        // the real file — re-review MINOR: the builder now flattens the full
+        // rel-path (`/`→`__`) to avoid dist-basename collisions, so a
+        // `file_name()`-only reconstruction here would name the wrong path.
+        let sidecar_rel = {
+            let flat = path.replace('\\', "/").replace('/', "__");
+            let base = if flat.is_empty() { path.clone() } else { flat };
+            format!(".claude/context/{}.pre-reconcile-{}", base, short_theirs)
+        };
+        let sidecar_name = sidecar_rel;
         if is_worktree_derived_artifact(path) {
             bullets.push(format!(
                 "  - `{}` — dropped-local-regeneration (uncommitted regeneration of a DERIVED \
@@ -3421,6 +3440,28 @@ mod tests {
             p,
             Path::new("/tmp/install/knowledge/concepts/foo.md.from-upstream-7b255dd")
         );
+    }
+
+    #[test]
+    fn pre_reconcile_sidecar_flattens_rel_path_no_dist_basename_collision() {
+        // re-review MINOR: launcher/dist/** has duplicate basenames across
+        // platform dirs (metadata.json ×3). The pre-restore sidecar must encode
+        // the FULL rel-path so two same-basename worktree-divergent dist files
+        // never map to the same backup (later would clobber earlier).
+        let install = Path::new("/tmp/install");
+        let a = pre_reconcile_sidecar_path(install, "launcher/dist/linux-x64/metadata.json", "7b255dd1");
+        let b = pre_reconcile_sidecar_path(install, "launcher/dist/windows-x64/metadata.json", "7b255dd1");
+        assert_ne!(a, b, "same-basename dist files must get DISTINCT sidecars");
+        assert_eq!(
+            a,
+            Path::new("/tmp/install/.claude/context/launcher__dist__linux-x64__metadata.json.pre-reconcile-7b255dd")
+        );
+        // Windows separators normalise identically (no escape, single segment).
+        let w = pre_reconcile_sidecar_path(install, "launcher\\dist\\windows-x64\\metadata.json", "7b255dd1");
+        assert_eq!(w, b, "backslash rel-paths must flatten the same as forward-slash");
+        // Contained under .claude/context/ — no separator survives in the final
+        // path component, so it cannot escape the directory.
+        assert_eq!(a.parent().unwrap(), Path::new("/tmp/install/.claude/context"));
     }
 
     #[test]
