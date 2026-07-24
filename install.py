@@ -7779,6 +7779,115 @@ def _apply_deferred_entries(
             )
             current_run_report.mark_resolved(cid)
 
+        elif cid == "hub_restart_failed_after_abort":
+            # v0.2.89: the launcher writes this entry when the abort-path hub
+            # restart's health poll fails — i.e. after a conflict-ABORTED
+            # update the launcher tried to bring vct-hub back with
+            # `--start-if-not-running` and the post-restart liveness poll
+            # timed out (emitted by installer.rs). Unlike
+            # generated_files_reconciled (a pure historical audit record with
+            # nothing to re-probe), this is an ACTIONABLE FAILURE record: the
+            # hub genuinely did not come back at abort time, so it must NOT be
+            # unconditionally cleared — it self-clears only once the hub is
+            # confirmed refreshed. It is FOREIGN (Rust-emitted, not in
+            # _INSTALL_OWNED_CONDITION_IDS — a foreign cid listed there would
+            # be silently clobbered on the next update, the A-2 data-loss bug).
+            #
+            # Re-probe (mirrors launcher_update_diverged's hub leg): install.py
+            # Step 8 restarts the hub (`--start-if-not-running`), so by the
+            # time this handler runs the hub is normally back up. The
+            # source-of-truth we can check WITHOUT depending on a live socket
+            # is the on-disk hub sidecar version
+            # (`vct-hub[.exe].metadata.json::launcher_version`) vs the source
+            # version: if the on-disk hub binary >= source, the hub has been
+            # refreshed and Step 8's start has run → the transient abort-time
+            # failure is resolved → mark_resolved. Else the hub genuinely has
+            # not caught up → [skip] and preserve so the entry survives to the
+            # next run. Any exception during the probe → preserve (never
+            # wrongly clear an actionable failure).
+            try:
+                source_version = _read_launcher_version(project_root)
+                subdir, fname = _launcher_binary_relative_path()
+                dist_dir = project_root / "launcher" / "dist" / subdir
+
+                def _read_dist_meta_version(meta_name: str) -> "str | None":
+                    p = dist_dir / meta_name
+                    if not p.is_file():
+                        return None
+                    try:
+                        m = json.loads(p.read_text(encoding="utf-8"))
+                    except Exception:
+                        return None
+                    raw = m.get("launcher_version")
+                    return raw.strip() if isinstance(raw, str) and raw.strip() else None
+
+                hub_meta_name = (
+                    "vct-hub.exe.metadata.json"
+                    if fname.endswith(".exe")
+                    else "vct-hub.metadata.json"
+                )
+                on_disk_hub_version = _read_dist_meta_version(hub_meta_name)
+
+                def _vparts(v: str) -> list[int]:
+                    out: list[int] = []
+                    for p in v.split("."):
+                        digits = ""
+                        for ch in p:
+                            if ch.isdigit():
+                                digits += ch
+                            else:
+                                break
+                        out.append(int(digits) if digits else 0)
+                    return out
+
+                def _ge(a_str: str, b_str: str) -> bool:
+                    a, b = _vparts(a_str), _vparts(b_str)
+                    n = max(len(a), len(b))
+                    a += [0] * (n - len(a))
+                    b += [0] * (n - len(b))
+                    return a >= b
+
+                # Unlike launcher_update_diverged (which treats an absent hub
+                # sidecar as "hub OK" so a caught-up launcher isn't blocked by
+                # a missing hub meta), THIS condition is specifically about the
+                # hub — an absent/unparseable sidecar means we cannot POSITIVELY
+                # confirm the hub caught up, so we keep the actionable entry
+                # (conservative: never wrongly clear a failure record).
+                resolved = bool(
+                    source_version and on_disk_hub_version
+                    and _ge(on_disk_hub_version, source_version)
+                )
+
+                if resolved:
+                    print(
+                        f"  [ok]   {cid}: on-disk hub v{on_disk_hub_version} "
+                        f">= source v{source_version} — the hub has been "
+                        "refreshed and Step 8 restarted it; the abort-time "
+                        "restart failure is resolved. Marking resolved."
+                    )
+                    # Resolved: clear seeded copy + tombstone (P1, v0.2.75).
+                    # FOREIGN cid (Rust-emitted, not in the owned set): the A-2
+                    # seed imported the on-disk copy into current_run_report and
+                    # the P1 pre-write re-merge would re-import it — without
+                    # mark_resolved here the 'do NOT re-add' resolution is inert
+                    # (same pattern launcher_update_diverged uses).
+                    current_run_report.mark_resolved(cid)
+                else:
+                    print(
+                        f"  [skip] {cid}: hub binary has not reached source "
+                        f"v{source_version or '<unknown>'} yet (on-disk hub "
+                        f"v{on_disk_hub_version or '<none>'}); the hub has not "
+                        "caught up, so the abort-time restart failure stands. "
+                        "Keeping entry."
+                    )
+                    current_run_report.add_entry(entry)
+            except Exception as exc:  # noqa: BLE001 — soft-fail
+                print(
+                    f"  [fail] {cid}: hub version re-probe failed ({exc}). "
+                    "Keeping entry."
+                )
+                current_run_report.add_entry(entry)
+
         else:
             # Unknown condition: preserve it to avoid silently losing info.
             print(f"  [unknown] {cid}: no handler. Preserving entry.")

@@ -21,6 +21,7 @@ uncertainty (probe failure, PID unparseable, sentinel present).
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import unittest
@@ -221,6 +222,149 @@ class TestUnknownConditionsStillPreserved(unittest.TestCase):
             _persist(folder, _entry("some_future_condition"))
             result = _apply(folder)
             self.assertIn("some_future_condition", _cids(result))
+
+    def test_unknown_foreign_cid_still_hits_unknown_branch(self):
+        """v0.2.89 guard: the new hub_restart_failed_after_abort elif must not
+        accidentally swallow OTHER foreign cids — a genuinely-unknown cid still
+        falls through to the [unknown] preserve branch."""
+        with TemporaryDirectory() as td:
+            folder = Path(td)
+            _persist(folder, _entry("some_totally_novel_foreign_cid"))
+            result = _apply(folder)
+            self.assertIn("some_totally_novel_foreign_cid", _cids(result),
+                          "an unknown foreign cid must be preserved, not "
+                          "swallowed by a sibling handler")
+
+
+def _write_hub_sidecar(folder: Path, version: "str | None") -> None:
+    """Materialize launcher/dist/<os>/vct-hub[.exe].metadata.json with the
+    given launcher_version. Pass version=None to intentionally OMIT the
+    sidecar (missing-metadata case)."""
+    subdir, fname = install._launcher_binary_relative_path()
+    dist = folder / "launcher" / "dist" / subdir
+    dist.mkdir(parents=True, exist_ok=True)
+    hub_meta_name = (
+        "vct-hub.exe.metadata.json"
+        if fname.endswith(".exe")
+        else "vct-hub.metadata.json"
+    )
+    if version is not None:
+        (dist / hub_meta_name).write_text(
+            json.dumps({"launcher_version": version}), encoding="utf-8"
+        )
+
+
+class TestGeneratedFilesReconciledSelfClears(unittest.TestCase):
+    """v0.2.89: `generated_files_reconciled` is a FOREIGN (Rust-emitted)
+    historical audit record with nothing to re-probe — reaching
+    _apply_deferred_entries means the reconciling update already completed,
+    so it must self-clear (mark_resolved). Phase 2c added the handler but no
+    test; this closes that gap."""
+
+    def test_self_clears_unconditionally(self):
+        with TemporaryDirectory() as td:
+            folder = Path(td)
+            _persist(folder, _entry("generated_files_reconciled"))
+            result = _apply(folder)
+            self.assertNotIn("generated_files_reconciled", _cids(result),
+                             "historical audit record must self-clear once the "
+                             "reconciling update has completed")
+
+    def test_foreign_cid_not_in_owned_set(self):
+        """It must NOT be in _INSTALL_OWNED_CONDITION_IDS — a foreign,
+        Rust-emitted cid listed there is silently clobbered on the next update
+        (the A-2 data-loss bug); it self-clears via mark_resolved instead."""
+        self.assertNotIn(
+            "generated_files_reconciled",
+            install._INSTALL_OWNED_CONDITION_IDS,
+        )
+
+
+class TestHubRestartFailedAfterAbortReprobe(unittest.TestCase):
+    """v0.2.89: `hub_restart_failed_after_abort` is an ACTIONABLE failure
+    record (the abort-path hub restart's health poll failed). It self-clears
+    ONLY once the on-disk hub sidecar version >= source (Step 8 refreshed +
+    restarted the hub); otherwise the actionable failure survives to the next
+    run. Re-probe discipline: act only on a confirmed premise change."""
+
+    def test_resolved_when_hub_caught_up(self):
+        with TemporaryDirectory() as td:
+            folder = Path(td)
+            _persist(folder, _entry("hub_restart_failed_after_abort"))
+            _write_hub_sidecar(folder, "0.2.89")
+            with mock.patch.object(
+                install, "_read_launcher_version", return_value="0.2.89"
+            ):
+                result = _apply(folder)
+            self.assertNotIn("hub_restart_failed_after_abort", _cids(result),
+                             "on-disk hub >= source = hub refreshed + "
+                             "restarted = failure resolved")
+
+    def test_resolved_when_hub_ahead_of_source(self):
+        # >= not == : a hub sidecar ahead of source is still resolved.
+        with TemporaryDirectory() as td:
+            folder = Path(td)
+            _persist(folder, _entry("hub_restart_failed_after_abort"))
+            _write_hub_sidecar(folder, "0.2.90")
+            with mock.patch.object(
+                install, "_read_launcher_version", return_value="0.2.89"
+            ):
+                result = _apply(folder)
+            self.assertNotIn("hub_restart_failed_after_abort", _cids(result))
+
+    def test_preserved_when_hub_behind_source(self):
+        """The actionable-failure-survives leg: on-disk hub < source means the
+        hub has NOT caught up, so the abort-time restart failure stands."""
+        with TemporaryDirectory() as td:
+            folder = Path(td)
+            _persist(folder, _entry("hub_restart_failed_after_abort"))
+            _write_hub_sidecar(folder, "0.2.60")
+            with mock.patch.object(
+                install, "_read_launcher_version", return_value="0.2.89"
+            ):
+                result = _apply(folder)
+            self.assertIn("hub_restart_failed_after_abort", _cids(result),
+                          "hub behind source = not caught up = keep the "
+                          "actionable failure record")
+
+    def test_preserved_when_sidecar_missing(self):
+        """Missing hub sidecar → cannot POSITIVELY confirm the hub caught up →
+        conservatively preserve (unlike launcher_update_diverged, which treats
+        an absent hub sidecar as OK; THIS cid is specifically about the hub)."""
+        with TemporaryDirectory() as td:
+            folder = Path(td)
+            _persist(folder, _entry("hub_restart_failed_after_abort"))
+            _write_hub_sidecar(folder, None)  # sidecar intentionally absent
+            with mock.patch.object(
+                install, "_read_launcher_version", return_value="0.2.89"
+            ):
+                result = _apply(folder)
+            self.assertIn("hub_restart_failed_after_abort", _cids(result),
+                          "absent sidecar = unconfirmed = keep")
+
+    def test_preserved_on_probe_exception(self):
+        """Any exception during the probe must preserve (never wrongly clear
+        an actionable failure)."""
+        with TemporaryDirectory() as td:
+            folder = Path(td)
+            _persist(folder, _entry("hub_restart_failed_after_abort"))
+            _write_hub_sidecar(folder, "0.2.89")
+            with mock.patch.object(
+                install, "_read_launcher_version",
+                side_effect=RuntimeError("boom"),
+            ):
+                result = _apply(folder)
+            self.assertIn("hub_restart_failed_after_abort", _cids(result),
+                          "probe failure must NOT clear the entry")
+
+    def test_foreign_cid_not_in_owned_set(self):
+        """FOREIGN (Rust-emitted): must NOT be in _INSTALL_OWNED_CONDITION_IDS
+        (else the A-2 data-loss clobber). It self-clears via the re-probe
+        mark_resolved leg, same as launcher_update_diverged."""
+        self.assertNotIn(
+            "hub_restart_failed_after_abort",
+            install._INSTALL_OWNED_CONDITION_IDS,
+        )
 
 
 if __name__ == "__main__":
