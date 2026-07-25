@@ -20,8 +20,13 @@
   import {
     type UpdateAllProgress,
     type ProgressState,
+    type KgSyncProgress,
+    type CodeGraphBuildProgress,
     emptyProgressState,
     applyProgressEvent,
+    applySubProgress,
+    kgSyncSubLabel,
+    codeGraphSubLabel,
     progressTotal as computeProgressTotal,
     progressIcon,
   } from './update-all-progress';
@@ -85,14 +90,27 @@
   // before the first event arrives).
   const progressTotal = $derived(computeProgressTotal(progress, projectCount));
 
-  // Unlisten handle for the `update_all_progress` event. Cleared on
-  // done/error and on unmount so we never leak a listener across runs.
+  // Unlisten handles. Cleared on done/error and on unmount so we never leak a
+  // listener across runs:
+  //   - `update_all_progress`          → per-project boundary (started/finished)
+  //   - `kg-sync-progress`             → intra-project KG/docs sub-progress (v0.2.89)
+  //   - `code-graph-build-progress`    → intra-project codegraph sub-progress (v0.2.89)
   let unlistenProgress: (() => void) | null = null;
+  let unlistenKgSync: (() => void) | null = null;
+  let unlistenCodeGraph: (() => void) | null = null;
 
   function teardownProgressListener() {
     if (unlistenProgress) {
       unlistenProgress();
       unlistenProgress = null;
+    }
+    if (unlistenKgSync) {
+      unlistenKgSync();
+      unlistenKgSync = null;
+    }
+    if (unlistenCodeGraph) {
+      unlistenCodeGraph();
+      unlistenCodeGraph = null;
     }
   }
 
@@ -134,6 +152,41 @@
     } catch (listenErr) {
       console.warn('update_all_progress listener setup failed:', listenErr);
       unlistenProgress = null;
+    }
+
+    // Intra-project sub-progress (v0.2.89): the SAME KG-sync / codegraph events
+    // the per-project views use also stream during Update-all (each carries the
+    // owning `project_id`). Fold a condensed label into the running row so a
+    // slow project (docs re-embed, codegraph build) visibly advances instead of
+    // showing a static spinner that "looks frozen". Soft-fail: a listener-setup
+    // error must not block the update; the row just falls back to "updating…".
+    try {
+      unlistenKgSync = await listen<KgSyncProgress>('kg-sync-progress', (e) => {
+        progress = applySubProgress(
+          progress,
+          e.payload.project_id,
+          kgSyncSubLabel(e.payload),
+        );
+      });
+    } catch (listenErr) {
+      console.warn('kg-sync-progress listener setup failed:', listenErr);
+      unlistenKgSync = null;
+    }
+
+    try {
+      unlistenCodeGraph = await listen<CodeGraphBuildProgress>(
+        'code-graph-build-progress',
+        (e) => {
+          progress = applySubProgress(
+            progress,
+            e.payload.project_id,
+            codeGraphSubLabel(e.payload),
+          );
+        },
+      );
+    } catch (listenErr) {
+      console.warn('code-graph-build-progress listener setup failed:', listenErr);
+      unlistenCodeGraph = null;
     }
 
     try {
@@ -324,7 +377,13 @@
               >
               <span class="ua-row-name">{p.project_name}</span>
               <span class="ua-row-status">
-                {#if p.status === 'running'}updating…{:else}{p.status}{/if}
+                {#if p.status === 'running'}
+                  <!-- Live intra-project sub-detail (v0.2.89): show the KG-sync
+                       / codegraph sub-label while it's in flight so a slow
+                       project doesn't look frozen; fall back to the generic
+                       "updating…" during quiet phases (never a stale count). -->
+                  {#if p.sub}{p.sub}{:else}updating…{/if}
+                {:else}{p.status}{/if}
               </span>
             </li>
           {/each}

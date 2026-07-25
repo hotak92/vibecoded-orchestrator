@@ -37,6 +37,15 @@ export type ProgressRow = {
   total: number;
   status: 'running' | 'succeeded' | 'failed' | 'skipped';
   warnings_count: number | null;
+  /**
+   * Live intra-project sub-progress label (v0.2.89) — a condensed line like
+   * "syncing docs 35/35" or "building code graph…", derived from the
+   * `kg-sync-progress` / `code-graph-build-progress` sub-events that stream
+   * *during* a single project's update. `null` when nothing informative is in
+   * flight (quiet phase, or the row is terminal). Only rendered while
+   * `status === 'running'` so a done row never shows a stale sub-line.
+   */
+  sub: string | null;
 };
 
 /** The "Updating <name> (i/N)…" headline target, or null between projects. */
@@ -82,6 +91,7 @@ export function applyProgressEvent(
       total: ev.total,
       status: 'running',
       warnings_count: null,
+      sub: null,
     };
     const rows =
       idx >= 0
@@ -101,6 +111,10 @@ export function applyProgressEvent(
     total: ev.total,
     status: ev.status ?? 'succeeded',
     warnings_count: ev.warnings_count,
+    // FORCE null on `finished`: a late, fire-and-forget sub-event that arrives
+    // after the project's terminal event must not leave a stale sub-line under
+    // a done row.
+    sub: null,
   };
   const rows =
     idx >= 0
@@ -126,4 +140,117 @@ export function progressIcon(s: ProgressRow['status']): string {
   if (s === 'failed') return '✗';
   if (s === 'skipped') return '–';
   return '⟳'; // running
+}
+
+// ── Intra-project sub-progress (v0.2.89) ──────────────────────────────────
+//
+// During a single project's update the backend already streams two finer
+// events that each carry the owning `project_id`:
+//   - `kg-sync-progress`         → mirror of Rust `KgSyncView` (kg_sync.rs)
+//   - `code-graph-build-progress`→ mirror of Rust `CodeGraphBuildView`
+//     (codegraph.rs)
+// During Update-all these stream for whichever project is currently running,
+// so we fold a condensed label into that project's row to prove long
+// re-embed / codegraph builds are progressing (not frozen). FRONTEND-ONLY:
+// no backend change — the events and their `project_id` already exist.
+//
+// `status` for both is one of the DB status strings: 'pending' | 'running' |
+// 'success' | 'partial' (codegraph only) | 'failed' | 'skipped'. Only
+// 'running' is worth surfacing as an in-flight sub-line; terminal statuses
+// return null so the reducer clears any lingering sub-detail.
+
+/**
+ * Mirror of the Rust `KgSyncView` payload (`kg-sync-progress` event). Only the
+ * fields we render are typed here; extra fields on the wire are ignored.
+ */
+export type KgSyncProgress = {
+  project_id: string;
+  status: string;
+  kg_total: number;
+  kg_succeeded: number;
+  docs_total: number;
+  docs_succeeded: number;
+  current_phase: string | null;
+};
+
+/**
+ * Mirror of the Rust `CodeGraphBuildView` payload
+ * (`code-graph-build-progress` event). Only the rendered fields are typed.
+ */
+export type CodeGraphBuildProgress = {
+  project_id: string;
+  status: string;
+  files_analyzed: number;
+  current_phase: string | null;
+};
+
+/**
+ * Condensed sub-label for a `kg-sync-progress` event, or `null` when the event
+ * is terminal / uninformative (so the row's sub-line clears). Deterministic:
+ * no clock / randomness — the label is a pure function of the payload.
+ */
+export function kgSyncSubLabel(evt: KgSyncProgress): string | null {
+  // Only surface while the sync is actually running; a terminal status means
+  // this phase is done and the row should stop showing a sub-line.
+  if (evt.status !== 'running') return null;
+
+  const phase = evt.current_phase ?? null;
+  // Docs re-embedding is the long tail Fabio's field report flagged as
+  // "looks frozen" — show the running count so it visibly advances.
+  if (phase === 'docs' && evt.docs_total > 0) {
+    return `syncing docs ${evt.docs_succeeded}/${evt.docs_total}`;
+  }
+  if (phase === 'knowledge' && evt.kg_total > 0) {
+    return `syncing knowledge ${evt.kg_succeeded}/${evt.kg_total}`;
+  }
+  if (phase === 'scan') {
+    return 'scanning knowledge graph…';
+  }
+  // Running but no count yet / unknown phase: a generic-but-alive line beats a
+  // static spinner.
+  return 'syncing knowledge graph…';
+}
+
+/**
+ * Condensed sub-label for a `code-graph-build-progress` event, or `null` when
+ * the event is terminal / uninformative. Deterministic (no clock/randomness).
+ */
+export function codeGraphSubLabel(evt: CodeGraphBuildProgress): string | null {
+  if (evt.status !== 'running') return null;
+
+  const phase = evt.current_phase ?? null;
+  if (phase === 'weaviate-upload') {
+    return 'uploading code graph…';
+  }
+  if (evt.files_analyzed > 0) {
+    // Language phases (python / typescript / …) — show files analysed so far.
+    return `building code graph (${evt.files_analyzed} files)…`;
+  }
+  return 'building code graph…';
+}
+
+/**
+ * Fold a sub-progress `label` into the row matching `projectId`, returning a
+ * NEW state (never mutates the input). Rules:
+ *   - Only rows that are still `running` accept a sub-label — a terminal row
+ *     (a late sub-event arriving after the project finished) is ignored so a
+ *     done row never regrows a sub-line.
+ *   - An unknown `projectId` (no matching row) is a no-op.
+ *   - `label === null` clears the row's sub-line.
+ *   - If the row's `sub` already equals `label`, return the SAME state object
+ *     (identity no-op) so reactive consumers don't re-render on a repeat.
+ */
+export function applySubProgress(
+  state: ProgressState,
+  projectId: string,
+  label: string | null,
+): ProgressState {
+  const idx = state.rows.findIndex((r) => r.project_id === projectId);
+  if (idx < 0) return state; // unknown project — ignore
+  const row = state.rows[idx];
+  if (row.status !== 'running') return state; // terminal row — ignore late event
+  if (row.sub === label) return state; // no change — identity no-op
+
+  const rows = state.rows.map((r, i) => (i === idx ? { ...r, sub: label } : r));
+  return { rows, current: state.current };
 }
