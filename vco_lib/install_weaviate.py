@@ -849,3 +849,378 @@ def build_orphan_dev_deferral(
         severity="info",
         kg_node_refs=[],
     )
+
+
+# ---------------------------------------------------------------------------
+# v0.2.89 FIX 1 — bounded Weaviate-readiness wait (gates the unbounded
+# re-embed subprocess). Extracted here so install.py keeps a thin one-line
+# wrapper (the install.py main()/total ratchet keeps real logic in vco_lib).
+# ---------------------------------------------------------------------------
+
+
+def wait_for_weaviate_ready(
+    weaviate_url: str,
+    deadline_seconds: float,
+    *,
+    print_fn: Optional[Callable[[str], None]] = None,
+    progress_interval_s: float = 15.0,
+    probe_timeout_s: float = 5.0,
+    poll_interval_s: float = 2.0,
+) -> bool:
+    """Poll ``<weaviate_url>/v1/.well-known/ready`` with a BOUNDED deadline.
+
+    v0.2.89 FIX 1. Returns True once the endpoint answers HTTP 200 within
+    ``deadline_seconds``; returns False if the deadline elapses first. NEVER
+    blocks indefinitely — that is the whole point (field report: a dead WSL2
+    port-forward made Weaviate return HTTP 000, and the unbounded re-embed
+    subprocess hung install.py forever on an unattended machine).
+
+    Mirrors install.py's ``_wait_for_ollama`` bounded ``time.monotonic() +
+    timeout`` pattern. Each probe carries its own short socket timeout so a
+    hung port can't stall one iteration past the overall deadline.
+
+    Pure except for the network probe + optional ``print_fn`` progress log;
+    ``time``/``urllib`` are imported locally so non-Weaviate code paths don't
+    pull them at module import.
+    """
+    import time
+    import urllib.error
+    import urllib.request
+
+    ready_url = f"{weaviate_url.rstrip('/')}/v1/.well-known/ready"
+    deadline = time.monotonic() + deadline_seconds
+    last_progress = time.monotonic()
+    while time.monotonic() < deadline:
+        try:
+            resp = urllib.request.urlopen(ready_url, timeout=probe_timeout_s)
+            status = getattr(resp, "status", None)
+            if status == 200 or (status is None and resp.getcode() == 200):
+                return True
+        except (urllib.error.URLError, OSError, ValueError):
+            # Connection refused, DNS, socket timeout, HTTP 000 from a dead
+            # port-forward — all "not ready yet"; keep polling until deadline.
+            pass
+        now = time.monotonic()
+        if print_fn is not None and now - last_progress >= progress_interval_s:
+            remaining = int(max(0, deadline - now))
+            try:
+                print_fn(
+                    f"  ... waiting for Weaviate at {ready_url} "
+                    f"(~{remaining}s left before soft-fail)"
+                )
+            except Exception:  # noqa: BLE001 — logging must never wedge the wait
+                pass
+            last_progress = now
+        time.sleep(poll_interval_s)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# v0.2.89 FIX 2 — orphan legacy `.mcp.json` weaviate-kg block that shadows the
+# migrated `.claude/settings.json`. Real logic lives here; install.py keeps a
+# thin wrapper that supplies its logger.
+# ---------------------------------------------------------------------------
+
+# Env keys whose disagreement between `.mcp.json` and `.claude/settings.json`
+# proves the `.mcp.json` weaviate-kg block is a stale pre-migration orphan.
+MCP_JSON_STALE_ENV_KEYS = ("WEAVIATE_URL", "KG_COLLECTION", "SHARED_KG_COLLECTION")
+
+
+def resolve_settings_weaviate_env(project_root: Path) -> "Optional[dict]":
+    """Return the migrated weaviate-relevant env from `.claude/settings.json`.
+
+    VCO writes a TOP-LEVEL ``env`` block in ``.claude/settings.json`` (see
+    install.py ``_build_vco_settings_defaults`` / ``_VCO_SETTINGS_MANAGED_KEYS``);
+    the MCP subprocess inherits it. Returns a dict of the present keys in
+    :data:`MCP_JSON_STALE_ENV_KEYS`, or ``None`` when the file is
+    missing/unreadable / carries no comparable env — in which case the caller
+    CANNOT prove staleness and must leave `.mcp.json` untouched.
+    """
+    import json
+
+    settings_path = project_root / ".claude" / "settings.json"
+    if not settings_path.is_file():
+        return None
+    try:
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    env = data.get("env")
+    if not isinstance(env, dict):
+        return None
+    out: dict = {}
+    for key in MCP_JSON_STALE_ENV_KEYS:
+        val = env.get(key)
+        if isinstance(val, str):
+            out[key] = val
+    # Require at least one identity key to make a confident comparison. Without
+    # a settings.json WEAVIATE_URL / KG_COLLECTION we cannot prove staleness.
+    if "WEAVIATE_URL" not in out and "KG_COLLECTION" not in out:
+        return None
+    return out
+
+
+def mcp_json_weaviate_env_is_stale(
+    mcp_env: dict,
+    settings_env: dict,
+) -> "Optional[list]":
+    """Return concrete reasons the `.mcp.json` weaviate-kg env is stale.
+
+    Returns a non-empty list of reason strings when the ``.mcp.json``
+    weaviate-kg env DEMONSTRABLY CONTRADICTS the migrated settings.json env
+    (stale port, differing collection, or empty shared while settings has one).
+    Returns ``None`` when there is NO positive contradiction (consistent →
+    leave alone) — the conservative default.
+
+    CONSERVATISM: only genuine contradictions count. A key ABSENT from
+    ``.mcp.json`` is NOT a contradiction (weaviate-kg would inherit settings.json
+    for it, EXCEPT shared — see below). A present-but-empty shared in `.mcp.json`
+    counts as stale ONLY when settings.json has a non-empty shared (the exact
+    Fabio case: shared-KG merge silently OFF).
+    """
+    if not isinstance(mcp_env, dict):
+        return None
+    reasons: list = []
+
+    # WEAVIATE_URL: a present-and-differing value is the strongest signal
+    # (Fabio: :8080 in .mcp.json vs :8081 in settings.json).
+    mcp_url = mcp_env.get("WEAVIATE_URL")
+    set_url = settings_env.get("WEAVIATE_URL")
+    if (
+        isinstance(mcp_url, str)
+        and mcp_url.strip()
+        and isinstance(set_url, str)
+        and set_url.strip()
+        and mcp_url.strip() != set_url.strip()
+    ):
+        reasons.append(
+            f"WEAVIATE_URL {mcp_url.strip()!r} (.mcp.json) != "
+            f"{set_url.strip()!r} (settings.json)"
+        )
+
+    # KG_COLLECTION: present-and-differing → stale routing.
+    mcp_kg = mcp_env.get("KG_COLLECTION")
+    set_kg = settings_env.get("KG_COLLECTION")
+    if (
+        isinstance(mcp_kg, str)
+        and mcp_kg.strip()
+        and isinstance(set_kg, str)
+        and set_kg.strip()
+        and mcp_kg.strip() != set_kg.strip()
+    ):
+        reasons.append(
+            f"KG_COLLECTION {mcp_kg.strip()!r} (.mcp.json) != "
+            f"{set_kg.strip()!r} (settings.json)"
+        )
+
+    # SHARED_KG_COLLECTION: empty/absent in .mcp.json while settings.json has a
+    # non-empty value → shared-KG merge silently disabled (the Fabio symptom).
+    set_shared = settings_env.get("SHARED_KG_COLLECTION")
+    if isinstance(set_shared, str) and set_shared.strip():
+        mcp_shared = mcp_env.get("SHARED_KG_COLLECTION")
+        if isinstance(mcp_shared, str) and not mcp_shared.strip():
+            # Present-but-empty shared: a standalone contradiction.
+            reasons.append(
+                "SHARED_KG_COLLECTION empty in .mcp.json while settings.json "
+                f"has {set_shared.strip()!r} (shared-KG merge disabled)"
+            )
+        elif "SHARED_KG_COLLECTION" not in mcp_env and reasons:
+            # Absent shared: the subprocess takes the WHOLE .mcp.json env (envs
+            # are NOT merged key-by-key across the two files — the
+            # higher-precedence .mcp.json dict wins), so a weaviate-kg env that
+            # omits shared runs with NO shared merge. Only name it when the
+            # block is ALREADY proven stale by url/collection; never let a
+            # missing shared alone trigger the action.
+            reasons.append(
+                "SHARED_KG_COLLECTION absent from the .mcp.json weaviate-kg "
+                f"env while settings.json has {set_shared.strip()!r} "
+                "(shared-KG merge disabled under .mcp.json precedence)"
+            )
+
+    return reasons or None
+
+
+def quarantine_stale_mcp_json_shadow(
+    project_root: Path,
+    *,
+    log_event: Optional[Callable] = None,
+    print_fn: Optional[Callable[[str], None]] = None,
+):
+    """Detect + quarantine an orphan `<project>/.mcp.json` weaviate-kg block
+    that shadows the migrated `.claude/settings.json`.
+
+    v0.2.89 FIX 2. Returns a ``DeferralEntry`` describing the quarantine when it
+    acts, or ``None`` when there is nothing to do / the block is consistent /
+    evidence is insufficient (all the leave-alone legs). Single-project scope.
+    Soft-fail throughout — any read/parse error or ambiguity leaves `.mcp.json`
+    untouched and returns ``None``.
+
+    Action, ONLY on a demonstrable contradiction (see
+    :func:`mcp_json_weaviate_env_is_stale`):
+      1. Back up the whole `.mcp.json` to ``.mcp.json.bak-<YYYY-MM-DD>``.
+      2. Remove ONLY the ``weaviate-kg`` entry from ``mcpServers`` (so it
+         inherits the correct env from settings.json). Other MCP entries are
+         preserved verbatim; an empty ``mcpServers`` object is a valid no-op.
+      3. Return a ``stale_mcp_json_shadow_quarantined`` deferral entry.
+    """
+    import json
+
+    def _log(step: str, phase: str, detail: str = "", data=None) -> None:
+        if log_event is None:
+            return
+        try:
+            log_event(step, phase, detail, data=data)
+        except TypeError:  # logger without a data= kwarg
+            log_event(step, phase, detail)
+
+    mcp_path = project_root / ".mcp.json"
+    if not mcp_path.is_file():
+        return None  # (c) no .mcp.json → no-op
+    try:
+        raw = mcp_path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        _log("mcp_json_shadow_check", "warn", f"could not read {mcp_path}: {exc}")
+        return None
+    try:
+        if not isinstance(data, dict):
+            return None
+        mcp_servers = data.get("mcpServers")
+        if not isinstance(mcp_servers, dict):
+            return None
+        weaviate_entry = mcp_servers.get("weaviate-kg")
+        if not isinstance(weaviate_entry, dict):
+            return None  # no weaviate-kg block to compare
+        mcp_env = weaviate_entry.get("env")
+        if not isinstance(mcp_env, dict):
+            return None
+
+        settings_env = resolve_settings_weaviate_env(project_root)
+        if settings_env is None:
+            _log(
+                "mcp_json_shadow_check", "info",
+                "found .mcp.json weaviate-kg env but no comparable "
+                "settings.json env — leaving .mcp.json untouched",
+            )
+            return None
+
+        reasons = mcp_json_weaviate_env_is_stale(mcp_env, settings_env)
+        if not reasons:
+            # (b) consistent .mcp.json → LEAVE UNTOUCHED (leave-alone leg).
+            _log(
+                "mcp_json_shadow_check", "info",
+                ".mcp.json weaviate-kg env is consistent with settings.json — "
+                "leaving it untouched",
+            )
+            return None
+
+        # ── Stale: back up, then quarantine ONLY the weaviate-kg block. ──
+        from datetime import datetime, timezone
+
+        date_stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        backup_path = mcp_path.with_name(f".mcp.json.bak-{date_stamp}")
+        if backup_path.exists():
+            n = 2
+            while True:
+                candidate = mcp_path.with_name(f".mcp.json.bak-{date_stamp}-{n}")
+                if not candidate.exists():
+                    backup_path = candidate
+                    break
+                n += 1
+        try:
+            backup_path.write_text(raw, encoding="utf-8")
+        except OSError as exc:
+            _log(
+                "mcp_json_shadow_check", "warn",
+                f"could not write backup {backup_path}: {exc} — "
+                "leaving .mcp.json untouched",
+            )
+            return None
+
+        remaining = {
+            name: entry
+            for name, entry in mcp_servers.items()
+            if name != "weaviate-kg"
+        }
+        data["mcpServers"] = remaining
+        try:
+            mcp_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            _log(
+                "mcp_json_shadow_check", "warn",
+                f"could not rewrite {mcp_path}: {exc} (backup at {backup_path})",
+            )
+            return None
+
+        other_servers = sorted(remaining.keys())
+        preserved_note = (
+            f"Preserved {len(other_servers)} other MCP entr"
+            f"{'y' if len(other_servers) == 1 else 'ies'} "
+            f"({', '.join(f'`{s}`' for s in other_servers)})."
+            if other_servers
+            else "No other MCP entries were present; `mcpServers` is now empty."
+        )
+        reasons_str = "; ".join(reasons)
+        if print_fn is not None:
+            try:
+                print_fn(
+                    f"  Quarantined stale weaviate-kg env from {mcp_path} "
+                    f"(shadowed settings.json). Backup: {backup_path}"
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        _log(
+            "mcp_json_shadow_check", "ok",
+            "quarantined stale .mcp.json weaviate-kg env block",
+            data={
+                "mcp_json": str(mcp_path),
+                "backup": str(backup_path),
+                "reasons": reasons,
+                "preserved": other_servers,
+            },
+        )
+
+        from vco_lib.deferral_report import DeferralEntry
+
+        return DeferralEntry(
+            condition_id="stale_mcp_json_shadow_quarantined",
+            title=(
+                "Quarantined stale .mcp.json weaviate-kg env "
+                "(shadowed migrated settings.json)"
+            ),
+            detected=(
+                f"`{mcp_path}` carried a `weaviate-kg` env block that "
+                f"contradicted the migrated `.claude/settings.json`: "
+                f"{reasons_str}. `.mcp.json` takes PRECEDENCE over settings.json "
+                "for MCP env, so every KG search ran against the stale "
+                "endpoint/collection (and cross-project shared-KG merge was "
+                "silently OFF). The weaviate-kg env block was removed so "
+                f"weaviate-kg inherits the correct env from settings.json. "
+                f"{preserved_note}"
+            ),
+            why_deferred=(
+                "The stale block was auto-quarantined (backed up first), but "
+                "VCO does NOT manage `.mcp.json` (it is Anthropic's "
+                "project-scoped config), so this deferral records the change "
+                "for the user's review rather than silently mutating an "
+                "un-owned file with no trace. Restart Claude Code so the "
+                "weaviate-kg MCP re-reads settings.json."
+            ),
+            command_to_apply=(
+                "# No action required — the stale weaviate-kg block was already "
+                "removed.\n"
+                f"# Backup of the original: {backup_path}\n"
+                "# Restart Claude Code so weaviate-kg picks up the correct env "
+                "from .claude/settings.json.\n"
+                f"# To roll back: restore the backup over {mcp_path}."
+            ),
+            severity="warning",
+            kg_node_refs=[
+                "knowledge/concepts/orchestrator-mcp-servers.md",
+            ],
+        )
+    except Exception as exc:  # noqa: BLE001 — soft-fail
+        _log("mcp_json_shadow_check", "warn", f"could not check .mcp.json shadow: {exc}")
+        return None

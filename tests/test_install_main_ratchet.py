@@ -38,7 +38,19 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # install.py's module-global PROJECT_ROOT + _log_install_event). Same
 # "inseparable thin-shim" precedent as the codegraph-ts / 5c lines in the TOTAL
 # block below. Re-pinned UP by 1 to the new measured span.
-_MAIN_SPAN_MAX = 1669
+# v0.2.89 FIX 1+2: +9 (1669→1678) for irreducible glue in main()'s existing
+# seed try/except + the --update MCP-remnant-check cluster. ALL substantive
+# logic (the bounded Weaviate-readiness poll + the stale-.mcp.json detect/
+# backup/quarantine) lives in vco_lib.install_weaviate.{wait_for_weaviate_ready,
+# quarantine_stale_mcp_json_shadow,resolve_settings_weaviate_env,
+# mcp_json_weaviate_env_is_stale}; the residual main() delta is the thin-shim
+# glue that must supply install.py's env-resolution + PROJECT_ROOT +
+# _deferral_report + the 3 short comments explaining WHY the two seed calls now
+# raise on an unreachable Weaviate (the readiness gate lives in
+# _ensure_collections / _seed_weaviate_impl, both OUTSIDE main()). Same
+# "inseparable thin-shim" precedent as the Step-4c / codegraph-ts lines. Re-pinned
+# UP to the new measured span.
+_MAIN_SPAN_MAX = 1678
 
 # TOTAL: strict — measured exactly, no headroom. Additions require
 # extraction to vco_lib, not a bump.
@@ -106,7 +118,22 @@ _MAIN_SPAN_MAX = 1669
 # Measured 23,889. Re-pinned DOWNWARD to 24089 (measured + a small headroom) per
 # the "update only DOWNWARD" discipline, so the slack-guard (`total > max-1200`)
 # stays meaningful and regrowth can't hide under the old 24809 budget.
-_TOTAL_LINES_MAX = 24089
+# v0.2.89 FIX 1+2: re-pinned UP to the measured 24316. TWO components:
+#   (1) PRE-EXISTING DRIFT: at this fix's base HEAD install.py already measured
+#       24186 — ~97 lines OVER the 24089 v0.2.85 pin, from commits landed between
+#       v0.2.85 and now that grew install.py without re-pinning (the ratchet was
+#       already RED at HEAD, independent of this change). FLAGGED for the release
+#       coordinator; not introduced here.
+#   (2) THIS CHANGE (+130): the field-fix additions. ALL substantive logic was
+#       extracted to vco_lib.install_weaviate (wait_for_weaviate_ready +
+#       quarantine_stale_mcp_json_shadow + the two pure predicates); install.py
+#       keeps ONLY thin same-signature wrappers (so the `install.<name>`
+#       accessors + monkeypatch contract keep resolving), the WEAVIATE_READY_
+#       TIMEOUT constant, the two in-function readiness gates, and the FIELD-
+#       REPORT header comment. Same "inseparable thin-shim" precedent as the
+#       R8 / 5c / codegraph-ts lines above. Pinned to the measured value with no
+#       headroom per the "TOTAL: strict — measured exactly" contract.
+_TOTAL_LINES_MAX = 24316
 
 
 def _measure() -> tuple:

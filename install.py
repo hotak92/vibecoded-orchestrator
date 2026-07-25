@@ -210,6 +210,12 @@ _INSTALL_OWNED_CONDITION_IDS = frozenset({
     "searxng_removed_from_default_install",
     "ollama_mcp_deprecated",
     "search_mcp_simplified",
+    # v0.2.89 FIX 2: emitted when an orphan pre-migration `<project>/.mcp.json`
+    # weaviate-kg env block that CONTRADICTS the migrated `.claude/settings.json`
+    # (stale Weaviate port / KG collection / empty shared-KG) is quarantined.
+    # Re-detected per run (the quarantine removes the stale block, so a clean
+    # subsequent run does NOT re-detect → drop-when-absent self-clears).
+    "stale_mcp_json_shadow_quarantined",
     "launcher_restart_required",
     "launcher_binary_swap_failed_locked",
     "update_resume_required",
@@ -539,6 +545,20 @@ def _build_ollama_pull_list(embed_config: dict, sysinfo: SystemInfo) -> list[str
     return out
 
 HEALTH_TIMEOUT = 120  # seconds
+
+# v0.2.89 FIX 1: bounded deadline for the pre-seed Weaviate-readiness probe.
+# Field report (Fabio, Windows CPU-only, v0.2.72→v0.2.88): the PC slept
+# mid-re-embed; on wake the WSL2 port-forward died so Weaviate :8081 returned
+# HTTP 000 from Windows. install.py then hung INDEFINITELY — the re-embed
+# subprocess (`sync_knowledge_graph.py`, connect_v4(skip_init_checks=False))
+# blocks on a Weaviate that never answers, and `subprocess.run` runs it with
+# NO wall-clock timeout (deliberate: a slow CPU re-embed is legitimate). On an
+# unattended machine this hangs forever. The fix gates the unbounded re-embed
+# on a BOUNDED readiness probe: if Weaviate isn't ready within this many
+# seconds, soft-fail to the `weaviate_unreachable_at_update` deferral and skip
+# the seed instead of blocking. Overridable via WEAVIATE_READY_TIMEOUT env for
+# operators on very slow container starts.
+WEAVIATE_READY_TIMEOUT = 150  # seconds
 
 
 class SystemInfo(NamedTuple):
@@ -6433,6 +6453,9 @@ def main() -> int:
         # collection earlier this run AND seed/ensure later crashes, the
         # deferral entry includes `rebuild_pending_seed` so the operator knows
         # what was lost.
+        # v0.2.89 FIX 1: the two calls below begin with a bounded readiness gate
+        # → an unreachable Weaviate raises here (soft-fail-to-deferral) instead
+        # of hanging the unbounded re-embed subprocess forever.
         _seed_succeeded = False
         try:
             _ensure_collections(embed_config, decisions=decisions, args=args)
@@ -6472,6 +6495,9 @@ def main() -> int:
                 )
                 import time as _time
                 _time.sleep(3)  # brief settle
+                # v0.2.89 FIX 1: the readiness gate inside these two re-runs, so
+                # a still-unreachable port raises TimeoutError (→ deferral below)
+                # rather than hanging the re-embed after a no-op `podman start`.
                 _ensure_collections(embed_config, decisions=decisions, args=args)
                 _seed_weaviate(args)
                 _restarted = True
@@ -6854,6 +6880,11 @@ def main() -> int:
     if not getattr(args, "suppress_mcp_deprecation_warnings", False):
         _check_ollama_mcp_remnants(_deferral_report)
         _check_search_mcp_env_obsolete(_deferral_report)
+
+    # v0.2.89 FIX 2: on --update, quarantine an orphan `.mcp.json` weaviate-kg
+    # block that shadows the migrated settings.json (soft-fails on ambiguity).
+    if args.update:
+        _check_stale_mcp_json_shadow(PROJECT_ROOT, _deferral_report)
 
     # PR-23 (v0.2.12, 2026-05-16): register bundled MCP entries into
     # ~/.claude.json. Pre-PR-23 install.py performed ZERO MCP registration,
@@ -14054,6 +14085,37 @@ def _resolve_project_id_by_folder(folder: Path) -> str | None:
             pass
 
 
+def _wait_for_weaviate_ready(
+    weaviate_url: str | None = None,
+    deadline_seconds: float | None = None,
+) -> bool:
+    """Thin wrapper over :func:`vco_lib.install_weaviate.wait_for_weaviate_ready`.
+
+    v0.2.89 FIX 1. Resolves the default URL + deadline from install.py's env
+    (``WEAVIATE_URL`` / ``WEAVIATE_PORT`` / ``WEAVIATE_READY_TIMEOUT``) and
+    delegates the BOUNDED-deadline poll to vco_lib (the install.py ratchet keeps
+    real logic out of install.py). Returns True once ready, False on timeout —
+    never blocks indefinitely.
+    """
+    if weaviate_url is None:
+        weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
+        weaviate_url = os.environ.get(
+            "WEAVIATE_URL", f"http://localhost:{weaviate_port}"
+        )
+    if deadline_seconds is None:
+        try:
+            deadline_seconds = float(
+                os.environ.get("WEAVIATE_READY_TIMEOUT", str(WEAVIATE_READY_TIMEOUT))
+            )
+        except (TypeError, ValueError):
+            deadline_seconds = float(WEAVIATE_READY_TIMEOUT)
+    return _install_weaviate.wait_for_weaviate_ready(
+        weaviate_url,
+        deadline_seconds,
+        print_fn=lambda msg: print(msg, flush=True),
+    )
+
+
 def _ensure_collections(embed_config: dict,
                         decisions: dict | None = None,
                         args: argparse.Namespace | None = None) -> None:
@@ -14101,6 +14163,16 @@ def _ensure_collections(embed_config: dict,
 
     weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
     weaviate_url = f"http://localhost:{weaviate_port}"
+
+    # v0.2.89 FIX 1: BOUNDED readiness gate. Raises TimeoutError on an
+    # unreachable Weaviate so the caller's soft-fail-to-deferral path runs
+    # instead of the downstream unbounded re-embed subprocess hanging forever.
+    if not _wait_for_weaviate_ready():
+        raise TimeoutError(
+            "Weaviate readiness probe (/v1/.well-known/ready) did not return "
+            f"200 within {WEAVIATE_READY_TIMEOUT}s — refusing to bootstrap "
+            "collections against an unreachable endpoint"
+        )
 
     # Detect adopt mode: install is reusing a Weaviate it didn't bring up.
     weaviate_decision = (decisions or {}).get("weaviate", {})
@@ -15264,6 +15336,18 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
         print("  Skipped (--skip-seed).")
         _log_install_event("7c/10", "skip", "seed skipped via --skip-seed")
         return
+
+    # v0.2.89 FIX 1: BOUNDED readiness gate immediately before the unbounded
+    # `sync_knowledge_graph.py` re-embed subprocess (which has NO wall-clock
+    # timeout). Raises TimeoutError on an unreachable Weaviate so the caller's
+    # soft-fail-to-deferral path runs instead of hanging forever (dead WSL2
+    # port-forward → HTTP 000, field report Fabio v0.2.72→v0.2.88).
+    if not _wait_for_weaviate_ready():
+        raise TimeoutError(
+            "Weaviate readiness probe (/v1/.well-known/ready) did not return "
+            f"200 within {WEAVIATE_READY_TIMEOUT}s — refusing to start an "
+            "unbounded re-embed against an unreachable endpoint"
+        )
 
     # We must use the venv's Python so weaviate-client + weaviate_mcp.chunking
     # import correctly. Step 4 creates the venv at PROJECT_ROOT/.venv (NOT
@@ -18654,6 +18738,52 @@ def _check_search_mcp_env_obsolete(
             "search_mcp_env_check", "warn",
             f"could not check search MCP env remnants: {exc}",
         )
+
+
+# ---------------------------------------------------------------------------
+# v0.2.89 FIX 2 — orphan legacy `.mcp.json` that shadows the migrated
+# `.claude/settings.json`. Real logic (detect predicate + backup/quarantine)
+# lives in vco_lib.install_weaviate; install.py keeps a thin wrapper that
+# supplies its logger + adds the returned deferral to the run report (the
+# install.py main()/total ratchet keeps substantive logic out of install.py).
+#
+# FIELD REPORT (Fabio, Windows CPU-only, v0.2.72→v0.2.88): 5 projects carried a
+# pre-migration top-level `<project>/.mcp.json` (KG_COLLECTION=FabioKnowledge,
+# SHARED_KG_COLLECTION empty, WEAVIATE_URL=http://localhost:8080) that OVERRODE
+# the correctly-migrated `.claude/settings.json` (:8081 + per-project collection
+# + shared active). `.mcp.json` has PRECEDENCE over settings.json for MCP env
+# (Anthropic's project-scoped config; VCO only READS it, never writes/manages
+# it — it is NOT in templates/ or the bundle manifest). So every hybrid_search
+# hit the OLD Weaviate :8080 with the empty SHARED → shared-KG merge silently
+# OFF → cross-project memory invisible.
+
+
+# Back-compat re-exports so the `install.<name>` accessors keep resolving.
+_MCP_JSON_STALE_ENV_KEYS = _install_weaviate.MCP_JSON_STALE_ENV_KEYS
+_resolve_settings_weaviate_env = _install_weaviate.resolve_settings_weaviate_env
+_mcp_json_weaviate_env_is_stale = _install_weaviate.mcp_json_weaviate_env_is_stale
+
+
+def _check_stale_mcp_json_shadow(
+    project_root: Path,
+    deferral_report: "DeferralReport",
+) -> None:
+    """Thin wrapper over
+    :func:`vco_lib.install_weaviate.quarantine_stale_mcp_json_shadow`.
+
+    v0.2.89 FIX 2. Delegates the detect + backup + quarantine of an orphan
+    `<project>/.mcp.json` weaviate-kg block that shadows the migrated
+    `.claude/settings.json`, then adds the returned deferral entry (if any) to
+    the run report. Soft-fail throughout — the vco_lib helper returns None on
+    any ambiguity / leave-alone leg, leaving `.mcp.json` untouched.
+    """
+    entry = _install_weaviate.quarantine_stale_mcp_json_shadow(
+        project_root,
+        log_event=_log_install_event,
+        print_fn=print,
+    )
+    if entry is not None:
+        deferral_report.add_entry(entry)
 
 
 # ---------------------------------------------------------------------------
