@@ -131,6 +131,15 @@ class AdoptCaseDifferentSharedKgTests(unittest.TestCase):
     place when the canonical default is capital-C."""
 
     def setUp(self):
+        # v0.2.89: stub the bounded Weaviate-readiness gate. These tests stub
+        # the seed machinery, not the gate; without this, runners with no live
+        # Weaviate burn the 150s deadline and raise (and machines WITH one
+        # leak a live probe into a hermetic test).
+        _gate = mock.patch.object(
+            install, "_wait_for_weaviate_ready", lambda *a, **k: True
+        )
+        _gate.start()
+        self.addCleanup(_gate.stop)
         _Handler.schema = {"classes": []}
         _Handler.posted = []
         _Handler.fail_post = False
@@ -305,6 +314,15 @@ class AdoptCaseDifferentPerProjectKgTests(unittest.TestCase):
     per-project triple)."""
 
     def setUp(self):
+        # v0.2.89: stub the bounded Weaviate-readiness gate. These tests stub
+        # the seed machinery, not the gate; without this, runners with no live
+        # Weaviate burn the 150s deadline and raise (and machines WITH one
+        # leak a live probe into a hermetic test).
+        _gate = mock.patch.object(
+            install, "_wait_for_weaviate_ready", lambda *a, **k: True
+        )
+        _gate.start()
+        self.addCleanup(_gate.stop)
         _Handler.schema = {"classes": []}
         _Handler.posted = []
         _Handler.fail_post = False

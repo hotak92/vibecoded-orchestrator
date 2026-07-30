@@ -89,6 +89,15 @@ class SeedDiffGateTest(unittest.TestCase):
     """CI-10: _seed_weaviate diff gate logic tests."""
 
     def setUp(self):
+        # v0.2.89: stub the bounded Weaviate-readiness gate. These tests stub
+        # the seed machinery, not the gate; without this, runners with no live
+        # Weaviate burn the 150s deadline and raise (and machines WITH one
+        # leak a live probe into a hermetic test).
+        _gate = mock.patch.object(
+            install, "_wait_for_weaviate_ready", lambda *a, **k: True
+        )
+        _gate.start()
+        self.addCleanup(_gate.stop)
         self.tmp = tempfile.mkdtemp()
         os.environ["VCT_STATE_DIR"] = self.tmp
         # Minimal matching env to simulate "no context change".
@@ -343,6 +352,15 @@ class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
     """
 
     def setUp(self):
+        # v0.2.89: stub the bounded Weaviate-readiness gate. These tests stub
+        # the seed machinery, not the gate; without this, runners with no live
+        # Weaviate burn the 150s deadline and raise (and machines WITH one
+        # leak a live probe into a hermetic test).
+        _gate = mock.patch.object(
+            install, "_wait_for_weaviate_ready", lambda *a, **k: True
+        )
+        _gate.start()
+        self.addCleanup(_gate.stop)
         self.tmp = tempfile.mkdtemp()
         os.environ["VCT_STATE_DIR"] = self.tmp
         os.environ["ACTIVE_EMBEDDING"] = "qwen3"

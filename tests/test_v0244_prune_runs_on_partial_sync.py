@@ -76,6 +76,15 @@ class PruneRunsOnPartialSyncTest(unittest.TestCase):
     """V44-A: _prune_stale_kg_rows IS invoked on the partial-sync branch."""
 
     def setUp(self) -> None:
+        # v0.2.89: stub the bounded Weaviate-readiness gate. These tests stub
+        # the seed machinery, not the gate; without this, runners with no live
+        # Weaviate burn the 150s deadline and raise (and machines WITH one
+        # leak a live probe into a hermetic test).
+        _gate = mock.patch.object(
+            install, "_wait_for_weaviate_ready", lambda *a, **k: True
+        )
+        _gate.start()
+        self.addCleanup(_gate.stop)
         self._tmpdir = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmpdir.name)
         # Stage env so the diff-gate's "context unchanged" check passes.
