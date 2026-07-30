@@ -50,10 +50,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # _ensure_collections / _seed_weaviate_impl, both OUTSIDE main()). Same
 # "inseparable thin-shim" precedent as the Step-4c / codegraph-ts lines. Re-pinned
 # UP to the new measured span.
-# v0.2.89 wave-2 P1 (+7): the two seed subprocess call-sites gained
-# KG_SYNC_PROJECT_ROOT env pins (BUG-3 wrong-project fix — the pin must ride
-# the exact subprocess env construction in main()'s seed flow; the substantive
-# root-resolution logic lives in templates/scripts/sync_knowledge_graph.py).
+# v0.2.89 wave-2 re-pin (1678 → 1687, +9) — attribution corrected per the
+# wave-2 review (F2): the +9 span is NOT wave-2 work. It came from WAVE-1's
+# install.py follow-up (ebbeaa7a — soft-fail quarantine reaches user
+# projects + background-embed footer glue in main()), which landed WITHOUT
+# re-pinning: the ratchet was already RED at the wave-2 base (measured 1687
+# vs the 1678 pin). Wave-2 P1's KG_SYNC_PROJECT_ROOT seed pins added +0
+# here — both seed sites live OUTSIDE main()
+# (_seed_weaviate_shared_kg_only ~:15171 and _seed_weaviate_impl ~:15703;
+# main() spans ~5471–7157). The original re-pin commit (332e362f)
+# misattributed the growth to the P1 seed pins.
 _MAIN_SPAN_MAX = 1687
 
 # TOTAL: strict — measured exactly, no headroom. Additions require
@@ -137,10 +143,19 @@ _MAIN_SPAN_MAX = 1687
 #       REPORT header comment. Same "inseparable thin-shim" precedent as the
 #       R8 / 5c / codegraph-ts lines above. Pinned to the measured value with no
 #       headroom per the "TOTAL: strict — measured exactly" contract.
-# v0.2.89 wave-2 P1 (+49): KG_SYNC_PROJECT_ROOT env pins at both seed
-# subprocess sites + their explanatory comments (BUG-3 wrong-project fix).
-# Inseparable seed-site glue — the substantive logic ships in
-# templates/scripts/sync_knowledge_graph.py + the kg-sync wrappers.
+# v0.2.89 wave-2 re-pin (24316 → 24365, +49) — attribution corrected per
+# the wave-2 review (F2): TWO components, misattributed as one by the
+# original re-pin commit (332e362f).
+#   (1) WAVE-1 follow-up, +32: the soft-fail/.mcp.json-quarantine review
+#       round (ebbeaa7a — quarantine reaches user projects, background-embed
+#       footer) grew install.py 24316 → 24348 WITHOUT re-pinning — a
+#       base-RED episode (the ratchet was already failing at the wave-2
+#       base, independent of wave-2 work).
+#   (2) WAVE-2 P1, +17: the KG_SYNC_PROJECT_ROOT env pins at both seed
+#       subprocess sites + their explanatory comments (BUG-3 wrong-project
+#       fix; inseparable seed-site glue — the substantive root-resolution
+#       logic ships in templates/scripts/sync_knowledge_graph.py + the
+#       kg-sync wrappers), ALL outside main() (+0 span).
 _TOTAL_LINES_MAX = 24365
 
 

@@ -44,7 +44,9 @@ pub(crate) struct BindingReconcileReport {
     pub probe_failed: bool,
     /// CG bindings restored to their evidence-backed historical prefix.
     pub bindings_repaired: usize,
-    /// Projects left with an honest `codegraph_binding_phantom` deferral.
+    /// `codegraph_binding_phantom` deferrals actually WRITTEN (wave-2 F8:
+    /// emissions only — a phantom project with no resolvable repo root, or
+    /// a failed emit, is logged but not counted).
     pub phantom_deferrals: usize,
     /// `kg_collection_access` rows rewritten back from v0.2.49 phantom
     /// names to their binding-backed siblings.
@@ -433,11 +435,10 @@ pub(crate) async fn reconcile_half_renamed_bindings_at_boot(
                 }
             }
             RepairDecision::Phantom => {
-                report.phantom_deferrals += 1;
                 eprintln!(
                     "[vct] binding-reconcile: project {:?} has a phantom \
                      codegraph prefix {:?} and no evidence-backed restoration \
-                     candidate; leaving it alone (deferral emitted)",
+                     candidate; leaving it alone",
                     project.name,
                     binding
                         .as_ref()
@@ -481,14 +482,18 @@ pub(crate) async fn reconcile_half_renamed_bindings_at_boot(
                         command_to_apply: &cmd,
                         severity: "warning",
                     };
-                    if let Err(e) =
-                        crate::services::deferral::emit_deferral_entry(root, folder, &fields)
+                    // Wave-2 review F8: count only ACTUAL emissions — the
+                    // boot log line reports "phantom deferrals: N" as
+                    // written entries, so a missing repo root or a failed
+                    // emit must not inflate the counter.
+                    match crate::services::deferral::emit_deferral_entry(root, folder, &fields)
                     {
-                        eprintln!(
+                        Ok(()) => report.phantom_deferrals += 1,
+                        Err(e) => eprintln!(
                             "[vct] binding-reconcile: phantom deferral emit failed \
                              (non-fatal): {}",
                             e
-                        );
+                        ),
                     }
                 }
             }

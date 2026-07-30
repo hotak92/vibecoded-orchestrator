@@ -82,7 +82,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   launcher pins it per project), then legacy `KG_BASE_DIR`, then script
   location — and every run banners which root it resolved and via which
   channel. A run against a root with no `knowledge/` or docs now exits 2
-  instead of "succeeding" against the wrong tree.
+  instead of "succeeding" against the wrong tree. After updating to
+  v0.2.89, restart the launcher before triggering syncs — a still-running
+  pre-.89 launcher binary combined with the new wrapper can coherently
+  misroot GUI syncs to the orchestrator root (bannered, no
+  cross-contamination) — and note the old manual-seed pattern
+  (`export KG_BASE_DIR` + the orchestrator wrapper) is superseded by
+  `--project-root`.
 
 - **Windows code-graph builds failed 10/10 with `os error 193`.** The
   build path spawned the `.ps1` analyzer directly (not a Win32 executable).

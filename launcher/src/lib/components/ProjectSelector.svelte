@@ -326,19 +326,26 @@
   });
 
   function handleClickOutside(e: MouseEvent) {
-    // BUG-5 (v0.2.89): a click target that is no longer in the document can
-    // never be a legitimate outside click — bail. Confirmed mechanism: real
-    // (UA-dispatched) clicks run a microtask checkpoint BETWEEN listeners, so
-    // Svelte 5's microtask render flush lands between the delegated pencil
-    // handler (startRename → {#if renamingId === p.id} subtree swap) and this
-    // window bubble listener. The pencil button is detached by the time we
-    // run, `wrapperEl.contains(e.target)` is false, and the dropdown closed
-    // on every rename click. (Synthetic `dispatchEvent` clicks do NOT
-    // interleave the checkpoint — which is why a component test can't catch
-    // this; verified against svelte 5.56.0.)
-    const target = e.target as Node | null;
-    if (target && !target.isConnected) return;
-    if (open && wrapperEl && !wrapperEl.contains(target)) {
+    // BUG-5 (v0.2.89): real (UA-dispatched) clicks run a microtask
+    // checkpoint BETWEEN listeners, so Svelte 5's microtask render flush
+    // lands between the delegated pencil handler (startRename →
+    // {#if renamingId === p.id} subtree swap) and this window bubble
+    // listener. The pencil button is detached by the time we run, so a
+    // containment check against `e.target` read every rename click as an
+    // outside click and closed the dropdown. (Synthetic `dispatchEvent`
+    // clicks do NOT interleave the checkpoint — which is why a component
+    // test can't catch the detach; verified against svelte 5.56.0.)
+    //
+    // Wave-2 review F6: decide with `e.composedPath()` instead of the
+    // earlier `!target.isConnected` bail. The path is CAPTURED AT DISPATCH
+    // TIME, so it is immune to the microtask-detach: the pencil's
+    // ancestor chain still includes wrapperEl even after the subtree swap
+    // (rename click stays "inside"), while a GENUINE outside click whose
+    // target detaches for unrelated reasons before this listener runs
+    // still closes the dropdown (its dispatch-time path never contained
+    // wrapperEl) — strictly better than the isConnected bail, which left
+    // the dropdown open in that case.
+    if (open && wrapperEl && !e.composedPath().includes(wrapperEl)) {
       open = false;
     }
   }

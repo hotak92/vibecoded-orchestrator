@@ -10036,13 +10036,22 @@ def install_project_bundle(
             # Unregistered, unpinned folders (incl. every test fixture and
             # standalone first-installs) skip the step entirely — it re-arms
             # on the next update once the env projection has landed.
+            #
+            # Wave-2 review F3 (TOCTOU): the gate's resolver result is USED,
+            # not discarded — when the launcher.db resolution succeeds, ITS
+            # names feed the operations below (a second, independent
+            # resolution could fail mid-window and fall to the name-DERIVED
+            # tier the gate exists to forbid). The binding-first resolver
+            # runs only on the env-pin leg, where its tier 2 (the same
+            # settings-env pin that armed the gate) is the intended source.
             _identity_pinned = False
+            _pinned_names: Optional[dict] = None
             try:
                 from vco_lib.config_projection import (
                     resolve_collection_names_for_folder as _rcnff,
                 )
-                _rcnff(folder)  # raises when unregistered / db unreachable
-                _identity_pinned = True
+                _pinned_names = _rcnff(folder)  # raises when unregistered /
+                _identity_pinned = True        # db unreachable
             except Exception:  # noqa: BLE001 — fall through to the env pin
                 _kg_pin = _res_env.get("KG_COLLECTION")
                 _identity_pinned = (
@@ -10057,9 +10066,17 @@ def install_project_bundle(
                      "residue/foreign-row step skipped: collection identity "
                      "not pinned (unregistered folder, no settings env pin)")
             else:
-                _res_names = _resolve_bundle_collection_names_binding_first(
-                    project_name or folder.name, folder,
-                )
+                if _pinned_names is not None:
+                    # Single resolution (F3): the gate's authoritative
+                    # launcher.db names ARE the operation names.
+                    _res_names = dict(_pinned_names)
+                else:
+                    # Env-pin leg: offline-deterministic — tier 2 of the
+                    # binding-first resolver reads the same settings-env
+                    # KG_COLLECTION pin that armed the gate.
+                    _res_names = _resolve_bundle_collection_names_binding_first(
+                        project_name or folder.name, folder,
+                    )
                 _res_weaviate_url = (
                     (_res_env.get("WEAVIATE_URL") or "").strip()
                     or _weaviate_url_default()
@@ -10076,6 +10093,11 @@ def install_project_bundle(
                         folder,
                         _res_weaviate_url,
                         _res_names.get("kg_collection", ""),
+                        # Wave-2 review F1: the cleanup shares the prune
+                        # leg's shared-identity guard — a non-root project
+                        # whose KG identity IS the shared collection must
+                        # never have its curated rows deleted.
+                        shared_kg_collection=_res_shared,
                         dry_run=dry_run,
                         orchestrator_root=orchestrator_root,
                         is_root_target=False,

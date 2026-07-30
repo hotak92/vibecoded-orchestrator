@@ -118,7 +118,7 @@ class ResidueCleanupBase(unittest.TestCase):
             "concepts/foo.md": [self.foo_sig],
         })
 
-    def _run(self, *, dry_run=False, fake=None, kg=_KG,
+    def _run(self, *, dry_run=False, fake=None, kg=_KG, shared=None,
              is_root_target=False, shared_read_disabled=False,
              registry_path=None):
         fake = fake or _FakeWeaviateHTTP(
@@ -130,6 +130,7 @@ class ResidueCleanupBase(unittest.TestCase):
                 self.project,
                 _URL,
                 kg,
+                shared_kg_collection=shared,
                 dry_run=dry_run,
                 is_root_target=is_root_target,
                 shared_read_disabled=shared_read_disabled,
@@ -246,6 +247,34 @@ class LeaveAloneTests(ResidueCleanupBase):
         self.assertEqual(result["skipped"], "shared-read disabled")
         self.assertTrue((self.knowledge / "concepts" / "foo.md").exists())
         self.assertEqual(fake.calls, [])
+
+    def test_shared_identity_collection_skips(self):
+        """Wave-2 review F1 leave-alone leg: a NON-root project whose KG
+        collection IS the shared collection (real topology: a second
+        orchestrator clone registered as a project in another install's
+        launcher) carries the full curated set on disk — its rows are the
+        machine-wide canonical curated set. The cleanup must skip entirely:
+        zero HTTP calls, zero deletions, files intact, no deferral.
+        Case-insensitive (mirror of the prune leg's §7.3 guard)."""
+        result, fake = self._run(kg="Shared_KG", shared="shared_kg")
+        self.assertEqual(result["skipped"], "shared-identity collection")
+        self.assertEqual(fake.calls, [],
+                         "zero HTTP calls on the shared-identity gate")
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["rows_deleted"], 0)
+        self.assertTrue(
+            (self.knowledge / "concepts" / "foo.md").exists(),
+            "curated files must survive on a shared-identity project",
+        )
+        self.assertEqual(self._deferred_text(), "",
+                         "one log line, no deferral spam")
+
+    def test_empty_shared_collection_does_not_skip(self):
+        """Empty shared name = 'no shared collection' → the shared-identity
+        gate must NOT fire; the cleanup proceeds normally."""
+        result, _ = self._run(shared="")
+        self.assertIsNone(result["skipped"])
+        self.assertEqual(result["removed"], ["concepts/foo.md"])
 
     def test_shared_read_disabled_resolved_from_settings(self):
         settings = self.project / ".claude" / "settings.json"
@@ -443,6 +472,12 @@ class BundleWiringTests(unittest.TestCase):
         self.assertEqual(args[2], "WireProj_KnowledgeGraph",
                          "kg_collection must come from the pinned identity")
         self.assertIs(kwargs["is_root_target"], False)
+        # Wave-2 review F1: the resolved shared collection must be threaded
+        # into the cleanup so its shared-identity guard can fire (no
+        # SHARED_KG_COLLECTION in settings env → the canonical default).
+        self.assertEqual(
+            kwargs["shared_kg_collection"], project_init._SHARED_KG_NAME,
+        )
         self.assertIn("residue_cleanup", result)
         self.assertIn("foreign_rows", result)
 

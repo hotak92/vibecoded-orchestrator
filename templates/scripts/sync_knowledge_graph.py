@@ -713,11 +713,16 @@ def _shipped_secondary_slots(knowledge_root: Path, active_slot: str) -> List[str
 
     v0.2.89 §8.5: candidates come from the ``.node_embeddings.<slot>.json``
     files actually present (each is still subject to the file-level slot
-    guard in ``_load_shipped_embeddings``). Slots not in the canonical
-    ``KG_NAMED_VECTORS`` catalog are dropped when the catalog is importable —
-    a sidecar for a slot the collection schema lacks would fail the whole
-    insert, which is strictly worse than ignoring it. Soft-fail: any error
-    returns [] (active-slot-only behaviour, exactly pre-v0.2.89).
+    guard in ``_load_shipped_embeddings``). Slots are filtered against the
+    ``KG_NAMED_VECTORS`` CODE catalog — the static set of slots the codebase
+    can ever configure — NOT the live collection schema. A pre-v0.2.18
+    collection could therefore still lack a catalog slot and fail the
+    insert; that residual exposure is identical to the dual-write COMPUTE
+    path's (which populates the same catalog slots without a schema check),
+    so shipped ingest is no worse than a normal sync there. A live-schema
+    intersection was considered and skipped: an extra schema roundtrip per
+    run buys protection only for that near-nil pre-v0.2.18 case. Soft-fail:
+    any error returns [] (active-slot-only behaviour, exactly pre-v0.2.89).
     """
     slots: List[str] = []
     try:
@@ -2253,19 +2258,23 @@ def _finish_shared_scope_write(server: "WeaviateMCPServer", fp_value: str) -> No
 
 
 def _notice_leftover_shared_rows(server: "WeaviateMCPServer", fp_value: str) -> None:
-    """shared → project transition notice (NO delete — conservative gate).
+    """Leftover-shared-rows notice (NO delete — conservative gate).
 
-    After a successful PROJECT-collection write, probe the shared collection
-    for rows with the same ``file_path``. If any exist, print a one-line
-    notice: they may be leftovers from a removed ``scope: shared`` key — or
-    a colliding sibling project's legitimate shared rows (``file_path`` is
-    not project-qualified in the shared store), which is exactly why they
-    are NEVER auto-deleted here. Soft-fail: any probe error is silent.
+    Probe the shared collection for rows with the same ``file_path``. If
+    any exist, print a one-line notice: they may be leftovers from a
+    removed ``scope: shared`` key — or a colliding sibling project's
+    legitimate shared rows (``file_path`` is not project-qualified in the
+    shared store), which is exactly why they are NEVER auto-deleted here.
+    Soft-fail: any probe error is silent.
 
-    Only called on the full-write path — removing a ``scope: shared`` key
-    changes the content signature, so the first post-flip sync always takes
-    the full-write path and the notice fires exactly when it matters;
-    subsequent unchanged syncs hit the embed-skip fast path and stay quiet.
+    Called on the full-write PROJECT-routed path (removing a
+    ``scope: shared`` key changes the content signature, so the first
+    post-flip sync always takes the full-write path and the notice fires
+    exactly when it matters; subsequent unchanged syncs hit the embed-skip
+    fast path and stay quiet) AND on the archived-node skip path when the
+    node declares ``scope: shared`` (wave-2 review F8 — archiving a shared
+    node never auto-deletes its shared rows; this makes the persistence
+    visible instead of silent).
     """
     if not SHARED_COLLECTION_NAME or SHARED_COLLECTION_NAME == COLLECTION_NAME:
         return
@@ -2280,9 +2289,13 @@ def _notice_leftover_shared_rows(server: "WeaviateMCPServer", fp_value: str) -> 
             print(
                 f"   ℹ️  {n} row(s) for '{fp_value}' remain in shared "
                 f"collection '{SHARED_COLLECTION_NAME}' — not auto-deleted "
-                f"(a sibling project may own them). If this node was "
-                f"previously `scope: shared`, remove them manually (e.g. "
-                f"delete-by-file_path via the launcher's Weaviate panel)."
+                f"(a sibling project may own them; and if this file_path "
+                f"collides with a curated path, the shared rows may be the "
+                f"ROOT's canonical curated node). If this node was "
+                f"previously `scope: shared`, verify the shared rows' "
+                f"title/content actually match this node before any manual "
+                f"delete (e.g. delete-by-file_path via the launcher's "
+                f"Weaviate panel)."
             )
     except Exception:
         pass
@@ -2437,6 +2450,22 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
                     print(f"  ↳ Removed {removed} prior Weaviate entry(ies) for '{fp_value}'")
             except Exception as e:
                 print(f"  ↳ Could not remove prior Weaviate entry: {e}")
+            # Wave-2 review F8: an archived `scope: shared` node's SHARED
+            # rows are never auto-deleted (collision class — see the
+            # `_node_scope` contract block); surface the persistence with
+            # the one-line leftover-rows notice instead of staying silent.
+            # Frontmatter isn't parsed on this path — sniff the scope key,
+            # soft-fail (any read/parse error ⇒ no notice).
+            try:
+                fm, _fm_body = parse_frontmatter(
+                    file_path.read_text(encoding="utf-8")
+                )
+                if _node_scope(fm or {})[0] == "shared":
+                    _notice_leftover_shared_rows(
+                        server, _relative_file_path(file_path)
+                    )
+            except Exception:
+                pass
             return True  # not a sync failure — intentional skip
 
         # Read, auto-update `updated:` timestamp, write back, then parse
@@ -2461,6 +2490,19 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
                     print(f"  ↳ Removed {removed} prior Weaviate entry(ies) for '{fp_value}'")
             except Exception as e:
                 print(f"  ↳ Could not remove prior Weaviate entry: {e}")
+            # Wave-2 review F8: same shared-rows visibility as the
+            # path-based archive branch above — an archived `scope: shared`
+            # node's shared rows persist by design (never auto-deleted);
+            # say so instead of staying silent.
+            try:
+                if _node_scope(node_data)[0] == "shared":
+                    _notice_leftover_shared_rows(
+                        server,
+                        node_data.get("file_path")
+                        or _relative_file_path(file_path),
+                    )
+            except Exception:
+                pass
             return True
 
         # ── v0.2.89 BUG 6: per-node target selection (`scope:` frontmatter).
@@ -2485,6 +2527,9 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
             and SHARED_COLLECTION_NAME
             and _resolve_shared_kg_write_disabled()
         ):
+            # NOT dead: consumed by the finally-block ToolUsageLogger row
+            # (success=error_msg is None, error=error_msg) — removing it
+            # would log this refused write as success=True.
             error_msg = "shared KG writes disabled (SHARED_KG_WRITE_DISABLED)"
             print(
                 "❌ scope: shared refused — shared KG writes are disabled for "
@@ -2501,6 +2546,8 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
             if matrix_note:
                 print(f"   ⚠️  {matrix_note}")
             if not matrix_allowed:
+                # NOT dead: consumed by the finally-block ToolUsageLogger
+                # row — see the write-gate branch above.
                 error_msg = "access matrix denies shared write"
                 print(
                     f"❌ scope: shared refused — the launcher's access matrix "

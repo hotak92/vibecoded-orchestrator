@@ -26,6 +26,14 @@ Data-safety invariants (binding, from PLAN-fabio-wave2-2026-07-30 §7.2):
 * Gates, in order — any miss ⇒ skip with one log line:
   1. NOT a root bundle target (the root's ``knowledge/`` IS the canonical
      materialization of the shared collection).
+  1b. The project's KG collection is NOT the shared collection
+     (case-insensitive; wave-2 review F1 — mirror of the prune leg's §7.3
+     shared-identity guard). A non-root project whose KG identity == the
+     shared collection (real topology: a second orchestrator clone
+     registered as a project in another install's launcher) carries the
+     full curated set on disk, and its "residue" rows ARE the canonical
+     curated rows every project on the machine reads. An empty shared
+     name means "no shared collection" → no skip.
   2. The project has NOT opted out of shared reads
      (``SHARED_KG_READ_DISABLED != true`` — an accept-loss project's on-disk
      copies are its ONLY curated access).
@@ -375,6 +383,7 @@ def cleanup_bundled_knowledge_residue(
     weaviate_url: str,
     kg_collection: str,
     *,
+    shared_kg_collection: Optional[str] = None,
     dry_run: bool = False,
     orchestrator_root: Optional[Path] = None,
     is_root_target: Optional[bool] = None,
@@ -429,6 +438,25 @@ def cleanup_bundled_knowledge_residue(
         result["skipped"] = "root target"
         _log_line(log_event, "ok",
                   "residue cleanup skipped: root bundle target")
+        return result
+
+    # Gate 1b — shared-identity KG (wave-2 review F1; mirrors
+    # collection_repair.prune_foreign_rows_for_project's §7.3 guard). When
+    # this project's KG collection IS the shared collection, its on-disk
+    # curated set is a MATERIALIZATION of the shared store — deleting rows
+    # keyed on those file_paths would destroy the canonical curated rows +
+    # vectors for every project on the machine. Skip entirely: one log
+    # line, no deferral. Empty shared name = "no shared collection" → no
+    # skip. Case-insensitive: Weaviate class names cannot differ by case
+    # only, and case-insensitive equality is the more conservative reading.
+    _kg_norm = str(kg_collection or "").strip()
+    _shared_norm = str(shared_kg_collection or "").strip()
+    if _kg_norm and _shared_norm and _kg_norm.lower() == _shared_norm.lower():
+        result["skipped"] = "shared-identity collection"
+        _log_line(log_event, "ok",
+                  f"residue cleanup skipped: KG collection {_kg_norm!r} IS "
+                  "the shared collection (its rows are the machine-wide "
+                  "canonical curated set)")
         return result
 
     # Gate 2 — accept-loss projects keep their on-disk copies (their ONLY

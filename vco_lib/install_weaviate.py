@@ -137,18 +137,19 @@ def _compute_on_disk_content_hashes(knowledge_root: Path) -> "dict[str, str]":
     detect drift purely by hash comparison regardless of the stored path format
     as long as we match the key consistently).
     """
-    import hashlib
-    import re as _re
+    from vco_lib.knowledge_residue import content_signature_excluding_updated
 
     def _sig(text: str) -> str:
-        """Mirror of sync_knowledge_graph.py::_content_signature_excluding_updated."""
-        if not text.strip().startswith("---"):
-            return hashlib.sha256(text.encode("utf-8")).hexdigest()
-        parts = text.split("---", 2)
-        if len(parts) < 3:
-            return hashlib.sha256(text.encode("utf-8")).hexdigest()
-        fm_no_updated = _re.sub(r"^updated:.*$\n?", "", parts[1], flags=_re.MULTILINE)
-        return hashlib.sha256((fm_no_updated + parts[2]).encode("utf-8")).hexdigest()
+        """Delegate to the vco_lib home of the storage-layer signature.
+
+        Wave-2 review F4: this was a third, parity-UNLOCKED copy of the
+        content signature (``knowledge_residue.content_signature_excluding_
+        updated`` is the vco_lib home; the sync-script mirror is
+        parity-locked to it by ``tests/test_v0289_curated_hash_registry.py``).
+        The local name/signature is kept so the call-site below stays
+        stable.
+        """
+        return content_signature_excluding_updated(text)
 
     result: dict[str, str] = {}
     if not knowledge_root.exists():
