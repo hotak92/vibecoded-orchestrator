@@ -21,7 +21,7 @@ byte-equivalent (modulo the machine-written ``updated:`` line) to a version
 VCO itself shipped, and the identical content remains available to the
 project via the unconditional shared-KG read fan-out.
 
-Data-safety invariants (binding, from PLAN-fabio-wave2-2026-07-30 §7.2):
+Data-safety invariants (binding, from the 2026-07-30 wave-2 plan §7.2):
 
 * Gates, in order — any miss ⇒ skip with one log line:
   1. NOT a root bundle target (the root's ``knowledge/`` IS the canonical

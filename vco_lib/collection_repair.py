@@ -12,7 +12,7 @@ fix (wave-2 P1) removes every path to the class; this module heals the
 EXISTING damage: rows whose ``file_path`` does not exist on disk under the
 project are stale/foreign and are deleted.
 
-Guards (binding, from PLAN-fabio-wave2-2026-07-30 §7.3):
+Guards (binding, from the 2026-07-30 wave-2 plan §7.3):
 
 * Rows whose file EXISTS on disk are NEVER touched (even if content
   drifted — normal sync owns that).
