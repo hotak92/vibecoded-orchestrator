@@ -1,4 +1,4 @@
-# PowerShell wrapper for sync_knowledge_graph.py (Windows equivalent of kg-sync)
+﻿# PowerShell wrapper for sync_knowledge_graph.py (Windows equivalent of kg-sync)
 # Usage: .\kg-sync.ps1 FILE
 #        .\kg-sync.ps1 --all
 #

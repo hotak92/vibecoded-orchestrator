@@ -50,7 +50,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # _ensure_collections / _seed_weaviate_impl, both OUTSIDE main()). Same
 # "inseparable thin-shim" precedent as the Step-4c / codegraph-ts lines. Re-pinned
 # UP to the new measured span.
-_MAIN_SPAN_MAX = 1678
+# v0.2.89 wave-2 P1 (+7): the two seed subprocess call-sites gained
+# KG_SYNC_PROJECT_ROOT env pins (BUG-3 wrong-project fix — the pin must ride
+# the exact subprocess env construction in main()'s seed flow; the substantive
+# root-resolution logic lives in templates/scripts/sync_knowledge_graph.py).
+_MAIN_SPAN_MAX = 1687
 
 # TOTAL: strict — measured exactly, no headroom. Additions require
 # extraction to vco_lib, not a bump.
@@ -133,7 +137,11 @@ _MAIN_SPAN_MAX = 1678
 #       REPORT header comment. Same "inseparable thin-shim" precedent as the
 #       R8 / 5c / codegraph-ts lines above. Pinned to the measured value with no
 #       headroom per the "TOTAL: strict — measured exactly" contract.
-_TOTAL_LINES_MAX = 24316
+# v0.2.89 wave-2 P1 (+49): KG_SYNC_PROJECT_ROOT env pins at both seed
+# subprocess sites + their explanatory comments (BUG-3 wrong-project fix).
+# Inseparable seed-site glue — the substantive logic ships in
+# templates/scripts/sync_knowledge_graph.py + the kg-sync wrappers.
+_TOTAL_LINES_MAX = 24365
 
 
 def _measure() -> tuple:
