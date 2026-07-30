@@ -10006,6 +10006,103 @@ def install_project_bundle(
              f"entries (files left on disk, read via shared collection)",
              data={"count": len(knowledge_retired)})
 
+    # ── v0.2.89 §7 (Fabio wave-2): bundled-knowledge residue cleanup +
+    # BUG-3 foreign-row repair. NON-root targets only; placed AFTER the
+    # orphan/retirement machinery by design — the v0.2.81 `knowledge-retired`
+    # branch above owns the MANIFEST transition, this step owns the
+    # disk+Weaviate residue independently of manifest state (one mechanism
+    # covers both never-updated and already-retired projects). Fully
+    # soft-fail: this step must NEVER fail the bundle update. Gate details
+    # (root target, SHARED_KG_READ_DISABLED, registry, Weaviate probe,
+    # rows-before-file ordering) live in `vco_lib.knowledge_residue`;
+    # foreign-row guards (shared-identity skip, absolute/`..` defense) in
+    # `vco_lib.collection_repair`.
+    if not is_root_target:
+        try:
+            from vco_lib import collection_repair as _crep
+            from vco_lib import knowledge_residue as _kres
+
+            _res_env = _kres.project_settings_env(folder)
+
+            # POSITIVE identity pin required (conservative-defaults rule):
+            # both sub-steps delete Weaviate rows keyed on the project's KG
+            # identity. A tier-3 NAME-DERIVED identity is a guess — for a
+            # renamed project (names immutable post-creation, §5) the guess
+            # targets a collection that doesn't exist, so "rows first"
+            # would delete zero rows and then delete the FILE, orphaning
+            # the real embeddings — exactly the §7.2 asymmetry this step
+            # exists to avoid. Pin sources: launcher.db primary binding
+            # (tier 1) or the settings.json env KG_COLLECTION pin (tier 2).
+            # Unregistered, unpinned folders (incl. every test fixture and
+            # standalone first-installs) skip the step entirely — it re-arms
+            # on the next update once the env projection has landed.
+            _identity_pinned = False
+            try:
+                from vco_lib.config_projection import (
+                    resolve_collection_names_for_folder as _rcnff,
+                )
+                _rcnff(folder)  # raises when unregistered / db unreachable
+                _identity_pinned = True
+            except Exception:  # noqa: BLE001 — fall through to the env pin
+                _kg_pin = _res_env.get("KG_COLLECTION")
+                _identity_pinned = (
+                    isinstance(_kg_pin, str) and bool(_kg_pin.strip())
+                )
+
+            if not _identity_pinned:
+                _skip = {"skipped": "collection identity not pinned"}
+                result["residue_cleanup"] = dict(_skip)
+                result["foreign_rows"] = dict(_skip)
+                _log("4.bundle.residue", "ok",
+                     "residue/foreign-row step skipped: collection identity "
+                     "not pinned (unregistered folder, no settings env pin)")
+            else:
+                _res_names = _resolve_bundle_collection_names_binding_first(
+                    project_name or folder.name, folder,
+                )
+                _res_weaviate_url = (
+                    (_res_env.get("WEAVIATE_URL") or "").strip()
+                    or _weaviate_url_default()
+                )
+                # SHARED_KG_COLLECTION: explicit empty string is a
+                # legitimate "no shared collection" choice — only an ABSENT
+                # key falls back to the canonical default name.
+                _res_shared = _res_env.get("SHARED_KG_COLLECTION")
+                if not isinstance(_res_shared, str):
+                    _res_shared = _SHARED_KG_NAME
+
+                result["residue_cleanup"] = (
+                    _kres.cleanup_bundled_knowledge_residue(
+                        folder,
+                        _res_weaviate_url,
+                        _res_names.get("kg_collection", ""),
+                        dry_run=dry_run,
+                        orchestrator_root=orchestrator_root,
+                        is_root_target=False,
+                        log_event=log_event,
+                    )
+                )
+                result["foreign_rows"] = _crep.prune_foreign_rows_for_project(
+                    folder,
+                    weaviate_url=_res_weaviate_url,
+                    kg_collection=_res_names.get("kg_collection", ""),
+                    development_collection=_res_names.get(
+                        "development_collection", ""
+                    ),
+                    shared_kg_collection=_res_shared,
+                    is_root_target=False,
+                    dry_run=dry_run,
+                    log_event=log_event,
+                )
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            _log("4.bundle.residue", "warn",
+                 f"knowledge-residue/foreign-row step failed (non-fatal): {err}",
+                 data={"error": err})
+            result["warnings"].append(
+                f"knowledge-residue cleanup failed (non-fatal): {err}"
+            )
+
     # Smart-merge settings.json template separately. The template carries
     # the orchestrator's hooks block + permissions defaults. The merge
     # logic mirrors install.py:_merge_settings_template + _smart_merge_settings.

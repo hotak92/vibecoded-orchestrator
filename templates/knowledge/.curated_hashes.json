@@ -1,0 +1,520 @@
+{
+ "files": {
+  "TAG_HIERARCHY.md": [
+   "1795670f608c3462dc05b030f5e8549e926493319ee6a0ba8b8ba13a90558020",
+   "f580a3bb83abd7b49c17ed0fc2a5f15afa9e7e5e4e4361c92785e12b6791af5b"
+  ],
+  "VOCABULARY.md": [
+   "a9430fb1079711914696de5f7c3ccb4fb698c9b0e15fa1c7e742f0258daa3956",
+   "b0b0e7888c79f57858f036ec548fb4f60c3d1b8240c437bb1ddbd5ae4453f54f"
+  ],
+  "concepts/actor-critic.md": [
+   "e8984b101a53db8c562aca267a7480d9b0cbffecc49d6ce5ba5f434812f5070c",
+   "fc09731245015dc2e32d6d3646e7ddce28516f26fb77e0ad61bfbc911862a1d1"
+  ],
+  "concepts/agent-framework-comparison-2026.md": [
+   "3be6972f44a2fb01464737eeef87913a3132438cd3803a0c2507708cbb014cb5",
+   "495eb914e8a5b6a46bb55d488e45719ea57e4e07fceb16d89c2a7f47f9c53f04",
+   "b2af5f89cdac3116ff5c2cd3744a4d8627b5f3af4ee9da6a4c584bbd576ba385"
+  ],
+  "concepts/agent-orchestration.md": [
+   "062a73e689465ceeb7984f7ffc5dad2990abfa56d8736bddb4c6494872f07d6e",
+   "76d73366c1c6e3890d9e0999aa4cb55e59ef8f3df5be0497716fa86f3c39d438",
+   "c33cefcf89c37b68c1a682ac017f8e23e38d94297e405316390d8e6bb6d1872a",
+   "d7c1b25374a013eeac15361b4c372c78225f3b566528124322d7d5da4095825f"
+  ],
+  "concepts/agentic-llm-workflows.md": [
+   "33cecf63634b49a0941936c84d6286a65bcd6cfe0c3b280e53287793963bcaeb",
+   "436422a0778fbb3dba282715bbf73d9dd509dbd609db0dce1a7d389554c3eeb5",
+   "e7bdab94f34891400d7c7131d94baa3e89edc9f22dc4f22e6628d9b6a01cb246"
+  ],
+  "concepts/ai-infrastructure-budget-configurations.md": [
+   "84370f7196852a424009e27dc7632095e93ec53652ecca35084fe54d227ee2ea",
+   "98b2802a85376a9232b0b05ebebb839af9d064930193c2c5a2fd6fcdfd51d687",
+   "a7b70d0d5e123260d33c901dc5a62c369f5d7e5c2705c9b2366be6e3e12f9220"
+  ],
+  "concepts/automation-workflow-design-framework.md": [
+   "36963853d0541a38a73ad726e7f8de48232a0928947002ebdaee964d9cc425fd"
+  ],
+  "concepts/bayesian-inference.md": [
+   "bdc13d8c24f742d581a8a96856fe45645d553054f3a4d7986f206072c7dff3bb",
+   "cc7cf1797500d8cd3072d9cb540c54f9b3a057b90b92cd8ffbe0e074f4e42b37"
+  ],
+  "concepts/blameless-postmortem-methodology.md": [
+   "b65906b3374f1ae970c02acc43f6102480798b3efd7eced288f1981d3c09026b"
+  ],
+  "concepts/brand-identity-system-layers.md": [
+   "0dee946369510fea2af4fadcd254d140d673ba3aec8ca85bc2c34f34658756ea"
+  ],
+  "concepts/build-vs-buy-decision-framework.md": [
+   "896d62e097478af3a5f9adb5701362f0f47d66b4a13fb2a9bd224d0cf3ba9205"
+  ],
+  "concepts/chunking-strategies-llm-rag.md": [
+   "3180281a954c0a45b9423915d2bab765f1477aaddfa2aacfb10c427e378acf9a",
+   "dd7df9be155c7ff879d0ad316e18555e6af54a968b019ea3b322fc1e2ae22e80"
+  ],
+  "concepts/churn-taxonomy-and-tactics.md": [
+   "d5f326626c06633014ce1ed196ddd46f4175d74eed4efcd2fe8e985d56c7756a"
+  ],
+  "concepts/claude-code-workflows-feature.md": [
+   "c55eeb21a307b2271a750a7dcf4c620903526f2f57bb21460d556da70f157a6c",
+   "ead34d5e8b13693d2b0fe7c302d657cd2857a3b816adfcd616afa5a5c4697a34",
+   "f4f36527248b4626397e4a74b4a53f9c7551092ff446aa95fe94f0abfc075536"
+  ],
+  "concepts/common-stats-pitfalls.md": [
+   "5ef45b7919719930e88c5a252d1d39a7ce5e00c0aa0643f8900ce14b21bca981"
+  ],
+  "concepts/constitutional-ai.md": [
+   "1dbc17277f88bc22077f3e6bdf1da5b8273bdbe9ea5df8e92d8bc8ee0f42a4a7",
+   "9b26ea3b3ffaff366021de97a7f2c201bb9ca2b243ae748b12c1ec6f089d8882"
+  ],
+  "concepts/default-on-unparseable-makes-fallbacks-unreachable-2026-06-12.md": [
+   "c6f7f99806a0fd0eb3df7769db942c123d96eb65d1d40b4c5881cc40a65b6de0"
+  ],
+  "concepts/diagnosing-non-deterministic-results.md": [
+   "0d20ad7946ce98d30718b4d911bd24d9e2b7938a1909e300589651e000667c0a"
+  ],
+  "concepts/dimensional-analysis-as-debugging.md": [
+   "69f91a306b4b72e90942882e4e90f031dd49ba3a73623fd5cda7b3e666f00d3a"
+  ],
+  "concepts/dpo-direct-preference-optimization.md": [
+   "0a7288f155f0688812b7d945ba1e53b3528c3b60ace6fcc9aa36a30027a60d72",
+   "5819b0cd537cfcdd529b4e81f88f52ef7432582fc7845de457f7be094223ffdb"
+  ],
+  "concepts/end-of-cycle-dedup-sweep-extract-vs-defer-2026-06-12.md": [
+   "5ec2e0057eb4eaaf9a93d084850589905be5cbe653058a0161b863df719fe61b",
+   "c50944a184234df8189bcadc72cb599353fee6369ca8385f1e9359779205c890"
+  ],
+  "concepts/experimental-design-framework.md": [
+   "824e1852fd88d6bd89a10d7e7e7b52d95a1a6d5270b4f16c6472fd2fbaa56b31"
+  ],
+  "concepts/fine-tuning-techniques-llm.md": [
+   "0aa887e00c50d88f4c584a81433d0773fa7cc239228b389dab2d8f8433b5a918",
+   "a8b4f5af0dcc2415fe884c712a18d6b2a1732251e8898ac11750d305f106d180",
+   "f111ec5d99c288bd77a8499fe9be2d0889206830ef5dcdfff4fbbc5df91a582b"
+  ],
+  "concepts/flashattention.md": [
+   "a1e1ab2be41c0b58b5be98582156169b4031fa5925c260acb3f3b1bd44e40754",
+   "a6da6b5c376b1809b06115c9bbd2ded26e5140bc3b506b6892eff084aa59d91f",
+   "d53fcf13427efba20c1d1f1fa34e4c1e1eda5694d1c25d01f0634217335404b9"
+  ],
+  "concepts/function-calling-reliability-patterns.md": [
+   "9021e5a4ef5134e494f46841111a7a03e5397b9cb9a9726cc9c817cbe1a847af"
+  ],
+  "concepts/gdpr-eu-vat-lite-for-solo-founders.md": [
+   "9219b5d5b8899cea98ec253de4cd010a36fa6eb6ace884831538e38abf255e4c"
+  ],
+  "concepts/generic-per-module-db-architecture.md": [
+   "269dc23780b156356a6cda7181a8edfb8d95ffcb31c31bd6efc93c466dca4a8d",
+   "544645d6c592bfceacb999a5dfbc709153f2a0490e069828fc2097f05e8c6faa",
+   "a3dff4c99842684ea205c201daf2c7145144b16f9c6307bd3eb37a221e21af07"
+  ],
+  "concepts/graphrag-pattern.md": [
+   "260176695016e37a1b6e6a0c055d1761ce1fbef9a91080a29f133022944a94ad",
+   "61e090a25d75d5eb9bd2a93b716556d0fca4b36bb54a78299b060b4bc1436d5e"
+  ],
+  "concepts/hook-discipline-vct-disable-hooks.md": [
+   "53254749e461693ea4affa8a485c1d25ca387b6e34949cb5da33cc5554811653",
+   "a92b37acc98a10228b275547845197ea17b0f89d56b2d570335df6b6e0a2f3e3",
+   "d7bbe86047552c826903f53b1b5a289c5fb37103850ee78f37ef6f29c6aa3987",
+   "e77c42b7bce7890b16ca1cb228855116b6e20d6a6abcb73401596ad3d340f836",
+   "f168c73e8ceefcffda96c6a50691b60dc63282ae97f6f84ce8ec17eccd326cf0"
+  ],
+  "concepts/hpc-job-submission-patterns.md": [
+   "0dd39bb7c28b3033af0d1c469c1469b1d18b9e1f3f5a1b40881da26e6de16cee",
+   "f8039b2540d93ba250f21639c30a40f6cd7d71f4997bd94804b82141c0bb9772"
+  ],
+  "concepts/hybrid-search-keyword-semantic.md": [
+   "46a65820abc246ad99442c4e738e2a6ddb42d265ebc91c04d4e662e0e0a1046b",
+   "7d2f7bb2d4bf61b8122bba07be3b82f32f12160730c15d73424510a20fce8470"
+  ],
+  "concepts/kg-summary-three-tier-pipeline.md": [
+   "27af83fc4fe586d33bcb7ccfc8a2672c1c37734596b1fab840fc0f810c232b89",
+   "9c8c87a097d0477d5aee1bf74db80217c5418391e9078955c64d0fc0bcd0bdc6",
+   "af9bf45e11782abc36284c901349421bfd6b877859dde1a4d17dbf5014c1d9ec",
+   "eb259aba8e5dcc5308e3b4b00d6c9118fa37cd17b694b0587878aec9aea3f309",
+   "fea49eaeb45002c0f2338053e558dfc40476eaa8f696d5991eada66a161381a5"
+  ],
+  "concepts/knowledge-graph.md": [
+   "536904371efcdfc2c84808cb87fbbac0046acf1fee436696361c18ebf3259596",
+   "6f8c50050726889d1755868e6a046c1599ee07b5f3e383f19151c1bcf77a3d60",
+   "99c53f3384772708e9104149e4eecadc6e14d456bc73aa021f0fcfa5962e2edb",
+   "baf51ce7b3202e858d6c5b770e27213f374ce3394a502a418d4185f6e80c8964"
+  ],
+  "concepts/kubernetes-manifest-review-discipline.md": [
+   "307ab30510057b72059d3752b1a5e15c8e61cd7037958a49f6d7ca09733cecc9",
+   "b77fd7a3302c0c4d56b3606a824c0fdd606c833b78a541f325f077002dfb164b"
+  ],
+  "concepts/kubernetes-resource-model-qos-eviction.md": [
+   "51c32738b79b4d2c7f49cf85e3ec80c1cbf9a808f89552875b08b39f99c5166a",
+   "c5eb361a6872dde21fadf9876944045196feb64ee366d7ea74d34be80cc237aa"
+  ],
+  "concepts/launcher-paid-modules-schema.md": [
+   "1beeb0840c9b222b7393ae5c3f58a72dca48a3901c27d79b868bf178d36d5ca1",
+   "467550fa2fbeb88de95c823f651a42dbf6188c4c1f4b673c3e5a307a5f3709b6",
+   "c83c1333e687e80b4f93442691dfd7e09b933ff5144f5a4f1d0e5de384625567",
+   "d303d1a0e08c6c6d7196e1d235cc752ba24bc673e61f0c4723e6183ba7e4632e",
+   "d386edc1f9fed739c00fa67c23af32455d57b683dbfa5e42320b9bb118792e42",
+   "ee57ecb197a4b44cb3c1be9add0fe7e8bfddd063395d9909287ff5498a15d03e",
+   "fe97a7983206077d2046f97b54b2ec0cf5fe638607fca11443b12a862b3662f8"
+  ],
+  "concepts/merchant-of-record-vs-stripe-for-indies.md": [
+   "8a4dbb4d6d714fc7c4ecf5cca88345f3f7c4a14c2e4cf3c3433216dbd819f632",
+   "f39bd3b6fa87a2e4db15782c38e9c68f96889d7bdc0c5a9c56d244f9161b0e21"
+  ],
+  "concepts/model-context-protocol.md": [
+   "04eb20508b373fcb4b906950a3b36650ea15494c8f624a5bcdf4a1be748610e3",
+   "2a4e1757d19d0693cbbe41d5a582aad18becf6028dc597ea0e4ee6c2ef17d7bb",
+   "cdab2238f4d9ade42697cc5e16741cbc8d91a7ce96673ff018a8b135585c9d69",
+   "f6c556a887525d661cfa4601c802167cd3968c12ae51f967ad7b6f4b3c23b6c0"
+  ],
+  "concepts/model-quantization.md": [
+   "0b45077ea105c1662441fe26190409b5a22718609051c6434275d9b29be11421",
+   "91e39a3e586f8891f914f010003e1dd171f68af9044107bebfcd79bbe243220a"
+  ],
+  "concepts/module-contributed-gui-tabs.md": [
+   "5343da452a8ec1bbf361dcd7c7b4258bea35887a834f74b59848718948aba858",
+   "60870615d32a934b085607545112122cfc587c74941f3038dced47bdf93d7773",
+   "68cb065750b7231201b6fe238582f88dbae489df4385963f558619264576a0b2",
+   "ad0fc73403e90113c48f65f53212db94ae26174d6d823bc0976922a70784dd2f",
+   "d2732b3f2751c6cf0c1e86b10dccd7434d00d187b2a39acb073d74163a9d9428",
+   "e1cb47a29dffc59e6b19027027ec3938625d107ddd3a2c68ce319572db8e44bc"
+  ],
+  "concepts/motion-principles-for-ui.md": [
+   "cf8909fc916b9a9eca05d84f77f66a74b10ab4b5fca71d4f110cf647f5c2c8d0"
+  ],
+  "concepts/neurosymbolic-ai.md": [
+   "34d74326f897c57f8b7b3b706fa9973ff56c1b16d7ddcfbc4b3cc4c43d13c268",
+   "6802ca03c7fa6c592f01d7603cb0064cda177f094b60809459fb716e4ea86132",
+   "b7123c6acc152c2e48518a03223078091b7c8d209bdfda9d684d6952188973e6"
+  ],
+  "concepts/oauth2-flow-decision-tree.md": [
+   "24d0e57debb25f32b188bb99f45d0b0a5ecf3b0f4a8430e6ed23ccb591ed591b",
+   "90df60ea10ca6d07acb34630b71162327fce37141b8c0be0a09d1251b3d7e6e0"
+  ],
+  "concepts/orchestrator-code-graph.md": [
+   "4a548f0fcc89cc311485793632ffd8a1e2fd386041ba46418c42f28d365c9b84",
+   "8be754cd248f2892c8d9b1388d7938f0cfff3b30b0475c03f18dfa1d49914d3e",
+   "ec50e6735475e298a900b51776b69705e5c9c4510ac18090d084af272e2eb1b1",
+   "ff99e9f3855cabbbaa0988a6799f0325c2448e7ce1f83c47e8df91df271eef14"
+  ],
+  "concepts/orchestrator-context-management.md": [
+   "1d8538c0da57e19dd40ef336cf1e994745e2262a50cba45dbcde35dd8d2cf82b",
+   "1dd798f964e52a3b3f8b628989bfd844c4263d0e67a5eee1765ffdcaba7fa399",
+   "7e1f74091394015eaed74fdfceb8f2f6150067776230065fb27b8282af536c20",
+   "dc6fcc8d06661a9ce922a3e5bf1d2b1f2d514303563bbe63f785228bc3626f61",
+   "deda8b81bfb4eb59b80e16cb07fb270d7e511a84b51b59ba0d6a667fecc600fc"
+  ],
+  "concepts/orchestrator-hook-system.md": [
+   "07e09125182cb8c88ca9ce22fcd1b0993ca1f7d1b99c935989a346895d92bdab",
+   "4a30e8933d436ae1bfc510f552f35a3d5e58012bf08772054a90cc425859906e",
+   "935c19a8e73a6b4d146c16559e15039ca53d1e47a0726387581a84bc2f73bcaa",
+   "967045fb6c5b49fd0aa5398971120bb693658bba96f42a39c64736f3937a8437",
+   "ade76f2f028942166b35b692398cf248e1dfa2a91e64e8b317f448f7b94329d3",
+   "d3f7a057075430ac872dae536173e470c7d87e4892372ad82929fe6f3a80610d",
+   "f0dcab052011d63a060eedab5aa791fc5142c192e4c50d19e21b0168338d261b"
+  ],
+  "concepts/orchestrator-knowledge-graph.md": [
+   "2a329b7f9bd6cecc359c64ccb4c3cb12ada86cb0255c169cd6e4cc383680c6da",
+   "4f023d197bc216f003d70cdc68f7632db8628fe396d09d8dd95c1176b347a1d2",
+   "8029734d2c8782f3239db09e2feb8210616376a536e0d4a0b27e4a06c2ddda38",
+   "a2cefdd80d47bbc969751f9056406e6ced9d9b9f74ee187b01a322ed7f23e82e"
+  ],
+  "concepts/orchestrator-mcp-servers.md": [
+   "41f7f43818ac02d38793e44bde23c564d8f90e97d53c6996c489c949e141e3a4",
+   "48b8af1cc9cd45a5a4f51bf3906bea7adfee387cfdc5b3073bdb71e7921b819b",
+   "73d9ca8716075aa50e6b4e2bf05287e0114db7e366b273ecc39f70e541ea8fba",
+   "f6fc2e4709001e8167619208b9da2e3bc4b1b9cd7db30a9a5f21bac616ede27a",
+   "ffa44289830fc89fa524ddeec7635bdbcdbeec584432bb378ab91831cd46feeb"
+  ],
+  "concepts/orchestrator-rl-retrieval.md": [
+   "be2dcfe75d4b4907549c7ab7f97e08386d3f3aaf0d7c50e05cc2ece0a1770a02",
+   "e2a34f69e99711bf76b9fb4852a1c09d359ae500ee84402a44f3ef1b8a99c181",
+   "ebc089e3ca3870c12c2164d69abce2393931046632792435ac39b374217085ff"
+  ],
+  "concepts/orchestrator-security.md": [
+   "0bd57f42f787634a5dbe1cc1e3ec00010ccbc92b71ecb876debd32bc901d6aa5",
+   "36ad54a1294bd2c867980d7112e5bc12f03e393dc4509e20ac4f8d614b7949c4",
+   "7076d798e9ce13985b619d150599bbad846010dbcac2060fddd5d7d5c81734d2",
+   "80325791e62238a518e365fd894c0db9e8414be96609c663ccfd4fbaa9574963"
+  ],
+  "concepts/parallel-agent-worktree-isolation-discipline.md": [
+   "537f6d6ddd537a3b3e594f25679bd116a32f305db11aabb4c22e4c9576efa736",
+   "629cb8027887c5edcde9a4793e9ff642e85317513e329defd074acc067e33e1e"
+  ],
+  "concepts/physical-constants-quick-reference.md": [
+   "aec9420ec273b0ba3566e4c36c9c3f062009e75d29280a8d448b1596d2487853"
+  ],
+  "concepts/postmortem-authoring-discipline.md": [
+   "fbdd48b30cb1ac3e9368f7b01a7218e04e3339b5a64f27ec87a397e651e01054"
+  ],
+  "concepts/power-analysis-sample-size.md": [
+   "53a6a6cce99f302468e0a4487a615921810bec88b8661d5dea927575d7b2d802"
+  ],
+  "concepts/ppo-improvements-st-ppo-modern-variants.md": [
+   "4cfb76cc6b9345bb6db937366fa4f42e2b2d9404db0666b1a87babee81831c01",
+   "730f311b2bfb3d92bd82374f2c7e0db74fd3243af9603c48b399b6362158f9ac",
+   "ae71b3f734dda484bef5c48264875e39198203e92aee867c368c32cc8a8a6157"
+  ],
+  "concepts/process-reward-models.md": [
+   "df1c48ac345e113c767ad20a28020ced7c52fdf6a1537e852a8ba4f08d4dc017",
+   "fe7aaccb7bd2fd312382908c25560ba7a90cf01d3043672da87e2fd0204bfe92"
+  ],
+  "concepts/project-extra-codegraph-paths-2026-06-05.md": [
+   "02f68234bbb56a4863d56c5d38c99a9aeb87c848fb7112d1439778d2a6650657",
+   "c8b691bec7bce66f6ecd7c9dceaa7acaef7f339b57f2b946439140da105ba7ef",
+   "e18380cefe72423251f65cce1f34f75993876587d49d586c03b264f2c7574b1d",
+   "f41348d0490b221afbd6c8c897266a59b785866aa7ffbd66f738be5134877435"
+  ],
+  "concepts/prompt-engineering-fundamentals.md": [
+   "5485c4302b583bf7e09f55cb1eedb941c31def684d76bbebf8d142750928d435",
+   "97e59fc288ebdfeeffc7d274edaccb00e45379cc042edc97a0f14c1cbf36be6b"
+  ],
+  "concepts/prompt-engineering-mcp-tool-design.md": [
+   "095c9003d2e22baab1ea2d26229069e0fc75e1fd86befa88471c379c6cee9be8"
+  ],
+  "concepts/prompt-engineering-multi-agent.md": [
+   "86a756531cea2dd05cad042bacbe61c32d66aeecbd10959f9d634f15252b2561",
+   "b7e4654cfd61784ece1dcc5b53e296773c2b8035240c20583395369f93bec1d6"
+  ],
+  "concepts/qlora.md": [
+   "46207456c95e5788928b76325dad6ace3427bb3fd7cad30961eaf5d7cd63e1f5",
+   "b13578d518cfa0b87d19fbcbbc540cc56a32a1f7f0068aee3b5b61c63919d10d",
+   "c8a701be5ba2955565c1101e1a6bfcb242fef5ec2e7aaa00d26fd8e27437ad26"
+  ],
+  "concepts/raft-consensus-algorithm.md": [
+   "4843fa5c7930bfed50e466191a0e4d25d2b57b8564c81980d695fca7f8978308",
+   "feee5144b5ed4f74fcdb77866719bdd8546e0beef7c0614c531805f0f5a7fac9"
+  ],
+  "concepts/rag-pattern.md": [
+   "22ca1ed63c6ab1f41c013a07809c633adef9b9f8e03f17358569d464fe4b14c4",
+   "4cb349110e19fa18488858919a00570792096ee74817066a4e5c0b59eefc03f5"
+  ],
+  "concepts/read-image-memory-aware-gating.md": [
+   "10e85347b8193bf5d3b5056b6d8ef3052afe89aaa5043d8c220cf68085abcfad",
+   "313740f3ec1bab23d8d979178086674331a588c32a9f8e5afe5a07d4565a2c62",
+   "68041bfa6e25b5f09ca4a51b308cd74aa962b8dca2cdec3dde7a84a1aea00c1e",
+   "84b311521098c8caa75e4647e54f8c69c02d8aac6af3d126d3227ac26a9eff42",
+   "9eb90f6b3937c0145a3e21b25c65f192935d06dfc77fe986f5ca9cea2b6a632d"
+  ],
+  "concepts/reinforcement-learning.md": [
+   "824ed2bc20846c92d3fc7358727a4fd0b6f2031be50f05ae5f29a982e2f238db",
+   "f97a49314cf911894452e8a3030236a6865da1641dd8c3c9985773b6a1522aec"
+  ],
+  "concepts/reproducible-research-workflows.md": [
+   "277f2f9c16be77f79023b57311ee6b13476777fd0dfc6e27957f81e0c6d7a4e1"
+  ],
+  "concepts/reward-shaping-intrinsic-reward-design.md": [
+   "2fdcf54582ccb47d06767aca6c87e50d9bc2fd997b53d914d289d9470930dbd4",
+   "8e8fb1fb0394e60f1e19d09dc7c30cc4a542c6489edc23658f366f2955d85133"
+  ],
+  "concepts/rotary-positional-embeddings-rope.md": [
+   "9bc058b5c26fcb816b47b9e1c6193a4118b2c9aa9c96dff710e5d60cdd7496b0",
+   "e658ee3370a97c73fb6e22c9b11e03d5fd5ee7b1cc035e1772a2cdcde4acdc0f",
+   "e86b708e8866d87cc7d905aa9d0cae21acafdfbf12c3417fb20c955794f602cd"
+  ],
+  "concepts/saas-pricing-psychology.md": [
+   "637f3509bc2c6a127c034ef7bea51ac2f8bbc83eff1244eaa9ee13c748dc72f1"
+  ],
+  "concepts/saas-pricing-rollout-playbook.md": [
+   "56d72b12f0fb6863a07bfef9543177fef30d323de8dc5d8b7866e7d6769a90e2"
+  ],
+  "concepts/safe-install.md": [
+   "3c006f91ef05776d601140a5d039468585d5782796ae5431f927025b8fac36aa",
+   "9381466f71fb3dcfce1976ceafb9c62b8b891383c5ab23e87598aeee24545865",
+   "9d069effa801d62f0b44d7f1376a29f07a6cee8cdc5f8413e9009bfa8e168f4a",
+   "c84cfc94b42eb301fd59a75850b3e1d97d4265233519f826f02e57a13a01236c"
+  ],
+  "concepts/saga-pattern-distributed-workflows.md": [
+   "739407c126991d40cc83abb53b68a16829cee1ecd7d326de1677369d2b6019f0"
+  ],
+  "concepts/sales-funnel-stages-2026.md": [
+   "eacd7ace9149b23aa63659d1298c9b38de098ec923e7f1df1fe62eadca6744bd"
+  ],
+  "concepts/scientific-paper-triage-schema.md": [
+   "b18cce7e83ef1082ce546d75e61033ce392c5b9b99197e01769d18fc1f0cf85c"
+  ],
+  "concepts/score-driven-retrieval-tiers.md": [
+   "03adeabd9642101ff326988a49e6d133d1f0eb8967187a962bf1e9947babb1a1",
+   "189c94422691a43deeb36a6b879fec066d6e971564f76b52caf8a088772359cf",
+   "c564bf15166e849da71fbe781d2e477fd3ed95e8efbe991e97f92e15297f10f2"
+  ],
+  "concepts/semantic-search.md": [
+   "3175ebdea4fd5fb6f79b1002a4a3da414b07cc3799547ad5c8419ce920b7e577",
+   "354fff4aba1f2d12eec47fe1c11799113df408ac37c97e479dec79d77fccf27b",
+   "b9385dfa74952cee16633eda1fbfd7b8b9922ba19a8936f53b8eb63c6279bd24",
+   "e3db2dba171424a50acae160278c93403f9eea47282c8b9fe3e5e97c59846248",
+   "e7b62333b717f39c242b8af914f5209f32649e2fb4b0934ce717fd1bf9c8eeb1"
+  ],
+  "concepts/shared-knowledge-graph.md": [
+   "084d16d98bd44fd7f60b1bc062d7833c0c09da8ab520f4afbde499e9c83ed14b",
+   "23ba5699d0c997031e83c02bd0366fce987a10e63cad0ce07a6885ef06f9ce99",
+   "2994e3cc8f81be546625da12a93bb12f5bc6129eba2c2dd436fd2d434e54d2c7",
+   "2eec8677a93048bce66f6dc81b1858574fea3158eb25827f854103c59015a39c",
+   "4ff73ebf1d4e7eb645980d37aa8fc7a3b09488010309cf175aa78846cecd3897",
+   "5f9272da7158a75c6ffd25148a63ac3c5b9dbc6c4fcf0f4f4cf258b0624aff1a",
+   "8a5e6ce607939095dbcd849756c1cb3bcec434950f8e77c39eecf88a34d13bc2"
+  ],
+  "concepts/sli-selection-methodology.md": [
+   "78e4bfd7ede7920262e2c1cd2f9fb62a1885417fcc97608ff904c3805126307a"
+  ],
+  "concepts/slo-error-budget-multi-burn-rate-alerts.md": [
+   "682eb7df971acbe1474545bf71d2c5eb357e5b1e9f0c19225e6c935d2b5ce63d"
+  ],
+  "concepts/solo-saas-launch-playbook.md": [
+   "dbed21f73e74c0c3b9aefad383bca6e78f1260770d9203ab10051d3840dbc2f1"
+  ],
+  "concepts/sow-contract-type-playbook.md": [
+   "3554dc58567c6abac978e8be29e3f642e20f391ba472100f128e8230c1c5e655"
+  ],
+  "concepts/sparse-activation.md": [
+   "1d16e0fff43573c6baa4d9fea6ad06d4a7f7ef86301ed1d581efc9ec4ebb035a",
+   "61c2783ce03b498ebfb3610eedbcf828463aa39b80238771750dac33e090ea18",
+   "bc5a87e41e8eba8fa8c7015828424fb1b0ff6e7d6b3544cba19b1ed861805fee"
+  ],
+  "concepts/speculative-decoding.md": [
+   "34ad48aa4d8f010dc854f5a96c90f134742204f47e93fdf8cc0292b9954316c6",
+   "ed211719ed64d2b8a27c1c166ebe3621885826b31201a127ea8ad190b401e405"
+  ],
+  "concepts/sre-incident-response-playbook.md": [
+   "94c6ca22bafa1fc254c0a167ad6e89af22147af5d4f75ea184a8ab23abe00ec0"
+  ],
+  "concepts/structured-output.md": [
+   "47bc88c1642cc199e72373662942a9816a4d8e9f2e98c146fbc930c071a8faa7",
+   "7ad9074572b6395a1c88b3e0607aee55850d624130e1595e067ab376186d79e2"
+  ],
+  "concepts/supply-chain-security-slsa-sbom-sigstore.md": [
+   "02edd514701dc1ee4869ede6a59c0a955dc84affb333102e1b45ee1c4c3a8119",
+   "3c8dba7d1668e4ad1e6d56593a3100ed160aa28b5a3f795279251476355480de"
+  ],
+  "concepts/tauri-windows-create-no-window-pattern.md": [
+   "382bab2eb4208078a9396180f7f9f9e6d50d743e2ad53a3f6202d777cf2b7e1c",
+   "450b61443112387783e35a6affd84035b9f716c2909fc4eee9417eea4af4ce0a",
+   "6af025bab7efa693d1768fc59dc2487dc39130dc46c87785399802637ba5f95e",
+   "acee0827973ed12e614515246c3021be9ac45d02c960af7404af7ad3a98b542a",
+   "f473a7ae5e1d2dcb32bc834f0efb09ab8c74aa09585ce5895a1376e00daad346",
+   "fedde23f6a6b25cef39f6b300709ada4741f2b7f1e1b6a358964242b1ab978e8"
+  ],
+  "concepts/technical-debt-accounting.md": [
+   "fa783f243d30cca45c94b28a8aae3e21a3bd43ff83beec5b1d77be0e1a6eb362"
+  ],
+  "concepts/terraform-plan-review-discipline.md": [
+   "1da7e0283f867ad7aaf33104965597fa9b7ed9dd7e4c9866fdfc87f630697dc3",
+   "bd78b6b5869751568a31132bce43093e8124c8036d466a95b620843ff8c89eb2"
+  ],
+  "concepts/transformer-architecture.md": [
+   "811bab628000992621d56a540e118a50eed7b402abb164ad341c70d7f604a9f3",
+   "ca01834376a68e1255ea5e0636aa74979b09833bbc7e2955a56f8e8b5a431457",
+   "d042191522c24e23eb48479c3645bdd71eeb1beaaa7e9060f0db6ae96625ccb5"
+  ],
+  "concepts/tree-of-thought.md": [
+   "73ba34ebb3caa8703686c5644244dde79922c9c75a8765b3e31ecf7c9f81b3a8",
+   "88500e68a129c55abf1b00bd924cfa0179698d9838f87e6345ebea97c4cef25e"
+  ],
+  "concepts/typography-system-design.md": [
+   "86a2d68e793a3eb072827f68aec3d0cf18f05ef8d8d4ba5b6fa165f273436a4d"
+  ],
+  "concepts/update-resume-required-bug-a-v0251.md": [
+   "2e73a0dd7dd6755ae3a0d146473729499fea54f64895e526dcda8ab23bdaa076",
+   "3a5945e775a8074c7d89ecffb5ee818203a93a995352c2223e2eef7cabbdadee",
+   "7f0e4ea1741480c5fb65a23e0bfb6dbd9a3d5e08403c4e3896651b4e11a10c86"
+  ],
+  "concepts/use-red-four-golden-signals-observability.md": [
+   "ed9d35e6e665c9fd35229161d412be95f1bbb454f03e3c9b28f7c51c3a2b2b09"
+  ],
+  "concepts/vision-language-models.md": [
+   "0abda0a68b00bcf8fa5268467a92a65f930b00fc248683bd92e59aa83325614c",
+   "1796162c49f26ab48cfd6d286c2e1b419a79538ccc2539f4451ae84a8905377e",
+   "e9163892391c240ba71b97953c3eda77ff660f559f3f55647daf2c14b974b8cb"
+  ],
+  "concepts/webhook-security-checklist.md": [
+   "fdf77ec73d10a900a0166742492d927612428a511d3053f722a7645c22964fc3"
+  ],
+  "concepts/webkit-egl-preflight-probe.md": [
+   "96cee6abd8e9e35720d0d3727f8c5ab9abbc6a15281dad761c00e877489884f7"
+  ],
+  "models/codesage-large-v2.md": [
+   "947081175273f2000c7e50935bd29a8c4038e0d65aa4d81eb59078b9d5be87b9",
+   "b9db2982b427ab012e9a9b4ce15c390c68ad38ec9388ca7c8459f0c92c40a561",
+   "f91aa31ef8773870eb9e5eaccf0f9deed0a9beb094ccc2fa874d1019f0544f29"
+  ],
+  "models/gemma4-e4b.md": [
+   "4ae2d9f4cda7cb27849d63c8eb94e2aabccf50db68dcc09d1b81d2045461149f",
+   "7adba78bc7ce749abd9eb6505b9a8d2df3cb68ad31c8b759da287f4ff4b93704",
+   "c1de2af417e762782b59d91ee6f14587a249566c9daa3c2524878128b588b6ae"
+  ],
+  "models/jina-embeddings-v2-base-code.md": [
+   "3a05468cd2cf6a4b1c7c02fb048d4e0418bcea719448a862202d64c031f0822b",
+   "84cfa1ba6e519717bbf4ca81b3a1d4a030f91d69124723956c334fd4fd7ee644"
+  ],
+  "models/qwen3-embedding.md": [
+   "98ab0ddd813c10d5dc771ebf3b87ddda44265843422546debd5e41fbd8d39def",
+   "f9d2d453f4e61bbda3315c891383f41a16656ae12b8b5378641a3aa35639ad53"
+  ],
+  "models/qwen3.5.md": [
+   "88062e5f707e9b9b49709ba741c1d5ebac635ed9bdef13dcefc9fab0a4932d60",
+   "b876f907f40ace8334dc1e5e2abb4fccf1df389878dbc0eb41262762d2382a33",
+   "c34cab87f1c77aef2423acc914276dd4d16c991aa3d56948268532c8cfc97ee8",
+   "feae58cf791635e25e732f86115562cf43688d9dbfdac3fbc922d083a8557a9d"
+  ],
+  "models/snowflake-arctic-embed2.md": [
+   "8081fe937eef5616ae36da4624d0ac654356254282e19c9993f72347d3ca5154",
+   "cf8451fc29f2f9ce34d7c579aa2efe4d3b1004cc193be2210c0582d73c86e513"
+  ],
+  "patterns/wear-the-hat-pattern.md": [
+   "6037ce0af9bb63207ab3a0f84aa2ee7ce8b75f37fdd92885d8f5c97852585904"
+  ],
+  "tools/claude-code-cli-headless.md": [
+   "128c7033a0bc931cb1752824dc0e8ffc4e6a22957991adfe7494221108f26c85",
+   "a140a29acd12ab76576525b51ea873ef9ccc8495dc9dc1bbf0b998bed2171177",
+   "c1ed65d1520ef20615405aefeca7c06c17540da74096fb19c39292cd1f89ca96",
+   "e02fd1f20f2700bde7180a3169d4ff85bd93aa32ebe242e1f6260f4411a18221"
+  ],
+  "tools/claude-code-mcp-configuration.md": [
+   "82c9f0c81e779f9f031114ae4fa9f5798d43a982cb66bff541f95669a8254c1f",
+   "c0ef1d83655d270d8b820441446b035f810e87a8f4b6ca76443f5ab9f6f0b45e"
+  ],
+  "tools/comfyui.md": [
+   "340311fcccbf8e0c5b12c943888d6c203c73fd8a15cc73d9c21afbd2577ad40a",
+   "399e0ad342eb27234b8fcd5503cc983c02788ecd6bbffc9b47c5c802fa3c9d24"
+  ],
+  "tools/crm-and-revops-stack-2026.md": [
+   "ff3b8d4456e2e908873cd8e03d54f7b40d65e0a2a5087dd6ee7495456c4adf8b"
+  ],
+  "tools/fastapi.md": [
+   "5db13100ce26d1fe50069aa1963941b2bad64e031211603a94f97c5a5a23bf03",
+   "dc066d50e27984657da49e5f4c7b541a081c9dd256c08c40dfca487f5c527410"
+  ],
+  "tools/fastmcp.md": [
+   "04d2c5501b09e953c621d1818daacf3890d6174d6420a1416612b90be93ff003",
+   "c1191f4cf89b8916e155feff10541e1f45e84eeb0811d316411a3bf85929554b"
+  ],
+  "tools/llama-cpp.md": [
+   "633ff16fa8d40e3bfc1bd219d7219afc011174f3e88c8a52cfc6a56ddb1c5145"
+  ],
+  "tools/ollama.md": [
+   "38436a435a294f926bf17f2b333f1f5e16f5cc96e8f0ebb623b9dbf12340ead7",
+   "dcd6536a32406555fcddfd152ed33ef66791be06b63c686409bd23d20995c1db"
+  ],
+  "tools/scientific-python-stack-2026.md": [
+   "c9efd7a50fd4e32f09ec42b863188d9197fe84948378ac90324de3f96d7f4f9b"
+  ],
+  "tools/terraform-opentofu.md": [
+   "107f5e2f0bd828394d214295e00ea4e362db7d6df9519cf7185244f380cc7bff",
+   "a037af8b4280388cfd2dce838fa0e509df2181a73f021c67112f5c2fd2081504"
+  ],
+  "tools/weaviate-usage-patterns.md": [
+   "2172c4e9e22461d116a8683bad3b935e4f4f8db52401851b93106237cdcec6d6",
+   "8f4880f5ef8afd554d278478ea6d0ad9b47ab54548ff290911b2c106a12dd508",
+   "97d8e7590c9aefabf3c2428a094cf155d34bf5c508d8ebdd2f54aa0b48e3a9f1",
+   "f016a80edf322f426457efdd8191de7080e9ddf45a2504f7e86ee2abc78a2453"
+  ],
+  "tools/weaviate.md": [
+   "79a8c803b5d697574e703b89f40dde91fd05aa35352378c974cc139972908520",
+   "dcf3bce5e5ffd2783b94c67952c098b0baba6e676b1b4e1c57b72fbd629a854a",
+   "f677af0f4e90801d9a080061d0abd443a6391316950bfa057e13466f11bf2b08"
+  ]
+ },
+ "generated_at": "2026-07-30T11:57:05Z",
+ "schema_version": 1
+}
