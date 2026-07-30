@@ -1,8 +1,8 @@
 {
   "binary_name": "vct-launcher.exe",
-  "built_at": "2026-07-23T17:37:40Z",
+  "built_at": "2026-07-30T17:03:26Z",
   "os": "windows-x64",
-  "size_bytes": 37457920,
-  "source_sha": "d16222c30ffbd733150794232478b00df5c11ebf",
-  "version": "0.2.88"
+  "size_bytes": 37709312,
+  "source_sha": "64324a5e84dfae60420fc680222b64fdf0950608",
+  "version": "0.2.89"
 }
