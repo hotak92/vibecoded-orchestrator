@@ -173,7 +173,7 @@ pub mod project_folder_health;
 pub mod project_state_cmd;
 pub mod project_state_populate;
 pub mod restart;
-// v0.2.89 BUG 1 (Fabio Windows field audit): ONE home for the
+// v0.2.89 BUG 1 (Windows field audit): ONE home for the
 // (program, prefix-args) resolution used to spawn bundled
 // `.claude/scripts/*` wrappers. Windows cannot CreateProcess a `.ps1`
 // (os error 193), so the spawn must route through `powershell.exe -File`.

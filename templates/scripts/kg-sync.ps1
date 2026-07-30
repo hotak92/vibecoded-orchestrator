@@ -65,7 +65,7 @@ if (-not $VenvPython) {
 # non-leaking env channel. `KG_BASE_DIR` is exported by every Claude Code
 # session (.claude/settings.json env), so a wrapper run from a session
 # whose env belongs to ANOTHER project used to inherit the foreign root
-# and sync the wrong tree with false success (Fabio field audit).
+# and sync the wrong tree with false success (Windows field audit).
 # `KG_SYNC_PROJECT_ROOT` is set ONLY by the launcher and by these
 # wrappers, never exported by Claude sessions — so it cannot leak.
 # Set-if-unset (NOT unconditional): the launcher's explicit value must

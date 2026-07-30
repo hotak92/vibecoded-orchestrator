@@ -10,7 +10,7 @@
 //! (v0.2.49). After v0.2.84 made every read path BINDING-first, those moves
 //! pointed consumers at classes that don't exist: the CG binding tracked an
 //! empty `NewName_Code*` set while the populated rows stayed under
-//! `OldName_Code*` (Fabio's 'HouseOfFlirt' phantom vs the real
+//! `OldName_Code*` (the field reporter's 'HouseOfFlirt' phantom vs the real
 //! 'HouseOfFire_*' classes), and access rows referenced phantom
 //! `{new_sanitized}_KnowledgeGraph`-shaped names. v0.2.89 makes names
 //! IMMUTABLE post-creation (rename = display name + slug only), which stops
@@ -634,7 +634,7 @@ mod tests {
     }
 
     /// ACT: no deferral evidence, but the KG-binding stem's classes exist →
-    /// restore from the stem (leg 3b, the Fabio no-underscore case).
+    /// restore from the stem (leg 3b, the no-underscore field case).
     #[test]
     fn repair_falls_back_to_kg_stem() {
         let cls = classes(&["HouseOfFire_CodeFunction"]);

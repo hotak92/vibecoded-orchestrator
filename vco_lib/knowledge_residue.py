@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""Bundled-knowledge residue cleanup (v0.2.89 §7 — Fabio wave-2).
+"""Bundled-knowledge residue cleanup (v0.2.89 §7 — wave-2).
 
 Why this module exists
 ----------------------
@@ -9,7 +9,7 @@ EVERY project's ``knowledge/`` + embedded into every project's KG collection.
 v0.2.81 made the set root-only, and the ``knowledge-retired`` manifest branch
 (project_init.py orphan loop) prunes the MANIFEST entries on the first
 post-.81 bundle update — deliberately leaving the files on disk and the
-Weaviate rows + vectors in place. On field installs (Fabio, v0.2.88) that
+Weaviate rows + vectors in place. On field installs (v0.2.88) that
 residue is now unreachable through any manifest-keyed mechanism: the manifest
 no longer lists the files.
 

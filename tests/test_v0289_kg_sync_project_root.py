@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""v0.2.89 BUG 3 — kg-sync project-root resolution (Fabio field audit).
+"""v0.2.89 BUG 3 — kg-sync project-root resolution (Windows field audit).
 
 Background
 ----------
@@ -40,7 +40,7 @@ Test strategy
   OLLAMA_URL additionally point at unroutable endpoints so a precedence
   REGRESSION (root resolving to a tree that HAS knowledge/) fails fast
   instead of touching live services.
-* The Fabio repro + launcher-fallback leave-alone go through the REAL
+* The field repro + launcher-fallback leave-alone go through the REAL
   bash wrapper (subprocess), with a fake venv whose python execs the
   test interpreter.
 * Wrapper parity + install.py seed pins: source-level assertions
@@ -289,7 +289,7 @@ class RootPrecedenceSubprocessTests(unittest.TestCase):
 @unittest.skipUnless(_HAVE_DEPS, "script runtime deps not installed")
 @unittest.skipIf(sys.platform == "win32", "bash wrapper path (POSIX only)")
 class WrapperRootPinningTests(unittest.TestCase):
-    """The Fabio repro + the launcher-fallback leave-alone leg, through the
+    """The field repro + the launcher-fallback leave-alone leg, through the
     REAL bash wrapper."""
 
     def setUp(self) -> None:

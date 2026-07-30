@@ -1083,14 +1083,14 @@ def mcp_json_weaviate_env_is_stale(
     ``.mcp.json`` is NOT a contradiction (weaviate-kg would inherit settings.json
     for it, EXCEPT shared — see below). A present-but-empty shared in `.mcp.json`
     counts as stale ONLY when settings.json has a non-empty shared (the exact
-    Fabio case: shared-KG merge silently OFF).
+    field case: shared-KG merge silently OFF).
     """
     if not isinstance(mcp_env, dict):
         return None
     reasons: list = []
 
     # WEAVIATE_URL: a present-and-differing value is the strongest signal
-    # (Fabio: :8080 in .mcp.json vs :8081 in settings.json). v0.2.89 review
+    # (field install: :8080 in .mcp.json vs :8081 in settings.json). v0.2.89 review
     # MAJOR-4.1: compared SEMANTICALLY via `weaviate_urls_equivalent` — a
     # trailing slash, a loopback alias (127.0.0.1 vs localhost), or a case
     # difference is NOT a contradiction; only a genuinely different endpoint
@@ -1125,7 +1125,7 @@ def mcp_json_weaviate_env_is_stale(
         )
 
     # SHARED_KG_COLLECTION: empty/absent in .mcp.json while settings.json has a
-    # non-empty value → shared-KG merge silently disabled (the Fabio symptom).
+    # non-empty value → shared-KG merge silently disabled (the field symptom).
     set_shared = settings_env.get("SHARED_KG_COLLECTION")
     if isinstance(set_shared, str) and set_shared.strip():
         mcp_shared = mcp_env.get("SHARED_KG_COLLECTION")

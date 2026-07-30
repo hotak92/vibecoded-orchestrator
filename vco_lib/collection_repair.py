@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
 """Foreign-row pruning for per-project KG/Development collections
-(v0.2.89 §7.3 — BUG-3 damage repair, Fabio wave-2).
+(v0.2.89 §7.3 — BUG-3 damage repair, wave-2).
 
 Why this module exists
 ----------------------

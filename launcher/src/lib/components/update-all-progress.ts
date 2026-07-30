@@ -195,7 +195,7 @@ export function kgSyncSubLabel(evt: KgSyncProgress): string | null {
   if (evt.status !== 'running') return null;
 
   const phase = evt.current_phase ?? null;
-  // Docs re-embedding is the long tail Fabio's field report flagged as
+  // Docs re-embedding is the long tail the Windows field report flagged as
   // "looks frozen" — show the running count so it visibly advances.
   if (phase === 'docs' && evt.docs_total > 0) {
     return `syncing docs ${evt.docs_succeeded}/${evt.docs_total}`;

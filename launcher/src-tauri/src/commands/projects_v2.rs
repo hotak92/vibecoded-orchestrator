@@ -4518,7 +4518,7 @@ pub(crate) use naming::*;
 //     phantoms; the hub-CLI rename path still calls the no-op).
 //   * `propagate_codegraph_binding_on_rename` — DELETED (it MOVED the
 //     binding prefix to the new name, pointing every read at an empty class
-//     set until a rebuild — the Fabio 'HouseOfFlirt' phantom — while
+//     set until a rebuild — the field 'HouseOfFlirt' phantom — while
 //     `project_kg_bindings` never moved: a half-update by construction).
 //   * `emit_codegraph_rename_deferral` / `codegraph_rename_split_pending` —
 //     DELETED (no split can occur when nothing moves). Stale pre-.89
@@ -8727,7 +8727,7 @@ mod tests {
     // binding-first resolution, the rewritten access rows pointed at
     // collections that will never exist (phantoms), and the moved codegraph
     // prefix pointed every read at an initially-EMPTY class set until a
-    // rebuild (the Fabio 'HouseOfFlirt' half-rename). The new suite pins the
+    // rebuild (the the field reporter 'HouseOfFlirt' half-rename). The new suite pins the
     // inverse contract: after a rename, bindings, access rows, and the
     // codegraph prefix are all byte-identical; only `projects.name` +
     // `projects.slug` change. The deleted emitters

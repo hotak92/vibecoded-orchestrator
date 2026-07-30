@@ -1441,7 +1441,7 @@ async fn run_build_task(
         crate::commands::embed_admission::acquire_update_all_admission(&db).await
     };
 
-    // v0.2.89 BUG 1 (Fabio Windows field audit): route the spawn through
+    // v0.2.89 BUG 1 (Windows field audit): route the spawn through
     // the shared `script_invocation::invocation_for` helper. This was the
     // ONE bundled-wrapper spawn site that never gained the Windows branch:
     // `Command::new(<code-graph-analyze.ps1>)` cannot CreateProcess a

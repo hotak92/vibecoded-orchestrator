@@ -2,7 +2,7 @@
 # Copyright (c) 2026 VibeCoded Tools
 """Tests for v0.2.89 FIX 1: bounded Weaviate-readiness wait.
 
-Field report (Fabio, Windows CPU-only, v0.2.72→v0.2.88): the PC slept
+Windows CPU-only field report (v0.2.72→v0.2.88): the PC slept
 mid-re-embed; on wake the WSL2 port-forward died so Weaviate :8081 returned
 HTTP 000 from Windows. install.py then hung INDEFINITELY — the unbounded
 re-embed subprocess blocked on a Weaviate that never answered. The fix gates

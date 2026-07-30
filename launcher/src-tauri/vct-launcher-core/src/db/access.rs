@@ -1687,7 +1687,7 @@ impl Db {
     /// v0.2.84 made KG/dev resolution BINDING-first, those name-derived
     /// targets stopped tracking anything real: the rewrite pointed access
     /// rows at collections that will never exist unless a migration ran —
-    /// i.e. it MANUFACTURED phantoms on every rename (the Fabio wave-2
+    /// i.e. it MANUFACTURED phantoms on every rename (the wave-2
     /// field finding). Under the v0.2.89 immutable-names ruling the binding
     /// keeps its creation-time collection name across renames, so the
     /// correct propagation is: none.

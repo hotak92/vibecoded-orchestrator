@@ -10006,7 +10006,7 @@ def install_project_bundle(
              f"entries (files left on disk, read via shared collection)",
              data={"count": len(knowledge_retired)})
 
-    # ── v0.2.89 §7 (Fabio wave-2): bundled-knowledge residue cleanup +
+    # ── v0.2.89 §7 (wave-2): bundled-knowledge residue cleanup +
     # BUG-3 foreign-row repair. NON-root targets only; placed AFTER the
     # orphan/retirement machinery by design — the v0.2.81 `knowledge-retired`
     # branch above owns the MANIFEST transition, this step owns the
@@ -10050,8 +10050,10 @@ def install_project_bundle(
                 from vco_lib.config_projection import (
                     resolve_collection_names_for_folder as _rcnff,
                 )
-                _pinned_names = _rcnff(folder)  # raises when unregistered /
-                _identity_pinned = True        # db unreachable
+                # dict(...) copy: the resolver returns a TypedDict, which
+                # pyright refuses to alias to a plain dict annotation directly.
+                _pinned_names = dict(_rcnff(folder))  # raises when unregistered
+                _identity_pinned = True               # / db unreachable
             except Exception:  # noqa: BLE001 — fall through to the env pin
                 _kg_pin = _res_env.get("KG_COLLECTION")
                 _identity_pinned = (

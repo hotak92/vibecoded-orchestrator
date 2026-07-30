@@ -4,7 +4,7 @@
 
 Pre-fix, ``sync_node`` always wrote ``COLLECTION_NAME`` — the ``scope:``
 frontmatter key was silently ignored, so a node the author declared shared
-landed only in the per-project collection (Fabio field audit).
+landed only in the per-project collection (Windows field audit).
 
 The fix mirrors ``store_knowledge_node``'s semantics (server.py):
 

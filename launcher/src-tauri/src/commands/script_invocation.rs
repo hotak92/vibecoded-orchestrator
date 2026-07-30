@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// v0.2.89 BUG 1 (Fabio Windows field audit): ONE home for the
+// v0.2.89 BUG 1 (Windows field audit): ONE home for the
 // (program, prefix-args) resolution used to spawn bundled
 // `.claude/scripts/*` wrapper scripts.
 //

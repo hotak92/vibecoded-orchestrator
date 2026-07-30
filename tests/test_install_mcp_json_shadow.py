@@ -2,7 +2,7 @@
 # Copyright (c) 2026 VibeCoded Tools
 """Tests for v0.2.89 FIX 2: stale `.mcp.json` weaviate-kg shadow quarantine.
 
-Field report (Fabio, Windows CPU-only, v0.2.72→v0.2.88): 5 projects carried a
+Windows CPU-only field report (v0.2.72→v0.2.88): 5 projects carried a
 pre-migration top-level `<project>/.mcp.json` whose weaviate-kg env pointed at
 the OLD Weaviate (:8080), a stale KG collection, and an EMPTY shared collection.
 Because `.mcp.json` has PRECEDENCE over the migrated `.claude/settings.json`
@@ -125,7 +125,7 @@ class StaleMcpJsonShadowTest(unittest.TestCase):
             {
                 "weaviate-kg": _weaviate_entry(
                     weaviate_url="http://localhost:8080",  # STALE port
-                    kg="FabioKnowledge",  # STALE collection
+                    kg="LegacyKnowledge",  # STALE collection
                     shared="",  # empty shared → merge OFF
                 )
             },
@@ -211,7 +211,7 @@ class StaleMcpJsonShadowTest(unittest.TestCase):
             {
                 "weaviate-kg": _weaviate_entry(
                     weaviate_url="http://localhost:8080",  # STALE
-                    kg="FabioKnowledge",
+                    kg="LegacyKnowledge",
                     shared="",
                 ),
                 "my-custom-mcp": other,
@@ -235,7 +235,7 @@ class StaleMcpJsonShadowTest(unittest.TestCase):
             {
                 "weaviate-kg": _weaviate_entry(
                     weaviate_url="http://localhost:8080",
-                    kg="FabioKnowledge",
+                    kg="LegacyKnowledge",
                     shared="",
                 )
             },
@@ -380,7 +380,7 @@ class StaleMcpJsonHardeningTest(unittest.TestCase):
             {
                 "weaviate-kg": _weaviate_entry(
                     weaviate_url="http://localhost:8080",
-                    kg="FabioKnowledge",
+                    kg="LegacyKnowledge",
                     shared="",
                 )
             },

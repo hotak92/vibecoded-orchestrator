@@ -1318,7 +1318,7 @@ fn single_field_response(
 ///   row exists. A never-analyzed project's name-derived FALLBACK prefix has
 ///   no classes BY DESIGN — warning on it would fire for every fresh project
 ///   on every resolve (pure noise). Only a binding pointing at absent
-///   classes is a genuine phantom (the Fabio half-rename class).
+///   classes is a genuine phantom (the field half-rename class).
 /// * `exists` is the probe answer per class name. `Some(false)` (probe
 ///   succeeded AND class absent) is the ONLY warning trigger; `None` (probe
 ///   failed / cache cold) never warns — probe failure ≠ absence.

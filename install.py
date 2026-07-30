@@ -553,7 +553,7 @@ def _build_ollama_pull_list(embed_config: dict, sysinfo: SystemInfo) -> list[str
 HEALTH_TIMEOUT = 120  # seconds
 
 # v0.2.89 FIX 1: bounded deadline for the pre-seed Weaviate-readiness probe.
-# Field report (Fabio, Windows CPU-only, v0.2.72→v0.2.88): the PC slept
+# Windows CPU-only field report (v0.2.72→v0.2.88): the PC slept
 # mid-re-embed; on wake the WSL2 port-forward died so Weaviate :8081 returned
 # HTTP 000 from Windows. install.py then hung INDEFINITELY — the re-embed
 # subprocess (`sync_knowledge_graph.py`, connect_v4(skip_init_checks=False))
@@ -15380,7 +15380,7 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
     # `sync_knowledge_graph.py` re-embed subprocess (which has NO wall-clock
     # timeout). Raises TimeoutError on an unreachable Weaviate so the caller's
     # soft-fail-to-deferral path runs instead of hanging forever (dead WSL2
-    # port-forward → HTTP 000, field report Fabio v0.2.72→v0.2.88).
+    # port-forward → HTTP 000, Windows field report, v0.2.72→v0.2.88).
     if not _wait_for_weaviate_ready():
         # v0.2.89 review NIT-1: report the ACTUAL (env-resolved) deadline.
         raise TimeoutError(
@@ -18796,8 +18796,8 @@ def _check_search_mcp_env_obsolete(
 # supplies its logger + adds the returned deferral to the run report (the
 # install.py main()/total ratchet keeps substantive logic out of install.py).
 #
-# FIELD REPORT (Fabio, Windows CPU-only, v0.2.72→v0.2.88): 5 projects carried a
-# pre-migration top-level `<project>/.mcp.json` (KG_COLLECTION=FabioKnowledge,
+# FIELD REPORT (Windows CPU-only install, v0.2.72→v0.2.88): 5 projects carried a
+# pre-migration top-level `<project>/.mcp.json` (KG_COLLECTION=LegacyKnowledge,
 # SHARED_KG_COLLECTION empty, WEAVIATE_URL=http://localhost:8080) that OVERRODE
 # the correctly-migrated `.claude/settings.json` (:8081 + per-project collection
 # + shared active). `.mcp.json` has PRECEDENCE over settings.json for MCP env

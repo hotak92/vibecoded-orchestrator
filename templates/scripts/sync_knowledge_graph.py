@@ -77,7 +77,7 @@ if str(_VCO_LIB_PARENT) not in sys.path:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# v0.2.89 BUG 3 (Fabio field audit): explicit project-root resolution.
+# v0.2.89 BUG 3 (Windows field audit): explicit project-root resolution.
 #
 # Pre-fix, the target root came from the inherited `KG_BASE_DIR` env with a
 # script-location fallback. Every Claude Code session exports `KG_BASE_DIR`
@@ -2123,7 +2123,7 @@ def _delete_node_by_file_path(server: WeaviateMCPServer, file_path_value: str) -
 
 
 # ──────────────────────────────────────────────────────────────────────
-# v0.2.89 BUG 6: `scope: shared` frontmatter routing (Fabio field audit).
+# v0.2.89 BUG 6: `scope: shared` frontmatter routing (Windows field audit).
 #
 # Frontmatter contract (top-level key):
 #     scope: shared    # valid: project (default) | shared; any other

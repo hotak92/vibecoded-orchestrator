@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""v0.2.89 §7.2 — bundled-knowledge residue cleanup (Fabio wave-2 P2).
+"""v0.2.89 §7.2 — bundled-knowledge residue cleanup (wave-2 P2).
 
 Act + leave-alone legs for ``vco_lib.knowledge_residue.
 cleanup_bundled_knowledge_residue`` (destructive-action rule: every gate
