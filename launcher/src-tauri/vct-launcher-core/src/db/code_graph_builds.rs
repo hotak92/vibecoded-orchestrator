@@ -55,6 +55,14 @@ pub struct CodeGraphBuildRow {
     /// boot-time sweep treats the two differently — see
     /// `sweep_dead_detached_code_graph_builds`.
     pub pid: Option<i64>,
+    /// BUG 2 (v0.2.89, migration 041): ms-since-epoch stamp written every
+    /// 60 s by the LAUNCHER-spawned build task's ticker
+    /// (`touch_code_graph_build_heartbeat`). Task liveness, not subprocess
+    /// progress. Always NULL for detached (pid-bearing) walks — those are
+    /// reconciled by the pid-aliveness sweep instead, and the heartbeat
+    /// stale sweep deliberately skips them (`pid IS NULL`). Twin of
+    /// `KgSyncRow::heartbeat_at`.
+    pub heartbeat_at: Option<i64>,
 }
 
 /// Cap stored log_tail at 4 KiB. The analyzer's stdout/stderr is mostly
@@ -99,11 +107,19 @@ impl Db {
     ) -> Result<(), String> {
         // Validate status against the CHECK constraint up-front so we
         // get a clear error rather than a SQLite "constraint failed".
+        //
+        // v0.2.89 fix (found during the BUG-2 heartbeat work): PARTIAL was
+        // missing from this list although migration 038 extended the SQL
+        // CHECK and `commands::codegraph` writes it (`success_or_partial_
+        // status`). The validator rejected every partial terminal write →
+        // `upsert_quiet` only logged a warning → the row stayed RUNNING
+        // forever — exactly the stuck-RUNNING class BUG 2 closes.
         if !matches!(
             status,
             status::PENDING
                 | status::RUNNING
                 | status::SUCCESS
+                | status::PARTIAL
                 | status::FAILED
                 | status::SKIPPED
         ) {
@@ -119,12 +135,18 @@ impl Db {
         let log_tail_capped: Option<String> = log_tail.map(cap_log_tail);
 
         let guard = self.lock();
+        // BUG 2 (v0.2.89): every lifecycle transition also CLEARS
+        // heartbeat_at — same rationale as the pid clear above (and as the
+        // kg_syncs twin): a stale stamp carried across a retry/pending
+        // transition would make the fresh RUNNING row look dead to the
+        // staleness predicate before its first tick lands.
         guard
             .execute(
                 "INSERT INTO code_graph_builds
                     (project_id, status, started_at, finished_at, duration_ms,
-                     files_analyzed, languages, joern_used, error_message, log_tail, pid)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)
+                     files_analyzed, languages, joern_used, error_message, log_tail, pid,
+                     heartbeat_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL)
                  ON CONFLICT(project_id) DO UPDATE SET
                     status         = excluded.status,
                     started_at     = excluded.started_at,
@@ -135,7 +157,8 @@ impl Db {
                     joern_used     = excluded.joern_used,
                     error_message  = excluded.error_message,
                     log_tail       = excluded.log_tail,
-                    pid            = NULL",
+                    pid            = NULL,
+                    heartbeat_at   = NULL",
                 params![
                     project_id,
                     status,
@@ -173,8 +196,9 @@ impl Db {
             .execute(
                 "INSERT INTO code_graph_builds
                     (project_id, status, started_at, finished_at, duration_ms,
-                     files_analyzed, languages, joern_used, error_message, log_tail, pid)
-                 VALUES (?1, 'running', ?2, NULL, NULL, 0, NULL, 0, NULL, NULL, ?3)
+                     files_analyzed, languages, joern_used, error_message, log_tail, pid,
+                     heartbeat_at)
+                 VALUES (?1, 'running', ?2, NULL, NULL, 0, NULL, 0, NULL, NULL, ?3, NULL)
                  ON CONFLICT(project_id) DO UPDATE SET
                     status         = 'running',
                     started_at     = excluded.started_at,
@@ -185,7 +209,8 @@ impl Db {
                     joern_used     = 0,
                     error_message  = NULL,
                     log_tail       = NULL,
-                    pid            = excluded.pid",
+                    pid            = excluded.pid,
+                    heartbeat_at   = NULL",
                 params![project_id, now_ms, pid as i64],
             )
             .map_err(|e| format!("register running code_graph_build: {}", e))?;
@@ -200,7 +225,8 @@ impl Db {
         guard
             .query_row(
                 "SELECT project_id, status, started_at, finished_at, duration_ms,
-                        files_analyzed, languages, joern_used, error_message, log_tail, pid
+                        files_analyzed, languages, joern_used, error_message, log_tail, pid,
+                        heartbeat_at
                  FROM code_graph_builds
                  WHERE project_id = ?1",
                 params![project_id],
@@ -208,6 +234,63 @@ impl Db {
             )
             .optional()
             .map_err(|e| format!("get code_graph_build: {}", e))
+    }
+
+    /// BUG 2 (v0.2.89): stamp `heartbeat_at = now` on this project's
+    /// LAUNCHER-spawned RUNNING row. Status-guarded (a post-terminal tick
+    /// is a no-op) AND `pid IS NULL`-guarded: if a detached walk
+    /// (install.py resync) re-registered the row mid-build, the launcher
+    /// ticker must not stamp liveness onto a row it no longer drives —
+    /// detached rows are reconciled by the pid-aliveness sweep instead.
+    /// Twin of `touch_kg_sync_heartbeat`. Returns rows affected.
+    pub fn touch_code_graph_build_heartbeat(&self, project_id: &str) -> Result<usize, String> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let guard = self.lock();
+        guard
+            .execute(
+                "UPDATE code_graph_builds SET heartbeat_at = ?1
+                  WHERE project_id = ?2 AND status = 'running' AND pid IS NULL",
+                params![now_ms, project_id],
+            )
+            .map_err(|e| format!("touch code_graph_build heartbeat: {}", e))
+    }
+
+    /// BUG 2 (v0.2.89): flip LAUNCHER-spawned RUNNING rows whose liveness
+    /// stamp is older than `stale_secs` to 'failed'. Twin of
+    /// `mark_stale_running_kg_syncs_failed` — the SQL predicate MUST match
+    /// `kg_syncs::heartbeat_is_stale`. Restricted to `pid IS NULL`:
+    /// detached (pid-bearing) walks have no launcher ticker, so judging
+    /// them by heartbeat would false-fail every live detached walk; their
+    /// death detection is `sweep_dead_detached_code_graph_builds`.
+    /// `only_project` scopes the flip for the read-time guard; `None`
+    /// sweeps (the 5-min sweeper).
+    pub fn mark_stale_running_code_graph_builds_failed(
+        &self,
+        stale_secs: u64,
+        error_message: &str,
+        only_project: Option<&str>,
+    ) -> Result<usize, String> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let cutoff_ms = now_ms.saturating_sub((stale_secs as i64).saturating_mul(1000));
+        let guard = self.lock();
+        let affected = guard
+            .execute(
+                "UPDATE code_graph_builds
+                    SET status = 'failed',
+                        finished_at = ?1,
+                        duration_ms = CASE
+                            WHEN started_at IS NOT NULL THEN ?1 - started_at
+                            ELSE NULL
+                        END,
+                        error_message = ?2
+                  WHERE status = 'running'
+                    AND pid IS NULL
+                    AND COALESCE(heartbeat_at, started_at, 0) < ?3
+                    AND (?4 IS NULL OR project_id = ?4)",
+                params![now_ms, error_message, cutoff_ms, only_project],
+            )
+            .map_err(|e| format!("mark stale running code_graph_builds failed: {}", e))?;
+        Ok(affected)
     }
 
     /// Project IDs whose most recent recorded status is 'pending'. Used
@@ -394,6 +477,7 @@ fn row_to_build(row: &rusqlite::Row<'_>) -> rusqlite::Result<CodeGraphBuildRow> 
         error_message: row.get(8)?,
         log_tail: row.get(9)?,
         pid: row.get(10)?,
+        heartbeat_at: row.get(11)?,
     })
 }
 
@@ -821,5 +905,208 @@ mod tests {
         db.delete_project(&pid).unwrap();
         let got = db.get_code_graph_build(&pid).unwrap();
         assert!(got.is_none(), "row should cascade-delete with project");
+    }
+
+    /// v0.2.89 fix: PARTIAL must pass the Rust-side validator. Before the
+    /// fix the validator rejected it although migration 038 extended the
+    /// SQL CHECK — the codegraph terminal write for a partial build failed
+    /// with only a stderr warning and the row stayed RUNNING forever
+    /// (a member of the BUG-2 stuck-RUNNING class).
+    #[test]
+    fn partial_status_round_trips_through_legacy_upsert() {
+        let (db, pid) = fresh_db_with_project();
+        db.upsert_code_graph_build(
+            &pid,
+            status::PARTIAL,
+            Some(1),
+            Some(2),
+            Some(1),
+            5,
+            Some(&["py".to_string()]),
+            false,
+            Some("3 stale row(s) could not be pruned; inserts succeeded"),
+            Some("tail"),
+        )
+        .expect("PARTIAL must be a valid status for the legacy upsert");
+        let row = db.get_code_graph_build(&pid).unwrap().unwrap();
+        assert_eq!(row.status, "partial");
+        assert_eq!(row.files_analyzed, 5, "files count survives a partial build");
+    }
+
+    // ─── BUG 2 (v0.2.89): heartbeat liveness (kg_syncs twin) ────────────
+
+    const STALE_SECS: u64 = 1800;
+    const STALE_MSG: &str = "build task died without reporting (heartbeat stale)";
+
+    /// Backdate liveness stamps directly (public writers only stamp now).
+    fn backdate_build(
+        db: &Db,
+        project_id: &str,
+        heartbeat_at: Option<i64>,
+        started_at: Option<i64>,
+    ) {
+        db.lock()
+            .execute(
+                "UPDATE code_graph_builds SET heartbeat_at = ?1, started_at = ?2 \
+                 WHERE project_id = ?3",
+                params![heartbeat_at, started_at, project_id],
+            )
+            .unwrap();
+    }
+
+    fn insert_build_project(db: &Db, label: &str, status: &str) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let slug = db.generate_unique_slug(label).unwrap();
+        db.insert_project(
+            &id,
+            label,
+            &fixture_path(&format!("hb-{}", label)),
+            ProjectHost::Base,
+            &slug,
+        )
+        .unwrap();
+        db.upsert_code_graph_build(&id, status, Some(0), None, None, 0, None, false, None, None)
+            .unwrap();
+        id
+    }
+
+    /// Ticker contract: stamps only a LAUNCHER-spawned RUNNING row; a tick
+    /// after the terminal transition (or against a detached pid-bearing
+    /// row) is a no-op.
+    #[test]
+    fn touch_build_heartbeat_stamps_running_and_noops_post_terminal_and_detached() {
+        let (db, pid) = fresh_db_with_project();
+        db.upsert_code_graph_build(&pid, status::RUNNING, Some(1), None, None, 0, None, false, None, None)
+            .unwrap();
+
+        assert_eq!(db.touch_code_graph_build_heartbeat(&pid).unwrap(), 1);
+        assert!(db.get_code_graph_build(&pid).unwrap().unwrap().heartbeat_at.is_some());
+
+        // Terminal transition clears the stamp; a late tick is a no-op.
+        db.upsert_code_graph_build(
+            &pid,
+            status::SUCCESS,
+            Some(1),
+            Some(2),
+            Some(1),
+            3,
+            None,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(db.get_code_graph_build(&pid).unwrap().unwrap().heartbeat_at, None);
+        assert_eq!(
+            db.touch_code_graph_build_heartbeat(&pid).unwrap(),
+            0,
+            "post-terminal tick must be a no-op"
+        );
+
+        // Detached re-registration: the launcher ticker must not stamp a
+        // row a detached walk now owns.
+        db.register_running_code_graph_build(&pid, 4242).unwrap();
+        assert_eq!(
+            db.touch_code_graph_build_heartbeat(&pid).unwrap(),
+            0,
+            "pid-bearing (detached) rows are not the launcher ticker's to stamp"
+        );
+        let row = db.get_code_graph_build(&pid).unwrap().unwrap();
+        assert_eq!(row.status, "running");
+        assert_eq!(row.heartbeat_at, None);
+    }
+
+    /// Act + leave-alone: the stale sweep flips ONLY launcher-spawned
+    /// (pid-NULL) RUNNING rows with a stale liveness stamp. Fresh RUNNING,
+    /// legacy-fresh, detached-stale, and every terminal state untouched.
+    #[test]
+    fn mark_stale_builds_flips_only_stale_launcher_running_rows() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let now = chrono::Utc::now().timestamp_millis();
+        let window_ms = (STALE_SECS as i64) * 1000;
+
+        let stale_hb = insert_build_project(&db, "cg-stale-hb", status::RUNNING);
+        backdate_build(&db, &stale_hb, Some(now - 2 * window_ms), Some(now - 3 * window_ms));
+
+        let fresh_hb = insert_build_project(&db, "cg-fresh-hb", status::RUNNING);
+        backdate_build(&db, &fresh_hb, Some(now - 60_000), Some(now - 3 * window_ms));
+
+        let legacy_stale = insert_build_project(&db, "cg-legacy-stale", status::RUNNING);
+        backdate_build(&db, &legacy_stale, None, Some(now - 2 * window_ms));
+
+        let legacy_fresh = insert_build_project(&db, "cg-legacy-fresh", status::RUNNING);
+        backdate_build(&db, &legacy_fresh, None, Some(now - 60_000));
+
+        // Detached walk with an ANCIENT started_at: heartbeat-stale by the
+        // formula, but pid-bearing → must be left for the pid sweep.
+        let detached = uuid::Uuid::new_v4().to_string();
+        let slug = db.generate_unique_slug("cg-detached").unwrap();
+        db.insert_project(
+            &detached,
+            "cg-detached",
+            &fixture_path("hb-cg-detached"),
+            ProjectHost::Base,
+            &slug,
+        )
+        .unwrap();
+        db.register_running_code_graph_build(&detached, 999).unwrap();
+        backdate_build(&db, &detached, None, Some(now - 10 * window_ms));
+
+        // Terminal + pending rows with ancient stamps.
+        let pending = insert_build_project(&db, "cg-pending", status::PENDING);
+        backdate_build(&db, &pending, None, Some(0));
+        let success = insert_build_project(&db, "cg-success", status::SUCCESS);
+        backdate_build(&db, &success, None, Some(0));
+        let partial = insert_build_project(&db, "cg-partial", status::PARTIAL);
+        backdate_build(&db, &partial, None, Some(0));
+        let failed = insert_build_project(&db, "cg-failed", status::FAILED);
+        backdate_build(&db, &failed, None, Some(0));
+        let skipped = insert_build_project(&db, "cg-skipped", status::SKIPPED);
+        backdate_build(&db, &skipped, None, Some(0));
+
+        let n = db
+            .mark_stale_running_code_graph_builds_failed(STALE_SECS, STALE_MSG, None)
+            .unwrap();
+        assert_eq!(n, 2, "exactly the two stale launcher-spawned RUNNING rows flip");
+
+        let flipped = db.get_code_graph_build(&stale_hb).unwrap().unwrap();
+        assert_eq!(flipped.status, "failed");
+        assert!(flipped.error_message.as_deref().unwrap_or("").contains("heartbeat stale"));
+        assert!(flipped.finished_at.is_some());
+        assert_eq!(db.get_code_graph_build(&legacy_stale).unwrap().unwrap().status, "failed");
+
+        // Leave-alone legs.
+        assert_eq!(db.get_code_graph_build(&fresh_hb).unwrap().unwrap().status, "running");
+        assert_eq!(db.get_code_graph_build(&legacy_fresh).unwrap().unwrap().status, "running");
+        assert_eq!(
+            db.get_code_graph_build(&detached).unwrap().unwrap().status,
+            "running",
+            "detached (pid-bearing) walks are the pid sweep's job, not the heartbeat sweep's"
+        );
+        assert_eq!(db.get_code_graph_build(&pending).unwrap().unwrap().status, "pending");
+        assert_eq!(db.get_code_graph_build(&success).unwrap().unwrap().status, "success");
+        assert_eq!(db.get_code_graph_build(&partial).unwrap().unwrap().status, "partial");
+        assert_eq!(db.get_code_graph_build(&failed).unwrap().unwrap().status, "failed");
+        assert_eq!(db.get_code_graph_build(&skipped).unwrap().unwrap().status, "skipped");
+    }
+
+    /// Read-time guard scoping: only the filtered project's stale row flips.
+    #[test]
+    fn mark_stale_builds_scopes_to_project_when_filter_given() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let now = chrono::Utc::now().timestamp_millis();
+        let window_ms = (STALE_SECS as i64) * 1000;
+
+        let a = insert_build_project(&db, "cg-scoped-a", status::RUNNING);
+        backdate_build(&db, &a, Some(now - 2 * window_ms), None);
+        let b = insert_build_project(&db, "cg-scoped-b", status::RUNNING);
+        backdate_build(&db, &b, Some(now - 2 * window_ms), None);
+
+        let n = db
+            .mark_stale_running_code_graph_builds_failed(STALE_SECS, STALE_MSG, Some(&a))
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(db.get_code_graph_build(&a).unwrap().unwrap().status, "failed");
+        assert_eq!(db.get_code_graph_build(&b).unwrap().unwrap().status, "running");
     }
 }

@@ -213,18 +213,28 @@ fn build_script_command(project_folder: &PathBuf, name: &str) -> Result<Command,
                 bin
             )
         })?;
-    let mut cmd = if cfg!(windows) {
-        let mut c = Command::new("powershell").silent();
-        c.arg("-NoProfile")
-            .arg("-ExecutionPolicy")
-            .arg("Bypass")
-            .arg("-File")
-            .arg(&path);
-        c
-    } else {
-        Command::new(&path).silent()
-    };
+    // v0.2.89 BUG 1: the powershell-vs-direct branch moved to the shared
+    // `script_invocation::invocation_for` (one home for all three
+    // bundled-wrapper spawn sites); this helper keeps its resolution
+    // ladder, error text and current_dir.
+    let (program, prefix_args) =
+        crate::commands::script_invocation::invocation_for(&path);
+    let mut cmd = Command::new(&program).silent();
+    cmd.args(&prefix_args);
     cmd.current_dir(project_folder);
+    // v0.2.89 BUG 3 (plan §1.3 D): pin BOTH project-root channels for
+    // every wrapper this helper drives (kg-sync, kg-duplicates,
+    // code-graph-analyze — all per-project scripts, so pinning their root
+    // is equally correct). REQUIRED, not defense-in-depth:
+    // `kg_rebuild_current_project` can resolve the ORCHESTRATOR's wrapper
+    // via the v0.2.77 fallback, whose location-derived root would be the
+    // orchestrator clone; and `current_dir` alone does nothing —
+    // sync_knowledge_graph.py never reads its cwd. KG_SYNC_PROJECT_ROOT
+    // is the new non-leaking channel (wrappers set it only when unset, so
+    // this explicit value survives the fallback); KG_BASE_DIR keeps old
+    // project-local scripts correct.
+    cmd.env("KG_SYNC_PROJECT_ROOT", project_folder);
+    cmd.env("KG_BASE_DIR", project_folder);
     Ok(cmd)
 }
 
@@ -906,6 +916,97 @@ mod tests {
         if let Err(e) = built {
             assert!(e.contains("not found"), "clear not-found error: {}", e);
         }
+
+        std::fs::remove_dir_all(&proj).ok();
+    }
+
+    /// v0.2.89 BUG 1 + BUG 3: `build_script_command` must (a) route the
+    /// spawn through the shared `script_invocation::invocation_for` shape
+    /// — on Windows `powershell.exe` + the 4-token `-File` prefix, on
+    /// POSIX the script itself — and (b) pin BOTH project-root env
+    /// channels (`KG_SYNC_PROJECT_ROOT` + `KG_BASE_DIR`) to the project
+    /// folder, so the sync never inherits a foreign Claude-session root
+    /// and the orchestrator-copy wrapper fallback can't misroot it.
+    #[test]
+    fn build_script_command_uses_shared_invocation_and_pins_root_env() {
+        let bin = script_bin("kg-sync");
+
+        // Project WITH a healthy local wrapper. `kg-sync` is on the
+        // resilience-marker list, so the fixture must carry the
+        // VCT_INSTALL_ROOT marker or the resolver skips it as stale.
+        let proj = std::env::temp_dir().join(format!(
+            "vct-bsc-envpin-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let scripts = proj.join(".claude").join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        let script_path = scripts.join(&bin);
+        std::fs::write(
+            &script_path,
+            b"#!/bin/bash\n# resilient ladder marker: VCT_INSTALL_ROOT\necho ok\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+        }
+
+        let cmd = build_script_command(&proj, "kg-sync").expect("must resolve");
+        let std_cmd = cmd.as_std();
+
+        // (a) Spawn shape from the shared helper.
+        if cfg!(windows) {
+            assert_eq!(std_cmd.get_program(), std::ffi::OsStr::new("powershell.exe"));
+            let args: Vec<String> = std_cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().to_string())
+                .collect();
+            assert_eq!(
+                &args[..4],
+                &["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"],
+                "powershell prefix must lead the argv"
+            );
+            assert!(
+                args[4].ends_with("kg-sync.ps1"),
+                "script path must follow -File: {:?}",
+                args
+            );
+        } else {
+            assert_eq!(std_cmd.get_program(), script_path.as_os_str());
+            assert_eq!(
+                std_cmd.get_args().count(),
+                0,
+                "POSIX invokes the wrapper directly with no prefix args"
+            );
+        }
+
+        // (b) Both root channels pinned to the project folder.
+        let env_of = |key: &str| {
+            std_cmd
+                .get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new(key))
+                .and_then(|(_, v)| v.map(|v| v.to_owned()))
+        };
+        assert_eq!(
+            env_of("KG_SYNC_PROJECT_ROOT"),
+            Some(proj.as_os_str().to_owned()),
+            "new non-leaking root channel must be pinned (BUG 3 §1.3 D)"
+        );
+        assert_eq!(
+            env_of("KG_BASE_DIR"),
+            Some(proj.as_os_str().to_owned()),
+            "legacy root channel must be pinned too"
+        );
+
+        // current_dir preserved from the pre-refactor behaviour.
+        assert_eq!(
+            std_cmd.get_current_dir(),
+            Some(proj.as_path()),
+            "current_dir must stay the project folder"
+        );
 
         std::fs::remove_dir_all(&proj).ok();
     }

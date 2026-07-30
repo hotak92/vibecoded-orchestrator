@@ -660,9 +660,38 @@ pub async fn get_code_graph_build_status(
     project_id: String,
     db: State<'_, Db>,
 ) -> Result<Option<CodeGraphBuildView>, String> {
-    Ok(db
-        .get_code_graph_build(&project_id)?
-        .map(CodeGraphBuildView::from_row))
+    let row = db.get_code_graph_build(&project_id)?;
+
+    // BUG 2 (v0.2.89) read-time guard — sibling of the one in
+    // `kg_sync::get_kg_sync_status`. Only LAUNCHER-spawned rows
+    // (pid IS NULL) are heartbeat-governed: a detached walk (install.py
+    // resync) has no launcher ticker and is death-detected by the boot
+    // pid-aliveness sweep instead, so judging it by heartbeat would
+    // false-fail every live detached walk. The targeted mark re-checks
+    // status + pid + staleness in its own WHERE clause (race-safe).
+    if let Some(ref r) = row {
+        if r.status == build_status::RUNNING && r.pid.is_none() {
+            let stale_secs = crate::commands::kg_sync::heartbeat_stale_secs();
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            if crate::db::kg_syncs::heartbeat_is_stale(
+                r.heartbeat_at,
+                r.started_at,
+                now_ms,
+                stale_secs,
+            ) {
+                db.mark_stale_running_code_graph_builds_failed(
+                    stale_secs,
+                    crate::commands::kg_sync::CODE_GRAPH_STALE_ERROR,
+                    Some(&project_id),
+                )?;
+                return Ok(db
+                    .get_code_graph_build(&project_id)?
+                    .map(CodeGraphBuildView::from_row));
+            }
+        }
+    }
+
+    Ok(row.map(CodeGraphBuildView::from_row))
 }
 
 /// Re-trigger a code-graph build for an existing project. Marks the row
@@ -1025,6 +1054,19 @@ async fn run_build_task(
         None,
     );
     emit_build(&app, &project_id, build_status::RUNNING, 0, Some("scan"), None);
+
+    // BUG 2 (v0.2.89): heartbeat ticker — sibling of the one in
+    // `kg_sync::run_sync_task`. Bound for the whole task scope so it
+    // keeps ticking through the admission-queue wait below; the RAII
+    // guard aborts it on every exit path incl. panic unwind. The DB stamp
+    // is status- AND pid-guarded (a detached walk re-registering the row
+    // mid-build takes it out of this ticker's reach).
+    let _heartbeat = crate::commands::kg_sync::spawn_heartbeat_ticker(
+        app.clone(),
+        project_id.clone(),
+        Db::touch_code_graph_build_heartbeat,
+        "code-graph build",
+    );
 
     // 2. Pre-check: any supported source files at all?
     let detected = match detect_supported_languages(std::path::Path::new(&folder_path), 3) {
@@ -1399,8 +1441,20 @@ async fn run_build_task(
         crate::commands::embed_admission::acquire_update_all_admission(&db).await
     };
 
-    let mut cmd = tokio::process::Command::new(&script).silent();
-    cmd.args(&args)
+    // v0.2.89 BUG 1 (Fabio Windows field audit): route the spawn through
+    // the shared `script_invocation::invocation_for` helper. This was the
+    // ONE bundled-wrapper spawn site that never gained the Windows branch:
+    // `Command::new(<code-graph-analyze.ps1>)` cannot CreateProcess a
+    // `.ps1` (not a PE image) → os error 193 → 10/10 failed Windows
+    // builds. On Windows the helper yields `powershell.exe` + the
+    // `-NoProfile -ExecutionPolicy Bypass -File <script>` prefix; on POSIX
+    // it yields the script itself with no prefix. Everything else in this
+    // spawn block (admission permit above, env, cwd, stdin-null) stays.
+    let (program, prefix_args) =
+        crate::commands::script_invocation::invocation_for(&script);
+    let mut cmd = tokio::process::Command::new(&program).silent();
+    cmd.args(&prefix_args)
+        .args(&args)
         // Don't inherit the launcher's working dir; the analyzer is
         // path-aware and we don't want it picking up an unrelated cwd.
         .current_dir(std::env::temp_dir())

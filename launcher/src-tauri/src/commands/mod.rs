@@ -173,6 +173,15 @@ pub mod project_folder_health;
 pub mod project_state_cmd;
 pub mod project_state_populate;
 pub mod restart;
+// v0.2.89 BUG 1 (Fabio Windows field audit): ONE home for the
+// (program, prefix-args) resolution used to spawn bundled
+// `.claude/scripts/*` wrappers. Windows cannot CreateProcess a `.ps1`
+// (os error 193), so the spawn must route through `powershell.exe -File`.
+// Extracted from the two previously-correct duplicates
+// (`kg_sync::invocation_for`, `orchestrator_core::build_script_command`);
+// `codegraph`'s direct spawn was the third call-site — the one that never
+// gained the Windows branch (10/10 failed Windows codegraph builds).
+pub mod script_invocation;
 // v0.2.52 V52-AH: Windows binary lock fix via stage1 updater handoff.
 // Companion to `commands::restart`. On Windows, `update_orchestrator`
 // writes a lock file describing pending binary swaps + spawns

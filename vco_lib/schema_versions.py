@@ -195,6 +195,11 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: the DB schema is at the level this code expects (refuse to start if
 #: launcher.db is somehow ahead — user downgraded orchestrator while running
 #: on newer DB).
+#: 41 = migration 041_job_heartbeats.sql (BUG 2, v0.2.89 — nullable
+#: heartbeat_at liveness columns on kg_syncs + code_graph_builds so a task
+#: death with the launcher still up is detected by the 5-min sweeper /
+#: read-time guards instead of leaving RUNNING rows forever). Bumped
+#: ATOMICALLY with mig 041's Rust registration.
 #: 40 = migration 040_shared_kg_gate_module_id_canonicalize.sql (2026-07-14
 #: split-brain fix — relocates the shared-KG gate flags
 #: shared_kg_read_disabled / shared_kg_write_disabled / shared_kg_opt_out
@@ -213,7 +218,7 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: 37 = migration 037_code_graph_build_pid.sql (code_graph_builds.pid, R-4 —
 #: registers the detached install-spawned resync walk so the GUI shows it and
 #: the boot sweep can death-detect it).
-LAUNCHER_DB_TABLE_SET_VERSION = 40
+LAUNCHER_DB_TABLE_SET_VERSION = 41
 
 
 # ===========================================================================

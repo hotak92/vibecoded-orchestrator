@@ -50,11 +50,164 @@ use tauri::{command, AppHandle, Emitter, Manager, State};
 
 use crate::commands::installer::find_local_repo_root;
 use crate::commands::project_env_settings::{self, ProjectEnvSettings};
-use crate::db::kg_syncs::{status as sync_status, KgSyncRow};
+// v0.2.89 BUG 1: the (program, prefix-args) spawn-shape resolution moved to
+// the shared `script_invocation` module (one home for all three bundled-
+// wrapper spawn sites — this file, orchestrator_core, codegraph).
+use crate::commands::script_invocation::invocation_for;
+use crate::db::kg_syncs::{heartbeat_is_stale, status as sync_status, KgSyncRow};
 use crate::db::Db;
 use vct_launcher_core::process::CommandExt as _;
 
 const SYNC_EVENT: &str = "kg-sync-progress";
+
+// ─── BUG 2 (v0.2.89): heartbeat liveness ────────────────────────────────
+//
+// Field report: kg_sync rows stuck RUNNING for ~70 h. Terminal-state writes
+// happen only inside the spawned task and the only reconciliation was the
+// boot-time orphan sweep — any task death with the launcher still up (tokio
+// panic/abort, a task parked on the embed-admission queue, launcher killed
+// and not restarted for days) left RUNNING forever. The mechanism below is
+// a LIVENESS net, per the standing rule NOT a per-file / per-node deadline
+// (the stall watchdog already bounds subprocess silence):
+//
+//   * ticker  — the running task stamps `heartbeat_at` every 60 s
+//               (status-guarded UPDATE; ticks during the admission wait
+//               too — a queued-but-alive task stays honest).
+//   * sweeper — a 5-min interval task (spawned once, from
+//               `resume_pending_syncs` so lib.rs stays untouched) flips
+//               stale RUNNING rows in BOTH twin tables to failed.
+//   * read-time guard — `get_kg_sync_status` / codegraph's status read
+//               flip a stale row on fetch for immediate GUI honesty
+//               between sweeps.
+//
+// The code-graph constants live here too because the cross-table sweeper
+// is owned by this module; `commands::codegraph` imports its message +
+// the shared ticker plumbing from here.
+
+/// Ticker cadence. A live task stamps liveness this often regardless of
+/// how slow the subprocess is, so the stale window below only ages on a
+/// dead task (or a launcher that never came back).
+const HEARTBEAT_TICK_SECS: u64 = 60;
+
+/// Floor of the staleness window: 30 min of missed 60 s ticks ⇒ the task
+/// is gone (launcher up) or the launcher is gone (next boot sweeps).
+const HEARTBEAT_STALE_FLOOR_SECS: u64 = 1800;
+
+/// Sweeper cadence.
+const HEARTBEAT_SWEEP_INTERVAL_SECS: u64 = 300;
+
+/// Error message for a heartbeat-swept kg_sync row (GUI banner contract —
+/// terse and action-oriented, mirrors the boot-sweep message shape).
+pub(crate) const KG_SYNC_STALE_ERROR: &str =
+    "sync task died without reporting (heartbeat stale); click Retry to re-run";
+
+/// Sibling message for the code_graph_builds twin (the sweeper reconciles
+/// both tables in one pass, so both messages live beside it).
+pub(crate) const CODE_GRAPH_STALE_ERROR: &str =
+    "build task died without reporting (heartbeat stale); click Retry to re-run";
+
+/// Staleness window: `max(1800, 2 × resolved stall timeout)`. A stall
+/// watchdog stretched via `KG_SYNC_STALL_TIMEOUT_SECS` widens this window
+/// too, so the liveness net can never fire before the (re-armed, silence-
+/// bounded) watchdog has had its say. When the watchdog is disabled
+/// (env = 0) the default window still applies — heartbeats bound TASK
+/// death, which is orthogonal to subprocess silence.
+pub(crate) fn heartbeat_stale_secs() -> u64 {
+    let stall_secs = resolve_stall_timeout()
+        .map(|d| d.as_secs())
+        .unwrap_or(DEFAULT_STALL_TIMEOUT_SECS);
+    HEARTBEAT_STALE_FLOOR_SECS.max(stall_secs.saturating_mul(2))
+}
+
+/// RAII guard for a heartbeat ticker task: aborts the ticker when dropped
+/// — including the panic-unwind path of the owning task, so a crashed
+/// sync can never leave a ticker stamping liveness onto a row whose task
+/// is gone (that would defeat the whole mechanism).
+pub(crate) struct HeartbeatGuard(tokio::task::AbortHandle);
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Spawn a 60 s heartbeat ticker for `project_id`. `touch` is the
+/// status-guarded DB stamp (`Db::touch_kg_sync_heartbeat` or
+/// `Db::touch_code_graph_build_heartbeat`) — the guard inside the SQL
+/// means a tick that lands after the row reached a terminal state (or,
+/// for codegraph, after a detached walk took the row over) touches
+/// nothing. Bind the returned guard for the whole task scope.
+pub(crate) fn spawn_heartbeat_ticker(
+    app: AppHandle,
+    project_id: String,
+    touch: fn(&Db, &str) -> Result<usize, String>,
+    label: &'static str,
+) -> HeartbeatGuard {
+    let handle = tokio::spawn(async move {
+        loop {
+            // First tick immediately: liveness is on record from the
+            // moment the task starts (covers the admission-queue wait).
+            {
+                let db = app.state::<Db>();
+                if let Err(e) = touch(&db, &project_id) {
+                    eprintln!(
+                        "[vct] warning: {} heartbeat tick failed for {}: {}",
+                        label, project_id, e
+                    );
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(HEARTBEAT_TICK_SECS)).await;
+        }
+    });
+    HeartbeatGuard(handle.abort_handle())
+}
+
+/// One-shot latch so the sweeper is spawned at most once per process even
+/// if `resume_pending_syncs` were ever called twice.
+static HEARTBEAT_SWEEPER_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Spawn the periodic staleness sweeper (both twin tables, one pass).
+/// Spawned from INSIDE `resume_pending_syncs` — deliberately not lib.rs,
+/// which already calls that function at setup. Soft-fail: DB errors are
+/// logged and the loop keeps going; a missed sweep is recovered by the
+/// next tick or the read-time guards.
+fn spawn_stale_heartbeat_sweeper(app: AppHandle) {
+    use std::sync::atomic::Ordering;
+    if HEARTBEAT_SWEEPER_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(
+                HEARTBEAT_SWEEP_INTERVAL_SECS,
+            ))
+            .await;
+            let stale_secs = heartbeat_stale_secs();
+            let db = app.state::<Db>();
+            match db.mark_stale_running_kg_syncs_failed(stale_secs, KG_SYNC_STALE_ERROR, None) {
+                Ok(n) if n > 0 => eprintln!(
+                    "[vct] kg-sync heartbeat sweep: {} row(s) stale > {}s; flipped to failed",
+                    n, stale_secs
+                ),
+                Err(e) => eprintln!("[vct] warning: kg-sync heartbeat sweep failed: {}", e),
+                _ => {}
+            }
+            match db.mark_stale_running_code_graph_builds_failed(
+                stale_secs,
+                CODE_GRAPH_STALE_ERROR,
+                None,
+            ) {
+                Ok(n) if n > 0 => eprintln!(
+                    "[vct] code-graph heartbeat sweep: {} row(s) stale > {}s; flipped to failed",
+                    n, stale_secs
+                ),
+                Err(e) => eprintln!("[vct] warning: code-graph heartbeat sweep failed: {}", e),
+                _ => {}
+            }
+        }
+    });
+}
 
 /// v0.2.71 Piece 5a — process-global single-flight cap on KG re-embeds.
 ///
@@ -183,7 +336,30 @@ pub async fn get_kg_sync_status(
     project_id: String,
     db: State<'_, Db>,
 ) -> Result<Option<KgSyncView>, String> {
-    Ok(db.get_kg_sync(&project_id)?.map(KgSyncView::from_row))
+    let row = db.get_kg_sync(&project_id)?;
+
+    // BUG 2 (v0.2.89) read-time guard: a RUNNING row whose liveness stamp
+    // aged past the window belongs to a dead task — mark it failed FIRST
+    // and return the failed row, so the GUI is honest immediately instead
+    // of waiting up to one sweeper interval. The targeted mark re-checks
+    // staleness inside its own WHERE clause, so a tick landing between
+    // our read and the update safely turns this into a no-op.
+    if let Some(ref r) = row {
+        if r.status == sync_status::RUNNING {
+            let stale_secs = heartbeat_stale_secs();
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            if heartbeat_is_stale(r.heartbeat_at, r.started_at, now_ms, stale_secs) {
+                db.mark_stale_running_kg_syncs_failed(
+                    stale_secs,
+                    KG_SYNC_STALE_ERROR,
+                    Some(&project_id),
+                )?;
+                return Ok(db.get_kg_sync(&project_id)?.map(KgSyncView::from_row));
+            }
+        }
+    }
+
+    Ok(row.map(KgSyncView::from_row))
 }
 
 /// Re-run the KG / docs sync for an existing project. Marks the row as
@@ -258,6 +434,12 @@ pub fn resume_pending_syncs(
     skip: &std::collections::HashSet<String>,
 ) -> (usize, usize) {
     let db = app.state::<Db>();
+
+    // BUG 2 (v0.2.89): start the periodic heartbeat-staleness sweeper for
+    // BOTH twin tables. Spawned here (lib.rs already calls this function
+    // at setup) so the boot wiring stays in one place; the latch inside
+    // makes a hypothetical second call a no-op.
+    spawn_stale_heartbeat_sweeper(app.clone());
 
     // Phase 1: stale-running sweep.
     let swept = match db.mark_orphaned_running_kg_syncs_failed(
@@ -373,6 +555,19 @@ async fn run_sync_task(
         ProgressCounts::zero(),
         Some("scan"),
         None,
+    );
+
+    // BUG 2 (v0.2.89): heartbeat ticker for the row we just marked
+    // RUNNING. Bound for the WHOLE task scope so it keeps ticking through
+    // the admission-queue wait below (a queued-but-alive task stays
+    // honest); the RAII guard aborts it on every exit path, including
+    // panic unwind. The DB stamp is status-guarded, so ticks racing the
+    // terminal upsert touch nothing.
+    let _heartbeat = spawn_heartbeat_ticker(
+        app.clone(),
+        project_id.clone(),
+        Db::touch_kg_sync_heartbeat,
+        "kg-sync",
     );
 
     // 2. Pre-check: any markdown files at all under knowledge/ or docs/?
@@ -689,6 +884,19 @@ fn build_kg_sync_env(
 ) -> Vec<(&'static str, std::ffi::OsString)> {
     let mut pairs: Vec<(&'static str, std::ffi::OsString)> = vec![
         ("KG_BASE_DIR", project_folder.as_os_str().to_owned()),
+        // BUG 3 (v0.2.89, plan §1.3 C): the NEW non-leaking root channel.
+        // `sync_knowledge_graph.py` resolves its project root with the
+        // precedence `--project-root argv > KG_SYNC_PROJECT_ROOT >
+        // KG_BASE_DIR (legacy) > script location`. `KG_BASE_DIR` is
+        // exported by every Claude session (poisoned by design), so the
+        // wrappers pin the new name set-if-unset from their own location —
+        // the launcher must set it EXPLICITLY so its value survives the
+        // v0.2.77 orchestrator-copy wrapper fallback (whose location-
+        // derived root would be the orchestrator clone — wrong). Env-only,
+        // no argv change: a NEW launcher driving an OLD project-local
+        // script must keep working (an unknown env var is ignored; an
+        // unknown argv flag would be mis-parsed as a file path).
+        ("KG_SYNC_PROJECT_ROOT", project_folder.as_os_str().to_owned()),
         (
             "PROJECT_NAME",
             std::ffi::OsString::from(&env_settings.project_name),
@@ -1324,32 +1532,9 @@ pub(crate) fn resolve_kg_sync_script(
     vct_launcher_core::paths::resolve_installed_script(project_folder, bin)
 }
 
-/// Resolve the (program, base-args) pair for invoking the kg-sync script.
-///
-/// On Windows we drive the .ps1 wrapper through `powershell.exe -File`;
-/// on POSIX we invoke the shell wrapper directly (it's chmod +x, with a
-/// `#!/bin/bash` shebang). The caller then appends `--all` + any other
-/// per-run args.
-///
-/// We pin `-ExecutionPolicy Bypass` on Windows because launcher installs
-/// frequently land on machines with the default Restricted policy; the
-/// script is bundled with VCO and trusted. Pattern matches install.ps1.
-fn invocation_for(script: &std::path::Path) -> (std::path::PathBuf, Vec<String>) {
-    if cfg!(windows) {
-        (
-            std::path::PathBuf::from("powershell.exe"),
-            vec![
-                "-NoProfile".to_string(),
-                "-ExecutionPolicy".to_string(),
-                "Bypass".to_string(),
-                "-File".to_string(),
-                script.to_string_lossy().to_string(),
-            ],
-        )
-    } else {
-        (script.to_path_buf(), Vec::new())
-    }
-}
+// v0.2.89 BUG 1: `invocation_for` (the powershell-vs-direct spawn shape)
+// moved verbatim to `crate::commands::script_invocation` — one home for
+// all three bundled-wrapper spawn sites. Its unit tests moved with it.
 
 // ─── Stdout parsing ──────────────────────────────────────────────────────
 
@@ -1555,19 +1740,8 @@ mod tests {
         assert_eq!(tail_log("all good"), "all good");
     }
 
-    #[test]
-    fn invocation_for_picks_powershell_on_windows() {
-        let script = std::path::Path::new("/x/.claude/scripts/kg-sync.ps1");
-        let (program, args) = invocation_for(script);
-        if cfg!(windows) {
-            assert_eq!(program, std::path::PathBuf::from("powershell.exe"));
-            assert!(args.contains(&"-File".to_string()));
-            assert!(args.iter().any(|a| a.ends_with("kg-sync.ps1")));
-        } else {
-            assert_eq!(program, script);
-            assert!(args.is_empty());
-        }
-    }
+    // v0.2.89 BUG 1: `invocation_for_picks_powershell_on_windows` moved to
+    // `commands::script_invocation::tests` alongside the function.
 
     #[test]
     fn resolve_kg_sync_finds_project_local_copy() {
@@ -1759,6 +1933,69 @@ mod tests {
             "PYTHONUNBUFFERED=1 must be set so per-chunk progress streams \
              promptly enough to feed the stall watchdog",
         );
+    }
+
+    // BUG 3 (v0.2.89, plan §1.3 C): the launcher must pin BOTH root
+    // channels. `KG_BASE_DIR` is the legacy channel (still honored);
+    // `KG_SYNC_PROJECT_ROOT` is the new non-leaking channel whose
+    // explicit launcher value must survive the orchestrator-copy wrapper
+    // fallback (wrappers only set it when UNSET).
+    #[test]
+    fn build_kg_sync_env_pins_both_project_root_channels() {
+        use crate::commands::project_env_settings::ProjectEnvSettings;
+        let settings = ProjectEnvSettings::with_defaults("TestProject");
+        let folder = std::path::Path::new("/tmp/proj-root-pin");
+        let env = build_kg_sync_env(&settings, folder, None);
+
+        let find = |key: &str| {
+            env.iter().find(|(k, _)| *k == key).map(|(_, v)| v.clone())
+        };
+        assert_eq!(
+            find("KG_BASE_DIR"),
+            Some(folder.as_os_str().to_owned()),
+            "legacy root channel must stay pinned"
+        );
+        assert_eq!(
+            find("KG_SYNC_PROJECT_ROOT"),
+            Some(folder.as_os_str().to_owned()),
+            "new non-leaking root channel must be pinned to the project folder \
+             (BUG 3: a leaked foreign KG_BASE_DIR must never win over this)"
+        );
+    }
+
+    // ─── BUG 2 (v0.2.89): heartbeat staleness window ─────────────────────
+    //
+    // `heartbeat_stale_secs` reads KG_SYNC_STALL_TIMEOUT_SECS via
+    // `resolve_stall_timeout`, so these tests serialize on the same env
+    // lock as the watchdog tests above.
+
+    #[test]
+    fn heartbeat_stale_secs_has_floor_and_scales_with_stall_timeout() {
+        let _g = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var_os("KG_SYNC_STALL_TIMEOUT_SECS");
+
+        // Default stall (900 s): max(1800, 2 × 900) = 1800 (the floor).
+        unsafe { std::env::remove_var("KG_SYNC_STALL_TIMEOUT_SECS"); }
+        assert_eq!(heartbeat_stale_secs(), 1800);
+
+        // Small stall override: floor still wins.
+        unsafe { std::env::set_var("KG_SYNC_STALL_TIMEOUT_SECS", "42"); }
+        assert_eq!(heartbeat_stale_secs(), 1800);
+
+        // Large stall override: window widens to 2× so the liveness net
+        // can never fire before the silence watchdog.
+        unsafe { std::env::set_var("KG_SYNC_STALL_TIMEOUT_SECS", "3600"); }
+        assert_eq!(heartbeat_stale_secs(), 7200);
+
+        // Watchdog disabled (0): the heartbeat window still applies —
+        // task liveness is orthogonal to subprocess silence.
+        unsafe { std::env::set_var("KG_SYNC_STALL_TIMEOUT_SECS", "0"); }
+        assert_eq!(heartbeat_stale_secs(), 1800);
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("KG_SYNC_STALL_TIMEOUT_SECS", v) },
+            None => unsafe { std::env::remove_var("KG_SYNC_STALL_TIMEOUT_SECS") },
+        }
     }
 
     // ─── Bug-3 v0.2.x (2026-05-12): concurrent-drain deadlock regression ──

@@ -218,6 +218,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "canonicalize the shared-KG gate module_id (2026-07-14 split-brain fix). The per-project gate flags shared_kg_read_disabled / shared_kg_write_disabled / shared_kg_opt_out were WRITTEN under module_settings.module_id='__project__' by the launcher GUI setters/getters (commands/projects_v2.rs) but READ under 'orchestrator-core' by the hub /config resolver (vct-hub/src/config_api.rs) + the Python env projection (vco_lib/config_projection.py) — same key, two namespaces, so the GUI toggle read FALSE on the hub + Python surfaces. The writers/getters are now repointed to the canonical 'orchestrator-core' id (db/module_settings_keys.rs::ORCHESTRATOR_CORE_MODULE_ID). This migration relocates existing '__project__' rows for these three keys onto the canonical id: rows with no canonical counterpart flip module_id in place; when both exist the NEWER value (higher rowid == later write) wins; the legacy '__project__' row is then deleted. Idempotent via the runner's version check (a manual re-run finds no '__project__' rows left). Plain UPDATE/DELETE — not self-transactional; rides the runner's outer transaction. LAUNCHER_DB_TABLE_SET_VERSION bumps 39->40 atomically with this migration (B-2).",
         sql: include_str!("migrations/040_shared_kg_gate_module_id_canonicalize.sql"),
     },
+    Migration {
+        version: 41,
+        description: "heartbeat_at liveness columns on kg_syncs + code_graph_builds (BUG 2, v0.2.89 — field-reported kg_sync rows stuck RUNNING ~70 h). Terminal-state writes happen only in-task and the only reconciliation was the boot-time orphan sweep, so any task death with the launcher still up (tokio panic/abort, admission-queue park, launcher killed without restart) left RUNNING forever. The running task now stamps heartbeat_at every 60 s (a task-liveness marker, NOT a per-item deadline — the stall watchdog already bounds subprocess silence); staleness = status='running' AND COALESCE(heartbeat_at, started_at, 0) older than the stale window (started_at fallback covers pre-migration legacy rows). Consumers: Db::touch_*_heartbeat tickers, Db::mark_stale_running_*_failed (5-min sweeper spawned from resume_pending_syncs + read-time guards in both status commands). One migration for both columns because the tables are deliberate twins reconciled in the same sweep pass. Plain additive ALTER TABLE — idempotent via the runner's version check, not self-transactional. LAUNCHER_DB_TABLE_SET_VERSION bumps 40->41 atomically with this migration (B-2).",
+        sql: include_str!("migrations/041_job_heartbeats.sql"),
+    },
 ];
 
 /// Migrations whose .sql manages its OWN `BEGIN`/`COMMIT` boundary.
@@ -2380,5 +2385,98 @@ mod tests {
             read_setting(&conn, "p1", "orchestrator-core", "shared_kg_write_disabled"),
             Some("true".to_string())
         );
+    }
+
+    // ─── Migration 041 — heartbeat_at on kg_syncs + code_graph_builds ────
+    //     (BUG 2, v0.2.89 — rows stuck RUNNING with the launcher up)
+
+    /// Fresh DB: both twin tables carry the nullable heartbeat_at column.
+    #[test]
+    fn migration_041_adds_heartbeat_columns_on_fresh_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply migrations");
+
+        for table in ["kg_syncs", "code_graph_builds"] {
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_info({})", table))
+                .unwrap();
+            let cols: Vec<(String, String, i64)> = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            let hb = cols
+                .iter()
+                .find(|c| c.0 == "heartbeat_at")
+                .unwrap_or_else(|| panic!("{}.heartbeat_at must exist after 041", table));
+            assert_eq!(hb.1.to_uppercase(), "INTEGER", "{} column type", table);
+            assert_eq!(hb.2, 0, "{}.heartbeat_at must be nullable", table);
+        }
+    }
+
+    /// Upgrade path on POPULATED tables: a DB stopped at v40 with existing
+    /// rows in both tables gains the column; pre-existing rows survive
+    /// verbatim with heartbeat_at NULL (the legacy-row class the staleness
+    /// predicate covers via its started_at fallback).
+    #[test]
+    fn migration_041_adds_columns_on_upgrade_preserving_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 40).expect("apply up to v40");
+
+        seed_project_row_for_mig(&conn, "p1");
+        conn.execute(
+            "INSERT INTO kg_syncs (project_id, status, started_at) \
+             VALUES ('p1', 'running', 1000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_graph_builds (project_id, status, started_at, files_analyzed, pid) \
+             VALUES ('p1', 'running', 1000, 3, 777)",
+            [],
+        )
+        .unwrap();
+
+        apply(&conn).expect("apply remaining migrations (041)");
+
+        // Rows survive with heartbeat_at NULL; pre-041 columns intact.
+        let (status, started, hb): (String, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT status, started_at, heartbeat_at FROM kg_syncs WHERE project_id='p1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "running");
+        assert_eq!(started, 1000);
+        assert_eq!(hb, None, "legacy kg_syncs row backfills heartbeat_at NULL");
+
+        let (status, pid, hb): (String, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT status, pid, heartbeat_at FROM code_graph_builds WHERE project_id='p1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "running");
+        assert_eq!(pid, Some(777), "pid column must survive the additive 041");
+        assert_eq!(hb, None, "legacy build row backfills heartbeat_at NULL");
+    }
+
+    /// Migration 041 is idempotent (runner version-gate; regression net).
+    #[test]
+    fn migration_041_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("first apply");
+        apply(&conn).expect("second apply (idempotent)");
     }
 }
