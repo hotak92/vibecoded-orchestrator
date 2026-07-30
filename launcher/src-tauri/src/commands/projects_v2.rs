@@ -19,7 +19,6 @@ use crate::db::kg_summaries::status as kg_summary_status;
 use crate::db::kg_syncs::status as kg_sync_status;
 use crate::db::models::{ModuleInstallRow, ProjectHost, ProjectRow};
 use crate::db::Db;
-use crate::project_naming::canonical_class_prefix;
 use vct_launcher_core::process::CommandExt as _;
 
 #[derive(Debug, Clone, Serialize)]
@@ -4508,13 +4507,27 @@ pub fn write_env_reference_sidecar(
 mod naming;
 pub(crate) use naming::*;
 
-// v0.2.49 access-matrix Step F SB2 (L1-F1 + L2-SB1 cross-lens fix):
-// the propagate_kg_access_on_rename helper has been LIFTED into
-// `db::access::Db::propagate_kg_access_on_rename` so both the Tauri
-// rename path AND the hub-CLI rename path (`vct-hub/src/cli_api.rs`)
-// share one source of truth. Pre-lift the hub CLI never called the
-// helper, leaving orphan kg_collection_access rows after CLI-driven
-// renames. See the new method's docstring for the full contract.
+// v0.2.89 (BUG 4) — IMMUTABLE NAMES: a project rename changes the display
+// name (+ URL slug) ONLY. Collection names (KG binding, dev/diagrams
+// siblings, code-graph binding prefix) are fixed at creation time and never
+// move on rename. The three v0.2.49/v0.2.75 rename-propagation mechanisms
+// are retired:
+//   * `db::access::Db::propagate_kg_access_on_rename` — now a documented
+//     no-op (post-v0.2.84 binding-first resolution it rewrote access rows to
+//     name-derived collections that will never exist ⇒ manufactured
+//     phantoms; the hub-CLI rename path still calls the no-op).
+//   * `propagate_codegraph_binding_on_rename` — DELETED (it MOVED the
+//     binding prefix to the new name, pointing every read at an empty class
+//     set until a rebuild — the Fabio 'HouseOfFlirt' phantom — while
+//     `project_kg_bindings` never moved: a half-update by construction).
+//   * `emit_codegraph_rename_deferral` / `codegraph_rename_split_pending` —
+//     DELETED (no split can occur when nothing moves). Stale pre-.89
+//     entries are settled by the boot-time `binding_reconcile` repair when
+//     it restores a half-renamed binding.
+// v0.2.82/84 already moved every READ path onto the bindings; immutable
+// names complete that direction. Half-renamed installs from the pre-.89
+// window are healed by the evidence-gated boot repair in
+// `crate::binding_reconcile`.
 
 #[command]
 pub async fn rename_project_v2(
@@ -4574,51 +4587,12 @@ pub async fn rename_project_v2(
     let count = db.list_module_installs_for_project(&id)?.len() as u32;
     let mut warnings: Vec<String> = Vec::new();
 
-    // v0.2.49 access-matrix Phase 4 (item #11): propagate the project-name
-    // change into `kg_collection_access`. See `propagate_kg_access_on_rename`
-    // for the full contract + soft-fail discipline. Returned warnings
-    // (if any) flow into `RenameProjectResult.warnings` for the GUI to
-    // surface, matching the env-refresh failure surface below.
-    if let Some(old) = &old_name {
-        warnings.extend(db.propagate_kg_access_on_rename(&id, old, &new_name));
-    }
-
-    // C-10 (v0.2.75): keep the code-graph binding prefix — the SINGLE source
-    // of truth every consumer reads (GUI counts, MCP/CLI reads via the env
-    // projection + hub resolver, and the class set the rebuild fills) — in
-    // lock-step with the rename. Pre-fix the binding kept the OLD prefix
-    // while (a) the launcher's rebuild spawned the analyzer with the NEW
-    // `projects.name` and (b) the GUI count queries filtered `project ==
-    // <new name>` against the OLD classes — a split brain where writes and
-    // reads disagreed and the orphan GUI could attribute the freshly-rebuilt
-    // NEW-prefix classes as a deletable orphan group (SEV-1 data-loss vector).
-    //
-    // Read-path window (decided v0.2.75, plan-preferred option): the binding
-    // moves to the NEW prefix AT RENAME TIME, so reads point at a NEW —
-    // initially EMPTY — class set until the user runs the rebuild the
-    // `codegraph_rename_split_pending` deferral names. Empty reads for that
-    // window are the deliberate trade: they are honest ("this graph needs a
-    // rebuild"), they can never lose data, and the OLD classes stay intact
-    // until the user consents to dropping them via the orphan-collections
-    // GUI (which, post-rename, correctly attributes them as an orphan group).
-    // The alternative (leave the binding on OLD until a migration) keeps
-    // COUNT reads broken anyway — the GUI filters rows by the NEW
-    // `projects.name`, which OLD-prefix rows aren't stamped with.
-    //
-    // Leave-alone case: a binding whose prefix does NOT match the OLD name's
-    // derived prefix was customized by the user (Identity tab → code-graph
-    // prefix). Never clobber it — the custom prefix stays the SSOT and the
-    // deferral text still names where the rows live.
-    let rename_cg_binding = db.get_project_codegraph_binding(&id).ok().flatten();
-    if let Some(old) = &old_name {
-        warnings.extend(propagate_codegraph_binding_on_rename(
-            &db,
-            &id,
-            old,
-            &new_name,
-            rename_cg_binding.as_ref(),
-        ));
-    }
+    // v0.2.89 (BUG 4): IMMUTABLE NAMES — no collection/binding/access-row
+    // propagation happens here anymore. `project_kg_bindings`,
+    // `project_codegraph_bindings`, and `kg_collection_access` all keep
+    // their creation-time names; every read path is binding-first since
+    // v0.2.82/84, so display renames are zero-migration by construction.
+    // (See the module-level retirement note above `rename_project_v2`.)
 
     // C-10 (v0.2.75): `codegraph_access` grants are ID-keyed
     // (grantor_project_id / grantee_project_id, FK → projects.id), so the
@@ -4676,80 +4650,42 @@ pub async fn rename_project_v2(
         warnings.push(msg);
     }
     // ensure_project_env_template is append-only, so the project-root `.env`
-    // may still carry the OLD KG_COLLECTION value as an active line. VCO never
-    // auto-rewrites `.env` on rename — that file may be committed to the user's
-    // VCS, so poisoning it silently is forbidden (B12 safety, matches safe-add).
-    // We only DETECT the stale line and surface honest remediations. B12 (audit
-    // v0.2.75): the previous message told the user to "run repair-env (PR 5)",
-    // a tool/command that never shipped — the user could not act on it. Name the
-    // REAL remediations instead: the launcher's per-project bundle update (or the
-    // equivalent CLI) re-projects the canonical env surfaces, or the user can hand-
-    // edit the single stale line. The stale finding is also appended to the rename
-    // deferral below so it survives past the toast (see `stale_env_note`).
-    let mut stale_env_note: Option<String> = None;
+    // may carry a DRIFTED KG_COLLECTION value as an active line. VCO never
+    // auto-rewrites `.env` — that file may be committed to the user's VCS, so
+    // poisoning it silently is forbidden (B12 safety, matches safe-add). We
+    // only DETECT the stale line and surface honest remediations (bundle
+    // update re-projects the canonical env surfaces, or hand-edit the line).
+    //
+    // v0.2.89 (BUG 4): compare against the BINDING-resolved KG collection,
+    // NOT `{new_name}_KnowledgeGraph`. Under immutable names the collection
+    // does not change on rename, so the old name-derived comparison would
+    // have flagged EVERY rename's .env as stale (it still — correctly —
+    // carries the creation-time collection name). The check now fires only
+    // for genuinely-drifted .env files.
     if let Ok(env_text) = std::fs::read_to_string(folder.join(".env")) {
-        let new_kg = format!("{}_KnowledgeGraph", sanitize_kg_collection(&new_name));
-        if !env_text.contains(&format!("KG_COLLECTION={}", new_kg)) {
+        let resolved = vct_launcher_core::collection_naming::resolve_project_collections(
+            &db,
+            Some(&id),
+            &new_name,
+            Some(&row.slug),
+        );
+        let bound_kg = resolved.kg;
+        if !env_text.contains(&format!("KG_COLLECTION={}", bound_kg)) {
             let msg = format!(
-                "The project-root .env at {} still contains a stale KG_COLLECTION \
-                 line after the rename (VCO never rewrites .env automatically — it \
-                 may be committed to your VCS). VCO's own env channels \
-                 (.claude/settings.json for MCP, .claude/env for the shell) were \
-                 already re-projected to the new name, so KG routing is NOT degraded. \
-                 To fix the committed .env too, either run \
+                "The project-root .env at {} carries a KG_COLLECTION line that \
+                 does not match the project's bound collection ({}). VCO never \
+                 rewrites .env automatically — it may be committed to your VCS. \
+                 VCO's own env channels (.claude/settings.json for MCP, \
+                 .claude/env for the shell) are re-projected from the binding, \
+                 so KG routing is NOT degraded. To fix the committed .env too, \
+                 either run \
                  `python -m vco_lib.project_init install-bundle --update --folder {}` \
                  (equivalently, the launcher's per-project \"Update bundle\" button), \
                  or manually edit the stale line to read KG_COLLECTION={}.",
-                row.folder_path, row.folder_path, new_kg
+                row.folder_path, bound_kg, row.folder_path, bound_kg
             );
             eprintln!("[vct] warning: {}", msg);
             warnings.push(msg);
-            stale_env_note = Some(format!(
-                "Stale project-root .env detected: it still carries the pre-rename \
-                 KG_COLLECTION line. VCO left .env untouched (it may be committed); \
-                 fix it with `install-bundle --update` or by editing the line to \
-                 KG_COLLECTION={} (VCO's own .claude env channels already track the \
-                 new name).",
-                new_kg
-            ));
-        }
-    }
-
-    // C-10 (v0.2.73, reworked v0.2.75): a rename leaves the existing rows in
-    // the OLD `<OldPrefix>_Code*` classes — Weaviate has no class-rename verb.
-    // The binding prefix has ALREADY been moved to the NEW name-derived
-    // prefix above (when it was name-derived), so reads now point at a NEW,
-    // initially EMPTY class set. This deferral is the honest "your code graph
-    // needs a rebuild under the new name" signal: the rebuild fills the NEW
-    // classes, and the OLD classes then surface in the launcher's
-    // orphan-collections GUI for consented cleanup. `cg_prefix_old` is the
-    // PRE-rename binding prefix (captured before the update) so the deferral
-    // can name where the existing rows still live.
-    if let Some(old) = &old_name {
-        if old != &new_name {
-            let cg_prefix_old = rename_cg_binding
-                .as_ref()
-                .map(|b| b.collection_prefix.clone());
-            if let Err(e) = emit_codegraph_rename_deferral(
-                Path::new(&row.folder_path),
-                old,
-                &new_name,
-                cg_prefix_old.as_deref(),
-                // B12 (audit v0.2.75): if a stale project-root .env was
-                // detected above, surface the SAME finding into the durable
-                // deferral so it survives past the transient rename toast.
-                stale_env_note.as_deref(),
-            ) {
-                // Soft-fail: a failed deferral emit must not fail the rename.
-                let msg = format!(
-                    "code-graph rename deferral emit failed: {}. The code graph \
-                     may be split across old/new collection prefixes until you \
-                     rebuild it under the new name.",
-                    e
-                );
-                eprintln!("[vct] warning: {}", msg);
-                warnings.push(msg);
-            }
         }
     }
 
@@ -4758,171 +4694,6 @@ pub async fn rename_project_v2(
         project: ProjectView::from_row(row, count),
         warnings,
     })
-}
-
-/// C-10 (v0.2.75): move the code-graph binding prefix to the NEW name-derived
-/// prefix on rename — but ONLY when the pre-rename binding was itself derived
-/// from the OLD name (leave a user-customized Identity-tab prefix alone).
-///
-/// `binding` is the PRE-rename binding row (captured by the caller before any
-/// update). Returns human-readable warnings (empty on the happy path / every
-/// leave-alone case). Pure DB logic — extracted from `rename_project_v2` so
-/// the act AND leave-alone branches are unit-testable without Tauri state.
-pub(crate) fn propagate_codegraph_binding_on_rename(
-    db: &Db,
-    project_id: &str,
-    old_name: &str,
-    new_name: &str,
-    binding: Option<&crate::db::project_state::ProjectCodegraphBinding>,
-) -> Vec<String> {
-    let mut warnings = Vec::new();
-    if old_name == new_name {
-        return warnings;
-    }
-    let binding = match binding {
-        Some(b) => b,
-        None => return warnings, // never analyzed — nothing to track
-    };
-    let old_derived =
-        canonical_class_prefix(old_name).unwrap_or_else(|_| sanitize_kg_collection(old_name));
-    let binding_is_name_derived = binding.collection_prefix == old_derived
-        || binding.collection_prefix == sanitize_kg_collection(old_name);
-    if !binding_is_name_derived {
-        return warnings; // user-customized prefix — never clobber
-    }
-    let new_prefix =
-        canonical_class_prefix(new_name).unwrap_or_else(|_| sanitize_kg_collection(new_name));
-    if new_prefix == binding.collection_prefix {
-        return warnings;
-    }
-    if let Err(e) = db.set_project_codegraph_binding(
-        project_id,
-        &new_prefix,
-        binding.embedding_model.as_deref(),
-        binding.embedding_dim,
-        binding.last_analyzed_commit.as_deref(),
-        binding.last_analyzed_at,
-        binding.enabled,
-        &binding.config,
-    ) {
-        let msg = format!(
-            "code-graph binding prefix update on rename failed: {}. \
-             The binding still points at '{}' while rebuilds write \
-             under '{}' — update it via the Identity tab.",
-            e, binding.collection_prefix, new_prefix
-        );
-        eprintln!("[vct] warning: {}", msg);
-        warnings.push(msg);
-    } else {
-        db.audit(
-            "codegraph_binding_update",
-            Some(project_id),
-            None,
-            &serde_json::json!({
-                "field": "collection_prefix",
-                "new_value": new_prefix,
-                "reason": "project_rename",
-                "old_value": binding.collection_prefix,
-            }),
-        )
-        .ok();
-    }
-    warnings
-}
-
-/// C-10 (v0.2.73): emit the `codegraph_rename_split_pending` deferral into the
-/// renamed project's `UPDATE_DEFERRED.md` via the shared `DeferralReport`
-/// (Python `-c`, same injection-safe pattern as `storage_ux::emit_deferral`).
-///
-/// Why a deferral and not an auto-fix: Weaviate has no class-rename, and
-/// re-embedding an entire code graph at rename time would block the GUI for
-/// minutes of Ollama/CodeSage time. We record ONE pending condition (keyed by
-/// condition_id, so repeated renames don't stack entries) telling the user to
-/// rebuild the code graph under the new name and drop the stale old-prefix
-/// classes when convenient.
-fn emit_codegraph_rename_deferral(
-    project_folder: &Path,
-    old_name: &str,
-    new_name: &str,
-    old_prefix: Option<&str>,
-    stale_env_note: Option<&str>,
-) -> Result<(), String> {
-    let repo_root =
-        find_local_repo_root().map_err(|e| format!("repo root not found: {}", e))?;
-
-    let old_prefix_note = match old_prefix {
-        Some(p) => format!(
-            "The existing code-graph rows live under the `{}_Code*` classes.",
-            p
-        ),
-        None => "This project has no code-graph binding yet (nothing to \
-                 rebuild until the first analyze runs)."
-            .to_string(),
-    };
-    // B12 (audit v0.2.75): when the caller detected a stale project-root
-    // `.env`, fold that finding into the SAME deferral so both the code-graph
-    // rebuild and the .env fix outlive the transient rename toast. Appended as
-    // one more sentence on the single-line `detected` field (the deferral
-    // round-trip parses `detected` as one line — keep it newline-free).
-    let stale_env_suffix = match stale_env_note {
-        Some(note) => format!(" {}", note),
-        None => String::new(),
-    };
-    let detected = format!(
-        "Project renamed from {:?} to {:?}. The code-graph binding prefix \
-         (the source of truth consumers read) now tracks the NEW name, so \
-         reads target an initially-empty class set until a rebuild fills it. \
-         {}{}",
-        old_name, new_name, old_prefix_note, stale_env_suffix
-    );
-    // POSIX single-quote the project name for the emitted shell command
-    // (names may contain spaces; embedded single quotes use the standard
-    // '\'' escape). The analyzer needs `--project` explicitly here because
-    // its default is the FOLDER name, which a rename does not change — the
-    // folder-name fallback would mint a third, wrong prefix (B-A2 warns on
-    // exactly that).
-    //
-    // C-10 (v0.2.75): the previous command emitted `--force`, which the
-    // analyzer's argparse REJECTS ("unrecognized arguments") — the user
-    // could never run the remediation as written. No flag is needed: the
-    // analyzer always ensures collections exist (`create_collections(force=
-    // args.force_recreate)` in main()), and the NEW-prefix classes are
-    // empty/new, so a plain full analyze is exactly the rebuild we want.
-    // `--force-recreate` would only add a pointless drop of the brand-new
-    // classes. Guarded by tests/test_deferral_command_argparse_sweep.py.
-    let name_sh = format!("'{}'", new_name.replace('\'', r"'\''"));
-    let cmd = format!(
-        "# Rebuild this project's code graph under the new name:\n\
-         cd {}\n\
-         .claude/scripts/code-graph-analyze . --project {}\n\
-         \n\
-         # Then drop the stale old-prefix classes via the launcher's \
-         orphan-collections cleanup (Codegraph page) so the old set stops \
-         lingering. If you prefer a custom collection prefix instead of the \
-         name-derived one, set it in the launcher's Identity tab \
-         (code-graph prefix) BEFORE rebuilding.",
-        project_folder.display(),
-        name_sh
-    );
-
-    // v0.2.77 (Part 7c task 4): interpreter resolution + the injection-safe
-    // `-c` snippet + spawn now live in the shared deferral writer. This
-    // deferral lands in the RENAMED project's folder (`report_folder =
-    // project_folder`) while importing `vco_lib` from the orchestrator clone
-    // (`sys_path_root = repo_root`) — the distinct two-path case the shared
-    // writer supports.
-    let why_deferred = "Re-embedding the whole code graph at rename time \
-        would block the launcher for minutes of embedding time. Reads still \
-        work against the existing collections; rebuild when convenient.";
-    let fields = crate::services::deferral::DeferralEntryFields {
-        condition_id: "codegraph_rename_split_pending",
-        title: "Code graph needs a rebuild after project rename",
-        detected: &detected,
-        why_deferred,
-        command_to_apply: &cmd,
-        severity: "info",
-    };
-    crate::services::deferral::emit_deferral_entry(&repo_root, project_folder, &fields)
 }
 
 /// MEDIUM-1 (2026-05-01, refactored): persist the SHARED_KG_WRITE_DISABLED
@@ -8946,205 +8717,70 @@ mod tests {
                 "warning must identify the failing surface: {:?}", warnings[0]);
     }
 
-    // ─── v0.2.49 access-matrix Phase 4 (item #11) — rename propagation ───
+    // ─── v0.2.89 (BUG 4) — IMMUTABLE NAMES: rename touches display name +
+    //     slug ONLY ─────────────────────────────────────────────────────────
+    //
+    // These REWRITE the v0.2.49 (item #11) / v0.2.75 (C-10) move-pinning
+    // tests. The old suite asserted that a rename MOVED `kg_collection_access`
+    // rows and the codegraph binding prefix to new-name-derived names. Under
+    // the v0.2.89 immutable-names ruling those moves ARE the bug: post-v0.2.84
+    // binding-first resolution, the rewritten access rows pointed at
+    // collections that will never exist (phantoms), and the moved codegraph
+    // prefix pointed every read at an initially-EMPTY class set until a
+    // rebuild (the Fabio 'HouseOfFlirt' half-rename). The new suite pins the
+    // inverse contract: after a rename, bindings, access rows, and the
+    // codegraph prefix are all byte-identical; only `projects.name` +
+    // `projects.slug` change. The deleted emitters
+    // (`propagate_codegraph_binding_on_rename`, `emit_codegraph_rename_deferral`)
+    // are the compile-time pin that no deferral / binding move can fire from
+    // the rename path anymore.
 
-    /// `propagate_kg_access_on_rename` rewrites the own-primary and
-    /// own-dev access rows from the old project name to the new name
-    /// when the rename changes the sanitized prefix. Pre-Phase-4 these
-    /// rows became orphans on rename, and the newly-derived collection
-    /// names had no access grant — so `require_kg_read` rejected every
-    /// KG access for the project until manual repair via the GUI.
-    // C-10 (v0.2.73): the rename-split code-graph deferral emitter routes
-    // through the shared DeferralReport (Python `-c`). Requires python + repo
-    // root resolvable; skips content assertions otherwise (the routing is the
-    // contract under test).
-    fn rename_deferral_python_available() -> bool {
-        vct_launcher_core::python_resolve::resolve_python_for_vco_lib_str().is_some()
-            && find_local_repo_root().is_ok()
-    }
-
+    /// ACT + LEAVE-ALONE: a rename leaves the `kg_collection_access` matrix
+    /// byte-identical — the creation-time names survive and no new-name rows
+    /// are minted. (Inverse of the retired `rename_project_v2_renames_access_rows`.)
     #[test]
-    fn emit_codegraph_rename_deferral_writes_pending_entry() {
-        if !rename_deferral_python_available() {
-            eprintln!("skipping: python/repo-root unavailable");
-            return;
-        }
-        let td = tempfile::TempDir::new().unwrap();
-        emit_codegraph_rename_deferral(td.path(), "OldName", "NewName", Some("OldName"), None)
-            .unwrap();
-        let path = td
-            .path()
-            .join(".claude")
-            .join("context")
-            .join("UPDATE_DEFERRED.md");
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("codegraph_rename_split_pending"));
-        assert!(content.contains("OldName"));
-        assert!(content.contains("NewName"));
-        // C-10 (v0.2.75): the emitted command must be one the analyzer's
-        // argparse ACCEPTS. The old `--force` flag does not exist and was
-        // rejected with "unrecognized arguments" — assert the VALID shape
-        // (`--project '<new name>'`) and that the bogus flag never returns.
-        // Family-wide guard: tests/test_deferral_command_argparse_sweep.py
-        // dry-parses every emitted command through the real parser.
-        assert!(
-            content.contains("code-graph-analyze . --project 'NewName'"),
-            "deferral must emit the argparse-valid rebuild command: {}",
-            content
-        );
-        assert!(
-            !content.contains("code-graph-analyze . --force"),
-            "the argparse-rejected --force flag must not be emitted"
-        );
-        // The deferral names the Identity-tab prefix updater as the
-        // customization surface.
-        assert!(content.contains("Identity tab"));
-    }
-
-    #[test]
-    fn emit_codegraph_rename_deferral_is_idempotent_by_condition() {
-        if !rename_deferral_python_available() {
-            eprintln!("skipping: python/repo-root unavailable");
-            return;
-        }
-        let td = tempfile::TempDir::new().unwrap();
-        emit_codegraph_rename_deferral(td.path(), "A", "B", Some("A"), None).unwrap();
-        emit_codegraph_rename_deferral(td.path(), "B", "C", Some("B"), None).unwrap();
-        let path = td
-            .path()
-            .join(".claude")
-            .join("context")
-            .join("UPDATE_DEFERRED.md");
-        let content = std::fs::read_to_string(&path).unwrap();
-        // add_entry dedups by condition_id → one section header regardless of
-        // repeated renames. (Count the header, not the bare slug which also
-        // appears in the condition_ids: frontmatter.)
-        assert_eq!(
-            content
-                .matches("## codegraph_rename_split_pending (")
-                .count(),
-            1,
-            "repeated renames must not stack deferral sections"
-        );
-    }
-
-    #[test]
-    fn emit_codegraph_rename_deferral_folds_in_stale_env_note_when_present() {
-        // B12 (audit v0.2.75): the ACT case — when the caller detected a stale
-        // project-root .env, the note is surfaced into the deferral body so the
-        // finding outlives the transient rename toast. The LEAVE-ALONE case
-        // (stale_env_note = None) is covered by
-        // `emit_codegraph_rename_deferral_writes_pending_entry` above, which
-        // asserts the base deferral shape WITHOUT any stale-.env text.
-        if !rename_deferral_python_available() {
-            eprintln!("skipping: python/repo-root unavailable");
-            return;
-        }
-        let td = tempfile::TempDir::new().unwrap();
-        emit_codegraph_rename_deferral(
-            td.path(),
-            "OldName",
-            "NewName",
-            Some("OldName"),
-            Some("Stale project-root .env detected: fix with install-bundle --update."),
-        )
-        .unwrap();
-        let content = std::fs::read_to_string(
-            td.path()
-                .join(".claude")
-                .join("context")
-                .join("UPDATE_DEFERRED.md"),
-        )
-        .unwrap();
-        assert!(
-            content.contains("Stale project-root .env detected"),
-            "the stale-.env note must be folded into the deferral body: {}",
-            content
-        );
-        // Sanity: it rides on the SAME single deferral, not a new section.
-        assert_eq!(
-            content
-                .matches("## codegraph_rename_split_pending (")
-                .count(),
-            1,
-            "the stale-.env note must not spawn a second deferral section"
-        );
-    }
-
-    #[test]
-    fn emit_codegraph_rename_deferral_omits_stale_env_text_when_absent() {
-        // B12 (audit v0.2.75): the explicit LEAVE-ALONE assertion — with
-        // stale_env_note = None the deferral body must NOT mention a stale .env,
-        // so a rename whose .env was already canonical carries no phantom note.
-        if !rename_deferral_python_available() {
-            eprintln!("skipping: python/repo-root unavailable");
-            return;
-        }
-        let td = tempfile::TempDir::new().unwrap();
-        emit_codegraph_rename_deferral(td.path(), "OldName", "NewName", Some("OldName"), None)
-            .unwrap();
-        let content = std::fs::read_to_string(
-            td.path()
-                .join(".claude")
-                .join("context")
-                .join("UPDATE_DEFERRED.md"),
-        )
-        .unwrap();
-        assert!(
-            !content.contains("Stale project-root .env detected"),
-            "no stale-.env note should appear when the caller passed None: {}",
-            content
-        );
-    }
-
-    #[test]
-    fn rename_project_v2_renames_access_rows() {
+    fn rename_leaves_access_rows_untouched() {
         let db = Db::open_in_memory().unwrap();
         let pid = uuid::Uuid::new_v4().to_string();
         db.insert_project(&pid, "Acme", "/tmp/acme", ProjectHost::Base, "acme").unwrap();
 
-        // Seed the access matrix as `create_project_v2` would (the
-        // populate path writes 3 rows: own primary write, own dev write,
-        // shared read).
+        // Seed the access matrix as `create_project_v2` would (3 rows: own
+        // primary write, own dev write, shared write).
         db.populate_kg_collection_access_for_project(&pid, "Acme").unwrap();
-        assert_eq!(db.kg_list_access(&pid).unwrap().len(), 3);
+        let before = db.kg_list_access(&pid).unwrap();
+        assert_eq!(before.len(), 3);
 
-        // Mimic the rename: DB row renamed, then propagate.
+        // Mimic the rename command body: DB row rename + the (retired,
+        // no-op) propagation call the hub-CLI path still routes through.
         db.rename_project(&pid, "Beta", Some("beta")).unwrap();
         let warnings = db.propagate_kg_access_on_rename(&pid, "Acme", "Beta");
-        assert!(warnings.is_empty(), "happy path emits no warnings: {:?}", warnings);
+        assert!(warnings.is_empty(), "retired no-op emits no warnings: {:?}", warnings);
 
-        // Old name's rows are gone; new name's rows hold the prior levels.
-        let access = db.kg_list_access(&pid).unwrap();
-        let by_collection: std::collections::HashMap<&str, &str> =
-            access.iter().map(|(c, l)| (c.as_str(), l.as_str())).collect();
-        assert_eq!(by_collection.get("Acme_KnowledgeGraph"), None);
-        assert_eq!(by_collection.get("Acme_Development"), None);
-        assert_eq!(by_collection.get("Beta_KnowledgeGraph"), Some(&"write"));
-        assert_eq!(by_collection.get("Beta_Development"), Some(&"write"));
-        // Shared row untouched (project-name-INDEPENDENT collection name).
-        // v0.2.49 Step F SB2: shared default is now 'write' per the
-        // resolver-semantic alignment fix.
-        assert_eq!(
-            by_collection.get("VibeCodedOrchestrator_KnowledgeGraph"),
-            Some(&"write")
+        let after = db.kg_list_access(&pid).unwrap();
+        assert_eq!(before, after, "rename must leave the access matrix byte-identical");
+        let names: std::collections::HashSet<&str> =
+            after.iter().map(|(c, _)| c.as_str()).collect();
+        assert!(names.contains("Acme_KnowledgeGraph"), "creation-time KG row survives");
+        assert!(names.contains("Acme_Development"), "creation-time dev row survives");
+        assert!(
+            !names.iter().any(|c| c.starts_with("Beta")),
+            "no new-name-derived rows may be minted (they would be phantoms): {:?}",
+            names
         );
     }
 
-    // ─── C-10 (v0.2.75) — rename ↔ code-graph binding lock-step ───────────
-
-    /// ACT case: a binding whose prefix was derived from the OLD name moves
-    /// to the NEW name-derived prefix on rename, preserving every other
-    /// binding field (embedding model/dim, last-analyzed markers, enabled,
-    /// config). This is the SSOT half of the C-10 fix: post-rename, GUI
-    /// counts / env projection / hub resolver / the rebuild's readers all
-    /// agree on the NEW prefix (initially empty until the deferral's rebuild
-    /// fills it — deliberate read-path window, never data loss).
+    /// ACT + LEAVE-ALONE: a NAME-DERIVED codegraph binding prefix — the exact
+    /// case v0.2.75 used to MOVE — stays untouched across a rename, with every
+    /// other binding field preserved. Also pins that no deferral file appears
+    /// under the project folder (best-effort disk check; the load-bearing pin
+    /// is that the emitter functions no longer exist).
     #[test]
-    fn rename_moves_name_derived_codegraph_binding() {
+    fn rename_leaves_name_derived_codegraph_binding_untouched() {
         let db = Db::open_in_memory().unwrap();
         let pid = uuid::Uuid::new_v4().to_string();
-        db.insert_project(&pid, "Acme", "/tmp/acme", ProjectHost::Base, "acme").unwrap();
+        let td = tempfile::TempDir::new().unwrap();
+        let folder = td.path().to_string_lossy().to_string();
+        db.insert_project(&pid, "Acme", &folder, ProjectHost::Base, "acme").unwrap();
         db.set_project_codegraph_binding(
             &pid,
             "Acme", // canonical_class_prefix("Acme") — name-derived
@@ -9158,27 +8794,32 @@ mod tests {
         .unwrap();
 
         db.rename_project(&pid, "Beta", Some("beta")).unwrap();
-        let binding = db.get_project_codegraph_binding(&pid).unwrap().unwrap();
-        let warnings = propagate_codegraph_binding_on_rename(
-            &db, &pid, "Acme", "Beta", Some(&binding),
-        );
-        assert!(warnings.is_empty(), "happy path emits no warnings: {:?}", warnings);
 
-        let updated = db.get_project_codegraph_binding(&pid).unwrap().unwrap();
-        assert_eq!(updated.collection_prefix, "Beta");
-        // Every non-prefix field survives the move.
-        assert_eq!(updated.embedding_model.as_deref(), Some("codesage-large-v2"));
-        assert_eq!(updated.embedding_dim, Some(2048));
-        assert_eq!(updated.last_analyzed_commit.as_deref(), Some("deadbeef"));
-        assert_eq!(updated.last_analyzed_at, Some(1_700_000_000));
-        assert!(updated.enabled);
-        assert_eq!(updated.config, serde_json::json!({"k": "v"}));
+        let after = db.get_project_codegraph_binding(&pid).unwrap().unwrap();
+        assert_eq!(
+            after.collection_prefix, "Acme",
+            "IMMUTABLE NAMES: the binding keeps its creation-time prefix — a \
+             move to 'Beta' would point every read at an empty class set"
+        );
+        assert_eq!(after.embedding_model.as_deref(), Some("codesage-large-v2"));
+        assert_eq!(after.embedding_dim, Some(2048));
+        assert_eq!(after.last_analyzed_commit.as_deref(), Some("deadbeef"));
+        assert_eq!(after.last_analyzed_at, Some(1_700_000_000));
+        assert!(after.enabled);
+        assert_eq!(after.config, serde_json::json!({"k": "v"}));
+
+        // No rename deferral may land in the project folder (the
+        // codegraph_rename_split_pending emitter is deleted).
+        assert!(
+            !td.path().join(".claude").join("context").join("UPDATE_DEFERRED.md").exists(),
+            "rename must not write any deferral entry"
+        );
     }
 
-    /// LEAVE-ALONE case: a user-customized prefix (Identity tab) does NOT
-    /// match the old name's derivation → the rename must not clobber it.
+    /// LEAVE-ALONE: a user-customized prefix (Identity tab) survives too —
+    /// under immutable names EVERY prefix survives, custom or derived.
     #[test]
-    fn rename_leaves_custom_codegraph_binding_alone() {
+    fn rename_leaves_custom_codegraph_binding_untouched() {
         let db = Db::open_in_memory().unwrap();
         let pid = uuid::Uuid::new_v4().to_string();
         db.insert_project(&pid, "Acme", "/tmp/acme", ProjectHost::Base, "acme").unwrap();
@@ -9195,40 +8836,63 @@ mod tests {
         .unwrap();
 
         db.rename_project(&pid, "Beta", Some("beta")).unwrap();
-        let binding = db.get_project_codegraph_binding(&pid).unwrap().unwrap();
-        let warnings = propagate_codegraph_binding_on_rename(
-            &db, &pid, "Acme", "Beta", Some(&binding),
-        );
-        assert!(warnings.is_empty());
-
         let after = db.get_project_codegraph_binding(&pid).unwrap().unwrap();
-        assert_eq!(
-            after.collection_prefix, "TotallyCustomPrefix",
-            "a user-customized prefix must survive rename untouched"
-        );
+        assert_eq!(after.collection_prefix, "TotallyCustomPrefix");
     }
 
-    /// No-binding case: nothing to track — the helper must NOT mint a
-    /// binding row for a never-analyzed project.
+    /// LEAVE-ALONE: a never-analyzed project (no binding row) must not have
+    /// one minted by a rename.
     #[test]
-    fn rename_with_no_codegraph_binding_is_a_noop() {
+    fn rename_with_no_codegraph_binding_mints_nothing() {
         let db = Db::open_in_memory().unwrap();
         let pid = uuid::Uuid::new_v4().to_string();
         db.insert_project(&pid, "Acme", "/tmp/acme", ProjectHost::Base, "acme").unwrap();
         db.rename_project(&pid, "Beta", Some("beta")).unwrap();
-        let warnings =
-            propagate_codegraph_binding_on_rename(&db, &pid, "Acme", "Beta", None);
-        assert!(warnings.is_empty());
         assert!(db.get_project_codegraph_binding(&pid).unwrap().is_none());
+    }
+
+    /// ACT: what a rename DOES change — display name + slug. Everything else
+    /// on the project row is preserved, and `project_kg_bindings` keeps its
+    /// creation-time collection name.
+    #[test]
+    fn rename_updates_name_and_slug_only() {
+        let db = Db::open_in_memory().unwrap();
+        let pid = uuid::Uuid::new_v4().to_string();
+        db.insert_project(&pid, "Acme", "/tmp/acme", ProjectHost::Base, "acme").unwrap();
+        db.set_project_kg_binding(
+            &pid,
+            "primary",
+            "Acme_KnowledgeGraph",
+            Some("qwen3-embedding:0.6b"),
+            Some(1024),
+            None,
+            None,
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+
+        db.rename_project(&pid, "Beta", Some("beta")).unwrap();
+
+        let row = db.get_project(&pid).unwrap().unwrap();
+        assert_eq!(row.name, "Beta");
+        assert_eq!(row.slug, "beta");
+        assert_eq!(row.folder_path, "/tmp/acme");
+        assert_eq!(row.host, ProjectHost::Base);
+
+        let bindings = db.list_project_kg_bindings(&pid).unwrap();
+        let primary = bindings.iter().find(|b| b.role == "primary").unwrap();
+        assert_eq!(
+            primary.collection_name, "Acme_KnowledgeGraph",
+            "the primary KG binding keeps its creation-time collection name"
+        );
     }
 
     /// `codegraph_access` grants are ID-keyed (grantor/grantee project ids,
     /// FK → projects.id) — a rename must leave every edge intact in BOTH
-    /// directions. This pins the verified-in-source design fact the C-10
-    /// fix relies on: no name-keyed codegraph-access rows exist, so rename
-    /// propagation for grants is "refresh the grantees' projected env", not
-    /// a row rewrite. (Contrast: `kg_collection_access` IS name-keyed and
-    /// needs `propagate_kg_access_on_rename`.)
+    /// directions. Under v0.2.89 immutable names this is one instance of the
+    /// general contract (rename touches nothing but name + slug); it stays
+    /// pinned separately because the grants matrix is the surface the
+    /// per-grantee env re-projection in `rename_project_v2` depends on.
     #[test]
     fn rename_preserves_codegraph_access_grants_both_directions() {
         let db = Db::open_in_memory().unwrap();
@@ -9254,82 +8918,55 @@ mod tests {
         );
     }
 
+    /// Retired-no-op contract: even when user-configured rows exist at BOTH
+    /// the old-name-derived AND new-name-derived collection names (the
+    /// v0.2.49 collision fixture), `propagate_kg_access_on_rename` touches
+    /// NEITHER — no merge, no delete, no privilege change. (The old suite
+    /// asserted a higher-privilege merge here; that machinery is retired
+    /// with the move itself.)
     #[test]
-    fn rename_preserves_user_configured_levels_on_collision() {
-        // Pre-rename, a user has manually configured an entry under
-        // BOTH the old name's prefix AND the new name's prefix (the
-        // latter could come from a prior re-onboard cycle). The rename
-        // must merge without lowering the existing privilege at the
-        // target name.
+    fn retired_rename_propagation_leaves_colliding_rows_alone() {
         let db = Db::open_in_memory().unwrap();
         let pid = uuid::Uuid::new_v4().to_string();
         db.insert_project(&pid, "Acme", "/tmp/acme", ProjectHost::Base, "acme").unwrap();
 
-        // Old name: write (from default populate).
         db.kg_set_access(&pid, "Acme_KnowledgeGraph", "write").unwrap();
-        // New name's row pre-exists at "read" (user downgraded earlier).
         db.kg_set_access(&pid, "Beta_KnowledgeGraph", "read").unwrap();
 
-        let _ = db.propagate_kg_access_on_rename(&pid, "Acme", "Beta");
+        let warnings = db.propagate_kg_access_on_rename(&pid, "Acme", "Beta");
+        assert!(warnings.is_empty());
 
         let access = db.kg_list_access(&pid).unwrap();
         let by_collection: std::collections::HashMap<&str, &str> =
             access.iter().map(|(c, l)| (c.as_str(), l.as_str())).collect();
-        // Old row gone.
-        assert_eq!(by_collection.get("Acme_KnowledgeGraph"), None);
-        // New row UPGRADED to write (source had higher privilege). This
-        // matches the v0.2.46-L3 "never lower an existing privilege"
-        // invariant baked into `kg_rename_access`.
+        assert_eq!(
+            by_collection.get("Acme_KnowledgeGraph"),
+            Some(&"write"),
+            "old-name row survives untouched"
+        );
         assert_eq!(
             by_collection.get("Beta_KnowledgeGraph"),
-            Some(&"write"),
-            "L3 invariant: rename must upgrade target to source's higher \
-             privilege, never silently downgrade"
+            Some(&"read"),
+            "pre-existing new-name row keeps its own level (no merge)"
         );
     }
 
-    #[test]
-    fn rename_no_op_when_sanitized_prefix_unchanged() {
-        // "Acme Corp" and "Acme-Corp" both sanitize to "AcmeCorp" —
-        // the rename is display-only (separator change), no collection
-        // name changes. Propagation MUST NOT issue rename calls (no
-        // spurious work; rows survive untouched).
-        let db = Db::open_in_memory().unwrap();
-        let pid = uuid::Uuid::new_v4().to_string();
-        db.insert_project(&pid, "Acme Corp", "/tmp/acme", ProjectHost::Base, "acme-corp").unwrap();
-        db.populate_kg_collection_access_for_project(&pid, "Acme Corp").unwrap();
-
-        let warnings = db.propagate_kg_access_on_rename(&pid, "Acme Corp", "Acme-Corp");
-        assert!(warnings.is_empty());
-
-        // Rows still exist under the unchanged sanitized prefix
-        // ("AcmeCorp_*"); no spurious "Acme Corp_*" or "Acme-Corp_*"
-        // entries were created.
-        let access = db.kg_list_access(&pid).unwrap();
-        let by_collection: std::collections::HashSet<&str> =
-            access.iter().map(|(c, _)| c.as_str()).collect();
-        assert!(by_collection.contains("AcmeCorp_KnowledgeGraph"));
-        assert!(by_collection.contains("AcmeCorp_Development"));
-        assert_eq!(by_collection.len(), 3, "no new rows created on no-op rename");
-    }
-
+    /// The shared KG collection name is project-name-INDEPENDENT — trivially
+    /// untouched now that the whole propagation is a no-op, but pinned
+    /// explicitly because a shared-row rewrite would be cross-project damage.
     #[test]
     fn rename_does_not_touch_shared_kg_row() {
-        // The shared KG collection name is project-name-INDEPENDENT —
-        // propagation MUST leave its access row alone.
         let db = Db::open_in_memory().unwrap();
         let pid = uuid::Uuid::new_v4().to_string();
         db.insert_project(&pid, "Acme", "/tmp/acme", ProjectHost::Base, "acme").unwrap();
         db.populate_kg_collection_access_for_project(&pid, "Acme").unwrap();
 
-        // Capture the shared row before rename.
-        // v0.2.49 Step F SB2: shared default is now 'write' (was 'read'
-        // pre-fix; aligned with resolver F-2a output + Step D migration).
         let before = db
             .kg_get_access(&pid, "VibeCodedOrchestrator_KnowledgeGraph")
             .unwrap();
         assert_eq!(before.as_deref(), Some("write"));
 
+        db.rename_project(&pid, "Beta", Some("beta")).unwrap();
         db.propagate_kg_access_on_rename(&pid, "Acme", "Beta");
 
         let after = db

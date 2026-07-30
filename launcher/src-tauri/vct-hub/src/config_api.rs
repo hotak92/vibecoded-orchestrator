@@ -457,6 +457,33 @@ struct ProjectConfigResponse {
     /// client-side.
     #[serde(default = "default_true_bool")]
     rl_reranker_enabled_for_project: bool,
+    /// v0.2.89 (BUG 4 §5.4) — phantom-name warnings. Populated when the
+    /// per-request schema snapshot (the SAME cached probe the casing
+    /// rebinds above use — zero extra roundtrips) POSITIVELY shows that a
+    /// served collection name does not exist on Weaviate: `kg_collection`,
+    /// `development_collection`, and (when a codegraph binding row exists)
+    /// `<code_graph_collection_prefix>_CodeModule`. The shared-KG name is
+    /// deliberately NOT checked — it may legitimately not exist pre-first-
+    /// seed on a fresh install, and the hub's startup probe sidecar already
+    /// records it.
+    ///
+    /// NEVER populated on probe failure: `weaviate_schema_probe::class_exists`
+    /// returns `None` when the snapshot came from a failed `/v1/schema`
+    /// fetch (probe failure ≠ absence), and `None` never warns.
+    ///
+    /// Degrade-with-warning, never mutate: the served VALUES are unchanged —
+    /// the hub is read-only over launcher.db state (bindings_writer.rs
+    /// contract); this field only tells the caller the name it is about to
+    /// use has no backing class yet.
+    ///
+    /// Additive + `skip_serializing_if`: the field is ABSENT from the JSON
+    /// when empty, so pre-v0.2.89 clients (and the three bundled resolver
+    /// clients, which pick known fields only) see byte-identical payloads on
+    /// healthy installs. Consequence: `?key=warnings` yields 404
+    /// `field_not_found` when there are no warnings — acceptable for an
+    /// advisory field no bundled client fetches by key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
     /// v0.2.31 — absolute path to Claude Code's per-workspace session-
     /// transcript directory (``~/.claude/projects/<slug>/``). The
     /// launcher computes this once from ``projects.folder_path`` using
@@ -1056,6 +1083,23 @@ async fn project_config(
             }
         });
 
+    // v0.2.89 (BUG 4 §5.4) — phantom-name validation. The casing-rebind
+    // calls above populated the per-URL schema snapshot, so `class_exists`
+    // answers from cache (zero extra roundtrips). Assembly is a pure helper
+    // (`phantom_warnings`) so the probe-failure / binding-gate legs are
+    // unit-testable without a live Weaviate.
+    let warnings = phantom_warnings(
+        &kg_collection,
+        &development_collection,
+        cg_binding
+            .as_ref()
+            .map(|_| code_graph_collection_prefix.as_str()),
+        |class| crate::weaviate_schema_probe::class_exists(&probe_weaviate_url, class),
+    );
+    for w in &warnings {
+        eprintln!("[vct-hub] WARNING: {}", w);
+    }
+
     // KG access list: filter access_level='none' out, add own
     // primary collection (always implicit), sort + dedup.
     let mut kg_access_list: Vec<String> = kg_access_rows
@@ -1205,6 +1249,7 @@ async fn project_config(
         rl_online_training_disabled,
         rl_global_training_source_flag,
         rl_reranker_enabled_for_project,
+        warnings,
         claude_session_dir,
         retrieval_tuning,
         code_graph_extra_paths,
@@ -1264,6 +1309,59 @@ fn single_field_response(
             format!("field {:?} is not in the project config response", field),
         ),
     }
+}
+
+/// v0.2.89 (BUG 4 §5.4) — pure assembly of the `/config` phantom-name
+/// warnings.
+///
+/// * `cg_prefix` is `Some(prefix)` ONLY when a `project_codegraph_bindings`
+///   row exists. A never-analyzed project's name-derived FALLBACK prefix has
+///   no classes BY DESIGN — warning on it would fire for every fresh project
+///   on every resolve (pure noise). Only a binding pointing at absent
+///   classes is a genuine phantom (the Fabio half-rename class).
+/// * `exists` is the probe answer per class name. `Some(false)` (probe
+///   succeeded AND class absent) is the ONLY warning trigger; `None` (probe
+///   failed / cache cold) never warns — probe failure ≠ absence.
+/// * The shared-KG name is intentionally NOT checked: it may legitimately
+///   not exist pre-first-seed on a fresh install, and the hub's startup
+///   probe sidecar already records it.
+fn phantom_warnings(
+    kg_collection: &str,
+    development_collection: &str,
+    cg_prefix: Option<&str>,
+    exists: impl Fn(&str) -> Option<bool>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let mut warn_if_phantom = |field: &str, class: &str, hint: &str| {
+        if exists(class) == Some(false) {
+            warnings.push(format!(
+                "{} {:?} does not exist on Weaviate (phantom name). {}",
+                field, class, hint
+            ));
+        }
+    };
+    warn_if_phantom(
+        "kg_collection",
+        kg_collection,
+        "Reads/writes will target a missing class until a kg-sync creates \
+         it, or fix the KG binding in the launcher's Identity tab.",
+    );
+    warn_if_phantom(
+        "development_collection",
+        development_collection,
+        "docs/ syncs will target a missing class until a sync creates it.",
+    );
+    if let Some(prefix) = cg_prefix {
+        warn_if_phantom(
+            "code_graph_collection_prefix",
+            &format!("{}_CodeModule", prefix),
+            "Code-graph reads will return nothing (e.g. a pre-v0.2.89 rename \
+             moved the binding off the populated classes). The launcher's \
+             boot repair may restore it; otherwise rebuild the code graph or \
+             fix the prefix in the Identity tab.",
+        );
+    }
+    warnings
 }
 
 /// JOIN over `codegraph_access` (grantee filter) + `projects`
@@ -3973,5 +4071,194 @@ kg_tier_full = 0.8
             Some("Unreach_Development")
         );
         std::env::remove_var("VCT_WEAVIATE_URL");
+    }
+
+    // ─── v0.2.89 (BUG 4 §5.4) — phantom-name warnings ──────────────────
+
+    /// Pure-helper matrix: only `Some(false)` warns; `Some(true)` and `None`
+    /// (probe failure / cold cache) are silent; the codegraph leg only fires
+    /// when a binding row exists (`cg_prefix = Some(..)`).
+    #[test]
+    fn phantom_warnings_matrix() {
+        // ACT: probe succeeded, every class absent → all three legs warn.
+        let w = phantom_warnings("Kg_KnowledgeGraph", "Kg_Development", Some("Pfx"), |_| {
+            Some(false)
+        });
+        assert_eq!(w.len(), 3, "all three phantom legs must warn: {:?}", w);
+        assert!(w[0].contains("Kg_KnowledgeGraph"));
+        assert!(w[1].contains("Kg_Development"));
+        assert!(w[2].contains("Pfx_CodeModule"));
+
+        // LEAVE-ALONE: classes exist → silent.
+        let w = phantom_warnings("Kg_KnowledgeGraph", "Kg_Development", Some("Pfx"), |_| {
+            Some(true)
+        });
+        assert!(w.is_empty(), "existing classes must not warn: {:?}", w);
+
+        // LEAVE-ALONE (the load-bearing leg): probe failed → NEVER warn.
+        // Pre-v0.2.89 the negative-cache made "Weaviate down" look identical
+        // to "class absent"; the `None` contract is what fixes that.
+        let w =
+            phantom_warnings("Kg_KnowledgeGraph", "Kg_Development", Some("Pfx"), |_| None);
+        assert!(w.is_empty(), "probe failure must never warn: {:?}", w);
+
+        // LEAVE-ALONE: no codegraph binding row → the CodeModule leg is
+        // skipped even when the class is absent (fresh never-analyzed
+        // projects are not phantoms).
+        let w = phantom_warnings("Kg_KnowledgeGraph", "Kg_Development", None, |class| {
+            // KG + dev exist; everything else absent.
+            Some(class == "Kg_KnowledgeGraph" || class == "Kg_Development")
+        });
+        assert!(
+            w.is_empty(),
+            "no binding row ⇒ no codegraph phantom warning: {:?}",
+            w
+        );
+    }
+
+    /// End-to-end `/config` legs (single sequential test to keep the
+    /// process-global VCT_WEAVIATE_URL + schema-cache footprint small):
+    ///   1. phantom binding + reachable Weaviate → `warnings` present and
+    ///      names every phantom class;
+    ///   2. healthy binding → field ABSENT (skip_serializing_if wire-compat);
+    ///   3. unreachable Weaviate → field ABSENT (probe failure ≠ absence).
+    #[tokio::test]
+    async fn config_warnings_phantom_and_probe_failure_legs() {
+        use axum::{routing::get, Json};
+        crate::weaviate_schema_probe::_reset_cache_for_test();
+
+        // Fake Weaviate serving a fixed /v1/schema class list.
+        let classes = ["Existing_KnowledgeGraph", "Existing_Development", "Existing_CodeModule"];
+        let body_json = serde_json::json!({
+            "classes": classes
+                .iter()
+                .map(|c| serde_json::json!({ "class": c }))
+                .collect::<Vec<_>>()
+        });
+        let schema_app: Router = Router::new().route(
+            "/v1/schema",
+            get(move || {
+                let b = body_json.clone();
+                async move { Json(b) }
+            }),
+        );
+        let schema_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let schema_addr = schema_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(schema_listener, schema_app).await;
+        });
+        std::env::set_var("VCT_WEAVIATE_URL", format!("http://{}", schema_addr));
+
+        let (base, h) = spawn_config_api_hub().await;
+
+        // Leg 1: phantom KG binding + phantom codegraph prefix.
+        let phantom_id = "p-warn-phantom";
+        let folder = format!("/tmp/test-config-project-{}", phantom_id);
+        seed_project(&h.0, phantom_id, "HouseOfFire", &folder, "houseoffire");
+        h.0.set_project_kg_binding(
+            phantom_id,
+            "primary",
+            "Phantom_KnowledgeGraph",
+            Some("qwen3-embedding:0.6b"),
+            Some(1024),
+            None,
+            None,
+            &empty_json_obj(),
+        )
+        .unwrap();
+        h.0.set_project_codegraph_binding(
+            phantom_id,
+            "HouseOfFlirt",
+            None,
+            None,
+            None,
+            None,
+            true,
+            &empty_json_obj(),
+        )
+        .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/{}/config", base, phantom_id))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        let warnings = body
+            .get("warnings")
+            .and_then(|v| v.as_array())
+            .expect("warnings field must be present for phantom names");
+        assert!(!warnings.is_empty());
+        let joined = warnings
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(joined.contains("Phantom_KnowledgeGraph"), "{}", joined);
+        assert!(joined.contains("Phantom_Development"), "{}", joined);
+        assert!(joined.contains("HouseOfFlirt_CodeModule"), "{}", joined);
+        // Served VALUES are unchanged — degrade-with-warning, never mutate.
+        assert_eq!(
+            body.get("kg_collection").and_then(|v| v.as_str()),
+            Some("Phantom_KnowledgeGraph")
+        );
+
+        // Leg 2: healthy binding → every class exists → field ABSENT
+        // (wire-compat: empty vec is skipped, pre-v0.2.89 payload shape).
+        let healthy_id = "p-warn-healthy";
+        let folder = format!("/tmp/test-config-project-{}", healthy_id);
+        seed_project(&h.0, healthy_id, "Existing", &folder, "existing");
+        h.0.set_project_kg_binding(
+            healthy_id,
+            "primary",
+            "Existing_KnowledgeGraph",
+            Some("qwen3-embedding:0.6b"),
+            Some(1024),
+            None,
+            None,
+            &empty_json_obj(),
+        )
+        .unwrap();
+        h.0.set_project_codegraph_binding(
+            healthy_id,
+            "Existing",
+            None,
+            None,
+            None,
+            None,
+            true,
+            &empty_json_obj(),
+        )
+        .unwrap();
+        let resp = reqwest::get(format!("{}/projects/{}/config", base, healthy_id))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert!(
+            body.get("warnings").is_none(),
+            "healthy install must serve NO warnings field (wire-compat): {:?}",
+            body.get("warnings")
+        );
+
+        // Leg 3: unreachable Weaviate → probe failure ≠ absence → ABSENT,
+        // even for the phantom-bound project that warned in leg 1.
+        crate::weaviate_schema_probe::_reset_cache_for_test();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        std::env::set_var("VCT_WEAVIATE_URL", format!("http://{}", addr));
+        let resp = reqwest::get(format!("{}/projects/{}/config", base, phantom_id))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert!(
+            body.get("warnings").is_none(),
+            "probe failure must never produce warnings: {:?}",
+            body.get("warnings")
+        );
+
+        std::env::remove_var("VCT_WEAVIATE_URL");
+        crate::weaviate_schema_probe::_reset_cache_for_test();
     }
 }

@@ -1674,67 +1674,42 @@ impl Db {
         Ok(inserted)
     }
 
-    /// v0.2.49 access-matrix Step F SB2 (L1-F1 + L2-SB1 cross-lens):
-    /// propagate a project rename into the `kg_collection_access` matrix.
+    /// RETIRED — v0.2.89 (BUG 4): collection names are IMMUTABLE
+    /// post-creation, so a project rename changes the display name (+ URL
+    /// slug) ONLY and there is nothing name-keyed to rewrite in
+    /// `kg_collection_access`. This is now a documented no-op that always
+    /// returns an empty warnings Vec.
     ///
-    /// Pre-fix this lived as a free function in
-    /// `commands/projects_v2.rs::propagate_kg_access_on_rename` —
-    /// callable from the Tauri rename path only. The hub-CLI rename
-    /// (`vct-hub/src/cli_api.rs::rename_project`) never called it, so
-    /// CLI-driven renames left orphan `kg_collection_access` rows
-    /// referencing the OLD sanitized collection names. After rename,
-    /// the project's own KG read-gate would refuse access to its own
-    /// (new-name) primary collection until manual GUI re-grant.
+    /// History: v0.2.49 Step F SB2 lifted the rename propagation here so
+    /// both the Tauri rename path AND the hub-CLI rename
+    /// (`vct-hub/src/cli_api.rs::rename_project`) rewrote access rows to
+    /// `{new_sanitized}{_KnowledgeGraph,_Development,_Diagrams}`. After
+    /// v0.2.84 made KG/dev resolution BINDING-first, those name-derived
+    /// targets stopped tracking anything real: the rewrite pointed access
+    /// rows at collections that will never exist unless a migration ran —
+    /// i.e. it MANUFACTURED phantoms on every rename (the Fabio wave-2
+    /// field finding). Under the v0.2.89 immutable-names ruling the binding
+    /// keeps its creation-time collection name across renames, so the
+    /// correct propagation is: none.
     ///
-    /// Lifted into `db::access` so both surfaces (Tauri + hub CLI) call
-    /// the same code path. Same pattern as Step B's
-    /// `populate_kg_collection_access_for_project` lift.
+    /// Kept as a no-op (rather than deleted) because the hub-CLI rename
+    /// call-site still invokes it; both surfaces now share the same
+    /// "rename touches no access rows" behaviour through this one home.
+    /// The empty return means callers' warning-folding paths are untouched.
+    /// Existing phantom rows minted by pre-.89 renames are healed by the
+    /// launcher's boot reconcile (`binding_reconcile` — evidence-gated).
     ///
-    /// Soft-fail per-suffix: a failure to rename one collection's row
-    /// does NOT abort the loop — the next suffix is still attempted.
-    /// Failed renames append to the returned `warnings` Vec; callers
-    /// fold these into their result envelope so the GUI/CLI can
-    /// surface them (matches the original projects_v2 contract). The
-    /// boot reconcile (`Db::reconcile_kg_collection_access`) catches
-    /// any stale rows on the next launcher start as backup.
-    ///
-    /// Returns `Vec<String>` of human-readable warnings (empty on the
-    /// happy path).
+    /// (The `project_kg_bindings`-driven rewrite for a REAL collection
+    /// rebind — `set_project_kg_binding_with_root_sync` → `kg_rename_access`
+    /// — is a different, still-live path: there the collection name
+    /// genuinely changes.)
     pub fn propagate_kg_access_on_rename(
         &self,
-        project_id: &str,
-        old_name: &str,
-        new_name: &str,
+        _project_id: &str,
+        _old_name: &str,
+        _new_name: &str,
     ) -> Vec<String> {
-        let mut warnings = Vec::new();
-        if old_name == new_name {
-            return warnings;
-        }
-        let old_sanitized = sanitize_kg_collection_local(old_name);
-        let new_sanitized = sanitize_kg_collection_local(new_name);
-        if old_sanitized == new_sanitized {
-            return warnings;
-        }
-        // v0.2.49 Step F SF5 fix: `_Diagrams` suffix was missing from
-        // the pre-lift list at `projects_v2.rs:3190` — Mermaid +
-        // Excalidraw indexer writes to `<Project>_Diagrams` per the
-        // diagrams pipeline. Without rename propagation, post-rename
-        // diagram writes silently failed access checks. Add `_Diagrams`
-        // here so rename + indexer stay coherent.
-        for suffix in &["_KnowledgeGraph", "_Development", "_Diagrams"] {
-            let old_collection = format!("{}{}", old_sanitized, suffix);
-            let new_collection = format!("{}{}", new_sanitized, suffix);
-            if let Err(e) = self.kg_rename_access(project_id, &old_collection, &new_collection) {
-                let msg = format!(
-                    "kg_rename_access({}, {} → {}): {}. Access matrix may carry \
-                     stale rows until next boot reconcile.",
-                    project_id, old_collection, new_collection, e
-                );
-                eprintln!("[vct] warning: {}", msg);
-                warnings.push(msg);
-            }
-        }
-        warnings
+        Vec::new()
     }
 }
 

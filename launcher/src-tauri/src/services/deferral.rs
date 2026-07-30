@@ -34,7 +34,8 @@
 //!   * `storage_ux::emit_deferral`
 //!   * `module_updates::write_partial_failure_deferral`
 //!   * `git_user_editable_merge::emit_orchestrator_user_modified_deferrals`
-//!   * `projects_v2::emit_codegraph_rename_deferral`
+//!   * `binding_reconcile` (repair/phantom deferrals; the v0.2.75 rename
+//!     emitter was retired by the v0.2.89 immutable-names ruling)
 //!   * `codegraph::emit_stale_wrapper_deferral`
 //!   * (`chunker_revision_deferral` uses a DIFFERENT vco_lib entry point —
 //!     `_emit_chunker_resync_deferral` — so it is intentionally NOT routed

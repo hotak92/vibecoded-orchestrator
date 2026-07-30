@@ -17,6 +17,16 @@ mod mcp_registration;
 mod quit_dialog;
 mod tray;
 
+// v0.2.89 (BUG 4 §5.3): boot-time, evidence-gated repair for projects
+// half-renamed by the pre-.89 rename machinery (codegraph binding on a
+// phantom prefix + v0.2.49 phantom access rows). Declared here via
+// `#[path]` rather than in `commands/mod.rs` because the wave-2 R2 phase
+// owns lib.rs but NOT commands/mod.rs (single-file-ownership discipline);
+// a later cleanup may move this to a plain `pub mod binding_reconcile;`
+// inside commands/mod.rs — delete this attribute block when doing so.
+#[path = "commands/binding_reconcile.rs"]
+mod binding_reconcile;
+
 // v0.2.26: WebKitGTK pre-flight probe — public so main.rs (which is a
 // separate compilation unit from this lib) can call it before Tauri
 // init. Linux-only at the use site; the module's own `#![cfg(...)]`
@@ -2141,6 +2151,46 @@ pub fn run() {
                     setup_swept, setup_resumed, cg_swept, cg_resumed,
                     kg_swept, kg_resumed, sum_swept, sum_resumed
                 );
+            }
+
+            // v0.2.89 (BUG 4 §5.3) — evidence-gated repair for installs
+            // half-renamed by the pre-.89 rename machinery: a codegraph
+            // binding moved onto a phantom prefix (v0.2.75 C-10) and/or
+            // kg_collection_access rows rewritten to phantom name-derived
+            // collections (v0.2.49). Spawned async (one Weaviate /v1/schema
+            // probe; must not block window paint), fully soft-fail, and a
+            // strict no-op when the schema probe fails — probe failure is
+            // never treated as evidence of absence. Idempotent across boots:
+            // once repaired, the "prefix classes absent" gate no longer
+            // passes. See `binding_reconcile` module docs.
+            {
+                let repair_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tauri::Manager;
+                    let Some(db) = repair_handle.try_state::<db::Db>() else {
+                        return;
+                    };
+                    let weaviate_url = std::env::var("WEAVIATE_URL")
+                        .unwrap_or_else(|_| "http://localhost:8081".to_string());
+                    let report =
+                        crate::binding_reconcile::reconcile_half_renamed_bindings_at_boot(
+                            db.inner(),
+                            &weaviate_url,
+                        )
+                        .await;
+                    if report.bindings_repaired > 0
+                        || report.phantom_deferrals > 0
+                        || report.access_rows_restored > 0
+                    {
+                        eprintln!(
+                            "[vct] binding-reconcile (boot): bindings repaired: {}, \
+                             phantom deferrals: {}, access rows restored: {}",
+                            report.bindings_repaired,
+                            report.phantom_deferrals,
+                            report.access_rows_restored
+                        );
+                    }
+                });
             }
 
             Ok(())

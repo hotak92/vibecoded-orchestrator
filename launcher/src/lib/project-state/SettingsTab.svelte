@@ -315,11 +315,15 @@
           <p><span>Created:</span> {new Date(project.created_at).toLocaleString()}</p>
         </div>
       </div>
+      <p class="ps-hint">
+        Renaming changes the display name only; the project's collections keep
+        their original names.
+      </p>
       <button
         class="ps-btn-primary"
         onclick={rename}
         disabled={saving || newName === project.name}
-        title="Rename the project (updates KG_COLLECTION + CODE_GRAPH_PROJECT env keys)"
+        title="Rename the project (display name + URL slug only — collection names are immutable post-creation)"
       >
         {saving ? 'Saving…' : 'Save name'}
       </button>

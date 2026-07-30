@@ -326,9 +326,28 @@
   });
 
   function handleClickOutside(e: MouseEvent) {
-    if (open && wrapperEl && !wrapperEl.contains(e.target as Node)) {
+    // BUG-5 (v0.2.89): a click target that is no longer in the document can
+    // never be a legitimate outside click — bail. Confirmed mechanism: real
+    // (UA-dispatched) clicks run a microtask checkpoint BETWEEN listeners, so
+    // Svelte 5's microtask render flush lands between the delegated pencil
+    // handler (startRename → {#if renamingId === p.id} subtree swap) and this
+    // window bubble listener. The pencil button is detached by the time we
+    // run, `wrapperEl.contains(e.target)` is false, and the dropdown closed
+    // on every rename click. (Synthetic `dispatchEvent` clicks do NOT
+    // interleave the checkpoint — which is why a component test can't catch
+    // this; verified against svelte 5.56.0.)
+    const target = e.target as Node | null;
+    if (target && !target.isConnected) return;
+    if (open && wrapperEl && !wrapperEl.contains(target)) {
       open = false;
     }
+  }
+
+  // BUG-5 companion: focus the inline rename input when it mounts. Nothing
+  // focused it before, so the `onblur` commit UX was dead until the user
+  // clicked into the input manually.
+  function focusOnMount(node: HTMLInputElement) {
+    node.focus();
   }
 
   function handleSelect(id: string) {
@@ -606,6 +625,7 @@
               {#if renamingId === p.id}
                 <input
                   class="rename-input"
+                  use:focusOnMount
                   bind:value={renameValue}
                   onkeydown={(e) => {
                     if (e.key === 'Enter') commitRename(p.id);

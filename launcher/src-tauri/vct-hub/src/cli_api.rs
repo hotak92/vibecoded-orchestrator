@@ -207,7 +207,10 @@ async fn rename_project(
         };
         // v0.2.49 access-matrix Step F SB2 fix (L1-F1): capture the
         // OLD project name BEFORE the rename so we can pass it to
-        // `propagate_kg_access_on_rename` below. Pre-fix this hub CLI
+        // `propagate_kg_access_on_rename` below. v0.2.89: that helper is
+        // now a documented NO-OP (immutable-names ruling — rename touches
+        // no access rows; `binding_reconcile` heals pre-.89 phantoms), so
+        // this call remains only for surface symmetry. Pre-fix this hub CLI
         // surface NEVER called the propagate helper, leaving orphan
         // kg_collection_access rows referencing the OLD sanitized
         // collection name after every CLI-driven rename. The Tauri

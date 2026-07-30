@@ -43,6 +43,16 @@ struct CachedSchema {
     lower_to_actual: HashMap<String, String>,
     /// When the snapshot was captured.
     captured_at: Instant,
+    /// v0.2.89 (BUG 4 §5.4): whether the `/v1/schema` fetch that produced
+    /// this snapshot SUCCEEDED. Before this flag, a failed fetch
+    /// negative-cached an EMPTY map that was indistinguishable from a
+    /// genuinely-empty schema — so "Weaviate down" and "class absent"
+    /// collapsed into the same observation. `resolve_existing_casing_for_class`
+    /// treats both identically (echo the candidate — correct for casing), but
+    /// [`class_exists`] MUST distinguish them: warning about a "phantom"
+    /// class on the evidence of a failed probe would be a false alarm on
+    /// every transient Weaviate hiccup.
+    probe_ok: bool,
 }
 
 /// Static cache. We don't expect more than a couple of distinct Weaviate URLs
@@ -71,7 +81,7 @@ pub async fn resolve_existing_casing_for_class(weaviate_url: &str, candidate: &s
     match fetch_schema_map(weaviate_url).await {
         Ok(map) => {
             let actual = map.get(&candidate.to_lowercase()).cloned();
-            store_cached(weaviate_url, map);
+            store_cached(weaviate_url, map, true);
             actual.unwrap_or_else(|| candidate.to_string())
         }
         Err(_) => {
@@ -98,10 +108,47 @@ pub async fn resolve_existing_casing_for_class(weaviate_url: &str, candidate: &s
             // single bounded stall. The empty snapshot is subject to the same
             // `CACHE_TTL` (5s) as a successful one, so a Weaviate that comes
             // up shortly after is picked up on the next resolve.
-            store_cached(weaviate_url, HashMap::new());
+            //
+            // v0.2.89: `probe_ok = false` marks this as a FAILED-probe
+            // snapshot so `class_exists` refuses to answer from it (probe
+            // failure ≠ absence). The casing-resolve behaviour above is
+            // unchanged.
+            store_cached(weaviate_url, HashMap::new(), false);
             candidate.to_string()
         }
     }
+}
+
+/// v0.2.89 (BUG 4 §5.4) — cache-only existence check for a Weaviate class.
+///
+/// Returns:
+///   * `Some(true)`  — a fresh snapshot from a SUCCESSFUL probe contains the
+///     class (any casing).
+///   * `Some(false)` — a fresh successful snapshot does NOT contain it: the
+///     class is genuinely absent on disk.
+///   * `None` — no fresh snapshot, or the fresh snapshot came from a FAILED
+///     probe (negative-cache). Callers must NEVER warn on `None`: "Weaviate
+///     down" is not evidence of absence.
+///
+/// Deliberately reads ONLY the cache (no network): the `/config` resolver
+/// calls `resolve_existing_casing_for_class` several times immediately before
+/// this, so within one request the snapshot is warm. A cold/expired cache
+/// (only possible if >CACHE_TTL elapsed mid-request) degrades to `None` —
+/// i.e. no warning — which is the conservative direction.
+pub fn class_exists(weaviate_url: &str, class_name: &str) -> Option<bool> {
+    if class_name.is_empty() {
+        return None;
+    }
+    let guard = SCHEMA_CACHE.lock().ok()?;
+    let cache = guard.as_ref()?;
+    let entry = cache.get(weaviate_url)?;
+    if entry.captured_at.elapsed() > CACHE_TTL {
+        return None;
+    }
+    if !entry.probe_ok {
+        return None;
+    }
+    Some(entry.lower_to_actual.contains_key(&class_name.to_lowercase()))
 }
 
 /// Look up a candidate in the cache without making any network calls.
@@ -130,7 +177,9 @@ fn lookup_cached(weaviate_url: &str, candidate: &str) -> Option<String> {
 }
 
 /// Populate / overwrite the cache entry for `weaviate_url` with `map`.
-fn store_cached(weaviate_url: &str, map: HashMap<String, String>) {
+/// `probe_ok` records whether the producing fetch succeeded (v0.2.89 —
+/// consumed by [`class_exists`]; the casing resolver ignores it).
+fn store_cached(weaviate_url: &str, map: HashMap<String, String>, probe_ok: bool) {
     let Ok(mut guard) = SCHEMA_CACHE.lock() else {
         return;
     };
@@ -140,6 +189,7 @@ fn store_cached(weaviate_url: &str, map: HashMap<String, String>) {
         CachedSchema {
             lower_to_actual: map,
             captured_at: Instant::now(),
+            probe_ok,
         },
     );
 }
@@ -356,6 +406,78 @@ mod tests {
         // to the candidate (cache-served, no panic, no hang).
         let fourth = resolve_existing_casing_for_class(&url, "Fourth_Development").await;
         assert_eq!(fourth, "Fourth_Development");
+    }
+
+    /// v0.2.89 (BUG 4 §5.4) — after a SUCCESSFUL probe, `class_exists`
+    /// answers definitively from the cached snapshot: present class →
+    /// `Some(true)`, absent class → `Some(false)`.
+    #[tokio::test]
+    async fn class_exists_answers_from_successful_snapshot() {
+        _reset_cache_for_test();
+        let (url, _server) = spawn_fake_weaviate(vec![
+            "HouseOfFire_CodeModule".to_string(),
+            "HouseOfFire_KnowledgeGraph".to_string(),
+        ])
+        .await;
+        // Warm the cache with one resolve (as project_config does).
+        let _ = resolve_existing_casing_for_class(&url, "HouseOfFire_KnowledgeGraph").await;
+
+        assert_eq!(
+            class_exists(&url, "HouseOfFire_CodeModule"),
+            Some(true),
+            "present class must be Some(true)"
+        );
+        // Case-insensitive: on-disk casing differences still count as present.
+        assert_eq!(
+            class_exists(&url, "houseoffire_codemodule"),
+            Some(true),
+            "existence is casing-insensitive (Weaviate class identity)"
+        );
+        assert_eq!(
+            class_exists(&url, "HouseOfFlirt_CodeModule"),
+            Some(false),
+            "absent class must be Some(false) — this is the phantom signal"
+        );
+    }
+
+    /// LEAVE-ALONE leg: probe failure ≠ absence. After an UNREACHABLE
+    /// Weaviate negative-caches an empty snapshot, `class_exists` must
+    /// return `None` for every candidate — never `Some(false)`. This is the
+    /// distinction the v0.2.89 `probe_ok` flag exists for: pre-fix, the
+    /// negative-cache was indistinguishable from an empty schema and any
+    /// existence-check layered on it would have warned on every transient
+    /// Weaviate outage.
+    #[tokio::test]
+    async fn class_exists_returns_none_after_failed_probe() {
+        _reset_cache_for_test();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let url = format!("http://{}", addr);
+
+        // Trigger the failing probe → negative-cache with probe_ok=false.
+        let _ = resolve_existing_casing_for_class(&url, "Any_KnowledgeGraph").await;
+
+        assert_eq!(
+            class_exists(&url, "Any_KnowledgeGraph"),
+            None,
+            "failed-probe snapshot must yield None (probe failure ≠ absence)"
+        );
+        assert_eq!(
+            class_exists(&url, "Other_CodeModule"),
+            None,
+            "every candidate against a failed-probe snapshot must be None"
+        );
+    }
+
+    /// LEAVE-ALONE leg: a cold (never-probed) cache also answers `None` —
+    /// `class_exists` never fetches on its own.
+    #[tokio::test]
+    async fn class_exists_returns_none_on_cold_cache() {
+        _reset_cache_for_test();
+        assert_eq!(class_exists("http://127.0.0.1:1#cold", "X_CodeModule"), None);
+        // Empty class name is never answerable either.
+        assert_eq!(class_exists("http://127.0.0.1:1#cold", ""), None);
     }
 
     #[tokio::test]

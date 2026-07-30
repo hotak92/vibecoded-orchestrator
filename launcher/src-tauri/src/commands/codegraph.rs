@@ -2857,7 +2857,7 @@ fn analyzer_wrapper_is_resilient(path: &std::path::Path) -> bool {
 ///
 /// Reuses the sanctioned `vco_lib.deferral_report.{DeferralEntry,
 /// DeferralReport}` machinery via a `-c` snippet — the same subprocess-into-
-/// Python pattern as `projects_v2::emit_codegraph_rename_deferral` and
+/// Python pattern as `binding_reconcile`'s deferral emits and
 /// `storage_ux::emit_deferral` (mirror-don't-fork: these deferral emitters
 /// are deliberately kept as thin local mirrors of the one Python writer).
 /// Idempotent at the Python layer (`add_entry` dedups by `condition_id`), so

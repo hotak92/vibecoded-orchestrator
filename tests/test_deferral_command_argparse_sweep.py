@@ -107,6 +107,12 @@ def _kg_sync_known_flags() -> set:
     """
     text = _KG_SYNC_PATH.read_text(encoding="utf-8", errors="replace")
     flags = set(re.findall(r"sys\.argv\[1\]\s*==\s*[\"'](--[a-z0-9-]+)[\"']", text))
+    # v0.2.89: the module-top argv PRE-SCAN (`_extract_cli_project_root`)
+    # accepts flags at ANY position via `tok == "--…"` comparisons (it strips
+    # them before main()'s positional dispatch). Track that shape too so
+    # pre-scanned flags (e.g. --project-root) count as real, and disappear
+    # from this set again if the pre-scan is ever removed.
+    flags |= set(re.findall(r"\btok\s*==\s*[\"'](--[a-z0-9-]+)[\"']", text))
     assert flags, "kg-sync source shape changed — update _kg_sync_known_flags"
     return flags
 
@@ -330,10 +336,12 @@ def test_chunker_deferral_commands_parse_clean(cli_registry):
 
 
 def test_rename_deferral_command_shape_parses_and_old_shape_rejects():
-    """The rename deferral emits `code-graph-analyze . --project '<name>'`
-    (see projects_v2.rs::emit_codegraph_rename_deferral). The exact argv
-    shape must parse clean; the historical `--force` shape must be rejected —
-    proving this sweep would have caught the original v0.2.73 bug."""
+    """Deferral remediation commands emit `code-graph-analyze . --project
+    '<name>'` (v0.2.89: the v0.2.75 rename emitter was retired by the
+    immutable-names ruling; binding_reconcile.rs's phantom deferral now emits
+    this shape). The exact argv shape must parse clean; the historical
+    `--force` shape must be rejected — proving this sweep would have caught
+    the original v0.2.73 bug."""
     parser = _load_analyzer_parser()
 
     ok, extras = parser.parse_known_args([".", "--project", "New Name"])
