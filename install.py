@@ -15161,6 +15161,14 @@ def _seed_weaviate_shared_kg_only(
     seed_env = _subprocess_env_with_embedding()
     seed_env["KG_COLLECTION"] = current_shared_kg
     seed_env["KG_BASE_DIR"] = str(PROJECT_ROOT)
+    # v0.2.89 BUG 3 (plan §1.3 E): sibling of the KG_BASE_DIR pin above on
+    # the NEW non-leaking root channel. sync_knowledge_graph.py resolves its
+    # root with `--project-root argv > KG_SYNC_PROJECT_ROOT > KG_BASE_DIR
+    # (legacy) > script location`, so without this pin a shell carrying a
+    # foreign KG_SYNC_PROJECT_ROOT (none should exist — but the pin makes
+    # the seed self-contained) or foreign KG_BASE_DIR could misroute the
+    # seed. Explicit env wins over the wrapper-style set-if-unset default.
+    seed_env["KG_SYNC_PROJECT_ROOT"] = str(PROJECT_ROOT)
     # v0.2.69 FIX 3: no per-process timeout here. A legitimate slow re-embed
     # (e.g. arctic on a cold CPU over the full shared KG) can run well past
     # any wall-clock cap we'd pick, and killing it mid-seed strands the user
@@ -15684,12 +15692,21 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
         # cap; the per-embed-REQUEST guard inside EmbeddingService
         # (VCT_EMBED_REQUEST_TIMEOUT_SECS) is the correct granularity for
         # catching a wedged embedder without aborting a healthy slow seed.
+        # v0.2.89 BUG 3 (plan §1.3 E): pin the target project root for the
+        # per-project seed subprocess. install.py run from a shell carrying
+        # a foreign KG_BASE_DIR (any `.claude/env`-sourced terminal opened
+        # in another project) used to seed the WRONG tree — the subprocess
+        # inherited the leaked env with no explicit root. Build the env in
+        # a local first (mirrors the shared-seed pattern above) and set the
+        # NEW non-leaking channel, which outranks any inherited KG_BASE_DIR.
+        seed_env = _subprocess_env_with_embedding()
+        seed_env["KG_SYNC_PROJECT_ROOT"] = str(PROJECT_ROOT)
         try:
             subprocess.run(
                 [str(venv_py), str(sync_kg)] + cmd_args,
                 check=True,
                 cwd=str(PROJECT_ROOT),
-                env=_subprocess_env_with_embedding(),
+                env=seed_env,
             )
             # Subprocess executed AND exited 0 — clean sync.
             sync_subprocess_ran = True

@@ -184,6 +184,10 @@ def test_env_db_disagreement_warning(monkeypatch, capsys, tmp_path):
     # branch (env wins, "no candidates exist in Weaviate yet"). For richer
     # branch coverage see the four test_g1_* cases below.
     monkeypatch.setattr(install, "_count_weaviate_class_objects", lambda *a, **k: None)
+    # v0.2.89: the bounded readiness gate polls WEAVIATE_URL before seeding;
+    # this test's fake `http://x` would burn the full deadline. The gate is
+    # not under test here — stub it like the rest of the downstream machinery.
+    monkeypatch.setattr(install, "_wait_for_weaviate_ready", lambda *a, **k: True)
 
     # We need .claude/scripts/sync_knowledge_graph.py to exist for the path.
     scripts = tmp_path / ".claude" / "scripts"

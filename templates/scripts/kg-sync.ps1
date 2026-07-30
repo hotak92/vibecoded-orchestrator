@@ -61,5 +61,22 @@ if (-not $VenvPython) {
     exit 1
 }
 
+# v0.2.89 BUG 3 (plan §1.3 B): pin the target project root via the NEW
+# non-leaking env channel. `KG_BASE_DIR` is exported by every Claude Code
+# session (.claude/settings.json env), so a wrapper run from a session
+# whose env belongs to ANOTHER project used to inherit the foreign root
+# and sync the wrong tree with false success (Fabio field audit).
+# `KG_SYNC_PROJECT_ROOT` is set ONLY by the launcher and by these
+# wrappers, never exported by Claude sessions — so it cannot leak.
+# Set-if-unset (NOT unconditional): the launcher's explicit value must
+# survive the v0.2.77 orchestrator-copy wrapper fallback, where the
+# ORCHESTRATOR's wrapper runs on behalf of a project and this wrapper's
+# own location would be the WRONG root. Do NOT touch KG_BASE_DIR.
+# PARITY: this block must match kg-sync (bash sibling — same logic, same
+# rationale).
+if (-not $env:KG_SYNC_PROJECT_ROOT) {
+    $env:KG_SYNC_PROJECT_ROOT = "$ProjectRoot"
+}
+
 & $VenvPython (Join-Path $ScriptDir "sync_knowledge_graph.py") @args
 exit $LASTEXITCODE

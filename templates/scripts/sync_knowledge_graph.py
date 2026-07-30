@@ -12,6 +12,9 @@ Handles chunking for large files (>6k tokens) to stay within embedding model lim
 Usage:
     python .claude/scripts/sync_knowledge_graph.py <file_path>
     python .claude/scripts/sync_knowledge_graph.py --all  # Sync all knowledge files
+    python .claude/scripts/sync_knowledge_graph.py --project-root <path> --all
+        # v0.2.89: pin the TARGET project root explicitly (outranks every
+        # env channel — the supported way to run a manual cross-project sync)
 """
 
 import sys
@@ -71,6 +74,100 @@ else:
 if str(_VCO_LIB_PARENT) not in sys.path:
     sys.path.insert(0, str(_VCO_LIB_PARENT))
 # VCO-REWIRE-END: orchestrator-root-resolution
+
+
+# ──────────────────────────────────────────────────────────────────────
+# v0.2.89 BUG 3 (Fabio field audit): explicit project-root resolution.
+#
+# Pre-fix, the target root came from the inherited `KG_BASE_DIR` env with a
+# script-location fallback. Every Claude Code session exports `KG_BASE_DIR`
+# (via `.claude/settings.json env`), so a wrapper run from a session whose
+# env belongs to ANOTHER project inherited the foreign root — and because
+# `_resolve_collections()` keyed the hub resolver off the same value, the
+# sync misrouted BOTH the walked tree AND the target collections coherently:
+# it "succeeded" against the wrong project with zero diagnostics.
+#
+# Two legitimate callers disagree about who knows the true root:
+#   * The LAUNCHER already sets the root env correctly — and relies on it
+#     for the v0.2.77 orchestrator-copy wrapper fallback (when the
+#     project-local wrapper is missing, the ORCHESTRATOR's wrapper runs,
+#     whose location-derived root would be the orchestrator clone — wrong).
+#   * A DIRECT CLI run from a foreign session has a POISONED env; the
+#     wrapper's own location is correct.
+#
+# A single channel cannot serve both, so the fix is layered precedence with
+# a NEW, non-leaking env name (set ONLY by the launcher and the kg-sync
+# wrappers, never exported by Claude sessions → "set ⇒ deliberate"):
+#
+#   1. --project-root <path>   argv   (explicit human/tooling intent)
+#   2. KG_SYNC_PROJECT_ROOT    env    (launcher + wrappers only — non-leaking)
+#   3. KG_BASE_DIR             env    (LEGACY; still honored, logged as such)
+#   4. script location                (_PROJECT_HOME)
+#
+# `main()` prints an unconditional resolution banner naming the root AND the
+# channel it came from, and refuses (`exit 2`) to run a tree sync against a
+# root that has neither `knowledge/` nor a docs root — converting silent
+# wrong-tree runs into diagnosable failures.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _extract_cli_project_root(argv: "List[str]") -> "Optional[Path]":
+    """Extract and REMOVE ``--project-root <path>`` / ``--project-root=<path>``
+    from *argv* (mutates the list in place). Returns the path or None.
+
+    Runs at module import — BEFORE ``_resolve_collections()`` and the
+    ``PROJECT_ROOT`` assignment — so ``main()``'s manual positional dispatch
+    (``--all`` / ``--all-docs`` / explicit file list) never sees the flag and
+    stays untouched. A missing/empty value is a hard usage error (exit 2):
+    an explicit flag pointing at nothing is always a caller mistake.
+    """
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--project-root":
+            if i + 1 >= len(argv) or not argv[i + 1].strip():
+                print("❌ --project-root requires a path argument", file=sys.stderr)
+                sys.exit(2)
+            value = argv[i + 1]
+            del argv[i:i + 2]
+            return Path(os.path.abspath(value))
+        if tok.startswith("--project-root="):
+            value = tok.split("=", 1)[1]
+            if not value.strip():
+                print("❌ --project-root= requires a non-empty path", file=sys.stderr)
+                sys.exit(2)
+            del argv[i]
+            return Path(os.path.abspath(value))
+        i += 1
+    return None
+
+
+_CLI_PROJECT_ROOT: "Optional[Path]" = _extract_cli_project_root(sys.argv)
+
+
+def _resolve_project_root() -> "Tuple[Path, str]":
+    """Resolve the target project root with the v0.2.89 layered precedence.
+
+    Returns ``(root, source)`` where *source* names the channel that won —
+    printed by ``main()``'s resolution banner so a misrouted run is
+    diagnosable from its output. Empty/whitespace-only env values are
+    treated as unset (skip to the next channel).
+    """
+    if _CLI_PROJECT_ROOT is not None:
+        return _CLI_PROJECT_ROOT, "--project-root"
+    new_env = os.environ.get("KG_SYNC_PROJECT_ROOT", "").strip()
+    if new_env:
+        return Path(new_env), "KG_SYNC_PROJECT_ROOT"
+    legacy = os.environ.get("KG_BASE_DIR", "").strip()
+    if legacy:
+        return Path(legacy), "KG_BASE_DIR (legacy env — consider --project-root)"
+    return _PROJECT_HOME, "script location"
+
+
+# Resolved ONCE at module top so `_resolve_collections()` below keys the hub
+# resolver off the SAME root the sync walks (the pre-fix asymmetry between
+# the walked tree and the collection names is what made BUG 3 silent).
+PROJECT_ROOT, _PROJECT_ROOT_SOURCE = _resolve_project_root()
 
 # v0.2.52 (Known Issue 6, Sub-issue A): silence
 # ``AuthlibDeprecationWarning: authlib.jose module is deprecated`` from
@@ -158,27 +255,34 @@ GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 # is unreachable (launcher not running, project not registered). The
 # resolver emits its own rate-limited warning so callers don't need to
 # log anything extra. See `.claude/context/plans/v0.2.21-resolver-design.md`.
-def _resolve_collections() -> tuple[str, str]:
-    """Return (kg_collection, development_collection) via hub, env-fallback.
+def _resolve_collections() -> tuple[str, str, str]:
+    """Return (kg_collection, development_collection, shared_kg_collection)
+    via hub, env-fallback.
 
     The hub resolver is authoritative when reachable (v0.2.21 contract: the
     launcher's per-project resolution wins over ambient env, so a stale env
     var can't misroute the normal in-project sync). The resolver is queried
-    against the TARGET PROJECT ROOT:
+    against the TARGET PROJECT ROOT — the SAME ``PROJECT_ROOT`` the sync
+    walks, resolved at module top with the v0.2.89 layered precedence
+    (``--project-root`` argv > ``KG_SYNC_PROJECT_ROOT`` env > legacy
+    ``KG_BASE_DIR`` env > script location):
 
-      * Normal in-project run: the script lives under the project's
-        ``.claude/scripts/``; ``KG_BASE_DIR`` is unset (or equals this tree),
-        so we resolve from the script's location → the project's own config.
-      * Manual cross-project seed: the script is run by hand against a
-        DIFFERENT project, with ``KG_BASE_DIR`` exported to that project's
-        root (the same var that already steers ``PROJECT_ROOT`` below). We
-        resolve the hub against ``KG_BASE_DIR`` so the collection name matches
-        the project whose ``knowledge/`` we are actually walking — not the
-        orchestrator tree the script file happens to live under. Resolving the
-        script's own parent tree (the prior behavior) silently routed manual
-        seeds into the orchestrator's collection regardless of ``KG_COLLECTION``
-        / ``KG_BASE_DIR``; keying the resolver off the target root fixes the
-        file-root vs collection-name asymmetry without inverting hub precedence.
+      * Normal in-project run: no explicit channel is set, so we resolve
+        from the script's location → the project's own config.
+      * Manual cross-project seed: run the script by hand against a
+        DIFFERENT project with ``--project-root <path>`` (the supported
+        channel since v0.2.89; the legacy ``KG_BASE_DIR`` env export still
+        works but is outranked by the explicit flag and by the launcher's
+        ``KG_SYNC_PROJECT_ROOT``). The hub is resolved against that root so
+        the collection names match the project whose tree is actually being
+        walked — keying the resolver off the target root preserves the
+        file-root vs collection-name symmetry without inverting hub
+        precedence.
+
+    v0.2.89 BUG 6: the third element is the shared-KG collection name
+    (``cfg.shared_kg_collection``, env fallback ``SHARED_KG_COLLECTION``,
+    empty allowed) — consumed by the ``scope: shared`` frontmatter routing
+    in ``sync_node``.
 
     VCT_DISABLE_HUB_RESOLVER short-circuit for the test session. See
     ``server.py::_try_resolve_project_config`` for the matching guard +
@@ -188,26 +292,29 @@ def _resolve_collections() -> tuple[str, str]:
         return (
             os.getenv("KG_COLLECTION", "KnowledgeGraph"),
             os.getenv("DEVELOPMENT_COLLECTION", ""),
+            os.getenv("SHARED_KG_COLLECTION", ""),
         )
     try:
         from vco_lib.project_config import resolve  # type: ignore[import-not-found]
-        # Resolve against the TARGET project root: KG_BASE_DIR when set (manual
-        # cross-project seed), else the script's own project tree.
-        _base = os.getenv("KG_BASE_DIR", "")
-        target_root = Path(_base) if _base else Path(__file__).resolve().parent.parent.parent
-        cfg = resolve(target_root)
+        # Resolve against the TARGET project root (v0.2.89 BUG 3: the same
+        # module-top resolution the sync walks — argv/env/location layered).
+        cfg = resolve(PROJECT_ROOT)
         return (
             cfg.kg_collection or os.getenv("KG_COLLECTION", "KnowledgeGraph"),
             cfg.development_collection or os.getenv("DEVELOPMENT_COLLECTION", ""),
+            cfg.shared_kg_collection or os.getenv("SHARED_KG_COLLECTION", ""),
         )
     except Exception:
         return (
             os.getenv("KG_COLLECTION", "KnowledgeGraph"),
             os.getenv("DEVELOPMENT_COLLECTION", ""),
+            os.getenv("SHARED_KG_COLLECTION", ""),
         )
 
 
-COLLECTION_NAME, _RESOLVED_DEV_COLLECTION = _resolve_collections()
+COLLECTION_NAME, _RESOLVED_DEV_COLLECTION, SHARED_COLLECTION_NAME = (
+    _resolve_collections()
+)
 DUAL_EMBEDDING_ENABLED = os.getenv("DUAL_EMBEDDING_ENABLED", "true").lower() == "true"
 
 # Chunking configuration for embedding limits.
@@ -270,11 +377,12 @@ def _max_chunk_tokens_for(server) -> int:
         pass
     return MAX_EMBEDDING_TOKENS
 
-# Project root - use KG_BASE_DIR if set (multi-project support), else
-# infer from this script's location (.claude/scripts/X → project root).
-# Cross-OS: Path.parent.parent works on every supported platform.
-_kg_base_dir = os.getenv("KG_BASE_DIR", "")
-PROJECT_ROOT = Path(_kg_base_dir) if _kg_base_dir else _PROJECT_HOME
+# Project root — resolved ONCE at module top (v0.2.89 BUG 3, see
+# `_resolve_project_root` above) with the layered precedence
+# `--project-root` argv > `KG_SYNC_PROJECT_ROOT` env > legacy `KG_BASE_DIR`
+# env > script location. `PROJECT_ROOT` / `_PROJECT_ROOT_SOURCE` are
+# assigned right after the resolver definition so `_resolve_collections()`
+# keys the hub off the SAME root the sync walks.
 KNOWLEDGE_ROOT = PROJECT_ROOT / "knowledge"
 
 # Development docs collection (project-scoped). Uses the same chunker, named
@@ -483,10 +591,13 @@ def _build_vector_arg(
 #       }
 #     }
 #
-# IMPORTANT — this release ships NO such file. The loader returns None when
-# the sidecar is absent, so the ingest gate is a strict NO-OP and the embed
-# path computes vectors exactly as before. The plumbing + its guards are
-# present and tested; the data lands in a later update.
+# v0.2.70 shipped the plumbing only (no data file → strict NO-OP). v0.2.89
+# ships the data for the bundled curated set (qwen3_embed + arctic2_embed
+# sidecars, root-only materialization) AND extends ingest with the §8.5
+# dual-slot merge: an active-slot hit also pulls every OTHER configured
+# slot's sidecar hit for the same signature/chunk into the {slot: vec} map
+# (never computing for a missing secondary). Absent sidecars still mean
+# "compute locally" — nothing breaks without the data.
 #
 # Two non-negotiable guards on ingest (the cross-model invariant from the
 # v0.2.70 same-active-slot ruling):
@@ -549,6 +660,114 @@ def _load_shipped_embeddings(knowledge_root: Path, slot: str) -> Optional[dict]:
     return result
 
 
+def _shipped_slot_chunk_vector(
+    knowledge_root: Path,
+    slot: str,
+    content_hash: str,
+    chunk_num: int,
+    expected_chunks: int,
+) -> Optional[List[float]]:
+    """Pure per-(slot, chunk) sidecar lookup with EVERY ingest guard applied.
+
+    One home for the guard chain shared by ``_shipped_vector_for`` (single-
+    object path, chunk 1) and ``_shipped_chunk_vector`` (multi-chunk path),
+    and reused verbatim for the v0.2.89 §8.5 secondary-slot merge. Returns
+    the validated vector or None when ANY guard fails:
+
+      * no sidecar for *slot* (absent / unparseable / slot-mismatched file),
+      * no entry for *content_hash* (staleness guard: a vector computed
+        against a now-edited node is never reused),
+      * the entry's chunk count != *expected_chunks* (the node would chunk
+        differently than the shipped vectors cover),
+      * no chunk with this 1-indexed *chunk_num*, or its vector is
+        missing / empty / non-numeric (incl. a non-int ``chunk_num`` field
+        in the sidecar — malformed data falls back to compute, never raises).
+    """
+    data = _load_shipped_embeddings(knowledge_root, slot)
+    if data is None:
+        return None
+
+    entry = data["nodes"].get(content_hash)
+    if not isinstance(entry, dict):
+        return None
+    chunks = entry.get("chunks")
+    if not isinstance(chunks, list) or not chunks or len(chunks) != expected_chunks:
+        return None
+
+    target = None
+    for c in chunks:
+        try:
+            if isinstance(c, dict) and int(c.get("chunk_num", -1)) == chunk_num:
+                target = c
+                break
+        except (TypeError, ValueError):
+            continue  # malformed chunk_num → skip this chunk entry
+    if target is None:
+        return None
+    return _coerce_vector(target.get("vector"))
+
+
+def _shipped_secondary_slots(knowledge_root: Path, active_slot: str) -> List[str]:
+    """Discover NON-active slots that ship a sidecar under *knowledge_root*.
+
+    v0.2.89 §8.5: candidates come from the ``.node_embeddings.<slot>.json``
+    files actually present (each is still subject to the file-level slot
+    guard in ``_load_shipped_embeddings``). Slots not in the canonical
+    ``KG_NAMED_VECTORS`` catalog are dropped when the catalog is importable —
+    a sidecar for a slot the collection schema lacks would fail the whole
+    insert, which is strictly worse than ignoring it. Soft-fail: any error
+    returns [] (active-slot-only behaviour, exactly pre-v0.2.89).
+    """
+    slots: List[str] = []
+    try:
+        catalog: Optional[set] = None
+        try:
+            from vco_lib.weaviate_schema import KG_NAMED_VECTORS
+            catalog = {s.name for s in KG_NAMED_VECTORS}
+        except Exception:
+            catalog = None  # no catalog available → accept discovered slots
+        prefix = ".node_embeddings."
+        suffix = ".json"
+        for p in sorted(knowledge_root.glob(f"{prefix}*{suffix}")):
+            name = p.name[len(prefix):-len(suffix)]
+            if not name or name == active_slot:
+                continue
+            if catalog is not None and name not in catalog:
+                continue
+            slots.append(name)
+    except Exception:
+        return []
+    return slots
+
+
+def _merge_secondary_shipped_slots(
+    knowledge_root: Path,
+    active_slot: str,
+    slots: "Dict[str, List[float]]",
+    content_hash: str,
+    chunk_num: int,
+    expected_chunks: int,
+) -> None:
+    """v0.2.89 §8.5 dual-slot ingest merge (mutates *slots* in place).
+
+    When the ACTIVE slot had a shipped hit, also look up every OTHER
+    configured slot's sidecar for the SAME signature/chunk and merge hits
+    into the ``{slot: vec}`` map — mirroring what the compute path's
+    multi-backend fan-out would have populated. NEVER computes for a
+    missing secondary (the v0.2.70 "never synthesise" rule): a secondary
+    with no valid entry simply stays unpopulated, exactly as a
+    partial-backend compute run leaves it. Only called when
+    ``DUAL_EMBEDDING_ENABLED`` (the legacy single-slot mode keeps its
+    active-slot-only shape).
+    """
+    for other_slot in _shipped_secondary_slots(knowledge_root, active_slot):
+        vec2 = _shipped_slot_chunk_vector(
+            knowledge_root, other_slot, content_hash, chunk_num, expected_chunks
+        )
+        if vec2 is not None:
+            slots[other_slot] = vec2
+
+
 def _shipped_vector_for(
     server: "WeaviateMCPServer",
     knowledge_root: Path,
@@ -557,49 +776,44 @@ def _shipped_vector_for(
 ) -> Optional[Tuple[object, Mapping[str, List[float]]]]:
     """Return a ready ``(vector_arg, slots_map)`` from the shipped sidecar, or None.
 
-    Mirrors ``_build_vector_arg``'s return shape so the embed path can drop
-    in the shipped vector with no other changes. Returns None (→ caller
-    computes the embedding) when ANY guard fails:
+    Mirrors ``_build_vector_arg``'s return shapes so the embed path can drop
+    in the shipped vector with no other changes:
 
-      * no sidecar for the active slot (the default this release — NO-OP),
-      * no entry for this node's *content_hash* (staleness guard: a vector
-        computed against a now-edited node is never reused),
-      * the entry's chunk count != *expected_chunks* (the node would embed as
-        a different number of chunks than the shipped vectors cover),
-      * any chunk vector is missing / empty / non-numeric.
+      * ``DUAL_EMBEDDING_ENABLED`` (default) → ``({slot: vec, ...}, same)``.
+        The active slot's hit is REQUIRED; on that hit, every other
+        configured slot's sidecar is consulted for the same signature/chunk
+        and merged (v0.2.89 §8.5 — see ``_merge_secondary_shipped_slots``).
+        Secondaries are best-effort: a miss is NEVER computed for.
+      * legacy single-slot mode → ``(vec_list, {slot: vec})`` — the active
+        slot only, matching the legacy ``_build_vector_arg`` shape.
 
-    The active slot is ``server.text_vector_slot`` — so a vector is only ever
-    placed in the slot whose embedding space matches the install's model. We
-    return a single-slot ``{slot: vec}`` map (NOT a multi-slot fan-out): the
-    shipped data only covers the active model's space, and we must never
-    synthesise a vector for a slot we don't have data for.
+    Returns None (→ caller computes the embedding) when any guard fails for
+    the ACTIVE slot — see ``_shipped_slot_chunk_vector`` for the guard
+    chain. The active slot is ``server.text_vector_slot``, so a vector is
+    only ever placed in the slot whose embedding space matches the model
+    that produced it (the never-cross-model invariant); the merged
+    secondaries carry their OWN slots' vectors, so the invariant holds for
+    them too. This function is the single-object path (``expected_chunks``
+    must be 1); the multi-chunk path goes through ``_shipped_chunk_vector``.
     """
-    slot = server.text_vector_slot
-    data = _load_shipped_embeddings(knowledge_root, slot)
-    if data is None:
-        return None  # NO-OP path (this release): no sidecar → compute.
-
-    entry = data["nodes"].get(content_hash)
-    if not isinstance(entry, dict):
-        return None  # staleness guard: no vector for the current content.
-
-    chunks = entry.get("chunks")
-    if not isinstance(chunks, list) or not chunks:
-        return None
-    if len(chunks) != expected_chunks:
-        # The node would chunk differently than the shipped vectors cover —
-        # don't risk a partial/mismatched ingest; compute fresh.
-        return None
-
-    # For the single-chunk caller (expected_chunks == 1) we hand back the lone
-    # vector. Multi-chunk ingest is handled chunk-by-chunk by the caller via
-    # `_shipped_chunk_vector` below; this function is the single-object path.
     if expected_chunks != 1:
         return None
 
-    vec = _coerce_vector(chunks[0].get("vector"))
+    slot = server.text_vector_slot
+    vec = _shipped_slot_chunk_vector(
+        knowledge_root, slot, content_hash, chunk_num=1,
+        expected_chunks=expected_chunks,
+    )
     if vec is None:
-        return None
+        return None  # no sidecar / stale / malformed → compute (pre-.89 path)
+
+    if DUAL_EMBEDDING_ENABLED:
+        slots: Dict[str, List[float]] = {slot: vec}
+        _merge_secondary_shipped_slots(
+            knowledge_root, slot, slots, content_hash,
+            chunk_num=1, expected_chunks=expected_chunks,
+        )
+        return slots, slots
     return vec, {slot: vec}
 
 
@@ -613,32 +827,25 @@ def _shipped_chunk_vector(
     """Per-chunk variant of ``_shipped_vector_for`` for the multi-chunk path.
 
     ``chunk_num`` is 1-indexed (matches the stored ``chunk_num`` and the
-    multi-chunk insert loop). Same guards as ``_shipped_vector_for``: slot
-    match (via the loaded sidecar), content_hash match (staleness), total
-    chunk-count match, and a present/valid vector for THIS chunk.
+    multi-chunk insert loop). Same guards (via ``_shipped_slot_chunk_vector``)
+    and the same v0.2.89 §8.5 dual-slot merge semantics as the single-object
+    path: active-slot hit required; secondary slots merged per-chunk when
+    ``DUAL_EMBEDDING_ENABLED``; never computed for.
     """
     slot = server.text_vector_slot
-    data = _load_shipped_embeddings(knowledge_root, slot)
-    if data is None:
-        return None
-
-    entry = data["nodes"].get(content_hash)
-    if not isinstance(entry, dict):
-        return None
-    chunks = entry.get("chunks")
-    if not isinstance(chunks, list) or len(chunks) != expected_chunks:
-        return None
-
-    target = None
-    for c in chunks:
-        if isinstance(c, dict) and int(c.get("chunk_num", -1)) == chunk_num:
-            target = c
-            break
-    if target is None:
-        return None
-    vec = _coerce_vector(target.get("vector"))
+    vec = _shipped_slot_chunk_vector(
+        knowledge_root, slot, content_hash, chunk_num, expected_chunks
+    )
     if vec is None:
         return None
+
+    if DUAL_EMBEDDING_ENABLED:
+        slots: Dict[str, List[float]] = {slot: vec}
+        _merge_secondary_shipped_slots(
+            knowledge_root, slot, slots, content_hash,
+            chunk_num=chunk_num, expected_chunks=expected_chunks,
+        )
+        return slots, slots
     return vec, {slot: vec}
 
 
@@ -993,6 +1200,13 @@ def parse_markdown_node(content: str, file_path: Path) -> Dict:
         "created_at": created_at.isoformat(),
         "updated_at": updated_at.isoformat()
     }
+
+    # v0.2.89 BUG 6: pass the raw frontmatter `scope:` value through for the
+    # per-node routing decision in `sync_node` (normalized + validated there
+    # via `_node_scope`). NOT a Weaviate property — `data_obj` is built from
+    # an explicit key list, so this never reaches the collection schema.
+    if frontmatter and 'scope' in frontmatter:
+        result["scope"] = frontmatter['scope']
 
     # Add temporal metadata if present
     result.update(temporal_data)
@@ -1727,7 +1941,11 @@ def sync_all_docs(server: WeaviateMCPServer) -> Tuple[int, int]:
     return success, fail
 
 
-def infer_tags_from_typed_links(server: WeaviateMCPServer, node_data: Dict) -> List[str]:
+def infer_tags_from_typed_links(
+    server: WeaviateMCPServer,
+    node_data: Dict,
+    collection_name: Optional[str] = None,
+) -> List[str]:
     """
     Infer tags from typed relationships BEFORE storing to Weaviate.
 
@@ -1738,6 +1956,10 @@ def infer_tags_from_typed_links(server: WeaviateMCPServer, node_data: Dict) -> L
     Args:
         server: Weaviate MCP server instance
         node_data: Parsed node data with typed_links
+        collection_name: Collection to read link targets from (v0.2.89
+            BUG 6 — the node's TARGET collection so shared-scoped nodes
+            infer from shared-collection siblings). Defaults to the
+            project collection.
 
     Returns:
         List of inferred tags
@@ -1754,7 +1976,9 @@ def infer_tags_from_typed_links(server: WeaviateMCPServer, node_data: Dict) -> L
     TAG_RELATIONS = ["uses", "implements", "extends", "buildsOn"]
 
     try:
-        collection = server.client.collections.get(COLLECTION_NAME)
+        collection = server.client.collections.get(
+            collection_name or COLLECTION_NAME
+        )
 
         for link in typed_links:
             relation = link.get("relation_type", "")
@@ -1797,13 +2021,21 @@ def infer_tags_from_typed_links(server: WeaviateMCPServer, node_data: Dict) -> L
     return inferred_tags
 
 
-def resolve_wikilinks_to_uuids(server: WeaviateMCPServer, wikilinks: List[str]) -> List[str]:
+def resolve_wikilinks_to_uuids(
+    server: WeaviateMCPServer,
+    wikilinks: List[str],
+    collection_name: Optional[str] = None,
+) -> List[str]:
     """
     Resolve WikiLink titles to Weaviate UUIDs.
 
     Args:
         server: Weaviate MCP server instance
         wikilinks: List of WikiLink titles (e.g., ["Node Title 1", "Node Title 2"])
+        collection_name: Collection to resolve within (v0.2.89 BUG 6 — the
+            node's TARGET collection, so cross-references from shared-scoped
+            nodes point at shared-collection objects). Defaults to the
+            project collection.
 
     Returns:
         List of UUIDs for matching nodes
@@ -1812,7 +2044,9 @@ def resolve_wikilinks_to_uuids(server: WeaviateMCPServer, wikilinks: List[str]) 
         return []
 
     try:
-        collection = server.client.collections.get(COLLECTION_NAME)
+        collection = server.client.collections.get(
+            collection_name or COLLECTION_NAME
+        )
         uuids = []
 
         for link_title in wikilinks:
@@ -1880,6 +2114,177 @@ def _delete_node_by_file_path(server: WeaviateMCPServer, file_path_value: str) -
         return n
     except Exception:
         return 0
+
+
+# ──────────────────────────────────────────────────────────────────────
+# v0.2.89 BUG 6: `scope: shared` frontmatter routing (Fabio field audit).
+#
+# Frontmatter contract (top-level key):
+#     scope: shared    # valid: project (default) | shared; any other
+#                      # value → warn + treat as project
+#
+# `sync_node` mirrors `store_knowledge_node`'s semantics (server.py):
+#   * targets_shared = scope=="shared" AND SHARED_COLLECTION_NAME nonempty
+#     AND SHARED_COLLECTION_NAME != COLLECTION_NAME (identity case — the
+#     orchestrator root — routes to the project collection, no special-
+#     casing and no migration delete).
+#   * Write gate keyed on the REQUESTED scope, not the resolved name
+#     (v0.2.44 fix-now-6): scope=="shared" + SHARED_KG_WRITE_DISABLED →
+#     the node FAILS with an explicit error — NO silent reroute.
+#   * Access-matrix gate composes on top for shared writes (fail-open with
+#     a warning on resolver absence/crash, deny only on explicit verdicts).
+#   * project → shared transition: after a successful shared write the
+#     same-file_path rows are deleted from the PROJECT collection.
+#   * shared → project transition (key removed): shared rows are NOT
+#     auto-deleted — deleting from a cross-project store on the evidence
+#     of a local frontmatter edit risks destroying a colliding sibling
+#     project's rows (`file_path` is not project-qualified in the shared
+#     store). A one-line notice names the leftover rows instead.
+# ──────────────────────────────────────────────────────────────────────
+
+#: Count of nodes routed to the shared collection this run (successful
+#: writes + embed-skips). Surfaced in main()'s `--all` summary line.
+_SHARED_ROUTED_COUNT = 0
+
+
+def _node_scope(node_data: Dict) -> Tuple[str, str]:
+    """Normalize the node's requested scope. Returns ``(scope, warning)``.
+
+    Absent key → ``("project", "")`` — zero behavior change for every
+    existing node. Invalid value → ``("project", <warning text>)`` so the
+    caller can print the warning once per node.
+    """
+    raw = node_data.get("scope")
+    if raw is None:
+        return "project", ""
+    val = str(raw).strip().lower()
+    if val in ("project", "shared"):
+        return val, ""
+    return "project", (
+        f"Invalid frontmatter scope: {raw!r} (valid: project | shared) — "
+        f"treating as project"
+    )
+
+
+def _resolve_shared_kg_write_disabled() -> bool:
+    """Resolve the shared-write gate from env, honouring the legacy alias.
+
+    MUST match ``weaviate_mcp.server._resolve_shared_kg_write_disabled``
+    (the store_knowledge_node gate) so the sync script and the MCP agree on
+    whether a shared write is allowed. Precedence:
+
+      1. SHARED_KG_WRITE_DISABLED (canonical) — wins if SET, even to a
+         falsy spelling ("false"/"0"/"") so users can explicitly RE-ENABLE
+         writes on a project that had the legacy opt-out.
+      2. SHARED_KG_OPT_OUT (legacy alias) — read only when the canonical
+         key is literally absent from the environment.
+      3. False (default: writes allowed).
+
+    Resolved at CALL time (not import) so a mid-session override is
+    honoured — same rationale as the MCP's call-time resolution.
+    """
+    canonical = os.environ.get("SHARED_KG_WRITE_DISABLED")
+    if canonical is not None:
+        return canonical.strip().lower() in ("1", "true", "yes")
+    legacy = os.environ.get("SHARED_KG_OPT_OUT")
+    if legacy is not None:
+        return legacy.strip().lower() in ("1", "true", "yes")
+    return False
+
+
+def _shared_write_matrix_allows(target_collection_name: str) -> Tuple[bool, str]:
+    """Access-matrix gate for shared writes — parity with store_knowledge_node.
+
+    Returns ``(allowed, note)``; *note* (possibly empty) is a caller-printed
+    one-liner. Mirrors server.py's composition rules:
+
+      * resolver module not installed (pre-v0.2.49 path) → allow silently;
+        any OTHER ImportError re-raises (a real bug must stay visible — MF5).
+      * VCT_PROJECT_ID unset → allow + visible note (the MCP's v0.2.49 SB1
+        silent-allow default; the JSONL metric/deferral machinery is
+        MCP-local, the sync script surfaces the skip inline instead).
+      * resolver crash → allow + warning (fail-open, loud — MF6 parity).
+      * explicit non-"write" verdict → deny.
+
+    Project-scope writes never consult this gate (plan §3.3.4).
+    """
+    try:
+        from vco_lib.access_resolver import check_access_level
+    except ImportError as imp_err:
+        if "access_resolver" not in str(imp_err):
+            raise
+        return True, ""  # pre-v0.2.49 install: no resolver, no gate
+    project_id = os.environ.get("VCT_PROJECT_ID", "")
+    if not project_id:
+        return True, "access-matrix gate skipped (VCT_PROJECT_ID unset)"
+    try:
+        level = check_access_level(project_id, target_collection_name)
+    except Exception as gate_exc:  # noqa: BLE001 — fail-open by contract
+        return True, f"access-matrix gate crashed ({gate_exc}); failing open"
+    if level != "write":
+        return False, (
+            f"access matrix denies writes to '{target_collection_name}' "
+            f"(level={level})"
+        )
+    return True, ""
+
+
+def _finish_shared_scope_write(server: "WeaviateMCPServer", fp_value: str) -> None:
+    """Post-success bookkeeping for a shared-routed node.
+
+    Counts the node for the summary line and performs the project → shared
+    MIGRATION DELETE: same-``file_path`` rows are removed from the PROJECT
+    collection so the node doesn't surface twice. Runs on BOTH success exits
+    (full write AND embed-skip fast path) so leftover project rows from a
+    partially-failed earlier migration still get cleaned. Never fires in the
+    identity case (shared == kg ⇒ ``targets_shared`` is False ⇒ not called).
+    ``_delete_node_by_file_path`` is soft-fail by design (returns 0 on any
+    error) — a failed cleanup never fails the node.
+    """
+    global _SHARED_ROUTED_COUNT
+    _SHARED_ROUTED_COUNT += 1
+    removed = _delete_node_by_file_path(server, fp_value)
+    if removed:
+        print(
+            f"   ↪ moved out of project collection (scope: shared): removed "
+            f"{removed} row(s) from '{COLLECTION_NAME}'"
+        )
+
+
+def _notice_leftover_shared_rows(server: "WeaviateMCPServer", fp_value: str) -> None:
+    """shared → project transition notice (NO delete — conservative gate).
+
+    After a successful PROJECT-collection write, probe the shared collection
+    for rows with the same ``file_path``. If any exist, print a one-line
+    notice: they may be leftovers from a removed ``scope: shared`` key — or
+    a colliding sibling project's legitimate shared rows (``file_path`` is
+    not project-qualified in the shared store), which is exactly why they
+    are NEVER auto-deleted here. Soft-fail: any probe error is silent.
+
+    Only called on the full-write path — removing a ``scope: shared`` key
+    changes the content signature, so the first post-flip sync always takes
+    the full-write path and the notice fires exactly when it matters;
+    subsequent unchanged syncs hit the embed-skip fast path and stay quiet.
+    """
+    if not SHARED_COLLECTION_NAME or SHARED_COLLECTION_NAME == COLLECTION_NAME:
+        return
+    try:
+        coll = server.client.collections.get(SHARED_COLLECTION_NAME)
+        existing = coll.query.fetch_objects(
+            filters=Filter.by_property("file_path").equal(fp_value),
+            limit=100,
+        )
+        n = len(existing.objects)
+        if n:
+            print(
+                f"   ℹ️  {n} row(s) for '{fp_value}' remain in shared "
+                f"collection '{SHARED_COLLECTION_NAME}' — not auto-deleted "
+                f"(a sibling project may own them). If this node was "
+                f"previously `scope: shared`, remove them manually (e.g. "
+                f"delete-by-file_path via the launcher's Weaviate panel)."
+            )
+    except Exception:
+        pass
 
 
 def _is_archived_node(file_path: Path, frontmatter: dict | None = None) -> tuple[bool, str]:
@@ -2057,6 +2462,58 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
                 print(f"  ↳ Could not remove prior Weaviate entry: {e}")
             return True
 
+        # ── v0.2.89 BUG 6: per-node target selection (`scope:` frontmatter).
+        # See the routing-contract comment block above `_node_scope`.
+        requested_scope, scope_warning = _node_scope(node_data)
+        if scope_warning:
+            print(f"⚠️  {scope_warning}")
+        targets_shared = (
+            requested_scope == "shared"
+            and bool(SHARED_COLLECTION_NAME)
+            and SHARED_COLLECTION_NAME != COLLECTION_NAME
+        )
+        # Write gate — keyed on the REQUESTED scope, not the resolved name
+        # (v0.2.44 fix-now-6 semantics, mirrored from store_knowledge_node):
+        # after the orchestrator-root rebind (KG == SHARED) a name-equality
+        # predicate would never fire; the gate's intent is "block cross-
+        # project shared writes", which is scope=='shared' regardless of the
+        # physical collection. Refuse LOUDLY — no silent reroute to the
+        # project collection (the node's declared destination was refused).
+        if (
+            requested_scope == "shared"
+            and SHARED_COLLECTION_NAME
+            and _resolve_shared_kg_write_disabled()
+        ):
+            error_msg = "shared KG writes disabled (SHARED_KG_WRITE_DISABLED)"
+            print(
+                "❌ scope: shared refused — shared KG writes are disabled for "
+                "this project (SHARED_KG_WRITE_DISABLED). Either set "
+                "SHARED_KG_WRITE_DISABLED=false to enable shared writes, or "
+                "drop the `scope: shared` frontmatter key to keep the node "
+                "project-scoped. Not rerouting to the project collection."
+            )
+            return False
+        if targets_shared:
+            matrix_allowed, matrix_note = _shared_write_matrix_allows(
+                SHARED_COLLECTION_NAME
+            )
+            if matrix_note:
+                print(f"   ⚠️  {matrix_note}")
+            if not matrix_allowed:
+                error_msg = "access matrix denies shared write"
+                print(
+                    f"❌ scope: shared refused — the launcher's access matrix "
+                    f"denies this project write access to "
+                    f"'{SHARED_COLLECTION_NAME}'. Grant write access in the "
+                    f"launcher GUI, or drop the `scope: shared` key."
+                )
+                return False
+        target_collection_name = (
+            SHARED_COLLECTION_NAME if targets_shared else COLLECTION_NAME
+        )
+        if targets_shared:
+            print(f"   ↪ scope: shared → routing to '{target_collection_name}'")
+
         # Validate against vocabulary (report warnings, don't block sync)
         validation_warnings = validate_node_against_vocabulary(node_data, file_path)
         if validation_warnings:
@@ -2066,8 +2523,12 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
             if len(validation_warnings) > 3:
                 print(f"   ... and {len(validation_warnings) - 3} more warnings")
 
-        # Run inference BEFORE storing (enrich with inferred tags)
-        inferred_tags = infer_tags_from_typed_links(server, node_data)
+        # Run inference BEFORE storing (enrich with inferred tags).
+        # v0.2.89 BUG 6: inference reads the TARGET collection so a shared-
+        # scoped node inherits tags from its shared-collection link targets.
+        inferred_tags = infer_tags_from_typed_links(
+            server, node_data, collection_name=target_collection_name
+        )
         if inferred_tags:
             # Add inferred tags to node data (will be stored with original tags)
             node_data["tags"] = list(set(node_data["tags"] + inferred_tags))
@@ -2087,8 +2548,13 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
         # path on every install.py --update.
         current_content_hash = _content_signature_excluding_updated(content)
 
-        # Delete old version (by file_path)
-        collection = server.client.collections.get(COLLECTION_NAME)
+        # Delete old version (by file_path).
+        # v0.2.89 BUG 6: EVERY downstream step (existing-object query,
+        # embed-skip fast path, delete-and-reinsert, chunked path) operates
+        # on the SELECTED collection — the fast path in particular MUST
+        # query the TARGET collection, or the skip check would silently
+        # read the wrong store.
+        collection = server.client.collections.get(target_collection_name)
 
         # Query for existing nodes with same file_path
         where_filter = Filter.by_property("file_path").equal(node_data["file_path"])
@@ -2151,6 +2617,13 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
                 # caller's success_count/fail_count tally still
                 # counts this as a successful sync — the data is
                 # already in Weaviate.
+                # v0.2.89 BUG 6: a shared-routed node still runs the
+                # project→shared migration cleanup on this exit, so
+                # leftover project rows from a partially-failed earlier
+                # migration get cleaned even when the shared rows are
+                # already up to date.
+                if targets_shared:
+                    _finish_shared_scope_write(server, node_data["file_path"])
                 return True
         except Exception as skip_err:  # noqa: BLE001 — soft-fail by design
             # Fall through to delete-and-re-embed. Log so future
@@ -2175,19 +2648,20 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
             # Single chunk - store as-is
             print("   Storing as single object")
 
-            # v0.2.70 Part 2: try a pre-shipped embedding FIRST (NO-OP this
-            # release — no sidecar is shipped, so this returns None and we
-            # compute below). Both guards (content_hash staleness + active-
-            # slot match) live inside _shipped_vector_for. expected_chunks=1
-            # for the single-object path.
+            # v0.2.70 Part 2 + v0.2.89 §8.5: try a pre-shipped embedding
+            # FIRST. Both guards (content_hash staleness + active-slot
+            # match) live inside _shipped_vector_for; with dual embedding
+            # enabled, a hit also merges every OTHER configured slot's
+            # sidecar vector for this node (never computing for a missing
+            # secondary). expected_chunks=1 for the single-object path.
             _shipped = _shipped_vector_for(
                 server, KNOWLEDGE_ROOT, current_content_hash, expected_chunks=1
             )
             if _shipped is not None:
                 vec_arg, slots_written = _shipped
                 print(
-                    f"   📦 Ingested shipped vector "
-                    f"(slot={server.text_vector_slot}, no embed call)"
+                    f"   📦 Ingested shipped vector(s) "
+                    f"(slots={sorted(slots_written)}, no embed call)"
                 )
             else:
                 # v0.2.18: build vector arg via EmbeddingService. With
@@ -2252,9 +2726,16 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
             chunks_created = 1
             print(f"   ✓ Stored node with UUID: {str(obj_uuid)[:8]}... (vectors={sorted(slots_written)})")
 
-            # Create cross-references for WikiLinks
+            # Create cross-references for WikiLinks.
+            # v0.2.89 BUG 6: resolve within the TARGET collection — Weaviate
+            # cross-references must point at objects in the collection the
+            # `linksTo` property targets, so a shared-routed node resolves
+            # its links against the shared store.
             if node_data["links"]:
-                target_uuids = resolve_wikilinks_to_uuids(server, node_data["links"])
+                target_uuids = resolve_wikilinks_to_uuids(
+                    server, node_data["links"],
+                    collection_name=target_collection_name,
+                )
                 if target_uuids:
                     for target_uuid in target_uuids:
                         try:
@@ -2359,8 +2840,13 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
                 )
 
                 # Create cross-references only from first chunk (represents the main node)
+                # v0.2.89 BUG 6: resolve within the TARGET collection (see
+                # the single-chunk path comment).
                 if chunk.chunk_number == 0 and node_data["links"]:
-                    target_uuids = resolve_wikilinks_to_uuids(server, node_data["links"])
+                    target_uuids = resolve_wikilinks_to_uuids(
+                        server, node_data["links"],
+                        collection_name=target_collection_name,
+                    )
                     if target_uuids:
                         for target_uuid in target_uuids:
                             try:
@@ -2385,6 +2871,15 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
 
             if last_slots:
                 print(f"   ✓ All chunks written to vectors={sorted(last_slots)}")
+
+        # v0.2.89 BUG 6 scope transitions (see the contract block above
+        # `_node_scope`): shared-routed → migrate same-file_path rows OUT of
+        # the project collection; project-routed → advisory-only probe for
+        # leftover shared rows (never auto-deleted — collision class).
+        if targets_shared:
+            _finish_shared_scope_write(server, node_data["file_path"])
+        else:
+            _notice_leftover_shared_rows(server, node_data["file_path"])
 
         print(f"✅ Successfully synced {node_data['title']}")
         return True
@@ -2579,7 +3074,35 @@ def main():
         print("       sync_knowledge_graph.py --all              (knowledge/ + docs/)")
         print("       sync_knowledge_graph.py --all-docs         (docs/ only)")
         print("       sync_knowledge_graph.py <f1> <f2> ...      (explicit file list)")
+        print("       (any form accepts --project-root <path> to pin the target project)")
         sys.exit(1)
+
+    # v0.2.89 BUG 3: loud, unconditional resolution banner — names WHICH
+    # root won and via WHICH channel, so a misrouted run is diagnosable
+    # from its output instead of "succeeding" against the wrong project.
+    print(
+        f"🧭 project root: {Path(os.path.abspath(str(PROJECT_ROOT)))} "
+        f"(source: {_PROJECT_ROOT_SOURCE}) "
+        f"→ KG={COLLECTION_NAME} DEV={DEV_COLLECTION_NAME or '(unset)'}",
+        flush=True,
+    )
+
+    # v0.2.89 BUG 3 validation leg: refuse to run a TREE sync against a
+    # root that has neither knowledge/ nor a docs root — the exact shape of
+    # the silent wrong-tree run this converts into a diagnosable failure.
+    # Exit 2 (distinct from exit 1 = per-node sync failures).
+    if sys.argv[1] in ("--all", "--all-docs"):
+        if not KNOWLEDGE_ROOT.is_dir() and not DOCS_ROOT.is_dir():
+            print(
+                f"❌ Resolved project root '{PROJECT_ROOT}' "
+                f"(source: {_PROJECT_ROOT_SOURCE}) contains neither "
+                f"'knowledge/' nor a docs root ('{DOCS_ROOT}') — refusing to "
+                f"run a tree sync against it. If this is the wrong project, "
+                f"pass --project-root <path> (or fix the env channel named "
+                f"above).",
+                file=sys.stderr,
+            )
+            sys.exit(2)
 
     embedding_service = None
     try:
@@ -2621,7 +3144,13 @@ def main():
             doc_success, doc_fail = sync_all_docs(server)
             total_success = kg_success + doc_success
             total_fail = kg_fail + doc_fail
-            print(f"📊 KG:   {kg_success} succeeded, {kg_fail} failed")
+            # v0.2.89 BUG 6: surface how many nodes routed to the shared
+            # collection via `scope: shared` frontmatter.
+            _shared_note = (
+                f" ({_SHARED_ROUTED_COUNT} → shared)"
+                if _SHARED_ROUTED_COUNT else ""
+            )
+            print(f"📊 KG:   {kg_success} succeeded, {kg_fail} failed{_shared_note}")
             print(f"📊 Docs: {doc_success} succeeded, {doc_fail} failed")
             # KG-4 (v0.2.75): refresh the .node_formats.json summaries after a
             # full resync (soft-fail — never changes the sync exit code).
@@ -2648,7 +3177,14 @@ def main():
                 elif in_docs:
                     ok = sync_doc(server, file_path)
                 else:
-                    print(f"ℹ️  {raw}: not in knowledge/ or docs/ — skipping")
+                    # v0.2.89 BUG 3: name the resolved root + its source —
+                    # the bare "not in knowledge/ or docs/" message was
+                    # undiagnosable when the root itself was misrouted.
+                    print(
+                        f"ℹ️  {raw}: not under knowledge/ or docs/ of project "
+                        f"root '{PROJECT_ROOT}' "
+                        f"(source: {_PROJECT_ROOT_SOURCE}) — skipping"
+                    )
                     continue
                 if ok:
                     success_count += 1

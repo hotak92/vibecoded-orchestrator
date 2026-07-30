@@ -91,6 +91,10 @@ def _clear_relevant_env() -> None:
         "PROJECT_NAME",
         "VCT_KG_ACCESS_LIST",
         "KG_BASE_DIR",
+        # v0.2.89 BUG 3: the new non-leaking root channel outranks
+        # KG_BASE_DIR in sync_knowledge_graph.py — strip it too so a
+        # host shell can never steer the module-load-time resolution.
+        "KG_SYNC_PROJECT_ROOT",
     ):
         os.environ.pop(k, None)
 
