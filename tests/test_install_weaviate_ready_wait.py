@@ -136,5 +136,53 @@ class InstallWrapperTest(unittest.TestCase):
         self.assertEqual(_args[1], 7.0)
 
 
+class SlowEmbedSeparationInvariantTest(unittest.TestCase):
+    """v0.2.89 review test-gap: pin the v0.2.69 FIX 3 separation invariant.
+
+    The bounded readiness gate exists PRECISELY so the re-embed subprocess can
+    stay UNTIMED (a legitimate slow CPU re-embed must never be killed by a
+    wall-clock kwarg — the regression v0.2.69 removed). A future edit that
+    quietly re-adds ``timeout=`` to the seed's ``subprocess.run`` would
+    reintroduce it; this pin goes red instead.
+    """
+
+    def test_seed_subprocess_has_no_timeout_kwarg(self) -> None:
+        import inspect
+
+        src = inspect.getsource(install._seed_weaviate_impl)
+        # Guard against the pin going vacuous if the subprocess call is
+        # refactored away entirely.
+        self.assertIn(
+            "subprocess.run(", src,
+            "_seed_weaviate_impl no longer calls subprocess.run directly — "
+            "relocate this pin to wherever the re-embed subprocess moved",
+        )
+        self.assertNotIn(
+            "timeout=", src,
+            "the re-embed subprocess must stay UNTIMED (v0.2.69 FIX 3): the "
+            "bounded pre-spawn readiness gate handles the dead-endpoint case; "
+            "a wall-clock timeout here would kill legitimate slow CPU re-embeds",
+        )
+
+
+class MalformedUrlFailFastTest(unittest.TestCase):
+    """v0.2.89 review MINOR-6 leg: a malformed WEAVIATE_URL is deterministic —
+    the wait must fail FAST instead of burning the whole deadline re-probing a
+    URL that can never become ready."""
+
+    def test_malformed_url_fails_fast(self) -> None:
+        start = time.monotonic()
+        result = install_weaviate.wait_for_weaviate_ready(
+            "not-a-url", deadline_seconds=30.0
+        )
+        elapsed = time.monotonic() - start
+        self.assertFalse(result)
+        self.assertLess(
+            elapsed, 5.0,
+            "a malformed URL (ValueError from the probe) must return "
+            "immediately, not poll until the 30s deadline",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

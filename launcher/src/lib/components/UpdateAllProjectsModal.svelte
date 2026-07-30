@@ -22,9 +22,13 @@
     type ProgressState,
     type KgSyncProgress,
     type CodeGraphBuildProgress,
+    type BackgroundActivity,
     emptyProgressState,
+    emptyBackgroundActivity,
     applyProgressEvent,
     applySubProgress,
+    applyBackgroundActivity,
+    backgroundActivityLines,
     kgSyncSubLabel,
     codeGraphSubLabel,
     progressTotal as computeProgressTotal,
@@ -90,8 +94,22 @@
   // before the first event arrives).
   const progressTotal = $derived(computeProgressTotal(progress, projectCount));
 
-  // Unlisten handles. Cleared on done/error and on unmount so we never leak a
-  // listener across runs:
+  // Background-activity footer (v0.2.89 review MAJOR-2): kg-sync / codegraph
+  // work is spawned fire-and-forget by the backend and mostly runs AFTER a
+  // project's `finished` boundary — its sub-events arrive against TERMINAL
+  // rows, which `applySubProgress` correctly drops. This map is the second
+  // surface: it accepts sub-events for ANY project regardless of row status
+  // and renders as footer lines ("background: Alpha — syncing docs 35/120")
+  // that stay live through phase === 'done' until the modal closes.
+  let background = $state<BackgroundActivity>(emptyBackgroundActivity());
+  const backgroundLines = $derived(
+    backgroundActivityLines(background, progress.rows),
+  );
+
+  // Unlisten handles. The BOUNDARY listener is cleared when the run resolves;
+  // the two SUB-EVENT listeners stay alive through phase === 'done' (the
+  // background embeds keep streaming after the run resolves — MAJOR-2) and
+  // are only cleared when the modal closes / re-opens / unmounts:
   //   - `update_all_progress`          → per-project boundary (started/finished)
   //   - `kg-sync-progress`             → intra-project KG/docs sub-progress (v0.2.89)
   //   - `code-graph-build-progress`    → intra-project codegraph sub-progress (v0.2.89)
@@ -99,11 +117,20 @@
   let unlistenKgSync: (() => void) | null = null;
   let unlistenCodeGraph: (() => void) | null = null;
 
-  function teardownProgressListener() {
+  // v0.2.89 review MINOR-8: set when the component unmounts. Each `await
+  // listen(...)` re-checks it before stashing the handle — if the unmount
+  // raced the setup, onDestroy's teardown already ran with a null handle, so
+  // the freshly-resolved unlisten must be invoked IMMEDIATELY or it leaks.
+  let destroyed = false;
+
+  function teardownBoundaryListener() {
     if (unlistenProgress) {
       unlistenProgress();
       unlistenProgress = null;
     }
+  }
+
+  function teardownSubListeners() {
     if (unlistenKgSync) {
       unlistenKgSync();
       unlistenKgSync = null;
@@ -114,11 +141,22 @@
     }
   }
 
-  onDestroy(teardownProgressListener);
+  function teardownAllListeners() {
+    teardownBoundaryListener();
+    teardownSubListeners();
+  }
+
+  onDestroy(() => {
+    destroyed = true;
+    teardownAllListeners();
+  });
 
   // Reset state every time the modal opens. Without this, a second
   // "Update all" click would render the previous report's state until
-  // the new run completes.
+  // the new run completes. On CLOSE (open → false, any path: Close button,
+  // DialogRoot backdrop/esc) tear down ALL listeners — the sub-event
+  // listeners deliberately outlive the run (MAJOR-2), so the modal close is
+  // their teardown point.
   $effect(() => {
     if (open) {
       phase = 'confirm';
@@ -128,7 +166,10 @@
       resolveTarget = null;
       probing = false;
       progress = emptyProgressState();
-      teardownProgressListener();
+      background = emptyBackgroundActivity();
+      teardownAllListeners();
+    } else {
+      teardownAllListeners();
     }
   });
 
@@ -136,6 +177,7 @@
     phase = 'running';
     runError = null;
     progress = emptyProgressState();
+    background = emptyBackgroundActivity();
 
     // Subscribe to per-project progress BEFORE invoking so we don't miss the
     // first project's `started` event. `listen` is a no-op outside the Tauri
@@ -143,12 +185,16 @@
     // render the indeterminate fallback. Soft-fail: a listener-setup error
     // must not block the actual update.
     try {
-      unlistenProgress = await listen<UpdateAllProgress>(
-        'update_all_progress',
-        (e) => {
-          progress = applyProgressEvent(progress, e.payload);
-        },
-      );
+      const un = await listen<UpdateAllProgress>('update_all_progress', (e) => {
+        progress = applyProgressEvent(progress, e.payload);
+      });
+      // MINOR-8: unmounted while `await listen` was in flight → onDestroy's
+      // teardown already ran with a null handle; release this one NOW.
+      if (destroyed) {
+        un();
+      } else {
+        unlistenProgress = un;
+      }
     } catch (listenErr) {
       console.warn('update_all_progress listener setup failed:', listenErr);
       unlistenProgress = null;
@@ -158,32 +204,49 @@
     // the per-project views use also stream during Update-all (each carries the
     // owning `project_id`). Fold a condensed label into the running row so a
     // slow project (docs re-embed, codegraph build) visibly advances instead of
-    // showing a static spinner that "looks frozen". Soft-fail: a listener-setup
-    // error must not block the update; the row just falls back to "updating…".
+    // showing a static spinner that "looks frozen" — AND into the
+    // background-activity map (MAJOR-2), which unlike the row rule accepts
+    // events for terminal rows (the post-`finished` fire-and-forget embeds).
+    // Soft-fail: a listener-setup error must not block the update; the row
+    // just falls back to "updating…".
     try {
-      unlistenKgSync = await listen<KgSyncProgress>('kg-sync-progress', (e) => {
-        progress = applySubProgress(
-          progress,
+      const un = await listen<KgSyncProgress>('kg-sync-progress', (e) => {
+        const label = kgSyncSubLabel(e.payload);
+        progress = applySubProgress(progress, e.payload.project_id, label);
+        background = applyBackgroundActivity(
+          background,
           e.payload.project_id,
-          kgSyncSubLabel(e.payload),
+          label,
         );
       });
+      if (destroyed) {
+        un(); // MINOR-8 — same race as above
+      } else {
+        unlistenKgSync = un;
+      }
     } catch (listenErr) {
       console.warn('kg-sync-progress listener setup failed:', listenErr);
       unlistenKgSync = null;
     }
 
     try {
-      unlistenCodeGraph = await listen<CodeGraphBuildProgress>(
+      const un = await listen<CodeGraphBuildProgress>(
         'code-graph-build-progress',
         (e) => {
-          progress = applySubProgress(
-            progress,
+          const label = codeGraphSubLabel(e.payload);
+          progress = applySubProgress(progress, e.payload.project_id, label);
+          background = applyBackgroundActivity(
+            background,
             e.payload.project_id,
-            codeGraphSubLabel(e.payload),
+            label,
           );
         },
       );
+      if (destroyed) {
+        un(); // MINOR-8 — same race as above
+      } else {
+        unlistenCodeGraph = un;
+      }
     } catch (listenErr) {
       console.warn('code-graph-build-progress listener setup failed:', listenErr);
       unlistenCodeGraph = null;
@@ -193,7 +256,12 @@
       const r = await projects.updateAll({ stop_on_error: stopOnError });
       report = r;
       phase = 'done';
-      teardownProgressListener();
+      // MAJOR-2: only the BOUNDARY listener is done (no more started/finished
+      // events will come). The two sub-event listeners stay ALIVE — kg-sync /
+      // codegraph embeds are fire-and-forget backend spawns that keep
+      // streaming after the run resolves; the done-phase footer renders them
+      // until the modal closes.
+      teardownBoundaryListener();
 
       // Surface a summary toast so the user sees the result even after
       // closing the modal.
@@ -217,7 +285,9 @@
     } catch (e) {
       runError = e instanceof Error ? e.message : String(e);
       phase = 'done';
-      teardownProgressListener();
+      // Same split as the success path: sub-event listeners stay alive so
+      // any in-flight background embeds remain visible in the done phase.
+      teardownBoundaryListener();
       toast.error(`Update all failed: ${runError}`);
     }
   }
@@ -389,6 +459,18 @@
           {/each}
         </ul>
       {/if}
+
+      {#if backgroundLines.length > 0}
+        <!-- Background-activity footer (v0.2.89 MAJOR-2): embeds/codegraph
+             builds for ALREADY-FINISHED rows still stream sub-events (the
+             backend spawns them fire-and-forget); the row rules drop those,
+             so this footer is where they stay visible. -->
+        <div class="ua-bg-activity" aria-live="polite">
+          {#each backgroundLines as line, i (i)}
+            <p class="ua-bg-line">background: {line}</p>
+          {/each}
+        </div>
+      {/if}
     {/if}
 
     {#if phase === 'done'}
@@ -462,6 +544,25 @@
         {#if probing}
           <p class="ua-hint ua-probing">Checking projects for collections that need re-syncing…</p>
         {/if}
+      {/if}
+
+      {#if backgroundLines.length > 0}
+        <!-- MAJOR-2: KG re-embeds / codegraph builds continue in the
+             background AFTER the run resolves (fire-and-forget backend
+             spawns). The sub-event listeners stay alive in this phase, so
+             these lines update live and each clears when its terminal
+             sub-event arrives. Without this, "finished" while embeds still
+             grind reads as frozen → user restarts → re-embed from scratch. -->
+        <div class="ua-bg-activity" aria-live="polite">
+          <p class="ua-bg-note">
+            KG re-embedding / code-graph builds are still running in the
+            background. Closing this dialog is safe, but keep the launcher
+            running until they finish:
+          </p>
+          {#each backgroundLines as line, i (i)}
+            <p class="ua-bg-line">background: {line}</p>
+          {/each}
+        </div>
       {/if}
     {/if}
   {/snippet}

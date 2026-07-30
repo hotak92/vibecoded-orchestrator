@@ -216,6 +216,12 @@ _INSTALL_OWNED_CONDITION_IDS = frozenset({
     # Re-detected per run (the quarantine removes the stale block, so a clean
     # subsequent run does NOT re-detect → drop-when-absent self-clears).
     "stale_mcp_json_shadow_quarantined",
+    # v0.2.89 review MAJOR-4.2: informational sibling — a stale `.mcp.json`
+    # was found byte-identical to a prior quarantine backup (the user
+    # deliberately restored it), so the quarantine was SKIPPED. Re-detected
+    # per run while the restore persists; drop-when-absent self-clears once
+    # the user deletes/edits `.mcp.json` or the matching backup.
+    "stale_mcp_json_restore_detected",
     "launcher_restart_required",
     "launcher_binary_swap_failed_locked",
     "update_resume_required",
@@ -6883,6 +6889,15 @@ def main() -> int:
 
     # v0.2.89 FIX 2: on --update, quarantine an orphan `.mcp.json` weaviate-kg
     # block that shadows the migrated settings.json (soft-fails on ambiguity).
+    # OWNERSHIP SPLIT (v0.2.89 review MAJOR-1): this call covers the
+    # ORCHESTRATOR ROOT only (PROJECT_ROOT — the root is also a project). USER
+    # projects are covered by the SAME vco_lib helper wired into the bundle
+    # engine (`vco_lib.project_init.install_project_bundle`, update-mode
+    # post-steps), which is how launcher Update-all / CLI `install-bundle
+    # --update` reach them. The bundle engine deliberately SKIPS root targets:
+    # emitting this install-OWNED condition_id into the root's on-disk report
+    # mid-install.py-run would get dropped by the single-final-write's
+    # drop-when-absent before the user ever saw it.
     if args.update:
         _check_stale_mcp_json_shadow(PROJECT_ROOT, _deferral_report)
 
@@ -14085,6 +14100,21 @@ def _resolve_project_id_by_folder(folder: Path) -> str | None:
             pass
 
 
+def _weaviate_ready_deadline_seconds() -> float:
+    """Resolve the ACTUAL readiness deadline: ``WEAVIATE_READY_TIMEOUT`` env
+    (when set to a parseable non-empty value) else the module default.
+
+    v0.2.89 review NIT-1: the TimeoutError messages at both readiness-gate
+    call sites report THIS resolved value, not the hardcoded constant — so a
+    user who overrode the env sees the deadline that actually applied.
+    Explicit-empty / garbage env values fall back to the default.
+    """
+    try:
+        return float(os.environ.get("WEAVIATE_READY_TIMEOUT") or WEAVIATE_READY_TIMEOUT)
+    except (TypeError, ValueError):
+        return float(WEAVIATE_READY_TIMEOUT)
+
+
 def _wait_for_weaviate_ready(
     weaviate_url: str | None = None,
     deadline_seconds: float | None = None,
@@ -14098,17 +14128,17 @@ def _wait_for_weaviate_ready(
     never blocks indefinitely.
     """
     if weaviate_url is None:
-        weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
-        weaviate_url = os.environ.get(
-            "WEAVIATE_URL", f"http://localhost:{weaviate_port}"
+        # v0.2.89 review MINOR-6: `or`, not a get() default — an explicit-empty
+        # `WEAVIATE_URL=""` must fall back instead of probing an invalid URL
+        # for the full deadline and then spurious-deferring on a healthy
+        # Weaviate (parity with _seed_weaviate_impl's resolution).
+        weaviate_port = os.environ.get("WEAVIATE_PORT") or str(DEFAULT_WEAVIATE_PORT)
+        weaviate_url = (
+            os.environ.get("WEAVIATE_URL")
+            or f"http://localhost:{weaviate_port}"
         )
     if deadline_seconds is None:
-        try:
-            deadline_seconds = float(
-                os.environ.get("WEAVIATE_READY_TIMEOUT", str(WEAVIATE_READY_TIMEOUT))
-            )
-        except (TypeError, ValueError):
-            deadline_seconds = float(WEAVIATE_READY_TIMEOUT)
+        deadline_seconds = _weaviate_ready_deadline_seconds()
     return _install_weaviate.wait_for_weaviate_ready(
         weaviate_url,
         deadline_seconds,
@@ -14168,10 +14198,11 @@ def _ensure_collections(embed_config: dict,
     # unreachable Weaviate so the caller's soft-fail-to-deferral path runs
     # instead of the downstream unbounded re-embed subprocess hanging forever.
     if not _wait_for_weaviate_ready():
+        # v0.2.89 review NIT-1: report the ACTUAL (env-resolved) deadline.
         raise TimeoutError(
             "Weaviate readiness probe (/v1/.well-known/ready) did not return "
-            f"200 within {WEAVIATE_READY_TIMEOUT}s — refusing to bootstrap "
-            "collections against an unreachable endpoint"
+            f"200 within {_weaviate_ready_deadline_seconds():g}s — refusing "
+            "to bootstrap collections against an unreachable endpoint"
         )
 
     # Detect adopt mode: install is reusing a Weaviate it didn't bring up.
@@ -15343,10 +15374,11 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
     # soft-fail-to-deferral path runs instead of hanging forever (dead WSL2
     # port-forward → HTTP 000, field report Fabio v0.2.72→v0.2.88).
     if not _wait_for_weaviate_ready():
+        # v0.2.89 review NIT-1: report the ACTUAL (env-resolved) deadline.
         raise TimeoutError(
             "Weaviate readiness probe (/v1/.well-known/ready) did not return "
-            f"200 within {WEAVIATE_READY_TIMEOUT}s — refusing to start an "
-            "unbounded re-embed against an unreachable endpoint"
+            f"200 within {_weaviate_ready_deadline_seconds():g}s — refusing "
+            "to start an unbounded re-embed against an unreachable endpoint"
         )
 
     # We must use the venv's Python so weaviate-client + weaviate_mcp.chunking

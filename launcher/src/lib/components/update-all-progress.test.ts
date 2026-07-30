@@ -14,11 +14,16 @@ import {
   type UpdateAllProgress,
   type KgSyncProgress,
   type CodeGraphBuildProgress,
+  type BackgroundActivity,
+  type ProgressRow,
   emptyProgressState,
   applyProgressEvent,
   applySubProgress,
   kgSyncSubLabel,
   codeGraphSubLabel,
+  emptyBackgroundActivity,
+  applyBackgroundActivity,
+  backgroundActivityLines,
   progressTotal,
   progressIcon,
 } from './update-all-progress';
@@ -402,5 +407,99 @@ describe('warning disclosure severity (report expandable warnings)', () => {
     expect(
       isErrorWarning('bootstrap deferred: collections will be created when'),
     ).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.2.89 review MAJOR-2 — background-activity footer. kg-sync/codegraph are
+// fire-and-forget spawns that mostly emit AFTER a project's row goes terminal;
+// applySubProgress (correctly) drops those events for the ROW, so the footer
+// map is the second surface that keeps post-`finished` embeds visible.
+// ---------------------------------------------------------------------------
+
+function row(overrides: Partial<ProgressRow> & Pick<ProgressRow, 'project_id' | 'project_name' | 'status'>): ProgressRow {
+  return {
+    index: 1,
+    total: 2,
+    warnings_count: null,
+    sub: null,
+    ...overrides,
+  };
+}
+
+describe('applyBackgroundActivity', () => {
+  it('records a label for a project', () => {
+    const next = applyBackgroundActivity(emptyBackgroundActivity(), 'p1', 'syncing docs 3/10');
+    expect(next).toEqual({ p1: 'syncing docs 3/10' });
+  });
+
+  it('is an identity no-op when the label is unchanged', () => {
+    const state: BackgroundActivity = { p1: 'syncing docs 3/10' };
+    expect(applyBackgroundActivity(state, 'p1', 'syncing docs 3/10')).toBe(state);
+  });
+
+  it('clears the entry on null (terminal sub-event)', () => {
+    const state: BackgroundActivity = { p1: 'syncing docs 3/10', p2: 'building code graph…' };
+    const next = applyBackgroundActivity(state, 'p1', null);
+    expect(next).toEqual({ p2: 'building code graph…' });
+  });
+
+  it('is an identity no-op when clearing an absent entry', () => {
+    const state: BackgroundActivity = { p2: 'x' };
+    expect(applyBackgroundActivity(state, 'p1', null)).toBe(state);
+  });
+
+  it('never mutates the input state', () => {
+    const state: BackgroundActivity = { p1: 'a' };
+    const frozen = Object.freeze({ ...state });
+    applyBackgroundActivity(state, 'p1', 'b');
+    applyBackgroundActivity(state, 'p1', null);
+    expect(state).toEqual(frozen);
+  });
+});
+
+describe('backgroundActivityLines', () => {
+  const rows: ProgressRow[] = [
+    row({ project_id: 'done1', project_name: 'Alpha', status: 'succeeded' }),
+    row({ project_id: 'run1', project_name: 'Beta', status: 'running' }),
+    row({ project_id: 'fail1', project_name: 'Gamma', status: 'failed' }),
+  ];
+
+  it('renders terminal-row activity with the project name', () => {
+    const bg: BackgroundActivity = { done1: 'syncing docs 35/120' };
+    expect(backgroundActivityLines(bg, rows)).toEqual(['Alpha — syncing docs 35/120']);
+  });
+
+  it('skips running rows (their own sub-line already covers them)', () => {
+    const bg: BackgroundActivity = { run1: 'syncing docs 1/5' };
+    expect(backgroundActivityLines(bg, rows)).toEqual([]);
+  });
+
+  it('skips unknown project_ids (sub-event outside this run)', () => {
+    const bg: BackgroundActivity = { stranger: 'syncing docs 1/5' };
+    expect(backgroundActivityLines(bg, rows)).toEqual([]);
+  });
+
+  it('renders failed rows too (a failed bundle update can still have a live embed)', () => {
+    const bg: BackgroundActivity = { fail1: 'building code graph (42 files)…' };
+    expect(backgroundActivityLines(bg, rows)).toEqual(['Gamma — building code graph (42 files)…']);
+  });
+});
+
+describe('terminal-row sub-event: row untouched, background line updated', () => {
+  it('post-finished kg-sync event feeds the footer without dirtying the row', () => {
+    const rows: ProgressRow[] = [
+      row({ project_id: 'p1', project_name: 'Alpha', status: 'succeeded' }),
+    ];
+    const state = { rows, current: null };
+    const label = 'syncing docs 35/120';
+
+    // The ROW rule: applySubProgress must NOT resurrect a terminal row.
+    const afterRow = applySubProgress(state, 'p1', label);
+    expect(afterRow).toBe(state);
+
+    // The FOOTER rule: the same event updates the background map and renders.
+    const bg = applyBackgroundActivity(emptyBackgroundActivity(), 'p1', label);
+    expect(backgroundActivityLines(bg, rows)).toEqual([`Alpha — ${label}`]);
   });
 });

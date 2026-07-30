@@ -10819,6 +10819,96 @@ def install_project_bundle(
                  f"pre-fix secret-value scan failed: {err}", data={"error": err})
             result["warnings"].append(f"pre-fix secret-value scan failed: {err}")
 
+    # v0.2.89 review MAJOR-1: stale `.mcp.json` weaviate-kg shadow quarantine
+    # for USER projects. install.py only ever ran this check for its own
+    # PROJECT_ROOT (the orchestrator clone), but the field condition lives in
+    # USER projects — which update through THIS engine (launcher Update-all →
+    # `update_project_v2` → CLI `install-bundle --update` → here; direct CLI
+    # bundle-updates land here too; the root's delegated Step-5b subprocess
+    # ALSO lands here). ONE helper, two owners:
+    #   * NON-root targets → quarantined HERE; the deferral lands in THIS
+    #     project's `.claude/context/UPDATE_DEFERRED.md` via the ONE locked
+    #     emitter home (deferral_emit).
+    #   * ROOT target → SKIPPED here; install.py's own
+    #     `_check_stale_mcp_json_shadow(PROJECT_ROOT, ...)` owns it. Running
+    #     it here for the root would emit an install-OWNED condition_id into
+    #     the root's on-disk report MID-install.py-run, and install.py's
+    #     single-final-write (InstallDeferralFlow.finalize) drop-when-absent
+    #     would delete it in the SAME run (install.py's later check finds the
+    #     block already quarantined → not re-detected → dropped) — the user
+    #     would never see the deferral.
+    # Lifecycle parity with the install.py owner: when the helper returns
+    # None (clean / already-quarantined / opt-out states), any stale on-disk
+    # entry from a PRIOR run self-clears — mirroring install.py's
+    # drop-when-absent for the same condition ids. Skipped on dry-run (the
+    # quarantine mutates `.mcp.json`). Soft-fail throughout — never blocks
+    # the bundle update.
+    if update_mode and not dry_run and not is_root_target:
+        try:
+            from vco_lib import deferral_emit as _de_mcp
+            from vco_lib.deferral_report import DeferralReport as _DR_mcp
+            from vco_lib.install_weaviate import (
+                quarantine_stale_mcp_json_shadow as _quarantine_mcp_shadow,
+            )
+
+            _mcp_entry = _quarantine_mcp_shadow(
+                folder,
+                log_event=log_event,
+                # stdout is the MACHINE CONTRACT under `--json` (the launcher
+                # parses it) — human notices go to stderr, same posture as
+                # the v0.2.84 adopt-NOTICE hotfix above.
+                print_fn=lambda msg: print(msg, file=sys.stderr, flush=True),
+            )
+            if _mcp_entry is not None:
+                _de_mcp.emit(folder, _mcp_entry, log=_log_auto)
+                # State transitions swap the SIBLING id (quarantined ⇄
+                # restore-detected: quarantine one run, user restores the
+                # backup, next run emits restore_detected). Resolve the id we
+                # did NOT just emit so the report reflects only the CURRENT
+                # condition — parity with install.py's drop-when-absent,
+                # which re-detects per run across BOTH ids.
+                _sibling_cids = [
+                    cid for cid in (
+                        "stale_mcp_json_shadow_quarantined",
+                        "stale_mcp_json_restore_detected",
+                    )
+                    if cid != _mcp_entry.condition_id
+                    and _DR_mcp.read(folder).has_condition(cid)
+                ]
+                if _sibling_cids:
+                    _de_mcp.resolve_conditions(
+                        folder, _sibling_cids, log=_log_auto
+                    )
+                _log("4.bundle.mcp_json_shadow", "ok",
+                     f"{_mcp_entry.condition_id} deferral emitted",
+                     data={"condition_id": _mcp_entry.condition_id})
+                result["warnings"].append(
+                    f"stale .mcp.json weaviate-kg env detected — see "
+                    f"UPDATE_DEFERRED.md ({_mcp_entry.condition_id})"
+                )
+            else:
+                # Self-clear stale entries from a prior run (parity with
+                # install.py's drop-when-absent). Cheap presence pre-check so
+                # the common clean path pays no locked read-modify-write.
+                _prior_report = _DR_mcp.read(folder)
+                _stale_cids = [
+                    cid for cid in (
+                        "stale_mcp_json_shadow_quarantined",
+                        "stale_mcp_json_restore_detected",
+                    )
+                    if _prior_report.has_condition(cid)
+                ]
+                if _stale_cids:
+                    _de_mcp.resolve_conditions(folder, _stale_cids, log=_log_auto)
+        except Exception as e:  # noqa: BLE001 — never blocks the bundle update
+            err = f"{type(e).__name__}: {e}"
+            _log("4.bundle.mcp_json_shadow", "error",
+                 f"stale .mcp.json shadow check failed: {err}",
+                 data={"error": err})
+            result["warnings"].append(
+                f"stale .mcp.json shadow check failed: {err}"
+            )
+
     return result
 
 

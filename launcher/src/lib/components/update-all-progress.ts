@@ -254,3 +254,79 @@ export function applySubProgress(
   const rows = state.rows.map((r, i) => (i === idx ? { ...r, sub: label } : r));
   return { rows, current: state.current };
 }
+
+// ── Background-activity footer (v0.2.89 review MAJOR-2) ────────────────────
+//
+// kg-sync / codegraph work is spawned FIRE-AND-FORGET by the backend
+// (`projects_v2.rs` tokio::spawn; the kg-sync also waits on embed-admission)
+// and mostly runs AFTER the project's `finished` boundary event — so its
+// sub-events stream against TERMINAL rows, which `applySubProgress`
+// correctly drops per its spec (a done row must never regrow a sub-line).
+// Without a second surface those embeds are invisible: the modal says
+// "finished" while Weaviate still grinds → the field failure mode
+// ("looks frozen → restart → re-embed") survives.
+//
+// The background-activity map is that second surface. It accepts sub-events
+// for ANY project REGARDLESS of row status and feeds a footer line
+// ("background: Alpha — syncing docs 35/120") that the modal keeps live
+// through phase === 'done' (the two sub-event listeners stay alive until the
+// modal closes). Row behaviour for RUNNING rows is unchanged — the footer
+// only RENDERS entries whose row is terminal (see backgroundActivityLines),
+// so a running project's activity shows once (on its row), never twice.
+
+/** project_id → latest in-flight background sub-label. */
+export type BackgroundActivity = Record<string, string>;
+
+/** The empty starting map (reset every run / on modal open). */
+export function emptyBackgroundActivity(): BackgroundActivity {
+  return {};
+}
+
+/**
+ * Fold one sub-event's label into the background-activity map, returning a
+ * NEW map (never mutates the input). Rules:
+ *   - a non-null label sets/updates the project's entry — row status is
+ *     IRRELEVANT here (that is the whole point vs `applySubProgress`);
+ *   - a null label (terminal sub-event: status !== 'running') CLEARS the
+ *     project's entry, so a finished embed drops off the footer;
+ *   - identity no-op when nothing changes (repeat label, or clearing an
+ *     absent entry) so reactive consumers don't re-render on repeats.
+ */
+export function applyBackgroundActivity(
+  state: BackgroundActivity,
+  projectId: string,
+  label: string | null,
+): BackgroundActivity {
+  if (label === null) {
+    if (!(projectId in state)) return state; // nothing to clear — identity
+    const next = { ...state };
+    delete next[projectId];
+    return next;
+  }
+  if (state[projectId] === label) return state; // identity no-op
+  return { ...state, [projectId]: label };
+}
+
+/**
+ * Render-ready footer lines ("<project name> — <label>"). Resolves each
+ * project's display name from the progress rows and SKIPS:
+ *   - unknown project_ids (a sub-event for a project outside this run);
+ *   - projects whose row is still 'running' — their activity already renders
+ *     as the row's own sub-line; the footer only covers what the row rules
+ *     drop (terminal rows, i.e. post-`finished` background embeds).
+ * Deterministic: preserves the map's insertion order; no clock/randomness.
+ */
+export function backgroundActivityLines(
+  bg: BackgroundActivity,
+  rows: ProgressRow[],
+): string[] {
+  const byId = new Map(rows.map((r) => [r.project_id, r]));
+  const lines: string[] = [];
+  for (const [projectId, label] of Object.entries(bg)) {
+    const row = byId.get(projectId);
+    if (!row) continue; // not a project in this run's report
+    if (row.status === 'running') continue; // row sub-line already covers it
+    lines.push(`${row.project_name} — ${label}`);
+  }
+  return lines;
+}

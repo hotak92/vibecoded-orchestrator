@@ -882,7 +882,18 @@ def wait_for_weaviate_ready(
     Pure except for the network probe + optional ``print_fn`` progress log;
     ``time``/``urllib`` are imported locally so non-Weaviate code paths don't
     pull them at module import.
+
+    v0.2.89 review MINOR-6/7 hardening:
+      * A ``ValueError`` from the probe (malformed URL — e.g. ``unknown url
+        type``, invalid port) is DETERMINISTIC per URL, so re-probing until
+        the deadline would burn the whole wait on a config error. Fail fast:
+        return False immediately with a clear message.
+      * ``http.client.HTTPException`` (e.g. ``BadStatusLine`` from a non-HTTP
+        service squatting on the port) is transient-shaped — poll until the
+        deadline instead of raising into the caller.
+      * The probe response is closed explicitly on every path.
     """
+    import http.client
     import time
     import urllib.error
     import urllib.request
@@ -893,12 +904,38 @@ def wait_for_weaviate_ready(
     while time.monotonic() < deadline:
         try:
             resp = urllib.request.urlopen(ready_url, timeout=probe_timeout_s)
-            status = getattr(resp, "status", None)
-            if status == 200 or (status is None and resp.getcode() == 200):
-                return True
-        except (urllib.error.URLError, OSError, ValueError):
+            try:
+                status = getattr(resp, "status", None)
+                if status == 200 or (status is None and resp.getcode() == 200):
+                    return True
+            finally:
+                try:
+                    resp.close()
+                except Exception:  # noqa: BLE001 — close must never wedge the wait
+                    pass
+        except ValueError as exc:
+            # MINOR-6: malformed URL — deterministic, will never become ready.
+            # Treat as unreachable IMMEDIATELY instead of burning the deadline.
+            if print_fn is not None:
+                try:
+                    print_fn(
+                        f"  ! Weaviate readiness probe aborted: malformed URL "
+                        f"{ready_url!r} ({exc})"
+                    )
+                except Exception:  # noqa: BLE001 — logging must never wedge the wait
+                    pass
+            return False
+        except urllib.error.HTTPError as exc:
+            # Non-200 HTTP answer (4xx/5xx while Weaviate boots) — not ready
+            # yet; close the error-response body and keep polling.
+            try:
+                exc.close()
+            except Exception:  # noqa: BLE001
+                pass
+        except (urllib.error.URLError, OSError, http.client.HTTPException):
             # Connection refused, DNS, socket timeout, HTTP 000 from a dead
-            # port-forward — all "not ready yet"; keep polling until deadline.
+            # port-forward, BadStatusLine from a non-HTTP service — all
+            # "not ready yet"; keep polling until deadline.
             pass
         now = time.monotonic()
         if print_fn is not None and now - last_progress >= progress_interval_s:
@@ -924,6 +961,73 @@ def wait_for_weaviate_ready(
 # Env keys whose disagreement between `.mcp.json` and `.claude/settings.json`
 # proves the `.mcp.json` weaviate-kg block is a stale pre-migration orphan.
 MCP_JSON_STALE_ENV_KEYS = ("WEAVIATE_URL", "KG_COLLECTION", "SHARED_KG_COLLECTION")
+
+# v0.2.89 review MAJOR-4.3: explicit user opt-out. When this env var is set to
+# a truthy value ("1"/"true"/"yes"/"on"), the quarantine helper is a total
+# no-op — for users who DELIBERATELY keep a divergent `.mcp.json` weaviate-kg
+# env (e.g. pointing one project at a different Weaviate on purpose).
+# Documented in docs/post-install/UPDATE-RECOVERY.md and in the deferral text.
+MCP_JSON_QUARANTINE_SKIP_ENV = "VCO_SKIP_MCP_JSON_QUARANTINE"
+
+# v0.2.89 review NIT-3: quarantine backups land under `.claude/context/`
+# (keeps the project root clean of git-status noise). The restore-detection
+# scan honours BOTH this location and legacy root-level `.mcp.json.bak-*`
+# siblings written by earlier builds.
+MCP_JSON_BACKUP_REL = Path(".claude") / "context"
+
+# Loopback host aliases that are semantically the SAME endpoint for the URL
+# comparison below. `[::1]` parses to hostname "::1" via urlsplit.
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def weaviate_urls_equivalent(a: str, b: str) -> bool:
+    """Semantic URL comparison for the `.mcp.json` staleness predicate.
+
+    v0.2.89 review MAJOR-4.1: a raw string compare treated
+    ``http://localhost:8081/`` vs ``http://localhost:8081``,
+    ``http://127.0.0.1:8081`` vs ``http://localhost:8081``, and case
+    differences as "demonstrable contradictions" — quarantining
+    semantically-equal configs (and the 127.0.0.1 crowd is exactly the
+    Windows demographic the quarantine targets).
+
+    Normalization before comparing: scheme + host lowercased; loopback
+    aliases (``localhost`` ≡ ``127.0.0.1`` ≡ ``[::1]``) collapse to one
+    host; trailing ``/`` stripped from the path; port compared EXPLICITLY
+    (an absent port resolves to the scheme default, 80/443). Query/fragment
+    are ignored (never present on a Weaviate base URL; ignoring them is the
+    false-negative-safe direction).
+
+    False-NEGATIVES are the safe direction: when either side cannot be
+    parsed (no host, invalid port, garbage), this returns True
+    ("equivalent") so an unparseable URL can never count as the positive
+    contradiction that triggers the quarantine.
+    """
+    from urllib.parse import urlsplit
+
+    a = (a or "").strip()
+    b = (b or "").strip()
+    if a == b:
+        return True
+
+    def _norm(url: str) -> "tuple[str, str, int, str]":
+        parts = urlsplit(url)
+        scheme = (parts.scheme or "http").lower()
+        host = (parts.hostname or "").lower()
+        if not host:
+            raise ValueError(f"no host in URL: {url!r}")
+        if host in _LOOPBACK_HOSTS:
+            host = "localhost"
+        port = parts.port  # raises ValueError on an invalid port
+        if port is None:
+            port = 443 if scheme == "https" else 80
+        return (scheme, host, port, parts.path.rstrip("/"))
+
+    try:
+        return _norm(a) == _norm(b)
+    except (ValueError, AttributeError):
+        # Unparseable on either side → cannot PROVE a contradiction →
+        # equivalent (NOT stale). See docstring.
+        return True
 
 
 def resolve_settings_weaviate_env(project_root: Path) -> "Optional[dict]":
@@ -985,7 +1089,11 @@ def mcp_json_weaviate_env_is_stale(
     reasons: list = []
 
     # WEAVIATE_URL: a present-and-differing value is the strongest signal
-    # (Fabio: :8080 in .mcp.json vs :8081 in settings.json).
+    # (Fabio: :8080 in .mcp.json vs :8081 in settings.json). v0.2.89 review
+    # MAJOR-4.1: compared SEMANTICALLY via `weaviate_urls_equivalent` — a
+    # trailing slash, a loopback alias (127.0.0.1 vs localhost), or a case
+    # difference is NOT a contradiction; only a genuinely different endpoint
+    # (host/port/path) counts.
     mcp_url = mcp_env.get("WEAVIATE_URL")
     set_url = settings_env.get("WEAVIATE_URL")
     if (
@@ -993,7 +1101,7 @@ def mcp_json_weaviate_env_is_stale(
         and mcp_url.strip()
         and isinstance(set_url, str)
         and set_url.strip()
-        and mcp_url.strip() != set_url.strip()
+        and not weaviate_urls_equivalent(mcp_url, set_url)
     ):
         reasons.append(
             f"WEAVIATE_URL {mcp_url.strip()!r} (.mcp.json) != "
@@ -1042,6 +1150,39 @@ def mcp_json_weaviate_env_is_stale(
     return reasons or None
 
 
+def _find_matching_mcp_json_backup(
+    project_root: Path,
+    mcp_path: Path,
+) -> "Optional[Path]":
+    """v0.2.89 review MAJOR-4.2: restore-detection scan.
+
+    Returns the first existing ``.mcp.json.bak-*`` sibling whose BYTES are
+    identical to the current ``.mcp.json`` — evidence the user deliberately
+    restored a quarantine backup — or ``None``. Scans BOTH backup locations:
+    the current ``.claude/context/`` home (NIT-3) and the legacy project-root
+    siblings written by earlier builds. Byte comparison (not text) so CRLF
+    files round-trip exactly. Soft-fail per candidate: an unreadable backup
+    simply doesn't match.
+    """
+    try:
+        current = mcp_path.read_bytes()
+    except OSError:
+        return None
+    scan_dirs = (project_root / MCP_JSON_BACKUP_REL, project_root)
+    for scan_dir in scan_dirs:
+        try:
+            candidates = sorted(scan_dir.glob(".mcp.json.bak-*"))
+        except OSError:
+            continue
+        for candidate in candidates:
+            try:
+                if candidate.is_file() and candidate.read_bytes() == current:
+                    return candidate
+            except OSError:
+                continue
+    return None
+
+
 def quarantine_stale_mcp_json_shadow(
     project_root: Path,
     *,
@@ -1052,20 +1193,44 @@ def quarantine_stale_mcp_json_shadow(
     that shadows the migrated `.claude/settings.json`.
 
     v0.2.89 FIX 2. Returns a ``DeferralEntry`` describing the quarantine when it
-    acts, or ``None`` when there is nothing to do / the block is consistent /
+    acts (or an INFO entry when a deliberate restore is detected and honoured),
+    or ``None`` when there is nothing to do / the block is consistent /
     evidence is insufficient (all the leave-alone legs). Single-project scope.
     Soft-fail throughout — any read/parse error or ambiguity leaves `.mcp.json`
     untouched and returns ``None``.
 
+    Two owners share this ONE helper (v0.2.89 review MAJOR-1): install.py runs
+    it for the orchestrator root (``_check_stale_mcp_json_shadow``), and the
+    bundle engine (``vco_lib.project_init.install_project_bundle``) runs it for
+    every NON-root project on ``install-bundle --update`` — which is how the
+    launcher's Update-all and the CLI bundle-update reach user projects.
+
+    Guard rails, in evaluation order:
+      * :data:`MCP_JSON_QUARANTINE_SKIP_ENV` (``VCO_SKIP_MCP_JSON_QUARANTINE``)
+        set truthy → total no-op (explicit user opt-out, MAJOR-4.3).
+      * A ``.mcp.json`` byte-identical to ANY existing ``.mcp.json.bak-*``
+        backup (new ``.claude/context/`` home or legacy project-root) means the
+        user deliberately restored a prior quarantine backup → LEAVE ALONE and
+        return an informational ``stale_mcp_json_restore_detected`` entry
+        instead of re-quarantining (MAJOR-4.2 — no restore/quarantine
+        ping-pong).
+
     Action, ONLY on a demonstrable contradiction (see
     :func:`mcp_json_weaviate_env_is_stale`):
-      1. Back up the whole `.mcp.json` to ``.mcp.json.bak-<YYYY-MM-DD>``.
+      1. Back up the whole `.mcp.json` to
+         ``.claude/context/.mcp.json.bak-<YYYY-MM-DD>`` (atomic write).
       2. Remove ONLY the ``weaviate-kg`` entry from ``mcpServers`` (so it
-         inherits the correct env from settings.json). Other MCP entries are
-         preserved verbatim; an empty ``mcpServers`` object is a valid no-op.
+         inherits the correct env from settings.json) and rewrite `.mcp.json`
+         ATOMICALLY (via :func:`vco_lib.atomic.atomic_write_text` — a crash
+         mid-write leaves either the old file or the new one, never a torn
+         file the next run's parse would choke on). Other MCP entries are
+         semantically preserved (the file is re-serialized as JSON, so
+         formatting/key-order may change but no entry's content does); an
+         empty ``mcpServers`` object is a valid no-op.
       3. Return a ``stale_mcp_json_shadow_quarantined`` deferral entry.
     """
     import json
+    import os
 
     def _log(step: str, phase: str, detail: str = "", data=None) -> None:
         if log_event is None:
@@ -1074,6 +1239,17 @@ def quarantine_stale_mcp_json_shadow(
             log_event(step, phase, detail, data=data)
         except TypeError:  # logger without a data= kwarg
             log_event(step, phase, detail)
+
+    # MAJOR-4.3: explicit user opt-out — checked HERE (the one shared helper)
+    # so it covers every caller (install.py root check + bundle engine).
+    skip_flag = os.environ.get(MCP_JSON_QUARANTINE_SKIP_ENV, "").strip().lower()
+    if skip_flag in ("1", "true", "yes", "on"):
+        _log(
+            "mcp_json_shadow_check", "info",
+            f"skipped: {MCP_JSON_QUARANTINE_SKIP_ENV} is set — "
+            ".mcp.json left untouched by user opt-out",
+        )
+        return None
 
     mcp_path = project_root / ".mcp.json"
     if not mcp_path.is_file():
@@ -1116,21 +1292,93 @@ def quarantine_stale_mcp_json_shadow(
             )
             return None
 
+        # ── MAJOR-4.2: restore-detection guard. A `.mcp.json` byte-identical
+        # to ANY existing quarantine backup means the user deliberately
+        # restored it — honour the decision, LEAVE ALONE, and surface an
+        # informational entry instead of re-quarantining forever (the
+        # pre-fix behaviour was a restore/quarantine ping-pong with no
+        # escape: the deferral said "restore the backup to roll back" while
+        # every --update re-quarantined the restored file).
+        restored_from = _find_matching_mcp_json_backup(project_root, mcp_path)
+        if restored_from is not None:
+            reasons_str = "; ".join(reasons)
+            _log(
+                "mcp_json_shadow_check", "info",
+                "deliberate .mcp.json restore detected (byte-identical to "
+                f"{restored_from}) — NOT re-quarantining",
+                data={
+                    "mcp_json": str(mcp_path),
+                    "matched_backup": str(restored_from),
+                    "reasons": reasons,
+                },
+            )
+            from vco_lib.deferral_report import DeferralEntry
+
+            return DeferralEntry(
+                condition_id="stale_mcp_json_restore_detected",
+                title=(
+                    "Deliberate .mcp.json restore detected — weaviate-kg "
+                    "block NOT re-quarantined"
+                ),
+                detected=(
+                    f"`{mcp_path}` carries a `weaviate-kg` env block that "
+                    f"contradicts the migrated `.claude/settings.json` "
+                    f"({reasons_str}), but the file is byte-identical to a "
+                    f"prior quarantine backup (`{restored_from}`) — you (or a "
+                    "script) restored that backup on purpose, so VCO is "
+                    "leaving it alone instead of re-quarantining it."
+                ),
+                why_deferred=(
+                    "A byte-identical match against a quarantine backup is "
+                    "treated as an explicit user decision to keep this "
+                    ".mcp.json. VCO will not fight it — no restore/quarantine "
+                    "ping-pong."
+                ),
+                command_to_apply=(
+                    "# No action required if the restore was intentional.\n"
+                    f"# To permanently silence this check: set "
+                    f"{MCP_JSON_QUARANTINE_SKIP_ENV}=1 in the environment of "
+                    "install.py / install-bundle runs.\n"
+                    "# To let VCO quarantine the stale block again: delete "
+                    "the matching backup\n"
+                    f"#   {restored_from}\n"
+                    "# (or edit .mcp.json so it no longer matches the backup "
+                    "byte-for-byte)."
+                ),
+                severity="info",
+                kg_node_refs=[
+                    "knowledge/concepts/orchestrator-mcp-servers.md",
+                ],
+            )
+
         # ── Stale: back up, then quarantine ONLY the weaviate-kg block. ──
+        # MAJOR-3: BOTH writes route through the shared atomic primitive
+        # (`vco_lib.atomic.atomic_write_text` — tempfile + fsync +
+        # os.replace) instead of `Path.write_text`'s truncate-then-write. A
+        # crash mid-rewrite previously left a TORN `.mcp.json`, and the torn
+        # file made the NEXT run's json parse fail → soft-fail no-op → the
+        # torn file stayed torn forever. One-home rule: no bespoke
+        # atomic-write copy here.
         from datetime import datetime, timezone
 
+        from vco_lib.atomic import atomic_write_text
+
+        # NIT-3: backups live under `.claude/context/` (out of the project
+        # root's git-status noise). Restore-detection above still honours
+        # legacy root-level `.mcp.json.bak-*` siblings from earlier builds.
+        backup_dir = project_root / MCP_JSON_BACKUP_REL
         date_stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        backup_path = mcp_path.with_name(f".mcp.json.bak-{date_stamp}")
+        backup_path = backup_dir / f".mcp.json.bak-{date_stamp}"
         if backup_path.exists():
             n = 2
             while True:
-                candidate = mcp_path.with_name(f".mcp.json.bak-{date_stamp}-{n}")
+                candidate = backup_dir / f".mcp.json.bak-{date_stamp}-{n}"
                 if not candidate.exists():
                     backup_path = candidate
                     break
                 n += 1
         try:
-            backup_path.write_text(raw, encoding="utf-8")
+            atomic_write_text(backup_path, raw)
         except OSError as exc:
             _log(
                 "mcp_json_shadow_check", "warn",
@@ -1146,7 +1394,7 @@ def quarantine_stale_mcp_json_shadow(
         }
         data["mcpServers"] = remaining
         try:
-            mcp_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+            atomic_write_text(mcp_path, json.dumps(data, indent=2) + "\n")
         except OSError as exc:
             _log(
                 "mcp_json_shadow_check", "warn",
@@ -1214,7 +1462,11 @@ def quarantine_stale_mcp_json_shadow(
                 f"# Backup of the original: {backup_path}\n"
                 "# Restart Claude Code so weaviate-kg picks up the correct env "
                 "from .claude/settings.json.\n"
-                f"# To roll back: restore the backup over {mcp_path}."
+                f"# To roll back: restore the backup over {mcp_path} — VCO "
+                "detects a byte-identical\n"
+                "# restore and will NOT re-quarantine it (no ping-pong).\n"
+                f"# To disable this check entirely: set "
+                f"{MCP_JSON_QUARANTINE_SKIP_ENV}=1."
             ),
             severity="warning",
             kg_node_refs=[

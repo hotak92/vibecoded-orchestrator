@@ -91,6 +91,14 @@ def _other_server_entry() -> dict:
     }
 
 
+def _backups(root: Path) -> "list[Path]":
+    """All `.mcp.json.bak-*` backups — BOTH the current `.claude/context/`
+    home (v0.2.89 review NIT-3) and the legacy project-root location."""
+    found = list((root / ".claude" / "context").glob(".mcp.json.bak-*"))
+    found += list(root.glob(".mcp.json.bak-*"))
+    return found
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -129,8 +137,10 @@ class StaleMcpJsonShadowTest(unittest.TestCase):
         data = json.loads(mcp_path.read_text(encoding="utf-8"))
         self.assertNotIn("weaviate-kg", data.get("mcpServers", {}))
 
-        # backup exists and contains the ORIGINAL stale block
-        backups = list(self.root.glob(".mcp.json.bak-*"))
+        # backup exists (in the .claude/context/ home — review NIT-3: keeps the
+        # project root clean of git-status noise) and contains the ORIGINAL
+        # stale block
+        backups = list((self.root / ".claude" / "context").glob(".mcp.json.bak-*"))
         self.assertEqual(len(backups), 1, "exactly one backup expected")
         backup_data = json.loads(backups[0].read_text(encoding="utf-8"))
         self.assertIn("weaviate-kg", backup_data["mcpServers"])
@@ -305,6 +315,183 @@ class StaleMcpJsonPredicateTest(unittest.TestCase):
         reasons = install._mcp_json_weaviate_env_is_stale(mcp_env, settings_env)
         self.assertIsNotNone(reasons)
         self.assertTrue(any("WEAVIATE_URL" in r for r in reasons))
+
+    # ------------------------------------------------------------------
+    # v0.2.89 review MAJOR-4 legs — URL equivalence must NOT be "stale"
+    # (false-negatives are the safe direction; quarantining a semantically
+    # equal config would hit exactly the 127.0.0.1 Windows demographic the
+    # fix targets).
+    # ------------------------------------------------------------------
+
+    def test_url_trailing_slash_is_not_stale(self) -> None:
+        settings_env = {"WEAVIATE_URL": "http://localhost:8081", "KG_COLLECTION": "K"}
+        mcp_env = {"WEAVIATE_URL": "http://localhost:8081/", "KG_COLLECTION": "K"}
+        self.assertIsNone(
+            install._mcp_json_weaviate_env_is_stale(mcp_env, settings_env)
+        )
+
+    def test_url_loopback_alias_is_not_stale(self) -> None:
+        settings_env = {"WEAVIATE_URL": "http://localhost:8081", "KG_COLLECTION": "K"}
+        for alias in ("http://127.0.0.1:8081", "http://[::1]:8081"):
+            mcp_env = {"WEAVIATE_URL": alias, "KG_COLLECTION": "K"}
+            self.assertIsNone(
+                install._mcp_json_weaviate_env_is_stale(mcp_env, settings_env),
+                f"loopback alias {alias!r} must compare equal to localhost",
+            )
+
+    def test_url_case_difference_is_not_stale(self) -> None:
+        settings_env = {"WEAVIATE_URL": "http://localhost:8081", "KG_COLLECTION": "K"}
+        mcp_env = {"WEAVIATE_URL": "HTTP://LOCALHOST:8081", "KG_COLLECTION": "K"}
+        self.assertIsNone(
+            install._mcp_json_weaviate_env_is_stale(mcp_env, settings_env)
+        )
+
+    def test_genuine_port_difference_still_stale(self) -> None:
+        # The normalization must not swallow REAL contradictions.
+        settings_env = {"WEAVIATE_URL": "http://localhost:8081", "KG_COLLECTION": "K"}
+        mcp_env = {"WEAVIATE_URL": "http://127.0.0.1:8080", "KG_COLLECTION": "K"}
+        self.assertIsNotNone(
+            install._mcp_json_weaviate_env_is_stale(mcp_env, settings_env)
+        )
+
+
+class StaleMcpJsonHardeningTest(unittest.TestCase):
+    """v0.2.89 review MAJOR-4 + test-gap legs — restore-detection guard (no
+    re-quarantine ping-pong), env opt-out, corrupt-input + backup-failure
+    conservatism, and the MAJOR-1 wiring pin. Behavior tests (need a scratch
+    project root, unlike the pure predicate class above)."""
+
+    def setUp(self) -> None:
+        self._tmp = __import__("tempfile").TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _stale_setup(self) -> Path:
+        _write_settings(
+            self.root,
+            weaviate_url="http://localhost:8081",
+            kg="ProjectKG",
+            shared="VibeCodedOrchestrator_KnowledgeGraph",
+        )
+        return _write_mcp_json(
+            self.root,
+            {
+                "weaviate-kg": _weaviate_entry(
+                    weaviate_url="http://localhost:8080",
+                    kg="FabioKnowledge",
+                    shared="",
+                )
+            },
+        )
+
+    def test_restore_detected_leaves_file_and_emits_info(self) -> None:
+        mcp_path = self._stale_setup()
+        original_bytes = mcp_path.read_bytes()
+
+        # First run quarantines (backup lands in .claude/context/).
+        report1 = DeferralReport()
+        install._check_stale_mcp_json_shadow(self.root, report1)
+        backups = _backups(self.root)
+        self.assertEqual(len(backups), 1)
+
+        # User deliberately restores the backup over .mcp.json.
+        mcp_path.write_bytes(backups[0].read_bytes())
+        self.assertEqual(mcp_path.read_bytes(), original_bytes)
+
+        # Second run must LEAVE the restored file alone and emit the
+        # informational restore-detected entry, NOT re-quarantine.
+        report2 = DeferralReport()
+        install._check_stale_mcp_json_shadow(self.root, report2)
+        self.assertEqual(
+            mcp_path.read_bytes(), original_bytes,
+            "a deliberately-restored .mcp.json must not be re-quarantined",
+        )
+        cids = {e.condition_id for e in report2.entries}
+        self.assertIn("stale_mcp_json_restore_detected", cids)
+        self.assertNotIn("stale_mcp_json_shadow_quarantined", cids)
+        # No SECOND backup was created by the leave-alone run.
+        self.assertEqual(len(_backups(self.root)), 1)
+
+    def test_opt_out_env_disables_quarantine(self) -> None:
+        import os
+        from unittest import mock
+
+        mcp_path = self._stale_setup()
+        original_bytes = mcp_path.read_bytes()
+        report = DeferralReport()
+        with mock.patch.dict(os.environ, {"VCO_SKIP_MCP_JSON_QUARANTINE": "1"}):
+            install._check_stale_mcp_json_shadow(self.root, report)
+        self.assertEqual(mcp_path.read_bytes(), original_bytes)
+        self.assertEqual(_backups(self.root), [])
+        self.assertNotIn(
+            "stale_mcp_json_shadow_quarantined",
+            {e.condition_id for e in report.entries},
+        )
+
+    # ------------------------------------------------------------------
+    # v0.2.89 review test-gap legs — corrupt input + backup-write failure
+    # must both leave .mcp.json untouched (soft-fail, never a partial write).
+    # ------------------------------------------------------------------
+
+    def test_corrupt_mcp_json_is_noop(self) -> None:
+        _write_settings(
+            self.root,
+            weaviate_url="http://localhost:8081",
+            kg="ProjectKG",
+            shared="Shared",
+        )
+        mcp_path = self.root / ".mcp.json"
+        mcp_path.write_text("{ this is not json", encoding="utf-8")
+        original_bytes = mcp_path.read_bytes()
+        report = DeferralReport()
+        install._check_stale_mcp_json_shadow(self.root, report)
+        self.assertEqual(mcp_path.read_bytes(), original_bytes)
+        self.assertEqual(_backups(self.root), [])
+
+    def test_backup_write_failure_leaves_mcp_untouched(self) -> None:
+        mcp_path = self._stale_setup()
+        original_bytes = mcp_path.read_bytes()
+        # Make the backup home un-creatable: `.claude/context` exists as a
+        # FILE, so the backup's create-parent-dirs step fails on every OS.
+        context_path = self.root / ".claude" / "context"
+        if context_path.exists():
+            import shutil
+
+            shutil.rmtree(context_path)
+        context_path.write_text("not a directory", encoding="utf-8")
+        report = DeferralReport()
+        install._check_stale_mcp_json_shadow(self.root, report)
+        self.assertEqual(
+            mcp_path.read_bytes(), original_bytes,
+            "backup failure must abort the quarantine BEFORE any mutation",
+        )
+        self.assertNotIn(
+            "stale_mcp_json_shadow_quarantined",
+            {e.condition_id for e in report.entries},
+        )
+
+    # ------------------------------------------------------------------
+    # v0.2.89 review MAJOR-1 — the quarantine must ride the per-project
+    # bundle-update path, not only the orchestrator root. The behaviour is
+    # covered by the unit legs above; this pins the WIRING so a refactor
+    # can't silently drop the project_init call-site.
+    # ------------------------------------------------------------------
+
+    def test_project_init_wires_quarantine_into_bundle_update(self) -> None:
+        project_init_src = (
+            Path(__file__).resolve().parent.parent / "vco_lib" / "project_init.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "quarantine_stale_mcp_json_shadow",
+            project_init_src,
+            "vco_lib/project_init.py must call the .mcp.json quarantine in its "
+            "bundle-update post-steps (v0.2.89 review MAJOR-1) — the stale "
+            ".mcp.json field condition lives in USER projects, which update "
+            "via the bundle engine, not via install.py's orchestrator-root "
+            "check",
+        )
 
 
 if __name__ == "__main__":
