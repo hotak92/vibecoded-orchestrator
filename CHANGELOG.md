@@ -35,6 +35,124 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the divergence modal one last time (the existing modal/resume flow handles
   it) — v0.2.89-onward auto-resolves.
 
+- **The bundled curated knowledge set ships with ready-made embeddings for
+  BOTH text slots — installs no longer re-embed it.** New sidecars
+  `templates/knowledge/.node_embeddings.qwen3_embed.json` and
+  `.node_embeddings.arctic2_embed.json` carry pre-computed vectors for the
+  113 ingestable curated nodes (archived/deprecated/superseded nodes ship no
+  vectors — the sync deliberately never ingests them). A fresh install's
+  curated-set embedding cost drops to ~zero for qwen3 AND arctic actives,
+  and dual-embedding installs pick up both slots from one sync. Data ships
+  root-only (non-root projects read curated content via the shared-KG
+  fan-out). The release-time generator
+  (`scripts/build_shipped_kg_embeddings.py`, with a `--verify` gate) keys
+  entries via the sync script's own content-signature function — the sidecar
+  README previously documented a WRONG key scheme and has been corrected.
+
+- **`scope: shared` frontmatter now works in the file-based KG workflow.**
+  A `knowledge/**/*.md` node carrying `scope: shared` routes to the shared
+  KG collection on sync, matching `store_knowledge_node(scope="shared")`
+  semantics: the `SHARED_KG_WRITE_DISABLED` gate refuses with a clear error
+  (no silent reroute), flipping a node project→shared migrates it (the stale
+  project-store copy is deleted), and flipping shared→project notices
+  leftover shared rows without deleting them.
+
+- **Update-all now shows live intra-project progress and background embed
+  activity.** The running project's row shows the actual step ("syncing
+  docs 35/120", "building code graph…"), and a footer tracks re-embeds that
+  continue in the background after a project's bundle update finishes — the
+  phase that previously looked frozen and tempted a restart (which re-embeds
+  from scratch).
+
+- **The hub warns about phantom collection names instead of serving them
+  silently.** `GET /api/v1/projects/{id}/config` gains a `warnings` field
+  (absent on healthy installs — the payload is byte-identical otherwise)
+  naming any served collection that does not exist on Weaviate. Warnings
+  fire only when the schema probe genuinely succeeded — "Weaviate down" is
+  now distinguishable from "class absent" and never warns.
+
+### Fixed
+
+- **`kg-sync` could silently sync the WRONG project with a false "success".**
+  The sync script trusted an inherited `KG_BASE_DIR` (any Claude session on
+  another project leaks one), so a kg-sync run from such a session embedded
+  the wrong tree's content under the right project's name. Root resolution
+  is now explicit: `--project-root` argv, then the new non-leakable
+  `KG_SYNC_PROJECT_ROOT` (wrappers pin it from their own location; the
+  launcher pins it per project), then legacy `KG_BASE_DIR`, then script
+  location — and every run banners which root it resolved and via which
+  channel. A run against a root with no `knowledge/` or docs now exits 2
+  instead of "succeeding" against the wrong tree.
+
+- **Windows code-graph builds failed 10/10 with `os error 193`.** The
+  build path spawned the `.ps1` analyzer directly (not a Win32 executable).
+  All bundled-script spawns now route through one shared invocation helper
+  (`powershell -NoProfile -ExecutionPolicy Bypass -File` on Windows).
+
+- **kg-sync / code-graph runs that died mid-run stayed RUNNING for days.**
+  Both job tables now carry a heartbeat stamped by the running task; a
+  sweeper and read-time guards mark heartbeat-stale RUNNING rows failed
+  promptly (previously only a launcher reboot reconciled them). No per-item
+  deadlines — a legitimately slow re-embed is never killed. Also fixed: a
+  partial build's terminal write was rejected by a stale validator, leaving
+  the row RUNNING forever.
+
+- **Project rename half-updated collection bindings and could point the hub
+  at nonexistent collections with no user-side fix.** Collection names are
+  now IMMUTABLE post-creation: rename changes the display name and slug
+  only. A boot-time reconciler repairs installs half-renamed by earlier
+  versions using positive evidence only (the rename-time record, or a
+  collection-backed sibling binding) and files an honest deferral instead of
+  guessing when evidence is insufficient; a schema probe failure results in
+  no action at all.
+
+- **Renaming a project closed the project dropdown before the edit could
+  happen.** Real-browser clicks run a microtask checkpoint between event
+  listeners, so the re-render detached the clicked pencil before the
+  outside-click handler ran, which read it as an outside click. Detached
+  targets no longer count as outside, and the rename input focuses on mount.
+
+- **`install.py` no longer hangs forever when Weaviate is unreachable** (a
+  Windows-standby-killed WSL2 port-forward left it waiting indefinitely on
+  an unattended machine). A bounded readiness gate (default 150 s,
+  `WEAVIATE_READY_TIMEOUT` overridable) runs before collection ensure/seed
+  and soft-fails to the existing `weaviate_unreachable_at_update` deferral;
+  the re-embed itself remains untimed (a slow CPU re-embed is never killed,
+  and a test now pins that invariant).
+
+- **A stale pre-migration `.mcp.json` no longer silently disables the
+  shared KG.** Project-scoped `.mcp.json` overrides `settings.json` for MCP
+  env, so a leftover pre-migration copy (old Weaviate port, stale
+  collection, empty shared) silently pointed searches at the wrong store.
+  Bundle updates (per-project AND orchestrator root) now detect a
+  weaviate-kg env block that demonstrably contradicts the migrated
+  settings.json, back it up, and remove only that block — other MCP entries
+  preserved, semantically-equal URLs (localhost ≡ 127.0.0.1 ≡ [::1], case,
+  trailing slash) never quarantined, a deliberately restored backup is
+  honoured (no re-quarantine ping-pong), and
+  `VCO_SKIP_MCP_JSON_QUARANTINE=1` opts out.
+
+- **Duplicated bundled knowledge from pre-v0.2.81 installs is cleaned up
+  automatically.** Older installs materialized the ~117 curated KG nodes
+  (and their embeddings) into every project. Bundle updates now remove a
+  project's copy only when its path and content-signature exactly match a
+  version VCO itself shipped (registry derived from full git history;
+  any user edit or relocation preserves the file), deleting Weaviate rows
+  before the file so no orphan embeddings survive, and only when the
+  project's collection identity is positively pinned — never on a
+  name-derived guess. Rows embedded from another project's tree (the
+  wrong-project sync damage above) are pruned by a companion repair that
+  never touches rows whose file exists, skips shared-identity collections
+  entirely, and ships as `python -m vco_lib.collection_repair` for manual
+  runs.
+
+- **Update aborts always verify the hub actually restarted.** The
+  abort-recovery path no longer trusts the happy-path cutover sentinel; it
+  health-polls on a background thread and files an honest
+  `hub_restart_failed_after_abort` deferral (self-clearing once a later
+  run confirms the hub is up — confirmed by a live health probe, not just
+  a version check) instead of failing silently.
+
 ## [0.2.88] - 2026-07-23
 
 ### Fixed
