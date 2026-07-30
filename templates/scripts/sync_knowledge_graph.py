@@ -570,7 +570,7 @@ def _build_vector_arg(
 #
 #     knowledge/.node_embeddings.<slot>.json   (one file per named-vector slot)
 #
-# Format (schema_version 1) — see knowledge/.node_embeddings.README.md:
+# Format (schema_version 1) — see knowledge/.node_embeddings.README.txt:
 #     {
 #       "schema_version": 1,
 #       "slot": "qwen3_embed",                 # the named-vector slot these
@@ -578,10 +578,11 @@ def _build_vector_arg(
 #       "model_id": "qwen3-embedding:0.6b",    # informational / provenance
 #       "dim": 1024,                           # informational / provenance
 #       "nodes": {
-#         "<content_hash>": {                  # the node's full-content
-#                                              #   signature (16-hex), == the
-#                                              #   value sync stores as
-#                                              #   `content_hash`
+#         "<signature>": {                     # _content_signature_excluding_
+#                                              #   updated (FULL 64-hex sha256,
+#                                              #   `updated:` line excluded) —
+#                                              #   NOT the 16-hex summary
+#                                              #   content_hash
 #           "total_chunks": 1,
 #           "chunks": [
 #             {"chunk_num": 1, "vector": [<float>, ...]}
