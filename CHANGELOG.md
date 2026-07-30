@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.89] - 2026-07-30
+
 ### Added
 
 - **Diverged generated / release-controlled files now reconcile to upstream
@@ -115,8 +117,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Renaming a project closed the project dropdown before the edit could
   happen.** Real-browser clicks run a microtask checkpoint between event
   listeners, so the re-render detached the clicked pencil before the
-  outside-click handler ran, which read it as an outside click. Detached
-  targets no longer count as outside, and the rename input focuses on mount.
+  outside-click handler ran, which read it as an outside click. The
+  outside-click decision now uses the event's dispatch-time propagation path
+  (`composedPath`), so the re-render can no longer misclassify the rename
+  click — while a genuinely-outside click still closes even if its own
+  target detaches. The rename input also focuses on mount.
 
 - **`install.py` no longer hangs forever when Weaviate is unreachable** (a
   Windows-standby-killed WSL2 port-forward left it waiting indefinitely on
