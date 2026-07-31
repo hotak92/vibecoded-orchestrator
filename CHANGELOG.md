@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.90] - 2026-07-31
+
+### Fixed
+
+- **Launcher died at boot after updating to v0.2.89** (all OSes): the
+  v0.2.89 heartbeat-staleness sweeper spawned its background task with a
+  bare `tokio::spawn` from Tauri's `setup()` on the main thread, where no
+  tokio reactor context exists — the spawn panicked (`there is no reactor
+  running`) and killed the launcher before the window appeared. The hub and
+  the update itself were unaffected; only the launcher GUI could no longer
+  start. All seven sync-context spawn entry points now use
+  `tauri::async_runtime::spawn`, which is safe from any thread: the
+  heartbeat ticker and staleness sweeper (the v0.2.89 regression) plus
+  `spawn_initial_sync`, `spawn_initial_build`, `spawn_initial_summary`, and
+  `spawn_setup_task` — those four carried the same latent crash since their
+  introduction, reachable whenever pending task rows existed at boot (e.g.
+  after a crash mid-task) — and `spawn_metadata_backfill`, which shared the
+  sync-fn shape (unsafe to call from any new non-runtime context) though
+  its one current caller runs on the runtime.
+
+### Added
+
+- **Launcher boot smoke** (`scripts/launcher-boot-smoke.sh`): boots the
+  built binary in an isolated HOME + private D-Bus session and requires the
+  new unconditional `[vct] setup complete` boot milestone before passing —
+  a plain alive-check is not enough (a boot can idle in desktop-services
+  negotiation without ever reaching the resume sweeps). Unit tests are
+  structurally blind to reactor-context panics because `#[tokio::test]`
+  provides the reactor `setup()` lacks. Wired twice: pre-ship Gate 2c
+  (debug build, before tagging) and a Linux xvfb step in the Release
+  workflow, where a failure blocks asset upload and the dist repoint — a
+  boot-dead binary can no longer reach users' update flow.
+- The `[vct] setup complete` milestone line itself: every earlier setup
+  step logs only when it has work to do, so a boot that died mid-setup was
+  previously indistinguishable in the journal from one that sailed through.
+- Source-level invariant test pinning the whole class: no bare
+  `tokio::spawn` in sync fns of the launcher crates
+  (`tests/test_v0290_no_bare_tokio_spawn_in_sync_fns.py`), plus a
+  no-reactor-context regression test for the spawn mechanism.
+
 ## [0.2.89] - 2026-07-30
 
 ### Added
