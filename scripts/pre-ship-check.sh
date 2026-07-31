@@ -297,6 +297,26 @@ else
     gate_fail "cargo test --lib (keychain-safe)" "See /tmp/preship-cargo-test.log"
 fi
 
+# Gate 2c (v0.2.90): launcher boot smoke. The v0.2.89 binary panicked in
+# setup() (bare tokio::spawn on the main thread — no reactor context) and
+# died before the window existed; cargo test is structurally blind to that
+# class because #[tokio::test] supplies the reactor setup() lacks. Build a
+# DEBUG binary (committed dist/ stays untouched — Gate 3's freshness
+# contract) and assert setup() COMPLETES (the "[vct] setup complete"
+# milestone) in an isolated HOME + private D-Bus. Debug profile note: with
+# devUrl configured the webview points at a dead dev server, but
+# setup()/boot-resume — where this class lives — runs identically to the
+# release binary.
+echo "  [running launcher boot smoke (debug build + setup-complete wait)...]"
+if (cd launcher/src-tauri && cargo build -p vct-launcher-temp) > /tmp/preship-boot-smoke.log 2>&1 \
+    && bash scripts/launcher-boot-smoke.sh \
+        launcher/src-tauri/target/debug/vct-launcher-temp 180 \
+        >> /tmp/preship-boot-smoke.log 2>&1; then
+    gate_pass "launcher boot smoke (setup complete, no panics)"
+else
+    gate_fail "launcher boot smoke" "See /tmp/preship-boot-smoke.log"
+fi
+
 # Gate 3: pytest
 echo "  [running pytest tests/ ...]"
 # SHADOW TRAP (v0.2.76 / update-lens): prepend REPO_ROOT to PYTHONPATH so the

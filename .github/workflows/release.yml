@@ -619,6 +619,23 @@ jobs:
           echo "[release] baking vct-hub fingerprint VCT_HUB_BUILD_FINGERPRINT=${VCT_HUB_BUILD_FINGERPRINT}"
           bash scripts/build-bundled-launcher.sh
 
+      # v0.2.90: boot smoke on the exact binary about to ship. The v0.2.89
+      # release binary panicked in setup() (bare tokio::spawn on the main
+      # thread — no tokio reactor context) and died before the window
+      # existed; unit tests are structurally blind to that class because
+      # #[tokio::test] supplies the reactor setup() lacks. Linux-only leg:
+      # the class is cross-platform Rust, so one OS covers it, and xvfb
+      # gives the headless runner a display. A failure here blocks asset
+      # upload AND the bot dist-repoint — the broken binary never reaches
+      # users' update flow.
+      - name: Boot smoke (Linux, xvfb)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -q xvfb dbus >/dev/null 2>&1 || sudo apt-get install -y xvfb dbus
+          bash scripts/launcher-boot-smoke.sh "launcher/dist/${{ matrix.target }}/vct-launcher" 300
+
       # v0.2.40 X1: ad-hoc codesign on macOS. `codesign --sign -` (the
       # literal hyphen identity) attaches a valid Mach-O signature with
       # NO trust anchor in Apple's PKI — Gatekeeper still warns on the
