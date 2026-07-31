@@ -63,7 +63,25 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-PYTHON_BIN="${SEARCH_MCP_PYTHON:-$REPO_ROOT/claude_mcp_servers/.venv/bin/python}"
+# Python resolution chain: explicit override, then the legacy MCP-stack
+# venv (pre-unification installs), then the repo-root venv (canonical
+# since the venv unification — installs where claude_mcp_servers/.venv
+# was retired). A single hardcoded default left the server unable to
+# start on root-venv layouts ("Failed to connect" with no visible cause).
+PYTHON_BIN="${SEARCH_MCP_PYTHON:-}"
+if [[ -z "$PYTHON_BIN" ]]; then
+    for candidate in \
+        "$REPO_ROOT/claude_mcp_servers/.venv/bin/python" \
+        "$REPO_ROOT/.venv/bin/python"; do
+        if [[ -x "$candidate" ]]; then
+            PYTHON_BIN="$candidate"
+            break
+        fi
+    done
+    # Keep the legacy default for the error message below when neither
+    # candidate exists.
+    PYTHON_BIN="${PYTHON_BIN:-$REPO_ROOT/claude_mcp_servers/.venv/bin/python}"
+fi
 SERVER_PY="${SEARCH_MCP_SERVER:-$REPO_ROOT/claude_mcp_servers/search_mcp/server.py}"
 
 # ── Locate the resolver ──────────────────────────────────────────────────────
