@@ -2193,6 +2193,15 @@ pub fn run() {
                 });
             }
 
+            // Unconditional boot milestone. Every step above (populate,
+            // config, reconcilers, the resume sweeps) logs only when it has
+            // work to do, so before this line existed a boot that DIED
+            // mid-setup was indistinguishable in the journal from one that
+            // sailed through (the v0.2.89 launcher panicked in the resume
+            // sweep and the log just... stopped). scripts/launcher-boot-smoke.sh
+            // waits for this exact string as its pass criterion.
+            eprintln!("[vct] setup complete");
+
             Ok(())
         })
         // Intercept window-close (X / Cmd+Q) on the main window. We

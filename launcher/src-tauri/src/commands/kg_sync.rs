@@ -123,7 +123,7 @@ pub(crate) fn heartbeat_stale_secs() -> u64 {
 /// — including the panic-unwind path of the owning task, so a crashed
 /// sync can never leave a ticker stamping liveness onto a row whose task
 /// is gone (that would defeat the whole mechanism).
-pub(crate) struct HeartbeatGuard(tokio::task::AbortHandle);
+pub(crate) struct HeartbeatGuard(tauri::async_runtime::JoinHandle<()>);
 
 impl Drop for HeartbeatGuard {
     fn drop(&mut self) {
@@ -143,7 +143,9 @@ pub(crate) fn spawn_heartbeat_ticker(
     touch: fn(&Db, &str) -> Result<usize, String>,
     label: &'static str,
 ) -> HeartbeatGuard {
-    let handle = tokio::spawn(async move {
+    // async_runtime::spawn, not tokio::spawn — sync fn, callable from
+    // main-thread contexts with no reactor (see the sweeper note below).
+    let handle = tauri::async_runtime::spawn(async move {
         loop {
             // First tick immediately: liveness is on record from the
             // moment the task starts (covers the admission-queue wait).
@@ -159,7 +161,7 @@ pub(crate) fn spawn_heartbeat_ticker(
             tokio::time::sleep(std::time::Duration::from_secs(HEARTBEAT_TICK_SECS)).await;
         }
     });
-    HeartbeatGuard(handle.abort_handle())
+    HeartbeatGuard(handle)
 }
 
 /// One-shot latch so the sweeper is spawned at most once per process even
@@ -177,7 +179,11 @@ fn spawn_stale_heartbeat_sweeper(app: AppHandle) {
     if HEARTBEAT_SWEEPER_STARTED.swap(true, Ordering::SeqCst) {
         return;
     }
-    tokio::spawn(async move {
+    // tauri::async_runtime::spawn, NOT tokio::spawn: this sync fn runs on
+    // the main thread during setup() (via resume_pending_syncs), where no
+    // tokio reactor context exists — a bare tokio::spawn panics there and
+    // kills the launcher at boot (v0.2.89 field incident).
+    tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(
                 HEARTBEAT_SWEEP_INTERVAL_SECS,
@@ -408,7 +414,9 @@ pub fn spawn_initial_sync(
     project_name: String,
     folder_path: String,
 ) {
-    tokio::spawn(async move {
+    // async_runtime::spawn, not tokio::spawn — sync fn, also called from
+    // setup()/main thread via the boot-resume sweep (no reactor context).
+    tauri::async_runtime::spawn(async move {
         run_sync_task(app, project_id, project_name, folder_path).await;
     });
 }
@@ -1618,6 +1626,26 @@ fn extract_number_before(s: &str, marker: &str) -> Option<u32> {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// Plain `#[test]` on a bare thread — deliberately NOT `#[tokio::test]`.
+    /// Reproduces the v0.2.89 boot context: `setup()` runs on the main
+    /// thread with no reactor, where a bare `tokio::spawn` panics ("there
+    /// is no reactor running") and kills the launcher before the window
+    /// exists. `tauri::async_runtime::spawn` must work from that context
+    /// (lazy global runtime) — this pins the mechanism every detached-spawn
+    /// entry point in this crate now relies on. A `#[tokio::test]` variant
+    /// would be worthless: it supplies the reactor the field context lacks.
+    #[test]
+    fn async_runtime_spawn_works_without_a_reactor_context() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tauri::async_runtime::spawn(async move {
+            let _ = tx.send(42u8);
+        });
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap(),
+            42
+        );
+    }
 
     fn tmpdir(label: &str) -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!(

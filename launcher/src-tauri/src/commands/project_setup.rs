@@ -240,7 +240,9 @@ pub fn spawn_setup_task(
     project_name: String,
     phase_fn: SetupPhaseFn,
 ) {
-    tokio::spawn(async move {
+    // async_runtime::spawn, not tokio::spawn — sync fn, also called from
+    // setup()/main thread via the boot-resume sweep (no reactor context).
+    tauri::async_runtime::spawn(async move {
         run_setup_task(app, project_id, project_name, phase_fn).await;
     });
 }

@@ -780,7 +780,9 @@ pub fn spawn_initial_build(
     // by default; the wizard's checkbox is the user-controlled path.
     prune_stale: bool,
 ) {
-    tokio::spawn(async move {
+    // async_runtime::spawn, not tokio::spawn — sync fn, also called from
+    // setup()/main thread via the boot-resume sweep (no reactor context).
+    tauri::async_runtime::spawn(async move {
         run_build_task(app, project_id, project_name, folder_path, prune_stale).await;
     });
 }
@@ -2615,7 +2617,9 @@ fn spawn_metadata_backfill(db: &Db, canonical_identity: String) {
         }
     };
     cmd.arg("--backfill-metadata").arg("--project").arg(&canonical_identity);
-    tokio::spawn(async move {
+    // async_runtime::spawn, not tokio::spawn — sync fn; keeps the no-bare-
+    // tokio::spawn-in-sync-fns invariant (safe from any calling context).
+    tauri::async_runtime::spawn(async move {
         let mut cmd = cmd;
         match cmd.output().await {
             Ok(out) if out.status.success() => {}

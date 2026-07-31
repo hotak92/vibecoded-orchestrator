@@ -42,6 +42,38 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 /// Tray refresh cadence.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
+/// 5 s hub-status poll loop driving the tray's hub label + Stop item.
+/// A named async fn rather than an inline async block inside `setup` —
+/// the blocking probes inside must run on the runtime, and the
+/// no-bare-tokio-spawn-in-sync-fns source scan requires that context to
+/// be explicit (v0.2.90).
+async fn hub_status_poll_loop<R: Runtime>(hub_label: MenuItem<R>, hub_stop: MenuItem<R>) {
+    // First tick fires immediately so the user sees real state
+    // shortly after the tray appears (no "probing…" stickiness).
+    let s = tokio::task::spawn_blocking(crate::hub_status::probe)
+        .await
+        .unwrap_or(crate::hub_status::HubStatus::NotRunning);
+    let _ = hub_label.set_text(crate::hub_status::label(s));
+    let _ = hub_stop.set_enabled(matches!(
+        s,
+        crate::hub_status::HubStatus::Running { .. }
+    ));
+
+    let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
+    ticker.tick().await; // burn the immediate-fire tick
+    loop {
+        ticker.tick().await;
+        let s = tokio::task::spawn_blocking(crate::hub_status::probe)
+            .await
+            .unwrap_or(crate::hub_status::HubStatus::NotRunning);
+        let _ = hub_label.set_text(crate::hub_status::label(s));
+        let _ = hub_stop.set_enabled(matches!(
+            s,
+            crate::hub_status::HubStatus::Running { .. }
+        ));
+    }
+}
+
 pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let open_item = MenuItem::with_id(app, "open", "Open Launcher", true, None::<&str>)?;
     // Initial text is a placeholder; the background task overwrites it on
@@ -231,34 +263,7 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     // services probe never starves the hub label. Probe is cheap
     // (read lockfile + kill(pid, 0)) — no HTTP call — so the poll
     // budget is well below the interval.
-    let hub_label_for_task = hub_label.clone();
-    let hub_stop_for_task = hub_stop.clone();
-    tauri::async_runtime::spawn(async move {
-        // First tick fires immediately so the user sees real state
-        // shortly after the tray appears (no "probing…" stickiness).
-        let s = tokio::task::spawn_blocking(crate::hub_status::probe)
-            .await
-            .unwrap_or(crate::hub_status::HubStatus::NotRunning);
-        let _ = hub_label_for_task.set_text(crate::hub_status::label(s));
-        let _ = hub_stop_for_task.set_enabled(matches!(
-            s,
-            crate::hub_status::HubStatus::Running { .. }
-        ));
-
-        let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
-        ticker.tick().await; // burn the immediate-fire tick
-        loop {
-            ticker.tick().await;
-            let s = tokio::task::spawn_blocking(crate::hub_status::probe)
-                .await
-                .unwrap_or(crate::hub_status::HubStatus::NotRunning);
-            let _ = hub_label_for_task.set_text(crate::hub_status::label(s));
-            let _ = hub_stop_for_task.set_enabled(matches!(
-                s,
-                crate::hub_status::HubStatus::Running { .. }
-            ));
-        }
-    });
+    tauri::async_runtime::spawn(hub_status_poll_loop(hub_label.clone(), hub_stop.clone()));
 
     // Background poller. `MenuItem<R>` is internally `Arc`-wrapped and
     // cheap to clone, so the spawned task gets its own handle without

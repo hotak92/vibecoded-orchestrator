@@ -179,7 +179,9 @@ pub fn spawn_initial_summary(
     project_name: String,
     folder_path: String,
 ) {
-    tokio::spawn(async move {
+    // async_runtime::spawn, not tokio::spawn — sync fn, also called from
+    // setup()/main thread via the boot-resume sweep (no reactor context).
+    tauri::async_runtime::spawn(async move {
         run_summary_task(app, project_id, project_name, folder_path).await;
     });
 }
