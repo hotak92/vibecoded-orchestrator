@@ -1,11 +1,11 @@
 {
-  "source_sha": "64324a5e84dfae60420fc680222b64fdf0950608",
-  "source_short_sha": "64324a5",
-  "source_hash": "e60a82bf02a2a2c289646455e87860375cc08327",
-  "built_at": "2026-07-30T16:58:01Z",
-  "launcher_version": "0.2.89",
+  "source_sha": "6ec4508404f5b233e69e98e7967b08bece5ebfcc",
+  "source_short_sha": "6ec4508",
+  "source_hash": "2767e798649c4c3de04e46c510ba018b0eda1790",
+  "built_at": "2026-07-31T15:11:11Z",
+  "launcher_version": "0.2.90",
   "host_target": "windows-x64",
   "binary_name": "vct-launcher.exe",
-  "binary_size_bytes": 37709312,
+  "binary_size_bytes": 37618688,
   "tier": "stable"
 }
