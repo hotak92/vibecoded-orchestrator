@@ -39,7 +39,7 @@ classifiers = [
 # since the packages are already present in the venv).
 dependencies = [
     "mcp>=1.27.0",
-    "weaviate-client>=4.21.0",
+    "weaviate-client>=4.23.0",
     "aiohttp>=3.13.5",
     "httpx>=0.28.1",
     "pydantic>=2.13.3",
