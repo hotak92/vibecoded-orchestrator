@@ -25,6 +25,21 @@
 # group + tightened `update-types` semantics. Expect ~3-5 PRs/week
 # total (1 per ecosystem with non-major activity, plus one per major
 # bump that fires through the ungrouped path).
+#
+# Cadence change (2026-08-23): weekly -> monthly, and `day:` dropped
+# (it is only meaningful for `interval: weekly`).
+#
+# Rationale: this config was mirrored verbatim into the PRIVATE fork
+# hotak92/VCO_dev, where every Dependabot PR fans out to 7 workflows
+# across a 5-OS matrix. Because private-repo minutes are billed (and
+# macOS bills at 10x with a 1-minute-per-job floor), three Dependabot
+# Mondays in August 2026 consumed ~2,615 of the account's 3,000
+# monthly Actions minutes. Runs in THIS repo are free (public repos
+# get free standard runners), but the weekly cadence was the upstream
+# driver of that spend and of the bot-commit divergence between the
+# two repos. Version updates now land here monthly and flow into
+# VCO_dev via the normal upstream merge; Dependabot is disabled
+# outright on VCO_dev (see that repo's dependabot.yml).
 
 version: 2
 updates:
@@ -32,8 +47,7 @@ updates:
   - package-ecosystem: "pip"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "06:00"
       timezone: "Etc/UTC"
     open-pull-requests-limit: 10
@@ -61,8 +75,7 @@ updates:
   - package-ecosystem: "pip"
     directory: "/claude_mcp_servers"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "06:00"
       timezone: "Etc/UTC"
     open-pull-requests-limit: 10
@@ -96,8 +109,7 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "06:00"
       timezone: "Etc/UTC"
     open-pull-requests-limit: 5
@@ -121,8 +133,7 @@ updates:
   - package-ecosystem: "npm"
     directory: "/launcher"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "06:00"
       timezone: "Etc/UTC"
     open-pull-requests-limit: 10
@@ -151,8 +162,7 @@ updates:
   - package-ecosystem: "cargo"
     directory: "/launcher/src-tauri"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "06:00"
       timezone: "Etc/UTC"
     open-pull-requests-limit: 10
