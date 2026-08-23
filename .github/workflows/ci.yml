@@ -129,7 +129,7 @@ jobs:
     name: Rust (cargo test --lib)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -189,12 +189,12 @@ jobs:
     # (separate per-language tests don't catch that — they only check
     # parser-vs-EXPECTED, not parser-vs-parser).
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: launcher/src-tauri
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install Tauri Linux build deps
@@ -214,8 +214,8 @@ jobs:
     name: Python (pytest)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -236,8 +236,8 @@ jobs:
     # CI gate caught type regressions slipping in via PR. This job
     # closes that gap.
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -273,8 +273,8 @@ jobs:
       run:
         working-directory: launcher
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
           cache: npm
@@ -315,7 +315,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: rust    # don't waste minutes if cargo test failed
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -466,7 +466,7 @@ jobs:
     name: Repo-tree leak gates (no-secrets + pre-tag-privacy)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Privacy gate uses `git ls-tree` against HEAD; full history
           # not needed. The leak grep scans tracked files only.
@@ -490,7 +490,7 @@ jobs:
     name: Version-pin consistency (no cross-file drift)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Pin check reads tracked manifests only; no history needed.
           fetch-depth: 1

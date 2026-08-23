@@ -98,7 +98,7 @@ jobs:
       # smoke-only into a hard requirement.
       VCT_CONTAINER_RUNTIME: ${{ matrix.runtime }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -112,7 +112,7 @@ jobs:
           # warm artifacts when the same commit ran the rust job first.
           shared-key: vct-hub-step22
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip

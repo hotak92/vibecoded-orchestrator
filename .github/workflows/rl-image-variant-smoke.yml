@@ -73,7 +73,7 @@ jobs:
     env:
       IMAGE_REF: ${{ inputs.image_repo || 'ghcr.io/hotak92/vct-rl-reranker' }}:${{ inputs.image_version || '0.2.10' }}-cpu
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
