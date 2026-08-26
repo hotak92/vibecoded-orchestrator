@@ -19348,16 +19348,26 @@ def _try_invoke_windows_stage1_updater(
         )
         return None
 
-    # Determine launcher PID. If the caller didn't pass one, no handoff
-    # is needed (install.py is in its standard "running launcher will
-    # restart later" mode; the deferral path covers this).
+    # Determine launcher PID. v0.2.91 WI-5: when the caller didn't pass one (the
+    # CLI-invoked case this helper exists for), SCAN — step 2 of the docstring
+    # above, promised since v0.2.52 and never implemented. Pre-v0.2.91 this
+    # branch just skipped, so a terminal `install.py --update` against a running
+    # Windows launcher could never hand off and the frozen binary stayed frozen.
     if launcher_pid is None or launcher_pid <= 0:
+        from vco_lib.dist_binary_repair import scan_for_launcher_pid
+        launcher_pid = scan_for_launcher_pid("vct-launcher.exe")
+        if launcher_pid is None:
+            _log_install_event(
+                "stage1_updater", "skip",
+                "no launcher PID provided and no running vct-launcher.exe found — "
+                "handoff not needed (install.py overwrites the dist binary directly)",
+            )
+            return None
         _log_install_event(
-            "stage1_updater", "skip",
-            "no launcher PID provided — handoff not needed "
-            "(install.py overwrites dist binary directly or emits deferral)",
+            "stage1_updater", "ok",
+            f"process scan found a running launcher (pid={launcher_pid}) — "
+            "proceeding with the handoff",
         )
-        return None
 
     # Build the swap list. Only include candidates that have a
     # `<target>.new` staged sibling on disk. If neither is staged, the
@@ -19961,6 +19971,17 @@ def _refresh_dist_binary_after_rebuild(
             deferral_report=deferral_report,
         )
     if not src.is_file():
+        # v0.2.91 WI-5: NO cargo artifact — the binary-download / git-pull case.
+        # Pre-v0.2.91 this returned here and install.py could not repair a dist
+        # tree diverged from HEAD at all, so a frozen Windows binary was
+        # unfixable even from a terminal. The restore leg needs only git, so it
+        # is the permanent escape hatch when no launcher binary works.
+        _repair_dist_from_head_leg(
+            install_root,
+            dist_rel_dir=f"launcher/dist/{subdir}",
+            dist_path=dist_path,
+            deferral_report=deferral_report,
+        )
         return None
 
     # subdir/fname/dist_path already resolved at the top of this
@@ -20254,6 +20275,50 @@ def _refresh_dist_binary_after_rebuild(
         )
 
     return dist_path
+
+
+def _repair_dist_from_head_leg(
+    install_root: Path,
+    *,
+    dist_rel_dir: str,
+    dist_path: Path,
+    deferral_report: Any = None,
+) -> None:
+    """v0.2.91 WI-5 — thin shim over ``vco_lib.dist_binary_repair.run_repair_leg``.
+
+    Runs on the NO-cargo-artifact path of
+    :func:`_refresh_dist_binary_after_rebuild` (the binary-download / git-pull
+    case). ALL decisions — dirty detection, restore-then-stage, the launcher-PID
+    scan, the v0.2.54 C-5 launcher-driven guard — live in vco_lib; this shim
+    supplies only install.py's side effects. ``--no-binary-swap`` already
+    returned before we get here, so hand-placed dist binaries have an opt-out.
+
+    LOUD-fail on the vco_lib import (a missing shipped module is a BROKEN
+    install); SOFT-fail inside the run (handled by ``run_repair_leg``).
+    """
+    from vco_lib.dist_binary_repair import run_repair_leg
+
+    run_repair_leg(
+        install_root,
+        dist_rel_dir=dist_rel_dir,
+        binary_name=dist_path.name,
+        launcher_driven=os.environ.get("VCT_AUTO_RESTART_LAUNCHER", "").strip() == "1",
+        launcher_pid_env=os.environ.get("VCT_LAUNCHER_PID", ""),
+        log=_log_install_event,
+        on_restart_required=lambda pid: _emit_launcher_restart_deferral(
+            deferral_report,
+            install_root=install_root,
+            new_binary_path=dist_path,
+            new_version=_query_launcher_version(dist_path),
+            old_pid=pid,
+        ),
+        on_swap_locked=lambda detail: _emit_binary_swap_locked_deferral(
+            deferral_report, new_binary_path=dist_path, error_detail=detail,
+        ),
+        invoke_stage1=lambda pid: _try_invoke_windows_stage1_updater(
+            install_root, launcher_pid=pid,
+        ),
+    )
 
 
 def _ensure_launcher_binary(

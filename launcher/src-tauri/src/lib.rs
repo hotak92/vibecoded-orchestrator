@@ -795,6 +795,48 @@ pub fn run() {
                 }
             }
 
+            // v0.2.91 WP-A / WI-1: dist-binary reconcile AT REST.
+            //
+            // `poll_update_lock_on_boot` above only interprets the updater's
+            // lock/result files — it never compares the binary ON DISK against
+            // HEAD or against the version this process is running. That gap is
+            // RC-2: with a stale exe over a current source, "Update" said
+            // "Already up to date", the self-update check compared git SHAs
+            // only, and boot repaired nothing — so a launcher frozen on an old
+            // binary could never recover. This probe closes it.
+            //
+            // BOOT DISCIPLINE (the v0.2.90 lesson): the work runs on
+            // `tauri::async_runtime::spawn` — NEVER a bare `tokio::spawn`
+            // (setup() has no reactor context) and never inline (setup() must
+            // stay fast and must reach the `[vct] setup complete` marker the
+            // boot smoke waits on). Nothing here restarts or quits the
+            // launcher: if a swap is needed it is STAGED and armed for the
+            // user's own next quit, and an honest `launcher_binary_stale`
+            // record explains it.
+            tauri::async_runtime::spawn(async {
+                let root = match commands::installer::find_local_repo_root() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        // Launcher running outside a clone (PATH wrapper, dev
+                        // build). Nothing to reconcile; not an error.
+                        eprintln!(
+                            "[vct] binary-freshness boot probe: no orchestrator root resolved \
+                             ({}) — skipping",
+                            e
+                        );
+                        return;
+                    }
+                };
+                let outcome = crate::services::binary_freshness::reconcile_dist_at_rest(&root).await;
+                if outcome.is_stale() {
+                    eprintln!(
+                        "[vct] binary-freshness boot probe: STALE (staged={:?}, armed={}) — a \
+                         `launcher_binary_stale` record was written; quit + relaunch applies it",
+                        outcome.staged, outcome.armed,
+                    );
+                }
+            });
+
             // v0.2.37 (Agent V37-E, 2026-05-27): consume the
             // install_path seed file that install.py may have written
             // alongside the orchestrator clone (see
@@ -3076,6 +3118,14 @@ pub fn run() {
         .run(|_app_handle, event| {
             if let tauri::RunEvent::Exit = event {
                 vct_launcher_core::secrets::shutdown_keychain_connection();
+                // v0.2.91 WP-A / WI-1 tail: if the at-rest reconcile staged a
+                // fresh binary this session, hand the swap to `vct-updater`
+                // NOW — the user is quitting, so the mandatory Windows lock on
+                // our own .exe is about to be released. The lock is written
+                // with `relaunch: None`: quitting means quitting (standing
+                // no-auto-restart ruling). No-op when nothing was armed, on
+                // POSIX, or when a real update handoff already owns the lock.
+                crate::services::binary_freshness::perform_armed_swap_on_exit();
             }
         });
 }

@@ -829,6 +829,35 @@ pub async fn check_for_launcher_update<R: Runtime>(
         .await
         .unwrap_or(0);
     let available = remote_sha != local_sha && commit_count > 0;
+
+    // v0.2.91 WI-1: reconcile the dist binaries at UPDATE-CHECK time too.
+    //
+    // `available` above is a pure SHA comparison — a clone whose SOURCE is
+    // current but whose BINARY is stale reports "no update available" and the
+    // user has no signal at all (RC-2). We deliberately do NOT flip
+    // `available` for a stale binary (that would relabel a source check as a
+    // binary problem and could pin the badge on permanently); instead the
+    // reconcile stages the fresh binary, arms the swap for the user's next
+    // quit, and writes the honest `launcher_binary_stale` record. Emission is
+    // once-per-process, so polling this command does not spam.
+    // v0.2.91 fix-round MAJOR-2(b): this command is POLLED, so it can land in
+    // the middle of a real update — in which case the reconcile stands down and
+    // reports `stood_down` rather than a verdict it never established.
+    let freshness = crate::services::binary_freshness::reconcile_dist_at_rest(&repo).await;
+    if freshness.stood_down {
+        eprintln!(
+            "[vct] check_for_launcher_update: binary freshness NOT probed this tick — an \
+             update owns the tree (source SHAs say available={})",
+            available,
+        );
+    } else if freshness.is_stale() {
+        eprintln!(
+            "[vct] check_for_launcher_update: source SHAs say available={} but the dist binary \
+             is stale (staged={:?}, armed={})",
+            available, freshness.staged, freshness.armed,
+        );
+    }
+
     let now = Utc::now();
 
     // Persist regardless of available/not — that's how we honor the daily
@@ -953,6 +982,58 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
     // whose working-tree content already == the incoming upstream blob is not a
     // real modification and must not force the resync modal via the
     // pop-conflict-risk set. Byte-identity-gated; divergent files left alone.
+    // v0.2.91 WI-4: Windows pre-pull rename, parity with the MenuBar surface.
+    //
+    // Two jobs, which is why it must sit HERE — before F1 + the generated-file
+    // reconcile, not just before the pull:
+    //   1. the reconcile's `git checkout HEAD -- launcher/dist/**` cannot
+    //      rewrite a mapped running `.exe`; with the canonical path freed it
+    //      can (this is exactly the ordering `update_orchestrator` already
+    //      has, and its absence here is why the reconcile was unreachable for
+    //      the dist-divergence class it was built for);
+    //   2. `git pull` would otherwise either abort atomically on
+    //      ERROR_SHARING_VIOLATION or complete the merge with the binary
+    //      silently skipped (metadata new + exe old + git-dirty).
+    //
+    // No-op on POSIX. Reverted NON-CLOBBERINGLY on every failure return below
+    // (WI-3). Nothing between here and the pull returns early, so the revert
+    // sites below are exhaustive.
+    let pre_pull_renamed =
+        crate::services::binary_freshness::pre_pull_rename_running_binary(&repo);
+    // Revert helper for the failure paths: keeps the freshly-pulled bytes when
+    // the pull already landed them (WI-3) and logs either way.
+    //
+    // v0.2.91 fix-round MINOR-1: the outcome is CHECKED, not discarded. An
+    // averted clobber on THIS surface used to produce nothing at all — no
+    // deferral, no audit row, no trace — while the installer surface recorded
+    // both. That asymmetry is the WI-7 silence this release closes: the state
+    // it describes ("the canonical binary now holds NEWER bytes than the
+    // process you are running") is exactly the one the field install sat in for
+    // a month undiagnosed. `revert_and_record` is the shared home for the
+    // revert + durable-condition pair; the audit row is written here because
+    // the Db handle is a property of the surface, not of the revert.
+    let audit_app = app.clone();
+    let revert_rename = |backup: Option<&std::path::Path>| {
+        let Some(b) = backup else { return };
+        let outcome = crate::services::binary_freshness::revert_and_record(&repo, b);
+        if outcome == crate::services::binary_freshness::RevertOutcome::ClobberAverted {
+            use tauri::Manager as _;
+            if let Some(db) = audit_app.try_state::<crate::db::Db>() {
+                let _ = db.audit(
+                    "update_binary_clobber_averted",
+                    None,
+                    None,
+                    &serde_json::json!({
+                        "surface": "apply_launcher_update",
+                        "branch": branch,
+                        "backup": b.display().to_string(),
+                        "note": "abort tail kept the freshly-pulled binary (WI-3)",
+                    }),
+                );
+            }
+        }
+    };
+
     let f1_restored =
         crate::commands::git_user_editable_merge::auto_restore_byte_identical_tracked_mods(
             &repo, &branch,
@@ -1031,6 +1112,9 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
             // then the tree must be clean + re-attemptable. (No-op for the
             // FfOnly/non-FF arm — nothing was merged.)
             abort_merge_or_rebase_in_progress(&repo).await;
+            // v0.2.91 WI-3/WI-4: put the running binary back at its canonical
+            // path (unless the pull already landed newer bytes there).
+            revert_rename(pre_pull_renamed.as_deref());
             // Best-effort: capture local + remote SHAs so the modal can
             // show users what their clone has vs. what upstream has.
             let local = current_sha(&repo).await.ok();
@@ -1056,6 +1140,7 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
                 &e,
             ));
         }
+        revert_rename(pre_pull_renamed.as_deref());
         return Err(e);
     }
 
@@ -1072,6 +1157,11 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
         // Abort here too: an autostash-pop conflict leaves the tree dirty +
         // a dangling stash; clean it so the next attempt isn't blocked.
         abort_merge_or_rebase_in_progress(&repo).await;
+        // v0.2.91 WI-3: NON-clobbering revert. On this branch the merge may
+        // well have LANDED (only the autostash pop conflicted), in which case
+        // the canonical path already holds the new binary and restoring the
+        // backup over it would freeze this install (RC-1).
+        revert_rename(pre_pull_renamed.as_deref());
         let local = current_sha(&repo).await.ok();
         let remote = ls_remote_sha(&repo, &branch).await.ok();
         let detail = "git pull (auto-merge) left unmerged files (autostash-pop conflict)";
@@ -1199,11 +1289,55 @@ async fn finish_apply_after_pull<R: Runtime>(
         rebuild_frontend(repo).await?;
     }
 
+    // v0.2.91 WI-4: Surface B parity — route through the SHARED staging +
+    // stage1-handoff tail before the restart hop.
+    //
+    // Pre-v0.2.91 this surface had NO staging and NO handoff: on Windows a
+    // dist binary the pull skipped (mandatory lock) stayed stale, and the
+    // `current_exe()` respawn below re-executed the SAME old binary — the
+    // stale-binary relaunch loop, on this surface, by construction. The tail
+    // lives in `services::binary_freshness` and is byte-identical to the one
+    // `installer::finalize_update_and_restart` runs, so the two surfaces
+    // cannot drift.
+    //
+    // No-op on POSIX (nothing to stage; the handoff reports "non-windows"),
+    // so Linux/macOS behaviour is unchanged.
+    // ORDERING (load-bearing): staged + armed HERE, but the exit hop happens
+    // at the very bottom — AFTER the desktop-shortcut / install-manifest /
+    // hardware-redetect bookkeeping below. Exiting straight from here would
+    // skip all three on the handoff path, and unlike the installer surface
+    // this flow never runs install.py, so nothing else would record the new
+    // version.
+    let handoff = crate::services::binary_freshness::stage_and_handoff_after_update(
+        repo,
+        &repo.display().to_string(),
+    )
+    .await;
+
     // Step 5: restart. Spawn the same binary path as a new process, then
     // exit the current one. On all three platforms `current_exe()` returns
     // the path that was used to launch us, which is what we want post-
     // rebuild because the new binary lives at the same path.
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    //
+    // v0.2.91 WI-4 exception: on Windows the pre-pull rename may have moved
+    // US to `<name>.old-<pid>`, and `current_exe()` follows the rename — so
+    // respawning it verbatim would launch the OLD binary we just moved aside.
+    // Recover the canonical sibling when it exists.
+    let exe = {
+        let running = std::env::current_exe().map_err(|e| e.to_string())?;
+        match crate::services::binary_freshness::canonical_path_for_backup(&running) {
+            Some(canonical) if canonical.is_file() => {
+                eprintln!(
+                    "[apply_launcher_update] running from a pre-pull backup ({}); relaunching \
+                     the canonical binary at {} instead",
+                    running.display(),
+                    canonical.display(),
+                );
+                canonical
+            }
+            _ => running,
+        }
+    };
 
     // C3 (v0.2.6): refresh the desktop shortcut so it picks up any
     // change in binary path/contents post-rebuild. The launcher repo is
@@ -1250,6 +1384,21 @@ async fn finish_apply_after_pull<R: Runtime>(
         eprintln!(
             "[apply_launcher_update] could not acquire Db State to mark hardware-redetect-pending; the next boot will skip the post-update redetect (Preferences button remains available)."
         );
+    }
+
+    // v0.2.91 WI-4: when the stage1 handoff fired, `vct-updater` owns both the
+    // swap and the relaunch — spawning `exe` ourselves here would start the
+    // OLD binary (the very file the updater is waiting to replace) and race it.
+    // Exit and let the updater do its job.
+    if handoff.handoff_active {
+        eprintln!(
+            "[apply_launcher_update] stage1 handoff active (lock={:?}); exiting so vct-updater \
+             can swap the locked binaries and relaunch",
+            handoff.lock_path,
+        );
+        crate::quit_dialog::force_quit();
+        app.exit(0);
+        return Ok(());
     }
 
     std::process::Command::new(&exe).silent()
@@ -1382,7 +1531,28 @@ pub(crate) fn json_escape(s: &str) -> String {
 /// Returns the first tracked-file change that would be clobbered by `git
 /// pull --ff-only`. Untracked files (status code `??`) are ignored —
 /// they're not at risk during a fast-forward merge.
+///
+/// v0.2.91 WI-4 — GENERATED / release-controlled paths are ignored too.
+///
+/// Why: this guard runs at Step 1 of `apply_launcher_update`, BEFORE the F1
+/// byte-identical restore and BEFORE `resolve_generated_files_to_upstream`.
+/// A dirty `launcher/dist/<arch>/vct-launcher.exe` — precisely what a failed
+/// Windows binary swap leaves behind — therefore hard-blocked this surface with
+/// "Uncommitted changes on tracked file … would be lost", and the reconcile
+/// built to auto-resolve that exact class was unreachable. The user's only
+/// remaining forward action on this surface was the DESTRUCTIVE resync.
+///
+/// The excluded set is the shared `GENERATED_RELEASE_CONTROLLED_PATTERNS`
+/// allowlist, classified with the shared globset builder (one home — the
+/// pattern list and its glob semantics are not restated here). Everything else
+/// still blocks: a hand-edited `Cargo.toml` / `*.rs` / `*.py` is a real signal
+/// and must not be silently pulled over.
 fn first_blocking_change(porcelain: &str) -> Option<String> {
+    // Built once per call; four patterns. On a (never-observed) malformed
+    // pattern, fall back to "exclude nothing" — the pre-v0.2.91 behaviour,
+    // which blocks rather than silently pulling over a dirty file.
+    let generated =
+        crate::commands::git_user_editable_merge::build_generated_release_controlled_globset().ok();
     for line in porcelain.lines() {
         if line.len() < 4 {
             continue;
@@ -1394,6 +1564,13 @@ fn first_blocking_change(porcelain: &str) -> Option<String> {
             continue;
         }
         let path = line[3..].to_string();
+        if let Some(gs) = generated.as_ref() {
+            if crate::commands::git_user_editable_merge::is_generated_release_controlled(&path, gs)
+            {
+                // Handled downstream by F1 + the take-upstream reconcile.
+                continue;
+            }
+        }
         return Some(path);
     }
     None
@@ -1759,6 +1936,82 @@ mod tests {
         assert_eq!(
             first_blocking_change(porcelain),
             Some("src-tauri/src/lib.rs".into())
+        );
+    }
+
+    /// v0.2.91 WI-4 RED-PROOF: a dirty `launcher/dist/<arch>/vct-launcher.exe`
+    /// is EXACTLY what a failed Windows binary swap (or a hand-copied recovery
+    /// binary) leaves behind. On `bd8f6836` this returned `Some(path)` and the
+    /// self-update surface hard-refused with "Uncommitted changes on tracked
+    /// file … would be lost" — BEFORE the F1 restore and BEFORE the
+    /// take-upstream reconcile that exists to auto-resolve this exact class.
+    /// The only forward action left to the user was the destructive resync.
+    #[test]
+    fn blocking_change_ignores_generated_release_controlled_dist_binaries() {
+        let porcelain = " M launcher/dist/windows-x64/vct-launcher.exe\n";
+        assert_eq!(
+            first_blocking_change(porcelain),
+            None,
+            "a dirty dist binary must not block the self-update surface — F1 + the \
+             take-upstream reconcile downstream own it"
+        );
+    }
+
+    /// The rest of the shared generated/release-controlled allowlist is
+    /// excluded too (one home: the same globset the installer surface uses).
+    #[test]
+    fn blocking_change_ignores_lockfiles_and_package_json() {
+        for p in [
+            "launcher/package.json",
+            "launcher/package-lock.json",
+            "launcher/src-tauri/Cargo.lock",
+            "launcher/dist/linux-x64/vct-hub",
+            "launcher/dist/windows-x64/vct-launcher.exe.metadata.json",
+        ] {
+            assert_eq!(
+                first_blocking_change(&format!(" M {}\n", p)),
+                None,
+                "{} is release-controlled and must not block",
+                p
+            );
+        }
+    }
+
+    /// Both-sides discipline: the guard must STILL block on a hand-authored
+    /// source file. Widening the exclusion past the allowlist would silently
+    /// pull over a user's real edit — the failure this guard exists to prevent.
+    #[test]
+    fn blocking_change_still_blocks_hand_authored_sources() {
+        for p in [
+            "launcher/src-tauri/Cargo.toml",
+            "launcher/src-tauri/tauri.conf.json",
+            "install.py",
+            "launcher/src-tauri/src/lib.rs",
+            "vct-module.json",
+            // Near-miss paths that must NOT be swallowed by the glob.
+            "launcher/distX/foo",
+            "launcher/package.json.bak",
+        ] {
+            assert_eq!(
+                first_blocking_change(&format!(" M {}\n", p)),
+                Some(p.to_string()),
+                "{} is hand-authored — a local edit there is a real signal",
+                p
+            );
+        }
+    }
+
+    /// Mixed porcelain: the excluded dist rows are skipped but a real blocker
+    /// later in the listing is still reported (the loop must not stop at the
+    /// first excluded row).
+    #[test]
+    fn blocking_change_scans_past_excluded_rows() {
+        let porcelain = " M launcher/dist/windows-x64/vct-launcher.exe\n\
+                         ?? .claude/CONTEXT_STATE.md\n\
+                         M  launcher/src-tauri/src/lib.rs\n";
+        assert_eq!(
+            first_blocking_change(porcelain),
+            Some("launcher/src-tauri/src/lib.rs".into())
         );
     }
 

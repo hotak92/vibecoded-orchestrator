@@ -156,7 +156,31 @@ _MAIN_SPAN_MAX = 1687
 #       fix; inseparable seed-site glue — the substantive root-resolution
 #       logic ships in templates/scripts/sync_knowledge_graph.py + the
 #       kg-sync wrappers), ALL outside main() (+0 span).
-_TOTAL_LINES_MAX = 24365
+# v0.2.91 WP-A (WI-5, dist-binary repair leg): re-pinned UP to the measured
+# 24429 (+64). Same "inseparable thin-shim" precedent as the v0.2.89 / R8 / 5c
+# lines above — ALL substantive logic ships in the NEW vco_lib module
+# `vco_lib/dist_binary_repair.py` (dirty detection, restore-then-stage over
+# `git checkout -- <path>` / `git show HEAD:<path>`, the launcher-PID process
+# scan, and the C-5 launcher-driven guard, via `run_repair_leg`). install.py
+# keeps ONLY glue that cannot leave the monolith:
+#   (a) `_repair_dist_from_head_leg` (+45) — a callback-passing wrapper whose
+#       three callables ARE install.py-local side effects
+#       (`_emit_launcher_restart_deferral`, `_emit_binary_swap_locked_deferral`,
+#       `_try_invoke_windows_stage1_updater`);
+#   (b) the no-cargo-artifact call site in `_refresh_dist_binary_after_rebuild`
+#       (+6);
+#   (c) the launcher-PID scan branch inside `_try_invoke_windows_stage1_updater`
+#       (+11) — the docstring-promised fallback that branch never had.
+# ALL outside main() (+0 span). Pinned to the measured value with no headroom
+# per the "TOTAL: strict — measured exactly" contract.
+# v0.2.91 fix-round (NIT-5): 24429 → 24430, +1. NOT logic — a single PEP 8
+# blank line. `_repair_dist_from_head_leg` and `_ensure_launcher_binary` were
+# separated by ONE blank line instead of two; the review asked for the missing
+# separator. Recorded explicitly so the +1 cannot be mistaken for headroom a
+# later change may spend: it is a whitespace character, and the next change to
+# install.py still has to justify itself against the "extract, don't grow"
+# rule. (+0 span.)
+_TOTAL_LINES_MAX = 24430
 
 
 def _measure() -> tuple:

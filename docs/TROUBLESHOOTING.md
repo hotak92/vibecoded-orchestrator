@@ -35,17 +35,50 @@ SmartScreen remembers the choice per binary hash; subsequent runs on the same ma
 
 **Fix (v0.2.52)**: Velopack/Squirrel-style stage1 updater pattern. The launcher spawns `vct-updater.exe` (small statically-linked Rust binary) DETACHED before exiting; the updater polls the parent PID, waits for the launcher to exit (releasing file handles), performs `MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)` for each staged `<target>.new` sibling, then spawns the new launcher. Hand-off contract via `~/.vct/update.lock.json`.
 
-**If you hit this on v0.2.52+**: the stage1 updater should handle it automatically. If it fails for any reason, the legacy `restart_launcher` path still runs as a fallback (= same UX as v0.2.51, which is the existing `launcher_binary_swap_failed_locked` deferral with manual `git checkout` recovery instructions). Either way, the update completes.
+**If you hit this on v0.2.52+**: the stage1 updater usually handles it automatically. If it fails for any reason, the legacy `restart_launcher` path still runs as a fallback (= same UX as v0.2.51, which is the existing `launcher_binary_swap_failed_locked` deferral with manual `git checkout` recovery instructions).
 
-**Emergency manual workaround** (only if vct-updater.exe is missing or fails):
+> **Corrected in v0.2.91** — this section used to end with "Either way, the update completes." **That claim was false and the field disproved it.** A failed swap could leave the SOURCE updated and the running `.exe` old *and git-dirty*, and until v0.2.91 no code path ever re-examined the on-disk binary outside the tail of a successful pull. Every subsequent update then reported "Already up to date" and changed nothing, so an install could sit frozen on an old binary indefinitely while its source tracked upstream perfectly. See the next section for how v0.2.91 detects and repairs that state.
+
+### Windows: the launcher keeps running an OLD version even though updates succeed (FIXED in v0.2.91)
+
+**Symptom**: "Update orchestrator" reports success (often "Already up to date"), `git log` shows your clone is current, but the launcher's About/version stays on an older release — and bugs that were fixed releases ago keep reproducing. `git status --porcelain -- launcher/dist/windows-x64/` shows ` M` rows.
+
+**Root causes** (both fixed in v0.2.91):
+
+1. **Abort paths clobbered a freshly-pulled binary.** When a pull's merge LANDED but its `--autostash` pop conflicted, the abort tail renamed the old running `.exe` back over the new bytes git had just written. The source advanced, the binary went backwards, and the binary was left diverged from HEAD — which fed the same loop on every later update.
+2. **Nothing repaired the binary at rest.** "Already up to date" returned before the staging/handoff machinery, the self-update check compared git SHAs only (blind to the binary), and boot recovery inspected updater lock files only.
+
+**What v0.2.91 does**:
+
+- The abort tail compares the backup against the canonical file and **keeps the newer bytes** instead of restoring over them.
+- The launcher reconciles the dist binaries **at rest** — at boot and at update-check time, and on the "Already up to date" branch — by comparing the running version against `launcher/dist/<arch>/<binary>.metadata.json` and against `git status -- launcher/dist/<arch>/`.
+- When they disagree, HEAD's binary is staged as `<target>.new` and a swap is armed for **your next quit**. The launcher never restarts or quits itself; a `launcher_binary_stale` entry in `.claude/context/UPDATE_DEFERRED.md` names the running version, the on-disk version, and the one manual action.
+- `python install.py --update` gained a real restore leg (`git checkout -- launcher/dist/<arch>/…`, falling back to `.new` staging plus the stage1 updater when the file is locked), so the repair works even with **no functioning launcher binary**.
+
+**Manual recovery** (works on any version; also the fastest fix if you are on a pre-0.2.91 build):
 
 ```powershell
-taskkill /F /IM vct-launcher.exe
-taskkill /F /IM vct-hub.exe
+# 1. Fully quit the launcher (tray -> Quit) and stop the hub.
+vct-hub --stop
+# Confirm in Task Manager: no vct-launcher.exe / vct-hub.exe / vct-updater.exe.
+
 cd C:\path\to\vibecoded-orchestrator
-git checkout HEAD -- dist/windows-x64/vct-launcher.exe dist/windows-x64/vct-hub.exe
-.\dist\windows-x64\vct-launcher.exe
+git status --porcelain -- launcher/dist/windows-x64/   # expect ` M` rows
+git pull                                               # if the tree is behind
+git checkout -- launcher/dist/windows-x64/             # HEAD's binaries land
+
+# 2. Clear leftovers from the failed swap (safe only while nothing is running):
+del launcher\dist\windows-x64\*.exe.new
+del launcher\dist\windows-x64\vct-*.exe.old-*
+del "$env:USERPROFILE\.vct\update.lock.json"
+del "$env:USERPROFILE\.vct\update.result.json"
+
+# 3. Verify, then reconcile hooks / MCP registrations, then relaunch.
+(Get-Item .\launcher\dist\windows-x64\vct-launcher.exe).VersionInfo.FileVersion
+python install.py --update
 ```
+
+Before deleting anything, copy `%USERPROFILE%\.vct\update.log` and `<install>\state\logs\install.jsonl` aside — they say which swap failed and why.
 
 ### Windows: MCP fork-bomb during update (V52-AI — FIXED in v0.2.52)
 

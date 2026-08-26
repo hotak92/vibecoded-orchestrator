@@ -149,8 +149,36 @@ Two caveats:
   - `launcher_restart_required` — new binary on disk, old binary still
     executing. Fix: quit (tray → Quit) + relaunch.
   - `launcher_binary_swap_failed_locked` — Windows lock beat every
-    fallback (overwrite, rename, stage1). Fix: close the launcher, run
+    fallback (overwrite, rename, stage1). Fix: fully quit the launcher
+    (tray → Quit) **and** `vct-hub --stop`, then run
     `python install.py --update` again.
+    *(Corrected in v0.2.91: before v0.2.91 that command could NOT repair a
+    dirty dist binary — install.py had no `git checkout`/restore of
+    `launcher/dist/**` at all, and its binary swap only ever fired when a
+    freshly cargo-built `target/release/vct-launcher-temp` existed, which a
+    binary-download user never has. v0.2.91 adds the restore leg
+    (`vco_lib/dist_binary_repair.py`), so the instruction is now true. On
+    an older build, use the manual recipe below instead.)*
+  - `launcher_binary_stale` (v0.2.91+) — the running launcher is not the
+    binary git says is on disk. The entry names all three values (running
+    version, dist sidecar version, whether the dist tree diverges from HEAD)
+    and states whether a swap was staged. Two shapes:
+    - **the dist sidecar declares a NEWER version than the running process** —
+      a swap is staged and armed. Fix: quit the launcher normally; the staged
+      binary is put in place as the process exits and your next launch runs it.
+      Nothing restarts itself.
+    - **the versions MATCH and only the dist tree is dirty** — the entry is
+      surfaced but **nothing is staged and nothing is armed**, because an
+      equal-version dirty dist slot is also what a local `cargo build` looks
+      like and the launcher will not overwrite your own build from HEAD
+      unasked. Fix: `python install.py --update` when you do want HEAD's
+      binaries back, or leave it alone if the divergence is your build.
+  - `launcher_binary_handoff_skipped_dirty` (v0.2.91+) — HEAD's bytes were
+    staged as `<target>.new` but the stage1 handoff did not fire (no
+    `vct-updater.exe`, spawn failure). Fix: the manual recipe below.
+  - `launcher_binary_clobber_averted` (v0.2.91+) — informational record: an
+    update abort declined to restore an old binary over freshly-pulled bytes.
+    No action needed.
   - `update_resume_required` — see resume sentinel above.
   - `generated_files_reconciled` — informational audit record: an update
     reconciled diverged generated / release-controlled files
@@ -171,7 +199,75 @@ Two caveats:
 | "Update may have failed (updater_crashed…)" toast | vct-updater died mid-swap | same as above; the lock has been cleaned for you |
 | Purple Continue Update badge after finishing manually | resume sentinel survives | v0.2.54+: run `python install.py --update`; older: delete the sentinel |
 | Launcher restarts into the OLD version repeatedly | dist binary still stale (lock) on Windows; on Intel Macs pre-v0.2.54, the arm64-hardcoded dist path | update to ≥v0.2.54; Windows: quit fully, let vct-updater swap |
+| **Update says "Already up to date", source IS current, but the launcher version never changes** | **stale dist binary (frozen exe) — see the stale-exe recipe below** | **v0.2.91+ heals it at boot/update-check; on older builds use the manual recipe** |
 | Hub still on old version after update | pre-v0.2.54 hub-restart-before-staging ordering | `vct-hub --stop` then relaunch the launcher |
+
+---
+
+## Stale-exe recovery (the launcher is frozen on an old binary)
+
+**How to recognise it**: updates keep succeeding — often reporting "Already up
+to date" — `git log` shows your clone tracking upstream, yet the launcher's
+version never moves and bugs fixed several releases ago keep reproducing. The
+give-away is `git status --porcelain -- launcher/dist/<arch>/` reporting ` M`
+rows: git thinks the bytes it wrote are not the bytes on disk.
+
+**How it happens**: a Windows binary swap fails (antivirus/indexer holding a
+handle, a pull that skipped the locked `.exe`, or — before v0.2.91 — an update
+abort restoring the old exe over freshly-pulled bytes). The dist binary is then
+diverged from HEAD, and before v0.2.91 nothing ever looked at it again.
+
+**v0.2.91 heals this on its own**: the launcher probes the binary at boot and at
+update-check time and writes a `launcher_binary_stale` entry naming the running
+version, the on-disk version, whether the dist tree diverges from HEAD, and the
+single manual action. When the dist sidecar declares a **newer** version than
+the running process — the frozen-exe shape described above — it also stages
+HEAD's binary as `<target>.new` and arms a swap for your next quit. When the
+versions match and only the tree is dirty, it surfaces the state but stages
+nothing (that shape is indistinguishable from a local `cargo build`, and your
+build is yours). It never restarts or quits itself, and it stands down entirely
+while an update is running.
+
+**Manual recipe** (any version; needs no working launcher):
+
+```bash
+# 0. FIRST, copy these aside — they say what actually failed:
+#    ~/.vct/update.log         (%USERPROFILE%\.vct\update.log on Windows)
+#    <install>/state/logs/install.jsonl
+
+# 1. Fully quit the launcher (tray -> Quit), then stop the hub.
+vct-hub --stop
+#    Confirm nothing is running: no vct-launcher / vct-hub / vct-updater.
+
+# 2. From the orchestrator install root:
+git status --porcelain -- launcher/dist/    # expect ` M` rows
+git pull                                    # only if the tree is behind
+git checkout -- launcher/dist/              # HEAD's binaries land on disk
+
+# 3. Remove leftovers from the failed swap (safe only while nothing runs):
+#    launcher/dist/<arch>/*.new
+#    launcher/dist/<arch>/vct-*.old-*
+#    ~/.vct/update.lock.json  and  ~/.vct/update.result.json
+
+# 4. Reconcile hooks / MCP registrations against the current source, then
+#    relaunch through your usual entrypoint.
+python install.py --update
+```
+
+Step 2's `git checkout` is the whole fix whenever nothing holds the file open —
+which is why step 1 matters.
+
+On v0.2.91+ `python install.py --update` does **step 2's restore for you**: it
+runs `git checkout HEAD --` on every dist file git reports as *tracked*-modified
+and, when a file is locked and cannot be rewritten, writes HEAD's bytes to
+`<target>.new` and hands off to the stage1 updater instead.
+
+**Step 3 is still yours.** The repair leg never touches untracked files —
+deliberately, because `*.new`, `vct-*.old-*` and the lock/result files under
+`~/.vct/` are exactly the untracked set, and a repair pass that deleted
+untracked paths would be free to delete a staged binary somebody is waiting on.
+Nothing in the product removes them; delete them by hand while nothing is
+running.
 
 ---
 
@@ -191,3 +287,30 @@ enforces, in order:
 `vct-updater` enforces: swaps → write `update.result.json` → delete
 lock iff full success → relaunch → write `update.log`. The result file
 preceding the relaunch is what makes the post-update toast reliable.
+
+### v0.2.91: one home for the delivery chain, and repair at rest
+
+Step 3's staging + handoff pair now lives in
+`launcher/src-tauri/src/services/binary_freshness.rs` and is called from BOTH
+update surfaces (`installer::finalize_update_and_restart` and
+`self_update::finish_apply_after_pull`), so they cannot drift. The same module
+owns the Windows pre-pull rename, its **non-clobbering** revert, and the
+at-rest reconcile.
+
+Two invariants worth keeping:
+
+- **An abort never blind-restores.** `revert_pre_pull_rename` hash-compares the
+  `<name>.old-<pid>` backup against the canonical path and keeps the canonical
+  bytes when they differ (the pull already landed a newer binary there). Both
+  legs are unit-tested; do not "simplify" it back to an unconditional rename.
+- **At-rest reconcile never restarts or quits.** Boot and update-check may
+  STAGE a binary and arm a swap, but the swap only runs from the
+  `RunEvent::Exit` hook, and its updater lock carries `relaunch: None`. It also
+  stands down when an update handoff already owns `~/.vct/update.lock.json`, so
+  a real update's relaunch is never dropped.
+
+The terminal-side equivalent is `vco_lib/dist_binary_repair.py`
+(restore-then-stage over `git checkout -- <path>` / `git show HEAD:<path>`),
+called from `install.py::_repair_dist_from_head_leg`. It is the escape hatch
+for the bootstrap paradox: every launcher-side fix ships inside the launcher
+binary, so the terminal path has to work when that binary is the broken part.

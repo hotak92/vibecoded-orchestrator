@@ -28,6 +28,11 @@ pub use vct_launcher_core::services::picker;
 pub use vct_launcher_core::services::runtime;
 
 pub mod adoption;
+/// v0.2.91 WP-A — dist-binary freshness: the ONE home for the pre-pull
+/// rename, its non-clobbering revert, `<target>.new` staging, the shared
+/// post-update handoff tail, and the at-rest (boot / update-check)
+/// reconcile that heals a launcher frozen on an old binary.
+pub mod binary_freshness;
 pub mod deferral;
 pub mod settings_json_watcher;
 pub mod vco_lib_bridge;

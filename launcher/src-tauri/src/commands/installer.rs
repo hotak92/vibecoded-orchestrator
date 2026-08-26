@@ -3835,267 +3835,24 @@ fn probe_hub_health(port: u16, token: &str) -> bool {
     head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
 }
 
-/// v0.2.17 (plan 0.0.B): pre-pull rename helper for Windows.
-///
-/// On Windows, `git pull` fails with ERROR_SHARING_VIOLATION when it
-/// tries to overwrite the running launcher's binary
-/// (`launcher/dist/<arch>/vct-launcher.exe`). Git's error is atomic:
-/// the entire pull is reverted, so neither source nor binary lands.
-/// The fix is to rename our own .exe to a sibling path BEFORE
-/// invoking git pull. Windows allows this — the running process's
-/// .exe can be renamed even though it can't be overwritten (Chrome,
-/// VS Code, npm-on-Windows all rely on this pattern). Once renamed,
-/// the canonical path is free for git to write the new binary there.
-///
-/// Linux / macOS skip this step — both kernels handle running-binary
-/// overwrite via inode/vnode ref-counting (old binary stays mapped;
-/// new bits land at the same path on a new inode).
-///
-/// Returns the renamed path on Windows when rename happened, or None
-/// on Linux/macOS / when rename was unnecessary / when rename failed
-/// soft. Caller uses the return to revert on git-pull failure
-/// (best-effort).
-#[cfg(windows)]
-fn pre_pull_rename_running_binary(install_path: &Path) -> Option<PathBuf> {
-    // Resolve the running launcher's binary path. If anything in this
-    // chain fails (no current_exe, can't canonicalize, not under
-    // install_path), fall through — Linux-style overwrite path
-    // probably won't work on Windows but the user gets a clear git
-    // error rather than a misleading "rename failed" one.
-    let exe = std::env::current_exe().ok()?;
-    let exe_canon = dunce::canonicalize(&exe).unwrap_or(exe);
-    let install_canon = dunce::canonicalize(install_path).unwrap_or_else(|_| install_path.to_path_buf());
-    if !exe_canon.starts_with(&install_canon) {
-        // Running from outside the install tree (e.g. development
-        // build from cargo) — git pull won't try to overwrite us.
-        return None;
-    }
-
-    let pid = std::process::id();
-    let backup_name = format!(
-        "{}.old-{}",
-        exe_canon.file_name()?.to_string_lossy(),
-        pid,
-    );
-    let backup_path = exe_canon.parent()?.join(backup_name);
-
-    match std::fs::rename(&exe_canon, &backup_path) {
-        Ok(()) => {
-            eprintln!(
-                "[vct] update_orchestrator: pre-pull renamed running launcher \
-                 binary to {} (Windows). New binary will be written to {} by \
-                 git pull.",
-                backup_path.display(),
-                exe_canon.display(),
-            );
-            Some(backup_path)
-        }
-        Err(e) => {
-            eprintln!(
-                "[vct] update_orchestrator: pre-pull rename FAILED ({}). git pull \
-                 will likely fail with ERROR_SHARING_VIOLATION. Continuing — \
-                 the user will see the git error.",
-                e,
-            );
-            None
-        }
-    }
-}
-
-#[cfg(not(windows))]
-fn pre_pull_rename_running_binary(_install_path: &Path) -> Option<PathBuf> {
-    // POSIX kernels handle running-binary overwrite cleanly via inode
-    // ref-counting. No rename needed.
-    None
-}
-
-/// v0.2.52 V52-AH (Windows binary-lock bug, 2026-06-09): post-pull staging for the
-/// Windows stage1 updater handoff.
-///
-/// Background
-/// ----------
-/// Even with `pre_pull_rename_running_binary`, the dist binary at
-/// `launcher/dist/windows-x64/vct-launcher.exe` (or `vct-hub.exe`) can
-/// end up STALE after a successful git pull when:
-///   - The rename failed silently (antivirus held a handle briefly).
-///   - Some other process held the file open (Windows defender scan,
-///     indexer, dev console with the .exe drag-dropped, etc).
-/// In those cases `git pull` saw ERROR_SHARING_VIOLATION on the binary
-/// but completed the rest of the merge — leaving metadata.json at the
-/// new version but the .exe bytes at the OLD version (the binary-lock scenario).
-///
-/// This helper detects that state by checking `git status --porcelain
-/// <relative_path>` for each candidate binary. Any dirty status means
-/// git considers the file diverged from HEAD (= the new bytes git
-/// SHOULD have written are not actually on disk). For each such file,
-/// we extract HEAD's blob into `<target>.new` via `git show
-/// HEAD:<relative_path>`. The updater (`vct-updater.exe`) then renames
-/// `<target>.new` → `<target>` after the running launcher exits.
-///
-/// On POSIX, this is a no-op (the rename pattern in
-/// `pre_pull_rename_running_binary` plus inode ref-counting already
-/// handles binary overwrite correctly).
-///
-/// Returns the list of relative paths that were staged as `.new`
-/// (empty on POSIX or when no binaries needed staging).
-#[cfg(windows)]
-async fn stage_locked_binaries_for_handoff(install_path: &Path) -> Vec<String> {
-    let mut staged: Vec<String> = Vec::new();
-    let candidates = [
-        "launcher/dist/windows-x64/vct-launcher.exe",
-        "launcher/dist/windows-x64/vct-hub.exe",
-    ];
-    for rel_path in candidates {
-        // Check git status. An empty stdout = clean = nothing to do.
-        let status_out = match tokio::process::Command::new("git")
-            .silent()
-            .args(["status", "--porcelain", "--", rel_path])
-            .current_dir(install_path)
-            .output()
-            .await
-        {
-            Ok(o) => o,
-            Err(e) => {
-                eprintln!(
-                    "[vct] stage_locked_binaries: git status failed for {}: {} \
-                     (skipping; handoff will gracefully no-op for this file)",
-                    rel_path, e
-                );
-                continue;
-            }
-        };
-        if status_out.stdout.is_empty() {
-            // Clean — binary already matches HEAD. Nothing to stage.
-            continue;
-        }
-
-        // Dirty: extract HEAD blob into `<target>.new`. We use
-        // `git show HEAD:<rel_path>` to read the bytes, then write to
-        // `<target>.new`. Path safety: the candidates list is
-        // hard-coded above so no injection risk.
-        let target_abs = install_path.join(rel_path);
-        let staged_abs = path_with_new_suffix(&target_abs);
-
-        let show_out = match tokio::process::Command::new("git")
-            .silent()
-            .args(["show", &format!("HEAD:{}", rel_path)])
-            .current_dir(install_path)
-            .output()
-            .await
-        {
-            Ok(o) if o.status.success() => o,
-            Ok(o) => {
-                eprintln!(
-                    "[vct] stage_locked_binaries: git show HEAD:{} exited non-zero ({:?}); \
-                     skipping. stderr: {}",
-                    rel_path,
-                    o.status.code(),
-                    String::from_utf8_lossy(&o.stderr).trim(),
-                );
-                continue;
-            }
-            Err(e) => {
-                eprintln!(
-                    "[vct] stage_locked_binaries: git show HEAD:{} spawn failed: {} (skipping)",
-                    rel_path, e
-                );
-                continue;
-            }
-        };
-
-        // Write the bytes atomically (write to `.tmp`, rename onto `.new`).
-        let tmp_path = staged_abs.with_extension("new.tmp");
-        if let Err(e) = std::fs::write(&tmp_path, &show_out.stdout) {
-            eprintln!(
-                "[vct] stage_locked_binaries: write {} failed: {} (skipping)",
-                tmp_path.display(),
-                e,
-            );
-            continue;
-        }
-        if let Err(e) = std::fs::rename(&tmp_path, &staged_abs) {
-            eprintln!(
-                "[vct] stage_locked_binaries: rename {} → {} failed: {} (skipping)",
-                tmp_path.display(),
-                staged_abs.display(),
-                e,
-            );
-            let _ = std::fs::remove_file(&tmp_path);
-            continue;
-        }
-        eprintln!(
-            "[vct] stage_locked_binaries: staged {} → {} ({} bytes)",
-            rel_path,
-            staged_abs.display(),
-            show_out.stdout.len(),
-        );
-        staged.push(rel_path.to_string());
-    }
-    staged
-}
-
-#[cfg(not(windows))]
-#[allow(dead_code)] // POSIX caller is gated by cfg; tests don't exercise this branch
-async fn stage_locked_binaries_for_handoff(_install_path: &Path) -> Vec<String> {
-    // POSIX: no-op. Inode ref-counting + rename pattern handle binary
-    // overwrite correctly without any handoff dance.
-    Vec::new()
-}
-
-/// Helper used by `stage_locked_binaries_for_handoff` (Windows) AND by
-/// tests on every host. Keep in sync with the same-named helper in
-/// `commands::update_handoff` — both must produce the same staging
-/// filename so the launcher writes where the updater reads.
-#[allow(dead_code)] // exercised by Windows path + tests
-fn path_with_new_suffix(path: &Path) -> PathBuf {
-    let parent = path.parent().unwrap_or_else(|| Path::new(""));
-    let name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    parent.join(format!("{}.new", name))
-}
-
-/// v0.2.17 (plan 0.0.B): revert the pre-pull rename on git-pull failure.
-///
-/// Best-effort: log + continue on any error. The user can manually
-/// rename `<binary>.old-<pid>` back to canonical if needed; failing
-/// to revert leaves the launcher unable to relaunch but the running
-/// instance still works fine.
-fn revert_pre_pull_rename(backup_path: &Path) {
-    let parent = match backup_path.parent() {
-        Some(p) => p,
-        None => return,
-    };
-    // Strip the `.old-<pid>` suffix to recover the canonical name.
-    let fname = match backup_path.file_name().and_then(|s| s.to_str()) {
-        Some(s) => s,
-        None => return,
-    };
-    let canonical_name = match fname.rsplit_once(".old-") {
-        Some((stem, _pid)) => stem.to_string(),
-        None => return,
-    };
-    let canonical_path = parent.join(canonical_name);
-    if let Err(e) = std::fs::rename(backup_path, &canonical_path) {
-        eprintln!(
-            "[vct] update_orchestrator: could not revert pre-pull rename \
-             ({} → {}): {}. The renamed file is left in place; the running \
-             launcher continues to work but a future launcher start may \
-             pick up the renamed binary as a stale .old-<pid> sibling \
-             (cleaned by the boot sweep).",
-            backup_path.display(),
-            canonical_path.display(),
-            e,
-        );
-    } else {
-        eprintln!(
-            "[vct] update_orchestrator: reverted pre-pull rename ({} → {})",
-            backup_path.display(),
-            canonical_path.display(),
-        );
-    }
-}
+// v0.2.91 WP-A (modularity, one home): `pre_pull_rename_running_binary`,
+// `stage_locked_binaries_for_handoff`, `path_with_new_suffix` and
+// `revert_pre_pull_rename` were RELOCATED to
+// `crate::services::binary_freshness`. That module is now the single home for
+// the whole dist-binary delivery chain — the pre-pull rename, its
+// **non-clobbering** revert (WI-3: the abort tail no longer restores the old
+// exe over freshly-pulled bytes), `<target>.new` staging, the shared
+// post-update staging+handoff tail (WI-4, also used by the launcher
+// self-update surface), and the at-rest reconcile that heals an install whose
+// binary froze (WI-1/WI-2).
+//
+// Behaviour of the relocated helpers is unchanged EXCEPT for
+// `revert_pre_pull_rename`, which now compares the backup against the
+// canonical file before renaming and returns a `RevertOutcome` (see WI-3 in
+// `services::binary_freshness`).
+use crate::services::binary_freshness::{
+    pre_pull_rename_running_binary, revert_pre_pull_rename, RevertOutcome,
+};
 
 /// Update an existing orchestrator installation.
 ///
@@ -5090,11 +4847,27 @@ pub async fn update_orchestrator<R: Runtime>(
             );
             // Restore the running binary + hub (we renamed/stopped pre-pull)
             // so the user can keep using the launcher after they resolve.
-            abort_update_restore_binaries_and_hub(
+            //
+            // v0.2.91 WI-3/WI-7: THIS is the RC-1 site. When the merge landed,
+            // the pull already wrote the NEW binary to the canonical path and
+            // the restore below now declines to rename the old exe back over
+            // it. Record the averted clobber in the audit log too — the
+            // durable deferral is written inside the tail.
+            let restore = abort_update_restore_binaries_and_hub(
                 &install_path,
                 pre_pull_renamed.as_deref(),
                 pre_pull_renamed_hub.as_deref(),
             );
+            if restore.clobber_averted {
+                write_audit(
+                    "update_binary_clobber_averted",
+                    serde_json::json!({
+                        "branch": pull_branch,
+                        "pop_conflict_after_success": pop_conflict_after_success,
+                        "note": "abort tail kept the freshly-pulled binary (WI-3)",
+                    }),
+                );
+            }
 
             if pop_conflict_after_success {
                 // The merge landed; only the WIP restore clashed. Write a
@@ -5152,6 +4925,24 @@ pub async fn update_orchestrator<R: Runtime>(
             pre_pull_renamed.as_deref(),
             pre_pull_renamed_hub.as_deref(),
         );
+        // v0.2.91 WI-2: "Already up to date" MUST STILL HEAL.
+        //
+        // Pre-v0.2.91 this branch returned success here and
+        // `finalize_update_and_restart` — and with it ALL staging/handoff
+        // machinery — was never reached. An install whose source is current
+        // but whose dist binary is stale (the field case: a hand-copied exe
+        // after a failed swap) therefore had NO path back to a fresh binary:
+        // every subsequent update said "Already up to date" and changed
+        // nothing, forever.
+        //
+        // Ordering note (deliberate deviation from the plan's literal
+        // wording): the revert runs FIRST, then the reconcile. On this branch
+        // the pull wrote nothing, so the pre-pull rename left the canonical
+        // path EMPTY — reconciling before the revert would stage against a
+        // missing file and leave the canonical path absent until the next
+        // quit. Reverting first restores a working binary; the reconcile then
+        // sees the true at-rest state and stages on top of it.
+        let heal = crate::services::binary_freshness::reconcile_dist_at_rest(&install_path).await;
         // v0.2.43 V0243-15: audit complete for the no-op path.
         write_audit(
             "update_orchestrator_complete",
@@ -5160,12 +4951,22 @@ pub async fn update_orchestrator<R: Runtime>(
                 "duration_ms": chrono::Utc::now().timestamp_millis() - update_start_ms,
                 "note": "already_up_to_date",
                 "branch": start_branch,
+                "binary_stale": heal.is_stale(),
+                "binaries_staged": heal.staged,
+                "swap_armed": heal.armed,
             }),
         );
+        let message = if heal.is_stale() {
+            "Already up to date — but the launcher binary on disk is newer than the running \
+             one. Quit and relaunch to pick it up."
+                .to_string()
+        } else {
+            "Already up to date".to_string()
+        };
         return Ok(InstallResult {
             success: true,
             install_path: path,
-            message: "Already up to date".to_string(),
+            message,
             system,
         });
     }
@@ -6680,39 +6481,21 @@ async fn finalize_update_and_restart<R: Runtime>(
     // pre-v0.2.52 behaviour and represents the worst case (= same as
     // not having V52-AH at all).
     //
-    // POSIX: stage_locked_binaries_for_handoff returns empty (no-op),
+    // POSIX: staging returns empty (no-op) and
     // prepare_windows_update_handoff returns handoff_active=false with
     // skip_reason="non-windows", so we fall through unconditionally
     // to restart_launcher. No behaviour change for Linux/macOS users.
-    #[cfg(target_os = "windows")]
-    {
-        let staged = stage_locked_binaries_for_handoff(install_path).await;
-        if !staged.is_empty() {
-            eprintln!(
-                "[vct] finalize_update_and_restart: V52-AH staged {} binary/binaries \
-                 for handoff: {:?}",
-                staged.len(),
-                staged,
-            );
-        }
-    }
-
-    let handoff_result = match crate::commands::update_handoff::prepare_windows_update_handoff(
-        path_string.to_string(),
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            // True error (install_root missing etc.) — log + fall through.
-            eprintln!(
-                "[vct] finalize_update_and_restart: V52-AH handoff returned error \
-                 ({}); falling through to legacy restart_launcher",
-                e,
-            );
-            crate::commands::update_handoff::HandoffResult::default()
-        }
-    };
+    //
+    // v0.2.91 WI-4 (one home): the staging + handoff pair now lives in
+    // `services::binary_freshness::stage_and_handoff_after_update`, shared
+    // verbatim with the launcher SELF-update surface
+    // (`self_update::finish_apply_after_pull`), which previously had NO
+    // staging and no handoff at all and therefore relaunched the same stale
+    // exe on Windows by construction. The shared tail also emits the WI-7
+    // "handoff skipped while a dist binary is dirty" record.
+    let handoff_result =
+        crate::services::binary_freshness::stage_and_handoff_after_update(install_path, path_string)
+            .await;
 
     if handoff_result.handoff_active {
         eprintln!(
@@ -6905,18 +6688,48 @@ async fn assert_head_reached_upstream(install_path: &Path) -> Result<(), String>
 /// `HubRestartContext::AbortRecovery`: the cutover-sentinel skip heuristic is
 /// refused (it never applies here) and the /health poll runs on a background
 /// thread so a genuine-conflict payload isn't stalled up to 30 s.
+///
+/// v0.2.91 WI-3/WI-7 — the reverts now route through the NON-CLOBBERING
+/// `services::binary_freshness::revert_pre_pull_rename`. On the
+/// autostash-pop-conflict-AFTER-merge-landed path the pull has already written
+/// the NEW binary to the canonical path; pre-v0.2.91 this tail renamed the OLD
+/// running exe straight back over it (RC-1 — the producer of a permanently
+/// frozen launcher). When that clobber is now averted the caller learns about
+/// it via the returned [`AbortRestoreOutcome`], and a durable
+/// `launcher_binary_clobber_averted` record is written so the moment stops
+/// being invisible.
 fn abort_update_restore_binaries_and_hub(
     install_path: &Path,
     pre_pull_renamed: Option<&Path>,
     pre_pull_renamed_hub: Option<&Path>,
-) {
-    if let Some(backup) = pre_pull_renamed {
-        revert_pre_pull_rename(backup);
-    }
-    if let Some(backup) = pre_pull_renamed_hub {
-        revert_pre_pull_rename(backup);
+) -> AbortRestoreOutcome {
+    let mut outcome = AbortRestoreOutcome::default();
+    for backup in [pre_pull_renamed, pre_pull_renamed_hub].into_iter().flatten() {
+        if revert_pre_pull_rename(backup) == RevertOutcome::ClobberAverted {
+            outcome.clobber_averted = true;
+            if let Some(canonical) =
+                crate::services::binary_freshness::canonical_path_for_backup(backup)
+            {
+                crate::services::binary_freshness::emit_clobber_averted_condition(
+                    install_path,
+                    backup,
+                    &canonical,
+                );
+            }
+        }
     }
     let _ = ensure_hub_started_after_update(install_path, HubRestartContext::AbortRecovery);
+    outcome
+}
+
+/// What the shared abort tail did, for callers that must react.
+///
+/// `clobber_averted == true` means the canonical path holds NEWER bytes than
+/// the binary this process is running — i.e. a stage1 swap is owed so the next
+/// launch actually picks them up.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AbortRestoreOutcome {
+    clobber_averted: bool,
 }
 
 async fn run_post_pull_install_and_restart<R: Runtime>(
@@ -7358,12 +7171,25 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
             pre_pull_renamed.as_deref(),
             pre_pull_renamed_hub.as_deref(),
         );
+        // v0.2.91 WI-2 (merge sibling of the `update_orchestrator` branch):
+        // an early return here skipped every staging/handoff path, so a stale
+        // dist binary stayed stale forever. Reconcile at rest AFTER the revert
+        // has put a working binary back at the canonical path — see the long
+        // ordering note on the `update_orchestrator` branch.
+        let heal = crate::services::binary_freshness::reconcile_dist_at_rest(&install_path).await;
         // v0.2.24 §A0 (Q1 fix): deferrals were already emitted BEFORE
         // the pull (see above) — no second call needed here.
+        let message = if heal.is_stale() {
+            "Already up to date — but the launcher binary on disk is newer than the running \
+             one. Quit and relaunch to pick it up."
+                .to_string()
+        } else {
+            "Already up to date".to_string()
+        };
         return Ok(InstallResult {
             success: true,
             install_path: path,
-            message: "Already up to date".to_string(),
+            message,
             system,
         });
     }
