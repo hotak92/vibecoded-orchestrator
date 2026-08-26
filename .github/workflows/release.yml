@@ -163,7 +163,11 @@ jobs:
   # manifest contract are verified green at the tag commit.
   #
   # What this gate runs (inline, not via workflow_call, to avoid the
-  # "workflow_call on a tag" scheduler race):
+  # "workflow_call on a tag" scheduler race — a v0.2.42 concern recorded
+  # without a reproduction; v0.2.91's `tri-os-smoke` job below DOES call a
+  # reusable workflow on the tag event, so the first release run after
+  # v0.2.91 is the observation that settles it. If a race does materialise,
+  # the fallback is inlining the smoke's steps here, not dropping the gate):
   #   1. install.py + install-bundle smoke  (mirrors installer-smoke Job 1)
   #   2. Weaviate schema bootstrap smoke    (mirrors installer-smoke Job 2)
   #   3. Manifest validate in strict mode   (mirrors manifest-validate)
@@ -493,6 +497,47 @@ jobs:
           echo "  Gate 3: dist-binary freshness — PASS (or SKIPPED for first release / workflow_dispatch)"
           echo "Proceeding to build matrix."
 
+  # ─────────────────────────────────────────────────────────────────────────
+  # tri-os-smoke (v0.2.91 WP-G — release-time install gate)
+  #
+  # WHAT: calls .github/workflows/install-smoke-tri-os.yml, which does a
+  # fresh ANONYMOUS `git clone` of this repo at the tagged commit and runs
+  # first-install.{sh,command,bat} end-to-end on ubuntu-22.04, ubuntu-24.04,
+  # macos-14, windows-latest and fedora-40. `build` needs this job, so a red
+  # install path means NO assets are built and NO release is published.
+  #
+  # WHY at release time and not only on push-to-main: pre-release-gate
+  # exercises `install.py` on ubuntu only. The tri-OS smoke is the only
+  # thing that walks the shim entry points a third-party user actually
+  # double-clicks, on the OSes they actually run. Gate 22 in
+  # scripts/pre-ship-check.sh checks the same workflow's freshness BEFORE
+  # the tag is pushed; this job re-verifies it ON the tagged tree, which is
+  # what actually ships.
+  #
+  # COST: ~17 min wall-clock (the five legs run in parallel) added ahead of
+  # `build`; it runs concurrently with pre-release-gate (both only need
+  # refresh-guard), so it does not stack with that job's 30 min. $0 billed —
+  # GitHub-hosted standard runners are free on public repos, which is also
+  # why the called workflow's job carries a public-repo guard and why this
+  # wiring must never be exercised on the private mirror.
+  #
+  # NOTE (reusable-workflow shape): a job with `uses:` cannot carry `steps`,
+  # `runs-on`, `env` or `timeout-minutes` — the called workflow owns those
+  # (it sets its own 25-min per-leg cap). No `with:`/`secrets:` here: the
+  # smoke declares no inputs and reads no secrets, so `secrets: inherit`
+  # would hand it privileges it does not need. The called workflow's own
+  # `permissions: contents: read` applies, intersected with this workflow's
+  # token permissions.
+  #
+  # The `if:` mirrors pre-release-gate/build: on a re-pointed binary-refresh
+  # tag the whole chain is a no-op, so there is nothing to smoke.
+  # ─────────────────────────────────────────────────────────────────────────
+  tri-os-smoke:
+    name: Tri-OS install smoke (release gate)
+    needs: refresh-guard
+    if: needs.refresh-guard.outputs.is_binary_refresh != 'true'
+    uses: ./.github/workflows/install-smoke-tri-os.yml
+
   build:
     name: Build (${{ matrix.target }})
     # v0.2.64 (P3 — tag-lag fix): need BOTH the guard and the gate. Gating
@@ -502,7 +547,13 @@ jobs:
     # change. On a re-pointed binary-refresh tag run this job is skipped, so
     # commit-dist-binaries + supabase-deploy (which `needs: build`) are skipped
     # too — the whole expensive chain is a no-op.
-    needs: [refresh-guard, pre-release-gate]
+    #
+    # v0.2.91 WP-G: `tri-os-smoke` joins the needs list — a red third-party
+    # install path on ANY of the five OS legs now blocks the build matrix, so
+    # no assets are published and no Release is cut. (On the binary-refresh
+    # re-trigger tri-os-smoke is skipped by the same `if:` as this job, so the
+    # no-op path is unchanged.)
+    needs: [refresh-guard, pre-release-gate, tri-os-smoke]
     if: needs.refresh-guard.outputs.is_binary_refresh != 'true'
     strategy:
       fail-fast: false

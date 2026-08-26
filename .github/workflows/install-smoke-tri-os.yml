@@ -15,14 +15,63 @@
 #
 # Per docs/INSTALL_ARCHITECTURE_v2.md §9.
 #
-# Triggers: PRs touching install surfaces, push to main, daily 06:00 UTC.
+# ── Contract (v0.2.91 WP-G) ─────────────────────────────────────────────
+#
+# Triggers:
+#   - pull_request touching install surfaces (paths filter below).
+#   - push to main.
+#   - workflow_dispatch — free on the public repo; this is the fix Gate 22
+#     asks for when its 24-hour freshness window has lapsed.
+#   - workflow_call — release.yml's `tri-os-smoke` job calls this workflow
+#     on every release tag, and `build` needs that job, so a red smoke
+#     means NO assets are built and NO release is published. Under
+#     workflow_call the github context is the CALLER's: event_name is the
+#     tag push, so the "Clone fresh" step below resolves github.sha to the
+#     TAGGED commit and smokes it through the same anonymous public clone
+#     a third-party user performs.
+#
+# NO cron — deliberately. The daily 06:00 UTC schedule was removed from the
+# public repo on 2026-07-23 and from the private mirror on 2026-08-23; do
+# NOT re-add it. Gate 22 in scripts/pre-ship-check.sh hard-FAILs a tag whose
+# newest all-green run on main is older than 24 h (v0.2.91 decision #13).
+#
+# Gate-22 freshness comes from exactly TWO sources: push-to-main runs and
+# manual `workflow_dispatch`. The release-time `workflow_call` is NOT one of
+# them, for two independent reasons: (1) a `uses:`-called workflow executes
+# inside the CALLER's run and never appears as its own entry in
+# `gh run list --workflow install-smoke-tri-os.yml`, so the gate's query
+# cannot see it; (2) the gate runs BEFORE the tag is pushed, so the release
+# run does not exist yet when the gate reads. The workflow_call is a release
+# BLOCKER (build needs it), not a freshness producer.
+#
+# Mirror guard: the `install-smoke` job is pinned to the public repo with
+# `if: github.repository == 'hotak92/vibecoded-orchestrator'`.
+#   WHY: the "Clone fresh" step deliberately clones
+#   https://github.com/${{ github.repository }}.git ANONYMOUSLY. On a
+#   PRIVATE repo — the mirror this file syncs to — an anonymous HTTPS clone
+#   has no credentials, so git aborts with exit 128 in ~1 s and all five
+#   legs go red. That burned ~15 billed minutes per run on every push/PR
+#   from 2026-07-20 to 2026-08-21 and contributed to the mirror's Actions
+#   quota exhaustion. The guard turns those runs into clean 0-minute SKIPS.
+#   Those reds were ENVIRONMENTAL, not a workflow-health problem: the file
+#   is byte-identical on both repos, and over the same window no public-repo
+#   run of it failed. This supersedes the earlier "wire this into releases
+#   only once the setup failure is fixed" note — there is no setup failure
+#   to fix.
+#   The pin is a repository-NAME check, so a public third-party fork skips
+#   too. If a fork ever needs this smoke, relax the pin to a visibility
+#   probe (`github.event.repository.private == false`) — do not delete the
+#   guard, or the private mirror starts burning minutes again on its next
+#   sync.
+#
 # Caching: pip + pnpm caches keyed by lockfile hashes to stay under 15 min
 #          per OS. Fresh clone happens INSIDE the runner — the workspace
 #          /__w/<repo>/ checkout is unused for the install probe.
 #
 # Owner: Track D.
 # Pre-ship gate 22 reads `gh run list --workflow=install-smoke-tri-os.yml`
-# and asserts success on main before allowing a release tag.
+# and asserts an all-green run on main, younger than 24 h, before allowing
+# a release tag.
 
 name: Install Smoke (tri-OS)
 
@@ -41,6 +90,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch: {}
+  # v0.2.91 WP-G: callable from release.yml so a red install smoke blocks
+  # the build matrix (see the contract block at the top of this file). No
+  # inputs and no secrets are needed — the smoke only clones the public
+  # repo and runs the shipped installer.
+  workflow_call: {}
 
 permissions:
   contents: read
@@ -48,12 +102,26 @@ permissions:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   # Cancel in-progress PR runs to save CI minutes — but NEVER cancel a
-  # push-to-main or scheduled run, those are load-bearing for gate 22.
+  # push-to-main or release-called run, those are load-bearing for gate 22
+  # and for the release build gate respectively.
+  #
+  # Under workflow_call the github context is the caller's, so both halves
+  # of this expression follow the CALLER: `github.workflow` resolves to the
+  # calling workflow's name (Release) and `github.event_name` to its event
+  # (push of a v* tag) — i.e. a release-called run lands in its own group
+  # and never cancels itself. Keep release.yml free of a top-level
+  # `concurrency:` using this same expression, or the called workflow would
+  # queue behind its own caller.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   install-smoke:
     name: install smoke (${{ matrix.target }})
+    # Mirror guard (v0.2.91 WP-G) — the anonymous "Clone fresh" step below
+    # can only work on a PUBLIC repo; on the private mirror it fails in ~1 s
+    # on all five legs and bills ~15 minutes per run. Skipping is the
+    # correct outcome there. Full rationale in the header block.
+    if: ${{ github.repository == 'hotak92/vibecoded-orchestrator' }}
     strategy:
       # One OS failure must NOT mask the others — gate 22 reads per-matrix
       # conclusions.

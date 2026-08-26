@@ -642,7 +642,7 @@ fi
 #
 # The install-smoke-tri-os.yml workflow runs the full first-install.{sh,
 # command,bat} flow against ubuntu-22.04, ubuntu-24.04, macos-14,
-# windows-latest, and fedora-40 (matrix.label) using a fresh git clone
+# windows-latest, and fedora-40 (matrix.target) using a fresh git clone
 # — the same code path third-party users exercise. Per
 # docs/INSTALL_ARCHITECTURE_v2.md §9.5 / §6 row M-P1-8 (Track D), no
 # release tag may be pushed unless EVERY matrix entry of the most-recent
@@ -652,9 +652,30 @@ fi
 # run, then check the per-job conclusion of all 5 matrix entries (the
 # workflow uses `fail-fast: false` so each matrix leg has its own
 # conclusion). A single failed leg → FAIL. The 24-hour window prevents
-# stale-success masking: if the workflow hasn't run in the last day,
-# we WARN (the daily cron should catch this; releasing right after a
-# multi-day infrastructure outage is uncommon).
+# stale-success masking.
+#
+# Freshness sources (v0.2.91 WP-G — there is NO cron any more; the daily
+# 06:00 UTC schedule was deleted from the public repo 2026-07-23 and from
+# the private mirror 2026-08-23, deliberately — see the header block of
+# install-smoke-tri-os.yml): push-to-main runs and manual dispatch. That is
+# the complete list. release.yml's `tri-os-smoke` job is NOT a freshness
+# source for this gate: a `uses:`-called workflow runs inside the CALLER's
+# run, so it never appears in the `gh run list --workflow
+# install-smoke-tri-os.yml` query below — and this gate runs BEFORE the tag
+# is pushed anyway, so that run does not exist yet. It blocks the release
+# (build needs it); it cannot refresh this window.
+#
+# Branch semantics:
+#   - latest completed run on main is NOT success  → FAIL (always was).
+#   - success but older than 24 h                  → FAIL (v0.2.91
+#     decision #13; was WARN). Without a cron, stale-green is now a
+#     LIKELY state rather than the rare multi-day-outage artifact the old
+#     comment assumed, and the house rule is that gates block. The fix is
+#     free on the public repo: dispatch a fresh run (the message below
+#     prints the exact command) and re-run this script.
+#   - no completed run on main at all              → WARN. That is the
+#     bootstrap case (the workflow just landed / retention aged every run
+#     out), not a stale-signal case, so it must not block a first tag.
 #
 # Dry-run support: `--dry-run` flag prints the gh CLI invocation that
 # would be made + exits with the WARN state, so the gate can be exercised
@@ -707,8 +728,12 @@ PY
             gate_fail "tri-OS install smoke green on main (v0.2.53 M-P1-8)" \
                 "Run $_tri_run_id concluded: $_tri_conclusion (expected: success). gh run view $_tri_run_id --repo $REPO"
         elif [ "$_tri_age_ok" != "1" ]; then
-            gate_warn "tri-OS install smoke green on main (v0.2.53 M-P1-8)" \
-                "Last success ($_tri_run_id at $_tri_created) is older than 24h; trigger a fresh run before tagging: gh workflow run $TRI_OS_WORKFLOW --repo $REPO --ref main"
+            # v0.2.91 decision #13: a stale green no longer SATISFIES this
+            # gate. Was gate_warn until the daily cron was removed; with no
+            # cron a >24h-old green is a likely state, not a rare outage
+            # artifact, and a non-blocking gate on a likely state is not a gate.
+            gate_fail "tri-OS install smoke green on main (v0.2.53 M-P1-8)" \
+                "Last success ($_tri_run_id at $_tri_created) is older than 24h — a stale green does not satisfy this gate. Dispatch a fresh run (free on the public repo), let it finish, then re-run this script: gh workflow run $TRI_OS_WORKFLOW --repo $REPO --ref main"
         else
             # Verify every matrix leg in the run succeeded, not just the
             # overall conclusion. (The aggregated `conclusion` reflects
