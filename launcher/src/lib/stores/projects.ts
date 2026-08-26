@@ -22,6 +22,58 @@ import { isErrorWarning } from '$lib/warning-severity';
 
 const SELECTED_KEY = 'vct.selected_project_id';
 
+/**
+ * v0.2.91 WP-F4 — severity typing for `rename_project_v2` warnings.
+ *
+ * `rename_project_v2` returns two very different classes of warning:
+ *
+ *   1. GENUINE failures — e.g. "rename env refresh
+ *      (apply_project_env_via_python) failed: …". Red.
+ *   2. The by-design `.env` DRIFT notice — the project-root `.env` carries a
+ *      `KG_COLLECTION` line that does not match the bound collection. VCO
+ *      deliberately never rewrites `.env` (it is often committed), and the
+ *      message itself says "KG routing is NOT degraded". Informational.
+ *
+ * Pre-v0.2.91 both rendered as `toast.error`, so a perfectly successful
+ * rename greeted the user with a red banner. The default stays ERROR — only
+ * the recognised informational class is downgraded, so a new failure mode can
+ * never be silently softened.
+ *
+ * ⚠️ MUST MATCH the message emitted by
+ * `launcher/src-tauri/src/commands/projects_v2.rs::rename_project_v2`
+ * (the `.env` drift branch). If that prose changes, change this marker.
+ */
+const RENAME_INFO_MARKERS = [
+  "does not match the project's bound collection",
+  'vco never rewrites .env',
+];
+
+export function isRenameInfoWarning(raw: string): boolean {
+  const lower = String(raw ?? '').toLowerCase();
+  return RENAME_INFO_MARKERS.some((m) => lower.includes(m.toLowerCase()));
+}
+
+/**
+ * v0.2.91 WP-F3 — resolve the row a project-scoped view should RENDER.
+ *
+ * The project page loads its own `ProjectView` once (`get_project_v2` on
+ * mount, re-run only when the route id changes). A rename does not change the
+ * id, so nothing re-ran and the header kept the OLD name while the selector —
+ * which subscribes to this store — already showed the new one. The page now
+ * derives its display row from the store and keeps its own loaded copy as the
+ * fallback for the window before `projects.load()` has resolved.
+ */
+export function liveProjectFor(
+  all: ProjectView[],
+  projectId: string | undefined,
+  fallback: ProjectView | null,
+): ProjectView | null {
+  // Route params are `string | undefined` until the router resolves; an
+  // unresolved id must render the fallback, never a wrong row.
+  if (!projectId) return fallback;
+  return all.find((p) => p.id === projectId) ?? fallback;
+}
+
 interface ProjectsState {
   projects: ProjectView[];
   selectedId: string | null;
@@ -223,6 +275,16 @@ function createProjectsStore() {
       return report;
     },
 
+    /**
+     * Rename a project — THE single rename call-site in the frontend.
+     *
+     * v0.2.91 WP-F3: `SettingsTab.svelte` used to carry a second, duplicate
+     * `invoke('rename_project_v2')` that assigned the result to its own local
+     * `$state` only. Renaming from Settings therefore updated neither this
+     * store nor the project page, so the selector AND the page header both
+     * stayed on the old name until a reload. One concern, one home: every
+     * rename surface calls this.
+     */
     async rename(id: string, newName: string): Promise<ProjectView> {
       // HIGH-7 (2026-05-01): rename now returns RenameProjectResult so env
       // refresh failures surface as warnings instead of disappearing into
@@ -232,7 +294,16 @@ function createProjectsStore() {
         newName,
       });
       const updated = result.project;
-      for (const w of result.warnings) toast.error(w);
+      // v0.2.91 WP-F4: severity typing. The `.env` drift notice is a
+      // BY-DESIGN informational message ("VCO never rewrites .env … KG
+      // routing is NOT degraded"); rendering it red made a successful rename
+      // look like a failure. Genuine failures keep the red toast — the
+      // default is still error, only the known-informational class is
+      // downgraded.
+      for (const w of result.warnings) {
+        if (isRenameInfoWarning(w)) toast.info(w);
+        else toast.error(w);
+      }
       update((s) => ({
         ...s,
         projects: s.projects.map((p) => (p.id === id ? updated : p)),

@@ -1112,6 +1112,16 @@ pub(crate) async fn reconcile_dist_at_rest_gated(
     let action = decide_at_rest_action(&verdict);
 
     if action == AtRestAction::Nothing {
+        // v0.2.91 WP-B registry pairing: `launcher_binary_stale` is
+        // `action_required` with a PROBE-DRIVEN clear, and THIS is the probe.
+        // Python's leg cannot see the running process's version, so without
+        // this call the record could only be retired by a weaker heuristic.
+        clear_stale_condition_if_fresh(install_path, &verdict);
+        // Its sibling record — "binaries staged, handoff never fired" — is
+        // over once the tree matches HEAD again and no `.new` sibling is left
+        // waiting. This branch is the only safe place to ask: we probed, and
+        // this pass stages nothing, so the `.new` reading is not our own.
+        clear_handoff_skipped_if_delivered(install_path, &verdict, inputs.dist_dirty);
         return ReconcileOutcome {
             verdict,
             inputs,
@@ -1175,6 +1185,190 @@ static ARMED_SWAP_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// anyway, so re-emitting would only burn a python subprocess per poll.
 static STALE_CONDITION_EMITTED: AtomicBool = AtomicBool::new(false);
 
+/// PURE: may this verdict retire the `launcher_binary_stale` record?
+///
+/// ONLY a positively-probed `Fresh`. `NotProbed` means an update owned the tree
+/// and the probe never ran — clearing an action-required record on the strength
+/// of a look we did not take is precisely the dishonest state this module
+/// exists to remove (it is why `NotProbed` is not `Fresh` in the first place).
+/// `Stale(_)` obviously keeps it.
+pub(crate) fn should_clear_stale_condition(verdict: &FreshnessVerdict) -> bool {
+    matches!(verdict, FreshnessVerdict::Fresh)
+}
+
+/// Is `cid` actually recorded on disk for this install?
+///
+/// Cheap pre-check so the common case — a healthy install polling the
+/// update-check every few minutes — never spends a python subprocess just to
+/// resolve nothing. Both the JSON sidecar (authoritative for Python reads) and
+/// the Markdown are checked, so an install that has only one of them is still
+/// cleared.
+///
+/// One home for both probe-driven clears in this module (`launcher_binary_stale`
+/// and `launcher_binary_handoff_skipped_dirty`) — the "is it there" question is
+/// the same question, so it gets one implementation.
+fn condition_is_recorded(install_path: &Path, cid: &str) -> bool {
+    let ctx = install_path.join(".claude").join("context");
+    ["UPDATE_DEFERRED.json", "UPDATE_DEFERRED.md"]
+        .iter()
+        .any(|name| {
+            std::fs::read_to_string(ctx.join(name))
+                .map(|body| body.contains(cid))
+                .unwrap_or(false)
+        })
+}
+
+/// Retire the `launcher_binary_stale` record once the binary is demonstrably
+/// fresh again (the user quit and relaunched, or `install.py --update` put
+/// HEAD's bytes back).
+///
+/// Also clears [`STALE_CONDITION_EMITTED`]: that latch exists to stop one
+/// process re-emitting the same record on every poll, but once the record is
+/// GONE the latch would suppress a legitimate re-emit if the binary went stale
+/// again later in the same process — the banner would silently never return.
+/// Clearing the record and clearing the latch are one operation.
+///
+/// Best-effort: a failed resolve leaves the record in place (false-keep is
+/// recoverable — the next boot probes again; a false-clear is not).
+fn clear_stale_condition_if_fresh(install_path: &Path, verdict: &FreshnessVerdict) {
+    clear_stale_condition_if_fresh_with(install_path, verdict, production_resolve);
+}
+
+/// The production resolve side-effect shared by both probe-driven clears.
+///
+/// Extracted so the two `*_with` cores below take it as a parameter: an ACT leg
+/// asserted only through "python was spawned" is an act leg nothing can test
+/// hermetically, and the acts here retire `action_required` records.
+fn production_resolve(install_path: &Path, cids: &[&str]) -> Result<(), String> {
+    crate::services::deferral::resolve_deferral_conditions(install_path, install_path, cids)
+}
+
+/// Resolver-injectable core of [`clear_stale_condition_if_fresh`].
+fn clear_stale_condition_if_fresh_with<F>(
+    install_path: &Path,
+    verdict: &FreshnessVerdict,
+    resolve: F,
+) where
+    F: FnOnce(&Path, &[&str]) -> Result<(), String>,
+{
+    if !should_clear_stale_condition(verdict) {
+        return;
+    }
+    if !condition_is_recorded(install_path, CID_BINARY_STALE) {
+        return;
+    }
+    match resolve(install_path, &[CID_BINARY_STALE]) {
+        Ok(()) => {
+            STALE_CONDITION_EMITTED.store(false, Ordering::SeqCst);
+            eprintln!(
+                "[vct] binary_freshness: the running binary matches the dist tree again — \
+                 retired the {} record",
+                CID_BINARY_STALE,
+            );
+        }
+        Err(e) => eprintln!(
+            "[vct] binary_freshness: could not retire the {} record (non-fatal, the next \
+             boot probes again): {}",
+            CID_BINARY_STALE, e,
+        ),
+    }
+}
+
+/// PURE: may this pass retire the `launcher_binary_handoff_skipped_dirty`
+/// record?
+///
+/// The record says: new bytes are parked as `<target>.new` siblings, the dist
+/// tree diverges from HEAD, and nothing is scheduled to move them. It is over
+/// exactly when BOTH halves of that are gone — the tree matches HEAD again AND
+/// no candidate still has a staged sibling waiting. Either half alone leaves a
+/// half-delivered state, which is the state the record exists to name.
+///
+/// `NotProbed` refuses regardless of the other two: a stand-down means an update
+/// owned the tree and this pass never looked, and the two inputs are then
+/// placeholders, not observations. Same tri-state discipline as
+/// [`should_clear_stale_condition`] — a probe that did not run proves nothing.
+pub(crate) fn should_clear_handoff_skipped_condition(
+    verdict: &FreshnessVerdict,
+    dist_dirty: bool,
+    new_siblings_remain: bool,
+) -> bool {
+    if matches!(verdict, FreshnessVerdict::NotProbed) {
+        return false;
+    }
+    !dist_dirty && !new_siblings_remain
+}
+
+/// Does ANY swap candidate still have a `<target>.new` sibling parked on disk?
+///
+/// The second half of the handoff-skipped truth condition. Reads the same
+/// candidate list and the same `.new` naming the staging writer and
+/// `vct-updater` use, so "a sibling is waiting" means the same thing on every
+/// side of the delivery chain.
+fn any_staged_new_sibling_remains(install_path: &Path) -> bool {
+    swap_candidate_rel_paths()
+        .iter()
+        .any(|rel| path_with_new_suffix(&install_path.join(rel)).is_file())
+}
+
+/// Retire the `launcher_binary_handoff_skipped_dirty` record once the staged
+/// bytes have actually been delivered (or discarded): dist clean vs HEAD and no
+/// `.new` sibling left waiting.
+///
+/// Called ONLY from the at-rest reconcile's do-nothing branch — i.e. after a
+/// real probe, and at a moment when this pass has staged nothing itself, so the
+/// `.new` reading below cannot be observing our own work-in-progress.
+///
+/// `dist_dirty` is the value THIS pass already probed
+/// ([`FreshnessInputs::dist_dirty`]) — passed in rather than re-probed so the
+/// clear cannot disagree with the verdict it hangs off, and so no second `git
+/// status` subprocess runs per poll.
+///
+/// The decision itself is [`should_clear_handoff_skipped_condition`]; placing
+/// the only call in the settled branch is the extra conservatism on top of it.
+/// False-keep is recoverable (the next boot probes again); false-clear tells a
+/// user with undelivered binaries that everything is fine.
+///
+/// Best-effort throughout — a resolve failure leaves the record in place.
+fn clear_handoff_skipped_if_delivered(
+    install_path: &Path,
+    verdict: &FreshnessVerdict,
+    dist_dirty: bool,
+) {
+    clear_handoff_skipped_if_delivered_with(install_path, verdict, dist_dirty, production_resolve);
+}
+
+/// Resolver-injectable core of [`clear_handoff_skipped_if_delivered`].
+fn clear_handoff_skipped_if_delivered_with<F>(
+    install_path: &Path,
+    verdict: &FreshnessVerdict,
+    dist_dirty: bool,
+    resolve: F,
+) where
+    F: FnOnce(&Path, &[&str]) -> Result<(), String>,
+{
+    // Order matters for cost: the cheap on-disk record check gates the
+    // filesystem walk, which gates the python subprocess.
+    if !condition_is_recorded(install_path, CID_HANDOFF_SKIPPED) {
+        return;
+    }
+    let siblings_remain = any_staged_new_sibling_remains(install_path);
+    if !should_clear_handoff_skipped_condition(verdict, dist_dirty, siblings_remain) {
+        return;
+    }
+    match resolve(install_path, &[CID_HANDOFF_SKIPPED]) {
+        Ok(()) => eprintln!(
+            "[vct] binary_freshness: the dist tree matches HEAD and no staged `.new` sibling \
+             remains — retired the {} record",
+            CID_HANDOFF_SKIPPED,
+        ),
+        Err(e) => eprintln!(
+            "[vct] binary_freshness: could not retire the {} record (non-fatal, the next \
+             boot probes again): {}",
+            CID_HANDOFF_SKIPPED, e,
+        ),
+    }
+}
+
 /// Arm a stage1 binary swap to run when the user quits.
 ///
 /// Returns true iff the arming took effect. Refuses (returns false) when an
@@ -1230,27 +1424,21 @@ pub(crate) fn perform_armed_swap_on_exit() {
 
 #[cfg(target_os = "windows")]
 fn swap_on_exit_impl(install_root: &Path) {
-    use crate::commands::update_handoff::{SwapEntry, UpdateLock, UPDATER_BIN, UPDATE_LOCK_FILE};
-
-    let dist_dir = install_root
-        .join("launcher")
-        .join("dist")
-        .join(launcher_dist_subdir());
-    let updater_path = dist_dir.join(UPDATER_BIN);
-    if !updater_path.is_file() {
-        eprintln!(
-            "[vct] binary_freshness: armed swap skipped — no updater at {}",
-            updater_path.display(),
-        );
-        return;
-    }
+    use crate::commands::update_handoff::{
+        prepare_update_handoff_impl, UPDATE_LOCK_FILE,
+    };
 
     // v0.2.91 fix-round MAJOR-2(a): same stale-`.new` invalidation the shared
     // post-update tail runs. Between ARMING (at boot / update-check) and this
     // exit, a real update may have landed newer binaries at the canonical
     // paths; the copy we staged back then is then older than what is on disk,
     // and swapping it in would undo the update the user just took.
-    let dropped = invalidate_stale_new_siblings_for_blocking(install_root, &swap_candidate_rel_paths());
+    //
+    // MUST stay BEFORE the delegation below: the handoff decides what to swap
+    // purely from which `<target>.new` siblings exist, so a stale sibling that
+    // is still on disk when it runs is a stale sibling that gets swapped in.
+    let dropped =
+        invalidate_stale_new_siblings_for_blocking(install_root, &swap_candidate_rel_paths());
     if !dropped.is_empty() {
         eprintln!(
             "[vct] binary_freshness: armed swap dropped {} stale staged binary/binaries: {:?}",
@@ -1259,21 +1447,13 @@ fn swap_on_exit_impl(install_root: &Path) {
         );
     }
 
-    let mut swaps: Vec<SwapEntry> = Vec::new();
-    for rel in swap_candidate_rel_paths() {
-        let target = install_root.join(&rel);
-        if path_with_new_suffix(&target).is_file() {
-            swaps.push(SwapEntry { target });
-        }
-    }
-    if swaps.is_empty() {
-        return;
-    }
-
+    // Yield to a REAL update handoff. `prepare_update_handoff_impl` overwrites
+    // the lock unconditionally (correct for the update surface, which owns
+    // it); at-rest we must not, or we would drop the post-update relaunch the
+    // user is waiting for. Same check `arm_stage1_swap_on_exit` makes at
+    // arming time — re-checked here because the window between them is wide.
     let lock_path = vct_root_dir().join(UPDATE_LOCK_FILE);
     if lock_path.exists() {
-        // A real update handoff armed between our arming and this exit. Its
-        // relaunch semantics win; do not clobber the lock.
         eprintln!(
             "[vct] binary_freshness: armed swap skipped — update handoff lock present at {}",
             lock_path.display(),
@@ -1281,64 +1461,26 @@ fn swap_on_exit_impl(install_root: &Path) {
         return;
     }
 
-    let lock = UpdateLock {
-        parent_pid: std::process::id(),
-        swaps,
-        // NO relaunch: the user quit. Standing no-auto-restart ruling.
-        relaunch: None,
-        started_at: Some(chrono::Utc::now().to_rfc3339()),
-    };
-
-    if let Some(parent) = lock_path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            eprintln!(
-                "[vct] binary_freshness: armed swap skipped — mkdir {} failed: {}",
-                parent.display(),
-                e
-            );
-            return;
-        }
-    }
-    let tmp = lock_path.with_extension("json.tmp");
-    let body = match serde_json::to_string_pretty(&lock) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("[vct] binary_freshness: armed swap lock serialize failed: {}", e);
-            return;
-        }
-    };
-    if std::fs::write(&tmp, &body).is_err() || std::fs::rename(&tmp, &lock_path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        eprintln!("[vct] binary_freshness: armed swap skipped — could not write updater lock");
-        return;
-    }
-
-    // Detached spawn: the updater must outlive us (it waits for our PID to go
-    // away before it can rename over the binaries we still hold open).
-    // NOTE: the creation-flag pair mirrors `update_handoff::spawn_updater`.
-    // See the report follow-up — making that helper `pub(crate)` collapses
-    // these two spawn sites into one.
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        let spawned = std::process::Command::new(&updater_path)
-            .arg(&lock_path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
-            .spawn();
-        match spawned {
-            Ok(_) => eprintln!(
-                "[vct] binary_freshness: at-rest swap handed to {} (no relaunch)",
-                updater_path.display(),
-            ),
-            Err(e) => {
-                eprintln!("[vct] binary_freshness: could not spawn updater: {}", e);
-                let _ = std::fs::remove_file(&lock_path);
+    // v0.2.91 wave-2 (WP-F carry-over ii): ONE home for "write the updater
+    // lock and spawn vct-updater detached". `relaunch: false` is the whole
+    // difference from the update surface — the user QUIT, so quitting is what
+    // happens; the fresh binary is what their next manual launch executes
+    // (standing no-auto-restart ruling).
+    match prepare_update_handoff_impl(install_root, false) {
+        Ok(res) if res.handoff_active => eprintln!(
+            "[vct] binary_freshness: at-rest swap handed to vct-updater (no relaunch); lock={:?}",
+            res.lock_path,
+        ),
+        Ok(res) => {
+            // no_swaps_needed is the common, silent case (nothing staged).
+            if res.skip_reason.as_deref() != Some("no_swaps_needed") {
+                eprintln!(
+                    "[vct] binary_freshness: armed swap skipped — {}",
+                    res.skip_reason.as_deref().unwrap_or("unknown reason"),
+                );
             }
         }
+        Err(e) => eprintln!("[vct] binary_freshness: armed swap could not run: {}", e),
     }
 }
 
@@ -1514,6 +1656,458 @@ pub(crate) fn emit_binary_stale_condition(
 mod tests {
     use super::*;
     use std::process::{Command as StdCommand, Stdio};
+
+    // -- WP-F carry-over (ii): one home for the updater handoff -------------
+
+    /// The at-rest exit swap must DELEGATE to
+    /// `update_handoff::prepare_update_handoff_impl`, not carry a second copy
+    /// of the lock-write + detached-spawn sequence. Wave-1 shipped that copy
+    /// (~12 lines, its own creation flags); a second copy is exactly how the
+    /// two sides drift when the wire contract or the flags change.
+    ///
+    /// The needles are assembled from fragments so this test's own source
+    /// cannot satisfy the search it performs.
+    #[test]
+    fn at_rest_swap_has_no_second_detached_spawn() {
+        let src = include_str!("binary_freshness.rs");
+        let flag = concat!("CREATE_NEW_", "PROCESS_GROUP");
+        assert!(
+            !src.contains(flag),
+            "the detached-spawn creation flags belong to update_handoff's \
+             spawn_updater — this module must call it, not re-implement it",
+        );
+        let detached = concat!("DETACHED_", "PROCESS");
+        assert!(!src.contains(detached));
+        assert!(
+            src.contains(concat!("prepare_update_", "handoff_impl")),
+            "the exit swap must route through the shared handoff impl",
+        );
+    }
+
+    // -- WP-B registry pairing: the probe-driven clears are WIRED IN ---------
+
+    /// The clears are only worth anything if the at-rest reconcile calls them.
+    /// Both live in the do-nothing branch — the one moment we have a probed
+    /// verdict AND have staged nothing ourselves — so this pins the call site,
+    /// not just the helpers. Deleting either call turns this red.
+    ///
+    /// Needles are assembled from fragments so this test's own source cannot
+    /// satisfy the search; the slice is bounded to the reconcile function so a
+    /// call from anywhere else would not count either.
+    #[test]
+    fn the_at_rest_reconcile_wires_both_probe_driven_clears() {
+        let src = include_str!("binary_freshness.rs");
+        let start = src
+            .find(concat!("pub(crate) async fn reconcile_dist_at_", "rest_gated"))
+            .expect("the gated reconcile must exist");
+        let end = src[start..]
+            .find("Arm / perform the NO-RELAUNCH")
+            .map(|i| start + i)
+            .expect("the section that follows the reconcile must exist");
+        let body = &src[start..end];
+
+        assert!(
+            body.contains(concat!("clear_stale_condition_if_", "fresh(install_path")),
+            "the do-nothing branch must retire `launcher_binary_stale` when the \
+             probe says Fresh — otherwise the once-per-process emit latch means \
+             nothing can ever clear it",
+        );
+        assert!(
+            body.contains(concat!("clear_handoff_skipped_if_", "delivered(install_path")),
+            "the do-nothing branch must retire \
+             `launcher_binary_handoff_skipped_dirty` once the staged bytes are \
+             delivered",
+        );
+    }
+
+    // -- WP-B registry pairing: the probe-driven clear of the stale record ----
+
+    /// Both sides of the destructive-ish gate (retiring an `action_required`
+    /// record). Only a verdict we POSITIVELY established may clear it.
+    #[test]
+    fn only_a_probed_fresh_verdict_retires_the_stale_record() {
+        assert!(should_clear_stale_condition(&FreshnessVerdict::Fresh));
+
+        assert!(
+            !should_clear_stale_condition(&FreshnessVerdict::NotProbed),
+            "NotProbed means an update owned the tree and we never looked — \
+             clearing on it invents a clean bill of health",
+        );
+        for reason in [
+            StaleReason::OnDiskNewerThanRunning,
+            StaleReason::DistDirtyVsHead,
+            StaleReason::Both,
+        ] {
+            assert!(!should_clear_stale_condition(&FreshnessVerdict::Stale(reason)));
+        }
+    }
+
+    #[test]
+    fn the_stale_record_is_detected_in_either_deferral_file() {
+        for name in ["UPDATE_DEFERRED.json", "UPDATE_DEFERRED.md"] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let ctx = tmp.path().join(".claude").join("context");
+            std::fs::create_dir_all(&ctx).expect("mkdir");
+            assert!(
+                !condition_is_recorded(tmp.path(), CID_BINARY_STALE),
+                "nothing on disk yet",
+            );
+            std::fs::write(
+                ctx.join(name),
+                format!("## {} (warning)\n\n**Title**: foo\n", CID_BINARY_STALE),
+            )
+            .expect("write");
+            assert!(
+                condition_is_recorded(tmp.path(), CID_BINARY_STALE),
+                "{} must be enough to trigger the clear",
+                name,
+            );
+        }
+    }
+
+    /// `condition_is_recorded` asks `body.contains(cid)` — a SUBSTRING test.
+    ///
+    /// That is safe for the two cids it serves today (neither is a substring of
+    /// the other) and its failure direction is benign anyway: a false positive
+    /// only spends a python subprocess, because resolving an id that is not
+    /// recorded is a no-op. It stops being safe the moment it is pointed at a
+    /// cid that is a PREFIX of another registered one — the registry already
+    /// contains such a pair (`deprecated_mcp_` vs
+    /// `deprecated_mcp_removal_summary`), where a sibling's record would be
+    /// read as this one's and an `action_required` entry could be retired while
+    /// its condition still holds.
+    ///
+    /// So the substring semantics are allowed to stay only while the call set
+    /// stays scoped. This pins that scope: generalising the helper to a third
+    /// cid fails here and forces the anchored-match decision to be made
+    /// deliberately rather than inherited by accident. (Raised by WP-B on the
+    /// registry review, 2026-08-26.)
+    #[test]
+    fn the_record_presence_check_stays_scoped_to_its_two_cids() {
+        let src = include_str!("binary_freshness.rs");
+        // Production call sites only — the fixtures below legitimately call it
+        // with the same two constants.
+        let production = src.split("mod tests {").next().expect("module has tests");
+        let needle = concat!("condition_is_", "recorded(install_path, ");
+        let call_args: Vec<&str> = production
+            .match_indices(needle)
+            .map(|(idx, _)| {
+                production[idx + needle.len()..]
+                    .split(')')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+            })
+            .collect();
+
+        assert!(
+            !call_args.is_empty(),
+            "expected the probe-driven clears to consult the presence helper",
+        );
+        for arg in &call_args {
+            assert!(
+                matches!(*arg, "CID_BINARY_STALE" | "CID_HANDOFF_SKIPPED"),
+                "`condition_is_recorded` does a SUBSTRING match, which is only \
+                 sound for cids that are not prefixes of another registered id. \
+                 Called with `{arg}` — either anchor the match (`## {{cid}} (` in \
+                 the markdown, `\"condition_id\": \"{{cid}}\"` in the JSON) or keep \
+                 the call set to the two ids this was reasoned about.",
+            );
+        }
+    }
+
+    // -- WP-B registry pairing: the handoff-skipped record's probe-driven clear --
+
+    /// The full truth table of the second probe-driven clear, both directions.
+    ///
+    /// `launcher_binary_handoff_skipped_dirty` says "new bytes are parked and
+    /// nothing will move them". It is over only when BOTH halves are gone; a
+    /// half-delivered state must keep it.
+    #[test]
+    fn the_handoff_record_retires_only_when_both_halves_are_gone() {
+        // Delivered: tree matches HEAD, nothing left staged.
+        assert!(should_clear_handoff_skipped_condition(
+            &FreshnessVerdict::Fresh,
+            false,
+            false,
+        ));
+
+        // Still dirty vs HEAD ⇒ the divergence half still holds.
+        assert!(
+            !should_clear_handoff_skipped_condition(&FreshnessVerdict::Fresh, true, false),
+            "a dirty dist tree is half the condition — it may not clear",
+        );
+        // A `.new` sibling is still parked ⇒ the undelivered half still holds.
+        assert!(
+            !should_clear_handoff_skipped_condition(&FreshnessVerdict::Fresh, false, true),
+            "a staged sibling still waiting is the other half — it may not clear",
+        );
+        assert!(!should_clear_handoff_skipped_condition(
+            &FreshnessVerdict::Fresh,
+            true,
+            true,
+        ));
+
+        // Tri-state: a stand-down never clears anything, whatever the other
+        // two inputs happen to say (they are placeholders, not observations).
+        for (dirty, staged) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert!(
+                !should_clear_handoff_skipped_condition(
+                    &FreshnessVerdict::NotProbed,
+                    dirty,
+                    staged,
+                ),
+                "NotProbed means we never looked — it may not clear \
+                 (dirty={dirty}, staged={staged})",
+            );
+        }
+    }
+
+    /// The `.new` probe reads the SAME candidate list and suffix the staging
+    /// writer and `vct-updater` use. Both legs: nothing parked, then one parked.
+    #[test]
+    fn the_staged_sibling_probe_sees_a_parked_new_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(
+            !any_staged_new_sibling_remains(tmp.path()),
+            "an empty tree has nothing parked",
+        );
+
+        let rel = swap_candidate_rel_paths()
+            .into_iter()
+            .next()
+            .expect("at least one swap candidate on every host");
+        let target = tmp.path().join(&rel);
+        std::fs::create_dir_all(target.parent().expect("candidate has a parent")).expect("mkdir");
+        // The canonical binary alone must NOT read as "staged".
+        std::fs::write(&target, b"canonical").expect("write");
+        assert!(
+            !any_staged_new_sibling_remains(tmp.path()),
+            "the canonical binary is not a staged sibling",
+        );
+
+        std::fs::write(path_with_new_suffix(&target), b"staged").expect("write");
+        assert!(
+            any_staged_new_sibling_remains(tmp.path()),
+            "a parked `{}.new` must be seen",
+            rel,
+        );
+    }
+
+    /// Write `cid` into a temp install's `UPDATE_DEFERRED.md` and hand back the
+    /// tempdir. Shared by the ACT/leave-alone legs below.
+    fn install_with_recorded_condition(cid: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = tmp.path().join(".claude").join("context");
+        std::fs::create_dir_all(&ctx).expect("mkdir");
+        std::fs::write(
+            ctx.join("UPDATE_DEFERRED.md"),
+            format!("## {} (warning)\n\n**Title**: foo\n", cid),
+        )
+        .expect("write");
+        tmp
+    }
+
+    /// Park a `<candidate>.new` sibling in `root`, returning the relative path.
+    fn park_staged_sibling(root: &Path) -> String {
+        let rel = swap_candidate_rel_paths()
+            .into_iter()
+            .next()
+            .expect("at least one swap candidate on every host");
+        let target = root.join(&rel);
+        std::fs::create_dir_all(target.parent().expect("candidate has a parent")).expect("mkdir");
+        std::fs::write(path_with_new_suffix(&target), b"staged").expect("write");
+        rel
+    }
+
+    /// ACT leg for the STALE clear (wave-1 shipped the leave-alone legs only).
+    /// A probed `Fresh` over a recorded entry must actually reach the resolver,
+    /// with exactly that one cid, and must drop the emit latch so a later
+    /// re-staling can surface again in the same process.
+    #[test]
+    fn a_fresh_verdict_over_a_recorded_stale_entry_resolves_it() {
+        let tmp = install_with_recorded_condition(CID_BINARY_STALE);
+        let mut seen: Vec<String> = Vec::new();
+        STALE_CONDITION_EMITTED.store(true, Ordering::SeqCst);
+
+        clear_stale_condition_if_fresh_with(
+            tmp.path(),
+            &FreshnessVerdict::Fresh,
+            |root, cids| {
+                assert_eq!(root, tmp.path(), "the resolve must target this install");
+                seen.extend(cids.iter().map(|c| c.to_string()));
+                Ok(())
+            },
+        );
+
+        assert_eq!(seen, vec![CID_BINARY_STALE.to_string()]);
+        assert!(
+            !STALE_CONDITION_EMITTED.load(Ordering::SeqCst),
+            "clearing the record must clear the latch, or a later re-stale in \
+             this process could never surface",
+        );
+        STALE_CONDITION_EMITTED.store(false, Ordering::SeqCst);
+    }
+
+    /// Leave-alone legs for the STALE clear at the CALL level: neither a stale
+    /// verdict nor a stand-down may reach the resolver.
+    #[test]
+    fn a_non_fresh_verdict_never_reaches_the_stale_resolver() {
+        for verdict in [
+            FreshnessVerdict::Stale(StaleReason::Both),
+            FreshnessVerdict::Stale(StaleReason::OnDiskNewerThanRunning),
+            FreshnessVerdict::Stale(StaleReason::DistDirtyVsHead),
+            FreshnessVerdict::NotProbed,
+        ] {
+            let tmp = install_with_recorded_condition(CID_BINARY_STALE);
+            let mut called = false;
+            clear_stale_condition_if_fresh_with(tmp.path(), &verdict, |_, _| {
+                called = true;
+                Ok(())
+            });
+            assert!(!called, "{:?} must not retire an action-required record", verdict);
+        }
+    }
+
+    /// ACT leg for the HANDOFF clear: recorded + probed + tree clean + nothing
+    /// parked ⇒ the resolver runs with exactly that cid.
+    #[test]
+    fn a_delivered_tree_retires_the_handoff_record() {
+        let tmp = install_with_recorded_condition(CID_HANDOFF_SKIPPED);
+        let mut seen: Vec<String> = Vec::new();
+
+        clear_handoff_skipped_if_delivered_with(
+            tmp.path(),
+            &FreshnessVerdict::Fresh,
+            false,
+            |root, cids| {
+                assert_eq!(root, tmp.path());
+                seen.extend(cids.iter().map(|c| c.to_string()));
+                Ok(())
+            },
+        );
+
+        assert_eq!(seen, vec![CID_HANDOFF_SKIPPED.to_string()]);
+    }
+
+    /// Leave-alone legs for the HANDOFF clear at the CALL level, one per way
+    /// the condition can still hold: a dirty tree, a parked sibling, a
+    /// stand-down verdict, and no record at all.
+    #[test]
+    fn an_undelivered_or_unprobed_state_never_reaches_the_handoff_resolver() {
+        // (a) tree still diverges from HEAD.
+        let tmp = install_with_recorded_condition(CID_HANDOFF_SKIPPED);
+        let mut called = false;
+        clear_handoff_skipped_if_delivered_with(
+            tmp.path(),
+            &FreshnessVerdict::Fresh,
+            true,
+            |_, _| {
+                called = true;
+                Ok(())
+            },
+        );
+        assert!(!called, "a dirty dist tree is half the condition — keep the record");
+
+        // (b) a staged `.new` sibling is still parked.
+        let tmp = install_with_recorded_condition(CID_HANDOFF_SKIPPED);
+        let rel = park_staged_sibling(tmp.path());
+        let mut called = false;
+        clear_handoff_skipped_if_delivered_with(
+            tmp.path(),
+            &FreshnessVerdict::Fresh,
+            false,
+            |_, _| {
+                called = true;
+                Ok(())
+            },
+        );
+        assert!(!called, "`{}.new` is still waiting — keep the record", rel);
+
+        // (c) the probe never ran (an update owned the tree).
+        let tmp = install_with_recorded_condition(CID_HANDOFF_SKIPPED);
+        let mut called = false;
+        clear_handoff_skipped_if_delivered_with(
+            tmp.path(),
+            &FreshnessVerdict::NotProbed,
+            false,
+            |_, _| {
+                called = true;
+                Ok(())
+            },
+        );
+        assert!(!called, "a probe that never ran proves nothing");
+
+        // (d) a FOREIGN record is on disk; ours is not. Nothing to resolve, and
+        //     nothing of anyone else's to touch.
+        let tmp = install_with_recorded_condition(CID_BINARY_STALE);
+        let mut called = false;
+        clear_handoff_skipped_if_delivered_with(
+            tmp.path(),
+            &FreshnessVerdict::Fresh,
+            false,
+            |_, _| {
+                called = true;
+                Ok(())
+            },
+        );
+        assert!(!called, "no handoff record on disk — spend nothing");
+    }
+
+    /// Leave-alone leg + the "don't spend a subprocess for nothing" guard: with
+    /// no record on disk the clear must return WITHOUT invoking the python
+    /// resolve helper. Hermetic precisely because it never reaches python.
+    #[test]
+    fn a_fresh_verdict_with_no_record_on_disk_does_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".claude").join("context")).expect("mkdir");
+        STALE_CONDITION_EMITTED.store(true, Ordering::SeqCst);
+        clear_stale_condition_if_fresh(tmp.path(), &FreshnessVerdict::Fresh);
+        assert!(
+            STALE_CONDITION_EMITTED.load(Ordering::SeqCst),
+            "no record was cleared, so the emit latch must be left exactly as it was",
+        );
+        STALE_CONDITION_EMITTED.store(false, Ordering::SeqCst);
+    }
+
+    /// A stale verdict must not even LOOK at the deferral files, let alone
+    /// resolve — the record is what the user is being asked to act on.
+    #[test]
+    fn a_stale_verdict_never_reaches_the_resolve_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = tmp.path().join(".claude").join("context");
+        std::fs::create_dir_all(&ctx).expect("mkdir");
+        let md = ctx.join("UPDATE_DEFERRED.md");
+        let body = format!("## {} (warning)\n\n**Title**: foo\n", CID_BINARY_STALE);
+        std::fs::write(&md, &body).expect("write");
+
+        clear_stale_condition_if_fresh(tmp.path(), &FreshnessVerdict::Stale(StaleReason::Both));
+
+        assert_eq!(
+            std::fs::read_to_string(&md).expect("read"),
+            body,
+            "the record must survive a stale verdict untouched",
+        );
+    }
+
+    /// WP-F carry-over (iv): the installer's abort tail must revert AND record
+    /// through the shared helper. It used to inline the outcome-check →
+    /// canonical-resolve → emit sequence; a second copy is how one surface
+    /// ends up silently dropping the `launcher_binary_clobber_averted` record
+    /// (which is precisely what `self_update.rs` did before the wave-1 fix).
+    #[test]
+    fn the_installer_abort_tail_reverts_through_the_shared_recorder() {
+        let installer = include_str!("../commands/installer.rs");
+        assert!(
+            installer.contains(concat!("binary_freshness::revert_and_", "record(")),
+            "installer.rs's abort tail must call the shared revert+record helper",
+        );
+        assert!(
+            !installer.contains(concat!("emit_clobber_averted_", "condition(")),
+            "emitting the clobber-averted record is the helper's job — an inline \
+             emit here is the duplicate that was consolidated in v0.2.91",
+        );
+    }
 
     // -- WI-3: the pure revert/keep decision, both legs ---------------------
 

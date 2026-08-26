@@ -22,17 +22,60 @@
   } from '$lib/types/embedding-catalog';
   import type { TelemetryStatus, ConsentFlags } from '$lib/types/project-state';
 
-  // Setting key → default value
-  const KEYS = [
-    { key: 'auto_update_enabled', label: 'Auto-check for orchestrator updates', kind: 'bool' as const, default: true },
-    { key: 'logging_level', label: 'Logging level', kind: 'enum' as const, default: 'info', options: ['debug', 'info', 'warning', 'error'] },
-    { key: 'tray_start_minimized', label: 'Start launcher minimized to tray', kind: 'bool' as const, default: false },
-    { key: 'tray_close_to_tray', label: 'Close button minimizes to tray (doesn\'t exit)', kind: 'bool' as const, default: true },
-    { key: 'default_embedding_mode', label: 'Default embedding backend', kind: 'enum' as const, default: 'gpu', options: ['gpu', 'ollama'] },
+  // ── Window behaviour (v0.2.91 WP-F2, user decisions #2 / #3) ────────
+  //
+  // These three toggles are LAUNCHER-GLOBAL: they describe what the X and
+  // minimize buttons do, which has nothing to do with whichever project
+  // happens to be selected. Until v0.2.91 they were persisted per selected
+  // project (`set_setting_v2`, module `launcher`) and read by NOTHING — the
+  // page promised "Close button minimizes to tray", defaulted ON, while the
+  // window handler unconditionally showed the quit dialog. They now write to
+  // launcher.db `app_state` through a dedicated command that also refreshes
+  // the running window handler's cache, so a toggle takes effect immediately.
+  //
+  // `consumer` is not decoration: `tests/test_v0291_pref_keys_have_consumers.py`
+  // asserts every key below is actually read by that Rust symbol. A toggle
+  // that persists a value nobody reads is a shipped lie, and that invariant is
+  // what stops the next one from being added.
+  //
+  // REMOVED in v0.2.91 (same wire-or-delete ruling, applied to the keys the
+  // ruling did not enumerate — all three had zero consumers repo-wide):
+  //   · `auto_update_enabled`  — the REAL, wired toggle lives one click away
+  //     on Preferences → Updates (`get/set_auto_check_enabled`). This copy
+  //     wrote an unread `module_settings` row and could visibly contradict it.
+  //   · `logging_level`        — no logging subsystem has ever read it.
+  //   · `default_embedding_mode` — superseded by the "Default embedding
+  //     models" pickers further down this same page
+  //     (`get/set_default_embedding_models`).
+  const WINDOW_PREF_KEYS = [
+    {
+      key: 'tray_close_to_tray',
+      label: 'Close button reduces to tray (doesn\'t exit)',
+      hint: 'Default. The launcher keeps running so Weaviate, Ollama and the hub stay available to your other tools. Quit for real from the tray icon: right-click → Quit.',
+      consumer: 'APP_STATE_CLOSE_TO_TRAY',
+    },
+    {
+      key: 'tray_minimize_to_tray',
+      label: 'Minimize button reduces to tray too',
+      hint: 'Off by default — the minimize button goes to the taskbar like any other window.',
+      consumer: 'APP_STATE_MINIMIZE_TO_TRAY',
+    },
+    {
+      key: 'tray_start_minimized',
+      label: 'Start launcher hidden in the tray',
+      hint: 'The window is not shown at startup; left-click the tray icon to open it.',
+      consumer: 'APP_STATE_START_MINIMIZED',
+    },
   ];
 
-  let values = $state<Record<string, any>>({});
-  let loading = $state(true);
+  interface TrayWindowPrefs {
+    close_to_tray: boolean;
+    minimize_to_tray: boolean;
+    start_minimized: boolean;
+  }
+
+  let windowPrefs = $state<Record<string, boolean>>({});
+  let windowPrefsLoading = $state(true);
 
   // Onboarding re-trigger state
   let showOnboardingConfirm = $state(false);
@@ -797,41 +840,46 @@
 
   const project = $derived($selectedProject);
 
-  async function load() {
-    if (!project) return;
-    loading = true;
+  // v0.2.91 WP-F2: launcher-global window prefs. No project needed — reading
+  // and writing go through the dedicated command pair, which owns both the
+  // `app_state` row AND the running window handler's cache (so the X button
+  // changes meaning the moment the checkbox moves, no relaunch).
+  async function loadWindowPrefs() {
+    windowPrefsLoading = true;
     try {
-      const out: Record<string, any> = {};
-      for (const k of KEYS) {
-        try {
-          const raw = await invoke<any>('get_setting_v2', {
-            projectId: project.id,
-            moduleId: 'launcher',
-            key: k.key,
-          });
-          out[k.key] = raw ?? k.default;
-        } catch {
-          out[k.key] = k.default;
-        }
-      }
-      values = out;
+      const p = await invoke<TrayWindowPrefs>('get_tray_window_prefs');
+      windowPrefs = {
+        tray_close_to_tray: p.close_to_tray,
+        tray_minimize_to_tray: p.minimize_to_tray,
+        tray_start_minimized: p.start_minimized,
+      };
+    } catch (e) {
+      // Browser/dev mode or a DB hiccup: render the shipped defaults rather
+      // than an empty list, and say nothing — this is not actionable.
+      console.debug('loadWindowPrefs failed', e);
+      windowPrefs = {
+        tray_close_to_tray: true,
+        tray_minimize_to_tray: false,
+        tray_start_minimized: false,
+      };
     } finally {
-      loading = false;
+      windowPrefsLoading = false;
     }
   }
 
-  async function save(key: string, value: any) {
-    if (!project) return;
-    values = { ...values, [key]: value };
+  async function saveWindowPref(key: string, value: boolean) {
+    const previous = windowPrefs[key];
+    windowPrefs = { ...windowPrefs, [key]: value };
     try {
-      await invoke('set_setting_v2', {
-        projectId: project.id,
-        moduleId: 'launcher',
-        key,
-        value,
-      });
+      const p = await invoke<TrayWindowPrefs>('set_tray_window_pref', { key, value });
+      windowPrefs = {
+        tray_close_to_tray: p.close_to_tray,
+        tray_minimize_to_tray: p.minimize_to_tray,
+        tray_start_minimized: p.start_minimized,
+      };
       toast.success('Saved');
     } catch (e) {
+      windowPrefs = { ...windowPrefs, [key]: previous }; // revert on failure
       toast.error(e);
     }
   }
@@ -1739,7 +1787,6 @@
   }
 
   onMount(() => {
-    void load();
     void loadPat();
     void loadInitialHardwareSnapshot();
     void loadEmbeddingCatalog();
@@ -1766,8 +1813,10 @@
     void loadStateDir();
     // Startup section: read the hub boot-autostart state.
     void loadBootAutostart();
+    // v0.2.91 WP-F2: window behaviour is launcher-global — loaded once,
+    // independent of whether a project is selected.
+    void loadWindowPrefs();
   });
-  $effect(() => { if (project) void load(); });
   $effect(() => { if ($selectedProject) void loadRlLocalState(); });
 
   onDestroy(() => {
@@ -1800,43 +1849,48 @@
   </header>
 
   <main class="pr-main">
-    <!-- Project-scoped settings (KG / module dropdowns) require a selected
-         project. Onboarding and Launcher self-update are app-level — they
-         work for new users who don't have a project yet, so they live
-         OUTSIDE the project guard. -->
+    <!--
+      Window behaviour (v0.2.91 WP-F2).
 
-    {#if !project}
-      <p class="pr-empty">Select a project from the menu bar to edit project-scoped settings.</p>
-    {:else if loading}
-      <p class="pr-empty">Loading project settings…</p>
-    {:else}
+      Launcher-GLOBAL, so it sits outside the project guard: what the X and
+      minimize buttons do cannot depend on which project is selected. Before
+      v0.2.91 these lived inside the guard AND were stored per project, so
+      they were invisible to anyone without a project selected — and did
+      nothing at all when they were visible.
+    -->
+    <section class="pr-section">
+      <h2 class="pr-section-title">Window behaviour</h2>
       <p class="pr-hint">
-        Settings scoped to <code>{project.name}</code>. They're stored under the <code>launcher</code> module
-        namespace in <code>~/.vct/launcher.db</code>.
+        Applies to the launcher window itself, on every project. Stored in
+        <code>~/.vct/launcher.db</code>. Changes take effect immediately.
       </p>
-      <ul class="pr-list">
-        {#each KEYS as k}
-          <li class="pr-row">
-            <strong>{k.label}</strong>
-            {#if k.kind === 'bool'}
+      {#if windowPrefsLoading}
+        <p class="pr-empty">Loading…</p>
+      {:else}
+        <ul class="pr-list">
+          {#each WINDOW_PREF_KEYS as k}
+            <li class="pr-row">
+              <div class="pr-onboarding-text">
+                <strong>{k.label}</strong>
+                <span class="pr-onboarding-hint">{k.hint}</span>
+              </div>
               <input
                 type="checkbox"
-                checked={values[k.key] === true}
-                onchange={(e) => save(k.key, (e.target as HTMLInputElement).checked)}
+                checked={windowPrefs[k.key] === true}
+                onchange={(e) =>
+                  saveWindowPref(k.key, (e.target as HTMLInputElement).checked)}
               />
-            {:else if k.kind === 'enum' && k.options}
-              <div class="pr-dd">
-                <Dropdown
-                  options={k.options.map((opt: string) => ({ value: opt, label: opt }))}
-                  value={values[k.key]}
-                  onChange={(v: string) => save(k.key, v)}
-                />
-              </div>
-            {/if}
-          </li>
-        {/each}
-      </ul>
-    {/if}
+            </li>
+          {/each}
+        </ul>
+        <p class="pr-hint">
+          Looking for automatic update checks? They live in
+          <button class="pr-link-btn" onclick={() => goto('/preferences/updates')}>
+            Preferences → Updates
+          </button>.
+        </p>
+      {/if}
+    </section>
 
     <!--
       Default embedding models for new projects (v0.2.18 Commit 8).

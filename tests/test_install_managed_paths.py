@@ -64,6 +64,12 @@ EXPECTED_MANAGED_PATHS: tuple[str, ...] = (
     # EDITS of the table to existing installs — same wheel-packaged,
     # self-propagating shape as ``bundled_mcp_versions.toml`` above.
     "vco_lib/mcp_scan_rules.toml",
+    # v0.2.91 WP-B: the deferral-condition registry table. NOT optional —
+    # ``vco_lib/deferral_registry.py`` reads it at IMPORT time and
+    # ``install.py`` calls ``install_owned_ids()`` at module level, so an
+    # install that received the module without its table raises on import.
+    # The copy-install path only copies what is listed here, hence this row.
+    "vco_lib/deferral_conditions.toml",
 )
 
 

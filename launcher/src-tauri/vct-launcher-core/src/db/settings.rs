@@ -305,6 +305,45 @@ impl Db {
         Ok(out)
     }
 
+    /// v0.2.91 WP-F2 — read ONE setting key across EVERY project, as booleans.
+    ///
+    /// Exists for the tray-preference re-homing migration: `tray_close_to_tray`
+    /// and `tray_start_minimized` are launcher-GLOBAL window behaviours but the
+    /// Preferences page persisted them per selected project, so the legacy
+    /// value could be sitting under any project id. The migration adopts them
+    /// into `app_state` once (see `quit_dialog::adopt_legacy_pref`).
+    ///
+    /// Non-boolean rows are skipped rather than coerced — a value the launcher
+    /// never wrote is not evidence of a user's choice. Returns rows in
+    /// `project_id` order for deterministic logging; the adoption decision
+    /// itself is order-independent.
+    pub fn find_all_project_settings_bool(
+        &self,
+        module_id: &str,
+        key: &str,
+    ) -> Result<Vec<bool>, String> {
+        let guard = self.lock();
+        let mut stmt = guard
+            .prepare(
+                "SELECT setting_value FROM module_settings
+                  WHERE module_id = ?1 AND setting_key = ?2 AND project_id IS NOT NULL
+               ORDER BY project_id ASC",
+            )
+            .map_err(|e| format!("prepare: {}", e))?;
+        let rows = stmt
+            .query_map(params![module_id, key], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("query: {}", e))?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let raw = row.map_err(|e| format!("row: {}", e))?;
+            if let Ok(Value::Bool(b)) = serde_json::from_str::<Value>(&raw) {
+                out.push(b);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn clear_module_settings(
         &self,
         project_id: &str,

@@ -2235,6 +2235,41 @@ pub fn run() {
                 });
             }
 
+            // v0.2.91 WP-F2 — resolve the launcher-global window prefs and
+            // prime the process cache the window-event handler reads.
+            //
+            // Cost: at most three indexed `app_state` point reads on the
+            // already-open SQLite handle (plus, exactly once per install, the
+            // legacy per-project adoption query). Nothing here spawns, waits
+            // on a socket, or probes the filesystem — the `[vct] setup
+            // complete` marker below stays reachable and last.
+            {
+                use tauri::Manager;
+                let prefs = match app.try_state::<db::Db>() {
+                    Some(db) => quit_dialog::load_tray_window_prefs(db.inner()),
+                    None => {
+                        // No Db state (should not happen — it is managed
+                        // above). Defaults already sit in the cache.
+                        eprintln!(
+                            "[vct] tray prefs: Db state unavailable at setup — \
+                             using shipped defaults",
+                        );
+                        quit_dialog::cached_tray_window_prefs()
+                    }
+                };
+                // "Start launcher minimized to tray": hide the window before
+                // it is ever shown. Dead since the pref shipped; wired here.
+                if prefs.start_minimized {
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.hide();
+                        eprintln!(
+                            "[vct] tray prefs: started hidden (tray_start_minimized=true) — \
+                             left-click the tray icon to open the window",
+                        );
+                    }
+                }
+            }
+
             // Unconditional boot milestone. Every step above (populate,
             // config, reconcilers, the resume sweeps) logs only when it has
             // work to do, so before this line existed a boot that DIED
@@ -2246,18 +2281,70 @@ pub fn run() {
 
             Ok(())
         })
-        // Intercept window-close (X / Cmd+Q) on the main window. We
-        // prevent the default close, then defer to the same confirmation
-        // dialog used by the tray Quit item. Programmatic quits set the
-        // FORCE_QUIT flag (see quit_dialog::force_quit) and bypass.
+        // Window-button semantics (v0.2.91 WP-F2, user decisions #2/#3).
+        //
+        // Two events are interpreted; the DECISION is the pure
+        // `quit_dialog::window_event_action` (unit-tested matrix), this
+        // closure only acts on it:
+        //
+        //   - CloseRequested (X / Cmd+W): with `tray_close_to_tray` ON
+        //     (shipped default) the window hides to the tray — matching the
+        //     label the Preferences page has shown since the pref shipped.
+        //     With it OFF the 3-button quit dialog appears, as before.
+        //   - Resized: Tauri 2 has NO `WindowEvent::Minimized`, so a minimize
+        //     is observed as a Resized whose window reports `is_minimized()`.
+        //     With `tray_minimize_to_tray` ON (default OFF) it hides to the
+        //     tray; `unminimize()` runs right after `hide()` so the next
+        //     restore is not minimized.
+        //
+        // Programmatic quits latch FORCE_QUIT (`quit_dialog::force_quit`)
+        // and are never converted into a hide — that is what keeps the tray
+        // menu's Quit a real quit.
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                use tauri::Manager;
-                if window.label() == "main" && !quit_dialog::should_skip_dialog() {
-                    api.prevent_close();
+            use tauri::Manager;
+            let kind = match event {
+                tauri::WindowEvent::CloseRequested { .. } => {
+                    Some(quit_dialog::WindowEventKind::CloseRequested)
+                }
+                tauri::WindowEvent::Resized(_) => Some(quit_dialog::WindowEventKind::Resized),
+                _ => None,
+            };
+            let Some(kind) = kind else { return };
+            let is_main = window.label() == "main";
+            // Only the minimize path needs the (cheap, but not free) probe.
+            let is_minimized = is_main
+                && kind == quit_dialog::WindowEventKind::Resized
+                && window.is_minimized().unwrap_or(false);
+
+            match quit_dialog::window_event_action(
+                kind,
+                is_main,
+                is_minimized,
+                quit_dialog::should_skip_dialog(),
+                quit_dialog::cached_tray_window_prefs(),
+            ) {
+                quit_dialog::WindowAction::Hide => {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                    }
+                    let _ = window.hide();
+                    if is_minimized {
+                        // Hide first, THEN unminimize: the window is off-screen
+                        // already, so the user sees no restore flash, and the
+                        // next `show()` (tray click / "Open Launcher" /
+                        // single-instance focus) lands a normal window.
+                        let _ = window.unminimize();
+                    }
+                    quit_dialog::notify_hidden_to_tray_once(&window.app_handle().clone());
+                }
+                quit_dialog::WindowAction::ConfirmQuit => {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                    }
                     let app = window.app_handle().clone();
                     quit_dialog::confirm_and_quit(&app);
                 }
+                quit_dialog::WindowAction::Nothing => {}
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -2269,6 +2356,14 @@ pub fn run() {
             commands::app_state_cmd::app_state_set,
             commands::app_state_cmd::app_state_get_bool,
             commands::app_state_cmd::app_state_set_bool,
+            // v0.2.91 WP-F2 — launcher-global window behaviour (X → tray,
+            // minimize → tray, start hidden). Dedicated command pair rather
+            // than the generic app_state one so the write ALSO refreshes the
+            // process cache the window-event handler reads, and so an unknown
+            // key is rejected instead of silently creating another dead
+            // toggle.
+            quit_dialog::get_tray_window_prefs,
+            quit_dialog::set_tray_window_pref,
             // Container-services lifecycle (Podman/Docker compose).
             // App-launch suite (launch_app/kill_app/get_app_status/etc.) was
             // archived 2026-04-28: zero FE consumers (Svelte) and zero Hub

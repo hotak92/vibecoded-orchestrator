@@ -3850,9 +3850,12 @@ fn probe_hub_health(port: u16, token: &str) -> bool {
 // `revert_pre_pull_rename`, which now compares the backup against the
 // canonical file before renaming and returns a `RevertOutcome` (see WI-3 in
 // `services::binary_freshness`).
-use crate::services::binary_freshness::{
-    pre_pull_rename_running_binary, revert_pre_pull_rename, RevertOutcome,
-};
+// v0.2.91 wave-2 (WP-F carry-over iv): the bare `revert_pre_pull_rename` is no
+// longer imported here — the abort tail routes through the shared
+// `revert_and_record`, which pairs the revert with its durable
+// `launcher_binary_clobber_averted` record so an averted clobber can never go
+// unrecorded from this surface.
+use crate::services::binary_freshness::{pre_pull_rename_running_binary, RevertOutcome};
 
 /// Update an existing orchestrator installation.
 ///
@@ -6703,19 +6706,20 @@ fn abort_update_restore_binaries_and_hub(
     pre_pull_renamed: Option<&Path>,
     pre_pull_renamed_hub: Option<&Path>,
 ) -> AbortRestoreOutcome {
+    // v0.2.91 wave-2 (WP-F carry-over iv): revert + record is ONE helper
+    // (`binary_freshness::revert_and_record`), shared with the launcher
+    // self-update surface. This tail previously inlined the same
+    // outcome-check → canonical-resolve → emit sequence; the duplicate was
+    // verified equivalent before collapsing it. The AUDIT row stays at the
+    // CALL sites (each knows its own branch context — pull branch,
+    // pop-conflict-after-success, …), which is exactly how `self_update.rs`
+    // splits it too.
     let mut outcome = AbortRestoreOutcome::default();
     for backup in [pre_pull_renamed, pre_pull_renamed_hub].into_iter().flatten() {
-        if revert_pre_pull_rename(backup) == RevertOutcome::ClobberAverted {
+        if crate::services::binary_freshness::revert_and_record(install_path, backup)
+            == RevertOutcome::ClobberAverted
+        {
             outcome.clobber_averted = true;
-            if let Some(canonical) =
-                crate::services::binary_freshness::canonical_path_for_backup(backup)
-            {
-                crate::services::binary_freshness::emit_clobber_averted_condition(
-                    install_path,
-                    backup,
-                    &canonical,
-                );
-            }
         }
     }
     let _ = ensure_hub_started_after_update(install_path, HubRestartContext::AbortRecovery);
@@ -11911,6 +11915,13 @@ mod tests {
             // wheel-packaged, self-propagating shape as
             // `bundled_mcp_versions.toml` above.
             "vco_lib/mcp_scan_rules.toml",
+            // v0.2.91 WP-B: the deferral-condition registry table read by
+            // `vco_lib/deferral_registry.py` at IMPORT time. `install.py`
+            // resolves `install_owned_ids()` at module level, so a copy-
+            // install that received `deferral_registry.py` without its table
+            // would raise before doing any work. Listed here so the copy path
+            // ships the pair and future EDITS of the table propagate.
+            "vco_lib/deferral_conditions.toml",
         ];
         let actual: Vec<&str> = ORCHESTRATOR_MANAGED_PATHS.iter().copied().collect();
         assert_eq!(

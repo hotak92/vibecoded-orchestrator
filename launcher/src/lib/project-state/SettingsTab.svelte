@@ -19,7 +19,7 @@
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import { projects } from '$lib/stores/projects';
-  import type { ProjectView, RenameProjectResult } from '$lib/types/launcher';
+  import type { ProjectView } from '$lib/types/launcher';
   import RegenerateOrDeferModal, {
     type StaleDerivedArtifact,
   } from '$lib/components/RegenerateOrDeferModal.svelte';
@@ -105,13 +105,14 @@
     if (!newName.trim() || !project) return;
     saving = true;
     try {
-      // HIGH-7: rename_project_v2 returns RenameProjectResult { project, warnings }.
-      const result = await invoke<RenameProjectResult>('rename_project_v2', {
-        id: project.id,
-        newName: newName.trim(),
-      });
-      project = result.project;
-      for (const w of result.warnings) toast.error(w);
+      // v0.2.91 WP-F3: delegate to the store instead of a second, direct
+      // rename invoke. The duplicate call-site updated only
+      // this component's local `project`, so a rename from Settings left the
+      // top-left selector AND the project-page header stale until reload.
+      // `projects.rename` patches the store row (which the selector and the
+      // page header both derive from) and owns the warning toasts, including
+      // their severity typing (WP-F4) — no toast logic here.
+      project = await projects.rename(project.id, newName.trim());
       toast.success('Renamed');
     } catch (e) {
       toast.error(e);

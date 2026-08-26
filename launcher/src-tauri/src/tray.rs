@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
-    tray::{TrayIconBuilder, TrayIconEvent},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Listener, Manager, Runtime,
 };
 
@@ -41,6 +41,63 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Tray refresh cadence.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+// ---------------------------------------------------------------------------
+// v0.2.91 WP-F1 — tray click policy (decision #1, Option A)
+// ---------------------------------------------------------------------------
+
+/// Whether the tray MENU opens on a left click.
+///
+/// **Policy A (user decision #1, 2026-08-26)**: `false` — left click restores
+/// the window, right click opens the menu (the Windows convention Discord /
+/// Slack / Teams use). Pre-v0.2.91 this was `true` AND the icon-event handler
+/// restored the window on `TrayIconEvent::Click { .. }` — a pattern that
+/// matches EVERY button and BOTH button states, so a single left click both
+/// opened the menu and fired `show()+set_focus()` twice. The window came back
+/// on any attempt to glance at the tray, which is the field report "I can't
+/// keep it in the tray".
+///
+/// The same constant feeds the builder flag and [`tray_click_action`], so the
+/// two can never drift apart.
+pub(crate) const TRAY_MENU_ON_LEFT_CLICK: bool = false;
+
+/// What a tray ICON event should do. Deliberately tiny — the menu path
+/// ("Open Launcher" item) is unaffected and stays the load-bearing route on
+/// Linux, where appindicator emits no icon events at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrayClickAction {
+    /// `show()` + `set_focus()` the main window.
+    Restore,
+    /// Do nothing — the OS/menu owns this click.
+    None,
+}
+
+/// Pure decision for a tray icon click.
+///
+/// Takes the button + state rather than the `TrayIconEvent` itself because
+/// `TrayIconEvent` is `#[non_exhaustive]` upstream (tests in this crate cannot
+/// construct its variants); the caller destructures and passes the two fields
+/// that carry the decision.
+///
+/// Rules:
+///   - `menu_on_left == true` → the left click belongs to the MENU; never
+///     restore from an icon event (that is the pre-v0.2.91 double-fire).
+///   - Only `Left` + `Up` restores. `Down` is half of the same physical click,
+///     so acting on it fires the restore twice.
+///   - `Right` / `Middle` never restore — right click is the menu.
+fn tray_click_action(
+    button: MouseButton,
+    button_state: MouseButtonState,
+    menu_on_left: bool,
+) -> TrayClickAction {
+    if menu_on_left {
+        return TrayClickAction::None;
+    }
+    match (button, button_state) {
+        (MouseButton::Left, MouseButtonState::Up) => TrayClickAction::Restore,
+        _ => TrayClickAction::None,
+    }
+}
 
 /// 5 s hub-status poll loop driving the tray's hub label + Stop item.
 /// A named async fn rather than an inline async block inside `setup` —
@@ -150,11 +207,17 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let _tray = TrayIconBuilder::with_id("vct-tray")
         .tooltip("VibeCoded Tools Launcher")
         .menu(&menu)
-        .show_menu_on_left_click(true)
+        .show_menu_on_left_click(TRAY_MENU_ON_LEFT_CLICK)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => {
                 if let Some(w) = app.get_webview_window("main") {
                     let _ = w.show();
+                    // v0.2.91 WP-F2: the minimize→tray path hides an
+                    // ALREADY-minimized window; it calls `unminimize()` right
+                    // after `hide()` so this restore lands un-minimized. Kept
+                    // here too as insurance for any path that hid the window
+                    // while minimized without that pairing.
+                    let _ = w.unminimize();
                     let _ = w.set_focus();
                 }
             }
@@ -235,10 +298,24 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click { .. } = event {
+            // v0.2.91 WP-F1: the closure only ACTS; the decision is the pure
+            // `tray_click_action` above (unit-tested matrix). Every non-Click
+            // event (Enter / Move / Leave / DoubleClick) is a no-op: with
+            // policy A the Click{Left,Up} pair inside a double click already
+            // restores, so handling DoubleClick too would just re-fire.
+            let action = match event {
+                TrayIconEvent::Click {
+                    button,
+                    button_state,
+                    ..
+                } => tray_click_action(button, button_state, TRAY_MENU_ON_LEFT_CLICK),
+                _ => TrayClickAction::None,
+            };
+            if action == TrayClickAction::Restore {
                 let app = tray.app_handle();
                 if let Some(w) = app.get_webview_window("main") {
                     let _ = w.show();
+                    let _ = w.unminimize();
                     let _ = w.set_focus();
                 }
             }
@@ -504,5 +581,96 @@ mod tests {
             format_update_label(&upd(true, 7)),
             "⚠ Update available (7 commits behind)"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // v0.2.91 WP-F1 — tray click policy matrix (decision #1, Option A).
+    //
+    // Pre-fix the closure matched `TrayIconEvent::Click { .. }`, i.e. every
+    // button in both states, so this whole block fails: Left+Down, Right+Up
+    // and Right+Down all restored the window, and the menu-on-left builder
+    // flag meant one physical left click did BOTH.
+    // -----------------------------------------------------------------
+
+    /// The shipped policy is A: the menu is a RIGHT-click surface.
+    #[test]
+    fn tray_menu_is_not_on_left_click_under_policy_a() {
+        assert!(
+            !TRAY_MENU_ON_LEFT_CLICK,
+            "policy A (user decision #1): left click restores the window, \
+             right click opens the menu",
+        );
+    }
+
+    #[test]
+    fn left_up_restores_under_policy_a() {
+        assert_eq!(
+            tray_click_action(MouseButton::Left, MouseButtonState::Up, false),
+            TrayClickAction::Restore,
+        );
+    }
+
+    /// The double-fire killer: `Down` is the first half of the same physical
+    /// click that later emits `Up`. Acting on both restored twice.
+    #[test]
+    fn left_down_never_acts() {
+        assert_eq!(
+            tray_click_action(MouseButton::Left, MouseButtonState::Down, false),
+            TrayClickAction::None,
+        );
+    }
+
+    #[test]
+    fn right_click_is_the_menus_job_in_both_states() {
+        assert_eq!(
+            tray_click_action(MouseButton::Right, MouseButtonState::Down, false),
+            TrayClickAction::None,
+        );
+        assert_eq!(
+            tray_click_action(MouseButton::Right, MouseButtonState::Up, false),
+            TrayClickAction::None,
+        );
+    }
+
+    #[test]
+    fn middle_click_never_acts() {
+        assert_eq!(
+            tray_click_action(MouseButton::Middle, MouseButtonState::Down, false),
+            TrayClickAction::None,
+        );
+        assert_eq!(
+            tray_click_action(MouseButton::Middle, MouseButtonState::Up, false),
+            TrayClickAction::None,
+        );
+    }
+
+    /// Leave-alone leg: if the menu is ever put back on left click, the icon
+    /// event must NOT also restore — that combination is the original bug.
+    #[test]
+    fn menu_on_left_disables_icon_restore_entirely() {
+        for state in [MouseButtonState::Down, MouseButtonState::Up] {
+            for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+                assert_eq!(
+                    tray_click_action(button, state, true),
+                    TrayClickAction::None,
+                    "menu_on_left=true must never restore from an icon event \
+                     (button={button:?}, state={state:?})",
+                );
+            }
+        }
+    }
+
+    /// One physical left click emits exactly one Down and one Up. Under the
+    /// shipped constant that must produce exactly ONE restore.
+    #[test]
+    fn one_physical_left_click_restores_exactly_once() {
+        let restores = [
+            tray_click_action(MouseButton::Left, MouseButtonState::Down, TRAY_MENU_ON_LEFT_CLICK),
+            tray_click_action(MouseButton::Left, MouseButtonState::Up, TRAY_MENU_ON_LEFT_CLICK),
+        ]
+        .into_iter()
+        .filter(|a| *a == TrayClickAction::Restore)
+        .count();
+        assert_eq!(restores, 1, "a single left click must restore exactly once");
     }
 }

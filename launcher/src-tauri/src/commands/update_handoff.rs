@@ -136,7 +136,40 @@ pub struct HandoffResult {
 pub async fn prepare_windows_update_handoff(
     install_root: String,
 ) -> Result<HandoffResult, String> {
-    let install_root_path = PathBuf::from(&install_root);
+    // The command is a thin wrapper. `relaunch: true` is the UPDATE
+    // semantic: the user asked for an update, so the updater brings the
+    // launcher back once the swap lands.
+    prepare_update_handoff_impl(&PathBuf::from(&install_root), true)
+}
+
+/// Shared implementation behind the `prepare_windows_update_handoff` command
+/// and the at-rest exit swap in `services::binary_freshness`.
+///
+/// v0.2.91 wave-2 (WP-F carry-over ii): `binary_freshness::swap_on_exit_impl`
+/// used to carry its own ~12-line copy of the lock-write + detached-spawn
+/// sequence — same wire structs, same creation flags, second copy of the
+/// spawn. That copy is now this call.
+///
+/// `relaunch` is the ONLY behavioural difference between the two callers:
+///   - `true`  → update path: the lock names the launcher as the relaunch
+///     target, so the updater starts it again after swapping.
+///   - `false` → at-rest path: the user QUIT. The swap happens, the process
+///     stays gone, and the fresh binary is what their next manual launch
+///     executes (standing no-auto-restart ruling).
+///
+/// NOT async: every step is synchronous file I/O plus one detached spawn, so
+/// the exit hook (a sync context with no reactor guarantees) can call it
+/// directly.
+///
+/// The caller owns the pre-flight decisions this function does NOT make:
+/// stale-`.new` invalidation and yielding to an already-present updater lock
+/// both live at the call sites (see `stage_and_handoff_after_update` and
+/// `swap_on_exit_impl`).
+pub(crate) fn prepare_update_handoff_impl(
+    install_root_path: &Path,
+    relaunch: bool,
+) -> Result<HandoffResult, String> {
+    let _ = relaunch; // read only on the Windows branch below
     if !install_root_path.is_dir() {
         return Err(format!(
             "install_root not a directory: {}",
@@ -212,7 +245,11 @@ pub async fn prepare_windows_update_handoff(
         let lock = UpdateLock {
             parent_pid: std::process::id(),
             swaps,
-            relaunch: Some(launcher_target.clone()),
+            relaunch: if relaunch {
+                Some(launcher_target.clone())
+            } else {
+                None
+            },
             started_at: Some(chrono::Utc::now().to_rfc3339()),
         };
 
@@ -561,6 +598,45 @@ mod tests {
         assert_eq!(back.parent_pid, 4242);
         assert_eq!(back.swaps.len(), 1);
         assert!(back.relaunch.is_some());
+    }
+
+    // -----------------------------------------------------------------
+    // v0.2.91 wave-2 (WP-F carry-over ii): the shared handoff impl.
+    //
+    // `prepare_update_handoff_impl` is now the ONE home for "write the
+    // updater lock + spawn vct-updater detached"; the update command and
+    // `binary_freshness::swap_on_exit_impl` differ only in `relaunch`.
+    // These pin the cross-OS contract that lets the exit hook (a sync
+    // context) call it at all.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn shared_impl_is_callable_with_both_relaunch_modes() {
+        let td = tempfile::tempdir().expect("tempdir");
+        for relaunch in [true, false] {
+            let res = prepare_update_handoff_impl(td.path(), relaunch)
+                .expect("a valid install root must never error");
+            #[cfg(not(target_os = "windows"))]
+            {
+                assert!(!res.handoff_active);
+                assert_eq!(res.skip_reason.as_deref(), Some("non-windows"));
+            }
+            #[cfg(target_os = "windows")]
+            {
+                // No dist tree in the tempdir → skipped, never a panic and
+                // never a half-written lock.
+                assert!(!res.handoff_active);
+                assert!(res.skip_reason.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn shared_impl_rejects_a_non_directory_install_root() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let not_a_dir = td.path().join("nope");
+        assert!(prepare_update_handoff_impl(&not_a_dir, true).is_err());
+        assert!(prepare_update_handoff_impl(&not_a_dir, false).is_err());
     }
 
     #[test]

@@ -38,6 +38,9 @@ SELF_UPDATE_RS = SRC / "commands" / "self_update.rs"
 LIB_RS = SRC / "lib.rs"
 FRESHNESS_RS = SRC / "services" / "binary_freshness.rs"
 SERVICES_MOD_RS = SRC / "services" / "mod.rs"
+# v0.2.91 wave-2: the at-rest swap delegates its lock-write + detached spawn
+# here, so the no-relaunch invariant is now checked across this seam.
+UPDATE_HANDOFF_RS = SRC / "commands" / "update_handoff.rs"
 
 
 def read(p: Path) -> str:
@@ -117,11 +120,42 @@ class Wi3NonClobberingRevertTests(unittest.TestCase):
         self.assertIn("RevertDecision::KeepCanonicalParkBackup", body)
 
     def test_abort_tail_reports_and_records_an_averted_clobber(self) -> None:
+        """The tail must both REPORT the averted clobber to its caller and
+        RECORD it durably.
+
+        v0.2.91 wave-2 (WP-F carry-over iv): the record is no longer emitted
+        inline here — the tail calls the shared `revert_and_record`, the same
+        helper the launcher self-update surface uses. The invariant is
+        unchanged, so this follows it across the seam instead of asserting on
+        the inlined shape (which would have made a one-home consolidation look
+        like a regression, and a genuine drop of the record look fine as long
+        as the old literal survived somewhere in the window).
+        """
         src = read(INSTALLER_RS)
         start = src.index("fn abort_update_restore_binaries_and_hub(")
         body = src[start : start + 1800]
         self.assertIn("RevertOutcome::ClobberAverted", body)
-        self.assertIn("emit_clobber_averted_condition(", body)
+        self.assertIn(
+            "binary_freshness::revert_and_record(",
+            body,
+            "the abort tail must revert through the shared revert+record helper",
+        )
+        # …and that helper must actually emit the record.
+        freshness = read(FRESHNESS_RS)
+        rec_start = freshness.index("pub(crate) fn revert_and_record_with(")
+        rec_body = freshness[rec_start : rec_start + 1400]
+        self.assertIn("RevertOutcome::ClobberAverted", rec_body)
+        self.assertIn(
+            "emit(",
+            rec_body,
+            "revert_and_record must emit the clobber-averted record",
+        )
+        wrapper = freshness.index("pub(crate) fn revert_and_record(")
+        self.assertIn(
+            "emit_clobber_averted_condition(",
+            freshness[wrapper : wrapper + 600],
+            "the production wrapper must supply the real emitter",
+        )
 
     def test_pop_conflict_site_audits_the_averted_clobber(self) -> None:
         """WI-7 (a) at the RC-1 site specifically."""
@@ -289,11 +323,38 @@ class NoAutoRestartTests(unittest.TestCase):
     """The at-rest swap must not relaunch — the user asked to quit."""
 
     def test_at_rest_swap_lock_carries_no_relaunch(self) -> None:
+        """Quitting means quitting: the at-rest lock must name no relaunch
+        target, or the launcher comes back after the user asked it to go away.
+
+        v0.2.91 wave-2 (WP-F carry-over ii): the lock is written by the shared
+        `prepare_update_handoff_impl`, and `relaunch` is the ONE parameter that
+        distinguishes the two callers. Followed across the seam: the call site
+        must pass `false`, and the impl must map `false` to `relaunch: None`.
+        """
         src = read(FRESHNESS_RS)
         start = src.index("fn swap_on_exit_impl(install_root: &Path)")
         body = src[start : src.index("#[cfg(not(target_os = \"windows\"))]", start)]
-        self.assertIn("relaunch: None", body)
+        self.assertIn(
+            "prepare_update_handoff_impl(install_root, false)",
+            body,
+            "the at-rest swap must ask the shared handoff for a NO-relaunch lock",
+        )
         self.assertNotIn("relaunch: Some(", body)
+
+        handoff = read(UPDATE_HANDOFF_RS)
+        impl_start = handoff.index("pub(crate) fn prepare_update_handoff_impl(")
+        impl_body = handoff[impl_start:]
+        lock_at = impl_body.index("let lock = UpdateLock {")
+        lock_body = impl_body[lock_at : lock_at + 500]
+        self.assertIn("relaunch: if relaunch {", lock_body)
+        self.assertIn("None", lock_body)
+        # The command wrapper is the UPDATE surface: it relaunches.
+        cmd_start = handoff.index("pub async fn prepare_windows_update_handoff(")
+        self.assertIn(
+            "prepare_update_handoff_impl(&PathBuf::from(&install_root), true)",
+            handoff[cmd_start : cmd_start + 900],
+            "the update command must still relaunch after its swap",
+        )
 
     def test_at_rest_arming_defers_to_an_in_flight_update_handoff(self) -> None:
         """An update handoff owns the relaunch; our at-rest lock must not
@@ -334,11 +395,45 @@ class Wi7ObservabilityTests(unittest.TestCase):
             self.assertIn(token, body)
 
     def test_deferrals_route_through_the_locked_shared_emitter(self) -> None:
-        """No raw UPDATE_DEFERRED.md rewrite from this module — a full-file
-        rewrite would drop foreign entries."""
+        """No raw UPDATE_DEFERRED rewrite from this module — a full-file
+        rewrite would drop foreign entries.
+
+        v0.2.91 wave-2: the module also RESOLVES its own records (the WP-B
+        registry pairs `launcher_binary_stale` and
+        `launcher_binary_handoff_skipped_dirty` with probe-driven clears, and
+        the freshness probe is that probe), which needs a cheap read-only
+        "is it even recorded?" pre-check so a healthy install does not spend a
+        python subprocess on every update-check poll. Reading is fine; writing
+        is not. So instead of asserting the filename never appears (a proxy
+        that a read trips just as loudly as a rewrite), state the invariant
+        itself: the names may appear ONLY inside the one read-only presence
+        helper, and that helper may not write.
+        """
         src = read(FRESHNESS_RS)
         self.assertIn("crate::services::deferral::emit_deferral_entry(", src)
-        self.assertNotIn("UPDATE_DEFERRED.md", src)
+        self.assertIn("crate::services::deferral::resolve_deferral_conditions(", src)
+
+        helper_start = src.index("fn condition_is_recorded(")
+        helper_end = src.index("\n}", helper_start) + 2
+        helper = src[helper_start:helper_end]
+
+        # Production code only — `#[cfg(test)]` fixtures legitimately write
+        # their own throwaway report files under a tempdir.
+        production = src[: src.index("mod tests {")].replace(helper, "")
+        for name in ("UPDATE_DEFERRED.md", "UPDATE_DEFERRED.json"):
+            self.assertNotIn(
+                name,
+                production,
+                f"{name} may only be named by the read-only presence helper — "
+                f"every write goes through the locked shared emitter/resolver",
+            )
+
+        for writer in ("fs::write(", "File::create(", "OpenOptions", "remove_file("):
+            self.assertNotIn(
+                writer,
+                helper,
+                f"the presence check must stay read-only (found {writer})",
+            )
 
 
 class FixRoundWiringTests(unittest.TestCase):
@@ -408,11 +503,23 @@ class FixRoundWiringTests(unittest.TestCase):
         start = src.index("fn swap_on_exit_impl(install_root: &Path)")
         body = src[start : src.index('#[cfg(not(target_os = "windows"))]', start)]
         idx_invalidate = body.index("invalidate_stale_new_siblings_for_blocking(")
-        idx_collect = body.index("let mut swaps: Vec<SwapEntry>")
+        # v0.2.91 wave-2 (carry-over ii): the swap list is now built inside the
+        # shared handoff impl, purely from which `<target>.new` siblings exist
+        # on disk. That makes the ORDER load-bearing in exactly the same way:
+        # a stale sibling still present when the handoff runs is a stale
+        # sibling that gets swapped in.
+        idx_delegate = body.index("prepare_update_handoff_impl(")
         self.assertLess(
             idx_invalidate,
-            idx_collect,
-            "the swap list must be built AFTER stale siblings are dropped",
+            idx_delegate,
+            "stale siblings must be dropped BEFORE the handoff reads them",
+        )
+        # And the yield-to-a-real-update check must also precede the handoff,
+        # which overwrites the lock unconditionally.
+        self.assertLess(
+            body.index("lock_path.exists()"),
+            idx_delegate,
+            "the at-rest swap must yield to an in-flight update handoff",
         )
 
     def test_major2b_at_rest_reconcile_stands_down_for_a_running_update(self) -> None:

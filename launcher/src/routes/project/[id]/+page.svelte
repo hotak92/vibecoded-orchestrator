@@ -53,9 +53,26 @@
   // auto-use-vs-show rule.
   import SubagentGitRepoModal from '$lib/components/SubagentGitRepoModal.svelte';
   import type { ProjectView } from '$lib/types/launcher';
+  // v0.2.91 WP-F3 (BUG 4, UI half): the header must not be a one-shot
+  // snapshot. `project` below is loaded ONCE by `loadProject()` (onMount +
+  // when the route id changes); a rename does not change the id, so nothing
+  // re-ran and `<h1>` kept the old name until a full reload while the
+  // top-left selector — a store subscriber — already showed the new one.
+  import { projects, liveProjectFor } from '$lib/stores/projects';
 
   let projectId = $derived($page.params.id);
   let project = $state<ProjectView | null>(null);
+
+  /**
+   * The row the header / meta / banners RENDER: the store row when the store
+   * knows this project (so a rename anywhere — selector, Settings tab, any
+   * future surface — repaints immediately), falling back to the page's own
+   * loaded copy for the window before `projects.load()` has resolved.
+   *
+   * `project` stays the loader for everything else on the page (orchState,
+   * module gates, tab bodies) — this only fixes what is DISPLAYED.
+   */
+  const liveProject = $derived(liveProjectFor($projects.projects, projectId, project));
   // PR-8 (v0.2.11): added 'identity' (project fundamentals: name, KG/code-graph
   // collection names) and 'access' (cross-project KG read levels +
   // code-graph grants). Position 'identity' first so it's the first
@@ -336,11 +353,12 @@
       ← Back
     </button>
     <div class="project-title">
-      <h1>{project?.name ?? 'Project'}</h1>
-      {#if project}
+      <!-- WP-F3: renders the LIVE row (store-derived), not the one-shot load. -->
+      <h1>{liveProject?.name ?? 'Project'}</h1>
+      {#if liveProject}
         <p class="project-meta">
-          <code>{project.folder_path}</code>
-          <span class="host-badge host-{project.host}">{project.host}</span>
+          <code>{liveProject.folder_path}</code>
+          <span class="host-badge host-{liveProject.host}">{liveProject.host}</span>
         </p>
       {/if}
     </div>
@@ -387,7 +405,12 @@
          rule. -->
     <KgSummaryBanner projectId={project.id} />
     <KgSyncBanner projectId={project.id} />
-    <CodeGraphBuildBanner projectId={project.id} projectName={project.name} />
+    <!-- WP-F3: the banner prints the project NAME, so it takes the live row
+         too — otherwise it kept announcing the pre-rename name. -->
+    <CodeGraphBuildBanner
+      projectId={project.id}
+      projectName={liveProject?.name ?? project.name}
+    />
   {/if}
 
   <!--

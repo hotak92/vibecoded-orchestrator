@@ -1321,6 +1321,25 @@ pub(crate) fn build_deferral_text(
     cmd_lines.push("#".to_string());
     cmd_lines.push("# Auto-merged files were already written to the working tree;".to_string());
     cmd_lines.push("# review them with `git diff HEAD`.".to_string());
+    // v0.2.91 WP-B: name the THIRD exit. Before the registry this condition was
+    // immortal in practice — a user who had decided to keep their local edits
+    // had no way to retire the entry, so it sat in the ledger for weeks. The
+    // registry gives it `dismiss_key = ["preserved_sidecars"]`, so a dismissal
+    // holds only while the preserved set is unchanged: a LATER update that
+    // preserves different files re-raises it rather than being swallowed.
+    cmd_lines.push("#".to_string());
+    cmd_lines.push(
+        "# Or silence this entry (holds until the preserved set changes):".to_string(),
+    );
+    // `--folder .` (not a `<install>` placeholder): every other command line in
+    // this block — the `mv`/`rm` pairs above — is repo-relative and assumes the
+    // user is standing in the install root, so a placeholder here is the one
+    // line they cannot copy-paste.
+    cmd_lines.push(
+        "#   python -m vco_lib.project_init dismiss-deferral --folder . \
+         --condition-id orchestrator_user_modified_preserved"
+            .to_string(),
+    );
     let command_to_apply = cmd_lines.join("\n");
     (title, detected, why_deferred, command_to_apply)
 }
@@ -3541,6 +3560,62 @@ mod tests {
             cmd.contains("knowledge/concepts/foo.md.from-upstream-7b255dd"),
             "cmd missing sidecar path: {}",
             cmd
+        );
+    }
+
+    /// v0.2.91 WP-B: the THIRD exit. `orchestrator_user_modified_preserved`
+    /// was immortal in practice — accept-upstream and keep-local were the only
+    /// documented paths, and a user who chose keep-local had nothing that
+    /// retired the entry. The registry gives it a dismissal keyed on
+    /// `preserved_sidecars`; this pins that the entry SAYS so, because a
+    /// mechanism nobody is told about is the same as no mechanism.
+    #[test]
+    fn build_deferral_text_names_the_dismiss_escape_hatch() {
+        let install = Path::new("/tmp/install");
+        let outcome_preserved = MergeOutcome {
+            path: PathBuf::from("knowledge/concepts/foo.md"),
+            kind: MergeOutcomeKind::PreservedWithUpstreamSidecar {
+                upstream_sidecar_path: install
+                    .join("knowledge/concepts/foo.md.from-upstream-7b255dd"),
+                ours_sha: "abc1234".to_string(),
+                theirs_sha: "7b255dd".to_string(),
+            },
+        };
+        let actionable = vec![&outcome_preserved];
+        let (_, _, _, cmd) = build_deferral_text(install, &actionable, "main");
+
+        assert!(
+            cmd.contains("# Or silence this entry (holds until the preserved set changes):"),
+            "cmd missing the dismiss lead-in: {}",
+            cmd,
+        );
+        // The full invocation must be on ONE line — a wrapped command is a
+        // command the user cannot copy-paste.
+        let line = cmd
+            .lines()
+            .find(|l| l.contains("dismiss-deferral"))
+            .unwrap_or_else(|| panic!("no dismiss-deferral line in: {}", cmd));
+        assert!(
+            line.contains("python -m vco_lib.project_init dismiss-deferral")
+                && line.contains("--folder .")
+                && line.contains("--condition-id orchestrator_user_modified_preserved"),
+            "dismiss line is not a complete invocation: {}",
+            line,
+        );
+        // wave-2 NIT-2: `.` not a placeholder. The `mv`/`rm` lines above are
+        // repo-relative, so the whole block is copy-pasteable from the install
+        // root — a `<install>` placeholder made this the one line that wasn't.
+        assert!(
+            !line.contains('<') && !line.contains('>'),
+            "dismiss line must carry no placeholder to fill in: {}",
+            line,
+        );
+        // It must stay a COMMENT: UPDATE_DEFERRED.md's command block is read
+        // by humans, and an uncommented line reads as "run me first".
+        assert!(
+            line.trim_start().starts_with('#'),
+            "dismiss line must be commented out: {}",
+            line,
         );
     }
 

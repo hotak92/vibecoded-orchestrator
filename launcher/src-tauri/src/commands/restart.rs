@@ -173,6 +173,60 @@ pub struct LauncherRestartStatus {
     /// Full "Detected" prose for the swap-failed case — surfaced verbatim
     /// in the red recovery banner.
     pub failure_detail: Option<String>,
+
+    // -- v0.2.91 WP-A/WI-1 surfacing (wave-2 carry-over i) ----------------
+    /// True iff a `launcher_binary_stale` entry is present: the binary on
+    /// disk is NOT the binary this process is executing.
+    ///
+    /// Distinct from `restart_required`, which means "an update just swapped
+    /// a NEW binary in, click to restart". This one means "the running
+    /// process is behind what git says is on disk" — detected AT REST by the
+    /// boot / update-check freshness probe, with no update in flight and no
+    /// button that can fix it: replacing a running executable is the user's
+    /// call (standing no-auto-restart ruling), so the banner is honest and
+    /// persistent rather than actionable.
+    pub binary_stale: bool,
+    /// Version this launcher PROCESS is running, parsed from the entry.
+    pub stale_running_version: Option<String>,
+    /// Version the dist sidecar ON DISK declares, parsed from the entry.
+    pub stale_on_disk_version: Option<String>,
+    /// Full "Detected" prose for the stale-binary case (names all three
+    /// signals + what was staged). Rendered behind a disclosure.
+    pub stale_detail: Option<String>,
+}
+
+/// Parse the `launcher_binary_stale` section into the banner's fields.
+///
+/// Split out as a pure fn so the parse is unit-testable without a temp
+/// install root or the async command wrapper. Every field is best-effort:
+/// an entry whose prose changed shape still sets `binary_stale = true` and
+/// the banner falls back to generic copy.
+fn binary_stale_fields(section: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let detail = section
+        .lines()
+        .find(|l| l.starts_with("**Detected**:"))
+        .map(|l| l.trim_start_matches("**Detected**:").trim().to_string());
+
+    // Emitted by `binary_freshness::emit_binary_stale_condition` as:
+    //   "The launcher process is running v<A>, the dist sidecar on disk
+    //    declares v<B>, and `git status ...`"
+    // MUST MATCH that format string; a wording change degrades to None
+    // (generic banner copy), never to a wrong version.
+    let grab = |after: &str| -> Option<String> {
+        let tail = detail.as_deref()?.split(after).nth(1)?;
+        let v: String = tail
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != ',')
+            .collect();
+        if v.is_empty() {
+            None
+        } else {
+            Some(v)
+        }
+    };
+    let running = grab("process is running v");
+    let on_disk = grab("on disk declares v");
+    (running, on_disk, detail)
 }
 
 /// Tauri command: read `<install_root>/.claude/context/UPDATE_DEFERRED.md`
@@ -200,6 +254,13 @@ pub async fn get_launcher_restart_status(
 
     let mut restart_section = extract_section(&content, "launcher_restart_required");
     let locked_section = extract_section(&content, "launcher_binary_swap_failed_locked");
+    // v0.2.91 (wave-2 carry-over i): the WI-1 at-rest condition. The cid
+    // constant is IMPORTED from its emitter rather than retyped — the two
+    // sides of this string cannot drift.
+    let stale_section = extract_section(
+        &content,
+        crate::services::binary_freshness::CID_BINARY_STALE,
+    );
 
     // v0.2.54 Track D (Theme 5): stale-entry self-clear. If the
     // restart entry was written BEFORE this launcher process started,
@@ -237,8 +298,16 @@ pub async fn get_launcher_restart_status(
     let mut status = LauncherRestartStatus {
         restart_required: restart_section.is_some(),
         swap_failed_locked: locked_section.is_some(),
+        binary_stale: stale_section.is_some(),
         ..Default::default()
     };
+
+    if let Some(section) = stale_section.as_deref() {
+        let (running, on_disk, detail) = binary_stale_fields(section);
+        status.stale_running_version = running;
+        status.stale_on_disk_version = on_disk;
+        status.stale_detail = detail;
+    }
 
     if let Some(section) = restart_section.as_deref() {
         // Title format: "Launcher binary updated to <version>"
@@ -670,6 +739,107 @@ condition_ids: [launcher_restart_required]
         // After stripping, only frontmatter + header should remain.
         assert!(!out.contains("## launcher_restart_required"));
         assert!(out.contains("VCO Update Deferred"));
+    }
+
+    // -----------------------------------------------------------------
+    // v0.2.91 wave-2 carry-over (i): `launcher_binary_stale` banner slice.
+    //
+    // Pre-fix `LauncherRestartStatus` had no `binary_stale` field and the
+    // command never looked for the section, so the WI-1 condition was
+    // durable-on-disk and invisible in the GUI.
+    // -----------------------------------------------------------------
+
+    /// Realistic entry, byte-shaped like `emit_binary_stale_condition`'s
+    /// output rendered by the deferral writer.
+    ///
+    /// wave-2 NIT-9: the `**Disposition**:` line is part of the real wire —
+    /// `deferral_report._render_entry` writes it between `**Title**` and
+    /// `**Detected**` for EVERY entry. A fixture missing it would let a parser
+    /// that (wrongly) assumed Detected follows Title directly pass here and
+    /// fail on the real file.
+    fn stale_doc() -> String {
+        format!(
+            "---\ncondition_ids: [{cid}]\n---\n\n# VCO Update Deferred\n\n\
+             ## {cid} (warning)\n\n\
+             **Title**: Launcher is running an older binary than the one on disk\n\n\
+             **Disposition**: action_required\n\n\
+             **Detected**: The launcher process is running v0.2.88, the dist sidecar on disk \
+             declares v0.2.91, and `git status --porcelain -- launcher/dist/windows-x64/` \
+             reports the dist tree as DIRTY (diverged from HEAD). That means the binary git \
+             says should be on disk is NOT the binary that is executing. Staged this pass: \
+             launcher/dist/windows-x64/vct-launcher.exe.\n\n\
+             **Detected at**: 2026-08-26T10:00:00Z\n\n---\n",
+            cid = crate::services::binary_freshness::CID_BINARY_STALE,
+        )
+    }
+
+    /// The cid must be SHARED with its emitter, not retyped. A literal here
+    /// looks identical today and silently stops matching the day the emitter
+    /// renames the condition — the banner would then just never appear again,
+    /// with no failing test and no error anywhere.
+    #[test]
+    fn the_stale_cid_is_imported_not_retyped() {
+        let src = include_str!("restart.rs");
+        let code = src.split("mod tests").next().unwrap();
+        assert!(
+            code.contains(concat!("binary_freshness::CID_BINARY", "_STALE")),
+            "restart.rs must read the cid from its emitter",
+        );
+        assert!(
+            !code.contains(concat!("\"launcher_binary", "_stale\"")),
+            "a hardcoded cid literal can drift away from the emitter unnoticed",
+        );
+    }
+
+    #[test]
+    fn binary_stale_section_is_extracted_by_the_emitters_own_cid() {
+        let doc = stale_doc();
+        let section = extract_section(&doc, crate::services::binary_freshness::CID_BINARY_STALE)
+            .expect("the stale section must be found by the shared cid constant");
+        assert!(section.contains("**Detected**:"));
+    }
+
+    #[test]
+    fn binary_stale_fields_parse_both_versions_and_the_prose() {
+        let doc = stale_doc();
+        let section =
+            extract_section(&doc, crate::services::binary_freshness::CID_BINARY_STALE).unwrap();
+        let (running, on_disk, detail) = binary_stale_fields(&section);
+        assert_eq!(running.as_deref(), Some("0.2.88"));
+        assert_eq!(on_disk.as_deref(), Some("0.2.91"));
+        assert!(
+            detail.unwrap().contains("NOT the binary that is executing"),
+            "the full prose must survive for the disclosure",
+        );
+    }
+
+    /// Leave-alone leg: a reworded entry must NOT produce a wrong version —
+    /// it degrades to None (generic banner copy) while still flagging stale.
+    #[test]
+    fn binary_stale_fields_degrade_to_none_on_unknown_prose() {
+        let section = "## launcher_binary_stale (warning)\n\n**Detected**: something else \
+                       entirely.\n\n---\n";
+        let (running, on_disk, detail) = binary_stale_fields(section);
+        assert_eq!(running, None);
+        assert_eq!(on_disk, None);
+        assert_eq!(detail.as_deref(), Some("something else entirely."));
+    }
+
+    #[test]
+    fn binary_stale_absent_when_no_such_entry() {
+        let body = "---\ncondition_ids: [other_thing]\n---\n\n## other_thing (warning)\n\n---\n";
+        assert!(
+            extract_section(body, crate::services::binary_freshness::CID_BINARY_STALE).is_none(),
+        );
+    }
+
+    /// The three banner states are independent: a stale-binary entry must not
+    /// make the FE think a one-click restart is available.
+    #[test]
+    fn stale_entry_does_not_imply_restart_required() {
+        let doc = stale_doc();
+        assert!(extract_section(&doc, "launcher_restart_required").is_none());
+        assert!(extract_section(&doc, "launcher_binary_swap_failed_locked").is_none());
     }
 
     #[test]

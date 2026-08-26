@@ -31,12 +31,26 @@
   import { toast } from '$lib/stores/toast';
   import { orchestrator } from '$lib/stores/orchestrator';
 
+  //   - `binary_stale` (amber banner, v0.2.91 WP-A/WI-1): detected AT REST by
+  //     the boot / update-check freshness probe — the binary on disk is not
+  //     the binary this process is executing (a frozen exe over advanced
+  //     source; the field failure that produced a launcher stuck two releases
+  //     behind with no code path able to repair it). Deliberately has NO
+  //     action button: replacing a running executable is the user's call
+  //     (standing no-auto-restart ruling), so the banner states the two
+  //     versions and the one manual action instead of pretending to fix it.
+
   interface LauncherRestartStatus {
     restart_required: boolean;
     swap_failed_locked: boolean;
     new_version: string | null;
     new_binary_path: string | null;
     failure_detail: string | null;
+    // v0.2.91 WI-1 surfacing.
+    binary_stale: boolean;
+    stale_running_version: string | null;
+    stale_on_disk_version: string | null;
+    stale_detail: string | null;
   }
 
   let status = $state<LauncherRestartStatus | null>(null);
@@ -66,7 +80,7 @@
       if (next) {
         // If status moved from "something" -> "nothing", auto-undismiss
         // for the next time an entry appears.
-        if (!next.restart_required && !next.swap_failed_locked) {
+        if (!next.restart_required && !next.swap_failed_locked && !next.binary_stale) {
           status = next;
           dismissed = false;
         } else {
@@ -106,7 +120,7 @@
 
   let visible = $derived.by(() => {
     if (!status || dismissed) return false;
-    return status.restart_required || status.swap_failed_locked;
+    return status.restart_required || status.swap_failed_locked || status.binary_stale;
   });
 </script>
 
@@ -188,6 +202,45 @@
             onclick={() => (dismissed = true)}
             disabled={restarting}
           >Later</button>
+        </div>
+      </div>
+    </div>
+  {:else if status.binary_stale}
+    <!-- Amber banner (v0.2.91 WI-1): the running process is behind the
+         binary on disk. No button by design — the launcher does not replace
+         its own running executable, and it never restarts or quits itself
+         (standing ruling). The honest statement IS the fix path. -->
+    <div class="lrb-banner lrb-stale" role="status" aria-live="polite">
+      <div class="lrb-row">
+        <span class="lrb-glyph" aria-hidden="true">⌛</span>
+        <div class="lrb-text">
+          <div class="lrb-label">
+            {#if status.stale_running_version && status.stale_on_disk_version}
+              Running launcher {status.stale_running_version} — {status.stale_on_disk_version}
+              is on disk
+            {:else}
+              The launcher on disk is newer than the one running
+            {/if}
+          </div>
+          <div class="lrb-detail">
+            Quit the launcher completely (tray icon → Quit) and start it again to
+            load it. Nothing restarts on its own, and closing the window to the
+            tray is not enough — the process has to exit.
+            {#if status.stale_detail}
+              <details class="lrb-details">
+                <summary>Show what was detected</summary>
+                <pre class="lrb-pre">{status.stale_detail}</pre>
+              </details>
+            {/if}
+          </div>
+        </div>
+        <div class="lrb-actions">
+          <button
+            type="button"
+            class="lrb-btn-x"
+            aria-label="Dismiss banner"
+            onclick={() => (dismissed = true)}
+          >×</button>
         </div>
       </div>
     </div>
@@ -327,6 +380,18 @@
   .lrb-restart .lrb-glyph {
     background: rgba(70, 200, 120, 0.25);
     color: rgb(140, 230, 175);
+  }
+
+  /* v0.2.91 WI-1: amber — informational-but-persistent. Distinct from the
+     green "one click and you're done" and the red "recovery required". */
+  .lrb-stale {
+    background: rgba(240, 180, 60, 0.10);
+    border-bottom-color: rgba(240, 180, 60, 0.35);
+    color: rgb(240, 205, 130);
+  }
+  .lrb-stale .lrb-glyph {
+    background: rgba(240, 180, 60, 0.22);
+    color: rgb(245, 210, 140);
   }
 
   .lrb-locked {

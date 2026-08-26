@@ -159,7 +159,61 @@ class MacArchAwareDistSlots(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class LauncherDrivenStage1Guard(unittest.TestCase):
-    def test_auto_restart_guard_precedes_stage1_invocation(self):
+    """C-5: EVERY stage1 spawn site must be guarded.
+
+    v0.2.91 (WP-F carry-over iii): this class used to locate the call site
+    with a single `str.find(...)`, which sees only the FIRST occurrence. When
+    v0.2.91's WI-5 repair leg added a SECOND invocation
+    (`invoke_stage1=lambda …`, handed to `vco_lib.dist_binary_repair
+    .run_repair_leg`), the test kept passing on the first site and would have
+    said nothing about the new one — and a launcher-driven run that spawns its
+    own updater is exactly the double-updater / 30 s parent-wait timeout C-5
+    exists to prevent. Now every site is enumerated and checked, and the
+    delegated site's guard is followed across the module boundary into
+    vco_lib rather than trusted because the string happens to be nearby.
+    """
+
+    CALL = "_try_invoke_windows_stage1_updater("
+
+    @staticmethod
+    def _enclosing_function(src: str, idx: int) -> str:
+        """Source of the module-level function containing `idx`, up to `idx`.
+
+        A fixed-size character window is NOT good enough: a 3000-char lookback
+        bleeds into the PRECEDING function, so a site whose own guard was
+        deleted still "passes" on a neighbour's copy of the string. Bounding
+        the search at the enclosing `def` is what makes the assertion mean
+        what it says. (Found by red-proofing this very test: with the guard
+        removed at the delegated site, the character-window version stayed
+        green.)
+        """
+        start = src.rfind("\ndef ", 0, idx)
+        return src[start if start >= 0 else 0 : idx]
+
+    def _call_sites(self, src: str) -> list:
+        """Byte offsets of every INVOCATION (the `def` line excluded)."""
+        sites, at = [], 0
+        while True:
+            idx = src.find(self.CALL, at)
+            if idx < 0:
+                return sites
+            at = idx + 1
+            line_start = src.rfind("\n", 0, idx) + 1
+            if src[line_start:idx].lstrip().startswith("def "):
+                continue  # the definition itself
+            sites.append(idx)
+
+    def test_every_stage1_call_site_is_enumerated(self):
+        src = (REPO_ROOT / "install.py").read_text(encoding="utf-8")
+        sites = self._call_sites(src)
+        self.assertGreaterEqual(
+            len(sites), 2,
+            "expected at least two stage1 invocation sites (the sharing-violation "
+            "branch and the WI-5 repair leg); a single-site scan is what let the "
+            "second one ship unchecked",
+        )
+
+    def test_auto_restart_guard_precedes_every_stage1_invocation(self):
         """Within the Windows sharing-violation branch, the
         VCT_AUTO_RESTART_LAUNCHER=1 guard must short-circuit BEFORE
         `_try_invoke_windows_stage1_updater` is reached. Pre-v0.2.54,
@@ -169,19 +223,66 @@ class LauncherDrivenStage1Guard(unittest.TestCase):
         update.lock.json (spurious failure toast) and a brief
         two-updaters window."""
         src = (REPO_ROOT / "install.py").read_text(encoding="utf-8")
-        # Locate the stage1 call site (skip the function's own def).
-        call_idx = src.find("lock_path = _try_invoke_windows_stage1_updater(")
-        self.assertGreater(call_idx, 0, "stage1 call site missing")
-        # The guard must appear in the ~3000 chars immediately before the
-        # call (same branch, after the .new staging).
-        window = src[max(0, call_idx - 3000):call_idx]
-        self.assertIn("VCT_AUTO_RESTART_LAUNCHER", window, (
-            "C-5 regression: the launcher-driven guard no longer "
-            "precedes the stage1 updater spawn"
-        ))
-        self.assertIn("swap_succeeded = True", window, (
-            "C-5: the launcher-driven path must mark the swap as "
-            "logically succeeded (staged .new; launcher handoff swaps)"
+        sites = self._call_sites(src)
+        self.assertTrue(sites, "stage1 call site missing")
+        for idx in sites:
+            # The guard must appear inside the SAME function, before the call.
+            window = self._enclosing_function(src, idx)
+            self.assertIn("VCT_AUTO_RESTART_LAUNCHER", window, (
+                f"C-5 regression: the launcher-driven guard no longer "
+                f"precedes the stage1 updater spawn at offset {idx}"
+            ))
+
+    def test_direct_invocation_marks_the_swap_logically_succeeded(self):
+        """The site that spawns the updater INLINE owns the
+        `swap_succeeded = True` bookkeeping (the delegated site's equivalent
+        lives in vco_lib — see the next test)."""
+        src = (REPO_ROOT / "install.py").read_text(encoding="utf-8")
+        direct = [
+            i for i in self._call_sites(src)
+            if src[src.rfind("\n", 0, i) + 1:i].lstrip().startswith("lock_path =")
+        ]
+        self.assertTrue(direct, "the inline stage1 invocation disappeared")
+        for idx in direct:
+            window = self._enclosing_function(src, idx)
+            self.assertIn("swap_succeeded = True", window, (
+                "C-5: the launcher-driven path must mark the swap as "
+                "logically succeeded (staged .new; launcher handoff swaps)"
+            ))
+
+    def test_delegated_invocation_threads_the_guard_into_vco_lib(self):
+        """The WI-5 repair leg passes the spawner as a CALLBACK, so its guard
+        is not textually adjacent — it is `launcher_driven=`, evaluated inside
+        `run_repair_leg`. Follow it: the flag must be threaded from install.py
+        AND must short-circuit before `invoke_stage1` is ever called, or the
+        callback fires on a launcher-driven run."""
+        src = (REPO_ROOT / "install.py").read_text(encoding="utf-8")
+        delegated = [
+            i for i in self._call_sites(src)
+            if "invoke_stage1=" in src[src.rfind("\n", 0, i) + 1:i]
+        ]
+        self.assertTrue(
+            delegated,
+            "the WI-5 repair leg no longer hands a stage1 invoker to run_repair_leg",
+        )
+        for idx in delegated:
+            window = self._enclosing_function(src, idx)
+            self.assertIn(
+                'launcher_driven=os.environ.get("VCT_AUTO_RESTART_LAUNCHER"',
+                window,
+                "the repair leg must thread the LIVE guard into run_repair_leg — "
+                "a hardcoded `launcher_driven=` is the same regression with a "
+                "keyword in front of it",
+            )
+
+        leg = (REPO_ROOT / "vco_lib" / "dist_binary_repair.py").read_text(encoding="utf-8")
+        guard = leg.find("if launcher_driven:")
+        call = leg.find("invoke_stage1(")
+        self.assertGreater(guard, 0, "run_repair_leg lost its C-5 guard")
+        self.assertGreater(call, 0, "run_repair_leg no longer invokes the spawner")
+        self.assertLess(guard, call, (
+            "C-5 regression: run_repair_leg reaches invoke_stage1 without the "
+            "launcher-driven short-circuit having had its say"
         ))
 
 

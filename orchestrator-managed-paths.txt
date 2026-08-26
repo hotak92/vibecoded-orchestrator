@@ -53,3 +53,4 @@ vct-module.json
 orchestrator-managed-paths.txt
 vco_lib/bundled_mcp_versions.toml
 vco_lib/mcp_scan_rules.toml
+vco_lib/deferral_conditions.toml
