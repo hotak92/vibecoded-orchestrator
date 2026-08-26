@@ -5545,93 +5545,30 @@ def _current_template_reference_hashes(folder: Path) -> dict[str, str]:
     return hashes
 
 
-def _stored_template_dismissal_hashes(folder: Path) -> Optional[dict[str, str]]:
-    """Return the reference-hash snapshot stored at the last dismissal, or
-    ``None`` when there is no recorded dismissal.
-
-    Reads ``dismissals.template_review_pending.reference_hashes`` from the
-    manifest. ``None`` (no dismissal recorded) is distinct from ``{}`` (a
-    dismissal recorded when NO sidecars existed) — both are handled by the
-    suppression predicate.
-    """
-    manifest = _read_manifest(folder)
-    dismissals = manifest.get("dismissals")
-    if not isinstance(dismissals, dict):
-        return None
-    entry = dismissals.get(_TEMPLATE_REVIEW_DISMISSAL_KEY)
-    if not isinstance(entry, dict):
-        return None
-    stored = entry.get("reference_hashes")
-    if not isinstance(stored, dict):
-        return None
-    # Coerce to a clean str->str map (defensive against manifest tampering).
-    return {str(k): str(v) for k, v in stored.items() if isinstance(v, str)}
-
-
 def _template_review_dismissal_suppresses(folder: Path) -> bool:
-    """True when a prior dismissal is still valid: EVERY stored reference hash
-    equals the CURRENT sidecar hash (VCO shipped no new reference since the
-    dismissal). Any missing/changed reference ⇒ False (re-emit).
+    """True when a recorded dismissal still covers the CURRENT reference set.
 
-    Suppression rule (D9):
-      * No dismissal recorded (``stored is None``) ⇒ False (never suppress).
-      * A stored key whose sidecar is now missing/unhashable (absent from
-        ``current``) ⇒ changed ⇒ False.
-      * A stored key whose current hash differs ⇒ changed ⇒ False.
-      * All stored keys present AND equal ⇒ True (suppress). An empty stored
-        map (dismissed when no sidecars existed) trivially satisfies "all
-        equal" — but if sidecars EXIST now that weren't hashed at dismissal
-        time, that's a genuinely new reference set, so those are treated as
-        changed too (an empty stored map with any current sidecar ⇒ False).
+    v0.2.91 WP-B item 5: this is now a THIN ADAPTER over the ONE shared
+    dismissal mechanism (:mod:`vco_lib.deferral_dismissal`) instead of a
+    bespoke per-family implementation. The v0.2.83 D9 semantics are preserved
+    exactly — suppression holds while every reference-sidecar hash is unchanged,
+    and the moment VCO ships a new reference (any hash differs, a tracked
+    sidecar disappears, or a new one appears) the key changes and the nudge
+    re-emits — because the shared key is computed over the SAME
+    ``reference_hashes`` mapping, canonicalised.
+
+    Pre-v0.2.91 dismissals (which stored only ``reference_hashes``, with no
+    ``key``) keep suppressing: ``deferral_dismissal.stored_key`` recomputes the
+    modern key from that legacy payload. An upgrade must never silently
+    un-dismiss something the user already silenced.
     """
-    stored = _stored_template_dismissal_hashes(folder)
-    if stored is None:
-        return False
-    current = _current_template_reference_hashes(folder)
-    if not stored:
-        # Dismissed when no sidecars were hashed. If sidecars exist now, that's
-        # new reference content the user hasn't reviewed → re-emit.
-        return not current
-    for base_name, stored_hash in stored.items():
-        if current.get(base_name) != stored_hash:
-            return False
-    # Every recorded reference still matches. A NEW sidecar that wasn't part of
-    # the dismissal snapshot is also "new content" → re-emit.
-    for base_name in current:
-        if base_name not in stored:
-            return False
-    return True
+    from vco_lib import deferral_dismissal as _dd
 
-
-def _store_template_review_dismissal(folder: Path) -> None:
-    """Snapshot the current reference-sidecar hashes into the manifest under
-    ``dismissals.template_review_pending`` (D9 writer).
-
-    Best-effort + SILENT: called from ``_cmd_dismiss_deferral`` AFTER the
-    dismissal itself succeeds. Never raises into the caller and never writes to
-    stdout/stderr (the dismiss command's JSON payload + stderr contract must
-    stay byte-stable). A missing manifest is created (schema_version 2); a
-    corrupt manifest is replaced with a fresh schema-2 shell carrying only the
-    dismissal (the manifest's `files`/`preserved_files` will be rebuilt on the
-    next install run).
-    """
-    try:
-        manifest = _read_manifest(folder)
-        dismissals = manifest.get("dismissals")
-        if not isinstance(dismissals, dict):
-            dismissals = {}
-        dismissals[_TEMPLATE_REVIEW_DISMISSAL_KEY] = {
-            "reference_hashes": _current_template_reference_hashes(folder),
-            "dismissed_at": datetime.now(timezone.utc).strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            ),
-        }
-        manifest["dismissals"] = dismissals
-        # Preserve schema_version; _read_manifest already defaults it to 2.
-        manifest.setdefault("schema_version", _MANIFEST_SCHEMA_VERSION)
-        _write_manifest_atomic(folder, manifest)
-    except Exception:  # noqa: BLE001 — dismissal memory is best-effort
-        pass
+    return _dd.dismissal_suppresses(
+        folder,
+        _TEMPLATE_REVIEW_DISMISSAL_KEY,
+        _dd.fields_for(folder, _TEMPLATE_REVIEW_DISMISSAL_KEY),
+    )
 
 
 def _emit_template_review_pending_deferral(
@@ -5653,10 +5590,21 @@ def _emit_template_review_pending_deferral(
     since (VCO shipped no new guidance), suppress re-emission. The moment VCO
     ships a new reference, the dismissal snapshot no longer matches and the
     nudge re-emits.
+
+    v0.2.91 WP-B: that memory is now the GENERALIZED mechanism
+    (:mod:`vco_lib.deferral_dismissal`, key = cid + the registry-declared
+    ``dismiss_key`` fields) rather than a per-family implementation, and the
+    entry CARRIES its key fields so a dismissal never has to re-derive them.
+    The condition is also tiered ``informational_record`` (decision #7) so it
+    collapses under the ledger's records fold instead of competing with real
+    work — 13/13 projects showing this nudge was the field's loudest noise.
     """
     if not diverged_files:
         return
-    # v0.2.83 B-F7/D9: honour a still-valid content-keyed dismissal.
+    from vco_lib import deferral_dismissal as _dd
+
+    # Honour a still-valid dismissal (v0.2.83 B-F7/D9 semantics, shared impl).
+    dismiss_fields = _dd.fields_for(folder, "template_review_pending")
     if _template_review_dismissal_suppresses(folder):
         _log_auto("template_review_pending suppressed (references unchanged "
                   "since dismissal)")
@@ -5701,6 +5649,9 @@ def _emit_template_review_pending_deferral(
         command_to_apply=cmd,
         severity="info",
         kg_node_refs=[],
+        # v0.2.91 WP-B: carry the dismissal identity on the entry so
+        # `dismiss-deferral` records the key without re-deriving it.
+        dismiss_fields=dismiss_fields,
     )
     # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
     _de.emit(folder, entry)
@@ -11082,6 +11033,31 @@ def _codegraph_wrapper_still_stale(folder: Path) -> bool:
     return False
 
 
+def _probe_resolvable_deferrals(folder: Path, report) -> list[str]:
+    """Condition ids whose registry-declared probe says they are provably over.
+
+    v0.2.91 WP-B. A thin adapter over the ONE shared dispatcher
+    (:func:`vco_lib.deferral_probes.resolvable_condition_ids`) so the bundle
+    update and install.py's re-probe pass can never disagree about what a probe
+    verdict means. Read-only and tri-state — ONLY a positive "no longer applies"
+    resolves; "still applies" and "could not determine" both leave the entry
+    alone. That asymmetry is the safety property: a probe that cannot run must
+    never look like a resolution.
+
+    Probes needing install.py-supplied extras (the launcher-binary ones, which
+    depend on the OS→dist-dir mapping install.py owns) get no extras here and
+    correctly decline, so the bundle leg simply passes on them.
+
+    Never raises — a probe failure must not break a bundle update.
+    """
+    try:
+        from vco_lib import deferral_probes as _dp
+
+        return _dp.resolvable_condition_ids(folder, report)
+    except Exception:  # noqa: BLE001 — probing is best-effort
+        return []
+
+
 def _reconcile_bundle_deferrals(
     folder: Path,
     *,
@@ -11179,8 +11155,18 @@ def _reconcile_bundle_deferrals(
             else still_user_secret_retained
         )
 
-    if not initial_ids & set(bundle_conditions):
-        # Nothing on-disk we own → no reconciliation to do.
+    # v0.2.91 WP-B item 3 (decision #5) — RE-PROBE PROMOTION, bundle leg.
+    #
+    # Registry-declared read-only probes run here too, so an entry gets its
+    # lifecycle from EVERY update surface (orchestrator `install.py --update`
+    # AND per-project bundle update), not just the one its author happened to
+    # wire. Tri-state: only a positive False ("provably over") resolves;
+    # True/None keep the entry. Probes needing install.py-supplied extras (the
+    # launcher-binary ones) return None here and are simply left alone.
+    probe_resolved = _probe_resolvable_deferrals(folder, report)
+
+    if not (initial_ids & set(bundle_conditions)) and not probe_resolved:
+        # Nothing on-disk we own or can probe → no reconciliation to do.
         return
 
     # Which owned conditions are on-disk AND no longer applicable this run.
@@ -11188,6 +11174,7 @@ def _reconcile_bundle_deferrals(
         cid for cid, still_applicable in bundle_conditions.items()
         if not still_applicable and cid in initial_ids
     ]
+    to_resolve.extend(cid for cid in probe_resolved if cid not in to_resolve)
     if not to_resolve:
         return
 
@@ -13883,19 +13870,39 @@ def _cmd_dismiss_deferral(args: argparse.Namespace) -> int:
     # locked_report) — the non-reentrancy contract holds.
     from vco_lib import deferral_emit as _de
 
+    dismissed_entry = None
     with _de.locked_report(folder) as locked:
+        # Capture the entry BEFORE resolving it: its `dismiss_fields` are the
+        # authoritative current values of the dismissal identity, and after
+        # mark_resolved it is gone.
+        dismissed_entry = locked.entry_for(condition_id)
         locked.mark_resolved(condition_id)
         remaining = len(locked.entries)
     # `locked_report` writes + deletes-when-empty + strips the CLAUDE.md
     # reminder block on exit — same side effects as the prior direct write.
 
-    # v0.2.83 PLAN-v0283 B-F7 + D9: content-keyed dismissal memory. When the
-    # user dismisses `template_review_pending`, snapshot the current reference-
-    # sidecar hashes so the producer suppresses re-emission until VCO ships a
-    # genuinely new reference. Best-effort + SILENT (never touches the JSON
-    # payload / stderr contract, never raises).
-    if condition_id == "template_review_pending":
-        _store_template_review_dismissal(folder)
+    # v0.2.83 B-F7/D9 → v0.2.91 WP-B: dismissal MEMORY, now generalized.
+    #
+    # Snapshot the dismissal identity so the producer can suppress re-emission
+    # until the underlying state actually changes. What changed in v0.2.91 is
+    # the scope: this used to fire only for `template_review_pending` through a
+    # bespoke helper, so every other recurring condition — most visibly
+    # `dual_ollama_detected`, which is re-detected on EVERY run — re-emitted on
+    # the next update no matter how many times the user dismissed it. Now any
+    # condition that declares a `dismiss_key` in the registry gets the same
+    # memory through the same helper, and one that declares none records a
+    # `manual` dismissal (never a prose hash: cosmetic rewording must not
+    # re-fire a dismissal).
+    #
+    # Best-effort + SILENT: never touches the JSON payload / stderr contract,
+    # never raises.
+    from vco_lib import deferral_dismissal as _dd
+
+    _dd.record_dismissal(
+        folder,
+        condition_id,
+        _dd.fields_for(folder, condition_id, dismissed_entry),
+    )
 
     payload = {
         "dismissed": True,

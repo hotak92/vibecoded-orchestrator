@@ -253,9 +253,56 @@ the shipped hash of every bundled file:
 
 `--force` accepts shipped defaults for preserved files but **never**
 overwrites user `knowledge/**` (the preserve carve-out is unconditional).
-Deferral entries self-clear on the next run once their condition no longer
-holds. Soft-fail throughout: subprocess errors surface as warnings, never
-abort the install.
+Soft-fail throughout: subprocess errors surface as warnings, never abort the
+install.
+
+### 6.1 The deferral lifecycle contract (v0.2.91)
+
+"Deferral entries self-clear on the next run once their condition no longer
+holds" was the pre-v0.2.91 claim, and it was overbroad. It held for
+install-owned conditions and for producer-cleared bundle conditions; it was
+FALSE for a family that had no clear mechanism at all — no owner, no reconcile
+entry, no `resolve_conditions` call site anywhere — so the entry survived even
+after the user did exactly what it asked. Four such conditions were live in the
+field at v0.2.90.
+
+The lifecycle is now DECLARED, not implied. `vco_lib/deferral_conditions.toml`
+is the single registry; every `condition_id` VCO can emit has a row naming:
+
+- **`class`** — the disposition tier: `action_required` (a human must act) ·
+  `auto_retryable` (transient; VCO can retry once the precondition returns) ·
+  `environmental` (a true description of the machine; persists while true) ·
+  `informational_record` (already done, or a by-design skip — nothing pending).
+- **`owner`** — the module that emits it.
+- **`clear_probe`** — HOW it stops being listed:
+  `owned-drop-when-absent` (install.py re-detects it every run; not re-detected
+  ⇒ dropped by the single end-of-run write — which for a condition install.py
+  never emits yields one-shot auto-expiry) · `bundle-reconciled` (recomputed on
+  every bundle update) · `paired-resolution` (a success path resolves the exact
+  cid) · `probe:py:<name>` / `probe:rs:<name>` (a named read-only probe) ·
+  `manual-dismiss` (no automatic clear — an honest admission, never an
+  aspiration).
+- **`emit_surfaces`** — where it renders besides the ledger.
+- **`dismiss_key`** — the stable state fields forming its dismissal identity.
+
+Two properties make this a contract rather than documentation:
+
+1. **A cid cannot ship unclassified.** `tests/test_deferral_registry_completeness_v0291.py`
+   source-scans every emit site across Python and Rust and hard-fails on any
+   condition absent from the table.
+2. **A declared probe cannot be fictional.** Every `probe:py:<name>` must
+   resolve to a real callable, which turns the recurring
+   "documented-protocol-never-implemented" failure into a test failure.
+
+The read-only re-probe/clear pass runs on **every** `install.py --update` and
+every bundle update. Before v0.2.91 it was gated behind `--apply-deferred`, a
+flag the launcher's GUI update path never passed — so the auto-resolution
+machinery existed but never ran for GUI users. Remediations WITH side effects
+(starting a container) still require the flag.
+
+Rust reads a compile-time mirror of the same table
+(`vct-launcher-core::deferral_registry`), drift-locked by parity tests in both
+languages — the same tier-(B) shared-config discipline as `mcp_scan_rules.toml`.
 
 A re-run of `install.py` over an installed root is an update by
 construction: the presence of `.vco-manifest.json` is the installed marker.

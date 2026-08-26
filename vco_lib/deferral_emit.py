@@ -184,11 +184,57 @@ def emit_entries(
             for entry in entries:
                 report.add_entry(entry)
             wrote = bool(report)
+        # v0.2.91 WP-B: mirror record-class entries into the auto-resolutions
+        # trail. Runs AFTER the locked cycle (different file, no lock needed)
+        # so a jsonl hiccup can never hold the deferral lock.
+        _mirror_record_entries_to_trail(folder, entries, log=log)
         return wrote
     except Exception as exc:  # noqa: BLE001 — deferral I/O is best-effort
         cids = ", ".join(e.condition_id for e in entries) or "(none)"
         _log(log, "warning", f"[vct] deferral emit_entries failed ({cids}): {exc}")
         return False
+
+
+def _mirror_record_entries_to_trail(
+    folder: Path,
+    entries: Sequence[DeferralEntry],
+    *,
+    log: Any = None,
+) -> None:
+    """Append an ``auto-resolutions.jsonl`` row for each record-class entry.
+
+    v0.2.91 WP-B, DATA-DRIVEN: an entry is mirrored iff its condition declares
+    ``auto_resolutions_jsonl`` in the registry's ``emit_surfaces``. Declaring
+    the surface is therefore what turns it on — the list is a contract, not
+    documentation.
+
+    Why only those: the surface is declared exclusively on conditions that
+    record an action that JUST HAPPENED and are not re-detected per run
+    (a repaired binding, an averted clobber, a completed hard cut). That yields
+    ONE row per real event. A recurring nudge like ``template_review_pending``
+    deliberately does NOT declare it — mirroring a per-update re-emission would
+    turn the trail into a log of nothing happening.
+
+    Best-effort throughout (``record_auto_resolution`` is itself soft-fail):
+    observability must never fail an emit that already landed.
+    """
+    try:
+        from vco_lib.deferral_registry import emit_surfaces_for
+    except Exception:  # noqa: BLE001 — registry unreadable ⇒ skip the mirror
+        return
+    for entry in entries:
+        try:
+            if "auto_resolutions_jsonl" not in emit_surfaces_for(entry.condition_id):
+                continue
+            record_auto_resolution(
+                folder,
+                entry.condition_id,
+                "recorded_informational_deferral",
+                entry.title or entry.condition_id,
+                log=log,
+            )
+        except Exception:  # noqa: BLE001 — per-entry soft-fail
+            continue
 
 
 def emit(folder: Path, entry: DeferralEntry, *, log: Any = None) -> bool:

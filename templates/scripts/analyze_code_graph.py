@@ -7262,10 +7262,13 @@ def _emit_code_graph_deferral_no_backend(install_root: Path, exc: Exception) -> 
     Same pattern as the KG-sync deferral helper in sync_knowledge_graph.py
     — writes ``<install_root>/.claude/context/UPDATE_DEFERRED.md`` so the
     launcher / install.py surfaces the issue. Idempotent. Soft-fail on
-    any IO / import error.
+    any IO / import error. v0.2.91 WP-B: uses the LOCKED emitter
+    ``vco_lib.deferral_emit`` — the raw triplet it replaced was an UNLOCKED
+    read-modify-write from a subprocess that runs while install.py's own
+    deferral finalize is live.
     """
     try:
-        from vco_lib.deferral_report import DeferralEntry, DeferralReport
+        from vco_lib.deferral_emit import DeferralEntry, emit
         entry = DeferralEntry(
             condition_id="code_graph_no_embedding_backend",
             title="Code-graph analysis skipped: no embedding backend reachable",
@@ -7291,9 +7294,7 @@ def _emit_code_graph_deferral_no_backend(install_root: Path, exc: Exception) -> 
                 "knowledge/concepts/embedding-service-v0218.md",
             ],
         )
-        report = DeferralReport.read(install_root)
-        report.add_entry(entry)
-        report.write(install_root)
+        emit(install_root, entry)
     except Exception as inner:
         print(f"   (deferral emit failed: {inner})", file=sys.stderr)
 
@@ -7306,10 +7307,11 @@ def _emit_code_graph_deferral_code_backend_down(
 
     Distinguishes from the no-backend-at-all case because a CodeEmbed
     container can be down while Ollama is up (or vice-versa). The
-    deferral entry points at the right service to restart.
+    deferral entry points at the right service to restart. Same
+    locked-emitter routing (v0.2.91 WP-B) as its sibling above.
     """
     try:
-        from vco_lib.deferral_report import DeferralEntry, DeferralReport
+        from vco_lib.deferral_emit import DeferralEntry, emit
         slot = svc.code_vector_slot
         model = svc.code_model_id
         if "codesage" in slot:
@@ -7350,9 +7352,7 @@ def _emit_code_graph_deferral_code_backend_down(
                 "knowledge/concepts/embedding-service-v0218.md",
             ],
         )
-        report = DeferralReport.read(install_root)
-        report.add_entry(entry)
-        report.write(install_root)
+        emit(install_root, entry)
     except Exception as inner:
         print(f"   (deferral emit failed: {inner})", file=sys.stderr)
 

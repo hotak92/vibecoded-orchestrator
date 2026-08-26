@@ -162,6 +162,11 @@ packages = ["vco_lib"]
 # NOT belong in the sdist.
 include = [
     "vco_lib/**/*.py",
+    # Data tables read at import time by their vco_lib modules — an sdist
+    # without them makes `import vco_lib.deferral_registry` (and the
+    # mcp_scan_rules / bundled_mcp_versions loaders) raise. The wheel
+    # already ships them via packages = ["vco_lib"]; keep sdist in parity.
+    "vco_lib/**/*.toml",
     "README.md",
     "LICENSE",
     "CHANGELOG.md",

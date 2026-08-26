@@ -143,6 +143,9 @@ from vco_lib import project_init as _project_init  # noqa: E402
 from vco_lib import self_install as _self_install  # noqa: E402
 from vco_lib import weaviate_helpers as _wh  # noqa: E402
 from vco_lib import secrets_audit as _secrets_audit  # noqa: E402
+from vco_lib import deferral_dismissal as _deferral_dismissal  # noqa: E402
+from vco_lib import deferral_probes as _deferral_probes  # noqa: E402
+from vco_lib import deferral_registry as _deferral_registry  # noqa: E402
 from vco_lib.deferral_report import (  # noqa: E402
     DeferralEntry,
     DeferralReport,
@@ -151,128 +154,28 @@ from vco_lib.deferral_report import (  # noqa: E402
 from vco_lib.install_deferral_flow import InstallDeferralFlow  # noqa: E402
 from vco_lib.install_update_gate import InstallUpdateGate  # noqa: E402
 
-# ── A-2 (v0.2.73): install.py's deferral-ownership set ──────────────────────
+# ── A-2 (v0.2.73) / WP-B (v0.2.91): install.py's deferral-ownership set ────
 #
 # UPDATE_DEFERRED.md has multiple writer families. install.py's end-of-run
 # write() rebuilds the file from its in-memory report — so it may only apply
-# drop-when-absent (self-cleaning) semantics to the condition IDs it OWNS,
-# i.e. the ones IT re-detects on every run. Every other on-disk entry is
-# FOREIGN (written by project_init, the Rust emitters, or a background resync
-# child) and is seeded back into the run's report at start of main() so the
-# final write preserves it verbatim.
+# drop-when-absent (self-cleaning) semantics to the condition IDs it OWNS.
+# Every other on-disk entry is FOREIGN (written by project_init, the Rust
+# emitters, or a background resync child) and is seeded back into the run's
+# report at start of main() so the final write preserves it verbatim.
 #
-# MAINTENANCE CONTRACT: every `condition_id=` install.py itself emits MUST be
-# listed here (exact ID) or covered by a prefix below (dynamic suffixes).
-# An install.py-emitted ID missing from this set is preserved-forever instead
-# of self-cleaning — annoying but safe. A NON-install.py ID wrongly listed
-# here is silently clobbered on the next update — the exact A-2 data-loss bug.
-# When in doubt, leave the ID out.
-#
-# DELIBERATE EXCLUSION: `codegraph_embed_resync_pending` is emitted through
-# install.py's resync shim but is an "owed work" ledger entry, NOT a
-# re-detected-per-run condition — it is resolved EXPLICITLY (mark_resolved)
-# when the R-6 owed-probe positively confirms zero stale rows, and otherwise
-# preserved (R-7: the background walk's post-walk verifier maintains it).
-_INSTALL_OWNED_CONDITION_IDS = frozenset({
-    "env_secrets_retained_in_plaintext",
-    "env_secrets_hub_migration_failed",
-    "env_secrets_hub_migration_partial",
-    "weaviate_unreachable_at_update",
-    "rebuild_pending_seed",
-    "podman_daemon_start_failed",
-    # retired v0.2.85 (PLAN-v0285 D3, searxng-precedent from WP-B3): the
-    # producer (_emit_self_materialize_preserved_deferral, called from the old
-    # Step 5b _materialize_orchestrator_self_claude_dir) was DELETED when root
-    # install moved to the delegated install-bundle path. Root now ADOPTS a
-    # drifted runtime copy with a timestamped backup (D3) instead of
-    # preserving + nagging — the same policy the launcher already applied to
-    # the root folder since v0.2.84. ID kept here so any stale on-disk entry
-    # from a pre-.85 run drop-when-absent self-clears on the next
-    # single-final-write (InstallDeferralFlow.finalize).
-    "orchestrator_self_user_modified_preserved",
-    "compose_overlay_ambiguous",
-    "dual_ollama_detected",
-    "schema_drift_rebuild_required",
-    "legacy_shared_kg_class_present",
-    "orphan_orchestrator_development_collection",
-    "links_to_property_schema_drift",
-    "kg_binding_self_heal_db_error",
-    "kg_binding_self_healed",
-    "multi_candidate_prefix_adopt",
-    "launcher_install_path_seed_unavailable",
-    "orchestrator_root_kg_collection_locked",
-    # retired v0.2.83 (WP-B3): the producer that emitted this was removed —
-    # VCO no longer ships searxng, so an on-disk searxng dir / a `searxng` MCP
-    # entry is USER property (they may run their own), NOT a VCO leftover, and
-    # the old `rm -r claude_mcp_servers/searxng` remediation was harmful to
-    # such users. ID kept here so any stale on-disk entry from a pre-.83 run
-    # drop-when-absent self-clears on the next single-final-write.
-    "searxng_removed_from_default_install",
-    "ollama_mcp_deprecated",
-    "search_mcp_simplified",
-    # v0.2.89 FIX 2: emitted when an orphan pre-migration `<project>/.mcp.json`
-    # weaviate-kg env block that CONTRADICTS the migrated `.claude/settings.json`
-    # (stale Weaviate port / KG collection / empty shared-KG) is quarantined.
-    # Re-detected per run (the quarantine removes the stale block, so a clean
-    # subsequent run does NOT re-detect → drop-when-absent self-clears).
-    "stale_mcp_json_shadow_quarantined",
-    # v0.2.89 review MAJOR-4.2: informational sibling — a stale `.mcp.json`
-    # was found byte-identical to a prior quarantine backup (the user
-    # deliberately restored it), so the quarantine was SKIPPED. Re-detected
-    # per run while the restore persists; drop-when-absent self-clears once
-    # the user deletes/edits `.mcp.json` or the matching backup.
-    "stale_mcp_json_restore_detected",
-    "launcher_restart_required",
-    "launcher_binary_swap_failed_locked",
-    "update_resume_required",
-    # v0.2.88 (MAJOR-3): the two update-flow collision deferrals the launcher's
-    # Rust emitters write (untracked-collision resolvable modal +
-    # autostash-pop-conflict modal). Both are RESOLVED by a one-click GUI
-    # resolution that then chains into the resume/update tail — which runs
-    # install.py, whose single-final-write (InstallDeferralFlow.finalize)
-    # drop-when-absent self-clears any owned cid not re-detected this run. Owned
-    # here so a completed GUI resolution stops nagging (the exact lifecycle
-    # `update_resume_required` uses). Also settled directly by the resolver
-    # commands via `deferral_emit.resolve_conditions` (belt-and-suspenders). NOT
-    # re-emitted by install.py — the emitters are the launcher's, so a stale
-    # on-disk row simply drop-when-absent clears; a live collision re-writes it
-    # from the launcher on the next update attempt.
-    "untracked_collision_divergent",
-    "autostash_pop_conflict",
-    "vct_hub_binary_unavailable",
-    "mcp_registration_no_venv",
-    "mcp_registration_python_fallback",
-    "mcp_registration_failed",
-    "stale_mcp_entry",
-    "stale_mcp_rewrite_quiet_skipped",
-    "stale_mcp_rewrite_declined",
-    "stale_mcp_rewrite_summary",
-    "deprecated_mcp_removal_quiet_skipped",
-    "deprecated_mcp_removal_declined",
-    "deprecated_mcp_removal_lock_failed",
-    "deprecated_mcp_removal_write_failed",
-    "deprecated_mcp_removal_summary",
-    "global_lean_ctx_hooks_detected",
-    "boot_service_path_repaired",
-    "claude_settings_unparseable",
-    "claude_settings_user_modified_preserved",
-})
-
-# Dynamically-suffixed families install.py emits (see condition_is_owned).
-_INSTALL_OWNED_CONDITION_PREFIXES = (
-    "schema_migration_failed_",
-    "kg_named_vector_slot_error_",
-    "lowercase_codegraph_residual_",
-    "schema_migration_required_",
-    "deprecated_mcp_",
-    "bundle_pin_drift_",
-    # Stale systemd user-unit retirement record (one per retired unit,
-    # ``stale_unit_retired_<unit-slug>``). Owned so the record drop-when-absent
-    # self-clears on the next single-final-write once the retirement is history
-    # (the unit is gone — it won't be re-detected, so the record served its
-    # one-time purpose of telling the user what changed + the restore command).
-    "stale_unit_retired_",
-)
+# v0.2.91 WP-B: both sets are DERIVED FROM THE REGISTRY
+# (`vco_lib/deferral_conditions.toml`, every row whose `clear_probe` is
+# `owned-drop-when-absent`). The accessors keep their names and types, so every
+# call site is unchanged; what moved is WHERE the fact lives — beside that
+# condition's class, owner and rationale, in the one table a completeness test
+# can check against the actual emit sites. The ownership INVARIANTS (an
+# un-owned install.py cid nags forever = annoying but safe; a wrongly-owned
+# FOREIGN cid is silently clobbered = the A-2 data-loss bug) and the deliberate
+# exclusion of `codegraph_embed_resync_pending` are documented in that table's
+# header. `tests/test_deferral_registry_completeness_v0291.py` pins the
+# migration against the v0.2.90 hand-written set.
+_INSTALL_OWNED_CONDITION_IDS = _deferral_registry.install_owned_ids()
+_INSTALL_OWNED_CONDITION_PREFIXES = _deferral_registry.install_owned_prefixes()
 
 # Hygiene (v0.2.75): keep the Popen handles of deliberately-DETACHED children
 # (Docker Desktop launch, stage-1 vct-updater handoff) alive for install.py's
@@ -6316,7 +6219,7 @@ def main() -> int:
             # the launcher-managed one is known to be up; emit an
             # UPDATE_DEFERRED warning if a personal instance is also
             # responding so the user sees the divergence post-install.
-            _emit_dual_ollama_deferral(_deferral_report)
+            _emit_dual_ollama_deferral(_deferral_report, folder=_deferral_folder)
 
         # A-6 rider (P3a, v0.2.75): venv/container/model-pull phase done —
         # re-extend the update-gate deadline before the collections/seed
@@ -6857,8 +6760,8 @@ def main() -> int:
     # (_deferral_folder is resolved at the top of main(), next to the A-2
     # disk seed — see the HIGH-2 comment there.)
 
-    # Apply pending deferrals if requested (--update --apply-deferred).
-    if args.update and getattr(args, "apply_deferred", False):
+    # v0.2.91 WP-B (decision #5): the re-probe pass runs on EVERY --update.
+    if args.update:
         _apply_deferred_entries(_deferral_report, _deferral_folder, args=args)
 
     # A-11 (v0.2.73): the mid-run `_deferral_report.write()` that used to sit
@@ -7275,8 +7178,9 @@ def _apply_deferred_entries(
     project_root: Path,
     *,
     args: "argparse.Namespace | None" = None,
+    side_effects: "bool | None" = None,
 ) -> None:
-    """Attempt to apply each entry in the persisted deferral report.
+    """Re-probe (and, when allowed, apply) each entry in the persisted report.
 
     Reads the on-disk ``UPDATE_DEFERRED.md``, attempts a best-effort
     resolution for each known condition, and marks successful ones resolved.
@@ -7284,7 +7188,28 @@ def _apply_deferred_entries(
     the current run) is written back by the caller (``_deferral_report.write()``
     at end of ``main()``).
 
-    Conditions handled:
+    Args:
+        current_run_report: the run's accumulating report. Entries that still
+            apply are re-added to it; resolved ones are ``mark_resolved`` (which
+            also tombstones them against the P1 pre-write re-merge).
+        project_root: the folder whose ledger is being processed.
+        args: the parsed install args, for handlers that consult flags.
+        side_effects: v0.2.91 WP-B (decision #5) — False makes the pass
+            STRICTLY READ-ONLY: probes and clears, never starts or repairs — its ONE
+            write is carved out on the ``launcher_restart_required`` bullet below.
+            The pass now runs on EVERY ``--update`` because it used to run only under
+            ``--apply-deferred``, a flag the launcher's GUI update path never passes,
+            so in the field the auto-resolve machinery never ran at all. The flag
+            re-enables, under ``--apply-deferred`` only, the two handlers that ACT on
+            the user's system: ``weaviate_unreachable_at_update`` → ``podman start``,
+            and the ``orphan_*_collection`` DROP (also needs ``--apply-orphan-deletes``).
+
+    Registry dispatch: before the hand-written branches, any cid declaring a
+    ``probe:py:<name>`` clear probe is evaluated via
+    :mod:`vco_lib.deferral_probes` (True ⇒ keep, False ⇒ resolve, None ⇒ keep).
+    New conditions get a lifecycle from a probe + one registry line.
+
+    Conditions handled by hand-written branches:
       - ``schema_drift_rebuild_required``: never auto-applies the rebuild
         (that stays behind explicit ``--rebuild-collections`` consent), but
         RE-PROBES the current drift state (v0.2.54 Track D): when the
@@ -7293,10 +7218,10 @@ def _apply_deferred_entries(
       - ``update_resume_required``: re-probes the launcher's resume
         sentinel (``.claude/state/orchestrator-update-resume-needed.json``
         in the install root); sentinel gone → resolved (v0.2.54 Track D).
-      - ``launcher_restart_required``: consumes
-        ``.claude/context/launcher-restart-marker`` (written by the
-        restarted launcher) or, failing that, verifies the recorded old
-        launcher PID has exited (v0.2.54 Track D).
+      - ``launcher_restart_required``: consumes its own signal file
+        ``.claude/context/launcher-restart-marker`` (written by the restarted
+        launcher) — the read-only pass's ONE write, and NOT a repair: that file
+        exists for no purpose but this handler. Else old-PID liveness (v0.2.54).
       - ``weaviate_unreachable_at_update``: try ``podman start <name>``
         (name discovered via ``vco_lib.containers.find_existing_container``;
         falls back to the canonical ``vco_weaviate`` if no container is
@@ -7305,15 +7230,49 @@ def _apply_deferred_entries(
       - ``compose_overlay_ambiguous``: cannot auto-resolve (requires human
         decision); emit informational note.
     """
+    if side_effects is None:
+        side_effects = bool(getattr(args, "apply_deferred", False))
     persisted = DeferralReport.read(project_root)
     if not persisted:
         return
 
     print()
-    print("[apply-deferred] Processing pending deferral entries ...")
+    if side_effects:
+        print("[apply-deferred] Processing pending deferral entries ...")
+    else:
+        print("[deferral-probe] Re-probing pending deferral entries "
+              "(read-only) ...")
+
+    # The launcher-binary probes need the OS facts install.py owns.
+    try:
+        _subdir, _fname = _launcher_binary_relative_path()
+        probe_extras = _deferral_probes.launcher_probe_extras(
+            _subdir, _fname, _read_launcher_version(project_root),
+        )
+    except Exception:  # noqa: BLE001 — probes degrade to "unknown" without extras
+        probe_extras = {}
 
     for entry in persisted.entries:
         cid = entry.condition_id
+
+        # Registry-declared probe (v0.2.91 WP-B): runs BEFORE the hand-written
+        # branches, so a condition gains a lifecycle by DECLARING one.
+        probe_name = _deferral_probes.registry_probe_name(cid)
+        if probe_name is not None:
+            verdict = _deferral_probes.evaluate(project_root, entry, probe_extras)
+            if verdict is False:
+                print(f"  [ok]   {cid}: probe `{probe_name}` reports the "
+                      "condition no longer applies. Marking resolved.")
+                current_run_report.mark_resolved(cid)
+                _deferral_probes.record_probe_resolution(
+                    project_root, cid, probe_name,
+                )
+            else:
+                why = "still applies" if verdict else "could not determine it"
+                print(f"  [skip] {cid}: probe `{probe_name}` {why}. "
+                      "Keeping entry.")
+                current_run_report.add_entry(entry)
+            continue
 
         if cid == "schema_drift_rebuild_required":
             # v0.2.54 Track D (Theme 5): re-probe instead of blind-skip.
@@ -7481,39 +7440,49 @@ def _apply_deferred_entries(
                     current_run_report.add_entry(entry)
 
         elif cid == "weaviate_unreachable_at_update":
-            # v0.2.15: discover the actual container name + runtime on
-            # this host instead of hardcoding `weaviate_claude` +
-            # `podman` (both maintainer-machine assumptions). See
-            # vco_lib/containers.py for the rename rationale + the
-            # _detect_container_runtime / _runtime_preference_from_env
-            # helpers above for the runtime contract.
-            from vco_lib.containers import (
-                find_existing_container as _find_existing_container,
+            # THE one side-effectful handler: it STARTS a container. v0.2.91
+            # split it — the reachability probe always runs; the start does not.
+            weaviate_url = os.environ.get(
+                "WEAVIATE_URL",
+                f"http://localhost:{DEFAULT_WEAVIATE_PORT}",
             )
-            _apply_runtime = (
-                _detect_container_runtime()
-                or _runtime_preference_from_env()
-                or "podman"
-            )
-            _weav_container = (
-                _find_existing_container("weaviate", runtime=_apply_runtime)
-                or "vco_weaviate"
-            )
-            print(
-                f"  [try]  {cid}: attempting {_apply_runtime} start "
-                f"{_weav_container} ..."
-            )
+            if side_effects:
+                # v0.2.15: discover the actual container name + runtime on
+                # this host instead of hardcoding `weaviate_claude` +
+                # `podman` (both maintainer-machine assumptions). See
+                # vco_lib/containers.py for the rename rationale + the
+                # _detect_container_runtime / _runtime_preference_from_env
+                # helpers above for the runtime contract.
+                from vco_lib.containers import (
+                    find_existing_container as _find_existing_container,
+                )
+                _apply_runtime = (
+                    _detect_container_runtime()
+                    or _runtime_preference_from_env()
+                    or "podman"
+                )
+                _weav_container = (
+                    _find_existing_container("weaviate", runtime=_apply_runtime)
+                    or "vco_weaviate"
+                )
+                print(
+                    f"  [try]  {cid}: attempting {_apply_runtime} start "
+                    f"{_weav_container} ..."
+                )
+                try:
+                    subprocess.run(
+                        [_apply_runtime, "start", _weav_container],
+                        capture_output=True, timeout=30,
+                    )
+                    import time as _t
+                    _t.sleep(3)
+                except Exception as exc:  # noqa: BLE001 — probe below decides
+                    print(f"  [warn] {cid}: container start failed ({exc}); "
+                          "probing anyway.")
+            else:
+                print(f"  [try]  {cid}: probing reachability (read-only; "
+                      "--apply-deferred also starts the container) ...")
             try:
-                subprocess.run(
-                    [_apply_runtime, "start", _weav_container],
-                    capture_output=True, timeout=30,
-                )
-                import time as _t
-                _t.sleep(3)
-                weaviate_url = os.environ.get(
-                    "WEAVIATE_URL",
-                    f"http://localhost:{DEFAULT_WEAVIATE_PORT}",
-                )
                 urllib.request.urlopen(
                     f"{weaviate_url}/v1/.well-known/ready", timeout=5
                 )
@@ -7600,14 +7569,14 @@ def _apply_deferred_entries(
 
         elif cid == "orphan_orchestrator_development_collection":
             # v0.2.46 post-adversarial L4 (handler): a 0-row legacy
-            # `VibeCodedOrchestrator_Development` Weaviate collection that
-            # older install.py versions created. Deleting it is destructive
-            # (Weaviate DROP can't be undone), but the deferral itself
-            # documents "Dropping is safe" — the collection has no callers
-            # and no rows. Gate auto-delete behind explicit user opt-in
-            # (`--apply-orphan-deletes` flag) so the default
-            # `--apply-deferred` flow remains non-destructive.
-            if getattr(args, "apply_orphan_deletes", False):
+            # `VibeCodedOrchestrator_Development` Weaviate collection older
+            # install.py versions created. The deferral says "Dropping is safe"
+            # (no callers, no rows) but a Weaviate DROP cannot be undone.
+            # v0.2.91 wave-2 (MINOR-1): consent is COMPOUND — `side_effects` AND
+            # `--apply-orphan-deletes`. Decision #5 put this pass on EVERY
+            # `--update`, so the orphan flag alone would let an unattended,
+            # read-only-by-contract run DROP. Matches the argparse help exactly.
+            if side_effects and getattr(args, "apply_orphan_deletes", False):
                 print(f"  [try]  {cid}: DELETE legacy orphan collection ...")
                 try:
                     weaviate_url = os.environ.get(
@@ -7675,7 +7644,7 @@ def _apply_deferred_entries(
             else:
                 print(
                     f"  [skip] {cid}: destructive — pass "
-                    f"--apply-orphan-deletes to consent."
+                    f"--apply-deferred --apply-orphan-deletes to consent."
                 )
                 current_run_report.add_entry(entry)
 
@@ -13715,6 +13684,7 @@ def _emit_dual_ollama_deferral(
     deferral_report: "DeferralReport",
     canonical_port: int = DEFAULT_OLLAMA_PORT,
     alternate_port: int = 11434,
+    folder: "Path | None" = None,
 ) -> None:
     """v0.2.49 Bug J: emit an info-severity deferral when both Ollama
     instances respond.
@@ -13722,6 +13692,14 @@ def _emit_dual_ollama_deferral(
     Mirrors the shape of :func:`_emit_orchestrator_root_schema_deferrals`
     — soft-fail throughout, idempotent on re-runs (the deferral writer
     deduplicates by ``condition_id``).
+
+    v0.2.91 WP-B (decision #9): ``environmental`` — a TRUE, permanent
+    description of a machine legitimately running two Ollamas, re-detected
+    every run, so a dismissal used to be re-emitted on the next update. It now
+    carries the registry-declared dismiss key (the ``(alt, canon)`` port pair)
+    and honours a matching dismissal until the topology changes. ``folder``
+    locates that memory; omitted ⇒ emit anyway (failing to suppress is noise,
+    failing to emit hides state).
     """
     try:
         result = _probe_dual_ollama_instances(
@@ -13734,6 +13712,20 @@ def _emit_dual_ollama_deferral(
         return
 
     alt, canon = result
+    dismiss_fields = {"alt_port": str(alt), "canon_port": str(canon)}
+    if folder is not None:
+        try:
+            if _deferral_dismissal.dismissal_suppresses(
+                folder, "dual_ollama_detected", dismiss_fields,
+            ):
+                _log_install_event(
+                    "7/10", "info",
+                    f"Bug J: dual-Ollama (:{alt} + :{canon}) suppressed — "
+                    f"dismissed for this exact port pair",
+                )
+                return
+        except Exception:  # noqa: BLE001 — suppression is best-effort
+            pass
     # v0.2.77 Part 7a cluster F: guard + try/except/soft-fail via the shared
     # factory; on success we still emit the info success-log below.
     emitted = _safe_emit_deferral(
@@ -13768,9 +13760,17 @@ def _emit_dual_ollama_deferral(
             f"# If you want to stop the personal instance:\n"
             f"#   systemctl --user stop ollama   # Linux\n"
             f"#   killall ollama                 # macOS / generic\n"
-            f"# Then re-run install.py --update to reseed."
+            f"# Then re-run install.py --update to reseed.\n"
+            f"#\n"
+            f"# If two Ollamas is your intended setup, silence this notice —\n"
+            f"# the dismissal holds until the (:{alt}, :{canon}) port pair\n"
+            f"# itself changes:\n"
+            f"python -m vco_lib.project_init dismiss-deferral "
+            f"--folder {str(folder) if folder is not None else '<project>'!r} "
+            f"--condition-id dual_ollama_detected"
         ),
         severity="info",
+        dismiss_fields=dismiss_fields,
         log_event=_log_install_event,
         log_step="7/10",
     )

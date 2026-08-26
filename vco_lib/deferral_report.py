@@ -131,7 +131,45 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _reminder_block() -> str:
+def _disposition_split_line(entries: List["DeferralEntry"]) -> str:
+    """One line summarising the ledger by DISPOSITION, or "" when unavailable.
+
+    v0.2.91 WP-B surfacing rider. The reminder block used to be binary — it
+    existed or it didn't — so a session opening a project with three stale
+    "already done, no action needed" records read exactly like one with a
+    blocking migration. Splitting the count lets a Claude session triage
+    without opening the file.
+
+    Soft-fail by design: if the registry can't be read the block simply keeps
+    its pre-v0.2.91 shape rather than breaking the write.
+
+    wave-2 MINOR-3: counts come from :meth:`DeferralReport.split_by_disposition`
+    — the ONE partition — not from the registry-only
+    ``deferral_registry.split_by_disposition(cids)``. The registry helper sees
+    only condition IDs, so it silently ignored an entry's EXPLICIT
+    ``disposition`` (which ``resolved_disposition`` prefers, and which is what
+    the ledger renders and the GUI reads). An escalated record then showed as
+    actionable in the ledger and as "0 actionable" in this line. The
+    ``split_by_disposition`` docstring promises the surfaces cannot disagree;
+    routing both through it is what makes that promise true.
+    """
+    if not entries:
+        return ""
+    try:
+        scratch = DeferralReport()
+        for e in entries:
+            scratch.add_entry(e)
+        actionable, informational = scratch.split_by_disposition()
+    except Exception:  # noqa: BLE001 — the reminder must never break a write
+        return ""
+    return (
+        f"Currently: **{len(actionable)} actionable**, "
+        f"{len(informational)} informational/record"
+        f"{'' if len(informational) == 1 else 's'}.\n"
+    )
+
+
+def _reminder_block(entries: Optional[List["DeferralEntry"]] = None) -> str:
     """Render the wrapped CLAUDE.md reminder block.
 
     Idempotency contract (matches install.py's vct-merge-pending pattern):
@@ -139,12 +177,18 @@ def _reminder_block() -> str:
     _REMINDER_END markers, otherwise the find-and-replace path would
     miscount. References to those markers are oblique ("the HTML-comment
     markers wrapping this block").
+
+    ``entries`` (v0.2.91) adds the actionable/informational split line. It is
+    optional so the block keeps rendering identically for callers that have no
+    entry list to hand.
     """
+    split = _disposition_split_line(entries or [])
     return (
         f"{_REMINDER_BEGIN}\n"
         "**Pending VCO action**: `.claude/context/UPDATE_DEFERRED.md` exists.\n"
         "Read it at session start — it contains commands to resolve\n"
         "unresolved VCO install actions.\n"
+        f"{split}"
         "\n"
         "To remove THIS reminder block: once the deferral is resolved (e.g.\n"
         "via `--update --force`), VCO's next install run will delete\n"
@@ -216,7 +260,9 @@ def _find_reminder_marker_span(existing: str):
     return None
 
 
-def _splice_reminder_into_claude_md(existing: str) -> str:
+def _splice_reminder_into_claude_md(
+    existing: str, entries: Optional[List["DeferralEntry"]] = None
+) -> str:
     """Return ``existing`` with the reminder block injected idempotently.
 
     Three insertion points (in priority order):
@@ -235,7 +281,7 @@ def _splice_reminder_into_claude_md(existing: str) -> str:
     unchanged so no user content is destroyed (the orphan marker stays; the
     user can clean it). This prefers a missing refresh over data loss.
     """
-    block = _reminder_block()
+    block = _reminder_block(entries)
 
     span = _find_reminder_marker_span(existing)
     if span == ("ambiguous",):
@@ -310,7 +356,9 @@ def _strip_reminder_from_claude_md(existing: str) -> str:
     return before + after
 
 
-def _ensure_claude_md_reminder(folder: Path) -> None:
+def _ensure_claude_md_reminder(
+    folder: Path, entries: Optional[List["DeferralEntry"]] = None
+) -> None:
     """Inject (or refresh) the reminder block in ``<folder>/CLAUDE.md``.
 
     No-op if CLAUDE.md is missing — the project-bootstrapper owns CLAUDE.md
@@ -323,7 +371,7 @@ def _ensure_claude_md_reminder(folder: Path) -> None:
         if not target.exists():
             return
         existing = target.read_text(encoding="utf-8")
-        updated = _splice_reminder_into_claude_md(existing)
+        updated = _splice_reminder_into_claude_md(existing, entries)
         if updated != existing:
             _atomic_write_text(target, updated)
     except OSError:
@@ -388,12 +436,59 @@ class DeferralEntry:
     detected_at: str = field(default_factory=_now_iso)
     """ISO-8601 UTC timestamp of detection."""
 
+    disposition: Optional[str] = None
+    """v0.2.91 WP-B — the DISPOSITION tier (``action_required`` |
+    ``auto_retryable`` | ``environmental`` | ``informational_record``).
+
+    Severity says how LOUD an entry is; disposition says what the reader OWES
+    it. The two were conflated: ``kg_access_phantom_repaired`` (a record of a
+    completed repair), ``safe_add_skipped_env_merge`` (a permanent by-design
+    skip) and ``orchestrator_user_modified_preserved`` (genuinely pending work)
+    all rendered as ``info`` and looked identical.
+
+    ``None`` means "not set explicitly" — :attr:`resolved_disposition` then
+    consults the registry, and falls back to ``action_required`` for an
+    unregistered id. Callers should read that property, never this field."""
+
+    dismiss_fields: dict = field(default_factory=dict)
+    """v0.2.91 WP-B — current values of this condition's registry-declared
+    ``dismiss_key`` fields (see :mod:`vco_lib.deferral_dismissal`).
+
+    Machine bookkeeping, not user-facing: carried losslessly in the JSON
+    sidecar, deliberately NOT rendered into the Markdown (the .md is a human
+    render, and the md→entry fallback path is already lossy by design)."""
+
     def __post_init__(self) -> None:
         if self.severity not in SEVERITY_ORDER:
             raise ValueError(
                 f"Invalid severity {self.severity!r}; must be one of "
                 f"{SEVERITY_ORDER}"
             )
+        if self.disposition is not None:
+            from vco_lib.deferral_registry import CLASSES
+
+            if self.disposition not in CLASSES:
+                raise ValueError(
+                    f"Invalid disposition {self.disposition!r}; must be one of "
+                    f"{CLASSES} (or None to resolve from the registry)"
+                )
+
+    @property
+    def resolved_disposition(self) -> str:
+        """The effective disposition: explicit → registry → ``action_required``.
+
+        Registry-driven resolution is what lets the launcher's Rust emitters
+        get a correct tier for free — they never pass one over the Python
+        bridge, and they should not have to.
+        """
+        if self.disposition:
+            return self.disposition
+        try:
+            from vco_lib.deferral_registry import disposition_for
+
+            return disposition_for(self.condition_id)
+        except Exception:  # noqa: BLE001 — conservative on any registry problem
+            return "action_required"
 
 
 def _severity_max(entries: List[DeferralEntry]) -> str:
@@ -436,6 +531,7 @@ def safe_emit_entry(
     command_to_apply: str,
     severity: str = "warning",
     kg_node_refs: Optional[List[str]] = None,
+    dismiss_fields: Optional[dict] = None,
     log_event: Optional[Callable[..., None]] = None,
     log_step: str = "",
 ) -> bool:
@@ -481,6 +577,7 @@ def safe_emit_entry(
             command_to_apply=command_to_apply,
             severity=severity,
             kg_node_refs=list(kg_node_refs) if kg_node_refs else [],
+            dismiss_fields=dict(dismiss_fields) if dismiss_fields else {},
         )
         report.add_entry(entry)
         return True
@@ -531,11 +628,19 @@ def _render_entry(entry: DeferralEntry) -> str:
         refs = "\n".join(f"- `{ref}`" for ref in entry.kg_node_refs)
         kg_lines = f"\n**Cross-references**:\n{refs}\n"
 
+    # v0.2.91 WP-B: the `## <cid> (<sev>)` HEADER SHAPE IS UNTOUCHED — both
+    # `_SECTION_RE` here and the Rust `restart.rs::extract_section` /
+    # `strip_section` parse it, and WP-F's banner work depends on
+    # extract_section keeping up with new entries. Disposition rides as an
+    # ordinary `**Field**:` line, which the field parser round-trips and
+    # unknown-field-tolerant readers ignore.
     return (
         f"\n"
         f"## {entry.condition_id} ({entry.severity})\n"
         f"\n"
         f"**Title**: {entry.title}\n"
+        f"\n"
+        f"**Disposition**: {entry.resolved_disposition}\n"
         f"\n"
         f"**Detected**: {entry.detected}\n"
         f"\n"
@@ -638,6 +743,13 @@ def _parse_entries(text: str) -> List[DeferralEntry]:
                 elif stripped.startswith("**") or stripped.startswith("##"):
                     after_refs = False
 
+        # v0.2.91: an unknown/legacy Disposition value is DROPPED rather than
+        # raising — the Markdown is a human-editable render, and a typo there
+        # must not make the whole report unreadable. The registry then supplies
+        # the tier via `resolved_disposition`.
+        raw_disposition = fields.get("Disposition")
+        disposition = _coerce_disposition(raw_disposition)
+
         entries.append(
             DeferralEntry(
                 condition_id=cid,
@@ -648,6 +760,7 @@ def _parse_entries(text: str) -> List[DeferralEntry]:
                 severity=sev if sev in SEVERITY_ORDER else "warning",
                 kg_node_refs=refs,
                 detected_at=fields.get("Detected at", _now_iso()),
+                disposition=disposition,
             )
         )
 
@@ -658,10 +771,37 @@ def _parse_entries(text: str) -> List[DeferralEntry]:
 # A-3: JSON sidecar (source of truth) serialisation
 # ---------------------------------------------------------------------------
 
+def _coerce_disposition(raw: Any) -> Optional[str]:
+    """Normalise a parsed disposition value; unknown/absent ⇒ ``None``.
+
+    ``None`` is the correct "not set" answer — :attr:`DeferralEntry.resolved_disposition`
+    then asks the registry, so an entry written by an older VCO (or by a Rust
+    emitter that never passes one) still renders with the right tier instead of
+    being pinned to a stale literal.
+    """
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    try:
+        from vco_lib.deferral_registry import CLASSES
+    except Exception:  # noqa: BLE001 — registry unreadable ⇒ treat as unset
+        return None
+    return value if value in CLASSES else None
+
+
 def _entry_to_dict(entry: DeferralEntry) -> dict:
     """Render one entry to a JSON-safe dict. Every field is preserved
-    losslessly (multi-line strings survive — no Markdown round-trip)."""
-    return {
+    losslessly (multi-line strings survive — no Markdown round-trip).
+
+    v0.2.91: ``disposition`` + ``dismiss_fields`` are ADDITIVE and optional, so
+    ``schema_version`` stays 1 — ``_entry_from_dict`` already ignores unknown
+    keys, which means an OLDER VCO reading a NEWER sidecar degrades to the
+    pre-v0.2.91 behaviour instead of rejecting the file. Absent keys are OMITTED
+    rather than written as nulls so the sidecar of a report with no dispositions
+    is byte-identical to what v0.2.90 wrote."""
+    out = {
         "condition_id": entry.condition_id,
         "title": entry.title,
         "detected": entry.detected,
@@ -671,6 +811,11 @@ def _entry_to_dict(entry: DeferralEntry) -> dict:
         "kg_node_refs": list(entry.kg_node_refs),
         "detected_at": entry.detected_at,
     }
+    if entry.disposition:
+        out["disposition"] = entry.disposition
+    if entry.dismiss_fields:
+        out["dismiss_fields"] = dict(entry.dismiss_fields)
+    return out
 
 
 def _entry_from_dict(d: dict) -> Optional[DeferralEntry]:
@@ -689,6 +834,9 @@ def _entry_from_dict(d: dict) -> Optional[DeferralEntry]:
     refs = d.get("kg_node_refs") or []
     if not isinstance(refs, list):
         refs = []
+    dismiss = d.get("dismiss_fields")
+    if not isinstance(dismiss, dict):
+        dismiss = {}
     return DeferralEntry(
         condition_id=cid,
         title=str(d.get("title", cid.replace("_", " ").title())),
@@ -698,6 +846,8 @@ def _entry_from_dict(d: dict) -> Optional[DeferralEntry]:
         severity=sev,
         kg_node_refs=[str(r) for r in refs],
         detected_at=str(d.get("detected_at", _now_iso())),
+        disposition=_coerce_disposition(d.get("disposition")),
+        dismiss_fields={str(k): v for k, v in dismiss.items()},
     )
 
 
@@ -915,7 +1065,7 @@ class DeferralReport:
         atomic_write_text(target, content)
 
         # Inject/refresh the wrapped reminder block in CLAUDE.md.
-        _ensure_claude_md_reminder(folder)
+        _ensure_claude_md_reminder(folder, self._entries)
 
         return True
 
@@ -994,6 +1144,36 @@ class DeferralReport:
 
     def has_condition(self, condition_id: str) -> bool:
         return any(e.condition_id == condition_id for e in self._entries)
+
+    def entry_for(self, condition_id: str) -> Optional[DeferralEntry]:
+        """The entry for ``condition_id``, or ``None``.
+
+        Used by the re-probe pass, which hands the entry to a probe so the
+        probe can read the state the emitter recorded (e.g. the preserved
+        sidecar paths) instead of re-deriving it.
+        """
+        for entry in self._entries:
+            if entry.condition_id == condition_id:
+                return entry
+        return None
+
+    def split_by_disposition(self) -> tuple[List[DeferralEntry], List[DeferralEntry]]:
+        """Partition entries into ``(actionable, informational)``.
+
+        Actionable = ``action_required`` + ``auto_retryable`` (still owed work,
+        even when VCO can do it itself). Informational = ``environmental`` +
+        ``informational_record``. The GUI ledger panel (WP-I) and the CLAUDE.md
+        reminder split both read this ONE partition so their counts can never
+        disagree.
+        """
+        actionable: List[DeferralEntry] = []
+        informational: List[DeferralEntry] = []
+        for entry in self._entries:
+            if entry.resolved_disposition in ("action_required", "auto_retryable"):
+                actionable.append(entry)
+            else:
+                informational.append(entry)
+        return actionable, informational
 
     def __len__(self) -> int:
         return len(self._entries)

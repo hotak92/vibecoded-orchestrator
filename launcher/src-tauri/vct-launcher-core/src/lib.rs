@@ -19,6 +19,11 @@ pub mod bundled_versions;
 pub mod collection_naming;
 pub mod config;
 pub mod db;
+// v0.2.91 WP-B: compile-time mirror of `vco_lib/deferral_conditions.toml` so
+// the launcher can classify a deferral's DISPOSITION on a boot path without a
+// Python subprocess. Drift-locked to the Python loader by
+// `tests/deferral_registry_parity.rs`.
+pub mod deferral_registry;
 // v0.2.49: shared license + machine-binding helpers used by the launcher
 // GUI AND vct-hub. Promoted out of the launcher crate so the hub-side
 // supervisor (Phase 3 auth port) can call the same keychain read +

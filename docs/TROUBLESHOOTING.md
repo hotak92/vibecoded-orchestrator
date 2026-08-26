@@ -661,7 +661,29 @@ The two deferral types you'll encounter most often:
 
 **`schema_migration_required`** — Update Bundle detected drift between the Weaviate target schema and the schema currently on disk for one of your project's collections. Because schema migration is destructive (it can re-embed or recreate collection objects), the bundle path never auto-applies it. The deferral entry shows the explicit consent command: `cd "$VCT_ORCHESTRATOR_ROOT" && .venv/bin/python -m vco_lib.project_init migrate-collections --name '<project>'` (the v0.2.19 fix made this work correctly from project venvs — previously it produced `ModuleNotFoundError`). Run it once you have a Weaviate backup or are comfortable with the migration's destructive scope.
 
-The file lives at `<project>/.claude/context/UPDATE_DEFERRED.md` and is regenerated on each Update Bundle / `install.py --update` run. Cleared entries disappear automatically when the underlying condition resolves on the next run; you don't need to delete the file manually.
+The file lives at `<project>/.claude/context/UPDATE_DEFERRED.md` and is regenerated on each Update Bundle / `install.py --update` run.
+
+### What each entry owes you — the lifecycle classes (v0.2.91)
+
+Every entry carries a `**Disposition**:` line naming what the reader owes it. The four classes are declared once, per condition, in `vco_lib/deferral_conditions.toml`:
+
+| Disposition | Meaning | How it goes away |
+|---|---|---|
+| `action_required` | A human (or their Claude) has to do something. | Doing it — then the next update's read-only re-probe confirms and clears the entry. |
+| `auto_retryable` | A transient failure (a backend was down when a seed ran). Work is still owed, but VCO can do it itself. | The next successful run of the thing that failed. |
+| `environmental` | A true, live description of your machine (e.g. two Ollama daemons). Nothing is broken. | Changing the environment — or dismissing it, which holds until that state actually changes. |
+| `informational_record` | A record of something VCO already did, or a by-design skip. Nothing is pending. | Automatically, on the next update. |
+
+Earlier releases claimed every entry "disappears automatically when the underlying condition resolves". That was true only for some of them: a handful of conditions had no clear mechanism at all and survived forever even after the user did exactly what the entry asked. If you are on an install from before v0.2.91 and an entry will not go away, the honest answer is that nothing in that version could remove it — update, or dismiss it explicitly:
+
+```bash
+python -m vco_lib.project_init dismiss-deferral \
+  --folder /path/to/project --condition-id <condition_id>
+```
+
+Since v0.2.91 a dismissal has a MEMORY: for conditions that declare one, it holds until the underlying state genuinely changes (the Ollama port pair, the shipped reference templates, the parked upstream sidecars) — rewording the message does not re-fire it.
+
+You never need to delete the file by hand. Entries whose condition is provably over are removed by the read-only re-probe pass that now runs on **every** `install.py --update` and every bundle update — not only under `--apply-deferred`, which is what it required before v0.2.91 and which the launcher's own update path never passed.
 
 ## Scripts in `.claude/scripts/` don't run
 

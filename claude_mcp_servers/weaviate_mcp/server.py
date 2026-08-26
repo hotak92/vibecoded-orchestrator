@@ -719,6 +719,15 @@ def _emit_gate_skipped_deferral(collection: str) -> None:
     repeat call (cross-process) wouldn't accumulate duplicates within
     a single UPDATE_DEFERRED.md file.
 
+    v0.2.91 WP-B: the write goes through the LOCKED emitter
+    ``vco_lib.deferral_emit.emit`` rather than a hand-rolled
+    ``DeferralReport.read/add_entry/write`` triplet. This module runs as an
+    MCP SUBPROCESS whose lifetime overlaps arbitrary install / bundle-update
+    runs, so its read-modify-write is exactly the concurrent pair that could
+    interleave with ``InstallDeferralFlow.finalize()``'s and drop entries.
+    Both soft-fail legs below are unchanged: an unimportable ``vco_lib``
+    still means a silent skip, and any I/O failure is still swallowed.
+
     Never raises; silent on I/O failure so the silent-allow contract
     isn't broken by a missing project dir / unwritable file.
     """
@@ -738,17 +747,16 @@ def _emit_gate_skipped_deferral(collection: str) -> None:
         return
 
     try:
-        from vco_lib.deferral_report import (
+        from vco_lib.deferral_emit import (
             DeferralEntry,
-            DeferralReport,
+            emit,
         )
     except Exception:
         # vco_lib not on sys.path — silent skip. The metric still fired.
         return
 
     try:
-        report = DeferralReport.read(project_root)
-        # Upsert: DeferralReport.add_entry de-dups on condition_id, so
+        # Upsert: the emitter's `add_entry` de-dups on condition_id, so
         # even if a prior session left the entry behind it gets refreshed
         # rather than duplicated.
         entry = DeferralEntry(
@@ -784,8 +792,7 @@ def _emit_gate_skipped_deferral(collection: str) -> None:
             ),
             severity="warning",
         )
-        report.add_entry(entry)
-        report.write(project_root)
+        emit(project_root, entry)
     except Exception:
         # Any I/O failure here must not break the silent-allow contract.
         pass

@@ -87,10 +87,27 @@ def test_dismiss_stores_reference_hashes(tmp_path: Path, capsys) -> None:
     manifest = json.loads(
         (tmp_path / ".claude" / ".vco-manifest.json").read_text(encoding="utf-8")
     )
-    stored = manifest["dismissals"]["template_review_pending"]["reference_hashes"]
+    row = manifest["dismissals"]["template_review_pending"]
+    # v0.2.91 WP-B: the D9 memory now rides the ONE generalized mechanism
+    # (`vco_lib.deferral_dismissal`), so the manifest stores a computed KEY plus
+    # the field values it was computed from, instead of a per-family
+    # `reference_hashes` map. The SEMANTICS are unchanged and still asserted
+    # below (and by tests 2–4 in this file): the identity is the set of
+    # reference-sidecar hashes, so a new shipped reference re-fires the nudge
+    # and a rewording of the prose never does.
+    from vco_lib import deferral_dismissal as _dd  # noqa: PLC0415
+    from vco_lib.project_init import (  # noqa: PLC0415
+        _current_template_reference_hashes,
+    )
+
+    hashes = _current_template_reference_hashes(tmp_path)
     # Both existing sidecars hashed; MEMORY.md sidecar absent → omitted.
-    assert set(stored.keys()) == {"CLAUDE.md", "CONTEXT_STATE.md"}
-    assert "dismissed_at" in manifest["dismissals"]["template_review_pending"]
+    assert set(hashes.keys()) == {"CLAUDE.md", "CONTEXT_STATE.md"}
+    assert row["key"] == _dd.compute_key(
+        "template_review_pending", {"reference_hashes": hashes},
+    )
+    assert set(row["fields"]) == {"reference_hashes"}
+    assert "dismissed_at" in row
     # schema_version stays 2 (additive key).
     assert manifest["schema_version"] == 2
 

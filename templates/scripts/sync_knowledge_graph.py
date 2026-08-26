@@ -3203,6 +3203,12 @@ def main():
             # KG-4 (v0.2.75): refresh the .node_formats.json summaries after a
             # full resync (soft-fail — never changes the sync exit code).
             _regen_node_formats_after_full_sync()
+            # v0.2.91 WP-B: the paired clear (decision #12 — NARROW home). A
+            # tree sync that completed with zero failures is the proof the
+            # entry's premise ("the seed was skipped") no longer holds. A
+            # PARTIAL sync deliberately does not clear: the next clean run will.
+            if total_fail == 0:
+                _clear_sync_deferral_no_backend(PROJECT_ROOT)
             sys.exit(0 if total_fail == 0 else 1)
         elif sys.argv[1] == "--all-docs":
             doc_success, doc_fail = sync_all_docs(server)
@@ -3260,21 +3266,62 @@ def main():
                 pass
 
 
+#: The one condition id this script owns. Named once so the emitter and the
+#: paired clear can never drift apart (the v0.2.91 WP-B pairing).
+_SYNC_NO_BACKEND_CID = "kg_sync_no_embedding_backend"
+
+
+def _clear_sync_deferral_no_backend(install_root: Path) -> None:
+    """Resolve ``kg_sync_no_embedding_backend`` after a SUCCESSFUL tree sync.
+
+    v0.2.91 WP-B (decision #12 — the NARROW clear home). Before this, the
+    condition had no clear anywhere: not in install.py's owned set, not in the
+    bundle reconcile map, no ``resolve_conditions`` site. A user could fix their
+    backend, run a full successful sync, and the "KG sync skipped" entry stayed
+    in their ledger forever — while its sibling ``kg_summary_no_backend``
+    self-healed on its own success path (``embedding_service._clear_failure_deferral``).
+    This is that missing pair.
+
+    NARROW on purpose: only the end of a tree sync that FULLY succeeded clears
+    it. "A backend is reachable again" is NOT the same claim as "the seed
+    actually ran" — the entry says the seed was skipped, so only a completed
+    seed may retire it. (Re-running the seed automatically when the backend
+    returns is v0.2.91 WP-H's retry class, a separate mechanism.)
+
+    Soft-fail: the sync's exit code must never depend on ledger bookkeeping.
+    """
+    try:
+        from vco_lib.deferral_emit import resolve_conditions
+
+        resolve_conditions(install_root, (_SYNC_NO_BACKEND_CID,))
+    except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
+        print(f"   (deferral clear failed: {inner})", file=sys.stderr)
+
+
 def _emit_sync_deferral_no_backend(install_root: Path, exc: Exception) -> None:
     """Soft-fail deferral when no embedding backend is reachable at seed time.
 
     Adds an entry to ``<install_root>/.claude/context/UPDATE_DEFERRED.md``
     so install.py / the launcher can surface the issue. Idempotent (the
-    DeferralReport uses last-write-wins per ``condition_id``). Soft-fail
-    on any IO / import error — we're already in an error path.
+    emitter is last-write-wins per ``condition_id``). Soft-fail on any IO /
+    import error — we're already in an error path.
+
+    v0.2.91 WP-B: routed through the LOCKED emitter ``vco_lib.deferral_emit``.
+    This was the LAST shipped writer still hand-rolling the raw
+    ``DeferralReport.read/add_entry/write`` triplet that v0.2.83 WP-B1
+    eliminated everywhere else — and the most dangerous place for it, because
+    this script runs as a SUBPROCESS while install.py's own flow is live, so its
+    unlocked read/write pair could interleave with ``finalize()``'s and drop
+    entries. ``tests/test_deferral_registry_completeness_v0291.py`` now
+    source-scans for that triplet so it cannot come back.
     """
     try:
         # Import locally because vco_lib is on sys.path now (added at top
-        # of file), but the deferral_report module isn't strictly needed
-        # in the happy path — keep it lazy.
-        from vco_lib.deferral_report import DeferralEntry, DeferralReport
+        # of file), but the emitter isn't needed in the happy path — keep
+        # it lazy.
+        from vco_lib.deferral_emit import DeferralEntry, emit
         entry = DeferralEntry(
-            condition_id="kg_sync_no_embedding_backend",
+            condition_id=_SYNC_NO_BACKEND_CID,
             title="KG sync skipped: no embedding backend reachable",
             detected=(
                 "sync_knowledge_graph.py at install/seed time could not "
@@ -3283,8 +3330,13 @@ def _emit_sync_deferral_no_backend(install_root: Path, exc: Exception) -> None:
             ),
             why_deferred=(
                 "Soft-fail policy: install must never block on transient "
-                "service unavailability. Knowledge-graph search will be "
-                "empty until the next sync run succeeds. See "
+                "service unavailability. Knowledge-graph search stays empty "
+                "for this project until a sync run succeeds. This entry "
+                "clears itself at the end of the next FULLY successful tree "
+                "sync (`--all` with zero failures) — including the one the "
+                "next `install.py --update` runs for you once a backend is "
+                "reachable. Nothing else clears it: a backend simply being "
+                "up again does not mean the seed ran. See "
                 "~/.claude/metrics/embedding_failures.jsonl for the "
                 "per-backend diagnostic written by EmbeddingService."
             ),
@@ -3298,9 +3350,7 @@ def _emit_sync_deferral_no_backend(install_root: Path, exc: Exception) -> None:
                 "knowledge/concepts/embedding-service-v0218.md",
             ],
         )
-        report = DeferralReport.read(install_root)
-        report.add_entry(entry)
-        report.write(install_root)
+        emit(install_root, entry)
     except Exception as inner:
         # Soft-fail — don't escalate. The failure JSONL written by
         # NoEmbeddingBackendError already captures the diagnostic.

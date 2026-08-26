@@ -244,6 +244,22 @@ fn build_deferral_emit_script(
     )
 }
 
+// v0.2.91 WP-B — DISPOSITION lookup deliberately has NO wrapper here.
+//
+// The compiled registry mirror is `vct_launcher_core::deferral_registry`; its
+// `disposition_for` / `is_actionable` are the launcher-side API and are already
+// unit-tested + parity-locked against `vco_lib/deferral_conditions.toml`. A
+// pass-through wrapper in this crate would be dead code until the ledger UI
+// (WP-I) lands, and this repo consumes symbols rather than `#[allow(dead_code)]`
+// them. Call the core functions directly:
+//
+//     vct_launcher_core::deferral_registry::disposition_for(cid)   // tier
+//     vct_launcher_core::deferral_registry::is_actionable(cid)     // badge count
+//
+// `is_actionable` is the partition a badge must use (`action_required` +
+// `auto_retryable`); it matches Python's `split_by_disposition`, so the
+// launcher's count and the CLAUDE.md reminder's count cannot disagree.
+
 /// Quote `s` as a Python double-quoted string literal, escaping
 /// backslashes, double-quotes, and control characters so the result is
 /// safe to embed in a Python `-c` snippet. The single canonical copy of
@@ -344,6 +360,29 @@ mod tests {
             !script.contains("DeferralReport"),
             "settle payload must NOT reference the unlocked DeferralReport; got:\n{script}"
         );
+    }
+
+    /// v0.2.91 WP-B: every cid this crate emits through the bridge must be
+    /// CLASSIFIED, and classified the way the ledger UI will render it. Pinned
+    /// from the emitting side (not only inside the registry module) so a future
+    /// Rust emitter cannot ship a condition the table has never heard of.
+    #[test]
+    fn launcher_emitted_conditions_are_classified() {
+        use vct_launcher_core::deferral_registry as reg;
+
+        assert_eq!(reg::disposition_for("launcher_binary_stale"), "action_required");
+        assert_eq!(
+            reg::disposition_for("launcher_binary_clobber_averted"),
+            "informational_record"
+        );
+        assert_eq!(reg::disposition_for("kg_access_phantom_repaired"), "informational_record");
+        assert_eq!(reg::disposition_for("dual_ollama_detected"), "environmental");
+        // Unregistered ⇒ conservative default, and it counts as work.
+        assert_eq!(reg::disposition_for("no_such_condition_id"), "action_required");
+        assert!(reg::is_actionable("no_such_condition_id"));
+        // auto_retryable is owed work; a completed record is not.
+        assert!(reg::is_actionable("kg_sync_no_embedding_backend"));
+        assert!(!reg::is_actionable("launcher_binary_clobber_averted"));
     }
 
     #[test]

@@ -46,8 +46,11 @@ pip install -r requirements.txt -r requirements-dev.txt
 
 Run tests:
 ```bash
-pytest
+pytest                             # Python suite
+bash scripts/test-keychain-safe.sh # Rust workspace battery
 ```
+
+The Rust battery is **always** `bash scripts/test-keychain-safe.sh` (single-threaded, keychain-safe) — never a bare `cargo test --workspace`. The wrapper is what CI (`.github/workflows/ci.yml`) and the pre-ship Gate 2 (`scripts/pre-ship-check.sh`) run, so it is the only local invocation whose green means the same thing theirs does. It forwards extra arguments to cargo (`bash scripts/test-keychain-safe.sh secrets_cmd::`, `bash scripts/test-keychain-safe.sh --release`).
 
 Run linting:
 ```bash
@@ -61,7 +64,7 @@ pyright
 
 Pull requests run a deliberately small CI matrix on every push (`.github/workflows/ci.yml`):
 
-- **Rust** — `cargo test --lib --manifest-path launcher/src-tauri/Cargo.toml`. Library tests only. Full Tauri bundle builds are gated behind a release workflow because they need a per-OS matrix and a lot of platform deps.
+- **Rust** — `bash scripts/test-keychain-safe.sh` (`cargo test --workspace --tests`, single-threaded), plus a separate step for the `vct-cli` sub-workspace. Full Tauri bundle builds are gated behind a release workflow because they need a per-OS matrix and a lot of platform deps.
 - **Python** — `pytest tests/` on Python 3.12 with `requirements.txt` + `requirements-dev.txt`. Covers the trust-critical helpers: license validator, telemetry PII scrubbing + consent gating, install-flow detection.
 - **Frontend** — `npm run check` in `launcher/` (svelte-check + TypeScript). No frontend runtime tests yet — known gap. PRs that add a Playwright smoke test or component tests are welcome.
 

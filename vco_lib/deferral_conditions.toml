@@ -1,0 +1,911 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# deferral_conditions.toml — the DEFERRAL LIFECYCLE CONTRACT (v0.2.91 WP-B)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# ONE registry declaring, for EVERY deferral condition_id VCO can emit:
+#
+#   * `class`          — the disposition tier (what the reader owes it)
+#   * `owner`          — the module that emits it
+#   * `clear_probe`    — HOW it stops being listed (the lifecycle mechanism)
+#   * `emit_surfaces`  — where it renders besides the ledger
+#   * `dismiss_key`    — the stable fields forming its dismissal identity
+#
+# WHY this file exists
+# --------------------
+# Before v0.2.91 each condition's lifecycle lived only in scattered comments.
+# Three consequences, all field-observed:
+#   1. Conditions shipped with a DOCUMENTED self-clear protocol that was never
+#      implemented on either side (v0.2.54 Track D found two;
+#      `kg_sync_no_embedding_backend` and `orchestrator_user_modified_preserved`
+#      were two more, still immortal at v0.2.90).
+#   2. Severity was conflated with disposition: an "already done, no action
+#      needed" record rendered identically to a blocking migration, so the
+#      Claude-pickup channel silted up with stale FYIs and real signals drowned.
+#   3. Nothing could enumerate the conditions, so no test could notice a NEW
+#      cid shipping without a lifecycle.
+#
+# The registry makes all three a TEST FAILURE instead of a docstring lie:
+#   * `tests/test_deferral_registry_completeness_v0291.py` source-scans every
+#     emit site across Python + Rust and hard-fails on any cid absent here.
+#   * The same test validates the schema and asserts every `probe:py:<name>`
+#     resolves to a real callable in `vco_lib.deferral_probes.PROBES`.
+#
+# CLASSES (the `class` key) — the disposition tier
+# -----------------------------------------------
+#   action_required     A human (or their Claude) must DO something. The
+#                       default for anything not positively known to be
+#                       otherwise — misclassifying downward hides work.
+#   auto_retryable      A transient failure VCO can retry on its own once the
+#                       precondition returns (backend up, daemon started).
+#                       The retry machinery itself is v0.2.91 WP-H; the class
+#                       is what marks a cid as ITS tenant.
+#   environmental       A true, live description of the user's machine that
+#                       persists while the machine looks that way. Nothing is
+#                       broken; VCO cannot and should not "fix" it.
+#   informational_record  A record of an action ALREADY COMPLETED, or a
+#                       by-design skip. Nothing is pending. These must not
+#                       require a manual action to disappear.
+#
+# CLEAR PROBES (the `clear_probe` key) — the lifecycle mechanism
+# -------------------------------------------------------------
+#   owned-drop-when-absent  install.py OWNS the cid: it re-detects it on every
+#                       run, and `InstallDeferralFlow.finalize()` rebuilds the
+#                       ledger from the run report, so an owned cid NOT
+#                       re-detected this run simply disappears. For a cid
+#                       install.py never emits (a Rust-emitted record), the
+#                       same ownership yields ONE-SHOT AUTO-EXPIRY on the next
+#                       update — the `stale_unit_retired_` precedent.
+#                       ⚠ Only safe when the emitter does NOT run inside an
+#                       install.py run: a same-run emit would be dropped by
+#                       that run's own finalize.
+#   bundle-reconciled   `vco_lib.project_init._reconcile_bundle_deferrals`
+#                       recomputes the condition on every bundle update and
+#                       clears it when it no longer applies.
+#   paired-resolution   A specific success path or re-probe calls
+#                       `resolve_conditions` / `mark_resolved` for this exact
+#                       cid. `notes` names the site.
+#   probe:py:<name>     A named read-only probe in `vco_lib.deferral_probes`.
+#                       Run by install.py's re-probe pass on EVERY `--update`
+#                       (v0.2.91 promoted it out of `--apply-deferred`) and by
+#                       the bundle-update reconcile.
+#   probe:rs:<name>     A named probe owned by the launcher (Rust), which sees
+#                       state Python cannot (e.g. the RUNNING process's
+#                       version). `notes` names the site.
+#   manual-dismiss      No automatic clear exists. The generic
+#                       `python -m vco_lib.project_init dismiss-deferral` is
+#                       the only exit. This value is an HONEST admission, not
+#                       an aspiration — never write a probe name here that
+#                       does not exist.
+#
+# DISMISS KEYS (the `dismiss_key` key) — generalized dismissal memory
+# ------------------------------------------------------------------
+# An ordered list of stable detected-state field NAMES. `vco_lib.deferral_dismissal`
+# computes ONE key = `cid + normalized(values of those fields)`; a dismissal
+# holds until the KEY changes. Cosmetic rewording of the entry's prose can
+# therefore never re-fire a dismissal — the failure mode that made a raw
+# hash-of-`detected` unacceptable (v0.2.91 decision #17). A cid with NO
+# declared key gets `manual` semantics: the dismissal holds until the cid is
+# cleared by its clear_probe or dismissed again.
+#
+# MATCHING (the `match` key)
+# --------------------------
+#   exact (default)  the table key IS the condition_id.
+#   glob             the table key is an fnmatch pattern with `*` wildcards
+#                    (dynamically-suffixed families). Lookup order: exact
+#                    first, then globs by DESCENDING literal length, so
+#                    `stale_unit_retired_*_backup_failed` wins over
+#                    `stale_unit_retired_*`.
+#
+# CROSS-LANGUAGE
+# --------------
+# Rust reads a compile-time mirror
+# (`launcher/src-tauri/vct-launcher-core/src/deferral_registry.rs`,
+# `include_str!` of THIS file) drift-locked by
+# `launcher/src-tauri/tests/deferral_registry_parity.rs` +
+# `tests/test_deferral_registry_parity_v0291.py` — the same tier-(B)
+# shared-config discipline as `mcp_scan_rules.toml`. The include path must
+# follow any future move of this file in lockstep.
+#
+# ADDING A CONDITION
+# ------------------
+# Emit sites and this table land in the SAME commit. The completeness test is
+# a hard gate — there is no warn-only grace period (zero-deferral rule).
+
+format_version = 1
+
+# ═══════════════════════════════════════════════════════════════════════════
+# install.py-owned conditions (family A — drop-when-absent)
+# ═══════════════════════════════════════════════════════════════════════════
+
+[conditions.env_secrets_retained_in_plaintext]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.env_secrets_hub_migration_failed]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.env_secrets_hub_migration_partial]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.weaviate_unreachable_at_update]
+class = "auto_retryable"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """The re-probe pass also re-checks reachability every --update; the \
+SIDE-EFFECTFUL `podman start` remediation stays behind --apply-deferred."""
+
+[conditions.rebuild_pending_seed]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.podman_daemon_start_failed]
+class = "auto_retryable"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.orchestrator_self_user_modified_preserved]
+class = "informational_record"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+status = "retired"
+notes = """Producer DELETED in v0.2.85 (root install moved to the delegated \
+install-bundle path). Kept owned so a pre-.85 on-disk entry drains."""
+
+[conditions.searxng_removed_from_default_install]
+class = "informational_record"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+status = "retired"
+notes = "Producer removed in v0.2.83; kept owned so pre-.83 entries drain."
+
+[conditions.compose_overlay_ambiguous]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "Re-probe pass reports it; resolution needs a human GPU-vendor choice."
+
+[conditions.dual_ollama_detected]
+class = "environmental"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+dismiss_key = ["alt_port", "canon_port"]
+notes = """v0.2.91 decision #9: a user legitimately running a personal Ollama \
+alongside the VCO container gets a TRUE, permanent description of their \
+machine. One dismissal holds until the (alt, canon) port pair changes."""
+
+[conditions.schema_drift_rebuild_required]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """Also re-probed by the install.py re-probe pass (drift gone ⇒ \
+resolved); the rebuild itself stays behind explicit --rebuild-collections."""
+
+[conditions.legacy_shared_kg_class_present]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.orphan_orchestrator_development_collection]
+class = "action_required"
+owner = "vco_lib.install_weaviate"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "Also re-probed by the install.py re-probe pass (v0.2.46 handler)."
+
+[conditions.links_to_property_schema_drift]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.kg_binding_self_heal_db_error]
+class = "action_required"
+owner = "vco_lib.kg_binding_heal"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.kg_binding_self_healed]
+class = "informational_record"
+owner = "vco_lib.kg_binding_heal"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.multi_candidate_prefix_adopt]
+class = "action_required"
+owner = "vco_lib.kg_binding_heal"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.launcher_install_path_seed_unavailable]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.orchestrator_root_kg_collection_locked]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.ollama_mcp_deprecated]
+class = "informational_record"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.search_mcp_simplified]
+class = "informational_record"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.stale_mcp_json_shadow_quarantined]
+class = "informational_record"
+owner = "vco_lib.install_weaviate"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.stale_mcp_json_restore_detected]
+class = "informational_record"
+owner = "vco_lib.install_weaviate"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.launcher_restart_required]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger", "gui_banner"]
+notes = """Also cleared by the Rust restart flow (restart.rs::clear_restart_deferral \
+strips the Markdown section — the ONE cid in _RUST_STRIPPABLE_CONDITION_IDS) and \
+by the install.py re-probe pass (restart marker / old-PID liveness)."""
+
+[conditions.launcher_binary_swap_failed_locked]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger", "gui_banner"]
+notes = """Rendered as the red recovery banner: restart.rs::get_launcher_restart_status \
+sets `swap_failed_locked` from this section and surfaces its Detected prose verbatim."""
+
+[conditions.update_resume_required]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger", "gui_badge"]
+notes = """Also re-probed by the install.py re-probe pass (resume sentinel \
+absent ⇒ resolved) and dual-unlinked by installer.rs on a completed resume."""
+
+[conditions.untracked_collision_divergent]
+class = "action_required"
+owner = "launcher/src-tauri/src/commands/installer.rs"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger", "gui_modal"]
+notes = "Also settled directly by the GUI resolver via resolve_deferral_conditions."
+
+[conditions.autostash_pop_conflict]
+class = "action_required"
+owner = "launcher/src-tauri/src/commands/installer.rs"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger", "gui_modal"]
+notes = "Also settled directly by the GUI resolver via resolve_deferral_conditions."
+
+[conditions.vct_hub_binary_unavailable]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.mcp_registration_no_venv]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.mcp_registration_python_fallback]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.mcp_registration_failed]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.stale_mcp_entry]
+class = "action_required"
+owner = "vco_lib.install_mcp"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.stale_mcp_rewrite_quiet_skipped]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.stale_mcp_rewrite_declined]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.stale_mcp_rewrite_summary]
+class = "informational_record"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.deprecated_mcp_removal_quiet_skipped]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.deprecated_mcp_removal_declined]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.deprecated_mcp_removal_lock_failed]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.deprecated_mcp_removal_write_failed]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.deprecated_mcp_removal_summary]
+class = "informational_record"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.global_lean_ctx_hooks_detected]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.boot_service_path_repaired]
+class = "informational_record"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.claude_settings_unparseable]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions.claude_settings_user_modified_preserved]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+# ── install.py-owned PREFIX families ───────────────────────────────────────
+
+[conditions."schema_migration_failed_*"]
+match = "glob"
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions."kg_named_vector_slot_error_*"]
+match = "glob"
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "Also re-probed by the install.py re-probe pass (slot present ⇒ resolved)."
+
+[conditions."lowercase_codegraph_residual_*"]
+match = "glob"
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions."schema_migration_required_*"]
+match = "glob"
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions."deprecated_mcp_*"]
+match = "glob"
+class = "informational_record"
+owner = "vco_lib.install_mcp"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions."bundle_pin_drift_*"]
+match = "glob"
+class = "action_required"
+owner = "vco_lib.install_npm"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
+[conditions."stale_unit_retired_*"]
+match = "glob"
+class = "informational_record"
+owner = "vco_lib.unit_reconcile"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """The ORIGINAL one-shot-record precedent: install.py never re-emits \
+these, so ownership alone auto-expires them on the next update."""
+
+[conditions."stale_unit_retired_*_backup_failed"]
+match = "glob"
+class = "action_required"
+owner = "vco_lib.unit_reconcile"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """A FAILED backup inside the retirement family is genuinely \
+actionable — the longer glob wins over `stale_unit_retired_*`."""
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Bundle-reconciled conditions (family B)
+# ═══════════════════════════════════════════════════════════════════════════
+
+[conditions.bundle_user_modified_preserved]
+class = "action_required"
+owner = "vco_lib.project_init"
+clear_probe = "bundle-reconciled"
+emit_surfaces = ["ledger"]
+
+[conditions.bundle_skipped_existing_files]
+class = "informational_record"
+owner = "vco_lib.project_init"
+clear_probe = "bundle-reconciled"
+emit_surfaces = ["ledger"]
+
+[conditions.bundle_user_modified_deletion_preserved]
+class = "action_required"
+owner = "vco_lib.project_init"
+clear_probe = "bundle-reconciled"
+emit_surfaces = ["ledger"]
+
+[conditions.kg_collection_legacy_candidates]
+class = "action_required"
+owner = "vco_lib.project_init"
+clear_probe = "bundle-reconciled"
+emit_surfaces = ["ledger"]
+
+[conditions.codegraph_collection_legacy_candidates]
+class = "action_required"
+owner = "vco_lib.project_init"
+clear_probe = "bundle-reconciled"
+emit_surfaces = ["ledger"]
+
+[conditions.legacy_vscode_mcp_env_keys_present]
+class = "action_required"
+owner = "vco_lib.project_init"
+clear_probe = "bundle-reconciled"
+emit_surfaces = ["ledger"]
+
+[conditions.stale_codegraph_wrapper_pending]
+class = "action_required"
+owner = "launcher/src-tauri/src/commands/codegraph.rs"
+clear_probe = "bundle-reconciled"
+emit_surfaces = ["ledger"]
+notes = """Probed clear (`_codegraph_wrapper_still_stale`) — the precedent the \
+v0.2.91 sidecar re-probe for orchestrator_user_modified_preserved follows."""
+
+[conditions.user_secret_values_retained_in_tree]
+class = "action_required"
+owner = "vco_lib.project_init"
+clear_probe = "bundle-reconciled"
+emit_surfaces = ["ledger"]
+notes = "Probed clear (B-F8 re-scan) on every bundle update."
+
+[conditions.template_review_pending]
+class = "informational_record"
+owner = "vco_lib.project_init"
+clear_probe = "bundle-reconciled"
+emit_surfaces = ["ledger"]
+dismiss_key = ["reference_hashes"]
+notes = """v0.2.91 decision #7: keeps emitting, but tiers as a record so the \
+13/13-projects field noise collapses under the GUI's Records fold. Its \
+content-keyed dismissal (v0.2.83 D9 reference-sidecar hashes) is now ONE \
+instance of the generalized dismiss_key mechanism, not a bespoke path."""
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Paired-resolution conditions (family C)
+# ═══════════════════════════════════════════════════════════════════════════
+
+[conditions.kg_summary_no_backend]
+class = "auto_retryable"
+owner = "vco_lib.embedding_service"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = """Cleared by `embedding_service._clear_failure_deferral` on the \
+success path — the model `kg_sync_no_embedding_backend` copies in v0.2.91."""
+
+[conditions.kg_sync_no_embedding_backend]
+class = "auto_retryable"
+owner = "templates/scripts/sync_knowledge_graph.py"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = """v0.2.91: the emitter finally routes through the LOCKED emitter \
+(vco_lib.deferral_emit) and the clear is paired at the NARROW home (decision \
+#12) — the end of a SUCCESSFUL tree sync, which proves the seed actually ran. \
+Retry machinery (re-run the owed seed when the backend returns) is WP-H."""
+
+[conditions.codegraph_embed_resync_pending]
+class = "auto_retryable"
+owner = "vco_lib.codegraph_resync"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = """Cleared on a positive-zero owed probe (install.py R-6) or by the \
+detached driver when it converges. v0.2.91 WP-C fixes the entity-orphan floor \
+that kept the owed count from ever reaching zero."""
+
+[conditions.residue_cleanup_pending]
+class = "action_required"
+owner = "vco_lib.knowledge_residue"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+
+[conditions.residue_cleanup_removed]
+class = "informational_record"
+owner = "vco_lib.knowledge_residue"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+
+[conditions.compose_override_renamed]
+class = "informational_record"
+owner = "vco_lib.project_init"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = "Reconcile-when-inactive (project_init) + install.py run-report replay."
+
+[conditions.compose_override_rename_failed]
+class = "action_required"
+owner = "vco_lib.project_init"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+
+[conditions.compose_override_filename_conflict]
+class = "action_required"
+owner = "vco_lib.project_init"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+
+[conditions.schema_migration_required]
+class = "action_required"
+owner = "vco_lib.project_init"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = "A clean migrate-collections dry-run clears it (project_init)."
+
+[conditions.chunker_preset_overhaul_pending]
+class = "action_required"
+owner = "vco_lib.project_init"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = "Settled by the Rust chunker-revision flow once the re-sync lands."
+
+[conditions.launcher_update_diverged]
+class = "action_required"
+owner = "launcher/src-tauri/src/commands/git_user_editable_merge.rs"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger", "gui_modal"]
+notes = "Re-probed by the install.py re-probe pass (version caught up ⇒ resolved)."
+
+[conditions.generated_files_reconciled]
+class = "informational_record"
+owner = "launcher/src-tauri/src/commands/git_user_editable_merge.rs"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger", "auto_resolutions_jsonl"]
+notes = """One-shot audit record: reaching install.py at all proves the merge \
+that wrote it completed, so the re-probe pass resolves it unconditionally. \
+v0.2.91 promotion means that now happens on EVERY --update, not only under \
+--apply-deferred."""
+
+[conditions.hub_restart_failed_after_abort]
+class = "action_required"
+owner = "launcher/src-tauri/src/commands/installer.rs"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = """Re-probed by the install.py re-probe pass; clears ONLY on positive \
+evidence (hub sidecar version caught up AND a live /health answer)."""
+
+[conditions.codegraph_rename_split_pending]
+class = "informational_record"
+owner = "launcher/src-tauri/src/commands/binding_reconcile.rs"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+status = "retired"
+notes = """Pre-v0.2.89 emitter is GONE (collection names became immutable). \
+binding_reconcile still RESOLVES a residual on-disk entry at boot."""
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Probe-cleared conditions (v0.2.91 — the immortal-cid fixes)
+# ═══════════════════════════════════════════════════════════════════════════
+
+[conditions.orchestrator_user_modified_preserved]
+class = "action_required"
+owner = "launcher/src-tauri/src/commands/git_user_editable_merge.rs"
+clear_probe = "probe:py:orchestrator_sidecars_still_present"
+emit_surfaces = ["ledger"]
+dismiss_key = ["preserved_sidecars"]
+notes = """v0.2.91: had NO lifecycle at all (31 days and counting on the \
+maintainer's own install). The entry names its `<path>.from-upstream-<sha>` \
+sidecars; once the user has accepted or deleted every one of them the \
+condition is objectively over, so the probe resolves it. Follows the \
+`stale_codegraph_wrapper_pending` probed-clear precedent."""
+
+[conditions.launcher_binary_stale]
+class = "action_required"
+owner = "launcher/src-tauri/src/services/binary_freshness.rs"
+clear_probe = "probe:py:launcher_binary_stale_still_applies"
+emit_surfaces = ["ledger", "gui_banner"]
+notes = """v0.2.91 WP-A. Rendered as the persistent (non-actionable) stale-binary \
+banner: restart.rs::get_launcher_restart_status sets `binary_stale` + the two \
+parsed versions from this section. The emit is latched once per launcher process \
+(STALE_CONDITION_EMITTED), so the clear MUST be probe-driven — an \
+emit-refresh clear could never fire. The canonical probe is the Rust \
+freshness probe at boot (it alone sees the RUNNING process version); the \
+Python probe here is the complementary leg that runs on every `--update`, \
+uses TRACKED-ONLY dist dirtiness (matching the v0.2.91 MAJOR-1 `-uno` fix), \
+and clears only on positive evidence that no launcher is holding a stale \
+image. A wrongly-cleared entry is re-emitted at the next launcher boot while \
+the condition holds, which is what makes the Python leg safe."""
+
+[conditions.launcher_binary_handoff_skipped_dirty]
+class = "action_required"
+owner = "launcher/src-tauri/src/services/binary_freshness.rs"
+clear_probe = "probe:py:launcher_dist_still_dirty"
+emit_surfaces = ["ledger"]
+notes = """v0.2.91 WP-A. Fully observable from Python: the condition is over \
+when `launcher/dist/<arch>/` is clean vs HEAD (tracked-only) and no staged \
+`.new` sibling is left waiting."""
+
+[conditions.launcher_binary_clobber_averted]
+class = "informational_record"
+owner = "launcher/src-tauri/src/services/binary_freshness.rs"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger", "auto_resolutions_jsonl"]
+notes = """v0.2.91 WP-A. A record of an averted clobber — nothing is pending. \
+Emitted by the launcher outside or before an install run; the record may expire \
+on that run's resume — its audit trail (the update_binary_clobber_averted row \
+plus the auto-resolutions.jsonl line) survives. Registry ownership is what gives \
+it that clean one-shot expiry (the `stale_unit_retired_` precedent extended to a \
+Rust-emitted record)."""
+
+[conditions.kg_access_phantom_repaired]
+class = "informational_record"
+owner = "launcher/src-tauri/src/commands/binding_reconcile.rs"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger", "auto_resolutions_jsonl"]
+notes = """v0.2.91: a record whose own body says "No action needed" must not \
+require a manual action to remove. Emitted at launcher BOOT (never inside an \
+install.py run), so ownership expires it one-shot on the next update."""
+
+[conditions.codegraph_binding_repaired]
+class = "informational_record"
+owner = "launcher/src-tauri/src/commands/binding_reconcile.rs"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger", "auto_resolutions_jsonl"]
+notes = "Same boot-time record class as kg_access_phantom_repaired."
+
+[conditions.hard_cut_performed]
+class = "informational_record"
+owner = "vco_lib.hard_cut"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger", "auto_resolutions_jsonl"]
+notes = """Invoked as its own subprocess from the launcher (never inside an \
+install.py run), so ownership expires the record one-shot."""
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Environmental conditions
+# ═══════════════════════════════════════════════════════════════════════════
+
+[conditions.symlink_preserved_under_install_path]
+class = "environmental"
+owner = "vco_lib.symlink_handler"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+notes = """A symlink the USER put under the install path. VCO never touches \
+it; the entry is a true description of their layout."""
+
+[conditions.safe_add_skipped_env_merge]
+class = "informational_record"
+owner = "vco_lib.project_init"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+notes = """By-design skip, permanent for every safe-add project. The entry \
+already offers dismiss-deferral."""
+
+[conditions.safe_add_git_exclude_updated]
+class = "informational_record"
+owner = "vco_lib.project_init"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+
+[conditions.override_yml_user_customization_preserved]
+class = "informational_record"
+owner = "launcher/src-tauri/src/commands/storage_ux.rs"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# No automatic clear today (family D — honest `manual-dismiss`)
+#
+# Every row here is a CANDIDATE for a probe. They are recorded as
+# manual-dismiss because that is what the code does TODAY; writing an
+# aspirational probe name would recreate the documented-protocol-never-
+# implemented failure class this registry exists to end.
+# ═══════════════════════════════════════════════════════════════════════════
+
+[conditions.vco_new_sibling_collision]
+class = "action_required"
+owner = "vco_lib.symlink_handler"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+
+[conditions.env_secrets_project_not_registered]
+class = "action_required"
+owner = "vco_lib.install_env_secret_scope"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+
+[conditions.module_update_partial_failure]
+class = "action_required"
+owner = "launcher/src-tauri/src/commands/module_updates.rs"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+
+[conditions.codegraph_binding_phantom]
+class = "action_required"
+owner = "launcher/src-tauri/src/commands/binding_reconcile.rs"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+
+[conditions.codegraph_prefix_drift_detected]
+class = "action_required"
+owner = "vco_lib.project_init"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+
+[conditions.codegraph_registry_reconcile_deferred]
+class = "action_required"
+owner = "vco_lib.codegraph_registry_reconcile"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+
+[conditions.codegraph_access_list_reprojection_failed]
+class = "action_required"
+owner = "vco_lib.config_projection"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+
+[conditions.code_formats_schema_migration_pending]
+class = "action_required"
+owner = "vco_lib.project_init"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+
+[conditions.regenerated_data_schema_migration_pending]
+class = "action_required"
+owner = "vco_lib.project_init"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+
+[conditions.legacy_bash_env_cleanup_pending]
+class = "action_required"
+owner = "vco_lib.project_init"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+
+[conditions.orphan_code_collections_detected]
+class = "action_required"
+owner = "vco_lib.project_init"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+
+[conditions.shared_kg_pointer_drift_unresolved]
+class = "action_required"
+owner = "vco_lib.kg_binding_heal"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+
+[conditions.schema_migration_refuse_downgrade]
+class = "action_required"
+owner = "vco_lib.schema_migration_runner"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+
+[conditions."schema_regenerate_or_defer_*"]
+match = "glob"
+class = "action_required"
+owner = "vco_lib.schema_migration_runner"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+
+[conditions."schema_reingest_incomplete_*"]
+match = "glob"
+class = "action_required"
+owner = "vco_lib.schema_regenerate"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+
+[conditions.foreign_rows_pruned]
+class = "informational_record"
+owner = "vco_lib.collection_repair"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+
+[conditions.weaviate_unreachable_at_bootstrap]
+class = "auto_retryable"
+owner = "vco_lib.project_init"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+notes = "Bootstrap re-runs heal the DATA; the ledger row is a WP-H candidate."
+
+[conditions.code_graph_no_embedding_backend]
+class = "auto_retryable"
+owner = "templates/scripts/analyze_code_graph.py"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+notes = """Sibling of kg_sync_no_embedding_backend. v0.2.91 WP-H owns pairing \
+its clear + retry (analyzer file, outside WP-B's edit set)."""
+
+[conditions.code_graph_code_backend_unreachable]
+class = "auto_retryable"
+owner = "templates/scripts/analyze_code_graph.py"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+notes = "Same WP-H pairing audit as code_graph_no_embedding_backend."
+
+[conditions.storage_migration_windows_manual]
+class = "action_required"
+owner = "launcher/src-tauri/src/commands/storage_ux.rs"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+
+[conditions.storage_migration_partial]
+class = "action_required"
+owner = "launcher/src-tauri/src/commands/storage_ux.rs"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]
+
+[conditions.gate_skipped_no_project_id]
+class = "action_required"
+owner = "claude_mcp_servers/weaviate_mcp/server.py"
+clear_probe = "manual-dismiss"
+emit_surfaces = ["ledger"]

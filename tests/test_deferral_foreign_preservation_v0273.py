@@ -230,37 +230,58 @@ class TestForeignSurvivesUpdateWrite(unittest.TestCase):
 
 
 class TestInstallOwnershipSet(unittest.TestCase):
-    """Guards on install.py's ownership constants (import-shape only —
-    running main() is out of scope for a unit test)."""
+    """Guards on install.py's ownership constants.
+
+    v0.2.91 WP-B: the ownership FACT moved out of an install.py literal and
+    into `vco_lib/deferral_conditions.toml` (rows whose
+    `clear_probe = "owned-drop-when-absent"`). These guards therefore assert
+    against the RESOLVED set instead of a source substring — which is strictly
+    stronger: the old text scan would have passed on a set that failed to load,
+    and would have missed an id owned via a glob family.
+    """
 
     @classmethod
     def setUpClass(cls):
-        # install.py executes heavy top-level code on import; parse the
-        # constants textually instead (stable anchors).
         cls.source = (REPO_ROOT / "install.py").read_text(encoding="utf-8")
+        from vco_lib import deferral_registry as _dr  # noqa: PLC0415
+
+        cls.owned = set(_dr.install_owned_ids())
+        cls.prefixes = tuple(_dr.install_owned_prefixes())
 
     def test_resync_ledger_cid_not_owned(self):
         """`codegraph_embed_resync_pending` must NEVER enter the owned set —
-        it is an owed-work ledger entry resolved explicitly by the probe."""
-        start = self.source.index("_INSTALL_OWNED_CONDITION_IDS = frozenset({")
-        end = self.source.index("})", start)
-        block = self.source[start:end]
-        self.assertNotIn("codegraph_embed_resync_pending", block)
+        it is an owed-work ledger entry resolved explicitly by the probe.
+        Owning it would silently clobber it on every update (the A-2 bug)."""
+        self.assertNotIn("codegraph_embed_resync_pending", self.owned)
+        self.assertFalse(
+            any(
+                "codegraph_embed_resync_pending".startswith(p)
+                for p in self.prefixes
+            ),
+            "no owned prefix family may swallow the resync ledger cid",
+        )
 
     def test_update_flow_collision_cids_owned(self):
         """v0.2.88 (MAJOR-3): the two launcher-emitted update-flow collision
         deferrals must be in the owned set so a completed GUI resolution
         drop-when-absent self-clears them (the exact update_resume_required
         lifecycle) instead of nagging every session forever."""
-        start = self.source.index("_INSTALL_OWNED_CONDITION_IDS = frozenset({")
-        end = self.source.index("})", start)
-        block = self.source[start:end]
-        self.assertIn('"untracked_collision_divergent"', block)
-        self.assertIn('"autostash_pop_conflict"', block)
+        self.assertIn("untracked_collision_divergent", self.owned)
+        self.assertIn("autostash_pop_conflict", self.owned)
 
     def test_owned_set_and_prefixes_exist(self):
-        self.assertIn("_INSTALL_OWNED_CONDITION_IDS = frozenset({", self.source)
-        self.assertIn("_INSTALL_OWNED_CONDITION_PREFIXES = (", self.source)
+        # The constants keep their names + types; only their SOURCE moved.
+        self.assertIn(
+            "_INSTALL_OWNED_CONDITION_IDS = _deferral_registry.install_owned_ids()",
+            self.source,
+        )
+        self.assertIn(
+            "_INSTALL_OWNED_CONDITION_PREFIXES = "
+            "_deferral_registry.install_owned_prefixes()",
+            self.source,
+        )
+        self.assertTrue(self.owned, "the derived owned set must not be empty")
+        self.assertTrue(self.prefixes, "owned prefix families must not be empty")
         # P2c-b (v0.2.75): the seed/finalize choreography moved to
         # vco_lib.install_deferral_flow — main() must hold the A-2 seed
         # call site (the flow is constructed with the owned sets above).
