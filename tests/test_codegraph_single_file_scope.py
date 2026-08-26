@@ -480,10 +480,18 @@ def test_analyze_only_files_from_prunes_deleted_path(
         [_Obj("mod-gone", "path", "gone.py"),
          _Obj("mod-keep", "path", "gone_helper.py")],
     )
+    # v0.2.91 (WP-C): the surviving sibling is anchored to `gone_helper.py` — a
+    # file that EXISTS on disk and is NOT in this batch. Anchoring it to
+    # `present.py` (a file the batch WALKS) would make it a legitimate
+    # entity-orphan for the per-file reconcile (a row for an entity the walk did
+    # not emit) and it would be deleted BY DESIGN, which is a different
+    # invariant. Keeping it on an unwalked file preserves this test's actual
+    # intent — the deleted-file prune must not over-delete a token-sharing
+    # sibling — and additionally pins the reconcile's leave-alone side.
     analyzer.functions_collection = _FakeCollWithDelete(
         f"{proj}_CodeFunction", "file_path",
         [_Obj("fn-gone", "file_path", "gone.py"),
-         _Obj("fn-keep", "file_path", "present.py")],
+         _Obj("fn-keep", "file_path", "gone_helper.py")],
     )
     analyzer.classes_collection = _FakeCollWithDelete(
         f"{proj}_CodeClass", "file_path", [],
@@ -518,7 +526,7 @@ def test_analyze_only_files_from_prunes_deleted_path(
         "the exact gone.py function row is deleted"
     )
     assert "fn-keep" not in analyzer.functions_collection.data.deleted_ids, (
-        "present.py (real file) must NOT be deleted"
+        "gone_helper.py (real file, unwalked, token-sharing) must NOT be deleted"
     )
 
 

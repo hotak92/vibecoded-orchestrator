@@ -39,8 +39,15 @@ _ANALYZER = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 # thin write+cache shims). Net after the full Part: 7335 -> 7363 (the writer
 # outweighs the python removal by ~28 lines — the ONE small justified net
 # increase in this ratchet's history, for a consolidation that makes the write
-# lifecycle single-homed and reviewable). Re-pinned to the measured value.
-_ANALYZER_LINES_MAX = 7363
+# lifecycle single-homed and reviewable).
+#
+# WP-C (v0.2.91): the per-file entity reconcile landed as a vco_lib engine
+# (``codegraph_resync.reconcile_walked_file_rows``) with only the scope
+# bookkeeping + one call site left analyzer-side, and the ONE file-row delete
+# primitive (``_delete_file_rows_exact``, ~105 lines incl. its banner) MOVED to
+# the same vco_lib module — the engine needs the same deleter, so one home. Net
+# 7363 -> 7361. Re-pinned DOWNWARD to the measured value.
+_ANALYZER_LINES_MAX = 7361
 
 
 def _measure() -> int:

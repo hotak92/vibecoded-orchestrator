@@ -330,6 +330,32 @@ def _noop_mark(_path: str) -> None:
     """Fallback for the ``_mark_file_walked`` getattr guard (minimal test stubs)."""
 
 
+def _note_written_uuid(analyzer, collection_name: str, uid: str) -> None:
+    """Record ONE UUID this walk upserted. The single recording point.
+
+    Two consumers:
+      * ``visited_uuids`` — the ``--prune-stale`` visited set (gated on
+        ``_track_visited``; semantics unchanged since v0.2.16);
+      * the OPEN per-file reconcile scope (``_reconcile_pending``, v0.2.91 /
+        WP-C) — every row written for the file currently being walked, so the
+        end-of-walk reconcile can delete rows anchored to that SAME file that
+        this walk did NOT write (an entity refactored out of a surviving file,
+        or an old-identity duplicate row). Ungated: the reconcile must work on
+        every walk, not only ``--prune-stale`` ones. (Scope shape: the 3-tuple
+        ``(key, written, withdrawn_prev)``; only ``written`` is touched here.)
+
+    Module-level (not a method) so the write choke-points keep working for the
+    minimal test stubs that bind ``_write_one_object`` / ``_dedup_insert`` as
+    unbound methods onto bare objects — same tolerance ``_noop_mark`` gives
+    ``_mark_file_walked``.
+    """
+    if getattr(analyzer, "_track_visited", False):
+        analyzer.visited_uuids.add((collection_name, uid))
+    pending = getattr(analyzer, "_reconcile_pending", None)
+    if pending is not None:
+        pending[1].setdefault(collection_name, set()).add(str(uid))
+
+
 def _stable_scalar(value: Any) -> str:
     """Render a property value into a stable, order-independent string.
 
@@ -566,6 +592,13 @@ try:
     from vco_lib.codegraph_resync import (
         union_stale_into_changed as _union_stale_into_changed_impl,
         log_vectorless_degrade as _log_vectorless_degrade,
+        # v0.2.91 (WP-C): the ONE file-row deleter + the per-file entity
+        # reconcile that closes the entity-orphan convergence gap.
+        delete_file_rows_exact as _delete_file_rows_exact_impl,
+        primary_sources_for as _primary_sources_for,
+        reconcile_walked_file_rows as _reconcile_walked_file_rows,
+        open_walked_file_scope as _open_scope,
+        commit_walked_file_scope as _commit_scope,
     )
     # v0.2.77 Part 5 (CG-2): ONE facade for cross-language call extraction.
     # Dependency-free to import (tree-sitter grammars are lazy-loaded inside
@@ -919,23 +952,6 @@ def _resolve_index_dot_claude(cli_value: Optional[bool], repo_path: Path) -> boo
     return _looks_like_orchestrator_root(repo_path)
 
 
-# ---------------------------------------------------------------------------
-# v0.2.74 (R3 / D1 orphan-clear): the ONE safe file-row delete primitive.
-#
-# `file_path` (CodeFunction/CodeClass) and `path` (CodeModule) are TEXT with
-# DEFAULT (word) tokenization. A Weaviate `Filter.by_property(...).equal(rel)`
-# or `.like(...)` matches on TOKENS, not the exact string, and can OVER-DELETE
-# sibling files whose token set overlaps (live-diagnosed 2026-07-04: a
-# `Like "*.claude/state/*"` would have swept ~5.5k REAL functions whose backup
-# copies share the `claude`/`state` tokens). The ONLY safe delete is: read the
-# raw property back per row, compare in PYTHON (exact string / on-disk test),
-# and `delete_by_id` ONLY the confirmed matches. This mirrors
-# `migrations/codegraph_collection/6_to_7.py::_purge_transient_rows` and is the
-# single home for both the deleted-file prune (FIX-B) and the orphan-clear
-# convergence fix (D1). NEVER add a tokenized Like/Equal DELETE elsewhere.
-# ---------------------------------------------------------------------------
-
-
 # X-1 / v0.2.76 (ruling #1): the classifier functions (path_is_ignored /
 # path_reachable_on_disk / classify_row) are now IMPORTED from
 # vco_lib.codegraph_row_classify at module top (loud-fail on a broken
@@ -948,97 +964,14 @@ def _resolve_index_dot_claude(cli_value: Optional[bool], repo_path: Path) -> boo
 _path_reachable_on_disk = path_reachable_on_disk
 
 
-def _delete_file_rows_exact(
-    coll,
-    path_prop: str,
-    match_fn,
-    *,
-    project: str = "",
-    project_source: str = "",
-    extra_props: "Optional[List[str]]" = None,
-    log_prefix: str = "",
-) -> "Tuple[int, int]":
-    """SAFE per-row delete: iterate ``coll``, read the raw ``path_prop`` (plus
-    ``project`` / ``project_source`` when scoping, plus any ``extra_props``) back
-    for EVERY row, test the raw values in PYTHON via ``match_fn``, and
-    ``delete_by_id`` ONLY confirmed matches. Returns ``(deleted, failures)``.
-
-    This is the ONE home for the tokenization-safe delete (see the module
-    banner above). It NEVER hands ``path_prop`` to a Weaviate Like/Equal
-    filter — those match on word tokens and can over-delete siblings.
-
-    Args:
-        coll: the Weaviate collection handle.
-        path_prop: ``"path"`` (CodeModule) or ``"file_path"`` (Function/Class).
-        match_fn: ``(raw_path: str, props: dict) -> bool`` — return True when
-            the row is confirmed for deletion. Called with the raw property
-            value already read back (never a tokenized filter result). ``props``
-            carries ``path_prop`` + whatever scope / ``extra_props`` the class
-            actually has.
-        project / project_source: when non-empty, a row is deleted ONLY if its
-            stored ``project`` / ``project_source`` matches EXACTLY (Python
-            ``==``) — scoping compared in Python for the same tokenization
-            reason. Empty means "do not scope on that field".
-        extra_props: additional property names the predicate needs (e.g.
-            ``embed_revision`` for the orphan-clear's stale check). Only those
-            the class actually has are requested; the predicate must tolerate a
-            missing key.
-        log_prefix: short label for the per-row failure log line.
-
-    Soft-fail per row: a single ``delete_by_id`` error logs + continues so a
-    transient failure can't wedge the caller, but the failure COUNT is
-    propagated so the caller can flip success→partial and defer the version
-    advance / re-attempt next run.
-    """
-    # Defense-in-depth: a class missing the path property would 500 the
-    # iterator. Confirm the prop exists first; skip cleanly if not.
-    read_props = [path_prop]
-    if project:
-        read_props.append("project")
-    if project_source:
-        read_props.append("project_source")
-    for ep in (extra_props or []):
-        if ep not in read_props:
-            read_props.append(ep)
-    try:
-        cfg = coll.config.get()
-        present = {p.name for p in cfg.properties}
-        if path_prop not in present:
-            return 0, 0
-        # Only request props the class actually has (avoid a 500 on a variant
-        # class); still compare in Python on whatever came back.
-        read_props = [p for p in read_props if p in present] or [path_prop]
-    except Exception:  # noqa: BLE001 — config probe is best-effort; fall through
-        pass
-
-    to_delete = []
-    for obj in coll.iterator(return_properties=read_props):
-        props = (getattr(obj, "properties", None) or {})
-        raw = props.get(path_prop) or ""
-        if project and (props.get("project") or "") != project:
-            continue
-        if project_source and (props.get("project_source") or "") != project_source:
-            continue
-        try:
-            if match_fn(raw, props):
-                to_delete.append(obj.uuid)
-        except Exception:  # noqa: BLE001 — a predicate error must never delete
-            continue
-
-    deleted = 0
-    failures = 0
-    for uid in to_delete:
-        try:
-            coll.data.delete_by_id(uuid=str(uid))
-            deleted += 1
-        except Exception as exc:  # noqa: BLE001 — never wedge on one row
-            failures += 1
-            print(
-                f"⚠️  {log_prefix or 'delete'}: delete_by_id failed for {uid} in "
-                f"{getattr(coll, 'name', '?')}: {exc}",
-                file=sys.stderr,
-            )
-    return deleted, failures
+# v0.2.91 (WP-C): the ONE tokenization-safe file-row delete primitive MOVED to
+# vco_lib.codegraph_resync (the per-file entity reconcile there needs the same
+# deleter — one deleter, one home; full contract + the over-delete rationale
+# live in that module's banner). This alias keeps every analyzer call site — and
+# every test that monkeypatches `analyzer_mod._delete_file_rows_exact` — working
+# unchanged, and it is what the analyzer hands the reconcile engine as its
+# `deleter`. NEVER add a tokenized Like/Equal DELETE anywhere.
+_delete_file_rows_exact = _delete_file_rows_exact_impl
 
 
 # ---------------------------------------------------------------------------
@@ -2475,6 +2408,17 @@ class CodeGraphAnalyzer:
             return stats
 
         md = fx.module
+        # v0.2.91 (WP-C): OPEN this file's entity-reconcile scope BEFORE the
+        # module write, so every UUID written below (module row, entities, chunk
+        # fan-out, revision-stamp patches) is recorded against
+        # (project_source, path). Committed only at the very END of this method:
+        # an exception from any write leaves the scope UNcommitted, so a partial
+        # walk can never authorise a delete. Opening also WITHDRAWS an earlier
+        # pass's authorisation for the same file (fix-round MINOR-5) — rationale
+        # in vco_lib.codegraph_resync.open_walked_file_scope.
+        _walked = self._reconcile_walked = getattr(self, "_reconcile_walked", None) or {}
+        _rec_key = (getattr(self, "_current_source", "") or "", md.path)
+        self._reconcile_pending = (_rec_key, {}, _open_scope(_walked, _rec_key))
         module_uuid = self._create_or_update_module(
             path=md.path,
             language=md.language,
@@ -2549,6 +2493,12 @@ class CodeGraphAnalyzer:
             )
             stats["interactions"] = stats.get("interactions", 0) + stored
 
+        # v0.2.91 (WP-C): COMMIT the scope — reached ONLY when every write for
+        # this file succeeded; restores the withdrawn authorisation together
+        # with this pass's writes, so two successful passes keep the UNION.
+        _key, _written, _prev = self._reconcile_pending
+        _commit_scope(self._reconcile_walked, _key, _written, _prev)
+        self._reconcile_pending = None
         return stats
 
     # ------------------------------------------------------------------
@@ -2852,8 +2802,7 @@ class CodeGraphAnalyzer:
                 )
             except Exception:  # noqa: BLE001 — a patch failure → re-embed (safe)
                 return False
-            if self._track_visited:
-                self.visited_uuids.add((getattr(collection, "name", ""), cu))
+            _note_written_uuid(self, getattr(collection, "name", ""), cu)
             self._embed_revision_patched = (
                 getattr(self, "_embed_revision_patched", 0) + 1
             )
@@ -3290,9 +3239,9 @@ class CodeGraphAnalyzer:
         if skip_replace:
             # Unchanged object: no replace(), no tombstone, no write. Still
             # record the UUID as visited so a concurrent `--prune-stale` pass
-            # does NOT delete this live row just because we skipped its write.
-            if self._track_visited:
-                self.visited_uuids.add((collection.name, det_uuid))
+            # (and the WP-C per-file reconcile) does NOT delete this live row
+            # just because we skipped its write.
+            _note_written_uuid(self, collection.name, det_uuid)
             return det_uuid
 
         # v0.2.16 docstring (above) claimed ``replace()`` is upsert.
@@ -3334,10 +3283,10 @@ class CodeGraphAnalyzer:
                 # write-to-Weaviate problem (vs. a parse / read / regex
                 # issue elsewhere in the analyze_*_file path). bug 0.2.
                 raise _DedupInsertError(exc, collection.name, det_uuid) from exc
-        # Track for --prune-stale (only populated when caller opted in;
-        # see main()'s argparse + analyze_repository's prune logic).
-        if self._track_visited:
-            self.visited_uuids.add((collection.name, det_uuid))
+        # Track for --prune-stale (only populated when caller opted in; see
+        # main()'s argparse + analyze_repository's prune logic) AND for the
+        # WP-C per-file reconcile (always).
+        _note_written_uuid(self, collection.name, det_uuid)
         return det_uuid
 
     def _ensure_import_names_property(self):
@@ -3845,6 +3794,13 @@ class CodeGraphAnalyzer:
         # process must never leak into this run's stats.
         self._prune_failures = 0
 
+        # v0.2.91 (WP-C): per-run reset of the entity-reconcile state — the
+        # committed {(source, path): {collection: {uuid}}} map and the open
+        # per-file scope. A prior analyze_repository call in the same process
+        # must never leak its walked set into this run's delete decisions.
+        self._reconcile_walked = {}
+        self._reconcile_pending = None
+
         # v0.2.76 (CG-4 sweep-guarantee): reset the lazily-built stale-file-set
         # cache per run so (a) a prior analyze_repository call in the same
         # process cannot leak its set into this run and (b) the end-of-walk
@@ -4186,6 +4142,48 @@ class CodeGraphAnalyzer:
         # also avoid paying the full stale-scan cost on narrow/incremental walks).
         if getattr(self, "_analyze_whole_repo", False):
             self._get_stale_file_set()
+
+        # v0.2.91 (WP-C): per-file ENTITY reconcile — the entity-orphan
+        # convergence fix. The D1 orphan-clear above only deletes rows whose
+        # FILE vanished; when an entity is refactored OUT of a file that still
+        # exists (a function extracted to another module, a renamed class), its
+        # deterministic-UUID row is never re-written, never re-stamped and never
+        # deleted — so the R-6 owed-probe can never reach zero and the
+        # `codegraph_embed_resync_pending` ledger entry can never clear. This
+        # pass deletes exactly the rows anchored to a file THIS walk walked
+        # whose UUID this walk did not write (old-identity duplicate rows
+        # included — decision #11). Engine + full safety contract:
+        # vco_lib.codegraph_resync.reconcile_walked_file_rows. Scope is bounded
+        # BY CONSTRUCTION to walked files, so it is safe under selective /
+        # single-file walks. Delete failures feed the SAME accounting chain as
+        # the orphan-clear (success→partial); the whole pass soft-fails.
+        try:
+            _rec_deleted, _rec_failures = _reconcile_walked_file_rows(
+                (
+                    (getattr(self, "modules_collection", None), "path"),
+                    (getattr(self, "classes_collection", None), "file_path"),
+                    (getattr(self, "functions_collection", None), "file_path"),
+                ),
+                getattr(self, "_reconcile_walked", None) or {},
+                project_name=self.project_name or "",
+                primary_sources=_primary_sources_for(repo_path),
+                deleter=_delete_file_rows_exact,
+                walked_sources=(_primary_sources_for(repo_path) or set())
+                | {p.as_posix() for p in canonical_extras},
+                audit_root=repo_path,
+            )
+            if _rec_deleted or _rec_failures:
+                print(
+                    f"   🧹 entity-reconcile: deleted {_rec_deleted} row(s) for "
+                    "entities no longer in their (re-walked) file"
+                    + (f"; {_rec_failures} delete(s) failed" if _rec_failures else "")
+                )
+            if _rec_failures:
+                self._prune_failures = (
+                    int(getattr(self, "_prune_failures", 0)) + _rec_failures
+                )
+        except Exception as exc:  # noqa: BLE001 — never wedge a walk on cleanup
+            print(f"⚠️  entity-reconcile failed: {exc}", file=sys.stderr)
 
         # v0.2.16 (1.4 / addendum H): --prune-stale pass.
         # Walk every per-project code-graph collection and delete any
@@ -5549,9 +5547,9 @@ class CodeGraphAnalyzer:
                 uuid=cached_uuid,
                 properties=update_props,
             )
-            # Still record as visited so --prune-stale doesn't delete it.
-            if self._track_visited:
-                self.visited_uuids.add((self.modules_collection.name, cached_uuid))
+            # Still record as written so --prune-stale (and the WP-C per-file
+            # reconcile) don't delete this live row.
+            _note_written_uuid(self, self.modules_collection.name, cached_uuid)
             getattr(self, "_mark_file_walked", _noop_mark)(path)  # rider b
             return cached_uuid
 
