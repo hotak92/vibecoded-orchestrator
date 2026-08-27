@@ -211,6 +211,24 @@ notes = """v0.2.91 decision #9: a user legitimately running a personal Ollama \
 alongside the VCO container gets a TRUE, permanent description of their \
 machine. One dismissal holds until the (alt, canon) port pair changes."""
 
+[conditions.disk_space_low]
+class = "environmental"
+owner = "vco_lib.doctor"
+clear_probe = "probe:py:disk_space_still_low"
+emit_surfaces = ["ledger"]
+dismiss_key = ["mount_paths"]
+notes = """v0.2.91 wave-4: free space under the floor on the install root \
+and/or the vct state dir (VCT_STATE_DIR else ~/.vct), deduped by filesystem. \
+Environmental because nothing is broken and the fix — deleting the user's \
+files — is never VCO's to make unattended. The clear probe re-runs the SAME \
+measurement the doctor emits from (doctor.disk_space_below_floor), so the \
+entry resolves on any run whose reading is back above the floor: the \
+install.py re-probe pass and the bundle-update reconcile clear it, and the \
+doctor itself resolves it on the no-sink paths (boot + `vco doctor`). Floor: \
+2 GiB, override VCT_DISK_SPACE_MIN_FREE_GB; critical under 256 MiB. \
+dismiss_key is the mount-path set, so a dismissal stops holding if the \
+install or the state dir moves to a different filesystem."""
+
 [conditions.schema_drift_rebuild_required]
 class = "action_required"
 owner = "install.py"

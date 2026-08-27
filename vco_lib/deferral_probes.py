@@ -388,6 +388,30 @@ def _launcher_process_running(binary_name: str) -> Optional[bool]:
         return None
 
 
+def disk_space_still_low(ctx: ProbeContext) -> Optional[bool]:
+    """``disk_space_low`` — is free space still under the floor?
+
+    A thin wrapper over ``vco_lib.doctor.disk_space_below_floor``, which is the
+    SAME measurement the doctor's ``disk_space`` probe emits from. One home for
+    the rule: a separate re-implementation here could clear an entry the doctor
+    would immediately re-emit (or keep one it would not).
+
+    Returns:
+        True  — at least one measured mount is still below the floor.
+        False — every measured mount is above it: the condition is over, and
+                the entry describes a machine state that has recovered.
+        None  — nothing could be measured (an unreadable path, a stat failure).
+                Positive evidence only, as everywhere else in this module.
+
+    Note the floor itself is env-tunable (``VCT_DISK_SPACE_MIN_FREE_GB``), so
+    raising it can legitimately RE-apply a condition a lower floor had cleared.
+    That is the honest reading of a user-set threshold, not drift.
+    """
+    from vco_lib.doctor import disk_space_below_floor
+
+    return disk_space_below_floor(ctx.folder)
+
+
 def pid_is_alive(pid: int) -> bool:
     """Cross-OS "is this PID still running" probe.
 
@@ -445,6 +469,7 @@ PROBES: dict[str, ProbeFn] = {
     "orchestrator_sidecars_still_present": orchestrator_sidecars_still_present,
     "launcher_dist_still_dirty": launcher_dist_still_dirty,
     "launcher_binary_stale_still_applies": launcher_binary_stale_still_applies,
+    "disk_space_still_low": disk_space_still_low,
 }
 
 
@@ -573,6 +598,7 @@ __all__ = [
     "ProbeContext",
     "ProbeFn",
     "dismiss_fields_for_sidecars",
+    "disk_space_still_low",
     "evaluate",
     "launcher_binary_stale_still_applies",
     "launcher_dist_still_dirty",

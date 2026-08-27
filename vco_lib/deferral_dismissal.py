@@ -149,6 +149,20 @@ def _fallback_upstream_sidecars(_folder: Path, entry: Any) -> dict:
     return dismiss_fields_for_sidecars(entry)
 
 
+def _fallback_disk_space_mounts(folder: Path, _entry: Any) -> dict:
+    """``disk_space_low`` fields, RE-MEASURED from the machine.
+
+    Shares ONE measurement with that condition's clear probe and its emitter
+    (``vco_lib.doctor.measure_disk_space``), so a dismissal is keyed on exactly
+    the mount set whose recovery would have cleared the entry anyway. Needed
+    for an entry written by an older VCO, or through the Rust bridge, which
+    carries no ``dismiss_fields``.
+    """
+    from vco_lib.doctor import disk_dismiss_fields
+
+    return disk_dismiss_fields(Path(folder))
+
+
 #: condition_id → provider computing its dismiss-key fields when the ENTRY does
 #: not carry them.
 #:
@@ -164,6 +178,7 @@ def _fallback_upstream_sidecars(_folder: Path, entry: Any) -> dict:
 _FALLBACK_PROVIDERS = {
     "template_review_pending": _fallback_template_reference_hashes,
     "orchestrator_user_modified_preserved": _fallback_upstream_sidecars,
+    "disk_space_low": _fallback_disk_space_mounts,
 }
 
 

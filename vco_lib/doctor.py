@@ -14,7 +14,10 @@ The engine
 ----------
 :func:`run_doctor` runs a set of PROBES and returns a :class:`DoctorReport`.
 It is deliberately **not a new detection codebase**: every probe composes a
-mechanism that already exists —
+mechanism that already exists — with ONE deliberate exception, ``disk_space``,
+which measures a resource nothing in VCO was watching at all (see its own
+docstring; one ``shutil.disk_usage`` call per distinct filesystem, no new
+subsystem) —
 
     probe id                    composes
     ─────────────────────────── ────────────────────────────────────────────
@@ -24,6 +27,8 @@ mechanism that already exists —
     launcher_binary_fresh       vco_lib.deferral_probes (WP-A's freshness leg)
     deferral_ledger             the WP-B registry's own clear probes
     owed_retryable_work         the WP-B registry's ``auto_retryable`` class
+    disk_space                  ``shutil.disk_usage`` on the install root +
+                                the vct state dir (``vco_lib.paths``)
     prereqs                     install.py's ``--bootstrap`` envelope (INJECTED
                                 by install.py; not re-derived here)
 
@@ -57,6 +62,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -85,6 +92,39 @@ SCOPE_BOOT = "boot"
 #: Registered ``action_required`` + install-owned, so it disappears on the
 #: first run after the user installs Node (drop-when-absent).
 CID_NPX_MISSING = "npx_missing_mcp_unspawnable"
+
+#: condition_id emitted when free disk space is under the floor. Registered
+#: ``environmental`` (a true, live description of the machine — nothing is
+#: broken and VCO must not "fix" it by deleting the user's files) with a named
+#: clear probe, so it resolves itself once space comes back.
+CID_DISK_SPACE_LOW = "disk_space_low"
+
+#: condition_ids the DOCTOR owns END-TO-END: it detects them AND emits them.
+#: A cid another component owns (``launcher_binary_stale``) is REPORTED by the
+#: doctor but emitted by its owner — re-emitting it here would fork its
+#: lifecycle.
+DOCTOR_OWNED_CIDS: tuple[str, ...] = (CID_NPX_MISSING, CID_DISK_SPACE_LOW)
+
+#: Doctor-owned cids the doctor also RESOLVES when its own probe reports OK.
+#: Only conditions whose probe is a cheap, positive-evidence re-measurement
+#: belong here: the reading that emitted the entry is the same reading that
+#: clears it, so "auto-clears once the machine recovers" is true at every
+#: invocation point, not only at the next ``--update``.
+DOCTOR_SELF_RESOLVING_CIDS: tuple[str, ...] = (CID_DISK_SPACE_LOW,)
+
+#: Env override for the free-space floor, in GiB (float). Default
+#: :data:`DISK_MIN_FREE_GB_DEFAULT`.
+DISK_MIN_FREE_ENV = "VCT_DISK_SPACE_MIN_FREE_GB"
+
+#: Default free-space floor, GiB. Sized for what VCO itself needs headroom
+#: for: a model pull, a Weaviate re-embed, a launcher rebuild + dist swap.
+DISK_MIN_FREE_GB_DEFAULT = 2.0
+
+#: Below this many free bytes the finding is ``critical`` rather than
+#: ``warning`` — at a quarter-gig, writes are actively failing, not "tight".
+DISK_CRITICAL_FREE_BYTES = 256 * 1024 * 1024
+
+_GIB = 1024 ** 3
 
 
 @dataclass(frozen=True)
@@ -184,6 +224,23 @@ class DoctorResolvers:
     #: () -> list of pin rows (``.key/.pinned/.installed/.status``), or None
     #: when npm is unavailable. Injected so tests never shell out to npm.
     pin_rows: Optional[Callable[[], Optional[list]]] = None
+    #: (path) -> object with ``.total/.used/.free``, or None when the path
+    #: cannot be measured. Injected so a test never reads the real disk.
+    disk_usage: Optional[Callable[[Path], Any]] = None
+
+    def resolve_disk_usage(self, path: Path):
+        """Free-space triple for ``path``, or ``None`` when unmeasurable.
+
+        Defaults to :func:`shutil.disk_usage`. Every failure arm returns
+        ``None`` (which the probe renders as ``unknown``) — a path that cannot
+        be stat'ed is not evidence that the disk is fine.
+        """
+        if self.disk_usage is not None:
+            return self.disk_usage(Path(path))
+        try:
+            return shutil.disk_usage(str(path))
+        except OSError:
+            return None
 
     def resolve_npx(self, names: Sequence[str]) -> dict:
         if self.npx_probe is not None:
@@ -659,6 +716,256 @@ def probe_npm_pins(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Findin
     ]
 
 
+# ---------------------------------------------------------------------------
+# Disk space — the one probe that measures a resource rather than a config
+# ---------------------------------------------------------------------------
+
+
+def disk_min_free_bytes() -> tuple[int, float, bool]:
+    """``(floor bytes, floor GiB, overridden?)`` from the env or the default.
+
+    A malformed / non-positive ``VCT_DISK_SPACE_MIN_FREE_GB`` falls back to the
+    default rather than disabling the probe: a fat-fingered value must not
+    silently turn the check off (the same policy as ``VCO_CG_INJECT_CAP``).
+    """
+    raw = os.environ.get(DISK_MIN_FREE_ENV, "").strip()
+    if raw:
+        try:
+            gib = float(raw)
+        except ValueError:
+            gib = DISK_MIN_FREE_GB_DEFAULT
+        else:
+            if gib > 0:
+                return int(gib * _GIB), gib, True
+    return int(DISK_MIN_FREE_GB_DEFAULT * _GIB), DISK_MIN_FREE_GB_DEFAULT, False
+
+
+def _nearest_existing(path: Path) -> Optional[Path]:
+    """``path`` or its nearest existing ancestor — ``None`` if none exists.
+
+    ``shutil.disk_usage`` needs a path that EXISTS. The vct state dir may not
+    have been created yet on a first run, and its parent's filesystem is the
+    one that would hold it, so walking up measures the right device instead of
+    reporting ``unknown`` for a perfectly measurable mount.
+    """
+    try:
+        current = Path(path).resolve()
+    except OSError:
+        return None
+    for candidate in (current, *current.parents):
+        try:
+            if candidate.exists():
+                return candidate
+        except OSError:
+            return None
+    return None
+
+
+def _disk_device_key(path: Path):
+    """A filesystem identity for ``path`` — ``st_dev``, else the path string.
+
+    Used to DEDUPE: on most installs the orchestrator clone and ``~/.vct`` sit
+    on the same filesystem, and reporting one mount twice would make a single
+    low-space condition read like two.
+    """
+    try:
+        return ("dev", os.stat(str(path)).st_dev)
+    except OSError:
+        return ("path", str(path))
+
+
+def measure_disk_space(
+    folder: Path, res: Optional["DoctorResolvers"] = None
+) -> tuple[list[dict], list[str], int, float]:
+    """``(measured, unmeasurable, floor_bytes, floor_gib)`` for this install.
+
+    ONE home for the measurement, shared by :func:`probe_disk_space` (which
+    reports + emits) and
+    ``vco_lib.deferral_probes.disk_space_still_low`` (which clears). A second
+    copy would let the emit and the clear disagree about the same disk.
+
+    Measures TWO locations, deduped by filesystem:
+
+    * the install/project ``folder`` — clone, venvs, dist binaries, KG files;
+    * the vct state dir (``$VCT_STATE_DIR`` else ``~/.vct``, resolved through
+      ``vco_lib.paths.vct_root_dir``) — ``launcher.db``, hub lockfiles, the RL
+      event archive, logs. Commonly a different filesystem from the clone.
+    """
+    resolvers = res or DoctorResolvers()
+    targets: list[tuple[str, Path]] = [("install root", Path(folder))]
+    try:
+        from vco_lib.paths import vct_root_dir
+
+        targets.append(("vct state dir", Path(vct_root_dir())))
+    except Exception:  # noqa: BLE001 — a broken paths import is not a verdict
+        pass
+
+    measured: list[dict] = []
+    unmeasurable: list[str] = []
+    seen_devices: set = set()
+    for label, raw_path in targets:
+        existing = _nearest_existing(raw_path)
+        if existing is None:
+            unmeasurable.append(f"{label} ({raw_path})")
+            continue
+        key = _disk_device_key(existing)
+        if key in seen_devices:
+            continue
+        usage = resolvers.resolve_disk_usage(existing)
+        free = getattr(usage, "free", None)
+        total = getattr(usage, "total", None)
+        if not isinstance(free, int):
+            unmeasurable.append(f"{label} ({existing})")
+            continue
+        seen_devices.add(key)
+        measured.append(
+            {
+                "label": label,
+                "path": str(existing),
+                "free_bytes": free,
+                "total_bytes": total if isinstance(total, int) else None,
+            }
+        )
+    floor_bytes, floor_gib, _ = disk_min_free_bytes()
+    return measured, unmeasurable, floor_bytes, floor_gib
+
+
+def disk_space_below_floor(folder: Path) -> Optional[bool]:
+    """Tri-state: is ANY measured mount still under the free-space floor?
+
+    ``True`` at least one is · ``False`` every measured one is above it ·
+    ``None`` nothing could be measured. The registry's clear probe for
+    :data:`CID_DISK_SPACE_LOW` is a thin wrapper over this, so the reading that
+    emitted the entry is the reading that clears it.
+    """
+    measured, _unmeasurable, floor_bytes, _gib = measure_disk_space(Path(folder))
+    if not measured:
+        return None
+    return any(m["free_bytes"] < floor_bytes for m in measured)
+
+
+def disk_dismiss_fields(folder: Path) -> dict:
+    """``dismiss_key`` payload for :data:`CID_DISK_SPACE_LOW`.
+
+    The identity is the set of MOUNT PATHS the finding is about, so a dismissal
+    holds for THIS machine's layout and stops holding if the install (or the
+    state dir) moves to a different filesystem — the same "dismissal keyed on
+    what would have cleared it anyway" shape as the sidecar and dual-Ollama
+    keys.
+    """
+    measured, _unmeasurable, _floor, _gib = measure_disk_space(Path(folder))
+    return {"mount_paths": sorted(m["path"] for m in measured)}
+
+
+def _fmt_gib(n_bytes: Optional[int]) -> str:
+    if not isinstance(n_bytes, int):
+        return "?"
+    return f"{n_bytes / _GIB:.2f} GiB"
+
+
+def probe_disk_space(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Free space on the filesystems VCO actually writes to.
+
+    Cheap — ONE ``shutil.disk_usage`` call per DISTINCT filesystem, since
+    :func:`measure_disk_space` de-dupes by ``st_dev`` BEFORE measuring: two
+    calls on a split install, one when the clone and the state dir share a
+    filesystem. So it runs in the BOOT scope too — the moment it matters most
+    is the one where the user is about to start work on a machine that can no
+    longer write. Everything downstream of a full disk
+    fails in a way that does not name the cause: a Weaviate write, a
+    ``launcher.db`` commit, a dist-binary swap, a gzip archive of RL rows all
+    surface as their own local error.
+
+    ``defer``, never ``auto_fix``: freeing space means deleting the user's
+    files, which VCO does not do unattended under any circumstances.
+    """
+    measured, unmeasurable, floor_bytes, floor_gib = measure_disk_space(folder, res)
+    if not measured:
+        return [
+            Finding(
+                probe="disk_space",
+                status=STATUS_UNKNOWN,
+                summary=(
+                    "free disk space could not be measured"
+                    + (f" ({'; '.join(unmeasurable)})" if unmeasurable else "")
+                ),
+                detail={"unmeasurable": unmeasurable},
+            )
+        ]
+
+    rendered = ", ".join(
+        f"{m['label']} {m['path']} {_fmt_gib(m['free_bytes'])} free" for m in measured
+    )
+    low = [m for m in measured if m["free_bytes"] < floor_bytes]
+    if not low:
+        return [
+            Finding(
+                probe="disk_space",
+                status=STATUS_OK,
+                # The cid rides the OK finding so the self-resolve pass can see
+                # WHICH condition this reading clears. `deferral_entries_for`
+                # only ever walks `report.problems`, so it can never emit here.
+                condition_id=CID_DISK_SPACE_LOW,
+                summary=(
+                    f"free space above the {floor_gib:g} GiB floor: {rendered}"
+                    + (f" (not measured: {'; '.join(unmeasurable)})" if unmeasurable else "")
+                ),
+                detail={"mounts": measured, "min_free_bytes": floor_bytes},
+            )
+        ]
+
+    critical = any(m["free_bytes"] < DISK_CRITICAL_FREE_BYTES for m in low)
+    return [
+        Finding(
+            probe="disk_space",
+            status=STATUS_PROBLEM,
+            summary=(
+                ("CRITICALLY low" if critical else "Low")
+                + f" free disk space (floor {floor_gib:g} GiB): "
+                + ", ".join(
+                    f"{m['label']} {m['path']} has only {_fmt_gib(m['free_bytes'])} free"
+                    for m in low
+                )
+            ),
+            fix=FIX_DEFER,
+            condition_id=CID_DISK_SPACE_LOW,
+            command=_disk_remediation(low, floor_gib),
+            detail={
+                "mounts": measured,
+                "low": [m["path"] for m in low],
+                "min_free_bytes": floor_bytes,
+                "severity": "critical" if critical else "warning",
+                "unmeasurable": unmeasurable,
+            },
+        )
+    ]
+
+
+def _disk_remediation(low: list[dict], floor_gib: float) -> str:
+    """The exact block the deferral + the CLI both print.
+
+    LOOK-FIRST, on purpose: every line is a read except the container prune,
+    which is labelled. VCO never deletes the user's files, and its own advice
+    should not hand them a recursive delete either — the operator decides what
+    is expendable on their machine, not this text.
+    """
+    paths = " ".join(m["path"] for m in low)
+    return (
+        f"# Free space on: {paths}\n"
+        f"#   df -h {paths}\n"
+        "# Where VCO's own footprint usually sits (inspect, then decide):\n"
+        "#   du -sh ~/.ollama/models/*        # local embedding/LLM models\n"
+        "#   du -sh \"$VCT_STATE_DIR\"/logs \"$VCT_STATE_DIR\"/rl_archive\n"
+        "#     (VCT_STATE_DIR defaults to ~/.vct; rl_archive holds the pruned\n"
+        "#      RL training rows — deleting it loses embeddings for good)\n"
+        "#   podman system prune            # DELETES unused images/layers\n"
+        f"# The floor is {floor_gib:g} GiB; raise or lower it with "
+        f"{DISK_MIN_FREE_ENV}=<GiB>.\n"
+        "# This entry CLEARS ITSELF on the next VCO run once space is back — "
+        "nothing to dismiss."
+    )
+
+
 #: probe id → (callable, scopes).
 #:
 #: ``boot`` is the cheap subset: in-process resolution + file reads only. Two
@@ -677,10 +984,17 @@ def probe_npm_pins(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Findin
 #: different evidence, and the weaker one would sometimes contradict the
 #: stronger. The Python leg stays for the ``full`` scope (install/update + the
 #: CLI), where no launcher process is doing the asking.
+#:
+#: ``disk_space`` IS in the boot subset: one ``shutil.disk_usage`` call per
+#: distinct filesystem (see :func:`probe_disk_space`) is cheaper than any file
+#: read the other boot probes already do, and a machine that cannot write is
+#: exactly the state a user needs to hear about BEFORE they start working, not
+#: at their next update.
 PROBES: dict = {
     "mcp_commands_spawnable": (probe_mcp_commands_spawnable, (SCOPE_FULL, SCOPE_BOOT)),
     "launcher_binary_fresh": (probe_launcher_binary_fresh, (SCOPE_FULL,)),
     "deferral_ledger": (probe_deferral_ledger, (SCOPE_FULL, SCOPE_BOOT)),
+    "disk_space": (probe_disk_space, (SCOPE_FULL, SCOPE_BOOT)),
     "prereqs": (probe_prereqs, (SCOPE_FULL,)),
     "npm_pins": (probe_npm_pins, (SCOPE_FULL,)),
 }
@@ -733,48 +1047,118 @@ def run_doctor(
 # ---------------------------------------------------------------------------
 
 
+def _npx_entry(finding: Finding):
+    from vco_lib.deferral_report import DeferralEntry
+
+    return DeferralEntry(
+        condition_id=CID_NPX_MISSING,
+        title="npx not resolvable — npx-based MCPs cannot spawn",
+        detected=finding.summary,
+        why_deferred=(
+            "Installing Node.js changes the user's machine, so VCO "
+            "never does it unattended. Until npx resolves, every MCP "
+            "registered as `npx` (playwright by default; mermaid when "
+            "enabled) fails to start — Claude Code shows only "
+            "'Failed to connect', with no indication that the cause is "
+            "a missing binary. This entry clears itself on the first "
+            "install/update run that finds npx."
+        ),
+        command_to_apply=finding.command,
+        severity="warning",
+        kg_node_refs=["docs/TROUBLESHOOTING.md"],
+    )
+
+
+def _disk_space_entry(finding: Finding):
+    from vco_lib.deferral_report import DeferralEntry
+
+    detail = finding.detail or {}
+    mounts = [m for m in (detail.get("mounts") or []) if isinstance(m, dict)]
+    return DeferralEntry(
+        condition_id=CID_DISK_SPACE_LOW,
+        title="Low disk space — VCO writes may start failing",
+        detected=finding.summary,
+        why_deferred=(
+            "Freeing space means DELETING the user's files, which VCO never "
+            "does unattended. This is reported rather than fixed because it is "
+            "a true description of the machine, not a VCO fault. Everything "
+            "downstream of a full disk fails in a way that does not name the "
+            "cause — a Weaviate write, a launcher.db commit, a dist-binary "
+            "swap and an RL archive each surface as their own local error — so "
+            "the honest place to say it is here, once, up front. The entry "
+            "CLEARS ITSELF on the next VCO run whose space check comes back "
+            "above the floor; there is nothing to dismiss by hand."
+        ),
+        command_to_apply=finding.command,
+        severity=(
+            "critical" if detail.get("severity") == "critical" else "warning"
+        ),
+        dismiss_fields={"mount_paths": sorted(str(m.get("path", "")) for m in mounts)},
+        kg_node_refs=["docs/TROUBLESHOOTING.md"],
+    )
+
+
+#: cid → builder for the ``DeferralEntry`` the doctor emits for it.
+_ENTRY_BUILDERS: dict = {
+    CID_NPX_MISSING: _npx_entry,
+    CID_DISK_SPACE_LOW: _disk_space_entry,
+}
+
+
 def deferral_entries_for(report: DoctorReport) -> list:
     """Build the ``DeferralEntry`` objects a report's `defer` findings owe.
 
     Only findings that (a) are problems, (b) declare ``defer``, and (c) name a
-    ``condition_id`` produce an entry. Findings that map onto a cid ANOTHER
-    component owns (``launcher_binary_stale``) are deliberately excluded here —
-    re-emitting someone else's condition from the doctor would fork its
-    lifecycle. The doctor REPORTS those; their owner emits them.
+    :data:`DOCTOR_OWNED_CIDS` ``condition_id`` produce an entry. Findings that
+    map onto a cid ANOTHER component owns (``launcher_binary_stale``) are
+    deliberately excluded — re-emitting someone else's condition from the
+    doctor would fork its lifecycle. The doctor REPORTS those; their owner
+    emits them.
     """
-    from vco_lib.deferral_report import DeferralEntry
-
     entries = []
     seen: set[str] = set()
     for finding in report.problems:
         cid = finding.condition_id
-        if finding.fix != FIX_DEFER or cid != CID_NPX_MISSING or cid in seen:
+        if finding.fix != FIX_DEFER or cid not in DOCTOR_OWNED_CIDS or cid in seen:
+            continue
+        builder = _ENTRY_BUILDERS.get(cid)
+        if builder is None:  # pragma: no cover — guarded by DOCTOR_OWNED_CIDS
             continue
         seen.add(cid)
-        entries.append(
-            DeferralEntry(
-                condition_id=cid,
-                title="npx not resolvable — npx-based MCPs cannot spawn",
-                detected=finding.summary,
-                why_deferred=(
-                    "Installing Node.js changes the user's machine, so VCO "
-                    "never does it unattended. Until npx resolves, every MCP "
-                    "registered as `npx` (playwright by default; mermaid when "
-                    "enabled) fails to start — Claude Code shows only "
-                    "'Failed to connect', with no indication that the cause is "
-                    "a missing binary. This entry clears itself on the first "
-                    "install/update run that finds npx."
-                ),
-                command_to_apply=finding.command,
-                severity="warning",
-                kg_node_refs=["docs/TROUBLESHOOTING.md"],
-            )
-        )
+        entries.append(builder(finding))
     return entries
+
+
+def healthy_condition_ids(report: DoctorReport) -> list[str]:
+    """Self-resolving cids whose probe reported OK in THIS pass.
+
+    The symmetric half of :func:`deferral_entries_for`: the same reading that
+    would have emitted the entry is the one that clears it, so the promise
+    "clears itself once the machine recovers" holds at every invocation point
+    rather than only at the next ``--update`` re-probe pass.
+
+    Restricted to :data:`DOCTOR_SELF_RESOLVING_CIDS` on purpose — a condition
+    whose OK reading is not positive evidence that it is over (npx: the ledger
+    entry may have been emitted by a different install root) must be left to
+    its own lifecycle.
+    """
+    out: list[str] = []
+    for finding in report.findings:
+        cid = finding.condition_id
+        if (
+            finding.status == STATUS_OK
+            and cid in DOCTOR_SELF_RESOLVING_CIDS
+            and cid not in out
+        ):
+            out.append(cid)
+    return out
 
 
 def emit_findings(folder: Path, report: DoctorReport, *, sink=None) -> list[str]:
     """Emit the report's deferred conditions. Returns the emitted cids.
+
+    Also RESOLVES the self-resolving cids whose probe came back OK — see
+    :func:`resolve_healthy_findings`, which runs only on the no-sink path.
 
     Args:
         sink: optional object with ``add_entry`` (install.py's in-flight run
@@ -784,6 +1168,8 @@ def emit_findings(folder: Path, report: DoctorReport, *, sink=None) -> list[str]
             emitter writes directly (the CLI path).
     """
     entries = deferral_entries_for(report)
+    if sink is None:
+        resolve_healthy_findings(Path(folder), report)
     if not entries:
         return []
     if sink is not None:
@@ -797,6 +1183,29 @@ def emit_findings(folder: Path, report: DoctorReport, *, sink=None) -> list[str]
     except Exception:  # noqa: BLE001 — reporting must never break the caller
         return []
     return [e.condition_id for e in entries]
+
+
+def resolve_healthy_findings(folder: Path, report: DoctorReport) -> list[str]:
+    """Resolve the ledger entries this pass's OK readings clear. Never raises.
+
+    Only ever called on the NO-SINK path. With a sink, install.py's
+    ``InstallDeferralFlow.finalize()`` is still pending and re-merges foreign
+    entries from disk — a resolve landing between that read and its write would
+    be resurrected, and the entry would look immortal for one more cycle (the
+    same race that keeps ``auto_fix=False`` on the install path). The
+    ``--update`` re-probe pass already clears these through the registry probe,
+    so nothing is lost by staying out of that window.
+    """
+    cids = healthy_condition_ids(report)
+    if not cids:
+        return []
+    try:
+        from vco_lib.deferral_emit import resolve_conditions
+
+        resolve_conditions(Path(folder), cids)
+    except Exception:  # noqa: BLE001 — clearing is best-effort observability
+        return []
+    return cids
 
 
 def run_and_report(
@@ -926,7 +1335,13 @@ def run_from_args(args: argparse.Namespace) -> int:
 
 
 __all__ = [
+    "CID_DISK_SPACE_LOW",
     "CID_NPX_MISSING",
+    "DISK_CRITICAL_FREE_BYTES",
+    "DISK_MIN_FREE_ENV",
+    "DISK_MIN_FREE_GB_DEFAULT",
+    "DOCTOR_OWNED_CIDS",
+    "DOCTOR_SELF_RESOLVING_CIDS",
     "DoctorReport",
     "DoctorResolvers",
     "FIX_AUTO",
@@ -943,8 +1358,15 @@ __all__ = [
     "bare_command_names",
     "command_is_path",
     "deferral_entries_for",
+    "disk_dismiss_fields",
+    "disk_min_free_bytes",
+    "disk_space_below_floor",
     "emit_findings",
+    "healthy_condition_ids",
     "main",
+    "measure_disk_space",
+    "probe_disk_space",
+    "resolve_healthy_findings",
     "run_and_report",
     "run_doctor",
     "run_from_args",
