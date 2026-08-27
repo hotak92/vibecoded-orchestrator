@@ -89,6 +89,80 @@ elif [[ -f "$state_dir/hub.token" ]]; then
     hub_token=$(tr -d '[:space:]' < "$state_dir/hub.token" 2>/dev/null || true)
 fi
 
+# ── Stale-env hub-token fallback (v0.2.91, WP-D item 4) ─────────────────
+#
+# MUST MATCH the SSOT `vco_lib/project_config.py::_stale_env_token_fallback`
+# and the mirrors in `vct_secrets_resolve.{sh,ps1}`,
+# `vct_project_config.{sh,ps1}`, `claude_mcp_servers/wrappers/_base.py`,
+# `launcher/tools/vct-cli/src/main.rs` and `tools/vct-secrets/vct`.
+# Locked by tests/test_stale_env_token_parity_v0291.py.
+#
+# WHY here: `$VCT_HUB_TOKEN` wins over the file, and the hub regenerates
+# `hub.token` on every start — so a shell that exported the token before
+# an update presents a dead credential, the hub 401s, and this client
+# FAILS OPEN to "write" on every single call. The gate then silently
+# degrades to permissive for the whole life of that shell while the
+# on-disk token sitting next to it would have answered correctly.
+# After a PROVABLE refusal (401/403) we retry ONCE with the on-disk token
+# and print one definitive line.
+#
+# THE FAIL-OPEN CONTRACT IS UNCHANGED (deliberate availability choice):
+# a genuine auth failure, an unreachable hub, a missing token, or a retry
+# that is ALSO refused still fails open to "write" with the SAME reason
+# string, the SAME rate-limited warning and the SAME dropped-write metric
+# row. This fix only makes the fail-open reached LESS OFTEN.
+#
+# GLOBAL TOKEN ONLY: `/projects/{id}/access/{collection}` is NOT a
+# per-project-token route (the hub gates only `/env` + `/config` that
+# way — see `auth.rs::per_project_token_route`), so presenting a scoped
+# `hub.token.<id>` here would itself 401. Unlike the resolver quadruplet,
+# this mirror deliberately has no scoped branch.
+
+# The ONE definitive line. Byte-identical across every mirror.
+_VCT_STALE_ENV_TOKEN_MESSAGE="stale VCT_HUB_TOKEN in env overridden by on-disk hub.token — run \`unset VCT_HUB_TOKEN\` or open a new shell"
+
+warn_stale_env_token() {
+    # NOT a fail-open event: no dropped-write metric row, no
+    # `hub unreachable` phrasing. The gate WORKED — we just had to reach
+    # past a dead env pin to make it work. One line, always emitted (this
+    # script is one-shot and its stderr policy is deliberately per-PID).
+    printf '[vct-access-check] WARNING: %s\n' "$_VCT_STALE_ENV_TOKEN_MESSAGE" >&2
+}
+
+hub_token_on_disk() {
+    # The ON-DISK global token, IGNORING $VCT_HUB_TOKEN. Empty when
+    # nothing readable exists.
+    local token_file="$state_dir/hub.token"
+    if [[ -f "$token_file" && -r "$token_file" ]]; then
+        tr -d '[:space:]' < "$token_file" 2>/dev/null || printf ''
+        return 0
+    fi
+    printf ''
+}
+
+stale_env_fallback_token() {
+    # Prints the on-disk token to retry with and returns 0, or returns 1
+    # (no output). Rules, in order (identical in every mirror):
+    #   1. VCT_HUB_TOKEN_STRICT=1        → 1 (the pin is authoritative)
+    #   2. VCT_HUB_TOKEN unset/empty     → 1 (nothing was pinned)
+    #   3. no readable on-disk token     → 1 (nothing better to try)
+    #   4. on-disk == env (whitespace-normalised) → 1 (pin is not stale)
+    # Trimmed comparison to the literal 1 — the SSOT's spelling, so a
+    # `VCT_HUB_TOKEN_STRICT=1` written with a trailing newline/CR means the
+    # same thing in bash, PowerShell, Rust and Python.
+    [[ "$(printf '%s' "${VCT_HUB_TOKEN_STRICT:-}" | tr -d '[:space:]')" == "1" ]] \
+        && return 1
+    local env_tok
+    env_tok=$(printf '%s' "${VCT_HUB_TOKEN:-}" | tr -d '[:space:]')
+    [[ -n "$env_tok" ]] || return 1
+    local disk_tok
+    disk_tok=$(hub_token_on_disk)
+    [[ -n "$disk_tok" ]] || return 1
+    [[ "$disk_tok" == "$env_tok" ]] && return 1
+    printf '%s' "$disk_tok"
+    return 0
+}
+
 # ── Fail-open path: print "write", emit metric, log warning ─────────────
 emit_metric() {
     local reason="$1"
@@ -162,12 +236,55 @@ http_status=""
 tmpfile=$(mktemp 2>/dev/null) || fail_open "mktemp_failed"
 trap 'rm -f "$tmpfile"' EXIT
 
-if ! http_status=$(curl --silent --show-error --max-time 5 \
+do_request() {
+    # $1 = bearer token. Echoes the HTTP status; body lands in $tmpfile.
+    # Returns non-zero only when curl itself fails (conn refused, DNS,
+    # timeout) — the caller maps that to the fail-open path.
+    local token="$1"
+    curl --silent --show-error --max-time 5 \
         --output "$tmpfile" --write-out "%{http_code}" \
-        --header "Authorization: Bearer $hub_token" \
-        "$url" 2>/dev/null); then
+        --header "Authorization: Bearer $token" \
+        "$url" 2>/dev/null
+}
+
+if ! http_status=$(do_request "$hub_token"); then
     fail_open "curl_failed"
 fi
+
+# v0.2.91 (WP-D item 4): a PROVABLE credential refusal is the ONLY
+# trigger for the one-shot on-disk-token retry. A strict pin, an absent
+# env token, an identical on-disk token, a retry that is ALSO refused, a
+# retry whose curl fails, or a retry whose answer does not PROVE the
+# fallback credential was accepted all fall through with the ORIGINAL
+# status — so every fail-open reason string, warning and metric row below
+# is byte-identical to pre-v0.2.91.
+#
+# ADOPT only 2xx or 404: the hub answers 404 ("project not registered / no
+# access row") strictly AFTER its auth middleware accepted the bearer, so
+# it is a post-auth answer like a 200. A 5xx is NOT — before the wave-3
+# MINOR-1 fix it was adopted, turning a truthful `hub_auth_401` metric row
+# into `hub_5xx_503` and printing the definitive line on no evidence.
+case "$http_status" in
+    401|403)
+        if fallback_token=$(stale_env_fallback_token); then
+            if retry_status=$(do_request "$fallback_token"); then
+                case "$retry_status" in
+                    2??|404)
+                        warn_stale_env_token
+                        http_status="$retry_status"
+                        ;;
+                    *) : ;;   # not proof — keep the original refusal
+                esac
+            else
+                # The retry's curl failed; re-run nothing. The original
+                # 401/403 body was overwritten in $tmpfile, but the 401
+                # arm below never reads the body — it fails open on the
+                # status alone.
+                :
+            fi
+        fi
+        ;;
+esac
 
 if [[ "$http_status" -ge 500 ]]; then
     fail_open "hub_5xx_${http_status}"

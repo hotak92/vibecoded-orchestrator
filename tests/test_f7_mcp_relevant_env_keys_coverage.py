@@ -47,6 +47,14 @@ DOCUMENTED_EXCLUSIONS: frozenset[str] = frozenset(
         # Never in settings.json env — resolved from hub files / per call.
         "VCT_HUB_PORT",
         "VCT_HUB_TOKEN",
+        # v0.2.91 (WP-D item 4): the hermeticity guard for the stale-env
+        # token fallback. Same channel as the VCT_HUB_TOKEN it guards — a
+        # test/harness pin from the runner's shell, never projected into
+        # settings.json env by any writer (verified: no config_projection
+        # / launcher / install.py writer emits it). It also cannot change
+        # search behaviour: it only governs whether a PROVABLY-refused hub
+        # call may retry once with the on-disk token.
+        "VCT_HUB_TOKEN_STRICT",
         "VCT_STATE_DIR",
         "VCT_QUERY_LOG_DIR",
         "VCT_SESSION_ID",

@@ -273,21 +273,70 @@ impl Hub {
         &self.base
     }
 
-    /// Apply the Authorization: Bearer <token> header if we have one.
-    /// Centralised here so every method gets it consistently.
-    fn with_auth(&self, b: reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder {
-        if let Some(t) = self.token.as_ref() {
+    /// Apply the `Authorization: Bearer <token>` header if we have one.
+    /// Centralised here so every method gets it consistently. Takes the
+    /// token EXPLICITLY (rather than reading `self.token`) — that is the
+    /// seam the stale-env retry needs so its second attempt can present
+    /// the on-disk token instead.
+    fn with_auth_token(
+        b: reqwest::blocking::RequestBuilder,
+        token: Option<&str>,
+    ) -> reqwest::blocking::RequestBuilder {
+        if let Some(t) = token {
             b.bearer_auth(t)
         } else {
             b
         }
     }
 
-    fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
-        let resp = self.with_auth(self.client.get(format!("{}{}", self.base, path))).send()
+    /// Send `build(token)` and return `(status, body)`, retrying ONCE with
+    /// the on-disk token when the hub PROVABLY refuses (401/403) a
+    /// `$VCT_HUB_TOKEN` that is provably stale.
+    ///
+    /// v0.2.91 (WP-D item 4) — MUST MATCH the Python SSOT
+    /// `vco_lib/project_config.py::_stale_env_token_fallback` +
+    /// `_get_with_401_retry` and the sh / ps1 mirrors. Failure of the
+    /// extra attempt returns the ORIGINAL `(status, body)` verbatim, so
+    /// every error message this CLI prints is byte-identical to
+    /// pre-v0.2.91. Bounded: at most one extra request, never a loop.
+    fn send_with_stale_token_retry(
+        &self,
+        build: impl Fn(Option<&str>) -> reqwest::blocking::RequestBuilder,
+    ) -> Result<(reqwest::StatusCode, String)> {
+        let resp = build(self.token.as_deref())
+            .send()
             .map_err(|e| anyhow!("Cannot reach launcher hub: {}. Is the launcher running?", e))?;
         let status = resp.status();
         let body = resp.text().context("read response body")?;
+        if !is_auth_refusal(status) {
+            return Ok((status, body));
+        }
+        let fallback = match stale_env_fallback_token() {
+            Some(t) => t,
+            None => return Ok((status, body)),
+        };
+        let retry = match build(Some(&fallback)).send() {
+            Ok(r) => r,
+            // The extra attempt could not complete — keep today's path.
+            Err(_) => return Ok((status, body)),
+        };
+        let retry_status = retry.status();
+        if !retry_answer_is_definitive(retry_status) {
+            return Ok((status, body));
+        }
+        let retry_body = match retry.text() {
+            Ok(b) => b,
+            Err(_) => return Ok((status, body)),
+        };
+        warn_stale_env_token();
+        Ok((retry_status, retry_body))
+    }
+
+    fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
+        let url = format!("{}{}", self.base, path);
+        let (status, body) = self.send_with_stale_token_retry(|tok| {
+            Self::with_auth_token(self.client.get(&url), tok)
+        })?;
         if !status.is_success() {
             return Err(anyhow!("hub error {}: {}", status, body));
         }
@@ -299,14 +348,14 @@ impl Hub {
         path: &str,
         body: &B,
     ) -> Result<T> {
-        let resp = self.with_auth(self.client.post(format!("{}{}", self.base, path)).json(body)).send()
-            .map_err(|e| anyhow!("Cannot reach launcher hub: {}. Is the launcher running?", e))?;
-        let status = resp.status();
-        let body = resp.text().context("read response body")?;
+        let url = format!("{}{}", self.base, path);
+        let (status, resp_body) = self.send_with_stale_token_retry(|tok| {
+            Self::with_auth_token(self.client.post(&url).json(body), tok)
+        })?;
         if !status.is_success() {
-            return Err(anyhow!("hub error {}: {}", status, body));
+            return Err(anyhow!("hub error {}: {}", status, resp_body));
         }
-        serde_json::from_str(&body).with_context(|| format!("decode {}", path))
+        serde_json::from_str(&resp_body).with_context(|| format!("decode {}", path))
     }
 
     fn patch_json<B: Serialize, T: for<'de> Deserialize<'de>>(
@@ -314,21 +363,21 @@ impl Hub {
         path: &str,
         body: &B,
     ) -> Result<T> {
-        let resp = self.with_auth(self.client.patch(format!("{}{}", self.base, path)).json(body)).send()
-            .map_err(|e| anyhow!("Cannot reach launcher hub: {}. Is the launcher running?", e))?;
-        let status = resp.status();
-        let body = resp.text().context("read response body")?;
+        let url = format!("{}{}", self.base, path);
+        let (status, resp_body) = self.send_with_stale_token_retry(|tok| {
+            Self::with_auth_token(self.client.patch(&url).json(body), tok)
+        })?;
         if !status.is_success() {
-            return Err(anyhow!("hub error {}: {}", status, body));
+            return Err(anyhow!("hub error {}: {}", status, resp_body));
         }
-        serde_json::from_str(&body).with_context(|| format!("decode {}", path))
+        serde_json::from_str(&resp_body).with_context(|| format!("decode {}", path))
     }
 
     fn delete_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
-        let resp = self.with_auth(self.client.delete(format!("{}{}", self.base, path))).send()
-            .map_err(|e| anyhow!("Cannot reach launcher hub: {}. Is the launcher running?", e))?;
-        let status = resp.status();
-        let body = resp.text().context("read response body")?;
+        let url = format!("{}{}", self.base, path);
+        let (status, body) = self.send_with_stale_token_retry(|tok| {
+            Self::with_auth_token(self.client.delete(&url), tok)
+        })?;
         if !status.is_success() {
             return Err(anyhow!("hub error {}: {}", status, body));
         }
@@ -348,16 +397,31 @@ fn resolve_token() -> Option<String> {
     // same reason resolve_port honours VCT_HUB_PORT — no need to
     // round-trip through a tempdir VCT_STATE_DIR if a test just
     // wants to inject a known token.
+    //
+    // v0.2.91 (WP-D item 4): the pin still wins on every FIRST attempt.
+    // It is only set aside AFTER the hub provably refuses it (401/403),
+    // by the one-shot retry in `Hub::send_with_stale_token_retry`; set
+    // `VCT_HUB_TOKEN_STRICT=1` to disable even that, so a harness that
+    // pins a deliberately-wrong token still observes the refusal.
     if let Ok(t) = std::env::var("VCT_HUB_TOKEN") {
         let trimmed = t.trim();
         if !trimmed.is_empty() {
             return Some(trimmed.to_string());
         }
     }
-    // Standard path: read from disk, mirroring server.rs's
-    // `auth::write_token_file`. We honour VCT_STATE_DIR the same
-    // way `resolve_port` does so dev launchers / tests stay
-    // isolated from the production state dir.
+    on_disk_hub_token()
+}
+
+/// The on-disk token, IGNORING `$VCT_HUB_TOKEN`.
+///
+/// Standard path: read from disk, mirroring server.rs's
+/// `auth::write_token_file`. We honour VCT_STATE_DIR the same way
+/// `resolve_port` does so dev launchers / tests stay isolated from the
+/// production state dir. This CLI only ever calls GLOBAL-token routes
+/// (`/cli/*`, `/projects`, `/modules`, …), so there is no scoped
+/// `hub.token.<project_id>` variant to resolve here — unlike the sh /
+/// ps1 / Python resolvers, which do hit `/env` + `/config`.
+fn on_disk_hub_token() -> Option<String> {
     let state_dir = std::env::var("VCT_STATE_DIR")
         .ok()
         .filter(|s| !s.is_empty())
@@ -372,6 +436,75 @@ fn resolve_token() -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+/// The ONE definitive line printed after a stale env token is overridden.
+/// Byte-identical to `vco_lib.project_config.STALE_ENV_TOKEN_MESSAGE` and
+/// to the sh / ps1 / wrapper mirrors (locked by
+/// `tests/test_stale_env_token_parity_v0291.py`).
+const STALE_ENV_TOKEN_MESSAGE: &str =
+    "stale VCT_HUB_TOKEN in env overridden by on-disk hub.token — \
+run `unset VCT_HUB_TOKEN` or open a new shell";
+
+/// PROVABLE credential refusals — the ONLY trigger for the fallback.
+/// 401 = the bearer matched nothing; 403 = the bearer is real but refused
+/// on this route. Anything else is not a credential problem.
+fn is_auth_refusal(status: reqwest::StatusCode) -> bool {
+    status.as_u16() == 401 || status.as_u16() == 403
+}
+
+/// May a stale-env RETRY's answer be ADOPTED (and the definitive line printed)?
+///
+/// Only when it PROVES the fallback credential was accepted: `2xx`, or `404` —
+/// the hub answers "not found" only AFTER its auth middleware accepted the
+/// bearer, so it is a post-auth answer just like a 200.
+///
+/// Everything else proves nothing about the credential. v0.2.91 wave-3
+/// (MINOR-1): before this, ANY non-401/403 answer was adopted, so a 401
+/// followed by a 5xx printed "stale VCT_HUB_TOKEN…" and surfaced
+/// `hub error 503` in place of the truthful `hub error 401`.
+///
+/// MUST MATCH `vco_lib/project_config.py::_retry_answer_is_definitive` and the
+/// sh / ps1 mirrors.
+fn retry_answer_is_definitive(status: reqwest::StatusCode) -> bool {
+    status.is_success() || status.as_u16() == 404
+}
+
+/// Decide whether a provably-refused request may be retried once with the
+/// on-disk token, and return that token when it may.
+///
+/// MUST MATCH `vco_lib/project_config.py::_stale_env_token_fallback`
+/// (the SSOT) and the sh / ps1 mirrors. Rules, in order:
+///   1. `VCT_HUB_TOKEN_STRICT=1`      → None (the pin is authoritative)
+///   2. `VCT_HUB_TOKEN` unset/empty   → None (nothing was pinned)
+///   3. no readable on-disk token     → None (nothing better to try)
+///   4. on-disk == env (trimmed)      → None (the pin is not stale)
+fn stale_env_fallback_token() -> Option<String> {
+    if std::env::var("VCT_HUB_TOKEN_STRICT")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let env_tok = std::env::var("VCT_HUB_TOKEN").ok()?;
+    let env_tok = env_tok.trim();
+    if env_tok.is_empty() {
+        return None;
+    }
+    let disk_tok = on_disk_hub_token()?;
+    if disk_tok == env_tok {
+        return None;
+    }
+    Some(disk_tok)
+}
+
+/// Emit the definitive line once per process (best-effort, stderr).
+fn warn_stale_env_token() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::SeqCst) {
+        eprintln!("vct: {}", STALE_ENV_TOKEN_MESSAGE);
     }
 }
 

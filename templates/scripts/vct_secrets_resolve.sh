@@ -73,6 +73,16 @@
 #   to exit 1 too, so callers see one consistent "talk to the launcher"
 #   diagnostic.
 #
+#   v0.2.91 — STALE-ENV FALLBACK: the env pin above wins on the FIRST
+#   attempt, always. On a PROVABLE refusal (401/403), when
+#   `$VCT_HUB_TOKEN` is set AND differs from the on-disk token, the
+#   request is retried ONCE with the on-disk token (the always-fresh
+#   0600 SSOT the hub regenerates on every start) and one definitive
+#   line is printed to stderr. A failed retry changes nothing — the
+#   exit codes above are a contract. Set `VCT_HUB_TOKEN_STRICT=1` to
+#   disable the fallback (harnesses that pin a bad token and assert the
+#   401 path).
+#
 # Project ID resolution (when the first arg looks like a path, not a UUID):
 #   GET /api/v1/projects/by-path?path=<folder>  → project_id
 #
@@ -160,6 +170,87 @@ hub_token() {
     printf ''
 }
 
+# ── Stale-env hub-token fallback (v0.2.91, WP-D item 4) ─────────────────
+#
+# MUST MATCH the SSOT `vco_lib/project_config.py::_stale_env_token_fallback`
+# and the mirrors in `vct_project_config.sh`, both `.ps1` siblings,
+# `claude_mcp_servers/wrappers/_base.py`,
+# `launcher/tools/vct-cli/src/main.rs` and `tools/vct-secrets/vct`.
+# Locked by tests/test_stale_env_token_parity_v0291.py (the F-8
+# quadruplet + the Python SSOT driven through the same fixtures).
+#
+# WHY: `$VCT_HUB_TOKEN` wins over the file on every FIRST attempt (that is
+# the tests/dev pin contract). But the hub regenerates `hub.token` on each
+# start, so a shell that exported the token before an update presents a
+# value the hub refuses — every resolve then 401s until that shell dies.
+# After a PROVABLE refusal (401/403) we retry ONCE with the on-disk token
+# (the always-fresh 0600 SSOT) and print one definitive line. Nothing
+# loops, respawns, or restarts; a failed retry keeps today's error path.
+
+# The ONE definitive line. Byte-identical across every mirror.
+_VCT_STALE_ENV_TOKEN_MESSAGE="stale VCT_HUB_TOKEN in env overridden by on-disk hub.token — run \`unset VCT_HUB_TOKEN\` or open a new shell"
+_VCT_STALE_ENV_WARNED=0
+
+_warn_stale_env_token() {
+    # Once per process — a chain that calls hub_get twice must not print
+    # the same fix twice.
+    if (( _VCT_STALE_ENV_WARNED == 0 )); then
+        _VCT_STALE_ENV_WARNED=1
+        err "$_VCT_STALE_ENV_TOKEN_MESSAGE"
+    fi
+}
+
+hub_token_on_disk() {
+    # $1 = optional project id. Prints the ON-DISK token, IGNORING
+    # $VCT_HUB_TOKEN, preserving this call-site's scoped-vs-global
+    # semantics (scoped `hub.token.<id>` preferred when an id is given).
+    # Prints empty when nothing readable exists.
+    local project_id="${1:-}"
+    local state_dir="${VCT_STATE_DIR:-$HOME/.vct}"
+    if [[ -n "$project_id" ]]; then
+        local proj_file="$state_dir/hub.token.$project_id"
+        if [[ -f "$proj_file" && -r "$proj_file" ]]; then
+            local scoped
+            scoped=$(tr -d '[:space:]' < "$proj_file" 2>/dev/null) || scoped=""
+            if [[ -n "$scoped" ]]; then
+                printf '%s' "$scoped"
+                return 0
+            fi
+        fi
+    fi
+    local token_file="$state_dir/hub.token"
+    if [[ -f "$token_file" && -r "$token_file" ]]; then
+        tr -d '[:space:]' < "$token_file" 2>/dev/null || printf ''
+        return 0
+    fi
+    printf ''
+}
+
+hub_stale_env_fallback_token() {
+    # $1 = optional project id. Prints the on-disk token to retry with
+    # and returns 0, or returns 1 (no output) to leave today's path
+    # alone. Rules, in order (identical in every mirror):
+    #   1. VCT_HUB_TOKEN_STRICT=1        → 1 (the pin is authoritative)
+    #   2. VCT_HUB_TOKEN unset/empty     → 1 (nothing was pinned)
+    #   3. no readable on-disk token     → 1 (nothing better to try)
+    #   4. on-disk == env (whitespace-normalised) → 1 (pin is not stale)
+    local project_id="${1:-}"
+    # Trimmed comparison to the literal 1 — the SSOT's spelling, so a
+    # `VCT_HUB_TOKEN_STRICT=1` written with a trailing newline/CR means the
+    # same thing in bash, PowerShell, Rust and Python.
+    [[ "$(printf '%s' "${VCT_HUB_TOKEN_STRICT:-}" | tr -d '[:space:]')" == "1" ]] \
+        && return 1
+    local env_tok="${VCT_HUB_TOKEN:-}"
+    env_tok=$(printf '%s' "$env_tok" | tr -d '[:space:]')
+    [[ -n "$env_tok" ]] || return 1
+    local disk_tok
+    disk_tok=$(hub_token_on_disk "$project_id")
+    [[ -n "$disk_tok" ]] || return 1
+    [[ "$disk_tok" == "$env_tok" ]] && return 1
+    printf '%s' "$disk_tok"
+    return 0
+}
+
 # ── HTTP helpers ────────────────────────────────────────────────────────
 #
 # We use curl directly so we can capture the HTTP status separately from
@@ -173,6 +264,28 @@ hub_token() {
 # Without this, `--header "Authorization: Bearer abc..."` would put the
 # secret on argv where any process on the box could read it via
 # /proc/<pid>/cmdline.
+_hub_curl() {
+    # $1 = full url, $2 = bearer token.
+    # echoes "<status>\t<body>"; returns 1 when curl itself fails.
+    #
+    # `--header @-` reads the header line from stdin. We feed exactly
+    # one line: "Authorization: Bearer <token>". This keeps the token
+    # off argv. The `<<<` here-string gives us a single-line stdin
+    # without an extra subshell.
+    local url="$1" token="$2"
+    local body status
+    if ! body=$(curl --silent --show-error --max-time 5 \
+                     --header @- \
+                     --output - --write-out '\n%{http_code}' "$url" \
+                     <<<"Authorization: Bearer ${token}" 2>&1); then
+        return 1
+    fi
+    # Last line is the status; everything before is the body.
+    status="${body##*$'\n'}"
+    body="${body%$'\n'*}"
+    printf '%s\t%s\n' "$status" "$body"
+}
+
 hub_get() {
     # $1 = path-with-query (no leading slash)
     # echoes "<status>\t<body>" on stdout; exit non-zero only when curl
@@ -191,21 +304,41 @@ hub_get() {
         return 2
     fi
     local url="http://127.0.0.1:${port}/api/v1/${path}"
-    local body status
-    # `--header @-` reads the header line from stdin. We feed exactly
-    # one line: "Authorization: Bearer <token>". This keeps the token
-    # off argv. The `<<<` here-string gives us a single-line stdin
-    # without an extra subshell.
-    if ! body=$(curl --silent --show-error --max-time 5 \
-                     --header @- \
-                     --output - --write-out '\n%{http_code}' "$url" \
-                     <<<"Authorization: Bearer ${token}" 2>&1); then
-        return 1
-    fi
-    # Last line is the status; everything before is the body.
-    status="${body##*$'\n'}"
-    body="${body%$'\n'*}"
-    printf '%s\t%s\n' "$status" "$body"
+    local result status
+    result=$(_hub_curl "$url" "$token") || return 1
+    status="${result%%$'\t'*}"
+    # v0.2.91 (WP-D item 4): a PROVABLE credential refusal is the ONLY
+    # trigger for the one-shot on-disk-token retry. Every other status —
+    # and a strict pin, an absent env token, an identical on-disk token,
+    # or a retry that is ALSO refused — falls through to the original
+    # result, so the exit-code contract above is byte-identical.
+    case "$status" in
+        401|403)
+            local fallback retry retry_status
+            if fallback=$(hub_stale_env_fallback_token "$project_id"); then
+                if retry=$(_hub_curl "$url" "$fallback"); then
+                    retry_status="${retry%%$'\t'*}"
+                    # ADOPT only an answer that PROVES the fallback
+                    # credential was accepted: 2xx, or 404 (the hub
+                    # answers "no row" only AFTER its auth middleware
+                    # accepted the bearer — a post-auth answer like a
+                    # 200). Anything else — 5xx included — proves
+                    # nothing, so the ORIGINAL 401/403 stands and no
+                    # definitive line is printed (v0.2.91 wave-3,
+                    # MINOR-1).
+                    case "$retry_status" in
+                        2??|404)
+                            _warn_stale_env_token
+                            printf '%s\n' "$retry"
+                            return 0
+                            ;;
+                        *) : ;;   # not proof — keep the original refusal
+                    esac
+                fi
+            fi
+            ;;
+    esac
+    printf '%s\n' "$result"
 }
 
 # ── JSON extraction ─────────────────────────────────────────────────────

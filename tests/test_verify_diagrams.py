@@ -27,7 +27,6 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
-from typing import Any, Mapping
 from unittest import mock
 
 import pytest
@@ -955,3 +954,145 @@ def test_overall_label_mapping():
     assert vd._overall_label(vd.EXIT_ENV_PROBLEM) == "env_problem"
     assert vd._overall_label(vd.EXIT_FIX_FAILED) == "fix_failed"
     assert vd._overall_label(999) == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# v0.2.91 (WP-D item 4): stale-env hub-token fallback.
+#
+# THE SEAM: `$VCT_HUB_TOKEN` wins over the on-disk token, and the hub
+# rotates that file on every start. A shell that exported the token before
+# an update therefore made this VERIFY command 401 — and because
+# `HTTPError` subclasses `URLError`, the 401 landed in the "hub not
+# reachable" arm and the check reported SKIP, blaming the hub. A verify
+# command that silently stops verifying (and misattributes the cause) is
+# the honesty class this release closes.
+#
+# THE SKIP SEMANTICS ARE UNCHANGED: an un-rescued refusal re-raises the
+# ORIGINAL exception, so the same STATUS_SKIP with the same message text
+# is produced. Both halves are pinned below.
+# ---------------------------------------------------------------------------
+
+_STALE_ENV_TOKEN = "stale-env-token-v0291-not-a-real-secret"
+_FRESH_DISK_TOKEN = "fresh-disk-token-v0291-not-a-real-secret"
+
+
+@pytest.fixture(autouse=True)
+def _reset_stale_env_latch():
+    """The latch is MODULE-level (a `--all` run verifies many projects in
+    ONE process), so it must not leak between tests."""
+    vd._test_reset_stale_env_state()
+    yield
+    vd._test_reset_stale_env_state()
+
+
+@pytest.fixture
+def stale_env_pin(tmp_path: Path, monkeypatch):
+    """Fresh token on disk, STALE token exported."""
+    state = tmp_path / "vct-state"
+    state.mkdir()
+    (state / "hub.token").write_text(_FRESH_DISK_TOKEN, encoding="utf-8")
+    monkeypatch.setattr(vd, "_on_disk_hub_token", lambda: _FRESH_DISK_TOKEN)
+    monkeypatch.setenv("VCT_HUB_TOKEN", _STALE_ENV_TOKEN)
+    monkeypatch.delenv("VCT_HUB_TOKEN_STRICT", raising=False)
+    return state
+
+
+def _hub_accepting(expected: str, seen: list):
+    """`_http_get_json` stub: raises HTTPError 401 unless the bearer matches."""
+    import urllib.error
+
+    def _stub_get(url: str, token, *, timeout: float = 5.0):
+        seen.append(token)
+        if token != expected:
+            raise urllib.error.HTTPError(
+                url=url, code=401, msg="Unauthorized", hdrs=None, fp=None
+            )
+        return {"default_allow_all": True}
+
+    return _stub_get
+
+
+def test_hub_allowlist_stale_pin_is_retried_and_check_runs(
+    monkeypatch, stale_env_pin, capsys
+):
+    """RED-PROOF: pre-v0.2.91 the 401 was caught by the URLError arm and
+    the check reported SKIP ("hub not reachable") — a silent non-verify."""
+    seen: list = []
+    monkeypatch.setattr(vd, "_http_get_json", _hub_accepting(_FRESH_DISK_TOKEN, seen))
+    result = vd._check_hub_allowlist("p-1")
+
+    assert result.status == vd.STATUS_OK, result.detail
+    # First probe presents the stale pin, retries with the on-disk token;
+    # the SECOND mcp_name then rides the latch directly.
+    assert seen == [_STALE_ENV_TOKEN, _FRESH_DISK_TOKEN, _FRESH_DISK_TOKEN]
+    assert vd._IGNORE_ENV_HUB_TOKEN is True
+    # The definitive line goes to stderr — never stdout (the `--json`
+    # machine contract).
+    captured = capsys.readouterr()
+    assert vd.STALE_ENV_TOKEN_MESSAGE in captured.err
+    assert vd.STALE_ENV_TOKEN_MESSAGE not in captured.out
+
+
+def test_hub_allowlist_strict_pin_keeps_the_skip(monkeypatch, stale_env_pin):
+    """LEAVE-ALONE: the guard keeps the pin authoritative → the historical
+    SKIP with the historical message."""
+    monkeypatch.setenv("VCT_HUB_TOKEN_STRICT", "1")
+    seen: list = []
+    monkeypatch.setattr(vd, "_http_get_json", _hub_accepting(_FRESH_DISK_TOKEN, seen))
+    result = vd._check_hub_allowlist("p-1")
+
+    assert result.status == vd.STATUS_SKIP
+    assert "hub not reachable" in result.detail
+    assert seen == [_STALE_ENV_TOKEN]
+    assert vd._IGNORE_ENV_HUB_TOKEN is False
+
+
+def test_hub_allowlist_retry_also_refused_keeps_the_original_diagnostic(
+    monkeypatch, stale_env_pin
+):
+    """LEAVE-ALONE: both tokens refused → the ORIGINAL exception is
+    re-raised, so the skip text is byte-identical to pre-v0.2.91."""
+    seen: list = []
+    monkeypatch.setattr(
+        vd, "_http_get_json", _hub_accepting("a-third-token-nobody-has", seen)
+    )
+    result = vd._check_hub_allowlist("p-1")
+
+    assert result.status == vd.STATUS_SKIP
+    assert "hub not reachable" in result.detail
+    assert seen == [_STALE_ENV_TOKEN, _FRESH_DISK_TOKEN]
+    assert vd._IGNORE_ENV_HUB_TOKEN is False
+
+
+def test_hub_allowlist_non_credential_error_is_not_retried(monkeypatch, stale_env_pin):
+    """LEAVE-ALONE: a 500 is not a credential problem — one request, and
+    the historical failure classification."""
+    import urllib.error
+
+    seen: list = []
+
+    def _stub_get(url: str, token, *, timeout: float = 5.0):
+        seen.append(token)
+        raise urllib.error.HTTPError(
+            url=url, code=500, msg="Server Error", hdrs=None, fp=None
+        )
+
+    monkeypatch.setattr(vd, "_http_get_json", _stub_get)
+    result = vd._check_hub_allowlist("p-1")
+
+    # HTTPError subclasses URLError → the historical "hub not reachable"
+    # SKIP arm, reached on the FIRST probe with no retry.
+    assert result.status == vd.STATUS_SKIP
+    assert seen == [_STALE_ENV_TOKEN]
+
+
+def test_hub_allowlist_identical_tokens_make_one_request_each(monkeypatch, tmp_path):
+    """LEAVE-ALONE: the pin is not stale — nothing extra happens."""
+    monkeypatch.setattr(vd, "_on_disk_hub_token", lambda: _FRESH_DISK_TOKEN)
+    monkeypatch.setenv("VCT_HUB_TOKEN", _FRESH_DISK_TOKEN)
+    seen: list = []
+    monkeypatch.setattr(vd, "_http_get_json", _hub_accepting(_FRESH_DISK_TOKEN, seen))
+    result = vd._check_hub_allowlist("p-1")
+
+    assert result.status == vd.STATUS_OK
+    assert seen == [_FRESH_DISK_TOKEN, _FRESH_DISK_TOKEN]

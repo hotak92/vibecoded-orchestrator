@@ -127,9 +127,23 @@ class _ResolverTestBase(unittest.TestCase):
         # clear=False merges into existing env, so we explicitly
         # remove the gate; the tearDown will restore it.
         os.environ.pop("VCT_DISABLE_HUB_RESOLVER", None)
+        # v0.2.91 (WP-D item 4) HERMETICITY PIN: this suite pins a
+        # synthetic `VCT_HUB_TOKEN` and asserts the refusal paths
+        # (401/403) verbatim, including the exact GET count. Since
+        # v0.2.91 a PROVABLY-stale env pin triggers ONE retry with the
+        # on-disk `hub.token` — which on a developer machine is the REAL
+        # `~/.vct/hub.token` (this suite does not isolate
+        # `VCT_STATE_DIR`), so the assertions would depend on ambient
+        # host state. `VCT_HUB_TOKEN_STRICT=1` is exactly the guard that
+        # exists for harnesses like this one: the pin stays
+        # authoritative and the refusal is observed unchanged.
         self._env_patch = mock.patch.dict(
             os.environ,
-            {"VCT_HUB_PORT": "9999", "VCT_HUB_TOKEN": "test-token-abc"},
+            {
+                "VCT_HUB_PORT": "9999",
+                "VCT_HUB_TOKEN": "test-token-abc",
+                "VCT_HUB_TOKEN_STRICT": "1",
+            },
         )
         self._env_patch.start()
         # Replace the singleton session with a Mock so we can assert calls.

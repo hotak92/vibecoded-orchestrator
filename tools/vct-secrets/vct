@@ -12,7 +12,10 @@
 # never touches the network; the ONLY network access is a bounded, read-only,
 # localhost-only vct-hub probe on a file-store MISS (v0.2.76 R4) purely to make
 # the miss message honest — it never fetches or writes a value and soft-fails
-# silently when the hub is absent/unreachable.
+# silently when the hub is absent/unreachable. v0.2.91: that probe may make ONE
+# extra bounded request when a PROVABLY-stale $VCT_HUB_TOKEN was refused
+# (401/403) and the on-disk hub.token differs — set VCT_HUB_TOKEN_STRICT=1 to
+# disable. Still read-only, still localhost, still never a value in a log.
 
 set -u
 umask 077
@@ -77,8 +80,42 @@ _hub_port() {
 
 _hub_token() {
     # $1 = optional project id/slug (prefers the per-project token file).
-    local project_id="${1:-}" state_dir="${VCT_STATE_DIR:-$HOME/.vct}"
+    # The env pin wins here, as everywhere — only a PROVABLE refusal sets
+    # it aside, via `_hub_stale_env_fallback_token` below.
+    local project_id="${1:-}"
     if [ -n "${VCT_HUB_TOKEN:-}" ]; then printf '%s' "$VCT_HUB_TOKEN"; return 0; fi
+    _hub_token_on_disk "$project_id"
+}
+
+# ── Stale-env hub-token fallback (v0.2.91, WP-D item 4) ─────────────────
+#
+# MUST MATCH the SSOT `vco_lib/project_config.py::_stale_env_token_fallback`
+# and the mirrors in `templates/scripts/vct_secrets_resolve.{sh,ps1}`,
+# `templates/scripts/vct_project_config.{sh,ps1}`,
+# `claude_mcp_servers/wrappers/_base.py` and
+# `launcher/tools/vct-cli/src/main.rs`.
+#
+# WHY here: the hub probe below is best-effort, but a stale exported
+# `VCT_HUB_TOKEN` makes it answer "refused (401/403) — key state UNKNOWN"
+# on a machine where the on-disk token would have answered definitively.
+# One bounded extra request fixes the diagnostic; nothing loops.
+
+# The ONE definitive line. Byte-identical across every mirror.
+_VCT_STALE_ENV_TOKEN_MESSAGE="stale VCT_HUB_TOKEN in env overridden by on-disk hub.token — run \`unset VCT_HUB_TOKEN\` or open a new shell"
+_VCT_STALE_ENV_WARNED=0
+
+_warn_stale_env_token() {
+    # Once per process, on stderr (never stdout — `vct get` pipes stdout).
+    if [ "$_VCT_STALE_ENV_WARNED" -eq 0 ]; then
+        _VCT_STALE_ENV_WARNED=1
+        warn "$_VCT_STALE_ENV_TOKEN_MESSAGE"
+    fi
+}
+
+_hub_token_on_disk() {
+    # $1 = optional project id/slug. Prints the ON-DISK token, IGNORING
+    # $VCT_HUB_TOKEN, preserving the scoped-vs-global preference.
+    local project_id="${1:-}" state_dir="${VCT_STATE_DIR:-$HOME/.vct}"
     if [ -n "$project_id" ] && [ -r "$state_dir/hub.token.$project_id" ]; then
         tr -d '[:space:]' < "$state_dir/hub.token.$project_id" 2>/dev/null
         return 0
@@ -88,6 +125,28 @@ _hub_token() {
         return 0
     fi
     printf ''
+}
+
+_hub_stale_env_fallback_token() {
+    # $1 = optional project id/slug. Prints the on-disk token to retry
+    # with and returns 0, or returns 1 (no output). Rules, in order:
+    #   1. VCT_HUB_TOKEN_STRICT=1        → 1 (the pin is authoritative)
+    #   2. VCT_HUB_TOKEN unset/empty     → 1 (nothing was pinned)
+    #   3. no readable on-disk token     → 1 (nothing better to try)
+    #   4. on-disk == env (whitespace-normalised) → 1 (pin is not stale)
+    local project_id="${1:-}" env_tok disk_tok
+    # Trimmed comparison to the literal 1 — the SSOT's spelling, so a
+    # `VCT_HUB_TOKEN_STRICT=1` written with a trailing newline/CR means the
+    # same thing in bash, PowerShell, Rust and Python.
+    [ "$(printf '%s' "${VCT_HUB_TOKEN_STRICT:-}" | tr -d '[:space:]')" = "1" ] \
+        && return 1
+    env_tok=$(printf '%s' "${VCT_HUB_TOKEN:-}" | tr -d '[:space:]')
+    [ -n "$env_tok" ] || return 1
+    disk_tok=$(_hub_token_on_disk "$project_id")
+    [ -n "$disk_tok" ] || return 1
+    [ "$disk_tok" = "$env_tok" ] && return 1
+    printf '%s' "$disk_tok"
+    return 0
 }
 
 # hub_has_key PROJECT KEY → probe the launcher keychain via the hub.
@@ -119,6 +178,39 @@ hub_has_key() {
                 <<<"Authorization: Bearer ${token}" 2>/dev/null) || return 1
     status="${body##*$'\n'}"
     body="${body%$'\n'*}"
+    # v0.2.91 (WP-D item 4): before classifying a refusal, give the ONE
+    # bounded on-disk-token retry a chance — a stale exported
+    # VCT_HUB_TOKEN otherwise degrades every probe to "UNKNOWN" on a
+    # machine whose hub.token would have answered. Failure of the retry
+    # leaves the classification below byte-identical.
+    case "$status" in
+        403|401)
+            local fallback retry retry_status
+            if fallback=$(_hub_stale_env_fallback_token "$project"); then
+                if retry=$(curl --silent --show-error --max-time 3 \
+                                --header @- --output - --write-out '\n%{http_code}' "$url" \
+                                <<<"Authorization: Bearer ${fallback}" 2>/dev/null); then
+                    retry_status="${retry##*$'\n'}"
+                    # ADOPT only an answer that PROVES the fallback
+                    # credential was accepted: 2xx, or 404 (the hub answers
+                    # "no row" only AFTER its auth middleware accepted the
+                    # bearer — a post-auth answer like a 200). Anything
+                    # else — 5xx included — proves nothing, so the ORIGINAL
+                    # 401/403 stands, this probe still reports UNKNOWN, and
+                    # no definitive line is printed (v0.2.91 wave-3,
+                    # MINOR-1).
+                    case "$retry_status" in
+                        2??|404)
+                            _warn_stale_env_token
+                            status="$retry_status"
+                            body="${retry%$'\n'*}"
+                            ;;
+                        *) : ;;   # not proof — keep the original refusal
+                    esac
+                fi
+            fi
+            ;;
+    esac
     # v0.2.77 Part 8 Task 4b (option iv): a 403/401 means the hub is up but
     # this probe's credential was refused — the key state is UNKNOWN, NOT a
     # confirmed absence. Signal that distinctly so die_miss withholds the

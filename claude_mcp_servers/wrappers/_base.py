@@ -82,7 +82,7 @@ import logging
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -118,6 +118,38 @@ DEFAULT_ALLOWLIST_TTL_SECONDS: int = 60
 #: making first-call hang.
 _HUB_CONNECT_TIMEOUT: float = 2.0
 _HUB_READ_TIMEOUT: float = 5.0
+
+#: HTTP statuses that constitute a PROVABLE credential refusal — the only
+#: trigger for the stale-env-token fallback (v0.2.91, WP-D item 4). 401 =
+#: the bearer matched nothing; 403 = the bearer is real but refused on
+#: this route (the global-token-on-``/env`` shape). Anything else is not
+#: a credential problem and never triggers a retry.
+_AUTH_REFUSAL_STATUSES: frozenset[int] = frozenset({401, 403})
+
+
+def _retry_answer_is_definitive(status: int) -> bool:
+    """May a stale-env RETRY's answer be adopted (and the pin latched off)?
+
+    Only when it PROVES the fallback credential was accepted: ``2xx``, or
+    ``404`` — which the hub answers only after its auth middleware
+    accepted the bearer ("no project for this path" / "no grants row"), so
+    it is a post-auth answer just like a 200.
+
+    Everything else proves nothing about the credential. v0.2.91 wave-3
+    (MINOR-1): before this, any non-401/403 retry answer was adopted, so a
+    5xx following a 401 permanently latched the env pin off for this
+    long-lived process and logged the definitive line on no evidence.
+    """
+    return 200 <= status < 300 or status == 404
+
+#: The ONE definitive line emitted after a stale env token is overridden.
+#: Byte-identical to ``vco_lib.project_config.STALE_ENV_TOKEN_MESSAGE``
+#: and to the sh / ps1 / Rust mirrors (locked by
+#: tests/test_stale_env_token_parity_v0291.py).
+STALE_ENV_TOKEN_MESSAGE: str = (
+    "stale VCT_HUB_TOKEN in env overridden by on-disk hub.token — "
+    "run `unset VCT_HUB_TOKEN` or open a new shell"
+)
 
 
 # ─── Cached state shapes ──────────────────────────────────────────────────
@@ -181,6 +213,17 @@ class WrapperMCP:
         # file changes or after a 401 forces invalidation.
         self._hub_port: Optional[int] = None
         self._hub_token: Optional[str] = None
+
+        # v0.2.91 (WP-D item 4): latched TRUE once the hub has PROVABLY
+        # refused this process's ``$VCT_HUB_TOKEN`` and the on-disk token
+        # worked instead. A wrapper is long-lived (it outlives the shell
+        # that spawned it), so without the latch every subsequent
+        # invalidation would re-prefer the same dead env value and the
+        # wrapper would 401 for its whole lifetime. Never set when
+        # ``VCT_HUB_TOKEN_STRICT=1``.
+        self._ignore_env_hub_token: bool = False
+        # One definitive stderr/log line per process, not per request.
+        self._stale_env_token_warned: bool = False
 
         # aiohttp session — created lazily on first use, closed on
         # subprocess shutdown.
@@ -608,30 +651,43 @@ class WrapperMCP:
         if port is None or token is None:
             return None
         url = f"http://127.0.0.1:{port}/api/v1/projects/by-path"
-        try:
+
+        async def attempt(bearer: str) -> tuple[int, Any]:
+            # Body-parsing set is byte-identical to the pre-v0.2.91 flow:
+            # 401 / 404 / 5xx short-circuit before `resp.json()`; every
+            # other status (403 included) parses exactly as it did.
             async with session.get(
                 url,
                 params={"path": abs_path},
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"Authorization": f"Bearer {bearer}"},
                 timeout=aiohttp.ClientTimeout(
                     connect=_HUB_CONNECT_TIMEOUT,
                     total=_HUB_READ_TIMEOUT,
                 ),
             ) as resp:
-                if resp.status == 401:
-                    # Token rotated — drop our cached creds and let next
-                    # call re-read.
-                    self._hub_port = None
-                    self._hub_token = None
-                    raise _HubUnreachable("hub returned 401 (token stale)")
-                if resp.status == 404:
-                    return None  # No project registered for this cwd.
-                if resp.status >= 500:
-                    raise _HubUnreachable(f"hub by-path returned {resp.status}")
-                body = await resp.json()
-                # Modules_api returns ProjectSummary with `id` field.
-                pid = body.get("id") or body.get("project_id")
-                return str(pid) if pid else None
+                if resp.status == 401 or resp.status == 404 or resp.status >= 500:
+                    return resp.status, None
+                return resp.status, await resp.json()
+
+        try:
+            status, body = await attempt(token)
+            status, body = await self._maybe_retry_with_disk_token(
+                status, body, attempt
+            )
+            if status == 401:
+                # Token rotated — drop our cached creds and let next
+                # call re-read.
+                self._hub_port = None
+                self._hub_token = None
+                raise _HubUnreachable("hub returned 401 (token stale)")
+
+            if status == 404:
+                return None  # No project registered for this cwd.
+            if status >= 500:
+                raise _HubUnreachable(f"hub by-path returned {status}")
+            # Modules_api returns ProjectSummary with `id` field.
+            pid = body.get("id") or body.get("project_id")
+            return str(pid) if pid else None
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             raise _HubUnreachable(f"hub by-path call failed: {e}") from e
 
@@ -648,35 +704,123 @@ class WrapperMCP:
             f"http://127.0.0.1:{port}/api/v1/projects/"
             f"{project_id}/mcp-tool-grants/{self.mcp_name}"
         )
-        try:
+
+        async def attempt(bearer: str) -> tuple[int, Any]:
+            # Body-parsing set is byte-identical to the pre-v0.2.91 flow.
             async with session.get(
                 url,
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"Authorization": f"Bearer {bearer}"},
                 timeout=aiohttp.ClientTimeout(
                     connect=_HUB_CONNECT_TIMEOUT,
                     total=_HUB_READ_TIMEOUT,
                 ),
             ) as resp:
-                if resp.status == 401:
-                    self._hub_port = None
-                    self._hub_token = None
-                    raise _HubUnreachable("hub returned 401 (token stale)")
-                if resp.status == 404:
-                    # No grants table OR no project — treat as failsafe.
-                    raise _HubUnreachable("hub returned 404")
-                if resp.status >= 500:
-                    raise _HubUnreachable(f"hub grants returned {resp.status}")
-                body = await resp.json()
-                grants = body.get("grants") or {}
-                if not isinstance(grants, dict):
-                    raise _HubUnreachable(
-                        f"hub grants response malformed: {type(grants).__name__}"
-                    )
-                # Coerce values to bool (defensive — JSON sometimes
-                # carries integers from older hub versions).
-                return {str(k): bool(v) for k, v in grants.items()}
+                if resp.status == 401 or resp.status == 404 or resp.status >= 500:
+                    return resp.status, None
+                return resp.status, await resp.json()
+
+        try:
+            status, body = await attempt(token)
+            status, body = await self._maybe_retry_with_disk_token(
+                status, body, attempt
+            )
+            if status == 401:
+                self._hub_port = None
+                self._hub_token = None
+                raise _HubUnreachable("hub returned 401 (token stale)")
+            if status == 404:
+                # No grants table OR no project — treat as failsafe.
+                raise _HubUnreachable("hub returned 404")
+            if status >= 500:
+                raise _HubUnreachable(f"hub grants returned {status}")
+            grants = body.get("grants") or {}
+            if not isinstance(grants, dict):
+                raise _HubUnreachable(
+                    f"hub grants response malformed: {type(grants).__name__}"
+                )
+            # Coerce values to bool (defensive — JSON sometimes
+            # carries integers from older hub versions).
+            return {str(k): bool(v) for k, v in grants.items()}
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             raise _HubUnreachable(f"hub grants call failed: {e}") from e
+
+    # ─── Stale-env hub-token fallback (v0.2.91, WP-D item 4) ─────────
+    #
+    # MUST MATCH `vco_lib/project_config.py::_stale_env_token_fallback`
+    # (the Python SSOT). We cannot call it directly here for the same
+    # reason `_get_hub_credentials` re-implements `_discover_hub`: this
+    # module is deliberately import-light + asyncio-friendly and must
+    # keep working when vco_lib is not importable from the wrapper's
+    # interpreter. The rules are locked by
+    # tests/test_stale_env_token_parity_v0291.py.
+
+    def _stale_env_token_fallback(self) -> str | None:
+        """The on-disk token to retry with, or ``None`` to leave alone.
+
+        Rules (identical to the SSOT): strict pin set → None; no env
+        token → None; no readable on-disk token → None; on-disk equals
+        env → None. Wrappers only ever hit GLOBAL-token routes
+        (``/projects/by-path``, ``/projects/{id}/mcp-tool-grants/...``
+        — neither is a per-project-token route, see the hub's
+        ``auth.rs::per_project_token_route``), so there is no scoped
+        variant to resolve here.
+        """
+        # Trimmed comparison to the literal "1" — the SSOT's spelling, so a
+        # `VCT_HUB_TOKEN_STRICT=1\n` from a here-doc means the same thing in
+        # every mirror.
+        if os.environ.get("VCT_HUB_TOKEN_STRICT", "").strip() == "1":
+            return None
+        env_tok = os.environ.get("VCT_HUB_TOKEN", "").strip()
+        if not env_tok:
+            return None
+        try:
+            disk_tok = (
+                (vct_root_dir() / "hub.token").read_text(encoding="utf-8").strip()
+            )
+        except (FileNotFoundError, OSError):
+            return None
+        if not disk_tok or disk_tok == env_tok:
+            return None
+        return disk_tok
+
+    async def _maybe_retry_with_disk_token(
+        self,
+        status: int,
+        body: Any,
+        attempt: Any,
+    ) -> tuple[int, Any]:
+        """One bounded retry with the on-disk token after a provable refusal.
+
+        Returns the retry's ``(status, body)`` only when it PROVES the
+        fallback credential was accepted (see
+        :func:`_retry_answer_is_definitive`), else the original pair
+        verbatim — so every non-stale-token path stays byte-compatible
+        with the pre-v0.2.91 flow. On adoption the env token is latched
+        OFF for the rest of this (long-lived) process and one definitive
+        line is logged.
+
+        Nothing loops: at most one extra request per hub call.
+        """
+        if status not in _AUTH_REFUSAL_STATUSES:
+            return status, body
+        fallback = self._stale_env_token_fallback()
+        if fallback is None:
+            return status, body
+        try:
+            retry_status, retry_body = await attempt(fallback)
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            # The extra attempt could not complete — keep today's path.
+            return status, body
+        if not _retry_answer_is_definitive(retry_status):
+            return status, body
+        # Success: the env pin was the problem. Stop presenting it.
+        self._ignore_env_hub_token = True
+        self._hub_port = None
+        self._hub_token = None
+        if not self._stale_env_token_warned:
+            self._stale_env_token_warned = True
+            logger.warning("wrapper(%s): %s", self.mcp_name, STALE_ENV_TOKEN_MESSAGE)
+        return retry_status, retry_body
 
     def _get_hub_credentials(self) -> tuple[int | None, str | None]:
         """Resolve (port, token) from env > on-disk > defaults.
@@ -752,7 +896,15 @@ class WrapperMCP:
         # unreachable path) and — for the UNREADABLE case only — warn first so
         # the diagnostic shape matches the sibling resolvers. The read failure
         # NEVER crashes with a raw OSError traceback.
+        #
+        # v0.2.91 (WP-D item 4): `_ignore_env_hub_token` latches TRUE
+        # only after the hub PROVABLY refused this env value AND the
+        # on-disk token worked. From then on this long-lived process
+        # skips the env pin entirely — otherwise every invalidation
+        # would re-prefer the dead value (the seam this fix closes).
         token_env = os.environ.get("VCT_HUB_TOKEN", "").strip()
+        if token_env and self._ignore_env_hub_token:
+            token_env = ""
         if token_env:
             token: str | None = token_env
         else:
@@ -869,4 +1021,5 @@ __all__ = [
     "WrapperMCP",
     "DEFAULT_ALLOWLIST_TTL_SECONDS",
     "DEFAULT_HUB_PORT",
+    "STALE_ENV_TOKEN_MESSAGE",
 ]

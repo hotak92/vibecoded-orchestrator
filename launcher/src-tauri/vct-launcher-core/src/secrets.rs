@@ -635,9 +635,26 @@ impl std::error::Error for KeychainError {}
 #[cfg(target_os = "linux")]
 pub fn probe_default_collection_locked() -> Option<bool> {
     // Allow tests to inject a deterministic lock state without a live D-Bus.
+    // An EXPLICIT override always wins — including over the mock check
+    // below — so a test that forces LOCKED while the mock is active (the
+    // T18 shape) keeps asserting exactly what it asserts.
     #[cfg(any(test, debug_assertions))]
     if let Some(forced) = test_probe_override() {
         return forced;
+    }
+    // v0.2.91 (WP-D item 3) — HERMETICITY. When the thread-local mock
+    // keychain is active, the mock IS the store: get/set/delete never
+    // touch the host's Secret Service, so this probe must not either.
+    // Without this, a LOCKED host login keyring made every mocked
+    // Background read return `Err(Locked)` before the mock was
+    // consulted (4 `db::secret_active` resolver tests red locally,
+    // green in CI's ephemeral-keyring environment — an ambient-state
+    // dependency, not a real signal). The mock store cannot be locked,
+    // so the honest answer is "unlocked". Inert in production: the
+    // predicate is false unless a test enabled the mock on this thread.
+    #[cfg(any(test, debug_assertions))]
+    if for_tests::mock_is_active() {
+        return Some(false);
     }
     // Run the D-Bus property read on the bounded-timeout worker: a wedged
     // Secret Service must not hang the probe. A timeout / worker-stuck →
@@ -2445,6 +2462,23 @@ pub mod for_tests {
         });
     }
 
+    /// Whether the thread-local mock keychain is active on THIS thread.
+    ///
+    /// v0.2.91 (WP-D item 3): the mock intercepts `get`/`set`/`delete`,
+    /// but the Background LOCK PROBE that runs BEFORE them
+    /// (`probe_default_collection_locked`) used to reach the host's real
+    /// Secret Service even inside a `MockGuard` scope. On a machine whose
+    /// login keyring is LOCKED the probe answered `Some(true)`, so four
+    /// hermetic `db::secret_active` tests failed with
+    /// `KeychainError::Locked` before the mock was ever consulted — they
+    /// passed only where a live UNLOCKED (or absent) Secret Service
+    /// happened to exist, which is exactly why CI's ephemeral keyring
+    /// masked it. This predicate lets the probe recognise "the mock IS
+    /// the store" and skip the host entirely.
+    pub fn mock_is_active() -> bool {
+        MOCK_STORE.with(|cell| cell.borrow().is_some())
+    }
+
     /// Snapshot all entries currently in the mock store.
     ///
     /// Returns `None` when the mock isn't active. Useful for assertions
@@ -3792,6 +3826,59 @@ mod tests {
         assert_eq!(
             is_set_with_context(scope, "mod", "absent", CallContext::Background),
             Err(KeychainError::Locked),
+        );
+    }
+
+    /// v0.2.91 (WP-D item 3) HERMETICITY PIN — ACT half: with the mock
+    /// keychain active and NO explicit probe override, a `Background` read
+    /// must resolve from the mock regardless of the HOST's Secret-Service
+    /// lock state. Pre-fix this test's outcome depended on the developer's
+    /// login keyring: a LOCKED keyring made the probe answer `Some(true)`
+    /// and the read returned `Err(Locked)` before the mock was consulted
+    /// (that is what red-ed four `db::secret_active` resolver tests
+    /// locally while CI's ephemeral keyring hid it).
+    ///
+    /// FAIL-ON-REVERT: drop the `mock_is_active()` short-circuit in
+    /// `probe_default_collection_locked` and this test goes back to
+    /// answering with whatever the host keyring happens to be.
+    #[test]
+    fn mock_active_makes_background_read_independent_of_host_keyring() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _g = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+        set(scope, "mod", "hermetic", "hv").unwrap();
+        // No TestProbeGuard here on purpose — the ambient host is the
+        // variable this pin removes.
+        assert_eq!(
+            get_with_context(scope, "mod", "hermetic", CallContext::Background),
+            Ok(Some("hv".to_string())),
+            "a mocked Background read must not consult the host keychain's \
+             lock state",
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            probe_default_collection_locked(),
+            Some(false),
+            "with the mock active the mock IS the store, and it is never locked",
+        );
+    }
+
+    /// v0.2.91 (WP-D item 3) HERMETICITY PIN — LEAVE-ALONE half: an
+    /// EXPLICIT `TestProbeGuard` override still wins over the mock
+    /// short-circuit, so tests that deliberately force a LOCKED store
+    /// while mocking the keychain keep asserting exactly what they assert.
+    #[test]
+    fn explicit_probe_override_still_wins_over_mock_short_circuit() {
+        let _lock = test_serialize::keychain_serialize_lock();
+        let _g = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+        set(scope, "mod", "forced", "fv").unwrap();
+        let _probe = TestProbeGuard::new(Some(true));
+        assert_eq!(
+            get_with_context(scope, "mod", "forced", CallContext::Background),
+            Err(KeychainError::Locked),
+            "an explicit forced-locked override must not be masked by the \
+             mock short-circuit",
         );
     }
 

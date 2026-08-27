@@ -329,7 +329,10 @@ function Get-HubPort {
 # `vct_project_config.sh::hub_token` and the python sibling
 # `vco_lib/project_config.py::_discover_hub` (token branch):
 #   * env `VCT_HUB_TOKEN` set → used verbatim after trim (any non-empty
-#     string is a legitimate token; no format to validate).
+#     string is a legitimate token; no format to validate). v0.2.91: the
+#     pin still wins on every FIRST attempt; only a PROVABLE refusal
+#     (401/403) triggers the one-shot on-disk retry in `Invoke-Hub`
+#     (`Get-StaleEnvFallbackToken`), disabled by VCT_HUB_TOKEN_STRICT=1.
 #   * `hub.token` present but UNREADABLE → emit ONE rate-limited stderr
 #     warning (kind `hub_token_unreadable`) and return $null. The token
 #     has NO sane default, so unreadable/absent → "no token" → caller
@@ -377,6 +380,103 @@ function Get-HubToken {
     return $null
 }
 
+# ── Stale-env hub-token fallback (v0.2.91, WP-D item 4) ─────────────────
+#
+# MUST MATCH the SSOT `vco_lib/project_config.py::_stale_env_token_fallback`
+# and the mirrors in `vct_project_config.sh`, `vct_secrets_resolve.sh`,
+# `vct_secrets_resolve.ps1`, `claude_mcp_servers/wrappers/_base.py`,
+# `launcher/tools/vct-cli/src/main.rs` and `tools/vct-secrets/vct`.
+# Locked by tests/test_stale_env_token_parity_v0291.py (the F-8
+# quadruplet + the Python SSOT driven through the same fixtures).
+#
+# WHY: `$Env:VCT_HUB_TOKEN` wins over the file on every FIRST attempt
+# (the tests/dev pin contract). But the hub regenerates `hub.token` on
+# each start, so a shell that exported the token before an update
+# presents a value the hub refuses — every resolve then 401s until that
+# shell dies. After a PROVABLE refusal (401/403) we retry ONCE with the
+# on-disk token and emit one definitive line. Nothing loops, respawns,
+# or restarts; a failed retry keeps today's error path (and exit codes).
+
+# The ONE definitive line. Byte-identical across every mirror.
+$script:StaleEnvTokenMessage = 'stale VCT_HUB_TOKEN in env overridden by on-disk hub.token — run `unset VCT_HUB_TOKEN` or open a new shell'
+$script:StaleEnvTokenWarned = $false
+
+function Write-StaleEnvTokenWarning {
+    # Once per process; routed through the rate-limited emitter (this
+    # script's stderr policy) with an explicit line override — the
+    # default "Falling back to env." shape would be a lie here, since
+    # the resolution SUCCEEDED with the on-disk token.
+    if (-not $script:StaleEnvTokenWarned) {
+        $script:StaleEnvTokenWarned = $true
+        Emit-Warning -ErrorKind "hub_token_stale_env" `
+            -Detail $script:StaleEnvTokenMessage `
+            -StderrLine ("[vct] project_config: hub_token_stale_env: " + $script:StaleEnvTokenMessage)
+    }
+}
+
+function Get-HubTokenOnDisk {
+    # Returns the ON-DISK token, IGNORING $Env:VCT_HUB_TOKEN, preserving
+    # this call-site's scoped-vs-global semantics (scoped
+    # `hub.token.<ProjectId>` preferred when an id is given). Returns
+    # $null when nothing readable exists. NEVER warns — this is the
+    # fallback probe, not the primary discovery path.
+    param([string]$ProjectId = '')
+    $stateDir = if ($Env:VCT_STATE_DIR) { $Env:VCT_STATE_DIR } else { Join-Path $HOME ".vct" }
+    if ($ProjectId) {
+        $projFile = Join-Path $stateDir "hub.token.$ProjectId"
+        if (Test-Path $projFile) {
+            try {
+                $rawP = (Get-Content -Raw -Path $projFile -ErrorAction Stop).Trim()
+                if ($rawP.Length -gt 0) { return $rawP }
+            } catch {
+                # Unreadable per-project file → fall through to global.
+            }
+        }
+    }
+    $tokenFile = Join-Path $stateDir "hub.token"
+    if (Test-Path $tokenFile) {
+        try {
+            $raw = (Get-Content -Raw -Path $tokenFile -ErrorAction Stop).Trim()
+            if ($raw.Length -gt 0) { return $raw }
+        } catch {
+            # Unreadable → treated as "no on-disk token".
+        }
+    }
+    return $null
+}
+
+function Test-StaleEnvRetryIsDefinitive {
+    # $true when a stale-env RETRY's status PROVES the fallback credential
+    # was accepted. MUST MATCH the SSOT
+    # `vco_lib/project_config.py::_retry_answer_is_definitive` and every
+    # other mirror.
+    param([int]$Status)
+    if ($Status -ge 200 -and $Status -lt 300) { return $true }
+    return ($Status -eq 404)
+}
+
+function Get-StaleEnvFallbackToken {
+    # Returns the on-disk token to retry with, or $null to leave today's
+    # path alone. Rules, in order (identical in every mirror):
+    #   1. VCT_HUB_TOKEN_STRICT=1        → $null (the pin is authoritative)
+    #   2. VCT_HUB_TOKEN unset/empty     → $null (nothing was pinned)
+    #   3. no readable on-disk token     → $null (nothing better to try)
+    #   4. on-disk == env (trimmed)      → $null (the pin is not stale)
+    param([string]$ProjectId = '')
+    # Trimmed, case-sensitive comparison to the literal 1 — the SSOT's
+    # spelling, so a value written with a trailing newline/CR means the
+    # same thing in bash, PowerShell, Rust and Python.
+    if ($Env:VCT_HUB_TOKEN_STRICT -and
+        $Env:VCT_HUB_TOKEN_STRICT.Trim() -ceq '1') { return $null }
+    if (-not $Env:VCT_HUB_TOKEN) { return $null }
+    $envTok = $Env:VCT_HUB_TOKEN.Trim()
+    if ($envTok.Length -eq 0) { return $null }
+    $diskTok = Get-HubTokenOnDisk -ProjectId $ProjectId
+    if ($null -eq $diskTok -or $diskTok.Length -eq 0) { return $null }
+    if ($diskTok -ceq $envTok) { return $null }
+    return $diskTok
+}
+
 # ── HTTP helper ─────────────────────────────────────────────────────────
 # Returns a hashtable: @{ Status = <int>; Body = <string> } on success,
 # @{ Status = 0; Body = '' } if token is missing, or $null on connection
@@ -399,8 +499,39 @@ function Invoke-Hub {
     if ($null -eq $token) {
         return @{ Status = 0; Body = '' }
     }
-    $url = "http://127.0.0.1:${port}/api/v1/${PathAndQuery}"
-    $headers = @{ Authorization = "Bearer $token" }
+    $result = Invoke-HubWithToken -PathAndQuery $PathAndQuery -Port $port -Token $token
+    # v0.2.91 (WP-D item 4): a PROVABLE credential refusal is the ONLY
+    # trigger for the one-shot on-disk-token retry. Every other status —
+    # and a strict pin, an absent env token, an identical on-disk token,
+    # a retry that is ALSO refused, or a retry that cannot complete —
+    # falls through to the original result, so the exit-code contract in
+    # the header is byte-identical.
+    if ($null -ne $result -and ($result.Status -eq 401 -or $result.Status -eq 403)) {
+        $fallback = Get-StaleEnvFallbackToken -ProjectId $ProjectId
+        if ($null -ne $fallback) {
+            $retry = Invoke-HubWithToken -PathAndQuery $PathAndQuery -Port $port -Token $fallback
+            # ADOPT only an answer that PROVES the fallback credential
+            # was accepted: 2xx, or 404 (the hub answers "no row" only
+            # AFTER its auth middleware accepted the bearer — a post-auth
+            # answer like a 200). Anything else — 5xx included — proves
+            # nothing, so the ORIGINAL refusal stands and no definitive
+            # line is emitted (v0.2.91 wave-3, MINOR-1).
+            if ($null -ne $retry -and
+                (Test-StaleEnvRetryIsDefinitive -Status $retry.Status)) {
+                Write-StaleEnvTokenWarning
+                return $retry
+            }
+        }
+    }
+    return $result
+}
+
+function Invoke-HubWithToken {
+    # ONE request with an explicit bearer. Returns @{Status;Body} or
+    # $null on a connection-level failure (refused / DNS / TLS).
+    param([string]$PathAndQuery, [int]$Port, [string]$Token)
+    $url = "http://127.0.0.1:${Port}/api/v1/${PathAndQuery}"
+    $headers = @{ Authorization = "Bearer $Token" }
     try {
         $resp = Invoke-WebRequest -Uri $url -Method Get -UseBasicParsing `
             -Headers $headers -TimeoutSec 5 `

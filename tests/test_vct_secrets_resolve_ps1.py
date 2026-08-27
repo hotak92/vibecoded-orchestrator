@@ -275,3 +275,135 @@ def test_live_404_key_not_active_still_exit_3(tmp_path, secrets_dir):
     with _fake_hub(404, body) as port:
         cp = _run_resolver_live(tmp_path, "p1", "PAUSED_KEY", secrets_dir, port)
     assert cp.returncode == 3, f"stderr={cp.stderr}"
+
+
+# ─── v0.2.91 WP-D item 4: stale-env hub-token fallback (live hub) ────────
+#
+# The bash sibling's e2e cases live in tests/test_vct_secrets_resolve.sh;
+# these are the PowerShell half, so the retry wiring inside `Invoke-Hub`
+# is exercised at RUNTIME on both shells (the decision function itself is
+# parity-locked in tests/test_stale_env_token_parity_v0291.py).
+
+_STALE_ENV_TOKEN = "stale-env-token-v0291-not-a-real-secret"
+_FRESH_DISK_TOKEN = "fresh-disk-token-v0291-not-a-real-secret"
+_DEFINITIVE_LINE = "stale VCT_HUB_TOKEN in env overridden by on-disk hub.token"
+
+
+@contextlib.contextmanager
+def _fake_auth_hub(expected_token: str, ok_body: str):
+    """401 unless the bearer matches; records every bearer it served.
+
+    Yields ``(port, bearers)`` — ``bearers`` is appended to live, so the
+    caller can assert the exact retry sequence after the run.
+    """
+    bearers: list[str] = []
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a, **k):  # noqa: D401 — silence the fake hub
+            pass
+
+        def do_GET(self):  # noqa: N802 — http.server API
+            auth = self.headers.get("Authorization", "")
+            parts = auth.split(None, 1)
+            bearer = parts[1].strip() if len(parts) == 2 else ""
+            bearers.append(bearer)
+            if bearer != expected_token:
+                payload = (
+                    '{"error": {"code": "unauthorized", "message": "bad token"}}'
+                ).encode()
+                status = 401
+            else:
+                payload = ok_body.encode()
+                status = 200
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _H)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield port, bearers
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def _run_resolver_stale(
+    tmp_path: Path,
+    key: str,
+    secrets_dir: Path,
+    port: int,
+    *,
+    disk_token: bool,
+    strict: bool,
+) -> subprocess.CompletedProcess:
+    """Invoke the ps1 resolver with a STALE env pin against a live hub."""
+    import os
+
+    state = tmp_path / "state-stale"
+    state.mkdir(exist_ok=True)
+    if disk_token:
+        (state / "hub.token").write_text(_FRESH_DISK_TOKEN, encoding="utf-8")
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": str(tmp_path / "home"),
+        "VCT_HUB_PORT": str(port),
+        "VCT_STATE_DIR": str(state),
+        "VCT_HUB_TOKEN": _STALE_ENV_TOKEN,
+        "VCT_SECRETS_DIR": str(secrets_dir),
+    }
+    if strict:
+        env["VCT_HUB_TOKEN_STRICT"] = "1"
+    (tmp_path / "home").mkdir(exist_ok=True)
+    return subprocess.run(
+        [_PWSH, "-NoProfile", "-NonInteractive", "-File", str(RESOLVER), "p1", key],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+
+
+def test_live_stale_env_token_retries_with_the_on_disk_token(tmp_path, secrets_dir):
+    """RED-PROOF: pre-v0.2.91 the ps1 resolver presented the stale env
+    token, got 401, and exited 1 ("hub unreachable")."""
+    ok = '{"STALE_KEY": "synthetic-resolved-through-disk-token"}'
+    with _fake_auth_hub(_FRESH_DISK_TOKEN, ok) as (port, bearers):
+        cp = _run_resolver_stale(
+            tmp_path, "STALE_KEY", secrets_dir, port, disk_token=True, strict=False
+        )
+    assert cp.returncode == 0, f"stderr={cp.stderr}"
+    assert cp.stdout == "synthetic-resolved-through-disk-token"
+    assert bearers == [_STALE_ENV_TOKEN, _FRESH_DISK_TOKEN], bearers
+    assert _DEFINITIVE_LINE in cp.stderr, cp.stderr
+    # Never leak a token value into a diagnostic.
+    assert _FRESH_DISK_TOKEN not in cp.stderr and _STALE_ENV_TOKEN not in cp.stderr
+
+
+def test_live_strict_pin_keeps_the_401_path(tmp_path, secrets_dir):
+    """LEAVE-ALONE: VCT_HUB_TOKEN_STRICT=1 → the pin is authoritative, one
+    request, historical exit 1."""
+    ok = '{"STALE_KEY": "unreachable-under-strict"}'
+    with _fake_auth_hub(_FRESH_DISK_TOKEN, ok) as (port, bearers):
+        cp = _run_resolver_stale(
+            tmp_path, "STALE_KEY", secrets_dir, port, disk_token=True, strict=True
+        )
+    assert cp.returncode == 1, f"stderr={cp.stderr}"
+    assert bearers == [_STALE_ENV_TOKEN], bearers
+    assert _DEFINITIVE_LINE not in cp.stderr
+
+
+def test_live_no_on_disk_token_keeps_the_401_path(tmp_path, secrets_dir):
+    """LEAVE-ALONE: nothing better to try → one request, historical exit 1."""
+    ok = '{"STALE_KEY": "unreachable-without-disk-token"}'
+    with _fake_auth_hub(_FRESH_DISK_TOKEN, ok) as (port, bearers):
+        cp = _run_resolver_stale(
+            tmp_path, "STALE_KEY", secrets_dir, port, disk_token=False, strict=False
+        )
+    assert cp.returncode == 1, f"stderr={cp.stderr}"
+    assert bearers == [_STALE_ENV_TOKEN], bearers
+    assert _DEFINITIVE_LINE not in cp.stderr

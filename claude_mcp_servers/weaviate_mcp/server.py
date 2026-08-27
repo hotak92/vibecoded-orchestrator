@@ -798,6 +798,96 @@ def _emit_gate_skipped_deferral(collection: str) -> None:
         pass
 
 
+# ─── Stale-env hub-token fallback (v0.2.91, WP-D item 4) ───────────────
+#
+# MUST MATCH the SSOT `vco_lib/project_config.py::_stale_env_token_fallback`
+# and the mirrors in `vco_lib/access_resolver.py` (this module's own
+# access-gate helper), `templates/scripts/vct_access_check.{sh,ps1}`,
+# `vct_secrets_resolve.{sh,ps1}`, `vct_project_config.{sh,ps1}`,
+# `claude_mcp_servers/wrappers/_base.py`,
+# `launcher/tools/vct-cli/src/main.rs` and `tools/vct-secrets/vct`.
+# Locked by tests/test_stale_env_token_parity_v0291.py.
+#
+# This module holds its own copy rather than importing the SSOT because
+# `_fetch_writable_collections_for_project` is a never-raises enrichment
+# helper whose whole contract is "no import, no dependency, no crash on
+# the deny branch" — but the RULES are identical and parity-tested.
+
+#: The ONE definitive line. Byte-identical to every mirror.
+STALE_ENV_TOKEN_MESSAGE = (
+    "stale VCT_HUB_TOKEN in env overridden by on-disk hub.token — "
+    "run `unset VCT_HUB_TOKEN` or open a new shell"
+)
+
+#: Latched TRUE once the hub proved this process's env pin dead and the
+#: on-disk token worked. Module-level because this MCP server is
+#: long-lived. Never set when ``VCT_HUB_TOKEN_STRICT=1``.
+_IGNORE_ENV_HUB_TOKEN = False
+_STALE_ENV_WARNED = False
+
+
+def _on_disk_hub_token(state_dir: str) -> Optional[str]:
+    """The on-disk GLOBAL token, IGNORING ``$VCT_HUB_TOKEN``.
+
+    Global, not scoped: see the ASSUMPTION PIN below — ``/access`` is not
+    a per-project-token route.
+    """
+    try:
+        with open(os.path.join(state_dir, "hub.token"), encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+def _stale_env_token_fallback(disk_token: Optional[str]) -> Optional[str]:
+    """The on-disk token to retry with, or ``None`` to leave alone.
+
+    Rules, in order (identical in every mirror): strict pin set → None;
+    no env token → None; no readable on-disk token → None; on-disk equals
+    env → None. Takes the already-read ``disk_token`` so the caller does
+    not pay a second file read.
+    """
+    if os.environ.get("VCT_HUB_TOKEN_STRICT", "").strip() == "1":
+        return None
+    env_tok = (os.environ.get("VCT_HUB_TOKEN") or "").strip()
+    if not env_tok:
+        return None
+    if not disk_token or disk_token == env_tok:
+        return None
+    return disk_token
+
+
+def _retry_answer_is_definitive(status: int) -> bool:
+    """May a stale-env RETRY's answer be adopted (and the pin latched off)?
+
+    Only when it PROVES the fallback credential was accepted: ``2xx``, or
+    ``404`` (the hub answers "no such project" only AFTER its auth
+    middleware accepted the bearer — a post-auth answer like a 200).
+
+    Everything else proves nothing. v0.2.91 wave-3 (MINOR-1): before this,
+    any non-401/403 answer was adopted, so a 5xx after a 401 latched the
+    env pin off for this LONG-LIVED server and logged the definitive line
+    on no evidence at all.
+    """
+    return 200 <= status < 300 or status == 404
+
+
+def _note_stale_env_token_override() -> None:
+    """Latch the env pin off for this process; log the fix ONCE."""
+    global _IGNORE_ENV_HUB_TOKEN, _STALE_ENV_WARNED
+    _IGNORE_ENV_HUB_TOKEN = True
+    if not _STALE_ENV_WARNED:
+        _STALE_ENV_WARNED = True
+        logger.warning("%s", STALE_ENV_TOKEN_MESSAGE)
+
+
+def _test_reset_stale_env_state() -> None:
+    """Reset the process-level latch + warn-once flag (tests only)."""
+    global _IGNORE_ENV_HUB_TOKEN, _STALE_ENV_WARNED
+    _IGNORE_ENV_HUB_TOKEN = False
+    _STALE_ENV_WARNED = False
+
+
 def _fetch_writable_collections_for_project(project_id: str) -> list[str]:
     """v0.2.49 Step F MF7+Q2: return the list of Weaviate collections
     where the project has `access_level == 'write'` per the launcher's
@@ -846,27 +936,60 @@ def _fetch_writable_collections_for_project(project_id: str) -> list[str]:
         # to the scoped token (via vco_lib.project_config._project_token,
         # the same picker the /config path uses); until then, global is
         # correct and the flip does NOT affect this call.
+        disk_token = _on_disk_hub_token(state_dir)
         token = os.environ.get("VCT_HUB_TOKEN")
+        if token and _IGNORE_ENV_HUB_TOKEN:
+            # v0.2.91: this process already proved the env pin dead.
+            token = None
         if not token:
-            try:
-                with open(os.path.join(state_dir, "hub.token"), encoding="utf-8") as fh:
-                    token = fh.read().strip()
-            except OSError:
-                return []  # no token → can't query
+            token = disk_token
+        if not token:
+            return []  # no token → can't query
 
         url = f"http://127.0.0.1:{port}/api/v1/projects/{project_id}/access?level=write"
-        req = urllib.request.Request(url, method="GET")
-        req.add_header("Authorization", f"Bearer {token}")
-        with urllib.request.urlopen(req, timeout=2.0) as resp:
-            if resp.status != 200:
-                return []
-            body = json.loads(resp.read().decode("utf-8"))
-            # Expected shape (per main chat's new endpoint, mirrors
-            # the /access/{collection} pattern): {"collections": [str, ...]}
-            collections = body.get("collections")
-            if isinstance(collections, list):
-                return [c for c in collections if isinstance(c, str)]
+
+        def _fetch(bearer: str) -> tuple[int, object]:
+            req = urllib.request.Request(url, method="GET")
+            req.add_header("Authorization", f"Bearer {bearer}")
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                if resp.status != 200:
+                    return resp.status, None
+                return resp.status, json.loads(resp.read().decode("utf-8"))
+
+        try:
+            status, body = _fetch(token)
+        except urllib.error.HTTPError as exc:
+            status, body = exc.code, None
+
+        # v0.2.91 (WP-D item 4) — STALE-ENV FALLBACK. This server is
+        # LONG-LIVED: a shell that exported a now-rotated VCT_HUB_TOKEN
+        # before spawning the MCP would otherwise poison every probe for
+        # the whole process lifetime, silently reducing this remediation
+        # hint to the generic string. One bounded retry with the on-disk
+        # token on a PROVABLE refusal (401/403), then the env pin is
+        # latched off for this process. MUST MATCH the SSOT
+        # `vco_lib/project_config.py::_stale_env_token_fallback`; the
+        # `return []` degradation and the never-raise contract above are
+        # untouched — a failed retry lands on exactly the old path.
+        if status in (401, 403):
+            fallback = _stale_env_token_fallback(disk_token)
+            if fallback is not None:
+                try:
+                    retry_status, retry_body = _fetch(fallback)
+                except urllib.error.HTTPError as exc:
+                    retry_status, retry_body = exc.code, None
+                if _retry_answer_is_definitive(retry_status):
+                    _note_stale_env_token_override()
+                    status, body = retry_status, retry_body
+
+        if status != 200 or body is None:
             return []
+        # Expected shape (per main chat's new endpoint, mirrors
+        # the /access/{collection} pattern): {"collections": [str, ...]}
+        collections = body.get("collections") if isinstance(body, dict) else None
+        if isinstance(collections, list):
+            return [c for c in collections if isinstance(c, str)]
+        return []
     except Exception:
         # Any failure → empty list → generic remediation. Never raise
         # back to the deny-branch caller.

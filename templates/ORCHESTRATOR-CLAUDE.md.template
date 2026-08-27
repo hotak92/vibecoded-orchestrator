@@ -419,7 +419,7 @@ If you find install.py running with the wrong embedding (e.g. stuck at 40-50% on
   - `GET /api/v1/projects/{id-or-slug}/config` — resolver for KG collection / codegraph prefix / embedding model / access-matrix lists.
   - `GET /api/v1/projects/{id}/env` — secrets resolver.
   - `GET /api/v1/services/status` — services snapshot.
-- **Resolver clients**: `templates/scripts/vct_project_config.sh` (bash), `templates/scripts/vct_project_config.ps1` (PowerShell 7+), `vco_lib/project_config.py` (Python). All three discover hub via `$VCT_HUB_PORT` → `<vct_root_dir>/hub.port` → `7700` default; token via `$VCT_HUB_TOKEN` → `<vct_root_dir>/hub.token`.
+- **Resolver clients**: `templates/scripts/vct_project_config.sh` (bash), `templates/scripts/vct_project_config.ps1` (PowerShell 7+), `vco_lib/project_config.py` (Python). All three discover hub via `$VCT_HUB_PORT` → `<vct_root_dir>/hub.port` → `7700` default; token via `$VCT_HUB_TOKEN` → `<vct_root_dir>/hub.token`. Since v0.2.91, a PROVABLY-stale `$VCT_HUB_TOKEN` (set, and different from the on-disk token) is retried ONCE against `hub.token` after a 401/403, with one stderr line telling you to `unset VCT_HUB_TOKEN`; `VCT_HUB_TOKEN_STRICT=1` disables that fallback for harnesses that pin a bad token on purpose.
 - **Boot auto-start**: cross-OS (systemd-user / launchd / Windows Scheduled Task). Default OFF; user opts in via launcher GUI Preferences.
 
 ### MCP Servers

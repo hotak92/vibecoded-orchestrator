@@ -68,6 +68,16 @@ class _MockHandler(BaseHTTPRequestHandler):
 
     response_map: dict = {}
 
+    #: v0.2.91 (WP-D item 4) — when set, ONLY this bearer is accepted;
+    #: anything else gets a 401, exactly like the real hub's
+    #: `auth.rs::require_auth`. `None` (the default) keeps the historical
+    #: "any Bearer is fine" behaviour, so every pre-existing test in this
+    #: file is untouched.
+    expected_token: Optional[str] = None
+    #: Every bearer the handler saw, in order. Lets a test observe the
+    #: retry sequence (stale pin first, on-disk token second).
+    seen_bearers: list = []
+
     def log_message(self, fmt: str, *args) -> None:  # noqa: N802
         # Silence default stderr noise. Test runs would otherwise spam
         # 200/404 lines into pytest output.
@@ -90,6 +100,18 @@ class _MockHandler(BaseHTTPRequestHandler):
             self.send_response(401)
             self.end_headers()
             self.wfile.write(b'{"error": "no bearer"}')
+            return
+        bearer = auth[len("Bearer "):].strip()
+        self.seen_bearers.append(bearer)
+        if self.expected_token is not None and bearer != self.expected_token:
+            body = json.dumps(
+                {"error": {"code": "unauthorized", "message": "bad token"}}
+            ).encode()
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
 
         entry = self.response_map.get((pid, coll))
@@ -147,7 +169,14 @@ def mock_hub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VCT_HUB_PORT", str(port))
     monkeypatch.setenv("VCT_HUB_TOKEN", "test_token_12345")
 
-    handler_class = type("_PerTestHandler", (_MockHandler,), {"response_map": {}})
+    # Fresh `seen_bearers` per test class too: the base-class list is a
+    # mutable class attribute, so without an override every handler built
+    # here would append into the SAME list for the whole session.
+    handler_class = type(
+        "_PerTestHandler",
+        (_MockHandler,),
+        {"response_map": {}, "seen_bearers": []},
+    )
     server = ThreadingHTTPServer(("127.0.0.1", port), handler_class)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -455,3 +484,297 @@ class TestBashPs1Parity:
         # Both clients emit reason='hub_404_no_row' on 404.
         reasons_404 = [r["reason"] for r in rows if r["reason"] == "hub_404_no_row"]
         assert len(reasons_404) == 2, f"expected 2 hub_404_no_row rows (1 bash + 1 ps1), got {[r['reason'] for r in rows]}"
+
+
+# ─── v0.2.91 (WP-D item 4): stale-env hub-token fallback ─────────────────
+#
+# THE SEAM this closes, and why it matters HERE specifically: this client
+# fails open to "write" on a 401. A shell that exported `VCT_HUB_TOKEN`
+# before an update presents a token the restarted hub refuses, so EVERY
+# access check from that shell used to fail open — the access matrix
+# silently degraded to permissive for the whole life of that shell, while
+# the fresh on-disk `hub.token` sitting next to it would have answered.
+#
+# The fail-open contract itself is DELIBERATE and unchanged (hub-down must
+# never brick KG writes). These tests pin both halves:
+#   * ACT — a provably-stale pin is retried once with the on-disk token,
+#     the REAL level is returned, and NO dropped-write metric row is
+#     emitted (the gate worked; nothing was over-granted).
+#   * LEAVE-ALONE — strict pin / no on-disk token → the identical
+#     fail-open reason, metric row and "write" output as before.
+
+_STALE_ENV_TOKEN = "stale-env-token-v0291-not-a-real-secret"
+_FRESH_DISK_TOKEN = "fresh-disk-token-v0291-not-a-real-secret"
+_DEFINITIVE_LINE = "stale VCT_HUB_TOKEN in env overridden by on-disk hub.token"
+
+
+@pytest.fixture
+def stale_token_hub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Mock hub that accepts ONLY the on-disk token, with a STALE
+    `VCT_HUB_TOKEN` exported — the field shape after a hub restart."""
+    port = _pick_free_port()
+    state_dir = tmp_path / "vct"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "hub.port").write_text(str(port), encoding="utf-8")
+    (state_dir / "hub.token").write_text(_FRESH_DISK_TOKEN, encoding="utf-8")
+
+    monkeypatch.setenv("VCT_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("VCT_HUB_PORT", str(port))
+    monkeypatch.setenv("VCT_HUB_TOKEN", _STALE_ENV_TOKEN)
+    monkeypatch.delenv("VCT_HUB_TOKEN_STRICT", raising=False)
+    # Force every warning through (this client rate-limits per PID).
+    monkeypatch.setenv("VCO_HOOK_DEBUG", "1")
+
+    handler_class = type(
+        "_StaleTokenHandler",
+        (_MockHandler,),
+        {
+            "response_map": {},
+            "expected_token": _FRESH_DISK_TOKEN,
+            "seen_bearers": [],
+        },
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", port), handler_class)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield handler_class, state_dir
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+class TestBashStaleEnvTokenFallback:
+    """templates/scripts/vct_access_check.sh"""
+
+    def test_stale_pin_is_retried_and_the_real_level_is_enforced(self, stale_token_hub):
+        """RED-PROOF: pre-v0.2.91 this returned "write" (fail-open on the
+        401) plus a `hub_auth_401` dropped-write row — i.e. a `none` grant
+        was silently over-granted for every call from a stale shell."""
+        handler_class, state_dir = stale_token_hub
+        handler_class.response_map[("p1", "GatedKG")] = (200, {"level": "none"})
+
+        result = _run_bash_resolver("p1", "GatedKG")
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "none", (
+            "the REAL level must be enforced once the fresh token is used"
+        )
+        assert handler_class.seen_bearers == [_STALE_ENV_TOKEN, _FRESH_DISK_TOKEN]
+        assert _DEFINITIVE_LINE in result.stderr, result.stderr
+        # The gate WORKED — this is not a degraded state.
+        assert _read_metric_rows(state_dir) == [], (
+            "a successful retry must NOT emit a dropped-write metric row"
+        )
+        # Never leak a token value into a diagnostic.
+        assert _FRESH_DISK_TOKEN not in result.stderr
+        assert _STALE_ENV_TOKEN not in result.stderr
+
+    def test_strict_pin_keeps_the_fail_open_contract(self, stale_token_hub):
+        """LEAVE-ALONE: with the guard set the pin stays authoritative and
+        the fail-open path is byte-identical (write + hub_auth_401)."""
+        handler_class, state_dir = stale_token_hub
+        handler_class.response_map[("p1", "GatedKG")] = (200, {"level": "none"})
+
+        result = _run_bash_resolver(
+            "p1", "GatedKG", env_extra={"VCT_HUB_TOKEN_STRICT": "1"}
+        )
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == "write", "fail-open must still fire"
+        assert handler_class.seen_bearers == [_STALE_ENV_TOKEN]
+        assert _DEFINITIVE_LINE not in result.stderr
+        rows = _read_metric_rows(state_dir)
+        assert [r["reason"] for r in rows] == ["hub_auth_401"], rows
+
+    def test_no_on_disk_token_keeps_the_fail_open_contract(self, stale_token_hub):
+        """LEAVE-ALONE: nothing better to try → identical fail-open."""
+        handler_class, state_dir = stale_token_hub
+        (state_dir / "hub.token").unlink()
+        handler_class.response_map[("p1", "GatedKG")] = (200, {"level": "none"})
+
+        result = _run_bash_resolver("p1", "GatedKG")
+
+        assert result.stdout.strip() == "write"
+        assert handler_class.seen_bearers == [_STALE_ENV_TOKEN]
+        assert _DEFINITIVE_LINE not in result.stderr
+        rows = _read_metric_rows(state_dir)
+        assert [r["reason"] for r in rows] == ["hub_auth_401"], rows
+
+
+@pytest.mark.skipif(not HAS_PWSH, reason="pwsh not on PATH")
+class TestPs1StaleEnvTokenFallback:
+    """templates/scripts/vct_access_check.ps1 — the same three cases."""
+
+    def test_stale_pin_is_retried_and_the_real_level_is_enforced(self, stale_token_hub):
+        handler_class, state_dir = stale_token_hub
+        handler_class.response_map[("p1", "GatedKG")] = (200, {"level": "none"})
+
+        result = _run_ps1_resolver("p1", "GatedKG")
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "none"
+        assert handler_class.seen_bearers == [_STALE_ENV_TOKEN, _FRESH_DISK_TOKEN]
+        assert _DEFINITIVE_LINE in result.stderr, result.stderr
+        assert _read_metric_rows(state_dir) == []
+        assert _FRESH_DISK_TOKEN not in result.stderr
+        assert _STALE_ENV_TOKEN not in result.stderr
+
+    def test_strict_pin_keeps_the_fail_open_contract(self, stale_token_hub):
+        handler_class, state_dir = stale_token_hub
+        handler_class.response_map[("p1", "GatedKG")] = (200, {"level": "none"})
+
+        result = _run_ps1_resolver(
+            "p1", "GatedKG", env_extra={"VCT_HUB_TOKEN_STRICT": "1"}
+        )
+
+        assert result.stdout.strip() == "write"
+        assert handler_class.seen_bearers == [_STALE_ENV_TOKEN]
+        assert _DEFINITIVE_LINE not in result.stderr
+        rows = _read_metric_rows(state_dir)
+        assert [r["reason"] for r in rows] == ["hub_auth_401"], rows
+
+    def test_no_on_disk_token_keeps_the_fail_open_contract(self, stale_token_hub):
+        handler_class, state_dir = stale_token_hub
+        (state_dir / "hub.token").unlink()
+        handler_class.response_map[("p1", "GatedKG")] = (200, {"level": "none"})
+
+        result = _run_ps1_resolver("p1", "GatedKG")
+
+        assert result.stdout.strip() == "write"
+        assert handler_class.seen_bearers == [_STALE_ENV_TOKEN]
+        assert _DEFINITIVE_LINE not in result.stderr
+        rows = _read_metric_rows(state_dir)
+        assert [r["reason"] for r in rows] == ["hub_auth_401"], rows
+
+
+class TestStaleEnvRetryAdoptsOnlyDefinitiveAnswers:
+    """v0.2.91 wave-3 (MINOR-1): the retry's answer is adopted ONLY when it
+    proves the fallback credential was accepted (2xx / 404).
+
+    RED-PROOF for both clients: pre-fix ANY non-401/403 retry answer was
+    adopted, so a hub that refused the stale pin and then hiccuped a 503
+    latched onto the 503 — reporting `hub_5xx_503` instead of the truthful
+    `hub_auth_401`, and printing "stale VCT_HUB_TOKEN…" on no evidence that
+    the token was stale at all.
+    """
+
+    def test_bash_keeps_the_original_401_when_the_retry_5xxs(self, stale_token_hub):
+        handler_class, state_dir = stale_token_hub
+        handler_class.response_map[("p1", "GatedKG")] = (503, {"error": "down"})
+
+        result = _run_bash_resolver("p1", "GatedKG")
+
+        assert result.stdout.strip() == "write"  # fail-open, unchanged
+        assert handler_class.seen_bearers == [_STALE_ENV_TOKEN, _FRESH_DISK_TOKEN]
+        assert _DEFINITIVE_LINE not in result.stderr, result.stderr
+        rows = _read_metric_rows(state_dir)
+        assert [r["reason"] for r in rows] == ["hub_auth_401"], rows
+
+    def test_bash_adopts_a_404_because_it_is_a_post_auth_answer(self, stale_token_hub):
+        """LEAVE-ALONE half: 404 IS proof the bearer was accepted (the hub
+        authenticates before it routes), so it is adopted — and the reason
+        becomes the accurate `hub_404_no_row`."""
+        handler_class, state_dir = stale_token_hub
+        # No response_map entry → the handler's default 404 for the fresh token.
+
+        result = _run_bash_resolver("p1", "GatedKG")
+
+        assert result.stdout.strip() == "write"
+        assert _DEFINITIVE_LINE in result.stderr, result.stderr
+        rows = _read_metric_rows(state_dir)
+        assert [r["reason"] for r in rows] == ["hub_404_no_row"], rows
+
+    @pytest.mark.skipif(not HAS_PWSH, reason="pwsh not on PATH")
+    def test_ps1_keeps_the_original_401_when_the_retry_5xxs(self, stale_token_hub):
+        handler_class, state_dir = stale_token_hub
+        handler_class.response_map[("p1", "GatedKG")] = (503, {"error": "down"})
+
+        result = _run_ps1_resolver("p1", "GatedKG")
+
+        assert result.stdout.strip() == "write"
+        assert handler_class.seen_bearers == [_STALE_ENV_TOKEN, _FRESH_DISK_TOKEN]
+        assert _DEFINITIVE_LINE not in result.stderr, result.stderr
+        rows = _read_metric_rows(state_dir)
+        assert [r["reason"] for r in rows] == ["hub_auth_401"], rows
+
+    @pytest.mark.skipif(not HAS_PWSH, reason="pwsh not on PATH")
+    def test_ps1_adopts_a_404_because_it_is_a_post_auth_answer(self, stale_token_hub):
+        handler_class, state_dir = stale_token_hub
+
+        result = _run_ps1_resolver("p1", "GatedKG")
+
+        assert result.stdout.strip() == "write"
+        assert _DEFINITIVE_LINE in result.stderr, result.stderr
+        rows = _read_metric_rows(state_dir)
+        assert [r["reason"] for r in rows] == ["hub_404_no_row"], rows
+
+
+@pytest.mark.skipif(not HAS_PWSH, reason="pwsh not on PATH")
+def test_ps1_retry_transport_failure_does_not_exit_url_error(tmp_path: Path):
+    """v0.2.91 wave-3 (MINOR-2): the ps1 RETRY must not fail open with
+    `url_error_*` when its connection fails — bash's `do_request` merely
+    returns non-zero, leaving the ORIGINAL `hub_auth_401`. Two clients
+    emitting different reasons for one event breaks cross-client
+    aggregation of `dropped_writes.jsonl`.
+
+    Driven at the function level (the retry's transport cannot be failed
+    independently of the first attempt over one URL): `-NoFailOpen` must
+    RETURN `Status = 0` instead of printing "write" and exiting.
+    """
+    import os
+
+    src = PS1_RESOLVER.read_text(encoding="utf-8")
+    marker = "# ── Main"
+    lib = tmp_path / "lib.ps1"
+    # Strip the param() header + the Main tail so the file can be dot-sourced.
+    cb = src.find("[CmdletBinding")
+    if cb != -1:
+        after = src.find("\n)\n", cb)
+        if after != -1:
+            src = src[:cb] + src[after + len("\n)\n"):]
+    idx = src.find(marker)
+    lib.write_text("﻿" + (src[:idx] if idx != -1 else src), encoding="utf-8")
+
+    dead_port = _pick_free_port()  # bound then released → nothing listening
+    snippet = (
+        f". '{lib}'; "
+        f"$r = Invoke-AccessRequest -Token 't' "
+        f"-Url 'http://127.0.0.1:{dead_port}/api/v1/projects/p1/access/K' "
+        f"-NoFailOpen; "
+        "[Console]::Out.Write('STATUS:' + $r.Status)"
+    )
+    env = os.environ.copy()
+    env["VCT_STATE_DIR"] = str(tmp_path / "vct")
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", snippet],
+        capture_output=True, text=True, env=env, timeout=60,
+    )
+    assert result.stdout.strip() == "STATUS:0", (
+        "a transport failure on the RETRY must be reported to the caller as "
+        f"Status 0, not fail open and exit: {result.stdout!r} {result.stderr!r}"
+    )
+    assert "write" not in result.stdout
+
+    # …and the retry call site must actually pass the switch.
+    assert "-Url $url -NoFailOpen" in PS1_RESOLVER.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(not HAS_PWSH, reason="parity test needs both bash and pwsh")
+def test_bash_ps1_agree_on_the_stale_token_fallback(stale_token_hub):
+    """Both clients must resolve the SAME level through the retry and emit
+    the SAME definitive line — the access-check pair of the resolver
+    quadruplet's parity lock."""
+    handler_class, state_dir = stale_token_hub
+    handler_class.response_map[("p1", "GatedKG")] = (200, {"level": "read"})
+
+    sh_result = _run_bash_resolver("p1", "GatedKG")
+    ps_result = _run_ps1_resolver("p1", "GatedKG")
+
+    assert sh_result.stdout.strip() == ps_result.stdout.strip() == "read"
+    assert _DEFINITIVE_LINE in sh_result.stderr
+    assert _DEFINITIVE_LINE in ps_result.stderr
+    assert handler_class.seen_bearers == [
+        _STALE_ENV_TOKEN, _FRESH_DISK_TOKEN, _STALE_ENV_TOKEN, _FRESH_DISK_TOKEN,
+    ]
+    assert _read_metric_rows(state_dir) == []

@@ -38,7 +38,10 @@ Every sanctioned resolver walks the SAME chain, in this order:
    per-`(secret × requester)` active-flag matrix (a paused or ungranted
    key answers `key_not_active` — respect it, don't route around).
    Hub discovery: `$VCT_HUB_PORT` / `$VCT_HUB_TOKEN` env →
-   `<vct_root>/hub.port` + `hub.token` → defaults. Canonical for
+   `<vct_root>/hub.port` + `hub.token` → defaults (a PROVABLY-stale
+   `$VCT_HUB_TOKEN` is retried once against the on-disk token — see
+   [Per-project resolver tokens](#per-project-resolver-tokens-tier-1-v0276)).
+   Canonical for
    launcher-managed slots (`github_pat`, `openai_api_key`, module
    secrets, and every GUI-saved user secret).
 2. **File store (tier 2)** — when the hub is unreachable, the project
@@ -97,6 +100,39 @@ The bundled resolvers already prefer the scoped token: each reads
 is absent (a project added while the hub is running, or a pre-v0.2.76
 hub). `VCT_HUB_TOKEN` (env) still overrides both, so a test/dev harness
 that pins it keeps a single token across every route.
+
+**Stale env pin (v0.2.91)** — the hub rotates `hub.token` on every start,
+so a shell that exported `VCT_HUB_TOKEN` before an update presents a
+token the hub refuses, and the env pin wins over the (fresh) file. Since
+v0.2.91 every hub client — `vct_secrets_resolve.{sh,ps1}`,
+`vct_project_config.{sh,ps1}`, `vct_access_check.{sh,ps1}` +
+`vco_lib/access_resolver.py` (the access-matrix gate trio, whose
+fail-open-to-`write` contract is untouched — it is just reached less
+often), `vco_lib/project_config.py`, the wrapper
+MCPs (`claude_mcp_servers/wrappers/_base.py`), the weaviate MCP's
+writable-collections probe, `vco verify-diagrams`, the codegraph-resync
+spawn registration, `vco` (`launcher/tools/vct-cli`) and `vct`
+(`tools/vct-secrets`) — reacts to a
+**provable** refusal (401/403) by retrying **once** with the on-disk
+token when the two provably differ, preserving each call site's
+scoped-vs-global choice, and printing exactly one stderr line:
+
+```
+stale VCT_HUB_TOKEN in env overridden by on-disk hub.token — run `unset VCT_HUB_TOKEN` or open a new shell
+```
+
+This is bounded correct-resolution, not auto-heal: one extra request per
+invocation, nothing restarts or loops, and the retry's answer is adopted
+ONLY when it proves the on-disk token was accepted (a `2xx`, or a `404` —
+which the hub answers only after its auth middleware accepted the bearer).
+Any other outcome — another refusal, a `5xx`, a transport failure — leaves
+the original error path, and every exit code in the contracts below,
+byte-identical. `VCT_HUB_TOKEN_STRICT=1` disables the fallback so
+a harness that pins a deliberately-wrong token still observes the
+refusal. The decision function is
+`vco_lib/project_config.py::_stale_env_token_fallback` (SSOT); the other
+thirteen surfaces are mirrors, locked by
+`tests/test_stale_env_token_parity_v0291.py`.
 
 As of **v0.2.77 the global `hub.token` is REFUSED by default** on these two
 routes (`/env` + `/config`) — the one-release compatibility window that

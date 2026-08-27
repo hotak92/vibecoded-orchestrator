@@ -2088,6 +2088,52 @@ def _record_unconverged_deferral(
         logger.warning("resync driver: could not record deferral: %s", exc)
 
 
+# ─── Stale-env hub-token fallback (v0.2.91, WP-D item 4) ───────────────
+#
+# MUST MATCH the SSOT `vco_lib/project_config.py::_stale_env_token_fallback`
+# and the mirrors in `vco_lib/access_resolver.py`,
+# `vco_lib/cli/verify_diagrams.py`,
+# `claude_mcp_servers/weaviate_mcp/server.py`,
+# `claude_mcp_servers/wrappers/_base.py`,
+# `templates/scripts/vct_access_check.{sh,ps1}`,
+# `vct_secrets_resolve.{sh,ps1}`, `vct_project_config.{sh,ps1}`,
+# `launcher/tools/vct-cli/src/main.rs` and `tools/vct-secrets/vct`.
+# Locked by tests/test_stale_env_token_parity_v0291.py.
+#
+# NO LATCH here (deliberate, verified): `_register_spawn_with_hub` has a
+# single call site and fires ONCE per resync spawn inside a short-lived
+# install process — unlike the MCP surfaces, there is no second call to
+# protect from re-presenting the dead pin.
+
+#: The ONE definitive line. Byte-identical to every mirror.
+STALE_ENV_TOKEN_MESSAGE = (
+    "stale VCT_HUB_TOKEN in env overridden by on-disk hub.token — "
+    "run `unset VCT_HUB_TOKEN` or open a new shell"
+)
+
+
+def _stale_env_token_fallback(root: Path) -> Optional[str]:
+    """The on-disk token to retry with, or ``None`` to leave alone.
+
+    Rules, in order (identical in every mirror): strict pin set → None;
+    no env token → None; no readable on-disk token → None; on-disk equals
+    env → None. ``root`` is the already-resolved ``vct_root_dir()`` so
+    this helper does no path work of its own.
+    """
+    if os.environ.get("VCT_HUB_TOKEN_STRICT", "").strip() == "1":
+        return None
+    env_tok = (os.environ.get("VCT_HUB_TOKEN") or "").strip()
+    if not env_tok:
+        return None
+    try:
+        disk_tok = (root / "hub.token").read_text(encoding="utf-8").strip()
+    except Exception:  # noqa: BLE001 — best-effort, never a gate
+        return None
+    if not disk_tok or disk_tok == env_tok:
+        return None
+    return disk_tok
+
+
 def _register_spawn_with_hub(
     project_name: str, pid: int, repo_root: "Path | str | None" = None
 ) -> None:
@@ -2117,6 +2163,7 @@ def _register_spawn_with_hub(
     """
     try:
         import json as _json
+        import urllib.error
         import urllib.parse
         import urllib.request
 
@@ -2142,17 +2189,49 @@ def _register_spawn_with_hub(
         if repo_root:
             _payload["repo_root"] = str(repo_root)
         body = _json.dumps(_payload).encode("utf-8")
-        req = urllib.request.Request(
+        url = (
             f"http://127.0.0.1:{port}/api/v1/projects/"
-            f"{urllib.parse.quote(project_name, safe='')}/codegraph-builds",
-            data=body,
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
+            f"{urllib.parse.quote(project_name, safe='')}/codegraph-builds"
         )
-        resp = urllib.request.urlopen(req, timeout=3.0)
+
+        def _post(bearer: str):
+            req = urllib.request.Request(
+                url,
+                data=body,
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {bearer}",
+                    "Content-Type": "application/json",
+                },
+            )
+            return urllib.request.urlopen(req, timeout=3.0)
+
+        try:
+            resp = _post(token)
+        except urllib.error.HTTPError as http_exc:
+            # v0.2.91 (WP-D item 4) — STALE-ENV FALLBACK. `$VCT_HUB_TOKEN`
+            # wins above and the hub rotates `hub.token` on every start,
+            # so an install run launched from a pre-update shell presented
+            # a dead credential: the build row never registered, and the
+            # GUI showed no running walk. On a PROVABLE refusal (401/403)
+            # with a provably-stale pin, retry ONCE with the on-disk
+            # token. NO latch here — unlike the MCP surfaces this helper
+            # runs once per spawn in a short-lived install process.
+            # MUST MATCH the SSOT
+            # `vco_lib/project_config.py::_stale_env_token_fallback`.
+            # A failed retry re-raises the ORIGINAL error into the same
+            # soft no-op debug line below — registration is observability,
+            # never a gate on the spawn.
+            if http_exc.code not in (401, 403):
+                raise
+            fallback = _stale_env_token_fallback(root)
+            if fallback is None:
+                raise
+            try:
+                resp = _post(fallback)
+            except Exception:
+                raise http_exc from None
+            logger.warning("%s", STALE_ENV_TOKEN_MESSAGE)
         logger.info(
             "codegraph resync: registered spawn with hub (HTTP %s)",
             getattr(resp, "status", "?"),

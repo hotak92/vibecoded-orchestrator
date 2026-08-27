@@ -77,7 +77,7 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -546,10 +546,50 @@ def _vct_hub_base_url() -> str:
 def _vct_hub_token() -> Optional[str]:
     """Resolve the hub bearer token. Order: ``$VCT_HUB_TOKEN`` →
     ``<vct_root>/hub.token``. Returns ``None`` if unavailable; callers
-    SKIP the check (cannot probe without auth)."""
+    SKIP the check (cannot probe without auth).
+
+    The env pin wins on every FIRST attempt — unless
+    :data:`_IGNORE_ENV_HUB_TOKEN` has latched, which happens only after
+    the hub PROVABLY refused it and the on-disk token worked."""
     token = os.environ.get("VCT_HUB_TOKEN")
-    if token:
+    if token and not _IGNORE_ENV_HUB_TOKEN:
         return token.strip()
+    return _on_disk_hub_token()
+
+
+# ─── Stale-env hub-token fallback (v0.2.91, WP-D item 4) ───────────────
+#
+# MUST MATCH the SSOT `vco_lib/project_config.py::_stale_env_token_fallback`
+# and the mirrors in `vco_lib/access_resolver.py`,
+# `claude_mcp_servers/weaviate_mcp/server.py`,
+# `templates/scripts/vct_access_check.{sh,ps1}`,
+# `vct_secrets_resolve.{sh,ps1}`, `vct_project_config.{sh,ps1}`,
+# `claude_mcp_servers/wrappers/_base.py`,
+# `launcher/tools/vct-cli/src/main.rs` and `tools/vct-secrets/vct`.
+# Locked by tests/test_stale_env_token_parity_v0291.py.
+#
+# WHY here: a stale exported token does NOT make this check fail loudly
+# — the hub 401s, `HTTPError` (a `URLError` subclass) lands in the
+# "hub not reachable" arm, and the check reports STATUS_SKIP blaming the
+# hub. A *verify* command that silently stops verifying, and points at
+# the wrong cause, is precisely the honesty class this release closes.
+# The SKIP SEMANTICS ARE UNCHANGED: an un-rescued refusal re-raises the
+# ORIGINAL exception, so the same STATUS_SKIP with the same message text
+# is produced. The latch matters because `--all` verifies many projects
+# in ONE process.
+
+#: The ONE definitive line. Byte-identical to every mirror.
+STALE_ENV_TOKEN_MESSAGE = (
+    "stale VCT_HUB_TOKEN in env overridden by on-disk hub.token — "
+    "run `unset VCT_HUB_TOKEN` or open a new shell"
+)
+
+_IGNORE_ENV_HUB_TOKEN = False
+_STALE_ENV_WARNED = False
+
+
+def _on_disk_hub_token() -> Optional[str]:
+    """The on-disk token, IGNORING ``$VCT_HUB_TOKEN``."""
     try:
         from vco_lib.paths import vct_root_dir
         token_path = vct_root_dir() / "hub.token"
@@ -558,6 +598,44 @@ def _vct_hub_token() -> Optional[str]:
     except Exception:
         return None
     return None
+
+
+def _stale_env_token_fallback() -> Optional[str]:
+    """The on-disk token to retry with, or ``None`` to leave alone.
+
+    Rules, in order (identical in every mirror): strict pin set → None;
+    no env token → None; no readable on-disk token → None; on-disk equals
+    env → None.
+    """
+    if os.environ.get("VCT_HUB_TOKEN_STRICT", "").strip() == "1":
+        return None
+    env_tok = (os.environ.get("VCT_HUB_TOKEN") or "").strip()
+    if not env_tok:
+        return None
+    disk_tok = _on_disk_hub_token()
+    if not disk_tok or disk_tok == env_tok:
+        return None
+    return disk_tok
+
+
+def _note_stale_env_token_override() -> None:
+    """Latch the env pin off for this process; emit the fix ONCE.
+
+    Goes to stderr, never stdout — ``--json`` callers parse stdout and
+    the machine contract must stay clean (v0.2.84 lesson).
+    """
+    global _IGNORE_ENV_HUB_TOKEN, _STALE_ENV_WARNED
+    _IGNORE_ENV_HUB_TOKEN = True
+    if not _STALE_ENV_WARNED:
+        _STALE_ENV_WARNED = True
+        print(f"[vco verify-diagrams] {STALE_ENV_TOKEN_MESSAGE}", file=sys.stderr)
+
+
+def _test_reset_stale_env_state() -> None:
+    """Reset the process-level latch + warn-once flag (tests only)."""
+    global _IGNORE_ENV_HUB_TOKEN, _STALE_ENV_WARNED
+    _IGNORE_ENV_HUB_TOKEN = False
+    _STALE_ENV_WARNED = False
 
 
 def _http_get_json(url: str, token: Optional[str], *, timeout: float = 5.0) -> Any:
@@ -570,6 +648,32 @@ def _http_get_json(url: str, token: Optional[str], *, timeout: float = 5.0) -> A
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — stdlib http call
         body = resp.read()
     return json.loads(body.decode("utf-8"))
+
+
+def _http_get_json_with_stale_token_retry(url: str, token: Optional[str]):
+    """:func:`_http_get_json` with ONE bounded stale-env-token retry.
+
+    On a PROVABLE refusal (401/403) with a provably-stale env pin, retry
+    once with the on-disk token. If that retry fails for ANY reason, the
+    ORIGINAL exception is re-raised — so every caller's error/skip path,
+    including its message text, is byte-identical to pre-v0.2.91.
+    """
+    try:
+        return _http_get_json(url, token)
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (401, 403):
+            raise
+        fallback = _stale_env_token_fallback()
+        if fallback is None:
+            raise
+        try:
+            payload = _http_get_json(url, fallback)
+        except Exception:
+            # Keep today's diagnostic verbatim — the retry never gets to
+            # rewrite the reason the user sees.
+            raise exc from None
+        _note_stale_env_token_override()
+        return payload
 
 
 def _check_hub_allowlist(project_id: str) -> _CheckResult:
@@ -585,7 +689,12 @@ def _check_hub_allowlist(project_id: str) -> _CheckResult:
     for mcp_name in ("mermaid", "excalidraw"):
         url = f"{base}/api/v1/projects/{project_id}/mcp-tool-grants/{mcp_name}"
         try:
-            payload = _http_get_json(url, token)
+            # Re-resolve per iteration: once the stale-env latch flips,
+            # the remaining probes present the on-disk token directly
+            # instead of paying another refused round-trip.
+            payload = _http_get_json_with_stale_token_retry(
+                url, _vct_hub_token() or token
+            )
         except urllib.error.URLError as exc:
             return _CheckResult(
                 "hub_allowlist",

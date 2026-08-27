@@ -597,6 +597,78 @@ case "$stderr_out" in
 esac
 assert_eq "$leak" "no" "test_chain_never_prints_values/no_value_in_stderr"
 
+# ── Test 17 (v0.2.91 WP-D item 4): stale $VCT_HUB_TOKEN → one-shot retry
+# with the on-disk hub.token, one definitive stderr line, exit 0.
+#
+# RED-PROOF: before the fix the resolver presented the stale env token,
+# got 401, mapped it to "hub unreachable" and exited 1 — the misleading
+# diagnostic a pre-update shell produced after every launcher restart.
+#
+# Runs LAST so the hub.token file + _require_token sentinel it installs
+# cannot perturb the earlier tests.
+stale_state="$scratch/state-stale"
+mkdir -p "$stale_state"
+FRESH_DISK_TOKEN="fresh-disk-token-v0291-not-a-real-secret"
+STALE_ENV_TOKEN="stale-env-token-v0291-not-a-real-secret"
+printf '%s' "$FRESH_DISK_TOKEN" > "$stale_state/hub.token"
+printf '%s' "$FRESH_DISK_TOKEN" > "$scratch/responses/_require_token"
+cat >"$scratch/responses/GET_projects_p1_env_key=STALE_TOKEN_KEY.json" <<'JSON'
+{"STALE_TOKEN_KEY": "synthetic-resolved-through-disk-token"}
+JSON
+
+set +e
+out=$(VCT_STATE_DIR="$stale_state" VCT_HUB_TOKEN="$STALE_ENV_TOKEN" \
+      VCT_HUB_PORT="$HUB_PORT" "$RESOLVER" p1 STALE_TOKEN_KEY \
+      2>"$scratch/stale.err")
+rc=$?
+set -e
+assert_eq "$rc" "0" "test_stale_env_token_falls_back_to_on_disk/exit_code"
+assert_eq "$out" "synthetic-resolved-through-disk-token" \
+    "test_stale_env_token_falls_back_to_on_disk/value"
+stale_err=$(cat "$scratch/stale.err")
+case "$stale_err" in
+    *"stale VCT_HUB_TOKEN in env overridden by on-disk hub.token"*)
+        assert_eq "yes" "yes" "test_stale_env_token_emits_definitive_line" ;;
+    *)
+        assert_eq "$stale_err" "contains the definitive stale-token line" \
+            "test_stale_env_token_emits_definitive_line" ;;
+esac
+# The values themselves must NEVER reach a diagnostic.
+leak="no"
+case "$stale_err" in
+    *"$FRESH_DISK_TOKEN"*|*"$STALE_ENV_TOKEN"*) leak="yes" ;;
+esac
+assert_eq "$leak" "no" "test_stale_env_token_never_prints_a_token_value"
+
+# ── Test 18 (v0.2.91): VCT_HUB_TOKEN_STRICT=1 pins the bad token ───────
+# LEAVE-ALONE half: a harness that deliberately pins a wrong token and
+# asserts the 401 path must keep observing it (hermeticity guard).
+set +e
+VCT_STATE_DIR="$stale_state" VCT_HUB_TOKEN="$STALE_ENV_TOKEN" \
+    VCT_HUB_TOKEN_STRICT=1 VCT_HUB_PORT="$HUB_PORT" \
+    "$RESOLVER" p1 STALE_TOKEN_KEY >/dev/null 2>"$scratch/strict.err"
+rc=$?
+set -e
+assert_eq "$rc" "1" "test_strict_pin_preserves_the_401_path"
+strict_err=$(cat "$scratch/strict.err")
+override="no"
+case "$strict_err" in
+    *"stale VCT_HUB_TOKEN in env overridden"*) override="yes" ;;
+esac
+assert_eq "$override" "no" "test_strict_pin_emits_no_override_line"
+
+# ── Test 19 (v0.2.91): no on-disk token → nothing to fall back to ──────
+# LEAVE-ALONE half: the 401 path is byte-identical when the fallback is
+# impossible.
+rm -f "$stale_state/hub.token"
+set +e
+VCT_STATE_DIR="$stale_state" VCT_HUB_TOKEN="$STALE_ENV_TOKEN" \
+    VCT_HUB_PORT="$HUB_PORT" "$RESOLVER" p1 STALE_TOKEN_KEY >/dev/null 2>&1
+rc=$?
+set -e
+assert_eq "$rc" "1" "test_no_on_disk_token_keeps_the_401_path"
+rm -f "$scratch/responses/_require_token"
+
 # ── Summary ─────────────────────────────────────────────────────────────
 printf '\n%s\n' "── Summary: $PASS passed, $FAIL failed"
 exit $((FAIL > 0 ? 1 : 0))

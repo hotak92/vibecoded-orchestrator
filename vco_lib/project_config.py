@@ -51,6 +51,20 @@ Discovery chain (mirrors the bash / ps1 clients)
 * port:  ``$VCT_HUB_PORT`` → ``<vct_root_dir>/hub.port`` → ``7700``
 * token: ``$VCT_HUB_TOKEN`` → ``<vct_root_dir>/hub.token`` → fail
 
+Stale-env-token fallback (v0.2.91)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The env pin above wins on the FIRST attempt, always. But the hub
+regenerates ``hub.token`` on every start, so a shell that exported
+``VCT_HUB_TOKEN`` before an update holds a value the hub will refuse.
+On a PROVABLE refusal (401/403) — and only then — the resolver retries
+ONCE with the on-disk token when the env value provably differs from it,
+prints one stderr line naming the fix, and otherwise leaves today's
+error path untouched. ``VCT_HUB_TOKEN_STRICT=1`` disables that fallback
+entirely (tests/harnesses that pin a bad token expecting the 401 path).
+See :func:`_stale_env_token_fallback` — the ONE decision function, whose
+sh/ps1/Rust mirrors must match it.
+
 Both are cached in-process for 5 s after the first read so a hot-path
 caller doing many resolves in one process pays the disk-read once. The
 cache TTL was chosen short enough that a launcher restart (which rotates
@@ -535,6 +549,13 @@ def _discover_hub() -> tuple[int, str]:
       3. Port falls back to :data:`DEFAULT_HUB_PORT`. The token has no
          default — missing file raises :class:`HubUnreachable`.
 
+    The ``$VCT_HUB_TOKEN`` pin wins here unconditionally — that is the
+    contract tests and dev harnesses rely on. It is only ever set aside
+    AFTER the hub PROVABLY refuses it (401/403), by the bounded one-shot
+    retry in :func:`_get_with_401_retry`; set ``VCT_HUB_TOKEN_STRICT=1``
+    (:data:`HUB_TOKEN_STRICT_ENV`) to disable even that, so a harness
+    pinning a deliberately-wrong token still observes the refusal.
+
     Results are cached in-process for :data:`HUB_DISCOVERY_TTL_SECONDS`.
     """
     global _discovery_cache
@@ -643,13 +664,15 @@ def _test_clear_cache() -> None:
     expected. Resetting the discovery cache and the warning set in the
     same helper keeps test setup symmetric.
     """
-    global _discovery_cache
+    global _discovery_cache, _stale_env_warned
     with _discovery_lock:
         _discovery_cache = None
     with _schema_warned_lock:
         _schema_warned_versions.clear()
     with _discovery_warned_lock:
         _discovery_warned_kinds.clear()
+    with _stale_env_warned_lock:
+        _stale_env_warned = False
 
 
 def _invalidate_discovery_cache() -> None:
@@ -672,6 +695,181 @@ def _invalidate_discovery_cache() -> None:
     global _discovery_cache
     with _discovery_lock:
         _discovery_cache = None
+
+
+# ─── Stale-env hub-token fallback (v0.2.91, WP-D item 4) ───────────────
+#
+# THE decision function lives here (Python SSOT). The three mirrors —
+# `templates/scripts/vct_secrets_resolve.sh` / `.ps1`,
+# `templates/scripts/vct_project_config.sh` / `.ps1`,
+# `claude_mcp_servers/wrappers/_base.py`,
+# `launcher/tools/vct-cli/src/main.rs`, `tools/vct-secrets/vct` — MUST
+# MATCH the four rules below verbatim (A>B>C: a per-call subprocess into
+# Python is not reachable from a bash `curl` retry path, so these stay
+# thin mirrors locked by the F-8 parity tests).
+
+#: Env var that DISABLES the stale-env-token fallback. A test/harness
+#: that pins a deliberately-wrong ``VCT_HUB_TOKEN`` and asserts the 401
+#: path sets this to ``1`` so the fallback never de-hermeticizes it.
+#: Documented next to the env pin in :func:`_discover_hub` (and in
+#: `launcher/tools/vct-cli/src/main.rs::resolve_token`).
+HUB_TOKEN_STRICT_ENV: str = "VCT_HUB_TOKEN_STRICT"
+
+#: The ONE definitive line printed (once per process) after a stale env
+#: token has been overridden by the on-disk token. Byte-identical in
+#: every mirror — the parity test asserts this exact sentence appears in
+#: each of them.
+STALE_ENV_TOKEN_MESSAGE: str = (
+    "stale VCT_HUB_TOKEN in env overridden by on-disk hub.token — "
+    "run `unset VCT_HUB_TOKEN` or open a new shell"
+)
+
+_stale_env_warned_lock = threading.Lock()
+_stale_env_warned = False
+
+
+def _hub_token_strict() -> bool:
+    """True when the hermeticity guard ``VCT_HUB_TOKEN_STRICT=1`` is set.
+
+    MUST MATCH the mirrors: the value is compared to the literal ``1``
+    (no truthy-string parsing) so the guard is unambiguous in bash,
+    PowerShell, and Rust alike.
+    """
+    return os.environ.get(HUB_TOKEN_STRICT_ENV, "").strip() == "1"
+
+
+def _on_disk_hub_token(project_id: str | None = None) -> str:
+    """Read the on-disk bearer token, IGNORING ``$VCT_HUB_TOKEN``.
+
+    Preserves each call-site's scoped-vs-global semantics: when
+    ``project_id`` is given (a per-project ``/env`` / ``/config`` route)
+    the scoped ``hub.token.<project_id>`` wins, exactly like
+    :func:`_project_token`; otherwise the global ``hub.token`` is used.
+    Returns ``""`` when nothing readable exists (never raises).
+    """
+    root = vct_root_dir()
+    if project_id:
+        scoped = root / f"hub.token.{project_id}"
+        try:
+            raw = scoped.read_text(encoding="utf-8").strip()
+        except (FileNotFoundError, OSError):
+            raw = ""
+        if raw:
+            return raw
+    try:
+        return (root / "hub.token").read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError):
+        return ""
+
+
+def _stale_env_token_fallback(project_id: str | None = None) -> str | None:
+    """Decide whether a PROVABLY-refused request may be retried once
+    with the on-disk token, and return that token when it may.
+
+    The four rules (mirrors must match):
+
+    1. ``VCT_HUB_TOKEN_STRICT=1`` → never (``None``). The pin is
+       authoritative; the caller keeps today's 401/403 path.
+    2. ``VCT_HUB_TOKEN`` unset/empty → never. Nothing was pinned, so the
+       first attempt already used the on-disk token.
+    3. No readable on-disk token → never (nothing better to try).
+    4. On-disk token EQUALS the env token → never (the env pin is not
+       stale; the refusal has another cause).
+
+    Otherwise return the on-disk token — the canonical always-fresh SSOT
+    (regenerated on every hub start, mode 0o600). Callers use it for ONE
+    bounded retry; nothing loops, respawns, or restarts.
+
+    SCOPE DECISION (v0.2.91, coordinator ruling — decided, not missed):
+    the original WP-D item 4 sketch ALSO proposed upgrading the resolvers'
+    hedged failure messages ("a pre-update session *may* hold a stale
+    VCT_HUB_TOKEN") to a definitive second sentence. That half is
+    deliberately NOT shipped. With this fallback in place the field case
+    SUCCEEDS and prints :data:`STALE_ENV_TOKEN_MESSAGE`, so the hedge is
+    only ever reached where a definitive claim would be FALSE or useless:
+    (a) ``VCT_HUB_TOKEN_STRICT=1`` — a harness pinned the token on
+    purpose; (b) the on-disk token was refused too — staleness is then not
+    the cause; (c) no readable on-disk token — staleness is unprovable.
+    A second parity-locked sentence across eight mirrors and ~15 message
+    sites would add complexity serving no reachable user.
+
+    KNOWN IMPRECISION, ACCEPTED (v0.2.91 wave-3 NIT — documented, not
+    missed). On a PER-PROJECT route (``/env``, ``/config``) there is one
+    corner where the word "stale" in :data:`STALE_ENV_TOKEN_MESSAGE` is
+    not literally true: the env pin holds a CURRENT global ``hub.token``
+    while the route requires the scoped ``hub.token.<id>``. The hub 403s
+    the global token, rule 4 sees env != scoped-on-disk, the retry with
+    the scoped token succeeds, and the user is told their pin is "stale"
+    when it was merely scope-mismatched.
+
+    Not fixed, deliberately: (a) the REMEDY the sentence gives — unset
+    ``VCT_HUB_TOKEN`` so the resolver picks the right token per route — is
+    exactly right in that corner too, so the user is not misdirected; and
+    (b) a corner-specific sentence is a SECOND parity-locked message
+    across all 14 mirrors, which is the same cost the B-half decision
+    above already declined for a larger benefit. One sentence, byte-locked
+    everywhere, beats two that can drift.
+    """
+    if _hub_token_strict():
+        return None
+    env_tok = os.environ.get("VCT_HUB_TOKEN", "").strip()
+    if not env_tok:
+        return None
+    disk_tok = _on_disk_hub_token(project_id)
+    if not disk_tok or disk_tok == env_tok:
+        return None
+    return disk_tok
+
+
+def _retry_answer_is_definitive(status_code: int) -> bool:
+    """May a stale-env RETRY's response be adopted (and warned about)?
+
+    Only when it PROVES the fallback credential was accepted:
+
+    * ``2xx`` — the hub served the request;
+    * ``404`` — ``project_not_found`` / ``field_not_found``, which the hub
+      answers only AFTER its auth middleware accepted the bearer, so it is
+      a post-auth answer exactly like a 200 (and the caller maps it to a
+      precise ``ProjectNotFound`` / ``FieldNotFound``, far better than the
+      401 it would otherwise see).
+
+    Everything else proves nothing about the credential and keeps the
+    ORIGINAL refusal. That deliberately includes ``400`` and ``503``,
+    which the hub also only emits post-auth: adopting them would trade a
+    truthful "401 unauthorized" for a marginally more specific message on
+    a path that requires BOTH a stale pin AND a hub error, while widening
+    the set of statuses that can latch the env pin off. The conservative
+    branch is byte-identical to pre-v0.2.91 there.
+
+    v0.2.91 wave-3 (MINOR-1): before this, ANY non-401/403 retry answer
+    was adopted — so a 5xx after a 401 latched the pin off, printed the
+    definitive line, and surfaced ``hub returned 503`` in place of the
+    truthful 401.
+    """
+    return 200 <= status_code < 300 or status_code == 404
+
+
+def _warn_stale_env_token() -> None:
+    """Emit :data:`STALE_ENV_TOKEN_MESSAGE` once per process (best-effort).
+
+    Once per process, not once per call: a hook that resolves many keys
+    with a stale export must not flood stderr, but the user must see the
+    fix at least once. Reset by :func:`_test_clear_cache`.
+    """
+    global _stale_env_warned
+    with _stale_env_warned_lock:
+        if _stale_env_warned:
+            return
+        _stale_env_warned = True
+    try:
+        sys.stderr.write(
+            f"[vco_lib.project_config] {STALE_ENV_TOKEN_MESSAGE}\n"
+        )
+        sys.stderr.flush()
+    except OSError:
+        # stderr unavailable (closed in a daemon context) — the
+        # diagnostic is best-effort; swallow.
+        pass
 
 
 def _project_token(project_id: str, global_token: str) -> str:
@@ -739,6 +937,26 @@ def _get_with_401_retry(
     Subsequent 401s (after the retry) are returned as-is so the caller
     can map them to ``HubUnreachable`` with the appropriate error
     message context.
+
+    v0.2.91 (WP-D item 4) — STALE-ENV-TOKEN FALLBACK. The re-discovery
+    above used to re-prefer the SAME stale ``$VCT_HUB_TOKEN`` (env wins
+    inside :func:`_discover_hub`), so the retry was a no-op in exactly
+    the scenario the field hits: a pre-update shell exported the token,
+    the hub rotated it on restart, every resolve 401s until the shell is
+    replaced. Now, when :func:`_stale_env_token_fallback` proves the env
+    pin differs from the on-disk token, the retry presents the ON-DISK
+    token instead and — on success — prints
+    :data:`STALE_ENV_TOKEN_MESSAGE` once. Request count is unchanged
+    (still at most two attempts on a 401). A 403 (the global-token-on-
+    ``/env`` refusal shape) gets ONE such attempt too, but only when a
+    fallback candidate exists.
+
+    The retry's answer is ADOPTED only when it proves the fallback
+    credential was accepted — see :func:`_retry_answer_is_definitive`.
+    Anything else (another refusal, a 5xx, a transport failure, any other
+    status) returns the ORIGINAL refusal response, so the caller's error
+    text is byte-identical to pre-v0.2.91 on every one of those paths.
+    ``VCT_HUB_TOKEN_STRICT=1`` disables all of it.
     """
     port, token = _discover_hub()
     url = url_builder(port, token)
@@ -754,6 +972,31 @@ def _get_with_401_retry(
     except requests.RequestException as exc:
         raise HubUnreachable(f"hub GET failed: {exc}") from exc
 
+    if resp.status_code == 403:
+        # Never retried before v0.2.91 (a 403 is an authorization
+        # decision, not a rotation artefact) — and it still is not,
+        # UNLESS the env pin is provably stale, in which case the
+        # scoped/global on-disk token is the correct credential to
+        # present. One bounded attempt; failure returns the original.
+        fallback = _stale_env_token_fallback(project_id)
+        if fallback is None:
+            return resp
+        try:
+            resp_fb = _http_session().get(
+                url,
+                params=params,
+                headers={"Authorization": f"Bearer {fallback}"},
+                timeout=(_CONNECT_TIMEOUT_SECONDS, _READ_TIMEOUT_SECONDS),
+            )
+        except requests.RequestException:
+            # The fallback attempt could not complete — keep today's
+            # error path exactly (the original 403 response).
+            return resp
+        if not _retry_answer_is_definitive(resp_fb.status_code):
+            return resp
+        _warn_stale_env_token()
+        return resp_fb
+
     if resp.status_code != 401:
         return resp
 
@@ -763,10 +1006,17 @@ def _get_with_401_retry(
     # The per-project token is re-resolved too (its file may have rotated
     # on the same restart, or vanished → we fall back to the freshly-read
     # global token, the compat path).
+    resp_401 = resp
     _invalidate_discovery_cache()
     port, token = _discover_hub()
     url = url_builder(port, token)
     bearer = _project_token(project_id, token) if project_id else token
+    # v0.2.91: when the env pin is provably stale, the ONE retry we were
+    # already making presents the on-disk token instead of re-presenting
+    # the value the hub just refused.
+    fallback = _stale_env_token_fallback(project_id)
+    if fallback is not None:
+        bearer = fallback
     headers = {"Authorization": f"Bearer {bearer}"}
     try:
         resp = _http_session().get(
@@ -777,6 +1027,16 @@ def _get_with_401_retry(
         )
     except requests.RequestException as exc:
         raise HubUnreachable(f"hub GET failed on retry: {exc}") from exc
+    if fallback is None:
+        # No credential swap happened — this is the pre-v0.2.91 cache
+        # invalidation retry, whose response is returned as it always was.
+        return resp
+    if not _retry_answer_is_definitive(resp.status_code):
+        # The swap did not prove itself. Return the ORIGINAL 401 rather
+        # than an answer produced by a credential we cannot vouch for, and
+        # do NOT print the definitive line.
+        return resp_401
+    _warn_stale_env_token()
     return resp
 
 

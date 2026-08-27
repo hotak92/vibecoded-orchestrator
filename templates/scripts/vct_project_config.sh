@@ -45,6 +45,15 @@
 #   3. Port default: 7700 (matches launcher server.rs::DEFAULT_PORT).
 #      Token has no default — missing file maps to exit 1.
 #
+#   v0.2.91 — STALE-ENV FALLBACK: the env token pin wins on the FIRST
+#   attempt, always. On a PROVABLE refusal (401/403), when
+#   $VCT_HUB_TOKEN is set AND differs from the on-disk token, the request
+#   is retried ONCE with the on-disk token (the always-fresh 0600 SSOT
+#   the hub regenerates on every start) and ONE definitive stderr line is
+#   emitted. A failed retry changes nothing — the exit codes above are a
+#   contract. Set VCT_HUB_TOKEN_STRICT=1 to disable the fallback
+#   (harnesses that pin a bad token and assert the 401 path).
+#
 # Dependencies: curl (always), jq (preferred) OR python3 (fallback).
 #
 # Stderr policy: on hub unreachable / project missing / misconfigured /
@@ -360,12 +369,113 @@ hub_token() {
     printf ''
 }
 
+# ── Stale-env hub-token fallback (v0.2.91, WP-D item 4) ─────────────────
+#
+# MUST MATCH the SSOT `vco_lib/project_config.py::_stale_env_token_fallback`
+# and the mirrors in `vct_secrets_resolve.sh`, both `.ps1` siblings,
+# `claude_mcp_servers/wrappers/_base.py`,
+# `launcher/tools/vct-cli/src/main.rs` and `tools/vct-secrets/vct`.
+# Locked by tests/test_stale_env_token_parity_v0291.py (the F-8
+# quadruplet + the Python SSOT driven through the same fixtures).
+#
+# WHY: `$VCT_HUB_TOKEN` wins over the file on every FIRST attempt (that is
+# the tests/dev pin contract). But the hub regenerates `hub.token` on each
+# start, so a shell that exported the token before an update presents a
+# value the hub refuses — every resolve then 401s until that shell dies.
+# After a PROVABLE refusal (401/403) we retry ONCE with the on-disk token
+# (the always-fresh 0600 SSOT) and emit one definitive line. Nothing
+# loops, respawns, or restarts; a failed retry keeps today's error path
+# (and therefore every exit code in the header contract).
+
+# The ONE definitive line. Byte-identical across every mirror.
+_VCT_STALE_ENV_TOKEN_MESSAGE="stale VCT_HUB_TOKEN in env overridden by on-disk hub.token — run \`unset VCT_HUB_TOKEN\` or open a new shell"
+_VCT_STALE_ENV_WARNED=0
+
+_warn_stale_env_token() {
+    # Once per process; routed through the rate-limited emitter (this
+    # script's stderr policy) with an explicit line override — the
+    # default "Falling back to env." shape would be a lie here, since
+    # the resolution SUCCEEDED with the on-disk token.
+    if (( _VCT_STALE_ENV_WARNED == 0 )); then
+        _VCT_STALE_ENV_WARNED=1
+        _emit_warning "hub_token_stale_env" "$_VCT_STALE_ENV_TOKEN_MESSAGE" "" \
+            "[vct] project_config: hub_token_stale_env: $_VCT_STALE_ENV_TOKEN_MESSAGE"
+    fi
+}
+
+hub_token_on_disk() {
+    # $1 = optional project id. Prints the ON-DISK token, IGNORING
+    # $VCT_HUB_TOKEN, preserving this call-site's scoped-vs-global
+    # semantics (scoped `hub.token.<id>` preferred when an id is given).
+    # Prints empty when nothing readable exists.
+    local project_id="${1:-}"
+    local state_dir="${VCT_STATE_DIR:-$HOME/.vct}"
+    if [[ -n "$project_id" ]]; then
+        local proj_file="$state_dir/hub.token.$project_id"
+        if [[ -f "$proj_file" && -r "$proj_file" ]]; then
+            local scoped
+            scoped=$(tr -d '[:space:]' < "$proj_file" 2>/dev/null) || scoped=""
+            if [[ -n "$scoped" ]]; then
+                printf '%s' "$scoped"
+                return 0
+            fi
+        fi
+    fi
+    local token_file="$state_dir/hub.token"
+    if [[ -f "$token_file" && -r "$token_file" ]]; then
+        tr -d '[:space:]' < "$token_file" 2>/dev/null || printf ''
+        return 0
+    fi
+    printf ''
+}
+
+hub_stale_env_fallback_token() {
+    # $1 = optional project id. Prints the on-disk token to retry with
+    # and returns 0, or returns 1 (no output) to leave today's path
+    # alone. Rules, in order (identical in every mirror):
+    #   1. VCT_HUB_TOKEN_STRICT=1        → 1 (the pin is authoritative)
+    #   2. VCT_HUB_TOKEN unset/empty     → 1 (nothing was pinned)
+    #   3. no readable on-disk token     → 1 (nothing better to try)
+    #   4. on-disk == env (whitespace-normalised) → 1 (pin is not stale)
+    local project_id="${1:-}"
+    # Trimmed comparison to the literal 1 — the SSOT's spelling, so a
+    # `VCT_HUB_TOKEN_STRICT=1` written with a trailing newline/CR means the
+    # same thing in bash, PowerShell, Rust and Python.
+    [[ "$(printf '%s' "${VCT_HUB_TOKEN_STRICT:-}" | tr -d '[:space:]')" == "1" ]] \
+        && return 1
+    local env_tok="${VCT_HUB_TOKEN:-}"
+    env_tok=$(printf '%s' "$env_tok" | tr -d '[:space:]')
+    [[ -n "$env_tok" ]] || return 1
+    local disk_tok
+    disk_tok=$(hub_token_on_disk "$project_id")
+    [[ -n "$disk_tok" ]] || return 1
+    [[ "$disk_tok" == "$env_tok" ]] && return 1
+    printf '%s' "$disk_tok"
+    return 0
+}
+
 # ── HTTP helper ─────────────────────────────────────────────────────────
 # `--header @-` reads the Authorization header from stdin so the token
 # never appears in argv (`ps`/`/proc/<pid>/cmdline`). Returns:
 #   exit 0 + stdout "<status>\t<body>"  on a completed request
 #   exit 1                              on curl failure (conn refused, etc.)
 #   exit 2                              on missing token (no hub.token)
+_hub_curl() {
+    # $1 = full url, $2 = bearer token.
+    # echoes "<status>\t<body>"; returns 1 when curl itself fails.
+    local url="$1" token="$2"
+    local body status
+    if ! body=$(curl --silent --show-error --max-time 5 \
+                     --header @- \
+                     --output - --write-out '\n%{http_code}' "$url" \
+                     <<<"Authorization: Bearer ${token}" 2>&1); then
+        return 1
+    fi
+    status="${body##*$'\n'}"
+    body="${body%$'\n'*}"
+    printf '%s\t%s\n' "$status" "$body"
+}
+
 hub_get() {
     local path="$1"
     # v0.2.76 Part 4: optional 2nd arg = the project id for a per-project
@@ -379,16 +489,41 @@ hub_get() {
         return 2
     fi
     local url="http://127.0.0.1:${port}/api/v1/${path}"
-    local body status
-    if ! body=$(curl --silent --show-error --max-time 5 \
-                     --header @- \
-                     --output - --write-out '\n%{http_code}' "$url" \
-                     <<<"Authorization: Bearer ${token}" 2>&1); then
-        return 1
-    fi
-    status="${body##*$'\n'}"
-    body="${body%$'\n'*}"
-    printf '%s\t%s\n' "$status" "$body"
+    local result status
+    result=$(_hub_curl "$url" "$token") || return 1
+    status="${result%%$'\t'*}"
+    # v0.2.91 (WP-D item 4): a PROVABLE credential refusal is the ONLY
+    # trigger for the one-shot on-disk-token retry. Every other status —
+    # and a strict pin, an absent env token, an identical on-disk token,
+    # or a retry that is ALSO refused — falls through to the original
+    # result, so the header's exit-code contract is byte-identical.
+    case "$status" in
+        401|403)
+            local fallback retry retry_status
+            if fallback=$(hub_stale_env_fallback_token "$project_id"); then
+                if retry=$(_hub_curl "$url" "$fallback"); then
+                    retry_status="${retry%%$'\t'*}"
+                    # ADOPT only an answer that PROVES the fallback
+                    # credential was accepted: 2xx, or 404 (the hub
+                    # answers "no row" only AFTER its auth middleware
+                    # accepted the bearer — a post-auth answer like a
+                    # 200). Anything else — 5xx included — proves
+                    # nothing, so the ORIGINAL 401/403 stands and no
+                    # definitive line is printed (v0.2.91 wave-3,
+                    # MINOR-1).
+                    case "$retry_status" in
+                        2??|404)
+                            _warn_stale_env_token
+                            printf '%s\n' "$retry"
+                            return 0
+                            ;;
+                        *) : ;;   # not proof — keep the original refusal
+                    esac
+                fi
+            fi
+            ;;
+    esac
+    printf '%s\n' "$result"
 }
 
 # ── URL-encode ──────────────────────────────────────────────────────────
