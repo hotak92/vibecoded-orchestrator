@@ -93,6 +93,17 @@ EMIT_SURFACES: tuple[str, ...] = (
 #: Recognised ``status`` values.
 STATUSES: tuple[str, ...] = ("active", "retired")
 
+#: Prefix for the optional ``retry_action`` field (v0.2.91 WP-H). Only
+#: ``auto_retryable`` rows may carry one, and its handler must exist in
+#: ``vco_lib.deferral_retry.HANDLERS`` (pinned by the retry tests).
+#:
+#: Python-side only BY DESIGN: retries are dispatched from Python, so the Rust
+#: mirror tolerates-and-ignores this key exactly as it already does ``notes``
+#: (``RawCondition`` has no ``deny_unknown_fields``; a parity test pins that).
+#: Adding a Rust field would mean a second retry engine — the opposite of the
+#: "registry data + ONE dispatcher" shape WP-H exists to enforce.
+RETRY_PREFIX = "retry:py:"
+
 
 @dataclass(frozen=True)
 class ConditionSpec:
@@ -114,6 +125,9 @@ class ConditionSpec:
     dismiss_key: tuple[str, ...] = ()
     #: ``"active"`` or ``"retired"``.
     status: str = "active"
+    #: ``retry:py:<handler>`` for an ``auto_retryable`` row VCO can re-attempt
+    #: on its own, else ``""``.
+    retry_action: str = ""
     #: Free-form rationale.
     notes: str = ""
 
@@ -136,6 +150,18 @@ class ConditionSpec:
     def rust_probe_name(self) -> Optional[str]:
         if self.clear_probe.startswith("probe:rs:"):
             return self.clear_probe[len("probe:rs:"):]
+        return None
+
+    @property
+    def retry_handler(self) -> Optional[str]:
+        """``<handler>`` for a ``retry:py:<handler>`` row, else ``None``.
+
+        ``None`` for every row that declares no ``retry_action`` — the
+        dispatcher treats that as "not my business", which is what keeps the
+        retry surface a declared list rather than "anything with a command".
+        """
+        if self.retry_action.startswith(RETRY_PREFIX):
+            return self.retry_action[len(RETRY_PREFIX):]
         return None
 
 
@@ -213,6 +239,19 @@ def _spec_from_raw(pattern: str, raw: Any) -> ConditionSpec:
             f"deferral_conditions.toml: {pattern!r} has status={status!r}; "
             f"expected one of {STATUSES}"
         )
+    retry_action = str(raw.get("retry_action", ""))
+    if retry_action:
+        if not retry_action.startswith(RETRY_PREFIX):
+            raise RuntimeError(
+                f"deferral_conditions.toml: {pattern!r} has retry_action="
+                f"{retry_action!r}; expected '{RETRY_PREFIX}<handler>'"
+            )
+        if cls != "auto_retryable":
+            raise RuntimeError(
+                f"deferral_conditions.toml: {pattern!r} declares a "
+                f"retry_action but class={cls!r}. Only auto_retryable rows "
+                f"may be retried — the class IS the consent record."
+            )
     if match == "exact" and "*" in pattern:
         raise RuntimeError(
             f"deferral_conditions.toml: {pattern!r} contains '*' but declares "
@@ -232,6 +271,7 @@ def _spec_from_raw(pattern: str, raw: Any) -> ConditionSpec:
         emit_surfaces=tuple(str(s) for s in surfaces),
         dismiss_key=tuple(str(k) for k in dismiss),
         status=status,
+        retry_action=retry_action,
         notes=str(raw.get("notes", "")),
     )
 
@@ -347,6 +387,19 @@ def dismiss_key_fields(
     return spec.dismiss_key if spec is not None else ()
 
 
+def retry_handler_for(
+    condition_id: str, *, path: Optional[Path] = None
+) -> Optional[str]:
+    """The declared retry handler name, or ``None``.
+
+    ``None`` covers unregistered ids, non-``auto_retryable`` rows, and rows
+    with no ``retry_action`` — every one of which means the retry dispatcher
+    must leave the condition alone.
+    """
+    spec = condition(condition_id, path=path)
+    return spec.retry_handler if spec is not None else None
+
+
 def is_action_required(condition_id: str, *, path: Optional[Path] = None) -> bool:
     """True when the condition asks a human to DO something."""
     return disposition_for(condition_id, path=path) == "action_required"
@@ -428,6 +481,7 @@ __all__ = [
     "CLEAR_SENTINELS",
     "DEFAULT_CLASS",
     "EMIT_SURFACES",
+    "RETRY_PREFIX",
     "STATUSES",
     "ConditionSpec",
     "all_specs",
@@ -442,6 +496,7 @@ __all__ = [
     "load_registry",
     "matches_registered_pattern",
     "registered_patterns",
+    "retry_handler_for",
     "split_by_disposition",
     "table_path",
 ]

@@ -30,6 +30,24 @@ Side-effect policy (`install.py:1523-1582`, `_run_bootstrap`):
 
 Exit codes: `0` detection succeeded; `1` exception (traceback on stderr); `2` bad invocation; `3` `--install-missing` failed.
 
+### Doctor phase (`vco doctor`) — v0.2.91
+
+The envelope above is a PRE-install snapshot. Until v0.2.91 nothing consumed it afterwards: `missing_prereqs` was computed, printed, and dropped, so an assumption that was false (or became false) stayed invisible. `vco_lib/doctor.py` closes that loop — ONE probe engine with three invocation points:
+
+| Invocation | Scope | Where |
+|---|---|---|
+| End of every install/update | `full` | `install.py::_post_install_probe_phase` → `_run_doctor_phase` (runs on fresh installs too; the re-probe pass ahead of it stays `--update`-only) |
+| Launcher boot | `boot` (cheap subset — no subprocess, no network) | launcher wiring |
+| On demand | `full` | `vco doctor` / `python -m vco_lib.doctor` (`--json`, `--scope`, `--no-emit`, `--no-auto-fix`) |
+
+It is **not a new detection codebase**: each probe composes a mechanism that already exists — the npx ladder (`vco_lib/npx_resolver.py`), the `--bootstrap` envelope's `missing_prereqs` (injected by install.py rather than re-derived), WP-A's binary-freshness probe via its Python leg, the deferral registry's own clear probes, and `vco verify-pins`' row collector.
+
+Each finding is `ok` / `problem` / `unknown`, and `unknown` never counts as `ok` — a probe that could not run must not read as "all good". Exit code is 1 only when a probe reports a real problem.
+
+**Fix boundary** (§F decision #4): environment-level owed WORK may be re-attempted automatically (the WP-H retry dispatcher re-runs an owed KG seed or code-graph walk once its backend answers — work the user already asked for by installing, idempotent, precondition-gated, attempt-capped). Everything else is surface-only: findings that touch a RUNNING binary are reported, never repaired, per the standing no-auto-restart ruling. The hub's own boot auto-restart (`running_hub_is_stale`) predates that ruling, is the hub's documented contract, and stays grandfathered — the doctor itself restarts nothing.
+
+Findings it defers become registry-classed deferral conditions with the exact remediation command (today: `npx_missing_mcp_unspawnable`). When install.py drives the phase it passes its in-flight run report as the sink, so those entries ride the run's single authoritative write instead of a second writer behind `finalize()`'s back.
+
 ---
 
 ## Bootstrapper Scripts
@@ -293,6 +311,8 @@ A file placed at the project root (one line = project name) used by `vct detect-
 ## Search MCP Wrapper + Git Credential Helper
 
 ### Search MCP wrapper (`claude_mcp_servers/search_mcp/wrapper.sh`)
+**Interpreter resolution (post-`0541dcf7`)**: the wrapper probes, in order, `$SEARCH_MCP_PYTHON` → `$REPO_ROOT/claude_mcp_servers/.venv/bin/python` (the legacy pre-unification layout) → `$REPO_ROOT/.venv/bin/python` (canonical since the venv unification), and only then falls back to the legacy path for its error message. Before that fix it hardcoded the legacy path alone, so on a root-venv install the MCP simply never started — `claude mcp list` said "Failed to connect" with no visible cause. The lesson generalises beyond this wrapper: a layout fact copied into a script is an assumption frozen at authoring time, and nothing re-verified it when the layout moved. v0.2.91's doctor phase (`vco doctor`) exists to be the thing that re-verifies such assumptions after install — the same probe engine that catches an unresolvable `npx`, a stale launcher binary, and drifted npm pins.
+
 Two-stage `GITHUB_TOKEN` resolution as of v0.1.7: (1) env-first — `$GITHUB_TOKEN` already exported by the launcher's `write_project_env_files` (which sources from the keychain); (2) resolver helper — `vct_secrets_resolve.sh <project_path> github_pat`, which calls the launcher's hub HTTP API (`GET /api/v1/projects/{id}/env?key=github_pat`). The legacy `~/.vct-secrets/shared/github_pat` file fallback (gated behind `VCT_LEGACY_FILE_FALLBACK=1`) was removed in the 0.1.7 fork-readiness sweep. Either way the token never appears in `~/.claude.json`.
 
 ### `git-credential-vct` — GitHub credential helper

@@ -672,3 +672,134 @@ def test_hub_registration_body_includes_repo_root(monkeypatch, tmp_path):
     payload = _json.loads(captured["body"].decode("utf-8"))
     assert payload["repo_root"] == "/abs/repo/root"
     assert payload["pid"] == 4321
+
+
+# ─── v0.2.91 (WP-D item 4): stale-env hub-token fallback ────────────────
+#
+# THE SEAM: `$VCT_HUB_TOKEN` wins over the on-disk token and the hub
+# rotates that file on every start, so an install run launched from a
+# pre-update shell registered its resync spawn with a dead credential —
+# the build row never landed, and the launcher GUI showed no running walk
+# while the analyzer churned invisibly.
+#
+# NO LATCH here (deliberate): this helper has ONE call site and fires once
+# per spawn inside a short-lived install process.
+#
+# The soft no-op contract is UNCHANGED: registration is observability and
+# must never gate the spawn, so every leave-alone case still swallows the
+# failure at debug level and returns without raising.
+
+_STALE_ENV_TOKEN_V0291 = "stale-env-token-v0291-not-a-real-secret"
+_FRESH_DISK_TOKEN_V0291 = "fresh-disk-token-v0291-not-a-real-secret"
+
+
+def _stale_token_hub(expected: str, seen: list):
+    """urlopen stub: HTTPError 401 for any bearer but ``expected``."""
+    import urllib.error
+
+    def _fake_urlopen(req, timeout=None):
+        bearer = (req.get_header("Authorization") or "").replace("Bearer ", "", 1)
+        seen.append(bearer)
+        if bearer != expected:
+            raise urllib.error.HTTPError(
+                url=req.full_url, code=401, msg="Unauthorized", hdrs=None, fp=None
+            )
+
+        class _R:
+            status = 200
+        return _R()
+
+    return _fake_urlopen
+
+
+def _seed_stale_pin(monkeypatch, tmp_path):
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path))
+    (tmp_path / "hub.port").write_text("7700", encoding="utf-8")
+    (tmp_path / "hub.token").write_text(_FRESH_DISK_TOKEN_V0291, encoding="utf-8")
+    monkeypatch.setenv("VCT_HUB_TOKEN", _STALE_ENV_TOKEN_V0291)
+    monkeypatch.delenv("VCT_HUB_TOKEN_STRICT", raising=False)
+
+
+def test_hub_registration_retries_once_with_the_on_disk_token(
+    monkeypatch, tmp_path, caplog
+):
+    """RED-PROOF: pre-v0.2.91 the 401 fell into the soft no-op and the
+    build row never registered — the GUI showed no running walk."""
+    import logging
+    caplog.set_level(logging.WARNING, logger="vco_lib.codegraph_resync")
+    _seed_stale_pin(monkeypatch, tmp_path)
+    seen: list = []
+    monkeypatch.setattr(
+        cr.urllib.request, "urlopen",
+        _stale_token_hub(_FRESH_DISK_TOKEN_V0291, seen),
+    )
+
+    cr._register_spawn_with_hub("MyProj", 4321, repo_root=str(tmp_path))
+
+    assert seen == [_STALE_ENV_TOKEN_V0291, _FRESH_DISK_TOKEN_V0291]
+    assert any(cr.STALE_ENV_TOKEN_MESSAGE in r.message for r in caplog.records)
+
+
+def test_hub_registration_strict_pin_keeps_the_soft_no_op(monkeypatch, tmp_path):
+    """LEAVE-ALONE: the guard keeps the pin authoritative — one request,
+    no raise, no override line."""
+    _seed_stale_pin(monkeypatch, tmp_path)
+    monkeypatch.setenv("VCT_HUB_TOKEN_STRICT", "1")
+    seen: list = []
+    monkeypatch.setattr(
+        cr.urllib.request, "urlopen",
+        _stale_token_hub(_FRESH_DISK_TOKEN_V0291, seen),
+    )
+
+    cr._register_spawn_with_hub("MyProj", 4321, repo_root=str(tmp_path))  # no raise
+
+    assert seen == [_STALE_ENV_TOKEN_V0291]
+
+
+def test_hub_registration_retry_also_refused_stays_soft(monkeypatch, tmp_path):
+    """LEAVE-ALONE: both tokens refused → still a soft no-op, never a raise."""
+    _seed_stale_pin(monkeypatch, tmp_path)
+    seen: list = []
+    monkeypatch.setattr(
+        cr.urllib.request, "urlopen",
+        _stale_token_hub("a-third-token-nobody-has", seen),
+    )
+
+    cr._register_spawn_with_hub("MyProj", 4321, repo_root=str(tmp_path))  # no raise
+
+    assert seen == [_STALE_ENV_TOKEN_V0291, _FRESH_DISK_TOKEN_V0291]
+
+
+def test_hub_registration_identical_tokens_make_one_request(monkeypatch, tmp_path):
+    """LEAVE-ALONE: the pin is not stale — the happy path is untouched."""
+    _seed_stale_pin(monkeypatch, tmp_path)
+    monkeypatch.setenv("VCT_HUB_TOKEN", _FRESH_DISK_TOKEN_V0291)
+    seen: list = []
+    monkeypatch.setattr(
+        cr.urllib.request, "urlopen",
+        _stale_token_hub(_FRESH_DISK_TOKEN_V0291, seen),
+    )
+
+    cr._register_spawn_with_hub("MyProj", 4321, repo_root=str(tmp_path))
+
+    assert seen == [_FRESH_DISK_TOKEN_V0291]
+
+
+def test_hub_registration_non_credential_error_is_not_retried(monkeypatch, tmp_path):
+    """LEAVE-ALONE: a 500 is not a credential problem — one request, and
+    the historical soft no-op."""
+    import urllib.error
+
+    _seed_stale_pin(monkeypatch, tmp_path)
+    seen: list = []
+
+    def _fake_urlopen(req, timeout=None):
+        seen.append((req.get_header("Authorization") or ""))
+        raise urllib.error.HTTPError(
+            url=req.full_url, code=500, msg="Server Error", hdrs=None, fp=None
+        )
+
+    monkeypatch.setattr(cr.urllib.request, "urlopen", _fake_urlopen)
+    cr._register_spawn_with_hub("MyProj", 4321, repo_root=str(tmp_path))  # no raise
+
+    assert len(seen) == 1

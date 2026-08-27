@@ -68,9 +68,30 @@ class CallSiteShapeTests(unittest.TestCase):
         cls.source = (REPO_ROOT / "install.py").read_text(encoding="utf-8")
 
     def test_pass_runs_on_every_update(self):
+        """The pass runs on every ``--update``, with no flag in front of it.
+
+        v0.2.91 WP-D moved the call site out of ``main()`` and into
+        ``_post_install_probe_phase`` (main() sits at a hard line ratchet, and
+        the phase now also runs the doctor). The INVARIANT is unchanged and is
+        pinned here at its new home: main() calls the phase unconditionally,
+        and inside the phase the only gate on the re-probe is ``args.update``.
+        """
         self.assertIn(
-            "    if args.update:\n        _apply_deferred_entries(", self.source
+            "_post_install_probe_phase(_deferral_report, _deferral_folder, args=args)",
+            self.source,
         )
+        phase = self.source[self.source.index("def _post_install_probe_phase"):]
+        phase = phase[: phase.index("def _run_doctor_phase")]
+        self.assertIn(
+            'if getattr(args, "update", False):\n'
+            "        _apply_deferred_entries(report, folder, args=args)",
+            phase,
+        )
+        # No `--apply-deferred` flag check anywhere in the phase body: the
+        # flag survives only INSIDE `_apply_deferred_entries`, as the
+        # side-effect selector.
+        body = phase.split('"""', 2)[-1]
+        self.assertNotIn('getattr(args, "apply_deferred"', body)
 
     def test_flag_no_longer_gates_the_pass(self):
         """The old shape `if args.update and getattr(args, "apply_deferred", ...)`

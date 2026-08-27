@@ -146,6 +146,8 @@ from vco_lib import secrets_audit as _secrets_audit  # noqa: E402
 from vco_lib import deferral_dismissal as _deferral_dismissal  # noqa: E402
 from vco_lib import deferral_probes as _deferral_probes  # noqa: E402
 from vco_lib import deferral_registry as _deferral_registry  # noqa: E402
+from vco_lib import doctor as _doctor  # noqa: E402
+from vco_lib import npx_resolver as _npx_resolver  # noqa: E402
 from vco_lib.deferral_report import (  # noqa: E402
     DeferralEntry,
     DeferralReport,
@@ -6760,9 +6762,8 @@ def main() -> int:
     # (_deferral_folder is resolved at the top of main(), next to the A-2
     # disk seed — see the HIGH-2 comment there.)
 
-    # v0.2.91 WP-B (decision #5): the re-probe pass runs on EVERY --update.
-    if args.update:
-        _apply_deferred_entries(_deferral_report, _deferral_folder, args=args)
+    # v0.2.91 WP-B (#5) re-probe pass + WP-D doctor phase — see the helper.
+    _post_install_probe_phase(_deferral_report, _deferral_folder, args=args)
 
     # A-11 (v0.2.73): the mid-run `_deferral_report.write()` that used to sit
     # here was REMOVED. With an empty in-memory report it unlinked the on-disk
@@ -7122,6 +7123,96 @@ def _write_update_deferred_stub(folder: Path, *, mode: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Post-install probe phase (v0.2.91 WP-B re-probe + WP-D doctor)
+# ---------------------------------------------------------------------------
+
+def _post_install_probe_phase(
+    report: DeferralReport,
+    folder: Path,
+    *,
+    args: "argparse.Namespace",
+) -> None:
+    """The single verification phase at the end of every install/update run.
+
+    Two passes, in this order:
+
+    1. **Re-probe** (``--update`` only) — ``_apply_deferred_entries`` clears
+       persisted conditions that no longer apply. Update-only because on a
+       FRESH install there is no prior ledger to re-probe.
+    2. **Doctor** (every run) — ``vco_lib.doctor`` re-verifies the environment
+       assumptions against what was actually registered and delivered, prints
+       the authoritative report, emits registry-classed conditions for what it
+       defers, and dispatches the WP-H retries for owed work.
+
+    Doctor runs AFTER the re-probe so a condition the re-probe just cleared is
+    not immediately re-listed by the ledger summary, and BEFORE
+    ``InstallDeferralFlow.finalize()`` (its caller in ``main()`` sits above the
+    finalize) so anything it emits rides the run's single authoritative write —
+    ``sink=report`` rather than a second writer behind finalize's back.
+
+    Lives outside ``main()`` deliberately: the monolith ratchet
+    (``tests/test_install_main_ratchet.py``) pins main()'s span, and a phase
+    with real branching belongs in a helper regardless.
+
+    Soft-fail: neither pass may fail an install that already succeeded.
+    """
+    if getattr(args, "update", False):
+        _apply_deferred_entries(report, folder, args=args)
+    _run_doctor_phase(report, folder, args=args)
+
+
+def _run_doctor_phase(
+    report: DeferralReport,
+    folder: Path,
+    *,
+    args: "argparse.Namespace",
+) -> None:
+    """Thin shim over ``vco_lib.doctor`` — supplies the facts install.py owns.
+
+    Two context facts the engine cannot derive without copying knowledge that
+    already has a home here:
+
+    * ``bootstrap_envelope`` — the ``--bootstrap`` probe payload. This is the
+      "consumer that acts after install" report 6 §B.1 found missing:
+      ``missing_prereqs`` was computed and then died in a stdout block.
+    * ``launcher_probe_extras`` — the OS → ``launcher/dist/<arch>/`` mapping,
+      whose ONE home is ``_launcher_binary_relative_path``.
+
+    Skipped entirely under ``--quiet`` bootstrap-style runs? No: the doctor is
+    the authoritative end-of-run report and must run even when nobody is
+    watching, because its OUTPUT is the ledger, not the terminal.
+    """
+    try:
+        context: dict = {}
+        try:
+            context["bootstrap_envelope"] = _bootstrap_build_envelope(folder)
+        except Exception as exc:  # noqa: BLE001 — envelope is optional context
+            _log_install_event("doctor", "warn", f"bootstrap envelope failed: {exc}")
+        try:
+            _subdir, _fname = _launcher_binary_relative_path()
+            context["launcher_probe_extras"] = _deferral_probes.launcher_probe_extras(
+                _subdir, _fname, _read_launcher_version(folder),
+            )
+        except Exception:  # noqa: BLE001 — probe declines without its extras
+            pass
+        # auto_fix=False HERE and only here — the owed-work retry must not run
+        # from inside an install run (write race with our own finalize; the
+        # seed just ran at step 7c; a minutes-long block after the last visible
+        # step). Full rationale + the real triggers: vco_lib.doctor.run_and_report.
+        result = _doctor.run_and_report(
+            folder, sink=report, context=context, auto_fix=False,
+        )
+        _log_install_event(
+            "doctor",
+            "ok" if result.ok else "warn",
+            f"{len(result.problems)} problem(s), {len(result.unknowns)} "
+            f"undetermined across {len(result.findings)} probe(s)",
+        )
+    except Exception as exc:  # noqa: BLE001 — soft-fail by design
+        _log_install_event("doctor", "error", f"doctor phase raised: {exc}")
+
+
+# ---------------------------------------------------------------------------
 # Deferral-apply helper
 # ---------------------------------------------------------------------------
 
@@ -7129,48 +7220,16 @@ def _pid_is_alive_for_deferral(pid: int) -> bool:
     """Cross-OS "is this PID still running" probe for deferral re-checks.
 
     v0.2.54 Track D: used by the ``launcher_restart_required`` handler.
-    On Windows, ``os.kill(pid, 0)`` is NOT a probe — any non-CTRL signal
-    value unconditionally TerminateProcess-es the target — so we go via
-    OpenProcess + GetExitCodeProcess (STILL_ACTIVE == 259) instead.
-    POSIX uses the conventional ``kill(pid, 0)`` errno dance.
-
-    Conservative on uncertainty: unknown → True (treat the process as
-    alive, so the deferral entry is KEPT rather than cleared on a
-    guess).
+    v0.2.91 wave-3 (MINOR-4): the implementation moved to
+    ``vco_lib.deferral_probes.pid_is_alive`` when the retry driver's
+    single-instance guard became a second caller — one concern, one home,
+    and one place to keep the Windows footgun (``os.kill(pid, 0)``
+    TerminateProcess-es the target) handled correctly. This wrapper stays
+    for the monkeypatch contract its call sites and tests already rely on.
     """
-    if pid <= 0:
-        return True  # unparseable / sentinel value — keep the entry
-    if sys.platform == "win32":
-        try:
-            import ctypes
+    from vco_lib.deferral_probes import pid_is_alive
 
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            STILL_ACTIVE = 259
-            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-            handle = kernel32.OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION, False, pid,
-            )
-            if not handle:
-                return False  # no such process (or no access → likely gone)
-            try:
-                exit_code = ctypes.c_ulong()
-                ok = kernel32.GetExitCodeProcess(
-                    handle, ctypes.byref(exit_code),
-                )
-                return bool(ok) and exit_code.value == STILL_ACTIVE
-            finally:
-                kernel32.CloseHandle(handle)
-        except Exception:  # noqa: BLE001 — conservative fallback
-            return True
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # exists, owned by someone else
-    except OSError:
-        return True  # uncertain → conservative
+    return pid_is_alive(pid)
 
 
 def _apply_deferred_entries(
@@ -23741,141 +23800,25 @@ def _record_npm_pin_drift_deferral(package_key: str,
 
 
 # ---------------------------------------------------------------------------
-# v0.2.51 Bug E: npx fallback for fnm/nvm-style setups.
+# Node CLI resolution — thin wrappers over vco_lib.npx_resolver.
 #
-# `shutil.which("npx")` handles the common case (apt/brew/winget/NodeSource
-# where npx is symlinked alongside npm on PATH). But on fnm/nvm setups where
-# users may have hand-symlinked just `npm` to ~/.local/bin/, npx is physically
-# present in the same bin dir as the REAL npm but not on PATH.
-#
-# Reported 2026-06-09 from a user's machine: `~/.local/bin/npm` was symlinked
-# to `~/.fnm/node-versions/v20.20.1/installation/bin/npm`. The corresponding
-# `npx` is at `~/.fnm/.../bin/npx` (same dir) — `shutil.which("npx")` failed,
-# Playwright pre-cache + bundled-npm pinning both skipped silently even though
-# the user clearly had a working Node install.
-#
-# Fallback: probe `dirname(realpath(which("npm")))/npx` (and `.cmd` / `.ps1`
-# on Windows). Cross-OS: ``Path.resolve()`` handles symlink chains on every
-# platform; on Windows there's no executable bit so we fall back to
-# ``is_file()``. Same shape as ``_find_lean_ctx_binary``.
+# v0.2.91 WP-D: the v0.2.51 Bug E ladder (which handles fnm/nvm setups where
+# only `npm` is symlinked onto PATH) moved to `vco_lib/npx_resolver.py` so ONE
+# implementation serves install.py, `vco doctor`, the wrapper proxies' npm-exec
+# fallback, and the launcher's registration-health badge (Rust shells out to
+# `python -m vco_lib.npx_resolver --json` rather than re-implementing the
+# ladder). Its negative answer is no longer a stdout notice nobody consumes:
+# the doctor phase emits `npx_missing_mcp_unspawnable`.
 # ---------------------------------------------------------------------------
 
 def _find_npx() -> Optional[str]:
-    """Locate npx with fnm/nvm-style fallback.
-
-    Returns the absolute path to the npx binary, or None if truly absent.
-
-    Strategy (each candidate gets the .cmd / .ps1 Windows variants too):
-      1. ``shutil.which("npx")`` — the common case (npx is on PATH).
-      2. ``dirname(which("npm"))/npx`` — sibling of the symlink target
-         (covers the case where the user symlinked `npm` to ~/.local/bin/
-         but the same dir also has `npx` as a sibling — common on apt /
-         brew where both ship together).
-      3. ``dirname(realpath(which("npm")))/npx`` — sibling of the REAL
-         npm. For fnm/nvm this lands in
-         ``lib/node_modules/npm/bin/`` because npm itself is a symlink
-         to ``npm-cli.js`` in that dir. The npx shim there is sometimes
-         a broken-without-context cli (it imports node modules
-         relatively); we probe it but it's not always runnable on its
-         own.
-      4. Climb up from the realpath: if real npm lives at
-         ``<root>/lib/node_modules/npm/bin/npm-cli.js``, probe
-         ``<root>/bin/npx`` — the canonical fnm/nvm shim that wraps
-         node + npx-cli.js with the right argv. This is the path that
-         works at runtime on real fnm/nvm setups.
-
-    Cross-OS:
-      * POSIX: ``os.access(path, os.X_OK)`` confirms executability.
-      * Windows: executable bit doesn't exist — ``is_file()`` is the
-        relevant check, matching the convention in
-        ``_find_lean_ctx_binary``.
-
-    Never raises — symlink loops, permission errors, hostile paths all
-    fall through to the next candidate or ``None``.
-    """
-    direct = shutil.which("npx")
-    if direct:
-        return direct
-    npm = shutil.which("npm")
-    if not npm:
-        return None
-    is_windows = sys.platform == "win32"
-
-    # Build candidate base directories. Order matters: prefer the
-    # canonical fnm/nvm shim (case 4) over the broken-on-its-own
-    # ``lib/node_modules/npm/bin/npx`` (case 3) because the former
-    # actually runs.
-    npm_path = Path(npm)
-    candidate_dirs: list[Path] = []
-
-    # Case 2: sibling of the symlink itself (apt / brew layout).
-    candidate_dirs.append(npm_path.parent)
-
-    # Case 4: canonical fnm/nvm installation/bin/ — derive from the real
-    # npm path by climbing out of lib/node_modules/npm/bin.
-    try:
-        real_npm = npm_path.resolve()
-    except OSError:
-        real_npm = None
-    if real_npm is not None:
-        # Look for the well-known lib/node_modules/npm/bin marker and
-        # climb to the installation/bin sibling.
-        parts = real_npm.parts
-        try:
-            idx = parts.index("node_modules")
-            # Need at least 3 levels above node_modules to find install root:
-            #   <root>/lib/node_modules/npm/bin/npm-cli.js
-            # We expect parts[idx-1] == "lib"; climb to parts[:idx-1] / "bin".
-            if idx >= 2 and parts[idx - 1] == "lib":
-                install_root = Path(*parts[:idx - 1])
-                candidate_dirs.append(install_root / "bin")
-        except ValueError:
-            pass
-
-        # Case 3: sibling of the real npm-cli.js. Lower priority because
-        # this shim sometimes doesn't run standalone, but it's the right
-        # answer for distros that ship `npm` as a bare executable
-        # (not the *-cli.js JavaScript shape).
-        candidate_dirs.append(real_npm.parent)
-
-    # Build final candidate list (with platform-specific suffixes).
-    candidates: list[Path] = []
-    seen: set[Path] = set()
-    for d in candidate_dirs:
-        for name in ("npx", "npx.cmd", "npx.ps1") if is_windows else ("npx",):
-            cand = d / name
-            if cand in seen:
-                continue
-            seen.add(cand)
-            candidates.append(cand)
-
-    for cand in candidates:
-        try:
-            if cand.is_file() and (is_windows or os.access(cand, os.X_OK)):
-                return str(cand)
-        except OSError:
-            continue
-    return None
+    """Wrapper — see vco_lib.npx_resolver.find_npx."""
+    return _npx_resolver.find_npx()
 
 
 def _find_npm() -> Optional[str]:
-    """Locate npm with fnm/nvm-style fallback. Mirror of :func:`_find_npx`.
-
-    Reserved for future use — the bundled-npm pin helpers cache npm at
-    module import time via ``_NPM_PATH``, but they could swap in this
-    resolver once we want runtime re-detection (e.g. for ``--update``
-    runs where the user installed Node mid-session). Today's call sites
-    don't need that, so this is a placeholder for symmetry.
-
-    Returns the absolute path to npm, or None if truly absent.
-    """
-    direct = shutil.which("npm")
-    if direct:
-        return direct
-    # No fallback heuristic for npm itself — if `npm` isn't on PATH,
-    # there's nothing to dirname-realpath off. Caller decides whether
-    # to surface an install hint or skip.
-    return None
+    """Wrapper — see vco_lib.npx_resolver.find_npm."""
+    return _npx_resolver.find_npm()
 
 
 # ---------------------------------------------------------------------------
@@ -23888,16 +23831,27 @@ def _install_playwright_browsers() -> None:
 
     Behaviour:
       - Skipped entirely if `VCT_SKIP_PLAYWRIGHT=1` is set in the env.
-      - Skipped if `npx` is not on PATH (the MCP can still lazy-install
-        when Node arrives later; we just warn).
+      - Skipped if `npx` is unresolvable — and in that case the MCP
+        CANNOT RUN AT ALL (see below).
       - Runs `npx -y @playwright/mcp@latest --version` to populate the
         npx cache (~few MB).
       - Runs `npx playwright install chromium` to fetch the Chromium
         binary (~150 MB).
 
     Non-fatal: any failure logs a warn event and prints a short notice,
-    but never aborts the install. The MCP can still lazy-install on
-    first invocation; the only cost is a one-time UX delay.
+    but never aborts the install.
+
+    v0.2.91 WP-D — the no-npx message was WRONG for four releases. It said
+    the MCP "will lazy-install when first invoked", but the registered entry
+    is ``{"command": "npx", "args": ["-y", "@playwright/mcp@latest"]}``: with
+    no npx there is nothing to invoke and therefore nothing to lazy-install
+    into. Claude Code shows "Failed to connect" and the user has no way to
+    learn why. The honest statement is "the MCP cannot spawn until npx
+    exists" — and the doctor phase at the end of this run emits
+    ``npx_missing_mcp_unspawnable`` so the fact reaches the ledger instead of
+    scrolling past in stdout. Only the CHROMIUM pre-cache is a genuine
+    lazy-install-later optimisation (the `--version` step above populates the
+    npx cache; the browser download can happen on first browser call).
     """
     print("[playwright] Pre-caching Playwright MCP + Chromium ... ",
           end="", flush=True)
@@ -23917,12 +23871,14 @@ def _install_playwright_browsers() -> None:
     npx_path = _find_npx()
     if not npx_path:
         print("SKIPPED (npx not found)")
-        print("  Node.js / npx not detected. Playwright MCP will")
-        print("  lazy-install when first invoked. Install Node.js 18+")
-        print("  to pre-cache: https://nodejs.org")
+        print("  Node.js / npx not detected. The Playwright MCP is registered")
+        print("  as `npx …`, so it CANNOT SPAWN until npx exists — Claude Code")
+        print("  will show it as 'Failed to connect'. Install Node.js 18+")
+        print("  (https://nodejs.org), then re-run this install.")
         _log_install_event("playwright", "skip",
                            "npx not on PATH and not adjacent to npm — "
-                           "MCP will lazy-install")
+                           "playwright MCP cannot spawn (doctor phase emits "
+                           "npx_missing_mcp_unspawnable)")
         return
 
     print("(this may take ~30s, ~150 MB)")

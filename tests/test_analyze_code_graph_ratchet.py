@@ -47,7 +47,17 @@ _ANALYZER = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 # primitive (``_delete_file_rows_exact``, ~105 lines incl. its banner) MOVED to
 # the same vco_lib module — the engine needs the same deleter, so one home. Net
 # 7363 -> 7361. Re-pinned DOWNWARD to the measured value.
-_ANALYZER_LINES_MAX = 7361
+#
+# v0.2.91 wave-3 (MAJOR-1): the analyzer needed a THIRD ledger operation — the
+# NARROW paired clear its two backend skip paths never had (both `return 0`
+# after re-emitting, so no retry dispatcher can infer success from the exit
+# code). Rather than grow the monolith, the whole deferral family moved to the
+# new `vco_lib/codegraph_deferrals.py` (both emitters + the clear); the
+# analyzer keeps three thin wrappers whose only analyzer-side knowledge is how
+# to read `code_vector_slot` / `code_model_id` off the EmbeddingService. Net
+# 7361 -> 7314 INCLUDING the new operation. Re-pinned DOWNWARD to the measured
+# value.
+_ANALYZER_LINES_MAX = 7314
 
 
 def _measure() -> int:

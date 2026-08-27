@@ -60,7 +60,9 @@ class ResolveUpstreamArgvTests(unittest.TestCase):
             argv = mermaid_proxy._resolve_upstream_argv()
         self.assertEqual(argv, ["/usr/bin/npx", "-y", "claude-mermaid@1.6.3"])
 
-    def test_missing_npx_exits_with_clear_stderr(self):
+    def test_missing_npx_and_npm_exits_with_clear_stderr(self):
+        # v0.2.91 WP-D: exit-1 now requires BOTH to be absent — with npm
+        # present the wrapper falls back to `npm exec` (see the test below).
         with _patch_manifest(), \
              mock.patch("shutil.which", return_value=None):
             from claude_mcp_servers.wrappers import mermaid_proxy
@@ -70,8 +72,30 @@ class ResolveUpstreamArgvTests(unittest.TestCase):
                     mermaid_proxy._resolve_upstream_argv()
             self.assertEqual(ctx.exception.code, 1)
             out = err.getvalue()
-            self.assertIn("npx not found", out)
+            self.assertIn("neither npx nor npm found", out)
             self.assertIn("nodejs.org", out)
+
+    def test_npm_exec_fallback_when_only_npm_present(self):
+        """v0.2.91 WP-D (report 5 item 1c). RED on c67ef888: the pre-fix
+        resolver was a bare ``shutil.which("npx")`` and exited 1 here, so an
+        fnm/nvm machine with npm-but-no-npx could not run the Mermaid MCP at
+        all even though ``npm exec`` is an equivalent invocation."""
+        # The npm path must live in a directory that does NOT exist, or the
+        # ladder's step-2 sibling probe ("<dirname npm>/npx") would find the
+        # real /usr/bin/npx on a developer machine and make this test's
+        # verdict depend on the host. Hermetic by construction.
+        fake_npm = "/nonexistent-vco-npx-test/bin/npm"
+
+        def _which(name):
+            return {"npm": fake_npm}.get(name)
+
+        with _patch_manifest(), mock.patch("shutil.which", side_effect=_which):
+            from claude_mcp_servers.wrappers import mermaid_proxy
+            argv = mermaid_proxy._resolve_upstream_argv()
+        self.assertEqual(
+            argv,
+            [fake_npm, "exec", "--yes", "--", "claude-mermaid@1.6.3"],
+        )
 
 
 # ─── Scoped-path validation ──────────────────────────────────────────────

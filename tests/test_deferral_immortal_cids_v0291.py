@@ -29,6 +29,7 @@ import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -340,6 +341,88 @@ class LauncherBinaryProbeTests(unittest.TestCase):
                 dp.ProbeContext(folder=self.folder, entry=None, extras={})
             )
         )
+
+    # ── v0.2.91 WP-D: the process scan is TRI-STATE ───────────────────────
+
+    def test_stale_probe_declines_when_the_process_scan_cannot_run(self):
+        """RED before WP-D: `_launcher_process_running` returned a plain bool
+        and answered ``False`` — "no launcher is running" — when the scan
+        itself could not be performed. The probe then RESOLVED an entry
+        describing real outstanding work, on evidence that did not exist.
+        Wave-2 accepted the residual because a later boot re-emits; "a later
+        boot fixes it" is not a reason to draw an unsupported conclusion."""
+        dp_orig = dp._process_scan_available
+        dp._process_scan_available = lambda: False
+        try:
+            self.assertIsNone(dp._launcher_process_running("vct-launcher"))
+            self.assertIsNone(
+                dp.launcher_binary_stale_still_applies(self._ctx()),
+                "scan-failed must keep the entry, never clear it",
+            )
+        finally:
+            dp._process_scan_available = dp_orig
+
+    def test_stale_probe_does_not_resolve_when_the_scanner_raises(self):
+        """The same guarantee, expressed WITHOUT naming the new helper — so it
+        red-proofs on behaviour, not on an attribute that did not exist yet.
+
+        On c67ef888 the scan's `except` swallowed the failure and returned
+        ``False`` ("nothing running"), and the probe RESOLVED. Now it declines.
+        """
+        with mock.patch(
+            "vco_lib.dist_binary_repair.scan_for_launcher_pid",
+            side_effect=OSError("process table unavailable"),
+        ):
+            self.assertIsNot(
+                dp.launcher_binary_stale_still_applies(self._ctx()), False,
+                "a failed process scan must never clear the entry",
+            )
+
+    def test_scan_availability_probes_the_right_tool_per_os(self):
+        import platform as _platform
+
+        seen: list[str] = []
+
+        def _which(name):
+            seen.append(name)
+            return None
+
+        with mock.patch("shutil.which", side_effect=_which):
+            dp._process_scan_available()
+        if _platform.system().lower().startswith("win"):
+            self.assertEqual(seen, ["tasklist"])
+        else:
+            self.assertEqual(seen, ["pgrep", "ps"])
+
+    def test_import_failure_in_the_scan_is_unknown_not_absence(self):
+        dp_orig = dp._process_scan_available
+        dp._process_scan_available = lambda: True
+        try:
+            with mock.patch.dict(
+                "sys.modules", {"vco_lib.dist_binary_repair": None},
+            ):
+                self.assertIsNone(dp._launcher_process_running("vct-launcher"))
+        finally:
+            dp._process_scan_available = dp_orig
+
+    def test_scan_available_still_distinguishes_running_from_absent(self):
+        """The tri-state must not collapse the OTHER way: with a usable
+        scanner, both real answers still come through."""
+        dp_orig = dp._process_scan_available
+        dp._process_scan_available = lambda: True
+        try:
+            with mock.patch(
+                "vco_lib.dist_binary_repair.scan_for_launcher_pid",
+                return_value=4242,
+            ):
+                self.assertIs(dp._launcher_process_running("vct-launcher"), True)
+            with mock.patch(
+                "vco_lib.dist_binary_repair.scan_for_launcher_pid",
+                return_value=None,
+            ):
+                self.assertIs(dp._launcher_process_running("vct-launcher"), False)
+        finally:
+            dp._process_scan_available = dp_orig
 
 
 class ProbeDispatchTests(unittest.TestCase):

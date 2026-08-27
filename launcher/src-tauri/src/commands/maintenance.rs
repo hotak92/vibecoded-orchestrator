@@ -110,6 +110,12 @@ pub struct McpRegistrationEntry {
     /// Command stored in the entry (or empty when absent). Surfaced so
     /// the GUI can render the path inline for diagnostics.
     pub command: String,
+    /// v0.2.91 WP-D — for an entry whose `command` is a BARE NAME (resolved
+    /// from Claude Code's spawn PATH at MCP-launch time, e.g. `npx`):
+    /// `Some(true)` it resolves, `Some(false)` it does NOT (the MCP can never
+    /// spawn), `None` not applicable (path-shaped command) or the probe could
+    /// not run. `None` never turns the badge yellow — positive evidence only.
+    pub command_resolvable: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,8 +131,18 @@ pub struct McpRegistrationStatusReport {
     /// default-orchestrator set per PR-23).
     pub entries: Vec<McpRegistrationEntry>,
     /// Overall: `green` (all registered + paths match), `yellow` (some
-    /// missing or path-mismatched), `red` (none registered).
+    /// missing, path-mismatched, or holding an unspawnable bare command),
+    /// `red` (none registered).
     pub badge: String,
+    /// v0.2.91 WP-D — `Some(true/false)` when the npx probe RAN, `None` when
+    /// it could not (no venv python, probe failed). Distinguishing the two is
+    /// the whole point: "npx is missing" and "I could not ask" must not render
+    /// the same way, because only the first is actionable.
+    pub npx_present: Option<bool>,
+    /// Absolute npx path when resolvable, else empty.
+    pub npx_path: String,
+    /// Human remediation line for the yellow-badge case (empty when green).
+    pub remediation: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +170,87 @@ pub struct RegistrationReport {
 /// `DEFAULT_MCP_NAMES ⊆ DEFAULT_MCP_ENTRY_NAMES` so this stays a subset
 /// rather than drifting into a 4th disagreeing catalog.
 const DEFAULT_MCP_NAMES: &[&str] = &["weaviate-kg", "search"];
+
+/// Bundled MCPs whose registered `command` is a BARE NAME resolved from PATH.
+///
+/// v0.2.91 WP-D. These are evaluated ONLY when the entry is actually present
+/// in `~/.claude.json` — `mermaid`/`excalidraw` are default-DISABLED per
+/// project and `playwright` may be legitimately absent, so their absence must
+/// never move the badge (the reason `DEFAULT_MCP_NAMES` excludes them). What
+/// DOES move the badge is a PRESENT entry whose command cannot be resolved:
+/// that MCP is registered, enabled, and structurally incapable of starting —
+/// the failure that went unseen for months in the field because nothing on any
+/// surface asked the question.
+const NPX_DEPENDENT_MCP_NAMES: &[&str] = &["playwright", "mermaid", "excalidraw"];
+
+/// Payload of `python -m vco_lib.npx_resolver --json`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct NpxProbePayload {
+    #[serde(default)]
+    npx_present: bool,
+    #[serde(default)]
+    npx_path: String,
+    #[serde(default)]
+    npm_present: bool,
+    #[serde(default)]
+    commands: HashMap<String, Option<String>>,
+}
+
+/// Resolve bare commands by SHELLING OUT to the Python resolver.
+///
+/// A>B>C, A-leg: `vco_lib/npx_resolver.py` is the ONE home of the npx
+/// resolution ladder (`which npx` → npm-sibling → realpath-sibling → fnm/nvm
+/// `<root>/bin`). Re-implementing four steps of filesystem archaeology in Rust
+/// would create exactly the cross-language mirror the modularity rule tells us
+/// to avoid — and it would drift the first time a fifth Node version manager
+/// needs a case. This runs at doctor/badge time (a GUI click or a status
+/// refresh), never on a hot path, so the ~100 ms interpreter start is free.
+///
+/// Returns `None` when the probe could not run at all (no venv python, spawn
+/// failure, unparseable output). The caller renders that as "unknown" and does
+/// NOT degrade the badge — a launcher that cannot find its own venv has a
+/// different problem, and guessing here would produce a false accusation.
+fn probe_bare_commands(install_root: &str, names: &[String]) -> Option<NpxProbePayload> {
+    if install_root.is_empty() {
+        return None;
+    }
+    let root = PathBuf::from(install_root);
+    // `resolve_venv_python`'s leg 2 probes the folder itself, so the `script`
+    // argument only needs to be a plausible in-tree path; the synthetic name
+    // below never has to exist.
+    let script = root.join(".claude").join("scripts").join("doctor-probe.py");
+    let py = crate::commands::kg_summary::resolve_venv_python(&root, &script)?;
+    // `.silent()` suppresses the Windows console flash (CREATE_NO_WINDOW).
+    let mut cmd = std::process::Command::new(py).silent();
+    cmd.arg("-m").arg("vco_lib.npx_resolver").arg("--json");
+    for name in names {
+        cmd.arg("--command").arg(name);
+    }
+    cmd.current_dir(&root);
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice::<NpxProbePayload>(&output.stdout).ok()
+}
+
+/// The one-line remediation the badge shows for an unspawnable bare command.
+///
+/// Mirrors `vco_lib.doctor._npx_remediation`'s two branches (npm present vs
+/// Node entirely absent). Kept SHORT here on purpose: the ledger entry the
+/// doctor emits carries the full command block, and this line's job is to
+/// point at it rather than to duplicate it.
+fn npx_remediation_line(npm_present: bool) -> String {
+    if npm_present {
+        "npx is not on PATH (npm is). Symlink npx from npm's bin dir, then \
+         reopen Claude Code — see UPDATE_DEFERRED.md."
+            .to_string()
+    } else {
+        "Node.js is not installed, so every npx-based MCP fails to spawn. \
+         Install Node.js 18+ (https://nodejs.org) and reopen Claude Code."
+            .to_string()
+    }
+}
 
 /// Resolve the install_root the same way `installer::get_known_install_path`
 /// does — app_state cache first, walking from the launcher binary second.
@@ -197,6 +294,142 @@ fn entry_resource_path(entry: &serde_json::Value) -> String {
     cmd.to_string()
 }
 
+/// Raw `command` string of an entry (NOT the resource path).
+///
+/// `entry_resource_path` deliberately falls back to `args[0]` when the command
+/// is not path-shaped — which for `{"command":"npx","args":["-y","@x/y"]}`
+/// yields `"-y"`. Useful for the path-match check, useless (and misleading)
+/// for the "can this bare name be resolved" question, hence this second,
+/// narrower accessor.
+fn entry_command(entry: &serde_json::Value) -> String {
+    entry
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Is `cmd` a filesystem path (vs a PATH lookup)? Mirrors
+/// `vco_lib.doctor.command_is_path` — must stay in step with it.
+fn command_is_path(cmd: &str) -> bool {
+    if cmd.is_empty() {
+        return false;
+    }
+    cmd.starts_with('/')
+        || cmd.starts_with("\\\\")
+        || (cmd.len() >= 2 && cmd.chars().nth(1) == Some(':'))
+        || cmd.contains('/')
+        || cmd.contains('\\')
+}
+
+/// Bare-name commands of the npx-dependent bundled MCPs that are PRESENT.
+pub(crate) fn bare_commands_to_probe(
+    servers: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in NPX_DEPENDENT_MCP_NAMES {
+        if let Some(entry) = servers.get(*name) {
+            let cmd = entry_command(entry);
+            if !cmd.is_empty() && !command_is_path(&cmd) && !out.contains(&cmd) {
+                out.push(cmd);
+            }
+        }
+    }
+    out
+}
+
+/// PURE view builder: entries + badge + remediation from the parsed servers
+/// map and (optionally) the resolver payload.
+///
+/// Extracted so the badge DECISION is unit-testable without Tauri state, a
+/// `~/.claude.json`, or a Python interpreter — the environment-probes-stubbed
+/// discipline. Every input is data.
+pub(crate) fn build_registration_view(
+    install_root: &str,
+    servers: &serde_json::Map<String, serde_json::Value>,
+    probe: Option<&NpxProbePayload>,
+) -> (Vec<McpRegistrationEntry>, String, String) {
+    let mut entries: Vec<McpRegistrationEntry> = Vec::new();
+    let mut present_count = 0usize;
+    let mut path_match_count = 0usize;
+
+    for name in DEFAULT_MCP_NAMES {
+        match servers.get(*name) {
+            Some(entry) => {
+                present_count += 1;
+                let path = entry_resource_path(entry);
+                let matches = !install_root.is_empty() && path.starts_with(install_root);
+                if matches {
+                    path_match_count += 1;
+                }
+                entries.push(McpRegistrationEntry {
+                    name: (*name).to_string(),
+                    present: true,
+                    path_matches_install: matches,
+                    command: path,
+                    command_resolvable: None,
+                });
+            }
+            None => entries.push(McpRegistrationEntry {
+                name: (*name).to_string(),
+                present: false,
+                path_matches_install: false,
+                command: String::new(),
+                command_resolvable: None,
+            }),
+        }
+    }
+
+    // The npx-dependent bundled MCPs join the list ONLY when present. Their
+    // absence is legitimate (default-disabled / not installed) and must never
+    // move the badge; their presence-with-an-unresolvable-command is the
+    // silent-death case this probe exists to expose.
+    let mut unspawnable = false;
+    for name in NPX_DEPENDENT_MCP_NAMES {
+        let Some(entry) = servers.get(*name) else {
+            continue;
+        };
+        let cmd = entry_command(entry);
+        let resolvable = if cmd.is_empty() || command_is_path(&cmd) {
+            None
+        } else {
+            probe.map(|p| p.commands.get(&cmd).map(|v| v.is_some()).unwrap_or(false))
+        };
+        if resolvable == Some(false) {
+            unspawnable = true;
+        }
+        entries.push(McpRegistrationEntry {
+            name: (*name).to_string(),
+            present: true,
+            // A bare-name command has no install-root path to match, so this
+            // flag is meaningless for these entries; report it as satisfied so
+            // it cannot drag the badge on its own.
+            path_matches_install: true,
+            command: cmd,
+            command_resolvable: resolvable,
+        });
+    }
+
+    let badge = if present_count == 0 {
+        "red"
+    } else if present_count < DEFAULT_MCP_NAMES.len()
+        || path_match_count < present_count
+        || unspawnable
+    {
+        "yellow"
+    } else {
+        "green"
+    };
+
+    let remediation = if unspawnable {
+        npx_remediation_line(probe.map(|p| p.npm_present).unwrap_or(false))
+    } else {
+        String::new()
+    };
+
+    (entries, badge.to_string(), remediation)
+}
+
 #[command]
 pub async fn mcp_registration_status(
     db: State<'_, Db>,
@@ -209,21 +442,20 @@ pub async fn mcp_registration_status(
         Ok(s) => s,
         Err(_) => {
             // File absent: every MCP is "missing".
-            let entries: Vec<McpRegistrationEntry> = DEFAULT_MCP_NAMES
-                .iter()
-                .map(|n| McpRegistrationEntry {
-                    name: n.to_string(),
-                    present: false,
-                    path_matches_install: false,
-                    command: String::new(),
-                })
-                .collect();
+            let (entries, _badge, _rem) = build_registration_view(
+                &install_root,
+                &serde_json::Map::new(),
+                None,
+            );
             return Ok(McpRegistrationStatusReport {
                 install_root,
                 claude_json_path,
                 claude_json_exists: false,
                 entries,
                 badge: "red".into(),
+                npx_present: None,
+                npx_path: String::new(),
+                remediation: String::new(),
             });
         }
     };
@@ -241,50 +473,25 @@ pub async fn mcp_registration_status(
         .cloned()
         .unwrap_or_default();
 
-    let mut entries = Vec::with_capacity(DEFAULT_MCP_NAMES.len());
-    let mut present_count = 0;
-    let mut path_match_count = 0;
-    for name in DEFAULT_MCP_NAMES {
-        match servers.get(*name) {
-            Some(entry) => {
-                present_count += 1;
-                let path = entry_resource_path(entry);
-                let matches = !install_root.is_empty() && path.starts_with(&install_root);
-                if matches {
-                    path_match_count += 1;
-                }
-                entries.push(McpRegistrationEntry {
-                    name: (*name).to_string(),
-                    present: true,
-                    path_matches_install: matches,
-                    command: path,
-                });
-            }
-            None => entries.push(McpRegistrationEntry {
-                name: (*name).to_string(),
-                present: false,
-                path_matches_install: false,
-                command: String::new(),
-            }),
-        }
-    }
+    // v0.2.91 WP-D: ask the Python resolver whether the bare commands VCO
+    // registered can actually be resolved. `None` = the probe could not run;
+    // the view then reports `command_resolvable: None` and leaves the badge
+    // alone rather than accusing a healthy install.
+    let to_probe = bare_commands_to_probe(&servers);
+    let probe = probe_bare_commands(&install_root, &to_probe);
 
-    let badge = if present_count == 0 {
-        "red"
-    } else if present_count < DEFAULT_MCP_NAMES.len()
-        || path_match_count < present_count
-    {
-        "yellow"
-    } else {
-        "green"
-    };
+    let (entries, badge, remediation) =
+        build_registration_view(&install_root, &servers, probe.as_ref());
 
     Ok(McpRegistrationStatusReport {
         install_root,
         claude_json_path,
         claude_json_exists: true,
         entries,
-        badge: badge.into(),
+        badge,
+        npx_present: probe.as_ref().map(|p| p.npx_present),
+        npx_path: probe.as_ref().map(|p| p.npx_path.clone()).unwrap_or_default(),
+        remediation,
     })
 }
 
@@ -1275,6 +1482,171 @@ mod tests {
 
     fn make_schema(classes: Vec<serde_json::Value>) -> serde_json::Value {
         serde_json::json!({ "classes": classes })
+    }
+
+    // ── v0.2.91 WP-D: npx / bare-command spawnability on the badge ───────
+    //
+    // Every case below feeds `build_registration_view` DATA — no
+    // ~/.claude.json, no Python interpreter, no Tauri state. The probe
+    // payload is the injected environment.
+
+    fn servers_from(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        v.as_object().cloned().unwrap_or_default()
+    }
+
+    fn healthy_defaults(root: &str) -> serde_json::Value {
+        serde_json::json!({
+            "weaviate-kg": {"command": format!("{}/.venv/bin/python", root)},
+            "search":      {"command": format!("{}/.venv/bin/python", root)},
+        })
+    }
+
+    fn probe_with(npx: Option<&str>, npm: bool) -> NpxProbePayload {
+        let mut commands = HashMap::new();
+        commands.insert("npx".to_string(), npx.map(|s| s.to_string()));
+        NpxProbePayload {
+            npx_present: npx.is_some(),
+            npx_path: npx.unwrap_or("").to_string(),
+            npm_present: npm,
+            commands,
+        }
+    }
+
+    #[test]
+    fn present_npx_entry_with_unresolvable_command_turns_badge_yellow() {
+        let root = "/opt/vco";
+        let mut servers = servers_from(healthy_defaults(root));
+        servers.insert(
+            "playwright".to_string(),
+            serde_json::json!({"command": "npx", "args": ["-y", "@playwright/mcp@latest"]}),
+        );
+        let probe = probe_with(None, true);
+        let (entries, badge, remediation) =
+            build_registration_view(root, &servers, Some(&probe));
+        assert_eq!(badge, "yellow", "an MCP that cannot spawn must not read green");
+        assert!(
+            remediation.contains("npx is not on PATH"),
+            "remediation must name the npm-present case: {remediation}"
+        );
+        let pw = entries.iter().find(|e| e.name == "playwright").unwrap();
+        assert_eq!(pw.command, "npx", "the BARE command, not args[0]");
+        assert_eq!(pw.command_resolvable, Some(false));
+    }
+
+    #[test]
+    fn resolvable_npx_entry_keeps_badge_green() {
+        let root = "/opt/vco";
+        let mut servers = servers_from(healthy_defaults(root));
+        servers.insert(
+            "playwright".to_string(),
+            serde_json::json!({"command": "npx", "args": ["-y", "@playwright/mcp@latest"]}),
+        );
+        let probe = probe_with(Some("/usr/bin/npx"), true);
+        let (entries, badge, remediation) =
+            build_registration_view(root, &servers, Some(&probe));
+        assert_eq!(badge, "green");
+        assert!(remediation.is_empty());
+        assert_eq!(
+            entries.iter().find(|e| e.name == "playwright").unwrap().command_resolvable,
+            Some(true),
+        );
+    }
+
+    #[test]
+    fn absent_npx_mcps_do_not_move_the_badge() {
+        // mermaid/excalidraw are default-DISABLED per project and playwright
+        // may be absent. Their absence is not a fault (the reason
+        // DEFAULT_MCP_NAMES excludes them) — only a PRESENT+unspawnable entry
+        // is.
+        let root = "/opt/vco";
+        let servers = servers_from(healthy_defaults(root));
+        let probe = probe_with(None, false);
+        let (entries, badge, remediation) =
+            build_registration_view(root, &servers, Some(&probe));
+        assert_eq!(badge, "green");
+        assert!(remediation.is_empty());
+        assert!(entries.iter().all(|e| e.name != "playwright"));
+    }
+
+    #[test]
+    fn probe_failure_is_unknown_and_never_accuses() {
+        // `None` payload = the resolver could not be run (no venv python,
+        // spawn failure). "I could not ask" must not render as "npx missing".
+        let root = "/opt/vco";
+        let mut servers = servers_from(healthy_defaults(root));
+        servers.insert(
+            "playwright".to_string(),
+            serde_json::json!({"command": "npx", "args": ["-y", "@playwright/mcp@latest"]}),
+        );
+        let (entries, badge, remediation) = build_registration_view(root, &servers, None);
+        assert_eq!(badge, "green", "an unrunnable probe must not degrade the badge");
+        assert!(remediation.is_empty());
+        assert_eq!(
+            entries.iter().find(|e| e.name == "playwright").unwrap().command_resolvable,
+            None,
+        );
+    }
+
+    #[test]
+    fn path_shaped_command_is_not_probed_as_a_bare_name() {
+        let root = "/opt/vco";
+        let mut servers = servers_from(healthy_defaults(root));
+        servers.insert(
+            "mermaid".to_string(),
+            serde_json::json!({"command": "/opt/vco/.venv/bin/python", "args": ["-m", "x"]}),
+        );
+        assert!(
+            bare_commands_to_probe(&servers).is_empty(),
+            "a path-shaped command is resolved by the OS, not by PATH",
+        );
+        let probe = probe_with(None, false);
+        let (entries, badge, _) = build_registration_view(root, &servers, Some(&probe));
+        assert_eq!(badge, "green");
+        assert_eq!(
+            entries.iter().find(|e| e.name == "mermaid").unwrap().command_resolvable,
+            None,
+        );
+    }
+
+    #[test]
+    fn missing_default_mcp_still_dominates_the_badge() {
+        // The pre-existing rules keep working: a missing weaviate-kg is
+        // yellow even when every npx entry is fine.
+        let root = "/opt/vco";
+        let servers = servers_from(serde_json::json!({
+            "search": {"command": format!("{}/.venv/bin/python", root)},
+            "playwright": {"command": "npx", "args": ["-y", "@playwright/mcp@latest"]},
+        }));
+        let probe = probe_with(Some("/usr/bin/npx"), true);
+        let (_entries, badge, _) = build_registration_view(root, &servers, Some(&probe));
+        assert_eq!(badge, "yellow");
+    }
+
+    #[test]
+    fn no_registered_mcps_is_red() {
+        let probe = probe_with(Some("/usr/bin/npx"), true);
+        let (_entries, badge, _) =
+            build_registration_view("/opt/vco", &serde_json::Map::new(), Some(&probe));
+        assert_eq!(badge, "red");
+    }
+
+    #[test]
+    fn command_is_path_matches_the_python_helper_shape() {
+        // Must stay in step with vco_lib.doctor.command_is_path — the two
+        // answer the same question on the two surfaces that ask it.
+        assert!(command_is_path("/usr/bin/python"));
+        assert!(command_is_path("C:\\Python\\python.exe"));
+        assert!(command_is_path("\\\\server\\share\\python.exe"));
+        assert!(command_is_path("./local/python"));
+        assert!(!command_is_path("npx"));
+        assert!(!command_is_path("node"));
+        assert!(!command_is_path(""));
+    }
+
+    #[test]
+    fn npx_remediation_line_distinguishes_npm_present() {
+        assert!(npx_remediation_line(true).contains("npm is"));
+        assert!(npx_remediation_line(false).contains("Node.js is not installed"));
     }
 
     // ── F-3 (v0.2.73): cross-catalog MCP-name agreement ──────────────────

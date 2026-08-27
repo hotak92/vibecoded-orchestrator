@@ -6660,6 +6660,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                        action='store_false',
                        help='Exclude the `.claude/` directory from analysis '
                             '(the launcher passes this for every non-root project).')
+    # v0.2.91 wave-3 (MAJOR-A): the LEDGER-root seam — see
+    # `_resolve_deferral_root`. Absent ⇒ resolution is exactly what it was.
+    parser.add_argument('--deferral-root', type=Path, default=None,
+                       help='Root of the UPDATE_DEFERRED.md ledger this run may emit '
+                            'into / clear (default: $VCT_ORCHESTRATOR_ROOT, else repo_path).')
     return parser
 
 
@@ -6913,11 +6918,14 @@ def main():
     #     the embed_* helpers would just emit `None` per call and produce
     #     a code graph with no vectors at all.
     install_root = Path(os.environ.get("VCT_ORCHESTRATOR_ROOT", "")).resolve() if os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip() else repo_path
+    # A SEPARATE axis from the config root above (MAJOR-A): ONE variable
+    # governs the emits below AND the clear on the success path.
+    deferral_root = _resolve_deferral_root(args.deferral_root, install_root)
     embedding_service: Optional[EmbeddingService] = None
     try:
         embedding_service = EmbeddingService.for_project(install_root)
     except NoEmbeddingBackendError as e:
-        _emit_code_graph_deferral_no_backend(install_root, e)
+        _deferral_op("emit_no_backend", deferral_root, e)
         print(f"⚠️  Code-graph analysis skipped: {e}", file=sys.stderr)
         print(
             "   See .claude/context/EMBEDDING_FAILURES.md + "
@@ -6927,7 +6935,9 @@ def main():
         return 0
 
     if not embedding_service.code_backend_ready():
-        _emit_code_graph_deferral_code_backend_down(install_root, embedding_service)
+        _deferral_op("emit_code_backend_down", deferral_root,
+                     embedding_service.code_vector_slot,
+                     embedding_service.code_model_id)
         print(
             f"⚠️  Code-graph analysis skipped: active code backend "
             f"(slot={embedding_service.code_vector_slot}, "
@@ -7229,6 +7239,10 @@ def main():
         # v0.2.82 (G6, WP-3 contract): one NORMATIVE provenance line at
         # successful run end (WP-3's launcher parser reads the last occurrence).
         _print_codegraph_provenance(embedding_service, repo_path)
+        # v0.2.91 wave-3 fix (MAJOR-1): the NARROW paired clear, at the only
+        # point that proves the walk actually happened. Mirrors
+        # `sync_knowledge_graph.py::_clear_sync_deferral_no_backend`.
+        _deferral_op("clear_backend_deferrals", deferral_root)
         return 0
 
     finally:
@@ -7256,105 +7270,40 @@ def _print_codegraph_provenance(
     )
 
 
-def _emit_code_graph_deferral_no_backend(install_root: Path, exc: Exception) -> None:
-    """Soft-fail deferral when NO embedding backend is reachable.
+# ── Deferral tenancy ───────────────────────────────────────────────────────
+#
+# The three ledger operations this script owns (both emitters + the paired
+# clear) live in ONE vco_lib module, `vco_lib.codegraph_deferrals`, and reach
+# it through the ONE guarded wrapper below — per the modularity rule the
+# analyzer ratchet enforces, and so the soft-fail guard has a single home.
 
-    Same pattern as the KG-sync deferral helper in sync_knowledge_graph.py
-    — writes ``<install_root>/.claude/context/UPDATE_DEFERRED.md`` so the
-    launcher / install.py surfaces the issue. Idempotent. Soft-fail on
-    any IO / import error. v0.2.91 WP-B: uses the LOCKED emitter
-    ``vco_lib.deferral_emit`` — the raw triplet it replaced was an UNLOCKED
-    read-modify-write from a subprocess that runs while install.py's own
-    deferral finalize is live.
+
+def _resolve_deferral_root(cli_root: Optional[Path], default_root: Path) -> Path:
+    """The ONE root this run emits into AND clears from (v0.2.91 MAJOR-A).
+
+    A caller that will RE-READ the ledger afterwards (`vco_lib.deferral_retry`)
+    pins it on argv; `default_root` answers a different question (where the
+    EmbeddingService config lives) and a retry inherits $VCT_ORCHESTRATOR_ROOT
+    from the session. Why that breaks: `vco_lib/codegraph_deferrals.py`.
+    No flag ⇒ `default_root` verbatim, so direct invocation is unchanged.
+    """
+    return Path(cli_root).resolve() if cli_root else default_root
+
+
+def _deferral_op(op: str, *args: object) -> None:
+    """Run ONE `vco_lib.codegraph_deferrals` operation. Never raises.
+
+    The import lives inside the try so a broken/absent vco_lib degrades to a
+    printed note instead of changing this script's exit code. `op` is
+    dispatched by name; every name is pinned against the module by
+    tests/test_codegraph_deferrals_v0291.py, so a typo cannot quietly turn a
+    ledger write into a no-op.
     """
     try:
-        from vco_lib.deferral_emit import DeferralEntry, emit
-        entry = DeferralEntry(
-            condition_id="code_graph_no_embedding_backend",
-            title="Code-graph analysis skipped: no embedding backend reachable",
-            detected=(
-                "analyze_code_graph.py could not reach any configured "
-                "embedding backend (CodeEmbed / Ollama / OpenAI). Error: "
-                f"{exc}"
-            ),
-            why_deferred=(
-                "Soft-fail policy: install must never block on transient "
-                "service unavailability. The code graph for this project "
-                "will be empty until the next analysis run succeeds. See "
-                "~/.claude/metrics/embedding_failures.jsonl for the "
-                "per-backend diagnostic written by EmbeddingService."
-            ),
-            command_to_apply=(
-                "# Restart embedding services then re-run analysis:\n"
-                "podman start vco_code_embed vco_ollama   # or: docker start ...\n"
-                ".claude/scripts/code-graph-analyze . --project <name>"
-            ),
-            severity="warning",
-            kg_node_refs=[
-                "knowledge/concepts/embedding-service-v0218.md",
-            ],
-        )
-        emit(install_root, entry)
-    except Exception as inner:
-        print(f"   (deferral emit failed: {inner})", file=sys.stderr)
-
-
-def _emit_code_graph_deferral_code_backend_down(
-    install_root: Path,
-    svc: "EmbeddingService",
-) -> None:
-    """Soft-fail deferral when the active CODE backend specifically is down.
-
-    Distinguishes from the no-backend-at-all case because a CodeEmbed
-    container can be down while Ollama is up (or vice-versa). The
-    deferral entry points at the right service to restart. Same
-    locked-emitter routing (v0.2.91 WP-B) as its sibling above.
-    """
-    try:
-        from vco_lib.deferral_emit import DeferralEntry, emit
-        slot = svc.code_vector_slot
-        model = svc.code_model_id
-        if "codesage" in slot:
-            service_hint = (
-                "CodeEmbed service (vco_code_embed container on port 11440)"
-            )
-            restart_cmd = "podman start vco_code_embed"
-        elif "openai" in slot:
-            service_hint = "OpenAI API"
-            restart_cmd = (
-                "# Check OPENAI_API_KEY is set and the key is valid:\n"
-                "# Preferences → Special Secrets → OpenAI → Re-check"
-            )
-        else:
-            service_hint = "Ollama (vco_ollama container on port 11435)"
-            restart_cmd = "podman start vco_ollama"
-
-        entry = DeferralEntry(
-            condition_id="code_graph_code_backend_unreachable",
-            title=f"Code-graph analysis skipped: {service_hint} not reachable",
-            detected=(
-                f"analyze_code_graph.py would write to slot '{slot}' "
-                f"(model: {model}), but the backend serving that slot is "
-                "currently unreachable. Refusing to proceed — a code graph "
-                "with empty vectors is worse than no code graph (search "
-                "would return all-zero scores)."
-            ),
-            why_deferred=(
-                "Soft-fail policy: never produce a degraded code graph. "
-                "Restart the service and re-run analysis."
-            ),
-            command_to_apply=(
-                f"{restart_cmd}\n"
-                ".claude/scripts/code-graph-analyze . --project <name>"
-            ),
-            severity="warning",
-            kg_node_refs=[
-                "knowledge/concepts/embedding-service-v0218.md",
-            ],
-        )
-        emit(install_root, entry)
-    except Exception as inner:
-        print(f"   (deferral emit failed: {inner})", file=sys.stderr)
+        from vco_lib import codegraph_deferrals
+        getattr(codegraph_deferrals, op)(*args)
+    except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
+        print(f"   (deferral {op} failed: {inner})", file=sys.stderr)
 
 
 if __name__ == '__main__':

@@ -171,6 +171,25 @@ class ResolveUpstreamArgvTests(unittest.TestCase):
             argv = excalidraw_proxy._resolve_upstream_argv()
         self.assertEqual(argv, ["/usr/bin/npx", "-y", "excalidraw-mcp-server@2.0.0"])
 
+    def test_registry_pin_falls_back_to_npm_exec(self):
+        """v0.2.91 WP-D: the dormant registry branch mirrors Mermaid's
+        npm-exec fallback, so the two wrappers cannot diverge the day the pin
+        flips back to a registry package. RED on c67ef888 (bare which(npx) →
+        SystemExit(1) with npm present)."""
+        fake_npm = "/nonexistent-vco-npx-test/bin/npm"
+
+        def _which(name):
+            return {"node": "/usr/bin/node", "npm": fake_npm}.get(name)
+
+        with _patch_manifest(_REGISTRY_PIN_MANIFEST), \
+             mock.patch("shutil.which", side_effect=_which):
+            from claude_mcp_servers.wrappers import excalidraw_proxy
+            argv = excalidraw_proxy._resolve_upstream_argv()
+        self.assertEqual(
+            argv,
+            [fake_npm, "exec", "--yes", "--", "excalidraw-mcp-server@2.0.0"],
+        )
+
     def test_missing_node_exits_with_clear_stderr(self):
         with _patch_manifest(_FILE_PIN_MANIFEST), \
              mock.patch("shutil.which", return_value=None):

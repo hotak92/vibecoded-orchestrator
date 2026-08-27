@@ -20,9 +20,10 @@ propagates here without any code change. Spawn command:
 
     npx -y claude-mermaid@<pinned-version>
 
-``npx`` resolution is cross-OS via :func:`shutil.which`, which handles
-``npx.cmd`` on Windows. If ``npx`` is missing we exit 1 with a clear
-message — the same posture as the install-time check.
+Node-CLI resolution goes through :mod:`vco_lib.npx_resolver` (v0.2.91): the
+fnm/nvm-aware npx ladder first, then ``npm exec --yes -- <pkg>@<ver>`` when
+npx is absent but npm is present, cross-OS (``npx.cmd`` on Windows included).
+Only when NEITHER resolves do we exit 1 with a clear message.
 
 Per-call enforcement
 --------------------
@@ -47,7 +48,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -63,12 +63,14 @@ except ImportError:  # pragma: no cover — script-mode invocation
 try:
     from vco_lib.bundled_versions import load_bundled_versions
     from vco_lib.diagram_paths import validate_scoped_path
+    from vco_lib.npx_resolver import package_run_argv
 except ImportError:  # pragma: no cover — script-mode invocation
     _here = Path(__file__).resolve().parent.parent.parent
     if str(_here) not in sys.path:
         sys.path.insert(0, str(_here))
     from vco_lib.bundled_versions import load_bundled_versions
     from vco_lib.diagram_paths import validate_scoped_path
+    from vco_lib.npx_resolver import package_run_argv
 
 
 logger = logging.getLogger(__name__)
@@ -184,19 +186,24 @@ def _resolve_upstream_argv() -> list[str]:
     """Build the spawn argv for claude-mermaid at the pinned version.
 
     Reads ``bundled_mcp_versions.toml`` so a pin bump auto-propagates.
-    Raises SystemExit(1) with a clear message if npx is missing — the
-    wrapper can't start without it.
-    """
-    npx = shutil.which("npx")
-    if npx is None:
-        sys.stderr.write(
-            "[mermaid_proxy] ERROR: npx not found on PATH. The Mermaid "
-            "wrapper MCP needs Node.js + npx to spawn the upstream "
-            "`claude-mermaid` package. Install Node.js 18+ "
-            "(https://nodejs.org) and reopen Claude Code.\n"
-        )
-        raise SystemExit(1)
 
+    v0.2.91 WP-D — npm-exec fallback. Previously this was a bare
+    ``shutil.which("npx")`` and an immediate ``SystemExit(1)``, so a machine
+    with npm but no npx (fnm/nvm installs where only ``node``/``npm`` were
+    symlinked onto PATH — the exact shape observed in the field) could not run
+    the Mermaid MCP at all, even though ``npm exec`` is an equivalent
+    invocation. Resolution now goes through ``vco_lib.npx_resolver``, which
+    carries the fnm/nvm ladder AND the ``npm exec --yes --`` fallback (same
+    precedent as ``scripts/build-bundled-launcher.sh``). Both absent still
+    exits 1 with a clear message.
+
+    This is VCO-owned WRAPPER code: nothing here touches the REGISTERED entry
+    shape in ``~/.claude.json``, so the third-party-preservation and
+    stale-detection fingerprints (which match on a bare ``"command": "npx"``)
+    are unaffected. Changing the registration is a separate, out-of-scope
+    decision precisely because it would fork those fingerprints in two
+    languages.
+    """
     try:
         pins = load_bundled_versions()
         spec = pins["npm"]["mermaid_mcp"]
@@ -209,7 +216,16 @@ def _resolve_upstream_argv() -> list[str]:
         )
         raise SystemExit(1)
 
-    return [npx, "-y", f"{package}@{version}"]
+    argv = package_run_argv(package, version)
+    if argv is None:
+        sys.stderr.write(
+            "[mermaid_proxy] ERROR: neither npx nor npm found on PATH. The "
+            "Mermaid wrapper MCP needs Node.js to spawn the upstream "
+            "`claude-mermaid` package. Install Node.js 18+ "
+            "(https://nodejs.org) and reopen Claude Code.\n"
+        )
+        raise SystemExit(1)
+    return argv
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────

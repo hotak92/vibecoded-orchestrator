@@ -180,7 +180,22 @@ _MAIN_SPAN_MAX = 1687
 # later change may spend: it is a whitespace character, and the next change to
 # install.py still has to justify itself against the "extract, don't grow"
 # rule. (+0 span.)
-_TOTAL_LINES_MAX = 24430
+#
+# v0.2.91 wave-3 (MINOR-5) — re-pinned DOWN to the measured 24386 (-44). TWO
+# components, both reductions:
+#   (1) -12: the wave-3 tree measured 24418 at the wave close (WP-D/E/H
+#       landed a net -12 against the 24430 pin without re-pinning; the ratchet
+#       was GREEN but carrying 12 lines of unearned headroom). Re-pinned per
+#       the "TOTAL: strict — measured exactly" contract, which forbids
+#       leaving slack a later change can spend without justifying itself.
+#   (2) -32: `_pid_is_alive_for_deferral`'s BODY moved to
+#       `vco_lib.deferral_probes.pid_is_alive` when the WP-H retry driver's
+#       single-instance guard became its second caller (one concern, one home
+#       — and one place to keep the Windows `os.kill(pid, 0)` footgun handled
+#       correctly). install.py keeps a 5-line delegating wrapper so the name's
+#       existing call sites + monkeypatch contract keep resolving.
+# ALL outside main() (+0 span).
+_TOTAL_LINES_MAX = 24386
 
 
 def _measure() -> tuple:

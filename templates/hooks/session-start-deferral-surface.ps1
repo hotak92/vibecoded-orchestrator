@@ -103,9 +103,22 @@ if not entries and md_path.exists():
 if not entries:
     sys.exit(0)
 
+# v0.2.91 WP-H: owed-work retry trigger. MUST MATCH the .sh sibling — and it
+# does so by CALLING the same vco_lib helper rather than mirroring its rule.
+owed = []
+try:
+    from vco_lib.deferral_retry import session_start_owed_check  # type: ignore
+
+    owed = session_start_owed_check(project)
+except Exception:
+    owed = []
+
 lines = ["", "Pending VCO update action(s) - %d deferred:" % len(entries)]
 for cid, title, sev, _cmd in entries:
     lines.append("  - [%s] %s: %s" % (sev, cid, title))
+if owed:
+    lines.append("  VCO is retrying in the background (backend permitting): "
+                 + ", ".join(owed))
 lines.append("  Details + apply commands: .claude/context/UPDATE_DEFERRED.md "
              "(run the command listed for each).")
 lines.append("")

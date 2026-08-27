@@ -37,8 +37,12 @@ launcher.
 from __future__ import annotations
 
 import json
+import os
+import platform
 import re
+import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -301,6 +305,8 @@ def launcher_binary_stale_still_applies(ctx: ProbeContext) -> Optional[bool]:
       * a launcher process is running                     → True (can't tell
         whether it is the new image; the launcher's own boot probe owns that
         call)
+      * the process SCAN itself failed                    → None (unknown —
+        v0.2.91 WP-D hardening; see :func:`_launcher_process_running`)
       * otherwise                                         → False (resolve)
 
     Why a Python-side clear is safe at all: the Rust emit is latched once per
@@ -309,7 +315,9 @@ def launcher_binary_stale_still_applies(ctx: ProbeContext) -> Optional[bool]:
     over-eager clear here costs at most one boot of silence, whereas the
     alternative — no Python-side clear — is the immortal-entry class this
     release exists to close. The canonical clear remains the launcher's boot
-    probe (``probe:rs:``-style, WP-F wiring).
+    probe (``probe:rs:``-style, WP-F wiring). That asymmetry justified a
+    RESIDUAL over-eager clear, never a systematic one — hence the scan is now
+    tri-state.
 
     Requires ``extras["dist_rel_dir"]``, ``extras["launcher_binary_name"]`` and
     ``extras["source_version"]``.
@@ -332,27 +340,104 @@ def launcher_binary_stale_still_applies(ctx: ProbeContext) -> Optional[bool]:
     if not _version_ge(on_disk, str(source_version)):
         return True
 
-    if _launcher_process_running(binary_name):
-        return True
-    return False
+    running = _launcher_process_running(binary_name)
+    if running is None:
+        return None
+    return True if running else False
 
 
-def _launcher_process_running(binary_name: str) -> bool:
-    """True when a launcher process is visible to the OS process scan.
+def _process_scan_available() -> bool:
+    """Can this machine's process table be scanned at all?
 
-    Delegates to the shared ``dist_binary_repair.scan_for_launcher_pid`` (which
-    already carries the tasklist/ps split) rather than growing a second process
-    scanner. That helper returns ``None`` both for "none running" and for "the
-    scan failed"; the conflation is acceptable HERE and only here, because the
-    caller's worst case is one over-eager clear that the launcher's next boot
-    re-emits (see :func:`launcher_binary_stale_still_applies`).
+    ``dist_binary_repair`` scans via ``tasklist`` (Windows) or ``pgrep``/``ps``
+    (POSIX). When NONE of those tools resolves, the scanner cannot distinguish
+    "no launcher is running" from "I could not look" — it returns an empty list
+    either way. Asking ``shutil.which`` first separates the two WITHOUT
+    duplicating the scanner or its output parsing (which stays in one home).
     """
+    if platform.system().lower().startswith("win"):
+        return shutil.which("tasklist") is not None
+    return shutil.which("pgrep") is not None or shutil.which("ps") is not None
+
+
+def _launcher_process_running(binary_name: str) -> Optional[bool]:
+    """Tri-state: is a launcher process visible to the OS process scan?
+
+    ``True`` a launcher is running · ``False`` provably none · ``None`` the
+    scan could not be performed.
+
+    Delegates the actual scan to ``dist_binary_repair.scan_for_launcher_pid``
+    (which carries the tasklist/ps split) rather than growing a second process
+    scanner. That helper is fail-SAFE FOR ITS OWN CALLER — a handoff must never
+    be armed against a hallucinated PID — so it collapses "none running" and
+    "the scan failed" into ``None``. A CLEAR probe reads that collapse the
+    wrong way round: it would treat an unusable process table as positive
+    evidence that nothing is running and resolve an entry describing real
+    outstanding work. v0.2.91 wave-2 review accepted that residual on the
+    grounds that the launcher's next boot re-emits; WP-D removes it instead,
+    because "a later boot fixes it" is not a reason to draw a conclusion the
+    evidence does not support. Positive evidence only, everywhere.
+    """
+    if not _process_scan_available():
+        return None
     try:
         from vco_lib.dist_binary_repair import scan_for_launcher_pid
 
         return scan_for_launcher_pid(binary_name) is not None
     except Exception:  # noqa: BLE001 — probe must never raise into the pass
+        return None
+
+
+def pid_is_alive(pid: int) -> bool:
+    """Cross-OS "is this PID still running" probe.
+
+    ONE home (v0.2.91 wave-3, MINOR-4): ``install.py``'s deferral re-probe
+    handlers and :mod:`vco_lib.deferral_retry`'s single-instance guard both
+    need it, and a second copy would be a second chance to get the Windows
+    footgun wrong. On Windows ``os.kill(pid, 0)`` is NOT a probe — any
+    non-CTRL signal value unconditionally ``TerminateProcess``-es the target —
+    so that branch goes via ``OpenProcess`` + ``GetExitCodeProcess``
+    (``STILL_ACTIVE == 259``). POSIX uses the conventional ``kill(pid, 0)``
+    errno dance.
+
+    Conservative on uncertainty: unknown → ``True`` (treat the process as
+    alive). Both callers want that direction — install.py KEEPS the deferral
+    entry rather than clearing it on a guess, and the retry driver DECLINES to
+    start a second seed rather than racing one it cannot see.
+    """
+    if pid <= 0:
+        return True  # unparseable / sentinel value — assume alive
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid,
+            )
+            if not handle:
+                return False  # no such process (or no access → likely gone)
+            try:
+                exit_code = ctypes.c_ulong()
+                ok = kernel32.GetExitCodeProcess(
+                    handle, ctypes.byref(exit_code),
+                )
+                return bool(ok) and exit_code.value == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001 — conservative fallback
+            return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
         return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    except OSError:
+        return True  # uncertain → conservative
 
 
 #: name → probe. Referenced from the registry as ``probe:py:<name>``.
@@ -492,6 +577,7 @@ __all__ = [
     "launcher_binary_stale_still_applies",
     "launcher_dist_still_dirty",
     "orchestrator_sidecars_still_present",
+    "pid_is_alive",
     "record_probe_resolution",
     "registry_probe_name",
     "resolvable_condition_ids",

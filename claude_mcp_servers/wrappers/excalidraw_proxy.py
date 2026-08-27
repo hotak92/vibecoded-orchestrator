@@ -40,7 +40,9 @@ This avoids:
 
 ``node`` resolution is cross-OS via :func:`shutil.which`, which handles
 ``node.exe`` on Windows. If ``node`` is missing we exit 1 with a clear
-message — same posture as the Mermaid wrapper's npx check.
+message. The dormant registry-pin branch resolves its runner through
+:mod:`vco_lib.npx_resolver` (npx ladder → ``npm exec`` fallback), mirroring
+the Mermaid wrapper so the two cannot drift.
 
 Per-call enforcement
 --------------------
@@ -98,12 +100,14 @@ except ImportError:  # pragma: no cover — script-mode invocation
 try:
     from vco_lib.bundled_versions import load_bundled_versions
     from vco_lib.diagram_paths import validate_scoped_path
+    from vco_lib.npx_resolver import package_run_argv
 except ImportError:  # pragma: no cover — script-mode invocation
     _here = Path(__file__).resolve().parent.parent.parent
     if str(_here) not in sys.path:
         sys.path.insert(0, str(_here))
     from vco_lib.bundled_versions import load_bundled_versions
     from vco_lib.diagram_paths import validate_scoped_path
+    from vco_lib.npx_resolver import package_run_argv
 
 
 logger = logging.getLogger(__name__)
@@ -258,14 +262,6 @@ def _resolve_upstream_argv() -> list[str]:
             raise SystemExit(1)
         return [node, str(entry)]
 
-    npx = shutil.which("npx")
-    if npx is None:
-        sys.stderr.write(
-            "[excalidraw_proxy] ERROR: npm-registry pin requires `npx` "
-            "on PATH but it was not found. Install Node.js 18+ or "
-            "switch back to a file: pin.\n"
-        )
-        raise SystemExit(1)
     version = spec.get("version", "")
     if not version:
         sys.stderr.write(
@@ -273,7 +269,20 @@ def _resolve_upstream_argv() -> list[str]:
             "in bundled_mcp_versions.toml::[npm.excalidraw_mcp].\n"
         )
         raise SystemExit(1)
-    return [npx, "-y", f"{package_pin}@{version}"]
+    # v0.2.91 WP-D: same resolution as the Mermaid wrapper — the fnm/nvm npx
+    # ladder, then `npm exec --yes --` when only npm is present. This branch is
+    # DORMANT today (the shipped pin is `file:`), and it is mirrored anyway so
+    # the two wrappers cannot diverge the day the pin flips back to a registry
+    # package — a divergence nobody would notice until that day.
+    argv = package_run_argv(package_pin, version)
+    if argv is None:
+        sys.stderr.write(
+            "[excalidraw_proxy] ERROR: npm-registry pin requires `npx` or "
+            "`npm` on PATH but neither was found. Install Node.js 18+ or "
+            "switch back to a file: pin.\n"
+        )
+        raise SystemExit(1)
+    return argv
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────

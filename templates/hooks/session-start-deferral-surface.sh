@@ -129,10 +129,29 @@ if not entries and md_path.exists():
 if not entries:
     sys.exit(0)
 
+# --- v0.2.91 WP-H: owed-work retry trigger -------------------------------
+# The containers hook (same SessionStart batch) has by now attempted to start
+# the embedding backend. If the ledger carries an `auto_retryable` condition,
+# hand it to the DETACHED driver: it re-probes the backend itself and does
+# nothing while it is still down, so this hook never waits and never guesses.
+# The rule lives in vco_lib (ONE home, shared with the .ps1 sibling).
+owed = []
+try:
+    from vco_lib.deferral_retry import session_start_owed_check  # type: ignore
+
+    owed = session_start_owed_check(project)
+except Exception:
+    owed = []
+
 # One concise line per entry — id + title + severity; NOT the full bodies.
 lines = ["", f"Pending VCO update action(s) — {len(entries)} deferred:"]
 for cid, title, sev, _cmd in entries:
     lines.append(f"  - [{sev}] {cid}: {title}")
+if owed:
+    lines.append(
+        "  VCO is retrying in the background (backend permitting): "
+        + ", ".join(owed)
+    )
 lines.append(
     "  Details + apply commands: .claude/context/UPDATE_DEFERRED.md "
     "(run the command listed for each)."

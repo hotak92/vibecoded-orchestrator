@@ -152,6 +152,21 @@ class RustMirrorStructureTests(unittest.TestCase):
         self.assertIn("literal_length(&b.pattern)", self.rust)
         self.assertIn(".cmp(&literal_length(&a.pattern))", self.rust)
 
+    def test_rust_tolerates_the_python_only_retry_action_key(self):
+        """v0.2.91 WP-H adds ``retry_action`` to some rows. Retries are
+        dispatched from PYTHON (one dispatcher, per the WP's own shape), so
+        the Rust mirror neither reads nor needs the key — it must simply
+        IGNORE it, exactly as it already ignores ``notes``.
+
+        The guard is structural: serde's `deny_unknown_fields` on
+        ``RawCondition`` would turn every retry-carrying row into a parse
+        error at launcher boot, silently disabling the whole registry on the
+        Rust side. Its ABSENCE is therefore load-bearing, not an oversight —
+        this test says so out loud so nobody "tightens" it later.
+        """
+        self.assertNotIn("deny_unknown_fields", self.rust)
+        self.assertIn("`notes` is documentation only", self.rust)
+
     def test_a_rust_parity_test_exists(self):
         self.assertTrue(
             RUST_PARITY_TEST.is_file(),

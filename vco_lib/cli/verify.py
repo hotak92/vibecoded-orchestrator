@@ -360,6 +360,29 @@ def _classify(pinned: str, installed: Optional[str]) -> str:
     return "drift"
 
 
+def _npm_pin_section(manifest: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The npm pin rows out of a bundled-versions document.
+
+    v0.2.91 WP-D. ``load_bundled_versions()`` returns the WHOLE document
+    (``{"npm": {"mermaid_mcp": …}, "chromium": {…}}``), but
+    :func:`_collect_pin_rows` wants the per-key pin map. Passing the document
+    straight through produced two phantom rows keyed ``npm`` and ``chromium``
+    with ``<missing-package-for-…>`` placeholders, classified as DRIFT — so
+    ``vco verify-pins`` could never exit 0 on a real install, and ``--fix``
+    would have called the installer with those non-keys.
+
+    Every existing test stubbed the FLAT shape that production does not
+    produce, which is why the mocks all agreed with each other and none of
+    them agreed with reality (the v0.2.46 lesson). Both shapes are accepted
+    here: a document with an ``npm`` table yields that table, a flat map is
+    returned unchanged.
+    """
+    npm = manifest.get("npm")
+    if isinstance(npm, Mapping):
+        return npm
+    return manifest
+
+
 def _collect_pin_rows(
     manifest: Mapping[str, Any], *, npm_path: Optional[str]
 ) -> list[_PinRow]:
@@ -490,7 +513,7 @@ def cmd_verify_pins(args: argparse.Namespace) -> int:
             print(msg, file=sys.stderr)
         return EXIT_DRIFT
 
-    rows = _collect_pin_rows(manifest, npm_path=npm_path)
+    rows = _collect_pin_rows(_npm_pin_section(manifest), npm_path=npm_path)
 
     # 3. Decide overall exit code.
     if npm_path is None:

@@ -138,6 +138,14 @@ _V0291_OWNED_ADDITIONS = frozenset({
     "hard_cut_performed",
     "kg_access_phantom_repaired",
     "launcher_binary_clobber_averted",
+    # WP-D: the doctor phase runs at the END of every install/update run, so
+    # its cid is re-detected exactly like any other install.py-emitted
+    # condition — installing Node makes the entry disappear on the next run
+    # with no dismissal. That is family A by construction, not a record-class
+    # exception: the emitter runs INSIDE the install.py run whose finalize
+    # rebuilds the ledger, and it emits into that run's own report (sink=),
+    # never behind finalize's back.
+    "npx_missing_mcp_unspawnable",
 })
 
 

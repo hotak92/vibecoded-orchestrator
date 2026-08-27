@@ -80,6 +80,25 @@
 #                       an aspiration — never write a probe name here that
 #                       does not exist.
 #
+# RETRY ACTIONS (the `retry_action` key) — v0.2.91 WP-H
+# -----------------------------------------------------
+#   retry:py:<handler>  The condition names OWED WORK VCO can re-attempt on
+#                       its own once the precondition returns (backend up).
+#                       `<handler>` must exist in
+#                       `vco_lib.deferral_retry.HANDLERS`; the dispatcher runs
+#                       it from the doctor pass and from the session-start
+#                       owed-work check, gated on POSITIVE precondition
+#                       evidence and capped at 3 attempts per folder.
+#                       ONLY `class = "auto_retryable"` rows may declare one —
+#                       the class IS the consent record (the loader rejects
+#                       the combination otherwise). A retry re-runs work the
+#                       user already asked for by installing; it never repairs
+#                       their machine and never touches a running binary
+#                       (decision #4).
+#                       Python-side only: the Rust mirror tolerates and
+#                       ignores this key (as it does `notes`), because a Rust
+#                       field would mean a second retry engine.
+#
 # DISMISS KEYS (the `dismiss_key` key) — generalized dismissal memory
 # ------------------------------------------------------------------
 # An ordered list of stable detected-state field NAMES. `vco_lib.deferral_dismissal`
@@ -336,6 +355,22 @@ owner = "install.py"
 clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
 
+[conditions.npx_missing_mcp_unspawnable]
+class = "action_required"
+owner = "vco_lib.doctor"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger", "gui_badge"]
+notes = """v0.2.91 WP-D. Registration writes `command = "npx"` unconditionally, \
+so on a machine without npx every npx-based MCP (playwright by default, \
+mermaid when enabled) fails to spawn and Claude Code shows only "Failed to \
+connect". install.py DETECTED this since v0.2.51 and answered it with a \
+stdout line claiming the MCP "will lazy-install when first invoked" — false, \
+there is nothing to lazy-install into. The doctor phase now emits this \
+instead. Owned/drop-when-absent: the doctor re-probes on every install/update \
+run, so installing Node makes the entry disappear by itself. The launcher's \
+registration badge renders the same fact (gui_badge) via \
+`python -m vco_lib.npx_resolver --json`."""
+
 [conditions.stale_mcp_entry]
 class = "action_required"
 owner = "vco_lib.install_mcp"
@@ -559,11 +594,17 @@ success path — the model `kg_sync_no_embedding_backend` copies in v0.2.91."""
 class = "auto_retryable"
 owner = "templates/scripts/sync_knowledge_graph.py"
 clear_probe = "paired-resolution"
+retry_action = "retry:py:kg_seed"
 emit_surfaces = ["ledger"]
 notes = """v0.2.91: the emitter finally routes through the LOCKED emitter \
 (vco_lib.deferral_emit) and the clear is paired at the NARROW home (decision \
 #12) — the end of a SUCCESSFUL tree sync, which proves the seed actually ran. \
-Retry machinery (re-run the owed seed when the backend returns) is WP-H."""
+WP-H makes the retry real: vco_lib.deferral_retry re-runs \
+`sync_knowledge_graph.py --all` (content-hash gated, so cheap and idempotent) \
+once the TEXT backend answers again. The script's own narrow clear is what \
+resolves the entry; the dispatcher only RECORDS that resolution, after \
+re-reading the ledger to confirm it happened (v0.2.91 wave-3: a zero exit is \
+not proof — this script's skip path exits 0 too)."""
 
 [conditions.codegraph_embed_resync_pending]
 class = "auto_retryable"
@@ -706,6 +747,25 @@ on that run's resume — its audit trail (the update_binary_clobber_averted row 
 plus the auto-resolutions.jsonl line) survives. Registry ownership is what gives \
 it that clean one-shot expiry (the `stale_unit_retired_` precedent extended to a \
 Rust-emitted record)."""
+
+[conditions.convergence_pending]
+class = "action_required"
+owner = "launcher/src-tauri/src/commands/convergence.rs"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = """v0.2.91 WP-E item 2 — the convergence engine's ONE deferral channel. \
+Emitted only when a boot pass ends with REAL pending work: a write tenant whose \
+DB write errored, a project whose rows could not be READ (positive-evidence \
+invariant: a failed read is never treated as absence, so the current defaults \
+are simply not applied), or a report-only tenant whose detector found drift. A \
+healthy pass emits nothing — the engine's report-only tenants that have no \
+detector yet contribute NOTHING rather than a standing "migration pending" FYI, \
+which is exactly the silt report 2 indicts. Paired resolution lives in the same \
+module (`convergence::settle_deferral`): a clean pass resolves the entry, and \
+that call is itself gated on the section actually being present in \
+UPDATE_DEFERRED.md so a converged install never spawns the settle helper. \
+Re-emitted on the next boot if the condition still holds, which is what makes \
+the self-clear safe."""
 
 [conditions.kg_access_phantom_repaired]
 class = "informational_record"
@@ -880,17 +940,33 @@ notes = "Bootstrap re-runs heal the DATA; the ledger row is a WP-H candidate."
 [conditions.code_graph_no_embedding_backend]
 class = "auto_retryable"
 owner = "templates/scripts/analyze_code_graph.py"
-clear_probe = "manual-dismiss"
+clear_probe = "paired-resolution"
+retry_action = "retry:py:code_graph_walk"
 emit_surfaces = ["ledger"]
-notes = """Sibling of kg_sync_no_embedding_backend. v0.2.91 WP-H owns pairing \
-its clear + retry (analyzer file, outside WP-B's edit set)."""
+notes = """Sibling of kg_sync_no_embedding_backend, and paired the same way. \
+The NARROW clear lives at the tenant: analyze_code_graph.py resolves this cid \
+(and its code-backend sibling) after a walk that completed and passed the \
+data-loss gates — `codegraph_deferrals.clear_backend_deferrals`. WP-H's retry re-runs \
+the analyzer `--incremental` (revision-gated; never \
+--force-recreate/--prune-stale) once a backend answers; the RESOLUTION is the \
+analyzer's own, never the retry's exit code. v0.2.91 wave-3 fixed the earlier \
+shape, which resolved on a zero exit: both skip paths in the analyzer exit 0 \
+after re-emitting this entry, so the retry deleted a row the child had just \
+written and logged "completed" for work that never ran."""
 
 [conditions.code_graph_code_backend_unreachable]
 class = "auto_retryable"
 owner = "templates/scripts/analyze_code_graph.py"
-clear_probe = "manual-dismiss"
+clear_probe = "paired-resolution"
+retry_action = "retry:py:code_graph_walk"
 emit_surfaces = ["ledger"]
-notes = "Same WP-H pairing audit as code_graph_no_embedding_backend."
+notes = """Same retry pairing as code_graph_no_embedding_backend (the analyzer \
+emits this one when the CODE backend specifically is down). The retry gate \
+asks `code_backend_ready()` — the analyzer's OWN predicate for this entry. \
+v0.2.91 wave-3 fixed the earlier gate, which merely CONSTRUCTED an \
+EmbeddingService: construction succeeds in exactly the state that emits this \
+condition (text backend up, code backend down), so every retry re-ran the \
+analyzer straight into its own skip path and burned an attempt."""
 
 [conditions.storage_migration_windows_manual]
 class = "action_required"
