@@ -15,6 +15,11 @@
   import { invoke, listen } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import Toast from '$lib/components/Toast.svelte';
+  // v0.2.91 WP-I (decision #6) — the GLOBAL deferral ledger lives here, on the
+  // page that already owns install-wide state (self-update, binary lag,
+  // protected paths). Per-project entries deliberately do NOT appear here;
+  // each project's ledger renders on its own Settings tab.
+  import DeferralLedgerPanel from '$lib/components/DeferralLedgerPanel.svelte';
 
   type UpdateStatus = {
     available: boolean;
@@ -449,6 +454,11 @@
         </button>
       </div>
     </section>
+
+    <!-- v0.2.91 WP-I: the orchestrator-ROOT deferral ledger. Clearly global:
+         it sits between the install's own update state and its protected
+         paths, and its own header + folder line name the scope. -->
+    <DeferralLedgerPanel scope="orchestrator_root" />
 
     <section class="upd-protected">
       <h2>Protected paths</h2>

@@ -11,6 +11,10 @@
   import ProjectSelector from './ProjectSelector.svelte';
   import UpdateBadge from './UpdateBadge.svelte';
   import NotificationBell from './NotificationBell.svelte';
+  // v0.2.91 WP-I: the orchestrator-ROOT deferral badge. Global chrome, so it
+  // counts the global ledger only — a project's own deferrals are badged on
+  // that project's Settings tab, never here (decision #6 UX rider).
+  import DeferralBadge from './DeferralBadge.svelte';
 
   // MenuBar is mounted from the root layout, so it renders on every route.
   // Top-level navigation moved to the left Sidebar; MenuBar now hosts:
@@ -130,9 +134,10 @@
     <ProjectSelector />
   </div>
 
-  <!-- Right: Notification bell + Tier badge + Update badge + Avatar -->
+  <!-- Right: Notification bell + Deferral badge + Tier badge + Update badge + Avatar -->
   <div class="menu-right">
     <NotificationBell />
+    <DeferralBadge />
     <UpdateBadge />
 
     <button

@@ -37,6 +37,14 @@ mod binding_reconcile;
 #[path = "commands/convergence.rs"]
 mod convergence;
 
+// v0.2.91 WP-I (decision #6): the deferral-ledger GUI backend — two
+// scope-explicit read commands, one dismissal command, and the boot doctor +
+// owed-work retry dispatch wired from `setup()` below. Declared via `#[path]`
+// for the same single-file-ownership reason as the two modules above; collapse
+// all three into `commands/mod.rs` when a cleanup wave owns that file.
+#[path = "commands/deferral_ledger.rs"]
+mod deferral_ledger;
+
 // v0.2.26: WebKitGTK pre-flight probe — public so main.rs (which is a
 // separate compilation unit from this lib) can call it before Tauri
 // init. Linux-only at the use site; the module's own `#![cfg(...)]`
@@ -845,6 +853,35 @@ pub fn run() {
                         outcome.staged, outcome.armed,
                     );
                 }
+            });
+
+            // v0.2.91 WP-D + WP-H, wired by WP-I: the cheap boot doctor pass,
+            // then the owed-work retry driver.
+            //
+            // `--scope boot` is the in-process-resolution + file-read subset
+            // (MCP spawnability, the deferral ledger itself) — it deliberately
+            // EXCLUDES binary freshness, which the Rust probe above answers
+            // from the RUNNING process version, a fact Python cannot see. Two
+            // implementations of one question would contradict each other.
+            //
+            // The doctor writes its findings into the deferral ledger; the WP-I
+            // panel renders them. The launcher itself emits NOTHING here — no
+            // event, no toast — so there is exactly one channel for these facts.
+            // Exit 1 (a problem was found) is a valid, expected outcome.
+            //
+            // Same BOOT DISCIPLINE as the probe above: `tauri::async_runtime::
+            // spawn`, never a bare `tokio::spawn`, and nothing blocks the
+            // `[vct] setup complete` marker.
+            tauri::async_runtime::spawn(async {
+                let root = match commands::installer::find_local_repo_root() {
+                    Ok(r) => r,
+                    Err(_) => {
+                        // Same no-clone case the freshness probe logs above;
+                        // not repeated here to keep boot output honest and thin.
+                        return;
+                    }
+                };
+                crate::deferral_ledger::run_boot_doctor_and_retries(root).await;
             });
 
             // v0.2.37 (Agent V37-E, 2026-05-27): consume the
@@ -3158,6 +3195,14 @@ pub fn run() {
             // automatically; the GUI button in McpMaintenanceSection
             // gives users a manual override.
             commands::maintenance::reload_mcps_sighup,
+            // v0.2.91 WP-I (decision #6): the deferral-ledger panel. TWO read
+            // commands, one per SCOPE — a per-project ledger and the
+            // orchestrator root's are separate surfaces on purpose, and the
+            // dismissal takes its scope explicitly so it can never act on the
+            // wrong folder. See `commands/deferral_ledger.rs`.
+            deferral_ledger::deferral_ledger_for_project,
+            deferral_ledger::deferral_ledger_for_root,
+            deferral_ledger::dismiss_deferral_entry,
             // Hub proxy (v1.1)
             commands::hub_proxy::hub_info,
             commands::hub_proxy::hub_list_apps,

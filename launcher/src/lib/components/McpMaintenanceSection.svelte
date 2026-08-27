@@ -16,15 +16,36 @@
   // SchemaMigrationModal and the legacy-collections cleanup.
 
   import { onMount } from 'svelte';
-  import { invoke } from '$lib/tauri';
+  import { invoke, safeInvoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import StaleMcpModal from '$lib/components/StaleMcpModal.svelte';
+  // v0.2.91 WP-I: two cross-links onto this page, because this is where a user
+  // looks when MCP rows seem wrong — the convergence engine's own deferral, and
+  // the durable retirement badge the engine writes onto retired rows.
+  import { selectedProject } from '$lib/stores/projects';
+  import { deferrals } from '$lib/stores/deferrals';
+  import { CID_CONVERGENCE_PENDING, findEntry } from '$lib/deferral-ledger';
+  // The page's decisions live in a plain .ts so they are unit-testable without
+  // jsdom (same split as codegraph-build-banner-logic.ts).
+  import {
+    isUserReEnabledAfterRetirement,
+    npxState,
+    retiredBadgeText,
+    retiredRows,
+    showsCannotSpawnTag,
+  } from '$lib/components/mcp-maintenance-logic';
 
   interface McpRegistrationEntry {
     name: string;
     present: boolean;
     path_matches_install: boolean;
     command: string;
+    // v0.2.91 WP-D: for an entry whose `command` is a BARE NAME resolved from
+    // Claude Code's spawn PATH (e.g. `npx`). `true` it resolves, `false` it
+    // does NOT (the MCP can never start), `null` not applicable (path-shaped
+    // command) or the probe could not run. `null` NEVER turns the badge yellow
+    // — positive evidence only.
+    command_resolvable: boolean | null;
   }
   interface McpRegistrationStatusReport {
     install_root: string;
@@ -32,6 +53,26 @@
     claude_json_exists: boolean;
     entries: McpRegistrationEntry[];
     badge: string;
+    // v0.2.91 WP-D: `true`/`false` when the npx probe RAN, `null` when it could
+    // not (no venv python, probe failed). "npx is missing" and "I could not
+    // ask" must not render the same way — only the first is actionable.
+    npx_present: boolean | null;
+    /** Absolute npx path when resolvable, else empty. */
+    npx_path: string;
+    /** One-line remediation for the yellow-badge case (empty when green). */
+    remediation: string;
+  }
+  // Mirrors `vct_launcher_core::db::project_mcp_servers::ProjectMcpServer`.
+  // The subset the logic module needs is typed there (`ProjectMcpServerView`);
+  // this is the full row as the Tauri command returns it.
+  interface ProjectMcpServer {
+    project_id: string;
+    mcp_name: string;
+    is_user_added: boolean;
+    source: string;
+    enabled: boolean;
+    command: string | null;
+    config: Record<string, unknown> | null;
   }
   interface RegistrationReport {
     claude_json_path: string;
@@ -63,6 +104,31 @@
 
   // PR-42: in-flight flag for the "Reload MCPs" button.
   let reloading = $state(false);
+
+  // v0.2.91 WP-I: retired MCP rows for the CURRENTLY SELECTED project. Scoped
+  // and labelled — a retirement lives on one project's row, so showing it
+  // without naming the project would be exactly the ambiguity decision #6's
+  // rider forbids. No project selected ⇒ the card does not render.
+  let retired = $state<ProjectMcpServer[]>([]);
+
+  const rootLedger = $derived($deferrals);
+  const convergenceEntry = $derived(
+    findEntry(rootLedger.view, CID_CONVERGENCE_PENDING),
+  );
+
+  async function refreshRetired() {
+    const projectId = $selectedProject?.id;
+    if (!projectId) {
+      retired = [];
+      return;
+    }
+    // Soft read: a project whose rows cannot be listed is not an MCP problem
+    // worth a toast on this page.
+    const rows = await safeInvoke<ProjectMcpServer[]>('list_project_mcp_servers', {
+      projectId,
+    });
+    retired = retiredRows(rows ?? []);
+  }
 
   async function refreshRegistration() {
     regLoading = true;
@@ -155,7 +221,22 @@
   }
 
   onMount(async () => {
-    await Promise.all([refreshRegistration(), refreshStale()]);
+    await Promise.all([
+      refreshRegistration(),
+      refreshStale(),
+      refreshRetired(),
+      // The convergence cross-link reads the ORCHESTRATOR-ROOT ledger through
+      // the shared store, so this page and the MenuBar badge can never show a
+      // different answer for the same file.
+      deferrals.refreshRoot(),
+    ]);
+  });
+
+  // Re-read retired rows whenever the selected project changes — the card is
+  // per-project and must never keep showing the previous project's rows.
+  $effect(() => {
+    void $selectedProject?.id;
+    void refreshRetired();
   });
 
   // Stale badge: green when zero, yellow when any exist. Stale entries
@@ -228,6 +309,29 @@
           install is registered.
         </p>
       {/if}
+
+      <!-- v0.2.91 WP-D: npx visibility. THREE states, three renderings —
+           collapsing "npx is missing" into "I could not ask" is the bug this
+           closes, because only the first is actionable. `null` says so
+           plainly and never accuses the machine of anything. -->
+      {#if npxState(regStatus) === 'present'}
+        <p class="mm-meta mm-meta-ok">
+          npx resolves: <code>{regStatus.npx_path}</code>
+        </p>
+      {:else if npxState(regStatus) === 'missing'}
+        <p class="mm-meta mm-meta-warn">
+          npx does not resolve — every npx-based MCP fails to spawn.
+        </p>
+      {:else}
+        <p class="mm-meta">
+          npx status unknown — the probe could not run (no orchestrator venv
+          python resolved). This is not evidence that npx is missing.
+        </p>
+      {/if}
+      {#if regStatus.remediation}
+        <p class="mm-meta mm-meta-warn">{regStatus.remediation}</p>
+      {/if}
+
       <ul class="mm-entry-list">
         {#each regStatus.entries as e (e.name)}
           <li class="mm-entry">
@@ -239,6 +343,19 @@
             {:else}
               <span class="mm-tag mm-tag-ok">OK</span>
             {/if}
+            <!-- v0.2.91 WP-D: a registered, enabled MCP whose bare command
+                 cannot be resolved is structurally incapable of starting.
+                 Only `false` earns the tag — `null` (not applicable, or the
+                 probe could not run) renders nothing, matching the badge's
+                 positive-evidence-only rule. -->
+            {#if showsCannotSpawnTag(e)}
+              <span
+                class="mm-tag mm-tag-err"
+                title="This MCP's command is a bare name that does not resolve on PATH — Claude Code cannot spawn it."
+              >
+                cannot spawn
+              </span>
+            {/if}
             {#if e.command}
               <code class="mm-entry-path">{e.command}</code>
             {/if}
@@ -247,6 +364,59 @@
       </ul>
     {/if}
   </article>
+
+  <!-- v0.2.91 WP-E/WP-I: the convergence engine's ONE deferral, surfaced where
+       MCP rows live. Renders ONLY when the orchestrator-root ledger actually
+       holds the entry — a converged install shows nothing here, which is the
+       point of the tiering (a standing "migration pending" FYI is the silt
+       this release removes). Scope is named: this is an INSTALL-wide
+       condition, not a fact about the selected project. -->
+  {#if convergenceEntry}
+    <article class="mm-card">
+      <header class="mm-card-h">
+        <span class="mm-badge mm-badge-yellow">pending</span>
+        <strong>Project MCP rows not converged (orchestrator root)</strong>
+      </header>
+      <p class="mm-meta">{convergenceEntry.detected}</p>
+      <p class="mm-meta">
+        Full entry + Dismiss: Preferences → Updates → Pending actions.
+      </p>
+    </article>
+  {/if}
+
+  <!-- v0.2.91 WP-E/WP-I: retired MCP rows for the SELECTED project. A
+       retirement is `enabled = 0` plus a durable badge — never a deletion — so
+       a user who deliberately re-enables one keeps it. The card exists so a
+       disabled row is explainable instead of mysterious. -->
+  {#if $selectedProject && retired.length > 0}
+    <article class="mm-card">
+      <header class="mm-card-h">
+        <span class="mm-badge mm-badge-gray">{retired.length} retired</span>
+        <strong>Retired MCPs — project “{$selectedProject.name}”</strong>
+      </header>
+      <p class="mm-meta">
+        These rows were retired by the convergence pass: disabled and badged,
+        never deleted. Re-enabling one from the project's MCP toggles sticks —
+        the pass will not retire it again.
+      </p>
+      <ul class="mm-entry-list">
+        {#each retired as r (r.mcp_name)}
+          <li class="mm-entry">
+            <code class="mm-entry-name">{r.mcp_name}</code>
+            <span class="mm-tag mm-tag-warn">{retiredBadgeText(r)}</span>
+            {#if isUserReEnabledAfterRetirement(r)}
+              <span
+                class="mm-tag mm-tag-ok"
+                title="You re-enabled this after it was retired — the convergence pass leaves it alone."
+              >
+                re-enabled by you
+              </span>
+            {/if}
+          </li>
+        {/each}
+      </ul>
+    </article>
+  {/if}
 
   <!-- Stale entries card -->
   <article class="mm-card">

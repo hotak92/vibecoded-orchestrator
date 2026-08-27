@@ -34,6 +34,13 @@
   import ActiveEmbeddingPicker from '$lib/project-state/ActiveEmbeddingPicker.svelte';
   // v0.2.71 T-B-flags — per-project dual-write + dual-log toggles.
   import DualWriteFlagsPanel from '$lib/project-state/DualWriteFlagsPanel.svelte';
+  // v0.2.91 WP-I (decision #6) — THIS project's deferral ledger. Scope-locked:
+  // the panel reads only this project's folder, and the orchestrator-root
+  // ledger renders on its own global surface (Preferences → Updates), never
+  // here. The Bundle section below already tells users their preserved-file
+  // entries land in UPDATE_DEFERRED.md; this panel is where they read and
+  // clear them without leaving the launcher.
+  import DeferralLedgerPanel from '$lib/components/DeferralLedgerPanel.svelte';
 
   let { projectId }: { projectId: string } = $props();
 
@@ -351,7 +358,15 @@
       >
         {updating ? 'Updating bundle…' : 'Update bundle'}
       </button>
+      <p class="ps-hint">
+        Preserved files and every other deferred condition for THIS project are
+        listed in the panel below — read them, run the exact command, or dismiss
+        an entry that no longer applies.
+      </p>
     </section>
+
+    <!-- v0.2.91 WP-I: per-project ledger. Scope-locked to this project. -->
+    <DeferralLedgerPanel scope="project" {projectId} />
 
     {#key pickerReloadNonce}
       <ActiveEmbeddingPicker {projectId} onModelSwitch={handleModelSwitch} />
