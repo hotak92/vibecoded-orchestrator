@@ -85,7 +85,7 @@ VCO sits on top of Claude Code rather than replacing your AI assistant. The comp
 | Persistent memory across sessions | No | Yes (Copilot Memory, repo-scoped, 28-day expiry) | Partial (team memory) | Partial (session-bound) | No | No | No | **Yes (KG, no expiry)** |
 | Code graph (AST, callers, APIs) | Partial (file index, opaque) | Partial (vector index) | Yes (Context Engine) | Yes | No | Yes (repomap) | Partial (Tree-sitter, not persisted) | **Yes (persisted graph)** |
 | Bring your own LLM subscription | Partial (chat only) | No | Partial (BYO agent, not LLM) | No | Yes (OpenAI) | Yes (75+ providers) | Yes (30+ providers) | **Yes (Claude)** |
-| User-extensible (hooks / agents / skills) | Yes (hooks + skills, no marketplace) | No | Limited (MCP only) | No | Limited (skills as prompts) | Yes (open source) | Yes (open source) | **Yes (45 hooks, 53 skills, 44 agents)** |
+| User-extensible (hooks / agents / skills) | Yes (hooks + skills, no marketplace) | No | Limited (MCP only) | No | Limited (skills as prompts) | Yes (open source) | Yes (open source) | **Yes (46 hooks, 53 skills, 44 agents)** |
 | Pricing model | $20/mo SaaS | $10–20/user/mo | BYOA + cloud compute | $20/mo + usage | Per-token OpenAI | Free + your LLM | Free + your LLM | **Free + your Claude sub; €19/mo Pro** |
 | Polished v1 product (vs. alpha) | Yes | Yes | Yes | Yes | Yes | Yes | Yes | **No — alpha** |
 
@@ -136,7 +136,7 @@ Each task gets a status banner on the project page (`pending` / `running` / `fai
 
 - **Knowledge Graph** — Obsidian-style markdown nodes with typed WikiLinks, indexed in Weaviate via qwen3 embeddings (1024-dim, local). Optional OpenAI embeddings.
 - **Code Graph** — per-language structural analysis across 10+ languages, populating `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction` collections. Call edges (`callers` / `path` queries) come from Python's `ast`; installing the optional `codegraph-ts` extra (`pip install '.[codegraph-ts]'`, opt out at install with `VCT_SKIP_CODEGRAPH_TS=1`) adds tree-sitter grammars so call edges extend to rust, go, javascript, typescript, java, c#, c/c++, ruby, lua, and bash. Without the extra those languages simply get no call edges (the rest of the graph is unaffected).
-- **45 automation hooks** — context injection on prompt submit, KG/code-graph auto-sync on file edit, credential scans, compaction-preserving context replay, security checks. 43 are event-registered in `settings.json`; 2 more (`kg-sync-on-edit`, `code-graph-incremental`) run as helpers invoked by sibling hooks. Every hook ships as `.sh` (Linux/macOS) with a native `.ps1` sibling (Windows). The `vct-hub` background service resolves per-project config for hooks, MCPs, and scripts.
+- **46 automation hooks** — context injection on prompt submit, KG/code-graph auto-sync on file edit, credential scans, compaction-preserving context replay, security checks. 44 are event-registered in `settings.json`; 2 more ship unwired — `code-graph-incremental` is invoked by `post-file-edit` rather than registered, and `kg-sync-on-edit` is an opt-in single-purpose hook superseded by that same auto-sync. Every hook ships as `.sh` (Linux/macOS) with a native `.ps1` sibling (Windows). The `vct-hub` background service resolves per-project config for hooks, MCPs, and scripts.
 - **MCP servers (default install)** — 4 registered in `~/.claude.json` at install: `weaviate-kg` (semantic + graph search + code graph) and `search` (academic papers via OpenAlex + arXiv) are **enabled by default per project**; `mermaid` and `excalidraw` are **registered but default-disabled** — connected in `claude mcp list`, tools not callable until you opt in via the launcher's Diagrams tab. A fifth MCP — `playwright` — is **enabled by default**, invoked via `npx -y @playwright/mcp@latest` (pre-cached at install; opt out with `VCT_SKIP_PLAYWRIGHT=1`). That entry needs `npx` resolvable on PATH: without Node.js installed it cannot spawn at all, and Claude Code reports only "Failed to connect". `vco doctor` (and the launcher's MCP registration badge) names that case explicitly. All local, no per-tool API keys. Ollama (Weaviate vectorizer + embedding fallback) and the code-embedding FastAPI service on port 11440 are backend infrastructure, not MCPs.
 - **Secrets primitive** — OS-keychain storage (launcher-managed) plus a chmod-600 file store under `~/.vct-secrets/`, resolved through the `vct` CLI and the `vct-hub` service. Agents inject credentials into child processes by key name (`vct exec --secret KEY=ENV_VAR -- cmd`) instead of printing them; a hook blocks env-grepping for tokens. See [`docs/VCT_SECRETS_PRIMITIVE.md`](docs/VCT_SECRETS_PRIMITIVE.md).
 - **44 agents + 53 skills** — shipped via `install.py` templates. Agents handle planning, coding, testing, doc maintenance, KG navigation, code-graph health. Skills cover security review, debugging, architecture, RAG advisory, accessibility, etc.
@@ -226,7 +226,7 @@ Non-interactive / CI: `python install.py --quiet --no-containers`
 ```
 vibecoded-orchestrator/
 ├── .claude/
-│   ├── hooks/                 # 45 automation hooks (.sh + .ps1 per hook)
+│   ├── hooks/                 # 46 automation hooks (.sh + .ps1 per hook)
 │   ├── scripts/               # CLI tools for KG and code graph
 │   └── settings.json          # Claude Code configuration
 ├── claude_mcp_servers/
@@ -253,7 +253,7 @@ The whole repository is AGPL-3.0. The codebase you see here is the Free tier —
 
 | Tier            | Price                | What you get                                                                                  |
 |-----------------|----------------------|-----------------------------------------------------------------------------------------------|
-| **Free**        | €0                   | Full orchestrator: KG, code graph, 45 hooks, 44 agents, 53 skills, all default MCP servers (see [Under the hood](#under-the-hood)). AGPL-3.0. |
+| **Free**        | €0                   | Full orchestrator: KG, code graph, 46 hooks, 44 agents, 53 skills, all default MCP servers (see [Under the hood](#under-the-hood)). AGPL-3.0. |
 | **Pro**         | €19/month            | Free + RL-scored retrieval reranking module. Modules ship as separate signed binaries via the launcher. |
 | **Enterprise**  | Contact us           | Free + commercial AGPL exemption, priority support, custom SLAs. [team@vibecodedtools.com](mailto:team@vibecodedtools.com) |
 

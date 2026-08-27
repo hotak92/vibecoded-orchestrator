@@ -1,6 +1,6 @@
 # Agents, Skills & Hooks
 
-The Claude Code automation surface: 44 bundled agents, 53 skills, and 45 hooks (43 event-registered in the default `.claude/settings.json`; 2 invoked by sibling hooks rather than registered). Templates in `templates/agents/` and `templates/skills/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
+The Claude Code automation surface: 44 bundled agents, 53 skills, and 46 hooks (44 event-registered in the default `.claude/settings.json`; 2 invoked by sibling hooks rather than registered). Templates in `templates/agents/` and `templates/skills/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
 
 For the MCP servers that agents use → see [02-mcps-and-agents.md](02-mcps-and-agents.md).
 
@@ -204,7 +204,7 @@ Skills are smaller and lighter than agents — they're injected into context as 
 
 ## Hooks (`.claude/hooks/`)
 
-31 shell scripts (with `.ps1` Windows siblings) that fire at well-defined points in the Claude Code lifecycle (`SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`, etc.). Most are wired in the default `.claude/settings.json`; `code-graph-incremental.sh` ships but is not wired. Two project-wide invariants: every hook checks `VCT_DISABLE_HOOKS=1` as its first action (so you can disable all automation in one shell), and every hook scrubs `SUPABASE_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, AWS credentials, and similar before spawning any subprocess.
+46 shell scripts (with `.ps1` Windows siblings) that fire at well-defined points in the Claude Code lifecycle (`SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`, etc.). 44 are wired in the default `.claude/settings.json`; two ship unwired — `code-graph-incremental.sh`, invoked by `post-file-edit.sh` rather than registered, and `kg-sync-on-edit.sh`, an opt-in single-purpose hook superseded by that same auto-sync (see the note at the end of this section). Two project-wide invariants: every hook checks `VCT_DISABLE_HOOKS=1` as its first action (so you can disable all automation in one shell), and every hook scrubs `SUPABASE_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, AWS credentials, and similar before spawning any subprocess.
 
 Hook input contract (PR #176, 2026-05): hooks receive their event payload as JSON on stdin per Claude Code v2.1.x spec. `session_id`, `tool_name`, and other fields are read from stdin via `python -c 'import json,sys; d=json.loads(sys.stdin.read()); ...'`. Positional args (`$1`, `$2`) are present for backward compatibility but are empty when invoked by Claude Code v2.1.x.
 
@@ -306,6 +306,27 @@ Spawn a background Haiku agent to review the commit diff and update relevant KG 
 
 ### `post-tool-security.sh` — PostToolUse Edit|Write (background)
 Scan written files for accidentally included credentials. Non-blocking; alerts logged to `.claude/logs/credential_alerts.jsonl` with desktop notification.
+
+### `post-mcp-retrieval-record.sh` — PostToolUse `mcp__weaviate-kg__hybrid_search|mcp__weaviate-kg__semantic_graph_search|mcp__weaviate-kg__search_code_graph` (v0.2.91)
+Records what an **explicit** retrieval already put in the context window, into the same per-session stores the injecting hooks consult (the inject-dedup store and the explicit-reads ledger), so the pre-edit / pre-bash injectors stop re-showing it.
+
+<details>
+<summary>Details</summary>
+
+Before v0.2.91 the session had two suppression channels — things the *hooks* injected, and files the model *Read* — and results the model deliberately fetched with an MCP retrieval call were recorded in neither. A node an agent had just pulled on purpose could be re-injected minutes later by `pre-edit-context-inject`.
+
+The safety rule is "suppress only what is provably in context, byte-for-byte", never "the model saw this node":
+
+- **KG results** record the injector's own per-chunk key `<title>#<sha1(body)[:12]>`, computed from the same body text `rl_kg_search.py --hook-format` would have printed for that entry *at that tier*. Retrieving the same node later at a different tier yields a different body, a different hash, and the block still injects — correct, because that is new content.
+- The hashed body is **trailing-newline-normalized on both sides** (`vco_seen_normalize_body` / `Get-VcoSeenNormalizedBody` in the seen-store, `normalize_block_body` in the recorder): trailing newlines collapse to exactly one, and an empty body stays empty. How many a rendered block actually carries is a function of *where in the blob it sits*, not of its content — the producer's `print(body)` emits an extra empty line for a body that already ends in `\n`, and the injector's `KG_RESULT="$(…)"` capture strips it back off for the LAST block only. Content `"x\n"` therefore reassembles as `"x\n\n"` in a non-final block and `"x\n"` in a final one, and the recorder cannot know a result's eventual position. Normalizing on both sides makes the key a function of the content alone; verified byte-identical three ways (bash filter, PowerShell filter, Python recorder) across every block position.
+- **KG results carrying `coverage: "complete"`** (the formatter's explicit all-chunks-returned marker) additionally write the node's source path into the reads-ledger, so any chunk of that node is suppressed. Sound only because the whole node is demonstrably in context; a partial view never does this.
+- **Code results** record the entity's `full_name`, and only when the result carried `function_body` / `class_body` (the untruncated top tier). A metadata-only "ref" entry records nothing — the model saw a name, not the code.
+
+Everything else records nothing: a `titles`-detail search, a truncated middle tier, a connected-node stub. Over-suppression silently costs the model context, which is strictly worse than a duplicate injection.
+
+Both OS flavours shell out to one shared implementation, `templates/scripts/mcp_retrieval_record.py` — all parsing and key derivation live there rather than being mirrored into PowerShell (CLAUDE.md "share, don't mirror, cross-language logic", option A). The hook never blocks, never writes to stdout (PostToolUse output would land in the transcript), and soft-fails everywhere: a parse failure records nothing.
+
+</details>
 
 ### `config-change-audit.sh` — ConfigChange (background)
 Log all settings.json changes to `.claude/logs/config_changes.jsonl` for audit trail.

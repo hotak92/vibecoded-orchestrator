@@ -260,6 +260,18 @@ Full ingestion pipeline: (1) chunk content to 800–2000 tokens, (2) store chunk
 ### Retrieval telemetry for RL training
 Every ranked-retrieval path (MCP `hybrid_search` / `semantic_graph_search` / `search_code_graph`, the pre-edit / pre-bash / subagent hook KG searches, and the `kg-search` / `code-graph-query` CLIs) emits an RL telemetry event through one chokepoint and POSTs it to the local `vct-hub`, which is the single writer of the `rl_events` table in `launcher.db`. The legacy JSONL sink under `~/.claude/retrieval_rl_data/` is frozen and no longer written. What each event carries, the dual-embedding gates, and the privacy posture are documented in [`TELEMETRY.md`](../TELEMETRY.md#rl-retrieval-telemetry--what-is-collected-and-what-it-means).
 
+#### Retention: archive-then-delete (v0.2.91)
+
+`rl_events` rows older than `RL_EVENTS_RETENTION_MAX_AGE_DAYS` (default 90) are pruned by `claude_mcp_servers/rl_client/rl_retention.py`, executed hub-side. Until v0.2.91 that prune deleted permanently; it now **archives before it deletes**, and there is no no-archive code path:
+
+1. Victim rows are selected, completing whole `task_id` groups so a retrieval and its citation never separate, oldest-first and capped at `RL_EVENTS_PRUNE_MAX_TASKS_PER_PASS` groups (default 500) — which is what makes the prune incremental rather than a single gigabyte-scale materialization.
+2. They are written to a gzip-JSONL sidecar, fsynced, and re-read to verify before anything is deleted. A failed archive of any kind aborts the prune with an error and deletes nothing.
+3. Only then does the `DELETE` run, and the sidecar is published (renamed off its `.pending` suffix). Readers skip `.pending` files by construction.
+
+Archives land in `$RL_EVENTS_ARCHIVE_DIR`, else `<VCT_STATE_DIR or ~/.vct>/rl_archive` — resolved hub-side, never from a request body, because a caller-supplied path would be an arbitrary-write surface on an authenticated localhost route and deletion authority must not depend on a caller remembering to name an archive.
+
+Each line is in **hub-row shape**: field-for-field the `RlEventOut` the hub's `GET` returns, with `payload_json` carried verbatim as a string, so an archived row round-trips byte-for-byte. Read archives back with `python -m vco_lib.rl_archive` (or `vco_lib.rl_archive.iter_archived_rows` in-process). It **excludes quarantined rows by default** — `include_quarantined=False`, CLI flag `--include-quarantined` — mirroring the trainer's `GET` (`rl_events_api.rs::list_events`' `include_quarantined.unwrap_or(false)`, pinned by a parity test). Archiving a quarantined row is correct, since nothing is ever dropped; serving one to a trainer by default is not, and the oldest slice archived first is exactly where a poisoned era lives. `archive_report()` reports `quarantined_rows` alongside the totals, so an operator can see both what was preserved and what a default training read actually sees.
+
 ### `KG_BASE_DIR` env var
 When set, all path resolution (node writes, `kg-sync`, hook auto-sync) uses this as the project root. Enables using the same MCP server config across multiple projects — the KG collection in Weaviate is still distinguished by `KG_COLLECTION`.
 

@@ -46,9 +46,11 @@ pip install -r requirements.txt -r requirements-dev.txt
 
 Run tests:
 ```bash
-pytest                             # Python suite
+PYTHONPATH="$PWD" pytest           # Python suite — see the shadow trap below
 bash scripts/test-keychain-safe.sh # Rust workspace battery
 ```
+
+The `PYTHONPATH="$PWD"` prefix is not decoration. `install.py` installs `vco_lib` into the venv with `pip install -e .`, so a clean install imports it straight from the checkout. But a venv carried over from an older layout can hold a **non-editable COPY** of `vco_lib` in `site-packages` (a real directory, no `__editable__*.pth`), and that copy shadows the repo — so `pytest` silently tests yesterday's code and reports failures that vanish for no visible reason. Putting the repo root first on `PYTHONPATH` is what `scripts/pre-ship-check.sh` does for exactly this reason. If you see failures you cannot reproduce by reading the source, check for a shadowing copy first: `python -c "import vco_lib; print(vco_lib.__file__)"` must print a path inside your checkout, not inside `.venv/lib/`.
 
 The Rust battery is **always** `bash scripts/test-keychain-safe.sh` (single-threaded, keychain-safe) — never a bare `cargo test --workspace`. The wrapper is what CI (`.github/workflows/ci.yml`) and the pre-ship Gate 2 (`scripts/pre-ship-check.sh`) run, so it is the only local invocation whose green means the same thing theirs does. It forwards extra arguments to cargo (`bash scripts/test-keychain-safe.sh secrets_cmd::`, `bash scripts/test-keychain-safe.sh --release`).
 

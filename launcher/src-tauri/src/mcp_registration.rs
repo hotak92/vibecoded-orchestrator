@@ -487,8 +487,23 @@ pub fn build_default_mcp_entries(
     // stack: bare `npx -y @playwright/mcp@latest` — the same invocation
     // the GUI catalog ships (vct-launcher-core/src/types.rs::
     // default_mcp_servers) and install.py's `_install_playwright_browsers`
-    // pre-caches. `npx` resolves from PATH cross-OS; no venv-python and
-    // no env vars are involved. Default-enabled per project.
+    // pre-caches. No venv-python and no env vars are involved.
+    // Default-enabled per project.
+    //
+    // v0.2.91 correction: this comment used to assert "`npx` resolves from
+    // PATH cross-OS". The field disproved it — on a machine with no Node.js
+    // (or an fnm/nvm shape where only `npm` was hand-symlinked onto PATH)
+    // there is nothing for Claude Code to resolve, so the server never
+    // starts and `claude mcp list` reports only "Failed to connect". The
+    // bare-`npx` command string is still the right entry — it is what the
+    // GUI catalog ships and what VCO's third-party-preservation and
+    // stale-entry fingerprints match on — so the fix is VISIBILITY, not a
+    // different command: `vco doctor` probes the ladder in
+    // `vco_lib/npx_resolver.py` at the end of every install/update, defers
+    // `npx_missing_mcp_unspawnable`, and the launcher's registration badge
+    // turns yellow with the same remediation. (The VCO-owned mermaid /
+    // excalidraw wrapper proxies CAN fall back to `npm exec` because they
+    // spawn the upstream package themselves; a registered entry cannot.)
     //
     // Pre-v0.2.73 this entry was MISSING from both builders (audit
     // finding F-1): the GUI catalog shipped `enabled: true`, so the

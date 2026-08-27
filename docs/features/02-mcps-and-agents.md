@@ -188,7 +188,7 @@ Browser automation MCP. Not in `claude_mcp_servers/` — registered against `~/.
 
 Install path: `install.py::_install_playwright_browsers` runs `npx -y @playwright/mcp@latest --version` (caches the package) then `npx playwright install chromium` (fetches the Chromium binary). Skip with `VCT_SKIP_PLAYWRIGHT=1`. Exposed to Claude Code as the `playwright` MCP server (tool prefix `mcp__playwright__browser_*`). Used by the `gui-tester` agent and the `gui-test` skill for visual regression / GUI smoke runs.
 
-Failure modes: `npx` not on PATH → install step skips with WARN; Chromium fetch timeout (600 s) → install step skips with WARN. The orchestrator works without Playwright; only `gui-tester` / `gui-test` go inert.
+Failure modes: `npx` not on PATH → the install step skips with WARN **and the registered MCP cannot spawn at all** (its command string *is* `npx`, so there is nothing to invoke and nothing to lazy-install into — Claude Code reports only "Failed to connect"). Since v0.2.91 that case is no longer silent: the doctor phase at the end of every install/update probes the ladder in `vco_lib/npx_resolver.py`, defers `npx_missing_mcp_unspawnable` into `UPDATE_DEFERRED.md`, and the launcher's MCP-registration badge turns yellow with the same remediation. Chromium fetch timeout (600 s) → install step skips with WARN; that one *is* a genuine lazy-install-later case (the MCP fetches the browser on the first browser call). The orchestrator works without Playwright; only `gui-tester` / `gui-test` go inert.
 
 ---
 

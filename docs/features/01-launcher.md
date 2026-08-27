@@ -144,6 +144,52 @@ Global settings persist immediately to SQLite via `invoke('get_setting')` / `inv
 
 ---
 
+## Deferral Ledger Panel (v0.2.91)
+
+`UPDATE_DEFERRED` used to be a file the user found out about from a CLAUDE.md reminder. The **Pending actions** panel renders it in the launcher — grouped, dispositioned, dismissible — so a deferred condition is something you read and clear where you already are.
+
+### Two scopes, two surfaces, never merged
+A deferral belongs to a folder, and the panel never blurs which one:
+
+| Scope | Renders on | Reads | Badge |
+|---|---|---|---|
+| **Project** | that project's **Settings** tab (`SettingsTab.svelte`) | `deferral_ledger_for_project(projectId)` → `<project>/.claude/context/UPDATE_DEFERRED.json` | in-panel, counts that project only |
+| **Orchestrator root** | **Preferences → Updates** | `deferral_ledger_for_root()` → `<clone>/.claude/context/UPDATE_DEFERRED.json` | in-panel **and** the MenuBar `DeferralBadge`, both counting the root only |
+
+The MenuBar badge is global chrome, so it counts the orchestrator root and says so in its title, its aria-label and its popover — it never sums in the selected project's entries. Every Dismiss confirmation names the entry, the scope, and the exact folder it will touch, and `dismiss_deferral_entry` takes the scope as an argument rather than inferring it, so a dismissal cannot act on the wrong ledger even if the UI were wired wrong.
+
+### The JSON sidecar is the source of truth
+`commands/deferral_ledger.rs` reads `UPDATE_DEFERRED.json` and **never parses the Markdown**. The `.md` is a lossy human render; the sidecar preserves multi-line `command_to_apply` blocks (with their `#` comment lines) verbatim and carries the machine-only `disposition` / `dismiss_fields`. An unknown `schema_version` is refused outright — the panel reports "could not read this ledger" rather than half-reading an unfamiliar shape, because a ledger that renders as "all clear" when it is actually unreadable is worse than one that admits it.
+
+### Grouping is by DISPOSITION, not severity
+Two groups: **Action needed** (open) and **Records / by-design** (collapsed). The split uses the WP-B disposition tier, resolved per entry as *explicit sidecar field → `deferral_registry::disposition_for(cid)` → `action_required`* — the same chain `DeferralEntry.resolved_disposition` applies. `action_required + auto_retryable` is the actionable partition, matching `deferral_registry::is_actionable` and Python's `split_by_disposition`, and it is what the **group** renders. Severity still renders as a chip (it says how loud; the disposition says what you owe) but does not decide the split — conflating the two is exactly what made a completed repair record and genuinely pending work look identical.
+
+An entry whose condition id is not in the registry is shown as `action_required` **and labelled as such** ("not in the deferral registry, so VCO is being conservative") — the default is a posture, not a verdict.
+
+### The badge counts `action_required` only
+Group membership and badging are two questions, answered differently (user decision 2026-08-27).
+
+- **The group** holds the whole actionable partition. An `auto_retryable` condition is open work and stays visible, with its "VCO retries this itself" line and its retry trail.
+- **The badge** — `deferral-ledger.ts::badgeCount`, mirrored by the Rust `action_required_count` — counts `action_required` alone. Badging a condition VCO is already retrying makes chrome nag about something the reader cannot usefully act on.
+
+When the two differ the panel says so under the group heading ("*N* of these are conditions VCO retries itself — shown here, not counted in the badge"), so a group of three under a badge of one reads as tiering rather than as a counting bug. The MenuBar popover carries the same sentence. `actionable_count` (the wider partition — what the CLAUDE.md reminder and `vco doctor` count) is unchanged on the wire and still agrees with `is_actionable` across Rust, Python and the panel; `tests/test_v0291_deferral_ledger_parity.py` pins both numbers against both languages.
+
+### Retry visibility
+For `auto_retryable` conditions the panel reads `<folder>/.claude/logs/deferral-retries.jsonl` and renders what VCO already tried: attempt count (the `started` rows — the same rows `deferral_retry.attempt_count` counts, so the panel's cap engages exactly when the driver's does), the per-attempt outcome rows, and the attempt cap once reached. **`inconclusive` is a first-class outcome**, coloured and worded apart from `failed`: it means a handler ran, exited 0, and the condition is still in the ledger — "ran, nothing proven". The driver refuses to call that a failure and the panel must not either.
+
+### Boot doctor + retry dispatch
+`lib.rs::setup()` spawns one `tauri::async_runtime::spawn` beside the binary-freshness probe that runs `python -m vco_lib.doctor --folder <root> --scope boot --json` and then fires `python -m vco_lib.deferral_retry --folder <root>` detached. Three deliberate properties: exit 0 and exit 1 are both valid outcomes (exit 1 means a probe found a problem — the doctor working); the launcher emits **nothing** of its own (the doctor writes its findings into the ledger and the panel renders them, so there is one channel for these facts, not two); and the retry dispatch fires unconditionally because `deferral_retry` self-gates on positive backend evidence plus a per-folder pidfile. Nothing here blocks the `[vct] setup complete` marker.
+
+### MCP maintenance cross-links
+The `/mcp` page's maintenance section carries three v0.2.91 additions, because that is where a user looks when MCP rows seem wrong:
+- **npx presence is tri-state** — `present` / `missing` / `unknown`. "The probe could not run" is rendered as its own sentence and never as "npx is missing"; only the latter is actionable. The one-line `remediation` from `mcp_registration_status` renders under it.
+- **"cannot spawn"** tags a registered entry whose bare command provably does not resolve (`command_resolvable === false`). `null` — not applicable, or the probe could not run — tags nothing, matching the badge's positive-evidence-only rule.
+- **`convergence_pending`** (from the orchestrator-root ledger) and **retired MCP rows** (`$._vct_retired` in `config_json`, read via `list_project_mcp_servers` for the selected project) both surface here with their scope named. A retired row is disabled and badged, never deleted; one the user has re-enabled is labelled as such, because the convergence engine's idempotence leaves it alone.
+
+Decision logic lives in `$lib/deferral-ledger.ts` and `$lib/components/mcp-maintenance-logic.ts` (unit-tested with vitest); the Rust half is unit-tested on fixtures in `deferral_ledger.rs`, and `tests/test_v0291_deferral_ledger_parity.py` pins the cross-language mirrors (sidecar schema version, retry cap, retry status vocabulary, the actionable partition, and the badge's narrower `action_required`-only count on both sides).
+
+---
+
 ## Secrets Management
 
 Secrets are kept out of the launcher's SQLite database entirely. Storage is the OS keychain; the DB only records *which* secrets a project needs (not their values), and even the secret-preview command returns first-4 + last-4 chars rather than the full value.
@@ -740,20 +786,41 @@ Twenty-one Tauri commands mutate or read the per-project Claude Code registry. E
 ### Tray Menu
 `tray.rs` builds a tray icon with: Open Launcher, Running services count (live label), Recent Projects sub-menu (top 5 by `updated_at`), Check for updates, About, Quit.
 
-### Tray Click to Focus
-Left-clicking the tray icon shows and focuses the main window (`w.show()` + `w.set_focus()`).
+### Tray Click Policy (v0.2.91)
+**Left click restores, right click menus** (the mainstream Windows convention; user decision #1). Only the `Left` + `Up` pair acts — `Down` is the other half of the same physical click, and `Right` / `Middle` never restore. Restoring is `w.show()` + `w.set_focus()`.
+
+Before v0.2.91 the handler matched `TrayIconEvent::Click { .. }`, i.e. *every* button in *both* states, while the builder also had `show_menu_on_left_click` enabled — so one physical left click both opened the menu and restored the window, and a right click restored it too. One constant (`TRAY_MENU_ON_LEFT_CLICK`) now feeds both the builder flag and the extracted decision fn `tray_click_action(button, state, menu_on_left)`, so the two cannot drift; the decision is unit-tested as a matrix rather than exercised through Tauri.
 
 ### Live Service Status Pill
 The "Running services" line is polled every 5s and updated in-place (`MenuItem::set_text` rather than full menu rebuild — avoids flicker and OS-level menu re-grab). States: `Services: N/M running`, `No services running`, `managed externally`. The probe reads the same port set as install.py (8081 / 11435 / 11440); foreign services on the same ports are counted as "running" for the headline count, with the externally-managed case surfaced when a foreign service is detected with no `~/.vct/services.toml` lock entry.
 
+### Window-button semantics (changed in v0.2.91)
+**The X / Cmd+W button reduces the launcher to the tray by default** — it no longer prompts. This is a user-visible behavior change (user decision #2): the `tray_close_to_tray` preference had shipped with default `true` and a Preferences label saying exactly that for months, while nothing consumed the value, so the label was false. Wiring the pref honors the shipped default rather than inventing a new one. Real exit is **tray → Quit**. A one-time native notice fires the first time the window hides this way, so the default is discoverable rather than surprising.
+
+Two events are interpreted, and the decision is the pure `quit_dialog::window_event_action` (unit-tested matrix) — the `on_window_event` closure only acts on its verdict:
+
+| Event | Preference | Action |
+|---|---|---|
+| `CloseRequested` (X / Cmd+W) | `tray_close_to_tray` ON (shipped default) | hide to tray |
+| `CloseRequested` | `tray_close_to_tray` OFF | 3-button quit dialog |
+| `Resized` where `is_minimized()` | `tray_minimize_to_tray` ON | hide to tray, then `unminimize()` so the next restore is a normal window |
+| `Resized` where `is_minimized()` | `tray_minimize_to_tray` OFF (shipped default) | normal taskbar minimize |
+
+Tauri 2 has no `WindowEvent::Minimized`, which is why a minimize is observed as a `Resized` whose window reports `is_minimized()`.
+
 ### 3-Button Quit Confirmation
-Both tray Quit and window-close (`WindowEvent::CloseRequested`) prompt with three options:
+Tray → Quit (and window-close when `tray_close_to_tray` is OFF) prompts with three options:
 
 - **Quit and stop services** — full shutdown cascade
 - **Reduce to tray** — minimize-to-background convenience (services keep running)
 - **Cancel** — keep window open
 
-Backed by `quit_dialog.rs` and `tauri-plugin-dialog` (native dialog on each OS). The self-update path bypasses the prompt via a `force_quit` flag set before the relaunch sequence — prevents double-prompting during update apply.
+Backed by `quit_dialog.rs` and `tauri-plugin-dialog` (native dialog on each OS). Programmatic quits — the self-update relaunch sequence among them — latch a `force_quit` flag that `window_event_action` honors ahead of every preference, so a programmatic quit can never be converted into a hide and the update apply never double-prompts.
+
+### Tray / window preference storage
+`tray_close_to_tray`, `tray_minimize_to_tray` and `tray_start_minimized` are launcher-**global** and live in the `app_state` table (`launcher.tray_*` keys). Until v0.2.91 they were persisted as per-project rows via `set_setting_v2` — a window-level setting that silently differed per selected project, and that nothing read. Adoption of the legacy per-project value is lossless and happens once. A dedicated command writes them and refreshes the running window handler's cache, so a toggle takes effect immediately instead of on next launch.
+
+`tests/test_v0291_pref_keys_have_consumers.py` asserts that every key rendered on the Preferences page names a Rust symbol that actually reads it — a toggle persisting a value nobody consumes is a shipped lie, and the invariant is what stops the next one being added. Three zero-consumer keys were removed from the page under the same wire-or-delete ruling: `auto_update_enabled` (the real toggle is one click away on Preferences → Updates, and this copy could visibly contradict it), `logging_level` (no logging subsystem ever read it), and `default_embedding_mode` (superseded by the "Default embedding models" pickers further down the same page).
 
 ### Bundled Tauri Plugins
 `tauri_plugin_opener` (open URLs and file paths in the OS default app) and `tauri_plugin_dialog` (native open/save dialogs) are bundled. Registered in `lib.rs` `Builder::default().plugin(...)`.

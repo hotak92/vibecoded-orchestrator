@@ -9,7 +9,7 @@ was not "visited" during the current run. The 2026-07-15 incident showed the
 visited-only semantics are DESTRUCTIVE when combined with the per-file
 unchanged gate: a fully-current project short-circuits every file BEFORE any
 write, the visited set stays empty, and the prune deleted two projects'
-entire code graphs (MeetApp: 1,876 objects → 0; Instambul1860: 436 → 0).
+entire code graphs (two field projects: 1,876 objects → 0 and 436 → 0).
 
 The fix threads a ``preserve_paths`` set (files the dispatcher DISCOVERED on
 disk but did not re-walk — unchanged-skip / minified-skip / parse failure)

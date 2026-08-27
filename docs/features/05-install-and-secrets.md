@@ -40,13 +40,33 @@ The envelope above is a PRE-install snapshot. Until v0.2.91 nothing consumed it 
 | Launcher boot | `boot` (cheap subset — no subprocess, no network) | launcher wiring |
 | On demand | `full` | `vco doctor` / `python -m vco_lib.doctor` (`--json`, `--scope`, `--no-emit`, `--no-auto-fix`) |
 
-It is **not a new detection codebase**: each probe composes a mechanism that already exists — the npx ladder (`vco_lib/npx_resolver.py`), the `--bootstrap` envelope's `missing_prereqs` (injected by install.py rather than re-derived), WP-A's binary-freshness probe via its Python leg, the deferral registry's own clear probes, and `vco verify-pins`' row collector.
+It is deliberately **not a new detection codebase**: every probe composes a mechanism that already exists — the npx ladder (`vco_lib/npx_resolver.py`), the `--bootstrap` envelope's `missing_prereqs` (injected by install.py rather than re-derived), WP-A's binary-freshness probe via its Python leg, the deferral registry's own clear probes, and `vco verify-pins`' row collector — with ONE deliberate exception, `disk_space` (v0.2.91), which measures a resource nothing in VCO was watching at all. The exception is bounded on purpose: one `shutil.disk_usage` call per distinct filesystem across the install root and the vct state dir (`vco_lib.paths`), no new subsystem.
 
 Each finding is `ok` / `problem` / `unknown`, and `unknown` never counts as `ok` — a probe that could not run must not read as "all good". Exit code is 1 only when a probe reports a real problem.
 
 **Fix boundary** (§F decision #4): environment-level owed WORK may be re-attempted automatically (the WP-H retry dispatcher re-runs an owed KG seed or code-graph walk once its backend answers — work the user already asked for by installing, idempotent, precondition-gated, attempt-capped). Everything else is surface-only: findings that touch a RUNNING binary are reported, never repaired, per the standing no-auto-restart ruling. The hub's own boot auto-restart (`running_hub_is_stale`) predates that ruling, is the hub's documented contract, and stays grandfathered — the doctor itself restarts nothing.
 
-Findings it defers become registry-classed deferral conditions with the exact remediation command (today: `npx_missing_mcp_unspawnable`). When install.py drives the phase it passes its in-flight run report as the sink, so those entries ride the run's single authoritative write instead of a second writer behind `finalize()`'s back.
+Findings it defers become registry-classed deferral conditions with the exact remediation command (`npx_missing_mcp_unspawnable`, `disk_space_low`). When install.py drives the phase it passes its in-flight run report as the sink, so those entries ride the run's single authoritative write instead of a second writer behind `finalize()`'s back.
+
+#### Disk-space probe
+
+The doctor probes free disk space on **two** locations — the install root and the vct state dir (`$VCT_STATE_DIR`, else `~/.vct` via `vco_lib.paths.vct_root_dir`) — because they are frequently on different filesystems and either one filling up breaks a different half of the system: the install root starves clones, venvs and dist binaries; the state dir starves `launcher.db`, the hub's lockfiles, RL archives and logs. The two are deduplicated by `st_dev` (falling back to the resolved path string when `stat` fails), so a single-filesystem install reports one mount rather than the same mount twice.
+
+It runs in **both** scopes — `boot` as well as `full` — so launcher boot, the end of every install/update, and `vco doctor` all check it. The dedupe happens *before* the measurement, not after, so the cost is one `shutil.disk_usage` call per distinct filesystem: two on a split install, one when the clone and the state dir share a filesystem. Deliberately cheap enough for the boot path.
+
+| Free space | Severity |
+|---|---|
+| ≥ floor | `ok` |
+| < floor (default **2 GiB**, override `VCT_DISK_SPACE_MIN_FREE_GB`) | warning |
+| < 256 MiB | critical |
+
+The comparison is strict: free space exactly *at* the floor is `ok`. A malformed or non-positive `VCT_DISK_SPACE_MIN_FREE_GB` falls back to the 2 GiB default rather than disabling the check (the same policy as `VCO_CG_INJECT_CAP`); fractional values such as `0.5` are legal.
+
+Below the floor the probe emits the `disk_space_low` deferral condition through the locked emitter (`vco_lib.deferral_emit`, never a raw report write), classed **environmental** — a fact about the machine rather than a task — so it renders in the ledger panel's "Records / by-design" group and does not badge. Its `command_to_apply` names `df -h` on the affected mounts, VCO's own reclaimable space (podman prune, `~/.vct/logs`, unused Ollama models), and the env knob. It reaches the user on both surfaces the deferral system already owns: the session-start deferral surface (so Claude sees it at the top of a session, before starting a walk that will fail on write) and the launcher's deferral-ledger panel.
+
+It **clears itself** on the next VCO run whose space check comes back above the floor — the boot doctor, `vco doctor`, the install/update re-probe pass, or a bundle update. Nothing to dismiss by hand. The doctor-side self-resolve exists because the boot doctor does *not* run the re-probe pass (`run_boot_doctor_and_retries` invokes `--scope boot --json`, which only emits), so a re-probe-only clear would have left the entry standing until the user's next `--update`. The one deliberate exception is install.py's sink path: a resolve landing while `InstallDeferralFlow.finalize()` is pending would be resurrected by that run's own write, so the self-resolve stands down there and the `--update` re-probe pass covers it.
+
+A path the probe cannot **measure** (permission denied, IO error, an unstat-able path) reports `unknown`, never `ok` — the same tri-state rule as every other doctor probe. A not-yet-created state dir is not that case: it is measured on its nearest existing ancestor, whose filesystem is the one that would hold it, so a first run gets a real reading.
 
 ---
 

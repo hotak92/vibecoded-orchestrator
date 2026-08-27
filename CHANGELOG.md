@@ -7,6 +7,378 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.91] - 2026-08-27
+
+### Changed
+
+- **The launcher's X / Cmd+W button now reduces to the tray instead of
+  prompting** (user-visible behavior change). The `tray_close_to_tray`
+  preference had shipped with default `true` and a Preferences label saying
+  exactly that, while nothing read the value and the window handler
+  unconditionally showed the 3-button quit dialog — so the shipped label was
+  false. Wiring the preference honors its shipped default rather than
+  inventing a new one. Turn the preference OFF to get the dialog back. Real
+  exit is **tray icon → Quit**; a one-time native notice fires the first time
+  the window hides this way so the default is discoverable. Programmatic
+  quits (the self-update relaunch among them) latch a force-quit flag that
+  wins over every preference, so a quit can never be converted into a hide.
+- **Tray click policy**: left click restores the window, right click opens the
+  menu (Windows convention). Only the `Left` + `Up` pair acts. Previously the
+  handler matched every button in both states while the builder also enabled
+  menu-on-left-click, so one physical left click both opened the menu and
+  restored the window, and a right click restored it too.
+- **Tray / window preferences are now launcher-global**, stored in the
+  `app_state` table instead of per-project rows — a window-level setting no
+  longer differs by whichever project happens to be selected. Legacy
+  per-project values are adopted losslessly, once. A toggle now takes effect
+  immediately (the command refreshes the running window handler's cache)
+  instead of on next launch.
+- **The read-only deferral re-probe/clear pass runs on every `install.py
+  --update` and every bundle update.** It was previously gated behind
+  `--apply-deferred`, a flag the launcher's GUI update path never passed — so
+  the auto-resolution machinery existed but never ran for GUI users, and
+  ledgers could not converge. The one side-effecting remediation
+  (`weaviate_unreachable_at_update`) and the orphan-collection drop remain
+  consent-gated.
+- **Pre-ship Gate 22 now FAILs** — not WARNs — when the tri-OS install smoke's
+  newest all-green run on `main` is older than 24 h. Without a cron, a stale
+  green is a likely state rather than a rare outage, and the house rule is
+  that gates block. A workflow that has never run stays a WARN so a fresh fork
+  can bootstrap. The dispatch hint is retained.
+- **The tri-OS install smoke gates releases.** `release.yml` gains a
+  `tri-os-smoke` job that calls `install-smoke-tri-os.yml`, and `build` needs
+  it: a red smoke means no assets are built and no release is published. The
+  job is skipped on binary-refresh (tag-repoint) runs, whose build is skipped
+  anyway.
+- **The `pre-edit-context-inject` hook's replay-cache TTL now matches the
+  shared query cache** (900 s, with the same `VCO_QUERY_CACHE_TTL` override)
+  instead of a hardcoded 600 s. An edit landing in the 600–900 s window was a
+  double miss: the per-file cache expired, the hook paid a fresh CPython start
+  to launch the producers, and those producers served the same blob back out of
+  the still-fresh shared cache — roughly 1.4 s of interpreter tax for identical
+  content. A replay can now be up to 5 minutes older, which is the staleness
+  class the 900 s cache already accepts on every other surface, and dedup still
+  applies current seen-state on replay.
+- **The pre-edit hook's KG and code-graph searches now run in ONE interpreter,
+  still concurrently.** A cache miss previously started two background CPython
+  processes that imported the same modules — `import weaviate` alone is ~0.41 s
+  of a ~1.0 s per-leg overhead — to do ~3 ms of Weaviate work plus ~58 ms of
+  query embedding. One driver
+  (`claude_mcp_servers/scripts/hook_dual_search.py`) pays the shared imports
+  once and runs the two legs in threads; both are I/O-bound and release the GIL,
+  so they overlap the way the two processes did. Merging them into one
+  SEQUENTIAL process was measured SLOWER than the old path (1.50 s vs 1.34 s) —
+  the old wall clock was `max(kg, cg)`, so deduplicating the imports only pays
+  if the legs stay concurrent. Measured effect: **~43% less CPU per miss and
+  ~10% better wall clock under multi-agent contention**. The ~0.68 s
+  interpreter-plus-import floor remains; removing it needs a warm query server,
+  which is not in this release. Zero functionality change is the contract: the
+  driver calls the same entry points with the same argv, the caller applies the
+  same per-leg output caps and cache keys, and the emitted blocks are
+  byte-identical (verified by golden-output diff). A missing driver, missing
+  venv or a missing leg marker degrades to the verbatim two-process path.
+- **Dependabot moved from weekly to monthly**, and `day: "monday"` (meaningful
+  only for `interval: weekly`) was dropped. Runs are free on this public repo,
+  but the weekly cadence was mirrored verbatim into a private fork where each
+  PR fans out to 7 workflows over a 5-OS matrix on billed minutes.
+
+### Added
+
+- **`vco doctor`** — one probe engine at three invocation points: the end of
+  every install/update, launcher boot (a cheap subset: no subprocess, no
+  network), and on demand (`vco doctor` / `python -m vco_lib.doctor`, with
+  `--json`, `--scope`, `--no-emit`, `--no-auto-fix`). It is not a new
+  detection codebase: each probe composes a mechanism that already existed —
+  the npx ladder, the `--bootstrap` envelope's `missing_prereqs` (injected by
+  install.py rather than re-derived), the binary-freshness probe, the deferral
+  registry's own clear probes, and `vco verify-pins`' row collector. Findings
+  are tri-state `ok` / `problem` / `unknown`, and `unknown` never counts as
+  `ok` or flips an exit code. Fix boundary: owed work may be retried,
+  anything touching a running binary is surfaced and never repaired.
+- **A declared deferral lifecycle contract.**
+  `vco_lib/deferral_conditions.toml` is one registry classifying all 111
+  condition ids VCO can emit (75 `action_required`, 8 `auto_retryable`, 2
+  `environmental`, 26 `informational_record`), each naming its owner, its
+  clear probe, its emit surfaces and its dismiss-key fields. Two properties
+  make it a contract rather than documentation: a completeness gate
+  source-scans every emit site across Python and Rust and hard-fails on any
+  unregistered condition, and every declared `probe:py:<name>` must resolve to
+  a real callable — which turns the recurring
+  "documented-protocol-never-implemented" failure into a test failure. A
+  compile-time Rust mirror is parity-locked. The class rides the wire
+  compatibly (sidecar schema v1, `.md` header shape untouched), so a v0.2.90
+  reader does not break.
+- **Registry-declared retries for `auto_retryable` conditions.** One
+  dispatcher, per-condition backend gates, an attempt cap of 3 counted from a
+  STARTED row written before the handler, a single-instance pidfile, and the
+  ledger as ground truth — a child's exit-0 never resolves anything, only its
+  own paired clear can. The retry pins the child's ledger root to the
+  dispatcher's project so emit, clear and re-read stay one variable even when
+  the session env names the orchestrator root. Attempts are logged to
+  `.claude/logs/deferral-retries.jsonl`. The session-start hook hands owed
+  work to a detached driver that re-probes the backend itself and does nothing
+  while it is still down, so the hook never waits and never guesses. A KG seed
+  or code-graph walk skipped because the embedding backend was unreachable now
+  self-heals on the next session once the backend returns.
+- **A convergence engine for launcher-managed project state**
+  (`commands/convergence.rs`), run at boot and after bundle updates, under two
+  hard invariants: provenance wins (insert-if-absent — existing rows keep even
+  their `updated_at`, and user-authored rows proven by the project's own files
+  are never retired) and positive evidence only (a failed READ blocks writes
+  for that scope; a report-only tenant with no detector emits nothing).
+  Retirement is `enabled = 0` plus a durable badge that survives populate's
+  UPSERT, so a user's re-enable of a retired row sticks across every future
+  bundle update. `project_mcp_servers` is the first write-enabled tenant;
+  `project_backfill`, `codegraph_bindings` and `module_settings` are
+  report-only this cycle.
+- **Generalized dismissal memory.** One keying helper over registry-declared
+  state fields, so prose is never an input and rewording a message cannot
+  re-fire a dismissed entry. Migration from the legacy reference-hash scheme
+  is lossless.
+- **`launcher_binary_stale`, `launcher_binary_handoff_skipped_dirty` and
+  `launcher_binary_clobber_averted`** deferral conditions, plus an amber
+  persistent banner for the stale-binary case, so a launcher frozen on an old
+  binary is visible instead of silent.
+- **`vco_lib/dist_binary_repair.py`** — a git-only repair leg install.py can
+  run with no functioning launcher: the permanent escape hatch for the
+  frozen-exe class.
+- **`VCT_HUB_TOKEN_STRICT=1`** — disables the new stale-token fallback so a
+  test or harness that pins a deliberately-wrong `VCT_HUB_TOKEN` still
+  observes the refusal.
+- **`npx_missing_mcp_unspawnable`** — deferred when the `npx`-registered MCPs
+  cannot spawn, with the remediation command.
+- **A free-disk-space probe in `vco doctor`**, over the install root and the vct
+  state dir (`$VCT_STATE_DIR`, else `~/.vct`) — usually different filesystems,
+  and either one filling up breaks a different half of the system; the two are
+  deduplicated by `st_dev` BEFORE the measurement, so a single-filesystem
+  install reports one mount and pays one `shutil.disk_usage` call. It runs in the
+  `boot` scope as well as `full`, so launcher boot checks it too — one call per
+  distinct filesystem is cheap enough for that path. The floor is 2 GiB
+  (`VCT_DISK_SPACE_MIN_FREE_GB`; a malformed or non-positive value falls back to
+  the default rather than disabling the check): strictly below it the finding is
+  a warning, below 256 MiB critical, and a path that cannot be MEASURED
+  (permission denied, IO error) is `unknown` rather than `ok` — a not-yet-created
+  state dir is measured on its nearest existing ancestor instead. Below the floor
+  emits the `disk_space_low` deferral condition through the locked emitter,
+  classed environmental — a fact about the machine, not a task — which reaches
+  Claude through the session-start deferral surface and the user through the
+  launcher's deferral ledger, with a `command_to_apply` naming `df -h` on the
+  affected mounts plus VCO's own reclaimable space. It clears itself on the next
+  run whose check comes back above the floor (boot doctor, `vco doctor`, the
+  install/update re-probe pass, or a bundle update); the boot doctor does not run
+  the re-probe pass, so a re-probe-only clear would have left the entry standing
+  until the next `--update`.
+- **`post-mcp-retrieval-record.{sh,ps1}`** — a PostToolUse hook on the three
+  `weaviate-kg` retrieval tools (`hybrid_search`, `semantic_graph_search`,
+  `search_code_graph`) that records what an EXPLICIT retrieval already put in
+  the context window, into the same per-session stores the injecting hooks
+  consult, so the pre-edit injector stops re-showing a node the agent
+  deliberately fetched minutes earlier. Two suppression channels already existed
+  — what the hooks injected, and what the model `Read` — and MCP retrieval
+  results were recorded in neither. It records only what is provably in context
+  byte-for-byte: a KG result's per-chunk key `<title>#<sha1(body)[:12]>`,
+  computed from the same body text the injector would have printed AT THAT TIER
+  (the same node retrieved later at a different tier hashes differently and
+  still injects, because that is new content); plus the node's source path when
+  the result carries `coverage: "complete"`; plus a code entity's `full_name`
+  only when the result carried the untruncated `function_body` / `class_body`. A
+  `titles`-detail search, a truncated tier and a connected-node stub record
+  nothing — over-suppression silently costs the model context, which is worse
+  than a duplicate injection. The hashed body is trailing-newline-normalized on
+  BOTH sides — the seen-store filter and the recorder — because how many trailing
+  newlines a rendered block carries is a function of where in the blob it sits,
+  not of its content: the producer's `print(body)` adds an empty line and the
+  injector's `KG_RESULT="$(…)"` capture strips it back off for the last block
+  only, so content `"x\n"` reassembles two different ways and no recorder-side
+  rule alone could match both. Normalizing on both sides makes the key depend on
+  the content alone; verified byte-identical across the bash filter, the
+  PowerShell filter and the Python recorder at every block position. Both OS
+  flavours shell out to one shared implementation
+  (`templates/scripts/mcp_retrieval_record.py`) rather than mirroring
+  hash-and-parse logic into PowerShell. Never blocks, never writes to stdout, and
+  soft-fails to recording nothing.
+- **`VCT_RESYNC_SPAWN_DISABLED`** — truthy disables the background code-graph
+  resync spawn in `vco_lib/codegraph_resync.py`. The gate is checked before the
+  per-spawn log file is created and before any `Popen`, so a disabled run also
+  stops depositing `resync-*.log` records. It is a real operator knob (CI
+  runners, air-gapped installs, walks strictly on demand), not a test-only
+  hatch; the test suite now sets it by default with an explicit opt-out list for
+  the tests that assert spawn behaviour, after the perf audit found pytest
+  fixtures writing 17 spawn records a day into the user's production
+  `~/.vct/logs/`.
+- **A deferral-ledger panel in the launcher.** `UPDATE_DEFERRED` renders as two
+  groups — "Action needed" (`action_required` / `auto_retryable`) and a
+  collapsed "Records / by-design" — with a per-entry Dismiss and the retry
+  trail the retry driver writes. The panel reads the `UPDATE_DEFERRED.json`
+  sidecar, never the Markdown: the `.md` is a human render whose round-trip is
+  lossy by design, and a second parser in Rust would corrupt exactly the
+  multi-line `command_to_apply` blocks the panel exists to display faithfully.
+  An absent or unknown-`schema_version` sidecar renders nothing rather than
+  guessing. Scope is explicit everywhere: a per-project ledger is read from
+  that project's folder and rendered only on its Settings panel, the
+  orchestrator root's ledger only on the global surface, each labelled, and a
+  Dismiss takes its scope explicitly rather than inferring it. The badge counts
+  `action_required` only: an `auto_retryable` condition stays in the open group
+  with its retry trail, but does not drive a number the reader cannot act on,
+  and the group says so under its heading when the two differ. The wider
+  actionable partition — what the CLAUDE.md reminder and `vco doctor` count — is
+  one number across those surfaces by construction, because every surface
+  resolves disposition by one rule (the entry's own field, else the registry,
+  else the registry's conservative default, so an unclassified condition
+  surfaces as work instead of hiding in the fold).
+- **RL event retention now archives before it deletes.** `prune_rl_events`
+  requires an archive directory — there is no no-archive code path — and a
+  failed archive aborts the prune with an error, so nothing is deleted. Victim
+  rows are written to a compressed, loader-readable `.jsonl.gz` sidecar before
+  any `DELETE` runs. The directory resolves from `$RL_EVENTS_ARCHIVE_DIR`, else
+  `<VCT_STATE_DIR or ~/.vct>/rl_archive`, and is resolved hub-side rather than
+  taken from the request body — a caller-supplied path would be an
+  arbitrary-write surface on an authenticated localhost route, and deletion
+  authority must not depend on a caller remembering to name an archive.
+  Previously the 90-day prune deleted permanently.
+- **Mirror guard on the tri-OS smoke**: the `install-smoke` job is pinned to
+  the public repository. Its "Clone fresh" step clones anonymously, which
+  cannot succeed against a private mirror, so the mirror now skips at zero
+  cost instead of burning billed minutes to fail. The trade-off (a third-party
+  public fork is skipped too) and the sanctioned relaxation are documented in
+  the workflow header.
+- `tests/test_pre_ship_gate22_freshness.py` slices the shipped gate block and
+  pins all four of its branches against a stubbed `gh`.
+- `tests/test_v0291_pref_keys_have_consumers.py` — every preference key
+  rendered in the launcher's Preferences page must name a Rust symbol that
+  actually reads it. A toggle that persists a value nobody consumes is a
+  shipped lie; this is what stops the next one being added.
+- The Python sdist now ships `vco_lib/**/*.toml`. Three import-time data
+  tables were absent from it (the wheel was unaffected).
+
+### Fixed
+
+- **A failed Windows binary swap could leave an install frozen on an old
+  launcher indefinitely.** The source updated, the running `.exe` stayed old
+  and git-dirty, and no code path ever re-examined the on-disk binary outside
+  the tail of a successful pull — so every later update reported "Already up
+  to date" and changed nothing. The delivery chain now has one home
+  (`services/binary_freshness.rs`) used by both update surfaces: an at-rest
+  freshness reconcile at boot and at update-check, stale-`.new` invalidation
+  before every handoff and exit swap, and "Already up to date" heals a stale
+  dist. Dirty-alone at rest is surface-only — it never destroys a local build
+  — and the reconcile stands down when another process's update owns the tree.
+- **An aborted update could rename old binary bytes over a freshly-pulled
+  executable.** The revert is now hash-guarded and refuses to clobber; the
+  averted case is recorded rather than silent.
+- **`codegraph_embed_resync_pending` was immortal.** The analyzer never
+  deleted rows for entities that a walk no longer produced, so refactored-out
+  entities and old-identity duplicate rows survived forever, the owed probe
+  could never reach zero, and the deferral could never clear — while the stale
+  rows served wrong search results. The analyzer now records every UUID it
+  upserts per walked file — committed only after all of that file's writes
+  succeed, so a partial or multi-pass-failed walk can never authorize a
+  deletion — and deletes rows anchored to walked primary-source files whose
+  UUID was not re-written. One deleter and one classifier (the stale-kind
+  classifier now agrees with the owed gate); worktree-stamped sources are
+  guarded against over-delete; stuck-row identities are logged into the
+  deferral. Ships via `templates/` + `vco_lib`, so every install converges
+  through the standard update flow.
+- **A stale exported `VCT_HUB_TOKEN` poisoned every hub resolver.** The hub
+  regenerates `hub.token` on every start, and the env pin wins over the file,
+  so a shell that exported the token before an update got 401s despite a
+  perfectly valid on-disk token — and on the access-matrix surfaces that
+  meant a silent fail-open of the KG-write matrix to permissive on every
+  call. Long-lived MCP processes stayed poisoned until restart. All 14
+  resolver surfaces now apply one rule: the env pin wins every first attempt;
+  only a provable 401/403 with a provably-different on-disk token triggers ONE
+  bounded retry with the file token; only a definitive answer (2xx, or a 404 —
+  which the hub returns only after its auth middleware accepted the bearer) is
+  adopted, latching long-lived processes off the dead pin. Anything else
+  returns the original refusal byte-identically. Fail-open contracts, exit
+  codes and reason strings are unchanged everywhere, and a successful retry
+  emits no dropped-write metric because nothing was dropped. One stderr line
+  tells the user to `unset VCT_HUB_TOKEN`. The decision function lives in
+  `vco_lib/project_config.py` and the other thirteen surfaces are
+  parity-locked mirrors.
+- **The `playwright` MCP silently failed to start on machines without
+  Node.js.** Its registered command *is* `npx`, so with nothing to resolve the
+  server never starts and Claude Code reports only "Failed to connect" — while
+  the installer printed that the MCP "will lazy-install when first invoked",
+  which is impossible without npx. The message now says it cannot spawn, the
+  doctor phase probes for it, and the launcher's registration badge turns
+  yellow with the same remediation.
+- **The Mermaid and Excalidraw wrapper MCPs could not run on an npm-only
+  machine.** Resolution was a bare `shutil.which("npx")` and an immediate
+  exit, so an fnm/nvm install where only `node`/`npm` were symlinked onto PATH
+  could not run them at all. Both proxies now resolve through
+  `vco_lib/npx_resolver.py`, which carries the fnm/nvm ladder and an
+  `npm exec --yes --` fallback. This applies to VCO-owned wrapper code only;
+  a registered bare-`npx` entry still cannot fall back, because its command
+  string is what VCO's third-party-preservation and stale-entry fingerprints
+  match on.
+- **The `search` MCP failed to connect on any install whose venv had moved to
+  the repo root.** Its wrapper hardcoded `claude_mcp_servers/.venv/bin/python`
+  — the pre-unification layout — with no visible cause (the error only appears
+  when running the wrapper by hand). Resolution is now a candidate chain:
+  `$SEARCH_MCP_PYTHON`, the legacy MCP venv, then the repo-root venv.
+- **`mermaid` and `excalidraw` were seeded `enabled = 1` by the install-time
+  registration DB-sync**, contradicting their documented project-default-
+  disabled status on that path. The fresh-insert rule now lives in one shared
+  DB helper used by the filesystem-mirror populate, the install-time DB-sync
+  and the convergence pass. A row that already exists is never re-flagged, so
+  a deliberate opt-in survives every later pass. Orchestrator roots installed
+  before this fix keep their existing rows: the column holds the same value
+  whether the old bug wrote it or the user deliberately enabled the MCP, and
+  flipping a user-visible toggle on a guess is worse than a stale default.
+- **The mermaid/excalidraw MCP registration env did not carry the install root
+  on `PYTHONPATH`**, at any of four builder sites. Verified fixed by a live
+  `initialize` handshake from a foreign working directory.
+- **A boot-time backfill that ran for a year and converged nothing** has been
+  deleted, with a characterization test as its epitaph: it was double-gated on
+  a zero-row count (so stale rows were unreachable) while its only action was
+  to re-run a disk mirror that inserts nothing once bundled MCPs live in the
+  global `~/.claude.json`.
+- **`kg_sync_no_embedding_backend` never cleared**, even after a successful
+  sync. It now has a narrow paired clear — honest, in that it fires when the
+  seed actually ran — and the last raw deferral-emitter bypass was routed
+  through the locked path (all three remaining bypasses are closed; the
+  ratchet on unlocked writers is now empty).
+- **`vco verify-pins` could never exit 0 on a real install** (pre-existing).
+  It was handed the whole bundled-versions document where the per-key pin map
+  was expected, producing two phantom rows keyed `npm` and `chromium` with
+  placeholder packages, classified as drift — and `--fix` would have called
+  the installer with those non-keys. Every existing test stubbed the flat
+  shape production does not produce, so the mocks all agreed with each other
+  and none of them agreed with reality.
+- **Project rename** now has one call-site home and a store-derived header that
+  updates live; rename drift notices render as informational rather than as
+  errors.
+- **The Windows update handoff had two implementations.** There is now one,
+  with `relaunch` as a parameter — the at-rest exit swap arms with
+  `relaunch: None` per the standing no-auto-restart ruling.
+- **Keychain tests were not hermetic**: a pre-flight lock probe read the real
+  store even where the store itself was mocked. Four tests now pass with the
+  login keyring locked. The keychain-safe wrapper also builds its echo and
+  exec argv from one array.
+- **Gate 22's freshness-source comments** claimed the release-time
+  `workflow_call` fed the gate. It cannot: a `uses:`-called workflow executes
+  inside the caller's run and never appears in `gh run list` for the called
+  workflow, and the gate reads before the tag is pushed. Freshness comes from
+  push-to-`main` runs and manual `workflow_dispatch` only.
+- **Documentation corrections** (each of these claims was false in the shipped
+  docs): the tri-OS smoke has not run on a daily 06:00 UTC cron since
+  2026-07-23 (`GETTING_STARTED.md`, `INSTALL_ARCHITECTURE_v2.md` §9); "either
+  way, the update completes" for a Windows swap fallback (`TROUBLESHOOTING.md`
+  — the field disproved it); "deferral entries self-clear on the next run once
+  their condition no longer holds" (`INSTALL_ARCHITECTURE_v2.md` §6,
+  `TROUBLESHOOTING.md` — overbroad; four conditions with no clear mechanism at
+  all were live in the field at v0.2.90); "`npx` resolves from PATH cross-OS"
+  (`mcp_registration.rs` comment) and the matching "lazy-install" claims in
+  `install.py`, `CONFIGURATION.md`, `TROUBLESHOOTING.md` and
+  `features/02-mcps-and-agents.md`; the launcher's window-button and tray-click
+  semantics (`features/01-launcher.md`); and the search-MCP wrapper's
+  interpreter resolution order (`features/05-install-and-secrets.md`).
+  `CONTRIBUTING.md` gains the sanctioned Rust battery
+  (`bash scripts/test-keychain-safe.sh`, never a bare `cargo test
+  --workspace`) and the `PYTHONPATH` shadow trap that makes a stale
+  `site-packages` copy of `vco_lib` silently shadow the checkout.
+
 ## [0.2.90] - 2026-07-31
 
 ### Fixed
@@ -3663,7 +4035,7 @@ A **public-repo cleanup release** triggered by a critical UX regression discover
 
 - Scrubbed `pb992/VCT-Launcher` references (co-maintainer's private fork, not a public repo) from `BOOTSTRAP.md`, `docs/features/07-architecture.md`, `launcher/bundled_manifests/vct-hub-api.json`.
 - Scrubbed personal product codenames (maintainer's other personal products) from `launcher/docs/SETUP.md` dev-mode activation examples; replaced with `DemoProduct1/2/3`.
-- Scrubbed personal-narrative leakage in `CHANGELOG.md` (`instambul_map`, `SD15` → "an external user project" / "a long-lived legacy project"); preserved technical context.
+- Scrubbed personal-narrative leakage in `CHANGELOG.md` (two private project names → "an external user project" / "a long-lived legacy project"); preserved technical context.
 - Scrubbed chat-role narrative ("RL chat", "main VCO chat") from 6 Rust inline comments + 1 TypeScript comment + 1 GHA workflow + 1 pytest test description; replaced with neutral architectural language ("v0.2.49 access-matrix follow-up", "module-author workflows", etc.).
 - Scrubbed dated release-narrative paragraphs from `launcher/supabase/functions/rl-{artifact-url,latest-weights}/README.md` while keeping the architectural Vault-vs-Edge-Function-Secrets explainer.
 - Scrubbed `VCO_dev` operational-checkout name from launcher docs + `templates/CLAUDE.md.template` (which propagates into user installs).
@@ -5131,7 +5503,7 @@ A **multi-axis hotfix release** — closes 7 distinct user-visible regressions d
 
 - **`sync_knowledge_graph.py::ensure_collection_exists` additive migration missing chunking props** (Agent V37-C Gap 6d): the fresh-create schema lists `chunk_num` / `total_chunks` / `source_node_id`, but the additive-migrate path for pre-chunking collections didn't add them. Every pre-chunking KG collection failed sync with `no such prop with name 'chunk_num' found in class '...'`. Fix: extend the additive prop loop to include the 3 chunking props. Verified against a real legacy `VCODev_KnowledgeGraph` collection during smoke testing.
 
-- **`analyze_code_graph.py` ignored `$CODE_GRAPH_PROJECT` env var** (Agent V37-C Gap 6e): when neither `--from-resolver` nor `--project` was passed, the analyzer fell back to repo dir name — diverging from the KG collection prefix set via `.claude/env`. Result: code-graph collections named after the directory (e.g. `Instambul_map_*`) instead of the configured project (`Instambul1860_*`). Fix: 3-step fallback order — `--from-resolver` > `--project` > `$CODE_GRAPH_PROJECT` > repo-dir-derived name.
+- **`analyze_code_graph.py` ignored `$CODE_GRAPH_PROJECT` env var** (Agent V37-C Gap 6e): when neither `--from-resolver` nor `--project` was passed, the analyzer fell back to repo dir name — diverging from the KG collection prefix set via `.claude/env`. Result: code-graph collections named after the directory (e.g. `My_repo_dir_*`) instead of the configured project (`MyProject_*`). Fix: 3-step fallback order — `--from-resolver` > `--project` > `$CODE_GRAPH_PROJECT` > repo-dir-derived name.
 
 ### Added — release-discipline automation
 

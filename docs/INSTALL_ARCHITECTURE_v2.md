@@ -420,7 +420,11 @@ patterns, step IDs, the `read_install_log` Tauri command) is in
 
 `.github/workflows/install-smoke-tri-os.yml` runs the actual entry-point
 shims end-to-end on every PR touching install files, every push to `main`,
-and daily:
+on manual `workflow_dispatch`, and — since v0.2.91 — as a `workflow_call`
+prerequisite of the Release workflow's `build` job. It has **no cron**: the
+daily 06:00 UTC schedule was removed on 2026-07-23 and must not be re-added
+(the workflow header says so, and the private mirror billed real minutes
+for it).
 
 - **Matrix**: `ubuntu-22.04`, `ubuntu-24.04` (libwebkit2gtk 4.0/4.1
   fallback), `macos-14` (Apple Silicon, bash 3.2, Homebrew cascade),
@@ -429,8 +433,28 @@ and daily:
 - **Fresh `git clone`**, not `actions/checkout` — the smoke exercises the
   exact code path a third-party user hits, including the bootstrap prepass
   before and after install (asserting `ready_to_install` flips to true).
-- The pre-ship gate blocks release tags while this workflow is red on
-  `main`.
+- **Release gating (v0.2.91)**: `release.yml`'s `tri-os-smoke` job calls
+  this workflow and `build` needs that job, so a red smoke means no assets
+  are built and no release is published. The job is skipped on
+  binary-refresh (tag-repoint) runs, whose build is skipped anyway.
+- **Mirror guard (v0.2.91)**: the `install-smoke` job carries
+  `if: github.repository == 'hotak92/vibecoded-orchestrator'`. The "Clone
+  fresh" step clones anonymously, which cannot succeed against a private
+  mirror — so on the mirror the job now skips at zero cost instead of
+  burning billed minutes to fail. The trade-off is documented in the
+  workflow header: a third-party public fork is skipped too, and the
+  sanctioned relaxation (a visibility probe) is named there.
+- Pre-ship **Gate 22** blocks release tags while this workflow is red on
+  `main`, and — since v0.2.91 — also when its newest all-green run on
+  `main` is older than 24 h (previously a WARN). Without a cron a stale
+  green is a likely state rather than a rare outage, and the house rule is
+  that gates block. A no-run-at-all stays WARN so a fresh fork can
+  bootstrap. Freshness comes from exactly two sources: push-to-`main` runs
+  and manual `workflow_dispatch`. The release-time `workflow_call` is
+  **not** one of them — a `uses:`-called workflow executes inside the
+  caller's run and never appears in `gh run list` for this workflow, and
+  the gate reads before the tag is pushed. The remedy the gate prints is a
+  `workflow_dispatch` run, which is free on the public repo.
 
 ---
 

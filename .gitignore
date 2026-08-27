@@ -104,6 +104,10 @@ claude_mcp_servers/weaviate_mcp/*_tool_usage.jsonl
 .claude/worktrees/
 # Hook ephemeral state (per-session dedup, etc.)
 .claude/state/
+# Local-only archives: legacy code/data a contributor parked for reference
+# (superseded modules, pre-refactor snapshots, retired trainer/logger trees).
+# Local by construction — never commit, and never copy into another repo.
+.claude/archive/
 # Per-machine orchestrator install artifacts — populated by install.py, NEVER commit
 .claude/agents/
 .claude/skills/

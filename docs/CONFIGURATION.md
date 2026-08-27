@@ -280,6 +280,21 @@ License resolution priority (first match wins; see `VCThelpers/license/validator
 | `RL_SERVER_PORT` | `11439` | Back-compat port override. |
 | `RL_PROJECT_ROOT` | project root | Override for the RL service's project-anchored state directory. |
 
+### RL event retention and archives
+
+The `rl_events` table in `launcher.db` is written on every ranked retrieval regardless of tier (only the *reranking* is Pro-gated), so its retention knobs apply to free installs too. The prune driver is `claude_mcp_servers/rl_client/rl_retention.py`; the delete and the archive are executed hub-side, by the process that owns `launcher.db`.
+
+| Var | Default | What it does |
+|---|---|---|
+| `RL_EVENTS_RETENTION_MAX_AGE_DAYS` | `90` | Delete events older than N days. `0`/negative disables the age bound. Read fresh on every pass. |
+| `RL_EVENTS_RETENTION_MAX_ROWS` | `0` (disabled) | Keep at most N most-recent rows; age is the primary bound. |
+| `RL_EVENTS_RETENTION_DISABLED` | unset | Truthy → never prune (offline-training operators who want the full corpus). |
+| `RL_EVENTS_RETENTION_MIN_INTERVAL_S` | `3600` | Minimum seconds between prune passes **for one process**. Throttle only; a fresh process always allows the first pass. |
+| `RL_EVENTS_ARCHIVE_DIR` | `<VCT_STATE_DIR or ~/.vct>/rl_archive` | Where the prune writes its archive sidecars. Resolved **hub-side**, never from a request body — a caller-supplied path would be an arbitrary-write surface on an authenticated localhost route. |
+| `RL_EVENTS_PRUNE_MAX_TASKS_PER_PASS` | `500` | How many task GROUPS one pass may move, oldest-first. Bounds the archive's in-memory row set, which is what makes the prune incremental: a long-neglected corpus drains over successive passes instead of materializing gigabytes at once. Raise it to drain a backlog faster. |
+
+Since v0.2.91 the prune is **archive-then-delete**: victim rows are written to a compressed, loader-readable sidecar and verified before any `DELETE` runs, and a failed archive aborts the prune so nothing is deleted. See [`features/04-knowledge-and-code-graph.md`](features/04-knowledge-and-code-graph.md#retention-archive-then-delete-v0291) for the archive format and how to read one back.
+
 ## Container runtime
 
 `vco_lib/containers.py` resolves the runtime via:
@@ -361,6 +376,17 @@ Set these before running `bash first-install.sh` (or export them for the duratio
 | `VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY=1` | **Test-only sentinel** consumed by `launcher/src-tauri/src/hub_launcher.rs:84`. When set, the launcher's hub-binary discovery skips steps 4 and 5 (in-tree dist resolution via `current_exe()` walking) and returns `None` if no other candidate matched. Production code never sets this — it exists so `cargo test` runs against `target/debug/` (where sibling cargo invocations may leave a real `vct-hub` binary) can deterministically assert "no hub anywhere". Do NOT use this as a user workaround for hub-start failures; the correct path for that is `vct-hub --start-if-not-running` (see TROUBLESHOOTING.md). |
 | `VCT_RL_PULL_TOKEN_ENDPOINT=<url>` | Runtime override for the RL module's paid-module pull-token gateway URL. Short-circuits the L0 catalog / L1 manifest / hardcoded-default resolution chain inside `installer_engine::request_pull_token` and POSTs the license-key request to `<url>` verbatim. Use when the on-disk endpoint is wrong (manifest still carries a `placeholder.<tld>` URL, tenant has migrated, gateway is being staged behind a custom domain). Empty / whitespace-only values are ignored. |
 | `VCT_MODULE_PULL_TIMEOUT_SECS=<n>` | Upper bound, in seconds, on a single module-image `podman`/`docker pull` during a module install or update. Default `1800` (30 min). The bound exists to catch a genuinely *stalled* registry (network black hole, half-open connection, a registry that accepts the connection but never streams layers) — without it, a stalled pull leaves the install row wedged at `status='installing'` forever (the pull future never resolves). On timeout the pull is killed and the install transitions to `status='error'` with an actionable message, then becomes retry-eligible. Raise it for unusually large GPU-variant images on a slow link. A zero, negative, or non-numeric value is **ignored** and the default is used — the bound is never disabled (a stalled pull must always be able to fail). |
+
+## Runtime env knobs
+
+Set these in the per-project `.claude/env` (shell-sourced) or `.claude/settings.json` `env` (propagates to MCP subprocesses), or export them for one shell. Unlike the table above they are read at use-time, not at install-time.
+
+| Var | Default | Effect |
+|---|---|---|
+| `VCT_RESYNC_SPAWN_DISABLED` | unset (spawn allowed) | Truthy (`true`/`1`/`yes`/`on`, case-insensitive) → `vco_lib/codegraph_resync.py` never spawns a background analyzer child. The gate is checked **before** the per-spawn log file is created and before any `Popen`, so a disabled run also stops writing `~/.vct/logs/resync-*.log` records. For CI runners, air-gapped installs, and anyone who wants code-graph walks strictly on demand. `tests/conftest.py` sets it for the whole suite (with an explicit opt-out list for the tests that assert spawn behaviour), the same convention as `RL_HUB_POST_DISABLED`. |
+| `VCT_DISK_SPACE_MIN_FREE_GB` | `2` | Free-space floor, in GiB, for `vco doctor`'s disk-space probe (install root + vct state dir, deduplicated by filesystem). Strictly below the floor the finding is a warning; below 256 MiB it is critical; exactly at the floor is `ok`. Fractional values (`0.5`) are legal; a malformed or non-positive value falls back to the 2 GiB default and does **not** disable the check. Below the floor also emits the `disk_space_low` deferral condition — see [`features/05-install-and-secrets.md`](features/05-install-and-secrets.md#disk-space-probe). |
+
+For the RL event-retention knobs (`RL_EVENTS_*`) see [Paid-module license framework → RL event retention and archives](#rl-event-retention-and-archives); they apply on free installs too.
 
 ## Disabling hooks for debugging or CI
 

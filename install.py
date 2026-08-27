@@ -6699,8 +6699,8 @@ def main() -> int:
 
     # Cache Playwright MCP + Chromium so the default-enabled `playwright`
     # MCP entry doesn't stall on first browser-launch with a 150 MB
-    # download. Non-fatal: failures here only warn, since the MCP can
-    # still lazy-install on first call.
+    # download. Non-fatal: only the CHROMIUM skip lazy-installs later; a
+    # missing-npx skip means the entry cannot spawn (see the docstring).
     _install_playwright_browsers()
     _install_codegraph_treesitter(venv_python)  # Part 5: optional TS grammars
 
@@ -6711,9 +6711,9 @@ def main() -> int:
     # DISABLED in vct-launcher-core); pre-installing here means
     # opt-in is one click in the launcher, not a 30 s wait.
     # Opt-out: VCT_SKIP_MERMAID=1.
-    # Non-fatal: returns False on skip / npm missing / pin mismatch;
-    # the wrapper MCP still lazy-installs via `npx -y` when first
-    # invoked, so the path is graceful.
+    # Non-fatal: returns False on skip / npm missing / pin mismatch; the
+    # VCO-owned wrapper then spawns upstream via `npx_resolver.
+    # package_run_argv` (npx ladder → `npm exec`), or exits 1 if neither.
     _install_pinned_npm("mermaid_mcp", skip_env_var="VCT_SKIP_MERMAID")
 
     # Phase 2 (diagrams plan): pre-pin the vendored Excalidraw MCP

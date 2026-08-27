@@ -8,7 +8,7 @@ For projects whose every file was current (per-file gate `_get_existing_module`
 hit on path+hash+embed_revision), the walk short-circuited before any
 `_dedup_insert` / `_create_or_update_module` call, so `visited_uuids` stayed
 EMPTY — and the prune pass deleted the projects' ENTIRE code graphs
-(MeetApp: 399 modules + 1477 functions → 0 objects; Instambul1860: 436 → 0).
+(one field project: 399 modules + 1477 functions → 0 objects; another: 436 → 0).
 
 Fix under test: the dispatcher records every DISCOVERED file; the module-write
 choke-point records every WALKED file; `discovered − walked` (the skipped-but-
