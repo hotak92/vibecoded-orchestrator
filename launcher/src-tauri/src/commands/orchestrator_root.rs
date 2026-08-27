@@ -157,10 +157,14 @@ pub fn ensure_orchestrator_root(db: &Db) -> Result<(), String> {
             // `populate_project_state_from_filesystem` was never invoked,
             // leaving the launcher GUI's per-project tabs empty even
             // though the clone has 65 agents / 52 skills / 28 hooks on
-            // disk. The startup MCP backfill at lib.rs guarded on
-            // `count_project_mcp_servers == 0` and so skipped re-populate
-            // once any MCP rows existed, never recovering the agents/
-            // skills/hooks state. Populate here is idempotent (UPSERT
+            // disk. The startup MCP backfill that used to live in lib.rs
+            // guarded on `count_project_mcp_servers == 0` and so skipped
+            // re-populate once any MCP rows existed, never recovering the
+            // agents/skills/hooks state. (That backfill was replaced in
+            // v0.2.91 by the convergence engine, which does NOT re-run
+            // populate at all — so this call remains the only thing keeping
+            // the orchestrator-root tabs in sync.) Populate here is
+            // idempotent (UPSERT
             // preserves enabled toggles) and runs every startup so the
             // orchestrator-root tabs stay in sync with the clone.
             ensure_orchestrator_root_state_populated(db, &row.id, &row.folder_path, &row.name);
@@ -296,12 +300,16 @@ pub fn ensure_orchestrator_root(db: &Db) -> Result<(), String> {
 /// Pre-v0.2.22 this was missing. `ensure_orchestrator_root` registered
 /// the row + KG binding but never invoked the FS scanner, leaving
 /// `project_agents` / `project_skills` / `project_hooks` empty for the
-/// VibeCoded Orchestrator project. The startup MCP-backfill at
-/// `lib.rs::setup` ran the scanner ONLY when `count_project_mcp_servers
+/// VibeCoded Orchestrator project. The startup MCP-backfill that used to sit
+/// in `lib.rs::setup` ran the scanner ONLY when `count_project_mcp_servers
 /// == 0`, so once any MCP rows landed (the migration-010 sweep adds
 /// a couple by default), the gate closed and the agents/skills/hooks
 /// tables stayed empty forever — visible in the launcher GUI as
 /// "No agents registered." despite 65 .md files on disk.
+///
+/// v0.2.91 WP-E replaced that backfill with the convergence engine, which
+/// converges MCP ROWS only and never invokes the FS scanner. This function is
+/// therefore the sole populate path for the orchestrator-root project.
 fn ensure_orchestrator_root_state_populated(
     db: &Db,
     project_id: &str,

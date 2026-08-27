@@ -277,6 +277,38 @@ class BuildEntriesTests(unittest.TestCase):
             self.assertEqual(entry["env"], {})
             self.assertEqual(dropped, [])
 
+    def test_wrapper_entries_pythonpath_includes_install_root(self):
+        """v0.2.91 WP-E item 1 — the `-m`-invoked wrapper entries must carry
+        BOTH the install root and the package dir on PYTHONPATH.
+
+        `python -m claude_mcp_servers.wrappers.<proxy>` resolves the dotted
+        name from sys.path, so the package's PARENT must be there. Before
+        v0.2.91 only the package-INTERNAL dir was on PYTHONPATH and the only
+        thing making the entries work was `python -m`'s implicit cwd-prepend
+        — i.e. they resolved ONLY when the Claude Code session's cwd happened
+        to be the orchestrator root. `~/.claude.json` is global, so that one
+        value broke the wrapper MCPs for every other project.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            root = _make_pseudo_install_root(Path(td))
+            py = install._resolve_venv_python_for_install(root)
+            entries = install._build_python_mcp_entries(root, py, 8081, 11435, 50052, 11440)
+            by_name = {n: e for n, e, _ in entries}
+            expected = os.pathsep.join((str(root), str(root / "claude_mcp_servers")))
+            for name in ("mermaid", "excalidraw"):
+                self.assertEqual(
+                    by_name[name]["env"]["PYTHONPATH"],
+                    expected,
+                    f"{name} PYTHONPATH must be <root>{os.pathsep}<root>/claude_mcp_servers "
+                    f"so `python -m` resolves the package from ANY cwd",
+                )
+            # The absolute-script entries keep the package-internal path:
+            # their imports are top-level siblings, not a dotted package name.
+            self.assertEqual(
+                by_name["weaviate-kg"]["env"]["PYTHONPATH"],
+                str(root / "claude_mcp_servers"),
+            )
+
     def test_weaviate_entry_shape(self):
         with tempfile.TemporaryDirectory() as td:
             root = _make_pseudo_install_root(Path(td))

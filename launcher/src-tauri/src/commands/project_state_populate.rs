@@ -40,7 +40,10 @@ use std::path::Path;
 use serde_json::Value as JsonValue;
 
 use crate::commands::project_env_settings::LAST_RESORT_SHARED_KG_COLLECTION;
-use crate::db::project_mcp_servers::{is_bundled_mcp, is_default_disabled_mcp};
+// v0.2.91 WP-E item 3: `is_default_disabled_mcp` is no longer consulted here —
+// the fresh-insert default-disabled rule lives in the shared
+// `Db::register_project_mcp_server_honoring_defaults` helper.
+use crate::db::project_mcp_servers::is_bundled_mcp;
 use crate::db::project_state::{resolve_kind_paths, AgentOrSkill};
 use crate::db::Db;
 
@@ -696,23 +699,15 @@ fn populate_mcp_servers(
             let source = if user_added { "user" } else { "bundled" };
 
             // Phase 1.2 (diagrams plan): bundled MCPs marked
-            // default-disabled (currently just `mermaid`) get their
-            // initial `enabled=false` flag on FRESH inserts. We pre-
-            // compute the fresh-insert flag BEFORE the UPSERT — by
-            // the time the call returns, the row exists either way.
-            // Re-populate (row already exists) MUST preserve the
-            // user's enabled toggle — see project_mcp_servers.rs
-            // "upsert_preserves_enabled_flag_on_re_register" test.
-            let was_fresh_insert = if !user_added && is_default_disabled_mcp(name) {
-                match db.project_mcp_server_exists(project_id, name) {
-                    Ok(exists) => !exists,
-                    Err(_) => false, // err on the side of "not fresh" → don't touch enabled
-                }
-            } else {
-                false
-            };
-
-            if let Err(e) = db.register_project_mcp_server(
+            // default-disabled get their initial `enabled=false` flag on
+            // FRESH inserts; re-populate MUST preserve the user's toggle.
+            //
+            // v0.2.91 WP-E item 3: that discipline moved into the shared
+            // `Db::register_project_mcp_server_honoring_defaults` helper so
+            // the OTHER seeding path (mcp_registration's DB-sync) applies the
+            // identical rule instead of the raw enabled=1 UPSERT. Do NOT
+            // re-inline it here — one concern, one home.
+            if let Err(e) = db.register_project_mcp_server_honoring_defaults(
                 project_id,
                 name,
                 user_added,
@@ -728,17 +723,6 @@ fn populate_mcp_servers(
                 ));
             } else {
                 report.mcp_servers_inserted += 1;
-                // Default-disabled on first insert. We do this AFTER the
-                // upsert so SQL-side INSERT defaults stay simple
-                // (enabled=1 unconditionally on INSERT, then we toggle).
-                if was_fresh_insert {
-                    if let Err(e) = db.set_project_mcp_server_enabled(project_id, name, false) {
-                        report.warnings.push(format!(
-                            "set_project_mcp_server_enabled({}/{}, false): {}",
-                            rel_label, name, e
-                        ));
-                    }
-                }
             }
         }
     }

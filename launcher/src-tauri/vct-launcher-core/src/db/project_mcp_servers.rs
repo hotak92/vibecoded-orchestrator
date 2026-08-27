@@ -112,6 +112,26 @@ pub struct ProjectMcpServer {
     pub updated_at: i64,
 }
 
+/// Reserved `config_json` key carrying a row's retirement badge.
+///
+/// v0.2.91 WP-E item 2. Written by [`Db::retire_project_mcp_server`], read by
+/// the convergence engine to make the retire pass IDEMPOTENT (a row that
+/// already carries the badge for the same `removed_in` is left alone — which
+/// also means a deliberate user re-enable after retirement is never undone).
+/// The underscore prefix marks it as VCO-owned metadata inside a blob that
+/// otherwise mirrors the user's MCP entry.
+pub const MCP_RETIRED_CONFIG_KEY: &str = "_vct_retired";
+
+/// Outcome of [`Db::register_project_mcp_server_honoring_defaults`].
+///
+/// `default_disabled_applied` is true only when THAT call created the row AND
+/// the name ships default-disabled — i.e. exactly when `enabled` was flipped
+/// to 0 post-UPSERT. Callers use it for reporting; nothing branches on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct McpSeedOutcome {
+    pub default_disabled_applied: bool,
+}
+
 const VALID_SOURCE: &[&str] = &["bundled", "user", "paid-module", "project"];
 
 fn json_from_str(s: &str) -> JsonValue {
@@ -122,10 +142,89 @@ fn json_to_str(v: &JsonValue) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// The `$._vct_retired` badge currently stored on a row, if any.
+///
+/// Read under the CALLER's lock guard so the read-modify-write of
+/// `config_json` it feeds cannot interleave with another writer — the same
+/// discipline [`Db::retire_project_mcp_server`] uses for the write half.
+///
+/// A missing row, an unreadable row, or a `config_json` that is not an object
+/// all resolve to `None`: no badge to preserve. Never an error — a preserve
+/// step must not be able to fail a registration.
+fn stored_retirement_badge(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    mcp_name: &str,
+) -> Option<JsonValue> {
+    let cfg_s: String = conn
+        .query_row(
+            "SELECT config_json FROM project_mcp_servers
+             WHERE project_id = ?1 AND mcp_name = ?2",
+            params![project_id, mcp_name],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()?;
+    json_from_str(&cfg_s).get(MCP_RETIRED_CONFIG_KEY).cloned()
+}
+
+/// `config` with a previously-stored retirement badge merged back in.
+///
+/// v0.2.91 wave-3 (MAJOR-3). The badge is DURABLE VCO-owned metadata living
+/// inside a blob that otherwise mirrors the user's MCP entry, so the UPSERT's
+/// `config_json = excluded.config_json` wiped it — and the two writers run
+/// back-to-back in `apply_post_bundle_steps` (populate, then converge). The
+/// composed effect was a silent loop: populate re-UPSERTs a deprecated name
+/// still present in the project's files → badge gone → the engine no longer
+/// sees `AlreadyRetired` → it retires the row AGAIN, re-disabling an MCP the
+/// user had deliberately re-enabled, and writing a fresh audit row, on EVERY
+/// bundle update.
+///
+/// Preserving it here rather than in the seeding helper is deliberate: the raw
+/// UPSERT is already the ONE home for "durable row state survives
+/// re-registration" (it is where `enabled` is kept off the `DO UPDATE` list),
+/// and every caller — populate, the registration DB-sync, the engine's own
+/// seed — needs the same guarantee.
+///
+/// An incoming config that already carries the key wins: that is a deliberate
+/// re-badge by a caller that knows what it is writing.
+fn with_preserved_retirement_badge(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    mcp_name: &str,
+    config: &JsonValue,
+) -> JsonValue {
+    if config.get(MCP_RETIRED_CONFIG_KEY).is_some() {
+        return config.clone();
+    }
+    let Some(badge) = stored_retirement_badge(conn, project_id, mcp_name) else {
+        return config.clone();
+    };
+    let mut merged = config.clone();
+    match merged.as_object_mut() {
+        Some(obj) => {
+            obj.insert(MCP_RETIRED_CONFIG_KEY.to_string(), badge);
+        }
+        None => {
+            // Incoming config is not an object (legacy/hand-edited shape).
+            // Same rescue as the retire path: keep it under a sibling key.
+            let mut obj = serde_json::Map::new();
+            obj.insert("_prior_config".to_string(), merged.clone());
+            obj.insert(MCP_RETIRED_CONFIG_KEY.to_string(), badge);
+            merged = JsonValue::Object(obj);
+        }
+    }
+    merged
+}
+
 impl Db {
     /// Idempotent UPSERT of a single MCP server entry. Preserves the
     /// `enabled` column on conflict (mirrors register_project_agent /
-    /// register_project_hook contract — user toggles survive re-populate).
+    /// register_project_hook contract — user toggles survive re-populate)
+    /// and, since v0.2.91 wave-3, the `$._vct_retired` badge inside
+    /// `config_json` — see [`with_preserved_retirement_badge`] for why the two
+    /// belong in the same home.
     ///
     /// `is_user_added` is the discriminator the Custom MCP tab filters
     /// on. Caller computes it via `is_bundled_mcp(name)`.
@@ -148,8 +247,16 @@ impl Db {
             ));
         }
         let now = Utc::now().timestamp_millis();
-        let cfg = json_to_str(config);
         let guard = self.lock();
+        // v0.2.91 wave-3 (MAJOR-3): the durable retirement badge survives
+        // re-registration, exactly like `enabled` does. One indexed lookup on
+        // an O(10s)-row table per registration — paid unconditionally on
+        // purpose: gating it on "is this name currently deprecated?" would
+        // couple the preservation invariant to a table that moves, which is
+        // the double-gate shape that made the migration-010 backfill useless.
+        let effective_config =
+            with_preserved_retirement_badge(&guard, project_id, mcp_name, config);
+        let cfg = json_to_str(&effective_config);
         guard
             .execute(
                 "INSERT INTO project_mcp_servers
@@ -187,9 +294,89 @@ impl Db {
             source_file: source_file.map(str::to_string),
             enabled: true,
             command: command.map(str::to_string),
-            config: config.clone(),
+            config: effective_config,
             installed_at: now,
             updated_at: now,
+        })
+    }
+
+    /// Idempotent UPSERT that also applies the fresh-insert default-disabled
+    /// rule — v0.2.91 WP-E item 3, the ONE home for that discipline.
+    ///
+    /// Before this, the discipline lived inline in
+    /// `project_state_populate::populate_mcp_servers` ONLY. The other seeding
+    /// path — `mcp_registration::register_default_orchestrator_mcps`' DB-sync
+    /// — called the raw UPSERT, whose SQL inserts `enabled = 1`
+    /// unconditionally. Result: on the orchestrator ROOT project (the only
+    /// project that path ever writes) `mermaid` and `excalidraw` landed
+    /// `enabled = 1`, contradicting [`BUNDLED_MCP_DEFAULT_DISABLED`] and
+    /// `docs/GETTING_STARTED.md`'s "registered but default-disabled per
+    /// project" claim. Two seeding paths, one discipline, one copy of it.
+    ///
+    /// Contract (identical to the pre-extraction populate behaviour):
+    ///   * The UPSERT itself NEVER writes `enabled` on conflict, so a user
+    ///     toggle survives re-registration (pinned by
+    ///     `upsert_preserves_enabled_flag_on_re_register`).
+    ///   * `enabled = 0` is applied ONLY on a fresh insert of a BUNDLED
+    ///     default-disabled name. A user-added row that happens to be named
+    ///     `mermaid` is never touched (provenance wins).
+    ///   * The existence probe runs only when it can change the outcome, and
+    ///     a probe ERROR resolves to "not fresh" — leaving `enabled` alone is
+    ///     the conservative branch (probe failure is never evidence).
+    ///
+    /// ACCEPTED RESIDUE (v0.2.91 wave-3, MINOR-7 — a decision, not an
+    /// oversight): this closes the defect for rows created from now on. Roots
+    /// installed BEFORE it already carry `mermaid` / `excalidraw` rows at
+    /// `enabled = 1`, and those are deliberately NOT remediated. There is no
+    /// evidence that distinguishes "the old bug wrote 1" from "the user
+    /// enabled it on purpose" — the column holds the same value either way —
+    /// so a remediation pass would silently disable diagram MCPs some users
+    /// deliberately turned on. Flipping a user-visible toggle on a guess is
+    /// worse than a stale default on installs that already exist; the toggle
+    /// is one click in the launcher's Diagrams tab for anyone who wants it off.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_project_mcp_server_honoring_defaults(
+        &self,
+        project_id: &str,
+        mcp_name: &str,
+        is_user_added: bool,
+        source: &str,
+        source_module: Option<&str>,
+        source_file: Option<&str>,
+        command: Option<&str>,
+        config: &JsonValue,
+    ) -> Result<McpSeedOutcome, String> {
+        // Only bundled, default-disabled names can have their initial
+        // `enabled` flipped — skip the probe entirely otherwise (keeps the
+        // per-row cost identical to the pre-extraction inline block).
+        let candidate = !is_user_added && is_default_disabled_mcp(mcp_name);
+        let was_fresh_insert = if candidate {
+            // Probe failure → "not fresh" → don't touch `enabled`.
+            !self
+                .project_mcp_server_exists(project_id, mcp_name)
+                .unwrap_or(true)
+        } else {
+            false
+        };
+
+        self.register_project_mcp_server(
+            project_id,
+            mcp_name,
+            is_user_added,
+            source,
+            source_module,
+            source_file,
+            command,
+            config,
+        )?;
+
+        // Applied AFTER the upsert so the SQL stays a plain
+        // `enabled = 1`-on-INSERT statement.
+        if was_fresh_insert {
+            self.set_project_mcp_server_enabled(project_id, mcp_name, false)?;
+        }
+        Ok(McpSeedOutcome {
+            default_disabled_applied: was_fresh_insert,
         })
     }
 
@@ -274,6 +461,71 @@ impl Db {
         Ok(())
     }
 
+    /// Retire a bundled row: `enabled = 0` **plus** a durable retirement badge
+    /// merged into `config_json` under [`MCP_RETIRED_CONFIG_KEY`]. The row is
+    /// NEVER deleted (v0.2.91 WP-E item 2, no-auto-destroy: actual deletion
+    /// stays behind install.py's consent-gated `--remove-deprecated-mcps`).
+    ///
+    /// Read-modify-write of `config_json` happens under ONE lock guard so a
+    /// concurrent writer cannot lose the badge or the merge.
+    ///
+    /// `badge` is stored verbatim; the caller composes it (the engine's
+    /// `retired_badge`) so the version + reason come from the shared
+    /// `mcp_scan_rules.toml` `[deprecated.*]` registry rather than from
+    /// prose typed at the DB layer.
+    ///
+    /// Returns `true` when a row was updated, `false` when no such row exists
+    /// (a safe no-op — never an error, so a converge pass over a project that
+    /// dropped the row mid-sweep does not fail).
+    pub fn retire_project_mcp_server(
+        &self,
+        project_id: &str,
+        mcp_name: &str,
+        badge: &JsonValue,
+    ) -> Result<bool, String> {
+        let guard = self.lock();
+        let existing: Option<String> = guard
+            .query_row(
+                "SELECT config_json FROM project_mcp_servers
+                 WHERE project_id = ?1 AND mcp_name = ?2",
+                params![project_id, mcp_name],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("retire_project_mcp_server(select): {}", e))?;
+        let Some(cfg_s) = existing else {
+            return Ok(false);
+        };
+        let mut cfg = json_from_str(&cfg_s);
+        match cfg.as_object_mut() {
+            Some(obj) => {
+                obj.insert(MCP_RETIRED_CONFIG_KEY.to_string(), badge.clone());
+            }
+            None => {
+                // config_json held a non-object (legacy/hand-edited row).
+                // Preserve it under a sibling key rather than dropping it.
+                let mut obj = serde_json::Map::new();
+                obj.insert("_prior_config".to_string(), cfg.clone());
+                obj.insert(MCP_RETIRED_CONFIG_KEY.to_string(), badge.clone());
+                cfg = JsonValue::Object(obj);
+            }
+        }
+        let n = guard
+            .execute(
+                "UPDATE project_mcp_servers
+                 SET enabled = 0, config_json = ?1, updated_at = ?2
+                 WHERE project_id = ?3 AND mcp_name = ?4",
+                params![
+                    json_to_str(&cfg),
+                    Utc::now().timestamp_millis(),
+                    project_id,
+                    mcp_name
+                ],
+            )
+            .map_err(|e| format!("retire_project_mcp_server(update): {}", e))?;
+        Ok(n > 0)
+    }
+
     pub fn unregister_project_mcp_server(
         &self,
         project_id: &str,
@@ -311,9 +563,14 @@ impl Db {
         Ok(exists > 0)
     }
 
-    /// Quick existence check used by the startup backfill: a project
-    /// with zero rows is one that was registered before migration 010
-    /// shipped and needs a populate-from-disk pass.
+    /// Row count for one project.
+    ///
+    /// Historically the gate of the migration-010 startup backfill ("zero
+    /// rows ⇒ needs a populate-from-disk pass"). v0.2.91 WP-E retired that
+    /// gate: a zero-row project is NOT the only project that can be out of
+    /// date, and the convergence engine decides per-NAME (comparing the rows
+    /// it read against the current default set) rather than on a count. Kept
+    /// as a plain accessor — do NOT reintroduce it as a convergence gate.
     pub fn count_project_mcp_servers(&self, project_id: &str) -> Result<i64, String> {
         let guard = self.lock();
         guard

@@ -401,6 +401,34 @@ pub fn build_default_mcp_entries(
     let code_embed_url = format!("http://localhost:{}", ports.code_embed_port);
     let mcp_root = install_root.join("claude_mcp_servers");
     let pythonpath = mcp_root.display().to_string();
+    // v0.2.91 WP-E item 1 — cwd-INDEPENDENT PYTHONPATH for the `-m`-invoked
+    // wrapper entries (mermaid / excalidraw).
+    //
+    // `pythonpath` above points INSIDE the `claude_mcp_servers` package. That
+    // is enough for the absolute-script entries (weaviate-kg / search import
+    // their siblings as top-level modules) but NOT for
+    // `python -m claude_mcp_servers.wrappers.<proxy>`: resolving that dotted
+    // name needs the package's PARENT (the install root) on sys.path. Until
+    // v0.2.91 the only thing supplying it was `python -m`'s implicit
+    // cwd-prepend, so the wrapper MCPs resolved ONLY when Claude Code was
+    // launched from the orchestrator root. Claude Code spawns stdio MCPs with
+    // cwd = the SESSION's project directory, and `~/.claude.json` is global —
+    // so every OTHER project got `ModuleNotFoundError: No module named
+    // 'claude_mcp_servers'` (rc=1, before any package code runs, so the
+    // wrappers' own script-mode import fallbacks cannot help). That is the
+    // long-reported mermaid/excalidraw "Failed to connect".
+    //
+    // Both roots stay on the path (root FIRST) so the wrappers' `vco_lib`
+    // imports and any package-relative import keep resolving. MUST stay in
+    // sync with the Python mirror `install_mcp.py::_build_python_mcp_entries`
+    // (`wrapper_pythonpath`).
+    let path_sep = if cfg!(target_os = "windows") { ";" } else { ":" };
+    let wrapper_pythonpath = format!(
+        "{}{}{}",
+        install_root.display(),
+        path_sep,
+        pythonpath
+    );
     let venv_python_str = venv_python.display().to_string();
 
     // ── weaviate-kg ─────────────────────────────────────────────────────
@@ -490,7 +518,9 @@ pub fn build_default_mcp_entries(
     // sits in ~/.claude.json but the launcher's per-project gate keeps
     // Claude Code from spawning it.
     let mut mermaid_env = serde_json::Map::new();
-    mermaid_env.insert("PYTHONPATH".into(), pythonpath.clone().into());
+    // v0.2.91 WP-E item 1: `wrapper_pythonpath` (root + package dir), NOT the
+    // package-internal `pythonpath` — see its definition above.
+    mermaid_env.insert("PYTHONPATH".into(), wrapper_pythonpath.clone().into());
     let (mermaid_env_safe, mermaid_dropped) = filter_env_for_global_json(&mermaid_env);
     let mermaid_entry = serde_json::json!({
         "type": "stdio",
@@ -516,7 +546,8 @@ pub fn build_default_mcp_entries(
     // sits in ~/.claude.json but the launcher's per-project gate keeps
     // Claude Code from spawning it. Same posture as Mermaid above.
     let mut excalidraw_env = serde_json::Map::new();
-    excalidraw_env.insert("PYTHONPATH".into(), pythonpath.clone().into());
+    // v0.2.91 WP-E item 1: same cwd-independent PYTHONPATH as mermaid.
+    excalidraw_env.insert("PYTHONPATH".into(), wrapper_pythonpath.clone().into());
     let (excalidraw_env_safe, excalidraw_dropped) =
         filter_env_for_global_json(&excalidraw_env);
     let excalidraw_entry = serde_json::json!({
@@ -680,7 +711,17 @@ pub fn register_default_orchestrator_mcps(
                 let command = entry
                     .get("command")
                     .and_then(|v| v.as_str());
-                if let Err(e) = db.register_project_mcp_server(
+                // v0.2.91 WP-E item 3: goes through the SHARED
+                // default-disabled helper, not the raw UPSERT.
+                //
+                // The raw UPSERT's SQL writes `enabled = 1` on INSERT
+                // unconditionally, so this path used to seed the orchestrator
+                // root's `mermaid` / `excalidraw` rows ENABLED — against
+                // `BUNDLED_MCP_DEFAULT_DISABLED` and against
+                // docs/GETTING_STARTED.md's "default-disabled per project"
+                // claim, while the populate path applied the rule correctly.
+                // Same discipline, one home (`project_mcp_servers.rs`).
+                if let Err(e) = db.register_project_mcp_server_honoring_defaults(
                     &project_id,
                     &name,
                     false,
@@ -1177,6 +1218,152 @@ mod tests {
             playwright_dropped
         );
 
+        // ── wrapper PYTHONPATH shape (v0.2.91 WP-E item 1) ───────────
+        // `python -m claude_mcp_servers.wrappers.<proxy>` resolves the
+        // dotted name from sys.path, so the package's PARENT (the install
+        // root) MUST be on PYTHONPATH. Pre-v0.2.91 only the package-
+        // internal dir was, and the entries worked ONLY from a cwd that
+        // happened to be the install root.
+        let sep = if cfg!(target_os = "windows") { ";" } else { ":" };
+        let expected_wrapper_pp = format!(
+            "{}{}{}",
+            root.display(),
+            sep,
+            root.join("claude_mcp_servers").display()
+        );
+        for (name, entry, _) in entries.iter().filter(|(n, _, _)| {
+            n == "mermaid" || n == "excalidraw"
+        }) {
+            assert_eq!(
+                entry["env"]["PYTHONPATH"].as_str().unwrap(),
+                expected_wrapper_pp,
+                "`{}` PYTHONPATH must be <install_root>{}<install_root>/claude_mcp_servers \
+                 so `python -m` resolves the package from ANY cwd",
+                name,
+                sep
+            );
+        }
+        // The absolute-script entries keep the package-internal path (their
+        // imports are top-level siblings, not a dotted package name).
+        assert_eq!(
+            weaviate["env"]["PYTHONPATH"].as_str().unwrap(),
+            root.join("claude_mcp_servers").display().to_string(),
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // ── v0.2.91 WP-E item 3: default-disabled parity on the DB-sync ────
+
+    /// ACT: the registration DB-sync seeds the orchestrator-root project's
+    /// rows through the SHARED default-disabled helper, so `mermaid` and
+    /// `excalidraw` land `enabled = false` exactly like the populate path
+    /// does — while the default-ENABLED entries land `enabled = true`.
+    ///
+    /// Red-proof (c67ef888): this path called the raw
+    /// `register_project_mcp_server`, whose SQL writes `enabled = 1` on
+    /// INSERT unconditionally, so both diagram MCPs came back enabled and
+    /// this assertion failed. That is why the field DB showed the root
+    /// project's mermaid/excalidraw rows enabled against
+    /// `BUNDLED_MCP_DEFAULT_DISABLED`.
+    #[test]
+    fn db_sync_applies_default_disabled_on_fresh_insert() {
+        use crate::db::models::ProjectHost;
+        use crate::db::Db;
+
+        let root = make_pseudo_install_root();
+        let db = Db::open_in_memory().unwrap();
+        let pid = uuid::Uuid::new_v4().to_string();
+        db.insert_project(
+            &pid,
+            "Orchestrator Root",
+            &root.to_string_lossy(),
+            ProjectHost::Base,
+            "orchestrator-root",
+        )
+        .unwrap();
+
+        let target = tmp_target();
+        let report = register_default_orchestrator_mcps(
+            &root,
+            ServicePorts::default(),
+            Some(&target),
+            Some(&db),
+        )
+        .expect("register_default_orchestrator_mcps");
+        assert!(
+            report.db_warnings.is_empty(),
+            "db sync warnings: {:?}",
+            report.db_warnings
+        );
+
+        let rows = db.list_project_mcp_servers(&pid).unwrap();
+        let by_name: std::collections::HashMap<&str, bool> =
+            rows.iter().map(|r| (r.mcp_name.as_str(), r.enabled)).collect();
+        assert_eq!(by_name.len(), DEFAULT_MCP_ENTRY_NAMES.len());
+        for name in vct_launcher_core::db::project_mcp_servers::BUNDLED_MCP_DEFAULT_DISABLED {
+            assert_eq!(
+                by_name.get(name),
+                Some(&false),
+                "`{}` is BUNDLED_MCP_DEFAULT_DISABLED — the DB-sync must seed it \
+                 enabled=false, same as the populate path",
+                name
+            );
+        }
+        for name in DEFAULT_MCP_ENTRY_NAMES {
+            if vct_launcher_core::db::project_mcp_servers::is_default_disabled_mcp(name) {
+                continue;
+            }
+            assert_eq!(
+                by_name.get(name),
+                Some(&true),
+                "`{}` is not default-disabled — it must seed enabled=true",
+                name
+            );
+        }
+
+        fs::remove_file(&target).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// LEAVE-ALONE: a re-run must NOT re-apply the default-disabled flip, and
+    /// must NOT undo a deliberate user opt-in. The row already exists, so the
+    /// UPSERT's enabled-preserving `DO UPDATE` is the only thing that runs.
+    #[test]
+    fn db_sync_rerun_preserves_user_enabled_toggle() {
+        use crate::db::models::ProjectHost;
+        use crate::db::Db;
+
+        let root = make_pseudo_install_root();
+        let db = Db::open_in_memory().unwrap();
+        let pid = uuid::Uuid::new_v4().to_string();
+        db.insert_project(
+            &pid,
+            "Orchestrator Root",
+            &root.to_string_lossy(),
+            ProjectHost::Base,
+            "orchestrator-root",
+        )
+        .unwrap();
+        let target = tmp_target();
+
+        register_default_orchestrator_mcps(&root, ServicePorts::default(), Some(&target), Some(&db))
+            .unwrap();
+        // The user opts into diagrams via the launcher's DiagramsTab.
+        db.set_project_mcp_server_enabled(&pid, "mermaid", true).unwrap();
+
+        register_default_orchestrator_mcps(&root, ServicePorts::default(), Some(&target), Some(&db))
+            .unwrap();
+
+        let rows = db.list_project_mcp_servers(&pid).unwrap();
+        let mermaid = rows.iter().find(|r| r.mcp_name == "mermaid").unwrap();
+        assert!(
+            mermaid.enabled,
+            "re-registration must never re-apply the default-disabled flip over \
+             a user opt-in (enabled is set on INSERT only)"
+        );
+
+        fs::remove_file(&target).ok();
         fs::remove_dir_all(&root).ok();
     }
 

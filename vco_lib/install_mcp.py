@@ -232,6 +232,27 @@ def _build_python_mcp_entries(
     code_embed_url = f"http://localhost:{code_embed_port}"
     mcp_root = install_root / "claude_mcp_servers"
     pythonpath = str(mcp_root)
+    # v0.2.91 WP-E item 1 — cwd-INDEPENDENT PYTHONPATH for the `-m`-invoked
+    # wrapper entries (mermaid / excalidraw).
+    #
+    # `pythonpath` above points INSIDE the `claude_mcp_servers` package, which
+    # is enough for the absolute-script entries (weaviate-kg / search import
+    # their siblings as top-level modules) but NOT for
+    # `python -m claude_mcp_servers.wrappers.<proxy>`: resolving that dotted
+    # name needs the package's PARENT (the install root) on sys.path. Until
+    # v0.2.91 the only thing supplying it was `python -m`'s implicit
+    # cwd-prepend, so the wrapper MCPs resolved ONLY when Claude Code happened
+    # to be launched from the orchestrator root. Every other project got
+    # `ModuleNotFoundError: No module named 'claude_mcp_servers'` (rc=1,
+    # instantly) — the long-reported mermaid/excalidraw "Failed to connect".
+    # `~/.claude.json` is global, so ONE bad value broke every non-root
+    # project.
+    #
+    # Both roots stay on the path (root FIRST) so the wrappers' `vco_lib`
+    # imports and any top-level `claude_mcp_servers`-relative import keep
+    # resolving. MUST stay in sync with the Rust builder
+    # mcp_registration.rs::build_default_mcp_entries (`wrapper_pythonpath`).
+    wrapper_pythonpath = os.pathsep.join((str(install_root), pythonpath))
     venv_python_str = str(venv_python)
 
     # weaviate-kg
@@ -304,7 +325,9 @@ def _build_python_mcp_entries(
     # — the wrapper itself spawns `npx` as a child once it's resolved the
     # per-project tool allowlist. Mirrors the Rust path's mermaid entry
     # in mcp_registration.rs::build_default_mcp_entries.
-    mermaid_env_raw = {"PYTHONPATH": pythonpath}
+    # v0.2.91 WP-E item 1: `wrapper_pythonpath` (root + package dir), NOT the
+    # package-internal `pythonpath` — see its definition above.
+    mermaid_env_raw = {"PYTHONPATH": wrapper_pythonpath}
     mermaid_env, mermaid_dropped = _filter_env_for_global_json(mermaid_env_raw)
     mermaid_entry = {
         "type": "stdio",
@@ -326,7 +349,8 @@ def _build_python_mcp_entries(
     # once it's resolved the per-project tool allowlist. Mirrors the
     # Rust path's excalidraw entry in
     # mcp_registration.rs::build_default_mcp_entries.
-    excalidraw_env_raw = {"PYTHONPATH": pythonpath}
+    # v0.2.91 WP-E item 1: same cwd-independent PYTHONPATH as mermaid.
+    excalidraw_env_raw = {"PYTHONPATH": wrapper_pythonpath}
     excalidraw_env, excalidraw_dropped = _filter_env_for_global_json(excalidraw_env_raw)
     excalidraw_entry = {
         "type": "stdio",

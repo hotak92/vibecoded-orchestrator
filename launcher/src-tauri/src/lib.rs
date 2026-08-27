@@ -27,6 +27,16 @@ mod tray;
 #[path = "commands/binding_reconcile.rs"]
 mod binding_reconcile;
 
+// v0.2.91 WP-E (decision #8): the convergence engine — one declarative table
+// of current-defaults tenants plus the two hard invariants (provenance wins;
+// positive evidence only), replacing the per-generation bespoke reconciler
+// habit. `project_mcp_servers` is its first WRITE tenant; the rest are
+// report-only this cycle. Declared via `#[path]` for the same
+// single-file-ownership reason as `binding_reconcile` above — collapse both
+// into `commands/mod.rs` when a cleanup wave owns that file.
+#[path = "commands/convergence.rs"]
+mod convergence;
+
 // v0.2.26: WebKitGTK pre-flight probe — public so main.rs (which is a
 // separate compilation unit from this lib) can call it before Tauri
 // init. Linux-only at the use site; the module's own `#![cfg(...)]`
@@ -1146,66 +1156,76 @@ pub fn run() {
                 app.handle().clone(),
             );
 
-            // Migration 010 follow-up (2026-05-10): backfill the
-            // `project_mcp_servers` table for projects registered before
-            // this migration shipped. For each existing project with zero
-            // MCP rows, re-run `populate_project_state_from_filesystem`
-            // to seed the `.claude/settings.json::mcpServers` +
-            // `.mcp.json` mirror. The populate function is idempotent
-            // and preserves user toggles — running it on already-seeded
-            // projects is a no-op for non-MCP rows.
+            // v0.2.91 WP-E item 2 — the CONVERGENCE ENGINE boot pass.
             //
-            // Soft-fail: a single project's populate hiccup MUST NOT
-            // block launcher boot. We log + continue.
+            // Replaces the migration-010 follow-up backfill that stood here
+            // from 2026-05-10 to v0.2.90. That block was double-gated into
+            // uselessness and converged NOTHING for a year:
+            //   (a) it only touched projects with `count_project_mcp_servers
+            //       == 0`, so legacy projects' stale pre-retirement `ollama`
+            //       rows were never reachable; and
+            //   (b) its only action was to re-run `populate_*`, a PURE
+            //       mirror of `.claude/settings.json` / `.mcp.json` — and
+            //       modern installs register bundled MCPs GLOBALLY in
+            //       `~/.claude.json`, so those files are empty and the
+            //       populate inserted 0 rows for the zero-row projects,
+            //       every boot, forever.
+            // Catalog alignment was never populate's job; populate stays a
+            // pure disk mirror and the engine owns the current-defaults
+            // convergence (see `convergence` module docs).
             //
-            // Cost: O(projects) on disk reads, capped at ~10ms per
-            // project on healthy disks. Fine for a startup hook.
+            // Spawned, not inline: the engine's deferral channel shells out
+            // to Python on a non-clean pass, and NOTHING may sit between here
+            // and the `[vct] setup complete` marker. `tauri::async_runtime::
+            // spawn` (never a bare `tokio::spawn` — a bare spawn from this
+            // sync `setup()` has no reactor: the v0.2.90 boot-death class).
+            // Fully soft-fail and idempotent across boots.
             {
-                use tauri::Manager;
-                if let Some(db) = app.try_state::<db::Db>() {
-                    if let Ok(rows) = db.list_projects() {
-                        let mut seeded = 0usize;
-                        for proj in &rows {
-                            // Only act on projects that haven't been
-                            // populated yet (count==0). New projects
-                            // created post-010 already have rows from
-                            // create_project_v2's populate call.
-                            let needs_seed = matches!(
-                                db.count_project_mcp_servers(&proj.id),
-                                Ok(0)
-                            );
-                            if !needs_seed {
-                                continue;
-                            }
-                            let folder = std::path::Path::new(&proj.folder_path);
-                            if !folder.is_dir() {
-                                continue;
-                            }
-                            let report = crate::commands::project_state_populate::
-                                populate_project_state_from_filesystem(
-                                    &proj.id,
-                                    &proj.name,
-                                    folder,
-                                    db.inner(),
-                                );
-                            if report.mcp_servers_inserted > 0 {
-                                seeded += 1;
-                            }
-                            for w in &report.warnings {
-                                eprintln!(
-                                    "[vct] mcp-backfill warning ({}): {}",
-                                    proj.id, w
-                                );
-                            }
-                        }
-                        if seeded > 0 {
+                let converge_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    // The sweep itself is BLOCKING (SQLite under a mutex, two
+                    // small file reads per project, and a Python spawn on the
+                    // deferral path). Running it inline in an async task would
+                    // occupy a runtime worker for its whole duration; hand it
+                    // to the blocking pool instead. `spawn_blocking` INSIDE the
+                    // async spawn, never instead of it: the marker semantics
+                    // above depend on `setup()` returning immediately, and
+                    // `tauri::async_runtime::spawn` is what guarantees that.
+                    let joined = tauri::async_runtime::spawn_blocking(move || {
+                        use tauri::Manager;
+                        let db = converge_handle.try_state::<db::Db>()?;
+                        let repo_root =
+                            commands::installer::find_local_repo_root().ok();
+                        Some(crate::convergence::converge_at_boot(
+                            db.inner(),
+                            repo_root.as_deref(),
+                        ))
+                    })
+                    .await;
+                    let report = match joined {
+                        Ok(Some(report)) => report,
+                        // No DB state yet — nothing to converge, not an error.
+                        Ok(None) => return,
+                        Err(e) => {
                             eprintln!(
-                                "[vct] mcp-backfill: seeded MCP servers for {} project(s) (migration 010)",
-                                seeded
+                                "[vct] convergence (boot): sweep task did not \
+                                 complete ({}); nothing converged this boot",
+                                e
                             );
+                            return;
                         }
+                    };
+                    if !report.is_quiet() {
+                        eprintln!(
+                            "[vct] convergence (boot): seeded {} row(s), retired {}, \
+                             skipped {} unreadable project(s), {} pending",
+                            report.seeded,
+                            report.retired,
+                            report.skipped_unreadable,
+                            report.pending.len()
+                        );
                     }
-                }
+                });
             }
 
             // v0.2.27 (Wave 2 / agent-skill-keyword-suggest-and-fs-disable

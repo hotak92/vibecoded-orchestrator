@@ -36,6 +36,7 @@
 //! are tolerated by serde (`deny_unknown_fields` is NOT set) — add an
 //! accessor when a Rust consumer grows for them.
 
+use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use serde::Deserialize;
@@ -108,6 +109,27 @@ pub struct McpScanRules {
     /// `project_mcp_servers::BUNDLED_MCP_DEFAULT_DISABLED` (WP-B5). Subset of
     /// bundled_mcp_names.
     pub bundled_mcp_default_disabled: Vec<String>,
+    /// [deprecated.*] — MCPs dropped from the default set, keyed by name.
+    /// Python-only until v0.2.91 WP-E; the convergence engine's MCP-rows
+    /// tenant now reads the SAME registry to retire stale per-project rows,
+    /// so both languages agree on what "deprecated" means and on the version
+    /// + reason shown to the user. `BTreeMap` so iteration order is stable
+    /// (audit rows and badges must not reshuffle between runs).
+    pub deprecated_default_mcps: BTreeMap<String, DeprecatedMcp>,
+}
+
+/// One `[deprecated.<name>]` table. Field semantics are documented in
+/// `mcp_scan_rules.toml` itself; mirrors the Python
+/// `mcp_scan_rules.deprecated_default_mcps()` shape.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DeprecatedMcp {
+    /// Release the MCP left the default set (e.g. `"v0.2.11"`).
+    pub removed_in: String,
+    /// Human-readable rationale, surfaced verbatim in the retirement badge.
+    pub reason: String,
+    /// Bundled-module manifest that re-adds it, if any.
+    #[serde(default)]
+    pub opt_in_manifest: Option<String>,
 }
 
 // ── Wire schema (serde) ────────────────────────────────────────────────────
@@ -124,6 +146,11 @@ struct RawTable {
     // empty slice, which the same-crate WP-B5 drift test flags immediately.
     #[serde(default)]
     bundled: RawBundled,
+    /// Optional at the wire level for the same fixture reason as `bundled`.
+    /// The real table always carries at least `[deprecated.ollama]`, pinned by
+    /// `deprecated_registry_loads_expected_values`.
+    #[serde(default)]
+    deprecated: BTreeMap<String, DeprecatedMcp>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,6 +192,7 @@ pub fn parse_str(toml_text: &str) -> Result<McpScanRules, McpScanRulesError> {
         default_mcp_entry_names: raw.entries.default_names,
         bundled_mcp_names: raw.bundled.all_names,
         bundled_mcp_default_disabled: raw.bundled.default_disabled,
+        deprecated_default_mcps: raw.deprecated,
     })
 }
 
@@ -216,6 +244,16 @@ pub fn bundled_mcp_names() -> &'static [String] {
 /// `project_mcp_servers::BUNDLED_MCP_DEFAULT_DISABLED` (v0.2.83 WP-B5).
 pub fn bundled_mcp_default_disabled() -> &'static [String] {
     &RULES.bundled_mcp_default_disabled
+}
+
+/// MCPs dropped from the default install set, keyed by name (v0.2.91 WP-E).
+///
+/// Consumers: the convergence engine's `project_mcp_servers` tenant (retires
+/// stale per-project rows, badged with `removed_in` + `reason`) and — on the
+/// Python side, from the SAME table — install.py's consent-gated
+/// `~/.claude.json` removal flow. Neither side owns the data.
+pub fn deprecated_default_mcps() -> &'static BTreeMap<String, DeprecatedMcp> {
+    &RULES.deprecated_default_mcps
 }
 
 #[cfg(test)]
@@ -277,6 +315,47 @@ mod tests {
             bundled_mcp_default_disabled(),
             r.bundled_mcp_default_disabled.as_slice()
         );
+    }
+
+    /// v0.2.91 WP-E: the `[deprecated.*]` registry is now a RUST consumer too
+    /// (the convergence engine retires per-project rows from it). Pin the
+    /// embedded values so a table edit updates this in the same commit.
+    #[test]
+    fn deprecated_registry_loads_expected_values() {
+        let d = deprecated_default_mcps();
+        let ollama = d
+            .get("ollama")
+            .expect("[deprecated.ollama] must be in the embedded table");
+        assert_eq!(ollama.removed_in, "v0.2.11");
+        assert!(
+            ollama.reason.starts_with("Ollama MCP server dropped"),
+            "reason is rendered verbatim into the retirement badge: {}",
+            ollama.reason
+        );
+        assert_eq!(
+            ollama.opt_in_manifest.as_deref(),
+            Some("launcher/bundled_manifests/vct-ollama.json"),
+        );
+        // Every deprecated name must be a name the orchestrator once shipped
+        // — otherwise the retire pass would badge a row it does not own.
+        for name in d.keys() {
+            assert!(
+                bundled_mcp_names().iter().any(|b| b == name),
+                "[deprecated.{}] is not in [bundled].all_names — a deprecated \
+                 MCP must still be recognised as orchestrator-shipped so the \
+                 is_user_added discriminator stays correct",
+                name
+            );
+        }
+        // …and must NOT still be in the set the builder composes.
+        for name in d.keys() {
+            assert!(
+                !default_mcp_entry_names().iter().any(|b| b == name),
+                "[deprecated.{}] is still in [entries].default_names — the \
+                 convergence engine would seed and retire it on the same pass",
+                name
+            );
+        }
     }
 
     #[test]

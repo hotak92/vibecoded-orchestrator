@@ -893,6 +893,27 @@ pub(crate) async fn apply_post_bundle_steps(
         }
     }
 
+    // v0.2.91 WP-E item 2: converge THIS project's MCP rows to the current
+    // shipped default set, right after the populate above.
+    //
+    // Populate stays a pure disk mirror (`.claude/settings.json` +
+    // `.mcp.json`); catalog alignment is the convergence engine's job. A
+    // bundle update is one of the two moments the shipped default set can
+    // move under a project, so running it here closes the window between the
+    // update and the user's next launcher restart (the other entry point is
+    // the boot sweep in `lib.rs::setup`). Idempotent, soft-fail, and bound by
+    // the same two invariants (provenance wins; positive evidence only) — see
+    // the `convergence` module docs.
+    for w in crate::convergence::converge_project_after_bundle_update(
+        db,
+        project_id,
+        project_name,
+        folder,
+    ) {
+        eprintln!("[vct] {} ({})", w, project_id);
+        warnings.push(w);
+    }
+
     // v0.2.49 Stream B: seed `enabled_for_project=true` rows for every
     // global-scope module already installed on the host. Without this,
     // a brand-new project would default to "no opinion" for each global

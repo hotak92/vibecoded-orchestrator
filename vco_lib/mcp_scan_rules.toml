@@ -220,11 +220,18 @@ uninstall_scrub_shape_gated = [
 ]
 
 # ── Deprecated-default MCP registry ────────────────────────────────────────
-# MCPs that used to be in the default install set but were dropped. On every
-# --update, ~/.claude.json is scanned for these names; a match whose command
-# path is INSIDE install_root ("our" entry) gets a consent-prompted-removal
-# deferral. Python-only consumer today (_DEPRECATED_DEFAULT_MCPS); the data
-# lives here so a future Rust consumer reads the identical registry.
+# MCPs that used to be in the default install set but were dropped.
+#
+# TWO consumers read this table, in two languages, and neither owns it:
+#   * Python (`_DEPRECATED_DEFAULT_MCPS`) — on every --update, ~/.claude.json
+#     is scanned for these names; a match whose command path is INSIDE
+#     install_root ("our" entry) gets a consent-prompted-removal deferral.
+#   * Rust (`mcp_scan_rules::deprecated_default_mcps`, v0.2.91 WP-E) — the
+#     launcher's convergence engine retires stale per-project
+#     `project_mcp_servers` rows, stamping `removed_in` + `reason` verbatim
+#     into the row's retirement badge.
+# Both therefore agree on what "deprecated" means and on the exact version +
+# rationale the user is shown.
 #
 # One [deprecated.<name>] table per deprecated MCP. Fields:
 #   removed_in      — release the MCP left the default set

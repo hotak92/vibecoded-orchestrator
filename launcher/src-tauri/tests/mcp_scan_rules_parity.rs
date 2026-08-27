@@ -64,6 +64,12 @@ fn embedded_rules_match_on_disk_table() {
         embedded.default_mcp_entry_names, disk.default_mcp_entry_names,
         "embedded default_mcp_entry_names drifted from the on-disk table"
     );
+    // v0.2.91 WP-E: the deprecated registry became a Rust consumer (the
+    // convergence engine's MCP-rows tenant). Same drift lock as the rest.
+    assert_eq!(
+        embedded.deprecated_default_mcps, disk.deprecated_default_mcps,
+        "embedded deprecated_default_mcps drifted from the on-disk table"
+    );
 }
 
 /// The public accessors return the on-disk table's values. This is the
@@ -83,6 +89,10 @@ fn accessors_match_on_disk_table() {
     assert_eq!(
         mcp_scan_rules::default_mcp_entry_names(),
         disk.default_mcp_entry_names.as_slice(),
+    );
+    assert_eq!(
+        mcp_scan_rules::deprecated_default_mcps(),
+        &disk.deprecated_default_mcps,
     );
 }
 
