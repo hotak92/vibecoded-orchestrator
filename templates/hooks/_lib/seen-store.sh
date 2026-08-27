@@ -134,6 +134,44 @@ vco_seen_add() {
     printf '%s\n' "$key" >> "$file" 2>/dev/null || true
 }
 
+# vco_seen_src_matches <reads_file> <src> [project_root]
+# P4 (v0.2.91): rule-(b) comparison WITH PATH-FORM NORMALIZATION.
+#
+# The bug this closes: the ledger and the producers do not always agree on path
+# SHAPE. pre-tool-use writes the REPO-RELATIVE form (via vco_to_repo_relative),
+# while a producer's "| src=" trailer can be absolute (a peer/extra-path code
+# graph whose file_path is rooted elsewhere) and the new MCP-retrieval recorder
+# writes whatever the MCP result carried. A single `grep -Fxq` on ONE shape
+# therefore silently never matched for those cases — the suppression looked
+# implemented but was inert.
+#
+# Fix: compare on BOTH shapes. Normalizing only to absolute (as first proposed)
+# would REGRESS the common relative-vs-relative match, since the ledger holds
+# relative paths — so the check is symmetric: try as-is, then the other form.
+# Still an EXACT match on each shape; no prefix/suffix fuzz, so a path that was
+# never Read can never be mistaken for one that was.
+#
+# MUST MATCH seen-store.ps1's Test-VcoSeenSrcMatches.
+vco_seen_src_matches() {
+    local reads_file="$1" src="$2"
+    local proot="${3:-${PROJECT_ROOT:-${CLAUDE_PROJECT_DIR:-}}}"
+    [ -n "$reads_file" ] && [ -n "$src" ] || return 1
+    vco_seen_has "$reads_file" "$src" && return 0
+    [ -n "$proot" ] || return 1
+    case "$src" in
+        /*)
+            # Absolute src → also try its repo-relative form (the ledger's shape).
+            vco_seen_has "$reads_file" "$(vco_to_repo_relative "$src" "$proot")" && return 0
+            ;;
+        *)
+            # Relative src → also try the absolute form (a ledger written by a
+            # surface that recorded an as-Read absolute path).
+            vco_seen_has "$reads_file" "$proot/$src" && return 0
+            ;;
+    esac
+    return 1
+}
+
 # --- Per-session codegraph inject VOLUME cap (v0.2.72 P6) ------------------
 # The seen-store above dedups by IDENTITY (same title#hash / full_name is not
 # re-injected). That bounds RE-injection but NOT total injection: a long session
@@ -242,6 +280,42 @@ vco_cg_inject_note_once() {
     return 0
 }
 
+# vco_cap_key_field <text>
+# Truncate a key's identity field (KG title / CODE full_name) to at most 200
+# UTF-8 BYTES, cut on a character boundary.
+#
+# MUST MATCH seen-store.ps1's Get-VcoCapKeyField and
+# templates/scripts/mcp_retrieval_record.py's cap_key_field. All three write
+# keys into the SAME per-session store, so the truncation axis has to be one
+# thing everywhere.
+#
+# Why BYTES, and why pinned (v0.2.91 wave-4 NIT-4): bash's `${v:0:200}` counts
+# CHARACTERS under a UTF-8 locale but BYTES under LC_ALL=C, and a hook shell's
+# ambient locale is not something VCO controls; PowerShell's Substring(0,200)
+# counts UTF-16 code units (2 per astral char); Python's [:200] counts code
+# points. For a >200-byte non-ASCII title that is three different keys → the
+# recorder's key never matches the injector's and the suppression silently
+# misses (fails open). Bytes is the ONE definition all three can pin without
+# depending on the ambient locale, so `local LC_ALL` pins it here (bash
+# re-runs setlocale on assignment and `local` restores it on return).
+#
+# The cut backs off over trailing UTF-8 CONTINUATION bytes (10xxxxxx) so a
+# truncated multi-byte sequence is dropped rather than emitted half-written —
+# the same result Python's `bytes[:200].decode("utf-8", "ignore")` produces.
+vco_cap_key_field() {
+    local LC_ALL=C LC_CTYPE=C
+    local s="$1"
+    [ "${#s}" -le 200 ] && { printf '%s' "$s"; return 0; }
+    local n=200
+    while [ "$n" -gt 0 ]; do
+        case "${s:$n:1}" in
+            [$'\x80'-$'\xbf']) n=$((n - 1)) ;;
+            *) break ;;
+        esac
+    done
+    printf '%s' "${s:0:$n}"
+}
+
 # vco_seen_key_for_header <prefix> <rest>
 # Derive the dedup KEY for one injected block, given the header prefix
 # ("KG"|"CODE") and the part after "<prefix>: ".
@@ -255,7 +329,43 @@ vco_seen_first_field() {
     rest="${rest#KG: }"
     rest="${rest#CODE: }"
     local field="${rest%% | *}"
-    printf '%s' "${field:0:200}"
+    vco_cap_key_field "$field"
+}
+
+# vco_seen_normalize_body <text>
+# Canonicalize a block body before hashing: trailing newlines collapse to
+# EXACTLY ONE (and an empty body stays empty).
+#
+# WHY (v0.2.91 wave-4 MINOR-5): the number of trailing newlines a block carries
+# depends on WHERE IN THE BLOB the block sits, which is not a property of the
+# content at all:
+#   * the producer prints header + `print(body)`, so a body that itself ends in
+#     "\n" emits an extra EMPTY line;
+#   * `KG_RESULT="$(…)"` strips ALL trailing newlines from the WHOLE blob, so
+#     that empty line survives for every block EXCEPT THE LAST one.
+# Measured on the real pair: for content "x\n", a non-final block reassembles
+# to "x\n\n" and a final block to "x\n" — two different keys for the same
+# chunk, and neither one a value the recorder could predict (it cannot know a
+# result's eventual position). Collapsing here makes the key a function of the
+# CONTENT only, and templates/scripts/mcp_retrieval_record.py applies the
+# identical rule so an explicit MCP retrieval and a hook injection agree.
+#
+# MUST MATCH seen-store.ps1's Get-VcoSeenNormalizedBody and
+# mcp_retrieval_record.py's normalize_block_body.
+#
+# Sets _VCO_SEEN_BODY_NORM rather than echoing: a `$(vco_seen_normalize_body …)`
+# capture would strip the very trailing newline this function just restored.
+vco_seen_normalize_body() {
+    local body="$1"
+    # Strip the whole trailing run of newlines...
+    body="${body%"${body##*[!$'\n']}"}"
+    # ...then restore exactly one, unless the body was empty (a summary-tier
+    # block renders its text on the HEADER line and has no body at all).
+    if [ -n "$body" ]; then
+        _VCO_SEEN_BODY_NORM="${body}"$'\n'
+    else
+        _VCO_SEEN_BODY_NORM=""
+    fi
 }
 
 # vco_seen_hash <text> — short stable hash of a block body for the per-chunk KG
@@ -316,9 +426,12 @@ vco_filter_seen_blocks() {
         # Compute the dedup key.
         local key=""
         if [ "$cur_prefix" = "KG" ]; then
-            # Per-chunk KG key: title # sha1(body).
+            # Per-chunk KG key: title # sha1(NORMALIZED body). The normalization
+            # is what makes the key depend on the CONTENT rather than on the
+            # block's position in the blob — see vco_seen_normalize_body.
             local bh
-            bh="$(vco_seen_hash "$cur_body")"
+            vco_seen_normalize_body "$cur_body"
+            bh="$(vco_seen_hash "$_VCO_SEEN_BODY_NORM")"
             key="${cur_first}#${bh}"
         else
             # Per-entity CODE key: full_name.
@@ -331,9 +444,13 @@ vco_filter_seen_blocks() {
             if vco_seen_has "$inject_file" "$key"; then
                 suppress=1
             fi
-            # (b) source already Read explicitly this session.
+            # (b) source already Read explicitly this session (or returned in
+            # full by an EXPLICIT MCP retrieval — see post-mcp-retrieval-record).
+            # P4 (v0.2.91): compare through vco_seen_src_matches, which tries
+            # BOTH path shapes; the old single-shape grep silently never matched
+            # when the ledger and the producer disagreed on relative-vs-absolute.
             if [ "$suppress" = "0" ] && [ -n "$cur_src" ] && [ -n "$reads_file" ] \
-                && vco_seen_has "$reads_file" "$cur_src"; then
+                && vco_seen_src_matches "$reads_file" "$cur_src"; then
                 suppress=1
             fi
         fi

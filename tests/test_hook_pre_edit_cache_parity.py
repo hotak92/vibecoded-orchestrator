@@ -63,9 +63,19 @@ def test_pre_edit_sh_defines_cache_file_path() -> None:
         "pre-edit-context-inject.sh missing CACHE_FILE=$CACHE_DIR/$FILE_HASH "
         "— per-file cache key broken (every file would share one entry)."
     )
-    assert "CACHE_TTL=600" in body, (
-        "pre-edit-context-inject.sh missing CACHE_TTL=600 — matches the "
-        ".ps1 sibling's 10-minute TTL constant."
+    # P3 (v0.2.91): the per-file TTL is no longer a hardcoded 600 — it is
+    # DERIVED from the shared query cache's default (900) with the same
+    # VCO_QUERY_CACHE_TTL override, so the two caches can never drift into the
+    # 600-900 s "double miss" window again. RED-PROOF: this assertion fails on
+    # the pre-P3 source (which carried `CACHE_TTL=600`).
+    assert 'CACHE_TTL="${VCO_QUERY_CACHE_TTL:-${_VCO_QUERY_CACHE_TTL_DEFAULT:-900}}"' in body, (
+        "pre-edit-context-inject.sh must derive CACHE_TTL from the shared "
+        "query-cache default (_VCO_QUERY_CACHE_TTL_DEFAULT, 900 s) — a "
+        "hardcoded 600 re-opens the P3 double-miss window."
+    )
+    assert "CACHE_TTL=600" not in body, (
+        "pre-edit-context-inject.sh still carries the pre-P3 hardcoded "
+        "CACHE_TTL=600."
     )
 
 

@@ -42,10 +42,30 @@ v0.2.73 (RL-5 / SPEC-1). This module talks to the route through
 result) when the route is absent — which now only happens against an OLDER hub
 binary (pre-v0.2.73), not a same-release sequencing gap.
 
+Archive-then-delete (R1, v0.2.91)
+--------------------------------
+The hub-side prune is no longer a bare DELETE. Every row it removes is first
+written to a compressed, loader-readable sidecar (gzip JSONL in hub-row shape),
+fsynced and read back for verification, BEFORE the first DELETE runs — and a
+failed archive ABORTS the pass, leaving the corpus untouched. Retrieval↔citation
+pairs are kept together (the victim set is completed by ``task_id`` group), so a
+prune can never split a training pair across the boundary.
+
+Nothing about that changes THIS driver's contract: it still only decides *when*
+to prune and *what* cutoff to send. The archive is enforced by the deletion
+authority itself (``Db::prune_rl_events``), so no caller — this driver, a manual
+curl, rl-doctor, or a future driver edit — can reach a DELETE without one.
+Read the archives back with ``vco_lib.rl_archive`` (library or
+``python -m vco_lib.rl_archive``).
+
 Config (env, all optional — sane defaults when unset)
 ----------------------------------------------------
   * ``RL_EVENTS_RETENTION_MAX_AGE_DAYS``  — delete events older than N days.
-    Default ``90``. ``0`` / negative disables the age bound.
+    Default ``90``. ``0`` / negative disables the age bound. This is the knob to
+    raise (or zero out) when you want to keep a longer corpus on disk; it is read
+    fresh on every pass, so setting it in the project's ``.claude/env`` /
+    ``.claude/settings.json`` ``env`` takes effect without a restart of anything
+    but the MCP subprocess that hosts the writer.
   * ``RL_EVENTS_RETENTION_MAX_ROWS``      — keep at most N most-recent rows.
     Default ``0`` (row-count bound disabled; age is the primary bound). When
     set, the hub keeps the newest N and deletes the rest.
@@ -54,6 +74,14 @@ Config (env, all optional — sane defaults when unset)
   * ``RL_EVENTS_RETENTION_MIN_INTERVAL_S`` — minimum seconds between prune
     passes for one process. Default ``3600`` (hourly). Throttle only; a fresh
     process always allows the first pass.
+  * ``RL_EVENTS_ARCHIVE_DIR``             — where the prune writes its archive
+    sidecars. Read HUB-SIDE (the process that owns launcher.db), not here.
+    Default ``<VCT_STATE_DIR or ~/.vct>/rl_archive``.
+  * ``RL_EVENTS_PRUNE_MAX_TASKS_PER_PASS`` — how many task GROUPS one pass may
+    move (default 500, oldest-first). Also HUB-SIDE. It bounds the archive's
+    in-memory row set, which makes the prune INCREMENTAL: a long-neglected
+    corpus drains over successive hourly passes instead of materializing
+    gigabytes of embeddings at once. Raise it to drain a backlog faster.
 """
 from __future__ import annotations
 

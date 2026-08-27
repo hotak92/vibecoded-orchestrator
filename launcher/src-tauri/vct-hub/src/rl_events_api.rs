@@ -360,14 +360,41 @@ pub struct PruneEventsResponse {
     pub deleted: u64,
 }
 
+/// Serializes prune passes issued through THIS hub (MINOR-2, wave-4).
+///
+/// `prune_rl_events` deliberately drops the DB lock between selecting its
+/// victims and deleting them (a multi-MB gzip + fsync must not block the
+/// launcher's other DB users for its whole duration). Two near-simultaneous
+/// POSTs — two writer processes each past their own per-process hourly throttle
+/// — could therefore select the SAME victims and both publish a sidecar for
+/// them, since the loser's delete-by-id removes 0 rows and 0 is not an error.
+/// The trainer would then read those rows twice.
+///
+/// Belt one: passes through this hub simply never overlap. Belt two lives in
+/// `prune_rl_events` itself (a pass that deleted nothing discards its own
+/// sidecar) and is the one that holds for a prune issued by a DIFFERENT
+/// process, which no in-process mutex can reach.
+static PRUNE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn prune_events(
     State(h): State<LauncherDbHandle>,
     Json(body): Json<PruneEventsBody>,
 ) -> impl IntoResponse {
+    // Held for the whole archive-then-delete pass, released at end of handler.
+    let _serialize = PRUNE_LOCK.lock().await;
+    // R1 (v0.2.91): the prune is ARCHIVE-THEN-DELETE. The archive directory is
+    // resolved HERE, hub-side (`$RL_EVENTS_ARCHIVE_DIR`, else
+    // `<VCT_STATE_DIR or ~/.vct>/rl_archive`) and NOT taken from the request
+    // body — a caller-supplied path would be an arbitrary-write surface on an
+    // authed localhost route, and the deletion authority must not depend on a
+    // caller remembering to name an archive. A failed archive makes
+    // `prune_rl_events` return Err → this handler 500s and NOTHING is deleted.
+    let archive_dir = vct_launcher_core::db::rl_events::rl_archive_dir();
     match h.0.prune_rl_events(
         body.cutoff_ms,
         body.max_rows,
         body.project_id.as_deref(),
+        &archive_dir,
     ) {
         Ok(deleted) => (
             StatusCode::OK,
@@ -530,6 +557,56 @@ mod tests {
         assert_eq!(v["count"], 1);
     }
 
+    /// R1 (v0.2.91): pin `$RL_EVENTS_ARCHIVE_DIR` at a temp dir for the life of
+    /// a prune test so the hermetic suite never deposits a retention sidecar in
+    /// the developer's real `~/.vct/rl_archive`. `--test-threads=1` (pinned by
+    /// `scripts/test-keychain-safe.sh`) makes the process-global env mutation
+    /// safe here. Restores the prior value on drop.
+    struct ArchiveDirGuard {
+        _dir: tempfile::TempDir,
+        prev: Option<String>,
+        path: std::path::PathBuf,
+    }
+
+    impl ArchiveDirGuard {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("temp archive dir");
+            let key = vct_launcher_core::db::rl_events::RL_ARCHIVE_DIR_ENV;
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, dir.path());
+            let path = dir.path().to_path_buf();
+            Self { _dir: dir, prev, path }
+        }
+
+        /// Published (non-`.pending`) archive sidecars currently in the dir.
+        fn published(&self) -> Vec<std::path::PathBuf> {
+            let suffix = vct_launcher_core::db::rl_events::RL_ARCHIVE_SUFFIX;
+            std::fs::read_dir(&self.path)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| {
+                            p.file_name()
+                                .map(|n| n.to_string_lossy().ends_with(suffix))
+                                .unwrap_or(false)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+    }
+
+    impl Drop for ArchiveDirGuard {
+        fn drop(&mut self) {
+            let key = vct_launcher_core::db::rl_events::RL_ARCHIVE_DIR_ENV;
+            match &self.prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
     /// Post `n` events with monotonically increasing ts, all `event_type`
     /// retrieval, no project scope. Returns nothing; caller re-queries count.
     async fn seed_events(base: &str, client: &reqwest::Client, n: i64) {
@@ -562,6 +639,7 @@ mod tests {
 
     #[tokio::test]
     async fn prune_cutoff_deletes_and_reports_count() {
+        let archive = ArchiveDirGuard::new();
         let base = spawn_test_hub().await;
         let client = reqwest::Client::new();
         // ts values 1000..1004.
@@ -580,10 +658,19 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["deleted"], 3);
         assert_eq!(count(&base, &client).await, 2);
+        // R1: the route archives BEFORE deleting — a published sidecar must
+        // exist for the rows that just left the table.
+        assert_eq!(
+            archive.published().len(),
+            1,
+            "prune route must publish exactly one archive sidecar, found {:?}",
+            archive.published()
+        );
     }
 
     #[tokio::test]
     async fn prune_max_rows_keeps_newest() {
+        let archive = ArchiveDirGuard::new();
         let base = spawn_test_hub().await;
         let client = reqwest::Client::new();
         seed_events(&base, &client, 5).await;
@@ -598,6 +685,50 @@ mod tests {
         let v: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(v["deleted"], 3);
         assert_eq!(count(&base, &client).await, 2);
+        assert_eq!(archive.published().len(), 1, "row-cap prune must archive too");
+    }
+
+    /// MINOR-2 (wave-4): two prune POSTs that arrive together must not both
+    /// archive the same rows. `prune_rl_events` drops the DB lock for the
+    /// gzip+fsync, so without serialization both passes could select the same
+    /// victims and publish a sidecar each — the loser's delete removing 0 rows
+    /// is `Ok`, not an error — and the trainer would count those rows twice.
+    ///
+    /// The invariant asserted is the OUTCOME one: whatever the interleaving, the
+    /// rows leave the table exactly once and exactly one sidecar carries them.
+    #[tokio::test]
+    async fn concurrent_prunes_publish_one_sidecar_not_two() {
+        let archive = ArchiveDirGuard::new();
+        let base = spawn_test_hub().await;
+        let client = reqwest::Client::new();
+        seed_events(&base, &client, 6).await;
+        assert_eq!(count(&base, &client).await, 6);
+
+        let body = serde_json::json!({ "cutoff_ms": 10_000_i64 });
+        let first = client
+            .post(format!("{}/rl/events/prune", base))
+            .json(&body)
+            .send();
+        let second = client
+            .post(format!("{}/rl/events/prune", base))
+            .json(&body)
+            .send();
+        let (a, b) = tokio::join!(first, second);
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(a.status(), reqwest::StatusCode::OK);
+        assert_eq!(b.status(), reqwest::StatusCode::OK);
+        let va: serde_json::Value = a.json().await.unwrap();
+        let vb: serde_json::Value = b.json().await.unwrap();
+
+        let total = va["deleted"].as_u64().unwrap() + vb["deleted"].as_u64().unwrap();
+        assert_eq!(total, 6, "every row must be deleted exactly once");
+        assert_eq!(count(&base, &client).await, 0);
+        assert_eq!(
+            archive.published().len(),
+            1,
+            "two sidecars for one victim set is the double-count, found {:?}",
+            archive.published(),
+        );
     }
 
     /// RL-14 (v0.2.75): quarantined rows are excluded from the trainer's GET
@@ -756,6 +887,7 @@ mod tests {
     #[tokio::test]
     async fn prune_empty_body_is_noop_returns_200_deleted_zero() {
         // The critical safety round-trip: `{}` must NOT delete anything.
+        let archive = ArchiveDirGuard::new();
         let base = spawn_test_hub().await;
         let client = reqwest::Client::new();
         seed_events(&base, &client, 4).await;
@@ -772,5 +904,12 @@ mod tests {
         assert_eq!(v["deleted"], 0);
         // Corpus untouched.
         assert_eq!(count(&base, &client).await, 4);
+        // R1: a no-op prune deletes nothing, so it must also archive nothing —
+        // an empty sidecar per hourly no-op pass would litter the archive dir.
+        assert!(
+            archive.published().is_empty(),
+            "no-op prune must not publish an archive sidecar, found {:?}",
+            archive.published()
+        );
     }
 }

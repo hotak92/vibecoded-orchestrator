@@ -75,11 +75,39 @@ RUNNER=("$BIN")
 if command -v dbus-run-session >/dev/null 2>&1; then
     RUNNER=(dbus-run-session -- "${RUNNER[@]}")
 fi
+# xvfb-run resolution: `command -v` only checks PATH, and a non-interactive
+# shell's PATH routinely lacks the dirs a package manager installed into. When
+# the probe came up empty the script SILENTLY fell through to the operator's
+# REAL display — a launcher window flashed onto the desktop mid-smoke, and the
+# run was no longer headless (the window-flash incident). Same candidate-path
+# pattern as templates/hooks/lean-ctx-rewrite.sh's lean-ctx probe: try PATH,
+# then the known install locations, and SAY SO before falling back.
+XVFB_RUN=""
 if command -v xvfb-run >/dev/null 2>&1; then
-    RUNNER=(xvfb-run --auto-servernum "${RUNNER[@]}")
+    XVFB_RUN="xvfb-run"
+else
+    for _cand in \
+        /usr/bin/xvfb-run \
+        /usr/local/bin/xvfb-run \
+        "$HOME/.local/bin/xvfb-run" \
+        /opt/homebrew/bin/xvfb-run \
+        /home/linuxbrew/.linuxbrew/bin/xvfb-run; do
+        if [ -x "$_cand" ]; then
+            XVFB_RUN="$_cand"
+            break
+        fi
+    done
+fi
+if [ -n "$XVFB_RUN" ]; then
+    RUNNER=("$XVFB_RUN" --auto-servernum "${RUNNER[@]}")
 elif [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
     echo "[boot-smoke] FAIL: no display and no xvfb-run — install xvfb" >&2
     exit 3
+else
+    echo "[boot-smoke] NOTE: xvfb-run not found on PATH or at any candidate" \
+         "path — running against the REAL display" \
+         "(DISPLAY='${DISPLAY:-}' WAYLAND_DISPLAY='${WAYLAND_DISPLAY:-}')." \
+         "A launcher window WILL appear briefly. Install xvfb to run headless." >&2
 fi
 
 echo "[boot-smoke] booting $BIN (isolated HOME=$SMOKE_HOME, waiting up to ${TIMEOUT_SECS}s for '$MARKER')"

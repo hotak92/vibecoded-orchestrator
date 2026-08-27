@@ -64,6 +64,12 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.pre_edit_hook_sandbox import (
+    build_sandbox,
+    invoke_hook,
+    write_stub_producers,
+)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOOK_SRC = REPO_ROOT / "templates" / "hooks" / "pre-edit-context-inject.sh"
 
@@ -79,196 +85,22 @@ def hook_env(tmp_path: Path):
     """Build a sandboxed VCT_INSTALL_ROOT layout that satisfies the
     hook's path probes without touching the real project tree.
 
-    Returns a dict with paths the individual tests need to assemble
-    stdin payloads + assert against state files.
+    v0.2.91: the layout + stub producers + invoker moved into
+    ``tests/common/pre_edit_hook_sandbox.py`` when a second suite
+    (``test_v0291_perf_quickwins.py``) needed the same rig — one home, two
+    callers. This fixture is now a thin wrapper over ``build_sandbox``.
     """
-    install_root = tmp_path / "install"
-    (install_root / "claude_mcp_servers" / "scripts").mkdir(parents=True)
-    (install_root / ".claude" / "scripts").mkdir(parents=True)
-    (install_root / ".claude" / "state").mkdir(parents=True)
-    (install_root / "templates" / "hooks" / "_lib").mkdir(parents=True)
-
-    # Stub _lib helpers (the hook sources them when present, falls back
-    # to no-ops when absent; here we ship explicit no-op + emit-context
-    # shim so the JSON envelope reaches our captured stdout).
-    (install_root / "templates" / "hooks" / "_lib" / "stderr-cap.sh").write_text(
-        "# noop stderr-cap stub\n", encoding="utf-8"
-    )
-    (install_root / "templates" / "hooks" / "_lib" / "emit-context.sh").write_text(
-        # Minimal emit_additional_context that wraps the context in the
-        # PreToolUse JSON envelope on stdout. Mirrors the production
-        # helper's contract (whitespace-only context → no emit).
-        "emit_additional_context() {\n"
-        '    local ctx="$1"; local phase="$2"\n'
-        "    case \"$ctx\" in\n"
-        "        *[![:space:]]*) ;;\n"
-        "        *) return 0 ;;\n"
-        "    esac\n"
-        "    local json_ctx\n"
-        "    json_ctx=$(printf '%s' \"$ctx\" | python3 -c "
-        "'import sys,json; print(json.dumps(sys.stdin.read()))')\n"
-        "    printf '{\"hookSpecificOutput\":{\"additionalContext\":%s,"
-        '"hookEventName":"%s"}}\\n\' "$json_ctx" "$phase"\n'
-        "}\n",
-        encoding="utf-8",
-    )
-    (install_root / "templates" / "hooks" / "_lib" / "find-python.sh").write_text(
-        'PY="$(command -v python3)"\n', encoding="utf-8"
-    )
-
-    # v0.2.46 post-adversarial F1: hook now sources resolve-vco-venv.sh.
-    # Use the real production helper so we exercise the canonical resolution
-    # path (the test sets up $VCT_INSTALL_ROOT below pointing at the sandbox
-    # root, which has the .venv created at line 127-130).
-    real_resolver = REPO_ROOT / "templates" / "hooks" / "_lib" / "resolve-vco-venv.sh"
-    shutil.copy(
-        real_resolver,
-        install_root / "templates" / "hooks" / "_lib" / "resolve-vco-venv.sh",
-    )
-
-    # v0.2.70 Stream E: the hook now sources the unified seen-store +
-    # session-id + codegraph-query helpers. Copy the REAL production helpers
-    # into the sandbox so the test exercises the new per-chunk dedup +
-    # seen_inject_<sid>.txt store (not the legacy fallback path).
-    for _lib_name in ("seen-store.sh", "session-id.sh", "codegraph-query.sh"):
-        _src = REPO_ROOT / "templates" / "hooks" / "_lib" / _lib_name
-        if _src.exists():
-            shutil.copy(
-                _src, install_root / "templates" / "hooks" / "_lib" / _lib_name
-            )
-
-    # detect-project stub — the hook sources it but we don't need
-    # multi-codebase detection for the dedup test.
-    (install_root / ".claude" / "scripts" / "detect-project.sh").write_text(
-        "detect_project_for_file() { echo \"\"; }\n", encoding="utf-8"
-    )
-
-    # Fake .venv pointing at system python3 (the hook resolves the venv
-    # in the same parent dir as where the producers live).
-    venv_bin = install_root / ".venv" / "bin"
-    venv_bin.mkdir(parents=True)
-    system_python = shutil.which("python3") or sys.executable
-    os.symlink(system_python, venv_bin / "python")
-
-    # Copy the production hook into the sandbox so its
-    # `dirname "${BASH_SOURCE[0]}"`-based path probes resolve into our
-    # stub _lib + scripts trees rather than the real repo.
-    sandbox_hook = install_root / "templates" / "hooks" / "pre-edit-context-inject.sh"
-    sandbox_hook.write_bytes(HOOK_SRC.read_bytes())
-    sandbox_hook.chmod(0o755)
-
-    yield {
-        "install_root": install_root,
-        "hook_path": sandbox_hook,
-        "state_dir": install_root / ".claude" / "state",
-        "scripts_dir": install_root / "claude_mcp_servers" / "scripts",
-        "cg_dir": install_root / ".claude" / "scripts",
-    }
+    yield build_sandbox(tmp_path)
 
 
 def _write_stub_producers(env, kg_lines: list[str], code_lines: list[str]) -> None:
-    """Install stub producers that emit the given lines on stdout
-    ONLY when invoked with --hook-format (mirroring the real
-    rl_kg_search.py / query_code_graph.py contract after b09ca2a).
-
-    `kg_lines` lands as `rl_kg_search.py`; `code_lines` as
-    `code-graph-query`.
-
-    Why --hook-format gating in the stub matters: the BEHAVIOURAL
-    regression test only catches the §25b bug if the stubs behave like
-    the real producers — emitting the `KG:`/`CODE:` prefix only when
-    asked. Without this gating, a hook that DROPPED --hook-format
-    would still get prefixed stdout from the stub and the dedup test
-    would falsely pass.
-
-    Producer-invocation quirks:
-      - KG producer is invoked through the venv Python (`"$VENV"
-        rl_kg_search.py --hook-format`), so the stub MUST be a Python
-        script. A bash shebang would be ignored and Python would try
-        to parse the bash as Python (SyntaxError, empty stdout).
-      - Code-graph producer is invoked via shell wrapper
-        (`"$PROJECT_ROOT/.claude/scripts/code-graph-query"`), so a
-        bash script with the execute bit is correct.
-    """
-    rl = env["scripts_dir"] / "rl_kg_search.py"
-    cg = env["cg_dir"] / "code-graph-query"
-    rl_lines_repr = ",\n    ".join(repr(l) for l in kg_lines) or "''"
-    rl.write_text(
-        "#!/usr/bin/env python3\n"
-        "import sys, argparse\n"
-        "# Mirror the real producer's argparse so --hook-format is\n"
-        "# accepted. When --hook-format is NOT passed, emit nothing\n"
-        "# (matches the real producer's silent-on-empty pre-b09ca2a\n"
-        "# behaviour — exposes hook regressions that drop the flag).\n"
-        "ap = argparse.ArgumentParser()\n"
-        "ap.add_argument('query')\n"
-        "ap.add_argument('--limit', type=int, default=1)\n"
-        "ap.add_argument('--hook-format', action='store_true')\n"
-        "args = ap.parse_args()\n"
-        "if not args.hook_format:\n"
-        "    sys.exit(0)\n"
-        "for _line in [\n    " + rl_lines_repr + ",\n]:\n"
-        "    print(_line)\n",
-        encoding="utf-8",
-    )
-    cg_lines_emit = "\n    ".join(f'printf "%s\\n" "{l}"' for l in code_lines)
-    cg.write_text(
-        "#!/usr/bin/env bash\n"
-        "# Mirror the real code-graph-query's --hook-format gate: emit\n"
-        "# the prefixed lines only when --hook-format is on argv. Lets\n"
-        "# behavioural regression tests catch a hook that drops the flag.\n"
-        '_has_hook_format=0\n'
-        'for a in "$@"; do\n'
-        '    if [ "$a" = "--hook-format" ]; then _has_hook_format=1; fi\n'
-        'done\n'
-        'if [ "$_has_hook_format" = "1" ]; then\n'
-        '    ' + cg_lines_emit + "\n"
-        "fi\n",
-        encoding="utf-8",
-    )
-    rl.chmod(rl.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    cg.chmod(cg.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    """Thin delegator to the shared harness (see the module note above)."""
+    write_stub_producers(env, kg_lines, code_lines)
 
 
 def _invoke_hook(env, session_id: str, file_path: str) -> subprocess.CompletedProcess:
-    """Call the hook with a synthetic Edit payload on stdin."""
-    payload = {
-        "tool_name": "Edit",
-        "session_id": session_id,
-        "tool_input": {
-            "file_path": file_path,
-            "new_string": "def f(): pass\n",
-        },
-    }
-    # v0.2.29: pre-create the TMPDIR override path explicitly. Pre-v0.2.29
-    # the hook's `CACHE_BASE="${TMPDIR:-/tmp}/claude_edit_cache_<sid>"` +
-    # subsequent `mkdir -p "$CACHE_DIR"` had the SIDE-EFFECT of creating
-    # this directory, which let later `mktemp` calls in the hook succeed.
-    # v0.2.29 moves CACHE_BASE to `$PROJECT_ROOT/.claude/state/edit_cache_*`,
-    # which no longer creates the legacy `install_root/tmp/` as a side
-    # effect — so we create it here instead. Functionally equivalent to
-    # the old behavior; just made explicit.
-    tmpdir = env["install_root"] / "tmp"
-    tmpdir.mkdir(parents=True, exist_ok=True)
-    return subprocess.run(
-        ["bash", str(env["hook_path"])],
-        input=json.dumps(payload),
-        capture_output=True,
-        text=True,
-        timeout=30,
-        env={
-            **os.environ,
-            # Pin the install-root so the hook's venv + script-path
-            # probes resolve to the sandbox.
-            "VCT_INSTALL_ROOT": str(env["install_root"]),
-            # Project root for emit-context.sh state — the hook computes
-            # PROJECT_ROOT as $SCRIPT_DIR/../.. which from
-            # templates/hooks/ resolves to the install_root. Same for
-            # `.claude/state/seen_kg_titles_<sid>.txt` and
-            # `.claude/state/edit_cache_<sid>/`.
-            "TMPDIR": str(tmpdir),
-        },
-    )
+    """Thin delegator to the shared harness (see the module note above)."""
+    return invoke_hook(env, session_id, file_path)
 
 
 # --------------------------------------------------------------------------
@@ -592,7 +424,16 @@ def test_sh_hook_passes_hook_format_to_rl_kg_search() -> None:
         # The producer call is a multi-line pipeline; --hook-format must
         # appear in the next ~3 lines (same continuation).
         window = "\n".join(lines[i: min(len(lines), i + 4)])
-        assert "--hook-format" in window, (
+        if "--hook-format" in window:
+            continue
+        # v0.2.91 P2: the merged single-interpreter path passes the SCRIPT PATH
+        # to vco_dual_search_cached, which forwards it to hook_dual_search.py —
+        # and THAT is where --hook-format is applied. The flag guarantee for this
+        # call-site is enforced by
+        # test_v0291_perf_quickwins.py::test_dual_driver_passes_hook_format_to_both_legs
+        # (which asserts the driver's argv), not by a textual window here.
+        preceding = "\n".join(lines[max(0, i - 6): i + 4])
+        assert "vco_dual_search_cached" in preceding, (
             f"rl_kg_search.py invocation at line {i + 1} missing --hook-format "
             f"in continuation window — silently breaks in-session dedup "
             f"(cf. v0.2.21 commit b09ca2a, plan §25b):\n{window}"

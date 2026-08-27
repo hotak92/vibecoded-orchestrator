@@ -461,6 +461,16 @@
           }
         ],
         "matcher": "*"
+      },
+      {
+        "matcher": "mcp__weaviate-kg__hybrid_search|mcp__weaviate-kg__semantic_graph_search|mcp__weaviate-kg__search_code_graph",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/post-mcp-retrieval-record.sh",
+            "timeout": 5
+          }
+        ]
       }
     ]
   },

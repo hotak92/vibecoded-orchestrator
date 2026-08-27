@@ -132,7 +132,21 @@ New-Item -ItemType Directory -Force -Path $CacheBase -ErrorAction SilentlyContin
 Get-ChildItem -Directory (Join-Path $ProjectRoot ".claude/state") -Filter "edit_cache_*" -ErrorAction SilentlyContinue |
     Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-14) } |
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-$CacheTtl = 600
+# P3 (v0.2.91): ALIGN the per-file replay-cache TTL with the shared
+# cross-surface result cache (_lib/query-cache.ps1, 900 s). Pre-v0.2.91 this was
+# a hardcoded 600 s against the query cache's 900 s, so an edit in the 600-900 s
+# window was a DOUBLE MISS: the per-file cache expired, the hook paid a fresh
+# interpreter start, and the producers then served the SAME blob back out of the
+# still-fresh shared query cache. One home for the value: the shared default plus
+# the same VCO_QUERY_CACHE_TTL override, literal fallback on a partial install.
+# MUST MATCH pre-edit-context-inject.sh (CACHE_TTL).
+$CacheTtl = 900
+if ($env:VCO_QUERY_CACHE_TTL) {
+    try { $CacheTtl = [int]$env:VCO_QUERY_CACHE_TTL } catch { $CacheTtl = 900 }
+} elseif ($script:VcoQueryCacheTtlDefault) {
+    $CacheTtl = [int]$script:VcoQueryCacheTtlDefault
+}
+if ($CacheTtl -le 0) { $CacheTtl = 900 }
 
 # State lives in the project directory (not /tmp/) so it survives reboots and
 # is co-located with the session's other ephemeral state. Wiped by the
@@ -374,7 +388,40 @@ $VenvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
 # (Test-Path $VenvPy) gate below skips the KG search subprocess and the
 # hook still exits 0 without blocking the edit.
 $RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_kg_search.py"
-if ($VenvPy -and (Test-Path $VenvPy) -and (Test-Path $RlScript)) {
+
+# v0.2.70 Stream C: keep the IS_CODE regex in lockstep with pre-tool-use.ps1 +
+# post-file-edit.ps1 (MUST MATCH). (v0.2.91 P2: the decision moved ABOVE the
+# search launch so the merged single-interpreter path knows up-front whether the
+# code-graph leg is wanted.)
+$IsCode = $false
+if ($FilePath -match '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$') {
+    $IsCode = $true
+}
+$ProjArg = if ($CodeGraphProjectArg.Count -gt 0) { $CodeGraphProjectArg -join ' ' } else { "" }
+
+# === P2 (v0.2.91): ONE interpreter for both searches ========================
+# Pre-P2 this ran the two producers as two separate CPython processes, each
+# paying ~1.0 s of interpreter + import + client-connect for ~60 ms of real
+# retrieval work. The shared wrapper runs whichever legs MISSED their
+# (unchanged, per-leg) cache in a single process: same queries, same argv, same
+# per-leg output caps, byte-identical blocks. $Ok = $false asks for the legacy
+# path (driver absent on a partial install, no venv, no framing) — not an error.
+# MUST MATCH pre-edit-context-inject.sh.
+$DualDone = $false
+if (Get-Command Invoke-VcoDualSearchCached -ErrorAction SilentlyContinue) {
+    try {
+        $dual = Invoke-VcoDualSearchCached -VenvPy $VenvPy -RlScript $RlScript -Query $Query `
+            -KgLimit 1 -WantKg $true -WantCg $IsCode -CgProjectArg $ProjArg -CgLimit 2 `
+            -CgExcludeFile $FilePath -CgAnchor $FilePath
+        if ($dual.Ok) {
+            $DualDone = $true
+            if ($dual.Kg) { Set-Content -Path $KgTmp.FullName -Value $dual.Kg }
+            if ($IsCode -and $dual.Cg) { Set-Content -Path $CodeTmp.FullName -Value $dual.Cg }
+        }
+    } catch { }
+}
+
+if (-not $DualDone -and $VenvPy -and (Test-Path $VenvPy) -and (Test-Path $RlScript)) {
     try {
         # v0.2.77 Part 9 task 2: route through the shared TTL result-cache
         # wrapper so a repeat query is served from disk. Falls back to the
@@ -389,13 +436,10 @@ if ($VenvPy -and (Test-Path $VenvPy) -and (Test-Path $RlScript)) {
     } catch { }
 }
 
-$IsCode = $false
-# v0.2.70 Stream C: keep the IS_CODE regex in lockstep with pre-tool-use.ps1 +
-# post-file-edit.ps1 (MUST MATCH). Route through the shared code-graph helper
-# when present (one home; pre-bash + pre-tool-use Read/Grep use the same
-# function); fall back to the inline invocation only on a partial install.
-if ($FilePath -match '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$') {
-    $IsCode = $true
+# Route through the shared code-graph helper when present (one home; pre-bash +
+# pre-tool-use Read/Grep use the same function); fall back to the inline
+# invocation only on a partial install.
+if (-not $DualDone -and $IsCode) {
     # v0.2.72 P2: pass the edited file as -Anchor so the CLI's shared retrieval
     # pipeline biases the rerank toward call-linked / same-module / shared-type
     # code relative to the file being edited. MUST MATCH pre-edit-context-inject.sh.

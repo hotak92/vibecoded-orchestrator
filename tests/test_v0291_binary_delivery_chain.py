@@ -610,5 +610,63 @@ class Wi6CommentCorrectionTests(unittest.TestCase):
                 )
 
 
+class BootSmokeDisplayResolutionTests(unittest.TestCase):
+    """`scripts/launcher-boot-smoke.sh` must not silently use the real display.
+
+    Standing wave-4 item: xvfb-run was resolved with a bare `command -v`, which
+    only checks PATH. On a machine where xvfb is installed but the invoking
+    shell's PATH lacks its directory, the script fell straight through to the
+    operator's REAL display — a launcher window flashed onto the desktop
+    mid-smoke and the run was no longer headless, with nothing said about it.
+
+    RED-PROOF: on the pre-change file the whole block is
+    `if command -v xvfb-run …; then RUNNER=(xvfb-run …); elif [ -z "$DISPLAY" ]
+    …` — there is no candidate loop and no note, so both assertions below fail.
+    """
+
+    def setUp(self) -> None:
+        self.src = (REPO_ROOT / "scripts" / "launcher-boot-smoke.sh").read_text(
+            encoding="utf-8"
+        )
+
+    def test_xvfb_run_is_probed_at_candidate_paths_after_path(self) -> None:
+        self.assertIn("command -v xvfb-run", self.src, "PATH stays the first try")
+        for candidate in (
+            "/usr/bin/xvfb-run",
+            "/usr/local/bin/xvfb-run",
+            "$HOME/.local/bin/xvfb-run",
+        ):
+            self.assertIn(
+                candidate,
+                self.src,
+                f"{candidate} is not probed — the same candidate-path pattern "
+                "as templates/hooks/lean-ctx-rewrite.sh's lean-ctx probe",
+            )
+
+    def test_falling_back_to_the_real_display_says_so_on_stderr(self) -> None:
+        idx = self.src.index("XVFB_RUN=")
+        block = self.src[idx : idx + 1800]
+        self.assertIn(
+            "REAL display",
+            block,
+            "a fallback onto the operator's display must be announced, not "
+            "silent — that silence IS the window-flash incident",
+        )
+        self.assertIn(">&2", block, "the note belongs on stderr, not stdout")
+        # The no-display case still HARD-FAILS rather than warning.
+        self.assertIn("exit 3", block)
+
+    def test_on_path_behaviour_is_unchanged(self) -> None:
+        """When xvfb-run IS on PATH the wrapper chain must be byte-identical to
+        the pre-change one — the fix adds a fallback leg, it does not change
+        the working path."""
+        self.assertIn('XVFB_RUN="xvfb-run"', self.src)
+        self.assertIn(
+            'RUNNER=("$XVFB_RUN" --auto-servernum "${RUNNER[@]}")',
+            self.src,
+            "the same `--auto-servernum` wrapper, just via the resolved name",
+        )
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

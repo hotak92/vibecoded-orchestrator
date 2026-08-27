@@ -161,7 +161,21 @@ mkdir -p "$CACHE_BASE" 2>/dev/null || true
 # deliberately SKIPPED — a shared sweeper would add a sourcing dependency and
 # break the single-file-hook discipline. Each hook GCs its own state files.
 find "$PROJECT_ROOT/.claude/state" -maxdepth 1 -type d -name "edit_cache_*" -mtime +14 -exec rm -rf {} + 2>/dev/null || true
-CACHE_TTL=600  # 10 minutes in seconds
+# P3 (v0.2.91): the per-file replay-cache TTL is ALIGNED with the shared
+# cross-surface result cache (_lib/query-cache.sh, 900 s). Pre-v0.2.91 this was
+# a hardcoded 600 s while the query cache used 900 s, so an edit landing in the
+# 600–900 s window was a DOUBLE MISS: the per-file cache expired → the hook paid
+# a fresh CPython start to launch the producers → which then served the SAME
+# blob back out of the still-fresh shared query cache. Same content, ~1.4 s of
+# interpreter tax for nothing. One home for the value: the shared default plus
+# the same VCO_QUERY_CACHE_TTL override, with a literal fallback for a partial
+# install where _lib/query-cache.sh was not sourced.
+# Staleness note: a replay can now be up to 5 min older — the SAME staleness
+# class the 900 s cache already accepts on every other surface, and dedup still
+# applies CURRENT seen-state on replay (the cache stores raw pre-dedup blocks).
+CACHE_TTL="${VCO_QUERY_CACHE_TTL:-${_VCO_QUERY_CACHE_TTL_DEFAULT:-900}}"
+case "$CACHE_TTL" in ''|*[!0-9]*) CACHE_TTL=900 ;; esac
+[ "$CACHE_TTL" -gt 0 ] 2>/dev/null || CACHE_TTL=900
 
 # === Dedup tracking: skip KG/codegraph nodes already injected this session ===
 # State lives in the project directory (not /tmp/) so it survives reboots and
@@ -468,51 +482,82 @@ VENV="${VCO_VENV_PYTHON:-}"
 # repeat query (this file re-edited, or the same module queried elsewhere) is
 # served from disk (~ms) instead of re-paying the ~1.3 s round-trip. Falls back
 # to the direct call when the cache helper is absent (partial install).
-if command -v vco_kg_search_cached >/dev/null 2>&1; then
-    ( vco_kg_search_cached "$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "$QUERY" 1 > "$KG_TMP" 2>/dev/null ) &
-    KG_PID=$!
-else
-    ("$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "$QUERY" --limit 1 --hook-format 2>/dev/null \
-        | head -40 > "$KG_TMP") &
-    KG_PID=$!
-fi
-
 # Code graph search — only for code files (not markdown, yaml, etc.)
 # Uses auto-detected project so edits in sibling repos query the right collections.
-IS_CODE=0
 # v0.2.70 Stream C: keep the IS_CODE extension regex in lockstep with
 # pre-tool-use.sh (Read/Grep branches) and post-file-edit.sh:440 — all three
 # decide "is this a code file" identically. MUST MATCH those two siblings.
+# (v0.2.91 P2: the decision moved ABOVE the search launch so the merged
+# single-interpreter path knows up-front whether the code-graph leg is wanted.)
+IS_CODE=0
 if [[ "$FILE_PATH" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$ ]]; then
     IS_CODE=1
-    # v0.2.70 Stream C: route the codegraph query through the shared
-    # _lib/codegraph-query.sh helper (one home; pre-bash + pre-tool-use Read/Grep
-    # use the SAME function) when present. The helper soft-fails to empty when
-    # code-graph-query is absent. Falls back to the legacy inline call only on a
-    # partial install. --hook-format gives "CODE: <full_name> | ..." headers the
-    # seen-store recognises. Empty result → "CODE: no-results | ..." sentinel.
-    # v0.2.72 P2: pass the edited file as --anchor (5th arg) so the CLI's
-    # shared retrieval pipeline biases the rerank toward call-linked /
-    # same-module / shared-type code relative to the file being edited.
-    if command -v codegraph_query_block >/dev/null 2>&1; then
-        ( codegraph_query_block "$QUERY" "$CODE_GRAPH_PROJECT_ARG" 2 "$FILE_PATH" "$FILE_PATH" > "$CODE_TMP" 2>/dev/null ) &
-        CODE_PID=$!
-    else
-        ("$PROJECT_ROOT/.claude/scripts/code-graph-query" search "$QUERY" $CODE_GRAPH_PROJECT_ARG --limit 2 --hook-format --anchor "$FILE_PATH" 2>/dev/null \
-            | grep -v "$FILE_PATH" | head -20 > "$CODE_TMP") &
-        CODE_PID=$!
+fi
+
+# === P2 (v0.2.91): ONE interpreter for both searches =========================
+# Pre-P2 this launched TWO background subprocesses — two full CPython starts,
+# each paying ~1.0 s of interpreter + `import weaviate` + client-connect for
+# ~60 ms of actual retrieval work (2026-08-27 perf audit: 1.50 s miss, 3 ms
+# Weaviate + 58 ms embed). The shared wrapper runs whichever legs MISSED their
+# (unchanged, per-leg) cache in a single process: same queries, same argv, same
+# per-leg output caps, byte-identical blocks. It returns non-zero ONLY to ask
+# for the legacy path (driver absent on a partial install, no venv, or a driver
+# that produced no framing) — never as an error.
+DUAL_DONE=0
+if command -v vco_dual_search_cached >/dev/null 2>&1; then
+    _DUAL_CG_OUT=""
+    [[ "$IS_CODE" == "1" ]] && _DUAL_CG_OUT="$CODE_TMP"
+    if vco_dual_search_cached \
+        "$KG_TMP" "$_DUAL_CG_OUT" "$VENV" \
+        "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" \
+        "$QUERY" 1 "$CODE_GRAPH_PROJECT_ARG" 2 "$FILE_PATH" "$FILE_PATH"; then
+        DUAL_DONE=1
     fi
 fi
 
-# Wait for searches (5s budget, leave 0.5s for formatting + output).
-# NOTE (audit F7, P3): Git Bash on Windows occasionally hangs on this
-# `wait <pid>` pattern due to signal-handling differences vs upstream bash.
-# If you hit this, set VCT_DISABLE_HOOKS=1 in your shell to opt out — the
-# only feature lost is the pre-edit context cache (a search-speed
-# optimisation, not correctness).
-wait "$KG_PID" 2>/dev/null || true
-if [[ "$IS_CODE" == "1" ]]; then
-    wait "$CODE_PID" 2>/dev/null || true
+if [[ "$DUAL_DONE" == "0" ]]; then
+    # --- Legacy two-process path (unchanged) -------------------------------
+    # KG search with RL reranking — same pipeline as weaviate MCP.
+    if command -v vco_kg_search_cached >/dev/null 2>&1; then
+        ( vco_kg_search_cached "$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "$QUERY" 1 > "$KG_TMP" 2>/dev/null ) &
+        KG_PID=$!
+    else
+        ("$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "$QUERY" --limit 1 --hook-format 2>/dev/null \
+            | head -40 > "$KG_TMP") &
+        KG_PID=$!
+    fi
+
+    if [[ "$IS_CODE" == "1" ]]; then
+        # v0.2.70 Stream C: route the codegraph query through the shared
+        # _lib/codegraph-query.sh helper (one home; pre-bash + pre-tool-use
+        # Read/Grep use the SAME function) when present. The helper soft-fails to
+        # empty when code-graph-query is absent. Falls back to the legacy inline
+        # call only on a partial install. --hook-format gives
+        # "CODE: <full_name> | ..." headers the seen-store recognises. Empty
+        # result → "CODE: no-results | ..." sentinel.
+        # v0.2.72 P2: pass the edited file as --anchor (5th arg) so the CLI's
+        # shared retrieval pipeline biases the rerank toward call-linked /
+        # same-module / shared-type code relative to the file being edited.
+        if command -v codegraph_query_block >/dev/null 2>&1; then
+            ( codegraph_query_block "$QUERY" "$CODE_GRAPH_PROJECT_ARG" 2 "$FILE_PATH" "$FILE_PATH" > "$CODE_TMP" 2>/dev/null ) &
+            CODE_PID=$!
+        else
+            ("$PROJECT_ROOT/.claude/scripts/code-graph-query" search "$QUERY" $CODE_GRAPH_PROJECT_ARG --limit 2 --hook-format --anchor "$FILE_PATH" 2>/dev/null \
+                | grep -v "$FILE_PATH" | head -20 > "$CODE_TMP") &
+            CODE_PID=$!
+        fi
+    fi
+
+    # Wait for searches (5s budget, leave 0.5s for formatting + output).
+    # NOTE (audit F7, P3): Git Bash on Windows occasionally hangs on this
+    # `wait <pid>` pattern due to signal-handling differences vs upstream bash.
+    # If you hit this, set VCT_DISABLE_HOOKS=1 in your shell to opt out — the
+    # only feature lost is the pre-edit context cache (a search-speed
+    # optimisation, not correctness).
+    wait "$KG_PID" 2>/dev/null || true
+    if [[ "$IS_CODE" == "1" ]]; then
+        wait "$CODE_PID" 2>/dev/null || true
+    fi
 fi
 
 KG_RESULT=$(cat "$KG_TMP" 2>/dev/null || true)

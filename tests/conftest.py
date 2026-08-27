@@ -46,11 +46,38 @@ import functools
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+# ─── P5 (v0.2.91): keep the suite out of the PRODUCTION telemetry streams ────
+#
+# The 2026-08-27 perf audit found two live leaks from this test suite into the
+# user's real `~/.vct/`:
+#
+#   * 6065 rows with FIXTURE titles ("Foo", "SharedConcept") in
+#     `~/.vct/logs/weaviate_mcp/<date>_tool_usage.jsonl` — the kg-search /
+#     kg-info / kg-sync CLI telemetry stream;
+#   * 17 `resync-TProj-*.log` spawn records a day in `~/.vct/logs/` from
+#     fixtures reaching `spawn_background_resync`.
+#
+# Neither is cosmetic: a production metrics stream polluted with fixture traffic
+# is a stream no future perf audit can trust (this one had to hand-filter it).
+# The fix is the same hermeticity convention the RL-hub and hub-resolver gates
+# already use — an env pin, set for the whole suite, with an explicit opt-out
+# list for the tests that genuinely exercise the pinned behaviour.
+#
+# `VCT_QUERY_LOG_DIR` MUST be set at conftest IMPORT time, not in a fixture:
+# `weaviate_mcp/query_logger.py` resolves `LOG_DIR` / `TOOL_USAGE_LOG` at MODULE
+# import, so a fixture that ran after the first test module imported it would be
+# too late. conftest.py is imported before any test module, so this is the one
+# hook early enough.
+_VCO_TEST_STATE = Path(tempfile.mkdtemp(prefix="vco-test-state-"))
+os.environ.setdefault("VCT_QUERY_LOG_DIR", str(_VCO_TEST_STATE / "query_logs"))
 
 
 def _weaviate_importable(python_exe: str) -> bool:
@@ -311,3 +338,67 @@ def _disable_rl_hub_writes_in_tests(request):
             os.environ.pop("RL_HUB_POST_DISABLED", None)
         else:
             os.environ["RL_HUB_POST_DISABLED"] = prev
+
+
+# Test files that EXPLICITLY exercise `spawn_background_resync`'s launch path
+# and assert `status == "launched"` (with `subprocess.Popen` faked). The P5 gate
+# below must be OFF for these, or they would all see the new `skipped` status.
+# Sibling of `_RL_HUB_WRITE_OPT_OUT_FILES` for the resync-spawn axis; kept
+# explicit so an accidentally-broken spawn test surfaces loudly.
+_RESYNC_SPAWN_OPT_OUT_FILES = frozenset({
+    "test_codegraph_embed_revision_resync.py",
+    "test_codegraph_metadata_producers_v0273.py",
+    "test_codegraph_resync_v0273.py",
+    "test_codegraph_spawn_identity_v0282.py",
+    "test_v0272_pregate_audit_fixes.py",
+    "test_v0283_embed_resync_selfclear_pin.py",
+    "test_v0284_identity_sweep.py",
+})
+
+
+@pytest.fixture(autouse=True)
+def _disable_resync_spawn_in_tests(request):
+    """P5 (v0.2.91): no test may spawn a background codegraph resync driver, or
+    deposit its spawn log in the user's real ``~/.vct/logs/``.
+
+    Root cause this closes: `spawn_background_resync` opens a per-spawn log file
+    under `<vct_root_dir>/logs/resync-<project>-<ts>.log` and writes its header
+    BEFORE the `subprocess.Popen` call — so even the many tests that correctly
+    fake `Popen` still littered the PRODUCTION state dir (the perf audit counted
+    17 `resync-TProj-*.log` files in one day). Tests that do NOT fake `Popen`
+    additionally spawned real detached venv children.
+
+    The gate (`VCT_RESYNC_SPAWN_DISABLED`) short-circuits the function before the
+    log file and before any `Popen`, returning `status="skipped"`. Files in
+    `_RESYNC_SPAWN_OPT_OUT_FILES` — which assert the launch path itself — get the
+    gate CLEARED plus `VCT_STATE_DIR` pointed at a per-session temp dir, so their
+    log headers land in tmp instead of `~/.vct/logs/`. Restores prior env in
+    ``finally`` so a test that sets the vars itself isn't clobbered.
+    """
+    key = "VCT_RESYNC_SPAWN_DISABLED"
+    test_file = request.node.fspath.basename
+    if test_file in _RESYNC_SPAWN_OPT_OUT_FILES:
+        prev_gate = os.environ.pop(key, None)
+        prev_state = os.environ.get("VCT_STATE_DIR")
+        spawn_state = _VCO_TEST_STATE / "resync_state"
+        spawn_state.mkdir(parents=True, exist_ok=True)
+        os.environ["VCT_STATE_DIR"] = str(spawn_state)
+        try:
+            yield
+        finally:
+            if prev_gate is not None:
+                os.environ[key] = prev_gate
+            if prev_state is None:
+                os.environ.pop("VCT_STATE_DIR", None)
+            else:
+                os.environ["VCT_STATE_DIR"] = prev_state
+        return
+    prev = os.environ.get(key)
+    os.environ[key] = "1"
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = prev

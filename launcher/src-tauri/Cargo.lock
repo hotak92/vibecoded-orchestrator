@@ -5414,6 +5414,7 @@ dependencies = [
  "dbus-secret-service",
  "directories",
  "dunce",
+ "flate2",
  "gethostname",
  "hex",
  "keyring",

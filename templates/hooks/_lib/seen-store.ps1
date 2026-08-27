@@ -91,6 +91,52 @@ function Add-VcoSeen {
     try { Add-Content -LiteralPath $File -Value $Key -ErrorAction Stop } catch { }
 }
 
+# Test-VcoSeenSrcMatches <ReadsFile> <Src> [ProjectRoot]
+# P4 (v0.2.91): rule-(b) comparison WITH PATH-FORM NORMALIZATION.
+# The ledger holds REPO-RELATIVE paths, but a producer's "| src=" trailer can be
+# absolute (a peer / extra-path code graph rooted elsewhere), so a single
+# exact-match check silently never fired for those. Compare on BOTH shapes --
+# normalizing only to absolute would REGRESS the common relative-vs-relative
+# match. Each check stays EXACT (no prefix fuzz), so a never-Read path can never
+# be mistaken for a Read one. MUST MATCH seen-store.sh's vco_seen_src_matches.
+#
+# SEPARATOR normalization (v0.2.91 wave-4 NIT-3, WINDOWS-ONLY surface): the
+# composed absolute form used '/' unconditionally, so a ledger entry written on
+# Windows in the as-Read BACKSLASH form ("C:\repo\knowledge\x.md") never matched
+# the '/'-composed candidate -- and ConvertTo-VcoRepoRelative's prefix test
+# likewise fails when Src and ProjectRoot disagree on the separator. Every
+# candidate is therefore tried in BOTH separator forms. This has no .sh sibling
+# by design: only Windows produces backslash paths, and Git Bash normalises them
+# before any hook sees them, so vco_seen_src_matches stays separator-free.
+function Test-VcoSeenSrcMatches {
+    param([string]$ReadsFile, [string]$Src, [string]$ProjectRoot = "")
+    if ([string]::IsNullOrEmpty($ReadsFile) -or [string]::IsNullOrEmpty($Src)) { return $false }
+    if (Test-VcoSeenHas -File $ReadsFile -Key $Src) { return $true }
+    if (-not $ProjectRoot) {
+        $ProjectRoot = if ($script:ProjectRoot) { $script:ProjectRoot } elseif ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { "" }
+    }
+    if (-not $ProjectRoot) { return $false }
+    $candidates = @()
+    if ([System.IO.Path]::IsPathRooted($Src)) {
+        $rel = ConvertTo-VcoRepoRelative -Path $Src -ProjectRoot $ProjectRoot
+        if ($rel) { $candidates += $rel }
+        # Retry the strip with both sides separator-normalised: the helper is a
+        # prefix match, so a backslash Src under a forward-slash root (or the
+        # converse) does not strip and would compare as an unchanged absolute.
+        $relNorm = ConvertTo-VcoRepoRelative -Path ($Src -replace '\\', '/') `
+            -ProjectRoot ($ProjectRoot -replace '\\', '/')
+        if ($relNorm -and ($relNorm -ne $rel)) { $candidates += $relNorm }
+    } else {
+        $candidates += (($ProjectRoot -replace '\\', '/').TrimEnd('/') + '/' + ($Src -replace '\\', '/'))
+    }
+    foreach ($cand in $candidates) {
+        foreach ($shape in @($cand, ($cand -replace '/', '\'))) {
+            if (Test-VcoSeenHas -File $ReadsFile -Key $shape) { return $true }
+        }
+    }
+    return $false
+}
+
 # --- Per-session codegraph inject VOLUME cap (v0.2.72 P6) ------------------
 # The dedup store bounds RE-injection (same identity) but NOT total injection: a
 # long session navigating many DISTINCT entities injects a fresh block for each.
@@ -180,8 +226,34 @@ function Test-VcoCgInjectNoteOnce {
     return $true
 }
 
+# Get-VcoCapKeyField <Text> -- truncate a key's identity field (KG title / CODE
+# full_name) to at most 200 UTF-8 BYTES, cut on a character boundary.
+#
+# MUST MATCH seen-store.sh's vco_cap_key_field and
+# templates/scripts/mcp_retrieval_record.py's cap_key_field. All three write
+# keys into the SAME per-session store, so the truncation axis has to be one
+# thing everywhere.
+#
+# Why BYTES (v0.2.91 wave-4 NIT-4): Substring(0, 200) counts UTF-16 CODE UNITS
+# (2 per astral char), bash's ${v:0:200} counts characters under a UTF-8 locale
+# and bytes under LC_ALL=C, Python's [:200] counts code points. For a >200-byte
+# non-ASCII title that is three different keys -> the recorder's key never
+# matches the injector's and the suppression silently misses (fails open).
+# Bytes is the one definition all three can pin. The back-off over trailing
+# CONTINUATION bytes (10xxxxxx) drops a truncated multi-byte sequence rather
+# than emitting a half-written one, matching the other two exactly.
+function Get-VcoCapKeyField {
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return "" }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+    if ($bytes.Length -le 200) { return $Text }
+    $n = 200
+    while (($n -gt 0) -and ((($bytes[$n]) -band 0xC0) -eq 0x80)) { $n-- }
+    return [System.Text.Encoding]::UTF8.GetString($bytes, 0, $n)
+}
+
 # Get-VcoSeenFirstField <Rest> -- first " | "-delimited field of a header,
-# capped to 200 chars. Strips an accidentally-doubled prefix.
+# capped to 200 UTF-8 bytes. Strips an accidentally-doubled prefix.
 function Get-VcoSeenFirstField {
     param([string]$Rest)
     $r = $Rest
@@ -189,8 +261,30 @@ function Get-VcoSeenFirstField {
     if ($r.StartsWith("CODE: ")) { $r = $r.Substring(6) }
     $idx = $r.IndexOf(" | ")
     $field = if ($idx -ge 0) { $r.Substring(0, $idx) } else { $r }
-    if ($field.Length -gt 200) { $field = $field.Substring(0, 200) }
-    return $field
+    return (Get-VcoCapKeyField -Text $field)
+}
+
+# Get-VcoSeenNormalizedBody <Text> -- canonicalize a block body before hashing:
+# the trailing run of newlines collapses to EXACTLY ONE (an empty body stays
+# empty).
+#
+# WHY (v0.2.91 wave-4 MINOR-5): the number of trailing newlines a block carries
+# depends on WHERE IN THE BLOB it sits, which is not a property of the content.
+# The producer prints header + `print(body)`, so a body that itself ends in a
+# newline emits an extra EMPTY line; the caller's whole-blob capture then strips
+# trailing newlines, so that empty line survives for every block EXCEPT THE
+# LAST. Two different keys for the same chunk, and neither predictable by the
+# MCP-retrieval recorder (it cannot know a result's eventual position).
+# Collapsing here makes the key a function of the CONTENT only.
+#
+# MUST MATCH seen-store.sh's vco_seen_normalize_body and
+# mcp_retrieval_record.py's normalize_block_body.
+function Get-VcoSeenNormalizedBody {
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return "" }
+    $trimmed = $Text.TrimEnd("`n")
+    if ([string]::IsNullOrEmpty($trimmed)) { return "" }
+    return ($trimmed + "`n")
 }
 
 # Get-VcoSeenHash <Text> -- sha1 of the body, first 12 hex chars.
@@ -262,7 +356,10 @@ function Invoke-VcoFilterSeenBlocks {
             return
         }
         if ($curPrefix -eq "KG") {
-            $bh = Get-VcoSeenHash -Text $curBody
+            # sha1 of the NORMALIZED body -- the normalization is what makes the
+            # key depend on the CONTENT rather than on the block's position in
+            # the blob (see Get-VcoSeenNormalizedBody).
+            $bh = Get-VcoSeenHash -Text (Get-VcoSeenNormalizedBody -Text $curBody)
             $key = "{0}#{1}" -f $curFirst, $bh
         } else {
             $key = $curFirst
@@ -270,7 +367,10 @@ function Invoke-VcoFilterSeenBlocks {
         $suppress = $false
         if ($dedupOn) {
             if (Test-VcoSeenHas -File $InjectFile -Key $key) { $suppress = $true }
-            if ((-not $suppress) -and $curSrc -and $ReadsFile -and (Test-VcoSeenHas -File $ReadsFile -Key $curSrc)) {
+            # P4 (v0.2.91): compare through Test-VcoSeenSrcMatches, which tries
+            # BOTH path shapes; the old single-shape check silently never matched
+            # when the ledger and the producer disagreed on relative-vs-absolute.
+            if ((-not $suppress) -and $curSrc -and $ReadsFile -and (Test-VcoSeenSrcMatches -ReadsFile $ReadsFile -Src $curSrc)) {
                 $suppress = $true
             }
         }

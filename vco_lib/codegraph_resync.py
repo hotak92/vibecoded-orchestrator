@@ -90,6 +90,16 @@ _CONDITION_ID = "codegraph_embed_resync_pending"
 # the warning is correct for genuinely-forgotten children.
 _DETACHED_CHILDREN: list = []
 
+
+def _truthy_env(name: str) -> bool:
+    """True iff env var ``name`` holds a truthy token.
+
+    Same token set the shell hooks and the RL client use ("true"/"1"/"yes"/"on",
+    case-insensitive) so an operator who sets ``VCT_RESYNC_SPAWN_DISABLED=true``
+    in ``.claude/env`` gets the same answer everywhere.
+    """
+    return (os.environ.get(name) or "").strip().lower() in ("true", "1", "yes", "on")
+
 # ── R-6 (v0.2.73): owed-work probe ───────────────────────────────────────────
 #
 # Fallback embedding revision when the analyzer source cannot be parsed.
@@ -2576,6 +2586,27 @@ def spawn_background_resync(
     if not project_name:
         return ResyncTriggerResult(
             status="skipped", message="no project name — cannot target collections"
+        )
+
+    # P5 (v0.2.91): explicit spawn kill-switch, checked BEFORE the per-spawn log
+    # file is created and before ANY Popen.
+    #
+    # Why it exists: the 2026-08-27 perf audit found 17 `resync-TProj-*.log`
+    # files a day in the user's REAL `~/.vct/logs/` — pytest fixtures reaching
+    # this function and depositing spawn records (and, where Popen was not
+    # faked, real detached venv children) into the production state dir. Test
+    # traffic in a production stream is not cosmetic: it is exactly the noise
+    # that made the perf audit's own numbers untrustworthy.
+    #
+    # It is a REAL operator knob, not a test-only hatch: CI runners, air-gapped
+    # installs, and users who want codegraph walks strictly on-demand all want
+    # "never spawn a background analyzer". `tests/conftest.py` sets it for the
+    # whole suite (with an explicit opt-out list for the tests that assert
+    # spawn behaviour) — the same convention as RL_HUB_POST_DISABLED.
+    if _truthy_env("VCT_RESYNC_SPAWN_DISABLED"):
+        return ResyncTriggerResult(
+            status="skipped",
+            message="background resync spawn disabled via VCT_RESYNC_SPAWN_DISABLED",
         )
 
     analyzer = _resolve_analyzer(repo_root)
