@@ -28,7 +28,7 @@ from __future__ import annotations
 import hashlib
 import re
 from pathlib import Path
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, FrozenSet, List, NamedTuple, Optional, Tuple
 
 
 # ── P2f stage 3 (v0.2.77 Part 6): the NARROW helpers protocol ───────────────
@@ -192,6 +192,7 @@ def _extract_balanced_block(
     opener: str = "{",
     closer: str = "}",
     max_lookahead: int = 400,
+    language: Optional[str] = None,
 ) -> int:
     """V52-O.11.E (v0.2.52, 2026-06-09): find the real end-line of a
     code block by counting balanced ``opener``/``closer`` pairs.
@@ -211,13 +212,15 @@ def _extract_balanced_block(
          for every ``closer`` decrement. When counter reaches 0, the
          current line is the close-brace line — return its 1-indexed
          line number.
-      3. Skip openers/closers inside:
-         - String literals (``"..."`` and ``'...'``) — single-line only;
-           multi-line raw/template strings are out of scope (caller
-           accepts mild bleed when the function contains a multi-line
-           string with unbalanced braces — that's a corner case).
-         - Line comments (``//`` and ``#``).
-         - Block comments (``/* ... */``) — single-line variant only.
+      3. Skip openers/closers inside comments and string literals, via
+         ``_scrub_line_stateful`` — ONE left-to-right pass per line with
+         LEXER STATE CARRIED ACROSS LINES, so block comments, template /
+         raw / verbatim strings, here-strings and Lua long brackets that
+         span lines are handled rather than mis-read (v0.2.91). Which
+         markers apply is decided by ``language`` (a ``lang_dispatch``
+         key): ``--`` is a comment only in Lua, ``#`` only in the
+         shell/ruby/python family, ``//`` only in the C family. Omitting
+         ``language`` selects the generic C-family profile.
       4. If no balanced close is found within ``max_lookahead`` lines,
          return ``min(start_line + max_lookahead, len(source_lines))``
          (graceful degradation — gives the caller the existing-pattern
@@ -233,7 +236,14 @@ def _extract_balanced_block(
     at every caller site — drop-in replacement, no off-by-one.
 
     Language coverage: works for any brace-balanced language (C, C++,
-    Java, JavaScript, TypeScript, Go, Rust, C#). ``end``-keyword
+    Java, JavaScript, TypeScript, Go, Rust, C#) — but PASS ``language``.
+    Comment markers are not universal (``--`` is a Lua comment and a C++
+    pre-decrement; ``#`` is a shell comment and a C string character), and
+    the line-spanning string forms are per-language (JS template literals,
+    Rust raw strings, C# verbatim strings, Lua long brackets). Omitting
+    ``language`` selects the C-family profile, which will mis-lex those.
+    Every in-package call site threads its key; the registry↔table parity
+    test keeps that true. ``end``-keyword
     languages (Lua) do NOT use this helper — their extractors
     (``vco_lib/codegraph_lang/lua.py``) key on the ``end`` token
     directly. Indent-significant languages don't use it either (Python
@@ -247,6 +257,16 @@ def _extract_balanced_block(
     this adds ~1ms per function vs the old fixed-window approach. The
     correctness gain (no body-bleed contamination in embeddings) is
     worth the cost.
+
+    v0.2.91 re-measured after the per-language lexer replaced the regex
+    scrub: 0.38 ms for a typical 30-line body, 5.0 ms for a 400-line
+    runaway (~6.5x the regex version, still inside the ~1 ms/function
+    budget above). At whole-repo scale that is ~0.4 s per 1000 entities —
+    negligible against the embedding round-trips that dominate an analyze
+    run, so the scrubber is deliberately kept simple (one obvious
+    character loop) rather than fast: this is the path where a clever
+    optimisation buys milliseconds and risks another truncated-body class
+    of bug.
     """
     if start_line < 1 or start_line > len(source_lines):
         return min(start_line + 40, len(source_lines))  # legacy fallback
@@ -254,13 +274,17 @@ def _extract_balanced_block(
     counter = 0
     found_opener = False
     lookahead_end = min(start_line - 1 + max_lookahead, len(source_lines))
+    syn = _syntax_for(language)
+    scrub_state: Optional[_ScrubState] = None
 
     for line_idx in range(start_line - 1, lookahead_end):
         line = source_lines[line_idx]
-        # Strip line comment + single-line block comment + string literals.
-        # This is a best-effort scrub — multi-line strings + multi-line
-        # block comments are out of scope (callers degrade gracefully).
-        scrubbed = _scrub_for_brace_balance(line)
+        # Strip comments + string literals with the per-language lexer, carrying
+        # its state across lines so multi-line strings / block comments don't
+        # feed their contents to the brace counter. A construct that opened
+        # BEFORE ``start_line`` is unknowable from here — the scan starts at the
+        # block's own first line by construction.
+        scrubbed, scrub_state = _scrub_line_stateful(line, syn, scrub_state)
         for ch in scrubbed:
             if ch == opener:
                 counter += 1
@@ -277,36 +301,403 @@ def _extract_balanced_block(
     return min(start_line + 40, len(source_lines))
 
 
-def _scrub_for_brace_balance(line: str) -> str:
-    """Best-effort: remove comments + single-line string literals from
-    ``line`` so the brace-counter in ``_extract_balanced_block`` doesn't
-    mis-count braces inside strings/comments.
+# ---------------------------------------------------------------------------
+# Brace-balance scrubbing — the per-language comment/string lexer
+# ---------------------------------------------------------------------------
+#
+# v0.2.91 (plan decision #29): the pre-fix scrubber stripped from the EARLIEST
+# of ``#`` / ``//`` / ``--`` — every marker applied to EVERY language — and did
+# so BEFORE removing string literals. Both halves were wrong, and the failures
+# are C-family commonplaces rather than the "exotic multi-line constructs" the
+# old docstring blamed:
+#
+#   ``for (int i = n; i > 0; --i) {``    → truncated at the pre-decrement
+#   ``if (u == "http://x") { return; }`` → truncated inside the URL string
+#   ``log("#tag"); if (c) {``            → truncated inside the string
+#   ``x=${VAR#pre}; ... ; then``         → truncated inside the shell expansion
+#
+# Each drops a real ``{``/``}`` from the counter, so ``_extract_balanced_block``
+# returns a SHORT end-line and the stored ``function_body`` is a truncated
+# fragment — degraded embeddings for every non-Python extractor (Python builds
+# bodies from the AST and never reaches here).
+#
+# THE FIX HAS THREE PARTS:
+#
+# 1. ONE left-to-right pass, not two sequential regex passes. "Strings first"
+#    and "comments first" are BOTH wrong as a global ordering: comments-first
+#    truncates on a marker inside a string (the bug above), strings-first makes
+#    the apostrophe in ``// don't do this`` open a string. A single scan that
+#    tracks which construct it is inside makes the ordering question moot —
+#    neither construct can begin inside the other.
+# 2. PER-LANGUAGE markers from ONE table (``_LANG_SYNTAX``), threaded to the
+#    scrubber as ``language=`` by every extractor call site. ``--`` is a comment
+#    only in Lua, ``#`` only in the shell/ruby/python family, ``//`` only in the
+#    C family.
+# 3. CROSS-LINE state for the constructs that genuinely span lines (block
+#    comments, template/raw/verbatim strings, here-strings, Lua long brackets).
+#    A stateless stripper mis-reading a multi-line string is the failure that
+#    silently un-scanned ~400 lines elsewhere in this cycle — see the KG node
+#    ``source-text-gates-fail-toward-green-2026-08-27``.
+#
+# BLAST-RADIUS RULE (conservative default): only constructs explicitly marked
+# as line-spanning carry state across a newline. A single-line string left open
+# at end-of-line RESETS to normal, so a lexer mistake can never poison more than
+# the line that caused it — the same bound the pre-fix scrubber had.
 
-    Order matters: comments first (so a quote inside a comment doesn't
-    open a string), then strings. Multi-line constructs (raw strings,
-    block comments spanning lines, template literals) are intentionally
-    not handled — they're rare enough that the caller's graceful
-    degradation suffices.
+
+class _MultilineForm(NamedTuple):
+    """A construct that may span lines and whose closer depends on its opener.
+
+    ``closer`` builds the literal closing token from the opener match, which is
+    what Rust's ``r##"`` → ``"##`` and Lua's ``[=[`` → ``]=]`` need.
     """
-    # Strip line comments. Handle Python ``#``, shell ``#``, C++ ``//``,
-    # Lua ``--``. We strip whichever appears first.
-    earliest = len(line)
-    for marker in ("#", "//", "--"):
-        idx = line.find(marker)
-        if idx >= 0 and idx < earliest:
-            earliest = idx
-    line = line[:earliest]
 
-    # Strip single-line block comments: /* ... */ on one line.
-    line = re.sub(r"/\*.*?\*/", "", line)
+    opener: "re.Pattern[str]"
+    closer: Callable[["re.Match[str]"], str]
+    escapes: bool = False        # backslash escapes the next char inside
+    doubled_close: bool = False  # a doubled closer is an escaped literal (C# @"")
+    ident_guard: bool = False    # opener must not continue an identifier (Rust r")
 
-    # Strip string literals. Single-line only — multi-line out of scope.
-    line = re.sub(r"\"(?:\\.|[^\"\\])*\"", '""', line)
-    line = re.sub(r"'(?:\\.|[^'\\])*'", "''", line)
-    # Template literals (backticks). Single-line only.
-    line = re.sub(r"`(?:\\.|[^`\\])*`", "``", line)
 
-    return line
+class _LangSyntax(NamedTuple):
+    """Comment/string syntax for ONE language key."""
+
+    line_comments: Tuple[str, ...] = ()
+    #: markers that only open a comment at a word boundary — ``${VAR#pre}`` and
+    #: ``${#VAR}`` are shell parameter expansions, NOT comments. See
+    #: :data:`_WORD_START_BEFORE` for which characters count as a boundary.
+    word_start_line_comments: Tuple[str, ...] = ()
+    #: (open, close, nested) — all span lines.
+    block_comments: Tuple[Tuple[str, str, bool], ...] = ()
+    multiline: Tuple[_MultilineForm, ...] = ()
+    #: ``'`` delimits a bounded char literal (and may also be a Rust lifetime or
+    #: a C++ digit separator, which must NOT be read as an unterminated string).
+    char_quote: bool = False
+    #: ``'`` delimits an ordinary single-line string.
+    single_quote_string: bool = False
+    #: a trailing backslash continues a ``"…`` string onto the next line.
+    string_line_continuation: bool = False
+
+
+class _ScrubState(NamedTuple):
+    """What the lexer is currently inside. ``None`` means normal code."""
+
+    closer: str
+    escapes: bool = False
+    doubled_close: bool = False
+    spans_lines: bool = False
+    opener: str = ""      # non-empty only for a NESTABLE block comment (Rust)
+    depth: int = 1
+    continuation: bool = False  # a trailing backslash may extend this string
+
+
+# Characters a shell/PowerShell ``#`` must follow to begin a comment.
+#
+# Braces are deliberately ABSENT (v0.2.91 wave-5 review MAJOR-3, a #29
+# residual). ``{`` and ``}`` are shell RESERVED WORDS, not metacharacters: a
+# brace-group opener is always followed by whitespace, so ``{ # comment`` still
+# opens a comment via the space rule, while bash reads an adjacent ``{#…`` as
+# part of a word. Treating ``{`` as a word boundary made ``${#arr[@]}`` /
+# ``${#VAR}`` — parameter LENGTH expansion, and PowerShell's braced-variable
+# form ``${…#…}`` — scrub to ``n=${``, which both truncates the line AND leaves
+# the counter an unmatched ``{``, so ``_extract_balanced_block`` overruns past
+# the real body end. Five shipped hooks use the shape
+# (``post-tool-security.sh``, ``pre-bash-context-inject.sh``,
+# ``subagent-stop-reconcile.sh``, ``verify-container-ports.sh``), so this
+# mis-extracted in every install's own code graph.
+_WORD_START_BEFORE: FrozenSet[str] = frozenset(" \t;&|()`")
+
+# A bounded char literal: 'a', '\n', '\x41', '\u{1F600}'. Deliberately does NOT
+# match a Rust lifetime ('a followed by anything but a quote) or a C++ digit
+# separator (1'000'000) — those stay ordinary characters.
+_CHAR_LITERAL_RE = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F]{1,6}\}|x[0-9a-fA-F]{1,8}|.)|[^'\\])'")
+
+# ── reusable multi-line forms ──────────────────────────────────────────────
+_ML_TEMPLATE_LITERAL = _MultilineForm(re.compile(r"`"), lambda m: "`", escapes=True)
+_ML_GO_RAW_STRING = _MultilineForm(re.compile(r"`"), lambda m: "`")
+_ML_RUST_RAW_STRING = _MultilineForm(
+    re.compile(r'(?:br|rb|r)(#*)"'), lambda m: '"' + m.group(1), ident_guard=True
+)
+_ML_CPP_RAW_STRING = _MultilineForm(
+    re.compile(r'R"([^()\\ \t]{0,16})\('), lambda m: ")" + m.group(1) + '"', ident_guard=True
+)
+_ML_CSHARP_VERBATIM = _MultilineForm(
+    re.compile(r'@"'), lambda m: '"', doubled_close=True
+)
+_ML_TRIPLE_DOUBLE = _MultilineForm(re.compile(r'"""'), lambda m: '"""')
+_ML_LUA_LONG_COMMENT = _MultilineForm(
+    re.compile(r"--\[(=*)\["), lambda m: "]" + m.group(1) + "]"
+)
+_ML_LUA_LONG_STRING = _MultilineForm(
+    re.compile(r"\[(=*)\["), lambda m: "]" + m.group(1) + "]"
+)
+_ML_PS_HERESTRING_D = _MultilineForm(re.compile(r'@"'), lambda m: '"@')
+_ML_PS_HERESTRING_S = _MultilineForm(re.compile(r"@'"), lambda m: "'@")
+# ``^`` anchors to the true start of the string, and a scrubbed line never
+# contains a newline — so this only ever matches at column 0, which is exactly
+# Ruby's rule for =begin/=end.
+_ML_RUBY_BLOCK_COMMENT = _MultilineForm(re.compile(r"^=begin\b"), lambda m: "=end")
+
+_C_BLOCK_COMMENT: Tuple[Tuple[str, str, bool], ...] = (("/*", "*/", False),)
+
+_C_FAMILY = _LangSyntax(
+    line_comments=("//",),
+    block_comments=_C_BLOCK_COMMENT,
+    char_quote=True,
+    string_line_continuation=True,
+)
+_JS_FAMILY = _LangSyntax(
+    line_comments=("//",),
+    block_comments=_C_BLOCK_COMMENT,
+    multiline=(_ML_TEMPLATE_LITERAL,),
+    single_quote_string=True,
+    string_line_continuation=True,
+)
+
+#: language key -> syntax. Keys are the analyzer's ``lang_dispatch`` keys — the
+#: SAME keys ``codegraph_lang.EXTRACTORS`` is keyed by. Registry↔table parity is
+#: pinned by ``tests/test_v0291_scrub_language_markers.py`` (which enumerates
+#: ``EXTRACTORS`` as the denominator), so a new language cannot land without
+#: declaring its markers here.
+_LANG_SYNTAX: Dict[str, _LangSyntax] = {
+    # ── C family ───────────────────────────────────────────────────────────
+    "cpp": _C_FAMILY._replace(multiline=(_ML_CPP_RAW_STRING,)),
+    "csharp": _C_FAMILY._replace(multiline=(_ML_TRIPLE_DOUBLE, _ML_CSHARP_VERBATIM)),
+    "java": _C_FAMILY._replace(multiline=(_ML_TRIPLE_DOUBLE,)),
+    "go": _C_FAMILY._replace(
+        multiline=(_ML_GO_RAW_STRING,), string_line_continuation=False
+    ),
+    "rust": _C_FAMILY._replace(
+        block_comments=(("/*", "*/", True),),  # Rust block comments NEST
+        multiline=(_ML_RUST_RAW_STRING,),
+    ),
+    "proto": _LangSyntax(
+        line_comments=("//",), block_comments=_C_BLOCK_COMMENT, single_quote_string=True
+    ),
+    # ── JS family (svelte's extracted bodies are <script> JavaScript) ──────
+    "javascript": _JS_FAMILY,
+    "typescript": _JS_FAMILY,
+    "svelte": _JS_FAMILY._replace(
+        block_comments=_C_BLOCK_COMMENT + (("<!--", "-->", False),)
+    ),
+    # ── hash-comment family ────────────────────────────────────────────────
+    # Python bypasses this helper entirely (AST bodies); the entry exists so the
+    # registry-parity test has an explicit row for every dispatch key.
+    "python": _LangSyntax(
+        line_comments=("#",),
+        multiline=(_ML_TRIPLE_DOUBLE, _MultilineForm(re.compile(r"'''"), lambda m: "'''")),
+        single_quote_string=True,
+    ),
+    "ruby": _LangSyntax(
+        line_comments=("#",),
+        multiline=(_ML_RUBY_BLOCK_COMMENT,),
+        single_quote_string=True,
+    ),
+    # POSIX: ``#`` opens a comment only at the start of a word, so ``${VAR#pre}``
+    # and ``${VAR%suf}`` keep their closing brace.
+    "shell": _LangSyntax(word_start_line_comments=("#",), single_quote_string=True),
+    "powershell": _LangSyntax(
+        word_start_line_comments=("#",),
+        block_comments=(("<#", "#>", False),),
+        multiline=(_ML_PS_HERESTRING_D, _ML_PS_HERESTRING_S),
+        single_quote_string=True,
+    ),
+    # ── other ──────────────────────────────────────────────────────────────
+    "lua": _LangSyntax(
+        line_comments=("--",),
+        multiline=(_ML_LUA_LONG_COMMENT, _ML_LUA_LONG_STRING),
+        single_quote_string=True,
+    ),
+}
+
+#: Used when a caller passes no language. Matches this module's documented
+#: coverage claim ("any brace-balanced language: C, C++, Java, JavaScript, Go,
+#: Rust, C#") — the C-family profile. Callers inside this package always pass an
+#: explicit key; the fallback exists for ad-hoc/legacy callers.
+_GENERIC_BRACE_SYNTAX = _C_FAMILY
+
+
+def _syntax_for(language: Optional[str]) -> _LangSyntax:
+    """Resolve a ``lang_dispatch`` key to its syntax, falling back to the
+    generic brace-language profile for an unknown/absent key."""
+    if not language:
+        return _GENERIC_BRACE_SYNTAX
+    return _LANG_SYNTAX.get(language.strip().lower(), _GENERIC_BRACE_SYNTAX)
+
+
+def _ends_with_odd_backslash(line: str) -> bool:
+    """True when ``line`` ends with an unescaped backslash (a line continuation)."""
+    trailing = len(line) - len(line.rstrip("\\"))
+    return trailing % 2 == 1
+
+
+def _scan_construct(line: str, i: int, state: _ScrubState) -> Tuple[int, Optional[_ScrubState]]:
+    """Scan forward from ``i`` while inside ``state``.
+
+    Returns ``(index just past the closer, None)`` when the construct closes on
+    this line, or ``(len(line), state)`` when it runs past the end of the line.
+    """
+    n = len(line)
+    while i < n:
+        if state.escapes and line[i] == "\\":
+            i += 2
+            continue
+        if state.opener and line.startswith(state.opener, i):
+            state = state._replace(depth=state.depth + 1)
+            i += len(state.opener)
+            continue
+        if line.startswith(state.closer, i):
+            j = i + len(state.closer)
+            if state.doubled_close and line.startswith(state.closer, j):
+                i = j + len(state.closer)  # an escaped literal delimiter ("" in @"")
+                continue
+            if state.depth > 1:
+                state = state._replace(depth=state.depth - 1)
+                i = j
+                continue
+            return j, None
+        i += 1
+    return n, state
+
+
+def _carry_state(state: _ScrubState, line: str) -> Optional[_ScrubState]:
+    """Decide whether an unterminated construct survives the newline.
+
+    Only explicitly line-spanning constructs (and a backslash-continued string in
+    a language that allows it) carry over; everything else resets, bounding a
+    mis-lex to the single line that caused it.
+    """
+    if state.spans_lines:
+        return state
+    if state.continuation and _ends_with_odd_backslash(line):
+        return state
+    return None
+
+
+def _open_construct_at(
+    line: str, i: int, syn: _LangSyntax
+) -> Optional[Tuple[int, _ScrubState]]:
+    """If a line-spanning construct opens at ``line[i]``, return
+    ``(index past the opener, state)``. Checked BEFORE line comments so Lua's
+    ``--[[`` beats ``--`` and PowerShell's ``<#`` beats ``#``."""
+    for form in syn.multiline:
+        if form.ident_guard and i > 0 and (line[i - 1].isalnum() or line[i - 1] == "_"):
+            continue
+        m = form.opener.match(line, i)
+        if m is not None:
+            return m.end(), _ScrubState(
+                closer=form.closer(m),
+                escapes=form.escapes,
+                doubled_close=form.doubled_close,
+                spans_lines=True,
+            )
+    for opener, closer, nested in syn.block_comments:
+        if line.startswith(opener, i):
+            return i + len(opener), _ScrubState(
+                closer=closer, spans_lines=True, opener=opener if nested else ""
+            )
+    return None
+
+
+def _line_comment_at(line: str, i: int, syn: _LangSyntax) -> bool:
+    for marker in syn.line_comments:
+        if line.startswith(marker, i):
+            return True
+    for marker in syn.word_start_line_comments:
+        if line.startswith(marker, i) and (i == 0 or line[i - 1] in _WORD_START_BEFORE):
+            return True
+    return False
+
+
+def _scrub_line_stateful(
+    line: str, syn: _LangSyntax, state: Optional[_ScrubState] = None
+) -> Tuple[str, Optional[_ScrubState]]:
+    """Remove comments + string literals from ONE line, carrying lexer state.
+
+    Returns ``(code-only text, state for the next line)``. The removed regions
+    are dropped entirely (delimiters included) — the only consumers are the
+    ``{``/``}`` counters in ``_extract_balanced_block``, and no delimiter this
+    lexer recognises is a brace.
+    """
+    out: List[str] = []
+    i = 0
+    n = len(line)
+
+    if state is not None:
+        i, state = _scan_construct(line, 0, state)
+        if state is not None:
+            return "", _carry_state(state, line)
+
+    while i < n:
+        opened = _open_construct_at(line, i, syn)
+        if opened is not None:
+            i, state = _scan_construct(line, opened[0], opened[1])
+            if state is not None:
+                return "".join(out), _carry_state(state, line)
+            continue
+
+        if _line_comment_at(line, i, syn):
+            return "".join(out), None  # the rest of the line is a comment
+
+        ch = line[i]
+        if ch == '"':
+            i, state = _scan_construct(
+                line,
+                i + 1,
+                _ScrubState(
+                    closer='"', escapes=True, continuation=syn.string_line_continuation
+                ),
+            )
+            if state is not None:
+                return "".join(out), _carry_state(state, line)
+            continue
+
+        if ch == "'":
+            if syn.char_quote:
+                m = _CHAR_LITERAL_RE.match(line, i)
+                if m is not None:
+                    i = m.end()
+                    continue
+                # A Rust lifetime ('a) or a C++ digit separator — ordinary text.
+                out.append(ch)
+                i += 1
+                continue
+            if syn.single_quote_string:
+                i, state = _scan_construct(
+                    line, i + 1, _ScrubState(closer="'", escapes=True)
+                )
+                if state is not None:
+                    return "".join(out), _carry_state(state, line)
+                continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out), None
+
+
+def _scrub_for_brace_balance(line: str, language: Optional[str] = None) -> str:
+    """Remove comments + string literals from ``line`` so the brace-counter in
+    ``_extract_balanced_block`` doesn't mis-count braces inside them.
+
+    The single-line entry point: a thin wrapper over ``_scrub_line_stateful``
+    with fresh state (ONE lexer implementation, two entry points). Multi-line
+    constructs therefore can't be recognised through THIS entry point — use the
+    stateful form, as ``_extract_balanced_block`` does, when scanning a span.
+
+    ``language`` is a ``lang_dispatch`` key (``"rust"``, ``"shell"``, …); it
+    selects the comment/string markers from ``_LANG_SYNTAX``. Omitting it falls
+    back to the generic brace-language (C-family) profile.
+
+    THE REAL RISK this handles — and what the pre-v0.2.91 version got wrong — is
+    a comment marker appearing inside a STRING or as an operator in another
+    language: ``--i`` (C++ pre-decrement), ``"http://…"`` (a URL), ``"#tag"``,
+    ``${VAR#pre}``. Each used to truncate the line and drop a real brace. It is
+    NOT "exotic multi-line constructs", which the old docstring blamed and which
+    lose no braces at all when they contain none.
+    """
+    scrubbed, _ = _scrub_line_stateful(line, _syntax_for(language))
+    return scrubbed
 
 
 # ---------------------------------------------------------------------------

@@ -92,7 +92,7 @@ def extract_ruby_file(
     stats: Dict[str, int] = {'modules': 1, 'classes': 0, 'functions': 0}
 
     for cname, start_line in class_info.items():
-        _class_end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 50)
+        _class_end_line = _extract_balanced_block(source_lines, start_line, language="ruby")  # V52-O.11.E (was: start_line + 50)
         class_lines = source_lines[max(0, start_line - 1):_class_end_line]
         class_body = '\n'.join(class_lines)
         methods = [m.group(1) for m in func_pattern.finditer(content_clean)]
@@ -115,7 +115,7 @@ def extract_ruby_file(
         fname = m.group(1)
         args_str = m.group(2) or ''
         start_line = content_clean[:m.start()].count('\n') + 1
-        end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 30)
+        end_line = _extract_balanced_block(source_lines, start_line, language="ruby")  # V52-O.11.E (was: start_line + 30)
         body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
         enclosing = next(
             (c for c, cl in sorted(class_info.items(), key=lambda x: x[1], reverse=True)

@@ -169,7 +169,7 @@ def _js_methods_for_class(
         class_open_pos = m.end() - 1  # position of `{`
         class_open_line = content_clean[:class_open_pos].count("\n") + 1
         class_close_line = _extract_balanced_block(
-            source_lines, class_open_line, max_lookahead=800
+            source_lines, class_open_line, max_lookahead=800, language="javascript"
         )
         block_start_pos = class_open_pos + 1  # skip `{`
 
@@ -425,7 +425,7 @@ def extract_js_file(
 
     # --- Store classes ---
     for cname, (start_line, base_class) in class_info.items():
-        _class_end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 80)
+        _class_end_line = _extract_balanced_block(source_lines, start_line, language="javascript")  # V52-O.11.E (was: start_line + 80)
         class_lines = source_lines[max(0, start_line - 1):_class_end_line]
         class_body = '\n'.join(class_lines)
         # V52-O.11.F.2-JS (v0.2.52, 2026-06-09): scope `methods` to
@@ -465,7 +465,7 @@ def extract_js_file(
 
     # --- Store functions ---
     for fname, start_line, is_async in func_matches:
-        end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 40)
+        end_line = _extract_balanced_block(source_lines, start_line, language="javascript")  # V52-O.11.E (was: start_line + 40)
         body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
         full_name = f"{file_path.stem}.{fname}"
         signature = f"{'async ' if is_async else ''}function {fname}()"

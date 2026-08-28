@@ -141,7 +141,7 @@ def extract_lua_file(
             continue
 
         start_line = content[:m.start()].count('\n') + 1
-        end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 40)
+        end_line = _extract_balanced_block(source_lines, start_line, language="lua")  # V52-O.11.E (was: start_line + 40)
         body = '\n'.join(source_lines[start_line - 1:end_line])
 
         func_full_name = f"{file_path.stem}.{func_name}"

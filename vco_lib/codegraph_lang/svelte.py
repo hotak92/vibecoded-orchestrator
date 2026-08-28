@@ -298,7 +298,7 @@ def extract_svelte_file(
     for decl in _parse_svelte_functions(content):
         name: str = decl["name"]
         start_line = content[:decl["start_offset"]].count('\n') + 1
-        end_line = _extract_balanced_block(source_lines, start_line)
+        end_line = _extract_balanced_block(source_lines, start_line, language="svelte")
         body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
 
         kind = decl["kind"]

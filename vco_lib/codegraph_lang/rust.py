@@ -124,7 +124,7 @@ def _rust_methods_for_struct(
         # We need a source-line index: convert char-offset to line.
         impl_open_line = content_clean[:impl_open_pos].count("\n") + 1
         impl_close_line = _extract_balanced_block(
-            source_lines, impl_open_line, max_lookahead=800
+            source_lines, impl_open_line, max_lookahead=800, language="rust"
         )
         # Slice content_clean (NOT source_lines — content_clean has
         # comments stripped, mirroring how the original method extraction
@@ -328,7 +328,7 @@ def extract_rust_file(
     stats: Dict[str, int] = {'modules': 1, 'classes': 0, 'functions': 0}
 
     for sname, start_line in struct_info.items():
-        _class_end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 40)
+        _class_end_line = _extract_balanced_block(source_lines, start_line, language="rust")  # V52-O.11.E (was: start_line + 40)
         class_lines = source_lines[max(0, start_line - 1):_class_end_line]
         class_body = '\n'.join(class_lines)
         signature = f"struct/enum/trait {sname}"
@@ -369,7 +369,7 @@ def extract_rust_file(
             continue
         is_async = bool(re.search(rf'async\s+fn\s+{re.escape(fname)}', content_clean))
         start_line = content_clean[:m.start()].count('\n') + 1
-        end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 40)
+        end_line = _extract_balanced_block(source_lines, start_line, language="rust")  # V52-O.11.E (was: start_line + 40)
         body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
         full_name = f"{file_path.stem}.{fname}"
         signature = f"fn {fname}({args_str})"

@@ -101,7 +101,7 @@ def extract_cpp_file(
     for cname, start_line in class_info.items():
         methods = [m.group(2) for m in method_pattern.finditer(content_clean)
                    if m.group(1) == cname]
-        _class_end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 60)
+        _class_end_line = _extract_balanced_block(source_lines, start_line, language="cpp")  # V52-O.11.E (was: start_line + 60)
         class_lines = source_lines[max(0, start_line - 1):_class_end_line]
         class_body = '\n'.join(class_lines)
         signature = f"class {cname}"
@@ -134,7 +134,7 @@ def extract_cpp_file(
     for m in method_pattern.finditer(content_clean):
         class_name, method_name, args_str = m.group(1), m.group(2), m.group(3)
         start_line = content_clean[:m.start()].count('\n') + 1
-        end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 50)
+        end_line = _extract_balanced_block(source_lines, start_line, language="cpp")  # V52-O.11.E (was: start_line + 50)
         body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
         full_name = f"{file_path.stem}.{class_name}.{method_name}"
         signature = f"{class_name}::{method_name}({args_str})"

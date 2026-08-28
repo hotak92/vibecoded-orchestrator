@@ -115,7 +115,7 @@ def extract_proto_file(
     for m in msg_pattern.finditer(content_clean):
         mname = m.group(1)
         start_line = content_clean[:m.start()].count('\n') + 1
-        end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 30)
+        end_line = _extract_balanced_block(source_lines, start_line, language="proto")  # V52-O.11.E (was: start_line + 30)
         class_body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
         signature = f"message {mname}"
         # v0.2.82 (G1 task 2): defer the class embed (this proto message CLASS

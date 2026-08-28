@@ -327,7 +327,7 @@ def extract_powershell_file(
         if not anchor_match:
             continue
         start_line = content[:anchor_match.start()].count('\n') + 1
-        end_line = _extract_balanced_block(source_lines, start_line)
+        end_line = _extract_balanced_block(source_lines, start_line, language="powershell")
         body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
 
         param_sig = ", ".join(f"${p}" for p in params)

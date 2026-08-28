@@ -197,7 +197,7 @@ def extract_go_file(
 
     # Struct/interface entries
     for sname, start_line in struct_info.items():
-        _class_end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 40)
+        _class_end_line = _extract_balanced_block(source_lines, start_line, language="go")  # V52-O.11.E (was: start_line + 40)
         class_lines = source_lines[max(0, start_line - 1):_class_end_line]
         class_body = '\n'.join(class_lines)
         signature = f"type {sname} struct/interface"
@@ -232,7 +232,7 @@ def extract_go_file(
         if fname[0].islower() and fname in ('if', 'for', 'switch', 'select'):
             continue
         start_line = content_clean[:m.start()].count('\n') + 1
-        end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 40)
+        end_line = _extract_balanced_block(source_lines, start_line, language="go")  # V52-O.11.E (was: start_line + 40)
         body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
         full_name = f"{pkg_name}.{fname}"
         signature = f"func {fname}({args_str})"

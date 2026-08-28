@@ -79,7 +79,7 @@ def extract_shell_file(
         if not fname:
             continue
         start_line = content_clean[:m.start()].count('\n') + 1
-        end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 30)
+        end_line = _extract_balanced_block(source_lines, start_line, language="shell")  # V52-O.11.E (was: start_line + 30)
         body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
         full_name = f"{file_path.stem}.{fname}"
         signature = f"{fname}()"

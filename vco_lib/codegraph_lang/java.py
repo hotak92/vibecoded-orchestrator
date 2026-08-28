@@ -173,7 +173,7 @@ def _java_methods_for_class(
         class_open_pos = m.end() - 1  # position of `{`
         class_open_line = content_clean[:class_open_pos].count("\n") + 1
         class_close_line = _extract_balanced_block(
-            source_lines, class_open_line, max_lookahead=2000
+            source_lines, class_open_line, max_lookahead=2000, language="java"
         )
         target_newlines = class_close_line - class_open_line
         if target_newlines <= 0:
@@ -360,7 +360,7 @@ def extract_java_file(
     stats: Dict[str, int] = {'modules': 1, 'classes': 0, 'functions': 0}
 
     for cname, start_line in class_info.items():
-        _class_end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 60)
+        _class_end_line = _extract_balanced_block(source_lines, start_line, language="java")  # V52-O.11.E (was: start_line + 60)
         class_lines = source_lines[max(0, start_line - 1):_class_end_line]
         class_body = '\n'.join(class_lines)
         # V52-O.11.F.2-JAVA (v0.2.52, 2026-06-09): scope `methods` to
@@ -392,7 +392,7 @@ def extract_java_file(
         if mname in ('if', 'while', 'for', 'switch', 'catch', 'try', 'else', 'return'):
             continue
         start_line = content_clean[:m.start()].count('\n') + 1
-        end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 50)
+        end_line = _extract_balanced_block(source_lines, start_line, language="java")  # V52-O.11.E (was: start_line + 50)
         body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
         # Find enclosing class
         enclosing = next(

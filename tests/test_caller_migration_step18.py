@@ -80,33 +80,63 @@ def _purge_modules(prefixes: tuple[str, ...]) -> None:
             del sys.modules[mod]
 
 
-def _clear_relevant_env() -> None:
-    """Strip env vars the migrated callers read so each test starts clean."""
-    for k in (
-        "KG_COLLECTION",
-        "SHARED_KG_COLLECTION",
-        "DEVELOPMENT_COLLECTION",
-        "ACTIVE_EMBEDDING",
-        "CODE_GRAPH_PROJECT",
-        "PROJECT_NAME",
-        "VCT_KG_ACCESS_LIST",
-        "KG_BASE_DIR",
-        # v0.2.89 BUG 3: the new non-leaking root channel outranks
-        # KG_BASE_DIR in sync_knowledge_graph.py — strip it too so a
-        # host shell can never steer the module-load-time resolution.
-        "KG_SYNC_PROJECT_ROOT",
-    ):
-        os.environ.pop(k, None)
+_RELEVANT_ENV_VARS: tuple[str, ...] = (
+    "KG_COLLECTION",
+    "SHARED_KG_COLLECTION",
+    "DEVELOPMENT_COLLECTION",
+    "ACTIVE_EMBEDDING",
+    "CODE_GRAPH_PROJECT",
+    "PROJECT_NAME",
+    "VCT_KG_ACCESS_LIST",
+    "KG_BASE_DIR",
+    # v0.2.89 BUG 3: the new non-leaking root channel outranks
+    # KG_BASE_DIR in sync_knowledge_graph.py — strip it too so a
+    # host shell can never steer the module-load-time resolution.
+    "KG_SYNC_PROJECT_ROOT",
+)
+
+
+def _clear_relevant_env() -> dict[str, str | None]:
+    """Strip env vars the migrated callers read so each test starts clean.
+
+    Returns a snapshot of the PRE-CLEAR value of each var (``None`` when it
+    was unset) so the caller can restore the exact prior state via
+    ``_restore_relevant_env``. This function used to be a bare unconditional
+    ``os.environ.pop(...)`` with no restore, called from both setUp AND
+    tearDown of every class in this file — it permanently stripped these
+    nine vars from the shared pytest process for every test collected after
+    this file (alphabetical order), which broke
+    ``test_codegraph_retrieval_quality_smoke.py`` (see the defensive fix in
+    that file). Snapshot-and-restore keeps the "vars absent DURING each
+    test" contract intact while guaranteeing the process env is
+    byte-identical to its pre-file state once this file's classes finish.
+    """
+    snapshot: dict[str, str | None] = {}
+    for k in _RELEVANT_ENV_VARS:
+        snapshot[k] = os.environ.pop(k, None)
+    return snapshot
+
+
+def _restore_relevant_env(snapshot: dict[str, str | None]) -> None:
+    """Undo `_clear_relevant_env`: reinstate vars that were set before the
+    clear, and ensure vars that were absent stay absent — i.e. restore the
+    exact pre-clear state (including any test-body mutations of the same
+    tracked vars, which get discarded)."""
+    for k, v in snapshot.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
 
 
 class WeaviateMcpServerResolverTests(unittest.TestCase):
     """The MCP server is the highest-value migration. Pin both paths."""
 
     def setUp(self) -> None:
-        _clear_relevant_env()
+        self._env_snapshot = _clear_relevant_env()
 
     def tearDown(self) -> None:
-        _clear_relevant_env()
+        _restore_relevant_env(self._env_snapshot)
         _purge_modules(("weaviate_mcp", "vco_lib.project_config"))
 
     def _reimport_server(self):
@@ -241,10 +271,10 @@ class TemplateScriptCallerTests(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        _clear_relevant_env()
+        self._env_snapshot = _clear_relevant_env()
 
     def tearDown(self) -> None:
-        _clear_relevant_env()
+        _restore_relevant_env(self._env_snapshot)
 
     def test_resolve_collections_prefers_hub(self):
         """The migrated _resolve_collections() returns the hub values
@@ -356,6 +386,54 @@ class TemplateScriptCallerTests(unittest.TestCase):
         self.assertIn(Path(target_root), seen_roots)
         self.assertEqual(module.COLLECTION_NAME, "TargetProjectKG")
         self.assertEqual(module.DEV_COLLECTION_NAME, "TargetProjectDev")
+
+
+class EnvRestorationRedProofTests(unittest.TestCase):
+    """Guards against the env-clobber regression this file used to carry:
+    ``_clear_relevant_env()`` was an unconditional ``os.environ.pop(...)``
+    over nine vars, invoked from setUp AND tearDown of every class above,
+    with no restore — permanently stripping those vars from the shared
+    pytest process for every test collected after this file. This test
+    drives one setUp/tearDown cycle of each class above directly (without
+    running a full test method) and asserts a sentinel ambient value
+    survives both cycles untouched.
+
+    Verified to catch the regression: reverting ``_clear_relevant_env`` to
+    the old bare ``for k in (...): os.environ.pop(k, None)`` (no snapshot,
+    no ``_restore_relevant_env``) and re-running this test FAILS with
+    ``AssertionError: None != 'sentinel-should-survive-de2e530a'`` at the
+    first cycle (``WeaviateMcpServerResolverTests``) — the sentinel is
+    popped in ``setUp`` and never comes back in ``tearDown``. It passes
+    again once ``_clear_relevant_env``/``_restore_relevant_env`` snapshot
+    and restore.
+    """
+
+    def test_sentinel_env_var_survives_setup_teardown_cycles_of_every_class(
+        self,
+    ) -> None:
+        sentinel = "sentinel-should-survive-de2e530a"
+        had_prior = "CODE_GRAPH_PROJECT" in os.environ
+        prior_value = os.environ.get("CODE_GRAPH_PROJECT")
+        os.environ["CODE_GRAPH_PROJECT"] = sentinel
+        try:
+            cycles = (
+                WeaviateMcpServerResolverTests("test_hub_up_resolver_values_win"),
+                TemplateScriptCallerTests("test_resolve_collections_prefers_hub"),
+            )
+            for case in cycles:
+                case.setUp()
+                case.tearDown()
+                self.assertEqual(
+                    os.environ.get("CODE_GRAPH_PROJECT"),
+                    sentinel,
+                    f"{type(case).__name__}'s setUp/tearDown cycle clobbered "
+                    "an ambient env var instead of restoring it",
+                )
+        finally:
+            if had_prior:
+                os.environ["CODE_GRAPH_PROJECT"] = prior_value  # type: ignore[assignment]
+            else:
+                os.environ.pop("CODE_GRAPH_PROJECT", None)
 
 
 if __name__ == "__main__":

@@ -112,13 +112,20 @@ def test_braces_in_single_quote_strings_ignored() -> None:
 
 
 def test_braces_in_template_literals_ignored() -> None:
+    # v0.2.91 (plan #29) CORRECTION — ``language="javascript"`` added.
+    # The backtick template literal is a JS/TS/Svelte construct, not a
+    # brace-language universal (in C/C++/Java/C# a backtick is not a string
+    # delimiter at all), so it now lives in the JS profile rather than being
+    # applied to every language. Declaring the language is what a real caller
+    # does: javascript.py threads ``language="javascript"`` at all 3 of its
+    # call sites. The assertion itself is unchanged.
     src = [
         "function foo() {",                       # 1
         "    const s = `template with } brace`;", # 2 — } in backtick
         "    return s;",                          # 3
         "}",                                      # 4
     ]
-    assert acg._extract_balanced_block(src, start_line=1) == 4
+    assert acg._extract_balanced_block(src, start_line=1, language="javascript") == 4
 
 
 # ---------------------------------------------------------------------------
@@ -149,13 +156,20 @@ def test_braces_in_line_comments_ignored_python() -> None:
 
 
 def test_braces_in_lua_comments_ignored() -> None:
+    # v0.2.91 (plan #29) CORRECTION — ``language="lua"`` added. Pre-fix, ``--``
+    # was treated as a comment marker in EVERY language, which is exactly the
+    # shipped bug: it truncated C-family lines at a pre-decrement (``--i``).
+    # ``--`` opening a comment is a Lua (and SQL-family) property, so the test
+    # must say which language it is testing. The assertion is unchanged; the
+    # C-family counterpart is pinned by
+    # test_v0291_scrub_language_markers::test_double_dash_is_not_a_comment_in_c_family.
     src = [
         "function foo() {",    # 1 — synthetic Lua-with-braces
         "    -- comment with }",# 2 — -- comment
         "    body()",          # 3
         "}",                   # 4
     ]
-    assert acg._extract_balanced_block(src, start_line=1) == 4
+    assert acg._extract_balanced_block(src, start_line=1, language="lua") == 4
 
 
 # ---------------------------------------------------------------------------

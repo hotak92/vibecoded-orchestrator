@@ -186,6 +186,37 @@ def _live_infra_present() -> tuple[bool, str]:
 
 _REQUIRE_LIVE = os.environ.get("VCO_RUN_LIVE_RETRIEVAL_SMOKE") == "1"
 
+# 2026-08-28 order-dependence fix: snapshot the project-resolution env vars at
+# IMPORT time. Pytest imports every test module during its collection phase,
+# BEFORE any test's body (setUp/tearDown included) runs — so this snapshot is
+# taken before any sibling test file gets a chance to mutate os.environ.
+#
+# Root cause this closes: this file's live test FAILED consistently when run
+# in true isolation, yet PASSED when run inside the full suite — for the
+# WRONG reason.
+# ``templates/scripts/query_code_graph.py``'s project resolver falls back to
+# ``os.getenv("CODE_GRAPH_PROJECT") or os.getenv("PROJECT_NAME")`` once the
+# hub-resolver path is disabled (this whole file runs under
+# ``conftest.py``'s autouse ``VCT_DISABLE_HUB_RESOLVER=1``, since it is not in
+# conftest's resolver opt-out list — by design, see conftest.py). In
+# isolation those two env vars still carry their ambient (pre-suite) values,
+# so the CLI resolves the real project and queries real seeded data. Inside
+# the full suite, ``tests/test_caller_migration_step18.py``'s
+# ``_clear_relevant_env()`` helper (an autouse-adjacent setUp/tearDown used by
+# an EARLIER-collected file) unconditionally ``os.environ.pop()``s
+# CODE_GRAPH_PROJECT/PROJECT_NAME with no restore, so by the time THIS test
+# runs later in the same process both are permanently gone — the CLI then
+# resolves no project, queries a collection that doesn't exist, and the
+# assertion below passes only because there is nothing left to query. That is
+# a pre-existing hermeticity bug in a SIBLING file (out of this lane's scope
+# to fix directly), so this test defends itself instead: it pins its own
+# subprocess env to what it captured before any test could have polluted it,
+# which keeps behaviour identical to a clean env (nothing to pin when the
+# ambient env never had these set, e.g. CI) while removing the dependency on
+# suite run order.
+_SNAPSHOT_CODE_GRAPH_PROJECT = os.environ.get("CODE_GRAPH_PROJECT", "")
+_SNAPSHOT_PROJECT_NAME = os.environ.get("PROJECT_NAME", "")
+
 
 def test_live_known_noise_query_returns_only_relevant_or_empty() -> None:
     """Run a deliberately-off-topic query through the CLI (same shared floor
@@ -209,10 +240,33 @@ def test_live_known_noise_query_returns_only_relevant_or_empty() -> None:
     url = detail
     # A query with no plausible code-entity match. If the floors work, the
     # result set is empty or contains only genuinely high-score rows.
-    noise_query = "xyzzy plugh frobnicate quux nonexistent gibberish token"
+    #
+    # 2026-08-28: this string previously ended in "... gibberish token". On
+    # this project's OWN live code graph (the CLI resolves project=self when
+    # queried from a checkout of this repo) "token" is no longer noise: the
+    # v0.2.8x/v0.2.9x auth/hub/secrets work seeded many real functions whose
+    # names and doc-summaries legitimately contain "token" (bearer tokens,
+    # hub tokens, project tokens). Those rows score 0.24-0.30 — inside the
+    # codesage post-rerank floor (0.22) — and saturate the 5-result limit, a
+    # live-data-drift false positive, not a floor regression. Verified
+    # empirically (2026-08-28): the query WITH "token" returns "Found 5
+    # results" every run; the same query with "token" removed returns "No
+    # matches" every run (5+ repeated live runs against this project's real
+    # collection). Dropping the one word that collided with real, growing
+    # domain vocabulary keeps the query genuinely noise for this corpus
+    # without weakening the assertion or the live-gated design.
+    noise_query = "xyzzy plugh frobnicate quux nonexistent gibberish"
     env = dict(os.environ)
     env.pop("VCT_VENV", None)  # discipline: don't let ambient VCT_VENV hijack
     env["WEAVIATE_URL"] = url
+    # Hermeticity (see the module-level snapshot comment above): pin project
+    # resolution to what this process saw before any sibling test could have
+    # stripped it, so this subprocess call behaves the same regardless of
+    # suite run order. No-op when the ambient env never had these set.
+    if _SNAPSHOT_CODE_GRAPH_PROJECT:
+        env["CODE_GRAPH_PROJECT"] = _SNAPSHOT_CODE_GRAPH_PROJECT
+    if _SNAPSHOT_PROJECT_NAME:
+        env["PROJECT_NAME"] = _SNAPSHOT_PROJECT_NAME
 
     proc = subprocess.run(
         ["bash", str(_QUERY_SHIM), "search", noise_query, "--limit", "5"],
