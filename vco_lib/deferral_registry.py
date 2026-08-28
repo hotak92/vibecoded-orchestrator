@@ -455,6 +455,13 @@ def matches_registered_pattern(
     return condition(condition_id, path=path) is not None
 
 
+# NOTE (v0.2.91 dogfood fix): this is the REGISTRY-LEVEL partition — it answers
+# "what tier does the registry assign these condition ids", and the
+# cross-language parity tests use it for exactly that. It is NOT the partition
+# for ENTRIES: it cannot see an entry's explicit `disposition`, so partitioning a
+# ledger through it silently disagrees with the ledger, the GUI and the CLAUDE.md
+# reminder. Entries go through `vco_lib.deferral_report.partition_entries`, and
+# `tests/test_v0291_dogfood_deferral_selfclear.py` source-scans for regressions.
 def split_by_disposition(
     condition_ids, *, path: Optional[Path] = None
 ) -> tuple[list[str], list[str]]:

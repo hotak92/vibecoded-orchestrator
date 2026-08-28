@@ -123,6 +123,35 @@ TEXT_BACKEND = "text"
 CODE_BACKEND = "code"
 
 
+#: Trail lines go to stdout, which ``--json`` reserves for its result list.
+#: One module flag rather than threading a "quiet" parameter through every
+#: helper — the trail is diagnostics, not data flow.
+_TRAIL_ENABLED = True
+
+
+def trail(message: str) -> None:
+    """Write one dispatcher trail line to stdout. Never raises.
+
+    v0.2.91 dogfood fix. The driver runs DETACHED with its stdio redirected to
+    ``<vct_root_dir>/logs/deferral-retry-<stamp>.log``, and it used to print
+    exactly one line per RESULT — so a pass that dispatched nothing produced a
+    ZERO-BYTE file. Fourteen of them accumulated on the maintainer's machine,
+    and every diagnosis they could support was identical: "something ran, or
+    maybe nothing did". A log that cannot distinguish "started and found
+    nothing owed" from "died at import" from "never started" is not a log.
+
+    So every taken path writes: driver start, the ledger read, per-condition
+    gate verdicts (handler, attempt count, backend probe), the child argv, the
+    child's exit code, the ledger RE-READ verdict, and a closing summary.
+    """
+    if not _TRAIL_ENABLED:
+        return
+    try:
+        print(f"[retry] {message}", flush=True)
+    except Exception:  # noqa: BLE001 — a broken stdout must not break a retry
+        pass
+
+
 @dataclass(frozen=True)
 class RetryResult:
     condition_id: str
@@ -156,8 +185,18 @@ class RetryContext:
             return None
 
     def run(self, argv: Sequence[str]) -> int:
+        """Run a handler's child, trailing the argv and the exit code.
+
+        The ONE funnel every handler's child goes through, so the trail cannot
+        miss a spawn a future handler adds (and so the injected test runner is
+        covered by the same lines the production one is).
+        """
         runner = self.runner or default_runner
-        return runner(argv, self.folder)
+        printable = " ".join(str(a) for a in argv)
+        trail(f"{self.condition_id}: spawning child: {printable}")
+        rc = runner(argv, self.folder)
+        trail(f"{self.condition_id}: child exited {rc}")
+        return rc
 
     def interpreter(self) -> str:
         return self.python or sys.executable or "python3"
@@ -327,6 +366,70 @@ def retry_code_graph_walk(ctx: RetryContext) -> RetryResult:
     return RetryResult(ctx.condition_id, FAILED, f"code-graph walk exited {rc}")
 
 
+def retry_codegraph_resync(ctx: RetryContext) -> RetryResult:
+    """Re-run the owed code-graph RESYNC for ``folder`` (``codegraph_embed_resync_pending``).
+
+    v0.2.91 dogfood fix. This condition shipped classed ``auto_retryable`` with
+    NO ``retry_action``, so ``handler_name_for`` returned None, the cid never
+    entered ``owed_condition_ids``, and the dispatcher could not select it —
+    the ledger told the user "VCO retries this itself" while nothing did. The
+    registry's own honesty rule (classification must never be mistakable for
+    implementation) says either the retry gets wired or the tier is wrong; the
+    machinery to converge this condition already exists, so it gets wired.
+
+    The child is the R-7 DRIVER (``vco_lib.codegraph_resync --run-resync``),
+    NOT a bare analyzer walk. That distinction is the whole point:
+
+    * the driver runs the analyzer, then RE-PROBES the stale-row count, and
+      resolves the ledger entry only on a positive zero — the paired clear this
+      dispatcher gates on. A bare ``analyze_code_graph.py`` invocation (what
+      the entry's own ``command_to_apply`` prints for a human) performs no such
+      clear, so wiring THAT would have been INCONCLUSIVE on every attempt and
+      would have burned the durable cap for nothing — the "a retry tenant
+      without a narrow clear is unresolvable by construction" trap.
+    * the driver also owns the WP-C entity reconcile, which is what actually
+      removes the entity-orphan rows that keep the owed count off zero.
+
+    Runs blocking (this process is already the detached child) and never
+    forwards ``--force-recreate`` / ``--prune-stale``: a retry has consent for
+    re-embedding owed rows, not for dropping anything.
+    """
+    project = _project_name(ctx.folder)
+    if not project:
+        return RetryResult(
+            ctx.condition_id, SKIPPED,
+            "cannot resolve the project name — the resync targets collections by prefix",
+        )
+    try:
+        from vco_lib.codegraph_resync import _resolve_analyzer
+        from vco_lib.paths import looks_like_orchestrator_root
+    except Exception as exc:  # noqa: BLE001 — broken install ⇒ skip, never crash
+        return RetryResult(
+            ctx.condition_id, SKIPPED, f"codegraph_resync unavailable: {exc}",
+        )
+    analyzer = _resolve_analyzer(ctx.folder)
+    if analyzer is None:
+        return RetryResult(
+            ctx.condition_id, SKIPPED, "no analyze_code_graph.py found",
+        )
+    argv = [
+        ctx.interpreter(), "-m", "vco_lib.codegraph_resync", "--run-resync",
+        "--project", project,
+        "--repo-root", str(ctx.folder),
+        "--analyzer", str(analyzer),
+    ]
+    # Same `.claude` decision the spawn path makes, from the SAME helper — so
+    # the driver's post-walk verify probe classifies `.claude/**` rows exactly
+    # as the owed gate that emitted the entry did. A mismatch here reads as
+    # "never converges" forever.
+    if looks_like_orchestrator_root(ctx.folder):
+        argv.append("--index-dot-claude")
+    rc = ctx.run(argv)
+    if rc == 0:
+        return RetryResult(ctx.condition_id, RETRIED, "code-graph resync driver completed")
+    return RetryResult(ctx.condition_id, FAILED, f"code-graph resync driver exited {rc}")
+
+
 def _project_name(folder: Path) -> Optional[str]:
     """Project name for the analyzer, resolved by the ONE existing helper."""
     try:
@@ -356,6 +459,7 @@ class Handler:
 HANDLERS: dict[str, Handler] = {
     "kg_seed": Handler(retry_kg_seed, TEXT_BACKEND),
     "code_graph_walk": Handler(retry_code_graph_walk, CODE_BACKEND),
+    "codegraph_resync": Handler(retry_codegraph_resync, CODE_BACKEND),
 }
 
 
@@ -642,13 +746,27 @@ def _dispatch_locked(
     runner: Optional[Callable[[Sequence[str], Path], int]],
     python: str,
 ) -> list[RetryResult]:
-    cids = list(condition_ids) if condition_ids is not None else owed_condition_ids(folder)
+    explicit = condition_ids is not None
+    cids = list(condition_ids) if explicit else owed_condition_ids(folder)
+    trail(
+        f"ledger read at {folder}: "
+        + (
+            f"{len(cids)} owed retryable condition(s): {', '.join(cids)}"
+            if cids
+            else "no retryable condition owed (nothing to dispatch)"
+        )
+    )
     results: list[RetryResult] = []
     #: backend kind → tri-state, probed at most once per kind per pass.
     probed: dict[str, Optional[bool]] = {}
     for cid in cids:
         name = handler_name_for(cid)
         if name is None:
+            # Only reachable when the CALLER named the cids: owed_condition_ids
+            # already filters on this. Trail it rather than `continue`-ing in
+            # silence — an unexplained absence from the results is the exact
+            # thing the empty-log defect taught us not to ship.
+            trail(f"{cid}: not retryable (registry declares no retry_action) — skipping")
             continue
         handler = HANDLERS.get(name)
         if handler is None:
@@ -656,7 +774,10 @@ def _dispatch_locked(
                 RetryResult(cid, SKIPPED, f"registry names unknown handler {name!r}")
             )
             continue
-        if attempt_count(folder, cid) >= MAX_ATTEMPTS:
+        attempts = attempt_count(folder, cid)
+        trail(f"{cid}: handler `{name}` (needs {handler.backend} backend), "
+              f"{attempts}/{MAX_ATTEMPTS} attempt(s) so far")
+        if attempts >= MAX_ATTEMPTS:
             results.append(
                 RetryResult(cid, SKIPPED, f"attempt cap ({MAX_ATTEMPTS}) reached")
             )
@@ -671,6 +792,10 @@ def _dispatch_locked(
         if handler.backend not in probed:
             probed[handler.backend] = ctx.backend_available(handler.backend)
         backend = probed[handler.backend]
+        trail(
+            f"{cid}: {handler.backend} backend gate → "
+            + {True: "reachable", False: "provably down"}.get(backend, "unknown")
+        )
         if backend is not True:
             results.append(
                 RetryResult(
@@ -687,6 +812,13 @@ def _dispatch_locked(
         result = handler.run(ctx)
         if result.status == RETRIED:
             cleared = condition_cleared(folder, cid)
+            trail(
+                f"{cid}: ledger re-read → "
+                + {
+                    True: "the child's own clear removed the condition",
+                    False: "the condition is STILL in the ledger",
+                }.get(cleared, "the ledger could not be re-read")
+            )
             if cleared is not True:
                 result = RetryResult(
                     cid, INCONCLUSIVE,
@@ -699,6 +831,18 @@ def _dispatch_locked(
             _record_resolution(folder, cid, result.detail)
         results.append(result)
     return results
+
+
+def _log_path_for_stamp(stamp: str) -> Optional[Path]:
+    """``<vct_root_dir>/logs/deferral-retry-<stamp>.log``, or ``None``."""
+    try:
+        from vco_lib.paths import vct_root_dir
+
+        logs_dir = vct_root_dir() / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        return logs_dir / f"deferral-retry-{stamp}.log"
+    except Exception:  # noqa: BLE001 — logging must never block the spawn
+        return None
 
 
 def _record_resolution(folder: Path, condition_id: str, detail: str) -> None:
@@ -743,15 +887,27 @@ def spawn_detached(folder: Path, *, python: str = "") -> bool:
     argv = [python or sys.executable, "-m", "vco_lib.deferral_retry",
             "--folder", str(folder)]
     log_handle = None
-    try:
-        from vco_lib.paths import vct_root_dir
-
-        logs_dir = vct_root_dir() / "logs"
-        logs_dir.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        log_handle = open(logs_dir / f"deferral-retry-{stamp}.log", "ab")
-    except Exception:  # noqa: BLE001 — logging must never block the spawn
-        log_handle = None
+    log_path = _log_path_for_stamp(time.strftime("%Y%m%d-%H%M%S"))
+    if log_path is not None:
+        try:
+            log_handle = open(log_path, "ab")
+            # v0.2.91 dogfood fix: the SPAWNER writes the first line, before
+            # Popen. Without it a child that dies before its first print (a
+            # bad interpreter, an import error swallowed by the OS, a spawn
+            # that never happened) leaves a zero-byte file indistinguishable
+            # from a healthy "nothing owed" pass — which is exactly what the
+            # field logs looked like.
+            log_handle.write(
+                (
+                    f"# vco deferral-retry driver spawned "
+                    f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n"
+                    f"# folder: {folder}\n"
+                    f"# argv:   {' '.join(argv)}\n"
+                ).encode("utf-8")
+            )
+            log_handle.flush()
+        except Exception:  # noqa: BLE001 — logging must never block the spawn
+            log_handle = None
     child_out = log_handle if log_handle is not None else subprocess.DEVNULL
     kwargs = {
         "cwd": str(folder),
@@ -835,16 +991,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(json.dumps(owed) if args.json else "\n".join(owed))
         return 0
 
-    results = dispatch(folder)
+    # --json is a machine contract: stdout carries the result list and nothing
+    # else. The human trail is suppressed there rather than corrupting it.
+    if not args.json:
+        trail(
+            f"driver start pid={os.getpid()} "
+            f"ts={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
+            f"folder={folder}"
+        )
+    results = dispatch(folder) if not args.json else _dispatch_quiet(folder)
     if args.json:
         print(json.dumps([
             {"condition_id": r.condition_id, "status": r.status, "detail": r.detail}
             for r in results
         ]))
-    else:
-        for r in results:
-            print(f"[retry] {r.condition_id}: {r.status} — {r.detail}")
+        return 0
+    for r in results:
+        trail(f"{r.condition_id}: {r.status} — {r.detail}")
+    tally: dict[str, int] = {}
+    for r in results:
+        tally[r.status] = tally.get(r.status, 0) + 1
+    summary = ", ".join(f"{k}={v}" for k, v in sorted(tally.items())) or "none"
+    trail(f"driver done: {len(results)} result(s) [{summary}]")
     return 0
+
+
+def _dispatch_quiet(folder: Path) -> list[RetryResult]:
+    """``dispatch`` with the trail silenced — for the ``--json`` stdout contract."""
+    global _TRAIL_ENABLED
+    previous = _TRAIL_ENABLED
+    _TRAIL_ENABLED = False
+    try:
+        return dispatch(folder)
+    finally:
+        _TRAIL_ENABLED = previous
 
 
 __all__ = [
@@ -875,10 +1055,12 @@ __all__ = [
     "pidfile_path",
     "record_attempt",
     "retry_code_graph_walk",
+    "retry_codegraph_resync",
     "retry_kg_seed",
     "retryable_condition_ids",
     "session_start_owed_check",
     "spawn_detached",
+    "trail",
 ]
 
 

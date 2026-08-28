@@ -287,6 +287,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Deferral entries cleared mid-run were written straight back.** A ledger
+  entry the A-2 seed copied into the run report at the start of an update, and
+  that a LATER step of the same update legitimately cleared from disk (the
+  bundle reconcile does exactly this), was rebuilt from memory by the run's
+  final write. The trail said "condition no longer applies — cleared" on every
+  run while the entry never moved. `InstallDeferralFlow.finalize` now drops a
+  seeded entry that vanished from disk during the run — whoever removed it —
+  unless the run itself re-detected the condition, in which case the fresh
+  entry wins. This replaces the per-caller "replay the resolution" remedy with
+  a structural one; the class no longer depends on each producer remembering.
+- **One-shot informational records never expired.** `kg_access_phantom_repaired`,
+  `codegraph_binding_repaired` and `hard_cut_performed` are install-owned
+  (drop-when-absent), so the end-of-run write is supposed to remove them once
+  a run stops re-detecting them. The re-probe pass's generic "no handler —
+  preserving entry" fallback re-added them from disk first, defeating the
+  ownership contract entirely: an entry whose own body reads "No action needed"
+  survived every update. The fallback now expires an owned record the run did
+  not re-detect, and keeps one that any step re-emitted.
+- **`codegraph_embed_resync_pending` advertised a retry that could not run.**
+  The row was classed `auto_retryable` but declared no `retry_action`, so the
+  dispatcher could never select it. It now runs the R-7 resync driver (which
+  re-probes the stale-row count and performs the condition's own paired clear),
+  never a bare analyzer walk — a walk clears nothing and would have been
+  inconclusive on every attempt until the retry cap burned.
+- **The deferral-retry driver logged nothing on most runs.** It printed one
+  line per result, so a detached pass that found no owed work produced a
+  zero-byte log file — indistinguishable from a driver that died at import or
+  never started. The driver now records its whole trail (start, ledger read,
+  per-condition gate verdicts, child argv, child exit, ledger re-read verdict,
+  summary), and the spawner writes the log's first line before the child
+  exists. `--json` output is unchanged.
+- **A preserved-upstream entry that named no sidecar could never clear.** The
+  probe returned "unknown" unconditionally for the legacy/auto-merge-only
+  shape. It now falls back to a bounded, read-only sweep of the install root:
+  no sidecar anywhere clears the entry, any sidecar keeps it, and a sweep that
+  cannot complete still returns "unknown" rather than guessing.
+- **The ledger now says how each entry can END.** Every re-probed entry carries
+  a `Probe status` line derived from its registry row and the probe's verdict —
+  "still applies", "undetermined, re-probed every update", "auto: the next
+  update drops it", or "no automatic clear: it stays until you act". Previously
+  an immortal entry and a live one rendered identically. The re-probe pass also
+  prints one accounting line reconciling its buckets against the ledger, so a
+  pass that looked at fewer entries than the ledger holds can no longer pass
+  unnoticed.
 - **The launcher's Hooks tab did nothing at all.** Its Enabled checkbox,
   Delete button and "+ Register" form wrote rows into the launcher database
   — a table nothing reads. Claude Code's hook engine reads

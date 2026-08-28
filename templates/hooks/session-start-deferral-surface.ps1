@@ -58,15 +58,22 @@ json_path = project / ".claude" / "context" / "UPDATE_DEFERRED.json"
 md_path = project / ".claude" / "context" / "UPDATE_DEFERRED.md"
 
 entries = []
+# (actionable_count, informational_count) from THE partition — Path 1 only.
+# Paths 2/3 are the degradation ladder (vco_lib unimportable); they keep the
+# raw total rather than mirroring the partition rule (A>B>C: no second copy).
+split = None
 
 try:
     from vco_lib.deferral_report import DeferralReport  # type: ignore
 
     report = DeferralReport.read(project)
+    _act, _info = report.split_by_disposition()
+    split = (len(_act), len(_info))
     for e in report.entries:
         entries.append((e.condition_id, e.title, e.severity, e.command_to_apply))
 except Exception:
     entries = []
+    split = None
 
 if not entries and json_path.exists():
     try:
@@ -113,7 +120,11 @@ try:
 except Exception:
     owed = []
 
-lines = ["", "Pending VCO update action(s) - %d deferred:" % len(entries)]
+if split is not None:
+    lines = ["", "Pending VCO update action(s) - %d actionable, %d informational/record:"
+                 % split]
+else:
+    lines = ["", "Pending VCO update action(s) - %d deferred:" % len(entries)]
 for cid, title, sev, _cmd in entries:
     lines.append("  - [%s] %s: %s" % (sev, cid, title))
 if owed:

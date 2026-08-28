@@ -63,6 +63,23 @@ _SIDECAR_RE = re.compile(r"`([^`\n]*\.from-upstream-[^`\n]+)`")
 #: "all named ones are gone" stops being evidence that all of them are gone.
 _TRUNCATED_LIST_RE = re.compile(r"^\s*-\s+\.\.\. and \d+ more\s*$", re.MULTILINE)
 
+#: Directories the legacy-entry sidecar sweep never descends into. Sidecars are
+#: parked NEXT TO the user-editable file the 3-way merge touched, and the
+#: allowlist (``CLAUDE.md``, ``knowledge/**``, ``docs/**``, ``.claude/**``)
+#: never reaches inside a VCS store, a virtualenv or a build output — so
+#: pruning these is not a heuristic about where sidecars "probably" are, it is
+#: the set of trees the emitter provably cannot write into.
+_SIDECAR_SCAN_SKIP_DIRS = frozenset({
+    ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
+    "target", "dist", "build", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    ".next", ".cargo", "site-packages",
+})
+
+#: Hard bound on the legacy sweep. A tree bigger than this is not walked to
+#: completion, and a partial walk is NOT evidence of absence — the sweep
+#: returns ``None`` (unknown) rather than a conclusion it did not earn.
+_SIDECAR_SCAN_MAX_ENTRIES = 400_000
+
 
 @dataclass
 class ProbeContext:
@@ -117,6 +134,47 @@ def dismiss_fields_for_sidecars(entry: Any) -> dict:
     set of sidecars whose disappearance would have cleared the entry anyway.
     """
     return {"preserved_sidecars": list(upstream_sidecar_paths(entry))}
+
+
+def any_upstream_sidecar_on_disk(root: Path) -> Optional[bool]:
+    """Bounded, read-only sweep: does ANY ``*.from-upstream-*`` file exist?
+
+    The fallback for an entry that names no sidecar paths of its own — the
+    LEGACY shape this probe could not otherwise touch (an entry written before
+    the emitter rendered the list, or one whose prose was hand-edited). Before
+    this existed, ``upstream_sidecar_paths() == ()`` returned ``None`` forever:
+    the entry was never resolvable, never re-classified, and never SAID so.
+    "Nothing to probe" is not a lifecycle.
+
+    Returns:
+        True  — at least one sidecar is parked somewhere under ``root``.
+        False — the walk COMPLETED inside the bound and found none.
+        None  — the walk could not complete (``OSError``, or more than
+                :data:`_SIDECAR_SCAN_MAX_ENTRIES` entries visited). A partial
+                walk proves nothing about the part it did not see, so it must
+                never read as absence — the same positive-evidence-only rule
+                every other probe in this module follows.
+
+    Read-only by construction: ``os.walk`` + name matching, no stat of the
+    candidates, nothing opened, nothing written.
+    """
+    root = Path(root)
+    visited = 0
+    try:
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in _SIDECAR_SCAN_SKIP_DIRS
+            ]
+            visited += len(dirnames) + len(filenames)
+            for name in filenames:
+                if ".from-upstream-" in name:
+                    return True
+            if visited > _SIDECAR_SCAN_MAX_ENTRIES:
+                return None
+    except OSError:
+        return None
+    return False
 
 
 def sidecar_list_is_truncated(entry: Any) -> bool:
@@ -239,12 +297,22 @@ def orchestrator_sidecars_still_present(ctx: ProbeContext) -> Optional[bool]:
     what its own ``command_to_apply`` said left the entry in place forever.
 
     Returns:
-        True  — at least one named sidecar is still on disk.
+        True  — at least one named sidecar is still on disk, OR the entry named
+                none and the bounded whole-root sweep found one anyway.
         False — the entry named sidecars, the list is COMPLETE, and every one
-                of them is gone.
-        None  — the entry named none (nothing to probe: an auto-merge-only
-                record, which the record tier handles), the list was truncated
-                at the emitter's cap (see below), or the folder is unreadable.
+                of them is gone; OR the entry named none and the bounded sweep
+                COMPLETED finding no sidecar anywhere under the root.
+        None  — the list was truncated at the emitter's cap (see below), the
+                folder is unreadable, or the fallback sweep could not complete.
+
+    v0.2.91 dogfood fix — the LEGACY arm: an entry naming no sidecars used to
+    return ``None`` unconditionally, i.e. NotProbed-forever with nothing in the
+    ledger saying so. It now falls back to :func:`any_upstream_sidecar_on_disk`,
+    which derives the answer from what the entry HAS (its root) instead of from
+    a field it lacks. The fallback is deliberately conservative in the KEEP
+    direction: a sidecar left by ANY merge keeps a list-less entry alive, which
+    is the honest reading of "N user-editable files were preserved" when the
+    entry cannot say which.
 
     Truncation (wave-2 MINOR-2): over 100 preserved files both emitters cut the
     bullet list and append ``  - ... and N more``. The tail is never named, so
@@ -256,7 +324,7 @@ def orchestrator_sidecars_still_present(ctx: ProbeContext) -> Optional[bool]:
     """
     paths = upstream_sidecar_paths(ctx.entry)
     if not paths:
-        return None
+        return any_upstream_sidecar_on_disk(ctx.folder)
     try:
         for rel in paths:
             candidate = ctx.folder / rel
@@ -533,29 +601,366 @@ def evaluate(folder: Path, entry: Any, extras: Optional[dict] = None):
     )
 
 
-def resolvable_condition_ids(
+def clear_mechanism_sentence(condition_id: str) -> str:
+    """One honest sentence about HOW ``condition_id`` can end, from the registry.
+
+    The sentinel families are not interchangeable and the difference matters to
+    whoever reads the ledger: ``manual-dismiss`` means "this will sit here until
+    YOU do something", while ``owned-drop-when-absent`` means "the next update
+    removes it by itself". Rendering them identically (which the ledger did
+    until this fix) is what let ~21 permanently-manual rows look exactly like
+    rows VCO was about to clear.
+    """
+    try:
+        from vco_lib.deferral_registry import condition
+
+        spec = condition(condition_id)
+    except Exception:  # noqa: BLE001 — registry trouble ⇒ say the honest thing
+        spec = None
+    if spec is None:
+        return (
+            "unregistered condition — VCO declares no lifecycle for it, so it "
+            "is treated as action required and will never clear on its own."
+        )
+    rust = spec.rust_probe_name
+    if rust:
+        return (
+            f"launcher-owned — the launcher's boot probe `{rust}` clears this "
+            "entry; an install/update pass deliberately does not evaluate it."
+        )
+    return {
+        "owned-drop-when-absent": (
+            "auto — install.py re-detects this condition on every update and "
+            "drops the entry on the first run that does not detect it."
+        ),
+        "bundle-reconciled": (
+            "auto — the next bundle update recomputes this condition and "
+            "clears the entry once it no longer applies."
+        ),
+        "paired-resolution": (
+            "auto — the component that emitted this entry clears it when its "
+            "owed work completes."
+        ),
+        "manual-dismiss": (
+            "no automatic clear — this entry stays until you act on it or "
+            "dismiss it explicitly; VCO will not remove it on its own."
+        ),
+    }.get(
+        spec.clear_probe,
+        f"clear mechanism `{spec.clear_probe}` — no Python probe evaluates it "
+        "on this pass.",
+    )
+
+
+def probe_status_sentence(
+    condition_id: str, probe_name: Optional[str], verdict: Optional[bool]
+) -> Optional[str]:
+    """The ``DeferralEntry.probe_status`` text for one probed entry.
+
+    ``None`` only for the resolved case (``verdict is False``), where the entry
+    is about to be removed and a status would never be read.
+    """
+    if verdict is False:
+        return None
+    if probe_name is None:
+        return clear_mechanism_sentence(condition_id)
+    if verdict is True:
+        return (
+            f"still applies — clear probe `{probe_name}` re-checked this on the "
+            "last update and the condition still holds."
+        )
+    return (
+        f"undetermined — clear probe `{probe_name}` could not decide on the "
+        "last update, so the entry was KEPT. It is re-probed on every update "
+        "and clears as soon as the probe can confirm the condition is over."
+    )
+
+
+@dataclass
+class ProbePass:
+    """The outcome of probing a whole report, bucketed so nothing is silent.
+
+    :attr:`probed` + :attr:`unprobed` partition the report EXACTLY — the
+    property install.py's summary line asserts, so a pass can never quietly
+    look at fewer entries than the ledger holds.
+    """
+
+    #: cid → tri-state verdict, for entries whose registry row names a Python probe.
+    verdicts: dict = field(default_factory=dict)
+    #: cid → the ``probe_status`` sentence this pass computed (``None`` = clear it).
+    statuses: dict = field(default_factory=dict)
+    #: cids whose probe returned a positive False ("provably over").
+    resolvable: list = field(default_factory=list)
+    #: cids that had a Python probe (in report order).
+    probed: list = field(default_factory=list)
+    #: cids with no Python probe — sentinel clear family, Rust probe, or unregistered.
+    unprobed: list = field(default_factory=list)
+    #: How many entries' ``probe_status`` this pass actually CHANGED.
+    #:
+    #: Load-bearing, not a statistic: :func:`probe_report` stamps the entries it
+    #: is given, so a caller that compares "before" and "after" ON THOSE ENTRIES
+    #: always sees equality and concludes nothing changed. (That is exactly how
+    #: the bundle leg first silently skipped every annotation.) The pass records
+    #: the delta itself, at the only moment the old value still exists.
+    changed: int = 0
+
+    @property
+    def total(self) -> int:
+        return len(self.probed) + len(self.unprobed)
+
+
+def probe_report(
     folder: Path, report: Any, extras: Optional[dict] = None
-) -> list:
-    """Condition ids in ``report`` whose probe says they are provably over.
+) -> ProbePass:
+    """Probe every entry ONCE, stamp ``probe_status``, and bucket the outcome.
 
     ONE home for "probe a whole report", shared by install.py's re-probe pass
     and project_init's bundle-update reconcile, so the two surfaces can never
-    disagree about what a probe verdict means. Only a positive ``False`` lands
-    in the list — that asymmetry is the safety property: a probe that could not
-    run must never look like a resolution.
+    disagree about what a probe verdict means — and now also so they cannot
+    disagree about what the LEDGER says a given entry's lifecycle is.
+
+    Mutates only the in-memory entries (``probe_status``); the probes
+    themselves stay read-only against the filesystem. Never raises: a broken
+    probe degrades that one entry to "unknown", exactly as before.
     """
-    out: list = []
+    out = ProbePass()
     try:
         entries = list(report.entries)
     except Exception:  # noqa: BLE001 — unreadable report ⇒ nothing to probe
         return out
     for entry in entries:
+        cid = getattr(entry, "condition_id", "")
         try:
-            if evaluate(folder, entry, extras) is False:
-                out.append(entry.condition_id)
+            name = registry_probe_name(cid)
+            verdict = (
+                run_probe(
+                    name,
+                    ProbeContext(
+                        folder=Path(folder), entry=entry, extras=extras or {}
+                    ),
+                )
+                if name is not None
+                else None
+            )
         except Exception:  # noqa: BLE001 — per-entry soft-fail
-            continue
+            name, verdict = None, None
+        if name is None:
+            out.unprobed.append(cid)
+        else:
+            out.probed.append(cid)
+            out.verdicts[cid] = verdict
+            if verdict is False:
+                out.resolvable.append(cid)
+        status = probe_status_sentence(cid, name, verdict)
+        out.statuses[cid] = status
+        try:
+            if getattr(entry, "probe_status", None) != status:
+                out.changed += 1
+            entry.probe_status = status
+        except Exception:  # noqa: BLE001 — an exotic entry type must not break the pass
+            pass
     return out
+
+
+def apply_probe_statuses(report: Any, statuses: dict) -> int:
+    """Copy a :attr:`ProbePass.statuses` map onto another report's entries.
+
+    Lets a caller probe the report it READ and persist the annotations through
+    a DIFFERENT (locked, re-read) report object without probing twice.
+    Returns how many entries changed.
+    """
+    changed = 0
+    try:
+        entries = list(report.entries)
+    except Exception:  # noqa: BLE001
+        return 0
+    for entry in entries:
+        cid = getattr(entry, "condition_id", "")
+        if cid not in statuses:
+            continue
+        new = statuses[cid]
+        if getattr(entry, "probe_status", None) != new:
+            try:
+                entry.probe_status = new
+                changed += 1
+            except Exception:  # noqa: BLE001
+                continue
+    return changed
+
+
+def apply_probe_verdict(
+    folder: Path,
+    entry: Any,
+    run_report: Any,
+    result: "ProbePass",
+    resolved_ids: list,
+    log: Callable[[str], None] = print,
+) -> bool:
+    """Settle one entry from its registry-declared probe. ``True`` = handled.
+
+    The GENERIC head of the re-probe loop, shared out of install.py so the
+    monolith keeps shrinking (the ratchet) and so the verdict→action mapping
+    has one home: ``False`` resolves and leaves a trail line, ``True``/``None``
+    keep. ``False`` when the condition declares no Python probe — the caller's
+    hand-written branches own it.
+    """
+    cid = getattr(entry, "condition_id", "")
+    name = registry_probe_name(cid)
+    if name is None:
+        return False
+    verdict = result.verdicts.get(cid)
+    if verdict is False:
+        resolved_ids.append(cid)
+        log(f"  [ok]   {cid}: probe `{name}` reports the condition no longer "
+            "applies. Marking resolved.")
+        run_report.mark_resolved(cid)
+        record_probe_resolution(folder, cid, name)
+    else:
+        why = "still applies" if verdict else "could not determine it"
+        log(f"  [skip] {cid}: probe `{name}` {why}. Keeping entry.")
+        run_report.add_entry(entry)
+    return True
+
+
+def settle_unhandled_entry(
+    folder: Path,
+    entry: Any,
+    run_report: Any,
+    expired_ids: list,
+    owned_ids,
+    owned_prefixes=(),
+    log: Callable[[str], None] = print,
+) -> str:
+    """The re-probe loop's TAIL: expire an owned record, else preserve.
+
+    Two outcomes, and which one applies turns entirely on OWNERSHIP:
+
+    * an install-owned record this run did not re-detect is DROPPED — see
+      :func:`owned_record_is_expirable` for why the generic preserve was the
+      v0.2.91 dogfood defect;
+    * anything else is preserved verbatim, because install.py not re-detecting
+      a FOREIGN condition says nothing about whether it still holds.
+
+    Returns ``"expired"`` or ``"kept"``.
+    """
+    cid = getattr(entry, "condition_id", "")
+    if owned_record_is_expirable(cid, run_report, owned_ids, owned_prefixes):
+        log(f"  [expired] {cid}: install-owned record not re-detected this "
+            "run — dropping it (owned-drop-when-absent).")
+        expired_ids.append(cid)
+        run_report.mark_resolved(cid)
+        record_owned_record_expiry(folder, cid)
+        return "expired"
+    log(f"  [unknown] {cid}: no handler. Preserving entry.")
+    run_report.add_entry(entry)
+    return "kept"
+
+
+def owned_record_is_expirable(
+    condition_id: str, run_report: Any, owned_ids, owned_prefixes=()
+) -> bool:
+    """Should the re-probe pass DROP this persisted entry instead of keeping it?
+
+    True only for an install-OWNED condition that no step of THIS run
+    re-detected. Both halves are load-bearing:
+
+    * **Owned** means ``clear_probe = "owned-drop-when-absent"`` — the A-2 seed
+      deliberately does not import the cid, precisely so the run's single
+      end-of-run write expires it. install.py's re-probe pass used to defeat
+      that contract with its generic ``[unknown]`` fallback: it re-added the
+      on-disk copy to the run report, and finalize wrote it straight back. The
+      one-shot records WP-B promised would auto-expire
+      (``kg_access_phantom_repaired``, ``codegraph_binding_repaired``,
+      ``hard_cut_performed`` — all emitted at launcher BOOT, never inside an
+      install run) therefore never expired at all: the v0.2.91 live dogfood
+      found "No action needed — the access rows were already restored" still in
+      the ledger after two consecutive updates.
+    * **Not re-detected** is the other side. If any step of this run emitted the
+      condition, the fresh entry is already in the run report and the record is
+      KEPT — expiring it would delete a fact detected seconds earlier.
+
+    FOREIGN conditions are never expirable here, whatever their clear family:
+    install.py does not re-detect them, so "absent from the run report" says
+    nothing about them.
+    """
+    try:
+        from vco_lib.deferral_report import condition_is_owned
+
+        if not condition_is_owned(condition_id, owned_ids, owned_prefixes):
+            return False
+        return not run_report.has_condition(condition_id)
+    except Exception:  # noqa: BLE001 — unknown ⇒ keep the entry (conservative)
+        return False
+
+
+def record_owned_record_expiry(folder: Path, condition_id: str) -> None:
+    """B-F9 trail for an install-owned record the re-probe pass dropped.
+
+    Never raises — observability must not break a pass that already decided.
+    """
+    try:
+        from vco_lib.deferral_emit import record_auto_resolution
+
+        record_auto_resolution(
+            Path(folder),
+            condition_id,
+            "expired_install_owned_record",
+            "install.py owns this condition and did not re-detect it this run "
+            "(owned-drop-when-absent)",
+        )
+    except Exception:  # noqa: BLE001 — best-effort
+        pass
+
+
+def format_probe_pass_summary(
+    persisted: Any,
+    run_report: Any,
+    result: "ProbePass",
+    probe_resolved_ids,
+    owned_expired_ids,
+) -> str:
+    """One accounting line: every persisted entry lands in exactly one bucket.
+
+    v0.2.91 dogfood fix. The pass printed per-entry lines and nothing else, so
+    "the pass reported 3 things and the ledger holds 4" was a discrepancy
+    nobody could act on — the reader had to count lines and hope no branch had
+    ``continue``d without printing. The counts are derived from the OUTCOME
+    (what the run report ends up holding), not from per-branch counters, so a
+    future branch that forgets to tally cannot make this line lie.
+    """
+    try:
+        persisted_ids = [e.condition_id for e in persisted.entries]
+        kept = [c for c in persisted_ids if run_report.has_condition(c)]
+        by_handler = [
+            c for c in persisted_ids
+            if c not in kept
+            and c not in probe_resolved_ids
+            and c not in owned_expired_ids
+        ]
+        kept_unprobed = [c for c in kept if c in result.unprobed]
+        return (
+            f"  [summary] {len(persisted_ids)} ledger entr"
+            f"{'y' if len(persisted_ids) == 1 else 'ies'} probed: "
+            f"{len(probe_resolved_ids)} resolved by probe, "
+            f"{len(owned_expired_ids)} expired (install-owned record), "
+            f"{len(by_handler)} resolved by handler, {len(kept)} kept "
+            f"({len(kept_unprobed)} of them have no Python clear probe — "
+            "each entry's `Probe status` line in the ledger names why)."
+        )
+    except Exception as exc:  # noqa: BLE001 — a summary must never break the pass
+        return f"  [summary] could not be computed ({exc})."
+
+
+def resolvable_condition_ids(
+    folder: Path, report: Any, extras: Optional[dict] = None
+) -> list:
+    """Condition ids in ``report`` whose probe says they are provably over.
+
+    Thin view over :func:`probe_report`. Only a positive ``False`` lands in the
+    list — that asymmetry is the safety property: a probe that could not run
+    must never look like a resolution.
+    """
+    return list(probe_report(folder, report, extras).resolvable)
 
 
 def record_probe_resolution(folder: Path, condition_id: str, probe_name: str) -> None:
@@ -597,7 +1002,16 @@ __all__ = [
     "PROBES",
     "ProbeContext",
     "ProbeFn",
+    "ProbePass",
+    "any_upstream_sidecar_on_disk",
+    "apply_probe_statuses",
+    "clear_mechanism_sentence",
     "dismiss_fields_for_sidecars",
+    "format_probe_pass_summary",
+    "owned_record_is_expirable",
+    "probe_report",
+    "probe_status_sentence",
+    "record_owned_record_expiry",
     "disk_space_still_low",
     "evaluate",
     "launcher_binary_stale_still_applies",

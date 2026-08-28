@@ -628,10 +628,21 @@ not proof — this script's skip path exits 0 too)."""
 class = "auto_retryable"
 owner = "vco_lib.codegraph_resync"
 clear_probe = "paired-resolution"
+retry_action = "retry:py:codegraph_resync"
 emit_surfaces = ["ledger"]
 notes = """Cleared on a positive-zero owed probe (install.py R-6) or by the \
 detached driver when it converges. v0.2.91 WP-C fixes the entity-orphan floor \
-that kept the owed count from ever reaching zero."""
+that kept the owed count from ever reaching zero. v0.2.91 dogfood fix: the row \
+shipped classed `auto_retryable` with NO `retry_action`, so the WP-H dispatcher \
+could not select it — `handler_name_for` returned None and the cid never \
+entered `owed_condition_ids`. The ledger therefore said "VCO retries this \
+itself" while nothing did, which is precisely the classification-mistaken-for- \
+implementation state the registry exists to end. The handler runs the R-7 \
+DRIVER (`vco_lib.codegraph_resync --run-resync`), never a bare analyzer walk: \
+the driver re-probes the stale count and performs THIS cid's paired clear on a \
+positive zero, so the dispatcher's ledger-re-read has something to observe. A \
+bare walk performs no clear and would have been INCONCLUSIVE every attempt \
+until the durable cap burned."""
 
 [conditions.residue_cleanup_pending]
 class = "action_required"

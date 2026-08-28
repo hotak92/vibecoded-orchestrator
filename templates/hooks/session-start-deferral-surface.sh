@@ -70,12 +70,18 @@ md_path = project / ".claude" / "context" / "UPDATE_DEFERRED.md"
 
 # (condition_id, title, severity, command_to_apply) tuples.
 entries = []
+# (actionable_count, informational_count) from THE partition — Path 1 only.
+# Paths 2/3 are the degradation ladder (vco_lib unimportable); they keep the
+# raw total rather than mirroring the partition rule (A>B>C: no second copy).
+split = None
 
 # --- Path 1: canonical reader (JSON-first, Markdown-fallback) ------------
 try:
     from vco_lib.deferral_report import DeferralReport  # type: ignore
 
     report = DeferralReport.read(project)
+    _act, _info = report.split_by_disposition()
+    split = (len(_act), len(_info))
     for e in report.entries:
         entries.append(
             (e.condition_id, e.title, e.severity, e.command_to_apply)
@@ -84,6 +90,7 @@ except Exception:
     # vco_lib not importable (portable interpreter) OR any read failure —
     # fall through to the direct parsers below.
     entries = []
+    split = None
 
 # --- Path 2: parse the JSON sidecar directly -----------------------------
 if not entries and json_path.exists():
@@ -144,7 +151,11 @@ except Exception:
     owed = []
 
 # One concise line per entry — id + title + severity; NOT the full bodies.
-lines = ["", f"Pending VCO update action(s) — {len(entries)} deferred:"]
+if split is not None:
+    lines = ["", f"Pending VCO update action(s) — {split[0]} actionable, "
+                 f"{split[1]} informational/record:"]
+else:
+    lines = ["", f"Pending VCO update action(s) — {len(entries)} deferred:"]
 for cid, title, sev, _cmd in entries:
     lines.append(f"  - [{sev}] {cid}: {title}")
 if owed:

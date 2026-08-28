@@ -168,13 +168,23 @@ def test_replay_keeps_conflict_cleared_through_finalize(tmp_path: Path) -> None:
     )
 
 
-def test_without_replay_the_entry_resurrects(tmp_path: Path) -> None:
-    """Pre-fix reproduction (skips the caller replay).
+def test_producer_disk_clear_holds_even_without_the_caller_replay(
+    tmp_path: Path,
+) -> None:
+    """The v0.2.91 dogfood fix makes the B-1 replay belt-and-braces.
 
-    This is the EXACT pre-B-1 behaviour: without replaying the producer's
-    resolution into the run report, the seeded in-memory conflict is rewritten
-    to disk at finalize — the resurrection the fix eliminates. Kept as a control
-    so a future regression that drops the replay is caught.
+    This scenario WAS the pre-B-1 reproduction: skip the caller's
+    ``mark_resolved`` replay and the seeded in-memory conflict is rewritten to
+    disk at finalize. v0.2.83 closed it per-caller (replay the producer's
+    resolution); the v0.2.91 live dogfood then found the SAME class reappearing
+    through a caller nobody had wired — the bundle reconcile at step 5b —
+    because a per-caller remedy only covers the callers somebody remembered.
+
+    ``InstallDeferralFlow.finalize`` now closes it structurally: a seeded entry
+    that vanished from disk during the run is dropped rather than written back,
+    whoever removed it. So the replay is no longer load-bearing HERE, and this
+    test pins the structural guarantee (the replay's own value — a prompt
+    in-memory resolve plus its tombstone — is covered by the tests above).
     """
     prior = DeferralReport()
     prior.add_entry(_stale_conflict_entry())
@@ -188,17 +198,18 @@ def test_without_replay_the_entry_resurrects(tmp_path: Path) -> None:
     flow = _new_flow(tmp_path)
     flow.seed()
 
-    # Producer clears on disk, but we DELIBERATELY skip the caller replay.
+    # Producer clears on disk; the caller replay is DELIBERATELY skipped.
     project_init._detect_and_rename_legacy_compose_override(tmp_path)
-    # No _replay_caller_resolution(...) — reproduce the bug.
 
-    flow.finalize()
+    result = flow.finalize()
 
     after = DeferralReport.read(tmp_path)
-    assert after.has_condition(_CONFLICT_CID), (
-        "control: without the mark_resolved replay, the seeded conflict "
-        "resurrects at finalize (this is the bug B-1 fixes)"
+    assert not after.has_condition(_CONFLICT_CID), (
+        "the producer's on-disk clear must survive finalize even with no "
+        "caller replay — that is the structural close the v0.2.91 dogfood "
+        "fix added"
     )
+    assert _CONFLICT_CID in result.vanished
 
 
 # ---------------------------------------------------------------------------
@@ -270,9 +281,15 @@ def test_stale_rename_failed_record_selfclears_through_finalize(
     _run_selfclear_scenario(tmp_path, _RENAME_FAILED_CID)
 
 
-def test_without_replay_stale_renamed_resurrects(tmp_path: Path) -> None:
-    """Control: without the caller replay, the seeded stale renamed record is
-    rewritten to disk at finalize — the N-2 resurrection the replay eliminates.
+def test_stale_renamed_record_stays_cleared_without_the_replay(
+    tmp_path: Path,
+) -> None:
+    """N-2's sibling of the case above, after the v0.2.91 dogfood fix.
+
+    Same story: the replay used to be the ONLY thing keeping the producer's
+    on-disk reconcile from being undone at finalize. ``finalize`` now drops a
+    seeded entry that vanished from disk during the run whoever removed it, so
+    the record stays cleared even with the replay skipped.
     """
     prior = DeferralReport()
     prior.add_entry(_stale_record(_RENAMED_CID))
@@ -283,14 +300,12 @@ def test_without_replay_stale_renamed_resurrects(tmp_path: Path) -> None:
     flow = _new_flow(tmp_path)
     flow.seed()
     project_init._detect_and_rename_legacy_compose_override(tmp_path)
-    # DELIBERATELY skip the replay → reproduce the resurrection.
-    flow.finalize()
+    # DELIBERATELY skip the replay — the structural close must carry it.
+    result = flow.finalize()
 
     after = DeferralReport.read(tmp_path)
-    assert after.has_condition(_RENAMED_CID), (
-        "control: without the mark_resolved replay, the seeded renamed record "
-        "resurrects at finalize (the N-2 resurrection the replay fixes)"
-    )
+    assert not after.has_condition(_RENAMED_CID)
+    assert _RENAMED_CID in result.vanished
 
 
 def test_active_renamed_this_run_is_not_reconciled(tmp_path: Path) -> None:

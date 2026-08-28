@@ -7311,26 +7311,22 @@ def _apply_deferred_entries(
     except Exception:  # noqa: BLE001 — probes degrade to "unknown" without extras
         probe_extras = {}
 
+    # v0.2.91 dogfood fix: probe every entry ONCE and stamp its `probe_status`
+    # (honest lifecycle text in the ledger); the loop reuses these verdicts so
+    # the summary accounts for every entry. See `deferral_probes.probe_report`.
+    probe_pass = _deferral_probes.probe_report(project_root, persisted, probe_extras)
+    probe_resolved_ids: list[str] = []
+    owned_expired_ids: list[str] = []
+
     for entry in persisted.entries:
         cid = entry.condition_id
 
         # Registry-declared probe (v0.2.91 WP-B): runs BEFORE the hand-written
         # branches, so a condition gains a lifecycle by DECLARING one.
-        probe_name = _deferral_probes.registry_probe_name(cid)
-        if probe_name is not None:
-            verdict = _deferral_probes.evaluate(project_root, entry, probe_extras)
-            if verdict is False:
-                print(f"  [ok]   {cid}: probe `{probe_name}` reports the "
-                      "condition no longer applies. Marking resolved.")
-                current_run_report.mark_resolved(cid)
-                _deferral_probes.record_probe_resolution(
-                    project_root, cid, probe_name,
-                )
-            else:
-                why = "still applies" if verdict else "could not determine it"
-                print(f"  [skip] {cid}: probe `{probe_name}` {why}. "
-                      "Keeping entry.")
-                current_run_report.add_entry(entry)
+        if _deferral_probes.apply_probe_verdict(
+            project_root, entry, current_run_report, probe_pass,
+            probe_resolved_ids,
+        ):
             continue
 
         if cid == "schema_drift_rebuild_required":
@@ -7997,10 +7993,14 @@ def _apply_deferred_entries(
                 )
                 current_run_report.add_entry(entry)
 
-        else:
-            # Unknown condition: preserve it to avoid silently losing info.
-            print(f"  [unknown] {cid}: no handler. Preserving entry.")
-            current_run_report.add_entry(entry)
+        else:  # no handler: expire an owned record, else preserve verbatim
+            _deferral_probes.settle_unhandled_entry(
+                project_root, entry, current_run_report, owned_expired_ids,
+                _INSTALL_OWNED_CONDITION_IDS, _INSTALL_OWNED_CONDITION_PREFIXES)
+
+    print(_deferral_probes.format_probe_pass_summary(
+        persisted, current_run_report, probe_pass,
+        probe_resolved_ids, owned_expired_ids))
 
 
 # ---------------------------------------------------------------------------

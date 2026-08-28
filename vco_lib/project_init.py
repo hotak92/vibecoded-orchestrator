@@ -11047,13 +11047,13 @@ def _codegraph_wrapper_still_stale(folder: Path) -> bool:
     return False
 
 
-def _probe_resolvable_deferrals(folder: Path, report) -> list[str]:
-    """Condition ids whose registry-declared probe says they are provably over.
+def _probe_deferrals(folder: Path, report) -> "tuple[list[str], dict, bool]":
+    """``(resolvable_cids, cid → probe_status, statuses_changed)`` for the bundle leg.
 
     v0.2.91 WP-B. A thin adapter over the ONE shared dispatcher
-    (:func:`vco_lib.deferral_probes.resolvable_condition_ids`) so the bundle
-    update and install.py's re-probe pass can never disagree about what a probe
-    verdict means. Read-only and tri-state — ONLY a positive "no longer applies"
+    (:func:`vco_lib.deferral_probes.probe_report`) so the bundle update and
+    install.py's re-probe pass can never disagree about what a probe verdict
+    means. Read-only and tri-state — ONLY a positive "no longer applies"
     resolves; "still applies" and "could not determine" both leave the entry
     alone. That asymmetry is the safety property: a probe that cannot run must
     never look like a resolution.
@@ -11062,14 +11062,22 @@ def _probe_resolvable_deferrals(folder: Path, report) -> list[str]:
     depend on the OS→dist-dir mapping install.py owns) get no extras here and
     correctly decline, so the bundle leg simply passes on them.
 
+    v0.2.91 dogfood fix: the second return value carries each entry's
+    ``Probe status`` sentence, so a project whose only update surface is the
+    GUI "Update bundle" button gets the same honest lifecycle text install.py's
+    ``--update`` leg writes. Probed ONCE here; the statuses are applied to the
+    locked (re-read) report by :func:`vco_lib.deferral_probes.apply_probe_statuses`
+    so nothing is probed twice.
+
     Never raises — a probe failure must not break a bundle update.
     """
     try:
         from vco_lib import deferral_probes as _dp
 
-        return _dp.resolvable_condition_ids(folder, report)
+        result = _dp.probe_report(folder, report)
+        return list(result.resolvable), dict(result.statuses), bool(result.changed)
     except Exception:  # noqa: BLE001 — probing is best-effort
-        return []
+        return [], {}, False
 
 
 def _reconcile_bundle_deferrals(
@@ -11177,10 +11185,20 @@ def _reconcile_bundle_deferrals(
     # wire. Tri-state: only a positive False ("provably over") resolves;
     # True/None keep the entry. Probes needing install.py-supplied extras (the
     # launcher-binary ones) return None here and are simply left alone.
-    probe_resolved = _probe_resolvable_deferrals(folder, report)
+    # v0.2.91 dogfood fix: `statuses_changed` comes FROM the pass, not from a
+    # before/after comparison here — the pass stamps these very entries, so any
+    # comparison made afterwards is against the value it just wrote and would
+    # report "nothing changed" every time. An entry whose `Probe status` line
+    # would change is reason enough to take the lock; otherwise a project that
+    # never resolves anything never learns why its entries are immortal.
+    probe_resolved, probe_statuses, statuses_changed = _probe_deferrals(folder, report)
 
-    if not (initial_ids & set(bundle_conditions)) and not probe_resolved:
-        # Nothing on-disk we own or can probe → no reconciliation to do.
+    if (
+        not (initial_ids & set(bundle_conditions))
+        and not probe_resolved
+        and not statuses_changed
+    ):
+        # Nothing on-disk we own, can probe, or need to re-annotate.
         return
 
     # Which owned conditions are on-disk AND no longer applicable this run.
@@ -11189,7 +11207,7 @@ def _reconcile_bundle_deferrals(
         if not still_applicable and cid in initial_ids
     ]
     to_resolve.extend(cid for cid in probe_resolved if cid not in to_resolve)
-    if not to_resolve:
+    if not to_resolve and not statuses_changed:
         return
 
     # Route the mutate+write through the ONE locked emitter home so a
@@ -11202,6 +11220,13 @@ def _reconcile_bundle_deferrals(
             if locked.has_condition(cid):
                 locked.mark_resolved(cid)
                 resolved_ids.append(cid)
+        if probe_statuses:
+            try:
+                from vco_lib import deferral_probes as _dp
+
+                _dp.apply_probe_statuses(locked, probe_statuses)
+            except Exception:  # noqa: BLE001 — annotation is best-effort
+                pass
 
     # B-F9: one honest auto-resolution record per cleared condition.
     for cid in resolved_ids:

@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -34,7 +36,7 @@ HEALTH_HOOK = HOOKS / "session-start-retrieval-health.sh"
 KG_SYNC_HOOK = HOOKS / "kg-sync-on-edit.sh"
 
 
-def _run(script: Path, *, env_extra=None, stdin="", project_dir=None):
+def _run(script: Path, *, env_extra=None, stdin="", project_dir=None, cwd=None):
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": tempfile.gettempdir(),
@@ -50,6 +52,32 @@ def _run(script: Path, *, env_extra=None, stdin="", project_dir=None):
         capture_output=True,
         text=True,
         timeout=30,
+        cwd=str(cwd) if cwd is not None else None,
+    )
+
+
+def _make_vco_lib_unimportable_venv(venv_dir: Path) -> None:
+    """Build a fake ``$VCT_VENV`` whose ``bin/python`` wraps the CURRENT
+    interpreter with ``-S`` (skip ``site`` — no site-packages on
+    ``sys.path``), so the hook's canonical-reader import
+    (``from vco_lib.deferral_report import DeferralReport``) genuinely fails
+    regardless of what happens to be pip-installed in this machine's venv.
+
+    Not enough on its own: Python's stdin-script execution also puts CWD on
+    ``sys.path[0]``, so the caller MUST additionally run the hook with
+    ``cwd`` pointed away from any directory that itself contains a
+    ``vco_lib`` package (this repo's own root does) — see ``_run(cwd=...)``.
+    """
+    bindir = venv_dir / "bin"
+    bindir.mkdir(parents=True, exist_ok=True)
+    wrapper = bindir / "python"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        f'exec "{sys.executable}" -S "$@"\n',
+        encoding="utf-8",
+    )
+    wrapper.chmod(
+        wrapper.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
     )
 
 
@@ -96,7 +124,13 @@ class DeferralSurfaceTests(unittest.TestCase):
             r = _run(DEFERRAL_HOOK, project_dir=project)
             self.assertEqual(r.returncode, 0, r.stderr)
             out = r.stdout
-            self.assertIn("2 deferred", out)
+            # Path 1 (canonical reader, vco_lib importable — the normal case
+            # in a real install and in this test's own environment): the
+            # header is the actionable/informational split, not a raw
+            # total. Both fixture entries here are `action_required` in the
+            # registry (vco_lib/deferral_conditions.toml), so 2 actionable,
+            # 0 informational.
+            self.assertIn("2 actionable, 0 informational/record", out)
             self.assertIn("schema_migration_required", out)
             self.assertIn("bundle_user_modified_preserved", out)
             self.assertIn("[warning]", out)
@@ -119,8 +153,74 @@ class DeferralSurfaceTests(unittest.TestCase):
             self.assertIn("foo_bar", r.stdout)
             self.assertIn("[critical]", r.stdout)
             # The frontmatter condition_ids line must NOT be parsed as an
-            # entry (only the ## header is a real entry).
-            self.assertIn("1 deferred", r.stdout)
+            # entry (only the ## header is a real entry). Path 1 again (see
+            # above): DeferralReport.read() does its OWN JSON-first/
+            # Markdown-fallback internally, so an MD-only fixture still
+            # goes through the canonical reader whenever vco_lib resolves —
+            # `foo_bar` is unregistered, and the registry's conservative
+            # default for an unknown condition_id is `action_required`
+            # (vco_lib/deferral_registry.py DEFAULT_CLASS), so 1 actionable.
+            self.assertIn("1 actionable, 0 informational/record", r.stdout)
+
+    def test_json_present_degraded_path_renders_raw_total(self) -> None:
+        """Path 2 (direct JSON parse) — vco_lib unimportable. The header
+        must fall back to the raw `N deferred` form; MINOR-D2's `split =
+        None` reset in the Path-1 except arm is what keeps this form from
+        leaking a stale split from a partial Path-1 failure."""
+        with tempfile.TemporaryDirectory() as td, \
+                tempfile.TemporaryDirectory() as venv_dir, \
+                tempfile.TemporaryDirectory() as cwd_dir:
+            project = Path(td)
+            _write_json_sidecar(
+                project,
+                [
+                    _entry("schema_migration_required", "Rebuild", "warning"),
+                    _entry("bundle_user_modified_preserved", "Preserved", "info"),
+                ],
+            )
+            _make_vco_lib_unimportable_venv(Path(venv_dir))
+            r = _run(
+                DEFERRAL_HOOK,
+                project_dir=project,
+                env_extra={"VCT_VENV": venv_dir},
+                cwd=cwd_dir,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            out = r.stdout
+            self.assertIn("2 deferred", out)
+            self.assertNotIn("actionable", out)
+            self.assertIn("schema_migration_required", out)
+            self.assertIn("bundle_user_modified_preserved", out)
+
+    def test_markdown_fallback_degraded_path_renders_raw_total(self) -> None:
+        """Path 3 (direct Markdown-header parse) — vco_lib unimportable AND
+        no JSON sidecar. Same raw `N deferred` header as Path 2 — Paths 2/3
+        share the degradation-ladder rendering rule (one copy, per the
+        hook's own A>B>C comment)."""
+        with tempfile.TemporaryDirectory() as td, \
+                tempfile.TemporaryDirectory() as venv_dir, \
+                tempfile.TemporaryDirectory() as cwd_dir:
+            project = Path(td)
+            ctx = project / ".claude" / "context"
+            ctx.mkdir(parents=True)
+            (ctx / "UPDATE_DEFERRED.md").write_text(
+                "---\ncondition_ids: [foo_bar]\n---\n\n"
+                "## foo_bar (critical)\n\n**Title**: Foo Bar\n",
+                encoding="utf-8",
+            )
+            _make_vco_lib_unimportable_venv(Path(venv_dir))
+            r = _run(
+                DEFERRAL_HOOK,
+                project_dir=project,
+                env_extra={"VCT_VENV": venv_dir},
+                cwd=cwd_dir,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            out = r.stdout
+            self.assertIn("foo_bar", out)
+            self.assertIn("[critical]", out)
+            self.assertIn("1 deferred", out)
+            self.assertNotIn("actionable", out)
 
     def test_both_absent_is_silent(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -124,6 +124,24 @@ _V0290_OWNED_IDS = frozenset({
 # With it empty, ANY file carrying the triplet is now a hard failure.
 _KNOWN_UNLOCKED_WRITERS: frozenset = frozenset()
 
+
+def _holds_shared_deferral_lock(text: str) -> bool:
+    """True when this source PROVABLY takes the shared deferral file lock.
+
+    Both signals are required and both are structural (an import plus a real
+    call), so a passing mention in a comment or a docstring cannot buy an
+    exemption. The lock path constant comes from the emitter home, which is
+    what makes it the SAME lock ``deferral_emit.locked_report`` holds.
+    """
+    code = "\n".join(
+        ln for ln in text.splitlines() if not ln.lstrip().startswith("#")
+    )
+    imports_lock_rel = re.search(
+        r"from\s+vco_lib\.deferral_emit\s+import\s+[^\n]*\bLOCK_REL\b", code
+    ) or re.search(r"\bdeferral_emit\.LOCK_REL\b", code)
+    takes_lock = re.search(r"\bexclusive_file_lock\s*\(", code)
+    return bool(imports_lock_rel and takes_lock)
+
 _V0290_OWNED_PREFIXES = (
     "bundle_pin_drift_", "deprecated_mcp_", "kg_named_vector_slot_error_",
     "lowercase_codegraph_residual_", "schema_migration_failed_",
@@ -263,6 +281,28 @@ class TestRegistryCompleteness(unittest.TestCase):
                 f"good as this scan",
             )
 
+    def test_lock_exemption_needs_both_structural_signals(self):
+        """Self-check for the exemption the scan above grants.
+
+        The gate is only as good as the thing that can bypass it: a file must
+        IMPORT the shared lock path from the emitter home AND actually call
+        ``exclusive_file_lock``. A comment, a docstring, or half the pair buys
+        nothing — otherwise the exemption becomes the fail-toward-green hole
+        the source-text-gate lesson warns about.
+        """
+        real = "from vco_lib.deferral_emit import LOCK_REL\nexclusive_file_lock(p)\n"
+        self.assertTrue(_holds_shared_deferral_lock(real))
+        self.assertFalse(_holds_shared_deferral_lock(
+            "# from vco_lib.deferral_emit import LOCK_REL\n"
+            "# exclusive_file_lock(p)\n"
+        ))
+        self.assertFalse(_holds_shared_deferral_lock(
+            "from vco_lib.deferral_emit import LOCK_REL\n"  # imports, never takes
+        ))
+        self.assertFalse(_holds_shared_deferral_lock(
+            "exclusive_file_lock(some_other_path)\n"  # takes SOME lock, not this one
+        ))
+
     def test_no_raw_deferral_triplet_outside_the_emitter_home(self):
         """`DeferralReport.read → add_entry → write` may only live in the
         emitter home. Anywhere else it is an UNLOCKED read-modify-write that
@@ -276,12 +316,25 @@ class TestRegistryCompleteness(unittest.TestCase):
         `templates/scripts/sync_knowledge_graph.py`, which was the dangerous
         one: it runs as a subprocess DURING an install run, so its unlocked
         write could interleave with `InstallDeferralFlow.finalize()`'s.
+
+        v0.2.91 dogfood fix — the gate now recognises the property it is
+        actually protecting: a file that PROVABLY holds the shared deferral
+        lock (`exclusive_file_lock(... LOCK_REL)`, the same lock
+        `deferral_emit.locked_report` takes) is serialised by construction and
+        is not an offender. `InstallDeferralFlow.finalize` is exactly that — it
+        already wrapped its write in that lock, and the vanished-entry
+        reconcile added in this fix needed to READ the ledger from inside the
+        same lock to make its decision. Allowlisting the file by NAME would
+        have been the fail-toward-green move; keying on the lock keeps a
+        genuinely unlocked writer failing.
         """
         offenders = []
         for rel, path in _iter_source_files({".py"}):
             if rel in _EMITTER_HOME_FILES:
                 continue
             text = path.read_text(encoding="utf-8", errors="replace")
+            if _holds_shared_deferral_lock(text):
+                continue
             # Only count real code: `.write(` on a report object combined with
             # a DeferralReport.read in the same file.
             if "DeferralReport.read(" not in text:
@@ -335,15 +388,24 @@ class TestRegistryCompleteness(unittest.TestCase):
         bundle-update reconcile must too. Without both call sites a declared
         probe is a docstring lie again."""
         install_src = (REPO_ROOT / "install.py").read_text(encoding="utf-8")
-        self.assertIn("_deferral_probes.registry_probe_name(cid)", install_src)
-        self.assertIn("_deferral_probes.evaluate(", install_src)
+        # The generic head of install.py's loop is now the shared
+        # `apply_probe_verdict` (extracted to keep the monolith under its
+        # ratchet); it is the only thing that turns a registry verdict into an
+        # action on that leg, so pinning it pins the routing.
+        self.assertIn("_deferral_probes.apply_probe_verdict(", install_src)
+        # v0.2.91 dogfood fix: both legs now call the SAME whole-report
+        # dispatcher (`probe_report`) — it returns the tri-state verdicts AND
+        # stamps each entry's `probe_status`, so the two surfaces cannot
+        # disagree about a verdict OR about what the ledger says a given
+        # entry's lifecycle is.
+        self.assertIn("_deferral_probes.probe_report(", install_src)
         project_init_src = (
             REPO_ROOT / "vco_lib" / "project_init.py"
         ).read_text(encoding="utf-8")
-        self.assertIn("_probe_resolvable_deferrals(folder, report)", project_init_src)
+        self.assertIn("_probe_deferrals(folder, report)", project_init_src)
         # Both surfaces route through the SAME dispatcher in vco_lib, so a
         # verdict can never mean different things on the two update paths.
-        self.assertIn("resolvable_condition_ids", project_init_src)
+        self.assertIn("_dp.probe_report(", project_init_src)
 
     def test_registry_schema_is_valid_and_non_trivial(self):
         specs = self.dr.all_specs()

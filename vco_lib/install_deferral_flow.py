@@ -53,6 +53,28 @@ from vco_lib.deferral_emit import LOCK_REL
 from vco_lib.deferral_report import DeferralReport
 
 
+def _record_vanished(folder: Path, condition_id: str) -> None:
+    """B-F9 trail for a seeded entry dropped because disk lost it mid-run.
+
+    No silent mutations: the run report is about to omit a row the ledger
+    carried when the run started, so the reason has to be written down.
+    Best-effort — observability never gates the write that already happened.
+    """
+    try:
+        from vco_lib.deferral_emit import record_auto_resolution
+
+        record_auto_resolution(
+            Path(folder),
+            condition_id,
+            "cleared_on_disk_during_run",
+            "another writer in this run resolved the condition and removed it "
+            "from the ledger; the run's in-memory copy was dropped instead of "
+            "being written back",
+        )
+    except Exception:  # noqa: BLE001 — observability is best-effort
+        pass
+
+
 @dataclass
 class FinalizeResult:
     """Outcome of :meth:`InstallDeferralFlow.finalize`."""
@@ -65,6 +87,12 @@ class FinalizeResult:
     #: written; ``False`` = no entries, existing file(s) deleted (the
     #: caller writes the --update paper-trail stub in that case).
     wrote_entries: bool
+
+    #: v0.2.91 dogfood fix — seeded cids DROPPED because another writer cleared
+    #: them from disk during this run (see :meth:`InstallDeferralFlow.finalize`).
+    vanished: Tuple[str, ...] = ()
+    #: Non-``None`` when the vanish reconcile soft-failed (the write still ran).
+    vanish_error: Optional[str] = None
 
 
 class InstallDeferralFlow:
@@ -89,6 +117,12 @@ class InstallDeferralFlow:
         #: The run's accumulating report. Mid-run steps add/resolve entries
         #: directly on this object; the flow only owns seed + finalize.
         self.report = DeferralReport()
+        #: v0.2.91 dogfood fix — cid → the exact entry OBJECT the A-2 seed
+        #: imported. Object identity (not equality) is the test used at
+        #: finalize: a mid-run re-emit calls ``add_entry`` with a NEW object,
+        #: so ``is`` cleanly separates "still the stale seeded copy" from
+        #: "re-detected this run", with no heuristic about field contents.
+        self._seeded_entries: dict = {}
 
     def _merge_foreign_from_disk(self) -> int:
         """One home for the exclusion-scoped disk merge (A-2 seed and the
@@ -105,8 +139,46 @@ class InstallDeferralFlow:
         Returns the number of entries merged. Exceptions propagate — the
         caller treats a seed failure as best-effort (logs a warning and
         degrades to the pre-A-2 behaviour, never blocking the install).
+
+        Also RECORDS which entry objects the seed imported, so
+        :meth:`finalize` can tell a stale seeded copy from a fresh re-detection
+        (the resurrection bug — see that method).
         """
-        return self._merge_foreign_from_disk()
+        before = {e.condition_id for e in self.report.entries}
+        merged = self._merge_foreign_from_disk()
+        for entry in self.report.entries:
+            if entry.condition_id not in before:
+                self._seeded_entries[entry.condition_id] = entry
+        return merged
+
+    def _vanished_seeded_ids(self, disk_ids: frozenset) -> list:
+        """Seeded cids ANOTHER writer cleared from disk during this run.
+
+        The resurrection bug this closes (v0.2.91 live dogfood): the A-2 seed
+        imports a FOREIGN entry at t0; a later step of the SAME run legitimately
+        clears it from the on-disk ledger — the bundle-update reconcile at step
+        5b does exactly this via the locked emitter, and writes an
+        ``auto-resolutions.jsonl`` row saying so; then finalize rebuilds the
+        file from memory and writes the seeded copy straight back. The user sees
+        "condition no longer applies — cleared" in the trail and the entry still
+        sitting in the ledger, every run, forever. Two consecutive `--update`
+        runs on the maintainer's install did precisely that for
+        ``orchestrator_user_modified_preserved``.
+
+        The clear is only honoured when the in-memory entry IS STILL the object
+        the seed imported. If any step of this run re-emitted the condition, the
+        in-memory entry is a fresh object carrying fresh evidence and must win —
+        a re-detected condition is not a resurrection.
+        """
+        vanished = []
+        for cid, seeded in self._seeded_entries.items():
+            if cid in disk_ids:
+                continue
+            current = self.report.entry_for(cid)
+            if current is None or current is not seeded:
+                continue
+            vanished.append(cid)
+        return vanished
 
     def finalize(self) -> FinalizeResult:
         """P1 pre-write re-merge, then the run's SINGLE authoritative write.
@@ -131,14 +203,36 @@ class InstallDeferralFlow:
         """
         late_merged = 0
         merge_error: Optional[str] = None
+        vanished: list = []
+        vanish_error: Optional[str] = None
         with exclusive_file_lock(self.folder / LOCK_REL):
+            # v0.2.91 dogfood fix: reconcile AWAY from disk before merging FROM
+            # it. Both directions are read from the SAME locked view, so the
+            # decision cannot straddle a concurrent write.
+            try:
+                disk_ids = frozenset(
+                    e.condition_id
+                    for e in DeferralReport.read(self.folder).entries
+                )
+                for cid in self._vanished_seeded_ids(disk_ids):
+                    self.report.mark_resolved(cid)
+                    vanished.append(cid)
+            except Exception as exc:  # noqa: BLE001 — reconcile is best-effort
+                vanish_error = str(exc)
             try:
                 late_merged = self._merge_foreign_from_disk()
             except Exception as exc:  # noqa: BLE001 — re-merge is best-effort
                 merge_error = str(exc)
             wrote_entries = self.report.write(self.folder)
+        # Trail lines go OUTSIDE the lock: `record_auto_resolution` appends to
+        # its own JSONL and must never be reachable while we hold the deferral
+        # lock (the emitter module documents its own re-entrancy rule).
+        for cid in vanished:
+            _record_vanished(self.folder, cid)
         return FinalizeResult(
             late_merged=late_merged,
             merge_error=merge_error,
             wrote_entries=wrote_entries,
+            vanished=tuple(vanished),
+            vanish_error=vanish_error,
         )

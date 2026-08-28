@@ -124,20 +124,73 @@ class UpstreamSidecarProbeTests(unittest.TestCase):
         )
         self.assertIs(verdict, True)
 
-    def test_entry_naming_no_sidecar_is_unknown_not_resolved(self):
-        """An auto-merge-only record names no sidecar. There is nothing to
-        probe, so the probe declines — it must not manufacture a resolution
-        out of an empty list."""
-        entry = DeferralEntry(
+    # -----------------------------------------------------------------
+    # v0.2.91 dogfood fix — the LEGACY / list-less arm.
+    #
+    # Pre-fix an entry naming no sidecar returned None UNCONDITIONALLY: not
+    # resolvable, not re-classifiable, and — worse — the ledger said nothing
+    # about it, so an immortal row looked exactly like a live one. The probe
+    # now derives the answer from what the entry HAS (its root) via a bounded
+    # read-only sweep. Still positive-evidence-only: a sweep that cannot
+    # complete returns None, never a resolution.
+    # -----------------------------------------------------------------
+
+    @staticmethod
+    def _listless_entry() -> DeferralEntry:
+        """An auto-merge-only / legacy entry: no sidecar path anywhere in it."""
+        return DeferralEntry(
             condition_id="orchestrator_user_modified_preserved",
             title="t", detected="1 file auto-merged (3-way)",
             why_deferred="w", command_to_apply="c", severity="info",
         )
-        self.assertIsNone(
+
+    def test_listless_entry_resolves_when_the_sweep_finds_no_sidecar(self):
+        """The sweep COMPLETED and found nothing — positive evidence the
+        condition is over, so the entry finally clears instead of living
+        forever with the ledger silent about why."""
+        self._touch("docs/A.md")
+        self.assertIs(
             dp.orchestrator_sidecars_still_present(
-                dp.ProbeContext(folder=self.folder, entry=entry)
-            )
+                dp.ProbeContext(folder=self.folder, entry=self._listless_entry())
+            ),
+            False,
         )
+
+    def test_listless_entry_is_kept_when_any_sidecar_is_parked(self):
+        """A sidecar left by ANY merge keeps a list-less entry alive — the
+        honest reading of "N files were preserved" when the entry cannot say
+        which ones."""
+        self._touch("knowledge/concepts/b.md.from-upstream-4c44eb8")
+        self.assertIs(
+            dp.orchestrator_sidecars_still_present(
+                dp.ProbeContext(folder=self.folder, entry=self._listless_entry())
+            ),
+            True,
+        )
+
+    def test_listless_entry_is_unknown_when_the_sweep_cannot_complete(self):
+        """A walk that could not finish proves nothing about what it did not
+        see. It must NEVER read as absence — the whole module's rule."""
+        with mock.patch.object(dp.os, "walk", side_effect=OSError("boom")):
+            self.assertIsNone(
+                dp.orchestrator_sidecars_still_present(
+                    dp.ProbeContext(folder=self.folder, entry=self._listless_entry())
+                )
+            )
+
+    def test_sweep_declines_rather_than_concluding_past_its_bound(self):
+        """The entry-count bound is a REFUSAL, not a truncated answer."""
+        self._touch("docs/A.md")
+        with mock.patch.object(dp, "_SIDECAR_SCAN_MAX_ENTRIES", 0):
+            self.assertIsNone(dp.any_upstream_sidecar_on_disk(self.folder))
+
+    def test_sweep_does_not_descend_into_vcs_or_build_trees(self):
+        """A sidecar can only be parked next to a user-editable file, never
+        inside `.git/` or a build output — so a stray match there must not
+        keep the entry alive (and the prune is what keeps the sweep bounded)."""
+        self._touch(".git/objects/x.md.from-upstream-deadbee")
+        self._touch("node_modules/p/y.md.from-upstream-deadbee")
+        self.assertIs(dp.any_upstream_sidecar_on_disk(self.folder), False)
 
     def test_dismiss_fields_share_the_extractor(self):
         """The dismissal key and the clear probe must agree on what "the

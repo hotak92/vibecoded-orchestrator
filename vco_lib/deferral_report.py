@@ -131,6 +131,72 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def entry_disposition(entry: Any) -> str:
+    """THE disposition rule for one entry: explicit → registry → action_required.
+
+    Works on a real :class:`DeferralEntry` (via
+    :attr:`~DeferralEntry.resolved_disposition`) AND on any duck-typed
+    entry-shaped object that only carries ``condition_id`` — the doctor's
+    injectable ``resolve_deferral_report`` seam produces exactly those, and
+    before this existed the doctor could not use the entry-aware partition at
+    all, which is why it stayed on the cid-only copy that ignored explicit
+    dispositions. One rule, every entry shape.
+
+    MUST MATCH ``deferral_ledger.rs::resolve_disposition`` (the launcher's
+    compiled mirror; parity-locked by
+    ``tests/test_v0291_deferral_ledger_parity.py`` +
+    ``launcher/src-tauri/tests/deferral_registry_parity.rs``).
+    """
+    resolved = getattr(entry, "resolved_disposition", None)
+    if isinstance(resolved, str) and resolved:
+        return resolved
+    explicit = _coerce_disposition(getattr(entry, "disposition", None))
+    if explicit:
+        return explicit
+    try:
+        from vco_lib.deferral_registry import disposition_for
+
+        return disposition_for(getattr(entry, "condition_id", "") or "")
+    except Exception:  # noqa: BLE001 — conservative on any registry problem
+        return "action_required"
+
+
+def partition_entries(report_or_entries: Any) -> tuple:
+    """THE partition, for any entry-bearing thing. ``(actionable, informational)``.
+
+    One function every surface calls, whatever it is holding: a
+    :class:`DeferralReport`, a plain list of entries, or a duck-typed report a
+    caller's injectable seam produced (the doctor's ``resolve_deferral_report``
+    is exactly that). It delegates to :meth:`DeferralReport.split_by_disposition`
+    so the rule itself has a single implementation.
+
+    Why it exists (v0.2.91 dogfood fix): the partition had TWO homes. The
+    entry-aware one honours ``resolved_disposition`` — an entry's EXPLICIT
+    ``disposition`` first, the registry second. The registry-only
+    ``deferral_registry.split_by_disposition(cids)`` sees condition IDs and
+    nothing else, so an escalated record counted as a record there and as
+    actionable everywhere else. wave-2 MINOR-3 fixed the CLAUDE.md reminder and
+    left ``vco_lib.doctor`` on the cid-only copy, which is how the shipped
+    doctor could report a count the ledger it had just read disagreed with.
+    A cid-only partition is still correct for registry-level questions (the
+    cross-language parity tests use it); it is never correct for ENTRIES.
+
+    Never raises: an unusable input yields ``([], [])``, which every caller
+    already treats as "nothing to say".
+    """
+    try:
+        entries = list(getattr(report_or_entries, "entries", report_or_entries) or [])
+    except Exception:  # noqa: BLE001 — unusable input ⇒ nothing to partition
+        return ([], [])
+    try:
+        scratch = DeferralReport()
+        for entry in entries:
+            scratch.add_entry(entry)
+        return scratch.split_by_disposition()
+    except Exception:  # noqa: BLE001 — never break the surface that asked
+        return ([], [])
+
+
 def _disposition_split_line(entries: List["DeferralEntry"]) -> str:
     """One line summarising the ledger by DISPOSITION, or "" when unavailable.
 
@@ -155,12 +221,8 @@ def _disposition_split_line(entries: List["DeferralEntry"]) -> str:
     """
     if not entries:
         return ""
-    try:
-        scratch = DeferralReport()
-        for e in entries:
-            scratch.add_entry(e)
-        actionable, informational = scratch.split_by_disposition()
-    except Exception:  # noqa: BLE001 — the reminder must never break a write
+    actionable, informational = partition_entries(entries)
+    if not actionable and not informational:
         return ""
     return (
         f"Currently: **{len(actionable)} actionable**, "
@@ -458,6 +520,21 @@ class DeferralEntry:
     sidecar, deliberately NOT rendered into the Markdown (the .md is a human
     render, and the md→entry fallback path is already lossy by design)."""
 
+    probe_status: Optional[str] = None
+    """v0.2.91 dogfood fix — one honest sentence saying HOW this entry can end.
+
+    The ledger used to be silent about lifecycle: an entry whose probe returned
+    "could not determine" and an entry with no automatic clear at all rendered
+    identically to one that is simply still true, so an immortal row was
+    indistinguishable from a live one — the exact "silent NotProbed-forever"
+    state the registry exists to end.
+
+    Set by the ONE annotator (:func:`vco_lib.deferral_probes.probe_report`) on
+    every re-probe pass, derived from the registry's ``clear_probe`` plus the
+    probe's tri-state verdict. ``None`` = not annotated yet (older ledgers, or a
+    writer family that never re-probes), which renders exactly as it did before
+    this field existed."""
+
     def __post_init__(self) -> None:
         if self.severity not in SEVERITY_ORDER:
             raise ValueError(
@@ -628,6 +705,15 @@ def _render_entry(entry: DeferralEntry) -> str:
         refs = "\n".join(f"- `{ref}`" for ref in entry.kg_node_refs)
         kg_lines = f"\n**Cross-references**:\n{refs}\n"
 
+    # v0.2.91 dogfood fix: rendered ONLY when set, so every ledger written
+    # before this field existed (and every writer family that does not
+    # re-probe) renders byte-identically to v0.2.90.
+    status_line = (
+        f"**Probe status**: {entry.probe_status}\n\n"
+        if entry.probe_status
+        else ""
+    )
+
     # v0.2.91 WP-B: the `## <cid> (<sev>)` HEADER SHAPE IS UNTOUCHED — both
     # `_SECTION_RE` here and the Rust `restart.rs::extract_section` /
     # `strip_section` parse it, and WP-F's banner work depends on
@@ -642,6 +728,7 @@ def _render_entry(entry: DeferralEntry) -> str:
         f"\n"
         f"**Disposition**: {entry.resolved_disposition}\n"
         f"\n"
+        f"{status_line}"
         f"**Detected**: {entry.detected}\n"
         f"\n"
         f"**Why deferred**: {entry.why_deferred}\n"
@@ -761,6 +848,7 @@ def _parse_entries(text: str) -> List[DeferralEntry]:
                 kg_node_refs=refs,
                 detected_at=fields.get("Detected at", _now_iso()),
                 disposition=disposition,
+                probe_status=(fields.get("Probe status") or None),
             )
         )
 
@@ -815,6 +903,8 @@ def _entry_to_dict(entry: DeferralEntry) -> dict:
         out["disposition"] = entry.disposition
     if entry.dismiss_fields:
         out["dismiss_fields"] = dict(entry.dismiss_fields)
+    if entry.probe_status:
+        out["probe_status"] = entry.probe_status
     return out
 
 
@@ -848,6 +938,11 @@ def _entry_from_dict(d: dict) -> Optional[DeferralEntry]:
         detected_at=str(d.get("detected_at", _now_iso())),
         disposition=_coerce_disposition(d.get("disposition")),
         dismiss_fields={str(k): v for k, v in dismiss.items()},
+        probe_status=(
+            str(d["probe_status"]).strip() or None
+            if isinstance(d.get("probe_status"), str)
+            else None
+        ),
     )
 
 
@@ -1169,7 +1264,11 @@ class DeferralReport:
         actionable: List[DeferralEntry] = []
         informational: List[DeferralEntry] = []
         for entry in self._entries:
-            if entry.resolved_disposition in ("action_required", "auto_retryable"):
+            # v0.2.91 dogfood fix: through the ONE rule (:func:`entry_disposition`)
+            # so a duck-typed entry — the doctor's injectable seam produces
+            # those — partitions identically to a real one instead of forcing
+            # that caller onto a second, cid-only implementation.
+            if entry_disposition(entry) in ("action_required", "auto_retryable"):
                 actionable.append(entry)
             else:
                 informational.append(entry)

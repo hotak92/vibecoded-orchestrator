@@ -609,6 +609,12 @@ try:
     # so the analyzer monolith stays flat (P2f ratchet). `_prune_collection`
     # is a thin shim over it.
     from vco_lib.codegraph_prune import prune_collection as _prune_collection_impl
+    # v0.2.91 dogfood fix: the orchestrator-root heuristic behind the
+    # `--index-dot-claude` default has TWO callers now (here and the deferral
+    # retry driver), so it lives in vco_lib rather than as a mirrored copy.
+    from vco_lib.paths import (
+        looks_like_orchestrator_root as _looks_like_orchestrator_root_impl,
+    )
 except ImportError as _exc:  # noqa: F841 — used in the message below
     sys.stderr.write(
         "analyze_code_graph: vco_lib not importable — VCO install is broken; "
@@ -913,19 +919,15 @@ def _keep_source_file(path: "Path", ignore_dirs: frozenset) -> bool:
 def _looks_like_orchestrator_root(repo_path: Path) -> bool:
     """Best-effort check: does ``repo_path`` look like the orchestrator clone?
 
-    The orchestrator clone is the ONE tree where ``.claude/`` is
-    first-party source under active development (bundled agents, hooks,
-    scripts, MCP servers), so a bare CLI run there should still index it.
-    Heuristic: the root both *contains* ``vco_lib/`` (unique to the
-    orchestrator clone) AND has a ``.claude/`` directory. Every other
-    project that has VCO installed has ``.claude/`` but NOT ``vco_lib/``.
-    Never raises — returns False on any filesystem error (conservative:
-    unknown → treat as a user project → exclude ``.claude``).
+    v0.2.91 dogfood fix — the rule MOVED to
+    :func:`vco_lib.paths.looks_like_orchestrator_root` (the A-leg of the
+    share-don't-mirror rule) because ``vco_lib.deferral_retry`` became a second
+    caller: the retry driver has to pick the same ``--index-dot-claude`` value
+    the analyzer would resolve, and a second copy is a second chance for the
+    spawn's owed-gate and the verify's probe to disagree about ``.claude`` rows.
+    This wrapper stays for the call site and its monkeypatch contract.
     """
-    try:
-        return (repo_path / "vco_lib").is_dir() and (repo_path / ".claude").is_dir()
-    except OSError:
-        return False
+    return _looks_like_orchestrator_root_impl(repo_path)
 
 
 def _resolve_index_dot_claude(cli_value: Optional[bool], repo_path: Path) -> bool:

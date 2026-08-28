@@ -552,7 +552,16 @@ def probe_deferral_ledger(folder: Path, res: DoctorResolvers, ctx: dict) -> list
                 summary="no pending deferral entries",
             )
         ]
-    actionable, informational = deferral_registry.split_by_disposition(cids)
+    # v0.2.91 dogfood fix: THE partition, not the registry-only one. The
+    # cid-only helper cannot see an entry's explicit `disposition`, so this
+    # finding could report a tier the ledger it just read disagreed with —
+    # the divergence wave-2 MINOR-3 closed for the CLAUDE.md reminder and left
+    # armed here. `partition_entries` returns entries; this finding reports ids.
+    from vco_lib.deferral_report import partition_entries
+
+    actionable_entries, informational_entries = partition_entries(report)
+    actionable = [getattr(e, "condition_id", "") for e in actionable_entries]
+    informational = [getattr(e, "condition_id", "") for e in informational_entries]
     # v0.2.91 wave-3 (NIT): consult the attempt cap. A cid whose cap is spent
     # would be SKIPPED by the dispatcher, so promising "VCO can retry this
     # itself" for it is a promise the next dispatch will not keep — the entry
@@ -1189,12 +1198,19 @@ def resolve_healthy_findings(folder: Path, report: DoctorReport) -> list[str]:
     """Resolve the ledger entries this pass's OK readings clear. Never raises.
 
     Only ever called on the NO-SINK path. With a sink, install.py's
-    ``InstallDeferralFlow.finalize()`` is still pending and re-merges foreign
-    entries from disk — a resolve landing between that read and its write would
-    be resurrected, and the entry would look immortal for one more cycle (the
-    same race that keeps ``auto_fix=False`` on the install path). The
-    ``--update`` re-probe pass already clears these through the registry probe,
-    so nothing is lost by staying out of that window.
+    ``InstallDeferralFlow.finalize()`` is still pending (the same window that
+    keeps ``auto_fix=False`` on the install path), and the ``--update``
+    re-probe pass already clears these through the registry probe — so nothing
+    is lost by staying out of it.
+
+    v0.2.91 dogfood fix: the ORIGINAL reason for the gate — a mid-run resolve
+    being resurrected by ``finalize()``'s rebuild-from-memory — no longer
+    holds. ``finalize`` now drops a seeded entry that vanished from disk during
+    the run, whoever removed it, so a resolve landing in that window is
+    honoured. The gate is KEPT as belt-and-braces (one writer per run is still
+    the simpler invariant), not because the race is live. Stating that
+    explicitly so the next reader does not treat a stale rationale as a
+    constraint.
     """
     cids = healthy_condition_ids(report)
     if not cids:

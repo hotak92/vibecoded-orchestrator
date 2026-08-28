@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-28T00:18:27Z",
+  "severity_max": "warning",
+  "entries": [
+    {
+      "condition_id": "orchestrator_user_modified_preserved",
+      "title": "1 orchestrator-root file preserved/merged during update",
+      "detected": "During an orchestrator-root update pulling from `vco_upstream/main`, 1 user-editable file(s) had both local and upstream changes. VCO ran a per-path 3-way merge before `git pull`:\n  - `docs/VCT_MODULE_MANIFEST_SPEC.md` — conflict; local preserved, upstream saved as `docs/VCT_MODULE_MANIFEST_SPEC.md.from-upstream-5a9ae53` (base=ef6ec75 theirs=5a9ae53)",
+      "why_deferred": "Default-to-safety: when a file in the user-editable allowlist (`CLAUDE.md`, `knowledge/**/*.md`, `.claude/CONTEXT_STATE.md`, `.claude/MEMORY.md`, etc.) has both local edits and upstream edits, VCO auto-merges non-overlapping changes but PRESERVES local content when the merge has conflicts. The upstream version is saved alongside as `<path>.from-upstream-<sha>` so you can inspect or accept it manually.",
+      "command_to_apply": "# Inspect the upstream version side-by-side with your local:\n#   diff -u <path> <path>.from-upstream-<sha>\n#\n# Accept upstream (overwrite local with the upstream version):\n#   mv docs/VCT_MODULE_MANIFEST_SPEC.md.from-upstream-5a9ae53 docs/VCT_MODULE_MANIFEST_SPEC.md    # POSIX\n#   move docs/VCT_MODULE_MANIFEST_SPEC.md.from-upstream-5a9ae53 docs/VCT_MODULE_MANIFEST_SPEC.md   # Windows cmd.exe\n#\n# OR keep your local edits and delete the upstream sidecar:\n#   rm docs/VCT_MODULE_MANIFEST_SPEC.md.from-upstream-5a9ae53      # POSIX\n#   del docs/VCT_MODULE_MANIFEST_SPEC.md.from-upstream-5a9ae53     # Windows cmd.exe\n#\n# Auto-merged files were already written to the working tree;\n# review them with `git diff HEAD`.",
+      "severity": "info",
+      "kg_node_refs": [],
+      "detected_at": "2026-07-23T01:13:22Z"
+    },
+    {
+      "condition_id": "kg_access_phantom_repaired",
+      "title": "KG access rows restored to binding-backed collection names",
+      "detected": "Pre-v0.2.89 renames rewrote this project's KG access rows to name-derived collection names that do not exist on Weaviate. The launcher rewrote them back to the binding-backed names at boot: [(\"LegacyPrefix_Development\", \"DemoProj_Development\")].",
+      "why_deferred": "Informational record of an automatic, evidence-gated repair (phantom name absent on Weaviate, binding-backed sibling present).",
+      "command_to_apply": "# No action needed — the access rows were already restored.",
+      "severity": "info",
+      "kg_node_refs": [],
+      "detected_at": "2026-07-31T15:24:15Z"
+    },
+    {
+      "condition_id": "codegraph_embed_resync_pending",
+      "title": "Code-graph resync did not fully converge",
+      "detected": "A background code-graph resync for project 'LegacyPrefix' finished but stale rows remain (LegacyPrefix_CodeModule: 2, LegacyPrefix_CodeClass: 1, LegacyPrefix_CodeFunction: 9). Retrieval still works via the previously stored vectors; the stale rows are just not re-embedded under the current revision yet.",
+      "why_deferred": "Background resyncs are best-effort and never force-applied. Re-running the command below re-embeds only the remaining stale rows (cheap, resumable). This entry is written once and clears automatically when a later update's probe confirms zero stale rows.",
+      "command_to_apply": "/home/user/Projects/DemoRoot/.venv/bin/python /home/user/Projects/DemoRoot/.claude/scripts/analyze_code_graph.py /home/user/Projects/DemoRoot --project LegacyPrefix",
+      "severity": "warning",
+      "kg_node_refs": [],
+      "detected_at": "2026-07-31T15:26:07Z"
+    },
+    {
+      "condition_id": "template_review_pending",
+      "title": "Project-level template review pending",
+      "detected": "VCO ships minimal-stub templates for CLAUDE.md, CONTEXT_STATE.md, and MEMORY.md to give fresh projects a starting point. 2 file(s) in this project meaningfully differ from the current shipping reference — that's expected for established projects, but you may want to review whether any new sections (e.g. `Session Start Discipline`, `KG-First Search Policy`) are worth pulling in:\n  - `.claude/CONTEXT_STATE.md`\n  - `CLAUDE.md`",
+      "why_deferred": "Project-level files are bespoke (CLAUDE.md sections, CONTEXT_STATE.md state) — VCO never overwrites them. The reference templates ship as `.reference.md` sidecars under `.claude/context/templates/` so you can diff and selectively adopt.",
+      "command_to_apply": "# Compare each file against VCO's reference template:\n#   diff -u /home/user/Projects/DemoRoot/<file> /home/user/Projects/DemoRoot/.claude/context/templates/<NAME>.reference.md\n# Adopt structure/sections you want; keep your project-specific\n# content. The reference files refresh on every install run, so\n# they always reflect VCO's current shipping shape.\n# To silence this nudge without changing anything:\npython -m vco_lib.project_init dismiss-deferral --folder '/home/user/Projects/DemoRoot' --condition-id template_review_pending",
+      "severity": "info",
+      "kg_node_refs": [],
+      "detected_at": "2026-08-28T00:17:27Z",
+      "dismiss_fields": {
+        "reference_hashes": {
+          "CLAUDE.md": "5d0a69289a40496ae4b2732747cb85f151cf7e41233b7e6e993fd30756cb92ac",
+          "CONTEXT_STATE.md": "e8209458f5d014826c746f48df001329640874361a45460619cb7b3976dfeb63",
+          "MEMORY.md": "08dda05cc65be9874dd7d1dcb5f7735fdcd5163f4a044ca596f02bfac6cd6266"
+        }
+      }
+    }
+  ]
+}

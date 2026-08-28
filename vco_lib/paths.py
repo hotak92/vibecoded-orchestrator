@@ -47,6 +47,33 @@ def to_posix_rel(rel: "str | Path") -> str:
     return str(rel).replace("\\", "/")
 
 
+def looks_like_orchestrator_root(repo_path: "str | Path") -> bool:
+    """Best-effort check: does ``repo_path`` look like the orchestrator clone?
+
+    The orchestrator clone is the ONE tree where ``.claude/`` is first-party
+    source under active development (bundled agents, hooks, scripts, MCP
+    servers), so tooling that must decide whether to INDEX ``.claude/`` asks
+    this. Heuristic: the root both contains ``vco_lib/`` (unique to the
+    orchestrator clone) AND has a ``.claude/`` directory; every other project
+    with VCO installed has ``.claude/`` but not ``vco_lib/``.
+
+    ONE home (v0.2.91 dogfood fix): ``analyze_code_graph._looks_like_orchestrator_root``
+    delegates here, and :mod:`vco_lib.deferral_retry` needs the same answer to
+    pick the resync driver's ``--index-dot-claude`` flag. A second copy would be
+    a second chance for the two to disagree about which tree indexes ``.claude``,
+    which is exactly the kind of split that makes a spawn say "owed" and the
+    verify say "converged".
+
+    Never raises — returns False on any filesystem error (conservative:
+    unknown → treat as a user project → exclude ``.claude``).
+    """
+    try:
+        root = Path(repo_path)
+        return (root / "vco_lib").is_dir() and (root / ".claude").is_dir()
+    except OSError:
+        return False
+
+
 def vct_root_dir() -> Path:
     """Return the launcher's state-root directory.
 
