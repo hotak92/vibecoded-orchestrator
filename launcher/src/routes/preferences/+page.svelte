@@ -14,6 +14,10 @@
   import { auth, currentUser } from '$lib/stores/auth';
   import Toast from '$lib/components/Toast.svelte';
   import Dropdown from '$lib/components/Dropdown.svelte';
+  // v0.2.91 WP-L (decision #22): ONE component, two scopes. Mounted here
+  // with scope="global" for the HOST-WIDE DEFAULTS, and on each project's
+  // Settings tab with scope="project" for that project's own choices.
+  import DualWriteFlagsPanel from '$lib/project-state/DualWriteFlagsPanel.svelte';
   import { focusOnMount, focusTrap } from '$lib/actions/focusManagement';
   import type {
     EmbeddingCatalog,
@@ -1588,6 +1592,107 @@
     }
   }
 
+  // ── Diagnostic log level (v0.2.91 WP-L, plan decision #21) ────────────
+  //
+  // GLOBAL knob backed by app_state `logging.level`. Read the header comment
+  // above `WINDOW_PREF_KEYS` first: `logging_level` (underscore) was DELETED
+  // from this page in v0.2.91 for having no consumer, and
+  // `tests/test_v0291_pref_keys_have_consumers.py` exists to keep a
+  // consumer-less pref from coming back. This is a DIFFERENT key with a real
+  // consumer chain, and the test asserts every link of it:
+  //
+  //   consumer: `vct_launcher_core::logging::resolve_log_level`
+  //     · written here through the dedicated `set_logging_level` command
+  //       (NOT `set_setting_v2` — a test pins that too, and not the generic
+  //       `app_state_set` either, because the command also validates the
+  //       value, applies it to the running process and re-projects env);
+  //     · read at launcher startup (`crate::logging::init_early` →
+  //       `apply_stored_level`) and by the hub at its own startup;
+  //     · projected to each project's `.claude/env` as VCO_LOG_LEVEL by
+  //       `vco_lib/config_projection.py`, in the DEFAULTED form so an
+  //       operator's own export still wins.
+  //
+  // Deliberately NOT added to WINDOW_PREF_KEYS: that array is asserted to
+  // contain exactly the three tray prefs, and this pref has its own command
+  // pair and its own section.
+  const LOG_LEVEL_CONSUMER = 'resolve_log_level';
+  const LOG_LEVEL_OPTIONS = [
+    { value: 'error', label: 'error — failures only' },
+    { value: 'warn', label: 'warn — failures and warnings' },
+    { value: 'info', label: 'info (default)' },
+    { value: 'debug', label: 'debug — verbose, for troubleshooting' },
+  ];
+  const LOG_LEVEL_DEFAULT = 'info';
+
+  interface LoggingLevelState {
+    stored: string | null;
+    effective: string;
+    env_override: boolean;
+    default_level: string;
+  }
+
+  let logLevel = $state<string>(LOG_LEVEL_DEFAULT);
+  let logLevelEffective = $state<string>(LOG_LEVEL_DEFAULT);
+  let logLevelEnvOverride = $state(false);
+  let logLevelLoading = $state(false);
+  let logLevelSaving = $state(false);
+  let logLevelSaved = $state(false);
+  let logLevelError = $state<string | null>(null);
+
+  function applyLogLevelState(state: LoggingLevelState): void {
+    logLevelEffective = state.effective;
+    logLevelEnvOverride = state.env_override;
+    const stored = state.stored;
+    if (stored && LOG_LEVEL_OPTIONS.some((o) => o.value === stored)) {
+      logLevel = stored;
+    } else {
+      if (stored) {
+        // Defensive: a level the UI does not know about (hand-edited row, or
+        // a future value) falls back to the default rather than rendering a
+        // dropdown whose displayed value is not one of its options.
+        console.warn('Unknown logging.level value, falling back:', stored);
+      }
+      logLevel = state.default_level || LOG_LEVEL_DEFAULT;
+    }
+  }
+
+  async function loadLogLevel(): Promise<void> {
+    logLevelLoading = true;
+    logLevelError = null;
+    try {
+      applyLogLevelState(await invoke<LoggingLevelState>('get_logging_level'));
+    } catch (e) {
+      logLevelError = String(e);
+    } finally {
+      logLevelLoading = false;
+    }
+  }
+
+  async function saveLogLevel(value: string): Promise<void> {
+    logLevelSaving = true;
+    logLevelError = null;
+    logLevelSaved = false;
+    try {
+      // The command returns the re-read state, so the row renders from what
+      // is actually stored and in force — including whether an environment
+      // override is currently beating the saved choice.
+      applyLogLevelState(
+        await invoke<LoggingLevelState>('set_logging_level', { level: value }),
+      );
+      logLevelSaved = true;
+      setTimeout(() => {
+        logLevelSaved = false;
+      }, 2000);
+    } catch (e) {
+      logLevelError = String(e);
+      // Re-read so the control snaps back to the stored value rather than
+      // showing a pick the backend refused.
+      await loadLogLevel();
+    } finally {
+      logLevelSaving = false;
+    }
+  }
+
   // ── Volume location (v0.2.23 F2 wave 2b, relocated) ───────────────────
   // Container data location for Weaviate / Ollama / code-embed. Migration
   // is a two-step flow: dry-run plan → user confirms → backend copies,
@@ -1816,6 +1921,8 @@
     // v0.2.91 WP-F2: window behaviour is launcher-global — loaded once,
     // independent of whether a project is selected.
     void loadWindowPrefs();
+    // v0.2.91 WP-L: the diagnostic log level is launcher-global too.
+    void loadLogLevel();
   });
   $effect(() => { if ($selectedProject) void loadRlLocalState(); });
 
@@ -1995,7 +2102,11 @@
          flag back here. The wizard re-fires on the next launcher
          start. -->
     <section class="pr-section">
-      <h2 class="pr-section-title">Code-graph collections</h2>
+      <!-- v0.2.91 F-24: "Code Graph" is the canonical spelling
+           (routes/codegraph/+page.svelte and the project docs both use it);
+           this heading was the lone hyphenated outlier, 249 lines from
+           "Code Graph Embeddings" under the same class and heading tier. -->
+      <h2 class="pr-section-title">Code Graph collections</h2>
       <div class="pr-onboarding-row">
         <div class="pr-onboarding-text">
           <strong>Re-check for legacy collections</strong>
@@ -2848,6 +2959,80 @@
           Per-project <code>.claude/rl-data/</code> directories are untouched.
         </span>
       </div>
+    </section>
+
+    <!-- v0.2.91 WP-L (decision #22): host-wide defaults for the three dual
+         embedding / RL-logging flags. Sibling of the app_state-backed RL
+         globals above, so it lives here rather than on /preferences/modules
+         (that page is a module-enablement CATALOG, a different concept).
+
+         NOTE the precedence difference from the two "— GLOBAL (all
+         projects)" toggles immediately above: those are HARD OVERRIDES that
+         beat every per-project setting. These are DEFAULTS that any explicit
+         per-project choice beats, in both directions. The panel's own copy
+         says so in its own words — every scope-naming string in it derives
+         from its `scope` prop, so the two mounts cannot describe each other.
+         Vocabulary is kept apart deliberately: "host-wide default" here,
+         "GLOBAL (all projects)" reserved for the overrides. -->
+    <!-- No heading here on purpose: the panel renders its own, derived from
+         its `scope` prop. A wrapper heading would be a second name for the
+         same thing that this page — not the component — controls, which is
+         exactly how two mounts start describing each other wrongly. -->
+    <section class="pr-section">
+      <DualWriteFlagsPanel scope="global" />
+    </section>
+
+    <!-- v0.2.91 WP-L (decision #21): machine-global diagnostic log level.
+         `logging_level` was DELETED from this page earlier in v0.2.91 for
+         having no consumer. This is not that key: it writes app_state
+         `logging.level`, which `vct_launcher_core::logging::resolve_log_level`
+         reads and `crate::logging::apply_stored_level` applies to the running
+         launcher, and which projects to `.claude/env` as VCO_LOG_LEVEL.
+         `tests/test_v0291_pref_keys_have_consumers.py` asserts that chain. -->
+    <section class="pr-section" aria-labelledby="pr-loglevel-title">
+      <h2 class="pr-section-title" id="pr-loglevel-title">Diagnostic log level</h2>
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Level</strong>
+          <span class="pr-onboarding-hint">
+            How much diagnostic output the launcher, the hub and the bundled
+            hooks write. Telemetry and audit records are <strong>not</strong>
+            affected — they are data, not diagnostics, and are never
+            level-gated.
+            <br /><br />
+            Takes effect in this launcher immediately; the background hub
+            picks it up the next time it starts. Projected to each project as
+            <code>VCO_LOG_LEVEL</code> in <code>.claude/env</code>, where your
+            own <code>VCO_LOG_LEVEL</code> export still wins. MCP servers are
+            not covered — they follow your environment, or the default.
+          </span>
+        </div>
+        <div class="pr-dd">
+          <Dropdown
+            options={LOG_LEVEL_OPTIONS}
+            value={logLevel}
+            disabled={logLevelLoading || logLevelSaving}
+            ariaLabel="Diagnostic log level"
+            onChange={(v: string) => void saveLogLevel(v)}
+          />
+        </div>
+      </div>
+      {#if logLevelEnvOverride}
+        <p class="pr-hint">
+          <code>VCO_LOG_LEVEL</code> is set in this launcher's environment, so
+          it is running at <strong>{logLevelEffective}</strong> regardless of
+          the choice above. The choice is still saved and applies once the
+          variable is unset.
+        </p>
+      {/if}
+      {#if logLevelSaving}
+        <p class="pr-hint">Saving…</p>
+      {:else if logLevelSaved}
+        <p class="pr-hint pr-kgsum-saved">Saved!</p>
+      {/if}
+      {#if logLevelError}
+        <p class="pr-error">Couldn't save: {logLevelError}</p>
+      {/if}
     </section>
 
     <!-- Hardware re-detection (Bug B, v0.2.5).

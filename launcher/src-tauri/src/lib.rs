@@ -53,6 +53,13 @@ mod deferral_ledger;
 #[cfg(target_os = "linux")]
 pub mod webkit_preflight;
 
+// v0.2.91 (user decision #21): leveled diagnostics. Public for the same
+// reason as `webkit_preflight` — main.rs is a separate compilation unit
+// and installs the subscriber before the preflight runs. The rules live
+// in `vct_launcher_core::logging`; this module is the launcher's two
+// call sites. See its docs for why initialisation is two-phase.
+pub mod logging;
+
 // Shared modules — live in vct-launcher-core. Re-exported here so the
 // existing `crate::db::Db` / `crate::manifest::*` / etc. usage across
 // the launcher continues to resolve. Only the DEFINITION moved; the
@@ -120,6 +127,25 @@ use std::sync::Mutex;
 // Manual arg parsing (no clap dep). Each subcommand has a dedicated
 // handler. To add a new subcommand: extend the `match` arm in
 // `handle_cli_args()`.
+//
+// PRINT CONTRACT (v0.2.91, user decision #21). Every print inside this
+// dispatch and the handlers it calls stays a BARE `println!`/`eprintln!`
+// — each is tagged `// [vct-print-contract]` so the no-bare-prints
+// ratchet can tell "deliberate" from "missed". Two reasons:
+//
+//   * STDOUT IS A MACHINE CONTRACT. install.py runs this binary headless
+//     (`_invoke_launcher_cli`), captures both streams and forwards them
+//     to the user. `tracing` writes to stderr, so migrating the stdout
+//     half would move the registration report onto the wrong stream.
+//   * A LOGGING LEVEL MUST NOT SILENCE A CLI. `logging.level` /
+//     `VCO_LOG_LEVEL` govern the GUI's diagnostics; a CLI invocation's
+//     own usage text, per-entry result lines and fatal errors are its
+//     RESULT, not chatter about it. `VCO_LOG_LEVEL=error` during an
+//     install must not blank the output install.py shows the user.
+//
+// Diagnostics from code REACHED BY the CLI but shared with the GUI (e.g.
+// `mcp_registration`, `storage_ux`) are ordinary tracing calls — the
+// contract covers this dispatch's own output, not everything downstream.
 fn handle_cli_args() -> Option<i32> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -155,6 +181,7 @@ fn handle_register_default_mcps_cli(rest: &[String]) -> i32 {
     let install_root = match rest.first() {
         Some(p) if !p.starts_with("--") => std::path::PathBuf::from(p),
         _ => {
+            // [vct-print-contract] CLI output — see handle_cli_args() above.
             eprintln!(
                 "[vct] --register-default-mcps requires a path argument, e.g. \
                  vct-launcher --register-default-mcps /path/to/orchestrator/install"
@@ -174,6 +201,7 @@ fn handle_register_default_mcps_cli(rest: &[String]) -> i32 {
             }
             "--accept" => {
                 if i + 1 >= rest.len() {
+                    // [vct-print-contract] CLI output — see handle_cli_args() above.
                     eprintln!("[vct] --accept requires a comma-separated value");
                     return 1;
                 }
@@ -185,6 +213,7 @@ fn handle_register_default_mcps_cli(rest: &[String]) -> i32 {
                 i += 2;
             }
             other => {
+                // [vct-print-contract] CLI output — see handle_cli_args() above.
                 eprintln!("[vct] unknown arg to --register-default-mcps: {}", other);
                 return 1;
             }
@@ -236,6 +265,7 @@ fn cli_register_default_mcps(install_root: &std::path::Path) -> i32 {
         db_handle.as_ref(),
     ) {
         Ok(report) => {
+            // [vct-print-contract] CLI output — see handle_cli_args() above.
             println!(
                 "[vct] MCP registration: wrote {} entr{} to {}",
                 report.success_count(),
@@ -244,8 +274,10 @@ fn cli_register_default_mcps(install_root: &std::path::Path) -> i32 {
             );
             for o in &report.outcomes {
                 if o.ok {
+                    // [vct-print-contract] CLI output — see handle_cli_args() above.
                     println!("[vct]   ok    {}", o.name);
                 } else {
+                    // [vct-print-contract] CLI output — see handle_cli_args() above.
                     eprintln!(
                         "[vct]   FAIL  {} : {}",
                         o.name,
@@ -253,6 +285,7 @@ fn cli_register_default_mcps(install_root: &std::path::Path) -> i32 {
                     );
                 }
                 if !o.dropped_keys.is_empty() {
+                    // [vct-print-contract] CLI output — see handle_cli_args() above.
                     println!(
                         "[vct]         (dropped {} secret/non-allowlisted env key(s): {:?})",
                         o.dropped_keys.len(),
@@ -261,6 +294,7 @@ fn cli_register_default_mcps(install_root: &std::path::Path) -> i32 {
                 }
             }
             for w in &report.db_warnings {
+                // [vct-print-contract] CLI output — see handle_cli_args() above.
                 eprintln!("[vct] db warning: {}", w);
             }
             if report.all_succeeded() {
@@ -270,6 +304,7 @@ fn cli_register_default_mcps(install_root: &std::path::Path) -> i32 {
             }
         }
         Err(e) => {
+            // [vct-print-contract] CLI output — see handle_cli_args() above.
             eprintln!("[vct] register_default_orchestrator_mcps: {}", e);
             1
         }
@@ -310,17 +345,21 @@ fn cli_rewrite_stale_mcps(install_root: &std::path::Path, accept_names: &[String
     ) {
         Ok(report) => {
             if report.stale_entries_found.is_empty() {
+                // [vct-print-contract] CLI output — see handle_cli_args() above.
                 println!("[vct] rewrite-stale-mcps: no stale entries found, nothing to do");
                 return 0;
             }
+            // [vct-print-contract] CLI output — see handle_cli_args() above.
             println!(
                 "[vct] rewrite-stale-mcps: found {} stale entr{}",
                 report.stale_entries_found.len(),
                 if report.stale_entries_found.len() == 1 { "y" } else { "ies" }
             );
             for s in &report.stale_entries_found {
+                // [vct-print-contract] CLI output — see handle_cli_args() above.
                 println!("[vct]   stale {}: {}", s.name, s.stale_path);
                 if !s.dropping_env_keys.is_empty() {
+                    // [vct-print-contract] CLI output — see handle_cli_args() above.
                     println!(
                         "[vct]         (rewrite would drop env keys: {:?})",
                         s.dropping_env_keys
@@ -328,13 +367,16 @@ fn cli_rewrite_stale_mcps(install_root: &std::path::Path, accept_names: &[String
                 }
             }
             if accept_names.is_empty() {
+                // [vct-print-contract] CLI output — see handle_cli_args() above.
                 println!("[vct] rewrite-stale-mcps: scan-only mode (no --accept list); no writes");
                 return 0;
             }
             if !report.rewritten.is_empty() {
+                // [vct-print-contract] CLI output — see handle_cli_args() above.
                 println!("[vct]   rewritten: {:?}", report.rewritten);
             }
             if !report.skipped_non_bundled.is_empty() {
+                // [vct-print-contract] CLI output — see handle_cli_args() above.
                 println!(
                     "[vct]   skipped (non-bundled, orchestrator owns weaviate-kg/search only): {:?}",
                     report.skipped_non_bundled
@@ -348,6 +390,7 @@ fn cli_rewrite_stale_mcps(install_root: &std::path::Path, accept_names: &[String
             0
         }
         Err(e) => {
+            // [vct-print-contract] CLI output — see handle_cli_args() above.
             eprintln!("[vct] rewrite_stale_orchestrator_mcps: {}", e);
             1
         }
@@ -363,6 +406,7 @@ fn cli_rewrite_stale_mcps(install_root: &std::path::Path, accept_names: &[String
 ///   2 — usage error (missing mode arg).
 fn handle_set_storage_config_cli(rest: &[String]) -> i32 {
     if rest.is_empty() {
+        // [vct-print-contract] CLI output — see handle_cli_args() above.
         eprintln!(
             "usage: vct-launcher --set-storage-config <named|bind|deferred> \
              [--bind-path service=path]..."
@@ -381,6 +425,7 @@ fn handle_set_storage_config_cli(rest: &[String]) -> i32 {
                 let s = service.trim();
                 let p = path.trim();
                 if s.is_empty() || p.is_empty() {
+                    // [vct-print-contract] CLI output — see handle_cli_args() above.
                     eprintln!(
                         "[vct] warning: --bind-path arg {:?} has empty service or path; \
                          skipping",
@@ -390,6 +435,7 @@ fn handle_set_storage_config_cli(rest: &[String]) -> i32 {
                     bind_paths.push((s.to_string(), std::path::PathBuf::from(p)));
                 }
             } else {
+                // [vct-print-contract] CLI output — see handle_cli_args() above.
                 eprintln!(
                     "[vct] warning: --bind-path arg {:?} missing `=`; expected \
                      `service=/abs/path` — skipping",
@@ -398,6 +444,7 @@ fn handle_set_storage_config_cli(rest: &[String]) -> i32 {
             }
             i += 2;
         } else if rest[i] == "--bind-path" {
+            // [vct-print-contract] CLI output — see handle_cli_args() above.
             eprintln!("[vct] warning: --bind-path missing value; ignoring trailing flag");
             i += 1;
         } else {
@@ -407,6 +454,7 @@ fn handle_set_storage_config_cli(rest: &[String]) -> i32 {
     match commands::storage_ux::set_storage_config_from_cli(mode, bind_paths) {
         Ok(()) => 0,
         Err(e) => {
+            // [vct-print-contract] CLI output — see handle_cli_args() above.
             eprintln!("error: {}", e);
             1
         }
@@ -459,7 +507,7 @@ fn reap_stale_install_py_lock() {
     let content = match std::fs::read_to_string(&lock_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] reap_stale_install_py_lock: could not read {}: {} \
                  (leaving lockfile in place)",
                 lock_path.display(),
@@ -474,7 +522,7 @@ fn reap_stale_install_py_lock() {
         None => {
             // Empty file — no holder claimed it. Safe to remove.
             let _ = std::fs::remove_file(&lock_path);
-            eprintln!(
+            tracing::warn!(
                 "[vct] reap_stale_install_py_lock: removed empty {}",
                 lock_path.display()
             );
@@ -487,7 +535,7 @@ fn reap_stale_install_py_lock() {
         Err(_) => {
             // Malformed first line — can't trust the file. Leave it
             // alone and surface a diagnostic so the user notices.
-            eprintln!(
+            tracing::warn!(
                 "[vct] reap_stale_install_py_lock: lockfile {} has \
                  unparseable PID line {:?}; leaving in place",
                 lock_path.display(),
@@ -507,13 +555,13 @@ fn reap_stale_install_py_lock() {
     // run starts clean.
     match std::fs::remove_file(&lock_path) {
         Ok(()) => {
-            eprintln!(
+            tracing::info!(
                 "[vct] reaped stale install.py.lock from dead PID {}",
                 pid
             );
         }
         Err(e) => {
-            eprintln!(
+            tracing::error!(
                 "[vct] reap_stale_install_py_lock: could not remove {} \
                  (dead PID {}): {}",
                 lock_path.display(),
@@ -556,7 +604,7 @@ pub fn run() {
     // blocks boot; runs at startup alongside the install.py-lock reaper.
     let reaped = crate::commands::update_gate::steady_state_orphaned_mcp_reap();
     if reaped > 0 {
-        eprintln!(
+        tracing::info!(
             "[vct] steady-state reaper terminated {} orphaned MCP process(es) at boot",
             reaped
         );
@@ -576,9 +624,18 @@ pub fn run() {
     // system depends on it. Log the error and abort rather than silently
     // running with stale JSON state.
     let db_handle = db::Db::open().unwrap_or_else(|e| {
-        eprintln!("[vct] FATAL: cannot open launcher.db: {}", e);
+        tracing::error!("[vct] FATAL: cannot open launcher.db: {}", e);
         std::process::exit(1);
     });
+
+    // v0.2.91 (user decision #21): phase 2 of logging setup. `main()`
+    // installed the subscriber from `VCO_LOG_LEVEL` alone, before the
+    // WebKit preflight; the stored `logging.level` preference only becomes
+    // readable HERE, at the first moment a `Db` handle exists. Re-resolves
+    // (env still wins) and reloads the filter. Soft-fail end to end — an
+    // unreadable or unparseable value falls back to the next tier and
+    // nothing about this call can block boot. See `src/logging.rs`.
+    logging::apply_stored_level(&db_handle);
 
     // v0.2.21 Step 3d: orchestrator-root auto-register moved out of
     // `Db::open()` because its implementation reaches into launcher-only
@@ -590,7 +647,7 @@ pub fn run() {
     // logs and continues — the row is a convenience, the rest of the
     // launcher works fine without it. The hub binary does NOT call this.
     if let Err(e) = commands::orchestrator_root::ensure_orchestrator_root(&db_handle) {
-        eprintln!("[vct] warning: ensure_orchestrator_root failed: {}", e);
+        tracing::warn!("[vct] warning: ensure_orchestrator_root failed: {}", e);
     }
 
     // v0.2.21 Step 19: launcher-startup project-row backfill. Sweep
@@ -605,13 +662,13 @@ pub fn run() {
     {
         let report = project_backfill::backfill_all_projects(&db_handle);
         if report.touched_projects > 0 {
-            eprintln!(
+            tracing::info!(
                 "[vct] project-backfill: seeded missing binding/settings rows for {} project(s)",
                 report.touched_projects
             );
         }
         for err in &report.errors {
-            eprintln!("[vct] project-backfill warning: {}", err);
+            tracing::warn!("[vct] project-backfill warning: {}", err);
         }
     }
 
@@ -745,7 +802,7 @@ pub fn run() {
             // launched the launcher manually mid-update from another
             // window) is preserved.
             if crate::commands::update_gate::cleanup_if_stale() {
-                eprintln!(
+                tracing::warn!(
                     "[vct] launcher boot: removed stale \
                      .update-in-progress.json lockfile (previous \
                      update did not exit cleanly)"
@@ -806,7 +863,7 @@ pub fn run() {
                     // surface that subscribes early enough; the FE's
                     // canonical path is the pull-on-mount above.
                     let _ = app.emit(event_name, &recovery);
-                    eprintln!(
+                    tracing::info!(
                         "[vct] boot recovery: {} (lock_path={:?}, reason={:?})",
                         event_name, recovery.lock_path, recovery.reason,
                     );
@@ -837,7 +894,7 @@ pub fn run() {
                     Err(e) => {
                         // Launcher running outside a clone (PATH wrapper, dev
                         // build). Nothing to reconcile; not an error.
-                        eprintln!(
+                        tracing::warn!(
                             "[vct] binary-freshness boot probe: no orchestrator root resolved \
                              ({}) — skipping",
                             e
@@ -847,7 +904,7 @@ pub fn run() {
                 };
                 let outcome = crate::services::binary_freshness::reconcile_dist_at_rest(&root).await;
                 if outcome.is_stale() {
-                    eprintln!(
+                    tracing::warn!(
                         "[vct] binary-freshness boot probe: STALE (staged={:?}, armed={}) — a \
                          `launcher_binary_stale` record was written; quit + relaunch applies it",
                         outcome.staged, outcome.armed,
@@ -934,7 +991,7 @@ pub fn run() {
                             || !report.refreshed_with_warnings.is_empty()
                             || !report.failed.is_empty()
                         {
-                            eprintln!(
+                            tracing::info!(
                                 "[vct] install-boundary env refresh: \
                                  refreshed={} with_warnings={} failed={} skipped={}",
                                 report.refreshed.len(),
@@ -943,7 +1000,7 @@ pub fn run() {
                                 report.skipped.len(),
                             );
                             for (name, err) in &report.failed {
-                                eprintln!(
+                                tracing::warn!(
                                     "[vct]   env refresh failed for {}: {}",
                                     name, err
                                 );
@@ -968,14 +1025,14 @@ pub fn run() {
                     ) {
                         Ok(report) => {
                             if !report.migrated_keys.is_empty() {
-                                eprintln!(
+                                tracing::info!(
                                     "[vct] migrated {} MCP secret(s) to keychain: {:?}",
                                     report.migrated_keys.len(),
                                     report.migrated_keys,
                                 );
                             }
                             if !report.skipped_keys.is_empty() {
-                                eprintln!(
+                                tracing::warn!(
                                     "[vct] warning: {} MCP secret(s) could not be migrated \
                                      to the keychain (will retry on next boot): {:?}",
                                     report.skipped_keys.len(),
@@ -984,7 +1041,7 @@ pub fn run() {
                             }
                         }
                         Err(e) => {
-                            eprintln!(
+                            tracing::warn!(
                                 "[vct] warning: MCP secret migration failed: {}. \
                                  Will retry on next boot.",
                                 e
@@ -1098,7 +1155,7 @@ pub fn run() {
                         let refresh_handle = app.handle().clone();
                         tauri::async_runtime::spawn(async move {
                             use tauri::Manager;
-                            eprintln!(
+                            tracing::info!(
                                 "[v0.2.45 V45-F] refreshing L0 module catalog post launcher-version-change"
                             );
                             let db = refresh_handle.state::<crate::db::Db>();
@@ -1108,13 +1165,13 @@ pub fn run() {
                             .await
                             {
                                 Ok(catalog) => {
-                                    eprintln!(
+                                    tracing::info!(
                                         "[v0.2.45 V45-F] L0 catalog refreshed (modules: {})",
                                         catalog.modules.len()
                                     );
                                 }
                                 Err(e) => {
-                                    eprintln!(
+                                    tracing::warn!(
                                         "[v0.2.45 V45-F] L0 catalog refresh failed (soft-fail): {}",
                                         e
                                     );
@@ -1148,7 +1205,7 @@ pub fn run() {
                     match db.backfill_partial_container_start_failures() {
                         Ok(0) => { /* clean slate; no rows to patch */ }
                         Ok(n) => {
-                            eprintln!(
+                            tracing::info!(
                                 "[v0.2.45 V45-E] backfilled {} module_installs row(s) \
                                  from 'installed'+last_error partial-failure state \
                                  → 'error' (now visible to V44-G4 auto-retry)",
@@ -1171,7 +1228,7 @@ pub fn run() {
                             );
                         }
                         Err(e) => {
-                            eprintln!(
+                            tracing::warn!(
                                 "[v0.2.45 V45-E] backfill SQL failed (soft-fail; \
                                  manual Reinstall remains the recovery path): {}",
                                 e
@@ -1244,7 +1301,7 @@ pub fn run() {
                         // No DB state yet — nothing to converge, not an error.
                         Ok(None) => return,
                         Err(e) => {
-                            eprintln!(
+                            tracing::warn!(
                                 "[vct] convergence (boot): sweep task did not \
                                  complete ({}); nothing converged this boot",
                                 e
@@ -1253,7 +1310,7 @@ pub fn run() {
                         }
                     };
                     if !report.is_quiet() {
-                        eprintln!(
+                        tracing::info!(
                             "[vct] convergence (boot): seeded {} row(s), retired {}, \
                              skipped {} unreadable project(s), {} pending",
                             report.seeded,
@@ -1326,7 +1383,7 @@ pub fn run() {
                                         || !report.errors.is_empty()
                                         || report.both_locations > 0
                                     {
-                                        eprintln!(
+                                        tracing::info!(
                                             "[vct] migrate-disabled: \
                                              project={} moved={} \
                                              already_disabled={} \
@@ -1339,7 +1396,7 @@ pub fn run() {
                                             report.errors.len(),
                                         );
                                         for err in &report.errors {
-                                            eprintln!(
+                                            tracing::warn!(
                                                 "[vct]   migrate-disabled \
                                                  warning ({}): {}",
                                                 proj.name, err,
@@ -1348,7 +1405,7 @@ pub fn run() {
                                     }
                                 }
                                 Err(e) => {
-                                    eprintln!(
+                                    tracing::warn!(
                                         "[vct] migrate-disabled: \
                                          project={} failed: {} \
                                          (continuing with next project)",
@@ -1358,7 +1415,7 @@ pub fn run() {
                             }
                         }
                         if total_moved > 0 {
-                            eprintln!(
+                            tracing::info!(
                                 "[vct] migrate-disabled: total {} \
                                  agent/skill file(s) moved to \
                                  .disabled/ siblings across {} project(s)",
@@ -1391,7 +1448,7 @@ pub fn run() {
                     match db.migrate_legacy_shared_kg_collection_names(canonical) {
                         Ok(0) => {}
                         Ok(n) => {
-                            eprintln!(
+                            tracing::info!(
                                 "[vct] migrate-shared-kg: renamed {} \
                                  legacy row(s) → '{}'",
                                 n, canonical
@@ -1407,7 +1464,7 @@ pub fn run() {
                             );
                         }
                         Err(e) => {
-                            eprintln!(
+                            tracing::warn!(
                                 "[vct] migrate-shared-kg warning (non-fatal): {}",
                                 e
                             );
@@ -1438,7 +1495,7 @@ pub fn run() {
                     match db.inner().sync_shared_to_primary_for_orchestrator_root() {
                         Ok((updated, inserted)) => {
                             if updated > 0 || inserted > 0 {
-                                eprintln!(
+                                tracing::info!(
                                     "[vct] sync-shared-to-primary (boot): \
                                      orchestrator-root updated={} inserted={}",
                                     updated, inserted
@@ -1455,7 +1512,7 @@ pub fn run() {
                             }
                         }
                         Err(e) => {
-                            eprintln!(
+                            tracing::warn!(
                                 "[vct] sync-shared-to-primary warning (non-fatal): {}",
                                 e
                             );
@@ -1607,7 +1664,7 @@ pub fn run() {
                     match adopt_report {
                         Ok(report) => {
                             if report.adopted > 0 || report.deferred > 0 {
-                                eprintln!(
+                                tracing::info!(
                                     "[vct] adopt-populated: \
                                      adopted={} deferred={} no_change={}",
                                     report.adopted,
@@ -1665,7 +1722,7 @@ pub fn run() {
                                             regened += 1;
                                         }
                                         Err(e) => {
-                                            eprintln!(
+                                            tracing::warn!(
                                                 "[vct] adopt-populated env \
                                                  regen failed for {}: {}",
                                                 proj.name, e
@@ -1674,7 +1731,7 @@ pub fn run() {
                                     }
                                 }
                                 if regened > 0 {
-                                    eprintln!(
+                                    tracing::info!(
                                         "[vct] adopt-populated: env \
                                          regenerated for {} project(s) \
                                          (binding newer than env file)",
@@ -1688,7 +1745,7 @@ pub fn run() {
                             // failed — the prefix-adopt step is best-
                             // effort; install.py --update is the
                             // canonical recovery path.
-                            eprintln!(
+                            tracing::warn!(
                                 "[vct] adopt-populated warning (non-fatal): {}",
                                 e
                             );
@@ -1747,7 +1804,7 @@ pub fn run() {
                     {
                         Ok(dropped) => {
                             if dropped > 0 {
-                                eprintln!(
+                                tracing::info!(
                                     "[vct] reconcile-kg-access (boot): dropped {} \
                                      orphan kg_collection_access rows",
                                     dropped
@@ -1761,7 +1818,7 @@ pub fn run() {
                             }
                         }
                         Err(e) => {
-                            eprintln!(
+                            tracing::warn!(
                                 "[vct] reconcile-kg-access warning (non-fatal): {}",
                                 e
                             );
@@ -1802,7 +1859,7 @@ pub fn run() {
                         commands::project_folder_health::default_folder_check,
                     );
                     if report.newly_missing > 0 || report.newly_returned > 0 {
-                        eprintln!(
+                        tracing::info!(
                             "[vct] folder-probe: newly_missing={} newly_returned={} \
                              unchanged_healthy={} unchanged_missing={} update_errors={}",
                             report.newly_missing,
@@ -1869,7 +1926,7 @@ pub fn run() {
                 let db_ref = app.state::<crate::db::Db>();
                 let report = commands::module_reconciler::reconcile_installed_modules(&db_ref);
                 if !report.broken.is_empty() {
-                    eprintln!(
+                    tracing::warn!(
                         "[vct] reconciler: {} module(s) marked broken (missing on-disk \
                          manifest): {:?}",
                         report.broken.len(),
@@ -1881,7 +1938,7 @@ pub fn run() {
                     // interrupted install (launcher restarted mid-pull)
                     // were auto-healed to 'error' so they stop spinning
                     // and become retry-eligible.
-                    eprintln!(
+                    tracing::warn!(
                         "[vct] reconciler: {} module(s) auto-healed from wedged \
                          'installing' to 'error' (interrupted install): {:?}",
                         report.healed_installing.len(),
@@ -1919,7 +1976,7 @@ pub fn run() {
 
             // System tray (v1.1)
             if let Err(e) = tray::setup(&app.handle()) {
-                eprintln!("[vct] tray setup failed: {}", e);
+                tracing::error!("[vct] tray setup failed: {}", e);
             }
             // Daily launcher self-update check. Honors `auto_check_enabled`
             // toggle in ~/.vct/launcher-update-state.json (default ON).
@@ -1949,7 +2006,7 @@ pub fn run() {
                 )
                 .await
                 {
-                    eprintln!("[vct] openai startup recheck warning (non-fatal): {}", e);
+                    tracing::warn!("[vct] openai startup recheck warning (non-fatal): {}", e);
                 }
             });
             // Auto-start the shared compose stack (Weaviate / Ollama /
@@ -2039,7 +2096,7 @@ pub fn run() {
                         // Locked / errored keychain: skip this poll cycle
                         // WITHOUT downgrading to free-tier classification.
                         Err(e) => {
-                            eprintln!(
+                            tracing::warn!(
                                 "[vct-launcher] weights poll skipped: keychain \
                                  {} (not a free-tier signal — the license may \
                                  still be valid; unlock the keychain to re-check)",
@@ -2145,7 +2202,7 @@ pub fn run() {
                     hub_status::HubStatus::Running { .. }
                 );
                 if stale && hub_reachable {
-                    eprintln!(
+                    tracing::warn!(
                         "[vct] v0.2.21 stale cutover sentinel (older than 60s + \
                          hub already running); auto-deleting and starting \
                          embedded services-watcher"
@@ -2155,7 +2212,7 @@ pub fn run() {
                 }
             }
             if cutover_sentinel_present {
-                eprintln!(
+                tracing::info!(
                     "[vct] v0.2.21 cutover sentinel detected at \
                      {}/v0.2.21-cutover.flag; skipping embedded \
                      services::watcher::spawn (vct-hub supervisor \
@@ -2242,7 +2299,7 @@ pub fn run() {
             if setup_swept + setup_resumed + cg_swept + cg_resumed
                 + kg_swept + kg_resumed + sum_swept + sum_resumed > 0
             {
-                eprintln!(
+                tracing::info!(
                     "[vct] resume-sweep: project-setup (running→failed: {}, pending respawned: {}); \
                      code-graph (running→failed: {}, pending respawned: {}); \
                      kg-sync (running→failed: {}, pending respawned: {}); \
@@ -2281,7 +2338,7 @@ pub fn run() {
                         || report.phantom_deferrals > 0
                         || report.access_rows_restored > 0
                     {
-                        eprintln!(
+                        tracing::info!(
                             "[vct] binding-reconcile (boot): bindings repaired: {}, \
                              phantom deferrals: {}, access rows restored: {}",
                             report.bindings_repaired,
@@ -2307,7 +2364,7 @@ pub fn run() {
                     None => {
                         // No Db state (should not happen — it is managed
                         // above). Defaults already sit in the cache.
-                        eprintln!(
+                        tracing::warn!(
                             "[vct] tray prefs: Db state unavailable at setup — \
                              using shipped defaults",
                         );
@@ -2319,7 +2376,7 @@ pub fn run() {
                 if prefs.start_minimized {
                     if let Some(w) = app.get_webview_window("main") {
                         let _ = w.hide();
-                        eprintln!(
+                        tracing::info!(
                             "[vct] tray prefs: started hidden (tray_start_minimized=true) — \
                              left-click the tray icon to open the window",
                         );
@@ -2334,6 +2391,18 @@ pub fn run() {
             // sailed through (the v0.2.89 launcher panicked in the resume
             // sweep and the log just... stopped). scripts/launcher-boot-smoke.sh
             // waits for this exact string as its pass criterion.
+            // The boot-smoke marker stays a DIRECT eprintln, byte-identical
+            // and last. scripts/launcher-boot-smoke.sh greps stderr for the
+            // exact string, and tests/test_v0291_binary_delivery_chain.py
+            // asserts the literal macro call below is present and that
+            // nothing but `Ok(())` follows it. Routing it through tracing
+            // would let a `logging.level` of warn/error silence the gate the
+            // release pipeline depends on.
+            //
+            // Do NOT repeat the marker text in a comment anywhere in this
+            // file: the test locates it with a plain `index()` on the
+            // literal, so a second copy in prose shadows the real one.
+            // [vct-print-contract]
             eprintln!("[vct] setup complete");
 
             Ok(())
@@ -2670,6 +2739,20 @@ pub fn run() {
             // now on the same DB→projection→env channel as its two siblings.
             commands::rl_settings::set_dual_embedding_arctic_secondary,
             commands::rl_settings::get_dual_embedding_arctic_secondary,
+            // v0.2.91 WP-L (decision #22): the same three flags, now with a
+            // HOST-WIDE default tier. The six commands above return/take a
+            // bare bool, which cannot say whether a value is this project's
+            // choice or an inherited default — these do. Both surfaces
+            // resolve through `Db::resolve_dual_flags`, so they cannot drift.
+            commands::dual_flags::get_dual_flags_state,
+            commands::dual_flags::set_dual_flag_for_project,
+            commands::dual_flags::get_dual_flags_global_defaults,
+            commands::dual_flags::set_dual_flag_global_default,
+            // v0.2.91 WP-L (decision #21): the machine-global diagnostic log
+            // level. Consumed by `crate::logging::apply_stored_level` (this
+            // process, live) and projected to every project as VCO_LOG_LEVEL.
+            commands::logging_prefs::get_logging_level,
+            commands::logging_prefs::set_logging_level,
             // v0.2.71: GUI-only per-project worktree-repo mode (T-WT) — the
             // subagent-git modal's create-local/adopt/opt-out choice.
             commands::worktree_repo_mode::set_worktree_repo_mode,
@@ -2683,6 +2766,12 @@ pub fn run() {
             // required. See `commands/module_dispatch.rs` for the
             // wire contract + trust surface notes.
             commands::module_dispatch::module_dispatch_action,
+            // v0.2.91 decision #24: the allow-query the renderer's LEGACY
+            // dispatch path (`ActionRef::Legacy(string)` — a manifest-
+            // supplied COMMAND NAME) consults before invoking. Same
+            // whitelist the declarative path enforces in-process, one
+            // home, no mirrored frontend list.
+            commands::module_dispatch::module_manifest_command_allowed,
             // v0.2.31: module-deprecation warning surface. Three layers
             // (GUI badge, env-var injection, audit table). The poller
             // for `runtime.update_endpoint` itself is deferred to v0.2.32 —
@@ -2722,9 +2811,13 @@ pub fn run() {
             commands::project_state_cmd::register_project_skill,
             commands::project_state_cmd::set_project_skill_enabled,
             commands::project_state_cmd::unregister_project_skill,
-            commands::project_state_cmd::register_project_hook,
-            commands::project_state_cmd::set_project_hook_enabled,
-            commands::project_state_cmd::unregister_project_hook,
+            // Hooks: the mutations edit `.claude/settings.json` (the file
+            // Claude Code actually reads) through the single Python writer,
+            // NOT the `project_hooks` mirror — v0.2.91 decision #27.
+            commands::project_hooks_settings::list_project_hooks_effective,
+            commands::project_hooks_settings::register_project_hook,
+            commands::project_hooks_settings::set_project_hook_enabled,
+            commands::project_hooks_settings::unregister_project_hook,
             commands::project_state_cmd::add_project_permission,
             commands::project_state_cmd::delete_project_permission,
             // 0.2.x backlog #5: per-project MCP toggle UI.
@@ -2769,12 +2862,23 @@ pub fn run() {
             commands::diagrams_cmd::set_project_module_enabled,
             commands::diagrams_cmd::list_project_modules,
             // v0.2.49 Stream B: per-project enable toggle for global-
-            // scope modules. The Svelte renderer calls
-            // `module_set_enabled_for_project` from the per-project
-            // Modules panel; `module_is_enabled_for_project` hydrates
-            // the toggle UI on mount. See `module_enabled.rs`.
+            // scope modules. Bare-bool surface, kept because it is
+            // shipped IPC — but it cannot express PROVENANCE and has no
+            // clear, so GUI code uses the v0.2.91 pair below instead.
+            // See `module_enabled.rs`.
             commands::module_enabled::module_set_enabled_for_project,
             commands::module_enabled::module_is_enabled_for_project,
+            // v0.2.91 decision #23 (F-3 / F-4): the tri-state per-project
+            // control. `module_set_enabled_for_project_v2` takes
+            // `Option<bool>` — None CLEARS the row (the way back to
+            // inheriting) — and `module_enable_state` reports which tier
+            // answered, so the control can say "off — host-wide default"
+            // rather than rendering an inherited value as a local choice.
+            // `module_clear_global_enabled` is the same way back at the
+            // host-wide tier. Same shape as WP-L's dual-flag commands.
+            commands::module_enabled::module_enable_state,
+            commands::module_enabled::module_set_enabled_for_project_v2,
+            commands::module_enabled::module_clear_global_enabled,
             // v0.2.52 V52-AD: host-wide (global) enable toggle that
             // shares the `module_settings` table with the per-project
             // toggle above. NULL `project_id` row == host default.
@@ -3336,13 +3440,13 @@ fn sweep_stale_binary_siblings(dist_dir: &std::path::Path) {
             continue;
         }
         if let Err(e) = std::fs::remove_file(&path) {
-            eprintln!(
+            tracing::warn!(
                 "[vct] boot sweep: could not delete stale sibling {}: {} (will retry next boot)",
                 path.display(),
                 e,
             );
         } else {
-            eprintln!(
+            tracing::info!(
                 "[vct] boot sweep: removed stale {} (pid {} no longer alive)",
                 path.display(),
                 pid,
@@ -3451,7 +3555,7 @@ fn process_install_path_seed(db: &db::Db, seed_path: &std::path::Path) -> bool {
     let raw = match std::fs::read_to_string(seed_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[vct] install-path seed at {} unreadable: {} \
                  (falling back to walk-up resolver)",
                 seed_path.display(),
@@ -3467,7 +3571,7 @@ fn process_install_path_seed(db: &db::Db, seed_path: &std::path::Path) -> bool {
         return false;
     }
     if !commands::installer::check_install_status(install_path.clone()) {
-        eprintln!(
+        tracing::warn!(
             "[vct] install-path seed at {} points at {} which does \
              not pass check_install_status — leaving DB unchanged. \
              The seed file will be retried on the next launcher boot.",
@@ -3482,14 +3586,14 @@ fn process_install_path_seed(db: &db::Db, seed_path: &std::path::Path) -> bool {
 
     // Promote: write the seed value into app_state.
     if let Err(e) = db.app_state_set(APP_STATE_KEY_INSTALL_PATH, &install_path) {
-        eprintln!(
+        tracing::warn!(
             "[vct] install-path seed: could not write {} to app_state: {} \
              (seed file left in place; will retry next boot)",
             install_path, e,
         );
         return false;
     }
-    eprintln!(
+    tracing::info!(
         "[vct] install-path seed: promoted {} to app_state from {}",
         install_path,
         seed_path.display(),
@@ -3497,7 +3601,7 @@ fn process_install_path_seed(db: &db::Db, seed_path: &std::path::Path) -> bool {
 
     // Delete the seed file so it doesn't shadow a future GUI override.
     if let Err(e) = std::fs::remove_file(seed_path) {
-        eprintln!(
+        tracing::warn!(
             "[vct] install-path seed: app_state updated but seed file \
              {} could not be removed: {} \
              (next boot will see the cache warm and skip the seed)",

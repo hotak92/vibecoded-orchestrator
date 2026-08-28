@@ -220,7 +220,9 @@ pub fn router() -> Router<LauncherDbHandle> {
 use crate::http_error::error_response;
 
 fn db_error_response(context: &str, raw: String) -> axum::response::Response {
-    eprintln!("[vct-hub] {} failed: {}", context, raw);
+    // The response body deliberately omits `raw` (it can carry SQL / path
+    // detail); the log line is where the cause lives, so it must survive.
+    tracing::error!(context = %context, error = %raw, "[vct-hub] db operation failed");
     error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal_error",
@@ -747,43 +749,32 @@ async fn project_config(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // 7a-bis. T-B-flags dual-write + dual-log flags (v0.2.71 — module_settings).
-    // Same `get_setting(...).as_bool().unwrap_or(false)` shape as the gates
-    // above. dual_embedding_write_all_slots lives under `orchestrator-core`
-    // (an orchestrator-wide indexing concern); dual_rl_log_enabled lives
-    // under `vct-rl-reranker` (RL-specific logging). Both default false on a
-    // missing row (opt-in), matching the GUI's pre-unchecked checkboxes and
-    // the setter helper's `unwrap_or(false)` contract.
+    // 7a-bis. T-B-flags dual-write + dual-log + arctic-secondary flags
+    // (v0.2.71 / v0.2.88 — module_settings).
     //
-    // The setter (`commands/rl_settings.rs::set_dual_rl_log_enabled`)
-    // force-enables dual_embedding_write_all_slots when dual_rl_log_enabled
-    // is turned on, so the (log=true, write=false) pair is unreachable in
-    // the DB — this resolver reads the two rows independently and trusts
-    // that invariant rather than re-deriving it.
-    let dual_embedding_write_all_slots = h
-        .0
-        .get_setting(&project.id, "orchestrator-core", "dual_embedding_write_all_slots")
-        .ok()
-        .flatten()
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let dual_rl_log_enabled = h
-        .0
-        .get_setting(&project.id, "vct-rl-reranker", "dual_rl_log_enabled")
-        .ok()
-        .flatten()
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    // v0.2.88 (DEFECT 5): third dual-write flag — the secondary arctic slot.
-    // Orchestrator-core scope like write_all_slots; independent (no cascade).
-    // Read on the same channel so the hub fetch + the Python projection agree.
-    let dual_embedding_arctic_secondary = h
-        .0
-        .get_setting(&project.id, "orchestrator-core", "dual_embedding_arctic_secondary")
-        .ok()
-        .flatten()
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // v0.2.91 WP-L (plan decision #22): these three flags gained an
+    // INSTALL-WIDE default tier in `app_state`, so the old
+    // `get_setting(...).as_bool().unwrap_or(false)` shape is no longer
+    // correct — it collapses "no per-project row" into `false` and would
+    // make the hub disagree with the GUI the moment a host-wide default is
+    // on. The cascade (explicit row wins in BOTH directions → host-wide
+    // default → false, then the log⟹write clamp on the RESOLVED values)
+    // lives in ONE place, `vct_launcher_core::db::settings::resolve_dual_flags`,
+    // which this resolver calls directly (same crate — a shared function,
+    // not a mirror).
+    //
+    // The Python env projection
+    // (`vco_lib/config_projection.py::_resolve_dual_flags_cascade`) IS a
+    // mirror of that function and must stay byte-identical to it; the lock
+    // is `tests/test_dual_flags_cascade_parity_v0291.py`.
+    //
+    // Note the clamp is re-derived here rather than trusted from the setter:
+    // a host-wide log default meeting an explicit per-project write=false is
+    // a cross-tier incoherence no single-tier setter can prevent.
+    let dual_flags = h.0.resolve_dual_flags(&project.id);
+    let dual_embedding_write_all_slots = dual_flags.write_all_slots.effective;
+    let dual_rl_log_enabled = dual_flags.rl_log.effective;
+    let dual_embedding_arctic_secondary = dual_flags.arctic_secondary.effective;
 
     // 7b. RL Reranker per-project flags (v0.2.40 R2 — module_settings →
     // vct-rl-reranker). Same shape as the orchestrator-core read above;
@@ -875,9 +866,12 @@ async fn project_config(
         match h.0.get_project_rl_port(&project.id) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "[vct-hub] config_api: get_project_rl_port({}) failed: {}; returning None",
-                    project.id, e
+                // Soft-fail degrade: the resolver still answers, without an
+                // RL port. WARN, not ERROR — the request succeeds.
+                tracing::warn!(
+                    project_id = %project.id,
+                    error = %e,
+                    "[vct-hub] config_api: get_project_rl_port failed; returning None",
                 );
                 None
             }
@@ -1070,13 +1064,16 @@ async fn project_config(
                 Ok(prefix) => prefix,
                 Err(e) => {
                     let fallback = sanitize_collection_prefix(&project.slug);
-                    eprintln!(
+                    // The comment above promises a WARNING here; keep it one.
+                    tracing::warn!(
+                        project_name = %project.name,
+                        error = %e,
+                        fallback = %fallback,
                         "[vct-hub config_api] code-graph prefix fallback: \
-                         canonical_class_prefix({:?}) rejected ({}); using \
-                         slug-sanitised placeholder {:?} — this diverges from \
-                         the analyzer's write prefix, so cross-check the project \
-                         name if code-graph reads return nothing",
-                        project.name, e, fallback
+                         canonical_class_prefix rejected the project name; using a \
+                         slug-sanitised placeholder — this diverges from the \
+                         analyzer's write prefix, so cross-check the project name \
+                         if code-graph reads return nothing",
                     );
                     fallback
                 }
@@ -1097,7 +1094,9 @@ async fn project_config(
         |class| crate::weaviate_schema_probe::class_exists(&probe_weaviate_url, class),
     );
     for w in &warnings {
-        eprintln!("[vct-hub] WARNING: {}", w);
+        // Phantom-name validation findings. They ride in the response too;
+        // this is the operator-visible copy.
+        tracing::warn!(warning = %w, "[vct-hub] phantom-name validation");
     }
 
     // KG access list: filter access_level='none' out, add own
@@ -1209,9 +1208,13 @@ async fn project_config(
                 })
                 .collect(),
             Err(e) => {
-                eprintln!(
-                    "[vct-hub config_api] list_enabled_codegraph_extras failed for project {}: {} (returning empty)",
-                    project.id, e
+                // Soft-fail degrade: the resolver answers with no extra paths
+                // rather than failing the whole /config request.
+                tracing::warn!(
+                    project_id = %project.id,
+                    error = %e,
+                    "[vct-hub config_api] list_enabled_codegraph_extras failed; \
+                     returning empty",
                 );
                 Vec::new()
             }
@@ -3561,6 +3564,116 @@ kg_tier_full = 0.8
             Some(true),
             "dependency: dual-log on requires dual-write on; body={}",
             body,
+        );
+    }
+
+    // ─── v0.2.91 WP-L: host-wide dual-flag defaults reach the hub ───────
+
+    /// A project with NO per-project rows inherits the host-wide defaults.
+    /// Pre-WP-L the resolver read `unwrap_or(false)` per row, so this body
+    /// came back all-false — the hub silently disagreeing with the GUI.
+    #[tokio::test]
+    async fn config_inherits_host_wide_dual_defaults_when_no_project_row() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-dual-global", "myproject");
+
+        // Mirror the global panel's setter (log ⟹ write cascade included).
+        h.0.set_dual_flag_global_default(
+            vct_launcher_core::db::settings::DualFlag::RlLog,
+            true,
+        )
+        .unwrap();
+        h.0.set_dual_flag_global_default(
+            vct_launcher_core::db::settings::DualFlag::ArcticSecondary,
+            true,
+        )
+        .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/p-dual-global/config", base))
+            .await
+            .expect("hub reachable");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        for key in [
+            "dual_embedding_write_all_slots",
+            "dual_rl_log_enabled",
+            "dual_embedding_arctic_secondary",
+        ] {
+            assert_eq!(
+                body.get(key).and_then(|v| v.as_bool()),
+                Some(true),
+                "{key} must inherit the host-wide default; body={body}",
+            );
+        }
+    }
+
+    /// An explicit per-project `false` beats a host-wide `true` — in the
+    /// hub, not just in the GUI. This is the direction a `unwrap_or(global)`
+    /// resolver written over `bool` (rather than `Option<bool>`) gets wrong.
+    #[tokio::test]
+    async fn config_explicit_project_false_beats_host_wide_true() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-dual-optout", "myproject");
+
+        h.0.set_dual_flag_global_default(
+            vct_launcher_core::db::settings::DualFlag::ArcticSecondary,
+            true,
+        )
+        .unwrap();
+        h.0.set_setting(
+            "p-dual-optout",
+            "orchestrator-core",
+            "dual_embedding_arctic_secondary",
+            &serde_json::Value::Bool(false),
+        )
+        .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/p-dual-optout/config", base))
+            .await
+            .expect("hub reachable");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("dual_embedding_arctic_secondary").and_then(|v| v.as_bool()),
+            Some(false),
+            "an explicit per-project opt-out must survive a host-wide ON; body={body}",
+        );
+    }
+
+    /// The CROSS-TIER clamp, at the hub: a host-wide log default meeting an
+    /// explicit per-project `write = false` must resolve the log OFF. The
+    /// per-project setter cannot prevent this pair, so the resolver must.
+    #[tokio::test]
+    async fn config_clamps_inherited_rl_log_to_the_project_write_flag() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-dual-clamp", "myproject");
+
+        h.0.set_dual_flag_global_default(
+            vct_launcher_core::db::settings::DualFlag::RlLog,
+            true,
+        )
+        .unwrap();
+        // Raw row write (not the cascading setter) so the project tier really
+        // holds an explicit write=false under a host-wide log=true.
+        h.0.set_setting(
+            "p-dual-clamp",
+            "orchestrator-core",
+            "dual_embedding_write_all_slots",
+            &serde_json::Value::Bool(false),
+        )
+        .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/p-dual-clamp/config", base))
+            .await
+            .expect("hub reachable");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("dual_embedding_write_all_slots").and_then(|v| v.as_bool()),
+            Some(false),
+        );
+        assert_eq!(
+            body.get("dual_rl_log_enabled").and_then(|v| v.as_bool()),
+            Some(false),
+            "the hub must never emit the incoherent (log=true, write=false) \
+             pair; body={body}",
         );
     }
 

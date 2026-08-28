@@ -25,6 +25,11 @@ pub mod chunker_revision_deferral;
 pub mod coordination;
 pub mod dashboard;
 pub mod desktop_shortcut;
+// v0.2.91 WP-L (decision #22): the three dual embedding / RL-logging flags
+// once they gained a host-wide default tier. The six per-project-only
+// commands in `rl_settings` stay registered; both surfaces resolve through
+// `vct_launcher_core::db::settings::resolve_dual_flags`.
+pub mod dual_flags;
 // Phase 1.1 of the diagrams (Mermaid + Excalidraw) integration plan
 // (.claude/context/plans/diagrams-integration-excalidraw-mermaid-2026-05-24.md).
 // Sibling Phase 1.2/1.3/1.5 agents stub these command names — keep
@@ -80,6 +85,10 @@ pub mod kg_sync;
 pub mod kg_summary;
 pub mod lifecycle;
 pub mod licensing;
+// v0.2.91 WP-L (decision #21): the machine-global diagnostic log level
+// preference. Writes app_state `logging.level` — the key
+// `vct_launcher_core::logging` resolves and `crate::logging` applies.
+pub mod logging_prefs;
 pub mod maintenance;
 pub mod manifest;
 // v0.2.33 Agent A (L0): public-catalog endpoint client. Fetches paid-module
@@ -170,6 +179,13 @@ pub mod project_setup;
 // (`read_project_folder_missing_flags`) the frontend consumes to render
 // a non-blocking warning banner on each affected project card.
 pub mod project_folder_health;
+// v0.2.91 decision #27: hook enable/disable/register/unregister edit the
+// project's `.claude/settings.json` hooks block — the file Claude Code's hook
+// engine actually reads — through the single writer
+// `python -m vco_lib.hooks_settings`. Before this the Hooks tab wrote only
+// `project_hooks` rows, which nothing reads (review
+// v0291-wave5-phase2-ux-completeness, P2-B2).
+pub mod project_hooks_settings;
 pub mod project_state_cmd;
 pub mod project_state_populate;
 pub mod restart;
@@ -196,6 +212,11 @@ pub mod secret_value_shape;
 pub mod secrets_cmd;
 pub mod secrets_import;
 pub mod self_update;
+// v0.2.91 decision #26: named process-wide single-flight guard. Refuses (does
+// NOT queue) a second concurrent run of a long-running destructive command —
+// `update_all_projects` and `update_orchestrator_at` today. Lives in its own
+// file rather than inside either 12k-line command module.
+pub mod single_flight;
 pub mod storage_ux;
 pub mod telemetry_cmd;
 // V52-AI (v0.2.52): MCP fork-bomb mitigation. Lockfile at

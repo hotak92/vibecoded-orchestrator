@@ -48,6 +48,7 @@
 use tauri::{command, AppHandle, Emitter, State};
 
 use crate::db::Db;
+use vct_launcher_core::db::settings::ModuleEnableState;
 use vct_launcher_core::manifest::ModuleManifest;
 
 /// Tauri event name used to notify the Svelte renderer that a module's
@@ -117,7 +118,7 @@ pub async fn module_set_enabled_for_project(
         enabled,
     };
     if let Err(e) = app.emit(MODULE_ENABLED_EVENT, payload) {
-        eprintln!(
+        tracing::warn!(
             "[module_enabled] emit({}) failed for ({}, {}): {}",
             MODULE_ENABLED_EVENT, project_id, module_id, e
         );
@@ -201,7 +202,7 @@ pub async fn module_set_global_enabled(
         enabled,
     };
     if let Err(e) = app.emit(MODULE_ENABLED_EVENT, payload) {
-        eprintln!(
+        tracing::warn!(
             "[module_enabled] emit({}) failed for global flip ({}): {}",
             MODULE_ENABLED_EVENT, module_id, e
         );
@@ -226,9 +227,13 @@ pub async fn module_is_global_enabled(
 /// Read the effective enable flag for a (project, module) pair using
 /// the v0.2.52 V52-AD cascade (per-project → global → fail-open true).
 /// This is the value the hub resolver emits as
-/// `rl_reranker_enabled_for_project`; the renderer reads it to display
-/// the "Effective state" indicator above the per-project + global
-/// switches.
+/// `rl_reranker_enabled_for_project`.
+///
+/// GUI code should call [`module_enable_state`] instead: this returns a
+/// bare bool, which cannot say WHICH tier answered, and a control rendered
+/// from it is the lying-toggle shape (F-3/F-4/F-22). Kept because it is a
+/// shipped IPC surface and the cheapest read for a caller that only needs
+/// the answer.
 #[command]
 pub async fn module_effective_enabled(
     project_id: String,
@@ -236,6 +241,194 @@ pub async fn module_effective_enabled(
     db: State<'_, Db>,
 ) -> Result<bool, String> {
     db.module_effective_enabled(&project_id, &module_id)
+}
+
+// ─── v0.2.91 decision #23 — the tri-state per-project control ────────────
+//
+// F-3: the only per-project module control a user could click wrote
+// `module_installs.enabled`, which the RL gate NEVER reads — unchecking
+// "Enabled" on the RL tile flipped a checkbox, toasted success, and changed
+// nothing about reranking. F-4: the host-wide panel could never return to
+// "no override set" once clicked, at EITHER layer.
+//
+// Both are the same defect in two places: a control that cannot express, or
+// cannot re-enter, a state the backend genuinely has. The fix is WP-L's
+// shape, reused rather than reinvented — a setter that takes `Option<bool>`
+// (None = CLEAR) and returns the RE-RESOLVED state so the GUI renders from
+// truth instead of from what it optimistically asked for.
+//
+// Routing (unchanged design, now actually honoured by the GUI): for
+// PROJECT-scope modules `module_installs.enabled` remains the gate; for
+// GLOBAL-scope modules it is this key. See the DB-layer docstring at
+// `vct_launcher_core::db::settings::MODULE_ENABLED_FOR_PROJECT_KEY`.
+//
+// SCOPE OF THE GATE (plan §F #25): reranking. Never telemetry collection —
+// the hub's rl-events ingest consults none of this.
+
+/// Read the resolved enable state of one module for one project, WITH
+/// provenance (`explicit` / `global_default` / `effective` / `source`).
+///
+/// One round trip for the whole control. `effective` is the same value
+/// [`module_effective_enabled`] returns, by construction — pinned by
+/// `resolve_module_enable_matches_effective` in the DB layer.
+#[command]
+pub async fn module_enable_state(
+    project_id: String,
+    module_id: String,
+    db: State<'_, Db>,
+) -> Result<ModuleEnableState, String> {
+    if project_id.trim().is_empty() {
+        return Err("module_enable_state: project_id required".to_string());
+    }
+    if module_id.trim().is_empty() {
+        return Err("module_enable_state: module_id required".to_string());
+    }
+    db.resolve_module_enable(&project_id, &module_id)
+}
+
+/// Free-function core of [`module_set_enabled_for_project_v2`] — argument
+/// guards, the write-or-clear, the audit row, and the re-resolve. No Tauri
+/// runtime needed, so every branch is unit-testable.
+///
+/// The unknown-project guard runs BEFORE the write: returning a clear error
+/// here beats the opaque `FOREIGN KEY constraint failed` the `set_setting`
+/// INSERT would otherwise surface.
+pub fn set_module_enabled_for_project_v2_with_db(
+    db: &Db,
+    project_id: &str,
+    module_id: &str,
+    value: Option<bool>,
+) -> Result<ModuleEnableState, String> {
+    if db.get_project(project_id)?.is_none() {
+        return Err(format!(
+            "project {} not found; cannot set module enable flag",
+            project_id
+        ));
+    }
+    if module_id.trim().is_empty() {
+        return Err("module_id must not be empty".to_string());
+    }
+
+    db.module_write_enabled_for_project(project_id, module_id, value)?;
+
+    db.audit(
+        "module_enabled_for_project_changed",
+        Some(project_id),
+        Some(module_id),
+        &serde_json::json!({
+            // `null` means the override was CLEARED — distinguishable from
+            // an explicit false in the forensic trace, which is the whole
+            // point of the third state.
+            "enabled": value,
+            "cleared": value.is_none(),
+        }),
+    )?;
+
+    db.resolve_module_enable(project_id, module_id)
+}
+
+/// Set — or CLEAR — the per-project enable flag for a (global-scope) module.
+///
+/// `value = None` DELETES the per-project row, returning the project to
+/// following the host-wide default. That is a first-class value, not an edge
+/// case: without it the control is a one-way door (F-4's shape at the
+/// per-project layer).
+///
+/// Returns the re-resolved state. Auth/permission model + audit + renderer
+/// notification are identical to [`module_set_enabled_for_project`]; the
+/// event payload carries the EFFECTIVE value so a listener that only wants
+/// "is it on now?" needs no follow-up read.
+///
+/// Guards + write + audit live in the free-function core
+/// [`set_module_enabled_for_project_v2_with_db`] so they are unit-testable
+/// without a Tauri runtime (the same split WP-L used for
+/// `set_dual_flag_global_default_with_db`). Only the emit is left here.
+#[command]
+pub async fn module_set_enabled_for_project_v2(
+    project_id: String,
+    module_id: String,
+    value: Option<bool>,
+    db: State<'_, Db>,
+    app: AppHandle,
+) -> Result<ModuleEnableState, String> {
+    let state = set_module_enabled_for_project_v2_with_db(&db, &project_id, &module_id, value)?;
+
+    let payload = ModuleEnabledChangedEvent {
+        project_id: project_id.clone(),
+        module_id: module_id.clone(),
+        enabled: state.effective,
+    };
+    if let Err(e) = app.emit(MODULE_ENABLED_EVENT, payload) {
+        tracing::warn!(
+            "[module_enabled] emit({}) failed for ({}, {}): {}",
+            MODULE_ENABLED_EVENT, project_id, module_id, e
+        );
+    }
+
+    Ok(state)
+}
+
+/// Clear the GLOBAL (host-wide) enable row for a module — the way back to
+/// "no host-wide override set" (F-4).
+///
+/// Per-project overrides are untouched (only the `project_id IS NULL` row is
+/// removed); the uninstall-time `module_clear_enabled_for_project_all` is
+/// the one that wipes everything. Idempotent.
+///
+/// Returns the host-wide value AFTER the clear — always `None`. The GUI
+/// re-renders from it rather than assuming.
+///
+/// Core split out for the same reason as the per-project setter: testable
+/// without a Tauri runtime.
+pub fn clear_global_enabled_with_db(
+    db: &Db,
+    module_id: &str,
+) -> Result<Option<bool>, String> {
+    if module_id.trim().is_empty() {
+        return Err("module_id must not be empty".to_string());
+    }
+
+    let removed = db.module_clear_global_enabled(module_id)?;
+
+    db.audit(
+        "module_global_enabled_changed",
+        None,
+        Some(module_id),
+        &serde_json::json!({
+            "enabled": serde_json::Value::Null,
+            "cleared": true,
+            "rows_removed": removed,
+            "scope": "global",
+        }),
+    )?;
+
+    Ok(db.module_global_enabled(module_id)?)
+}
+
+#[command]
+pub async fn module_clear_global_enabled(
+    module_id: String,
+    db: State<'_, Db>,
+    app: AppHandle,
+) -> Result<Option<bool>, String> {
+    clear_global_enabled_with_db(&db, &module_id)?;
+
+    // Same channel as the two setters — every project inheriting the
+    // host-wide row now resolves differently, so every mounted panel needs
+    // the redraw. `enabled` carries the post-clear system default.
+    let payload = ModuleEnabledChangedEvent {
+        project_id: GLOBAL_PROJECT_SENTINEL.to_string(),
+        module_id: module_id.clone(),
+        enabled: true,
+    };
+    if let Err(e) = app.emit(MODULE_ENABLED_EVENT, payload) {
+        tracing::warn!(
+            "[module_enabled] emit({}) failed for global clear ({}): {}",
+            MODULE_ENABLED_EVENT, module_id, e
+        );
+    }
+
+    Ok(None)
 }
 
 // ─── v0.2.52 V52-AD — RL training-data accumulator query ───────────────
@@ -315,7 +508,7 @@ pub fn probe_rl_auto_enable_at_boot(
     let count = match count_result {
         Ok(n) => n,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[rl-auto-enable] rl_events probe failed (table likely \
                  missing): {}",
                 e
@@ -337,7 +530,7 @@ pub fn probe_rl_auto_enable_at_boot(
     let global = match db.module_global_enabled("vct-rl-reranker") {
         Ok(g) => g,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[rl-auto-enable] module_global_enabled probe failed: {}",
                 e
             );
@@ -355,12 +548,12 @@ pub fn probe_rl_auto_enable_at_boot(
                 module_id: "vct-rl-reranker".to_string(),
             };
             if let Err(e) = app.emit(RL_AUTO_ENABLE_EVENT, payload) {
-                eprintln!(
+                tracing::warn!(
                     "[rl-auto-enable] emit({}) failed: {}",
                     RL_AUTO_ENABLE_EVENT, e
                 );
             } else {
-                eprintln!(
+                tracing::info!(
                     "[rl-auto-enable] threshold met ({} >= {}) and \
                      global default still disabled — prompting user.",
                     count, RL_AUTO_ENABLE_EVENT_THRESHOLD
@@ -432,7 +625,7 @@ pub fn seed_enabled_rows_for_new_project(db: &Db, project_id: &str) -> usize {
     let all_projects = match db.list_projects() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!(
+            tracing::error!(
                 "[module_enabled] seed_enabled_rows_for_new_project({}): \
                  list_projects failed: {}",
                 project_id, e
@@ -454,7 +647,7 @@ pub fn seed_enabled_rows_for_new_project(db: &Db, project_id: &str) -> usize {
         let installs = match db.list_module_installs_for_project(&other_project.id) {
             Ok(rows) => rows,
             Err(e) => {
-                eprintln!(
+                tracing::error!(
                     "[module_enabled] seed_enabled_rows_for_new_project({}): \
                      list_module_installs_for_project({}) failed: {}",
                     project_id, other_project.id, e
@@ -476,7 +669,7 @@ pub fn seed_enabled_rows_for_new_project(db: &Db, project_id: &str) -> usize {
                         &row.module_id,
                         true,
                     ) {
-                        eprintln!(
+                        tracing::error!(
                             "[module_enabled] seed_enabled_rows_for_new_project({}, {}): \
                              write failed: {}",
                             project_id, row.module_id, e
@@ -518,7 +711,7 @@ pub fn seed_enabled_rows_for_new_global_module(
     let projects = match db.list_projects() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!(
+            tracing::error!(
                 "[module_enabled] seed_enabled_rows_for_new_global_module({}): \
                  list_projects failed: {}",
                 module_id, e
@@ -530,7 +723,7 @@ pub fn seed_enabled_rows_for_new_global_module(
     let mut seeded = 0usize;
     for project in &projects {
         if let Err(e) = db.module_set_enabled_for_project(&project.id, module_id, true) {
-            eprintln!(
+            tracing::error!(
                 "[module_enabled] seed_enabled_rows_for_new_global_module({}, {}): \
                  write failed: {}",
                 project.id, module_id, e
@@ -554,7 +747,7 @@ pub fn clear_enabled_rows_for_uninstalled_module(db: &Db, module_id: &str) -> us
     match db.module_clear_enabled_for_project_all(module_id) {
         Ok(n) => n,
         Err(e) => {
-            eprintln!(
+            tracing::error!(
                 "[module_enabled] clear_enabled_rows_for_uninstalled_module({}): \
                  delete failed: {}",
                 module_id, e
@@ -696,5 +889,124 @@ mod tests {
         assert!(db
             .module_is_enabled_for_project("p2", "vct-rl-reranker")
             .unwrap());
+    }
+
+    // ─── v0.2.91 decision #23 — command-layer contracts ──────────────
+    //
+    // The cascade itself is tested in vct-launcher-core. What is tested
+    // HERE is what this layer owns: the argument guards, and the fact
+    // that the audit trail can tell a CLEAR apart from an explicit off
+    // (without that, the third state is invisible to forensics even
+    // though it is visible in the GUI). The Tauri wrappers need an
+    // AppHandle to emit on, so — following this file's existing pattern
+    // for `probe_rl_auto_enable_at_boot` — the emit stays uncovered at
+    // the unit level and the decisions are driven against `&Db`.
+
+    use vct_launcher_core::db::settings::ModuleEnableSource;
+
+    /// The whole tri-state walk through the command core: inherit → on →
+    /// back to inherit, then the host-wide clear. Every step asserts the
+    /// state the command RETURNS (which is what the control re-renders
+    /// from), not just the row.
+    #[test]
+    fn tri_state_round_trip_through_the_command_core() {
+        let db = mkdb();
+        mkproject(&db, "p1", "p1");
+        db.module_set_global_enabled("vct-rl-reranker", false).unwrap();
+
+        // Explicit on for this project — beats the host-wide off.
+        let st =
+            set_module_enabled_for_project_v2_with_db(&db, "p1", "vct-rl-reranker", Some(true))
+                .expect("write must succeed");
+        assert_eq!(st.explicit, Some(true));
+        assert_eq!(st.source, ModuleEnableSource::Project);
+        assert!(st.effective);
+
+        // Back to inheriting — the state that had no way back before #23.
+        let st = set_module_enabled_for_project_v2_with_db(&db, "p1", "vct-rl-reranker", None)
+            .expect("clear must succeed");
+        assert_eq!(st.explicit, None, "the row is gone, not set to a value");
+        assert_eq!(st.source, ModuleEnableSource::GlobalDefault);
+        assert!(!st.effective, "now following the host-wide off");
+
+        // And the host-wide clear leaves the fail-open system default.
+        assert_eq!(
+            clear_global_enabled_with_db(&db, "vct-rl-reranker").expect("clear"),
+            None,
+        );
+        let st = db.resolve_module_enable("p1", "vct-rl-reranker").unwrap();
+        assert_eq!(st.source, ModuleEnableSource::SystemDefault);
+        assert!(st.effective, "fail-open when nothing is set anywhere");
+    }
+
+    /// The audit trail can tell a CLEAR apart from an explicit off. Without
+    /// this the third state is invisible to forensics even though it is
+    /// visible in the GUI. Read back from the audit table the core writes.
+    #[test]
+    fn audit_row_distinguishes_clear_from_explicit_off() {
+        let db = mkdb();
+        mkproject(&db, "p1", "p1");
+
+        set_module_enabled_for_project_v2_with_db(&db, "p1", "vct-rl-reranker", Some(false))
+            .unwrap();
+        set_module_enabled_for_project_v2_with_db(&db, "p1", "vct-rl-reranker", None).unwrap();
+
+        let guard = db.lock();
+        let mut stmt = guard
+            .prepare(
+                "SELECT detail FROM audit_log
+                  WHERE operation = 'module_enabled_for_project_changed'
+               ORDER BY id ASC",
+            )
+            .expect("prepare");
+        let rows: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("query")
+            .map(|r| r.expect("row"))
+            .collect();
+        drop(stmt);
+        drop(guard);
+
+        assert_eq!(rows.len(), 2, "one audit row per write");
+        let first: serde_json::Value = serde_json::from_str(&rows[0]).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&rows[1]).unwrap();
+        assert_eq!(first["enabled"], serde_json::json!(false));
+        assert_eq!(first["cleared"], serde_json::json!(false));
+        assert_eq!(second["enabled"], serde_json::Value::Null);
+        assert_eq!(second["cleared"], serde_json::json!(true));
+    }
+
+    /// Guards, both refusing branches. An unknown project is refused with a
+    /// clear message BEFORE any write (rather than surfacing the opaque
+    /// FK-violation cascade), and an empty module id never writes an orphan
+    /// row the cleanup helpers could not find again.
+    #[test]
+    fn command_core_guards_refuse_and_write_nothing() {
+        let db = mkdb();
+        mkproject(&db, "p1", "p1");
+
+        let err = set_module_enabled_for_project_v2_with_db(
+            &db, "ghost", "vct-rl-reranker", Some(true),
+        )
+        .expect_err("unknown project must be refused");
+        assert!(err.contains("not found"), "unhelpful message: {err}");
+        assert!(db
+            .list_module_settings("ghost", "vct-rl-reranker")
+            .unwrap()
+            .is_empty());
+
+        let err = set_module_enabled_for_project_v2_with_db(&db, "p1", "   ", Some(true))
+            .expect_err("empty module_id must be refused");
+        assert!(err.contains("module_id"), "unhelpful message: {err}");
+        assert!(clear_global_enabled_with_db(&db, "").is_err());
+
+        // Leave-alone half: the real project/module pair still writes.
+        assert!(
+            set_module_enabled_for_project_v2_with_db(
+                &db, "p1", "vct-rl-reranker", Some(true)
+            )
+            .expect("valid write must succeed")
+            .effective
+        );
     }
 }

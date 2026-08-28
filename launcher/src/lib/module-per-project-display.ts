@@ -232,7 +232,10 @@ export function resolvePerProjectBadge(
         kind: 'enabled-globally',
         label: 'Installed globally',
         tooltip:
-          'This module is installed once on this machine and available to every project. Per-project opt-out is on the module dashboard.',
+          // v0.2.91 (#23): the old wording sent users to "the module
+          // dashboard" for the per-project opt-out. No such control existed
+          // there — or anywhere (F-3). It exists now, on this tile.
+          'This module is installed once on this machine and available to every project. Use the On / Off / Use host-wide default control on this tile to set it for this project.',
       };
     }
     return {

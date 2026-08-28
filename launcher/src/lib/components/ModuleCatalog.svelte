@@ -11,7 +11,7 @@
   //   Rust backend emits a single `module://install-complete` event; we
   //   currently render a busy spinner while waiting.
 
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { goto } from '$app/navigation';
   import { modules, installedIds } from '$lib/stores/modules';
@@ -62,6 +62,28 @@
     resolvePerProjectBadge,
     perProjectBadgeClass,
   } from '$lib/module-per-project-display';
+  // v0.2.91 decision #23 (F-3): the per-project enable control must drive
+  // the mechanism that matches the module's install SCOPE. For a
+  // global-scope module (one host-wide install row shared by every project)
+  // the gate the MCP consults is `module_settings.enabled_for_project`,
+  // resolved through a three-tier cascade — NOT `module_installs.enabled`,
+  // which the checkbox below writes and which that gate never reads. So a
+  // global-scope tile renders the tri-state cascade control instead, and
+  // only project-scope tiles keep the checkbox. Decision logic + copy live
+  // in `$lib/module-enable` (pure ⇒ unit-tested; this file is markup).
+  import {
+    MODULE_TRI_CHOICE_LABELS,
+    dormantNotice,
+    moduleBadgeFor,
+    moduleEffectiveLine,
+    moduleTriChoiceFor,
+    moduleTriChoiceToValue,
+    installedTileUsesCascade,
+    showsProjectSettingControl,
+    type ModuleEnableState,
+    type ModuleTriChoice,
+  } from '$lib/module-enable';
+  import { listen as tauriListen } from '$lib/tauri';
 
   type Filter = 'all' | 'free' | 'pro' | 'installed';
 
@@ -108,11 +130,118 @@
   const installed = $derived($installedIds);
   const tier = $derived($license.cache?.orchestrator_tier ?? 'free');
 
+  // ─── v0.2.91 decision #23 — global-scope enable state, per project ────
+  //
+  // Resolved cascade state (explicit / host-wide / effective + provenance)
+  // keyed by module_id, for the installed GLOBAL-scope modules only. Absent
+  // key = not loaded (or the read failed); the control renders a disabled
+  // placeholder rather than guessing a position, because guessing is what
+  // makes an inherited value read as a local choice.
+  let enableStates = $state<Record<string, ModuleEnableState>>({});
+  let enableBusy = $state<string | null>(null);
+  let unlistenEnable: (() => void) | undefined;
+
+  /**
+   * The global-scope modules whose control needs cascade state.
+   *
+   * Keyed off the CATALOG (host-wide install signal), not off
+   * `installedIds` — a global module's single install row has
+   * `project_id IS NULL`, so it is absent from this project's installed
+   * list even though it is installed and gateable. See
+   * `showsProjectSettingControl`.
+   */
+  function globalScopeInstalledIds(): string[] {
+    return mState.catalog
+      .filter(
+        (m) =>
+          // Union of BOTH places the control can render: the "available"
+          // tile of a host-wide install, and the "installed" tile of a
+          // global-scope module that also has a per-project row. Loading
+          // state for a superset is cheap; a control whose state never
+          // loaded renders permanently disabled, which is worse.
+          showsProjectSettingControl(m) ||
+          (installedTileUsesCascade(m) && installed.has(m.id)),
+      )
+      .map((m) => m.id);
+  }
+
+  /**
+   * Refresh the cascade state for every global-scope installed module.
+   * Soft-fail per module: one failed read leaves that control in its
+   * placeholder state instead of blanking the tile (the same posture as
+   * `RlRerankerStatusPanel`'s independent reads).
+   */
+  async function loadEnableStates() {
+    if (!project) {
+      enableStates = {};
+      return;
+    }
+    const ids = globalScopeInstalledIds();
+    const next: Record<string, ModuleEnableState> = {};
+    await Promise.all(
+      ids.map(async (moduleId) => {
+        try {
+          next[moduleId] = await invoke<ModuleEnableState>('module_enable_state', {
+            projectId: project.id,
+            moduleId,
+          });
+        } catch (e) {
+          console.warn(`[ModuleCatalog] module_enable_state(${moduleId}) failed:`, e);
+        }
+      }),
+    );
+    enableStates = next;
+  }
+
+  /**
+   * Write (or CLEAR) this project's override. The backend returns the
+   * RE-RESOLVED state; render from that, never from the requested value —
+   * the requested value cannot say which tier ends up answering.
+   */
+  async function chooseEnable(moduleId: string, choice: ModuleTriChoice) {
+    if (!project) return;
+    enableBusy = moduleId;
+    try {
+      const state = await invoke<ModuleEnableState>(
+        'module_set_enabled_for_project_v2',
+        {
+          projectId: project.id,
+          moduleId,
+          value: moduleTriChoiceToValue(choice),
+        },
+      );
+      enableStates = { ...enableStates, [moduleId]: state };
+    } catch (e) {
+      toast.error(
+        `Failed to change enable state: ${e instanceof Error ? e.message : String(e)}`,
+      );
+      await loadEnableStates();
+    } finally {
+      enableBusy = null;
+    }
+  }
+
   onMount(async () => {
     await modules.loadCatalog();
     if (project) {
       await modules.loadInstalled(project.id);
     }
+    await loadEnableStates();
+    // The host-wide panel (/preferences/modules) writes the SAME cascade and
+    // fires this event. Without the listener a tile left open in another view
+    // would keep showing a provenance line that is no longer true.
+    tauriListen<{ project_id: string; module_id: string; enabled: boolean }>(
+      'module:enabled-for-project-changed',
+      () => {
+        void loadEnableStates();
+      },
+    ).then((un) => {
+      unlistenEnable = un;
+    });
+  });
+
+  onDestroy(() => {
+    unlistenEnable?.();
   });
 
   $effect(() => {
@@ -120,6 +249,14 @@
     if (project) {
       modules.loadInstalled(project.id);
     }
+  });
+
+  $effect(() => {
+    // Re-resolve the cascade whenever the project or the installed set
+    // changes — both change WHICH modules have a control and what it shows.
+    void project;
+    void installed;
+    void loadEnableStates();
   });
 
   // v0.2.33 (Agent E, L9): persist every fresh batch of parse errors
@@ -569,6 +706,71 @@
   });
 </script>
 
+<!--
+  v0.2.91 decision #23 (F-3 / F-4) — the per-project enable control for a
+  GLOBAL-scope module.
+
+  ONE snippet, rendered from TWO tile states, because a global-scope module
+  reaches both and the control must exist in both:
+
+    * `installed` — this project also has its own install row (a module that
+      predates global scope, or was installed per-project once);
+    * `available` — the ordinary case. The single install row has
+      `project_id IS NULL`, so `list_installed_modules(project_id)` does not
+      return it and the tile falls through to the "available" branch with an
+      `Installed globally` badge. Rendering the control only in the first
+      branch would leave it invisible exactly where it matters.
+
+  Three positions, not a checkbox: the cascade has an explicit per-project
+  row, a host-wide default, and a fail-open system default, so "no row" and
+  "row = false" are different states — and only the third position can
+  return to inheriting once a user has clicked (F-4).
+
+  `enableState === undefined` means the read failed: render disabled and say
+  so, rather than guessing a position (a guessed position is the lie).
+-->
+{#snippet enableCascadeControl(m: ModuleCatalogEntry, tileLicenseGated: boolean)}
+  {@const enableState = enableStates[m.id]}
+  <div class="mc-enable" data-testid="mc-enable-cascade">
+    <div class="mc-enable-seg" role="group" aria-label="{m.name} for this project">
+      {#each ['inherit', 'on', 'off'] as const as choice (choice)}
+        <button
+          class="mc-enable-btn"
+          class:mc-enable-active={enableState !== undefined &&
+            moduleTriChoiceFor(enableState) === choice}
+          aria-pressed={enableState !== undefined &&
+            moduleTriChoiceFor(enableState) === choice}
+          disabled={tileLicenseGated || enableState === undefined || enableBusy !== null}
+          title={tileLicenseGated
+            ? 'License required to change enable state. Re-activate the license to manage this module.'
+            : undefined}
+          onclick={() => chooseEnable(m.id, choice)}
+        >
+          {MODULE_TRI_CHOICE_LABELS[choice]}
+        </button>
+      {/each}
+    </div>
+    <p class="mc-enable-line">
+      {#if enableState === undefined}
+        Enable state unavailable — could not read this project's setting.
+      {:else}
+        {moduleEffectiveLine(enableState)}
+        {@const badge = moduleBadgeFor(enableState)}
+        <span
+          class="mc-enable-badge"
+          class:mc-enable-badge-user={badge.kind === 'user'}
+          class:mc-enable-badge-auto={badge.kind === 'auto'}>{badge.label}</span
+        >
+      {/if}
+    </p>
+    {#if dormantNotice(m.id)}
+      <!-- USER rider (#23): say what is TRUE today, so "On" never reads as
+           "actively reranking". -->
+      <p class="mc-enable-dormant">{dormantNotice(m.id)}</p>
+    {/if}
+  </div>
+{/snippet}
+
 <div class="catalog">
   <div class="catalog-header">
     <div>
@@ -846,23 +1048,35 @@
                    so a user can pull a fix that doesn't itself need the
                    license, and Uninstall is always a reversible exit. -->
               {@const tileLicenseGated = moduleIsLicenseGated(m, $license.cache)}
-              <label
-                class="enabled-toggle"
-                class:license-gated={tileLicenseGated}
-                title={tileLicenseGated
-                  ? 'License required to change enable state. Re-activate the license to manage this module.'
-                  : undefined}
-              >
-                <input
-                  type="checkbox"
-                  checked={display.install_row.enabled}
-                  disabled={tileLicenseGated}
-                  aria-disabled={tileLicenseGated ? 'true' : undefined}
-                  onchange={(e) => handleToggleEnabled(m, (e.target as HTMLInputElement).checked)}
-                  aria-label="Enable or disable {m.name}"
-                />
-                <span>Enabled</span>
-              </label>
+              {#if installedTileUsesCascade(m)}
+                <!-- Global scope ⇒ cascade control, unconditionally. Keyed on
+                     SCOPE, not on the catalog kind: if the two ever disagree
+                     for a global-scope module, falling back to the checkbox
+                     would restore the F-3 placebo (a control writing a column
+                     the gate never reads). -->
+                {@render enableCascadeControl(m, tileLicenseGated)}
+              {:else}
+                <!-- PROJECT-scope module: `module_installs.enabled` IS the
+                     per-project gate (one install row per project), so the
+                     checkbox is correct here and stays. -->
+                <label
+                  class="enabled-toggle"
+                  class:license-gated={tileLicenseGated}
+                  title={tileLicenseGated
+                    ? 'License required to change enable state. Re-activate the license to manage this module.'
+                    : undefined}
+                >
+                  <input
+                    type="checkbox"
+                    checked={display.install_row.enabled}
+                    disabled={tileLicenseGated}
+                    aria-disabled={tileLicenseGated ? 'true' : undefined}
+                    onchange={(e) => handleToggleEnabled(m, (e.target as HTMLInputElement).checked)}
+                    aria-label="Enable or disable {m.name}"
+                  />
+                  <span>Enabled</span>
+                </label>
+              {/if}
               {#if display.can_update}
                 <button
                   class="btn-3d btn-3d-primary btn-3d-sm"
@@ -951,6 +1165,17 @@
               >
                 Install
               </button>
+              {#if showsProjectSettingControl(m)}
+                <!-- v0.2.91 decision #23 (F-3): a GLOBAL-scope module that IS
+                     installed on this host lands here — its one install row
+                     has `project_id IS NULL`, so this project has no row and
+                     the tile reads as "available" (the badge says "Installed
+                     globally"). The per-project gate is real and settable in
+                     this state, so the control renders. Install stays as the
+                     repair affordance for a damaged global install; it is
+                     not the enable path and never was. -->
+                {@render enableCascadeControl(m, moduleIsLicenseGated(m, $license.cache))}
+              {/if}
             {/if}
           </div>
         </div>
@@ -1469,6 +1694,78 @@
   }
   .enabled-toggle.license-gated input {
     cursor: not-allowed;
+  }
+
+  /* v0.2.91 decision #23: tri-state cascade control for global-scope
+     modules. Segmented rather than a checkbox because there are three
+     positions; the badge hues match `DualWriteFlagsPanel` (teal = chosen
+     here, purple = inherited) so the two provenance surfaces read the
+     same way. The block spans the card footer's full width — the footer
+     is a flex row of small buttons and a three-segment control plus its
+     explanation does not belong inline with them. */
+  .mc-enable {
+    flex-basis: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .mc-enable-seg {
+    display: inline-flex;
+    gap: 4px;
+  }
+  .mc-enable-btn {
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--color-light);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 6px;
+    padding: 3px 10px;
+    font-size: 11px;
+    cursor: pointer;
+    transition:
+      background 0.15s,
+      border-color 0.15s;
+  }
+  .mc-enable-btn:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.1);
+  }
+  .mc-enable-btn.mc-enable-active {
+    background: var(--color-teal);
+    border-color: var(--color-teal);
+    color: #052e29;
+    font-weight: 600;
+  }
+  .mc-enable-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+  .mc-enable-line {
+    margin: 0;
+    font-size: 11px;
+    color: var(--color-mid);
+  }
+  .mc-enable-badge {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 6px;
+    border-radius: 999px;
+    font-size: 10px;
+    line-height: 1.5;
+  }
+  .mc-enable-badge-user {
+    background: rgba(0, 191, 166, 0.15);
+    color: var(--color-teal);
+  }
+  .mc-enable-badge-auto {
+    background: rgba(123, 95, 255, 0.15);
+    color: var(--color-purple);
+  }
+  .mc-enable-dormant {
+    margin: 0;
+    font-size: 11px;
+    line-height: 1.45;
+    color: var(--color-mid);
+    border-left: 2px solid var(--color-purple);
+    padding-left: 8px;
   }
 
   .mono {

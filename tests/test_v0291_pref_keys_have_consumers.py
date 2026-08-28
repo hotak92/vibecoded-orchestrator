@@ -38,6 +38,20 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PREFS_PAGE = REPO_ROOT / "launcher" / "src" / "routes" / "preferences" / "+page.svelte"
 QUIT_DIALOG = REPO_ROOT / "launcher" / "src-tauri" / "src" / "quit_dialog.rs"
 LIB_RS = REPO_ROOT / "launcher" / "src-tauri" / "src" / "lib.rs"
+# v0.2.91 WP-L — the log-level pref's consumer chain.
+CORE_LOGGING = (
+    REPO_ROOT
+    / "launcher"
+    / "src-tauri"
+    / "vct-launcher-core"
+    / "src"
+    / "logging.rs"
+)
+APP_LOGGING = REPO_ROOT / "launcher" / "src-tauri" / "src" / "logging.rs"
+LOGGING_PREFS_CMD = (
+    REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands" / "logging_prefs.rs"
+)
+CONFIG_PROJECTION = REPO_ROOT / "vco_lib" / "config_projection.py"
 
 _ENTRY_RE = re.compile(
     r"\{\s*key:\s*'(?P<key>[^']+)'.*?consumer:\s*'(?P<consumer>[^']+)'\s*,?\s*\}",
@@ -145,6 +159,163 @@ class WindowPrefsHaveBackendConsumers(unittest.TestCase):
             code,
             "the Preferences page must not persist settings through the generic "
             "per-project setting writer",
+        )
+
+
+class LoggingLevelPrefHasBackendConsumers(unittest.TestCase):
+    """v0.2.91 WP-L — the same wire-or-delete check, for the ONE pref this
+    release RE-ADDS to this page.
+
+    `logging_level` (underscore) was deleted above for having no consumer.
+    Re-adding a level picker is only defensible because the consumers now
+    exist, so every link of the chain gets an assertion here — the cheapest
+    possible insurance against the exact regression this module was written
+    for. The chain is:
+
+        Preferences <Dropdown>
+          → `set_logging_level` (dedicated command: validates, applies to the
+            running process, re-projects env)
+          → app_state `logging.level`
+          → `vct_launcher_core::logging::resolve_log_level` (launcher + hub)
+          → `vco_lib/config_projection.py` → `.claude/env` VCO_LOG_LEVEL
+    """
+
+    def setUp(self) -> None:
+        self.page = PREFS_PAGE.read_text(encoding="utf-8")
+        self.script = self.page.split("</script>")[0]
+
+    def test_the_page_names_the_rust_symbol_that_reads_the_pref(self):
+        m = re.search(r"LOG_LEVEL_CONSUMER = '([^']+)'", self.script)
+        self.assertIsNotNone(
+            m,
+            "the log-level section must name the Rust symbol that reads it, "
+            "the same `consumer:` discipline the window prefs carry",
+        )
+        assert m is not None  # for type checkers
+        self.consumer = m.group(1)
+
+    def test_the_claimed_consumer_exists_and_is_read(self):
+        m = re.search(r"LOG_LEVEL_CONSUMER = '([^']+)'", self.script)
+        assert m is not None, "consumer claim missing (see the test above)"
+        consumer = m.group(1)
+        core = CORE_LOGGING.read_text(encoding="utf-8")
+        self.assertIn(
+            f"pub fn {consumer}",
+            core,
+            f"the page claims consumer {consumer}, which is not defined in "
+            f"{CORE_LOGGING.name}",
+        )
+        # Defined AND used elsewhere: a resolver nothing calls is a dead
+        # toggle wearing a plausible name.
+        app = APP_LOGGING.read_text(encoding="utf-8")
+        self.assertIn(
+            consumer,
+            app,
+            f"{consumer} is never called from {APP_LOGGING.name} — the "
+            "launcher would persist a level it never applies",
+        )
+
+    def test_the_pref_writes_the_key_the_consumer_reads(self):
+        """One key literal, asserted on both sides. The legacy `logging_level`
+        name must not come back: reusing it would resurrect stale values
+        written while it was a no-op."""
+        core = CORE_LOGGING.read_text(encoding="utf-8")
+        m = re.search(
+            r'pub const LOG_LEVEL_APP_STATE_KEY\s*:\s*&str\s*=\s*"([^"]+)"', core
+        )
+        self.assertIsNotNone(m, "LOG_LEVEL_APP_STATE_KEY not found in core logging")
+        assert m is not None
+        key = m.group(1)
+        self.assertEqual(key, "logging.level")
+        self.assertNotEqual(key, "logging_level")
+        cmd = LOGGING_PREFS_CMD.read_text(encoding="utf-8")
+        self.assertIn(
+            "LOG_LEVEL_APP_STATE_KEY",
+            cmd,
+            "the write command must address the key through the shared "
+            "constant, not a literal that can drift from the reader",
+        )
+
+    def test_the_command_pair_is_registered_with_tauri(self):
+        lib_rs = LIB_RS.read_text(encoding="utf-8")
+        for cmd in (
+            "logging_prefs::get_logging_level",
+            "logging_prefs::set_logging_level",
+        ):
+            self.assertIn(
+                cmd,
+                lib_rs,
+                f"{cmd} is not in the invoke_handler — the GUI could not call it",
+            )
+
+    def test_the_page_invokes_that_command_pair(self):
+        for cmd in ("'get_logging_level'", "'set_logging_level'"):
+            self.assertIn(
+                cmd,
+                self.script,
+                f"the page must go through {cmd}; the generic app_state "
+                "writer would skip validation AND the env re-projection",
+            )
+
+    def test_the_write_command_accepts_every_offered_level(self):
+        """A level the picker offers but the command refuses would error on
+        every click — the same lie with extra steps."""
+        cmd = LOGGING_PREFS_CMD.read_text(encoding="utf-8")
+        m = re.search(r"LOG_LEVELS:\s*\[&str;\s*4\]\s*=\s*\[([^\]]+)\]", cmd)
+        self.assertIsNotNone(m, "LOG_LEVELS not found in logging_prefs.rs")
+        assert m is not None
+        accepted = set(re.findall(r'"([^"]+)"', m.group(1)))
+        offered = set(
+            re.findall(r"\{\s*value:\s*'([^']+)'", self.script.split("LOG_LEVEL_OPTIONS")[1])
+        )
+        self.assertTrue(offered, "no LOG_LEVEL_OPTIONS parsed from the page")
+        self.assertTrue(
+            offered <= accepted,
+            f"the page offers {sorted(offered - accepted)}, which "
+            f"set_logging_level would refuse (accepts {sorted(accepted)})",
+        )
+
+    def test_the_level_is_not_smuggled_into_the_window_pref_array(self):
+        """WINDOW_PREF_KEYS is asserted elsewhere to hold exactly the three
+        tray prefs. This pref has its own command pair and its own section —
+        it must not be bolted onto that array."""
+        keys = [k for k, _ in _window_pref_entries()]
+        self.assertNotIn("logging_level", keys)
+        self.assertNotIn("logging.level", keys)
+
+    def test_the_projection_carries_the_pref_to_projects(self):
+        """A pref the launcher stores but never projects would leave every
+        hook and helper script on the default — wired at one end only."""
+        proj = CONFIG_PROJECTION.read_text(encoding="utf-8")
+        self.assertIn('APP_STATE_KEY_LOGGING_LEVEL = "logging.level"', proj)
+        self.assertIn('_ENV_LOGGING_LEVEL = "VCO_LOG_LEVEL"', proj)
+        self.assertIn(
+            "SHELL_DEFAULTED_ENV_KEYS",
+            proj,
+            "the level must ride the shell-defaulted channel — a canonical "
+            "key would clobber an operator's own VCO_LOG_LEVEL export",
+        )
+
+    def test_the_page_says_where_the_pref_does_and_does_not_reach(self):
+        """The pref deliberately does NOT reach MCP servers (projecting it
+        into `.claude/settings.json` env would overwrite an operator's
+        export for exactly the processes they are debugging). A control that
+        stays silent about its own reach is the shipped-lie shape in a
+        subtler form, so the hint must say so."""
+        # The rendered hint lives after the </script> block.
+        markup = self.page.split("</script>", 1)[1]
+        section = markup.split("Diagnostic log level", 1)
+        self.assertEqual(
+            len(section), 2, "the Diagnostic log level section is not rendered"
+        )
+        hint = section[1][:2000]
+        self.assertIn("VCO_LOG_LEVEL", hint)
+        self.assertIn("MCP", hint, "the hint must state the MCP-server carve-out")
+        self.assertIn(
+            "hub",
+            hint,
+            "the hint must state that the hub adopts the level on its next "
+            "start rather than immediately",
         )
 
 

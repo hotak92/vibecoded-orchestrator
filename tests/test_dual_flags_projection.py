@@ -59,6 +59,7 @@ def _make_launcher_db(
     project_folder: str,
     project_slug: str = "demo",
     module_settings: list[tuple[str, str, str, str]] | None = None,
+    app_state: dict[str, str] | None = None,
 ) -> None:
     conn = sqlite3.connect(str(db_path))
     cur = conn.cursor()
@@ -122,6 +123,12 @@ def _make_launcher_db(
             "INSERT INTO module_settings (project_id, module_id, setting_key, setting_value) "
             "VALUES (?, ?, ?, ?)",
             (pid, mid, key, value),
+        )
+    # v0.2.91 WP-L: host-wide defaults (and the diagnostic log level) live in
+    # app_state, so the fixture must be able to seed it.
+    for key, value in (app_state or {}).items():
+        cur.execute(
+            "INSERT INTO app_state (key, value) VALUES (?, ?)", (key, value)
         )
     conn.commit()
     conn.close()
@@ -495,6 +502,242 @@ def test_arctic_secondary_survives_simulated_update(tmp_path: Path) -> None:
         post_env["DUAL_EMBEDDING_ARCTIC_SECONDARY"]
         == pre_env["DUAL_EMBEDDING_ARCTIC_SECONDARY"]
         == "true"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 5. v0.2.91 WP-L: the host-wide default tier reaches .claude/env
+# ─────────────────────────────────────────────────────────────────────
+#
+# The unit-level cascade (all cases, both directions, the clamp) is pinned in
+# ``test_dual_flags_cascade_parity_v0291.py``. What these add is the END of the
+# channel: that the resolved value actually lands in the projected env, which
+# is what every consumer reads. A cascade that is right and never projected is
+# the shipped lie one layer down.
+
+from vco_lib.config_projection import (  # noqa: E402
+    APP_STATE_KEY_DUAL_ARCTIC_DEFAULT,
+    APP_STATE_KEY_DUAL_RL_LOG_DEFAULT,
+    APP_STATE_KEY_DUAL_WRITE_DEFAULT,
+    APP_STATE_KEY_LOGGING_LEVEL,
+    SHELL_DEFAULTED_ENV_KEYS,
+)
+
+
+def test_host_wide_defaults_project_into_env_with_no_project_rows(
+    tmp_path: Path,
+) -> None:
+    """A project that has never chosen inherits the host-wide defaults, and
+    the inherited value reaches ``.claude/env``. Pre-WP-L the projection read
+    each row with ``default=False`` and emitted 'false' here."""
+    db = tmp_path / "launcher.db"
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    _make_launcher_db(
+        db,
+        project_id="g1",
+        project_folder=str(folder),
+        app_state={
+            APP_STATE_KEY_DUAL_WRITE_DEFAULT: "true",
+            APP_STATE_KEY_DUAL_RL_LOG_DEFAULT: "true",
+            APP_STATE_KEY_DUAL_ARCTIC_DEFAULT: "true",
+        },
+    )
+
+    env = project_env_from_db("g1", db_path=db)["canonical_env"]
+    assert env["DUAL_EMBEDDING_WRITE_ALL_SLOTS"] == "true"
+    assert env["DUAL_RL_LOG_ENABLED"] == "true"
+    assert env["DUAL_EMBEDDING_ARCTIC_SECONDARY"] == "true"
+
+
+def test_explicit_project_false_survives_a_host_wide_true(tmp_path: Path) -> None:
+    """Decision #22: an explicit per-project row wins IN BOTH DIRECTIONS. The
+    opt-out must reach the env, or the project keeps paying for the extra
+    embed calls it opted out of."""
+    db = tmp_path / "launcher.db"
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    _make_launcher_db(
+        db,
+        project_id="g2",
+        project_folder=str(folder),
+        module_settings=[
+            ("g2", "orchestrator-core", "dual_embedding_arctic_secondary", "false"),
+        ],
+        app_state={APP_STATE_KEY_DUAL_ARCTIC_DEFAULT: "true"},
+    )
+
+    env = project_env_from_db("g2", db_path=db)["canonical_env"]
+    assert env["DUAL_EMBEDDING_ARCTIC_SECONDARY"] == "false"
+
+
+def test_cross_tier_clamp_reaches_the_env(tmp_path: Path) -> None:
+    """Host-wide log default ON meeting an explicit per-project write OFF:
+    the projected env must never carry the incoherent
+    ``(DUAL_RL_LOG_ENABLED=true, DUAL_EMBEDDING_WRITE_ALL_SLOTS=false)``
+    pair — the RL telemetry path would try to log into a slot nothing is
+    populating."""
+    db = tmp_path / "launcher.db"
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    _make_launcher_db(
+        db,
+        project_id="g3",
+        project_folder=str(folder),
+        module_settings=[
+            ("g3", "orchestrator-core", "dual_embedding_write_all_slots", "false"),
+        ],
+        app_state={
+            APP_STATE_KEY_DUAL_WRITE_DEFAULT: "true",
+            APP_STATE_KEY_DUAL_RL_LOG_DEFAULT: "true",
+        },
+    )
+
+    env = project_env_from_db("g3", db_path=db)["canonical_env"]
+    assert env["DUAL_EMBEDDING_WRITE_ALL_SLOTS"] == "false"
+    assert env["DUAL_RL_LOG_ENABLED"] == "false"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 6. v0.2.91 WP-L: VCO_LOG_LEVEL (plan decision #21)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_vco_log_level_is_deliberately_not_a_canonical_key() -> None:
+    """A canonical key is written into ``.claude/settings.json`` env, which
+    STRUCTURALLY overwrites inherited environment for MCP subprocesses — no
+    conditional syntax available. Projecting the level there would let the
+    GUI preference clobber the shell export of the operator debugging that
+    very MCP, inverting decision #21's ``env > app_state > INFO``. So the
+    level rides the shell-defaulted channel instead."""
+    assert "VCO_LOG_LEVEL" not in list_canonical_keys()
+    assert "VCO_LOG_LEVEL" in SHELL_DEFAULTED_ENV_KEYS
+
+
+def test_vco_log_level_omitted_when_no_app_state_row(tmp_path: Path) -> None:
+    """Absent app_state row ⇒ omitted entirely (not emitted as 'info'), so
+    consumers apply their own INFO default and no new line is written into
+    every project's .claude/env for no behavioural gain."""
+    db = tmp_path / "launcher.db"
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    _make_launcher_db(db, project_id="l1", project_folder=str(folder))
+
+    bundle = project_env_from_db("l1", db_path=db)
+    assert "VCO_LOG_LEVEL" not in bundle["canonical_env"]
+    assert bundle.get("shell_defaulted_env") == {}
+
+
+def test_vco_log_level_rides_the_shell_defaulted_channel(tmp_path: Path) -> None:
+    db = tmp_path / "launcher.db"
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    _make_launcher_db(
+        db,
+        project_id="l2",
+        project_folder=str(folder),
+        app_state={APP_STATE_KEY_LOGGING_LEVEL: "debug"},
+    )
+
+    bundle = project_env_from_db("l2", db_path=db)
+    assert bundle["shell_defaulted_env"] == {"VCO_LOG_LEVEL": "debug"}
+    assert "VCO_LOG_LEVEL" not in bundle["canonical_env"]
+
+
+def test_vco_log_level_is_written_in_the_defaulted_shell_form(
+    tmp_path: Path,
+) -> None:
+    """RED-PROOF for the precedence inversion: the emitted line MUST be
+    ``export VCO_LOG_LEVEL="${VCO_LOG_LEVEL:-debug}"``, not a hard
+    assignment. With a hard assignment, an operator who exports
+    ``VCO_LOG_LEVEL=debug`` in their shell to debug a misbehaving hook gets
+    it silently overwritten at ``source`` time by the stored preference —
+    tier 1 would stop meaning "operator override" for exactly the processes
+    they are trying to debug."""
+    from vco_lib.config_projection import apply_project_env  # noqa: PLC0415
+
+    folder = tmp_path / "proj"
+    (folder / ".claude").mkdir(parents=True)
+    db = tmp_path / "launcher.db"
+    _make_launcher_db(
+        db,
+        project_id="l3",
+        project_folder=str(folder),
+        app_state={APP_STATE_KEY_LOGGING_LEVEL: "warn"},
+    )
+
+    bundle = project_env_from_db("l3", db_path=db)
+    apply_project_env(bundle, surfaces=("claude_env",))
+    written = (folder / ".claude" / "env").read_text(encoding="utf-8")
+
+    assert 'export VCO_LOG_LEVEL="${VCO_LOG_LEVEL:-warn}"' in written, (
+        "the level must be emitted in the DEFAULTED form so an operator's "
+        f"shell export survives sourcing; got:\n{written}"
+    )
+    assert 'export VCO_LOG_LEVEL="warn"' not in written, (
+        "a hard assignment would clobber the operator's own export"
+    )
+
+
+def test_vco_log_level_never_reaches_claude_settings_json(tmp_path: Path) -> None:
+    """The JSON env block has no conditional syntax, so anything written
+    there wins over the inherited environment for MCP subprocesses. The
+    level must not appear on that surface at all."""
+    from vco_lib.config_projection import apply_project_env  # noqa: PLC0415
+
+    folder = tmp_path / "proj"
+    (folder / ".claude").mkdir(parents=True)
+    db = tmp_path / "launcher.db"
+    _make_launcher_db(
+        db,
+        project_id="l4",
+        project_folder=str(folder),
+        app_state={APP_STATE_KEY_LOGGING_LEVEL: "debug"},
+    )
+
+    bundle = project_env_from_db("l4", db_path=db)
+    apply_project_env(bundle, surfaces=("claude_settings_json", "claude_env"))
+
+    settings = json.loads(
+        (folder / ".claude" / "settings.json").read_text(encoding="utf-8")
+    )
+    assert "VCO_LOG_LEVEL" not in settings.get("env", {}), (
+        "projecting the level into settings.json env would clobber an "
+        "operator's export for MCP subprocesses (see decision #21)"
+    )
+    # It DID reach the shell surface — proving this is a channel choice, not
+    # a failure to project.
+    assert "VCO_LOG_LEVEL" in (folder / ".claude" / "env").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_a_removed_preference_stops_being_emitted(tmp_path: Path) -> None:
+    """The shell managed block is rebuilt wholesale, so clearing the
+    app_state row removes the line on the next projection — no strip-set
+    bookkeeping needed, and no stale level left governing hooks."""
+    from vco_lib.config_projection import apply_project_env  # noqa: PLC0415
+
+    folder = tmp_path / "proj"
+    (folder / ".claude").mkdir(parents=True)
+    db = tmp_path / "launcher.db"
+    _make_launcher_db(
+        db,
+        project_id="l5",
+        project_folder=str(folder),
+        app_state={APP_STATE_KEY_LOGGING_LEVEL: "debug"},
+    )
+    apply_project_env(project_env_from_db("l5", db_path=db), surfaces=("claude_env",))
+    assert "VCO_LOG_LEVEL" in (folder / ".claude" / "env").read_text(encoding="utf-8")
+
+    conn = sqlite3.connect(str(db))
+    conn.execute("DELETE FROM app_state WHERE key = ?", (APP_STATE_KEY_LOGGING_LEVEL,))
+    conn.commit()
+    conn.close()
+
+    apply_project_env(project_env_from_db("l5", db_path=db), surfaces=("claude_env",))
+    assert "VCO_LOG_LEVEL" not in (folder / ".claude" / "env").read_text(
+        encoding="utf-8"
     )
 
 

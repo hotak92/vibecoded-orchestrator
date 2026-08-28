@@ -227,7 +227,7 @@ import sqlite3
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional, TypedDict
+from typing import Any, Iterable, Mapping, NotRequired, Optional, TypedDict
 
 from vco_lib.atomic import atomic_write_text
 from vco_lib.launcher_db_reader import (
@@ -339,6 +339,24 @@ _CANONICAL_KEYS: tuple[str, ...] = (
     # flag still applies). Same Python-canonical-writer split as the floors above.
     "RL_LOCAL_LOGGING_DISABLED_GLOBAL",
     "RL_ONLINE_TRAINING_DISABLED_GLOBAL",
+    # NOTE — ``VCO_LOG_LEVEL`` (v0.2.91 WP-L / decision #21) is deliberately
+    # NOT a canonical key. It is the one projected value that must NOT beat
+    # an operator's own environment, so it cannot ride this list:
+    #
+    #   * canonical keys are written into ``.claude/settings.json`` ``env``,
+    #     a plain string→string map that STRUCTURALLY overwrites inherited
+    #     environment for MCP subprocesses. There is no conditional syntax
+    #     there, so projecting the level would make the GUI preference
+    #     clobber the shell export of the person debugging that very MCP —
+    #     an inversion of decision #21's ``env > app_state > INFO``;
+    #   * canonical keys are written into ``.claude/env`` as hard
+    #     ``export K="v"`` assignments, which clobber at ``source`` time.
+    #
+    # So the level takes the ``shell_defaulted_env`` path instead: emitted
+    # ONLY into ``.claude/env``, and in the DEFAULTED form
+    # ``export VCO_LOG_LEVEL="${VCO_LOG_LEVEL:-<stored>}"`` so an operator's
+    # export still wins for hooks and their Python children. See
+    # :data:`SHELL_DEFAULTED_ENV_KEYS`.
     "WEAVIATE_URL",
     "WEAVIATE_PORT",
     "OLLAMA_URL",
@@ -442,11 +460,20 @@ class ProjectEnvBundle(TypedDict):
 
     ``project_id`` and ``project_root`` are carried alongside the env
     map so callers don't have to re-query the DB to know where to write.
+
+    ``shell_defaulted_env`` (v0.2.91 WP-L, optional) carries the keys in
+    :data:`SHELL_DEFAULTED_ENV_KEYS` — values that reach ONLY ``.claude/env``,
+    and there in the ``export K="${K:-v}"`` form so the operator's own
+    environment still wins. They are NOT canonical keys: they never touch the
+    JSON surfaces, and their absence is not a signal to strip anything (the
+    shell block is rebuilt wholesale, so a removed key simply stops being
+    emitted). Absent or empty ⇒ nothing extra is written.
     """
 
     canonical_env: dict[str, str]
     project_id: str
     project_root: Path
+    shell_defaulted_env: NotRequired[dict[str, str]]
 
 
 class UserSecretBundle(TypedDict):
@@ -851,6 +878,82 @@ APP_STATE_KEY_RL_ONLINE_TRAINING_DISABLED_GLOBAL = "rl.online_training_disabled_
 _ENV_RL_LOCAL_LOGGING_DISABLED_GLOBAL = "RL_LOCAL_LOGGING_DISABLED_GLOBAL"
 _ENV_RL_ONLINE_TRAINING_DISABLED_GLOBAL = "RL_ONLINE_TRAINING_DISABLED_GLOBAL"
 
+# ─── v0.2.91 WP-L: dual-flag host-wide defaults + the log⟹write clamp ───
+#
+# MUST MATCH, byte-for-byte, the Rust home of this cascade:
+# ``launcher/src-tauri/vct-launcher-core/src/db/settings.rs`` (the
+# ``DualFlag`` addressing table, ``Db::resolve_dual_flags``, and
+# ``Db::set_dual_flag_global_default``). The hub ``/config`` resolver
+# (``vct-hub/src/config_api.rs``) calls the Rust function directly; THIS is
+# the one mirror, because the projection runs in a separate Python process
+# with no interpreter on the Rust side of the hot path (tier C of the A>B>C
+# sharing rule). The lock is ``tests/test_dual_flags_cascade_parity_v0291.py``
+# — it parses the Rust addressing table + truth table and drives this
+# resolver through the identical cases.
+#
+# Precedence per flag:
+#   1. explicit per-project ``module_settings`` row — wins IN BOTH
+#      DIRECTIONS (an explicit ``false`` beats a host-wide ``true``);
+#   2. host-wide ``app_state`` default (absent row ⇒ False);
+#   3. False.
+# Then the CROSS-TIER clamp on the RESOLVED values:
+#   ``resolved_log = resolved_log and resolved_write``
+# (down only — an inherited log=True must never promote write to True).
+APP_STATE_KEY_DUAL_WRITE_DEFAULT = "embedding.dual_write_default"
+APP_STATE_KEY_DUAL_RL_LOG_DEFAULT = "embedding.dual_rl_log_default"
+APP_STATE_KEY_DUAL_ARCTIC_DEFAULT = "embedding.dual_arctic_default"
+
+_DUAL_SETTING_KEY_WRITE_ALL_SLOTS = "dual_embedding_write_all_slots"
+_DUAL_SETTING_KEY_RL_LOG = "dual_rl_log_enabled"
+_DUAL_SETTING_KEY_ARCTIC_SECONDARY = "dual_embedding_arctic_secondary"
+
+# v0.2.91 WP-L / plan decision #21 — machine-GLOBAL diagnostic log level.
+# app_state ``logging.level`` → ``.claude/env`` ``VCO_LOG_LEVEL``.
+#
+# MUST MATCH ``vct_launcher_core::logging::LOG_LEVEL_APP_STATE_KEY`` /
+# ``LOG_LEVEL_ENV``. Deliberately NOT the legacy ``logging_level`` key, which
+# was removed from the Preferences page this same release for having no
+# consumer — reusing that name would resurrect stale values written while it
+# was a no-op and let them govern behaviour nobody opted into.
+#
+# Three consumer populations, and they do NOT resolve the level the same way:
+#
+#   * the launcher and the hub PROCESSES read ``launcher.db`` directly and
+#     resolve ``VCO_LOG_LEVEL`` (real environment) > app_state > INFO. They
+#     never source ``.claude/env``, so their tier 1 is the real environment
+#     and the documented order holds exactly.
+#   * project-side HOOKS and their Python children source ``.claude/env``.
+#     They get the DEFAULTED form below, so an operator who exports
+#     ``VCO_LOG_LEVEL=debug`` in their shell keeps it — the stored preference
+#     only fills in when the environment is silent.
+#   * MCP SERVERS get their environment from ``.claude/settings.json`` ``env``,
+#     which structurally overwrites inherited values with no conditional
+#     syntax available. Projecting the level there would invert tier 1 for
+#     precisely the processes an operator raises verbosity to debug, so
+#     v0.2.91 does NOT project it to that surface at all: MCP diagnostics
+#     follow the operator's environment, or the INFO default. (Recorded
+#     extension point, deliberately not built this cycle: the MCP already
+#     queries the hub's ``/config`` at import, so a hub-config tier could
+#     carry the preference there without the clobber. Add it only if field
+#     demand appears.)
+APP_STATE_KEY_LOGGING_LEVEL = "logging.level"
+_ENV_LOGGING_LEVEL = "VCO_LOG_LEVEL"
+
+#: Keys emitted ONLY into ``.claude/env``, and in the DEFAULTED shell form
+#: ``export K="${K:-value}"`` rather than a hard assignment.
+#:
+#: This is the escape hatch for a projected value that must yield to the
+#: operator's own environment. A canonical key does the opposite — it is the
+#: authority, and a hand-set value on disk is reconciled away on the next
+#: projection (that is the contract
+#: ``test_arctic_secondary_hand_set_env_file_flips_to_db_off`` pins, and it is
+#: correct for per-project CONFIG). A debug knob is the other kind of value:
+#: the person who exported it is the authority for that shell.
+#:
+#: Keep this set tiny. If a key is per-project configuration, it belongs in
+#: :data:`_CANONICAL_KEYS`; only operator-override knobs belong here.
+SHELL_DEFAULTED_ENV_KEYS: tuple[str, ...] = (_ENV_LOGGING_LEVEL,)
+
 # v0.2.72 R1 (F5 residual): explicit GUI override for the machine-global
 # shared-KG class name, written by the launcher's SharedKgPicker via
 # ``set_shared_kg_collection_name`` (project_identity.rs).
@@ -946,6 +1049,104 @@ def _resolve_active_embedding_cascade(
             return value
         # source=user but the value row is missing/empty — fall through.
     return _global_active_embedding(conn) or "qwen3"
+
+
+def _global_dual_flag(conn: sqlite3.Connection, app_state_key: str) -> bool:
+    """Host-wide default for one dual flag, from ``app_state``.
+
+    Mirror of ``Db::dual_flag_install_default``. The Rust
+    ``app_state_set_bool`` writer stores the literal strings ``"true"`` /
+    ``"false"``, and ``app_state_get_bool`` reads back
+    ``matches!(v, "true" | "1")`` — replicate that exactly (NOT a generic
+    truthy parse) so a value like ``"yes"`` is False on both sides.
+    Absent row ⇒ ``False``. Soft-fail on any DB error.
+    """
+    raw = _fetch_app_state_str(conn, app_state_key)
+    return raw in ("true", "1")
+
+
+def _fetch_dual_flag_explicit(
+    conn: sqlite3.Connection,
+    project_id: str,
+    module_id: str,
+    setting_key: str,
+) -> Optional[bool]:
+    """Explicit per-project dual-flag row, or ``None`` when inheriting.
+
+    Mirror of ``Db::dual_flag_explicit``. A malformed (non-bool) value is
+    treated as ABSENT rather than fail-open-to-true: these flags are opt-in
+    cost multipliers, so a corrupt row must not silently turn on extra
+    embedding calls.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT setting_value FROM module_settings "
+        "WHERE project_id = ? AND module_id = ? AND setting_key = ?",
+        (project_id, module_id, setting_key),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    try:
+        value = json.loads(row["setting_value"])
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return value if isinstance(value, bool) else None
+
+
+def _resolve_dual_flags_cascade(
+    conn: sqlite3.Connection,
+    project_id: str,
+) -> tuple[bool, bool, bool]:
+    """Resolve the three dual flags — the ONE cascade, mirrored.
+
+    Returns ``(write_all_slots, rl_log, arctic_secondary)`` as EFFECTIVE
+    values, i.e. after the log⟹write clamp.
+
+    LOCKED order (must match
+    ``vct-launcher-core/src/db/settings.rs::Db::resolve_dual_flags`` — and
+    therefore the hub ``config_api.rs`` resolver, which calls it — byte-for-
+    byte; cross-surface lockstep prevents the Defect-D class of
+    GUI-write-vs-hub-read disagreement):
+
+      1. explicit per-project ``module_settings`` row wins in BOTH
+         directions (an explicit ``False`` beats a host-wide ``True``);
+      2. else the host-wide ``app_state`` default;
+      3. else ``False``.
+
+    Then the CROSS-TIER clamp: ``rl_log = rl_log and write_all_slots``. It
+    only ever clamps DOWN — an inherited ``rl_log = True`` must never promote
+    ``write_all_slots``, because that would let a host-wide default overrule
+    an explicit per-project opt-out, which step 1 forbids.
+
+    Plan §F #25: NOTHING here consults ``module_installs`` or any
+    module-enabled flag. ``dual_rl_log_enabled`` is addressed under module_id
+    ``vct-rl-reranker``, but the paid module gates RERANKING, never
+    COLLECTION — a project without the module resolves identically.
+    """
+
+    def resolve(module_id: str, setting_key: str, app_state_key: str) -> bool:
+        explicit = _fetch_dual_flag_explicit(conn, project_id, module_id, setting_key)
+        if explicit is not None:
+            return explicit
+        return _global_dual_flag(conn, app_state_key)
+
+    write_all_slots = resolve(
+        ORCHESTRATOR_CORE_MODULE_ID,
+        _DUAL_SETTING_KEY_WRITE_ALL_SLOTS,
+        APP_STATE_KEY_DUAL_WRITE_DEFAULT,
+    )
+    rl_log = resolve(
+        _RL_RERANKER_MODULE_ID,
+        _DUAL_SETTING_KEY_RL_LOG,
+        APP_STATE_KEY_DUAL_RL_LOG_DEFAULT,
+    )
+    arctic_secondary = resolve(
+        ORCHESTRATOR_CORE_MODULE_ID,
+        _DUAL_SETTING_KEY_ARCTIC_SECONDARY,
+        APP_STATE_KEY_DUAL_ARCTIC_DEFAULT,
+    )
+    return (write_all_slots, rl_log and write_all_slots, arctic_secondary)
 
 
 def _fetch_kg_bindings(
@@ -1717,31 +1918,21 @@ def project_env_from_db(
             conn, project_id, "orchestrator-core",
             "shared_kg_read_disabled", default=False,
         )
-        # v0.2.71 T-B-flags — dual-write + dual-log toggles. Same
-        # module_settings read shape + default-false (opt-in) as the gates
-        # above; the hub resolver (config_api.rs) reads the identical rows
-        # so a hub fetch and this env projection can never disagree.
-        # dual_embedding_write_all_slots → orchestrator-core scope;
-        # dual_rl_log_enabled → vct-rl-reranker scope. The Tauri setter
-        # enforces dual-log ⟹ dual-write, so the DB never holds the
-        # incoherent pair this projection might otherwise surface.
-        dual_embedding_write_all_slots = _fetch_module_setting_bool(
-            conn, project_id, "orchestrator-core",
-            "dual_embedding_write_all_slots", default=False,
-        )
-        dual_rl_log_enabled = _fetch_module_setting_bool(
-            conn, project_id, _RL_RERANKER_MODULE_ID,
-            "dual_rl_log_enabled", default=False,
-        )
-        # v0.2.88 (DEFECT 5): third dual-write flag — the secondary arctic slot.
-        # Same orchestrator-core scope + default-false (opt-in) read shape as
-        # dual_embedding_write_all_slots. Independent (no coherence cascade). The
-        # hub resolver (config_api.rs) reads the identical row so a hub fetch and
-        # this projection cannot disagree.
-        dual_embedding_arctic_secondary = _fetch_module_setting_bool(
-            conn, project_id, "orchestrator-core",
-            "dual_embedding_arctic_secondary", default=False,
-        )
+        # v0.2.71 T-B-flags / v0.2.88 (DEFECT 5) — the three dual toggles.
+        #
+        # v0.2.91 WP-L (plan decision #22): they gained an INSTALL-WIDE
+        # default tier, so the old per-row ``_fetch_module_setting_bool(...,
+        # default=False)`` shape is no longer correct — it collapses "no
+        # per-project row" into False and would make this projection disagree
+        # with both the GUI and the hub the moment a host-wide default is on.
+        # ONE cascade, mirrored from the Rust home; see
+        # ``_resolve_dual_flags_cascade``'s docstring for the locked order,
+        # the cross-tier clamp, and the parity test that pins them.
+        (
+            dual_embedding_write_all_slots,
+            dual_rl_log_enabled,
+            dual_embedding_arctic_secondary,
+        ) = _resolve_dual_flags_cascade(conn, project_id)
         if active_embedding_override is not None:
             active_embedding = active_embedding_override
         else:
@@ -1800,6 +1991,13 @@ def project_env_from_db(
         rl_online_training_disabled_global = _fetch_app_state_str(
             conn, APP_STATE_KEY_RL_ONLINE_TRAINING_DISABLED_GLOBAL
         )
+
+        # v0.2.91 WP-L (decision #21): machine-GLOBAL diagnostic log level.
+        # Absent row → None → the key is OMITTED by ``_set`` below and the
+        # consumers apply their INFO default. Unknown values are NOT coerced
+        # here — the consumer owns that fallback (same split as the codegraph
+        # floors), and the GUI only ever writes error|warn|info|debug.
+        logging_level = _fetch_app_state_str(conn, APP_STATE_KEY_LOGGING_LEVEL)
 
         # v0.2.72 R2 (F5 residual): CODE_GRAPH_PROJECT derives
         # hub-consistently — the project's codegraph binding prefix
@@ -1939,6 +2137,10 @@ def project_env_from_db(
     # verbatim; the resolver parses truthily ({"true","1","yes","on"}).
     _set(_ENV_RL_LOCAL_LOGGING_DISABLED_GLOBAL, rl_local_logging_disabled_global)
     _set(_ENV_RL_ONLINE_TRAINING_DISABLED_GLOBAL, rl_online_training_disabled_global)
+    # (v0.2.91 WP-L: VCO_LOG_LEVEL is deliberately NOT `_set` here — it is
+    # not a canonical key. It leaves via `shell_defaulted_env` at the bottom
+    # of this function, reaching `.claude/env` only, in the defaulted form.
+    # See SHELL_DEFAULTED_ENV_KEYS.)
     _set("WEAVIATE_URL", weaviate_url)
     _set("WEAVIATE_PORT", str(weaviate_port_default))
     _set("OLLAMA_URL", ollama_url)
@@ -1993,10 +2195,20 @@ def project_env_from_db(
     # this key (matching the "keychain empty / paused" omit behaviour
     # the Rust resolver already documents).
 
+    # v0.2.91 WP-L (decision #21): the diagnostic log level rides the
+    # shell-defaulted channel, NOT `canonical_env` — see
+    # SHELL_DEFAULTED_ENV_KEYS for why an operator-override knob must not be
+    # written as an authoritative assignment. Absent app_state row ⇒ omitted
+    # entirely ⇒ consumers apply their INFO default.
+    shell_defaulted: dict[str, str] = {}
+    if logging_level:
+        shell_defaulted[_ENV_LOGGING_LEVEL] = logging_level
+
     return {
         "canonical_env": env,
         "project_id": project_id,
         "project_root": Path(proj.folder_path),
+        "shell_defaulted_env": shell_defaulted,
     }
 
 
@@ -2391,7 +2603,12 @@ def apply_project_env(
     if _SURFACE_CLAUDE_ENV in surfaces_seq:
         path = project_root / ".claude" / "env"
         keys = _write_shell_env_managed_block(
-            path, env, user_secret_pairs=us_pairs,
+            path,
+            env,
+            user_secret_pairs=us_pairs,
+            # v0.2.91 WP-L: shell-only, operator-yielding keys. This is the
+            # ONLY surface that gets them — see SHELL_DEFAULTED_ENV_KEYS.
+            defaulted_env=bundle.get("shell_defaulted_env"),
         )
         report[_SURFACE_CLAUDE_ENV] = keys
 
@@ -2957,6 +3174,7 @@ def _write_shell_env_managed_block(
     canonical_env: Mapping[str, str],
     *,
     user_secret_pairs: Iterable[tuple[str, str]] | None = None,
+    defaulted_env: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Write the canonical env between bracket markers in ``.claude/env``.
 
@@ -3007,17 +3225,22 @@ def _write_shell_env_managed_block(
     else:
         prior = None
 
-    managed = _build_managed_block(canonical_env, user_secret_pairs=user_secret_pairs)
+    managed = _build_managed_block(
+        canonical_env,
+        user_secret_pairs=user_secret_pairs,
+        defaulted_env=defaulted_env,
+    )
     new_text = _merge_managed_block(prior, managed)
     _atomic_write_text(path, new_text)
 
-    return sorted(canonical_env.keys())
+    return sorted(list(canonical_env.keys()) + list((defaulted_env or {}).keys()))
 
 
 def _build_managed_block(
     canonical_env: Mapping[str, str],
     *,
     user_secret_pairs: Iterable[tuple[str, str]] | None = None,
+    defaulted_env: Mapping[str, str] | None = None,
 ) -> str:
     """Render the managed block for ``.claude/env``.
 
@@ -3079,6 +3302,28 @@ def _build_managed_block(
     for key, value in canonical_env.items():
         escaped = value.replace('"', '\\"')
         out.append(f'export {key}="{escaped}"')
+    # v0.2.91 WP-L — shell-DEFAULTED keys (currently just VCO_LOG_LEVEL).
+    #
+    # `export K="${K:-v}"` instead of `export K="v"`: the projected value
+    # fills in only when the environment is silent, so an operator who
+    # exported the variable in their shell keeps it after sourcing this file.
+    # That is the difference between per-project CONFIG (where the projection
+    # is the authority and reconciles a hand-set value away) and an
+    # operator-override DEBUG knob (where the person who exported it is).
+    #
+    # This section is the one deliberate divergence from Rust's
+    # `build_claude_env_managed_block_with_user_secrets`: the Rust writer has
+    # no defaulted form, and does not need one — the Python `apply` CLI is
+    # the canonical writer for these keys (the Option-A interop strategy at
+    # the top of this module), exactly as it already is for DUAL_* / the
+    # code-graph floors / the RL globals.
+    #
+    # Emitted AFTER the canonical exports so the shape is stable, and before
+    # the user-secret section so secrets stay last (their block is the one a
+    # reader scans for).
+    for key, value in (defaulted_env or {}).items():
+        escaped = value.replace('"', '\\"')
+        out.append(f'export {key}="${{{key}:-{escaped}}}"')
     # Phase 0.E user-secret section. Materialise the iterable first so we
     # can branch on emptiness without consuming a one-shot iterator twice.
     pairs_list: list[tuple[str, str]] = (

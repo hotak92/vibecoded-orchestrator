@@ -38,6 +38,10 @@ use tauri::{command, State};
 
 use crate::db::Db;
 use crate::manifest::SelectOption;
+// v0.2.91 WP-L: the ONE home of the dual-flag precedence + cascade. The six
+// dual_* commands in this file delegate to it so they cannot disagree with
+// the hub `/config` resolver, which calls the same function.
+use vct_launcher_core::db::settings::DualFlag;
 
 const MODULE_ID: &str = "vct-rl-reranker";
 
@@ -101,67 +105,25 @@ fn get_bool_flag(db: &Db, project_id: &str, key: &str) -> Result<bool, String> {
         .unwrap_or(false))
 }
 
-// ─── v0.2.71 T-B-flags: module-id-parameterised bool flag helpers ────────
+// ─── v0.2.71 T-B-flags → v0.2.91 WP-L: addressing moved to `DualFlag` ────
 //
-// The two `set_bool_flag` / `get_bool_flag` helpers above are pinned to
-// `MODULE_ID = "vct-rl-reranker"`. The T-B-flags pair below needs to write
-// under TWO module_ids — `orchestrator-core` (dual_embedding_write_all_slots)
-// and `vct-rl-reranker` (dual_rl_log_enabled) — so we add explicit
-// module-id-taking variants rather than overloading the pinned ones. Same
-// JSON-bool encoding + `unwrap_or(false)` default contract as the pinned
-// helpers, so the hub resolver's `get_setting(...).as_bool().unwrap_or(false)`
-// reader round-trips byte-identically.
-
-/// Canonical `module_id` the `dual_embedding_write_all_slots` flag lives
-/// under. Orchestrator-core scope (not RL-specific): the flag controls
-/// the embedding service's secondary-slot dual-write, which is an
-/// orchestrator-wide indexing concern.
-const ORCHESTRATOR_CORE_MODULE_ID: &str = "orchestrator-core";
-
-/// Setting key for the per-project "write embeddings to ALL named-vector
-/// slots" flag. Consumed (via the projected `DUAL_EMBEDDING_WRITE_ALL_SLOTS`
-/// env) by `vco_lib/embedding_service.py::_dual_embedding_write_all_slots`.
-const DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY: &str = "dual_embedding_write_all_slots";
-
-/// Setting key for the per-project "also log RL events under the secondary
-/// embedding slot" flag. Consumed (via the projected `DUAL_RL_LOG_ENABLED`
-/// env) by the RL telemetry path in
-/// `claude_mcp_servers/weaviate_mcp/server.py::_resolve_dual_rl_log_enabled`
-/// (T-C). Lives under `vct-rl-reranker` because it gates RL-specific logging.
-const DUAL_RL_LOG_ENABLED_KEY: &str = "dual_rl_log_enabled";
-
-/// v0.2.88 (DEFECT 5) — setting key for the per-project "also write embeddings
-/// into a SECONDARY arctic slot" flag. Consumed (via the projected
-/// `DUAL_EMBEDDING_ARCTIC_SECONDARY` env) by
-/// `vco_lib/embedding_service.py::_resolve_dual_embedding_arctic_secondary`.
-/// Orchestrator-core scope like `dual_embedding_write_all_slots` (an embedding
-/// indexing concern, not RL-specific). Added this cycle so all THREE dual-write
-/// flags share ONE canonical channel (DB → projection → env); pre-fix it was
-/// env-only and survived updates only by being UNKNOWN to the projection (luck,
-/// not design). Now the DB is the truth that POPULATES it.
-const DUAL_EMBEDDING_ARCTIC_SECONDARY_KEY: &str = "dual_embedding_arctic_secondary";
-
-fn set_bool_flag_for_module(
-    db: &Db,
-    project_id: &str,
-    module_id: &str,
-    key: &str,
-    value: bool,
-) -> Result<(), String> {
-    db.set_setting(project_id, module_id, key, &serde_json::Value::Bool(value))
-}
-
-fn get_bool_flag_for_module(
-    db: &Db,
-    project_id: &str,
-    module_id: &str,
-    key: &str,
-) -> Result<bool, String> {
-    Ok(db
-        .get_setting(project_id, module_id, key)?
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false))
-}
+// This file used to carry its own copies of the dual flags' `module_id` +
+// `setting_key` strings plus a pair of module-id-parameterised row helpers.
+// v0.2.91 WP-L gave those flags a host-wide default tier, and with it ONE
+// home for their addressing AND their precedence:
+// `vct_launcher_core::db::settings::DualFlag` (+ `Db::resolve_dual_flags` /
+// `Db::set_dual_flag_for_project`), which the hub `/config` resolver calls
+// too.
+//
+// The local copies were deleted rather than left in place: a second table of
+// the same strings, now read by nobody in production, is exactly the shape
+// that drifts silently. `DualFlag::{module_id, setting_key, app_state_key}`
+// is the SSOT, pinned by `settings.rs::addressing_table_is_stable` and
+// cross-checked against the Python projection by
+// `tests/test_dual_flags_cascade_parity_v0291.py`.
+//
+// `MODULE_ID` above stays — the three ORIGINAL RL flags (`rl_use_global` et
+// al.) are unrelated to the dual family and still live under it.
 
 /// "Use global model (read-only)" — when true, this project's online
 /// training events are NOT applied to its local model. Project still
@@ -300,30 +262,14 @@ pub fn set_dual_embedding_write_all_slots_with_db(
     project_id: &str,
     value: bool,
 ) -> Result<crate::commands::projects_v2::RefreshProjectEnvResult, String> {
-    if project_id.is_empty() {
-        return Err("set_dual_embedding_write_all_slots: project_id required".into());
-    }
-    set_bool_flag_for_module(
-        db,
-        project_id,
-        ORCHESTRATOR_CORE_MODULE_ID,
-        DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY,
-        value,
-    )?;
-    // Coherence cascade: a dependent dual-log flag cannot survive its
-    // prerequisite being switched off. Mirror the GUI's grey-out by
-    // force-disabling the dependent here so the DB never holds the
-    // incoherent (log=true, write=false) pair even if the caller bypasses
-    // the GUI (e.g. a direct Tauri invoke or a future scripted setter).
-    if !value {
-        set_bool_flag_for_module(
-            db,
-            project_id,
-            MODULE_ID,
-            DUAL_RL_LOG_ENABLED_KEY,
-            false,
-        )?;
-    }
+    // v0.2.91 WP-L: the coherence cascade that used to live inline here now
+    // lives in `Db::set_dual_flag_for_project` — see the delegation note on
+    // `get_dual_embedding_write_all_slots` below. Behaviour is unchanged for
+    // this entry point (write the row, force the dependent off when the
+    // prerequisite goes off), except that the dependent is only written when
+    // it would otherwise RESOLVE on, so an already-off project no longer
+    // gains a redundant row.
+    db.set_dual_flag_for_project(project_id, DualFlag::WriteAllSlots, Some(value))?;
     Ok(crate::commands::projects_v2::reproject_env_soft(db, project_id))
 }
 
@@ -345,8 +291,25 @@ pub async fn set_dual_embedding_write_all_slots(
     set_dual_embedding_write_all_slots_with_db(&db, &project_id, value).map(|_| ())
 }
 
-/// Read back the persisted "write embeddings to ALL named-vector slots"
-/// flag. Default `false` for a missing row (opt-in).
+/// Read the EFFECTIVE "write embeddings to ALL named-vector slots" flag.
+///
+/// v0.2.91 WP-L (decision #22) — DELEGATION NOTE, applies to all three
+/// `get_dual_*` commands and all three `set_dual_*_with_db` functions below.
+///
+/// These commands predate the host-wide default tier. Their bare-`bool`
+/// signature reads "no per-project row" as `false`, which stopped being
+/// correct the moment a project could inherit an install-wide `true`: a
+/// caller here would have seen `false` while the hub `/config` resolver and
+/// the env projection both served `true`. That is the Defect-D class of
+/// GUI-write-vs-hub-read disagreement, so the bodies now delegate to the ONE
+/// resolver (`vct_launcher_core::db::settings::Db::resolve_dual_flags`) that
+/// the hub also calls, and cannot drift from it.
+///
+/// The signature is deliberately unchanged — these are a shipped IPC surface.
+/// What they cannot express is PROVENANCE (is this value this project's
+/// choice or an inherited default?), which is why new GUI code calls
+/// `commands::dual_flags::get_dual_flags_state` instead. Rendering a
+/// checkbox from the value returned here would be the lying toggle.
 #[command]
 pub async fn get_dual_embedding_write_all_slots(
     project_id: String,
@@ -355,12 +318,7 @@ pub async fn get_dual_embedding_write_all_slots(
     if project_id.is_empty() {
         return Err("get_dual_embedding_write_all_slots: project_id required".into());
     }
-    get_bool_flag_for_module(
-        &db,
-        &project_id,
-        ORCHESTRATOR_CORE_MODULE_ID,
-        DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY,
-    )
+    Ok(db.resolve_dual_flags(&project_id).write_all_slots.effective)
 }
 
 /// Free-function core of `set_dual_rl_log_enabled` — DB write + coherence
@@ -376,28 +334,13 @@ pub fn set_dual_rl_log_enabled_with_db(
     project_id: &str,
     value: bool,
 ) -> Result<crate::commands::projects_v2::RefreshProjectEnvResult, String> {
-    if project_id.is_empty() {
-        return Err("set_dual_rl_log_enabled: project_id required".into());
-    }
-    if value {
-        // Force-enable the prerequisite BEFORE writing the dependent so an
-        // observer can never read (log=true, write=false). dual-logging
-        // requires the secondary slot to be populated.
-        set_bool_flag_for_module(
-            db,
-            project_id,
-            ORCHESTRATOR_CORE_MODULE_ID,
-            DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY,
-            true,
-        )?;
-    }
-    set_bool_flag_for_module(
-        db,
-        project_id,
-        MODULE_ID,
-        DUAL_RL_LOG_ENABLED_KEY,
-        value,
-    )?;
+    // v0.2.91 WP-L: delegates to the ONE cascade (see the delegation note on
+    // `get_dual_embedding_write_all_slots`). The prerequisite is still
+    // force-enabled BEFORE the dependent is written, so no observer can read
+    // (log=true, write=false) — but only when dual-write does not already
+    // RESOLVE on, so a project inheriting a host-wide `write = true` keeps
+    // inheriting instead of being silently pinned to an explicit row.
+    db.set_dual_flag_for_project(project_id, DualFlag::RlLog, Some(value))?;
     Ok(crate::commands::projects_v2::reproject_env_soft(db, project_id))
 }
 
@@ -417,8 +360,9 @@ pub async fn set_dual_rl_log_enabled(
     set_dual_rl_log_enabled_with_db(&db, &project_id, value).map(|_| ())
 }
 
-/// Read back the persisted "also log RL events under the secondary
-/// embedding slot" flag. Default `false` for a missing row (opt-in).
+/// Read the EFFECTIVE "also log RL events under the secondary embedding
+/// slot" flag — after the host-wide default tier AND the log⟹write clamp.
+/// See the delegation note on `get_dual_embedding_write_all_slots`.
 #[command]
 pub async fn get_dual_rl_log_enabled(
     project_id: String,
@@ -427,7 +371,7 @@ pub async fn get_dual_rl_log_enabled(
     if project_id.is_empty() {
         return Err("get_dual_rl_log_enabled: project_id required".into());
     }
-    get_bool_flag_for_module(&db, &project_id, MODULE_ID, DUAL_RL_LOG_ENABLED_KEY)
+    Ok(db.resolve_dual_flags(&project_id).rl_log.effective)
 }
 
 /// v0.2.88 (DEFECT 5) — free-function core of `set_dual_embedding_arctic_secondary`.
@@ -444,16 +388,10 @@ pub fn set_dual_embedding_arctic_secondary_with_db(
     project_id: &str,
     value: bool,
 ) -> Result<crate::commands::projects_v2::RefreshProjectEnvResult, String> {
-    if project_id.is_empty() {
-        return Err("set_dual_embedding_arctic_secondary: project_id required".into());
-    }
-    set_bool_flag_for_module(
-        db,
-        project_id,
-        ORCHESTRATOR_CORE_MODULE_ID,
-        DUAL_EMBEDDING_ARCTIC_SECONDARY_KEY,
-        value,
-    )?;
+    // v0.2.91 WP-L: delegates to the ONE writer (see the delegation note on
+    // `get_dual_embedding_write_all_slots`). Still cascade-free in both
+    // directions — arctic-secondary is independent of the other two.
+    db.set_dual_flag_for_project(project_id, DualFlag::ArcticSecondary, Some(value))?;
     Ok(crate::commands::projects_v2::reproject_env_soft(db, project_id))
 }
 
@@ -471,8 +409,9 @@ pub async fn set_dual_embedding_arctic_secondary(
     set_dual_embedding_arctic_secondary_with_db(&db, &project_id, value).map(|_| ())
 }
 
-/// Read back the persisted "also write embeddings into a secondary arctic slot"
-/// flag. Default `false` for a missing row (opt-in).
+/// Read the EFFECTIVE "also write embeddings into a secondary arctic slot"
+/// flag — after the host-wide default tier. See the delegation note on
+/// `get_dual_embedding_write_all_slots`.
 #[command]
 pub async fn get_dual_embedding_arctic_secondary(
     project_id: String,
@@ -481,12 +420,7 @@ pub async fn get_dual_embedding_arctic_secondary(
     if project_id.is_empty() {
         return Err("get_dual_embedding_arctic_secondary: project_id required".into());
     }
-    get_bool_flag_for_module(
-        &db,
-        &project_id,
-        ORCHESTRATOR_CORE_MODULE_ID,
-        DUAL_EMBEDDING_ARCTIC_SECONDARY_KEY,
-    )
+    Ok(db.resolve_dual_flags(&project_id).arctic_secondary.effective)
 }
 
 // ─── Reset / retrain (STUBS for Stream 2) ───────────────────────────────
@@ -542,6 +476,34 @@ pub async fn list_rl_global_training_source_projects(
 mod tests {
     use super::*;
     use crate::db::Db;
+
+    /// Read a dual flag's RAW per-project row (no cascade, no host-wide
+    /// tier) — what most tests below assert on, because they are pinning the
+    /// setters' write behaviour rather than the resolver's answer.
+    ///
+    /// Addressed through `DualFlag` so these fixtures cannot drift from the
+    /// production strings; the old local const table was deleted in WP-L.
+    /// `Result` shape kept so the existing `.unwrap()` call sites read the
+    /// same as before.
+    fn dual_row(db: &Db, project_id: &str, flag: DualFlag) -> Result<bool, String> {
+        Ok(db.dual_flag_explicit(project_id, flag).unwrap_or(false))
+    }
+
+    /// Write a dual flag's raw per-project row, bypassing the coherence
+    /// cascade — for seeding states the setters would refuse to produce.
+    fn set_dual_row(
+        db: &Db,
+        project_id: &str,
+        flag: DualFlag,
+        value: bool,
+    ) -> Result<(), String> {
+        db.set_setting(
+            project_id,
+            flag.module_id(),
+            flag.setting_key(),
+            &serde_json::Value::Bool(value),
+        )
+    }
 
     fn open_db_with_projects(count: usize) -> (Db, Vec<String>) {
         let db = Db::open_in_memory().expect("in-memory db");
@@ -657,13 +619,9 @@ mod tests {
         let (db, ids) = open_db_with_projects(1);
         let p = &ids[0];
 
-        assert!(!get_bool_flag_for_module(
-            &db, p, ORCHESTRATOR_CORE_MODULE_ID, DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY
-        )
+        assert!(!dual_row(&db, p, DualFlag::WriteAllSlots)
         .unwrap());
-        assert!(!get_bool_flag_for_module(
-            &db, p, MODULE_ID, DUAL_RL_LOG_ENABLED_KEY
-        )
+        assert!(!dual_row(&db, p, DualFlag::RlLog)
         .unwrap());
     }
 
@@ -674,16 +632,12 @@ mod tests {
         let (db, ids) = open_db_with_projects(1);
         let p = &ids[0];
 
-        set_bool_flag_for_module(
-            &db, p, ORCHESTRATOR_CORE_MODULE_ID, DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY, true,
-        )
+        set_dual_row(&db, p, DualFlag::WriteAllSlots, true)
         .unwrap();
-        assert!(get_bool_flag_for_module(
-            &db, p, ORCHESTRATOR_CORE_MODULE_ID, DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY
-        )
+        assert!(dual_row(&db, p, DualFlag::WriteAllSlots)
         .unwrap());
         // dual_rl_log untouched.
-        assert!(!get_bool_flag_for_module(&db, p, MODULE_ID, DUAL_RL_LOG_ENABLED_KEY).unwrap());
+        assert!(!dual_row(&db, p, DualFlag::RlLog).unwrap());
     }
 
     // F5 (v0.2.72): the cascade + re-projection now live in the
@@ -739,21 +693,17 @@ mod tests {
         let p = &ids[0];
 
         // Sanity: both off to start.
-        assert!(!get_bool_flag_for_module(
-            &db, p, ORCHESTRATOR_CORE_MODULE_ID, DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY
-        )
+        assert!(!dual_row(&db, p, DualFlag::WriteAllSlots)
         .unwrap());
 
         apply_set_dual_rl_log(&db, p, true).unwrap();
 
         assert!(
-            get_bool_flag_for_module(&db, p, MODULE_ID, DUAL_RL_LOG_ENABLED_KEY).unwrap(),
+            dual_row(&db, p, DualFlag::RlLog).unwrap(),
             "dual_rl_log must be true after enabling",
         );
         assert!(
-            get_bool_flag_for_module(
-                &db, p, ORCHESTRATOR_CORE_MODULE_ID, DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY
-            )
+            dual_row(&db, p, DualFlag::WriteAllSlots)
             .unwrap(),
             "enabling dual_rl_log must force-enable dual_embedding_write_all_slots",
         );
@@ -769,20 +719,18 @@ mod tests {
 
         // Seed the coherent (both-on) starting point.
         apply_set_dual_rl_log(&db, p, true).unwrap();
-        assert!(get_bool_flag_for_module(&db, p, MODULE_ID, DUAL_RL_LOG_ENABLED_KEY).unwrap());
+        assert!(dual_row(&db, p, DualFlag::RlLog).unwrap());
 
         // Now turn the prerequisite OFF — the dependent must cascade off.
         apply_set_dual_write(&db, p, false).unwrap();
 
         assert!(
-            !get_bool_flag_for_module(
-                &db, p, ORCHESTRATOR_CORE_MODULE_ID, DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY
-            )
+            !dual_row(&db, p, DualFlag::WriteAllSlots)
             .unwrap(),
             "dual_embedding_write_all_slots must be false after disable",
         );
         assert!(
-            !get_bool_flag_for_module(&db, p, MODULE_ID, DUAL_RL_LOG_ENABLED_KEY).unwrap(),
+            !dual_row(&db, p, DualFlag::RlLog).unwrap(),
             "disabling the prerequisite must cascade the dependent off",
         );
     }
@@ -794,9 +742,7 @@ mod tests {
     fn arctic_secondary_defaults_false() {
         let (db, ids) = open_db_with_projects(1);
         let p = &ids[0];
-        assert!(!get_bool_flag_for_module(
-            &db, p, ORCHESTRATOR_CORE_MODULE_ID, DUAL_EMBEDDING_ARCTIC_SECONDARY_KEY
-        )
+        assert!(!dual_row(&db, p, DualFlag::ArcticSecondary)
         .unwrap());
     }
 
@@ -809,28 +755,22 @@ mod tests {
 
         // Turn arctic-secondary ON — the other two must stay OFF.
         set_dual_embedding_arctic_secondary_with_db(&db, p, true).unwrap();
-        assert!(get_bool_flag_for_module(
-            &db, p, ORCHESTRATOR_CORE_MODULE_ID, DUAL_EMBEDDING_ARCTIC_SECONDARY_KEY
-        )
+        assert!(dual_row(&db, p, DualFlag::ArcticSecondary)
         .unwrap());
         assert!(
-            !get_bool_flag_for_module(
-                &db, p, ORCHESTRATOR_CORE_MODULE_ID, DUAL_EMBEDDING_WRITE_ALL_SLOTS_KEY
-            )
+            !dual_row(&db, p, DualFlag::WriteAllSlots)
             .unwrap(),
             "arctic-secondary must NOT force-enable write_all_slots",
         );
         assert!(
-            !get_bool_flag_for_module(&db, p, MODULE_ID, DUAL_RL_LOG_ENABLED_KEY).unwrap(),
+            !dual_row(&db, p, DualFlag::RlLog).unwrap(),
             "arctic-secondary must NOT touch dual_rl_log",
         );
 
         // Enabling write_all_slots must NOT flip arctic-secondary off.
         set_dual_embedding_write_all_slots_with_db(&db, p, true).unwrap();
         assert!(
-            get_bool_flag_for_module(
-                &db, p, ORCHESTRATOR_CORE_MODULE_ID, DUAL_EMBEDDING_ARCTIC_SECONDARY_KEY
-            )
+            dual_row(&db, p, DualFlag::ArcticSecondary)
             .unwrap(),
             "toggling write_all_slots must leave arctic-secondary untouched",
         );
@@ -839,11 +779,91 @@ mod tests {
         // leave arctic-secondary untouched (it's not part of that cascade).
         set_dual_embedding_write_all_slots_with_db(&db, p, false).unwrap();
         assert!(
-            get_bool_flag_for_module(
-                &db, p, ORCHESTRATOR_CORE_MODULE_ID, DUAL_EMBEDDING_ARCTIC_SECONDARY_KEY
-            )
+            dual_row(&db, p, DualFlag::ArcticSecondary)
             .unwrap(),
             "the write_all_slots→dual_rl_log cascade must NOT reach arctic-secondary",
+        );
+    }
+
+    // ─── v0.2.91 WP-L: the delegation is GUARDED ─────────────────────────
+    //
+    // Every test above reaches the DB through the private row helpers
+    // (`get_bool_flag_for_module`), which is why they all still pass after
+    // the six commands were re-pointed at `Db::resolve_dual_flags`. That
+    // also means they can no longer fail when the RESOLVER is wrong: they
+    // measure the row, not the answer the commands now return. The three
+    // below close that gap by reading through the delegating path in the
+    // exact state where row-reading and resolving diverge.
+
+    /// Read the value the delegating `get_dual_*` command bodies produce.
+    /// (The `#[command]` wrappers need Tauri `State`; the body is one line
+    /// over `resolve_dual_flags`, so drive that directly.)
+    fn effective_via_delegation(db: &Db, project_id: &str) -> (bool, bool, bool) {
+        let s = db.resolve_dual_flags(project_id);
+        (
+            s.write_all_slots.effective,
+            s.rl_log.effective,
+            s.arctic_secondary.effective,
+        )
+    }
+
+    /// The state the OLD bodies got wrong: no per-project row, host-wide
+    /// default ON. Row-reading says false; the hub says true. A getter that
+    /// still read the row would fail here and nowhere else.
+    #[test]
+    fn getters_report_the_inherited_host_wide_default() {
+        let (db, ids) = open_db_with_projects(1);
+        let p = &ids[0];
+        db.set_dual_flag_global_default(DualFlag::WriteAllSlots, true)
+            .unwrap();
+        db.set_dual_flag_global_default(DualFlag::ArcticSecondary, true)
+            .unwrap();
+
+        // The raw rows are still absent — this is inheritance, not a write.
+        assert!(!dual_row(&db, p, DualFlag::WriteAllSlots)
+        .unwrap());
+
+        let (write, _log, arctic) = effective_via_delegation(&db, p);
+        assert!(
+            write,
+            "the getter must report the host-wide default the hub also serves",
+        );
+        assert!(arctic);
+    }
+
+    /// An explicit per-project `false` must beat a host-wide `true` through
+    /// the delegating getters too (decision #22, both directions).
+    #[test]
+    fn getters_honour_an_explicit_project_optout() {
+        let (db, ids) = open_db_with_projects(1);
+        let p = &ids[0];
+        db.set_dual_flag_global_default(DualFlag::ArcticSecondary, true)
+            .unwrap();
+        set_dual_embedding_arctic_secondary_with_db(&db, p, false).unwrap();
+
+        let (_w, _l, arctic) = effective_via_delegation(&db, p);
+        assert!(!arctic, "an explicit per-project OFF must survive a host-wide ON");
+    }
+
+    /// The cross-tier clamp reaches the legacy getters: a host-wide log
+    /// default meeting an explicit per-project write=false must read as
+    /// log=false here, not just in the hub.
+    #[test]
+    fn getters_apply_the_cross_tier_clamp() {
+        let (db, ids) = open_db_with_projects(1);
+        let p = &ids[0];
+        db.set_dual_flag_global_default(DualFlag::RlLog, true).unwrap();
+        // Raw row write so the project tier holds write=false under a
+        // host-wide log=true (the setter's own cascade would prevent it).
+        set_dual_row(&db, p, DualFlag::WriteAllSlots, false)
+        .unwrap();
+
+        let (write, log, _a) = effective_via_delegation(&db, p);
+        assert!(!write);
+        assert!(
+            !log,
+            "the legacy getter must never report the incoherent \
+             (log=true, write=false) pair either",
         );
     }
 

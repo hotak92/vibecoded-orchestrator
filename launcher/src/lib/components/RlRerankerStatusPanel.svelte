@@ -140,6 +140,20 @@
         Adjust these in the controls below. Changes apply immediately.
       </p>
     {/if}
+    <!-- v0.2.91 (#23 USER rider, MC-11): the two rows above describe the
+         LOCAL TRAINING pipeline's write mode — whether events update the
+         local model. Neither says whether reranking is influencing search
+         results, and the default flag state renders as "Online training
+         active", from which a reader can reasonably infer that it is. It is
+         not: no trained model has been produced yet, so results are
+         unaffected regardless of these rows or the module's enable switch.
+         State it here rather than leaving the inference standing. Delete
+         this note when a trained model ships. -->
+    <p class="dormant" data-testid="rl-reranking-dormant">
+      <strong>Reranking:</strong> not live yet — no trained model has been produced,
+      so search results are unaffected whatever these settings say. Event collection
+      is separate and continues regardless.
+    </p>
   </div>
 </div>
 
@@ -230,5 +244,15 @@
     color: var(--color-mid, #9ca3af);
     font-size: 12px;
     font-style: italic;
+  }
+  /* v0.2.91: current-state note, not an error — quiet, with the purple rule
+     the other "informational, nothing is broken" surfaces use. */
+  .dormant {
+    margin: 10px 0 0 0;
+    padding-left: 8px;
+    border-left: 2px solid var(--color-purple, #7b5fff);
+    color: var(--color-mid, #9ca3af);
+    font-size: 12px;
+    line-height: 1.45;
   }
 </style>
